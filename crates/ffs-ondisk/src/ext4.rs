@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use ffs_types::{
-    EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, ParseError, ensure_slice,
+    EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_MAX, EXT4_INDEX_FL, EXT4_SUPER_MAGIC,
+    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_XATTR_MAGIC, ParseError, S_IFBLK, S_IFCHR,
+    S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, ensure_slice,
     ext4_block_size_from_log, read_fixed, read_le_u16, read_le_u32, trim_nul_padded,
 };
 use serde::{Deserialize, Serialize};
@@ -9,48 +11,131 @@ use serde::{Deserialize, Serialize};
 const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
 const EXT_INIT_MAX_LEN: u16 = 1_u16 << 15;
 
-// ext4 feature flags (incompat subset; not exhaustive)
-const EXT4_FEATURE_INCOMPAT_COMPRESSION: u32 = 0x0001;
-const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
-const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
-const EXT4_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
-const EXT4_FEATURE_INCOMPAT_META_BG: u32 = 0x0010;
-const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
-const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
-const EXT4_FEATURE_INCOMPAT_MMP: u32 = 0x0100;
-const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
-const EXT4_FEATURE_INCOMPAT_EA_INODE: u32 = 0x0400;
-const EXT4_FEATURE_INCOMPAT_DIRDATA: u32 = 0x1000;
-const EXT4_FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
-const EXT4_FEATURE_INCOMPAT_LARGEDIR: u32 = 0x4000;
-const EXT4_FEATURE_INCOMPAT_INLINE_DATA: u32 = 0x8000;
-const EXT4_FEATURE_INCOMPAT_ENCRYPT: u32 = 0x10000;
-const EXT4_FEATURE_INCOMPAT_CASEFOLD: u32 = 0x20000;
+// ── ext4 feature flags ─────────────────────────────────────────────────────
 
-const EXT4_INCOMPAT_REQUIRED_MASK: u32 =
-    EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS;
+/// ext4 compatible feature flags (`s_feature_compat`).
+///
+/// These are advisory; unknown bits are safe to ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext4CompatFeatures(pub u32);
 
-// Bits FrankenFS v1 can parse/understand without failing mount validation.
-const EXT4_INCOMPAT_ALLOWED_MASK: u32 = EXT4_FEATURE_INCOMPAT_FILETYPE
-    | EXT4_FEATURE_INCOMPAT_EXTENTS
-    | EXT4_FEATURE_INCOMPAT_RECOVER
-    | EXT4_FEATURE_INCOMPAT_META_BG
-    | EXT4_FEATURE_INCOMPAT_64BIT
-    | EXT4_FEATURE_INCOMPAT_MMP
-    | EXT4_FEATURE_INCOMPAT_FLEX_BG
-    | EXT4_FEATURE_INCOMPAT_EA_INODE
-    | EXT4_FEATURE_INCOMPAT_DIRDATA
-    | EXT4_FEATURE_INCOMPAT_CSUM_SEED
-    | EXT4_FEATURE_INCOMPAT_LARGEDIR;
+impl Ext4CompatFeatures {
+    pub const DIR_PREALLOC: Self = Self(0x0001);
+    pub const IMAGIC_INODES: Self = Self(0x0002);
+    pub const HAS_JOURNAL: Self = Self(0x0004);
+    pub const EXT_ATTR: Self = Self(0x0008);
+    pub const RESIZE_INODE: Self = Self(0x0010);
+    pub const DIR_INDEX: Self = Self(0x0020);
+    pub const SPARSE_SUPER2: Self = Self(0x0200);
+    pub const FAST_COMMIT: Self = Self(0x0400);
+    pub const STABLE_INODES: Self = Self(0x0800);
+    pub const ORPHAN_FILE: Self = Self(0x1000);
 
-// ext4 feature flags (ro_compat subset)
-const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+    #[must_use]
+    pub fn bits(self) -> u32 {
+        self.0
+    }
 
-const EXT4_INCOMPAT_REJECT_MASK: u32 = EXT4_FEATURE_INCOMPAT_COMPRESSION
-    | EXT4_FEATURE_INCOMPAT_JOURNAL_DEV
-    | EXT4_FEATURE_INCOMPAT_INLINE_DATA
-    | EXT4_FEATURE_INCOMPAT_ENCRYPT
-    | EXT4_FEATURE_INCOMPAT_CASEFOLD;
+    #[must_use]
+    pub fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+}
+
+/// ext4 incompatible feature flags (`s_feature_incompat`).
+///
+/// Unknown bits MUST cause mount failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext4IncompatFeatures(pub u32);
+
+impl Ext4IncompatFeatures {
+    pub const COMPRESSION: Self = Self(0x0001);
+    pub const FILETYPE: Self = Self(0x0002);
+    pub const RECOVER: Self = Self(0x0004);
+    pub const JOURNAL_DEV: Self = Self(0x0008);
+    pub const META_BG: Self = Self(0x0010);
+    pub const EXTENTS: Self = Self(0x0040);
+    pub const BIT64: Self = Self(0x0080);
+    pub const MMP: Self = Self(0x0100);
+    pub const FLEX_BG: Self = Self(0x0200);
+    pub const EA_INODE: Self = Self(0x0400);
+    pub const DIRDATA: Self = Self(0x1000);
+    pub const CSUM_SEED: Self = Self(0x2000);
+    pub const LARGEDIR: Self = Self(0x4000);
+    pub const INLINE_DATA: Self = Self(0x8000);
+    pub const ENCRYPT: Self = Self(0x10000);
+    pub const CASEFOLD: Self = Self(0x20000);
+
+    /// Features required for FrankenFS v1 ext4 parsing.
+    pub const REQUIRED_V1: Self = Self(Self::FILETYPE.0 | Self::EXTENTS.0);
+
+    /// Bits FrankenFS v1 can parse/understand without failing mount validation.
+    pub const ALLOWED_V1: Self = Self(
+        Self::FILETYPE.0
+            | Self::EXTENTS.0
+            | Self::RECOVER.0
+            | Self::META_BG.0
+            | Self::BIT64.0
+            | Self::MMP.0
+            | Self::FLEX_BG.0
+            | Self::EA_INODE.0
+            | Self::DIRDATA.0
+            | Self::CSUM_SEED.0
+            | Self::LARGEDIR.0,
+    );
+
+    /// Bits FrankenFS v1 explicitly rejects.
+    pub const REJECTED_V1: Self = Self(
+        Self::COMPRESSION.0
+            | Self::JOURNAL_DEV.0
+            | Self::INLINE_DATA.0
+            | Self::ENCRYPT.0
+            | Self::CASEFOLD.0,
+    );
+
+    #[must_use]
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+}
+
+/// ext4 read-only compatible feature flags (`s_feature_ro_compat`).
+///
+/// Unknown bits imply the filesystem must not be mounted read-write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext4RoCompatFeatures(pub u32);
+
+impl Ext4RoCompatFeatures {
+    pub const SPARSE_SUPER: Self = Self(0x0001);
+    pub const LARGE_FILE: Self = Self(0x0002);
+    pub const BTREE_DIR: Self = Self(0x0004);
+    pub const HUGE_FILE: Self = Self(0x0008);
+    pub const GDT_CSUM: Self = Self(0x0010);
+    pub const DIR_NLINK: Self = Self(0x0020);
+    pub const EXTRA_ISIZE: Self = Self(0x0040);
+    pub const QUOTA: Self = Self(0x0100);
+    pub const BIGALLOC: Self = Self(0x0200);
+    pub const METADATA_CSUM: Self = Self(0x0400);
+    pub const READONLY: Self = Self(0x1000);
+    pub const PROJECT: Self = Self(0x2000);
+    pub const VERITY: Self = Self(0x8000);
+    pub const ORPHAN_PRESENT: Self = Self(0x10000);
+
+    #[must_use]
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ext4Superblock {
@@ -62,7 +147,10 @@ pub struct Ext4Superblock {
     pub free_inodes_count: u32,
     pub first_data_block: u32,
     pub block_size: u32,
+    pub log_cluster_size: u32,
+    pub cluster_size: u32,
     pub blocks_per_group: u32,
+    pub clusters_per_group: u32,
     pub inodes_per_group: u32,
     pub inode_size: u16,
     pub first_ino: u32,
@@ -80,9 +168,9 @@ pub struct Ext4Superblock {
     pub creator_os: u32,
 
     // ── Features ─────────────────────────────────────────────────────────
-    pub feature_compat: u32,
-    pub feature_incompat: u32,
-    pub feature_ro_compat: u32,
+    pub feature_compat: Ext4CompatFeatures,
+    pub feature_incompat: Ext4IncompatFeatures,
+    pub feature_ro_compat: Ext4RoCompatFeatures,
     pub default_mount_opts: u32,
 
     // ── State & error tracking ───────────────────────────────────────────
@@ -160,6 +248,14 @@ impl Ext4Superblock {
             });
         }
 
+        let log_cluster_size = read_le_u32(region, 0x1C)?;
+        let Some(cluster_size) = ext4_block_size_from_log(log_cluster_size) else {
+            return Err(ParseError::InvalidField {
+                field: "s_log_cluster_size",
+                reason: "invalid shift",
+            });
+        };
+
         // Read single-byte fields via ensure_slice
         let checksum_type = ensure_slice(region, 0x175, 1)?[0];
         let def_hash_version = ensure_slice(region, 0xFC, 1)?[0];
@@ -174,7 +270,10 @@ impl Ext4Superblock {
             free_inodes_count: read_le_u32(region, 0x10)?,
             first_data_block: read_le_u32(region, 0x14)?,
             block_size,
+            log_cluster_size,
+            cluster_size,
             blocks_per_group: read_le_u32(region, 0x20)?,
+            clusters_per_group: read_le_u32(region, 0x24)?,
             inodes_per_group: read_le_u32(region, 0x28)?,
             inode_size: read_le_u16(region, 0x58)?,
             first_ino: read_le_u32(region, 0x54)?,
@@ -192,9 +291,9 @@ impl Ext4Superblock {
             creator_os: read_le_u32(region, 0x48)?,
 
             // Features
-            feature_compat: read_le_u32(region, 0x5C)?,
-            feature_incompat: read_le_u32(region, 0x60)?,
-            feature_ro_compat: read_le_u32(region, 0x64)?,
+            feature_compat: Ext4CompatFeatures(read_le_u32(region, 0x5C)?),
+            feature_incompat: Ext4IncompatFeatures(read_le_u32(region, 0x60)?),
+            feature_ro_compat: Ext4RoCompatFeatures(read_le_u32(region, 0x64)?),
             default_mount_opts: read_le_u32(region, 0x100)?,
 
             // State & error tracking
@@ -257,23 +356,23 @@ impl Ext4Superblock {
     }
 
     #[must_use]
-    pub fn has_compat(&self, mask: u32) -> bool {
-        (self.feature_compat & mask) != 0
+    pub fn has_compat(&self, mask: Ext4CompatFeatures) -> bool {
+        (self.feature_compat.0 & mask.0) != 0
     }
 
     #[must_use]
-    pub fn has_incompat(&self, mask: u32) -> bool {
-        (self.feature_incompat & mask) != 0
+    pub fn has_incompat(&self, mask: Ext4IncompatFeatures) -> bool {
+        (self.feature_incompat.0 & mask.0) != 0
     }
 
     #[must_use]
-    pub fn has_ro_compat(&self, mask: u32) -> bool {
-        (self.feature_ro_compat & mask) != 0
+    pub fn has_ro_compat(&self, mask: Ext4RoCompatFeatures) -> bool {
+        (self.feature_ro_compat.0 & mask.0) != 0
     }
 
     #[must_use]
     pub fn is_64bit(&self) -> bool {
-        self.has_incompat(EXT4_FEATURE_INCOMPAT_64BIT)
+        self.has_incompat(Ext4IncompatFeatures::BIT64)
     }
 
     #[must_use]
@@ -302,7 +401,7 @@ impl Ext4Superblock {
     /// Whether this superblock uses metadata checksums (crc32c).
     #[must_use]
     pub fn has_metadata_csum(&self) -> bool {
-        self.has_ro_compat(EXT4_FEATURE_RO_COMPAT_METADATA_CSUM)
+        self.has_ro_compat(Ext4RoCompatFeatures::METADATA_CSUM)
     }
 
     /// Compute the crc32c checksum seed used for metadata checksums.
@@ -315,7 +414,7 @@ impl Ext4Superblock {
     /// which uses a different initial value.
     #[must_use]
     pub fn csum_seed(&self) -> u32 {
-        if self.has_incompat(EXT4_FEATURE_INCOMPAT_CSUM_SEED) {
+        if self.has_incompat(Ext4IncompatFeatures::CSUM_SEED) {
             self.checksum_seed
         } else {
             // kernel: ext4_chksum(sbi, ~0, uuid, 16) = crc32c_append(!0, uuid)
@@ -393,21 +492,23 @@ impl Ext4Superblock {
             });
         }
 
-        if (self.feature_incompat & EXT4_INCOMPAT_REQUIRED_MASK) != EXT4_INCOMPAT_REQUIRED_MASK {
+        if (self.feature_incompat.0 & Ext4IncompatFeatures::REQUIRED_V1.0)
+            != Ext4IncompatFeatures::REQUIRED_V1.0
+        {
             return Err(ParseError::InvalidField {
                 field: "s_feature_incompat",
                 reason: "missing required FILETYPE/EXTENTS features",
             });
         }
 
-        if (self.feature_incompat & EXT4_INCOMPAT_REJECT_MASK) != 0 {
+        if (self.feature_incompat.0 & Ext4IncompatFeatures::REJECTED_V1.0) != 0 {
             return Err(ParseError::InvalidField {
                 field: "s_feature_incompat",
                 reason: "contains explicitly unsupported incompatible feature flags",
             });
         }
 
-        if (self.feature_incompat & !EXT4_INCOMPAT_ALLOWED_MASK) != 0 {
+        if (self.feature_incompat.0 & !Ext4IncompatFeatures::ALLOWED_V1.0) != 0 {
             return Err(ParseError::InvalidField {
                 field: "s_feature_incompat",
                 reason: "unknown incompatible feature flags present",
@@ -870,7 +971,114 @@ impl Ext4Inode {
     /// Whether the EXTENTS flag is set.
     #[must_use]
     pub fn uses_extents(&self) -> bool {
-        (self.flags & 0x0008_0000) != 0 // EXT4_EXTENTS_FL
+        (self.flags & EXT4_EXTENTS_FL) != 0
+    }
+
+    /// Whether this inode has the htree index flag (hash-indexed directory).
+    #[must_use]
+    pub fn has_htree_index(&self) -> bool {
+        (self.flags & EXT4_INDEX_FL) != 0
+    }
+
+    // ── File type detection ─────────────────────────────────────────────
+
+    /// Extract the file type bits from the mode field.
+    #[must_use]
+    pub fn file_type_mode(&self) -> u16 {
+        self.mode & S_IFMT
+    }
+
+    /// Whether this inode is a regular file.
+    #[must_use]
+    pub fn is_regular(&self) -> bool {
+        self.file_type_mode() == S_IFREG
+    }
+
+    /// Whether this inode is a directory.
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        self.file_type_mode() == S_IFDIR
+    }
+
+    /// Whether this inode is a symbolic link.
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.file_type_mode() == S_IFLNK
+    }
+
+    /// Whether this inode is a character device.
+    #[must_use]
+    pub fn is_chrdev(&self) -> bool {
+        self.file_type_mode() == S_IFCHR
+    }
+
+    /// Whether this inode is a block device.
+    #[must_use]
+    pub fn is_blkdev(&self) -> bool {
+        self.file_type_mode() == S_IFBLK
+    }
+
+    /// Whether this inode is a FIFO (named pipe).
+    #[must_use]
+    pub fn is_fifo(&self) -> bool {
+        self.file_type_mode() == S_IFIFO
+    }
+
+    /// Whether this inode is a socket.
+    #[must_use]
+    pub fn is_socket(&self) -> bool {
+        self.file_type_mode() == S_IFSOCK
+    }
+
+    /// Permission bits (lower 12 bits of mode).
+    #[must_use]
+    pub fn permission_bits(&self) -> u16 {
+        self.mode & 0o7777
+    }
+
+    // ── Symlink helpers ─────────────────────────────────────────────────
+
+    /// Whether this is a "fast" (inline) symlink stored in the inode's i_block area.
+    ///
+    /// ext4 stores short symlink targets (up to 60 bytes) directly in the
+    /// `i_block` field of the inode rather than in separate data blocks.
+    /// This is detected by: symlink type + no extents flag + size <= 60.
+    #[must_use]
+    pub fn is_fast_symlink(&self) -> bool {
+        self.is_symlink() && !self.uses_extents() && (self.size as usize) <= EXT4_FAST_SYMLINK_MAX
+    }
+
+    /// Read the target of a fast (inline) symlink from the inode's extent_bytes.
+    ///
+    /// Returns `None` if this is not a fast symlink.
+    #[must_use]
+    pub fn fast_symlink_target(&self) -> Option<&[u8]> {
+        if !self.is_fast_symlink() {
+            return None;
+        }
+        let len = self.size as usize;
+        if len <= self.extent_bytes.len() {
+            Some(&self.extent_bytes[..len])
+        } else {
+            None
+        }
+    }
+
+    // ── Xattr helpers ───────────────────────────────────────────────────
+
+    /// The raw bytes of the inode body area available for inline xattrs.
+    ///
+    /// Returns the portion of the inode between `128 + extra_isize` and
+    /// the end of the inode. If `extra_isize` is 0 (no extended area),
+    /// returns an empty slice.
+    #[must_use]
+    pub fn xattr_ibody_region(&self) -> &[u8] {
+        // Inline xattrs live in the inode body after the fixed fields (128 bytes)
+        // plus extra_isize bytes. We stored extent_bytes as bytes [0x28..0x28+60],
+        // but the full raw inode is not kept. We'll need to handle this at the
+        // ImageReader level where we have access to the full raw inode bytes.
+        // This method is a placeholder indicating the concept.
+        &[]
     }
 
     /// Extract nanoseconds from an `*_extra` timestamp field.
@@ -1724,10 +1932,12 @@ mod tests {
         let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
         sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
         sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log_block_size=2 -> 4K
+        sb[0x1C..0x20].copy_from_slice(&2_u32.to_le_bytes()); // log_cluster_size=2 -> 4K
         sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_count
         sb[0x04..0x08].copy_from_slice(&32768_u32.to_le_bytes()); // blocks_count_lo
         sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block
         sb[0x20..0x24].copy_from_slice(&32768_u32.to_le_bytes()); // blocks_per_group
+        sb[0x24..0x28].copy_from_slice(&32768_u32.to_le_bytes()); // clusters_per_group
         sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_per_group
         sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
         sb
@@ -1739,7 +1949,7 @@ mod tests {
 
         // required incompat bits: FILETYPE + EXTENTS
         let incompat =
-            (EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS).to_le_bytes();
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0).to_le_bytes();
         sb[0x60..0x64].copy_from_slice(&incompat);
 
         let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
@@ -1748,7 +1958,7 @@ mod tests {
         let mut sb2 = sb;
         // add an unknown incompat bit
         let unknown =
-            (EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS | (1_u32 << 31))
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0 | (1_u32 << 31))
                 .to_le_bytes();
         sb2[0x60..0x64].copy_from_slice(&unknown);
         let parsed2 = Ext4Superblock::parse_superblock_region(&sb2).expect("parse2");
@@ -1759,7 +1969,7 @@ mod tests {
     fn validate_geometry_catches_bad_values() {
         let mut sb = make_valid_sb();
         let incompat =
-            (EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS).to_le_bytes();
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0).to_le_bytes();
         sb[0x60..0x64].copy_from_slice(&incompat);
 
         // Zero blocks_per_group

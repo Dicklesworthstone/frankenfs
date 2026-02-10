@@ -252,7 +252,188 @@ impl fmt::Display for Generation {
 impl InodeNumber {
     pub const ROOT: Self = Self(2);
     pub const JOURNAL: Self = Self(8);
+
+    /// Narrow to an ext4 inode number (u32).
+    ///
+    /// Returns `ParseError::IntegerConversion` if the value exceeds `u32::MAX`,
+    /// which would indicate a btrfs objectid was mistakenly treated as ext4.
+    pub fn to_ext4(self) -> Result<Ext4InodeNumber, ParseError> {
+        u32::try_from(self.0)
+            .map(Ext4InodeNumber)
+            .map_err(|_| ParseError::IntegerConversion {
+                field: "inode_number",
+            })
+    }
+
+    /// Convert to a btrfs object ID (infallible — same width).
+    #[must_use]
+    pub fn to_btrfs(self) -> BtrfsObjectId {
+        BtrfsObjectId(self.0)
+    }
 }
+
+// ── Format-specific inode/objectid types ────────────────────────────────────
+//
+// These types are used at parsing boundaries to prevent mixing ext4 inode
+// numbers (u32) with btrfs object IDs (u64). The canonical `InodeNumber(u64)`
+// is used throughout the codebase; these wrappers provide safe entry points.
+
+/// ext4 inode number (u32, 1-indexed).
+///
+/// ext4 stores inode numbers as 32-bit values. This wrapper ensures that
+/// parsing code uses the correct width and that conversion to the canonical
+/// `InodeNumber(u64)` is explicit and lossless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Ext4InodeNumber(pub u32);
+
+impl Ext4InodeNumber {
+    pub const ROOT: Self = Self(2);
+    pub const JOURNAL: Self = Self(8);
+
+    /// Promote to the canonical `InodeNumber(u64)` (infallible, lossless).
+    #[must_use]
+    pub fn to_canonical(self) -> InodeNumber {
+        InodeNumber(u64::from(self.0))
+    }
+}
+
+impl From<Ext4InodeNumber> for InodeNumber {
+    fn from(ext4: Ext4InodeNumber) -> Self {
+        ext4.to_canonical()
+    }
+}
+
+impl fmt::Display for Ext4InodeNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// btrfs object ID (u64).
+///
+/// btrfs uses 64-bit object IDs as B-tree keys. This wrapper distinguishes
+/// btrfs-specific IDs from the canonical `InodeNumber` at parsing boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BtrfsObjectId(pub u64);
+
+impl BtrfsObjectId {
+    /// Promote to the canonical `InodeNumber(u64)` (infallible, same width).
+    #[must_use]
+    pub fn to_canonical(self) -> InodeNumber {
+        InodeNumber(self.0)
+    }
+}
+
+impl From<BtrfsObjectId> for InodeNumber {
+    fn from(btrfs: BtrfsObjectId) -> Self {
+        btrfs.to_canonical()
+    }
+}
+
+impl fmt::Display for BtrfsObjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// ── POSIX file mode constants ────────────────────────────────────────────────
+
+/// File type mask (upper 4 bits of mode).
+pub const S_IFMT: u16 = 0o170000;
+/// Named pipe (FIFO).
+pub const S_IFIFO: u16 = 0o010000;
+/// Character device.
+pub const S_IFCHR: u16 = 0o020000;
+/// Directory.
+pub const S_IFDIR: u16 = 0o040000;
+/// Block device.
+pub const S_IFBLK: u16 = 0o060000;
+/// Regular file.
+pub const S_IFREG: u16 = 0o100000;
+/// Symbolic link.
+pub const S_IFLNK: u16 = 0o120000;
+/// Socket.
+pub const S_IFSOCK: u16 = 0o140000;
+
+// ── ext4 inode flags (i_flags) ──────────────────────────────────────────────
+
+/// Secure deletion (not actually implemented in ext4).
+pub const EXT4_SECRM_FL: u32 = 0x0000_0001;
+/// Undelete (not implemented).
+pub const EXT4_UNRM_FL: u32 = 0x0000_0002;
+/// Compressed file.
+pub const EXT4_COMPR_FL: u32 = 0x0000_0004;
+/// Synchronous updates.
+pub const EXT4_SYNC_FL: u32 = 0x0000_0008;
+/// Immutable file.
+pub const EXT4_IMMUTABLE_FL: u32 = 0x0000_0010;
+/// Append-only file.
+pub const EXT4_APPEND_FL: u32 = 0x0000_0020;
+/// Do not dump/undelete.
+pub const EXT4_NODUMP_FL: u32 = 0x0000_0040;
+/// Do not update access time.
+pub const EXT4_NOATIME_FL: u32 = 0x0000_0080;
+/// Hash-indexed directory (htree/DX).
+pub const EXT4_INDEX_FL: u32 = 0x0000_1000;
+/// AFS directory.
+pub const EXT4_IMAGIC_FL: u32 = 0x0000_2000;
+/// File data should be journaled.
+pub const EXT4_JOURNAL_DATA_FL: u32 = 0x0000_4000;
+/// File tail should not be merged.
+pub const EXT4_NOTAIL_FL: u32 = 0x0000_8000;
+/// Dirsync behaviour (directories only).
+pub const EXT4_DIRSYNC_FL: u32 = 0x0001_0000;
+/// Top of directory hierarchies.
+pub const EXT4_TOPDIR_FL: u32 = 0x0002_0000;
+/// Set to each huge file.
+pub const EXT4_HUGE_FILE_FL: u32 = 0x0004_0000;
+/// Inode uses extents.
+pub const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+/// Inode used for large EA.
+pub const EXT4_EA_INODE_FL: u32 = 0x0020_0000;
+/// Blocks allocated beyond EOF (pre-allocation).
+pub const EXT4_EOFBLOCKS_FL: u32 = 0x0040_0000;
+/// Inode is a snapshot.
+pub const EXT4_SNAPFILE_FL: u32 = 0x0100_0000;
+/// Snapshot is being deleted.
+pub const EXT4_SNAPFILE_DELETED_FL: u32 = 0x0400_0000;
+/// Snapshot shrink has completed.
+pub const EXT4_SNAPFILE_SHRUNK_FL: u32 = 0x0800_0000;
+/// Inode has inline data.
+pub const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
+/// Create with parents projid.
+pub const EXT4_PROJINHERIT_FL: u32 = 0x2000_0000;
+/// Casefolded directory.
+pub const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
+
+/// Maximum ext4 fast symlink target size (stored in the inode's i_block area).
+pub const EXT4_FAST_SYMLINK_MAX: usize = 60;
+
+// ── ext4 xattr name indices ─────────────────────────────────────────────────
+
+/// User extended attributes (user.*)
+pub const EXT4_XATTR_INDEX_USER: u8 = 1;
+/// POSIX ACL access.
+pub const EXT4_XATTR_INDEX_POSIX_ACL_ACCESS: u8 = 2;
+/// POSIX ACL default.
+pub const EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT: u8 = 3;
+/// Trusted extended attributes (trusted.*)
+pub const EXT4_XATTR_INDEX_TRUSTED: u8 = 4;
+/// Lustre (reserved).
+pub const EXT4_XATTR_INDEX_LUSTRE: u8 = 5;
+/// Security extended attributes (security.*)
+pub const EXT4_XATTR_INDEX_SECURITY: u8 = 6;
+/// System extended attributes (system.*)
+pub const EXT4_XATTR_INDEX_SYSTEM: u8 = 7;
+/// System richacl.
+pub const EXT4_XATTR_INDEX_RICHACL: u8 = 8;
+/// Encryption.
+pub const EXT4_XATTR_INDEX_ENCRYPTION: u8 = 9;
+/// Hurd.
+pub const EXT4_XATTR_INDEX_HURD: u8 = 10;
+
+/// Magic number for ext4 xattr blocks.
+pub const EXT4_XATTR_MAGIC: u32 = 0xEA02_0000;
 
 // ── Checked arithmetic helpers ──────────────────────────────────────────────
 
@@ -530,6 +711,60 @@ mod tests {
     fn test_inode_constants() {
         assert_eq!(InodeNumber::ROOT, InodeNumber(2));
         assert_eq!(InodeNumber::JOURNAL, InodeNumber(8));
+    }
+
+    // ── bd-1ds: format-specific inode/objectid tests ────────────────────
+
+    #[test]
+    fn ext4_inode_number_round_trip() {
+        let ext4 = Ext4InodeNumber(42);
+        let canonical: InodeNumber = ext4.into();
+        assert_eq!(canonical, InodeNumber(42));
+        assert_eq!(canonical.to_ext4(), Ok(Ext4InodeNumber(42)));
+    }
+
+    #[test]
+    fn ext4_inode_number_max_u32() {
+        let ext4 = Ext4InodeNumber(u32::MAX);
+        let canonical: InodeNumber = ext4.into();
+        assert_eq!(canonical.0, u64::from(u32::MAX));
+        assert_eq!(canonical.to_ext4(), Ok(Ext4InodeNumber(u32::MAX)));
+    }
+
+    #[test]
+    fn ext4_inode_number_overflow() {
+        // A btrfs-sized inode number cannot be narrowed to ext4
+        let large = InodeNumber(u64::from(u32::MAX) + 1);
+        assert!(large.to_ext4().is_err());
+        assert_eq!(
+            InodeNumber(u64::MAX).to_ext4().unwrap_err(),
+            ParseError::IntegerConversion {
+                field: "inode_number"
+            }
+        );
+    }
+
+    #[test]
+    fn btrfs_object_id_round_trip() {
+        let btrfs = BtrfsObjectId(0xDEAD_BEEF_CAFE_BABE);
+        let canonical: InodeNumber = btrfs.into();
+        assert_eq!(canonical.0, 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(canonical.to_btrfs(), BtrfsObjectId(0xDEAD_BEEF_CAFE_BABE));
+    }
+
+    #[test]
+    fn ext4_inode_constants_match_canonical() {
+        assert_eq!(Ext4InodeNumber::ROOT.to_canonical(), InodeNumber::ROOT);
+        assert_eq!(
+            Ext4InodeNumber::JOURNAL.to_canonical(),
+            InodeNumber::JOURNAL
+        );
+    }
+
+    #[test]
+    fn display_format_specific_types() {
+        assert_eq!(Ext4InodeNumber(42).to_string(), "42");
+        assert_eq!(BtrfsObjectId(256).to_string(), "256");
     }
 
     // ── bd-sik: checked arithmetic + alignment tests ────────────────────
