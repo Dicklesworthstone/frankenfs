@@ -29,6 +29,53 @@ pub struct Snapshot {
     pub high: CommitSeq,
 }
 
+/// Validated block size (must be a power of two in 1024..=65536).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BlockSize(u32);
+
+impl BlockSize {
+    /// Create a `BlockSize` if `value` is a power of two in [1024, 65536].
+    pub fn new(value: u32) -> Result<Self, ParseError> {
+        if !value.is_power_of_two() || value < 1024 || value > 65536 {
+            return Err(ParseError::InvalidField {
+                field: "block_size",
+                reason: "must be power of two in 1024..=65536",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Number of bits to shift to convert between bytes and blocks.
+    #[must_use]
+    pub fn shift(self) -> u32 {
+        self.0.trailing_zeros()
+    }
+
+    /// Convert a byte offset to a block number (truncating).
+    #[must_use]
+    pub fn byte_to_block(self, byte_offset: u64) -> BlockNumber {
+        BlockNumber(byte_offset >> u64::from(self.shift()))
+    }
+
+    /// Convert a block number to a byte offset.
+    pub fn block_to_byte(self, block: BlockNumber) -> Option<u64> {
+        block.0.checked_mul(u64::from(self.0))
+    }
+}
+
+/// Block group index (ext4: u32 group number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct GroupNumber(pub u32);
+
+/// Inode or filesystem generation counter (ext4: u32, btrfs: u64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Generation(pub u64);
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ParseError {
     #[error("insufficient data: need {needed} bytes at offset {offset}, got {actual}")]
@@ -119,6 +166,80 @@ impl fmt::Display for BlockNumber {
     }
 }
 
+impl fmt::Display for InodeNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for BlockSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for GroupNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for Generation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl InodeNumber {
+    pub const ROOT: Self = Self(2);
+    pub const JOURNAL: Self = Self(8);
+}
+
+// ── Checked arithmetic helpers ──────────────────────────────────────────────
+
+impl BlockNumber {
+    /// Add a block count, returning `None` on overflow.
+    #[must_use]
+    pub fn checked_add(self, count: u64) -> Option<Self> {
+        self.0.checked_add(count).map(Self)
+    }
+
+    /// Subtract a block count, returning `None` on underflow.
+    #[must_use]
+    pub fn checked_sub(self, count: u64) -> Option<Self> {
+        self.0.checked_sub(count).map(Self)
+    }
+}
+
+/// Compute the block group that contains a given block.
+///
+/// `first_data_block` is typically 0 for 4K blocks and 1 for 1K blocks.
+#[must_use]
+pub fn block_to_group(block: BlockNumber, blocks_per_group: u32, first_data_block: u32) -> GroupNumber {
+    let adjusted = block.0.saturating_sub(u64::from(first_data_block));
+    GroupNumber((adjusted / u64::from(blocks_per_group)) as u32)
+}
+
+/// Compute the first block of a given block group.
+pub fn group_first_block(group: GroupNumber, blocks_per_group: u32, first_data_block: u32) -> Option<BlockNumber> {
+    let offset = u64::from(group.0).checked_mul(u64::from(blocks_per_group))?;
+    offset.checked_add(u64::from(first_data_block)).map(BlockNumber)
+}
+
+/// Compute the inode's block group from its inode number.
+///
+/// Inode numbers are 1-indexed; group assignment uses `(ino - 1) / inodes_per_group`.
+#[must_use]
+pub fn inode_to_group(ino: InodeNumber, inodes_per_group: u32) -> GroupNumber {
+    GroupNumber(((ino.0.saturating_sub(1)) / u64::from(inodes_per_group)) as u32)
+}
+
+/// Compute the index of an inode within its block group.
+#[must_use]
+pub fn inode_index_in_group(ino: InodeNumber, inodes_per_group: u32) -> u32 {
+    ((ino.0.saturating_sub(1)) % u64::from(inodes_per_group)) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +263,79 @@ mod tests {
         assert_eq!(ext4_block_size_from_log(0), Some(1024));
         assert_eq!(ext4_block_size_from_log(1), Some(2048));
         assert_eq!(ext4_block_size_from_log(2), Some(4096));
+    }
+
+    #[test]
+    fn test_block_size_validation() {
+        assert!(BlockSize::new(4096).is_ok());
+        assert!(BlockSize::new(1024).is_ok());
+        assert!(BlockSize::new(65536).is_ok());
+        assert_eq!(BlockSize::new(4096).unwrap().get(), 4096);
+        assert_eq!(BlockSize::new(4096).unwrap().shift(), 12);
+
+        // Invalid: not power of two
+        assert!(BlockSize::new(3000).is_err());
+        // Invalid: too small
+        assert!(BlockSize::new(512).is_err());
+        // Invalid: too large
+        assert!(BlockSize::new(131_072).is_err());
+        // Invalid: zero
+        assert!(BlockSize::new(0).is_err());
+    }
+
+    #[test]
+    fn test_block_size_conversions() {
+        let bs = BlockSize::new(4096).unwrap();
+        assert_eq!(bs.byte_to_block(0), BlockNumber(0));
+        assert_eq!(bs.byte_to_block(4096), BlockNumber(1));
+        assert_eq!(bs.byte_to_block(8192), BlockNumber(2));
+        assert_eq!(bs.byte_to_block(4095), BlockNumber(0)); // truncates
+
+        assert_eq!(bs.block_to_byte(BlockNumber(0)), Some(0));
+        assert_eq!(bs.block_to_byte(BlockNumber(1)), Some(4096));
+        assert_eq!(bs.block_to_byte(BlockNumber(100)), Some(409_600));
+    }
+
+    #[test]
+    fn test_inode_group_math() {
+        // Standard: 8192 inodes per group
+        assert_eq!(inode_to_group(InodeNumber(1), 8192), GroupNumber(0));
+        assert_eq!(inode_to_group(InodeNumber(8192), 8192), GroupNumber(0));
+        assert_eq!(inode_to_group(InodeNumber(8193), 8192), GroupNumber(1));
+
+        assert_eq!(inode_index_in_group(InodeNumber(1), 8192), 0);
+        assert_eq!(inode_index_in_group(InodeNumber(2), 8192), 1);
+        assert_eq!(inode_index_in_group(InodeNumber(8193), 8192), 0);
+    }
+
+    #[test]
+    fn test_block_group_math() {
+        // 4K blocks, first_data_block = 0, 32768 blocks per group
+        assert_eq!(block_to_group(BlockNumber(0), 32768, 0), GroupNumber(0));
+        assert_eq!(block_to_group(BlockNumber(32767), 32768, 0), GroupNumber(0));
+        assert_eq!(block_to_group(BlockNumber(32768), 32768, 0), GroupNumber(1));
+
+        assert_eq!(group_first_block(GroupNumber(0), 32768, 0), Some(BlockNumber(0)));
+        assert_eq!(group_first_block(GroupNumber(1), 32768, 0), Some(BlockNumber(32768)));
+
+        // 1K blocks, first_data_block = 1, 8192 blocks per group
+        assert_eq!(block_to_group(BlockNumber(1), 8192, 1), GroupNumber(0));
+        assert_eq!(block_to_group(BlockNumber(8193), 8192, 1), GroupNumber(1));
+        assert_eq!(group_first_block(GroupNumber(0), 8192, 1), Some(BlockNumber(1)));
+        assert_eq!(group_first_block(GroupNumber(1), 8192, 1), Some(BlockNumber(8193)));
+    }
+
+    #[test]
+    fn test_block_number_checked_ops() {
+        assert_eq!(BlockNumber(10).checked_add(5), Some(BlockNumber(15)));
+        assert_eq!(BlockNumber(u64::MAX).checked_add(1), None);
+        assert_eq!(BlockNumber(10).checked_sub(3), Some(BlockNumber(7)));
+        assert_eq!(BlockNumber(0).checked_sub(1), None);
+    }
+
+    #[test]
+    fn test_inode_constants() {
+        assert_eq!(InodeNumber::ROOT, InodeNumber(2));
+        assert_eq!(InodeNumber::JOURNAL, InodeNumber(8));
     }
 }

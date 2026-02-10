@@ -24,14 +24,14 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 ### 0.1 Documentation and Consistency (Blocker Before Deep Implementation)
 
-- [~] Canonicalize crate naming across all docs (no phantom crates like `ffs-ops`, `ffs-cache`, `ffs-io`, `ffs-async`)
-- [~] Canonicalize all normative type definitions (single source for `TxnId`, `CommitSeq`, `Snapshot`, `BlockNumber`, `InodeNumber`, `BlockVersion`)
+- [x] Canonicalize crate naming across all docs (no phantom crates like `ffs-ops`, `ffs-cache`, `ffs-io`, `ffs-async`)
+- [x] Canonicalize all normative type definitions (single source for `TxnId`, `CommitSeq`, `Snapshot`, `BlockNumber`, `InodeNumber`, `BlockVersion`)
 - [~] Canonicalize all normative trait definitions (single source for `BlockDevice`, MVCC interfaces, repair interfaces)
-- [~] Reconcile doc claims vs workspace reality (21 workspace crates: 19 core + `ffs-ext4`/`ffs-btrfs` wrappers)
-- [~] Reconcile ext4/btrfs scope statements (both formats are in-scope; btrfs phased)
+- [x] Reconcile doc claims vs workspace reality (21 workspace crates: 19 core + `ffs-ext4`/`ffs-btrfs` wrappers)
+- [x] Reconcile ext4/btrfs scope statements (both formats are in-scope; btrfs phased)
 - [x] Fix math/spec errors in Section 18 (probabilistic conflict model) to be dimensionally correct and assumption-explicit
-- [ ] Remove/repair any references to non-existent files (`ARCHITECTURE.md`, `CONVENTIONS.md`) or create them if truly required
-- [~] Ensure dependency lists match `Cargo.toml` (zerocopy/bytes references removed; fuser planned for Phase 7; Appendix C updated to match actual Cargo.toml)
+- [x] Remove/repair any references to non-existent files (`ARCHITECTURE.md` -> `PROPOSED_ARCHITECTURE.md`, `CONVENTIONS.md` merged into `AGENTS.md`)
+- [x] Ensure dependency lists match `Cargo.toml` (zerocopy/bytes references removed; fuser planned for Phase 7; Appendix C updated to match actual Cargo.toml)
 - [x] Doc fix: `COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md` Section 18 “Sequential writes” row is inconsistent with the stated formula (make assumptions explicit or remove the row)
 - [x] Doc fix: `COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md` Section 18 group/bitmap conflict math (`1/G` vs `(1/G)^2`) and version-chain length formula (dimensional correctness)
 - [x] Doc fix: `COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md` ext4 block-size support statements (format allows 1K–64K, but FrankenFS v1 support must be stated consistently)
@@ -45,8 +45,8 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
   - ext4 on-disk inode is `u32`
   - btrfs objectid is `u64`
   - pick canonical `InodeNumber` representation and add per-format wrappers if needed
-- [ ] Add missing newtypes used by docs/spec: `BlockSize`, `GroupNumber`, `ByteOffset`, `DeviceId`, `Generation`
-- [ ] Add helpers: checked arithmetic helpers for offsets, block math, and alignment
+- [x] Add missing newtypes used by docs/spec: `BlockSize` (validated), `GroupNumber`, `Generation` (landed); `ByteOffset`/`DeviceId` deferred as not yet needed
+- [x] Add helpers: `BlockSize::byte_to_block/block_to_byte/shift`, `BlockNumber::checked_add/sub`, `block_to_group`, `group_first_block`, `inode_to_group`, `inode_index_in_group`
 
 ### 0.3 `ffs-error` (Error Model + Errno Mapping)
 
@@ -56,11 +56,11 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 ### 0.4 `ffs-ondisk` ext4 (Parsing + Validation)
 
-- [~] Expand `Ext4Superblock` parsing toward full on-disk layout (per `EXISTING_EXT4_BTRFS_STRUCTURE.md`)
-- [~] Implement ext4 feature flag decoding (compat / ro_compat / incompat) (incompat validation + helpers landed; compat/ro_compat decode pending)
-- [~] Implement superblock validation helpers (block size, geometry, required incompat flags) (block size + required/unknown incompat validation landed; geometry pending)
+- [x] Expand `Ext4Superblock` parsing toward full on-disk layout (~30 fields: geometry, identity, revision, features, state/errors, timestamps, journal, htree hash seed, flex BG, checksums)
+- [x] Implement ext4 feature flag decoding (compat / ro_compat / incompat) — `has_compat`, `has_incompat`, `has_ro_compat`, `is_64bit`, `has_metadata_csum` landed
+- [x] Implement superblock validation helpers — `validate_v1` (block size, features), `validate_geometry` (blocks_per_group, inodes_per_group, inode_size, first_data_block), `validate_checksum` (CRC32C), `csum_seed`
 - [~] Implement group descriptor parsing (32/64 byte descriptors; 64-bit fields; checksum hooks) (descriptor parsing landed; checksum hooks pending)
-- [ ] Implement inode location math (group + index -> table block + offset) as pure helpers
+- [x] Implement inode location math — `inode_to_group`, `inode_index_in_group` in ffs-types; `Ext4Superblock::inode_table_offset` and `group_desc_offset` in ffs-ondisk
 
 ### 0.5 `ffs-ondisk` btrfs (Parsing + Mapping + Tree Primitives)
 
@@ -267,9 +267,8 @@ four specification documents, and verify the workspace compiles.
 | `Cargo.toml` (workspace root) | Workspace members, shared dependency versions, workspace lints |
 | 19 crate `Cargo.toml` + `src/lib.rs` stubs | Empty crates with correct inter-crate dependencies declared |
 | `PLAN_TO_PORT_FRANKENFS_TO_RUST.md` | This document |
-| `ARCHITECTURE.md` | Crate topology, data-flow, trait contracts |
-| `AGENTS.md` | Agent assignments, coordination protocol |
-| `CONVENTIONS.md` | Code style, commit format, review checklist |
+| `PROPOSED_ARCHITECTURE.md` | Crate topology, data-flow, trait contracts |
+| `AGENTS.md` | Agent assignments, coordination protocol, code conventions |
 | `README.md` | Project overview, build instructions, quick start |
 
 **Acceptance Criteria:**
@@ -1068,7 +1067,7 @@ unsafe_code = "forbid"
 This is a hard constraint. If a third-party crate requires `unsafe`, it must be:
 1. Audited via `cargo vet` or `cargo crev`.
 2. Isolated behind a safe abstraction boundary.
-3. Documented in `ARCHITECTURE.md` with justification.
+3. Documented in `PROPOSED_ARCHITECTURE.md` with justification.
 
 Third-party crates like `crc32c`, `blake3`, and `parking_lot` use `unsafe`
 internally but expose safe APIs. This is acceptable because they are widely
