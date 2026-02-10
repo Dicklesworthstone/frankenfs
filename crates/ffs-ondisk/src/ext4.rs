@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
 use ffs_types::{
-    EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_MAX, EXT4_INDEX_FL, EXT4_SUPER_MAGIC,
+    EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_MAX, EXT4_HUGE_FILE_FL, EXT4_INDEX_FL, EXT4_SUPER_MAGIC,
     EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_XATTR_MAGIC, ParseError, S_IFBLK, S_IFCHR,
-    S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, ensure_slice,
-    ext4_block_size_from_log, read_fixed, read_le_u16, read_le_u32, trim_nul_padded,
+    S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, ensure_slice, ext4_block_size_from_log,
+    read_fixed, read_le_u16, read_le_u32, trim_nul_padded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -774,8 +774,7 @@ pub fn verify_inode_checksum(
     Ok(())
 }
 
-/// ext4 inode flags
-const EXT4_HUGE_FILE_FL: u32 = 0x0004_0000;
+// EXT4_HUGE_FILE_FL imported from ffs_types
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ext4Inode {
@@ -810,6 +809,11 @@ pub struct Ext4Inode {
 
     // ── Extent / inline data ─────────────────────────────────────────────
     pub extent_bytes: Vec<u8>,
+
+    // ── Inline xattr area ───────────────────────────────────────────────
+    /// Raw bytes from the inode body area available for inline xattrs.
+    /// This is the region `[128 + extra_isize .. inode_size]`.
+    pub xattr_ibody: Vec<u8>,
 }
 
 impl Ext4Inode {
@@ -959,6 +963,17 @@ impl Ext4Inode {
             projid,
 
             extent_bytes,
+
+            xattr_ibody: if extra_isize > 0 {
+                let xattr_start = 128 + usize::from(extra_isize);
+                if xattr_start < bytes.len() {
+                    bytes[xattr_start..].to_vec()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -1045,7 +1060,7 @@ impl Ext4Inode {
     /// This is detected by: symlink type + no extents flag + size <= 60.
     #[must_use]
     pub fn is_fast_symlink(&self) -> bool {
-        self.is_symlink() && !self.uses_extents() && (self.size as usize) <= EXT4_FAST_SYMLINK_MAX
+        self.is_symlink() && !self.uses_extents() && self.size <= EXT4_FAST_SYMLINK_MAX as u64
     }
 
     /// Read the target of a fast (inline) symlink from the inode's extent_bytes.
@@ -1056,29 +1071,13 @@ impl Ext4Inode {
         if !self.is_fast_symlink() {
             return None;
         }
-        let len = self.size as usize;
+        // is_fast_symlink guarantees size <= 60, so this cast is safe
+        let len = usize::try_from(self.size).ok()?;
         if len <= self.extent_bytes.len() {
             Some(&self.extent_bytes[..len])
         } else {
             None
         }
-    }
-
-    // ── Xattr helpers ───────────────────────────────────────────────────
-
-    /// The raw bytes of the inode body area available for inline xattrs.
-    ///
-    /// Returns the portion of the inode between `128 + extra_isize` and
-    /// the end of the inode. If `extra_isize` is 0 (no extended area),
-    /// returns an empty slice.
-    #[must_use]
-    pub fn xattr_ibody_region(&self) -> &[u8] {
-        // Inline xattrs live in the inode body after the fixed fields (128 bytes)
-        // plus extra_isize bytes. We stored extent_bytes as bytes [0x28..0x28+60],
-        // but the full raw inode is not kept. We'll need to handle this at the
-        // ImageReader level where we have access to the full raw inode bytes.
-        // This method is a placeholder indicating the concept.
-        &[]
     }
 
     /// Extract nanoseconds from an `*_extra` timestamp field.
@@ -1443,6 +1442,217 @@ pub fn parse_dir_block(
 pub fn lookup_in_dir_block(block: &[u8], block_size: u32, target: &[u8]) -> Option<Ext4DirEntry> {
     let (entries, _) = parse_dir_block(block, block_size).ok()?;
     entries.into_iter().find(|e| e.name == target)
+}
+
+// ── Zero-allocation directory block iterator ────────────────────────────────
+
+/// A borrowed directory entry (zero-copy reference into the block buffer).
+///
+/// Unlike [`Ext4DirEntry`] which owns its name bytes via `Vec<u8>`,
+/// `Ext4DirEntryRef` borrows the name slice from the block buffer. This
+/// avoids per-entry heap allocation when iterating directory blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ext4DirEntryRef<'a> {
+    pub inode: u32,
+    pub rec_len: u32,
+    pub name_len: u8,
+    pub file_type: Ext4FileType,
+    pub name: &'a [u8],
+}
+
+impl Ext4DirEntryRef<'_> {
+    /// Convert to an owned [`Ext4DirEntry`] (allocates name bytes).
+    #[must_use]
+    pub fn to_owned(&self) -> Ext4DirEntry {
+        Ext4DirEntry {
+            inode: self.inode,
+            rec_len: u16::try_from(self.rec_len).unwrap_or(u16::MAX),
+            name_len: self.name_len,
+            file_type: self.file_type,
+            name: self.name.to_vec(),
+        }
+    }
+
+    /// Return the name as a UTF-8 string (lossy).
+    #[must_use]
+    pub fn name_str(&self) -> String {
+        String::from_utf8_lossy(self.name).into_owned()
+    }
+
+    /// Whether this is the `.` entry.
+    #[must_use]
+    pub fn is_dot(&self) -> bool {
+        self.name == b"."
+    }
+
+    /// Whether this is the `..` entry.
+    #[must_use]
+    pub fn is_dotdot(&self) -> bool {
+        self.name == b".."
+    }
+}
+
+/// A zero-allocation iterator over ext4 directory entries in a block buffer.
+///
+/// Yields `Result<Ext4DirEntryRef<'a>, ParseError>` for each live entry
+/// (inode != 0), skipping deleted entries and the checksum tail. After
+/// exhausting the iterator, call [`checksum_tail()`](DirBlockIter::checksum_tail)
+/// to retrieve the tail if one was present.
+///
+/// # Example
+///
+/// ```ignore
+/// let iter = DirBlockIter::new(block_data, block_size);
+/// for result in iter {
+///     let entry = result?;
+///     println!("{} -> inode {}", entry.name_str(), entry.inode);
+/// }
+/// ```
+pub struct DirBlockIter<'a> {
+    block: &'a [u8],
+    block_size: u32,
+    offset: usize,
+    tail: Option<Ext4DirEntryTail>,
+    done: bool,
+}
+
+impl<'a> DirBlockIter<'a> {
+    /// Create a new iterator over directory entries in `block`.
+    #[must_use]
+    pub fn new(block: &'a [u8], block_size: u32) -> Self {
+        Self {
+            block,
+            block_size,
+            offset: 0,
+            tail: None,
+            done: false,
+        }
+    }
+
+    /// Return the checksum tail, if one was found during iteration.
+    ///
+    /// Only valid after the iterator has been fully consumed.
+    #[must_use]
+    pub fn checksum_tail(&self) -> Option<Ext4DirEntryTail> {
+        self.tail
+    }
+}
+
+impl<'a> Iterator for DirBlockIter<'a> {
+    type Item = Result<Ext4DirEntryRef<'a>, ParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done || self.offset + 8 > self.block.len() {
+                return None;
+            }
+
+            let inode = match read_le_u32(self.block, self.offset) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+            let rec_len_raw = match read_le_u16(self.block, self.offset + 4) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+            let name_len = match ensure_slice(self.block, self.offset + 6, 1) {
+                Ok(s) => s[0],
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+            let file_type_raw = match ensure_slice(self.block, self.offset + 7, 1) {
+                Ok(s) => s[0],
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+
+            let rec_len = rec_len_from_disk(rec_len_raw, self.block_size);
+
+            // rec_len must be >= 8 (header size)
+            if rec_len < 8 {
+                self.done = true;
+                return Some(Err(ParseError::InvalidField {
+                    field: "de_rec_len",
+                    reason: "directory entry rec_len < 8",
+                }));
+            }
+
+            // rec_len must not overflow or exceed block
+            let entry_end = match self.offset.checked_add(rec_len as usize) {
+                Some(end) if end <= self.block.len() => end,
+                Some(_) => {
+                    self.done = true;
+                    return Some(Err(ParseError::InvalidField {
+                        field: "de_rec_len",
+                        reason: "directory entry extends past block boundary",
+                    }));
+                }
+                None => {
+                    self.done = true;
+                    return Some(Err(ParseError::InvalidField {
+                        field: "de_rec_len",
+                        reason: "overflow",
+                    }));
+                }
+            };
+
+            // Detect checksum tail sentinel
+            if inode == 0 && name_len == 0 && file_type_raw == EXT4_FT_DIR_CSUM && rec_len == 12 {
+                if self.offset + 12 <= self.block.len() {
+                    if let Ok(csum) = read_le_u32(self.block, self.offset + 8) {
+                        self.tail = Some(Ext4DirEntryTail { checksum: csum });
+                    }
+                }
+                self.done = true;
+                return None;
+            }
+
+            // Skip deleted entries (inode == 0)
+            if inode == 0 {
+                self.offset = entry_end;
+                continue;
+            }
+
+            // Validate name_len fits within rec_len
+            let name_end = self.offset + 8 + usize::from(name_len);
+            if name_end > entry_end {
+                self.done = true;
+                return Some(Err(ParseError::InvalidField {
+                    field: "de_name_len",
+                    reason: "name extends past rec_len",
+                }));
+            }
+
+            let name = &self.block[self.offset + 8..name_end];
+            self.offset = entry_end;
+
+            return Some(Ok(Ext4DirEntryRef {
+                inode,
+                rec_len,
+                name_len,
+                file_type: Ext4FileType::from_raw(file_type_raw),
+                name,
+            }));
+        }
+    }
+}
+
+/// Create an iterator over directory entries in a block buffer.
+///
+/// This is a convenience wrapper around [`DirBlockIter::new`].
+#[must_use]
+pub fn iter_dir_block(block: &[u8], block_size: u32) -> DirBlockIter<'_> {
+    DirBlockIter::new(block, block_size)
 }
 
 // ── High-level image readers ────────────────────────────────────────────────
@@ -1851,7 +2061,7 @@ impl Ext4ImageReader {
         // Split path and process each non-empty component
         for component in path.split('/').filter(|c| !c.is_empty()) {
             // Current inode must be a directory
-            if (current_inode.mode & 0xF000) != 0x4000 {
+            if !current_inode.is_dir() {
                 return Err(ParseError::InvalidField {
                     field: "path",
                     reason: "component is not a directory",
@@ -1872,6 +2082,272 @@ impl Ext4ImageReader {
         Ok((current_ino, current_inode))
     }
 
+    // ── Symlink operations ────────────────────────────────────────────
+
+    /// Read the target of a symbolic link.
+    ///
+    /// For "fast" symlinks (target <= 60 bytes, stored inline in the inode's
+    /// i_block area), the target is read directly from the inode.
+    /// For longer symlinks, the target is read from extent-mapped data blocks.
+    pub fn read_symlink(&self, image: &[u8], inode: &Ext4Inode) -> Result<Vec<u8>, ParseError> {
+        if !inode.is_symlink() {
+            return Err(ParseError::InvalidField {
+                field: "i_mode",
+                reason: "inode is not a symlink",
+            });
+        }
+
+        // Fast symlink: target stored in i_block area
+        if let Some(target) = inode.fast_symlink_target() {
+            return Ok(target.to_vec());
+        }
+
+        // Extent-mapped symlink: read via normal file data path
+        let size = usize::try_from(inode.size)
+            .map_err(|_| ParseError::IntegerConversion { field: "i_size" })?;
+        let mut buf = vec![0_u8; size];
+        let n = self.read_inode_data(image, inode, 0, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Maximum number of symlink resolutions in a single path traversal.
+    ///
+    /// Matches the Linux kernel's MAXSYMLINKS (40) to prevent infinite loops.
+    const MAX_SYMLINKS: u32 = 40;
+
+    /// Resolve an absolute path, following symbolic links.
+    ///
+    /// Like `resolve_path`, but when a path component resolves to a symlink,
+    /// the symlink target is read and the remaining path is adjusted.
+    /// Detects symlink loops via a resolution counter (max 40, matching the kernel).
+    ///
+    /// Does not support relative symlinks that escape the root (they are
+    /// resolved relative to the filesystem root).
+    pub fn resolve_path_follow(
+        &self,
+        image: &[u8],
+        path: &str,
+    ) -> Result<(ffs_types::InodeNumber, Ext4Inode), ParseError> {
+        if !path.starts_with('/') {
+            return Err(ParseError::InvalidField {
+                field: "path",
+                reason: "path must be absolute (start with /)",
+            });
+        }
+
+        let mut symlink_count = 0_u32;
+        // Build the full component queue from the initial path
+        let mut components: Vec<String> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .collect();
+        components.reverse(); // process from the back as a stack
+
+        let mut current_ino = ffs_types::InodeNumber::ROOT;
+        let mut current_inode = self.read_inode(image, current_ino)?;
+
+        while let Some(component) = components.pop() {
+            // Current must be a directory to traverse into
+            if !current_inode.is_dir() {
+                return Err(ParseError::InvalidField {
+                    field: "path",
+                    reason: "component is not a directory",
+                });
+            }
+
+            // Save parent directory for relative symlink resolution
+            let parent_ino = current_ino;
+            let parent_inode = current_inode.clone();
+
+            let entry = self
+                .lookup(image, &parent_inode, component.as_bytes())?
+                .ok_or(ParseError::InvalidField {
+                    field: "path",
+                    reason: "component not found",
+                })?;
+
+            current_ino = ffs_types::InodeNumber(u64::from(entry.inode));
+            current_inode = self.read_inode(image, current_ino)?;
+
+            // If we landed on a symlink, resolve it
+            if current_inode.is_symlink() {
+                symlink_count += 1;
+                if symlink_count > Self::MAX_SYMLINKS {
+                    return Err(ParseError::InvalidField {
+                        field: "path",
+                        reason: "too many levels of symbolic links",
+                    });
+                }
+
+                let target = self.read_symlink(image, &current_inode)?;
+                let target_str =
+                    std::str::from_utf8(&target).map_err(|_| ParseError::InvalidField {
+                        field: "symlink_target",
+                        reason: "symlink target is not valid UTF-8",
+                    })?;
+
+                if target_str.starts_with('/') {
+                    // Absolute symlink: restart from root
+                    current_ino = ffs_types::InodeNumber::ROOT;
+                    current_inode = self.read_inode(image, current_ino)?;
+                } else {
+                    // Relative symlink: resolve from parent directory
+                    current_ino = parent_ino;
+                    current_inode = parent_inode;
+                }
+
+                // Push target components onto the stack (reversed)
+                for comp in target_str
+                    .split('/')
+                    .filter(|c| !c.is_empty())
+                    .map(String::from)
+                    .rev()
+                {
+                    components.push(comp);
+                }
+            }
+        }
+
+        Ok((current_ino, current_inode))
+    }
+
+    // ── Extended attributes ─────────────────────────────────────────────
+
+    /// Read inline xattrs from the inode body (ibody region).
+    ///
+    /// The inline xattr area starts after `128 + extra_isize` and contains
+    /// entries prefixed with a 4-byte magic header.
+    pub fn read_xattrs_ibody(&self, inode: &Ext4Inode) -> Result<Vec<Ext4Xattr>, ParseError> {
+        if inode.xattr_ibody.len() < 4 {
+            return Ok(Vec::new());
+        }
+        // The ibody xattr region starts with a 4-byte header (just the magic)
+        let magic = read_le_u32(&inode.xattr_ibody, 0)?;
+        if magic != EXT4_XATTR_MAGIC {
+            // No inline xattrs present (or corrupted)
+            return Ok(Vec::new());
+        }
+        parse_xattr_entries(&inode.xattr_ibody[4..])
+    }
+
+    /// Read xattrs from an external xattr block (pointed to by `i_file_acl`).
+    pub fn read_xattrs_block(
+        &self,
+        image: &[u8],
+        inode: &Ext4Inode,
+    ) -> Result<Vec<Ext4Xattr>, ParseError> {
+        if inode.file_acl == 0 {
+            return Ok(Vec::new());
+        }
+        let block_data = self.read_block(image, ffs_types::BlockNumber(inode.file_acl))?;
+
+        // External xattr block starts with a 32-byte header
+        if block_data.len() < 32 {
+            return Err(ParseError::InsufficientData {
+                needed: 32,
+                offset: 0,
+                actual: block_data.len(),
+            });
+        }
+        let magic = read_le_u32(block_data, 0)?;
+        if magic != EXT4_XATTR_MAGIC {
+            return Err(ParseError::InvalidMagic {
+                expected: u64::from(EXT4_XATTR_MAGIC),
+                actual: u64::from(magic),
+            });
+        }
+        // Entries start at byte 32 of the xattr block
+        parse_xattr_entries(&block_data[32..])
+    }
+
+    /// Read all xattrs for an inode (inline + external block).
+    pub fn list_xattrs(
+        &self,
+        image: &[u8],
+        inode: &Ext4Inode,
+    ) -> Result<Vec<Ext4Xattr>, ParseError> {
+        let mut result = self.read_xattrs_ibody(inode)?;
+        let block_xattrs = self.read_xattrs_block(image, inode)?;
+        result.extend(block_xattrs);
+        Ok(result)
+    }
+
+    /// Get a specific xattr by name index and name.
+    pub fn get_xattr(
+        &self,
+        image: &[u8],
+        inode: &Ext4Inode,
+        name_index: u8,
+        name: &[u8],
+    ) -> Result<Option<Vec<u8>>, ParseError> {
+        let all = self.list_xattrs(image, inode)?;
+        Ok(all
+            .into_iter()
+            .find(|x| x.name_index == name_index && x.name == name)
+            .map(|x| x.value))
+    }
+
+    // ── Hash-tree (htree/DX) directory lookup ───────────────────────────
+
+    /// Look up a name in a hash-indexed directory using the htree/DX index.
+    ///
+    /// If the directory has the `EXT4_INDEX_FL` flag set and block 0 contains
+    /// a valid DX root, this performs an O(log n) lookup by hashing the name,
+    /// binary-searching the DX entries to find the target leaf block, then
+    /// doing a linear scan of that leaf block.
+    ///
+    /// Falls back to linear scan if the htree is not present or valid.
+    pub fn htree_lookup(
+        &self,
+        image: &[u8],
+        dir_inode: &Ext4Inode,
+        name: &[u8],
+    ) -> Result<Option<Ext4DirEntry>, ParseError> {
+        // Only attempt htree if the INDEX flag is set
+        if !dir_inode.has_htree_index() {
+            return self.lookup(image, dir_inode, name);
+        }
+
+        // Read block 0 of the directory — it contains the DX root
+        let Some(phys0) = self.resolve_extent(image, dir_inode, 0)? else {
+            return self.lookup(image, dir_inode, name);
+        };
+        let block0 = self.read_block(image, ffs_types::BlockNumber(phys0))?;
+
+        // Parse the DX root from block 0
+        let Ok(dx_root) = parse_dx_root(block0) else {
+            return self.lookup(image, dir_inode, name);
+        };
+
+        // Hash the name using the hash version from the DX root
+        let (hash, _minor) = dx_hash(dx_root.hash_version, name, &self.sb.hash_seed);
+
+        // Binary search the DX entries for the target hash
+        let target_block = dx_find_leaf(&dx_root.entries, hash);
+
+        // If there's an indirect level, we need to read the inner index block
+        let leaf_block = if dx_root.indirect_levels > 0 {
+            let Some(inner_phys) = self.resolve_extent(image, dir_inode, target_block)? else {
+                return Ok(None);
+            };
+            let inner_data = self.read_block(image, ffs_types::BlockNumber(inner_phys))?;
+            let inner_entries = parse_dx_entries(inner_data, 8)?;
+
+            dx_find_leaf(&inner_entries, hash)
+        } else {
+            target_block
+        };
+
+        // Read the leaf directory block and do a linear scan
+        let Some(leaf_phys) = self.resolve_extent(image, dir_inode, leaf_block)? else {
+            return Ok(None);
+        };
+        let leaf_data = self.read_block(image, ffs_types::BlockNumber(leaf_phys))?;
+        Ok(lookup_in_dir_block(leaf_data, self.sb.block_size, name))
+    }
+
     /// Read a directory block and parse its entries.
     pub fn read_dir_block(
         &self,
@@ -1880,6 +2356,479 @@ impl Ext4ImageReader {
     ) -> Result<(Vec<Ext4DirEntry>, Option<Ext4DirEntryTail>), ParseError> {
         let data = self.read_block(image, block)?;
         parse_dir_block(data, self.sb.block_size)
+    }
+}
+
+// ── Extended attribute types and parsing ─────────────────────────────────────
+
+/// A parsed extended attribute (name + value).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext4Xattr {
+    /// Name index (namespace): 1=user, 2=posix_acl_access, 4=trusted, 6=security, etc.
+    pub name_index: u8,
+    /// Attribute name (without the namespace prefix).
+    pub name: Vec<u8>,
+    /// Attribute value.
+    pub value: Vec<u8>,
+}
+
+impl Ext4Xattr {
+    /// Return the full attribute name including the namespace prefix.
+    #[must_use]
+    pub fn full_name(&self) -> String {
+        let prefix = match self.name_index {
+            ffs_types::EXT4_XATTR_INDEX_USER => "user.",
+            ffs_types::EXT4_XATTR_INDEX_POSIX_ACL_ACCESS => "system.posix_acl_access",
+            ffs_types::EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT => "system.posix_acl_default",
+            ffs_types::EXT4_XATTR_INDEX_TRUSTED => "trusted.",
+            ffs_types::EXT4_XATTR_INDEX_SECURITY => "security.",
+            ffs_types::EXT4_XATTR_INDEX_SYSTEM => "system.",
+            _ => "unknown.",
+        };
+        format!("{prefix}{}", String::from_utf8_lossy(&self.name))
+    }
+}
+
+/// Parse xattr entries from a byte slice (after the header/magic).
+///
+/// Each entry is:
+///   - u8 name_len
+///   - u8 name_index
+///   - u16 value_offs (offset from start of the value area, which is the end of the block/ibody)
+///   - u32 value_size
+///   - u32 hash (we ignore this)
+///   - [u8; name_len] name
+///   - padding to 4-byte boundary
+///
+/// Entry list is terminated by a zero name_len + zero name_index.
+fn parse_xattr_entries(data: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError> {
+    let mut entries = Vec::new();
+    let mut offset = 0_usize;
+
+    loop {
+        // Need at least 4 bytes to check terminator and read entry header
+        if offset + 4 > data.len() {
+            break;
+        }
+
+        let name_len = data[offset];
+        let name_index = data[offset + 1];
+
+        // Terminator: name_len=0, name_index=0
+        if name_len == 0 && name_index == 0 {
+            break;
+        }
+
+        // Full entry header is 16 bytes
+        if offset + 16 > data.len() {
+            break;
+        }
+
+        let value_offs = read_le_u16(data, offset + 2)?;
+        let value_size = read_le_u32(data, offset + 4)?;
+        // skip hash at offset + 8..12
+
+        let name_start = offset + 16;
+        let name_end = name_start + usize::from(name_len);
+        if name_end > data.len() {
+            return Err(ParseError::InvalidField {
+                field: "xattr_name",
+                reason: "name extends past data boundary",
+            });
+        }
+        let name = data[name_start..name_end].to_vec();
+
+        // Read value from value area (offsets are from end of data working backwards)
+        let value = if value_size > 0 {
+            let v_off = usize::from(value_offs);
+            let v_size =
+                usize::try_from(value_size).map_err(|_| ParseError::IntegerConversion {
+                    field: "xattr_value_size",
+                })?;
+            if v_off + v_size > data.len() {
+                return Err(ParseError::InvalidField {
+                    field: "xattr_value",
+                    reason: "value extends past data boundary",
+                });
+            }
+            data[v_off..v_off + v_size].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        entries.push(Ext4Xattr {
+            name_index,
+            name,
+            value,
+        });
+
+        // Advance past the entry: header (16) + name_len, padded to 4 bytes
+        offset = (name_end + 3) & !3;
+    }
+
+    Ok(entries)
+}
+
+// ── Hash-tree (htree/DX) structures and algorithms ──────────────────────────
+
+/// Parsed DX root (block 0 of an htree directory).
+#[derive(Debug, Clone)]
+pub struct Ext4DxRoot {
+    /// Hash version (0=legacy, 1=half_md4, 2=tea, 3=legacy_unsigned, 4=half_md4_unsigned, 5=tea_unsigned).
+    pub hash_version: u8,
+    /// Indirect levels (0 = single level, 1 = two levels).
+    pub indirect_levels: u8,
+    /// DX entries (hash → block pairs).
+    pub entries: Vec<Ext4DxEntry>,
+}
+
+/// A single DX index entry: hash value → directory block number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ext4DxEntry {
+    pub hash: u32,
+    pub block: u32,
+}
+
+/// Parse the DX root from the first block of a hash-indexed directory.
+///
+/// Layout of the DX root (after the fake "." and ".." dir entries):
+///   Byte 0x18: reserved (u32)
+///   Byte 0x1C: hash_version (u8)
+///   Byte 0x1D: info_length (u8)
+///   Byte 0x1E: indirect_levels (u8)
+///   Byte 0x1F: unused_flags (u8)
+///   Byte 0x20: count/limit (u16, u16)
+///   Byte 0x24+: DX entries (8 bytes each: hash(4) + block(4))
+pub fn parse_dx_root(block: &[u8]) -> Result<Ext4DxRoot, ParseError> {
+    // The DX root info starts at byte 0x1C in the directory block
+    // (after the fake "." entry at 0x00 and ".." entry at 0x0C)
+    if block.len() < 0x28 {
+        return Err(ParseError::InsufficientData {
+            needed: 0x28,
+            offset: 0,
+            actual: block.len(),
+        });
+    }
+
+    let hash_version = block[0x1C];
+    let info_length = block[0x1D];
+    let indirect_levels = block[0x1E];
+
+    // Validate
+    if info_length != 8 {
+        return Err(ParseError::InvalidField {
+            field: "dx_root_info_length",
+            reason: "expected 8",
+        });
+    }
+    if indirect_levels > 2 {
+        return Err(ParseError::InvalidField {
+            field: "dx_indirect_levels",
+            reason: "exceeds maximum (2)",
+        });
+    }
+
+    // Count/limit at 0x20
+    let count = read_le_u16(block, 0x20)?;
+    let _limit = read_le_u16(block, 0x22)?;
+
+    // Entries start at 0x24 (first is the zero-hash sentinel entry)
+    let entries = parse_dx_entries(block, 0x24)?;
+
+    // Sanity: should have `count` entries total (including sentinel)
+    if entries.len() != usize::from(count) {
+        // Parse what we can, but if count is wildly off, report as many as fit
+    }
+
+    Ok(Ext4DxRoot {
+        hash_version,
+        indirect_levels,
+        entries,
+    })
+}
+
+/// Parse DX entries starting at `offset` in a block.
+///
+/// Each entry is 8 bytes: hash(4) + block(4). The list continues
+/// until we run out of space in the block.
+fn parse_dx_entries(data: &[u8], start: usize) -> Result<Vec<Ext4DxEntry>, ParseError> {
+    let mut entries = Vec::new();
+    let mut off = start;
+
+    // First, read count at start - 4 (the count/limit pair is 4 bytes before entries)
+    let count = if start >= 4 {
+        usize::from(read_le_u16(data, start - 4)?)
+    } else {
+        // Estimate: fill remaining space
+        (data.len() - start) / 8
+    };
+
+    for _ in 0..count {
+        if off + 8 > data.len() {
+            break;
+        }
+        let hash = read_le_u32(data, off)?;
+        let block = read_le_u32(data, off + 4)?;
+        entries.push(Ext4DxEntry { hash, block });
+        off += 8;
+    }
+
+    Ok(entries)
+}
+
+/// Find the leaf block for a given hash in a sorted DX entry list.
+///
+/// The entries are sorted by hash. We find the last entry whose hash <= target.
+/// Entry 0 is the sentinel (hash=0, points to the first data block), so
+/// for any hash, we always have at least one candidate.
+fn dx_find_leaf(entries: &[Ext4DxEntry], hash: u32) -> u32 {
+    // Binary search: find rightmost entry where entry.hash <= hash
+    let mut lo = 0_usize;
+    let mut hi = entries.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if entries[mid].hash <= hash {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // lo-1 is the rightmost entry with hash <= target (lo >= 1 due to sentinel)
+    if lo > 0 {
+        entries[lo - 1].block
+    } else {
+        entries[0].block
+    }
+}
+
+// ── ext4 directory hash functions ───────────────────────────────────────────
+
+/// Hash version constants from the ext4 DX root.
+const DX_HASH_LEGACY: u8 = 0;
+const DX_HASH_HALF_MD4: u8 = 1;
+const DX_HASH_TEA: u8 = 2;
+const DX_HASH_LEGACY_UNSIGNED: u8 = 3;
+const _DX_HASH_HALF_MD4_UNSIGNED: u8 = 4;
+const DX_HASH_TEA_UNSIGNED: u8 = 5;
+const _DX_HASH_SIPHASH: u8 = 6;
+
+/// Compute the ext4 directory hash for a filename.
+///
+/// Returns (major_hash, minor_hash). The `hash_version` selects the algorithm
+/// and whether characters are treated as signed or unsigned.
+#[must_use]
+pub fn dx_hash(hash_version: u8, name: &[u8], seed: &[u32; 4]) -> (u32, u32) {
+    match hash_version {
+        DX_HASH_LEGACY => dx_hash_legacy(name, true),
+        DX_HASH_LEGACY_UNSIGNED => dx_hash_legacy(name, false),
+        DX_HASH_HALF_MD4 => dx_hash_half_md4(name, seed, true),
+        DX_HASH_TEA => dx_hash_tea(name, seed, true),
+        DX_HASH_TEA_UNSIGNED => dx_hash_tea(name, seed, false),
+        // DX_HASH_HALF_MD4_UNSIGNED and any unknown versions default to half_md4 unsigned
+        _ => dx_hash_half_md4(name, seed, false),
+    }
+}
+
+/// Legacy (r5) hash function — simple polynomial hash.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // intentional signed char semantics
+fn dx_hash_legacy(name: &[u8], signed: bool) -> (u32, u32) {
+    let mut h0: u32 = 0x12a3_fe2d;
+    let mut h1: u32 = 0x37ab_e8f9;
+
+    for &b in name {
+        let val = if signed {
+            i32::from(b as i8) as u32
+        } else {
+            u32::from(b)
+        };
+        h0 = h0.wrapping_mul(16).wrapping_add(val);
+        h1 = h1.wrapping_mul(16).wrapping_add(val);
+    }
+
+    // Fold to produce major/minor
+    (h0 & !1, h1) // clear low bit of major (reserved by ext4)
+}
+
+/// Half-MD4 hash function — used by most ext4 filesystems.
+///
+/// This implements the str2hashbuf + half-MD4 transform from the kernel.
+#[allow(clippy::cast_possible_wrap)] // intentional signed char semantics
+fn dx_hash_half_md4(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
+    let buf = str2hashbuf(name, 8, signed);
+    let mut a = seed[0];
+    let mut b = seed[1];
+    let mut c = seed[2];
+    let mut d = seed[3];
+
+    half_md4_transform(&mut a, &mut b, &mut c, &mut d, &buf);
+
+    (a & !1, b) // clear low bit of major
+}
+
+/// TEA (Tiny Encryption Algorithm) hash — an alternative ext4 hash.
+#[allow(clippy::cast_possible_wrap)]
+fn dx_hash_tea(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
+    let buf = str2hashbuf(name, 4, signed);
+    let mut a = seed[0];
+    let mut b = seed[1];
+    let mut c = seed[2];
+    let mut d = seed[3];
+
+    tea_transform(&mut a, &mut b, &mut c, &mut d, &buf);
+
+    (a & !1, b)
+}
+
+/// Convert a filename to a u32 buffer for hashing.
+///
+/// The kernel's `str2hashbuf` packs characters into u32 words (little-endian),
+/// with optional signed character semantics.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn str2hashbuf(name: &[u8], buf_size: usize, signed: bool) -> Vec<u32> {
+    let mut buf = vec![0_u32; buf_size];
+    let mut idx = 0_usize;
+    let mut shift = 0_u32;
+
+    for &b in name {
+        let val = if signed {
+            (b as i8) as u32
+        } else {
+            u32::from(b)
+        };
+        buf[idx] |= val << shift;
+        shift += 8;
+        if shift >= 32 {
+            shift = 0;
+            idx += 1;
+            if idx >= buf_size {
+                break;
+            }
+        }
+    }
+
+    // Pad with 0x80 terminator like the kernel does
+    if idx < buf_size {
+        buf[idx] |= 0x80 << shift;
+    }
+
+    buf
+}
+
+/// Half-MD4 transform — the core of the half-MD4 hash.
+///
+/// This is a simplified version of MD4 that operates on a single 32-byte
+/// block (8 u32 words) and produces a 128-bit intermediate state.
+fn half_md4_transform(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32, buf: &[u32]) {
+    const K2: u32 = 0x5A82_7999; // Round 2 constant
+    const K3: u32 = 0x6ED9_EBA1; // Round 3 constant
+
+    // Ensure we have 8 words; pad with zero if shorter
+    let get = |i: usize| -> u32 { buf.get(i).copied().unwrap_or(0) };
+
+    // Round 1: F(x,y,z) = (x & y) | (!x & z)
+    macro_rules! ff {
+        ($a:expr, $b:expr, $c:expr, $d:expr, $k:expr, $s:expr) => {
+            $a = $a
+                .wrapping_add(($b & $c) | (!$b & $d))
+                .wrapping_add(get($k));
+            $a = $a.rotate_left($s);
+        };
+    }
+
+    ff!(*a, *b, *c, *d, 0, 3);
+    ff!(*d, *a, *b, *c, 1, 7);
+    ff!(*c, *d, *a, *b, 2, 11);
+    ff!(*b, *c, *d, *a, 3, 19);
+    ff!(*a, *b, *c, *d, 4, 3);
+    ff!(*d, *a, *b, *c, 5, 7);
+    ff!(*c, *d, *a, *b, 6, 11);
+    ff!(*b, *c, *d, *a, 7, 19);
+
+    // Round 2: G(x,y,z) = (x & y) | (x & z) | (y & z)
+    macro_rules! gg {
+        ($a:expr, $b:expr, $c:expr, $d:expr, $k:expr, $s:expr) => {
+            $a = $a
+                .wrapping_add(($b & $c) | ($b & $d) | ($c & $d))
+                .wrapping_add(get($k))
+                .wrapping_add(K2);
+            $a = $a.rotate_left($s);
+        };
+    }
+
+    gg!(*a, *b, *c, *d, 1, 3);
+    gg!(*d, *a, *b, *c, 3, 5);
+    gg!(*c, *d, *a, *b, 5, 9);
+    gg!(*b, *c, *d, *a, 7, 13);
+    gg!(*a, *b, *c, *d, 0, 3);
+    gg!(*d, *a, *b, *c, 2, 5);
+    gg!(*c, *d, *a, *b, 4, 9);
+    gg!(*b, *c, *d, *a, 6, 13);
+
+    // Round 3: H(x,y,z) = x ^ y ^ z
+    macro_rules! hh {
+        ($a:expr, $b:expr, $c:expr, $d:expr, $k:expr, $s:expr) => {
+            $a = $a
+                .wrapping_add($b ^ $c ^ $d)
+                .wrapping_add(get($k))
+                .wrapping_add(K3);
+            $a = $a.rotate_left($s);
+        };
+    }
+
+    hh!(*a, *b, *c, *d, 0, 3);
+    hh!(*d, *a, *b, *c, 4, 9);
+    hh!(*c, *d, *a, *b, 7, 11);
+    hh!(*b, *c, *d, *a, 2, 15);
+    hh!(*a, *b, *c, *d, 6, 3);
+    hh!(*d, *a, *b, *c, 1, 9);
+    hh!(*c, *d, *a, *b, 3, 11);
+    hh!(*b, *c, *d, *a, 5, 15);
+}
+
+/// TEA (Tiny Encryption Algorithm) transform.
+///
+/// Operates on 4 u32 words of input, modifying the state (a, b, c, d).
+fn tea_transform(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32, buf: &[u32]) {
+    let get = |i: usize| -> u32 { buf.get(i).copied().unwrap_or(0) };
+
+    let mut sum: u32 = 0;
+    let delta: u32 = 0x9E37_79B9;
+
+    // TEA uses the buf as "key" and the state as "data"
+    let k0 = get(0);
+    let k1 = get(1);
+    let k2 = get(2);
+    let k3 = get(3);
+
+    // 16 rounds of TEA on (a, b) pair
+    for _ in 0..16 {
+        sum = sum.wrapping_add(delta);
+        *a = a.wrapping_add(
+            (b.wrapping_shl(4).wrapping_add(k0))
+                ^ b.wrapping_add(sum)
+                ^ (b.wrapping_shr(5).wrapping_add(k1)),
+        );
+        *b = b.wrapping_add(
+            (a.wrapping_shl(4).wrapping_add(k2))
+                ^ a.wrapping_add(sum)
+                ^ (a.wrapping_shr(5).wrapping_add(k3)),
+        );
+    }
+
+    // 16 rounds on (c, d) pair
+    sum = 0;
+    for _ in 0..16 {
+        sum = sum.wrapping_add(delta);
+        *c = c.wrapping_add(
+            (d.wrapping_shl(4).wrapping_add(k0))
+                ^ d.wrapping_add(sum)
+                ^ (d.wrapping_shr(5).wrapping_add(k1)),
+        );
+        *d = d.wrapping_add(
+            (c.wrapping_shl(4).wrapping_add(k2))
+                ^ c.wrapping_add(sum)
+                ^ (c.wrapping_shr(5).wrapping_add(k3)),
+        );
     }
 }
 
@@ -2373,6 +3322,214 @@ mod tests {
         assert_eq!(Ext4FileType::from_raw(2), Ext4FileType::Dir);
         assert_eq!(Ext4FileType::from_raw(7), Ext4FileType::Symlink);
         assert_eq!(Ext4FileType::from_raw(255), Ext4FileType::Unknown);
+    }
+
+    // ── DirBlockIter tests ──────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_basic() {
+        let block_size = 4096_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        write_dir_entry(&mut block, 0, 2, 2, b".", 12);
+        write_dir_entry(&mut block, 12, 2, 2, b"..", 12);
+        let remaining = block_size as u16 - 24;
+        write_dir_entry(&mut block, 24, 12, 1, b"hello.txt", remaining);
+
+        let mut iter = iter_dir_block(&block, block_size);
+        let e0 = iter.next().unwrap().unwrap();
+        assert!(e0.is_dot());
+        assert_eq!(e0.inode, 2);
+
+        let e1 = iter.next().unwrap().unwrap();
+        assert!(e1.is_dotdot());
+
+        let e2 = iter.next().unwrap().unwrap();
+        assert_eq!(e2.name_str(), "hello.txt");
+        assert_eq!(e2.inode, 12);
+        assert_eq!(e2.file_type, Ext4FileType::RegFile);
+
+        assert!(iter.next().is_none());
+        assert!(iter.checksum_tail().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_with_checksum_tail() {
+        let block_size = 4096_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        let entry_rec_len = block_size as u16 - 12;
+        write_dir_entry(&mut block, 0, 2, 2, b".", entry_rec_len);
+
+        // Checksum tail
+        let tail_off = (block_size - 12) as usize;
+        block[tail_off..tail_off + 4].copy_from_slice(&0_u32.to_le_bytes());
+        block[tail_off + 4..tail_off + 6].copy_from_slice(&12_u16.to_le_bytes());
+        block[tail_off + 6] = 0;
+        block[tail_off + 7] = EXT4_FT_DIR_CSUM;
+        block[tail_off + 8..tail_off + 12].copy_from_slice(&0xCAFE_BABE_u32.to_le_bytes());
+
+        let mut iter = iter_dir_block(&block, block_size);
+        let e0 = iter.next().unwrap().unwrap();
+        assert!(e0.is_dot());
+        assert!(iter.next().is_none());
+        assert_eq!(iter.checksum_tail().unwrap().checksum, 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn dir_iter_empty_block() {
+        // All-zero block: every entry has inode=0, rec_len=0 → rec_len < 8 error
+        let block = vec![0_u8; 4096];
+        let mut iter = iter_dir_block(&block, 4096);
+        let result = iter.next().unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "de_rec_len",
+                    ..
+                }
+            ),
+            "expected rec_len error, got {err:?}",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_rec_len_zero() {
+        let mut block = vec![0_u8; 1024];
+        // Entry with inode=5 but rec_len=0
+        block[0..4].copy_from_slice(&5_u32.to_le_bytes());
+        block[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        block[6] = 1;
+        block[7] = 1;
+        block[8] = b'x';
+
+        let mut iter = iter_dir_block(&block, 1024);
+        let result = iter.next().unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "de_rec_len",
+                    reason,
+                } if reason.contains("< 8")
+            ),
+            "expected rec_len < 8 error, got {err:?}",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_rec_len_overflow() {
+        let block_size = 1024_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        block[0..4].copy_from_slice(&5_u32.to_le_bytes());
+        block[4..6].copy_from_slice(&2048_u16.to_le_bytes());
+        block[6] = 1;
+        block[7] = 1;
+        block[8] = b'x';
+
+        let mut iter = iter_dir_block(&block, block_size);
+        let result = iter.next().unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "de_rec_len",
+                    reason,
+                } if reason.contains("past block")
+            ),
+            "expected past-block error, got {err:?}",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_name_len_exceeds_rec_len() {
+        let block_size = 1024_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        // rec_len=12 but name_len=10 → 8 + 10 = 18 > 12
+        block[0..4].copy_from_slice(&5_u32.to_le_bytes());
+        block[4..6].copy_from_slice(&12_u16.to_le_bytes());
+        block[6] = 10;
+        block[7] = 1;
+
+        let mut iter = iter_dir_block(&block, block_size);
+        let result = iter.next().unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "de_name_len",
+                    ..
+                }
+            ),
+            "expected name_len error, got {err:?}",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_skips_deleted() {
+        let block_size = 1024_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        write_dir_entry(&mut block, 0, 5, 1, b"a", 12);
+        write_dir_entry(&mut block, 12, 0, 0, b"", 12);
+        let remaining = block_size as u16 - 24;
+        write_dir_entry(&mut block, 24, 6, 1, b"b", remaining);
+
+        let entries: Vec<_> = iter_dir_block(&block, block_size)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, b"a");
+        assert_eq!(entries[1].name, b"b");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_to_owned_roundtrip() {
+        let block_size = 4096_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        let remaining = block_size as u16;
+        write_dir_entry(&mut block, 0, 42, 1, b"testfile", remaining);
+
+        let entry_ref = iter_dir_block(&block, block_size).next().unwrap().unwrap();
+        let owned = entry_ref.to_owned();
+        assert_eq!(owned.inode, 42);
+        assert_eq!(owned.name, b"testfile");
+        assert_eq!(owned.file_type, Ext4FileType::RegFile);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_last_entry_fills_block() {
+        let block_size = 1024_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        write_dir_entry(&mut block, 0, 11, 2, b"only_entry", block_size as u16);
+
+        let entries: Vec<_> = iter_dir_block(&block, block_size)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"only_entry");
+        assert_eq!(entries[0].file_type, Ext4FileType::Dir);
     }
 
     // ── Ext4ImageReader integration test ────────────────────────────────
@@ -2966,5 +4123,519 @@ mod tests {
         let n = reader.read_inode_data(&image, &inode, 0, &mut buf).unwrap();
         assert_eq!(n, 8192);
         assert!(buf.iter().all(|&b| b == b'A'));
+    }
+
+    // ── Inode type helper tests ─────────────────────────────────────────
+
+    #[test]
+    fn inode_type_helpers() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let root = reader
+            .read_inode(&image, ffs_types::InodeNumber(2))
+            .unwrap();
+        assert!(root.is_dir());
+        assert!(!root.is_regular());
+        assert!(!root.is_symlink());
+        assert_eq!(root.file_type_mode(), ffs_types::S_IFDIR);
+        assert_eq!(root.permission_bits(), 0o755);
+
+        let hello = reader
+            .read_inode(&image, ffs_types::InodeNumber(11))
+            .unwrap();
+        assert!(hello.is_regular());
+        assert!(!hello.is_dir());
+        assert!(!hello.is_symlink());
+        assert_eq!(hello.file_type_mode(), ffs_types::S_IFREG);
+        assert_eq!(hello.permission_bits(), 0o644);
+    }
+
+    // ── Symlink tests ───────────────────────────────────────────────────
+
+    /// Build a test image with symlinks added.
+    ///
+    /// Extends build_test_image with:
+    ///   /link (inode 14): fast symlink → "hello.txt" (9 bytes, stored inline)
+    ///   /longlink (inode 15): extent-mapped symlink → long target at block 50
+    ///   Root dir updated with "link" and "longlink" entries.
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    fn build_symlink_test_image() -> Vec<u8> {
+        let block_size = 4096_usize;
+        let image_blocks = 64;
+        let mut image = vec![0_u8; block_size * image_blocks];
+
+        // ── Superblock ──────────────────────────────────────────────────
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes());
+        sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes());
+        sb[0x04..0x08].copy_from_slice(&(image_blocks as u32).to_le_bytes());
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes());
+        sb[0x20..0x24].copy_from_slice(&(image_blocks as u32).to_le_bytes());
+        sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes());
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes());
+        sb[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes());
+        image[sb_off..sb_off + EXT4_SUPERBLOCK_SIZE].copy_from_slice(&sb);
+
+        // ── Group descriptor ────────────────────────────────────────────
+        let gdt_off = block_size;
+        let mut gd = [0_u8; 32];
+        gd[0x08..0x0C].copy_from_slice(&2_u32.to_le_bytes());
+        image[gdt_off..gdt_off + 32].copy_from_slice(&gd);
+
+        let itable_off = 2 * block_size;
+        let inode_size = 256_usize;
+
+        // Write an inode with extent mapping
+        let write_ext_inode = |img: &mut Vec<u8>,
+                               ino: u32,
+                               mode: u16,
+                               size: u64,
+                               links: u16,
+                               flags: u32,
+                               extent_block: u32,
+                               extent_len: u16| {
+            let off = itable_off + (ino as usize - 1) * inode_size;
+            img[off..off + 2].copy_from_slice(&mode.to_le_bytes());
+            img[off + 0x04..off + 0x08].copy_from_slice(&(size as u32).to_le_bytes());
+            img[off + 0x6C..off + 0x70].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+            img[off + 0x1A..off + 0x1C].copy_from_slice(&links.to_le_bytes());
+            img[off + 0x20..off + 0x24].copy_from_slice(&flags.to_le_bytes());
+            img[off + 0x64..off + 0x68].copy_from_slice(&1_u32.to_le_bytes());
+
+            let eh = off + 0x28;
+            img[eh..eh + 2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes());
+            img[eh + 2..eh + 4].copy_from_slice(&1_u16.to_le_bytes());
+            img[eh + 4..eh + 6].copy_from_slice(&4_u16.to_le_bytes());
+            img[eh + 6..eh + 8].copy_from_slice(&0_u16.to_le_bytes());
+            let ee = eh + 12;
+            img[ee..ee + 4].copy_from_slice(&0_u32.to_le_bytes());
+            img[ee + 4..ee + 6].copy_from_slice(&extent_len.to_le_bytes());
+            img[ee + 6..ee + 8].copy_from_slice(&0_u16.to_le_bytes());
+            img[ee + 8..ee + 12].copy_from_slice(&extent_block.to_le_bytes());
+        };
+
+        // Write a fast symlink inode (target stored in i_block area, NO extents flag)
+        let write_fast_symlink = |img: &mut Vec<u8>, ino: u32, target: &[u8]| {
+            let off = itable_off + (ino as usize - 1) * inode_size;
+            img[off..off + 2].copy_from_slice(&0o120_777_u16.to_le_bytes()); // symlink mode
+            img[off + 0x04..off + 0x08].copy_from_slice(&(target.len() as u32).to_le_bytes());
+            img[off + 0x6C..off + 0x70].copy_from_slice(&0_u32.to_le_bytes()); // size_hi=0
+            img[off + 0x1A..off + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+            img[off + 0x20..off + 0x24].copy_from_slice(&0_u32.to_le_bytes()); // NO extents flag
+            img[off + 0x64..off + 0x68].copy_from_slice(&1_u32.to_le_bytes());
+            // Write target into i_block area (offset 0x28, 60 bytes)
+            let ib = off + 0x28;
+            img[ib..ib + target.len()].copy_from_slice(target);
+        };
+
+        // Root dir (inode 2)
+        write_ext_inode(&mut image, 2, 0o040_755, 4096, 4, 0x0008_0000, 10, 1);
+
+        // hello.txt (inode 11)
+        write_ext_inode(&mut image, 11, 0o100_644, 18, 1, 0x0008_0000, 20, 1);
+
+        // subdir (inode 12)
+        write_ext_inode(&mut image, 12, 0o040_755, 4096, 2, 0x0008_0000, 30, 1);
+
+        // deep.txt (inode 13)
+        write_ext_inode(&mut image, 13, 0o100_644, 8192, 1, 0x0008_0000, 40, 2);
+
+        // Fast symlink (inode 14): target = "hello.txt" (9 bytes, fits in i_block)
+        write_fast_symlink(&mut image, 14, b"hello.txt");
+
+        // Extent-mapped symlink (inode 15): long target at block 50
+        let long_target = b"/subdir/deep.txt";
+        write_ext_inode(
+            &mut image,
+            15,
+            0o120_777,
+            long_target.len() as u64,
+            1,
+            0x0008_0000,
+            50,
+            1,
+        );
+
+        // ── Root directory data (block 10) ──────────────────────────────
+        let root_blk = 10 * block_size;
+        write_dir_entry(&mut image, root_blk, 2, 2, b".", 12);
+        write_dir_entry(&mut image, root_blk + 12, 2, 2, b"..", 12);
+        write_dir_entry(&mut image, root_blk + 24, 11, 1, b"hello.txt", 24);
+        write_dir_entry(&mut image, root_blk + 48, 12, 2, b"subdir", 20);
+        write_dir_entry(&mut image, root_blk + 68, 14, 7, b"link", 16);
+        let remaining: u16 = 4096 - 12 - 12 - 24 - 20 - 16;
+        write_dir_entry(&mut image, root_blk + 84, 15, 7, b"longlink", remaining);
+
+        // ── File data ───────────────────────────────────────────────────
+        let hello_blk = 20 * block_size;
+        image[hello_blk..hello_blk + 18].copy_from_slice(b"Hello, FrankenFS!\n");
+
+        let sub_blk = 30 * block_size;
+        write_dir_entry(&mut image, sub_blk, 12, 2, b".", 12);
+        write_dir_entry(&mut image, sub_blk + 12, 2, 2, b"..", 12);
+        let remaining: u16 = 4096 - 12 - 12;
+        write_dir_entry(&mut image, sub_blk + 24, 13, 1, b"deep.txt", remaining);
+
+        let deep_blk = 40 * block_size;
+        image[deep_blk..deep_blk + 8192].fill(b'A');
+
+        // Long symlink target data at block 50
+        let link_blk = 50 * block_size;
+        image[link_blk..link_blk + long_target.len()].copy_from_slice(long_target);
+
+        image
+    }
+
+    #[test]
+    fn fast_symlink_detection_and_reading() {
+        let image = build_symlink_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let link_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(14))
+            .unwrap();
+
+        assert!(link_inode.is_symlink());
+        assert!(link_inode.is_fast_symlink());
+        assert!(!link_inode.uses_extents());
+
+        let target = link_inode.fast_symlink_target().unwrap();
+        assert_eq!(target, b"hello.txt");
+
+        let target_via_reader = reader.read_symlink(&image, &link_inode).unwrap();
+        assert_eq!(target_via_reader, b"hello.txt");
+    }
+
+    #[test]
+    fn extent_mapped_symlink_reading() {
+        let image = build_symlink_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let link_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(15))
+            .unwrap();
+
+        assert!(link_inode.is_symlink());
+        assert!(!link_inode.is_fast_symlink()); // has extents flag
+        assert!(link_inode.uses_extents());
+
+        let target = reader.read_symlink(&image, &link_inode).unwrap();
+        assert_eq!(target, b"/subdir/deep.txt");
+    }
+
+    #[test]
+    fn read_symlink_rejects_non_symlink() {
+        let image = build_symlink_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let hello = reader
+            .read_inode(&image, ffs_types::InodeNumber(11))
+            .unwrap();
+        assert!(reader.read_symlink(&image, &hello).is_err());
+    }
+
+    #[test]
+    fn resolve_path_follow_through_fast_symlink() {
+        let image = build_symlink_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        // /link → "hello.txt" (relative symlink, resolves to /hello.txt)
+        let (ino, inode) = reader.resolve_path_follow(&image, "/link").unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(11));
+        assert!(inode.is_regular());
+        assert_eq!(inode.size, 18);
+    }
+
+    #[test]
+    fn resolve_path_follow_through_absolute_symlink() {
+        let image = build_symlink_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        // /longlink → "/subdir/deep.txt" (absolute symlink)
+        let (ino, inode) = reader.resolve_path_follow(&image, "/longlink").unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(13));
+        assert!(inode.is_regular());
+        assert_eq!(inode.size, 8192);
+    }
+
+    #[test]
+    fn resolve_path_follow_non_symlink_unchanged() {
+        let image = build_symlink_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let (ino, _) = reader.resolve_path_follow(&image, "/hello.txt").unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(11));
+
+        let (ino, _) = reader
+            .resolve_path_follow(&image, "/subdir/deep.txt")
+            .unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(13));
+    }
+
+    // ── Xattr parsing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_xattr_entries_basic() {
+        // Build a minimal xattr entry: name_index=1 (user), name="test", value="val"
+        let mut data = vec![0_u8; 256];
+
+        // Entry header (16 bytes):
+        data[0] = 4; // name_len=4
+        data[1] = 1; // name_index=1 (user)
+        data[2..4].copy_from_slice(&128_u16.to_le_bytes()); // value_offs=128
+        data[4..8].copy_from_slice(&3_u32.to_le_bytes()); // value_size=3
+        data[8..12].copy_from_slice(&0_u32.to_le_bytes()); // hash (unused)
+        // 12..16 reserved
+        // Name: "test" at byte 16
+        data[16..20].copy_from_slice(b"test");
+
+        // Value at offset 128: "val"
+        data[128..131].copy_from_slice(b"val");
+
+        // Terminator at byte 20 (padded: 16 + 4 = 20, already 4-byte aligned)
+        data[20] = 0; // name_len=0
+        data[21] = 0; // name_index=0
+
+        let entries = super::parse_xattr_entries(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name_index, 1);
+        assert_eq!(entries[0].name, b"test");
+        assert_eq!(entries[0].value, b"val");
+        assert_eq!(entries[0].full_name(), "user.test");
+    }
+
+    #[test]
+    fn parse_xattr_entries_multiple() {
+        let mut data = vec![0_u8; 512];
+
+        // Entry 1: security.selinux = "context"
+        data[0] = 7; // name_len
+        data[1] = ffs_types::EXT4_XATTR_INDEX_SECURITY;
+        data[2..4].copy_from_slice(&200_u16.to_le_bytes());
+        data[4..8].copy_from_slice(&7_u32.to_le_bytes());
+        data[16..23].copy_from_slice(b"selinux");
+        data[200..207].copy_from_slice(b"context");
+
+        // Entry 2 at byte 24 (16 + 7 rounded up to 24): user.mime = "text"
+        data[24] = 4;
+        data[25] = ffs_types::EXT4_XATTR_INDEX_USER;
+        data[26..28].copy_from_slice(&250_u16.to_le_bytes());
+        data[28..32].copy_from_slice(&4_u32.to_le_bytes());
+        data[40..44].copy_from_slice(b"mime");
+        data[250..254].copy_from_slice(b"text");
+
+        // Terminator at byte 44 (24 + 16 + 4 = 44)
+        data[44] = 0;
+        data[45] = 0;
+
+        let entries = super::parse_xattr_entries(&data).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].full_name(), "security.selinux");
+        assert_eq!(entries[0].value, b"context");
+        assert_eq!(entries[1].full_name(), "user.mime");
+        assert_eq!(entries[1].value, b"text");
+    }
+
+    #[test]
+    fn parse_xattr_entries_empty() {
+        // Just a terminator
+        let data = [0_u8; 4];
+        let entries = super::parse_xattr_entries(&data).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn xattr_ibody_magic_check() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        // The test image inodes don't have xattr magic, so should return empty
+        let inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(2))
+            .unwrap();
+        let xattrs = reader.read_xattrs_ibody(&inode).unwrap();
+        assert!(xattrs.is_empty());
+    }
+
+    // ── DX hash function tests ──────────────────────────────────────────
+
+    #[test]
+    fn dx_hash_legacy_basic() {
+        let (h, _) = super::dx_hash_legacy(b"hello", false);
+        assert_ne!(h, 0);
+
+        // Same input produces same hash
+        let (h2, _) = super::dx_hash_legacy(b"hello", false);
+        assert_eq!(h, h2);
+
+        // Different input produces different hash
+        let (h3, _) = super::dx_hash_legacy(b"world", false);
+        assert_ne!(h, h3);
+
+        // Low bit should be cleared (ext4 convention)
+        assert_eq!(h & 1, 0);
+    }
+
+    #[test]
+    fn dx_hash_half_md4_basic() {
+        let seed = [0x1234_5678, 0x9abc_def0, 0xfedc_ba98, 0x7654_3210];
+
+        let (h, _) = super::dx_hash_half_md4(b"testfile.txt", &seed, false);
+        assert_ne!(h, 0);
+        assert_eq!(h & 1, 0); // low bit cleared
+
+        // Deterministic
+        let (h2, _) = super::dx_hash_half_md4(b"testfile.txt", &seed, false);
+        assert_eq!(h, h2);
+
+        // Different name gives different hash
+        let (h3, _) = super::dx_hash_half_md4(b"otherfile.txt", &seed, false);
+        assert_ne!(h, h3);
+    }
+
+    #[test]
+    fn dx_hash_tea_basic() {
+        let seed = [0xAAAA_BBBB, 0xCCCC_DDDD, 0xEEEE_FFFF, 0x1111_2222];
+
+        let (h, _) = super::dx_hash_tea(b"example", &seed, false);
+        assert_ne!(h, 0);
+        assert_eq!(h & 1, 0);
+
+        let (h2, _) = super::dx_hash_tea(b"example", &seed, false);
+        assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn dx_hash_signed_vs_unsigned() {
+        let seed = [0, 0, 0, 0];
+        // Filename with high-bit bytes (like UTF-8 encoded chars)
+        let name = b"\xc3\xa9"; // é in UTF-8
+
+        let (h_signed, _) = super::dx_hash_half_md4(name, &seed, true);
+        let (h_unsigned, _) = super::dx_hash_half_md4(name, &seed, false);
+
+        // Signed vs unsigned should produce different hashes for high-bit bytes
+        assert_ne!(h_signed, h_unsigned);
+    }
+
+    #[test]
+    fn dx_hash_dispatcher() {
+        let seed = [1, 2, 3, 4];
+        let name = b"test";
+
+        // The dispatcher should route to the correct function
+        let (h_legacy, _) = super::dx_hash(0, name, &seed);
+        let (h_legacy_direct, _) = super::dx_hash_legacy(name, true);
+        assert_eq!(h_legacy, h_legacy_direct);
+
+        let (h_hmd4, _) = super::dx_hash(1, name, &seed);
+        let (h_hmd4_direct, _) = super::dx_hash_half_md4(name, &seed, true);
+        assert_eq!(h_hmd4, h_hmd4_direct);
+
+        let (h_tea, _) = super::dx_hash(2, name, &seed);
+        let (h_tea_direct, _) = super::dx_hash_tea(name, &seed, true);
+        assert_eq!(h_tea, h_tea_direct);
+    }
+
+    // ── DX root parsing tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_dx_root_basic() {
+        let mut block = vec![0_u8; 4096];
+
+        // Fake "." dir entry at 0x00 (12 bytes)
+        write_dir_entry(&mut block, 0, 2, 2, b".", 12);
+        // Fake ".." dir entry at 0x0C (12 bytes, but rec_len covers to 0x1C)
+        write_dir_entry(&mut block, 12, 2, 2, b"..", 12);
+
+        // DX root info at 0x18 (after ".." dir entry header)
+        // Actually, the root info is at fixed offset 0x1C
+        block[0x1C] = 1; // hash_version = half_md4
+        block[0x1D] = 8; // info_length = 8
+        block[0x1E] = 0; // indirect_levels = 0
+        block[0x1F] = 0; // unused_flags
+
+        // count/limit at 0x20
+        block[0x20..0x22].copy_from_slice(&3_u16.to_le_bytes()); // count=3
+        block[0x22..0x24].copy_from_slice(&100_u16.to_le_bytes()); // limit=100
+
+        // Entry 0 (sentinel): hash=0, block=1
+        block[0x24..0x28].copy_from_slice(&0_u32.to_le_bytes());
+        block[0x28..0x2C].copy_from_slice(&1_u32.to_le_bytes());
+
+        // Entry 1: hash=0x1000, block=2
+        block[0x2C..0x30].copy_from_slice(&0x1000_u32.to_le_bytes());
+        block[0x30..0x34].copy_from_slice(&2_u32.to_le_bytes());
+
+        // Entry 2: hash=0x8000, block=3
+        block[0x34..0x38].copy_from_slice(&0x8000_u32.to_le_bytes());
+        block[0x38..0x3C].copy_from_slice(&3_u32.to_le_bytes());
+
+        let root = parse_dx_root(&block).unwrap();
+        assert_eq!(root.hash_version, 1);
+        assert_eq!(root.indirect_levels, 0);
+        assert_eq!(root.entries.len(), 3);
+        assert_eq!(root.entries[0].hash, 0);
+        assert_eq!(root.entries[0].block, 1);
+        assert_eq!(root.entries[1].hash, 0x1000);
+        assert_eq!(root.entries[2].hash, 0x8000);
+    }
+
+    #[test]
+    fn dx_find_leaf_basic() {
+        let entries = vec![
+            Ext4DxEntry { hash: 0, block: 1 }, // sentinel
+            Ext4DxEntry {
+                hash: 0x1000,
+                block: 2,
+            },
+            Ext4DxEntry {
+                hash: 0x8000,
+                block: 3,
+            },
+        ];
+
+        // Hash 0x500: between sentinel(0) and entry(0x1000) → block 1
+        assert_eq!(super::dx_find_leaf(&entries, 0x500), 1);
+
+        // Hash 0x1000: exact match → block 2
+        assert_eq!(super::dx_find_leaf(&entries, 0x1000), 2);
+
+        // Hash 0x5000: between 0x1000 and 0x8000 → block 2
+        assert_eq!(super::dx_find_leaf(&entries, 0x5000), 2);
+
+        // Hash 0x8000: exact match → block 3
+        assert_eq!(super::dx_find_leaf(&entries, 0x8000), 3);
+
+        // Hash 0xFFFF: past all entries → block 3
+        assert_eq!(super::dx_find_leaf(&entries, 0xFFFF), 3);
+
+        // Hash 0: match sentinel → block 1
+        assert_eq!(super::dx_find_leaf(&entries, 0), 1);
+    }
+
+    #[test]
+    fn str2hashbuf_basic() {
+        let buf = super::str2hashbuf(b"abc", 4, false);
+        assert_eq!(buf.len(), 4);
+        // "abc" packs into first word: 'a'=0x61, 'b'=0x62, 'c'=0x63
+        // plus 0x80 terminator in byte 3
+        let expected = 0x61_u32 | (0x62 << 8) | (0x63 << 16) | (0x80 << 24);
+        assert_eq!(buf[0], expected);
+        assert_eq!(buf[1], 0); // remaining words are 0
+    }
+
+    #[test]
+    fn str2hashbuf_signed_chars() {
+        // 0xC3 as signed i8 is -61 (0xFFFFFFC3 as u32)
+        let buf_signed = super::str2hashbuf(b"\xC3", 4, true);
+        let buf_unsigned = super::str2hashbuf(b"\xC3", 4, false);
+
+        // Signed: 0xC3 sign-extended + 0x80 terminator at byte 1
+        // Unsigned: 0xC3 zero-extended + 0x80 terminator at byte 1
+        assert_ne!(buf_signed[0], buf_unsigned[0]);
     }
 }
