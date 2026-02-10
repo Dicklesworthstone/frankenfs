@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use ffs_ondisk::{
-    BtrfsSuperblock, Ext4DirEntry, Ext4GroupDesc, Ext4Inode, Ext4Superblock, parse_dir_block,
+    BtrfsHeader, BtrfsItem, BtrfsSuperblock, Ext4DirEntry, Ext4GroupDesc, Ext4Inode,
+    Ext4Superblock, map_logical_to_physical, parse_dir_block, parse_leaf_items,
+    parse_sys_chunk_array,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -29,7 +31,7 @@ impl ParityReport {
     pub fn current() -> Self {
         let domains = vec![
             CoverageDomain::new("ext4 metadata parsing", 9, 19),
-            CoverageDomain::new("btrfs metadata parsing", 4, 20),
+            CoverageDomain::new("btrfs metadata parsing", 7, 20),
             CoverageDomain::new("MVCC/COW core", 4, 14),
             CoverageDomain::new("FUSE surface", 6, 12),
             CoverageDomain::new("self-healing durability policy", 2, 10),
@@ -142,6 +144,41 @@ pub fn validate_dir_block_fixture(path: &Path, block_size: u32) -> Result<Vec<Ex
     Ok(entries)
 }
 
+/// Validate a btrfs superblock fixture that contains a sys_chunk_array,
+/// parse the chunk array, and map logical addresses to physical.
+pub fn validate_btrfs_chunk_fixture(
+    path: &Path,
+) -> Result<(BtrfsSuperblock, Vec<ffs_ondisk::BtrfsChunkEntry>)> {
+    let data = load_sparse_fixture(path)?;
+    let sb = BtrfsSuperblock::parse_superblock_region(&data)
+        .with_context(|| format!("failed btrfs parse for fixture {}", path.display()))?;
+    let chunks = parse_sys_chunk_array(&sb.sys_chunk_array)
+        .with_context(|| format!("failed chunk parse for fixture {}", path.display()))?;
+    // Verify mapping is functional for root and chunk_root
+    for (name, addr) in [("root", sb.root), ("chunk_root", sb.chunk_root)] {
+        if addr != 0 {
+            let _mapping = map_logical_to_physical(&chunks, addr).with_context(|| {
+                format!(
+                    "mapping {name} ({addr:#x}) failed for fixture {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok((sb, chunks))
+}
+
+/// Validate a btrfs leaf node fixture, returning the parsed header and items.
+pub fn validate_btrfs_leaf_fixture(path: &Path) -> Result<(BtrfsHeader, Vec<BtrfsItem>)> {
+    let data = load_sparse_fixture(path)?;
+    let (header, items) = parse_leaf_items(&data)
+        .with_context(|| format!("failed leaf parse for fixture {}", path.display()))?;
+    header
+        .validate(data.len(), None)
+        .with_context(|| format!("header validation failed for fixture {}", path.display()))?;
+    Ok((header, items))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +274,49 @@ mod tests {
         assert_eq!(entries[1].inode, 2);
         assert_eq!(entries[2].name_str(), "hello.txt");
         assert_eq!(entries[2].inode, 11);
+    }
+
+    #[test]
+    fn btrfs_chunk_fixture_parses() {
+        let path = fixture_path("btrfs_superblock_with_chunks.json");
+        let (sb, chunks) = validate_btrfs_chunk_fixture(&path).expect("btrfs chunk fixture parse");
+        assert_eq!(sb.magic, ffs_types::BTRFS_MAGIC);
+        assert_eq!(sb.label, "ffs-chunks");
+        assert_eq!(sb.sys_chunk_array_size, 97);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].key.objectid, 256);
+        assert_eq!(chunks[0].key.item_type, 228);
+        assert_eq!(chunks[0].length, 8 * 1024 * 1024);
+        assert_eq!(chunks[0].stripes[0].devid, 1);
+        assert_eq!(chunks[0].stripes[0].offset, 0x10_0000);
+    }
+
+    #[test]
+    fn btrfs_chunk_mapping_covers_root() {
+        let path = fixture_path("btrfs_superblock_with_chunks.json");
+        let (sb, chunks) = validate_btrfs_chunk_fixture(&path).expect("btrfs chunk fixture parse");
+        // root=0x4000 is within chunk [0, 8MiB), mapped to physical [1MiB, 9MiB)
+        let mapping = ffs_ondisk::map_logical_to_physical(&chunks, sb.root)
+            .expect("mapping ok")
+            .expect("root should be covered");
+        assert_eq!(mapping.devid, 1);
+        assert_eq!(mapping.physical, 0x10_0000 + sb.root);
+    }
+
+    #[test]
+    fn btrfs_leaf_fixture_parses() {
+        let path = fixture_path("btrfs_leaf_node.json");
+        let (header, items) = validate_btrfs_leaf_fixture(&path).expect("btrfs leaf fixture parse");
+        assert_eq!(header.level, 0);
+        assert_eq!(header.nritems, 3);
+        assert_eq!(header.owner, 5);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].key.objectid, 256);
+        assert_eq!(items[0].key.item_type, 1);
+        assert_eq!(items[1].key.objectid, 256);
+        assert_eq!(items[1].key.item_type, 12);
+        assert_eq!(items[2].key.objectid, 257);
+        assert_eq!(items[2].key.item_type, 1);
     }
 
     #[test]

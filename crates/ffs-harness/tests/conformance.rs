@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use ffs_harness::{
-    ParityReport, validate_btrfs_fixture, validate_dir_block_fixture, validate_ext4_fixture,
+    ParityReport, validate_btrfs_chunk_fixture, validate_btrfs_fixture,
+    validate_btrfs_leaf_fixture, validate_dir_block_fixture, validate_ext4_fixture,
     validate_group_desc_fixture, validate_inode_fixture,
 };
 use std::path::Path;
@@ -74,6 +75,40 @@ fn ext4_dir_block_fixture_conforms() {
         validate_dir_block_fixture(&fixture_path("ext4_dir_block.json"), 4096).expect("dir block");
     assert!(entries.len() >= 3, "should have at least 3 entries");
     assert!(entries.iter().any(|e| e.name_str() == "hello.txt"));
+}
+
+#[test]
+fn btrfs_chunk_mapping_fixture_conforms() {
+    let (sb, chunks) =
+        validate_btrfs_chunk_fixture(&fixture_path("btrfs_superblock_with_chunks.json"))
+            .expect("btrfs chunk fixture");
+    assert!(!chunks.is_empty(), "should have at least one chunk entry");
+    // root and chunk_root should be mappable
+    let root_map = ffs_ondisk::map_logical_to_physical(&chunks, sb.root)
+        .expect("mapping ok")
+        .expect("root covered");
+    assert_eq!(root_map.devid, 1);
+    let cr_map = ffs_ondisk::map_logical_to_physical(&chunks, sb.chunk_root)
+        .expect("mapping ok")
+        .expect("chunk_root covered");
+    assert_eq!(cr_map.devid, 1);
+}
+
+#[test]
+fn btrfs_leaf_fixture_conforms() {
+    let (header, items) = validate_btrfs_leaf_fixture(&fixture_path("btrfs_leaf_node.json"))
+        .expect("btrfs leaf fixture");
+    assert_eq!(header.level, 0, "should be a leaf");
+    assert!(items.len() >= 3, "should have at least 3 items");
+    // Items should be sorted by key (objectid then type)
+    for pair in items.windows(2) {
+        let a = &pair[0].key;
+        let b = &pair[1].key;
+        assert!(
+            (a.objectid, a.item_type) <= (b.objectid, b.item_type),
+            "items should be sorted by key"
+        );
+    }
 }
 
 #[test]
