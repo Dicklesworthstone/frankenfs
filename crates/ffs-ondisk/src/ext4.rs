@@ -1391,6 +1391,52 @@ impl Ext4Inode {
     pub fn crtime_full(&self) -> (i64, u32) {
         Self::timestamp_full(self.crtime, self.crtime_extra)
     }
+
+    /// Convert a (seconds, nanoseconds) pair to `SystemTime`.
+    ///
+    /// Negative seconds produce times before `UNIX_EPOCH` (pre-1970).
+    /// Returns `None` for timestamps that overflow `SystemTime`'s range.
+    #[must_use]
+    pub fn to_system_time(secs: i64, nsec: u32) -> Option<std::time::SystemTime> {
+        use std::time::{Duration, UNIX_EPOCH};
+        if secs >= 0 {
+            let secs = u64::try_from(secs).ok()?;
+            UNIX_EPOCH.checked_add(Duration::new(secs, nsec))
+        } else {
+            let abs = u64::try_from(secs.checked_neg()?).ok()?;
+            UNIX_EPOCH
+                .checked_sub(Duration::new(abs, 0))?
+                .checked_add(Duration::new(0, nsec))
+        }
+    }
+
+    /// Access time as `SystemTime`. Falls back to `UNIX_EPOCH` on overflow.
+    #[must_use]
+    pub fn atime_system_time(&self) -> std::time::SystemTime {
+        let (s, ns) = self.atime_full();
+        Self::to_system_time(s, ns).unwrap_or(std::time::UNIX_EPOCH)
+    }
+
+    /// Modification time as `SystemTime`. Falls back to `UNIX_EPOCH` on overflow.
+    #[must_use]
+    pub fn mtime_system_time(&self) -> std::time::SystemTime {
+        let (s, ns) = self.mtime_full();
+        Self::to_system_time(s, ns).unwrap_or(std::time::UNIX_EPOCH)
+    }
+
+    /// Inode change time as `SystemTime`. Falls back to `UNIX_EPOCH` on overflow.
+    #[must_use]
+    pub fn ctime_system_time(&self) -> std::time::SystemTime {
+        let (s, ns) = self.ctime_full();
+        Self::to_system_time(s, ns).unwrap_or(std::time::UNIX_EPOCH)
+    }
+
+    /// Creation time as `SystemTime`. Falls back to `UNIX_EPOCH` on overflow.
+    #[must_use]
+    pub fn crtime_system_time(&self) -> std::time::SystemTime {
+        let (s, ns) = self.crtime_full();
+        Self::to_system_time(s, ns).unwrap_or(std::time::UNIX_EPOCH)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5038,5 +5084,202 @@ mod tests {
             reason.contains("ENCRYPT") || reason.contains("unsupported"),
             "expected actionable error, got: {reason}",
         );
+    }
+
+    // ── Inode parsing edge-case tests ───────────────────────────────────
+
+    /// Build a minimal 128-byte inode buffer (no extended area).
+    fn make_inode_128() -> [u8; 128] {
+        let mut buf = [0_u8; 128];
+        // mode = 0o100644 (regular file)
+        buf[0x00..0x02].copy_from_slice(&0o100_644_u16.to_le_bytes());
+        // uid_lo = 1000
+        buf[0x02..0x04].copy_from_slice(&1000_u16.to_le_bytes());
+        // size_lo = 42
+        buf[0x04..0x08].copy_from_slice(&42_u32.to_le_bytes());
+        // atime = 1_700_000_000 (2023-11-14)
+        buf[0x08..0x0C].copy_from_slice(&1_700_000_000_u32.to_le_bytes());
+        // ctime = 1_700_000_001
+        buf[0x0C..0x10].copy_from_slice(&1_700_000_001_u32.to_le_bytes());
+        // mtime = 1_700_000_002
+        buf[0x10..0x14].copy_from_slice(&1_700_000_002_u32.to_le_bytes());
+        // gid_lo = 1000
+        buf[0x18..0x1A].copy_from_slice(&1000_u16.to_le_bytes());
+        // links_count = 1
+        buf[0x1A..0x1C].copy_from_slice(&1_u16.to_le_bytes());
+        // blocks_lo = 8
+        buf[0x1C..0x20].copy_from_slice(&8_u32.to_le_bytes());
+        // flags = EXTENTS
+        buf[0x20..0x24].copy_from_slice(&EXT4_EXTENTS_FL.to_le_bytes());
+        // generation = 7
+        buf[0x64..0x68].copy_from_slice(&7_u32.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn inode_parse_128_byte_base() {
+        let buf = make_inode_128();
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert_eq!(inode.mode, 0o100_644);
+        assert_eq!(inode.uid, 1000);
+        assert_eq!(inode.gid, 1000);
+        assert_eq!(inode.size, 42);
+        assert_eq!(inode.links_count, 1);
+        assert_eq!(inode.blocks, 8);
+        assert_eq!(inode.generation, 7);
+        assert!(inode.is_regular());
+        assert!(!inode.is_dir());
+        assert_eq!(inode.permission_bits(), 0o644);
+    }
+
+    #[test]
+    fn inode_parse_insufficient_data() {
+        // Less than 128 bytes should produce InsufficientData.
+        let buf = [0_u8; 64];
+        let err = Ext4Inode::parse_from_bytes(&buf).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InsufficientData { .. }),
+            "expected InsufficientData, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn inode_parse_empty_slice() {
+        let err = Ext4Inode::parse_from_bytes(&[]).unwrap_err();
+        assert!(matches!(err, ParseError::InsufficientData { .. }));
+    }
+
+    #[test]
+    fn inode_128_byte_has_zero_extra_fields() {
+        let buf = make_inode_128();
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        // No extended area: extra fields should be zero.
+        assert_eq!(inode.extra_isize, 0);
+        assert_eq!(inode.atime_extra, 0);
+        assert_eq!(inode.ctime_extra, 0);
+        assert_eq!(inode.mtime_extra, 0);
+        assert_eq!(inode.crtime, 0);
+        assert_eq!(inode.crtime_extra, 0);
+        assert_eq!(inode.projid, 0);
+    }
+
+    #[test]
+    fn inode_256_byte_with_extended_timestamps() {
+        let mut buf = [0_u8; 256];
+        buf[..128].copy_from_slice(&make_inode_128());
+        // extra_isize = 32 (standard for modern ext4)
+        buf[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+        // ctime_extra: epoch=0, nsec=500_000_000 (0.5s) -> (500_000_000 << 2) | 0
+        let ctime_extra = 500_000_000_u32 << 2;
+        buf[0x84..0x88].copy_from_slice(&ctime_extra.to_le_bytes());
+        // mtime_extra: epoch=0, nsec=250_000_000
+        let mtime_extra = 250_000_000_u32 << 2;
+        buf[0x88..0x8C].copy_from_slice(&mtime_extra.to_le_bytes());
+        // atime_extra: epoch=0, nsec=100_000_000
+        let atime_extra = 100_000_000_u32 << 2;
+        buf[0x8C..0x90].copy_from_slice(&atime_extra.to_le_bytes());
+        // crtime = 1_600_000_000
+        buf[0x90..0x94].copy_from_slice(&1_600_000_000_u32.to_le_bytes());
+
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert_eq!(inode.extra_isize, 32);
+
+        // Verify full timestamps.
+        let atime = inode.atime_full();
+        assert_eq!(atime.0, 1_700_000_000);
+        assert_eq!(atime.1, 100_000_000);
+
+        let mtime = inode.mtime_full();
+        assert_eq!(mtime.0, 1_700_000_002);
+        assert_eq!(mtime.1, 250_000_000);
+
+        let ctime = inode.ctime_full();
+        assert_eq!(ctime.0, 1_700_000_001);
+        assert_eq!(ctime.1, 500_000_000);
+    }
+
+    #[test]
+    fn inode_system_time_conversion() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Positive timestamp.
+        let st = Ext4Inode::to_system_time(1_700_000_000, 500_000_000).unwrap();
+        let expected = UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000);
+        assert_eq!(st, expected);
+
+        // Zero timestamp.
+        let st = Ext4Inode::to_system_time(0, 0).unwrap();
+        assert_eq!(st, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn inode_system_time_convenience_methods() {
+        let mut buf = [0_u8; 256];
+        buf[..128].copy_from_slice(&make_inode_128());
+        buf[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        // atime_system_time should produce a valid time (no extra → no nanoseconds).
+        let st = inode.atime_system_time();
+        let epoch_secs = st.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(epoch_secs, 1_700_000_000);
+    }
+
+    #[test]
+    fn inode_uid_gid_high_bits() {
+        let mut buf = [0_u8; 256];
+        buf[..128].copy_from_slice(&make_inode_128());
+        // Set uid_hi = 1 (at offset 0x78 in Linux osd2)
+        buf[0x78..0x7A].copy_from_slice(&1_u16.to_le_bytes());
+        // Set gid_hi = 2 (at offset 0x7A)
+        buf[0x7A..0x7C].copy_from_slice(&2_u16.to_le_bytes());
+
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert_eq!(inode.uid, (1_u32 << 16) | 0x03e8);
+        assert_eq!(inode.gid, (2_u32 << 16) | 0x03e8);
+    }
+
+    #[test]
+    fn inode_file_type_detection() {
+        let mut buf = make_inode_128();
+        // directory
+        buf[0x00..0x02].copy_from_slice(&(S_IFDIR | 0o755).to_le_bytes());
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert!(inode.is_dir());
+        assert!(!inode.is_regular());
+        assert_eq!(inode.permission_bits(), 0o755);
+
+        // symlink
+        buf[0x00..0x02].copy_from_slice(&(S_IFLNK | 0o777).to_le_bytes());
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert!(inode.is_symlink());
+
+        // block device
+        buf[0x00..0x02].copy_from_slice(&(S_IFBLK | 0o660).to_le_bytes());
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert!(inode.is_blkdev());
+
+        // char device
+        buf[0x00..0x02].copy_from_slice(&(S_IFCHR | 0o666).to_le_bytes());
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert!(inode.is_chrdev());
+
+        // FIFO
+        buf[0x00..0x02].copy_from_slice(&(S_IFIFO | 0o644).to_le_bytes());
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert!(inode.is_fifo());
+
+        // socket
+        buf[0x00..0x02].copy_from_slice(&(S_IFSOCK | 0o755).to_le_bytes());
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        assert!(inode.is_socket());
+    }
+
+    #[test]
+    fn inode_extent_bytes_available() {
+        let buf = make_inode_128();
+        let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
+        // 60 bytes of i_block area should be present.
+        assert_eq!(inode.extent_bytes.len(), 60);
     }
 }
