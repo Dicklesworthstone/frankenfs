@@ -30,8 +30,7 @@ Implementation is phased for sequencing, not scope reduction. A feature in Phase
 
 This section records *current* (not historical) drift between this spec and the codebase. It exists to prevent agents from "implementing to the wrong contract."
 
-- **Types drift:** Spec §0.3 Glossary + downstream sections rely on canonical newtypes (e.g. `GroupNumber`, `BlockSize`, `ByteOffset`) that are not yet present in `crates/ffs-types`. Resolution: implement them in `crates/ffs-types` and update call sites. Track: `bd-14w`.
-- **ParseError vs FfsError drift:** Spec §2/§10 assume parser errors (`ParseError`) remain format-local, while `FfsError` models mount/runtime/FUSE behavior. The code currently exposes both (`crates/ffs-core/src/lib.rs` returns `ParseError` from `parse_ext4/parse_btrfs` and uses `FfsError` for device probing), but the mapping policy is not yet canonicalized. Resolution: define the mapping boundary and implement contextual conversion in `ffs-core`. Tracks: `bd-126`, `bd-2fy`.
+- **ParseError -> FfsError context drift:** The crate boundary is now explicit: `ffs-ondisk` returns `ParseError` (pure parsing + checksum verification), while user-facing layers return `FfsError` and convert at the orchestration boundary (`ffs-core`). However, the conversion still lacks a structured context object (structure + offsets + inode/group) for actionable diagnostics. Track: `bd-2fy`.
 - **Missing normative traits (integration points):** Spec §8/§9/§14 define normative traits (repair manager, scrub progress, semantics ops) that are not yet present in code (`crates/ffs-repair` is currently stub-only, `crates/ffs-fuse` is scaffolding). Resolution: introduce the traits in the owning crates without creating dependency cycles, then migrate scaffolding to those contracts. Tracks: `bd-2l4`, `bd-3bf`, `bd-hv6`.
 
 ### 0.1.2 Audit Checklist (Mechanical)
@@ -1855,8 +1854,14 @@ in the integrity stack.
 
 CRC32C is mandatory for ext4 on-disk structures when `metadata_csum`
 (`RO_COMPAT_METADATA_CSUM`, bit 0x0400) is set. Polynomial: Castagnoli
-`0x1EDC6F41`. Seed: use `s_checksum_seed` if `INCOMPAT_CSUM_SEED` is set,
-else compute `crc32c::crc32c(&s_uuid)`.
+`0x1EDC6F41`.
+
+**Metadata checksum seed (`csum_seed`):**
+- If `INCOMPAT_CSUM_SEED` is set: `csum_seed = s_checksum_seed`.
+- Else: `csum_seed = crc32c_append(0xFFFF_FFFF, s_uuid)` (i.e., kernel `crc32c(~0, uuid, 16)`).
+
+> **Note:** The **superblock** checksum uses seed `0xFFFF_FFFF` over bytes `0x000..0x3FB`.
+> Other metadata structures use `csum_seed` as their base seed.
 
 | Structure | Field | Scope |
 |-----------|-------|-------|
@@ -1870,34 +1875,32 @@ else compute `crc32c::crc32c(&s_uuid)`.
 | Journal commit | `h_chksum[0]` | CRC32C over commit header |
 | Journal revoke | `r_checksum` | CRC32C over revoke block |
 
-All CRC32C lives in `ffs-ondisk` as pure functions (no I/O):
+All CRC32C verification lives in `ffs-ondisk` as **pure** functions/methods (no I/O),
+returning `ffs-types::ParseError`. User-facing layers (CLI/FUSE/mount) map `ParseError`
+to `ffs-error::FfsError` at the orchestration boundary (`ffs-core`).
 
 ```rust
-pub fn verify_superblock_csum(sb_bytes: &[u8; 1024]) -> Result<()> {
-    let stored = u32::from_le_bytes(sb_bytes[0x3FC..0x400].try_into().unwrap());
-    let mut buf = *sb_bytes;
-    buf[0x3FC..0x400].copy_from_slice(&[0; 4]);
-    let computed = crc32c::crc32c_seed(&buf, 0xFFFF_FFFF);
+use crc32c;
+use ffs_types::ParseError;
+
+pub fn verify_superblock_csum(raw_region: &[u8]) -> Result<(), ParseError> {
+    if raw_region.len() < 1024 {
+        return Err(ParseError::InsufficientData {
+            needed: 1024,
+            offset: 0,
+            actual: raw_region.len(),
+        });
+    }
+
+    let stored = u32::from_le_bytes(raw_region[0x3FC..0x400].try_into().unwrap());
+    let computed = crc32c::crc32c_append(0xFFFF_FFFF, &raw_region[..0x3FC]);
     if stored != computed {
-        return Err(FfsError::Corruption {
-            block: 0,
-            detail: format!("superblock CRC32C: stored={stored:#010x} computed={computed:#010x}"),
+        return Err(ParseError::InvalidField {
+            field: "s_checksum",
+            reason: "superblock CRC32C mismatch",
         });
     }
     Ok(())
-}
-
-pub fn compute_group_desc_csum(seed: u32, group: GroupNumber, desc: &[u8], off: usize) -> u32 {
-    let mut c = crc32c::crc32c_seed(&group.0.to_le_bytes(), seed);
-    c = crc32c::crc32c_seed(&desc[..off], c);
-    if off + 2 < desc.len() { c = crc32c::crc32c_seed(&desc[off + 2..], c); }
-    c
-}
-
-pub fn compute_inode_csum(seed: u32, ino: InodeNumber, gen: u32, data: &[u8]) -> u32 {
-    let mut c = crc32c::crc32c_seed(&ino.0.to_le_bytes(), seed);
-    c = crc32c::crc32c_seed(&gen.to_le_bytes(), c);
-    crc32c::crc32c_seed(data, c)
 }
 ```
 
@@ -4237,7 +4240,10 @@ Phases MUST NOT be reordered; the dependency chain is strict.
 
 **ffs-error:** `FfsError` enum (**14 variants** — canonical definition in `ffs-error/src/lib.rs` and PROPOSED_ARCHITECTURE.md Section 7): `Io` -> `EIO`, `Corruption` -> `EIO`, `Format` -> `EINVAL`, `MvccConflict` -> `EAGAIN`, `Cancelled` -> `EINTR`, `NoSpace` -> `ENOSPC`, `NotFound` -> `ENOENT`, `PermissionDenied` -> `EACCES`, `NotDirectory` -> `ENOTDIR`, `IsDirectory` -> `EISDIR`, `NotEmpty` -> `ENOTEMPTY`, `NameTooLong` -> `ENAMETOOLONG`, `Exists` -> `EEXIST`, `RepairFailed` -> `EIO`.
 
-**ffs-ondisk:** All parsers implement `parse(&[u8]) -> Result<Self>` and `serialize(&self, &mut [u8]) -> Result<()>`.
+**ffs-ondisk:** On-disk parsers are **pure** (no I/O, no ambient authority) and return
+`Result<T, ParseError>`. User-facing layers (mount/CLI/FUSE) return `FfsError` and MUST
+convert `ParseError -> FfsError` at the orchestration boundary (`ffs-core`), adding
+context (structure, offset, group/inode) without dumping large byte buffers.
 
 | Structure | Size | Checksum |
 |-----------|------|----------|
@@ -4250,12 +4256,13 @@ Phases MUST NOT be reordered; the dependency chain is strict.
 | `DxRoot` / `DxEntry` | variable / 8 B | Covered by directory block checksum |
 | `JournalSuperblock` | 1024 B | CRC32C (JBD2 v3) |
 
-All parsers MUST: validate magic numbers first, verify CRC32C when `metadata_csum` is enabled, return `FfsError::Corruption` or `FfsError::Format` for invalid input, never panic on malformed input.
+All parsers MUST: validate magic numbers first, verify CRC32C when `metadata_csum` is enabled,
+return `ParseError` for invalid input, never panic on malformed input.
 
 **Acceptance Criteria:**
 1. Parse real ext4 image superblock; verify `s_magic == 0xEF53`, block size, UUID match `dumpe2fs`
 2. Round-trip all structures: `parse(serialize(x)) == x`
-3. CRC32C verification: pass on valid data, `ChecksumMismatch` on flipped bit
+3. CRC32C verification: pass on valid data; on mismatch return `ParseError::InvalidField` with a stable reason string (e.g., `"superblock CRC32C mismatch"`)
 4. Proptest round-trip for Superblock, Inode, Extent, DirEntry2, GroupDesc (10,000 iterations each)
 5. Fuzz all parsers for 60s with no panics
 6. Golden fixtures from 3 real ext4 images (64MB, 1GB, 10GB)
