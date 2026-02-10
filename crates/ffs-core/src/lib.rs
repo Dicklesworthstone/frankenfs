@@ -6,8 +6,12 @@ use ffs_block::{
 };
 use ffs_error::FfsError;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
-use ffs_ondisk::{BtrfsSuperblock, Ext4FileType, Ext4ImageReader, Ext4Inode, Ext4Superblock};
-use ffs_types::{BlockNumber, CommitSeq, InodeNumber, ParseError, Snapshot};
+use ffs_ondisk::{
+    BtrfsSuperblock, Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock,
+};
+use ffs_types::{
+    BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot,
+};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -253,6 +257,64 @@ impl OpenFs {
     pub fn device_len(&self) -> u64 {
         self.dev.len_bytes()
     }
+
+    /// Return the ext4 superblock, or `None` if this is not ext4.
+    #[must_use]
+    pub fn ext4_superblock(&self) -> Option<&Ext4Superblock> {
+        match &self.flavor {
+            FsFlavor::Ext4(sb) => Some(sb),
+            FsFlavor::Btrfs(_) => None,
+        }
+    }
+
+    /// Read a group descriptor via the device.
+    ///
+    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    pub fn read_group_desc(&self, cx: &Cx, group: GroupNumber) -> Result<Ext4GroupDesc, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let desc_size = sb.group_desc_size();
+        let offset = sb
+            .group_desc_offset(group)
+            .ok_or_else(|| FfsError::InvalidGeometry("group desc offset overflow".into()))?;
+
+        let mut buf = vec![0_u8; usize::from(desc_size)];
+        self.dev.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
+        Ext4GroupDesc::parse_from_bytes(&buf, desc_size).map_err(|e| parse_to_ffs_error(&e))
+    }
+
+    /// Read an ext4 inode by number via the device.
+    ///
+    /// Uses [`Ext4Superblock::locate_inode`] and [`Ext4Superblock::inode_device_offset`]
+    /// to compute the on-disk position, reads the group descriptor for the
+    /// inode table pointer, then reads and parses the inode.
+    pub fn read_inode(&self, cx: &Cx, ino: InodeNumber) -> Result<Ext4Inode, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+
+        let loc = sb.locate_inode(ino).map_err(|e| parse_to_ffs_error(&e))?;
+        let gd = self.read_group_desc(cx, loc.group)?;
+        let abs_offset = sb
+            .inode_device_offset(&loc, gd.inode_table)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+
+        let inode_size = usize::from(sb.inode_size);
+        let mut buf = vec![0_u8; inode_size];
+        self.dev
+            .read_exact_at(cx, ByteOffset(abs_offset), &mut buf)?;
+        Ext4Inode::parse_from_bytes(&buf).map_err(|e| parse_to_ffs_error(&e))
+    }
+
+    /// Read an ext4 inode and return its VFS attributes.
+    pub fn read_inode_attr(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let inode = self.read_inode(cx, ino)?;
+        Ok(inode_to_attr(sb, ino, &inode))
+    }
 }
 
 /// Convert a mount-time `ParseError` into the appropriate `FfsError` variant.
@@ -492,32 +554,7 @@ impl Ext4FsOps {
 
     /// Read and convert an inode to `InodeAttr`.
     fn inode_to_attr(&self, ino: InodeNumber, inode: &Ext4Inode) -> InodeAttr {
-        let kind = inode_file_type(inode);
-        let blocks_512 = if (inode.flags & ffs_types::EXT4_HUGE_FILE_FL) != 0 {
-            // huge_file: i_blocks counts filesystem blocks, multiply by block_size/512
-            inode
-                .blocks
-                .saturating_mul(u64::from(self.reader.sb.block_size / 512))
-        } else {
-            inode.blocks
-        };
-
-        InodeAttr {
-            ino,
-            size: inode.size,
-            blocks: blocks_512,
-            atime: inode.atime_system_time(),
-            mtime: inode.mtime_system_time(),
-            ctime: inode.ctime_system_time(),
-            crtime: inode.crtime_system_time(),
-            kind,
-            perm: inode.permission_bits(),
-            nlink: u32::from(inode.links_count),
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: 0,
-            blksize: self.reader.sb.block_size,
-        }
+        inode_to_attr(&self.reader.sb, ino, inode)
     }
 }
 
@@ -540,6 +577,33 @@ fn parse_to_ffs_error(e: &ParseError) -> FfsError {
                 detail: e.to_string(),
             }
         }
+    }
+}
+
+/// Convert an ext4 inode into VFS `InodeAttr` using the superblock for context.
+fn inode_to_attr(sb: &Ext4Superblock, ino: InodeNumber, inode: &Ext4Inode) -> InodeAttr {
+    let kind = inode_file_type(inode);
+    let blocks_512 = if (inode.flags & ffs_types::EXT4_HUGE_FILE_FL) != 0 {
+        inode.blocks.saturating_mul(u64::from(sb.block_size / 512))
+    } else {
+        inode.blocks
+    };
+
+    InodeAttr {
+        ino,
+        size: inode.size,
+        blocks: blocks_512,
+        atime: inode.atime_system_time(),
+        mtime: inode.mtime_system_time(),
+        ctime: inode.ctime_system_time(),
+        crtime: inode.crtime_system_time(),
+        kind,
+        perm: inode.permission_bits(),
+        nlink: u32::from(inode.links_count),
+        uid: inode.uid,
+        gid: inode.gid,
+        rdev: 0,
+        blksize: sb.block_size,
     }
 }
 
@@ -1929,6 +1993,135 @@ mod tests {
         assert_eq!(deser.block_size, 4096);
         assert_eq!(deser.inodes_count, 8192);
         assert_eq!(deser.groups_count, 1);
+    }
+
+    // ── Device-based inode read tests ──────────────────────────────────
+
+    /// Build an ext4 image with a valid group descriptor and a root inode.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_ext4_image_with_inode() -> Vec<u8> {
+        let block_size: u32 = 4096;
+        let image_size: u32 = 256 * 1024; // 256K = 64 blocks
+        let mut image = vec![0_u8; image_size as usize];
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+
+        // ── Superblock ──
+        image[sb_off + 0x38..sb_off + 0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        image[sb_off + 0x18..sb_off + 0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log=2 → 4K
+        let blocks_count = image_size / block_size;
+        image[sb_off + 0x04..sb_off + 0x08].copy_from_slice(&blocks_count.to_le_bytes());
+        image[sb_off..sb_off + 0x04].copy_from_slice(&128_u32.to_le_bytes()); // inodes_count
+        image[sb_off + 0x14..sb_off + 0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block
+        image[sb_off + 0x20..sb_off + 0x24].copy_from_slice(&blocks_count.to_le_bytes()); // blocks_per_group
+        image[sb_off + 0x28..sb_off + 0x2C].copy_from_slice(&128_u32.to_le_bytes()); // inodes_per_group
+        image[sb_off + 0x58..sb_off + 0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        image[sb_off + 0x4C..sb_off + 0x50].copy_from_slice(&1_u32.to_le_bytes()); // rev_level=DYNAMIC
+        let incompat: u32 = 0x0002 | 0x0040; // FILETYPE | EXTENTS
+        image[sb_off + 0x60..sb_off + 0x64].copy_from_slice(&incompat.to_le_bytes());
+        image[sb_off + 0x54..sb_off + 0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino
+
+        // ── Group descriptor at block 1 (offset 4096) ──
+        // 32-byte group descriptor (no 64BIT feature).
+        let gd_off: usize = 4096;
+        // bg_block_bitmap = block 2
+        image[gd_off..gd_off + 4].copy_from_slice(&2_u32.to_le_bytes());
+        // bg_inode_bitmap = block 3
+        image[gd_off + 4..gd_off + 8].copy_from_slice(&3_u32.to_le_bytes());
+        // bg_inode_table = block 4 (offset 16384)
+        image[gd_off + 8..gd_off + 12].copy_from_slice(&4_u32.to_le_bytes());
+
+        // ── Root inode (#2) in the inode table ──
+        // Inode 2 is at index 1 (0-based) in the table.
+        // offset = 16384 + 1 * 256 = 16640
+        let ino_off: usize = 16384 + 256;
+        // mode = S_IFDIR | 0o755
+        let mode: u16 = 0o040_755;
+        image[ino_off..ino_off + 2].copy_from_slice(&mode.to_le_bytes());
+        // uid_lo = 0
+        image[ino_off + 2..ino_off + 4].copy_from_slice(&0_u16.to_le_bytes());
+        // size = 4096
+        image[ino_off + 4..ino_off + 8].copy_from_slice(&4096_u32.to_le_bytes());
+        // links_count = 2
+        image[ino_off + 0x1A..ino_off + 0x1C].copy_from_slice(&2_u16.to_le_bytes());
+        // i_extra_isize = 32 (for 256-byte inodes, extra area starts at 128)
+        image[ino_off + 0x80..ino_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        image
+    }
+
+    #[test]
+    fn read_inode_via_device() {
+        let image = build_ext4_image_with_inode();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+
+        assert!(inode.is_dir());
+        assert_eq!(inode.size, 4096);
+        assert_eq!(inode.links_count, 2);
+        assert_eq!(inode.permission_bits(), 0o755);
+    }
+
+    #[test]
+    fn read_inode_attr_via_device() {
+        let image = build_ext4_image_with_inode();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let attr = fs.read_inode_attr(&cx, InodeNumber(2)).unwrap();
+
+        assert_eq!(attr.ino, InodeNumber(2));
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+        assert_eq!(attr.nlink, 2);
+        assert_eq!(attr.size, 4096);
+        assert_eq!(attr.blksize, 4096);
+    }
+
+    #[test]
+    fn read_inode_zero_fails() {
+        let image = build_ext4_image_with_inode();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let err = fs.read_inode(&cx, InodeNumber(0)).unwrap_err();
+        // inode 0 is invalid → should produce an error
+        assert!(
+            !matches!(err, FfsError::Io(_)),
+            "expected parse/format error, got I/O: {err:?}",
+        );
+    }
+
+    #[test]
+    fn read_inode_out_of_bounds_fails() {
+        let image = build_ext4_image_with_inode();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        // Image has 128 inodes; 129 is out of range.
+        let err = fs.read_inode(&cx, InodeNumber(129)).unwrap_err();
+        assert!(
+            !matches!(err, FfsError::Io(_)),
+            "expected parse/format error, got I/O: {err:?}",
+        );
+    }
+
+    #[test]
+    fn read_group_desc_via_device() {
+        let image = build_ext4_image_with_inode();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let gd = fs.read_group_desc(&cx, GroupNumber(0)).unwrap();
+        assert_eq!(gd.block_bitmap, 2);
+        assert_eq!(gd.inode_bitmap, 3);
+        assert_eq!(gd.inode_table, 4);
     }
 
     #[test]
