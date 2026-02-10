@@ -26,6 +26,11 @@ impl Transaction {
     }
 
     #[must_use]
+    pub fn staged_write(&self, block: BlockNumber) -> Option<&[u8]> {
+        self.writes.get(&block).map(Vec::as_slice)
+    }
+
+    #[must_use]
     pub fn pending_writes(&self) -> usize {
         self.writes.len()
     }

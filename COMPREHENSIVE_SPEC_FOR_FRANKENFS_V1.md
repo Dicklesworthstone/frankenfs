@@ -1137,9 +1137,55 @@ The following MUST NOT appear in any FrankenFS crate:
 ---
 ## 5. MVCC Formal Model
 
-All definitions in this section are **normative** unless marked informative. Implementation: `ffs-mvcc` crate; shared types: `ffs-types`.
+This spec is split into phases:
+
+- **Phase A (implemented)**: snapshot visibility + FCW (first-committer-wins) write-write conflict detection. This is **normative** and MUST match `crates/ffs-mvcc/src/lib.rs`.
+- **Phase B (planned)**: SSI (rw-antidependency tracking), read-set bookkeeping, active transaction registry, and GC watermarking. This is **informative** until implemented (APIs MAY change).
+
+Implementation home: `ffs-mvcc` crate; shared types: `ffs-types`.
 
 ---
+
+### 5.0 Phase Plan (FCW -> SSI)
+
+**Phase A (implemented now):**
+
+- Snapshot isolation at block granularity via version chains and `Snapshot { high: CommitSeq }`.
+- FCW (first-committer-wins) write-write conflict detection at commit time.
+- No read-set tracking (so no SSI write-skew detection yet).
+- Aborting is implicit: drop the `Transaction` without committing.
+
+**Phase B (planned):**
+
+- Add read-set bookkeeping and rw-antidependency tracking for SSI.
+- Add an explicit `abort(tx)` API (needed once there is active-tx bookkeeping).
+- Add GC watermark computation from active snapshots (safe version reclamation).
+- Potentially evolve `ffs-mvcc` toward the `MvccBlockManager` trait in `PROPOSED_ARCHITECTURE.md` (which takes `&Cx`).
+
+### 5.0.1 Phase A Public API (ffs-mvcc)
+
+```rust
+// Implemented in `crates/ffs-mvcc/src/lib.rs` (Phase A).
+
+pub struct MvccStore { /* ... */ }
+pub struct Transaction { pub id: TxnId, pub snapshot: Snapshot, /* ... */ }
+
+impl MvccStore {
+    pub fn new() -> Self;
+    pub fn current_snapshot(&self) -> Snapshot;
+    pub fn begin(&mut self) -> Transaction;
+    pub fn commit(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError>;
+    pub fn latest_commit_seq(&self, block: BlockNumber) -> CommitSeq;
+    pub fn read_visible(&self, block: BlockNumber, snapshot: Snapshot) -> Option<&[u8]>;
+    pub fn prune_versions_older_than(&mut self, watermark: CommitSeq);
+}
+
+impl Transaction {
+    pub fn stage_write(&mut self, block: BlockNumber, bytes: Vec<u8>);
+    pub fn staged_write(&self, block: BlockNumber) -> Option<&[u8]>;
+    pub fn pending_writes(&self) -> usize;
+}
+```
 
 ### 5.1 Core Types
 
@@ -1167,7 +1213,7 @@ The `TxHandle` struct shown in earlier revisions (with `HashSet<BlockNumber>` re
 |------|----------|---------|
 | `TxnId` | `TxnId(0)` / `None` | No transaction |
 | `CommitSeq` | `CommitSeq(0)` | No committed version for block |
-| `CommitSeq` | `UNCOMMITTED` = `CommitSeq(u64::MAX)` | Written but uncommitted |
+| `CommitSeq` | `CommitSeq(u64::MAX)` (reserved) | Phase B only: sentinel if uncommitted versions are represented in-chain. Phase A keeps uncommitted bytes in `Transaction.writes` (private), not in the store. |
 
 #### 5.1.2 Ordering
 
@@ -1183,7 +1229,7 @@ Each block maintains a version chain: a sequence of `BlockVersion` entries, newe
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockVersion {
     pub block: BlockNumber,
-    pub commit_seq: CommitSeq,   // UNCOMMITTED until commit
+    pub commit_seq: CommitSeq,   // Phase A: always committed. Phase B: may use an UNCOMMITTED sentinel until commit.
     pub writer: TxnId,
     pub bytes: Vec<u8>,          // length MUST == block_size
 }
@@ -1209,14 +1255,15 @@ pub struct MvccStore {
 
 **Definition.** Version V in `VersionChain(B)` is *visible* to snapshot S iff:
 
-1. `V.commit_seq != UNCOMMITTED`, AND
-2. `V.commit_seq <= S.high`, AND
-3. No other committed V' exists with `V'.commit_seq <= S.high` AND `V'.commit_seq > V.commit_seq`.
+1. `V.commit_seq <= S.high`, AND
+2. No other committed V' exists with `V'.commit_seq <= S.high` AND `V'.commit_seq > V.commit_seq`.
+
+**Phase B note:** If uncommitted versions are ever represented in-chain, the visibility rule MUST additionally exclude them.
 
 ```rust
 fn read_visible(chain: &[BlockVersion], snapshot: Snapshot) -> Option<&[u8]> {
     chain.iter().rev()
-        .find(|v| v.commit_seq != UNCOMMITTED && v.commit_seq <= snapshot.high)
+        .find(|v| v.commit_seq <= snapshot.high)
         .map(|v| v.bytes.as_slice())
 }
 ```
@@ -1233,16 +1280,14 @@ fn read_visible(chain: &[BlockVersion], snapshot: Snapshot) -> Option<&[u8]> {
 #### 5.3.2 Read-Your-Own-Writes Path
 
 ```rust
-impl TxHandle {
-    fn read(&mut self, store: &MvccStore, block: BlockNumber) -> Option<&[u8]> {
-        // 1. Check local write buffer (no read_set recording for self-reads)
-        if let Some(local) = self.write_set_data.get(&block) {
-            return Some(local);
-        }
-        // 2. Read from version chain, record in read_set for SSI
-        self.read_set.insert(block);
-        store.read_visible(block, self.snapshot)
+// Phase A (implemented): the MVCC layer exposes `Transaction` for staging writes.
+// Higher layers MUST implement "read-your-writes" by overlaying staged writes on top
+// of snapshot reads.
+fn read_tx_overlay(store: &MvccStore, tx: &Transaction, block: BlockNumber) -> Option<&[u8]> {
+    if let Some(staged) = tx.staged_write(block) {
+        return Some(staged);
     }
+    store.read_visible(block, tx.snapshot)
 }
 ```
 
@@ -1255,10 +1300,11 @@ impl TxHandle {
 Writes are buffered locally. No chain modification occurs until commit.
 
 ```rust
-impl TxHandle {
+// Phase A (implemented): `Transaction` stores staged writes as a per-block map.
+// The last write to a block wins.
+impl Transaction {
     pub fn stage_write(&mut self, block: BlockNumber, bytes: Vec<u8>) {
-        self.write_set.insert(block);
-        self.write_set_data.insert(block, bytes); // last write wins
+        self.writes.insert(block, bytes);
     }
 }
 ```
@@ -1268,37 +1314,32 @@ impl TxHandle {
 ```
 PROCEDURE commit(T):
     // 1. FCW validation
-    FOR EACH block B in T.write_set:
-        IF latest_committed(B).commit_seq > T.snapshot.high THEN
-            RETURN Err(Conflict { block: B, ... })
-    // 2. SSI dangerous-structure check (Section 5.5)
-    IF ssi_dangerous_structure_detected(T) THEN
-        RETURN Err(SerializationFailure)
-    // 3. Allocate CommitSeq (strictly monotonic)
+    FOR EACH block B in keys(T.staged_writes):
+        IF store.latest_commit_seq(B) > T.snapshot.high THEN
+            RETURN Err(CommitError::Conflict { block: B, ... })
+    // 2. Allocate CommitSeq (strictly monotonic)
     LET seq = next_commit_seq()
-    // 4. Install versions into chains
+    // 3. Install versions into chains
     FOR EACH (block, data) in T.staged_writes:
         append_to_chain(block, BlockVersion { block, commit_seq: seq, writer: T.txn_id, bytes: data })
-    // 5. Record for SSI bookkeeping
-    record_committed(T, seq)
     RETURN Ok(seq)
 ```
 
-Steps 1-5 MUST execute as a single critical section.
+**FCW correctness sketch (Phase A):**
+
+- If two transactions `T1` and `T2` both write the same block `B`, at most one can commit: the first committer publishes `B@cs=k`; the other must see `latest_commit_seq(B)=k > snapshot.high` and abort.
+- Snapshot reads are consistent because visibility is defined as “newest `commit_seq <= snapshot.high`”, and `commit_seq` is a total order over committed versions.
+- FCW alone does **not** prevent write-skew across *different* blocks; SSI (Phase B) is the roadmap for serializability.
+
+Steps 1-3 MUST execute as a single critical section.
+
+**Phase B note:** SSI validation is applied at commit time after FCW validation and before `CommitSeq` assignment.
 
 #### 5.4.3 Phase 3 -- Abort
 
-On abort or drop-without-commit: staged writes discarded, `TxnId` retired (never reused), SSI bookkeeping cleaned up. No chain entries exist for aborted transactions.
+Phase A (implemented): dropping a `Transaction` without calling `commit()` discards staged writes. No chain entries exist for aborted transactions because Phase A does not publish uncommitted versions.
 
-```rust
-impl Drop for TxHandle {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.store_ref.remove_active_transaction(self.txn_id);
-        }
-    }
-}
-```
+Phase B (planned): if the MVCC layer tracks active transactions for GC watermarking and SSI bookkeeping, an explicit `abort(tx)` API is REQUIRED to remove active bookkeeping deterministically.
 
 #### 5.4.4 CommitSeq Guarantees
 

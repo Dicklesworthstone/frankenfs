@@ -582,11 +582,15 @@ dependencies = [
  "unicode-display-width",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
 name = "ftui-extras"
 version = "0.1.1"
+dependencies = [
+ "web-time",
+]
 
 [[package]]
 name = "ftui-i18n"
@@ -625,6 +629,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
@@ -663,6 +668,7 @@ dependencies = [
  "ftui-text",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
@@ -1609,6 +1615,16 @@ name = "web-sys"
 version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

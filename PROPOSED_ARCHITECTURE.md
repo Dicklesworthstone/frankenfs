@@ -121,6 +121,8 @@ pub trait CachePolicy: Send + Sync {
 
 ### 3.2 MVCC Traits
 
+**Phase note:** `ffs-mvcc` currently ships a Phase A API (`MvccStore` + `Transaction`) that implements snapshot visibility + FCW conflict detection. The trait below is the Phase B+ target once we add SSI/read-set tracking, active transaction bookkeeping, and thread-safe sharing (and once MVCC needs `&Cx` cancellation plumbing).
+
 ```rust
 /// Block-level MVCC manager.
 pub trait MvccBlockManager: Send + Sync {
