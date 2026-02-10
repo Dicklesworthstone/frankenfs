@@ -593,6 +593,43 @@ impl OpenFs {
         buf.truncate(n);
         Ok(buf)
     }
+
+    // ── Path resolution ───────────────────────────────────────────────
+
+    /// Resolve an absolute path to an inode number and parsed inode.
+    ///
+    /// Walks the directory tree from root (inode 2), looking up each path
+    /// component via [`lookup_name`](Self::lookup_name). The path must
+    /// start with `/`.
+    ///
+    /// Returns `FfsError::NotFound` if a component does not exist, or
+    /// `FfsError::NotDirectory` if an intermediate component is not a
+    /// directory.
+    pub fn resolve_path(&self, cx: &Cx, path: &str) -> Result<(InodeNumber, Ext4Inode), FfsError> {
+        if !path.starts_with('/') {
+            return Err(FfsError::Format(
+                "path must be absolute (start with /)".into(),
+            ));
+        }
+
+        let mut current_ino = InodeNumber::ROOT;
+        let mut current_inode = self.read_inode(cx, current_ino)?;
+
+        for component in path.split('/').filter(|c| !c.is_empty()) {
+            if !current_inode.is_dir() {
+                return Err(FfsError::NotDirectory);
+            }
+
+            let entry = self
+                .lookup_name(cx, &current_inode, component.as_bytes())?
+                .ok_or_else(|| FfsError::NotFound(component.to_owned()))?;
+
+            current_ino = InodeNumber(u64::from(entry.inode));
+            current_inode = self.read_inode(cx, current_ino)?;
+        }
+
+        Ok((current_ino, current_inode))
+    }
 }
 
 /// Compute the number of logical blocks in a directory, as a u32.
@@ -2806,6 +2843,66 @@ mod tests {
 
         let err = fs.read_file(&cx, InodeNumber(2), 0, 4096).unwrap_err();
         assert_eq!(err.to_errno(), libc::EISDIR);
+    }
+
+    // ── Path resolution tests ─────────────────────────────────────────
+
+    #[test]
+    fn resolve_path_root() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let (ino, inode) = fs.resolve_path(&cx, "/").unwrap();
+        assert_eq!(ino, InodeNumber(2));
+        assert!(inode.is_dir());
+    }
+
+    #[test]
+    fn resolve_path_file() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let (ino, inode) = fs.resolve_path(&cx, "/hello.txt").unwrap();
+        assert_eq!(ino, InodeNumber(11));
+        assert!(inode.is_regular());
+    }
+
+    #[test]
+    fn resolve_path_not_found() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let err = fs.resolve_path(&cx, "/missing").unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn resolve_path_not_directory() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        // hello.txt is a regular file, not a directory — traversal through it fails.
+        let err = fs.resolve_path(&cx, "/hello.txt/child").unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOTDIR);
+    }
+
+    #[test]
+    fn resolve_path_relative_rejected() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let err = fs.resolve_path(&cx, "hello.txt").unwrap_err();
+        assert!(matches!(err, FfsError::Format(_)));
     }
 
     #[test]
