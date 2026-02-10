@@ -8,6 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 ffs-ondisk = { workspace = true }
+ffs-types = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
