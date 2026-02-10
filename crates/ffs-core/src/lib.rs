@@ -7,8 +7,9 @@ use ffs_block::{
 use ffs_error::FfsError;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    BtrfsSuperblock, Ext4Extent, Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode,
-    Ext4Superblock, ExtentTree, parse_extent_tree, parse_inode_extent_tree,
+    BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc, Ext4ImageReader,
+    Ext4Inode, Ext4Superblock, ExtentTree, lookup_in_dir_block, parse_dir_block, parse_extent_tree,
+    parse_inode_extent_tree,
 };
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot,
@@ -520,6 +521,63 @@ impl OpenFs {
 
         Ok(bytes_read)
     }
+
+    // ── Directory operations via device ───────────────────────────────
+
+    /// Read all directory entries from a directory inode via the device.
+    ///
+    /// Iterates over the inode's data blocks via extent mapping, reading
+    /// each block from the device and parsing directory entries.
+    pub fn read_dir(&self, cx: &Cx, inode: &Ext4Inode) -> Result<Vec<Ext4DirEntry>, FfsError> {
+        let bs = u64::from(self.block_size());
+        let num_blocks = dir_logical_block_count(inode.size, bs)?;
+
+        let mut all_entries = Vec::new();
+
+        for lb in 0..num_blocks {
+            if let Some(phys) = self.resolve_extent(cx, inode, lb)? {
+                let block_data = self.read_block_vec(cx, BlockNumber(phys))?;
+                let (entries, _tail) = parse_dir_block(&block_data, self.block_size())
+                    .map_err(|e| parse_to_ffs_error(&e))?;
+                all_entries.extend(entries);
+            }
+        }
+
+        Ok(all_entries)
+    }
+
+    /// Look up a single name in a directory inode via the device.
+    ///
+    /// Returns the matching `Ext4DirEntry` if found, `None` otherwise.
+    pub fn lookup_name(
+        &self,
+        cx: &Cx,
+        dir_inode: &Ext4Inode,
+        name: &[u8],
+    ) -> Result<Option<Ext4DirEntry>, FfsError> {
+        let bs = u64::from(self.block_size());
+        let num_blocks = dir_logical_block_count(dir_inode.size, bs)?;
+
+        for lb in 0..num_blocks {
+            if let Some(phys) = self.resolve_extent(cx, dir_inode, lb)? {
+                let block_data = self.read_block_vec(cx, BlockNumber(phys))?;
+                if let Some(entry) = lookup_in_dir_block(&block_data, self.block_size(), name) {
+                    return Ok(Some(entry));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+/// Compute the number of logical blocks in a directory, as a u32.
+fn dir_logical_block_count(file_size: u64, block_size: u64) -> Result<u32, FfsError> {
+    let num = file_size.div_ceil(block_size);
+    u32::try_from(num).map_err(|_| FfsError::Corruption {
+        block: 0,
+        detail: "directory block count overflow".into(),
+    })
 }
 
 /// Convert a mount-time `ParseError` into the appropriate `FfsError` variant.
@@ -2548,6 +2606,147 @@ mod tests {
         let mut buf = vec![0_u8; 10];
         let n = fs.read_file_data(&cx, &inode, 100, &mut buf).unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ── Device-based directory tests ──────────────────────────────────
+
+    /// Build an ext4 image with a directory inode containing entries.
+    ///
+    /// Layout (4K blocks, 256K image):
+    /// - Block 0: superblock at offset 1024
+    /// - Block 1: group descriptor table
+    /// - Block 4+: inode table
+    ///   - Inode #2 (root): directory, size=4096, extent: logical 0 → physical 10
+    ///   - Inode #11: regular file stub
+    /// - Block 10: directory data block with ".", "..", "hello.txt"
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_ext4_image_with_dir() -> Vec<u8> {
+        let block_size: u32 = 4096;
+        let image_size: u32 = 256 * 1024;
+        let mut image = vec![0_u8; image_size as usize];
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+
+        // ── Superblock ──
+        image[sb_off + 0x38..sb_off + 0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        image[sb_off + 0x18..sb_off + 0x1C].copy_from_slice(&2_u32.to_le_bytes());
+        let blocks_count = image_size / block_size;
+        image[sb_off + 0x04..sb_off + 0x08].copy_from_slice(&blocks_count.to_le_bytes());
+        image[sb_off..sb_off + 0x04].copy_from_slice(&128_u32.to_le_bytes());
+        image[sb_off + 0x14..sb_off + 0x18].copy_from_slice(&0_u32.to_le_bytes());
+        image[sb_off + 0x20..sb_off + 0x24].copy_from_slice(&blocks_count.to_le_bytes());
+        image[sb_off + 0x28..sb_off + 0x2C].copy_from_slice(&128_u32.to_le_bytes());
+        image[sb_off + 0x58..sb_off + 0x5A].copy_from_slice(&256_u16.to_le_bytes());
+        image[sb_off + 0x4C..sb_off + 0x50].copy_from_slice(&1_u32.to_le_bytes());
+        let incompat: u32 = 0x0002 | 0x0040;
+        image[sb_off + 0x60..sb_off + 0x64].copy_from_slice(&incompat.to_le_bytes());
+        image[sb_off + 0x54..sb_off + 0x58].copy_from_slice(&11_u32.to_le_bytes());
+
+        // ── Group descriptor at block 1 ──
+        let gd_off: usize = 4096;
+        image[gd_off..gd_off + 4].copy_from_slice(&2_u32.to_le_bytes());
+        image[gd_off + 4..gd_off + 8].copy_from_slice(&3_u32.to_le_bytes());
+        image[gd_off + 8..gd_off + 12].copy_from_slice(&4_u32.to_le_bytes());
+
+        // ── Inode #2 (root dir, index 1) ──
+        let ino2 = 4 * 4096 + 256; // inode #2 = index 1
+        image[ino2..ino2 + 2].copy_from_slice(&0o040_755_u16.to_le_bytes()); // S_IFDIR|0755
+        image[ino2 + 4..ino2 + 8].copy_from_slice(&4096_u32.to_le_bytes()); // size = 1 block
+        image[ino2 + 0x1A..ino2 + 0x1C].copy_from_slice(&3_u16.to_le_bytes()); // links=3
+        image[ino2 + 0x20..ino2 + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+        image[ino2 + 0x80..ino2 + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        // Extent tree: depth=0, 1 extent: logical 0 → physical 10
+        let e = ino2 + 0x28;
+        image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+        image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes());
+        image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes());
+        image[e + 6..e + 8].copy_from_slice(&0_u16.to_le_bytes());
+        image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes());
+        image[e + 16..e + 18].copy_from_slice(&1_u16.to_le_bytes());
+        image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes());
+        image[e + 20..e + 24].copy_from_slice(&10_u32.to_le_bytes());
+
+        // ── Inode #11 (file, index 10) ──
+        let ino11 = 4 * 4096 + 10 * 256;
+        image[ino11..ino11 + 2].copy_from_slice(&0o100_644_u16.to_le_bytes());
+        image[ino11 + 4..ino11 + 8].copy_from_slice(&5_u32.to_le_bytes());
+        image[ino11 + 0x1A..ino11 + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+        image[ino11 + 0x80..ino11 + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        // ── Block 10: directory data ──
+        // Entry "." → inode 2, type=DIR(2)
+        let d = 10 * 4096;
+        image[d..d + 4].copy_from_slice(&2_u32.to_le_bytes()); // inode
+        image[d + 4..d + 6].copy_from_slice(&12_u16.to_le_bytes()); // rec_len
+        image[d + 6] = 1; // name_len
+        image[d + 7] = 2; // file_type = DIR
+        image[d + 8] = b'.';
+
+        // Entry ".." → inode 2, type=DIR(2)
+        let d = d + 12;
+        image[d..d + 4].copy_from_slice(&2_u32.to_le_bytes());
+        image[d + 4..d + 6].copy_from_slice(&12_u16.to_le_bytes());
+        image[d + 6] = 2;
+        image[d + 7] = 2;
+        image[d + 8] = b'.';
+        image[d + 9] = b'.';
+
+        // Entry "hello.txt" → inode 11, type=REG(1)
+        let d = d + 12;
+        image[d..d + 4].copy_from_slice(&11_u32.to_le_bytes());
+        image[d + 4..d + 6].copy_from_slice(&4072_u16.to_le_bytes()); // rest of block
+        image[d + 6] = 9;
+        image[d + 7] = 1;
+        image[d + 8..d + 17].copy_from_slice(b"hello.txt");
+
+        image
+    }
+
+    #[test]
+    fn read_dir_via_device() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        assert!(inode.is_dir());
+
+        let entries = fs.read_dir(&cx, &inode).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[0].inode, 2);
+        assert_eq!(entries[1].name, b"..");
+        assert_eq!(entries[1].inode, 2);
+        assert_eq!(entries[2].name, b"hello.txt");
+        assert_eq!(entries[2].inode, 11);
+    }
+
+    #[test]
+    fn lookup_name_found() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        let entry = fs.lookup_name(&cx, &inode, b"hello.txt").unwrap();
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.inode, 11);
+        assert_eq!(entry.name, b"hello.txt");
+    }
+
+    #[test]
+    fn lookup_name_not_found() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        let entry = fs.lookup_name(&cx, &inode, b"missing.txt").unwrap();
+        assert!(entry.is_none());
     }
 
     #[test]
