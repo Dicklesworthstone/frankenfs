@@ -305,6 +305,49 @@ pub fn read_btrfs_superblock_region(
     Ok(buf)
 }
 
+/// Snapshot of ARC cache statistics.
+///
+/// Obtained via [`ArcCache::metrics()`] with a single lock acquisition.
+/// All counters are monotonically increasing for the lifetime of the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheMetrics {
+    /// Number of read requests satisfied from the cache.
+    pub hits: u64,
+    /// Number of read requests that required a device read.
+    pub misses: u64,
+    /// Number of resident blocks evicted to make room for new entries.
+    pub evictions: u64,
+    /// Current number of blocks in the T1 (recently accessed) list.
+    pub t1_len: usize,
+    /// Current number of blocks in the T2 (frequently accessed) list.
+    pub t2_len: usize,
+    /// Current number of ghost entries in B1 (evicted from T1).
+    pub b1_len: usize,
+    /// Current number of ghost entries in B2 (evicted from T2).
+    pub b2_len: usize,
+    /// Total number of resident (cached) blocks.
+    pub resident: usize,
+    /// Maximum cache capacity in blocks.
+    pub capacity: usize,
+    /// Current adaptive target size for T1.
+    pub p: usize,
+}
+
+impl CacheMetrics {
+    /// Cache hit ratio in the range [0.0, 1.0].
+    ///
+    /// Returns 0.0 if no accesses have been made.
+    #[must_use]
+    pub fn hit_ratio(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArcList {
     T1,
@@ -324,6 +367,12 @@ struct ArcState {
     b2: VecDeque<BlockNumber>,
     loc: HashMap<BlockNumber, ArcList>,
     resident: HashMap<BlockNumber, Vec<u8>>,
+    /// Monotonic hit counter (resident data found).
+    hits: u64,
+    /// Monotonic miss counter (device read required).
+    misses: u64,
+    /// Monotonic eviction counter (resident block displaced).
+    evictions: u64,
 }
 
 impl ArcState {
@@ -337,6 +386,9 @@ impl ArcState {
             b2: VecDeque::new(),
             loc: HashMap::new(),
             resident: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
         }
     }
 
@@ -346,6 +398,21 @@ impl ArcState {
 
     fn total_len(&self) -> usize {
         self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len()
+    }
+
+    fn snapshot_metrics(&self) -> CacheMetrics {
+        CacheMetrics {
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+            t1_len: self.t1.len(),
+            t2_len: self.t2.len(),
+            b1_len: self.b1.len(),
+            b2_len: self.b2.len(),
+            resident: self.resident_len(),
+            capacity: self.capacity,
+            p: self.p,
+        }
     }
 
     fn remove_from_list(list: &mut VecDeque<BlockNumber>, key: BlockNumber) -> bool {
@@ -392,11 +459,13 @@ impl ArcState {
                 self.loc.insert(victim, ArcList::B1);
                 let _ = self.resident.remove(&victim);
                 self.b1.push_back(victim);
+                self.evictions += 1;
             }
         } else if let Some(victim) = self.t2.pop_front() {
             self.loc.insert(victim, ArcList::B2);
             let _ = self.resident.remove(&victim);
             self.b2.push_back(victim);
+            self.evictions += 1;
         }
 
         while self.b1.len() > self.capacity {
@@ -412,10 +481,12 @@ impl ArcState {
     }
 
     fn on_hit(&mut self, key: BlockNumber) {
+        self.hits += 1;
         self.touch_mru(key);
     }
 
     fn on_miss_or_ghost_hit(&mut self, key: BlockNumber) {
+        self.misses += 1;
         // Defensive: callers use `resident.contains_key()` to decide hit vs miss.
         // If we ever see a "miss" for a resident key, treat it as a hit to avoid
         // duplicating list entries.
@@ -462,6 +533,7 @@ impl ArcState {
             } else if let Some(victim) = self.t1.pop_front() {
                 let _ = self.loc.remove(&victim);
                 let _ = self.resident.remove(&victim);
+                self.evictions += 1;
             }
         } else if l1_len < self.capacity && total_len >= self.capacity {
             if total_len >= self.capacity.saturating_mul(2) {
@@ -504,6 +576,15 @@ impl<D: BlockDevice> ArcCache<D> {
     #[must_use]
     pub fn inner(&self) -> &D {
         &self.inner
+    }
+
+    /// Take a snapshot of current cache metrics.
+    ///
+    /// Acquires the state lock briefly to read counters and list sizes.
+    /// The returned [`CacheMetrics`] is a frozen point-in-time snapshot.
+    #[must_use]
+    pub fn metrics(&self) -> CacheMetrics {
+        self.state.lock().snapshot_metrics()
     }
 }
 
@@ -752,5 +833,97 @@ mod tests {
         let guard = cache.state.lock();
         assert_eq!(guard.resident.len(), 2);
         drop(guard);
+    }
+
+    // ── CacheMetrics tests ──────────────────────────────────────────────
+
+    #[test]
+    fn cache_metrics_initial_state() {
+        let state = ArcState::new(4);
+        let m = state.snapshot_metrics();
+        assert_eq!(m.hits, 0);
+        assert_eq!(m.misses, 0);
+        assert_eq!(m.evictions, 0);
+        assert_eq!(m.t1_len, 0);
+        assert_eq!(m.t2_len, 0);
+        assert_eq!(m.b1_len, 0);
+        assert_eq!(m.b2_len, 0);
+        assert_eq!(m.resident, 0);
+        assert_eq!(m.capacity, 4);
+        assert_eq!(m.p, 0);
+        assert!(m.hit_ratio().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_metrics_track_hits_and_misses() {
+        let mut state = ArcState::new(4);
+        // First access to block 0: miss
+        arc_access(&mut state, BlockNumber(0));
+        let m = state.snapshot_metrics();
+        assert_eq!(m.misses, 1);
+        assert_eq!(m.hits, 0);
+
+        // Second access to block 0: hit (it's now resident)
+        arc_access(&mut state, BlockNumber(0));
+        let m = state.snapshot_metrics();
+        assert_eq!(m.misses, 1);
+        assert_eq!(m.hits, 1);
+        assert!((m.hit_ratio() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_metrics_track_evictions() {
+        let mut state = ArcState::new(2);
+        // Fill cache: blocks 0, 1
+        arc_access(&mut state, BlockNumber(0));
+        arc_access(&mut state, BlockNumber(1));
+        let m = state.snapshot_metrics();
+        assert_eq!(m.evictions, 0);
+        assert_eq!(m.resident, 2);
+
+        // Block 2 causes eviction
+        arc_access(&mut state, BlockNumber(2));
+        let m = state.snapshot_metrics();
+        assert_eq!(m.evictions, 1);
+        assert_eq!(m.resident, 2);
+    }
+
+    #[test]
+    fn cache_metrics_list_sizes() {
+        let mut state = ArcState::new(4);
+        arc_access(&mut state, BlockNumber(10));
+        arc_access(&mut state, BlockNumber(20));
+        let m = state.snapshot_metrics();
+        assert_eq!(m.t1_len, 2); // both in T1 (first access)
+        assert_eq!(m.t2_len, 0);
+
+        // Hit block 10: moves T1 → T2
+        arc_access(&mut state, BlockNumber(10));
+        let m = state.snapshot_metrics();
+        assert_eq!(m.t1_len, 1);
+        assert_eq!(m.t2_len, 1);
+    }
+
+    #[test]
+    fn arc_cache_metrics_via_block_device() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 4).expect("cache");
+
+        let m = cache.metrics();
+        assert_eq!(m.hits, 0);
+        assert_eq!(m.misses, 0);
+
+        let _ = cache.read_block(&cx, BlockNumber(0)).expect("read0");
+        let m = cache.metrics();
+        assert_eq!(m.misses, 1);
+        assert_eq!(m.hits, 0);
+
+        let _ = cache.read_block(&cx, BlockNumber(0)).expect("read0 again");
+        let m = cache.metrics();
+        assert_eq!(m.misses, 1);
+        assert_eq!(m.hits, 1);
+        assert!((m.hit_ratio() - 0.5).abs() < f64::EPSILON);
     }
 }
