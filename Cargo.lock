@@ -373,6 +373,8 @@ name = "ffs-btrfs"
 version = "0.1.0"
 dependencies = [
  "ffs-ondisk",
+ "ffs-types",
+ "serde_json",
 ]
 
 [[package]]
@@ -394,6 +396,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "ffs-block",
+ "ffs-btrfs",
  "ffs-error",
  "ffs-mvcc",
  "ffs-ondisk",

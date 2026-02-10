@@ -4,12 +4,13 @@ use asupersync::{Cx, RaptorQConfig};
 use ffs_block::{
     ByteDevice, FileByteDevice, read_btrfs_superblock_region, read_ext4_superblock_region,
 };
+use ffs_btrfs::{BtrfsLeafEntry, walk_tree};
 use ffs_error::FfsError;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc, Ext4ImageReader,
-    Ext4Inode, Ext4Superblock, ExtentTree, lookup_in_dir_block, parse_dir_block, parse_extent_tree,
-    parse_inode_extent_tree,
+    BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc,
+    Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, lookup_in_dir_block, parse_dir_block,
+    parse_extent_tree, parse_inode_extent_tree, parse_sys_chunk_array,
 };
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot,
@@ -138,6 +139,19 @@ pub struct Ext4Geometry {
     pub has_metadata_csum: bool,
 }
 
+/// Pre-computed btrfs context derived from the superblock.
+///
+/// Contains the parsed sys_chunk logical-to-physical mapping and the node
+/// size, computed once at open time so that tree-walk operations do not
+/// re-parse the chunk array on every call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BtrfsContext {
+    /// Parsed sys_chunk logical-to-physical mapping entries.
+    pub chunks: Vec<BtrfsChunkEntry>,
+    /// Tree node size in bytes.
+    pub nodesize: u32,
+}
+
 /// An opened filesystem image, ready for VFS operations.
 ///
 /// `OpenFs` bundles a validated superblock, pre-computed geometry, and the
@@ -156,6 +170,8 @@ pub struct OpenFs {
     pub flavor: FsFlavor,
     /// Pre-computed ext4 geometry (None for btrfs).
     pub ext4_geometry: Option<Ext4Geometry>,
+    /// Pre-computed btrfs context (None for ext4).
+    pub btrfs_context: Option<BtrfsContext>,
     /// Block device for I/O operations.
     dev: Box<dyn ByteDevice>,
 }
@@ -165,6 +181,7 @@ impl std::fmt::Debug for OpenFs {
         f.debug_struct("OpenFs")
             .field("flavor", &self.flavor)
             .field("ext4_geometry", &self.ext4_geometry)
+            .field("btrfs_context", &self.btrfs_context)
             .field("dev_len", &self.dev.len_bytes())
             .finish()
     }
@@ -199,12 +216,12 @@ impl OpenFs {
             DetectionError::Io(ffs_err) => ffs_err,
         })?;
 
-        let ext4_geometry = match &flavor {
+        let (ext4_geometry, btrfs_context) = match &flavor {
             FsFlavor::Ext4(sb) => {
                 if !options.skip_validation {
                     sb.validate_v1().map_err(|e| parse_error_to_ffs(&e))?;
                 }
-                Some(Ext4Geometry {
+                let geom = Ext4Geometry {
                     block_size: sb.block_size,
                     inodes_count: sb.inodes_count,
                     inodes_per_group: sb.inodes_per_group,
@@ -215,14 +232,27 @@ impl OpenFs {
                     csum_seed: sb.csum_seed(),
                     is_64bit: sb.is_64bit(),
                     has_metadata_csum: sb.has_metadata_csum(),
-                })
+                };
+                (Some(geom), None)
             }
-            FsFlavor::Btrfs(_) => None,
+            FsFlavor::Btrfs(sb) => {
+                if !options.skip_validation {
+                    validate_btrfs_superblock(sb)?;
+                }
+                let chunks = parse_sys_chunk_array(&sb.sys_chunk_array)
+                    .map_err(|e| parse_to_ffs_error(&e))?;
+                let ctx = BtrfsContext {
+                    chunks,
+                    nodesize: sb.nodesize,
+                };
+                (None, Some(ctx))
+            }
         };
 
         Ok(Self {
             flavor,
             ext4_geometry,
+            btrfs_context,
             dev,
         })
     }
@@ -267,6 +297,70 @@ impl OpenFs {
             FsFlavor::Ext4(sb) => Some(sb),
             FsFlavor::Btrfs(_) => None,
         }
+    }
+
+    /// Return the btrfs superblock, or `None` if this is not btrfs.
+    #[must_use]
+    pub fn btrfs_superblock(&self) -> Option<&BtrfsSuperblock> {
+        match &self.flavor {
+            FsFlavor::Btrfs(sb) => Some(sb),
+            FsFlavor::Ext4(_) => None,
+        }
+    }
+
+    /// Return the btrfs context (chunk mapping + nodesize), or `None` if not btrfs.
+    #[must_use]
+    pub fn btrfs_context(&self) -> Option<&BtrfsContext> {
+        self.btrfs_context.as_ref()
+    }
+
+    // ── Btrfs tree-walk via device ───────────────────────────────────
+
+    /// Walk a btrfs tree from the given logical root, reading nodes via the device.
+    ///
+    /// Uses the sys_chunk logical-to-physical mapping to translate addresses,
+    /// then reads each node from the block device. Returns all leaf items in
+    /// key order (left-to-right DFS).
+    ///
+    /// Returns `FfsError::Format` if this is not a btrfs filesystem.
+    pub fn walk_btrfs_tree(
+        &self,
+        cx: &Cx,
+        root_logical: u64,
+    ) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        let ctx = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+
+        let nodesize = ctx.nodesize;
+        let ns =
+            usize::try_from(nodesize).map_err(|_| FfsError::Format("nodesize overflow".into()))?;
+
+        let mut read_fn = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            let mut buf = vec![0_u8; ns];
+            self.dev
+                .read_exact_at(cx, ByteOffset(phys), &mut buf)
+                .map_err(|_| ParseError::InsufficientData {
+                    needed: ns,
+                    offset: 0,
+                    actual: 0,
+                })?;
+            Ok(buf)
+        };
+
+        walk_tree(&mut read_fn, &ctx.chunks, root_logical, nodesize)
+            .map_err(|e| parse_to_ffs_error(&e))
+    }
+
+    /// Walk the btrfs root tree, returning all leaf items.
+    ///
+    /// Convenience wrapper around [`walk_btrfs_tree`](Self::walk_btrfs_tree)
+    /// that uses the superblock's `root` address.
+    pub fn walk_btrfs_root_tree(&self, cx: &Cx) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        let sb = self
+            .btrfs_superblock()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        self.walk_btrfs_tree(cx, sb.root)
     }
 
     /// Read a group descriptor via the device.
@@ -668,6 +762,28 @@ fn dir_logical_block_count(file_size: u64, block_size: u64) -> Result<u32, FfsEr
         block: 0,
         detail: "directory block count overflow".into(),
     })
+}
+
+/// Validate btrfs superblock fields at mount time.
+///
+/// Checks that `sectorsize` and `nodesize` are within the range accepted
+/// by the kernel and are consistent with each other.
+fn validate_btrfs_superblock(sb: &BtrfsSuperblock) -> Result<(), FfsError> {
+    // sectorsize: power of 2, [512, 4096]
+    if sb.sectorsize < 512 || sb.sectorsize > 4096 {
+        return Err(FfsError::InvalidGeometry(format!(
+            "btrfs sectorsize {} out of range [512, 4096]",
+            sb.sectorsize
+        )));
+    }
+    // nodesize: power of 2, [sectorsize, 65536]
+    if sb.nodesize < sb.sectorsize || sb.nodesize > 65536 {
+        return Err(FfsError::InvalidGeometry(format!(
+            "btrfs nodesize {} out of range [{}, 65536]",
+            sb.nodesize, sb.sectorsize
+        )));
+    }
+    Ok(())
 }
 
 /// Convert a mount-time `ParseError` into the appropriate `FfsError` variant.
@@ -3339,5 +3455,202 @@ mod tests {
         assert_eq!(deser.passed, 1);
         assert_eq!(deser.failed, 0);
         assert!(deser.healthy);
+    }
+
+    // ── Btrfs OpenFs tests ──────────────────────────────────────────────
+
+    /// Build a minimal synthetic btrfs image with a sys_chunk_array and a leaf
+    /// node at the root tree address.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_btrfs_image() -> Vec<u8> {
+        let image_size: usize = 256 * 1024; // 256 KB
+        let mut image = vec![0_u8; image_size];
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+
+        // magic
+        image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        // generation
+        image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes());
+        // root (logical address of root tree leaf)
+        let root_logical = 0x4000_u64;
+        image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_logical.to_le_bytes());
+        // chunk_root (set to 0 — we only use sys_chunk_array)
+        image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes());
+        // total_bytes
+        image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
+        // root_dir_objectid
+        image[sb_off + 0x80..sb_off + 0x88].copy_from_slice(&256_u64.to_le_bytes());
+        // num_devices
+        image[sb_off + 0x88..sb_off + 0x90].copy_from_slice(&1_u64.to_le_bytes());
+        // sectorsize = 4096
+        image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&4096_u32.to_le_bytes());
+        // nodesize = 4096
+        image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&4096_u32.to_le_bytes());
+        // stripesize = 4096
+        image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&4096_u32.to_le_bytes());
+
+        // Build sys_chunk_array: one chunk, identity mapping [0, 256K) → [0, 256K)
+        let mut chunk_array = Vec::new();
+        // disk_key: objectid=256, type=228, offset=0
+        chunk_array.extend_from_slice(&256_u64.to_le_bytes());
+        chunk_array.push(228_u8);
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        // chunk: length, owner, stripe_len, type
+        chunk_array.extend_from_slice(&(image_size as u64).to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0x1_0000_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        // io_align, io_width, sector_size
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        // num_stripes=1, sub_stripes=0
+        chunk_array.extend_from_slice(&1_u16.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u16.to_le_bytes());
+        // stripe: devid=1, offset=0 (identity), dev_uuid=[0;16]
+        chunk_array.extend_from_slice(&1_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&[0_u8; 16]);
+
+        // sys_chunk_array_size
+        let array_size = chunk_array.len() as u32;
+        image[sb_off + 0xA0..sb_off + 0xA4].copy_from_slice(&array_size.to_le_bytes());
+        // sys_chunk_array data (at offset 0x32B from sb region start)
+        let array_start = sb_off + 0x32B;
+        image[array_start..array_start + chunk_array.len()].copy_from_slice(&chunk_array);
+        // root_level = 0 (leaf)
+        image[sb_off + 0xC6] = 0;
+
+        // Write a leaf node at physical 0x4000 (= root_logical via identity map)
+        let leaf_off = root_logical as usize;
+        // btrfs header: bytenr
+        image[leaf_off + 0x30..leaf_off + 0x38].copy_from_slice(&root_logical.to_le_bytes());
+        // generation
+        image[leaf_off + 0x50..leaf_off + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        // owner (ROOT_TREE = 1)
+        image[leaf_off + 0x58..leaf_off + 0x60].copy_from_slice(&1_u64.to_le_bytes());
+        // nritems = 1
+        image[leaf_off + 0x60..leaf_off + 0x64].copy_from_slice(&1_u32.to_le_bytes());
+        // level = 0 (leaf)
+        image[leaf_off + 0x64] = 0;
+
+        // Leaf item 0 at header_size=101
+        let item_off = leaf_off + 101;
+        // key: objectid=256, type=132 (ROOT_ITEM), offset=0
+        image[item_off..item_off + 8].copy_from_slice(&256_u64.to_le_bytes());
+        image[item_off + 8] = 132;
+        image[item_off + 9..item_off + 17].copy_from_slice(&0_u64.to_le_bytes());
+        // data_offset=200, data_size=8
+        image[item_off + 17..item_off + 21].copy_from_slice(&200_u32.to_le_bytes());
+        image[item_off + 21..item_off + 25].copy_from_slice(&8_u32.to_le_bytes());
+        // Actual data at leaf_off + 200
+        image[leaf_off + 200..leaf_off + 208]
+            .copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF]);
+
+        image
+    }
+
+    #[test]
+    fn open_fs_from_btrfs_image() {
+        let image = build_btrfs_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert!(fs.is_btrfs());
+        assert!(!fs.is_ext4());
+        assert_eq!(fs.block_size(), 4096);
+        assert!(fs.ext4_geometry.is_none());
+        assert!(fs.btrfs_context.is_some());
+
+        let ctx = fs.btrfs_context().unwrap();
+        assert_eq!(ctx.nodesize, 4096);
+        assert_eq!(ctx.chunks.len(), 1);
+    }
+
+    #[test]
+    fn open_fs_btrfs_debug_format() {
+        let image = build_btrfs_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let debug = format!("{fs:?}");
+        assert!(debug.contains("OpenFs"));
+        assert!(debug.contains("btrfs_context"));
+    }
+
+    #[test]
+    fn open_fs_btrfs_superblock_accessor() {
+        let image = build_btrfs_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let sb = fs.btrfs_superblock().expect("btrfs superblock");
+        assert_eq!(sb.magic, BTRFS_MAGIC);
+        assert_eq!(sb.sectorsize, 4096);
+        assert_eq!(sb.nodesize, 4096);
+    }
+
+    #[test]
+    fn open_fs_btrfs_walk_root_tree() {
+        let image = build_btrfs_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let items = fs.walk_btrfs_root_tree(&cx).expect("walk root tree");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.objectid, 256);
+        assert_eq!(items[0].key.item_type, 132);
+        assert_eq!(
+            items[0].data,
+            vec![0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[test]
+    fn open_fs_btrfs_walk_on_ext4_errors() {
+        let image = build_ext4_image(2);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let err = fs.walk_btrfs_root_tree(&cx).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EINVAL);
+    }
+
+    #[test]
+    fn validate_btrfs_rejects_bad_nodesize() {
+        let mut image = build_btrfs_image();
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+        // Set nodesize to 128K (too large for our validation)
+        image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&(128 * 1024_u32).to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let err = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap_err();
+        assert!(
+            matches!(err, FfsError::InvalidGeometry(_)),
+            "expected InvalidGeometry, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_btrfs_skip_validation() {
+        let mut image = build_btrfs_image();
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+        // Set nodesize to 128K (too large)
+        image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&(128 * 1024_u32).to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            skip_validation: true,
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
+        assert!(fs.is_btrfs());
+        assert!(fs.btrfs_context.is_some());
     }
 }

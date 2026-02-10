@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 asupersync = { workspace = true }
 ffs-block = { workspace = true }
+ffs-btrfs = { workspace = true }
 ffs-error = { workspace = true }
 ffs-mvcc = { workspace = true }
 ffs-ondisk = { workspace = true }
