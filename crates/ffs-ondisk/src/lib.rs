@@ -10,8 +10,8 @@ pub mod btrfs;
 pub mod ext4;
 
 pub use btrfs::{
-    BtrfsChunkEntry, BtrfsHeader, BtrfsItem, BtrfsKey, BtrfsStripe, BtrfsSuperblock,
-    parse_leaf_items, parse_sys_chunk_array,
+    BtrfsChunkEntry, BtrfsHeader, BtrfsItem, BtrfsKey, BtrfsPhysicalMapping, BtrfsStripe,
+    BtrfsSuperblock, map_logical_to_physical, parse_leaf_items, parse_sys_chunk_array,
 };
 pub use ext4::{
     DirBlockIter, Ext4CompatFeatures, Ext4DirEntry, Ext4DirEntryRef, Ext4DirEntryTail, Ext4DxEntry,

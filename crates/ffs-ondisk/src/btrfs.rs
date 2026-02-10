@@ -315,6 +315,61 @@ pub fn parse_sys_chunk_array(data: &[u8]) -> Result<Vec<BtrfsChunkEntry>, ParseE
     Ok(entries)
 }
 
+// ── Logical → physical mapping ──────────────────────────────────────────────
+
+/// Result of a logical-to-physical bytenr mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsPhysicalMapping {
+    pub devid: u64,
+    pub physical: u64,
+}
+
+/// Map a logical byte address to a physical (device, offset) pair using
+/// only the sys_chunk_array entries.
+///
+/// This is the bootstrap mapping needed to read the chunk tree and root
+/// tree from a single-device btrfs image. For multi-device or RAID
+/// layouts, the full chunk tree is required.
+///
+/// Returns `Ok(Some(mapping))` if the logical address is covered,
+/// `Ok(None)` if no chunk covers it, or `Err` on malformed data.
+pub fn map_logical_to_physical(
+    chunks: &[BtrfsChunkEntry],
+    logical: u64,
+) -> Result<Option<BtrfsPhysicalMapping>, ParseError> {
+    for chunk in chunks {
+        let chunk_start = chunk.key.offset;
+        let chunk_end = chunk_start
+            .checked_add(chunk.length)
+            .ok_or(ParseError::InvalidField {
+                field: "chunk_length",
+                reason: "logical range overflow",
+            })?;
+
+        if logical >= chunk_start && logical < chunk_end {
+            let offset_within = logical - chunk_start;
+            // Use the first stripe (single-device assumption).
+            let stripe = chunk.stripes.first().ok_or(ParseError::InvalidField {
+                field: "stripes",
+                reason: "chunk has no stripes",
+            })?;
+            let physical =
+                stripe
+                    .offset
+                    .checked_add(offset_within)
+                    .ok_or(ParseError::InvalidField {
+                        field: "stripe_offset",
+                        reason: "physical address overflow",
+                    })?;
+            return Ok(Some(BtrfsPhysicalMapping {
+                devid: stripe.devid,
+                physical,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 // ── Tree node types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,6 +610,72 @@ mod tests {
             ),
             "expected nodesize error, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn map_logical_to_physical_hit() {
+        let chunks = vec![BtrfsChunkEntry {
+            key: BtrfsKey {
+                objectid: 256,
+                item_type: 228,
+                offset: 0x100_0000, // logical start = 16 MiB
+            },
+            length: 0x80_0000, // 8 MiB
+            owner: 2,
+            stripe_len: 0x1_0000,
+            chunk_type: 2,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            num_stripes: 1,
+            sub_stripes: 0,
+            stripes: vec![BtrfsStripe {
+                devid: 1,
+                offset: 0x20_0000, // physical start = 2 MiB
+                dev_uuid: [0; 16],
+            }],
+        }];
+
+        // Hit: logical 16.5 MiB → physical 2.5 MiB
+        let result = map_logical_to_physical(&chunks, 0x108_0000).expect("mapping should succeed");
+        let mapping = result.expect("should find a mapping");
+        assert_eq!(mapping.devid, 1);
+        assert_eq!(mapping.physical, 0x28_0000);
+    }
+
+    #[test]
+    fn map_logical_to_physical_miss() {
+        let chunks = vec![BtrfsChunkEntry {
+            key: BtrfsKey {
+                objectid: 256,
+                item_type: 228,
+                offset: 0x100_0000,
+            },
+            length: 0x80_0000,
+            owner: 2,
+            stripe_len: 0x1_0000,
+            chunk_type: 2,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            num_stripes: 1,
+            sub_stripes: 0,
+            stripes: vec![BtrfsStripe {
+                devid: 1,
+                offset: 0x20_0000,
+                dev_uuid: [0; 16],
+            }],
+        }];
+
+        // Miss: logical address outside the chunk range
+        let result = map_logical_to_physical(&chunks, 0x200_0000).expect("no error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn map_logical_to_physical_empty_chunks() {
+        let result = map_logical_to_physical(&[], 0x1000).expect("no error");
+        assert!(result.is_none());
     }
 
     #[test]
