@@ -268,6 +268,105 @@ impl BlockNumber {
     pub fn checked_sub(self, count: u64) -> Option<Self> {
         self.0.checked_sub(count).map(Self)
     }
+
+    /// Convert this block number to its byte offset using the given block size.
+    ///
+    /// Returns `None` on overflow.
+    #[must_use]
+    pub fn to_byte_offset(self, block_size: BlockSize) -> Option<ByteOffset> {
+        checked_mul_block(self, block_size)
+    }
+
+    /// Narrow to `u32`, returning `ParseError::IntegerConversion` on overflow.
+    pub fn to_u32(self) -> Result<u32, ParseError> {
+        u32::try_from(self.0).map_err(|_| ParseError::IntegerConversion {
+            field: "block_number",
+        })
+    }
+}
+
+impl ByteOffset {
+    /// Round down to the nearest multiple of `alignment` (must be a non-zero power of two).
+    ///
+    /// Returns `None` if `alignment` is zero or not a power of two.
+    #[must_use]
+    pub fn align_down(self, alignment: u64) -> Option<Self> {
+        align_down(self.0, alignment).map(Self)
+    }
+
+    /// Round up to the nearest multiple of `alignment` (must be a non-zero power of two).
+    ///
+    /// Returns `None` on overflow or if `alignment` is invalid.
+    #[must_use]
+    pub fn align_up(self, alignment: u64) -> Option<Self> {
+        align_up(self.0, alignment).map(Self)
+    }
+
+    /// Narrow to `usize`, returning `ParseError::IntegerConversion` on overflow.
+    pub fn to_usize(self) -> Result<usize, ParseError> {
+        usize::try_from(self.0).map_err(|_| ParseError::IntegerConversion {
+            field: "byte_offset",
+        })
+    }
+}
+
+// ── Free-standing checked arithmetic functions ──────────────────────────────
+
+/// Add a byte length to a byte offset, returning the end position.
+///
+/// Returns `None` on overflow. Equivalent to `offset.checked_add(len)` but
+/// named for clarity at call sites that compute "offset + length = end".
+#[must_use]
+pub fn checked_add_bytes(offset: ByteOffset, len: u64) -> Option<ByteOffset> {
+    offset.checked_add(len)
+}
+
+/// Compute the byte offset of a block number given a block size.
+///
+/// Returns `None` on overflow.
+#[must_use]
+pub fn checked_mul_block(block: BlockNumber, block_size: BlockSize) -> Option<ByteOffset> {
+    block
+        .0
+        .checked_mul(u64::from(block_size.get()))
+        .map(ByteOffset)
+}
+
+/// Round `value` down to the nearest multiple of `alignment`.
+///
+/// `alignment` must be a non-zero power of two; returns `None` otherwise.
+#[must_use]
+pub fn align_down(value: u64, alignment: u64) -> Option<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    Some(value & !(alignment - 1))
+}
+
+/// Round `value` up to the nearest multiple of `alignment`.
+///
+/// `alignment` must be a non-zero power of two; returns `None` on overflow
+/// or if `alignment` is invalid.
+#[must_use]
+pub fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    let mask = alignment - 1;
+    value.checked_add(mask).map(|v| v & !mask)
+}
+
+/// Narrow a `u64` to `usize` with an explicit error path.
+///
+/// On 64-bit platforms this is infallible; on 32-bit it can fail.
+/// The `field` label is included in the error for diagnostics.
+pub fn u64_to_usize(value: u64, field: &'static str) -> Result<usize, ParseError> {
+    usize::try_from(value).map_err(|_| ParseError::IntegerConversion { field })
+}
+
+/// Narrow a `u64` to `u32` with an explicit error path.
+pub fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, ParseError> {
+    u32::try_from(value).map_err(|_| ParseError::IntegerConversion { field })
 }
 
 /// Compute the block group that contains a given block.
@@ -431,5 +530,152 @@ mod tests {
     fn test_inode_constants() {
         assert_eq!(InodeNumber::ROOT, InodeNumber(2));
         assert_eq!(InodeNumber::JOURNAL, InodeNumber(8));
+    }
+
+    // ── bd-sik: checked arithmetic + alignment tests ────────────────────
+
+    #[test]
+    fn test_checked_add_bytes() {
+        let base = ByteOffset(1024);
+        assert_eq!(checked_add_bytes(base, 512), Some(ByteOffset(1536)));
+        assert_eq!(checked_add_bytes(base, 0), Some(ByteOffset(1024)));
+        assert_eq!(checked_add_bytes(ByteOffset(u64::MAX), 1), None);
+        assert_eq!(checked_add_bytes(ByteOffset(u64::MAX - 10), 11), None);
+        assert_eq!(
+            checked_add_bytes(ByteOffset(u64::MAX - 10), 10),
+            Some(ByteOffset(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn test_checked_mul_block() {
+        let bs = BlockSize::new(4096).unwrap();
+        assert_eq!(checked_mul_block(BlockNumber(0), bs), Some(ByteOffset(0)));
+        assert_eq!(
+            checked_mul_block(BlockNumber(1), bs),
+            Some(ByteOffset(4096))
+        );
+        assert_eq!(
+            checked_mul_block(BlockNumber(256), bs),
+            Some(ByteOffset(1_048_576))
+        );
+        // Overflow: huge block number * block size
+        assert_eq!(checked_mul_block(BlockNumber(u64::MAX), bs), None);
+        // Large but valid
+        let large_block = u64::MAX / 4096;
+        assert!(checked_mul_block(BlockNumber(large_block), bs).is_some());
+        assert_eq!(checked_mul_block(BlockNumber(large_block + 1), bs), None);
+    }
+
+    #[test]
+    fn test_block_number_to_byte_offset() {
+        let bs = BlockSize::new(4096).unwrap();
+        assert_eq!(BlockNumber(10).to_byte_offset(bs), Some(ByteOffset(40960)));
+        assert_eq!(BlockNumber(u64::MAX).to_byte_offset(bs), None);
+    }
+
+    #[test]
+    fn test_block_number_to_u32() {
+        assert_eq!(BlockNumber(0).to_u32(), Ok(0));
+        assert_eq!(BlockNumber(u64::from(u32::MAX)).to_u32(), Ok(u32::MAX));
+        assert!(BlockNumber(u64::from(u32::MAX) + 1).to_u32().is_err());
+    }
+
+    #[test]
+    fn test_align_down() {
+        // 4K alignment
+        assert_eq!(align_down(4096, 4096), Some(4096));
+        assert_eq!(align_down(4097, 4096), Some(4096));
+        assert_eq!(align_down(8191, 4096), Some(4096));
+        assert_eq!(align_down(8192, 4096), Some(8192));
+        assert_eq!(align_down(0, 4096), Some(0));
+        // 1-byte alignment (trivial)
+        assert_eq!(align_down(12345, 1), Some(12345));
+        // Large values
+        assert_eq!(align_down(u64::MAX, 4096), Some(u64::MAX - 4095));
+        // Invalid: zero alignment
+        assert_eq!(align_down(100, 0), None);
+        // Invalid: non-power-of-two
+        assert_eq!(align_down(100, 3), None);
+        assert_eq!(align_down(100, 6), None);
+    }
+
+    #[test]
+    fn test_align_up() {
+        // 4K alignment
+        assert_eq!(align_up(4096, 4096), Some(4096));
+        assert_eq!(align_up(4097, 4096), Some(8192));
+        assert_eq!(align_up(1, 4096), Some(4096));
+        assert_eq!(align_up(0, 4096), Some(0));
+        // 1-byte alignment (trivial)
+        assert_eq!(align_up(12345, 1), Some(12345));
+        // Overflow: aligning MAX up
+        assert_eq!(align_up(u64::MAX, 4096), None);
+        assert_eq!(align_up(u64::MAX - 4094, 4096), None);
+        // Edge: just fits
+        assert_eq!(align_up(u64::MAX - 4095, 4096), Some(u64::MAX - 4095));
+        // Invalid: zero alignment
+        assert_eq!(align_up(100, 0), None);
+        // Invalid: non-power-of-two
+        assert_eq!(align_up(100, 3), None);
+    }
+
+    #[test]
+    fn test_byte_offset_align_methods() {
+        let off = ByteOffset(5000);
+        assert_eq!(off.align_down(4096), Some(ByteOffset(4096)));
+        assert_eq!(off.align_up(4096), Some(ByteOffset(8192)));
+
+        let aligned = ByteOffset(8192);
+        assert_eq!(aligned.align_down(4096), Some(ByteOffset(8192)));
+        assert_eq!(aligned.align_up(4096), Some(ByteOffset(8192)));
+
+        // Invalid alignment
+        assert_eq!(off.align_down(0), None);
+        assert_eq!(off.align_up(0), None);
+    }
+
+    #[test]
+    fn test_byte_offset_to_usize() {
+        assert_eq!(ByteOffset(0).to_usize(), Ok(0));
+        assert_eq!(ByteOffset(1024).to_usize(), Ok(1024));
+        // On 64-bit platforms, u64::MAX should fit in usize.
+        // On 32-bit platforms it wouldn't, but we test the error path
+        // with a value that won't fit in u32.
+        #[cfg(target_pointer_width = "64")]
+        assert!(ByteOffset(u64::MAX).to_usize().is_ok());
+    }
+
+    #[test]
+    fn test_u64_to_usize() {
+        assert_eq!(u64_to_usize(42, "test"), Ok(42));
+        assert_eq!(u64_to_usize(0, "test"), Ok(0));
+    }
+
+    #[test]
+    fn test_u64_to_u32() {
+        assert_eq!(u64_to_u32(0, "test"), Ok(0));
+        assert_eq!(u64_to_u32(u64::from(u32::MAX), "test"), Ok(u32::MAX));
+        assert!(u64_to_u32(u64::from(u32::MAX) + 1, "test").is_err());
+        assert!(u64_to_u32(u64::MAX, "test").is_err());
+    }
+
+    #[test]
+    fn test_align_power_of_two_boundaries() {
+        // Exhaustive check for small powers of two
+        for shift in 0..16 {
+            let alignment = 1_u64 << shift;
+            // Zero always aligns
+            assert_eq!(align_down(0, alignment), Some(0));
+            assert_eq!(align_up(0, alignment), Some(0));
+            // alignment itself always aligns
+            assert_eq!(align_down(alignment, alignment), Some(alignment));
+            assert_eq!(align_up(alignment, alignment), Some(alignment));
+            // alignment - 1 rounds down to 0, up to alignment
+            if alignment > 1 {
+                assert_eq!(align_down(alignment - 1, alignment), Some(0));
+                assert_eq!(align_up(alignment - 1, alignment), Some(alignment));
+            }
+        }
     }
 }
