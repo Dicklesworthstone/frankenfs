@@ -2,33 +2,62 @@
 
 use anyhow::{Context, Result, bail};
 use asupersync::{Budget, Cx};
+use clap::{Parser, Subcommand};
 use ffs_core::{FsFlavor, FsOps, OpenFs, detect_filesystem_at_path};
 use ffs_fuse::MountOptions;
-use ftui::{Style, Theme};
+use ffs_harness::ParityReport;
 use serde::Serialize;
-use std::env;
-use std::path::Path;
+use std::path::PathBuf;
 
 // ── Production Cx acquisition ───────────────────────────────────────────────
 
-/// Create a production `Cx` for CLI commands.
-///
-/// Uses ephemeral region/task IDs (not test IDs) and an infinite budget
-/// for synchronous CLI operations. When timeout support is needed, use
-/// `cli_cx_with_timeout` instead.
-///
-/// Future: integrate `ShutdownController` + SIGINT handler here once
-/// asupersync's signal module reaches Phase 1.
 fn cli_cx() -> Cx {
     Cx::for_request()
 }
 
-/// Create a production `Cx` with a deadline budget for CLI commands that
-/// should be time-bounded (e.g., fsck with a timeout).
 #[allow(dead_code)]
 fn cli_cx_with_timeout_secs(secs: u64) -> Cx {
     Cx::for_request_with_budget(Budget::with_deadline_secs(secs))
 }
+
+// ── CLI definition ──────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "ffs", about = "FrankenFS — memory-safe filesystem toolkit")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Inspect a filesystem image (ext4 or btrfs).
+    Inspect {
+        /// Path to the filesystem image.
+        image: PathBuf,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mount a filesystem image via FUSE (read-only).
+    Mount {
+        /// Path to the filesystem image.
+        image: PathBuf,
+        /// Mountpoint directory.
+        mountpoint: PathBuf,
+        /// Allow other users to access the mount.
+        #[arg(long)]
+        allow_other: bool,
+    },
+    /// Show feature parity coverage report.
+    Parity {
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// ── Serializable outputs ────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "filesystem", rename_all = "lowercase")]
@@ -47,6 +76,8 @@ enum InspectOutput {
     },
 }
 
+// ── Main ────────────────────────────────────────────────────────────────────
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error:#}");
@@ -55,56 +86,23 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut args = env::args().skip(1);
-    let Some(command) = args.next() else {
-        print_usage();
-        return Ok(());
-    };
+    let cli = Cli::parse();
 
-    match command.as_str() {
-        "inspect" => {
-            let Some(path) = args.next() else {
-                bail!("inspect requires a path argument");
-            };
-            let json = args.any(|arg| arg == "--json");
-            inspect(Path::new(&path), json)
-        }
-        "mount" => {
-            let Some(image_path) = args.next() else {
-                bail!("mount requires <image-path> <mountpoint>");
-            };
-            let Some(mountpoint) = args.next() else {
-                bail!("mount requires <image-path> <mountpoint>");
-            };
-            let remaining: Vec<String> = args.collect();
-            let allow_other = remaining.iter().any(|a| a == "--allow-other");
-            mount_cmd(Path::new(&image_path), Path::new(&mountpoint), allow_other)
-        }
-        "--help" | "-h" | "help" => {
-            print_usage();
-            Ok(())
-        }
-        _ => {
-            print_usage();
-            bail!("unknown command: {command}")
-        }
+    match cli.command {
+        Command::Inspect { image, json } => inspect(&image, json),
+        Command::Mount {
+            image,
+            mountpoint,
+            allow_other,
+        } => mount_cmd(&image, &mountpoint, allow_other),
+        Command::Parity { json } => parity(json),
     }
 }
 
-fn print_usage() {
-    println!("ffs-cli\n");
-    println!("USAGE:");
-    println!("  ffs-cli inspect <image-path> [--json]");
-    println!("  ffs-cli mount <image-path> <mountpoint> [--allow-other]");
-}
-
-fn inspect(path: &Path, json: bool) -> Result<()> {
+fn inspect(path: &PathBuf, json: bool) -> Result<()> {
     let cx = cli_cx();
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
-
-    let _theme = Theme::default();
-    let _headline = Style::new().bold().underline();
 
     let output = match flavor {
         FsFlavor::Ext4(sb) => InspectOutput::Ext4 {
@@ -159,7 +157,7 @@ fn inspect(path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn mount_cmd(image_path: &Path, mountpoint: &Path, allow_other: bool) -> Result<()> {
+fn mount_cmd(image_path: &PathBuf, mountpoint: &PathBuf, allow_other: bool) -> Result<()> {
     let cx = cli_cx();
     let open_fs = OpenFs::open(&cx, image_path)
         .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
@@ -190,6 +188,36 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, allow_other: bool) -> Result<
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
     ffs_fuse::mount(fs_ops, mountpoint, &opts)
         .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))?;
+
+    Ok(())
+}
+
+fn parity(json: bool) -> Result<()> {
+    let report = ParityReport::current();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize parity report")?
+        );
+    } else {
+        println!("FrankenFS Feature Parity Report");
+        println!();
+        for domain in &report.domains {
+            println!(
+                "  {:<35} {:>2}/{:<2}  ({:.1}%)",
+                domain.domain, domain.implemented, domain.total, domain.coverage_percent
+            );
+        }
+        println!();
+        println!(
+            "  {:<35} {:>2}/{:<2}  ({:.1}%)",
+            "OVERALL",
+            report.overall_implemented,
+            report.overall_total,
+            report.overall_coverage_percent
+        );
+    }
 
     Ok(())
 }
