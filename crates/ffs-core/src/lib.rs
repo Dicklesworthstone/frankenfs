@@ -6,7 +6,7 @@ use ffs_block::{
 };
 use ffs_error::FfsError;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
-use ffs_ondisk::{BtrfsSuperblock, Ext4Superblock};
+use ffs_ondisk::{BtrfsSuperblock, Ext4FileType, Ext4ImageReader, Ext4Inode, Ext4Superblock};
 use ffs_types::{BlockNumber, CommitSeq, InodeNumber, ParseError, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -110,6 +110,16 @@ impl Default for OpenOptions {
 /// downstream code does not re-derive them on every operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ext4Geometry {
+    /// Block size in bytes (1024, 2048, or 4096 for v1).
+    pub block_size: u32,
+    /// Total number of inodes.
+    pub inodes_count: u32,
+    /// Number of inodes per block group.
+    pub inodes_per_group: u32,
+    /// First non-reserved inode number.
+    pub first_ino: u32,
+    /// On-disk inode structure size in bytes.
+    pub inode_size: u16,
     /// Number of block groups.
     pub groups_count: u32,
     /// Size of each group descriptor (32 or 64 bytes).
@@ -118,6 +128,8 @@ pub struct Ext4Geometry {
     pub csum_seed: u32,
     /// Whether the filesystem uses 64-bit block addressing.
     pub is_64bit: bool,
+    /// Whether metadata_csum is enabled.
+    pub has_metadata_csum: bool,
 }
 
 /// An opened filesystem image, ready for VFS operations.
@@ -187,10 +199,16 @@ impl OpenFs {
                     sb.validate_v1().map_err(|e| parse_error_to_ffs(&e))?;
                 }
                 Some(Ext4Geometry {
+                    block_size: sb.block_size,
+                    inodes_count: sb.inodes_count,
+                    inodes_per_group: sb.inodes_per_group,
+                    first_ino: sb.first_ino,
+                    inode_size: sb.inode_size,
                     groups_count: sb.groups_count(),
                     group_desc_size: sb.group_desc_size(),
                     csum_seed: sb.csum_seed(),
                     is_64bit: sb.is_64bit(),
+                    has_metadata_csum: sb.has_metadata_csum(),
                 })
             }
             FsFlavor::Btrfs(_) => None,
@@ -255,6 +273,10 @@ fn parse_error_to_ffs(e: &ParseError) -> FfsError {
                 || field.contains("blocks_per_group")
                 || field.contains("inodes_per_group")
                 || field.contains("inode_size")
+                || field.contains("desc_size")
+                || field.contains("first_data_block")
+                || field.contains("blocks_count")
+                || field.contains("inodes_count")
             {
                 FfsError::InvalidGeometry(format!("{field}: {reason}"))
             }
@@ -402,6 +424,687 @@ pub trait FsOps: Send + Sync {
     /// `FfsError::IsDirectory` if `ino` is a directory.
     fn read(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32)
     -> ffs_error::Result<Vec<u8>>;
+
+    /// Read the target of a symbolic link.
+    ///
+    /// Returns the raw bytes of the symlink target. Returns
+    /// `FfsError::Format` if `ino` is not a symlink.
+    fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>>;
+}
+
+// ── Ext4FsOps: bridge from Ext4ImageReader to FsOps ───────────────────────
+
+/// Read-only ext4 filesystem operations backed by an in-memory image.
+///
+/// This is the bridge layer that connects the pure-parsing `Ext4ImageReader`
+/// (which operates on `&[u8]` slices) to the VFS-level `FsOps` trait (which
+/// the FUSE adapter and test harness consume).
+///
+/// # Design
+///
+/// The image is stored as `Arc<Vec<u8>>` so that `Ext4FsOps` is `Send + Sync`
+/// without copying. The `Ext4ImageReader` holds only the parsed superblock
+/// and pre-computed geometry — no mutable state — so concurrent reads are safe.
+pub struct Ext4FsOps {
+    reader: Ext4ImageReader,
+    image: std::sync::Arc<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Ext4FsOps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ext4FsOps")
+            .field("block_size", &self.reader.sb.block_size)
+            .field("image_len", &self.image.len())
+            .finish()
+    }
+}
+
+impl Ext4FsOps {
+    /// Create from an in-memory ext4 image.
+    ///
+    /// Parses the superblock and validates geometry. The image is wrapped
+    /// in `Arc` for zero-copy sharing.
+    pub fn new(image: Vec<u8>) -> Result<Self, FfsError> {
+        let reader = Ext4ImageReader::new(&image).map_err(|e| parse_to_ffs_error(&e))?;
+        Ok(Self {
+            reader,
+            image: std::sync::Arc::new(image),
+        })
+    }
+
+    /// Create from an already-shared image.
+    pub fn from_arc(image: std::sync::Arc<Vec<u8>>) -> Result<Self, FfsError> {
+        let reader = Ext4ImageReader::new(&image).map_err(|e| parse_to_ffs_error(&e))?;
+        Ok(Self { reader, image })
+    }
+
+    /// Access the underlying `Ext4ImageReader`.
+    #[must_use]
+    pub fn reader(&self) -> &Ext4ImageReader {
+        &self.reader
+    }
+
+    /// Access the raw image bytes.
+    #[must_use]
+    pub fn image(&self) -> &[u8] {
+        &self.image
+    }
+
+    /// Read and convert an inode to `InodeAttr`.
+    fn inode_to_attr(&self, ino: InodeNumber, inode: &Ext4Inode) -> InodeAttr {
+        let kind = inode_file_type(inode);
+        let blocks_512 = if (inode.flags & ffs_types::EXT4_HUGE_FILE_FL) != 0 {
+            // huge_file: i_blocks counts filesystem blocks, multiply by block_size/512
+            inode
+                .blocks
+                .saturating_mul(u64::from(self.reader.sb.block_size / 512))
+        } else {
+            inode.blocks
+        };
+
+        InodeAttr {
+            ino,
+            size: inode.size,
+            blocks: blocks_512,
+            atime: inode.atime_system_time(),
+            mtime: inode.mtime_system_time(),
+            ctime: inode.ctime_system_time(),
+            crtime: inode.crtime_system_time(),
+            kind,
+            perm: inode.permission_bits(),
+            nlink: u32::from(inode.links_count),
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev: 0,
+            blksize: self.reader.sb.block_size,
+        }
+    }
+}
+
+/// Convert `ParseError` to `FfsError` for runtime operations (not mount-time).
+fn parse_to_ffs_error(e: &ParseError) -> FfsError {
+    match e {
+        ParseError::InvalidField { field, reason } => {
+            if reason.contains("not found") || reason.contains("component not found") {
+                FfsError::NotFound(format!("{field}: {reason}"))
+            } else if reason.contains("not a directory") {
+                FfsError::NotDirectory
+            } else {
+                FfsError::Format(e.to_string())
+            }
+        }
+        ParseError::InvalidMagic { .. } => FfsError::Format(e.to_string()),
+        ParseError::InsufficientData { .. } | ParseError::IntegerConversion { .. } => {
+            FfsError::Corruption {
+                block: 0,
+                detail: e.to_string(),
+            }
+        }
+    }
+}
+
+/// Map ext4 inode mode to VFS `FileType`.
+fn inode_file_type(inode: &Ext4Inode) -> FileType {
+    if inode.is_regular() {
+        FileType::RegularFile
+    } else if inode.is_dir() {
+        FileType::Directory
+    } else if inode.is_symlink() {
+        FileType::Symlink
+    } else if inode.is_blkdev() {
+        FileType::BlockDevice
+    } else if inode.is_chrdev() {
+        FileType::CharDevice
+    } else if inode.is_fifo() {
+        FileType::Fifo
+    } else if inode.is_socket() {
+        FileType::Socket
+    } else {
+        FileType::RegularFile // fallback for unknown types
+    }
+}
+
+/// Map ext4 directory entry file type to VFS `FileType`.
+fn dir_entry_file_type(ft: Ext4FileType) -> FileType {
+    match ft {
+        Ext4FileType::Dir => FileType::Directory,
+        Ext4FileType::Symlink => FileType::Symlink,
+        Ext4FileType::Blkdev => FileType::BlockDevice,
+        Ext4FileType::Chrdev => FileType::CharDevice,
+        Ext4FileType::Fifo => FileType::Fifo,
+        Ext4FileType::Sock => FileType::Socket,
+        Ext4FileType::RegFile | Ext4FileType::Unknown => FileType::RegularFile,
+    }
+}
+
+impl FsOps for Ext4FsOps {
+    fn getattr(&self, _cx: &Cx, ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
+        let inode = self
+            .reader
+            .read_inode(&self.image, ino)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        Ok(self.inode_to_attr(ino, &inode))
+    }
+
+    fn lookup(&self, _cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<InodeAttr> {
+        let parent_inode = self
+            .reader
+            .read_inode(&self.image, parent)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let name_bytes = name.as_encoded_bytes();
+        let entry = self
+            .reader
+            .lookup(&self.image, &parent_inode, name_bytes)
+            .map_err(|e| parse_to_ffs_error(&e))?
+            .ok_or_else(|| FfsError::NotFound(name.to_string_lossy().into_owned()))?;
+
+        let child_ino = InodeNumber(u64::from(entry.inode));
+        let child_inode = self
+            .reader
+            .read_inode(&self.image, child_ino)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        Ok(self.inode_to_attr(child_ino, &child_inode))
+    }
+
+    fn readdir(&self, _cx: &Cx, ino: InodeNumber, offset: u64) -> ffs_error::Result<Vec<DirEntry>> {
+        let inode = self
+            .reader
+            .read_inode(&self.image, ino)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+
+        if !inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let raw_entries = self
+            .reader
+            .read_dir(&self.image, &inode)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+
+        // Convert to VFS DirEntry with offset cookies.
+        // Offset is 1-indexed position in the entry list.
+        let entries: Vec<DirEntry> = raw_entries
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| (*idx as u64) >= offset)
+            .map(|(idx, e)| DirEntry {
+                ino: InodeNumber(u64::from(e.inode)),
+                offset: (idx as u64) + 1,
+                kind: dir_entry_file_type(e.file_type),
+                name: e.name,
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    fn read(
+        &self,
+        _cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+    ) -> ffs_error::Result<Vec<u8>> {
+        let inode = self
+            .reader
+            .read_inode(&self.image, ino)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+
+        if inode.is_dir() {
+            return Err(FfsError::IsDirectory);
+        }
+
+        let mut buf = vec![0_u8; size as usize];
+        let n = self
+            .reader
+            .read_inode_data(&self.image, &inode, offset, &mut buf)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    fn readlink(&self, _cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+        let inode = self
+            .reader
+            .read_inode(&self.image, ino)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+
+        if !inode.is_symlink() {
+            return Err(FfsError::Format("not a symlink".into()));
+        }
+
+        self.reader
+            .read_symlink(&self.image, &inode)
+            .map_err(|e| parse_to_ffs_error(&e))
+    }
+}
+
+// ── Bayesian Filesystem Integrity Scanner ──────────────────────────────────
+//
+// Alien-artifact quality: cascading checksum verification with a formal
+// evidence ledger. Each verification step contributes a log-likelihood
+// observation to a Beta-Binomial posterior over the corruption rate.
+//
+// The posterior P(healthy|evidence) is computed via conjugate update:
+//   α += corrupted_count, β += clean_count
+// where clean = verified_ok and corrupted = checksum_mismatch.
+//
+// Decision theory: the expected corruption rate E[p] = α/(α+β) and the
+// upper credible bound p_hi = E[p] + z·√Var[p] provide actionable thresholds.
+
+/// Verdict for a single integrity check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckVerdict {
+    /// What was checked (e.g., "superblock", "group_desc[3]", "inode[142]").
+    pub component: String,
+    /// Whether the check passed.
+    pub passed: bool,
+    /// Human-readable detail (empty on success).
+    pub detail: String,
+}
+
+/// The complete evidence ledger from an integrity scan.
+///
+/// # Bayesian Model
+///
+/// We model each metadata object as a Bernoulli trial: P(corrupt) = p.
+/// Using a Beta(α, β) conjugate prior (default: uninformative Beta(1,1)),
+/// after observing n_clean clean objects and n_corrupt corrupted objects:
+///
+/// ```text
+/// Posterior: Beta(α + n_corrupt, β + n_clean)
+/// E[p] = α / (α + β)                           — expected corruption rate
+/// Var[p] = αβ / ((α+β)²(α+β+1))                — posterior variance
+/// p_hi = E[p] + z·√Var[p]                       — upper credible bound
+/// ```
+///
+/// A filesystem is "healthy" when p_hi < threshold (default 0.01).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityReport {
+    /// Per-component verdicts (evidence ledger).
+    pub verdicts: Vec<CheckVerdict>,
+    /// Number of checks that passed.
+    pub passed: u64,
+    /// Number of checks that failed.
+    pub failed: u64,
+    /// Posterior α (prior + observed corruptions).
+    pub posterior_alpha: f64,
+    /// Posterior β (prior + observed clean).
+    pub posterior_beta: f64,
+    /// E[p] = expected corruption rate.
+    pub expected_corruption_rate: f64,
+    /// Upper credible bound on corruption rate (z=3 by default).
+    pub upper_bound_corruption_rate: f64,
+    /// Overall health verdict: true if upper_bound < 0.01.
+    pub healthy: bool,
+}
+
+impl IntegrityReport {
+    /// Posterior probability that corruption rate < threshold.
+    ///
+    /// Uses the regularized incomplete beta function approximation:
+    /// for large sample sizes, the Beta posterior is approximately Normal,
+    /// so P(p < t) ≈ Φ((t - μ) / σ) where μ = E[p], σ = √Var[p].
+    #[must_use]
+    pub fn prob_healthy(&self, threshold: f64) -> f64 {
+        let a = self.posterior_alpha;
+        let b = self.posterior_beta;
+        let mean = a / (a + b);
+        let var = (a * b) / ((a + b).powi(2) * (a + b + 1.0));
+        let std = var.sqrt();
+        if std < 1e-15 {
+            return if mean < threshold { 1.0 } else { 0.0 };
+        }
+        // Normal CDF approximation: Φ(x) ≈ 0.5 * erfc(-x/√2)
+        let z = (threshold - mean) / std;
+        0.5 * erfc_approx(-z / std::f64::consts::SQRT_2)
+    }
+
+    /// Log Bayes factor: ln(P(evidence|healthy) / P(evidence|corrupt)).
+    ///
+    /// Positive values favor health; negative values favor corruption.
+    /// Uses the ratio of Beta-Binomial marginal likelihoods:
+    ///   - H₀ (healthy): p ~ Beta(1, 99) (expect ~1% corruption)
+    ///   - H₁ (corrupt): p ~ Beta(1, 1) (uniform prior)
+    #[must_use]
+    pub fn log_bayes_factor(&self) -> f64 {
+        // ln B(α₀ + f, β₀ + p) - ln B(α₀, β₀) - ln B(α₁ + f, β₁ + p) + ln B(α₁, β₁)
+        // where f = failed, p = passed, and B is the beta function
+        let f = self.failed as f64;
+        let p = self.passed as f64;
+
+        // H₀: healthy prior Beta(1, 99)
+        let a0 = 1.0_f64;
+        let b0 = 99.0_f64;
+        // H₁: corrupt prior Beta(1, 1)
+        let a1 = 1.0_f64;
+        let b1 = 1.0_f64;
+
+        ln_beta(a0 + f, b0 + p) - ln_beta(a0, b0) - ln_beta(a1 + f, b1 + p) + ln_beta(a1, b1)
+    }
+}
+
+/// Approximate complementary error function erfc(x) for Normal CDF.
+fn erfc_approx(x: f64) -> f64 {
+    // Abramowitz & Stegun approximation (7.1.26), max error < 1.5e-7
+    let t = 1.0 / 0.327_591_1_f64.mul_add(x.abs(), 1.0);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let result = poly * (-x * x).exp();
+    if x >= 0.0 { result } else { 2.0 - result }
+}
+
+/// ln(Beta(a, b)) = ln(Γ(a)) + ln(Γ(b)) - ln(Γ(a+b))
+fn ln_beta(a: f64, b: f64) -> f64 {
+    ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b)
+}
+
+/// Lanczos approximation for ln(Γ(x)), accurate for x > 0.
+#[allow(clippy::excessive_precision)]
+fn ln_gamma(x: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_403,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+
+    if x <= 0.0 {
+        return f64::INFINITY;
+    }
+    let g = 7.0_f64;
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
+    }
+    let z = x - 1.0;
+    let mut sum = COEFFS[0];
+    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
+        sum += c / (z + i as f64);
+    }
+    let t = z + g + 0.5;
+    0.5_f64.mul_add(
+        (2.0 * std::f64::consts::PI).ln(),
+        (z + 0.5).mul_add(t.ln(), -t),
+    ) + sum.ln()
+}
+
+/// Run a comprehensive integrity scan of an ext4 filesystem image.
+///
+/// Cascades through verification levels:
+/// 1. **Superblock checksum** (if metadata_csum enabled)
+/// 2. **Group descriptor checksums** (all groups)
+/// 3. **Inode checksums** (sampled or exhaustive)
+/// 4. **Directory block checksums** (for sampled directory inodes)
+///
+/// Returns an `IntegrityReport` with per-component verdicts and a
+/// Bayesian posterior over the corruption rate.
+///
+/// # Arguments
+/// * `image` - raw filesystem image bytes
+/// * `max_inodes` - maximum number of inodes to verify (0 = all)
+#[allow(clippy::too_many_lines)]
+pub fn verify_ext4_integrity(image: &[u8], max_inodes: u32) -> Result<IntegrityReport, FfsError> {
+    let reader = Ext4ImageReader::new(image).map_err(|e| parse_to_ffs_error(&e))?;
+    let sb = &reader.sb;
+
+    let mut verdicts = Vec::new();
+    let mut passed = 0_u64;
+    let mut failed = 0_u64;
+    let mut sb_passed = false;
+
+    // ── Level 1: Superblock checksum ───────────────────────────────────
+    if sb.has_metadata_csum() {
+        let sb_region = &image[ffs_types::EXT4_SUPERBLOCK_OFFSET
+            ..ffs_types::EXT4_SUPERBLOCK_OFFSET + ffs_types::EXT4_SUPERBLOCK_SIZE];
+        match sb.validate_checksum(sb_region) {
+            Ok(()) => {
+                verdicts.push(CheckVerdict {
+                    component: "superblock".into(),
+                    passed: true,
+                    detail: String::new(),
+                });
+                passed += 1;
+                sb_passed = true;
+            }
+            Err(e) => {
+                verdicts.push(CheckVerdict {
+                    component: "superblock".into(),
+                    passed: false,
+                    detail: e.to_string(),
+                });
+                failed += 1;
+            }
+        }
+    }
+
+    // ── Level 2: Group descriptor checksums ────────────────────────────
+    let csum_seed = sb.csum_seed();
+    let groups_count = sb.groups_count();
+    let desc_size = sb.group_desc_size();
+
+    for g in 0..groups_count {
+        let group = ffs_types::GroupNumber(g);
+        let gd_result = reader.read_group_desc(image, group);
+        match gd_result {
+            Ok(_gd) => {
+                // Read raw GD bytes for checksum verification
+                if let Some(gd_off) = sb.group_desc_offset(group) {
+                    let ds = usize::from(desc_size);
+                    let offset = usize::try_from(gd_off).unwrap_or(usize::MAX);
+                    if offset.saturating_add(ds) <= image.len() {
+                        let raw_gd = &image[offset..offset + ds];
+                        match ffs_ondisk::verify_group_desc_checksum(
+                            raw_gd, csum_seed, g, desc_size,
+                        ) {
+                            Ok(()) => {
+                                passed += 1;
+                            }
+                            Err(e) => {
+                                verdicts.push(CheckVerdict {
+                                    component: format!("group_desc[{g}]"),
+                                    passed: false,
+                                    detail: e.to_string(),
+                                });
+                                failed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                verdicts.push(CheckVerdict {
+                    component: format!("group_desc[{g}]"),
+                    passed: false,
+                    detail: e.to_string(),
+                });
+                failed += 1;
+            }
+        }
+    }
+    // Single success verdict for all clean group descs
+    if failed == 0 || passed > 0 {
+        let clean_gd = passed - u64::from(sb_passed); // subtract superblock if it was counted
+        if clean_gd > 0 {
+            verdicts.push(CheckVerdict {
+                component: format!("group_descs ({clean_gd}/{groups_count} verified)"),
+                passed: true,
+                detail: String::new(),
+            });
+        }
+    }
+
+    // ── Level 3: Inode checksums (sampled) ─────────────────────────────
+    let inodes_count = sb.inodes_count;
+    let first_ino = sb.first_ino;
+    let inode_size = usize::from(sb.inode_size);
+
+    // Always check root inode (2) and first non-reserved inode
+    let check_limit = if max_inodes == 0 {
+        inodes_count
+    } else {
+        max_inodes.min(inodes_count)
+    };
+
+    let mut inodes_checked = 0_u64;
+    let mut inodes_clean = 0_u64;
+    let mut inodes_corrupt = 0_u64;
+
+    // Check inodes: root (2), then first_ino..first_ino+check_limit
+    let ino_list: Vec<u32> = {
+        let mut v = vec![2_u32]; // root inode
+        let start = first_ino.max(2);
+        let end = start
+            .saturating_add(check_limit)
+            .min(inodes_count.saturating_add(1));
+        for i in start..end {
+            if i != 2 {
+                v.push(i);
+            }
+        }
+        v
+    };
+
+    for &ino in &ino_list {
+        if inodes_checked >= u64::from(check_limit) {
+            break;
+        }
+
+        // Read raw inode bytes for checksum verification
+        let ino_num = ffs_types::InodeNumber(u64::from(ino));
+        match reader.read_inode(image, ino_num) {
+            Ok(inode) => {
+                // Verify inode checksum using raw bytes
+                let group = ffs_types::GroupNumber((ino - 1) / sb.inodes_per_group);
+                if let Ok(gd) = reader.read_group_desc(image, group) {
+                    let local = (ino - 1) % sb.inodes_per_group;
+                    let itable_off = gd.inode_table * u64::from(sb.block_size);
+                    let inode_off = itable_off + u64::from(local) * inode_size as u64;
+                    let off = usize::try_from(inode_off).unwrap_or(usize::MAX);
+                    if off.saturating_add(inode_size) <= image.len() {
+                        let raw = &image[off..off + inode_size];
+                        match ffs_ondisk::verify_inode_checksum(
+                            raw,
+                            csum_seed,
+                            ino,
+                            u16::try_from(inode_size).unwrap_or(256),
+                        ) {
+                            Ok(()) => {
+                                inodes_clean += 1;
+                                passed += 1;
+                            }
+                            Err(e) => {
+                                verdicts.push(CheckVerdict {
+                                    component: format!("inode[{ino}]"),
+                                    passed: false,
+                                    detail: e.to_string(),
+                                });
+                                inodes_corrupt += 1;
+                                failed += 1;
+                            }
+                        }
+                    }
+                }
+
+                // ── Level 4: Directory block checksums ─────────────────
+                if inode.is_dir() && inode.uses_extents() {
+                    let dir_blocks = inode.size / u64::from(sb.block_size);
+                    let scan_blocks = u32::try_from(dir_blocks.min(16)).unwrap_or(16);
+                    for lb in 0..scan_blocks {
+                        if let Ok(Some(phys)) = reader.resolve_extent(image, &inode, lb) {
+                            let blk_off = usize::try_from(phys * u64::from(sb.block_size))
+                                .unwrap_or(usize::MAX);
+                            let bs = sb.block_size as usize;
+                            if blk_off.saturating_add(bs) <= image.len() {
+                                let block_data = &image[blk_off..blk_off + bs];
+                                // Check if block has a checksum tail
+                                // (last entry has inode=0 and file_type=0xDE)
+                                if bs >= 12 {
+                                    let tail_ino = u32::from_le_bytes([
+                                        block_data[bs - 12],
+                                        block_data[bs - 11],
+                                        block_data[bs - 10],
+                                        block_data[bs - 9],
+                                    ]);
+                                    let tail_ft = block_data[bs - 5];
+                                    if tail_ino == 0 && tail_ft == 0xDE {
+                                        match ffs_ondisk::verify_dir_block_checksum(
+                                            block_data,
+                                            csum_seed,
+                                            ino,
+                                            inode.generation,
+                                        ) {
+                                            Ok(()) => {
+                                                passed += 1;
+                                            }
+                                            Err(e) => {
+                                                verdicts.push(CheckVerdict {
+                                                    component: format!(
+                                                        "dir_block[ino={ino},lb={lb}]"
+                                                    ),
+                                                    passed: false,
+                                                    detail: e.to_string(),
+                                                });
+                                                failed += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                inodes_checked += 1;
+            }
+            Err(_) => {
+                // Inode unreadable — skip silently (might be unallocated)
+                inodes_checked += 1;
+            }
+        }
+    }
+
+    if inodes_clean > 0 {
+        verdicts.push(CheckVerdict {
+            component: format!(
+                "inodes ({inodes_clean}/{inodes_checked} verified, {inodes_corrupt} corrupt)"
+            ),
+            passed: inodes_corrupt == 0,
+            detail: String::new(),
+        });
+    }
+
+    // ── Compute Bayesian posterior ──────────────────────────────────────
+    // Prior: Beta(1, 1) — uninformative
+    let alpha = 1.0 + failed as f64;
+    let beta_param = 1.0 + passed as f64;
+    let mean = alpha / (alpha + beta_param);
+    let var = (alpha * beta_param) / ((alpha + beta_param).powi(2) * (alpha + beta_param + 1.0));
+    let z = 3.0_f64; // 99.7% credible interval
+    let upper = z.mul_add(var.sqrt(), mean).clamp(0.0, 1.0);
+
+    Ok(IntegrityReport {
+        verdicts,
+        passed,
+        failed,
+        posterior_alpha: alpha,
+        posterior_beta: beta_param,
+        expected_corruption_rate: mean,
+        upper_bound_corruption_rate: upper,
+        healthy: upper < 0.01,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -846,6 +1549,10 @@ mod tests {
             let end = (start + size as usize).min(data.len());
             Ok(data[start..end].to_vec())
         }
+
+        fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+            Err(FfsError::Format("not a symlink".into()))
+        }
     }
 
     #[test]
@@ -1128,6 +1835,103 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_to_ffs_new_geometry_fields() {
+        // desc_size → InvalidGeometry
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
+            field: "s_desc_size",
+            reason: "must be >= 32 when non-zero",
+        });
+        assert!(
+            matches!(e, FfsError::InvalidGeometry(_)),
+            "desc_size should map to InvalidGeometry, got: {e:?}",
+        );
+
+        // first_data_block → InvalidGeometry
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
+            field: "s_first_data_block",
+            reason: "must be 1 for 1K block size",
+        });
+        assert!(
+            matches!(e, FfsError::InvalidGeometry(_)),
+            "first_data_block should map to InvalidGeometry, got: {e:?}",
+        );
+
+        // blocks_count → InvalidGeometry
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
+            field: "s_blocks_count",
+            reason: "group descriptor table extends beyond device",
+        });
+        assert!(
+            matches!(e, FfsError::InvalidGeometry(_)),
+            "blocks_count should map to InvalidGeometry, got: {e:?}",
+        );
+
+        // inodes_count → InvalidGeometry
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
+            field: "s_inodes_count",
+            reason: "inodes_count exceeds groups * inodes_per_group",
+        });
+        assert!(
+            matches!(e, FfsError::InvalidGeometry(_)),
+            "inodes_count should map to InvalidGeometry, got: {e:?}",
+        );
+    }
+
+    #[test]
+    fn ext4_geometry_has_all_fields() {
+        let image = build_ext4_image(2); // 4K blocks
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let geom = fs.ext4_geometry.as_ref().unwrap();
+
+        assert_eq!(geom.block_size, 4096);
+        assert_eq!(geom.inodes_count, 128);
+        assert_eq!(geom.inodes_per_group, 128);
+        assert_eq!(geom.first_ino, 11);
+        assert_eq!(geom.inode_size, 256);
+        assert!(geom.groups_count > 0);
+        assert!(geom.group_desc_size == 32 || geom.group_desc_size == 64);
+        // 32-bit fs (no 64BIT flag set)
+        assert!(!geom.is_64bit);
+        // No metadata_csum flag set
+        assert!(!geom.has_metadata_csum);
+    }
+
+    #[test]
+    fn ext4_geometry_1k_blocks() {
+        let image = build_ext4_image(0); // 1K blocks
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let geom = fs.ext4_geometry.as_ref().unwrap();
+        assert_eq!(geom.block_size, 1024);
+    }
+
+    #[test]
+    fn ext4_geometry_serializes() {
+        let geom = Ext4Geometry {
+            block_size: 4096,
+            inodes_count: 8192,
+            inodes_per_group: 8192,
+            first_ino: 11,
+            inode_size: 256,
+            groups_count: 1,
+            group_desc_size: 32,
+            csum_seed: 0,
+            is_64bit: false,
+            has_metadata_csum: false,
+        };
+        let json = serde_json::to_string(&geom).unwrap();
+        let deser: Ext4Geometry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.block_size, 4096);
+        assert_eq!(deser.inodes_count, 8192);
+        assert_eq!(deser.groups_count, 1);
+    }
+
+    #[test]
     fn durability_autopilot_prefers_more_redundancy_when_failures_observed() {
         let candidates = [1.02, 1.05, 1.10];
 
@@ -1140,5 +1944,249 @@ mod tests {
         dirty.observe_scrub(10_000, 300);
         let dirty_decision = dirty.choose_overhead(&candidates);
         assert!(dirty_decision.repair_overhead >= 1.05);
+    }
+
+    // ── Math helper tests ───────────────────────────────────────────────
+
+    #[test]
+    fn erfc_approx_known_values() {
+        // erfc(0) = 1.0
+        let val = erfc_approx(0.0);
+        assert!((val - 1.0).abs() < 1e-6, "erfc(0) = {val}, expected 1.0");
+
+        // erfc(large) → 0
+        let val = erfc_approx(5.0);
+        assert!(val < 1e-6, "erfc(5) = {val}, expected ~0");
+
+        // erfc(-large) → 2
+        let val = erfc_approx(-5.0);
+        assert!((val - 2.0).abs() < 1e-6, "erfc(-5) = {val}, expected ~2");
+
+        // erfc(1) ≈ 0.1573 (known value)
+        let val = erfc_approx(1.0);
+        assert!(
+            (val - 0.1573).abs() < 0.001,
+            "erfc(1) = {val}, expected ~0.1573",
+        );
+    }
+
+    #[test]
+    fn ln_gamma_known_values() {
+        // Γ(1) = 1, ln(1) = 0
+        let val = ln_gamma(1.0);
+        assert!(val.abs() < 1e-10, "ln_gamma(1) = {val}, expected 0");
+
+        // Γ(2) = 1, ln(1) = 0
+        let val = ln_gamma(2.0);
+        assert!(val.abs() < 1e-10, "ln_gamma(2) = {val}, expected 0");
+
+        // Γ(5) = 24, ln(24) ≈ 3.1781
+        let val = ln_gamma(5.0);
+        let expected = 24.0_f64.ln();
+        assert!(
+            (val - expected).abs() < 1e-8,
+            "ln_gamma(5) = {val}, expected {expected}",
+        );
+
+        // Γ(0.5) = √π ≈ 1.7725, ln(√π) ≈ 0.5724
+        let val = ln_gamma(0.5);
+        let expected = std::f64::consts::PI.sqrt().ln();
+        assert!(
+            (val - expected).abs() < 1e-6,
+            "ln_gamma(0.5) = {val}, expected {expected}",
+        );
+
+        // Γ(10) = 9! = 362880
+        let val = ln_gamma(10.0);
+        let expected = 362_880.0_f64.ln();
+        assert!(
+            (val - expected).abs() < 1e-6,
+            "ln_gamma(10) = {val}, expected {expected}",
+        );
+    }
+
+    #[test]
+    fn ln_gamma_zero_and_negative() {
+        assert!(ln_gamma(0.0).is_infinite());
+        assert!(ln_gamma(-1.0).is_infinite());
+    }
+
+    #[test]
+    fn ln_beta_known_values() {
+        // B(1,1) = 1, ln(1) = 0
+        let val = ln_beta(1.0, 1.0);
+        assert!(val.abs() < 1e-10, "ln_beta(1,1) = {val}, expected 0");
+
+        // B(1,2) = 1/2, ln(1/2) ≈ -0.6931
+        let val = ln_beta(1.0, 2.0);
+        let expected = 0.5_f64.ln();
+        assert!(
+            (val - expected).abs() < 1e-8,
+            "ln_beta(1,2) = {val}, expected {expected}",
+        );
+
+        // B(2,2) = 1/6, ln(1/6) ≈ -1.7918
+        let val = ln_beta(2.0, 2.0);
+        let expected = (1.0 / 6.0_f64).ln();
+        assert!(
+            (val - expected).abs() < 1e-8,
+            "ln_beta(2,2) = {val}, expected {expected}",
+        );
+    }
+
+    // ── IntegrityReport tests ───────────────────────────────────────────
+
+    #[test]
+    fn integrity_report_all_clean() {
+        let report = IntegrityReport {
+            verdicts: vec![],
+            passed: 100,
+            failed: 0,
+            posterior_alpha: 1.0,
+            posterior_beta: 101.0,
+            expected_corruption_rate: 1.0 / 102.0,
+            upper_bound_corruption_rate: 0.005,
+            healthy: true,
+        };
+
+        let p = report.prob_healthy(0.05);
+        assert!(p > 0.9, "prob_healthy = {p}, expected > 0.9");
+
+        let lbf = report.log_bayes_factor();
+        assert!(
+            lbf > 0.0,
+            "log_bayes_factor = {lbf}, expected > 0 (favors health)"
+        );
+    }
+
+    #[test]
+    fn integrity_report_heavily_corrupted() {
+        let report = IntegrityReport {
+            verdicts: vec![],
+            passed: 10,
+            failed: 90,
+            posterior_alpha: 91.0,
+            posterior_beta: 11.0,
+            expected_corruption_rate: 91.0 / 102.0,
+            upper_bound_corruption_rate: 0.95,
+            healthy: false,
+        };
+
+        let p = report.prob_healthy(0.01);
+        assert!(p < 0.01, "prob_healthy = {p}, expected < 0.01");
+
+        let lbf = report.log_bayes_factor();
+        assert!(
+            lbf < 0.0,
+            "log_bayes_factor = {lbf}, expected < 0 (favors corruption)"
+        );
+    }
+
+    #[test]
+    fn integrity_report_bayes_factor_is_finite() {
+        let report = IntegrityReport {
+            verdicts: vec![],
+            passed: 50,
+            failed: 50,
+            posterior_alpha: 51.0,
+            posterior_beta: 51.0,
+            expected_corruption_rate: 0.5,
+            upper_bound_corruption_rate: 0.55,
+            healthy: false,
+        };
+        let lbf = report.log_bayes_factor();
+        assert!(lbf.is_finite(), "log_bayes_factor should be finite");
+    }
+
+    // ── Ext4FsOps helper tests ──────────────────────────────────────────
+
+    #[test]
+    fn dir_entry_file_type_mapping() {
+        assert_eq!(dir_entry_file_type(Ext4FileType::Dir), FileType::Directory);
+        assert_eq!(
+            dir_entry_file_type(Ext4FileType::Symlink),
+            FileType::Symlink
+        );
+        assert_eq!(
+            dir_entry_file_type(Ext4FileType::Blkdev),
+            FileType::BlockDevice
+        );
+        assert_eq!(
+            dir_entry_file_type(Ext4FileType::Chrdev),
+            FileType::CharDevice
+        );
+        assert_eq!(dir_entry_file_type(Ext4FileType::Fifo), FileType::Fifo);
+        assert_eq!(dir_entry_file_type(Ext4FileType::Sock), FileType::Socket);
+        assert_eq!(
+            dir_entry_file_type(Ext4FileType::RegFile),
+            FileType::RegularFile
+        );
+        assert_eq!(
+            dir_entry_file_type(Ext4FileType::Unknown),
+            FileType::RegularFile
+        );
+    }
+
+    #[test]
+    fn parse_to_ffs_error_runtime_mappings() {
+        let e = parse_to_ffs_error(&ParseError::InvalidField {
+            field: "dir_entry",
+            reason: "component not found in directory",
+        });
+        assert!(matches!(e, FfsError::NotFound(_)));
+
+        let e = parse_to_ffs_error(&ParseError::InvalidField {
+            field: "path",
+            reason: "not a directory",
+        });
+        assert!(matches!(e, FfsError::NotDirectory));
+
+        let e = parse_to_ffs_error(&ParseError::InvalidField {
+            field: "extent",
+            reason: "corrupt extent header",
+        });
+        assert!(matches!(e, FfsError::Format(_)));
+
+        let e = parse_to_ffs_error(&ParseError::InsufficientData {
+            needed: 256,
+            offset: 0,
+            actual: 128,
+        });
+        assert!(matches!(e, FfsError::Corruption { .. }));
+    }
+
+    #[test]
+    fn check_verdict_serializes() {
+        let v = CheckVerdict {
+            component: "superblock".into(),
+            passed: true,
+            detail: String::new(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains("superblock"));
+        assert!(json.contains("true"));
+    }
+
+    #[test]
+    fn integrity_report_serializes() {
+        let report = IntegrityReport {
+            verdicts: vec![CheckVerdict {
+                component: "test".into(),
+                passed: true,
+                detail: String::new(),
+            }],
+            passed: 1,
+            failed: 0,
+            posterior_alpha: 1.0,
+            posterior_beta: 2.0,
+            expected_corruption_rate: 0.333,
+            upper_bound_corruption_rate: 0.5,
+            healthy: true,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let deser: IntegrityReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.passed, 1);
+        assert_eq!(deser.failed, 0);
+        assert!(deser.healthy);
     }
 }
