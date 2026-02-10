@@ -79,6 +79,200 @@ pub fn detect_filesystem_at_path(
     detect_filesystem_on_device(cx, &dev)
 }
 
+// ── OpenFs API ──────────────────────────────────────────────────────────────
+
+/// Options controlling how a filesystem image is opened.
+///
+/// By default, mount-time validation is enabled. Disable it only for
+/// recovery or diagnostic workflows where reading a partially-corrupt
+/// image is intentional.
+#[derive(Debug, Clone)]
+pub struct OpenOptions {
+    /// Skip mount-time validation (geometry, features, checksums).
+    ///
+    /// When `true`, the superblock is parsed but not validated via
+    /// `validate_v1()`. Use for recovery or diagnostics only.
+    pub skip_validation: bool,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            skip_validation: false,
+        }
+    }
+}
+
+/// Pre-computed ext4 geometry derived from the superblock.
+///
+/// These values are computed once at open time and cached so that
+/// downstream code does not re-derive them on every operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ext4Geometry {
+    /// Number of block groups.
+    pub groups_count: u32,
+    /// Size of each group descriptor (32 or 64 bytes).
+    pub group_desc_size: u16,
+    /// Checksum seed for metadata_csum verification.
+    pub csum_seed: u32,
+    /// Whether the filesystem uses 64-bit block addressing.
+    pub is_64bit: bool,
+}
+
+/// An opened filesystem image, ready for VFS operations.
+///
+/// `OpenFs` bundles a validated superblock, pre-computed geometry, and the
+/// block device handle into a single context. The constructor validates by
+/// default so callers cannot accidentally operate on unvalidated metadata.
+///
+/// # Opening a filesystem
+///
+/// ```ignore
+/// let cx = Cx::for_request();
+/// let fs = OpenFs::open(&cx, "/path/to/image.ext4")?;
+/// println!("block_size = {}", fs.block_size());
+/// ```
+pub struct OpenFs {
+    /// Detected filesystem type with parsed superblock.
+    pub flavor: FsFlavor,
+    /// Pre-computed ext4 geometry (None for btrfs).
+    pub ext4_geometry: Option<Ext4Geometry>,
+    /// Block device for I/O operations.
+    dev: Box<dyn ByteDevice>,
+}
+
+impl std::fmt::Debug for OpenFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenFs")
+            .field("flavor", &self.flavor)
+            .field("ext4_geometry", &self.ext4_geometry)
+            .field("dev_len", &self.dev.len_bytes())
+            .finish()
+    }
+}
+
+impl OpenFs {
+    /// Open a filesystem image at `path` with default options (validation enabled).
+    pub fn open(cx: &Cx, path: impl AsRef<Path>) -> Result<Self, FfsError> {
+        Self::open_with_options(cx, path, &OpenOptions::default())
+    }
+
+    /// Open a filesystem image with custom options.
+    pub fn open_with_options(
+        cx: &Cx,
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+    ) -> Result<Self, FfsError> {
+        let dev = FileByteDevice::open(path.as_ref())?;
+        Self::from_device(cx, Box::new(dev), options)
+    }
+
+    /// Open a filesystem from an already-opened device.
+    pub fn from_device(
+        cx: &Cx,
+        dev: Box<dyn ByteDevice>,
+        options: &OpenOptions,
+    ) -> Result<Self, FfsError> {
+        let flavor = detect_filesystem_on_device(cx, &*dev).map_err(|e| match e {
+            DetectionError::UnsupportedImage => {
+                FfsError::Format("image is not a recognized ext4 or btrfs filesystem".into())
+            }
+            DetectionError::Io(ffs_err) => ffs_err,
+        })?;
+
+        let ext4_geometry = match &flavor {
+            FsFlavor::Ext4(sb) => {
+                if !options.skip_validation {
+                    sb.validate_v1().map_err(parse_error_to_ffs)?;
+                }
+                Some(Ext4Geometry {
+                    groups_count: sb.groups_count(),
+                    group_desc_size: sb.group_desc_size(),
+                    csum_seed: sb.csum_seed(),
+                    is_64bit: sb.is_64bit(),
+                })
+            }
+            FsFlavor::Btrfs(_) => None,
+        };
+
+        Ok(Self {
+            flavor,
+            ext4_geometry,
+            dev,
+        })
+    }
+
+    /// The block device backing this filesystem.
+    #[must_use]
+    pub fn device(&self) -> &dyn ByteDevice {
+        &*self.dev
+    }
+
+    /// Block size in bytes.
+    #[must_use]
+    pub fn block_size(&self) -> u32 {
+        match &self.flavor {
+            FsFlavor::Ext4(sb) => sb.block_size,
+            FsFlavor::Btrfs(sb) => sb.sectorsize,
+        }
+    }
+
+    /// Whether this is an ext4 filesystem.
+    #[must_use]
+    pub fn is_ext4(&self) -> bool {
+        matches!(self.flavor, FsFlavor::Ext4(_))
+    }
+
+    /// Whether this is a btrfs filesystem.
+    #[must_use]
+    pub fn is_btrfs(&self) -> bool {
+        matches!(self.flavor, FsFlavor::Btrfs(_))
+    }
+
+    /// Device length in bytes.
+    #[must_use]
+    pub fn device_len(&self) -> u64 {
+        self.dev.len_bytes()
+    }
+}
+
+/// Convert a mount-time `ParseError` into the appropriate `FfsError` variant.
+///
+/// This is the crate-boundary conversion described in the `ffs-error` error
+/// taxonomy. During mount-time validation, `ParseError::InvalidField` is
+/// mapped based on the field name to distinguish unsupported features from
+/// geometry errors from format errors.
+fn parse_error_to_ffs(e: &ParseError) -> FfsError {
+    match e {
+        ParseError::InvalidField { field, reason } => {
+            // Feature validation failures → UnsupportedFeature
+            if field.contains("feature") || reason.contains("unsupported") {
+                FfsError::UnsupportedFeature(format!("{field}: {reason}"))
+            }
+            // Geometry failures → InvalidGeometry
+            else if field.contains("block_size")
+                || field.contains("blocks_per_group")
+                || field.contains("inodes_per_group")
+                || field.contains("inode_size")
+            {
+                FfsError::InvalidGeometry(format!("{field}: {reason}"))
+            }
+            // Everything else → Format
+            else {
+                FfsError::Format(e.to_string())
+            }
+        }
+        ParseError::InvalidMagic { .. } => FfsError::Format(e.to_string()),
+        ParseError::InsufficientData { .. } | ParseError::IntegerConversion { .. } => {
+            FfsError::Corruption {
+                block: 0,
+                detail: e.to_string(),
+            }
+        }
+    }
+}
+
 // ── VFS semantics layer ─────────────────────────────────────────────────────
 
 /// Filesystem-agnostic file type for VFS operations.
@@ -461,9 +655,67 @@ impl FrankenFsEngine {
 mod tests {
     use super::*;
     use ffs_types::{
-        BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, EXT4_SUPER_MAGIC,
+        BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, ByteOffset, EXT4_SUPER_MAGIC,
         EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
     };
+    use std::sync::Mutex;
+
+    /// In-memory ByteDevice for testing (no file I/O).
+    #[derive(Debug)]
+    struct TestDevice {
+        data: Mutex<Vec<u8>>,
+    }
+
+    impl TestDevice {
+        fn from_vec(v: Vec<u8>) -> Self {
+            Self {
+                data: Mutex::new(v),
+            }
+        }
+    }
+
+    impl ByteDevice for TestDevice {
+        fn len_bytes(&self) -> u64 {
+            self.data.lock().unwrap().len() as u64
+        }
+
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            let off = offset.0 as usize;
+            let data = self.data.lock().unwrap();
+            let end = off + buf.len();
+            if end > data.len() {
+                return Err(FfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "read past end",
+                )));
+            }
+            buf.copy_from_slice(&data[off..end]);
+            Ok(())
+        }
+
+        fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> ffs_error::Result<()> {
+            let off = offset.0 as usize;
+            let mut data = self.data.lock().unwrap();
+            let end = off + buf.len();
+            if end > data.len() {
+                return Err(FfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "write past end",
+                )));
+            }
+            data[off..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn detect_ext4_and_btrfs_images() {
@@ -584,7 +836,9 @@ mod tests {
                 return Err(FfsError::IsDirectory);
             }
             let data = b"Hello, world!";
-            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
             let end = (start + size as usize).min(data.len());
             Ok(data[start..end].to_vec())
         }
@@ -715,6 +969,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── OpenFs tests ─────────────────────────────────────────────────────
+
+    /// Build a minimal synthetic ext4 image for OpenFs testing.
+    fn build_ext4_image(block_size_log: u32) -> Vec<u8> {
+        let block_size = 1024_u32 << block_size_log;
+        let image_size = 128 * 1024; // 128K
+        let mut image = vec![0_u8; image_size];
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+
+        // magic
+        image[sb_off + 0x38..sb_off + 0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        // log_block_size
+        image[sb_off + 0x18..sb_off + 0x1C].copy_from_slice(&block_size_log.to_le_bytes());
+        // blocks_count_lo
+        let blocks_count = (image_size as u32) / block_size;
+        image[sb_off + 0x04..sb_off + 0x08].copy_from_slice(&blocks_count.to_le_bytes());
+        // inodes_count
+        image[sb_off + 0x00..sb_off + 0x04].copy_from_slice(&128_u32.to_le_bytes());
+        // first_data_block
+        let first_data = if block_size == 1024 { 1_u32 } else { 0_u32 };
+        image[sb_off + 0x14..sb_off + 0x18].copy_from_slice(&first_data.to_le_bytes());
+        // blocks_per_group
+        image[sb_off + 0x20..sb_off + 0x24].copy_from_slice(&blocks_count.to_le_bytes());
+        // inodes_per_group
+        image[sb_off + 0x28..sb_off + 0x2C].copy_from_slice(&128_u32.to_le_bytes());
+        // inode_size = 256
+        image[sb_off + 0x58..sb_off + 0x5A].copy_from_slice(&256_u16.to_le_bytes());
+        // rev_level = 1 (dynamic)
+        image[sb_off + 0x4C..sb_off + 0x50].copy_from_slice(&1_u32.to_le_bytes());
+        // feature_incompat = FILETYPE | EXTENTS
+        let filetype: u32 = 0x0002;
+        let extents: u32 = 0x0040;
+        image[sb_off + 0x60..sb_off + 0x64].copy_from_slice(&(filetype | extents).to_le_bytes());
+        // first_ino
+        image[sb_off + 0x54..sb_off + 0x58].copy_from_slice(&11_u32.to_le_bytes());
+
+        image
+    }
+
+    #[test]
+    fn open_options_default_enables_validation() {
+        let opts = OpenOptions::default();
+        assert!(!opts.skip_validation);
+    }
+
+    #[test]
+    fn open_fs_from_ext4_image() {
+        let image = build_ext4_image(2); // 4K blocks
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert!(fs.is_ext4());
+        assert!(!fs.is_btrfs());
+        assert_eq!(fs.block_size(), 4096);
+        assert!(fs.ext4_geometry.is_some());
+
+        let geom = fs.ext4_geometry.as_ref().unwrap();
+        assert!(geom.groups_count > 0);
+        assert!(geom.group_desc_size == 32 || geom.group_desc_size == 64);
+    }
+
+    #[test]
+    fn open_fs_debug_format() {
+        let image = build_ext4_image(2);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let debug = format!("{fs:?}");
+        assert!(debug.contains("OpenFs"));
+        assert!(debug.contains("dev_len"));
+    }
+
+    #[test]
+    fn open_fs_rejects_garbage() {
+        let garbage = vec![0xAB_u8; 1024 * 128];
+        let dev = TestDevice::from_vec(garbage);
+        let cx = Cx::for_testing();
+
+        let err = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EINVAL); // Format error
+    }
+
+    #[test]
+    fn open_fs_skip_validation() {
+        // Build an image with bad features (should fail validation but pass with skip)
+        let mut image = build_ext4_image(2);
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        // Set unsupported incompat feature (COMPRESSION = 0x0001)
+        let bad_incompat: u32 = 0x0002 | 0x0040 | 0x0001; // FILETYPE | EXTENTS | COMPRESSION
+        image[sb_off + 0x60..sb_off + 0x64].copy_from_slice(&bad_incompat.to_le_bytes());
+
+        let dev = TestDevice::from_vec(image.clone());
+        let cx = Cx::for_testing();
+
+        // Should fail with default options
+        let err = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap_err();
+        assert!(
+            matches!(err, FfsError::UnsupportedFeature(_) | FfsError::Format(_)),
+            "expected feature/format error, got {err:?}",
+        );
+
+        // Should succeed with skip_validation
+        let dev2 = TestDevice::from_vec(image);
+        let opts = OpenOptions {
+            skip_validation: true,
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev2), &opts).unwrap();
+        assert!(fs.is_ext4());
+    }
+
+    #[test]
+    fn parse_error_to_ffs_mapping() {
+        // Feature error
+        let e = parse_error_to_ffs(ParseError::InvalidField {
+            field: "feature_incompat",
+            reason: "unsupported flags",
+        });
+        assert!(matches!(e, FfsError::UnsupportedFeature(_)));
+
+        // Geometry error
+        let e = parse_error_to_ffs(ParseError::InvalidField {
+            field: "block_size",
+            reason: "out of range",
+        });
+        assert!(matches!(e, FfsError::InvalidGeometry(_)));
+
+        // Generic format error
+        let e = parse_error_to_ffs(ParseError::InvalidField {
+            field: "magic",
+            reason: "wrong value",
+        });
+        assert!(matches!(e, FfsError::Format(_)));
+
+        // Magic error
+        let e = parse_error_to_ffs(ParseError::InvalidMagic {
+            expected: 0xEF53,
+            actual: 0x0000,
+        });
+        assert!(matches!(e, FfsError::Format(_)));
+
+        // Truncation error
+        let e = parse_error_to_ffs(ParseError::InsufficientData {
+            needed: 100,
+            offset: 0,
+            actual: 50,
+        });
+        assert!(matches!(e, FfsError::Corruption { .. }));
     }
 
     #[test]
