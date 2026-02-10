@@ -7,9 +7,11 @@ use ffs_block::{
 use ffs_error::FfsError;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{BtrfsSuperblock, Ext4Superblock};
-use ffs_types::{BlockNumber, CommitSeq, ParseError, Snapshot};
+use ffs_types::{BlockNumber, CommitSeq, InodeNumber, ParseError, Snapshot};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::path::Path;
+use std::time::SystemTime;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +77,137 @@ pub fn detect_filesystem_at_path(
 ) -> Result<FsFlavor, DetectionError> {
     let dev = FileByteDevice::open(path)?;
     detect_filesystem_on_device(cx, &dev)
+}
+
+// ── VFS semantics layer ─────────────────────────────────────────────────────
+
+/// Filesystem-agnostic file type for VFS operations.
+///
+/// This is the semantics-level file type used by [`FsOps`] methods. It unifies
+/// ext4's `Ext4FileType` and btrfs's inode type into a single enum that
+/// higher layers (FUSE, harness) consume without filesystem-specific knowledge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FileType {
+    RegularFile,
+    Directory,
+    Symlink,
+    BlockDevice,
+    CharDevice,
+    Fifo,
+    Socket,
+}
+
+/// Inode attributes returned by [`FsOps::getattr`] and [`FsOps::lookup`].
+///
+/// This is the semantics-level stat structure, analogous to POSIX `struct stat`.
+/// Format-specific crates (ffs-ext4, ffs-btrfs) convert their on-disk inode
+/// representations into `InodeAttr` at the crate boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InodeAttr {
+    /// Inode number.
+    pub ino: InodeNumber,
+    /// File size in bytes.
+    pub size: u64,
+    /// Number of 512-byte blocks allocated.
+    pub blocks: u64,
+    /// Last access time.
+    pub atime: SystemTime,
+    /// Last modification time.
+    pub mtime: SystemTime,
+    /// Last status change time.
+    pub ctime: SystemTime,
+    /// Creation time (if available).
+    pub crtime: SystemTime,
+    /// File type.
+    pub kind: FileType,
+    /// POSIX permission bits (lower 12 bits of mode).
+    pub perm: u16,
+    /// Number of hard links.
+    pub nlink: u32,
+    /// Owner user ID.
+    pub uid: u32,
+    /// Owner group ID.
+    pub gid: u32,
+    /// Device ID (for block/char devices).
+    pub rdev: u32,
+    /// Preferred I/O block size.
+    pub blksize: u32,
+}
+
+/// A directory entry returned by [`FsOps::readdir`].
+///
+/// Each entry represents one name in a directory listing. The `offset` field
+/// is an opaque cookie for resuming iteration — FUSE passes it back on
+/// subsequent `readdir` calls so the implementation can skip already-returned
+/// entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    /// Inode number of the target.
+    pub ino: InodeNumber,
+    /// Opaque offset cookie for readdir continuation.
+    pub offset: u64,
+    /// File type of the target.
+    pub kind: FileType,
+    /// Entry name (filename component, not a full path).
+    pub name: Vec<u8>,
+}
+
+impl DirEntry {
+    /// Return the name as a UTF-8 string (lossy).
+    #[must_use]
+    pub fn name_str(&self) -> String {
+        String::from_utf8_lossy(&self.name).into_owned()
+    }
+}
+
+/// Minimal VFS operations trait for read-only filesystem access.
+///
+/// This is the internal interface that FUSE and the test harness call.
+/// Format-specific implementations (ext4, btrfs) live behind this trait so
+/// that higher layers are filesystem-agnostic.
+///
+/// # Design Notes
+///
+/// - All methods take `&Cx` for cooperative cancellation and deadline
+///   propagation via the asupersync runtime.
+/// - Errors are returned as `ffs_error::FfsError`, which maps to POSIX
+///   errnos via [`FfsError::to_errno()`].
+/// - The trait is `Send + Sync` so that FUSE can call it from multiple
+///   threads concurrently.
+/// - Only read-only operations are included in this initial version.
+///   Write operations (create, write, mkdir, unlink, etc.) will be added
+///   in a future bead once the MVCC write path is ready.
+pub trait FsOps: Send + Sync {
+    /// Get file attributes by inode number.
+    ///
+    /// Returns the attributes for the given inode. Returns
+    /// `FfsError::NotFound` if the inode does not exist.
+    fn getattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<InodeAttr>;
+
+    /// Look up a directory entry by name.
+    ///
+    /// Returns the attributes of the child inode named `name` within the
+    /// directory `parent`. Returns `FfsError::NotFound` if the name does
+    /// not exist, or `FfsError::NotDirectory` if `parent` is not a directory.
+    fn lookup(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<InodeAttr>;
+
+    /// List directory entries starting from `offset`.
+    ///
+    /// Returns a batch of entries from the directory identified by `ino`.
+    /// The `offset` parameter is an opaque cookie from a previous call's
+    /// `DirEntry::offset` field (use 0 for the first call). An empty
+    /// result indicates the end of the directory.
+    ///
+    /// Returns `FfsError::NotDirectory` if `ino` is not a directory.
+    fn readdir(&self, cx: &Cx, ino: InodeNumber, offset: u64) -> ffs_error::Result<Vec<DirEntry>>;
+
+    /// Read file data.
+    ///
+    /// Returns up to `size` bytes starting at byte `offset` within the
+    /// file identified by `ino`. Returns fewer bytes at EOF. Returns
+    /// `FfsError::IsDirectory` if `ino` is a directory.
+    fn read(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32)
+    -> ffs_error::Result<Vec<u8>>;
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -348,6 +481,240 @@ mod tests {
         btrfs_img[sb2 + 0x94..sb2 + 0x98].copy_from_slice(&4096_u32.to_le_bytes());
         let btrfs = detect_filesystem(&btrfs_img).expect("detect btrfs");
         assert!(matches!(btrfs, FsFlavor::Btrfs(_)));
+    }
+
+    // ── FsOps VFS trait tests ─────────────────────────────────────────
+
+    /// A stub FsOps implementation for testing that the trait is object-safe
+    /// and can be used as a trait object behind `dyn`.
+    struct StubFs;
+
+    impl FsOps for StubFs {
+        fn getattr(&self, _cx: &Cx, ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
+            if ino == InodeNumber(1) {
+                Ok(InodeAttr {
+                    ino,
+                    size: 4096,
+                    blocks: 8,
+                    atime: SystemTime::UNIX_EPOCH,
+                    mtime: SystemTime::UNIX_EPOCH,
+                    ctime: SystemTime::UNIX_EPOCH,
+                    crtime: SystemTime::UNIX_EPOCH,
+                    kind: FileType::Directory,
+                    perm: 0o755,
+                    nlink: 2,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    blksize: 4096,
+                })
+            } else {
+                Err(FfsError::NotFound(format!("inode {ino}")))
+            }
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _parent: InodeNumber,
+            name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            if name == "hello.txt" {
+                Ok(InodeAttr {
+                    ino: InodeNumber(11),
+                    size: 13,
+                    blocks: 8,
+                    atime: SystemTime::UNIX_EPOCH,
+                    mtime: SystemTime::UNIX_EPOCH,
+                    ctime: SystemTime::UNIX_EPOCH,
+                    crtime: SystemTime::UNIX_EPOCH,
+                    kind: FileType::RegularFile,
+                    perm: 0o644,
+                    nlink: 1,
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    blksize: 4096,
+                })
+            } else {
+                Err(FfsError::NotFound(name.to_string_lossy().into_owned()))
+            }
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            ino: InodeNumber,
+            offset: u64,
+        ) -> ffs_error::Result<Vec<DirEntry>> {
+            if ino != InodeNumber(1) {
+                return Err(FfsError::NotDirectory);
+            }
+            let all = vec![
+                DirEntry {
+                    ino: InodeNumber(1),
+                    offset: 1,
+                    kind: FileType::Directory,
+                    name: b".".to_vec(),
+                },
+                DirEntry {
+                    ino: InodeNumber(1),
+                    offset: 2,
+                    kind: FileType::Directory,
+                    name: b"..".to_vec(),
+                },
+                DirEntry {
+                    ino: InodeNumber(11),
+                    offset: 3,
+                    kind: FileType::RegularFile,
+                    name: b"hello.txt".to_vec(),
+                },
+            ];
+            Ok(all.into_iter().filter(|e| e.offset > offset).collect())
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            ino: InodeNumber,
+            offset: u64,
+            size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            if ino == InodeNumber(1) {
+                return Err(FfsError::IsDirectory);
+            }
+            let data = b"Hello, world!";
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+            let end = (start + size as usize).min(data.len());
+            Ok(data[start..end].to_vec())
+        }
+    }
+
+    #[test]
+    fn fsops_getattr_root() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let attr = fs.getattr(&cx, InodeNumber(1)).unwrap();
+        assert_eq!(attr.ino, InodeNumber(1));
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+        assert_eq!(attr.nlink, 2);
+    }
+
+    #[test]
+    fn fsops_getattr_not_found() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let err = fs.getattr(&cx, InodeNumber(999)).unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn fsops_lookup_found() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let attr = fs
+            .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+            .unwrap();
+        assert_eq!(attr.ino, InodeNumber(11));
+        assert_eq!(attr.kind, FileType::RegularFile);
+    }
+
+    #[test]
+    fn fsops_lookup_not_found() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let err = fs
+            .lookup(&cx, InodeNumber(1), OsStr::new("missing"))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn fsops_readdir_with_offset() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+
+        // Full listing from offset 0
+        let entries = fs.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name_str(), ".");
+        assert_eq!(entries[2].name_str(), "hello.txt");
+
+        // Resume from offset 2 (skip . and ..)
+        let entries = fs.readdir(&cx, InodeNumber(1), 2).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name_str(), "hello.txt");
+    }
+
+    #[test]
+    fn fsops_readdir_not_directory() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let err = fs.readdir(&cx, InodeNumber(11), 0).unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOTDIR);
+    }
+
+    #[test]
+    fn fsops_read_file() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let data = fs.read(&cx, InodeNumber(11), 0, 5).unwrap();
+        assert_eq!(&data, b"Hello");
+
+        // Read from offset
+        let data = fs.read(&cx, InodeNumber(11), 7, 100).unwrap();
+        assert_eq!(&data, b"world!");
+    }
+
+    #[test]
+    fn fsops_read_directory_returns_is_directory() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let err = fs.read(&cx, InodeNumber(1), 0, 4096).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EISDIR);
+    }
+
+    #[test]
+    fn fsops_trait_is_object_safe() {
+        // Verify FsOps can be used as dyn trait object
+        let fs: Box<dyn FsOps> = Box::new(StubFs);
+        let cx = Cx::for_testing();
+        let attr = fs.getattr(&cx, InodeNumber(1)).unwrap();
+        assert_eq!(attr.kind, FileType::Directory);
+    }
+
+    #[test]
+    fn dir_entry_name_str() {
+        let entry = DirEntry {
+            ino: InodeNumber(5),
+            offset: 1,
+            kind: FileType::RegularFile,
+            name: b"test.txt".to_vec(),
+        };
+        assert_eq!(entry.name_str(), "test.txt");
+    }
+
+    #[test]
+    fn file_type_variants_are_distinct() {
+        let types = [
+            FileType::RegularFile,
+            FileType::Directory,
+            FileType::Symlink,
+            FileType::BlockDevice,
+            FileType::CharDevice,
+            FileType::Fifo,
+            FileType::Socket,
+        ];
+        for (i, a) in types.iter().enumerate() {
+            for (j, b) in types.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
     }
 
     #[test]

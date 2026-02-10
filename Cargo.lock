@@ -397,6 +397,7 @@ dependencies = [
  "ffs-mvcc",
  "ffs-ondisk",
  "ffs-types",
+ "libc",
  "serde",
  "thiserror",
 ]

@@ -16,5 +16,8 @@ ffs-types = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+libc = { workspace = true }
+
 [lints]
 workspace = true
