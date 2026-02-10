@@ -553,6 +553,26 @@ impl ArcState {
 /// - read caching of whole blocks
 /// - write-through (writes update cache and the underlying device immediately)
 ///
+/// # Concurrency design
+///
+/// **Locking strategy:** A single `parking_lot::Mutex<ArcState>` protects all
+/// cache metadata (T1/T2/B1/B2 lists, resident map, counters).  This is
+/// sufficient because:
+///
+/// 1. The lock is **never held during I/O**.  `read_block` drops the lock
+///    before issuing a device read and re-acquires it afterwards.
+///    `write_block` writes through to the device first, then acquires the lock
+///    only to update metadata.
+/// 2. `parking_lot::Mutex` is non-poisoning and uses adaptive spinning, so
+///    contention under typical FUSE workloads (many concurrent reads, few
+///    writes) remains low.
+///
+/// **Future sharding:** If profiling reveals lock contention under heavy
+/// parallel read workloads, the cache can be sharded by `BlockNumber` into N
+/// independent `Mutex<ArcState>` segments (e.g. `block.0 % N`).  The current
+/// single-lock design keeps the implementation simple and correct as a
+/// baseline.
+///
 /// TODO: add write-back, dirty eviction, and background flush integration.
 #[derive(Debug)]
 pub struct ArcCache<D: BlockDevice> {
@@ -603,8 +623,15 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         let buf = self.inner.read_block(cx, block)?;
 
         let mut guard = self.state.lock();
-        guard.on_miss_or_ghost_hit(block);
-        guard.resident.insert(block, buf.as_slice().to_vec());
+        // Re-check: another thread may have populated this block while we
+        // were reading from the device (TOCTOU race).  If so, treat as a hit
+        // and discard our redundant device read.
+        if guard.resident.contains_key(&block) {
+            guard.on_hit(block);
+        } else {
+            guard.on_miss_or_ghost_hit(block);
+            guard.resident.insert(block, buf.as_slice().to_vec());
+        }
         drop(guard);
         Ok(buf)
     }
@@ -612,8 +639,14 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
         self.inner.write_block(cx, block, data)?;
         let mut guard = self.state.lock();
-        guard.on_miss_or_ghost_hit(block);
-        guard.resident.insert(block, data.to_vec());
+        if guard.resident.contains_key(&block) {
+            // Block already cached — just update data and touch for recency.
+            guard.resident.insert(block, data.to_vec());
+            guard.on_hit(block);
+        } else {
+            guard.on_miss_or_ghost_hit(block);
+            guard.resident.insert(block, data.to_vec());
+        }
         drop(guard);
         Ok(())
     }
@@ -925,5 +958,122 @@ mod tests {
         assert_eq!(m.misses, 1);
         assert_eq!(m.hits, 1);
         assert!((m.hit_ratio() - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ── Concurrency stress tests ────────────────────────────────────────
+
+    #[test]
+    fn arc_cache_concurrent_reads_no_deadlock() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        const NUM_THREADS: usize = 8;
+        const OPS_PER_THREAD: usize = 500;
+        const NUM_BLOCKS: usize = 16;
+        const BLOCK_SIZE: u32 = 4096;
+        const CACHE_CAPACITY: usize = 4;
+
+        let mem = MemoryByteDevice::new(BLOCK_SIZE as usize * NUM_BLOCKS);
+        let dev = ByteBlockDevice::new(mem, BLOCK_SIZE).expect("device");
+
+        // Pre-populate the device so reads succeed.
+        let cx = Cx::for_testing();
+        for i in 0..NUM_BLOCKS {
+            let fill = u8::try_from(i & 0xFF).unwrap_or(0);
+            let data = vec![fill; BLOCK_SIZE as usize];
+            dev.write_block(&cx, BlockNumber(i as u64), &data)
+                .expect("seed");
+        }
+
+        let cache = StdArc::new(ArcCache::new(dev, CACHE_CAPACITY).expect("cache"));
+
+        let handles: Vec<_> = (0..NUM_THREADS)
+            .map(|t| {
+                let cache = StdArc::clone(&cache);
+                thread::spawn(move || {
+                    let cx = Cx::for_testing();
+                    for i in 0..OPS_PER_THREAD {
+                        let idx = (t + i) % NUM_BLOCKS;
+                        let block = BlockNumber(idx as u64);
+                        let buf = cache.read_block(&cx, block).expect("read");
+                        let expected = u8::try_from(idx & 0xFF).unwrap_or(0);
+                        assert_eq!(buf.as_slice()[0], expected);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        let m = cache.metrics();
+        let total_ops = u64::try_from(NUM_THREADS * OPS_PER_THREAD).expect("fits u64");
+        assert_eq!(m.hits + m.misses, total_ops);
+        assert!(m.hits > 0, "should have some cache hits");
+    }
+
+    #[test]
+    fn arc_cache_concurrent_mixed_read_write() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        const READERS: usize = 4;
+        const WRITERS: usize = 2;
+        const OPS: usize = 200;
+        const NUM_BLOCKS: usize = 8;
+        const BLOCK_SIZE: u32 = 4096;
+
+        let mem = MemoryByteDevice::new(BLOCK_SIZE as usize * NUM_BLOCKS);
+        let dev = ByteBlockDevice::new(mem, BLOCK_SIZE).expect("device");
+
+        // Seed device.
+        let cx = Cx::for_testing();
+        for i in 0..NUM_BLOCKS {
+            dev.write_block(&cx, BlockNumber(i as u64), &vec![0u8; BLOCK_SIZE as usize])
+                .expect("seed");
+        }
+
+        let cache = StdArc::new(ArcCache::new(dev, 4).expect("cache"));
+
+        let mut handles = Vec::new();
+
+        // Reader threads.
+        for t in 0..READERS {
+            let cache = StdArc::clone(&cache);
+            handles.push(thread::spawn(move || {
+                let cx = Cx::for_testing();
+                for i in 0..OPS {
+                    let idx = (t + i) % NUM_BLOCKS;
+                    let _ = cache
+                        .read_block(&cx, BlockNumber(idx as u64))
+                        .expect("read");
+                }
+            }));
+        }
+
+        // Writer threads.
+        for t in 0..WRITERS {
+            let cache = StdArc::clone(&cache);
+            handles.push(thread::spawn(move || {
+                let cx = Cx::for_testing();
+                for i in 0..OPS {
+                    let idx = (t + i) % NUM_BLOCKS;
+                    let fill = u8::try_from((t + i) & 0xFF).unwrap_or(0);
+                    let data = vec![fill; BLOCK_SIZE as usize];
+                    cache
+                        .write_block(&cx, BlockNumber(idx as u64), &data)
+                        .expect("write");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        let m = cache.metrics();
+        assert!(m.hits + m.misses > 0, "should have recorded some accesses");
+        assert!(m.resident <= 4, "resident should not exceed capacity");
     }
 }
