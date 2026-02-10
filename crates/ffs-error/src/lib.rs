@@ -31,6 +31,23 @@
 //! mounted image), prefer `FfsError::Corruption` with the block number for
 //! repair triage.
 //!
+//! ## Mount-Validation Errors
+//!
+//! Mount-time validation (`validate_v1()` in ffs-ondisk) can fail for three
+//! distinct reasons, each with its own FfsError variant:
+//!
+//! | Failure | FfsError Variant | errno | Example |
+//! |---------|------------------|-------|---------|
+//! | Feature not supported by this build | `UnsupportedFeature` | `EOPNOTSUPP` | ENCRYPT, INLINE_DATA |
+//! | Block size or geometry out of range | `InvalidGeometry` | `EINVAL` | 64K blocks, zero blocks_per_group |
+//! | Structurally invalid format | `Format` | `EINVAL` | Bad magic, unknown revision |
+//!
+//! The `ffs-core` mount path converts `ParseError::InvalidField` from
+//! `validate_v1()` into the appropriate variant by inspecting the field
+//! name and reason. The parsing layer (`ffs-ondisk`) does not need to know
+//! about `FfsError` — it returns `ParseError` and the boundary conversion
+//! adds the mount-validation context.
+//!
 //! ## FUSE errno Mapping
 //!
 //! Every `FfsError` variant maps to exactly one POSIX errno via [`FfsError::to_errno`].
@@ -43,6 +60,8 @@
 //! | `Corruption` | `EIO` | 5 |
 //! | `Format` | `EINVAL` | 22 |
 //! | `Parse` | `EINVAL` | 22 |
+//! | `UnsupportedFeature` | `EOPNOTSUPP` | 95 |
+//! | `InvalidGeometry` | `EINVAL` | 22 |
 //! | `MvccConflict` | `EAGAIN` | 11 |
 //! | `Cancelled` | `EINTR` | 4 |
 //! | `NoSpace` | `ENOSPC` | 28 |
@@ -101,6 +120,22 @@ pub enum FfsError {
     /// `Format` when the block number or mount-validation context is known.
     #[error("parse error: {0}")]
     Parse(String),
+
+    /// The filesystem image uses a feature that this build does not support.
+    ///
+    /// Used during mount-time validation when incompatible feature flags are
+    /// set (e.g., ENCRYPT, INLINE_DATA). Maps to `EOPNOTSUPP` to distinguish
+    /// "we don't support this yet" from "this image is broken."
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(String),
+
+    /// On-disk geometry is invalid or out of the supported range.
+    ///
+    /// Used during mount-time validation for block sizes, blocks_per_group,
+    /// inodes_per_group, or other structural parameters that are numerically
+    /// invalid or outside what FrankenFS supports.
+    #[error("invalid geometry: {0}")]
+    InvalidGeometry(String),
 
     /// MVCC serialization conflict.
     #[error("MVCC conflict: transaction {tx} conflicts on block {block}")]
@@ -162,13 +197,17 @@ impl FfsError {
     ///   semantics. FUSE callers may retry at a higher layer.
     /// - `Parse` → `EINVAL`: parse failures during mount are format errors;
     ///   during live operation they should be wrapped as `Corruption` instead.
+    /// - `UnsupportedFeature` → `EOPNOTSUPP`: distinguishes "not implemented"
+    ///   from "structurally invalid."
+    /// - `InvalidGeometry` → `EINVAL`: bad on-disk parameters.
     /// - `ReadOnly` → `EROFS`: standard read-only filesystem errno.
     #[must_use]
     pub fn to_errno(&self) -> libc::c_int {
         match self {
             Self::Io(err) => err.raw_os_error().unwrap_or(libc::EIO),
             Self::Corruption { .. } | Self::RepairFailed(_) => libc::EIO,
-            Self::Format(_) | Self::Parse(_) => libc::EINVAL,
+            Self::Format(_) | Self::Parse(_) | Self::InvalidGeometry(_) => libc::EINVAL,
+            Self::UnsupportedFeature(_) => libc::EOPNOTSUPP,
             Self::MvccConflict { .. } => libc::EAGAIN,
             Self::Cancelled => libc::EINTR,
             Self::NoSpace => libc::ENOSPC,
@@ -195,10 +234,7 @@ mod tests {
     fn errno_mapping_covers_all_variants() {
         // Verify each variant produces the expected errno.
         let cases: Vec<(FfsError, libc::c_int)> = vec![
-            (
-                FfsError::Io(std::io::Error::other("test")),
-                libc::EIO,
-            ),
+            (FfsError::Io(std::io::Error::other("test")), libc::EIO),
             (
                 FfsError::Corruption {
                     block: 0,
@@ -208,6 +244,14 @@ mod tests {
             ),
             (FfsError::Format("test".into()), libc::EINVAL),
             (FfsError::Parse("test".into()), libc::EINVAL),
+            (
+                FfsError::UnsupportedFeature("ENCRYPT".into()),
+                libc::EOPNOTSUPP,
+            ),
+            (
+                FfsError::InvalidGeometry("block_size=0".into()),
+                libc::EINVAL,
+            ),
             (FfsError::MvccConflict { tx: 1, block: 2 }, libc::EAGAIN),
             (FfsError::Cancelled, libc::EINTR),
             (FfsError::NoSpace, libc::ENOSPC),
@@ -254,5 +298,26 @@ mod tests {
 
         let ro = FfsError::ReadOnly;
         assert_eq!(ro.to_string(), "read-only filesystem");
+
+        let unsup = FfsError::UnsupportedFeature("ENCRYPT".into());
+        assert_eq!(unsup.to_string(), "unsupported feature: ENCRYPT");
+
+        let geom = FfsError::InvalidGeometry("blocks_per_group=0".into());
+        assert_eq!(geom.to_string(), "invalid geometry: blocks_per_group=0");
+    }
+
+    #[test]
+    fn mount_validation_errnos_are_distinct() {
+        // UnsupportedFeature should be EOPNOTSUPP, not EINVAL
+        let unsup = FfsError::UnsupportedFeature("ENCRYPT".into());
+        let geom = FfsError::InvalidGeometry("bad block size".into());
+        let fmt = FfsError::Format("bad magic".into());
+
+        assert_eq!(unsup.to_errno(), libc::EOPNOTSUPP);
+        assert_eq!(geom.to_errno(), libc::EINVAL);
+        assert_eq!(fmt.to_errno(), libc::EINVAL);
+
+        // EOPNOTSUPP != EINVAL (verifying the distinction matters)
+        assert_ne!(unsup.to_errno(), geom.to_errno());
     }
 }

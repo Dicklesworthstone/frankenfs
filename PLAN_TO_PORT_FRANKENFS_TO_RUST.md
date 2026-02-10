@@ -297,7 +297,7 @@ parsing with round-trip fidelity.
 | Crate | Key Items |
 |---|---|
 | `ffs-types` | `BlockNumber(u64)`, `InodeNumber(u64)`, `TxnId(u64)`, `CommitSeq(u64)`, `Snapshot { high: CommitSeq }`, `ParseError` enum; binary read helpers (`read_le_u16/u32/u64`, `ensure_slice`, `trim_nul_padded`); ext4/btrfs magic constants |
-| `ffs-error` | `FfsError` enum (16 variants: Io, Corruption, Format, Parse, MvccConflict, Cancelled, NoSpace, NotFound, PermissionDenied, ReadOnly, NotDirectory, IsDirectory, NotEmpty, NameTooLong, Exists, RepairFailed); `Result<T>` alias. See canonical listing in `crates/ffs-error/src/lib.rs`. |
+| `ffs-error` | `FfsError` enum (18 variants: Io, Corruption, Format, Parse, UnsupportedFeature, InvalidGeometry, MvccConflict, Cancelled, NoSpace, NotFound, PermissionDenied, ReadOnly, NotDirectory, IsDirectory, NotEmpty, NameTooLong, Exists, RepairFailed); `Result<T>` alias. See canonical listing in `crates/ffs-error/src/lib.rs`. |
 | `ffs-ondisk` | Parsing and serialization for all ext4 on-disk structures |
 
 **Key On-Disk Structures:**
@@ -746,6 +746,8 @@ Every `FfsError` variant maps to a POSIX errno for FUSE:
 | `Corruption` | `EIO` | On-disk corruption detected |
 | `Format` | `EINVAL` | Invalid on-disk format |
 | `Parse` | `EINVAL` | Parse-layer error surfaced to user |
+| `UnsupportedFeature` | `EOPNOTSUPP` | Feature not supported by this build |
+| `InvalidGeometry` | `EINVAL` | Block size or geometry out of range |
 | `MvccConflict` | `EAGAIN` | SSI conflict; retry transaction |
 | `Cancelled` | `EINTR` | Cx cancellation |
 | `NoSpace` | `ENOSPC` | No free blocks or inodes |
@@ -759,7 +761,7 @@ Every `FfsError` variant maps to a POSIX errno for FUSE:
 | `Exists` | `EEXIST` | File already exists in create/mkdir |
 | `RepairFailed` | `EIO` | RaptorQ repair could not recover data |
 
-> **Note:** These are the canonical 16 FfsError variants. See `crates/ffs-error/src/lib.rs` for the normative definition and mapping policy documentation.
+> **Note:** These are the canonical 18 FfsError variants. See `crates/ffs-error/src/lib.rs` for the normative definition and mapping policy documentation.
 
 **Acceptance Criteria:**
 - Mount a real ext4 test image via FUSE.
