@@ -1,12 +1,33 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail};
-use asupersync::Cx;
+use asupersync::{Budget, Cx};
 use ffs_core::{FsFlavor, detect_filesystem_at_path};
 use ftui::{Style, Theme};
 use serde::Serialize;
 use std::env;
 use std::path::Path;
+
+// ── Production Cx acquisition ───────────────────────────────────────────────
+
+/// Create a production `Cx` for CLI commands.
+///
+/// Uses ephemeral region/task IDs (not test IDs) and an infinite budget
+/// for synchronous CLI operations. When timeout support is needed, use
+/// `cli_cx_with_timeout` instead.
+///
+/// Future: integrate `ShutdownController` + SIGINT handler here once
+/// asupersync's signal module reaches Phase 1.
+fn cli_cx() -> Cx {
+    Cx::for_request()
+}
+
+/// Create a production `Cx` with a deadline budget for CLI commands that
+/// should be time-bounded (e.g., fsck with a timeout).
+#[allow(dead_code)]
+fn cli_cx_with_timeout_secs(secs: u64) -> Cx {
+    Cx::for_request_with_budget(Budget::with_deadline_secs(secs))
+}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "filesystem", rename_all = "lowercase")]
@@ -65,7 +86,7 @@ fn print_usage() {
 }
 
 fn inspect(path: &Path, json: bool) -> Result<()> {
-    let cx = Cx::for_testing();
+    let cx = cli_cx();
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
 
