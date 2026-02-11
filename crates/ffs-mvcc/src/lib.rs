@@ -432,4 +432,310 @@ mod tests {
         assert_eq!(dev.block_size(), 4096);
         assert_eq!(dev.block_count(), 128);
     }
+
+    // ── Deterministic concurrency tests (bd-hrv) ─────────────────────────
+    //
+    // These tests encode MVCC invariants under controlled interleavings:
+    //   1. Snapshot visibility — readers see only committed versions ≤ snap.
+    //   2. First-committer-wins (FCW) — concurrent writers conflict correctly.
+    //   3. No lost updates — every committed write is observable.
+    //
+    // The tests are deterministic: each constructs a specific interleaving
+    // order rather than relying on thread scheduling, making them non-flaky.
+
+    /// Invariant: snapshot visibility across a chain of commits.
+    ///
+    /// Commits v1..v5 to the same block, captures a snapshot after each.
+    /// Each snapshot sees exactly the version committed at or before it.
+    #[test]
+    fn snapshot_visibility_chain() {
+        let mut store = MvccStore::new();
+        let mut snapshots = Vec::new();
+        let block = BlockNumber(42);
+
+        for version in 1_u8..=5 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![version; 4]);
+            store.commit(txn).expect("commit");
+            snapshots.push(store.current_snapshot());
+        }
+
+        // Each snapshot i should see version i+1 (1-indexed).
+        for (i, snap) in snapshots.iter().enumerate() {
+            let expected_version = u8::try_from(i + 1).expect("fits u8");
+            let data = store.read_visible(block, *snap).expect("should be visible");
+            assert_eq!(
+                data, &[expected_version; 4],
+                "snapshot {i} should see version {expected_version}"
+            );
+        }
+    }
+
+    /// Invariant: snapshot isolation prevents seeing future commits.
+    ///
+    /// Take a snapshot before any commits. Later commits must not be
+    /// visible at that snapshot.
+    #[test]
+    fn snapshot_isolation_future_invisible() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(1);
+
+        let early_snap = store.current_snapshot();
+
+        // Commit 3 versions after the snapshot.
+        for v in 1_u8..=3 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit(txn).expect("commit");
+        }
+
+        // Early snapshot should see nothing.
+        assert!(
+            store.read_visible(block, early_snap).is_none(),
+            "snapshot taken before any commits should see nothing"
+        );
+    }
+
+    /// Invariant: FCW — interleaved writers to same block.
+    ///
+    /// Scenario: 3 transactions all begin at the same snapshot, all write
+    /// the same block. Only the first to commit succeeds; the other two
+    /// get Conflict errors.
+    #[test]
+    fn fcw_three_concurrent_writers() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(10);
+
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+        let mut t3 = store.begin();
+
+        t1.stage_write(block, vec![1]);
+        t2.stage_write(block, vec![2]);
+        t3.stage_write(block, vec![3]);
+
+        // T1 commits first — succeeds.
+        let c1 = store.commit(t1).expect("t1 should succeed");
+        assert_eq!(c1, CommitSeq(1));
+
+        // T2 and T3 conflict because block was updated after their snapshot.
+        let err2 = store.commit(t2).expect_err("t2 should conflict");
+        assert!(matches!(err2, CommitError::Conflict { .. }));
+
+        let err3 = store.commit(t3).expect_err("t3 should conflict");
+        assert!(matches!(err3, CommitError::Conflict { .. }));
+    }
+
+    /// Invariant: FCW is per-block — disjoint writers don't conflict.
+    ///
+    /// Two concurrent transactions writing to different blocks both succeed.
+    #[test]
+    fn fcw_disjoint_blocks_no_conflict() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+
+        t1.stage_write(BlockNumber(1), vec![0xAA]);
+        t2.stage_write(BlockNumber(2), vec![0xBB]);
+
+        store.commit(t1).expect("t1 should succeed");
+        store
+            .commit(t2)
+            .expect("t2 should succeed (disjoint block)");
+
+        let snap = store.current_snapshot();
+        assert_eq!(store.read_visible(BlockNumber(1), snap).unwrap(), &[0xAA]);
+        assert_eq!(store.read_visible(BlockNumber(2), snap).unwrap(), &[0xBB]);
+    }
+
+    /// Invariant: no lost updates — every committed write is observable.
+    ///
+    /// Serial commits to different blocks; all are visible at the final snapshot.
+    #[test]
+    fn no_lost_updates_serial() {
+        let mut store = MvccStore::new();
+
+        for i in 0_u64..20 {
+            let block = BlockNumber(i);
+            let mut txn = store.begin();
+            let val = u8::try_from(i % 256).expect("fits u8");
+            txn.stage_write(block, vec![val; 8]);
+            store.commit(txn).expect("commit");
+        }
+
+        let snap = store.current_snapshot();
+        for i in 0_u64..20 {
+            let block = BlockNumber(i);
+            let expected_val = u8::try_from(i % 256).expect("fits u8");
+            let data = store.read_visible(block, snap).expect("must be visible");
+            assert_eq!(data, &[expected_val; 8], "block {i} data mismatch");
+        }
+    }
+
+    /// Invariant: no lost updates under interleaved begin/commit ordering.
+    ///
+    /// Interleave: begin(t1), begin(t2), commit(t1), commit(t2)
+    /// where t1 and t2 write disjoint blocks. Both must persist.
+    #[test]
+    fn no_lost_updates_interleaved_disjoint() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+
+        t1.stage_write(BlockNumber(100), vec![1; 16]);
+        t2.stage_write(BlockNumber(200), vec![2; 16]);
+
+        store.commit(t1).expect("commit t1");
+        store.commit(t2).expect("commit t2");
+
+        let snap = store.current_snapshot();
+        assert_eq!(
+            store.read_visible(BlockNumber(100), snap).unwrap(),
+            &[1; 16]
+        );
+        assert_eq!(
+            store.read_visible(BlockNumber(200), snap).unwrap(),
+            &[2; 16]
+        );
+    }
+
+    /// Invariant: prune does not break snapshot visibility.
+    ///
+    /// After pruning old versions, a snapshot that sees the latest
+    /// version still returns the correct data.
+    #[test]
+    fn prune_preserves_latest_visibility() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(5);
+
+        // Write 5 versions.
+        for v in 1_u8..=5 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit(txn).expect("commit");
+        }
+
+        let snap = store.current_snapshot();
+
+        // Prune everything up to commit 4.
+        store.prune_versions_older_than(CommitSeq(4));
+
+        // Latest snapshot should still see version 5.
+        let data = store.read_visible(block, snap).expect("still visible");
+        assert_eq!(data, &[5]);
+    }
+
+    /// Multi-threaded stress: concurrent MvccBlockDevice writers on disjoint blocks.
+    ///
+    /// Multiple threads each write to their own block via the MvccBlockDevice.
+    /// After all threads complete, all writes must be visible.
+    #[test]
+    fn concurrent_mvcc_device_disjoint_writers() {
+        let store = Arc::new(RwLock::new(MvccStore::new()));
+        let num_threads: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let block_num = u64::try_from(i).expect("thread index fits u64");
+                std::thread::spawn(move || {
+                    let cx = Cx::for_testing();
+                    let snap = store.read().current_snapshot();
+                    let base = MemBlockDevice::new(64, 256);
+                    let dev = MvccBlockDevice::new(base, Arc::clone(&store), snap);
+
+                    // Synchronize all threads to start at the same time.
+                    barrier.wait();
+
+                    let val = u8::try_from(i % 256).expect("fits u8");
+                    dev.write_block(&cx, BlockNumber(block_num), &[val; 64])
+                        .expect("write should succeed (disjoint blocks)");
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // Verify all writes are visible at the latest snapshot.
+        let guard = store.read();
+        let snap = guard.current_snapshot();
+        for i in 0..num_threads {
+            let block_num = u64::try_from(i).expect("thread index fits u64");
+            let expected_val = u8::try_from(i % 256).expect("fits u8");
+            let data = guard
+                .read_visible(BlockNumber(block_num), snap)
+                .expect("block must be visible");
+            assert_eq!(data, &[expected_val; 64], "thread {i} write lost");
+        }
+        drop(guard);
+    }
+
+    /// Multi-threaded stress: concurrent readers see stable snapshots.
+    ///
+    /// A writer thread commits versions while reader threads assert that
+    /// their snapshot view never changes mid-read.
+    #[test]
+    fn concurrent_readers_stable_snapshot() {
+        let store = Arc::new(RwLock::new(MvccStore::new()));
+        let block = BlockNumber(0);
+
+        // Seed an initial version so readers have something to see.
+        {
+            let mut guard = store.write();
+            let mut txn = guard.begin();
+            txn.stage_write(block, vec![0; 64]);
+            guard.commit(txn).expect("seed commit");
+        }
+
+        let snap = store.read().current_snapshot();
+        let num_readers: usize = 4;
+        let reads_per_thread: usize = 200;
+        let barrier = Arc::new(std::sync::Barrier::new(num_readers + 1));
+
+        // Reader threads: each reads the same block many times at `snap`.
+        let reader_handles: Vec<_> = (0..num_readers)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let cx = Cx::for_testing();
+                    let base = MemBlockDevice::new(64, 256);
+                    let dev = MvccBlockDevice::new(base, Arc::clone(&store), snap);
+
+                    barrier.wait();
+
+                    for _ in 0..reads_per_thread {
+                        let buf = dev.read_block(&cx, block).expect("read");
+                        // Snapshot should always see version 0.
+                        assert_eq!(buf.as_slice(), &[0; 64], "snapshot view changed");
+                    }
+                })
+            })
+            .collect();
+
+        // Writer thread: commits new versions concurrently.
+        let writer_store = Arc::clone(&store);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_handle = std::thread::spawn(move || {
+            writer_barrier.wait();
+
+            for v in 1_u8..=50 {
+                let mut guard = writer_store.write();
+                let mut txn = guard.begin();
+                txn.stage_write(block, vec![v; 64]);
+                guard.commit(txn).expect("writer commit");
+            }
+        });
+
+        for h in reader_handles {
+            h.join().expect("reader panicked");
+        }
+        writer_handle.join().expect("writer panicked");
+    }
 }
