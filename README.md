@@ -372,7 +372,7 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the full capability matrix and [P
 
 ## Limitations
 
-- **Not mountable yet.** FUSE interface is scaffolded but returns `NotImplemented` for all operations.
+- **Read-only mount only.** `ffs mount` supports read-only ext4 via FUSE. Write support and btrfs mount are not yet implemented.
 - **Linux only.** FUSE is the sole mount target. No macOS or Windows support planned.
 - **Nightly Rust required.** Edition 2024 features require the nightly toolchain.
 - **No write path.** Current parsing is read-only. Write-path MVCC and journaling are in progress.

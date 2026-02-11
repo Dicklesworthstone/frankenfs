@@ -257,7 +257,7 @@ nursery  = { level = "deny", priority = -1 }
 | `#![forbid(unsafe_code)]` | Workspace lint + crate-root attribute | Memory safety non-negotiable. Third-party `unsafe` (e.g., `crc32c`) acceptable if audited + safe API. |
 | Edition 2024 | `[workspace.package]` | Latest language features. |
 | Nightly toolchain | `rust-toolchain.toml`: `channel = "nightly"` | Required for Edition 2024 + dependency features. |
-| `rust-version = "1.85"` | `[workspace.package]` | Minimum nightly version. |
+| `rust-version = "1.85"` | `[workspace.package]` | MSRV: minimum Rust version supporting Edition 2024. The nightly toolchain is unpinned (latest nightly). |
 | Clippy pedantic+nursery deny | Workspace lints | Idiomatic Rust, catch common bugs. |
 | No tokio | Dependency audit | See Section 1.4. |
 | `panic = "abort"` in release | `[profile.release]` | No unwinding; smaller binary; no catch_unwind misuse. |
