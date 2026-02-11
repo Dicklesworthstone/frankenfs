@@ -9,8 +9,8 @@ use ffs_error::FfsError;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
     BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc,
-    Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, lookup_in_dir_block, parse_dir_block,
-    parse_extent_tree, parse_inode_extent_tree, parse_sys_chunk_array,
+    Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree, lookup_in_dir_block,
+    parse_dir_block, parse_extent_tree, parse_inode_extent_tree, parse_sys_chunk_array,
 };
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
@@ -1000,6 +1000,26 @@ pub trait FsOps: Send + Sync {
     /// `FfsError::Format` if `ino` is not a symlink.
     fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>>;
 
+    /// List extended attribute names for an inode.
+    ///
+    /// Returns the full attribute names (including namespace prefix, e.g.
+    /// `"user.myattr"`, `"security.selinux"`). Returns an empty list if the
+    /// inode has no xattrs or the filesystem does not support them.
+    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        let _ = (cx, ino);
+        Ok(Vec::new())
+    }
+
+    /// Get the value of an extended attribute by full name.
+    ///
+    /// The `name` parameter is the full attribute name including namespace
+    /// prefix (e.g. `"user.myattr"`). Returns `None` if the attribute does
+    /// not exist.
+    fn getxattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<Option<Vec<u8>>> {
+        let _ = (cx, ino, name);
+        Ok(None)
+    }
+
     /// Acquire request scope before executing a VFS operation.
     ///
     /// Default behavior is a no-op for read-only backends.
@@ -1272,6 +1292,35 @@ impl FsOps for Ext4FsOps {
             .read_symlink(&self.image, &inode)
             .map_err(|e| parse_to_ffs_error(&e))
     }
+
+    fn listxattr(&self, _cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        let inode = self
+            .reader
+            .read_inode(&self.image, ino)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        let xattrs = self
+            .reader
+            .list_xattrs(&self.image, &inode)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        Ok(xattrs.iter().map(Ext4Xattr::full_name).collect())
+    }
+
+    fn getxattr(
+        &self,
+        _cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<Option<Vec<u8>>> {
+        let inode = self
+            .reader
+            .read_inode(&self.image, ino)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        let xattrs = self
+            .reader
+            .list_xattrs(&self.image, &inode)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        Ok(xattrs.into_iter().find(|x| x.full_name() == name).map(|x| x.value))
+    }
 }
 
 // ── FsOps for OpenFs (device-based ext4 adapter) ──────────────────────────
@@ -1331,6 +1380,37 @@ impl FsOps for OpenFs {
     fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
         let inode = self.read_inode(cx, ino)?;
         self.read_symlink(cx, &inode)
+    }
+
+    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        let inode = self.read_inode(cx, ino)?;
+        let mut xattrs =
+            ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
+        if inode.file_acl != 0 {
+            let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
+            let block_xattrs = ffs_ondisk::parse_xattr_block(&block_data)
+                .map_err(|e| parse_to_ffs_error(&e))?;
+            xattrs.extend(block_xattrs);
+        }
+        Ok(xattrs.iter().map(Ext4Xattr::full_name).collect())
+    }
+
+    fn getxattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<Option<Vec<u8>>> {
+        let inode = self.read_inode(cx, ino)?;
+        let mut xattrs =
+            ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
+        if inode.file_acl != 0 {
+            let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
+            let block_xattrs = ffs_ondisk::parse_xattr_block(&block_data)
+                .map_err(|e| parse_to_ffs_error(&e))?;
+            xattrs.extend(block_xattrs);
+        }
+        Ok(xattrs.into_iter().find(|x| x.full_name() == name).map(|x| x.value))
     }
 }
 
@@ -2451,6 +2531,24 @@ mod tests {
         assert_eq!(attr.perm, 0o644);
         assert_eq!(attr.uid, 0);
         assert_eq!(attr.gid, 0);
+    }
+
+    // ── listxattr/getxattr via FsOps defaults ────────────────────────────
+
+    #[test]
+    fn fsops_listxattr_default_returns_empty() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let names = fs.listxattr(&cx, InodeNumber(1)).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn fsops_getxattr_default_returns_none() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let val = fs.getxattr(&cx, InodeNumber(1), "user.test").unwrap();
+        assert!(val.is_none());
     }
 
     // ── OpenFs tests ─────────────────────────────────────────────────────

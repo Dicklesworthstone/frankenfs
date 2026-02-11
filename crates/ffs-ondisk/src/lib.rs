@@ -20,6 +20,7 @@ pub use ext4::{
     Ext4ImageReader, Ext4IncompatFeatures, Ext4Inode, Ext4RoCompatFeatures, Ext4Superblock,
     Ext4Xattr, ExtentTree, FeatureDiagnostics, InodeLocation, dx_hash, iter_dir_block,
     lookup_in_dir_block, parse_dir_block, parse_dx_root, parse_extent_tree,
-    parse_inode_extent_tree, verify_dir_block_checksum, verify_extent_block_checksum,
-    verify_group_desc_checksum, verify_inode_checksum,
+    parse_ibody_xattrs, parse_inode_extent_tree, parse_xattr_block,
+    verify_dir_block_checksum, verify_extent_block_checksum, verify_group_desc_checksum,
+    verify_inode_checksum,
 };

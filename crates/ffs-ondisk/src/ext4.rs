@@ -3128,6 +3128,42 @@ fn parse_xattr_entries(data: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError> {
     Ok(entries)
 }
 
+/// Parse inline (ibody) xattrs from an `Ext4Inode`.
+///
+/// This is a standalone version of `Ext4ImageReader::read_xattrs_ibody` that
+/// does not require an image reader — useful for device-based backends.
+pub fn parse_ibody_xattrs(inode: &Ext4Inode) -> Result<Vec<Ext4Xattr>, ParseError> {
+    if inode.xattr_ibody.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let magic = read_le_u32(&inode.xattr_ibody, 0)?;
+    if magic != EXT4_XATTR_MAGIC {
+        return Ok(Vec::new());
+    }
+    parse_xattr_entries(&inode.xattr_ibody[4..])
+}
+
+/// Parse xattrs from an external xattr block (raw block data).
+///
+/// The block starts with a 32-byte header containing the xattr magic.
+pub fn parse_xattr_block(block_data: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError> {
+    if block_data.len() < 32 {
+        return Err(ParseError::InsufficientData {
+            needed: 32,
+            offset: 0,
+            actual: block_data.len(),
+        });
+    }
+    let magic = read_le_u32(block_data, 0)?;
+    if magic != EXT4_XATTR_MAGIC {
+        return Err(ParseError::InvalidMagic {
+            expected: u64::from(EXT4_XATTR_MAGIC),
+            actual: u64::from(magic),
+        });
+    }
+    parse_xattr_entries(&block_data[32..])
+}
+
 // ── Hash-tree (htree/DX) structures and algorithms ──────────────────────────
 
 /// Parsed DX root (block 0 of an htree directory).
@@ -5456,6 +5492,86 @@ mod tests {
             .unwrap();
         let xattrs = reader.read_xattrs_ibody(&inode).unwrap();
         assert!(xattrs.is_empty());
+    }
+
+    #[test]
+    fn parse_ibody_xattrs_with_data() {
+        // Build a 256-byte inode with xattr ibody containing one attribute
+        let mut buf = vec![0_u8; 256];
+        // mode = regular file
+        buf[0x00..0x02].copy_from_slice(&(S_IFREG | 0o644).to_le_bytes());
+        // extra_isize = 32 (0x20) at offset 0x80
+        buf[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        // The inode parser sets xattr_ibody = bytes[128 + extra_isize .. inode_size]
+        // = bytes[160..256] = 96 bytes of xattr ibody region
+        // First 4 bytes of ibody region: magic
+        let ibody_start = 128 + 32; // = 160
+        buf[ibody_start..ibody_start + 4]
+            .copy_from_slice(&ffs_types::EXT4_XATTR_MAGIC.to_le_bytes());
+
+        // Xattr entry at ibody_start + 4 (relative offset 0 in parse_xattr_entries)
+        let entry_start = ibody_start + 4;
+        buf[entry_start] = 4; // name_len=4
+        buf[entry_start + 1] = ffs_types::EXT4_XATTR_INDEX_USER;
+        buf[entry_start + 2..entry_start + 4].copy_from_slice(&80_u16.to_le_bytes()); // value_offs=80 (relative to ibody+4)
+        buf[entry_start + 4..entry_start + 8].copy_from_slice(&5_u32.to_le_bytes()); // value_size=5
+        buf[entry_start + 16..entry_start + 20].copy_from_slice(b"mime");
+
+        // Value at ibody+4+80 = entry data area offset 80
+        let value_off = ibody_start + 4 + 80;
+        buf[value_off..value_off + 5].copy_from_slice(b"image");
+
+        // Terminator
+        buf[entry_start + 20] = 0;
+        buf[entry_start + 21] = 0;
+
+        let inode = Ext4Inode::parse_from_bytes(&buf).expect("parse inode");
+        let xattrs = super::parse_ibody_xattrs(&inode).expect("parse ibody xattrs");
+        assert_eq!(xattrs.len(), 1);
+        assert_eq!(xattrs[0].full_name(), "user.mime");
+        assert_eq!(xattrs[0].value, b"image");
+    }
+
+    #[test]
+    fn parse_ibody_xattrs_no_magic() {
+        // Inode with empty xattr ibody (no magic)
+        let buf = [0_u8; 128];
+        let inode = Ext4Inode::parse_from_bytes(&buf).expect("parse inode");
+        let xattrs = super::parse_ibody_xattrs(&inode).expect("parse ibody xattrs");
+        assert!(xattrs.is_empty());
+    }
+
+    #[test]
+    fn parse_xattr_block_smoke() {
+        let mut block = vec![0_u8; 4096];
+        // 32-byte header with magic
+        block[0..4].copy_from_slice(&ffs_types::EXT4_XATTR_MAGIC.to_le_bytes());
+
+        // Entry at offset 32 (after header)
+        block[32] = 3; // name_len=3
+        block[33] = ffs_types::EXT4_XATTR_INDEX_SECURITY;
+        block[34..36].copy_from_slice(&200_u16.to_le_bytes());
+        block[36..40].copy_from_slice(&4_u32.to_le_bytes());
+        block[48..51].copy_from_slice(b"cap");
+        block[32 + 200..32 + 204].copy_from_slice(b"data");
+
+        // Terminator
+        // Entry header is 16 bytes + 3 name = 19, rounded to 20
+        block[52] = 0;
+        block[53] = 0;
+
+        let xattrs = super::parse_xattr_block(&block).expect("parse xattr block");
+        assert_eq!(xattrs.len(), 1);
+        assert_eq!(xattrs[0].full_name(), "security.cap");
+        assert_eq!(xattrs[0].value, b"data");
+    }
+
+    #[test]
+    fn parse_xattr_block_bad_magic() {
+        let block = vec![0_u8; 4096];
+        let err = super::parse_xattr_block(&block).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidMagic { .. }));
     }
 
     // ── DX hash function tests ──────────────────────────────────────────
