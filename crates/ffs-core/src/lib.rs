@@ -13,7 +13,7 @@ use ffs_ondisk::{
     parse_extent_tree, parse_inode_extent_tree, parse_sys_chunk_array,
 };
 use ffs_types::{
-    BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot,
+    BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -907,6 +907,42 @@ impl DirEntry {
     }
 }
 
+/// FUSE/VFS operation kind used for MVCC request-scope hooks.
+///
+/// These operation tags let `FsOps` implementations choose an MVCC policy per
+/// request (for example: read-snapshot only vs. begin write transaction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RequestOp {
+    Getattr,
+    Lookup,
+    Open,
+    Opendir,
+    Read,
+    Readdir,
+    Readlink,
+}
+
+/// MVCC scope acquired for a single VFS request.
+///
+/// Current read-only implementations can return an empty scope. Future write
+/// implementations may attach a transaction id and snapshot captured at request
+/// start so that begin/end hooks can manage commit/abort semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RequestScope {
+    pub snapshot: Option<Snapshot>,
+    pub tx: Option<TxnId>,
+}
+
+impl RequestScope {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            snapshot: None,
+            tx: None,
+        }
+    }
+}
+
 /// Minimal VFS operations trait for read-only filesystem access.
 ///
 /// This is the internal interface that FUSE and the test harness call.
@@ -924,6 +960,8 @@ impl DirEntry {
 /// - Only read-only operations are included in this initial version.
 ///   Write operations (create, write, mkdir, unlink, etc.) will be added
 ///   in a future bead once the MVCC write path is ready.
+/// - `begin_request_scope`/`end_request_scope` provide a policy hook for
+///   per-request MVCC snapshot/transaction management.
 pub trait FsOps: Send + Sync {
     /// Get file attributes by inode number.
     ///
@@ -961,6 +999,25 @@ pub trait FsOps: Send + Sync {
     /// Returns the raw bytes of the symlink target. Returns
     /// `FfsError::Format` if `ino` is not a symlink.
     fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>>;
+
+    /// Acquire request scope before executing a VFS operation.
+    ///
+    /// Default behavior is a no-op for read-only backends.
+    fn begin_request_scope(&self, _cx: &Cx, _op: RequestOp) -> ffs_error::Result<RequestScope> {
+        Ok(RequestScope::empty())
+    }
+
+    /// Release request scope after executing a VFS operation.
+    ///
+    /// Called even when the operation body fails. Default behavior is a no-op.
+    fn end_request_scope(
+        &self,
+        _cx: &Cx,
+        _op: RequestOp,
+        _scope: RequestScope,
+    ) -> ffs_error::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Ext4FsOps: bridge from Ext4ImageReader to FsOps ───────────────────────

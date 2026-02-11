@@ -6,7 +6,7 @@
 //! and errors are mapped through [`FfsError::to_errno()`].
 
 use asupersync::Cx;
-use ffs_core::{FileType as FfsFileType, FsOps, InodeAttr};
+use ffs_core::{FileType as FfsFileType, FsOps, InodeAttr, RequestOp};
 use ffs_error::FfsError;
 use ffs_types::InodeNumber;
 use fuser::{
@@ -131,6 +131,25 @@ impl FrankenFuse {
     fn reply_error_dir(err: &FfsError, reply: ReplyDirectory) {
         reply.error(err.to_errno());
     }
+
+    fn with_request_scope<T, F>(&self, cx: &Cx, op: RequestOp, f: F) -> ffs_error::Result<T>
+    where
+        F: FnOnce(&Cx) -> ffs_error::Result<T>,
+    {
+        let scope = self.ops.begin_request_scope(cx, op)?;
+        let op_result = f(cx);
+        let end_result = self.ops.end_request_scope(cx, op, scope);
+
+        match (op_result, end_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(end_err)) => Err(end_err),
+            (Err(op_err), Ok(())) => Err(op_err),
+            (Err(op_err), Err(end_err)) => {
+                warn!(?op, error = %end_err, "request scope cleanup failed after operation error");
+                Err(op_err)
+            }
+        }
+    }
 }
 
 impl Filesystem for FrankenFuse {
@@ -142,7 +161,9 @@ impl Filesystem for FrankenFuse {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let cx = Self::cx_for_request();
-        match self.ops.getattr(&cx, InodeNumber(ino)) {
+        match self.with_request_scope(&cx, RequestOp::Getattr, |cx| {
+            self.ops.getattr(cx, InodeNumber(ino))
+        }) {
             Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(&attr)),
             Err(e) => {
                 warn!(ino, error = %e, "getattr failed");
@@ -153,7 +174,9 @@ impl Filesystem for FrankenFuse {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let cx = Self::cx_for_request();
-        match self.ops.lookup(&cx, InodeNumber(parent), name) {
+        match self.with_request_scope(&cx, RequestOp::Lookup, |cx| {
+            self.ops.lookup(cx, InodeNumber(parent), name)
+        }) {
             Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), 0),
             Err(e) => {
                 // ENOENT is expected for missing entries — don't warn for that.
@@ -165,13 +188,27 @@ impl Filesystem for FrankenFuse {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Stateless open: we don't track file handles.
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Open, |_cx| Ok(())) {
+            // Stateless open: we don't track file handles.
+            Ok(()) => reply.opened(0, 0),
+            Err(e) => {
+                warn!(ino, error = %e, "open failed");
+                reply.error(e.to_errno());
+            }
+        }
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Opendir, |_cx| Ok(())) {
+            Ok(()) => reply.opened(0, 0),
+            Err(e) => {
+                warn!(ino, error = %e, "opendir failed");
+                reply.error(e.to_errno());
+            }
+        }
     }
 
     fn read(
@@ -188,7 +225,9 @@ impl Filesystem for FrankenFuse {
         let cx = Self::cx_for_request();
         // Clamp negative offsets to 0 (shouldn't happen in practice).
         let byte_offset = u64::try_from(offset).unwrap_or(0);
-        match self.ops.read(&cx, InodeNumber(ino), byte_offset, size) {
+        match self.with_request_scope(&cx, RequestOp::Read, |cx| {
+            self.ops.read(cx, InodeNumber(ino), byte_offset, size)
+        }) {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 warn!(ino, offset, size, error = %e, "read failed");
@@ -207,7 +246,9 @@ impl Filesystem for FrankenFuse {
     ) {
         let cx = Self::cx_for_request();
         let fs_offset = u64::try_from(offset).unwrap_or(0);
-        match self.ops.readdir(&cx, InodeNumber(ino), fs_offset) {
+        match self.with_request_scope(&cx, RequestOp::Readdir, |cx| {
+            self.ops.readdir(cx, InodeNumber(ino), fs_offset)
+        }) {
             Ok(entries) => {
                 for entry in &entries {
                     let full = reply.add(
@@ -231,7 +272,9 @@ impl Filesystem for FrankenFuse {
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         let cx = Self::cx_for_request();
-        match self.ops.readlink(&cx, InodeNumber(ino)) {
+        match self.with_request_scope(&cx, RequestOp::Readlink, |cx| {
+            self.ops.readlink(cx, InodeNumber(ino))
+        }) {
             Ok(target) => reply.data(&target),
             Err(e) => {
                 warn!(ino, error = %e, "readlink failed");
@@ -308,7 +351,9 @@ pub fn mount_background(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffs_core::DirEntry as FfsDirEntry;
+    use ffs_core::{DirEntry as FfsDirEntry, RequestScope};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
 
     #[test]
@@ -457,5 +502,194 @@ mod tests {
         let _fuse = FrankenFuse::new(Box::new(StubFs));
         // Verify the Cx creation helper works.
         let _cx = FrankenFuse::cx_for_request();
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HookEvent {
+        Begin(RequestOp),
+        Body(RequestOp),
+        End(RequestOp),
+    }
+
+    struct HookFs {
+        events: Arc<Mutex<Vec<HookEvent>>>,
+        fail_begin: bool,
+        fail_end: bool,
+    }
+
+    impl HookFs {
+        fn new(events: Arc<Mutex<Vec<HookEvent>>>, fail_begin: bool, fail_end: bool) -> Self {
+            Self {
+                events,
+                fail_begin,
+                fail_end,
+            }
+        }
+    }
+
+    impl FsOps for HookFs {
+        fn getattr(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+            self.events.lock().unwrap().push(HookEvent::Begin(op));
+            if self.fail_begin {
+                return Err(FfsError::Io(std::io::Error::other("begin failed")));
+            }
+            Ok(RequestScope::empty())
+        }
+
+        fn end_request_scope(
+            &self,
+            _cx: &Cx,
+            op: RequestOp,
+            _scope: RequestScope,
+        ) -> ffs_error::Result<()> {
+            self.events.lock().unwrap().push(HookEvent::End(op));
+            if self.fail_end {
+                return Err(FfsError::Io(std::io::Error::other("end failed")));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn request_scope_calls_begin_and_end_for_successful_operation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, false);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+        let body_events = Arc::clone(&events);
+
+        let out = fuse
+            .with_request_scope(&cx, RequestOp::Read, |_cx| {
+                body_events
+                    .lock()
+                    .unwrap()
+                    .push(HookEvent::Body(RequestOp::Read));
+                Ok::<u32, FfsError>(7)
+            })
+            .unwrap();
+        assert_eq!(out, 7);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[
+                HookEvent::Begin(RequestOp::Read),
+                HookEvent::Body(RequestOp::Read),
+                HookEvent::End(RequestOp::Read)
+            ]
+        );
+    }
+
+    #[test]
+    fn request_scope_short_circuits_body_when_begin_fails() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), true, false);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+        let body_called = Arc::new(AtomicBool::new(false));
+        let body_called_ref = Arc::clone(&body_called);
+
+        let err = fuse
+            .with_request_scope(&cx, RequestOp::Lookup, |_cx| {
+                body_called_ref.store(true, Ordering::Relaxed);
+                Ok::<(), FfsError>(())
+            })
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EIO);
+        assert!(!body_called.load(Ordering::Relaxed));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[HookEvent::Begin(RequestOp::Lookup)]
+        );
+    }
+
+    #[test]
+    fn request_scope_prefers_operation_error_when_body_and_end_fail() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, true);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+        let body_events = Arc::clone(&events);
+
+        let err = fuse
+            .with_request_scope(&cx, RequestOp::Readlink, |_cx| {
+                body_events
+                    .lock()
+                    .unwrap()
+                    .push(HookEvent::Body(RequestOp::Readlink));
+                Err::<(), FfsError>(FfsError::NotFound("missing".into()))
+            })
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[
+                HookEvent::Begin(RequestOp::Readlink),
+                HookEvent::Body(RequestOp::Readlink),
+                HookEvent::End(RequestOp::Readlink)
+            ]
+        );
+    }
+
+    #[test]
+    fn request_scope_returns_cleanup_error_when_operation_succeeds() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, true);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+        let body_events = Arc::clone(&events);
+
+        let err = fuse
+            .with_request_scope(&cx, RequestOp::Getattr, |_cx| {
+                body_events
+                    .lock()
+                    .unwrap()
+                    .push(HookEvent::Body(RequestOp::Getattr));
+                Ok::<(), FfsError>(())
+            })
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EIO);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[
+                HookEvent::Begin(RequestOp::Getattr),
+                HookEvent::Body(RequestOp::Getattr),
+                HookEvent::End(RequestOp::Getattr)
+            ]
+        );
     }
 }

@@ -3894,13 +3894,28 @@ See Section 13.3.
 
 #### 12.2.1 opendir / readdir / readdirplus / releasedir
 
-- `opendir` captures a snapshot for the directory handle. All `readdir` calls
-  see a consistent view even under concurrent modifications.
+- **Target-state policy (Phase 7B+):** `opendir` captures a snapshot for the
+  directory handle. All `readdir` calls on that handle see a consistent view
+  even under concurrent modifications.
 - `readdir` returns entries from the given offset cookie in on-disk order
   (not alphabetical, matching kernel ext4). For htree directories, walks
   leaf blocks ignoring hash index.
 - `readdirplus` also returns full inode attributes per entry (reduces stat calls).
 - `.` and `..` MUST appear first with correct inode numbers.
+
+**Current implementation policy (Phase 7A / read-only ext4):**
+
+1. Each FUSE callback acquires a request scope via
+   `FsOps::begin_request_scope(&Cx, RequestOp)` and releases it with
+   `FsOps::end_request_scope(...)` before replying.
+2. `RequestScope` carries optional `{ snapshot, tx }`. Read-only backends MAY
+   return an empty scope; MVCC-aware backends can attach per-request metadata.
+3. `open`/`opendir` are currently stateless (no persistent per-handle MVCC
+   state). Therefore, `lookup` + `readdir` consistency is guaranteed per
+   callback, not across separate callbacks.
+4. This is acceptable in the current read-only image mode; when write support
+   is enabled, the implementation MUST move to handle-scoped snapshot pinning
+   for directory and file handles.
 
 #### 12.2.2 mkdir
 
