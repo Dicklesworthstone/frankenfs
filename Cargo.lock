@@ -584,9 +584,11 @@ name = "ffs-repair"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "crc32c",
  "ffs-block",
  "ffs-error",
  "ffs-types",
+ "parking_lot",
 ]
 
 [[package]]

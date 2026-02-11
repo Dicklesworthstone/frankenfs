@@ -12,5 +12,9 @@ ffs-error = { workspace = true }
 ffs-block = { workspace = true }
 asupersync = { workspace = true }
 
+[dev-dependencies]
+crc32c = { workspace = true }
+parking_lot = { workspace = true }
+
 [lints]
 workspace = true
