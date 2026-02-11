@@ -11,11 +11,13 @@ asupersync = { workspace = true }
 ffs-block = { workspace = true }
 ffs-btrfs = { workspace = true }
 ffs-error = { workspace = true }
+ffs-journal = { workspace = true }
 ffs-mvcc = { workspace = true }
 ffs-ondisk = { workspace = true }
 ffs-types = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 libc = { workspace = true }

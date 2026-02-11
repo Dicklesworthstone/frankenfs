@@ -31,7 +31,7 @@
 | ext4 directory entry parsing | `fs/ext4/dir.c` | ✅ | Implemented in `ffs-ondisk` |
 | ext4 inode device read | `fs/ext4/inode.c` | ✅ | `OpenFs::read_inode` via `ByteDevice` |
 | ext4 path resolution | `fs/ext4/namei.c` | ✅ | `OpenFs::resolve_path` |
-| ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | ❌ | Not yet implemented |
+| ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | 🟡 | Phase 1 implemented in `ffs-journal` (descriptor/commit/revoke replay + tests); full mount-path integration and complete parity still pending |
 | ext4 allocator parity | `fs/ext4/mballoc.c` | ❌ | Not yet implemented |
 | ext4 orphan recovery parity | `fs/ext4/orphan.c` | ❌ | Not yet implemented |
 | btrfs superblock decode | `fs/btrfs/disk-io.c` | ✅ | Implemented in `ffs-ondisk` |

@@ -511,6 +511,7 @@ dependencies = [
  "ffs-block",
  "ffs-btrfs",
  "ffs-error",
+ "ffs-journal",
  "ffs-mvcc",
  "ffs-ondisk",
  "ffs-types",
@@ -518,6 +519,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -581,8 +583,11 @@ name = "ffs-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asupersync",
  "criterion",
+ "ffs-block",
  "ffs-core",
+ "ffs-error",
  "ffs-ondisk",
  "ffs-types",
  "hex",

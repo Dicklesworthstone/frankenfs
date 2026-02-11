@@ -2,10 +2,12 @@
 
 use asupersync::{Cx, RaptorQConfig};
 use ffs_block::{
-    ByteDevice, FileByteDevice, read_btrfs_superblock_region, read_ext4_superblock_region,
+    BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
+    read_ext4_superblock_region,
 };
 use ffs_btrfs::{BtrfsLeafEntry, walk_tree};
 use ffs_error::FfsError;
+use ffs_journal::{JournalRegion, ReplayOutcome, replay_jbd2};
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
     BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc,
@@ -20,6 +22,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsFlavor {
@@ -172,6 +175,8 @@ pub struct OpenFs {
     pub ext4_geometry: Option<Ext4Geometry>,
     /// Pre-computed btrfs context (None for ext4).
     pub btrfs_context: Option<BtrfsContext>,
+    /// Mount-time JBD2 replay outcome for ext4 images with an internal journal.
+    pub ext4_journal_replay: Option<ReplayOutcome>,
     /// Block device for I/O operations.
     dev: Box<dyn ByteDevice>,
 }
@@ -182,8 +187,82 @@ impl std::fmt::Debug for OpenFs {
             .field("flavor", &self.flavor)
             .field("ext4_geometry", &self.ext4_geometry)
             .field("btrfs_context", &self.btrfs_context)
+            .field("ext4_journal_replay", &self.ext4_journal_replay)
             .field("dev_len", &self.dev.len_bytes())
             .finish()
+    }
+}
+
+/// Adapter that exposes a `ByteDevice` as a `BlockDevice` for journal replay.
+struct ByteDeviceBlockAdapter<'a> {
+    dev: &'a dyn ByteDevice,
+    block_size: u32,
+}
+
+impl ByteDeviceBlockAdapter<'_> {
+    fn block_offset(&self, block: BlockNumber) -> Result<u64, FfsError> {
+        block
+            .0
+            .checked_mul(u64::from(self.block_size))
+            .ok_or_else(|| FfsError::Format("block offset overflow".to_owned()))
+    }
+}
+
+impl BlockDevice for ByteDeviceBlockAdapter<'_> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
+        let block_size = usize::try_from(self.block_size)
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+        let offset = self.block_offset(block)?;
+        let end = offset
+            .checked_add(u64::from(self.block_size))
+            .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
+        if end > self.dev.len_bytes() {
+            return Err(FfsError::Format(format!(
+                "block {} out of range for device length {}",
+                block.0,
+                self.dev.len_bytes()
+            )));
+        }
+        let mut bytes = vec![0_u8; block_size];
+        self.dev.read_exact_at(cx, ByteOffset(offset), &mut bytes)?;
+        Ok(BlockBuf::new(bytes))
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<(), FfsError> {
+        let expected = usize::try_from(self.block_size)
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+        if data.len() != expected {
+            return Err(FfsError::Format(format!(
+                "write_block size mismatch: got {} expected {expected}",
+                data.len()
+            )));
+        }
+
+        let offset = self.block_offset(block)?;
+        let end = offset
+            .checked_add(u64::from(self.block_size))
+            .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
+        if end > self.dev.len_bytes() {
+            return Err(FfsError::Format(format!(
+                "block {} out of range for device length {}",
+                block.0,
+                self.dev.len_bytes()
+            )));
+        }
+
+        self.dev.write_all_at(cx, ByteOffset(offset), data)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn block_count(&self) -> u64 {
+        self.dev.len_bytes() / u64::from(self.block_size)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
+        self.dev.sync(cx)
     }
 }
 
@@ -249,12 +328,19 @@ impl OpenFs {
             }
         };
 
-        Ok(Self {
+        let mut fs = Self {
             flavor,
             ext4_geometry,
             btrfs_context,
+            ext4_journal_replay: None,
             dev,
-        })
+        };
+
+        if fs.is_ext4() && !options.skip_validation {
+            fs.ext4_journal_replay = fs.maybe_replay_ext4_journal(cx)?;
+        }
+
+        Ok(fs)
     }
 
     /// The block device backing this filesystem.
@@ -312,6 +398,88 @@ impl OpenFs {
     #[must_use]
     pub fn btrfs_context(&self) -> Option<&BtrfsContext> {
         self.btrfs_context.as_ref()
+    }
+
+    /// Return ext4 mount-time journal replay outcome when available.
+    #[must_use]
+    pub fn ext4_journal_replay(&self) -> Option<&ReplayOutcome> {
+        self.ext4_journal_replay.as_ref()
+    }
+
+    fn maybe_replay_ext4_journal(&self, cx: &Cx) -> Result<Option<ReplayOutcome>, FfsError> {
+        let (block_size, journal_inum, journal_dev) = match self.ext4_superblock() {
+            Some(sb) => (sb.block_size, sb.journal_inum, sb.journal_dev),
+            None => return Ok(None),
+        };
+
+        if journal_inum == 0 {
+            info!("ext4 journal replay skipped: no journal inode");
+            return Ok(None);
+        }
+
+        if journal_dev != 0 {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "external ext4 journal device {journal_dev} is not supported"
+            )));
+        }
+
+        let journal_ino = InodeNumber(u64::from(journal_inum));
+        let journal_inode = self.read_inode(cx, journal_ino)?;
+        let extents = self.collect_extents(cx, &journal_inode)?;
+        if extents.is_empty() {
+            info!(
+                journal_inum,
+                "ext4 journal replay skipped: journal inode has no extents"
+            );
+            return Ok(None);
+        }
+
+        let mut total_blocks = 0_u64;
+        let mut expected_start = extents[0].physical_start;
+        for ext in &extents {
+            if ext.physical_start != expected_start {
+                return Err(FfsError::UnsupportedFeature(
+                    "non-contiguous ext4 journal extents are not supported".to_owned(),
+                ));
+            }
+            let len = u64::from(ext.actual_len());
+            total_blocks = total_blocks
+                .checked_add(len)
+                .ok_or_else(|| FfsError::Format("journal extent length overflow".to_owned()))?;
+            expected_start = expected_start
+                .checked_add(len)
+                .ok_or_else(|| FfsError::Format("journal extent range overflow".to_owned()))?;
+        }
+
+        let region = JournalRegion {
+            start: BlockNumber(extents[0].physical_start),
+            blocks: total_blocks,
+        };
+        let block_dev = ByteDeviceBlockAdapter {
+            dev: &*self.dev,
+            block_size,
+        };
+
+        info!(
+            journal_inum,
+            journal_start_block = region.start.0,
+            journal_blocks = region.blocks,
+            "ext4 journal replay start"
+        );
+        let outcome = replay_jbd2(cx, &block_dev, region)?;
+        info!(
+            journal_inum,
+            scanned_blocks = outcome.stats.scanned_blocks,
+            descriptor_blocks = outcome.stats.descriptor_blocks,
+            commit_blocks = outcome.stats.commit_blocks,
+            revoke_blocks = outcome.stats.revoke_blocks,
+            replayed_blocks = outcome.stats.replayed_blocks,
+            skipped_revoked_blocks = outcome.stats.skipped_revoked_blocks,
+            incomplete_transactions = outcome.stats.incomplete_transactions,
+            committed_sequences = outcome.committed_sequences.len(),
+            "ext4 journal replay completed"
+        );
+        Ok(Some(outcome))
     }
 
     // ── Btrfs tree-walk via device ───────────────────────────────────
@@ -1015,7 +1183,12 @@ pub trait FsOps: Send + Sync {
     /// The `name` parameter is the full attribute name including namespace
     /// prefix (e.g. `"user.myattr"`). Returns `None` if the attribute does
     /// not exist.
-    fn getxattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<Option<Vec<u8>>> {
+    fn getxattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<Option<Vec<u8>>> {
         let _ = (cx, ino, name);
         Ok(None)
     }
@@ -1319,7 +1492,10 @@ impl FsOps for Ext4FsOps {
             .reader
             .list_xattrs(&self.image, &inode)
             .map_err(|e| parse_to_ffs_error(&e))?;
-        Ok(xattrs.into_iter().find(|x| x.full_name() == name).map(|x| x.value))
+        Ok(xattrs
+            .into_iter()
+            .find(|x| x.full_name() == name)
+            .map(|x| x.value))
     }
 }
 
@@ -1388,8 +1564,8 @@ impl FsOps for OpenFs {
             ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
         if inode.file_acl != 0 {
             let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
-            let block_xattrs = ffs_ondisk::parse_xattr_block(&block_data)
-                .map_err(|e| parse_to_ffs_error(&e))?;
+            let block_xattrs =
+                ffs_ondisk::parse_xattr_block(&block_data).map_err(|e| parse_to_ffs_error(&e))?;
             xattrs.extend(block_xattrs);
         }
         Ok(xattrs.iter().map(Ext4Xattr::full_name).collect())
@@ -1406,11 +1582,14 @@ impl FsOps for OpenFs {
             ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
         if inode.file_acl != 0 {
             let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
-            let block_xattrs = ffs_ondisk::parse_xattr_block(&block_data)
-                .map_err(|e| parse_to_ffs_error(&e))?;
+            let block_xattrs =
+                ffs_ondisk::parse_xattr_block(&block_data).map_err(|e| parse_to_ffs_error(&e))?;
             xattrs.extend(block_xattrs);
         }
-        Ok(xattrs.into_iter().find(|x| x.full_name() == name).map(|x| x.value))
+        Ok(xattrs
+            .into_iter()
+            .find(|x| x.full_name() == name)
+            .map(|x| x.value))
     }
 }
 
@@ -2608,6 +2787,7 @@ mod tests {
         assert!(!fs.is_btrfs());
         assert_eq!(fs.block_size(), 4096);
         assert!(fs.ext4_geometry.is_some());
+        assert!(fs.ext4_journal_replay().is_none());
 
         let geom = fs.ext4_geometry.as_ref().unwrap();
         assert!(geom.groups_count > 0);
@@ -2662,6 +2842,38 @@ mod tests {
         };
         let fs = OpenFs::from_device(&cx, Box::new(dev2), &opts).unwrap();
         assert!(fs.is_ext4());
+    }
+
+    #[test]
+    fn open_fs_replays_internal_journal_transaction() {
+        let image = build_ext4_image_with_internal_journal();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let replay = fs
+            .ext4_journal_replay()
+            .expect("journal replay outcome should be present");
+
+        assert_eq!(replay.committed_sequences, vec![1]);
+        assert_eq!(replay.stats.replayed_blocks, 1);
+        assert_eq!(replay.stats.skipped_revoked_blocks, 0);
+
+        let target = fs.read_block_vec(&cx, BlockNumber(15)).unwrap();
+        assert_eq!(&target[..16], b"JBD2-REPLAY-TEST");
+    }
+
+    #[test]
+    fn open_fs_rejects_external_journal_device() {
+        let mut image = build_ext4_image_with_inode();
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        image[sb_off + 0xE0..sb_off + 0xE4].copy_from_slice(&8_u32.to_le_bytes()); // journal_inum
+        image[sb_off + 0xE4..sb_off + 0xE8].copy_from_slice(&1_u32.to_le_bytes()); // journal_dev
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let err = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap_err();
+        assert!(matches!(err, FfsError::UnsupportedFeature(_)));
     }
 
     #[test]
@@ -2850,6 +3062,65 @@ mod tests {
         image[ino_off + 0x1A..ino_off + 0x1C].copy_from_slice(&2_u16.to_le_bytes());
         // i_extra_isize = 32 (for 256-byte inodes, extra area starts at 128)
         image[ino_off + 0x80..ino_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        image
+    }
+
+    fn write_jbd2_header(block: &mut [u8], block_type: u32, sequence: u32) {
+        const JBD2_MAGIC: u32 = 0xC03B_3998;
+        block[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        block[4..8].copy_from_slice(&block_type.to_be_bytes());
+        block[8..12].copy_from_slice(&sequence.to_be_bytes());
+    }
+
+    /// Build an ext4 image with an internal journal inode and one committed
+    /// JBD2 transaction that rewrites block 15.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_ext4_image_with_internal_journal() -> Vec<u8> {
+        let mut image = build_ext4_image_with_extents();
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+
+        // Enable HAS_JOURNAL and point to internal journal inode #8.
+        let compat = u32::from_le_bytes([
+            image[sb_off + 0x5C],
+            image[sb_off + 0x5D],
+            image[sb_off + 0x5E],
+            image[sb_off + 0x5F],
+        ]);
+        image[sb_off + 0x5C..sb_off + 0x60].copy_from_slice(&(compat | 0x0004).to_le_bytes());
+        image[sb_off + 0xE0..sb_off + 0xE4].copy_from_slice(&8_u32.to_le_bytes());
+
+        // Inode #8 (index 7) -> journal extent [block 20..=22].
+        let ino8_off: usize = 4 * 4096 + 7 * 256;
+        image[ino8_off..ino8_off + 2].copy_from_slice(&0o100_600_u16.to_le_bytes());
+        image[ino8_off + 4..ino8_off + 8].copy_from_slice(&(3_u32 * 4096).to_le_bytes());
+        image[ino8_off + 0x1A..ino8_off + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+        image[ino8_off + 0x20..ino8_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+        image[ino8_off + 0x80..ino8_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        let e = ino8_off + 0x28;
+        image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // extent magic
+        image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
+        image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
+        image[e + 6..e + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
+        image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical 0
+        image[e + 16..e + 18].copy_from_slice(&3_u16.to_le_bytes()); // len = 3 blocks
+        image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi
+        image[e + 20..e + 24].copy_from_slice(&20_u32.to_le_bytes()); // start_lo
+
+        // Journal block 20: descriptor, one tag to target block 15.
+        let j_desc = 20 * 4096;
+        write_jbd2_header(&mut image[j_desc..j_desc + 4096], 1, 1);
+        image[j_desc + 12..j_desc + 16].copy_from_slice(&15_u32.to_be_bytes());
+        image[j_desc + 16..j_desc + 20].copy_from_slice(&0x0000_0008_u32.to_be_bytes()); // LAST_TAG
+
+        // Journal block 21: replay payload.
+        let j_data = 21 * 4096;
+        image[j_data..j_data + 16].copy_from_slice(b"JBD2-REPLAY-TEST");
+
+        // Journal block 22: commit.
+        let j_commit = 22 * 4096;
+        write_jbd2_header(&mut image[j_commit..j_commit + 4096], 2, 1);
 
         image
     }

@@ -16,7 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true }
 criterion = { workspace = true }
+ffs-block = { workspace = true }
+ffs-error = { workspace = true }
 
 [[bench]]
 name = "metadata_parse"
