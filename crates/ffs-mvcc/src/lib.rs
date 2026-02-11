@@ -58,6 +58,13 @@ pub struct MvccStore {
     next_txn: u64,
     next_commit: u64,
     versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
+    /// Active snapshots: each entry is a `CommitSeq` from which a reader is
+    /// still potentially reading.  The set uses a `BTreeSet` so that the
+    /// minimum (oldest active snapshot) can be obtained in O(log n).
+    ///
+    /// Callers **must** pair every `register_snapshot` with a corresponding
+    /// `release_snapshot` to avoid preventing GC indefinitely.
+    active_snapshots: BTreeMap<CommitSeq, u32>,
 }
 
 impl MvccStore {
@@ -67,6 +74,7 @@ impl MvccStore {
             next_txn: 1,
             next_commit: 1,
             versions: BTreeMap::new(),
+            active_snapshots: BTreeMap::new(),
         }
     }
 
@@ -153,6 +161,80 @@ impl MvccStore {
                 versions.drain(0..keep_from);
             }
         }
+    }
+
+    // ── Watermark / active snapshot tracking ───────────────────────────
+
+    /// Register a snapshot as active.  This prevents `prune_safe` from
+    /// removing versions that this snapshot might still need.
+    ///
+    /// Multiple registrations of the same `CommitSeq` are ref-counted;
+    /// each must be paired with a corresponding `release_snapshot`.
+    pub fn register_snapshot(&mut self, snapshot: Snapshot) {
+        *self.active_snapshots.entry(snapshot.high).or_insert(0) += 1;
+    }
+
+    /// Release a previously registered snapshot.  When the last reference
+    /// at a given `CommitSeq` is released, that sequence is no longer
+    /// considered active and versions below it become eligible for pruning.
+    ///
+    /// Returns `true` if the snapshot was still registered, `false` if it
+    /// was already fully released (a logic error by the caller, but not
+    /// fatal).
+    pub fn release_snapshot(&mut self, snapshot: Snapshot) -> bool {
+        if let Some(count) = self.active_snapshots.get_mut(&snapshot.high) {
+            *count -= 1;
+            if *count == 0 {
+                self.active_snapshots.remove(&snapshot.high);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The oldest active snapshot, or `None` if no snapshots are
+    /// registered.
+    ///
+    /// This is the **safe watermark**: pruning versions with
+    /// `commit_seq < watermark` will not break any active reader.
+    #[must_use]
+    pub fn watermark(&self) -> Option<CommitSeq> {
+        self.active_snapshots.keys().next().copied()
+    }
+
+    /// Number of currently active (registered) snapshots.
+    #[must_use]
+    pub fn active_snapshot_count(&self) -> usize {
+        self.active_snapshots.values().map(|c| *c as usize).sum()
+    }
+
+    /// Prune versions that are no longer needed by any active snapshot.
+    ///
+    /// Equivalent to `prune_versions_older_than(watermark)` where
+    /// `watermark` is the oldest active snapshot.  If no snapshots are
+    /// registered, prunes up to the current commit sequence (i.e., keeps
+    /// only the latest version per block).
+    ///
+    /// Returns the watermark that was used.
+    pub fn prune_safe(&mut self) -> CommitSeq {
+        let wm = self
+            .watermark()
+            .unwrap_or_else(|| self.current_snapshot().high);
+        self.prune_versions_older_than(wm);
+        wm
+    }
+
+    /// Total number of block versions stored across all blocks.
+    #[must_use]
+    pub fn version_count(&self) -> usize {
+        self.versions.values().map(Vec::len).sum()
+    }
+
+    /// Number of distinct blocks that have at least one version.
+    #[must_use]
+    pub fn block_count_versioned(&self) -> usize {
+        self.versions.len()
     }
 }
 
@@ -1214,6 +1296,294 @@ mod tests {
                 data,
                 vec![expected_val; 4],
                 "seed {seed}: visible data should match winner's write"
+            );
+        }
+    }
+
+    // ── Watermark / GC tests ───────────────────────────────────────────
+
+    #[test]
+    fn watermark_empty_when_no_snapshots_registered() {
+        let store = MvccStore::new();
+        assert!(store.watermark().is_none());
+        assert_eq!(store.active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn register_and_release_snapshot() {
+        let mut store = MvccStore::new();
+        let snap = Snapshot { high: CommitSeq(5) };
+
+        store.register_snapshot(snap);
+        assert_eq!(store.watermark(), Some(CommitSeq(5)));
+        assert_eq!(store.active_snapshot_count(), 1);
+
+        assert!(store.release_snapshot(snap));
+        assert!(store.watermark().is_none());
+        assert_eq!(store.active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn watermark_tracks_oldest_active_snapshot() {
+        let mut store = MvccStore::new();
+        let old = Snapshot { high: CommitSeq(3) };
+        let mid = Snapshot { high: CommitSeq(7) };
+        let new = Snapshot {
+            high: CommitSeq(12),
+        };
+
+        store.register_snapshot(mid);
+        store.register_snapshot(new);
+        store.register_snapshot(old);
+
+        assert_eq!(store.watermark(), Some(CommitSeq(3)));
+        assert_eq!(store.active_snapshot_count(), 3);
+
+        // Release the oldest — watermark advances.
+        store.release_snapshot(old);
+        assert_eq!(store.watermark(), Some(CommitSeq(7)));
+
+        // Release mid — watermark advances again.
+        store.release_snapshot(mid);
+        assert_eq!(store.watermark(), Some(CommitSeq(12)));
+
+        // Release last — no watermark.
+        store.release_snapshot(new);
+        assert!(store.watermark().is_none());
+    }
+
+    #[test]
+    fn snapshot_ref_counting() {
+        let mut store = MvccStore::new();
+        let snap = Snapshot { high: CommitSeq(5) };
+
+        // Register same snapshot twice.
+        store.register_snapshot(snap);
+        store.register_snapshot(snap);
+        assert_eq!(store.active_snapshot_count(), 2);
+        assert_eq!(store.watermark(), Some(CommitSeq(5)));
+
+        // First release — still active.
+        store.release_snapshot(snap);
+        assert_eq!(store.active_snapshot_count(), 1);
+        assert_eq!(store.watermark(), Some(CommitSeq(5)));
+
+        // Second release — gone.
+        store.release_snapshot(snap);
+        assert_eq!(store.active_snapshot_count(), 0);
+        assert!(store.watermark().is_none());
+    }
+
+    #[test]
+    fn release_unregistered_snapshot_returns_false() {
+        let mut store = MvccStore::new();
+        let snap = Snapshot {
+            high: CommitSeq(99),
+        };
+        assert!(!store.release_snapshot(snap));
+    }
+
+    #[test]
+    fn prune_safe_respects_active_snapshots() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(1);
+
+        // Write 5 versions (commit seqs 1..=5).
+        let mut snaps = Vec::new();
+        for v in 1_u8..=5 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit(txn).expect("commit");
+            snaps.push(store.current_snapshot());
+        }
+
+        // Register snapshot at commit 3.
+        store.register_snapshot(snaps[2]);
+
+        // Safe prune should keep versions readable at commit 3.
+        let wm = store.prune_safe();
+        assert_eq!(wm, CommitSeq(3));
+
+        // Snapshot at commit 3 still works.
+        assert_eq!(
+            store.read_visible(block, snaps[2]).unwrap(),
+            &[3],
+            "version at commit 3 should survive pruning"
+        );
+
+        // Latest snapshot still works.
+        assert_eq!(
+            store.read_visible(block, snaps[4]).unwrap(),
+            &[5],
+            "latest version should always survive"
+        );
+
+        // Versions 1 and 2 should have been pruned.
+        let snap_1 = Snapshot { high: CommitSeq(1) };
+        let old_read = store.read_visible(block, snap_1);
+        assert!(
+            old_read.is_none() || old_read.unwrap() == [3],
+            "version 1 should be pruned or replaced by version 3"
+        );
+    }
+
+    #[test]
+    fn prune_safe_with_no_snapshots_keeps_only_latest() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(1);
+
+        // Write 10 versions.
+        for v in 1_u8..=10 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit(txn).expect("commit");
+        }
+
+        assert_eq!(store.version_count(), 10);
+
+        // No active snapshots — prune should reduce to 1 per block.
+        store.prune_safe();
+
+        // At most 1 version per block should remain.
+        assert!(
+            store.version_count() <= 1,
+            "expected <= 1 version, got {}",
+            store.version_count()
+        );
+
+        // Latest version still readable.
+        let snap = store.current_snapshot();
+        assert_eq!(store.read_visible(block, snap).unwrap(), &[10]);
+    }
+
+    #[test]
+    fn version_count_and_block_count_versioned() {
+        let mut store = MvccStore::new();
+
+        assert_eq!(store.version_count(), 0);
+        assert_eq!(store.block_count_versioned(), 0);
+
+        // 3 versions of block 1, 2 versions of block 2.
+        for v in 1_u8..=3 {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(1), vec![v]);
+            store.commit(txn).expect("commit");
+        }
+        for v in 1_u8..=2 {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(2), vec![v]);
+            store.commit(txn).expect("commit");
+        }
+
+        assert_eq!(store.version_count(), 5);
+        assert_eq!(store.block_count_versioned(), 2);
+    }
+
+    /// Memory bounding simulation: many commits with periodic pruning.
+    ///
+    /// Writes 200 versions to the same block.  With periodic `prune_safe`
+    /// and a single active snapshot sliding forward, version count stays
+    /// bounded.
+    #[test]
+    fn memory_bounded_under_periodic_gc() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(0);
+        let mut max_versions = 0_usize;
+        let mut current_snap: Option<Snapshot> = None;
+
+        for round in 0_u64..200 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![u8::try_from(round % 256).unwrap()]);
+            store.commit(txn).expect("commit");
+
+            // Slide the active snapshot window every 10 commits.
+            if round % 10 == 0 {
+                if let Some(old) = current_snap {
+                    store.release_snapshot(old);
+                }
+                let snap = store.current_snapshot();
+                store.register_snapshot(snap);
+                current_snap = Some(snap);
+
+                store.prune_safe();
+            }
+
+            let vc = store.version_count();
+            if vc > max_versions {
+                max_versions = vc;
+            }
+        }
+
+        // With pruning every 10 commits and a sliding window of ~10 commits,
+        // the max version count should be bounded well below 200.
+        assert!(
+            max_versions < 25,
+            "expected bounded version growth, but max_versions was {max_versions}"
+        );
+
+        // Final state: current snapshot still readable.
+        let snap = store.current_snapshot();
+        let data = store.read_visible(block, snap).expect("readable");
+        assert_eq!(data, &[199_u8]);
+    }
+
+    /// Long-running simulation with multiple blocks.
+    ///
+    /// 500 commits across 10 blocks with periodic GC.  Verifies that
+    /// version count stays bounded and all latest values are correct.
+    #[test]
+    fn memory_bounded_multi_block_simulation() {
+        let mut store = MvccStore::new();
+        let num_blocks = 10_u64;
+        let num_rounds = 500_u64;
+        let mut current_snap: Option<Snapshot> = None;
+
+        for round in 0..num_rounds {
+            let block = BlockNumber(round % num_blocks);
+            let val = u8::try_from(round % 256).unwrap();
+
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![val]);
+            store.commit(txn).expect("commit");
+
+            // Slide the active snapshot window every 20 commits.
+            if round % 20 == 0 {
+                if let Some(old) = current_snap {
+                    store.release_snapshot(old);
+                }
+                let snap = store.current_snapshot();
+                store.register_snapshot(snap);
+                current_snap = Some(snap);
+
+                store.prune_safe();
+            }
+        }
+
+        // Final cleanup.
+        if let Some(old) = current_snap {
+            store.release_snapshot(old);
+        }
+        store.prune_safe();
+
+        // After full cleanup, should have at most 1 version per block.
+        let expected_max = usize::try_from(num_blocks).unwrap();
+        assert!(
+            store.version_count() <= expected_max,
+            "expected <= {num_blocks} versions after full GC, got {}",
+            store.version_count()
+        );
+
+        // Verify latest values are correct.
+        let snap = store.current_snapshot();
+        for b in 0..num_blocks {
+            let block = BlockNumber(b);
+            // The last round that wrote to this block:
+            let last_round = num_rounds - num_blocks + b;
+            let expected = u8::try_from(last_round % 256).unwrap();
+            assert_eq!(
+                store.read_visible(block, snap).unwrap(),
+                &[expected],
+                "block {b} should have latest value"
             );
         }
     }
