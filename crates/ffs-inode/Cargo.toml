@@ -11,6 +11,10 @@ ffs-types = { workspace = true }
 ffs-error = { workspace = true }
 ffs-block = { workspace = true }
 ffs-ondisk = { workspace = true }
+ffs-alloc = { workspace = true }
+ffs-extent = { workspace = true }
+asupersync = { workspace = true }
+crc32c = { workspace = true }
 
 [lints]
 workspace = true
