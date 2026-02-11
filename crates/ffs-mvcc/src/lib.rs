@@ -238,7 +238,7 @@ impl MvccStore {
         let txn_id = txn.id;
         let snapshot = txn.snapshot;
         let read_set = txn.reads;
-        let write_keys: BTreeMap<BlockNumber, ()> = txn.writes.keys().map(|&b| (b, ())).collect();
+        let write_keys: BTreeSet<BlockNumber> = txn.writes.keys().copied().collect();
 
         for (block, bytes) in txn.writes {
             self.versions.entry(block).or_default().push(BlockVersion {
@@ -1979,10 +1979,13 @@ mod tests {
             // one block to 2 while the other remains 1, so a+b=3 (not 4 as
             // under FCW's write-skew).  The key SSI property is that the
             // "double write" (a=2, b=2, sum=4) is prevented.
-            let s = store.lock().unwrap();
-            let snap = s.current_snapshot();
-            let a = s.read_visible(block_a, snap).unwrap()[0];
-            let b = s.read_visible(block_b, snap).unwrap()[0];
+            let (a, b) = {
+                let s = store.lock().unwrap();
+                let snap = s.current_snapshot();
+                let a = s.read_visible(block_a, snap).unwrap()[0];
+                let b = s.read_visible(block_b, snap).unwrap()[0];
+                (a, b)
+            };
             assert_eq!(
                 a + b,
                 3,
