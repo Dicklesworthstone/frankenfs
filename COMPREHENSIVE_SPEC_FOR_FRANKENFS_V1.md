@@ -516,14 +516,7 @@ OTI MUST be persisted in the group descriptor extension (Section 3.7). Because d
 
 `ffs-repair` owns all RaptorQ logic within FrankenFS and MUST provide:
 
-```rust
-pub trait RepairManager: Send + Sync {
-    fn generate_symbols(&self, cx: &Cx, group: GroupNumber) -> Result<RepairSymbolSet>;
-    fn recover_block(&self, cx: &Cx, block: BlockNumber) -> Result<RecoveryResult>;
-    fn scrub(&self, cx: &Cx, progress: &dyn ScrubProgress) -> Result<ScrubReport>;
-    fn refresh_symbols(&self, cx: &Cx, block: BlockNumber) -> Result<()>;
-}
-```
+the `RepairManager` interface (normative signature in **Section 9.5**).
 
 Encoding and decoding delegate to `asupersync::raptorq::{RaptorQSender, RaptorQReceiver}`. All codec entry points MUST call `cx.checkpoint()?` before initiating work.
 
@@ -918,7 +911,7 @@ The last block group in the filesystem may contain fewer than `blocks_per_group`
 - K (source symbol count) = actual data blocks in the group (may be < `blocks_per_group`).
 - Repair overhead is still `ceil(K * (overhead_ratio - 1.0))`.
 - OTI parameters MUST be derived from the actual K, not the nominal group size.
-- For very small tail groups (K < 8), enforce a minimum of 3 repair symbols (extracted from FrankenSQLite's `small_k_min_repair` policy).
+- For very small tail groups (K < 8), enforce a minimum of 3 repair symbols. This mirrors FrankenSQLite's small-object clamping rule to avoid under-provisioning due to rounding/additive slack (see `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md` §3.5.12.1) and MUST be validated in the harness.
 
 #### 3.16.2 Metadata Block Protection
 
@@ -941,21 +934,23 @@ pub struct RepairPolicy {
 
 This section records the key design choices extracted from FrankenSQLite's proven RaptorQ self-healing implementation and how each adapts to the FrankenFS filesystem context.
 
-| FrankenSQLite Design Choice | Filesystem Adaptation | Section |
-|----|----|-----|
-| Sidecar files (`.wal-fec`, `.db-fec`) store symbols outside the main file | Symbols stored in **reserved blocks at end of each block group** (in-image; no sidecar needed because the filesystem controls block allocation) | 3.7 |
-| Per-commit-group encoding (K = pages per transaction) | Per-block-group encoding (K = blocks per group, typically 32,768) | 3.3, 3.7 |
-| Small fixed repair count (default R=2 symbols per WAL commit group) | Proportional overhead (default 5%, yielding ~1,639 repair symbols per 32K-block group) | 3.8 |
-| Pipelined symbol generation (async, not on commit critical path) | Lazy refresh (mark group stale on write, re-encode on next scrub) as default; eager refresh as option | 3.10 |
-| Generation digest prevents stale sidecar attacks | `repair_generation` counter in group descriptor must match stored symbols | 3.7.2 |
-| Per-source xxh3_128 hashes for independent frame validation | Per-source BLAKE3 digests stored in validation blocks (Section 3.15) | 3.15 |
-| Decode proofs (mathematical witness for every repair) | Decode proofs with BLAKE3 digests of recovered blocks (Section 3.12) | 3.12 |
-| Evidence ledger (auditable record of every policy change and repair action) | Repair evidence ledger with structured entries (Section 3.13) | 3.13 |
-| Deterministic encoding (same input = same symbols) via content-addressed seed | Deterministic seed from fs_uuid + group_number (Section 3.14) | 3.14 |
-| Special page-1 treatment (elevated redundancy for header page) | Elevated overhead for metadata groups containing superblock/GDT (Section 3.16.2) | 3.16 |
-| Small-K clamping (minimum 3 repair symbols for objects with K <= 8) | Minimum 3 repair symbols for tail block groups with K < 8 (Section 3.16.1) | 3.16 |
-| Checkpoint-only sidecar updates (single writer, no concurrent mutation) | Symbol refresh only during scrub (lazy mode) or committed write path (eager mode); never during read | 3.10 |
-| Bayesian autopilot for redundancy tuning | Beta posterior over corruption rate with expected-loss overhead selection (Section 3.11) | 3.11 |
+**Source anchor:** `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md` (§3.4.1, §3.4.6, §3.5.3, §3.5.8, §3.5.9, §3.5.12, §4.16.1).
+
+| FrankenSQLite Design Choice | FrankenSQLite Spec | Filesystem Adaptation | FrankenFS Section |
+|----|----|----|-----|
+| Sidecar files (`.wal-fec`, `.db-fec`) store symbols outside the main file | §3.4.1, §3.4.6 | Symbols stored in **reserved blocks at end of each block group** (in-image; no sidecar needed because the filesystem controls block allocation) | 3.7 |
+| Per-commit-group encoding (K = pages per transaction) | §3.4.1 | Per-block-group encoding (K = blocks per group, typically 32,768) | 3.3, 3.7 |
+| Small fixed repair count (default R=2 symbols per WAL commit group) | §3.4.1 | Proportional overhead (default 5%, yielding ~1,639 repair symbols per 32K-block group) | 3.8 |
+| Pipelined symbol generation (async, not on commit critical path) | §3.4.1, §3.4.6 | Lazy refresh (mark group stale on write, re-encode on next scrub) as default; eager refresh as option | 3.10 |
+| Generation digest prevents stale sidecar attacks | §3.4.6 | `repair_generation` counter in group descriptor must match stored symbols | 3.7.2 |
+| Per-source xxh3_128 hashes for independent frame validation | §3.4.1, §3.4.6 | Per-source BLAKE3 digests stored in validation blocks | 3.15 |
+| Decode proofs (mathematical witness for every repair) | §3.5.8 | Decode proofs with BLAKE3 digests of recovered blocks | 3.12 |
+| Evidence ledger (auditable record of every policy change and repair action) | §4.16.1 | Repair evidence ledger with structured entries | 3.13 |
+| Deterministic repair symbol generation (same input = same symbols) | §3.5.3, §3.5.9 | Deterministic seed from `fs_uuid + group_number` | 3.14 |
+| Special page-1 treatment (elevated redundancy for header page) | §3.4.6 | Elevated overhead for metadata groups containing superblock/GDT | 3.16.2 |
+| Small-object clamping (avoid under-provisioning due to rounding/additive slack) | §3.5.12.1 | Minimum 3 repair symbols for tail block groups with K < 8 | 3.16.1 |
+| Checkpoint-only sidecar updates (single writer, no concurrent mutation) | §3.4.1, §3.4.6 | Symbol refresh only during scrub (lazy mode) or committed write path (eager mode); never during read | 3.10 |
+| Adaptive redundancy (autopilot control loop; raise redundancy on evidence) | §3.5.12 | Beta posterior over corruption rate with expected-loss overhead selection | 3.11 |
 
 ---
 
@@ -1686,6 +1681,181 @@ async fn gc_region(cx: &Cx, store: &RwLock<MvccStore>, region: RegionId) -> Resu
 
 ---
 
+### 5.9 Durable Version Store (planned; bd-1u7)
+
+Phase A MVCC (`MvccStore`) is currently in-memory only. This section defines the **planned** durable persistence layer for block versions: a version store that survives restart and can be replayed to reconstruct the latest MVCC state.
+
+#### 5.9.1 Goals / Non-Goals
+
+**Goals:**
+
+1. **Crash-safe commits:** after restart, every commit is either fully present or fully absent (no partial commits).
+2. **Replayability:** we can reconstruct MVCC state by replaying the version store.
+3. **Determinism:** record ordering is deterministic (stable across runs) for reproducible debugging.
+4. **GC hooks:** the design supports watermark-driven pruning and eventual physical compaction.
+
+**Non-goals (for bd-1u7):**
+
+- Defining SSI (Phase B) bookkeeping.
+- Defining the ext4/btrfs on-image checkpoint/migration format.
+
+#### 5.9.2 High-Level Model
+
+The durable MVCC store is an **append-only log** stored separately from the underlying filesystem image (an “overlay”):
+
+- Reads consult the in-memory MVCC index first; when no version exists, fall back to the base `BlockDevice`.
+- Commits append new block versions to the overlay log and then append a **commit marker** that makes the commit durable/visible on replay.
+
+This is WAL-like: `VERSION*` records then a `COMMIT` record. A commit exists iff its `COMMIT` record is present and valid.
+
+#### 5.9.3 Storage Interface (informative)
+
+The durable store is byte-addressed and uses the canonical `ByteDevice` (Section 9.1).
+
+```rust
+/// Durable append-only store for MVCC block versions.
+///
+/// This trait is informative (planned) until implemented.
+pub trait VersionStore: Send + Sync {
+    /// Append a single block version record.
+    fn append_version(
+        &self,
+        cx: &Cx,
+        commit_seq: CommitSeq,
+        writer: TxnId,
+        block: BlockNumber,
+        bytes: &[u8],
+    ) -> Result<()>;
+
+    /// Append a commit marker record (atomicity boundary).
+    fn append_commit_marker(
+        &self,
+        cx: &Cx,
+        commit_seq: CommitSeq,
+        writer: TxnId,
+        write_count: u32,
+    ) -> Result<()>;
+
+    /// Flush appended records to stable storage (fsync).
+    fn sync(&self, cx: &Cx) -> Result<()>;
+
+    /// Replay the log and invoke callbacks for committed versions.
+    fn replay(&self, cx: &Cx, apply: &mut dyn FnMut(BlockVersion)) -> Result<CommitSeq>;
+}
+```
+
+The MVCC engine MAY bundle this behind a higher-level `MvccBlockManager` implementation; the key requirement is that the version store can be replayed deterministically.
+
+#### 5.9.4 On-Disk Log Format (v1)
+
+The overlay file is a linear sequence of records:
+
+1. **Header** (single record, must be first)
+2. Repeated `{ VERSION* , COMMIT }` groups
+
+Each record is:
+
+- A fixed-size header with a **magic**, a **type**, a **payload length**, and a **checksum**
+- Followed by the payload bytes
+
+Record header (conceptual):
+
+| Field | Size | Notes |
+|------|------|------|
+| magic | 4 B | `"FFSV"` |
+| kind | 1 B | `1=HEADER`, `2=VERSION`, `3=COMMIT` |
+| reserved | 3 B | must be 0 |
+| payload_len | 4 B | little-endian |
+| payload_crc32c | 4 B | CRC32C of payload bytes |
+
+`HEADER` payload (must include enough to prevent accidental reuse against the wrong base device):
+
+- `format_version: u32` (currently `1`)
+- `block_size: u32`
+- `base_fingerprint: [u8; 32]` (BLAKE3 of the base device identity; exact definition is implementation-chosen but MUST be stable)
+
+`VERSION` payload:
+
+- `commit_seq: u64`
+- `writer_txn: u64`
+- `block_number: u64`
+- `bytes_len: u32` (must equal `block_size`)
+- `bytes: [u8; bytes_len]`
+
+`COMMIT` payload:
+
+- `commit_seq: u64`
+- `writer_txn: u64`
+- `write_count: u32` (sanity only; replay does not require it for correctness)
+
+**Checksum choice:** CRC32C is sufficient to detect torn/incomplete writes and random corruption. The durability layer MAY additionally store a BLAKE3 hash per block version for stronger integrity checks, but CRC32C is the required minimum.
+
+#### 5.9.5 Commit Protocol and Crash Consistency
+
+To make a commit crash-safe, the system MUST enforce:
+
+1. All `VERSION` records for a commit are durable before the `COMMIT` record is appended.
+2. The `COMMIT` record is durable before the commit is considered durable/visible after restart.
+
+Concrete protocol:
+
+```
+PROCEDURE durable_commit(T):
+  validate_fcw(T)                         // in-memory check (Phase A)
+  seq = allocate_commit_seq()             // monotonically increasing
+
+  // Deterministic ordering for reproducible logs.
+  writes = sort_by_block_number(T.staged_writes)
+
+  FOR EACH (block, bytes) in writes:
+    append VERSION(seq, T.txn_id, block, bytes)
+  sync()                                  // ensures all VERSION records are durable
+
+  append COMMIT(seq, T.txn_id, len(writes))
+  sync()                                  // ensures COMMIT marker is durable
+
+  publish_to_in_memory_index(seq, writes) // versions become visible immediately after commit returns
+  RETURN seq
+```
+
+If the process crashes:
+
+- After writing some `VERSION` records but before the `COMMIT` marker: the commit is treated as **absent** on replay.
+- After writing the `COMMIT` marker: the commit is treated as **present** and its versions are applied on replay.
+
+#### 5.9.6 Recovery Procedure (Replay)
+
+Recovery scans the overlay log sequentially:
+
+1. Validate `HEADER` (magic/version/block_size/base_fingerprint).
+2. Accumulate `VERSION` records for a given `commit_seq` into a temporary buffer.
+3. When a matching `COMMIT` record is encountered, apply the buffered versions in deterministic order.
+4. Stop at the first invalid record (bad magic, impossible length, checksum failure) and treat the remainder of the file as truncated tail.
+
+This yields:
+
+- `last_commit_seq` = highest committed `commit_seq` applied
+- `next_commit_seq` = `last_commit_seq + 1`
+
+**Replay MUST NOT publish versions for any `commit_seq` lacking a valid `COMMIT` marker.**
+
+#### 5.9.7 GC / Watermarks / Compaction (strategy)
+
+**Logical pruning (required):** the MVCC engine uses the standard watermark rule (Section 5.6/5.6.4):
+
+- `watermark = min(active snapshots).high`
+- per block, keep the **newest** version with `commit_seq <= watermark` (the keeper) plus all newer versions
+
+**Physical compaction (recommended):** the overlay file is append-only, so disk usage grows. When the overlay exceeds a size threshold, a background compactor MAY:
+
+1. Take an MVCC barrier (exclusive) to obtain a stable view of which versions are live at the watermark.
+2. Write a new overlay file containing only live `VERSION` records (preserving original `commit_seq` values) plus `COMMIT` markers.
+3. `sync()` the new file, then atomically replace the old overlay via `rename()`.
+
+The compactor MUST preserve snapshot semantics: it may only discard versions that are provably invisible to all active snapshots (the same GC-SAFE rule).
+
+---
+
 ## 6. Buffer Pool: ARC Cache
 
 Implementation: `ffs-block` crate.
@@ -2038,17 +2208,9 @@ async fn flush_daemon(cx: &Cx, cache: &RwLock<ArcCache>,
 
 ### 6.9 BlockDevice Trait
 
-```rust
-pub trait BlockDevice: Send + Sync {
-    fn read_block(&self, block: BlockNumber) -> Result<Vec<u8>, FfsError>;
-    fn write_block(&self, block: BlockNumber, data: &[u8]) -> Result<(), FfsError>;
-    fn sync(&self) -> Result<(), FfsError>;
-    fn block_count(&self) -> u64;
-    fn block_size(&self) -> usize;
-}
-```
+Normative storage trait signatures live in **Section 9.1** (`ByteDevice` + `BlockDevice`). This ARC cache section intentionally does **not** redefine those traits.
 
-Implementations: `FileBlockDevice` (file-backed), `RawBlockDevice` (`/dev/sdX`), `MemoryBlockDevice` (tests/fuzz).
+Implementation note: v1 code provides `ffs_block::FileByteDevice` (file-backed byte I/O) and `ffs_block::ByteBlockDevice` (block wrapper), plus in-memory test devices.
 
 ---
 
@@ -2229,18 +2391,18 @@ pedantic+nursery at deny, common versions via `[workspace.dependencies]`.
 | 3 | `ffs-ondisk` | Pure ext4 + btrfs parsing (superblocks, extents, leaf items); no I/O | `ffs-types`, `ffs-error`, `crc32c`, `serde` |
 | 4 | `ffs-block` | Block I/O: `ByteDevice`, `BlockDevice`, ARC cache; Cx-aware I/O | `ffs-types`, `ffs-error`, `asupersync`, `parking_lot` |
 | 5 | `ffs-journal` | JBD2-compatible journal replay scaffolding (phased) | `ffs-types`, `ffs-error`, `ffs-block` |
-| 6 | `ffs-mvcc` | MVCC core (currently in-memory FCW; SSI phased) | `ffs-types`, `serde`, `thiserror` |
+| 6 | `ffs-mvcc` | MVCC core: block-backed version chains, snapshot isolation, FCW conflict detection; SSI phased | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `parking_lot`, `serde`, `thiserror` |
 | 7 | `ffs-btree` | Tree ops used by ext4 (extents/htree) and btrfs (metadata trees) | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
 | 8 | `ffs-alloc` | Allocation scaffolding (mballoc/Orlov phased) | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
 | 9 | `ffs-inode` | Inode lifecycle scaffolding | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
 | 10 | `ffs-dir` | Directory ops scaffolding | `ffs-types`, `ffs-error`, `ffs-inode` |
 | 11 | `ffs-extent` | Extent mapping scaffolding | `ffs-types`, `ffs-error`, `ffs-btree`, `ffs-alloc` |
 | 12 | `ffs-xattr` | Xattr scaffolding | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
-| 13 | `ffs-fuse` | FUSE adapter scaffolding; delegates to `ffs-core` (fuser integration phased) | `asupersync`, `ffs-core`, `ffs-types`, `serde`, `thiserror` |
-| 14 | `ffs-repair` | Repair scaffolding (RaptorQ integration phased) | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync` |
-| 15 | `ffs-core` | Engine integration: detect/inspect, MVCC wrapper, autopilot | `asupersync`, `ffs-block`, `ffs-error`, `ffs-mvcc`, `ffs-ondisk`, `ffs-types`, `serde`, `thiserror` |
+| 13 | `ffs-fuse` | FUSE adapter: implements `fuser::Filesystem` for read-only ext4 mount; delegates to `ffs-core` | `asupersync`, `ffs-core`, `ffs-error`, `ffs-types`, `fuser`, `libc`, `serde`, `thiserror`, `tracing` |
+| 14 | `ffs-repair` | Scrub pipeline + repair symbol format (RaptorQ encode/decode phased) | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `blake3`, `crc32c` |
+| 15 | `ffs-core` | Engine integration: detect/inspect, MVCC wrapper, autopilot, RepairPolicy | `asupersync`, `ffs-block`, `ffs-btrfs`, `ffs-error`, `ffs-mvcc`, `ffs-ondisk`, `ffs-types`, `libc`, `serde`, `serde_json`, `thiserror` |
 | 16 | `ffs` | Public facade; re-exports `ffs-core` | `ffs-core` |
-| 17 | `ffs-cli` | CLI: `inspect` (current), mount/fsck/info phased | `anyhow`, `asupersync`, `ffs-core`, `serde`, `serde_json`, `ftui` |
+| 17 | `ffs-cli` | CLI: `inspect`, `mount`, `scrub`, `parity`; clap-based structured subcommands | `anyhow`, `asupersync`, `clap`, `ffs-block`, `ffs-core`, `ffs-fuse`, `ffs-harness`, `ffs-repair`, `serde`, `serde_json` |
 | 18 | `ffs-tui` | TUI monitoring | `ffs`, `ftui` |
 | 19 | `ffs-harness` | Fixture conformance + benches | `anyhow`, `ffs-core`, `ffs-ondisk`, `ffs-types`, `hex`, `serde`, `serde_json` (+dev: `criterion`) |
 
@@ -2253,48 +2415,47 @@ All crates implicitly depend on `ffs-types` and `ffs-error`.
                          │ ffs-types │  │ ffs-error  │
                          └─────┬─────┘  └─────┬─────┘
                                └──────┬───────┘
-                               ┌──────▼──────┐
-                               │  ffs-ondisk  │   (pure; no I/O)
-                               └──────┬──────┘
-            ┌─────────────────────────┼──────────────────────────┐
-            │                         │                          │
-     ┌──────▼──────┐          ┌──────▼──────┐           ┌──────▼──────┐
-     │  ffs-block   │          │  ffs-btree  │           │  ffs-xattr  │
-     │  (ARC cache) │          └──────┬──────┘           └──────┬──────┘
-     └──┬──┬──┬──┬──┘                │                         │
-        │  │  │  │           ┌───────▼───────┐                 │
-        │  │  │  │           │   ffs-alloc   │                 │
-        │  │  │  │           └───────┬───────┘                 │
-        │  │  │  └───────────────────┼─────────────────────────┘
-   ┌────▼┐ │  ┌▼───────┐     ┌──────▼──────┐   ┌──────────┐
-   │ffs- │ │  │ffs-    │     │ ffs-extent  │   │ffs-inode │
-   │jour.│ │  │repair  │     └──────┬──────┘   └────┬─────┘
-   └──┬──┘ │  └────────┘            │               │
-      │    │                        │        ┌──────▼──────┐
-   ┌──▼────▼───┐                    │        │   ffs-dir   │
-   │  ffs-mvcc  │                    │        └──────┬──────┘
-   └─────┬─────┘                    │               │
-         └──────────┬───────────────┴───────────────┘
-             ┌──────▼──────┐
-             │   ffs-fuse   │
-             └──────┬──────┘
-             ┌──────▼──────┐
-             │   ffs-core   │
-             └──────┬──────┘
-             ┌──────▼──────┐
-             │     ffs      │   (facade)
-             └──┬───┬───┬──┘
-        ┌───────┘   │   └────────┐
- ┌──────▼──┐ ┌─────▼─────┐ ┌───▼──────────┐
- │ ffs-cli  │ │  ffs-tui   │ │ ffs-harness   │
- └─────────┘ └───────────┘ └──────────────┘
+                    ┌─────────────────┼────────────────┐
+                    │                 │                 │
+             ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
+             │  ffs-ondisk  │  │  ffs-block   │  │  ffs-mvcc   │
+             │  (pure)      │  │  (ARC cache) │  │  (ffs-block) │
+             └──────┬──────┘  └──┬──┬──┬──┬──┘  └─────────────┘
+     ┌──────────────┼─────┐     │  │  │  │
+     │       ┌──────▼────┐│     │  │  │  │
+     │       │ ffs-btree  ││     │  │  │  │
+     │       └──────┬────┘│     │  │  │  │
+     │       ┌──────▼────┐│     │  │  │  │
+     │       │ ffs-alloc  ││     │  │  │  │
+     │       └──────┬────┘│     │  │  │  │
+     │              │     │     │  │  │  │
+  ┌──▼──────┐ ┌────▼─┐  ┌▼─┐ ┌▼──▼┐ │ ┌▼──────┐ ┌──────────┐
+  │ffs-xattr│ │extent│  │  │ │jrnl│ │ │repair │ │ffs-inode │
+  └─────────┘ └──────┘  └──┘ └────┘ │ └───────┘ └────┬─────┘
+                                     │                │
+                                     │         ┌──────▼──────┐
+                                     │         │   ffs-dir   │
+                                     │         └─────────────┘
+                                     │
+              ┌──────────────────────▼────────────────────────┐
+              │                   ffs-core                     │
+              │  (orchestrates mvcc, ondisk, block, btrfs)     │
+              └──┬──────────┬──────────────────────────────┬──┘
+                 │          │                              │
+          ┌──────▼────┐  ┌──▼──────────┐           ┌──────▼──────┐
+          │  ffs-fuse  │  │     ffs      │ (facade)  │ ffs-harness  │
+          └────────────┘  └──┬───┬──────┘           └─────────────┘
+                    ┌────────┘   └────────┐
+             ┌──────▼──┐          ┌──────▼─────┐
+             │ ffs-cli  │          │  ffs-tui   │
+             └─────────┘          └────────────┘
 ```
 
 ### 8.4 Layering Rules
 
 1. **Parser crates are pure.** `ffs-ondisk` does no I/O. MUST NOT depend on `ffs-block` or `asupersync`.
-2. **MVCC is transport-agnostic.** `ffs-mvcc` knows nothing about FUSE, files, or inodes.
-3. **FUSE adapter delegates.** `ffs-fuse` maps callbacks to `FfsOperations`; zero FS logic.
+2. **MVCC is transport-agnostic.** `ffs-mvcc` operates on blocks, not files or directories. It depends on `ffs-block` for versioned block storage but has no knowledge of FUSE, inodes, or directory entries.
+3. **FUSE adapter delegates.** `ffs-fuse` maps FUSE callbacks to `ffs-core`; zero FS logic. Depends on `ffs-core` and `fuser`.
 4. **Repair is orthogonal.** `ffs-repair` operates on blocks, not files.
 5. **Harness depends on everything.** No production crate (1-18) depends on `ffs-harness`.
 6. **No cycles.** Strict DAG; enforced by `cargo` and CI.
@@ -2612,47 +2773,54 @@ testing infrastructure. No production crate depends on `ffs-harness`.
 
 All trait methods performing I/O accept `&Cx` for cancellation and budget
 propagation. Types: `BlockNumber`, `InodeNumber`, `GroupNumber`, `TxnId`,
-`CommitSeq`, `Snapshot`, `FileMode`, `Timestamp` from `ffs-types`; `Cx`
+`CommitSeq`, `Snapshot`, `ByteOffset`, `FileMode`, `Timestamp` from `ffs-types`; `Cx`
 from `asupersync`; `Result<T>` is `ffs_error::Result<T>`.
 
-### 9.1 BlockDevice (ffs-block)
+### 9.1 ByteDevice / BlockDevice (ffs-block)
 
 ```rust
+/// Owned block buffer.
+///
+/// Invariant: length == device block size for the originating device.
 pub struct BlockBuf { /* block-aligned, exactly block_size bytes */ }
 
-pub trait BlockDevice: Send + Sync {
-    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf>;
-    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()>;
-    fn block_size(&self) -> u32;
-    fn block_count(&self) -> u64;
+/// Byte-addressed device for fixed-offset I/O (pread/pwrite semantics).
+pub trait ByteDevice: Send + Sync {
+    /// Total length in bytes.
+    fn len_bytes(&self) -> u64;
+
+    /// Read exactly `buf.len()` bytes from `offset` into `buf`.
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()>;
+
+    /// Write all bytes in `buf` to `offset`.
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()>;
+
+    /// Flush pending writes to stable storage.
     fn sync(&self, cx: &Cx) -> Result<()>;
+}
 
-    fn read_blocks(&self, cx: &Cx, start: BlockNumber, count: u32) -> Result<Vec<BlockBuf>> {
-        let mut bufs = Vec::with_capacity(count as usize);
-        for i in 0..u64::from(count) {
-            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-            bufs.push(self.read_block(cx, BlockNumber(start.0 + i))?);
-        }
-        Ok(bufs)
-    }
+/// Block-addressed I/O interface.
+pub trait BlockDevice: Send + Sync {
+    /// Read a block by number.
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf>;
 
-    fn write_blocks(&self, cx: &Cx, start: BlockNumber, data: &[&[u8]]) -> Result<()> {
-        for (i, d) in data.iter().enumerate() {
-            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-            self.write_block(cx, BlockNumber(start.0 + i as u64), d)?;
-        }
-        Ok(())
-    }
+    /// Write a block by number. `data.len()` MUST equal `block_size()`.
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()>;
 
-    fn discard(&self, _cx: &Cx, _start: BlockNumber, _count: u64) -> Result<()> { Ok(()) }
+    /// Device block size in bytes.
+    fn block_size(&self) -> u32;
+
+    /// Total number of blocks.
+    fn block_count(&self) -> u64;
+
+    /// Flush pending writes to stable storage.
+    fn sync(&self, cx: &Cx) -> Result<()>;
 }
 ```
 
 - `read_block` MUST verify CRC32C before returning; returns `FfsError::Corruption` on mismatch.
 - `write_block` computes CRC32C (and BLAKE3 in native mode) before writing. `data` MUST be `block_size()` bytes.
-- `read_blocks`/`write_blocks` default to loops; implementations SHOULD override for `preadv2`.
 - `sync` flushes to stable storage (`fdatasync` equivalent).
-- `discard` issues TRIM; no-op by default.
 
 ### 9.2 CachePolicy (ffs-block)
 
@@ -2792,8 +2960,6 @@ pub trait RepairManager: Send + Sync {
     fn recover_block(&self, cx: &Cx, block: BlockNumber) -> Result<RecoveryResult>;
     fn scrub(&self, cx: &Cx, progress: &dyn ScrubProgress) -> Result<ScrubReport>;
     fn refresh_symbols(&self, cx: &Cx, block: BlockNumber) -> Result<()>;
-    fn stale_group_count(&self) -> u32;
-    fn is_group_current(&self, group: GroupNumber) -> bool;
 }
 ```
 
