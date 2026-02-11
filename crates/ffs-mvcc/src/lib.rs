@@ -1909,14 +1909,14 @@ mod tests {
             let outcomes = Arc::new(std::sync::Mutex::new((None, None)));
 
             // Pre-begin both at the same snapshot.
-            let (t1_base, t2_base) = {
-                let mut s = store.lock().unwrap();
-                let t1 = s.begin();
-                let a_ver = s.latest_commit_seq(block_a);
-                let b_ver = s.latest_commit_seq(block_b);
-                let t2 = s.begin();
-                ((t1, a_ver), (t2, b_ver))
-            };
+            let mut s = store.lock().unwrap();
+            let t1 = s.begin();
+            let a_ver = s.latest_commit_seq(block_a);
+            let b_ver = s.latest_commit_seq(block_b);
+            let t2 = s.begin();
+            drop(s);
+            let t1_base = (t1, a_ver);
+            let t2_base = (t2, b_ver);
 
             // T1: reads A, writes B.
             {
@@ -1979,13 +1979,11 @@ mod tests {
             // one block to 2 while the other remains 1, so a+b=3 (not 4 as
             // under FCW's write-skew).  The key SSI property is that the
             // "double write" (a=2, b=2, sum=4) is prevented.
-            let (a, b) = {
-                let s = store.lock().unwrap();
-                let snap = s.current_snapshot();
-                let a = s.read_visible(block_a, snap).unwrap()[0];
-                let b = s.read_visible(block_b, snap).unwrap()[0];
-                (a, b)
-            };
+            let s = store.lock().unwrap();
+            let snap = s.current_snapshot();
+            let a = s.read_visible(block_a, snap).unwrap()[0];
+            let b = s.read_visible(block_b, snap).unwrap()[0];
+            drop(s);
             assert_eq!(
                 a + b,
                 3,

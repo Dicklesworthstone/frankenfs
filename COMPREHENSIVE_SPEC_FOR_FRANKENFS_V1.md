@@ -1311,7 +1311,7 @@ The following MUST NOT appear in any FrankenFS crate:
 This spec is split into phases:
 
 - **Phase A (implemented)**: snapshot visibility + FCW (first-committer-wins) write-write conflict detection. This is **normative** and MUST match `crates/ffs-mvcc/src/lib.rs`.
-- **Phase B (planned)**: SSI (rw-antidependency tracking), read-set bookkeeping, active transaction registry, and GC watermarking. This is **informative** until implemented (APIs MAY change).
+- **Phase B (implemented)**: SSI (rw-antidependency tracking via `commit_ssi`), read-set bookkeeping (`record_read`), active snapshot registry (`register_snapshot`/`release_snapshot`), and GC watermarking (`watermark`/`prune_safe`). This is **normative** and MUST match `crates/ffs-mvcc/src/lib.rs`.
 
 Implementation home: `ffs-mvcc` crate; shared types: `ffs-types`.
 
@@ -1326,17 +1326,19 @@ Implementation home: `ffs-mvcc` crate; shared types: `ffs-types`.
 - No read-set tracking (so no SSI write-skew detection yet).
 - Aborting is implicit: drop the `Transaction` without committing.
 
-**Phase B (planned):**
+**Phase B (implemented):**
 
-- Add read-set bookkeeping and rw-antidependency tracking for SSI.
-- Add an explicit `abort(tx)` API (needed once there is active-tx bookkeeping).
-- Add GC watermark computation from active snapshots (safe version reclamation).
-- Potentially evolve `ffs-mvcc` toward the `MvccBlockManager` trait in `PROPOSED_ARCHITECTURE.md` (which takes `&Cx`).
+- Read-set bookkeeping via `Transaction::record_read(block, version_seq)`.
+- SSI rw-antidependency detection via `MvccStore::commit_ssi(txn)`.
+- Active snapshot registry: `register_snapshot`/`release_snapshot` with ref-counting.
+- GC watermark: `watermark()` returns oldest active snapshot; `prune_safe()` prunes up to watermark.
+- SSI log: `CommittedTxnRecord` entries retained for antidependency checking; prunable via `prune_ssi_log(watermark)`.
+- Explicit `abort(tx)` not yet needed: dropping `Transaction` without committing is sufficient since SSI bookkeeping is checked at commit time, not during the transaction lifetime.
 
-### 5.0.1 Phase A Public API (ffs-mvcc)
+### 5.0.1 Public API (ffs-mvcc, Phase A+B)
 
 ```rust
-// Implemented in `crates/ffs-mvcc/src/lib.rs` (Phase A).
+// Implemented in `crates/ffs-mvcc/src/lib.rs`.
 
 pub struct MvccStore { /* ... */ }
 pub struct Transaction { pub id: TxnId, pub snapshot: Snapshot, /* ... */ }
@@ -1345,16 +1347,34 @@ impl MvccStore {
     pub fn new() -> Self;
     pub fn current_snapshot(&self) -> Snapshot;
     pub fn begin(&mut self) -> Transaction;
+    // Phase A: FCW-only commit (write-write conflict detection).
     pub fn commit(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError>;
+    // Phase B: SSI commit (FCW + rw-antidependency detection).
+    pub fn commit_ssi(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError>;
     pub fn latest_commit_seq(&self, block: BlockNumber) -> CommitSeq;
     pub fn read_visible(&self, block: BlockNumber, snapshot: Snapshot) -> Option<&[u8]>;
+    // Version GC.
     pub fn prune_versions_older_than(&mut self, watermark: CommitSeq);
+    pub fn prune_safe(&mut self) -> CommitSeq;
+    pub fn prune_ssi_log(&mut self, watermark: CommitSeq);
+    // Active snapshot tracking.
+    pub fn register_snapshot(&mut self, snapshot: Snapshot);
+    pub fn release_snapshot(&mut self, snapshot: Snapshot) -> bool;
+    pub fn watermark(&self) -> Option<CommitSeq>;
+    pub fn active_snapshot_count(&self) -> usize;
+    // Introspection.
+    pub fn version_count(&self) -> usize;
+    pub fn block_count_versioned(&self) -> usize;
 }
 
 impl Transaction {
     pub fn stage_write(&mut self, block: BlockNumber, bytes: Vec<u8>);
     pub fn staged_write(&self, block: BlockNumber) -> Option<&[u8]>;
     pub fn pending_writes(&self) -> usize;
+    // Phase B: read-set tracking for SSI.
+    pub fn record_read(&mut self, block: BlockNumber, version_seq: CommitSeq);
+    pub fn read_set(&self) -> &BTreeMap<BlockNumber, CommitSeq>;
+    pub fn write_set(&self) -> &BTreeMap<BlockNumber, Vec<u8>>;
 }
 ```
 
@@ -1376,7 +1396,7 @@ pub struct Snapshot { pub high: CommitSeq }
 
 **Implementation note:** The canonical `TxnId` is `TxnId(pub u64)`, not `NonZeroU64`. The `MvccStore` (in `ffs-mvcc`) starts its allocator at 1, so `TxnId(0)` is never issued in practice. The earlier plan to migrate to `NonZeroU64` has been deferred indefinitely — `u64` is simpler and the zero-sentinel invariant is enforced by the allocator, not by the type system.
 
-The `TxHandle` struct shown in earlier revisions (with `HashSet<BlockNumber>` read/write sets) is an aspirational SSI design. The current implementation uses `Transaction` (in `ffs-mvcc`), which has `BTreeMap<BlockNumber, Vec<u8>>` for staged writes and uses first-committer-wins conflict detection (not full SSI with read-set tracking).
+The `TxHandle` struct shown in earlier revisions (with `HashSet<BlockNumber>` read/write sets) has been superseded. The current `Transaction` (in `ffs-mvcc`) tracks both a write set (`BTreeMap<BlockNumber, Vec<u8>>`) and a read set (`BTreeMap<BlockNumber, CommitSeq>`). FCW is available via `commit()` and SSI via `commit_ssi()`. Read-set population is explicit via `record_read()` — callers opt in to SSI tracking.
 
 #### 5.1.1 Sentinel Values
 
