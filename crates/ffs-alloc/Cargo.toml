@@ -11,6 +11,7 @@ ffs-types = { workspace = true }
 ffs-error = { workspace = true }
 ffs-block = { workspace = true }
 ffs-ondisk = { workspace = true }
+asupersync = { workspace = true }
 
 [lints]
 workspace = true
