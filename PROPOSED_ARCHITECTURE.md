@@ -13,18 +13,18 @@
 | 3 | `ffs-ondisk` | ext4 + btrfs on-disk format parsing: superblocks, headers, keys/items, ext4 group desc/inodes/extents/dirs, JBD2 structures | `ffs-types`, `ffs-error`, `crc32c`, `serde` | 2 |
 | 4 | `ffs-block` | Block I/O layer: BlockDevice trait, ARC (Adaptive Replacement Cache), read/write with Cx, dirty page tracking | `ffs-types`, `ffs-error`, `asupersync`, `parking_lot` | 3 |
 | 5 | `ffs-journal` | JBD2-compatible journal replay + native COW journal: transaction lifecycle, descriptor/commit/revoke blocks | `ffs-types`, `ffs-error`, `ffs-block` | 6 |
-| 6 | `ffs-mvcc` | Block-level MVCC: version chains (BlockVersion), snapshot isolation, first-committer-wins conflict detection, GC of old versions | `ffs-types`, `serde`, `thiserror` | 6 |
+| 6 | `ffs-mvcc` | Block-level MVCC: version chains (BlockVersion), snapshot isolation, first-committer-wins conflict detection, GC of old versions | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `parking_lot`, `serde`, `thiserror` | 6 |
 | 7 | `ffs-btree` | B-tree operations used by ext4 (extents/htree) and btrfs (metadata trees): search, insert, split, merge, tree walk | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 4 |
 | 8 | `ffs-alloc` | Block/inode allocation: mballoc-style multi-block allocator (buddy system, best-fit, prealloc), Orlov inode allocator | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 4 |
 | 9 | `ffs-inode` | Inode management: read/write/create/delete, permissions, timestamps, flags | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 5 |
 | 10 | `ffs-dir` | Directory operations: linear scan, htree (hashed B-tree) lookup, dx_hash, create/delete entries | `ffs-types`, `ffs-error`, `ffs-inode` | 5 |
 | 11 | `ffs-extent` | Extent mapping: logical→physical block resolution, extent allocation, hole detection | `ffs-types`, `ffs-error`, `ffs-btree`, `ffs-alloc` | 4 |
 | 12 | `ffs-xattr` | Extended attributes: inline (after inode extra fields), external block, namespace routing (user/system/security/trusted) | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 5 |
-| 13 | `ffs-fuse` | FUSE interface: FuseBackend trait, MountOptions, FrankenFuseMount — delegates to ffs-core engine (not domain crates directly) | `ffs-core`, `ffs-types`, `asupersync`, `serde`, `thiserror` | 7 |
-| 14 | `ffs-repair` | RaptorQ self-healing: generate/store repair symbols per block group, detect corruption via checksum, recover blocks, background scrub | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync` | 8 |
-| 15 | `ffs-core` | Engine integration: format detection (FsFlavor), FrankenFsEngine (MVCC wrapper), DurabilityAutopilot (Bayesian redundancy), mount orchestration | `ffs-types`, `ffs-ondisk`, `ffs-mvcc`, `asupersync`, `serde`, `thiserror` | 7 |
+| 13 | `ffs-fuse` | FUSE interface: FuseBackend trait, MountOptions, FrankenFuseMount — delegates to ffs-core engine (not domain crates directly) | `ffs-core`, `ffs-types`, `ffs-error`, `asupersync`, `fuser`, `libc`, `serde`, `thiserror`, `tracing` | 7 |
+| 14 | `ffs-repair` | RaptorQ self-healing: generate/store repair symbols per block group, detect corruption via checksum, recover blocks, background scrub | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `blake3`, `crc32c` | 8 |
+| 15 | `ffs-core` | Engine integration: format detection (FsFlavor), FrankenFsEngine (MVCC wrapper), DurabilityAutopilot (Bayesian redundancy), mount orchestration | `ffs-types`, `ffs-error`, `ffs-ondisk`, `ffs-block`, `ffs-mvcc`, `ffs-btrfs`, `asupersync`, `serde`, `thiserror` | 7 |
 | 16 | `ffs` | Public API facade: re-exports core functionality, stable external interface | `ffs-core` | 9 |
-| 17 | `ffs-cli` | CLI binary: `ffs inspect` (currently), planned: `ffs mount`, `ffs fsck`, `ffs info`, `ffs repair` | `ffs-core`, `anyhow`, `serde`, `serde_json`, `ftui` | 9 |
+| 17 | `ffs-cli` | CLI binary: `ffs inspect`, `ffs mount`, `ffs scrub`, `ffs parity` | `ffs-core`, `ffs-block`, `ffs-fuse`, `ffs-repair`, `ffs-harness`, `anyhow`, `asupersync`, `clap`, `serde`, `serde_json` | 9 |
 | 18 | `ffs-tui` | TUI monitoring: live cache stats, MVCC version counts, repair status, I/O throughput | `ffs`, `ftui` | 9 |
 | 19 | `ffs-harness` | Conformance testing harness: parity reports, sparse JSON fixtures, compare FrankenFS behavior against real ext4/btrfs images | `ffs-core`, `ffs-ondisk`, `ffs-types`, `anyhow`, `hex`, `serde`, `serde_json`; dev: `criterion` | 9 |
 | 20 | `ffs-ext4` | Legacy/reference wrapper for ext4 parsing APIs (re-exports `ffs-ondisk::ext4::*`) | `ffs-ondisk` | 1 |
@@ -41,35 +41,37 @@
                          │              │
                          └──────┬───────┘
                                 │
-                         ┌──────▼──────┐
-                         │  ffs-ondisk  │       ┌──────────┐
-                         └──────┬──────┘       │ ffs-mvcc  │
-                                │              │(ffs-types,│
-              ┌─────────────────┼──────────┐   │serde,     │
-              │                 │          │   │thiserror) │
-       ┌──────▼──────┐  ┌──────▼──────┐  ┌▼───┴──────────┐
-       │  ffs-block   │  │  ffs-btree  │  │   ffs-xattr   │
-       │  (+ ARC)     │  └──────┬──────┘  └───────────────┘
-       └──┬───┬───┬───┘        │
-          │   │   │      ┌─────▼─────┐
-          │   │   │      │ ffs-alloc  │
-          │   │   │      └─────┬─────┘
-          │   │   │            │
-   ┌──────▼┐  │  ┌▼──────┐  ┌─▼────────┐  ┌──────────────┐
-   │ffs-   │  │  │ffs-   │  │ffs-extent│  │  ffs-inode   │
-   │journal│  │  │repair │  └──────────┘  └──────┬───────┘
-   └───────┘  │  └───────┘                       │
-              │                           ┌──────▼──────┐
-              │                           │   ffs-dir   │
-              │                           └─────────────┘
-              │
-       ┌──────▼──────┐  (orchestrates ffs-mvcc, ffs-ondisk, ffs-types)
-       │   ffs-core   │
+                    ┌───────────┼───────────┐
+                    │           │           │
+             ┌──────▼──────┐   │    ┌──────▼──────┐
+             │  ffs-ondisk  │   │    │  ffs-block   │
+             └──────┬──────┘   │    │  (+ ARC)     │
+                    │          │    └──┬──┬──┬──┬──┘
+     ┌──────────────┼──────┐   │       │  │  │  │
+     │              │      │   │       │  │  │  └──────────┐
+     │       ┌──────▼────┐ │   │       │  │  │      ┌──────▼──────┐
+     │       │ ffs-btree  │ │   │       │  │  │      │  ffs-mvcc   │
+     │       └──────┬────┘ │   │       │  │  │      │  (ffs-block) │
+     │              │      │   │       │  │  │      └─────────────┘
+     │       ┌──────▼────┐ │   │       │  │  │
+     │       │ ffs-alloc  │ │   │       │  │  │
+     │       └──────┬────┘ │   │       │  │  │
+     │              │      │   │       │  │  │
+  ┌──▼──────────┐  ┌▼─────▼┐  │  ┌────▼┐ │ ┌▼──────┐  ┌────────────┐
+  │  ffs-xattr  │  │extent │  │  │jrnl │ │ │repair │  │ ffs-inode  │
+  └─────────────┘  └───────┘  │  └─────┘ │ └───────┘  └──────┬─────┘
+                              │           │                   │
+                              │           │            ┌──────▼──────┐
+                              │           │            │   ffs-dir   │
+                              │           │            └─────────────┘
+                              │           │
+       ┌──────────────────────▼───────────┘
+       │   ffs-core  (orchestrates mvcc, ondisk, block, btrfs)
        └──┬───────┬───┘
           │       │
    ┌──────▼────┐  │  ┌────────────┐
    │  ffs-fuse  │  │  │    ffs     │  (public facade)
-   │(ffs-core)  │  │  │ (ffs-core) │
+   │ (ffs-core) │  │  │ (ffs-core) │
    └────────────┘  │  └──┬───┬────┘
                    │     │   │
            ┌───────┘     │   └────────┐
@@ -79,7 +81,7 @@
     └─────────┘  └────────────┘ └────────────┘
 ```
 
-> **Note:** `ffs-fuse` depends on `ffs-core` (which orchestrates domain crates), NOT on domain crates directly. This is the canonical layering — ffs-core is the integration point, ffs-fuse is a thin FUSE protocol adapter. `ffs-mvcc` is currently standalone (depends only on `ffs-types`, `serde`, `thiserror`) — it will gain `ffs-block` and `ffs-journal` dependencies as block-backed versioning is implemented.
+> **Note:** `ffs-fuse` depends on `ffs-core` (which orchestrates domain crates), NOT on domain crates directly. This is the canonical layering — ffs-core is the integration point, ffs-fuse is a thin FUSE protocol adapter. `ffs-mvcc` now depends on `ffs-block` for versioned block storage (MvccBlockDevice wraps a BlockDevice to provide snapshot-isolated reads/writes). `ffs-core` depends on `ffs-btrfs` for btrfs root tree walking during format detection and multi-format support.
 
 ---
 
@@ -88,6 +90,21 @@
 ### 3.1 Storage Traits
 
 ```rust
+/// Byte-addressed device for fixed-offset I/O (pread/pwrite semantics).
+pub trait ByteDevice: Send + Sync {
+    /// Total length in bytes.
+    fn len_bytes(&self) -> u64;
+
+    /// Read exactly `buf.len()` bytes from `offset` into `buf`.
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()>;
+
+    /// Write all bytes in `buf` to `offset`.
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()>;
+
+    /// Flush pending writes to stable storage.
+    fn sync(&self, cx: &Cx) -> Result<()>;
+}
+
 /// Low-level block device abstraction.
 pub trait BlockDevice: Send + Sync {
     /// Read a single block. Returns owned block data.
@@ -145,6 +162,12 @@ pub trait MvccBlockManager: Send + Sync {
 
     /// Garbage-collect versions no longer visible to any active transaction.
     fn gc(&self, cx: &Cx) -> Result<GcStats>;
+
+    /// Current global commit sequence (used to form snapshots).
+    fn current_commit_seq(&self) -> CommitSeq;
+
+    /// Number of active transactions (used for observability/backpressure).
+    fn active_transaction_count(&self) -> usize;
 }
 ```
 
@@ -196,7 +219,7 @@ pub trait RepairManager: Send + Sync {
 ## 4. Layering Rules
 
 1. **Parser crates are pure.** `ffs-ondisk` performs no I/O — it parses byte slices into typed structures.
-2. **MVCC is transport-agnostic.** `ffs-mvcc` knows nothing about FUSE, files, or directories.
+2. **MVCC is transport-agnostic.** `ffs-mvcc` operates on blocks, not files or directories. It depends on `ffs-block` for versioned block storage but has no knowledge of FUSE, inodes, or directory entries.
 3. **FUSE adapter delegates to ffs-core.** `ffs-fuse` maps FUSE protocol to `ffs-core::FrankenFsEngine` — it contains no filesystem logic and does not depend on domain crates directly.
 4. **Repair is orthogonal.** `ffs-repair` operates on blocks, not files. It doesn't know about inodes or directories.
 5. **Harness depends on everything.** `ffs-harness` may use any internal crate. No production crate depends on harness.
@@ -226,15 +249,15 @@ pub trait RepairManager: Send + Sync {
 | Widget library | Live dashboard widgets for cache stats, MVCC metrics, repair status |
 | Event loop | TUI refresh loop integrated with filesystem event notifications |
 
-### 5.3 fuser (planned — not yet in workspace dependencies)
+### 5.3 fuser
 
 | Feature | Usage |
 |---------|-------|
-| `Filesystem` trait | `ffs-fuse` will implement this trait to serve FUSE requests (Phase 7) |
-| `MountOption` | Mount configuration (read-only, allow_other, direct_io) |
-| `Session` | FUSE session lifecycle management in `ffs-core` |
+| `Filesystem` trait | `ffs-fuse` implements this trait to serve FUSE requests |
+| `MountOption` | Mount configuration (read-only, allow_other, auto_unmount) |
+| `Session` | FUSE session lifecycle management |
 
-> **Status:** `fuser` is not yet listed in `Cargo.toml` workspace dependencies. It will be added when `ffs-fuse` progresses past scaffolding (Phase 7). Currently, `ffs-fuse` defines its own `FuseBackend` trait and `FrankenFuseMount` that returns `NotImplemented`.
+> **Status:** `fuser` is a workspace dependency. `ffs-fuse` implements the `fuser::Filesystem` trait for read-only ext4 mounts via `ffs mount`. Write support and btrfs mount are Phase 7+ work.
 
 ---
 
