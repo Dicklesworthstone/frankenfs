@@ -71,16 +71,83 @@ pub fn percentage(implemented: u32, total: u32) -> f64 {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SparseFixture {
     pub size: usize,
     pub writes: Vec<FixtureWrite>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixtureWrite {
     pub offset: usize,
     pub hex: String,
+}
+
+impl SparseFixture {
+    /// Create a sparse fixture from raw bytes by extracting non-zero regions.
+    ///
+    /// Scans `data` for contiguous runs of non-zero bytes and records each run
+    /// as a `FixtureWrite`. Zero-filled regions are omitted since the loader
+    /// starts with an all-zero buffer.
+    #[must_use]
+    pub fn from_bytes(data: &[u8]) -> Self {
+        let mut writes = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            // Skip zero bytes.
+            if data[i] == 0 {
+                i += 1;
+                continue;
+            }
+            // Found a non-zero byte — scan for the end of the non-zero run.
+            let start = i;
+            while i < data.len() && data[i] != 0 {
+                i += 1;
+            }
+            writes.push(FixtureWrite {
+                offset: start,
+                hex: hex::encode(&data[start..i]),
+            });
+        }
+        Self {
+            size: data.len(),
+            writes,
+        }
+    }
+
+    /// Create a sparse fixture from a byte range within a larger image.
+    ///
+    /// Extracts `data[offset..offset+len]` and adjusts write offsets so they
+    /// are relative to the start of the extracted region.
+    #[must_use]
+    pub fn from_region(data: &[u8], offset: usize, len: usize) -> Self {
+        let end = (offset + len).min(data.len());
+        let region = &data[offset.min(data.len())..end];
+        Self::from_bytes(region)
+    }
+
+    /// Round-trip: expand this fixture into a fully materialized byte buffer.
+    pub fn materialize(&self) -> Result<Vec<u8>> {
+        let mut bytes = vec![0_u8; self.size];
+        for write in &self.writes {
+            let payload = hex::decode(&write.hex)
+                .with_context(|| format!("invalid hex at offset {}", write.offset))?;
+            let end = write
+                .offset
+                .checked_add(payload.len())
+                .context("fixture offset overflow")?;
+            if end > bytes.len() {
+                bail!(
+                    "fixture write out of bounds: offset={} payload={} size={}",
+                    write.offset,
+                    payload.len(),
+                    bytes.len()
+                );
+            }
+            bytes[write.offset..end].copy_from_slice(&payload);
+        }
+        Ok(bytes)
+    }
 }
 
 pub fn load_sparse_fixture(path: &Path) -> Result<Vec<u8>> {
@@ -111,6 +178,59 @@ pub fn load_sparse_fixture(path: &Path) -> Result<Vec<u8>> {
     }
 
     Ok(bytes)
+}
+
+/// Extract an ext4 superblock sparse fixture from a raw image.
+///
+/// Reads the 1024 bytes at offset 1024 (the ext4 superblock location),
+/// validates it parses, and returns a `SparseFixture`.
+pub fn extract_ext4_superblock(image: &[u8]) -> Result<SparseFixture> {
+    let offset = ffs_types::EXT4_SUPERBLOCK_OFFSET;
+    let size = ffs_types::EXT4_SUPERBLOCK_SIZE;
+    if image.len() < offset + size {
+        bail!(
+            "image too small for ext4 superblock: need {} bytes, got {}",
+            offset + size,
+            image.len()
+        );
+    }
+    // Validate it parses.
+    let _sb = Ext4Superblock::parse_superblock_region(&image[offset..offset + size])
+        .context("region does not contain a valid ext4 superblock")?;
+    Ok(SparseFixture::from_bytes(&image[offset..offset + size]))
+}
+
+/// Extract a btrfs superblock sparse fixture from a raw image.
+///
+/// Reads the 4096 bytes at offset 65536 (the btrfs superblock location),
+/// validates it parses, and returns a `SparseFixture`.
+pub fn extract_btrfs_superblock(image: &[u8]) -> Result<SparseFixture> {
+    let offset = ffs_types::BTRFS_SUPER_INFO_OFFSET;
+    let size = ffs_types::BTRFS_SUPER_INFO_SIZE;
+    if image.len() < offset + size {
+        bail!(
+            "image too small for btrfs superblock: need {} bytes, got {}",
+            offset + size,
+            image.len()
+        );
+    }
+    let _sb = BtrfsSuperblock::parse_superblock_region(&image[offset..offset + size])
+        .context("region does not contain a valid btrfs superblock")?;
+    Ok(SparseFixture::from_bytes(&image[offset..offset + size]))
+}
+
+/// Extract a sparse fixture from an arbitrary byte range in an image.
+///
+/// This is the general-purpose version: specify `offset` and `len` to capture
+/// any metadata structure (group descriptor, inode, directory block, etc.).
+pub fn extract_region(image: &[u8], offset: usize, len: usize) -> Result<SparseFixture> {
+    if offset.saturating_add(len) > image.len() {
+        bail!(
+            "region out of bounds: offset={offset} len={len} image_len={}",
+            image.len()
+        );
+    }
+    Ok(SparseFixture::from_bytes(&image[offset..offset + len]))
 }
 
 pub fn validate_ext4_fixture(path: &Path) -> Result<Ext4Superblock> {
@@ -349,6 +469,79 @@ mod tests {
             .parse()
             .ok()?;
         Some((domain.to_lowercase(), implemented, total))
+    }
+
+    // ── Fixture generation tests ──────────────────────────────────────
+
+    #[test]
+    fn sparse_fixture_from_bytes_round_trips() {
+        let original = vec![0, 0, 0xAA, 0xBB, 0, 0, 0xCC, 0, 0];
+        let fixture = SparseFixture::from_bytes(&original);
+        assert_eq!(fixture.size, 9);
+        assert_eq!(fixture.writes.len(), 2);
+        assert_eq!(fixture.writes[0].offset, 2);
+        assert_eq!(fixture.writes[0].hex, "aabb");
+        assert_eq!(fixture.writes[1].offset, 6);
+        assert_eq!(fixture.writes[1].hex, "cc");
+
+        // Round-trip: materialize should produce identical bytes.
+        let materialized = fixture.materialize().expect("materialize");
+        assert_eq!(materialized, original);
+    }
+
+    #[test]
+    fn sparse_fixture_from_bytes_all_zero() {
+        let zeroes = vec![0_u8; 1024];
+        let fixture = SparseFixture::from_bytes(&zeroes);
+        assert_eq!(fixture.size, 1024);
+        assert!(fixture.writes.is_empty());
+        let materialized = fixture.materialize().expect("materialize");
+        assert_eq!(materialized, zeroes);
+    }
+
+    #[test]
+    fn sparse_fixture_from_bytes_all_nonzero() {
+        let data = vec![0xFF_u8; 16];
+        let fixture = SparseFixture::from_bytes(&data);
+        assert_eq!(fixture.writes.len(), 1);
+        assert_eq!(fixture.writes[0].offset, 0);
+        assert_eq!(fixture.writes[0].hex, "ff".repeat(16));
+    }
+
+    #[test]
+    fn sparse_fixture_json_round_trip() {
+        let original = vec![0, 0x42, 0, 0, 0xDE, 0xAD, 0, 0];
+        let fixture = SparseFixture::from_bytes(&original);
+        let json = serde_json::to_string_pretty(&fixture).expect("serialize");
+        let parsed: SparseFixture = serde_json::from_str(&json).expect("deserialize");
+        let materialized = parsed.materialize().expect("materialize");
+        assert_eq!(materialized, original);
+    }
+
+    #[test]
+    fn extract_region_basic() {
+        let data = vec![0, 0, 0xAA, 0xBB, 0xCC, 0, 0, 0, 0xDD, 0];
+        let fixture = extract_region(&data, 2, 4).expect("extract_region");
+        assert_eq!(fixture.size, 4);
+        let materialized = fixture.materialize().expect("materialize");
+        assert_eq!(materialized, vec![0xAA, 0xBB, 0xCC, 0]);
+    }
+
+    #[test]
+    fn extract_region_out_of_bounds() {
+        let data = vec![0; 10];
+        assert!(extract_region(&data, 8, 5).is_err());
+    }
+
+    #[test]
+    fn existing_fixture_round_trips_through_generation() {
+        // Load an existing fixture, materialize it, generate a new fixture from
+        // the materialized bytes, and verify the result is equivalent.
+        let path = fixture_path("ext4_superblock_sparse.json");
+        let original_data = load_sparse_fixture(&path).expect("load fixture");
+        let generated = SparseFixture::from_bytes(&original_data);
+        let regenerated_data = generated.materialize().expect("materialize");
+        assert_eq!(original_data, regenerated_data);
     }
 
     #[test]
