@@ -11,9 +11,10 @@ ffs-types = { workspace = true }
 ffs-error = { workspace = true }
 ffs-block = { workspace = true }
 asupersync = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
 
 [dev-dependencies]
-crc32c = { workspace = true }
 parking_lot = { workspace = true }
 
 [lints]

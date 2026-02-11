@@ -6,3 +6,4 @@
 //! corrupted blocks from repair symbols, and runs background scrub passes.
 
 pub mod scrub;
+pub mod symbol;
