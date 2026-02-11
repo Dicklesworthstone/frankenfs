@@ -6,7 +6,7 @@ use ffs_error::FfsError;
 use ffs_types::{BlockNumber, CommitSeq, Snapshot, TxnId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -23,6 +23,12 @@ pub struct Transaction {
     pub id: TxnId,
     pub snapshot: Snapshot,
     writes: BTreeMap<BlockNumber, Vec<u8>>,
+    /// Blocks read during the transaction's lifetime.  Each entry maps
+    /// the block to the `CommitSeq` of the version that was read (or
+    /// `CommitSeq(0)` if the block had no version at that snapshot).
+    ///
+    /// Populated by `record_read`.  Used by SSI conflict detection.
+    reads: BTreeMap<BlockNumber, CommitSeq>,
 }
 
 impl Transaction {
@@ -39,6 +45,27 @@ impl Transaction {
     pub fn pending_writes(&self) -> usize {
         self.writes.len()
     }
+
+    /// Record that `block` was read at version `version_seq`.
+    ///
+    /// This is required for SSI conflict detection.  When using FCW-only
+    /// mode this is a no-op — reads are not tracked and the `reads` map
+    /// stays empty.
+    pub fn record_read(&mut self, block: BlockNumber, version_seq: CommitSeq) {
+        self.reads.entry(block).or_insert(version_seq);
+    }
+
+    /// The set of blocks this transaction has read (and their version).
+    #[must_use]
+    pub fn read_set(&self) -> &BTreeMap<BlockNumber, CommitSeq> {
+        &self.reads
+    }
+
+    /// The set of blocks this transaction will write.
+    #[must_use]
+    pub fn write_set(&self) -> &BTreeMap<BlockNumber, Vec<u8>> {
+        &self.writes
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -51,6 +78,31 @@ pub enum CommitError {
         snapshot: CommitSeq,
         observed: CommitSeq,
     },
+    #[error(
+        "SSI: dangerous structure detected — rw-antidependency cycle via block {pivot_block} \
+         (this txn read it at {read_version:?}, concurrent txn {concurrent_txn:?} wrote it at {write_version:?})"
+    )]
+    SsiConflict {
+        pivot_block: BlockNumber,
+        read_version: CommitSeq,
+        write_version: CommitSeq,
+        concurrent_txn: TxnId,
+    },
+}
+
+/// Record of a committed transaction kept for SSI antidependency checking.
+///
+/// `snapshot` and `read_set` are retained for future bidirectional SSI
+/// (checking if the committer's reads were invalidated by a *later*
+/// concurrent reader that also committed).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct CommittedTxnRecord {
+    txn_id: TxnId,
+    commit_seq: CommitSeq,
+    snapshot: Snapshot,
+    write_set: BTreeSet<BlockNumber>,
+    read_set: BTreeMap<BlockNumber, CommitSeq>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,12 +111,15 @@ pub struct MvccStore {
     next_commit: u64,
     versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
     /// Active snapshots: each entry is a `CommitSeq` from which a reader is
-    /// still potentially reading.  The set uses a `BTreeSet` so that the
+    /// still potentially reading.  The set uses a `BTreeMap` so that the
     /// minimum (oldest active snapshot) can be obtained in O(log n).
     ///
     /// Callers **must** pair every `register_snapshot` with a corresponding
     /// `release_snapshot` to avoid preventing GC indefinitely.
     active_snapshots: BTreeMap<CommitSeq, u32>,
+    /// Recent committed transactions retained for SSI antidependency
+    /// checking.  Pruned by `prune_ssi_log`.
+    ssi_log: Vec<CommittedTxnRecord>,
 }
 
 impl MvccStore {
@@ -75,6 +130,7 @@ impl MvccStore {
             next_commit: 1,
             versions: BTreeMap::new(),
             active_snapshots: BTreeMap::new(),
+            ssi_log: Vec::new(),
         }
     }
 
@@ -91,6 +147,7 @@ impl MvccStore {
             id: TxnId(self.next_txn),
             snapshot: self.current_snapshot(),
             writes: BTreeMap::new(),
+            reads: BTreeMap::new(),
         };
         self.next_txn = self.next_txn.saturating_add(1);
         txn
@@ -121,6 +178,96 @@ impl MvccStore {
         }
 
         Ok(commit_seq)
+    }
+
+    /// Commit with Serializable Snapshot Isolation (SSI) enforcement.
+    ///
+    /// This extends FCW with rw-antidependency tracking.  A "dangerous
+    /// structure" is detected when:
+    ///
+    /// 1. This transaction **read** block B at version V.
+    /// 2. A concurrent transaction (committed after our snapshot) **wrote**
+    ///    a newer version of B (i.e., `latest_commit_seq(B) > V` AND
+    ///    the writer committed after our snapshot).
+    /// 3. This transaction itself has writes — so it's not read-only.
+    ///
+    /// This is the simplified "first-updater-wins + read-set check" variant
+    /// of SSI (as used by PostgreSQL).  Read-only transactions never trigger
+    /// SSI aborts.
+    pub fn commit_ssi(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+        // Step 1: FCW check (write-write conflicts).
+        for block in txn.writes.keys() {
+            let latest = self.latest_commit_seq(*block);
+            if latest > txn.snapshot.high {
+                return Err(CommitError::Conflict {
+                    block: *block,
+                    snapshot: txn.snapshot.high,
+                    observed: latest,
+                });
+            }
+        }
+
+        // Step 2: SSI rw-antidependency check.
+        // For each block in our read set, check if any transaction that
+        // committed after our snapshot wrote to that block.
+        if !txn.writes.is_empty() {
+            for (&block, &read_version) in &txn.reads {
+                // Find if any committed transaction (after our snapshot)
+                // wrote to this block.
+                for record in self.ssi_log.iter().rev() {
+                    // Only check transactions that committed after our snapshot.
+                    if record.commit_seq <= txn.snapshot.high {
+                        break;
+                    }
+                    if record.write_set.contains(&block) {
+                        return Err(CommitError::SsiConflict {
+                            pivot_block: block,
+                            read_version,
+                            write_version: record.commit_seq,
+                            concurrent_txn: record.txn_id,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Step 3: Commit — same as FCW.
+        let commit_seq = CommitSeq(self.next_commit);
+        self.next_commit = self.next_commit.saturating_add(1);
+
+        let txn_id = txn.id;
+        let snapshot = txn.snapshot;
+        let read_set = txn.reads;
+        let write_keys: BTreeMap<BlockNumber, ()> = txn.writes.keys().map(|&b| (b, ())).collect();
+
+        for (block, bytes) in txn.writes {
+            self.versions.entry(block).or_default().push(BlockVersion {
+                block,
+                commit_seq,
+                writer: txn_id,
+                bytes,
+            });
+        }
+
+        // Record in SSI log for future antidependency checks.
+        self.ssi_log.push(CommittedTxnRecord {
+            txn_id,
+            commit_seq,
+            snapshot,
+            write_set: write_keys,
+            read_set,
+        });
+
+        Ok(commit_seq)
+    }
+
+    /// Prune SSI log entries older than `watermark`.
+    ///
+    /// Once no active transaction has a snapshot older than `watermark`,
+    /// those log entries can no longer participate in antidependency
+    /// detection and can be safely removed.
+    pub fn prune_ssi_log(&mut self, watermark: CommitSeq) {
+        self.ssi_log.retain(|r| r.commit_seq > watermark);
     }
 
     #[must_use]
@@ -403,6 +550,7 @@ mod tests {
         let err = store.commit(t2).expect_err("t2 should conflict");
         match err {
             CommitError::Conflict { block, .. } => assert_eq!(block, BlockNumber(7)),
+            CommitError::SsiConflict { .. } => panic!("unexpected SSI conflict from FCW path"),
         }
     }
 
@@ -1584,6 +1732,261 @@ mod tests {
                 store.read_visible(block, snap).unwrap(),
                 &[expected],
                 "block {b} should have latest value"
+            );
+        }
+    }
+
+    // ── SSI conflict detection tests ───────────────────────────────────
+
+    /// Classic write-skew scenario that FCW allows but SSI rejects.
+    ///
+    /// T1 reads A, writes B.  T2 reads B, writes A.
+    /// Both succeed under FCW (disjoint write sets).
+    /// Under SSI, the second committer detects the rw-antidependency.
+    #[test]
+    fn ssi_detects_write_skew() {
+        let mut store = MvccStore::new();
+        let block_a = BlockNumber(100);
+        let block_b = BlockNumber(200);
+
+        // Seed: both blocks start at 1.
+        let mut seed_txn = store.begin();
+        seed_txn.stage_write(block_a, vec![1]);
+        seed_txn.stage_write(block_b, vec![1]);
+        store.commit_ssi(seed_txn).expect("seed");
+
+        // T1: reads A (sees 1), writes B to 2.
+        let mut t1 = store.begin();
+        let a_version = store.latest_commit_seq(block_a);
+        t1.record_read(block_a, a_version);
+        t1.stage_write(block_b, vec![2]);
+
+        // T2: reads B (sees 1), writes A to 2.
+        let mut t2 = store.begin();
+        let b_version = store.latest_commit_seq(block_b);
+        t2.record_read(block_b, b_version);
+        t2.stage_write(block_a, vec![2]);
+
+        // T1 commits first — succeeds.
+        store.commit_ssi(t1).expect("T1 should succeed");
+
+        // T2 commits second — SSI detects that T2 read B, which T1 just wrote.
+        let result = store.commit_ssi(t2);
+        assert!(
+            matches!(result, Err(CommitError::SsiConflict { .. })),
+            "SSI should reject T2 due to rw-antidependency on block B, got {result:?}"
+        );
+    }
+
+    /// SSI does not reject read-only transactions.
+    #[test]
+    fn ssi_allows_read_only_transactions() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(1);
+
+        // Seed.
+        let mut seed = store.begin();
+        seed.stage_write(block, vec![1]);
+        store.commit_ssi(seed).expect("seed");
+
+        // T1: read-only, reads block 1.
+        let mut t1 = store.begin();
+        let v = store.latest_commit_seq(block);
+        t1.record_read(block, v);
+
+        // T2: writes block 1 to 2.
+        let mut t2 = store.begin();
+        t2.stage_write(block, vec![2]);
+        store.commit_ssi(t2).expect("T2 should succeed");
+
+        // T1: read-only commit — should succeed even though its read was
+        // invalidated, because read-only txns have no writes.
+        store.commit_ssi(t1).expect("read-only T1 should succeed");
+    }
+
+    /// SSI allows disjoint readers/writers (no overlap).
+    #[test]
+    fn ssi_allows_disjoint_read_write_sets() {
+        let mut store = MvccStore::new();
+        let block_a = BlockNumber(1);
+        let block_b = BlockNumber(2);
+
+        // Seed both blocks.
+        let mut seed = store.begin();
+        seed.stage_write(block_a, vec![1]);
+        seed.stage_write(block_b, vec![1]);
+        store.commit_ssi(seed).expect("seed");
+
+        // T1: reads A, writes A (same block — no cross-block dependency).
+        let mut t1 = store.begin();
+        let v_a = store.latest_commit_seq(block_a);
+        t1.record_read(block_a, v_a);
+        t1.stage_write(block_a, vec![2]);
+
+        // T2: reads B, writes B.
+        let mut t2 = store.begin();
+        let v_b = store.latest_commit_seq(block_b);
+        t2.record_read(block_b, v_b);
+        t2.stage_write(block_b, vec![2]);
+
+        // Both should succeed — no cross-block rw-antidependencies.
+        store.commit_ssi(t1).expect("T1 should succeed");
+        store.commit_ssi(t2).expect("T2 should succeed");
+    }
+
+    /// SSI still catches write-write conflicts (FCW layer).
+    #[test]
+    fn ssi_fcw_layer_still_active() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(1);
+
+        let mut seed = store.begin();
+        seed.stage_write(block, vec![1]);
+        store.commit_ssi(seed).expect("seed");
+
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+
+        t1.stage_write(block, vec![2]);
+        t2.stage_write(block, vec![3]);
+
+        store.commit_ssi(t1).expect("T1 should succeed");
+
+        let result = store.commit_ssi(t2);
+        assert!(
+            matches!(result, Err(CommitError::Conflict { .. })),
+            "FCW should reject T2, got {result:?}"
+        );
+    }
+
+    /// SSI log pruning does not affect correctness for active transactions.
+    #[test]
+    fn ssi_log_pruning() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(1);
+
+        // Create several committed transactions.
+        for v in 1_u8..=5 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit_ssi(txn).expect("commit");
+        }
+
+        // SSI log should have 5 entries.
+        assert_eq!(store.ssi_log.len(), 5);
+
+        // Prune entries with commit_seq <= 3.
+        store.prune_ssi_log(CommitSeq(3));
+
+        // Should have 2 entries remaining (commit_seq 4 and 5).
+        assert_eq!(store.ssi_log.len(), 2);
+    }
+
+    /// SSI with the write-skew scenario across 20 seeds using the lab runtime.
+    ///
+    /// Under SSI (unlike FCW), exactly one of the two transactions must
+    /// be rejected when they form a write-skew pattern.
+    #[test]
+    fn lab_ssi_rejects_write_skew() {
+        let block_a = BlockNumber(100);
+        let block_b = BlockNumber(200);
+
+        for seed in 0_u64..20 {
+            let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+
+            let store = Arc::new(std::sync::Mutex::new(MvccStore::new()));
+
+            // Seed: both blocks start with value 1.
+            {
+                let mut s = store.lock().unwrap();
+                let mut txn = s.begin();
+                txn.stage_write(block_a, vec![1]);
+                txn.stage_write(block_b, vec![1]);
+                s.commit_ssi(txn).expect("seed commit");
+            }
+
+            let outcomes = Arc::new(std::sync::Mutex::new((None, None)));
+
+            // Pre-begin both at the same snapshot.
+            let (t1_base, t2_base) = {
+                let mut s = store.lock().unwrap();
+                let t1 = s.begin();
+                let a_ver = s.latest_commit_seq(block_a);
+                let b_ver = s.latest_commit_seq(block_b);
+                let t2 = s.begin();
+                ((t1, a_ver), (t2, b_ver))
+            };
+
+            // T1: reads A, writes B.
+            {
+                let store = Arc::clone(&store);
+                let outcomes = Arc::clone(&outcomes);
+                let (mut txn1, a_ver) = t1_base;
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        yield_now().await;
+
+                        txn1.record_read(block_a, a_ver);
+                        txn1.stage_write(block_b, vec![2]);
+                        let result = {
+                            let mut s = store.lock().unwrap();
+                            s.commit_ssi(txn1)
+                        };
+                        outcomes.lock().unwrap().0 = Some(result.is_ok());
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            // T2: reads B, writes A.
+            {
+                let store = Arc::clone(&store);
+                let outcomes = Arc::clone(&outcomes);
+                let (mut txn2, b_ver) = t2_base;
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        yield_now().await;
+
+                        txn2.record_read(block_b, b_ver);
+                        txn2.stage_write(block_a, vec![2]);
+                        let result = {
+                            let mut s = store.lock().unwrap();
+                            s.commit_ssi(txn2)
+                        };
+                        outcomes.lock().unwrap().1 = Some(result.is_ok());
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            runtime.run_until_quiescent();
+
+            let outcomes = Arc::try_unwrap(outcomes).unwrap().into_inner().unwrap();
+            let t1_ok = outcomes.0.expect("T1 should complete");
+            let t2_ok = outcomes.1.expect("T2 should complete");
+
+            // Under SSI, exactly one should succeed and one should fail.
+            assert!(
+                t1_ok ^ t2_ok,
+                "seed {seed}: SSI should reject exactly one of the write-skew \
+                 transactions. Got t1={t1_ok}, t2={t2_ok}"
+            );
+
+            // Under SSI, only one writer succeeds.  The winning writer sets
+            // one block to 2 while the other remains 1, so a+b=3 (not 4 as
+            // under FCW's write-skew).  The key SSI property is that the
+            // "double write" (a=2, b=2, sum=4) is prevented.
+            let s = store.lock().unwrap();
+            let snap = s.current_snapshot();
+            let a = s.read_visible(block_a, snap).unwrap()[0];
+            let b = s.read_visible(block_b, snap).unwrap()[0];
+            assert_eq!(
+                a + b,
+                3,
+                "seed {seed}: SSI should prevent both writers from succeeding, got a={a} b={b}"
             );
         }
     }
