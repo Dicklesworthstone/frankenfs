@@ -1097,7 +1097,9 @@ impl DirEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RequestOp {
     Getattr,
+    Getxattr,
     Lookup,
+    Listxattr,
     Open,
     Opendir,
     Read,

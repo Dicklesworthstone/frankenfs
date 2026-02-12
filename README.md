@@ -354,8 +354,8 @@ FrankenFS is in **early development**. The workspace compiles, on-disk parsing a
 | btrfs metadata parsing | 35.0% (7/20) |
 | MVCC/COW core | 28.6% (4/14) |
 | FUSE surface | 50.0% (6/12) |
-| Self-healing durability | 20.0% (2/10) |
-| **Overall** | **37.3% (28/75)** |
+| Self-healing durability | 30.0% (3/10) |
+| **Overall** | **38.7% (29/75)** |
 
 ### What Works Today
 
@@ -393,7 +393,7 @@ See [COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1
 - **Nightly Rust required.** Edition 2024 features require the nightly toolchain.
 - **No write path.** Current parsing is read-only. Write-path MVCC and journaling are in progress.
 - **External dependencies.** Requires `asupersync` and `ftui` as sibling project checkouts (not yet published to crates.io).
-- **Legacy reference corpus not included.** The ~26MB Linux kernel ext4/btrfs source (`legacy_ext4_and_btrfs_code/`) used for behavioral extraction is gitignored. The extracted behavior is fully captured in [EXISTING_EXT4_BTRFS_STRUCTURE.md](EXISTING_EXT4_BTRFS_STRUCTURE.md).
+- **Legacy reference corpus is checked in.** The Linux kernel ext4/btrfs source used for behavioral extraction is available under `legacy_ext4_and_btrfs_code/linux-fs/`. The extracted behavior is fully captured in [EXISTING_EXT4_BTRFS_STRUCTURE.md](EXISTING_EXT4_BTRFS_STRUCTURE.md).
 
 ---
 
@@ -439,7 +439,7 @@ FrankenFS was designed by extracting behavior from Linux kernel v6.19 filesystem
 - **ext4** — superblock, inode, extent tree, journal (JBD2), block allocation (mballoc)
 - **btrfs** — B-tree, transaction, delayed refs, scrub, extent allocation
 
-The raw kernel source is not included in this repository (gitignored). All extracted behavioral contracts are captured in [EXISTING_EXT4_BTRFS_STRUCTURE.md](EXISTING_EXT4_BTRFS_STRUCTURE.md) (95KB).
+The legacy kernel source corpus is present in this repository under `legacy_ext4_and_btrfs_code/linux-fs/`. All extracted behavioral contracts are captured in [EXISTING_EXT4_BTRFS_STRUCTURE.md](EXISTING_EXT4_BTRFS_STRUCTURE.md) (95KB).
 
 ---
 

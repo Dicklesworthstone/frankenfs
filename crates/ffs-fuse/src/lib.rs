@@ -11,7 +11,7 @@ use ffs_error::FfsError;
 use ffs_types::InodeNumber;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyOpen, Request,
+    ReplyDirectory, ReplyEntry, ReplyOpen, ReplyXattr, Request,
 };
 use std::ffi::OsStr;
 use std::os::raw::c_int;
@@ -96,9 +96,16 @@ impl Default for MountOptions {
 ///
 /// Unimplemented operations return `ENOSYS` via fuser's default method
 /// implementations. Only `getattr`, `lookup`, `readdir`, `open`, `opendir`,
-/// `read`, and `readlink` are overridden.
+/// `read`, `readlink`, `listxattr`, and `getxattr` are overridden.
 pub struct FrankenFuse {
     ops: Box<dyn FsOps>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XattrReplyPlan {
+    Size(u32),
+    Data,
+    Error(c_int),
 }
 
 impl FrankenFuse {
@@ -130,6 +137,47 @@ impl FrankenFuse {
 
     fn reply_error_dir(err: &FfsError, reply: ReplyDirectory) {
         reply.error(err.to_errno());
+    }
+
+    fn reply_error_xattr(err: &FfsError, reply: ReplyXattr) {
+        reply.error(err.to_errno());
+    }
+
+    fn classify_xattr_reply(size: u32, payload_len: usize) -> XattrReplyPlan {
+        match u32::try_from(payload_len) {
+            Ok(payload_len_u32) if size == 0 => XattrReplyPlan::Size(payload_len_u32),
+            Ok(payload_len_u32) if payload_len_u32 <= size => XattrReplyPlan::Data,
+            Ok(_) => XattrReplyPlan::Error(libc::ERANGE),
+            Err(_) => XattrReplyPlan::Error(libc::EOVERFLOW),
+        }
+    }
+
+    fn reply_xattr_payload(size: u32, payload: &[u8], reply: ReplyXattr) {
+        match Self::classify_xattr_reply(size, payload.len()) {
+            XattrReplyPlan::Size(payload_len) => reply.size(payload_len),
+            XattrReplyPlan::Data => reply.data(payload),
+            XattrReplyPlan::Error(errno) => reply.error(errno),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const fn missing_xattr_errno() -> c_int {
+        libc::ENODATA
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn missing_xattr_errno() -> c_int {
+        libc::ENOATTR
+    }
+
+    fn encode_xattr_names(names: &[String]) -> Vec<u8> {
+        let total_len = names.iter().map(|name| name.len() + 1).sum();
+        let mut bytes = Vec::with_capacity(total_len);
+        for name in names {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+        bytes
     }
 
     fn with_request_scope<T, F>(&self, cx: &Cx, op: RequestOp, f: F) -> ffs_error::Result<T>
@@ -279,6 +327,47 @@ impl Filesystem for FrankenFuse {
             Err(e) => {
                 warn!(ino, error = %e, "readlink failed");
                 Self::reply_error_data(&e, reply);
+            }
+        }
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Getxattr, |cx| {
+            self.ops.getxattr(cx, InodeNumber(ino), name)
+        }) {
+            Ok(Some(value)) => Self::reply_xattr_payload(size, &value, reply),
+            Ok(None) => reply.error(Self::missing_xattr_errno()),
+            Err(e) => {
+                warn!(ino, xattr = name, error = %e, "getxattr failed");
+                Self::reply_error_xattr(&e, reply);
+            }
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Listxattr, |cx| {
+            self.ops.listxattr(cx, InodeNumber(ino))
+        }) {
+            Ok(names) => {
+                let payload = Self::encode_xattr_names(&names);
+                Self::reply_xattr_payload(size, &payload, reply);
+            }
+            Err(e) => {
+                warn!(ino, error = %e, "listxattr failed");
+                Self::reply_error_xattr(&e, reply);
             }
         }
     }
@@ -502,6 +591,62 @@ mod tests {
         let _fuse = FrankenFuse::new(Box::new(StubFs));
         // Verify the Cx creation helper works.
         let _cx = FrankenFuse::cx_for_request();
+    }
+
+    #[test]
+    fn encode_xattr_names_empty_is_empty_payload() {
+        let encoded = FrankenFuse::encode_xattr_names(&[]);
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn encode_xattr_names_produces_nul_separated_list() {
+        let encoded = FrankenFuse::encode_xattr_names(&[
+            "user.project".to_owned(),
+            "security.selinux".to_owned(),
+        ]);
+        assert_eq!(encoded, b"user.project\0security.selinux\0");
+    }
+
+    #[test]
+    fn classify_xattr_reply_size_probe_returns_size() {
+        assert_eq!(
+            FrankenFuse::classify_xattr_reply(0, 11),
+            XattrReplyPlan::Size(11)
+        );
+    }
+
+    #[test]
+    fn classify_xattr_reply_data_when_buffer_fits() {
+        assert_eq!(
+            FrankenFuse::classify_xattr_reply(64, 32),
+            XattrReplyPlan::Data
+        );
+    }
+
+    #[test]
+    fn classify_xattr_reply_erange_when_buffer_too_small() {
+        assert_eq!(
+            FrankenFuse::classify_xattr_reply(8, 32),
+            XattrReplyPlan::Error(libc::ERANGE)
+        );
+    }
+
+    #[test]
+    fn classify_xattr_reply_eoverflow_for_oversized_payload() {
+        assert_eq!(
+            FrankenFuse::classify_xattr_reply(0, usize::MAX),
+            XattrReplyPlan::Error(libc::EOVERFLOW)
+        );
+    }
+
+    #[test]
+    fn missing_xattr_errno_matches_platform() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(FrankenFuse::missing_xattr_errno(), libc::ENODATA);
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(FrankenFuse::missing_xattr_errno(), libc::ENOATTR);
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
