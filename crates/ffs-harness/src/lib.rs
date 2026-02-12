@@ -30,7 +30,7 @@ impl ParityReport {
     #[must_use]
     pub fn current() -> Self {
         let domains = vec![
-            CoverageDomain::new("ext4 metadata parsing", 9, 19),
+            CoverageDomain::new("ext4 metadata parsing", 10, 19),
             CoverageDomain::new("btrfs metadata parsing", 7, 20),
             CoverageDomain::new("MVCC/COW core", 4, 14),
             CoverageDomain::new("FUSE surface", 6, 12),

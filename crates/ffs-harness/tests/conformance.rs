@@ -111,6 +111,111 @@ fn btrfs_leaf_fixture_conforms() {
     }
 }
 
+/// btrfs item type constants for fixture validation
+mod btrfs_item_types {
+    pub const INODE_ITEM: u8 = 1;
+    pub const DIR_ITEM: u8 = 84;
+    pub const DIR_INDEX: u8 = 96;
+    pub const EXTENT_DATA: u8 = 108;
+    pub const ROOT_ITEM: u8 = 132;
+}
+
+/// Validate the fs-tree leaf fixture (bd-2jk.2 deliverable).
+///
+/// This fixture contains the minimum item types needed to support btrfs
+/// read-only operations: INODE_ITEM, DIR_ITEM, DIR_INDEX, EXTENT_DATA.
+#[test]
+fn btrfs_fstree_leaf_fixture_conforms() {
+    let (header, items) = validate_btrfs_leaf_fixture(&fixture_path("btrfs_fstree_leaf.json"))
+        .expect("btrfs fs-tree leaf fixture");
+
+    // Verify header
+    assert_eq!(header.level, 0, "should be a leaf");
+    assert_eq!(header.owner, 5, "owner should be FS_TREE (5)");
+    assert!(items.len() >= 5, "should have at least 5 items");
+
+    // Verify items are sorted
+    for pair in items.windows(2) {
+        let a = &pair[0].key;
+        let b = &pair[1].key;
+        assert!(
+            (a.objectid, a.item_type, a.offset) <= (b.objectid, b.item_type, b.offset),
+            "items should be sorted by key: {a:?} vs {b:?}"
+        );
+    }
+
+    // Verify required item types are present
+    let has_inode = items
+        .iter()
+        .any(|i| i.key.item_type == btrfs_item_types::INODE_ITEM);
+    let has_dir_item = items
+        .iter()
+        .any(|i| i.key.item_type == btrfs_item_types::DIR_ITEM);
+    let has_dir_index = items
+        .iter()
+        .any(|i| i.key.item_type == btrfs_item_types::DIR_INDEX);
+    let has_extent_data = items
+        .iter()
+        .any(|i| i.key.item_type == btrfs_item_types::EXTENT_DATA);
+
+    assert!(has_inode, "fixture should contain INODE_ITEM (type 1)");
+    assert!(has_dir_item, "fixture should contain DIR_ITEM (type 84)");
+    assert!(has_dir_index, "fixture should contain DIR_INDEX (type 96)");
+    assert!(
+        has_extent_data,
+        "fixture should contain EXTENT_DATA (type 108)"
+    );
+}
+
+/// Validate the root-tree leaf fixture (bd-2jk.2 deliverable).
+///
+/// This fixture contains ROOT_ITEM entries for the core btrfs trees,
+/// needed to bootstrap tree traversal from the superblock.
+#[test]
+fn btrfs_roottree_leaf_fixture_conforms() {
+    let (header, items) = validate_btrfs_leaf_fixture(&fixture_path("btrfs_roottree_leaf.json"))
+        .expect("btrfs root-tree leaf fixture");
+
+    // Verify header
+    assert_eq!(header.level, 0, "should be a leaf");
+    assert_eq!(header.owner, 1, "owner should be ROOT_TREE (1)");
+    assert!(items.len() >= 3, "should have at least 3 ROOT_ITEM entries");
+
+    // Verify items are sorted
+    for pair in items.windows(2) {
+        let a = &pair[0].key;
+        let b = &pair[1].key;
+        assert!(
+            (a.objectid, a.item_type, a.offset) <= (b.objectid, b.item_type, b.offset),
+            "items should be sorted by key: {a:?} vs {b:?}"
+        );
+    }
+
+    // All items should be ROOT_ITEM (type 132)
+    for item in &items {
+        assert_eq!(
+            item.key.item_type,
+            btrfs_item_types::ROOT_ITEM,
+            "root tree should only contain ROOT_ITEM entries"
+        );
+    }
+
+    // Should have entries for standard trees: EXTENT_TREE (2), CHUNK_TREE (3), FS_TREE (5)
+    let tree_ids: Vec<u64> = items.iter().map(|i| i.key.objectid).collect();
+    assert!(
+        tree_ids.contains(&2),
+        "should have ROOT_ITEM for EXTENT_TREE (2)"
+    );
+    assert!(
+        tree_ids.contains(&3),
+        "should have ROOT_ITEM for CHUNK_TREE (3)"
+    );
+    assert!(
+        tree_ids.contains(&5),
+        "should have ROOT_ITEM for FS_TREE (5)"
+    );
+}
+
 #[test]
 fn parity_report_totals_are_consistent() {
     let report = ParityReport::current();

@@ -92,6 +92,33 @@ fn run_debugfs_w(image: &Path, cmd: &str) {
     assert!(st.success(), "debugfs -w -R {cmd:?} failed");
 }
 
+/// Create an ext4 image without a journal (for tests that don't need journal replay).
+fn create_nojournal_image(image_path: &Path) -> PathBuf {
+    // Create 8MB zero file
+    let f = std::fs::File::create(image_path).expect("create image file");
+    f.set_len(8 * 1024 * 1024).expect("set image length");
+    drop(f);
+
+    // Format as ext4 without journal (-O ^has_journal)
+    let st = Command::new("mkfs.ext4")
+        .args([
+            "-L",
+            "ffs-nojournal",
+            "-b",
+            "4096",
+            "-q",
+            "-O",
+            "^has_journal",
+        ])
+        .arg(image_path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run mkfs.ext4");
+    assert!(st.success(), "mkfs.ext4 failed");
+
+    image_path.to_path_buf()
+}
+
 // ── Kernel tool output capture ──────────────────────────────────
 
 struct KernelSuperblock {
@@ -576,6 +603,63 @@ fn ffs_ondisk_matches_golden_json() {
             gfile.path
         );
     }
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+/// E2E: verify OpenFs bitmap-based free space counting matches kernel tools.
+///
+/// This test exercises the bitmap reading API (bd-1xe.2) by:
+/// 1. Creating an ext4 image with mkfs.ext4 (no journal to avoid replay issues)
+/// 2. Using OpenFs::free_space_summary() to count free blocks/inodes from bitmaps
+/// 3. Comparing against dumpe2fs output
+/// 4. Verifying that bitmap counts match group descriptor cached values
+#[test]
+fn ext4_bitmap_free_space_matches_kernel() {
+    use asupersync::Cx;
+    use ffs_core::OpenFs;
+
+    if !ext4_tools_available() {
+        eprintln!("SKIPPED: ext4 kernel tools not available");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join("ffs_bitmap_free_test.ext4");
+    // Create image without journal to avoid journal replay issues
+    create_nojournal_image(&tmp);
+
+    // Get kernel view via dumpe2fs
+    let kernel = capture_superblock(&tmp);
+
+    // Get FrankenFS view via OpenFs bitmap reading
+    let cx = Cx::for_request();
+    let open_fs = OpenFs::open(&cx, &tmp).expect("open ext4 image");
+    let summary = open_fs
+        .free_space_summary(&cx)
+        .expect("compute free space summary");
+
+    // Compare bitmap-derived counts against kernel tools
+    assert_eq!(
+        summary.free_blocks_total, kernel.free_blocks_count,
+        "bitmap free_blocks_total should match dumpe2fs"
+    );
+    assert_eq!(
+        summary.free_inodes_total,
+        u64::from(kernel.free_inodes_count),
+        "bitmap free_inodes_total should match dumpe2fs"
+    );
+
+    // Verify bitmap counts match group descriptor cached values (no corruption)
+    assert!(
+        !summary.blocks_mismatch,
+        "bitmap block count should match group descriptors: bitmap={}, gd={}",
+        summary.free_blocks_total, summary.gd_free_blocks_total
+    );
+    assert!(
+        !summary.inodes_mismatch,
+        "bitmap inode count should match group descriptors: bitmap={}, gd={}",
+        summary.free_inodes_total, summary.gd_free_inodes_total
+    );
 
     std::fs::remove_file(&tmp).ok();
 }
