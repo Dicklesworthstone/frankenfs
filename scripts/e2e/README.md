@@ -7,6 +7,12 @@ End-to-end smoke tests for FrankenFS that exercise user-facing workflows.
 ```bash
 # Run the main smoke test
 ./scripts/e2e/ffs_smoke.sh
+
+# Run ext4 read-write smoke + crash checks
+./scripts/e2e/ffs_ext4_rw_smoke.sh
+
+# Run write-back durability scenarios
+./scripts/e2e/ffs_writeback_e2e.sh
 ```
 
 ## What It Tests
@@ -23,6 +29,23 @@ The smoke test exercises:
    - List directory contents
    - Read file contents
    - Unmount cleanly
+
+The write-back E2E suite exercises:
+
+1. Basic flush correctness (1000 committed blocks)
+2. Clean shutdown flush-all behavior
+3. Simulated SIGKILL durability boundary (fsync vs non-fsync)
+4. Abort lifecycle discard behavior
+5. Backpressure under sustained write load
+6. Concurrent commit/abort transactions with daemon flush
+
+The ext4 read-write smoke suite exercises:
+
+1. Rootless fixture lifecycle: create `base.ext4`, copy to `work.ext4`, mount only the work image
+2. RW operations: create/write/overwrite, mkdir/rmdir, rename, unlink
+3. Metadata checks (phase-gated): chmod verification and mtime monotonicity
+4. Clean shutdown persistence: remount read-only and re-verify post-unmount state
+5. Best-effort crash phase: SIGKILL mount process, inspect image, and verify remount or explicit recovery diagnostic
 
 ## Output
 
@@ -47,6 +70,7 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 - `mkfs.ext4` and `debugfs` (e2fsprogs)
 - `/dev/fuse` accessible (for mount tests)
 - `fusermount` or `fusermount3` (for unmounting)
+- `mountpoint` utility (used for readiness checks)
 
 ## Skipping Mount Tests
 

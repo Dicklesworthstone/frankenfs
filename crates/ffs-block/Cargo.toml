@@ -15,6 +15,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+blake3 = { workspace = true }
 
 [[bench]]
 name = "arc_cache"
