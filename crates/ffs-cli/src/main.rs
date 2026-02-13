@@ -48,7 +48,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Mount a filesystem image via FUSE (read-only).
+    /// Mount a filesystem image via FUSE.
     Mount {
         /// Path to the filesystem image.
         image: PathBuf,
@@ -57,6 +57,9 @@ enum Command {
         /// Allow other users to access the mount.
         #[arg(long)]
         allow_other: bool,
+        /// Mount read-write (default is read-only).
+        #[arg(long)]
+        rw: bool,
     },
     /// Run a read-only integrity scan (scrub) on a filesystem image.
     Scrub {
@@ -144,7 +147,8 @@ fn run() -> Result<()> {
             image,
             mountpoint,
             allow_other,
-        } => mount_cmd(&image, &mountpoint, allow_other),
+            rw,
+        } => mount_cmd(&image, &mountpoint, allow_other, rw),
         Command::Scrub { image, json } => scrub_cmd(&image, json),
         Command::Parity { json } => parity(json),
         Command::Evidence {
@@ -287,34 +291,70 @@ fn inspect_ext4_output(
     })
 }
 
-fn mount_cmd(image_path: &PathBuf, mountpoint: &PathBuf, allow_other: bool) -> Result<()> {
+fn mount_cmd(
+    image_path: &PathBuf,
+    mountpoint: &PathBuf,
+    allow_other: bool,
+    rw: bool,
+) -> Result<()> {
     let cx = cli_cx();
     let open_opts = OpenOptions {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let open_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
+    let mut open_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
         .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
 
+    let mode_str = if rw { "rw" } else { "ro" };
     match &open_fs.flavor {
         FsFlavor::Ext4(sb) => {
             eprintln!(
-                "Mounting ext4 image (block_size={}, blocks={}) at {}",
+                "Mounting ext4 image (block_size={}, blocks={}, {mode_str}) at {}",
                 sb.block_size,
                 sb.blocks_count,
                 mountpoint.display()
             );
         }
         FsFlavor::Btrfs(sb) => {
-            bail!(
-                "btrfs mount not yet supported (image label: {:?})",
-                sb.label
+            if rw {
+                bail!("btrfs read-write mount is not yet supported");
+            }
+            eprintln!(
+                "Mounting btrfs image (sectorsize={}, nodesize={}, label={:?}, {mode_str}) at {}",
+                sb.sectorsize,
+                sb.nodesize,
+                sb.label,
+                mountpoint.display()
             );
         }
     }
 
+    if let Some(recovery) = open_fs.crash_recovery() {
+        if recovery.recovery_performed() {
+            eprintln!(
+                "  crash recovery: unclean shutdown detected (state=0x{:04X}, errors={}, orphans={})",
+                recovery.raw_state, recovery.had_errors, recovery.had_orphans
+            );
+            if recovery.journal_txns_replayed > 0 {
+                eprintln!(
+                    "  journal replay: {} transactions, {} blocks replayed",
+                    recovery.journal_txns_replayed, recovery.journal_blocks_replayed
+                );
+            }
+            if recovery.mvcc_reset {
+                eprintln!("  mvcc: version store reset (in-flight transactions discarded)");
+            }
+        }
+    }
+
+    if rw {
+        open_fs
+            .enable_writes(&cx)
+            .context("failed to enable write support")?;
+    }
+
     let opts = MountOptions {
-        read_only: true,
+        read_only: !rw,
         allow_other,
         auto_unmount: true,
         worker_threads: 0,

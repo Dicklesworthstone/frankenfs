@@ -273,3 +273,56 @@ fn fixture_checksum_manifest_is_complete() {
         );
     }
 }
+
+/// CI gate: verify that every golden file listed in checksums.sha256 exists,
+/// is non-empty, and that every golden JSON is present in the manifest.
+#[test]
+fn golden_checksum_manifest_is_complete() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let checksums_path = workspace.join("conformance/golden/checksums.sha256");
+    let checksums_text =
+        std::fs::read_to_string(&checksums_path).expect("read conformance/golden/checksums.sha256");
+
+    let listed_files: Vec<&str> = checksums_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once("  ").map(|(_, f)| f))
+        .collect();
+
+    assert!(
+        !listed_files.is_empty(),
+        "checksums.sha256 should list golden files"
+    );
+
+    let golden_dir = workspace.join("conformance/golden");
+    for filename in &listed_files {
+        assert!(
+            Path::new(filename)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
+            "golden checksum manifest should only track .json files: {filename}"
+        );
+        let path = golden_dir.join(filename);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("golden {filename} missing or unreadable: {e}"));
+        assert!(!data.is_empty(), "golden {filename} should be non-empty");
+    }
+
+    let mut actual_jsons: Vec<_> = std::fs::read_dir(&golden_dir)
+        .expect("read golden dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    actual_jsons.sort();
+
+    for json_file in &actual_jsons {
+        assert!(
+            listed_files.contains(&json_file.as_str()),
+            "golden {json_file} exists but is not listed in checksums.sha256"
+        );
+    }
+}

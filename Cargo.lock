@@ -480,6 +480,7 @@ dependencies = [
  "ffs-error",
  "ffs-types",
  "parking_lot",
+ "tracing",
 ]
 
 [[package]]
@@ -528,8 +529,12 @@ dependencies = [
  "asupersync",
  "ffs-alloc",
  "ffs-block",
+ "ffs-btree",
  "ffs-btrfs",
+ "ffs-dir",
  "ffs-error",
+ "ffs-extent",
+ "ffs-inode",
  "ffs-journal",
  "ffs-mvcc",
  "ffs-ondisk",
@@ -640,6 +645,7 @@ dependencies = [
  "ffs-error",
  "ffs-types",
  "parking_lot",
+ "tracing",
 ]
 
 [[package]]
@@ -649,11 +655,13 @@ dependencies = [
  "asupersync",
  "crc32c",
  "criterion",
+ "crossbeam-epoch",
  "ffs-block",
  "ffs-error",
  "ffs-types",
  "parking_lot",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

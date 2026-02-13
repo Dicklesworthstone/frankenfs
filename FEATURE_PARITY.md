@@ -32,8 +32,8 @@
 | ext4 inode device read | `fs/ext4/inode.c` | ✅ | `OpenFs::read_inode` via `ByteDevice` |
 | ext4 path resolution | `fs/ext4/namei.c` | ✅ | `OpenFs::resolve_path` |
 | ext4 bitmap free space reading | `fs/ext4/balloc.c` | ✅ | `OpenFs::free_space_summary`, bitmap-derived free block/inode counts |
-| ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | 🟡 | Phase 1 implemented in `ffs-journal` (descriptor/commit/revoke replay + tests); full mount-path integration and complete parity still pending |
-| ext4 allocator parity | `fs/ext4/mballoc.c` | ❌ | Not yet implemented |
+| ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | 🟡 | Replay + write-side implemented in `ffs-journal` (`replay_jbd2`, `Jbd2Writer` with descriptor/data/revoke/commit blocks, self-replayability verified). `OpenFs::commit_transaction_journaled` integration boundary in `ffs-core`. Checkpoint/space management pending. |
+| ext4 allocator parity | `fs/ext4/mballoc.c` | 🟡 | Phase A: correctness-first contiguous alloc with reserved-block exclusion, on-disk GDT persistence, double-free detection. `alloc_blocks_persist` / `free_blocks_persist` in `ffs-alloc`. Buddy-style search and preallocation pending. |
 | ext4 orphan recovery parity | `fs/ext4/orphan.c` | 🟡 | Read-only orphan-list detection/traversal implemented (`OpenFs::read_ext4_orphan_list` + CLI inspect diagnostics); mutating orphan cleanup still pending |
 | btrfs superblock decode | `fs/btrfs/disk-io.c` | ✅ | Implemented in `ffs-ondisk` |
 | btrfs btree header decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |
@@ -49,7 +49,7 @@
 | MVCC snapshot visibility | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | MVCC commit sequencing | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | FCW conflict detection | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
-| version retention policy | FrankenFS spec §3 | ✅ | In-memory retention with `VersionData::Identical` dedup (zero-copy for unchanged blocks), configurable `CompressionPolicy` (dedup + max chain length cap), watermark-safe pruning in `ffs-mvcc::compression` |
+| version retention policy | FrankenFS spec §3 | ✅ | In-memory retention with `VersionData::Identical` dedup (zero-copy for unchanged blocks), configurable `CompressionPolicy` (dedup + max chain length cap), watermark-safe pruning, chain-pressure handling (oldest-snapshot force-advance + `CommitError::ChainBackpressure`), and crossbeam-epoch deferred reclamation counters/collection (`ebr_stats`, `ebr_collect`) in `ffs-mvcc` |
 | COW block rewrite path | FrankenFS spec §3 | ✅ | Allocation-backed COW rewrite path implemented in `ffs-mvcc` (`write_cow`, logical→physical mapping visibility, deferred-free + watermark GC integration) |
 | durability policy model | FrankenFS spec §4 | ✅ | Bayesian expected-loss selector |
 | asupersync config mapping | FrankenFS spec §4 | ✅ | `RaptorQConfig` mapping implemented |

@@ -52,6 +52,7 @@ blake3 = "1.6.0"
 clap = { version = "4.5.0", features = ["derive"] }
 crc32c = "0.6.8"
 criterion = { version = "0.5.1", features = ["html_reports"] }
+crossbeam-epoch = "0.9.18"
 hex = "0.4.3"
 insta = "1.42.1"
 libc = "0.2.181"
