@@ -1,0 +1,4 @@
+Benchmark 1: /data/tmp/cargo-target/release/ffs-harness check-fixtures
+  Time (mean ± σ):       1.2 ms ±   0.5 ms    [User: 0.4 ms, System: 0.8 ms]
+  Range (min … max):     0.8 ms …   2.4 ms    10 runs
+ 

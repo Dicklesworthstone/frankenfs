@@ -1,0 +1,1 @@
+Benchmark 1: /data/tmp/cargo-target/release/ffs-cli inspect conformance/golden/ext4_8mb_reference.ext4 --json

@@ -85,9 +85,7 @@ pub struct BtrfsDirItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BtrfsExtentData {
     /// Inline extent payload bytes.
-    Inline {
-        data: Vec<u8>,
-    },
+    Inline { data: Vec<u8> },
     /// Regular or preallocated extent that references on-disk bytes.
     ///
     /// `disk_bytenr` is a logical bytenr in btrfs address space.
@@ -100,7 +98,11 @@ pub enum BtrfsExtentData {
     },
 }
 
-fn read_exact<const N: usize>(data: &[u8], off: usize, field: &'static str) -> Result<[u8; N], ParseError> {
+fn read_exact<const N: usize>(
+    data: &[u8],
+    off: usize,
+    field: &'static str,
+) -> Result<[u8; N], ParseError> {
     let end = off.checked_add(N).ok_or(ParseError::InvalidField {
         field,
         reason: "offset overflow",
@@ -719,14 +721,14 @@ mod tests {
         inode[40..44].copy_from_slice(&2_u32.to_le_bytes());
         inode[44..48].copy_from_slice(&1000_u32.to_le_bytes());
         inode[48..52].copy_from_slice(&1000_u32.to_le_bytes());
-        inode[52..56].copy_from_slice(&0o040755_u32.to_le_bytes());
+        inode[52..56].copy_from_slice(&0o040_755_u32.to_le_bytes());
         inode[112..120].copy_from_slice(&10_u64.to_le_bytes());
         inode[124..132].copy_from_slice(&11_u64.to_le_bytes());
         inode[136..144].copy_from_slice(&12_u64.to_le_bytes());
         inode[148..156].copy_from_slice(&13_u64.to_le_bytes());
         let parsed = parse_inode_item(&inode).expect("parse inode item");
         assert_eq!(parsed.size, 4096);
-        assert_eq!(parsed.mode, 0o040755);
+        assert_eq!(parsed.mode, 0o040_755);
         assert_eq!(parsed.nlink, 2);
         assert_eq!(parsed.mtime_sec, 12);
     }
@@ -739,7 +741,8 @@ mod tests {
         data[8] = BTRFS_ITEM_INODE_ITEM;
         data[17..25].copy_from_slice(&1_u64.to_le_bytes()); // transid
         data[25..27].copy_from_slice(&0_u16.to_le_bytes()); // data_len
-        data[27..29].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        let name_len = u16::try_from(name.len()).expect("test name length should fit u16");
+        data[27..29].copy_from_slice(&name_len.to_le_bytes());
         data[29] = BTRFS_FT_REG_FILE;
         data[30..30 + name.len()].copy_from_slice(name);
 

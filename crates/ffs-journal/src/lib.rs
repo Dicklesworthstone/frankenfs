@@ -16,6 +16,7 @@ const JBD2_BLOCKTYPE_DESCRIPTOR: u32 = 1;
 const JBD2_BLOCKTYPE_COMMIT: u32 = 2;
 const JBD2_BLOCKTYPE_REVOKE: u32 = 5;
 const JBD2_HEADER_SIZE: usize = 12;
+const JBD2_REVOKE_HEADER_SIZE: usize = 16; // journal header (12) + r_count (4)
 const JBD2_TAG_SIZE: usize = 8;
 const JBD2_TAG_FLAG_LAST: u32 = 0x0000_0008;
 
@@ -433,7 +434,10 @@ fn parse_descriptor_tags(block: &[u8]) -> Vec<DescriptorTag> {
 #[must_use]
 fn parse_revoke_entries(block: &[u8]) -> Vec<BlockNumber> {
     let mut out = Vec::new();
-    let mut offset = JBD2_HEADER_SIZE;
+    // Revoke header: journal_header (12 bytes) + r_count (4 bytes) = 16 bytes.
+    // The r_count field at offset 12 specifies total bytes in the revoke record
+    // including the header. Revoke entries start at offset 16.
+    let mut offset = JBD2_REVOKE_HEADER_SIZE;
 
     while offset.saturating_add(4) <= block.len() {
         let Some(raw) = read_be_u32(block, offset) else {
@@ -734,7 +738,13 @@ mod tests {
     fn revoke_block(block_size: usize, seq: u32, targets: &[u32]) -> Vec<u8> {
         let mut out = vec![0_u8; block_size];
         out[0..JBD2_HEADER_SIZE].copy_from_slice(&jbd2_header(JBD2_BLOCKTYPE_REVOKE, seq));
-        let mut off = JBD2_HEADER_SIZE;
+        // r_count at offset 12: total bytes in the revoke record including header.
+        // Header is 16 bytes, each 32-bit entry is 4 bytes.
+        let r_count = u32::try_from(JBD2_REVOKE_HEADER_SIZE + targets.len() * 4)
+            .expect("r_count should fit in u32");
+        out[12..16].copy_from_slice(&r_count.to_be_bytes());
+        // Revoke entries start at offset 16.
+        let mut off = JBD2_REVOKE_HEADER_SIZE;
         for target in targets {
             out[off..off + 4].copy_from_slice(&target.to_be_bytes());
             off += 4;

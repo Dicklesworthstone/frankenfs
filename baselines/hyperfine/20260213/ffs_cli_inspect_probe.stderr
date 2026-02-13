@@ -1,0 +1,1 @@
+error: failed to open ext4 image: conformance/golden/ext4_8mb_reference.ext4: unsupported feature: non-contiguous ext4 journal extents are not supported

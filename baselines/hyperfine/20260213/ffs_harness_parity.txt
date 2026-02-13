@@ -1,0 +1,4 @@
+Benchmark 1: /data/tmp/cargo-target/release/ffs-harness parity
+  Time (mean ± σ):     925.8 µs ± 290.9 µs    [User: 425.9 µs, System: 626.6 µs]
+  Range (min … max):   633.3 µs … 1572.2 µs    10 runs
+ 

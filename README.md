@@ -312,6 +312,9 @@ cargo run -p ffs-harness -- parity
 
 # Run benchmarks
 cargo bench -p ffs-harness
+
+# Record reproducible hyperfine baseline artifacts
+scripts/benchmark_record.sh --compare
 ```
 
 ### Development Gates

@@ -659,6 +659,8 @@ dependencies = [
  "ffs-ondisk",
  "ffs-types",
  "parking_lot",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

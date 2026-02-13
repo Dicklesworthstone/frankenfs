@@ -296,7 +296,10 @@ fn build_ext4_image_with_journal(scenario: JournalScenario) -> Vec<u8> {
                 JBD2_BLOCKTYPE_REVOKE,
                 1,
             );
-            image[j_revoke + 12..j_revoke + 16].copy_from_slice(
+            // r_count at offset 12: total bytes = 16 (header) + 4 (one 32-bit entry) = 20
+            image[j_revoke + 12..j_revoke + 16].copy_from_slice(&20_u32.to_be_bytes());
+            // Revoke entries start at offset 16
+            image[j_revoke + 16..j_revoke + 20].copy_from_slice(
                 &u32::try_from(TARGET_BLOCK)
                     .expect("target block should fit u32")
                     .to_be_bytes(),

@@ -7,12 +7,11 @@ use ffs_block::{
     read_ext4_superblock_region,
 };
 use ffs_btrfs::{
-    BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID,
-    BTRFS_FT_BLKDEV, BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_REG_FILE,
-    BTRFS_FT_SOCK, BTRFS_FT_SYMLINK, BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM,
-    BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM, BtrfsExtentData,
-    BtrfsInodeItem, BtrfsLeafEntry, map_logical_to_physical, parse_dir_items, parse_extent_data,
-    parse_inode_item, parse_root_item, walk_tree,
+    BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV,
+    BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK,
+    BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
+    BTRFS_ITEM_ROOT_ITEM, BtrfsExtentData, BtrfsInodeItem, BtrfsLeafEntry, map_logical_to_physical,
+    parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item, walk_tree,
 };
 use ffs_error::FfsError;
 use ffs_journal::{JournalRegion, ReplayOutcome, replay_jbd2};
@@ -581,12 +580,12 @@ impl OpenFs {
         let fs_tree_root = root_items
             .iter()
             .find(|item| {
-                item.key.objectid == BTRFS_FS_TREE_OBJECTID && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+                item.key.objectid == BTRFS_FS_TREE_OBJECTID
+                    && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
             })
             .ok_or_else(|| {
                 FfsError::NotFound(format!(
-                    "btrfs ROOT_ITEM for FS_TREE objectid {}",
-                    BTRFS_FS_TREE_OBJECTID
+                    "btrfs ROOT_ITEM for FS_TREE objectid {BTRFS_FS_TREE_OBJECTID}"
                 ))
             })?;
 
@@ -600,20 +599,19 @@ impl OpenFs {
     }
 
     fn btrfs_mode_to_file_type(mode: u32) -> FileType {
-        match mode & 0o170000 {
-            0o040000 => FileType::Directory,
-            0o120000 => FileType::Symlink,
-            0o060000 => FileType::BlockDevice,
-            0o020000 => FileType::CharDevice,
-            0o010000 => FileType::Fifo,
-            0o140000 => FileType::Socket,
+        match mode & 0o170_000 {
+            0o040_000 => FileType::Directory,
+            0o120_000 => FileType::Symlink,
+            0o060_000 => FileType::BlockDevice,
+            0o020_000 => FileType::CharDevice,
+            0o010_000 => FileType::Fifo,
+            0o140_000 => FileType::Socket,
             _ => FileType::RegularFile,
         }
     }
 
     fn btrfs_dir_type_to_file_type(dir_type: u8) -> FileType {
         match dir_type {
-            BTRFS_FT_REG_FILE => FileType::RegularFile,
             BTRFS_FT_DIR => FileType::Directory,
             BTRFS_FT_SYMLINK => FileType::Symlink,
             BTRFS_FT_BLKDEV => FileType::BlockDevice,
@@ -652,13 +650,15 @@ impl OpenFs {
         })
     }
 
-    fn btrfs_find_inode_item<'a>(
-        items: &'a [BtrfsLeafEntry],
+    fn btrfs_find_inode_item(
+        items: &[BtrfsLeafEntry],
         objectid: u64,
-    ) -> Result<&'a BtrfsLeafEntry, FfsError> {
+    ) -> Result<&BtrfsLeafEntry, FfsError> {
         items
             .iter()
-            .find(|item| item.key.objectid == objectid && item.key.item_type == BTRFS_ITEM_INODE_ITEM)
+            .find(|item| {
+                item.key.objectid == objectid && item.key.item_type == BTRFS_ITEM_INODE_ITEM
+            })
             .ok_or_else(|| FfsError::NotFound(format!("btrfs inode objectid {objectid}")))
     }
 
@@ -686,7 +686,9 @@ impl OpenFs {
 
         for preferred_item_type in [BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_DIR_INDEX] {
             for item in &items {
-                if item.key.objectid != canonical_parent || item.key.item_type != preferred_item_type {
+                if item.key.objectid != canonical_parent
+                    || item.key.item_type != preferred_item_type
+                {
                     continue;
                 }
                 let dir_items = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
@@ -699,7 +701,9 @@ impl OpenFs {
             }
         }
 
-        Err(FfsError::NotFound(String::from_utf8_lossy(name).into_owned()))
+        Err(FfsError::NotFound(
+            String::from_utf8_lossy(name).into_owned(),
+        ))
     }
 
     fn btrfs_readdir_entries(
@@ -720,7 +724,9 @@ impl OpenFs {
             if item.key.objectid != canonical_dir {
                 continue;
             }
-            if item.key.item_type != BTRFS_ITEM_DIR_INDEX && item.key.item_type != BTRFS_ITEM_DIR_ITEM {
+            if item.key.item_type != BTRFS_ITEM_DIR_INDEX
+                && item.key.item_type != BTRFS_ITEM_DIR_ITEM
+            {
                 continue;
             }
 
@@ -756,7 +762,10 @@ impl OpenFs {
         // the same entry). Keep first-by-sort-key for stable pagination.
         let mut deduped: Vec<(u64, DirEntry)> = Vec::new();
         for row in rows {
-            if deduped.iter().any(|(_, existing)| existing.name == row.1.name) {
+            if deduped
+                .iter()
+                .any(|(_, existing)| existing.name == row.1.name)
+            {
                 continue;
             }
             deduped.push(row);
@@ -788,14 +797,15 @@ impl OpenFs {
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
         for chunk in &ctx.chunks {
-            let end = chunk
-                .key
-                .offset
-                .checked_add(chunk.length)
-                .ok_or_else(|| FfsError::Corruption {
-                    block: logical,
-                    detail: "btrfs chunk logical range overflow".into(),
-                })?;
+            let end =
+                chunk
+                    .key
+                    .offset
+                    .checked_add(chunk.length)
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: logical,
+                        detail: "btrfs chunk logical range overflow".into(),
+                    })?;
             if logical >= chunk.key.offset && logical < end {
                 return Ok(end);
             }
@@ -806,7 +816,12 @@ impl OpenFs {
         })
     }
 
-    fn btrfs_read_logical_into(&self, cx: &Cx, mut logical: u64, mut out: &mut [u8]) -> Result<(), FfsError> {
+    fn btrfs_read_logical_into(
+        &self,
+        cx: &Cx,
+        mut logical: u64,
+        mut out: &mut [u8],
+    ) -> Result<(), FfsError> {
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
@@ -820,12 +835,13 @@ impl OpenFs {
                 })?;
             let chunk_end = self.btrfs_logical_chunk_end(logical)?;
             let span_u64 = chunk_end.saturating_sub(logical);
-            let span = usize::try_from(span_u64).unwrap_or(usize::MAX).min(out.len());
+            let span = usize::try_from(span_u64)
+                .unwrap_or(usize::MAX)
+                .min(out.len());
 
             let (head, tail) = out.split_at_mut(span);
             self.dev
-                .read_exact_at(cx, ByteOffset(mapping.physical), head)
-                .map_err(FfsError::from)?;
+                .read_exact_at(cx, ByteOffset(mapping.physical), head)?;
             logical = logical.saturating_add(span as u64);
             out = tail;
         }
@@ -833,7 +849,14 @@ impl OpenFs {
         Ok(())
     }
 
-    fn btrfs_read_file(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32) -> Result<Vec<u8>, FfsError> {
+    #[allow(clippy::too_many_lines)]
+    fn btrfs_read_file(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, FfsError> {
         let canonical = self.btrfs_canonical_inode(ino)?;
         let items = self.walk_btrfs_fs_tree(cx)?;
         let inode_entry = Self::btrfs_find_inode_item(&items, canonical)?;
@@ -847,13 +870,16 @@ impl OpenFs {
             return Ok(Vec::new());
         }
 
-        let to_read = usize::try_from((inode.size - offset).min(u64::from(size))).unwrap_or(size as usize);
+        let to_read =
+            usize::try_from((inode.size - offset).min(u64::from(size))).unwrap_or(size as usize);
         let mut out = vec![0_u8; to_read];
         let read_end = offset.saturating_add(to_read as u64);
 
         let mut extents: Vec<(u64, BtrfsExtentData)> = items
             .iter()
-            .filter(|item| item.key.objectid == canonical && item.key.item_type == BTRFS_ITEM_EXTENT_DATA)
+            .filter(|item| {
+                item.key.objectid == canonical && item.key.item_type == BTRFS_ITEM_EXTENT_DATA
+            })
             .map(|item| {
                 parse_extent_data(&item.data)
                     .map(|parsed| (item.key.offset, parsed))
@@ -865,10 +891,11 @@ impl OpenFs {
         for (logical_start, extent) in extents {
             match extent {
                 BtrfsExtentData::Inline { data } => {
-                    let extent_len = u64::try_from(data.len()).map_err(|_| FfsError::Corruption {
-                        block: 0,
-                        detail: "inline extent length overflow".into(),
-                    })?;
+                    let extent_len =
+                        u64::try_from(data.len()).map_err(|_| FfsError::Corruption {
+                            block: 0,
+                            detail: "inline extent length overflow".into(),
+                        })?;
                     let extent_end = logical_start.saturating_add(extent_len);
                     let overlap_start = logical_start.max(offset);
                     let overlap_end = extent_end.min(read_end);
@@ -876,19 +903,24 @@ impl OpenFs {
                         continue;
                     }
 
-                    let src_start = usize::try_from(overlap_start - logical_start).map_err(|_| {
+                    let src_start =
+                        usize::try_from(overlap_start - logical_start).map_err(|_| {
+                            FfsError::Corruption {
+                                block: 0,
+                                detail: "inline source offset overflow".into(),
+                            }
+                        })?;
+                    let dst_start = usize::try_from(overlap_start - offset).map_err(|_| {
                         FfsError::Corruption {
                             block: 0,
-                            detail: "inline source offset overflow".into(),
+                            detail: "inline destination offset overflow".into(),
                         }
                     })?;
-                    let dst_start = usize::try_from(overlap_start - offset).map_err(|_| FfsError::Corruption {
-                        block: 0,
-                        detail: "inline destination offset overflow".into(),
-                    })?;
-                    let copy_len = usize::try_from(overlap_end - overlap_start).map_err(|_| FfsError::Corruption {
-                        block: 0,
-                        detail: "inline copy length overflow".into(),
+                    let copy_len = usize::try_from(overlap_end - overlap_start).map_err(|_| {
+                        FfsError::Corruption {
+                            block: 0,
+                            detail: "inline copy length overflow".into(),
+                        }
                     })?;
                     out[dst_start..dst_start + copy_len]
                         .copy_from_slice(&data[src_start..src_start + copy_len]);
@@ -925,13 +957,17 @@ impl OpenFs {
                             block: disk_bytenr,
                             detail: "extent source logical overflow".into(),
                         })?;
-                    let dst_start = usize::try_from(overlap_start - offset).map_err(|_| FfsError::Corruption {
-                        block: 0,
-                        detail: "extent destination offset overflow".into(),
+                    let dst_start = usize::try_from(overlap_start - offset).map_err(|_| {
+                        FfsError::Corruption {
+                            block: 0,
+                            detail: "extent destination offset overflow".into(),
+                        }
                     })?;
-                    let copy_len = usize::try_from(overlap_end - overlap_start).map_err(|_| FfsError::Corruption {
-                        block: 0,
-                        detail: "extent copy length overflow".into(),
+                    let copy_len = usize::try_from(overlap_end - overlap_start).map_err(|_| {
+                        FfsError::Corruption {
+                            block: 0,
+                            detail: "extent copy length overflow".into(),
+                        }
                     })?;
                     self.btrfs_read_logical_into(
                         cx,
@@ -4770,6 +4806,7 @@ mod tests {
         image
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_btrfs_leaf_item(
         image: &mut [u8],
         leaf_off: usize,
@@ -4813,7 +4850,8 @@ mod tests {
         entry[9..17].copy_from_slice(&0_u64.to_le_bytes());
         entry[17..25].copy_from_slice(&1_u64.to_le_bytes()); // transid
         entry[25..27].copy_from_slice(&0_u16.to_le_bytes()); // data_len
-        entry[27..29].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        let name_len = u16::try_from(name.len()).expect("test name length should fit in u16");
+        entry[27..29].copy_from_slice(&name_len.to_le_bytes());
         entry[29] = file_type;
         entry[30..30 + name.len()].copy_from_slice(name);
         entry
@@ -4834,6 +4872,7 @@ mod tests {
     /// Build a minimal btrfs image with ROOT_TREE + FS_TREE content sufficient
     /// for read-only `FsOps` operations (`getattr/lookup/readdir/read`).
     #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_lines)]
     fn build_btrfs_fsops_image() -> Vec<u8> {
         let image_size: usize = 512 * 1024;
         let mut image = vec![0_u8; image_size];
@@ -4874,7 +4913,8 @@ mod tests {
         chunk_array.extend_from_slice(&0_u64.to_le_bytes()); // physical offset (identity)
         chunk_array.extend_from_slice(&[0_u8; 16]); // dev_uuid
 
-        image[sb_off + 0xA0..sb_off + 0xA4].copy_from_slice(&(chunk_array.len() as u32).to_le_bytes());
+        image[sb_off + 0xA0..sb_off + 0xA4]
+            .copy_from_slice(&(chunk_array.len() as u32).to_le_bytes());
         let array_start = sb_off + 0x32B;
         image[array_start..array_start + chunk_array.len()].copy_from_slice(&chunk_array);
 
@@ -4900,7 +4940,8 @@ mod tests {
         );
         let mut root_item = vec![0_u8; root_item_size as usize];
         root_item[176..184].copy_from_slice(&fs_tree_logical.to_le_bytes()); // bytenr
-        root_item[root_item.len() - 1] = 0; // level
+        let root_item_last = root_item.len() - 1;
+        root_item[root_item_last] = 0; // level
         let root_data_off = root_leaf + root_item_offset as usize;
         image[root_data_off..root_data_off + root_item.len()].copy_from_slice(&root_item);
 
@@ -4912,14 +4953,15 @@ mod tests {
         image[fs_leaf + 0x60..fs_leaf + 0x64].copy_from_slice(&4_u32.to_le_bytes());
         image[fs_leaf + 0x64] = 0;
 
-        let root_inode = encode_btrfs_inode_item(0o040755, 4096, 4096, 2);
+        let root_inode = encode_btrfs_inode_item(0o040_755, 4096, 4096, 2);
         let file_inode = encode_btrfs_inode_item(
-            0o100644,
+            0o100_644,
             file_bytes.len() as u64,
             file_bytes.len() as u64,
             1,
         );
-        let dir_index = encode_btrfs_dir_index_entry(b"hello.txt", 257, BTRFS_FT_REG_FILE);
+        let dir_index =
+            encode_btrfs_dir_index_entry(b"hello.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE);
         let extent = encode_btrfs_extent_regular(file_data_logical, file_bytes.len() as u64);
 
         let root_inode_off: u32 = 3200;
@@ -4968,11 +5010,13 @@ mod tests {
             extent.len() as u32,
         );
 
-        image[fs_leaf + root_inode_off as usize..fs_leaf + root_inode_off as usize + root_inode.len()]
+        image[fs_leaf + root_inode_off as usize
+            ..fs_leaf + root_inode_off as usize + root_inode.len()]
             .copy_from_slice(&root_inode);
         image[fs_leaf + dir_index_off as usize..fs_leaf + dir_index_off as usize + dir_index.len()]
             .copy_from_slice(&dir_index);
-        image[fs_leaf + file_inode_off as usize..fs_leaf + file_inode_off as usize + file_inode.len()]
+        image[fs_leaf + file_inode_off as usize
+            ..fs_leaf + file_inode_off as usize + file_inode.len()]
             .copy_from_slice(&file_inode);
         image[fs_leaf + extent_off as usize..fs_leaf + extent_off as usize + extent.len()]
             .copy_from_slice(&extent);

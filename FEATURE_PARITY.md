@@ -7,11 +7,11 @@
 | Domain | Implemented | Total Tracked | Coverage |
 |--------|-------------|---------------|----------|
 | ext4 metadata parsing | 10 | 19 | 52.6% |
-| btrfs metadata parsing | 7 | 20 | 35.0% |
+| btrfs metadata parsing | 8 | 20 | 40.0% |
 | MVCC/COW core | 4 | 14 | 28.6% |
 | FUSE surface | 6 | 12 | 50.0% |
-| self-healing durability policy | 3 | 10 | 30.0% |
-| **Overall** | **30** | **75** | **40.0%** |
+| self-healing durability policy | 5 | 10 | 50.0% |
+| **Overall** | **33** | **75** | **44.0%** |
 
 > **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
 > authoritative source for implemented/total counts. This table MUST match those
@@ -41,6 +41,7 @@
 | btrfs internal node parsing | `fs/btrfs/ctree.c` | ✅ | `parse_internal_items` in `ffs-ondisk` |
 | btrfs sys_chunk mapping | `fs/btrfs/volumes.c` | ✅ | `map_logical_to_physical` in `ffs-ondisk` |
 | btrfs read-only tree walk | `fs/btrfs/ctree.c` | ✅ | `walk_tree` in `ffs-btrfs` |
+| btrfs item payload decode (ROOT/INODE/DIR/EXTENT_DATA) | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-btrfs` (`parse_root_item`, `parse_inode_item`, `parse_dir_items`, `parse_extent_data`) |
 | btrfs open/validate pipeline | `fs/btrfs/disk-io.c` | ✅ | `BtrfsContext` in `ffs-core` |
 | btrfs transaction parity | `fs/btrfs/transaction.c` | ❌ | Not yet implemented |
 | btrfs delayed refs parity | `fs/btrfs/delayed-ref.c` | ❌ | Not yet implemented |
@@ -53,6 +54,8 @@
 | durability policy model | FrankenFS spec §4 | ✅ | Bayesian expected-loss selector |
 | asupersync config mapping | FrankenFS spec §4 | ✅ | `RaptorQConfig` mapping implemented |
 | format-aware scrub superblock validation | FrankenFS spec §4 | ✅ | `Ext4SuperblockValidator` + `BtrfsSuperblockValidator` in `ffs-repair`, wired into `ffs-cli scrub` |
+| repair symbol storage I/O (dual-slot generation commit) | FrankenFS spec §4 | ✅ | `RepairGroupStorage` in `ffs-repair::storage` with symbol-block validation + torn-generation fallback |
+| corruption recovery orchestrator + evidence ledger | FrankenFS spec §4 | ✅ | `GroupRecoveryOrchestrator` in `ffs-repair::recovery` (decode + writeback + post-verify + JSON evidence) |
 | FUSE getattr | FrankenFS spec §9 | ✅ | `FsOps::getattr` via `OpenFs` |
 | FUSE lookup | FrankenFS spec §9 | ✅ | `FsOps::lookup` via `OpenFs` |
 | FUSE readdir | FrankenFS spec §9 | ✅ | `FsOps::readdir` via `OpenFs` |
