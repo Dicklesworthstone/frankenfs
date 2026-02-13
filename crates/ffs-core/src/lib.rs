@@ -665,6 +665,8 @@ impl OpenFs {
     /// Count free inodes in a specific group by reading and analyzing the bitmap.
     ///
     /// This reads the inode bitmap from disk and counts zero bits (free inodes).
+    /// For the last group, only the bits corresponding to actual inodes are
+    /// counted.
     ///
     /// # Errors
     ///
@@ -674,8 +676,11 @@ impl OpenFs {
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
 
+        let geo = FsGeometry::from_superblock(sb);
+        let inodes_in_group = geo.inodes_in_group(group);
+
         let bitmap = self.read_inode_bitmap(cx, group)?;
-        Ok(bitmap_count_free(&bitmap, sb.inodes_per_group))
+        Ok(bitmap_count_free(&bitmap, inodes_in_group))
     }
 
     /// Compute a free-space summary for the entire ext4 filesystem.

@@ -246,6 +246,19 @@ impl FsGeometry {
         }
     }
 
+    /// Number of inodes in a specific group (last group may be shorter).
+    #[must_use]
+    #[expect(clippy::cast_possible_truncation)]
+    pub fn inodes_in_group(&self, group: GroupNumber) -> u32 {
+        let inode_start = u64::from(group.0) * u64::from(self.inodes_per_group);
+        let remaining = u64::from(self.total_inodes).saturating_sub(inode_start);
+        if remaining >= u64::from(self.inodes_per_group) {
+            self.inodes_per_group
+        } else {
+            remaining as u32
+        }
+    }
+
     /// Absolute block number for a relative block within a group.
     #[must_use]
     pub fn group_block_to_absolute(&self, group: GroupNumber, rel_block: u32) -> BlockNumber {
@@ -770,6 +783,21 @@ mod tests {
         geo.total_blocks = 30000;
         // Groups 0,1,2 have 8192 each = 24576. Group 3 has 30000-24576 = 5424.
         assert_eq!(geo.blocks_in_group(GroupNumber(3)), 5424);
+    }
+
+    #[test]
+    fn geometry_inodes_in_group() {
+        let mut geo = make_geometry();
+        // 4 groups * 2048 inodes_per_group = 8192 total_inodes (exact fit)
+        assert_eq!(geo.inodes_in_group(GroupNumber(0)), 2048);
+        assert_eq!(geo.inodes_in_group(GroupNumber(3)), 2048);
+
+        // Make total not evenly divisible: 7000 total inodes
+        // Groups 0,1,2 have 2048 each = 6144. Group 3 has 7000-6144 = 856.
+        geo.total_inodes = 7000;
+        assert_eq!(geo.inodes_in_group(GroupNumber(0)), 2048);
+        assert_eq!(geo.inodes_in_group(GroupNumber(2)), 2048);
+        assert_eq!(geo.inodes_in_group(GroupNumber(3)), 856);
     }
 
     // ── Block allocation tests ──────────────────────────────────────────
