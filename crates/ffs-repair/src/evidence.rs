@@ -112,10 +112,25 @@ pub struct ScrubCycleDetail {
 pub struct PolicyDecisionDetail {
     /// Posterior probability of corruption.
     pub corruption_posterior: f64,
+    /// Beta posterior alpha parameter.
+    #[serde(default)]
+    pub posterior_alpha: f64,
+    /// Beta posterior beta parameter.
+    #[serde(default)]
+    pub posterior_beta: f64,
     /// Current or proposed overhead ratio.
     pub overhead_ratio: f64,
     /// Risk bound threshold.
     pub risk_bound: f64,
+    /// Expected loss at `overhead_ratio`.
+    #[serde(default)]
+    pub expected_loss: f64,
+    /// Number of repair symbols selected for next refresh.
+    #[serde(default)]
+    pub symbols_selected: u32,
+    /// Whether metadata-specific multiplier was applied.
+    #[serde(default)]
+    pub metadata_group: bool,
     /// Human-readable description of the policy decision.
     pub decision: String,
 }
@@ -437,8 +452,13 @@ mod tests {
     fn sample_policy_detail() -> PolicyDecisionDetail {
         PolicyDecisionDetail {
             corruption_posterior: 0.023,
-            overhead_ratio: 1.05,
+            posterior_alpha: 23.0,
+            posterior_beta: 977.0,
+            overhead_ratio: 0.05,
             risk_bound: 1e-9,
+            expected_loss: 0.051,
+            symbols_selected: 5,
+            metadata_group: false,
             decision: "maintain current overhead ratio".to_owned(),
         }
     }
@@ -534,13 +554,27 @@ mod tests {
             "corruption_posterior mismatch"
         );
         assert!(
-            (policy.overhead_ratio - 1.05).abs() < 1e-15,
+            (policy.posterior_alpha - 23.0).abs() < 1e-15,
+            "posterior_alpha mismatch"
+        );
+        assert!(
+            (policy.posterior_beta - 977.0).abs() < 1e-15,
+            "posterior_beta mismatch"
+        );
+        assert!(
+            (policy.overhead_ratio - 0.05).abs() < 1e-15,
             "overhead_ratio mismatch"
         );
         assert!(
             (policy.risk_bound - 1e-9).abs() < 1e-20,
             "risk_bound mismatch"
         );
+        assert!(
+            (policy.expected_loss - 0.051).abs() < 1e-15,
+            "expected_loss mismatch"
+        );
+        assert_eq!(policy.symbols_selected, 5);
+        assert!(!policy.metadata_group);
         assert_eq!(policy.decision, "maintain current overhead ratio");
     }
 

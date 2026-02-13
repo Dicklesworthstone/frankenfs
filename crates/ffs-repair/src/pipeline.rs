@@ -13,7 +13,7 @@
 //! scrub range → corrupt blocks → group recovery → evidence → symbol refresh
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
 use asupersync::Cx;
@@ -23,8 +23,11 @@ use ffs_types::{BlockNumber, GroupNumber};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::autopilot::{DurabilityAutopilot, OverheadDecision};
 use crate::codec::{EncodedGroup, encode_group};
-use crate::evidence::{CorruptionDetail, EvidenceLedger, EvidenceRecord, SymbolRefreshDetail};
+use crate::evidence::{
+    CorruptionDetail, EvidenceLedger, EvidenceRecord, PolicyDecisionDetail, SymbolRefreshDetail,
+};
 use crate::recovery::{
     GroupRecoveryOrchestrator, RecoveryAttemptResult, RecoveryDecoderStats, RecoveryOutcome,
 };
@@ -114,8 +117,14 @@ pub struct ScrubWithRecovery<'a, W: Write> {
     fs_uuid: [u8; 16],
     groups: Vec<GroupConfig>,
     ledger: EvidenceLedger<W>,
-    /// Number of repair symbols to generate on refresh (0 = skip refresh).
+    /// Static fallback symbol count when adaptive policy is disabled.
     repair_symbol_count: u32,
+    /// Optional adaptive overhead policy state.
+    adaptive_overhead: Option<DurabilityAutopilot>,
+    /// Groups treated as metadata-critical for policy multiplier.
+    metadata_groups: BTreeSet<u32>,
+    /// Latest adaptive decisions keyed by group number.
+    policy_decisions: BTreeMap<u32, OverheadDecision>,
 }
 
 impl<'a, W: Write> ScrubWithRecovery<'a, W> {
@@ -143,7 +152,27 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             groups,
             ledger: EvidenceLedger::new(ledger_writer),
             repair_symbol_count,
+            adaptive_overhead: None,
+            metadata_groups: BTreeSet::from([0_u32]),
+            policy_decisions: BTreeMap::new(),
         }
+    }
+
+    /// Enable adaptive Bayesian overhead policy.
+    #[must_use]
+    pub fn with_adaptive_overhead(mut self, autopilot: DurabilityAutopilot) -> Self {
+        self.adaptive_overhead = Some(autopilot);
+        self
+    }
+
+    /// Override metadata-critical group set for 2x overhead multiplier.
+    #[must_use]
+    pub fn with_metadata_groups<I>(mut self, groups: I) -> Self
+    where
+        I: IntoIterator<Item = GroupNumber>,
+    {
+        self.metadata_groups = groups.into_iter().map(|group| group.0).collect();
+        self
     }
 
     /// Run the full scrub-and-recover pipeline.
@@ -165,6 +194,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             findings = report.findings.len(),
             "scrub complete"
         );
+        self.update_adaptive_policy(&report)?;
 
         if report.is_clean() {
             info!("scrub_and_recover: no corruption found");
@@ -216,6 +246,101 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
 
     // ── Internal helpers ──────────────────────────────────────────────
 
+    fn update_adaptive_policy(&mut self, report: &ScrubReport) -> Result<()> {
+        self.policy_decisions.clear();
+
+        let Some(autopilot) = self.adaptive_overhead.as_mut() else {
+            return Ok(());
+        };
+
+        trace!(
+            target: "ffs::repair::policy",
+            checked_blocks = report.blocks_scanned,
+            corrupted_blocks = report.blocks_corrupt,
+            groups_total = self.groups.len(),
+            "policy_scrub_observation"
+        );
+        autopilot.update_posterior(report.blocks_corrupt, report.blocks_scanned);
+        let (posterior_alpha, posterior_beta) = autopilot.posterior_params();
+        debug!(
+            target: "ffs::repair::policy",
+            posterior_alpha,
+            posterior_beta,
+            posterior_mean = autopilot.posterior_mean(),
+            "policy_posterior_updated"
+        );
+
+        for group_cfg in &self.groups {
+            let group = group_cfg.layout.group.0;
+            let metadata_group = self.metadata_groups.contains(&group);
+            let mut decision = autopilot.decision_for_group(group_cfg.source_block_count, metadata_group);
+
+            if decision.symbols_selected > group_cfg.layout.repair_block_count {
+                let effective_symbols = group_cfg.layout.repair_block_count;
+                let source_count = group_cfg.source_block_count.max(1);
+                let effective_overhead = f64::from(effective_symbols) / f64::from(source_count);
+                decision.symbols_selected = effective_symbols;
+                decision.overhead_ratio = effective_overhead;
+                decision.risk_bound = autopilot.risk_bound(effective_overhead, group_cfg.source_block_count);
+                decision.expected_loss =
+                    autopilot.expected_loss(effective_overhead, group_cfg.source_block_count);
+                warn!(
+                    target: "ffs::repair::policy",
+                    group,
+                    selected_symbols = decision.symbols_selected,
+                    layout_capacity = group_cfg.layout.repair_block_count,
+                    effective_overhead,
+                    "policy_symbol_count_clamped"
+                );
+            }
+
+            info!(
+                target: "ffs::repair::policy",
+                group,
+                metadata_group = decision.metadata_group,
+                selected_overhead = decision.overhead_ratio,
+                symbol_count = decision.symbols_selected,
+                risk_bound = decision.risk_bound,
+                expected_loss = decision.expected_loss,
+                "policy_decision_selected"
+            );
+
+            let record = EvidenceRecord::policy_decision(
+                group,
+                PolicyDecisionDetail {
+                    corruption_posterior: decision.corruption_posterior,
+                    posterior_alpha: decision.posterior_alpha,
+                    posterior_beta: decision.posterior_beta,
+                    overhead_ratio: decision.overhead_ratio,
+                    risk_bound: decision.risk_bound,
+                    expected_loss: decision.expected_loss,
+                    symbols_selected: decision.symbols_selected,
+                    metadata_group: decision.metadata_group,
+                    decision: "adaptive_overhead_expected_loss".to_owned(),
+                },
+            );
+            self.ledger.append(&record).map_err(|e| {
+                error!(
+                    target: "ffs::repair::policy",
+                    group,
+                    error = %e,
+                    "policy_evidence_append_failed"
+                );
+                FfsError::RepairFailed(format!("failed to write policy evidence: {e}"))
+            })?;
+            self.policy_decisions.insert(group, decision);
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
+    fn selected_refresh_symbol_count(&self, group_cfg: &GroupConfig) -> u32 {
+        self.policy_decisions
+            .get(&group_cfg.layout.group.0)
+            .map_or(self.repair_symbol_count, |decision| decision.symbols_selected)
+    }
+
     /// Recover a single group's corrupt blocks and return a summary.
     fn recover_group(
         &mut self,
@@ -261,8 +386,9 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                 *total_recovered += recovery_result.repaired_blocks.len();
 
                 // Refresh symbols after successful recovery.
-                if self.repair_symbol_count > 0 {
-                    match self.refresh_symbols(cx, group_cfg) {
+                let refresh_symbol_count = self.selected_refresh_symbol_count(group_cfg);
+                if refresh_symbol_count > 0 {
+                    match self.refresh_symbols(cx, group_cfg, refresh_symbol_count) {
                         Ok(()) => {
                             symbols_refreshed = true;
                             info!(group = group_num.0, "repair symbols refreshed");
@@ -427,17 +553,36 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     }
 
     /// Re-encode repair symbols for a group after successful recovery.
-    fn refresh_symbols(&mut self, cx: &Cx, group_cfg: &GroupConfig) -> Result<()> {
+    fn refresh_symbols(
+        &mut self,
+        cx: &Cx,
+        group_cfg: &GroupConfig,
+        repair_symbol_count: u32,
+    ) -> Result<()> {
         let group_num = group_cfg.layout.group;
         let storage = RepairGroupStorage::new(self.device, group_cfg.layout);
 
         // Read current generation.
         let old_desc = storage.read_group_desc_ext(cx)?;
         let old_gen = old_desc.repair_generation;
+        let effective_symbol_count = repair_symbol_count.min(group_cfg.layout.repair_block_count);
+        if effective_symbol_count != repair_symbol_count {
+            warn!(
+                target: "ffs::repair::policy",
+                group = group_num.0,
+                selected_symbols = repair_symbol_count,
+                layout_capacity = group_cfg.layout.repair_block_count,
+                effective_overhead = f64::from(effective_symbol_count)
+                    / f64::from(group_cfg.source_block_count.max(1)),
+                "policy_symbol_count_clamped"
+            );
+        }
 
         debug!(
             group = group_num.0,
             previous_generation = old_gen,
+            requested_symbols = repair_symbol_count,
+            effective_symbols = effective_symbol_count,
             "refreshing repair symbols"
         );
 
@@ -449,7 +594,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             group_num,
             group_cfg.source_first_block,
             group_cfg.source_block_count,
-            self.repair_symbol_count,
+            effective_symbol_count,
         )?;
 
         let new_gen = old_gen + 1;

@@ -8,7 +8,7 @@
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_types::{
-    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset,
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset, CommitSeq, TxnId,
     EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
 };
 use parking_lot::Mutex;
@@ -196,6 +196,52 @@ pub trait BlockCache: BlockDevice {
     ///
     /// Implementations must panic if the target block is dirty.
     fn evict(&self, block: BlockNumber);
+}
+
+/// Opaque flush pin token used to hold MVCC/GC protection across flush I/O.
+#[derive(Debug, Default)]
+pub struct FlushPinToken(Option<Box<dyn Send + Sync>>);
+
+impl FlushPinToken {
+    #[must_use]
+    pub fn noop() -> Self {
+        Self(None)
+    }
+
+    #[must_use]
+    pub fn new<T>(token: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self(Some(Box::new(token)))
+    }
+
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+/// MVCC coordination hook for write-back flush lifecycle.
+///
+/// Implementations can pin version chains before disk write and mark versions
+/// persisted after successful write completion.
+pub trait MvccFlushLifecycle: Send + Sync + std::fmt::Debug {
+    fn pin_for_flush(&self, block: BlockNumber, commit_seq: CommitSeq) -> Result<FlushPinToken>;
+    fn mark_persisted(&self, block: BlockNumber, commit_seq: CommitSeq) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+struct NoopMvccFlushLifecycle;
+
+impl MvccFlushLifecycle for NoopMvccFlushLifecycle {
+    fn pin_for_flush(&self, _block: BlockNumber, _commit_seq: CommitSeq) -> Result<FlushPinToken> {
+        Ok(FlushPinToken::noop())
+    }
+
+    fn mark_persisted(&self, _block: BlockNumber, _commit_seq: CommitSeq) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -395,9 +441,32 @@ enum ArcList {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyState {
+    InFlight,
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirtyEntry {
     seq: u64,
     bytes: usize,
+    txn_id: TxnId,
+    commit_seq: Option<CommitSeq>,
+    state: DirtyState,
+}
+
+impl DirtyEntry {
+    fn is_flushable(self) -> bool {
+        matches!(self.state, DirtyState::Committed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FlushCandidate {
+    block: BlockNumber,
+    data: Vec<u8>,
+    txn_id: TxnId,
+    commit_seq: CommitSeq,
 }
 
 /// Ordered tracking of dirty blocks with deterministic age semantics.
@@ -410,7 +479,14 @@ struct DirtyTracker {
 }
 
 impl DirtyTracker {
-    fn mark_dirty(&mut self, block: BlockNumber, bytes: usize) {
+    fn mark_dirty(
+        &mut self,
+        block: BlockNumber,
+        bytes: usize,
+        txn_id: TxnId,
+        commit_seq: Option<CommitSeq>,
+        state: DirtyState,
+    ) {
         if let Some(prev) = self.by_block.remove(&block) {
             let _ = self.by_age.remove(&(prev.seq, block));
             self.dirty_bytes = self.dirty_bytes.saturating_sub(prev.bytes);
@@ -418,7 +494,13 @@ impl DirtyTracker {
 
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        let entry = DirtyEntry { seq, bytes };
+        let entry = DirtyEntry {
+            seq,
+            bytes,
+            txn_id,
+            commit_seq,
+            state,
+        };
         self.by_block.insert(block, entry);
         self.by_age.insert((seq, block));
         self.dirty_bytes = self.dirty_bytes.saturating_add(bytes);
@@ -433,6 +515,10 @@ impl DirtyTracker {
 
     fn is_dirty(&self, block: BlockNumber) -> bool {
         self.by_block.contains_key(&block)
+    }
+
+    fn entry(&self, block: BlockNumber) -> Option<DirtyEntry> {
+        self.by_block.get(&block).copied()
     }
 
     fn dirty_count(&self) -> usize {
@@ -453,6 +539,18 @@ impl DirtyTracker {
     fn dirty_blocks_oldest_first(&self) -> Vec<BlockNumber> {
         self.by_age.iter().map(|(_, block)| *block).collect()
     }
+
+    fn state_counts(&self) -> (usize, usize) {
+        let mut in_flight = 0_usize;
+        let mut committed = 0_usize;
+        for entry in self.by_block.values() {
+            match entry.state {
+                DirtyState::InFlight => in_flight += 1,
+                DirtyState::Committed => committed += 1,
+            }
+        }
+        (in_flight, committed)
+    }
 }
 
 #[derive(Debug)]
@@ -469,7 +567,11 @@ struct ArcState {
     /// Ordered dirty block tracking for write-back and durability accounting.
     dirty: DirtyTracker,
     /// Dirty payloads queued for retry after a failed flush attempt.
-    pending_flush: Vec<(BlockNumber, Vec<u8>)>,
+    pending_flush: Vec<FlushCandidate>,
+    /// Staged, not-yet-committed transactional payloads.
+    staged_txn_writes: HashMap<TxnId, HashMap<BlockNumber, Vec<u8>>>,
+    /// Reverse map for staged payload ownership checks.
+    staged_block_owner: HashMap<BlockNumber, TxnId>,
     /// Monotonic hit counter (resident data found).
     hits: u64,
     /// Monotonic miss counter (device read required).
@@ -493,6 +595,8 @@ impl ArcState {
             resident: HashMap::new(),
             dirty: DirtyTracker::default(),
             pending_flush: Vec::new(),
+            staged_txn_writes: HashMap::new(),
+            staged_block_owner: HashMap::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -678,8 +782,16 @@ impl ArcState {
     }
 
     /// Mark a block as dirty (written but not yet flushed to disk).
-    fn mark_dirty(&mut self, block: BlockNumber, bytes: usize) {
-        self.dirty.mark_dirty(block, bytes);
+    fn mark_dirty(
+        &mut self,
+        block: BlockNumber,
+        bytes: usize,
+        txn_id: TxnId,
+        commit_seq: Option<CommitSeq>,
+        state: DirtyState,
+    ) {
+        self.dirty
+            .mark_dirty(block, bytes, txn_id, commit_seq, state);
     }
 
     /// Clear the dirty flag for a block (after flushing to disk).
@@ -697,38 +809,110 @@ impl ArcState {
         self.dirty.dirty_blocks_oldest_first()
     }
 
-    fn take_pending_flush(&mut self) -> Vec<(BlockNumber, Vec<u8>)> {
+    fn stage_txn_write(&mut self, txn_id: TxnId, block: BlockNumber, data: Vec<u8>) -> Result<()> {
+        if let Some(owner) = self.staged_block_owner.get(&block).copied()
+            && owner != txn_id
+        {
+            return Err(FfsError::Format(format!(
+                "block {} already staged by txn {}",
+                block.0, owner.0
+            )));
+        }
+
+        self.staged_txn_writes
+            .entry(txn_id)
+            .or_default()
+            .insert(block, data.clone());
+        self.staged_block_owner.insert(block, txn_id);
+        self.mark_dirty(block, data.len(), txn_id, None, DirtyState::InFlight);
+        trace!(
+            event = "mvcc_dirty_stage",
+            txn_id = txn_id.0,
+            block = block.0,
+            commit_seq_opt = 0_u64,
+            state = "in_flight"
+        );
+        Ok(())
+    }
+
+    fn take_staged_txn(&mut self, txn_id: TxnId) -> HashMap<BlockNumber, Vec<u8>> {
+        let staged = self.staged_txn_writes.remove(&txn_id).unwrap_or_default();
+        for block in staged.keys() {
+            let _ = self.staged_block_owner.remove(block);
+        }
+        staged
+    }
+
+    fn take_pending_flush(&mut self) -> Vec<FlushCandidate> {
         std::mem::take(&mut self.pending_flush)
     }
 
-    fn take_dirty_and_pending_flushes(&mut self) -> Vec<(BlockNumber, Vec<u8>)> {
+    fn take_dirty_and_pending_flushes(&mut self) -> Vec<FlushCandidate> {
         let mut flushes = self.take_pending_flush();
+        let requested_blocks = self.dirty.dirty_count();
+        let (in_flight_blocks, _) = self.dirty.state_counts();
         let mut queued = HashSet::with_capacity(flushes.len());
-        for (block, _) in &flushes {
-            queued.insert(*block);
+        for candidate in &flushes {
+            queued.insert(candidate.block);
         }
 
         for block in self.dirty_blocks() {
             if queued.contains(&block) {
                 continue;
             }
+            let Some(entry) = self.dirty.entry(block) else {
+                continue;
+            };
+            if !entry.is_flushable() {
+                warn!(
+                    event = "mvcc_flush_skipped_uncommitted",
+                    txn_id = entry.txn_id.0,
+                    block = block.0,
+                    state = "in_flight"
+                );
+                continue;
+            }
+            let Some(commit_seq) = entry.commit_seq else {
+                continue;
+            };
             if let Some(data) = self.resident.get(&block).cloned() {
-                flushes.push((block, data));
+                trace!(
+                    event = "mvcc_flush_candidate",
+                    block = block.0,
+                    commit_seq = commit_seq.0,
+                    flushable = true
+                );
+                flushes.push(FlushCandidate {
+                    block,
+                    data,
+                    txn_id: entry.txn_id,
+                    commit_seq,
+                });
                 queued.insert(block);
             }
         }
+
+        debug!(
+            event = "mvcc_flush_batch_filter",
+            requested_blocks,
+            eligible_blocks = flushes.len(),
+            in_flight_blocks,
+            aborted_blocks = 0_usize
+        );
         flushes
     }
 
     fn take_dirty_and_pending_flushes_limited(
         &mut self,
         limit: usize,
-    ) -> Vec<(BlockNumber, Vec<u8>)> {
+    ) -> Vec<FlushCandidate> {
         if limit == 0 {
             return Vec::new();
         }
 
         let pending = self.take_pending_flush();
+        let requested_blocks = self.dirty.dirty_count();
+        let (in_flight_blocks, _) = self.dirty.state_counts();
         let mut flushes = Vec::with_capacity(limit.min(pending.len()));
         let mut overflow_pending = Vec::new();
 
@@ -745,8 +929,8 @@ impl ArcState {
         }
 
         let mut queued = HashSet::with_capacity(flushes.len());
-        for (block, _) in &flushes {
-            queued.insert(*block);
+        for candidate in &flushes {
+            queued.insert(candidate.block);
         }
 
         for block in self.dirty_blocks() {
@@ -756,11 +940,45 @@ impl ArcState {
             if queued.contains(&block) {
                 continue;
             }
+            let Some(entry) = self.dirty.entry(block) else {
+                continue;
+            };
+            if !entry.is_flushable() {
+                warn!(
+                    event = "mvcc_flush_skipped_uncommitted",
+                    txn_id = entry.txn_id.0,
+                    block = block.0,
+                    state = "in_flight"
+                );
+                continue;
+            }
+            let Some(commit_seq) = entry.commit_seq else {
+                continue;
+            };
             if let Some(data) = self.resident.get(&block).cloned() {
-                flushes.push((block, data));
+                trace!(
+                    event = "mvcc_flush_candidate",
+                    block = block.0,
+                    commit_seq = commit_seq.0,
+                    flushable = true
+                );
+                flushes.push(FlushCandidate {
+                    block,
+                    data,
+                    txn_id: entry.txn_id,
+                    commit_seq,
+                });
                 queued.insert(block);
             }
         }
+
+        debug!(
+            event = "mvcc_flush_batch_filter",
+            requested_blocks,
+            eligible_blocks = flushes.len(),
+            in_flight_blocks,
+            aborted_blocks = 0_usize
+        );
 
         flushes
     }
@@ -799,6 +1017,7 @@ pub struct ArcCache<D: BlockDevice> {
     inner: D,
     state: Mutex<ArcState>,
     write_policy: ArcWritePolicy,
+    mvcc_flush_lifecycle: Arc<dyn MvccFlushLifecycle>,
 }
 
 /// Write policy for [`ArcCache`].
@@ -899,6 +1118,20 @@ impl<D: BlockDevice> ArcCache<D> {
         capacity_blocks: usize,
         write_policy: ArcWritePolicy,
     ) -> Result<Self> {
+        Self::new_with_policy_and_mvcc_lifecycle(
+            inner,
+            capacity_blocks,
+            write_policy,
+            Arc::new(NoopMvccFlushLifecycle),
+        )
+    }
+
+    pub fn new_with_policy_and_mvcc_lifecycle(
+        inner: D,
+        capacity_blocks: usize,
+        write_policy: ArcWritePolicy,
+        mvcc_flush_lifecycle: Arc<dyn MvccFlushLifecycle>,
+    ) -> Result<Self> {
         if capacity_blocks == 0 {
             return Err(FfsError::Format(
                 "ArcCache capacity_blocks must be > 0".to_owned(),
@@ -908,6 +1141,7 @@ impl<D: BlockDevice> ArcCache<D> {
             inner,
             state: Mutex::new(ArcState::new(capacity_blocks)),
             write_policy,
+            mvcc_flush_lifecycle,
         })
     }
 
@@ -928,6 +1162,155 @@ impl<D: BlockDevice> ArcCache<D> {
     #[must_use]
     pub fn write_policy(&self) -> ArcWritePolicy {
         self.write_policy
+    }
+
+    fn dirty_state_counts(&self) -> (usize, usize) {
+        self.state.lock().dirty.state_counts()
+    }
+
+    fn committed_dirty_ratio(&self) -> f64 {
+        let guard = self.state.lock();
+        let (_, committed_blocks) = guard.dirty.state_counts();
+        if guard.capacity == 0 {
+            0.0
+        } else {
+            committed_blocks as f64 / guard.capacity as f64
+        }
+    }
+
+    /// Stage a transactional write that is not yet visible/flushable.
+    ///
+    /// The payload is tracked as in-flight dirty state and only becomes
+    /// cache-visible + flushable after [`Self::commit_staged_txn`].
+    pub fn stage_txn_write(
+        &self,
+        cx: &Cx,
+        txn_id: TxnId,
+        block: BlockNumber,
+        data: &[u8],
+    ) -> Result<()> {
+        cx_checkpoint(cx)?;
+        let expected = usize::try_from(self.block_size())
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+        if data.len() != expected {
+            return Err(FfsError::Format(format!(
+                "stage_txn_write data size mismatch: got={} expected={expected}",
+                data.len()
+            )));
+        }
+
+        let mut guard = self.state.lock();
+        guard.stage_txn_write(txn_id, block, data.to_vec())
+    }
+
+    /// Commit all staged writes for `txn_id` and mark them flushable.
+    ///
+    /// Returns the number of blocks transitioned from in-flight to committed.
+    pub fn commit_staged_txn(&self, cx: &Cx, txn_id: TxnId, commit_seq: CommitSeq) -> Result<usize> {
+        cx_checkpoint(cx)?;
+        let staged = {
+            let mut guard = self.state.lock();
+            guard.take_staged_txn(txn_id)
+        };
+        if staged.is_empty() {
+            return Ok(0);
+        }
+
+        let mut enforce_backpressure = false;
+        let mut committed_blocks = 0_usize;
+        let mut guard = self.state.lock();
+        for (block, data) in &staged {
+            if guard.resident.contains_key(block) {
+                guard.resident.insert(*block, data.clone());
+                guard.on_hit(*block);
+            } else {
+                guard.on_miss_or_ghost_hit(*block);
+                guard.resident.insert(*block, data.clone());
+            }
+            guard.mark_dirty(
+                *block,
+                data.len(),
+                txn_id,
+                Some(commit_seq),
+                DirtyState::Committed,
+            );
+            trace!(
+                event = "mvcc_dirty_stage",
+                txn_id = txn_id.0,
+                block = block.0,
+                commit_seq_opt = commit_seq.0,
+                state = "committed"
+            );
+            committed_blocks += 1;
+        }
+
+        if matches!(self.write_policy, ArcWritePolicy::WriteBack) {
+            let (_, committed_blocks_now) = guard.dirty.state_counts();
+            let dirty_ratio = if guard.capacity == 0 {
+                0.0
+            } else {
+                committed_blocks_now as f64 / guard.capacity as f64
+            };
+            if dirty_ratio > DIRTY_CRITICAL_WATERMARK {
+                enforce_backpressure = true;
+                warn!(
+                    event = "flush_backpressure_critical",
+                    txn_id = txn_id.0,
+                    dirty_ratio,
+                    critical_watermark = DIRTY_CRITICAL_WATERMARK
+                );
+            } else if dirty_ratio > DIRTY_HIGH_WATERMARK {
+                warn!(
+                    event = "flush_backpressure_high",
+                    txn_id = txn_id.0,
+                    dirty_ratio,
+                    high_watermark = DIRTY_HIGH_WATERMARK
+                );
+            }
+        }
+
+        let pending_flush = guard.take_pending_flush();
+        drop(guard);
+        self.flush_pending_evictions(cx, pending_flush)?;
+
+        if enforce_backpressure {
+            loop {
+                let dirty_ratio = self.committed_dirty_ratio();
+                if dirty_ratio <= DIRTY_HIGH_WATERMARK {
+                    break;
+                }
+                self.flush_dirty(cx)?;
+            }
+        }
+
+        Ok(committed_blocks)
+    }
+
+    /// Abort all staged writes for `txn_id`, discarding in-flight dirty state.
+    ///
+    /// Returns the number of discarded staged blocks.
+    #[must_use]
+    pub fn abort_staged_txn(&self, txn_id: TxnId) -> usize {
+        let mut guard = self.state.lock();
+        let staged = guard.take_staged_txn(txn_id);
+        let discarded_blocks = staged.len();
+        for block in staged.keys() {
+            let is_same_txn_inflight = guard
+                .dirty
+                .entry(*block)
+                .is_some_and(|entry| entry.txn_id == txn_id && matches!(entry.state, DirtyState::InFlight));
+            if is_same_txn_inflight {
+                guard.clear_dirty(*block);
+            }
+        }
+        if discarded_blocks > 0 {
+            warn!(
+                event = "mvcc_discard_aborted_dirty",
+                txn_id = txn_id.0,
+                discarded_blocks
+            );
+        }
+        discarded_blocks
     }
 
     /// Spawn a background thread that periodically flushes dirty blocks.
@@ -961,16 +1344,25 @@ impl<D: BlockDevice> ArcCache<D> {
 
                     let metrics = cache.metrics();
                     let dirty_ratio = metrics.dirty_ratio();
+                    let (in_flight_blocks, committed_blocks) = cache.dirty_state_counts();
+                    let committed_dirty_ratio = if metrics.capacity == 0 {
+                        0.0
+                    } else {
+                        committed_blocks as f64 / metrics.capacity as f64
+                    };
                     trace!(
                         event = "flush_daemon_tick",
                         cycle_seq,
                         dirty_blocks = metrics.dirty_blocks,
+                        in_flight_blocks,
+                        committed_blocks,
                         dirty_bytes = metrics.dirty_bytes,
                         dirty_ratio,
+                        committed_dirty_ratio,
                         oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0)
                     );
 
-                    if metrics.dirty_blocks == 0 {
+                    if committed_blocks == 0 {
                         trace!(
                             event = "flush_daemon_sleep",
                             cycle_seq,
@@ -979,23 +1371,23 @@ impl<D: BlockDevice> ArcCache<D> {
                         continue;
                     }
 
-                    let flush_res = if dirty_ratio > config.high_watermark {
-                        if dirty_ratio > config.critical_watermark {
+                    let flush_res = if committed_dirty_ratio > config.high_watermark {
+                        if committed_dirty_ratio > config.critical_watermark {
                             warn!(
                                 event = "flush_backpressure_critical",
                                 cycle_seq,
-                                dirty_ratio,
+                                dirty_ratio = committed_dirty_ratio,
                                 critical_watermark = config.critical_watermark
                             );
                         } else {
                             warn!(
                                 event = "flush_backpressure_high",
                                 cycle_seq,
-                                dirty_ratio,
+                                dirty_ratio = committed_dirty_ratio,
                                 high_watermark = config.high_watermark
                             );
                         }
-                        cache.flush_dirty(&cx).map(|()| metrics.dirty_blocks)
+                        cache.flush_dirty(&cx).map(|()| committed_blocks)
                     } else {
                         cache.flush_dirty_batch(&cx, config.batch_size)
                     };
@@ -1033,10 +1425,34 @@ impl<D: BlockDevice> ArcCache<D> {
         })
     }
 
-    fn flush_blocks(&self, cx: &Cx, flushes: &[(BlockNumber, Vec<u8>)]) -> Result<()> {
-        for (block, data) in flushes {
+    fn flush_blocks(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
+        let lifecycle = Arc::clone(&self.mvcc_flush_lifecycle);
+        for candidate in flushes {
             cx_checkpoint(cx)?;
-            self.inner.write_block(cx, *block, data)?;
+            let pin = match lifecycle.pin_for_flush(candidate.block, candidate.commit_seq) {
+                Ok(pin) => pin,
+                Err(err) => {
+                    error!(
+                        event = "mvcc_flush_pin_conflict",
+                        block = candidate.block.0,
+                        commit_seq = candidate.commit_seq.0,
+                        error = %err
+                    );
+                    return Err(err);
+                }
+            };
+            self.inner.write_block(cx, candidate.block, &candidate.data)?;
+            if let Err(err) = lifecycle.mark_persisted(candidate.block, candidate.commit_seq) {
+                error!(
+                    event = "mvcc_flush_commit_state_update_failed",
+                    txn_id = candidate.txn_id.0,
+                    block = candidate.block.0,
+                    commit_seq = candidate.commit_seq.0,
+                    error = %err
+                );
+                return Err(err);
+            }
+            drop(pin);
         }
         Ok(())
     }
@@ -1044,7 +1460,7 @@ impl<D: BlockDevice> ArcCache<D> {
     fn flush_pending_evictions(
         &self,
         cx: &Cx,
-        pending_flush: Vec<(BlockNumber, Vec<u8>)>,
+        pending_flush: Vec<FlushCandidate>,
     ) -> Result<()> {
         if pending_flush.is_empty() {
             return Ok(());
@@ -1059,8 +1475,14 @@ impl<D: BlockDevice> ArcCache<D> {
         if let Err(err) = self.flush_blocks(cx, &pending_flush) {
             // Restore the pending queue on failure so callers can retry.
             let mut guard = self.state.lock();
-            for (block, data) in &pending_flush {
-                guard.mark_dirty(*block, data.len());
+            for candidate in &pending_flush {
+                guard.mark_dirty(
+                    candidate.block,
+                    candidate.data.len(),
+                    candidate.txn_id,
+                    Some(candidate.commit_seq),
+                    DirtyState::Committed,
+                );
             }
             guard.pending_flush.extend(pending_flush);
             drop(guard);
@@ -1129,7 +1551,20 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         }
 
         if matches!(self.write_policy, ArcWritePolicy::WriteBack) {
-            guard.mark_dirty(block, data.len());
+            guard.mark_dirty(
+                block,
+                data.len(),
+                TxnId(0),
+                Some(CommitSeq(0)),
+                DirtyState::Committed,
+            );
+            trace!(
+                event = "mvcc_dirty_stage",
+                txn_id = 0_u64,
+                block = block.0,
+                commit_seq_opt = 0_u64,
+                state = "committed"
+            );
         } else {
             guard.clear_dirty(block);
         }
@@ -1147,7 +1582,12 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         );
 
         if matches!(self.write_policy, ArcWritePolicy::WriteBack) {
-            let dirty_ratio = metrics.dirty_ratio();
+            let (_, committed_blocks) = guard.dirty.state_counts();
+            let dirty_ratio = if guard.capacity == 0 {
+                0.0
+            } else {
+                committed_blocks as f64 / guard.capacity as f64
+            };
             if dirty_ratio > DIRTY_CRITICAL_WATERMARK {
                 enforce_backpressure = true;
                 warn!(
@@ -1173,7 +1613,7 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         if enforce_backpressure {
             // Block writers by synchronously draining until we're back under high watermark.
             loop {
-                let dirty_ratio = self.metrics().dirty_ratio();
+                let dirty_ratio = self.committed_dirty_ratio();
                 if dirty_ratio <= DIRTY_HIGH_WATERMARK {
                     break;
                 }
@@ -1278,11 +1718,13 @@ impl<D: BlockDevice> ArcCache<D> {
             return Ok(0);
         }
 
-        let flush_bytes: usize = flushes.iter().map(|(_, data)| data.len()).sum();
+        let flush_bytes: usize = flushes.iter().map(|candidate| candidate.data.len()).sum();
+        let min_commit_seq = flushes.iter().map(|candidate| candidate.commit_seq.0).min();
+        let max_commit_seq = flushes.iter().map(|candidate| candidate.commit_seq.0).max();
         debug!(
             event = "flush_batch_start",
             batch_len = flushes.len(),
-            oldest_block = flushes.first().map_or(0, |(b, _)| b.0),
+            oldest_block = flushes.first().map_or(0, |candidate| candidate.block.0),
             oldest_dirty_age_ticks = pre_metrics.oldest_dirty_age_ticks.unwrap_or(0),
             policy = ?self.write_policy,
             attempted_bytes = flush_bytes
@@ -1292,8 +1734,14 @@ impl<D: BlockDevice> ArcCache<D> {
         if let Err(err) = self.flush_blocks(cx, &flushes) {
             let attempted_blocks = flushes.len();
             let mut guard = self.state.lock();
-            for (block, data) in &flushes {
-                guard.mark_dirty(*block, data.len());
+            for candidate in &flushes {
+                guard.mark_dirty(
+                    candidate.block,
+                    candidate.data.len(),
+                    candidate.txn_id,
+                    Some(candidate.commit_seq),
+                    DirtyState::Committed,
+                );
             }
             guard.pending_flush.extend(flushes);
             drop(guard);
@@ -1308,12 +1756,19 @@ impl<D: BlockDevice> ArcCache<D> {
         }
 
         let mut guard = self.state.lock();
-        for (block, _) in &flushes {
-            guard.clear_dirty(*block);
+        for candidate in &flushes {
+            guard.clear_dirty(candidate.block);
         }
         guard.dirty_flushes += flushes.len() as u64;
         let metrics = guard.snapshot_metrics();
         drop(guard);
+        info!(
+            event = "mvcc_flush_commit_batch",
+            flushed_blocks = flushes.len(),
+            min_commit_seq = min_commit_seq.unwrap_or(0),
+            max_commit_seq = max_commit_seq.unwrap_or(0),
+            duration_ms = started.elapsed().as_millis()
+        );
         info!(
             event = "flush_batch_complete",
             flushed_blocks = flushes.len(),
@@ -1346,7 +1801,9 @@ impl<D: BlockDevice> ArcCache<D> {
             return Ok(());
         }
 
-        let flush_bytes: usize = flushes.iter().map(|(_, data)| data.len()).sum();
+        let flush_bytes: usize = flushes.iter().map(|candidate| candidate.data.len()).sum();
+        let min_commit_seq = flushes.iter().map(|candidate| candidate.commit_seq.0).min();
+        let max_commit_seq = flushes.iter().map(|candidate| candidate.commit_seq.0).max();
         debug!(
             event = "flush_dirty_start",
             blocks = flushes.len(),
@@ -1357,8 +1814,14 @@ impl<D: BlockDevice> ArcCache<D> {
         if let Err(err) = self.flush_blocks(cx, &flushes) {
             // Restore flush state on failure so retry logic can recover.
             let mut guard = self.state.lock();
-            for (block, data) in &flushes {
-                guard.mark_dirty(*block, data.len());
+            for candidate in &flushes {
+                guard.mark_dirty(
+                    candidate.block,
+                    candidate.data.len(),
+                    candidate.txn_id,
+                    Some(candidate.commit_seq),
+                    DirtyState::Committed,
+                );
             }
             guard.pending_flush.extend(flushes);
             drop(guard);
@@ -1371,11 +1834,18 @@ impl<D: BlockDevice> ArcCache<D> {
         }
 
         let mut guard = self.state.lock();
-        for (block, _) in &flushes {
-            guard.clear_dirty(*block);
+        for candidate in &flushes {
+            guard.clear_dirty(candidate.block);
         }
         guard.dirty_flushes += flushes.len() as u64;
         let metrics = guard.snapshot_metrics();
+        info!(
+            event = "mvcc_flush_commit_batch",
+            flushed_blocks = flushes.len(),
+            min_commit_seq = min_commit_seq.unwrap_or(0),
+            max_commit_seq = max_commit_seq.unwrap_or(0),
+            duration_ms = started.elapsed().as_millis()
+        );
         info!(
             event = "flush_dirty_complete",
             blocks = flushes.len(),
@@ -1406,6 +1876,7 @@ impl<D: BlockDevice> ArcCache<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn arc_access(state: &mut ArcState, key: BlockNumber) {
@@ -1520,6 +1991,34 @@ mod tests {
 
         fn sync_count(&self) -> usize {
             self.sync_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingFlushLifecycle {
+        pins: AtomicUsize,
+        persisted: AtomicUsize,
+    }
+
+    impl RecordingFlushLifecycle {
+        fn pin_count(&self) -> usize {
+            self.pins.load(Ordering::SeqCst)
+        }
+
+        fn persisted_count(&self) -> usize {
+            self.persisted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MvccFlushLifecycle for RecordingFlushLifecycle {
+        fn pin_for_flush(&self, _block: BlockNumber, _commit_seq: CommitSeq) -> Result<FlushPinToken> {
+            self.pins.fetch_add(1, Ordering::SeqCst);
+            Ok(FlushPinToken::new(()))
+        }
+
+        fn mark_persisted(&self, _block: BlockNumber, _commit_seq: CommitSeq) -> Result<()> {
+            self.persisted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1981,6 +2480,139 @@ mod tests {
 
         assert_eq!(cache.dirty_count(), 0);
         assert_eq!(cache.inner().write_count(), 1000);
+    }
+
+    #[test]
+    fn mvcc_uncommitted_dirty_blocks_are_not_flushed() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache =
+            ArcCache::new_with_policy(counted, 4, ArcWritePolicy::WriteBack).expect("cache");
+
+        cache
+            .stage_txn_write(&cx, TxnId(41), BlockNumber(1), &[0xAA; 4096])
+            .expect("stage");
+        assert_eq!(cache.dirty_count(), 1);
+
+        cache.flush_dirty(&cx).expect("flush");
+        assert_eq!(cache.inner().write_count(), 0);
+        assert_eq!(cache.dirty_count(), 1);
+
+        let discarded = cache.abort_staged_txn(TxnId(41));
+        assert_eq!(discarded, 1);
+        assert_eq!(cache.dirty_count(), 0);
+    }
+
+    #[test]
+    fn mvcc_commit_then_flush_marks_persisted_with_pin() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 8);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let lifecycle = StdArc::new(RecordingFlushLifecycle::default());
+        let cache = ArcCache::new_with_policy_and_mvcc_lifecycle(
+            counted,
+            8,
+            ArcWritePolicy::WriteBack,
+            lifecycle.clone(),
+        )
+        .expect("cache");
+
+        cache
+            .stage_txn_write(&cx, TxnId(7), BlockNumber(2), &[0x11; 4096])
+            .expect("stage");
+        cache
+            .commit_staged_txn(&cx, TxnId(7), CommitSeq(77))
+            .expect("commit");
+
+        // Committed-but-unflushed block is served from cache immediately.
+        let read = cache.read_block(&cx, BlockNumber(2)).expect("read");
+        assert_eq!(read.as_slice(), &[0x11; 4096]);
+        assert_eq!(cache.inner().write_count(), 0);
+
+        cache.flush_dirty(&cx).expect("flush");
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(cache.inner().write_count(), 1);
+        assert_eq!(lifecycle.pin_count(), 1);
+        assert_eq!(lifecycle.persisted_count(), 1);
+    }
+
+    #[test]
+    fn mvcc_concurrent_commit_abort_with_daemon_running() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 32);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let lifecycle = StdArc::new(RecordingFlushLifecycle::default());
+        let cache = StdArc::new(
+            ArcCache::new_with_policy_and_mvcc_lifecycle(
+                counted,
+                16,
+                ArcWritePolicy::WriteBack,
+                lifecycle.clone(),
+            )
+            .expect("cache"),
+        );
+        let daemon = cache
+            .start_flush_daemon(FlushDaemonConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 2,
+                ..FlushDaemonConfig::default()
+            })
+            .expect("start daemon");
+
+        let c1 = StdArc::clone(&cache);
+        let t1 = std::thread::spawn(move || {
+            let cx = Cx::for_testing();
+            c1.stage_txn_write(&cx, TxnId(100), BlockNumber(4), &[0x44; 4096])
+                .expect("stage t1");
+            c1.commit_staged_txn(&cx, TxnId(100), CommitSeq(100))
+                .expect("commit t1");
+        });
+
+        let c2 = StdArc::clone(&cache);
+        let t2 = std::thread::spawn(move || {
+            let cx = Cx::for_testing();
+            c2.stage_txn_write(&cx, TxnId(200), BlockNumber(5), &[0x55; 4096])
+                .expect("stage t2");
+            let discarded = c2.abort_staged_txn(TxnId(200));
+            assert_eq!(discarded, 1);
+        });
+
+        let c3 = StdArc::clone(&cache);
+        let t3 = std::thread::spawn(move || {
+            let cx = Cx::for_testing();
+            c3.stage_txn_write(&cx, TxnId(300), BlockNumber(6), &[0x66; 4096])
+                .expect("stage t3");
+            c3.commit_staged_txn(&cx, TxnId(300), CommitSeq(300))
+                .expect("commit t3");
+        });
+
+        t1.join().expect("t1 join");
+        t2.join().expect("t2 join");
+        t3.join().expect("t3 join");
+
+        for _ in 0..120 {
+            if cache.dirty_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        daemon.shutdown();
+
+        assert_eq!(cache.dirty_count(), 0);
+        let writes = cache.inner().write_sequence();
+        assert!(writes.contains(&BlockNumber(4)));
+        assert!(writes.contains(&BlockNumber(6)));
+        assert!(!writes.contains(&BlockNumber(5)));
+        assert_eq!(lifecycle.pin_count(), 2);
+        assert_eq!(lifecycle.persisted_count(), 2);
+
+        // Aborted txn data is not visible.
+        let aborted_read = cache.read_block(&cx, BlockNumber(5)).expect("aborted read");
+        assert_eq!(aborted_read.as_slice(), &[0_u8; 4096]);
     }
 
     // ── CacheMetrics tests ──────────────────────────────────────────────

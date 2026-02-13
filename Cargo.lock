@@ -689,6 +689,7 @@ dependencies = [
  "ffs-ondisk",
  "ffs-types",
  "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "tracing",
