@@ -44,6 +44,9 @@ fn ext4_tools_available() -> bool {
 // ── Image creation ──────────────────────────────────────────────
 
 const FILE_CONTENT: &[u8] = b"hello from FrankenFS reference test\n";
+const LARGE_FILE_CONTENT: &[u8] = b"hello from FrankenFS 64mb geometry variant\n";
+const DIR_INDEX_FILE_CONTENT: &[u8] = b"hello from FrankenFS dir_index variant\n";
+const DIR_INDEX_FILE_COUNT: usize = 180;
 
 fn create_reference_image(image_path: &Path) -> PathBuf {
     // Create 8MB zero file
@@ -52,6 +55,10 @@ fn create_reference_image(image_path: &Path) -> PathBuf {
     drop(f);
 
     // Format as ext4
+    eprintln!(
+        "mkfs.ext4 params: -L ffs-ref -b 4096 -q {}",
+        image_path.display()
+    );
     let st = Command::new("mkfs.ext4")
         .args(["-L", "ffs-ref", "-b", "4096", "-q"])
         .arg(image_path)
@@ -82,6 +89,7 @@ fn create_reference_image(image_path: &Path) -> PathBuf {
 }
 
 fn run_debugfs_w(image: &Path, cmd: &str) {
+    eprintln!("debugfs params: -w -R {cmd:?} {}", image.display());
     let st = Command::new("debugfs")
         .args(["-w", "-R", cmd])
         .arg(image)
@@ -92,6 +100,78 @@ fn run_debugfs_w(image: &Path, cmd: &str) {
     assert!(st.success(), "debugfs -w -R {cmd:?} failed");
 }
 
+/// Create a larger ext4 image variant (64 MiB, 4 KiB blocks) for golden tests.
+fn create_large_reference_image(image_path: &Path) -> PathBuf {
+    let f = std::fs::File::create(image_path).expect("create image file");
+    f.set_len(64 * 1024 * 1024).expect("set image length");
+    drop(f);
+
+    eprintln!(
+        "mkfs.ext4 params: -L ffs-ref-64 -b 4096 -q {}",
+        image_path.display()
+    );
+    let st = Command::new("mkfs.ext4")
+        .args(["-L", "ffs-ref-64", "-b", "4096", "-q"])
+        .arg(image_path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run mkfs.ext4");
+    assert!(st.success(), "mkfs.ext4 failed");
+
+    let content_path = image_path.with_extension("large.content.tmp");
+    std::fs::write(&content_path, LARGE_FILE_CONTENT).expect("write content file");
+
+    run_debugfs_w(image_path, "mkdir /deep");
+    run_debugfs_w(image_path, "mkdir /deep/nested");
+    run_debugfs_w(
+        image_path,
+        &format!("write {} /deep/nested/data.txt", content_path.display()),
+    );
+    run_debugfs_w(
+        image_path,
+        &format!("write {} /readme64.txt", content_path.display()),
+    );
+
+    std::fs::remove_file(&content_path).ok();
+    image_path.to_path_buf()
+}
+
+/// Create a dir_index-focused ext4 image variant with many directory entries.
+fn create_dir_index_reference_image(image_path: &Path) -> PathBuf {
+    let f = std::fs::File::create(image_path).expect("create image file");
+    f.set_len(64 * 1024 * 1024).expect("set image length");
+    drop(f);
+
+    eprintln!(
+        "mkfs.ext4 params: -L ffs-ref-dx -b 4096 -q -O dir_index {}",
+        image_path.display()
+    );
+    let st = Command::new("mkfs.ext4")
+        .args(["-L", "ffs-ref-dx", "-b", "4096", "-q", "-O", "dir_index"])
+        .arg(image_path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run mkfs.ext4");
+    assert!(st.success(), "mkfs.ext4 -O dir_index failed");
+
+    run_debugfs_w(image_path, "mkdir /htree");
+
+    let content_path = image_path.with_extension("dir_index.content.tmp");
+    std::fs::write(&content_path, DIR_INDEX_FILE_CONTENT).expect("write content file");
+
+    for idx in 0..DIR_INDEX_FILE_COUNT {
+        let cmd = format!("write {} /htree/file_{idx:03}.txt", content_path.display());
+        run_debugfs_w(image_path, &cmd);
+    }
+    run_debugfs_w(
+        image_path,
+        &format!("write {} /readme-dx.txt", content_path.display()),
+    );
+
+    std::fs::remove_file(&content_path).ok();
+    image_path.to_path_buf()
+}
+
 /// Create an ext4 image without a journal (for tests that don't need journal replay).
 fn create_nojournal_image(image_path: &Path) -> PathBuf {
     // Create 8MB zero file
@@ -100,6 +180,10 @@ fn create_nojournal_image(image_path: &Path) -> PathBuf {
     drop(f);
 
     // Format as ext4 without journal (-O ^has_journal)
+    eprintln!(
+        "mkfs.ext4 params: -L ffs-nojournal -b 4096 -q -O ^has_journal {}",
+        image_path.display()
+    );
     let st = Command::new("mkfs.ext4")
         .args([
             "-L",
@@ -211,19 +295,23 @@ fn capture_directory(image: &Path, dir: &str) -> Vec<KernelDirEntry> {
 
 // ── Golden JSON helpers ─────────────────────────────────────────
 
-fn golden_path() -> PathBuf {
+fn golden_path_named(file_name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("workspace root")
         .join("conformance")
         .join("golden")
-        .join("ext4_8mb_reference.json")
+        .join(file_name)
+}
+
+fn load_golden_named(file_name: &str) -> GoldenReference {
+    let text = std::fs::read_to_string(golden_path_named(file_name)).expect("read golden JSON");
+    serde_json::from_str(&text).expect("parse golden JSON")
 }
 
 fn load_golden() -> GoldenReference {
-    let text = std::fs::read_to_string(golden_path()).expect("read golden JSON");
-    serde_json::from_str(&text).expect("parse golden JSON")
+    load_golden_named("ext4_8mb_reference.json")
 }
 
 fn assert_dir_entries_match(expected: &[GoldenDirEntry], actual_names: &[(String, String)]) {
@@ -376,6 +464,47 @@ fn assert_dir_entries_match_kernel(
         k_sorted, f_sorted,
         "directory {path}: kernel vs ffs-ondisk entry mismatch"
     );
+}
+
+fn assert_field_eq<T>(variant: &str, path: &str, field: &str, expected: &T, actual: &T)
+where
+    T: std::fmt::Debug + PartialEq,
+{
+    assert_eq!(
+        expected, actual,
+        "variant={variant} path={path} field={field} expected={expected:?} actual={actual:?}"
+    );
+}
+
+#[derive(Clone, Copy)]
+struct Ext4GoldenVariant {
+    name: &'static str,
+    golden_file: &'static str,
+    temp_image_name: &'static str,
+    create_image: fn(&Path) -> PathBuf,
+}
+
+fn ext4_golden_variants() -> [Ext4GoldenVariant; 3] {
+    [
+        Ext4GoldenVariant {
+            name: "ext4_8mb_reference",
+            golden_file: "ext4_8mb_reference.json",
+            temp_image_name: "ffs_ref_variant_8mb.ext4",
+            create_image: create_reference_image,
+        },
+        Ext4GoldenVariant {
+            name: "ext4_64mb_reference",
+            golden_file: "ext4_64mb_reference.json",
+            temp_image_name: "ffs_ref_variant_64mb.ext4",
+            create_image: create_large_reference_image,
+        },
+        Ext4GoldenVariant {
+            name: "ext4_dir_index_reference",
+            golden_file: "ext4_dir_index_reference.json",
+            temp_image_name: "ffs_ref_variant_dir_index.ext4",
+            create_image: create_dir_index_reference_image,
+        },
+    ]
 }
 
 /// E2E: read file content via ffs-ondisk and compare against known bytes.
@@ -605,6 +734,163 @@ fn ffs_ondisk_matches_golden_json() {
     }
 
     std::fs::remove_file(&tmp).ok();
+}
+
+/// E2E: each ext4 golden variant must match a freshly generated image.
+///
+/// This is the primary regression gate for ext4 golden variants. On mismatch,
+/// assertions include explicit variant/path/field context.
+fn assert_variant_superblock_fields(
+    variant: &Ext4GoldenVariant,
+    golden: &GoldenReference,
+    reader: &Ext4ImageReader,
+) {
+    assert_field_eq(
+        variant.name,
+        "/",
+        "superblock.block_size",
+        &golden.superblock.block_size,
+        &reader.sb.block_size,
+    );
+    assert_field_eq(
+        variant.name,
+        "/",
+        "superblock.blocks_count",
+        &golden.superblock.blocks_count,
+        &reader.sb.blocks_count,
+    );
+    assert_field_eq(
+        variant.name,
+        "/",
+        "superblock.inodes_count",
+        &golden.superblock.inodes_count,
+        &reader.sb.inodes_count,
+    );
+    assert_field_eq(
+        variant.name,
+        "/",
+        "superblock.volume_name",
+        &golden.superblock.volume_name,
+        &reader.sb.volume_name,
+    );
+    assert_field_eq(
+        variant.name,
+        "/",
+        "superblock.free_blocks_count",
+        &golden.superblock.free_blocks_count,
+        &reader.sb.free_blocks_count,
+    );
+    assert_field_eq(
+        variant.name,
+        "/",
+        "superblock.free_inodes_count",
+        &golden.superblock.free_inodes_count,
+        &reader.sb.free_inodes_count,
+    );
+}
+
+fn assert_variant_directory_fields(
+    variant: &Ext4GoldenVariant,
+    golden: &GoldenReference,
+    reader: &Ext4ImageReader,
+    image: &[u8],
+) {
+    for gdir in &golden.directories {
+        let (_, inode) = reader
+            .resolve_path(image, &gdir.path)
+            .unwrap_or_else(|e| panic!("variant={} resolve {}: {e}", variant.name, gdir.path));
+        let entries = reader
+            .read_dir(image, &inode)
+            .unwrap_or_else(|e| panic!("variant={} read_dir {}: {e}", variant.name, gdir.path));
+        let mut actual: Vec<(String, String)> = entries
+            .iter()
+            .map(|e| (e.name_str(), ext4_dir_entry_type_str(e).to_string()))
+            .collect();
+        actual.sort_unstable();
+
+        let mut expected: Vec<(String, String)> = gdir
+            .entries
+            .iter()
+            .map(|e| (e.name.clone(), e.file_type.clone()))
+            .collect();
+        expected.sort_unstable();
+
+        assert_field_eq(
+            variant.name,
+            &gdir.path,
+            "directory.entries",
+            &expected,
+            &actual,
+        );
+    }
+}
+
+fn assert_variant_file_fields(
+    variant: &Ext4GoldenVariant,
+    golden: &GoldenReference,
+    reader: &Ext4ImageReader,
+    image: &[u8],
+) {
+    for gfile in &golden.files {
+        let (_, inode) = reader
+            .resolve_path(image, &gfile.path)
+            .unwrap_or_else(|e| panic!("variant={} resolve {}: {e}", variant.name, gfile.path));
+        assert_field_eq(
+            variant.name,
+            &gfile.path,
+            "file.size",
+            &gfile.size,
+            &inode.size,
+        );
+
+        #[allow(clippy::cast_possible_truncation)]
+        let mut buf = vec![0_u8; inode.size as usize];
+        let n = reader
+            .read_inode_data(image, &inode, 0, &mut buf)
+            .unwrap_or_else(|e| panic!("variant={} read {}: {e}", variant.name, gfile.path));
+        let actual_content = buf[..n].to_vec();
+        assert_field_eq(
+            variant.name,
+            &gfile.path,
+            "file.content",
+            &gfile.content,
+            &actual_content,
+        );
+    }
+}
+
+fn assert_variant_matches_generated_image(variant: &Ext4GoldenVariant) {
+    let golden = load_golden_named(variant.golden_file);
+    let tmp = std::env::temp_dir().join(variant.temp_image_name);
+
+    eprintln!(
+        "testing variant={} golden={} image={}",
+        variant.name,
+        variant.golden_file,
+        tmp.display()
+    );
+    (variant.create_image)(&tmp);
+
+    let image = std::fs::read(&tmp).expect("read image");
+    let reader = Ext4ImageReader::new(&image).expect("parse ext4 image");
+
+    assert_variant_superblock_fields(variant, &golden, &reader);
+    assert_variant_directory_fields(variant, &golden, &reader, &image);
+    assert_variant_file_fields(variant, &golden, &reader, &image);
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn ext4_variant_goldens_match_generated_images() {
+    if !ext4_tools_available() {
+        eprintln!("SKIPPED: ext4 kernel tools not available");
+        return;
+    }
+
+    for variant in ext4_golden_variants() {
+        assert_variant_matches_generated_image(&variant);
+    }
 }
 
 /// E2E: verify OpenFs bitmap-based free space counting matches kernel tools.

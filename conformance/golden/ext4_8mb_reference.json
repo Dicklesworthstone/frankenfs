@@ -18,32 +18,36 @@
     {
       "path": "/",
       "entries": [
-    {"name": ".", "file_type": "directory"},
-    {"name": "..", "file_type": "directory"},
-    {"name": "lost+found", "file_type": "directory"},
-    {"name": "testdir", "file_type": "directory"},
-    {"name": "readme.txt", "file_type": "regular"}
-  ]
-    },
+        {"name": ".", "file_type": "directory"},
+        {"name": "..", "file_type": "directory"},
+        {"name": "lost+found", "file_type": "directory"},
+        {"name": "testdir", "file_type": "directory"},
+        {"name": "readme.txt", "file_type": "regular"}
+      ]
+    }
+,
     {
       "path": "/testdir",
       "entries": [
-    {"name": ".", "file_type": "directory"},
-    {"name": "..", "file_type": "directory"},
-    {"name": "hello.txt", "file_type": "regular"}
-  ]
+        {"name": ".", "file_type": "directory"},
+        {"name": "..", "file_type": "directory"},
+        {"name": "hello.txt", "file_type": "regular"}
+      ]
     }
+
   ],
   "files": [
     {
       "path": "/testdir/hello.txt",
       "size": 36,
       "content": [104,101,108,108,111,32,102,114,111,109,32,70,114,97,110,107,101,110,70,83,32,114,101,102,101,114,101,110,99,101,32,116,101,115,116,10]
-    },
+    }
+,
     {
       "path": "/readme.txt",
       "size": 36,
       "content": [104,101,108,108,111,32,102,114,111,109,32,70,114,97,110,107,101,110,70,83,32,114,101,102,101,114,101,110,99,101,32,116,101,115,116,10]
     }
+
   ]
 }

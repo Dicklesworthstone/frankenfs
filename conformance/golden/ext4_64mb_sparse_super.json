@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "source": "Linux e2fsprogs (mkfs.ext4 + debugfs + dumpe2fs)",
+  "image_params": {
+    "size_bytes": 67108864,
+    "block_size": 4096,
+    "volume_name": "ffs-64mb"
+  },
+  "superblock": {
+    "block_size": 4096,
+    "blocks_count": 16384,
+    "inodes_count": 16384,
+    "volume_name": "ffs-64mb",
+    "free_blocks_count": 14276,
+    "free_inodes_count": 16364
+  },
+  "directories": [
+    {
+      "path": "/",
+      "entries": [
+    {"name": ".", "file_type": "directory"},
+    {"name": "..", "file_type": "directory"},
+    {"name": "lost+found", "file_type": "directory"},
+    {"name": "a", "file_type": "directory"},
+    {"name": "empty.dat", "file_type": "regular"},
+    {"name": "link_to_small", "file_type": "symlink"}
+  ]
+    },
+    {
+      "path": "/a",
+      "entries": [
+    {"name": ".", "file_type": "directory"},
+    {"name": "..", "file_type": "directory"},
+    {"name": "b", "file_type": "directory"},
+    {"name": "small.txt", "file_type": "regular"}
+  ]
+    },
+    {
+      "path": "/a/b",
+      "entries": [
+    {"name": ".", "file_type": "directory"},
+    {"name": "..", "file_type": "directory"},
+    {"name": "c", "file_type": "directory"},
+    {"name": "medium.bin", "file_type": "regular"}
+  ]
+    },
+    {
+      "path": "/a/b/c",
+      "entries": [
+    {"name": ".", "file_type": "directory"},
+    {"name": "..", "file_type": "directory"},
+    {"name": "large.bin", "file_type": "regular"}
+  ]
+    }
+  ],
+  "files": [
+    {
+      "path": "/a/small.txt",
+      "size": 36,
+      "content": [104,101,108,108,111,32,102,114,111,109,32,70,114,97,110,107,101,110,70,83,32,114,101,102,101,114,101,110,99,101,32,116,101,115,116,10]
+    }
+  ]
+}

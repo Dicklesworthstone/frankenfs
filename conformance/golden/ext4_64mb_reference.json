@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "source": "Linux e2fsprogs (mkfs.ext4 + debugfs + dumpe2fs)",
+  "image_params": {
+    "size_bytes": 67108864,
+    "block_size": 4096,
+    "volume_name": "ffs-ref-64"
+  },
+  "superblock": {
+    "block_size": 4096,
+    "blocks_count": 16384,
+    "inodes_count": 16384,
+    "volume_name": "ffs-ref-64",
+    "free_blocks_count": 14283,
+    "free_inodes_count": 16368
+  },
+  "directories": [
+    {
+      "path": "/",
+      "entries": [
+        {"name": ".", "file_type": "directory"},
+        {"name": "..", "file_type": "directory"},
+        {"name": "lost+found", "file_type": "directory"},
+        {"name": "deep", "file_type": "directory"},
+        {"name": "readme64.txt", "file_type": "regular"}
+      ]
+    }
+,
+    {
+      "path": "/deep",
+      "entries": [
+        {"name": ".", "file_type": "directory"},
+        {"name": "..", "file_type": "directory"},
+        {"name": "nested", "file_type": "directory"}
+      ]
+    }
+,
+    {
+      "path": "/deep/nested",
+      "entries": [
+        {"name": ".", "file_type": "directory"},
+        {"name": "..", "file_type": "directory"},
+        {"name": "data.txt", "file_type": "regular"}
+      ]
+    }
+
+  ],
+  "files": [
+    {
+      "path": "/deep/nested/data.txt",
+      "size": 43,
+      "content": [104,101,108,108,111,32,102,114,111,109,32,70,114,97,110,107,101,110,70,83,32,54,52,109,98,32,103,101,111,109,101,116,114,121,32,118,97,114,105,97,110,116,10]
+    }
+,
+    {
+      "path": "/readme64.txt",
+      "size": 43,
+      "content": [104,101,108,108,111,32,102,114,111,109,32,70,114,97,110,107,101,110,70,83,32,54,52,109,98,32,103,101,111,109,101,116,114,121,32,118,97,114,105,97,110,116,10]
+    }
+
+  ]
+}
