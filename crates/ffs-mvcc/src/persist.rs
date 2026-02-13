@@ -1387,4 +1387,259 @@ mod tests {
             assert_eq!(report.records_discarded, 0);
         }
     }
+
+    // ── Fault Injection: WAL Interruption Tests ────────────────────────
+
+    /// Helper: create a WAL with `n` commits, return path and per-commit byte
+    /// sizes (so we know exactly where to truncate).
+    fn create_wal_with_commits(n: u8) -> (std::path::PathBuf, Vec<u64>) {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("temp file");
+        let path = tmp.path().to_path_buf();
+        std::fs::remove_file(&path).ok();
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("open");
+        let mut sizes = Vec::new();
+        for i in 1..=n {
+            let prev_size = store.wal_stats().wal_size_bytes;
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(u64::from(i)), vec![i; 64]);
+            store.commit(txn).expect("commit");
+            sizes.push(store.wal_stats().wal_size_bytes - prev_size);
+        }
+        // Prevent NamedTempFile from being dropped (which would delete the file).
+        std::mem::forget(tmp);
+        (path, sizes)
+    }
+
+    /// Scenario 1: Crash during WAL entry write (before fsync).
+    ///
+    /// Simulate by truncating the WAL mid-record after a successful first
+    /// commit.  On recovery, only the first commit survives.
+    #[test]
+    fn fault_crash_before_fsync_loses_uncommitted() {
+        let cx = test_cx();
+        let (path, sizes) = create_wal_with_commits(2);
+
+        // Truncate partway through the second commit record.
+        let first_commit_end = HEADER_SIZE as u64 + sizes[0];
+        let partial_second = first_commit_end + sizes[1] / 2;
+        {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open for truncate");
+            file.set_len(partial_second).expect("truncate");
+        }
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+        let report = store.recovery_report();
+        assert_eq!(
+            report.commits_replayed, 1,
+            "only first commit should survive"
+        );
+        assert!(
+            report.records_discarded > 0,
+            "truncated record should be discarded"
+        );
+
+        let snap = store.current_snapshot();
+        assert_eq!(
+            store.read_visible(BlockNumber(1), snap),
+            Some(vec![1_u8; 64])
+        );
+        assert_eq!(store.read_visible(BlockNumber(2), snap), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario 2: Torn write — CRC32c detects partial record.
+    ///
+    /// Write a valid WAL, then corrupt the CRC of the last record by
+    /// flipping bytes in the middle.  Recovery should discard the corrupt
+    /// record.
+    #[test]
+    fn fault_torn_write_detected_by_crc() {
+        let cx = test_cx();
+        let (path, sizes) = create_wal_with_commits(2);
+
+        // Corrupt a byte in the second commit record (flip the data area).
+        let second_record_start = HEADER_SIZE as u64 + sizes[0];
+        {
+            let mut data = std::fs::read(&path).expect("read WAL");
+            #[expect(clippy::cast_possible_truncation)]
+            let corrupt_offset = second_record_start as usize + 25; // in the data area
+            if corrupt_offset < data.len() {
+                data[corrupt_offset] ^= 0xFF;
+            }
+            std::fs::write(&path, &data).expect("write corrupted WAL");
+        }
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+        let report = store.recovery_report();
+        assert_eq!(report.commits_replayed, 1, "first commit should survive");
+        assert!(
+            report.records_discarded > 0,
+            "corrupt record should be discarded"
+        );
+
+        let snap = store.current_snapshot();
+        assert_eq!(
+            store.read_visible(BlockNumber(1), snap),
+            Some(vec![1_u8; 64])
+        );
+        assert_eq!(store.read_visible(BlockNumber(2), snap), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario 3: Crash after data entries written but before commit
+    /// record completes.
+    ///
+    /// Truncate the WAL so the record_len field is present but the
+    /// record body is incomplete.
+    #[test]
+    fn fault_crash_before_commit_record_complete() {
+        let cx = test_cx();
+        let (path, sizes) = create_wal_with_commits(2);
+
+        // Truncate so only the first 8 bytes of the second record survive
+        // (record_len + record_type + partial commit_seq).
+        let second_record_start = HEADER_SIZE as u64 + sizes[0];
+        let truncate_at = second_record_start + 8;
+        {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open for truncate");
+            file.set_len(truncate_at).expect("truncate");
+        }
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+        let report = store.recovery_report();
+        assert_eq!(report.commits_replayed, 1);
+        assert!(report.records_discarded > 0);
+
+        let snap = store.current_snapshot();
+        assert_eq!(
+            store.read_visible(BlockNumber(1), snap),
+            Some(vec![1_u8; 64])
+        );
+        assert_eq!(store.read_visible(BlockNumber(2), snap), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario 4: Crash during commit record write — corrupt CRC at
+    /// exact CRC field position.
+    ///
+    /// Overwrite the last 4 bytes (CRC field) of the second record with
+    /// garbage.  The record_len will indicate a full record but the CRC
+    /// won't match.
+    #[test]
+    fn fault_corrupt_commit_record_crc() {
+        let cx = test_cx();
+        let (path, sizes) = create_wal_with_commits(2);
+
+        // Overwrite the CRC field (last 4 bytes of the second record).
+        let second_record_end = HEADER_SIZE as u64 + sizes[0] + sizes[1];
+        {
+            let mut data = std::fs::read(&path).expect("read WAL");
+            #[expect(clippy::cast_possible_truncation)]
+            let crc_start = second_record_end as usize - 4;
+            if crc_start + 4 <= data.len() {
+                data[crc_start..crc_start + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            std::fs::write(&path, &data).expect("write corrupted WAL");
+        }
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+        let report = store.recovery_report();
+        assert_eq!(report.commits_replayed, 1, "first commit should survive");
+        assert!(report.records_discarded > 0, "bad CRC should be discarded");
+
+        let snap = store.current_snapshot();
+        assert_eq!(
+            store.read_visible(BlockNumber(1), snap),
+            Some(vec![1_u8; 64])
+        );
+        assert_eq!(store.read_visible(BlockNumber(2), snap), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario 5: Crash after commit record is fully written (durable)
+    /// but before cache flush.
+    ///
+    /// Both commits are fully in the WAL, so recovery should restore
+    /// everything.  This is the "good" crash case.
+    #[test]
+    fn fault_crash_after_commit_both_survive() {
+        let cx = test_cx();
+        let (path, _sizes) = create_wal_with_commits(3);
+
+        // No corruption — the WAL is intact.  Simulate a "crash" by
+        // simply reopening.
+        let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+        let report = store.recovery_report();
+        assert_eq!(report.commits_replayed, 3, "all 3 commits should survive");
+        assert_eq!(report.records_discarded, 0, "no discards expected");
+
+        let snap = store.current_snapshot();
+        for i in 1_u8..=3 {
+            assert_eq!(
+                store.read_visible(BlockNumber(u64::from(i)), snap),
+                Some(vec![i; 64]),
+                "block {i} should be intact"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Comprehensive: multiple truncation points across a 5-commit WAL.
+    ///
+    /// For each byte boundary between commits, truncate and verify that
+    /// exactly the completed commits survive.
+    #[test]
+    fn fault_systematic_truncation_sweep() {
+        let cx = test_cx();
+        let (path, sizes) = create_wal_with_commits(5);
+
+        // Cumulative byte positions where each commit ends.
+        let mut boundaries = Vec::new();
+        let mut pos = HEADER_SIZE as u64;
+        for s in &sizes {
+            pos += s;
+            boundaries.push(pos);
+        }
+
+        // For each commit boundary, truncate just before it and verify
+        // that exactly (i) commits survive.
+        for (i, &boundary) in boundaries.iter().enumerate() {
+            let truncate_at = boundary - 1; // one byte short of complete
+            {
+                // Copy the original WAL
+                let original = std::fs::read(&path).expect("read WAL");
+                let truncated_path = path.with_extension(format!("trunc{i}"));
+                #[expect(clippy::cast_possible_truncation)]
+                std::fs::write(&truncated_path, &original[..truncate_at as usize])
+                    .expect("write truncated");
+
+                let store = PersistentMvccStore::open(&cx, &truncated_path).expect("reopen");
+                let report = store.recovery_report();
+                assert_eq!(
+                    report.commits_replayed,
+                    i as u64,
+                    "truncation before commit {}: expected {i} commits",
+                    i + 1
+                );
+                assert!(report.records_discarded > 0);
+
+                let _ = std::fs::remove_file(&truncated_path);
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -307,6 +307,334 @@ pub fn clear_journal(cx: &Cx, dev: &dyn BlockDevice, region: JournalRegion) -> R
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// JBD2-compatible journal writer
+// ---------------------------------------------------------------------------
+
+/// Statistics from a JBD2 journal write operation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Jbd2WriteStats {
+    pub descriptor_blocks: u64,
+    pub data_blocks: u64,
+    pub revoke_blocks: u64,
+    pub commit_blocks: u64,
+}
+
+/// A pending JBD2 transaction being assembled before commit.
+#[derive(Debug, Clone)]
+pub struct Jbd2Transaction {
+    sequence: u32,
+    writes: Vec<(BlockNumber, Vec<u8>)>,
+    revokes: Vec<BlockNumber>,
+}
+
+impl Jbd2Transaction {
+    /// Add a block write to this transaction.
+    ///
+    /// `target` is the home (destination) block number; `payload` is the data.
+    pub fn add_write(&mut self, target: BlockNumber, payload: Vec<u8>) {
+        self.writes.push((target, payload));
+    }
+
+    /// Add a revoke entry — `target` will be skipped during replay even if a
+    /// prior descriptor references it.
+    pub fn add_revoke(&mut self, target: BlockNumber) {
+        self.revokes.push(target);
+    }
+
+    /// The sequence number assigned to this transaction.
+    #[must_use]
+    pub fn sequence(&self) -> u32 {
+        self.sequence
+    }
+
+    /// Number of writes staged so far.
+    #[must_use]
+    pub fn write_count(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// Number of revoke entries staged so far.
+    #[must_use]
+    pub fn revoke_count(&self) -> usize {
+        self.revokes.len()
+    }
+}
+
+/// JBD2-compatible journal writer.
+///
+/// Produces descriptor + data + revoke + commit blocks in a journal region
+/// that [`replay_jbd2`] can successfully replay. This is the write-side
+/// counterpart needed for compatibility-mode ext4 writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jbd2Writer {
+    region: JournalRegion,
+    /// Next free index within the journal region (region-relative).
+    head: u64,
+    /// Next sequence number for a new transaction.
+    next_seq: u32,
+}
+
+impl Jbd2Writer {
+    /// Create a writer for an empty journal region starting at `start_seq`.
+    #[must_use]
+    pub fn new(region: JournalRegion, start_seq: u32) -> Self {
+        Self {
+            region,
+            head: 0,
+            next_seq: start_seq,
+        }
+    }
+
+    /// Open an existing journal region, scanning forward to discover the tail.
+    ///
+    /// Scans JBD2 header blocks to find the first free slot. The next sequence
+    /// number is set to one past the highest sequence seen, or `start_seq` if
+    /// the region is empty.
+    pub fn open(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        region: JournalRegion,
+        start_seq: u32,
+    ) -> Result<Self> {
+        let mut head = 0_u64;
+        let mut max_seq = start_seq;
+
+        while head < region.blocks {
+            let block = resolve_region_block(region, head)?;
+            let raw = dev.read_block(cx, block)?;
+
+            let Some(header) = Jbd2Header::parse(raw.as_slice()) else {
+                break;
+            };
+            if header.magic != JBD2_MAGIC {
+                break;
+            }
+
+            if header.sequence >= max_seq {
+                max_seq = header.sequence.saturating_add(1);
+            }
+
+            match header.block_type {
+                JBD2_BLOCKTYPE_DESCRIPTOR => {
+                    let tags = parse_descriptor_tags(raw.as_slice());
+                    // Advance past descriptor + its data blocks.
+                    head = head
+                        .saturating_add(1)
+                        .saturating_add(u64::try_from(tags.len()).unwrap_or(u64::MAX));
+                }
+                _ => {
+                    head = head.saturating_add(1);
+                }
+            }
+        }
+
+        Ok(Self {
+            region,
+            head,
+            next_seq: max_seq,
+        })
+    }
+
+    /// Begin a new transaction, consuming the next sequence number.
+    pub fn begin_transaction(&mut self) -> Jbd2Transaction {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        Jbd2Transaction {
+            sequence: seq,
+            writes: Vec::new(),
+            revokes: Vec::new(),
+        }
+    }
+
+    /// Current head position (region-relative block index).
+    #[must_use]
+    pub fn head(&self) -> u64 {
+        self.head
+    }
+
+    /// Next sequence number that will be assigned.
+    #[must_use]
+    pub fn next_seq(&self) -> u32 {
+        self.next_seq
+    }
+
+    /// Number of free blocks remaining in the journal region.
+    #[must_use]
+    pub fn free_blocks(&self) -> u64 {
+        self.region.blocks.saturating_sub(self.head)
+    }
+
+    /// Compute how many journal blocks a transaction with `writes` data blocks
+    /// and `revokes` revoke entries will consume.
+    #[must_use]
+    pub fn blocks_needed(block_size: u32, writes: usize, revokes: usize) -> u64 {
+        let bs = block_size as usize;
+        let tags_per_desc = max_tags_per_descriptor(bs);
+        let entries_per_revoke = max_revoke_entries(bs);
+
+        let mut total = 0_u64;
+        if writes > 0 {
+            let desc_blocks = writes.div_ceil(tags_per_desc) as u64;
+            total = total
+                .saturating_add(desc_blocks)
+                .saturating_add(writes as u64);
+        }
+        if revokes > 0 {
+            total = total.saturating_add(revokes.div_ceil(entries_per_revoke) as u64);
+        }
+        // Commit block.
+        total.saturating_add(1)
+    }
+
+    /// Commit a transaction to the journal region.
+    ///
+    /// Layout produced:
+    /// 1. One or more descriptor blocks, each followed by its data blocks.
+    /// 2. Zero or more revoke blocks.
+    /// 3. One commit block.
+    ///
+    /// Returns `(sequence_number, write_stats)`.
+    pub fn commit_transaction(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        txn: &Jbd2Transaction,
+    ) -> Result<(u32, Jbd2WriteStats)> {
+        let bs = usize::try_from(dev.block_size())
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+
+        let needed = Self::blocks_needed(dev.block_size(), txn.writes.len(), txn.revokes.len());
+        if needed > self.free_blocks() {
+            return Err(FfsError::NoSpace);
+        }
+
+        let mut stats = Jbd2WriteStats::default();
+        let seq = txn.sequence;
+
+        // --- Phase 1: descriptor + data blocks ---
+        let tags_per_desc = max_tags_per_descriptor(bs);
+        let mut write_idx = 0;
+        while write_idx < txn.writes.len() {
+            let chunk_end = (write_idx + tags_per_desc).min(txn.writes.len());
+            let chunk = &txn.writes[write_idx..chunk_end];
+
+            let mut desc = vec![0_u8; bs];
+            encode_jbd2_header(&mut desc, JBD2_BLOCKTYPE_DESCRIPTOR, seq);
+
+            let mut off = JBD2_HEADER_SIZE;
+            for (i, (target, _)) in chunk.iter().enumerate() {
+                let target_u32 = u32::try_from(target.0).map_err(|_| {
+                    FfsError::Format(format!("target block {} exceeds u32 range", target.0))
+                })?;
+                let is_last_in_desc = i == chunk.len() - 1;
+                let flags = if is_last_in_desc {
+                    JBD2_TAG_FLAG_LAST
+                } else {
+                    0
+                };
+                desc[off..off + 4].copy_from_slice(&target_u32.to_be_bytes());
+                desc[off + 4..off + 8].copy_from_slice(&flags.to_be_bytes());
+                off += JBD2_TAG_SIZE;
+            }
+
+            let desc_block = self.alloc_block()?;
+            dev.write_block(cx, desc_block, &desc)?;
+            stats.descriptor_blocks = stats.descriptor_blocks.saturating_add(1);
+
+            for (_, payload) in chunk {
+                let data_block = self.alloc_block()?;
+                let mut padded = vec![0_u8; bs];
+                let copy_len = payload.len().min(bs);
+                padded[..copy_len].copy_from_slice(&payload[..copy_len]);
+                dev.write_block(cx, data_block, &padded)?;
+                stats.data_blocks = stats.data_blocks.saturating_add(1);
+            }
+
+            write_idx = chunk_end;
+        }
+
+        // --- Phase 2: revoke blocks ---
+        if !txn.revokes.is_empty() {
+            let entries_per_revoke = max_revoke_entries(bs);
+            let mut revoke_idx = 0;
+
+            while revoke_idx < txn.revokes.len() {
+                let chunk_end = (revoke_idx + entries_per_revoke).min(txn.revokes.len());
+                let chunk = &txn.revokes[revoke_idx..chunk_end];
+
+                let mut revoke = vec![0_u8; bs];
+                encode_jbd2_header(&mut revoke, JBD2_BLOCKTYPE_REVOKE, seq);
+
+                let r_count = u32::try_from(JBD2_REVOKE_HEADER_SIZE + chunk.len() * 4)
+                    .map_err(|_| FfsError::Format("revoke r_count overflow".to_owned()))?;
+                revoke[12..16].copy_from_slice(&r_count.to_be_bytes());
+
+                let mut off = JBD2_REVOKE_HEADER_SIZE;
+                for target in chunk {
+                    let target_u32 = u32::try_from(target.0).map_err(|_| {
+                        FfsError::Format(format!("revoke target {} exceeds u32 range", target.0))
+                    })?;
+                    revoke[off..off + 4].copy_from_slice(&target_u32.to_be_bytes());
+                    off += 4;
+                }
+
+                let rev_block = self.alloc_block()?;
+                dev.write_block(cx, rev_block, &revoke)?;
+                stats.revoke_blocks = stats.revoke_blocks.saturating_add(1);
+
+                revoke_idx = chunk_end;
+            }
+        }
+
+        // --- Phase 3: commit block ---
+        let mut commit = vec![0_u8; bs];
+        encode_jbd2_header(&mut commit, JBD2_BLOCKTYPE_COMMIT, seq);
+
+        let commit_blk = self.alloc_block()?;
+        dev.write_block(cx, commit_blk, &commit)?;
+        stats.commit_blocks = stats.commit_blocks.saturating_add(1);
+
+        tracing::trace!(
+            target: "ffs::journal",
+            seq,
+            data_blocks = stats.data_blocks,
+            revoke_blocks = stats.revoke_blocks,
+            head = self.head,
+            free = self.free_blocks(),
+            "jbd2_writer_committed"
+        );
+
+        Ok((seq, stats))
+    }
+
+    /// Allocate the next journal block, advancing head.
+    fn alloc_block(&mut self) -> Result<BlockNumber> {
+        if self.head >= self.region.blocks {
+            return Err(FfsError::NoSpace);
+        }
+        let block = resolve_region_block(self.region, self.head)?;
+        self.head = self.head.saturating_add(1);
+        Ok(block)
+    }
+}
+
+fn encode_jbd2_header(buf: &mut [u8], block_type: u32, sequence: u32) {
+    buf[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    buf[4..8].copy_from_slice(&block_type.to_be_bytes());
+    buf[8..12].copy_from_slice(&sequence.to_be_bytes());
+}
+
+#[must_use]
+fn max_tags_per_descriptor(block_size: usize) -> usize {
+    (block_size.saturating_sub(JBD2_HEADER_SIZE)) / JBD2_TAG_SIZE
+}
+
+#[must_use]
+fn max_revoke_entries(block_size: usize) -> usize {
+    (block_size.saturating_sub(JBD2_REVOKE_HEADER_SIZE)) / 4
+}
+
 /// A single recovered native COW write operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CowWrite {
@@ -1107,5 +1435,312 @@ mod tests {
 
         let block6 = dev.read_block(&cx, BlockNumber(6)).expect("read 6");
         assert_eq!(block6.as_slice(), &[0_u8; 512]); // Block 6 not written.
+    }
+
+    // -----------------------------------------------------------------------
+    // JBD2 Writer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jbd2_writer_single_write_replays_correctly() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(5), vec![0xAB; 512]);
+        let (seq, stats) = writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+
+        assert_eq!(seq, 1);
+        assert_eq!(stats.descriptor_blocks, 1);
+        assert_eq!(stats.data_blocks, 1);
+        assert_eq!(stats.commit_blocks, 1);
+        assert_eq!(stats.revoke_blocks, 0);
+
+        // Replay and verify the target block.
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.committed_sequences, vec![1]);
+        assert_eq!(outcome.stats.replayed_blocks, 1);
+
+        let target = dev.read_block(&cx, BlockNumber(5)).expect("read target");
+        assert_eq!(target.as_slice(), &[0xAB; 512]);
+    }
+
+    #[test]
+    fn jbd2_writer_multi_write_replays_all() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 10);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(2), vec![0x11; 512]);
+        txn.add_write(BlockNumber(3), vec![0x22; 512]);
+        txn.add_write(BlockNumber(4), vec![0x33; 512]);
+        let (seq, stats) = writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+
+        assert_eq!(seq, 10);
+        assert_eq!(stats.descriptor_blocks, 1);
+        assert_eq!(stats.data_blocks, 3);
+
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.committed_sequences, vec![10]);
+        assert_eq!(outcome.stats.replayed_blocks, 3);
+
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(2)).unwrap().as_slice(),
+            &[0x11; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0x22; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(4)).unwrap().as_slice(),
+            &[0x33; 512]
+        );
+    }
+
+    #[test]
+    fn jbd2_writer_revoke_prevents_replay() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(7), vec![0xDD; 512]);
+        txn.add_write(BlockNumber(8), vec![0xEE; 512]);
+        txn.add_revoke(BlockNumber(7)); // Revoke block 7.
+        let (_, stats) = writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+
+        assert_eq!(stats.revoke_blocks, 1);
+
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.committed_sequences, vec![1]);
+        assert_eq!(outcome.stats.replayed_blocks, 1);
+        assert_eq!(outcome.stats.skipped_revoked_blocks, 1);
+
+        // Block 7 was revoked — should remain zeroed.
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(7)).unwrap().as_slice(),
+            &[0_u8; 512]
+        );
+        // Block 8 was not revoked — should contain payload.
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(8)).unwrap().as_slice(),
+            &[0xEE; 512]
+        );
+    }
+
+    #[test]
+    fn jbd2_writer_incomplete_txn_ignored_on_replay() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        // Simulate a crash: write descriptor + data but NO commit.
+        let bs = 512_usize;
+        let mut desc = vec![0_u8; bs];
+        encode_jbd2_header(&mut desc, JBD2_BLOCKTYPE_DESCRIPTOR, 1);
+        let target_u32 = 9_u32;
+        desc[JBD2_HEADER_SIZE..JBD2_HEADER_SIZE + 4].copy_from_slice(&target_u32.to_be_bytes());
+        desc[JBD2_HEADER_SIZE + 4..JBD2_HEADER_SIZE + 8]
+            .copy_from_slice(&JBD2_TAG_FLAG_LAST.to_be_bytes());
+        dev.raw_write(BlockNumber(100), desc);
+        dev.raw_write(BlockNumber(101), vec![0xFF; 512]);
+        // No commit block written — simulates crash.
+
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert!(outcome.committed_sequences.is_empty());
+        assert_eq!(outcome.stats.incomplete_transactions, 1);
+
+        // Target block should remain untouched.
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(9)).unwrap().as_slice(),
+            &[0_u8; 512]
+        );
+    }
+
+    #[test]
+    fn jbd2_writer_journal_full_returns_no_space() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        // Region with only 2 blocks: needs desc(1) + data(1) + commit(1) = 3.
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 2,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(5), vec![0xAA; 512]);
+
+        let result = writer.commit_transaction(&cx, &dev, &txn);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FfsError::NoSpace => {}
+            other => panic!("expected NoSpace, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jbd2_writer_multi_transaction_sequence() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 64,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+
+        // Transaction 1: write block 2.
+        let mut txn1 = writer.begin_transaction();
+        txn1.add_write(BlockNumber(2), vec![0x11; 512]);
+        let (seq1, _) = writer
+            .commit_transaction(&cx, &dev, &txn1)
+            .expect("commit 1");
+        assert_eq!(seq1, 1);
+
+        // Transaction 2: write block 3.
+        let mut txn2 = writer.begin_transaction();
+        txn2.add_write(BlockNumber(3), vec![0x22; 512]);
+        let (seq2, _) = writer
+            .commit_transaction(&cx, &dev, &txn2)
+            .expect("commit 2");
+        assert_eq!(seq2, 2);
+
+        // Transaction 3: write block 4.
+        let mut txn3 = writer.begin_transaction();
+        txn3.add_write(BlockNumber(4), vec![0x33; 512]);
+        let (seq3, _) = writer
+            .commit_transaction(&cx, &dev, &txn3)
+            .expect("commit 3");
+        assert_eq!(seq3, 3);
+
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.committed_sequences, vec![1, 2, 3]);
+        assert_eq!(outcome.stats.replayed_blocks, 3);
+
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(2)).unwrap().as_slice(),
+            &[0x11; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0x22; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(4)).unwrap().as_slice(),
+            &[0x33; 512]
+        );
+    }
+
+    #[test]
+    fn jbd2_writer_open_discovers_existing_head() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        // Write a transaction.
+        {
+            let mut writer = Jbd2Writer::new(region, 1);
+            let mut txn = writer.begin_transaction();
+            txn.add_write(BlockNumber(5), vec![0xAA; 512]);
+            writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+            assert_eq!(writer.head(), 3); // descriptor + data + commit
+            assert_eq!(writer.next_seq(), 2);
+        }
+
+        // Re-open and verify head/seq discovery.
+        let reopened = Jbd2Writer::open(&cx, &dev, region, 1).expect("open");
+        assert_eq!(reopened.head(), 3);
+        assert_eq!(reopened.next_seq(), 2);
+    }
+
+    #[test]
+    fn jbd2_writer_descriptor_tag_encoding() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 42);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(7), vec![0x00; 512]);
+        txn.add_write(BlockNumber(13), vec![0x00; 512]);
+        writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+
+        // Read back the descriptor block and verify tag encoding.
+        let desc_raw = dev
+            .read_block(&cx, BlockNumber(100))
+            .expect("read descriptor");
+        let header = Jbd2Header::parse(desc_raw.as_slice()).expect("parse header");
+        assert_eq!(header.magic, JBD2_MAGIC);
+        assert_eq!(header.block_type, JBD2_BLOCKTYPE_DESCRIPTOR);
+        assert_eq!(header.sequence, 42);
+
+        let tags = parse_descriptor_tags(desc_raw.as_slice());
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].target, BlockNumber(7));
+        assert_eq!(tags[0].flags & JBD2_TAG_FLAG_LAST, 0); // Not last.
+        assert_eq!(tags[1].target, BlockNumber(13));
+        assert_ne!(tags[1].flags & JBD2_TAG_FLAG_LAST, 0); // Last.
+    }
+
+    #[test]
+    fn jbd2_writer_blocks_needed_calculation() {
+        // 512-byte blocks: (512-12)/8 = 62 tags per desc, (512-16)/4 = 124 entries per revoke.
+        assert_eq!(Jbd2Writer::blocks_needed(512, 0, 0), 1); // Just commit.
+        assert_eq!(Jbd2Writer::blocks_needed(512, 1, 0), 3); // desc + data + commit.
+        assert_eq!(Jbd2Writer::blocks_needed(512, 3, 0), 5); // desc + 3 data + commit.
+        assert_eq!(Jbd2Writer::blocks_needed(512, 0, 1), 2); // revoke + commit.
+        assert_eq!(Jbd2Writer::blocks_needed(512, 1, 1), 4); // desc + data + revoke + commit.
+        // 62 writes: fits in one descriptor.
+        assert_eq!(Jbd2Writer::blocks_needed(512, 62, 0), 64); // 1 desc + 62 data + commit.
+        // 63 writes: needs two descriptors.
+        assert_eq!(Jbd2Writer::blocks_needed(512, 63, 0), 66); // 2 desc + 63 data + commit.
+    }
+
+    #[test]
+    fn jbd2_writer_payload_padding() {
+        // Payloads shorter than block_size should be zero-padded.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(5), vec![0xCC; 128]); // Only 128 bytes.
+        writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.stats.replayed_blocks, 1);
+
+        let target = dev.read_block(&cx, BlockNumber(5)).expect("read");
+        assert_eq!(&target.as_slice()[..128], &[0xCC; 128]);
+        assert_eq!(&target.as_slice()[128..], &[0_u8; 384]);
     }
 }

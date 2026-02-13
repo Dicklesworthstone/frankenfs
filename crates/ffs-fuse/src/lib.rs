@@ -6,12 +6,12 @@
 //! and errors are mapped through [`FfsError::to_errno()`].
 
 use asupersync::Cx;
-use ffs_core::{FileType as FfsFileType, FsOps, InodeAttr, RequestOp};
+use ffs_core::{FileType as FfsFileType, FsOps, InodeAttr, RequestOp, SetAttrRequest};
 use ffs_error::FfsError;
 use ffs_types::InodeNumber;
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyOpen, ReplyXattr, Request,
+    FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use std::ffi::OsStr;
 use std::os::raw::c_int;
@@ -20,7 +20,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{info, trace, warn};
 
@@ -263,6 +263,7 @@ struct FuseInner {
     ops: Arc<dyn FsOps>,
     metrics: Arc<AtomicMetrics>,
     thread_count: usize,
+    read_only: bool,
 }
 
 impl std::fmt::Debug for FuseInner {
@@ -270,6 +271,7 @@ impl std::fmt::Debug for FuseInner {
         f.debug_struct("FuseInner")
             .field("metrics", &self.metrics)
             .field("thread_count", &self.thread_count)
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
@@ -320,6 +322,7 @@ impl FrankenFuse {
                 ops: Arc::from(ops),
                 metrics: Arc::new(AtomicMetrics::new()),
                 thread_count,
+                read_only: options.read_only,
             }),
         }
     }
@@ -361,6 +364,18 @@ impl FrankenFuse {
     }
 
     fn reply_error_xattr(ctx: &FuseErrorContext<'_>, reply: ReplyXattr) {
+        reply.error(ctx.log_and_errno());
+    }
+
+    fn reply_error_empty(ctx: &FuseErrorContext<'_>, reply: ReplyEmpty) {
+        reply.error(ctx.log_and_errno());
+    }
+
+    fn reply_error_write(ctx: &FuseErrorContext<'_>, reply: ReplyWrite) {
+        reply.error(ctx.log_and_errno());
+    }
+
+    fn reply_error_create(ctx: &FuseErrorContext<'_>, reply: ReplyCreate) {
         reply.error(ctx.log_and_errno());
     }
 
@@ -663,6 +678,272 @@ impl Filesystem for FrankenFuse {
                         error: &e,
                         operation: "listxattr",
                         ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    // ── Write operations ─────────────────────────────────────────────────
+
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        let resolve_time = |t: TimeOrNow| -> SystemTime {
+            match t {
+                TimeOrNow::SpecificTime(st) => st,
+                TimeOrNow::Now => SystemTime::now(),
+            }
+        };
+        let attrs = SetAttrRequest {
+            #[allow(clippy::cast_possible_truncation)]
+            mode: mode.map(|m| m as u16), // FUSE mode is u32, ext4 mode is u16
+            uid,
+            gid,
+            size,
+            atime: atime.map(resolve_time),
+            mtime: mtime.map(resolve_time),
+        };
+        match self.with_request_scope(&cx, RequestOp::Setattr, |cx| {
+            self.inner.ops.setattr(cx, InodeNumber(ino), &attrs)
+        }) {
+            Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(&attr)),
+            Err(e) => {
+                Self::reply_error_attr(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "setattr",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // FUSE mode u32 → ext4 u16
+    fn mkdir(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Mkdir, |cx| {
+            self.inner.ops.mkdir(
+                cx,
+                InodeNumber(parent),
+                name,
+                mode as u16,
+                req.uid(),
+                req.gid(),
+            )
+        }) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), 0),
+            Err(e) => {
+                Self::reply_error_entry(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "mkdir",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Unlink, |cx| {
+            self.inner.ops.unlink(cx, InodeNumber(parent), name)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "unlink",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Rmdir, |cx| {
+            self.inner.ops.rmdir(cx, InodeNumber(parent), name)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "rmdir",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Rename, |cx| {
+            self.inner.ops.rename(
+                cx,
+                InodeNumber(parent),
+                name,
+                InodeNumber(newparent),
+                newname,
+            )
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "rename",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        let byte_offset = u64::try_from(offset).unwrap_or(0);
+        match self.with_request_scope(&cx, RequestOp::Write, |cx| {
+            self.inner
+                .ops
+                .write(cx, InodeNumber(ino), byte_offset, data)
+        }) {
+            Ok(written) => reply.written(written),
+            Err(e) => {
+                Self::reply_error_write(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "write",
+                        ino,
+                        offset: Some(byte_offset),
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // FUSE mode u32 → ext4 u16
+    fn create(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Create, |cx| {
+            self.inner.ops.create(
+                cx,
+                InodeNumber(parent),
+                name,
+                mode as u16,
+                req.uid(),
+                req.gid(),
+            )
+        }) {
+            Ok(attr) => {
+                reply.created(&ATTR_TTL, &to_file_attr(&attr), 0, 0, 0);
+            }
+            Err(e) => {
+                Self::reply_error_create(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "create",
+                        ino: parent,
                         offset: None,
                     },
                     reply,
@@ -1533,6 +1814,7 @@ mod tests {
             ops: Arc::new(StubFs),
             metrics: Arc::new(AtomicMetrics::new()),
             thread_count: 4,
+            read_only: true,
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
 

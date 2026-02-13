@@ -12,6 +12,7 @@ crc32c = { workspace = true }
 ffs-types = { workspace = true }
 ffs-error = { workspace = true }
 ffs-block = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 parking_lot = { workspace = true }

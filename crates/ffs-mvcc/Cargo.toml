@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 asupersync = { workspace = true }
 crc32c = { workspace = true }
+crossbeam-epoch = { workspace = true }
 ffs-block = { workspace = true }
 ffs-error = { workspace = true }
 ffs-types = { workspace = true }
@@ -20,6 +21,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "wal_throughput"
