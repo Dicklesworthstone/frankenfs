@@ -4383,6 +4383,42 @@ mod tests {
     }
 
     #[test]
+    fn open_fs_btrfs_fsops_getattr_lookup_readdir_read() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+
+        // Root inode alias: VFS inode 1 should map to btrfs root_dir_objectid.
+        let root_attr = ops.getattr(&cx, InodeNumber(1)).unwrap();
+        assert_eq!(root_attr.kind, FileType::Directory);
+        assert_eq!(root_attr.perm, 0o755);
+
+        let child_attr = ops
+            .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+            .unwrap();
+        assert_eq!(child_attr.ino, InodeNumber(257));
+        assert_eq!(child_attr.kind, FileType::RegularFile);
+        assert_eq!(child_attr.size, 22);
+
+        let entries = ops.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[1].name, b"..");
+        assert_eq!(entries[2].name, b"hello.txt");
+
+        // Offset pagination should skip "." and ".."
+        let paged = ops.readdir(&cx, InodeNumber(1), 2).unwrap();
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].name, b"hello.txt");
+
+        let data = ops.read(&cx, InodeNumber(257), 0, 128).unwrap();
+        assert_eq!(&data, b"hello from btrfs fsops");
+    }
+
+    #[test]
     fn durability_autopilot_prefers_more_redundancy_when_failures_observed() {
         let candidates = [1.02, 1.05, 1.10];
 
