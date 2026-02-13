@@ -700,4 +700,77 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn parse_root_item_smoke() {
+        let mut root = vec![0_u8; 239];
+        root[176..184].copy_from_slice(&0x1234_0000_u64.to_le_bytes());
+        root[238] = 0;
+        let parsed = parse_root_item(&root).expect("parse root item");
+        assert_eq!(parsed.bytenr, 0x1234_0000);
+        assert_eq!(parsed.level, 0);
+    }
+
+    #[test]
+    fn parse_inode_item_smoke() {
+        let mut inode = [0_u8; 160];
+        inode[16..24].copy_from_slice(&4096_u64.to_le_bytes());
+        inode[24..32].copy_from_slice(&4096_u64.to_le_bytes());
+        inode[40..44].copy_from_slice(&2_u32.to_le_bytes());
+        inode[44..48].copy_from_slice(&1000_u32.to_le_bytes());
+        inode[48..52].copy_from_slice(&1000_u32.to_le_bytes());
+        inode[52..56].copy_from_slice(&0o040755_u32.to_le_bytes());
+        inode[112..120].copy_from_slice(&10_u64.to_le_bytes());
+        inode[124..132].copy_from_slice(&11_u64.to_le_bytes());
+        inode[136..144].copy_from_slice(&12_u64.to_le_bytes());
+        inode[148..156].copy_from_slice(&13_u64.to_le_bytes());
+        let parsed = parse_inode_item(&inode).expect("parse inode item");
+        assert_eq!(parsed.size, 4096);
+        assert_eq!(parsed.mode, 0o040755);
+        assert_eq!(parsed.nlink, 2);
+        assert_eq!(parsed.mtime_sec, 12);
+    }
+
+    #[test]
+    fn parse_dir_items_smoke() {
+        let name = b"hello.txt";
+        let mut data = vec![0_u8; 30 + name.len()];
+        data[0..8].copy_from_slice(&257_u64.to_le_bytes());
+        data[8] = BTRFS_ITEM_INODE_ITEM;
+        data[17..25].copy_from_slice(&1_u64.to_le_bytes()); // transid
+        data[25..27].copy_from_slice(&0_u16.to_le_bytes()); // data_len
+        data[27..29].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        data[29] = BTRFS_FT_REG_FILE;
+        data[30..30 + name.len()].copy_from_slice(name);
+
+        let parsed = parse_dir_items(&data).expect("parse dir items");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].child_objectid, 257);
+        assert_eq!(parsed[0].file_type, BTRFS_FT_REG_FILE);
+        assert_eq!(parsed[0].name, name);
+    }
+
+    #[test]
+    fn parse_extent_data_regular_smoke() {
+        let mut data = [0_u8; 53];
+        data[20] = BTRFS_FILE_EXTENT_REG;
+        data[21..29].copy_from_slice(&0x8_000_u64.to_le_bytes());
+        data[29..37].copy_from_slice(&4096_u64.to_le_bytes());
+        data[45..53].copy_from_slice(&128_u64.to_le_bytes());
+
+        let parsed = parse_extent_data(&data).expect("parse extent");
+        match parsed {
+            BtrfsExtentData::Regular {
+                extent_type,
+                disk_bytenr,
+                num_bytes,
+                ..
+            } => {
+                assert_eq!(extent_type, BTRFS_FILE_EXTENT_REG);
+                assert_eq!(disk_bytenr, 0x8_000);
+                assert_eq!(num_bytes, 128);
+            }
+            BtrfsExtentData::Inline { .. } => panic!("expected regular extent"),
+        }
+    }
 }
