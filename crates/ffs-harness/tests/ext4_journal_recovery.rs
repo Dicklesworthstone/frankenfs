@@ -2,9 +2,9 @@
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
-use ffs_core::{OpenFs, OpenOptions};
+use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions};
 use ffs_error::{FfsError, Result};
-use ffs_types::{ByteOffset, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET};
+use ffs_types::{BlockNumber, ByteOffset, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET};
 use std::sync::{Arc, Mutex};
 
 const BLOCK_SIZE: usize = 4096;
@@ -140,6 +140,41 @@ fn ext4_journal_recovery_replays_committed_transaction() {
         inspector.read_block_prefix(TARGET_BLOCK, TARGET_PREFIX_LEN),
         b"JBD2-REPLAY-TEST"
     );
+}
+
+#[test]
+fn ext4_journal_recovery_simulate_overlay_preserves_underlying_bytes() {
+    let image = build_ext4_image_with_journal(JournalScenario::Committed);
+    let dev = MemByteDevice::new(image);
+    let inspector = dev.clone();
+    let cx = Cx::for_testing();
+    let options = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+        ..OpenOptions::default()
+    };
+
+    let fs =
+        OpenFs::from_device(&cx, Box::new(dev), &options).expect("open ext4 with overlay replay");
+    let replay = fs
+        .ext4_journal_replay()
+        .expect("replay outcome should be present");
+
+    assert_eq!(replay.committed_sequences, vec![1]);
+    assert_eq!(replay.stats.replayed_blocks, 1);
+
+    // Underlying memory image is untouched.
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK, TARGET_PREFIX_LEN),
+        b"BLOCK15-ORIGINAL"
+    );
+    // Reads through OpenFs observe replayed bytes from the in-memory overlay.
+    let overlaid = fs
+        .read_block_vec(
+            &cx,
+            BlockNumber(u64::try_from(TARGET_BLOCK).expect("target block fits u64")),
+        )
+        .expect("overlay read should succeed");
+    assert_eq!(&overlaid[..TARGET_PREFIX_LEN], b"JBD2-REPLAY-TEST");
 }
 
 #[test]
