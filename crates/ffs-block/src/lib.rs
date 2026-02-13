@@ -8,8 +8,8 @@
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_types::{
-    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset, CommitSeq, TxnId,
-    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset, CommitSeq,
+    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, TxnId,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -199,8 +199,16 @@ pub trait BlockCache: BlockDevice {
 }
 
 /// Opaque flush pin token used to hold MVCC/GC protection across flush I/O.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct FlushPinToken(Option<Box<dyn Send + Sync>>);
+
+impl std::fmt::Debug for FlushPinToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("FlushPinToken")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
 
 impl FlushPinToken {
     #[must_use]
@@ -902,10 +910,7 @@ impl ArcState {
         flushes
     }
 
-    fn take_dirty_and_pending_flushes_limited(
-        &mut self,
-        limit: usize,
-    ) -> Vec<FlushCandidate> {
+    fn take_dirty_and_pending_flushes_limited(&mut self, limit: usize) -> Vec<FlushCandidate> {
         if limit == 0 {
             return Vec::new();
         }
@@ -1206,7 +1211,12 @@ impl<D: BlockDevice> ArcCache<D> {
     /// Commit all staged writes for `txn_id` and mark them flushable.
     ///
     /// Returns the number of blocks transitioned from in-flight to committed.
-    pub fn commit_staged_txn(&self, cx: &Cx, txn_id: TxnId, commit_seq: CommitSeq) -> Result<usize> {
+    pub fn commit_staged_txn(
+        &self,
+        cx: &Cx,
+        txn_id: TxnId,
+        commit_seq: CommitSeq,
+    ) -> Result<usize> {
         cx_checkpoint(cx)?;
         let staged = {
             let mut guard = self.state.lock();
@@ -1295,10 +1305,9 @@ impl<D: BlockDevice> ArcCache<D> {
         let staged = guard.take_staged_txn(txn_id);
         let discarded_blocks = staged.len();
         for block in staged.keys() {
-            let is_same_txn_inflight = guard
-                .dirty
-                .entry(*block)
-                .is_some_and(|entry| entry.txn_id == txn_id && matches!(entry.state, DirtyState::InFlight));
+            let is_same_txn_inflight = guard.dirty.entry(*block).is_some_and(|entry| {
+                entry.txn_id == txn_id && matches!(entry.state, DirtyState::InFlight)
+            });
             if is_same_txn_inflight {
                 guard.clear_dirty(*block);
             }
@@ -1441,7 +1450,8 @@ impl<D: BlockDevice> ArcCache<D> {
                     return Err(err);
                 }
             };
-            self.inner.write_block(cx, candidate.block, &candidate.data)?;
+            self.inner
+                .write_block(cx, candidate.block, &candidate.data)?;
             if let Err(err) = lifecycle.mark_persisted(candidate.block, candidate.commit_seq) {
                 error!(
                     event = "mvcc_flush_commit_state_update_failed",
@@ -1457,11 +1467,7 @@ impl<D: BlockDevice> ArcCache<D> {
         Ok(())
     }
 
-    fn flush_pending_evictions(
-        &self,
-        cx: &Cx,
-        pending_flush: Vec<FlushCandidate>,
-    ) -> Result<()> {
+    fn flush_pending_evictions(&self, cx: &Cx, pending_flush: Vec<FlushCandidate>) -> Result<()> {
         if pending_flush.is_empty() {
             return Ok(());
         }
@@ -2011,7 +2017,11 @@ mod tests {
     }
 
     impl MvccFlushLifecycle for RecordingFlushLifecycle {
-        fn pin_for_flush(&self, _block: BlockNumber, _commit_seq: CommitSeq) -> Result<FlushPinToken> {
+        fn pin_for_flush(
+            &self,
+            _block: BlockNumber,
+            _commit_seq: CommitSeq,
+        ) -> Result<FlushPinToken> {
             self.pins.fetch_add(1, Ordering::SeqCst);
             Ok(FlushPinToken::new(()))
         }

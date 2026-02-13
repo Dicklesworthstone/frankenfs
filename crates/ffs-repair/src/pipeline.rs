@@ -249,7 +249,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     fn update_adaptive_policy(&mut self, report: &ScrubReport) -> Result<()> {
         self.policy_decisions.clear();
 
-        let Some(autopilot) = self.adaptive_overhead.as_mut() else {
+        let Some(mut autopilot) = self.adaptive_overhead else {
             return Ok(());
         };
 
@@ -273,7 +273,8 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         for group_cfg in &self.groups {
             let group = group_cfg.layout.group.0;
             let metadata_group = self.metadata_groups.contains(&group);
-            let mut decision = autopilot.decision_for_group(group_cfg.source_block_count, metadata_group);
+            let mut decision =
+                autopilot.decision_for_group(group_cfg.source_block_count, metadata_group);
 
             if decision.symbols_selected > group_cfg.layout.repair_block_count {
                 let effective_symbols = group_cfg.layout.repair_block_count;
@@ -281,7 +282,8 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                 let effective_overhead = f64::from(effective_symbols) / f64::from(source_count);
                 decision.symbols_selected = effective_symbols;
                 decision.overhead_ratio = effective_overhead;
-                decision.risk_bound = autopilot.risk_bound(effective_overhead, group_cfg.source_block_count);
+                decision.risk_bound =
+                    autopilot.risk_bound(effective_overhead, group_cfg.source_block_count);
                 decision.expected_loss =
                     autopilot.expected_loss(effective_overhead, group_cfg.source_block_count);
                 warn!(
@@ -331,6 +333,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             self.policy_decisions.insert(group, decision);
         }
 
+        self.adaptive_overhead = Some(autopilot);
         Ok(())
     }
 
@@ -338,7 +341,9 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     fn selected_refresh_symbol_count(&self, group_cfg: &GroupConfig) -> u32 {
         self.policy_decisions
             .get(&group_cfg.layout.group.0)
-            .map_or(self.repair_symbol_count, |decision| decision.symbols_selected)
+            .map_or(self.repair_symbol_count, |decision| {
+                decision.symbols_selected
+            })
     }
 
     /// Recover a single group's corrupt blocks and return a summary.
@@ -677,6 +682,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::DurabilityAutopilot;
     use crate::codec::encode_group;
     use crate::scrub::{BlockVerdict, CorruptionKind, Severity};
     use crate::symbol::RepairGroupDescExt;
@@ -1236,5 +1242,127 @@ mod tests {
                 "block {idx} not restored correctly"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_policy_logs_decision_on_clean_scrub() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 64);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 16;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_adaptive_overhead(DurabilityAutopilot::default())
+        .with_metadata_groups([GroupNumber(0)]);
+
+        let report = pipeline.scrub_and_recover(&cx).expect("pipeline");
+        assert!(report.is_fully_recovered());
+
+        let records = crate::evidence::parse_evidence_ledger(pipeline.into_ledger());
+        let policy = records
+            .iter()
+            .find(|record| record.event_type == crate::evidence::EvidenceEventType::PolicyDecision)
+            .expect("policy decision record");
+        let detail = policy.policy.as_ref().expect("policy detail");
+        assert!(detail.posterior_alpha >= 1.0);
+        assert!(detail.posterior_beta >= 100.0);
+        assert!(detail.overhead_ratio >= 0.03);
+        assert!(detail.overhead_ratio <= 0.20);
+    }
+
+    #[test]
+    fn adaptive_policy_controls_symbol_refresh_count() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        device
+            .write_block(&cx, BlockNumber(2), &vec![0xAB; block_size as usize])
+            .expect("inject corruption");
+
+        let validator = CorruptBlockValidator::new(vec![2]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_adaptive_overhead(DurabilityAutopilot::default())
+        .with_metadata_groups([GroupNumber(0)]);
+
+        let report = pipeline.scrub_and_recover(&cx).expect("pipeline");
+        assert!(report.is_fully_recovered());
+
+        let records = crate::evidence::parse_evidence_ledger(pipeline.into_ledger());
+        let policy_detail = records
+            .iter()
+            .filter_map(|record| {
+                if record.event_type == crate::evidence::EvidenceEventType::PolicyDecision {
+                    record.policy.as_ref()
+                } else {
+                    None
+                }
+            })
+            .find(|detail| detail.symbols_selected > 0)
+            .unwrap_or_else(|| {
+                records
+                    .iter()
+                    .filter_map(|record| record.policy.as_ref())
+                    .next()
+                    .expect("policy detail")
+            });
+
+        let refresh_detail = records
+            .iter()
+            .find_map(|record| {
+                if record.event_type == crate::evidence::EvidenceEventType::SymbolRefresh {
+                    record.symbol_refresh.as_ref()
+                } else {
+                    None
+                }
+            })
+            .expect("symbol refresh detail");
+
+        assert_eq!(
+            refresh_detail.symbols_generated,
+            policy_detail.symbols_selected
+        );
     }
 }
