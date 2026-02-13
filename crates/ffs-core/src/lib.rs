@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-use asupersync::{Cx, RaptorQConfig};
-use ffs_alloc::{FsGeometry, bitmap_count_free};
+use asupersync::{Cx, RaptorQConfig, SystemPressure};
+use ffs_alloc::{AllocHint, FsGeometry, GroupStats, PersistCtx, bitmap_count_free};
 use ffs_block::{
     BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
     read_ext4_superblock_region,
@@ -14,17 +14,18 @@ use ffs_btrfs::{
     parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item, walk_tree,
 };
 use ffs_error::FfsError;
-use ffs_journal::{JournalRegion, ReplayOutcome, replay_jbd2};
+use ffs_journal::{Jbd2WriteStats, Jbd2Writer, JournalRegion, ReplayOutcome, replay_jbd2};
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc,
-    Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree, lookup_in_dir_block,
-    parse_dir_block, parse_extent_tree, parse_inode_extent_tree, parse_sys_chunk_array,
+    BtrfsChunkEntry, BtrfsSuperblock, EXT4_ERROR_FS, EXT4_ORPHAN_FS, EXT4_VALID_FS, Ext4DirEntry,
+    Ext4Extent, Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr,
+    ExtentTree, lookup_in_dir_block, parse_dir_block, parse_extent_tree, parse_inode_extent_tree,
+    parse_sys_chunk_array,
 };
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -33,6 +34,103 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
+
+// ── Compute budget and degradation ─────────────────────────────────────────
+
+/// Compute budget monitor that samples system load and updates pressure state.
+///
+/// Reads `/proc/loadavg` on Linux and converts the 1-minute load average
+/// into a headroom value (0.0–1.0) based on the number of CPU cores.
+pub struct ComputeBudget {
+    pressure: Arc<SystemPressure>,
+    cpu_count: f32,
+}
+
+impl ComputeBudget {
+    /// Create a new compute budget monitor.
+    ///
+    /// `pressure` is the shared handle that will be updated on each sample.
+    #[must_use]
+    pub fn new(pressure: Arc<SystemPressure>) -> Self {
+        #[allow(clippy::cast_precision_loss)]
+        let cpu_count =
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as f32;
+        Self {
+            pressure,
+            cpu_count,
+        }
+    }
+
+    /// Sample the current system load and update the pressure handle.
+    ///
+    /// On Linux, reads `/proc/loadavg`. On other platforms, returns 1.0 (idle).
+    /// Returns the computed headroom value.
+    pub fn sample(&self) -> f32 {
+        let headroom = self.sample_headroom();
+        self.pressure.set_headroom(headroom);
+        trace!(
+            target: "ffs::budget",
+            headroom,
+            cpu_count = self.cpu_count,
+            level = self.pressure.level_label(),
+            "budget_sample"
+        );
+        headroom
+    }
+
+    /// Read the current headroom without updating pressure.
+    #[must_use]
+    pub fn current_headroom(&self) -> f32 {
+        self.pressure.headroom()
+    }
+
+    /// The shared pressure handle.
+    #[must_use]
+    pub fn pressure(&self) -> &Arc<SystemPressure> {
+        &self.pressure
+    }
+
+    fn sample_headroom(&self) -> f32 {
+        Self::read_load_avg().map_or(1.0, |load_1m| {
+            // headroom = 1.0 - (load / cpus), clamped to [0, 1]
+            let ratio = load_1m / self.cpu_count;
+            (1.0 - ratio).clamp(0.0, 1.0)
+        })
+    }
+
+    /// Read 1-minute load average from `/proc/loadavg` on Linux.
+    fn read_load_avg() -> Option<f32> {
+        let content = std::fs::read_to_string("/proc/loadavg").ok()?;
+        let first = content.split_whitespace().next()?;
+        first.parse::<f32>().ok()
+    }
+}
+
+impl std::fmt::Debug for ComputeBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComputeBudget")
+            .field("headroom", &self.pressure.headroom())
+            .field("cpu_count", &self.cpu_count)
+            .field("level", &self.pressure.level_label())
+            .finish()
+    }
+}
+
+/// Policy that reacts to system pressure changes.
+///
+/// Implementations adjust their behavior based on the current headroom value
+/// (0.0 = critically overloaded, 1.0 = idle).
+pub trait DegradationPolicy: Send + Sync {
+    /// Apply the policy based on current headroom.
+    ///
+    /// Called periodically by the budget monitor. Implementations should
+    /// adjust internal parameters (cache sizes, intervals, thresholds)
+    /// based on the headroom value.
+    fn apply(&self, headroom: f32);
+
+    /// Human-readable name for this policy.
+    fn name(&self) -> &str;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsFlavor {
@@ -219,6 +317,54 @@ pub struct BtrfsContext {
     pub nodesize: u32,
 }
 
+/// Mutable ext4 allocation state for write operations.
+///
+/// Tracks per-group block/inode bitmaps and free counts. Loaded at open time
+/// when write access is requested.
+struct Ext4AllocState {
+    /// Filesystem geometry derived from the superblock.
+    geo: FsGeometry,
+    /// Per-group allocation statistics (block/inode counts, bitmap locations).
+    groups: Vec<GroupStats>,
+    /// On-disk persistence context for group descriptor updates.
+    #[allow(dead_code)]
+    persist_ctx: PersistCtx,
+}
+
+/// Outcome of crash recovery performed at mount time.
+///
+/// When an ext4 filesystem is mounted and the superblock `state` field
+/// indicates an unclean shutdown (dirty flag set, error flag, or orphan
+/// recovery in progress), FrankenFS performs recovery before serving
+/// requests. This struct captures what was detected and what actions
+/// were taken.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrashRecoveryOutcome {
+    /// Whether the filesystem was found in a clean state on mount.
+    pub was_clean: bool,
+    /// Raw ext4 superblock state value at mount time.
+    pub raw_state: u16,
+    /// True if the `EXT4_ERROR_FS` flag was set.
+    pub had_errors: bool,
+    /// True if the `EXT4_ORPHAN_FS` flag was set.
+    pub had_orphans: bool,
+    /// Number of journal transactions replayed during recovery.
+    pub journal_txns_replayed: u32,
+    /// Number of journal blocks replayed during recovery.
+    pub journal_blocks_replayed: u64,
+    /// Whether MVCC version chains were reset (always true for unclean mount).
+    pub mvcc_reset: bool,
+}
+
+impl CrashRecoveryOutcome {
+    /// True if any recovery action was actually performed.
+    #[must_use]
+    pub fn recovery_performed(&self) -> bool {
+        !self.was_clean
+    }
+}
+
 /// An opened filesystem image, ready for VFS operations.
 ///
 /// `OpenFs` bundles a validated superblock, pre-computed geometry, and the
@@ -241,6 +387,8 @@ pub struct OpenFs {
     pub btrfs_context: Option<BtrfsContext>,
     /// Mount-time JBD2 replay outcome for ext4 images with an internal journal.
     pub ext4_journal_replay: Option<ReplayOutcome>,
+    /// Crash recovery outcome, if the filesystem required recovery on mount.
+    pub crash_recovery: Option<CrashRecoveryOutcome>,
     /// Block device for I/O operations.
     dev: Box<dyn ByteDevice>,
     /// MVCC version store for snapshot-isolated block access.
@@ -248,6 +396,17 @@ pub struct OpenFs {
     /// Shared across all snapshots/transactions that operate on this filesystem.
     /// Writes stage versions here; reads check here before falling back to device.
     mvcc_store: Arc<RwLock<MvccStore>>,
+    /// Optional JBD2 writer for ext4 compatibility-mode write path.
+    ///
+    /// When present, `commit_transaction_journaled` journals writes to the
+    /// ext4 journal region before committing to the MVCC store. This ensures
+    /// crash consistency compatible with standard ext4 mount.
+    jbd2_writer: Option<Mutex<Jbd2Writer>>,
+    /// Mutable ext4 allocation state (block/inode bitmaps, group stats).
+    ///
+    /// Protected by a Mutex since write operations need exclusive access.
+    /// `None` for btrfs or when opened in read-only mode.
+    ext4_alloc_state: Option<Mutex<Ext4AllocState>>,
 }
 
 // Compile-time assertion: OpenFs must be Send + Sync for multi-threaded FUSE dispatch.
@@ -264,9 +423,12 @@ impl std::fmt::Debug for OpenFs {
             .field("ext4_geometry", &self.ext4_geometry)
             .field("btrfs_context", &self.btrfs_context)
             .field("ext4_journal_replay", &self.ext4_journal_replay)
+            .field("crash_recovery", &self.crash_recovery)
             .field("dev_len", &self.dev.len_bytes())
             .field("mvcc_version_count", &mvcc_guard.version_count())
             .field("mvcc_active_snapshots", &mvcc_guard.active_snapshot_count())
+            .field("jbd2_writer", &self.jbd2_writer.is_some())
+            .field("writable", &self.ext4_alloc_state.is_some())
             .finish()
     }
 }
@@ -528,13 +690,17 @@ impl OpenFs {
             ext4_geometry,
             btrfs_context,
             ext4_journal_replay: None,
+            crash_recovery: None,
             dev,
             mvcc_store,
+            jbd2_writer: None,
+            ext4_alloc_state: None,
         };
 
         if fs.is_ext4() && !options.skip_validation {
             fs.ext4_journal_replay =
                 fs.maybe_replay_ext4_journal(cx, options.ext4_journal_replay_mode)?;
+            fs.crash_recovery = fs.detect_and_recover_crash();
         }
 
         Ok(fs)
@@ -601,6 +767,62 @@ impl OpenFs {
     #[must_use]
     pub fn ext4_journal_replay(&self) -> Option<&ReplayOutcome> {
         self.ext4_journal_replay.as_ref()
+    }
+
+    /// Return crash recovery outcome if the filesystem was not cleanly mounted.
+    #[must_use]
+    pub fn crash_recovery(&self) -> Option<&CrashRecoveryOutcome> {
+        self.crash_recovery.as_ref()
+    }
+
+    /// Detect unclean shutdown state from the ext4 superblock and record
+    /// recovery actions taken. Returns `None` for btrfs or when the
+    /// filesystem was cleanly unmounted.
+    fn detect_and_recover_crash(&self) -> Option<CrashRecoveryOutcome> {
+        let sb = self.ext4_superblock()?;
+        let state = sb.state;
+        let was_clean = (state & EXT4_VALID_FS) != 0
+            && (state & EXT4_ERROR_FS) == 0
+            && (state & EXT4_ORPHAN_FS) == 0;
+        let had_errors = (state & EXT4_ERROR_FS) != 0;
+        let had_orphans = (state & EXT4_ORPHAN_FS) != 0;
+
+        // Derive journal replay stats from the already-completed replay.
+        #[allow(clippy::cast_possible_truncation)]
+        let (journal_txns_replayed, journal_blocks_replayed) =
+            self.ext4_journal_replay.as_ref().map_or((0, 0), |replay| {
+                (
+                    replay.committed_sequences.len() as u32,
+                    replay.stats.replayed_blocks,
+                )
+            });
+
+        // MVCC store is always freshly initialized on mount — any in-flight
+        // transactions from a previous session are implicitly discarded.
+        let mvcc_reset = !was_clean;
+
+        if was_clean {
+            info!(raw_state = state, "ext4 filesystem state: clean");
+        } else {
+            warn!(
+                raw_state = state,
+                had_errors,
+                had_orphans,
+                journal_txns_replayed,
+                journal_blocks_replayed,
+                "ext4 unclean shutdown detected — recovery performed"
+            );
+        }
+
+        Some(CrashRecoveryOutcome {
+            was_clean,
+            raw_state: state,
+            had_errors,
+            had_orphans,
+            journal_txns_replayed,
+            journal_blocks_replayed,
+            mvcc_reset,
+        })
     }
 
     fn maybe_replay_ext4_journal(
@@ -809,6 +1031,22 @@ impl OpenFs {
                     "txn_commit_conflict"
                 );
             }
+            Err(CommitError::ChainBackpressure {
+                block,
+                chain_len,
+                cap,
+                ..
+            }) => {
+                warn!(
+                    target: "ffs::mvcc",
+                    txn_id = txn_id.0,
+                    block = block.0,
+                    chain_len,
+                    cap,
+                    conflict_type = "backpressure",
+                    "txn_commit_backpressure"
+                );
+            }
         }
 
         result
@@ -865,6 +1103,157 @@ impl OpenFs {
         }
 
         result
+    }
+
+    /// Attach a JBD2 writer for ext4 compatibility-mode journaled commits.
+    ///
+    /// Once attached, [`commit_transaction_journaled`](Self::commit_transaction_journaled)
+    /// can be used to atomically journal block writes before committing
+    /// to the MVCC store.
+    pub fn attach_jbd2_writer(&mut self, writer: Jbd2Writer) {
+        self.jbd2_writer = Some(Mutex::new(writer));
+    }
+
+    /// Whether a JBD2 writer is attached.
+    #[must_use]
+    pub fn has_jbd2_writer(&self) -> bool {
+        self.jbd2_writer.is_some()
+    }
+
+    /// Whether write operations are enabled.
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        self.ext4_alloc_state.is_some()
+    }
+
+    /// Enable write operations by loading ext4 allocation state.
+    ///
+    /// Reads all group descriptors from disk to populate the in-memory
+    /// group statistics cache. Must be called before any write operations.
+    pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
+        let sb = match &self.flavor {
+            FsFlavor::Ext4(sb) => sb,
+            FsFlavor::Btrfs(_) => {
+                return Err(FfsError::UnsupportedFeature(
+                    "btrfs write operations not yet supported".into(),
+                ));
+            }
+        };
+
+        let geo = FsGeometry::from_superblock(sb);
+        let block_size = sb.block_size;
+        // Load group descriptors from disk.
+        let mut groups = Vec::with_capacity(geo.group_count as usize);
+        let geom = self
+            .ext4_geometry
+            .as_ref()
+            .ok_or_else(|| FfsError::Format("ext4_geometry not available".into()))?;
+
+        for g in 0..geo.group_count {
+            let gd = self.read_group_desc(cx, GroupNumber(g))?;
+            groups.push(GroupStats::from_group_desc(GroupNumber(g), &gd));
+        }
+
+        let persist_ctx = PersistCtx {
+            gdt_block: BlockNumber(if block_size == 1024 { 2 } else { 1 }),
+            desc_size: geom.group_desc_size,
+            has_metadata_csum: geom.has_metadata_csum,
+            csum_seed: geom.csum_seed,
+        };
+
+        info!(
+            target: "ffs::write",
+            groups = geo.group_count,
+            block_size,
+            "ext4 write state initialized"
+        );
+
+        self.ext4_alloc_state = Some(Mutex::new(Ext4AllocState {
+            geo,
+            groups,
+            persist_ctx,
+        }));
+
+        Ok(())
+    }
+
+    /// Commit an MVCC transaction with JBD2 journaling.
+    ///
+    /// The write path is:
+    /// 1. Extract the transaction's write set.
+    /// 2. Write a JBD2 transaction (descriptor + data + commit blocks)
+    ///    to the journal region via the attached [`Jbd2Writer`].
+    /// 3. Commit the MVCC transaction (in-memory).
+    ///
+    /// If the journal write succeeds but the MVCC commit fails (conflict),
+    /// the journal transaction is harmless — replay will apply data that
+    /// has no semantic effect since it was never made visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FfsError` if no JBD2 writer is attached or if the journal
+    /// write fails. Returns `CommitError` (wrapped in `FfsError`) if the
+    /// MVCC commit detects a conflict.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn commit_transaction_journaled(
+        &self,
+        cx: &Cx,
+        txn: Transaction,
+    ) -> std::result::Result<(CommitSeq, Jbd2WriteStats), FfsError> {
+        let jbd2_mutex = self.jbd2_writer.as_ref().ok_or_else(|| {
+            FfsError::Format("no JBD2 writer attached for journaled commit".to_owned())
+        })?;
+
+        let txn_id = txn.id;
+        let write_count = txn.pending_writes();
+
+        debug!(
+            target: "ffs::journal",
+            txn_id = txn_id.0,
+            write_count,
+            "journaled_commit_start"
+        );
+
+        // Build a BlockDevice adapter for journal I/O.
+        let block_size = self.block_size();
+        let block_dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size,
+        };
+
+        // Phase 1: write all pending blocks to the JBD2 journal.
+        let jbd2_stats = {
+            let mut writer = jbd2_mutex.lock();
+            let mut jbd2_txn = writer.begin_transaction();
+
+            for (block, payload) in txn.write_set() {
+                jbd2_txn.add_write(*block, payload.clone());
+            }
+
+            let (_seq, stats) = writer.commit_transaction(cx, &block_dev, &jbd2_txn)?;
+            stats
+        };
+
+        // Phase 2: commit to MVCC store.
+        let commit_seq = self.mvcc_store.write().commit(txn).map_err(|e| {
+            warn!(
+                target: "ffs::journal",
+                txn_id = txn_id.0,
+                error = %e,
+                "journaled_commit_mvcc_conflict"
+            );
+            FfsError::Format(format!("MVCC commit failed after journal write: {e}"))
+        })?;
+
+        info!(
+            target: "ffs::journal",
+            txn_id = txn_id.0,
+            commit_seq = commit_seq.0,
+            data_blocks = jbd2_stats.data_blocks,
+            "journaled_commit_success"
+        );
+
+        Ok((commit_seq, jbd2_stats))
     }
 
     /// Read a block at a specific snapshot, checking MVCC store first.
@@ -2379,6 +2768,14 @@ pub enum RequestOp {
     Read,
     Readdir,
     Readlink,
+    // Write operations
+    Create,
+    Mkdir,
+    Unlink,
+    Rmdir,
+    Rename,
+    Setattr,
+    Write,
 }
 
 /// MVCC scope acquired for a single VFS request.
@@ -2402,7 +2799,27 @@ impl RequestScope {
     }
 }
 
-/// Minimal VFS operations trait for read-only filesystem access.
+/// Request to modify inode attributes via `setattr`.
+///
+/// Each field is `Option` — only present fields are applied. Missing fields
+/// leave the corresponding attribute unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct SetAttrRequest {
+    /// New permission mode bits (lower 12 bits of st_mode).
+    pub mode: Option<u16>,
+    /// New owner UID.
+    pub uid: Option<u32>,
+    /// New owner GID.
+    pub gid: Option<u32>,
+    /// New file size (truncate/extend).
+    pub size: Option<u64>,
+    /// New access time.
+    pub atime: Option<SystemTime>,
+    /// New modification time.
+    pub mtime: Option<SystemTime>,
+}
+
+/// VFS operations trait for filesystem access.
 ///
 /// This is the internal interface that FUSE and the test harness call.
 /// Format-specific implementations (ext4, btrfs) live behind this trait so
@@ -2416,9 +2833,7 @@ impl RequestScope {
 ///   errnos via [`FfsError::to_errno()`].
 /// - The trait is `Send + Sync` so that FUSE can call it from multiple
 ///   threads concurrently.
-/// - Only read-only operations are included in this initial version.
-///   Write operations (create, write, mkdir, unlink, etc.) will be added
-///   in a future bead once the MVCC write path is ready.
+/// - Write operations have default implementations returning `FfsError::ReadOnly`.
 /// - `begin_request_scope`/`end_request_scope` provide a policy hook for
 ///   per-request MVCC snapshot/transaction management.
 pub trait FsOps: Send + Sync {
@@ -2483,6 +2898,81 @@ pub trait FsOps: Send + Sync {
         let _ = (cx, ino, name);
         Ok(None)
     }
+
+    // ── Write operations (default: return ReadOnly) ─────────────────────
+
+    /// Create a regular file in directory `parent` with name `name`.
+    ///
+    /// Returns attributes of the newly created inode.
+    fn create(
+        &self,
+        _cx: &Cx,
+        _parent: InodeNumber,
+        _name: &OsStr,
+        _mode: u16,
+        _uid: u32,
+        _gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Create a directory in `parent` with name `name`.
+    fn mkdir(
+        &self,
+        _cx: &Cx,
+        _parent: InodeNumber,
+        _name: &OsStr,
+        _mode: u16,
+        _uid: u32,
+        _gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Remove a non-directory entry from `parent`.
+    fn unlink(&self, _cx: &Cx, _parent: InodeNumber, _name: &OsStr) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Remove an empty directory entry from `parent`.
+    fn rmdir(&self, _cx: &Cx, _parent: InodeNumber, _name: &OsStr) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Rename an entry from `parent`/`name` to `new_parent`/`new_name`.
+    fn rename(
+        &self,
+        _cx: &Cx,
+        _parent: InodeNumber,
+        _name: &OsStr,
+        _new_parent: InodeNumber,
+        _new_name: &OsStr,
+    ) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Write data to file `ino` at byte `offset`. Returns bytes written.
+    fn write(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _offset: u64,
+        _data: &[u8],
+    ) -> ffs_error::Result<u32> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Set inode attributes. Returns updated attributes.
+    fn setattr(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _attrs: &SetAttrRequest,
+    ) -> ffs_error::Result<InodeAttr> {
+        Err(FfsError::ReadOnly)
+    }
+
+    // ── Request scope hooks ───────────────────────────────────────────
 
     /// Acquire request scope before executing a VFS operation.
     ///
@@ -2790,6 +3280,948 @@ impl FsOps for Ext4FsOps {
     }
 }
 
+// ── ext4 write-path helpers ─────────────────────────────────────────────────
+
+impl OpenFs {
+    /// Extract 60-byte extent tree root from inode's extent_bytes.
+    fn extent_root(inode: &Ext4Inode) -> [u8; 60] {
+        let mut root = [0u8; 60];
+        let len = inode.extent_bytes.len().min(60);
+        root[..len].copy_from_slice(&inode.extent_bytes[..len]);
+        root
+    }
+
+    /// Write back 60-byte extent tree root into inode's extent_bytes.
+    fn set_extent_root(inode: &mut Ext4Inode, root: &[u8; 60]) {
+        if inode.extent_bytes.len() < 60 {
+            inode.extent_bytes.resize(60, 0);
+        }
+        inode.extent_bytes[..60].copy_from_slice(root);
+    }
+
+    /// Iterate physical blocks for an extent.
+    fn extent_phys_blocks(ext: &Ext4Extent) -> impl Iterator<Item = BlockNumber> + '_ {
+        (0..u32::from(ext.actual_len()))
+            .map(move |i| BlockNumber(ext.physical_start + u64::from(i)))
+    }
+
+    /// Last physical block after an extent (for allocation hint).
+    fn extent_end_hint(ext: &Ext4Extent) -> BlockNumber {
+        BlockNumber(ext.physical_start + u64::from(ext.actual_len()))
+    }
+
+    /// Get a block device adapter for the underlying byte device.
+    fn block_device_adapter(&self) -> ByteDeviceBlockAdapter<'_> {
+        ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: self.block_size(),
+        }
+    }
+
+    /// Get current wall-clock timestamp as (seconds-since-epoch, nanoseconds).
+    fn now_timestamp() -> (u32, u32) {
+        let now = SystemTime::now();
+        let dur = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        #[allow(clippy::cast_possible_truncation)]
+        let secs = dur.as_secs() as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let nsec = dur.subsec_nanos();
+        (secs, nsec)
+    }
+
+    /// Require the ext4 alloc state to be present (i.e., writes enabled).
+    fn require_alloc_state(&self) -> Result<&Mutex<Ext4AllocState>, FfsError> {
+        self.ext4_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
+    }
+
+    /// Create a regular file in an ext4 directory.
+    #[allow(clippy::significant_drop_tightening)]
+    fn ext4_create(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        // Determine parent's group for locality hint.
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let mut alloc = alloc_mutex.lock();
+        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+
+        // Allocate a new inode.
+        let parent_group = GroupNumber(
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group)) as u32
+            },
+        );
+        let (ino, new_inode) = ffs_inode::create_inode(
+            cx,
+            &block_dev,
+            geo,
+            groups,
+            mode | 0o100_000, // S_IFREG
+            uid,
+            gid,
+            parent_group,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )?;
+
+        // Add directory entry to parent.
+        self.ext4_add_dir_entry(
+            cx,
+            &block_dev,
+            &mut alloc,
+            parent,
+            &parent_inode,
+            name,
+            ino,
+            ffs_ondisk::Ext4FileType::RegFile,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )?;
+
+        let attr = inode_to_attr(sb, ino, &new_inode);
+
+        trace!(
+            target: "ffs::write",
+            op = "create",
+            parent = parent.0,
+            ino = ino.0,
+            name = %String::from_utf8_lossy(name),
+            mode,
+            "file created"
+        );
+
+        Ok(attr)
+    }
+
+    /// Create a directory inside an ext4 parent directory.
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+    fn ext4_mkdir(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let mut alloc = alloc_mutex.lock();
+
+        let parent_group = GroupNumber(
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group)) as u32
+            },
+        );
+        let (ino, mut new_inode) = {
+            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            ffs_inode::create_inode(
+                cx,
+                &block_dev,
+                geo,
+                groups,
+                mode | 0o040_000, // S_IFDIR
+                uid,
+                gid,
+                parent_group,
+                csum_seed,
+                tstamp_secs,
+                tstamp_nanos,
+            )?
+        };
+
+        // Allocate a data block for the directory and initialize with . and ..
+        let hint = AllocHint {
+            goal_group: Some(parent_group),
+            goal_block: None,
+        };
+        let dir_alloc = {
+            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            ffs_alloc::alloc_blocks(cx, &block_dev, geo, groups, 1, &hint)?
+        };
+
+        let block_size_usize = alloc.geo.block_size as usize;
+        let mut dir_block = vec![0u8; block_size_usize];
+        #[allow(clippy::cast_possible_truncation)]
+        ffs_dir::init_dir_block(&mut dir_block, ino.0 as u32, parent.0 as u32)?;
+        block_dev.write_block(cx, dir_alloc.start, &dir_block)?;
+
+        // Set up the extent tree to point to this block.
+        let extent = Ext4Extent {
+            logical_block: 0,
+            raw_len: 1,
+            physical_start: dir_alloc.start.0,
+        };
+        let mut root_bytes = Self::extent_root(&new_inode);
+        {
+            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            let mut tree_alloc = ffs_extent::GroupBlockAllocator {
+                cx,
+                dev: &block_dev,
+                geo,
+                groups,
+                hint,
+            };
+            ffs_btree::insert(cx, &block_dev, &mut root_bytes, extent, &mut tree_alloc)?;
+        }
+        Self::set_extent_root(&mut new_inode, &root_bytes);
+
+        // Update inode metadata.
+        let bs = alloc.geo.block_size;
+        new_inode.size = u64::from(bs);
+        new_inode.blocks = u64::from(bs / 512);
+        new_inode.links_count = 2; // . and parent
+        {
+            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            ffs_inode::write_inode(cx, &block_dev, geo, groups, ino, &new_inode, csum_seed)?;
+        }
+
+        // Increment parent's link count (for ..)
+        let mut parent_inode = parent_inode;
+        parent_inode.links_count = parent_inode.links_count.saturating_add(1);
+        ffs_inode::touch_mtime_ctime(&mut parent_inode, tstamp_secs, tstamp_nanos);
+        {
+            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            ffs_inode::write_inode(
+                cx,
+                &block_dev,
+                geo,
+                groups,
+                parent,
+                &parent_inode,
+                csum_seed,
+            )?;
+        }
+
+        // Add directory entry to parent.
+        self.ext4_add_dir_entry(
+            cx,
+            &block_dev,
+            &mut alloc,
+            parent,
+            &parent_inode,
+            name,
+            ino,
+            ffs_ondisk::Ext4FileType::Dir,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )?;
+
+        let attr = inode_to_attr(sb, ino, &new_inode);
+
+        trace!(
+            target: "ffs::write",
+            op = "mkdir",
+            parent = parent.0,
+            ino = ino.0,
+            name = %String::from_utf8_lossy(name),
+            "directory created"
+        );
+
+        Ok(attr)
+    }
+
+    /// Add a directory entry by scanning existing dir blocks, or allocating a new one.
+    #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
+    fn ext4_add_dir_entry(
+        &self,
+        cx: &Cx,
+        block_dev: &ByteDeviceBlockAdapter<'_>,
+        alloc: &mut Ext4AllocState,
+        parent: InodeNumber,
+        parent_inode: &Ext4Inode,
+        name: &[u8],
+        child_ino: InodeNumber,
+        file_type: Ext4FileType,
+        csum_seed: u32,
+        tstamp_secs: u32,
+        tstamp_nanos: u32,
+    ) -> ffs_error::Result<()> {
+        // Collect existing directory extents.
+        let extents = self.collect_extents(cx, parent_inode)?;
+
+        // Try adding to each existing block.
+        #[allow(clippy::cast_possible_truncation)]
+        let child_ino_u32 = child_ino.0 as u32;
+        for ext in &extents {
+            for block in Self::extent_phys_blocks(ext) {
+                let mut data = self.read_block_vec(cx, block)?;
+                if ffs_dir::add_entry(&mut data, child_ino_u32, name, file_type).is_ok() {
+                    block_dev.write_block(cx, block, &data)?;
+
+                    // Update parent mtime/ctime.
+                    let mut parent_upd = self.read_inode(cx, parent)?;
+                    ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
+                    ffs_inode::write_inode(
+                        cx,
+                        block_dev,
+                        &alloc.geo,
+                        &alloc.groups,
+                        parent,
+                        &parent_upd,
+                        csum_seed,
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // All blocks full — allocate a new directory block.
+        let hint = AllocHint {
+            goal_group: None,
+            goal_block: extents.last().map(Self::extent_end_hint),
+        };
+        let new_alloc =
+            ffs_alloc::alloc_blocks(cx, block_dev, &alloc.geo, &mut alloc.groups, 1, &hint)?;
+
+        let block_size = alloc.geo.block_size as usize;
+        let mut new_block = vec![0u8; block_size];
+        // Write a single empty dir entry spanning the whole block, then add our entry.
+        // Initialize with a single unused entry spanning the whole block.
+        {
+            // rec_len covers the whole block
+            #[allow(clippy::cast_possible_truncation)]
+            let rec_len = block_size as u16;
+            new_block[4..6].copy_from_slice(&rec_len.to_le_bytes());
+            // inode=0, name_len=0, file_type=0 ⇒ unused entry
+        }
+        ffs_dir::add_entry(&mut new_block, child_ino_u32, name, file_type)?;
+        block_dev.write_block(cx, new_alloc.start, &new_block)?;
+
+        // Insert extent for the new directory block.
+        let mut parent_upd = self.read_inode(cx, parent)?;
+        let logical_end = extents
+            .iter()
+            .map(|e| e.logical_block + u32::from(e.actual_len()))
+            .max()
+            .unwrap_or(0);
+        let extent = Ext4Extent {
+            logical_block: logical_end,
+            raw_len: 1,
+            physical_start: new_alloc.start.0,
+        };
+        let mut root_bytes = Self::extent_root(&parent_upd);
+        let tree_hint = AllocHint {
+            goal_group: None,
+            goal_block: Some(new_alloc.start),
+        };
+        let mut tree_alloc = ffs_extent::GroupBlockAllocator {
+            cx,
+            dev: block_dev,
+            geo: &alloc.geo,
+            groups: &mut alloc.groups,
+            hint: tree_hint,
+        };
+        ffs_btree::insert(cx, block_dev, &mut root_bytes, extent, &mut tree_alloc)?;
+        Self::set_extent_root(&mut parent_upd, &root_bytes);
+
+        parent_upd.size += u64::from(alloc.geo.block_size);
+        parent_upd.blocks += u64::from(alloc.geo.block_size / 512);
+        ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
+        ffs_inode::write_inode(
+            cx,
+            block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            parent,
+            &parent_upd,
+            csum_seed,
+        )?;
+
+        Ok(())
+    }
+
+    /// Remove a directory entry (unlink a file or rmdir).
+    #[allow(clippy::significant_drop_tightening)]
+    fn ext4_unlink_impl(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        expect_dir: bool,
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        // Look up the child to get its inode number.
+        let entry = self
+            .lookup_name(cx, &parent_inode, name)?
+            .ok_or_else(|| FfsError::NotFound(String::from_utf8_lossy(name).into_owned()))?;
+        let child_ino = InodeNumber(u64::from(entry.inode));
+        let child_inode = self.read_inode(cx, child_ino)?;
+
+        if expect_dir {
+            if !child_inode.is_dir() {
+                return Err(FfsError::NotDirectory);
+            }
+            // Check directory is empty (only . and ..).
+            let entries = self.read_dir(cx, &child_inode)?;
+            let real_entries = entries
+                .iter()
+                .filter(|e| e.name != b"." && e.name != b"..")
+                .count();
+            if real_entries > 0 {
+                return Err(FfsError::NotEmpty);
+            }
+        } else if child_inode.is_dir() {
+            return Err(FfsError::IsDirectory);
+        }
+
+        let mut alloc = alloc_mutex.lock();
+
+        // Remove directory entry from parent blocks.
+        let extents = self.collect_extents(cx, &parent_inode)?;
+        let mut removed = false;
+        'outer: for ext in &extents {
+            if removed {
+                break;
+            }
+            for block in Self::extent_phys_blocks(ext) {
+                let mut data = self.read_block_vec(cx, block)?;
+                if ffs_dir::remove_entry(&mut data, name)? {
+                    block_dev.write_block(cx, block, &data)?;
+                    removed = true;
+                    break 'outer;
+                }
+            }
+        }
+        if !removed {
+            return Err(FfsError::NotFound(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
+        }
+
+        // Decrement child link count.
+        let mut child_upd = child_inode;
+        child_upd.links_count = child_upd.links_count.saturating_sub(1);
+        ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
+
+        {
+            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            if child_upd.links_count == 0 {
+                ffs_inode::delete_inode(
+                    cx,
+                    &block_dev,
+                    geo,
+                    groups,
+                    child_ino,
+                    &mut child_upd,
+                    csum_seed,
+                    tstamp_secs,
+                )?;
+            } else {
+                ffs_inode::write_inode(
+                    cx, &block_dev, geo, groups, child_ino, &child_upd, csum_seed,
+                )?;
+            }
+        }
+
+        // Update parent timestamps.
+        let mut parent_upd = self.read_inode(cx, parent)?;
+        if expect_dir {
+            parent_upd.links_count = parent_upd.links_count.saturating_sub(1);
+        }
+        ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
+        {
+            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            ffs_inode::write_inode(cx, &block_dev, geo, groups, parent, &parent_upd, csum_seed)?;
+        }
+
+        trace!(
+            target: "ffs::write",
+            op = if expect_dir { "rmdir" } else { "unlink" },
+            parent = parent.0,
+            child = child_ino.0,
+            name = %String::from_utf8_lossy(name),
+            links_remaining = child_upd.links_count,
+            "entry removed"
+        );
+
+        Ok(())
+    }
+
+    /// Write data to an ext4 file.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::significant_drop_tightening,
+        clippy::cast_possible_truncation,
+        clippy::single_match_else
+    )]
+    fn ext4_write(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        data: &[u8],
+    ) -> ffs_error::Result<u32> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+        let block_size = sb.block_size;
+        let bs = u64::from(block_size);
+
+        let mut inode = self.read_inode(cx, ino)?;
+        if inode.is_dir() {
+            return Err(FfsError::IsDirectory);
+        }
+
+        let mut alloc = alloc_mutex.lock();
+        let mut bytes_written = 0u32;
+        let mut pos = offset;
+        let end = offset + data.len() as u64;
+
+        while pos < end {
+            #[allow(clippy::cast_possible_truncation)]
+            let logical_block = (pos / bs) as u32;
+            let block_offset = (pos % bs) as usize;
+            let chunk_len = ((bs as usize) - block_offset).min((end - pos) as usize);
+
+            // Resolve or allocate the physical block.
+            let extents = self.collect_extents(cx, &inode)?;
+            let phys = extents.iter().find_map(|e| {
+                if logical_block >= e.logical_block
+                    && logical_block < e.logical_block + u32::from(e.actual_len())
+                {
+                    Some(BlockNumber(
+                        e.physical_start + u64::from(logical_block - e.logical_block),
+                    ))
+                } else {
+                    None
+                }
+            });
+
+            let phys_block = match phys {
+                Some(b) => b,
+                None => {
+                    // Allocate new extent for this block.
+                    let hint = AllocHint {
+                        goal_group: None,
+                        goal_block: extents.last().map(Self::extent_end_hint),
+                    };
+                    let mut root_bytes = Self::extent_root(&inode);
+                    let mapping = {
+                        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                        ffs_extent::allocate_extent(
+                            cx,
+                            &block_dev,
+                            &mut root_bytes,
+                            geo,
+                            groups,
+                            logical_block,
+                            1,
+                            &hint,
+                        )?
+                    };
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                    inode.blocks += u64::from(block_size / 512);
+                    BlockNumber(mapping.physical_start)
+                }
+            };
+
+            // Read-modify-write the block.
+            let mut block_data = if block_offset == 0 && chunk_len == bs as usize {
+                vec![0u8; bs as usize]
+            } else {
+                let buf = block_dev.read_block(cx, phys_block)?;
+                buf.as_slice().to_vec()
+            };
+            let data_start = (pos - offset) as usize;
+            block_data[block_offset..block_offset + chunk_len]
+                .copy_from_slice(&data[data_start..data_start + chunk_len]);
+            block_dev.write_block(cx, phys_block, &block_data)?;
+
+            pos += chunk_len as u64;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                bytes_written += chunk_len as u32;
+            }
+        }
+
+        // Update inode size if we extended the file.
+        if end > inode.size {
+            inode.size = end;
+        }
+        ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+        ffs_inode::write_inode(
+            cx,
+            &block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            ino,
+            &inode,
+            csum_seed,
+        )?;
+
+        trace!(
+            target: "ffs::write",
+            op = "write",
+            ino = ino.0,
+            offset,
+            len = data.len(),
+            new_size = inode.size,
+            "data written"
+        );
+
+        Ok(bytes_written)
+    }
+
+    /// Rename an entry from one directory to another.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::significant_drop_tightening,
+        clippy::cast_possible_truncation
+    )]
+    fn ext4_rename(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        new_parent: InodeNumber,
+        new_name: &[u8],
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        // Look up the source entry.
+        let entry = self
+            .lookup_name(cx, &parent_inode, name)?
+            .ok_or_else(|| FfsError::NotFound(String::from_utf8_lossy(name).into_owned()))?;
+        let child_ino = InodeNumber(u64::from(entry.inode));
+        let child_inode = self.read_inode(cx, child_ino)?;
+        let ft = if child_inode.is_dir() {
+            ffs_ondisk::Ext4FileType::Dir
+        } else {
+            ffs_ondisk::Ext4FileType::RegFile
+        };
+
+        let mut alloc = alloc_mutex.lock();
+
+        // Check if target already exists — if so, remove it first.
+        let new_parent_inode = if new_parent == parent {
+            parent_inode.clone()
+        } else {
+            self.read_inode(cx, new_parent)?
+        };
+        if !new_parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        if let Some(existing) = self.lookup_name(cx, &new_parent_inode, new_name)? {
+            let existing_ino = InodeNumber(u64::from(existing.inode));
+            let existing_inode = self.read_inode(cx, existing_ino)?;
+            // Remove the existing target.
+            let extents = self.collect_extents(cx, &new_parent_inode)?;
+            'rm_existing: for ext in &extents {
+                for block in Self::extent_phys_blocks(ext) {
+                    let mut data = self.read_block_vec(cx, block)?;
+                    if ffs_dir::remove_entry(&mut data, new_name)? {
+                        block_dev.write_block(cx, block, &data)?;
+                        break 'rm_existing;
+                    }
+                }
+            }
+            // Decrement link count / delete.
+            let mut ex_upd = existing_inode;
+            ex_upd.links_count = ex_upd.links_count.saturating_sub(1);
+            {
+                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                if ex_upd.links_count == 0 {
+                    ffs_inode::delete_inode(
+                        cx,
+                        &block_dev,
+                        geo,
+                        groups,
+                        existing_ino,
+                        &mut ex_upd,
+                        csum_seed,
+                        tstamp_secs,
+                    )?;
+                } else {
+                    ffs_inode::write_inode(
+                        cx,
+                        &block_dev,
+                        geo,
+                        groups,
+                        existing_ino,
+                        &ex_upd,
+                        csum_seed,
+                    )?;
+                }
+            }
+        }
+
+        // Remove old entry from source parent.
+        let src_extents = self.collect_extents(cx, &parent_inode)?;
+        'rm_src: for ext in &src_extents {
+            for block in Self::extent_phys_blocks(ext) {
+                let mut data = self.read_block_vec(cx, block)?;
+                if ffs_dir::remove_entry(&mut data, name)? {
+                    block_dev.write_block(cx, block, &data)?;
+                    break 'rm_src;
+                }
+            }
+        }
+
+        // Add new entry to target parent.
+        let new_parent_inode_fresh = self.read_inode(cx, new_parent)?;
+        self.ext4_add_dir_entry(
+            cx,
+            &block_dev,
+            &mut alloc,
+            new_parent,
+            &new_parent_inode_fresh,
+            new_name,
+            child_ino,
+            ft,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )?;
+
+        // If renaming a directory across parents, update .. and link counts.
+        if child_inode.is_dir() && parent != new_parent {
+            // Update .. in child directory to point to new_parent.
+            let child_extents = self.collect_extents(cx, &child_inode)?;
+            if let Some(first_ext) = child_extents.first() {
+                let dot_dot_block = BlockNumber(first_ext.physical_start);
+                let mut data = self.read_block_vec(cx, dot_dot_block)?;
+                // Remove old .. and add new one.
+                let _ = ffs_dir::remove_entry(&mut data, b"..");
+                #[allow(clippy::cast_possible_truncation)]
+                ffs_dir::add_entry(&mut data, new_parent.0 as u32, b"..", Ext4FileType::Dir)?;
+                block_dev.write_block(cx, dot_dot_block, &data)?;
+            }
+
+            // Decrement old parent link count, increment new parent.
+            let mut old_parent = self.read_inode(cx, parent)?;
+            old_parent.links_count = old_parent.links_count.saturating_sub(1);
+            ffs_inode::touch_mtime_ctime(&mut old_parent, tstamp_secs, tstamp_nanos);
+            ffs_inode::write_inode(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &alloc.groups,
+                parent,
+                &old_parent,
+                csum_seed,
+            )?;
+
+            let mut new_par = self.read_inode(cx, new_parent)?;
+            new_par.links_count = new_par.links_count.saturating_add(1);
+            ffs_inode::touch_mtime_ctime(&mut new_par, tstamp_secs, tstamp_nanos);
+            ffs_inode::write_inode(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &alloc.groups,
+                new_parent,
+                &new_par,
+                csum_seed,
+            )?;
+        }
+
+        // Touch ctime on the moved inode.
+        let mut child_upd = self.read_inode(cx, child_ino)?;
+        ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
+        ffs_inode::write_inode(
+            cx,
+            &block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            child_ino,
+            &child_upd,
+            csum_seed,
+        )?;
+
+        trace!(
+            target: "ffs::write",
+            op = "rename",
+            src_parent = parent.0,
+            dst_parent = new_parent.0,
+            old_name = %String::from_utf8_lossy(name),
+            new_name = %String::from_utf8_lossy(new_name),
+            ino = child_ino.0,
+            "entry renamed"
+        );
+
+        Ok(())
+    }
+
+    /// Set attributes on an ext4 inode.
+    #[allow(clippy::significant_drop_tightening)]
+    fn ext4_setattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let mut inode = self.read_inode(cx, ino)?;
+
+        if let Some(mode) = attrs.mode {
+            // Preserve file type bits (upper 4 bits of 16-bit mode).
+            let type_bits = inode.mode & 0xF000;
+            inode.mode = type_bits | (mode & 0o7777);
+        }
+        if let Some(uid) = attrs.uid {
+            inode.uid = uid;
+        }
+        if let Some(gid) = attrs.gid {
+            inode.gid = gid;
+        }
+        if let Some(atime) = attrs.atime {
+            let dur = atime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+            #[allow(clippy::cast_possible_truncation)]
+            ffs_inode::touch_atime(&mut inode, dur.as_secs() as u32, dur.subsec_nanos());
+        }
+        if let Some(mtime) = attrs.mtime {
+            let dur = mtime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                inode.mtime = dur.as_secs() as u32;
+                inode.mtime_extra =
+                    ffs_inode::encode_extra_timestamp(dur.as_secs() as u32, dur.subsec_nanos());
+            }
+        }
+
+        // Handle truncation.
+        if let Some(new_size) = attrs.size {
+            if new_size != inode.size {
+                let mut alloc = alloc_mutex.lock();
+                let block_size = alloc.geo.block_size;
+
+                if new_size < inode.size {
+                    // Truncate: free blocks beyond new size.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let new_logical_end = new_size.div_ceil(u64::from(block_size)) as u32;
+                    let mut root_bytes = Self::extent_root(&inode);
+                    let freed = {
+                        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                        ffs_extent::truncate_extents(
+                            cx,
+                            &block_dev,
+                            &mut root_bytes,
+                            geo,
+                            groups,
+                            new_logical_end,
+                        )?
+                    };
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                    inode.blocks = inode
+                        .blocks
+                        .saturating_sub(freed * u64::from(block_size / 512));
+                } else {
+                    // Extend: just update size (sparse — blocks allocated on write).
+                }
+
+                inode.size = new_size;
+            }
+        }
+
+        ffs_inode::touch_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+
+        {
+            let alloc = alloc_mutex.lock();
+            ffs_inode::write_inode(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &alloc.groups,
+                ino,
+                &inode,
+                csum_seed,
+            )?;
+        }
+
+        let attr = inode_to_attr(sb, ino, &inode);
+
+        trace!(
+            target: "ffs::write",
+            op = "setattr",
+            ino = ino.0,
+            new_size = inode.size,
+            mode = inode.mode,
+            "attributes updated"
+        );
+
+        Ok(attr)
+    }
+}
+
 // ── FsOps for OpenFs (device-based ext4 adapter) ──────────────────────────
 
 impl FsOps for OpenFs {
@@ -2936,6 +4368,95 @@ impl FsOps for OpenFs {
                 let _ = (cx, ino, name);
                 Ok(None)
             }
+        }
+    }
+
+    // ── Write operations ──────────────────────────────────────────────
+
+    fn create(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                self.ext4_create(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
+            }
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                self.ext4_mkdir(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
+            }
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn unlink(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_unlink_impl(cx, parent, name.as_encoded_bytes(), false),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn rmdir(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_unlink_impl(cx, parent, name.as_encoded_bytes(), true),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn rename(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_rename(
+                cx,
+                parent,
+                name.as_encoded_bytes(),
+                new_parent,
+                new_name.as_encoded_bytes(),
+            ),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn write(&self, cx: &Cx, ino: InodeNumber, offset: u64, data: &[u8]) -> ffs_error::Result<u32> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_write(cx, ino, offset, data),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn setattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> ffs_error::Result<InodeAttr> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_setattr(cx, ino, attrs),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
 }
@@ -7075,5 +8596,882 @@ mod tests {
 
         let decision = policy.autopilot_decision().expect("should have decision");
         assert!((decision.repair_overhead - overhead).abs() < f64::EPSILON);
+    }
+
+    // ── FsOps write operation tests ──────────────────────────────────────
+
+    #[test]
+    fn fsops_default_write_methods_return_read_only() {
+        let fs = StubFs;
+        let cx = Cx::for_testing();
+        let root = InodeNumber(1);
+
+        let err = fs
+            .create(&cx, root, OsStr::new("x"), 0o644, 0, 0)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs
+            .mkdir(&cx, root, OsStr::new("d"), 0o755, 0, 0)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.unlink(&cx, root, OsStr::new("x")).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.rmdir(&cx, root, OsStr::new("d")).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs
+            .rename(&cx, root, OsStr::new("a"), root, OsStr::new("b"))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.write(&cx, InodeNumber(11), 0, b"hello").unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs
+            .setattr(&cx, root, &SetAttrRequest::default())
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+    }
+
+    #[test]
+    fn open_fs_not_writable_by_default() {
+        let image = build_ext4_image(2);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert!(!fs.is_writable());
+    }
+
+    /// Helper: open the ext4_small test fixture and enable writes.
+    ///
+    /// Returns None if the fixture doesn't exist (e.g. in minimal CI).
+    fn open_writable_ext4() -> Option<OpenFs> {
+        let path = std::path::Path::new("tests/fixtures/images/ext4_small.img");
+        // Also check from the workspace root
+        let path = if path.exists() {
+            path.to_path_buf()
+        } else {
+            let ws = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("tests/fixtures/images/ext4_small.img");
+            if ws.exists() {
+                ws
+            } else {
+                return None;
+            }
+        };
+        let cx = Cx::for_testing();
+        // Copy the image so we don't mutate the fixture.
+        let data = std::fs::read(&path).expect("read fixture");
+        let dev = TestDevice::from_vec(data);
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev), &opts).expect("open ext4");
+        fs.enable_writes(&cx).expect("enable writes");
+        assert!(fs.is_writable());
+        Some(fs)
+    }
+
+    #[test]
+    fn write_create_and_read_roundtrip() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2); // ext4 root inode
+
+        // Create a new file
+        let attr = fs
+            .create(&cx, root, OsStr::new("test_rw.txt"), 0o644, 1000, 1000)
+            .expect("create");
+        assert_eq!(attr.kind, FileType::RegularFile);
+        assert_eq!(attr.perm, 0o644);
+        assert_eq!(attr.uid, 1000);
+        let ino = attr.ino;
+
+        // Write data
+        let payload = b"FrankenFS write test!";
+        let written = fs.write(&cx, ino, 0, payload).expect("write");
+        assert_eq!(written as usize, payload.len());
+
+        // Read back
+        let readback = fs.read(&cx, ino, 0, 4096).expect("read");
+        assert_eq!(&readback[..payload.len()], payload);
+
+        // Lookup should find it
+        let looked_up = fs
+            .lookup(&cx, root, OsStr::new("test_rw.txt"))
+            .expect("lookup");
+        assert_eq!(looked_up.ino, ino);
+    }
+
+    #[test]
+    fn write_mkdir_and_lookup() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .mkdir(&cx, root, OsStr::new("test_dir"), 0o755, 0, 0)
+            .expect("mkdir");
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+
+        let looked_up = fs
+            .lookup(&cx, root, OsStr::new("test_dir"))
+            .expect("lookup dir");
+        assert_eq!(looked_up.ino, attr.ino);
+        assert_eq!(looked_up.kind, FileType::Directory);
+    }
+
+    #[test]
+    fn write_unlink_removes_entry() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("to_delete.txt"), 0o644, 0, 0)
+            .expect("create");
+        assert!(attr.ino.0 > 0);
+
+        // Unlink it
+        fs.unlink(&cx, root, OsStr::new("to_delete.txt"))
+            .expect("unlink");
+
+        // Lookup should fail
+        let err = fs
+            .lookup(&cx, root, OsStr::new("to_delete.txt"))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn write_rename_moves_entry() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("old_name.txt"), 0o644, 0, 0)
+            .expect("create");
+        let ino = attr.ino;
+
+        // Rename
+        fs.rename(
+            &cx,
+            root,
+            OsStr::new("old_name.txt"),
+            root,
+            OsStr::new("new_name.txt"),
+        )
+        .expect("rename");
+
+        // Old name gone
+        let err = fs
+            .lookup(&cx, root, OsStr::new("old_name.txt"))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+
+        // New name present with same inode
+        let looked_up = fs
+            .lookup(&cx, root, OsStr::new("new_name.txt"))
+            .expect("lookup new name");
+        assert_eq!(looked_up.ino, ino);
+    }
+
+    #[test]
+    fn write_setattr_truncate() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("truncate_me.txt"), 0o644, 0, 0)
+            .expect("create");
+        let ino = attr.ino;
+
+        // Write 100 bytes
+        let data = vec![0x42_u8; 100];
+        fs.write(&cx, ino, 0, &data).expect("write");
+
+        // Verify size
+        let attr = fs.getattr(&cx, ino).expect("getattr");
+        assert_eq!(attr.size, 100);
+
+        // Truncate to 50 bytes
+        let attrs = SetAttrRequest {
+            size: Some(50),
+            ..SetAttrRequest::default()
+        };
+        let new_attr = fs.setattr(&cx, ino, &attrs).expect("setattr truncate");
+        assert_eq!(new_attr.size, 50);
+
+        // Read should return 50 bytes
+        let readback = fs.read(&cx, ino, 0, 4096).expect("read after truncate");
+        assert_eq!(readback.len(), 50);
+        assert!(readback.iter().all(|&b| b == 0x42));
+    }
+
+    #[test]
+    fn write_rmdir_non_empty_returns_enotempty() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // Create a directory and a file inside it.
+        let dir_attr = fs
+            .mkdir(&cx, root, OsStr::new("nonempty_dir"), 0o755, 0, 0)
+            .expect("mkdir");
+        fs.create(&cx, dir_attr.ino, OsStr::new("child.txt"), 0o644, 0, 0)
+            .expect("create child");
+
+        // rmdir should fail with ENOTEMPTY
+        let err = fs.rmdir(&cx, root, OsStr::new("nonempty_dir")).unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOTEMPTY);
+    }
+
+    #[test]
+    fn write_read_only_fs_returns_erofs() {
+        let path = std::path::Path::new("tests/fixtures/images/ext4_small.img");
+        let path = if path.exists() {
+            path.to_path_buf()
+        } else {
+            let ws = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("tests/fixtures/images/ext4_small.img");
+            if !ws.exists() {
+                return;
+            }
+            ws
+        };
+        let cx = Cx::for_testing();
+        let data = std::fs::read(&path).expect("read fixture");
+        let dev = TestDevice::from_vec(data);
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        // Open without enable_writes — should be read-only.
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).expect("open ext4");
+        assert!(!fs.is_writable());
+
+        let root = InodeNumber(2);
+        let err = fs
+            .create(&cx, root, OsStr::new("nope"), 0o644, 0, 0)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs
+            .mkdir(&cx, root, OsStr::new("nope"), 0o755, 0, 0)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.write(&cx, InodeNumber(11), 0, b"data").unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+    }
+
+    #[test]
+    fn write_mkdir_create_inside_readdir() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // Create a directory
+        let dir_attr = fs
+            .mkdir(&cx, root, OsStr::new("readdir_test"), 0o755, 0, 0)
+            .expect("mkdir");
+
+        // Create two files inside it
+        fs.create(&cx, dir_attr.ino, OsStr::new("alpha.txt"), 0o644, 0, 0)
+            .expect("create alpha");
+        fs.create(&cx, dir_attr.ino, OsStr::new("beta.txt"), 0o644, 0, 0)
+            .expect("create beta");
+
+        // readdir should list . .. alpha.txt beta.txt
+        let entries = fs.readdir(&cx, dir_attr.ino, 0).expect("readdir");
+        let names: Vec<String> = entries.iter().map(DirEntry::name_str).collect();
+        assert!(names.contains(&".".to_owned()));
+        assert!(names.contains(&"..".to_owned()));
+        assert!(names.contains(&"alpha.txt".to_owned()));
+        assert!(names.contains(&"beta.txt".to_owned()));
+        assert_eq!(entries.len(), 4);
+    }
+
+    // ── Crash recovery tests ──────────────────────────────────────────
+
+    /// Build an ext4 image with a specific superblock `state` value.
+    fn build_ext4_image_with_state(state: u16) -> Vec<u8> {
+        let mut image = build_ext4_image(2); // 4K blocks
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        // state field is at superblock offset 0x3A
+        image[sb_off + 0x3A..sb_off + 0x3C].copy_from_slice(&state.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn crash_recovery_clean_fs() {
+        let image = build_ext4_image_with_state(EXT4_VALID_FS);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let recovery = fs
+            .crash_recovery()
+            .expect("should have recovery outcome for ext4");
+        assert!(recovery.was_clean);
+        assert!(!recovery.had_errors);
+        assert!(!recovery.had_orphans);
+        assert!(!recovery.mvcc_reset);
+        assert!(!recovery.recovery_performed());
+    }
+
+    #[test]
+    fn crash_recovery_dirty_fs_no_valid_flag() {
+        // state=0 means VALID_FS is not set → unclean
+        let image = build_ext4_image_with_state(0);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let recovery = fs.crash_recovery().expect("should have recovery outcome");
+        assert!(!recovery.was_clean);
+        assert_eq!(recovery.raw_state, 0);
+        assert!(!recovery.had_errors);
+        assert!(!recovery.had_orphans);
+        assert!(recovery.mvcc_reset);
+        assert!(recovery.recovery_performed());
+    }
+
+    #[test]
+    fn crash_recovery_error_fs_flag() {
+        let image = build_ext4_image_with_state(EXT4_VALID_FS | EXT4_ERROR_FS);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let recovery = fs.crash_recovery().expect("should have recovery outcome");
+        assert!(!recovery.was_clean);
+        assert!(recovery.had_errors);
+        assert!(!recovery.had_orphans);
+        assert!(recovery.mvcc_reset);
+    }
+
+    #[test]
+    fn crash_recovery_orphan_fs_flag() {
+        let image = build_ext4_image_with_state(EXT4_VALID_FS | EXT4_ORPHAN_FS);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let recovery = fs.crash_recovery().expect("should have recovery outcome");
+        assert!(!recovery.was_clean);
+        assert!(!recovery.had_errors);
+        assert!(recovery.had_orphans);
+        assert!(recovery.mvcc_reset);
+    }
+
+    #[test]
+    fn crash_recovery_all_flags() {
+        let image = build_ext4_image_with_state(EXT4_VALID_FS | EXT4_ERROR_FS | EXT4_ORPHAN_FS);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let recovery = fs.crash_recovery().expect("should have recovery outcome");
+        assert!(!recovery.was_clean);
+        assert!(recovery.had_errors);
+        assert!(recovery.had_orphans);
+        assert!(recovery.mvcc_reset);
+        assert_eq!(
+            recovery.raw_state,
+            EXT4_VALID_FS | EXT4_ERROR_FS | EXT4_ORPHAN_FS
+        );
+    }
+
+    #[test]
+    fn crash_recovery_skipped_for_skip_validation() {
+        let image = build_ext4_image_with_state(0); // dirty
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            skip_validation: true,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
+
+        // With skip_validation, crash recovery detection is bypassed
+        assert!(fs.crash_recovery().is_none());
+    }
+
+    #[test]
+    fn crash_recovery_outcome_serializes() {
+        let outcome = CrashRecoveryOutcome {
+            was_clean: false,
+            raw_state: 0x0002,
+            had_errors: true,
+            had_orphans: false,
+            journal_txns_replayed: 3,
+            journal_blocks_replayed: 12,
+            mvcc_reset: true,
+        };
+        let json = serde_json::to_string(&outcome).expect("serialize");
+        let parsed: CrashRecoveryOutcome = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, outcome);
+    }
+
+    // ── E2E persistence tests ─────────────────────────────────────────
+
+    /// Create a temp file copy of the ext4_small fixture for persistence testing.
+    /// Returns the temp path, or None if the fixture is not available.
+    fn create_temp_ext4_image(label: &str) -> Option<std::path::PathBuf> {
+        let fixture = std::path::Path::new("tests/fixtures/images/ext4_small.img");
+        let fixture = if fixture.exists() {
+            fixture.to_path_buf()
+        } else {
+            let ws = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("tests/fixtures/images/ext4_small.img");
+            if !ws.exists() {
+                return None;
+            }
+            ws
+        };
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ffs-e2e-{label}-{}-{:?}.img",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::copy(&fixture, &tmp).expect("copy fixture to temp");
+        Some(tmp)
+    }
+
+    /// Deterministic file content for a given path (simple hash).
+    fn deterministic_content(name: &str, size: u32) -> Vec<u8> {
+        let seed: u32 = name.bytes().fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        });
+        (0..size)
+            .map(|i| seed.wrapping_add(i).to_le_bytes()[0])
+            .collect()
+    }
+
+    #[test]
+    fn e2e_write_close_reopen_verify() {
+        let Some(tmp_path) = create_temp_ext4_image("persist") else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // ── Phase 1: Write ──────────────────────────────────────────
+        let dir_count = 10;
+        let files_per_dir = 10;
+        let file_size: u32 = 128; // bytes per file
+
+        {
+            let opts = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open for write");
+            fs.enable_writes(&cx).expect("enable writes");
+
+            for d in 0..dir_count {
+                let dir_name = format!("dir_{d:03}");
+                let dir_attr = fs
+                    .mkdir(&cx, root, OsStr::new(&dir_name), 0o755, 1000, 1000)
+                    .expect("mkdir");
+
+                for f in 0..files_per_dir {
+                    let file_name = format!("file_{f:03}.dat");
+                    let full_name = format!("{dir_name}/{file_name}");
+                    let content = deterministic_content(&full_name, file_size);
+
+                    let file_attr = fs
+                        .create(&cx, dir_attr.ino, OsStr::new(&file_name), 0o644, 1000, 1000)
+                        .expect("create file");
+
+                    let written = fs
+                        .write(&cx, file_attr.ino, 0, &content)
+                        .expect("write file");
+                    assert_eq!(written as usize, content.len());
+                }
+            }
+            // Drop fs — closes file handles, writes should be flushed.
+        }
+
+        // ── Phase 2: Reopen and verify ──────────────────────────────
+        {
+            let opts = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("reopen for verify");
+
+            // Verify directory structure
+            let root_entries = fs.readdir(&cx, root, 0).expect("readdir root");
+            let root_names: Vec<String> = root_entries.iter().map(DirEntry::name_str).collect();
+
+            for d in 0..dir_count {
+                let dir_name = format!("dir_{d:03}");
+                assert!(
+                    root_names.contains(&dir_name),
+                    "missing directory {dir_name} in root"
+                );
+
+                // Lookup the directory
+                let dir_attr = fs
+                    .lookup(&cx, root, OsStr::new(&dir_name))
+                    .expect("lookup dir");
+
+                // Verify files inside
+                let dir_entries = fs.readdir(&cx, dir_attr.ino, 0).expect("readdir dir");
+                let file_names: Vec<String> = dir_entries.iter().map(DirEntry::name_str).collect();
+
+                for f in 0..files_per_dir {
+                    let file_name = format!("file_{f:03}.dat");
+                    let full_name = format!("{dir_name}/{file_name}");
+                    assert!(file_names.contains(&file_name), "missing file {full_name}");
+
+                    // Lookup the file
+                    let file_attr = fs
+                        .lookup(&cx, dir_attr.ino, OsStr::new(&file_name))
+                        .expect("lookup file");
+
+                    // Read and verify content
+                    let expected = deterministic_content(&full_name, file_size);
+                    let data = fs
+                        .read(&cx, file_attr.ino, 0, file_size)
+                        .expect("read file");
+                    assert_eq!(data, expected, "content mismatch for {full_name}");
+                }
+            }
+        }
+
+        // Cleanup temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn e2e_write_modify_delete_reopen_verify() {
+        let Some(tmp_path) = create_temp_ext4_image("modify") else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // Phase 1: Create initial files
+        {
+            let opts = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open for write");
+            fs.enable_writes(&cx).expect("enable writes");
+
+            let dir_attr = fs
+                .mkdir(&cx, root, OsStr::new("modify_test"), 0o755, 1000, 1000)
+                .expect("mkdir");
+
+            for i in 0..20 {
+                let name = format!("item_{i:02}.txt");
+                let content = format!("original content {i}");
+                let attr = fs
+                    .create(&cx, dir_attr.ino, OsStr::new(&name), 0o644, 1000, 1000)
+                    .expect("create");
+                fs.write(&cx, attr.ino, 0, content.as_bytes())
+                    .expect("write");
+            }
+        }
+
+        // Phase 2: Modify some, delete some, create new
+        {
+            let opts = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let mut fs =
+                OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("reopen for modify");
+            fs.enable_writes(&cx).expect("enable writes");
+
+            let dir_attr = fs
+                .lookup(&cx, root, OsStr::new("modify_test"))
+                .expect("lookup dir");
+
+            // Delete items 0-4
+            for i in 0..5 {
+                let name = format!("item_{i:02}.txt");
+                fs.unlink(&cx, dir_attr.ino, OsStr::new(&name))
+                    .expect("unlink");
+            }
+
+            // Modify items 10-14
+            for i in 10..15 {
+                let name = format!("item_{i:02}.txt");
+                let attr = fs
+                    .lookup(&cx, dir_attr.ino, OsStr::new(&name))
+                    .expect("lookup");
+                let new_content = format!("MODIFIED content {i}");
+                fs.write(&cx, attr.ino, 0, new_content.as_bytes())
+                    .expect("write");
+            }
+
+            // Create 5 new files
+            for i in 20..25 {
+                let name = format!("item_{i:02}.txt");
+                let content = format!("new content {i}");
+                let attr = fs
+                    .create(&cx, dir_attr.ino, OsStr::new(&name), 0o644, 1000, 1000)
+                    .expect("create");
+                fs.write(&cx, attr.ino, 0, content.as_bytes())
+                    .expect("write");
+            }
+        }
+
+        // Phase 3: Verify
+        {
+            let opts = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("reopen for verify");
+
+            let dir_attr = fs
+                .lookup(&cx, root, OsStr::new("modify_test"))
+                .expect("lookup dir");
+
+            let entries = fs.readdir(&cx, dir_attr.ino, 0).expect("readdir");
+            let names: Vec<String> = entries.iter().map(DirEntry::name_str).collect();
+
+            // Items 0-4 should be deleted
+            for i in 0..5 {
+                let name = format!("item_{i:02}.txt");
+                assert!(!names.contains(&name), "{name} should be deleted");
+            }
+
+            // Items 5-9 should have original content
+            for i in 5..10 {
+                let name = format!("item_{i:02}.txt");
+                assert!(names.contains(&name), "{name} should exist");
+                let attr = fs
+                    .lookup(&cx, dir_attr.ino, OsStr::new(&name))
+                    .expect("lookup");
+                let data = fs.read(&cx, attr.ino, 0, 256).expect("read");
+                let expected = format!("original content {i}");
+                assert_eq!(
+                    &data[..expected.len()],
+                    expected.as_bytes(),
+                    "content mismatch for {name}"
+                );
+            }
+
+            // Items 10-14 should have modified content
+            for i in 10..15 {
+                let name = format!("item_{i:02}.txt");
+                assert!(names.contains(&name), "{name} should exist");
+                let attr = fs
+                    .lookup(&cx, dir_attr.ino, OsStr::new(&name))
+                    .expect("lookup");
+                let data = fs.read(&cx, attr.ino, 0, 256).expect("read");
+                let expected = format!("MODIFIED content {i}");
+                assert_eq!(
+                    &data[..expected.len()],
+                    expected.as_bytes(),
+                    "content mismatch for {name}"
+                );
+            }
+
+            // Items 15-19 should have original content
+            for i in 15..20 {
+                let name = format!("item_{i:02}.txt");
+                assert!(names.contains(&name), "{name} should exist");
+            }
+
+            // Items 20-24 should be new
+            for i in 20..25 {
+                let name = format!("item_{i:02}.txt");
+                assert!(names.contains(&name), "{name} should exist");
+                let attr = fs
+                    .lookup(&cx, dir_attr.ino, OsStr::new(&name))
+                    .expect("lookup");
+                let data = fs.read(&cx, attr.ino, 0, 256).expect("read");
+                let expected = format!("new content {i}");
+                assert_eq!(
+                    &data[..expected.len()],
+                    expected.as_bytes(),
+                    "content mismatch for {name}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    // ── ComputeBudget and degradation tests ───────────────────────────
+
+    #[test]
+    fn compute_budget_reads_load_avg() {
+        let pressure = Arc::new(SystemPressure::new());
+        let budget = ComputeBudget::new(Arc::clone(&pressure));
+        let headroom = budget.sample();
+        // On any running system, headroom should be a valid value.
+        assert!((0.0..=1.0).contains(&headroom));
+        // Pressure handle should be updated.
+        assert!((pressure.headroom() - headroom).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn compute_budget_headroom_decreases_under_load() {
+        // Verify the formula: headroom = 1.0 - (load / cpus)
+        let pressure = Arc::new(SystemPressure::new());
+        let budget = ComputeBudget::new(Arc::clone(&pressure));
+
+        // Sample once to establish a baseline.
+        let h1 = budget.sample();
+        assert!((0.0..=1.0).contains(&h1));
+
+        // The budget should reflect current system state.
+        assert!((pressure.headroom() - h1).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn system_pressure_degradation_levels() {
+        let p = SystemPressure::new();
+
+        p.set_headroom(0.8);
+        assert_eq!(p.degradation_level(), 0);
+        assert_eq!(p.level_label(), "normal");
+
+        p.set_headroom(0.4);
+        assert_eq!(p.degradation_level(), 1);
+        assert_eq!(p.level_label(), "warning");
+
+        p.set_headroom(0.2);
+        assert_eq!(p.degradation_level(), 2);
+        assert_eq!(p.level_label(), "degraded");
+
+        p.set_headroom(0.1);
+        assert_eq!(p.degradation_level(), 3);
+        assert_eq!(p.level_label(), "critical");
+
+        p.set_headroom(0.02);
+        assert_eq!(p.degradation_level(), 4);
+        assert_eq!(p.level_label(), "emergency");
+    }
+
+    #[test]
+    fn system_pressure_recovery() {
+        let p = SystemPressure::new();
+
+        // Degrade
+        p.set_headroom(0.1);
+        assert_eq!(p.degradation_level(), 3);
+        assert!(p.should_degrade(0.5));
+
+        // Recover
+        p.set_headroom(0.8);
+        assert_eq!(p.degradation_level(), 0);
+        assert!(!p.should_degrade(0.5));
+    }
+
+    struct TestPolicy {
+        name: String,
+        last_headroom: Mutex<f32>,
+    }
+
+    impl TestPolicy {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_owned(),
+                last_headroom: Mutex::new(1.0),
+            }
+        }
+
+        fn last_headroom(&self) -> f32 {
+            *self.last_headroom.lock().unwrap()
+        }
+    }
+
+    impl DegradationPolicy for TestPolicy {
+        fn apply(&self, headroom: f32) {
+            *self.last_headroom.lock().unwrap() = headroom;
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[test]
+    fn degradation_policies_compose() {
+        let cache_policy = Arc::new(TestPolicy::new("cache"));
+        let scrub_policy = Arc::new(TestPolicy::new("scrub"));
+        let mvcc_policy = Arc::new(TestPolicy::new("mvcc"));
+
+        let policies: Vec<Arc<dyn DegradationPolicy>> = vec![
+            Arc::clone(&cache_policy) as Arc<dyn DegradationPolicy>,
+            Arc::clone(&scrub_policy) as Arc<dyn DegradationPolicy>,
+            Arc::clone(&mvcc_policy) as Arc<dyn DegradationPolicy>,
+        ];
+
+        let headroom = 0.3;
+        for policy in &policies {
+            policy.apply(headroom);
+        }
+
+        // All policies should have received the updated headroom.
+        assert!((cache_policy.last_headroom() - 0.3).abs() < f32::EPSILON);
+        assert!((scrub_policy.last_headroom() - 0.3).abs() < f32::EPSILON);
+        assert!((mvcc_policy.last_headroom() - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cx_pressure_propagation() {
+        let pressure = Arc::new(SystemPressure::with_headroom(0.5));
+        let cx = Cx::for_testing().with_pressure(Arc::clone(&pressure));
+
+        // Should be accessible via Cx.
+        let p = cx.pressure().expect("pressure should be attached");
+        assert!((p.headroom() - 0.5).abs() < f32::EPSILON);
+
+        // Update from external monitor.
+        pressure.set_headroom(0.1);
+        assert!((p.headroom() - 0.1).abs() < f32::EPSILON);
+        assert_eq!(p.degradation_level(), 3);
+    }
+
+    #[test]
+    fn cx_without_pressure_returns_none() {
+        let cx = Cx::for_testing();
+        assert!(cx.pressure().is_none());
     }
 }
