@@ -7,11 +7,11 @@
 | Domain | Implemented | Total Tracked | Coverage |
 |--------|-------------|---------------|----------|
 | ext4 metadata parsing | 10 | 19 | 52.6% |
-| btrfs metadata parsing | 8 | 20 | 40.0% |
+| btrfs metadata parsing | 9 | 20 | 45.0% |
 | MVCC/COW core | 5 | 14 | 35.7% |
 | FUSE surface | 6 | 12 | 50.0% |
 | self-healing durability policy | 5 | 10 | 50.0% |
-| **Overall** | **34** | **75** | **45.3%** |
+| **Overall** | **35** | **75** | **46.7%** |
 
 > **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
 > authoritative source for implemented/total counts. This table MUST match those
@@ -44,7 +44,7 @@
 | btrfs item payload decode (ROOT/INODE/DIR/EXTENT_DATA) | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-btrfs` (`parse_root_item`, `parse_inode_item`, `parse_dir_items`, `parse_extent_data`) |
 | btrfs open/validate pipeline | `fs/btrfs/disk-io.c` | ✅ | `BtrfsContext` in `ffs-core` |
 | btrfs transaction parity | `fs/btrfs/transaction.c` | ❌ | Not yet implemented |
-| btrfs delayed refs parity | `fs/btrfs/delayed-ref.c` | ❌ | Not yet implemented |
+| btrfs delayed refs parity | `fs/btrfs/delayed-ref.c` | ✅ | `DelayedRefQueue` + `BtrfsRef` model + bounded flush/refcount tracking in `ffs-btrfs::BtrfsExtentAllocator`, with queue/refcount/stress tests |
 | btrfs scrub parity | `fs/btrfs/scrub.c` | ❌ | Not yet implemented |
 | MVCC snapshot visibility | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | MVCC commit sequencing | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
@@ -71,7 +71,7 @@ Legend: `✅` implemented, `🟡` partial, `❌` not implemented.
 ## 3. Blocking Gaps to 100%
 
 1. ext4 journal and allocator mutation behavior parity
-2. btrfs transaction/delayed-ref/scrub parity
+2. btrfs transaction/scrub parity
 3. production FUSE mount path
 4. full compatibility-mode write-path equivalence
 

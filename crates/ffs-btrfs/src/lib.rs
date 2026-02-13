@@ -29,6 +29,21 @@ pub const BTRFS_ITEM_DIR_INDEX: u8 = 96;
 pub const BTRFS_ITEM_EXTENT_DATA: u8 = 108;
 pub const BTRFS_ITEM_ROOT_ITEM: u8 = 132;
 
+/// btrfs item type constants for extent/block-group management (write path).
+pub const BTRFS_ITEM_EXTENT_ITEM: u8 = 168;
+pub const BTRFS_ITEM_METADATA_ITEM: u8 = 169;
+pub const BTRFS_ITEM_BLOCK_GROUP_ITEM: u8 = 192;
+
+/// Well-known tree objectids.
+pub const BTRFS_EXTENT_TREE_OBJECTID: u64 = 2;
+pub const BTRFS_CHUNK_TREE_OBJECTID: u64 = 3;
+pub const BTRFS_DEV_TREE_OBJECTID: u64 = 4;
+
+/// Block group type flags.
+pub const BTRFS_BLOCK_GROUP_DATA: u64 = 1;
+pub const BTRFS_BLOCK_GROUP_SYSTEM: u64 = 2;
+pub const BTRFS_BLOCK_GROUP_METADATA: u64 = 4;
+
 /// Directory entry type values stored in btrfs dir items.
 pub const BTRFS_FT_UNKNOWN: u8 = 0;
 pub const BTRFS_FT_REG_FILE: u8 = 1;
@@ -1377,6 +1392,651 @@ impl BtrfsBTree for InMemoryCowBtrfsTree {
     }
 }
 
+// ── Extent allocation ───────────────────────────────────────────────────────
+
+/// On-disk block group item: describes a contiguous region of the address space
+/// and how much of it is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsBlockGroupItem {
+    /// Total bytes in this block group.
+    pub total_bytes: u64,
+    /// Bytes currently allocated.
+    pub used_bytes: u64,
+    /// Type flags (DATA, METADATA, SYSTEM).
+    pub flags: u64,
+}
+
+impl BtrfsBlockGroupItem {
+    /// Serialize to on-disk format (24 bytes LE).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(24);
+        buf.extend_from_slice(&self.used_bytes.to_le_bytes());
+        buf.extend_from_slice(&self.total_bytes.to_le_bytes()); // Note: kernel stores chunk_objectid here; we reuse for total
+        buf.extend_from_slice(&self.flags.to_le_bytes());
+        buf
+    }
+
+    /// Free bytes remaining.
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.used_bytes)
+    }
+}
+
+/// On-disk extent item: records a single allocated extent and its reference count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsExtentItem {
+    /// Reference count.
+    pub refs: u64,
+    /// Generation.
+    pub generation: u64,
+    /// Flags.
+    pub flags: u64,
+}
+
+impl BtrfsExtentItem {
+    /// Extent flag: this is a tree block (metadata).
+    pub const FLAG_TREE_BLOCK: u64 = 2;
+
+    /// Serialize to on-disk format (24 bytes LE).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(24);
+        buf.extend_from_slice(&self.refs.to_le_bytes());
+        buf.extend_from_slice(&self.generation.to_le_bytes());
+        buf.extend_from_slice(&self.flags.to_le_bytes());
+        buf
+    }
+}
+
+/// Logical key for a physical extent in delayed reference bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtentKey {
+    /// Physical byte address of the extent.
+    pub bytenr: u64,
+    /// Extent length in bytes.
+    pub num_bytes: u64,
+}
+
+/// Reference kinds tracked by delayed references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BtrfsRef {
+    /// Tree block back-reference.
+    TreeBlock {
+        root: u64,
+        owner: u64,
+        offset: u64,
+        level: u8,
+    },
+    /// Data extent back-reference.
+    DataExtent {
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    },
+    /// Shared tree block reference.
+    SharedTreeBlock { parent: u64, level: u8 },
+    /// Shared data extent reference.
+    SharedDataExtent { parent: u64 },
+}
+
+/// Delayed reference action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefAction {
+    /// Add a back-reference (increment refcount).
+    Insert,
+    /// Delete a back-reference (decrement refcount).
+    Delete,
+}
+
+/// A delayed reference entry queued for batch processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelayedRef {
+    /// Extent this reference applies to.
+    pub extent: ExtentKey,
+    /// Reference shape.
+    pub ref_type: BtrfsRef,
+    /// Insert/delete action.
+    pub action: RefAction,
+    /// Monotonic sequence number for deterministic replay.
+    pub sequence: u64,
+}
+
+/// Delayed reference queue keyed by extent, with deterministic sequencing.
+#[derive(Debug, Clone, Default)]
+pub struct DelayedRefQueue {
+    refs: BTreeMap<ExtentKey, Vec<DelayedRef>>,
+    pending_count: usize,
+    next_sequence: u64,
+}
+
+impl DelayedRefQueue {
+    /// Create an empty delayed reference queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a delayed reference action for an extent.
+    pub fn queue(&mut self, extent: ExtentKey, ref_type: BtrfsRef, action: RefAction) {
+        let seq = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let entry = DelayedRef {
+            extent,
+            ref_type,
+            action,
+            sequence: seq,
+        };
+        self.refs.entry(extent).or_default().push(entry);
+        self.pending_count = self.pending_count.saturating_add(1);
+    }
+
+    /// Number of queued delayed reference entries.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending_count
+    }
+
+    /// Borrow pending entries for one extent key.
+    #[must_use]
+    pub fn pending_for(&self, extent: &ExtentKey) -> &[DelayedRef] {
+        self.refs.get(extent).map_or(&[], Vec::as_slice)
+    }
+
+    /// Flush up to `limit` delayed refs into persistent refcounts.
+    ///
+    /// Returns number of flushed entries.
+    pub fn flush(
+        &mut self,
+        limit: usize,
+        refcounts: &mut BTreeMap<ExtentKey, u64>,
+    ) -> Result<usize, BtrfsMutationError> {
+        if limit == 0 || self.pending_count == 0 {
+            return Ok(0);
+        }
+
+        let started = std::time::Instant::now();
+        let mut flushed = 0usize;
+        let mut to_prune = Vec::new();
+        let extent_keys: Vec<ExtentKey> = self.refs.keys().copied().collect();
+
+        for extent in extent_keys {
+            if flushed >= limit {
+                break;
+            }
+
+            let Some(entries) = self.refs.get_mut(&extent) else {
+                continue;
+            };
+
+            let remaining_budget = limit - flushed;
+            let take_n = remaining_budget.min(entries.len());
+            let batch: Vec<DelayedRef> = entries.iter().copied().take(take_n).collect();
+
+            for entry in batch {
+                match entry.action {
+                    RefAction::Insert => {
+                        let counter = refcounts.entry(entry.extent).or_insert(0);
+                        *counter = counter.saturating_add(1);
+                    }
+                    RefAction::Delete => match refcounts.entry(entry.extent) {
+                        std::collections::btree_map::Entry::Occupied(mut occ) => {
+                            let current = *occ.get();
+                            if current == 0 {
+                                return Err(BtrfsMutationError::BrokenInvariant(
+                                    "delayed ref delete underflow",
+                                ));
+                            }
+                            let next = current - 1;
+                            if next == 0 {
+                                occ.remove_entry();
+                            } else {
+                                *occ.get_mut() = next;
+                            }
+                        }
+                        std::collections::btree_map::Entry::Vacant(_) => {
+                            return Err(BtrfsMutationError::BrokenInvariant(
+                                "delayed ref delete without prior refcount",
+                            ));
+                        }
+                    },
+                }
+            }
+
+            entries.drain(..take_n);
+            flushed = flushed.saturating_add(take_n);
+            self.pending_count = self.pending_count.saturating_sub(take_n);
+
+            if entries.is_empty() {
+                to_prune.push(extent);
+            }
+        }
+
+        for extent in to_prune {
+            self.refs.remove(&extent);
+        }
+
+        debug!(
+            target: "ffs::btrfs::alloc",
+            flushed,
+            remaining = self.pending_count,
+            duration_us = started.elapsed().as_micros(),
+            "delayed_ref_flush_batch"
+        );
+
+        Ok(flushed)
+    }
+
+    /// Drain all queued delayed refs in sequence order.
+    pub fn drain_all(&mut self) -> Vec<DelayedRef> {
+        let mut drained: Vec<DelayedRef> = self
+            .refs
+            .values_mut()
+            .flat_map(|entries| entries.drain(..))
+            .collect();
+        self.refs.clear();
+        self.pending_count = 0;
+        drained.sort_by_key(|entry| entry.sequence);
+        drained
+    }
+}
+
+/// Result of an extent allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentAllocation {
+    /// Physical byte address of the allocated extent.
+    pub bytenr: u64,
+    /// Size of the allocated extent.
+    pub num_bytes: u64,
+    /// Block group the allocation came from.
+    pub block_group_start: u64,
+}
+
+/// In-memory block group state tracked by the extent allocator.
+#[derive(Debug, Clone)]
+struct BlockGroupState {
+    /// Starting byte address of this block group.
+    start: u64,
+    /// On-disk item.
+    item: BtrfsBlockGroupItem,
+    /// Hint for next allocation search offset within this group.
+    alloc_offset: u64,
+}
+
+/// Extent allocator for btrfs write path.
+///
+/// Manages block groups and finds free space by scanning for gaps between
+/// allocated extents in the extent tree. For V1 single-device, free space
+/// is determined by gap analysis (no free-space-tree optimization yet).
+#[derive(Debug)]
+pub struct BtrfsExtentAllocator {
+    /// Block groups, keyed by start address.
+    block_groups: BTreeMap<u64, BlockGroupState>,
+    /// The extent tree (COW B-tree tracking allocated extents).
+    extent_tree: InMemoryCowBtrfsTree,
+    /// Queued delayed references for batch commit.
+    delayed_ref_queue: DelayedRefQueue,
+    /// Refcounts materialized by delayed-ref flush.
+    extent_refcounts: BTreeMap<ExtentKey, u64>,
+    /// Current transaction generation.
+    generation: u64,
+}
+
+impl BtrfsExtentAllocator {
+    /// Create a new extent allocator with an empty extent tree.
+    pub fn new(generation: u64) -> Result<Self, BtrfsMutationError> {
+        let extent_tree = InMemoryCowBtrfsTree::new(5)?;
+        Ok(Self {
+            block_groups: BTreeMap::new(),
+            extent_tree,
+            delayed_ref_queue: DelayedRefQueue::new(),
+            extent_refcounts: BTreeMap::new(),
+            generation,
+        })
+    }
+
+    /// Register a block group.
+    pub fn add_block_group(&mut self, start: u64, item: BtrfsBlockGroupItem) {
+        debug!(
+            target: "ffs::btrfs::alloc",
+            start, total = item.total_bytes, used = item.used_bytes,
+            flags = item.flags, "block_group_register"
+        );
+        self.block_groups.insert(
+            start,
+            BlockGroupState {
+                start,
+                item,
+                alloc_offset: 0,
+            },
+        );
+    }
+
+    /// Allocate a data extent of the given size.
+    ///
+    /// Scans block groups with `BTRFS_BLOCK_GROUP_DATA` flag for a gap
+    /// large enough to hold `num_bytes`.
+    pub fn alloc_data(&mut self, num_bytes: u64) -> Result<ExtentAllocation, BtrfsMutationError> {
+        self.alloc_extent(num_bytes, BTRFS_BLOCK_GROUP_DATA, false)
+    }
+
+    /// Allocate a metadata extent (tree block).
+    pub fn alloc_metadata(
+        &mut self,
+        num_bytes: u64,
+    ) -> Result<ExtentAllocation, BtrfsMutationError> {
+        self.alloc_extent(num_bytes, BTRFS_BLOCK_GROUP_METADATA, true)
+    }
+
+    /// Core allocation logic.
+    #[allow(clippy::too_many_lines)]
+    fn alloc_extent(
+        &mut self,
+        num_bytes: u64,
+        required_flags: u64,
+        is_metadata: bool,
+    ) -> Result<ExtentAllocation, BtrfsMutationError> {
+        // Find a block group with enough free space.
+        let bg_start = self
+            .block_groups
+            .values()
+            .find(|bg| (bg.item.flags & required_flags) != 0 && bg.item.free_bytes() >= num_bytes)
+            .map(|bg| bg.start);
+
+        let bg_start = bg_start.ok_or(BtrfsMutationError::BrokenInvariant(
+            "no block group with enough free space",
+        ))?;
+
+        debug!(
+            target: "ffs::btrfs::alloc",
+            block_group = bg_start,
+            size_needed = num_bytes,
+            "alloc_search_start"
+        );
+
+        // Find a gap in this block group by scanning extent items in range.
+        let bg = &self.block_groups[&bg_start];
+        let bg_end = bg.start + bg.item.total_bytes;
+
+        let range_start = BtrfsKey {
+            objectid: bg.start,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: 0,
+        };
+        let range_end = BtrfsKey {
+            objectid: bg_end,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: u64::MAX,
+        };
+
+        let extents = self.extent_tree.range(&range_start, &range_end);
+        let extents = extents.unwrap_or_default();
+
+        // Scan for gaps between existing extents.
+        let alloc_offset = self.block_groups[&bg_start].alloc_offset;
+        let mut cursor = bg_start + alloc_offset;
+
+        let allocated_ranges: Vec<(u64, u64)> = extents
+            .iter()
+            .map(|(key, _)| (key.objectid, key.offset))
+            .collect();
+
+        let mut found = None;
+        // Try from alloc_offset first, then wrap around.
+        for &(ext_start, ext_size) in &allocated_ranges {
+            let ext_end = ext_start + ext_size;
+            if cursor < ext_start {
+                let gap = ext_start - cursor;
+                if gap >= num_bytes {
+                    found = Some(cursor);
+                    break;
+                }
+            }
+            if ext_end > cursor {
+                cursor = ext_end;
+            }
+        }
+        // Check gap after last extent.
+        if found.is_none() && cursor + num_bytes <= bg_end {
+            found = Some(cursor);
+        }
+        // Wrap around: try from block group start if we started mid-group.
+        if found.is_none() && alloc_offset > 0 {
+            cursor = bg_start;
+            for &(ext_start, ext_size) in &allocated_ranges {
+                let ext_end = ext_start + ext_size;
+                if cursor < ext_start {
+                    let gap = ext_start - cursor;
+                    if gap >= num_bytes {
+                        found = Some(cursor);
+                        break;
+                    }
+                }
+                if ext_end > cursor {
+                    cursor = ext_end;
+                }
+            }
+            if found.is_none() && cursor + num_bytes <= bg_end {
+                found = Some(cursor);
+            }
+        }
+
+        let bytenr = found.ok_or(BtrfsMutationError::BrokenInvariant(
+            "block group has no gap",
+        ))?;
+        let extent = ExtentKey { bytenr, num_bytes };
+
+        debug!(
+            target: "ffs::btrfs::alloc",
+            block_group = bg_start,
+            extent_start = bytenr,
+            extent_size = num_bytes,
+            "alloc_found"
+        );
+
+        // Insert EXTENT_ITEM into extent tree.
+        let extent_item = BtrfsExtentItem {
+            refs: 1,
+            generation: self.generation,
+            flags: if is_metadata {
+                BtrfsExtentItem::FLAG_TREE_BLOCK
+            } else {
+                0
+            },
+        };
+        let key = BtrfsKey {
+            objectid: bytenr,
+            item_type: if is_metadata {
+                BTRFS_ITEM_METADATA_ITEM
+            } else {
+                BTRFS_ITEM_EXTENT_ITEM
+            },
+            offset: num_bytes,
+        };
+        self.extent_tree.insert(key, &extent_item.to_bytes())?;
+
+        trace!(
+            target: "ffs::btrfs::alloc",
+            bytenr,
+            size = num_bytes,
+            refs = 1,
+            "extent_item_insert"
+        );
+
+        // Update block group accounting.
+        if let Some(bg) = self.block_groups.get_mut(&bg_start) {
+            let used_before = bg.item.used_bytes;
+            bg.item.used_bytes += num_bytes;
+            bg.alloc_offset = (bytenr + num_bytes) - bg_start;
+            trace!(
+                target: "ffs::btrfs::alloc",
+                block_group = bg_start,
+                used_before,
+                used_after = bg.item.used_bytes,
+                delta = num_bytes,
+                "bg_accounting"
+            );
+        }
+
+        // Queue delayed ref.
+        let ref_type = if is_metadata {
+            BtrfsRef::TreeBlock {
+                root: bg_start,
+                owner: bytenr,
+                offset: num_bytes,
+                level: 0,
+            }
+        } else {
+            BtrfsRef::DataExtent {
+                root: bg_start,
+                objectid: bytenr,
+                offset: num_bytes,
+            }
+        };
+        self.delayed_ref_queue
+            .queue(extent, ref_type, RefAction::Insert);
+        debug!(
+            target: "ffs::btrfs::alloc",
+            bytenr,
+            ref_type = if is_metadata { "metadata" } else { "data" },
+            action = "insert",
+            "delayed_ref_queue"
+        );
+
+        Ok(ExtentAllocation {
+            bytenr,
+            num_bytes,
+            block_group_start: bg_start,
+        })
+    }
+
+    /// Free an extent (decrement refcount, remove if zero).
+    pub fn free_extent(
+        &mut self,
+        bytenr: u64,
+        num_bytes: u64,
+        is_metadata: bool,
+    ) -> Result<(), BtrfsMutationError> {
+        debug!(
+            target: "ffs::btrfs::alloc",
+            bytenr, size = num_bytes, "free_search"
+        );
+
+        let item_type = if is_metadata {
+            BTRFS_ITEM_METADATA_ITEM
+        } else {
+            BTRFS_ITEM_EXTENT_ITEM
+        };
+        let key = BtrfsKey {
+            objectid: bytenr,
+            item_type,
+            offset: num_bytes,
+        };
+
+        // Remove from extent tree.
+        self.extent_tree.delete(&key)?;
+        trace!(
+            target: "ffs::btrfs::alloc",
+            bytenr, size = num_bytes, "extent_item_remove"
+        );
+
+        // Update block group accounting.
+        let mut owning_bg = None;
+        for bg in self.block_groups.values_mut() {
+            let bg_end = bg.start + bg.item.total_bytes;
+            if bytenr >= bg.start && bytenr < bg_end {
+                let used_before = bg.item.used_bytes;
+                bg.item.used_bytes = bg.item.used_bytes.saturating_sub(num_bytes);
+                owning_bg = Some(bg.start);
+                trace!(
+                    target: "ffs::btrfs::alloc",
+                    block_group = bg.start,
+                    used_before,
+                    used_after = bg.item.used_bytes,
+                    delta = num_bytes,
+                    "bg_accounting_free"
+                );
+                break;
+            }
+        }
+
+        // Queue delayed ref for delete.
+        let extent = ExtentKey { bytenr, num_bytes };
+        let root = owning_bg.unwrap_or_default();
+        let ref_type = if is_metadata {
+            BtrfsRef::TreeBlock {
+                root,
+                owner: bytenr,
+                offset: num_bytes,
+                level: 0,
+            }
+        } else {
+            BtrfsRef::DataExtent {
+                root,
+                objectid: bytenr,
+                offset: num_bytes,
+            }
+        };
+        self.delayed_ref_queue
+            .queue(extent, ref_type, RefAction::Delete);
+        debug!(
+            target: "ffs::btrfs::alloc",
+            bytenr,
+            ref_type = if is_metadata { "metadata" } else { "data" },
+            action = "delete",
+            "delayed_ref_queue"
+        );
+
+        Ok(())
+    }
+
+    /// Drain all queued delayed references (for transaction commit).
+    pub fn drain_delayed_refs(&mut self) -> Vec<DelayedRef> {
+        self.delayed_ref_queue.drain_all()
+    }
+
+    /// Number of queued delayed references.
+    #[must_use]
+    pub fn delayed_ref_count(&self) -> usize {
+        self.delayed_ref_queue.pending_count()
+    }
+
+    /// Borrow queued delayed references for an extent.
+    #[must_use]
+    pub fn pending_for(&self, extent: &ExtentKey) -> &[DelayedRef] {
+        self.delayed_ref_queue.pending_for(extent)
+    }
+
+    /// Flush up to `limit` delayed refs into materialized refcounts.
+    pub fn flush_delayed_refs(&mut self, limit: usize) -> Result<usize, BtrfsMutationError> {
+        self.delayed_ref_queue
+            .flush(limit, &mut self.extent_refcounts)
+    }
+
+    /// Materialized refcount for an extent.
+    #[must_use]
+    pub fn extent_refcount(&self, extent: ExtentKey) -> u64 {
+        self.extent_refcounts.get(&extent).copied().unwrap_or(0)
+    }
+
+    /// Get block group state for inspection.
+    #[must_use]
+    pub fn block_group(&self, start: u64) -> Option<&BtrfsBlockGroupItem> {
+        self.block_groups.get(&start).map(|bg| &bg.item)
+    }
+
+    /// Total free space across all block groups with the given type flags.
+    #[must_use]
+    pub fn total_free(&self, type_flags: u64) -> u64 {
+        self.block_groups
+            .values()
+            .filter(|bg| (bg.item.flags & type_flags) != 0)
+            .map(|bg| bg.item.free_bytes())
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1971,5 +2631,276 @@ mod tests {
             }
             BtrfsExtentData::Inline { .. } => panic!("expected regular extent"),
         }
+    }
+
+    // ── Extent allocator tests ──────────────────────────────────────────
+
+    fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
+        BtrfsBlockGroupItem {
+            total_bytes: size,
+            used_bytes: 0,
+            flags: BTRFS_BLOCK_GROUP_DATA,
+        }
+    }
+
+    fn make_meta_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
+        BtrfsBlockGroupItem {
+            total_bytes: size,
+            used_bytes: 0,
+            flags: BTRFS_BLOCK_GROUP_METADATA,
+        }
+    }
+
+    #[test]
+    fn alloc_single_extent_in_empty_group() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+
+        let result = alloc.alloc_data(4096).expect("alloc");
+        assert_eq!(result.bytenr, 0x1_0000);
+        assert_eq!(result.num_bytes, 4096);
+        assert_eq!(result.block_group_start, 0x1_0000);
+
+        // Block group accounting should be updated.
+        let bg = alloc.block_group(0x1_0000).expect("bg");
+        assert_eq!(bg.used_bytes, 4096);
+        assert_eq!(bg.free_bytes(), 0x10_0000 - 4096);
+    }
+
+    #[test]
+    fn alloc_fills_group_sequentially() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+
+        let a1 = alloc.alloc_data(4096).expect("first");
+        let a2 = alloc.alloc_data(8192).expect("second");
+        let a3 = alloc.alloc_data(4096).expect("third");
+
+        // Allocations should be sequential.
+        assert_eq!(a1.bytenr, 0x1_0000);
+        assert_eq!(a2.bytenr, 0x1_0000 + 4096);
+        assert_eq!(a3.bytenr, 0x1_0000 + 4096 + 8192);
+
+        let bg = alloc.block_group(0x1_0000).expect("bg");
+        assert_eq!(bg.used_bytes, 4096 + 8192 + 4096);
+    }
+
+    #[test]
+    fn free_extent_creates_reclaimable_space() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+
+        let a1 = alloc.alloc_data(4096).expect("first");
+        let _a2 = alloc.alloc_data(4096).expect("second");
+
+        // Free first extent.
+        alloc
+            .free_extent(a1.bytenr, a1.num_bytes, false)
+            .expect("free");
+
+        let bg = alloc.block_group(0x1_0000).expect("bg");
+        assert_eq!(bg.used_bytes, 4096); // only second extent remains
+    }
+
+    #[test]
+    fn alloc_respects_block_group_type() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+        alloc.add_block_group(0x20_0000, make_meta_bg(0x20_0000, 0x10_0000));
+
+        // Data allocation should go to the data block group.
+        let data = alloc.alloc_data(4096).expect("data alloc");
+        assert_eq!(data.block_group_start, 0x1_0000);
+
+        // Metadata allocation should go to the metadata block group.
+        let meta = alloc.alloc_metadata(4096).expect("meta alloc");
+        assert_eq!(meta.block_group_start, 0x20_0000);
+    }
+
+    #[test]
+    fn delayed_refs_tracked() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+
+        let a1 = alloc.alloc_data(4096).expect("alloc");
+        let extent = ExtentKey {
+            bytenr: a1.bytenr,
+            num_bytes: a1.num_bytes,
+        };
+        assert_eq!(alloc.delayed_ref_count(), 1);
+        assert_eq!(alloc.pending_for(&extent).len(), 1);
+
+        alloc
+            .free_extent(a1.bytenr, a1.num_bytes, false)
+            .expect("free");
+        assert_eq!(alloc.delayed_ref_count(), 2);
+        assert_eq!(alloc.pending_for(&extent).len(), 2);
+
+        let refs = alloc.drain_delayed_refs();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].action, RefAction::Insert);
+        assert_eq!(refs[0].extent.bytenr, a1.bytenr);
+        assert_eq!(refs[1].action, RefAction::Delete);
+        assert_eq!(refs[1].extent.bytenr, a1.bytenr);
+
+        // After drain, count is zero.
+        assert_eq!(alloc.delayed_ref_count(), 0);
+    }
+
+    #[test]
+    fn flush_delayed_refs_applies_refcounts() {
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+
+        let a1 = alloc.alloc_data(4096).expect("alloc");
+        let extent = ExtentKey {
+            bytenr: a1.bytenr,
+            num_bytes: a1.num_bytes,
+        };
+
+        let flushed = alloc.flush_delayed_refs(1).expect("flush insert");
+        assert_eq!(flushed, 1);
+        assert_eq!(alloc.delayed_ref_count(), 0);
+        assert_eq!(alloc.extent_refcount(extent), 1);
+
+        alloc
+            .free_extent(a1.bytenr, a1.num_bytes, false)
+            .expect("free");
+        let flushed = alloc.flush_delayed_refs(1).expect("flush delete");
+        assert_eq!(flushed, 1);
+        assert_eq!(alloc.extent_refcount(extent), 0);
+    }
+
+    #[test]
+    fn flush_delayed_refs_respects_limit() {
+        let mut alloc = BtrfsExtentAllocator::new(9).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+
+        let a1 = alloc.alloc_data(4096).expect("a1");
+        let a2 = alloc.alloc_data(4096).expect("a2");
+        let e1 = ExtentKey {
+            bytenr: a1.bytenr,
+            num_bytes: a1.num_bytes,
+        };
+        let e2 = ExtentKey {
+            bytenr: a2.bytenr,
+            num_bytes: a2.num_bytes,
+        };
+
+        let flushed = alloc.flush_delayed_refs(1).expect("first flush");
+        assert_eq!(flushed, 1);
+        assert_eq!(alloc.delayed_ref_count(), 1);
+        assert_eq!(alloc.extent_refcount(e1) + alloc.extent_refcount(e2), 1);
+
+        let flushed = alloc.flush_delayed_refs(1).expect("second flush");
+        assert_eq!(flushed, 1);
+        assert_eq!(alloc.delayed_ref_count(), 0);
+        assert_eq!(alloc.extent_refcount(e1), 1);
+        assert_eq!(alloc.extent_refcount(e2), 1);
+    }
+
+    #[test]
+    fn delayed_ref_queue_shared_extent_refcount() {
+        let mut queue = DelayedRefQueue::new();
+        let extent = ExtentKey {
+            bytenr: 0x80_0000,
+            num_bytes: 4096,
+        };
+        queue.queue(
+            extent,
+            BtrfsRef::DataExtent {
+                root: 5,
+                objectid: 0x200,
+                offset: 0,
+            },
+            RefAction::Insert,
+        );
+        queue.queue(
+            extent,
+            BtrfsRef::SharedDataExtent { parent: 0x1000 },
+            RefAction::Insert,
+        );
+
+        let mut refcounts = BTreeMap::new();
+        let flushed = queue.flush(1024, &mut refcounts).expect("flush");
+        assert_eq!(flushed, 2);
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(refcounts.get(&extent), Some(&2));
+    }
+
+    #[test]
+    fn delayed_ref_queue_stress_10000_refs_flushes_all() {
+        let mut queue = DelayedRefQueue::new();
+        let mut refcounts = BTreeMap::new();
+
+        for i in 0..10_000_u64 {
+            let extent = ExtentKey {
+                bytenr: 0x10_0000 + (i * 4096),
+                num_bytes: 4096,
+            };
+            queue.queue(
+                extent,
+                BtrfsRef::DataExtent {
+                    root: 5,
+                    objectid: i,
+                    offset: 0,
+                },
+                RefAction::Insert,
+            );
+        }
+
+        assert_eq!(queue.pending_count(), 10_000);
+        let flushed = queue.flush(10_000, &mut refcounts).expect("flush");
+        assert_eq!(flushed, 10_000);
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(refcounts.len(), 10_000);
+    }
+
+    #[test]
+    fn alloc_fails_when_no_space() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        // Small block group: only 100 bytes.
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 100));
+
+        let result = alloc.alloc_data(200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn total_free_computation() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 1000));
+        alloc.add_block_group(0x2_0000, make_data_bg(0x2_0000, 2000));
+        alloc.add_block_group(0x3_0000, make_meta_bg(0x3_0000, 500));
+
+        assert_eq!(alloc.total_free(BTRFS_BLOCK_GROUP_DATA), 3000);
+        assert_eq!(alloc.total_free(BTRFS_BLOCK_GROUP_METADATA), 500);
+
+        alloc.alloc_data(100).expect("alloc");
+        assert_eq!(alloc.total_free(BTRFS_BLOCK_GROUP_DATA), 2900);
+    }
+
+    #[test]
+    fn extent_item_serialization() {
+        let item = BtrfsExtentItem {
+            refs: 1,
+            generation: 42,
+            flags: 0,
+        };
+        let bytes = item.to_bytes();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 42);
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn block_group_item_free_bytes() {
+        let bg = BtrfsBlockGroupItem {
+            total_bytes: 1000,
+            used_bytes: 300,
+            flags: BTRFS_BLOCK_GROUP_DATA,
+        };
+        assert_eq!(bg.free_bytes(), 700);
     }
 }
