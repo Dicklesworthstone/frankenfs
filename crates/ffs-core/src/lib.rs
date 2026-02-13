@@ -24,12 +24,14 @@ use ffs_ondisk::{
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
 };
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsFlavor {
@@ -206,16 +208,24 @@ pub struct OpenFs {
     pub ext4_journal_replay: Option<ReplayOutcome>,
     /// Block device for I/O operations.
     dev: Box<dyn ByteDevice>,
+    /// MVCC version store for snapshot-isolated block access.
+    ///
+    /// Shared across all snapshots/transactions that operate on this filesystem.
+    /// Writes stage versions here; reads check here before falling back to device.
+    mvcc_store: Arc<RwLock<MvccStore>>,
 }
 
 impl std::fmt::Debug for OpenFs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mvcc_guard = self.mvcc_store.read();
         f.debug_struct("OpenFs")
             .field("flavor", &self.flavor)
             .field("ext4_geometry", &self.ext4_geometry)
             .field("btrfs_context", &self.btrfs_context)
             .field("ext4_journal_replay", &self.ext4_journal_replay)
             .field("dev_len", &self.dev.len_bytes())
+            .field("mvcc_version_count", &mvcc_guard.version_count())
+            .field("mvcc_active_snapshots", &mvcc_guard.active_snapshot_count())
             .finish()
     }
 }
@@ -355,12 +365,19 @@ impl OpenFs {
             }
         };
 
+        let mvcc_store = Arc::new(RwLock::new(MvccStore::new()));
+        trace!(
+            target: "ffs::mvcc",
+            "mvcc_store_init"
+        );
+
         let mut fs = Self {
             flavor,
             ext4_geometry,
             btrfs_context,
             ext4_journal_replay: None,
             dev,
+            mvcc_store,
         };
 
         if fs.is_ext4() && !options.skip_validation {
@@ -507,6 +524,304 @@ impl OpenFs {
             "ext4 journal replay completed"
         );
         Ok(Some(outcome))
+    }
+
+    // ── MVCC transaction API ─────────────────────────────────────────
+
+    /// Get the shared MVCC store for this filesystem.
+    ///
+    /// The returned `Arc<RwLock<MvccStore>>` can be cloned and used to create
+    /// `MvccBlockDevice` wrappers or access versioned data directly.
+    #[must_use]
+    pub fn mvcc_store(&self) -> &Arc<RwLock<MvccStore>> {
+        &self.mvcc_store
+    }
+
+    /// Get the current snapshot sequence for new read-only operations.
+    ///
+    /// Readers that want a consistent view should capture this snapshot
+    /// at the start of their operation and use it throughout.
+    #[must_use]
+    pub fn current_snapshot(&self) -> Snapshot {
+        let snap = self.mvcc_store.read().current_snapshot();
+        trace!(
+            target: "ffs::mvcc",
+            snapshot_high = snap.high.0,
+            "mvcc_snapshot_acquired"
+        );
+        snap
+    }
+
+    /// Begin a new MVCC transaction.
+    ///
+    /// The transaction captures a snapshot at the current commit sequence.
+    /// Writes are staged in the transaction and become visible only after
+    /// a successful commit.
+    ///
+    /// # Logging
+    /// - `txn_begin`: transaction ID and snapshot sequence
+    pub fn begin_transaction(&self) -> Transaction {
+        let txn = self.mvcc_store.write().begin();
+        debug!(
+            target: "ffs::mvcc",
+            txn_id = txn.id.0,
+            snapshot_high = txn.snapshot.high.0,
+            "txn_begin"
+        );
+        txn
+    }
+
+    /// Commit an MVCC transaction using First-Committer-Wins (FCW) semantics.
+    ///
+    /// # Errors
+    /// Returns `CommitError::Conflict` if another transaction committed to
+    /// a block in this transaction's write set after our snapshot.
+    ///
+    /// # Logging
+    /// - `txn_commit_start`: transaction details before commit
+    /// - `txn_commit_success`: on successful commit with commit sequence
+    /// - `txn_commit_conflict`: on FCW conflict with conflict details
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn commit_transaction(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+        let txn_id = txn.id;
+        let write_set_size = txn.pending_writes();
+        let read_set_size = txn.read_set().len();
+
+        debug!(
+            target: "ffs::mvcc",
+            txn_id = txn_id.0,
+            write_set_size,
+            read_set_size,
+            "txn_commit_start"
+        );
+
+        let start = std::time::Instant::now();
+        let result = self.mvcc_store.write().commit(txn);
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        match &result {
+            Ok(commit_seq) => {
+                info!(
+                    target: "ffs::mvcc",
+                    txn_id = txn_id.0,
+                    commit_seq = commit_seq.0,
+                    write_set_size,
+                    duration_us,
+                    "txn_commit_success"
+                );
+            }
+            Err(CommitError::Conflict {
+                block,
+                snapshot,
+                observed,
+            }) => {
+                warn!(
+                    target: "ffs::mvcc",
+                    txn_id = txn_id.0,
+                    conflict_block = block.0,
+                    snapshot = snapshot.0,
+                    observed = observed.0,
+                    conflict_type = "fcw",
+                    "txn_commit_conflict"
+                );
+            }
+            Err(CommitError::SsiConflict {
+                pivot_block,
+                read_version,
+                write_version,
+                concurrent_txn,
+            }) => {
+                warn!(
+                    target: "ffs::mvcc",
+                    txn_id = txn_id.0,
+                    pivot_block = pivot_block.0,
+                    read_version = read_version.0,
+                    write_version = write_version.0,
+                    concurrent_txn = concurrent_txn.0,
+                    conflict_type = "ssi",
+                    "txn_commit_conflict"
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Commit an MVCC transaction using Serializable Snapshot Isolation (SSI).
+    ///
+    /// SSI extends FCW with rw-antidependency tracking to detect and prevent
+    /// write skew anomalies. Use this when full serializability is required.
+    ///
+    /// # Errors
+    /// Returns `CommitError::Conflict` for write-write conflicts (FCW layer).
+    /// Returns `CommitError::SsiConflict` for rw-antidependency cycles.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn commit_transaction_ssi(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+        let txn_id = txn.id;
+        let write_set_size = txn.pending_writes();
+        let read_set_size = txn.read_set().len();
+
+        debug!(
+            target: "ffs::mvcc",
+            txn_id = txn_id.0,
+            write_set_size,
+            read_set_size,
+            mode = "ssi",
+            "txn_commit_start"
+        );
+
+        let start = std::time::Instant::now();
+        let result = self.mvcc_store.write().commit_ssi(txn);
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        match &result {
+            Ok(commit_seq) => {
+                info!(
+                    target: "ffs::mvcc",
+                    txn_id = txn_id.0,
+                    commit_seq = commit_seq.0,
+                    write_set_size,
+                    duration_us,
+                    mode = "ssi",
+                    "txn_commit_success"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "ffs::mvcc",
+                    txn_id = txn_id.0,
+                    error = %e,
+                    mode = "ssi",
+                    "txn_commit_conflict"
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Read a block at a specific snapshot, checking MVCC store first.
+    ///
+    /// This is the core MVCC-aware read operation:
+    /// 1. Check if the MVCC store has a version visible at `snapshot`
+    /// 2. If found, return the versioned data
+    /// 3. Otherwise, fall back to the underlying device
+    ///
+    /// # Logging
+    /// - `mvcc_read_start`: block and snapshot
+    /// - `mvcc_version_hit`: when found in MVCC store
+    /// - `mvcc_version_miss`: when falling back to device
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn read_block_at_snapshot(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Result<Vec<u8>, FfsError> {
+        trace!(
+            target: "ffs::mvcc",
+            block = block.0,
+            snapshot = snapshot.high.0,
+            "mvcc_read_start"
+        );
+
+        let start = std::time::Instant::now();
+
+        // Check MVCC store first (shared lock, no I/O).
+        {
+            let guard = self.mvcc_store.read();
+            if let Some(bytes) = guard.read_visible(block, snapshot) {
+                let duration_us = start.elapsed().as_micros() as u64;
+                trace!(
+                    target: "ffs::mvcc",
+                    block = block.0,
+                    snapshot = snapshot.high.0,
+                    source = "mvcc",
+                    duration_us,
+                    "mvcc_version_hit"
+                );
+                return Ok(bytes.to_vec());
+            }
+        }
+
+        // Fall back to device.
+        let block_size = self.block_size();
+        let offset = block
+            .0
+            .checked_mul(u64::from(block_size))
+            .ok_or_else(|| FfsError::Format("block offset overflow".to_owned()))?;
+
+        let bs = usize::try_from(block_size)
+            .map_err(|_| FfsError::Format("block_size overflow".to_owned()))?;
+        let mut buf = vec![0_u8; bs];
+        self.dev.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
+
+        let duration_us = start.elapsed().as_micros() as u64;
+        trace!(
+            target: "ffs::mvcc",
+            block = block.0,
+            snapshot = snapshot.high.0,
+            source = "device",
+            duration_us,
+            "mvcc_version_miss"
+        );
+
+        Ok(buf)
+    }
+
+    /// Stage a block write in a transaction.
+    ///
+    /// The write is not visible to other transactions until commit.
+    ///
+    /// # Logging
+    /// - `mvcc_write_stage`: block, transaction, and data length
+    pub fn stage_block_write(&self, txn: &mut Transaction, block: BlockNumber, data: Vec<u8>) {
+        trace!(
+            target: "ffs::mvcc",
+            txn_id = txn.id.0,
+            block = block.0,
+            data_len = data.len(),
+            "mvcc_write_stage"
+        );
+        txn.stage_write(block, data);
+    }
+
+    /// Record that a block was read at a specific version (for SSI tracking).
+    ///
+    /// Call this after reading a block if using SSI commit mode.
+    pub fn record_read(&self, txn: &mut Transaction, block: BlockNumber, version: CommitSeq) {
+        trace!(
+            target: "ffs::mvcc",
+            txn_id = txn.id.0,
+            block = block.0,
+            version = version.0,
+            "mvcc_read_set_add"
+        );
+        txn.record_read(block, version);
+    }
+
+    /// Get the latest commit sequence for a block.
+    ///
+    /// Useful for recording reads when using SSI mode.
+    #[must_use]
+    pub fn latest_block_version(&self, block: BlockNumber) -> CommitSeq {
+        self.mvcc_store.read().latest_commit_seq(block)
+    }
+
+    /// Prune old versions that are no longer needed by any active snapshot.
+    ///
+    /// Call this periodically to reclaim memory from superseded versions.
+    /// Returns the watermark that was used for pruning.
+    pub fn prune_mvcc_versions(&self) -> CommitSeq {
+        let mut guard = self.mvcc_store.write();
+        let watermark = guard.prune_safe();
+        debug!(
+            target: "ffs::mvcc",
+            watermark = watermark.0,
+            remaining_versions = guard.version_count(),
+            "mvcc_prune"
+        );
+        watermark
     }
 
     // ── Btrfs tree-walk via device ───────────────────────────────────

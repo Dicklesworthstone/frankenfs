@@ -517,6 +517,7 @@ dependencies = [
  "ffs-ondisk",
  "ffs-types",
  "libc",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",
