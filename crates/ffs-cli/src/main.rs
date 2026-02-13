@@ -4,7 +4,9 @@ use anyhow::{Context, Result, bail};
 use asupersync::{Budget, Cx};
 use clap::{Parser, Subcommand};
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
-use ffs_core::{FsFlavor, FsOps, OpenFs, detect_filesystem_at_path};
+use ffs_core::{
+    Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions, detect_filesystem_at_path,
+};
 use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
 use ffs_repair::scrub::{
@@ -127,13 +129,17 @@ fn run() -> Result<()> {
 
 fn inspect(path: &PathBuf, json: bool) -> Result<()> {
     let cx = cli_cx();
+    let open_opts = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+        ..OpenOptions::default()
+    };
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
 
     let output = match &flavor {
         FsFlavor::Ext4(sb) => {
             // Open the filesystem to read bitmaps for free space
-            let open_fs = OpenFs::open(&cx, path)
+            let open_fs = OpenFs::open_with_options(&cx, path, &open_opts)
                 .with_context(|| format!("failed to open ext4 image: {}", path.display()))?;
             let summary = open_fs
                 .free_space_summary(&cx)
@@ -217,7 +223,11 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
 
 fn mount_cmd(image_path: &PathBuf, mountpoint: &PathBuf, allow_other: bool) -> Result<()> {
     let cx = cli_cx();
-    let open_fs = OpenFs::open(&cx, image_path)
+    let open_opts = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+        ..OpenOptions::default()
+    };
+    let open_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
         .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
 
     match &open_fs.flavor {

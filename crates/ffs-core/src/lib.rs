@@ -132,6 +132,11 @@ pub struct OpenOptions {
     /// When `true`, the superblock is parsed but not validated via
     /// `validate_v1()`. Use for recovery or diagnostics only.
     pub skip_validation: bool,
+    /// ext4 internal journal replay mode.
+    ///
+    /// Controls whether mount-time JBD2 replay writes through to the underlying
+    /// image, writes into an in-memory overlay, or is skipped entirely.
+    pub ext4_journal_replay_mode: Ext4JournalReplayMode,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -139,8 +144,21 @@ impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             skip_validation: false,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         }
     }
+}
+
+/// ext4 internal journal replay policy at open/mount time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ext4JournalReplayMode {
+    /// Replay committed transactions to the underlying device.
+    Apply,
+    /// Replay into an in-memory overlay so reads observe recovered state
+    /// without mutating the base image.
+    SimulateOverlay,
+    /// Skip replay entirely; expose that a journal was present.
+    Skip,
 }
 
 /// Pre-computed ext4 geometry derived from the superblock.
@@ -245,6 +263,106 @@ impl ByteDeviceBlockAdapter<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct OverlayWrite {
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// Copy-on-write byte overlay over an existing `ByteDevice`.
+///
+/// Reads merge overlay writes on top of the underlying device, while writes
+/// are captured in-memory only.
+struct OverlayByteDevice {
+    inner: Box<dyn ByteDevice>,
+    writes: RwLock<Vec<OverlayWrite>>,
+}
+
+impl OverlayByteDevice {
+    fn new(inner: Box<dyn ByteDevice>) -> Self {
+        Self {
+            inner,
+            writes: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+impl ByteDevice for OverlayByteDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<(), FfsError> {
+        self.inner.read_exact_at(cx, offset, buf)?;
+        let range_start = offset.0;
+        let range_end =
+            range_start
+                .checked_add(u64::try_from(buf.len()).map_err(|_| {
+                    FfsError::Format("read buffer length does not fit u64".to_owned())
+                })?)
+                .ok_or_else(|| FfsError::Format("read range overflow".to_owned()))?;
+
+        let writes = self.writes.read();
+        for write in writes.iter() {
+            let write_start = write.offset;
+            let write_end = write_start
+                .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
+                    FfsError::Format("overlay write length does not fit u64".to_owned())
+                })?)
+                .ok_or_else(|| FfsError::Format("overlay write range overflow".to_owned()))?;
+
+            if write_end <= range_start || write_start >= range_end {
+                continue;
+            }
+
+            let overlap_start = write_start.max(range_start);
+            let overlap_end = write_end.min(range_end);
+
+            let src_start = usize::try_from(overlap_start.saturating_sub(write_start))
+                .map_err(|_| FfsError::Format("overlay source offset overflow".to_owned()))?;
+            let src_end = usize::try_from(overlap_end.saturating_sub(write_start))
+                .map_err(|_| FfsError::Format("overlay source end overflow".to_owned()))?;
+            let dst_start = usize::try_from(overlap_start.saturating_sub(range_start))
+                .map_err(|_| FfsError::Format("overlay destination offset overflow".to_owned()))?;
+            let dst_end = usize::try_from(overlap_end.saturating_sub(range_start))
+                .map_err(|_| FfsError::Format("overlay destination end overflow".to_owned()))?;
+
+            buf[dst_start..dst_end].copy_from_slice(&write.bytes[src_start..src_end]);
+        }
+        drop(writes);
+
+        Ok(())
+    }
+
+    fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<(), FfsError> {
+        let range_end =
+            offset
+                .0
+                .checked_add(u64::try_from(buf.len()).map_err(|_| {
+                    FfsError::Format("write buffer length does not fit u64".to_owned())
+                })?)
+                .ok_or_else(|| FfsError::Format("write range overflow".to_owned()))?;
+        if range_end > self.inner.len_bytes() {
+            return Err(FfsError::Format(format!(
+                "write out of bounds: offset={} len={} device_len={}",
+                offset.0,
+                buf.len(),
+                self.inner.len_bytes()
+            )));
+        }
+
+        self.writes.write().push(OverlayWrite {
+            offset: offset.0,
+            bytes: buf.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn sync(&self, _cx: &Cx) -> Result<(), FfsError> {
+        Ok(())
+    }
+}
+
 impl BlockDevice for ByteDeviceBlockAdapter<'_> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
         let block_size = usize::try_from(self.block_size)
@@ -332,6 +450,17 @@ impl OpenFs {
             DetectionError::Io(ffs_err) => ffs_err,
         })?;
 
+        let dev: Box<dyn ByteDevice> = if matches!(flavor, FsFlavor::Ext4(_))
+            && !options.skip_validation
+            && matches!(
+                options.ext4_journal_replay_mode,
+                Ext4JournalReplayMode::SimulateOverlay
+            ) {
+            Box::new(OverlayByteDevice::new(dev))
+        } else {
+            dev
+        };
+
         let (ext4_geometry, btrfs_context) = match &flavor {
             FsFlavor::Ext4(sb) => {
                 if !options.skip_validation {
@@ -381,7 +510,8 @@ impl OpenFs {
         };
 
         if fs.is_ext4() && !options.skip_validation {
-            fs.ext4_journal_replay = fs.maybe_replay_ext4_journal(cx)?;
+            fs.ext4_journal_replay =
+                fs.maybe_replay_ext4_journal(cx, options.ext4_journal_replay_mode)?;
         }
 
         Ok(fs)
@@ -450,7 +580,11 @@ impl OpenFs {
         self.ext4_journal_replay.as_ref()
     }
 
-    fn maybe_replay_ext4_journal(&self, cx: &Cx) -> Result<Option<ReplayOutcome>, FfsError> {
+    fn maybe_replay_ext4_journal(
+        &self,
+        cx: &Cx,
+        mode: Ext4JournalReplayMode,
+    ) -> Result<Option<ReplayOutcome>, FfsError> {
         let (block_size, journal_inum, journal_dev) = match self.ext4_superblock() {
             Some(sb) => (sb.block_size, sb.journal_inum, sb.journal_dev),
             None => return Ok(None),
@@ -465,6 +599,14 @@ impl OpenFs {
             return Err(FfsError::UnsupportedFeature(format!(
                 "external ext4 journal device {journal_dev} is not supported"
             )));
+        }
+
+        if mode == Ext4JournalReplayMode::Skip {
+            info!(
+                journal_inum,
+                "ext4 journal replay skipped by open options (journal present)"
+            );
+            return Ok(Some(ReplayOutcome::default()));
         }
 
         let journal_ino = InodeNumber(u64::from(journal_inum));
@@ -508,6 +650,7 @@ impl OpenFs {
             journal_inum,
             journal_start_block = region.start.0,
             journal_blocks = region.blocks,
+            replay_mode = ?mode,
             "ext4 journal replay start"
         );
         let outcome = replay_jbd2(cx, &block_dev, region)?;
@@ -521,6 +664,7 @@ impl OpenFs {
             skipped_revoked_blocks = outcome.stats.skipped_revoked_blocks,
             incomplete_transactions = outcome.stats.incomplete_transactions,
             committed_sequences = outcome.committed_sequences.len(),
+            replay_mode = ?mode,
             "ext4 journal replay completed"
         );
         Ok(Some(outcome))
@@ -1026,6 +1170,8 @@ impl OpenFs {
         cx: &Cx,
         ino: InodeNumber,
     ) -> Result<Vec<(u64, DirEntry)>, FfsError> {
+        trace!(inode = %ino, "btrfs readdir_start");
+
         let dir_attr = self.btrfs_read_inode_attr(cx, ino)?;
         if dir_attr.kind != FileType::Directory {
             return Err(FfsError::NotDirectory);
@@ -1045,7 +1191,17 @@ impl OpenFs {
                 continue;
             }
 
-            let parsed = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
+            let parsed = match parse_dir_items(&item.data) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        inode = canonical_dir,
+                        item_type = item.key.item_type,
+                        "btrfs invalid_dir_entry"
+                    );
+                    return Err(parse_to_ffs_error(&e));
+                }
+            };
             for (idx, dir_item) in parsed.into_iter().enumerate() {
                 let local_idx = u64::try_from(idx).map_err(|_| FfsError::Corruption {
                     block: 0,
@@ -1058,6 +1214,14 @@ impl OpenFs {
                 } else {
                     item.key.offset | (1_u64 << 63)
                 };
+
+                trace!(
+                    inode = canonical_dir,
+                    child_inode = dir_item.child_objectid,
+                    file_type = dir_item.file_type,
+                    index = base.saturating_add(local_idx),
+                    "btrfs dir_item_found"
+                );
 
                 rows.push((
                     base.saturating_add(local_idx),
@@ -1086,6 +1250,14 @@ impl OpenFs {
             deduped.push(row);
         }
 
+        if deduped.len() > 1000 {
+            debug!(
+                inode = canonical_dir,
+                entry_count = deduped.len(),
+                "btrfs large_directory"
+            );
+        }
+
         // Add synthetic "." and ".." for VFS compatibility.
         let dot = DirEntry {
             ino,
@@ -1104,6 +1276,13 @@ impl OpenFs {
         out.push((0, dot));
         out.push((1, dotdot));
         out.extend(deduped);
+
+        trace!(
+            inode = canonical_dir,
+            entry_count = out.len(),
+            "btrfs readdir_complete"
+        );
+
         Ok(out)
     }
 
@@ -1614,7 +1793,7 @@ impl OpenFs {
 
     /// Read a full filesystem block from the device.
     #[allow(clippy::cast_possible_truncation)] // block_size is u32, always fits usize
-    fn read_block_vec(&self, cx: &Cx, block: BlockNumber) -> Result<Vec<u8>, FfsError> {
+    pub fn read_block_vec(&self, cx: &Cx, block: BlockNumber) -> Result<Vec<u8>, FfsError> {
         let bs = u64::from(self.block_size());
         let offset = block
             .0
@@ -3874,6 +4053,7 @@ mod tests {
     fn open_options_default_enables_validation() {
         let opts = OpenOptions::default();
         assert!(!opts.skip_validation);
+        assert_eq!(opts.ext4_journal_replay_mode, Ext4JournalReplayMode::Apply);
     }
 
     #[test]
@@ -3945,6 +4125,7 @@ mod tests {
         let dev2 = TestDevice::from_vec(image);
         let opts = OpenOptions {
             skip_validation: true,
+            ..OpenOptions::default()
         };
         let fs = OpenFs::from_device(&cx, Box::new(dev2), &opts).unwrap();
         assert!(fs.is_ext4());
@@ -3967,6 +4148,29 @@ mod tests {
 
         let target = fs.read_block_vec(&cx, BlockNumber(15)).unwrap();
         assert_eq!(&target[..16], b"JBD2-REPLAY-TEST");
+    }
+
+    #[test]
+    fn open_fs_skip_mode_reports_journal_present_without_replay() {
+        let image = build_ext4_image_with_internal_journal();
+        let baseline = image[15 * 4096..15 * 4096 + 16].to_vec();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
+        let replay = fs
+            .ext4_journal_replay()
+            .expect("journal presence should still be reported");
+        assert!(replay.committed_sequences.is_empty());
+        assert_eq!(replay.stats.scanned_blocks, 0);
+        assert_eq!(replay.stats.replayed_blocks, 0);
+
+        let target = fs.read_block_vec(&cx, BlockNumber(15)).unwrap();
+        assert_eq!(&target[..16], baseline.as_slice());
     }
 
     #[test]
@@ -5737,6 +5941,7 @@ mod tests {
         let cx = Cx::for_testing();
         let opts = OpenOptions {
             skip_validation: true,
+            ..OpenOptions::default()
         };
         let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
         assert!(fs.is_btrfs());
@@ -6079,6 +6284,360 @@ mod tests {
         // Root inode (256, aliased as 1) is a directory.
         let err = ops.read(&cx, InodeNumber(1), 0, 4096).unwrap_err();
         assert_eq!(err.to_errno(), libc::EISDIR);
+    }
+
+    // ── Btrfs readdir tests ─────────────────────────────────────────────
+
+    /// Build a btrfs image with multiple directory entries for readdir testing.
+    ///
+    /// Creates a root directory (256) containing the specified entries.
+    /// Each entry gets: DIR_INDEX(256, idx) → child_objectid + INODE_ITEM(child_objectid).
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_lines)]
+    fn build_btrfs_readdir_image(entries: &[(&[u8], u64, u8, u32)]) -> Vec<u8> {
+        // entries: (name, child_objectid, file_type, mode)
+        let image_size: usize = 1024 * 1024; // 1 MiB to fit many items
+        let mut image = vec![0_u8; image_size];
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+
+        let root_tree_logical = 0x4_000_u64;
+        let fs_tree_logical = 0x10_000_u64; // use a bigger gap
+
+        // Superblock
+        image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes());
+        image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_tree_logical.to_le_bytes());
+        image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes());
+        image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
+        image[sb_off + 0x80..sb_off + 0x88].copy_from_slice(&256_u64.to_le_bytes());
+        image[sb_off + 0x88..sb_off + 0x90].copy_from_slice(&1_u64.to_le_bytes());
+        image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&4096_u32.to_le_bytes());
+        // nodesize = 16384 to fit more items
+        image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&16384_u32.to_le_bytes());
+        image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&4096_u32.to_le_bytes());
+        image[sb_off + 0xC6] = 0;
+
+        // sys_chunk_array: identity map
+        let mut chunk_array = Vec::new();
+        chunk_array.extend_from_slice(&256_u64.to_le_bytes());
+        chunk_array.push(228_u8);
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&(image_size as u64).to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0x1_0000_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&1_u16.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u16.to_le_bytes());
+        chunk_array.extend_from_slice(&1_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&[0_u8; 16]);
+
+        image[sb_off + 0xA0..sb_off + 0xA4]
+            .copy_from_slice(&(chunk_array.len() as u32).to_le_bytes());
+        let array_start = sb_off + 0x32B;
+        image[array_start..array_start + chunk_array.len()].copy_from_slice(&chunk_array);
+
+        // Root tree leaf: ROOT_ITEM for FS_TREE
+        let root_leaf = root_tree_logical as usize;
+        image[root_leaf + 0x30..root_leaf + 0x38].copy_from_slice(&root_tree_logical.to_le_bytes());
+        image[root_leaf + 0x50..root_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[root_leaf + 0x58..root_leaf + 0x60].copy_from_slice(&1_u64.to_le_bytes());
+        image[root_leaf + 0x60..root_leaf + 0x64].copy_from_slice(&1_u32.to_le_bytes());
+        image[root_leaf + 0x64] = 0;
+
+        let root_item_offset: u32 = 3000;
+        let root_item_size: u32 = 239;
+        write_btrfs_leaf_item(
+            &mut image,
+            root_leaf,
+            0,
+            BTRFS_FS_TREE_OBJECTID,
+            BTRFS_ITEM_ROOT_ITEM,
+            0,
+            root_item_offset,
+            root_item_size,
+        );
+        let mut root_item = vec![0_u8; root_item_size as usize];
+        root_item[176..184].copy_from_slice(&fs_tree_logical.to_le_bytes());
+        let last = root_item.len() - 1;
+        root_item[last] = 0;
+        let root_data_off = root_leaf + root_item_offset as usize;
+        image[root_data_off..root_data_off + root_item.len()].copy_from_slice(&root_item);
+
+        // FS tree leaf: root_inode(256) + DIR_INDEX items + child INODE_ITEM items
+        let fs_leaf = fs_tree_logical as usize;
+        let nodesize = 16384_usize;
+        image[fs_leaf + 0x30..fs_leaf + 0x38].copy_from_slice(&fs_tree_logical.to_le_bytes());
+        image[fs_leaf + 0x50..fs_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[fs_leaf + 0x58..fs_leaf + 0x60].copy_from_slice(&5_u64.to_le_bytes());
+        image[fs_leaf + 0x64] = 0;
+
+        // Build items: root_inode, then DIR_INDEX for each entry, then child inodes
+        let nritems = 1 + entries.len() * 2; // root_inode + (dir_index + child_inode) per entry
+        image[fs_leaf + 0x60..fs_leaf + 0x64].copy_from_slice(&(nritems as u32).to_le_bytes());
+
+        let root_inode = encode_btrfs_inode_item(0o040_755, 4096, 4096, 2);
+
+        // Place data payloads from the end of the node backwards
+        let mut data_cursor = nodesize;
+        let mut item_idx = 0_usize;
+
+        // Item 0: root inode
+        data_cursor -= root_inode.len();
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            item_idx,
+            256,
+            BTRFS_ITEM_INODE_ITEM,
+            0,
+            data_cursor as u32,
+            root_inode.len() as u32,
+        );
+        image[fs_leaf + data_cursor..fs_leaf + data_cursor + root_inode.len()]
+            .copy_from_slice(&root_inode);
+        item_idx += 1;
+
+        // DIR_INDEX entries for each child (objectid=256, key_offset=index)
+        for (i, (name, child_oid, file_type, _mode)) in entries.iter().enumerate() {
+            let dir_entry = encode_btrfs_dir_index_entry(name, *child_oid, *file_type);
+            data_cursor -= dir_entry.len();
+            write_btrfs_leaf_item(
+                &mut image,
+                fs_leaf,
+                item_idx,
+                256,
+                BTRFS_ITEM_DIR_INDEX,
+                (i + 1) as u64,
+                data_cursor as u32,
+                dir_entry.len() as u32,
+            );
+            image[fs_leaf + data_cursor..fs_leaf + data_cursor + dir_entry.len()]
+                .copy_from_slice(&dir_entry);
+            item_idx += 1;
+        }
+
+        // Child INODE_ITEM for each entry
+        for (_, child_oid, _, mode) in entries {
+            let child_inode = encode_btrfs_inode_item(*mode, 0, 0, 1);
+            data_cursor -= child_inode.len();
+            write_btrfs_leaf_item(
+                &mut image,
+                fs_leaf,
+                item_idx,
+                *child_oid,
+                BTRFS_ITEM_INODE_ITEM,
+                0,
+                data_cursor as u32,
+                child_inode.len() as u32,
+            );
+            image[fs_leaf + data_cursor..fs_leaf + data_cursor + child_inode.len()]
+                .copy_from_slice(&child_inode);
+            item_idx += 1;
+        }
+
+        image
+    }
+
+    #[test]
+    fn btrfs_readdir_root_directory() {
+        // Existing fsops image has root dir with one entry "hello.txt"
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let entries = ops.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(entries.len(), 3); // . + .. + hello.txt
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[0].kind, FileType::Directory);
+        assert_eq!(entries[1].name, b"..");
+        assert_eq!(entries[1].kind, FileType::Directory);
+        assert_eq!(entries[2].name, b"hello.txt");
+        assert_eq!(entries[2].kind, FileType::RegularFile);
+    }
+
+    #[test]
+    fn btrfs_readdir_mixed_types() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"readme.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"subdir", 258, ffs_btrfs::BTRFS_FT_DIR, 0o040_755),
+            (b"link.txt", 259, ffs_btrfs::BTRFS_FT_SYMLINK, 0o120_777),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let result = ops.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(result.len(), 5); // . + .. + 3 entries
+
+        // Check types are correct
+        let readme = result.iter().find(|e| e.name == b"readme.txt").unwrap();
+        assert_eq!(readme.kind, FileType::RegularFile);
+        let subdir = result.iter().find(|e| e.name == b"subdir").unwrap();
+        assert_eq!(subdir.kind, FileType::Directory);
+        let link = result.iter().find(|e| e.name == b"link.txt").unwrap();
+        assert_eq!(link.kind, FileType::Symlink);
+    }
+
+    #[test]
+    fn btrfs_readdir_empty_directory_returns_dot_dotdot() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![];
+        let image = build_btrfs_readdir_image(&entries);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let result = ops.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, b".");
+        assert_eq!(result[1].name, b"..");
+    }
+
+    #[test]
+    fn btrfs_readdir_sorted_by_index() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"aaa.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"bbb.txt", 258, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"ccc.txt", 259, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let result = ops.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(result.len(), 5);
+        // Entries after . and .. should be in index order
+        assert_eq!(result[2].name, b"aaa.txt");
+        assert_eq!(result[3].name, b"bbb.txt");
+        assert_eq!(result[4].name, b"ccc.txt");
+
+        // Offsets should be monotonically increasing
+        for pair in result.windows(2) {
+            assert!(
+                pair[0].offset < pair[1].offset,
+                "offsets must be monotonically increasing: {} vs {}",
+                pair[0].offset,
+                pair[1].offset,
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_readdir_offset_pagination() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"aaa.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"bbb.txt", 258, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"ccc.txt", 259, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+
+        // Skip . and ..
+        let paged = ops.readdir(&cx, InodeNumber(1), 2).unwrap();
+        assert_eq!(paged.len(), 3);
+        assert_eq!(paged[0].name, b"aaa.txt");
+        assert_eq!(paged[1].name, b"bbb.txt");
+        assert_eq!(paged[2].name, b"ccc.txt");
+
+        // Skip all but last
+        let paged = ops.readdir(&cx, InodeNumber(1), 4).unwrap();
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].name, b"ccc.txt");
+
+        // Skip all
+        let paged = ops.readdir(&cx, InodeNumber(1), 5).unwrap();
+        assert!(paged.is_empty());
+    }
+
+    #[test]
+    fn btrfs_readdir_special_characters_in_names() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (
+                b"file with spaces.txt",
+                257,
+                ffs_btrfs::BTRFS_FT_REG_FILE,
+                0o100_644,
+            ),
+            (
+                "möbius.txt".as_bytes(),
+                258,
+                ffs_btrfs::BTRFS_FT_REG_FILE,
+                0o100_644,
+            ),
+            (b"dots...name", 259, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let result = ops.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(result.len(), 5);
+
+        let names: Vec<&[u8]> = result.iter().map(|e| e.name.as_slice()).collect();
+        assert!(names.contains(&b"file with spaces.txt".as_slice()));
+        assert!(names.contains(&"möbius.txt".as_bytes()));
+        assert!(names.contains(&b"dots...name".as_slice()));
+    }
+
+    #[test]
+    fn btrfs_readdir_lookup_consistency() {
+        // Every entry returned by readdir should be lookable.
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let entries = ops.readdir(&cx, InodeNumber(1), 0).unwrap();
+
+        for entry in &entries {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
+            let name = OsStr::new(std::str::from_utf8(&entry.name).unwrap());
+            let attr = ops.lookup(&cx, InodeNumber(1), name).unwrap();
+            assert_eq!(
+                attr.ino,
+                entry.ino,
+                "lookup inode mismatch for {:?}",
+                entry.name_str()
+            );
+            assert_eq!(
+                attr.kind,
+                entry.kind,
+                "lookup type mismatch for {:?}",
+                entry.name_str()
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_readdir_on_non_directory_fails() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        // InodeNumber(257) is a regular file
+        let err = ops.readdir(&cx, InodeNumber(257), 0).unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOTDIR);
     }
 
     // ── DurabilityAutopilot tests ────────────────────────────────────────

@@ -485,6 +485,7 @@ dependencies = [
  "ffs-ondisk",
  "ffs-types",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

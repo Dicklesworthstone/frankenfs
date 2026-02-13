@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 pub mod persist;
+pub mod sharded;
 pub mod wal;
 
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
-use ffs_error::FfsError;
+use ffs_error::{FfsError, Result as FfsResult};
 use ffs_types::{BlockNumber, CommitSeq, Snapshot, TxnId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,31 @@ pub struct BlockVersion {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalBlockVersion {
+    pub logical: BlockNumber,
+    pub physical: BlockNumber,
+    pub commit_seq: CommitSeq,
+    pub writer: TxnId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct CowRewriteIntent {
+    old_physical: Option<BlockNumber>,
+    new_physical: BlockNumber,
+}
+
+pub trait CowAllocator {
+    /// Allocate a new physical block for a COW write.
+    fn alloc_cow(&self, hint: Option<BlockNumber>, cx: &Cx) -> FfsResult<BlockNumber>;
+
+    /// Mark a block as deferrable until the given commit is no longer visible.
+    fn defer_free(&self, block: BlockNumber, commit_seq: CommitSeq);
+
+    /// Free all deferred blocks eligible at `watermark`.
+    fn gc_free(&self, watermark: CommitSeq, cx: &Cx) -> usize;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: TxnId,
@@ -34,11 +60,75 @@ pub struct Transaction {
     ///
     /// Populated by `record_read`.  Used by SSI conflict detection.
     reads: BTreeMap<BlockNumber, CommitSeq>,
+    /// COW rewrite metadata for logical blocks staged in this transaction.
+    ///
+    /// This tracks the newly allocated physical location and the physical
+    /// location that will become free after commit.
+    cow_writes: BTreeMap<BlockNumber, CowRewriteIntent>,
+    /// Newly allocated physical blocks superseded by a later write in the
+    /// same transaction. These blocks never became visible and should be
+    /// deferred for freeing on commit.
+    cow_orphans: BTreeSet<BlockNumber>,
 }
 
 impl Transaction {
+    /// Create a new transaction at the given snapshot.
+    #[must_use]
+    pub(crate) fn new(id: TxnId, snapshot: Snapshot) -> Self {
+        Self {
+            id,
+            snapshot,
+            writes: BTreeMap::new(),
+            reads: BTreeMap::new(),
+            cow_writes: BTreeMap::new(),
+            cow_orphans: BTreeSet::new(),
+        }
+    }
+
+    /// The transaction's unique ID.
+    #[must_use]
+    pub fn id(&self) -> TxnId {
+        self.id
+    }
+
+    /// The snapshot this transaction reads at.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot
+    }
+
+    /// Consume the transaction and return its staged writes.
+    pub(crate) fn into_writes(self) -> BTreeMap<BlockNumber, Vec<u8>> {
+        self.writes
+    }
+
     pub fn stage_write(&mut self, block: BlockNumber, bytes: Vec<u8>) {
         self.writes.insert(block, bytes);
+    }
+
+    fn stage_cow_rewrite(
+        &mut self,
+        logical: BlockNumber,
+        old_physical: Option<BlockNumber>,
+        new_physical: BlockNumber,
+        bytes: Vec<u8>,
+    ) {
+        if let Some(previous) = self.cow_writes.insert(
+            logical,
+            CowRewriteIntent {
+                old_physical,
+                new_physical,
+            },
+        ) {
+            self.cow_orphans.insert(previous.new_physical);
+            trace!(
+                txn_id = self.id.0,
+                logical = logical.0,
+                orphan_physical = previous.new_physical.0,
+                "cow_orphan_staged_for_free"
+            );
+        }
+        self.writes.insert(logical, bytes);
     }
 
     #[must_use]
@@ -71,6 +161,11 @@ impl Transaction {
     pub fn write_set(&self) -> &BTreeMap<BlockNumber, Vec<u8>> {
         &self.writes
     }
+
+    #[must_use]
+    pub fn staged_physical(&self, block: BlockNumber) -> Option<BlockNumber> {
+        self.cow_writes.get(&block).map(|w| w.new_physical)
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -102,12 +197,12 @@ pub enum CommitError {
 /// concurrent reader that also committed).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct CommittedTxnRecord {
-    txn_id: TxnId,
-    commit_seq: CommitSeq,
-    snapshot: Snapshot,
-    write_set: BTreeSet<BlockNumber>,
-    read_set: BTreeMap<BlockNumber, CommitSeq>,
+pub(crate) struct CommittedTxnRecord {
+    pub(crate) txn_id: TxnId,
+    pub(crate) commit_seq: CommitSeq,
+    pub(crate) snapshot: Snapshot,
+    pub(crate) write_set: BTreeSet<BlockNumber>,
+    pub(crate) read_set: BTreeMap<BlockNumber, CommitSeq>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,6 +210,7 @@ pub struct MvccStore {
     next_txn: u64,
     next_commit: u64,
     versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
+    physical_versions: BTreeMap<BlockNumber, Vec<PhysicalBlockVersion>>,
     /// Active snapshots: each entry is a `CommitSeq` from which a reader is
     /// still potentially reading.  The set uses a `BTreeMap` so that the
     /// minimum (oldest active snapshot) can be obtained in O(log n).
@@ -139,6 +235,7 @@ impl MvccStore {
             next_txn: 1,
             next_commit: 1,
             versions: BTreeMap::new(),
+            physical_versions: BTreeMap::new(),
             active_snapshots: BTreeMap::new(),
             ssi_log: Vec::new(),
         }
@@ -158,35 +255,30 @@ impl MvccStore {
             snapshot: self.current_snapshot(),
             writes: BTreeMap::new(),
             reads: BTreeMap::new(),
+            cow_writes: BTreeMap::new(),
+            cow_orphans: BTreeSet::new(),
         };
         self.next_txn = self.next_txn.saturating_add(1);
         txn
     }
 
     pub fn commit(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
-        for block in txn.writes.keys() {
-            let latest = self.latest_commit_seq(*block);
-            if latest > txn.snapshot.high {
-                return Err(CommitError::Conflict {
-                    block: *block,
-                    snapshot: txn.snapshot.high,
-                    observed: latest,
-                });
-            }
+        self.commit_fcw_internal(txn)
+            .map(|(commit_seq, _)| commit_seq)
+    }
+
+    pub fn commit_with_cow_allocator(
+        &mut self,
+        txn: Transaction,
+        allocator: &dyn CowAllocator,
+        cx: &Cx,
+    ) -> Result<CommitSeq, CommitError> {
+        let (commit_seq, deferred) = self.commit_fcw_internal(txn)?;
+        for block in deferred {
+            trace!(block = block.0, commit_seq = commit_seq.0, "cow_defer_free");
+            allocator.defer_free(block, commit_seq);
         }
-
-        let commit_seq = CommitSeq(self.next_commit);
-        self.next_commit = self.next_commit.saturating_add(1);
-
-        for (block, bytes) in txn.writes {
-            self.versions.entry(block).or_default().push(BlockVersion {
-                block,
-                commit_seq,
-                writer: txn.id,
-                bytes,
-            });
-        }
-
+        let _ = self.gc_cow_blocks(allocator, cx);
         Ok(commit_seq)
     }
 
@@ -205,6 +297,81 @@ impl MvccStore {
     /// of SSI (as used by PostgreSQL).  Read-only transactions never trigger
     /// SSI aborts.
     pub fn commit_ssi(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+        self.commit_ssi_internal(txn)
+            .map(|(commit_seq, _)| commit_seq)
+    }
+
+    pub fn commit_ssi_with_cow_allocator(
+        &mut self,
+        txn: Transaction,
+        allocator: &dyn CowAllocator,
+        cx: &Cx,
+    ) -> Result<CommitSeq, CommitError> {
+        let (commit_seq, deferred) = self.commit_ssi_internal(txn)?;
+        for block in deferred {
+            trace!(block = block.0, commit_seq = commit_seq.0, "cow_defer_free");
+            allocator.defer_free(block, commit_seq);
+        }
+        let _ = self.gc_cow_blocks(allocator, cx);
+        Ok(commit_seq)
+    }
+
+    fn commit_fcw_internal(
+        &mut self,
+        txn: Transaction,
+    ) -> Result<(CommitSeq, Vec<BlockNumber>), CommitError> {
+        for block in txn.writes.keys() {
+            let latest = self.latest_commit_seq(*block);
+            if latest > txn.snapshot.high {
+                return Err(CommitError::Conflict {
+                    block: *block,
+                    snapshot: txn.snapshot.high,
+                    observed: latest,
+                });
+            }
+        }
+
+        let Transaction {
+            id: txn_id,
+            snapshot: _,
+            writes,
+            reads: _,
+            cow_writes,
+            cow_orphans,
+        } = txn;
+
+        let commit_seq = CommitSeq(self.next_commit);
+        self.next_commit = self.next_commit.saturating_add(1);
+
+        for (block, bytes) in writes {
+            self.versions.entry(block).or_default().push(BlockVersion {
+                block,
+                commit_seq,
+                writer: txn_id,
+                bytes,
+            });
+
+            if let Some(intent) = cow_writes.get(&block) {
+                self.physical_versions
+                    .entry(block)
+                    .or_default()
+                    .push(PhysicalBlockVersion {
+                        logical: block,
+                        physical: intent.new_physical,
+                        commit_seq,
+                        writer: txn_id,
+                    });
+            }
+        }
+
+        let deferred = Self::collect_cow_deferred_frees(&cow_writes, cow_orphans);
+        Ok((commit_seq, deferred))
+    }
+
+    fn commit_ssi_internal(
+        &mut self,
+        txn: Transaction,
+    ) -> Result<(CommitSeq, Vec<BlockNumber>), CommitError> {
         // Step 1: FCW check (write-write conflicts).
         for block in txn.writes.keys() {
             let latest = self.latest_commit_seq(*block);
@@ -218,14 +385,9 @@ impl MvccStore {
         }
 
         // Step 2: SSI rw-antidependency check.
-        // For each block in our read set, check if any transaction that
-        // committed after our snapshot wrote to that block.
         if !txn.writes.is_empty() {
             for (&block, &read_version) in &txn.reads {
-                // Find if any committed transaction (after our snapshot)
-                // wrote to this block.
                 for record in self.ssi_log.iter().rev() {
-                    // Only check transactions that committed after our snapshot.
                     if record.commit_seq <= txn.snapshot.high {
                         break;
                     }
@@ -241,34 +403,64 @@ impl MvccStore {
             }
         }
 
-        // Step 3: Commit — same as FCW.
+        let Transaction {
+            id: txn_id,
+            snapshot,
+            writes,
+            reads,
+            cow_writes,
+            cow_orphans,
+        } = txn;
+
         let commit_seq = CommitSeq(self.next_commit);
         self.next_commit = self.next_commit.saturating_add(1);
 
-        let txn_id = txn.id;
-        let snapshot = txn.snapshot;
-        let read_set = txn.reads;
-        let write_keys: BTreeSet<BlockNumber> = txn.writes.keys().copied().collect();
-
-        for (block, bytes) in txn.writes {
+        let write_keys: BTreeSet<BlockNumber> = writes.keys().copied().collect();
+        for (block, bytes) in writes {
             self.versions.entry(block).or_default().push(BlockVersion {
                 block,
                 commit_seq,
                 writer: txn_id,
                 bytes,
             });
+
+            if let Some(intent) = cow_writes.get(&block) {
+                self.physical_versions
+                    .entry(block)
+                    .or_default()
+                    .push(PhysicalBlockVersion {
+                        logical: block,
+                        physical: intent.new_physical,
+                        commit_seq,
+                        writer: txn_id,
+                    });
+            }
         }
 
-        // Record in SSI log for future antidependency checks.
         self.ssi_log.push(CommittedTxnRecord {
             txn_id,
             commit_seq,
             snapshot,
             write_set: write_keys,
-            read_set,
+            read_set: reads,
         });
 
-        Ok(commit_seq)
+        let deferred = Self::collect_cow_deferred_frees(&cow_writes, cow_orphans);
+        Ok((commit_seq, deferred))
+    }
+
+    fn collect_cow_deferred_frees(
+        cow_writes: &BTreeMap<BlockNumber, CowRewriteIntent>,
+        mut cow_orphans: BTreeSet<BlockNumber>,
+    ) -> Vec<BlockNumber> {
+        for intent in cow_writes.values() {
+            if let Some(old_physical) = intent.old_physical
+                && old_physical != intent.new_physical
+            {
+                cow_orphans.insert(old_physical);
+            }
+        }
+        cow_orphans.into_iter().collect()
     }
 
     /// Prune SSI log entries older than `watermark`.
@@ -299,8 +491,88 @@ impl MvccStore {
         })
     }
 
+    #[must_use]
+    pub fn read_visible_physical(
+        &self,
+        logical: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Option<BlockNumber> {
+        if let Some(versions) = self.physical_versions.get(&logical)
+            && let Some(version) = versions
+                .iter()
+                .rev()
+                .find(|version| version.commit_seq <= snapshot.high)
+        {
+            return Some(version.physical);
+        }
+        self.read_visible(logical, snapshot).map(|_| logical)
+    }
+
+    #[must_use]
+    pub fn latest_physical_block(&self, logical: BlockNumber) -> Option<BlockNumber> {
+        self.read_visible_physical(logical, self.current_snapshot())
+    }
+
+    pub fn write_cow(
+        &self,
+        logical: BlockNumber,
+        data: &[u8],
+        txn: &mut Transaction,
+        allocator: &dyn CowAllocator,
+        cx: &Cx,
+    ) -> FfsResult<BlockNumber> {
+        let committed_old = txn
+            .cow_writes
+            .get(&logical)
+            .and_then(|intent| intent.old_physical)
+            .or_else(|| self.read_visible_physical(logical, txn.snapshot));
+        let allocation_hint = txn
+            .cow_writes
+            .get(&logical)
+            .map(|intent| intent.new_physical)
+            .or(committed_old);
+        let new_physical = allocator.alloc_cow(allocation_hint, cx)?;
+        trace!(
+            txn_id = txn.id.0,
+            logical = logical.0,
+            old_physical = committed_old.map(|b| b.0),
+            new_physical = new_physical.0,
+            "cow_allocation"
+        );
+        txn.stage_cow_rewrite(logical, committed_old, new_physical, data.to_vec());
+        Ok(new_physical)
+    }
+
+    pub fn gc_cow_blocks(&self, allocator: &dyn CowAllocator, cx: &Cx) -> usize {
+        let watermark = self
+            .watermark()
+            .unwrap_or_else(|| self.current_snapshot().high);
+        let freed = allocator.gc_free(watermark, cx);
+        debug!(watermark = watermark.0, freed_blocks = freed, "cow_gc");
+        freed
+    }
+
     pub fn prune_versions_older_than(&mut self, watermark: CommitSeq) {
         for versions in self.versions.values_mut() {
+            if versions.len() <= 1 {
+                continue;
+            }
+
+            let mut keep_from = 0_usize;
+            while keep_from + 1 < versions.len() {
+                if versions[keep_from + 1].commit_seq <= watermark {
+                    keep_from += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if keep_from > 0 {
+                versions.drain(0..keep_from);
+            }
+        }
+
+        for versions in self.physical_versions.values_mut() {
             if versions.len() <= 1 {
                 continue;
             }
@@ -811,7 +1083,7 @@ impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     /// Simple in-memory block device for testing `MvccBlockDevice`.
     #[derive(Debug)]
@@ -866,6 +1138,66 @@ mod tests {
         Cx::for_testing()
     }
 
+    #[derive(Debug)]
+    struct TestCowAllocator {
+        next_block: std::sync::atomic::AtomicU64,
+        allocated: parking_lot::Mutex<Vec<BlockNumber>>,
+        deferred: parking_lot::Mutex<Vec<(BlockNumber, CommitSeq)>>,
+        freed: parking_lot::Mutex<Vec<BlockNumber>>,
+    }
+
+    impl TestCowAllocator {
+        fn new(start: u64) -> Self {
+            Self {
+                next_block: std::sync::atomic::AtomicU64::new(start),
+                allocated: parking_lot::Mutex::new(Vec::new()),
+                deferred: parking_lot::Mutex::new(Vec::new()),
+                freed: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn allocated_blocks(&self) -> Vec<BlockNumber> {
+            self.allocated.lock().clone()
+        }
+
+        fn freed_blocks(&self) -> Vec<BlockNumber> {
+            self.freed.lock().clone()
+        }
+    }
+
+    impl CowAllocator for TestCowAllocator {
+        fn alloc_cow(&self, _hint: Option<BlockNumber>, _cx: &Cx) -> FfsResult<BlockNumber> {
+            let next = self
+                .next_block
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let block = BlockNumber(next);
+            self.allocated.lock().push(block);
+            Ok(block)
+        }
+
+        fn defer_free(&self, block: BlockNumber, commit_seq: CommitSeq) {
+            self.deferred.lock().push((block, commit_seq));
+        }
+
+        fn gc_free(&self, watermark: CommitSeq, _cx: &Cx) -> usize {
+            let mut deferred = self.deferred.lock();
+            let mut still_deferred = Vec::with_capacity(deferred.len());
+            let mut newly_freed = Vec::new();
+            for (block, retire_seq) in deferred.drain(..) {
+                if retire_seq <= watermark {
+                    newly_freed.push(block);
+                } else {
+                    still_deferred.push((block, retire_seq));
+                }
+            }
+            *deferred = still_deferred;
+            drop(deferred);
+            let freed_count = newly_freed.len();
+            self.freed.lock().extend(newly_freed);
+            freed_count
+        }
+    }
+
     #[test]
     fn visibility_and_fcw_conflict() {
         let mut store = MvccStore::new();
@@ -904,6 +1236,132 @@ mod tests {
             .read_visible(BlockNumber(1), snap)
             .expect("visible data at snap");
         assert_eq!(visible, &[1]);
+    }
+
+    #[test]
+    fn cow_write_allocates_new_physical_block() {
+        let cx = test_cx();
+        let mut store = MvccStore::new();
+        let allocator = TestCowAllocator::new(1_000);
+        let logical = BlockNumber(7);
+
+        let mut txn = store.begin();
+        let new_physical = store
+            .write_cow(logical, &[0xAB; 8], &mut txn, &allocator, &cx)
+            .expect("cow allocation");
+        assert_ne!(new_physical, logical);
+        assert_eq!(txn.staged_physical(logical), Some(new_physical));
+
+        let commit_seq = store
+            .commit_with_cow_allocator(txn, &allocator, &cx)
+            .expect("cow commit");
+        assert_eq!(commit_seq, CommitSeq(1));
+
+        let latest = store.current_snapshot();
+        assert_eq!(store.read_visible(logical, latest).unwrap(), &[0xAB; 8]);
+        assert_eq!(store.latest_physical_block(logical), Some(new_physical));
+        assert!(allocator.freed_blocks().is_empty());
+    }
+
+    #[test]
+    fn cow_preserves_old_snapshot_and_gc_frees_after_release() {
+        let cx = test_cx();
+        let mut store = MvccStore::new();
+        let allocator = TestCowAllocator::new(2_000);
+        let logical = BlockNumber(13);
+
+        let mut seed = store.begin();
+        seed.stage_write(logical, vec![0x11; 4]);
+        store.commit(seed).expect("seed commit");
+
+        let old_snapshot = store.current_snapshot();
+        store.register_snapshot(old_snapshot);
+
+        let mut txn = store.begin();
+        let new_physical = store
+            .write_cow(logical, &[0x22; 4], &mut txn, &allocator, &cx)
+            .expect("cow allocation");
+        store
+            .commit_with_cow_allocator(txn, &allocator, &cx)
+            .expect("cow commit");
+
+        assert_eq!(
+            store.read_visible(logical, old_snapshot).unwrap(),
+            &[0x11; 4]
+        );
+        assert_eq!(
+            store.read_visible_physical(logical, old_snapshot),
+            Some(logical)
+        );
+        assert_eq!(store.latest_physical_block(logical), Some(new_physical));
+        assert!(allocator.freed_blocks().is_empty());
+
+        assert!(store.release_snapshot(old_snapshot));
+        let freed_now = store.gc_cow_blocks(&allocator, &cx);
+        assert_eq!(freed_now, 1);
+        assert_eq!(allocator.freed_blocks(), vec![logical]);
+    }
+
+    #[test]
+    fn cow_hundred_rewrites_produce_unique_physical_blocks() {
+        let cx = test_cx();
+        let mut store = MvccStore::new();
+        let allocator = TestCowAllocator::new(3_000);
+        let logical = BlockNumber(99);
+        let mut seen = BTreeSet::new();
+
+        for i in 0_u8..100_u8 {
+            let mut txn = store.begin();
+            let physical = store
+                .write_cow(logical, &[i], &mut txn, &allocator, &cx)
+                .expect("cow allocation");
+            assert!(seen.insert(physical), "physical block was reused");
+            store
+                .commit_with_cow_allocator(txn, &allocator, &cx)
+                .expect("cow commit");
+        }
+
+        assert_eq!(seen.len(), 100);
+        assert_eq!(allocator.allocated_blocks().len(), 100);
+        assert_eq!(
+            store.latest_physical_block(logical),
+            allocator.allocated_blocks().last().copied()
+        );
+    }
+
+    #[test]
+    fn cow_gc_reclaims_all_deferred_blocks_after_snapshot_release() {
+        let cx = test_cx();
+        let mut store = MvccStore::new();
+        let allocator = TestCowAllocator::new(4_000);
+        let logical = BlockNumber(17);
+
+        let mut seed = store.begin();
+        seed.stage_write(logical, vec![0xAA; 2]);
+        store.commit(seed).expect("seed commit");
+
+        let held_snapshot = store.current_snapshot();
+        store.register_snapshot(held_snapshot);
+
+        for i in 0_u8..5_u8 {
+            let mut txn = store.begin();
+            store
+                .write_cow(logical, &[i; 2], &mut txn, &allocator, &cx)
+                .expect("cow allocation");
+            store
+                .commit_with_cow_allocator(txn, &allocator, &cx)
+                .expect("cow commit");
+        }
+
+        assert!(allocator.freed_blocks().is_empty());
+
+        assert!(store.release_snapshot(held_snapshot));
+        let freed_now = store.gc_cow_blocks(&allocator, &cx);
+        assert_eq!(freed_now, 5);
+
+        let freed_set: BTreeSet<BlockNumber> = allocator.freed_blocks().into_iter().collect();
+        assert_eq!(freed_set.len(), 5);
+        assert!(freed_set.contains(&logical));
     }
 
     // ── MvccBlockDevice tests ────────────────────────────────────────────

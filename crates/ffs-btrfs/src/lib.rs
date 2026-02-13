@@ -8,6 +8,7 @@ pub use ffs_ondisk::btrfs::*;
 use ffs_types::ParseError;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
+use tracing::{debug, trace};
 
 /// A single leaf item yielded by tree traversal: key + raw payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +471,12 @@ struct InsertResult {
     split: Option<(BtrfsKey, u64)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeleteResult {
+    node_id: u64,
+    deleted: bool,
+}
+
 /// In-memory COW btrfs B-tree. Every mutation allocates new nodes and advances
 /// the root pointer, keeping previously-addressed nodes immutable.
 #[derive(Debug, Clone)]
@@ -558,15 +565,34 @@ impl InMemoryCowBtrfsTree {
         entry: BtrfsTreeItem,
         allow_replace: bool,
     ) -> Result<u64, BtrfsMutationError> {
+        let old_root = self.root;
+        trace!(
+            root = old_root,
+            objectid = entry.key.objectid,
+            item_type = entry.key.item_type,
+            offset = entry.key.offset,
+            allow_replace,
+            "btrfs_cow_insert_start"
+        );
         let result = self.insert_into(self.root, entry, allow_replace)?;
         self.root = result.node_id;
         if let Some((separator, right_id)) = result.split {
+            debug!(
+                old_root,
+                left_root = self.root,
+                right_root = right_id,
+                separator_objectid = separator.objectid,
+                separator_type = separator.item_type,
+                separator_offset = separator.offset,
+                "btrfs_cow_root_split"
+            );
             let new_root = self.alloc_node(BtrfsCowNode::Internal {
                 keys: vec![separator],
                 children: vec![self.root, right_id],
             })?;
             self.root = new_root;
         }
+        trace!(old_root, new_root = self.root, "btrfs_cow_insert_complete");
         Ok(self.root)
     }
 
@@ -578,91 +604,459 @@ impl InMemoryCowBtrfsTree {
     ) -> Result<InsertResult, BtrfsMutationError> {
         let node = self.node_ref(node_id)?.clone();
         match node {
-            BtrfsCowNode::Leaf { mut items } => {
-                let idx =
-                    items.partition_point(|existing| key_cmp(&existing.key, &entry.key).is_lt());
-                if let Some(existing) = items.get_mut(idx)
-                    && key_cmp(&existing.key, &entry.key) == Ordering::Equal
-                {
-                    if allow_replace {
-                        existing.data = entry.data;
-                        let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
-                        return Ok(InsertResult {
-                            node_id: new_id,
-                            split: None,
-                        });
-                    }
-                    return Err(BtrfsMutationError::KeyAlreadyExists);
-                }
+            BtrfsCowNode::Leaf { items } => self.insert_into_leaf(items, entry, allow_replace),
+            BtrfsCowNode::Internal { keys, children } => {
+                self.insert_into_internal(keys, children, entry, allow_replace)
+            }
+        }
+    }
 
-                items.insert(idx, entry);
-                if items.len() <= self.max_items {
-                    let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
-                    return Ok(InsertResult {
-                        node_id: new_id,
-                        split: None,
+    fn insert_into_leaf(
+        &mut self,
+        mut items: Vec<BtrfsTreeItem>,
+        entry: BtrfsTreeItem,
+        allow_replace: bool,
+    ) -> Result<InsertResult, BtrfsMutationError> {
+        let idx = items.partition_point(|existing| key_cmp(&existing.key, &entry.key).is_lt());
+        if let Some(existing) = items.get_mut(idx)
+            && key_cmp(&existing.key, &entry.key) == Ordering::Equal
+        {
+            if allow_replace {
+                trace!(
+                    objectid = entry.key.objectid,
+                    item_type = entry.key.item_type,
+                    offset = entry.key.offset,
+                    "btrfs_cow_update_leaf"
+                );
+                existing.data = entry.data;
+                let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
+                return Ok(InsertResult {
+                    node_id: new_id,
+                    split: None,
+                });
+            }
+            return Err(BtrfsMutationError::KeyAlreadyExists);
+        }
+
+        items.insert(idx, entry);
+        if items.len() <= self.max_items {
+            let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
+            return Ok(InsertResult {
+                node_id: new_id,
+                split: None,
+            });
+        }
+
+        let mid = items.len() / 2;
+        let right_items = items.split_off(mid);
+        let separator =
+            right_items
+                .first()
+                .map(|item| item.key)
+                .ok_or(BtrfsMutationError::BrokenInvariant(
+                    "right split leaf must not be empty",
+                ))?;
+        debug!(
+            separator_objectid = separator.objectid,
+            separator_type = separator.item_type,
+            separator_offset = separator.offset,
+            left_items = items.len(),
+            right_items = right_items.len(),
+            "btrfs_cow_leaf_split"
+        );
+        let left_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
+        let right_id = self.alloc_node(BtrfsCowNode::Leaf { items: right_items })?;
+        Ok(InsertResult {
+            node_id: left_id,
+            split: Some((separator, right_id)),
+        })
+    }
+
+    fn insert_into_internal(
+        &mut self,
+        mut keys: Vec<BtrfsKey>,
+        mut children: Vec<u64>,
+        entry: BtrfsTreeItem,
+        allow_replace: bool,
+    ) -> Result<InsertResult, BtrfsMutationError> {
+        if children.len() != keys.len().saturating_add(1) {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "internal node child count mismatch",
+            ));
+        }
+
+        let idx = Self::child_slot(&keys, &entry.key);
+        let child_result = self.insert_into(children[idx], entry, allow_replace)?;
+        children[idx] = child_result.node_id;
+        if let Some((separator, right_child)) = child_result.split {
+            keys.insert(idx, separator);
+            children.insert(idx + 1, right_child);
+        }
+
+        if keys.len() <= self.max_items {
+            let new_id = self.alloc_node(BtrfsCowNode::Internal { keys, children })?;
+            return Ok(InsertResult {
+                node_id: new_id,
+                split: None,
+            });
+        }
+
+        let mid = keys.len() / 2;
+        let separator = keys[mid];
+        let right_keys = keys.split_off(mid + 1);
+        let removed = keys.pop();
+        if removed.is_none() {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "internal split separator missing",
+            ));
+        }
+        let right_children = children.split_off(mid + 1);
+        debug!(
+            separator_objectid = separator.objectid,
+            separator_type = separator.item_type,
+            separator_offset = separator.offset,
+            left_keys = keys.len(),
+            right_keys = right_keys.len(),
+            "btrfs_cow_internal_split"
+        );
+        let left_id = self.alloc_node(BtrfsCowNode::Internal { keys, children })?;
+        let right_id = self.alloc_node(BtrfsCowNode::Internal {
+            keys: right_keys,
+            children: right_children,
+        })?;
+        Ok(InsertResult {
+            node_id: left_id,
+            split: Some((separator, right_id)),
+        })
+    }
+
+    fn first_key(&self, node_id: u64) -> Result<Option<BtrfsKey>, BtrfsMutationError> {
+        match self.node_ref(node_id)? {
+            BtrfsCowNode::Leaf { items } => Ok(items.first().map(|item| item.key)),
+            BtrfsCowNode::Internal { children, .. } => {
+                let Some(first_child) = children.first() else {
+                    return Err(BtrfsMutationError::BrokenInvariant(
+                        "internal node must have children",
+                    ));
+                };
+                self.first_key(*first_child)
+            }
+        }
+    }
+
+    fn compute_internal_keys(&self, children: &[u64]) -> Result<Vec<BtrfsKey>, BtrfsMutationError> {
+        if children.is_empty() {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "internal node must have children",
+            ));
+        }
+        let mut keys = Vec::with_capacity(children.len().saturating_sub(1));
+        for child in children.iter().skip(1) {
+            let Some(separator) = self.first_key(*child)? else {
+                return Err(BtrfsMutationError::BrokenInvariant(
+                    "internal separator child must contain a key",
+                ));
+            };
+            keys.push(separator);
+        }
+        Ok(keys)
+    }
+
+    fn alloc_internal_node(&mut self, children: Vec<u64>) -> Result<u64, BtrfsMutationError> {
+        let keys = self.compute_internal_keys(&children)?;
+        self.alloc_node(BtrfsCowNode::Internal { keys, children })
+    }
+
+    fn node_key_count(&self, node_id: u64) -> Result<usize, BtrfsMutationError> {
+        match self.node_ref(node_id)? {
+            BtrfsCowNode::Leaf { items } => Ok(items.len()),
+            BtrfsCowNode::Internal { keys, .. } => Ok(keys.len()),
+        }
+    }
+
+    fn rotate_from_left(
+        &mut self,
+        left_id: u64,
+        right_id: u64,
+    ) -> Result<(u64, u64), BtrfsMutationError> {
+        let left_node = self.node_ref(left_id)?.clone();
+        let right_node = self.node_ref(right_id)?.clone();
+        match (left_node, right_node) {
+            (
+                BtrfsCowNode::Leaf {
+                    items: mut left_items,
+                },
+                BtrfsCowNode::Leaf {
+                    items: mut right_items,
+                },
+            ) => {
+                let moved = left_items.pop().ok_or(BtrfsMutationError::BrokenInvariant(
+                    "cannot borrow from empty left leaf",
+                ))?;
+                right_items.insert(0, moved);
+                let new_left = self.alloc_node(BtrfsCowNode::Leaf { items: left_items })?;
+                let new_right = self.alloc_node(BtrfsCowNode::Leaf { items: right_items })?;
+                Ok((new_left, new_right))
+            }
+            (
+                BtrfsCowNode::Internal {
+                    children: mut left_children,
+                    ..
+                },
+                BtrfsCowNode::Internal {
+                    children: mut right_children,
+                    ..
+                },
+            ) => {
+                let moved = left_children
+                    .pop()
+                    .ok_or(BtrfsMutationError::BrokenInvariant(
+                        "cannot borrow from empty left internal",
+                    ))?;
+                right_children.insert(0, moved);
+                let new_left = self.alloc_internal_node(left_children)?;
+                let new_right = self.alloc_internal_node(right_children)?;
+                Ok((new_left, new_right))
+            }
+            _ => Err(BtrfsMutationError::BrokenInvariant(
+                "sibling node type mismatch",
+            )),
+        }
+    }
+
+    fn rotate_from_right(
+        &mut self,
+        left_id: u64,
+        right_id: u64,
+    ) -> Result<(u64, u64), BtrfsMutationError> {
+        let left_node = self.node_ref(left_id)?.clone();
+        let right_node = self.node_ref(right_id)?.clone();
+        match (left_node, right_node) {
+            (
+                BtrfsCowNode::Leaf {
+                    items: mut left_items,
+                },
+                BtrfsCowNode::Leaf {
+                    items: mut right_items,
+                },
+            ) => {
+                if right_items.is_empty() {
+                    return Err(BtrfsMutationError::BrokenInvariant(
+                        "cannot borrow from empty right leaf",
+                    ));
+                }
+                right_items.rotate_left(1);
+                let moved = right_items
+                    .pop()
+                    .ok_or(BtrfsMutationError::BrokenInvariant(
+                        "cannot borrow from empty right leaf",
+                    ))?;
+                left_items.push(moved);
+                let new_left = self.alloc_node(BtrfsCowNode::Leaf { items: left_items })?;
+                let new_right = self.alloc_node(BtrfsCowNode::Leaf { items: right_items })?;
+                Ok((new_left, new_right))
+            }
+            (
+                BtrfsCowNode::Internal {
+                    children: mut left_children,
+                    ..
+                },
+                BtrfsCowNode::Internal {
+                    children: mut right_children,
+                    ..
+                },
+            ) => {
+                if right_children.is_empty() {
+                    return Err(BtrfsMutationError::BrokenInvariant(
+                        "cannot borrow from empty right internal",
+                    ));
+                }
+                right_children.rotate_left(1);
+                let moved = right_children
+                    .pop()
+                    .ok_or(BtrfsMutationError::BrokenInvariant(
+                        "cannot borrow from empty right internal",
+                    ))?;
+                left_children.push(moved);
+                let new_left = self.alloc_internal_node(left_children)?;
+                let new_right = self.alloc_internal_node(right_children)?;
+                Ok((new_left, new_right))
+            }
+            _ => Err(BtrfsMutationError::BrokenInvariant(
+                "sibling node type mismatch",
+            )),
+        }
+    }
+
+    fn merge_adjacent_nodes(
+        &mut self,
+        left_id: u64,
+        right_id: u64,
+    ) -> Result<u64, BtrfsMutationError> {
+        let left_node = self.node_ref(left_id)?.clone();
+        let right_node = self.node_ref(right_id)?.clone();
+        match (left_node, right_node) {
+            (
+                BtrfsCowNode::Leaf {
+                    items: mut left_items,
+                },
+                BtrfsCowNode::Leaf { items: right_items },
+            ) => {
+                left_items.extend(right_items);
+                self.alloc_node(BtrfsCowNode::Leaf { items: left_items })
+            }
+            (
+                BtrfsCowNode::Internal {
+                    children: mut left_children,
+                    ..
+                },
+                BtrfsCowNode::Internal {
+                    children: right_children,
+                    ..
+                },
+            ) => {
+                left_children.extend(right_children);
+                self.alloc_internal_node(left_children)
+            }
+            _ => Err(BtrfsMutationError::BrokenInvariant(
+                "cannot merge different node types",
+            )),
+        }
+    }
+
+    fn rebalance_child(
+        &mut self,
+        children: &mut Vec<u64>,
+        child_idx: usize,
+    ) -> Result<(), BtrfsMutationError> {
+        if child_idx >= children.len() {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "child index out of bounds",
+            ));
+        }
+        if children.len() <= 1 {
+            return Ok(());
+        }
+
+        let child_keys = self.node_key_count(children[child_idx])?;
+        if child_keys >= self.min_items {
+            return Ok(());
+        }
+
+        if child_idx > 0 {
+            let left_keys = self.node_key_count(children[child_idx - 1])?;
+            if left_keys > self.min_items {
+                let (new_left, new_child) =
+                    self.rotate_from_left(children[child_idx - 1], children[child_idx])?;
+                children[child_idx - 1] = new_left;
+                children[child_idx] = new_child;
+                debug!(
+                    child_idx,
+                    left_keys, child_keys, "btrfs_cow_delete_borrow_left"
+                );
+                return Ok(());
+            }
+        }
+
+        if child_idx + 1 < children.len() {
+            let right_keys = self.node_key_count(children[child_idx + 1])?;
+            if right_keys > self.min_items {
+                let (new_child, new_right) =
+                    self.rotate_from_right(children[child_idx], children[child_idx + 1])?;
+                children[child_idx] = new_child;
+                children[child_idx + 1] = new_right;
+                debug!(
+                    child_idx,
+                    right_keys, child_keys, "btrfs_cow_delete_borrow_right"
+                );
+                return Ok(());
+            }
+        }
+
+        if child_idx > 0 {
+            let merged = self.merge_adjacent_nodes(children[child_idx - 1], children[child_idx])?;
+            children[child_idx - 1] = merged;
+            children.remove(child_idx);
+            debug!(merged_child = child_idx - 1, "btrfs_cow_delete_merge_left");
+        } else {
+            let merged = self.merge_adjacent_nodes(children[child_idx], children[child_idx + 1])?;
+            children[child_idx] = merged;
+            children.remove(child_idx + 1);
+            debug!(merged_child = child_idx, "btrfs_cow_delete_merge_right");
+        }
+        Ok(())
+    }
+
+    fn delete_from(
+        &mut self,
+        node_id: u64,
+        key: &BtrfsKey,
+    ) -> Result<DeleteResult, BtrfsMutationError> {
+        let node = self.node_ref(node_id)?.clone();
+        match node {
+            BtrfsCowNode::Leaf { mut items } => {
+                let idx = items.partition_point(|existing| key_cmp(&existing.key, key).is_lt());
+                let Some(existing) = items.get(idx) else {
+                    return Ok(DeleteResult {
+                        node_id,
+                        deleted: false,
+                    });
+                };
+                if key_cmp(&existing.key, key) != Ordering::Equal {
+                    return Ok(DeleteResult {
+                        node_id,
+                        deleted: false,
                     });
                 }
-
-                let mid = items.len() / 2;
-                let right_items = items.split_off(mid);
-                let separator = right_items.first().map(|item| item.key).ok_or(
-                    BtrfsMutationError::BrokenInvariant("right split leaf must not be empty"),
-                )?;
-                let left_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
-                let right_id = self.alloc_node(BtrfsCowNode::Leaf { items: right_items })?;
-                Ok(InsertResult {
-                    node_id: left_id,
-                    split: Some((separator, right_id)),
+                items.remove(idx);
+                let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
+                Ok(DeleteResult {
+                    node_id: new_id,
+                    deleted: true,
                 })
             }
-            BtrfsCowNode::Internal {
-                mut keys,
-                mut children,
-            } => {
+            BtrfsCowNode::Internal { keys, mut children } => {
                 if children.len() != keys.len().saturating_add(1) {
                     return Err(BtrfsMutationError::BrokenInvariant(
                         "internal node child count mismatch",
                     ));
                 }
-
-                let idx = Self::child_slot(&keys, &entry.key);
-                let child_result = self.insert_into(children[idx], entry, allow_replace)?;
-                children[idx] = child_result.node_id;
-                if let Some((separator, right_child)) = child_result.split {
-                    keys.insert(idx, separator);
-                    children.insert(idx + 1, right_child);
-                }
-
-                if keys.len() <= self.max_items {
-                    let new_id = self.alloc_node(BtrfsCowNode::Internal { keys, children })?;
-                    return Ok(InsertResult {
-                        node_id: new_id,
-                        split: None,
+                let idx = Self::child_slot(&keys, key);
+                let child_result = self.delete_from(children[idx], key)?;
+                if !child_result.deleted {
+                    return Ok(DeleteResult {
+                        node_id,
+                        deleted: false,
                     });
                 }
-
-                let mid = keys.len() / 2;
-                let separator = keys[mid];
-                let right_keys = keys.split_off(mid + 1);
-                let removed = keys.pop();
-                if removed.is_none() {
-                    return Err(BtrfsMutationError::BrokenInvariant(
-                        "internal split separator missing",
-                    ));
-                }
-                let right_children = children.split_off(mid + 1);
-                let left_id = self.alloc_node(BtrfsCowNode::Internal { keys, children })?;
-                let right_id = self.alloc_node(BtrfsCowNode::Internal {
-                    keys: right_keys,
-                    children: right_children,
-                })?;
-                Ok(InsertResult {
-                    node_id: left_id,
-                    split: Some((separator, right_id)),
+                children[idx] = child_result.node_id;
+                self.rebalance_child(&mut children, idx)?;
+                let new_id = self.alloc_internal_node(children)?;
+                Ok(DeleteResult {
+                    node_id: new_id,
+                    deleted: true,
                 })
             }
         }
+    }
+
+    fn normalize_root_after_delete(&mut self) -> Result<(), BtrfsMutationError> {
+        loop {
+            let root_node = self.node_ref(self.root)?.clone();
+            let BtrfsCowNode::Internal { children, .. } = root_node else {
+                break;
+            };
+            if children.len() != 1 {
+                break;
+            }
+            let Some(child) = children.first() else {
+                return Err(BtrfsMutationError::BrokenInvariant(
+                    "internal node must have children",
+                ));
+            };
+            self.root = *child;
+        }
+        Ok(())
     }
 
     fn find(&self, key: &BtrfsKey) -> Result<Option<Vec<u8>>, BtrfsMutationError> {
@@ -709,24 +1103,6 @@ impl InMemoryCowBtrfsTree {
             }
         }
         Ok(())
-    }
-
-    fn rebuild_without_key(&mut self, key: &BtrfsKey) -> Result<u64, BtrfsMutationError> {
-        let mut items = self.collect_all_items()?;
-        let Some(pos) = items
-            .iter()
-            .position(|item| key_cmp(&item.key, key) == Ordering::Equal)
-        else {
-            return Err(BtrfsMutationError::KeyNotFound);
-        };
-        items.remove(pos);
-
-        let empty_root = self.alloc_node(BtrfsCowNode::Leaf { items: Vec::new() })?;
-        self.root = empty_root;
-        for item in items {
-            self.insert_entry(item, false)?;
-        }
-        Ok(self.root)
     }
 
     fn height_of(&self, node_id: u64) -> Result<usize, BtrfsMutationError> {
@@ -820,6 +1196,18 @@ impl InMemoryCowBtrfsTree {
                         ));
                     }
                 }
+                for (idx, separator) in keys.iter().enumerate() {
+                    let Some(expected) = self.first_key(children[idx + 1])? else {
+                        return Err(BtrfsMutationError::BrokenInvariant(
+                            "separator child must contain a key",
+                        ));
+                    };
+                    if key_cmp(separator, &expected) != Ordering::Equal {
+                        return Err(BtrfsMutationError::BrokenInvariant(
+                            "internal separator mismatch",
+                        ));
+                    }
+                }
                 for (idx, child) in children.iter().enumerate() {
                     let child_lower = if idx == 0 { lower } else { Some(keys[idx - 1]) };
                     let child_upper = if idx == keys.len() {
@@ -854,7 +1242,22 @@ impl BtrfsBTree for InMemoryCowBtrfsTree {
     }
 
     fn delete(&mut self, key: &BtrfsKey) -> Result<u64, BtrfsMutationError> {
-        self.rebuild_without_key(key)
+        let old_root = self.root;
+        trace!(
+            root = old_root,
+            objectid = key.objectid,
+            item_type = key.item_type,
+            offset = key.offset,
+            "btrfs_cow_delete_start"
+        );
+        let deleted = self.delete_from(self.root, key)?;
+        if !deleted.deleted {
+            return Err(BtrfsMutationError::KeyNotFound);
+        }
+        self.root = deleted.node_id;
+        self.normalize_root_after_delete()?;
+        trace!(old_root, new_root = self.root, "btrfs_cow_delete_complete");
+        Ok(self.root)
     }
 
     fn update(&mut self, key: &BtrfsKey, item: &[u8]) -> Result<u64, BtrfsMutationError> {
@@ -894,7 +1297,7 @@ impl BtrfsBTree for InMemoryCowBtrfsTree {
 mod tests {
     use super::*;
     use ffs_ondisk::BtrfsStripe;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     const NODESIZE: u32 = 4096;
     const HEADER_SIZE: usize = 101;
@@ -1238,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_rebuild_shrinks_to_leaf_root() {
+    fn delete_shrinks_to_leaf_root() {
         let mut tree = InMemoryCowBtrfsTree::new(3).expect("tree");
         for objectid in 1_u64..=8 {
             tree.insert(test_key(objectid), &test_payload(objectid))
@@ -1266,6 +1669,60 @@ mod tests {
     }
 
     #[test]
+    fn delete_underflow_borrows_from_right_sibling() {
+        let mut tree = InMemoryCowBtrfsTree::new(4).expect("tree");
+        for objectid in 1_u64..=5 {
+            tree.insert(test_key(objectid), &test_payload(objectid))
+                .expect("insert");
+        }
+
+        tree.delete(&test_key(1)).expect("delete");
+        let keys = tree
+            .range(&test_key(0), &test_key(10))
+            .expect("range query")
+            .iter()
+            .map(|(key, _)| key.objectid)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![2, 3, 4, 5]);
+        assert_eq!(tree.height().expect("height"), 2);
+        tree.validate_invariants().expect("invariants");
+    }
+
+    #[test]
+    fn delete_underflow_merges_and_shrinks_root() {
+        let mut tree = InMemoryCowBtrfsTree::new(4).expect("tree");
+        for objectid in 1_u64..=5 {
+            tree.insert(test_key(objectid), &test_payload(objectid))
+                .expect("insert");
+        }
+
+        tree.delete(&test_key(5)).expect("delete first");
+        tree.delete(&test_key(4)).expect("delete second");
+        let keys = tree
+            .range(&test_key(0), &test_key(10))
+            .expect("range query")
+            .iter()
+            .map(|(key, _)| key.objectid)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![1, 2, 3]);
+        assert_eq!(tree.height().expect("height"), 1);
+        assert!(matches!(
+            tree.node_snapshot(tree.root_block())
+                .expect("root snapshot"),
+            BtrfsCowNode::Leaf { .. }
+        ));
+        tree.validate_invariants().expect("invariants");
+    }
+
+    #[test]
+    fn delete_missing_key_returns_error() {
+        let mut tree = InMemoryCowBtrfsTree::new(3).expect("tree");
+        tree.insert(test_key(1), b"a").expect("insert");
+        let err = tree.delete(&test_key(999)).expect_err("delete should fail");
+        assert_eq!(err, BtrfsMutationError::KeyNotFound);
+    }
+
+    #[test]
     fn update_replaces_existing_value() {
         let mut tree = InMemoryCowBtrfsTree::new(5).expect("tree");
         let key = test_key(9);
@@ -1290,6 +1747,53 @@ mod tests {
             .map(|(key, _)| key.objectid)
             .collect::<Vec<_>>();
         assert_eq!(keys, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn random_mutations_preserve_invariants_and_ordering() {
+        let mut tree = InMemoryCowBtrfsTree::new(5).expect("tree");
+        let mut model = BTreeMap::<u64, u8>::new();
+        let mut state = 0xD1CE_D00D_CAFE_BABEu64;
+
+        for _ in 0..1000 {
+            // LCG for deterministic pseudo-random operations without extra deps.
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let objectid = (state % 128) + 1;
+            let op = state % 3;
+            let payload = [u8::try_from(objectid).expect("objectid should fit u8")];
+            let key = test_key(objectid);
+
+            match op {
+                0 => {
+                    if tree.insert(key, &payload).is_ok() {
+                        model.insert(objectid, payload[0]);
+                    }
+                }
+                1 => {
+                    if tree.update(&key, &payload).is_ok() {
+                        model.insert(objectid, payload[0]);
+                    }
+                }
+                _ => {
+                    if tree.delete(&key).is_ok() {
+                        model.remove(&objectid);
+                    }
+                }
+            }
+
+            tree.validate_invariants().expect("invariants after op");
+            let observed = tree
+                .range(&test_key(0), &test_key(u64::MAX))
+                .expect("full range");
+            let observed_keys = observed
+                .iter()
+                .map(|(entry_key, _)| entry_key.objectid)
+                .collect::<Vec<_>>();
+            let model_keys = model.keys().copied().collect::<Vec<_>>();
+            assert_eq!(observed_keys, model_keys);
+        }
     }
 
     #[test]
