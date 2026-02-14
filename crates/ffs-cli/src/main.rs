@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use asupersync::{Budget, Cx};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
 use ffs_core::{
     Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions, detect_filesystem_at_path,
@@ -16,7 +16,11 @@ use ffs_repair::scrub::{
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::env::VarError;
 use std::path::PathBuf;
+use std::time::Instant;
+use tracing::{error, info, info_span};
+use tracing_subscriber::EnvFilter;
 
 // ── Production Cx acquisition ───────────────────────────────────────────────
 
@@ -31,9 +35,82 @@ fn cli_cx_with_timeout_secs(secs: u64) -> Cx {
 
 // ── CLI definition ──────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogFormat {
+    Human,
+    Json,
+}
+
+impl LogFormat {
+    const ENV_KEY: &'static str = "FFS_LOG_FORMAT";
+
+    fn parse(raw: &str) -> Result<Self> {
+        <Self as ValueEnum>::from_str(raw.trim(), true).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid {key}={raw:?}; expected one of: human, json",
+                key = Self::ENV_KEY
+            )
+        })
+    }
+
+    fn from_env() -> Result<Option<Self>> {
+        match std::env::var(Self::ENV_KEY) {
+            Ok(value) => Ok(Some(Self::parse(&value)?)),
+            Err(VarError::NotPresent) => Ok(None),
+            Err(VarError::NotUnicode(_)) => {
+                bail!("{key} contains non-UTF-8 bytes", key = Self::ENV_KEY)
+            }
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+        }
+    }
+}
+
+fn default_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
+fn init_logging(log_format_override: Option<LogFormat>) -> Result<LogFormat> {
+    let format = log_format_override
+        .or(LogFormat::from_env()?)
+        .unwrap_or(LogFormat::Human);
+
+    match format {
+        LogFormat::Human => tracing_subscriber::fmt()
+            .with_env_filter(default_env_filter())
+            .with_target(true)
+            .with_level(true)
+            .compact()
+            .try_init()
+            .map_err(|err| anyhow::anyhow!("failed to initialize human logger: {err}"))?,
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_env_filter(default_env_filter())
+            .with_target(true)
+            .with_level(true)
+            .try_init()
+            .map_err(|err| anyhow::anyhow!("failed to initialize JSON logger: {err}"))?,
+    }
+
+    Ok(format)
+}
+
 #[derive(Parser)]
 #[command(name = "ffs", about = "FrankenFS — memory-safe filesystem toolkit")]
 struct Cli {
+    /// Log output format (`human` or `json`).
+    ///
+    /// Precedence: `--log-format` > `FFS_LOG_FORMAT` > `human`.
+    #[arg(long, value_enum, global = true)]
+    log_format: Option<LogFormat>,
     #[command(subcommand)]
     command: Command,
 }
@@ -91,6 +168,18 @@ enum Command {
     },
 }
 
+impl Command {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Inspect { .. } => "inspect",
+            Self::Mount { .. } => "mount",
+            Self::Scrub { .. } => "scrub",
+            Self::Parity { .. } => "parity",
+            Self::Evidence { .. } => "evidence",
+        }
+    }
+}
+
 // ── Serializable outputs ────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -140,8 +229,25 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let log_format = init_logging(cli.log_format)?;
+    let command_name = cli.command.name();
+    let run_span = info_span!(
+        target: "ffs::cli",
+        "command",
+        command = command_name,
+        log_format = log_format.as_str()
+    );
+    let _run_guard = run_span.enter();
+    let started = Instant::now();
 
-    match cli.command {
+    info!(
+        target: "ffs::cli",
+        command = command_name,
+        log_format = log_format.as_str(),
+        "command_start"
+    );
+
+    let result = match cli.command {
         Command::Inspect { image, json } => inspect(&image, json),
         Command::Mount {
             image,
@@ -157,10 +263,40 @@ fn run() -> Result<()> {
             event_type,
             tail,
         } => evidence_cmd(&ledger, json, event_type.as_deref(), tail),
+    };
+
+    let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if let Err(err) = &result {
+        error!(
+            target: "ffs::cli",
+            command = command_name,
+            duration_us,
+            error = %err,
+            "command_failed"
+        );
+    } else {
+        info!(
+            target: "ffs::cli",
+            command = command_name,
+            duration_us,
+            "command_succeeded"
+        );
     }
+
+    result
 }
 
 fn inspect(path: &PathBuf, json: bool) -> Result<()> {
+    let command_span = info_span!(
+        target: "ffs::cli::inspect",
+        "inspect",
+        image = %path.display(),
+        output_json = json
+    );
+    let _command_guard = command_span.enter();
+    let started = Instant::now();
+    info!(target: "ffs::cli::inspect", "inspect_start");
+
     let cx = cli_cx();
     let open_opts = OpenOptions {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
@@ -186,6 +322,16 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
             label: sb.label.clone(),
         },
     };
+
+    info!(
+        target: "ffs::cli::inspect",
+        filesystem = match &flavor {
+            FsFlavor::Ext4(_) => "ext4",
+            FsFlavor::Btrfs(_) => "btrfs",
+        },
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "inspect_detected_filesystem"
+    );
 
     if json {
         println!(
@@ -239,6 +385,12 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
             }
         }
     }
+
+    info!(
+        target: "ffs::cli::inspect",
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "inspect_complete"
+    );
 
     Ok(())
 }
@@ -297,6 +449,18 @@ fn mount_cmd(
     allow_other: bool,
     rw: bool,
 ) -> Result<()> {
+    let command_span = info_span!(
+        target: "ffs::cli::mount",
+        "mount",
+        image = %image_path.display(),
+        mountpoint = %mountpoint.display(),
+        allow_other,
+        read_write = rw
+    );
+    let _command_guard = command_span.enter();
+    let started = Instant::now();
+    info!(target: "ffs::cli::mount", "mount_start");
+
     let cx = cli_cx();
     let open_opts = OpenOptions {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
@@ -364,6 +528,12 @@ fn mount_cmd(
     ffs_fuse::mount(fs_ops, mountpoint, &opts)
         .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))?;
 
+    info!(
+        target: "ffs::cli::mount",
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "mount_complete"
+    );
+
     Ok(())
 }
 
@@ -427,7 +597,57 @@ fn count_blocks_at_severity_or_higher(report: &ScrubReport, min: Severity) -> u6
         .len() as u64
 }
 
+fn scrub_validator(flavor: &FsFlavor, block_size: u32) -> Box<dyn BlockValidator> {
+    match flavor {
+        FsFlavor::Ext4(_) => Box::new(CompositeValidator::new(vec![
+            Box::new(ZeroCheckValidator),
+            Box::new(Ext4SuperblockValidator::new(block_size)),
+        ])),
+        FsFlavor::Btrfs(_) => Box::new(CompositeValidator::new(vec![
+            Box::new(ZeroCheckValidator),
+            Box::new(BtrfsSuperblockValidator::new(block_size)),
+        ])),
+    }
+}
+
+fn print_scrub_output(json: bool, output: &ScrubOutput, report: &ScrubReport) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(output).context("serialize scrub report")?
+        );
+    } else {
+        println!("FrankenFS Scrub Report");
+        println!(
+            "scanned {} blocks: {} corrupt, {} error+, {} io_errors, {} findings",
+            output.blocks_scanned,
+            output.blocks_corrupt,
+            output.blocks_error_or_higher,
+            output.blocks_io_error,
+            output.findings.len(),
+        );
+        if !report.findings.is_empty() {
+            println!();
+            for finding in &report.findings {
+                println!("  {finding}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
+    let command_span = info_span!(
+        target: "ffs::cli::scrub",
+        "scrub",
+        image = %path.display(),
+        output_json = json
+    );
+    let _command_guard = command_span.enter();
+    let started = Instant::now();
+    info!(target: "ffs::cli::scrub", "scrub_start");
+
     let cx = cli_cx();
 
     // Detect filesystem to get the block size.
@@ -452,16 +672,7 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
 
-    let validator: Box<dyn BlockValidator> = match &flavor {
-        FsFlavor::Ext4(_) => Box::new(CompositeValidator::new(vec![
-            Box::new(ZeroCheckValidator),
-            Box::new(Ext4SuperblockValidator::new(block_size)),
-        ])),
-        FsFlavor::Btrfs(_) => Box::new(CompositeValidator::new(vec![
-            Box::new(ZeroCheckValidator),
-            Box::new(BtrfsSuperblockValidator::new(block_size)),
-        ])),
-    };
+    let validator = scrub_validator(&flavor, block_size);
 
     if !json {
         let fs_name = match &flavor {
@@ -498,31 +709,22 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
             .collect(),
     };
 
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).context("serialize scrub report")?
-        );
-    } else {
-        println!("FrankenFS Scrub Report");
-        println!(
-            "scanned {} blocks: {} corrupt, {} error+, {} io_errors, {} findings",
-            output.blocks_scanned,
-            output.blocks_corrupt,
-            output.blocks_error_or_higher,
-            output.blocks_io_error,
-            output.findings.len(),
-        );
-        if !report.findings.is_empty() {
-            println!();
-            for f in &report.findings {
-                println!("  {f}");
-            }
-        }
-    }
+    print_scrub_output(json, &output, &report)?;
+
+    let has_error_findings = report.count_at_severity(Severity::Error) > 0;
+
+    info!(
+        target: "ffs::cli::scrub",
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        blocks_scanned = output.blocks_scanned,
+        blocks_corrupt = output.blocks_corrupt,
+        blocks_error_or_higher = output.blocks_error_or_higher,
+        has_error_findings,
+        "scrub_complete"
+    );
 
     // Exit with non-zero status if corruption found at Error or above.
-    if report.count_at_severity(Severity::Error) > 0 {
+    if has_error_findings {
         std::process::exit(2);
     }
 
@@ -535,6 +737,18 @@ fn evidence_cmd(
     event_type_filter: Option<&str>,
     tail: Option<usize>,
 ) -> Result<()> {
+    let command_span = info_span!(
+        target: "ffs::cli::evidence",
+        "evidence",
+        ledger = %path.display(),
+        output_json = json,
+        event_type_filter = event_type_filter.unwrap_or(""),
+        tail = tail.unwrap_or(0)
+    );
+    let _command_guard = command_span.enter();
+    let started = Instant::now();
+    info!(target: "ffs::cli::evidence", "evidence_start");
+
     let data = std::fs::read(path)
         .with_context(|| format!("failed to read evidence ledger: {}", path.display()))?;
 
@@ -573,6 +787,13 @@ fn evidence_cmd(
             print_evidence_record(record);
         }
     }
+
+    info!(
+        target: "ffs::cli::evidence",
+        record_count = records.len(),
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "evidence_complete"
+    );
 
     Ok(())
 }
@@ -663,6 +884,15 @@ fn print_evidence_record(record: &EvidenceRecord) {
 }
 
 fn parity(json: bool) -> Result<()> {
+    let command_span = info_span!(
+        target: "ffs::cli::parity",
+        "parity",
+        output_json = json
+    );
+    let _command_guard = command_span.enter();
+    let started = Instant::now();
+    info!(target: "ffs::cli::parity", "parity_start");
+
     let report = ParityReport::current();
 
     if json {
@@ -689,5 +919,142 @@ fn parity(json: bool) -> Result<()> {
         );
     }
 
+    info!(
+        target: "ffs::cli::parity",
+        overall_coverage_percent = report.overall_coverage_percent,
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "parity_complete"
+    );
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogFormat;
+    use serde_json::Value;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing::{info, info_span};
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedLogBuffer {
+        fn as_string(&self) -> String {
+            let bytes = self.bytes.lock().expect("log buffer lock poisoned").clone();
+            String::from_utf8(bytes).expect("log buffer must be utf-8")
+        }
+    }
+
+    struct SharedLogWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes
+                .lock()
+                .expect("log buffer lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedLogWriter {
+                bytes: Arc::clone(&self.bytes),
+            }
+        }
+    }
+
+    fn parse_first_json_line(buffer: &SharedLogBuffer) -> Value {
+        let logs = buffer.as_string();
+        let line = logs
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("expected at least one log line");
+        serde_json::from_str(line).expect("line should parse as JSON")
+    }
+
+    #[test]
+    fn log_format_parser_supports_human_and_json() {
+        assert_eq!(
+            LogFormat::parse("human").expect("parse human"),
+            LogFormat::Human
+        );
+        assert_eq!(
+            LogFormat::parse("JSON").expect("parse json"),
+            LogFormat::Json
+        );
+        assert!(LogFormat::parse("invalid").is_err());
+    }
+
+    #[test]
+    fn json_log_serializes_domain_fields() {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(buffer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            info!(
+                target: "ffs::test",
+                event_name = "transaction_commit",
+                txn_id = 42_u64,
+                write_set_size = 3_u64,
+                duration_us = 900_u64,
+                "transaction_commit"
+            );
+        });
+
+        let json = parse_first_json_line(&buffer);
+        assert_eq!(json["event_name"], "transaction_commit");
+        assert_eq!(json["txn_id"], 42);
+        assert_eq!(json["write_set_size"], 3);
+        assert_eq!(json["duration_us"], 900);
+        assert_eq!(json["target"], "ffs::test");
+        assert_eq!(json["level"], "INFO");
+    }
+
+    #[test]
+    fn json_log_preserves_span_context() {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(buffer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = info_span!("mount", image = "/tmp/ext4.img", mode = "ro");
+            let _guard = span.enter();
+            info!(target: "ffs::test", action = "mount_begin", "mount_begin");
+        });
+
+        let json = parse_first_json_line(&buffer);
+        assert_eq!(json["action"], "mount_begin");
+        assert_eq!(json["span"]["name"], "mount");
+        assert_eq!(json["span"]["image"], "/tmp/ext4.img");
+        assert_eq!(json["span"]["mode"], "ro");
+    }
 }

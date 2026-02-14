@@ -17,6 +17,8 @@ ffs-harness = { workspace = true }
 ffs-repair = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [lints]
 workspace = true
