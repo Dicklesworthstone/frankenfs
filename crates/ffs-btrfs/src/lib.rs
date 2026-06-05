@@ -44,6 +44,8 @@ pub const BTRFS_ITEM_TREE_BLOCK_REF: u8 = 176;
 pub const BTRFS_ITEM_EXTENT_DATA_REF: u8 = 178;
 pub const BTRFS_ITEM_BLOCK_GROUP_ITEM: u8 = 192;
 pub const BTRFS_ITEM_DEV_ITEM: u8 = 216;
+/// Data-checksum item in the csum tree (kernel: `BTRFS_EXTENT_CSUM_KEY`).
+pub const BTRFS_ITEM_EXTENT_CSUM: u8 = 128;
 pub const BTRFS_ITEM_CHUNK: u8 = 228;
 pub const BTRFS_ITEM_FREE_SPACE_INFO: u8 = 198;
 pub const BTRFS_ITEM_FREE_SPACE_EXTENT: u8 = 199;
@@ -65,6 +67,12 @@ pub const BTRFS_UUID_TREE_OBJECTID: u64 = 9;
 pub const BTRFS_FREE_SPACE_TREE_OBJECTID: u64 = 10;
 /// Block-group tree v2 (kernel: `BTRFS_BLOCK_GROUP_TREE_OBJECTID`).
 pub const BTRFS_BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
+/// Objectid shared by all data-checksum items in the csum tree
+/// (kernel: `BTRFS_EXTENT_CSUM_OBJECTID`, defined as `-10`).
+pub const BTRFS_EXTENT_CSUM_OBJECTID: u64 = 0xFFFF_FFFF_FFFF_FFF6;
+/// On-disk size of a single crc32c data checksum (kernel: `BTRFS_CSUM_SIZE`
+/// for the crc32c algorithm).
+pub const BTRFS_CRC32C_CSUM_SIZE: usize = 4;
 
 /// Block group type flags.
 pub const BTRFS_BLOCK_GROUP_DATA: u64 = 1;
@@ -117,6 +125,263 @@ pub const BTRFS_INODE_NOATIME: u64 = 1 << 9;
 pub const BTRFS_INODE_DIRSYNC: u64 = 1 << 10;
 /// Compress data.
 pub const BTRFS_INODE_COMPRESS: u64 = 1 << 11;
+
+/// Build the csum-tree leaf item for one on-disk data extent.
+///
+/// btrfs stores data checksums in the csum tree (`BTRFS_CSUM_TREE_OBJECTID`) as
+/// `EXTENT_CSUM` items. Each item's key is
+/// `{ objectid: BTRFS_EXTENT_CSUM_OBJECTID, type: BTRFS_ITEM_EXTENT_CSUM,
+/// offset: <logical byte address of the extent start> }`, and its value is a
+/// densely packed array of one crc32c per `sectorsize` bytes of extent data,
+/// each stored little-endian (`BTRFS_CRC32C_CSUM_SIZE` bytes). The kernel
+/// verifies every data read against these checksums on a `datasum`
+/// filesystem, so a file written without them is unreadable (EIO).
+///
+/// This is the pure foundational primitive for csum-tree population (bd-x3fcu):
+/// it computes the key and packed checksum bytes for a single contiguous
+/// extent. Wiring it into the COW commit (capturing extents during write,
+/// inserting these items, and updating the csum root) is the follow-on work.
+///
+/// `data` must be the on-disk (sector-padded) extent bytes, i.e. a non-empty
+/// whole multiple of `sectorsize`; `sectorsize` must be non-zero. Either
+/// violation returns [`BtrfsMutationError::InvalidConfig`] rather than
+/// producing a silently truncated checksum run.
+///
+/// # Errors
+/// Returns [`BtrfsMutationError::InvalidConfig`] if `sectorsize` is zero or if
+/// `data.len()` is not a positive multiple of `sectorsize`.
+pub fn build_extent_csum_item(
+    disk_bytenr: u64,
+    data: &[u8],
+    sectorsize: usize,
+) -> Result<(BtrfsKey, Vec<u8>), BtrfsMutationError> {
+    if sectorsize == 0 {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "sectorsize must be non-zero",
+        ));
+    }
+    if data.is_empty() || data.len() % sectorsize != 0 {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "data must be a positive whole multiple of sectorsize",
+        ));
+    }
+    let sectors = data.len() / sectorsize;
+    let mut value = Vec::with_capacity(sectors * BTRFS_CRC32C_CSUM_SIZE);
+    for sector in data.chunks_exact(sectorsize) {
+        let csum = ffs_types::crc32c(sector);
+        value.extend_from_slice(&csum.to_le_bytes());
+    }
+    let key = BtrfsKey {
+        objectid: BTRFS_EXTENT_CSUM_OBJECTID,
+        item_type: BTRFS_ITEM_EXTENT_CSUM,
+        offset: disk_bytenr,
+    };
+    Ok((key, value))
+}
+
+/// Maximum number of crc32c data checksums that fit in a single EXTENT_CSUM
+/// item in a leaf of `nodesize` bytes.
+///
+/// A leaf is `BTRFS_HEADER_SIZE` (101) of header plus item slots; a single
+/// item costs its 25-byte item entry plus its value bytes. So the value of one
+/// EXTENT_CSUM item that is alone in a leaf can be at most
+/// `nodesize - 101 - 25` bytes, i.e. `(nodesize - 126) / 4` crc32c checksums.
+/// Items at or below this bound always fit in a leaf (the B-tree handles
+/// packing several smaller items per leaf); the kernel accepts an EXTENT_CSUM
+/// item of any valid length, so any split that respects this bound is
+/// kernel-readable.
+#[must_use]
+pub fn max_data_csums_per_item(nodesize: u32) -> usize {
+    let usable = (nodesize as usize).saturating_sub(101 + 25);
+    (usable / BTRFS_CRC32C_CSUM_SIZE).max(1)
+}
+
+/// Build the csum-tree leaf items for one contiguous on-disk data extent,
+/// splitting into multiple EXTENT_CSUM items so each fits in a leaf.
+///
+/// [`build_extent_csum_item`] packs every sector's checksum into a single
+/// item, which overflows a leaf once an extent has more than
+/// [`max_data_csums_per_item`] sectors (a multi-MiB extent). btrfs stores such
+/// an extent's checksums across several EXTENT_CSUM items, each keyed by the
+/// disk bytenr of the first sector it covers. This returns that ordered set:
+/// each item covers up to `max_csums_per_item` consecutive sectors, and item
+/// `n`'s key offset is `disk_bytenr + n * max_csums_per_item * sectorsize`.
+///
+/// `data` must be a non-empty whole multiple of `sectorsize`; `sectorsize` and
+/// `max_csums_per_item` must be non-zero. Pass
+/// `max_data_csums_per_item(nodesize)` for `max_csums_per_item`.
+///
+/// # Errors
+/// Returns [`BtrfsMutationError::InvalidConfig`] on a zero `sectorsize` /
+/// `max_csums_per_item`, or `data` that is not a positive multiple of
+/// `sectorsize`.
+pub fn build_extent_csum_items(
+    disk_bytenr: u64,
+    data: &[u8],
+    sectorsize: usize,
+    max_csums_per_item: usize,
+) -> Result<Vec<(BtrfsKey, Vec<u8>)>, BtrfsMutationError> {
+    if max_csums_per_item == 0 {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "max_csums_per_item must be non-zero",
+        ));
+    }
+    // build_extent_csum_item validates sectorsize / data shape.
+    let chunk_bytes =
+        max_csums_per_item
+            .checked_mul(sectorsize)
+            .ok_or(BtrfsMutationError::InvalidConfig(
+                "max_csums_per_item * sectorsize overflows",
+            ))?;
+    if chunk_bytes == 0 {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "sectorsize must be non-zero",
+        ));
+    }
+    if data.is_empty() || data.len() % sectorsize != 0 {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "data must be a positive whole multiple of sectorsize",
+        ));
+    }
+    let mut items = Vec::with_capacity(data.len().div_ceil(chunk_bytes));
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let end = (offset + chunk_bytes).min(data.len());
+        let chunk_bytenr =
+            disk_bytenr
+                .checked_add(offset as u64)
+                .ok_or(BtrfsMutationError::InvalidConfig(
+                    "extent disk bytenr overflows",
+                ))?;
+        items.push(build_extent_csum_item(
+            chunk_bytenr,
+            &data[offset..end],
+            sectorsize,
+        )?);
+        offset = end;
+    }
+    Ok(items)
+}
+
+/// Look up the expected crc32c for the on-disk sector at `disk_bytenr` among a
+/// set of EXTENT_CSUM items (the read-side counterpart of
+/// [`build_extent_csum_items`]).
+///
+/// `items` are `(key, packed_csums)` pairs as stored in the csum tree, each key
+/// carrying the disk bytenr of the item's first sector in `key.offset` (the
+/// caller gathers the relevant items via a tree range query; order does not
+/// matter). Returns the checksum recorded for the sector that begins at
+/// `disk_bytenr`, or `None` if no item covers it or `disk_bytenr` is not
+/// sector-aligned to an item's coverage. A reader/scrub feeds the result to
+/// [`verify_extent_csum`] (or compares directly) to detect data corruption.
+#[must_use]
+pub fn lookup_data_block_csum(
+    items: &[(BtrfsKey, Vec<u8>)],
+    disk_bytenr: u64,
+    sectorsize: usize,
+) -> Option<u32> {
+    if sectorsize == 0 {
+        return None;
+    }
+    // The covering item is the one with the greatest offset <= disk_bytenr
+    // whose checksum run actually reaches disk_bytenr.
+    let mut best: Option<(u64, &[u8])> = None;
+    for (key, value) in items {
+        if key.item_type != BTRFS_ITEM_EXTENT_CSUM || key.objectid != BTRFS_EXTENT_CSUM_OBJECTID {
+            continue;
+        }
+        if key.offset > disk_bytenr {
+            continue;
+        }
+        if best.is_none_or(|(off, _)| key.offset > off) {
+            best = Some((key.offset, value.as_slice()));
+        }
+    }
+    let (item_offset, value) = best?;
+    let delta = disk_bytenr.checked_sub(item_offset)?;
+    let delta = usize::try_from(delta).ok()?;
+    if delta % sectorsize != 0 {
+        return None;
+    }
+    let index = delta / sectorsize;
+    let base = index.checked_mul(BTRFS_CRC32C_CSUM_SIZE)?;
+    let end = base.checked_add(BTRFS_CRC32C_CSUM_SIZE)?;
+    if end > value.len() {
+        return None; // beyond this item's coverage
+    }
+    Some(u32::from_le_bytes([
+        value[base],
+        value[base + 1],
+        value[base + 2],
+        value[base + 3],
+    ]))
+}
+
+/// First-mismatch detail from [`verify_extent_csum`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CsumMismatch {
+    /// Zero-based index of the first sector whose checksum did not match.
+    pub sector_index: usize,
+    /// The crc32c recorded in the csum tree for that sector.
+    pub expected: u32,
+    /// The crc32c actually computed over the on-disk sector bytes.
+    pub actual: u32,
+}
+
+/// Verify a contiguous on-disk data extent against its packed crc32c checksums.
+///
+/// Read-side inverse of [`build_extent_csum_item`]: given the extent's
+/// sector-padded bytes and the densely packed little-endian crc32c-per-sector
+/// value from its EXTENT_CSUM item, recompute each sector's crc32c (the same
+/// `ffs_types::crc32c` the kernel uses) and compare. The kernel returns EIO on
+/// the first mismatch when reading a `datasum` file; a reader or scrub built on
+/// this can do the same instead of silently returning corrupted data.
+///
+/// # Errors
+/// - `Err(Err(BtrfsMutationError::InvalidConfig))` if `sectorsize` is zero,
+///   `data` is not a positive whole multiple of `sectorsize`, or
+///   `expected_csums` length does not match the sector count.
+/// - `Err(Ok(CsumMismatch))` on the first sector whose checksum does not match.
+pub fn verify_extent_csum(
+    data: &[u8],
+    sectorsize: usize,
+    expected_csums: &[u8],
+) -> Result<(), Result<CsumMismatch, BtrfsMutationError>> {
+    if sectorsize == 0 {
+        return Err(Err(BtrfsMutationError::InvalidConfig(
+            "sectorsize must be non-zero",
+        )));
+    }
+    if data.is_empty() || data.len() % sectorsize != 0 {
+        return Err(Err(BtrfsMutationError::InvalidConfig(
+            "data must be a positive whole multiple of sectorsize",
+        )));
+    }
+    let sectors = data.len() / sectorsize;
+    if expected_csums.len() != sectors * BTRFS_CRC32C_CSUM_SIZE {
+        return Err(Err(BtrfsMutationError::InvalidConfig(
+            "expected_csums length does not match sector count",
+        )));
+    }
+    for (index, sector) in data.chunks_exact(sectorsize).enumerate() {
+        let base = index * BTRFS_CRC32C_CSUM_SIZE;
+        let expected = u32::from_le_bytes([
+            expected_csums[base],
+            expected_csums[base + 1],
+            expected_csums[base + 2],
+            expected_csums[base + 3],
+        ]);
+        let actual = ffs_types::crc32c(sector);
+        if actual != expected {
+            return Err(Ok(CsumMismatch {
+                sector_index: index,
+                expected,
+                actual,
+            }));
+        }
+    }
+    Ok(())
+}
 
 /// Convert btrfs inode flags to generic FS_*_FL flags for `FS_IOC_GETFLAGS`.
 ///
@@ -747,8 +1012,8 @@ pub fn parse_xattr_items(data: &[u8]) -> Result<Vec<BtrfsXattrItem>, ParseError>
                 actual: data.len() - cur,
             });
         }
-        let data_len = usize::from(read_u16(data, cur + 25, "xattr.data_len")?);
-        let name_len = usize::from(read_u16(data, cur + 27, "xattr.name_len")?);
+        let data_len = usize::from(u16::from_le_bytes([data[cur + 25], data[cur + 26]]));
+        let name_len = usize::from(u16::from_le_bytes([data[cur + 27], data[cur + 28]]));
         if name_len == 0 {
             return Err(ParseError::InvalidField {
                 field: "xattr.name_len",
@@ -1372,7 +1637,6 @@ pub fn parse_dir_items(data: &[u8]) -> Result<Vec<BtrfsDirItem>, ParseError> {
         let child_key_type = data[cur + 8];
         let child_key_offset = read_u64(data, cur + 9, "dir_item.location.offset")?;
         // transid at +17..+25 (currently unused in VFS path)
-        let _transid = read_u64(data, cur + 17, "dir_item.transid")?;
         let data_len = usize::from(read_u16(data, cur + 25, "dir_item.data_len")?);
         let name_len = usize::from(read_u16(data, cur + 27, "dir_item.name_len")?);
         let file_type = data[cur + 29];
@@ -1586,6 +1850,40 @@ pub fn walk_tree(
         out: Vec::new(),
         active_path: HashSet::new(),
         visited_nodes: HashSet::new(),
+        range: None,
+    };
+    walker.walk_node(root_logical)?;
+    Ok(walker.out)
+}
+
+/// Walk a btrfs b-tree but descend only into subtrees that can contain a key
+/// in the half-open range `[lo, hi)`, returning exactly the leaf entries whose
+/// key falls in that range.
+///
+/// This is the targeted-descent counterpart to [`walk_tree`]: instead of
+/// visiting every node (O(N) reads), it binary-prunes internal-node children
+/// whose key span cannot overlap the requested range, reading only the
+/// O(log N) nodes along the covering paths. The returned entries are identical
+/// to `walk_tree(...).into_iter().filter(|e| lo <= e.key < hi)` — same items,
+/// same order — but without reading subtrees that hold no matching key.
+pub fn walk_tree_range(
+    read_physical: &mut dyn FnMut(u64) -> Result<Vec<u8>, ParseError>,
+    chunks: &[BtrfsChunkEntry],
+    root_logical: u64,
+    nodesize: u32,
+    csum_type: u16,
+    lo: BtrfsKey,
+    hi: BtrfsKey,
+) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
+    let mut walker = BtrfsTreeWalker {
+        read_physical,
+        chunks,
+        nodesize,
+        csum_type,
+        out: Vec::new(),
+        active_path: HashSet::new(),
+        visited_nodes: HashSet::new(),
+        range: Some((lo, hi)),
     };
     walker.walk_node(root_logical)?;
     Ok(walker.out)
@@ -1599,6 +1897,9 @@ struct BtrfsTreeWalker<'a> {
     out: Vec<BtrfsLeafEntry>,
     active_path: HashSet<u64>,
     visited_nodes: HashSet<u64>,
+    /// When `Some((lo, hi))`, prune internal-node children and leaf items
+    /// outside the half-open key range `[lo, hi)`. `None` walks the whole tree.
+    range: Option<(BtrfsKey, BtrfsKey)>,
 }
 
 impl BtrfsTreeWalker<'_> {
@@ -1653,15 +1954,32 @@ impl BtrfsTreeWalker<'_> {
         header.validate(block.len(), Some(logical))?;
 
         if header.level == 0 {
-            collect_leaf_items(&block, &mut self.out)?;
+            collect_leaf_items(&block, &mut self.out, self.range.as_ref())?;
         } else {
             let (_, ptrs) = parse_internal_items(&block)?;
-            for kp in &ptrs {
+            for (idx, kp) in ptrs.iter().enumerate() {
                 if kp.blockptr % nodesize_u64 != 0 {
                     return Err(ParseError::InvalidField {
                         field: "blockptr",
                         reason: "not aligned to nodesize",
                     });
+                }
+                // Targeted descent: child `idx` covers the key span
+                // `[kp.key, next_key)` (the next sibling's key, or +inf for the
+                // last child). Skip it when that span cannot overlap [lo, hi).
+                if let Some((lo, hi)) = self.range.as_ref() {
+                    // Span starts at or after `hi` -> no overlap (keys sorted).
+                    if key_cmp(&kp.key, hi) != Ordering::Less {
+                        // All later children start even higher; stop early.
+                        break;
+                    }
+                    // Span ends at or before `lo` -> no overlap. The span end is
+                    // the next sibling's key; the last child's span is unbounded.
+                    if let Some(next) = ptrs.get(idx + 1) {
+                        if key_cmp(&next.key, lo) != Ordering::Greater {
+                            continue;
+                        }
+                    }
                 }
                 self.walk_node(kp.blockptr)?;
             }
@@ -1672,9 +1990,20 @@ impl BtrfsTreeWalker<'_> {
     }
 }
 
-fn collect_leaf_items(block: &[u8], out: &mut Vec<BtrfsLeafEntry>) -> Result<(), ParseError> {
+fn collect_leaf_items(
+    block: &[u8],
+    out: &mut Vec<BtrfsLeafEntry>,
+    range: Option<&(BtrfsKey, BtrfsKey)>,
+) -> Result<(), ParseError> {
     let (_, items) = parse_leaf_items(block)?;
     for item in &items {
+        if let Some((lo, hi)) = range {
+            // Keep only items in the half-open range [lo, hi).
+            if key_cmp(&item.key, lo) == Ordering::Less || key_cmp(&item.key, hi) != Ordering::Less
+            {
+                continue;
+            }
+        }
         let off = usize::try_from(item.data_offset).map_err(|_| ParseError::IntegerConversion {
             field: "data_offset",
         })?;
@@ -3635,6 +3964,16 @@ struct BlockGroupState {
     item: BtrfsBlockGroupItem,
     /// Hint for next allocation search offset within this group.
     alloc_offset: u64,
+    /// Lowest offset within the group that may be handed out. Captured at
+    /// registration from the group's already-used bytes, this fences off the
+    /// reserved prefix (superblock / system / root region that carries no
+    /// EXTENT_ITEM in the data allocator's tree). The wrap-around gap search
+    /// must clamp to `start + min_usable_offset`; otherwise, when every data
+    /// extent in a group rooted at logical 0 has been freed (gap scan sees an
+    /// empty range set), it would reset to `start == 0` and hand out bytenr 0 —
+    /// the btrfs hole/none sentinel — silently turning the write into a hole
+    /// that reads back as zeros (bd-5aybu).
+    min_usable_offset: u64,
 }
 
 /// Extent allocator for btrfs write path.
@@ -3682,6 +4021,7 @@ impl BtrfsExtentAllocator {
                 start,
                 item,
                 alloc_offset: item.used_bytes,
+                min_usable_offset: item.used_bytes,
             },
         );
     }
@@ -3830,9 +4170,17 @@ impl BtrfsExtentAllocator {
 
         // Scan for gaps between existing extents.
         let alloc_offset = self.block_groups[&bg_start].alloc_offset;
+        // Lowest address this group may hand out: fences off the reserved prefix
+        // (system/root region carrying no EXTENT_ITEM here). Both the forward and
+        // wrap-around searches must respect it, or a fully-freed group rooted at
+        // logical 0 would allocate bytenr 0 — the hole sentinel (bd-5aybu).
+        let min_usable = bg_start
+            .checked_add(self.block_groups[&bg_start].min_usable_offset)
+            .ok_or(BtrfsMutationError::AddressOverflow)?;
         let mut cursor = bg_start
             .checked_add(alloc_offset)
-            .ok_or(BtrfsMutationError::AddressOverflow)?;
+            .ok_or(BtrfsMutationError::AddressOverflow)?
+            .max(min_usable);
 
         let allocated_ranges: Vec<(u64, u64)> = extents
             .iter()
@@ -3864,9 +4212,9 @@ impl BtrfsExtentAllocator {
                 }
             }
         }
-        // Wrap around: try from block group start if we started mid-group.
+        // Wrap around: try from the first usable offset if we started mid-group.
         if found.is_none() && alloc_offset > 0 {
-            cursor = bg_start;
+            cursor = min_usable;
             for &(ext_start, ext_size) in &allocated_ranges {
                 let ext_end = ext_start
                     .checked_add(ext_size)
@@ -3891,7 +4239,11 @@ impl BtrfsExtentAllocator {
             }
         }
 
-        let bytenr = found.ok_or(BtrfsMutationError::NoSpace)?;
+        // bytenr 0 is the btrfs hole/none sentinel and must never back a real
+        // extent; refuse it defensively rather than corrupt data (bd-5aybu).
+        let bytenr = found
+            .filter(|&b| b != 0)
+            .ok_or(BtrfsMutationError::NoSpace)?;
         let extent = ExtentKey { bytenr, num_bytes };
 
         debug!(
@@ -5060,6 +5412,17 @@ impl SendStreamBuilder {
 
         let mut payload = Vec::new();
         for (atype, adata) in attrs {
+            // The btrfs send TLV length field is a u16. Casting a longer
+            // attribute would silently wrap the declared length and emit a
+            // corrupt, unparseable stream. Callers that carry bulk data (file
+            // writes) MUST chunk to `BTRFS_SEND_WRITE_CHUNK`; assert here so any
+            // future caller that forgets fails loudly instead of corrupting.
+            assert!(
+                u16::try_from(adata.len()).is_ok(),
+                "send-stream attribute data exceeds u16 TLV limit ({} > {})",
+                adata.len(),
+                u16::MAX
+            );
             payload.extend_from_slice(&(*atype as u16).to_le_bytes());
             payload.extend_from_slice(&(adata.len() as u16).to_le_bytes());
             payload.extend_from_slice(adata);
@@ -5434,6 +5797,28 @@ pub fn build_update_extent_command(
 
 // ── send stream generation from FS tree ───────────────────────────────────
 
+/// Maximum payload bytes per send-stream `DATA` attribute.
+///
+/// The btrfs send TLV length field is a `u16`, so a single attribute can carry
+/// at most 65535 bytes. The kernel chunks file data at `BTRFS_SEND_READ_SIZE`
+/// (48 KiB); matching that keeps generated `Write` commands well under the u16
+/// ceiling and interoperable with `btrfs receive`.
+const BTRFS_SEND_WRITE_CHUNK: usize = 48 * 1024;
+
+/// Emit one or more `Write` commands for `data`, splitting it into
+/// [`BTRFS_SEND_WRITE_CHUNK`]-sized pieces so no `DATA` attribute exceeds the
+/// u16 TLV length limit. Each chunk carries its own incrementing file offset,
+/// exactly as the kernel's send implementation does.
+fn emit_write_chunks(builder: &mut SendStreamBuilder, path: &[u8], file_offset: u64, data: &[u8]) {
+    let mut chunk_offset = file_offset;
+    for chunk in data.chunks(BTRFS_SEND_WRITE_CHUNK) {
+        let (cmd, attrs) = build_write_command(path, chunk_offset, chunk);
+        let refs: Vec<(SendAttr, &[u8])> = attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+        builder.add_command(cmd, &refs);
+        chunk_offset = chunk_offset.saturating_add(chunk.len() as u64);
+    }
+}
+
 /// Generate a btrfs send stream from FS tree items.
 ///
 /// This function walks the given FS tree items and produces a valid send stream
@@ -5572,12 +5957,14 @@ where
                     if extent_type == 0 {
                         // Inline extent: data follows header
                         let data = &entry.data[21..];
-                        let (cmd, attrs) = build_write_command(&path, file_offset, data);
-                        let refs: Vec<(SendAttr, &[u8])> =
-                            attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
-                        builder.add_command(cmd, &refs);
-                    } else if extent_type == 1 && entry.data.len() >= 53 {
-                        // Regular extent: read from disk
+                        emit_write_chunks(&mut builder, &path, file_offset, data);
+                    } else if (extent_type == BTRFS_FILE_EXTENT_REG
+                        || extent_type == BTRFS_FILE_EXTENT_PREALLOC)
+                        && entry.data.len() >= 53
+                    {
+                        // Regular extents carry initialized data; preallocated
+                        // extents are unwritten and must be represented as an
+                        // extent update, not as bytes read from disk.
                         let disk_bytenr =
                             u64::from_le_bytes(entry.data[21..29].try_into().unwrap_or([0; 8]));
                         let disk_num_bytes =
@@ -5587,8 +5974,7 @@ where
                         let num_bytes =
                             u64::from_le_bytes(entry.data[45..53].try_into().unwrap_or([0; 8]));
 
-                        if disk_bytenr == 0 {
-                            // Sparse hole - emit update_extent instead
+                        if extent_type == BTRFS_FILE_EXTENT_PREALLOC || disk_bytenr == 0 {
                             let (cmd, attrs) =
                                 build_update_extent_command(&path, file_offset, num_bytes);
                             let refs: Vec<(SendAttr, &[u8])> =
@@ -5608,18 +5994,11 @@ where
                                 } else {
                                     &[]
                                 };
-                                if !data.is_empty() {
-                                    let (cmd, attrs) =
-                                        build_write_command(&path, file_offset, data);
-                                    let refs: Vec<(SendAttr, &[u8])> =
-                                        attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
-                                    builder.add_command(cmd, &refs);
-                                }
+                                emit_write_chunks(&mut builder, &path, file_offset, data);
                             }
                             // Skip extent on read error
                         }
                     }
-                    // type 2 = prealloc, skip for now
                 }
 
                 // Truncate to exact size
@@ -5789,6 +6168,223 @@ mod tests {
     const ITEM_SIZE: usize = 25;
     const KEY_PTR_SIZE: usize = 33;
 
+    #[test]
+    fn build_extent_csum_item_packs_one_crc32c_per_sector_bd_x3fcu() {
+        let sectorsize = 4096_usize;
+        // Two sectors with distinct, recognizable content.
+        let mut data = vec![0xAB_u8; sectorsize];
+        data.extend(std::iter::repeat_n(0xCD_u8, sectorsize));
+
+        let disk_bytenr = 0x1_0000_u64;
+        let (key, value) = build_extent_csum_item(disk_bytenr, &data, sectorsize)
+            .expect("aligned two-sector extent");
+
+        // Key identifies the csum tree's single EXTENT_CSUM objectid, the
+        // EXTENT_CSUM item type, and the extent's logical start as the offset.
+        assert_eq!(key.objectid, BTRFS_EXTENT_CSUM_OBJECTID);
+        assert_eq!(
+            key.objectid,
+            u64::from_le_bytes((-10_i64).to_le_bytes()),
+            "EXTENT_CSUM objectid is -10"
+        );
+        assert_eq!(key.item_type, BTRFS_ITEM_EXTENT_CSUM);
+        assert_eq!(key.item_type, 128);
+        assert_eq!(key.offset, disk_bytenr);
+
+        // One crc32c per sector, packed densely little-endian.
+        assert_eq!(value.len(), 2 * BTRFS_CRC32C_CSUM_SIZE);
+        let expect0 = ffs_types::crc32c(&data[..sectorsize]).to_le_bytes();
+        let expect1 = ffs_types::crc32c(&data[sectorsize..]).to_le_bytes();
+        assert_eq!(&value[0..4], &expect0);
+        assert_eq!(&value[4..8], &expect1);
+        // Distinct sector content yields distinct checksums (no accidental
+        // whole-extent hashing).
+        assert_ne!(&value[0..4], &value[4..8]);
+    }
+
+    #[test]
+    fn build_extent_csum_item_rejects_misaligned_or_empty_bd_x3fcu() {
+        // Not a whole multiple of sectorsize.
+        assert!(matches!(
+            build_extent_csum_item(0, &[0u8; 4097], 4096),
+            Err(BtrfsMutationError::InvalidConfig(_))
+        ));
+        // Empty extent.
+        assert!(matches!(
+            build_extent_csum_item(0, &[], 4096),
+            Err(BtrfsMutationError::InvalidConfig(_))
+        ));
+        // Zero sectorsize.
+        assert!(matches!(
+            build_extent_csum_item(0, &[0u8; 8], 0),
+            Err(BtrfsMutationError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn build_extent_csum_items_splits_large_extent_across_leaf_sized_items_bd_x3fcu() {
+        let sectorsize = 4096_usize;
+        let max_per_item = 2_usize; // force splitting
+        // 5 sectors with distinct content -> ceil(5/2) = 3 items (2,2,1).
+        let mut data = Vec::new();
+        for s in 0..5_u8 {
+            data.extend(std::iter::repeat_n(0xA0 | s, sectorsize));
+        }
+        let disk_bytenr = 0x40_000_u64;
+        let items =
+            build_extent_csum_items(disk_bytenr, &data, sectorsize, max_per_item).expect("split");
+
+        assert_eq!(items.len(), 3, "5 sectors / 2 per item = 3 items");
+        // Item keys advance by max_per_item*sectorsize from disk_bytenr.
+        assert_eq!(items[0].0.offset, disk_bytenr);
+        assert_eq!(items[1].0.offset, disk_bytenr + 2 * sectorsize as u64);
+        assert_eq!(items[2].0.offset, disk_bytenr + 4 * sectorsize as u64);
+        // All keys carry the EXTENT_CSUM objectid + type.
+        for (k, _) in &items {
+            assert_eq!(k.objectid, BTRFS_EXTENT_CSUM_OBJECTID);
+            assert_eq!(k.item_type, BTRFS_ITEM_EXTENT_CSUM);
+        }
+        // Value lengths: 2,2,1 csums * 4 bytes.
+        assert_eq!(items[0].1.len(), 2 * BTRFS_CRC32C_CSUM_SIZE);
+        assert_eq!(items[1].1.len(), 2 * BTRFS_CRC32C_CSUM_SIZE);
+        assert_eq!(items[2].1.len(), BTRFS_CRC32C_CSUM_SIZE);
+        // Concatenating all item values reproduces the single-item packing
+        // (proves the split is a faithful partition, not a recompute).
+        let whole = build_extent_csum_item(disk_bytenr, &data, sectorsize)
+            .expect("single")
+            .1;
+        let joined: Vec<u8> = items.iter().flat_map(|(_, v)| v.clone()).collect();
+        assert_eq!(joined, whole);
+    }
+
+    #[test]
+    fn build_extent_csum_items_single_item_when_under_limit_bd_x3fcu() {
+        let sectorsize = 4096_usize;
+        let data = vec![0x5A_u8; sectorsize * 3];
+        let items = build_extent_csum_items(0x1000, &data, sectorsize, 8).expect("fits");
+        assert_eq!(
+            items.len(),
+            1,
+            "3 sectors under the 8-per-item limit = 1 item"
+        );
+        assert_eq!(items[0].1.len(), 3 * BTRFS_CRC32C_CSUM_SIZE);
+    }
+
+    #[test]
+    fn max_data_csums_per_item_matches_leaf_geometry_bd_x3fcu() {
+        // (nodesize - 101 - 25) / 4, floored, min 1.
+        assert_eq!(max_data_csums_per_item(4096), (4096 - 126) / 4);
+        assert_eq!(max_data_csums_per_item(16384), (16384 - 126) / 4);
+        // Degenerate tiny nodesize never returns 0.
+        assert_eq!(max_data_csums_per_item(64), 1);
+    }
+
+    #[test]
+    fn build_extent_csum_items_rejects_bad_args_bd_x3fcu() {
+        assert!(matches!(
+            build_extent_csum_items(0, &[0u8; 4096], 4096, 0),
+            Err(BtrfsMutationError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            build_extent_csum_items(0, &[0u8; 4097], 4096, 4),
+            Err(BtrfsMutationError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            build_extent_csum_items(0, &[], 4096, 4),
+            Err(BtrfsMutationError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn verify_extent_csum_accepts_matching_and_flags_corruption_bd_x3fcu() {
+        let sectorsize = 4096_usize;
+        let mut data = vec![0xC3_u8; sectorsize];
+        data.extend(std::iter::repeat_n(0x7E_u8, sectorsize)); // 2 sectors
+        let (_key, csums) = build_extent_csum_item(0x1000, &data, sectorsize).expect("build csums");
+
+        // Faithful data verifies clean (round-trip with the builder).
+        assert_eq!(verify_extent_csum(&data, sectorsize, &csums), Ok(()));
+
+        // Corrupt one byte in the SECOND sector -> mismatch reported at sector 1
+        // with the recomputed crc, sector 0 still considered good.
+        let mut corrupt = data.clone();
+        corrupt[sectorsize + 10] ^= 0xFF;
+        let expected_good = ffs_types::crc32c(&data[sectorsize..]);
+        let result = verify_extent_csum(&corrupt, sectorsize, &csums);
+        assert!(
+            matches!(result, Err(Ok(_))),
+            "expected a sector mismatch, got {result:?}"
+        );
+        if let Err(Ok(m)) = result {
+            assert_eq!(m.sector_index, 1);
+            assert_eq!(m.expected, expected_good);
+            assert_ne!(m.actual, m.expected);
+        }
+    }
+
+    #[test]
+    fn verify_extent_csum_rejects_bad_args_bd_x3fcu() {
+        // Zero sectorsize.
+        assert!(matches!(
+            verify_extent_csum(&[0u8; 8], 0, &[0u8; 8]),
+            Err(Err(BtrfsMutationError::InvalidConfig(_)))
+        ));
+        // Non-multiple data.
+        assert!(matches!(
+            verify_extent_csum(&[0u8; 4097], 4096, &[0u8; 4]),
+            Err(Err(BtrfsMutationError::InvalidConfig(_)))
+        ));
+        // Wrong csum length (2 sectors but only 1 csum).
+        assert!(matches!(
+            verify_extent_csum(&[0u8; 8192], 4096, &[0u8; 4]),
+            Err(Err(BtrfsMutationError::InvalidConfig(_)))
+        ));
+    }
+
+    #[test]
+    fn lookup_data_block_csum_finds_block_across_split_items_bd_x3fcu() {
+        let sectorsize = 4096_usize;
+        let base = 0x80_000_u64;
+        // 5 distinct sectors, split into items of 2 -> 3 items at base, base+2*ss, base+4*ss.
+        let mut data = Vec::new();
+        for s in 0..5_u8 {
+            data.extend(std::iter::repeat_n(0x10 | s, sectorsize));
+        }
+        let items = build_extent_csum_items(base, &data, sectorsize, 2).expect("split");
+        assert_eq!(items.len(), 3);
+
+        let ss = u64::try_from(sectorsize).unwrap();
+        // Every sector resolves to the same crc the single-item builder packs.
+        for s in 0..5_usize {
+            let off = s * sectorsize;
+            let bytenr = base + u64::try_from(off).unwrap();
+            let want = ffs_types::crc32c(&data[off..off + sectorsize]);
+            assert_eq!(
+                lookup_data_block_csum(&items, bytenr, sectorsize),
+                Some(want),
+                "sector {s} (crosses item boundaries at 2 and 4)"
+            );
+        }
+
+        // Misses: before the run, past the run, and a non-sector-aligned bytenr.
+        assert_eq!(lookup_data_block_csum(&items, base - ss, sectorsize), None);
+        assert_eq!(
+            lookup_data_block_csum(&items, base + 5 * ss, sectorsize),
+            None
+        );
+        assert_eq!(lookup_data_block_csum(&items, base + 100, sectorsize), None);
+        // Unrelated key types are ignored.
+        let noise = vec![(
+            BtrfsKey {
+                objectid: 5,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: base,
+            },
+            vec![0xFF_u8; 4],
+        )];
+        assert_eq!(lookup_data_block_csum(&noise, base, sectorsize), None);
+    }
+
     fn test_key(objectid: u64) -> BtrfsKey {
         BtrfsKey {
             objectid,
@@ -5938,6 +6534,7 @@ mod tests {
             generation: 1,
             root: 0,
             chunk_root: root_logical,
+            chunk_root_generation: 1,
             log_root: 0,
             total_bytes: 0,
             bytes_used: 0,
@@ -6041,6 +6638,116 @@ mod tests {
         assert_eq!(entries[0].data, vec![1, 2, 3, 4]);
         assert_eq!(entries[1].key.objectid, 512);
         assert_eq!(entries[1].data, vec![5, 6, 7, 8]);
+    }
+
+    /// Build a 2-level tree: one internal root with `objectids.len()` leaf
+    /// children, each leaf holding a single item keyed `(objectid, 1, 0)` with a
+    /// 4-byte payload. Returns the block map and the root logical address.
+    fn build_two_level_tree(objectids: &[u64]) -> (HashMap<u64, Vec<u8>>, u64) {
+        let root_logical = 0x1_0000_u64;
+        let mut root = vec![0_u8; NODESIZE as usize];
+        let nritems = u32::try_from(objectids.len()).expect("test child count fits u32");
+        write_header(&mut root, root_logical, nritems, 1, 1, 10);
+        let mut blocks: HashMap<u64, Vec<u8>> = HashMap::new();
+        for (i, &oid) in objectids.iter().enumerate() {
+            let leaf_logical = 0x2_0000_u64 + (i as u64) * 0x1_0000;
+            write_key_ptr(&mut root, i, oid, 1, leaf_logical, 10);
+            let mut leaf = vec![0_u8; NODESIZE as usize];
+            write_header(&mut leaf, leaf_logical, 1, 0, 5, 10);
+            write_leaf_item(&mut leaf, 0, oid, 1, 2000, 4);
+            let payload = u32::try_from(oid).unwrap_or(0).to_le_bytes();
+            leaf[2000..2004].copy_from_slice(&payload);
+            stamp_tree_block_crc32c(&mut leaf);
+            blocks.insert(leaf_logical, leaf);
+        }
+        stamp_tree_block_crc32c(&mut root);
+        blocks.insert(root_logical, root);
+        (blocks, root_logical)
+    }
+
+    #[test]
+    fn walk_tree_range_isomorphic_to_filtered_full_walk_and_prunes_reads() {
+        // 8 leaves spread across the keyspace under a single internal root.
+        let oids: Vec<u64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
+        let (blocks, root_logical) = build_two_level_tree(&oids);
+        let chunks = identity_chunks();
+
+        let key = |oid: u64| BtrfsKey {
+            objectid: oid,
+            item_type: 0,
+            offset: 0,
+        };
+
+        // Probe a spread of half-open ranges, including empty, single-hit,
+        // multi-hit, boundary, and whole-tree.
+        let ranges = [
+            (key(0), key(50)),     // empty (below everything)
+            (key(300), key(301)),  // single leaf
+            (key(250), key(650)),  // spans 300,400,500,600
+            (key(800), key(900)),  // last leaf only
+            (key(0), key(10_000)), // whole tree
+            (key(401), key(599)),  // gap-only: hits leaf keyed 500
+        ];
+
+        for (lo, hi) in ranges {
+            // Reference: full walk, filtered to [lo, hi) in plain code.
+            let mut full_reads = 0_u32;
+            let mut read_full = |phys: u64| -> Result<Vec<u8>, ParseError> {
+                full_reads += 1;
+                blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                    field: "physical",
+                    reason: "block not in test image",
+                })
+            };
+            let full =
+                walk_tree(&mut read_full, &chunks, root_logical, NODESIZE, 0).expect("full walk");
+            let expected: Vec<_> = full
+                .into_iter()
+                .filter(|e| {
+                    key_cmp(&e.key, &lo) != Ordering::Less && key_cmp(&e.key, &hi) == Ordering::Less
+                })
+                .collect();
+
+            // Targeted descent.
+            let mut range_reads = 0_u32;
+            let mut read_range = |phys: u64| -> Result<Vec<u8>, ParseError> {
+                range_reads += 1;
+                blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                    field: "physical",
+                    reason: "block not in test image",
+                })
+            };
+            let got = walk_tree_range(&mut read_range, &chunks, root_logical, NODESIZE, 0, lo, hi)
+                .expect("range walk");
+
+            // Isomorphism: identical entries (key + data), identical order.
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "range [{lo:?},{hi:?}) entry count"
+            );
+            for (g, e) in got.iter().zip(expected.iter()) {
+                assert_eq!(g.key, e.key, "range [{lo:?},{hi:?}) key");
+                assert_eq!(g.data, e.data, "range [{lo:?},{hi:?}) data");
+            }
+
+            // Pruning: the targeted walk never reads MORE nodes than the full
+            // walk, and reads strictly fewer whenever the range excludes at
+            // least one leaf (every probe here except the whole-tree one).
+            assert!(
+                range_reads <= full_reads,
+                "range [{lo:?},{hi:?}) read {range_reads} > full {full_reads}"
+            );
+            let hits = got.len();
+            // full_reads = 1 root + 8 leaves = 9; targeted = 1 root + (leaves touched).
+            // Touched leaves <= hits + 1 boundary leaf, always < 8 for these probes.
+            if hits < oids.len() {
+                assert!(
+                    range_reads < full_reads,
+                    "range [{lo:?},{hi:?}) hit {hits} leaves but read {range_reads} (no pruning vs full {full_reads})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6330,6 +7037,117 @@ mod tests {
             tree.root_level() >= 1,
             "expected root_level >= 1 after splits, got {}",
             tree.root_level()
+        );
+    }
+
+    #[test]
+    fn writeback_dag_assigns_true_per_node_levels_bd_iv5uy() {
+        use crate::writeback::WriteDependencyDag;
+        use std::collections::{BTreeSet, VecDeque};
+
+        // max_items=3 → a 3-level tree needs > 3*3 leaf items; 40 forces height>=3.
+        let mut tree = InMemoryCowBtrfsTree::new(3).expect("tree");
+        for objectid in 1_u64..=40 {
+            tree.insert(test_key(objectid), &test_payload(objectid))
+                .expect("insert");
+        }
+        let root_level = tree.root_level();
+        assert!(
+            root_level >= 2,
+            "test needs a height>=3 tree, got root_level {root_level}"
+        );
+
+        let dag = WriteDependencyDag::from_cow_tree(&tree, 7).expect("dag");
+
+        // BFS the tree: every node's DAG level must equal its true depth
+        // (root_level - depth from the root), i.e. leaves 0, parents-of-leaves
+        // 1, ..., root = root_level. The pre-fix code gave every internal node
+        // level == root_level, so a middle internal at level 1 proves the fix.
+        let mut levels_seen = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back((tree.root_block(), 0_u8));
+        while let Some((block, depth)) = queue.pop_front() {
+            if !visited.insert(block) {
+                continue;
+            }
+            let expected = root_level - depth;
+            let got = dag.node_level(block).expect("block present in dag");
+            assert_eq!(
+                got, expected,
+                "block {block} at true depth {depth} should have level {expected}, got {got}"
+            );
+            levels_seen.insert(got);
+            if let BtrfsCowNode::Internal { children, .. } =
+                tree.node_snapshot(block).expect("snapshot")
+            {
+                for child in children {
+                    queue.push_back((child, depth + 1));
+                }
+            }
+        }
+
+        // A genuine height-3 tree spans levels 0, 1 and 2 — the pre-fix code
+        // could only ever emit level 0 (leaves) and root_level (all internals).
+        assert!(
+            levels_seen.contains(&0) && levels_seen.contains(&1) && levels_seen.contains(&2),
+            "expected node levels 0, 1 and 2 to be present, got {levels_seen:?}"
+        );
+    }
+
+    #[test]
+    fn cow_tree_delete_stress_maintains_invariants_at_height3() {
+        use std::collections::BTreeSet;
+
+        // Build a height>=3 tree, then delete every key in an interleaved order
+        // (evens then odds) so merges/borrows fire across ALL internal levels —
+        // previously only the height 2->1 collapse was covered.
+        let mut tree = InMemoryCowBtrfsTree::new(3).expect("tree");
+        let n: u64 = 60;
+        for oid in 1..=n {
+            tree.insert(test_key(oid), &test_payload(oid)).expect("insert");
+        }
+        assert!(
+            tree.height().expect("height") >= 3,
+            "test needs a height>=3 tree, got {}",
+            tree.height().expect("height")
+        );
+        tree.validate_invariants().expect("invariants after build");
+
+        let order: Vec<u64> = (1..=n)
+            .filter(|x| x % 2 == 0)
+            .chain((1..=n).filter(|x| x % 2 == 1))
+            .collect();
+        let mut remaining: BTreeSet<u64> = (1..=n).collect();
+        for oid in order {
+            tree.delete(&test_key(oid)).expect("delete");
+            remaining.remove(&oid);
+
+            // The tree must remain a valid, balanced btree after every delete.
+            tree.validate_invariants()
+                .unwrap_or_else(|e| panic!("invariants broken after deleting {oid}: {e:?}"));
+
+            // The deleted key is gone and every remaining key still reads back.
+            assert!(
+                tree.get(&test_key(oid)).is_none(),
+                "deleted key {oid} still present"
+            );
+            for &r in &remaining {
+                let got = tree
+                    .get(&test_key(r))
+                    .unwrap_or_else(|| panic!("key {r} lost after deleting {oid}"));
+                assert_eq!(
+                    got,
+                    test_payload(r).to_vec(),
+                    "key {r} payload corrupted after deleting {oid}"
+                );
+            }
+        }
+        assert!(remaining.is_empty());
+        assert_eq!(
+            tree.root_level(),
+            0,
+            "a fully drained tree collapses back to a leaf root"
         );
     }
 
@@ -10599,6 +11417,38 @@ mod tests {
             used_bytes: 0,
             flags: BTRFS_BLOCK_GROUP_METADATA,
         }
+    }
+
+    #[test]
+    fn alloc_data_and_metadata_do_not_overlap_on_mixed_block_group_bd_s0ogm() {
+        // On a single mixed DATA|METADATA block group, a data extent and a
+        // subsequently allocated metadata extent must not share physical space
+        // (else a metadata commit would overwrite freshly written data).
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(
+            0,
+            BtrfsBlockGroupItem {
+                total_bytes: 1 << 20,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+
+        let data = alloc.alloc_data(4096).expect("alloc data");
+        let meta = alloc
+            .alloc_metadata_for_tree(4096, BTRFS_FS_TREE_OBJECTID, 0)
+            .expect("alloc metadata");
+
+        let data_end = data.bytenr + 4096;
+        let meta_end = meta.bytenr + 4096;
+        assert!(
+            data_end <= meta.bytenr || meta_end <= data.bytenr,
+            "data [{:#x},{:#x}) and metadata [{:#x},{:#x}) overlap on a mixed block group",
+            data.bytenr,
+            data_end,
+            meta.bytenr,
+            meta_end
+        );
     }
 
     #[test]
@@ -15413,6 +16263,7 @@ mod tests {
             generation: 100,
             root: 0x10000,
             chunk_root: 0x20000,
+            chunk_root_generation: 100,
             log_root: 0,
             total_bytes: 1_000_000_000,
             bytes_used: 500_000,
@@ -15831,5 +16682,273 @@ mod tests {
             cmd_types.contains(&SendCommand::Utimes),
             "should have utimes command"
         );
+    }
+
+    /// Regression: a file extent larger than the u16 TLV limit must be split
+    /// into multiple `Write` commands, each carrying a `DATA` attribute within
+    /// the 65535-byte ceiling, and the reassembled payload must equal the
+    /// original extent bytes. Before chunking, the whole extent went into a
+    /// single attribute whose length silently wrapped mod 65536, producing a
+    /// corrupt, unparseable stream for any file with a >64 KiB extent.
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn generate_send_stream_chunks_large_writes() {
+        const ATTR_DATA: u16 = SendAttr::Data as u16;
+        const ATTR_FILE_OFFSET: u16 = SendAttr::FileOffset as u16;
+
+        fn make_inode_item(mode: u32, size: u64, uid: u32, gid: u32) -> Vec<u8> {
+            let mut buf = vec![0u8; 160];
+            buf[0..8].copy_from_slice(&1_u64.to_le_bytes());
+            buf[16..24].copy_from_slice(&size.to_le_bytes());
+            buf[24..32].copy_from_slice(&size.to_le_bytes());
+            buf[40..44].copy_from_slice(&1_u32.to_le_bytes());
+            buf[44..48].copy_from_slice(&uid.to_le_bytes());
+            buf[48..52].copy_from_slice(&gid.to_le_bytes());
+            buf[52..56].copy_from_slice(&mode.to_le_bytes());
+            buf
+        }
+
+        #[expect(clippy::cast_possible_truncation)]
+        fn make_inode_ref(index: u64, name: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&index.to_le_bytes());
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name);
+            buf
+        }
+
+        // Regular (non-inline) EXTENT_DATA item (type 1) header layout consumed
+        // by `generate_send_stream`: byte 20 = type, 21..29 disk_bytenr,
+        // 29..37 disk_num_bytes, 37..45 extent_offset, 45..53 num_bytes.
+        fn make_regular_extent(disk_bytenr: u64, num_bytes: u64) -> Vec<u8> {
+            let mut buf = vec![0u8; 53];
+            buf[20] = 1;
+            buf[21..29].copy_from_slice(&disk_bytenr.to_le_bytes());
+            buf[29..37].copy_from_slice(&num_bytes.to_le_bytes());
+            buf[37..45].copy_from_slice(&0u64.to_le_bytes());
+            buf[45..53].copy_from_slice(&num_bytes.to_le_bytes());
+            buf
+        }
+
+        // 100_000 bytes spans three 48 KiB chunks (48K + 48K + ~4K) and exceeds
+        // the u16 ceiling, so a single-attribute encoding would corrupt.
+        const EXTENT_LEN: u64 = 100_000;
+        const DISK_BYTENR: u64 = 0x1_0000;
+        let original: Vec<u8> = (0..EXTENT_LEN).map(|i| (i % 251) as u8).collect();
+
+        let items = vec![
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: 256,
+                    item_type: BTRFS_ITEM_INODE_ITEM,
+                    offset: 0,
+                },
+                data: make_inode_item(0o40755, 0, 0, 0),
+            },
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: 257,
+                    item_type: BTRFS_ITEM_INODE_ITEM,
+                    offset: 0,
+                },
+                data: make_inode_item(0o100_644, EXTENT_LEN, 0, 0),
+            },
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: 257,
+                    item_type: BTRFS_ITEM_INODE_REF,
+                    offset: 256,
+                },
+                data: make_inode_ref(2, b"big.bin"),
+            },
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: 257,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: 0,
+                },
+                data: make_regular_extent(DISK_BYTENR, EXTENT_LEN),
+            },
+        ];
+
+        let uuid = [0u8; 16];
+        let original_for_read = original.clone();
+        let stream = generate_send_stream(&items, b"test_subvol", &uuid, 1, |bytenr, len| {
+            assert_eq!(bytenr, DISK_BYTENR, "unexpected extent read");
+            let len = usize::try_from(len).expect("len fits usize");
+            Ok(original_for_read[..len].to_vec())
+        })
+        .expect("generate send stream");
+
+        // The stream must round-trip through the parser (it would not if any
+        // attribute length had wrapped).
+        let parsed = parse_send_stream(&stream).expect("parse chunked stream");
+
+        let writes: Vec<&SendStreamCommand> = parsed
+            .commands
+            .iter()
+            .filter(|c| c.cmd == SendCommand::Write)
+            .collect();
+        assert!(
+            writes.len() >= 2,
+            "large extent must split into multiple writes, got {}",
+            writes.len()
+        );
+
+        // Reassemble the file from the Write commands, keyed by file offset, and
+        // confirm every DATA attribute respects the u16 TLV ceiling.
+        let mut reassembled = vec![0u8; original.len()];
+        for w in &writes {
+            let mut offset: Option<u64> = None;
+            let mut data: Option<&[u8]> = None;
+            for (atype, adata) in &w.attrs {
+                if *atype == ATTR_FILE_OFFSET {
+                    offset = Some(u64::from_le_bytes(
+                        adata.as_slice().try_into().expect("8-byte file offset"),
+                    ));
+                } else if *atype == ATTR_DATA {
+                    assert!(
+                        u16::try_from(adata.len()).is_ok(),
+                        "DATA attribute exceeds u16 TLV limit: {}",
+                        adata.len()
+                    );
+                    data = Some(adata);
+                }
+            }
+            let offset =
+                usize::try_from(offset.expect("write has file offset")).expect("offset fits usize");
+            let data = data.expect("write has data");
+            reassembled[offset..offset + data.len()].copy_from_slice(data);
+        }
+
+        assert_eq!(
+            reassembled, original,
+            "reassembled file must match original"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn generate_send_stream_prealloc_extent_emits_update_extent() {
+        const ATTR_PATH: u16 = SendAttr::Path as u16;
+        const ATTR_FILE_OFFSET: u16 = SendAttr::FileOffset as u16;
+        const ATTR_SIZE: u16 = SendAttr::Size as u16;
+        const FILE_OFFSET: u64 = 8192;
+        const PREALLOC_LEN: u64 = 16_384;
+
+        fn make_inode_item(mode: u32, size: u64, uid: u32, gid: u32) -> Vec<u8> {
+            let mut buf = vec![0u8; 160];
+            buf[0..8].copy_from_slice(&1_u64.to_le_bytes());
+            buf[16..24].copy_from_slice(&size.to_le_bytes());
+            buf[24..32].copy_from_slice(&size.to_le_bytes());
+            buf[40..44].copy_from_slice(&1_u32.to_le_bytes());
+            buf[44..48].copy_from_slice(&uid.to_le_bytes());
+            buf[48..52].copy_from_slice(&gid.to_le_bytes());
+            buf[52..56].copy_from_slice(&mode.to_le_bytes());
+            buf
+        }
+
+        #[expect(clippy::cast_possible_truncation)]
+        fn make_inode_ref(index: u64, name: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&index.to_le_bytes());
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name);
+            buf
+        }
+
+        fn make_prealloc_extent(disk_bytenr: u64, disk_num_bytes: u64, num_bytes: u64) -> Vec<u8> {
+            let mut buf = vec![0u8; 53];
+            buf[20] = BTRFS_FILE_EXTENT_PREALLOC;
+            buf[21..29].copy_from_slice(&disk_bytenr.to_le_bytes());
+            buf[29..37].copy_from_slice(&disk_num_bytes.to_le_bytes());
+            buf[37..45].copy_from_slice(&0_u64.to_le_bytes());
+            buf[45..53].copy_from_slice(&num_bytes.to_le_bytes());
+            buf
+        }
+
+        fn attr_u64(command: &SendStreamCommand, attr: u16) -> u64 {
+            let raw = command
+                .attrs
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == attr).then_some(value.as_slice()))
+                .expect("attribute should exist");
+            u64::from_le_bytes(raw.try_into().expect("attribute should be u64"))
+        }
+
+        let items = vec![
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: 257,
+                    item_type: BTRFS_ITEM_INODE_ITEM,
+                    offset: 0,
+                },
+                data: make_inode_item(0o100_644, FILE_OFFSET + PREALLOC_LEN, 0, 0),
+            },
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: 257,
+                    item_type: BTRFS_ITEM_INODE_REF,
+                    offset: BTRFS_FIRST_FREE_OBJECTID,
+                },
+                data: make_inode_ref(1, b"prealloc.bin"),
+            },
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: 257,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: FILE_OFFSET,
+                },
+                data: make_prealloc_extent(0x40_0000, PREALLOC_LEN, PREALLOC_LEN),
+            },
+        ];
+
+        let uuid = [0_u8; 16];
+        let mut read_extent_called = false;
+        let stream = generate_send_stream(&items, b"test_subvol", &uuid, 1, |_bytenr, _len| {
+            read_extent_called = true;
+            Err(ffs_types::ParseError::InvalidField {
+                field: "test",
+                reason: "prealloc extents must not read disk bytes",
+            })
+        })
+        .expect("generate send stream");
+
+        assert!(
+            !read_extent_called,
+            "preallocated extents are unwritten and must not call read_extent"
+        );
+
+        let parsed = parse_send_stream(&stream).expect("parse generated stream");
+        let cmd_types: Vec<_> = parsed.commands.iter().map(|c| c.cmd).collect();
+        assert!(
+            cmd_types.contains(&SendCommand::Mkfile),
+            "regular file should still be created"
+        );
+        assert!(
+            !cmd_types.contains(&SendCommand::Write),
+            "preallocated unwritten extent must not emit file data"
+        );
+
+        let update_extents: Vec<_> = parsed
+            .commands
+            .iter()
+            .filter(|command| command.cmd == SendCommand::UpdateExtent)
+            .collect();
+        assert_eq!(
+            update_extents.len(),
+            1,
+            "exactly one UpdateExtent command should preserve the prealloc range"
+        );
+
+        let update = update_extents[0];
+        let path = update
+            .attrs
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == ATTR_PATH).then_some(value.as_slice()))
+            .expect("UpdateExtent should carry path");
+        assert_eq!(path, b"test_subvol/prealloc.bin");
+        assert_eq!(attr_u64(update, ATTR_FILE_OFFSET), FILE_OFFSET);
+        assert_eq!(attr_u64(update, ATTR_SIZE), PREALLOC_LEN);
     }
 }

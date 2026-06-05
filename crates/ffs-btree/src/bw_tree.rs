@@ -12,7 +12,7 @@
 
 use crossbeam_epoch as epoch;
 use ffs_error::{FfsError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error as IoError, ErrorKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -29,6 +29,7 @@ const MAX_CHAIN_DEPTH: usize = 16_384;
 /// when its base node was perfectly valid.
 const MAX_CHAIN_WALK: usize = MAX_CHAIN_DEPTH * 2;
 const DEFAULT_CONSOLIDATION_THRESHOLD: usize = 16;
+const DEFAULT_MESSAGE_BUFFER_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BwKey(pub u64);
@@ -57,6 +58,14 @@ pub enum PageDelta {
     },
     Merge {
         removed_sibling: PageId,
+        next: Arc<Self>,
+    },
+    MessageBuffer {
+        messages: BTreeMap<BwKey, BufferedMutation>,
+        next: Arc<Self>,
+    },
+    AppendRun {
+        entries: Arc<Vec<(BwKey, BwValue)>>,
         next: Arc<Self>,
     },
     Base {
@@ -93,7 +102,9 @@ impl Drop for PageDelta {
             Self::Insert { next, .. }
             | Self::Delete { next, .. }
             | Self::Split { next, .. }
-            | Self::Merge { next, .. } => std::mem::replace(next, Self::empty_base()),
+            | Self::Merge { next, .. }
+            | Self::MessageBuffer { next, .. }
+            | Self::AppendRun { next, .. } => std::mem::replace(next, Self::empty_base()),
             Self::Base { .. } => return,
         };
         // `self`'s default field-drops still run after this method returns,
@@ -106,7 +117,11 @@ impl Drop for PageDelta {
                         Self::Insert { next, .. }
                         | Self::Delete { next, .. }
                         | Self::Split { next, .. }
-                        | Self::Merge { next, .. } => std::mem::replace(next, Self::empty_base()),
+                        | Self::Merge { next, .. }
+                        | Self::MessageBuffer { next, .. }
+                        | Self::AppendRun { next, .. } => {
+                            std::mem::replace(next, Self::empty_base())
+                        }
                         Self::Base { .. } => return,
                     };
                     // `node` is dropped at the end of this arm; recursing
@@ -129,6 +144,7 @@ impl Drop for PageDelta {
 pub struct PageSnapshot {
     pub epoch: u64,
     pub head: Arc<PageDelta>,
+    pub chain_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,16 +165,49 @@ pub enum DeltaMutation {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferedMutation {
+    Insert(BwValue),
+    Delete,
+}
+
+enum MessageBufferAppend {
+    Buffered {
+        new_head: Arc<PageDelta>,
+        new_chain_len: usize,
+    },
+    FlushRequired,
+}
+
+#[derive(Debug)]
+struct PageHead {
+    delta: Arc<PageDelta>,
+    chain_len: usize,
+}
+
+impl PageHead {
+    fn empty() -> Self {
+        Self {
+            delta: PageDelta::empty_base(),
+            chain_len: 1,
+        }
+    }
+
+    fn new(delta: Arc<PageDelta>, chain_len: usize) -> Self {
+        Self { delta, chain_len }
+    }
+}
+
 #[derive(Debug)]
 struct MappingEntry {
-    head: RwLock<Arc<PageDelta>>,
+    head: RwLock<PageHead>,
     epoch: AtomicU64,
 }
 
 impl MappingEntry {
     fn new() -> Self {
         Self {
-            head: RwLock::new(PageDelta::empty_base()),
+            head: RwLock::new(PageHead::empty()),
             epoch: AtomicU64::new(0),
         }
     }
@@ -215,8 +264,12 @@ impl MappingTable {
     pub fn get_page(&self, page_id: PageId) -> Result<PageSnapshot> {
         let entry = self.entry(page_id)?;
         let epoch = entry.epoch.load(Ordering::Acquire);
-        let head = Arc::clone(&read_lock(&entry.head));
-        Ok(PageSnapshot { epoch, head })
+        let head_guard = read_lock(&entry.head);
+        Ok(PageSnapshot {
+            epoch,
+            head: Arc::clone(&head_guard.delta),
+            chain_len: head_guard.chain_len,
+        })
     }
 
     pub fn cas_page(
@@ -224,6 +277,7 @@ impl MappingTable {
         page_id: PageId,
         expected_epoch: u64,
         new_head: Arc<PageDelta>,
+        new_chain_len: usize,
     ) -> Result<bool> {
         let entry = self.entry(page_id)?;
         trace!(
@@ -240,8 +294,9 @@ impl MappingTable {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                let old_head = Arc::clone(&head_guard);
-                *head_guard = new_head;
+                debug_assert_eq!(chain_length(&new_head), new_chain_len);
+                let old_head = Arc::clone(&head_guard.delta);
+                *head_guard = PageHead::new(new_head, new_chain_len);
                 defer_reclaim(old_head);
                 debug!(
                     target: "ffs::bwtree",
@@ -270,11 +325,37 @@ impl MappingTable {
             let snapshot = self.get_page(page_id)?;
             let _guard = epoch::pin();
 
-            let chain_len = chain_length(&snapshot.head);
-            if chain_len >= MAX_CHAIN_DEPTH {
+            match message_buffer_append(mutation, &snapshot) {
+                Some(MessageBufferAppend::Buffered {
+                    new_head,
+                    new_chain_len,
+                }) => {
+                    if self.cas_page(page_id, snapshot.epoch, new_head, new_chain_len)? {
+                        return Ok(attempt);
+                    }
+                    continue;
+                }
+                Some(MessageBufferAppend::FlushRequired) => {
+                    let (new_head, new_chain_len) =
+                        append_run_or_materialized_base(&snapshot)?;
+                    if self.cas_page(page_id, snapshot.epoch, new_head, new_chain_len)? {
+                        debug!(
+                            target: "ffs::bwtree",
+                            event = "bw_append_message_buffer_flush",
+                            page_id = page_id.0,
+                            capacity = DEFAULT_MESSAGE_BUFFER_CAPACITY
+                        );
+                    }
+                    continue;
+                }
+                None => {}
+            }
+
+            let chain_len = snapshot.chain_len;
+            if chain_len > DEFAULT_CONSOLIDATION_THRESHOLD {
                 let (state, _) = materialize_from_head(&snapshot.head)?;
                 let new_base = Arc::new(PageDelta::Base { entries: state });
-                if self.cas_page(page_id, snapshot.epoch, new_base)? {
+                if self.cas_page(page_id, snapshot.epoch, new_base, 1)? {
                     debug!(
                         target: "ffs::bwtree",
                         event = "bw_append_preconsolidate",
@@ -286,7 +367,7 @@ impl MappingTable {
             }
 
             let new_head = Arc::new(mutation.to_delta(snapshot.head));
-            if self.cas_page(page_id, snapshot.epoch, new_head)? {
+            if self.cas_page(page_id, snapshot.epoch, new_head, snapshot.chain_len + 1)? {
                 return Ok(attempt);
             }
         }
@@ -329,8 +410,16 @@ impl MappingTable {
     }
 
     pub fn lookup(&self, page_id: PageId, key: BwKey) -> Result<Option<BwValue>> {
-        let state = self.materialize_page(page_id)?;
-        Ok(state.get(&key).copied())
+        let snapshot = self.get_page(page_id)?;
+        let (value, chain_len) = lookup_from_head(&snapshot.head, key)?;
+        debug!(
+            target: "ffs::bwtree",
+            event = "bw_lookup_chain_stats",
+            page_id = page_id.0,
+            chain_len,
+            epoch = snapshot.epoch
+        );
+        Ok(value)
     }
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<BTreeMap<BwKey, BwValue>> {
@@ -344,6 +433,24 @@ impl MappingTable {
             epoch = snapshot.epoch
         );
         Ok(state)
+    }
+
+    pub fn range_scan(
+        &self,
+        page_id: PageId,
+        start: BwKey,
+        count: usize,
+    ) -> Result<Vec<(BwKey, BwValue)>> {
+        let snapshot = self.get_page(page_id)?;
+        let (rows, chain_len) = range_scan_from_head(&snapshot.head, start, count)?;
+        debug!(
+            target: "ffs::bwtree",
+            event = "bw_lookup_chain_stats",
+            page_id = page_id.0,
+            chain_len,
+            epoch = snapshot.epoch
+        );
+        Ok(rows)
     }
 
     /// Consolidate a page's delta chain into a fresh base page.
@@ -361,7 +468,7 @@ impl MappingTable {
     ) -> Result<ConsolidationResult> {
         for attempt in 1..=config.max_retries {
             let snapshot = self.get_page(page_id)?;
-            let chain_len_before = chain_length(&snapshot.head);
+            let chain_len_before = snapshot.chain_len;
 
             if chain_len_before <= 1 {
                 // Already a base page (or single delta on base); nothing to do.
@@ -393,7 +500,7 @@ impl MappingTable {
             let entries_count = state.len();
             let new_base = Arc::new(PageDelta::Base { entries: state });
 
-            if self.cas_page(page_id, snapshot.epoch, new_base)? {
+            if self.cas_page(page_id, snapshot.epoch, new_base, 1)? {
                 debug!(
                     target: "ffs::bwtree",
                     event = "bw_consolidate_done",
@@ -439,8 +546,7 @@ impl MappingTable {
         for raw_id in 0..allocated {
             let page_id = PageId(raw_id);
             if let Ok(snapshot) = self.get_page(page_id) {
-                let len = chain_length(&snapshot.head);
-                if len > threshold {
+                if snapshot.chain_len > threshold {
                     candidates.push(page_id);
                 }
             }
@@ -549,7 +655,9 @@ pub fn chain_length(head: &Arc<PageDelta>) -> usize {
             PageDelta::Insert { next, .. }
             | PageDelta::Delete { next, .. }
             | PageDelta::Split { next, .. }
-            | PageDelta::Merge { next, .. } => {
+            | PageDelta::Merge { next, .. }
+            | PageDelta::MessageBuffer { next, .. }
+            | PageDelta::AppendRun { next, .. } => {
                 cursor = Arc::clone(next);
             }
         }
@@ -573,6 +681,120 @@ impl DeltaMutation {
                 removed_sibling,
                 next,
             },
+        }
+    }
+}
+
+fn message_buffer_append(
+    mutation: DeltaMutation,
+    snapshot: &PageSnapshot,
+) -> Option<MessageBufferAppend> {
+    let buffered = BufferedMutation::from_delta(mutation)?;
+    match snapshot.head.as_ref() {
+        PageDelta::MessageBuffer { messages, next } => {
+            let grows = !messages.contains_key(&buffered.key);
+            if grows && messages.len() >= DEFAULT_MESSAGE_BUFFER_CAPACITY {
+                return Some(MessageBufferAppend::FlushRequired);
+            }
+            let mut new_messages = messages.clone();
+            new_messages.insert(buffered.key, buffered.mutation);
+            Some(MessageBufferAppend::Buffered {
+                new_head: Arc::new(PageDelta::MessageBuffer {
+                    messages: new_messages,
+                    next: Arc::clone(next),
+                }),
+                new_chain_len: snapshot.chain_len,
+            })
+        }
+        _ if snapshot.chain_len <= DEFAULT_CONSOLIDATION_THRESHOLD => {
+            let mut messages = BTreeMap::new();
+            messages.insert(buffered.key, buffered.mutation);
+            Some(MessageBufferAppend::Buffered {
+                new_head: Arc::new(PageDelta::MessageBuffer {
+                    messages,
+                    next: Arc::clone(&snapshot.head),
+                }),
+                new_chain_len: snapshot.chain_len + 1,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn append_run_or_materialized_base(snapshot: &PageSnapshot) -> Result<(Arc<PageDelta>, usize)> {
+    if let Some(new_head) = append_run_from_message_buffer(&snapshot.head) {
+        return Ok((new_head, snapshot.chain_len));
+    }
+
+    let (state, _) = materialize_from_head(&snapshot.head)?;
+    Ok((Arc::new(PageDelta::Base { entries: state }), 1))
+}
+
+fn append_run_from_message_buffer(head: &Arc<PageDelta>) -> Option<Arc<PageDelta>> {
+    let PageDelta::MessageBuffer { messages, next } = head.as_ref() else {
+        return None;
+    };
+    let max_key = append_only_max_key(next.as_ref())?;
+    let entries = buffered_insert_run_above(messages, max_key)?;
+    Some(Arc::new(PageDelta::AppendRun {
+        entries: Arc::new(entries),
+        next: Arc::clone(next),
+    }))
+}
+
+fn append_only_max_key(head: &PageDelta) -> Option<Option<BwKey>> {
+    match head {
+        PageDelta::Base { entries } => Some(entries.keys().next_back().copied()),
+        PageDelta::AppendRun { entries, next } => entries
+            .last()
+            .map(|&(key, _)| Some(key))
+            .or_else(|| append_only_max_key(next.as_ref())),
+        PageDelta::Insert { .. }
+        | PageDelta::Delete { .. }
+        | PageDelta::Split { .. }
+        | PageDelta::Merge { .. }
+        | PageDelta::MessageBuffer { .. } => None,
+    }
+}
+
+fn buffered_insert_run_above(
+    messages: &BTreeMap<BwKey, BufferedMutation>,
+    max_key: Option<BwKey>,
+) -> Option<Vec<(BwKey, BwValue)>> {
+    if messages.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(messages.len());
+    for (&key, &message) in messages {
+        if max_key.is_some_and(|bound| key <= bound) {
+            return None;
+        }
+        let BufferedMutation::Insert(value) = message else {
+            return None;
+        };
+        entries.push((key, value));
+    }
+    Some(entries)
+}
+
+struct BufferedMutationEntry {
+    key: BwKey,
+    mutation: BufferedMutation,
+}
+
+impl BufferedMutation {
+    fn from_delta(mutation: DeltaMutation) -> Option<BufferedMutationEntry> {
+        match mutation {
+            DeltaMutation::Insert { key, value } => Some(BufferedMutationEntry {
+                key,
+                mutation: Self::Insert(value),
+            }),
+            DeltaMutation::Delete { key } => Some(BufferedMutationEntry {
+                key,
+                mutation: Self::Delete,
+            }),
+            DeltaMutation::Split { .. } | DeltaMutation::Merge { .. } => None,
         }
     }
 }
@@ -644,7 +866,245 @@ fn materialize_from_head(head: &Arc<PageDelta>) -> Result<(BTreeMap<BwKey, BwVal
             PageDelta::Merge { next, .. } => {
                 cursor = Arc::clone(next);
             }
+            PageDelta::MessageBuffer { messages, next } => {
+                push_buffered_ops(&mut ops, messages);
+                cursor = Arc::clone(next);
+            }
+            PageDelta::AppendRun { entries, next } => {
+                push_append_run_ops(&mut ops, entries);
+                cursor = Arc::clone(next);
+            }
         }
+    }
+}
+
+fn range_scan_from_head(
+    head: &Arc<PageDelta>,
+    start: BwKey,
+    count: usize,
+) -> Result<(Vec<(BwKey, BwValue)>, usize)> {
+    let mut ops: Vec<MaterializeOp> = Vec::new();
+    let mut cursor = Arc::clone(head);
+    let mut chain_len = 0_usize;
+
+    loop {
+        chain_len = chain_len.saturating_add(1);
+        if chain_len > MAX_CHAIN_WALK {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "bw-tree delta chain exceeded walk limit ({MAX_CHAIN_WALK}) without base page"
+                ),
+            });
+        }
+
+        match cursor.as_ref() {
+            PageDelta::Base { entries } => {
+                let rows = bounded_range_from_base(entries, &ops, start, count);
+                return Ok((rows, chain_len));
+            }
+            PageDelta::Insert { key, value, next } => {
+                ops.push(MaterializeOp::Insert {
+                    key: *key,
+                    value: *value,
+                });
+                cursor = Arc::clone(next);
+            }
+            PageDelta::Delete { key, next } => {
+                ops.push(MaterializeOp::Delete { key: *key });
+                cursor = Arc::clone(next);
+            }
+            PageDelta::Split {
+                separator, next, ..
+            } => {
+                ops.push(MaterializeOp::Split {
+                    separator: *separator,
+                });
+                cursor = Arc::clone(next);
+            }
+            PageDelta::Merge { next, .. } => {
+                cursor = Arc::clone(next);
+            }
+            PageDelta::MessageBuffer { messages, next } => {
+                push_buffered_ops(&mut ops, messages);
+                cursor = Arc::clone(next);
+            }
+            PageDelta::AppendRun { entries, next } => {
+                push_append_run_ops(&mut ops, entries);
+                cursor = Arc::clone(next);
+            }
+        }
+    }
+}
+
+fn bounded_range_from_base(
+    entries: &BTreeMap<BwKey, BwValue>,
+    ops: &[MaterializeOp],
+    start: BwKey,
+    count: usize,
+) -> Vec<(BwKey, BwValue)> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let mut delta_values = BTreeMap::new();
+    let mut shadowed_keys = BTreeSet::new();
+    let mut base_upper_bound: Option<BwKey> = None;
+
+    for op in ops {
+        match *op {
+            MaterializeOp::Insert { key, value } => {
+                if key >= start
+                    && !shadowed_keys.contains(&key)
+                    && key_before_bound(key, base_upper_bound)
+                {
+                    delta_values.insert(key, value);
+                }
+                shadowed_keys.insert(key);
+            }
+            MaterializeOp::Delete { key } => {
+                shadowed_keys.insert(key);
+            }
+            MaterializeOp::Split { separator } => {
+                base_upper_bound =
+                    Some(base_upper_bound.map_or(separator, |bound| bound.min(separator)));
+            }
+        }
+    }
+
+    let mut rows = Vec::with_capacity(count);
+    let mut base_iter = entries.range(start..).peekable();
+    let mut delta_iter = delta_values.iter().peekable();
+
+    while rows.len() < count {
+        let next_base = base_iter
+            .peek()
+            .map(|&(&key, &value)| (key, value))
+            .filter(|&(key, _)| key_before_bound(key, base_upper_bound));
+        let next_delta = delta_iter.peek().map(|&(&key, &value)| (key, value));
+
+        match (next_base, next_delta) {
+            (Some((base_key, base_value)), Some((delta_key, delta_value))) => {
+                match base_key.cmp(&delta_key) {
+                    std::cmp::Ordering::Less => {
+                        base_iter.next();
+                        if !shadowed_keys.contains(&base_key) {
+                            rows.push((base_key, base_value));
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        delta_iter.next();
+                        rows.push((delta_key, delta_value));
+                    }
+                    std::cmp::Ordering::Equal => {
+                        base_iter.next();
+                        delta_iter.next();
+                        rows.push((delta_key, delta_value));
+                    }
+                }
+            }
+            (Some((base_key, base_value)), None) => {
+                base_iter.next();
+                if !shadowed_keys.contains(&base_key) {
+                    rows.push((base_key, base_value));
+                }
+            }
+            (None, Some((delta_key, delta_value))) => {
+                delta_iter.next();
+                rows.push((delta_key, delta_value));
+            }
+            (None, None) => break,
+        }
+    }
+
+    rows
+}
+
+fn key_before_bound(key: BwKey, bound: Option<BwKey>) -> bool {
+    bound.is_none_or(|bound| key < bound)
+}
+
+fn lookup_from_head(head: &Arc<PageDelta>, key: BwKey) -> Result<(Option<BwValue>, usize)> {
+    let mut cursor = head.as_ref();
+    let mut chain_len = 0_usize;
+
+    loop {
+        chain_len = chain_len.saturating_add(1);
+        if chain_len > MAX_CHAIN_WALK {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "bw-tree delta chain exceeded walk limit ({MAX_CHAIN_WALK}) without base page"
+                ),
+            });
+        }
+
+        match cursor {
+            PageDelta::Base { entries } => return Ok((entries.get(&key).copied(), chain_len)),
+            PageDelta::Insert {
+                key: delta_key,
+                value,
+                next,
+            } => {
+                if *delta_key == key {
+                    return Ok((Some(*value), chain_len));
+                }
+                cursor = next.as_ref();
+            }
+            PageDelta::Delete {
+                key: delta_key,
+                next,
+            } => {
+                if *delta_key == key {
+                    return Ok((None, chain_len));
+                }
+                cursor = next.as_ref();
+            }
+            PageDelta::Split {
+                separator, next, ..
+            } => {
+                if key >= *separator {
+                    return Ok((None, chain_len));
+                }
+                cursor = next.as_ref();
+            }
+            PageDelta::Merge { next, .. } => {
+                cursor = next.as_ref();
+            }
+            PageDelta::MessageBuffer { messages, next } => {
+                if let Some(message) = messages.get(&key) {
+                    return Ok((
+                        match *message {
+                            BufferedMutation::Insert(value) => Some(value),
+                            BufferedMutation::Delete => None,
+                        },
+                        chain_len,
+                    ));
+                }
+                cursor = next.as_ref();
+            }
+            PageDelta::AppendRun { entries, next } => {
+                match entries.binary_search_by_key(&key, |(entry_key, _)| *entry_key) {
+                    Ok(index) => return Ok((Some(entries[index].1), chain_len)),
+                    Err(_) => cursor = next.as_ref(),
+                }
+            }
+        }
+    }
+}
+
+fn push_buffered_ops(ops: &mut Vec<MaterializeOp>, messages: &BTreeMap<BwKey, BufferedMutation>) {
+    for (&key, &message) in messages {
+        match message {
+            BufferedMutation::Insert(value) => ops.push(MaterializeOp::Insert { key, value }),
+            BufferedMutation::Delete => ops.push(MaterializeOp::Delete { key }),
+        }
+    }
+}
+
+fn push_append_run_ops(ops: &mut Vec<MaterializeOp>, entries: &[(BwKey, BwValue)]) {
+    for &(key, value) in entries {
+        ops.push(MaterializeOp::Insert { key, value });
     }
 }
 
@@ -673,8 +1133,10 @@ fn defer_reclaim(delta: Arc<PageDelta>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BwKey, BwValue, ConsolidationConfig, FfsError, MAX_CHAIN_DEPTH, MAX_CHAIN_WALK,
-        MappingTable, PageDelta, PageId, chain_length, materialize_from_head, write_lock,
+        BwKey, BwValue, ConsolidationConfig, DEFAULT_CONSOLIDATION_THRESHOLD,
+        DEFAULT_MESSAGE_BUFFER_CAPACITY, DeltaMutation, FfsError, MAX_CAS_RETRIES, MAX_CHAIN_DEPTH,
+        MAX_CHAIN_WALK, MappingTable, PageDelta, PageHead, PageId, chain_length,
+        materialize_from_head, range_scan_from_head, write_lock,
     };
     use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier, atomic::Ordering};
@@ -686,6 +1148,127 @@ mod tests {
         std::thread::Builder::new()
             .spawn(f)
             .expect("spawn test thread")
+    }
+
+    fn append_delta_without_preconsolidation_for_test(
+        table: &MappingTable,
+        page: PageId,
+        mutation: DeltaMutation,
+    ) {
+        for _ in 0..MAX_CAS_RETRIES {
+            let snapshot = table.get_page(page).expect("snapshot");
+            let new_head = Arc::new(match mutation {
+                DeltaMutation::Insert { key, value } => PageDelta::Insert {
+                    key,
+                    value,
+                    next: snapshot.head,
+                },
+                DeltaMutation::Delete { key } => PageDelta::Delete {
+                    key,
+                    next: snapshot.head,
+                },
+                DeltaMutation::Split {
+                    separator,
+                    new_sibling,
+                } => PageDelta::Split {
+                    separator,
+                    new_sibling,
+                    next: snapshot.head,
+                },
+                DeltaMutation::Merge { removed_sibling } => PageDelta::Merge {
+                    removed_sibling,
+                    next: snapshot.head,
+                },
+            });
+            if table
+                .cas_page(page, snapshot.epoch, new_head, snapshot.chain_len + 1)
+                .expect("legacy cas")
+            {
+                return;
+            }
+        }
+        panic!("legacy no-preconsolidation append exhausted CAS retries");
+    }
+
+    fn insert_without_preconsolidation_for_test(
+        table: &MappingTable,
+        page: PageId,
+        key: BwKey,
+        value: BwValue,
+    ) {
+        append_delta_without_preconsolidation_for_test(
+            table,
+            page,
+            DeltaMutation::Insert { key, value },
+        );
+    }
+
+    fn delete_without_preconsolidation_for_test(table: &MappingTable, page: PageId, key: BwKey) {
+        append_delta_without_preconsolidation_for_test(table, page, DeltaMutation::Delete { key });
+    }
+
+    fn append_delta_without_message_buffer_for_test(
+        table: &MappingTable,
+        page: PageId,
+        mutation: DeltaMutation,
+    ) {
+        let cfg = ConsolidationConfig::default();
+        for _ in 0..MAX_CAS_RETRIES {
+            let snapshot = table.get_page(page).expect("snapshot");
+            if snapshot.chain_len > cfg.chain_threshold {
+                table
+                    .consolidate_page(page, &cfg)
+                    .expect("legacy preconsolidate");
+                continue;
+            }
+            let new_head = Arc::new(match mutation {
+                DeltaMutation::Insert { key, value } => PageDelta::Insert {
+                    key,
+                    value,
+                    next: snapshot.head,
+                },
+                DeltaMutation::Delete { key } => PageDelta::Delete {
+                    key,
+                    next: snapshot.head,
+                },
+                DeltaMutation::Split {
+                    separator,
+                    new_sibling,
+                } => PageDelta::Split {
+                    separator,
+                    new_sibling,
+                    next: snapshot.head,
+                },
+                DeltaMutation::Merge { removed_sibling } => PageDelta::Merge {
+                    removed_sibling,
+                    next: snapshot.head,
+                },
+            });
+            if table
+                .cas_page(page, snapshot.epoch, new_head, snapshot.chain_len + 1)
+                .expect("legacy cas")
+            {
+                return;
+            }
+        }
+        panic!("legacy individual preconsolidation append exhausted CAS retries");
+    }
+
+    fn insert_without_message_buffer_for_test(
+        table: &MappingTable,
+        page: PageId,
+        key: BwKey,
+        value: BwValue,
+    ) {
+        append_delta_without_message_buffer_for_test(
+            table,
+            page,
+            DeltaMutation::Insert { key, value },
+        );
+    }
+
+    fn delete_without_message_buffer_for_test(table: &MappingTable, page: PageId, key: BwKey) {
+        append_delta_without_message_buffer_for_test(table, page, DeltaMutation::Delete { key });
     }
 
     #[test]
@@ -827,6 +1410,13 @@ mod tests {
         }
     }
 
+    fn assert_cached_chain_len_matches(table: &MappingTable, page: PageId) -> usize {
+        let snapshot = table.get_page(page).expect("snapshot");
+        let computed = chain_length(&snapshot.head);
+        assert_eq!(snapshot.chain_len, computed);
+        computed
+    }
+
     #[test]
     fn chain_length_of_empty_base_is_one() {
         let base = PageDelta::empty_base();
@@ -838,10 +1428,9 @@ mod tests {
         let table = MappingTable::with_capacity(1);
         let page = table.allocate_page().expect("alloc");
         for i in 0..10 {
-            table.insert(page, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, page, BwKey(i), BwValue(i));
         }
-        let snap = table.get_page(page).expect("get");
-        assert_eq!(chain_length(&snap.head), 11); // 10 inserts + 1 base
+        assert_eq!(assert_cached_chain_len_matches(&table, page), 11); // 10 inserts + 1 base
     }
 
     #[test]
@@ -850,12 +1439,9 @@ mod tests {
         let page = table.allocate_page().expect("alloc");
 
         for i in 0..20 {
-            table
-                .insert(page, BwKey(i), BwValue(i * 10))
-                .expect("insert");
+            insert_without_preconsolidation_for_test(&table, page, BwKey(i), BwValue(i * 10));
         }
-        let snap_before = table.get_page(page).expect("get");
-        assert_eq!(chain_length(&snap_before.head), 21);
+        assert_eq!(assert_cached_chain_len_matches(&table, page), 21);
 
         let config = default_config();
         let result = table.consolidate_page(page, &config).expect("consolidate");
@@ -864,8 +1450,7 @@ mod tests {
         assert_eq!(result.entries_count, 20);
         assert!(result.cas_attempts >= 1);
 
-        let snap_after = table.get_page(page).expect("get");
-        assert_eq!(chain_length(&snap_after.head), 1);
+        assert_eq!(assert_cached_chain_len_matches(&table, page), 1);
     }
 
     #[test]
@@ -918,11 +1503,11 @@ mod tests {
 
         // p0: 3 deltas (below threshold of 4)
         for i in 0..3 {
-            table.insert(p0, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, p0, BwKey(i), BwValue(i));
         }
         // p1: 10 deltas (above threshold)
         for i in 0..10 {
-            table.insert(p1, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, p1, BwKey(i), BwValue(i));
         }
         // p2: 1 delta (base only, below threshold)
 
@@ -939,13 +1524,13 @@ mod tests {
         let p2 = table.allocate_page().expect("alloc");
 
         for i in 0..2 {
-            table.insert(p0, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, p0, BwKey(i), BwValue(i));
         }
         for i in 0..10 {
-            table.insert(p1, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, p1, BwKey(i), BwValue(i));
         }
         for i in 0..8 {
-            table.insert(p2, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, p2, BwKey(i), BwValue(i));
         }
 
         let config = ConsolidationConfig {
@@ -956,14 +1541,11 @@ mod tests {
         assert_eq!(count, 2); // p1 and p2
 
         // p0 should still have chain length > 1
-        let snap0 = table.get_page(p0).expect("get");
-        assert_eq!(chain_length(&snap0.head), 3);
+        assert_eq!(assert_cached_chain_len_matches(&table, p0), 3);
 
         // p1 and p2 should be consolidated
-        let snap1 = table.get_page(p1).expect("get");
-        assert_eq!(chain_length(&snap1.head), 1);
-        let snap2 = table.get_page(p2).expect("get");
-        assert_eq!(chain_length(&snap2.head), 1);
+        assert_eq!(assert_cached_chain_len_matches(&table, p1), 1);
+        assert_eq!(assert_cached_chain_len_matches(&table, p2), 1);
     }
 
     #[test]
@@ -1035,6 +1617,7 @@ mod tests {
                 );
             }
         }
+        assert_cached_chain_len_matches(&table, page);
     }
 
     #[test]
@@ -1042,9 +1625,9 @@ mod tests {
         let table = MappingTable::with_capacity(1);
         let page = table.allocate_page().expect("alloc");
 
-        table.insert(page, BwKey(1), BwValue(10)).expect("insert");
-        table.insert(page, BwKey(2), BwValue(20)).expect("insert");
-        table.delete(page, BwKey(1)).expect("delete");
+        insert_without_preconsolidation_for_test(&table, page, BwKey(1), BwValue(10));
+        insert_without_preconsolidation_for_test(&table, page, BwKey(2), BwValue(20));
+        delete_without_preconsolidation_for_test(&table, page, BwKey(1));
 
         let config = default_config();
         let result = table.consolidate_page(page, &config).expect("consolidate");
@@ -1116,13 +1699,13 @@ mod tests {
 
         let config = default_config();
         table.consolidate_page(page, &config).expect("consolidate");
-        assert_eq!(chain_length(&table.get_page(page).expect("get").head), 1);
+        assert_eq!(assert_cached_chain_len_matches(&table, page), 1);
 
         // New inserts build on consolidated base
         for i in 10..15 {
             table.insert(page, BwKey(i), BwValue(i)).expect("insert");
         }
-        assert_eq!(chain_length(&table.get_page(page).expect("get").head), 6);
+        assert_eq!(assert_cached_chain_len_matches(&table, page), 2);
 
         // All data still accessible
         for i in 0..15 {
@@ -1134,29 +1717,359 @@ mod tests {
     }
 
     #[test]
-    fn append_at_chain_depth_limit_preconsolidates_before_appending() {
-        let table = MappingTable::with_capacity(1);
+    fn append_structural_delta_at_default_threshold_preconsolidates_before_appending() {
+        let table = MappingTable::with_capacity(2);
         let page = table.allocate_page().expect("alloc");
-        let limit_keys =
-            u64::try_from(MAX_CHAIN_DEPTH - 1).expect("chain depth fits in u64 for tests");
+        let sibling = table.allocate_page().expect("sibling alloc");
 
-        for i in 0..limit_keys {
-            table.insert(page, BwKey(i), BwValue(i)).expect("insert");
+        for i in 0..u64::try_from(DEFAULT_CONSOLIDATION_THRESHOLD).expect("threshold fits") {
+            insert_without_preconsolidation_for_test(&table, page, BwKey(i), BwValue(i));
         }
 
-        let snap_before = table.get_page(page).expect("get before");
-        assert_eq!(chain_length(&snap_before.head), MAX_CHAIN_DEPTH);
+        assert_eq!(
+            assert_cached_chain_len_matches(&table, page),
+            DEFAULT_CONSOLIDATION_THRESHOLD + 1
+        );
 
         table
-            .insert(page, BwKey(u64::MAX), BwValue(99))
-            .expect("append after preconsolidation");
+            .append_split_delta(page, BwKey(u64::MAX), sibling)
+            .expect("append structural delta after preconsolidation");
 
         let state = table.materialize_page(page).expect("materialize");
-        assert_eq!(state.len(), MAX_CHAIN_DEPTH);
-        assert_eq!(state.get(&BwKey(u64::MAX)).copied(), Some(BwValue(99)));
+        assert_eq!(state.len(), DEFAULT_CONSOLIDATION_THRESHOLD);
 
-        let snap_after = table.get_page(page).expect("get after");
-        assert_eq!(chain_length(&snap_after.head), 2);
+        assert_eq!(assert_cached_chain_len_matches(&table, page), 2);
+    }
+
+    #[test]
+    fn append_preconsolidation_matches_deferred_golden_report() {
+        let old_table = MappingTable::with_capacity(1);
+        let old_page = old_table.allocate_page().expect("old alloc");
+        let new_table = MappingTable::with_capacity(1);
+        let new_page = new_table.allocate_page().expect("new alloc");
+
+        for key in 0..32_u64 {
+            insert_without_preconsolidation_for_test(
+                &old_table,
+                old_page,
+                BwKey(key),
+                BwValue(key * 10),
+            );
+            new_table
+                .insert(new_page, BwKey(key), BwValue(key * 10))
+                .expect("new seed insert");
+        }
+
+        let cfg = ConsolidationConfig::default();
+        old_table
+            .consolidate_page(old_page, &cfg)
+            .expect("old consolidate");
+        new_table
+            .consolidate_page(new_page, &cfg)
+            .expect("new consolidate");
+
+        for step in 0..96_u64 {
+            let key = BwKey((step * 37 + 11) % 64);
+            match step % 4 {
+                0 => {
+                    let value = BwValue(10_000 + step);
+                    insert_without_preconsolidation_for_test(&old_table, old_page, key, value);
+                    new_table.insert(new_page, key, value).expect("new insert");
+                }
+                1 => {
+                    delete_without_preconsolidation_for_test(&old_table, old_page, key);
+                    new_table.delete(new_page, key).expect("new delete");
+                }
+                2 => {
+                    let value = BwValue(20_000 + step);
+                    insert_without_preconsolidation_for_test(&old_table, old_page, key, value);
+                    new_table.insert(new_page, key, value).expect("new insert");
+                }
+                _ => {
+                    if key.0 % 3 == 0 {
+                        delete_without_preconsolidation_for_test(&old_table, old_page, key);
+                        new_table.delete(new_page, key).expect("new delete");
+                    } else {
+                        let value = BwValue(30_000 + step);
+                        insert_without_preconsolidation_for_test(&old_table, old_page, key, value);
+                        new_table.insert(new_page, key, value).expect("new insert");
+                    }
+                }
+            }
+        }
+
+        let old_state = old_table
+            .materialize_page(old_page)
+            .expect("old materialize");
+        let new_state = new_table
+            .materialize_page(new_page)
+            .expect("new materialize");
+        assert_eq!(old_state, new_state);
+
+        let old_chain_len = assert_cached_chain_len_matches(&old_table, old_page);
+        let new_chain_len = assert_cached_chain_len_matches(&new_table, new_page);
+        assert!(old_chain_len > DEFAULT_CONSOLIDATION_THRESHOLD);
+        assert!(new_chain_len <= DEFAULT_CONSOLIDATION_THRESHOLD + 1);
+
+        println!("BWTREE_PRECONSOLIDATE_GOLDEN\told_chain_len\t{old_chain_len}");
+        println!("BWTREE_PRECONSOLIDATE_GOLDEN\tnew_chain_len\t{new_chain_len}");
+        println!(
+            "BWTREE_PRECONSOLIDATE_GOLDEN\tstate_len\t{}",
+            new_state.len()
+        );
+
+        for key in [0_u64, 1, 2, 3, 5, 8, 13, 21, 34, 55, 63] {
+            let key = BwKey(key);
+            let old_lookup = old_table.lookup(old_page, key).expect("old lookup");
+            let new_lookup = new_table.lookup(new_page, key).expect("new lookup");
+            assert_eq!(old_lookup, new_lookup);
+            println!(
+                "BWTREE_PRECONSOLIDATE_GOLDEN\tlookup\t{}\t{}",
+                key.0,
+                new_lookup.map_or_else(|| "None".to_owned(), |value| value.0.to_string())
+            );
+        }
+
+        let old_range = old_table
+            .range_scan(old_page, BwKey(7), 12)
+            .expect("old range");
+        let new_range = new_table
+            .range_scan(new_page, BwKey(7), 12)
+            .expect("new range");
+        assert_eq!(old_range, new_range);
+        for (key, value) in new_range {
+            println!(
+                "BWTREE_PRECONSOLIDATE_GOLDEN\trange\t{}\t{}",
+                key.0, value.0
+            );
+        }
+    }
+
+    struct MessageBufferGoldenTables {
+        old_table: MappingTable,
+        old_page: PageId,
+        old_sibling: PageId,
+        new_table: MappingTable,
+        new_page: PageId,
+        new_sibling: PageId,
+    }
+
+    fn seed_message_buffer_golden_tables() -> MessageBufferGoldenTables {
+        let old_table = MappingTable::with_capacity(2);
+        let old_page = old_table.allocate_page().expect("old alloc");
+        let old_sibling = old_table.allocate_page().expect("old sibling");
+        let new_table = MappingTable::with_capacity(2);
+        let new_page = new_table.allocate_page().expect("new alloc");
+        let new_sibling = new_table.allocate_page().expect("new sibling");
+
+        for key in 0..96_u64 {
+            insert_without_message_buffer_for_test(
+                &old_table,
+                old_page,
+                BwKey(key),
+                BwValue(key * 10),
+            );
+            new_table
+                .insert(new_page, BwKey(key), BwValue(key * 10))
+                .expect("new seed insert");
+        }
+
+        let cfg = ConsolidationConfig::default();
+        old_table
+            .consolidate_page(old_page, &cfg)
+            .expect("old consolidate");
+        new_table
+            .consolidate_page(new_page, &cfg)
+            .expect("new consolidate");
+
+        MessageBufferGoldenTables {
+            old_table,
+            old_page,
+            old_sibling,
+            new_table,
+            new_page,
+            new_sibling,
+        }
+    }
+
+    fn apply_message_buffer_split_probe(tables: &MessageBufferGoldenTables) {
+        insert_without_message_buffer_for_test(
+            &tables.old_table,
+            tables.old_page,
+            BwKey(300),
+            BwValue(30_000),
+        );
+        tables
+            .new_table
+            .insert(tables.new_page, BwKey(300), BwValue(30_000))
+            .expect("new pre-split insert");
+        append_delta_without_message_buffer_for_test(
+            &tables.old_table,
+            tables.old_page,
+            DeltaMutation::Split {
+                separator: BwKey(256),
+                new_sibling: tables.old_sibling,
+            },
+        );
+        tables
+            .new_table
+            .append_split_delta(tables.new_page, BwKey(256), tables.new_sibling)
+            .expect("new split");
+        insert_without_message_buffer_for_test(
+            &tables.old_table,
+            tables.old_page,
+            BwKey(300),
+            BwValue(30_001),
+        );
+        tables
+            .new_table
+            .insert(tables.new_page, BwKey(300), BwValue(30_001))
+            .expect("new post-split insert");
+    }
+
+    fn apply_message_buffer_golden_workload(tables: &MessageBufferGoldenTables) {
+        for step in 0..384_u64 {
+            let key = BwKey((step * 109 + 17) % 512);
+            match step % 6 {
+                0 | 2 => {
+                    let value = BwValue(40_000 + step);
+                    insert_without_message_buffer_for_test(
+                        &tables.old_table,
+                        tables.old_page,
+                        key,
+                        value,
+                    );
+                    tables
+                        .new_table
+                        .insert(tables.new_page, key, value)
+                        .expect("new insert");
+                }
+                1 => {
+                    delete_without_message_buffer_for_test(&tables.old_table, tables.old_page, key);
+                    tables
+                        .new_table
+                        .delete(tables.new_page, key)
+                        .expect("new delete");
+                }
+                3 => {
+                    let value = BwValue(50_000 + step);
+                    insert_without_message_buffer_for_test(
+                        &tables.old_table,
+                        tables.old_page,
+                        key,
+                        value,
+                    );
+                    tables
+                        .new_table
+                        .insert(tables.new_page, key, value)
+                        .expect("new insert");
+                }
+                4 => {
+                    if key.0 % 4 == 0 {
+                        delete_without_message_buffer_for_test(
+                            &tables.old_table,
+                            tables.old_page,
+                            key,
+                        );
+                        tables
+                            .new_table
+                            .delete(tables.new_page, key)
+                            .expect("new delete");
+                    } else {
+                        let value = BwValue(60_000 + step);
+                        insert_without_message_buffer_for_test(
+                            &tables.old_table,
+                            tables.old_page,
+                            key,
+                            value,
+                        );
+                        tables
+                            .new_table
+                            .insert(tables.new_page, key, value)
+                            .expect("new insert");
+                    }
+                }
+                _ => {
+                    let value = BwValue(70_000 + step);
+                    insert_without_message_buffer_for_test(
+                        &tables.old_table,
+                        tables.old_page,
+                        key,
+                        value,
+                    );
+                    tables
+                        .new_table
+                        .insert(tables.new_page, key, value)
+                        .expect("new insert");
+                }
+            }
+        }
+    }
+
+    fn assert_message_buffer_golden_report(tables: &MessageBufferGoldenTables) {
+        let old_state = tables
+            .old_table
+            .materialize_page(tables.old_page)
+            .expect("old materialize");
+        let new_state = tables
+            .new_table
+            .materialize_page(tables.new_page)
+            .expect("new materialize");
+        assert_eq!(old_state, new_state);
+
+        let old_chain_len = assert_cached_chain_len_matches(&tables.old_table, tables.old_page);
+        let new_chain_len = assert_cached_chain_len_matches(&tables.new_table, tables.new_page);
+        assert!(old_chain_len <= DEFAULT_CONSOLIDATION_THRESHOLD + 1);
+        assert!(new_chain_len <= DEFAULT_MESSAGE_BUFFER_CAPACITY + 2);
+
+        println!("BWTREE_MESSAGE_BUFFER_GOLDEN\told_chain_len\t{old_chain_len}");
+        println!("BWTREE_MESSAGE_BUFFER_GOLDEN\tnew_chain_len\t{new_chain_len}");
+        println!(
+            "BWTREE_MESSAGE_BUFFER_GOLDEN\tstate_len\t{}",
+            new_state.len()
+        );
+
+        for key in [0_u64, 7, 17, 31, 63, 96, 127, 191, 255, 383, 511] {
+            let key = BwKey(key);
+            let old_lookup = tables
+                .old_table
+                .lookup(tables.old_page, key)
+                .expect("old lookup");
+            let new_lookup = tables
+                .new_table
+                .lookup(tables.new_page, key)
+                .expect("new lookup");
+            assert_eq!(old_lookup, new_lookup);
+            println!(
+                "BWTREE_MESSAGE_BUFFER_GOLDEN\tlookup\t{}\t{}",
+                key.0,
+                new_lookup.map_or_else(|| "None".to_owned(), |value| value.0.to_string())
+            );
+        }
+
+        let old_range = tables
+            .old_table
+            .range_scan(tables.old_page, BwKey(89), 16)
+            .expect("old range");
+        let new_range = tables
+            .new_table
+            .range_scan(tables.new_page, BwKey(89), 16)
+            .expect("new range");
+        assert_eq!(old_range, new_range);
+        for (key, value) in new_range {
+            println!(
+                "BWTREE_MESSAGE_BUFFER_GOLDEN\trange\t{}\t{}",
+                key.0, value.0
+            );
+        }
+    }
+
+    #[test]
+    fn message_buffer_matches_individual_preconsolidation_golden_report() {
+        let tables = seed_message_buffer_golden_tables();
+        apply_message_buffer_split_probe(&tables);
+        apply_message_buffer_golden_workload(&tables);
+        assert_message_buffer_golden_report(&tables);
     }
 
     // ── Comprehensive unit tests (bd-1mdk.3) ─────────────────────
@@ -1250,6 +2163,117 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    fn range_scan_returns_sorted_bounded_entries_from_start_key() {
+        let table = MappingTable::with_capacity(1);
+        let page = table.allocate_page().expect("alloc");
+
+        for i in (0..10_u64).rev() {
+            table
+                .insert(page, BwKey(i * 10), BwValue(i))
+                .expect("insert");
+        }
+
+        let rows = table
+            .range_scan(page, BwKey(25), 4)
+            .expect("range scan should succeed");
+        assert_eq!(
+            rows,
+            vec![
+                (BwKey(30), BwValue(3)),
+                (BwKey(40), BwValue(4)),
+                (BwKey(50), BwValue(5)),
+                (BwKey(60), BwValue(6)),
+            ]
+        );
+    }
+
+    #[test]
+    fn range_scan_filters_deletes_and_split_removed_tail() {
+        let table = MappingTable::with_capacity(2);
+        let page = table.allocate_page().expect("alloc");
+        let sibling = table.allocate_page().expect("alloc sibling");
+
+        for i in 0..10_u64 {
+            table.insert(page, BwKey(i), BwValue(i)).expect("insert");
+        }
+        table.delete(page, BwKey(4)).expect("delete");
+        table
+            .append_split_delta(page, BwKey(7), sibling)
+            .expect("split");
+
+        let rows = table
+            .range_scan(page, BwKey(3), 10)
+            .expect("range scan should succeed");
+        assert_eq!(
+            rows,
+            vec![
+                (BwKey(3), BwValue(3)),
+                (BwKey(5), BwValue(5)),
+                (BwKey(6), BwValue(6)),
+            ]
+        );
+    }
+
+    #[test]
+    fn range_scan_matches_materialized_range_with_shadowing_deltas() {
+        let table = MappingTable::with_capacity(2);
+        let page = table.allocate_page().expect("alloc");
+        let sibling = table.allocate_page().expect("alloc sibling");
+
+        for i in 0..12_u64 {
+            table.insert(page, BwKey(i), BwValue(i)).expect("insert");
+        }
+        table
+            .consolidate_page(page, &default_config())
+            .expect("consolidate");
+
+        table.insert(page, BwKey(9), BwValue(90)).expect("insert");
+        table
+            .append_split_delta(page, BwKey(8), sibling)
+            .expect("split");
+        table
+            .insert(page, BwKey(8), BwValue(800))
+            .expect("insert after split");
+        table.delete(page, BwKey(3)).expect("delete");
+        table
+            .insert(page, BwKey(5), BwValue(500))
+            .expect("shadow base");
+
+        let materialized = table.materialize_page(page).expect("materialize");
+        let expected: Vec<_> = materialized
+            .range(BwKey(2)..)
+            .take(10)
+            .map(|(&key, &value)| (key, value))
+            .collect();
+
+        assert_eq!(
+            table
+                .range_scan(page, BwKey(2), 10)
+                .expect("range scan should succeed"),
+            expected
+        );
+    }
+
+    #[test]
+    fn range_scan_zero_count_returns_empty_after_page_validation() {
+        let table = MappingTable::with_capacity(1);
+        let page = table.allocate_page().expect("alloc");
+
+        table.insert(page, BwKey(1), BwValue(1)).expect("insert");
+
+        assert_eq!(
+            table
+                .range_scan(page, BwKey(0), 0)
+                .expect("range scan should succeed"),
+            Vec::<(BwKey, BwValue)>::new()
+        );
+        assert!(matches!(
+            table.range_scan(PageId(99), BwKey(0), 0),
+            Err(FfsError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -1514,11 +2538,11 @@ mod tests {
 
         // p0: exactly at threshold (should not be consolidated)
         for i in 0..4_u64 {
-            table.insert(p0, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, p0, BwKey(i), BwValue(i));
         }
         // p1: above threshold
         for i in 0..20_u64 {
-            table.insert(p1, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, p1, BwKey(i), BwValue(i));
         }
 
         let config = ConsolidationConfig {
@@ -1671,6 +2695,114 @@ mod tests {
                 "key {i} should be split away from main page"
             );
         }
+        for i in 1..=10 {
+            assert_eq!(
+                table.lookup(page, BwKey(i)).expect("lookup after split"),
+                main_state.get(&BwKey(i)).copied(),
+                "lookup should match materialized split state for key {i}"
+            );
+        }
+
+        table
+            .insert(page, BwKey(7), BwValue(7000))
+            .expect("newer insert after split");
+        table
+            .delete(page, BwKey(5))
+            .expect("newer delete after split");
+
+        let shadowed_state = table
+            .materialize_page(page)
+            .expect("materialize shadowed split state");
+        for i in 1..=10 {
+            assert_eq!(
+                table
+                    .lookup(page, BwKey(i))
+                    .expect("lookup after split shadowing"),
+                shadowed_state.get(&BwKey(i)).copied(),
+                "lookup should match materialized split-shadow state for key {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_lookup_matches_materialized_state_for_golden_trace() {
+        let table = MappingTable::with_capacity(4);
+        let page = table.allocate_page().expect("alloc");
+        let sibling = table.allocate_page().expect("alloc sibling");
+
+        for i in 1..=12 {
+            table
+                .insert(page, BwKey(i), BwValue(i * 100))
+                .expect("seed insert");
+        }
+        table
+            .insert(page, BwKey(3), BwValue(3333))
+            .expect("overwrite before split");
+        table
+            .insert(page, BwKey(9), BwValue(9999))
+            .expect("overwrite split-tail key before split");
+        table.delete(page, BwKey(2)).expect("delete before split");
+        table
+            .append_split_delta(page, BwKey(8), sibling)
+            .expect("split");
+        table
+            .insert(page, BwKey(9), BwValue(9000))
+            .expect("newer insert shadows split");
+        table
+            .delete(page, BwKey(6))
+            .expect("newer delete shadows base");
+        table.append_merge_delta(page, sibling).expect("merge");
+        table
+            .insert(page, BwKey(7), BwValue(7000))
+            .expect("newer insert under split separator");
+        table
+            .delete(page, BwKey(9))
+            .expect("newer delete shadows post-split insert");
+
+        let materialized = table.materialize_page(page).expect("materialize");
+        for key in 0..=13 {
+            let lookup = table.lookup(page, BwKey(key)).expect("lookup");
+            let expected = materialized.get(&BwKey(key)).copied();
+            assert_eq!(
+                lookup, expected,
+                "direct lookup should match materialized state for key {key}"
+            );
+            let rendered = lookup.map_or_else(|| String::from("-"), |value| value.0.to_string());
+            println!("BWTREE_GOLDEN\t{key}\t{rendered}");
+        }
+    }
+
+    #[test]
+    fn bwtree_lookup_golden_report() {
+        let table = MappingTable::with_capacity(4);
+        let page = table.allocate_page().expect("alloc");
+        let sibling = table.allocate_page().expect("alloc sibling");
+
+        for (key, value) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
+            table
+                .insert(page, BwKey(key), BwValue(value))
+                .expect("insert");
+        }
+        table.delete(page, BwKey(2)).expect("delete");
+        table
+            .append_split_delta(page, BwKey(4), sibling)
+            .expect("split");
+        table
+            .insert(page, BwKey(5), BwValue(500))
+            .expect("newer insert");
+
+        let materialized = table.materialize_page(page).expect("materialize");
+        for key in [1, 2, 3, 4, 5, 6] {
+            let key = BwKey(key);
+            let lookup = table.lookup(page, key).expect("lookup");
+            let expected = materialized.get(&key).copied();
+            assert_eq!(lookup, expected);
+            println!(
+                "BWTREE_LOOKUP_GOLDEN\t{}\t{}",
+                key.0,
+                lookup.map_or_else(|| "None".to_owned(), |value| value.0.to_string())
+            );
+        }
     }
 
     #[test]
@@ -1681,7 +2813,7 @@ mod tests {
 
         // Insert data, split, then merge.
         for i in 1..=5 {
-            table.insert(page, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, page, BwKey(i), BwValue(i));
         }
         table
             .append_split_delta(page, BwKey(4), sibling)
@@ -1739,7 +2871,7 @@ mod tests {
 
         // Insert enough to build a long chain.
         for i in 0..20 {
-            table.insert(page, BwKey(i), BwValue(i)).expect("insert");
+            insert_without_preconsolidation_for_test(&table, page, BwKey(i), BwValue(i));
         }
 
         // With high threshold, no pages should need consolidation.
@@ -1832,7 +2964,10 @@ mod tests {
 
         // Build several pages with chains long enough to qualify for
         // consolidation under the default threshold.
-        let cfg = ConsolidationConfig::default();
+        let cfg = ConsolidationConfig {
+            chain_threshold: 1,
+            max_retries: MAX_CAS_RETRIES,
+        };
         let mut pages = Vec::new();
         for _ in 0..4 {
             let p = table.allocate_page().expect("alloc");
@@ -1879,7 +3014,7 @@ mod tests {
         }
 
         let entry = table.entry(page).expect("entry");
-        *write_lock(&entry.head) = head;
+        *write_lock(&entry.head) = PageHead::new(head, MAX_CHAIN_WALK + 1);
 
         let cfg = ConsolidationConfig {
             chain_threshold: 1,
@@ -2056,5 +3191,118 @@ mod tests {
             prop_assert_eq!(second.cas_attempts, 0,
                 "second consolidate must not perform any CAS attempts");
         }
+    }
+
+    /// Same-binary A/B for bd-xmh5g.15: run the mixed bench workload
+    /// (50% lookup / 30% insert / 10% delete / 10% range_scan, PREPOPULATE
+    /// 10_000, 5_000 ops) twice in ONE process over an IDENTICAL seeded op
+    /// sequence — once with `range_scan` materializing the whole page (the old
+    /// path) and once with the bounded delta replay. Only the scan
+    /// implementation differs; both runs share the worker and binary, so the
+    /// relative comparison is machine-independent. This is the rigorous proof
+    /// the cross-worker criterion figures (bogus 2.31x / 4.75s) could not give.
+    /// The scan-row checksums must match (isomorphism on workload-generated
+    /// states). Prints the speedup with `--nocapture`.
+    #[test]
+    fn bd_xmh5g_15_range_scan_same_binary_ab() {
+        const PREPOPULATE: u64 = 10_000;
+        const OPS: u64 = 5_000;
+        const REPS: usize = 5;
+        const SCAN_COUNT: usize = 10;
+
+        fn xorshift64(s: &mut u64) -> u64 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            x
+        }
+
+        // Old path: materialize the full page, then range(start..).take(count).
+        fn scan_materialize(
+            table: &MappingTable,
+            page: PageId,
+            start: BwKey,
+        ) -> Vec<(BwKey, BwValue)> {
+            let snap = table.get_page(page).expect("get_page");
+            let (state, _) = materialize_from_head(&snap.head).expect("materialize");
+            state
+                .range(start..)
+                .take(SCAN_COUNT)
+                .map(|(&k, &v)| (k, v))
+                .collect()
+        }
+        // New path: bounded delta replay (the committed range_scan body).
+        fn scan_bounded(table: &MappingTable, page: PageId, start: BwKey) -> Vec<(BwKey, BwValue)> {
+            let snap = table.get_page(page).expect("get_page");
+            range_scan_from_head(&snap.head, start, SCAN_COUNT)
+                .expect("bounded range scan")
+                .0
+        }
+
+        // Replay the identical workload with the chosen scan path; return
+        // (elapsed, checksum-of-scan-rows). A fresh table + fixed seed make the
+        // mutation stream — and therefore the chain state at every scan —
+        // identical across both variants.
+        let run = |use_bounded: bool| -> (std::time::Duration, u64) {
+            let table = MappingTable::with_capacity(16);
+            let page = table.allocate_page().expect("alloc");
+            for i in 0..PREPOPULATE {
+                table.insert(page, BwKey(i), BwValue(i)).expect("insert");
+            }
+            let cfg = ConsolidationConfig::default();
+            let _ = table.consolidate_page(page, &cfg);
+
+            let mut rng = 0x9E37_79B9_7F4A_7C15_u64;
+            let mut checksum = 0_u64;
+            let begin = std::time::Instant::now();
+            for _ in 0..OPS {
+                let op = xorshift64(&mut rng) % 100;
+                let key = xorshift64(&mut rng) % (PREPOPULATE * 2);
+                if op < 50 {
+                    let _ = table.lookup(page, BwKey(key));
+                } else if op < 80 {
+                    let _ = table.insert(page, BwKey(key), BwValue(key + 1));
+                } else if op < 90 {
+                    let _ = table.delete(page, BwKey(key));
+                } else {
+                    let rows = if use_bounded {
+                        scan_bounded(&table, page, BwKey(key))
+                    } else {
+                        scan_materialize(&table, page, BwKey(key))
+                    };
+                    for (k, _) in &rows {
+                        checksum = checksum.wrapping_add(k.0);
+                    }
+                }
+            }
+            (begin.elapsed(), checksum)
+        };
+
+        let mut best_mat = std::time::Duration::MAX;
+        let mut best_bnd = std::time::Duration::MAX;
+        let mut cks_mat = 0_u64;
+        let mut cks_bnd = 0_u64;
+        for _ in 0..REPS {
+            let (d, c) = run(false);
+            best_mat = best_mat.min(d);
+            cks_mat = c;
+            let (d, c) = run(true);
+            best_bnd = best_bnd.min(d);
+            cks_bnd = c;
+        }
+
+        assert_eq!(
+            cks_mat, cks_bnd,
+            "bounded range_scan must return identical rows to materialize \
+             across the whole workload (isomorphism)"
+        );
+
+        let speedup = best_mat.as_secs_f64() / best_bnd.as_secs_f64();
+        eprintln!(
+            "bd-xmh5g.15 same-binary A/B (mixed, 1 thread): materialize={best_mat:?} \
+             bounded={best_bnd:?} speedup={speedup:.3}x checksum={cks_bnd}"
+        );
     }
 }

@@ -109,6 +109,29 @@ pub fn bitmap_set(bitmap: &mut [u8], idx: u32) {
     }
 }
 
+/// Highest set bit index strictly below `count`, or `None` if no bit is set.
+/// Matches [`bitmap_set`]'s LSB-first-within-byte convention.
+fn highest_set_bit_index(bitmap: &[u8], count: u32) -> Option<u32> {
+    let count = count as usize;
+    let nbytes = count.div_ceil(8).min(bitmap.len());
+    for byte_idx in (0..nbytes).rev() {
+        let byte = bitmap[byte_idx];
+        if byte == 0 {
+            continue;
+        }
+        for bit in (0..8u32).rev() {
+            if byte & (1 << bit) != 0 {
+                let idx = byte_idx * 8 + bit as usize;
+                if idx < count {
+                    #[expect(clippy::cast_possible_truncation)]
+                    return Some(idx as u32);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Clear bit `idx` in a bitmap byte slice.
 pub fn bitmap_clear(bitmap: &mut [u8], idx: u32) {
     let byte_idx = (idx / 8) as usize;
@@ -168,6 +191,23 @@ fn bitmap_find_free_range(bitmap: &[u8], mut idx: u32, end: u32) -> Option<u32> 
         idx += 1;
     }
 
+    // Word-at-a-time fast path: scan 64 bits per iteration. `idx` is byte-
+    // aligned here (the leading loop advanced to a byte boundary), so the 8
+    // bytes at `idx / 8` cover bits [idx, idx + 64). `(!word).trailing_zeros()`
+    // is the first free (zero) bit relative to `idx` — bit-identical to the
+    // byte loop below, just 8× fewer iterations on a full bitmap scan.
+    while end.saturating_sub(idx) >= 64 {
+        let byte_idx = (idx / 8) as usize;
+        let chunk = bitmap.get(byte_idx..byte_idx + 8)?;
+        let word = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        if word != u64::MAX {
+            return Some(idx + (!word).trailing_zeros());
+        }
+        idx += 64;
+    }
+
     while end.saturating_sub(idx) >= 8 {
         let byte_idx = (idx / 8) as usize;
         let &byte = bitmap.get(byte_idx)?;
@@ -187,6 +227,120 @@ fn bitmap_find_free_range(bitmap: &[u8], mut idx: u32, end: u32) -> Option<u32> 
     }
 
     None
+}
+
+fn bitmap_take_free_bits_cyclic<F>(
+    bitmap: &mut [u8],
+    count: u32,
+    max_count: u32,
+    start: u32,
+    mut record: F,
+) -> u32
+where
+    F: FnMut(u32),
+{
+    if count == 0 || max_count == 0 {
+        return 0;
+    }
+
+    let start = start.min(count);
+    let mut taken = bitmap_take_free_bits_range(bitmap, start, count, max_count, &mut record);
+    if taken < max_count && start > 0 {
+        taken += bitmap_take_free_bits_range(bitmap, 0, start, max_count - taken, &mut record);
+    }
+    taken
+}
+
+fn bitmap_take_free_bits_range<F>(
+    bitmap: &mut [u8],
+    mut idx: u32,
+    end: u32,
+    max_count: u32,
+    record: &mut F,
+) -> u32
+where
+    F: FnMut(u32),
+{
+    let mut taken = 0;
+
+    while idx < end && idx % 8 != 0 {
+        let byte_idx = (idx / 8) as usize;
+        let Some(byte) = bitmap.get_mut(byte_idx) else {
+            return taken;
+        };
+        let bit = idx % 8;
+        if (*byte >> bit) & 1 == 0 {
+            *byte |= 1 << bit;
+            record(idx);
+            taken += 1;
+            if taken == max_count {
+                return taken;
+            }
+        }
+        idx += 1;
+    }
+
+    while end.saturating_sub(idx) >= 64 {
+        let byte_idx = (idx / 8) as usize;
+        let Some(chunk) = bitmap.get_mut(byte_idx..byte_idx + 8) else {
+            return taken;
+        };
+        let word = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        let mut free = !word;
+        while free != 0 {
+            let bit = free.trailing_zeros();
+            let byte_offset = (bit / 8) as usize;
+            let bit_offset = bit % 8;
+            chunk[byte_offset] |= 1 << bit_offset;
+            record(idx + bit);
+            taken += 1;
+            if taken == max_count {
+                return taken;
+            }
+            free &= free - 1;
+        }
+        idx += 64;
+    }
+
+    while end.saturating_sub(idx) >= 8 {
+        let byte_idx = (idx / 8) as usize;
+        let Some(byte) = bitmap.get_mut(byte_idx) else {
+            return taken;
+        };
+        let mut free = !*byte;
+        while free != 0 {
+            let bit = free.trailing_zeros();
+            *byte |= 1 << bit;
+            record(idx + bit);
+            taken += 1;
+            if taken == max_count {
+                return taken;
+            }
+            free &= free - 1;
+        }
+        idx += 8;
+    }
+
+    while idx < end {
+        let byte_idx = (idx / 8) as usize;
+        let Some(byte) = bitmap.get_mut(byte_idx) else {
+            return taken;
+        };
+        let bit = idx % 8;
+        if (*byte >> bit) & 1 == 0 {
+            *byte |= 1 << bit;
+            record(idx);
+            taken += 1;
+            if taken == max_count {
+                return taken;
+            }
+        }
+        idx += 1;
+    }
+
+    taken
 }
 
 /// Find `n` contiguous free bits in the first `count` bits of `bitmap`,
@@ -217,10 +371,10 @@ pub fn bitmap_find_contiguous(bitmap: &[u8], count: u32, n: u32, start: u32) -> 
 /// aware available-space numbers for `statvfs(3)` callers and the
 /// fallocate/free-space-FIEMAP fast paths.
 ///
-/// Whole-byte 0x00 bytes contribute 8 each via a fast skip; 0xFF bytes
-/// terminate the current run. Partial-byte boundaries (non-zero non-FF
-/// bytes, plus the trailing remainder when `count % 8 != 0`) fall back to
-/// per-bit inspection.
+/// Full 64-bit words are summarized with bit-parallel zero-run operations;
+/// remaining bytes use the byte summary table. Partial-byte boundaries (the
+/// trailing remainder when `count % 8 != 0`) are masked to preserve the exact
+/// LSB-first bitmap semantics.
 #[must_use]
 pub fn bitmap_largest_free_run(bitmap: &[u8], count: u32) -> u32 {
     if count == 0 {
@@ -232,15 +386,24 @@ pub fn bitmap_largest_free_run(bitmap: &[u8], count: u32) -> u32 {
     let mut best = 0_u32;
     let mut run = 0_u32;
 
-    for byte_idx in 0..full_bytes {
-        // Mirror `bitmap_count_free`: bytes past the end of the slice
-        // contribute zero to the free count and break any in-flight run.
-        // This is the conservative answer when the bitmap was truncated.
-        let Some(&byte) = bitmap.get(byte_idx) else {
-            run = 0;
-            continue;
-        };
+    let available_full_bytes = full_bytes.min(bitmap.len());
+    let word_bytes = available_full_bytes - (available_full_bytes % 8);
+
+    for chunk in bitmap[..word_bytes].chunks_exact(8) {
+        let word = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        apply_word_zero_run(word, &mut run, &mut best);
+    }
+
+    for &byte in &bitmap[word_bytes..available_full_bytes] {
         apply_byte_zero_run(BYTE_ZERO_RUNS[byte as usize], &mut run, &mut best);
+    }
+
+    // Mirror `bitmap_count_free`: bytes past the end of the slice contribute
+    // zero to the free count and break any in-flight run.
+    if full_bytes > available_full_bytes {
+        run = 0;
     }
 
     if remainder > 0 {
@@ -253,6 +416,35 @@ pub fn bitmap_largest_free_run(bitmap: &[u8], count: u32) -> u32 {
     }
 
     best
+}
+
+fn apply_word_zero_run(word: u64, run: &mut u32, best: &mut u32) {
+    if word == 0 {
+        *run = run.saturating_add(64);
+        *best = (*best).max(*run);
+        return;
+    }
+    if word == u64::MAX {
+        *run = 0;
+        return;
+    }
+
+    let prefix = word.trailing_zeros();
+    if prefix > 0 {
+        *best = (*best).max(run.saturating_add(prefix));
+    }
+    *best = (*best).max(longest_zero_run_in_mixed_word(word));
+    *run = word.leading_zeros();
+}
+
+fn longest_zero_run_in_mixed_word(word: u64) -> u32 {
+    let mut free = !word;
+    let mut len = 0;
+    while free != 0 {
+        len += 1;
+        free &= free << 1;
+    }
+    len
 }
 
 fn apply_byte_zero_run(stats: ByteZeroRun, run: &mut u32, best: &mut u32) {
@@ -274,6 +466,40 @@ fn bitmap_find_contiguous_linear(bitmap: &[u8], count: u32, n: u32, start: u32) 
     let mut run_start = start;
     let mut run_len = 0u32;
     let mut idx = start;
+
+    while idx < count && idx % 8 != 0 {
+        if bitmap_get(bitmap, idx) {
+            idx += 1;
+            run_start = idx;
+            run_len = 0;
+        } else {
+            run_len += 1;
+            if run_len >= n {
+                return Some(run_start);
+            }
+            idx += 1;
+        }
+    }
+
+    while count.saturating_sub(idx) >= 64 {
+        let byte_idx = (idx / 8) as usize;
+        let Some(chunk) = bitmap.get(byte_idx..byte_idx + 8) else {
+            break;
+        };
+        let word = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+
+        if word == u64::MAX {
+            run_start = idx + 64;
+            run_len = 0;
+        } else if let Some(found) =
+            apply_contiguous_word_zero_run(word, idx, n, &mut run_start, &mut run_len)
+        {
+            return Some(found);
+        }
+        idx += 64;
+    }
 
     while idx < count {
         if idx % 8 == 0 && (idx + 8) <= count {
@@ -326,6 +552,36 @@ fn bitmap_find_contiguous_linear(bitmap: &[u8], count: u32, n: u32, start: u32) 
                 return Some(run_start);
             }
             idx += 1;
+        }
+    }
+    None
+}
+
+fn apply_contiguous_word_zero_run(
+    word: u64,
+    base: u32,
+    n: u32,
+    run_start: &mut u32,
+    run_len: &mut u32,
+) -> Option<u32> {
+    if word == 0 {
+        if *run_len == 0 {
+            *run_start = base;
+        }
+        *run_len = run_len.saturating_add(64);
+        return (*run_len >= n).then_some(*run_start);
+    }
+
+    for bit in 0..64 {
+        let pos = base + bit;
+        if (word >> bit) & 1 == 1 {
+            *run_start = pos + 1;
+            *run_len = 0;
+        } else {
+            *run_len += 1;
+            if *run_len >= n {
+                return Some(*run_start);
+            }
         }
     }
     None
@@ -1171,10 +1427,10 @@ fn is_reserved(reserved: &[u32], rel_block: u32) -> bool {
 pub fn reserved_inodes_in_group(geo: &FsGeometry, group: GroupNumber) -> Vec<u32> {
     // Total number of reserved inodes across the entire filesystem
     // s_first_ino is 1-based. Reserved are [1, first_inode).
-    let total_reserved = geo.first_inode.saturating_sub(1);
+    let total_reserved = u64::from(geo.first_inode.saturating_sub(1));
 
     // The number of inodes before this group.
-    let inodes_before = group.0 * geo.inodes_per_group;
+    let inodes_before = u64::from(group.0).saturating_mul(u64::from(geo.inodes_per_group));
 
     if inodes_before >= total_reserved {
         return Vec::new();
@@ -1183,7 +1439,8 @@ pub fn reserved_inodes_in_group(geo: &FsGeometry, group: GroupNumber) -> Vec<u32
     // The number of reserved inodes that fall into this group.
     let remaining_reserved = total_reserved - inodes_before;
 
-    let limit = remaining_reserved.min(geo.inodes_in_group(group));
+    let limit = remaining_reserved.min(u64::from(geo.inodes_in_group(group)));
+    let limit = u32::try_from(limit).unwrap_or(u32::MAX);
     let mut reserved = Vec::with_capacity(limit as usize);
     for i in 0..limit {
         reserved.push(i);
@@ -1195,12 +1452,14 @@ pub fn reserved_inodes_in_group(geo: &FsGeometry, group: GroupNumber) -> Vec<u32
 ///
 /// Reads the GDT block containing `group`, patches the free_blocks/inodes/dirs
 /// fields, recomputes the checksum (if enabled), and writes the block back.
-fn persist_group_desc(
+fn persist_group_desc_with_bitmap_overrides(
     cx: &Cx,
     dev: &dyn BlockDevice,
     pctx: &PersistCtx,
     group: GroupNumber,
     stats: &GroupStats,
+    block_bitmap_override: Option<&[u8]>,
+    inode_bitmap_override: Option<&[u8]>,
 ) -> Result<()> {
     let ds = usize::from(pctx.desc_size);
     if ds == 0 {
@@ -1237,22 +1496,55 @@ fn persist_group_desc(
     };
 
     if pctx.has_metadata_csum {
-        let block_bitmap = dev.read_block(cx, stats.block_bitmap_block)?;
-        let inode_bitmap = dev.read_block(cx, stats.inode_bitmap_block)?;
+        let block_bitmap_buf;
+        let block_bitmap = if let Some(bitmap) = block_bitmap_override {
+            bitmap
+        } else {
+            block_bitmap_buf = dev.read_block(cx, stats.block_bitmap_block)?;
+            block_bitmap_buf.as_slice()
+        };
+        let inode_bitmap_buf;
+        let inode_bitmap = if let Some(bitmap) = inode_bitmap_override {
+            bitmap
+        } else {
+            inode_bitmap_buf = dev.read_block(cx, stats.inode_bitmap_block)?;
+            inode_bitmap_buf.as_slice()
+        };
         ffs_ondisk::ext4::stamp_block_bitmap_checksum(
-            block_bitmap.as_slice(),
+            block_bitmap,
             pctx.csum_seed,
             pctx.blocks_per_group,
             &mut updated,
             pctx.desc_size,
         );
         ffs_ondisk::ext4::stamp_inode_bitmap_checksum(
-            inode_bitmap.as_slice(),
+            inode_bitmap,
             pctx.csum_seed,
             pctx.inodes_per_group,
             &mut updated,
             pctx.desc_size,
         );
+    }
+
+    // bd-0ta4z: once a group's bitmap is written explicitly, the group is no
+    // longer "uninitialized" — clear the matching UNINIT flag so e2fsck reads
+    // the on-disk bitmap as authoritative instead of recomputing it as all-free.
+    // For inode allocations also shrink `itable_unused` (the count of inodes at
+    // the end of the table never yet used) so the freshly allocated inode leaves
+    // the descriptor's "unused inodes" tail. It is monotonic — taken as a `min`
+    // so it never grows back when inodes are freed (the inode table stays
+    // initialized up to the high-water mark).
+    if let Some(ibitmap) = inode_bitmap_override {
+        updated.flags &= !GD_FLAG_INODE_UNINIT;
+        if let Some(highest_used) = highest_set_bit_index(ibitmap, pctx.inodes_per_group) {
+            let unused = pctx
+                .inodes_per_group
+                .saturating_sub(highest_used.saturating_add(1));
+            updated.itable_unused = updated.itable_unused.min(unused);
+        }
+    }
+    if block_bitmap_override.is_some() {
+        updated.flags &= !GD_FLAG_BLOCK_UNINIT;
     }
 
     updated
@@ -1515,8 +1807,7 @@ fn try_alloc_safe(
     let reserved = reserved_blocks_in_group(geo, groups, group);
 
     let bitmap_buf = dev.read_block(cx, groups[gidx].block_bitmap_block)?;
-    let original_bitmap = bitmap_buf.as_slice().to_vec();
-    let mut bitmap = original_bitmap.clone();
+    let mut bitmap = bitmap_buf.as_slice().to_vec();
 
     // Ensure all reserved blocks are marked as allocated in the bitmap.
     for &r in &reserved {
@@ -1556,13 +1847,21 @@ fn try_alloc_safe(
         groups[gidx].free_blocks = previous_free_blocks.saturating_sub(alloc_count);
 
         // Persist group descriptor (includes bitmap checksum stamping if metadata_csum).
-        if let Err(error) = persist_group_desc(cx, dev, pctx, group, &groups[gidx]) {
+        if let Err(error) = persist_group_desc_with_bitmap_overrides(
+            cx,
+            dev,
+            pctx,
+            group,
+            &groups[gidx],
+            Some(&bitmap),
+            None,
+        ) {
             groups[gidx].free_blocks = previous_free_blocks;
             restore_bitmap_after_group_desc_error(
                 cx,
                 dev,
                 groups[gidx].block_bitmap_block,
-                &original_bitmap,
+                bitmap_buf.as_slice(),
                 "block bitmap allocation",
                 error,
             )?;
@@ -1660,7 +1959,15 @@ pub fn free_blocks_persist(
         groups[gidx].free_blocks = groups[gidx].free_blocks.saturating_add(segment.count);
 
         // Persist group descriptor.
-        if let Err(error) = persist_group_desc(cx, dev, pctx, segment.group, &groups[gidx]) {
+        if let Err(error) = persist_group_desc_with_bitmap_overrides(
+            cx,
+            dev,
+            pctx,
+            segment.group,
+            &groups[gidx],
+            Some(&bitmap),
+            None,
+        ) {
             groups[gidx].free_blocks = previous_free_blocks;
             restore_bitmap_after_group_desc_error(
                 cx,
@@ -1774,8 +2081,7 @@ fn try_alloc_batch_in_group(
     let reserved = reserved_blocks_in_group(geo, groups, group);
 
     let bitmap_buf = dev.read_block(cx, groups[gidx].block_bitmap_block)?;
-    let original_bitmap = bitmap_buf.as_slice().to_vec();
-    let mut bitmap = original_bitmap.clone();
+    let mut bitmap = bitmap_buf.as_slice().to_vec();
 
     // Mark reserved blocks.
     for &r in &reserved {
@@ -1789,27 +2095,14 @@ fn try_alloc_batch_in_group(
 
     let to_alloc = max_count.min(groups[gidx].free_blocks);
     let mut allocated = Vec::with_capacity(to_alloc as usize);
-    let mut search_pos = start;
 
-    for _ in 0..to_alloc {
-        let Some(idx) = bitmap_find_free(&bitmap, blocks_in_group, search_pos) else {
-            break;
-        };
-        // Verify not reserved (belt-and-suspenders).
-        if is_reserved(&reserved, idx) {
-            // Skip past this position and continue.
-            search_pos = idx + 1;
-            continue;
-        }
-        bitmap_set(&mut bitmap, idx);
+    bitmap_take_free_bits_cyclic(&mut bitmap, blocks_in_group, to_alloc, start, |idx| {
         let abs = geo.group_block_to_absolute(group, idx);
         allocated.push(BlockAlloc {
             start: abs,
             count: 1,
         });
-        // Advance search position for locality.
-        search_pos = idx + 1;
-    }
+    });
 
     if allocated.is_empty() {
         return Ok(Vec::new());
@@ -1825,13 +2118,21 @@ fn try_alloc_batch_in_group(
     groups[gidx].free_blocks = previous_free_blocks.saturating_sub(count_allocated);
 
     // Single GDT persist for all allocations in this group.
-    if let Err(error) = persist_group_desc(cx, dev, pctx, group, &groups[gidx]) {
+    if let Err(error) = persist_group_desc_with_bitmap_overrides(
+        cx,
+        dev,
+        pctx,
+        group,
+        &groups[gidx],
+        Some(&bitmap),
+        None,
+    ) {
         groups[gidx].free_blocks = previous_free_blocks;
         restore_bitmap_after_group_desc_error(
             cx,
             dev,
             groups[gidx].block_bitmap_block,
-            &original_bitmap,
+            bitmap_buf.as_slice(),
             "batch block bitmap allocation",
             error,
         )?;
@@ -2068,25 +2369,55 @@ fn try_alloc_inode_in_group_persist(
 
     let bitmap_block = groups[gidx].inode_bitmap_block;
     let original_bitmap = dev.read_block(cx, bitmap_block)?.as_slice().to_vec();
+    let mut bitmap = original_bitmap.clone();
     let previous_free_inodes = groups[gidx].free_inodes;
 
-    let alloc = try_alloc_inode_in_group(cx, dev, geo, groups, group)?;
-    if let Some(a) = alloc {
-        if let Err(error) = persist_group_desc(cx, dev, pctx, group, &groups[gidx]) {
-            groups[gidx].free_inodes = previous_free_inodes;
-            restore_bitmap_after_group_desc_error(
-                cx,
-                dev,
-                bitmap_block,
-                &original_bitmap,
-                "inode bitmap allocation",
-                error,
-            )?;
-        }
-        Ok(Some(a))
-    } else {
-        Ok(None)
+    let inodes_in_group = geo.inodes_in_group(group);
+    let reserved = reserved_inodes_in_group(geo, group);
+    for &r in &reserved {
+        bitmap_set(&mut bitmap, r);
     }
+
+    let Some(idx) = bitmap_find_free(&bitmap, inodes_in_group, 0) else {
+        return Ok(None);
+    };
+
+    let ino = u64::from(group.0) * u64::from(geo.inodes_per_group) + u64::from(idx) + 1;
+    if ino > u64::from(geo.total_inodes) {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("allocated inode {ino} exceeds total inode count"),
+        });
+    }
+
+    bitmap_set(&mut bitmap, idx);
+    dev.write_block(cx, bitmap_block, &bitmap)?;
+    groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_sub(1);
+
+    if let Err(error) = persist_group_desc_with_bitmap_overrides(
+        cx,
+        dev,
+        pctx,
+        group,
+        &groups[gidx],
+        None,
+        Some(&bitmap),
+    ) {
+        groups[gidx].free_inodes = previous_free_inodes;
+        restore_bitmap_after_group_desc_error(
+            cx,
+            dev,
+            bitmap_block,
+            &original_bitmap,
+            "inode bitmap allocation",
+            error,
+        )?;
+    }
+
+    Ok(Some(InodeAlloc {
+        ino: InodeNumber(ino),
+        group,
+    }))
 }
 
 /// Free an inode.
@@ -2204,10 +2535,52 @@ pub fn free_inode_persist(
     }
     let bitmap_block = groups[gidx].inode_bitmap_block;
     let original_bitmap = dev.read_block(cx, bitmap_block)?.as_slice().to_vec();
+    let mut bitmap = original_bitmap.clone();
     let previous_free_inodes = groups[gidx].free_inodes;
+    let group = GroupNumber(group_idx);
+    let bit_idx = u32::try_from(ino_zero % u64::from(geo.inodes_per_group)).map_err(|_| {
+        FfsError::Corruption {
+            block: 0,
+            detail: format!("free_inode_persist: inode {} bit index exceeds u32", ino.0),
+        }
+    })?;
+    let inodes_in_group = geo.inodes_in_group(group);
+    if bit_idx >= inodes_in_group {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!(
+                "inode {} is outside group {group_idx} inode capacity",
+                ino.0
+            ),
+        });
+    }
+    if !bitmap_get(&bitmap, bit_idx) {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("double-free: inode {} already free in bitmap", ino.0),
+        });
+    }
+    let reserved = reserved_inodes_in_group(geo, group);
+    if is_reserved(&reserved, bit_idx) {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("attempt to free reserved inode {}", ino.0),
+        });
+    }
 
-    free_inode(cx, dev, geo, groups, ino)?;
-    if let Err(error) = persist_group_desc(cx, dev, pctx, GroupNumber(group_idx), &groups[gidx]) {
+    bitmap_clear(&mut bitmap, bit_idx);
+    dev.write_block(cx, bitmap_block, &bitmap)?;
+    groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_add(1);
+
+    if let Err(error) = persist_group_desc_with_bitmap_overrides(
+        cx,
+        dev,
+        pctx,
+        group,
+        &groups[gidx],
+        None,
+        Some(&bitmap),
+    ) {
         groups[gidx].free_inodes = previous_free_inodes;
         restore_bitmap_after_group_desc_error(
             cx,
@@ -2545,6 +2918,153 @@ mod tests {
         assert_eq!(bitmap_find_contiguous(&bm, 16, 2, 0), None);
     }
 
+    /// Naive first-fit reference: pure per-bit scan, no word/byte fast paths.
+    /// `bitmap_get` reports out-of-range positions as allocated, matching the
+    /// production scan's treatment of a truncated bitmap.
+    fn find_contiguous_linear_naive(bitmap: &[u8], count: u32, n: u32, start: u32) -> Option<u32> {
+        let mut run_start = start;
+        let mut run_len = 0u32;
+        for idx in start..count {
+            if bitmap_get(bitmap, idx) {
+                run_start = idx + 1;
+                run_len = 0;
+            } else {
+                run_len += 1;
+                if run_len >= n {
+                    return Some(run_start);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn bitmap_find_contiguous_golden_report() {
+        use std::fmt::Write as _;
+        // 320 bits crossing multiple 64-bit word boundaries: all-used words,
+        // an all-free word, and mixed words.
+        let mut bm = vec![0xFF_u8; 40];
+        for pos in [70_u32, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80] {
+            bm[(pos / 8) as usize] &= !(1 << (pos % 8));
+        }
+        for byte in bm.iter_mut().take(24).skip(16) {
+            *byte = 0x00; // bits 128..192 all free (a full aligned word)
+        }
+        let count = 320;
+        let mut report = String::new();
+        for n in [1_u32, 8, 11, 12, 32, 64, 65, 128] {
+            for start in [0_u32, 1, 64, 65, 128, 200, 256] {
+                let actual = bitmap_find_contiguous_linear(&bm, count, n, start);
+                let expected = find_contiguous_linear_naive(&bm, count, n, start);
+                assert_eq!(actual, expected, "n={n} start={start}");
+                writeln!(
+                    report,
+                    "FIND_CONTIG_GOLDEN\t{n}\t{start}\t{}",
+                    actual.map_or_else(|| String::from("None"), |p| p.to_string())
+                )
+                .expect("write to String");
+            }
+        }
+        print!("{report}");
+    }
+
+    fn take_free_bits_cyclic_naive(
+        bitmap: &mut [u8],
+        count: u32,
+        max_count: u32,
+        start: u32,
+    ) -> Vec<u32> {
+        let mut taken = Vec::new();
+        let mut search_pos = start;
+        for _ in 0..max_count {
+            let Some(idx) = bitmap_find_free(bitmap, count, search_pos) else {
+                break;
+            };
+            bitmap_set(bitmap, idx);
+            taken.push(idx);
+            search_pos = idx + 1;
+        }
+        taken
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(hex, "{byte:02x}").expect("write to String");
+        }
+        hex
+    }
+
+    #[test]
+    fn bitmap_take_free_bits_cyclic_golden_report() {
+        use std::fmt::Write as _;
+        let cases = vec![
+            ("truncated", Vec::new(), 16, 3, 0),
+            ("start_aligned_dense", vec![0xF0, 0x00, 0xFF], 24, 6, 0),
+            ("unaligned_start", vec![0xEF, 0x00, 0xFE], 24, 7, 5),
+            ("wraparound", vec![0xFF, 0xF0, 0x0F], 24, 8, 20),
+            ("partial_count_wrap", vec![0x00, 0x00, 0x00], 20, 12, 16),
+            (
+                "word_window",
+                vec![
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+                128,
+                10,
+                64,
+            ),
+        ];
+
+        let mut report = String::new();
+        for (name, bytes, count, max_count, start) in cases {
+            let mut actual_bitmap = bytes.clone();
+            let mut actual = Vec::new();
+            let taken =
+                bitmap_take_free_bits_cyclic(&mut actual_bitmap, count, max_count, start, |idx| {
+                    actual.push(idx);
+                });
+
+            let mut expected_bitmap = bytes;
+            let expected =
+                take_free_bits_cyclic_naive(&mut expected_bitmap, count, max_count, start);
+            assert_eq!(taken as usize, actual.len(), "{name}: taken count");
+            assert_eq!(actual, expected, "{name}: allocation order");
+            assert_eq!(actual_bitmap, expected_bitmap, "{name}: bitmap state");
+
+            let allocations = actual
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                report,
+                "BATCH_TAKE_GOLDEN\t{name}\tcount={count}\tmax={max_count}\tstart={start}\talloc={allocations}\tbitmap={}",
+                hex_bytes(&actual_bitmap)
+            )
+            .expect("write to String");
+        }
+        print!("{report}");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn proptest_find_contiguous_matches_naive(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 1..48),
+            n in 1u32..80,
+            start_frac in 0u32..200,
+        ) {
+            let count = u32::try_from(bytes.len()).expect("len fits u32") * 8;
+            let start = (start_frac % (count + 1)).min(count);
+            let got = bitmap_find_contiguous_linear(&bytes, count, n, start);
+            let want = find_contiguous_linear_naive(&bytes, count, n, start);
+            proptest::prop_assert_eq!(got, want, "n={} start={}", n, start);
+        }
+    }
+
     // ── Geometry tests ──────────────────────────────────────────────────
 
     #[test]
@@ -2583,6 +3103,18 @@ mod tests {
         assert_eq!(geo.inodes_in_group(GroupNumber(0)), 2048);
         assert_eq!(geo.inodes_in_group(GroupNumber(2)), 2048);
         assert_eq!(geo.inodes_in_group(GroupNumber(3)), 856);
+    }
+
+    #[test]
+    fn reserved_inodes_large_group_index_does_not_overflow() {
+        let mut geo = make_geometry();
+        geo.inodes_per_group = 65_536;
+        geo.total_inodes = u32::MAX;
+        geo.group_count = u32::MAX;
+        geo.first_inode = 32;
+
+        let reserved = reserved_inodes_in_group(&geo, GroupNumber(65_536));
+        assert!(reserved.is_empty());
     }
 
     // ── Block allocation tests ──────────────────────────────────────────
@@ -5155,6 +5687,20 @@ InodeAlloc { ino: InodeNumber(17), group: GroupNumber(1) }
         }
 
         #[test]
+        fn proptest_bitmap_find_free_matches_naive(
+            (ref bm, count) in bitmap_strat(),
+            start_seed in any::<u32>(),
+        ) {
+            // Ground-truth for the word-at-a-time find-free scan: first free bit
+            // in [start, count), else in [0, start).
+            let start = start_seed % count;
+            let naive = (start..count)
+                .find(|&i| !bitmap_get(bm, i))
+                .or_else(|| (0..start).find(|&i| !bitmap_get(bm, i)));
+            prop_assert_eq!(bitmap_find_free(bm, count, start), naive);
+        }
+
+        #[test]
         fn proptest_bitmap_find_free_returns_zero_bit(
             (ref bm, count) in bitmap_strat(),
             start_seed in any::<u32>(),
@@ -5187,6 +5733,30 @@ InodeAlloc { ino: InodeNumber(17), group: GroupNumber(1) }
                     );
                 }
             }
+        }
+
+        #[test]
+        fn proptest_bitmap_find_contiguous_matches_naive_wraparound(
+            (ref bm, count) in bitmap_strat(),
+            n in 1_u32..32,
+            start_seed in any::<u32>(),
+        ) {
+            let start = start_seed % count;
+            let naive_range = |range: std::ops::Range<u32>| {
+                range.into_iter().find(|&pos| {
+                    pos.checked_add(n)
+                        .is_some_and(|end| end <= count && (pos..end).all(|bit| !bitmap_get(bm, bit)))
+                })
+            };
+            let expected = if n > count {
+                None
+            } else {
+                naive_range(start..count).or_else(|| {
+                    let pass2_end = start.saturating_add(n).saturating_sub(1).min(count);
+                    naive_range(0..pass2_end)
+                })
+            };
+            prop_assert_eq!(bitmap_find_contiguous(bm, count, n, start), expected);
         }
 
         #[test]
@@ -6342,6 +6912,15 @@ InodeAlloc { ino: InodeNumber(17), group: GroupNumber(1) }
     }
 
     #[test]
+    fn largest_free_run_spans_word_boundary_bit128() {
+        let mut bitmap = [0xFFu8; 40];
+        for bit in 120..136 {
+            bitmap_clear(&mut bitmap, bit);
+        }
+        assert_eq!(bitmap_largest_free_run(&bitmap, 320), 16);
+    }
+
+    #[test]
     fn largest_free_run_count_smaller_than_byte_remainder() {
         // 1 byte with bits 0..3 free, bits 4..7 used. count=8 → run=4.
         let bitmap = [0xF0u8];
@@ -6381,5 +6960,31 @@ InodeAlloc { ino: InodeNumber(17), group: GroupNumber(1) }
             bitmap_largest_free_run(&bitmap, count),
             bitmap_count_free(&bitmap, count)
         );
+    }
+
+    #[test]
+    fn bitmap_largest_free_run_golden_report() {
+        let cases: &[(&str, &[u8], u32)] = &[
+            ("empty_zero", &[], 0),
+            ("missing_byte_nonzero_count", &[], 8),
+            ("all_used", &[0xFF, 0xFF, 0xFF, 0xFF], 32),
+            ("all_free_partial", &[0x00, 0x00, 0x00], 20),
+            ("lsb_prefix", &[0xF0], 8),
+            ("spans_byte", &[0x80, 0x01], 16),
+            ("full_zero_extends", &[0x80, 0x00, 0x00, 0xFF], 32),
+            (
+                "fragmented",
+                &[0x55, 0x33, 0xF0, 0x00, 0x7F, 0xFF, 0x01],
+                53,
+            ),
+            ("truncated_mid_run", &[0x00, 0x00], 24),
+        ];
+
+        println!("LARGEST_FREE_RUN_GOLDEN_BEGIN");
+        for (name, bitmap, count) in cases {
+            let result = bitmap_largest_free_run(bitmap, *count);
+            println!("case={name}\tcount={count}\tresult={result}");
+        }
+        println!("LARGEST_FREE_RUN_GOLDEN_END");
     }
 }

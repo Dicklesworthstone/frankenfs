@@ -13,14 +13,17 @@
 //! - **punch**: `punch_hole` — remove mappings without changing file size.
 //! - **unwritten**: `mark_written` — clear unwritten flag on extents.
 
-use std::collections::BTreeMap;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
+};
 
 use asupersync::Cx;
 use ffs_alloc::{AllocHint, BlockAlloc, FsGeometry, GroupStats};
 use ffs_block::BlockDevice;
 use ffs_btree::{BlockAllocator, SearchResult};
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::{EXT_INIT_MAX_LEN, Ext4Extent, ExtentTree, parse_extent_tree};
+use ffs_ondisk::{EXT_INIT_MAX_LEN, Ext4Extent, Ext4ExtentHeader, ExtentTree, parse_extent_tree};
 use ffs_types::BlockNumber;
 use parking_lot::RwLock;
 
@@ -58,8 +61,155 @@ pub fn map_logical_to_physical(
     if count == 0 {
         return Ok(Vec::new());
     }
-    validate_root_header("map_logical_to_physical", root_bytes)?;
+    let (root_header, root_tree) =
+        parse_and_validate_root_header("map_logical_to_physical", root_bytes)?;
 
+    let end = checked_logical_range_end("map_logical_to_physical", logical_start, count)?;
+
+    if count == 1 {
+        return map_single_logical_to_physical(cx, dev, &root_header, &root_tree, logical_start);
+    }
+
+    map_logical_range_by_walk(cx, dev, root_bytes, logical_start, end)
+}
+
+fn map_single_logical_to_physical(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    root_header: &Ext4ExtentHeader,
+    root_tree: &ExtentTree,
+    logical_block: u32,
+) -> Result<Vec<ExtentMapping>> {
+    cx_checkpoint(cx)?;
+    let result = ffs_btree::search_parsed_root(cx, dev, root_header, root_tree, logical_block)?;
+    Ok(vec![single_mapping_from_search_result(
+        "map_logical_to_physical",
+        logical_block,
+        &result,
+    )?])
+}
+
+fn map_logical_range_by_walk(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    root_bytes: &[u8; 60],
+    logical_start: u32,
+    end: u64,
+) -> Result<Vec<ExtentMapping>> {
+    let mut mappings = Vec::new();
+    let mut pos = u64::from(logical_start);
+
+    ffs_btree::walk_range(
+        cx,
+        dev,
+        root_bytes,
+        logical_start,
+        end.saturating_sub(pos),
+        &mut |extent: &Ext4Extent| {
+            if pos >= end {
+                return Ok(());
+            }
+
+            let actual_len = u32::from(extent.actual_len());
+            let extent_start = u64::from(extent.logical_block);
+            let extent_end = extent_start.saturating_add(u64::from(actual_len));
+            if extent_end <= pos {
+                return Ok(());
+            }
+
+            if extent_start > pos {
+                let hole_end = extent_start.min(end);
+                append_hole_mappings(cx, &mut mappings, pos, hole_end)?;
+                pos = hole_end;
+                if pos >= end {
+                    return Ok(());
+                }
+            }
+
+            let map_start = pos.max(extent_start);
+            let map_end = extent_end.min(end);
+            if map_start >= map_end {
+                return Ok(());
+            }
+
+            cx_checkpoint(cx)?;
+            validate_physical_span("map_logical_to_physical", extent.physical_start, actual_len)?;
+            let mapping_count = u32::try_from(map_end - map_start).map_err(|_| {
+                FfsError::InvalidGeometry(format!(
+                    "map_logical_to_physical: extent chunk length {} exceeds u32",
+                    map_end - map_start
+                ))
+            })?;
+            let mapping_start = u32::try_from(map_start).map_err(|_| {
+                FfsError::InvalidGeometry(format!(
+                    "map_logical_to_physical: logical position {map_start} exceeds u32 block range"
+                ))
+            })?;
+            mappings.push(ExtentMapping {
+                logical_start: mapping_start,
+                physical_start: checked_physical_add(
+                    "map_logical_to_physical",
+                    extent.physical_start,
+                    map_start - extent_start,
+                )?,
+                count: mapping_count,
+                unwritten: extent.is_unwritten(),
+            });
+            pos = map_end;
+            Ok(())
+        },
+    )?;
+
+    append_hole_mappings(cx, &mut mappings, pos, end)?;
+    Ok(mappings)
+}
+
+fn append_hole_mappings(
+    cx: &Cx,
+    mappings: &mut Vec<ExtentMapping>,
+    mut start: u64,
+    end: u64,
+) -> Result<()> {
+    while start < end {
+        cx_checkpoint(cx)?;
+        let to_map = (end - start).min(u64::from(u32::MAX));
+        if to_map == 0 {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "map_logical_to_physical: zero-length hole traversal at logical block {start}"
+                ),
+            });
+        }
+        let logical_start = u32::try_from(start).map_err(|_| {
+            FfsError::InvalidGeometry(format!(
+                "map_logical_to_physical: hole position {start} exceeds u32 block range"
+            ))
+        })?;
+        let hole_count = u32::try_from(to_map).map_err(|_| {
+            FfsError::InvalidGeometry(format!(
+                "map_logical_to_physical: hole chunk length {to_map} exceeds u32"
+            ))
+        })?;
+        mappings.push(ExtentMapping {
+            logical_start,
+            physical_start: 0,
+            count: hole_count,
+            unwritten: false,
+        });
+        start += to_map;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn map_logical_range_by_search(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    root_bytes: &[u8; 60],
+    logical_start: u32,
+    count: u64,
+) -> Result<Vec<ExtentMapping>> {
     let mut mappings = Vec::new();
     let mut pos = u64::from(logical_start);
     let end = checked_logical_range_end("map_logical_to_physical", logical_start, count)?;
@@ -157,6 +307,21 @@ pub struct GroupBlockAllocator<'a> {
     pub groups: &'a mut [GroupStats],
     pub hint: AllocHint,
     pub pctx: &'a ffs_alloc::PersistCtx,
+    /// Owning inode number — keys the external extent-block CRC32C tail.
+    pub ino: u32,
+    /// Owning inode `i_generation` — second key for the extent-block CRC32C.
+    pub generation: u32,
+}
+
+/// Identifies the inode that owns an extent tree.
+///
+/// External (depth >= 1) extent-tree blocks are stamped with the
+/// `metadata_csum` CRC32C tail keyed on the inode number and its
+/// `i_generation` (see `ffs_ondisk::ext4::stamp_extent_block_checksum`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExtentOwner {
+    pub ino: u32,
+    pub generation: u32,
 }
 
 impl BlockAllocator for GroupBlockAllocator<'_> {
@@ -178,6 +343,21 @@ impl BlockAllocator for GroupBlockAllocator<'_> {
     fn free_block(&mut self, cx: &Cx, block: BlockNumber) -> Result<()> {
         ffs_alloc::free_blocks_persist(cx, self.dev, self.geo, self.groups, block, 1, self.pctx)
     }
+
+    fn finalize_node(&self, block: &mut [u8]) {
+        // External extent-tree nodes carry a CRC32C tail on metadata_csum
+        // filesystems, keyed on the filesystem csum seed plus the owning
+        // inode's number and generation. The inode `i_block` root is covered
+        // by the inode checksum instead and never reaches this hook.
+        if self.pctx.has_metadata_csum {
+            ffs_ondisk::ext4::stamp_extent_block_checksum(
+                block,
+                self.pctx.csum_seed,
+                self.ino,
+                self.generation,
+            );
+        }
+    }
 }
 
 /// Allocate and map `count` contiguous logical blocks starting at `logical_start`.
@@ -198,6 +378,7 @@ pub fn allocate_extent(
     count: u32,
     hint: &AllocHint,
     pctx: &ffs_alloc::PersistCtx,
+    owner: ExtentOwner,
 ) -> Result<ExtentMapping> {
     cx_checkpoint(cx)?;
 
@@ -236,6 +417,8 @@ pub fn allocate_extent(
         groups,
         hint: tree_hint,
         pctx,
+        ino: owner.ino,
+        generation: owner.generation,
     };
     ffs_btree::insert(cx, dev, root_bytes, extent, &mut tree_alloc)?;
 
@@ -262,6 +445,7 @@ pub fn allocate_unwritten_extent(
     count: u32,
     hint: &AllocHint,
     pctx: &ffs_alloc::PersistCtx,
+    owner: ExtentOwner,
 ) -> Result<ExtentMapping> {
     cx_checkpoint(cx)?;
 
@@ -295,6 +479,8 @@ pub fn allocate_unwritten_extent(
         groups,
         hint: tree_hint,
         pctx,
+        ino: owner.ino,
+        generation: owner.generation,
     };
     ffs_btree::insert(cx, dev, root_bytes, extent, &mut tree_alloc)?;
 
@@ -311,6 +497,7 @@ pub fn allocate_unwritten_extent(
 /// Truncate the extent tree: remove all mappings beyond `new_logical_end`.
 ///
 /// Returns the total number of physical blocks freed.
+#[expect(clippy::too_many_arguments)]
 pub fn truncate_extents(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -319,6 +506,7 @@ pub fn truncate_extents(
     groups: &mut [GroupStats],
     new_logical_end: u32,
     pctx: &ffs_alloc::PersistCtx,
+    owner: ExtentOwner,
 ) -> Result<u64> {
     cx_checkpoint(cx)?;
     validate_root_header("truncate_extents", root_bytes)?;
@@ -333,6 +521,8 @@ pub fn truncate_extents(
             groups,
             hint: AllocHint::default(),
             pctx,
+            ino: owner.ino,
+            generation: owner.generation,
         };
         let count_to_delete = (1_u64 << 32).saturating_sub(u64::from(new_logical_end));
         ffs_btree::delete_range(
@@ -377,6 +567,7 @@ pub fn punch_hole(
     logical_start: u32,
     count: u64,
     pctx: &ffs_alloc::PersistCtx,
+    owner: ExtentOwner,
 ) -> Result<u64> {
     if count == 0 {
         return Ok(0);
@@ -409,6 +600,8 @@ pub fn punch_hole(
             groups,
             hint: AllocHint::default(),
             pctx,
+            ino: owner.ino,
+            generation: owner.generation,
         };
 
         let ext_len = u32::from(ext.actual_len());
@@ -470,6 +663,7 @@ pub fn collapse_range(
     logical_start: u32,
     count: u32,
     pctx: &ffs_alloc::PersistCtx,
+    owner: ExtentOwner,
 ) -> Result<u64> {
     if count == 0 {
         return Ok(0);
@@ -491,6 +685,7 @@ pub fn collapse_range(
         logical_start,
         u64::from(count),
         pctx,
+        owner,
     )?;
 
     // Phase 2: snapshot the tail before mutating the tree. We cannot
@@ -516,6 +711,8 @@ pub fn collapse_range(
         groups,
         hint: AllocHint::default(),
         pctx,
+        ino: owner.ino,
+        generation: owner.generation,
     };
     for ext in &tail {
         ffs_btree::delete_range(
@@ -564,6 +761,7 @@ pub fn insert_range(
     logical_start: u32,
     count: u32,
     pctx: &ffs_alloc::PersistCtx,
+    owner: ExtentOwner,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
@@ -597,6 +795,8 @@ pub fn insert_range(
         groups,
         hint: AllocHint::default(),
         pctx,
+        ino: owner.ino,
+        generation: owner.generation,
     };
 
     if let Some(ext) = straddler {
@@ -661,21 +861,15 @@ fn split_insert_range_straddler(
     let right_len_u32 = u32::try_from(ext_end - cut)
         .map_err(|_| ffs_error::FfsError::Format("insert_range: split tail exceeds u32".into()))?;
     let unwritten = ext.is_unwritten();
-    let make_raw_len = |len: u32, unwritten: bool| -> Result<u16> {
-        let len16 = u16::try_from(len).map_err(|_| {
-            ffs_error::FfsError::Format("insert_range: extent split exceeds u16".into())
-        })?;
-        Ok(if unwritten { len16 | (1 << 15) } else { len16 })
-    };
     let left = Ext4Extent {
         logical_block: ext.logical_block,
-        raw_len: make_raw_len(left_len_u32, unwritten)?,
+        raw_len: encode_split_extent_len("insert_range split left", left_len_u32, unwritten)?,
         physical_start: ext.physical_start,
     };
     let right = Ext4Extent {
         logical_block: u32::try_from(cut)
             .map_err(|_| ffs_error::FfsError::Format("insert_range: cut exceeds u32".into()))?,
-        raw_len: make_raw_len(right_len_u32, unwritten)?,
+        raw_len: encode_split_extent_len("insert_range split right", right_len_u32, unwritten)?,
         physical_start: checked_physical_add(
             "insert_range split tail",
             ext.physical_start,
@@ -704,6 +898,7 @@ pub fn mark_written(
     logical_start: u32,
     count: u32,
     pctx: &ffs_alloc::PersistCtx,
+    owner: ExtentOwner,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
@@ -736,6 +931,8 @@ pub fn mark_written(
             groups,
             hint: AllocHint::default(),
             pctx,
+            ino: owner.ino,
+            generation: owner.generation,
         };
 
         // All branches start by removing the old extent.
@@ -936,6 +1133,14 @@ fn encode_unwritten_len(label: &str, len: u64) -> Result<u16> {
     Ok(len | UNWRITTEN_FLAG)
 }
 
+fn encode_split_extent_len(label: &str, len: u32, unwritten: bool) -> Result<u16> {
+    if unwritten {
+        encode_unwritten_len(label, u64::from(len))
+    } else {
+        encode_written_len(label, u64::from(len))
+    }
+}
+
 fn cx_checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
@@ -984,7 +1189,10 @@ fn validate_shifted_extent_fits_logical_space(
     Ok(())
 }
 
-fn validate_root_header(op: &str, root_bytes: &[u8; 60]) -> Result<()> {
+fn parse_and_validate_root_header(
+    op: &str,
+    root_bytes: &[u8; 60],
+) -> Result<(Ext4ExtentHeader, ExtentTree)> {
     let (header, tree) = parse_extent_tree(root_bytes).map_err(|err| FfsError::Corruption {
         block: 0,
         detail: format!("{op}: invalid root extent header: {err}"),
@@ -1004,7 +1212,7 @@ fn validate_root_header(op: &str, root_bytes: &[u8; 60]) -> Result<()> {
             detail: format!("{op}: non-leaf extent root has zero entries"),
         });
     }
-    if let ExtentTree::Leaf(extents) = tree {
+    if let ExtentTree::Leaf(extents) = &tree {
         if extents.iter().any(|ext| ext.actual_len() == 0) {
             return Err(FfsError::Corruption {
                 block: 0,
@@ -1012,7 +1220,11 @@ fn validate_root_header(op: &str, root_bytes: &[u8; 60]) -> Result<()> {
             });
         }
     }
-    Ok(())
+    Ok((header, tree))
+}
+
+fn validate_root_header(op: &str, root_bytes: &[u8; 60]) -> Result<()> {
+    parse_and_validate_root_header(op, root_bytes).map(|_| ())
 }
 
 // ── Extent cache ────────────────────────────────────────────────────────────
@@ -1048,6 +1260,13 @@ struct ExtentCacheInner {
     /// number) that prevents cross-scope cache pollution when a single cache
     /// instance is shared across many objects.
     entries: BTreeMap<(u64, u32), CacheEntry>,
+    /// Lazy min-heap of `(last_access, key)` eviction candidates.
+    ///
+    /// `BinaryHeap` does not support arbitrary removal, so lookup and insert
+    /// push fresh states and eviction discards stale heap rows until it reaches
+    /// a row matching the current cache entry. The tuple matches the previous
+    /// scan tie-break: oldest access first, then lexicographically smallest key.
+    eviction_heap: BinaryHeap<Reverse<(u64, (u64, u32))>>,
     /// Maximum number of entries before eviction.
     capacity: usize,
     /// Monotonically increasing generation; bumped on bulk invalidation.
@@ -1103,6 +1322,7 @@ impl ExtentCache {
         Self {
             inner: RwLock::new(ExtentCacheInner {
                 entries: BTreeMap::new(),
+                eviction_heap: BinaryHeap::with_capacity(capacity),
                 capacity,
                 generation: 0,
                 hits: 0,
@@ -1157,6 +1377,9 @@ impl ExtentCache {
             if let Some(e) = inner.entries.get_mut(&key) {
                 e.last_access = clock;
             }
+            if inner.entries.len() >= inner.capacity && inner.capacity != 0 {
+                push_eviction_state(&mut inner, key, clock);
+            }
             Some(ExtentMapping {
                 logical_start: logical_block,
                 physical_start,
@@ -1193,12 +1416,7 @@ impl ExtentCache {
 
         // Evict if at capacity and this is a new key.
         if inner.entries.len() >= inner.capacity && !inner.entries.contains_key(&key) {
-            // Find entry with lowest last_access.
-            if let Some((&victim_key, _)) = inner.entries.iter().min_by_key(|(_, e)| e.last_access)
-            {
-                inner.entries.remove(&victim_key);
-                inner.evictions = inner.evictions.saturating_add(1);
-            }
+            evict_lru_entry(&mut inner);
         }
 
         inner.entries.insert(
@@ -1209,6 +1427,7 @@ impl ExtentCache {
                 last_access: access_clock,
             },
         );
+        push_eviction_state(&mut inner, key, access_clock);
     }
 
     /// Invalidate all cached entries in the given namespace whose range overlaps
@@ -1239,6 +1458,7 @@ impl ExtentCache {
         for k in to_remove {
             inner.entries.remove(&k);
         }
+        compact_eviction_heap_if_needed(&mut inner);
     }
 
     /// Invalidate all entries (bulk reset). Bumps the generation counter so
@@ -1246,6 +1466,7 @@ impl ExtentCache {
     pub fn invalidate_all(&self) {
         let mut inner = self.inner.write();
         inner.entries.clear();
+        inner.eviction_heap.clear();
         inner.generation = inner.generation.saturating_add(1);
     }
 
@@ -1269,6 +1490,56 @@ impl ExtentCache {
         inner.misses = 0;
         inner.evictions = 0;
     }
+}
+
+fn push_eviction_state(inner: &mut ExtentCacheInner, key: (u64, u32), last_access: u64) {
+    inner.eviction_heap.push(Reverse((last_access, key)));
+    compact_eviction_heap_if_needed(inner);
+}
+
+fn evict_lru_entry(inner: &mut ExtentCacheInner) {
+    while let Some(Reverse((last_access, key))) = inner.eviction_heap.pop() {
+        if inner
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.last_access == last_access)
+        {
+            inner.entries.remove(&key);
+            inner.evictions = inner.evictions.saturating_add(1);
+            return;
+        }
+    }
+
+    let victim_key = inner
+        .entries
+        .iter()
+        .min_by_key(|(key, entry)| (entry.last_access, **key))
+        .map(|(key, _)| *key);
+    if let Some(key) = victim_key {
+        inner.entries.remove(&key);
+        inner.evictions = inner.evictions.saturating_add(1);
+    }
+}
+
+fn compact_eviction_heap_if_needed(inner: &mut ExtentCacheInner) {
+    let live_entries = inner.entries.len();
+    if live_entries == 0 {
+        inner.eviction_heap.clear();
+        return;
+    }
+
+    let max_lazy_rows = live_entries.saturating_mul(4).max(64);
+    if inner.eviction_heap.len() <= max_lazy_rows {
+        return;
+    }
+
+    inner.eviction_heap.clear();
+    inner.eviction_heap.extend(
+        inner
+            .entries
+            .iter()
+            .map(|(&key, entry)| Reverse((entry.last_access, key))),
+    );
 }
 
 impl Default for ExtentCache {
@@ -1307,6 +1578,10 @@ pub fn cached_map_logical_to_physical(
         }
     }
 
+    if count == 1 {
+        return cached_single_block_miss(cx, dev, root_bytes, logical_start, cache, ns);
+    }
+
     // Full tree walk (miss path).
     let mappings = map_logical_to_physical(cx, dev, root_bytes, logical_start, count)?;
 
@@ -1316,6 +1591,106 @@ pub fn cached_map_logical_to_physical(
     }
 
     Ok(mappings)
+}
+
+fn cached_single_block_miss(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    root_bytes: &[u8; 60],
+    logical_start: u32,
+    cache: &ExtentCache,
+    ns: u64,
+) -> Result<Vec<ExtentMapping>> {
+    validate_root_header("map_logical_to_physical", root_bytes)?;
+    let _end = checked_logical_range_end("map_logical_to_physical", logical_start, 1)?;
+
+    cx_checkpoint(cx)?;
+    let window = ffs_btree::search_with_leaf_window(cx, dev, root_bytes, logical_start)?;
+    let mapping = single_mapping_from_search_result(
+        "map_logical_to_physical",
+        logical_start,
+        &window.result,
+    )?;
+
+    cache_valid_leaf_extents(cache, ns, &window.extents);
+    if let SearchResult::Hole { hole_len } = window.result {
+        cache_hole_interval(cache, ns, logical_start, hole_len);
+    }
+
+    Ok(vec![mapping])
+}
+
+fn single_mapping_from_search_result(
+    op: &str,
+    logical_start: u32,
+    result: &SearchResult,
+) -> Result<ExtentMapping> {
+    match result {
+        SearchResult::Found {
+            extent,
+            offset_in_extent,
+        } => {
+            let actual_len = u32::from(extent.actual_len());
+            validate_physical_span(op, extent.physical_start, actual_len)?;
+            Ok(ExtentMapping {
+                logical_start,
+                physical_start: checked_physical_add(
+                    op,
+                    extent.physical_start,
+                    u64::from(*offset_in_extent),
+                )?,
+                count: 1,
+                unwritten: extent.is_unwritten(),
+            })
+        }
+        SearchResult::Hole { .. } => Ok(ExtentMapping {
+            logical_start,
+            physical_start: 0,
+            count: 1,
+            unwritten: false,
+        }),
+    }
+}
+
+fn cache_valid_leaf_extents(cache: &ExtentCache, ns: u64, extents: &[Ext4Extent]) {
+    for extent in extents {
+        let count = u32::from(extent.actual_len());
+        if count == 0
+            || validate_physical_span("map_logical_to_physical", extent.physical_start, count)
+                .is_err()
+        {
+            continue;
+        }
+        cache.insert(
+            ns,
+            ExtentMapping {
+                logical_start: extent.logical_block,
+                physical_start: extent.physical_start,
+                count,
+                unwritten: extent.is_unwritten(),
+            },
+        );
+    }
+}
+
+fn cache_hole_interval(cache: &ExtentCache, ns: u64, logical_start: u32, hole_len: u64) {
+    let remaining_space = LOGICAL_BLOCK_SPACE.saturating_sub(u64::from(logical_start));
+    let count = hole_len.min(remaining_space).min(u64::from(u32::MAX));
+    let Ok(count) = u32::try_from(count) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    cache.insert(
+        ns,
+        ExtentMapping {
+            logical_start,
+            physical_start: 0,
+            count,
+            unwritten: false,
+        },
+    );
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1331,6 +1706,7 @@ mod tests {
     struct MemBlockDevice {
         block_size: u32,
         blocks: Mutex<HashMap<u64, Vec<u8>>>,
+        read_counts: Mutex<HashMap<u64, u64>>,
     }
 
     impl MemBlockDevice {
@@ -1338,12 +1714,22 @@ mod tests {
             Self {
                 block_size,
                 blocks: Mutex::new(HashMap::new()),
+                read_counts: Mutex::new(HashMap::new()),
             }
+        }
+
+        fn clear_read_counts(&self) {
+            self.read_counts.lock().clear();
+        }
+
+        fn total_reads(&self) -> u64 {
+            self.read_counts.lock().values().sum()
         }
     }
 
     impl BlockDevice for MemBlockDevice {
         fn read_block(&self, _cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            *self.read_counts.lock().entry(block.0).or_insert(0) += 1;
             let blocks = self.blocks.lock();
             blocks.get(&block.0).map_or_else(
                 || Ok(BlockBuf::new(vec![0u8; self.block_size as usize])),
@@ -1493,7 +1879,19 @@ mod tests {
 
         let pctx = mock_pctx();
         let hint = AllocHint::default();
-        allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 5, &hint, &pctx).unwrap();
+        allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            5,
+            &hint,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         let mappings = map_logical_to_physical(&cx, &dev, &root, 0, 10).unwrap();
         assert_eq!(mappings.len(), 2);
@@ -1525,6 +1923,7 @@ mod tests {
             3,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         let unwritten = allocate_unwritten_extent(
@@ -1537,6 +1936,7 @@ mod tests {
             2,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         let mappings = map_logical_to_physical(&cx, &dev, &root, 0, 9).unwrap();
@@ -1645,6 +2045,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         assert_eq!(mapping.logical_start, 0);
@@ -1671,6 +2072,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         let m2 = allocate_extent(
@@ -1686,6 +2088,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 ..Default::default()
             },
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         assert_eq!(m2.logical_start, 5);
@@ -1724,6 +2127,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             1,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         match result.expect_err("expected Corruption for invalid non-leaf root") {
             FfsError::Corruption { detail, .. } => {
@@ -1755,6 +2159,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         assert!(mapping.unwritten);
@@ -1788,6 +2193,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         allocate_extent(
@@ -1800,13 +2206,24 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Truncate at logical block 10 — should remove second extent.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 10);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -1841,10 +2258,21 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 10);
 
         // Tree should be empty.
@@ -1878,13 +2306,25 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Punch hole in blocks 3-6 (4 blocks).
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4, &pctx).unwrap();
+        let freed = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            3,
+            4,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert!(freed > 0);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -1900,7 +2340,18 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let mut root = empty_root();
         let pctx = mock_pctx();
 
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
+        let freed = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 0);
     }
 
@@ -1913,7 +2364,17 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let mut root = empty_root();
         let pctx = mock_pctx();
 
-        let result = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, u32::MAX, 2, &pctx);
+        let result = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            u32::MAX,
+            2,
+            &pctx,
+            ExtentOwner::default(),
+        );
         assert_invalid_logical_range(result, "punch_hole");
     }
 
@@ -1938,6 +2399,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         allocate_extent(
@@ -1950,10 +2412,22 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 2, 3, &pctx).unwrap();
+        let freed = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            2,
+            3,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 3);
 
         let mappings = map_logical_to_physical(&cx, &dev, &root, 0, 30).unwrap();
@@ -1999,6 +2473,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -2009,7 +2484,18 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         assert!(extent.is_unwritten());
 
         // Mark entire range as written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Verify now written.
         let extent = found_extent(&cx, &dev, &root, 0)
@@ -2037,10 +2523,22 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             1,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, u32::MAX, 1, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            u32::MAX,
+            1,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         let extent = found_extent(&cx, &dev, &root, u32::MAX)
             .unwrap()
@@ -2059,7 +2557,17 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let mut root = empty_root();
         let pctx = mock_pctx();
 
-        let result = mark_written(&cx, &dev, &mut root, &geo, &mut groups, u32::MAX, 2, &pctx);
+        let result = mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            u32::MAX,
+            2,
+            &pctx,
+            ExtentOwner::default(),
+        );
         assert!(matches!(result, Err(FfsError::InvalidGeometry(_))));
     }
 
@@ -2083,11 +2591,23 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // Mark blocks 3-6 as written (partial range).
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 3, 4, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            3,
+            4,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Block 0 should still be unwritten.
         let extent = found_extent(&cx, &dev, &root, 0)
@@ -2136,6 +2656,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             0,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         assert!(result.is_err());
     }
@@ -2160,6 +2681,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             32768,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         assert!(result.is_err());
     }
@@ -2184,6 +2706,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         let m2 = allocate_extent(
@@ -2196,6 +2719,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -2211,6 +2735,44 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
     }
 
     #[test]
+    fn map_depth1_range_matches_repeated_search_and_reads_leaf_once() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+        let pctx = mock_pctx();
+
+        for logical in 0..100_u32 {
+            allocate_extent(
+                &cx,
+                &dev,
+                &mut root,
+                &geo,
+                &mut groups,
+                logical,
+                1,
+                &AllocHint::default(),
+                &pctx,
+                ExtentOwner::default(),
+            )
+            .unwrap();
+        }
+
+        dev.clear_read_counts();
+        let expected = map_logical_range_by_search(&cx, &dev, &root, 10, 50).unwrap();
+        let repeated_search_reads = dev.total_reads();
+
+        dev.clear_read_counts();
+        let actual = map_logical_to_physical(&cx, &dev, &root, 10, 50).unwrap();
+        let range_walk_reads = dev.total_reads();
+
+        assert_eq!(actual, expected);
+        assert_eq!(range_walk_reads, 1);
+        assert!(repeated_search_reads > range_walk_reads);
+    }
+
+    #[test]
     fn truncate_empty_tree_is_noop() {
         let cx = test_cx();
         let dev = MemBlockDevice::new(4096);
@@ -2219,7 +2781,17 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let mut root = empty_root();
         let pctx = mock_pctx();
 
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 0);
     }
 
@@ -2243,6 +2815,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -2381,11 +2954,23 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // mark_written should be a no-op since the extent is already written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Verify the extent is still there and still written.
         let extent = found_extent(&cx, &dev, &root, 0)
@@ -2414,7 +2999,18 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let pctx = mock_pctx();
 
         // mark_written on empty tree should succeed with no changes.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Tree should still be empty.
         let mut count = 0;
@@ -2446,13 +3042,25 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Punch hole in blocks 3-6 within the unwritten extent.
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4, &pctx).unwrap();
+        let freed = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            3,
+            4,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert!(freed > 0);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -2493,6 +3101,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             0,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         assert!(
             matches!(result, Err(FfsError::Format(_))),
@@ -2519,6 +3128,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             32768,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         assert!(
             matches!(result, Err(FfsError::Format(_))),
@@ -2550,6 +3160,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         assert!(
             matches!(result, Err(FfsError::NoSpace)),
@@ -2581,6 +3192,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         assert!(
             matches!(result, Err(FfsError::NoSpace)),
@@ -2610,6 +3222,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         allocate_unwritten_extent(
@@ -2622,6 +3235,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -2636,7 +3250,18 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         assert!(extent.is_unwritten());
 
         // Mark blocks 3-7 as written, spanning both extents.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 3, 5, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            3,
+            5,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Block 1 should still be unwritten (left residual of first extent).
         let extent = found_extent(&cx, &dev, &root, 1)
@@ -2690,12 +3315,24 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 4,
                 &AllocHint::default(),
                 &pctx,
+                ExtentOwner::default(),
             )
             .unwrap();
         }
 
         // Mark the entire range as written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 12, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            12,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // All blocks should now be written.
         for block in [0, 3, 4, 7, 8, 11] {
@@ -2731,6 +3368,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         allocate_unwritten_extent(
@@ -2743,11 +3381,23 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // Mark [7-13] as written — spans tail of first, head of second.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 7, 7, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            7,
+            7,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Blocks 0-6: unwritten (left residual of first extent).
         let extent = found_extent(&cx, &dev, &root, 3)
@@ -2798,12 +3448,24 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         assert!(mapping.unwritten);
 
         // Step 2: mark blocks 0-4 as written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 5, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            5,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Verify: blocks 0-4 written, blocks 5-9 still unwritten.
         let extent = found_extent(&cx, &dev, &root, 2)
@@ -2816,7 +3478,17 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         assert!(extent.is_unwritten());
 
         // Step 3: truncate at block 5 — should remove the unwritten tail.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 5, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            5,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 5);
 
         // Only the written extent [0-4] should remain.
@@ -2830,7 +3502,17 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         assert_eq!(count, 1);
 
         // Step 4: truncate everything.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 5);
 
         // All blocks should be freed.
@@ -2891,6 +3573,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             32767,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         // Should be NoSpace (not enough blocks) or Ok, but NOT Format.
         assert!(
@@ -2919,11 +3602,23 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // Punch exactly the full extent.
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
+        let freed = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 10);
 
         // Tree should be empty.
@@ -2945,7 +3640,17 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let mut root = empty_root();
         let pctx = mock_pctx();
 
-        let result = collapse_range(&cx, &dev, &mut root, &geo, &mut groups, u32::MAX, 2, &pctx);
+        let result = collapse_range(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            u32::MAX,
+            2,
+            &pctx,
+            ExtentOwner::default(),
+        );
         assert_invalid_logical_range(result, "collapse_range");
     }
 
@@ -2958,7 +3663,17 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let mut root = empty_root();
         let pctx = mock_pctx();
 
-        let result = insert_range(&cx, &dev, &mut root, &geo, &mut groups, u32::MAX, 2, &pctx);
+        let result = insert_range(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            u32::MAX,
+            2,
+            &pctx,
+            ExtentOwner::default(),
+        );
         assert_invalid_logical_range(result, "insert_range");
     }
 
@@ -2981,11 +3696,23 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             1,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         let before = map_logical_to_physical(&cx, &dev, &root, u32::MAX, 1).unwrap();
 
-        let err = insert_range(&cx, &dev, &mut root, &geo, &mut groups, 0, 1, &pctx).unwrap_err();
+        let err = insert_range(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            1,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -3019,14 +3746,35 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
-        let freed1 = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
+        let freed1 = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed1, 10);
 
         // Second truncate at same point should free 0.
-        let freed2 = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
+        let freed2 = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed2, 0, "second truncate should be a noop");
     }
 
@@ -3050,6 +3798,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -3089,10 +3838,22 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 5, 0, &pctx).unwrap();
+        let freed = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            5,
+            0,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 0, "punch_hole with count=0 should free nothing");
 
         // Extent should still be a single intact extent.
@@ -3124,11 +3885,23 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // mark_written with count=0 should be a noop.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 5, 0, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            5,
+            0,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         // Extent should still be unwritten and intact.
         let extent = found_extent(&cx, &dev, &root, 5)
@@ -3159,6 +3932,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         assert_eq!(mapping.logical_start, logical);
@@ -3191,11 +3965,22 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             20,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // Truncate at block 10 — should trim the extent, keeping [0-9].
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 10, "should free 10 trailing blocks");
 
         // Blocks 0-9 should still be mapped.
@@ -3225,6 +4010,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             0,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap_err();
         assert!(matches!(err, FfsError::Format(_)));
@@ -3248,6 +4034,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             32769,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap_err();
         assert!(matches!(err, FfsError::Format(_)));
@@ -3271,6 +4058,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             0,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap_err();
         assert!(matches!(err, FfsError::Format(_)));
@@ -3296,10 +4084,22 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             20,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 0, 20, &pctx).unwrap();
+        let freed = punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            20,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 20);
 
         let final_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -3331,6 +4131,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         allocate_extent(
@@ -3343,6 +4144,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -3377,6 +4179,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             7,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -3412,6 +4215,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             1,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         );
         assert!(matches!(result, Err(FfsError::Corruption { .. })));
     }
@@ -3520,11 +4324,23 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // mark_written on a written extent should succeed without changing anything.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
+        mark_written(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
 
         let maps = map_logical_to_physical(&cx, &dev, &root, 0, 10).unwrap();
         assert_eq!(maps.len(), 1);
@@ -3551,6 +4367,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             5,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
         assert_eq!(m.logical_start, 100);
@@ -3585,11 +4402,22 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             20,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // Truncate at block 10 — should free the second half.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert!(freed > 0);
 
         // Only blocks 0-9 should remain mapped.
@@ -3613,6 +4441,44 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
     #[test]
     fn encode_unwritten_len_rejects_written_boundary() {
         let err = encode_unwritten_len("test", u64::from(EXT_INIT_MAX_LEN)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("32767"),
+            "error should explain the unwritten extent limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn encode_split_extent_len_preserves_written_boundary() {
+        let raw_len = encode_split_extent_len("test", u32::from(EXT_INIT_MAX_LEN), false).unwrap();
+        let ext = Ext4Extent {
+            logical_block: 0,
+            raw_len,
+            physical_start: 100,
+        };
+
+        assert_eq!(raw_len, EXT_INIT_MAX_LEN);
+        assert_eq!(ext.actual_len(), EXT_INIT_MAX_LEN);
+        assert!(!ext.is_unwritten());
+    }
+
+    #[test]
+    fn encode_split_extent_len_preserves_unwritten_lengths() {
+        let raw_len = encode_split_extent_len("test", 1, true).unwrap();
+        let ext = Ext4Extent {
+            logical_block: 0,
+            raw_len,
+            physical_start: 100,
+        };
+
+        assert!(raw_len > EXT_INIT_MAX_LEN);
+        assert_eq!(ext.actual_len(), 1);
+        assert!(ext.is_unwritten());
+    }
+
+    #[test]
+    fn encode_split_extent_len_rejects_unwritten_boundary() {
+        let err = encode_split_extent_len("test", u32::from(EXT_INIT_MAX_LEN), true).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("32767"),
@@ -3806,6 +4672,8 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             groups: &mut groups,
             hint: AllocHint::default(),
             pctx: &pctx,
+            ino: 0,
+            generation: 0,
         };
 
         let blk = alloc.alloc_block(&cx).unwrap();
@@ -3829,6 +4697,8 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             groups: &mut groups,
             hint: AllocHint::default(),
             pctx: &pctx,
+            ino: 0,
+            generation: 0,
         };
 
         let blk1 = alloc.alloc_block(&cx).unwrap();
@@ -3858,6 +4728,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             32769,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -3884,6 +4755,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             32768,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -3921,11 +4793,22 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
         // Truncate at logical 10 (extent covers [0, 10)) — nothing to free.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10, &pctx).unwrap();
+        let freed = truncate_extents(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            10,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
         assert_eq!(freed, 0);
 
         // All 10 blocks still mapped.
@@ -4057,6 +4940,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 logical_start, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             prop_assert_eq!(alloc.logical_start, logical_start);
@@ -4094,10 +4978,12 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let freed = truncate_extents(
                 &cx, &dev, &mut root, &geo, &mut groups, 0, &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             prop_assert_eq!(freed, u64::from(count));
@@ -4127,17 +5013,20 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let freed1 = punch_hole(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 hole_offset, actual_hole_len.into(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
             prop_assert_eq!(freed1, u64::from(actual_hole_len));
 
             let freed2 = punch_hole(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 hole_offset, actual_hole_len.into(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
             prop_assert_eq!(freed2, 0_u64, "second punch of same range should free 0 blocks");
         }
@@ -4161,6 +5050,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let maps = map_logical_to_physical(
@@ -4199,6 +5089,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count_a,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let logical_b = count_a + gap;
@@ -4206,6 +5097,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 logical_b, count_b,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             // Physical ranges must not overlap.
@@ -4249,11 +5141,13 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             punch_hole(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 hole_offset, actual_hole.into(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             // Blocks before hole should still map to original physical range.
@@ -4291,6 +5185,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             prop_assert!(alloc.unwritten, "allocate_unwritten_extent must set unwritten=true");
@@ -4324,11 +5219,13 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             mark_written(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 mark_offset, actual_mark, &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             // Map the full range and verify physical addresses are preserved.
@@ -4464,6 +5361,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let after_alloc_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -4475,6 +5373,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             let freed = punch_hole(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 hole_offset, actual_hole.into(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
             prop_assert_eq!(freed, u64::from(actual_hole));
 
@@ -4487,6 +5386,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             // Now truncate everything to free remaining.
             let freed2 = truncate_extents(
                 &cx, &dev, &mut root, &geo, &mut groups, 0, &pctx,
+                ExtentOwner::default(),
             ).unwrap();
             prop_assert_eq!(
                 freed2, u64::from(count - actual_hole),
@@ -4522,6 +5422,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             // Map sub-range and check physical addresses.
@@ -4562,10 +5463,12 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let freed = truncate_extents(
                 &cx, &dev, &mut root, &geo, &mut groups, cut, &pctx,
+                ExtentOwner::default(),
             ).unwrap();
             prop_assert_eq!(freed, u64::from(count - cut), "freed block count");
 
@@ -4603,12 +5506,14 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             // First mark_written.
             mark_written(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 mark_offset, actual_mark, &pctx,
+                ExtentOwner::default(),
             ).unwrap();
             let maps1 = map_logical_to_physical(&cx, &dev, &root, 0, count.into()).unwrap();
 
@@ -4616,6 +5521,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             mark_written(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 mark_offset, actual_mark, &pctx,
+                ExtentOwner::default(),
             ).unwrap();
             let maps2 = map_logical_to_physical(&cx, &dev, &root, 0, count.into()).unwrap();
 
@@ -4646,6 +5552,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count_a,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let b_offset = count_a + gap;
@@ -4653,6 +5560,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 b_offset, count_b,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             let a_end = a.physical_start + u64::from(count_a);
@@ -4692,11 +5600,13 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 &cx, &dev, &mut root, &geo, &mut groups,
                 0, count,
                 &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             punch_hole(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 hole_offset, actual_hole.into(), &pctx,
+                ExtentOwner::default(),
             ).unwrap();
 
             // Map the full range.
@@ -5311,6 +6221,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             10,
             &AllocHint::default(),
             &pctx,
+            ExtentOwner::default(),
         )
         .unwrap();
 
@@ -5327,6 +6238,56 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let result2 = cached_map_logical_to_physical(&cx, &dev, &root, 5, 1, &cache, 0).unwrap();
         assert_eq!(result2.len(), 1);
         assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn cached_single_block_miss_populates_searched_leaf_window() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = mock_pctx();
+        let mut root = empty_root();
+
+        for logical in 0..100_u32 {
+            allocate_extent(
+                &cx,
+                &dev,
+                &mut root,
+                &geo,
+                &mut groups,
+                logical,
+                1,
+                &AllocHint::default(),
+                &pctx,
+                ExtentOwner::default(),
+            )
+            .unwrap();
+        }
+
+        let cache = ExtentCache::new();
+        let expected_first = map_logical_to_physical(&cx, &dev, &root, 10, 1).unwrap();
+        let expected_second = map_logical_to_physical(&cx, &dev, &root, 11, 1).unwrap();
+
+        dev.clear_read_counts();
+        let first = cached_map_logical_to_physical(&cx, &dev, &root, 10, 1, &cache, 0).unwrap();
+        assert_eq!(first, expected_first);
+        assert_eq!(first[0].count, 1);
+        assert_eq!(dev.total_reads(), 1);
+        assert!(
+            cache.stats().entries > 1,
+            "a single-block miss should cache neighboring leaf extents"
+        );
+
+        dev.clear_read_counts();
+        let second = cached_map_logical_to_physical(&cx, &dev, &root, 11, 1, &cache, 0).unwrap();
+        assert_eq!(second, expected_second);
+        assert_eq!(second[0].count, 1);
+        assert_eq!(
+            dev.total_reads(),
+            0,
+            "adjacent block should be served from the searched leaf window"
+        );
     }
 
     #[test]
@@ -5545,6 +6506,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 5,
                 &AllocHint::default(),
                 &pctx,
+                ExtentOwner::default(),
             )
             .unwrap();
         }
@@ -5552,7 +6514,18 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         // Punching a hole in the middle of the first extent [0..5]
         // This splits it into two, making 5 total entries in the tree.
         // It must handle root split properly.
-        punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 2, 1, &pctx).unwrap();
+        punch_hole(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            2,
+            1,
+            &pctx,
+            ExtentOwner::default(),
+        )
+        .unwrap();
     }
 
     // bd-4fy6y: metamorphic relation — cached_map_logical_to_physical
@@ -5585,6 +6558,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             allocate_extent(
                 &cx, &dev, &mut root, &geo, &mut groups,
                 extent_start, extent_len, &AllocHint::default(), &pctx,
+                ExtentOwner::default(),
             )
             .expect("allocate test extent");
 
