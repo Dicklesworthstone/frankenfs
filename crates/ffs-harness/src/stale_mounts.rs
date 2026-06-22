@@ -19,7 +19,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use std::time::Duration;
 
 /// Outcome of one reap sweep.
@@ -222,7 +222,10 @@ fn probe_liveness(mountpoint: &Path, timeout: Duration) -> Liveness {
 }
 
 /// Lazily detach a dead mount: `fusermount3 -uz`, then `fusermount -uz`,
-/// then `umount -l`. Returns whether the mountpoint left the mount table.
+/// then `umount -l`, and finally — for a server thread wedged so hard the
+/// lazy detach cannot drain it — abort the FUSE connection directly via
+/// `/sys/fs/fuse/connections/<id>/abort`. Returns whether the mountpoint
+/// left the mount table.
 #[cfg(target_os = "linux")]
 fn lazy_unmount(mountpoint: &Path) -> bool {
     use std::process::{Command, Stdio};
@@ -244,15 +247,216 @@ fn lazy_unmount(mountpoint: &Path) -> bool {
         }
     }
 
-    // Verify against the live mount table rather than trusting exit codes.
+    if !still_mounted(mountpoint) {
+        return true;
+    }
+
+    // Lazy detach alone cannot reclaim a connection whose server thread is
+    // wedged in `/dev/fuse` (the toxic D-state case): the device fd never
+    // closes, so the kernel keeps the FUSE worker threads alive forever.
+    // Aborting the connection makes every outstanding/future request fail
+    // with ENOTCONN, which releases those threads so the lazy unmount above
+    // can complete. This is the manual `echo 1 > .../abort` recovery, in code.
+    abort_fuse_connection_for(mountpoint);
+
+    !still_mounted(mountpoint)
+}
+
+/// Whether `mountpoint` is still present in `/proc/mounts` (truth over exit codes).
+#[cfg(target_os = "linux")]
+fn still_mounted(mountpoint: &Path) -> bool {
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
         return false;
     };
-    !mounts.lines().any(|line| {
+    mounts.lines().any(|line| {
         line.split_whitespace()
             .nth(1)
             .is_some_and(|mp| unescape_mounts_field(mp) == mountpoint)
     })
+}
+
+/// Find the FUSE connection device id (`st_dev` minor) backing `mountpoint`
+/// from `/proc/self/mountinfo`, then write `1` to
+/// `/sys/fs/fuse/connections/<id>/abort` to tear down a wedged connection.
+///
+/// Best-effort: silently no-ops if mountinfo is unreadable, the mount is gone,
+/// or the sysfs node is not writable (e.g. unprivileged sandbox).
+#[cfg(target_os = "linux")]
+fn abort_fuse_connection_for(mountpoint: &Path) {
+    use std::io::Write;
+
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let Some(minor) = fuse_connection_minor(&mountinfo, mountpoint) else {
+        return;
+    };
+    let abort = PathBuf::from("/sys/fs/fuse/connections")
+        .join(minor)
+        .join("abort");
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&abort) {
+        let _ = f.write_all(b"1");
+    }
+}
+
+/// Extract the FUSE connection id (the `minor` of the `major:minor` field) for
+/// `mountpoint` from `/proc/self/mountinfo` contents.
+///
+/// mountinfo line layout: `id parent major:minor root mountpoint ...`. The
+/// connection id under `/sys/fs/fuse/connections/<id>` is the device minor.
+#[cfg(target_os = "linux")]
+fn fuse_connection_minor(mountinfo: &str, mountpoint: &Path) -> Option<String> {
+    for line in mountinfo.lines() {
+        let mut fields = line.split_whitespace();
+        let (_id, _parent, majmin, _root, mp_raw) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        );
+        let (Some(majmin), Some(mp_raw)) = (majmin, mp_raw) else {
+            continue;
+        };
+        if unescape_mounts_field(mp_raw) != mountpoint {
+            continue;
+        }
+        if let Some(minor) = majmin.split(':').nth(1) {
+            return Some(minor.to_owned());
+        }
+    }
+    None
+}
+
+// ── RAII teardown guard ──────────────────────────────────────────────────────
+
+/// Registry of live FUSE mountpoints owned by [`MountGuard`]s in this process.
+///
+/// Populated on guard construction and drained on guard drop. The signal
+/// handler walks this list to reclaim mounts on an abrupt (SIGINT/SIGTERM)
+/// exit, where no `Drop` would otherwise run.
+static LIVE_MOUNTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// RAII guard owning a background FUSE session and its mountpoint.
+///
+/// On `Drop` (normal return, `?`, **panic unwind**, or explicit `drop()`) it
+/// first drops the inner `fuser::BackgroundSession` — that performs the clean
+/// `fusermount -u` on the happy path, leaving the mountpoint free for an
+/// immediate remount — and then, only if the mount is *still* present (a
+/// busy/wedged server the clean unmount could not drain), escalates to the
+/// robust lazy-detach + connection-abort teardown. Combined with the
+/// process-wide signal handler installed by [`install_teardown_hooks`], this
+/// guarantees the mount is reclaimed on every reachable exit path short of
+/// SIGKILL (which `stale_mounts` reaping covers on the next run).
+#[cfg(target_os = "linux")]
+pub struct MountGuard {
+    session: Option<fuser::BackgroundSession>,
+    mountpoint: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl MountGuard {
+    /// Wrap a live background session, registering its mountpoint for
+    /// signal-driven teardown and installing the process-wide hooks once.
+    #[must_use]
+    pub fn new(session: fuser::BackgroundSession, mountpoint: &Path) -> Self {
+        install_teardown_hooks();
+        if let Ok(mut live) = LIVE_MOUNTS.lock() {
+            live.push(mountpoint.to_path_buf());
+        }
+        Self {
+            session: Some(session),
+            mountpoint: mountpoint.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        // Clean happy-path unmount first (frees the mountpoint for remount).
+        drop(self.session.take());
+        // Escalate only if a wedged/busy server kept the mount alive.
+        if still_mounted(&self.mountpoint) {
+            let _ = lazy_unmount(&self.mountpoint);
+        }
+        if let Ok(mut live) = LIVE_MOUNTS.lock() {
+            if let Some(idx) = live.iter().position(|p| p == &self.mountpoint) {
+                live.swap_remove(idx);
+            }
+        }
+    }
+}
+
+/// Non-Linux stub: the mount-leak mechanism (and `/proc`, `/sys/fs/fuse`) is
+/// Linux-specific, so the guard just owns the session and drops it normally.
+#[cfg(not(target_os = "linux"))]
+pub struct MountGuard {
+    session: Option<fuser::BackgroundSession>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl MountGuard {
+    #[must_use]
+    pub fn new(session: fuser::BackgroundSession, _mountpoint: &Path) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        drop(self.session.take());
+    }
+}
+
+/// Lazily unmount + abort every currently-registered live mount. Called from
+/// the signal handler, where no `Drop` runs. Must not panic or block long.
+#[cfg(target_os = "linux")]
+fn reap_live_mounts_on_signal() {
+    let mounts: Vec<PathBuf> = LIVE_MOUNTS
+        .lock()
+        .map(|live| live.clone())
+        .unwrap_or_default();
+    for mountpoint in mounts {
+        let _ = lazy_unmount(&mountpoint);
+    }
+}
+
+/// Install — exactly once per process — a SIGINT/SIGTERM handler and a panic
+/// hook that reclaim every registered live FUSE mount.
+///
+/// * Signals (timeout-kill, Ctrl+C): `ctrlc` (with the `termination` feature
+///   covers SIGTERM too) runs the teardown then re-exits with the conventional
+///   128+signo code so the runner still observes a killed test binary.
+/// * Panic: the inner `MountGuard::drop` already unmounts during unwind, so the
+///   hook only needs to chain the previous (default) hook for the message; it
+///   is installed for parity and to cover `panic = "abort"` builds, where the
+///   process aborts *after* the hook runs but *without* unwinding drops.
+fn install_teardown_hooks() {
+    static HOOKS: Once = Once::new();
+    HOOKS.call_once(|| {
+        #[cfg(target_os = "linux")]
+        {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                reap_live_mounts_on_signal();
+                prev(info);
+            }));
+
+            // `ctrlc::set_handler` may be called only once per process; this is
+            // the sole installer. The handler runs on its own thread, so the
+            // teardown does not execute in async-signal context.
+            let _ = ctrlc::set_handler(|| {
+                reap_live_mounts_on_signal();
+                // Re-exit so the runner sees the binary as terminated; 130 is
+                // the conventional 128+SIGINT code used by shells for Ctrl+C.
+                std::process::exit(130);
+            });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -296,5 +500,30 @@ mod tests {
         let roots = temp_roots();
         assert!(roots.contains(&PathBuf::from("/tmp")));
         assert!(roots.contains(&PathBuf::from("/data/tmp")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_connection_minor_extracts_device_minor() {
+        // Real-shaped mountinfo lines: `id parent major:minor root mp ...`.
+        let mountinfo = "\
+36 35 0:32 / /proc rw,nosuid shared:5 - proc proc rw
+99 24 0:74 / /tmp/.tmpXyz/mnt rw,nosuid,relatime shared:1 - fuse.ffs frankenfs rw
+100 24 0:75 / /tmp/with\\040space/mnt rw shared:2 - fuse.frankenfs frankenfs rw
+";
+        assert_eq!(
+            fuse_connection_minor(mountinfo, &PathBuf::from("/tmp/.tmpXyz/mnt")),
+            Some("74".to_owned())
+        );
+        // Octal-escaped mountpoints are decoded before matching.
+        assert_eq!(
+            fuse_connection_minor(mountinfo, &PathBuf::from("/tmp/with space/mnt")),
+            Some("75".to_owned())
+        );
+        // Unknown mountpoint yields no connection id.
+        assert_eq!(
+            fuse_connection_minor(mountinfo, &PathBuf::from("/tmp/absent/mnt")),
+            None
+        );
     }
 }

@@ -1084,6 +1084,7 @@ dependencies = [
  "blake3",
  "crc32c",
  "criterion",
+ "ctrlc",
  "ffs-alloc",
  "ffs-block",
  "ffs-btrfs",

@@ -9,11 +9,17 @@ rust-version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 asupersync = { workspace = true }
+# `termination` makes the Ctrl+C handler also fire on SIGTERM (timeout-kill),
+# which `stale_mounts::MountGuard` needs to reclaim FUSE mounts on abrupt exit.
+ctrlc = { workspace = true, features = ["termination"] }
 ffs-btrfs = { workspace = true }
 ffs-core = { workspace = true }
 ffs-fuse = { workspace = true }
 ffs-ondisk = { workspace = true }
 ffs-types = { workspace = true }
+# `fuser` is a runtime dependency because `stale_mounts::MountGuard` (in the
+# library) owns a `fuser::BackgroundSession`; the e2e tests use it too.
+fuser = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
@@ -32,7 +38,6 @@ ffs-error = { workspace = true }
 ffs-inode = { workspace = true }
 ffs-xattr = { workspace = true }
 flate2 = { workspace = true }
-fuser = { workspace = true }
 insta = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }

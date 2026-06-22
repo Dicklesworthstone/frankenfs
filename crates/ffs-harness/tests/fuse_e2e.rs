@@ -1035,7 +1035,7 @@ fn try_mount_ffs_with_options(
     image: &Path,
     mountpoint: &Path,
     mount_opts: &MountOptions,
-) -> Option<fuser::BackgroundSession> {
+) -> Option<ffs_harness::stale_mounts::MountGuard> {
     // Self-heal dead mounts leaked by earlier crashed/killed runs.
     ffs_harness::stale_mounts::reap_stale_frankenfs_mounts_once();
     let cx = Cx::for_testing();
@@ -1048,7 +1048,9 @@ fn try_mount_ffs_with_options(
     match mount_background(Box::new(fs), mountpoint, mount_opts) {
         Ok(session) => {
             wait_for_fuse_mount_ready(mountpoint);
-            Some(session)
+            Some(ffs_harness::stale_mounts::MountGuard::new(
+                session, mountpoint,
+            ))
         }
         Err(e) => {
             eprintln!("FUSE mount failed (skipping test): {e}");
@@ -1060,7 +1062,7 @@ fn try_mount_ffs_with_options(
 /// Try to mount an ext4 image via FrankenFS FUSE (read-only).
 ///
 /// Returns `None` if FUSE mounting fails (e.g. permission denied in containers).
-fn try_mount_ffs(image: &Path, mountpoint: &Path) -> Option<fuser::BackgroundSession> {
+fn try_mount_ffs(image: &Path, mountpoint: &Path) -> Option<ffs_harness::stale_mounts::MountGuard> {
     let mount_opts = MountOptions {
         read_only: true,
         auto_unmount: false,
@@ -1283,7 +1285,7 @@ fn try_mount_ffs_rw_with_options(
     image: &Path,
     mountpoint: &Path,
     mount_opts: &MountOptions,
-) -> Option<fuser::BackgroundSession> {
+) -> Option<ffs_harness::stale_mounts::MountGuard> {
     // Self-heal dead mounts leaked by earlier crashed/killed runs.
     ffs_harness::stale_mounts::reap_stale_frankenfs_mounts_once();
     let cx = Cx::for_testing();
@@ -1298,7 +1300,9 @@ fn try_mount_ffs_rw_with_options(
     match mount_background(Box::new(fs), mountpoint, mount_opts) {
         Ok(session) => {
             wait_for_fuse_mount_ready(mountpoint);
-            Some(session)
+            Some(ffs_harness::stale_mounts::MountGuard::new(
+                session, mountpoint,
+            ))
         }
         Err(e) => {
             eprintln!("FUSE mount (rw) failed (skipping test): {e}");
@@ -1310,7 +1314,7 @@ fn try_mount_ffs_rw_with_options(
 /// Try to mount an ext4 image via FrankenFS FUSE in **read-write** mode.
 ///
 /// Returns `None` if FUSE mounting fails (e.g. permission denied in containers).
-fn try_mount_ffs_rw(image: &Path, mountpoint: &Path) -> Option<fuser::BackgroundSession> {
+fn try_mount_ffs_rw(image: &Path, mountpoint: &Path) -> Option<ffs_harness::stale_mounts::MountGuard> {
     let mount_opts = MountOptions {
         read_only: false,
         auto_unmount: false,
@@ -11413,7 +11417,7 @@ fn try_mount_btrfs_rw_with_options(
     image: &Path,
     mountpoint: &Path,
     mount_opts: &MountOptions,
-) -> Option<fuser::BackgroundSession> {
+) -> Option<ffs_harness::stale_mounts::MountGuard> {
     let cx = Cx::for_testing();
     let opts = OpenOptions {
         skip_validation: false,
@@ -11428,7 +11432,9 @@ fn try_mount_btrfs_rw_with_options(
     match mount_background(Box::new(fs), mountpoint, mount_opts) {
         Ok(session) => {
             wait_for_fuse_mount_ready(mountpoint);
-            Some(session)
+            Some(ffs_harness::stale_mounts::MountGuard::new(
+                session, mountpoint,
+            ))
         }
         Err(e) => {
             eprintln!("btrfs FUSE mount failed (skipping test): {e}");
@@ -11438,7 +11444,7 @@ fn try_mount_btrfs_rw_with_options(
 }
 
 /// Try to mount a btrfs image via FrankenFS FUSE (read-write).
-fn try_mount_btrfs_rw(image: &Path, mountpoint: &Path) -> Option<fuser::BackgroundSession> {
+fn try_mount_btrfs_rw(image: &Path, mountpoint: &Path) -> Option<ffs_harness::stale_mounts::MountGuard> {
     let mount_opts = MountOptions {
         read_only: false,
         auto_unmount: false,
@@ -11585,7 +11591,7 @@ fn create_btrfs_test_image_with_seeded_namespace_removal_fixture(dir: &Path) -> 
     image
 }
 
-fn try_mount_btrfs_ro(image: &Path, mountpoint: &Path) -> Option<fuser::BackgroundSession> {
+fn try_mount_btrfs_ro(image: &Path, mountpoint: &Path) -> Option<ffs_harness::stale_mounts::MountGuard> {
     let cx = Cx::for_testing();
     let opts = OpenOptions {
         skip_validation: false,
@@ -11601,7 +11607,9 @@ fn try_mount_btrfs_ro(image: &Path, mountpoint: &Path) -> Option<fuser::Backgrou
     match mount_background(Box::new(fs), mountpoint, &mount_opts) {
         Ok(session) => {
             wait_for_fuse_mount_ready(mountpoint);
-            Some(session)
+            Some(ffs_harness::stale_mounts::MountGuard::new(
+                session, mountpoint,
+            ))
         }
         Err(e) => {
             eprintln!("btrfs read-only FUSE mount failed (skipping test): {e}");
@@ -11616,7 +11624,7 @@ fn try_mount_btrfs_with_open_options(
     mountpoint: &Path,
     open_opts: &OpenOptions,
     mount_opts: &MountOptions,
-) -> Option<fuser::BackgroundSession> {
+) -> Option<ffs_harness::stale_mounts::MountGuard> {
     let cx = Cx::for_testing();
     let fs = match OpenFs::open_with_options(&cx, image, open_opts) {
         Ok(f) => f,
@@ -11628,7 +11636,9 @@ fn try_mount_btrfs_with_open_options(
     match mount_background(Box::new(fs), mountpoint, mount_opts) {
         Ok(session) => {
             wait_for_fuse_mount_ready(mountpoint);
-            Some(session)
+            Some(ffs_harness::stale_mounts::MountGuard::new(
+                session, mountpoint,
+            ))
         }
         Err(e) => {
             eprintln!("btrfs FUSE mount failed: {e}");
