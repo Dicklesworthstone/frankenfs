@@ -60,7 +60,6 @@ crossbeam-epoch = "0.9.18"
 hex = "0.4.3"
 insta = "1.47.2"
 libc = "0.2.185"
-loom = "0.7.2"
 memchr = "2.8.0"
 parking_lot = "0.12.5"
 proptest = "1.11.0"
@@ -68,31 +67,23 @@ rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 sha2 = "0.11.0"
-smallvec = { version = "1.15.1", features = ["serde"] }
+smallvec = "1.15.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 trybuild = "1.0"
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-xattr = "1.6.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 fuser = { version = "0.17.0", features = ["abi-7-40"] }
 zstd = "0.13.3"
 brotli = "8.0.2"
-# zlib-rs backend: a pure-safe-Rust reimplementation of zlib that inflates
-# markedly faster than the default `miniz_oxide` (rust_backend) — the btrfs
-# compressed-read path (btrfs_decompress, ZLIB) was ~25% self-time in
-# `miniz_oxide::inflate::core::init_tree` on cold/uncached decompression
-# (bd-cc-zlib-rs). No C toolchain (unlike zlib-ng); output is byte-identical
-# DEFLATE. Compatible with the workspace `unsafe_code = "forbid"` (the lint
-# scopes to our crates, not deps).
-flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+flate2 = "1.1.9"
 lzokay-native = "0.1"
 nix = { version = "0.29", features = ["fs", "uio"] }
 
 # Sibling project dependencies (crates.io; local path overrides via [patch] if needed)
-asupersync = { version = "0.3.9", features = ["test-internals"] }
+asupersync = { version = "=0.3.4", features = ["test-internals"] }
 ftui = "0.3.1"
 
 # Workspace crate cross-references
@@ -136,4 +127,4 @@ inherits = "release"
 opt-level = 3
 debug = "line-tables-only"
 strip = false
-lto = "fat"
+lto = "thin"
