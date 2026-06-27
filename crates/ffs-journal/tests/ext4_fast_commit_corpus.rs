@@ -65,7 +65,7 @@ fn decode_hex_string(hex: &str) -> Vec<u8> {
 
 fn assert_expected_operation(actual: &FcOperation, expected: &ExpectedOperation) {
     match (actual, expected) {
-        (FcOperation::InodeUpdate(actual_ino), ExpectedOperation::InodeUpdate { ino }) => {
+        (FcOperation::InodeUpdate(actual_ino, _raw), ExpectedOperation::InodeUpdate { ino }) => {
             assert_eq!(actual_ino, ino);
         }
         (
