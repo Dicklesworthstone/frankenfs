@@ -359,13 +359,23 @@ fn decode_group_impl(
     match repair_symbols {
         RepairSymbolInput::Borrowed(symbols) => {
             for (esi, data) in symbols {
-                let (cols, coefs) = decoder.repair_equation(*esi);
+                let (cols, coefs) = decoder.repair_equation(*esi).map_err(|error| {
+                    FfsError::RepairFailed(format!(
+                        "repair_equation failed for esi {} in group {}: {error:?}",
+                        *esi, group.0
+                    ))
+                })?;
                 received.push(ReceivedSymbol::repair(*esi, cols, coefs, data.clone()));
             }
         }
         RepairSymbolInput::Owned(symbols) => {
             for (esi, data) in symbols {
-                let (cols, coefs) = decoder.repair_equation(esi);
+                let (cols, coefs) = decoder.repair_equation(esi).map_err(|error| {
+                    FfsError::RepairFailed(format!(
+                        "repair_equation failed for esi {esi} in group {}: {error:?}",
+                        group.0
+                    ))
+                })?;
                 received.push(ReceivedSymbol::repair(esi, cols, coefs, data));
             }
         }

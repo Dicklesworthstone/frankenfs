@@ -2245,8 +2245,6 @@ struct ArcState {
     access_count: HashMap<BlockNumber, Arc<S3AccessHandle>>,
     #[cfg(feature = "s3fifo")]
     fast_invalidations: Vec<BlockNumber>,
-    #[cfg(feature = "s3fifo")]
-    applied_s3_fast_hits: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2320,8 +2318,6 @@ impl ArcState {
             access_count: HashMap::new(),
             #[cfg(feature = "s3fifo")]
             fast_invalidations: Vec::new(),
-            #[cfg(feature = "s3fifo")]
-            applied_s3_fast_hits: 0,
         }
     }
 
@@ -2845,7 +2841,6 @@ impl ArcState {
         Self::increment_counter(&mut self.hits);
         #[cfg(feature = "s3fifo")]
         {
-            self.reset_s3_read_scan_detector();
             self.s3_on_hit(key);
         }
         #[cfg(not(feature = "s3fifo"))]
@@ -2926,12 +2921,6 @@ impl ArcState {
             self.t1.push_back(key);
             self.loc.insert(key, ArcList::T1);
         }
-    }
-
-    #[cfg(feature = "s3fifo")]
-    fn reset_s3_read_scan_detector(&mut self) {
-        self.last_read_miss = None;
-        self.sequential_read_miss_streak = 0;
     }
 
     #[cfg(feature = "s3fifo")]
@@ -3703,8 +3692,6 @@ pub struct ArcCache<D: BlockDevice> {
     #[cfg(feature = "s3fifo")]
     s3_fast_cache_id: u64,
     #[cfg(feature = "s3fifo")]
-    s3_fast_reset_pending: AtomicBool,
-    #[cfg(feature = "s3fifo")]
     s3_fast_mutation_active: AtomicUsize,
     #[cfg(feature = "s3fifo")]
     s3_fast_mutation_epoch: AtomicU64,
@@ -4142,8 +4129,6 @@ impl<D: BlockDevice> ArcCache<D> {
             #[cfg(feature = "s3fifo")]
             s3_fast_cache_id: next_s3_fast_cache_id(),
             #[cfg(feature = "s3fifo")]
-            s3_fast_reset_pending: AtomicBool::new(false),
-            #[cfg(feature = "s3fifo")]
             s3_fast_mutation_active: AtomicUsize::new(0),
             #[cfg(feature = "s3fifo")]
             s3_fast_mutation_epoch: AtomicU64::new(0),
@@ -4221,7 +4206,6 @@ impl<D: BlockDevice> ArcCache<D> {
         }
         entry.access.increment_count();
         self.s3_fast_hits.increment(block);
-        self.s3_fast_reset_pending.store(true, Ordering::Release);
         let data = entry.data.clone_ref();
         self.store_s3_thread_fast_hit(block, epoch, entry);
         Some(data)
@@ -4242,7 +4226,6 @@ impl<D: BlockDevice> ArcCache<D> {
         }
         access.increment_count();
         self.s3_fast_hits.increment(block);
-        self.s3_fast_reset_pending.store(true, Ordering::Release);
         Some(data)
     }
 
@@ -4262,18 +4245,6 @@ impl<D: BlockDevice> ArcCache<D> {
         S3FastMutationGuard {
             active: &self.s3_fast_mutation_active,
             epoch: &self.s3_fast_mutation_epoch,
-        }
-    }
-
-    #[cfg(feature = "s3fifo")]
-    fn apply_s3_fast_hit_scan_reset(&self, state: &mut ArcState) {
-        if !self.s3_fast_reset_pending.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        let fast_hits = self.s3_fast_hits.total(Ordering::Acquire);
-        if state.applied_s3_fast_hits != fast_hits {
-            state.applied_s3_fast_hits = fast_hits;
-            state.reset_s3_read_scan_detector();
         }
     }
 
@@ -4955,8 +4926,6 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         }
         {
             let mut guard = self.state.lock();
-            #[cfg(feature = "s3fifo")]
-            self.apply_s3_fast_hit_scan_reset(&mut guard);
             if let Some(buf) = guard.resident.get(&block).cloned() {
                 guard.on_hit(block);
                 #[cfg(feature = "s3fifo")]
@@ -4971,8 +4940,6 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         let _page_lock = self.page_locks.acquire(block);
         {
             let mut guard = self.state.lock();
-            #[cfg(feature = "s3fifo")]
-            self.apply_s3_fast_hit_scan_reset(&mut guard);
             if let Some(buf) = guard.resident.get(&block).cloned() {
                 guard.on_hit(block);
                 #[cfg(feature = "s3fifo")]
@@ -4989,8 +4956,6 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         #[cfg(feature = "s3fifo")]
         let mutation_guard = self.begin_s3_fast_mutation();
         let mut guard = self.state.lock();
-        #[cfg(feature = "s3fifo")]
-        self.apply_s3_fast_hit_scan_reset(&mut guard);
         // Re-check: another thread may have populated this block while we
         // were reading from the device (TOCTOU race).  If so, treat as a hit
         // and return the data already in the cache (it might be newer).
@@ -5041,8 +5006,6 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         #[cfg(feature = "s3fifo")]
         let mutation_guard = self.begin_s3_fast_mutation();
         let mut guard = self.state.lock();
-        #[cfg(feature = "s3fifo")]
-        self.apply_s3_fast_hit_scan_reset(&mut guard);
         let payload = BlockBuf::new(data.to_vec());
         if guard.resident.contains_key(&block) {
             // Block already cached — just update data and touch for recency.

@@ -651,29 +651,56 @@ impl SsiDangerousStructure {
 }
 
 fn ssi_incoming_edge(txn: &Transaction, record: &CommittedTxnRecord) -> Option<SsiRwEdge> {
-    record.read_set.iter().find_map(|(&block, &read_version)| {
-        txn.write_set().contains_key(&block).then_some(SsiRwEdge {
-            reader_txn: record.txn_id,
-            writer_txn: txn.id(),
-            block,
-            read_version,
-            reader_snapshot_high: record.snapshot.high,
-            write_version: CommitSeq(0),
-        })
-    })
+    // rw-antidependency: a block the committed txn READ and we WRITE. This is a
+    // set intersection of `record.read_set` and our `write_set`. Both are sorted
+    // (BTreeMap), so iterating EITHER in order and taking the first match yields
+    // the identical block — the minimum of the intersection. Iterate the SMALLER
+    // set so the cost is O(min(|read_set|, |write_set|)) rather than always
+    // O(|read_set|); read-heavy transactions have large read sets but write few.
+    let read_set = &record.read_set;
+    let write_set = txn.write_set();
+    let mk = |block, read_version| SsiRwEdge {
+        reader_txn: record.txn_id,
+        writer_txn: txn.id(),
+        block,
+        read_version,
+        reader_snapshot_high: record.snapshot.high,
+        write_version: CommitSeq(0),
+    };
+    if write_set.len() < read_set.len() {
+        write_set
+            .keys()
+            .find_map(|&block| read_set.get(&block).map(|&rv| mk(block, rv)))
+    } else {
+        read_set
+            .iter()
+            .find_map(|(&block, &rv)| write_set.contains_key(&block).then(|| mk(block, rv)))
+    }
 }
 
 fn ssi_outgoing_edge(txn: &Transaction, record: &CommittedTxnRecord) -> Option<SsiRwEdge> {
-    txn.read_set().iter().find_map(|(&block, &read_version)| {
-        record.write_set.contains(&block).then_some(SsiRwEdge {
-            reader_txn: txn.id(),
-            writer_txn: record.txn_id,
-            block,
-            read_version,
-            reader_snapshot_high: txn.snapshot().high,
-            write_version: record.commit_seq,
-        })
-    })
+    // Mirror of `ssi_incoming_edge`: a block we READ and the committed txn WROTE.
+    // Intersection of our `read_set` (BTreeMap) and `record.write_set` (BTreeSet),
+    // both sorted — iterate the smaller, identical first-match (min of intersection).
+    let read_set = txn.read_set();
+    let write_set = &record.write_set;
+    let mk = |block, read_version| SsiRwEdge {
+        reader_txn: txn.id(),
+        writer_txn: record.txn_id,
+        block,
+        read_version,
+        reader_snapshot_high: txn.snapshot().high,
+        write_version: record.commit_seq,
+    };
+    if write_set.len() < read_set.len() {
+        write_set
+            .iter()
+            .find_map(|&block| read_set.get(&block).map(|&rv| mk(block, rv)))
+    } else {
+        read_set
+            .iter()
+            .find_map(|(&block, &rv)| write_set.contains(&block).then(|| mk(block, rv)))
+    }
 }
 
 pub(crate) fn detect_ssi_dangerous_structure<'a>(

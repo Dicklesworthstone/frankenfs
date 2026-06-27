@@ -149,6 +149,42 @@ fn bench_ssi_overhead(c: &mut Criterion) {
         });
     });
 
+    // Read-heavy SSI pivot scanned against many concurrent committed records —
+    // the case the smaller-set rw-antidependency edge intersection targets
+    // (perf: SSI edge detection iterates the smaller set). The pivot begins
+    // first (so the records land after its snapshot and detect scans them all),
+    // reads 192 blocks but writes 1; each of the 32 concurrent records is the
+    // mirror (read-heavy, single disjoint write) so no dangerous structure forms
+    // and detect scans every record fully (no early exit). The per-record edge
+    // cost drops from O(192) to O(1).
+    c.bench_function("mvcc_commit_ssi_pivot_192reads_32records", |b| {
+        use criterion::BatchSize;
+        b.iter_batched(
+            || {
+                let mut store = MvccStore::new();
+                let mut pivot = store.begin();
+                for r in 0..192_u64 {
+                    pivot.record_read(BlockNumber(r), CommitSeq(1));
+                }
+                pivot.stage_write(BlockNumber(1_000_000), block_data.clone());
+                for k in 0..32_u64 {
+                    let mut w = store.begin();
+                    let base = 10_000 + k * 1_000;
+                    for r in 0..192_u64 {
+                        w.record_read(BlockNumber(base + r), CommitSeq(1));
+                    }
+                    w.stage_write(BlockNumber(2_000_000 + k), block_data.clone());
+                    store.commit_ssi(w).expect("seed concurrent record");
+                }
+                (store, pivot)
+            },
+            |(mut store, pivot)| {
+                black_box(store.commit_ssi(pivot).expect("pivot commit"));
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     // SSI commit with 0-block read-set (measures SSI log overhead alone).
     c.bench_function("mvcc_commit_ssi_0reads", |b| {
         let mut store = MvccStore::new();
