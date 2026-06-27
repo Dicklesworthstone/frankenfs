@@ -4328,18 +4328,164 @@ impl BtrfsExtentAllocator {
         value[0..8].copy_from_slice(&new_refs.to_le_bytes());
         self.extent_tree.update(&item_key, &value)?;
 
+        let ref_key = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+            offset: hash_extent_data_ref(root, objectid, offset),
+        };
+        // If an EXTENT_DATA_REF for this exact (root, objectid, offset) already
+        // exists, the kernel MERGES the new reference by incrementing the
+        // existing item's count rather than failing — multiple file extents in
+        // one inode can legitimately reference the same data extent at the same
+        // backref key (bd-ngt1y). A keyed EXTENT_DATA_REF whose offset is
+        // hash_extent_data_ref(...) can hash-collide with a DIFFERENT
+        // (root, objectid, offset); only merge when the stored triple actually
+        // matches, so a genuine collision still falls through to insert() and
+        // keeps the prior fail-closed behavior (rather than corrupting an
+        // unrelated backref's count).
+        if let Some(existing) = self.extent_tree.get(&ref_key)
+            && let Some(existing_ref) = BtrfsExtentDataRef::from_bytes(&existing)
+            && existing_ref.root == root
+            && existing_ref.objectid == objectid
+            && existing_ref.offset == offset
+        {
+            let merged = BtrfsExtentDataRef {
+                root,
+                objectid,
+                offset,
+                count: existing_ref
+                    .count
+                    .checked_add(1)
+                    .ok_or(BtrfsMutationError::AddressOverflow)?,
+            };
+            self.extent_tree.update(&ref_key, &merged.to_bytes())?;
+            return Ok(());
+        }
         let data_ref = BtrfsExtentDataRef {
             root,
             objectid,
             offset,
             count: 1,
         };
+        self.extent_tree.insert(ref_key, &data_ref.to_bytes())?;
+        Ok(())
+    }
+
+    /// Drop one reference to a SHARED data extent (refcount-aware free, bd-xkvcm)
+    /// — the exact inverse of [`add_data_extent_ref`]. Decrement the
+    /// `EXTENT_ITEM` refcount by one and remove this inode's `EXTENT_DATA_REF`
+    /// backref for `(root, objectid, offset)`, WITHOUT freeing the extent's
+    /// space (other references keep it live). The backref may be either the
+    /// keyed item (the form `add_data_extent_ref` writes, located by
+    /// [`hash_extent_data_ref`]) or the inline ref inside the `EXTENT_ITEM` (the
+    /// form `insert_data_extent_item` writes for the first reference); both are
+    /// handled. Use this only when the extent has more than one reference; a
+    /// refs==1 extent is freed outright via [`free_extent`].
+    ///
+    /// # Errors
+    /// Returns `KeyNotFound` if the extent item is absent, `BrokenInvariant` if
+    /// its value is malformed, the refcount would underflow, no matching backref
+    /// is found, or the inline backref list contains an unsupported ref type.
+    pub fn remove_data_extent_ref(
+        &mut self,
+        bytenr: u64,
+        num_bytes: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    ) -> Result<(), BtrfsMutationError> {
+        const EXTENT_ITEM_HEADER: usize = 24; // refs(8) + generation(8) + flags(8)
+        const DATA_REF_PAYLOAD: usize = 28;
+
+        let item_key = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: num_bytes,
+        };
+        let mut value = self
+            .extent_tree
+            .get(&item_key)
+            .ok_or(BtrfsMutationError::KeyNotFound)?;
+        if value.len() < EXTENT_ITEM_HEADER {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "extent item value too short for header",
+            ));
+        }
+        let refs = u64::from_le_bytes(value[0..8].try_into().expect("8 bytes"));
+        let new_refs = refs.checked_sub(1).ok_or(BtrfsMutationError::BrokenInvariant(
+            "extent item refcount underflow",
+        ))?;
+
+        // Prefer the keyed EXTENT_DATA_REF (the add_data_extent_ref form).
         let ref_key = BtrfsKey {
             objectid: bytenr,
             item_type: BTRFS_ITEM_EXTENT_DATA_REF,
             offset: hash_extent_data_ref(root, objectid, offset),
         };
-        self.extent_tree.insert(ref_key, &data_ref.to_bytes())?;
+        let removed_keyed = match self.extent_tree.get(&ref_key) {
+            Some(kv) => match BtrfsExtentDataRef::from_bytes(&kv) {
+                Some(dr) if dr.root == root && dr.objectid == objectid && dr.offset == offset => {
+                    // A keyed EXTENT_DATA_REF can hold count > 1 when
+                    // add_data_extent_ref merged duplicate references (bd-ngt1y).
+                    // Decrement the count and keep the item; only delete it when
+                    // this was its last reference — otherwise the backref would
+                    // vanish while EXTENT_ITEM.refs still counts the remaining
+                    // ones, leaving a later decrement with no backref to find
+                    // (bd-vrv1q).
+                    if dr.count > 1 {
+                        let decremented = BtrfsExtentDataRef {
+                            count: dr.count - 1,
+                            ..dr
+                        };
+                        self.extent_tree.update(&ref_key, &decremented.to_bytes())?;
+                    } else {
+                        self.extent_tree.delete(&ref_key)?;
+                    }
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        };
+
+        if !removed_keyed {
+            // Remove the matching INLINE EXTENT_DATA_REF from the item value.
+            let mut cursor = EXTENT_ITEM_HEADER;
+            let mut found = false;
+            while cursor < value.len() {
+                if value[cursor] != BTRFS_ITEM_EXTENT_DATA_REF {
+                    // SHARED_DATA_REF / other inline forms aren't produced by
+                    // FrankenFS; refuse rather than mis-parse (atomic, no change
+                    // committed yet).
+                    return Err(BtrfsMutationError::BrokenInvariant(
+                        "unsupported inline backref type in extent item",
+                    ));
+                }
+                let payload_start = cursor + 1;
+                let payload_end = payload_start + DATA_REF_PAYLOAD;
+                if payload_end > value.len() {
+                    return Err(BtrfsMutationError::BrokenInvariant(
+                        "truncated inline EXTENT_DATA_REF",
+                    ));
+                }
+                match BtrfsExtentDataRef::from_bytes(&value[payload_start..payload_end]) {
+                    Some(dr) if dr.root == root && dr.objectid == objectid && dr.offset == offset => {
+                        value.drain(cursor..payload_end);
+                        found = true;
+                        break;
+                    }
+                    _ => cursor = payload_end,
+                }
+            }
+            if !found {
+                return Err(BtrfsMutationError::BrokenInvariant(
+                    "no matching EXTENT_DATA_REF backref for decrement",
+                ));
+            }
+        }
+
+        value[0..8].copy_from_slice(&new_refs.to_le_bytes());
+        self.extent_tree.update(&item_key, &value)?;
         Ok(())
     }
 
@@ -6558,8 +6704,17 @@ where
         .filter_map(|(&ino, links)| links.first().map(|(p, n)| (ino, (*p, n.clone()))))
         .collect();
 
-    // Build path for an inode by walking up the parent chain
+    // Build a command PATH for an inode by walking up the parent chain. btrfs
+    // send command paths are RELATIVE to the received subvolume root: no
+    // subvol-name prefix and no leading slash (the receiver creates entries
+    // inside the freshly-created subvol). The subvolume root inode itself is the
+    // received root — its path is empty (chmod/chown/utimes of the root apply to
+    // "."). A subvol-name prefix here makes every MKFILE/MKDIR/WRITE target a
+    // never-created `subvol/` subdirectory, so `btrfs receive` fails with ENOENT.
     let build_path = |ino: u64| -> Vec<u8> {
+        if ino == BTRFS_FIRST_FREE_OBJECTID {
+            return Vec::new();
+        }
         let mut components = Vec::new();
         let mut current = ino;
 
@@ -6572,9 +6727,11 @@ where
         }
 
         components.reverse();
-        let mut path = subvol_name.to_vec();
+        let mut path = Vec::new();
         for comp in components {
-            path.push(b'/');
+            if !path.is_empty() {
+                path.push(b'/');
+            }
             path.extend_from_slice(&comp);
         }
         path
@@ -6797,7 +6954,11 @@ where
             if let Some(links) = inode_links.get(&ino) {
                 for (parent, name) in links.iter().skip(1) {
                     let mut link_path = build_path(*parent);
-                    link_path.push(b'/');
+                    // Relative to the subvol root: no leading slash for a link
+                    // directly under the root (whose build_path is empty).
+                    if !link_path.is_empty() {
+                        link_path.push(b'/');
+                    }
                     link_path.extend_from_slice(name);
                     let (cmd, attrs) = build_link_command(&link_path, &path);
                     let refs: Vec<(SendAttr, &[u8])> =
@@ -12473,6 +12634,151 @@ mod tests {
         );
     }
 
+    /// bd-ngt1y: adding a SECOND EXTENT_DATA_REF for the same
+    /// (root, objectid, offset) must MERGE into the existing keyed item by
+    /// bumping its count (kernel behavior), not fail with KeyAlreadyExists or
+    /// create a duplicate item.
+    #[test]
+    fn add_data_extent_ref_merges_duplicate_backref_bd_ngt1y() {
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+        let a = alloc.alloc_data(4096).expect("alloc");
+        // refs == 1: inline ref for inode 256 at offset 0.
+        alloc
+            .insert_data_extent_item(a.bytenr, a.num_bytes, 5, 256, 0, 7)
+            .expect("insert refs=1 extent item");
+
+        // First keyed ref for (5, 257, 0): refs 1 -> 2, keyed count 1.
+        alloc
+            .add_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("add keyed ref");
+        // Second ref for the SAME (5, 257, 0): must merge, not error.
+        alloc
+            .add_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("duplicate (root,objectid,offset) ref must merge, not fail");
+
+        // Total EXTENT_ITEM refs is now 3 (1 inline + 2 from the merged keyed ref).
+        assert_eq!(
+            alloc.extent_item_refs(a.bytenr, a.num_bytes).expect("refs"),
+            Some(3)
+        );
+        // Still exactly ONE keyed EXTENT_DATA_REF, now with count 2.
+        let keyed = alloc.get_extent_data_refs(a.bytenr).expect("keyed refs");
+        assert_eq!(keyed.len(), 1, "duplicate merged into one keyed item");
+        assert_eq!(
+            keyed[0],
+            BtrfsExtentDataRef {
+                root: 5,
+                objectid: 257,
+                offset: 0,
+                count: 2,
+            }
+        );
+    }
+
+    /// bd-vrv1q: removing a reference to a keyed EXTENT_DATA_REF whose count > 1
+    /// (merged by bd-ngt1y) must DECREMENT the count and keep the item, only
+    /// deleting it on the last reference — otherwise the backref vanishes while
+    /// EXTENT_ITEM.refs still counts the rest, and a later decrement fails with
+    /// "no matching EXTENT_DATA_REF backref for decrement".
+    #[test]
+    fn remove_data_extent_ref_decrements_merged_count_bd_vrv1q() {
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+        let a = alloc.alloc_data(4096).expect("alloc");
+        // refs == 1: inline ref for inode 256.
+        alloc
+            .insert_data_extent_item(a.bytenr, a.num_bytes, 5, 256, 0, 7)
+            .expect("insert refs=1 extent item");
+        // Two refs for the SAME (5, 257, 0): merged keyed ref count == 2, refs == 3.
+        alloc
+            .add_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("first keyed ref");
+        alloc
+            .add_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("merged keyed ref");
+        assert_eq!(
+            alloc.extent_item_refs(a.bytenr, a.num_bytes).expect("refs"),
+            Some(3)
+        );
+
+        // First removal: refs 3 -> 2, keyed item kept with count 1.
+        alloc
+            .remove_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("decrement merged ref");
+        assert_eq!(
+            alloc.extent_item_refs(a.bytenr, a.num_bytes).expect("refs"),
+            Some(2)
+        );
+        let keyed = alloc.get_extent_data_refs(a.bytenr).expect("keyed refs");
+        assert_eq!(keyed.len(), 1, "keyed ref kept after first decrement");
+        assert_eq!(keyed[0].count, 1, "count decremented 2 -> 1");
+
+        // Second removal: refs 2 -> 1, keyed item now deleted (last reference).
+        alloc
+            .remove_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("remove last keyed ref");
+        assert_eq!(
+            alloc.extent_item_refs(a.bytenr, a.num_bytes).expect("refs"),
+            Some(1)
+        );
+        assert!(
+            alloc.get_extent_data_refs(a.bytenr).expect("keyed refs").is_empty(),
+            "keyed ref removed on its last reference"
+        );
+    }
+
+    #[test]
+    fn remove_data_extent_ref_drops_inline_and_keyed_refs() {
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+        let a = alloc.alloc_data(4096).expect("alloc");
+
+        // refs == 2: an inline ref for inode 256, a keyed ref for inode 257
+        // (a reflink), exactly the form the validated clone path produces.
+        alloc
+            .insert_data_extent_item(a.bytenr, a.num_bytes, 5, 256, 0, 7)
+            .expect("inline ref (inode 256)");
+        alloc
+            .add_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("keyed ref (inode 257)");
+        assert_eq!(
+            alloc.extent_item_refs(a.bytenr, a.num_bytes).unwrap(),
+            Some(2)
+        );
+
+        // Drop the INLINE ref (inode 256): refs 2 -> 1; the keyed ref survives.
+        alloc
+            .remove_data_extent_ref(a.bytenr, a.num_bytes, 5, 256, 0)
+            .expect("drop inline ref");
+        assert_eq!(
+            alloc.extent_item_refs(a.bytenr, a.num_bytes).unwrap(),
+            Some(1)
+        );
+        let keyed = alloc.get_extent_data_refs(a.bytenr).unwrap();
+        assert_eq!(keyed.len(), 1, "keyed ref must survive inline removal");
+        assert_eq!(keyed[0].objectid, 257);
+
+        // Drop the KEYED ref (inode 257): refs 1 -> 0; backref removed.
+        alloc
+            .remove_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
+            .expect("drop keyed ref");
+        assert_eq!(
+            alloc.extent_item_refs(a.bytenr, a.num_bytes).unwrap(),
+            Some(0)
+        );
+        assert!(alloc.get_extent_data_refs(a.bytenr).unwrap().is_empty());
+
+        // Dropping a ref that isn't present is an atomic error (no change).
+        alloc
+            .insert_data_extent_item(a.bytenr, a.num_bytes, 5, 256, 0, 7)
+            .expect("re-add inline");
+        assert!(matches!(
+            alloc.remove_data_extent_ref(a.bytenr, a.num_bytes, 5, 999, 0),
+            Err(BtrfsMutationError::BrokenInvariant(_))
+        ));
+    }
+
     #[test]
     fn alloc_respects_block_group_type() {
         let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
@@ -17780,6 +18086,57 @@ mod tests {
             cmd_types.contains(&SendCommand::Utimes),
             "should have utimes command"
         );
+
+        // Command PATHs must be RELATIVE to the received subvol root — no
+        // subvol-name prefix, no '..' escape (bd-dnyr0). Previously every path
+        // was prefixed with "test_subvol", making the stream unreceivable.
+        const ATTR_PATH: u16 = SendAttr::Path as u16;
+        let path_of = |cmd: SendCommand| -> Option<Vec<u8>> {
+            parsed.commands.iter().find(|c| c.cmd == cmd).and_then(|c| {
+                c.attrs
+                    .iter()
+                    .find(|(t, _)| *t == ATTR_PATH)
+                    .map(|(_, v)| v.clone())
+            })
+        };
+        // The SUBVOL command does carry the subvolume name.
+        assert_eq!(path_of(SendCommand::Subvol).as_deref(), Some(&b"test_subvol"[..]));
+        // Child commands are subvol-relative.
+        assert_eq!(
+            path_of(SendCommand::Mkfile).as_deref(),
+            Some(&b"hello.txt"[..]),
+            "MKFILE path must be subvol-relative (no subvol-name prefix)"
+        );
+        assert_eq!(
+            path_of(SendCommand::Mkdir).as_deref(),
+            Some(&b"subdir"[..]),
+            "MKDIR path must be subvol-relative"
+        );
+        // No command path may carry the subvol prefix or escape the root.
+        for c in &parsed.commands {
+            for (t, v) in &c.attrs {
+                if *t == ATTR_PATH {
+                    assert!(
+                        !v.starts_with(b"test_subvol/"),
+                        "command path must not be subvol-name-prefixed: {:?}",
+                        String::from_utf8_lossy(v)
+                    );
+                    assert!(
+                        !v.windows(2).any(|w| w == b".."),
+                        "command path must not contain '..': {:?}",
+                        String::from_utf8_lossy(v)
+                    );
+                }
+            }
+        }
+        // The subvol root's metadata commands apply via an empty path.
+        assert!(
+            parsed.commands.iter().any(|c| c.cmd == SendCommand::Chmod
+                && c.attrs
+                    .iter()
+                    .any(|(t, v)| *t == ATTR_PATH && v.is_empty())),
+            "the subvolume root's chmod must use an empty (root-relative) path"
+        );
     }
 
     /// Regression: a file extent larger than the u16 TLV limit must be split
@@ -18125,10 +18482,10 @@ mod tests {
                 .map(|(_, d)| d.clone())
         };
         let mkdir_pos = parsed.commands.iter().position(|c| {
-            c.cmd == SendCommand::Mkdir && path_of(c).as_deref() == Some(b"sv/d".as_ref())
+            c.cmd == SendCommand::Mkdir && path_of(c).as_deref() == Some(b"d".as_ref())
         });
         let mkfile_pos = parsed.commands.iter().position(|c| {
-            c.cmd == SendCommand::Mkfile && path_of(c).as_deref() == Some(b"sv/d/f".as_ref())
+            c.cmd == SendCommand::Mkfile && path_of(c).as_deref() == Some(b"d/f".as_ref())
         });
 
         let mkdir_pos = mkdir_pos.expect("mkdir sv/d emitted");
@@ -18210,17 +18567,17 @@ mod tests {
         // mkfile at the primary path a/f1.
         assert!(
             parsed.commands.iter().any(|c| c.cmd == SendCommand::Mkfile
-                && attr(c, ATTR_PATH).as_deref() == Some(b"sv/a/f1".as_ref())),
+                && attr(c, ATTR_PATH).as_deref() == Some(b"a/f1".as_ref())),
             "file created once at its primary path"
         );
         // link b/f2 -> a/f1 for the second hard link.
         let link = parsed.commands.iter().find(|c| {
-            c.cmd == SendCommand::Link && attr(c, ATTR_PATH).as_deref() == Some(b"sv/b/f2".as_ref())
+            c.cmd == SendCommand::Link && attr(c, ATTR_PATH).as_deref() == Some(b"b/f2".as_ref())
         });
         let link = link.expect("second hard link must emit a Link command");
         assert_eq!(
             attr(link, ATTR_PATH_LINK).as_deref(),
-            Some(b"sv/a/f1".as_ref()),
+            Some(b"a/f1".as_ref()),
             "Link must target the primary path"
         );
     }
@@ -18351,7 +18708,7 @@ mod tests {
             .iter()
             .find_map(|(candidate, value)| (*candidate == ATTR_PATH).then_some(value.as_slice()))
             .expect("UpdateExtent should carry path");
-        assert_eq!(path, b"test_subvol/prealloc.bin");
+        assert_eq!(path, b"prealloc.bin");
         assert_eq!(attr_u64(update, ATTR_FILE_OFFSET), FILE_OFFSET);
         assert_eq!(attr_u64(update, ATTR_SIZE), PREALLOC_LEN);
     }

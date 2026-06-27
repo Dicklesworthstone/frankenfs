@@ -137,7 +137,7 @@ pub fn write_inode(
 
 /// Serialize an `Ext4Inode` into raw bytes of the given `inode_size`.
 #[expect(clippy::cast_possible_truncation)]
-fn serialize_inode(inode: &Ext4Inode, inode_size: usize) -> Vec<u8> {
+pub fn serialize_inode(inode: &Ext4Inode, inode_size: usize) -> Vec<u8> {
     let mut buf = vec![0u8; inode_size];
 
     // Mode (0x00).

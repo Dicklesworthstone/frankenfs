@@ -2139,16 +2139,18 @@ pub trait FsOps: Send + Sync {
         ))
     }
 
-    /// Clone (reflink) entire file for `FICLONE`.
+    /// Clone (reflink) an entire file for `FICLONE`.
     ///
-    /// Creates a CoW copy where dest file shares blocks with source.
-    /// Returns `FfsError::ReadOnly` for read-only mounts.
+    /// Creates a CoW copy where `dest_ino` shares the source's data extents.
+    /// FUSE dispatch resolves the caller's source fd to `src_ino` (same-device
+    /// check) before invoking this. Returns `FfsError::ReadOnly` for read-only
+    /// mounts.
     fn clone_file(
         &self,
         _cx: &Cx,
         _scope: &mut RequestScope,
-        _dest_fh: u64,
-        _src_fd: i32,
+        _dest_ino: InodeNumber,
+        _src_ino: InodeNumber,
     ) -> ffs_error::Result<()> {
         Err(FfsError::UnsupportedFeature(
             "clone_file (FICLONE) is not supported by this backend".to_owned(),
@@ -2157,14 +2159,19 @@ pub trait FsOps: Send + Sync {
 
     /// Clone a range of blocks for `FICLONERANGE`.
     ///
-    /// Creates a CoW copy of a range where dest shares blocks with source.
-    /// Returns `FfsError::ReadOnly` for read-only mounts.
+    /// Creates a CoW copy of a range where `dest_ino` shares the source's
+    /// extents. FUSE dispatch resolves the caller's source fd to `src_ino`
+    /// first. `src_length == 0` means "to source EOF". Returns
+    /// `FfsError::ReadOnly` for read-only mounts.
     fn clone_file_range(
         &self,
         _cx: &Cx,
         _scope: &mut RequestScope,
-        _dest_fh: u64,
-        _range: FileCloneRange,
+        _dest_ino: InodeNumber,
+        _src_ino: InodeNumber,
+        _src_offset: u64,
+        _src_length: u64,
+        _dest_offset: u64,
     ) -> ffs_error::Result<()> {
         Err(FfsError::UnsupportedFeature(
             "clone_file_range (FICLONERANGE) is not supported by this backend".to_owned(),
@@ -3119,6 +3126,37 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
     ) -> ffs_error::Result<u64> {
         self.as_ref()
             .move_ext(cx, scope, ino, donor_fd, orig_start, donor_start, len)
+    }
+
+    fn clone_file(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        dest_ino: InodeNumber,
+        src_ino: InodeNumber,
+    ) -> ffs_error::Result<()> {
+        self.as_ref().clone_file(cx, scope, dest_ino, src_ino)
+    }
+
+    fn clone_file_range(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        dest_ino: InodeNumber,
+        src_ino: InodeNumber,
+        src_offset: u64,
+        src_length: u64,
+        dest_offset: u64,
+    ) -> ffs_error::Result<()> {
+        self.as_ref().clone_file_range(
+            cx,
+            scope,
+            dest_ino,
+            src_ino,
+            src_offset,
+            src_length,
+            dest_offset,
+        )
     }
 
     fn register_move_ext_donor_fd(

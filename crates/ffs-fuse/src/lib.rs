@@ -12,7 +12,7 @@ pub mod per_core;
 use asupersync::Cx;
 use ffs_core::{
     BackpressureDecision, BackpressureGate, BtrfsQgroupLimitRequest, BtrfsTreeSearchKey,
-    DirEntry as FfsDirEntry, FIEMAP_EXTENT_UNWRITTEN, FiemapExtent, FileCloneRange,
+    DirEntry as FfsDirEntry, FIEMAP_EXTENT_UNWRITTEN, FiemapExtent,
     FileType as FfsFileType, FsOps, FsStat, FsxattrInfo, InodeAttr, ReleaseRequest, RequestOp,
     RequestScope, SeekWhence, SetAttrRequest, XattrSetMode,
 };
@@ -4661,21 +4661,40 @@ impl FrankenFuse {
                 }
             }
             FICLONE => {
-                // Input: 4-byte source fd
+                // Reflink: writes dst's extent tree, so a read-only mount must
+                // reject with EROFS. Input: 4-byte source fd.
+                if self.inner.read_only {
+                    return IoctlResult::Error(libc::EROFS);
+                }
                 if in_data.len() < 4 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let src_fd = i32::from_le_bytes(in_data[0..4].try_into().unwrap_or([0; 4]));
+                let Ok(src_fd) = u32::try_from(src_fd) else {
+                    return IoctlResult::Error(libc::EBADF);
+                };
                 let cx = Self::cx_for_request();
-                match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
-                    self.inner.ops.clone_file(cx, scope, fh, src_fd)
+                // Resolve the caller's source fd to a same-device inode (reuses
+                // the move_ext donor resolver), then share its extents into the
+                // ioctl target (`ino`). bd-vh8p9.
+                match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
+                    let src_ino = self.resolve_move_ext_donor(caller_pid, src_fd)?;
+                    self.inner
+                        .ops
+                        .clone_file(cx, scope, InodeNumber(ino), src_ino)?;
+                    self.inner.ops.commit_request_scope(scope)?;
+                    Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
                     Err(error) => IoctlResult::Error(error.to_errno()),
                 }
             }
             FICLONERANGE => {
-                // Input: 32-byte file_clone_range struct
+                // Input: 32-byte file_clone_range struct. Writes dst, so RO
+                // mounts reject with EROFS.
+                if self.inner.read_only {
+                    return IoctlResult::Error(libc::EROFS);
+                }
                 if in_data.len() < FILE_CLONE_RANGE_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
@@ -4683,15 +4702,23 @@ impl FrankenFuse {
                 let src_offset = u64::from_le_bytes(in_data[8..16].try_into().unwrap_or([0; 8]));
                 let src_length = u64::from_le_bytes(in_data[16..24].try_into().unwrap_or([0; 8]));
                 let dest_offset = u64::from_le_bytes(in_data[24..32].try_into().unwrap_or([0; 8]));
-                let range = FileCloneRange {
-                    src_fd,
-                    src_offset,
-                    src_length,
-                    dest_offset,
+                let Ok(src_fd) = u32::try_from(src_fd) else {
+                    return IoctlResult::Error(libc::EBADF);
                 };
                 let cx = Self::cx_for_request();
-                match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
-                    self.inner.ops.clone_file_range(cx, scope, fh, range)
+                match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
+                    let src_ino = self.resolve_move_ext_donor(caller_pid, src_fd)?;
+                    self.inner.ops.clone_file_range(
+                        cx,
+                        scope,
+                        InodeNumber(ino),
+                        src_ino,
+                        src_offset,
+                        src_length,
+                        dest_offset,
+                    )?;
+                    self.inner.ops.commit_request_scope(scope)?;
+                    Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
                     Err(error) => IoctlResult::Error(error.to_errno()),
