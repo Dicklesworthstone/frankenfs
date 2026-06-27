@@ -12,7 +12,6 @@ use asupersync::Cx;
 use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, CommitSeq};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 const JBD2_MAGIC: u32 = 0xC03B_3998;
@@ -271,9 +270,6 @@ impl Jbd2Header {
     #[must_use]
     fn parse(bytes: &[u8]) -> Option<Self> {
         let magic = read_be_u32(bytes, 0)?;
-        if magic != JBD2_MAGIC {
-            return None;
-        }
         let block_type = read_be_u32(bytes, 4)?;
         let sequence = read_be_u32(bytes, 8)?;
         Some(Self {
@@ -305,8 +301,6 @@ impl DescriptorTag {
 
 const JBD2_COMMIT_CHKSUM_OFFSET: usize = 16;
 const JBD2_CHECKSUM_TAIL_SIZE: usize = 4;
-const JBD2_ZERO_CHECKSUM_FIELD: [u8; JBD2_CHECKSUM_TAIL_SIZE] = [0; JBD2_CHECKSUM_TAIL_SIZE];
-const JBD2_COMMIT_SEGMENTED_CHECKSUM_MIN: usize = 4096;
 
 fn checksum_jbd2_tail_zeroed_block(block: &[u8], seed: u32) -> Option<u32> {
     if block.len() < JBD2_CHECKSUM_TAIL_SIZE {
@@ -315,25 +309,7 @@ fn checksum_jbd2_tail_zeroed_block(block: &[u8], seed: u32) -> Option<u32> {
 
     let tail = block.len() - JBD2_CHECKSUM_TAIL_SIZE;
     let checksum = crc32c::crc32c_append(!seed, &block[..tail]);
-    let checksum = crc32c::crc32c_append(checksum, &JBD2_ZERO_CHECKSUM_FIELD);
-    Some(!checksum)
-}
-
-fn checksum_jbd2_commit_zeroed_block(block: &[u8], seed: u32) -> Option<u32> {
-    let after_field = JBD2_COMMIT_CHKSUM_OFFSET.checked_add(JBD2_CHECKSUM_TAIL_SIZE)?;
-    if block.len() < after_field {
-        return None;
-    }
-
-    if block.len() < JBD2_COMMIT_SEGMENTED_CHECKSUM_MIN {
-        let mut temp = block.to_vec();
-        temp[JBD2_COMMIT_CHKSUM_OFFSET..after_field].copy_from_slice(&JBD2_ZERO_CHECKSUM_FIELD);
-        return Some(!crc32c::crc32c_append(!seed, &temp));
-    }
-
-    let checksum = crc32c::crc32c_append(!seed, &block[..JBD2_COMMIT_CHKSUM_OFFSET]);
-    let checksum = crc32c::crc32c_append(checksum, &JBD2_ZERO_CHECKSUM_FIELD);
-    let checksum = crc32c::crc32c_append(checksum, &block[after_field..]);
+    let checksum = crc32c::crc32c_append(checksum, &[0_u8; JBD2_CHECKSUM_TAIL_SIZE]);
     Some(!checksum)
 }
 
@@ -358,10 +334,8 @@ fn stamp_jbd2_tag_data_checksum(
     sequence: u32,
     seed: u32,
 ) -> Result<()> {
+    let checksum = checksum_jbd2_data_block(data_block, sequence, seed);
     match format {
-        // Legacy tags carry no data checksum field. The old code computed a full
-        // data-block CRC up front and then discarded it here — pure per-write
-        // waste. Compute the CRC only in the arms that actually stamp it.
         Jbd2TagFormat::Legacy => Ok(()),
         Jbd2TagFormat::CsumV2 => {
             if tag.len() < JBD2_TAG_CHECKSUM_OFFSET_V1_V2 + 2 {
@@ -369,7 +343,6 @@ fn stamp_jbd2_tag_data_checksum(
                     "JBD2 tag too small for checksum".to_owned(),
                 ));
             }
-            let checksum = checksum_jbd2_data_block(data_block, sequence, seed);
             let checksum = u16::try_from(checksum & 0xFFFF)
                 .map_err(|_| FfsError::Format("JBD2 checksum truncation failed".to_owned()))?;
             tag[JBD2_TAG_CHECKSUM_OFFSET_V1_V2..JBD2_TAG_CHECKSUM_OFFSET_V1_V2 + 2]
@@ -382,7 +355,6 @@ fn stamp_jbd2_tag_data_checksum(
                     "JBD2 tag too small for checksum".to_owned(),
                 ));
             }
-            let checksum = checksum_jbd2_data_block(data_block, sequence, seed);
             tag[JBD2_TAG_CHECKSUM_OFFSET_V3..JBD2_TAG_CHECKSUM_OFFSET_V3 + JBD2_CHECKSUM_TAIL_SIZE]
                 .copy_from_slice(&checksum.to_be_bytes());
             Ok(())
@@ -428,12 +400,17 @@ fn verify_jbd2_block_checksum(block: &[u8], sb: &Jbd2Superblock) -> bool {
         }
         JBD2_BLOCKTYPE_COMMIT => {
             // Commit block checksum is at offset 16.
-            if block.len() < JBD2_COMMIT_CHKSUM_OFFSET + JBD2_CHECKSUM_TAIL_SIZE {
+            if block.len() < JBD2_COMMIT_CHKSUM_OFFSET + 4 {
                 return false;
             }
             let stored = read_be_u32(block, JBD2_COMMIT_CHKSUM_OFFSET).unwrap_or(0);
+            let mut temp = block.to_vec();
+            // Zero out the checksum field before computing.
+            for i in 0..4 {
+                temp[JBD2_COMMIT_CHKSUM_OFFSET + i] = 0;
+            }
             let seed = sb.csum_seed();
-            let computed = checksum_jbd2_commit_zeroed_block(block, seed).unwrap_or(0);
+            let computed = !crc32c::crc32c_append(!seed, &temp);
             stored == computed
         }
         _ => true,
@@ -695,10 +672,7 @@ fn replay_jbd2_inner(
                     break;
                 }
                 stats.descriptor_blocks = stats.descriptor_blocks.saturating_add(1);
-                // Single strict pass: parse the tags AND apply the strict
-                // "must be LAST-terminated within bounds" gate at once, instead
-                // of scanning the same tag region twice (count then parse).
-                let Some(tags) = parse_descriptor_tags_strict_with_format(
+                let Some(tag_count) = strict_descriptor_tag_count_with_format(
                     raw.as_slice(),
                     is_64bit,
                     has_tail,
@@ -706,12 +680,19 @@ fn replay_jbd2_inner(
                 ) else {
                     break;
                 };
+                let tags = parse_descriptor_tags_with_format(
+                    raw.as_slice(),
+                    is_64bit,
+                    has_tail,
+                    tag_format,
+                );
+                debug_assert_eq!(tags.len(), tag_count);
                 stats.descriptor_tags = stats
                     .descriptor_tags
                     .saturating_add(u64::try_from(tags.len()).unwrap_or(u64::MAX));
 
                 // Check if all data blocks fit within the journal region.
-                let tag_count_u64 = u64::try_from(tags.len()).unwrap_or(u64::MAX);
+                let tag_count_u64 = u64::try_from(tag_count).unwrap_or(u64::MAX);
                 if tag_count_u64 >= total_blocks {
                     break;
                 }
@@ -761,18 +742,16 @@ fn replay_jbd2_inner(
                     break;
                 }
                 stats.revoke_blocks = stats.revoke_blocks.saturating_add(1);
-                let txn = pending.entry(header.sequence).or_default();
-                let Some(revoke_count) = extend_strict_revoke_events(
-                    raw.as_slice(),
-                    is_64bit,
-                    has_tail,
-                    &mut txn.body_events,
-                ) else {
+                let Some(revokes) = strict_revoke_entries(raw.as_slice(), is_64bit, has_tail)
+                else {
                     break;
                 };
                 stats.revoke_entries = stats
                     .revoke_entries
-                    .saturating_add(u64::try_from(revoke_count).unwrap_or(u64::MAX));
+                    .saturating_add(u64::try_from(revokes.len()).unwrap_or(u64::MAX));
+                let txn = pending.entry(header.sequence).or_default();
+                txn.body_events
+                    .extend(revokes.into_iter().map(TxnBodyEvent::Revoke));
                 idx = idx.saturating_add(1);
             }
             _ => {
@@ -838,36 +817,10 @@ fn replay_jbd2_inner(
         .as_ref()
         .map_or(Jbd2TagFormat::Legacy, Jbd2Superblock::tag_format);
 
-    // Apply the committed writes. The staged-block READS are independent, but
-    // `resolve_block` is an FnMut caller closure and the verify/escape/write/count
-    // is order-sensitive, so split into three phases:
-    //   1. serial PLAN — resolve every absolute block number (keeps the FnMut
-    //      serial and preserves the first resolve error in target order);
-    //   2. parallel READ — read each staged journal block across the rayon pool,
-    //      so a blocking read parks its worker and the access latencies overlap up
-    //      to the pool size (I/O-overlap, bd-g5v1s/bd-w52e5 family);
-    //   3. serial CONSUME — verify + restore-escaped + write + count in target
-    //      order, byte-identical to the old single loop (checksum skip, write
-    //      order, replayed_blocks count, first-error-in-order all preserved).
-    let planned: Vec<(BlockNumber, StagedWrite, BlockNumber)> = {
-        let mut planned = Vec::with_capacity(final_writes.len());
-        for (target, staged) in final_writes {
-            let absolute = resolve_block(staged.journal_idx)?;
-            planned.push((target, staged, absolute));
-        }
-        planned
-    };
-    let staged_reads: Vec<Result<Vec<u8>>> = {
-        use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-        planned
-            .par_iter()
-            .map(|(_, _, absolute)| dev.read_block(cx, *absolute).map(|b| b.as_slice().to_vec()))
-            .collect()
-    };
-
     let mut replayed_blocks = 0_u64;
-    for ((target, staged, _absolute), read) in planned.into_iter().zip(staged_reads) {
-        let mut data = read?;
+    for (target, staged) in final_writes {
+        let absolute = resolve_block(staged.journal_idx)?;
+        let mut data = dev.read_block(cx, absolute)?.as_slice().to_vec();
         if options.verify_checksums
             && let Some(seed) = checksum_seed
             && let Some(expected) = staged.data_checksum
@@ -1073,27 +1026,6 @@ pub struct Jbd2Writer {
     has_checksum: bool,
     /// CRC32C seed used by the active JBD2 checksum feature set.
     csum_seed: u32,
-}
-
-#[cfg_attr(feature = "bench-instrumentation", inline(never))]
-#[cfg_attr(not(feature = "bench-instrumentation"), inline)]
-fn assemble_jbd2_descriptor_data_run(
-    descriptor: &[u8],
-    chunk: &[(BlockNumber, bool, Cow<'_, [u8]>)],
-    block_size: usize,
-) -> Result<Vec<u8>> {
-    let run_len = chunk
-        .len()
-        .checked_add(1)
-        .and_then(|blocks| blocks.checked_mul(block_size))
-        .ok_or_else(|| FfsError::Format("JBD2 descriptor/data write length overflow".to_owned()))?;
-    let mut run = Vec::with_capacity(run_len);
-    run.extend_from_slice(descriptor);
-    for (_, _, padded) in chunk {
-        run.extend_from_slice(padded);
-    }
-    debug_assert_eq!(run.len(), run_len);
-    Ok(run)
 }
 
 impl Jbd2Writer {
@@ -1340,41 +1272,20 @@ impl Jbd2Writer {
         while item_idx < txn.body_items.len() {
             match &txn.body_items[item_idx] {
                 Jbd2TxnBodyItem::Write(..) => {
-                    let mut chunk: Vec<(BlockNumber, bool, Cow<'_, [u8]>)> = Vec::new();
+                    let mut chunk: Vec<(BlockNumber, &[u8], Vec<u8>)> = Vec::new();
                     while item_idx < txn.body_items.len() && chunk.len() < tags_per_desc {
                         match &txn.body_items[item_idx] {
                             Jbd2TxnBodyItem::Write(target, payload) => {
+                                let mut padded = vec![0_u8; bs];
                                 let copy_len = payload.len().min(bs);
-                                // The JBD2 escape rule and the in-place magic
-                                // zeroing both key on the SAME test — the original
-                                // payload's first four bytes equal JBD2_MAGIC.
-                                // Compute it once here (the descriptor tag loop
-                                // below reuses it) instead of re-comparing the
-                                // bytes a second time per block.
-                                let escaped =
-                                    payload.len() >= 4 && payload[0..4] == JBD2_MAGIC.to_be_bytes();
-                                // Full, non-escaped payloads already have the
-                                // exact bytes and lifetime needed by the device
-                                // write, so borrow them through this descriptor
-                                // chunk. Escaped or short payloads still need an
-                                // owned mutable/padded buffer.
-                                let padded = if copy_len == bs && !escaped {
-                                    Cow::Borrowed(&payload[..bs])
-                                } else {
-                                    let mut p = if copy_len == bs {
-                                        payload[..bs].to_vec()
-                                    } else {
-                                        let mut p = vec![0_u8; bs];
-                                        p[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                        p
-                                    };
-                                    if escaped {
-                                        p[0..4].copy_from_slice(&[0u8; 4]);
-                                    }
-                                    Cow::Owned(p)
-                                };
+                                padded[..copy_len].copy_from_slice(&payload[..copy_len]);
 
-                                chunk.push((*target, escaped, padded));
+                                let magic_be = JBD2_MAGIC.to_be_bytes();
+                                if padded.len() >= 4 && padded[0..4] == magic_be {
+                                    padded[0..4].copy_from_slice(&[0u8; 4]);
+                                }
+
+                                chunk.push((*target, payload.as_slice(), padded));
                                 item_idx += 1;
                             }
                             Jbd2TxnBodyItem::Revoke(_) => break,
@@ -1385,7 +1296,7 @@ impl Jbd2Writer {
                     encode_jbd2_header(&mut desc, JBD2_BLOCKTYPE_DESCRIPTOR, seq);
 
                     let mut off = JBD2_HEADER_SIZE;
-                    for (i, (target, escaped, padded)) in chunk.iter().enumerate() {
+                    for (i, (target, payload, padded)) in chunk.iter().enumerate() {
                         let is_last_in_desc = i == chunk.len() - 1;
                         let mut flags = if is_last_in_desc {
                             JBD2_TAG_FLAG_LAST
@@ -1393,7 +1304,8 @@ impl Jbd2Writer {
                             0
                         };
 
-                        if *escaped {
+                        let magic_be = JBD2_MAGIC.to_be_bytes();
+                        if payload.len() >= 4 && payload[0..4] == magic_be {
                             flags |= JBD2_TAG_FLAG_ESCAPE;
                         }
 
@@ -1468,34 +1380,14 @@ impl Jbd2Writer {
                     }
 
                     let desc_block = self.alloc_block(&mut staged_head)?;
-                    let mut data_blocks = Vec::with_capacity(chunk.len());
-                    for _ in &chunk {
-                        data_blocks.push(self.alloc_block(&mut staged_head)?);
-                    }
-
-                    let physically_contiguous =
-                        data_blocks.iter().enumerate().all(|(index, block)| {
-                            u64::try_from(index)
-                                .ok()
-                                .and_then(|index| index.checked_add(1))
-                                .and_then(|delta| desc_block.0.checked_add(delta))
-                                == Some(block.0)
-                        });
-
-                    if dev.supports_contiguous_writes() && physically_contiguous {
-                        let run = assemble_jbd2_descriptor_data_run(&desc, &chunk, bs)?;
-                        dev.write_contiguous_blocks(cx, desc_block, &run)?;
-                    } else {
-                        dev.write_block(cx, desc_block, &desc)?;
-                        for (data_block, (_, _, padded)) in data_blocks.iter().copied().zip(&chunk)
-                        {
-                            dev.write_block(cx, data_block, padded)?;
-                        }
-                    }
+                    dev.write_block(cx, desc_block, &desc)?;
                     stats.descriptor_blocks = stats.descriptor_blocks.saturating_add(1);
-                    stats.data_blocks = stats
-                        .data_blocks
-                        .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+
+                    for (_, _, padded) in &chunk {
+                        let data_block = self.alloc_block(&mut staged_head)?;
+                        dev.write_block(cx, data_block, padded)?;
+                        stats.data_blocks = stats.data_blocks.saturating_add(1);
+                    }
                 }
                 Jbd2TxnBodyItem::Revoke(_) => {
                     let entry_size = if self.is_64bit { 8 } else { 4 };
@@ -2067,10 +1959,7 @@ mod fc_tests {
         ok.extend(build_fc_tag(0x08, &tail2)); // TAIL
         let ok_result = replay_fast_commit(&ok).unwrap();
         assert_eq!(ok_result.transactions_found, 1);
-        assert_eq!(
-            ok_result.operations,
-            vec![FcOperation::InodeUpdate(7, Vec::new())]
-        );
+        assert_eq!(ok_result.operations, vec![FcOperation::InodeUpdate(7, Vec::new())]);
         assert!(!ok_result.fallback_required);
     }
 
@@ -2148,9 +2037,6 @@ mod fc_tests {
         p.extend_from_slice(&ee_len.to_le_bytes());
         #[allow(clippy::cast_possible_truncation)]
         let ee_start_hi = (physical >> 32) as u16;
-        // The low 32 bits are the ext4 EXTENT ee_start_lo field; truncation is
-        // intentional (ee_start_hi above carries bits 32..48 of the 48-bit block).
-        #[allow(clippy::cast_possible_truncation)]
         let ee_start_lo = physical as u32;
         p.extend_from_slice(&ee_start_hi.to_le_bytes());
         p.extend_from_slice(&ee_start_lo.to_le_bytes());
@@ -2367,34 +2253,6 @@ mod fc_tests {
     }
 
     #[test]
-    fn replay_short_del_creat_link_unlink_tags_require_fallback() {
-        // DelRange(0x02,>=12), Creat(0x03,>=8), Link(0x04,>=8), Unlink(0x05,>=8):
-        // a payload shorter than the tag's fixed header, framed inside a valid
-        // HEAD/TAIL transaction, must skip the op and flag fallback, never panic
-        // on out-of-bounds indexing. Only ADD_RANGE/INODE/HEAD/TAIL had this
-        // coverage before.
-        for tag in [0x02_u16, 0x03, 0x04, 0x05] {
-            let mut data = Vec::new();
-            data.extend(build_fc_tag(0x09, &[0_u8; 16])); // HEAD
-            data.extend(build_fc_tag(tag, &[1, 2, 3])); // short payload for the tag under test
-            let mut tail = Vec::new();
-            tail.extend_from_slice(&3_u32.to_le_bytes()); // tid
-            tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
-            data.extend(build_fc_tag(0x08, &tail)); // TAIL
-
-            let result = replay_fast_commit(&data).unwrap();
-            assert!(
-                result.operations.is_empty(),
-                "tag {tag:#x}: short payload op must be skipped",
-            );
-            assert!(
-                result.fallback_required,
-                "tag {tag:#x}: short payload must require fallback",
-            );
-        }
-    }
-
-    #[test]
     fn replay_tail_without_crc_requires_fallback() {
         let mut data = Vec::new();
         data.extend(build_fc_tag(0x09, &[0; 16])); // HEAD
@@ -2437,10 +2295,7 @@ mod fc_tests {
         let result = replay_fast_commit(&data).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.last_tid, 3);
-        assert_eq!(
-            result.operations,
-            vec![FcOperation::InodeUpdate(42, Vec::new())]
-        );
+        assert_eq!(result.operations, vec![FcOperation::InodeUpdate(42, Vec::new())]);
         assert_eq!(result.incomplete_transactions, 0);
         assert!(result.fallback_required);
     }
@@ -2459,10 +2314,7 @@ mod fc_tests {
         let result = replay_fast_commit(&data).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.last_tid, 3);
-        assert_eq!(
-            result.operations,
-            vec![FcOperation::InodeUpdate(42, Vec::new())]
-        );
+        assert_eq!(result.operations, vec![FcOperation::InodeUpdate(42, Vec::new())]);
         assert_eq!(result.incomplete_transactions, 0);
         assert!(result.fallback_required);
     }
@@ -2481,10 +2333,7 @@ mod fc_tests {
         let result = replay_fast_commit(&data).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.last_tid, 3);
-        assert_eq!(
-            result.operations,
-            vec![FcOperation::InodeUpdate(42, Vec::new())]
-        );
+        assert_eq!(result.operations, vec![FcOperation::InodeUpdate(42, Vec::new())]);
         assert_eq!(result.incomplete_transactions, 0);
         assert!(!result.fallback_required);
     }
@@ -2514,13 +2363,7 @@ impl NativeCowJournal {
                 Ok(Some(_)) => {
                     next_slot = next_slot.saturating_add(1);
                 }
-                Ok(None) => break,
-                Err(FfsError::Format(message)) => {
-                    if next_slot == 0 {
-                        return Err(FfsError::Format(message));
-                    }
-                    break;
-                }
+                Ok(None) | Err(FfsError::Format(_)) => break,
                 Err(err) => return Err(err),
             }
         }
@@ -2595,12 +2438,7 @@ pub fn recover_native_cow(
         let raw = dev.read_block(cx, block)?;
         let decoded = match decode_cow_record(raw.as_slice()) {
             Ok(decoded) => decoded,
-            Err(FfsError::Format(message)) => {
-                if commit_order.is_empty() {
-                    return Err(FfsError::Format(message));
-                }
-                break;
-            }
+            Err(FfsError::Format(_)) => break,
             Err(err) => return Err(err),
         };
         let Some(record) = decoded else {
@@ -2622,15 +2460,6 @@ pub fn recover_native_cow(
                 });
             }
             DecodedCowRecord::Commit { commit_seq } => {
-                if let Some(last_commit_seq) = commit_order
-                    .last()
-                    .copied()
-                    .filter(|last_commit_seq| commit_seq < *last_commit_seq)
-                {
-                    return Err(FfsError::Format(format!(
-                        "COW commit sequence regressed: {commit_seq} after {last_commit_seq}"
-                    )));
-                }
                 if committed.insert(commit_seq) {
                     commit_order.push(commit_seq);
                 }
@@ -2677,23 +2506,12 @@ pub fn replay_native_cow(
 }
 
 fn resolve_region_block(region: JournalRegion, index: u64) -> Result<BlockNumber> {
-    if index >= region.blocks {
-        return Err(FfsError::Format(format!(
+    region.resolve(index).ok_or_else(|| {
+        FfsError::Format(format!(
             "journal block index {index} out of range (region size={})",
             region.blocks
-        )));
-    }
-    region
-        .start
-        .0
-        .checked_add(index)
-        .map(BlockNumber)
-        .ok_or_else(|| {
-            FfsError::Format(format!(
-                "journal block index {index} overflows absolute block number from start {}",
-                region.start.0
-            ))
-        })
+        ))
+    })
 }
 
 fn resolve_segment_block(
@@ -2704,17 +2522,12 @@ fn resolve_segment_block(
     let mut remaining = index;
     for segment in segments {
         if remaining < segment.blocks {
-            return segment
-                .start
-                .0
-                .checked_add(remaining)
-                .map(BlockNumber)
-                .ok_or_else(|| {
-                    FfsError::Format(format!(
-                        "journal segment offset {remaining} overflows absolute block number from start {}",
-                        segment.start.0
-                    ))
-                });
+            return segment.resolve(remaining).ok_or_else(|| {
+                FfsError::Format(format!(
+                    "journal segment offset {remaining} out of range for segment size={}",
+                    segment.blocks
+                ))
+            });
         }
         remaining = remaining.saturating_sub(segment.blocks);
     }
@@ -2786,105 +2599,6 @@ fn parse_descriptor_tags_with_format(
     }
 
     tags
-}
-
-/// Strict descriptor-tag parse: build the tag `Vec` in ONE pass, returning
-/// `None` under exactly the conditions [`strict_descriptor_tag_count_with_format`]
-/// rejects (no `LAST`-terminated tag within bounds, a tag record overflowing the
-/// block, or an out-of-range read). Merges the previously separate
-/// count-then-parse passes the replay loop ran back-to-back over the same block
-/// (a 2× scan of every descriptor's tag region): the strict gate and the tag
-/// materialisation are the identical iteration, so `tags.len()` is the count.
-///
-/// Behaviour-identical to `strict_...count` + `parse_...tags` at the replay
-/// call site: it aborts (→ `None`) on precisely the malformations the strict
-/// count aborts on, and on success yields exactly the tags
-/// `parse_descriptor_tags_with_format` produces for a well-formed descriptor
-/// (same target-high reconstruction, same `LAST` termination).
-fn parse_descriptor_tags_strict_with_format(
-    block: &[u8],
-    is_64bit: bool,
-    has_tail: bool,
-    tag_format: Jbd2TagFormat,
-) -> Option<Vec<DescriptorTag>> {
-    let base_tag_size = tag_format.tag_size(is_64bit);
-    let mut tags = Vec::new();
-    let mut offset = JBD2_HEADER_SIZE;
-    let limit = if has_tail {
-        block.len().saturating_sub(4)
-    } else {
-        block.len()
-    };
-
-    while offset.checked_add(base_tag_size)? <= limit {
-        let (flags, data_checksum) =
-            read_descriptor_tag_flags_and_checksum(block, offset, tag_format)?;
-        let tag_size = descriptor_tag_record_size(base_tag_size, flags)?;
-        if offset.checked_add(tag_size)? > limit {
-            return None;
-        }
-
-        // Target reconstruction mirrors `parse_descriptor_tags_with_format`
-        // exactly (tolerant high-word read) so the produced tags are identical.
-        let target_low = read_be_u32(block, offset)?;
-        let mut target = u64::from(target_low);
-        let high_offset = match tag_format {
-            Jbd2TagFormat::CsumV3 => Some(JBD2_TAG_HIGH_OFFSET_V3),
-            Jbd2TagFormat::Legacy | Jbd2TagFormat::CsumV2 if is_64bit => Some(8),
-            Jbd2TagFormat::Legacy | Jbd2TagFormat::CsumV2 => None,
-        };
-        if let Some(high_offset) = high_offset
-            && let Some(target_high) = read_be_u32(block, offset.saturating_add(high_offset))
-        {
-            target |= u64::from(target_high) << 32;
-        }
-
-        let tag = DescriptorTag {
-            target: BlockNumber(target),
-            flags,
-            data_checksum,
-        };
-        let is_last = tag.is_last();
-        tags.push(tag);
-        if is_last {
-            return Some(tags);
-        }
-        offset = offset.checked_add(tag_size)?;
-    }
-
-    None
-}
-
-/// Benchmark-only shim: exercise the descriptor-tag decode either as the old
-/// two-pass (strict count THEN parse) or the new single strict-parse, returning
-/// the resulting tag count so the internal `DescriptorTag` / `Jbd2TagFormat`
-/// types stay private. Not part of the public API (guards the dedup in
-/// `05ce88c5`; see bench `descriptor_decode`).
-#[doc(hidden)]
-#[must_use]
-pub fn bench_descriptor_decode(
-    block: &[u8],
-    is_64bit: bool,
-    has_tail: bool,
-    format: u8,
-    one_pass: bool,
-) -> usize {
-    let tag_format = match format {
-        0 => Jbd2TagFormat::Legacy,
-        1 => Jbd2TagFormat::CsumV2,
-        _ => Jbd2TagFormat::CsumV3,
-    };
-    if one_pass {
-        parse_descriptor_tags_strict_with_format(block, is_64bit, has_tail, tag_format)
-            .map_or(0, |tags| tags.len())
-    } else {
-        match strict_descriptor_tag_count_with_format(block, is_64bit, has_tail, tag_format) {
-            Some(_) => {
-                parse_descriptor_tags_with_format(block, is_64bit, has_tail, tag_format).len()
-            }
-            None => 0,
-        }
-    }
 }
 
 fn strict_descriptor_tag_count_with_format(
@@ -3027,7 +2741,7 @@ fn scan_committed_tail_transaction(
             }
             JBD2_BLOCKTYPE_REVOKE => {
                 saw_body = true;
-                if strict_revoke_entry_count(raw.as_slice(), is_64bit, has_tail).is_none() {
+                if strict_revoke_entries(raw.as_slice(), is_64bit, has_tail).is_none() {
                     return Ok(None);
                 }
                 idx = idx.saturating_add(1);
@@ -3077,86 +2791,6 @@ fn strict_revoke_entries(block: &[u8], is_64bit: bool, has_tail: bool) -> Option
     }
 
     Some(out)
-}
-
-fn strict_revoke_layout(block: &[u8], is_64bit: bool, has_tail: bool) -> Option<(usize, usize)> {
-    let r_count = usize::try_from(read_be_u32(block, 12)?).ok()?;
-    let entry_size = if is_64bit { 8 } else { 4 };
-    let limit = if has_tail {
-        block.len().saturating_sub(4)
-    } else {
-        block.len()
-    };
-
-    if r_count < JBD2_REVOKE_HEADER_SIZE || r_count > limit {
-        return None;
-    }
-    if (r_count - JBD2_REVOKE_HEADER_SIZE) % entry_size != 0 {
-        return None;
-    }
-
-    let entry_count = (r_count - JBD2_REVOKE_HEADER_SIZE) / entry_size;
-    Some((r_count, entry_count))
-}
-
-fn strict_revoke_entry_count(block: &[u8], is_64bit: bool, has_tail: bool) -> Option<usize> {
-    strict_revoke_layout(block, is_64bit, has_tail).map(|(_, entry_count)| entry_count)
-}
-
-fn extend_strict_revoke_events(
-    block: &[u8],
-    is_64bit: bool,
-    has_tail: bool,
-    events: &mut Vec<TxnBodyEvent>,
-) -> Option<usize> {
-    let (r_count, entry_count) = strict_revoke_layout(block, is_64bit, has_tail)?;
-    let entry_size = if is_64bit { 8 } else { 4 };
-    events.reserve(entry_count);
-
-    let mut offset = JBD2_REVOKE_HEADER_SIZE;
-    while offset.checked_add(entry_size)? <= r_count {
-        let target = if is_64bit {
-            let high = read_be_u32(block, offset)?;
-            let low = read_be_u32(block, offset + 4)?;
-            BlockNumber((u64::from(high) << 32) | u64::from(low))
-        } else {
-            BlockNumber(u64::from(read_be_u32(block, offset)?))
-        };
-        events.push(TxnBodyEvent::Revoke(target));
-        offset = offset.checked_add(entry_size)?;
-    }
-
-    Some(entry_count)
-}
-
-/// Benchmark-only shim: compare the original strict revoke decode path
-/// (materialize a `Vec<BlockNumber>`, then append events) with the fused
-/// scanner used by replay. Returns a deterministic checksum so the private
-/// event representation stays hidden from the benchmark crate.
-#[doc(hidden)]
-#[must_use]
-pub fn bench_revoke_decode(
-    block: &[u8],
-    is_64bit: bool,
-    has_tail: bool,
-    fused_events: bool,
-) -> u64 {
-    let mut events = Vec::new();
-    if fused_events {
-        if extend_strict_revoke_events(block, is_64bit, has_tail, &mut events).is_none() {
-            return 0;
-        }
-    } else {
-        let Some(revokes) = strict_revoke_entries(block, is_64bit, has_tail) else {
-            return 0;
-        };
-        events.extend(revokes.into_iter().map(TxnBodyEvent::Revoke));
-    }
-
-    let len = u64::try_from(events.len()).unwrap_or(u64::MAX);
-    events.iter().fold(len, |acc, event| match event {
-        TxnBodyEvent::Write(target, _) | TxnBodyEvent::Revoke(target) => acc ^ target.0,
-    })
 }
 
 #[cfg(test)]
@@ -3260,9 +2894,9 @@ fn encode_cow_record(block_size: u32, record: &CowRecord<'_>) -> Result<Vec<u8>>
     let block_size = usize::try_from(block_size)
         .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
     if block_size < COW_HEADER_SIZE {
-        return Err(FfsError::Format(format!(
-            "COW journal block size {block_size} is smaller than header size {COW_HEADER_SIZE}"
-        )));
+        return Err(FfsError::Format(
+            "block size too small for COW journal record".to_owned(),
+        ));
     }
 
     let mut out = vec![0_u8; block_size];
@@ -3278,7 +2912,7 @@ fn encode_cow_record(block_size: u32, record: &CowRecord<'_>) -> Result<Vec<u8>>
             let payload_capacity = block_size.saturating_sub(COW_HEADER_SIZE);
             if payload.len() > payload_capacity {
                 return Err(FfsError::Format(format!(
-                    "COW payload too large: {} bytes exceeds capacity {payload_capacity}",
+                    "COW payload too large: {} bytes (capacity {payload_capacity})",
                     payload.len()
                 )));
             }
@@ -3359,30 +2993,13 @@ fn decode_cow_record(block: &[u8]) -> Result<Option<DecodedCowRecord>> {
                     ),
                 });
             }
-            if block[payload_end..].iter().any(|byte| *byte != 0) {
-                return Err(FfsError::Format(
-                    "COW write record padding must be zero".to_owned(),
-                ));
-            }
             Ok(Some(DecodedCowRecord::Write {
                 commit_seq,
                 block: BlockNumber(target_block),
                 payload,
             }))
         }
-        COW_RECORD_COMMIT => {
-            if target_block != 0 || payload_len != 0 || payload_crc != 0 {
-                return Err(FfsError::Format(
-                    "COW commit record metadata must be zero".to_owned(),
-                ));
-            }
-            if block[COW_HEADER_SIZE..].iter().any(|byte| *byte != 0) {
-                return Err(FfsError::Format(
-                    "COW commit record payload area must be zero".to_owned(),
-                ));
-            }
-            Ok(Some(DecodedCowRecord::Commit { commit_seq }))
-        }
+        COW_RECORD_COMMIT => Ok(Some(DecodedCowRecord::Commit { commit_seq })),
         other => Err(FfsError::Format(format!(
             "unknown COW record kind: {other}"
         ))),
@@ -3455,37 +3072,6 @@ mod tests {
             Ok(())
         }
 
-        fn supports_contiguous_writes(&self) -> bool {
-            true
-        }
-
-        fn write_contiguous_blocks(&self, _cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
-            let block_size = usize::try_from(self.block_size)
-                .map_err(|_| FfsError::Format("block_size overflow".to_owned()))?;
-            if data.len() % block_size != 0 {
-                return Err(FfsError::Format(
-                    "contiguous write size mismatch".to_owned(),
-                ));
-            }
-            let count = u64::try_from(data.len() / block_size)
-                .map_err(|_| FfsError::Format("block count overflow".to_owned()))?;
-            if start
-                .0
-                .checked_add(count)
-                .is_none_or(|end| end > self.block_count)
-            {
-                return Err(FfsError::Format("contiguous write out of range".to_owned()));
-            }
-
-            let mut blocks = self.blocks.write();
-            for (index, bytes) in data.chunks_exact(block_size).enumerate() {
-                let index = u64::try_from(index)
-                    .map_err(|_| FfsError::Format("block index overflow".to_owned()))?;
-                blocks.insert(BlockNumber(start.0 + index), bytes.to_vec());
-            }
-            Ok(())
-        }
-
         fn block_size(&self) -> u32 {
             self.block_size
         }
@@ -3529,65 +3115,6 @@ mod tests {
                 )));
             }
             self.inner.write_block(cx, block, data)
-        }
-
-        fn block_size(&self) -> u32 {
-            self.inner.block_size()
-        }
-
-        fn block_count(&self) -> u64 {
-            self.inner.block_count()
-        }
-
-        fn sync(&self, cx: &Cx) -> Result<()> {
-            self.inner.sync(cx)
-        }
-    }
-
-    #[derive(Debug)]
-    struct FailContiguousWriteBlockDevice {
-        inner: MemBlockDevice,
-        prefix_blocks: usize,
-    }
-
-    impl FailContiguousWriteBlockDevice {
-        fn new(block_size: u32, block_count: u64, prefix_blocks: usize) -> Self {
-            Self {
-                inner: MemBlockDevice::new(block_size, block_count),
-                prefix_blocks,
-            }
-        }
-    }
-
-    impl BlockDevice for FailContiguousWriteBlockDevice {
-        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<ffs_block::BlockBuf> {
-            self.inner.read_block(cx, block)
-        }
-
-        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
-            self.inner.write_block(cx, block, data)
-        }
-
-        fn supports_contiguous_writes(&self) -> bool {
-            true
-        }
-
-        fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
-            let block_size = usize::try_from(self.inner.block_size())
-                .map_err(|_| FfsError::Format("block_size overflow".to_owned()))?;
-            for (index, bytes) in data
-                .chunks_exact(block_size)
-                .take(self.prefix_blocks)
-                .enumerate()
-            {
-                let index = u64::try_from(index)
-                    .map_err(|_| FfsError::Format("block index overflow".to_owned()))?;
-                self.inner
-                    .write_block(cx, BlockNumber(start.0 + index), bytes)?;
-            }
-            Err(FfsError::Format(
-                "injected partial contiguous-write failure".to_owned(),
-            ))
         }
 
         fn block_size(&self) -> u32 {
@@ -3647,28 +3174,6 @@ mod tests {
         assert!(
             Jbd2Superblock::parse(&block[..JBD2_SUPERBLOCK_MIN_PARSE_SIZE]).is_some(),
             "minimum consumed superblock fields should parse"
-        );
-    }
-
-    #[test]
-    fn jbd2_superblock_parse_rejects_bad_magic_and_block_type() {
-        // A full-size buffer with the wrong magic must not parse as a superblock.
-        let mut bad_magic =
-            jbd2_superblock_block(512, 1, 1, 0, JBD2_FEATURE_INCOMPAT_CSUM_V3, [7; 16]);
-        bad_magic[0..4].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
-        assert!(
-            Jbd2Superblock::parse(&bad_magic).is_none(),
-            "wrong magic must be rejected"
-        );
-
-        // Correct magic but a non-superblock block type (a descriptor block)
-        // must be rejected so recovery never misreads it as a superblock.
-        let mut wrong_type =
-            jbd2_superblock_block(512, 1, 1, 0, JBD2_FEATURE_INCOMPAT_CSUM_V3, [7; 16]);
-        wrong_type[4..8].copy_from_slice(&JBD2_BLOCKTYPE_DESCRIPTOR.to_be_bytes());
-        assert!(
-            Jbd2Superblock::parse(&wrong_type).is_none(),
-            "non-superblock block type must be rejected"
         );
     }
 
@@ -3949,37 +3454,6 @@ mod tests {
         assert!(!verify_jbd2_block_checksum(&revoke, &sb));
         stamp_descriptor_or_revoke_checksum(&mut revoke, &sb);
         assert!(verify_jbd2_block_checksum(&revoke, &sb));
-    }
-
-    #[test]
-    fn commit_checksum_zeroed_helper_matches_clone_zero_model() {
-        let seed = 0xA55A_F00D;
-        assert_eq!(
-            checksum_jbd2_commit_zeroed_block(&[0_u8; JBD2_COMMIT_CHKSUM_OFFSET], seed),
-            None
-        );
-
-        for len in [20_usize, 512, 4096, 16_384] {
-            let mut block = commit_block(len, 0x5566_7788);
-            for (i, byte) in block.iter_mut().enumerate().skip(JBD2_HEADER_SIZE) {
-                let low = u8::try_from(i & 0xFF).expect("masked index fits in u8");
-                *byte = low.wrapping_mul(37).wrapping_add(11);
-            }
-            block[JBD2_COMMIT_CHKSUM_OFFSET..JBD2_COMMIT_CHKSUM_OFFSET + JBD2_CHECKSUM_TAIL_SIZE]
-                .copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
-
-            let mut clone_zero = block.clone();
-            clone_zero
-                [JBD2_COMMIT_CHKSUM_OFFSET..JBD2_COMMIT_CHKSUM_OFFSET + JBD2_CHECKSUM_TAIL_SIZE]
-                .copy_from_slice(&0_u32.to_be_bytes());
-            let expected = !crc32c::crc32c_append(!seed, &clone_zero);
-
-            assert_eq!(
-                checksum_jbd2_commit_zeroed_block(&block, seed),
-                Some(expected),
-                "segmented checksum must match clone-zero model for len={len}"
-            );
-        }
     }
 
     #[test]
@@ -4368,81 +3842,6 @@ mod tests {
         let reopened = NativeCowJournal::open(&cx, &dev, region)
             .expect("malformed tail should stop discovery cleanly");
         assert_eq!(reopened.next_slot(), 2);
-    }
-
-    #[test]
-    fn native_cow_open_rejects_malformed_first_record() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(512, 128);
-        let region = JournalRegion {
-            start: BlockNumber(60),
-            blocks: 16,
-        };
-
-        let mut malformed = vec![0_u8; 512];
-        malformed[0..4].copy_from_slice(&COW_MAGIC.to_le_bytes());
-        malformed[4..6].copy_from_slice(&COW_VERSION.to_le_bytes());
-        malformed[6..8].copy_from_slice(&(999_u16).to_le_bytes());
-        dev.raw_write(BlockNumber(60), malformed);
-
-        let err = NativeCowJournal::open(&cx, &dev, region).expect_err("malformed head");
-        assert!(
-            matches!(err, FfsError::Format(ref message) if message.contains("unknown COW record kind")),
-            "expected unknown-kind Format error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn native_cow_append_rejects_block_size_smaller_than_header() {
-        let cx = test_cx();
-        let undersized = u32::try_from(COW_HEADER_SIZE - 1).expect("header size fits u32");
-        let dev = MemBlockDevice::new(undersized, 128);
-        let region = JournalRegion {
-            start: BlockNumber(60),
-            blocks: 16,
-        };
-
-        let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
-        let err = journal
-            .append_commit(&cx, &dev, CommitSeq(1))
-            .expect_err("undersized COW block");
-
-        assert!(
-            matches!(err, FfsError::Format(ref message)
-                if message.contains("smaller than header size")
-                    && message.contains(&undersized.to_string())
-                    && message.contains(&COW_HEADER_SIZE.to_string())),
-            "expected undersized-header Format error, got {err:?}"
-        );
-        assert_eq!(journal.next_slot(), 0);
-    }
-
-    #[test]
-    fn native_cow_append_rejects_oversized_payload_without_advancing_tail() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(64, 128);
-        let region = JournalRegion {
-            start: BlockNumber(60),
-            blocks: 16,
-        };
-        let capacity =
-            usize::try_from(dev.block_size()).expect("block size fits usize") - COW_HEADER_SIZE;
-        let payload = vec![0x5A; capacity + 1];
-
-        let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
-        let err = journal
-            .append_write(&cx, &dev, CommitSeq(1), BlockNumber(7), &payload)
-            .expect_err("oversized COW payload");
-
-        assert!(
-            matches!(err, FfsError::Format(ref message)
-                if message.contains("COW payload too large")
-                    && message.contains("exceeds capacity")
-                    && message.contains(&payload.len().to_string())
-                    && message.contains(&capacity.to_string())),
-            "expected oversized-payload Format error, got {err:?}"
-        );
-        assert_eq!(journal.next_slot(), 0);
     }
 
     #[test]
@@ -5062,42 +4461,6 @@ mod tests {
     }
 
     #[test]
-    fn jbd2_writer_partial_contiguous_write_is_ignored_on_replay() {
-        let cx = test_cx();
-        let dev = FailContiguousWriteBlockDevice::new(512, 256, 2);
-        let region = JournalRegion {
-            start: BlockNumber(100),
-            blocks: 32,
-        };
-
-        let mut writer = Jbd2Writer::new(region, 1);
-        let mut txn = writer.begin_transaction();
-        txn.add_write(BlockNumber(7), vec![0xA7; 512]);
-        txn.add_write(BlockNumber(8), vec![0xB8; 512]);
-        let error = writer
-            .commit_transaction(&cx, &dev, &txn)
-            .expect_err("partial grouped write must fail the commit");
-        assert!(
-            error
-                .to_string()
-                .contains("injected partial contiguous-write failure")
-        );
-        assert_eq!(writer.head(), 0, "failed commit must not advance head");
-
-        let outcome = replay_jbd2(&cx, &dev, region).expect("replay partial journal");
-        assert!(outcome.committed_sequences.is_empty());
-        assert_eq!(outcome.stats.incomplete_transactions, 1);
-        assert_eq!(
-            dev.read_block(&cx, BlockNumber(7)).unwrap().as_slice(),
-            &[0_u8; 512]
-        );
-        assert_eq!(
-            dev.read_block(&cx, BlockNumber(8)).unwrap().as_slice(),
-            &[0_u8; 512]
-        );
-    }
-
-    #[test]
     fn jbd2_writer_open_ignores_incomplete_trailing_transaction() {
         let cx = test_cx();
         let dev = MemBlockDevice::new(512, 256);
@@ -5351,14 +4714,8 @@ mod tests {
         // legacy tag; t_checksum is in-struct, not appended (bd-bryy3).
         assert_eq!(Jbd2TagFormat::CsumV2.tag_size(false), 8);
         assert_eq!(Jbd2TagFormat::CsumV2.tag_size(true), 12);
-        assert_eq!(
-            Jbd2TagFormat::CsumV2.tag_size(false),
-            Jbd2TagFormat::Legacy.tag_size(false)
-        );
-        assert_eq!(
-            Jbd2TagFormat::CsumV2.tag_size(true),
-            Jbd2TagFormat::Legacy.tag_size(true)
-        );
+        assert_eq!(Jbd2TagFormat::CsumV2.tag_size(false), Jbd2TagFormat::Legacy.tag_size(false));
+        assert_eq!(Jbd2TagFormat::CsumV2.tag_size(true), Jbd2TagFormat::Legacy.tag_size(true));
         assert_eq!(
             max_tags_per_descriptor_for_format(512, false, true, Jbd2TagFormat::CsumV2),
             62
@@ -5391,72 +4748,6 @@ mod tests {
         assert_eq!(tags[0].target, BlockNumber(5));
         assert_eq!(tags[1].target, BlockNumber(6));
         assert!(tags[1].is_last());
-    }
-
-    #[test]
-    fn strict_parse_matches_count_then_parse_across_formats() {
-        // Build a Legacy descriptor with `n` SAME_UUID tags (8-byte records),
-        // the last one LAST-terminated — the shape the replay loop decodes.
-        fn legacy_multi_tag(n: usize) -> Vec<u8> {
-            let mut desc = vec![0_u8; 512];
-            encode_jbd2_header(&mut desc, JBD2_BLOCKTYPE_DESCRIPTOR, 7);
-            for i in 0..n {
-                let off = JBD2_HEADER_SIZE + i * 8;
-                desc[off..off + 4].copy_from_slice(&u32::try_from(i + 1).unwrap().to_be_bytes());
-                let mut fl = JBD2_TAG_FLAG_SAME_UUID;
-                if i == n - 1 {
-                    fl |= JBD2_TAG_FLAG_LAST;
-                }
-                desc[off + JBD2_TAG_FLAGS_OFFSET_V1_V2..off + JBD2_TAG_FLAGS_OFFSET_V1_V2 + 2]
-                    .copy_from_slice(&u16::try_from(fl).unwrap().to_be_bytes());
-            }
-            desc
-        }
-
-        // Well-formed: strict single-pass yields exactly count-then-parse's tags.
-        for n in [1_usize, 2, 5, 20] {
-            let desc = legacy_multi_tag(n);
-            let old_count =
-                strict_descriptor_tag_count_with_format(&desc, false, false, Jbd2TagFormat::Legacy);
-            let old_tags =
-                parse_descriptor_tags_with_format(&desc, false, false, Jbd2TagFormat::Legacy);
-            let new_tags = parse_descriptor_tags_strict_with_format(
-                &desc,
-                false,
-                false,
-                Jbd2TagFormat::Legacy,
-            );
-            assert_eq!(old_count, Some(n), "strict count for n={n}");
-            assert_eq!(
-                new_tags.as_ref().map(Vec::len),
-                Some(n),
-                "strict-parse len n={n}"
-            );
-            assert_eq!(
-                new_tags,
-                Some(old_tags),
-                "strict-parse tags == parse tags n={n}"
-            );
-        }
-
-        // Malformed (no LAST terminator): both the old strict gate and the new
-        // strict-parse abort with None.
-        let mut no_last = legacy_multi_tag(3);
-        // Clear the LAST flag on the final tag.
-        let last_off = JBD2_HEADER_SIZE + 2 * 8 + JBD2_TAG_FLAGS_OFFSET_V1_V2;
-        no_last[last_off..last_off + 2].copy_from_slice(
-            &u16::try_from(JBD2_TAG_FLAG_SAME_UUID)
-                .unwrap()
-                .to_be_bytes(),
-        );
-        assert_eq!(
-            strict_descriptor_tag_count_with_format(&no_last, false, false, Jbd2TagFormat::Legacy),
-            None
-        );
-        assert_eq!(
-            parse_descriptor_tags_strict_with_format(&no_last, false, false, Jbd2TagFormat::Legacy),
-            None
-        );
     }
 
     #[test]
@@ -5722,26 +5013,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_segment_block_reports_absolute_block_overflow() {
-        let start = u64::MAX - 1;
-        let segments = [JournalSegment {
-            start: BlockNumber(start),
-            blocks: 3,
-        }];
-
-        assert_eq!(segments[0].resolve(2), None);
-
-        let err = resolve_segment_block(&segments, 2, 3).expect_err("absolute block overflow");
-        assert!(
-            matches!(err, FfsError::Format(ref message)
-                if message.contains("overflows absolute block number")
-                    && message.contains(&start.to_string())
-                    && message.contains('2')),
-            "expected absolute-overflow Format error, got {err:?}"
-        );
-    }
-
-    #[test]
     fn journal_region_resolve_in_range() {
         let region = JournalRegion {
             start: BlockNumber(100),
@@ -5759,26 +5030,6 @@ mod tests {
         };
         assert_eq!(region.resolve(10), None);
         assert_eq!(region.resolve(u64::MAX), None);
-    }
-
-    #[test]
-    fn resolve_region_block_reports_absolute_block_overflow() {
-        let start = u64::MAX - 1;
-        let region = JournalRegion {
-            start: BlockNumber(start),
-            blocks: 3,
-        };
-
-        assert_eq!(region.resolve(2), None);
-
-        let err = resolve_region_block(region, 2).expect_err("absolute block overflow");
-        assert!(
-            matches!(err, FfsError::Format(ref message)
-                if message.contains("overflows absolute block number")
-                    && message.contains(&start.to_string())
-                    && message.contains('2')),
-            "expected absolute-overflow Format error, got {err:?}"
-        );
     }
 
     #[test]
@@ -5910,63 +5161,6 @@ mod tests {
         assert!(
             matches!(err, FfsError::Corruption { .. }),
             "expected Corruption, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn native_cow_recover_rejects_unsupported_version() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(512, 128);
-        let region = JournalRegion {
-            start: BlockNumber(40),
-            blocks: 16,
-        };
-
-        let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
-        journal
-            .append_write(&cx, &dev, CommitSeq(1), BlockNumber(5), &[0xAA; 64])
-            .expect("write");
-        journal
-            .append_commit(&cx, &dev, CommitSeq(1))
-            .expect("commit");
-
-        // Bump the write record's version field (offset 4..6) to an unsupported
-        // value; the version check rejects it before any payload/CRC handling.
-        let write_block = BlockNumber(40);
-        let mut raw = dev
-            .read_block(&cx, write_block)
-            .expect("read")
-            .as_slice()
-            .to_vec();
-        raw[4..6].copy_from_slice(&(COW_VERSION + 1).to_le_bytes());
-        dev.raw_write(write_block, raw);
-
-        let err = recover_native_cow(&cx, &dev, region).expect_err("unsupported version");
-        assert!(
-            matches!(err, FfsError::Format(_)),
-            "expected Format error for unsupported COW version, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn native_cow_recover_rejects_malformed_first_record() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(512, 128);
-        let region = JournalRegion {
-            start: BlockNumber(40),
-            blocks: 16,
-        };
-
-        let mut malformed = vec![0_u8; 512];
-        malformed[0..4].copy_from_slice(&COW_MAGIC.to_le_bytes());
-        malformed[4..6].copy_from_slice(&COW_VERSION.to_le_bytes());
-        malformed[6..8].copy_from_slice(&999_u16.to_le_bytes());
-        dev.raw_write(BlockNumber(40), malformed);
-
-        let err = recover_native_cow(&cx, &dev, region).expect_err("malformed first record");
-        assert!(
-            matches!(err, FfsError::Format(ref message) if message.contains("unknown COW record kind")),
-            "expected unknown-kind Format error, got {err:?}"
         );
     }
 
@@ -7214,39 +6408,6 @@ mod tests {
     }
 
     #[test]
-    fn native_cow_recovery_rejects_regressing_commit_sequence() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(512, 128);
-        let region = JournalRegion {
-            start: BlockNumber(40),
-            blocks: 32,
-        };
-
-        let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
-        journal
-            .append_write(&cx, &dev, CommitSeq(2), BlockNumber(10), &[0x22; 64])
-            .expect("seq2 write");
-        journal
-            .append_commit(&cx, &dev, CommitSeq(2))
-            .expect("seq2 commit");
-        journal
-            .append_write(&cx, &dev, CommitSeq(1), BlockNumber(11), &[0x11; 64])
-            .expect("seq1 write");
-        journal
-            .append_commit(&cx, &dev, CommitSeq(1))
-            .expect("seq1 commit");
-
-        let err = recover_native_cow(&cx, &dev, region).expect_err("regressing commit sequence");
-        assert!(
-            matches!(err, FfsError::Format(ref message)
-                if message.contains("commit sequence regressed")
-                    && message.contains('1')
-                    && message.contains('2')),
-            "expected regressing-sequence Format error, got {err:?}"
-        );
-    }
-
-    #[test]
     fn native_cow_duplicate_commit_same_sequence_recovered_once() {
         let cx = test_cx();
         let dev = MemBlockDevice::new(512, 128);
@@ -7559,73 +6720,6 @@ mod tests {
     }
 
     #[test]
-    fn native_cow_commit_decode_rejects_nonzero_metadata() -> Result<()> {
-        let commit = encode_cow_record(
-            64,
-            &CowRecord::Commit {
-                commit_seq: CommitSeq(9),
-            },
-        )?;
-
-        let assert_format = |raw: &[u8], needle: &str| match decode_cow_record(raw) {
-            Err(FfsError::Format(message)) => {
-                assert!(
-                    message.contains(needle),
-                    "expected {needle:?} in error message {message:?}"
-                );
-            }
-            Err(other) => panic!("expected Format error, got {other:?}"),
-            Ok(_) => panic!("malformed commit record decoded successfully"),
-        };
-
-        let mut nonzero_target = commit.clone();
-        nonzero_target[16..24].copy_from_slice(&7_u64.to_le_bytes());
-        assert_format(&nonzero_target, "metadata");
-
-        let mut nonzero_payload_len = commit.clone();
-        nonzero_payload_len[24..28].copy_from_slice(&1_u32.to_le_bytes());
-        assert_format(&nonzero_payload_len, "metadata");
-
-        let mut nonzero_payload_crc = commit.clone();
-        nonzero_payload_crc[28..32].copy_from_slice(&0xA5A5_5A5A_u32.to_le_bytes());
-        assert_format(&nonzero_payload_crc, "metadata");
-
-        let mut nonzero_payload_area = commit;
-        nonzero_payload_area[COW_HEADER_SIZE] = 0xA5;
-        assert_format(&nonzero_payload_area, "payload area");
-
-        Ok(())
-    }
-
-    #[test]
-    fn native_cow_write_decode_rejects_nonzero_padding() -> Result<()> {
-        let payload = [0x11, 0x22, 0x33];
-        let mut write = encode_cow_record(
-            64,
-            &CowRecord::Write {
-                commit_seq: CommitSeq(10),
-                block: BlockNumber(5),
-                payload: &payload,
-            },
-        )?;
-
-        write[COW_HEADER_SIZE + payload.len()] = 0xA5;
-
-        match decode_cow_record(&write) {
-            Err(FfsError::Format(message)) => {
-                assert!(
-                    message.contains("padding"),
-                    "expected padding error, got {message:?}"
-                );
-            }
-            Err(other) => panic!("expected Format error, got {other:?}"),
-            Ok(_) => panic!("malformed write record decoded successfully"),
-        }
-
-        Ok(())
-    }
-
-    #[test]
     fn journal_segment_debug_clone_copy_eq() {
         let seg = JournalSegment {
             start: BlockNumber(100),
@@ -7774,43 +6868,12 @@ mod tests {
     }
 
     #[test]
-    fn jbd2_header_parse_bad_magic_returns_none() {
-        let mut raw = jbd2_header(JBD2_BLOCKTYPE_DESCRIPTOR, 42);
-        raw[0..4].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
-        assert!(Jbd2Header::parse(&raw).is_none());
-    }
-
-    #[test]
     fn jbd2_header_parse_valid() {
         let raw = jbd2_header(JBD2_BLOCKTYPE_DESCRIPTOR, 42);
         let hdr = Jbd2Header::parse(&raw).unwrap();
         assert_eq!(hdr.magic, JBD2_MAGIC);
         assert_eq!(hdr.block_type, JBD2_BLOCKTYPE_DESCRIPTOR);
         assert_eq!(hdr.sequence, 42);
-    }
-
-    #[test]
-    fn journal_seq_newer_half_range_boundary_contract() {
-        let current: u32 = 0xFFFF_FFF0;
-        let one_ahead = current.wrapping_add(1);
-        let one_behind = current.wrapping_sub(1);
-        let last_newer = current.wrapping_add(JOURNAL_SEQ_HALF_RANGE - 1);
-        let exactly_half_range = current.wrapping_add(JOURNAL_SEQ_HALF_RANGE);
-
-        assert!(!journal_seq_is_newer(current, current));
-        assert!(journal_seq_is_newer_or_equal(current, current));
-        assert!(journal_seq_is_newer(one_ahead, current));
-        assert!(journal_seq_is_newer(last_newer, current));
-        assert!(!journal_seq_is_newer(exactly_half_range, current));
-        assert!(!journal_seq_is_newer(one_behind, current));
-        assert!(!journal_seq_is_newer(current, one_ahead));
-
-        // is_newer_or_equal accepts equal (above) and otherwise matches
-        // is_newer for newer / older / half-range candidates.
-        assert!(journal_seq_is_newer_or_equal(one_ahead, current));
-        assert!(journal_seq_is_newer_or_equal(last_newer, current));
-        assert!(!journal_seq_is_newer_or_equal(one_behind, current));
-        assert!(!journal_seq_is_newer_or_equal(exactly_half_range, current));
     }
 
     #[test]
@@ -7917,61 +6980,6 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
-
-        /// `Jbd2Superblock::parse` must decode every field from its correct
-        /// big-endian on-disk offset. A reference builder lays random field
-        /// values at the kernel-defined offsets; parse must recover each one
-        /// exactly. A field read from the wrong offset would corrupt the journal
-        /// geometry recovery uses to locate descriptor/commit/data blocks
-        /// (bd-xmh5g.202).
-        #[test]
-        fn proptest_jbd2_superblock_parse_field_offsets(
-            block_type_v2 in any::<bool>(),
-            sequence in any::<u32>(),
-            block_size in any::<u32>(),
-            max_len in any::<u32>(),
-            first_log_block in any::<u32>(),
-            start_sequence in any::<u32>(),
-            start_block in any::<u32>(),
-            feature_compat in any::<u32>(),
-            feature_incompat in any::<u32>(),
-            feature_ro_compat in any::<u32>(),
-            num_fc_blocks in any::<u32>(),
-            uuid in any::<[u8; 16]>(),
-        ) {
-            let block_type = if block_type_v2 {
-                JBD2_BLOCKTYPE_SUPERBLOCK_V2
-            } else {
-                JBD2_BLOCKTYPE_SUPERBLOCK_V1
-            };
-            let mut buf = vec![0_u8; 1024];
-            buf[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
-            buf[4..8].copy_from_slice(&block_type.to_be_bytes());
-            buf[8..12].copy_from_slice(&sequence.to_be_bytes());
-            buf[12..16].copy_from_slice(&block_size.to_be_bytes());
-            buf[16..20].copy_from_slice(&max_len.to_be_bytes());
-            buf[20..24].copy_from_slice(&first_log_block.to_be_bytes());
-            buf[24..28].copy_from_slice(&start_sequence.to_be_bytes());
-            buf[28..32].copy_from_slice(&start_block.to_be_bytes());
-            buf[36..40].copy_from_slice(&feature_compat.to_be_bytes());
-            buf[40..44].copy_from_slice(&feature_incompat.to_be_bytes());
-            buf[44..48].copy_from_slice(&feature_ro_compat.to_be_bytes());
-            buf[48..64].copy_from_slice(&uuid);
-            buf[84..88].copy_from_slice(&num_fc_blocks.to_be_bytes());
-
-            let sb = Jbd2Superblock::parse(&buf)
-                .expect("a well-formed JBD2 superblock must parse");
-            prop_assert_eq!(sb.block_size, block_size);
-            prop_assert_eq!(sb.max_len, max_len);
-            prop_assert_eq!(sb.first_log_block, first_log_block);
-            prop_assert_eq!(sb.start_sequence, start_sequence);
-            prop_assert_eq!(sb.start_block, start_block);
-            prop_assert_eq!(sb.feature_compat, feature_compat);
-            prop_assert_eq!(sb.feature_incompat, feature_incompat);
-            prop_assert_eq!(sb.feature_ro_compat, feature_ro_compat);
-            prop_assert_eq!(sb.num_fc_blocks, num_fc_blocks);
-            prop_assert_eq!(sb.uuid, uuid);
-        }
 
         #[test]
         fn proptest_commit_checksum_zeroed_field_is_field_invariant(
