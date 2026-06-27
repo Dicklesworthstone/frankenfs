@@ -113,137 +113,74 @@ pub fn write_inode(
     })?;
 
     let inode_size = usize::from(geo.inode_size);
-    write_inode_at(cx, dev, loc, inode_size, ino, inode, csum_seed)
-}
+    let mut raw = serialize_inode(inode, inode_size);
 
-/// Write an inode to a KNOWN on-disk location (bd-bhh0i): the location-resolution
-/// half of `write_inode` factored out so the sharded per-group create path can
-/// supply an `InodeLocation` it computed from the sharded allocator, instead of a
-/// `&[GroupStats]` slice.
-pub fn write_inode_at(
-    cx: &Cx,
-    dev: &dyn BlockDevice,
-    loc: InodeLocation,
-    inode_size: usize,
-    ino: InodeNumber,
-    inode: &Ext4Inode,
-    csum_seed: u32,
-) -> Result<()> {
-    // Serialize into a STACK buffer for the standard inode_size (128/256),
-    // avoiding the per-write `vec![0; inode_size]` heap alloc; unusual large
-    // inode_size (>256) falls back to a heap buffer (bd-cc-serialize-into).
-    let mut stack_buf = [0u8; 256];
-    let mut heap_buf: Vec<u8>;
-    let raw: &mut [u8] = if inode_size <= stack_buf.len() {
-        &mut stack_buf[..inode_size]
-    } else {
-        heap_buf = vec![0u8; inode_size];
-        &mut heap_buf
-    };
-    serialize_inode_with_checksum(inode, inode_size, ino, csum_seed, raw);
+    // Compute and write checksum.
+    #[expect(clippy::cast_possible_truncation)]
+    let ino32 = ino.0 as u32;
+    compute_and_set_checksum(&mut raw, csum_seed, ino32);
 
-    // Read the block, patch the inode bytes IN PLACE, write back. `make_mut` is
-    // COW (`Arc::make_mut`): when the freshly-read block is uniquely owned it hands
-    // back the existing buffer with no copy — eliminating the per-inode-write 4 KiB
-    // heap alloc + memcpy the old `buf.as_slice().to_vec()` always paid; when the
-    // buffer is shared (cached) it clones once, exactly as `to_vec` did. Pareto and
-    // byte-identical: the same patched block is written either way.
-    let mut buf = dev.read_block(cx, loc.block)?;
-    if loc.byte_offset + inode_size > buf.as_slice().len() {
+    // Read the block, patch the inode bytes, write back.
+    let buf = dev.read_block(cx, loc.block)?;
+    let mut block_data = buf.as_slice().to_vec();
+    if loc.byte_offset + inode_size > block_data.len() {
         return Err(FfsError::Corruption {
             block: loc.block.0,
             detail: "inode extends beyond block boundary".into(),
         });
     }
-    // `make_mut()`'s borrow ends at this statement, so the immutable `as_slice()`
-    // below is a fresh borrow (no overlap).
-    buf.make_mut()[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(raw);
-    dev.write_block(cx, loc.block, buf.as_slice())?;
+    block_data[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(&raw);
+    dev.write_block(cx, loc.block, &block_data)?;
 
     Ok(())
 }
 
-/// Serialize `inode` into `buf` (`buf.len()` must be `inode_size`) AND stamp its
-/// CRC32C checksum — i.e. the exact bytes `write_inode` lands in the inode's slot,
-/// with NO device I/O. Exposed so the transactional ext4 create/write path in
-/// ffs-core can build the patched inode-table block itself and stage it with a
-/// slot-scoped MVCC merge proof: relaxed first-committer-wins so concurrent creates
-/// writing DISJOINT inode slots of the same 4 KiB table block MERGE instead of
-/// FCW-conflicting — the parallel-create bottleneck the bd-bhh0i cutover hit. The
-/// caller pairs this with `locate_inode` (block + `byte_offset`) to know the slot's
-/// `[byte_offset, byte_offset + inode_size)` range for the proof.
+/// Serialize an `Ext4Inode` into raw bytes of the given `inode_size`.
 #[expect(clippy::cast_possible_truncation)]
-pub fn serialize_inode_with_checksum(
-    inode: &Ext4Inode,
-    inode_size: usize,
-    ino: InodeNumber,
-    csum_seed: u32,
-    buf: &mut [u8],
-) {
-    serialize_inode_into(inode, inode_size, buf);
-    compute_and_set_checksum(buf, csum_seed, ino.0 as u32);
-}
-
-/// Serialize into a caller-provided `buf` (`buf.len()` must be `inode_size`) —
-/// lets the hot write path (`write_inode`) use a stack buffer instead of the
-/// per-call `vec![0; inode_size]` heap allocation (bd-cc-serialize-into).
-#[expect(clippy::cast_possible_truncation)]
-pub fn serialize_inode_into(inode: &Ext4Inode, inode_size: usize, buf: &mut [u8]) {
-    debug_assert_eq!(buf.len(), inode_size);
-    buf.fill(0);
-
-    // Reslice the fixed 128-byte base area to an array ref ONCE (one bounds
-    // check): const-offset writes into `&mut [u8; 128]` are provably in-bounds,
-    // so the ~30 base-field `copy_from_slice`s drop their per-write bounds check
-    // with NO extra buffer traffic (writes still land straight in `buf`). The
-    // write-side analog of the extent-parse read_fixed hoist (b83531ef); the
-    // caller always sizes `buf` to `inode_size >= 128`. The variable-offset
-    // extended area (0x80+) keeps direct `buf` writes below.
-    let base: &mut [u8; 128] = (&mut buf[..128])
-        .try_into()
-        .expect("ext4 inode buffer is at least 128 bytes");
+pub fn serialize_inode(inode: &Ext4Inode, inode_size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; inode_size];
 
     // Mode (0x00).
-    base[0x00..0x02].copy_from_slice(&inode.mode.to_le_bytes());
+    buf[0x00..0x02].copy_from_slice(&inode.mode.to_le_bytes());
     // UID low (0x02).
-    base[0x02..0x04].copy_from_slice(&(inode.uid as u16).to_le_bytes());
+    buf[0x02..0x04].copy_from_slice(&(inode.uid as u16).to_le_bytes());
     // Size low (0x04).
-    base[0x04..0x08].copy_from_slice(&(inode.size as u32).to_le_bytes());
+    buf[0x04..0x08].copy_from_slice(&(inode.size as u32).to_le_bytes());
     // atime (0x08).
-    base[0x08..0x0C].copy_from_slice(&inode.atime.to_le_bytes());
+    buf[0x08..0x0C].copy_from_slice(&inode.atime.to_le_bytes());
     // ctime (0x0C).
-    base[0x0C..0x10].copy_from_slice(&inode.ctime.to_le_bytes());
+    buf[0x0C..0x10].copy_from_slice(&inode.ctime.to_le_bytes());
     // mtime (0x10).
-    base[0x10..0x14].copy_from_slice(&inode.mtime.to_le_bytes());
+    buf[0x10..0x14].copy_from_slice(&inode.mtime.to_le_bytes());
     // dtime (0x14).
-    base[0x14..0x18].copy_from_slice(&inode.dtime.to_le_bytes());
+    buf[0x14..0x18].copy_from_slice(&inode.dtime.to_le_bytes());
     // GID low (0x18).
-    base[0x18..0x1A].copy_from_slice(&(inode.gid as u16).to_le_bytes());
+    buf[0x18..0x1A].copy_from_slice(&(inode.gid as u16).to_le_bytes());
     // Links count (0x1A).
-    base[0x1A..0x1C].copy_from_slice(&inode.links_count.to_le_bytes());
+    buf[0x1A..0x1C].copy_from_slice(&inode.links_count.to_le_bytes());
     // Blocks low (0x1C).
-    base[0x1C..0x20].copy_from_slice(&(inode.blocks as u32).to_le_bytes());
+    buf[0x1C..0x20].copy_from_slice(&(inode.blocks as u32).to_le_bytes());
     // Flags (0x20).
-    base[0x20..0x24].copy_from_slice(&inode.flags.to_le_bytes());
+    buf[0x20..0x24].copy_from_slice(&inode.flags.to_le_bytes());
     // i_osd1 / l_i_version (0x24) — NFS change attribute low 32 bits.
-    base[0x24..0x28].copy_from_slice(&inode.version.to_le_bytes());
+    buf[0x24..0x28].copy_from_slice(&inode.version.to_le_bytes());
     // i_block / extent bytes (0x28, 60 bytes).
     let copy_len = inode.extent_bytes.len().min(60);
-    base[0x28..0x28 + copy_len].copy_from_slice(&inode.extent_bytes[..copy_len]);
+    buf[0x28..0x28 + copy_len].copy_from_slice(&inode.extent_bytes[..copy_len]);
     // Generation (0x64).
-    base[0x64..0x68].copy_from_slice(&inode.generation.to_le_bytes());
+    buf[0x64..0x68].copy_from_slice(&inode.generation.to_le_bytes());
     // File ACL low (0x68).
-    base[0x68..0x6C].copy_from_slice(&(inode.file_acl as u32).to_le_bytes());
+    buf[0x68..0x6C].copy_from_slice(&(inode.file_acl as u32).to_le_bytes());
     // Size high (0x6C).
-    base[0x6C..0x70].copy_from_slice(&((inode.size >> 32) as u32).to_le_bytes());
+    buf[0x6C..0x70].copy_from_slice(&((inode.size >> 32) as u32).to_le_bytes());
     // Blocks high (0x74, 2 bytes).
-    base[0x74..0x76].copy_from_slice(&((inode.blocks >> 32) as u16).to_le_bytes());
+    buf[0x74..0x76].copy_from_slice(&((inode.blocks >> 32) as u16).to_le_bytes());
     // File ACL high (0x76, 2 bytes).
-    base[0x76..0x78].copy_from_slice(&((inode.file_acl >> 32) as u16).to_le_bytes());
+    buf[0x76..0x78].copy_from_slice(&((inode.file_acl >> 32) as u16).to_le_bytes());
     // UID high (0x78).
-    base[0x78..0x7A].copy_from_slice(&((inode.uid >> 16) as u16).to_le_bytes());
+    buf[0x78..0x7A].copy_from_slice(&((inode.uid >> 16) as u16).to_le_bytes());
     // GID high (0x7A).
-    base[0x7A..0x7C].copy_from_slice(&((inode.gid >> 16) as u16).to_le_bytes());
+    buf[0x7A..0x7C].copy_from_slice(&((inode.gid >> 16) as u16).to_le_bytes());
     // checksum_lo (0x7C) — will be set by compute_and_set_checksum.
 
     // Extended area (when inode_size > 128).
@@ -285,15 +222,7 @@ pub fn serialize_inode_into(inode: &Ext4Inode, inode_size: usize, buf: &mut [u8]
                 .copy_from_slice(&inode.xattr_ibody[..xattr_copy]);
         }
     }
-}
 
-/// Serialize an `Ext4Inode` into a freshly-allocated `Vec` (convenience wrapper
-/// over [`serialize_inode_into`] for the non-hot callers; the hot `write_inode`
-/// path uses a stack buffer).
-#[must_use]
-pub fn serialize_inode(inode: &Ext4Inode, inode_size: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; inode_size];
-    serialize_inode_into(inode, inode_size, &mut buf);
     buf
 }
 
@@ -351,18 +280,7 @@ pub mod file_type {
 /// Allocates an inode number via `ffs-alloc`, initializes fields, writes to disk.
 /// Returns `(InodeNumber, Ext4Inode)`.
 #[expect(clippy::too_many_arguments)]
-/// Allocate an inode number (with its bitmap/group-descriptor persist) and build
-/// the initial [`Ext4Inode`] WITHOUT persisting the inode body to the inode
-/// table. Callers that immediately mutate the returned inode and write it back
-/// themselves — `mkdir` (size/blocks/links_count/extent root), `mknod` (rdev),
-/// `symlink` (target) — use this to skip the redundant inode-table-block write
-/// that [`create_inode`] would do one step before the caller's own `write_inode`
-/// overwrites it (bd-mkinode-defer). [`create_inode`] is `prepare_inode` followed
-/// by that persist, for callers whose returned inode is already final
-/// (`ext4_create`). No intermediate reader observes the still-unwritten inode
-/// slot: the number is already reserved in the bitmap and every create-family
-/// caller writes the final body before any lookup can resolve the new name.
-pub fn prepare_inode(
+pub fn create_inode(
     cx: &Cx,
     dev: &dyn BlockDevice,
     geo: &FsGeometry,
@@ -371,6 +289,7 @@ pub fn prepare_inode(
     uid: u32,
     gid: u32,
     parent_group: GroupNumber,
+    csum_seed: u32,
     now_secs: u64,
     now_nsec: u32,
     pctx: &ffs_alloc::PersistCtx,
@@ -378,12 +297,14 @@ pub fn prepare_inode(
     cx_checkpoint(cx)?;
 
     let is_dir = (mode & 0xF000) == file_type::S_IFDIR;
-    // `alloc_inode_persist` itself increments the allocated group's `used_dirs`
-    // (and persists it in the same group-descriptor write) when `is_dir`, so the
-    // on-disk `bg_used_dirs_count` stays consistent (bd-0y7jp). Do NOT increment
-    // again here — a second bump double-counts once a later same-group
-    // allocation flushes the in-memory value to disk.
     let alloc = ffs_alloc::alloc_inode_persist(cx, dev, geo, groups, parent_group, is_dir, pctx)?;
+
+    if is_dir {
+        let gidx = alloc.group.0 as usize;
+        if gidx < groups.len() {
+            groups[gidx].used_dirs = groups[gidx].used_dirs.saturating_add(1);
+        }
+    }
 
     // Read old generation from the on-disk inode slot so we can bump it.
     // This is the NFS-style generation counter: when an inode number is reused,
@@ -408,41 +329,7 @@ pub fn prepare_inode(
         None => 0,
     };
 
-    let new_generation = old_generation.wrapping_add(1);
-    debug!(
-        target: "ffs::inode::generation",
-        ino = alloc.ino.0,
-        old_generation,
-        new_generation,
-        "inode_generation_bump"
-    );
-    let inode = build_fresh_inode(mode, uid, gid, is_dir, new_generation, now_secs, now_nsec);
-
-    Ok((alloc.ino, inode))
-}
-
-/// Build a fresh regular-file / directory [`Ext4Inode`] body — NO allocation,
-/// NO I/O. This is the pure construction half of [`prepare_inode`], extracted
-/// verbatim so the sharded parallel-create path (bd-bhh0i) can reuse the EXACT
-/// same field initialization off a lock-free-allocated inode number without
-/// duplicating (and risking divergence from) it. `generation` is the
-/// already-bumped NFS generation counter (`old + 1`); the caller reads the old
-/// value and logs the bump.
-#[must_use]
-pub fn build_fresh_inode(
-    mode: u16,
-    uid: u32,
-    gid: u32,
-    is_dir: bool,
-    generation: u32,
-    now_secs: u64,
-    now_nsec: u32,
-) -> Ext4Inode {
     // Initialize extent tree root (empty tree: magic + 0 entries, max 4, depth 0).
-    // NB: `vec![0;60].into()` (From<Vec> = SmallVec spill, reusing the jemalloc
-    // buffer) benchmarks FASTER here than a stack-array `.as_slice().into()`
-    // inline copy — the small-alloc + buffer-reuse beats copying 60B inline
-    // (see benches/serialize_inode.rs prepare_inode_extent_bytes; bd-cc-prepare-inode-inline REFUTED).
     let mut extent_bytes = vec![0u8; 60];
     extent_bytes[0] = (EXT4_EXTENT_MAGIC & 0xFF) as u8;
     extent_bytes[1] = (EXT4_EXTENT_MAGIC >> 8) as u8;
@@ -454,7 +341,7 @@ pub fn build_fresh_inode(
 
     #[allow(clippy::cast_possible_truncation)]
     let now_lo = now_secs as u32;
-    Ext4Inode {
+    let inode = Ext4Inode {
         mode,
         uid,
         gid,
@@ -463,7 +350,17 @@ pub fn build_fresh_inode(
         blocks: 0,
         flags: EXT4_EXTENTS_FL,
         version: 0,
-        generation,
+        generation: {
+            let new_gen = old_generation.wrapping_add(1);
+            debug!(
+                target: "ffs::inode::generation",
+                ino = alloc.ino.0,
+                old_generation,
+                new_generation = new_gen,
+                "inode_generation_bump"
+            );
+            new_gen
+        },
         file_acl: 0,
         atime: now_lo,
         ctime: now_lo,
@@ -478,45 +375,14 @@ pub fn build_fresh_inode(
         checksum: 0,
         version_hi: 0,
         projid: 0,
-        extent_bytes: extent_bytes.into(),
+        extent_bytes,
         xattr_ibody: Vec::new(),
         number: 0,
-    }
-}
+    };
 
-/// Allocate and persist a fresh inode with its initial body. Equivalent to
-/// [`prepare_inode`] followed by [`write_inode`]; used by callers (e.g.
-/// `ext4_create`) whose returned inode needs no further mutation.
-#[allow(clippy::too_many_arguments)]
-pub fn create_inode(
-    cx: &Cx,
-    dev: &dyn BlockDevice,
-    geo: &FsGeometry,
-    groups: &mut [GroupStats],
-    mode: u16,
-    uid: u32,
-    gid: u32,
-    parent_group: GroupNumber,
-    csum_seed: u32,
-    now_secs: u64,
-    now_nsec: u32,
-    pctx: &ffs_alloc::PersistCtx,
-) -> Result<(InodeNumber, Ext4Inode)> {
-    let (ino, inode) = prepare_inode(
-        cx,
-        dev,
-        geo,
-        groups,
-        mode,
-        uid,
-        gid,
-        parent_group,
-        now_secs,
-        now_nsec,
-        pctx,
-    )?;
-    write_inode(cx, dev, geo, groups, ino, &inode, csum_seed)?;
-    Ok((ino, inode))
+    write_inode(cx, dev, geo, groups, alloc.ino, &inode, csum_seed)?;
+
+    Ok((alloc.ino, inode))
 }
 
 // ── Delete ──────────────────────────────────────────────────────────────────
@@ -546,7 +412,8 @@ const S_IFLNK: u16 = 0xA000;
 /// cluster-aware block management is unimplemented; deleting one currently
 /// leaks its data blocks rather than corrupting the bitmap).
 fn inode_uses_indirect_blocks(inode: &Ext4Inode) -> bool {
-    const EXCLUDED: u32 = EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL | EXT4_COMPR_FL | EXT4_COMPRBLK_FL;
+    const EXCLUDED: u32 =
+        EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL | EXT4_COMPR_FL | EXT4_COMPRBLK_FL;
     if inode.flags & EXCLUDED != 0 {
         return false;
     }
@@ -554,45 +421,6 @@ fn inode_uses_indirect_blocks(inode: &Ext4Inode) -> bool {
         return false;
     }
     matches!(inode.mode & S_IFMT, S_IFREG | S_IFDIR | S_IFLNK)
-}
-
-/// Free a list of data block numbers (in file order) in maximal contiguous
-/// runs. `free_blocks_persist(start, len)` already does a single bitmap-block
-/// read-modify-write per group for the whole range, so collapsing a contiguous
-/// run into one ranged call turns O(blocks) bitmap RMWs into O(runs) — a large
-/// win when deleting/truncating sequentially-allocated files. Freeing a range is
-/// the canonical batch form of freeing each block individually (same bits, same
-/// validation, same accounting; freeing is commutative), so this is behaviorally
-/// identical to the per-block loop it replaces.
-fn free_data_blocks_in_runs(
-    cx: &Cx,
-    dev: &dyn BlockDevice,
-    geo: &FsGeometry,
-    groups: &mut [GroupStats],
-    blocks: &[u32],
-    pctx: &ffs_alloc::PersistCtx,
-) -> Result<()> {
-    let mut idx = 0;
-    while idx < blocks.len() {
-        let start = blocks[idx];
-        let mut len = 1u32;
-        while idx + (len as usize) < blocks.len()
-            && start.checked_add(len) == Some(blocks[idx + len as usize])
-        {
-            len += 1;
-        }
-        ffs_alloc::free_blocks_persist(
-            cx,
-            dev,
-            geo,
-            groups,
-            BlockNumber(u64::from(start)),
-            len,
-            pctx,
-        )?;
-        idx += len as usize;
-    }
-    Ok(())
 }
 
 /// Recursively free an indirect pointer block at indirection `level`
@@ -612,43 +440,20 @@ fn free_indirect_chain(
     cx_checkpoint(cx)?;
     let buf = dev.read_block(cx, block)?;
     let bytes = buf.as_slice();
-    if level == 1 {
-        // Leaf: gather the data-block pointers and free them in contiguous runs
-        // (one bitmap read-modify-write per group per run instead of per block).
-        let mut data_blocks = Vec::with_capacity(ppb);
-        for i in 0..ppb {
-            let off = i * 4;
-            if off + 4 > bytes.len() {
-                break;
-            }
-            let ptr =
-                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-            if ptr != 0 {
-                data_blocks.push(ptr);
-            }
+    for i in 0..ppb {
+        let off = i * 4;
+        if off + 4 > bytes.len() {
+            break;
         }
-        free_data_blocks_in_runs(cx, dev, geo, groups, &data_blocks, pctx)?;
-    } else {
-        for i in 0..ppb {
-            let off = i * 4;
-            if off + 4 > bytes.len() {
-                break;
-            }
-            let ptr =
-                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-            if ptr == 0 {
-                continue;
-            }
-            free_indirect_chain(
-                cx,
-                dev,
-                geo,
-                groups,
-                BlockNumber(u64::from(ptr)),
-                level - 1,
-                ppb,
-                pctx,
-            )?;
+        let ptr = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        if ptr == 0 {
+            continue;
+        }
+        let child = BlockNumber(u64::from(ptr));
+        if level == 1 {
+            ffs_alloc::free_blocks_persist(cx, dev, geo, groups, child, 1, pctx)?;
+        } else {
+            free_indirect_chain(cx, dev, geo, groups, child, level - 1, ppb, pctx)?;
         }
     }
     // Free this indirect (metadata) block itself.
@@ -676,9 +481,21 @@ fn free_indirect_blocks(
     };
     let ppb = (geo.block_size / 4) as usize;
 
-    // Direct blocks i_block[0..12], freed in contiguous runs.
-    let direct_blocks: Vec<u32> = (0..12usize).map(read_ptr).filter(|&ptr| ptr != 0).collect();
-    free_data_blocks_in_runs(cx, dev, geo, groups, &direct_blocks, pctx)?;
+    // Direct blocks i_block[0..12].
+    for i in 0..12usize {
+        let ptr = read_ptr(i);
+        if ptr != 0 {
+            ffs_alloc::free_blocks_persist(
+                cx,
+                dev,
+                geo,
+                groups,
+                BlockNumber(u64::from(ptr)),
+                1,
+                pctx,
+            )?;
+        }
+    }
     // Single / double / triple indirect roots.
     for (idx, level) in [(12usize, 1u32), (13usize, 2u32), (14usize, 3u32)] {
         let ptr = read_ptr(idx);
@@ -696,43 +513,6 @@ fn free_indirect_blocks(
         }
     }
     Ok(())
-}
-
-/// Fast all-zero test for the indirect-block "is this block now empty?" check.
-///
-/// The idiomatic byte-wise `data.iter().all(|&b| b == 0)` is NOT auto-vectorized
-/// (~1.5 µs on a 4 KiB block); a 4-wide u64 OR-reduce is ~15x faster (~99 ns)
-/// with no regression on a non-empty block (early-exit at the first set byte).
-/// Result-identical. Same fix as ffs-core `is_block_all_zero` (bench
-/// `sparse_zero_scan`).
-fn indirect_block_all_zero(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
-        let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
-        let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
-        let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
-        let w3 = u64::from_ne_bytes(block[24..32].try_into().unwrap());
-        if (w0 | w1 | w2 | w3) != 0 {
-            return false;
-        }
-    }
-    let mut tail = chunks.remainder().chunks_exact(8);
-    tail.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&b| b == 0)
-}
-
-/// Return the first indirect entry whose logical range is not wholly below
-/// `cutoff`. This is the closed-form equivalent of the saturating range check
-/// in `free_indirect_subtree_range`; the original predicate remains in the
-/// shortened loop as a defensive guard.
-fn first_indirect_entry_at_cutoff(base: u64, cutoff: u64, entry_span: u64, ppb: u64) -> u64 {
-    if entry_span == 0 {
-        return if base <= cutoff { ppb } else { 0 };
-    }
-    if cutoff == u64::MAX {
-        return ppb;
-    }
-    (cutoff.saturating_sub(base) / entry_span).min(ppb)
 }
 
 /// Recursively free data blocks at or beyond logical block `cutoff` within an
@@ -757,56 +537,30 @@ fn free_indirect_subtree_range(
     let buf = dev.read_block(cx, block)?;
     let mut data = buf.as_slice().to_vec();
     let entry_span = ppb.saturating_pow(level - 1);
-    let first_entry = first_indirect_entry_at_cutoff(base, cutoff, entry_span, ppb);
     let mut freed = 0u64;
     let mut dirty = false;
 
-    if level == 1 {
-        // entry_span == 1: every non-zero pointer surviving the cutoff check has
-        // `child_base >= cutoff` and is freed. Collect them (zeroing each slot in
-        // the in-memory indirect buffer) and free them in contiguous runs — one
-        // bitmap read-modify-write per run instead of per block (bd-wgv6x).
-        let mut to_free = Vec::new();
-        for i in first_entry..ppb {
-            let off = match usize::try_from(i) {
-                Ok(idx) => idx * 4,
-                Err(_) => break,
-            };
-            if off + 4 > data.len() {
-                break;
-            }
-            let ptr = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-            if ptr == 0 {
-                continue;
-            }
-            to_free.push(ptr);
-            data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
-            dirty = true;
+    for i in 0..ppb {
+        let child_base = base.saturating_add(i.saturating_mul(entry_span));
+        // Entry's whole logical range is below the cutoff — keep untouched.
+        if child_base.saturating_add(entry_span) <= cutoff {
+            continue;
         }
-        if !to_free.is_empty() {
-            let n = to_free.len() as u64;
-            free_data_blocks_in_runs(cx, dev, geo, groups, &to_free, pctx)?;
-            freed = freed.saturating_add(n);
+        let off = match usize::try_from(i) {
+            Ok(idx) => idx * 4,
+            Err(_) => break,
+        };
+        if off + 4 > data.len() {
+            break;
         }
-    } else {
-        for i in first_entry..ppb {
-            let child_base = base.saturating_add(i.saturating_mul(entry_span));
-            // Entry's whole logical range is below the cutoff — keep untouched.
-            if child_base.saturating_add(entry_span) <= cutoff {
-                continue;
-            }
-            let off = match usize::try_from(i) {
-                Ok(idx) => idx * 4,
-                Err(_) => break,
-            };
-            if off + 4 > data.len() {
-                break;
-            }
-            let ptr = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-            if ptr == 0 {
-                continue;
-            }
-            let child = BlockNumber(u64::from(ptr));
+        let ptr = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        if ptr == 0 {
+            continue;
+        }
+        let child = BlockNumber(u64::from(ptr));
+        let free_this = if level == 1 {
+            child_base >= cutoff
+        } else {
             let (child_freed, child_empty) = free_indirect_subtree_range(
                 cx,
                 dev,
@@ -820,16 +574,17 @@ fn free_indirect_subtree_range(
                 pctx,
             )?;
             freed = freed.saturating_add(child_freed);
-            if child_empty {
-                ffs_alloc::free_blocks_persist(cx, dev, geo, groups, child, 1, pctx)?;
-                data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
-                dirty = true;
-                freed = freed.saturating_add(1);
-            }
+            child_empty
+        };
+        if free_this {
+            ffs_alloc::free_blocks_persist(cx, dev, geo, groups, child, 1, pctx)?;
+            data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+            dirty = true;
+            freed = freed.saturating_add(1);
         }
     }
 
-    let empty = indirect_block_all_zero(&data);
+    let empty = data.iter().all(|&b| b == 0);
     // Persist zeroed slots only when the block survives; an emptied block is
     // freed by the caller, so its contents become unreachable.
     if dirty && !empty {
@@ -895,9 +650,7 @@ pub fn truncate_indirect_blocks(
         (
             14usize,
             3u32,
-            12u64
-                .saturating_add(ppb)
-                .saturating_add(ppb.saturating_mul(ppb)),
+            12u64.saturating_add(ppb).saturating_add(ppb.saturating_mul(ppb)),
         ),
     ] {
         let span = ppb.saturating_pow(level);
@@ -959,11 +712,6 @@ pub fn delete_inode(
     pctx: &ffs_alloc::PersistCtx,
 ) -> Result<()> {
     cx_checkpoint(cx)?;
-
-    // Capture the directory bit before the inode fields are zeroed below: ext4
-    // decrements the group's `bg_used_dirs_count` when a directory inode is
-    // freed (bd-0y7jp), and `free_inode_persist` needs to know which kind it is.
-    let is_dir = inode.is_dir();
 
     debug!(
         target: "ffs::inode::generation",
@@ -1035,7 +783,7 @@ pub fn delete_inode(
     write_inode(cx, dev, geo, groups, ino, inode, csum_seed)?;
 
     // Free the inode in the bitmap.
-    ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, is_dir, pctx)?;
+    ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, pctx)?;
 
     Ok(())
 }
@@ -1248,9 +996,6 @@ mod tests {
                 flags: 0,
                 block_bitmap_csum: 0,
                 inode_bitmap_csum: 0,
-                inode_search_start: 0,
-                reserved_cache: std::sync::OnceLock::new(),
-                reserved_confirmed: std::sync::OnceLock::new(),
             })
             .collect()
     }
@@ -1284,39 +1029,6 @@ mod tests {
             xattr_ibody: vec![0xAA, 0xBB, 0xCC, 0xDD],
             number: 0,
         }
-    }
-
-    #[test]
-    fn serialize_inode_with_checksum_matches_write_and_round_trips() {
-        // Seam contract (bd-bhh0i merge-proof slice 1): the pure serialize+CRC the
-        // transactional create path in ffs-core will stage under a slot-scoped merge
-        // proof must produce the exact bytes `write_inode_at` lands in the slot.
-        let inode = representative_inode();
-        let inode_size = 256usize;
-        let ino = InodeNumber(11);
-        let seed = 0x1234_5678_u32;
-
-        let mut buf = [0u8; 256];
-        serialize_inode_with_checksum(&inode, inode_size, ino, seed, &mut buf[..inode_size]);
-
-        // It is exactly serialize_inode_into + compute_and_set_checksum (what
-        // write_inode_at now calls), so the block write is byte-identical.
-        let mut expected = [0u8; 256];
-        serialize_inode_into(&inode, inode_size, &mut expected[..inode_size]);
-        compute_and_set_checksum(
-            &mut expected[..inode_size],
-            seed,
-            u32::try_from(ino.0).expect("test ino fits in u32"),
-        );
-        assert_eq!(buf, expected);
-
-        // And the serialized slot parses back to the same inode (core fields).
-        let parsed = Ext4Inode::parse_from_bytes(&buf[..inode_size]).expect("parse serialized inode");
-        assert_eq!(parsed.mode, inode.mode);
-        assert_eq!(parsed.size, inode.size);
-        assert_eq!(parsed.links_count, inode.links_count);
-        assert_eq!(parsed.uid, inode.uid);
-        assert_eq!(parsed.gid, inode.gid);
     }
 
     const REPRESENTATIVE_INODE_GOLDEN: &str = concat!(
@@ -1482,7 +1194,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -1540,7 +1252,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -1671,317 +1383,9 @@ mod tests {
         assert_eq!(groups[0].free_inodes, free_before + 1);
     }
 
-    #[test]
-    fn delete_inode_preserves_generation() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(4096);
-        let geo = make_geometry();
-        let mut groups = make_groups(&geo);
-
-        let (ino, mut inode) = create_inode(
-            &cx,
-            &dev,
-            &geo,
-            &mut groups,
-            0o100_644,
-            0,
-            0,
-            GroupNumber(0),
-            0,
-            1_700_000_000,
-            0,
-            &mock_pctx(),
-        )
-        .unwrap();
-
-        // ext4 preserves the inode generation across delete (NFS file-handle
-        // staleness detection and undelete safety); only inode REUSE bumps it.
-        inode.generation = 0xDEAD_BEEF;
-
-        delete_inode(
-            &cx,
-            &dev,
-            &geo,
-            &mut groups,
-            ino,
-            &mut inode,
-            0,
-            1_700_000_001,
-            &mock_pctx(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            inode.generation, 0xDEAD_BEEF,
-            "delete must preserve the inode generation"
-        );
-        // Sanity: the delete actually occurred.
-        assert_eq!(inode.links_count, 0);
-        assert_eq!(inode.dtime, 1_700_000_001);
-    }
-
-    #[test]
-    fn indirect_cutoff_prefix_bound_matches_saturating_predicate() {
-        // `ppb: u64` (matches first_indirect_entry_at_cutoff's param): without the
-        // annotation `i` in `(0..ppb).find(|&i| i.saturating_mul(entry_span))` is an
-        // ambiguous `{integer}` and `saturating_mul` cannot resolve (E0689).
-        let ppb: u64 = 1024;
-        for &(base, cutoff, entry_span) in &[
-            (12, 11, 1),
-            (12, 12, 1),
-            (12, 13, 1),
-            (12, 912, 1),
-            (12, 1036, 1),
-            (12, u64::MAX, 1),
-            (u64::MAX - 3, u64::MAX - 2, 2),
-            (12, 11, 0),
-            (12, 12, 0),
-        ] {
-            let expected = (0..ppb)
-                .find(|&i| {
-                    let child_base = base.saturating_add(i.saturating_mul(entry_span));
-                    child_base.saturating_add(entry_span) > cutoff
-                })
-                .unwrap_or(ppb);
-            assert_eq!(
-                first_indirect_entry_at_cutoff(base, cutoff, entry_span, ppb),
-                expected,
-                "base={base} cutoff={cutoff} entry_span={entry_span}"
-            );
-        }
-    }
-
-    /// truncate_indirect_blocks must also free a DOUBLE-indirect subtree
-    /// (i_block[13]): the data block, the intermediate single-indirect block,
-    /// and the double-indirect root, zeroing the slot. The single-indirect
-    /// coverage below never exercises the nested level-2 recursion in
-    /// free_indirect_subtree_range (bd-xmh5g.216).
-    #[test]
-    fn truncate_indirect_blocks_frees_double_indirect_subtree() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(4096);
-        let geo = make_geometry();
-        let mut groups = make_groups(&geo);
-        // Keep group 0's block bitmap off the gdt block so descriptor
-        // persistence does not clobber it mid-test.
-        groups[0].block_bitmap_block = BlockNumber(10);
-
-        // Double-indirect chain: i_block[13] -> root 2600 -> single 2601 -> data 2602.
-        let mut bitmap = vec![0u8; 4096];
-        for &b in &[2600usize, 2601, 2602] {
-            bitmap[b / 8] |= 1 << (b % 8);
-        }
-        dev.write_block(&cx, BlockNumber(10), &bitmap).unwrap();
-        groups[0].free_blocks = geo.blocks_per_group - 3;
-
-        // Double-indirect root 2600: entry[0] -> single-indirect block 2601.
-        let mut dind = vec![0u8; 4096];
-        dind[0..4].copy_from_slice(&2601u32.to_le_bytes());
-        dev.write_block(&cx, BlockNumber(2600), &dind).unwrap();
-        // Single-indirect 2601: entry[0] -> data block 2602.
-        let mut sind = vec![0u8; 4096];
-        sind[0..4].copy_from_slice(&2602u32.to_le_bytes());
-        dev.write_block(&cx, BlockNumber(2601), &sind).unwrap();
-
-        let mut inode = representative_inode();
-        inode.flags = 0; // legacy indirect (not extents, not inline)
-        inode.mode = 0o100_644; // regular file
-        inode.blocks = 3 * (4096 / 512);
-        inode.size = 1100 * 4096; // spans into the double-indirect range (base 1036)
-        let mut eb = vec![0u8; 60];
-        eb[52..56].copy_from_slice(&2600u32.to_le_bytes()); // i_block[13] -> double-indirect root
-        inode.extent_bytes = eb.into();
-
-        let freed = truncate_indirect_blocks(
-            &cx,
-            &dev,
-            &geo,
-            &mut groups,
-            &mut inode,
-            12, // free everything from logical block 12 onward
-            &mock_pctx(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            freed, 3,
-            "frees data + intermediate single-indirect + double-indirect root"
-        );
-        assert_eq!(
-            &inode.extent_bytes[52..56],
-            &[0, 0, 0, 0],
-            "double-indirect root slot cleared"
-        );
-
-        // All three blocks must now be free in the group bitmap.
-        let bm_buf = dev.read_block(&cx, BlockNumber(10)).unwrap();
-        let bm_after = bm_buf.as_slice();
-        for &b in &[2600usize, 2601, 2602] {
-            assert_eq!(
-                bm_after[b / 8] & (1 << (b % 8)),
-                0,
-                "block {b} must be freed in the bitmap"
-            );
-        }
-    }
-
-    /// truncate_indirect_blocks PARTIAL path: when the cutoff falls inside a
-    /// single-indirect block, the blocks below the cutoff are kept, the blocks
-    /// at/after it are freed, and the surviving single-indirect block is
-    /// rewritten with the freed slots zeroed (the dirty-but-not-empty branch of
-    /// free_indirect_subtree_range) — i_block[12] stays pointed at the root
-    /// (bd-xmh5g.218).
-    #[test]
-    fn truncate_indirect_blocks_partial_single_indirect_keeps_survivors() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(4096);
-        let geo = make_geometry();
-        let mut groups = make_groups(&geo);
-        groups[0].block_bitmap_block = BlockNumber(10);
-
-        // Single-indirect root 2500 with data at logical 12/13/14 -> 2400/2401/2402.
-        let mut bitmap = vec![0u8; 4096];
-        for &b in &[2500usize, 2400, 2401, 2402] {
-            bitmap[b / 8] |= 1 << (b % 8);
-        }
-        dev.write_block(&cx, BlockNumber(10), &bitmap).unwrap();
-        groups[0].free_blocks = geo.blocks_per_group - 4;
-
-        let mut sind = vec![0u8; 4096];
-        sind[0..4].copy_from_slice(&2400u32.to_le_bytes()); // logical 12
-        sind[4..8].copy_from_slice(&2401u32.to_le_bytes()); // logical 13
-        sind[8..12].copy_from_slice(&2402u32.to_le_bytes()); // logical 14
-        dev.write_block(&cx, BlockNumber(2500), &sind).unwrap();
-
-        let mut inode = representative_inode();
-        inode.flags = 0;
-        inode.mode = 0o100_644;
-        inode.blocks = 4 * (4096 / 512);
-        inode.size = 15 * 4096;
-        let mut eb = vec![0u8; 60];
-        eb[48..52].copy_from_slice(&2500u32.to_le_bytes()); // i_block[12] -> single-indirect root
-        inode.extent_bytes = eb.into();
-
-        // cutoff 13: keep logical 12, free logical 13 and 14.
-        let freed =
-            truncate_indirect_blocks(&cx, &dev, &geo, &mut groups, &mut inode, 13, &mock_pctx())
-                .unwrap();
-
-        assert_eq!(freed, 2, "frees logical 13 and 14 only");
-        assert_eq!(
-            &inode.extent_bytes[48..52],
-            &2500u32.to_le_bytes(),
-            "surviving single-indirect root must stay referenced"
-        );
-
-        let bm_buf = dev.read_block(&cx, BlockNumber(10)).unwrap();
-        let bm_after = bm_buf.as_slice();
-        // Survivors stay allocated.
-        for &b in &[2500usize, 2400] {
-            assert_ne!(
-                bm_after[b / 8] & (1 << (b % 8)),
-                0,
-                "survivor block {b} must stay allocated"
-            );
-        }
-        // Freed data blocks are cleared.
-        for &b in &[2401usize, 2402] {
-            assert_eq!(
-                bm_after[b / 8] & (1 << (b % 8)),
-                0,
-                "block {b} must be freed in the bitmap"
-            );
-        }
-        // The surviving single-indirect block has its freed slots zeroed but
-        // keeps the kept-data pointer.
-        let sind_buf = dev.read_block(&cx, BlockNumber(2500)).unwrap();
-        let sind_after = sind_buf.as_slice();
-        assert_eq!(&sind_after[0..4], &2400u32.to_le_bytes(), "logical 12 kept");
-        assert_eq!(&sind_after[4..8], &[0, 0, 0, 0], "logical 13 slot zeroed");
-        assert_eq!(&sind_after[8..12], &[0, 0, 0, 0], "logical 14 slot zeroed");
-    }
-
-    /// truncate_indirect_blocks must free a TRIPLE-indirect subtree
-    /// (i_block[14]): data block, single-indirect, double-indirect, and the
-    /// triple-indirect root, zeroing the slot. Exercises the deepest level-3
-    /// recursion in free_indirect_subtree_range (bd-xmh5g.217).
-    #[test]
-    fn truncate_indirect_blocks_frees_triple_indirect_subtree() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(4096);
-        let geo = make_geometry();
-        let mut groups = make_groups(&geo);
-        // Keep group 0's block bitmap off the gdt block so persistence does not
-        // clobber it mid-test.
-        groups[0].block_bitmap_block = BlockNumber(10);
-
-        // Triple-indirect chain: i_block[14] -> root 2700 -> double 2701 ->
-        // single 2702 -> data 2703.
-        let mut bitmap = vec![0u8; 4096];
-        for &b in &[2700usize, 2701, 2702, 2703] {
-            bitmap[b / 8] |= 1 << (b % 8);
-        }
-        dev.write_block(&cx, BlockNumber(10), &bitmap).unwrap();
-        groups[0].free_blocks = geo.blocks_per_group - 4;
-
-        // Triple-indirect root 2700 -> double-indirect 2701.
-        let mut tind = vec![0u8; 4096];
-        tind[0..4].copy_from_slice(&2701u32.to_le_bytes());
-        dev.write_block(&cx, BlockNumber(2700), &tind).unwrap();
-        // Double-indirect 2701 -> single-indirect 2702.
-        let mut dind = vec![0u8; 4096];
-        dind[0..4].copy_from_slice(&2702u32.to_le_bytes());
-        dev.write_block(&cx, BlockNumber(2701), &dind).unwrap();
-        // Single-indirect 2702 -> data 2703.
-        let mut sind = vec![0u8; 4096];
-        sind[0..4].copy_from_slice(&2703u32.to_le_bytes());
-        dev.write_block(&cx, BlockNumber(2702), &sind).unwrap();
-
-        let mut inode = representative_inode();
-        inode.flags = 0; // legacy indirect
-        inode.mode = 0o100_644; // regular file
-        inode.blocks = 4 * (4096 / 512);
-        inode.size = 1_050_000_u64 * 4096; // spans into the triple-indirect range
-        let mut eb = vec![0u8; 60];
-        eb[56..60].copy_from_slice(&2700u32.to_le_bytes()); // i_block[14] -> triple-indirect root
-        inode.extent_bytes = eb.into();
-
-        let freed = truncate_indirect_blocks(
-            &cx,
-            &dev,
-            &geo,
-            &mut groups,
-            &mut inode,
-            12, // free everything from logical block 12 onward
-            &mock_pctx(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            freed, 4,
-            "frees data + single + double + triple-indirect root"
-        );
-        assert_eq!(
-            &inode.extent_bytes[56..60],
-            &[0, 0, 0, 0],
-            "triple-indirect root slot cleared"
-        );
-
-        // All four blocks must now be free in the group bitmap.
-        let bm_buf = dev.read_block(&cx, BlockNumber(10)).unwrap();
-        let bm_after = bm_buf.as_slice();
-        for &b in &[2700usize, 2701, 2702, 2703] {
-            assert_eq!(
-                bm_after[b / 8] & (1 << (b % 8)),
-                0,
-                "block {b} must be freed in the bitmap"
-            );
-        }
-    }
-
     /// bd-c7t59 follow-up: truncate_indirect_blocks (used by orphan recovery to
     /// complete an interrupted truncate of a legacy indirect file) frees the data
-    /// and now-empty indirect-metadata blocks at/after the cutoff, zeroes the freed
+    /// + now-empty indirect-metadata blocks at/after the cutoff, zeroes the freed
     /// inode pointer slots, and leaves blocks below the cutoff intact.
     #[test]
     fn truncate_indirect_blocks_frees_range_and_zeroes_slots() {
@@ -2017,7 +1421,7 @@ mod tests {
         eb[0..4].copy_from_slice(&2000u32.to_le_bytes()); // i_block[0]  -> logical 0
         eb[4..8].copy_from_slice(&2001u32.to_le_bytes()); // i_block[1]  -> logical 1
         eb[48..52].copy_from_slice(&2500u32.to_le_bytes()); // i_block[12] -> single-indirect root
-        inode.extent_bytes = eb.into();
+        inode.extent_bytes = eb;
 
         let freed = truncate_indirect_blocks(
             &cx,
@@ -2030,65 +1434,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            freed, 3,
-            "frees direct[1] + single-indirect data + its root"
-        );
+        assert_eq!(freed, 3, "frees direct[1] + single-indirect data + its root");
         // Slot 0 (logical 0) survives; slot 1 and the single-indirect root cleared.
-        assert_eq!(
-            &inode.extent_bytes[0..4],
-            &2000u32.to_le_bytes(),
-            "logical 0 kept"
-        );
-        assert_eq!(
-            &inode.extent_bytes[4..8],
-            &[0, 0, 0, 0],
-            "logical 1 slot cleared"
-        );
-        assert_eq!(
-            &inode.extent_bytes[48..52],
-            &[0, 0, 0, 0],
-            "single-indirect root cleared"
-        );
+        assert_eq!(&inode.extent_bytes[0..4], &2000u32.to_le_bytes(), "logical 0 kept");
+        assert_eq!(&inode.extent_bytes[4..8], &[0, 0, 0, 0], "logical 1 slot cleared");
+        assert_eq!(&inode.extent_bytes[48..52], &[0, 0, 0, 0], "single-indirect root cleared");
         assert_eq!(
             groups[0].free_blocks,
             geo.blocks_per_group - 1,
             "three of the four allocated blocks were freed"
         );
-    }
-
-    #[test]
-    fn inode_uses_indirect_blocks_excludes_extents_inline_and_non_data_modes() {
-        let mut base = representative_inode();
-        base.flags = 0;
-        base.mode = 0o100_644; // S_IFREG
-        base.blocks = 8;
-        assert!(
-            inode_uses_indirect_blocks(&base),
-            "a plain non-extent regular file is indirect-mapped"
-        );
-
-        // Extent-mapped and inline-data inodes must not be walked as indirect.
-        let mut ext = base.clone();
-        ext.flags = EXT4_EXTENTS_FL;
-        assert!(!inode_uses_indirect_blocks(&ext), "extent inode");
-        let mut inline = base.clone();
-        inline.flags = EXT4_INLINE_DATA_FL;
-        assert!(!inode_uses_indirect_blocks(&inline), "inline-data inode");
-
-        // An inode with no blocks has nothing to walk.
-        let mut noblocks = base.clone();
-        noblocks.blocks = 0;
-        assert!(!inode_uses_indirect_blocks(&noblocks), "zero blocks");
-
-        // Directories with blocks are indirect-mapped; device nodes are not
-        // (i_block holds the device number, not block pointers).
-        let mut dir = base.clone();
-        dir.mode = 0o040_755; // S_IFDIR
-        assert!(inode_uses_indirect_blocks(&dir), "directory");
-        let mut chr = base;
-        chr.mode = 0o020_644; // S_IFCHR
-        assert!(!inode_uses_indirect_blocks(&chr), "char device");
     }
 
     /// Regression: an e2compr (compressed) inode must NOT be treated as a plain
@@ -2147,7 +1502,7 @@ mod tests {
         inode.blocks = 8;
         let mut eb = vec![0u8; 60];
         eb[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // EXT2_COMPRESSED_BLKADDR
-        inode.extent_bytes = eb.into();
+        inode.extent_bytes = eb;
 
         // Must not error (pre-fix this hit free_blocks_persist(0xFFFFFFFF)).
         delete_inode(
@@ -2229,7 +1584,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -2391,7 +1746,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -2431,7 +1786,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -2470,7 +1825,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: xattr_data.clone(),
             number: 0,
         };
@@ -2577,40 +1932,6 @@ mod tests {
         assert_eq!(read_back.uid, 500);
         assert_eq!(read_back.mtime, 1_700_000_100);
         assert_eq!(read_back.ctime, 1_700_000_100);
-    }
-
-    #[test]
-    fn write_inode_out_of_range_returns_corruption() {
-        let cx = test_cx();
-        let dev = MemBlockDevice::new(4096);
-        let geo = make_geometry();
-        let mut groups = make_groups(&geo);
-
-        let (_ino, inode) = create_inode(
-            &cx,
-            &dev,
-            &geo,
-            &mut groups,
-            0o100_644,
-            0,
-            0,
-            GroupNumber(0),
-            0,
-            1_700_000_000,
-            0,
-            &mock_pctx(),
-        )
-        .unwrap();
-
-        // write_inode must reject an inode number beyond the table, mirroring
-        // the read_inode out-of-range guard, instead of patching and writing
-        // back an arbitrary block.
-        let err =
-            write_inode(&cx, &dev, &geo, &groups, InodeNumber(100_000), &inode, 0).unwrap_err();
-        assert!(
-            matches!(err, FfsError::Corruption { ref detail, .. } if detail.contains("out of range")),
-            "got {err:?}",
-        );
     }
 
     #[test]
@@ -2797,7 +2118,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3122,7 +2443,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3157,9 +2478,6 @@ mod tests {
             flags: 0,
             block_bitmap_csum: 0,
             inode_bitmap_csum: 0,
-            inode_search_start: 0,
-            reserved_cache: std::sync::OnceLock::new(),
-            reserved_confirmed: std::sync::OnceLock::new(),
         }];
         let inode = Ext4Inode {
             mode: 0o100_644,
@@ -3187,7 +2505,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3228,7 +2546,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0x1234,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![0xAA; 10],
             number: 0,
         };
@@ -3277,7 +2595,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3320,7 +2638,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0xABCD_1234,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3361,7 +2679,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3530,7 +2848,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3567,7 +2885,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3606,7 +2924,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3647,7 +2965,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3764,7 +3082,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -3862,7 +3180,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 999, mtime_extra: 888,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -3893,7 +3211,7 @@ mod tests {
                 atime_extra: 42, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -3928,7 +3246,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -3989,7 +3307,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
             // Ensure generation matches what will be in the raw buffer.
@@ -4018,7 +3336,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 1_700_000_000, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -4066,7 +3384,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -4103,7 +3421,7 @@ mod tests {
                 atime_extra, ctime_extra, mtime_extra,
                 crtime, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -4137,7 +3455,7 @@ mod tests {
                 atime_extra: init_atime_extra, ctime_extra: 0, mtime_extra: init_mtime_extra,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -4163,7 +3481,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -4193,7 +3511,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 1_700_000_000, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -4227,7 +3545,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: 0, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: xattr_data.clone(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: xattr_data.clone(),
                 number: 0,
             };
 
@@ -4257,7 +3575,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: initial_hi, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
 
@@ -4296,7 +3614,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: initial_hi, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
             touch_atime(&mut inode, secs, nsec);
@@ -4321,7 +3639,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: initial_hi, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
             let initial = u64::from(initial_lo) | (u64::from(initial_hi) << 32);
@@ -4346,7 +3664,7 @@ mod tests {
                 atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
                 crtime: 0, crtime_extra: 0, extra_isize: 32,
                 checksum: 0, version_hi: initial_hi, projid: 0,
-                extent_bytes: vec![0u8; 60].into(), xattr_ibody: Vec::new(),
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
                 number: 0,
             };
             let initial = u64::from(initial_lo) | (u64::from(initial_hi) << 32);
@@ -4429,7 +3747,7 @@ mod tests {
                 checksum: 0,
                 version_hi: if advertise(0x9C) { 0x1234_5678 } else { 0 },
                 projid: if advertise(0xA0) { 0xABCD_0123 } else { 0 },
-                extent_bytes: vec![0_u8; 60].into(),
+                extent_bytes: vec![0_u8; 60],
                 xattr_ibody: if extra_isize > 0 {
                     vec![0_u8; xattr_capacity]
                 } else {
@@ -4548,7 +3866,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -4584,7 +3902,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -4655,7 +3973,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -4696,7 +4014,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -4776,7 +4094,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0xAB; 100].into(), // larger than 60
+            extent_bytes: vec![0xAB; 100], // larger than 60
             xattr_ibody: vec![],
             number: 0,
         };
@@ -4816,7 +4134,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -4853,7 +4171,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5087,7 +4405,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5127,7 +4445,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5256,7 +4574,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0xCC; 10].into(), // shorter than 60
+            extent_bytes: vec![0xCC; 10], // shorter than 60
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5296,7 +4614,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5336,7 +4654,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5460,7 +4778,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5504,7 +4822,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![],
             number: 0,
         };
@@ -5549,7 +4867,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -5602,7 +4920,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -5696,7 +5014,7 @@ mod tests {
 
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0u8; 60].into(),
+            extent_bytes: vec![0u8; 60],
             xattr_ibody: vec![0xAA; 128],
             number: 0,
         };
@@ -5840,7 +5158,7 @@ mod tests {
             checksum: 0,
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0; 60].into(),
+            extent_bytes: vec![0; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -5877,7 +5195,7 @@ mod tests {
             checksum: 0,
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0; 60].into(),
+            extent_bytes: vec![0; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -5913,7 +5231,7 @@ mod tests {
             checksum: 0,
             version_hi: u32::MAX,
             projid: 0,
-            extent_bytes: vec![0; 60].into(),
+            extent_bytes: vec![0; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -5949,7 +5267,7 @@ mod tests {
             checksum: 0,
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0; 60].into(),
+            extent_bytes: vec![0; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };
@@ -5986,7 +5304,7 @@ mod tests {
             checksum: 0,
             version_hi: 0,
             projid: 0,
-            extent_bytes: vec![0; 60].into(),
+            extent_bytes: vec![0; 60],
             xattr_ibody: Vec::new(),
             number: 0,
         };

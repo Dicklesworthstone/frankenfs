@@ -11,95 +11,16 @@ use asupersync::Cx;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 pub use ffs_ondisk::btrfs::*;
 use ffs_types::{BlockNumber, CommitSeq, ParseError, Snapshot, TxnId};
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
-
-const BTRFS_RANGE_PREFETCH_THREADS: usize = 16;
-/// Minimum surviving-child fan-out before a tree-range walk dispatches the child
-/// fetch to the parallel prefetch pool. A point/narrow walk (e.g. a getattr inode
-/// point lookup) surfaces a single surviving child per internal node, so a
-/// 1-element `par_iter` on the 16-thread pool is pure dispatch overhead — and a
-/// metadata walk doing thousands of these thrashes the idle pool workers on
-/// `sched_yield` (measured ~7× slower than kernel btrfs on a 30k-entry directory
-/// before this gate). The deep-/wide-range walk that `bd-h6p3w` parallelized
-/// surfaces many children per node and stays on the parallel path.
-const BTRFS_PREFETCH_MIN_CHILDREN: usize = 2;
-static BTRFS_RANGE_PREFETCH_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-
-fn btrfs_range_prefetch_pool() -> &'static rayon::ThreadPool {
-    BTRFS_RANGE_PREFETCH_POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(BTRFS_RANGE_PREFETCH_THREADS)
-            .thread_name(|idx| format!("ffs-btrfs-prefetch-{idx}"))
-            .build()
-            .unwrap_or_else(|err| panic!("failed to build btrfs range prefetch pool: {err}"))
-    })
-}
 
 /// A single leaf item yielded by tree traversal: key + raw payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtrfsLeafEntry {
     pub key: BtrfsKey,
     pub data: Vec<u8>,
-}
-
-/// A leaf item whose payload borrows from its containing verified tree block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BtrfsLeafItemRef {
-    pub key: BtrfsKey,
-    data_start: usize,
-    data_end: usize,
-}
-
-impl BtrfsLeafItemRef {
-    /// Byte range of this item payload within its containing tree block.
-    #[must_use]
-    pub fn data_range(&self) -> Range<usize> {
-        self.data_start..self.data_end
-    }
-}
-
-/// Arc-backed batch of leaf entries from one verified btrfs tree block.
-///
-/// This is the zero-copy counterpart to [`BtrfsLeafEntry`]: each item records a
-/// range into the shared leaf block instead of allocating and copying its
-/// payload into a per-entry `Vec<u8>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BtrfsLeafEntryBatch {
-    block: Arc<Vec<u8>>,
-    pub entries: Vec<BtrfsLeafItemRef>,
-}
-
-impl BtrfsLeafEntryBatch {
-    /// Return the payload bytes for `entry`.
-    #[must_use]
-    pub fn data<'a>(&'a self, entry: &BtrfsLeafItemRef) -> &'a [u8] {
-        &self.block[entry.data_start..entry.data_end]
-    }
-
-    /// Iterate over `(key, data)` pairs in this leaf batch.
-    pub fn iter(&self) -> impl Iterator<Item = (BtrfsKey, &[u8])> + '_ {
-        self.entries
-            .iter()
-            .map(|entry| (entry.key, self.data(entry)))
-    }
-
-    /// Convert this zero-copy batch back to owned entries.
-    #[must_use]
-    pub fn to_owned_entries(&self) -> Vec<BtrfsLeafEntry> {
-        self.iter()
-            .map(|(key, data)| BtrfsLeafEntry {
-                key,
-                data: data.to_vec(),
-            })
-            .collect()
-    }
 }
 
 /// btrfs objectid for the root tree.
@@ -392,19 +313,12 @@ pub fn build_extent_csum_items(
 /// [`build_extent_csum_items`]).
 ///
 /// `items` are `(key, packed_csums)` pairs as stored in the csum tree, each key
-/// carrying the disk bytenr of the item's first sector in `key.offset`. They
-/// must be sorted ascending by `key.offset` — the order both
-/// [`build_extent_csum_items`] emits and a csum-tree range/B-tree walk yields,
-/// so every real caller already satisfies it. Returns the checksum recorded for
-/// the sector that begins at `disk_bytenr`, or `None` if no item covers it or
-/// `disk_bytenr` is not sector-aligned to an item's coverage. A reader/scrub
-/// feeds the result to [`verify_extent_csum`] (or compares directly) to detect
-/// data corruption.
-///
-/// Whole-file csum verification calls this once per sector against the entire
-/// csum tree, so a linear scan made it O(sectors * items); the covering item is
-/// the greatest `key.offset <= disk_bytenr`, so on a sorted list we
-/// binary-search to it — O(items) -> O(log items) per sector (bd-dgih3).
+/// carrying the disk bytenr of the item's first sector in `key.offset` (the
+/// caller gathers the relevant items via a tree range query; order does not
+/// matter). Returns the checksum recorded for the sector that begins at
+/// `disk_bytenr`, or `None` if no item covers it or `disk_bytenr` is not
+/// sector-aligned to an item's coverage. A reader/scrub feeds the result to
+/// [`verify_extent_csum`] (or compares directly) to detect data corruption.
 #[must_use]
 pub fn lookup_data_block_csum(
     items: &[(BtrfsKey, Vec<u8>)],
@@ -414,20 +328,19 @@ pub fn lookup_data_block_csum(
     if sectorsize == 0 {
         return None;
     }
-    // Items are sorted ascending by key.offset. The covering item is the last
-    // one with offset <= disk_bytenr whose checksum run reaches disk_bytenr, so
-    // partition_point to the candidate suffix boundary and walk back to the
-    // first EXTENT_CSUM item (greatest offset <= target among matching items —
-    // identical to the old max-over-filtered scan, but O(log) on the common
-    // pure-csum list instead of O(items)).
-    let hi = items.partition_point(|(key, _)| key.offset <= disk_bytenr);
+    // The covering item is the one with the greatest offset <= disk_bytenr
+    // whose checksum run actually reaches disk_bytenr.
     let mut best: Option<(u64, &[u8])> = None;
-    for (key, value) in items[..hi].iter().rev() {
+    for (key, value) in items {
         if key.item_type != BTRFS_ITEM_EXTENT_CSUM || key.objectid != BTRFS_EXTENT_CSUM_OBJECTID {
             continue;
         }
-        best = Some((key.offset, value.as_slice()));
-        break;
+        if key.offset > disk_bytenr {
+            continue;
+        }
+        if best.is_none_or(|(off, _)| key.offset > off) {
+            best = Some((key.offset, value.as_slice()));
+        }
     }
     let (item_offset, value) = best?;
     let delta = disk_bytenr.checked_sub(item_offset)?;
@@ -1074,20 +987,6 @@ pub struct BtrfsDirItem {
     pub name: Vec<u8>,
 }
 
-/// Borrowed directory entry produced while walking a DIR_ITEM / DIR_INDEX
-/// payload.
-///
-/// Consumers that immediately project entries into another owned type can use
-/// [`visit_dir_items`] to avoid allocating an intermediate `Vec<BtrfsDirItem>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BtrfsDirItemRef<'a> {
-    pub child_objectid: u64,
-    pub child_key_type: u8,
-    pub child_key_offset: u64,
-    pub file_type: u8,
-    pub name: &'a [u8],
-}
-
 impl BtrfsDirItem {
     /// Fallibly serialize to the on-disk DIR_ITEM / DIR_INDEX layout.
     ///
@@ -1193,121 +1092,6 @@ pub fn parse_xattr_items(data: &[u8]) -> Result<Vec<BtrfsXattrItem>, ParseError>
             name: data[name_start..name_end].to_vec(),
             value: data[name_end..value_end].to_vec(),
         });
-        cur = value_end;
-    }
-    Ok(out)
-}
-
-/// Find the first matching XATTR_ITEM value without materializing every item.
-///
-/// The entire concatenated payload is still validated before a value is
-/// returned, so malformed entries after a match produce the same error as
-/// [`parse_xattr_items`]. For a valid payload this is equivalent to parsing all
-/// items and taking the first matching name, but allocates only the selected
-/// value (or nothing on a miss).
-pub fn find_xattr_item_value(data: &[u8], target: &[u8]) -> Result<Option<Vec<u8>>, ParseError> {
-    const HEADER: usize = 30;
-    let mut matched = None;
-    let mut cur = 0_usize;
-    while cur < data.len() {
-        if cur + HEADER > data.len() {
-            return Err(ParseError::InsufficientData {
-                needed: HEADER,
-                offset: cur,
-                actual: data.len() - cur,
-            });
-        }
-        let data_len = usize::from(u16::from_le_bytes([data[cur + 25], data[cur + 26]]));
-        let name_len = usize::from(u16::from_le_bytes([data[cur + 27], data[cur + 28]]));
-        if name_len == 0 {
-            return Err(ParseError::InvalidField {
-                field: "xattr.name_len",
-                reason: "must be non-zero",
-            });
-        }
-
-        let name_start = cur + HEADER;
-        let name_end = name_start
-            .checked_add(name_len)
-            .ok_or(ParseError::InvalidField {
-                field: "xattr.name_len",
-                reason: "overflow",
-            })?;
-        let value_end = name_end
-            .checked_add(data_len)
-            .ok_or(ParseError::InvalidField {
-                field: "xattr.data_len",
-                reason: "overflow",
-            })?;
-
-        if value_end > data.len() {
-            return Err(ParseError::InsufficientData {
-                needed: value_end,
-                offset: cur,
-                actual: data.len(),
-            });
-        }
-
-        if matched.is_none() && data[name_start..name_end] == *target {
-            matched = Some((name_end, value_end));
-        }
-        cur = value_end;
-    }
-
-    Ok(matched.map(|(start, end)| data[start..end].to_vec()))
-}
-
-/// Parse only the NAMES of the xattr items in a DIR_ITEM/XATTR_ITEM payload,
-/// without materialising values. `listxattr` needs names only, but
-/// [`parse_xattr_items`] copies each attribute's value into a fresh `Vec`
-/// (`data[name_end..value_end].to_vec()`) that the caller immediately discards.
-/// This performs the identical walk + bounds validation (so it rejects the same
-/// truncated/overflowing payloads) but skips the value copy. Returns each name's
-/// raw bytes.
-pub fn parse_xattr_item_names(data: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
-    const HEADER: usize = 30;
-    let mut out = Vec::new();
-    let mut cur = 0_usize;
-    while cur < data.len() {
-        if cur + HEADER > data.len() {
-            return Err(ParseError::InsufficientData {
-                needed: HEADER,
-                offset: cur,
-                actual: data.len() - cur,
-            });
-        }
-        let data_len = usize::from(u16::from_le_bytes([data[cur + 25], data[cur + 26]]));
-        let name_len = usize::from(u16::from_le_bytes([data[cur + 27], data[cur + 28]]));
-        if name_len == 0 {
-            return Err(ParseError::InvalidField {
-                field: "xattr.name_len",
-                reason: "must be non-zero",
-            });
-        }
-
-        let name_start = cur + HEADER;
-        let name_end = name_start
-            .checked_add(name_len)
-            .ok_or(ParseError::InvalidField {
-                field: "xattr.name_len",
-                reason: "overflow",
-            })?;
-        let value_end = name_end
-            .checked_add(data_len)
-            .ok_or(ParseError::InvalidField {
-                field: "xattr.data_len",
-                reason: "overflow",
-            })?;
-
-        if value_end > data.len() {
-            return Err(ParseError::InsufficientData {
-                needed: value_end,
-                offset: cur,
-                actual: data.len(),
-            });
-        }
-
-        out.push(data[name_start..name_end].to_vec());
         cur = value_end;
     }
     Ok(out)
@@ -1639,18 +1423,6 @@ pub fn parse_inode_refs(data: &[u8]) -> Result<Vec<BtrfsInodeRef>, ParseError> {
 /// entries for objectids >= 256 (user subvolumes).
 #[must_use]
 pub fn enumerate_subvolumes(entries: &[BtrfsLeafEntry]) -> Vec<BtrfsSubvolume> {
-    let mut root_refs = FxHashMap::default();
-    for entry in entries {
-        if entry.key.item_type != BTRFS_ITEM_ROOT_REF {
-            continue;
-        }
-        if let std::collections::hash_map::Entry::Vacant(slot) = root_refs.entry(entry.key.offset)
-            && let Ok(root_ref) = parse_root_ref(&entry.data)
-        {
-            slot.insert((entry.key.objectid, root_ref));
-        }
-    }
-
     let mut subvols = Vec::new();
 
     // Collect ROOT_ITEM entries for user subvolumes
@@ -1666,15 +1438,19 @@ pub fn enumerate_subvolumes(entries: &[BtrfsLeafEntry]) -> Vec<BtrfsSubvolume> {
             continue;
         };
 
-        let (parent_id, name) = root_refs.get(&id).map_or_else(
-            || (0, format!("subvol-{id}")),
-            |(parent_id, root_ref)| {
-                (
-                    *parent_id,
-                    String::from_utf8_lossy(&root_ref.name).into_owned(),
-                )
-            },
-        );
+        // Find matching ROOT_REF for this subvolume
+        let (parent_id, name) = entries
+            .iter()
+            .find_map(|e| {
+                if e.key.item_type == BTRFS_ITEM_ROOT_REF && e.key.offset == id {
+                    let rref = parse_root_ref(&e.data).ok()?;
+                    let name = String::from_utf8_lossy(&rref.name).into_owned();
+                    Some((e.key.objectid, name))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| (0, format!("subvol-{id}")));
 
         subvols.push(BtrfsSubvolume {
             id,
@@ -1701,52 +1477,52 @@ fn uuid_is_set(uuid: &[u8; 16]) -> bool {
 /// it was created as a snapshot of another subvolume.
 #[must_use]
 pub fn enumerate_snapshots(entries: &[BtrfsLeafEntry]) -> Vec<BtrfsSnapshot> {
-    let mut roots = Vec::new();
-    let mut source_ids = FxHashMap::default();
+    let mut snapshots = Vec::new();
+
+    // First pass: collect all ROOT_ITEM entries with parent_uuid set
     for entry in entries {
         if entry.key.item_type != BTRFS_ITEM_ROOT_ITEM {
             continue;
         }
-        if let Ok(root) = parse_root_item(&entry.data) {
-            if uuid_is_set(&root.uuid) {
-                source_ids.entry(root.uuid).or_insert(entry.key.objectid);
-            }
-            if entry.key.objectid >= BTRFS_FIRST_FREE_OBJECTID && uuid_is_set(&root.parent_uuid) {
-                roots.push((entry.key.objectid, root));
-            }
-        }
-    }
-
-    // Only snapshot roots can consume a ROOT_REF name. Index those candidates
-    // first so regular subvolume refs are neither parsed nor allocated.
-    let mut snapshot_names: FxHashMap<u64, Option<Vec<u8>>> =
-        roots.iter().map(|(id, _)| (*id, None)).collect();
-    for entry in entries {
-        if entry.key.item_type != BTRFS_ITEM_ROOT_REF {
+        let id = entry.key.objectid;
+        if id < BTRFS_FIRST_FREE_OBJECTID {
             continue;
         }
-        if let Some(name) = snapshot_names.get_mut(&entry.key.offset)
-            && name.is_none()
-            && let Ok(root_ref) = parse_root_ref(&entry.data)
-        {
-            *name = Some(root_ref.name);
+        let Ok(root) = parse_root_item(&entry.data) else {
+            continue;
+        };
+        if !uuid_is_set(&root.parent_uuid) {
+            continue;
         }
-    }
 
-    let mut snapshots = Vec::new();
+        // Find the source subvolume by matching parent_uuid to uuid
+        let source_id = entries
+            .iter()
+            .find_map(|e| {
+                if e.key.item_type != BTRFS_ITEM_ROOT_ITEM {
+                    return None;
+                }
+                let src = parse_root_item(&e.data).ok()?;
+                if src.uuid == root.parent_uuid {
+                    Some(e.key.objectid)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
 
-    // Build snapshots from the candidates retained above.
-    for (id, root) in roots {
-        // Find the source subvolume by matching parent_uuid to uuid.
-        let source_id = source_ids.get(&root.parent_uuid).copied().unwrap_or(0);
-
-        let name = snapshot_names
-            .get(&id)
-            .and_then(Option::as_ref)
-            .map_or_else(
-                || format!("snap-{id}"),
-                |name| String::from_utf8_lossy(name).into_owned(),
-            );
+        // Find matching ROOT_REF for the snapshot name
+        let name = entries
+            .iter()
+            .find_map(|e| {
+                if e.key.item_type == BTRFS_ITEM_ROOT_REF && e.key.offset == id {
+                    let rref = parse_root_ref(&e.data).ok()?;
+                    Some(String::from_utf8_lossy(&rref.name).into_owned())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| format!("snap-{id}"));
 
         snapshots.push(BtrfsSnapshot {
             id,
@@ -1794,56 +1570,38 @@ pub fn snapshot_diff_by_generation(
 
     let old_inodes = collect_inodes(older_entries);
     let new_inodes = collect_inodes(newer_entries);
-    let mut old_inodes = old_inodes.into_iter().peekable();
-    let mut new_inodes = new_inodes.into_iter().peekable();
     let mut diffs = Vec::new();
 
-    // Merge the two ordered maps so the result is already sorted by inode.
-    loop {
-        match (old_inodes.peek().copied(), new_inodes.peek().copied()) {
-            (None, None) => break,
-            (Some((oid, _)), None) => {
-                diffs.push(SnapshotDiffEntry {
-                    inode: oid,
-                    change_type: SnapshotChangeType::Deleted,
-                });
-                let _ = old_inodes.next();
-            }
-            (None, Some((oid, _))) => {
+    // Deleted: in old but not in new
+    for &oid in old_inodes.keys() {
+        if !new_inodes.contains_key(&oid) {
+            diffs.push(SnapshotDiffEntry {
+                inode: oid,
+                change_type: SnapshotChangeType::Deleted,
+            });
+        }
+    }
+
+    // Added or Modified
+    for (&oid, &new_gen) in &new_inodes {
+        match old_inodes.get(&oid) {
+            None => {
                 diffs.push(SnapshotDiffEntry {
                     inode: oid,
                     change_type: SnapshotChangeType::Added,
                 });
-                let _ = new_inodes.next();
             }
-            (Some((old_oid, old_gen)), Some((new_oid, new_gen))) => match old_oid.cmp(&new_oid) {
-                std::cmp::Ordering::Less => {
-                    diffs.push(SnapshotDiffEntry {
-                        inode: old_oid,
-                        change_type: SnapshotChangeType::Deleted,
-                    });
-                    let _ = old_inodes.next();
-                }
-                std::cmp::Ordering::Greater => {
-                    diffs.push(SnapshotDiffEntry {
-                        inode: new_oid,
-                        change_type: SnapshotChangeType::Added,
-                    });
-                    let _ = new_inodes.next();
-                }
-                std::cmp::Ordering::Equal => {
-                    if new_gen > old_gen {
-                        diffs.push(SnapshotDiffEntry {
-                            inode: old_oid,
-                            change_type: SnapshotChangeType::Modified,
-                        });
-                    }
-                    let _ = old_inodes.next();
-                    let _ = new_inodes.next();
-                }
-            },
+            Some(&old_gen) if new_gen > old_gen => {
+                diffs.push(SnapshotDiffEntry {
+                    inode: oid,
+                    change_type: SnapshotChangeType::Modified,
+                });
+            }
+            _ => {}
         }
     }
+
+    diffs.sort_by_key(|d| d.inode);
     diffs
 }
 
@@ -1905,18 +1663,11 @@ pub fn parse_inode_item(data: &[u8]) -> Result<BtrfsInodeItem, ParseError> {
     })
 }
 
-/// Visit one or more directory entries from a DIR_ITEM or DIR_INDEX payload.
-///
-/// The callback receives borrowed names after the same field and bounds
-/// validation performed by [`parse_dir_items`]. If a later entry is malformed,
-/// callbacks for its valid prefix may already have run; callers that retain
-/// output should roll that prefix back when this function returns an error.
-pub fn visit_dir_items(
-    data: &[u8],
-    mut visit: impl FnMut(BtrfsDirItemRef<'_>),
-) -> Result<(), ParseError> {
+/// Parse one or more directory entries from a DIR_ITEM or DIR_INDEX payload.
+pub fn parse_dir_items(data: &[u8]) -> Result<Vec<BtrfsDirItem>, ParseError> {
     const HEADER: usize = 30; // disk_key(17) + transid(8) + data_len(2) + name_len(2) + type(1)
 
+    let mut out = Vec::new();
     let mut cur = 0_usize;
     while cur < data.len() {
         if cur + HEADER > data.len() {
@@ -1963,32 +1714,17 @@ pub fn visit_dir_items(
             });
         }
 
-        visit(BtrfsDirItemRef {
+        out.push(BtrfsDirItem {
             child_objectid,
             child_key_type,
             child_key_offset,
             file_type,
-            name: &data[name_start..name_end],
+            name: data[name_start..name_end].to_vec(),
         });
 
         cur = name_end;
     }
 
-    Ok(())
-}
-
-/// Parse one or more directory entries from a DIR_ITEM or DIR_INDEX payload.
-pub fn parse_dir_items(data: &[u8]) -> Result<Vec<BtrfsDirItem>, ParseError> {
-    let mut out = Vec::new();
-    visit_dir_items(data, |item| {
-        out.push(BtrfsDirItem {
-            child_objectid: item.child_objectid,
-            child_key_type: item.child_key_type,
-            child_key_offset: item.child_key_offset,
-            file_type: item.file_type,
-            name: item.name.to_vec(),
-        });
-    })?;
     Ok(out)
 }
 
@@ -2138,133 +1874,6 @@ fn validate_inline_extent_ram_bytes(
 
 /// Walk a btrfs tree from `root_logical` down to all leaves, collecting items.
 ///
-/// A btrfs tree node after checksum verification and structural parsing.
-///
-/// This is the unit the tree walkers consume. Producing it (read → verify →
-/// `parse_leaf_items`/`parse_internal_items`) is the per-node cost that a
-/// read-only mount pays once per *distinct* node and then re-pays on every
-/// re-traversal — a node-cache keyed on the logical address can hand the walker
-/// a shared `Arc<BtrfsParsedNode>` and skip read+verify+parse entirely on a hit
-/// (the kernel's `extent_buffer` model). A `Leaf` keeps the verified block
-/// shared so item payloads are still sliced lazily (only in-range items are
-/// cloned), matching the old in-walker parse with no extra per-traversal copy.
-#[derive(Debug, Clone)]
-pub enum BtrfsParsedNode {
-    /// A level-0 node: the verified block bytes plus its parsed item index.
-    Leaf {
-        block: Arc<Vec<u8>>,
-        items: Vec<BtrfsItem>,
-    },
-    /// An internal node: its parsed key-pointers (key = child subtree minimum).
-    Internal { ptrs: Vec<BtrfsKeyPtr> },
-}
-
-/// Verify a btrfs tree block's checksum and parse it into a [`BtrfsParsedNode`].
-///
-/// Does exactly the per-node work the walker used to do inline (length check,
-/// `verify_btrfs_tree_block_checksum`, header parse + `validate`, then leaf or
-/// internal item parse), so the result is byte-for-byte equivalent to walking
-/// the raw block — it just lets a caller cache the parsed form.
-///
-/// # Errors
-/// Returns a [`ParseError`] on a length mismatch, checksum mismatch, or any
-/// malformed header / item layout.
-pub fn parse_btrfs_tree_node(
-    block: &[u8],
-    csum_type: u16,
-    logical: u64,
-    nodesize: u32,
-) -> Result<BtrfsParsedNode, ParseError> {
-    match parse_btrfs_tree_node_parts(block, csum_type, logical, nodesize)? {
-        ParsedBtrfsTreeNodeParts::Leaf(items) => Ok(BtrfsParsedNode::Leaf {
-            block: Arc::new(block.to_vec()),
-            items,
-        }),
-        ParsedBtrfsTreeNodeParts::Internal(ptrs) => Ok(BtrfsParsedNode::Internal { ptrs }),
-    }
-}
-
-/// Verify and parse an owned btrfs tree block, retaining its allocation when
-/// the block is a leaf.
-///
-/// This is equivalent to [`parse_btrfs_tree_node`], but callers that already
-/// own their read buffer avoid copying the full leaf into cache storage.
-/// Internal nodes retain only their parsed key pointers and drop the buffer.
-///
-/// # Errors
-/// Returns the same [`ParseError`] as [`parse_btrfs_tree_node`] for the same
-/// bytes, checksum type, logical address, and node size.
-pub fn parse_btrfs_tree_node_owned(
-    block: Vec<u8>,
-    csum_type: u16,
-    logical: u64,
-    nodesize: u32,
-) -> Result<BtrfsParsedNode, ParseError> {
-    match parse_btrfs_tree_node_parts(&block, csum_type, logical, nodesize)? {
-        ParsedBtrfsTreeNodeParts::Leaf(items) => Ok(BtrfsParsedNode::Leaf {
-            block: Arc::new(block),
-            items,
-        }),
-        ParsedBtrfsTreeNodeParts::Internal(ptrs) => Ok(BtrfsParsedNode::Internal { ptrs }),
-    }
-}
-
-enum ParsedBtrfsTreeNodeParts {
-    Leaf(Vec<BtrfsItem>),
-    Internal(Vec<BtrfsKeyPtr>),
-}
-
-fn parse_btrfs_tree_node_parts(
-    block: &[u8],
-    csum_type: u16,
-    logical: u64,
-    nodesize: u32,
-) -> Result<ParsedBtrfsTreeNodeParts, ParseError> {
-    let ns = usize::try_from(nodesize)
-        .map_err(|_| ParseError::IntegerConversion { field: "nodesize" })?;
-    if block.len() != ns {
-        return Err(ParseError::InsufficientData {
-            needed: ns,
-            offset: 0,
-            actual: block.len(),
-        });
-    }
-    ffs_ondisk::verify_btrfs_tree_block_checksum(block, csum_type)?;
-    let header = BtrfsHeader::parse_from_block(block)?;
-    header.validate(block.len(), Some(logical))?;
-    if header.level == 0 {
-        let (_, items) = parse_leaf_items(block)?;
-        Ok(ParsedBtrfsTreeNodeParts::Leaf(items))
-    } else {
-        let (_, ptrs) = parse_internal_items(block)?;
-        Ok(ParsedBtrfsTreeNodeParts::Internal(ptrs))
-    }
-}
-
-/// Build the default node provider that reads a raw block via `read_physical`
-/// (after mapping logical→physical through `chunks`), verifies it, and parses
-/// it into a fresh `Arc<BtrfsParsedNode>` — i.e. the no-cache path. The
-/// `*_with_nodes` walkers take any such provider, so a caller with a parsed-node
-/// cache can substitute one that returns cached `Arc`s on a hit.
-fn byte_node_provider<'a>(
-    read_physical: &'a mut dyn FnMut(u64) -> Result<Vec<u8>, ParseError>,
-    chunks: &'a [BtrfsChunkEntry],
-    nodesize: u32,
-    csum_type: u16,
-) -> impl FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError> + 'a {
-    move |logical: u64| {
-        let mapping =
-            map_logical_to_physical(chunks, logical)?.ok_or(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "not covered by any chunk",
-            })?;
-        let block = read_physical(mapping.physical)?;
-        Ok(Arc::new(parse_btrfs_tree_node_owned(
-            block, csum_type, logical, nodesize,
-        )?))
-    }
-}
-
 /// `read_physical` reads `nodesize` bytes at the given physical byte offset.
 /// `chunks` provides the logical→physical address mapping.
 ///
@@ -2278,52 +1887,14 @@ pub fn walk_tree(
     nodesize: u32,
     csum_type: u16,
 ) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
-    let mut provider = byte_node_provider(read_physical, chunks, nodesize, csum_type);
-    walk_tree_with_nodes(&mut provider, root_logical, nodesize)
-}
-
-/// Full-tree walk driven by a [`BtrfsParsedNode`] provider.
-///
-/// Identical to [`walk_tree`] but obtains each node from `node_provider`
-/// (keyed by logical address) instead of reading+parsing raw bytes itself, so a
-/// caller holding a parsed-node cache reuses verified+parsed nodes across
-/// traversals.
-///
-/// # Errors
-/// Propagates any [`ParseError`] from the provider or from structural
-/// validation (cycles, misalignment, oversized items).
-pub fn walk_tree_with_nodes(
-    node_provider: &mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
-    root_logical: u64,
-    nodesize: u32,
-) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
     let mut walker = BtrfsTreeWalker {
-        node_provider,
+        read_physical,
+        chunks,
         nodesize,
+        csum_type,
         out: Vec::new(),
-        active_path: FxHashSet::default(),
-        visited_nodes: FxHashSet::default(),
-        range: None,
-    };
-    walker.walk_node(root_logical)?;
-    Ok(walker.out)
-}
-
-/// Full-tree zero-copy walk driven by a [`BtrfsParsedNode`] provider.
-///
-/// Returns one [`BtrfsLeafEntryBatch`] per visited leaf with item payloads stored
-/// as ranges into the shared verified leaf block.
-pub fn walk_tree_borrowed_with_nodes(
-    node_provider: &mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
-    root_logical: u64,
-    nodesize: u32,
-) -> Result<Vec<BtrfsLeafEntryBatch>, ParseError> {
-    let mut walker = BtrfsBorrowedTreeWalker {
-        node_provider,
-        nodesize,
-        out: Vec::new(),
-        active_path: FxHashSet::default(),
-        visited_nodes: FxHashSet::default(),
+        active_path: HashSet::new(),
+        visited_nodes: HashSet::new(),
         range: None,
     };
     walker.walk_node(root_logical)?;
@@ -2349,252 +1920,28 @@ pub fn walk_tree_range(
     lo: BtrfsKey,
     hi: BtrfsKey,
 ) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
-    let mut provider = byte_node_provider(read_physical, chunks, nodesize, csum_type);
-    walk_tree_range_with_nodes(&mut provider, root_logical, nodesize, lo, hi)
-}
-
-/// Range walk driven by a [`BtrfsParsedNode`] provider.
-///
-/// Identical to [`walk_tree_range`] but obtains each node from `node_provider`
-/// (keyed by logical address) instead of reading+parsing raw bytes itself, so a
-/// caller holding a parsed-node cache reuses verified+parsed nodes across the
-/// many range descents a single read/getattr/readdir performs.
-///
-/// # Errors
-/// Propagates any [`ParseError`] from the provider or from structural
-/// validation (cycles, misalignment, oversized items).
-pub fn walk_tree_range_with_nodes(
-    node_provider: &mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
-    root_logical: u64,
-    nodesize: u32,
-    lo: BtrfsKey,
-    hi: BtrfsKey,
-) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
     let mut walker = BtrfsTreeWalker {
-        node_provider,
+        read_physical,
+        chunks,
         nodesize,
+        csum_type,
         out: Vec::new(),
-        active_path: FxHashSet::default(),
-        visited_nodes: FxHashSet::default(),
+        active_path: HashSet::new(),
+        visited_nodes: HashSet::new(),
         range: Some((lo, hi)),
     };
     walker.walk_node(root_logical)?;
     Ok(walker.out)
-}
-
-/// Full-tree walk with a `Sync` parsed-node provider and parallel sibling
-/// prefetch.
-///
-/// Full-tree counterpart to [`walk_tree_range_parallel_with_nodes`]: visits
-/// every leaf in left-to-right DFS order while fetching the children of each
-/// internal node concurrently. Output order is identical to the serial
-/// [`walk_tree_with_nodes`] because subtrees are still finalized serially in
-/// key-pointer order; only the per-node child fetch overlaps.
-pub fn walk_tree_parallel_with_nodes(
-    node_provider: &(dyn Fn(u64) -> Result<Arc<BtrfsParsedNode>, ParseError> + Sync),
-    root_logical: u64,
-    nodesize: u32,
-) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
-    let mut walker = BtrfsParallelTreeWalker {
-        node_provider,
-        nodesize,
-        out: Vec::new(),
-        active_path: FxHashSet::default(),
-        visited_nodes: FxHashSet::default(),
-        range: None,
-    };
-    walker.walk_node(root_logical)?;
-    Ok(walker.out)
-}
-
-/// Range walk with a `Sync` parsed-node provider and parallel sibling prefetch.
-///
-/// This preserves [`walk_tree_range_with_nodes`] output order by still
-/// finalizing child subtrees serially in key-pointer order. The only parallel
-/// work is fetching already-selected child nodes for one internal node after
-/// the serial range-pruning pass has determined that their spans overlap
-/// `[lo, hi)`.
-pub fn walk_tree_range_parallel_with_nodes(
-    node_provider: &(dyn Fn(u64) -> Result<Arc<BtrfsParsedNode>, ParseError> + Sync),
-    root_logical: u64,
-    nodesize: u32,
-    lo: BtrfsKey,
-    hi: BtrfsKey,
-) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
-    let mut walker = BtrfsParallelTreeWalker {
-        node_provider,
-        nodesize,
-        out: Vec::new(),
-        active_path: FxHashSet::default(),
-        visited_nodes: FxHashSet::default(),
-        range: Some((lo, hi)),
-    };
-    walker.walk_node(root_logical)?;
-    Ok(walker.out)
-}
-
-/// Range zero-copy walk driven by a [`BtrfsParsedNode`] provider.
-///
-/// Identical to [`walk_tree_range_with_nodes`] except payload bytes stay in the
-/// shared leaf block and are exposed through per-item ranges.
-pub fn walk_tree_range_borrowed_with_nodes(
-    node_provider: &mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
-    root_logical: u64,
-    nodesize: u32,
-    lo: BtrfsKey,
-    hi: BtrfsKey,
-) -> Result<Vec<BtrfsLeafEntryBatch>, ParseError> {
-    let mut walker = BtrfsBorrowedTreeWalker {
-        node_provider,
-        nodesize,
-        out: Vec::new(),
-        active_path: FxHashSet::default(),
-        visited_nodes: FxHashSet::default(),
-        range: Some((lo, hi)),
-    };
-    walker.walk_node(root_logical)?;
-    Ok(walker.out)
-}
-
-/// Predecessor-or-equal descent over an on-disk btrfs B-tree.
-///
-/// Returns the single leaf entry whose key is the largest `<= target`, reading
-/// only the O(log N) nodes on the path to it, or `None` when every key in the
-/// tree is greater than `target`.
-///
-/// The on-disk dual of [`InMemoryCowBtrfsTree::floor_key`]. A btrfs internal
-/// node's key-pointer key is the *minimum* key of its child subtree, so the
-/// floor lives in the rightmost child whose key-pointer key is `<= target` (that
-/// child's minimum is `<= target`, so it is guaranteed to hold a qualifying key
-/// — no left-sibling fallback is needed, unlike the separator-keyed in-memory
-/// tree). Lets a read seek straight to the extent covering a file offset instead
-/// of descending from the inode's first item (bd-kms5z).
-pub fn walk_tree_floor(
-    read_physical: &mut dyn FnMut(u64) -> Result<Vec<u8>, ParseError>,
-    chunks: &[BtrfsChunkEntry],
-    root_logical: u64,
-    nodesize: u32,
-    csum_type: u16,
-    target: BtrfsKey,
-) -> Result<Option<BtrfsLeafEntry>, ParseError> {
-    let mut provider = byte_node_provider(read_physical, chunks, nodesize, csum_type);
-    walk_tree_floor_with_nodes(&mut provider, root_logical, nodesize, target)
-}
-
-/// Predecessor-or-equal descent driven by a [`BtrfsParsedNode`] provider.
-///
-/// Identical to [`walk_tree_floor`] but obtains each node from `node_provider`
-/// (keyed by logical address) instead of reading+parsing raw bytes itself, so a
-/// caller holding a parsed-node cache reuses verified+parsed nodes.
-///
-/// # Errors
-/// Propagates any [`ParseError`] from the provider or from structural
-/// validation (cycles, misalignment, oversized items).
-pub fn walk_tree_floor_with_nodes(
-    node_provider: &mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
-    root_logical: u64,
-    nodesize: u32,
-    target: BtrfsKey,
-) -> Result<Option<BtrfsLeafEntry>, ParseError> {
-    floor_descend(node_provider, root_logical, nodesize, &target, 0)
-}
-
-fn floor_descend(
-    node_provider: &mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
-    logical: u64,
-    nodesize: u32,
-    target: &BtrfsKey,
-    depth: u16,
-) -> Result<Option<BtrfsLeafEntry>, ParseError> {
-    // A floor descent follows ONE child per level (root -> leaf), so a node can be
-    // revisited only through a cycle in the tree pointers. A depth bound catches
-    // that with zero allocation — the prior per-descent `visited` HashSet (alloc +
-    // insert/level) was pure overhead on this single-path descent, and a read-only
-    // btrfs lookup runs it ~3× per op (dir item + parent/child inode). A valid
-    // btrfs tree is at most `BTRFS_MAX_TREE_LEVEL + 1` (8) nodes deep; anything
-    // deeper is corrupt (bd-cc-btrfs-point).
-    if depth > u16::from(BTRFS_MAX_TREE_LEVEL) + 1 {
-        return Err(ParseError::InvalidField {
-            field: "logical_address",
-            reason: "btrfs floor descent exceeded max tree depth (cycle in tree pointers)",
-        });
-    }
-    let nodesize_u64 = u64::from(nodesize);
-    if nodesize_u64 == 0 {
-        return Err(ParseError::InvalidField {
-            field: "nodesize",
-            reason: "zero nodesize",
-        });
-    }
-    if logical % nodesize_u64 != 0 {
-        return Err(ParseError::InvalidField {
-            field: "logical_address",
-            reason: "not aligned to nodesize",
-        });
-    }
-
-    let node = node_provider(logical)?;
-    match node.as_ref() {
-        BtrfsParsedNode::Leaf { block, items } => {
-            let block = block.as_ref();
-            // Leaf items are sorted ascending by key; the floor is the last item
-            // `<= target`. Binary-search to it instead of scanning the whole node
-            // (a 16 KiB leaf packs hundreds of items, and a floor descent visits
-            // one node per tree level on every read_file extent fetch — bd-hv6ww,
-            // the within-node dual of bd-6u6xb). O(items) -> O(log items).
-            let pp = items.partition_point(|item| key_cmp(&item.key, target) != Ordering::Greater);
-            if pp == 0 {
-                return Ok(None);
-            }
-            let item = &items[pp - 1];
-            let off =
-                usize::try_from(item.data_offset).map_err(|_| ParseError::IntegerConversion {
-                    field: "data_offset",
-                })?;
-            let sz = usize::try_from(item.data_size)
-                .map_err(|_| ParseError::IntegerConversion { field: "data_size" })?;
-            let end = off.checked_add(sz).ok_or(ParseError::InvalidField {
-                field: "data_offset",
-                reason: "overflow",
-            })?;
-            if end > block.len() {
-                return Err(ParseError::InvalidField {
-                    field: "data_offset",
-                    reason: "item data extends past block",
-                });
-            }
-            Ok(Some(BtrfsLeafEntry {
-                key: item.key,
-                data: block[off..end].to_vec(),
-            }))
-        }
-        BtrfsParsedNode::Internal { ptrs } => {
-            // Key-ptrs are sorted ascending by key (each key is the child
-            // subtree's minimum); the floor child is the rightmost whose key is
-            // `<= target`. Binary-search to it instead of scanning every ptr
-            // (bd-hv6ww). O(ptrs) -> O(log ptrs).
-            let pp = ptrs.partition_point(|kp| key_cmp(&kp.key, target) != Ordering::Greater);
-            if pp == 0 {
-                return Ok(None);
-            }
-            let blockptr = ptrs[pp - 1].blockptr;
-            if blockptr % nodesize_u64 != 0 {
-                return Err(ParseError::InvalidField {
-                    field: "blockptr",
-                    reason: "not aligned to nodesize",
-                });
-            }
-            floor_descend(node_provider, blockptr, nodesize, target, depth + 1)
-        }
-    }
 }
 
 struct BtrfsTreeWalker<'a> {
-    node_provider: &'a mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
+    read_physical: &'a mut dyn FnMut(u64) -> Result<Vec<u8>, ParseError>,
+    chunks: &'a [BtrfsChunkEntry],
     nodesize: u32,
+    csum_type: u16,
     out: Vec<BtrfsLeafEntry>,
-    active_path: FxHashSet<u64>,
-    visited_nodes: FxHashSet<u64>,
+    active_path: HashSet<u64>,
+    visited_nodes: HashSet<u64>,
     /// When `Some((lo, hi))`, prune internal-node children and leaf items
     /// outside the half-open key range `[lo, hi)`. `None` walks the whole tree.
     range: Option<(BtrfsKey, BtrfsKey)>,
@@ -2628,201 +1975,80 @@ impl BtrfsTreeWalker<'_> {
             });
         }
 
-        // The provider maps logical→physical, reads the block, verifies its
-        // checksum, and parses it — the per-node work a parsed-node cache can
-        // serve from a prior traversal (bd-u1n5f).
-        let node = (self.node_provider)(logical)?;
+        let mapping =
+            map_logical_to_physical(self.chunks, logical)?.ok_or(ParseError::InvalidField {
+                field: "logical_address",
+                reason: "not covered by any chunk",
+            })?;
 
-        match node.as_ref() {
-            BtrfsParsedNode::Leaf { block, items } => {
-                collect_leaf_items(block.as_ref(), items, &mut self.out, self.range.as_ref())?;
-            }
-            BtrfsParsedNode::Internal { ptrs } => {
-                for (idx, kp) in ptrs.iter().enumerate() {
-                    if kp.blockptr % nodesize_u64 != 0 {
-                        return Err(ParseError::InvalidField {
-                            field: "blockptr",
-                            reason: "not aligned to nodesize",
-                        });
-                    }
-                    // Targeted descent: child `idx` covers the key span
-                    // `[kp.key, next_key)` (the next sibling's key, or +inf for
-                    // the last child). Skip it when that span cannot overlap
-                    // [lo, hi).
-                    if let Some((lo, hi)) = self.range.as_ref() {
-                        // Span starts at or after `hi` -> no overlap (sorted).
-                        if key_cmp(&kp.key, hi) != Ordering::Less {
-                            // All later children start even higher; stop early.
-                            break;
-                        }
-                        // Span ends at or before `lo` -> no overlap. The span end
-                        // is the next sibling's key; the last child is unbounded.
-                        if let Some(next) = ptrs.get(idx + 1) {
-                            if key_cmp(&next.key, lo) != Ordering::Greater {
-                                continue;
-                            }
-                        }
-                    }
-                    self.walk_node(kp.blockptr)?;
+        let block = (self.read_physical)(mapping.physical)?;
+        let ns = usize::try_from(self.nodesize)
+            .map_err(|_| ParseError::IntegerConversion { field: "nodesize" })?;
+        if block.len() != ns {
+            return Err(ParseError::InsufficientData {
+                needed: ns,
+                offset: 0,
+                actual: block.len(),
+            });
+        }
+
+        // Verify checksum before parsing.
+        ffs_ondisk::verify_btrfs_tree_block_checksum(&block, self.csum_type)?;
+
+        let header = BtrfsHeader::parse_from_block(&block)?;
+        header.validate(block.len(), Some(logical))?;
+
+        if header.level == 0 {
+            collect_leaf_items(&block, &mut self.out, self.range.as_ref())?;
+        } else {
+            let (_, ptrs) = parse_internal_items(&block)?;
+            for (idx, kp) in ptrs.iter().enumerate() {
+                if kp.blockptr % nodesize_u64 != 0 {
+                    return Err(ParseError::InvalidField {
+                        field: "blockptr",
+                        reason: "not aligned to nodesize",
+                    });
                 }
+                // Targeted descent: child `idx` covers the key span
+                // `[kp.key, next_key)` (the next sibling's key, or +inf for the
+                // last child). Skip it when that span cannot overlap [lo, hi).
+                if let Some((lo, hi)) = self.range.as_ref() {
+                    // Span starts at or after `hi` -> no overlap (keys sorted).
+                    if key_cmp(&kp.key, hi) != Ordering::Less {
+                        // All later children start even higher; stop early.
+                        break;
+                    }
+                    // Span ends at or before `lo` -> no overlap. The span end is
+                    // the next sibling's key; the last child's span is unbounded.
+                    if let Some(next) = ptrs.get(idx + 1) {
+                        if key_cmp(&next.key, lo) != Ordering::Greater {
+                            continue;
+                        }
+                    }
+                }
+                self.walk_node(kp.blockptr)?;
             }
         }
 
         self.active_path.remove(&logical);
         Ok(())
-    }
-}
-
-struct BtrfsParallelTreeWalker<'a> {
-    node_provider: &'a (dyn Fn(u64) -> Result<Arc<BtrfsParsedNode>, ParseError> + Sync),
-    nodesize: u32,
-    out: Vec<BtrfsLeafEntry>,
-    active_path: FxHashSet<u64>,
-    visited_nodes: FxHashSet<u64>,
-    range: Option<(BtrfsKey, BtrfsKey)>,
-}
-
-impl BtrfsParallelTreeWalker<'_> {
-    fn enter_node(&mut self, logical: u64) -> Result<u64, ParseError> {
-        let nodesize_u64 = u64::from(self.nodesize);
-        if nodesize_u64 == 0 {
-            return Err(ParseError::InvalidField {
-                field: "nodesize",
-                reason: "zero nodesize",
-            });
-        }
-        if logical % nodesize_u64 != 0 {
-            return Err(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "not aligned to nodesize",
-            });
-        }
-        if !self.active_path.insert(logical) {
-            return Err(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "cycle detected in btrfs tree pointers",
-            });
-        }
-        if !self.visited_nodes.insert(logical) {
-            self.active_path.remove(&logical);
-            return Err(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "duplicate node reference in btrfs tree pointers",
-            });
-        }
-        Ok(nodesize_u64)
-    }
-
-    fn walk_node(&mut self, logical: u64) -> Result<(), ParseError> {
-        let nodesize_u64 = self.enter_node(logical)?;
-        let result =
-            (self.node_provider)(logical).and_then(|node| self.walk_node_body(&node, nodesize_u64));
-        self.active_path.remove(&logical);
-        result
-    }
-
-    fn walk_loaded_node(
-        &mut self,
-        logical: u64,
-        node: Result<Arc<BtrfsParsedNode>, ParseError>,
-    ) -> Result<(), ParseError> {
-        let nodesize_u64 = self.enter_node(logical)?;
-        let result = node.and_then(|node| self.walk_node_body(&node, nodesize_u64));
-        self.active_path.remove(&logical);
-        result
-    }
-
-    fn walk_node_body(
-        &mut self,
-        node: &Arc<BtrfsParsedNode>,
-        nodesize_u64: u64,
-    ) -> Result<(), ParseError> {
-        match node.as_ref() {
-            BtrfsParsedNode::Leaf { block, items } => {
-                collect_leaf_items(block.as_ref(), items, &mut self.out, self.range.as_ref())?;
-            }
-            BtrfsParsedNode::Internal { ptrs } => {
-                let mut children = Vec::new();
-                for (idx, kp) in ptrs.iter().enumerate() {
-                    if kp.blockptr % nodesize_u64 != 0 {
-                        return Err(ParseError::InvalidField {
-                            field: "blockptr",
-                            reason: "not aligned to nodesize",
-                        });
-                    }
-                    if let Some((lo, hi)) = self.range.as_ref() {
-                        if key_cmp(&kp.key, hi) != Ordering::Less {
-                            break;
-                        }
-                        if let Some(next) = ptrs.get(idx + 1) {
-                            if key_cmp(&next.key, lo) != Ordering::Greater {
-                                continue;
-                            }
-                        }
-                    }
-                    children.push(kp.blockptr);
-                }
-
-                let node_provider = self.node_provider;
-                // Fan-out gate (see BTRFS_PREFETCH_MIN_CHILDREN): only dispatch to
-                // the parallel prefetch pool when there are enough surviving
-                // children for the I/O-overlap to outweigh dispatch + worker-wakeup
-                // cost; otherwise fetch serially so narrow/point walks don't thrash
-                // the pool. Byte-identical: `into_par_iter` on a `Vec` + `collect`
-                // preserves index order, matching the serial `into_iter().map`.
-                let fetched: Vec<(u64, Result<Arc<BtrfsParsedNode>, ParseError>)> =
-                    if children.len() >= BTRFS_PREFETCH_MIN_CHILDREN {
-                        btrfs_range_prefetch_pool().install(|| {
-                            children
-                                .into_par_iter()
-                                .map(|logical| (logical, node_provider(logical)))
-                                .collect::<Vec<_>>()
-                        })
-                    } else {
-                        children
-                            .into_iter()
-                            .map(|logical| (logical, node_provider(logical)))
-                            .collect::<Vec<_>>()
-                    };
-                for (logical, node) in fetched {
-                    self.walk_loaded_node(logical, node)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// For a leaf whose `items` are sorted ascending by key, return the half-open
-/// index window `[start, end)` of items that fall in the key range `[lo, hi)`.
-///
-/// The kept items form a contiguous run because the leaf is sorted, so two
-/// `partition_point` probes (lower bound `>= lo`, upper bound `>= hi`) bracket
-/// them in O(log items) instead of scanning the whole leaf and filtering each
-/// item (bd-cp077). With no range the whole leaf `0..len` is the window. This
-/// runs once per leaf visited by a range walk (readdir/fiemap/listxattr), and a
-/// 16 KiB leaf packs hundreds of items.
-fn leaf_range_window(items: &[BtrfsItem], range: Option<&(BtrfsKey, BtrfsKey)>) -> (usize, usize) {
-    match range {
-        Some((lo, hi)) => {
-            let start = items.partition_point(|item| key_cmp(&item.key, lo) == Ordering::Less);
-            let end = items.partition_point(|item| key_cmp(&item.key, hi) == Ordering::Less);
-            // Guard against a degenerate lo > hi (keeps nothing, as the old
-            // per-item filter did) so the slice bounds stay valid.
-            (start, end.max(start))
-        }
-        None => (0, items.len()),
     }
 }
 
 fn collect_leaf_items(
     block: &[u8],
-    items: &[BtrfsItem],
     out: &mut Vec<BtrfsLeafEntry>,
     range: Option<&(BtrfsKey, BtrfsKey)>,
 ) -> Result<(), ParseError> {
-    let (start, end) = leaf_range_window(items, range);
-    for item in &items[start..end] {
+    let (_, items) = parse_leaf_items(block)?;
+    for item in &items {
+        if let Some((lo, hi)) = range {
+            // Keep only items in the half-open range [lo, hi).
+            if key_cmp(&item.key, lo) == Ordering::Less || key_cmp(&item.key, hi) != Ordering::Less
+            {
+                continue;
+            }
+        }
         let off = usize::try_from(item.data_offset).map_err(|_| ParseError::IntegerConversion {
             field: "data_offset",
         })?;
@@ -2841,116 +2067,6 @@ fn collect_leaf_items(
         out.push(BtrfsLeafEntry {
             key: item.key,
             data: block[off..end].to_vec(),
-        });
-    }
-    Ok(())
-}
-
-struct BtrfsBorrowedTreeWalker<'a> {
-    node_provider: &'a mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
-    nodesize: u32,
-    out: Vec<BtrfsLeafEntryBatch>,
-    active_path: FxHashSet<u64>,
-    visited_nodes: FxHashSet<u64>,
-    range: Option<(BtrfsKey, BtrfsKey)>,
-}
-
-impl BtrfsBorrowedTreeWalker<'_> {
-    fn walk_node(&mut self, logical: u64) -> Result<(), ParseError> {
-        let nodesize_u64 = u64::from(self.nodesize);
-        if nodesize_u64 == 0 {
-            return Err(ParseError::InvalidField {
-                field: "nodesize",
-                reason: "zero nodesize",
-            });
-        }
-        if logical % nodesize_u64 != 0 {
-            return Err(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "not aligned to nodesize",
-            });
-        }
-        if !self.active_path.insert(logical) {
-            return Err(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "cycle detected in btrfs tree pointers",
-            });
-        }
-        if !self.visited_nodes.insert(logical) {
-            return Err(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "duplicate node reference in btrfs tree pointers",
-            });
-        }
-
-        let node = (self.node_provider)(logical)?;
-
-        match node.as_ref() {
-            BtrfsParsedNode::Leaf { block, items } => {
-                collect_leaf_item_batch(block, items, &mut self.out, self.range.as_ref())?;
-            }
-            BtrfsParsedNode::Internal { ptrs } => {
-                for (idx, kp) in ptrs.iter().enumerate() {
-                    if kp.blockptr % nodesize_u64 != 0 {
-                        return Err(ParseError::InvalidField {
-                            field: "blockptr",
-                            reason: "not aligned to nodesize",
-                        });
-                    }
-                    if let Some((lo, hi)) = self.range.as_ref() {
-                        if key_cmp(&kp.key, hi) != Ordering::Less {
-                            break;
-                        }
-                        if let Some(next) = ptrs.get(idx + 1) {
-                            if key_cmp(&next.key, lo) != Ordering::Greater {
-                                continue;
-                            }
-                        }
-                    }
-                    self.walk_node(kp.blockptr)?;
-                }
-            }
-        }
-
-        self.active_path.remove(&logical);
-        Ok(())
-    }
-}
-
-fn collect_leaf_item_batch(
-    block: &Arc<Vec<u8>>,
-    items: &[BtrfsItem],
-    out: &mut Vec<BtrfsLeafEntryBatch>,
-    range: Option<&(BtrfsKey, BtrfsKey)>,
-) -> Result<(), ParseError> {
-    let mut entries = Vec::new();
-    let (start, win_end) = leaf_range_window(items, range);
-    for item in &items[start..win_end] {
-        let off = usize::try_from(item.data_offset).map_err(|_| ParseError::IntegerConversion {
-            field: "data_offset",
-        })?;
-        let sz = usize::try_from(item.data_size)
-            .map_err(|_| ParseError::IntegerConversion { field: "data_size" })?;
-        let end = off.checked_add(sz).ok_or(ParseError::InvalidField {
-            field: "data_offset",
-            reason: "overflow",
-        })?;
-        if end > block.len() {
-            return Err(ParseError::InvalidField {
-                field: "data_offset",
-                reason: "item data extends past block",
-            });
-        }
-        entries.push(BtrfsLeafItemRef {
-            key: item.key,
-            data_start: off,
-            data_end: end,
-        });
-    }
-    if !entries.is_empty() {
-        out.push(BtrfsLeafEntryBatch {
-            block: Arc::clone(block),
-            entries,
         });
     }
     Ok(())
@@ -2992,16 +2108,10 @@ impl std::fmt::Display for BtrfsMutationError {
 }
 
 /// Key/value payload stored in leaf nodes for the in-memory COW model.
-///
-/// `data` is an `Arc<[u8]>` (bd-btrcow) so cloning a `BtrfsCowNode` during a COW
-/// b-tree mutation shares each unchanged item's payload via a refcount bump
-/// instead of deep-copying every item's bytes — the dominant cost of btrfs
-/// metadata writes (node clone was ~40% of create, with the item-data copy the
-/// largest slice). A replaced item just swaps in a fresh `Arc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtrfsTreeItem {
     pub key: BtrfsKey,
-    pub data: Arc<[u8]>,
+    pub data: Vec<u8>,
 }
 
 /// In-memory btrfs B-tree node model used for mutation planning and testing.
@@ -3041,15 +2151,6 @@ pub const BTRFS_ITEM_SIZE: usize = 25;
 /// btrfs internal key-pointer size in bytes.
 pub const BTRFS_KEY_PTR_SIZE: usize = 33;
 
-/// Sentinel "largest possible" key, used only as the legacy fallback key for an
-/// internal node's last child when no per-child minimum key was supplied (see
-/// `child_min_keys`). Production writeback always supplies real minimums.
-const BTRFS_SENTINEL_MAX_KEY: BtrfsKey = BtrfsKey {
-    objectid: u64::MAX,
-    item_type: u8::MAX,
-    offset: u64::MAX,
-};
-
 /// Parameters for serializing a btrfs node to on-disk format.
 #[derive(Debug, Clone)]
 pub struct BtrfsNodeSerializeParams {
@@ -3085,16 +2186,6 @@ pub struct BtrfsNodeSerializeParams {
     /// `children[i]` value verbatim — that path is preserved for the
     /// simulator and standalone serializer tests.
     pub child_bytenrs: Vec<u64>,
-    /// Per-child subtree minimum key for internal nodes (indexed by child
-    /// position). btrfs requires key_ptr[i].key == the smallest key in child[i]'s
-    /// subtree; the in-memory CoW node only stores N-1 SEPARATOR keys (the
-    /// minimum of child[i+1]), so serialization must be told each child's own
-    /// minimum. When empty (default) serialization falls back to the legacy
-    /// separator-based keys — which mis-key every child by one and fabricate a
-    /// MAX_KEY for the last child, so `btrfs check` rejects any multi-leaf tree
-    /// ("Wrong key of child node/leaf"); production writeback now supplies this
-    /// (bd-6uyto). Preserved-empty for the simulator/standalone serializer tests.
-    pub child_min_keys: Vec<BtrfsKey>,
 }
 
 impl BtrfsCowNode {
@@ -3202,24 +2293,18 @@ impl BtrfsCowNode {
                         return Err(BtrfsMutationError::InvalidConfig("node overflow: key-ptrs"));
                     }
 
-                    // key (17 bytes): btrfs requires key_ptr[i].key to be the
-                    // SMALLEST key in child[i]'s subtree. Production writeback
-                    // supplies that per-child minimum in `child_min_keys`
-                    // (bd-6uyto). Fall back to the legacy separator mapping only
-                    // when no minimums were provided (simulator / serializer
-                    // tests) — note that fallback is only correct for a
-                    // single-leaf-per-child shape and is rejected by btrfs check
-                    // for real multi-leaf trees.
-                    let key = params.child_min_keys.get(i).map_or_else(
-                        || {
-                            if i < keys.len() {
-                                &keys[i]
-                            } else {
-                                &BTRFS_SENTINEL_MAX_KEY
-                            }
-                        },
-                        |min_key| min_key,
-                    );
+                    // key (17 bytes): use keys[i] if i < keys.len(), else use a max key
+                    let key = if i < keys.len() {
+                        &keys[i]
+                    } else {
+                        // Last child has no separator key in our model; use max key
+                        static MAX_KEY: BtrfsKey = BtrfsKey {
+                            objectid: u64::MAX,
+                            item_type: u8::MAX,
+                            offset: u64::MAX,
+                        };
+                        &MAX_KEY
+                    };
                     buf[kp_offset..kp_offset + 8].copy_from_slice(&key.objectid.to_le_bytes());
                     buf[kp_offset + 8] = key.item_type;
                     buf[kp_offset + 9..kp_offset + 17].copy_from_slice(&key.offset.to_le_bytes());
@@ -3322,7 +2407,7 @@ pub trait BtrfsBTree {
     ) -> Result<Vec<(BtrfsKey, Vec<u8>)>, BtrfsMutationError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InsertResult {
     node_id: u64,
     split: Option<(BtrfsKey, u64)>,
@@ -3340,28 +2425,12 @@ struct DeleteResult {
 pub struct InMemoryCowBtrfsTree {
     max_items: usize,
     min_items: usize,
-    /// Maximum serialized bytes a leaf may hold (`nodesize - BTRFS_HEADER_SIZE`).
-    /// A leaf is split when EITHER its item count exceeds `max_items` OR its
-    /// serialized size (sum of `BTRFS_ITEM_SIZE + data.len()` per item) exceeds
-    /// this budget — because real items vary in size (INODE_ITEM ~160 B, inline
-    /// EXTENT_DATA up to a sector), so the count cap alone lets a leaf overflow
-    /// `nodesize` on serialization (bd-6uyto). Defaults to `usize::MAX` (count
-    /// cap only) for callers that don't set a nodesize-derived budget.
-    leaf_byte_budget: usize,
     root: u64,
     allocator: Box<dyn BtrfsAllocator>,
     deferred_frees: Vec<u64>,
     staged_allocations: Vec<u64>,
     staged_deferred_frees: Vec<u64>,
-    /// Block ids retired by the PREVIOUS committed batch, retained for exactly
-    /// one generation so the immediately-previous version stays readable via
-    /// `node_snapshot(old_root)` (the COW snapshot contract — see
-    /// `cow_insert_preserves_previous_root_node`). Evicted from `nodes` at the
-    /// next commit, when they become two generations back and unreachable from
-    /// `root`. Bounds `nodes` to ~2x the live tree instead of leaking every
-    /// superseded version for the life of the tree (bd-btrcow-evict).
-    prev_committed_retired: Vec<u64>,
-    nodes: FxHashMap<u64, BtrfsCowNode>,
+    nodes: BTreeMap<u64, BtrfsCowNode>,
 }
 
 impl InMemoryCowBtrfsTree {
@@ -3381,46 +2450,18 @@ impl InMemoryCowBtrfsTree {
             return Err(BtrfsMutationError::InvalidConfig("max_items must be >= 3"));
         }
         let root = 1_u64;
-        let mut nodes = FxHashMap::default();
+        let mut nodes = BTreeMap::new();
         nodes.insert(root, BtrfsCowNode::Leaf { items: Vec::new() });
         Ok(Self {
             max_items,
             min_items: max_items / 2,
-            leaf_byte_budget: usize::MAX,
             root,
             allocator,
             deferred_frees: Vec::new(),
             staged_allocations: Vec::new(),
             staged_deferred_frees: Vec::new(),
-            prev_committed_retired: Vec::new(),
             nodes,
         })
-    }
-
-    /// Set the per-leaf serialized-byte budget (`nodesize - BTRFS_HEADER_SIZE`)
-    /// so leaves split before they overflow an on-disk node (bd-6uyto). Builder
-    /// style; the tree must be empty (call right after construction).
-    #[must_use]
-    pub fn with_leaf_byte_budget(mut self, budget: usize) -> Self {
-        self.leaf_byte_budget = budget.max(1);
-        self
-    }
-
-    /// Smallest key in the subtree rooted at `block` — the first key of its
-    /// leftmost leaf. Used by writeback to stamp each internal-node key-pointer
-    /// with the child's true minimum (btrfs requires key_ptr[i].key == min of
-    /// child[i]), not the CoW separator (bd-6uyto). `None` for an empty tree.
-    pub fn subtree_min_key(&self, block: u64) -> Result<Option<BtrfsKey>, BtrfsMutationError> {
-        let mut current = block;
-        loop {
-            match self.node_snapshot(current)? {
-                BtrfsCowNode::Leaf { items } => return Ok(items.first().map(|item| item.key)),
-                BtrfsCowNode::Internal { children, .. } => match children.first() {
-                    Some(&first) => current = first,
-                    None => return Ok(None),
-                },
-            }
-        }
     }
 
     /// Current root block identifier.
@@ -3450,10 +2491,14 @@ impl InMemoryCowBtrfsTree {
 
     fn search(&self, node_id: u64, key: &BtrfsKey) -> Result<Vec<u8>, BtrfsMutationError> {
         match self.node_ref(node_id)? {
-            BtrfsCowNode::Leaf { items } => items
-                .binary_search_by(|item| key_cmp(&item.key, key))
-                .map(|idx| items[idx].data.to_vec())
-                .map_err(|_| BtrfsMutationError::KeyNotFound),
+            BtrfsCowNode::Leaf { items } => {
+                for item in items {
+                    if key_cmp(&item.key, key) == Ordering::Equal {
+                        return Ok(item.data.clone());
+                    }
+                }
+                Err(BtrfsMutationError::KeyNotFound)
+            }
             BtrfsCowNode::Internal { keys, children } => {
                 let idx = keys.partition_point(|k| key_cmp(k, key) != Ordering::Greater);
                 self.search(children[idx], key)
@@ -3511,28 +2556,6 @@ impl InMemoryCowBtrfsTree {
     }
 
     fn commit_retired_nodes(&mut self) {
-        // Two-generation eviction (bd-btrcow-evict). Without this, every COW that
-        // retires a node leaves the superseded version in `nodes` forever (the
-        // monotonic allocator never reissues a block id), so `nodes` grows with
-        // the operation count — an unbounded memory leak that decays mutation
-        // throughput via FxHashMap cache misses and pays a giant one-shot drop
-        // when the tree is finally released (measured ~9% of btrfs rename).
-        //
-        // We cannot evict a node the instant it is retired: the COW snapshot
-        // contract requires the immediately-previous version to stay readable via
-        // `node_snapshot(old_root)` (see `cow_insert_preserves_previous_root_node`;
-        // production only ever reads the current `root`, MVCC versioning lives in
-        // `MvccStore`, so one generation back is the whole requirement). So this
-        // batch's retired nodes are parked in `prev_committed_retired` and only
-        // evicted at the NEXT commit, when they are two generations back and
-        // unreachable from `root`. The rollback path keeps retired nodes (it
-        // clears `staged_deferred_frees` via `discard_retired_nodes` WITHOUT
-        // removing them), so eviction is correct only here, post-commit.
-        for block in self.prev_committed_retired.drain(..) {
-            self.nodes.remove(&block);
-        }
-        self.prev_committed_retired
-            .extend_from_slice(&self.staged_deferred_frees);
         for block in self.staged_deferred_frees.drain(..) {
             self.allocator.defer_free(block);
             self.deferred_frees.push(block);
@@ -3561,12 +2584,9 @@ impl InMemoryCowBtrfsTree {
     }
 
     fn child_slot(keys: &[BtrfsKey], key: &BtrfsKey) -> usize {
-        // Separators are sorted ascending, so `key < sep` is false-then-true: the
-        // old `position(key < sep).unwrap_or(len)` is the first index where it
-        // flips true. That equals the count of separators with `key >= sep`
-        // (`!= Less`), a true-then-false predicate — i.e. partition_point, which
-        // is O(log N) over the up-to-~max_items keys instead of O(N) (bd-4p0ie).
-        keys.partition_point(|sep| key_cmp(key, sep) != Ordering::Less)
+        keys.iter()
+            .position(|sep| key_cmp(key, sep) == Ordering::Less)
+            .unwrap_or(keys.len())
     }
 
     fn insert_entry(
@@ -3622,791 +2642,16 @@ impl InMemoryCowBtrfsTree {
         Ok(self.root)
     }
 
-    /// Insert many entries in ONE COW transaction (bd-cowbatch). Entries whose
-    /// target leaf was already cloned earlier in THIS batch — so the leaf is
-    /// private to the in-flight mutation (in `staged_allocations`) — and that do
-    /// not split it are applied IN PLACE: a read-only descent plus one
-    /// `Vec::insert`, with NO extra node clone / alloc / retire. Entries that hit
-    /// a not-yet-staged leaf, or that would split their leaf, fall back to the
-    /// proven single-entry clone path. This collapses the per-entry root->leaf
-    /// path re-clone that makes a multi-insert (e.g. btrfs create's 4 items)
-    /// `BtrfsCowNode::clone`-bound. The resulting tree is byte-identical to
-    /// inserting the entries one-by-one with [`Self::insert_entry`] (proven by
-    /// `insert_many_matches_sequential*`), so it is a drop-in for any
-    /// insert-then-insert sequence on the same tree.
-    ///
-    /// # Errors
-    /// Returns the same COW-tree errors as the equivalent `insert_entry`
-    /// sequence; on any error the whole batch is rolled back.
-    pub fn insert_many(
-        &mut self,
-        entries: Vec<BtrfsTreeItem>,
-        allow_replace: bool,
-    ) -> Result<u64, BtrfsMutationError> {
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
-        for entry in entries {
-            let inserted_inplace = match self.try_insert_inplace(self.root, &entry, allow_replace) {
-                Ok(inserted_inplace) => inserted_inplace,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            };
-            if inserted_inplace {
-                continue;
-            }
-            let old_root = self.root;
-            let result = match self.insert_into(self.root, entry, allow_replace) {
-                Ok(r) => r,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            };
-            match self.root_from_insert_result(old_root, result) {
-                Ok(root) => self.root = root,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            }
-        }
-        self.commit_allocated_nodes();
-        self.commit_retired_nodes();
-        Ok(self.root)
-    }
-
-    /// Read-only descent to the leaf that would hold `entry.key`; if that leaf is
-    /// private to the current batch (`staged_allocations`) and the insert neither
-    /// collides (unless `allow_replace`) nor overflows it, apply it in place and
-    /// return `Ok(true)`. Returns `Ok(false)` when the caller must use the clone
-    /// path (leaf not staged this batch, or the insert would split it), so the
-    /// rare split case takes the proven path; returns `Err` on a hard collision.
-    fn try_insert_inplace(
-        &mut self,
-        root: u64,
-        entry: &BtrfsTreeItem,
-        allow_replace: bool,
-    ) -> Result<bool, BtrfsMutationError> {
-        // Descend read-only to the target leaf, mirroring `child_slot` exactly so
-        // the leaf reached is identical to the clone path's. `root` is the current
-        // (in-batch) root — `insert_many` uses `self.root`; `insert_many_then_update`
-        // threads its own `current_root`.
-        let mut id = root;
-        loop {
-            match self.node_ref(id)? {
-                BtrfsCowNode::Leaf { .. } => break,
-                BtrfsCowNode::Internal { keys, children } => {
-                    let idx = Self::child_slot(keys, &entry.key);
-                    id = *children
-                        .get(idx)
-                        .ok_or(BtrfsMutationError::BrokenInvariant(
-                            "internal child index out of range",
-                        ))?;
-                }
-            }
-        }
-        // Only a node allocated in THIS batch is safe to mutate in place.
-        if !self.staged_allocations.contains(&id) {
-            return Ok(false);
-        }
-        let (idx, is_exact, would_split) = {
-            let BtrfsCowNode::Leaf { items } = self.node_ref(id)? else {
-                return Ok(false);
-            };
-            let idx = items.partition_point(|e| key_cmp(&e.key, &entry.key).is_lt());
-            let is_exact = items
-                .get(idx)
-                .is_some_and(|e| key_cmp(&e.key, &entry.key) == Ordering::Equal);
-            // Mirror `leaf_exceeds_capacity` for items + the new entry, without
-            // mutating: a replace (is_exact) never grows, so it never splits.
-            let new_len = items.len().saturating_add(1);
-            let would_split = if is_exact || new_len <= 1 {
-                false
-            } else if new_len > self.max_items {
-                true
-            } else if self.leaf_byte_budget == usize::MAX {
-                false
-            } else {
-                Self::leaf_serialized_bytes(items)
-                    .saturating_add(BTRFS_ITEM_SIZE + entry.data.len())
-                    > self.leaf_byte_budget
-            };
-            (idx, is_exact, would_split)
-        };
-        if is_exact && !allow_replace {
-            return Err(BtrfsMutationError::KeyAlreadyExists);
-        }
-        if would_split {
-            return Ok(false);
-        }
-        let BtrfsCowNode::Leaf { items } = self
-            .nodes
-            .get_mut(&id)
-            .ok_or(BtrfsMutationError::BrokenInvariant("staged leaf vanished"))?
-        else {
-            return Ok(false);
-        };
-        if is_exact {
-            items[idx].data = entry.data.clone();
-        } else {
-            items.insert(idx, entry.clone());
-        }
-        Ok(true)
-    }
-
-    /// Remove many keys in ONE COW transaction (bd-cowbatch, the delete analog of
-    /// [`Self::insert_many`]). A key whose target leaf was already cloned earlier in
-    /// THIS batch (private, in `staged_allocations`) and whose removal leaves the
-    /// leaf a valid node (root may empty; a non-root leaf must keep >= min_items) is
-    /// removed IN PLACE — a read-only descent plus one `Vec::remove`, with NO extra
-    /// node clone / alloc / retire and NO rebalance. A key in a not-yet-staged leaf,
-    /// a missing key, or a removal that would underflow (needs rebalance/merge)
-    /// falls back to the proven single-key `delete_from` path. The resulting tree is
-    /// byte-identical to deleting the keys one-by-one with [`BtrfsBTree::delete`].
-    ///
-    /// # Errors
-    /// Returns the same COW-tree errors as the equivalent `delete` sequence (incl.
-    /// `KeyNotFound` for an absent key); on any error the whole batch is rolled back.
-    pub fn remove_many(&mut self, keys: &[BtrfsKey]) -> Result<u64, BtrfsMutationError> {
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
-        for key in keys {
-            let removed_inplace = match self.try_remove_inplace(self.root, key) {
-                Ok(removed_inplace) => removed_inplace,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            };
-            if removed_inplace {
-                continue;
-            }
-            let deleted = match self.delete_from(self.root, key) {
-                Ok(d) => d,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            };
-            if !deleted.deleted {
-                self.rollback_mutation();
-                return Err(BtrfsMutationError::KeyNotFound);
-            }
-            self.root = match self.normalized_root_after_delete(deleted.node_id) {
-                Ok(root) => root,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            }
-        }
-        self.commit_allocated_nodes();
-        self.commit_retired_nodes();
-        Ok(self.root)
-    }
-
-    /// Read-only descent to the leaf for `key`; if that leaf is private to the
-    /// current batch (`staged_allocations`), contains `key`, and removing it keeps
-    /// the leaf valid (the root may go empty; a non-root leaf must stay >=
-    /// min_items), remove it in place and return `Ok(true)`. Returns `Ok(false)`
-    /// when the caller must use `delete_from` (leaf not staged this batch, key
-    /// absent, or the removal would underflow and need rebalance/merge).
-    fn try_remove_inplace(
-        &mut self,
-        root: u64,
-        key: &BtrfsKey,
-    ) -> Result<bool, BtrfsMutationError> {
-        let mut id = root;
-        let mut leaf_is_root = true;
-        loop {
-            match self.node_ref(id)? {
-                BtrfsCowNode::Leaf { .. } => break,
-                BtrfsCowNode::Internal { keys, children } => {
-                    leaf_is_root = false;
-                    let idx = Self::child_slot(keys, key);
-                    id = *children
-                        .get(idx)
-                        .ok_or(BtrfsMutationError::BrokenInvariant(
-                            "internal child index out of range",
-                        ))?;
-                }
-            }
-        }
-        if !self.staged_allocations.contains(&id) {
-            return Ok(false);
-        }
-        let (idx, found, len) = {
-            let BtrfsCowNode::Leaf { items } = self.node_ref(id)? else {
-                return Ok(false);
-            };
-            let idx = items.partition_point(|e| key_cmp(&e.key, key).is_lt());
-            let found = items
-                .get(idx)
-                .is_some_and(|e| key_cmp(&e.key, key) == Ordering::Equal);
-            (idx, found, items.len())
-        };
-        if !found {
-            return Ok(false);
-        }
-        // Removing the leaf's FIRST (minimum) item changes its minimum key, which a
-        // non-root parent holds as this leaf's separator; repairing that separator
-        // up the path is the clone path's job, so defer first-item removals.
-        if idx == 0 && !leaf_is_root {
-            return Ok(false);
-        }
-        // Removing would underflow a non-root leaf -> needs rebalance/merge, which
-        // the in-place fast path does not do: defer to the proven clone path.
-        if !leaf_is_root && len.saturating_sub(1) < self.min_items {
-            return Ok(false);
-        }
-        let BtrfsCowNode::Leaf { items } = self
-            .nodes
-            .get_mut(&id)
-            .ok_or(BtrfsMutationError::BrokenInvariant("staged leaf vanished"))?
-        else {
-            return Ok(false);
-        };
-        items.remove(idx);
-        Ok(true)
-    }
-
-    /// Insert `item` at `key`, or replace the existing exact-key item.
-    ///
-    /// This preserves the existing sorted-key COW mutation semantics while
-    /// avoiding caller-side speculative update followed by insert fallback.
-    ///
-    /// # Errors
-    /// Returns the same COW-tree structural errors as [`Self::insert`].
-    pub fn upsert(&mut self, key: BtrfsKey, item: &[u8]) -> Result<u64, BtrfsMutationError> {
-        self.insert_entry(
-            BtrfsTreeItem {
-                key,
-                data: item.into(),
-            },
-            true,
-        )
-    }
-
-    /// Insert `insert_item` at `insert_key`, then update `update_key` to
-    /// `update_item` as one atomic COW mutation.
-    ///
-    /// This preserves the externally visible semantics of calling
-    /// [`BtrfsBTree::insert`] followed by [`BtrfsBTree::update`]: duplicate
-    /// insert keys still fail with [`BtrfsMutationError::KeyAlreadyExists`],
-    /// and missing update keys still fail with [`BtrfsMutationError::KeyNotFound`].
-    /// When both keys live in the root leaf and no split is needed, the leaf is
-    /// cloned and retired once instead of once per operation.
-    ///
-    /// # Errors
-    /// Returns any COW-tree mutation error produced by the equivalent
-    /// insert-then-update sequence.
-    pub fn insert_then_update(
-        &mut self,
-        insert_key: BtrfsKey,
-        insert_item: &[u8],
-        update_key: &BtrfsKey,
-        update_item: &[u8],
-    ) -> Result<u64, BtrfsMutationError> {
-        if key_cmp(&insert_key, update_key) == Ordering::Equal {
-            if self.find(&insert_key)?.is_some() {
-                return Err(BtrfsMutationError::KeyAlreadyExists);
-            }
-            return self.insert_entry(
-                BtrfsTreeItem {
-                    key: insert_key,
-                    data: update_item.into(),
-                },
-                false,
-            );
-        }
-
-        if let Some(root) =
-            self.try_insert_then_update_root_leaf(insert_key, insert_item, update_key, update_item)?
-        {
-            return Ok(root);
-        }
-
-        if self.find(update_key)?.is_none() {
-            return Err(BtrfsMutationError::KeyNotFound);
-        }
-
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
-        let old_root = self.root;
-        let insert_result = match self.insert_into(
-            self.root,
-            BtrfsTreeItem {
-                key: insert_key,
-                data: insert_item.into(),
-            },
-            false,
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                self.rollback_mutation();
-                return Err(err);
-            }
-        };
-        let after_insert_root = match self.root_from_insert_result(old_root, insert_result) {
-            Ok(root) => root,
-            Err(err) => {
-                self.rollback_mutation();
-                return Err(err);
-            }
-        };
-        let update_result = match self.insert_into(
-            after_insert_root,
-            BtrfsTreeItem {
-                key: *update_key,
-                data: update_item.into(),
-            },
-            true,
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                self.rollback_mutation();
-                return Err(err);
-            }
-        };
-        let new_root = match self.root_from_insert_result(after_insert_root, update_result) {
-            Ok(root) => root,
-            Err(err) => {
-                self.rollback_mutation();
-                return Err(err);
-            }
-        };
-        self.root = new_root;
-        self.commit_allocated_nodes();
-        self.commit_retired_nodes();
-        trace!(
-            old_root,
-            new_root = self.root,
-            "btrfs_cow_insert_then_update_complete"
-        );
-        Ok(self.root)
-    }
-
-    /// Insert several new items, then update one existing item as one atomic COW
-    /// mutation.
-    ///
-    /// This is the buffered-tree analogue of repeatedly calling
-    /// [`BtrfsBTree::insert`] followed by one final [`BtrfsBTree::update`], but
-    /// when the batch fits in the root leaf it clones and retires that leaf once.
-    /// The `update_key` must exist before the batch starts; every insert key must
-    /// be absent. If the root-leaf fast path does not apply, the fallback keeps
-    /// all allocations staged until every insert and the final update succeeds.
-    ///
-    /// # Errors
-    /// Returns the same key and structural errors as the equivalent sequential
-    /// insert/update sequence.
-    pub fn insert_many_then_update(
-        &mut self,
-        inserts: &[(BtrfsKey, &[u8])],
-        update_key: &BtrfsKey,
-        update_item: &[u8],
-    ) -> Result<u64, BtrfsMutationError> {
-        if inserts.is_empty() {
-            return <Self as BtrfsBTree>::update(self, update_key, update_item);
-        }
-
-        if let Some(root) =
-            self.try_insert_many_then_update_root_leaf(inserts, update_key, update_item)?
-        {
-            return Ok(root);
-        }
-
-        if self.find(update_key)?.is_none() {
-            return Err(BtrfsMutationError::KeyNotFound);
-        }
-
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
-        let old_root = self.root;
-        let mut current_root = old_root;
-        for &(key, item) in inserts {
-            let entry = BtrfsTreeItem {
-                key,
-                data: item.into(),
-            };
-            // bd-cowbatch: if this entry's target leaf was already cloned earlier
-            // in THIS batch and won't split, apply it in place (no path re-clone,
-            // current_root unchanged) — same in-place fast path as `insert_many`.
-            match self.try_insert_inplace(current_root, &entry, false) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            }
-            let result = match self.insert_into(current_root, entry, false) {
-                Ok(result) => result,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            };
-            current_root = match self.root_from_insert_result(current_root, result) {
-                Ok(root) => root,
-                Err(err) => {
-                    self.rollback_mutation();
-                    return Err(err);
-                }
-            };
-        }
-
-        let update_result = match self.insert_into(
-            current_root,
-            BtrfsTreeItem {
-                key: *update_key,
-                data: update_item.into(),
-            },
-            true,
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                self.rollback_mutation();
-                return Err(err);
-            }
-        };
-        let new_root = match self.root_from_insert_result(current_root, update_result) {
-            Ok(root) => root,
-            Err(err) => {
-                self.rollback_mutation();
-                return Err(err);
-            }
-        };
-        self.root = new_root;
-        self.commit_allocated_nodes();
-        self.commit_retired_nodes();
-        trace!(
-            old_root,
-            new_root = self.root,
-            inserts = inserts.len(),
-            "btrfs_cow_insert_many_then_update_complete"
-        );
-        Ok(self.root)
-    }
-
-    /// Remove several existing keys, insert several new items, then update one
-    /// existing item as one atomic COW mutation.
-    ///
-    /// This is the buffered-tree analogue of calling [`Self::remove_many`] and
-    /// then [`Self::insert_many_then_update`], but it keeps the cloned COW path
-    /// private across the whole delete/insert/update sequence. That matches the
-    /// btrfs same-directory rename shape: remove old DIR_ITEM/DIR_INDEX/INODE_REF,
-    /// insert new DIR_ITEM/DIR_INDEX/INODE_REF, then touch the parent INODE_ITEM.
-    ///
-    /// # Errors
-    /// Returns the same key and structural errors as the equivalent sequential
-    /// delete/insert/update sequence; on any error the whole batch is rolled back.
-    pub fn remove_many_then_insert_many_then_update(
-        &mut self,
-        removals: &[BtrfsKey],
-        inserts: &[(BtrfsKey, &[u8])],
-        update_key: &BtrfsKey,
-        update_item: &[u8],
-    ) -> Result<u64, BtrfsMutationError> {
-        if removals.is_empty() {
-            return self.insert_many_then_update(inserts, update_key, update_item);
-        }
-        if inserts.is_empty() {
-            self.remove_many(removals)?;
-            return <Self as BtrfsBTree>::update(self, update_key, update_item);
-        }
-
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
-        let old_root = self.root;
-        let mut current_root = old_root;
-
-        if let Err(err) = self.apply_staged_removals(&mut current_root, removals) {
-            self.rollback_mutation();
-            return Err(err);
-        }
-        if let Err(err) = self.apply_staged_inserts(&mut current_root, inserts) {
-            self.rollback_mutation();
-            return Err(err);
-        }
-        let new_root = match self.replace_existing_in_root(current_root, update_key, update_item) {
-            Ok(root) => root,
-            Err(err) => {
-                self.rollback_mutation();
-                return Err(err);
-            }
-        };
-        self.root = new_root;
-        self.commit_allocated_nodes();
-        self.commit_retired_nodes();
-        trace!(
-            old_root,
-            new_root = self.root,
-            removals = removals.len(),
-            inserts = inserts.len(),
-            "btrfs_cow_remove_many_then_insert_many_then_update_complete"
-        );
-        Ok(self.root)
-    }
-
-    fn apply_staged_removals(
-        &mut self,
-        current_root: &mut u64,
-        removals: &[BtrfsKey],
-    ) -> Result<(), BtrfsMutationError> {
-        for key in removals {
-            if self.try_remove_inplace(*current_root, key)? {
-                continue;
-            }
-            let deleted = self.delete_from(*current_root, key)?;
-            if !deleted.deleted {
-                return Err(BtrfsMutationError::KeyNotFound);
-            }
-            *current_root = self.normalized_root_after_delete(deleted.node_id)?;
-        }
-        Ok(())
-    }
-
-    fn apply_staged_inserts(
-        &mut self,
-        current_root: &mut u64,
-        inserts: &[(BtrfsKey, &[u8])],
-    ) -> Result<(), BtrfsMutationError> {
-        for &(key, item) in inserts {
-            let entry = BtrfsTreeItem {
-                key,
-                data: item.into(),
-            };
-            if self.try_insert_inplace(*current_root, &entry, false)? {
-                continue;
-            }
-            let result = self.insert_into(*current_root, entry, false)?;
-            *current_root = self.root_from_insert_result(*current_root, result)?;
-        }
-        Ok(())
-    }
-
-    fn replace_existing_in_root(
-        &mut self,
-        current_root: u64,
-        update_key: &BtrfsKey,
-        update_item: &[u8],
-    ) -> Result<u64, BtrfsMutationError> {
-        match self.find_in(current_root, update_key) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Err(BtrfsMutationError::KeyNotFound);
-            }
-            Err(err) => return Err(err),
-        }
-        let update_result = self.insert_into(
-            current_root,
-            BtrfsTreeItem {
-                key: *update_key,
-                data: update_item.into(),
-            },
-            true,
-        )?;
-        self.root_from_insert_result(current_root, update_result)
-    }
-
-    fn root_from_insert_result(
-        &mut self,
-        old_root: u64,
-        result: InsertResult,
-    ) -> Result<u64, BtrfsMutationError> {
-        if let Some((separator, right_id)) = result.split {
-            debug!(
-                old_root,
-                left_root = result.node_id,
-                right_root = right_id,
-                separator_objectid = separator.objectid,
-                separator_type = separator.item_type,
-                separator_offset = separator.offset,
-                "btrfs_cow_root_split"
-            );
-            self.alloc_node(BtrfsCowNode::Internal {
-                keys: vec![separator],
-                children: vec![result.node_id, right_id],
-            })
-        } else {
-            Ok(result.node_id)
-        }
-    }
-
-    fn leaf_serialized_bytes(items: &[BtrfsTreeItem]) -> usize {
-        items.iter().map(|it| BTRFS_ITEM_SIZE + it.data.len()).sum()
-    }
-
-    fn leaf_exceeds_capacity(&self, items: &[BtrfsTreeItem]) -> bool {
-        if items.len() <= 1 {
-            return false;
-        }
-        if items.len() > self.max_items {
-            return true;
-        }
-        if self.leaf_byte_budget == usize::MAX {
-            return false;
-        }
-        Self::leaf_serialized_bytes(items) > self.leaf_byte_budget
-    }
-
-    fn try_insert_then_update_root_leaf(
-        &mut self,
-        insert_key: BtrfsKey,
-        insert_item: &[u8],
-        update_key: &BtrfsKey,
-        update_item: &[u8],
-    ) -> Result<Option<u64>, BtrfsMutationError> {
-        let old_root = self.root;
-        let BtrfsCowNode::Leaf { mut items } = self.node_ref(old_root)?.clone() else {
-            return Ok(None);
-        };
-
-        let insert_idx =
-            items.partition_point(|existing| key_cmp(&existing.key, &insert_key).is_lt());
-        if let Some(existing) = items.get(insert_idx)
-            && key_cmp(&existing.key, &insert_key) == Ordering::Equal
-        {
-            return Err(BtrfsMutationError::KeyAlreadyExists);
-        }
-        items.insert(
-            insert_idx,
-            BtrfsTreeItem {
-                key: insert_key,
-                data: insert_item.into(),
-            },
-        );
-
-        let update_idx =
-            items.partition_point(|existing| key_cmp(&existing.key, update_key).is_lt());
-        let Some(existing) = items.get_mut(update_idx) else {
-            return Err(BtrfsMutationError::KeyNotFound);
-        };
-        if key_cmp(&existing.key, update_key) != Ordering::Equal {
-            return Err(BtrfsMutationError::KeyNotFound);
-        }
-        existing.data = update_item.into();
-
-        if self.leaf_exceeds_capacity(&items) {
-            return Ok(None);
-        }
-
-        let new_root = self.alloc_node(BtrfsCowNode::Leaf { items })?;
-        self.retire_node(old_root);
-        self.root = new_root;
-        self.commit_allocated_nodes();
-        self.commit_retired_nodes();
-        trace!(
-            old_root,
-            new_root = self.root,
-            "btrfs_cow_root_leaf_insert_then_update_complete"
-        );
-        Ok(Some(self.root))
-    }
-
-    fn try_insert_many_then_update_root_leaf(
-        &mut self,
-        inserts: &[(BtrfsKey, &[u8])],
-        update_key: &BtrfsKey,
-        update_item: &[u8],
-    ) -> Result<Option<u64>, BtrfsMutationError> {
-        let old_root = self.root;
-        let BtrfsCowNode::Leaf { items: old_items } = self.node_ref(old_root)? else {
-            return Ok(None);
-        };
-
-        let mut items = Vec::with_capacity(old_items.len().saturating_add(inserts.len()));
-        items.extend(old_items.iter().cloned());
-
-        let update_idx =
-            items.partition_point(|existing| key_cmp(&existing.key, update_key).is_lt());
-        if items
-            .get(update_idx)
-            .is_none_or(|existing| key_cmp(&existing.key, update_key) != Ordering::Equal)
-        {
-            return Err(BtrfsMutationError::KeyNotFound);
-        }
-
-        for &(key, data) in inserts {
-            let idx = items.partition_point(|existing| key_cmp(&existing.key, &key).is_lt());
-            if let Some(existing) = items.get(idx)
-                && key_cmp(&existing.key, &key) == Ordering::Equal
-            {
-                return Err(BtrfsMutationError::KeyAlreadyExists);
-            }
-            items.insert(
-                idx,
-                BtrfsTreeItem {
-                    key,
-                    data: data.into(),
-                },
-            );
-        }
-
-        let update_idx =
-            items.partition_point(|existing| key_cmp(&existing.key, update_key).is_lt());
-        let Some(existing) = items.get_mut(update_idx) else {
-            return Err(BtrfsMutationError::KeyNotFound);
-        };
-        if key_cmp(&existing.key, update_key) != Ordering::Equal {
-            return Err(BtrfsMutationError::KeyNotFound);
-        }
-        existing.data = update_item.into();
-
-        if self.leaf_exceeds_capacity(&items) {
-            return Ok(None);
-        }
-
-        let new_root = self.alloc_node(BtrfsCowNode::Leaf { items })?;
-        self.retire_node(old_root);
-        self.root = new_root;
-        self.commit_allocated_nodes();
-        self.commit_retired_nodes();
-        trace!(
-            old_root,
-            new_root = self.root,
-            inserts = inserts.len(),
-            "btrfs_cow_root_leaf_insert_many_then_update_complete"
-        );
-        Ok(Some(self.root))
-    }
-
     fn insert_into(
         &mut self,
         node_id: u64,
         entry: BtrfsTreeItem,
         allow_replace: bool,
     ) -> Result<InsertResult, BtrfsMutationError> {
-        // Build the modified node's vectors with ONE extra capacity slot
-        // (bd-btrcow2): the subsequent `insert` then shifts in place instead of
-        // reallocating-and-recopying the whole vector. A plain `.clone()` yields
-        // an EXACT-capacity vector, so the insert below forced a second full
-        // copy of every key/item on every COW insert (the `realloc`/`finish_grow`
-        // ~13% of btrfs create). `extend(iter().cloned())` does the same single
-        // payload clone the derived `Clone` did (Arc data is a refcount bump).
-        enum Prepared {
-            Leaf(Vec<BtrfsTreeItem>),
-            Internal(Vec<BtrfsKey>, Vec<u64>),
-        }
-        let prepared = match self.node_ref(node_id)? {
-            BtrfsCowNode::Leaf { items } => {
-                let mut v = Vec::with_capacity(items.len().saturating_add(1));
-                v.extend(items.iter().cloned());
-                Prepared::Leaf(v)
-            }
+        let node = self.node_ref(node_id)?.clone();
+        let result = match node {
+            BtrfsCowNode::Leaf { items } => self.insert_into_leaf(items, entry, allow_replace),
             BtrfsCowNode::Internal { keys, children } => {
-                let mut k = Vec::with_capacity(keys.len().saturating_add(1));
-                k.extend(keys.iter().copied());
-                let mut c = Vec::with_capacity(children.len().saturating_add(1));
-                c.extend(children.iter().copied());
-                Prepared::Internal(k, c)
-            }
-        };
-        let result = match prepared {
-            Prepared::Leaf(items) => self.insert_into_leaf(items, entry, allow_replace),
-            Prepared::Internal(keys, children) => {
                 self.insert_into_internal(keys, children, entry, allow_replace)
             }
         };
@@ -4444,12 +2689,7 @@ impl InMemoryCowBtrfsTree {
         }
 
         items.insert(idx, entry);
-        // Split when the leaf exceeds EITHER the item-count cap OR the serialized
-        // byte budget (bd-6uyto). The byte check is what keeps a leaf of larger
-        // items (INODE_ITEM, inline EXTENT_DATA, long DIR names) from overflowing
-        // the on-disk node even while under `max_items`. A single item always fits
-        // a node (btrfs caps item size), so a 1-item leaf is never split.
-        if !self.leaf_exceeds_capacity(&items) {
+        if items.len() <= self.max_items {
             let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
             return Ok(InsertResult {
                 node_id: new_id,
@@ -4457,23 +2697,8 @@ impl InMemoryCowBtrfsTree {
             });
         }
 
-        // Choose the split index by balancing serialized BYTES (not item count),
-        // so each half fits the node byte budget; this also lands near the count
-        // midpoint when items are uniform. Both halves stay non-empty.
-        let leaf_bytes = Self::leaf_serialized_bytes(&items);
-        let split_idx = {
-            let mut acc = 0usize;
-            let mut idx = items.len() / 2;
-            for (i, it) in items.iter().enumerate() {
-                acc += BTRFS_ITEM_SIZE + it.data.len();
-                if acc.saturating_mul(2) >= leaf_bytes {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            idx.clamp(1, items.len() - 1)
-        };
-        let right_items = items.split_off(split_idx);
+        let mid = items.len() / 2;
+        let right_items = items.split_off(mid);
         let separator =
             right_items
                 .first()
@@ -4749,34 +2974,23 @@ impl InMemoryCowBtrfsTree {
         }
     }
 
-    /// Rebalance the (possibly underflowing) child at `child_idx`, maintaining the
-    /// parent's `keys` (separators) IN PLACE so the caller never has to re-derive
-    /// them by descending to every child's leftmost leaf (~`max_items` `first_key`
-    /// descents — the dominant cost of mass deletion, bd-btrcow-sepkeep2). Each
-    /// structural op touches at most the separators immediately around `child_idx`:
-    /// a rotate refreshes one or two adjacent separators via a single `first_key`
-    /// each; a merge drops the one separator between the merged pair. Returns
-    /// `true` iff a rotate/merge happened; `false` (the common no-underflow case)
-    /// leaves `keys` untouched and lets the caller fix only `keys[child_idx - 1]`
-    /// (the deleted child's minimum may have shifted).
     fn rebalance_child(
         &mut self,
-        keys: &mut Vec<BtrfsKey>,
         children: &mut Vec<u64>,
         child_idx: usize,
-    ) -> Result<bool, BtrfsMutationError> {
+    ) -> Result<(), BtrfsMutationError> {
         if child_idx >= children.len() {
             return Err(BtrfsMutationError::BrokenInvariant(
                 "child index out of bounds",
             ));
         }
         if children.len() <= 1 {
-            return Ok(false);
+            return Ok(());
         }
 
         let child_keys = self.node_key_count(children[child_idx])?;
         if child_keys >= self.min_items {
-            return Ok(false);
+            return Ok(());
         }
 
         if child_idx > 0 {
@@ -4790,21 +3004,11 @@ impl InMemoryCowBtrfsTree {
                 children[child_idx] = new_child;
                 self.retire_node(old_left);
                 self.retire_node(old_child);
-                // The child borrowed the left sibling's largest item, which is
-                // smaller than everything the child held, so the child's new
-                // minimum IS that borrowed item; the left sibling lost only its
-                // last item, so its minimum (and thus keys[child_idx - 2]) is
-                // unchanged. Refresh just the separator between them.
-                keys[child_idx - 1] = self.first_key(children[child_idx])?.ok_or(
-                    BtrfsMutationError::BrokenInvariant(
-                        "internal separator child must contain a key",
-                    ),
-                )?;
                 debug!(
                     child_idx,
                     left_keys, child_keys, "btrfs_cow_delete_borrow_left"
                 );
-                return Ok(true);
+                return Ok(());
             }
         }
 
@@ -4819,28 +3023,11 @@ impl InMemoryCowBtrfsTree {
                 children[child_idx + 1] = new_right;
                 self.retire_node(old_child);
                 self.retire_node(old_right);
-                // The right sibling lost its first (smallest) item, so its new
-                // minimum is the separator between the child and the right —
-                // refresh keys[child_idx]. The child appended that item at its end
-                // (larger than all it held), so the child's minimum is set only by
-                // the earlier delete; refresh keys[child_idx - 1] too when it exists.
-                keys[child_idx] = self.first_key(children[child_idx + 1])?.ok_or(
-                    BtrfsMutationError::BrokenInvariant(
-                        "internal separator child must contain a key",
-                    ),
-                )?;
-                if child_idx > 0 {
-                    keys[child_idx - 1] = self.first_key(children[child_idx])?.ok_or(
-                        BtrfsMutationError::BrokenInvariant(
-                            "internal separator child must contain a key",
-                        ),
-                    )?;
-                }
                 debug!(
                     child_idx,
                     right_keys, child_keys, "btrfs_cow_delete_borrow_right"
                 );
-                return Ok(true);
+                return Ok(());
             }
         }
 
@@ -4850,9 +3037,6 @@ impl InMemoryCowBtrfsTree {
             let merged = self.merge_adjacent_nodes(children[child_idx - 1], children[child_idx])?;
             children[child_idx - 1] = merged;
             children.remove(child_idx);
-            // The merged node takes the left sibling's minimum (unchanged), so the
-            // only separator that moves is the one between the merged pair, now gone.
-            keys.remove(child_idx - 1);
             self.retire_node(old_left);
             self.retire_node(old_child);
             debug!(merged_child = child_idx - 1, "btrfs_cow_delete_merge_left");
@@ -4862,15 +3046,11 @@ impl InMemoryCowBtrfsTree {
             let merged = self.merge_adjacent_nodes(children[child_idx], children[child_idx + 1])?;
             children[child_idx] = merged;
             children.remove(child_idx + 1);
-            // child_idx == 0: the merged node is the new first child (no separator
-            // to its left in this node — its minimum propagates up via the parent),
-            // so only the separator between the merged pair is removed.
-            keys.remove(child_idx);
             self.retire_node(old_child);
             self.retire_node(old_right);
             debug!(merged_child = child_idx, "btrfs_cow_delete_merge_right");
         }
-        Ok(true)
+        Ok(())
     }
 
     fn delete_from(
@@ -4878,43 +3058,6 @@ impl InMemoryCowBtrfsTree {
         node_id: u64,
         key: &BtrfsKey,
     ) -> Result<DeleteResult, BtrfsMutationError> {
-        // Leaf fast path (bd-cc-btrcow-del): build the COW result with the target
-        // item SKIPPED, instead of a full-node `.clone()` (`BtrfsCowNode::clone`
-        // ~14.5% of btrfs unlink) followed by `Vec::remove`'s shift. Same N−1 item
-        // clones (Arc refcount, inherent), minus the removed item's clone and the
-        // post-`idx` element shift. Internal nodes keep the clone path below (they
-        // COW the whole keys+children on the delete descent).
-        if matches!(self.node_ref(node_id)?, BtrfsCowNode::Leaf { .. }) {
-            let new_items = {
-                let BtrfsCowNode::Leaf { items } = self.node_ref(node_id)? else {
-                    unreachable!("matches! confirmed Leaf");
-                };
-                let idx = items.partition_point(|existing| key_cmp(&existing.key, key).is_lt());
-                match items.get(idx) {
-                    Some(existing) if key_cmp(&existing.key, key) == Ordering::Equal => {
-                        let mut v = Vec::with_capacity(items.len().saturating_sub(1));
-                        v.extend(items[..idx].iter().cloned());
-                        v.extend(items[idx + 1..].iter().cloned());
-                        Some(v)
-                    }
-                    _ => None,
-                }
-            };
-            return match new_items {
-                Some(items) => {
-                    let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
-                    self.retire_node(node_id);
-                    Ok(DeleteResult {
-                        node_id: new_id,
-                        deleted: true,
-                    })
-                }
-                None => Ok(DeleteResult {
-                    node_id,
-                    deleted: false,
-                }),
-            };
-        }
         let node = self.node_ref(node_id)?.clone();
         match node {
             BtrfsCowNode::Leaf { mut items } => {
@@ -4939,10 +3082,7 @@ impl InMemoryCowBtrfsTree {
                     deleted: true,
                 })
             }
-            BtrfsCowNode::Internal {
-                mut keys,
-                mut children,
-            } => {
+            BtrfsCowNode::Internal { keys, mut children } => {
                 if children.len() != keys.len().saturating_add(1) {
                     return Err(BtrfsMutationError::BrokenInvariant(
                         "internal node child count mismatch",
@@ -4957,24 +3097,8 @@ impl InMemoryCowBtrfsTree {
                     });
                 }
                 children[idx] = child_result.node_id;
-                // `rebalance_child` maintains `keys` in place across any rotate/merge
-                // (bd-btrcow-sepkeep2). On the common no-underflow path it returns
-                // `false` and leaves `keys` untouched, so we refresh only the one
-                // separator left of the touched child, whose subtree minimum may have
-                // shifted if the deleted item was that subtree's smallest.
-                // `children[0]`'s minimum has no separator in THIS node (it
-                // propagates up via the parent), so `idx == 0` leaves `keys`
-                // untouched. Either way the full ~max_items separator recompute is
-                // gone.
-                let did_rebalance = self.rebalance_child(&mut keys, &mut children, idx)?;
-                if !did_rebalance && idx > 0 {
-                    keys[idx - 1] = self.first_key(children[idx])?.ok_or(
-                        BtrfsMutationError::BrokenInvariant(
-                            "internal separator child must contain a key",
-                        ),
-                    )?;
-                }
-                let new_id = self.alloc_node(BtrfsCowNode::Internal { keys, children })?;
+                self.rebalance_child(&mut children, idx)?;
+                let new_id = self.alloc_internal_node(children)?;
                 self.retire_node(node_id);
                 Ok(DeleteResult {
                     node_id: new_id,
@@ -5011,13 +3135,10 @@ impl InMemoryCowBtrfsTree {
 
     fn find_in(&self, node_id: u64, key: &BtrfsKey) -> Result<Option<Vec<u8>>, BtrfsMutationError> {
         match self.node_ref(node_id)? {
-            // Leaf items are sorted ascending by key with unique keys, so the
-            // exact-match lookup is a binary search instead of a linear scan over
-            // up-to-~max_items items (bd-4p0ie).
             BtrfsCowNode::Leaf { items } => Ok(items
-                .binary_search_by(|item| key_cmp(&item.key, key))
-                .ok()
-                .map(|idx| items[idx].data.to_vec())),
+                .iter()
+                .find(|item| key_cmp(&item.key, key) == Ordering::Equal)
+                .map(|item| item.data.clone())),
             BtrfsCowNode::Internal { keys, children } => {
                 if children.len() != keys.len().saturating_add(1) {
                     return Err(BtrfsMutationError::BrokenInvariant(
@@ -5160,7 +3281,7 @@ impl BtrfsBTree for InMemoryCowBtrfsTree {
         self.insert_entry(
             BtrfsTreeItem {
                 key,
-                data: item.into(),
+                data: item.to_vec(),
             },
             false,
         )
@@ -5209,7 +3330,7 @@ impl BtrfsBTree for InMemoryCowBtrfsTree {
         self.insert_entry(
             BtrfsTreeItem {
                 key: *key,
-                data: item.into(),
+                data: item.to_vec(),
             },
             true,
         )
@@ -5224,33 +3345,25 @@ impl BtrfsBTree for InMemoryCowBtrfsTree {
             return Err(BtrfsMutationError::InvalidRange);
         }
         let mut out = Vec::new();
-        self.for_each_in_range(self.root, start, end, &mut |item| {
-            out.push((item.key, item.data.to_vec()));
-        })?;
+        self.collect_range_from(self.root, start, end, &mut out)?;
         Ok(out)
     }
 }
 
 impl InMemoryCowBtrfsTree {
-    /// B-tree-aware range descent invoking `f` on every item whose key is in
-    /// `[start, end]`, in ascending key order. Only visits internal children
-    /// whose `[keys[i-1], keys[i])` span intersects `[start, end]`, and uses
-    /// `partition_point` on sorted leaves so the walk is O(log N + k) per call
-    /// instead of a full-tree materialisation followed by filter. bd-yt66z's
-    /// `btrfs_resolve_inode_path_via_cow` fast path depends on this for its
-    /// O(depth · log N) complexity. The items are borrowed from the tree nodes
-    /// (no allocation); both `range` (materialising) and `range_with`
-    /// (zero-copy) are thin wrappers so the traversal has a single definition.
-    fn for_each_in_range<F>(
+    /// B-tree-aware range descent. Only visits internal children whose
+    /// `[keys[i-1], keys[i])` span intersects `[start, end]`, and uses
+    /// `partition_point` on sorted leaves so the result is O(log N + k)
+    /// per call instead of a full-tree materialisation followed by
+    /// filter. bd-yt66z's `btrfs_resolve_inode_path_via_cow`
+    /// fast path depends on this for its O(depth · log N) complexity.
+    fn collect_range_from(
         &self,
         node_id: u64,
         start: &BtrfsKey,
         end: &BtrfsKey,
-        f: &mut F,
-    ) -> Result<(), BtrfsMutationError>
-    where
-        F: FnMut(&BtrfsTreeItem),
-    {
+        out: &mut Vec<(BtrfsKey, Vec<u8>)>,
+    ) -> Result<(), BtrfsMutationError> {
         match self.node_ref(node_id)? {
             BtrfsCowNode::Leaf { items } => {
                 let lo = items.partition_point(|item| key_cmp(&item.key, start).is_lt());
@@ -5258,7 +3371,7 @@ impl InMemoryCowBtrfsTree {
                     if key_cmp(&item.key, end).is_gt() {
                         break;
                     }
-                    f(item);
+                    out.push((item.key, item.data.clone()));
                 }
             }
             BtrfsCowNode::Internal { keys, children } => {
@@ -5276,80 +3389,11 @@ impl InMemoryCowBtrfsTree {
                     if i > 0 && key_cmp(&keys[i - 1], end).is_gt() {
                         break;
                     }
-                    self.for_each_in_range(*child, start, end, f)?;
+                    self.collect_range_from(*child, start, end, out)?;
                 }
             }
         }
         Ok(())
-    }
-
-    /// Zero-copy range scan: invoke `f(key, &data)` for every item in
-    /// `[start, end]` with the item's bytes borrowed directly from the tree
-    /// node — no per-item `Vec<u8>` allocation. Callers that parse-and-discard
-    /// (extent reads, fiemap, readdir) avoid the clone that [`Self::range`]
-    /// performs. Same traversal and order as `range`.
-    pub fn range_with<F>(
-        &self,
-        start: &BtrfsKey,
-        end: &BtrfsKey,
-        mut f: F,
-    ) -> Result<(), BtrfsMutationError>
-    where
-        F: FnMut(BtrfsKey, &[u8]),
-    {
-        if key_cmp(start, end) == Ordering::Greater {
-            return Err(BtrfsMutationError::InvalidRange);
-        }
-        self.for_each_in_range(self.root, start, end, &mut |item| f(item.key, &item.data))
-    }
-
-    /// The largest key in the tree that is `<= target` (predecessor-or-equal), or
-    /// `None` if every key is greater. O(log N) B-tree descent — the dual of
-    /// [`Self::collect_range_from`]. Lets a caller seek directly to the item
-    /// covering a position (e.g. the file extent covering a read offset) instead
-    /// of scanning from the start of an object's items.
-    pub fn floor_key(&self, target: &BtrfsKey) -> Result<Option<BtrfsKey>, BtrfsMutationError> {
-        self.floor_key_from(self.root, target)
-    }
-
-    fn floor_key_from(
-        &self,
-        node_id: u64,
-        target: &BtrfsKey,
-    ) -> Result<Option<BtrfsKey>, BtrfsMutationError> {
-        match self.node_ref(node_id)? {
-            BtrfsCowNode::Leaf { items } => {
-                // `partition_point` returns the count of keys <= target (the
-                // predicate holds for the sorted prefix); the floor is the last
-                // such key.
-                let le =
-                    items.partition_point(|item| key_cmp(&item.key, target) != Ordering::Greater);
-                Ok(if le == 0 {
-                    None
-                } else {
-                    Some(items[le - 1].key)
-                })
-            }
-            BtrfsCowNode::Internal { keys, children } => {
-                // children[i] holds keys in [keys[i-1], keys[i]); child 0's lower
-                // edge is -inf. The floor is in the rightmost child whose lower
-                // bound (keys[i-1]) is <= target — child index = count of separator
-                // keys <= target. If that child holds no key <= target (target sits
-                // in the gap below its first key), fall back to a left sibling,
-                // whose keys are all < keys[i-1] <= target, so its max is the floor.
-                let candidate = keys.partition_point(|k| key_cmp(k, target) != Ordering::Greater);
-                let mut i = candidate;
-                loop {
-                    if let Some(found) = self.floor_key_from(children[i], target)? {
-                        return Ok(Some(found));
-                    }
-                    if i == 0 {
-                        return Ok(None);
-                    }
-                    i -= 1;
-                }
-            }
-        }
     }
 }
 
@@ -5562,11 +3606,7 @@ impl DelayedRefQueue {
             return Ok(0);
         }
 
-        // `started` only feeds the `duration_us` field of the `debug!` below
-        // (target off by default) — capture the clock only when that record
-        // would be emitted, so the per-commit delayed-ref flush pays nothing.
-        let started = tracing::enabled!(target: "ffs::btrfs::alloc", tracing::Level::DEBUG)
-            .then(std::time::Instant::now);
+        let started = std::time::Instant::now();
         let mut flushed = 0usize;
         let mut selected = Vec::new();
         let extent_keys: Vec<ExtentKey> = self.refs.keys().copied().collect();
@@ -5646,7 +3686,7 @@ impl DelayedRefQueue {
             target: "ffs::btrfs::alloc",
             flushed,
             remaining = self.pending_count,
-            duration_us = started.map_or(0_u128, |s| s.elapsed().as_micros()),
+            duration_us = started.elapsed().as_micros(),
             "delayed_ref_flush_batch"
         );
 
@@ -5842,11 +3882,7 @@ impl BtrfsTransaction {
             return Err(BtrfsTransactionError::EmptyRootSet);
         }
 
-        // `commit_started` only feeds the `duration_us` field of the `info!`
-        // below (target off by default) — capture the clock only when enabled so
-        // the transaction-commit path pays nothing for the timing when unlogged.
-        let commit_started = tracing::enabled!(target: "ffs::btrfs::txn", tracing::Level::INFO)
-            .then(std::time::Instant::now);
+        let commit_started = std::time::Instant::now();
         let delayed_ref_total = self.delayed_refs.pending_count();
         let mut materialized_refcounts = BTreeMap::new();
         if delayed_ref_total > 0 {
@@ -5862,9 +3898,7 @@ impl BtrfsTransaction {
             .take()
             .ok_or(BtrfsTransactionError::AlreadyFinished)?;
         let commit_seq = store.commit(txn)?;
-        let duration_us = commit_started.map_or(0_u64, |s| {
-            u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX)
-        });
+        let duration_us = u64::try_from(commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         info!(
             target: "ffs::btrfs::txn",
             txn_id = self.txn_id.0,
@@ -6004,13 +4038,6 @@ pub struct BlockGroupFreeSpace {
     pub free_ranges: Vec<(u64, u64)>,
 }
 
-struct GroupAccountingFreeSpaceScan {
-    used: u64,
-    materialized_used: u64,
-    cursor: u64,
-    free_ranges: Vec<(u64, u64)>,
-}
-
 /// Build the on-disk `FREE_SPACE_TREE` items for the given per-block-group free
 /// space, in ascending btrfs key order.
 ///
@@ -6065,10 +4092,6 @@ struct BlockGroupState {
     item: BtrfsBlockGroupItem,
     /// Hint for next allocation search offset within this group.
     alloc_offset: u64,
-    /// True when a prior full gap scan proved that `[start + alloc_offset,
-    /// start + total_bytes)` contains no allocation items. While true,
-    /// sequential tail allocations can use the bump pointer directly.
-    tail_verified: bool,
     /// Lowest offset within the group that may be handed out. Captured at
     /// registration from the group's already-used bytes, this fences off the
     /// reserved prefix (superblock / system / root region that carries no
@@ -6150,29 +4173,26 @@ impl BtrfsExtentAllocator {
             item_type: u8::MAX,
             offset: u64::MAX,
         };
-        let mut to_remove = Vec::new();
-        self.extent_tree.range_with(&lo, &hi, |key, value| {
-            // Skinny METADATA_ITEM value: extent_item (24 bytes) followed by
-            // an inline ref { u8 type = TREE_BLOCK_REF (176), __le64 root }.
-            if key.item_type != BTRFS_ITEM_METADATA_ITEM || value.len() < 33 {
-                return;
-            }
-            if value[24] != BTRFS_ITEM_TREE_BLOCK_REF {
-                return;
-            }
-            let mut root_bytes = [0_u8; 8];
-            root_bytes.copy_from_slice(&value[25..33]);
-            let root = u64::from_le_bytes(root_bytes);
-            if roots.contains(&root) {
-                to_remove.push(key);
-            }
-        })?;
+        let to_remove: Vec<BtrfsKey> = self
+            .extent_tree
+            .range(&lo, &hi)?
+            .into_iter()
+            .filter_map(|(key, value)| {
+                // Skinny METADATA_ITEM value: extent_item (24 bytes) followed by
+                // an inline ref { u8 type = TREE_BLOCK_REF (176), __le64 root }.
+                if key.item_type != BTRFS_ITEM_METADATA_ITEM || value.len() < 33 {
+                    return None;
+                }
+                if value[24] != BTRFS_ITEM_TREE_BLOCK_REF {
+                    return None;
+                }
+                let root = u64::from_le_bytes(value[25..33].try_into().ok()?);
+                roots.contains(&root).then_some(key)
+            })
+            .collect();
         let removed = to_remove.len();
         for key in to_remove {
             self.extent_tree.delete(&key)?;
-        }
-        if removed > 0 {
-            self.invalidate_tail_cursors();
         }
         Ok(removed)
     }
@@ -6258,12 +4278,10 @@ impl BtrfsExtentAllocator {
         };
         // alloc_extent already inserted the bare item; rewrite it in place. Fall
         // back to insert for any caller that allocated with skip_extent_item.
-        self.extent_tree
-            .update(&key, &value)
-            .or_else(|err| match err {
-                BtrfsMutationError::KeyNotFound => self.extent_tree.insert(key, &value),
-                other => Err(other),
-            })?;
+        self.extent_tree.update(&key, &value).or_else(|err| match err {
+            BtrfsMutationError::KeyNotFound => self.extent_tree.insert(key, &value),
+            other => Err(other),
+        })?;
         Ok(())
     }
 
@@ -6394,11 +4412,9 @@ impl BtrfsExtentAllocator {
             ));
         }
         let refs = u64::from_le_bytes(value[0..8].try_into().expect("8 bytes"));
-        let new_refs = refs
-            .checked_sub(1)
-            .ok_or(BtrfsMutationError::BrokenInvariant(
-                "extent item refcount underflow",
-            ))?;
+        let new_refs = refs.checked_sub(1).ok_or(BtrfsMutationError::BrokenInvariant(
+            "extent item refcount underflow",
+        ))?;
 
         // Prefer the keyed EXTENT_DATA_REF (the add_data_extent_ref form).
         let ref_key = BtrfsKey {
@@ -6453,9 +4469,7 @@ impl BtrfsExtentAllocator {
                     ));
                 }
                 match BtrfsExtentDataRef::from_bytes(&value[payload_start..payload_end]) {
-                    Some(dr)
-                        if dr.root == root && dr.objectid == objectid && dr.offset == offset =>
-                    {
+                    Some(dr) if dr.root == root && dr.objectid == objectid && dr.offset == offset => {
                         value.drain(cursor..payload_end);
                         found = true;
                         break;
@@ -6570,16 +4584,9 @@ impl BtrfsExtentAllocator {
                 start,
                 item,
                 alloc_offset: item.used_bytes,
-                tail_verified: false,
                 min_usable_offset: item.used_bytes,
             },
         );
-    }
-
-    fn invalidate_tail_cursors(&mut self) {
-        for bg in self.block_groups.values_mut() {
-            bg.tail_verified = false;
-        }
     }
 
     /// Allocate a data extent of the given size.
@@ -6702,80 +4709,97 @@ impl BtrfsExtentAllocator {
             "alloc_search_start"
         );
 
-        let (bg_base, bg_total, alloc_offset, min_usable_offset, tail_verified) = {
-            let bg = &self.block_groups[&bg_start];
-            (
-                bg.start,
-                bg.item.total_bytes,
-                bg.alloc_offset,
-                bg.min_usable_offset,
-                bg.tail_verified,
-            )
-        };
-        let bg_end = bg_base
-            .checked_add(bg_total)
+        // Find a gap in this block group by scanning allocation items in range.
+        // We must include both EXTENT_ITEM (168) and METADATA_ITEM (169)
+        // as both represent physical space allocations.
+        let bg = &self.block_groups[&bg_start];
+        let bg_end = bg
+            .start
+            .checked_add(bg.item.total_bytes)
             .ok_or(BtrfsMutationError::AddressOverflow)?;
+
+        let range_start = BtrfsKey {
+            objectid: bg.start,
+            item_type: BTRFS_ITEM_EXTENT_ITEM, // 168
+            offset: 0,
+        };
+        let range_end = BtrfsKey {
+            objectid: bg_end,
+            item_type: BTRFS_ITEM_METADATA_ITEM, // 169
+            offset: u64::MAX,
+        };
+
+        let extents = self.extent_tree.range(&range_start, &range_end)?;
+
+        // Scan for gaps between existing extents.
+        let alloc_offset = self.block_groups[&bg_start].alloc_offset;
         // Lowest address this group may hand out: fences off the reserved prefix
         // (system/root region carrying no EXTENT_ITEM here). Both the forward and
         // wrap-around searches must respect it, or a fully-freed group rooted at
         // logical 0 would allocate bytenr 0 — the hole sentinel (bd-5aybu).
         let min_usable = bg_start
-            .checked_add(min_usable_offset)
+            .checked_add(self.block_groups[&bg_start].min_usable_offset)
             .ok_or(BtrfsMutationError::AddressOverflow)?;
-        let cursor = bg_start
+        let mut cursor = bg_start
             .checked_add(alloc_offset)
             .ok_or(BtrfsMutationError::AddressOverflow)?;
 
-        let direct_tail = tail_verified
-            && cursor >= min_usable
-            && cursor != 0
-            && cursor
-                .checked_add(num_bytes)
-                .is_some_and(|end| end <= bg_end);
-        let (found, tail_verified_after_alloc) = if direct_tail {
-            (Some(cursor), true)
-        } else {
-            // Find a gap in this block group by scanning allocation items in
-            // range. We must include both EXTENT_ITEM (168) and METADATA_ITEM
-            // (169) as both represent physical space allocations.
-            let range_start = BtrfsKey {
-                objectid: bg_base,
-                item_type: BTRFS_ITEM_EXTENT_ITEM, // 168
-                offset: 0,
-            };
-            let range_end = BtrfsKey {
-                objectid: bg_end,
-                item_type: BTRFS_ITEM_METADATA_ITEM, // 169
-                offset: u64::MAX,
-            };
-            let extents = self.extent_tree.range(&range_start, &range_end)?;
+        let allocated_ranges: Vec<(u64, u64)> = extents
+            .iter()
+            .filter_map(|(key, _)| allocation_extent_range(*key, self.nodesize))
+            .collect();
 
-            let allocated_ranges: Vec<(u64, u64)> = extents
-                .iter()
-                .filter_map(|(key, _)| allocation_extent_range(*key, self.nodesize))
-                .collect();
-
-            // Forward search from the bump-pointer offset; if that finds
-            // nothing and we started mid-group, wrap around to the
-            // reserved-prefix floor. Both searches binary-search past the no-op
-            // prefix below their start cursor (bd-8fbka).
-            let mut found = first_gap_at_or_after(&allocated_ranges, cursor, num_bytes, bg_end)?;
-            if found.is_none() && alloc_offset > 0 {
-                found = first_gap_at_or_after(&allocated_ranges, min_usable, num_bytes, bg_end)?;
+        let mut found = None;
+        // Try from alloc_offset first, then wrap around.
+        for &(ext_start, ext_size) in &allocated_ranges {
+            let ext_end = ext_start
+                .checked_add(ext_size)
+                .ok_or(BtrfsMutationError::AddressOverflow)?;
+            if cursor < ext_start {
+                let gap = ext_start - cursor;
+                if gap >= num_bytes {
+                    found = Some(cursor);
+                    break;
+                }
             }
-
-            let mut last_extent_end = min_usable;
+            if ext_end > cursor {
+                cursor = ext_end;
+            }
+        }
+        // Check gap after last extent.
+        if found.is_none() {
+            if let Some(end) = cursor.checked_add(num_bytes) {
+                if end <= bg_end {
+                    found = Some(cursor);
+                }
+            }
+        }
+        // Wrap around: try from the first usable offset if we started mid-group.
+        if found.is_none() && alloc_offset > 0 {
+            cursor = min_usable;
             for &(ext_start, ext_size) in &allocated_ranges {
                 let ext_end = ext_start
                     .checked_add(ext_size)
                     .ok_or(BtrfsMutationError::AddressOverflow)?;
-                if ext_end > last_extent_end {
-                    last_extent_end = ext_end;
+                if cursor < ext_start {
+                    let gap = ext_start - cursor;
+                    if gap >= num_bytes {
+                        found = Some(cursor);
+                        break;
+                    }
+                }
+                if ext_end > cursor {
+                    cursor = ext_end;
                 }
             }
-            let tail_verified = found.is_some_and(|bytenr| bytenr >= last_extent_end);
-            (found, tail_verified)
-        };
+            if found.is_none() {
+                if let Some(end) = cursor.checked_add(num_bytes) {
+                    if end <= bg_end {
+                        found = Some(cursor);
+                    }
+                }
+            }
+        }
 
         // bytenr 0 is the btrfs hole/none sentinel and must never back a real
         // extent; refuse it defensively rather than corrupt data (bd-5aybu).
@@ -6863,7 +4887,6 @@ impl BtrfsExtentAllocator {
             bg.alloc_offset = alloc_end
                 .checked_sub(bg_start)
                 .ok_or(BtrfsMutationError::AddressOverflow)?;
-            bg.tail_verified = tail_verified_after_alloc;
             trace!(
                 target: "ffs::btrfs::alloc",
                 block_group = bg_start,
@@ -6921,38 +4944,34 @@ impl BtrfsExtentAllocator {
         } else {
             BTRFS_ITEM_EXTENT_ITEM
         };
-        let lo = BtrfsKey {
-            objectid: bytenr,
-            item_type,
-            offset: if is_metadata { 0 } else { num_bytes },
-        };
-        let hi = BtrfsKey {
-            objectid: bytenr,
-            item_type,
-            offset: if is_metadata { u64::MAX } else { num_bytes },
-        };
-        let mut found = None;
-        self.extent_tree.range_with(&lo, &hi, |key, _| {
-            if found.is_none() {
-                found = Some(key);
+        if is_metadata {
+            let lo = BtrfsKey {
+                objectid: bytenr,
+                item_type,
+                offset: 0,
+            };
+            let hi = BtrfsKey {
+                objectid: bytenr,
+                item_type,
+                offset: u64::MAX,
+            };
+            self.extent_tree
+                .range(&lo, &hi)?
+                .into_iter()
+                .next()
+                .map(|(found_key, _)| found_key)
+                .ok_or(BtrfsMutationError::KeyNotFound)
+        } else {
+            let key = BtrfsKey {
+                objectid: bytenr,
+                item_type,
+                offset: num_bytes,
+            };
+            if self.extent_tree.range(&key, &key)?.is_empty() {
+                return Err(BtrfsMutationError::KeyNotFound);
             }
-        })?;
-        found.ok_or(BtrfsMutationError::KeyNotFound)
-    }
-
-    /// Benchmark-only access to the production extent-key location path.
-    ///
-    /// # Errors
-    /// Returns the same tree lookup or missing-key error as [`Self::free_extent`].
-    #[cfg(feature = "bench-instrumentation")]
-    #[doc(hidden)]
-    pub fn bench_locate_extent_key(
-        &self,
-        bytenr: u64,
-        num_bytes: u64,
-        is_metadata: bool,
-    ) -> Result<BtrfsKey, BtrfsMutationError> {
-        self.locate_extent_key(bytenr, num_bytes, is_metadata)
+            Ok(key)
+        }
     }
 
     pub fn free_extent(
@@ -7013,7 +5032,6 @@ impl BtrfsExtentAllocator {
             ))?;
         let used_before = bg.item.used_bytes;
         bg.item.used_bytes = used_after;
-        bg.tail_verified = false;
         trace!(
             target: "ffs::btrfs::alloc",
             block_group = bg.start,
@@ -7087,22 +5105,22 @@ impl BtrfsExtentAllocator {
                 item_type: BTRFS_ITEM_EXTENT_ITEM,
                 offset: u64::MAX,
             };
-            self.extent_tree
-                .range_with(&range_start, &range_end, |key, _| {
-                    if key.objectid < bg_end && key.item_type == BTRFS_ITEM_EXTENT_ITEM {
-                        let extent = ExtentKey {
-                            bytenr: key.objectid,
-                            num_bytes: key.offset,
-                        };
-                        if !referenced.contains(&extent) {
-                            orphaned.push(ExtentAllocation {
-                                bytenr: extent.bytenr,
-                                num_bytes: extent.num_bytes,
-                                block_group_start: bg.start,
-                            });
-                        }
-                    }
-                })?;
+            for (key, _) in self.extent_tree.range(&range_start, &range_end)? {
+                if key.objectid >= bg_end || key.item_type != BTRFS_ITEM_EXTENT_ITEM {
+                    continue;
+                }
+                let extent = ExtentKey {
+                    bytenr: key.objectid,
+                    num_bytes: key.offset,
+                };
+                if !referenced.contains(&extent) {
+                    orphaned.push(ExtentAllocation {
+                        bytenr: extent.bytenr,
+                        num_bytes: extent.num_bytes,
+                        block_group_start: bg.start,
+                    });
+                }
+            }
         }
 
         for extent in &orphaned {
@@ -7196,14 +5214,78 @@ impl BtrfsExtentAllocator {
             .values()
             .filter(|bg| (bg.item.flags & type_flags) != 0)
         {
-            let scan = self.scan_group_accounting_free_space(bg.start, bg.item.total_bytes)?;
-            let free_ranges = Self::finish_group_free_ranges(
-                bg.start,
-                bg.item.total_bytes,
-                bg.item.used_bytes,
-                scan,
-            )?;
-            let group_best = free_ranges.iter().map(|&(_, len)| len).max().unwrap_or(0);
+            let bg_end = bg
+                .start
+                .checked_add(bg.item.total_bytes)
+                .ok_or(BtrfsMutationError::AddressOverflow)?;
+            let range_start = BtrfsKey {
+                objectid: bg.start,
+                item_type: BTRFS_ITEM_EXTENT_ITEM,
+                offset: 0,
+            };
+            let range_end = BtrfsKey {
+                objectid: bg_end,
+                item_type: BTRFS_ITEM_METADATA_ITEM,
+                offset: u64::MAX,
+            };
+            let mut allocated_ranges = Vec::new();
+            let mut materialized_used = 0_u64;
+
+            for (key, _) in self.extent_tree.range(&range_start, &range_end)? {
+                if key.objectid >= bg_end {
+                    break;
+                }
+                if !matches!(
+                    key.item_type,
+                    BTRFS_ITEM_EXTENT_ITEM | BTRFS_ITEM_METADATA_ITEM
+                ) {
+                    continue;
+                }
+                let extent_start = key.objectid.max(bg.start);
+                let extent_end = key
+                    .objectid
+                    .checked_add(key.offset)
+                    .ok_or(BtrfsMutationError::AddressOverflow)?
+                    .min(bg_end);
+                if extent_start < extent_end {
+                    let extent_len = extent_end - extent_start;
+                    materialized_used = materialized_used
+                        .checked_add(extent_len)
+                        .ok_or(BtrfsMutationError::AddressOverflow)?;
+                    allocated_ranges.push((extent_start, extent_end));
+                }
+            }
+
+            let untracked_used = bg
+                .item
+                .used_bytes
+                .saturating_sub(materialized_used)
+                .min(bg.item.total_bytes);
+            if untracked_used > 0 {
+                allocated_ranges.push((
+                    bg.start,
+                    bg.start
+                        .checked_add(untracked_used)
+                        .ok_or(BtrfsMutationError::AddressOverflow)?,
+                ));
+            }
+            allocated_ranges.sort_unstable_by_key(|&(start, end)| (start, end));
+
+            let mut cursor = bg.start;
+            let mut group_best = 0_u64;
+            for (extent_start, extent_end) in allocated_ranges {
+                if extent_end <= cursor {
+                    continue;
+                }
+                if cursor < extent_start {
+                    group_best = group_best.max(extent_start - cursor);
+                }
+                cursor = extent_end;
+            }
+
+            if cursor < bg_end {
+                group_best = group_best.max(bg_end - cursor);
+            }
             best = best.max(group_best.min(bg.item.free_bytes()));
         }
 
@@ -7234,13 +5316,86 @@ impl BtrfsExtentAllocator {
     pub fn free_space_extents(&self) -> Result<Vec<BlockGroupFreeSpace>, BtrfsMutationError> {
         let mut result = Vec::with_capacity(self.block_groups.len());
         for bg in self.block_groups.values() {
-            let scan = self.scan_group_accounting_free_space(bg.start, bg.item.total_bytes)?;
-            let free_ranges = Self::finish_group_free_ranges(
-                bg.start,
-                bg.item.total_bytes,
-                bg.item.used_bytes,
-                scan,
-            )?;
+            let bg_end = bg
+                .start
+                .checked_add(bg.item.total_bytes)
+                .ok_or(BtrfsMutationError::AddressOverflow)?;
+            let range_start = BtrfsKey {
+                objectid: bg.start,
+                item_type: BTRFS_ITEM_EXTENT_ITEM,
+                offset: 0,
+            };
+            let range_end = BtrfsKey {
+                objectid: bg_end,
+                item_type: BTRFS_ITEM_METADATA_ITEM,
+                offset: u64::MAX,
+            };
+            let mut allocated_ranges = Vec::new();
+            let mut materialized_used = 0_u64;
+            for (key, _) in self.extent_tree.range(&range_start, &range_end)? {
+                if key.objectid >= bg_end {
+                    break;
+                }
+                if !matches!(
+                    key.item_type,
+                    BTRFS_ITEM_EXTENT_ITEM | BTRFS_ITEM_METADATA_ITEM
+                ) {
+                    continue;
+                }
+                // A skinny METADATA_ITEM key encodes the tree LEVEL in its
+                // offset, not the byte length — the block is always `nodesize`
+                // bytes. An EXTENT_ITEM key offset is the real byte length.
+                let extent_len = if key.item_type == BTRFS_ITEM_METADATA_ITEM {
+                    self.nodesize
+                } else {
+                    key.offset
+                };
+                let extent_start = key.objectid.max(bg.start);
+                let extent_end = key
+                    .objectid
+                    .checked_add(extent_len)
+                    .ok_or(BtrfsMutationError::AddressOverflow)?
+                    .min(bg_end);
+                if extent_start < extent_end {
+                    materialized_used = materialized_used
+                        .checked_add(extent_end - extent_start)
+                        .ok_or(BtrfsMutationError::AddressOverflow)?;
+                    allocated_ranges.push((extent_start, extent_end));
+                }
+            }
+
+            // Used bytes not represented as an extent item (the reserved
+            // system/superblock prefix) are fenced off at the group start, so
+            // the free-space tree never advertises them as free.
+            let untracked_used = bg
+                .item
+                .used_bytes
+                .saturating_sub(materialized_used)
+                .min(bg.item.total_bytes);
+            if untracked_used > 0 {
+                allocated_ranges.push((
+                    bg.start,
+                    bg.start
+                        .checked_add(untracked_used)
+                        .ok_or(BtrfsMutationError::AddressOverflow)?,
+                ));
+            }
+            allocated_ranges.sort_unstable_by_key(|&(start, end)| (start, end));
+
+            let mut free_ranges = Vec::new();
+            let mut cursor = bg.start;
+            for (extent_start, extent_end) in allocated_ranges {
+                if extent_end <= cursor {
+                    continue;
+                }
+                if cursor < extent_start {
+                    free_ranges.push((cursor, extent_start - cursor));
+                }
+                cursor = extent_end;
+            }
+            if cursor < bg_end {
+                free_ranges.push((cursor, bg_end - cursor));
+            }
 
             result.push(BlockGroupFreeSpace {
                 start: bg.start,
@@ -7299,18 +5454,16 @@ impl BtrfsExtentAllocator {
                 item_type: BTRFS_ITEM_METADATA_ITEM,
                 offset: u64::MAX,
             };
-            let mut extent_keys = Vec::new();
-            self.extent_tree
-                .range_with(&lo, &hi, |key, _| extent_keys.push(key))?;
-            let used: u64 = extent_keys
-                .into_iter()
-                .filter_map(|key| allocation_extent_range(key, nodesize))
+            let used: u64 = self
+                .extent_tree
+                .range(&lo, &hi)?
+                .iter()
+                .filter_map(|(key, _)| allocation_extent_range(*key, nodesize))
                 .filter(|(ext_start, _)| *ext_start >= start && *ext_start < end)
                 .fold(0_u64, |acc, (_, len)| acc.saturating_add(len));
 
             if let Some(bg) = self.block_groups.get_mut(&start) {
                 bg.item.used_bytes = used;
-                bg.tail_verified = false;
             }
             let bg_key = BtrfsKey {
                 objectid: start,
@@ -7326,198 +5479,6 @@ impl BtrfsExtentAllocator {
             grand_total = grand_total.saturating_add(used);
         }
         Ok(grand_total)
-    }
-
-    fn scan_group_accounting_free_space(
-        &self,
-        start: u64,
-        total_bytes: u64,
-    ) -> Result<GroupAccountingFreeSpaceScan, BtrfsMutationError> {
-        let end = start
-            .checked_add(total_bytes)
-            .ok_or(BtrfsMutationError::AddressOverflow)?;
-        let lo = BtrfsKey {
-            objectid: start,
-            item_type: BTRFS_ITEM_EXTENT_ITEM,
-            offset: 0,
-        };
-        let hi = BtrfsKey {
-            objectid: end,
-            item_type: BTRFS_ITEM_METADATA_ITEM,
-            offset: u64::MAX,
-        };
-        let nodesize = self.nodesize;
-        let mut scan = GroupAccountingFreeSpaceScan {
-            used: 0,
-            materialized_used: 0,
-            cursor: start,
-            free_ranges: Vec::new(),
-        };
-        let mut range_error = None;
-
-        self.extent_tree.range_with(&lo, &hi, |key, _| {
-            if range_error.is_some() || key.objectid >= end {
-                return;
-            }
-            let Some((ext_start, ext_len)) = allocation_extent_range(key, nodesize) else {
-                return;
-            };
-
-            scan.used = scan.used.saturating_add(ext_len);
-            let extent_start = ext_start.max(start);
-            let Some(extent_end) = ext_start.checked_add(ext_len).map(|stop| stop.min(end)) else {
-                range_error = Some(BtrfsMutationError::AddressOverflow);
-                return;
-            };
-            if extent_start >= extent_end {
-                return;
-            }
-            let Some(next_materialized_used) = scan
-                .materialized_used
-                .checked_add(extent_end - extent_start)
-            else {
-                range_error = Some(BtrfsMutationError::AddressOverflow);
-                return;
-            };
-            if extent_end <= scan.cursor {
-                scan.materialized_used = next_materialized_used;
-                return;
-            }
-            if scan.cursor < extent_start {
-                scan.free_ranges
-                    .push((scan.cursor, extent_start - scan.cursor));
-            }
-            scan.cursor = extent_end;
-            scan.materialized_used = next_materialized_used;
-        })?;
-        if let Some(error) = range_error {
-            return Err(error);
-        }
-        Ok(scan)
-    }
-
-    fn write_block_group_accounting(
-        &mut self,
-        start: u64,
-        total_bytes: u64,
-        used: u64,
-    ) -> Result<(), BtrfsMutationError> {
-        if let Some(bg) = self.block_groups.get_mut(&start) {
-            bg.item.used_bytes = used;
-            bg.tail_verified = false;
-        }
-        let bg_key = BtrfsKey {
-            objectid: start,
-            item_type: BTRFS_ITEM_BLOCK_GROUP_ITEM,
-            offset: total_bytes,
-        };
-        if let Some(mut value) = self.extent_tree.get(&bg_key) {
-            if value.len() >= 8 {
-                value[0..8].copy_from_slice(&used.to_le_bytes());
-                self.extent_tree.update(&bg_key, &value)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn fence_free_ranges_before(
-        free_ranges: Vec<(u64, u64)>,
-        reserved_end: u64,
-    ) -> Result<Vec<(u64, u64)>, BtrfsMutationError> {
-        let mut fenced_ranges = Vec::with_capacity(free_ranges.len());
-        for (free_start, free_len) in free_ranges {
-            let free_end = free_start
-                .checked_add(free_len)
-                .ok_or(BtrfsMutationError::AddressOverflow)?;
-            if free_end <= reserved_end {
-                continue;
-            }
-            let fenced_start = free_start.max(reserved_end);
-            fenced_ranges.push((fenced_start, free_end - fenced_start));
-        }
-        Ok(fenced_ranges)
-    }
-
-    fn finish_group_free_ranges(
-        start: u64,
-        total_bytes: u64,
-        used_bytes: u64,
-        mut scan: GroupAccountingFreeSpaceScan,
-    ) -> Result<Vec<(u64, u64)>, BtrfsMutationError> {
-        let end = start
-            .checked_add(total_bytes)
-            .ok_or(BtrfsMutationError::AddressOverflow)?;
-        let untracked_used = used_bytes
-            .saturating_sub(scan.materialized_used)
-            .min(total_bytes);
-        if untracked_used > 0 {
-            let reserved_end = start
-                .checked_add(untracked_used)
-                .ok_or(BtrfsMutationError::AddressOverflow)?;
-            scan.free_ranges = Self::fence_free_ranges_before(scan.free_ranges, reserved_end)?;
-            scan.cursor = scan.cursor.max(reserved_end);
-        }
-        if scan.cursor < end {
-            scan.free_ranges.push((scan.cursor, end - scan.cursor));
-        }
-        Ok(scan.free_ranges)
-    }
-
-    /// Fused commit-path pass that, in a SINGLE `EXTENT_ITEM`/`METADATA_ITEM`
-    /// key scan per block group, does the work of both
-    /// [`Self::sync_block_group_accounting`] and [`Self::free_space_extents`]:
-    ///
-    /// * recomputes every group's `used_bytes` (patching the in-memory group,
-    ///   the on-disk `BLOCK_GROUP_ITEM`, and accumulating the superblock grand
-    ///   total), and
-    /// * derives that group's free `[start, len)` ranges (the allocation
-    ///   complement) for `FREE_SPACE_TREE` maintenance.
-    ///
-    /// The btrfs commit path runs those two passes back-to-back whenever the
-    /// `FREE_SPACE_TREE` is rewritten in place (`fst_reuse`), and both passes
-    /// scan the identical per-group extent-key range. Folding them into one
-    /// scan halves the extent-tree key-scan work on every transaction commit
-    /// that reuses the free-space tree (bd-xmh5g.193).
-    ///
-    /// The result is byte-identical to calling `sync_block_group_accounting()`
-    /// and then `free_space_extents()`: within each group `used_bytes` is set
-    /// before the free ranges are derived, so the reserved-prefix
-    /// `untracked_used` fence uses the freshly recomputed figure exactly as the
-    /// two-call sequence does. Because each group's accounting depends only on
-    /// its own extent keys, processing one group fully (used then free) before
-    /// the next yields the same per-group `used_bytes` the free pass would have
-    /// observed after a separate full accounting pass.
-    ///
-    /// Callers that rewrite no free-space tree should keep using the standalone
-    /// [`Self::sync_block_group_accounting`] (no free-range work performed).
-    ///
-    /// # Errors
-    /// Returns any error from reading or updating the in-memory extent tree.
-    pub fn sync_accounting_and_free_space(
-        &mut self,
-    ) -> Result<(u64, Vec<BlockGroupFreeSpace>), BtrfsMutationError> {
-        let groups: Vec<(u64, u64, u64)> = self
-            .block_groups
-            .values()
-            .map(|bg| (bg.start, bg.item.total_bytes, bg.item.flags))
-            .collect();
-        let mut grand_total = 0_u64;
-        let mut free_space = Vec::with_capacity(groups.len());
-        for (start, total_bytes, flags) in groups {
-            let scan = self.scan_group_accounting_free_space(start, total_bytes)?;
-            self.write_block_group_accounting(start, total_bytes, scan.used)?;
-            grand_total = grand_total.saturating_add(scan.used);
-            let used = scan.used;
-            let free_ranges = Self::finish_group_free_ranges(start, total_bytes, used, scan)?;
-
-            free_space.push(BlockGroupFreeSpace {
-                start,
-                total_bytes,
-                flags,
-                free_ranges,
-            });
-        }
-        Ok((grand_total, free_space))
     }
 
     /// Total capacity across all block groups.
@@ -7559,17 +5520,14 @@ impl BtrfsExtentAllocator {
             item_type: BTRFS_ITEM_EXTENT_ITEM,
             offset: num_bytes,
         };
-        let mut refs = None;
-        self.extent_tree.range_with(&key, &key, |_, data| {
+        let items = self.extent_tree.range(&key, &key)?;
+        Ok(items.into_iter().next().and_then(|(_, data)| {
             if data.len() >= 8 {
-                refs = Some(u64::from_le_bytes(
-                    data[0..8]
-                        .try_into()
-                        .expect("extent refcount slice is exactly eight bytes"),
-                ));
+                Some(u64::from_le_bytes(data[0..8].try_into().ok()?))
+            } else {
+                None
             }
-        })?;
-        Ok(refs)
+        }))
     }
 
     pub fn get_extent_data_refs(
@@ -7586,70 +5544,14 @@ impl BtrfsExtentAllocator {
             item_type: BTRFS_ITEM_EXTENT_DATA_REF,
             offset: u64::MAX,
         };
+        let refs = self.extent_tree.range(&range_start, &range_end)?;
         let mut result = Vec::new();
-        self.extent_tree
-            .range_with(&range_start, &range_end, |_, value| {
-                if let Some(data_ref) = BtrfsExtentDataRef::from_bytes(value) {
-                    result.push(data_ref);
-                }
-            })?;
-        Ok(result)
-    }
-
-    /// Resolve the data `EXTENT_ITEM` that *contains* `logical` and return its
-    /// start bytenr.
-    ///
-    /// `BTRFS_IOC_LOGICAL_INO[_V2]` takes an arbitrary logical byte address,
-    /// which usually points into the *middle* of an extent (e.g. a byte from a
-    /// corruption report). The kernel first finds the extent covering the
-    /// address and then walks that extent's back-references. Keying the backref
-    /// lookup directly on `logical` (as [`Self::get_extent_data_refs`] does)
-    /// only matches when `logical` is exactly an extent's start bytenr, so any
-    /// mid-extent address resolved to an empty result. This finds the covering
-    /// `EXTENT_ITEM` so the caller can look up its backrefs (`bd-uv16n`).
-    ///
-    /// Data extents do not overlap, so at most one `EXTENT_ITEM` covers a given
-    /// address. The `EXTENT_ITEM` key encodes the extent length in `offset`.
-    pub fn resolve_containing_data_extent(
-        &self,
-        logical: u64,
-    ) -> Result<Option<u64>, BtrfsMutationError> {
-        // EXTENT_ITEM keys are ordered by start bytenr. The only possible
-        // covering data extent is the greatest EXTENT_ITEM whose start is
-        // <= logical. Walk floor keys backward across interleaved non-extent
-        // records instead of materializing every preceding key.
-        let mut target = BtrfsKey {
-            objectid: logical,
-            item_type: BTRFS_ITEM_EXTENT_ITEM,
-            offset: u64::MAX,
-        };
-        while let Some(key) = self.extent_tree.floor_key(&target)? {
-            match key.item_type.cmp(&BTRFS_ITEM_EXTENT_ITEM) {
-                Ordering::Equal => {
-                    let start = key.objectid;
-                    let end = start.saturating_add(key.offset);
-                    return Ok((start <= logical && logical < end).then_some(start));
-                }
-                Ordering::Greater => {
-                    target = BtrfsKey {
-                        objectid: key.objectid,
-                        item_type: BTRFS_ITEM_EXTENT_ITEM,
-                        offset: u64::MAX,
-                    };
-                }
-                Ordering::Less => {
-                    let Some(previous_objectid) = key.objectid.checked_sub(1) else {
-                        return Ok(None);
-                    };
-                    target = BtrfsKey {
-                        objectid: previous_objectid,
-                        item_type: u8::MAX,
-                        offset: u64::MAX,
-                    };
-                }
+        for (_key, value) in refs {
+            if let Some(data_ref) = BtrfsExtentDataRef::from_bytes(&value) {
+                result.push(data_ref);
             }
         }
-        Ok(None)
+        Ok(result)
     }
 
     fn delete_backrefs_for_extent(
@@ -7683,43 +5585,6 @@ impl BtrfsExtentAllocator {
         }
         Ok(())
     }
-
-    /// Benchmark-only replay of the rejected borrowed-key backref deletion.
-    /// Production intentionally retains payload materialization because the
-    /// full-path median-CI gate did not clear its null floor.
-    ///
-    /// # Errors
-    /// Returns the same tree mutation error as production extent deletion.
-    #[cfg(feature = "bench-instrumentation")]
-    #[doc(hidden)]
-    pub fn bench_delete_backrefs_for_extent_borrowed_candidate(
-        &mut self,
-        bytenr: u64,
-        is_metadata: bool,
-    ) -> Result<(), BtrfsMutationError> {
-        let ref_item_type = if is_metadata {
-            BTRFS_ITEM_TREE_BLOCK_REF
-        } else {
-            BTRFS_ITEM_EXTENT_DATA_REF
-        };
-        let range_start = BtrfsKey {
-            objectid: bytenr,
-            item_type: ref_item_type,
-            offset: 0,
-        };
-        let range_end = BtrfsKey {
-            objectid: bytenr,
-            item_type: ref_item_type,
-            offset: u64::MAX,
-        };
-        let mut refs = Vec::new();
-        self.extent_tree
-            .range_with(&range_start, &range_end, |key, _| refs.push(key))?;
-        for key in refs {
-            self.extent_tree.delete(&key)?;
-        }
-        Ok(())
-    }
 }
 
 fn allocation_extent_range(key: BtrfsKey, metadata_nodesize: u64) -> Option<(u64, u64)> {
@@ -7732,50 +5597,6 @@ fn allocation_extent_range(key: BtrfsKey, metadata_nodesize: u64) -> Option<(u64
         BTRFS_ITEM_METADATA_ITEM => Some((key.objectid, metadata_nodesize)),
         _ => None,
     }
-}
-
-/// First-fit gap search over `allocated_ranges` (sorted ascending by start,
-/// non-overlapping) for the lowest address `>= cursor` with `num_bytes` free
-/// before `bg_end`.
-///
-/// The scan binary-searches past every extent that ends at or before `cursor`:
-/// those satisfy neither loop branch (`cursor < ext_start` is false because
-/// `ext_start < ext_end <= cursor`, and `ext_end > cursor` is false), so they
-/// are pure no-ops. Skipping them makes a bump-pointer sequential fill — where
-/// `cursor` advances past the allocated prefix every call — pay O(log E + tail)
-/// instead of O(E) per allocation, i.e. O(N log N) to fill a group instead of
-/// O(N^2) (bd-8fbka). Result is identical to scanning from index 0.
-fn first_gap_at_or_after(
-    allocated_ranges: &[(u64, u64)],
-    mut cursor: u64,
-    num_bytes: u64,
-    bg_end: u64,
-) -> Result<Option<u64>, BtrfsMutationError> {
-    // ext_end is non-decreasing (sorted, non-overlapping), so `ext_end <= cursor`
-    // is monotonic — a valid partition_point predicate.
-    let start_idx = allocated_ranges
-        .partition_point(|&(ext_start, ext_size)| ext_start.saturating_add(ext_size) <= cursor);
-    for &(ext_start, ext_size) in &allocated_ranges[start_idx..] {
-        let ext_end = ext_start
-            .checked_add(ext_size)
-            .ok_or(BtrfsMutationError::AddressOverflow)?;
-        if cursor < ext_start {
-            let gap = ext_start - cursor;
-            if gap >= num_bytes {
-                return Ok(Some(cursor));
-            }
-        }
-        if ext_end > cursor {
-            cursor = ext_end;
-        }
-    }
-    // Gap after the last extent.
-    if let Some(end) = cursor.checked_add(num_bytes) {
-        if end <= bg_end {
-            return Ok(Some(cursor));
-        }
-    }
-    Ok(None)
 }
 
 // ── btrfs multi-device support ─────────────────────────────────────────────
@@ -7960,16 +5781,11 @@ pub fn walk_chunk_tree(
     )?;
 
     let mut chunks = bootstrap_chunks.to_vec();
-    // Dedup by logical offset against the bootstrap set + chunks already added.
-    // The old `chunks.iter().any(...)` scan made this O(chunks^2) at mount; a
-    // multi-TB filesystem has thousands of chunk items, so track seen offsets
-    // in a HashSet for O(1) membership: O(chunks^2) -> O(chunks) (bd-o6orc).
-    // Keeps the first occurrence of each offset, identical to the linear scan.
-    let mut seen: HashSet<u64> = bootstrap_chunks.iter().map(|c| c.key.offset).collect();
     for item in &items {
         if item.key.item_type == BTRFS_ITEM_CHUNK {
             let chunk = parse_chunk_item(&item.data, item.key.offset)?;
-            if seen.insert(chunk.key.offset) {
+            // Only add if not already in bootstrap set (avoid duplicates).
+            if !chunks.iter().any(|c| c.key.offset == chunk.key.offset) {
                 chunks.push(chunk);
             }
         }
@@ -8211,11 +6027,21 @@ pub struct SendStreamParseResult {
     pub commands: Vec<SendStreamCommand>,
 }
 
-/// Continue Btrfs send's raw (uncomplemented) CRC32C state through `data`.
-/// `crc32c_append` complements its input and output for the conventional API,
-/// so complementing on both sides preserves the kernel send-stream convention.
+const BTRFS_SEND_CRC32C_POLY: u32 = 0x82F6_3B78;
+
 fn btrfs_send_crc32c(seed: u32, data: &[u8]) -> u32 {
-    !ffs_types::crc32c_append(!seed, data)
+    let mut crc = seed;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ BTRFS_SEND_CRC32C_POLY
+            };
+        }
+    }
+    crc
 }
 
 fn send_stream_command_crc32c(command: &[u8]) -> u32 {
@@ -8387,14 +6213,6 @@ impl SendStreamBuilder {
         }
     }
 
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            buffer: Vec::with_capacity(capacity),
-            has_header: false,
-            finalized: false,
-        }
-    }
-
     /// Write the stream header (magic + version).
     /// Must be called before adding any commands.
     pub fn write_header(&mut self) {
@@ -8412,8 +6230,8 @@ impl SendStreamBuilder {
         assert!(self.has_header, "must write header first");
         assert!(!self.finalized, "stream already finalized");
 
-        let mut payload_len = 0usize;
-        for (_, adata) in attrs {
+        let mut payload = Vec::new();
+        for (atype, adata) in attrs {
             // The btrfs send TLV length field is a u16. Casting a longer
             // attribute would silently wrap the declared length and emit a
             // corrupt, unparseable stream. Callers that carry bulk data (file
@@ -8425,34 +6243,24 @@ impl SendStreamBuilder {
                 adata.len(),
                 u16::MAX
             );
-            payload_len = payload_len
-                .checked_add(4)
-                .and_then(|len| len.checked_add(adata.len()))
-                .expect("send-stream command payload length overflow");
+            payload.extend_from_slice(&(*atype as u16).to_le_bytes());
+            payload.extend_from_slice(&(adata.len() as u16).to_le_bytes());
+            payload.extend_from_slice(adata);
         }
 
-        let payload_len_u32 =
-            u32::try_from(payload_len).expect("send-stream command payload exceeds u32 length");
-        let full_len = 10usize
-            .checked_add(payload_len)
-            .expect("send-stream command frame length overflow");
+        let payload_len = payload.len() as u32;
+        let full_len = 10 + payload.len();
 
-        let frame_start = self.buffer.len();
-        self.buffer.reserve(full_len);
-        self.buffer
-            .extend_from_slice(&payload_len_u32.to_le_bytes());
-        self.buffer.extend_from_slice(&(cmd as u16).to_le_bytes());
-        self.buffer.extend_from_slice(&[0_u8; 4]); // CRC placeholder
-        for (atype, adata) in attrs {
-            self.buffer
-                .extend_from_slice(&(*atype as u16).to_le_bytes());
-            self.buffer
-                .extend_from_slice(&(adata.len() as u16).to_le_bytes());
-            self.buffer.extend_from_slice(adata);
-        }
+        let mut frame = Vec::with_capacity(full_len);
+        frame.extend_from_slice(&payload_len.to_le_bytes());
+        frame.extend_from_slice(&(cmd as u16).to_le_bytes());
+        frame.extend_from_slice(&[0_u8; 4]); // CRC placeholder
+        frame.extend_from_slice(&payload);
 
-        let crc = send_stream_command_crc32c(&self.buffer[frame_start..]);
-        self.buffer[frame_start + 6..frame_start + 10].copy_from_slice(&crc.to_le_bytes());
+        let crc = send_stream_command_crc32c(&frame);
+        frame[6..10].copy_from_slice(&crc.to_le_bytes());
+
+        self.buffer.extend_from_slice(&frame);
     }
 
     /// Add the End command and finalize the stream.
@@ -8807,184 +6615,6 @@ pub fn build_update_extent_command(
     )
 }
 
-fn add_subvol_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    uuid: &[u8; 16],
-    ctransid: u64,
-) {
-    let ctransid_bytes = ctransid.to_le_bytes();
-    builder.add_command(
-        SendCommand::Subvol,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::Uuid, &uuid[..]),
-            (SendAttr::Ctransid, &ctransid_bytes),
-        ],
-    );
-}
-
-fn add_path_ino_command_direct(
-    builder: &mut SendStreamBuilder,
-    cmd: SendCommand,
-    path: &[u8],
-    ino: u64,
-) {
-    let ino_bytes = ino.to_le_bytes();
-    builder.add_command(cmd, &[(SendAttr::Path, path), (SendAttr::Ino, &ino_bytes)]);
-}
-
-fn add_path_u64_command_direct(
-    builder: &mut SendStreamBuilder,
-    cmd: SendCommand,
-    path: &[u8],
-    attr: SendAttr,
-    value: u64,
-) {
-    let value_bytes = value.to_le_bytes();
-    builder.add_command(cmd, &[(SendAttr::Path, path), (attr, &value_bytes)]);
-}
-
-fn add_chown_command_direct(builder: &mut SendStreamBuilder, path: &[u8], uid: u64, gid: u64) {
-    let uid_bytes = uid.to_le_bytes();
-    let gid_bytes = gid.to_le_bytes();
-    builder.add_command(
-        SendCommand::Chown,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::Uid, &uid_bytes),
-            (SendAttr::Gid, &gid_bytes),
-        ],
-    );
-}
-
-fn send_timespec_bytes(sec: i64, nsec: i32) -> [u8; 12] {
-    let mut buf = [0_u8; 12];
-    buf[0..8].copy_from_slice(&sec.to_le_bytes());
-    buf[8..12].copy_from_slice(&nsec.to_le_bytes());
-    buf
-}
-
-fn add_utimes_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    atime_sec: i64,
-    atime_nsec: i32,
-    mtime_sec: i64,
-    mtime_nsec: i32,
-    ctime_sec: i64,
-    ctime_nsec: i32,
-) {
-    let atime = send_timespec_bytes(atime_sec, atime_nsec);
-    let mtime = send_timespec_bytes(mtime_sec, mtime_nsec);
-    let ctime = send_timespec_bytes(ctime_sec, ctime_nsec);
-    builder.add_command(
-        SendCommand::Utimes,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::Atime, &atime),
-            (SendAttr::Mtime, &mtime),
-            (SendAttr::Ctime, &ctime),
-        ],
-    );
-}
-
-fn add_symlink_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    ino: u64,
-    link_target: &[u8],
-) {
-    let ino_bytes = ino.to_le_bytes();
-    builder.add_command(
-        SendCommand::Symlink,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::Ino, &ino_bytes),
-            (SendAttr::PathLink, link_target),
-        ],
-    );
-}
-
-fn add_setxattr_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    name: &[u8],
-    data: &[u8],
-) {
-    builder.add_command(
-        SendCommand::SetXattr,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::XattrName, name),
-            (SendAttr::XattrData, data),
-        ],
-    );
-}
-
-fn add_link_command_direct(builder: &mut SendStreamBuilder, path: &[u8], path_link: &[u8]) {
-    builder.add_command(
-        SendCommand::Link,
-        &[(SendAttr::Path, path), (SendAttr::PathLink, path_link)],
-    );
-}
-
-fn add_mknod_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    ino: u64,
-    mode: u64,
-    rdev: u64,
-) {
-    let ino_bytes = ino.to_le_bytes();
-    let mode_bytes = mode.to_le_bytes();
-    let rdev_bytes = rdev.to_le_bytes();
-    builder.add_command(
-        SendCommand::Mknod,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::Ino, &ino_bytes),
-            (SendAttr::Mode, &mode_bytes),
-            (SendAttr::Rdev, &rdev_bytes),
-        ],
-    );
-}
-
-fn add_write_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    offset: u64,
-    data: &[u8],
-) {
-    let offset_bytes = offset.to_le_bytes();
-    builder.add_command(
-        SendCommand::Write,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::FileOffset, &offset_bytes),
-            (SendAttr::Data, data),
-        ],
-    );
-}
-
-fn add_update_extent_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    offset: u64,
-    len: u64,
-) {
-    let offset_bytes = offset.to_le_bytes();
-    let len_bytes = len.to_le_bytes();
-    builder.add_command(
-        SendCommand::UpdateExtent,
-        &[
-            (SendAttr::Path, path),
-            (SendAttr::FileOffset, &offset_bytes),
-            (SendAttr::Size, &len_bytes),
-        ],
-    );
-}
-
 // ── send stream generation from FS tree ───────────────────────────────────
 
 /// Maximum payload bytes per send-stream `DATA` attribute.
@@ -9002,203 +6632,11 @@ const BTRFS_SEND_WRITE_CHUNK: usize = 48 * 1024;
 fn emit_write_chunks(builder: &mut SendStreamBuilder, path: &[u8], file_offset: u64, data: &[u8]) {
     let mut chunk_offset = file_offset;
     for chunk in data.chunks(BTRFS_SEND_WRITE_CHUNK) {
-        add_write_command_direct(builder, path, chunk_offset, chunk);
+        let (cmd, attrs) = build_write_command(path, chunk_offset, chunk);
+        let refs: Vec<(SendAttr, &[u8])> = attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+        builder.add_command(cmd, &refs);
         chunk_offset = chunk_offset.saturating_add(chunk.len() as u64);
     }
-}
-
-struct SendInodeLinkGroup {
-    ino: u64,
-    links: Vec<(u64, Vec<u8>)>,
-}
-
-enum SendInodeLinks {
-    Ordered(Vec<SendInodeLinkGroup>),
-    Gathered(BTreeMap<u64, Vec<(u64, Vec<u8>)>>),
-}
-
-impl SendInodeLinks {
-    fn len(&self) -> usize {
-        match self {
-            Self::Ordered(groups) => groups.len(),
-            Self::Gathered(groups) => groups.len(),
-        }
-    }
-
-    fn get(&self, ino: u64) -> Option<&[(u64, Vec<u8>)]> {
-        match self {
-            Self::Ordered(groups) => groups
-                .binary_search_by_key(&ino, |group| group.ino)
-                .ok()
-                .map(|index| groups[index].links.as_slice()),
-            Self::Gathered(groups) => groups.get(&ino).map(Vec::as_slice),
-        }
-    }
-
-    fn materialize_primary_parents(&self) -> BTreeMap<u64, (u64, Vec<u8>)> {
-        match self {
-            Self::Ordered(groups) => groups
-                .iter()
-                .filter_map(|group| {
-                    group
-                        .links
-                        .first()
-                        .map(|(parent, name)| (group.ino, (*parent, name.clone())))
-                })
-                .collect(),
-            Self::Gathered(groups) => groups
-                .iter()
-                .filter_map(|(&ino, links)| {
-                    links
-                        .first()
-                        .map(|(parent, name)| (ino, (*parent, name.clone())))
-                })
-                .collect(),
-        }
-    }
-}
-
-fn collect_send_inode_links<const FORCE_BTREE: bool>(items: &[BtrfsLeafEntry]) -> SendInodeLinks {
-    let monotone_objectids = !FORCE_BTREE
-        && items
-            .windows(2)
-            .all(|pair| pair[0].key.objectid <= pair[1].key.objectid);
-    if monotone_objectids {
-        let mut groups: Vec<SendInodeLinkGroup> =
-            Vec::with_capacity(items.len().saturating_add(1) / 2);
-        for entry in items {
-            if entry.key.item_type != BTRFS_ITEM_INODE_REF {
-                continue;
-            }
-            let Ok(refs) = parse_inode_refs(&entry.data) else {
-                continue;
-            };
-            if groups
-                .last()
-                .is_none_or(|group| group.ino != entry.key.objectid)
-            {
-                groups.push(SendInodeLinkGroup {
-                    ino: entry.key.objectid,
-                    links: Vec::new(),
-                });
-            }
-            let links = &mut groups.last_mut().expect("link group just inserted").links;
-            for inode_ref in refs {
-                // Preserve the existing parse-to-map ownership behavior. The
-                // representation lever changes only the outer index.
-                links.push((entry.key.offset, inode_ref.name.clone()));
-            }
-        }
-        return SendInodeLinks::Ordered(groups);
-    }
-
-    let mut gathered: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
-    for entry in items {
-        if entry.key.item_type == BTRFS_ITEM_INODE_REF
-            && let Ok(refs) = parse_inode_refs(&entry.data)
-        {
-            let links = gathered.entry(entry.key.objectid).or_default();
-            for inode_ref in refs {
-                links.push((entry.key.offset, inode_ref.name.clone()));
-            }
-        }
-    }
-    SendInodeLinks::Gathered(gathered)
-}
-
-fn primary_inode_link<'a, const MATERIALIZED: bool>(
-    inode_links: &'a SendInodeLinks,
-    inode_parents: Option<&'a BTreeMap<u64, (u64, Vec<u8>)>>,
-    ino: u64,
-) -> Option<(u64, &'a [u8])> {
-    if MATERIALIZED {
-        inode_parents?
-            .get(&ino)
-            .map(|(parent, name)| (*parent, name.as_slice()))
-    } else {
-        inode_links
-            .get(ino)?
-            .first()
-            .map(|(parent, name)| (*parent, name.as_slice()))
-    }
-}
-
-enum SendInodeEntries<'a> {
-    Contiguous(&'a [BtrfsLeafEntry]),
-    Gathered(Vec<&'a BtrfsLeafEntry>),
-}
-
-enum SendInodeEntryIter<'items, 'group> {
-    Contiguous(std::slice::Iter<'items, BtrfsLeafEntry>),
-    Gathered(std::slice::Iter<'group, &'items BtrfsLeafEntry>),
-}
-
-impl<'items> Iterator for SendInodeEntryIter<'items, '_> {
-    type Item = &'items BtrfsLeafEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Contiguous(entries) => entries.next(),
-            Self::Gathered(entries) => entries.next().copied(),
-        }
-    }
-}
-
-impl<'items> SendInodeEntries<'items> {
-    fn iter(&self) -> SendInodeEntryIter<'items, '_> {
-        match self {
-            Self::Contiguous(entries) => SendInodeEntryIter::Contiguous(entries.iter()),
-            Self::Gathered(entries) => SendInodeEntryIter::Gathered(entries.iter()),
-        }
-    }
-}
-
-struct SendInodeGroup<'a> {
-    ino: u64,
-    entries: SendInodeEntries<'a>,
-}
-
-fn group_send_inode_entries<const FORCE_BTREE: bool>(
-    items: &[BtrfsLeafEntry],
-) -> Vec<SendInodeGroup<'_>> {
-    let monotone_objectids = !FORCE_BTREE
-        && items
-            .windows(2)
-            .all(|pair| pair[0].key.objectid <= pair[1].key.objectid);
-    if monotone_objectids {
-        let group_count = usize::from(!items.is_empty())
-            + items
-                .windows(2)
-                .filter(|pair| pair[0].key.objectid != pair[1].key.objectid)
-                .count();
-        let mut groups = Vec::with_capacity(group_count);
-        let mut start = 0;
-        while start < items.len() {
-            let ino = items[start].key.objectid;
-            let mut end = start + 1;
-            while end < items.len() && items[end].key.objectid == ino {
-                end += 1;
-            }
-            groups.push(SendInodeGroup {
-                ino,
-                entries: SendInodeEntries::Contiguous(&items[start..end]),
-            });
-            start = end;
-        }
-        return groups;
-    }
-
-    let mut gathered: BTreeMap<u64, Vec<&BtrfsLeafEntry>> = BTreeMap::new();
-    for entry in items {
-        gathered.entry(entry.key.objectid).or_default().push(entry);
-    }
-    gathered
-        .into_iter()
-        .map(|(ino, entries)| SendInodeGroup {
-            ino,
-            entries: SendInodeEntries::Gathered(entries),
-        })
-        .collect()
 }
 
 /// Generate a btrfs send stream from FS tree items.
@@ -9221,12 +6659,13 @@ fn group_send_inode_entries<const FORCE_BTREE: bool>(
 ///
 /// # Returns
 /// The complete send stream bytes on success.
+#[expect(clippy::too_many_lines)]
 pub fn generate_send_stream<F>(
     items: &[BtrfsLeafEntry],
     subvol_name: &[u8],
     subvol_uuid: &[u8; 16],
     ctransid: u64,
-    read_extent: F,
+    mut read_extent: F,
 ) -> Result<Vec<u8>, ParseError>
 where
     // (disk_bytenr, disk_num_bytes, ram_bytes, compression) -> DECOMPRESSED extent
@@ -9234,165 +6673,36 @@ where
     // decompressor) so the slice below is always in uncompressed/logical space.
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<false, false, false, false, F>(
-        items,
-        subvol_name,
-        subvol_uuid,
-        ctransid,
-        0,
-        read_extent,
-    ))
-}
-
-/// Exact-capacity oracle for the same-ELF performance harness.
-///
-/// This is not a supported application API. It supplies the final stream size
-/// before generation only to bound the maximum possible gain from eliminating
-/// output-buffer growth; production has no such oracle.
-#[cfg(feature = "bench-instrumentation")]
-#[doc(hidden)]
-pub fn generate_send_stream_exact_capacity_oracle<F>(
-    items: &[BtrfsLeafEntry],
-    subvol_name: &[u8],
-    subvol_uuid: &[u8; 16],
-    ctransid: u64,
-    exact_capacity: usize,
-    read_extent: F,
-) -> Result<Vec<u8>, ParseError>
-where
-    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
-{
-    Ok(generate_send_stream_impl::<false, false, false, true, F>(
-        items,
-        subvol_name,
-        subvol_uuid,
-        ctransid,
-        exact_capacity,
-        read_extent,
-    ))
-}
-
-/// Materialized-primary-parent control for the same-ELF performance harness.
-///
-/// This is not a supported application API. It exists only when explicit
-/// benchmark instrumentation is enabled, so the production implementation and
-/// its pre-optimization control can be timed in one process.
-#[cfg(feature = "bench-instrumentation")]
-#[doc(hidden)]
-pub fn generate_send_stream_materialized_parent_index_control<F>(
-    items: &[BtrfsLeafEntry],
-    subvol_name: &[u8],
-    subvol_uuid: &[u8; 16],
-    ctransid: u64,
-    read_extent: F,
-) -> Result<Vec<u8>, ParseError>
-where
-    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
-{
-    Ok(generate_send_stream_impl::<true, false, false, false, F>(
-        items,
-        subvol_name,
-        subvol_uuid,
-        ctransid,
-        0,
-        read_extent,
-    ))
-}
-
-/// BTreeMap inode-grouping control for the same-ELF performance harness.
-///
-/// This is not a supported application API. It retains the pre-optimization
-/// grouping representation only when benchmark instrumentation is enabled.
-#[cfg(feature = "bench-instrumentation")]
-#[doc(hidden)]
-pub fn generate_send_stream_btree_grouping_control<F>(
-    items: &[BtrfsLeafEntry],
-    subvol_name: &[u8],
-    subvol_uuid: &[u8; 16],
-    ctransid: u64,
-    read_extent: F,
-) -> Result<Vec<u8>, ParseError>
-where
-    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
-{
-    Ok(generate_send_stream_impl::<false, true, false, false, F>(
-        items,
-        subvol_name,
-        subvol_uuid,
-        ctransid,
-        0,
-        read_extent,
-    ))
-}
-
-/// BTreeMap inode-links control for the same-ELF performance harness.
-///
-/// This is not a supported application API. It retains the pre-optimization
-/// outer link-map representation only when benchmark instrumentation is enabled.
-#[cfg(feature = "bench-instrumentation")]
-#[doc(hidden)]
-pub fn generate_send_stream_btree_inode_links_control<F>(
-    items: &[BtrfsLeafEntry],
-    subvol_name: &[u8],
-    subvol_uuid: &[u8; 16],
-    ctransid: u64,
-    read_extent: F,
-) -> Result<Vec<u8>, ParseError>
-where
-    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
-{
-    Ok(generate_send_stream_impl::<false, false, true, false, F>(
-        items,
-        subvol_name,
-        subvol_uuid,
-        ctransid,
-        0,
-        read_extent,
-    ))
-}
-
-#[expect(clippy::too_many_lines)]
-fn generate_send_stream_impl<
-    const MATERIALIZED_PRIMARY_PARENTS: bool,
-    const FORCE_BTREE_INODE_GROUPS: bool,
-    const FORCE_BTREE_INODE_LINKS: bool,
-    const EXACT_OUTPUT_CAPACITY: bool,
-    F,
->(
-    items: &[BtrfsLeafEntry],
-    subvol_name: &[u8],
-    subvol_uuid: &[u8; 16],
-    ctransid: u64,
-    exact_output_capacity: usize,
-    mut read_extent: F,
-) -> Vec<u8>
-where
-    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
-{
-    let mut builder = if EXACT_OUTPUT_CAPACITY {
-        SendStreamBuilder::with_capacity(exact_output_capacity)
-    } else {
-        SendStreamBuilder::new()
-    };
+    let mut builder = SendStreamBuilder::new();
     builder.write_header();
 
     // Emit subvol command
-    add_subvol_command_direct(&mut builder, subvol_name, subvol_uuid, ctransid);
+    let (cmd, attrs) = build_subvol_command(subvol_name, subvol_uuid, ctransid);
+    let refs: Vec<(SendAttr, &[u8])> = attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+    builder.add_command(cmd, &refs);
 
     // Build inode -> links mapping from INODE_REF items. key.objectid = child
     // inode, key.offset = parent inode; an item can list several names (links
     // into the same parent), and an inode can have several INODE_REF items
     // (links into different parents). Collect ALL (parent, name) links so hard
     // links beyond the first are emitted as `link` commands, not dropped.
-    let inode_links = collect_send_inode_links::<FORCE_BTREE_INODE_LINKS>(items);
+    let mut inode_links: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
+    for entry in items {
+        if entry.key.item_type == BTRFS_ITEM_INODE_REF {
+            if let Ok(refs) = parse_inode_refs(&entry.data) {
+                let links = inode_links.entry(entry.key.objectid).or_default();
+                for r in refs {
+                    links.push((entry.key.offset, r.name.clone()));
+                }
+            }
+        }
+    }
     // The primary link (first) drives path construction; the rest become hard
-    // links. Production reads that link directly. The optional materialized
-    // projection is compiled only for the same-ELF benchmark control.
-    let inode_parents =
-        MATERIALIZED_PRIMARY_PARENTS.then(|| inode_links.materialize_primary_parents());
-    let primary_link_count = inode_parents
-        .as_ref()
-        .map_or_else(|| inode_links.len(), BTreeMap::len);
+    // links.
+    let inode_parents: BTreeMap<u64, (u64, Vec<u8>)> = inode_links
+        .iter()
+        .filter_map(|(&ino, links)| links.first().map(|(p, n)| (ino, (*p, n.clone()))))
+        .collect();
 
     // Build a command PATH for an inode by walking up the parent chain. btrfs
     // send command paths are RELATIVE to the received subvolume root: no
@@ -9401,72 +6711,48 @@ where
     // received root — its path is empty (chmod/chown/utimes of the root apply to
     // "."). A subvol-name prefix here makes every MKFILE/MKDIR/WRITE target a
     // never-created `subvol/` subdirectory, so `btrfs receive` fails with ENOENT.
-    let mut path_cache: HashMap<u64, Vec<u8>> =
-        HashMap::with_capacity(primary_link_count.saturating_add(1));
-    path_cache.insert(BTRFS_FIRST_FREE_OBJECTID, Vec::new());
-    let mut build_path = |ino: u64, cache_terminal: bool| -> Vec<u8> {
-        if let Some(path) = path_cache.get(&ino) {
-            return path.clone();
+    let build_path = |ino: u64| -> Vec<u8> {
+        if ino == BTRFS_FIRST_FREE_OBJECTID {
+            return Vec::new();
         }
-
-        let mut trail = Vec::new();
+        let mut components = Vec::new();
         let mut current = ino;
-        let mut base_path = Vec::new();
-        loop {
-            if let Some(path) = path_cache.get(&current) {
-                base_path.clone_from(path);
+
+        while let Some((parent, name)) = inode_parents.get(&current) {
+            components.push(name.clone());
+            if *parent == current || *parent == BTRFS_FIRST_FREE_OBJECTID {
                 break;
             }
-            let Some((parent, name)) = primary_inode_link::<MATERIALIZED_PRIMARY_PARENTS>(
-                &inode_links,
-                inode_parents.as_ref(),
-                current,
-            ) else {
-                break;
-            };
-            trail.push((current, name.to_vec()));
-            if parent == current || parent == BTRFS_FIRST_FREE_OBJECTID {
-                break;
-            }
-            current = parent;
+            current = *parent;
         }
 
-        let mut path = base_path;
-        let trail_len = trail.len();
-        for (position, (node, name)) in trail.iter().rev().enumerate() {
+        components.reverse();
+        let mut path = Vec::new();
+        for comp in components {
             if !path.is_empty() {
                 path.push(b'/');
             }
-            path.extend_from_slice(name);
-            let terminal = position + 1 == trail_len;
-            if cache_terminal || !terminal {
-                path_cache.insert(*node, path.clone());
-            }
-        }
-        if trail.is_empty() && cache_terminal {
-            path_cache.insert(ino, path.clone());
+            path.extend_from_slice(&comp);
         }
         path
     };
 
-    // Full tree walks and tree-log overlays produce key-ordered entries, so all
-    // items for one inode form a contiguous span. Borrow those spans directly
-    // instead of allocating a BTreeMap node plus Vec for every inode. Preserve
-    // the public function's arbitrary-slice behavior with the gathered fallback.
-    let inodes = group_send_inode_entries::<FORCE_BTREE_INODE_GROUPS>(items);
+    // Group items by objectid (inode)
+    let mut inodes: BTreeMap<u64, Vec<&BtrfsLeafEntry>> = BTreeMap::new();
+    for entry in items {
+        inodes.entry(entry.key.objectid).or_default().push(entry);
+    }
 
     // Emission order (bd-7ucz7): the receiver creates by PATH, so a parent
     // directory must already exist when its child is created. Emit DIRECTORIES
     // first in topological order (parent dirs before child dirs, by depth in the
-    // primary-link chain), then all non-directory inodes (whose parents are now
+    // inode_parents chain), then all non-directory inodes (whose parents are now
     // all present). Plain objectid order is parent-before-child for simple trees
     // but a rename can place a child under a higher-objectid dir, which would
     // emit the child before its parent and break the receive.
-    let mut dir_groups: Vec<usize> = Vec::new();
-    let mut other_groups: Vec<usize> = Vec::new();
-    for (group_index, group) in inodes.iter().enumerate() {
-        let ino = group.ino;
-        let entries = &group.entries;
+    let mut dir_inos: Vec<u64> = Vec::new();
+    let mut other_inos: Vec<u64> = Vec::new();
+    for (&ino, entries) in &inodes {
         if ino < BTRFS_FIRST_FREE_OBJECTID {
             continue;
         }
@@ -9479,66 +6765,32 @@ where
         };
         #[expect(clippy::cast_possible_truncation)]
         if (inode.mode as u16) & ffs_types::S_IFMT == ffs_types::S_IFDIR {
-            dir_groups.push(group_index);
+            dir_inos.push(ino);
         } else {
-            other_groups.push(group_index);
+            other_inos.push(ino);
         }
     }
-    let mut depth_cache: HashMap<u64, usize> =
-        HashMap::with_capacity(primary_link_count.saturating_add(1));
-    depth_cache.insert(BTRFS_FIRST_FREE_OBJECTID, 0);
-    let mut dir_depth = |start: u64| -> usize {
-        if let Some(&depth) = depth_cache.get(&start) {
-            return depth;
-        }
-
-        let mut trail = Vec::new();
+    let dir_depth = |start: u64| -> usize {
+        let mut depth = 0usize;
         let mut cur = start;
-        let mut base_depth = 0usize;
-        loop {
-            if let Some(&depth) = depth_cache.get(&cur) {
-                base_depth = depth;
+        while let Some((parent, _)) = inode_parents.get(&cur) {
+            if *parent == cur || *parent == BTRFS_FIRST_FREE_OBJECTID {
                 break;
             }
-            let Some((parent, _)) = primary_inode_link::<MATERIALIZED_PRIMARY_PARENTS>(
-                &inode_links,
-                inode_parents.as_ref(),
-                cur,
-            ) else {
-                break;
-            };
-            if parent == cur || parent == BTRFS_FIRST_FREE_OBJECTID {
-                break;
-            }
-            trail.push(cur);
-            cur = parent;
-            if trail.len() > inodes.len() {
-                let depth = trail.len();
-                depth_cache.insert(start, depth);
-                return depth;
-            }
-        }
-
-        let mut depth = base_depth;
-        for node in trail.iter().rev() {
+            cur = *parent;
             depth += 1;
-            depth_cache.insert(*node, depth);
+            if depth > inodes.len() {
+                break; // defensive: malformed cyclic parent chain
+            }
         }
-        let depth = depth_cache.get(&start).copied().unwrap_or(base_depth);
-        depth_cache.insert(start, depth);
         depth
     };
-    dir_groups.sort_by_key(|&group_index| {
-        let ino = inodes[group_index].ino;
-        (dir_depth(ino), ino)
-    });
-    let emit_order: Vec<usize> = dir_groups.into_iter().chain(other_groups).collect();
+    dir_inos.sort_by_key(|&ino| (dir_depth(ino), ino));
+    let emit_order: Vec<u64> = dir_inos.into_iter().chain(other_inos).collect();
 
     // Process each inode
-    for &group_index in &emit_order {
-        let group = &inodes[group_index];
-        let ino = group.ino;
-        let entries = &group.entries;
+    for &ino in &emit_order {
+        let entries = &inodes[&ino];
         // Skip special inodes (< BTRFS_FIRST_FREE_OBJECTID)
         if ino < BTRFS_FIRST_FREE_OBJECTID {
             continue;
@@ -9556,21 +6808,27 @@ where
             continue;
         };
 
+        let path = build_path(ino);
         // Truncate mode to u16 for S_IF* comparisons (upper bits are flags)
         #[expect(clippy::cast_possible_truncation)]
         let file_type = (inode.mode as u16) & ffs_types::S_IFMT;
-        let path = build_path(ino, file_type == ffs_types::S_IFDIR);
 
         // Emit create command based on type
         match file_type {
             ffs_types::S_IFDIR => {
                 // Skip root directory (already created by subvol)
                 if ino != BTRFS_FIRST_FREE_OBJECTID {
-                    add_path_ino_command_direct(&mut builder, SendCommand::Mkdir, &path, ino);
+                    let (cmd, attrs) = build_mkdir_command(&path, ino);
+                    let refs: Vec<(SendAttr, &[u8])> =
+                        attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                    builder.add_command(cmd, &refs);
                 }
             }
             ffs_types::S_IFREG => {
-                add_path_ino_command_direct(&mut builder, SendCommand::Mkfile, &path, ino);
+                let (cmd, attrs) = build_mkfile_command(&path, ino);
+                let refs: Vec<(SendAttr, &[u8])> =
+                    attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                builder.add_command(cmd, &refs);
 
                 // Emit write commands for file data
                 for entry in entries
@@ -9613,12 +6871,11 @@ where
                             u64::from_le_bytes(entry.data[45..53].try_into().unwrap_or([0; 8]));
 
                         if extent_type == BTRFS_FILE_EXTENT_PREALLOC || disk_bytenr == 0 {
-                            add_update_extent_command_direct(
-                                &mut builder,
-                                &path,
-                                file_offset,
-                                num_bytes,
-                            );
+                            let (cmd, attrs) =
+                                build_update_extent_command(&path, file_offset, num_bytes);
+                            let refs: Vec<(SendAttr, &[u8])> =
+                                attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                            builder.add_command(cmd, &refs);
                         } else if disk_num_bytes > 0 {
                             // Read (and, if compressed, decompress) extent data,
                             // then emit the write in uncompressed/logical space.
@@ -9644,13 +6901,10 @@ where
                 }
 
                 // Truncate to exact size
-                add_path_u64_command_direct(
-                    &mut builder,
-                    SendCommand::Truncate,
-                    &path,
-                    SendAttr::Size,
-                    inode.size,
-                );
+                let (cmd, attrs) = build_truncate_command(&path, inode.size);
+                let refs: Vec<(SendAttr, &[u8])> =
+                    attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                builder.add_command(cmd, &refs);
             }
             ffs_types::S_IFLNK => {
                 // For symlinks, the target is in the inline extent
@@ -9665,17 +6919,29 @@ where
                         }
                     })
                     .unwrap_or(b"");
-                add_symlink_command_direct(&mut builder, &path, ino, target);
+                let (cmd, attrs) = build_symlink_command(&path, ino, target);
+                let refs: Vec<(SendAttr, &[u8])> =
+                    attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                builder.add_command(cmd, &refs);
             }
             ffs_types::S_IFIFO => {
-                add_path_ino_command_direct(&mut builder, SendCommand::Mkfifo, &path, ino);
+                let (cmd, attrs) = build_mkfifo_command(&path, ino);
+                let refs: Vec<(SendAttr, &[u8])> =
+                    attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                builder.add_command(cmd, &refs);
             }
             ffs_types::S_IFSOCK => {
-                add_path_ino_command_direct(&mut builder, SendCommand::Mksock, &path, ino);
+                let (cmd, attrs) = build_mksock_command(&path, ino);
+                let refs: Vec<(SendAttr, &[u8])> =
+                    attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                builder.add_command(cmd, &refs);
             }
             ffs_types::S_IFCHR | ffs_types::S_IFBLK => {
                 let mode_with_type = u64::from(inode.mode);
-                add_mknod_command_direct(&mut builder, &path, ino, mode_with_type, inode.rdev);
+                let (cmd, attrs) = build_mknod_command(&path, ino, mode_with_type, inode.rdev);
+                let refs: Vec<(SendAttr, &[u8])> =
+                    attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                builder.add_command(cmd, &refs);
             }
             _ => continue,
         }
@@ -9685,16 +6951,19 @@ where
         // additional path. All parent dirs are already emitted, so the link path
         // resolves. (Directories cannot be hard-linked.)
         if file_type != ffs_types::S_IFDIR {
-            if let Some(links) = inode_links.get(ino) {
+            if let Some(links) = inode_links.get(&ino) {
                 for (parent, name) in links.iter().skip(1) {
-                    let mut link_path = build_path(*parent, true);
+                    let mut link_path = build_path(*parent);
                     // Relative to the subvol root: no leading slash for a link
                     // directly under the root (whose build_path is empty).
                     if !link_path.is_empty() {
                         link_path.push(b'/');
                     }
                     link_path.extend_from_slice(name);
-                    add_link_command_direct(&mut builder, &link_path, &path);
+                    let (cmd, attrs) = build_link_command(&link_path, &path);
+                    let refs: Vec<(SendAttr, &[u8])> =
+                        attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                    builder.add_command(cmd, &refs);
                 }
             }
         }
@@ -9706,33 +6975,28 @@ where
         {
             if let Ok(xattr_items) = parse_xattr_items(&entry.data) {
                 for xattr in xattr_items {
-                    add_setxattr_command_direct(&mut builder, &path, &xattr.name, &xattr.value);
+                    let (cmd, attrs) = build_setxattr_command(&path, &xattr.name, &xattr.value);
+                    let refs: Vec<(SendAttr, &[u8])> =
+                        attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+                    builder.add_command(cmd, &refs);
                 }
             }
         }
 
         // Emit chmod
         let mode_bits = u64::from(inode.mode & 0o7777);
-        add_path_u64_command_direct(
-            &mut builder,
-            SendCommand::Chmod,
-            &path,
-            SendAttr::Mode,
-            mode_bits,
-        );
+        let (cmd, attrs) = build_chmod_command(&path, mode_bits);
+        let refs: Vec<(SendAttr, &[u8])> = attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+        builder.add_command(cmd, &refs);
 
         // Emit chown
-        add_chown_command_direct(
-            &mut builder,
-            &path,
-            u64::from(inode.uid),
-            u64::from(inode.gid),
-        );
+        let (cmd, attrs) = build_chown_command(&path, u64::from(inode.uid), u64::from(inode.gid));
+        let refs: Vec<(SendAttr, &[u8])> = attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+        builder.add_command(cmd, &refs);
 
         // Emit utimes
         #[expect(clippy::cast_possible_wrap)]
-        add_utimes_command_direct(
-            &mut builder,
+        let (cmd, attrs) = build_utimes_command(
             &path,
             inode.atime_sec as i64,
             inode.atime_nsec as i32,
@@ -9741,10 +7005,12 @@ where
             inode.ctime_sec as i64,
             inode.ctime_nsec as i32,
         );
+        let refs: Vec<(SendAttr, &[u8])> = attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
+        builder.add_command(cmd, &refs);
     }
 
     builder.finalize();
-    builder.finish()
+    Ok(builder.finish())
 }
 
 // ── btrfs tree-log replay ─────────────────────────────────────────────────
@@ -9811,97 +7077,15 @@ pub fn replay_tree_log(
 
 #[cfg(test)]
 mod tests {
-    // Test code relaxes a few pedantic style lints (the workspace denies
-    // clippy::pedantic + nursery and the production lib stays strict); these add
-    // noise without value in test setup. See bd-rmcf0.
-    #![allow(
-        clippy::too_many_lines,
-        clippy::items_after_statements,
-        clippy::cast_possible_truncation
-    )]
     use super::*;
     use ffs_ondisk::{BtrfsStripe, BtrfsSuperblock};
     use proptest::prelude::*;
-    use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashMap};
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
 
     const NODESIZE: u32 = 4096;
     const HEADER_SIZE: usize = 101;
-
-    #[test]
-    fn send_inode_grouping_spans_match_btree_fallback() {
-        fn entry(objectid: u64, item_type: u8, offset: u64, marker: u8) -> BtrfsLeafEntry {
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid,
-                    item_type,
-                    offset,
-                },
-                data: vec![marker],
-            }
-        }
-
-        fn signature(groups: &[SendInodeGroup<'_>]) -> Vec<(u64, Vec<(u8, u64, u8)>)> {
-            groups
-                .iter()
-                .map(|group| {
-                    (
-                        group.ino,
-                        group
-                            .entries
-                            .iter()
-                            .map(|entry| {
-                                (
-                                    entry.key.item_type,
-                                    entry.key.offset,
-                                    entry.data.first().copied().unwrap_or_default(),
-                                )
-                            })
-                            .collect(),
-                    )
-                })
-                .collect()
-        }
-
-        let arbitrary = vec![
-            entry(258, BTRFS_ITEM_INODE_REF, 256, 1),
-            entry(256, BTRFS_ITEM_INODE_ITEM, 0, 2),
-            entry(258, BTRFS_ITEM_INODE_ITEM, 0, 3),
-            entry(257, BTRFS_ITEM_INODE_ITEM, 0, 4),
-            entry(256, BTRFS_ITEM_INODE_REF, 256, 5),
-        ];
-        let arbitrary_auto = group_send_inode_entries::<false>(&arbitrary);
-        let arbitrary_control = group_send_inode_entries::<true>(&arbitrary);
-        assert_eq!(
-            signature(&arbitrary_auto),
-            signature(&arbitrary_control),
-            "arbitrary input fallback changed group or within-group order"
-        );
-        assert!(
-            arbitrary_auto
-                .iter()
-                .all(|group| matches!(&group.entries, SendInodeEntries::Gathered(_))),
-            "non-monotone objectids must take the gathered fallback"
-        );
-
-        let mut sorted = arbitrary;
-        sorted.sort_by(|lhs, rhs| key_cmp(&lhs.key, &rhs.key));
-        let sorted_auto = group_send_inode_entries::<false>(&sorted);
-        let sorted_control = group_send_inode_entries::<true>(&sorted);
-        assert_eq!(
-            signature(&sorted_auto),
-            signature(&sorted_control),
-            "contiguous spans changed key order or group membership"
-        );
-        assert!(
-            sorted_auto
-                .iter()
-                .all(|group| matches!(&group.entries, SendInodeEntries::Contiguous(_))),
-            "key-ordered tree-walk input must borrow contiguous inode spans"
-        );
-    }
     const ITEM_SIZE: usize = 25;
     const KEY_PTR_SIZE: usize = 33;
 
@@ -10137,100 +7321,6 @@ mod tests {
         ));
     }
 
-    proptest::proptest! {
-        /// verify_extent_csum accepts correct per-sector crc32c and reports the
-        /// first mismatching sector when one is corrupted, across varying sector
-        /// counts. The unit tests only use fixed 2-sector examples.
-        #[test]
-        fn proptest_verify_extent_csum_roundtrip_and_tamper(
-            num_sectors in 1_usize..=8,
-            seed in any::<u64>(),
-            corrupt_sector in 0_usize..8,
-        ) {
-            let sectorsize = 64_usize;
-            let mut data = vec![0_u8; num_sectors * sectorsize];
-            let mut rng = seed;
-            for b in &mut data {
-                rng = rng
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                *b = rng.to_le_bytes()[7];
-            }
-
-            let mut csums = Vec::with_capacity(num_sectors * 4);
-            for s in 0..num_sectors {
-                let crc = ffs_types::crc32c(&data[s * sectorsize..(s + 1) * sectorsize]);
-                csums.extend_from_slice(&crc.to_le_bytes());
-            }
-
-            // Correct csums verify.
-            proptest::prop_assert_eq!(verify_extent_csum(&data, sectorsize, &csums), Ok(()));
-
-            // Corrupting one sector flags exactly that sector (the only, hence
-            // first, mismatch).
-            if corrupt_sector < num_sectors {
-                let mut tampered = data.clone();
-                tampered[corrupt_sector * sectorsize] ^= 0x5A;
-                match verify_extent_csum(&tampered, sectorsize, &csums) {
-                    Err(Ok(m)) => proptest::prop_assert_eq!(m.sector_index, corrupt_sector),
-                    other => proptest::prop_assert!(
-                        false,
-                        "expected mismatch at sector {}, got {:?}",
-                        corrupt_sector,
-                        other
-                    ),
-                }
-            }
-        }
-    }
-
-    proptest::proptest! {
-        /// build_extent_csum_items + lookup_data_block_csum form a roundtrip:
-        /// every sector's packed crc32c must be recoverable, across arbitrary
-        /// sector counts, split factors, and bases. The unit test below covers
-        /// one fixed configuration only.
-        #[test]
-        fn proptest_build_csum_items_then_lookup_each_sector(
-            num_sectors in 1_usize..=12,
-            split in 1_usize..=4,
-            base_units in 0_u64..=1000,
-            seed in any::<u64>(),
-        ) {
-            let sectorsize = 4096_usize;
-            let base = base_units * u64::try_from(sectorsize).unwrap();
-
-            let mut data = vec![0_u8; num_sectors * sectorsize];
-            let mut rng = seed;
-            for b in &mut data {
-                rng = rng
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                *b = rng.to_le_bytes()[7];
-            }
-
-            let items = build_extent_csum_items(base, &data, sectorsize, split)
-                .expect("build csum items");
-
-            // Every sector's csum is recoverable.
-            for s in 0..num_sectors {
-                let off = s * sectorsize;
-                let bytenr = base + u64::try_from(off).unwrap();
-                let want = ffs_types::crc32c(&data[off..off + sectorsize]);
-                proptest::prop_assert_eq!(
-                    lookup_data_block_csum(&items, bytenr, sectorsize),
-                    Some(want),
-                    "sector {} of {}",
-                    s,
-                    num_sectors
-                );
-            }
-
-            // Just past the covered run -> miss.
-            let past = base + u64::try_from(num_sectors * sectorsize).unwrap();
-            proptest::prop_assert_eq!(lookup_data_block_csum(&items, past, sectorsize), None);
-        }
-    }
-
     #[test]
     fn lookup_data_block_csum_finds_block_across_split_items_bd_x3fcu() {
         let sectorsize = 4096_usize;
@@ -10275,43 +7365,6 @@ mod tests {
         assert_eq!(lookup_data_block_csum(&noise, base, sectorsize), None);
     }
 
-    #[test]
-    fn lookup_data_block_csum_skips_interleaved_non_csum_item() {
-        let sectorsize = 4096_usize;
-        let base = 0x80_000_u64;
-        let ss = u64::try_from(sectorsize).expect("ss");
-
-        // A single EXTENT_CSUM item covering two sectors at `base`.
-        let mut data = Vec::new();
-        for s in 0..2_u8 {
-            data.extend(std::iter::repeat_n(0x20 | s, sectorsize));
-        }
-        let mut items = build_extent_csum_items(base, &data, sectorsize, 2).expect("csum item");
-        assert_eq!(items.len(), 1);
-
-        // A non-csum item at a HIGHER offset (base + sectorsize), still
-        // <= disk_bytenr, so the reverse walk-back encounters it first and must
-        // skip it (continue) to reach the csum item at `base`.
-        items.push((
-            BtrfsKey {
-                objectid: 5,
-                item_type: BTRFS_ITEM_INODE_ITEM,
-                offset: base + ss,
-            },
-            vec![0xFF_u8; 64],
-        ));
-        items.sort_by_key(|(k, _)| k.offset);
-
-        // Sector 1 lives at base + sectorsize, exactly where the non-csum item
-        // sits. The lookup must skip it and resolve sector index 1's real crc.
-        let want = ffs_types::crc32c(&data[sectorsize..2 * sectorsize]);
-        assert_eq!(
-            lookup_data_block_csum(&items, base + ss, sectorsize),
-            Some(want),
-            "must skip the interleaved non-csum item and resolve sector 1",
-        );
-    }
-
     fn test_key(objectid: u64) -> BtrfsKey {
         BtrfsKey {
             objectid,
@@ -10322,355 +7375,6 @@ mod tests {
 
     fn test_payload(objectid: u64) -> [u8; 1] {
         [u8::try_from(objectid).expect("test objectid should fit in u8")]
-    }
-
-    // bd-cowbatch: `insert_many` (batched, in-place fast path for same-batch
-    // staged leaves) must yield a tree LOGICALLY IDENTICAL to inserting the same
-    // entries one-by-one — the invariant that catches any in-place COW corruption.
-    #[test]
-    fn insert_many_matches_sequential_bd_cowbatch() {
-        fn cb_key(oid: u64) -> BtrfsKey {
-            BtrfsKey {
-                objectid: oid,
-                item_type: BTRFS_ITEM_INODE_ITEM,
-                offset: 0,
-            }
-        }
-        fn cb_payload(oid: u64) -> Vec<u8> {
-            oid.to_le_bytes().to_vec()
-        }
-        let mut seq = InMemoryCowBtrfsTree::new(8).expect("seq tree");
-        let mut batch = InMemoryCowBtrfsTree::new(8).expect("batch tree");
-        // Pre-fill identically into a deep tree (internal nodes + splits).
-        let mut seeded = std::collections::BTreeSet::new();
-        for i in 0..600u64 {
-            let oid = i.wrapping_mul(7) % 1000;
-            if seeded.insert(oid) {
-                seq.insert(cb_key(oid), &cb_payload(oid))
-                    .expect("seq prefill");
-                batch
-                    .insert(cb_key(oid), &cb_payload(oid))
-                    .expect("batch prefill");
-            }
-        }
-        // New entries: an adjacent cluster (same leaf -> exercises in-place after
-        // the first insert stages it) + scattered keys (different leaves) + keys
-        // adjacent to existing ones (split pressure). Skip any already seeded.
-        let new_oids: Vec<u64> = [
-            1001, 1002, 1003, 1004, 2500, 5500, 7500, 1005, 1006, 1007, 9001, 9002,
-        ]
-        .into_iter()
-        .filter(|oid| !seeded.contains(oid))
-        .collect();
-        let entries: Vec<BtrfsTreeItem> = new_oids
-            .iter()
-            .map(|&oid| BtrfsTreeItem {
-                key: cb_key(oid),
-                data: cb_payload(oid).into(),
-            })
-            .collect();
-        for &oid in &new_oids {
-            seq.insert(cb_key(oid), &cb_payload(oid))
-                .expect("seq insert");
-        }
-        batch
-            .insert_many(entries, false)
-            .expect("batch insert_many");
-
-        seq.validate_invariants().expect("seq invariants");
-        batch.validate_invariants().expect("batch invariants");
-
-        let mut all: Vec<u64> = seeded.iter().copied().collect();
-        all.extend(new_oids.iter().copied());
-        for &oid in &all {
-            assert_eq!(
-                batch.find(&cb_key(oid)).expect("batch find"),
-                seq.find(&cb_key(oid)).expect("seq find"),
-                "insert_many vs sequential mismatch at oid {oid}"
-            );
-        }
-        // A never-inserted key is absent in both.
-        assert_eq!(batch.find(&cb_key(424_242)).expect("batch absent"), None);
-        assert_eq!(seq.find(&cb_key(424_242)).expect("seq absent"), None);
-    }
-
-    #[test]
-    fn remove_many_insert_many_update_matches_sequential_rename_shape_bd_cowbatch() {
-        fn rk(objectid: u64, item_type: u8, offset: u64) -> BtrfsKey {
-            BtrfsKey {
-                objectid,
-                item_type,
-                offset,
-            }
-        }
-        fn rp(tag: u64) -> Vec<u8> {
-            let mut payload = vec![0_u8; 24];
-            payload[0..8].copy_from_slice(&tag.to_le_bytes());
-            payload[8..16].copy_from_slice(&(tag.wrapping_mul(17)).to_le_bytes());
-            payload[16..24].copy_from_slice(&(tag ^ 0xa5a5_a5a5_a5a5_a5a5).to_le_bytes());
-            payload
-        }
-        fn full_range(tree: &InMemoryCowBtrfsTree) -> Vec<(BtrfsKey, Vec<u8>)> {
-            tree.range(
-                &BtrfsKey {
-                    objectid: 0,
-                    item_type: 0,
-                    offset: 0,
-                },
-                &BtrfsKey {
-                    objectid: u64::MAX,
-                    item_type: u8::MAX,
-                    offset: u64::MAX,
-                },
-            )
-            .expect("full range")
-        }
-
-        let mut seq = InMemoryCowBtrfsTree::new(8).expect("seq tree");
-        let mut fused = InMemoryCowBtrfsTree::new(8).expect("fused tree");
-        for i in 0..700_u64 {
-            let key = rk(i.wrapping_mul(5).wrapping_add(10), BTRFS_ITEM_INODE_ITEM, 0);
-            let payload = rp(i);
-            seq.insert(key, &payload).expect("seq prefill");
-            fused.insert(key, &payload).expect("fused prefill");
-        }
-
-        let parent_oid = 1_000_000_u64;
-        let child_oid = 1_000_001_u64;
-        let parent_key = rk(parent_oid, BTRFS_ITEM_INODE_ITEM, 0);
-        let old_dir_item_key = rk(parent_oid, BTRFS_ITEM_DIR_ITEM, 10);
-        let old_dir_index_key = rk(parent_oid, BTRFS_ITEM_DIR_INDEX, 30);
-        let ref_key = rk(child_oid, BTRFS_ITEM_INODE_REF, parent_oid);
-        let new_dir_item_key = rk(parent_oid, BTRFS_ITEM_DIR_ITEM, 11);
-        let new_dir_index_key = rk(parent_oid, BTRFS_ITEM_DIR_INDEX, 31);
-
-        let initial_items = [
-            (parent_key, rp(1)),
-            (old_dir_item_key, rp(2)),
-            (old_dir_index_key, rp(3)),
-            (ref_key, rp(4)),
-        ];
-        for (key, payload) in &initial_items {
-            seq.insert(*key, payload).expect("seq rename seed");
-            fused.insert(*key, payload).expect("fused rename seed");
-        }
-
-        let removals = [old_dir_item_key, old_dir_index_key, ref_key];
-        let insert_payloads = [
-            (new_dir_item_key, rp(20)),
-            (new_dir_index_key, rp(21)),
-            (ref_key, rp(22)),
-        ];
-        let insert_refs: Vec<_> = insert_payloads
-            .iter()
-            .map(|(key, payload)| (*key, payload.as_slice()))
-            .collect();
-        let parent_payload = rp(99);
-
-        for key in removals {
-            seq.delete(&key).expect("seq remove");
-        }
-        for (key, payload) in &insert_payloads {
-            seq.insert(*key, payload).expect("seq insert");
-        }
-        seq.update(&parent_key, &parent_payload)
-            .expect("seq parent update");
-
-        fused
-            .remove_many_then_insert_many_then_update(
-                &removals,
-                &insert_refs,
-                &parent_key,
-                &parent_payload,
-            )
-            .expect("fused rename batch");
-
-        seq.validate_invariants().expect("seq invariants");
-        fused.validate_invariants().expect("fused invariants");
-        assert_eq!(full_range(&fused), full_range(&seq));
-    }
-
-    // bd-cowbatch timing proxy (run explicitly: `cargo test -p ffs-btrfs --
-    // cowbatch_timing --ignored --nocapture --profile release-perf`). Models btrfs
-    // create's 4 inserts hitting 2 leaves (2 items per objectid), measuring the
-    // COW-clone churn of insert_many (in-place for the 2nd item of each pair) vs
-    // 4 separate insert()s (full root->leaf re-clone each).
-    #[test]
-    #[ignore = "manual timing proxy; run explicitly under release-perf"]
-    fn cowbatch_timing_ratio_bd_cowbatch() {
-        fn tk(oid: u64, t: u8) -> BtrfsKey {
-            BtrfsKey {
-                objectid: oid,
-                item_type: t,
-                offset: 0,
-            }
-        }
-        fn tp(oid: u64) -> Vec<u8> {
-            oid.to_le_bytes().to_vec()
-        }
-        let build = || {
-            let mut t = InMemoryCowBtrfsTree::new(16).expect("tree");
-            for i in 0..4000u64 {
-                t.insert(tk(i * 3, 1), &tp(i)).expect("prefill");
-            }
-            t
-        };
-        let n = 4000u64;
-        let mut seq = build();
-        let t0 = std::time::Instant::now();
-        for i in 0..n {
-            let a = 14_000 + i * 4;
-            let b = 200_000 + i * 4;
-            seq.insert(tk(a, 1), &tp(a)).expect("s1");
-            seq.insert(tk(a, 12), &tp(a)).expect("s2");
-            seq.insert(tk(b, 1), &tp(b)).expect("s3");
-            seq.insert(tk(b, 12), &tp(b)).expect("s4");
-        }
-        let seq_us = t0.elapsed().as_micros();
-        let mut bat = build();
-        let t1 = std::time::Instant::now();
-        for i in 0..n {
-            let a = 14_000 + i * 4;
-            let b = 200_000 + i * 4;
-            let entries = vec![
-                BtrfsTreeItem {
-                    key: tk(a, 1),
-                    data: tp(a).into(),
-                },
-                BtrfsTreeItem {
-                    key: tk(a, 12),
-                    data: tp(a).into(),
-                },
-                BtrfsTreeItem {
-                    key: tk(b, 1),
-                    data: tp(b).into(),
-                },
-                BtrfsTreeItem {
-                    key: tk(b, 12),
-                    data: tp(b).into(),
-                },
-            ];
-            bat.insert_many(entries, false).expect("batch");
-        }
-        let bat_us = t1.elapsed().as_micros();
-        eprintln!(
-            "COWBATCH n={n} seq={seq_us}us batch={bat_us}us ratio={:.2}x",
-            seq_us as f64 / bat_us.max(1) as f64
-        );
-        assert_eq!(
-            bat.find(&tk(14_000, 1)).expect("b"),
-            seq.find(&tk(14_000, 1)).expect("s")
-        );
-    }
-
-    proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
-        /// bd-cowbatch hardened gate: over RANDOM node fanouts, random prefills and
-        /// random insert batches (multi-leaf, split pressure, in-place + clone-path
-        /// mix), `insert_many` must yield a tree LOGICALLY IDENTICAL to inserting
-        /// the same entries one-by-one — catches any in-place COW corruption the
-        /// fixed unit test misses.
-        #[test]
-        fn proptest_insert_many_matches_sequential_bd_cowbatch(
-            max_items in 3_usize..=12,
-            prefill in proptest::collection::vec(0_u64..400, 0..220),
-            batch in proptest::collection::vec(0_u64..400, 1..40),
-        ) {
-            fn pk(oid: u64) -> BtrfsKey {
-                BtrfsKey { objectid: oid, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 }
-            }
-            fn pp(oid: u64) -> Vec<u8> {
-                oid.to_le_bytes().to_vec()
-            }
-            let mut seq = InMemoryCowBtrfsTree::new(max_items).expect("seq tree");
-            let mut bat = InMemoryCowBtrfsTree::new(max_items).expect("bat tree");
-            let mut present = std::collections::BTreeSet::new();
-            for &oid in &prefill {
-                if present.insert(oid) {
-                    seq.insert(pk(oid), &pp(oid)).expect("seq prefill");
-                    bat.insert(pk(oid), &pp(oid)).expect("bat prefill");
-                }
-            }
-            // Insert-set must be free of duplicates (allow_replace=false), so drop
-            // any batch key already present or repeated within the batch.
-            let mut seen = present.clone();
-            let mut batch_keys = Vec::new();
-            for &oid in &batch {
-                if seen.insert(oid) {
-                    batch_keys.push(oid);
-                }
-            }
-            proptest::prop_assume!(!batch_keys.is_empty());
-            for &oid in &batch_keys {
-                seq.insert(pk(oid), &pp(oid)).expect("seq insert");
-            }
-            let entries: Vec<BtrfsTreeItem> = batch_keys
-                .iter()
-                .map(|&oid| BtrfsTreeItem { key: pk(oid), data: pp(oid).into() })
-                .collect();
-            bat.insert_many(entries, false).expect("bat insert_many");
-            seq.validate_invariants().expect("seq invariants");
-            bat.validate_invariants().expect("bat invariants");
-            let mut all: Vec<u64> = present.iter().copied().collect();
-            all.extend(batch_keys.iter().copied());
-            for &oid in &all {
-                proptest::prop_assert_eq!(
-                    bat.find(&pk(oid)).expect("bat find"),
-                    seq.find(&pk(oid)).expect("seq find")
-                );
-            }
-        }
-
-        /// bd-cowbatch remove_many hardened gate: over random fanouts, random
-        /// prefills and random delete subsets (multi-leaf, underflow/rebalance +
-        /// in-place mix), remove_many yields a tree LOGICALLY IDENTICAL to deleting
-        /// the keys one-by-one — catches any in-place COW-delete corruption.
-        #[test]
-        fn proptest_remove_many_matches_sequential_bd_cowbatch(
-            max_items in 3_usize..=12,
-            prefill in proptest::collection::vec(0_u64..400, 1..240),
-            del in proptest::collection::vec(0_u64..400, 1..60),
-        ) {
-            fn pk(oid: u64) -> BtrfsKey {
-                BtrfsKey { objectid: oid, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 }
-            }
-            fn pp(oid: u64) -> Vec<u8> {
-                oid.to_le_bytes().to_vec()
-            }
-            let mut seq = InMemoryCowBtrfsTree::new(max_items).expect("seq tree");
-            let mut bat = InMemoryCowBtrfsTree::new(max_items).expect("bat tree");
-            let mut present = std::collections::BTreeSet::new();
-            for &oid in &prefill {
-                if present.insert(oid) {
-                    seq.insert(pk(oid), &pp(oid)).expect("seq prefill");
-                    bat.insert(pk(oid), &pp(oid)).expect("bat prefill");
-                }
-            }
-            // Delete only existing keys (delete errors on a missing key), each once.
-            let mut to_del = Vec::new();
-            let mut seen = std::collections::BTreeSet::new();
-            for &oid in &del {
-                if present.contains(&oid) && seen.insert(oid) {
-                    to_del.push(oid);
-                }
-            }
-            proptest::prop_assume!(!to_del.is_empty());
-            for &oid in &to_del {
-                seq.delete(&pk(oid)).expect("seq delete");
-            }
-            let keys: Vec<BtrfsKey> = to_del.iter().map(|&oid| pk(oid)).collect();
-            bat.remove_many(&keys).expect("bat remove_many");
-            seq.validate_invariants().expect("seq invariants");
-            bat.validate_invariants().expect("bat invariants");
-            // Every prefilled key resolves identically (deleted => None in both;
-            // surviving => same payload in both).
-            for &oid in &present {
-                proptest::prop_assert_eq!(
-                    bat.find(&pk(oid)).expect("bat find"),
-                    seq.find(&pk(oid)).expect("seq find")
-                );
-            }
-        }
     }
 
     fn hex_lower(bytes: &[u8]) -> String {
@@ -10738,20 +7442,6 @@ mod tests {
             .checked_add(payload.len())
             .expect("test item payload end fits usize");
         block[data_start..data_end].copy_from_slice(payload);
-    }
-
-    fn write_leaf_item_payload_with_key_offset(
-        block: &mut [u8],
-        idx: usize,
-        objectid: u64,
-        item_type: u8,
-        key_offset: u64,
-        data_off: u32,
-        payload: &[u8],
-    ) {
-        write_leaf_item_payload(block, idx, objectid, item_type, data_off, payload);
-        let base = HEADER_SIZE + idx * ITEM_SIZE;
-        block[base + 9..base + 17].copy_from_slice(&key_offset.to_le_bytes());
     }
 
     /// Write an internal key-pointer entry at the given index.
@@ -10847,116 +7537,6 @@ mod tests {
 
         let err = walk_chunk_tree(&mut read, &sb, &chunks).unwrap_err();
         assert!(matches!(err, ParseError::InsufficientData { .. }));
-    }
-
-    #[test]
-    fn walk_chunk_tree_dedup_preserves_first_occurrence_golden_bd_o6orc() {
-        let root_logical = 0x4000_u64;
-        let chunks = identity_chunks();
-        let chunk_type = chunk_type_flags::BTRFS_BLOCK_GROUP_DATA;
-
-        let duplicate_bootstrap = make_chunk_item_payload(0x2000_0000, 0x1_0000, chunk_type, 1);
-        let first_new = make_chunk_item_payload(0x4000_0000, 0x1_0000, chunk_type, 1);
-        let second_new = make_chunk_item_payload(0x4000_0000, 0x1_0000, chunk_type, 1);
-
-        let mut leaf = vec![0_u8; NODESIZE as usize];
-        write_header(&mut leaf, root_logical, 4, 0, BTRFS_CHUNK_TREE_OBJECTID, 1);
-
-        let mut data_off = NODESIZE;
-        data_off = data_off
-            .checked_sub(4)
-            .expect("test noise item fits in node");
-        write_leaf_item_payload_with_key_offset(
-            &mut leaf,
-            0,
-            BTRFS_CHUNK_TREE_OBJECTID,
-            BTRFS_ITEM_INODE_ITEM,
-            0x2000_0000,
-            data_off,
-            b"skip",
-        );
-        for (idx, logical, payload) in [
-            (1_usize, 0_u64, duplicate_bootstrap.as_slice()),
-            (2, 0x4000_0000, first_new.as_slice()),
-            (3, 0x8000_0000, second_new.as_slice()),
-        ] {
-            let payload_len = u32::try_from(payload.len()).expect("test payload fits u32");
-            data_off = data_off
-                .checked_sub(payload_len)
-                .expect("test leaf payloads fit in node");
-            write_leaf_item_payload_with_key_offset(
-                &mut leaf,
-                idx,
-                BTRFS_CHUNK_TREE_OBJECTID,
-                BTRFS_ITEM_CHUNK,
-                logical,
-                data_off,
-                payload,
-            );
-        }
-        stamp_tree_block_crc32c(&mut leaf);
-
-        let blocks: HashMap<u64, Vec<u8>> = [(root_logical, leaf)].into();
-        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
-            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
-                field: "physical",
-                reason: "block not in test image",
-            })
-        };
-
-        let sb = BtrfsSuperblock {
-            csum: [0; 32],
-            fsid: [0; 16],
-            bytenr: root_logical,
-            flags: 0,
-            magic: 0,
-            generation: 1,
-            root: 0,
-            chunk_root: root_logical,
-            chunk_root_generation: 1,
-            log_root: 0,
-            total_bytes: 0,
-            bytes_used: 0,
-            root_dir_objectid: 0,
-            num_devices: 1,
-            sectorsize: 4096,
-            nodesize: NODESIZE,
-            stripesize: 0,
-            compat_flags: 0,
-            compat_ro_flags: 0,
-            incompat_flags: 0,
-            csum_type: 0,
-            root_level: 0,
-            chunk_root_level: 0,
-            log_root_level: 0,
-            label: String::new(),
-            sys_chunk_array_size: 0,
-            sys_chunk_array: Vec::new(),
-        };
-
-        let walked = walk_chunk_tree(&mut read, &sb, &chunks).expect("walk chunk tree");
-        let offsets: Vec<u64> = walked.iter().map(|chunk| chunk.key.offset).collect();
-        assert_eq!(offsets, vec![0, 0x4000_0000, 0x8000_0000]);
-        assert_eq!(
-            walked
-                .iter()
-                .find(|chunk| chunk.key.offset == 0)
-                .expect("deduped chunk exists")
-                .length,
-            0x4000_0000,
-            "dedup must keep the bootstrap chunk for a duplicated logical offset"
-        );
-
-        let mut digest = Sha256::new();
-        for chunk in &walked {
-            digest.update(chunk.key.offset.to_le_bytes());
-            digest.update(chunk.length.to_le_bytes());
-            digest.update(chunk.stripes[0].offset.to_le_bytes());
-        }
-        assert_eq!(
-            hex_lower(digest.finalize().as_ref()),
-            "5449ca7c23cfc149c3770b706d2363ba9f44dab3b1ec3e5347d5e98e87a0abbc"
-        );
     }
 
     #[test]
@@ -11147,362 +7727,6 @@ mod tests {
                     "range [{lo:?},{hi:?}) hit {hits} leaves but read {range_reads} (no pruning vs full {full_reads})"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn parse_btrfs_tree_node_owned_reuses_leaf_buffer_bd_5koeh() {
-        let oids: Vec<u64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
-        let (blocks, root_logical) = build_two_level_tree(&oids);
-
-        for (&logical, bytes) in &blocks {
-            let borrowed = parse_btrfs_tree_node(bytes, 0, logical, NODESIZE).expect("borrowed");
-            let owned_bytes = bytes.clone();
-            let owned_ptr = owned_bytes.as_ptr();
-            let owned =
-                parse_btrfs_tree_node_owned(owned_bytes, 0, logical, NODESIZE).expect("owned");
-
-            match (borrowed, owned) {
-                (
-                    BtrfsParsedNode::Leaf {
-                        block: borrowed_block,
-                        items: borrowed_items,
-                    },
-                    BtrfsParsedNode::Leaf {
-                        block: owned_block,
-                        items: owned_items,
-                    },
-                ) => {
-                    assert_eq!(borrowed_items, owned_items);
-                    assert_eq!(borrowed_block.as_slice(), owned_block.as_slice());
-                    assert_eq!(owned_ptr, owned_block.as_ptr());
-                }
-                (
-                    BtrfsParsedNode::Internal {
-                        ptrs: borrowed_ptrs,
-                    },
-                    BtrfsParsedNode::Internal { ptrs: owned_ptrs },
-                ) => assert_eq!(borrowed_ptrs, owned_ptrs),
-                _ => panic!("borrowed and owned parsers disagreed on node level"),
-            }
-        }
-
-        let (&leaf_logical, leaf_bytes) = blocks
-            .iter()
-            .find(|(logical, _)| **logical != root_logical)
-            .expect("leaf");
-        let mut truncated = leaf_bytes.clone();
-        truncated.pop();
-        assert_eq!(
-            parse_btrfs_tree_node(&truncated, 0, leaf_logical, NODESIZE).unwrap_err(),
-            parse_btrfs_tree_node_owned(truncated, 0, leaf_logical, NODESIZE).unwrap_err()
-        );
-        let mut corrupt = leaf_bytes.clone();
-        corrupt[BTRFS_HEADER_SIZE + BTRFS_ITEM_SIZE] ^= 0x80;
-        assert_eq!(
-            parse_btrfs_tree_node(&corrupt, 0, leaf_logical, NODESIZE).unwrap_err(),
-            parse_btrfs_tree_node_owned(corrupt, 0, leaf_logical, NODESIZE).unwrap_err()
-        );
-    }
-
-    #[test]
-    fn walk_tree_range_with_nodes_matches_byte_walk_bd_u1n5f() {
-        // A parsed-node cache (the read-only mount's reuse of verified+parsed
-        // nodes across traversals) must yield byte-for-byte the same entries as
-        // the byte walker, across repeated passes (warm cache) and varied ranges.
-        let oids: Vec<u64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
-        let (blocks, root_logical) = build_two_level_tree(&oids);
-        let chunks = identity_chunks();
-
-        // Parse every node once into a shared cache, keyed by logical address
-        // (logical == physical under the identity chunk map).
-        let mut cache: HashMap<u64, Arc<BtrfsParsedNode>> = HashMap::new();
-        for (&addr, bytes) in &blocks {
-            let node = parse_btrfs_tree_node(bytes, 0, addr, NODESIZE).expect("parse node");
-            cache.insert(addr, Arc::new(node));
-        }
-
-        let key = |oid: u64| BtrfsKey {
-            objectid: oid,
-            item_type: 0,
-            offset: 0,
-        };
-        let ranges = [
-            (key(0), key(50)),
-            (key(300), key(301)),
-            (key(250), key(650)),
-            (key(800), key(900)),
-            (key(0), key(10_000)),
-            (key(401), key(599)),
-        ];
-
-        // Two passes exercise warm-cache reuse (the second pass re-reads the
-        // same Arc nodes the first pass did).
-        for _pass in 0..2 {
-            for (lo, hi) in ranges {
-                let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
-                    blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
-                        field: "physical",
-                        reason: "block not in test image",
-                    })
-                };
-                let from_bytes =
-                    walk_tree_range(&mut read, &chunks, root_logical, NODESIZE, 0, lo, hi)
-                        .expect("byte walk");
-
-                let mut provider = |logical: u64| -> Result<Arc<BtrfsParsedNode>, ParseError> {
-                    cache
-                        .get(&logical)
-                        .cloned()
-                        .ok_or(ParseError::InvalidField {
-                            field: "logical",
-                            reason: "node not in parsed cache",
-                        })
-                };
-                let from_cache =
-                    walk_tree_range_with_nodes(&mut provider, root_logical, NODESIZE, lo, hi)
-                        .expect("cached walk");
-
-                assert_eq!(from_bytes, from_cache, "range [{lo:?},{hi:?})");
-            }
-        }
-    }
-
-    #[test]
-    fn walk_tree_range_parallel_with_nodes_matches_serial() {
-        // bd-h6p3w isomorphism: parallel child-node prefetch may overlap the
-        // provider cost, but subtrees are still finalized in key-pointer order.
-        // The owned entries must therefore match the serial cached walker
-        // exactly for empty, narrow, multi-leaf, boundary, and whole-tree ranges.
-        let oids: Vec<u64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
-        let (blocks, root_logical) = build_two_level_tree(&oids);
-
-        let mut cache: HashMap<u64, Arc<BtrfsParsedNode>> = HashMap::new();
-        for (&addr, bytes) in &blocks {
-            let node = parse_btrfs_tree_node(bytes, 0, addr, NODESIZE).expect("parse node");
-            cache.insert(addr, Arc::new(node));
-        }
-
-        let key = |oid: u64| BtrfsKey {
-            objectid: oid,
-            item_type: 0,
-            offset: 0,
-        };
-        let ranges = [
-            (key(0), key(50)),
-            (key(100), key(101)),
-            (key(250), key(650)),
-            (key(800), key(900)),
-            (key(0), key(10_000)),
-            (key(401), key(599)),
-        ];
-
-        for (lo, hi) in ranges {
-            let mut serial_provider = |logical: u64| -> Result<Arc<BtrfsParsedNode>, ParseError> {
-                cache
-                    .get(&logical)
-                    .cloned()
-                    .ok_or(ParseError::InvalidField {
-                        field: "logical",
-                        reason: "node not in parsed cache",
-                    })
-            };
-            let serial =
-                walk_tree_range_with_nodes(&mut serial_provider, root_logical, NODESIZE, lo, hi)
-                    .expect("serial cached walk");
-
-            let parallel_provider = |logical: u64| -> Result<Arc<BtrfsParsedNode>, ParseError> {
-                cache
-                    .get(&logical)
-                    .cloned()
-                    .ok_or(ParseError::InvalidField {
-                        field: "logical",
-                        reason: "node not in parsed cache",
-                    })
-            };
-            let parallel = walk_tree_range_parallel_with_nodes(
-                &parallel_provider,
-                root_logical,
-                NODESIZE,
-                lo,
-                hi,
-            )
-            .expect("parallel cached walk");
-
-            assert_eq!(parallel, serial, "range [{lo:?},{hi:?})");
-        }
-    }
-
-    #[test]
-    fn walk_tree_parallel_with_nodes_matches_serial() {
-        // bd-l8r3s isomorphism: the full-tree parallel walker must produce the
-        // exact same owned leaf entries (left-to-right DFS order) as the serial
-        // walk_tree_with_nodes — subtrees are still finalized serially in
-        // key-pointer order, only the per-node child fetch overlaps.
-        let oids: Vec<u64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
-        let (blocks, root_logical) = build_two_level_tree(&oids);
-
-        let mut cache: HashMap<u64, Arc<BtrfsParsedNode>> = HashMap::new();
-        for (&addr, bytes) in &blocks {
-            let node = parse_btrfs_tree_node(bytes, 0, addr, NODESIZE).expect("parse node");
-            cache.insert(addr, Arc::new(node));
-        }
-
-        let mut serial_provider = |logical: u64| -> Result<Arc<BtrfsParsedNode>, ParseError> {
-            cache
-                .get(&logical)
-                .cloned()
-                .ok_or(ParseError::InvalidField {
-                    field: "logical",
-                    reason: "node not in parsed cache",
-                })
-        };
-        let serial = walk_tree_with_nodes(&mut serial_provider, root_logical, NODESIZE)
-            .expect("serial cached full walk");
-
-        let parallel_provider = |logical: u64| -> Result<Arc<BtrfsParsedNode>, ParseError> {
-            cache
-                .get(&logical)
-                .cloned()
-                .ok_or(ParseError::InvalidField {
-                    field: "logical",
-                    reason: "node not in parsed cache",
-                })
-        };
-        let parallel = walk_tree_parallel_with_nodes(&parallel_provider, root_logical, NODESIZE)
-            .expect("parallel cached full walk");
-
-        assert_eq!(parallel, serial, "full-tree parallel walk diverged");
-    }
-
-    #[test]
-    fn walk_tree_range_borrowed_with_nodes_matches_owned_entries_bd_eiywc() {
-        // bd-eiywc isomorphism: the borrowed walker exposes each leaf item's
-        // payload as a range into the verified Arc-backed leaf block, but must
-        // return the same keys, same byte payloads, and same traversal order as
-        // the owned walker that clones every item into a Vec<u8>.
-        let oids: Vec<u64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
-        let (blocks, root_logical) = build_two_level_tree(&oids);
-        let chunks = identity_chunks();
-
-        let mut cache: HashMap<u64, Arc<BtrfsParsedNode>> = HashMap::new();
-        for (&addr, bytes) in &blocks {
-            let node = parse_btrfs_tree_node(bytes, 0, addr, NODESIZE).expect("parse node");
-            cache.insert(addr, Arc::new(node));
-        }
-
-        let key = |oid: u64| BtrfsKey {
-            objectid: oid,
-            item_type: 0,
-            offset: 0,
-        };
-        let ranges = [
-            (key(0), key(50)),
-            (key(100), key(101)),
-            (key(250), key(650)),
-            (key(800), key(900)),
-            (key(0), key(10_000)),
-            (key(401), key(599)),
-        ];
-
-        for _pass in 0..2 {
-            for (lo, hi) in ranges {
-                let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
-                    blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
-                        field: "physical",
-                        reason: "block not in test image",
-                    })
-                };
-                let expected =
-                    walk_tree_range(&mut read, &chunks, root_logical, NODESIZE, 0, lo, hi)
-                        .expect("byte walk");
-
-                let mut provider = |logical: u64| -> Result<Arc<BtrfsParsedNode>, ParseError> {
-                    cache
-                        .get(&logical)
-                        .cloned()
-                        .ok_or(ParseError::InvalidField {
-                            field: "logical",
-                            reason: "node not in parsed cache",
-                        })
-                };
-                let borrowed = walk_tree_range_borrowed_with_nodes(
-                    &mut provider,
-                    root_logical,
-                    NODESIZE,
-                    lo,
-                    hi,
-                )
-                .expect("borrowed walk");
-                let actual: Vec<BtrfsLeafEntry> = borrowed
-                    .iter()
-                    .flat_map(BtrfsLeafEntryBatch::to_owned_entries)
-                    .collect();
-
-                assert_eq!(actual, expected, "range [{lo:?},{hi:?})");
-            }
-        }
-    }
-
-    #[test]
-    fn walk_tree_floor_isomorphic_to_filtered_full_walk_max() {
-        // 8 leaves keyed 100..=800 under a single internal root.
-        let oids: Vec<u64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
-        let (blocks, root_logical) = build_two_level_tree(&oids);
-        let chunks = identity_chunks();
-        let key = |oid: u64| BtrfsKey {
-            objectid: oid,
-            item_type: 0,
-            offset: 0,
-        };
-
-        // Below everything, exact leaf keys, gaps between leaves, above everything.
-        let targets = [50_u64, 100, 150, 300, 450, 750, 800, 1000];
-        for t in targets {
-            let target = key(t);
-
-            // Reference: full walk, take the largest entry with key <= target.
-            let mut read_full = |phys: u64| -> Result<Vec<u8>, ParseError> {
-                blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
-                    field: "physical",
-                    reason: "block not in test image",
-                })
-            };
-            let full =
-                walk_tree(&mut read_full, &chunks, root_logical, NODESIZE, 0).expect("full walk");
-            let expected = full
-                .into_iter()
-                .filter(|e| key_cmp(&e.key, &target) != Ordering::Greater)
-                .max_by(|a, b| key_cmp(&a.key, &b.key));
-
-            // Targeted floor descent.
-            let mut floor_reads = 0_u32;
-            let mut read_floor = |phys: u64| -> Result<Vec<u8>, ParseError> {
-                floor_reads += 1;
-                blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
-                    field: "physical",
-                    reason: "block not in test image",
-                })
-            };
-            let got = walk_tree_floor(&mut read_floor, &chunks, root_logical, NODESIZE, 0, target)
-                .expect("floor walk");
-
-            // Isomorphism: same predecessor entry (key + data), or both empty.
-            match (&got, &expected) {
-                (Some(g), Some(e)) => {
-                    assert_eq!(g.key, e.key, "floor key for target {t}");
-                    assert_eq!(g.data, e.data, "floor data for target {t}");
-                }
-                (None, None) => {}
-                _ => panic!("floor mismatch for target {t}: got {got:?}, expected {expected:?}"),
-            }
-
-            // Pruning: a two-level tree is descended as root + at most one leaf,
-            // i.e. O(log N) reads, never the full 1-root-plus-8-leaf scan.
-            assert!(
-                floor_reads <= 2,
-                "floor for target {t} read {floor_reads} nodes (expected <= 2)"
-            );
         }
     }
 
@@ -11716,52 +7940,6 @@ mod tests {
     }
 
     #[test]
-    fn default_leaf_budget_bypass_keeps_finite_budget_split_bd_xmh5g_184() {
-        let mut default_budget = InMemoryCowBtrfsTree::new(3).expect("default budget tree");
-        default_budget
-            .insert(test_key(1), b"a")
-            .expect("default insert 1");
-        default_budget
-            .insert(test_key(2), b"b")
-            .expect("default insert 2");
-        assert_eq!(
-            default_budget.root_level(),
-            0,
-            "default infinite byte budget must not split before the item-count cap"
-        );
-        default_budget
-            .validate_invariants()
-            .expect("default invariants");
-
-        let mut finite_budget = InMemoryCowBtrfsTree::new(3)
-            .expect("finite budget tree")
-            .with_leaf_byte_budget(BTRFS_ITEM_SIZE + 1);
-        finite_budget
-            .insert(test_key(1), b"a")
-            .expect("finite insert 1");
-        finite_budget
-            .insert(test_key(2), b"b")
-            .expect("finite insert 2");
-        assert_eq!(
-            finite_budget.root_level(),
-            1,
-            "finite byte budget must still force a split"
-        );
-        assert_eq!(
-            finite_budget
-                .range(&test_key(0), &test_key(3))
-                .expect("finite range")
-                .into_iter()
-                .map(|(key, data)| (key.objectid, data))
-                .collect::<Vec<_>>(),
-            vec![(1, b"a".to_vec()), (2, b"b".to_vec())]
-        );
-        finite_budget
-            .validate_invariants()
-            .expect("finite invariants");
-    }
-
-    #[test]
     fn cow_mutations_record_deferred_node_frees() {
         let mut tree = InMemoryCowBtrfsTree::new(3).expect("tree");
         tree.insert(test_key(1), b"a").expect("insert 1");
@@ -11815,23 +7993,6 @@ mod tests {
         assert_eq!(tree.get(&test_key(15)), None);
         assert_eq!(tree.get(&test_key(0)), None);
         assert_eq!(tree.get(&test_key(100)), None);
-    }
-
-    #[test]
-    fn get_returns_existing_key_data_from_dense_leaf() {
-        let mut tree = InMemoryCowBtrfsTree::new(64).expect("tree");
-        for objectid in (0_u64..64).map(|i| i * 2) {
-            tree.insert(test_key(objectid), &test_payload(objectid))
-                .expect("insert");
-        }
-
-        assert_eq!(tree.get(&test_key(0)), Some(test_payload(0).to_vec()));
-        assert_eq!(tree.get(&test_key(64)), Some(test_payload(64).to_vec()));
-        assert_eq!(tree.get(&test_key(126)), Some(test_payload(126).to_vec()));
-        assert_eq!(tree.get(&test_key(65)), None);
-        assert_eq!(tree.get(&test_key(127)), None);
-        assert_eq!(tree.root_level(), 0);
-        tree.validate_invariants().expect("invariants");
     }
 
     #[test]
@@ -11924,8 +8085,7 @@ mod tests {
         let mut tree = InMemoryCowBtrfsTree::new(3).expect("tree");
         let n: u64 = 60;
         for oid in 1..=n {
-            tree.insert(test_key(oid), &test_payload(oid))
-                .expect("insert");
+            tree.insert(test_key(oid), &test_payload(oid)).expect("insert");
         }
         assert!(
             tree.height().expect("height") >= 3,
@@ -12088,208 +8248,6 @@ mod tests {
         let entries = tree.range(&key, &key).expect("point range");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, b"new");
-    }
-
-    fn bd_hfkty_csum_key(block_idx: u64) -> BtrfsKey {
-        BtrfsKey {
-            objectid: BTRFS_EXTENT_CSUM_OBJECTID,
-            item_type: BTRFS_ITEM_EXTENT_CSUM,
-            offset: block_idx * 4096,
-        }
-    }
-
-    fn bd_hfkty_csum_payload(block_idx: u64, revision: usize) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(16);
-        payload.extend_from_slice(&block_idx.to_le_bytes());
-        payload.extend_from_slice(
-            &u64::try_from(revision)
-                .expect("test revision fits in u64")
-                .wrapping_mul(0x9E37_79B9)
-                .to_le_bytes(),
-        );
-        payload
-    }
-
-    #[test]
-    fn upsert_matches_update_or_insert_and_preserves_order_bd_hfkty() {
-        let mut legacy = InMemoryCowBtrfsTree::new(5).expect("legacy tree");
-        let mut upserted = InMemoryCowBtrfsTree::new(5).expect("upsert tree");
-        let write_order = [9_u64, 3, 27, 12, 3, 45, 27, 6, 51, 9, 60, 1, 12, 33];
-
-        for (revision, block_idx) in write_order.into_iter().enumerate() {
-            let key = bd_hfkty_csum_key(block_idx);
-            let payload = bd_hfkty_csum_payload(block_idx, revision);
-            legacy
-                .update(&key, &payload)
-                .or_else(|err| match err {
-                    BtrfsMutationError::KeyNotFound => legacy.insert(key, &payload),
-                    other => Err(other),
-                })
-                .expect("legacy update-or-insert");
-            upserted.upsert(key, &payload).expect("upsert");
-        }
-
-        let lo = bd_hfkty_csum_key(0);
-        let hi = bd_hfkty_csum_key(u64::MAX / 4096);
-        let legacy_entries = legacy.range(&lo, &hi).expect("legacy range");
-        let upsert_entries = upserted.range(&lo, &hi).expect("upsert range");
-        assert_eq!(upsert_entries, legacy_entries);
-        assert_eq!(
-            upsert_entries
-                .iter()
-                .map(|(key, _)| key.offset / 4096)
-                .collect::<Vec<_>>(),
-            vec![1, 3, 6, 9, 12, 27, 33, 45, 51, 60]
-        );
-
-        let mut digest = Sha256::new();
-        for (key, data) in &upsert_entries {
-            digest.update(key.objectid.to_le_bytes());
-            digest.update([key.item_type]);
-            digest.update(key.offset.to_le_bytes());
-            digest.update(
-                u64::try_from(data.len())
-                    .expect("test payload length fits")
-                    .to_le_bytes(),
-            );
-            digest.update(data);
-        }
-        let digest_hex = hex_lower(digest.finalize().as_ref());
-        assert_eq!(
-            digest_hex,
-            "a4098f58b4744652ef7cf8b227537c092989ffc8b91712c5a60c73d89ab42644"
-        );
-        println!(
-            "BD_HFKTY_CSUM_UPSERT_GOLDEN_BEGIN\n{digest_hex}\nBD_HFKTY_CSUM_UPSERT_GOLDEN_END"
-        );
-    }
-
-    fn bd_hfkty_inode_key() -> BtrfsKey {
-        BtrfsKey {
-            objectid: 257,
-            item_type: BTRFS_ITEM_INODE_ITEM,
-            offset: 0,
-        }
-    }
-
-    fn bd_hfkty_extent_key(write_idx: u64) -> BtrfsKey {
-        BtrfsKey {
-            objectid: 257,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: write_idx * 4096,
-        }
-    }
-
-    fn bd_hfkty_inode_payload(write_idx: u64) -> Vec<u8> {
-        let mut payload = vec![0_u8; 160];
-        payload[16..24].copy_from_slice(&((write_idx + 1) * 4096).to_le_bytes());
-        payload[24..32].copy_from_slice(&((write_idx + 1) * 4096).to_le_bytes());
-        payload
-    }
-
-    fn bd_hfkty_extent_payload(write_idx: u64) -> Vec<u8> {
-        let mut payload = vec![0_u8; 53];
-        payload[0..8].copy_from_slice(&(write_idx + 1).to_le_bytes());
-        payload[13..21].copy_from_slice(&(0x1000_0000 + write_idx * 4096).to_le_bytes());
-        payload[21..29].copy_from_slice(&4096_u64.to_le_bytes());
-        payload[37..45].copy_from_slice(&4096_u64.to_le_bytes());
-        payload
-    }
-
-    #[test]
-    fn insert_then_update_matches_sequential_and_preserves_order_bd_hfkty() {
-        let mut sequential = InMemoryCowBtrfsTree::new(512).expect("sequential tree");
-        let mut batched = InMemoryCowBtrfsTree::new(512).expect("batched tree");
-        let mut bulk = InMemoryCowBtrfsTree::new(512).expect("bulk tree");
-        sequential
-            .insert(bd_hfkty_inode_key(), &bd_hfkty_inode_payload(0))
-            .expect("seed sequential inode");
-        batched
-            .insert(bd_hfkty_inode_key(), &bd_hfkty_inode_payload(0))
-            .expect("seed batched inode");
-        bulk.insert(bd_hfkty_inode_key(), &bd_hfkty_inode_payload(0))
-            .expect("seed bulk inode");
-
-        for write_idx in 0..32 {
-            let extent_key = bd_hfkty_extent_key(write_idx);
-            let extent_payload = bd_hfkty_extent_payload(write_idx);
-            let inode_payload = bd_hfkty_inode_payload(write_idx);
-            sequential
-                .insert(extent_key, &extent_payload)
-                .expect("sequential extent insert");
-            sequential
-                .update(&bd_hfkty_inode_key(), &inode_payload)
-                .expect("sequential inode update");
-            batched
-                .insert_then_update(
-                    extent_key,
-                    &extent_payload,
-                    &bd_hfkty_inode_key(),
-                    &inode_payload,
-                )
-                .expect("batched extent insert and inode update");
-        }
-        let bulk_payloads: Vec<_> = (0..32)
-            .map(|write_idx| {
-                (
-                    bd_hfkty_extent_key(write_idx),
-                    bd_hfkty_extent_payload(write_idx),
-                )
-            })
-            .collect();
-        let bulk_refs: Vec<_> = bulk_payloads
-            .iter()
-            .map(|(key, payload)| (*key, payload.as_slice()))
-            .collect();
-        bulk.insert_many_then_update(
-            &bulk_refs,
-            &bd_hfkty_inode_key(),
-            &bd_hfkty_inode_payload(31),
-        )
-        .expect("bulk extent inserts and final inode update");
-
-        let lo = BtrfsKey {
-            objectid: 257,
-            item_type: 0,
-            offset: 0,
-        };
-        let hi = BtrfsKey {
-            objectid: 257,
-            item_type: u8::MAX,
-            offset: u64::MAX,
-        };
-        let sequential_entries = sequential.range(&lo, &hi).expect("sequential range");
-        let batched_entries = batched.range(&lo, &hi).expect("batched range");
-        let bulk_entries = bulk.range(&lo, &hi).expect("bulk range");
-        assert_eq!(batched_entries, sequential_entries);
-        assert_eq!(bulk_entries, sequential_entries);
-        assert_eq!(batched_entries.len(), 33);
-        assert_eq!(batched_entries[0].0, bd_hfkty_inode_key());
-        assert!(
-            batched_entries[1..]
-                .iter()
-                .map(|(key, _)| key.offset)
-                .eq((0..32).map(|write_idx| write_idx * 4096))
-        );
-
-        let mut digest = Sha256::new();
-        for (key, data) in &batched_entries {
-            digest.update(key.objectid.to_le_bytes());
-            digest.update([key.item_type]);
-            digest.update(key.offset.to_le_bytes());
-            digest.update(
-                u64::try_from(data.len())
-                    .expect("test payload length fits")
-                    .to_le_bytes(),
-            );
-            digest.update(data);
-        }
-        let digest_hex = hex_lower(digest.finalize().as_ref());
-        assert_eq!(
-            digest_hex,
-            "bd523dce52c8af3935c65703cec9a593e76a0a9eb505799247cf882a05ab730f"
-        );
-        println!("BD_HFKTY_COW_BATCH_GOLDEN_BEGIN\n{digest_hex}\nBD_HFKTY_COW_BATCH_GOLDEN_END");
     }
 
     #[test]
@@ -13987,74 +9945,6 @@ mod tests {
         }
     }
 
-    proptest::proptest! {
-        /// `floor_key` (predecessor-or-equal) must agree with a brute-force scan
-        /// of every inserted key for any target, across randomly-built trees
-        /// (varying both objectid and offset so the full key ordering is exercised
-        /// and the descent crosses internal-node boundaries).
-        #[test]
-        fn floor_key_matches_bruteforce(
-            raw in proptest::collection::vec((0_u64..40, 0_u64..40), 0..=48),
-            target_oid in 0_u64..40,
-            target_off in 0_u64..40,
-        ) {
-            let mk = |oid: u64, off: u64| BtrfsKey {
-                objectid: oid,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: off,
-            };
-            let mut tree = InMemoryCowBtrfsTree::new(4).expect("tree");
-            let mut keys = std::collections::BTreeSet::new();
-            for (oid, off) in &raw {
-                if keys.insert((*oid, *off)) {
-                    tree.insert(mk(*oid, *off), &[0_u8]).expect("insert");
-                }
-            }
-            let target = mk(target_oid, target_off);
-            let expected = keys
-                .iter()
-                .map(|(o, f)| mk(*o, *f))
-                .filter(|k| super::key_cmp(k, &target) != std::cmp::Ordering::Greater)
-                .max_by(super::key_cmp);
-            let got = tree.floor_key(&target).expect("floor_key");
-            proptest::prop_assert_eq!(got, expected);
-        }
-
-        /// `range_with` (zero-copy callback scan) must produce exactly the same
-        /// (key, bytes) sequence as `range` (materialising), for any window —
-        /// including the start > end error case — across randomly-built trees.
-        #[test]
-        fn range_with_matches_range(
-            raw in proptest::collection::vec((0_u64..40, 0_u64..40), 0..=48),
-            start_oid in 0_u64..40,
-            start_off in 0_u64..40,
-            end_oid in 0_u64..40,
-            end_off in 0_u64..40,
-        ) {
-            let mk = |oid: u64, off: u64| BtrfsKey {
-                objectid: oid,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: off,
-            };
-            let mut tree = InMemoryCowBtrfsTree::new(4).expect("tree");
-            let mut keys = std::collections::BTreeSet::new();
-            for (oid, off) in &raw {
-                if keys.insert((*oid, *off)) {
-                    tree.insert(mk(*oid, *off), &[*oid as u8, *off as u8]).expect("insert");
-                }
-            }
-            let start = mk(start_oid, start_off);
-            let end = mk(end_oid, end_off);
-            let range_res = tree.range(&start, &end);
-            let mut collected = Vec::new();
-            let with_res = tree.range_with(&start, &end, |k, v| collected.push((k, v.to_vec())));
-            proptest::prop_assert_eq!(range_res.is_ok(), with_res.is_ok());
-            if let Ok(materialised) = range_res {
-                proptest::prop_assert_eq!(materialised, collected);
-            }
-        }
-    }
-
     #[test]
     fn root_item_to_bytes_roundtrip() {
         let item = BtrfsRootItem {
@@ -14564,30 +10454,13 @@ mod tests {
         assert_eq!(parsed[0].value, b"alpha");
         assert_eq!(parsed[1].name, b"user.b");
         assert!(parsed[1].value.is_empty());
-        assert_eq!(
-            find_xattr_item_value(&payload, b"user.a").expect("find first xattr"),
-            Some(b"alpha".to_vec())
-        );
-        assert_eq!(
-            find_xattr_item_value(&payload, b"user.b").expect("find empty xattr"),
-            Some(Vec::new())
-        );
-        assert_eq!(
-            find_xattr_item_value(&payload, b"user.missing").expect("miss xattr"),
-            None
-        );
         assert!(
             parse_xattr_items(&[])
                 .expect("parse empty xattr payload")
                 .is_empty()
         );
-        assert_eq!(
-            find_xattr_item_value(&[], b"user.a").expect("find in empty payload"),
-            None
-        );
 
         assert_insufficient_data(parse_xattr_items(&[0_u8; 29]), 30, 0, 29);
-        assert_insufficient_data(find_xattr_item_value(&[0_u8; 29], b"user.a"), 30, 0, 29);
 
         let empty_name = vec![0_u8; 30];
         assert_invalid_field(
@@ -16678,30 +12551,6 @@ mod tests {
     }
 
     #[test]
-    fn free_extent_rejects_unallocated_extent_without_side_effects() {
-        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
-        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
-
-        // Seed one real allocation so the block group has nonzero used_bytes.
-        let _seed = alloc.alloc_data(4096).expect("seed alloc");
-        let used_before = alloc.block_group(0x1_0000).expect("bg").used_bytes;
-        let refs_before = alloc.delayed_ref_count();
-
-        // Freeing an extent that was never allocated (no extent item at this
-        // bytenr/len) must error before touching any accounting.
-        let result = alloc.free_extent(0x5_0000, 4096, false);
-        assert_eq!(result, Err(BtrfsMutationError::KeyNotFound));
-
-        let bg = alloc.block_group(0x1_0000).expect("bg");
-        assert_eq!(bg.used_bytes, used_before, "used_bytes must be unchanged");
-        assert_eq!(
-            alloc.delayed_ref_count(),
-            refs_before,
-            "no delayed ref must be queued"
-        );
-    }
-
-    #[test]
     fn alloc_fills_group_sequentially() {
         let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
         alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
@@ -16782,84 +12631,6 @@ mod tests {
                 offset: 0,
                 count: 1,
             }
-        );
-    }
-
-    /// bd-uv16n: BTRFS_IOC_LOGICAL_INO takes an arbitrary logical byte address
-    /// that usually lands in the middle of an extent. Resolving the containing
-    /// EXTENT_ITEM must work for a mid-extent address, not only the exact start
-    /// bytenr (which is all `get_extent_data_refs` matches on its own).
-    #[test]
-    fn resolve_containing_data_extent_handles_mid_extent_address_bd_uv16n() {
-        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
-        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
-        let a = alloc.alloc_data(4096).expect("alloc");
-        alloc
-            .insert_data_extent_item(a.bytenr, a.num_bytes, 5, 256, 0, 7)
-            .expect("insert extent item");
-        alloc
-            .add_data_extent_ref(a.bytenr, a.num_bytes, 5, 257, 0)
-            .expect("add keyed ref");
-
-        let mid = a.bytenr + 2048; // a byte in the middle of the extent
-        let interleaved_ref = BtrfsExtentDataRef {
-            root: 5,
-            objectid: 999,
-            offset: 0,
-            count: 1,
-        };
-        alloc
-            .extent_tree_mut()
-            .insert(
-                BtrfsKey {
-                    objectid: mid - 256,
-                    item_type: BTRFS_ITEM_EXTENT_DATA_REF,
-                    offset: 0,
-                },
-                &interleaved_ref.to_bytes(),
-            )
-            .expect("insert interleaved non-extent key");
-
-        // The bug: a mid-extent address matches no EXTENT_DATA_REF because the
-        // lookup keys on the exact extent start bytenr.
-        assert!(
-            alloc.get_extent_data_refs(mid).expect("refs").is_empty(),
-            "mid-extent address does not match a backref keyed at the extent start"
-        );
-
-        // The fix: resolve the covering extent first, then look up its refs.
-        let start = alloc
-            .resolve_containing_data_extent(mid)
-            .expect("resolve")
-            .expect("a data extent covers the mid-extent address");
-        assert_eq!(start, a.bytenr, "must resolve to the extent's start bytenr");
-        assert_eq!(
-            alloc.get_extent_data_refs(start).expect("refs").len(),
-            1,
-            "the containing extent's keyed backref is found via the resolved start"
-        );
-
-        // Boundary behaviour: exact start covered, exclusive end not covered,
-        // an address below any extent resolves to nothing.
-        assert_eq!(
-            alloc
-                .resolve_containing_data_extent(a.bytenr)
-                .expect("resolve"),
-            Some(a.bytenr),
-        );
-        assert_eq!(
-            alloc
-                .resolve_containing_data_extent(a.bytenr + a.num_bytes)
-                .expect("resolve"),
-            None,
-            "the first byte past the extent (exclusive end) is not covered"
-        );
-        assert_eq!(
-            alloc
-                .resolve_containing_data_extent(0x500)
-                .expect("resolve"),
-            None,
-            "an address below any extent resolves to nothing"
         );
     }
 
@@ -16952,10 +12723,7 @@ mod tests {
             Some(1)
         );
         assert!(
-            alloc
-                .get_extent_data_refs(a.bytenr)
-                .expect("keyed refs")
-                .is_empty(),
+            alloc.get_extent_data_refs(a.bytenr).expect("keyed refs").is_empty(),
             "keyed ref removed on its last reference"
         );
     }
@@ -17201,30 +12969,6 @@ mod tests {
         let flushed = alloc.flush_delayed_refs(1).expect("flush delete");
         assert_eq!(flushed, 1);
         assert_eq!(alloc.extent_refcount(extent), 0);
-    }
-
-    proptest::proptest! {
-        /// alloc_data(N) then free_extent of the returned extent must leave the
-        /// owning block group's used_bytes exactly as it was, for any size. The
-        /// existing accounting tests only check fixed sizes (4096/8192), so a
-        /// size-dependent asymmetry between alloc and free rounding would slip
-        /// through.
-        #[test]
-        fn proptest_alloc_free_restores_block_group_used_bytes(size in 1_u64..=0x8000) {
-            let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
-            alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
-            let before = alloc.block_group(0x1_0000).expect("bg").used_bytes;
-
-            let a = alloc.alloc_data(size).expect("alloc");
-            let after_alloc = alloc.block_group(0x1_0000).expect("bg").used_bytes;
-            proptest::prop_assert!(after_alloc > before, "alloc must consume space");
-
-            alloc
-                .free_extent(a.bytenr, a.num_bytes, false)
-                .expect("free");
-            let after_free = alloc.block_group(0x1_0000).expect("bg").used_bytes;
-            proptest::prop_assert_eq!(after_free, before, "free must restore used_bytes");
-        }
     }
 
     #[test]
@@ -17609,422 +13353,6 @@ mod tests {
             ],
             "loaded metadata blocks must be excluded from free space"
         );
-    }
-
-    #[test]
-    fn remove_metadata_items_owned_by_roots_preserves_other_items_bd_opb6l() {
-        let mut alloc = BtrfsExtentAllocator::new(17).expect("allocator");
-        let rewritten_roots = [
-            BTRFS_ROOT_TREE_OBJECTID,
-            BTRFS_EXTENT_TREE_OBJECTID,
-            BTRFS_FS_TREE_OBJECTID,
-            BTRFS_CSUM_TREE_OBJECTID,
-        ];
-        let preserved_root = BTRFS_CHUNK_TREE_OBJECTID;
-        let metadata_items = [
-            (0x10_0000, rewritten_roots[0]),
-            (0x20_0000, rewritten_roots[1]),
-            (0x30_0000, rewritten_roots[2]),
-            (0x40_0000, rewritten_roots[3]),
-            (0x50_0000, preserved_root),
-        ];
-
-        for (bytenr, owner_root) in metadata_items {
-            alloc
-                .insert_self_metadata_item(bytenr, 0, owner_root, 17)
-                .expect("insert metadata item");
-        }
-
-        let removed = alloc
-            .remove_metadata_items_owned_by_roots(&rewritten_roots)
-            .expect("remove rewritten-root metadata items");
-        assert_eq!(removed, rewritten_roots.len());
-
-        for (bytenr, owner_root) in metadata_items {
-            let key = BtrfsKey {
-                objectid: bytenr,
-                item_type: BTRFS_ITEM_METADATA_ITEM,
-                offset: 0,
-            };
-            assert_eq!(
-                alloc.extent_tree().get(&key).is_some(),
-                owner_root == preserved_root,
-                "metadata ownership filtering diverged for root {owner_root}"
-            );
-        }
-        assert_eq!(
-            alloc
-                .remove_metadata_items_owned_by_roots(&rewritten_roots)
-                .expect("repeat removal"),
-            0,
-            "removal must be idempotent once rewritten-root items are gone"
-        );
-    }
-
-    #[test]
-    fn largest_free_extent_excludes_loaded_skinny_metadata_items() {
-        let mut alloc = BtrfsExtentAllocator::new(9).expect("alloc");
-        alloc.set_nodesize(0x4000);
-        let bg_start = 0x1d0_0000_u64;
-        let bg_len = 0x20_0000_u64;
-        alloc.add_block_group(bg_start, make_meta_bg(bg_start, bg_len));
-
-        for node in [bg_start, bg_start + 0x8000] {
-            let item = BtrfsExtentItem {
-                refs: 1,
-                generation: 9,
-                flags: BtrfsExtentItem::FLAG_TREE_BLOCK,
-            };
-            let mut value = item.to_bytes();
-            value.push(BTRFS_ITEM_TREE_BLOCK_REF);
-            value.extend_from_slice(&BTRFS_EXTENT_TREE_OBJECTID.to_le_bytes());
-            let key = BtrfsKey {
-                objectid: node,
-                item_type: BTRFS_ITEM_METADATA_ITEM,
-                offset: 0,
-            };
-            alloc.extent_tree_mut().insert(key, &value).expect("insert");
-        }
-
-        assert_eq!(
-            alloc
-                .largest_free_extent(BTRFS_BLOCK_GROUP_METADATA)
-                .expect("largest metadata gap"),
-            bg_len - 0xc000
-        );
-    }
-
-    #[test]
-    fn sync_block_group_accounting_uses_extent_keys_bd_xmh5g_192() {
-        let mut alloc = BtrfsExtentAllocator::new(11).expect("alloc");
-        alloc.set_nodesize(0x4000);
-        let bg_start = 0x2d0_0000_u64;
-        let bg_len = 0x40_0000_u64;
-        alloc.add_block_group(bg_start, make_meta_bg(bg_start, bg_len));
-
-        alloc
-            .insert_data_extent_item(bg_start, 0x2000, 5, 256, 0, 11)
-            .expect("insert data extent");
-        let item = BtrfsExtentItem {
-            refs: 1,
-            generation: 11,
-            flags: BtrfsExtentItem::FLAG_TREE_BLOCK,
-        };
-        let mut value = item.to_bytes();
-        value.push(BTRFS_ITEM_TREE_BLOCK_REF);
-        value.extend_from_slice(&BTRFS_EXTENT_TREE_OBJECTID.to_le_bytes());
-        let metadata_key = BtrfsKey {
-            objectid: bg_start + 0x8000,
-            item_type: BTRFS_ITEM_METADATA_ITEM,
-            offset: 0, // level 0, not length
-        };
-        alloc
-            .extent_tree_mut()
-            .insert(metadata_key, &value)
-            .expect("insert metadata extent");
-
-        let used = alloc
-            .sync_block_group_accounting()
-            .expect("sync block group accounting");
-        assert_eq!(used, 0x2000 + 0x4000);
-        assert_eq!(
-            alloc.block_group(bg_start).expect("block group").used_bytes,
-            used
-        );
-    }
-
-    #[test]
-    fn sync_accounting_and_free_space_matches_two_pass_bd_xmh5g_193() {
-        // Build an allocator with two block groups (one data, one metadata),
-        // a mix of EXTENT_ITEM and skinny METADATA_ITEM extents, and real
-        // BLOCK_GROUP_ITEM payloads that both paths must patch identically.
-        let build = || {
-            let mut alloc = BtrfsExtentAllocator::new(11).expect("alloc");
-            alloc.set_nodesize(0x4000);
-            let insert_block_group_item =
-                |alloc: &mut BtrfsExtentAllocator, start: u64, item: BtrfsBlockGroupItem| {
-                    alloc
-                        .extent_tree_mut()
-                        .insert(
-                            BtrfsKey {
-                                objectid: start,
-                                item_type: BTRFS_ITEM_BLOCK_GROUP_ITEM,
-                                offset: item.total_bytes,
-                            },
-                            &item.to_bytes(),
-                        )
-                        .expect("insert block group item");
-                };
-
-            let data_start = 0x2d0_0000_u64;
-            let data_len = 0x40_0000_u64;
-            let data_item = BtrfsBlockGroupItem {
-                total_bytes: data_len,
-                used_bytes: 0x9000,
-                flags: BTRFS_BLOCK_GROUP_DATA,
-            };
-            alloc.add_block_group(data_start, data_item);
-            insert_block_group_item(&mut alloc, data_start, data_item);
-            alloc
-                .insert_data_extent_item(data_start + 0x4000, 0x2000, 5, 256, 0, 11)
-                .expect("insert data extent");
-            alloc
-                .insert_data_extent_item(data_start + 0x10_0000, 0x3000, 6, 257, 0, 11)
-                .expect("insert data extent 2");
-            alloc
-                .insert_data_extent_item(data_start + data_len - 0x1000, 0x3000, 7, 258, 0, 11)
-                .expect("insert crossing data extent");
-
-            let meta_start = 0x400_0000_u64;
-            let meta_len = 0x40_0000_u64;
-            let meta_item = make_meta_bg(meta_start, meta_len);
-            alloc.add_block_group(meta_start, meta_item);
-            insert_block_group_item(&mut alloc, meta_start, meta_item);
-            let item = BtrfsExtentItem {
-                refs: 1,
-                generation: 11,
-                flags: BtrfsExtentItem::FLAG_TREE_BLOCK,
-            };
-            let mut value = item.to_bytes();
-            value.push(BTRFS_ITEM_TREE_BLOCK_REF);
-            value.extend_from_slice(&BTRFS_EXTENT_TREE_OBJECTID.to_le_bytes());
-            let metadata_key = BtrfsKey {
-                objectid: meta_start + 0x8000,
-                item_type: BTRFS_ITEM_METADATA_ITEM,
-                offset: 0, // level 0, not length
-            };
-            alloc
-                .extent_tree_mut()
-                .insert(metadata_key, &value)
-                .expect("insert metadata extent");
-            alloc
-        };
-
-        // Two-pass reference (production order: accounting then free-space).
-        let mut alloc_two = build();
-        let used_two = alloc_two
-            .sync_block_group_accounting()
-            .expect("two-pass accounting");
-        let free_two = alloc_two.free_space_extents().expect("two-pass free space");
-        let used_bytes_two: Vec<(u64, u64)> = alloc_two
-            .block_groups
-            .values()
-            .map(|bg| (bg.start, bg.item.used_bytes))
-            .collect();
-
-        // Fused single-scan.
-        let mut alloc_fused = build();
-        let (used_fused, free_fused) = alloc_fused
-            .sync_accounting_and_free_space()
-            .expect("fused accounting + free space");
-        let used_bytes_fused: Vec<(u64, u64)> = alloc_fused
-            .block_groups
-            .values()
-            .map(|bg| (bg.start, bg.item.used_bytes))
-            .collect();
-
-        assert_eq!(used_two, used_fused, "grand total bytes_used must match");
-        assert_eq!(free_two, free_fused, "free-space groups must match exactly");
-        assert_eq!(
-            used_bytes_two, used_bytes_fused,
-            "per-block-group used_bytes patches must match"
-        );
-
-        // The on-disk BLOCK_GROUP_ITEMs must be patched identically too.
-        for (start, _) in &used_bytes_two {
-            let bg_key = BtrfsKey {
-                objectid: *start,
-                item_type: BTRFS_ITEM_BLOCK_GROUP_ITEM,
-                offset: alloc_two.block_group(*start).expect("bg").total_bytes,
-            };
-            assert_eq!(
-                alloc_two.extent_tree().get(&bg_key),
-                alloc_fused.extent_tree().get(&bg_key),
-                "BLOCK_GROUP_ITEM payload must match for {start:#x}"
-            );
-            assert!(
-                alloc_fused.extent_tree().get(&bg_key).is_some(),
-                "test must exercise BLOCK_GROUP_ITEM patching for {start:#x}"
-            );
-        }
-    }
-
-    /// One generated block group: (total in 16 KiB units, used fraction n/255,
-    /// list of (offset_blocks, len_blocks) data extents).
-    type FusedAccountingGroupSpec = (u64, u64, Vec<(u64, u64)>);
-
-    proptest::proptest! {
-        /// The fused single-scan `sync_accounting_and_free_space` must return
-        /// byte-identical results to the two-pass `sync_block_group_accounting`
-        /// then `free_space_extents` sequence it replaces, for ANY block-group /
-        /// extent-tree state — random reserved-prefix `used_bytes` (the
-        /// `untracked_used` fence) and overlapping / out-of-group extents
-        /// (clamping) included. Two identical allocators are built from the same
-        /// spec; one runs the two-pass path, the other the fused path, and the
-        /// grand total, per-group free ranges, and per-group `used_bytes`
-        /// writeback must all match (bd-xmh5g.193 / .198).
-        #[test]
-        fn fused_accounting_matches_two_pass_proptest(
-            groups in proptest::collection::vec(
-                (
-                    1_u64..=64,   // total size in 16 KiB units
-                    0_u64..=255,  // used_bytes as a fraction (n/255) of total
-                    proptest::collection::vec((0_u64..256, 1_u64..=8), 0..=12), // (offset_blocks, len_blocks)
-                ),
-                1..=3,
-            ),
-        ) {
-            let build = |spec: &[FusedAccountingGroupSpec]| -> BtrfsExtentAllocator {
-                let mut alloc = BtrfsExtentAllocator::new(11).expect("alloc");
-                alloc.set_nodesize(0x4000);
-                for (gi, group) in spec.iter().enumerate() {
-                    let (total_units, used_frac, exts) = group;
-                    let start = 0x100_0000_u64 * (gi as u64 + 1);
-                    let total = *total_units * 0x4000;
-                    let used = ((*used_frac).saturating_mul(total) / 255).min(total);
-                    alloc.add_block_group(
-                        start,
-                        BtrfsBlockGroupItem {
-                            total_bytes: total,
-                            used_bytes: used,
-                            flags: BTRFS_BLOCK_GROUP_DATA,
-                        },
-                    );
-                    for ext in exts {
-                        let (off_blocks, len_blocks) = ext;
-                        let off = *off_blocks * 0x1000;
-                        if off >= total {
-                            continue;
-                        }
-                        let bytenr = start + off;
-                        let len = *len_blocks * 0x1000;
-                        // Identical for both builds, so any insert outcome
-                        // (including a duplicate-key rewrite) is reproduced on
-                        // both sides — the comparison stays valid.
-                        let _ = alloc.insert_data_extent_item(bytenr, len, 5, 256, 0, 11);
-                    }
-                }
-                alloc
-            };
-
-            let mut alloc_two = build(&groups);
-            let mut alloc_fused = build(&groups);
-
-            let used_two = alloc_two
-                .sync_block_group_accounting()
-                .expect("two-pass accounting");
-            let free_two = alloc_two.free_space_extents().expect("two-pass free space");
-            let used_bytes_two: Vec<(u64, u64)> = alloc_two
-                .block_groups
-                .values()
-                .map(|bg| (bg.start, bg.item.used_bytes))
-                .collect();
-
-            let (used_fused, free_fused) = alloc_fused
-                .sync_accounting_and_free_space()
-                .expect("fused accounting + free space");
-            let used_bytes_fused: Vec<(u64, u64)> = alloc_fused
-                .block_groups
-                .values()
-                .map(|bg| (bg.start, bg.item.used_bytes))
-                .collect();
-
-            proptest::prop_assert_eq!(used_two, used_fused);
-            proptest::prop_assert_eq!(free_two, free_fused);
-            proptest::prop_assert_eq!(used_bytes_two, used_bytes_fused);
-        }
-    }
-
-    proptest::proptest! {
-        /// `build_free_space_tree_items` must emit a btrfs-check-valid
-        /// FREE_SPACE_TREE item set for ANY per-group free-space layout: the
-        /// whole list globally sorted by (objectid, item_type, offset); exactly
-        /// one FREE_SPACE_INFO per group whose 8-byte value encodes
-        /// `extent_count == free_ranges.len()` and `flags == 0`; and one empty
-        /// FREE_SPACE_EXTENT per free range keyed (free_start, 199, free_len)
-        /// (bd-qxo5x / bd-xmh5g.199).
-        #[test]
-        fn build_free_space_tree_items_invariants_proptest(
-            raw_groups in proptest::collection::vec(
-                (
-                    1_u64..=64, // total size in 16 KiB units
-                    proptest::collection::vec((0_u64..4096, 1_u64..=4096), 0..=8), // (free_start_blocks, free_len_blocks)
-                ),
-                0..=4,
-            ),
-        ) {
-            // Place each group 4 GiB apart so starts are distinct and groups do
-            // not overlap (total_bytes <= 1 MiB << 4 GiB); free ranges sit inside
-            // the group at block granularity.
-            let groups: Vec<BlockGroupFreeSpace> = raw_groups
-                .iter()
-                .enumerate()
-                .map(|(gi, (total_units, ranges))| {
-                    let base = (gi as u64 + 1) * 0x1_0000_0000;
-                    BlockGroupFreeSpace {
-                        start: base,
-                        total_bytes: total_units * 0x4000,
-                        flags: BTRFS_BLOCK_GROUP_DATA,
-                        free_ranges: ranges
-                            .iter()
-                            .map(|&(start_blocks, len_blocks)| {
-                                (base + start_blocks * 0x1000, len_blocks * 0x1000)
-                            })
-                            .collect(),
-                    }
-                })
-                .collect();
-
-            let items = build_free_space_tree_items(&groups);
-
-            // Invariant 1: total item count == groups + sum(free_ranges).
-            let expected_len = groups.len()
-                + groups.iter().map(|g| g.free_ranges.len()).sum::<usize>();
-            proptest::prop_assert_eq!(items.len(), expected_len);
-
-            // Invariant 2: globally sorted by (objectid, item_type, offset).
-            for window in items.windows(2) {
-                let (a, _) = &window[0];
-                let (b, _) = &window[1];
-                proptest::prop_assert!(
-                    (a.objectid, a.item_type, a.offset) <= (b.objectid, b.item_type, b.offset),
-                    "FREE_SPACE_TREE items must be globally key-sorted"
-                );
-            }
-
-            // Invariant 3: exactly one FREE_SPACE_INFO per group, value encodes
-            // extent_count == free_ranges.len() and flags == 0.
-            for group in &groups {
-                let infos: Vec<&(BtrfsKey, Vec<u8>)> = items
-                    .iter()
-                    .filter(|(key, _)| {
-                        key.item_type == BTRFS_ITEM_FREE_SPACE_INFO
-                            && key.objectid == group.start
-                            && key.offset == group.total_bytes
-                    })
-                    .collect();
-                proptest::prop_assert_eq!(infos.len(), 1);
-                let (_, value) = infos[0];
-                proptest::prop_assert_eq!(value.len(), 8);
-                let extent_count = u32::from_le_bytes(value[0..4].try_into().unwrap());
-                let flags = u32::from_le_bytes(value[4..8].try_into().unwrap());
-                proptest::prop_assert_eq!(extent_count as usize, group.free_ranges.len());
-                proptest::prop_assert_eq!(flags, 0_u32);
-            }
-
-            // Invariant 4: each free range has an empty FREE_SPACE_EXTENT item.
-            for group in &groups {
-                for &(free_start, free_len) in &group.free_ranges {
-                    let found = items.iter().any(|(key, value)| {
-                        key.item_type == BTRFS_ITEM_FREE_SPACE_EXTENT
-                            && key.objectid == free_start
-                            && key.offset == free_len
-                            && value.is_empty()
-                    });
-                    proptest::prop_assert!(found, "missing FREE_SPACE_EXTENT for a free range");
-                }
-            }
-        }
     }
 
     #[test]
@@ -19788,70 +15116,6 @@ mod tests {
         assert_eq!(alloc.delayed_ref_count(), 0);
     }
 
-    /// bd-ftev0. The test above pins the allocator's fail-closed contract: given a
-    /// block group whose tally disagrees with the extent tree, freeing MUST refuse.
-    /// That contract is right, and it was firing on every real image, because mount
-    /// built exactly that inconsistent state — block groups seeded at `used_bytes =
-    /// 0` alongside a fully-loaded on-disk extent tree — so the first overwrite of
-    /// any `mkfs.btrfs`-written extent returned EIO.
-    ///
-    /// This pins the fix at the seam the mount path now uses: reconciling the tally
-    /// against the extent tree turns the same starting state into a legal free. The
-    /// underflow guard is not weakened — it is simply no longer reachable from a
-    /// correctly mounted filesystem.
-    #[test]
-    fn reconciled_block_group_accounting_makes_a_preexisting_extent_freeable_bd_ftev0() {
-        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
-        let bg_start = 0x10_0000;
-        // Exactly the mount-time seeding: total space known, used tally zero.
-        alloc.add_block_group(bg_start, make_data_bg(bg_start, 8192));
-        let key = BtrfsKey {
-            objectid: bg_start,
-            item_type: BTRFS_ITEM_EXTENT_ITEM,
-            offset: 4096,
-        };
-        let extent_item = BtrfsExtentItem {
-            refs: 1,
-            generation: 1,
-            flags: 0,
-        };
-        // ...and an extent tree loaded from disk that says otherwise.
-        alloc
-            .extent_tree
-            .insert(key, &extent_item.to_bytes())
-            .expect("insert on-disk extent");
-        assert_eq!(
-            alloc.block_group(bg_start).expect("bg").used_bytes,
-            0,
-            "precondition: the tally starts blind to the on-disk extent"
-        );
-
-        let total = alloc
-            .sync_block_group_accounting()
-            .expect("reconcile against the extent tree");
-        assert_eq!(total, 4096, "grand total is the sum of on-disk extents");
-        assert_eq!(
-            alloc.block_group(bg_start).expect("bg").used_bytes,
-            4096,
-            "the tally now matches the extent the image actually contains"
-        );
-
-        // The same call that produced EIO before the fix.
-        alloc
-            .free_extent(bg_start, 4096, false)
-            .expect("freeing a pre-existing extent must succeed after reconciliation");
-        assert_eq!(alloc.block_group(bg_start).expect("bg").used_bytes, 0);
-        assert_eq!(
-            alloc
-                .extent_tree
-                .range(&key, &key)
-                .expect("extent lookup")
-                .len(),
-            0,
-            "a successful free removes the extent item"
-        );
-    }
-
     #[test]
     fn reclaim_unreferenced_data_extents_frees_orphans_only() {
         let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
@@ -20078,37 +15342,6 @@ mod tests {
         }
 
         assert_eq!(alloc.total_used(), 4096 * 3);
-    }
-
-    #[test]
-    fn tail_verified_allocations_preserve_bump_semantics_bd_xmh5g_188() {
-        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
-        let bg_start = 0x10_0000;
-        alloc.add_block_group(bg_start, make_data_bg(bg_start, 0x100_000));
-
-        let a1 = alloc.alloc_data(4096).expect("alloc 1");
-        let a2 = alloc.alloc_data(4096).expect("alloc 2");
-        assert_eq!(a1.bytenr, bg_start);
-        assert_eq!(a2.bytenr, bg_start + 4096);
-        assert!(
-            alloc.block_groups.get(&bg_start).expect("bg").tail_verified,
-            "sequential tail allocation should keep the verified suffix"
-        );
-
-        alloc
-            .free_extent(a1.bytenr, a1.num_bytes, false)
-            .expect("free first extent");
-        assert!(
-            !alloc.block_groups.get(&bg_start).expect("bg").tail_verified,
-            "freeing an extent must force the next allocation through a scan"
-        );
-
-        let a3 = alloc.alloc_data(4096).expect("alloc 3");
-        assert_eq!(
-            a3.bytenr,
-            bg_start + 8192,
-            "bump-pointer semantics skip the earlier freed hole until wrap"
-        );
     }
 
     #[test]
@@ -20551,51 +15784,6 @@ mod tests {
         assert_eq!(subvols[0].name, "subvol-601");
     }
 
-    #[test]
-    fn enumerate_subvolumes_uses_first_valid_root_ref() {
-        let mut malformed_ref = make_root_ref_data(256, b"broken");
-        malformed_ref.truncate(20);
-        let entries = vec![
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 5,
-                    item_type: BTRFS_ITEM_ROOT_REF,
-                    offset: 602,
-                },
-                data: malformed_ref,
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 7,
-                    item_type: BTRFS_ITEM_ROOT_REF,
-                    offset: 602,
-                },
-                data: make_root_ref_data(256, b"first-valid"),
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 9,
-                    item_type: BTRFS_ITEM_ROOT_REF,
-                    offset: 602,
-                },
-                data: make_root_ref_data(256, b"later-valid"),
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 602,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: make_root_item_data(0x6000, 22, 0),
-            },
-        ];
-
-        let subvols = enumerate_subvolumes(&entries);
-        assert_eq!(subvols.len(), 1);
-        assert_eq!(subvols[0].parent_id, 7);
-        assert_eq!(subvols[0].name, "first-valid");
-    }
-
     // ── Snapshot enumeration tests ─────────────────────────────────
 
     #[test]
@@ -20653,105 +15841,6 @@ mod tests {
             snapshots.is_empty(),
             "regular subvolume should not be listed as snapshot"
         );
-    }
-
-    #[test]
-    fn enumerate_snapshots_uses_first_valid_uuid_source() {
-        let source_uuid = [3_u8; 16];
-        let mut malformed_source = make_root_item_with_uuids(0x1000, 10, 0, source_uuid, [0; 16]);
-        malformed_source.truncate(20);
-        let entries = vec![
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 300,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: malformed_source,
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 301,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: make_root_item_with_uuids(0x2000, 11, 0, source_uuid, [0; 16]),
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 302,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: make_root_item_with_uuids(0x3000, 12, 0, source_uuid, [0; 16]),
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 400,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: make_root_item_with_uuids(0x4000, 13, 1, [4; 16], source_uuid),
-            },
-        ];
-
-        let snapshots = enumerate_snapshots(&entries);
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].source_id, 301);
-    }
-
-    #[test]
-    fn enumerate_snapshots_uses_first_valid_root_ref_name() {
-        let source_uuid = [5_u8; 16];
-        let mut malformed_ref = make_root_ref_data(300, b"broken");
-        malformed_ref.truncate(20);
-        let entries = vec![
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 7,
-                    item_type: BTRFS_ITEM_ROOT_REF,
-                    offset: 400,
-                },
-                data: malformed_ref,
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 8,
-                    item_type: BTRFS_ITEM_ROOT_REF,
-                    offset: 400,
-                },
-                data: make_root_ref_data(300, &[0xff, b'x']),
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 9,
-                    item_type: BTRFS_ITEM_ROOT_REF,
-                    offset: 400,
-                },
-                data: make_root_ref_data(300, b"later-valid"),
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 300,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: make_root_item_with_uuids(0x1000, 10, 0, source_uuid, [0; 16]),
-            },
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 400,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: make_root_item_with_uuids(0x2000, 15, 1, [6; 16], source_uuid),
-            },
-        ];
-
-        let snapshots = enumerate_snapshots(&entries);
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].source_id, 300);
-        assert_eq!(snapshots[0].name, "\u{fffd}x");
     }
 
     #[test]
@@ -21653,7 +16742,7 @@ mod tests {
         }
 
         // bd-gasht — btrfs_send_crc32c foundational laws.
-        // btrfs_send_crc32c is the raw-state CRC32C continuation (poly
+        // btrfs_send_crc32c is the in-house CRC32C primitive (poly
         // 0x82F6_3B78 = bit-reversed Castagnoli) used by
         // send_stream_command_crc32c. The command-header CRC
         // computation (super::send_stream_command_crc32c) splits the
@@ -21662,28 +16751,6 @@ mod tests {
         // primitive is associative. Sister bd-8pbjm (ext4_chksum),
         // bd-oviw2 (crc32c_append), bd-0djme (ext4_gdt_crc16) pin
         // the same laws for the other CRC primitives.
-
-        /// MR-0 — the accelerated continuation is bit-identical to the frozen
-        /// bitwise Castagnoli implementation it replaced.
-        #[test]
-        fn btrfs_send_crc32c_proptest_matches_bitwise_reference(
-            seed in proptest::prelude::any::<u32>(),
-            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=4096),
-        ) {
-            const POLY: u32 = 0x82F6_3B78;
-            let mut expected = seed;
-            for byte in data.iter().copied() {
-                expected ^= u32::from(byte);
-                for _ in 0..8 {
-                    expected = if expected & 1 == 0 {
-                        expected >> 1
-                    } else {
-                        (expected >> 1) ^ POLY
-                    };
-                }
-            }
-            proptest::prop_assert_eq!(super::btrfs_send_crc32c(seed, &data), expected);
-        }
 
         /// MR-1 — Empty-suffix identity: f(seed, &[]) == seed.
         #[test]
@@ -22472,7 +17539,7 @@ mod tests {
                     item_type: INODE_ITEM_KEY,
                     offset: 0,
                 },
-                data: vec![0xAA; 160].into(),
+                data: vec![0xAA; 160],
             },
             BtrfsTreeItem {
                 key: BtrfsKey {
@@ -22480,7 +17547,7 @@ mod tests {
                     item_type: DIR_ITEM_KEY,
                     offset: 0x1234,
                 },
-                data: vec![0xBB; 32].into(),
+                data: vec![0xBB; 32],
             },
         ];
         let node = BtrfsCowNode::Leaf { items };
@@ -22496,7 +17563,6 @@ mod tests {
             level: 0, // leaf
             child_generations: vec![],
             child_bytenrs: vec![],
-            child_min_keys: vec![],
         };
 
         let buf = node.serialize(&params).expect("serialize should succeed");
@@ -22550,7 +17616,6 @@ mod tests {
             level: 1, // internal node, level 1
             child_generations: vec![190, 195, 200],
             child_bytenrs: vec![],
-            child_min_keys: vec![],
         };
 
         let buf = node.serialize(&params).expect("serialize should succeed");
@@ -23035,10 +18100,7 @@ mod tests {
             })
         };
         // The SUBVOL command does carry the subvolume name.
-        assert_eq!(
-            path_of(SendCommand::Subvol).as_deref(),
-            Some(&b"test_subvol"[..])
-        );
+        assert_eq!(path_of(SendCommand::Subvol).as_deref(), Some(&b"test_subvol"[..]));
         // Child commands are subvol-relative.
         assert_eq!(
             path_of(SendCommand::Mkfile).as_deref(),
@@ -23070,7 +18132,9 @@ mod tests {
         // The subvol root's metadata commands apply via an empty path.
         assert!(
             parsed.commands.iter().any(|c| c.cmd == SendCommand::Chmod
-                && c.attrs.iter().any(|(t, v)| *t == ATTR_PATH && v.is_empty())),
+                && c.attrs
+                    .iter()
+                    .any(|(t, v)| *t == ATTR_PATH && v.is_empty())),
             "the subvolume root's chmod must use an empty (root-relative) path"
         );
     }
@@ -23334,11 +18398,7 @@ mod tests {
 
         let parsed = parse_send_stream(&stream).expect("parse stream");
         let mut reassembled = vec![0u8; decompressed.len()];
-        for w in parsed
-            .commands
-            .iter()
-            .filter(|c| c.cmd == SendCommand::Write)
-        {
+        for w in parsed.commands.iter().filter(|c| c.cmd == SendCommand::Write) {
             let mut offset = None;
             let mut data: Option<&[u8]> = None;
             for (atype, adata) in &w.attrs {
@@ -23356,50 +18416,6 @@ mod tests {
             reassembled, decompressed,
             "send stream of a compressed extent must carry the full DECOMPRESSED data"
         );
-    }
-
-    #[test]
-    fn collect_send_inode_links_preserves_link_order_and_unsorted_fallback() {
-        #[expect(clippy::cast_possible_truncation)]
-        fn inode_ref_entry(ino: u64, parent: u64, index: u64, name: &[u8]) -> BtrfsLeafEntry {
-            let mut data = Vec::new();
-            data.extend_from_slice(&index.to_le_bytes());
-            data.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            data.extend_from_slice(name);
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: ino,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: parent,
-                },
-                data,
-            }
-        }
-
-        let sorted = vec![
-            inode_ref_entry(257, 256, 2, b"first"),
-            inode_ref_entry(257, 300, 3, b"second"),
-            inode_ref_entry(258, 256, 4, b"third"),
-        ];
-        let expected_257 = vec![(256, b"first".to_vec()), (300, b"second".to_vec())];
-
-        let ordered = collect_send_inode_links::<false>(&sorted);
-        assert!(matches!(ordered, SendInodeLinks::Ordered(_)));
-        assert_eq!(ordered.get(257), Some(expected_257.as_slice()));
-
-        let forced_control = collect_send_inode_links::<true>(&sorted);
-        assert!(matches!(forced_control, SendInodeLinks::Gathered(_)));
-        assert_eq!(forced_control.get(257), Some(expected_257.as_slice()));
-
-        let unsorted = vec![
-            inode_ref_entry(258, 256, 4, b"third"),
-            inode_ref_entry(257, 256, 2, b"first"),
-            inode_ref_entry(258, 300, 5, b"fourth"),
-        ];
-        let expected_258 = vec![(256, b"third".to_vec()), (300, b"fourth".to_vec())];
-        let fallback = collect_send_inode_links::<false>(&unsorted);
-        assert!(matches!(fallback, SendInodeLinks::Gathered(_)));
-        assert_eq!(fallback.get(258), Some(expected_258.as_slice()));
     }
 
     /// bd-7ucz7: a child must never be emitted before its parent directory, even
@@ -23431,50 +18447,32 @@ mod tests {
         // f before d.
         let items = vec![
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 256,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
+                key: BtrfsKey { objectid: 256, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 },
                 data: make_inode_item(0o40755),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 257,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
+                key: BtrfsKey { objectid: 257, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 },
                 data: make_inode_item(0o100_644),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 257,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: 300,
-                },
+                key: BtrfsKey { objectid: 257, item_type: BTRFS_ITEM_INODE_REF, offset: 300 },
                 data: make_inode_ref(2, b"f"),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 300,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
+                key: BtrfsKey { objectid: 300, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 },
                 data: make_inode_item(0o40755),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 300,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: 256,
-                },
+                key: BtrfsKey { objectid: 300, item_type: BTRFS_ITEM_INODE_REF, offset: 256 },
                 data: make_inode_ref(2, b"d"),
             },
         ];
 
         let uuid = [0u8; 16];
-        let stream = generate_send_stream(&items, b"sv", &uuid, 1, |_b, _l, _r, _c| Ok(Vec::new()))
-            .expect("generate send stream");
+        let stream = generate_send_stream(&items, b"sv", &uuid, 1, |_b, _l, _r, _c| {
+            Ok(Vec::new())
+        })
+        .expect("generate send stream");
         let parsed = parse_send_stream(&stream).expect("parse stream");
 
         let path_of = |c: &SendStreamCommand| -> Option<Vec<u8>> {
@@ -23525,67 +18523,35 @@ mod tests {
         // b/f2 (two INODE_REF items, distinct parents).
         let items = vec![
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 256,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
+                key: BtrfsKey { objectid: 256, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 },
                 data: make_inode_item(0o40755),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 257,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
+                key: BtrfsKey { objectid: 257, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 },
                 data: make_inode_item(0o40755),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 257,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: 256,
-                },
+                key: BtrfsKey { objectid: 257, item_type: BTRFS_ITEM_INODE_REF, offset: 256 },
                 data: make_inode_ref(2, b"a"),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 258,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
+                key: BtrfsKey { objectid: 258, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 },
                 data: make_inode_item(0o40755),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 258,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: 256,
-                },
+                key: BtrfsKey { objectid: 258, item_type: BTRFS_ITEM_INODE_REF, offset: 256 },
                 data: make_inode_ref(2, b"b"),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 259,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
+                key: BtrfsKey { objectid: 259, item_type: BTRFS_ITEM_INODE_ITEM, offset: 0 },
                 data: make_inode_item(0o100_644),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 259,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: 257,
-                },
+                key: BtrfsKey { objectid: 259, item_type: BTRFS_ITEM_INODE_REF, offset: 257 },
                 data: make_inode_ref(2, b"f1"),
             },
             BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid: 259,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: 258,
-                },
+                key: BtrfsKey { objectid: 259, item_type: BTRFS_ITEM_INODE_REF, offset: 258 },
                 data: make_inode_ref(3, b"f2"),
             },
         ];
@@ -23596,10 +18562,7 @@ mod tests {
         let parsed = parse_send_stream(&stream).expect("parse stream");
 
         let attr = |c: &SendStreamCommand, t: u16| -> Option<Vec<u8>> {
-            c.attrs
-                .iter()
-                .find(|(ty, _)| *ty == t)
-                .map(|(_, d)| d.clone())
+            c.attrs.iter().find(|(ty, _)| *ty == t).map(|(_, d)| d.clone())
         };
         // mkfile at the primary path a/f1.
         assert!(
@@ -23617,138 +18580,6 @@ mod tests {
             Some(b"a/f1".as_ref()),
             "Link must target the primary path"
         );
-    }
-
-    #[test]
-    fn generate_send_stream_path_edge_golden_hashes() {
-        fn make_inode_item(mode: u32) -> Vec<u8> {
-            let mut buf = vec![0u8; 160];
-            buf[0..8].copy_from_slice(&1_u64.to_le_bytes());
-            buf[40..44].copy_from_slice(&1_u32.to_le_bytes());
-            buf[52..56].copy_from_slice(&mode.to_le_bytes());
-            buf
-        }
-        #[expect(clippy::cast_possible_truncation)]
-        fn make_inode_ref(index: u64, name: &[u8]) -> Vec<u8> {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&index.to_le_bytes());
-            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            buf.extend_from_slice(name);
-            buf
-        }
-        fn inode_item(objectid: u64, mode: u32) -> BtrfsLeafEntry {
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                },
-                data: make_inode_item(mode),
-            }
-        }
-        fn inode_ref(objectid: u64, parent: u64, index: u64, name: &[u8]) -> BtrfsLeafEntry {
-            BtrfsLeafEntry {
-                key: BtrfsKey {
-                    objectid,
-                    item_type: BTRFS_ITEM_INODE_REF,
-                    offset: parent,
-                },
-                data: make_inode_ref(index, name),
-            }
-        }
-        fn stream_hash(items: &[BtrfsLeafEntry]) -> String {
-            let uuid = [0x42_u8; 16];
-            let stream =
-                generate_send_stream(items, b"sv", &uuid, 7, |_b, _l, _r, _c| Ok(Vec::new()))
-                    .expect("generate send stream");
-            let digest = Sha256::digest(&stream);
-            let mut hash = String::with_capacity(64);
-            for byte in digest {
-                write!(&mut hash, "{byte:02x}").expect("write hash");
-            }
-            hash
-        }
-
-        let dir = u32::from(ffs_types::S_IFDIR | 0o755);
-        let reg = u32::from(ffs_types::S_IFREG | 0o644);
-        let root = BTRFS_FIRST_FREE_OBJECTID;
-        let cases: [(&str, &str, Vec<BtrfsLeafEntry>); 7] = [
-            (
-                "flat",
-                "bab19e3cc9e0639ff53470abc6ed5e596a9f9b9868a46d76061e31c3cf237431",
-                vec![
-                    inode_item(root, dir),
-                    inode_item(root + 1, reg),
-                    inode_ref(root + 1, root, 1, b"file"),
-                ],
-            ),
-            (
-                "deep",
-                "482fd169b19c71bdb36a9bb4e70ad0bf7d4df087632b0ad9539062785089b480",
-                vec![
-                    inode_item(root, dir),
-                    inode_item(root + 1, dir),
-                    inode_ref(root + 1, root, 1, b"a"),
-                    inode_item(root + 2, dir),
-                    inode_ref(root + 2, root + 1, 1, b"b"),
-                    inode_item(root + 3, reg),
-                    inode_ref(root + 3, root + 2, 1, b"c"),
-                ],
-            ),
-            (
-                "renamed_parent_higher_objectid",
-                "064c7895f53ab4745c18cdceb536b56c197f969d46fc1297c6145bf5bed93af0",
-                vec![
-                    inode_item(root, dir),
-                    inode_item(root + 1, reg),
-                    inode_ref(root + 1, root + 44, 1, b"child"),
-                    inode_item(root + 44, dir),
-                    inode_ref(root + 44, root, 1, b"parent"),
-                ],
-            ),
-            (
-                "hardlink_second_parent",
-                "e23470feba03c5cb6acd9391ce357d8b85c31a416c0929526e12e9b09e92aeb7",
-                vec![
-                    inode_item(root, dir),
-                    inode_item(root + 1, dir),
-                    inode_ref(root + 1, root, 1, b"a"),
-                    inode_item(root + 2, dir),
-                    inode_ref(root + 2, root, 1, b"b"),
-                    inode_item(root + 3, reg),
-                    inode_ref(root + 3, root + 1, 1, b"f1"),
-                    inode_ref(root + 3, root + 2, 2, b"f2"),
-                ],
-            ),
-            (
-                "missing_parent",
-                "5cc7d8d4ee9ef3d0c6c37ed721630551c420e9d3365bef194955af8eb50fa54e",
-                vec![
-                    inode_item(root, dir),
-                    inode_item(root + 1, reg),
-                    inode_ref(root + 1, root + 99, 1, b"orphan"),
-                ],
-            ),
-            (
-                "root_self_ref",
-                "d272ea2d17b469310a9c24b0e937ce5baad73e9ee173ae3a85f61c7afec97a92",
-                vec![inode_item(root, dir), inode_ref(root, root, 0, b"..")],
-            ),
-            (
-                "non_root_self_loop",
-                "b2e688204e610da9a4566562676611e1cd597231ae62e5fb0f87da0981e2584c",
-                vec![
-                    inode_item(root, dir),
-                    inode_item(root + 1, reg),
-                    inode_ref(root + 1, root + 1, 1, b"loop"),
-                ],
-            ),
-        ];
-
-        for (name, expected_hash, items) in cases {
-            let hash = stream_hash(&items);
-            assert_eq!(hash, expected_hash, "{name} raw stream hash changed");
-        }
     }
 
     #[test]

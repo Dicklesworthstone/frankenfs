@@ -12,9 +12,9 @@ pub mod per_core;
 use asupersync::Cx;
 use ffs_core::{
     BackpressureDecision, BackpressureGate, BtrfsQgroupLimitRequest, BtrfsTreeSearchKey,
-    DirEntry as FfsDirEntry, FIEMAP_EXTENT_UNWRITTEN, FiemapExtent, FileType as FfsFileType, FsOps,
-    FsStat, FsxattrInfo, InodeAttr, ReleaseRequest, RequestOp, RequestScope, SeekWhence,
-    SetAttrRequest, XattrSetMode,
+    DirEntry as FfsDirEntry, FIEMAP_EXTENT_UNWRITTEN, FiemapExtent,
+    FileType as FfsFileType, FsOps, FsStat, FsxattrInfo, InodeAttr, ReleaseRequest, RequestOp,
+    RequestScope, SeekWhence, SetAttrRequest, XattrSetMode,
 };
 use ffs_error::FfsError;
 use ffs_types::{EXT4_EXTENTS_FL, InodeNumber};
@@ -54,7 +54,6 @@ const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
 const FUSE_MAX_READ_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
 const MAX_ACCESS_PREDICTOR_ENTRIES: usize = 4096;
-const MAX_WRITEBACK_BATCH_PENDING_WRITES: usize = 8192;
 const BACKPRESSURE_THROTTLE_DELAY: Duration = Duration::from_millis(5);
 const BACKPRESSURE_SLEEP_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 const MOUNT_HANDLE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -830,10 +829,6 @@ pub struct AtomicMetrics {
 }
 
 impl AtomicMetrics {
-    #[allow(
-        deprecated,
-        reason = "try_update requires Rust 1.95; workspace MSRV is 1.85"
-    )]
     fn saturating_add(counter: &AtomicU64, delta: u64) {
         while counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -1219,7 +1214,6 @@ impl ReadaheadManager {
 /// | `kernel_notifier`  | `Mutex<Option<Notifier>>`           | leaf |
 /// | `access_predictor` | `AccessPredictor.state: Mutex`      | leaf |
 /// | `readahead`        | `ReadaheadManager.pending: Mutex`   | leaf |
-/// | `writeback_batches` | table mutex + per-batch scope mutex | leaf/table-only, then per-handle scope |
 /// | `inode_locks`      | `FuseInodeLocks.table: Mutex`       | 0 (see bd-pfv55 doc on FuseInodeLocks for the per-inode `held` rank-1 sublock) |
 ///
 /// Production callers comply by **never nesting two subsystem
@@ -1237,8 +1231,6 @@ impl ReadaheadManager {
 /// | `AccessPredictor::invalidate_inode` | access_predictor | leaf-only                        |
 /// | `ReadaheadManager::insert/take` | readahead          | leaf-only                        |
 /// | `ReadaheadManager::invalidate_inode` | readahead       | leaf-only                        |
-/// | `get_or_begin_writeback_batch` | writeback_batches  | table-only; no inode/readahead lock held |
-/// | `commit_writeback_batch_for_key` | writeback_batches | drain batch, release table, then commit |
 /// | `FuseInodeLocks::acquire`       | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeLocks::try_acquire`   | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeGuard::Drop`          | inode_locks        | rank 0 → rank 1 (nested)         |
@@ -1262,113 +1254,13 @@ struct FuseInner {
     metrics: Arc<AtomicMetrics>,
     thread_count: usize,
     read_only: bool,
-    writeback_cache: bool,
     mountpoint: Option<PathBuf>,
     kernel_notifier: Mutex<Option<fuser::Notifier>>,
     ioctl_trace: Option<IoctlTraceProbe>,
     backpressure: Option<Arc<BackpressureGate>>,
-    writeback_batches: Mutex<BTreeMap<WritebackKey, Arc<WritebackBatch>>>,
     access_predictor: AccessPredictor,
     readahead: ReadaheadManager,
     inode_locks: Arc<FuseInodeLocks>,
-    /// Dedicated pool that `read` requests are dispatched onto so the single
-    /// fuser session loop can immediately fetch the next kernel request
-    /// instead of serving reads one-at-a-time. The mounted multi-file read
-    /// storm profiled the daemon at ~1.5 busy CPUs with wall bounded by this
-    /// serial dispatch (2026-07-22 ledger entry), which is exactly the
-    /// "per-request dispatch model" bd-kdmu4 calls for. `None` when disabled
-    /// (`FFS_FUSE_ASYNC_READ=0`) or when only one worker thread is resolved —
-    /// reads then reply inline on the session loop, the pre-lever behavior.
-    read_offload: Option<rayon::ThreadPool>,
-}
-
-/// Whether `read` requests are dispatched onto the offload pool (default on).
-/// Set `FFS_FUSE_ASYNC_READ=0` (or `off`) to reply inline on the session loop —
-/// the pre-lever behavior — so the lever can be A/B'd in one binary.
-fn fuse_async_read_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("FFS_FUSE_ASYNC_READ")
-                .ok()
-                .as_deref()
-                .map(str::trim),
-            Some("0" | "off" | "false")
-        )
-    })
-}
-
-/// Whether `unlink`/`rmdir` re-tell the kernel to forget the entry they just
-/// removed (default off; `FFS_FUSE_NOTIFY_UNLINK=1` restores it).
-///
-/// The dispatchers used to issue `FUSE_NOTIFY_INVAL_ENTRY` for that entry from
-/// inside the request handler, before replying. Both halves of that are wrong:
-///
-/// - **It is redundant.** On a successful `FUSE_UNLINK`/`FUSE_RMDIR` reply the
-///   kernel runs `fuse_dir_changed()` and `fuse_entry_unlinked()`, which expire
-///   that dentry's cache entry itself, and the VFS then `d_delete`s it. So the
-///   notify costs one extra `/dev/fuse` write per delete to ask for something
-///   already in progress. In-kernel ext4 has no such channel and pays nothing.
-/// - **It deadlocks.** The kernel holds the parent directory's inode lock
-///   across `fuse_unlink` while it waits in `request_wait_answer`, and
-///   `fuse_reverse_inval_entry` wants that same lock — a circular wait. This is
-///   the HEAD hang recorded on 2026-08-01 that blocks the concurrent-mutation
-///   correctness gate, reproduced with concurrent dispatch both off and on.
-///
-/// Kept behind an environment switch so one binary supplies both A/B arms.
-fn unlink_entry_invalidation_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("FFS_FUSE_NOTIFY_UNLINK")
-                .ok()
-                .as_deref()
-                .map(str::trim),
-            Some("1" | "on" | "true")
-        )
-    })
-}
-
-/// How many concurrent FUSE dispatch workers the daemon should run.
-///
-/// The classic loop reads one request from `/dev/fuse`, services it, replies,
-/// and only then reads the next — so N client threads issuing metadata calls
-/// are funnelled through one server thread, while the in-kernel incumbent
-/// serves the same callers on N CPUs. `FFS_FUSE_WORKERS=N` runs N readers with
-/// a reader/writer dispatch gate: concurrency-safe reads overlap, mutations
-/// keep whole-session exclusion.
-///
-/// Returns `None` when unset/invalid/1, which selects the historical
-/// single-threaded loop, so the same binary supplies both A/B arms.
-fn fuse_dispatch_workers() -> Option<usize> {
-    let raw = std::env::var("FFS_FUSE_WORKERS").ok()?;
-    let requested = raw.trim().parse::<usize>().ok()?;
-    (requested > 1).then_some(requested.min(MAX_FUSE_DISPATCH_WORKERS))
-}
-
-/// Upper bound on `FFS_FUSE_WORKERS`; each worker owns a `BUFFER_SIZE` receive
-/// buffer, so an unbounded count would be an unbounded allocation.
-const MAX_FUSE_DISPATCH_WORKERS: usize = 64;
-
-/// Build the `read`-request offload pool: `thread_count` dedicated threads
-/// (the same knob that already sizes `max_background`). Returns `None` when
-/// the lever is disabled or the pool cannot be built — callers then reply
-/// inline, which is always correct.
-fn build_read_offload_pool(thread_count: usize) -> Option<rayon::ThreadPool> {
-    if !fuse_async_read_enabled() || thread_count < 2 {
-        return None;
-    }
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(thread_count)
-        .thread_name(|i| format!("ffs-fuse-rd-{i}"))
-        .build()
-        .map_err(|error| {
-            warn!(%error, "read offload pool build failed; reads reply inline");
-            error
-        })
-        .ok()
 }
 
 impl std::fmt::Debug for FuseInner {
@@ -1377,34 +1269,8 @@ impl std::fmt::Debug for FuseInner {
             .field("metrics", &self.metrics)
             .field("thread_count", &self.thread_count)
             .field("read_only", &self.read_only)
-            .field("writeback_cache", &self.writeback_cache)
             .field("mountpoint", &self.mountpoint)
             .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct WritebackKey {
-    ino: InodeNumber,
-    fh: u64,
-}
-
-impl WritebackKey {
-    const fn new(ino: InodeNumber, fh: u64) -> Self {
-        Self { ino, fh }
-    }
-}
-
-#[derive(Debug)]
-struct WritebackBatch {
-    scope: Mutex<Option<RequestScope>>,
-}
-
-impl WritebackBatch {
-    fn new(scope: RequestScope) -> Self {
-        Self {
-            scope: Mutex::new(Some(scope)),
-        }
     }
 }
 
@@ -1819,10 +1685,6 @@ struct IoctlTraceProbe {
 }
 
 impl IoctlTraceProbe {
-    #[allow(
-        deprecated,
-        reason = "try_update requires Rust 1.95; workspace MSRV is 1.85"
-    )]
     fn saturating_add_u64(counter: &AtomicU64, delta: u64) {
         while counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -2048,7 +1910,6 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
 /// and ready for multi-threaded FUSE dispatch.  All `FsOps` calls go
 /// through `self.inner.ops` (which is `Arc<dyn FsOps>`), and lock-free
 /// [`AtomicMetrics`] are updated on every request.
-#[derive(Clone)]
 pub struct FrankenFuse {
     inner: Arc<FuseInner>,
 }
@@ -2122,16 +1983,13 @@ impl FrankenFuse {
                 metrics: Arc::new(AtomicMetrics::new()),
                 thread_count,
                 read_only: options.read_only,
-                writeback_cache: options.writeback_cache.is_enabled(),
                 mountpoint: mountpoint.map(Path::to_path_buf),
                 kernel_notifier: Mutex::new(None),
                 ioctl_trace: options.ioctl_trace_path.clone().map(IoctlTraceProbe::new),
                 backpressure,
-                writeback_batches: Mutex::new(BTreeMap::new()),
                 access_predictor: AccessPredictor::default(),
                 readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
-                read_offload: build_read_offload_pool(thread_count),
             }),
         }
     }
@@ -2193,33 +2051,6 @@ impl FrankenFuse {
         }
     }
 
-    /// Serve one FUSE `read` request and send its reply. Runs either inline on
-    /// the session loop (offload disabled) or on the `read_offload` pool; the
-    /// body is identical in both cases — the exact code the inline `read` op
-    /// ran before the dispatch lever.
-    fn serve_read_request(&self, ino: u64, fh: u64, byte_offset: u64, size: u32, reply: ReplyData) {
-        let cx = Self::cx_for_request();
-        match self.read_with_readahead(&cx, InodeNumber(ino), fh, byte_offset, size) {
-            Ok(data) => {
-                self.inner
-                    .metrics
-                    .record_bytes_read(u64::try_from(data.len()).unwrap_or(u64::MAX));
-                reply.data(&data);
-            }
-            Err(e) => {
-                Self::reply_error_data(
-                    &FuseErrorContext {
-                        error: &e,
-                        operation: "read",
-                        ino,
-                        offset: Some(byte_offset),
-                    },
-                    reply,
-                );
-            }
-        }
-    }
-
     fn install_kernel_notifier(&self, notifier: fuser::Notifier) {
         let mut guard = match self.inner.kernel_notifier.lock() {
             Ok(guard) => guard,
@@ -2241,11 +2072,6 @@ impl FrankenFuse {
         }
     }
 
-    /// Invalidate a cached entry the kernel does *not* already know is gone.
-    ///
-    /// Only `rename` needs this: the kernel keeps the source and destination
-    /// dentries meaningful across the operation. Deletions must not use it —
-    /// see [`unlink_entry_invalidation_enabled`].
     fn notify_entry_invalidation(&self, parent: u64, name: &OsStr) {
         let Some(notifier) = self.kernel_notifier() else {
             return;
@@ -2305,7 +2131,7 @@ impl FrankenFuse {
         let byte_offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let cx = Self::cx_for_request();
         let data = self
-            .read_with_readahead(&cx, InodeNumber(ino), 0, byte_offset, size)
+            .read_with_readahead(&cx, InodeNumber(ino), byte_offset, size)
             .map_err(|error| error.to_errno())?;
         self.inner
             .metrics
@@ -2355,9 +2181,6 @@ impl FrankenFuse {
         lock_owner: u64,
     ) -> std::result::Result<(), c_int> {
         let cx = Self::cx_for_request();
-        let key = WritebackKey::new(InodeNumber(ino), fh);
-        self.commit_writeback_batch_for_key(&cx, key)
-            .map_err(|error| error.to_errno())?;
         self.with_request_scope(&cx, RequestOp::Flush, |cx, scope| {
             self.inner
                 .ops
@@ -2381,9 +2204,6 @@ impl FrankenFuse {
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Fsync) {
             return Err(errno);
         }
-        let key = WritebackKey::new(InodeNumber(ino), fh);
-        self.commit_writeback_batch_for_key(&cx, key)
-            .map_err(|error| error.to_errno())?;
         self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
             self.inner
                 .ops
@@ -2405,9 +2225,6 @@ impl FrankenFuse {
         flush: bool,
     ) -> std::result::Result<(), c_int> {
         let cx = Self::cx_for_request();
-        let key = WritebackKey::new(InodeNumber(ino), fh);
-        self.commit_writeback_batch_for_key(&cx, key)
-            .map_err(|error| error.to_errno())?;
         self.with_request_scope(&cx, RequestOp::Release, |cx, scope| {
             self.inner.ops.release(
                 cx,
@@ -2488,7 +2305,7 @@ impl FrankenFuse {
             let _ = entry.name_str();
         }
 
-        Ok(entries.to_vec())
+        Ok(entries)
     }
 
     /// Execute readlink without a live mount.
@@ -2948,12 +2765,8 @@ impl FrankenFuse {
         }
     }
 
-    fn xattr_names_encoded_len(names: &[String]) -> usize {
-        names.iter().map(|name| name.len() + 1).sum()
-    }
-
     fn encode_xattr_names(names: &[String]) -> Vec<u8> {
-        let total_len = Self::xattr_names_encoded_len(names);
+        let total_len = names.iter().map(|name| name.len() + 1).sum();
         let mut bytes = Vec::with_capacity(total_len);
         for name in names {
             bytes.extend_from_slice(name.as_bytes());
@@ -5072,142 +4885,6 @@ impl FrankenFuse {
         }
     }
 
-    fn lock_writeback_batches(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<WritebackKey, Arc<WritebackBatch>>> {
-        match self.inner.writeback_batches.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!("FUSE writeback batch table poisoned, recovering");
-                poisoned.into_inner()
-            }
-        }
-    }
-
-    fn lock_writeback_scope(
-        batch: &WritebackBatch,
-    ) -> std::sync::MutexGuard<'_, Option<RequestScope>> {
-        match batch.scope.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!("FUSE writeback batch scope poisoned, recovering");
-                poisoned.into_inner()
-            }
-        }
-    }
-
-    fn begin_deferred_write_scope(&self, cx: &Cx) -> ffs_error::Result<RequestScope> {
-        let mut scope = self.inner.ops.begin_request_scope(cx, RequestOp::Write)?;
-        scope.defer_commit_until_flush();
-        Ok(scope)
-    }
-
-    fn end_deferred_write_scope(&self, cx: &Cx, scope: RequestScope) -> ffs_error::Result<()> {
-        self.inner
-            .ops
-            .end_request_scope(cx, RequestOp::Write, scope)
-    }
-
-    fn commit_deferred_write_scope(
-        &self,
-        cx: &Cx,
-        mut scope: RequestScope,
-    ) -> ffs_error::Result<ffs_types::CommitSeq> {
-        let commit_result = self.inner.ops.commit_request_scope(&mut scope);
-        let end_result = self.end_deferred_write_scope(cx, scope);
-
-        match (commit_result, end_result) {
-            (Ok(commit), Ok(())) => Ok(commit),
-            (Ok(_), Err(end_err)) => Err(end_err),
-            (Err(commit_err), Ok(())) => Err(commit_err),
-            (Err(commit_err), Err(end_err)) => {
-                warn!(
-                    error = %end_err,
-                    "writeback batch cleanup failed after commit error"
-                );
-                Err(commit_err)
-            }
-        }
-    }
-
-    fn writeback_batch(&self, key: WritebackKey) -> Option<Arc<WritebackBatch>> {
-        self.lock_writeback_batches().get(&key).cloned()
-    }
-
-    fn get_or_begin_writeback_batch(
-        &self,
-        cx: &Cx,
-        key: WritebackKey,
-    ) -> ffs_error::Result<Arc<WritebackBatch>> {
-        if let Some(batch) = self.writeback_batch(key) {
-            return Ok(batch);
-        }
-
-        let scope = self.begin_deferred_write_scope(cx)?;
-        let batch = Arc::new(WritebackBatch::new(scope));
-        let mut batches = self.lock_writeback_batches();
-        if let Some(existing) = batches.get(&key) {
-            let existing = Arc::clone(existing);
-            drop(batches);
-            let mut scope_guard = Self::lock_writeback_scope(&batch);
-            if let Some(scope) = scope_guard.take() {
-                drop(scope_guard);
-                self.end_deferred_write_scope(cx, scope)?;
-            }
-            return Ok(existing);
-        }
-        batches.insert(key, Arc::clone(&batch));
-        drop(batches);
-        Ok(batch)
-    }
-
-    fn remove_writeback_batch_if_same(&self, key: WritebackKey, batch: &Arc<WritebackBatch>) {
-        let mut batches = self.lock_writeback_batches();
-        if batches
-            .get(&key)
-            .is_some_and(|existing| Arc::ptr_eq(existing, batch))
-        {
-            batches.remove(&key);
-        }
-    }
-
-    fn commit_writeback_batch_for_key(
-        &self,
-        cx: &Cx,
-        key: WritebackKey,
-    ) -> ffs_error::Result<Option<ffs_types::CommitSeq>> {
-        let batch = self.lock_writeback_batches().remove(&key);
-        let Some(batch) = batch else {
-            return Ok(None);
-        };
-        let mut scope_guard = Self::lock_writeback_scope(&batch);
-        let Some(scope) = scope_guard.take() else {
-            return Ok(None);
-        };
-        drop(scope_guard);
-        self.commit_deferred_write_scope(cx, scope).map(Some)
-    }
-
-    fn commit_all_writeback_batches(&self, cx: &Cx) -> ffs_error::Result<usize> {
-        let batches: Vec<_> = {
-            let mut table = self.lock_writeback_batches();
-            let batches = table.values().cloned().collect();
-            table.clear();
-            batches
-        };
-        let mut committed = 0;
-        for batch in batches {
-            let mut scope_guard = Self::lock_writeback_scope(&batch);
-            let Some(scope) = scope_guard.take() else {
-                continue;
-            };
-            drop(scope_guard);
-            self.commit_deferred_write_scope(cx, scope)?;
-            committed += 1;
-        }
-        Ok(committed)
-    }
-
     fn dispatch_opendir(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<(u64, u32)> {
         self.with_request_scope(cx, RequestOp::Opendir, |cx, scope| {
             let attr = self.inner.ops.getattr(cx, scope, ino)?;
@@ -5286,7 +4963,7 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_removed_entry(parent, name);
+        self.notify_entry_invalidation(parent, name);
         Ok(())
     }
 
@@ -5307,18 +4984,8 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_removed_entry(parent, name);
+        self.notify_entry_invalidation(parent, name);
         Ok(())
-    }
-
-    /// The deletion path's invalidation, which the kernel already performs.
-    ///
-    /// Off by default; `FFS_FUSE_NOTIFY_UNLINK=1` restores the historical
-    /// round trip so the same binary can supply both A/B arms.
-    fn notify_removed_entry(&self, parent: u64, name: &OsStr) {
-        if unlink_entry_invalidation_enabled() {
-            self.notify_entry_invalidation(parent, name);
-        }
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -5457,29 +5124,6 @@ impl FrankenFuse {
         }
         let byte_offset =
             u64::try_from(offset).map_err(|_| MutationDispatchError::Errno(libc::EINVAL))?;
-        if !self.inner.writeback_cache || intent.nowait() {
-            return self.dispatch_write_per_request(&cx, ino, byte_offset, data, intent);
-        }
-        if intent.sync_mode().is_some() {
-            let key = WritebackKey::new(InodeNumber(ino), intent.fh);
-            self.commit_writeback_batch_for_key(&cx, key)
-                .map_err(|error| MutationDispatchError::Operation {
-                    error,
-                    offset: Some(byte_offset),
-                })?;
-            return self.dispatch_write_per_request(&cx, ino, byte_offset, data, intent);
-        }
-        self.dispatch_write_batched(&cx, ino, byte_offset, data, intent)
-    }
-
-    fn dispatch_write_per_request(
-        &self,
-        cx: &Cx,
-        ino: u64,
-        byte_offset: u64,
-        data: &[u8],
-        intent: WriteIntent,
-    ) -> Result<u32, MutationDispatchError> {
         let mut operation_offset = byte_offset;
         let (written, _commit_seq) = {
             let _inode_guards = if intent.nowait() {
@@ -5488,7 +5132,7 @@ impl FrankenFuse {
             } else {
                 self.acquire_mutation_inode_guards(&[InodeNumber(ino)])
             };
-            self.with_request_scope(cx, RequestOp::Write, |cx, scope| {
+            self.with_request_scope(&cx, RequestOp::Write, |cx, scope| {
                 let write_offset = if intent.append_to_eof() {
                     self.inner.ops.getattr(cx, scope, InodeNumber(ino))?.size
                 } else {
@@ -5518,56 +5162,6 @@ impl FrankenFuse {
             offset: Some(operation_offset),
         })?;
         // Update writeback barrier if enabled.
-        Ok(written)
-    }
-
-    fn dispatch_write_batched(
-        &self,
-        cx: &Cx,
-        ino: u64,
-        byte_offset: u64,
-        data: &[u8],
-        intent: WriteIntent,
-    ) -> Result<u32, MutationDispatchError> {
-        let key = WritebackKey::new(InodeNumber(ino), intent.fh);
-        let mut operation_offset = byte_offset;
-        let write_result: ffs_error::Result<u32> = (|| {
-            loop {
-                let batch = self.get_or_begin_writeback_batch(cx, key)?;
-                let inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(ino)]);
-                let mut scope_guard = Self::lock_writeback_scope(&batch);
-                let Some(scope) = scope_guard.as_mut() else {
-                    drop(scope_guard);
-                    drop(inode_guards);
-                    self.remove_writeback_batch_if_same(key, &batch);
-                    continue;
-                };
-                let write_offset = if intent.append_to_eof() {
-                    self.inner.ops.getattr(cx, scope, InodeNumber(ino))?.size
-                } else {
-                    byte_offset
-                };
-                operation_offset = write_offset;
-                let bytes =
-                    self.inner
-                        .ops
-                        .write(cx, scope, InodeNumber(ino), write_offset, data)?;
-                self.inner.readahead.invalidate_inode(InodeNumber(ino));
-                if scope.pending_write_count() < MAX_WRITEBACK_BATCH_PENDING_WRITES {
-                    return Ok(bytes);
-                }
-                let scope = scope_guard.take().expect("scope present after as_mut");
-                drop(scope_guard);
-                drop(inode_guards);
-                self.remove_writeback_batch_if_same(key, &batch);
-                self.commit_deferred_write_scope(cx, scope)?;
-                return Ok(bytes);
-            }
-        })();
-        let written = write_result.map_err(|error| MutationDispatchError::Operation {
-            error,
-            offset: Some(operation_offset),
-        })?;
         Ok(written)
     }
 
@@ -5663,27 +5257,10 @@ impl FrankenFuse {
         &self,
         cx: &Cx,
         ino: InodeNumber,
-        fh: u64,
         byte_offset: u64,
         size: u32,
     ) -> ffs_error::Result<Vec<u8>> {
         let requested_len = usize::try_from(size).unwrap_or(usize::MAX);
-        if self.inner.writeback_cache {
-            let key = WritebackKey::new(ino, fh);
-            if let Some(batch) = self.writeback_batch(key) {
-                let mut scope_guard = Self::lock_writeback_scope(&batch);
-                if let Some(scope) = scope_guard.as_mut() {
-                    let mut data = self.inner.ops.read(cx, scope, ino, byte_offset, size)?;
-                    data.truncate(requested_len);
-                    self.inner.access_predictor.record_read(
-                        ino,
-                        byte_offset,
-                        u32::try_from(data.len()).unwrap_or(u32::MAX),
-                    );
-                    return Ok(data);
-                }
-            }
-        }
         self.with_request_scope(cx, RequestOp::Read, |cx, scope| {
             let mut served = self
                 .inner
@@ -5717,17 +5294,7 @@ impl FrankenFuse {
                 let fetched_served_len = (requested_len - served.len()).min(fetched.len());
                 let tail = fetched.split_off(fetched_served_len);
 
-                // With no cached prefix and no prefetch tail, the backend's
-                // allocation is exactly the reply: move it instead of making
-                // `Vec::append` allocate and copy the whole requested range.
-                // Keep append for partial-cache hits and coalesced reads; moving
-                // only the head of a larger prefetch buffer retains excess
-                // capacity and measured worse (bd-kdmu4).
-                if served.is_empty() && tail.is_empty() {
-                    served = fetched;
-                } else {
-                    served.append(&mut fetched);
-                }
+                served.append(&mut fetched);
 
                 if !tail.is_empty() {
                     let consumed = u64::try_from(fetched_served_len).unwrap_or(u64::MAX);
@@ -5859,16 +5426,6 @@ impl Filesystem for FrankenFuse {
 
     fn destroy(&mut self) {
         let cx = Self::cx_for_request();
-        match self.commit_all_writeback_batches(&cx) {
-            Ok(committed) if committed > 0 => {
-                debug!(
-                    committed,
-                    "committed deferred writeback batches during destroy"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => warn!("writeback batch commit failed during FUSE destroy: {e}"),
-        }
         if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {
             warn!("flush_on_destroy failed during FUSE destroy: {e}");
         }
@@ -6044,31 +5601,37 @@ impl Filesystem for FrankenFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let cx = Self::cx_for_request();
         let Ok(byte_offset) = u64::try_from(offset) else {
             warn!(ino, offset, "read: negative offset");
             reply.error(libc::EINVAL);
             return;
         };
-        // Dispatch the read onto the offload pool so this single session loop
-        // can immediately fetch the next kernel request. Every structure the
-        // handler touches lives behind `Arc<FuseInner>` (`read_with_readahead`
-        // takes `&self`), the fuser reply owns a `Send` channel sender built
-        // for exactly this cross-thread reply pattern, and FUSE imposes no
-        // reply-ordering requirement across concurrent requests. Bytes,
-        // errors, and metrics are identical to the inline path — only the
-        // thread that executes them changes.
-        if let Some(pool) = &self.inner.read_offload {
-            let handle = self.shared_handle();
-            pool.spawn(move || handle.serve_read_request(ino, fh, byte_offset, size, reply));
-        } else {
-            self.serve_read_request(ino, fh, byte_offset, size, reply);
+        match self.read_with_readahead(&cx, InodeNumber(ino), byte_offset, size) {
+            Ok(data) => {
+                self.inner
+                    .metrics
+                    .record_bytes_read(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                reply.data(&data);
+            }
+            Err(e) => {
+                Self::reply_error_data(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "read",
+                        ino,
+                        offset: Some(byte_offset),
+                    },
+                    reply,
+                );
+            }
         }
     }
 
@@ -6141,80 +5704,40 @@ impl Filesystem for FrankenFuse {
             return;
         };
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
-            // readdirplus getattrs every returned entry itself (below), so the
-            // readdir-internal inode-table prefetch fan-out is a redundant SECOND
-            // parallel pass over the same blocks the getattr fan-out reads. Skip
-            // it here (plain `readdir` leaves it on for readdir-then-stat walks).
-            scope.skip_readdir_prefetch = true;
             self.inner
                 .ops
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                // bd-xmh5g.399: fetch entries' attributes in PARALLEL so a cold
-                // `ls -l` does not pay a serial inode-table-block read per entry;
-                // then add them to the reply in original order. I/O-overlap: the
-                // blocking inode reads park their cores and overlap across the
-                // rayon pool. Conformance-neutral — identical entries, attributes,
-                // and ordering; getattr is already concurrency-safe (the FUSE
-                // dispatcher calls it from multiple worker threads), Cx is Sync, and
-                // with_request_scope takes &self.
-                //
-                // The `ops.readdir` page is capped at 512 entries, but the client
-                // reply buffer fills (`reply.add` -> `full`) after only ~150-200,
-                // so a single 512-wide fan-out computed ~300 getattrs whose results
-                // are discarded — and because successive readdirplus cookies advance
-                // by only the entries that fit, a full `ls -l` re-fetched that
-                // discarded window on every page (~512·N/F getattrs vs the ideal N).
-                // Fan out in BOUNDED BATCHES in entry order and stop the moment the
-                // reply buffer is full: identical entries/attrs/order, but wasted
-                // getattrs are bounded to < one batch instead of 512−F.
-                use rayon::prelude::*;
-                // Batch wide enough to saturate the rayon pool for I/O-overlap,
-                // small enough that overshoot past a full buffer stays tiny.
-                const READDIRPLUS_GETATTR_BATCH: usize = 128;
+                for entry in &entries {
+                    #[cfg(unix)]
+                    let name = OsStr::from_bytes(&entry.name);
+                    #[cfg(not(unix))]
+                    let owned_name = entry.name_str();
+                    #[cfg(not(unix))]
+                    let name = OsStr::new(&owned_name);
 
-                let this: &Self = &*self;
-                let cx_ref = &cx;
-                let mut buffer_full = false;
-                for batch in entries.chunks(READDIRPLUS_GETATTR_BATCH) {
-                    let attrs: Vec<Option<FileAttr>> = batch
-                        .par_iter()
-                        .map(|entry| {
-                            this.with_request_scope(cx_ref, RequestOp::Getattr, |cx, scope| {
-                                this.inner.ops.getattr(cx, scope, entry.ino)
-                            })
-                            .ok()
-                            .map(|attr| to_file_attr(&attr))
-                        })
-                        .collect();
-
-                    for (entry, attr) in batch.iter().zip(attrs) {
-                        // If we couldn't get attrs, skip this entry (same as before).
-                        let Some(attr) = attr else {
-                            continue;
+                    // Get attributes for each entry
+                    let attr =
+                        match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                            self.inner.ops.getattr(cx, scope, entry.ino)
+                        }) {
+                            Ok(attr) => to_file_attr(&attr),
+                            Err(_) => {
+                                // If we can't get attrs, skip this entry
+                                continue;
+                            }
                         };
-                        #[cfg(unix)]
-                        let name = OsStr::from_bytes(&entry.name);
-                        #[cfg(not(unix))]
-                        let owned_name = entry.name_str();
-                        #[cfg(not(unix))]
-                        let name = OsStr::new(&owned_name);
 
-                        let full = reply.add(
-                            entry.ino.0,
-                            i64::try_from(entry.offset).unwrap_or(i64::MAX),
-                            name,
-                            &ATTR_TTL,
-                            &attr,
-                            0, // generation - not tracked
-                        );
-                        if full {
-                            buffer_full = true;
-                            break;
-                        }
-                    }
-                    if buffer_full {
+                    let full = reply.add(
+                        entry.ino.0,
+                        i64::try_from(entry.offset).unwrap_or(i64::MAX),
+                        name,
+                        &ATTR_TTL,
+                        &attr,
+                        0, // generation - not tracked
+                    );
+                    if full {
                         break;
                     }
                 }
@@ -6435,13 +5958,6 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.listxattr(cx, InodeNumber(ino))
         }) {
             Ok(names) => {
-                if size == 0 {
-                    match u32::try_from(Self::xattr_names_encoded_len(&names)) {
-                        Ok(payload_len) => reply.size(payload_len),
-                        Err(_) => reply.error(libc::EOVERFLOW),
-                    }
-                    return;
-                }
                 let payload = Self::encode_xattr_names(&names);
                 Self::reply_xattr_payload(size, &payload, reply);
             }
@@ -6915,19 +6431,6 @@ impl Filesystem for FrankenFuse {
 
     fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
         let cx = Self::cx_for_request();
-        let key = WritebackKey::new(InodeNumber(ino), fh);
-        if let Err(e) = self.commit_writeback_batch_for_key(&cx, key) {
-            Self::reply_error_empty(
-                &FuseErrorContext {
-                    error: &e,
-                    operation: "flush",
-                    ino,
-                    offset: None,
-                },
-                reply,
-            );
-            return;
-        }
         match self.with_request_scope(&cx, RequestOp::Flush, |cx, scope| {
             self.inner
                 .ops
@@ -6959,19 +6462,6 @@ impl Filesystem for FrankenFuse {
         reply: ReplyEmpty,
     ) {
         let cx = Self::cx_for_request();
-        let key = WritebackKey::new(InodeNumber(ino), fh);
-        if let Err(e) = self.commit_writeback_batch_for_key(&cx, key) {
-            Self::reply_error_empty(
-                &FuseErrorContext {
-                    error: &e,
-                    operation: "release",
-                    ino,
-                    offset: None,
-                },
-                reply,
-            );
-            return;
-        }
         match self.with_request_scope(&cx, RequestOp::Release, |cx, scope| {
             self.inner.ops.release(
                 cx,
@@ -7009,19 +6499,6 @@ impl Filesystem for FrankenFuse {
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Fsync) {
             warn!(ino, "backpressure: shedding fsync");
             reply.error(errno);
-            return;
-        }
-        let key = WritebackKey::new(InodeNumber(ino), fh);
-        if let Err(e) = self.commit_writeback_batch_for_key(&cx, key) {
-            Self::reply_error_empty(
-                &FuseErrorContext {
-                    error: &e,
-                    operation: "fsync",
-                    ino,
-                    offset: None,
-                },
-                reply,
-            );
             return;
         }
         match self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
@@ -7322,11 +6799,7 @@ pub fn mount(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
     fs.install_kernel_notifier(session.notifier());
-    if let Some(workers) = fuse_dispatch_workers() {
-        session.run_with_workers(workers)?;
-    } else {
-        session.run()?;
-    }
+    session.run()?;
     Ok(())
 }
 
@@ -7548,17 +7021,7 @@ pub fn mount_managed(
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
 
-    let session = match fuse_dispatch_workers() {
-        Some(workers) => {
-            info!(
-                mountpoint = %mountpoint.display(),
-                workers,
-                "FUSE dispatch workers enabled"
-            );
-            fuser::spawn_mount2_with_workers(fs, mountpoint, &fuse_opts, workers)?
-        }
-        None => fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?,
-    };
+    let session = fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?;
     notifier_owner.install_kernel_notifier(session.notifier());
 
     info!(mountpoint = %mountpoint.display(), "FUSE mount active");
@@ -7576,8 +7039,7 @@ pub fn mount_managed(
 mod tests {
     use super::*;
     use ffs_core::{
-        DirEntry as FfsDirEntry, FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_UNWRITTEN,
-        ReaddirPage as FfsReaddirPage, RequestScope,
+        DirEntry as FfsDirEntry, FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_UNWRITTEN, RequestScope,
     };
     use ffs_types::CommitSeq;
     use std::os::fd::AsRawFd;
@@ -7611,8 +7073,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<FfsReaddirPage> {
-            Ok(vec![].into())
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
         }
         fn read(
             &self,
@@ -8619,38 +8081,6 @@ mod tests {
     }
 
     #[test]
-    fn to_file_attr_maps_each_timestamp_field_distinctly() {
-        // Distinct per-field values so an atime/mtime swap or ctime->crtime
-        // miscopy in the getattr translation cannot pass unnoticed.
-        let atime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
-        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2);
-        let ctime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(3);
-        let creation_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(4);
-        let iattr = InodeAttr {
-            ino: InodeNumber(1),
-            size: 0,
-            blocks: 0,
-            atime,
-            mtime,
-            ctime,
-            crtime: creation_time,
-            kind: FfsFileType::RegularFile,
-            perm: 0o644,
-            nlink: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            blksize: 4096,
-            generation: 0,
-        };
-        let fattr = to_file_attr(&iattr);
-        assert_eq!(fattr.atime, atime, "atime");
-        assert_eq!(fattr.mtime, mtime, "mtime");
-        assert_eq!(fattr.ctime, ctime, "ctime");
-        assert_eq!(fattr.crtime, creation_time, "crtime");
-    }
-
-    #[test]
     fn to_fuser_file_type_all_variants() {
         assert_eq!(
             to_fuser_file_type(FfsFileType::RegularFile),
@@ -8859,54 +8289,6 @@ mod tests {
     }
 
     #[test]
-    fn fuse_inode_locks_evict_slots_when_guards_drop() {
-        let locks = Arc::new(FuseInodeLocks {
-            table: Mutex::new(std::collections::BTreeMap::new()),
-        });
-
-        // A single-inode acquire creates one slot with users == 1.
-        let g = locks.acquire(&[InodeNumber(5)]);
-        assert_eq!(locks.table.lock().unwrap().len(), 1);
-        assert_eq!(locks.table.lock().unwrap()[&InodeNumber(5)].users, 1);
-        // Dropping the guard evicts the slot (users reaches 0) — no leak.
-        drop(g);
-        assert!(locks.table.lock().unwrap().is_empty());
-
-        // A multi-inode batch creates one slot per distinct inode, all evicted.
-        let g2 = locks.acquire(&[InodeNumber(5), InodeNumber(7)]);
-        assert_eq!(locks.table.lock().unwrap().len(), 2);
-        drop(g2);
-        assert!(locks.table.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn readahead_manager_reinsert_does_not_evict_updated_entry() {
-        let r = ReadaheadManager::new(2);
-        r.insert(InodeNumber(1), 0, vec![1]);
-        r.insert(InodeNumber(1), 0, vec![2]); // re-insert same key: dedups the FIFO slot
-        r.insert(InodeNumber(2), 0, vec![3]);
-
-        // With FIFO dedup, both distinct keys fit within max_pending=2; the
-        // re-inserted entry was not spuriously evicted and holds the new value.
-        assert_eq!(r.take(InodeNumber(1), 0, 1), Some(vec![2]));
-        assert_eq!(r.take(InodeNumber(2), 0, 1), Some(vec![3]));
-    }
-
-    #[test]
-    fn readahead_manager_evicts_oldest_when_over_limit() {
-        let r = ReadaheadManager::new(2);
-        r.insert(InodeNumber(1), 0, vec![1]);
-        r.insert(InodeNumber(2), 0, vec![2]);
-        r.insert(InodeNumber(3), 0, vec![3]); // exceeds max_pending=2
-
-        // The oldest entry was evicted to keep the cache bounded.
-        assert!(r.take(InodeNumber(1), 0, 1).is_none());
-        // The two most recent entries survive.
-        assert_eq!(r.take(InodeNumber(2), 0, 1), Some(vec![2]));
-        assert_eq!(r.take(InodeNumber(3), 0, 1), Some(vec![3]));
-    }
-
-    #[test]
     fn readahead_manager_take_removes_entry() {
         let r = ReadaheadManager::new(10);
         r.insert(InodeNumber(1), 0, vec![1, 2, 3, 4]);
@@ -8987,7 +8369,7 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<FfsReaddirPage> {
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
             unreachable!("opendir validation only calls getattr")
         }
 
@@ -9193,7 +8575,7 @@ mod tests {
                 _scope: &mut RequestScope,
                 _ino: InodeNumber,
                 _offset: u64,
-            ) -> ffs_error::Result<FfsReaddirPage> {
+            ) -> ffs_error::Result<Vec<FfsDirEntry>> {
                 unreachable!()
             }
             fn read(
@@ -9437,34 +8819,6 @@ mod tests {
                     .expect("extent flags")
             ),
             FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_UNWRITTEN
-        );
-    }
-
-    #[test]
-    fn encode_fiemap_response_writes_extent_logical_physical_length_fields() {
-        // Distinct values so a logical/physical swap or a misplaced length fails.
-        let extents = vec![FiemapExtent {
-            logical: 0x1111,
-            physical: 0x2222,
-            length: 0x3333,
-            flags: 0,
-        }];
-        let response = FrankenFuse::encode_fiemap_response(0, u64::MAX, 4, &extents, 4096);
-        let off = FIEMAP_HEADER_SIZE;
-        assert_eq!(
-            u64::from_ne_bytes(response[off..off + 8].try_into().expect("logical")),
-            0x1111,
-            "logical at off"
-        );
-        assert_eq!(
-            u64::from_ne_bytes(response[off + 8..off + 16].try_into().expect("physical")),
-            0x2222,
-            "physical at off+8"
-        );
-        assert_eq!(
-            u64::from_ne_bytes(response[off + 16..off + 24].try_into().expect("length")),
-            0x3333,
-            "length at off+16"
         );
     }
 
@@ -9961,8 +9315,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<FfsReaddirPage> {
-            Ok(vec![].into())
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
         }
 
         fn read(
@@ -14835,8 +14189,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<FfsReaddirPage> {
-            Ok(vec![].into())
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
         }
 
         fn read(
@@ -14876,19 +14230,19 @@ mod tests {
         let ino = InodeNumber(1);
 
         assert_eq!(
-            fuse.read_with_readahead(&cx, ino, 0, 0, 4).unwrap(),
+            fuse.read_with_readahead(&cx, ino, 0, 4).unwrap(),
             vec![0, 1, 2, 3]
         );
         assert_eq!(
-            fuse.read_with_readahead(&cx, ino, 0, 4, 4).unwrap(),
+            fuse.read_with_readahead(&cx, ino, 4, 4).unwrap(),
             vec![4, 5, 6, 7]
         );
         assert_eq!(
-            fuse.read_with_readahead(&cx, ino, 0, 8, 4).unwrap(),
+            fuse.read_with_readahead(&cx, ino, 8, 4).unwrap(),
             vec![8, 9, 10, 11]
         );
         assert_eq!(
-            fuse.read_with_readahead(&cx, ino, 0, 12, 4).unwrap(),
+            fuse.read_with_readahead(&cx, ino, 12, 4).unwrap(),
             vec![12, 13, 14, 15]
         );
 
@@ -14915,7 +14269,7 @@ mod tests {
                 expected_start.saturating_add(3),
             ];
             assert_eq!(
-                fuse.read_with_readahead(&cx, ino, 0, offset, 4).unwrap(),
+                fuse.read_with_readahead(&cx, ino, offset, 4).unwrap(),
                 expected
             );
         }
@@ -14935,7 +14289,7 @@ mod tests {
         let offsets = [0_u64, 32, 4, 48, 8, 64];
 
         for offset in offsets {
-            let _ = fuse.read_with_readahead(&cx, ino, 0, offset, 4).unwrap();
+            let _ = fuse.read_with_readahead(&cx, ino, offset, 4).unwrap();
         }
 
         assert_eq!(
@@ -14993,8 +14347,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<FfsReaddirPage> {
-            Ok(vec![].into())
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
         }
 
         fn read(
@@ -15410,7 +14764,7 @@ mod tests {
             _scope: &mut RequestScope,
             ino: InodeNumber,
             offset: u64,
-        ) -> ffs_error::Result<FfsReaddirPage> {
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
             self.calls
                 .lock()
                 .expect("lock mutation calls")
@@ -15420,8 +14774,7 @@ mod tests {
                 offset: offset + 1,
                 kind: FfsFileType::RegularFile,
                 name: b"entry.txt".to_vec(),
-            }]
-            .into())
+            }])
         }
 
         fn read(
@@ -15861,69 +15214,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn authorize_setattr_owner_change_denies_non_root_chown() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let options = MountOptions {
-            read_only: false,
-            ..MountOptions::default()
-        };
-        let fuse = FrankenFuse::with_options(
-            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
-            &options,
-        );
-        // The mock getattr reports uid=1000, gid=1000 for every inode.
-
-        let uid_change = SetAttrRequest {
-            mode: None,
-            uid: Some(501),
-            gid: None,
-            size: None,
-            atime: None,
-            mtime: None,
-        };
-        // Root may change ownership.
-        assert!(fuse.setattr_for_fuzzing_as(7, &uid_change, 0).is_ok());
-        // A non-root caller changing uid to a different value is refused (EPERM).
-        assert!(matches!(
-            fuse.setattr_for_fuzzing_as(7, &uid_change, 1000),
-            Err(errno) if errno == libc::EPERM
-        ));
-        // Same for an actual gid change.
-        let gid_change = SetAttrRequest {
-            mode: None,
-            uid: None,
-            gid: Some(999),
-            size: None,
-            atime: None,
-            mtime: None,
-        };
-        assert!(matches!(
-            fuse.setattr_for_fuzzing_as(7, &gid_change, 1000),
-            Err(errno) if errno == libc::EPERM
-        ));
-        // A non-root no-op (uid/gid set to their current values) is allowed.
-        let noop = SetAttrRequest {
-            mode: None,
-            uid: Some(1000),
-            gid: Some(1000),
-            size: None,
-            atime: None,
-            mtime: None,
-        };
-        assert!(fuse.setattr_for_fuzzing_as(7, &noop, 1000).is_ok());
-        // A non-root change to non-ownership attributes is allowed.
-        let mode_change = SetAttrRequest {
-            mode: Some(0o600),
-            uid: None,
-            gid: None,
-            size: None,
-            atime: None,
-            mtime: None,
-        };
-        assert!(fuse.setattr_for_fuzzing_as(7, &mode_change, 1000).is_ok());
     }
 
     #[test]
@@ -16505,227 +15795,6 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cache_write_defers_commit_until_flush() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let options = MountOptions {
-            read_only: false,
-            writeback_cache: WritebackCacheMode::Enabled,
-            ..MountOptions::default()
-        };
-        let fuse = FrankenFuse::with_options(
-            Box::new(MutationRecordingFs::with_scope_recording(Arc::clone(
-                &calls,
-            ))),
-            &options,
-        );
-
-        let written = fuse
-            .dispatch_write_with_intent(44, 16, b"payload", WriteIntent::from_fuse(9001, 0, 0))
-            .expect("writeback-cache write");
-        assert_eq!(written, 7);
-        assert_eq!(
-            calls.lock().expect("lock calls").as_slice(),
-            &[
-                MutationCall::Begin {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Write {
-                    ino: InodeNumber(44),
-                    offset: 16,
-                    data: b"payload".to_vec(),
-                },
-            ],
-            "buffered writeback-cache writes must not commit before a boundary"
-        );
-
-        fuse.flush_for_fuzzing(44, 9001, 0xABCD)
-            .expect("flush commits pending batch");
-        assert_eq!(
-            calls.lock().expect("lock calls").as_slice(),
-            &[
-                MutationCall::Begin {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Write {
-                    ino: InodeNumber(44),
-                    offset: 16,
-                    data: b"payload".to_vec(),
-                },
-                MutationCall::Commit,
-                MutationCall::End {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Begin {
-                    op: RequestOp::Flush,
-                },
-                MutationCall::Flush {
-                    ino: InodeNumber(44),
-                    fh: 9001,
-                    lock_owner: 0xABCD,
-                },
-                MutationCall::End {
-                    op: RequestOp::Flush,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn writeback_cache_fsync_commits_pending_writes_before_fsync() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let options = MountOptions {
-            read_only: false,
-            writeback_cache: WritebackCacheMode::Enabled,
-            ..MountOptions::default()
-        };
-        let fuse = FrankenFuse::with_options(
-            Box::new(MutationRecordingFs::with_scope_recording(Arc::clone(
-                &calls,
-            ))),
-            &options,
-        );
-
-        fuse.dispatch_write_with_intent(44, 0, b"abc", WriteIntent::from_fuse(9001, 0, 0))
-            .expect("writeback-cache write");
-        fuse.fsync_for_fuzzing(44, 9001, true)
-            .expect("fsync commits pending batch");
-
-        assert_eq!(
-            calls.lock().expect("lock calls").as_slice(),
-            &[
-                MutationCall::Begin {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Write {
-                    ino: InodeNumber(44),
-                    offset: 0,
-                    data: b"abc".to_vec(),
-                },
-                MutationCall::Commit,
-                MutationCall::End {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Begin {
-                    op: RequestOp::Fsync,
-                },
-                MutationCall::Fsync {
-                    ino: InodeNumber(44),
-                    fh: 9001,
-                    datasync: true,
-                },
-                MutationCall::Commit,
-                MutationCall::End {
-                    op: RequestOp::Fsync,
-                },
-            ]
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn writeback_cache_sync_write_drains_existing_batch_first() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let options = MountOptions {
-            read_only: false,
-            writeback_cache: WritebackCacheMode::Enabled,
-            ..MountOptions::default()
-        };
-        let fuse = FrankenFuse::with_options(
-            Box::new(MutationRecordingFs::with_scope_recording(Arc::clone(
-                &calls,
-            ))),
-            &options,
-        );
-
-        fuse.dispatch_write_with_intent(44, 0, b"old", WriteIntent::from_fuse(9001, 0, 0))
-            .expect("deferred write");
-        fuse.dispatch_write_with_intent(
-            44,
-            3,
-            b"sync",
-            WriteIntent::from_fuse(9001, 0, libc::O_DSYNC),
-        )
-        .expect("sync write");
-
-        assert_eq!(
-            calls.lock().expect("lock calls").as_slice(),
-            &[
-                MutationCall::Begin {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Write {
-                    ino: InodeNumber(44),
-                    offset: 0,
-                    data: b"old".to_vec(),
-                },
-                MutationCall::Commit,
-                MutationCall::End {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Begin {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Write {
-                    ino: InodeNumber(44),
-                    offset: 3,
-                    data: b"sync".to_vec(),
-                },
-                MutationCall::Commit,
-                MutationCall::Fsync {
-                    ino: InodeNumber(44),
-                    fh: 9001,
-                    datasync: true,
-                },
-                MutationCall::End {
-                    op: RequestOp::Write,
-                },
-            ],
-            "a sync write must publish any older deferred writes before its own fsync boundary"
-        );
-    }
-
-    #[test]
-    fn writeback_cache_read_reuses_live_write_scope_for_same_handle() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let options = MountOptions {
-            read_only: false,
-            writeback_cache: WritebackCacheMode::Enabled,
-            ..MountOptions::default()
-        };
-        let fuse = FrankenFuse::with_options(
-            Box::new(MutationRecordingFs::with_scope_recording(Arc::clone(
-                &calls,
-            ))),
-            &options,
-        );
-
-        fuse.write_for_fuzzing(44, 16, b"payload")
-            .expect("writeback-cache write");
-        let data = fuse.read_for_fuzzing(44, 16, 4).expect("same-handle read");
-
-        assert_eq!(data, b"read".to_vec());
-        assert_eq!(
-            calls.lock().expect("lock calls").as_slice(),
-            &[
-                MutationCall::Begin {
-                    op: RequestOp::Write,
-                },
-                MutationCall::Write {
-                    ino: InodeNumber(44),
-                    offset: 16,
-                    data: b"payload".to_vec(),
-                },
-                MutationCall::Read {
-                    ino: InodeNumber(44),
-                    offset: 16,
-                    size: 4,
-                },
-            ],
-            "same-handle reads must use the deferred write scope, not a new read snapshot"
-        );
-    }
-
-    #[test]
     fn conformance_fuse_copy_file_range_lifecycle_round_trip() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let options = MountOptions {
@@ -16922,8 +15991,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<FfsReaddirPage> {
-            Ok(vec![].into())
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
         }
 
         fn read(
@@ -18221,16 +17290,13 @@ mod tests {
             metrics: Arc::new(AtomicMetrics::new()),
             thread_count: 4,
             read_only: true,
-            writeback_cache: false,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
             ioctl_trace: None,
             backpressure: None,
-            writeback_batches: Mutex::new(BTreeMap::new()),
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             inode_locks: Arc::new(FuseInodeLocks::default()),
-            read_offload: None,
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
 
@@ -19574,7 +18640,6 @@ CUSTOM("congestion_threshold=3")"#;
             "bytes_read: 0, requests_throttled: 0, requests_shed: 0 }, ",
             "thread_count: 2, ",
             "read_only: false, ",
-            "writeback_cache: false, ",
             "mountpoint: None, ",
             ".. }"
         );
@@ -19584,16 +18649,13 @@ CUSTOM("congestion_threshold=3")"#;
             metrics: Arc::new(AtomicMetrics::new()),
             thread_count: 2,
             read_only: false,
-            writeback_cache: false,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
             ioctl_trace: None,
             backpressure: None,
-            writeback_batches: Mutex::new(BTreeMap::new()),
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(8),
             inode_locks: Arc::new(FuseInodeLocks::default()),
-            read_offload: None,
         };
         let dbg = format!("{inner:?}");
         assert_eq!(dbg, FUSE_INNER_DEBUG_GOLDEN);
@@ -20284,7 +19346,6 @@ CUSTOM("congestion_threshold=3")"#;
                 let encoded = FrankenFuse::encode_xattr_names(&names);
                 let expected_len: usize = names.iter().map(|n| n.len() + 1).sum();
                 prop_assert_eq!(encoded.len(), expected_len);
-                prop_assert_eq!(FrankenFuse::xattr_names_encoded_len(&names), expected_len);
             }
 
             /// Each encoded name ends with NUL separator.
