@@ -49,6 +49,27 @@ suspect. Retry predicate to push past 2.1x: profile an 8t sharded create-bench
 (release-perf, `perf -g`), find the >5%-self-time shared frame (commit-seq CAS /
 prune / allocator), and cut per-create commit count or contention.
 
+PROFILE DONE (perf -g --call-graph dwarf, 8t sharded create-bench count 120000,
+105k creates/s): TOP self-time = **`__memmove/memcpy_avx_unaligned` 11.70%**
+(block-sized copies — 10.5% is memcpy), then `ShardedMvccStore::commit` **5.19%**,
+`RawMutex::lock_slow` 1.51%, `add_entry_reject_existing_tracked` 1.46%, crc32c
+1.18%, jemalloc `sdallocx`+`malloc` ~2.0%, `RawRwLock::lock_shared_slow` 1.01%,
+plus ~7% kernel `[unknown]` (write/read syscalls). VERDICT: the 8t cap is
+MEMORY-BANDWIDTH-BOUND on 4 KiB block copies in the MVCC path — bandwidth is shared
+across cores, so it saturates at 8t (→ the 4t→8t dip). The per-create MVCC path
+copies each 4 KiB block multiple times: `read_visible`→Vec, the turn-8 `base`
+clone in `rmw_commit_block_with_proof` (`(bytes.clone(), Some(bytes))`, needed for
+the pruning-race merge base but a full-block copy on the no-conflict common path),
+`write_block`→`data.to_vec()`, and the merge-install rebuild. NEXT LEVER (bounded,
+one at a time): make the MVCC hot path Arc/COW-share block buffers instead of
+cloning — e.g. record the `base` as a shared `Arc<[u8]>`/`BlockBuf` from
+`read_visible_block_buf` (no copy) rather than an owned `Vec`, so the common
+no-conflict inode/bitmap write stops paying a 4 KiB memcpy. Each copy-elim is its
+own commit; re-measure the A/B after each. This is the path from ~2.1x toward the
+memory's aspirational 3.7x, but it is bounded (memcpy is 11.7%, commit 5.2% — even
+eliminating both fully is ~1.2x, so ~2.1x×1.2 ≈ 2.5x is a realistic ceiling for
+copy-elim alone; 3.7x would additionally need fewer per-create commits).
+
 ⭐ HONEST CAMPAIGN VERDICT: bd-bhh0i is a CORRECTNESS success + a real ~2.1x
 convoy-elimination throughput win, delivered end-to-end (BitmapOr proof +
 block-bitmap find-race + inode-table pruning race + read-vs-prune TOCTOU, all
