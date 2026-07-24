@@ -13,6 +13,49 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## bd-bhh0i RELEASE-PERF A/B — the honest number: ~2.1x convoy ELIMINATION, NOT the aspirational 3.7x; scaling caps at 4t (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 11, ⭐ MEASURED)
+
+Status: definitive measurement (release-perf, e2fsck-validated). The bd-bhh0i
+parallel-create cutover is CORRECT and beats the single-lock convoy ~2.1x at 4-8
+threads, but does NOT achieve the campaign's long-quoted "3.7x / 8t≥4x1t" — that
+was an unmeasured aspiration. Correcting the ledger with the real number.
+
+A/B: `create-bench <2GiB/16-group ext4> / --count 40000 --threads T`, single-lock
+(no env) vs sharded (`FFS_BHH0I_SHARDED=1`), same release-perf binary (built
+`--profile release-perf --features bhh0i_sharded_alloc`, 3m57s). All runs e2fsck rc0.
+
+| threads | single-lock c/s | sharded c/s | sharded/single-lock |
+|--------:|----------------:|------------:|--------------------:|
+| 1       | 119156          | 116382      | 0.98x (parity)      |
+| 2       | 87737           | 129436      | 1.48x               |
+| 4       | 68947           | 142627      | 2.07x               |
+| 8       | 61512           | 128206      | 2.08x               |
+
+READ: (1) single-lock CONVOYS — negative scaling 119k→61k (the whole-state write
+lock; reproduces the memory's 143k→80k). (2) The sharded cutover REMOVES the
+convoy: flat-to-positive, ~2.1x the single-lock at 4-8t; that convoy elimination is
+the real, correct, e2fsck-validated win. (3) BUT sharded SELF-scaling is weak: 1t
+116k → 4t 142k (1.23x) → 8t 128k (DIPS). "8t≥4x1t" is NOT met (8t is 1.10x of 1t);
+peak is 4t at 1.23x. Sharded 1t≈single-lock 1t (parity — the auto-commit/base-clone
+overhead is ~free at 1 thread).
+
+WHY the 4t cap / 8t dip (the perf lever, needs a profile — NOT a correctness gap):
+a high-thread serialization limiter. Per create the sharded path does SEVERAL MVCC
+auto-commits (inode bitmap, inode-table slot w/ a full-block `base` clone [added
+turn 8, ~free at 1t but allocator pressure at 8t], block bitmap) each hitting the
+global commit-seq CAS + `prune_after_commit_if_due` + shard locks; that shared
+machinery, not the per-group locks (0.5 thread/group at 8t/16-group), is the
+suspect. Retry predicate to push past 2.1x: profile an 8t sharded create-bench
+(release-perf, `perf -g`), find the >5%-self-time shared frame (commit-seq CAS /
+prune / allocator), and cut per-create commit count or contention.
+
+⭐ HONEST CAMPAIGN VERDICT: bd-bhh0i is a CORRECTNESS success + a real ~2.1x
+convoy-elimination throughput win, delivered end-to-end (BitmapOr proof +
+block-bitmap find-race + inode-table pruning race + read-vs-prune TOCTOU, all
+landed, e2fsck rc0 @40000/8t). The "3.7x" was aspirational and is not supported;
+the measured ceiling is ~2.1x vs single-lock, capped at 4t by shared-commit
+contention. Further gains are a bounded perf-tuning lever, not a structural one.
+
 ## ⭐⭐ bd-bhh0i CUTOVER COMPLETE — read-vs-prune TOCTOU FIXED; passes at 40k, e2fsck clean, 2.71x positive scaling (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 10, ⭐ FULL PASS)
 
 Status: LANDED (f9183ad9). The sharded parallel-create cutover now passes reliably
