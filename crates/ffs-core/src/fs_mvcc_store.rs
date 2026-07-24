@@ -331,7 +331,16 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
 
     fn read_snapshot(&self) -> Snapshot {
         if self.read_your_writes {
-            self.store.current_snapshot()
+            // Read-your-writes wants the LATEST committed content. Resolve at the
+            // MAX sentinel (newest RETAINED version) rather than a freshly fetched
+            // `current_snapshot()`, which has a TOCTOU with pruning: bd-bhh0i
+            // writable adapters are unregistered, so the prune watermark is the
+            // chain head — a concurrent commit+prune between capturing `current`
+            // and `read_visible` drops the captured version and the read falls to
+            // the stale on-device block (bd-bhh0i BUG-4 read-your-writes vs prune).
+            Snapshot {
+                high: CommitSeq(u64::MAX),
+            }
         } else {
             self.snapshot()
         }

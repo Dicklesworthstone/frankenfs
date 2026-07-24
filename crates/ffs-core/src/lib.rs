@@ -12007,7 +12007,21 @@ impl OpenFs {
         cx: &Cx,
         block: BlockNumber,
     ) -> Result<Vec<u8>, FfsError> {
-        let snapshot = self.mvcc_store.current_snapshot();
+        // Resolve at the MAX sentinel (the newest RETAINED version) rather than a
+        // freshly captured `current_snapshot()`: the bd-bhh0i writable adapters are
+        // unregistered, so pruning's watermark is the chain head and a concurrent
+        // commit+prune can DROP the version at the captured seq between capture and
+        // `read_visible` — after which `read_visible(block, captured)` returns None
+        // and we fall through to the STALE on-device block (which, for a
+        // create-heavy workload that never flushes mid-run, is the mkfs-empty inode
+        // table → a create then fails `NotFound` reading a just-committed inode).
+        // Pruning always keeps the newest version, so `CommitSeq::MAX` lands on it;
+        // this is a "current" read, so newest is exactly the intent (bd-bhh0i BUG-4
+        // read vs prune TOCTOU). A block with no version at all still falls through
+        // to the base device below (correct: it lives only on disk).
+        let snapshot = Snapshot {
+            high: CommitSeq(u64::MAX),
+        };
         if let Some(visible) = self.mvcc_store.read_visible(block, snapshot) {
             return Ok(visible);
         }
