@@ -66,7 +66,11 @@ fn run(writers: usize, ops_per_writer: u64, disjoint_shards: bool) -> f64 {
 fn sweep(ops: u64, disjoint: bool) {
     let _ = run(1, ops / 10, disjoint); // warm
     let base = run(1, ops, disjoint);
-    let layout = if disjoint { "SHARD-DISJOINT (block=i*W+w)" } else { "ALIASED (block=w*4096+i, bench default)" };
+    let layout = if disjoint {
+        "SHARD-DISJOINT (block=i*W+w)"
+    } else {
+        "ALIASED (block=w*4096+i, bench default)"
+    };
     println!("# layout={layout}  ops/writer={ops}");
     println!("writers=1   commits/s={base:>10.0}  per_writer={base:>9.0}  eff=1.00 (baseline)");
     for &w in &[2usize, 4, 8, 16, 32] {
@@ -75,7 +79,13 @@ fn sweep(ops: u64, disjoint: bool) {
         let eff = per / base; // 1.0 = perfect linear scaling; ->0 = full serialization
         println!(
             "writers={w:<3} commits/s={total:>10.0}  per_writer={per:>9.0}  eff={eff:.2} ({})",
-            if eff > 0.7 { "scales" } else if eff > 0.35 { "partial" } else { "SERIALIZED" }
+            if eff > 0.7 {
+                "scales"
+            } else if eff > 0.35 {
+                "partial"
+            } else {
+                "SERIALIZED"
+            }
         );
     }
 }

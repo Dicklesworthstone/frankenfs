@@ -266,15 +266,7 @@ impl PerGroupAlloc {
         // `alloc_blocks`.
         let reserved = stats.reserved_cache.get().cloned().unwrap_or_default();
         ffs_alloc::free_blocks_in_group(
-            cx,
-            dev,
-            geo,
-            &mut stats,
-            group,
-            rel_start,
-            count,
-            pctx,
-            &reserved,
+            cx, dev, geo, &mut stats, group, rel_start, count, pctx, &reserved,
         )
     }
 
@@ -442,8 +434,16 @@ fn choose_dir_group_from_snapshot(snapshot: &[GroupFree]) -> Option<ffs_types::G
         return None;
     }
     let n = snapshot.len() as u64;
-    let avg_free_inodes = snapshot.iter().map(|g| u64::from(g.free_inodes)).sum::<u64>() / n;
-    let avg_free_blocks = snapshot.iter().map(|g| u64::from(g.free_blocks)).sum::<u64>() / n;
+    let avg_free_inodes = snapshot
+        .iter()
+        .map(|g| u64::from(g.free_inodes))
+        .sum::<u64>()
+        / n;
+    let avg_free_blocks = snapshot
+        .iter()
+        .map(|g| u64::from(g.free_blocks))
+        .sum::<u64>()
+        / n;
     let avg_dirs = snapshot.iter().map(|g| u64::from(g.used_dirs)).sum::<u64>() / n;
 
     let mut best_group: u32 = 0;
@@ -532,7 +532,11 @@ mod spread_tests {
         let starts: std::collections::HashSet<u32> = (0..8u32)
             .map(|seed| spread_start_group(GroupNumber(2), seed, 8).0)
             .collect();
-        assert_eq!(starts.len(), 8, "8 distinct seeds must give 8 distinct start groups");
+        assert_eq!(
+            starts.len(),
+            8,
+            "8 distinct seeds must give 8 distinct start groups"
+        );
     }
 
     #[test]
@@ -540,7 +544,10 @@ mod spread_tests {
         for parent in [0u32, 3, 7] {
             for seed in [0u32, 1, 7, 8, 100, u32::MAX] {
                 let g = spread_start_group(GroupNumber(parent), seed, 8).0;
-                assert!(g < 8, "start group {g} must be a valid index (< group_count)");
+                assert!(
+                    g < 8,
+                    "start group {g} must be a valid index (< group_count)"
+                );
             }
         }
     }
@@ -639,8 +646,16 @@ mod tests {
         assert_eq!(hit, Some(2));
         assert_eq!(sharded.lock_group(0).free_blocks, 0);
         assert_eq!(sharded.lock_group(1).free_blocks, 0);
-        assert_eq!(sharded.lock_group(2).free_blocks, 2, "group 2 should be debited");
-        assert_eq!(sharded.lock_group(3).free_blocks, 10, "group 3 untouched (scan stopped)");
+        assert_eq!(
+            sharded.lock_group(2).free_blocks,
+            2,
+            "group 2 should be debited"
+        );
+        assert_eq!(
+            sharded.lock_group(3).free_blocks,
+            10,
+            "group 3 untouched (scan stopped)"
+        );
     }
 
     #[test]
@@ -655,7 +670,11 @@ mod tests {
         let hit = sharded.alloc_in_scan_order([2usize, 0, 1, 3], try_take(3));
         assert_eq!(hit, Some(2));
         assert_eq!(sharded.lock_group(2).free_blocks, 1);
-        assert_eq!(sharded.lock_group(0).free_blocks, 4, "goal group won; others untouched");
+        assert_eq!(
+            sharded.lock_group(0).free_blocks,
+            4,
+            "goal group won; others untouched"
+        );
     }
 
     #[test]
@@ -670,7 +689,11 @@ mod tests {
         assert_eq!(hit, None);
         for g in 0..3usize {
             let expect = [2u32, 1, 2][g];
-            assert_eq!(sharded.lock_group(g).free_blocks, expect, "group {g} must be unchanged");
+            assert_eq!(
+                sharded.lock_group(g).free_blocks,
+                expect,
+                "group {g} must be unchanged"
+            );
         }
     }
 
@@ -690,22 +713,38 @@ mod tests {
 
     #[test]
     fn total_free_sums_all_groups() {
-        let stats: Vec<GroupStats> = (0..4)
-            .map(|g| sample_group(g, 100 + g, 10 + g))
-            .collect();
+        let stats: Vec<GroupStats> = (0..4).map(|g| sample_group(g, 100 + g, 10 + g)).collect();
         let sharded = PerGroupAlloc::from_group_stats(stats);
         // blocks = 100+101+102+103 = 406; inodes = 10+11+12+13 = 46.
-        assert_eq!(sharded.total_free(), FreeTotals { blocks: 406, inodes: 46 });
+        assert_eq!(
+            sharded.total_free(),
+            FreeTotals {
+                blocks: 406,
+                inodes: 46
+            }
+        );
     }
 
     #[test]
     fn total_free_reflects_post_allocation_state() {
         let stats: Vec<GroupStats> = (0..3).map(|g| sample_group(g, 50, 5)).collect();
         let sharded = PerGroupAlloc::from_group_stats(stats);
-        assert_eq!(sharded.total_free(), FreeTotals { blocks: 150, inodes: 15 });
+        assert_eq!(
+            sharded.total_free(),
+            FreeTotals {
+                blocks: 150,
+                inodes: 15
+            }
+        );
         // Debit 7 blocks from whichever group the scan commits to.
         assert!(sharded.alloc_in_scan_order(0..3, try_take(7)).is_some());
-        assert_eq!(sharded.total_free(), FreeTotals { blocks: 143, inodes: 15 });
+        assert_eq!(
+            sharded.total_free(),
+            FreeTotals {
+                blocks: 143,
+                inodes: 15
+            }
+        );
     }
 
     #[test]
@@ -715,9 +754,30 @@ mod tests {
         let sharded = PerGroupAlloc::from_group_stats(stats);
         let snap = sharded.group_free_snapshot();
         assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0], GroupFree { free_blocks: 100, free_inodes: 10, used_dirs: 0 });
-        assert_eq!(snap[1], GroupFree { free_blocks: 101, free_inodes: 11, used_dirs: 4 });
-        assert_eq!(snap[2], GroupFree { free_blocks: 102, free_inodes: 12, used_dirs: 0 });
+        assert_eq!(
+            snap[0],
+            GroupFree {
+                free_blocks: 100,
+                free_inodes: 10,
+                used_dirs: 0
+            }
+        );
+        assert_eq!(
+            snap[1],
+            GroupFree {
+                free_blocks: 101,
+                free_inodes: 11,
+                used_dirs: 4
+            }
+        );
+        assert_eq!(
+            snap[2],
+            GroupFree {
+                free_blocks: 102,
+                free_inodes: 12,
+                used_dirs: 0
+            }
+        );
     }
 
     #[test]
@@ -732,7 +792,10 @@ mod tests {
         assert_eq!(sharded.alloc_in_scan_order([1usize], try_take(4)), Some(1));
         let snap = sharded.group_free_snapshot();
         assert_eq!(snap[0].free_blocks, 10);
-        assert_eq!(snap[1].free_blocks, 6, "group 1 snapshot must show the debit");
+        assert_eq!(
+            snap[1].free_blocks, 6,
+            "group 1 snapshot must show the debit"
+        );
         assert_eq!(snap[2].free_blocks, 10);
     }
 

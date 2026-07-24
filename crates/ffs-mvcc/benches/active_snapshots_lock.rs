@@ -25,9 +25,7 @@ const PER_THREAD: u64 = 100_000;
 
 fn hammer_register_release(threads: usize) {
     let store = Arc::new(ShardedMvccStore::for_host_parallelism());
-    let snapshot = Snapshot {
-        high: CommitSeq(0),
-    };
+    let snapshot = Snapshot { high: CommitSeq(0) };
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let store = Arc::clone(&store);

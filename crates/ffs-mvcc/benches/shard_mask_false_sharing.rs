@@ -98,12 +98,20 @@ fn bench_shard_mask(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_shard_mask_false_sharing");
     group.sample_size(20);
     for committers in [1_usize, 2, 4] {
-        group.bench_with_input(BenchmarkId::new("adjacent_same_line", committers), &committers, |b, &n| {
-            b.iter(|| run_adjacent(n));
-        });
-        group.bench_with_input(BenchmarkId::new("isolated_own_line", committers), &committers, |b, &n| {
-            b.iter(|| run_isolated(n));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("adjacent_same_line", committers),
+            &committers,
+            |b, &n| {
+                b.iter(|| run_adjacent(n));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("isolated_own_line", committers),
+            &committers,
+            |b, &n| {
+                b.iter(|| run_isolated(n));
+            },
+        );
     }
     group.finish();
 }
