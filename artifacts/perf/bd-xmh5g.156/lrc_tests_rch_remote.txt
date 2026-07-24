@@ -1,0 +1,678 @@
+  [2m2026-06-10T18:42:55.194033Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (1 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:514 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:42:55.560806Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankenfs (hash: 92b811703d71c6db)[0m
+    [2;3mat[0m rch/src/hook.rs:5994 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:42:55.560871Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 24 roots[0m
+    [2;3mat[0m rch/src/hook.rs:6016 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:42:58.413294Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook.rs:6046 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:42:58.413434Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 2 pattern(s) from .rchignore (total: 40)[0m
+    [2;3mat[0m rch/src/transfer.rs:799 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:42:58.413446Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs -> /data/projects/frankenfs on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:03.943094Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 5529ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:03.943234Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs -> /data/projects/frankenfs/crates/ffs on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:05.838593Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1895ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:05.838732Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-alloc -> /data/projects/frankenfs/crates/ffs-alloc on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:07.710541Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1871ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:07.710666Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-block -> /data/projects/frankenfs/crates/ffs-block on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:09.584827Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1874ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:09.585000Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-btree -> /data/projects/frankenfs/crates/ffs-btree on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:11.438349Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1853ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:11.438492Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-btrfs -> /data/projects/frankenfs/crates/ffs-btrfs on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:13.386805Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1948ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:13.386947Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-cli -> /data/projects/frankenfs/crates/ffs-cli on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:15.162552Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1775ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:15.162726Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-core -> /data/projects/frankenfs/crates/ffs-core on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:17.049089Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1886ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:17.049245Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-dir -> /data/projects/frankenfs/crates/ffs-dir on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:18.904426Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1855ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:18.904568Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-error -> /data/projects/frankenfs/crates/ffs-error on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:20.793996Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1889ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:20.794148Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-ext4 -> /data/projects/frankenfs/crates/ffs-ext4 on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:22.608624Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1814ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:22.608784Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-extent -> /data/projects/frankenfs/crates/ffs-extent on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:24.473308Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1864ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:24.473450Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-fuse -> /data/projects/frankenfs/crates/ffs-fuse on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:26.309877Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1836ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:26.310015Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-harness -> /data/projects/frankenfs/crates/ffs-harness on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:28.273233Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1963ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:28.273398Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-inode -> /data/projects/frankenfs/crates/ffs-inode on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:30.174611Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1901ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:30.174744Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-journal -> /data/projects/frankenfs/crates/ffs-journal on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:32.018509Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1843ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:32.018687Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-mvcc -> /data/projects/frankenfs/crates/ffs-mvcc on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:33.871641Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1852ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:33.871805Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-ondisk -> /data/projects/frankenfs/crates/ffs-ondisk on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:35.827830Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1956ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:35.827952Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-repair -> /data/projects/frankenfs/crates/ffs-repair on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:37.677471Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1849ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:37.677615Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-tui -> /data/projects/frankenfs/crates/ffs-tui on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:39.519091Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1841ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:39.519252Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-types -> /data/projects/frankenfs/crates/ffs-types on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:41.376507Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1857ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:41.376664Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/crates/ffs-xattr -> /data/projects/frankenfs/crates/ffs-xattr on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:43.191479Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1814ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:43.191620Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/tools/ffs-ops -> /data/projects/frankenfs/tools/ffs-ops on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:45.002523Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1810ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:45.002669Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenfs/vendor/fuser -> /data/projects/frankenfs/vendor/fuser on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:46.860440Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1857ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:46.860487Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 34598 files, 1646035 bytes in 48432ms[0m
+    [2;3mat[0m rch/src/hook.rs:6209 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:51.028357Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: cargo test -j 1 -p ffs-repair --lib lrc -- --nocapture '--test-threads=1'[0m
+    [2;3mat[0m rch/src/hook.rs:6252 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:43:51.028420Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/frankenfs/.rch-target-vmi1227854-job-29879662679165325-1781116978413285047-0[0m
+    [2;3mat[0m rch/src/transfer.rs:712 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anes v0.1.6
+  Downloaded log v0.4.29
+  Downloaded aead v0.5.2
+  Downloaded alloca v0.4.0
+  Downloaded block-buffer v0.10.4
+  Downloaded aho-corasick v1.1.4
+  Downloaded ciborium-ll v0.2.2
+  Downloaded sharded-slab v0.1.7
+  Downloaded rand_core v0.9.5
+  Downloaded polyval v0.6.2
+  Downloaded rayon v1.12.0
+  Downloaded signature v2.2.0
+  Downloaded allocator-api2 v0.2.21
+  Downloaded regex v1.12.3
+  Downloaded rand_chacha v0.9.0
+  Downloaded serde v1.0.228
+  Downloaded sha2 v0.10.9
+  Downloaded quote v1.0.45
+  Downloaded subtle v2.6.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded crypto-common v0.2.1
+  Downloaded slab v0.4.12
+  Downloaded block-buffer v0.12.0
+  Downloaded lazy_static v1.5.0
+  Downloaded zeroize v1.8.2
+  Downloaded tracing-log v0.2.0
+  Downloaded unty-next v0.1.1
+  Downloaded tinytemplate v1.2.1
+  Downloaded plotters-svg v0.3.7
+  Downloaded thiserror v2.0.18
+  Downloaded thread_local v1.1.9
+  Downloaded memoffset v0.9.1
+  Downloaded spki v0.7.3
+  Downloaded wait-timeout v0.2.1
+  Downloaded pkcs8 v0.10.2
+  Downloaded nkeys v0.4.5
+  Downloaded walkdir v2.5.0
+  Downloaded once_cell v1.21.4
+  Downloaded sha1 v0.11.0
+  Downloaded plotters-backend v0.3.7
+  Downloaded pem-rfc7468 v0.7.0
+  Downloaded crypto-common v0.1.7
+  Downloaded cpufeatures v0.2.17
+  Downloaded bytes v1.11.1
+  Downloaded zmij v1.0.21
+  Downloaded scopeguard v1.2.0
+  Downloaded rayon-core v1.13.0
+  Downloaded tracing-core v0.1.36
+  Downloaded unicode-ident v1.0.24
+  Downloaded quick-error v1.2.3
+  Downloaded similar v2.7.0
+  Downloaded hex v0.4.3
+  Downloaded version_check v0.9.5
+  Downloaded ghash v0.5.1
+  Downloaded bincode_derive-next v2.1.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded virtue-next v0.1.3
+  Downloaded ciborium-io v0.2.2
+  Downloaded tracing-attributes v0.1.31
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded zeroize_derive v1.4.3
+  Downloaded proptest v1.11.0
+  Downloaded typenum v1.20.0
+  Downloaded sha2 v0.11.0
+  Downloaded thiserror-impl v2.0.18
+  Downloaded num-traits v0.2.19
+  Downloaded memchr v2.8.0
+  Downloaded pin-project-internal v1.1.11
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded half v2.7.1
+  Downloaded signatory v0.27.1
+  Downloaded rand v0.9.4
+  Downloaded nix v0.29.0
+  Downloaded hmac v0.13.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded bincode-next v2.1.0
+  Downloaded tracing v0.1.44
+  Downloaded rustix v1.1.4
+  Downloaded getrandom v0.4.2
+  Downloaded regex-syntax v0.8.10
+  Downloaded insta v1.47.2
+  Downloaded nix v0.31.2
+  Downloaded indexmap v2.14.0
+  Downloaded regex-automata v0.4.14
+  Downloaded itertools v0.13.0
+  Downloaded hkdf v0.12.4
+  Downloaded clap_builder v4.6.0
+  Downloaded itertools v0.14.0
+  Downloaded hashbrown v0.17.0
+  Downloaded aes v0.8.4
+  Downloaded blake3 v1.8.4
+  Downloaded criterion v0.8.2
+  Downloaded ed25519-dalek v2.2.0
+  Downloaded curve25519-dalek v4.1.3
+  Downloaded der v0.7.10
+  Downloaded chacha20poly1305 v0.10.1
+  Downloaded cc v1.2.60
+  Downloaded base64 v0.22.1
+  Downloaded aes-gcm v0.10.3
+  Downloaded getrandom v0.2.17
+  Downloaded clap v4.6.1
+  Downloaded bitflags v2.11.1
+  Downloaded hmac v0.12.1
+  Downloaded futures-lite v2.6.1
+  Downloaded console v0.16.3
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded const-oid v0.9.6
+  Downloaded ciborium v0.2.2
+  Downloaded anyhow v1.0.102
+  Downloaded getrandom v0.3.4
+  Downloaded franken-evidence v0.3.4
+  Downloaded fastrand v2.4.1
+  Downloaded either v1.15.0
+  Downloaded digest v0.11.2
+  Downloaded data-encoding v2.11.0
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded criterion-plot v0.8.2
+  Downloaded crc32fast v1.5.0
+  Downloaded constant_time_eq v0.4.2
+  Downloaded cmov v0.5.3
+  Downloaded asupersync-macros v0.3.4
+  Downloaded anstyle v1.0.14
+  Downloaded digest v0.10.7
+  Downloaded lock_api v0.4.14
+  Downloaded libc v0.2.185
+  Downloaded foldhash v0.2.0
+  Downloaded ctutils v0.4.2
+  Downloaded const-oid v0.10.2
+  Downloaded sysinfo v0.33.1
+  Downloaded inout v0.1.4
+  Downloaded hybrid-array v0.4.10
+  Downloaded clap_lex v1.1.0
+  Downloaded cipher v0.4.4
+  Downloaded autocfg v1.5.0
+  Downloaded futures-io v0.3.32
+  Downloaded crossbeam-queue v0.3.12
+  Downloaded visibility v0.1.1
+  Downloaded unarray v0.1.4
+  Downloaded shlex v1.3.0
+  Downloaded curve25519-dalek-derive v0.1.1
+  Downloaded chacha20 v0.9.1
+  Downloaded base64ct v1.8.3
+  Downloaded tempfile v3.27.0
+  Downloaded serde_json v1.0.149
+  Downloaded plotters v0.3.7
+  Downloaded pin-project-lite v0.2.17
+  Downloaded generic-array v0.14.7
+  Downloaded fnv v1.0.7
+  Downloaded bit-set v0.8.0
+  Downloaded arrayref v0.3.9
+  Downloaded serde_derive v1.0.228
+  Downloaded equivalent v1.0.2
+  Downloaded arrayvec v0.7.6
+  Downloaded franken-kernel v0.3.4
+  Downloaded franken-decision v0.3.4
+  Downloaded crc32c v0.6.8
+  Downloaded cfg_aliases v0.2.1
+  Downloaded rand_xorshift v0.4.0
+  Downloaded parking v2.2.1
+  Downloaded rand_chacha v0.3.1
+  Downloaded parking_lot_core v0.9.12
+  Downloaded socket2 v0.6.3
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded serde_core v1.0.228
+  Downloaded semver v1.0.28
+  Downloaded pin-project v1.1.11
+  Downloaded smallvec v1.15.1
+  Downloaded signal-hook v0.4.4
+  Downloaded same-file v1.0.6
+  Downloaded rustc_version v0.4.1
+  Downloaded rmp-serde v1.3.1
+  Downloaded errno v0.3.14
+  Downloaded cast v0.3.0
+  Downloaded rand v0.8.6
+  Downloaded parking_lot v0.12.5
+  Downloaded oorandom v11.1.5
+  Downloaded rmp v0.8.15
+  Downloaded cfg-if v1.0.4
+  Downloaded opaque-debug v0.3.1
+  Downloaded poly1305 v0.8.0
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded universal-hash v0.5.1
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded prost-derive v0.14.4
+  Downloaded polling v3.11.0
+  Downloaded itoa v1.0.18
+  Downloaded prost v0.14.4
+  Downloaded futures-core v0.3.32
+  Downloaded cpufeatures v0.3.0
+  Downloaded rusty-fork v0.3.1
+  Downloaded rand_core v0.6.4
+  Downloaded page_size v0.6.0
+  Downloaded ed25519 v2.2.3
+  Downloaded ctr v0.9.2
+  Downloaded bit-vec v0.8.0
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded asupersync v0.3.4
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling syn v2.0.117
+   Compiling typenum v1.20.0
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling getrandom v0.2.17
+   Compiling rand_core v0.6.4
+   Compiling crypto-common v0.1.7
+   Compiling subtle v2.6.1
+   Compiling serde_core v1.0.228
+   Compiling zeroize_derive v1.4.3
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling serde v1.0.228
+   Compiling zeroize v1.8.2
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling crossbeam-utils v0.8.21
+   Compiling semver v1.0.28
+   Compiling cpufeatures v0.2.17
+   Compiling rustc_version v0.4.1
+   Compiling block-buffer v0.10.4
+   Compiling either v1.15.0
+   Compiling once_cell v1.21.4
+   Compiling digest v0.10.7
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.60
+   Compiling bitflags v2.11.1
+   Compiling crossbeam-epoch v0.9.18
+   Compiling num-traits v0.2.19
+   Compiling rayon-core v1.13.0
+   Compiling equivalent v1.0.2
+   Compiling zmij v1.0.21
+   Compiling rustix v1.1.4
+   Compiling allocator-api2 v0.2.21
+   Compiling foldhash v0.2.0
+   Compiling hashbrown v0.17.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling inout v0.1.4
+   Compiling hybrid-array v0.4.10
+   Compiling linux-raw-sys v0.12.1
+   Compiling cfg_aliases v0.2.1
+   Compiling getrandom v0.4.2
+   Compiling base64ct v1.8.3
+   Compiling memchr v2.8.0
+   Compiling serde_json v1.0.149
+   Compiling pem-rfc7468 v0.7.0
+   Compiling cipher v0.4.4
+   Compiling indexmap v2.14.0
+   Compiling tracing-core v0.1.36
+   Compiling ppv-lite86 v0.2.21
+   Compiling universal-hash v0.5.1
+   Compiling getrandom v0.3.4
+   Compiling cmov v0.5.3
+   Compiling thiserror v2.0.18
+   Compiling fastrand v2.4.1
+   Compiling cpufeatures v0.3.0
+   Compiling const-oid v0.9.6
+   Compiling opaque-debug v0.3.1
+   Compiling itoa v1.0.18
+   Compiling der v0.7.10
+   Compiling ctutils v0.4.2
+   Compiling rayon v1.12.0
+   Compiling crypto-common v0.2.1
+   Compiling block-buffer v0.12.0
+   Compiling signature v2.2.0
+   Compiling curve25519-dalek v4.1.3
+   Compiling thiserror-impl v2.0.18
+   Compiling anyhow v1.0.102
+   Compiling pin-project-lite v0.2.17
+   Compiling const-oid v0.10.2
+   Compiling digest v0.11.2
+   Compiling tempfile v3.27.0
+   Compiling spki v0.7.3
+   Compiling blake3 v1.8.4
+   Compiling crc32c v0.6.8
+   Compiling memoffset v0.9.1
+   Compiling tracing-attributes v0.1.31
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling log v0.4.29
+   Compiling parking_lot_core v0.9.12
+   Compiling smallvec v1.15.1
+   Compiling tracing v0.1.44
+   Compiling pkcs8 v0.10.2
+   Compiling rand_core v0.9.5
+   Compiling ed25519 v2.2.3
+   Compiling polyval v0.6.2
+   Compiling rand_chacha v0.3.1
+   Compiling nix v0.31.2
+   Compiling sha2 v0.10.9
+   Compiling itertools v0.14.0
+   Compiling aead v0.5.2
+   Compiling errno v0.3.14
+   Compiling arrayref v0.3.9
+   Compiling arrayvec v0.7.6
+   Compiling lazy_static v1.5.0
+   Compiling virtue-next v0.1.3
+   Compiling regex-syntax v0.8.10
+   Compiling crc32fast v1.5.0
+   Compiling scopeguard v1.2.0
+   Compiling constant_time_eq v0.4.2
+   Compiling signal-hook v0.4.4
+   Compiling lock_api v0.4.14
+   Compiling bincode_derive-next v2.1.0
+   Compiling sharded-slab v0.1.7
+   Compiling signal-hook-registry v1.4.8
+   Compiling prost-derive v0.14.4
+   Compiling ed25519-dalek v2.2.0
+   Compiling rand v0.8.6
+   Compiling ghash v0.5.1
+   Compiling signatory v0.27.1
+   Compiling tracing-log v0.2.0
+   Compiling franken-evidence v0.3.4
+   Compiling poly1305 v0.8.0
+   Compiling rmp v0.8.15
+   Compiling ctr v0.9.2
+   Compiling chacha20 v0.9.1
+   Compiling aes v0.8.4
+   Compiling nix v0.29.0
+   Compiling alloca v0.4.0
+   Compiling hmac v0.12.1
+   Compiling franken-kernel v0.3.4
+   Compiling half v2.7.1
+   Compiling pin-project-internal v1.1.11
+   Compiling thread_local v1.1.9
+   Compiling unty-next v0.1.1
+   Compiling data-encoding v2.11.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling ciborium-io v0.2.2
+   Compiling bytes v1.11.1
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.1.0
+   Compiling parking v2.2.1
+   Compiling futures-io v0.3.32
+   Compiling anstyle v1.0.14
+   Compiling futures-core v0.3.32
+   Compiling futures-lite v2.6.1
+   Compiling clap_builder v4.6.0
+   Compiling plotters-svg v0.3.7
+   Compiling prost v0.14.4
+   Compiling ciborium-ll v0.2.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling nkeys v0.4.5
+   Compiling bincode-next v2.1.0
+   Compiling pin-project v1.1.11
+   Compiling franken-decision v0.3.4
+   Compiling hkdf v0.12.4
+   Compiling aes-gcm v0.10.3
+   Compiling chacha20poly1305 v0.10.1
+   Compiling rmp-serde v1.3.1
+   Compiling parking_lot v0.12.5
+   Compiling ffs-types v0.1.0 (/data/projects/frankenfs/crates/ffs-types)
+   Compiling regex-automata v0.4.14
+   Compiling sha1 v0.11.0
+   Compiling sha2 v0.11.0
+   Compiling hmac v0.13.0
+   Compiling sysinfo v0.33.1
+   Compiling polling v3.11.0
+   Compiling crossbeam-queue v0.3.12
+   Compiling itertools v0.13.0
+   Compiling asupersync-macros v0.3.4
+   Compiling visibility v0.1.1
+   Compiling wait-timeout v0.2.1
+   Compiling socket2 v0.6.3
+   Compiling fnv v1.0.7
+   Compiling slab v0.4.12
+   Compiling same-file v1.0.6
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling base64 v0.22.1
+   Compiling cast v0.3.0
+   Compiling hex v0.4.3
+   Compiling asupersync v0.3.4
+   Compiling criterion-plot v0.8.2
+   Compiling bit-set v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling walkdir v2.5.0
+   Compiling regex v1.12.3
+   Compiling ciborium v0.2.2
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling ffs-error v0.1.0 (/data/projects/frankenfs/crates/ffs-error)
+   Compiling tinytemplate v1.2.1
+   Compiling console v0.16.3
+   Compiling page_size v0.6.0
+   Compiling oorandom v11.1.5
+   Compiling unarray v0.1.4
+   Compiling anes v0.1.6
+   Compiling similar v2.7.0
+   Compiling insta v1.47.2
+   Compiling criterion v0.8.2
+   Compiling proptest v1.11.0
+   Compiling ffs-block v0.1.0 (/data/projects/frankenfs/crates/ffs-block)
+   Compiling ffs-ondisk v0.1.0 (/data/projects/frankenfs/crates/ffs-ondisk)
+   Compiling ffs-repair v0.1.0 (/data/projects/frankenfs/crates/ffs-repair)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 18s
+     Running unittests src/lib.rs (.rch-target-vmi1227854-job-29879662679165325-1781116978413285047-0/debug/deps/ffs_repair-00ae4f516f7114d6)
+
+running 50 tests
+test lrc::gf256::tests::generator_has_full_nonzero_field_order ... ok
+test lrc::gf256::tests::mul_commutative ... ok
+test lrc::gf256::tests::mul_identity ... ok
+test lrc::gf256::tests::mul_inverse ... ok
+test lrc::gf256::tests::mul_zero ... ok
+test lrc::tests::config_basics ... ok
+test lrc::tests::config_serde_roundtrip ... ok
+test lrc::tests::encode_global_matches_closed_form_for_quad_remainders ... ok
+test lrc::tests::encode_global_produces_correct_count ... ok
+
+thread 'lrc::tests::encode_global_rejects_mismatched_block_sizes' (3150989) panicked at crates/ffs-repair/src/lrc.rs:347:13:
+assertion `left == right` failed: block size mismatch
+  left: 8
+ right: 16
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test lrc::tests::encode_global_rejects_mismatched_block_sizes - should panic ... ok
+test lrc::tests::encode_global_zero_parity_preserves_no_extra_block_size_validation ... ok
+test lrc::tests::encode_local_produces_correct_count ... ok
+test lrc::tests::full_encode_local_plus_global ... ok
+
+thread 'lrc::tests::gf256_inv_zero_panics' (3150993) panicked at crates/ffs-repair/src/lrc.rs:129:9:
+assertion `left != right` failed: GF(256) inverse of zero is undefined
+  left: 0
+ right: 0
+test lrc::tests::gf256_inv_zero_panics - should panic ... ok
+test lrc::tests::gf256_mul_associative_spot_check ... ok
+test lrc::tests::gf256_mul_self_inverse ... ok
+test lrc::tests::gf256_mul_xor_four_matches_separate_passes ... ok
+test lrc::tests::gf256_mul_xor_pair_matches_separate_passes ... ok
+test lrc::tests::global_encode_decode_single_failure ... ok
+test lrc::tests::global_parity_coefficient_recurrence_matches_formula ... ok
+test lrc::tests::global_repair_exceeds_capacity ... ok
+test lrc::tests::global_repair_handles_columns_separated_by_51 ... ok
+test lrc::tests::global_repair_rejects_mismatched_parity_size_without_panic ... ok
+test lrc::tests::global_repair_two_failures ... ok
+test lrc::tests::local_parity_is_xor_of_group ... ok
+test lrc::tests::local_parity_xor_correct ... ok
+test lrc::tests::local_repair_all_groups ... ok
+test lrc::tests::local_repair_fails_for_two_missing ... ok
+test lrc::tests::local_repair_invalid_group_or_missing_index_returns_none ... ok
+test lrc::tests::local_repair_rejects_block_size_mismatch_without_panic ... ok
+test lrc::tests::local_repair_rejects_malformed_available_count_without_panic ... ok
+test lrc::tests::local_repair_single_failure ... ok
+test lrc::tests::lrc_config_clone_and_copy ... ok
+test lrc::tests::lrc_config_minimum_viable ... ok
+test lrc::tests::lrc_config_num_groups_and_total ... ok
+test lrc::tests::lrc_config_overhead_fraction_correct ... ok
+test lrc::tests::lrc_config_rejects_indivisible - should panic ... ok
+test lrc::tests::lrc_config_rejects_too_many_global_data_columns - should panic ... ok
+test lrc::tests::lrc_config_rejects_zero_data_blocks - should panic ... ok
+
+thread 'lrc::tests::lrc_config_rejects_indivisible' (3151066) panicked at crates/ffs-repair/src/lrc.rs:213:9:
+data_blocks (7) must be divisible by local_group_size (3)
+
+thread 'lrc::tests::lrc_config_rejects_too_many_global_data_columns' (3151067) panicked at crates/ffs-repair/src/lrc.rs:221:9:
+data_blocks must be <= 255 when global parity is enabled
+
+thread 'lrc::tests::lrc_config_rejects_zero_data_blocks' (3151068) panicked at crates/ffs-repair/src/lrc.rs:211:9:
+data_blocks must be > 0
+
+thread 'lrc::tests::lrc_config_rejects_zero_group_size' (3151069) panicked at crates/ffs-repair/src/lrc.rs:212:9:
+local_group_size must be > 0
+test lrc::tests::lrc_config_rejects_zero_group_size - should panic ... ok
+test lrc::tests::lrc_global_parity_golden_report ... LRC_GLOBAL_PARITY_GOLDEN_BEGIN
+config data_blocks=16 local_group_size=4 global_parity_count=4 block_size=96
+parity[0]=ffbd4bc76a655ea01c5b1cc127a41de283e850a27ae8ee38921b6c5ec91869a8518345030e3c0b0cd1819054485eeb1354f832e5088016be8c77fe6ea4b67ba655991cfaa224d13a449b6a3eb9a5fb9c138a701d229ec02cc91a8a7c36b28cff
+parity[1]=80d2898fbfa53ad5d86b5891f96bfbd236408374948e277cbe3b6febc3ca82cc8d02c6ff39807e67ce6a19313fcbe1d0d639990fe6a6130e773beeaf59c7ed83a62be37a8b1f7ff96ed2b9fe3df198bead4b923b226f698fb1a10cc0acec58a6
+parity[2]=f83a68e6a6ee570fab6fe40020fa9e4bcbe98e490545951ce663c63486fdb6461a1688d51ed870a357f0b3b171fc4dee4e329f696440a6f58e1f56d8ac1f05a6c4a7be0eb24befd7e621b5e0d4ac96406e533f5a48287565d435ce6b66c1c190
+parity[3]=01bd2acf2b09a7692f267e2ad817f824dd9b90310ed90eb3f91db8b7e9e5d9902b692e03da82fc6a8e2654c3e3067c47c39edb892fdd5a43c6074b2bd6cf6994cb09a51ed924fc1467b245ce803279797bbf01dd46e261b03538399b0d2fdc1f
+LRC_GLOBAL_PARITY_GOLDEN_END
+ok
+test lrc::tests::no_failures_do_not_require_available_global_parity ... ok
+test lrc::tests::no_failures_returns_trivial_success ... ok
+test lrc::tests::proptest_config_serde_roundtrip ... ok
+test lrc::tests::proptest_config_total_blocks ... ok
+test lrc::tests::proptest_global_repair_within_budget ... ok
+test lrc::tests::proptest_local_parity_xor_identity ... ok
+test lrc::tests::proptest_local_repair_single_block ... ok
+test lrc::tests::proptest_overhead_fraction_bounded ... ok
+test lrc::tests::repair_io_comparison ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 396 filtered out; finished in 0.42s
+
+  [2m2026-06-10T18:49:11.622989Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 320594ms[0m
+    [2;3mat[0m rch/src/hook.rs:6376 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:49:11.623380Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook.rs:6425 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:49:11.623408Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankenfs on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2106 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:49:11.623451Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 2 retrieval exclude pattern(s) from .rchignore (total: 6)[0m
+    [2;3mat[0m rch/src/transfer.rs:909 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:49:13.535139Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1911ms (1 files, 1561 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2145 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-10T18:49:13.535171Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 1 files, 1561 bytes in 1911ms[0m
+    [2;3mat[0m rch/src/hook.rs:6458 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (378.3s)
