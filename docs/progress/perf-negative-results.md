@@ -13,6 +13,43 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## ⭐⭐ bd-bhh0i CUTOVER COMPLETE — read-vs-prune TOCTOU FIXED; passes at 40k, e2fsck clean, 2.71x positive scaling (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 10, ⭐ FULL PASS)
+
+Status: LANDED (f9183ad9). The sharded parallel-create cutover now passes reliably
+at the full count 40000 across 1/2/4/8 threads with e2fsck rc0 — the last
+correctness gap (turn-8/9 residual) is closed.
+
+Root cause (fully pinned, correcting turn 9): the bd-bhh0i writable adapters are
+UNREGISTERED (perf opt), so `ShardedMvccStore::prune_safe`'s watermark is the chain
+head whenever `active_snapshots` is empty → `prune_versions_older_than` collapses a
+hot block to its single newest version. A "current" read that captured seq S then
+races a concurrent commit+prune to S+1: `read_visible(block, S)` = None (S dropped)
+→ falls to the STALE on-device block (mkfs-empty inode table for a run that never
+flushes mid-run) → a create fails `NotFound` reading a just-committed parent inode.
+NOT a write clobber — the turn-9 suspicion was wrong: `INSTALL-SHRINK` re-run at a
+32-byte threshold on the inode-table blocks fired 0×. The turn-9 partial (MAX in
+`with_latest_scope`) was DEAD: `read_block_with_scope` step-2 read_visible only
+runs when `scope.tx.is_some()`, and the latest-scope has no tx, so the read fell
+through to `read_current_block_vec_from_device`.
+
+FIX: `read_current_block_vec_from_device` and `FsMvccBlockDevice::read_snapshot`
+(read-your-writes) resolve at `CommitSeq::MAX` (newest RETAINED version) instead of
+a freshly captured `current_snapshot()`. Pruning always keeps the newest, so MAX is
+TOCTOU-free, and "current"/read-your-writes both mean newest. Byte-identical for
+serialized single-lock + RO (newest == current): ffs-core default lib 1185 pass;
+the 2 failures (fast_commit_del_range, btrfs_reflink_random) are PRE-EXISTING on
+clean HEAD (verified by stash), not this change.
+
+SCALING (debug binary, 2GiB/16-group, count 40000): 1t 9817 → 2t 13881 → 4t 21236
+→ 8t 26622 creates/s = 2.71x @8t, POSITIVE (single-lock baseline scaled NEGATIVELY
+143k→80k). e2fsck rc0, 40020 files.
+
+⏭ REMAINING (perf, not correctness): (1) release-perf measurement (`--profile
+release-perf`) — the ratio may differ from debug; (2) close the 2.71x→4x gap
+(per-commit MVCC shard-lock / deferred-GDT / auto-commit-under-lock contention at
+8t/16-group is the likely limiter — profile the 8t create path). Cutover CORRECTNESS
+is done; the ≥4x is now a pure perf-tuning lever.
+
 ## bd-bhh0i cutover residual @30k REFINED — read-your-writes-vs-prune TOCTOU (partial fix) + a suspected sub-threshold write clobber (bd-kdmu4) - 2026-07-24 (turn 9, investigation)
 
 Status: no net commit (exploration reverted; main stays at the turn-8 8k-validated
