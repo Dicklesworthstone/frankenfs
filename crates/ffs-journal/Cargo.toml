@@ -20,9 +20,11 @@ serde = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 crc32c = { workspace = true }
 hex = { workspace = true }
+nix = { workspace = true }
 parking_lot = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "journal_replay_apply_io_overlap"
@@ -34,6 +36,10 @@ harness = false
 
 [[bench]]
 name = "jbd2_data_block_prep"
+harness = false
+
+[[bench]]
+name = "jbd2_write_combining"
 harness = false
 
 [lints]

@@ -1447,14 +1447,48 @@ impl Jbd2Writer {
                     }
 
                     let desc_block = self.alloc_block(&mut staged_head)?;
-                    dev.write_block(cx, desc_block, &desc)?;
-                    stats.descriptor_blocks = stats.descriptor_blocks.saturating_add(1);
-
-                    for (_, _, padded) in &chunk {
-                        let data_block = self.alloc_block(&mut staged_head)?;
-                        dev.write_block(cx, data_block, padded)?;
-                        stats.data_blocks = stats.data_blocks.saturating_add(1);
+                    let mut data_blocks = Vec::with_capacity(chunk.len());
+                    for _ in &chunk {
+                        data_blocks.push(self.alloc_block(&mut staged_head)?);
                     }
+
+                    let physically_contiguous =
+                        data_blocks.iter().enumerate().all(|(index, block)| {
+                            u64::try_from(index)
+                                .ok()
+                                .and_then(|index| index.checked_add(1))
+                                .and_then(|delta| desc_block.0.checked_add(delta))
+                                == Some(block.0)
+                        });
+
+                    if dev.supports_contiguous_writes() && physically_contiguous {
+                        let run_len = chunk
+                            .len()
+                            .checked_add(1)
+                            .and_then(|blocks| blocks.checked_mul(bs))
+                            .ok_or_else(|| {
+                                FfsError::Format(
+                                    "JBD2 descriptor/data write length overflow".to_owned(),
+                                )
+                            })?;
+                        let mut run = Vec::with_capacity(run_len);
+                        run.extend_from_slice(&desc);
+                        for (_, _, padded) in &chunk {
+                            run.extend_from_slice(padded);
+                        }
+                        debug_assert_eq!(run.len(), run_len);
+                        dev.write_contiguous_blocks(cx, desc_block, &run)?;
+                    } else {
+                        dev.write_block(cx, desc_block, &desc)?;
+                        for (data_block, (_, _, padded)) in data_blocks.iter().copied().zip(&chunk)
+                        {
+                            dev.write_block(cx, data_block, padded)?;
+                        }
+                    }
+                    stats.descriptor_blocks = stats.descriptor_blocks.saturating_add(1);
+                    stats.data_blocks = stats
+                        .data_blocks
+                        .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
                 }
                 Jbd2TxnBodyItem::Revoke(_) => {
                     let entry_size = if self.is_64bit { 8 } else { 4 };
@@ -3414,6 +3448,37 @@ mod tests {
             Ok(())
         }
 
+        fn supports_contiguous_writes(&self) -> bool {
+            true
+        }
+
+        fn write_contiguous_blocks(&self, _cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
+            let block_size = usize::try_from(self.block_size)
+                .map_err(|_| FfsError::Format("block_size overflow".to_owned()))?;
+            if data.len() % block_size != 0 {
+                return Err(FfsError::Format(
+                    "contiguous write size mismatch".to_owned(),
+                ));
+            }
+            let count = u64::try_from(data.len() / block_size)
+                .map_err(|_| FfsError::Format("block count overflow".to_owned()))?;
+            if start
+                .0
+                .checked_add(count)
+                .is_none_or(|end| end > self.block_count)
+            {
+                return Err(FfsError::Format("contiguous write out of range".to_owned()));
+            }
+
+            let mut blocks = self.blocks.write();
+            for (index, bytes) in data.chunks_exact(block_size).enumerate() {
+                let index = u64::try_from(index)
+                    .map_err(|_| FfsError::Format("block index overflow".to_owned()))?;
+                blocks.insert(BlockNumber(start.0 + index), bytes.to_vec());
+            }
+            Ok(())
+        }
+
         fn block_size(&self) -> u32 {
             self.block_size
         }
@@ -3457,6 +3522,65 @@ mod tests {
                 )));
             }
             self.inner.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailContiguousWriteBlockDevice {
+        inner: MemBlockDevice,
+        prefix_blocks: usize,
+    }
+
+    impl FailContiguousWriteBlockDevice {
+        fn new(block_size: u32, block_count: u64, prefix_blocks: usize) -> Self {
+            Self {
+                inner: MemBlockDevice::new(block_size, block_count),
+                prefix_blocks,
+            }
+        }
+    }
+
+    impl BlockDevice for FailContiguousWriteBlockDevice {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<ffs_block::BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn supports_contiguous_writes(&self) -> bool {
+            true
+        }
+
+        fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
+            let block_size = usize::try_from(self.inner.block_size())
+                .map_err(|_| FfsError::Format("block_size overflow".to_owned()))?;
+            for (index, bytes) in data
+                .chunks_exact(block_size)
+                .take(self.prefix_blocks)
+                .enumerate()
+            {
+                let index = u64::try_from(index)
+                    .map_err(|_| FfsError::Format("block index overflow".to_owned()))?;
+                self.inner
+                    .write_block(cx, BlockNumber(start.0 + index), bytes)?;
+            }
+            Err(FfsError::Format(
+                "injected partial contiguous-write failure".to_owned(),
+            ))
         }
 
         fn block_size(&self) -> u32 {
@@ -4926,6 +5050,42 @@ mod tests {
         // Target block should remain untouched.
         assert_eq!(
             dev.read_block(&cx, BlockNumber(9)).unwrap().as_slice(),
+            &[0_u8; 512]
+        );
+    }
+
+    #[test]
+    fn jbd2_writer_partial_contiguous_write_is_ignored_on_replay() {
+        let cx = test_cx();
+        let dev = FailContiguousWriteBlockDevice::new(512, 256, 2);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(7), vec![0xA7; 512]);
+        txn.add_write(BlockNumber(8), vec![0xB8; 512]);
+        let error = writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect_err("partial grouped write must fail the commit");
+        assert!(
+            error
+                .to_string()
+                .contains("injected partial contiguous-write failure")
+        );
+        assert_eq!(writer.head(), 0, "failed commit must not advance head");
+
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay partial journal");
+        assert!(outcome.committed_sequences.is_empty());
+        assert_eq!(outcome.stats.incomplete_transactions, 1);
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(7)).unwrap().as_slice(),
+            &[0_u8; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(8)).unwrap().as_slice(),
             &[0_u8; 512]
         );
     }

@@ -1086,6 +1086,12 @@ pub trait BlockDevice: Send + Sync {
         Ok((self.read_block(cx, block)?, None))
     }
 
+    /// Returns true when `write_contiguous_blocks` collapses a run into fewer
+    /// device I/O operations than scalar `write_block` calls.
+    fn supports_contiguous_writes(&self) -> bool {
+        false
+    }
+
     /// Write a contiguous run of blocks starting at `start`. `data` holds the
     /// concatenated block contents (`data.len()` MUST be a multiple of
     /// `block_size()`); block `start + i` receives `data[i*bs .. (i+1)*bs]`.
@@ -1161,6 +1167,10 @@ impl<D: BlockDevice + ?Sized> BlockDevice for Arc<D> {
 
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
         (**self).write_block(cx, block, data)
+    }
+
+    fn supports_contiguous_writes(&self) -> bool {
+        (**self).supports_contiguous_writes()
     }
 
     fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
@@ -1552,6 +1562,10 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
         self.inner.write_all_at(cx, ByteOffset(offset), data)?;
         cx_checkpoint(cx)?;
         Ok(())
+    }
+
+    fn supports_contiguous_writes(&self) -> bool {
+        true
     }
 
     fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
