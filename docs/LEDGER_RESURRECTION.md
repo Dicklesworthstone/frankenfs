@@ -181,12 +181,56 @@ needs an Agent Mail reservation before anyone starts.
 | Handed to the cod lane to re-run | 1 (rank 2) |
 | Void but superseded — closed, not re-run | 1 (rank 3) |
 
-### 4.1 Rank 1 re-run — status
+### 4.1 Rank 1 re-run — profile attribution
 
-Rebuilt from the ledger description (the original branch is gone) as an **env-gated,
-same-binary** arm so both A and B run from one ELF, and measured on a pinned worker
-through `wal_throughput --profile-only`, which emits the binary sha256, the worker, and
-31 interleaved A/A pairs at 1/2/4/8 writers with per-phase publication p99s.
+Before touching source, the frame was re-attributed on the **real** commit path (not a
+synthetic model). `bd-bhh0i`'s 2026-07-10 `cod_ffs` characterization ran the production
+`ShardedMvccStore::commit` under `CommitLockProfile` at 1/2/4/8 threads:
+
+| phase (p99, ns) | 1t | 2t | 4t | 8t |
+|---|---:|---:|---:|---:|
+| shard wait | 255 | 255 | 511 | 511 |
+| shard hold | 32767 | 16383 | 8191 | 8191 |
+| **publication mutex wait** | **127** | **2047** | **32767** | **131071** |
+| publication hold | 255 | 1023 | 2047 | 2047 |
+| ordered-prefix wait | 0 | 65535 | 131071 | 262143 |
+
+The publication **mutex wait** grows **1,000× from 1t to 8t** and reaches **131 µs p99**,
+against a shard wait of **511 ns** — a 256× ratio. The shard locks are not the problem;
+the single gate mutex is. That is the frame the lever removes.
+
+It also bounds the claim honestly. The gate has two costs and this lever only removes one:
+
+- **Mutex wait** (131 µs p99 at 8t) — pure mechanism: queueing on one global lock to
+  insert into a `BTreeSet` and `notify_all`. **Removed** by the ring + CAS prefix advance.
+- **Ordered-prefix wait** (262 µs p99 at 8t) — semantic: a commit may not publish before
+  its predecessors, because a snapshot must see a gap-free prefix. **Preserved exactly.**
+  Any lever that removes this changes visibility semantics and is a different, much
+  larger proof obligation.
+
+So the ceiling for this lever is the mutex-wait term, not the whole publication cost.
+
+### 4.2 Rank 1 re-run — method
+
+The original code is gone (branch and stash both deleted), so it was rebuilt from the
+row's description as `PublicationMode::{Mutex, WaitFree}` — a **per-store** setting, not
+a process-global one, so **both arms run from one ELF** and codegen cannot differ between
+them. Production selects via `FFS_MVCC_WAITFREE_PUBLISH`; unset means the untouched
+mutex gate, so the default build is byte-identical to the pre-lever binary.
+
+Harness: `crates/ffs-mvcc/benches/wal_throughput.rs` under `--features bench-instrumentation`,
+which already implements the campaign §2 contract — self-reported ELF sha256 + worker,
+31 interleaved pairs with alternating order, median of per-round log-ratios, p90 spread,
+and per-phase publication p99s — against the real `ShardedMvccStore::commit`. Added:
+`run_paired_arms` (so the same pairing driver produces both the A/A null and the A/B),
+and `assert_publication_mode_isomorphism`, which runs **before any timing** and asserts
+both modes produce an identical final watermark and an identical SHA-256 over every
+block's resolved bytes at 1/2/4/8 writers.
+
+**Prerequisite fixed first:** `--features bench-instrumentation` did not compile on HEAD
+— `std::fmt::Write` and `std::io::Write` were both imported unaliased in
+`wal_throughput.rs`, so every `write_all` call failed `E0599`. The repo's §2-contract
+harness was unbuildable. Fixed (`use std::fmt::Write as FmtWrite`).
 
 *Result rows are appended below as they land.*
 
