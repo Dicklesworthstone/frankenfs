@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
 use asupersync::Cx;
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group};
 use ffs_block::ByteDevice;
 use ffs_core::{OpenFs, OpenOptions};
 use ffs_error::{FfsError, Result as FfsResult};
 use ffs_harness::load_sparse_fixture;
 use ffs_ondisk::{BtrfsSuperblock, Ext4Superblock};
 use ffs_types::{ByteOffset, InodeNumber};
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::hint::black_box;
 use std::ops::Range;
 use std::path::Path;
@@ -20,6 +22,23 @@ const BTRFS_SEQUENTIAL_WRITE_TOTAL: usize = 1024 * 1024;
 const BTRFS_SEQUENTIAL_WRITE_CHUNK: usize = 4096;
 const BTRFS_PREALLOC_APPEND_EXTENTS: usize = 512;
 const BTRFS_PREALLOC_APPEND_WRITES: usize = 128;
+
+fn self_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    format!("{} ({} bytes) {}", encoded, bytes.len(), path.display())
+}
 
 #[derive(Debug)]
 struct BenchByteDevice {
@@ -397,4 +416,9 @@ criterion_group!(
     bench_btrfs_sequential_write,
     bench_ext4_write_path
 );
-criterion_main!(metadata);
+
+fn main() {
+    println!("bench_elf_sha256={}", self_identity());
+    metadata();
+    Criterion::default().configure_from_args().final_summary();
+}

@@ -1814,7 +1814,10 @@ one honest same-worker A/B binary. Representative headline results:
 
 **Honesty methodology.** Claims are gated on the median-ratio 95% confidence
 interval against a paired null control; coefficient of variation is reported
-as provenance but is never the decision gate. Wins are not best-of-N; they are
+as provenance but is never the decision gate. The `ffs-harness` benchmark
+executables self-report their own SHA-256 as their first program line so the
+executing ELF, rather than an adjacent build artifact, identifies each run.
+Wins are not best-of-N; they are
 isomorphism-preserving (behaviour proven byte-identical before keeping), and
 every *rejected* lever is recorded — with its null-control result and a concrete
 retry condition — in the negative-evidence ledger
