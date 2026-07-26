@@ -13,6 +13,105 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Profitability-gated repair source reads reject on their scalar fallback (bd-repair-source-read-profitability-w74sl) - 2026-07-26 (GreenSpring, MEASURED REJECT #3 / SWITCH VEINS)
+
+The institutional exact-surface preflight exited 2 on the preceding
+`codec::encode_group` contiguous-read REJECT and printed its concrete escape
+condition. This attempt did not waive that closure. Before editing it supplied a
+named real-file backend and explicit default-false profitability contract,
+separate from functional contiguous-read support; the decision harness supplied
+an in-process executable hash, same-invocation A/A null control **1.000000x** plus
+A/B, deterministic 10,000-resample bootstrap median-ratio CIs, exact full-output
+and first-error oracles, and physical-call counters. CV was never computed or
+used.
+
+The candidate asked the `BlockDevice` profitability capability once per
+`encode_group`. Opted-in devices replaced 16 ordered positioned reads with one
+ordered contiguous read. Devices that did not opt in executed the unchanged
+scalar loop. The same process proved exact equality of every `EncodedGroup`
+field and repair byte, identical source/symbol ordering, and the same first
+injected error at block 3. The counted target mechanism was **16 logical / 16
+physical reads -> 16 logical / 1 physical read**. The cheap arm stayed scalar
+and retired **496 physical calls in both arms** over 31 observations.
+
+### Invalid instrument input, then satisfied retry
+
+The first v3 scouting invocation selected an 80-byte divisor of the executing
+ELF as its file-backed block size. `ByteBlockDevice` correctly rejected that
+non-power-of-two geometry after the latency and cheap controls ran. This was an
+instrument-input reject, not a performance verdict.
+
+**Retry predicate:** rerun only with production-valid, power-of-two block
+geometry and a stable real-file fixture. The next source used the checked-in
+`conformance/golden/ext4_8mb_reference.ext4` at 4KiB blocks and satisfied that
+predicate. No generated local image or fresh local Cargo target was created.
+
+### Routing-only v3 and profile-generation evidence
+
+The corrected non-PGO scouting ELF
+`e4fb9ba677fc2c2cc22fad4b58187e3faea93641f94508d1abf8eb1a6437866e`
+reported compile/runtime AVX2 and FMA and cleared all three routing arms:
+
+- 250 us/call: **14.820947x**, CI **[14.740945, 14.840636]**, versus A/A
+  **[0.999918, 1.000033]**;
+- zero-latency scalar fallback: **0.998165x**, CI
+  **[0.996801, 0.999542]**, inside doubled A/A envelope
+  **[0.996372, 1.003641]**; and
+- warm checked-in ext4 file: **1.452175x**, CI
+  **[1.449020, 1.455309]**, versus A/A
+  **[0.998786, 1.000304]**.
+
+Those results admitted PGO generation but were not publishable shipped-binary
+claims. The instrumented training ELF
+`68baa853bf76d5add2b6f045444a1bdee92d5ef5e39d427d0ca71ad238c3864d`
+then ran the same complete contract on pinned worker `ovh-a` and generated a
+14,565,488-byte merged profile with SHA-256
+`b46277d4058788abb9d9d055b4a27ea17786f0f47d2343f19b24ccd0c49266bb`.
+Its routing ratios were 13.593584x for the latency arm, neutral for the scalar
+fallback, and 1.016512x for the warm file. They describe the instrumented
+training binary only.
+
+### Final v3+PGO decision: REJECT
+
+The final profile-use process reported:
+
+`bench_elf_sha256=2fe8049ec08d747144a32c8d19f02111e85b1ead3d14979f7c34b812090e6e23 (15096336 bytes)`
+
+It witnessed compile/runtime SSE2, SSE4.2, AVX2, and FMA, and embedded the
+consumed profile SHA-256
+`b46277d4058788abb9d9d055b4a27ea17786f0f47d2343f19b24ccd0c49266bb`.
+The same-worker, same-invocation decision was:
+
+| shape | control / candidate medians | median ratio | bootstrap median CI | A/A CI | verdict |
+|---|---:|---:|---:|---:|---|
+| 250 us physical-call latency | 4.902002 / 0.331432 ms | **14.792775x** | **[14.760729, 14.822999]** | **[0.999828, 0.999939]** | target win |
+| zero-latency scalar fallback | 17.293 / 17.342 us | **0.997174x** | **[0.994190, 0.998325]** | **[0.998334, 1.001428]** | decisive non-neutral loss |
+
+The cheap arm's doubled-null equivalence interval was
+**[0.996680, 1.003331]**. Its complete real CI escaped that interval, identifying
+the per-encode dynamic capability query/branch as a small but statistically real
+cost even though both arms issued the same 496 scalar reads. The harness exited
+101 at that pre-registered assertion, before the final-PGO warm-file arm; the
+earlier v3/training warm-file ratios are therefore not substituted as a final
+claim.
+
+**DECISION:** REJECT and manually restore every production and benchmark source
+hunk. Output/error isomorphism passed, but performance does not admit the
+per-call profitability contract. This is the third consecutive repair
+source-read scheduling REJECT, after parallel reads and unconditional contiguous
+batching, so the no-ceiling rule switches to another profile-attributed vein.
+
+**Retry predicate:** do not retry codec-level per-call source-read scheduling.
+Reopen only if a fresh witnessed-v3+PGO production profile attributes at least
+**5%** of whole repair-encode wall/cycles to scalar source-read calls on a named
+backend, and the backend strategy can be bound once outside the timed
+`encode_group` path so the measured query/branch is absent. The next decision
+must use one self-hashing v3+PGO ELF, exact output and first-error parity, counted
+logical/physical calls, and same-invocation A/A plus A/B. Both the target
+latency/cold arm and warm real-file arm must clear twice their own bootstrap
+median null margins; the cheap-device CI must lie wholly inside its doubled A/A
+equivalence envelope. Never gate on CV.
+
 ## bd-bhh0i cutover: wait-free publication is now the default after a 1.467327x final-source e2e win (2026-07-26, GreenSpring, MEASURED)
 
 The institutional preflight found the prior wait-free publication row and printed
