@@ -883,6 +883,7 @@ dependencies = [
  "ffs-ondisk",
  "ffs-types",
  "proptest",
+ "sha2 0.11.0",
  "smallvec",
 ]
 

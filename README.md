@@ -1794,7 +1794,7 @@ The `v0.2.0` release consolidates a solo, negative-evidence-ledger-first
 optimization campaign. Every kept lever is measured against the mounted **kernel**
 filesystem (ext4 / btrfs), proven **byte-identical** before it is kept (btrfs
 images pass `btrfs-check`, ext4 images pass `e2fsck`), and gated on **median**
-self-time vs a **paired null control** (the identical arm run twice, cv < 5%) in
+self-time vs a **paired null control** (the identical arm run twice) in
 one honest same-worker A/B binary. Representative headline results:
 
 | Subsystem | Lever | Result | Commit |
@@ -1812,10 +1812,12 @@ one honest same-worker A/B binary. Representative headline results:
 | CLI | jemalloc global allocator | create **1.26–1.6×**, now faster than kernel single-thread | [`14f443cb`](https://github.com/Dicklesworthstone/frankenfs/commit/14f443cb) |
 | btrfs read | Read directly into caller buffer | **1.37× warm, RSS halved, beats kernel** | [`54b0ae94`](https://github.com/Dicklesworthstone/frankenfs/commit/54b0ae94) |
 
-**Honesty methodology.** Claims are median-gated against a paired null control,
-not best-of-N; wins are isomorphism-preserving (behaviour proven byte-identical
-before keeping); and every *rejected* lever is recorded — with its null-control
-result and a concrete retry condition — in the negative-evidence ledger
+**Honesty methodology.** Claims are gated on the median-ratio 95% confidence
+interval against a paired null control; coefficient of variation is reported
+as provenance but is never the decision gate. Wins are not best-of-N; they are
+isomorphism-preserving (behaviour proven byte-identical before keeping), and
+every *rejected* lever is recorded — with its null-control result and a concrete
+retry condition — in the negative-evidence ledger
 (`docs/NEGATIVE_EVIDENCE.md`, `docs/PERF_CAMPAIGN_FINAL.md`) rather than quietly
 dropped. When honest scrutiny contradicted an earlier claim it was corrected in
 the open: a previously-reported "1.7× faster than kernel" cold-read row flipped
