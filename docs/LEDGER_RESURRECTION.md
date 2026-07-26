@@ -38,6 +38,20 @@ was read in full and adjudicated by hand; the §5 table is the mechanical screen
 
 ## 2. Counts
 
+> **CORRECTED 2026-07-25 (later the same day).** The figures below were produced by the
+> one-off audit script. Productionizing that script as `scripts/perf_ledger_preflight.py`
+> exposed a parser bug in it: it split a `##` entry at each of its `###` subsections, so
+> an entry whose evidence table lived in a subsection was scored **without** its own
+> evidence and marked void. Re-running the corrected parser over the **same corpus**
+> (`9e377a01`) gives **205 void of 273 REJECT rows = 75.1%**, against the 219/276 = 79.3%
+> published below. The REJECT count is essentially unchanged (273 vs 276), so *what
+> counts as a rejection* was sound; only *admissibility detection* was over-strict.
+>
+> **The corrected figure is 75.1%.** It is the one to use. 79.3% is left in place below
+> rather than overwritten, because silently restating a published number is exactly the
+> ledger-integrity failure this document exists to catch. The finding is unchanged in
+> substance — three quarters of this repo's rejections cannot decide anything.
+
 | Metric | Count |
 |---|---:|
 | Ledger entries parsed | 1,031 |
