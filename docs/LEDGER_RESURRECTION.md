@@ -254,6 +254,14 @@ Decision arm (unprofiled production commit path):
 | 4 | 1.0204 | 1.2666 | 1.3675 | outside floor, below the 2× margin — not claimed |
 | 8 | 0.9839 | 1.2811 | **1.7004** | **decidable, 2.14× log-margin** |
 
+Reproduced on two further independently built ELFs: **1.8841×** and **2.1066×** at
+8 writers, each decidable against its own A/A floor (2.75× and 3.21× log-margins).
+**Completed unprofiled 8-thread runs: 3/3 decidable, range 1.70–2.11×, median 1.88×.**
+The conservative **1.70×** is the published claim, qualified as *on a quiet pinned
+worker* — a fourth run whose thread sweep was truncated by a harness overrun read
+only 1.30× on its profiled arm, and a contention-removal lever is by construction
+load-sensitive: less contention on the box, less to remove.
+
 Mechanism, not just wall time — publication **mutex** wait p99 collapses
 32767 ns → **511 ns** at 8 threads (64×) while the **ordered-prefix** wait is identical
 in both arms (524287 / 524287). Exactly the split predicted in §4.1: the mechanism cost

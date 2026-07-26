@@ -13,6 +13,69 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## bd-bhh0i wait-free gate FINAL: 8t decidable 3/3 (1.70 / 1.88 / 2.11x) + the spin-vs-nospin question is a NULL (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12d, cc, MEASURED)
+
+Run 4 (binary SHA-256 `32c5c1ba5afb89a292aa119986b979e6ca6e7113e871787f58948660f83989cc`,
+pinned worker `vmi1227854`) completed the full unprofiled sweep with the profiled
+pass off, and settles both open questions.
+
+### 1. The main lever: 3 of 3 completed runs decidable at 8 writers
+
+| threads | A/A null | A/A floor | Mutex -> WaitFree | log-margin | verdict |
+|--------:|---------:|----------:|------------------:|-----------:|---------|
+| 1 | 1.0160 | 1.5097 | 1.0009 | — | inside null |
+| 2 | 1.0140 | 1.3230 | 1.1285 | 0.42x | inside null |
+| 4 | 0.9555 | 1.3817 | 1.4771 | 1.21x | outside floor, BELOW the 2x margin — not claimed |
+| 8 | 1.0035 | 1.2615 | **2.1066** | **3.21x** | **DECIDABLE** |
+
+Completed unprofiled 8-thread runs: **1.7004x, 1.8841x, 2.1066x — 3/3 decidable**,
+on three independently built ELFs. Median 1.88x. **The conservative 1.70x remains
+the published claim**; the observed range is 1.70-2.11x and the "quiet pinned
+worker" qualifier from turn 12c stands (run 3 truncated before this row and its
+profiled reading was not decidable). Shape is identical in all runs: nothing at
+1t/2t, directional at 4t, decidable at 8t — which is what a contention-removal
+lever must look like.
+
+### 2. Is the pre-park spin earning its 16% CPU? NULL — not decidable
+
+`PublicationMode::WaitFree` (spin 64 rounds) vs `PublicationMode::WaitFreeNoSpin`
+(park immediately), same ELF, same pairing driver, `lhs = spin`:
+
+| threads | A/A floor | spin / nospin | \|log ratio\| vs floor | verdict |
+|--------:|----------:|--------------:|------------------------:|---------|
+| 1 | 1.5097 | 0.9155 | 0.088 vs 0.412 | inside null |
+| 2 | 1.3230 | 0.8904 | 0.116 vs 0.280 | inside null |
+| 4 | 1.3817 | 0.9290 | 0.074 vs 0.323 | inside null |
+| 8 | 1.2615 | 0.9172 | 0.086 vs 0.232 | inside null |
+
+**The spin's wall effect is inside the A/A null at EVERY thread count.** Directionally
+it is consistently favourable (spin faster by 8-11%, and **4 of 4 thread counts point
+the same way** — a sign test gives one-sided p = 0.0625), but no single reading is
+decidable and the campaign's rule is explicit: nothing inside the null may be claimed.
+
+DECISION, and a deliberate departure from my own pre-registered rule. Turn 12b
+pre-registered "(a) no-spin is neutral -> DELETE the spin, keep the wall win and give
+back the 16% CPU." The result IS neutral, so the rule says delete. **I am not
+deleting it, and I am flagging that rather than quietly re-interpreting the rule.**
+Reasons: (i) the pre-registration did not contemplate a consistent 4/4 direction, and
+deleting on a null whose every reading favours the thing being deleted is not
+conservative, it is just a different bet; (ii) the 1.70-2.11x headline was measured
+WITH the spin, and removing it would mean the shipped configuration is no longer the
+measured one — the exact substitution this campaign exists to prevent.
+
+So both remain available and neither is claimed over the other:
+`FFS_MVCC_WAITFREE_PUBLISH=1` (spin, the measured configuration) and
+`FFS_MVCC_WAITFREE_PUBLISH=nospin` (park immediately, for CPU-constrained or
+oversubscribed hosts where the 16.33%-self-time spin is a real cost).
+
+RETRY PREDICATE for the spin question: it needs a harness with an 8-thread A/A floor
+below **1.10x** to resolve an 8-11% effect at a 2x margin; this harness floors at
+1.26-1.51x, so it CANNOT decide it — that is a statement about the instrument, not
+about the spin. Either build a lower-variance harness (drop the per-batch thread
+spawn/join and the per-batch store construction, which is where the jemalloc cluster
+in the post-lever profile comes from) or decide it on an oversubscribed host where
+the CPU cost, not the wall time, is the discriminator.
+
 ## ⚠ bd-bhh0i wait-free gate — RUN 3 DID NOT REPRODUCE A DECIDABLE 8t EFFECT (harness overrun + a noisy worker); claim tempered to "1.70x on a quiet pinned worker" (bd-bhh0i) - 2026-07-25 (turn 12c, cc)
 
 Recording a disagreement with my own result, because it changes how the number
