@@ -5862,8 +5862,9 @@ impl BtrfsTransaction {
             .take()
             .ok_or(BtrfsTransactionError::AlreadyFinished)?;
         let commit_seq = store.commit(txn)?;
-        let duration_us = commit_started
-            .map_or(0_u64, |s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX));
+        let duration_us = commit_started.map_or(0_u64, |s| {
+            u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         info!(
             target: "ffs::btrfs::txn",
             txn_id = self.txn_id.0,
@@ -8954,6 +8955,23 @@ fn emit_write_chunks(builder: &mut SendStreamBuilder, path: &[u8], file_offset: 
     }
 }
 
+fn primary_inode_link<'a, const MATERIALIZED: bool>(
+    inode_links: &'a BTreeMap<u64, Vec<(u64, Vec<u8>)>>,
+    inode_parents: Option<&'a BTreeMap<u64, (u64, Vec<u8>)>>,
+    ino: u64,
+) -> Option<(u64, &'a [u8])> {
+    if MATERIALIZED {
+        inode_parents?
+            .get(&ino)
+            .map(|(parent, name)| (*parent, name.as_slice()))
+    } else {
+        inode_links
+            .get(&ino)?
+            .first()
+            .map(|(parent, name)| (*parent, name.as_slice()))
+    }
+}
+
 /// Generate a btrfs send stream from FS tree items.
 ///
 /// This function walks the given FS tree items and produces a valid send stream
@@ -8974,18 +8992,63 @@ fn emit_write_chunks(builder: &mut SendStreamBuilder, path: &[u8], file_offset: 
 ///
 /// # Returns
 /// The complete send stream bytes on success.
-#[expect(clippy::too_many_lines)]
 pub fn generate_send_stream<F>(
     items: &[BtrfsLeafEntry],
     subvol_name: &[u8],
     subvol_uuid: &[u8; 16],
     ctransid: u64,
-    mut read_extent: F,
+    read_extent: F,
 ) -> Result<Vec<u8>, ParseError>
 where
     // (disk_bytenr, disk_num_bytes, ram_bytes, compression) -> DECOMPRESSED extent
     // bytes. The callee must decompress compressed extents (ffs-btrfs has no
     // decompressor) so the slice below is always in uncompressed/logical space.
+    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
+{
+    Ok(generate_send_stream_impl::<false, F>(
+        items,
+        subvol_name,
+        subvol_uuid,
+        ctransid,
+        read_extent,
+    ))
+}
+
+/// Materialized-primary-parent control for the same-ELF performance harness.
+///
+/// This is not a supported application API. It exists only when explicit
+/// benchmark instrumentation is enabled, so the production implementation and
+/// its pre-optimization control can be timed in one process.
+#[cfg(feature = "bench-instrumentation")]
+#[doc(hidden)]
+pub fn generate_send_stream_materialized_parent_index_control<F>(
+    items: &[BtrfsLeafEntry],
+    subvol_name: &[u8],
+    subvol_uuid: &[u8; 16],
+    ctransid: u64,
+    read_extent: F,
+) -> Result<Vec<u8>, ParseError>
+where
+    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
+{
+    Ok(generate_send_stream_impl::<true, F>(
+        items,
+        subvol_name,
+        subvol_uuid,
+        ctransid,
+        read_extent,
+    ))
+}
+
+#[expect(clippy::too_many_lines)]
+fn generate_send_stream_impl<const MATERIALIZED_PRIMARY_PARENTS: bool, F>(
+    items: &[BtrfsLeafEntry],
+    subvol_name: &[u8],
+    subvol_uuid: &[u8; 16],
+    ctransid: u64,
+    mut read_extent: F,
+) -> Vec<u8>
+where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
     let mut builder = SendStreamBuilder::new();
@@ -9011,11 +9074,17 @@ where
         }
     }
     // The primary link (first) drives path construction; the rest become hard
-    // links.
-    let inode_parents: BTreeMap<u64, (u64, Vec<u8>)> = inode_links
-        .iter()
-        .filter_map(|(&ino, links)| links.first().map(|(p, n)| (ino, (*p, n.clone()))))
-        .collect();
+    // links. Production reads that link directly. The optional materialized
+    // projection is compiled only for the same-ELF benchmark control.
+    let inode_parents = MATERIALIZED_PRIMARY_PARENTS.then(|| {
+        inode_links
+            .iter()
+            .filter_map(|(&ino, links)| links.first().map(|(p, n)| (ino, (*p, n.clone()))))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let primary_link_count = inode_parents
+        .as_ref()
+        .map_or_else(|| inode_links.len(), BTreeMap::len);
 
     // Build a command PATH for an inode by walking up the parent chain. btrfs
     // send command paths are RELATIVE to the received subvolume root: no
@@ -9025,7 +9094,7 @@ where
     // "."). A subvol-name prefix here makes every MKFILE/MKDIR/WRITE target a
     // never-created `subvol/` subdirectory, so `btrfs receive` fails with ENOENT.
     let mut path_cache: HashMap<u64, Vec<u8>> =
-        HashMap::with_capacity(inode_parents.len().saturating_add(1));
+        HashMap::with_capacity(primary_link_count.saturating_add(1));
     path_cache.insert(BTRFS_FIRST_FREE_OBJECTID, Vec::new());
     let mut build_path = |ino: u64, cache_terminal: bool| -> Vec<u8> {
         if let Some(path) = path_cache.get(&ino) {
@@ -9040,14 +9109,18 @@ where
                 base_path.clone_from(path);
                 break;
             }
-            let Some((parent, name)) = inode_parents.get(&current) else {
+            let Some((parent, name)) = primary_inode_link::<MATERIALIZED_PRIMARY_PARENTS>(
+                &inode_links,
+                inode_parents.as_ref(),
+                current,
+            ) else {
                 break;
             };
-            trail.push((current, name.clone()));
-            if *parent == current || *parent == BTRFS_FIRST_FREE_OBJECTID {
+            trail.push((current, name.to_vec()));
+            if parent == current || parent == BTRFS_FIRST_FREE_OBJECTID {
                 break;
             }
-            current = *parent;
+            current = parent;
         }
 
         let mut path = base_path;
@@ -9077,7 +9150,7 @@ where
     // Emission order (bd-7ucz7): the receiver creates by PATH, so a parent
     // directory must already exist when its child is created. Emit DIRECTORIES
     // first in topological order (parent dirs before child dirs, by depth in the
-    // inode_parents chain), then all non-directory inodes (whose parents are now
+    // primary-link chain), then all non-directory inodes (whose parents are now
     // all present). Plain objectid order is parent-before-child for simple trees
     // but a rename can place a child under a higher-objectid dir, which would
     // emit the child before its parent and break the receive.
@@ -9102,7 +9175,7 @@ where
         }
     }
     let mut depth_cache: HashMap<u64, usize> =
-        HashMap::with_capacity(inode_parents.len().saturating_add(1));
+        HashMap::with_capacity(primary_link_count.saturating_add(1));
     depth_cache.insert(BTRFS_FIRST_FREE_OBJECTID, 0);
     let mut dir_depth = |start: u64| -> usize {
         if let Some(&depth) = depth_cache.get(&start) {
@@ -9117,14 +9190,18 @@ where
                 base_depth = depth;
                 break;
             }
-            let Some((parent, _)) = inode_parents.get(&cur) else {
+            let Some((parent, _)) = primary_inode_link::<MATERIALIZED_PRIMARY_PARENTS>(
+                &inode_links,
+                inode_parents.as_ref(),
+                cur,
+            ) else {
                 break;
             };
-            if *parent == cur || *parent == BTRFS_FIRST_FREE_OBJECTID {
+            if parent == cur || parent == BTRFS_FIRST_FREE_OBJECTID {
                 break;
             }
             trail.push(cur);
-            cur = *parent;
+            cur = parent;
             if trail.len() > inodes.len() {
                 let depth = trail.len();
                 depth_cache.insert(start, depth);
@@ -9352,7 +9429,7 @@ where
     }
 
     builder.finalize();
-    Ok(builder.finish())
+    builder.finish()
 }
 
 // ── btrfs tree-log replay ─────────────────────────────────────────────────

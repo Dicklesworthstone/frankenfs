@@ -13,6 +13,81 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Send-stream primary-parent projection removed: 1.044838x whole-stream win (bd-btrfs-send-parent-index-azojl) - 2026-07-26 (GreenSpring, MEASURED)
+
+The institutional preflight first exited 2 on the existing parsed-`INODE_REF`
+negative-evidence row and printed its prior escape condition. That condition allowed a
+production edit only after either usable line-level profiling or a counted
+whole-stream stage attributed at least 0.1% to the derived primary-parent map.
+Before changing production, a source-neutral decision invocation measured the
+exact `inode_links -> inode_parents` projection against duplicate executions of
+the current complete stream:
+
+- 896 projected primary entries from 1,088 total links;
+- 4,352 primary-name bytes cloned into the redundant map;
+- projection/whole-stream median fraction **3.8593%**, deterministic
+  20,000-resample bootstrap median CI **[3.8394%, 3.9644%]**; and
+- same-invocation whole/whole A/A **0.999853**, CI
+  **[0.995953, 1.005182]**, symmetric null envelope **1.005182x**.
+
+That source-neutral `x86-64-v3` process self-reported executing ELF SHA-256
+`11d5cc8eccc4714f7e0f8dd4cde9c05bbc8256cf929ce9f749153287aab29999`
+and compile/runtime SSE2, SSE4.2, AVX2, and FMA true. It also pinned primary-map
+SHA-256 `4eac935568a24607ace1aa59c4688ddfcb9f30fbdb857e3d72a9fe2b8d5eb7f9`
+and complete-stream SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+The 3.84% lower bound cleared the pre-registered 0.1% admission threshold, so
+the source edit was allowed.
+
+Production now reads the canonical first link directly from the already-required
+`inode_links` map. The secondary `BTreeMap<u64, (u64, Vec<u8>)>` allocation and
+all primary-name clones are gone. A `bench-instrumentation` control monomorph
+retains the prior materialized projection only for the same-process decision
+harness; normal builds instantiate the direct-link path.
+
+The final-source whole-stream gate ran 31 alternating `AAB`/`BAA` rounds on
+pinned strict-remote worker `ovh-a` (reported hostname `fixmydocuments`), with
+two complete stream generations per observation. The executing process emitted
+`bench_evidence,binary_sha256=51a59b548173c252ae2b2cacdb9a5fe221afbffa4c822e13ad3edeffd6509a52,worker=fixmydocuments`
+and reported compile/runtime SSE2, SSE4.2, AVX2, and FMA true. Its results were:
+
+- materialized/materialized A/A median **1.000859**, bootstrap median CI
+  **[0.998920, 1.003464]**;
+- symmetric null envelope **1.003464x** and pre-registered twice-null threshold
+  **1.006941x**;
+- materialized/direct median **1.044838x**, bootstrap median CI
+  **[1.040822, 1.047479]**; and
+- gate verdict **KEEP**, because the complete A/B CI is above both 1.0 and the
+  twice-null threshold. CV was not computed or consulted.
+
+The control and candidate each produced the identical 3,048,915-byte stream,
+SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+Ordering is preserved because both paths choose `inode_links[ino].first()` in
+the same insertion order; hardlink emission still iterates the same vector from
+index 1 onward. Tie-breaking is therefore unchanged. Floating point and RNG are
+N/A. The final strict-remote focused `generate_send_stream` suite passed 7/7.
+Final-source scoped Clippy reached the owned crate and stopped only on the five
+pre-existing `parse_xattr_names`/`add_utimes_command_direct` diagnostics; the
+candidate-specific private-`Result` lint found by the first run was fixed and
+did not recur. Targeted nightly rustfmt and `git diff --check` passed.
+
+**DECISION:** KEEP the direct primary-link lookup. The measured claim is a
+**1.044838x whole-stream wall-time win (95% median CI
+[1.040822, 1.047479])** for this deep-path/hardlink fixture under a witnessed
+v3 release-perf ELF. It is not a PGO claim and is not a mounted-kernel
+comparison.
+
+**Retry predicate:** revisit a separately materialized primary-parent index only
+if a fresh witnessed-v3+PGO production profile on a concrete send workload
+attributes at least 5% of whole-stream cycles to repeated direct first-link
+lookups, or if a correctness requirement needs a primary ordering different
+from `inode_links` insertion order. Any retry must preserve exact complete-stream
+and hardlink-order hashes, count cloned/borrowed primary-name bytes, self-report
+the executing ELF SHA/ISA, and use one fixed worker with same-invocation
+interleaved A/A plus A/B whose bootstrap median wall/cycles CI clears twice its
+own null log-margin; never gate on CV.
+
 ## bd-bhh0i spin/no-spin NULL resolved: persistent harness proves a 1.203-1.318x wall-throughput win at 8 writers (bd-mvcc-spin-persistent-ci-ml4nw) - 2026-07-26 (GreenSpring, MEASURED)
 
 The prior row required an 8-writer A/A floor below 1.10x and named the mechanism
