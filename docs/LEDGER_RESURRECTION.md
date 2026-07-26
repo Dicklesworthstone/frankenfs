@@ -682,3 +682,55 @@ ELF all proved insufficient in this campaign until the binary reported
 That aligns the ISA with the performance distribution; it does **not** make a
 bench ELF PGO-identical. Exact “shipped configuration” wording still requires
 the complete training/profile-use flow and an explicit PGO identity.
+
+---
+
+## 7. Institutionalized anti-decay gate
+
+The corrected **205/274 = 74.8% VOID** census is now a forward invariant, not a
+one-time audit. `scripts/perf_ledger_preflight.py` implements three mechanical
+checks:
+
+1. `--candidate "<lever>" --surface "<target>"` searches both canonical
+   ledgers before a lever is proposed. A target-surface match against an earlier
+   REJECT prints the matching row and its concrete retry predicate, then exits
+   **2 (BLOCKED)**. The proposed mechanism alone is not enough; callers must name
+   the function, module, or benchmark surface they intend to touch.
+2. `--lint --staged` reads the Git index, not the potentially different shared
+   working tree. A new or modified REJECT is blocked unless its row records
+   either an A/A null control from the same invocation or a counted mechanism
+   such as instructions, cycles, syscalls, allocations, or numeric profile
+   attribution. A future requirement written only in the retry clause is
+   excluded from the just-completed run's evidence.
+3. The same staged lint blocks a KEEP unless its row contains a full SHA-256
+   emitted from inside the executing process. The accepted machine-readable
+   witnesses are `bench_elf_sha256=...`,
+   `bench_evidence,binary_sha256=...`, or an equivalently explicit
+   executing-ELF self-report. An adjacent `sha256sum` is intentionally
+   insufficient because it cannot prove which binary executed.
+
+Policy failures use exit **2**; preflight infrastructure failures use exit
+**64** and fail closed. The active checkout installs this guard with:
+
+```bash
+python3 scripts/perf_ledger_preflight.py --install-hook
+```
+
+The hook invokes `--lint --staged`, so unstaged peer edits cannot alter the
+commit decision and the old inert `HEAD...HEAD` comparison cannot silently pass.
+`--self-test` exercises the A/A, counted-mechanism, adjacent-hash rejection,
+in-process-hash acceptance, and surface-match predicates without Cargo.
+`--audit` remains the reproducible whole-ledger census.
+
+This gate does not retroactively certify the 205 historical VOID rows and does
+not resurrect them automatically. It prevents the undecidable class from
+growing while preserving each row's own retry predicate. Retry the gate itself
+after any ledger-format change; extend an accepted hash marker only when its
+implementation demonstrably hashes `current_exe` in process, and add a
+corresponding self-test before relying on it.
+
+Validation on 2026-07-26 was source-only because of the `/data` disk emergency:
+the thirteen policy self-checks passed, the live audit reproduced **274 REJECT /
+205 VOID (74.8%)**, and a known `SnapshotRegistry` publication candidate was
+blocked with the matching ledger rows and recorded retry predicate. No Cargo,
+RCH, benchmark, or test command was started.

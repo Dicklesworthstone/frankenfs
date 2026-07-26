@@ -1872,6 +1872,21 @@ retry condition — in the negative-evidence ledger
 dropped. Historical rows predate this contract: the corrected 2026-07-25
 preflight found 205 of 274 rejected rows (74.8%) measurement-void, so this
 methodology is a forward gate rather than a blanket retroactive certification.
+The contract is mechanically enforced in the staged index:
+
+```bash
+python3 scripts/perf_ledger_preflight.py --install-hook
+python3 scripts/perf_ledger_preflight.py \
+  --candidate "proposed mechanism" --surface "target function or benchmark"
+```
+
+The installed pre-commit hook exits 2 for a new or modified REJECT lacking
+either a same-invocation A/A null control or a counted mechanism, and for a KEEP
+lacking a full SHA-256 self-reported by the executing ELF. A hash computed next
+to the run is deliberately not accepted. Candidate preflight also exits 2 when
+the target surface matches prior negative evidence and prints that row's retry
+predicate. `--audit` reproduces the whole-ledger census; `--self-test` validates
+the policy predicates without invoking Cargo.
 When honest scrutiny contradicted an earlier claim,
 it was corrected in the open: a previously-reported "1.7× faster than kernel"
 cold-read row flipped
