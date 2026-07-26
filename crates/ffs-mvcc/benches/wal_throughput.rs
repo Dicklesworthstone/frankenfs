@@ -576,11 +576,13 @@ fn print_actual_null_summary(writers: usize, phase: &str, pairs: &[ActualNullPai
 
 #[cfg(feature = "bench-instrumentation")]
 fn profile_only() {
+    // POST-LEVER frontier: profile the wait-free gate only, so the frame table
+    // answers "what is the next serialization point now that the publication
+    // mutex is gone" rather than re-measuring the mutex path we already know.
     use ffs_mvcc::sharded::PublicationMode;
-    let _ = run_actual_commit_arm(8, false, PublicationMode::Mutex);
-    let _ = run_actual_commit_arm(8, true, PublicationMode::Mutex);
-    let _ = run_actual_commit_arm(8, false, PublicationMode::WaitFree);
-    let _ = run_actual_commit_arm(8, true, PublicationMode::WaitFree);
+    for _ in 0..4 {
+        let _ = run_actual_commit_arm(8, false, PublicationMode::WaitFree);
+    }
 }
 
 #[cfg(feature = "bench-instrumentation")]
@@ -655,6 +657,27 @@ fn spawn_profile_report() {
     };
     let text = String::from_utf8_lossy(&report.stdout);
     println!("profile_frame_table_begin\n{text}profile_frame_table_end");
+    // Compact top-frame line so the frontier survives any log truncation.
+    let mut frames: Vec<(f64, String)> = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pct = fields.next()?.strip_suffix('%')?.parse::<f64>().ok()?;
+            let symbol = line.split("] ").nth(1).unwrap_or("?").trim();
+            Some((pct, symbol.chars().take(70).collect::<String>()))
+        })
+        .collect();
+    frames.sort_by(|a, b| b.0.total_cmp(&a.0));
+    frames.truncate(15);
+    let mut top = String::new();
+    for (pct, symbol) in &frames {
+        if !top.is_empty() {
+            top.push(';');
+        }
+        write!(&mut top, "{pct:.2}%={symbol}").expect("format top frame");
+    }
+    println!("profile_top_frames,mode=wait_free,threads=8,frames={top}");
     if !status.success() || !report.status.success() {
         println!(
             "profile_blocker=perf_permission_denied record_status={status} report_status={}",
