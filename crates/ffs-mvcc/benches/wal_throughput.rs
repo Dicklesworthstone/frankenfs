@@ -415,7 +415,18 @@ fn print_actual_null_control() {
     // `Instant::now()` probes per commit are paid by BOTH arms, so they cancel
     // in the ratio but dilute its magnitude — the unprofiled pass below is the
     // decision measurement.
+    //
+    // OFF BY DEFAULT — set `FFS_BENCH_PROFILED=1` to re-enable. This pass roughly
+    // doubles wall time, and a run that overruns its budget loses the TAIL thread
+    // counts, which are exactly the 8-writer rows every decision here depends on
+    // (one run lost its unprofiled 4t/8t rows to precisely that). The per-phase
+    // attribution it produces is already recorded in the ledger; the unprofiled
+    // pass below is what decides.
+    let profiled_pass = std::env::var_os("FFS_BENCH_PROFILED").is_some();
     for writers in [1_usize, 2, 4, 8] {
+        if !profiled_pass {
+            break;
+        }
         run_paired_arms(
             writers,
             "profiled_aa",

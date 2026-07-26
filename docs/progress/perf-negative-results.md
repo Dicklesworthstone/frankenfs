@@ -13,6 +13,54 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## ⚠ bd-bhh0i wait-free gate — RUN 3 DID NOT REPRODUCE A DECIDABLE 8t EFFECT (harness overrun + a noisy worker); claim tempered to "1.70x on a quiet pinned worker" (bd-bhh0i) - 2026-07-25 (turn 12c, cc)
+
+Recording a disagreement with my own result, because it changes how the number
+should be quoted.
+
+Run 3 (binary SHA-256 `c513a49a7b5503150178a10ff550cc20c39cbb84303ff2fb78abc1f90bf2f967`,
+same pinned worker `vmi1227854`) added the `unprofiled_spin_vs_nospin_ab` phase,
+which pushed total runtime past the 3000 s budget. Consequence: **the run died
+before emitting the unprofiled 4-writer and 8-writer rows** — exactly the rows
+every decision here rests on. What it did emit disagrees with runs 1 and 2:
+
+| phase | t | A/A floor | A/B | log-margin | verdict |
+|-------|--:|----------:|----:|-----------:|---------|
+| profiled | 4 | 1.2872 | 1.6063 | 1.59x | below the 2x margin |
+| profiled | 8 | 1.2619 | **1.2961** | **1.11x** | **NOT decidable** |
+
+Run 1's profiled 8t was 2.2433 and run 2's unprofiled 8t was 1.8841. Run 3's
+profiled 8t is 1.2961 — barely outside its own A/A floor. The A/A itself was
+healthy (0.9867, floor 1.2619), so this is not a broken harness; it is a worker
+that was busier during the candidate arms, and the paired design correctly
+reported a smaller effect rather than hiding it.
+
+STATE OF THE CLAIM after three runs:
+- **Unprofiled (decision) 8t: 2 of 2 completed runs decidable — 1.7004x and
+  1.8841x.** Run 3 never produced this row.
+- **Profiled (attribution) 8t: 2 of 3 decidable — 2.2433x, (run 2 not separately
+  re-read), 1.2961x NOT decidable.**
+
+So the honest quotation is **"~1.70x at 8 writers on a quiet pinned worker"**, NOT
+"1.70x". The effect is real — it is mechanism-backed (publication mutex wait p99
+32767 -> 511 ns) and it reproduced on two independent ELFs — but its MAGNITUDE is
+worker-load-sensitive, which is expected for a lever whose entire mechanism is the
+removal of contention: less contention on the box, less to remove.
+
+HARNESS FIX (landed with this row): the profiled pass is now OFF by default behind
+`FFS_BENCH_PROFILED=1`. It roughly doubles wall time, and when a run overruns, what
+it loses is the TAIL of the thread sweep — the 8-writer rows — so the failure mode
+is silent and maximally damaging: a truncated run looks like a completed run that
+simply had fewer phases. Any harness that sweeps a parameter in increasing order
+and can time out has this bug shape; sweep the expensive end FIRST, or make the
+expensive pass opt-in. Chose opt-in.
+
+RETRY PREDICATE for anyone quoting this number: require a completed unprofiled
+sweep (all four thread counts present), an 8-thread A/A floor below 1.30x, and a
+candidate clearing it by a 2x log-margin. Two such runs exist; demand a third
+before raising the claim above 1.70x, and re-check the box load before blaming the
+lever if a run comes in low.
+
 ## bd-bhh0i wait-free gate: REPLICATED on a second binary (1.88x @8t) + an HONEST CPU caveat — the spin trades CPU for wall (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12b, cc)
 
 REPLICATION. A second, independently built binary (SHA-256
