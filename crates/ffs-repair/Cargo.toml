@@ -6,6 +6,9 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+bench-instrumentation = []
+
 [dependencies]
 ffs-types = { workspace = true }
 ffs-error = { workspace = true }
@@ -24,6 +27,7 @@ criterion = { workspace = true }
 insta = { workspace = true }
 parking_lot = { workspace = true }
 proptest = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "scrub_codec"
