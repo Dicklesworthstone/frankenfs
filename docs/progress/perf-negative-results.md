@@ -13,6 +13,70 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## bd-b9dug CORRECTED: every published frankenfs ratio came from a baseline-ISA binary that is NOT what ships; claims re-stated by class (bd-b9dug) - 2026-07-25 (Lane L, cc, no worker used)
+
+Full writeup: `docs/BD_B9DUG_ISA_CORRECTION.md`.
+
+THE DELTA. `cargo bench --profile release-perf` and `scripts/build-perf.sh` share the
+same Cargo profile (opt-level 3, fat LTO, codegen-units 1, panic=abort) and differ in
+exactly the two things a Cargo profile CANNOT express: **`-C target-cpu=x86-64-v3`**
+(AVX2/BMI2/FMA) and **PGO**. So `[profile.release-perf]` is not wrong, it is
+INCOMPLETE as a description of what ships — and nothing in the bench path ever said so.
+
+IN-BINARY WITNESS (not inference — the executing binary reported it):
+`codegen_isa,compile_sse2=true,compile_sse4_2=false,compile_avx2=false,
+runtime_sse4_2=true,runtime_avx2=true` on `vmi1227854`. Compiled for a CPU far weaker
+than the one it ran on.
+
+SIZE, from evidence already in-repo (`build-perf.sh` header, `perf stat` 2026-07-03,
+behaviour-preserving and stacking): target-cpu=v3 ~8.5% fewer create instructions / ~3%
+lookup; PGO on top ~10% / ~24%; compounded **~17.6% create, ~26.3% lookup**.
+⚠ INSTRUCTION COUNTS, NOT WALL — the script itself says "wall-clock was too noisy to
+see them", and this repo's own ledger carries the matching lesson ("instructions alone
+with flat cycles = neutral", the scrub word→SIMD REJECT). Direction established,
+instruction magnitude measured, **wall magnitude unknown**. Do not convert 17.6% fewer
+instructions into 17.6% faster.
+
+CLAIMS RE-STATED BY CLASS:
+- **Class A (wins vs kernel** — allocator range-overlap 3110x, journal replay 2024x,
+  extent coalescing 120x, incremental crc32c 24.7x): FrankenFS ran on the WEAKER
+  binary, kernel arm unaffected ⇒ these wins are **UNDERSTATED**. Nothing to withdraw;
+  quote as ">= N x (baseline-ISA build)".
+- **Class B (losses vs kernel** — parallel metadata writes 8.3x slower @8t, multi-file
+  parallel read ~2.9x, mounted create storm 4.599x): same direction ⇒ these losses are
+  **OVERSTATED**; the real gap is smaller. Strategically unchanged, but ⭐ **no loss in
+  this class may be called "structural" or "irreducible" on the strength of a
+  baseline-ISA measurement** — campaign §3b names exactly that failure mode.
+- **Class C (internal A/B, one binary** — the 2026-07-25 wait-free gate 1.70-2.11x and
+  essentially every KEEP/REJECT row in this file): both arms share one ELF, **the ISA
+  cancels and the ratio stands as measured.** What does not automatically transfer is
+  the magnitude on the shipped binary: a compute-shaped lever can SHRINK under v3+PGO
+  (the baseline it improves gets faster) while a contention-shaped lever can GROW (the
+  compute term shrinks, so the serialization term is a larger share). The wait-free gate
+  is contention-shaped, so its 1.70x is not at risk and should if anything be LARGER on
+  the shipped binary — recorded as a prediction, not a measurement.
+- **Not affected:** e2fsck results, byte-identity proofs, conformance counts. ISA
+  changes codegen, not behaviour.
+
+THE CORRECTION — deliberately NOT "make v3 the default". `build-perf.sh` explains why
+it is opt-in (v3 needs a 2015+ CPU and removes the runtime scalar fallback FrankenFS
+keeps), and campaign §3b adds that worker `ovh-b` SIGILLs on AVX2 builds: a global
+default trades a reporting bug for a crash. Instead, make the mismatch UNPUBLISHABLE:
+(1) every bench binary self-reports `codegen_isa` (ffs-mvcc `wal_throughput` does);
+(2) NEW ADMISSIBILITY RULE — a ratio may not be published from a run whose output lacks
+a `codegen_isa` line, and a ratio whose `compile_avx2` differs from the shipped config
+must carry the A/B/C qualifier above; (3) reproduce production with
+`RUSTFLAGS="-C target-cpu=x86-64-v3"` (or `scripts/build-perf.sh` for +PGO), pinned to
+an AVX2-capable worker, with the ELF sha proving codegen changed; (4) an ISA A/B is
+gated on wall/cycles, NEVER on instruction count — an ISA change retires more work per
+instruction, so fewer instructions is the mechanism, not a neutral proxy.
+
+STILL OPEN: the WALL-CLOCK size of the ISA+PGO gap. That is a whole-binary A/B (two
+ELFs, `paired()` inapplicable) needing same-worker execution with ELF-sha confirmation
+on an AVX2-capable pinned worker — a measurement window this lane does not hold. FILED,
+NOT DONE. Retry predicate: identical source, baseline vs v3, confirm the shas differ,
+gate on wall/cycles.
+
 ## bd-bhh0i wait-free gate FINAL: 8t decidable 3/3 (1.70 / 1.88 / 2.11x) + the spin-vs-nospin question is a NULL (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12d, cc, MEASURED)
 
 Run 4 (binary SHA-256 `32c5c1ba5afb89a292aa119986b979e6ca6e7113e871787f58948660f83989cc`,
