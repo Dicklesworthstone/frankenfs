@@ -13,6 +13,105 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## ⭐⭐⭐ bd-bhh0i E2E DECIDABLE AT LAST — wait-free publication gate is 1.49x at 8 threads end-to-end; instrument rebuilt from a 52% null floor to 1.1145x (bd-bhh0i / bd-kdmu4) - 2026-07-26 (turn 14, cc, MEASURED)
+
+Status: the end-to-end question that has been UNDECIDABLE through four instrument
+versions is now DECIDED. The lever wins on the real create path, not only on the
+commit primitive.
+
+`bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`
+— self-reported IN-PROCESS by the executing ELF from `current_exe()`, outside the
+timed region, not a `sha256sum` run beside it (see PROVENANCE below).
+
+### The decidable result
+
+A/A NULL CONTROL: the 1-thread arm. At 1 writer both arms execute the identical code
+path — the ffs-mvcc micro A/B measured the lever inert below 4 writers across three
+ELFs — so the 1-thread arm is a true A/A null on the production binary, and it is run
+in the SAME invocation as the test.
+
+| arm | median ratio (on/off) | null floor | cv off / on |
+|---|---:|---:|---:|
+| **A/A null (1 thread)** | **1.0105** | **1.1145x** | 4.1% / 6.1% |
+| **A/B test (8 threads)** | **1.4914** | — | 9.5% / 6.2% |
+
+Margin `|log 1.4914| / log(1.1145) = 0.3997 / 0.1084 = **3.69x**` against the
+campaign's required 2.0x. **DECIDABLE.**
+
+⭐ COMPLETE ARM SEPARATION: across all 11 paired rounds, **every** wait-free value
+(186,748-228,201 c/s) exceeds **every** mutex value (116,785-156,134 c/s). Zero
+overlap. That is independent of any statistic.
+
+### The honest range, and why the two runs differ
+
+The SAME instrument measured **1.2440x** an hour earlier (margin 1.28x, NOT
+decidable) under heavier fleet load: arm cv was 16.9/17.5% then versus 9.5/6.2% now.
+That is coherent with the mechanism rather than a contradiction — a
+contention-removal lever shows LESS benefit when the box is already saturated,
+because contention adds a load-dependent cost common to both arms and compresses the
+ratio toward 1.
+
+**Published claim: ~1.24-1.49x at 8 threads, quoting the conservative 1.24x.** The
+decidable measurement is 1.49x; the 1.24x run was not decidable and is reported as
+the floor of the observed range, not as a competing result.
+
+### The instrument rebuild that made this possible
+
+Four versions, each gated on the A/A null:
+
+| version | change | control median | control null floor | control cv |
+|---|---|---:|---:|---:|
+| v1 | historical shape | 0.8118 | — (52% worst dev) | 21.4 / 36.5% |
+| v2 | rounds share one image; flush excluded | 1.3445 | — (57% worst dev) | **5.5%** / 19.3% |
+| v3 | v2 + arms alternate per round | 0.9632 | 1.678x | 22.6 / 20.4% |
+| v4 | v3 + measured region 44 ms -> 440 ms | 1.0353 | 1.1853x | 3.7% / 7.6% |
+| v4b | v4 + quieter box + ELF self-report | **1.0105** | **1.1145x** | 4.1% / 6.1% |
+
+⭐ THE v2 FAILURE IS THE INSTRUCTIVE ONE. v2 fixed exactly what it targeted — the
+unaffected arm's cv fell 21% -> 5.5% — yet its control median went to 1.34 with a
+STEP CHANGE at round 4, not noise, because running each arm as ONE whole sequential
+process left time-correlated drift uncancelled; v1's per-round alternation had been
+suppressing it. **The two variance sources want OPPOSITE structures: page-cache
+variance wants rounds batched inside one process, drift wants arms interleaved in
+time.** v3 gets both by using `mke2fs` per run (a sparse 2 GiB mke2fs perturbs the
+page cache far less than copying a populated 2 GiB file) instead of `cp`.
+Generalizable: **fixing one variance source can destroy the design property that was
+suppressing another, and only a negative control catches it.**
+
+Landed as `create-bench --rounds` — additive; `--rounds 1` is byte-identical to the
+historical path, flush inside the timer and all, so every previously published
+create-bench number stays comparable.
+
+### PROVENANCE — a real weakness, found by the repo's own pre-commit guard
+
+The first attempt to land this row was REFUSED by `scripts/perf_ledger_preflight.py
+--lint --staged`, the ledger guard installed after fleet broadcast 2. It was right:
+every create-bench number produced before this row identified its binary with a
+`sha256sum` run BESIDE the benchmark, which proves which file was on disk, not which
+binary the kernel mapped. Those diverge in this fleet — the first `ffs-cli` cutover
+build died because rustup replaced the toolchain mid-build.
+
+Fixed at the source: `ffs-cli` now hashes `current_exe()` in-process, outside the
+timed region, emitting `bench_evidence,binary_sha256=...`. The v4b numbers above are
+the first create-bench measurements in this repo with real execution provenance. The
+guard blocking its own author on the first commit after installation is the strongest
+available evidence that it works.
+
+### Correctness
+
+`e2fsck -fn` rc 0. Across v1+v2+v3+v4+v4b that is **26 end-to-end images, all rc 0**,
+with exact file parity between arms wherever both were fscked (v1: 20 images, 40,013
+@1t and 40,021 @8t identical in both arms every round; v2: 4 images, identical).
+
+### Default
+
+`FFS_MVCC_WAITFREE_PUBLISH` stays **OFF pending one confirming decidable run**. One
+decidable end-to-end win is enough to PROPOSE the flip and not enough to make it: the
+same instrument returned a non-decidable 1.24x an hour earlier, and flipping a default
+on a single favourable run is the failure this campaign exists to prevent. Retry
+predicate for the flip: one further run with the A/A null inside 1.10x, floor <=1.15x,
+and 8-thread margin >= 2.0x, plus per-arm `e2fsck` rc 0 with exact file-count parity.
+
 ## ⭐ bd-bhh0i E2E CUTOVER GATE RUN — correctness PASSES 20/20, performance UNDECIDABLE; default stays OFF for a MEASURED reason (bd-bhh0i) - 2026-07-25 (turn 13, cc, scoped local-exec exception)
 
 Status: the gate that has been blocked since 2026-07-13 finally RAN. Correctness is

@@ -744,6 +744,24 @@ enum Command {
         /// own subdir, isolating the MVCC commit-lock contention). 1 = serial.
         #[arg(long, default_value_t = 1)]
         threads: usize,
+        /// Repeat the create phase `rounds` times in ONE process against ONE
+        /// image, timing each round's creates SEPARATELY and flushing once at
+        /// the end.
+        ///
+        /// `--rounds 1` (the default) is byte-identical to the historical
+        /// behaviour, flush inside the timer and all, so every previously
+        /// published create-bench number stays comparable.
+        ///
+        /// `--rounds N > 1` exists because the historical shape cannot decide a
+        /// small effect: it needs a fresh 2 GiB image copy per run (thread
+        /// subdirs `t{t}` collide on reuse) and it times the whole-image flush,
+        /// so run-to-run variance is page-cache and writeback dominated rather
+        /// than filesystem dominated. The bd-bhh0i cutover gate measured a
+        /// 1-thread NEGATIVE CONTROL swinging 52% on that shape, which cannot
+        /// resolve the ~6% effect under test. Rounds share one image (no copy)
+        /// and exclude the flush, leaving the create loop as the signal.
+        #[arg(long, default_value_t = 1)]
+        rounds: usize,
     },
     /// Benchmark mkdir: create `count` subdirectories in `dir` + flush, timing
     /// total throughput. Each mkdir is an existence-check lookup + inode/dir
@@ -1994,7 +2012,13 @@ fn run() -> Result<()> {
             count,
             seed,
         } => lookupbench_cmd(&image, &dir, count, seed),
-        Command::CreateBench { image, dir, count, threads } => createbench_cmd(&image, &dir, count, threads),
+        Command::CreateBench {
+            image,
+            dir,
+            count,
+            threads,
+            rounds,
+        } => createbench_cmd(&image, &dir, count, threads, rounds),
         Command::MkdirBench { image, dir, count } => mkdirbench_cmd(&image, &dir, count),
         Command::RmdirBench { image, dir, count } => rmdirbench_cmd(&image, &dir, count),
         Command::UnlinkBench { image, dir, count } => unlinkbench_cmd(&image, &dir, count),
@@ -2454,7 +2478,13 @@ fn read_file_cmd(path: &PathBuf, file_path: &str, discard: bool) -> Result<()> {
 /// a kernel random `pread` loop. Random access does one extent-map lookup per
 /// read (sequential `read` coalesces runs), so this exercises the per-lookup
 /// path (e.g. the `ffs-extent` cache) that sequential reads hide (bd-7f6yr).
-fn createbench_cmd(path: &PathBuf, dir_path: &str, count: usize, threads: usize) -> Result<()> {
+fn createbench_cmd(
+    path: &PathBuf,
+    dir_path: &str,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<()> {
     let cx = cli_cx();
     let mut open_fs = OpenFs::open(&cx, path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
@@ -2477,6 +2507,12 @@ fn createbench_cmd(path: &PathBuf, dir_path: &str, count: usize, threads: usize)
             .with_context(|| format!("failed to resolve {dir_path} at component {comp:?}"))?;
         parent = attr.ino;
     }
+    // Low-variance mode (`--rounds N > 1`). Everything below the historical
+    // single-round paths, so `--rounds 1` reaches them untouched.
+    if rounds > 1 {
+        return createbench_rounds(&cx, &mut open_fs, parent, count, threads, rounds);
+    }
+
     // Parallel mode: each thread creates in its own subdir, so the only shared
     // contention is the MVCC commit lock — isolating whether writes scale.
     if threads > 1 {
@@ -2547,6 +2583,130 @@ fn createbench_cmd(path: &PathBuf, dir_path: &str, count: usize, threads: usize)
     eprintln!(
         "createbench: {count} creates in {dir_path} -> {created} created in {duration_us} us = {} creates/s",
         creates_per_s as u64
+    );
+    Ok(())
+}
+
+/// Repeat the create phase in one process against one image, timing each round's
+/// creates alone and flushing once at the end.
+///
+/// Why this exists: the historical shape times creates AND a whole-image
+/// `sync_all_to_device`, and needs a fresh image per run because the `t{t}`
+/// thread subdirs collide on reuse. Both make the measurement page-cache and
+/// writeback bound. On the bd-bhh0i cutover gate that produced a 1-thread
+/// negative control — where the lever under test is provably inert — swinging
+/// **52%**, against a ~6% effect under test. An instrument whose null moves 52%
+/// cannot decide 6%.
+///
+/// Rounds share one image so no copy is needed, and the flush is reported
+/// separately so it stops contributing variance to the statistic.
+///
+/// Rounds are NOT independent: the filesystem fills monotonically, so round N
+/// starts fuller than round 1. That is why per-round lines are printed rather
+/// than a single aggregate — the caller alternates arms ACROSS rounds, which
+/// cancels the fill trend to first order, and can inspect it directly.
+/// SHA-256 of the executing binary, hashed in-process from `current_exe()`.
+fn elf_self_sha256() -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let exe = std::env::current_exe().context("current_exe")?;
+    let mut file = std::fs::File::open(&exe)
+        .with_context(|| format!("open {} for self-hash", exe.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0_u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).context("read self for hash")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(&mut acc, "{b:02x}");
+            acc
+        }))
+}
+
+fn createbench_rounds(
+    cx: &Cx,
+    open_fs: &mut OpenFs,
+    parent: InodeNumber,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<()> {
+    // Self-report the EXECUTING ELF's SHA-256. A `sha256sum` run beside the
+    // benchmark proves which file exists on disk, not which binary the kernel
+    // actually mapped — the two diverge whenever a concurrent build replaces the
+    // file mid-run, which has happened in this fleet. Hash `current_exe()` from
+    // inside the measuring process, outside the timed region.
+    match elf_self_sha256() {
+        Ok(sha) => println!("bench_evidence,binary_sha256={sha}"),
+        Err(err) => println!("bench_evidence,binary_sha256=unavailable,error={err}"),
+    }
+    let per = if threads > 1 { count / threads } else { count };
+    let per_round_total = per * threads.max(1);
+    for round in 0..rounds {
+        let create_us = if threads > 1 {
+            let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
+            for t in 0..threads {
+                let attr = open_fs
+                    .mkdir(
+                        cx,
+                        parent,
+                        std::ffi::OsStr::new(&format!("t{t}_r{round}")),
+                        0o755,
+                        0,
+                        0,
+                    )
+                    .with_context(|| format!("failed to mkdir t{t}_r{round}"))?;
+                tdirs.push(attr.ino);
+            }
+            let started = Instant::now();
+            std::thread::scope(|s| {
+                for (t, &tdir) in tdirs.iter().enumerate() {
+                    let fs = &*open_fs;
+                    s.spawn(move || {
+                        for i in 0..per {
+                            let name = format!("cb_{t}_{i:08}");
+                            fs.create(cx, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
+                                .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
+                        }
+                    });
+                }
+            });
+            started.elapsed()
+        } else {
+            let started = Instant::now();
+            for i in 0..per {
+                let name = format!("cb_r{round}_{i:08}");
+                open_fs
+                    .create(cx, parent, std::ffi::OsStr::new(&name), 0o644, 0, 0)
+                    .with_context(|| format!("failed to create {name}"))?;
+            }
+            started.elapsed()
+        };
+        let secs = create_us.as_secs_f64().max(1e-9);
+        println!(
+            "createbench_round,round={round},threads={threads},count={per_round_total},\
+create_us={},creates_per_s={}",
+            create_us.as_micros(),
+            (per_round_total as f64 / secs) as u64
+        );
+    }
+    // One flush for the whole run, timed and reported separately so it can be
+    // read but never contributes to the per-round statistic.
+    let flush_started = Instant::now();
+    open_fs
+        .sync_all_to_device(cx)
+        .with_context(|| "failed to flush creates".to_string())?;
+    println!(
+        "createbench_flush,rounds={rounds},flush_us={}",
+        flush_started.elapsed().as_micros()
     );
     Ok(())
 }
