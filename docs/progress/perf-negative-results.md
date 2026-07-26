@@ -13,6 +13,49 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Duplicate Btrfs send inode-item parse is only 0.4246% of whole-stream time (bd-btrfs-send-inode-reparse-etlpr) - 2026-07-26 (GreenSpring, PROFILE-BOUND / NOT ADMITTED)
+
+Before proposing a production edit, ledger grep and the institutional preflight
+found the earlier parsed-`INODE_REF` negative-evidence row on this exact
+`generate_send_stream` parse surface. Its escape condition requires evidence
+that the parsed work is a whole-send bottleneck. The new source-neutral
+attribution mode reproduces the second complete `parse_inode_item` pass over the
+already-grouped inode entries and counts **897 duplicate parses** per stage
+observation. It runs duplicate unchanged whole streams as its same-invocation
+A/A null control.
+
+The witnessed x86-64-v3 release-perf process reported:
+
+`bench_evidence,binary_sha256=8ba9bd0535388339e6bd13ea1167da8378ac2e70bd5ad1431b9eb1b818eb860d,worker=fixmydocuments`
+
+Compile-time and runtime AVX2 and FMA were true. The unchanged whole-stream arms
+produced identical 3,048,915-byte output, SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+Across 31 alternating whole/whole/stage observations, the deterministic
+20,000-resample bootstrap results were:
+
+- whole/whole A/A median **1.001070x**, CI **[0.995185, 1.006003]**;
+- duplicate-reparse/whole median **0.4246%**, CI
+  **[0.4029%, 0.4342%]**; and
+- pre-registered admission floor **5%**.
+
+**DECISION:** PROFILE-BOUND / NOT ADMITTED. No production source was edited and
+no primitive-only A/B was allowed. Even perfect elimination has less than half
+a percent observed whole-stream budget on this 897-inode fixture, before paying
+for retained-item storage and lookup. The benchmark-only source-neutral mode is
+retained to make the closure reproducible. This is v3 attribution evidence, not
+a PGO or shipped-binary speedup claim. The gate used the bootstrap median CI and
+never computed or consulted CV.
+
+**Retry predicate:** reopen only if a fresh witnessed-v3+PGO production send
+workload attributes at least **5%** of whole-stream wall/cycles to the duplicate
+`parse_inode_item` pass, or a materially different many-tiny-inode workload
+raises the counted stage's median-CI lower bound to at least 5%. Then retain the
+already-validated parsed item, prove exact complete-stream and malformed-item
+behavior, and require one self-hashing v3+PGO ELF with pinned-worker
+same-invocation A/A+B whose bootstrap median wall/cycles CI clears twice its own
+null margin. Never gate on CV.
+
 ## Profitability-gated repair source reads reject on their scalar fallback (bd-repair-source-read-profitability-w74sl) - 2026-07-26 (GreenSpring, MEASURED REJECT #3 / SWITCH VEINS)
 
 The institutional exact-surface preflight exited 2 on the preceding
