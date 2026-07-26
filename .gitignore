@@ -201,3 +201,7 @@ rust_out
 # One-off local CARGO_TARGET_DIR override directories (e.g. criterion micro-benches).
 **/local-target/
 .rch-targets/
+
+# Python bytecode from scripts/ (perf_ledger_preflight.py)
+__pycache__/
+*.pyc
