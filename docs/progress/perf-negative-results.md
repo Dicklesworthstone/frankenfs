@@ -13,6 +13,67 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## 🛑 BLOCKER (infrastructure, not idea): the wait-free-gate e2e cutover cannot run — rch excludes `target/` from artifact retrieval AND the fleet has no `mke2fs`/`e2fsck` (bd-bhh0i / bd-b9dug) - 2026-07-25 (turn 12, cc)
+
+Status: LEDGERED BLOCKER. The `FFS_MVCC_WAITFREE_PUBLISH` default stays OFF because
+the end-to-end gate could not be executed, NOT because it failed.
+
+WHAT WAS ATTEMPTED. After the ffs-mvcc primitive A/B won (1.70x @8t, entry below),
+the plan was the documented cutover gate: `mke2fs -t ext4 -F -q -b 4096 -N 65536
+<img> 524288` (2 GiB / 16 groups / 65536 inodes — image was created successfully
+and verified with `dumpe2fs`), then `FFS_BHH0I_SHARDED=1 create-bench <img> /d
+--count 40000 --threads 8` with `FFS_MVCC_WAITFREE_PUBLISH` off vs on from the SAME
+binary (the per-store `PublicationMode` makes that a true same-ELF A/B), gated on
+`e2fsck -fn` rc 0 and exact file parity.
+
+WHY IT COULD NOT RUN — two independent walls, both infrastructure:
+
+1. **rch cannot hand back a built binary.** Two `cargo build --profile release-perf
+   -p ffs-cli --features bhh0i_sharded_alloc` runs both succeeded remotely (`ovh-a`
+   378.0s; `vmi1227854` 658.5s, both exit 0) and both retrieved only **2-5 files /
+   536-563 bytes**. Root cause is exact and global: `~/.config/rch/config.toml`
+   `[transfer] exclude_patterns` contains **`"target/"`, `"target-*/"`,
+   `"target_*/"`, `".rch-target*/"`, `".cargo-target/"`**. Every Cargo output
+   directory is on the exclude list, so no compiled artifact can ever be retrieved
+   from a worker — with the default target dir OR a custom one. The campaign's
+   prescribed `env -u CARGO_TARGET_DIR` form does not help; the exclusion is on the
+   destination directory name, not on the env var.
+2. **The fleet cannot run the gate remotely either.** `mkfs.ext4`/`mke2fs` and
+   `e2fsck` are absent on the workers (already ledgered 2026-07-13: the sharded
+   create tests `open_writable_ext4_mkfs` SKIP there, and the in-Rust
+   `build_ext4_image` helpers are single-group 128 KiB PARSE fixtures that cannot
+   be opened writable for a multi-group parallel create). Shipping the image is not
+   a workaround: rch's `verify_max_size_bytes` is 100 MiB and the image is 2 GiB.
+
+So the gate is reachable only by an explicit LOCAL `release-perf` build of
+`ffs-cli`. That is a deliberate policy decision (the campaign forbids SILENT local
+fallback; `/data` has 246 GiB free and prior turns did run this cutover locally), and
+the `cargo` PreToolUse hook routes every `cargo` invocation through rch, so taking it
+means bypassing a user-installed guard. NOT done unilaterally — surfaced instead.
+
+UNBLOCK (any one of these, all cheap):
+(a) drop `target/` from `[transfer] exclude_patterns` for artifact RETRIEVAL (it is
+    correct as an UPLOAD exclusion; applying it to the download direction is what
+    breaks every "build remote, run local" workflow in this fleet);
+(b) add an rch flag to retrieve named binaries (`rch exec --retrieve
+    target/release-perf/ffs`);
+(c) explicit greenlight for ONE local `release-perf` `ffs-cli` build per cutover turn.
+
+This is a FLEET-WIDE finding, not a frankenfs one: any repo whose measurement needs a
+locally-executed binary (mounted-FS gates, hardware-specific runs, anything needing a
+tool absent on the workers) hits the same wall.
+
+WHAT IS STILL PROVEN WITHOUT THE GATE: the ffs-mvcc commit primitive A/B (below) is
+complete on its own terms — same ELF, pinned worker, A/A null in the same invocation,
+byte-identity proven before timing, and per-phase p99 mechanism evidence. What the
+e2e would add is (i) confirmation that the 8-thread gain survives the full create
+path where MVCC commit is one term among allocation, directory insert and inode-table
+RMW, and (ii) `e2fsck` proof on a mutated image. Neither is required to KEEP the flag
+default-OFF; both are required to FLIP the default. Retry predicate: re-run the exact
+gate above once any of (a)/(b)/(c) lands; flip the default only if 8-thread
+creates/s improves beyond the create-bench A/A null AND both arms are `e2fsck -fn`
+rc 0 with identical file counts.
+
 ## ⭐⭐ bd-bhh0i WIN — wait-free ordered publication: 1.70x at 8 threads, publication-lock wait collapses 64x (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12, cc/STRUCTURAL, MEASURED KEEP behind a flag)
 
 Status: KEEP behind `FFS_MVCC_WAITFREE_PUBLISH` (default OFF = byte-identical to
