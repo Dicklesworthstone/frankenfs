@@ -13,6 +13,55 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Historical 960x JBD2 group-commit claim is VOID: the FS path issues zero durability barriers (bd-fsync-journal-latency-gap-ptp4x) - 2026-07-26 (GreenSpring, VOID-MECHANISM / NO BENCH)
+
+The institutional preflight blocked a proposed cross-FsOp JBD2 group-commit
+lever on the prior fsync/group-commit rows. Source and history inspection then
+showed that the proposed optimization's baseline mechanism does not exist:
+
+- `ffs_journal::Jbd2Writer::commit_transaction` writes descriptor, data,
+  revoke, and commit blocks, advances `head`, and returns without calling
+  `BlockDevice::sync`;
+- `ffs_core::OpenFs::commit_transaction_journaled` calls that writer and then
+  makes the transaction visible in MVCC, again without a sync; and
+- `git blame` traces the no-sync implementation back to the original
+  `Jbd2Writer` commit `d51a0c159`. No later JBD2 change removed a barrier.
+
+The counted mechanism is therefore **syscall count: 0 sync syscalls -> 0 sync
+syscalls at `commit_transaction_journaled` return**, not the one-per-FsOp
+baseline asserted by the 2026-06-28/29 rows. The separately measured ~960x result belongs to
+`wal_buffer::GroupCommitCoordinator` / `FileWalWriter`, where `flush_epoch`
+really does call `WalWriter::sync`; that WAL subsystem is not used by the FS
+JBD2 path. The old journal-level ratio cannot establish either a current
+FS-level gap or an FS-level speedup.
+
+**DECISION — REJECT / VOID-MECHANISM:** classify the historical “JBD2 txn +
+fdatasync per FsOp” premise
+and every 960x FS-level extrapolation from it as **VOID-MECHANISM**. No
+production edit and no benchmark were run. Benchmarking “one sync per
+transaction versus one sync per epoch” against current `main` would fabricate a
+control arm that production does not execute. This audit also exposes a
+correctness obligation: the method documented as making the JBD2 transaction
+durable currently publishes MVCC visibility after buffered writes alone.
+Correcting that durability contract is not a performance optimization and is
+outside this docs-only result.
+
+**Retry predicate:** do not reopen JBD2 group commit as a performance lever
+until all of the following are true:
+
+1. the FS JBD2 path has an explicit durability barrier after its commit block
+   and before MVCC visibility/return;
+2. injected write and sync failures prove that an unsynced epoch is never
+   reported durable or made visible, and crash replay proves that every
+   returned-durable transaction survives while incomplete epochs do not;
+3. a current FS-level harness counts exactly one real device sync per
+   ungrouped returned-durable transaction; and
+4. one self-hashing x86-64-v3+PGO process on one pinned worker runs
+   same-invocation A/A plus ungrouped/grouped A/B, proves exact journal replay
+   and visibility order, and gates on a bootstrap median wall/cycles CI clearing
+   twice its own null margin. Never use the historical WAL ratio, instruction
+   count, or CV as the decision gate.
+
 ## Duplicate Btrfs send inode-item parse is only 0.4246% of whole-stream time (bd-btrfs-send-inode-reparse-etlpr) - 2026-07-26 (GreenSpring, PROFILE-BOUND / NOT ADMITTED)
 
 Before proposing a production edit, ledger grep and the institutional preflight
