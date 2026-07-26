@@ -13,6 +13,77 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## bd-bhh0i spin/no-spin NULL resolved: persistent harness proves a 1.203-1.318x wall-throughput win at 8 writers (bd-mvcc-spin-persistent-ci-ml4nw) - 2026-07-26 (GreenSpring, MEASURED)
+
+The prior row required an 8-writer A/A floor below 1.10x and named the mechanism
+polluting the instrument: every timed observation rebuilt the store and spawned/joined
+its workers. The institutional preflight correctly exited 2 on that closed surface.
+This run satisfies the recorded escape hatch:
+
+- four stores and their 32 workers are created once per process;
+- eight bounded block banks are populated before timing and reused in steady state;
+- each of 31 rounds interleaves a `WaitFree`/`WaitFree` A/A pair and a
+  `WaitFree`/`WaitFreeNoSpin` A/B pair, alternating both pair and arm order;
+- each arm retires exactly 16,384 commits per observation;
+- pruning, store/thread lifecycle, ELF hashing, and full-state digests are outside
+  the timed worker interval; and
+- the only decision statistic is a deterministic 20,000-resample paired bootstrap
+  median CI over log ratios. The new gate does not compute or consult CV.
+- each expected worker result has a 10-second no-progress bound that reports its
+  exact arm, epoch, completed-writer set, and publication watermark before exiting 2.
+
+Three strict-remote `x86-64-v3` release-perf invocations ran on pinned worker `ovh-a`
+(reported hostname `fixmydocuments`). The executing processes self-reported distinct
+ELFs:
+
+- `bench_evidence,binary_sha256=a6b0fb82ec93394e119619c8546af2f6b05fc31ab4c640e2b4f14bfb061e4bd1`
+- `bench_evidence,binary_sha256=d2059be34c2c90666a72b17dcc84214e901dc05bf38ff843cd077e8be8f1e41c`
+- `bench_evidence,binary_sha256=bf4804c53e507ae78d69ec11d803533097c83cba5a682731df8df8db18d50ed4`
+
+All three reported compile/runtime SSE2, SSE4.2, and AVX2 true.
+
+| run | A/A median CI | symmetric null envelope | spin/no-spin median | spin/no-spin median CI | verdict |
+|---|---:|---:|---:|---:|---|
+| 1 | `[0.967670, 1.014414]` | `1.033410x` | `0.758570` | `[0.725926, 0.779200]` | spin faster |
+| 2 | `[0.950265, 0.997507]` | `1.052338x` | `0.759147` | `[0.734401, 0.777777]` | spin faster |
+| 3 | `[0.955871, 1.031111]` | `1.046166x` | `0.831172` | `[0.760373, 0.850078]` | spin faster |
+
+All three null envelopes clear the pre-registered `<1.10x` admission bound. Every
+A/B CI is wholly below twice its own null log-margin. In throughput terms the
+spinning submode is **1.203-1.318x faster** (**16.9-24.1% less elapsed time**) than
+parking immediately in this isolated steady-state 8-writer workload.
+
+Correctness is exact, not inferred from equal commit counts. Before timing, all four
+arms had watermark 16,384 and identical bytes over all 16,384 blocks, SHA-256
+`1cb4c8f0a7e38ea1018077959bc30d69c53b994142801ea60afb0cb42a771928`.
+After timing, all four had watermark 524,288 and identical bytes, SHA-256
+`87e7183d06f60b8d9da6d5536daf006b9642e48f72a9ccab528b3d440b7ed193`.
+
+A separate current-source attempt self-reported ELF
+`b14a6158e5b64cb65a42fb08e06d0e73d8b050e2bf8b4c6307334bdffacc407c`
+and passed pre-timing parity, then produced no timing rows while both it and an
+unrelated job on `ovh-a` had stale RCH progress. It was cancelled after more than
+six minutes to release four fleet slots and is **not** counted as a performance or
+production-liveness verdict. That incident motivated the bounded liveness diagnostic;
+the final ELF then completed every pair on the same worker without firing it.
+
+**DECISION:** keep the persistent median-CI harness and retain the spinning
+`PublicationMode::WaitFree` submode. No production algorithm or default changes:
+when `FFS_MVCC_WAITFREE_PUBLISH` is absent, production still selects `Mutex`;
+`nospin` remains an explicit option for CPU-constrained or oversubscribed hosts.
+This result settles isolated wall throughput, not aggregate CPU efficiency on those
+hosts.
+
+**Retry predicate:** revisit immediate parking only after a production profile on an
+oversubscribed or CPU-budgeted deployment makes aggregate cycles/CPU the
+discriminator. Require a pinned witnessed-v3+PGO executing ELF, same-invocation
+persistent A/A plus A/B, full watermark/content parity, and a bootstrap median
+wall/cycles CI clearing twice its own null log-margin. Never gate on CV or retry with
+per-sample store construction and thread churn. If the new
+`persistent_commit_liveness_blocker` fires on an otherwise idle worker, first
+reproduce the reported arm/epoch under the existing publication-gate watchdog tests;
+do not infer a production deadlock from RCH stale-progress metadata alone.
+
 ## ⚠ CORRECTION + CONFIRMATION — the e2e win replicates 3/3 (1.44-1.57x) but my "26 images all rc 0" was PARTLY VACUOUS; real count is 68 (bd-bhh0i) - 2026-07-26 (turn 14b, cc)
 
 `bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`

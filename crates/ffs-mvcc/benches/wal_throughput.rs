@@ -43,10 +43,13 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 #[cfg(feature = "bench-instrumentation")]
 use std::process::{Command, Stdio};
-#[cfg(feature = "bench-instrumentation")]
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+#[cfg(feature = "bench-instrumentation")]
+use std::sync::{
+    Barrier,
+    mpsc::{self, Receiver, SyncSender},
+};
 use std::thread;
 #[cfg(feature = "bench-instrumentation")]
 use std::time::Duration;
@@ -106,6 +109,300 @@ struct ActualNullPair {
 }
 
 #[cfg(feature = "bench-instrumentation")]
+struct PersistentArmObservation {
+    elapsed_ns: u64,
+    commits: u64,
+}
+
+#[cfg(feature = "bench-instrumentation")]
+struct PersistentNullPair {
+    lhs: PersistentArmObservation,
+    rhs: PersistentArmObservation,
+    order: &'static str,
+}
+
+#[cfg(feature = "bench-instrumentation")]
+#[derive(Clone, Copy)]
+struct BootstrapMedianCi {
+    median: f64,
+    low: f64,
+    high: f64,
+}
+
+#[cfg(feature = "bench-instrumentation")]
+enum PersistentWorkerCommand {
+    Run { bank: u64, epoch: u64 },
+    Stop,
+}
+
+/// One publication-mode arm whose store and writer threads live for the entire
+/// decision invocation. Construction, thread startup, and teardown are outside
+/// every timed sample; the old harness paid all three inside each observation.
+#[cfg(feature = "bench-instrumentation")]
+struct PersistentCommitArm {
+    label: &'static str,
+    store: Arc<ffs_mvcc::sharded::ShardedMvccStore>,
+    start_gate: Arc<Barrier>,
+    command_txs: Vec<SyncSender<PersistentWorkerCommand>>,
+    result_rx: Receiver<(usize, Duration)>,
+    handles: Vec<thread::JoinHandle<()>>,
+    next_epoch: u64,
+}
+
+#[cfg(feature = "bench-instrumentation")]
+impl PersistentCommitArm {
+    const WRITERS: usize = 8;
+    const OPS_PER_WRITER: u64 = 256;
+    const BLOCK_BANKS: u64 = 8;
+    const BATCHES_PER_OBSERVATION: u64 = 8;
+    const SHARD_COUNT: usize = 16;
+
+    fn new(label: &'static str, mode: ffs_mvcc::sharded::PublicationMode) -> Self {
+        use ffs_mvcc::sharded::ShardedMvccStore;
+
+        let store = Arc::new(ShardedMvccStore::with_publication_mode(
+            Self::SHARD_COUNT,
+            mode,
+        ));
+        let start_gate = Arc::new(Barrier::new(Self::WRITERS + 1));
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut command_txs = Vec::with_capacity(Self::WRITERS);
+        let mut handles = Vec::with_capacity(Self::WRITERS);
+
+        for writer in 0..Self::WRITERS {
+            let (command_tx, command_rx) = mpsc::sync_channel(1);
+            command_txs.push(command_tx);
+            let worker_store = Arc::clone(&store);
+            let worker_gate = Arc::clone(&start_gate);
+            let worker_result_tx = result_tx.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("mvcc-persistent-{writer}"))
+                    .spawn(move || {
+                        persistent_commit_worker(
+                            writer,
+                            &worker_store,
+                            &worker_gate,
+                            &command_rx,
+                            &worker_result_tx,
+                        );
+                    })
+                    .expect("spawn persistent commit worker"),
+            );
+        }
+        drop(result_tx);
+
+        Self {
+            label,
+            store,
+            start_gate,
+            command_txs,
+            result_rx,
+            handles,
+            next_epoch: 0,
+        }
+    }
+
+    fn warm_to_steady_state(&mut self) {
+        for _ in 0..Self::BLOCK_BANKS {
+            black_box(self.run_batch());
+        }
+        assert_eq!(
+            self.store.block_count_versioned(),
+            Self::expected_block_count(),
+            "warmup must populate every reusable block bank"
+        );
+        assert_eq!(
+            self.store.version_count(),
+            Self::expected_block_count(),
+            "warmup pruning must leave one version per block"
+        );
+    }
+
+    fn observe(&mut self) -> PersistentArmObservation {
+        let before = self.store.current_snapshot().high.0;
+        let mut elapsed_ns = 0_u64;
+        for _ in 0..Self::BATCHES_PER_OBSERVATION {
+            elapsed_ns = elapsed_ns.saturating_add(
+                u64::try_from(black_box(self.run_batch()).as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
+        let commits = self.store.current_snapshot().high.0.saturating_sub(before);
+        let expected = Self::commits_per_observation();
+        assert_eq!(
+            commits, expected,
+            "persistent arm retired an unexpected number of commits"
+        );
+        PersistentArmObservation {
+            elapsed_ns,
+            commits,
+        }
+    }
+
+    fn run_batch(&mut self) -> Duration {
+        const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let epoch = self.next_epoch;
+        self.next_epoch = self.next_epoch.saturating_add(1);
+        let bank = epoch % Self::BLOCK_BANKS;
+        let watermark_before = self.store.current_snapshot().high.0;
+        for command_tx in &self.command_txs {
+            command_tx
+                .send(PersistentWorkerCommand::Run { bank, epoch })
+                .expect("persistent commit worker accepts command");
+        }
+        self.start_gate.wait();
+
+        let mut elapsed = Duration::ZERO;
+        let mut seen = vec![false; Self::WRITERS];
+        for received in 0..Self::WRITERS {
+            let (writer, worker_elapsed) = match self.result_rx.recv_timeout(LIVENESS_TIMEOUT) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("persistent commit worker disconnected before reporting")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let missing_writers = seen
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(writer, completed)| {
+                            (!completed).then_some(writer.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":");
+                    let watermark = self.store.current_snapshot().high.0;
+                    println!(
+                        "persistent_commit_liveness_blocker,arm={},epoch={epoch},received={received},missing_writers={missing_writers},watermark_before={watermark_before},watermark_now={watermark},expected_commits={},timeout_ms={},verdict=BLOCKED",
+                        self.label,
+                        Self::OPS_PER_WRITER.saturating_mul(Self::WRITERS as u64),
+                        LIVENESS_TIMEOUT.as_millis(),
+                    );
+                    std::io::stdout()
+                        .flush()
+                        .expect("flush persistent liveness blocker");
+                    // Do not run `Drop`: joining a publisher that has not
+                    // made progress would turn a bounded diagnostic into
+                    // another hang.
+                    std::process::exit(2);
+                }
+            };
+            assert!(!seen[writer], "persistent worker reported twice");
+            seen[writer] = true;
+            elapsed = elapsed.max(worker_elapsed);
+        }
+        assert!(seen.into_iter().all(std::convert::identity));
+
+        // Reusing a finite block bank keeps the steady-state harness bounded.
+        // Pruning is deliberately outside the timed worker interval.
+        self.store.prune_safe();
+        assert_eq!(
+            self.store.version_count(),
+            self.store.block_count_versioned(),
+            "steady-state pruning must leave one version per block"
+        );
+        elapsed
+    }
+
+    fn content_digest(&self) -> (u64, String) {
+        let snapshot = self.store.current_snapshot();
+        let shard_stride =
+            u64::try_from(Self::SHARD_COUNT).expect("benchmark shard count fits u64");
+        let bank_span = Self::OPS_PER_WRITER.saturating_mul(shard_stride);
+        let mut hasher = Sha256::new();
+        for bank in 0..Self::BLOCK_BANKS {
+            for index in 0..Self::OPS_PER_WRITER {
+                for writer in 0..u64::try_from(Self::WRITERS).expect("writers fit u64") {
+                    let block = BlockNumber(
+                        bank.saturating_mul(bank_span)
+                            .saturating_add(index.saturating_mul(shard_stride))
+                            .saturating_add(writer),
+                    );
+                    let bytes = self
+                        .store
+                        .read_visible(block, snapshot)
+                        .expect("every persistent-harness block resolves");
+                    hasher.update(block.0.to_le_bytes());
+                    hasher.update(&bytes);
+                }
+            }
+        }
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+        for byte in digest {
+            write!(&mut hex, "{byte:02x}").expect("format persistent content digest");
+        }
+        (snapshot.high.0, hex)
+    }
+
+    const fn commits_per_observation() -> u64 {
+        Self::OPS_PER_WRITER
+            .saturating_mul(Self::WRITERS as u64)
+            .saturating_mul(Self::BATCHES_PER_OBSERVATION)
+    }
+
+    fn expected_block_count() -> usize {
+        usize::try_from(Self::BLOCK_BANKS)
+            .expect("block-bank count fits usize")
+            .saturating_mul(
+                usize::try_from(Self::OPS_PER_WRITER).expect("operation count fits usize"),
+            )
+            .saturating_mul(Self::WRITERS)
+    }
+}
+
+#[cfg(feature = "bench-instrumentation")]
+impl Drop for PersistentCommitArm {
+    fn drop(&mut self) {
+        for command_tx in &self.command_txs {
+            let _ = command_tx.try_send(PersistentWorkerCommand::Stop);
+        }
+        self.command_txs.clear();
+        for handle in self.handles.drain(..) {
+            handle.join().expect("join persistent commit worker");
+        }
+    }
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn persistent_commit_worker(
+    writer: usize,
+    store: &ffs_mvcc::sharded::ShardedMvccStore,
+    start_gate: &Barrier,
+    command_rx: &Receiver<PersistentWorkerCommand>,
+    result_tx: &mpsc::Sender<(usize, Duration)>,
+) {
+    let writer_u64 = u64::try_from(writer).expect("writer index fits u64");
+    let shard_stride =
+        u64::try_from(PersistentCommitArm::SHARD_COUNT).expect("shard count fits u64");
+    let bank_span = PersistentCommitArm::OPS_PER_WRITER.saturating_mul(shard_stride);
+    while let Ok(command) = command_rx.recv() {
+        let PersistentWorkerCommand::Run { bank, epoch } = command else {
+            break;
+        };
+        start_gate.wait();
+        let started = Instant::now();
+        for index in 0..PersistentCommitArm::OPS_PER_WRITER {
+            let block = BlockNumber(
+                bank.saturating_mul(bank_span)
+                    .saturating_add(index.saturating_mul(shard_stride))
+                    .saturating_add(writer_u64),
+            );
+            let payload_byte = u8::try_from((writer_u64 ^ index) & u64::from(u8::MAX))
+                .expect("masked payload byte fits u8");
+            let mut payload = vec![payload_byte; 4096];
+            payload[..8].copy_from_slice(&epoch.to_le_bytes());
+            payload[8..16].copy_from_slice(&block.0.to_le_bytes());
+            let mut txn = store.begin();
+            txn.stage_write(block, payload);
+            store.commit(txn).expect("persistent worker commit");
+        }
+        result_tx
+            .send((writer, started.elapsed()))
+            .expect("persistent result receiver remains live");
+    }
+}
+
+#[cfg(feature = "bench-instrumentation")]
 fn median(mut values: Vec<f64>) -> f64 {
     assert!(!values.is_empty(), "median requires at least one sample");
     values.sort_by(f64::total_cmp);
@@ -114,6 +411,50 @@ fn median(mut values: Vec<f64>) -> f64 {
         values[midpoint - 1].midpoint(values[midpoint])
     } else {
         values[midpoint]
+    }
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// Deterministic paired bootstrap over log ratios. The gate consumes only this
+/// median confidence interval; CV is neither computed nor consulted.
+#[cfg(feature = "bench-instrumentation")]
+fn bootstrap_median_ci(log_ratios: &[f64]) -> BootstrapMedianCi {
+    const RESAMPLES: usize = 20_000;
+    assert!(
+        !log_ratios.is_empty(),
+        "bootstrap median CI requires paired samples"
+    );
+    let mut state =
+        0xF55F_C1A0_2026_0725_u64 ^ u64::try_from(log_ratios.len()).expect("sample count fits u64");
+    let mut bootstrapped = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut sample = Vec::with_capacity(log_ratios.len());
+        for _ in log_ratios {
+            let draw = splitmix64(&mut state)
+                % u64::try_from(log_ratios.len()).expect("sample count fits u64");
+            let index = usize::try_from(draw).expect("bounded bootstrap index fits usize");
+            sample.push(log_ratios[index]);
+        }
+        bootstrapped.push(median(sample));
+    }
+    bootstrapped.sort_by(f64::total_cmp);
+    let low_index = RESAMPLES.saturating_mul(25) / 1000;
+    let high_index = RESAMPLES
+        .saturating_mul(975)
+        .div_ceil(1000)
+        .saturating_sub(1);
+    BootstrapMedianCi {
+        median: median(log_ratios.to_vec()).exp(),
+        low: bootstrapped[low_index].exp(),
+        high: bootstrapped[high_index].exp(),
     }
 }
 
@@ -593,6 +934,189 @@ fn print_actual_null_summary(writers: usize, phase: &str, pairs: &[ActualNullPai
         rhs_arena.total_wait_time,
         lhs_arena.num_owner_switch,
         rhs_arena.num_owner_switch,
+    );
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn observe_persistent_pair(
+    lhs: &mut PersistentCommitArm,
+    rhs: &mut PersistentCommitArm,
+    lhs_first: bool,
+) -> PersistentNullPair {
+    if lhs_first {
+        PersistentNullPair {
+            lhs: lhs.observe(),
+            rhs: rhs.observe(),
+            order: "AB",
+        }
+    } else {
+        let rhs_observation = rhs.observe();
+        let lhs_observation = lhs.observe();
+        PersistentNullPair {
+            lhs: lhs_observation,
+            rhs: rhs_observation,
+            order: "BA",
+        }
+    }
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn print_persistent_median_ci(phase: &str, pairs: &[PersistentNullPair]) -> BootstrapMedianCi {
+    let log_ratios = pairs
+        .iter()
+        .map(|pair| (pair.lhs.elapsed_ns as f64 / pair.rhs.elapsed_ns as f64).ln())
+        .collect::<Vec<_>>();
+    let summary = bootstrap_median_ci(&log_ratios);
+    let ab_pairs = pairs.iter().filter(|pair| pair.order == "AB").count();
+    let ba_pairs = pairs.len().saturating_sub(ab_pairs);
+    let mut raw_pairs = String::with_capacity(pairs.len().saturating_mul(48));
+    for (index, pair) in pairs.iter().enumerate() {
+        assert_eq!(
+            pair.lhs.commits, pair.rhs.commits,
+            "persistent paired arms retired different commit counts"
+        );
+        if index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{}:{}:{}",
+            pair.order, pair.lhs.elapsed_ns, pair.rhs.elapsed_ns
+        )
+        .expect("format persistent raw pair");
+    }
+    println!(
+        "persistent_commit_pairs,threads=8,phase={phase},pairs={},batches_per_arm={},commits_per_arm={},format=order:lhs_ns:rhs_ns,values={raw_pairs}",
+        pairs.len(),
+        PersistentCommitArm::BATCHES_PER_OBSERVATION,
+        PersistentCommitArm::commits_per_observation(),
+    );
+    println!(
+        "persistent_commit_median_ci,threads=8,phase={phase},pairs={},ab_pairs={ab_pairs},ba_pairs={ba_pairs},lhs_over_rhs_median={:.6},bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6},bootstrap_resamples=20000,gate_basis=bootstrap_median_ci,cv_used=false",
+        pairs.len(),
+        summary.median,
+        summary.low,
+        summary.high,
+    );
+    summary
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn assert_persistent_isomorphism(phase: &str, arms: &[&PersistentCommitArm]) {
+    let (expected_watermark, expected_digest) = arms[0].content_digest();
+    for arm in &arms[1..] {
+        let (watermark, digest) = arm.content_digest();
+        assert_eq!(
+            watermark, expected_watermark,
+            "persistent publication watermark diverged"
+        );
+        assert_eq!(
+            digest, expected_digest,
+            "persistent publication content diverged"
+        );
+    }
+    println!(
+        "persistent_publication_isomorphism,phase={phase},threads=8,arms={},watermark={expected_watermark},blocks={},sha256={expected_digest},result=identical",
+        arms.len(),
+        PersistentCommitArm::expected_block_count(),
+    );
+}
+
+/// The ledgered retry for the spin/no-spin NULL. Unlike the legacy driver, this
+/// creates four stores and 32 workers once, warms every reusable block bank, and
+/// then interleaves its A/A and A/B pairs without timed construction or teardown.
+#[cfg(feature = "bench-instrumentation")]
+fn persistent_spin_decision_only() {
+    use ffs_mvcc::sharded::PublicationMode;
+
+    const PAIRS: usize = 31;
+    let mut null_lhs = PersistentCommitArm::new("null_lhs_wait_free", PublicationMode::WaitFree);
+    let mut null_rhs = PersistentCommitArm::new("null_rhs_wait_free", PublicationMode::WaitFree);
+    let mut spin_lhs = PersistentCommitArm::new("spin_lhs_wait_free", PublicationMode::WaitFree);
+    let mut nospin_rhs = PersistentCommitArm::new(
+        "nospin_rhs_wait_free_no_spin",
+        PublicationMode::WaitFreeNoSpin,
+    );
+    null_lhs.warm_to_steady_state();
+    null_rhs.warm_to_steady_state();
+    spin_lhs.warm_to_steady_state();
+    nospin_rhs.warm_to_steady_state();
+    assert_persistent_isomorphism(
+        "pre_timing",
+        &[&null_lhs, &null_rhs, &spin_lhs, &nospin_rhs],
+    );
+
+    let mut null_pairs = Vec::with_capacity(PAIRS);
+    let mut decision_pairs = Vec::with_capacity(PAIRS);
+    for pair_index in 0..PAIRS {
+        let lhs_first = pair_index % 2 == 0;
+        if lhs_first {
+            null_pairs.push(observe_persistent_pair(&mut null_lhs, &mut null_rhs, true));
+            decision_pairs.push(observe_persistent_pair(
+                &mut spin_lhs,
+                &mut nospin_rhs,
+                true,
+            ));
+        } else {
+            decision_pairs.push(observe_persistent_pair(
+                &mut spin_lhs,
+                &mut nospin_rhs,
+                false,
+            ));
+            null_pairs.push(observe_persistent_pair(&mut null_lhs, &mut null_rhs, false));
+        }
+        println!(
+            "persistent_commit_progress,pair={},pairs_total={PAIRS},null_watermark={},decision_watermark={}",
+            pair_index.saturating_add(1),
+            null_lhs.store.current_snapshot().high.0,
+            spin_lhs.store.current_snapshot().high.0,
+        );
+        std::io::stdout()
+            .flush()
+            .expect("flush persistent pair progress");
+    }
+
+    let null_summary = print_persistent_median_ci("persistent_wait_free_aa", &null_pairs);
+    let decision_summary =
+        print_persistent_median_ci("persistent_spin_vs_nospin_ab", &decision_pairs);
+    assert_persistent_isomorphism(
+        "post_timing",
+        &[&null_lhs, &null_rhs, &spin_lhs, &nospin_rhs],
+    );
+
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let two_x_log_margin_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio < 1.10;
+    let (verdict, reason) = if !admitted {
+        (
+            "BLOCKED_NULL_FLOOR",
+            "aa_bootstrap_ci_envelope_not_below_1.10x",
+        )
+    } else if decision_summary.high < two_x_log_margin_ratio.recip() {
+        ("SPIN_FASTER", "ab_bootstrap_ci_below_two_x_null_log_margin")
+    } else if decision_summary.low > two_x_log_margin_ratio {
+        (
+            "NOSPIN_FASTER",
+            "ab_bootstrap_ci_above_two_x_null_log_margin",
+        )
+    } else {
+        (
+            "UNRESOLVED",
+            "ab_bootstrap_ci_does_not_clear_two_x_null_log_margin",
+        )
+    };
+    println!(
+        "persistent_spin_decision,threads=8,aa_ci_low={:.6},aa_ci_high={:.6},aa_null_floor_ratio={null_floor_ratio:.6},required_two_x_log_margin_ratio={two_x_log_margin_ratio:.6},spin_over_nospin_median={:.6},spin_over_nospin_ci_low={:.6},spin_over_nospin_ci_high={:.6},admitted={admitted},verdict={verdict},reason={reason},gate_basis=bootstrap_median_ci,cv_used=false",
+        null_summary.low,
+        null_summary.high,
+        decision_summary.median,
+        decision_summary.low,
+        decision_summary.high,
     );
 }
 
@@ -2925,6 +3449,10 @@ fn main() {
         }
         print_bench_evidence_metadata();
         print_codegen_isa();
+        if std::env::args().any(|arg| arg == "--persistent-spin-decision-only") {
+            persistent_spin_decision_only();
+            return;
+        }
         assert_publication_mode_isomorphism();
         print_actual_null_control();
         spawn_profile_report();
