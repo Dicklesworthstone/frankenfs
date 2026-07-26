@@ -115,13 +115,28 @@ behaviour-preserving and `e2fsck`-clean.
 
 ## 3. The correction
 
-**What NOT to do: make `target-cpu=x86-64-v3` the global default.** `build-perf.sh`
-already explains why it is opt-in — v3 requires a 2015+ CPU and removes the runtime
-scalar fallback FrankenFS deliberately keeps. Campaign §3b adds the fleet fact: worker
-`ovh-b` **SIGILLs** on AVX2 builds. A global default would trade a reporting bug for a
-crash, and would make every ISA-sensitive bench worker-dependent.
+> **UPDATE 2026-07-25 — the fleet ISA constraint has been lifted.** The orchestrator
+> surveyed `/proc/cpuinfo` on all 12 rch workers: `ovh-b` (Xeon E3-1245 V2, Ivy Bridge
+> 2012) was the **only** one without `avx2`+`fma`; all 11 others have both, and `hz2`
+> has `avx512f`. Rust had to target the fleet's lowest common denominator, so that one
+> 8-core box was pinning every franken benchmark binary to SSE2. `ovh-b` is now out of
+> the `rust` tag — **73 rust slots across 11 AVX2+FMA workers.** The `ovh-b` SIGILL
+> argument below is therefore **obsolete**, and §3.3 is upgraded from "how to reproduce
+> production if you want to" to **"this is how benchmarks should be built from now on."**
+> The *product* argument is untouched — see immediately below.
 
-**What to do instead — make the mismatch unpublishable:**
+**Still true, and unaffected by the fleet change: do not make `target-cpu=x86-64-v3` the
+default for the SHIPPED product build.** `build-perf.sh` explains why it is opt-in — v3
+requires a 2015+ CPU and removes the runtime scalar fallback FrankenFS deliberately
+keeps for older hardware. That is a portability decision about users' machines, not
+about our workers, so lifting the fleet constraint does not touch it.
+
+What *has* changed is the **benchmark** configuration. There is no longer any reason to
+measure at x86-64 baseline: doing so measures a binary nobody ships, on hardware that
+could have run the real one. Benchmarks should now be built with
+`RUSTFLAGS="-C target-cpu=x86-64-v3"`.
+
+**And make the mismatch unpublishable either way:**
 
 1. **Every bench binary self-reports its codegen ISA**, as `ffs-mvcc/benches/wal_throughput.rs`
    now does via `print_codegen_isa()`. One `cfg!(target_feature = ...)` line per binary.
@@ -143,12 +158,36 @@ crash, and would make every ISA-sensitive bench worker-dependent.
 
 ---
 
-## 4. What this does not resolve
+## 4. What this does not resolve — corrected
 
-The *wall-clock* size of the ISA+PGO gap is still unmeasured — the 2026-07-03 evidence
-is instruction counts, and the wall signal was inside the noise. Measuring it is a
-whole-binary A/B (two ELFs, so `paired()` does not apply) requiring same-worker
-execution with ELF-sha confirmation, which needs a measurement window this lane does
-not hold. **Filed, not done.** Retry predicate: on an AVX2-capable pinned worker, build
-baseline and v3 from identical source, confirm the shas differ, and gate on
-wall/cycles — never on instruction count.
+An earlier revision of this document said the wall-clock size of the gap was "still
+unmeasured". **That was wrong, and the correction matters.**
+`docs/NEGATIVE_EVIDENCE.md:128` (bd-b9dug, 2026-07-11) already ran an **interleaved,
+drift-cancelled** A/B of a production-ISA `create-bench` against the default build:
+
+> v3 is **1.18–1.40× faster** in absolute throughput at every thread count
+> (t1 74k→93k, t8 46k→54k), so the benchmark binary **UNDERSTATES production** and the
+> "8.3×@8t" gap is inflated.
+
+Two things follow, and they are exactly the re-statement in §2 arrived at independently
+a fortnight earlier — which is corroboration, not coincidence:
+
+- It confirms **Class B**: the published parallel-metadata-write loss is inflated.
+- It confirms the **Class C** reasoning about contention-shaped levers. The same row
+  reports the *scaling shape* is unchanged (v3 `t8/t1` = **0.58×** vs opt-z **0.62×**,
+  both negative) and concludes *"the contention is real + ISA-independent."* That is
+  direct evidence for the prediction in §2 that the wait-free publication gate's
+  1.70–2.11× is not at risk from the ISA gap.
+
+**What genuinely remains open is narrower than "the wall-clock gap".** That A/B compared
+`v3 + opt-3 + fat-LTO` against **the default `release` profile, which is `opt-level="z"`**
+— so it measures `opt-z → opt-3` *plus* fat-LTO *plus* the ISA, conflated. The
+benchmark profile `release-perf` **already has opt-3 and fat LTO**. So the ISA-only
+delta from `release-perf` to production is **strictly smaller than 1.18–1.40×**, and
+that residual is what is unmeasured.
+
+Retry predicate for the residual: on an AVX2-capable pinned worker, build
+`--profile release-perf` with and without `-C target-cpu=x86-64-v3` from identical
+source, confirm the ELF shas differ (proving the flag reached the compiler), and gate on
+wall/cycles — never on instruction count. With `ovh-b` out of the `rust` tag this is now
+schedulable on any of 11 workers; it was not before.

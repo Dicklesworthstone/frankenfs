@@ -131,8 +131,9 @@ margin of roughly 200×. This is the textbook case the campaign describes.
 
 Retry predicate (satisfied): re-decide on the median-CI gate rather than CV; then build
 wrap-aware production grouping in `commit_transaction` and gate on journal replay +
-crash-injection proof before keeping. **Owner: cod lane** (harness + frontier; this is
-their re-run list). Flagged on the campaign thread.
+crash-injection proof before keeping. **Result: KEEP at `8b228bd8`** after the cod
+lane reran both the source-neutral mechanism and the actual production `Jbd2Writer`
+path under the corrected contract. See §4.4.
 
 ### Rank 3 — `ExtentCache` eviction scan (`NEGATIVE_EVIDENCE.md:512`)
 
@@ -176,14 +177,16 @@ needs an Agent Mail reservation before anyone starts.
 |---|---:|
 | Entries audited | 276 |
 | Void | 219 |
-| Re-run under the corrected harness | 1 (rank 1) |
-| **Re-won** | **1 — 1.70× at 8 threads, decidable at a 2.14× log-margin** |
-| Handed to the cod lane to re-run | 1 (rank 2) |
+| Re-run under the corrected harness | 2 (ranks 1 and 2) |
+| **Re-won** | **2 — rank 1: 1.70× at 8 threads; rank 2: 2.626589× on the production writer path** |
+| Handed to the cod lane to re-run | 0 (rank 2 completed) |
 | Void but superseded — closed, not re-run | 1 (rank 3) |
 
-**Resurrection yield: 1 of 1 re-run entries re-won.** The rank-1 row was void in the
-strongest sense — not "rejected on a bad gate" but **never measured at all**. Its design
-work was already paid for in June; all this turn added was a harness that could decide it.
+**Resurrection yield: 2 of 2 runnable entries re-won.** The rank-1 row was void in the
+strongest sense — not "rejected on a bad gate" but **never measured at all**. Rank 2
+was the complementary failure: a large, real effect rejected solely by the obsolete
+CV gate despite a near-1.0× null. The corrected harness decided both without
+reinterpreting the other 217 void rows as wins.
 
 ### 4.1 Rank 1 re-run — profile attribution
 
@@ -268,6 +271,33 @@ in both arms (524287 / 524287). Exactly the split predicted in §4.1: the mechan
 is removed, the semantic cost is untouched.
 
 Default stays **OFF** until an end-to-end `create-bench` + `e2fsck` gate passes.
+
+### 4.4 Rank 2 re-run — **RE-WON and landed**
+
+The cod lane first reproduced the source-neutral scalar/coalesced mechanism at
+**2.695917×** CI `[2.688833, 2.698551]` against an A/A null of **0.999405×**
+CI `[0.997459, 1.001275]`. It then implemented the capability-gated,
+non-wrapping contiguous-write path in the actual `Jbd2Writer` and reran that
+production path in the same invocation:
+
+| arm | median | 95% CI |
+|---|---:|---:|
+| scalar writer | 4.412596 ms | `[4.384394, 4.471727]` |
+| grouped writer | 1.679416 ms | `[1.663977, 1.692571]` |
+| A/B ratio | **2.626589×** | **`[2.620535, 2.644222]`** |
+| A/A null | **0.999374×** | **`[0.997753, 1.000544]`** |
+
+The executing ELF self-reported
+`5061553cc2591da94df062a99c1de878bfab1769adff6d99030023d94814d300`
+on pinned worker `ovh-a`. The same invocation asserted exact 524,288-byte journal
+output equality. The focused writer, replay, and partial-write crash suite passed
+27/27: an injected partial grouped write returns the original error, does not
+advance the writer head, and leaves no commit block for replay to accept.
+
+Landed as `8b228bd8`. Retry only if a production profile attributes at least 5%
+self-time or material syscall count to wrap-crossing scalar fallback or run
+assembly; require the same executing-ELF, A/A, median-CI, exact-byte, replay, and
+partial-write crash contract.
 
 ---
 
@@ -555,3 +585,52 @@ sound rejections. `—` means the field is absent from the row, which for
 | 274 | `progress/perf-negative-results.md:2567` — Gauntlet Release-Readiness Scorecard | 3.2x | none recorded | — | no | **VALID-MECHANISM** — no A/A null, but refuted on a counted mechanism (instructions/cycles/syscalls/allocs unchanged) that does not need one |
 | 275 | `progress/perf-negative-results.md:3338` — 2026-07-10 — Cold-read WHY: ranked frame table (bd-5koeh follow-up, BlackThrush/cc_ffs) | 1.44x | none recorded | 0.1% | yes | **VALID-MECHANISM** — no A/A null, but refuted on a counted mechanism (instructions/cycles/syscalls/allocs unchanged) that does not need one |
 | 276 | `progress/perf-negative-results.md:4412` — 2026-07-10 — ISA finding + bd-bhh0i doc coverage (no collision) (bd-b9dug, BlackThrush/cc_ffs) | — | 1.21x | — | yes | **VALID-AB** — A/B with a recorded null; effect inside the null |
+
+---
+
+## 6. VOID-ISA — rows whose mechanism was SIMD-shaped, measured on an SSE2 binary
+
+**Added 2026-07-25 after the orchestrator lifted the fleet ISA constraint.** Survey of
+`/proc/cpuinfo` across all 12 rch workers found `ovh-b` (Xeon E3-1245 V2, Ivy Bridge
+2012) was the **only** worker lacking `avx2`+`fma`; all 11 others have both and `hz2`
+has `avx512f`. Rust had to target the fleet's lowest common denominator, so **one
+8-core box pinned every franken benchmark binary to x86-64 baseline SSE2.** `ovh-b` is
+now out of the `rust` tag — 73 rust slots across 11 AVX2+FMA workers.
+
+That creates a new void class. A rejection is **VOID-ISA** when the lever's mechanism
+was vectorization-shaped and the measurement ran on a binary that could not emit AVX2:
+the bench could not have detected the lever, which is this audit's definition of void.
+
+The class is **small and specific**. Most SIMD-adjacent rows in this ledger were
+rejected on grounds that survive the ISA change, and saying otherwise would inflate the
+count — the failure mode §2 warns about. Hand-adjudicated:
+
+| Entry | Mechanism | Verdict under the lifted constraint |
+|---|---|---|
+| `NEGATIVE_EVIDENCE.md:329` — scrub zero-check word→SIMD 64-byte OR-fold | Manual 4×u64 OR-fold vs `chunks_exact(8).all()`; rejected because *"the word-wise `all()` already auto-vectorizes"* and cycles were flat despite 7–13% fewer instructions | ⭐ **VOID-ISA — rank 1.** "Already auto-vectorizes" meant *to 128-bit SSE2*. Under AVX2 both the baseline and the candidate lower differently, and a 64-byte OR-fold is two YMM ops instead of four XMM. Target frame was **12.89% self** on btrfs scrub (16 KiB blocks, ~2 GB scanned) — the largest self-time of any SIMD-shaped row here. The *other* half of the rejection (partly memory-bandwidth-bound) still holds and caps the upside. |
+| `NEGATIVE_EVIDENCE.md:209` — `last_nonzero_len` reverse zero-scan | Refuted by reading it: *"already OR-reduces 32 bytes (4 u64s) per iter — optimal"* | **VOID-ISA (weak).** "Optimal" was a judgement about SSE2 codegen. 32 bytes is one YMM register under AVX2, so the hand-written 4×u64 shape is no longer obviously the right one. Low EV — this is a tail scan, not a hot loop. |
+| `NEGATIVE_EVIDENCE.md:321` — `alloc_extent` max-fusion | Fusion measured **1.14× slower**; root cause *"a bulk collect + a SEPARATE tight max loop AUTO-VECTORIZES, but a manual push-loop with interleaved max defeats that SIMD"* | **NOT void, magnitude only.** The *direction* (fusion defeats reduction-vectorization) is ISA-independent and if anything strengthens under AVX2, because the vectorized loop it defeats gets faster. Do not re-run to reverse it; the recorded 1.14× may understate the cost. |
+| `NEGATIVE_EVIDENCE.md:327` — GF(256) region-multiply `swizzle_dyn` | 2.7–3.1× slower *"at every x86 baseline **incl v2/v3**"* because it will not lower to `PSHUFB` under `forbid(unsafe_code)` | **NOT void — this row already tested v3.** The blocker is codegen lowering plus the workspace `unsafe_code = "forbid"` policy, not ISA availability. Unchanged. |
+| `NEGATIVE_EVIDENCE.md:356`, `:2618` — crc32c hardware path | `crc32c` crate **runtime-detects** SSE4.2 | **NOT void.** Runtime dispatch was already reaching the hardware instruction regardless of compile-time flags. (Note the bench binary reported `compile_sse4_2=false`, so what was lost is *inlining* across the crc boundary, not the instruction.) |
+| `NEGATIVE_EVIDENCE.md:330`, `:403` — byte→word hole-detect / scrub validator elsewhere | Rejected as COLD, and on a ~1.05× Amdahl ceiling | **NOT void.** Amdahl ceilings and cold-path arguments are ISA-independent. |
+
+### A second-order effect worth stating
+
+Several **landed wins** were measured against an SSE2 baseline — the SWAR name-compare,
+SWAR has-zero path-validate, and the word-at-a-time `root_ns_hash` (7.14×). Under AVX2
+the *scalar baselines they beat* may auto-vectorize better, so **their published win
+magnitudes may shrink**. Nothing is withdrawn (they are still wins, and the underlying
+work is still removed), but any of these ratios re-quoted at v3 should be re-measured
+rather than carried forward. This is the mirror image of the Class-A/B correction in
+`docs/BD_B9DUG_ISA_CORRECTION.md`: an ISA change moves the *baseline*, so it moves both
+the losses and the wins measured against it.
+
+### The forward-looking consequence, which is larger than the backlog
+
+With 11 AVX2+FMA workers there is no longer any reason to benchmark at x86-64 baseline.
+**Benchmark builds should now carry `RUSTFLAGS="-C target-cpu=x86-64-v3"` so the
+measured binary matches what `scripts/build-perf.sh` ships**, and the `codegen_isa`
+admissibility line (§3 of the bd-b9dug correction) becomes the check that it actually
+did. Every ratio measured from here should be a ratio from the shipped configuration —
+which is the whole point of bd-b9dug.
+
