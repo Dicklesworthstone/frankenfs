@@ -177,9 +177,13 @@ needs an Agent Mail reservation before anyone starts.
 | Entries audited | 276 |
 | Void | 219 |
 | Re-run under the corrected harness | 1 (rank 1) |
-| Re-won | *see §4.1* |
+| **Re-won** | **1 — 1.70× at 8 threads, decidable at a 2.14× log-margin** |
 | Handed to the cod lane to re-run | 1 (rank 2) |
 | Void but superseded — closed, not re-run | 1 (rank 3) |
+
+**Resurrection yield: 1 of 1 re-run entries re-won.** The rank-1 row was void in the
+strongest sense — not "rejected on a bad gate" but **never measured at all**. Its design
+work was already paid for in June; all this turn added was a harness that could decide it.
 
 ### 4.1 Rank 1 re-run — profile attribution
 
@@ -232,7 +236,30 @@ block's resolved bytes at 1/2/4/8 writers.
 `wal_throughput.rs`, so every `write_all` call failed `E0599`. The repo's §2-contract
 harness was unbuildable. Fixed (`use std::fmt::Write as FmtWrite`).
 
-*Result rows are appended below as they land.*
+### 4.3 Rank 1 re-run — result: **RE-WON**
+
+Full evidence in `docs/progress/perf-negative-results.md` (2026-07-25, turn 12). Binary
+SHA-256 `516342ec9754db9fe37edcbf0944340e2875f6cb67dd867fa43d4338257fbcac`, worker
+`vmi1227854`, 31 interleaved pairs per phase.
+
+Behavior proven **before timing**: identical watermark and identical SHA-256 over every
+resolved block at 1/2/4/8 writers, both modes.
+
+Decision arm (unprofiled production commit path):
+
+| threads | A/A null | A/A floor | A/B | verdict |
+|--------:|---------:|----------:|----:|---|
+| 1 | 1.0358 | 1.3970 | 0.9766 | inside null |
+| 2 | 1.0076 | 1.2628 | 1.1525 | inside null |
+| 4 | 1.0204 | 1.2666 | 1.3675 | outside floor, below the 2× margin — not claimed |
+| 8 | 0.9839 | 1.2811 | **1.7004** | **decidable, 2.14× log-margin** |
+
+Mechanism, not just wall time — publication **mutex** wait p99 collapses
+32767 ns → **511 ns** at 8 threads (64×) while the **ordered-prefix** wait is identical
+in both arms (524287 / 524287). Exactly the split predicted in §4.1: the mechanism cost
+is removed, the semantic cost is untouched.
+
+Default stays **OFF** until an end-to-end `create-bench` + `e2fsck` gate passes.
 
 ---
 

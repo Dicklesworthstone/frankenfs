@@ -13,6 +13,135 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## ⭐⭐ bd-bhh0i WIN — wait-free ordered publication: 1.70x at 8 threads, publication-lock wait collapses 64x (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12, cc/STRUCTURAL, MEASURED KEEP behind a flag)
+
+Status: KEEP behind `FFS_MVCC_WAITFREE_PUBLISH` (default OFF = byte-identical to
+the pre-lever binary). This is a **ledger resurrection**: the lever was
+implemented, correctness-tested, and NEVER MEASURED on 2026-06-29
+(`docs/NEGATIVE_EVIDENCE.md:3491`), then shelved on a branch/stash that no longer
+exists. `docs/LEDGER_RESURRECTION.md` ranks it #1 of 276 audited REJECT rows.
+
+LEVER (one): replace `CommitPublicationGate`'s global `Mutex<BTreeSet<u64>>` +
+`Condvar` ordered-publication path with a wait-free power-of-two ring of ready
+sequences plus a CAS walk of the contiguous prefix. The committer stores its own
+sequence into `ring[seq & MASK]`, drains the prefix with a CAS loop, and only
+parks on the `Condvar` if a predecessor has not published after a bounded spin.
+The mutex survives solely as the parking path.
+
+PROFILE-FIRST ATTRIBUTION (real path, not a synthetic model). bd-bhh0i's
+2026-07-10 `CommitLockProfile` characterization of production
+`ShardedMvccStore::commit`: publication mutex wait p99 **127 / 2047 / 32767 /
+131071 ns** at 1/2/4/8 threads against a shard wait p99 of **255 / 255 / 511 /
+511 ns** — the gate mutex grows **1000x** from 1t to 8t and reaches **131 us**,
+a **256x** ratio over the shard locks. Same-invocation `perf` on the decision
+binary put `publish_with_probe` at **1.89% self** (`verified_nonzero=true`);
+an earlier mutex-only run put it at **5.85% self**. Self-time UNDERSTATES this
+frame — time parked in a futex accrues no CPU samples — so the A/B wall ratio,
+not an Amdahl bound on 5.85%, is the measure.
+
+LEDGER GATE PASSED. `NEGATIVE_EVIDENCE.md:85` closed the publication **atomic
+store shape** family (prefix-batching measured 0.999x, correctly rejected) and
+its own retry text names the residual: *"the gate already holds a BTreeSet
+removal loop whose ordered-tree work dominates these atomic accesses... do not
+retry unless a profile attributes material self-time specifically to the
+per-entry atomic load/store rather than the publication mutex/tree work."* This
+lever removes the mutex and the tree — the thing that row names as dominant —
+not the atomic shapes it closed.
+
+BEHAVIOR PROOF, BEFORE TIMING. `assert_publication_mode_isomorphism` runs in the
+same binary ahead of every timed arm: a deterministic multi-writer workload
+(payload derived from block and index, so the correct final content is fixed and
+interleaving-independent) commits under BOTH modes, then every block is resolved
+at the final watermark and hashed in block order.
+
+| threads | watermark | sha256 of all resolved blocks | result |
+|--------:|----------:|-------------------------------|--------|
+| 1 | 256  | `ae6bc48bcdee96b3...` | identical |
+| 2 | 512  | `84cd5935a51b74a8...` | identical |
+| 4 | 1024 | `f4ae906dcc619b15...` | identical |
+| 8 | 2048 | `638052fc547a163f...` | identical |
+
+Ordering preserved: the watermark advances only over a contiguous prefix in both
+modes (`commit_publication_gate_wait_free_advances_only_over_contiguous_prefix`).
+Tie-breaking / FP / RNG: N/A.
+
+A/B + A/A NULL, SAME BINARY, SAME INVOCATION, ONE PINNED WORKER. Binary SHA-256
+`516342ec9754db9fe37edcbf0944340e2875f6cb67dd867fa43d4338257fbcac`, worker
+`vmi1227854`, `--profile release-perf --features bench-instrumentation`. 31
+interleaved pairs per phase, order alternating per pair, statistic = median of
+per-round log-ratios; floor = `exp(|median| + p90|deviation|)`. Both modes are a
+per-STORE setting, so both arms run from ONE ELF and codegen cannot differ.
+
+Decision arm (unprofiled = the production commit path, no instrumentation):
+
+| threads | A/A null | A/A floor | A/B (mutex/wait-free) | log-margin vs floor | verdict |
+|--------:|---------:|----------:|----------------------:|--------------------:|---------|
+| 1 | 1.0358 | 1.3970 | 0.9766 | — | inside null (no convoy at 1t) |
+| 2 | 1.0076 | 1.2628 | 1.1525 | 0.61x | inside null |
+| 4 | 1.0204 | 1.2666 | 1.3675 | 1.32x | outside floor, BELOW the 2x margin — not claimed |
+| 8 | 0.9839 | 1.2811 | **1.7004** | **2.14x** | **DECIDABLE WIN** |
+
+Profiled arm (six `Instant::now()` probes per commit, paid by both arms): 1t
+0.9971, 2t 1.0877, 4t 1.5657, 8t **2.2433** vs an A/A floor of 1.3233 (2.9x
+log-margin). The probes inflate the mutex arm more because they cluster on the
+gate, so **1.70x is the claim** and 2.24x is the instrumented upper reading.
+
+MECHANISM PROOF (this is the part that makes it a lever and not a wall-time
+story). Per-phase p99 from the profiled arms, mutex arm -> wait-free arm:
+
+| threads | publication mutex wait p99 | ordered-prefix wait p99 |
+|--------:|---------------------------:|------------------------:|
+| 1 | 63 -> 63 ns | 0 -> 0 |
+| 2 | 1023 -> **63 ns** | 131071 -> 131071 (identical) |
+| 4 | 16383 -> **255 ns** | 262143 -> 262143 (identical) |
+| 8 | 32767 -> **511 ns** (**64x collapse**) | 524287 -> 524287 (identical) |
+
+The lock wait collapses 64x at 8 threads while the ordered-prefix wait is
+byte-for-byte unchanged. That is the designed split: the MECHANISM cost (queue on
+one global lock, insert into a BTreeSet, `notify_all` a thundering herd) is
+removed; the SEMANTIC cost (a snapshot must see a gap-free prefix, so a commit
+may not publish before its predecessors) is preserved exactly. Removing the
+semantic half would change visibility semantics and is a different, much larger
+proof obligation — NOT attempted here.
+
+HONEST SCOPE. (1) 1t/2t are inside the null and no gain is claimed there — the
+convoy does not exist without contention, which is itself confirmation of the
+mechanism. (2) 4t is directionally positive but below the campaign's 2x
+median-CI margin; not claimed. (3) The arm includes thread spawn/join per batch,
+which dilutes the ratio — the true per-commit effect is larger than 1.70x. (4)
+This is the ffs-mvcc commit primitive; it has NOT yet been measured end-to-end on
+`create-bench` + `e2fsck`, so the default stays OFF pending that gate.
+
+CODEGEN NOTE (bd-b9dug, cod lane): `codegen_isa,compile_sse2=true,
+compile_sse4_2=false,compile_avx2=false,runtime_avx2=true` — the `release-perf`
+bench binary is x86-64 baseline while the worker supports AVX2. Confirms the
+campaign section 3b ISA mismatch on the exact binary these ratios come from.
+
+GATES: `cargo test -p ffs-mvcc --lib` **497 passed / 0 failed** (495 before, plus
+two new gate tests: `..._wait_free_matches_mutex_under_shuffled_publish`, 8
+threads x 2000 shuffled publishes under both modes with identical final
+watermark, no buffered remnants, no leaked waiters; and
+`..._wait_free_advances_only_over_contiguous_prefix`). `cargo check -p ffs-mvcc
+--features bench-instrumentation --benches` exit 0. `cargo clippy -p ffs-mvcc
+--all-targets --features bench-instrumentation -- -D warnings`: **zero
+diagnostics in `crates/ffs-mvcc`**; the 6 errors are pre-existing in
+`crates/ffs-ondisk` (`ext4.rs` similar_names x2, `crc_incremental.rs`
+cast_possible_truncation / needless_range_loop / large_stack_arrays x2) and are
+the campaign section 3c nightly-clippy drift, untouched by this change.
+
+PREREQUISITE FIXED FIRST: `--features bench-instrumentation` did NOT compile on
+HEAD — `std::fmt::Write` and `std::io::Write` were both imported unaliased in
+`crates/ffs-mvcc/benches/wal_throughput.rs`, so every `write_all` failed E0599.
+This repo's own section-2-contract harness (self-reported ELF sha, interleaved
+A/A pairs, median-of-ratios, per-phase publication p99s) was unbuildable.
+
+NEXT (in order): (1) end-to-end `FFS_BHH0I_SHARDED=1 FFS_MVCC_WAITFREE_PUBLISH=1
+create-bench <2GiB/16-group> --count 40000 --threads {1,4,8}` vs the same binary
+with the flag off, gated on e2fsck rc0 and exact file parity; (2) only if that
+holds, propose flipping the default. Retry predicate if a future run disagrees:
+re-decide only on a same-worker, same-ELF interleaved A/A + A/B where the 8-thread
+A/A floor is below 1.30x and the candidate clears it by a 2x log-margin.
+
 ## bd-bhh0i RELEASE-PERF A/B — the honest number: ~2.1x convoy ELIMINATION, NOT the aspirational 3.7x; scaling caps at 4t (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 11, ⭐ MEASURED)
 
 Status: definitive measurement (release-perf, e2fsck-validated). The bd-bhh0i

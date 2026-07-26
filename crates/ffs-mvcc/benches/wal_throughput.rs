@@ -31,8 +31,10 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+// Aliased: `std::io::Write` below owns the bare name, and importing both traits
+// unaliased makes the whole `bench-instrumentation` build fail to compile.
 #[cfg(feature = "bench-instrumentation")]
-use std::fmt::Write;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::hint::black_box;
 #[cfg(feature = "bench-instrumentation")]
@@ -241,12 +243,13 @@ fn print_codegen_isa() {
 fn run_actual_commit_arm(
     writers: usize,
     profiled: bool,
+    mode: ffs_mvcc::sharded::PublicationMode,
 ) -> (Duration, ffs_mvcc::sharded::CommitLockProfile, u64) {
     use ffs_mvcc::sharded::{CommitLockProfile, ShardedMvccStore};
     const OPS: u64 = 256;
     let shard_count = 16_usize;
     let shard_stride = u64::try_from(shard_count).expect("benchmark shard count must fit u64");
-    let store = Arc::new(ShardedMvccStore::new(shard_count));
+    let store = Arc::new(ShardedMvccStore::with_publication_mode(shard_count, mode));
     let start_gate = Arc::new(Barrier::new(writers));
     let mut handles = Vec::with_capacity(writers);
     for writer in 0..writers {
@@ -285,15 +288,22 @@ fn run_actual_commit_arm(
 }
 
 #[cfg(feature = "bench-instrumentation")]
-fn observe_actual_commit_arm(writers: usize) -> ActualArmObservation {
+fn observe_actual_commit_arm(
+    writers: usize,
+    mode: ffs_mvcc::sharded::PublicationMode,
+    profiled: bool,
+) -> ActualArmObservation {
     const BATCHES_PER_ARM: usize = 16;
     let before = arena_counters();
     let mut elapsed_ns = 0_u64;
     let mut profile = ffs_mvcc::sharded::CommitLockProfile::default();
     let mut commits = 0_u64;
     for _ in 0..BATCHES_PER_ARM {
-        let (elapsed, batch_profile, batch_commits) =
-            black_box(run_actual_commit_arm(black_box(writers), black_box(true)));
+        let (elapsed, batch_profile, batch_commits) = black_box(run_actual_commit_arm(
+            black_box(writers),
+            black_box(profiled),
+            black_box(mode),
+        ));
         elapsed_ns =
             elapsed_ns.saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         profile.merge(&batch_profile);
@@ -308,37 +318,185 @@ fn observe_actual_commit_arm(writers: usize) -> ActualArmObservation {
     }
 }
 
+/// Commit a deterministic multi-writer workload under `mode` and return the
+/// final publication watermark plus a SHA-256 over every block's resolved bytes
+/// at that watermark, in block order.
+///
+/// Each block is written by exactly one writer with a payload derived from
+/// `(writer, index)`, so the correct final content is fixed and independent of
+/// interleaving — any divergence is a real publication-visibility defect, not a
+/// benign scheduling difference.
+#[cfg(feature = "bench-instrumentation")]
+fn publication_mode_content_digest(
+    mode: ffs_mvcc::sharded::PublicationMode,
+    writers: usize,
+) -> (u64, String) {
+    use ffs_mvcc::sharded::ShardedMvccStore;
+    const OPS: u64 = 256;
+    const BLOCK_LEN: usize = 4096;
+    let shard_count = 16_usize;
+    let shard_stride = u64::try_from(shard_count).expect("shard count fits u64");
+    let store = Arc::new(ShardedMvccStore::with_publication_mode(shard_count, mode));
+    let start_gate = Arc::new(Barrier::new(writers));
+    let mut handles = Vec::with_capacity(writers);
+    for writer in 0..writers {
+        let writer = u64::try_from(writer).expect("writer index fits u64");
+        let store = Arc::clone(&store);
+        let start_gate = Arc::clone(&start_gate);
+        handles.push(thread::spawn(move || {
+            start_gate.wait();
+            for i in 0..OPS {
+                let block = BlockNumber(i.saturating_mul(shard_stride).saturating_add(writer));
+                let mut payload = vec![0_u8; BLOCK_LEN];
+                for (offset, byte) in payload.iter_mut().enumerate() {
+                    *byte = (block.0 ^ (offset as u64).rotate_left(3) ^ i) as u8;
+                }
+                let mut txn = store.begin();
+                txn.stage_write(block, payload);
+                store.commit(txn).expect("identity-proof commit");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("identity-proof writer");
+    }
+
+    let snapshot = store.current_snapshot();
+    let mut hasher = Sha256::new();
+    for i in 0..OPS {
+        for writer in 0..u64::try_from(writers).expect("writers fits u64") {
+            let block = BlockNumber(i.saturating_mul(shard_stride).saturating_add(writer));
+            let bytes = store
+                .read_visible(block, snapshot)
+                .expect("every committed block resolves at the final watermark");
+            hasher.update(block.0.to_le_bytes());
+            hasher.update(&bytes);
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("format digest");
+    }
+    (snapshot.high.0, hex)
+}
+
+/// Behavior gate, run BEFORE any timing: the two publication modes must produce
+/// an identical final watermark and identical resolved bytes for every block.
+#[cfg(feature = "bench-instrumentation")]
+fn assert_publication_mode_isomorphism() {
+    use ffs_mvcc::sharded::PublicationMode;
+    for writers in [1_usize, 2, 4, 8] {
+        let (mutex_high, mutex_digest) =
+            publication_mode_content_digest(PublicationMode::Mutex, writers);
+        let (wait_free_high, wait_free_digest) =
+            publication_mode_content_digest(PublicationMode::WaitFree, writers);
+        assert_eq!(
+            mutex_high, wait_free_high,
+            "publication watermark diverged at {writers} writers"
+        );
+        assert_eq!(
+            mutex_digest, wait_free_digest,
+            "resolved block content diverged at {writers} writers"
+        );
+        println!(
+            "publication_mode_isomorphism,threads={writers},watermark={mutex_high},sha256={mutex_digest},result=identical"
+        );
+    }
+}
+
 #[cfg(feature = "bench-instrumentation")]
 fn print_actual_null_control() {
-    const PAIRS: usize = 31;
+    use ffs_mvcc::sharded::PublicationMode;
+    // A/A on the production gate, then the A/B against the wait-free gate, both
+    // from THIS binary (see `bench_evidence,binary_sha256`) so codegen cannot
+    // differ between arms. Campaign 2026-07-25 section 2.2: print both, always.
+    // Profiled arms: per-phase publication p99s (attribution). The six
+    // `Instant::now()` probes per commit are paid by BOTH arms, so they cancel
+    // in the ratio but dilute its magnitude — the unprofiled pass below is the
+    // decision measurement.
     for writers in [1_usize, 2, 4, 8] {
-        let mut pairs = Vec::with_capacity(PAIRS);
-        for pair_index in 0..PAIRS {
-            let (lhs, rhs, order) = if pair_index % 2 == 0 {
-                (
-                    observe_actual_commit_arm(writers),
-                    observe_actual_commit_arm(writers),
-                    "AB",
-                )
-            } else {
-                let rhs = observe_actual_commit_arm(writers);
-                let lhs = observe_actual_commit_arm(writers);
-                (lhs, rhs, "BA")
-            };
+        run_paired_arms(
+            writers,
+            "profiled_aa",
+            PublicationMode::Mutex,
+            PublicationMode::Mutex,
+            true,
+        );
+        run_paired_arms(
+            writers,
+            "profiled_publication_gate_ab",
+            PublicationMode::Mutex,
+            PublicationMode::WaitFree,
+            true,
+        );
+    }
+    // Unprofiled arms: the production commit path with no instrumentation. A/A
+    // null first, then the A/B, at every thread count.
+    for writers in [1_usize, 2, 4, 8] {
+        run_paired_arms(
+            writers,
+            "unprofiled_aa",
+            PublicationMode::Mutex,
+            PublicationMode::Mutex,
+            false,
+        );
+        run_paired_arms(
+            writers,
+            "unprofiled_publication_gate_ab",
+            PublicationMode::Mutex,
+            PublicationMode::WaitFree,
+            false,
+        );
+    }
+}
+
+/// Interleave two arms inside one round, alternating which runs first, and
+/// report the median of per-round ratios. With both modes equal this is the A/A
+/// null floor; with `rhs` set to the candidate it is the decision A/B.
+#[cfg(feature = "bench-instrumentation")]
+fn run_paired_arms(
+    writers: usize,
+    phase: &str,
+    lhs_mode: ffs_mvcc::sharded::PublicationMode,
+    rhs_mode: ffs_mvcc::sharded::PublicationMode,
+    profiled: bool,
+) {
+    const PAIRS: usize = 31;
+    let mut pairs = Vec::with_capacity(PAIRS);
+    for pair_index in 0..PAIRS {
+        let (lhs, rhs, order) = if pair_index % 2 == 0 {
+            (
+                observe_actual_commit_arm(writers, lhs_mode, profiled),
+                observe_actual_commit_arm(writers, rhs_mode, profiled),
+                "AB",
+            )
+        } else {
+            let rhs = observe_actual_commit_arm(writers, rhs_mode, profiled);
+            let lhs = observe_actual_commit_arm(writers, lhs_mode, profiled);
+            (lhs, rhs, "BA")
+        };
+        if profiled {
             let lhs_shard_wait = lhs.profile.shard_wait();
             let rhs_shard_wait = rhs.profile.shard_wait();
             assert_eq!(lhs_shard_wait.samples, lhs.commits);
             assert_eq!(lhs.profile.publication_total().samples, lhs.commits);
             assert_eq!(rhs_shard_wait.samples, rhs.commits);
             assert_eq!(rhs.profile.publication_total().samples, rhs.commits);
-            pairs.push(ActualNullPair { lhs, rhs, order });
         }
-        print_actual_null_summary(writers, &pairs);
+        // Behavior gate: both gates must retire exactly the same number of
+        // commits in the same workload, or the ratio below is meaningless.
+        assert_eq!(
+            lhs.commits, rhs.commits,
+            "arms retired different commit counts at {writers} writers"
+        );
+        pairs.push(ActualNullPair { lhs, rhs, order });
     }
+    print_actual_null_summary(writers, phase, &pairs);
 }
 
 #[cfg(feature = "bench-instrumentation")]
-fn print_actual_null_summary(writers: usize, pairs: &[ActualNullPair]) {
+fn print_actual_null_summary(writers: usize, phase: &str, pairs: &[ActualNullPair]) {
     let lhs_elapsed = pairs
         .iter()
         .map(|pair| pair.lhs.elapsed_ns as f64)
@@ -381,10 +539,10 @@ fn print_actual_null_summary(writers: usize, pairs: &[ActualNullPair]) {
         .expect("format raw A/A pair");
     }
     println!(
-        "actual_commit_null_pairs,threads={writers},phase=profiled_aa,batches_per_arm=16,format=order:lhs_ns:rhs_ns,values={raw_pairs}"
+        "actual_commit_null_pairs,threads={writers},phase={phase},batches_per_arm=16,format=order:lhs_ns:rhs_ns,values={raw_pairs}"
     );
     println!(
-        "actual_commit_null_summary,threads={writers},phase=profiled_aa,pairs={},batches_per_arm=16,ab_pairs={ab_pairs},ba_pairs={ba_pairs},lhs_median_ms={:.6},rhs_median_ms={:.6},lhs_cv_pct={:.3},rhs_cv_pct={:.3},null_median_ratio={:.6},null_spread_p90_ratio={:.6},null_floor_ratio={:.6},lhs_shard_wait_p99_ns={},rhs_shard_wait_p99_ns={},lhs_shard_hold_p99_ns={},rhs_shard_hold_p99_ns={},lhs_publish_wait_p99_ns={},rhs_publish_wait_p99_ns={},lhs_publish_hold_p99_ns={},rhs_publish_hold_p99_ns={},lhs_prefix_wait_p99_ns={},rhs_prefix_wait_p99_ns={},lhs_arena_num_ops={},rhs_arena_num_ops={},lhs_arena_spin_acq={},rhs_arena_spin_acq={},lhs_arena_num_wait={},rhs_arena_num_wait={},lhs_arena_wait_ns={},rhs_arena_wait_ns={},lhs_arena_owner_switch={},rhs_arena_owner_switch={},decomposition_gate=not_applicable",
+        "actual_commit_null_summary,threads={writers},phase={phase},pairs={},batches_per_arm=16,ab_pairs={ab_pairs},ba_pairs={ba_pairs},lhs_median_ms={:.6},rhs_median_ms={:.6},lhs_cv_pct={:.3},rhs_cv_pct={:.3},null_median_ratio={:.6},null_spread_p90_ratio={:.6},null_floor_ratio={:.6},lhs_shard_wait_p99_ns={},rhs_shard_wait_p99_ns={},lhs_shard_hold_p99_ns={},rhs_shard_hold_p99_ns={},lhs_publish_wait_p99_ns={},rhs_publish_wait_p99_ns={},lhs_publish_hold_p99_ns={},rhs_publish_hold_p99_ns={},lhs_prefix_wait_p99_ns={},rhs_prefix_wait_p99_ns={},lhs_arena_num_ops={},rhs_arena_num_ops={},lhs_arena_spin_acq={},rhs_arena_spin_acq={},lhs_arena_num_wait={},rhs_arena_num_wait={},lhs_arena_wait_ns={},rhs_arena_wait_ns={},lhs_arena_owner_switch={},rhs_arena_owner_switch={},decomposition_gate=not_applicable",
         pairs.len(),
         median(lhs_elapsed.clone()) / 1e6,
         median(rhs_elapsed.clone()) / 1e6,
@@ -418,8 +576,11 @@ fn print_actual_null_summary(writers: usize, pairs: &[ActualNullPair]) {
 
 #[cfg(feature = "bench-instrumentation")]
 fn profile_only() {
-    let _ = run_actual_commit_arm(8, false);
-    let _ = run_actual_commit_arm(8, true);
+    use ffs_mvcc::sharded::PublicationMode;
+    let _ = run_actual_commit_arm(8, false, PublicationMode::Mutex);
+    let _ = run_actual_commit_arm(8, true, PublicationMode::Mutex);
+    let _ = run_actual_commit_arm(8, false, PublicationMode::WaitFree);
+    let _ = run_actual_commit_arm(8, true, PublicationMode::WaitFree);
 }
 
 #[cfg(feature = "bench-instrumentation")]
@@ -2656,6 +2817,7 @@ fn bench_bhh0i_actual_contention(c: &mut Criterion) {
     #[cfg(feature = "bench-instrumentation")]
     {
         let mut group = c.benchmark_group("bd_bhh0i_actual_commit");
+        let mode = ffs_mvcc::sharded::PublicationMode::Mutex;
         for writers in [1_usize, 2, 4, 8] {
             group.bench_function(
                 BenchmarkId::new("probe_overhead_pair_combined_no_ratio", writers),
@@ -2665,11 +2827,11 @@ fn bench_bhh0i_actual_contention(c: &mut Criterion) {
                         let start = Instant::now();
                         for round in 0..rounds {
                             if round % 2 == 0 {
-                                black_box(run_actual_commit_arm(black_box(writers), false));
-                                black_box(run_actual_commit_arm(black_box(writers), true));
+                                black_box(run_actual_commit_arm(black_box(writers), false, mode));
+                                black_box(run_actual_commit_arm(black_box(writers), true, mode));
                             } else {
-                                black_box(run_actual_commit_arm(black_box(writers), true));
-                                black_box(run_actual_commit_arm(black_box(writers), false));
+                                black_box(run_actual_commit_arm(black_box(writers), true, mode));
+                                black_box(run_actual_commit_arm(black_box(writers), false, mode));
                             }
                         }
                         let elapsed = start.elapsed();
@@ -2718,6 +2880,7 @@ fn main() {
         }
         print_bench_evidence_metadata();
         print_codegen_isa();
+        assert_publication_mode_isomorphism();
         print_actual_null_control();
         spawn_profile_report();
     }
