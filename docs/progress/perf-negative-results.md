@@ -13,6 +13,64 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## bd-bhh0i wait-free gate: REPLICATED on a second binary (1.88x @8t) + an HONEST CPU caveat — the spin trades CPU for wall (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12b, cc)
+
+REPLICATION. A second, independently built binary (SHA-256
+`bf92caee472d944150ced8410cda8a7cdc658e8033e54ead52579f64a71c9f2f`, same pinned
+worker `vmi1227854`) reproduced the win. Unprofiled decision arm:
+
+| threads | A/A null | A/A floor | A/B run 1 | A/B run 2 |
+|--------:|---------:|----------:|----------:|----------:|
+| 1 | 1.0531 | 1.5026 | 0.9766 | 1.0072 |
+| 2 | 0.9915 | 1.3564 | 1.1525 | 1.0890 |
+| 4 | 0.9347 | 1.4622 | 1.3675 | 1.4087 |
+| 8 | 0.9976 | 1.2589 | **1.7004** | **1.8841** |
+
+Run 2's 8-thread A/B clears its own A/A floor by a **2.75x log-margin**. Two
+independent ELFs agree on the shape (nothing at 1t/2t, directional at 4t,
+decidable at 8t). **The conservative 1.70x remains the claim**; the range across
+both runs is 1.70-1.88x.
+
+⚠ HONEST CAVEAT — THE SPIN MOVES CPU, IT DOES NOT ELIMINATE IT. Profiling the
+POST-lever path (wait-free only, 8 writers, same invocation) put
+`CommitPublicationGate::publish_with_probe` at **16.33% self**, against **5.85%**
+for the mutex gate on the same workload. Wall time fell ~1.8x while CPU in that
+frame roughly TRIPLED. Mechanism: `PUBLICATION_SPIN_ROUNDS = 64` re-drains before
+parking, and a spin accrues CPU samples where a futex wait accrues none. So the
+part that genuinely VANISHED is the mutex queueing (publication mutex wait p99
+32767 -> 511 ns); the waiting itself was converted from blocking into spinning.
+
+This matters beyond bookkeeping. This repo has already ledgered the failure mode:
+"spin-wait is CPU burned while other threads block on the device... Projection
+1.12x-1.85x. Measurement 1.00x" (cold-read lane). On a host where FrankenFS shares
+cores with the workload, a 16% self-time spin can be a NET LOSS even though the
+isolated A/B shows a wall win. The 1.70x is measured on 8 writers with cores to
+spare; it is NOT a claim about an oversubscribed host.
+
+POST-LEVER FRONTIER (wait-free, 8 writers, top self-time frames):
+`publish_with_probe` **16.33%**; `_rjem_je_arena_ptr_array_flush` 3.36%;
+`drop_glue::<HashMap<...>>` 2.89%; thread-start 2.75%;
+`parking_lot_core` TLS destroy 1.78%; `_rjem_je_edata_heap_remove` 1.77%;
+`extent_recycle` 1.73%; `preflight_fcw_locked` 1.49%;
+`Transaction::insert_staged_write` 1.34%; `commit_policy` 1.27%;
+`commit_with_probe` 1.01%; `lock_shards` 0.96%. Note the allocator cluster
+(jemalloc arena flush / heap remove / extent recycle ~6.9% combined) is now the
+second-largest term — per-batch store construction and teardown, an artifact of
+this harness rather than of production, so it is NOT a production lever.
+
+NEXT LEVER (attributed, wired, not yet measured): added
+`PublicationMode::WaitFreeNoSpin` so the spin can be A/B'd against no-spin inside
+ONE binary via the same pairing driver
+(`unprofiled_spin_vs_nospin_ab` phase, `FFS_MVCC_WAITFREE_PUBLISH=nospin`). Three
+outcomes and what each means: (a) no-spin is neutral -> DELETE the spin, keep the
+wall win and give back the 16% CPU; (b) no-spin is slower -> the spin is earning
+its CPU on this workload, keep it and document the oversubscription caveat as a
+standing risk; (c) no-spin is FASTER -> the spin is actively hurting and the
+default should be no-spin. Retry predicate: decide only on a same-worker, same-ELF
+interleaved A/A + A/B where the 8-thread A/A floor is below 1.30x and the
+candidate clears it by a 2x log-margin, and re-profile to confirm
+`publish_with_probe` self-time actually falls in the no-spin arm.
+
 ## 🛑 BLOCKER (infrastructure, not idea): the wait-free-gate e2e cutover cannot run — rch excludes `target/` from artifact retrieval AND the fleet has no `mke2fs`/`e2fsck` (bd-bhh0i / bd-b9dug) - 2026-07-25 (turn 12, cc)
 
 Status: LEDGERED BLOCKER. The `FFS_MVCC_WAITFREE_PUBLISH` default stays OFF because

@@ -269,6 +269,17 @@ pub enum PublicationMode {
     /// `Condvar` survives only as the parking path for a committer whose
     /// predecessor has not published yet.
     WaitFree,
+    /// [`Self::WaitFree`] with the pre-park spin disabled: a committer whose
+    /// predecessor has not published parks immediately instead of re-draining
+    /// `PUBLICATION_SPIN_ROUNDS` times.
+    ///
+    /// The spin trades CPU for wall time, and the trade is not obviously
+    /// correct: profiling the wait-free gate at 8 writers put
+    /// `publish_with_probe` at **16.33% self** against **5.85%** for the mutex
+    /// gate, because a futex wait accrues no CPU samples while a spin does. This
+    /// variant exists so the spin can be A/B'd against no-spin inside ONE binary
+    /// rather than argued about.
+    WaitFreeNoSpin,
 }
 
 impl PublicationMode {
@@ -280,6 +291,7 @@ impl PublicationMode {
         match std::env::var("FFS_MVCC_WAITFREE_PUBLISH") {
             Ok(value) => match value.trim() {
                 "1" | "true" | "on" | "yes" => Self::WaitFree,
+                "nospin" | "no-spin" => Self::WaitFreeNoSpin,
                 _ => Self::Mutex,
             },
             Err(_) => Self::Mutex,
@@ -331,9 +343,11 @@ impl CommitPublicationGate {
     fn with_mode(mode: PublicationMode) -> Self {
         let ring = match mode {
             PublicationMode::Mutex => Vec::new(),
-            PublicationMode::WaitFree => (0..PUBLICATION_RING_SLOTS)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            PublicationMode::WaitFree | PublicationMode::WaitFreeNoSpin => {
+                (0..PUBLICATION_RING_SLOTS)
+                    .map(|_| AtomicU64::new(0))
+                    .collect()
+            }
         };
         Self {
             completed_commit: AtomicU64::new(0),
@@ -370,7 +384,10 @@ impl CommitPublicationGate {
         let total_started = probe.start();
         match self.mode {
             PublicationMode::Mutex => self.publish_mutex(commit_seq, probe),
-            PublicationMode::WaitFree => self.publish_wait_free(commit_seq, probe),
+            PublicationMode::WaitFree => {
+                self.publish_wait_free(commit_seq, probe, PUBLICATION_SPIN_ROUNDS);
+            }
+            PublicationMode::WaitFreeNoSpin => self.publish_wait_free(commit_seq, probe, 0),
         }
         probe.finish(CommitLockPhase::PublicationTotal, total_started);
     }
@@ -457,7 +474,12 @@ impl CommitPublicationGate {
         }
     }
 
-    fn publish_wait_free<P: CommitLockProbe>(&self, commit_seq: CommitSeq, probe: &mut P) {
+    fn publish_wait_free<P: CommitLockProbe>(
+        &self,
+        commit_seq: CommitSeq,
+        probe: &mut P,
+        spin_rounds: u32,
+    ) {
         let seq = commit_seq.0;
         if self.completed() >= seq {
             return;
@@ -488,7 +510,7 @@ impl CommitPublicationGate {
 
         // A predecessor is still installing. Spin briefly, then park.
         let prefix_wait_started = probe.start();
-        for _ in 0..PUBLICATION_SPIN_ROUNDS {
+        for _ in 0..spin_rounds {
             std::hint::spin_loop();
             if self.drain_ready_prefix() {
                 self.notify_parked();
@@ -2074,7 +2096,11 @@ mod tests {
         const SEQS: u64 = 2000;
         const THREADS: u64 = 8;
 
-        for mode in [PublicationMode::Mutex, PublicationMode::WaitFree] {
+        for mode in [
+            PublicationMode::Mutex,
+            PublicationMode::WaitFree,
+            PublicationMode::WaitFreeNoSpin,
+        ] {
             let gate = Arc::new(CommitPublicationGate::with_mode(mode));
             let mut handles = Vec::new();
             for thread in 0..THREADS {

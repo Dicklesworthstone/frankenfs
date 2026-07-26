@@ -448,6 +448,17 @@ fn print_actual_null_control() {
             PublicationMode::WaitFree,
             false,
         );
+        // Is the pre-park spin earning its CPU? Profiling the wait-free gate put
+        // `publish_with_probe` at 16.33% self vs 5.85% for the mutex gate, because
+        // a spin accrues CPU samples where a futex wait does not. Decide it here
+        // instead of arguing: same ELF, same pairing driver, spin vs no-spin.
+        run_paired_arms(
+            writers,
+            "unprofiled_spin_vs_nospin_ab",
+            PublicationMode::WaitFree,
+            PublicationMode::WaitFreeNoSpin,
+            false,
+        );
     }
 }
 
