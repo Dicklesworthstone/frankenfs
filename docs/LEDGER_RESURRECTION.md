@@ -42,15 +42,16 @@ was read in full and adjudicated by hand; the §5 table is the mechanical screen
 > one-off audit script. Productionizing that script as `scripts/perf_ledger_preflight.py`
 > exposed a parser bug in it: it split a `##` entry at each of its `###` subsections, so
 > an entry whose evidence table lived in a subsection was scored **without** its own
-> evidence and marked void. Re-running the corrected parser over the **same corpus**
-> (`9e377a01`) gives **205 void of 273 REJECT rows = 75.1%**, against the 219/276 = 79.3%
-> published below. The REJECT count is essentially unchanged (273 vs 276), so *what
-> counts as a rejection* was sound; only *admissibility detection* was over-strict.
+> evidence and marked void. Re-running the corrected parser over corpus `9e377a01`
+> gave **205 void of 273 REJECT rows = 75.1%**, against the 219/276 = 79.3% published
+> below.
 >
-> **The corrected figure is 75.1%.** It is the one to use. 79.3% is left in place below
-> rather than overwritten, because silently restating a published number is exactly the
-> ledger-integrity failure this document exists to catch. The finding is unchanged in
-> substance — three quarters of this repo's rejections cannot decide anything.
+> **Live closeout:** after later ledger additions and explicit SURVEY classification for
+> audit-summary rows, the canonical preflight reports **205 void of 274 REJECT rows =
+> 74.8%**. The VOID numerator did not grow. Use 74.8% for the current corpus; 75.1% is
+> the earlier corrected snapshot and 79.3% is retained below as the original one-off
+> output. The finding is unchanged in substance — roughly three quarters of this repo's
+> rejections cannot decide anything.
 
 | Metric | Count |
 |---|---:|
@@ -189,10 +190,10 @@ needs an Agent Mail reservation before anyone starts.
 
 | Metric | Count |
 |---|---:|
-| Entries audited | 276 |
-| Void | 219 |
+| Entries audited | 274 (live corrected parser) |
+| Void | 205 (74.8%) |
 | Re-run under the corrected harness | 2 (ranks 1 and 2) |
-| **Re-won** | **2 — rank 1: 1.70× at 8 threads; rank 2: 2.626589× on the production writer path** |
+| **Re-won** | **2 — rank 1: 1.70× at 8 threads; rank 2: 2.605531× witnessed-v3 on the production writer path (2.626589× generic)** |
 | Handed to the cod lane to re-run | 0 (rank 2 completed) |
 | Void but superseded — closed, not re-run | 1 (rank 3) |
 
@@ -200,7 +201,7 @@ needs an Agent Mail reservation before anyone starts.
 strongest sense — not "rejected on a bad gate" but **never measured at all**. Rank 2
 was the complementary failure: a large, real effect rejected solely by the obsolete
 CV gate despite a near-1.0× null. The corrected harness decided both without
-reinterpreting the other 217 void rows as wins.
+reinterpreting the other 203 void rows as wins.
 
 ### 4.1 Rank 1 re-run — profile attribution
 
@@ -319,6 +320,22 @@ on pinned worker `ovh-a`. The same invocation asserted exact 524,288-byte journa
 output equality. The focused writer, replay, and partial-write crash suite passed
 27/27: an injected partial grouped write returns the original error, does not
 advance the writer head, and leaves no commit block for replay to accept.
+
+After the fleet ISA lift, the production path was rebuilt as a whole-binary pair
+on pinned `hz2`/CPU 6. The generic ELF
+`8695daa5adfbbe17e9a823790ebc644b490f9738a41f44e93f7005b51ca2f899`
+reported AVX2/FMA false; the v3 ELF
+`f91979ffaf94b61a589716314344f6ec006e31a3beffe01faaf817e8a208f433`
+reported both true. Exact 524,288-byte parity held in both invocations:
+
+| build | scalar | grouped | A/B ratio (95% CI) | A/A ratio (95% CI) |
+|---|---:|---:|---:|---:|
+| generic | 4.401601 ms | 1.670168 ms | **2.630522×** `[2.623337, 2.643932]` | **0.998940×** `[0.994136, 1.002432]` |
+| x86-64-v3 | 4.373304 ms | 1.680029 ms | **2.605531×** `[2.597625, 2.618523]` | **1.000215×** `[0.999222, 1.001697]` |
+
+The source-lever magnitude shrank 0.95% under v3 but remains decisively above
+the paired null. Jobs were `j-29947955108642837` and
+`j-29947955108642859`. This is v3-only evidence, not the CLI PGO profile.
 
 Landed as `8b228bd8`. Retry only if a production profile attributes at least 5%
 self-time or material syscall count to wrap-crossing scalar fallback or run
@@ -653,10 +670,15 @@ the losses and the wins measured against it.
 
 ### The forward-looking consequence, which is larger than the backlog
 
-With 11 AVX2+FMA workers there is no longer any reason to benchmark at x86-64 baseline.
-**Benchmark builds should now carry `RUSTFLAGS="-C target-cpu=x86-64-v3"` so the
-measured binary matches what `scripts/build-perf.sh` ships**, and the `codegen_isa`
-admissibility line (§3 of the bd-b9dug correction) becomes the check that it actually
-did. Every ratio measured from here should be a ratio from the shipped configuration —
-which is the whole point of bd-b9dug.
+With 11 AVX2+FMA workers there is no longer any reason to benchmark at x86-64
+baseline. **RCH benchmark builds should carry
+`RUSTFLAGS="-C target-cpu=x86-64-v3"` through
+`RCH_ENV_ALLOWLIST=RUSTFLAGS`**, and the `codegen_isa` line (§3 of the
+bd-b9dug correction) must prove that the executing binary actually received it.
+Local flags, global Cargo rustflags, target-table config, and even a distinct
+ELF all proved insufficient in this campaign until the binary reported
+`compile_avx2=true,compile_fma=true`.
 
+That aligns the ISA with the performance distribution; it does **not** make a
+bench ELF PGO-identical. Exact “shipped configuration” wording still requires
+the complete training/profile-use flow and an explicit PGO identity.

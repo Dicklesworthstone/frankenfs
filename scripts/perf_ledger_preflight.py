@@ -3,8 +3,8 @@
 
 Motivation (fleet broadcast 2, 2026-07-25): ledger integrity is not a one-time
 cleanup, it DECAYS. Repos that audited once and institutionalized the check sit at
-~1.7% VOID; repos that never did sit at 25-91%. frankenfs audited at **79.3% VOID**
-(219 of 276 REJECT rows). This script is the institutionalization.
+~1.7% VOID; repos that never did sit at 25-91%. frankenfs currently audits at
+**74.8% VOID** (205 of 274 REJECT rows). This script is the institutionalization.
 
 Two jobs, two exit codes:
 
@@ -77,7 +77,10 @@ REJECT_VERDICT = re.compile(
 KEEP_VERDICT = re.compile(
     r"(?:\*\*)?(?:⭐+\s*)?(KEEP|SHIPPED|LANDED|WIN\b|FLIPPED|PASS\b|CONFIRMED)", re.I
 )
-SURVEY_VERDICT = re.compile(r"(?:\*\*)?(SURFACE|N/A|NO CODE\b|NO-GAP)", re.I)
+SURVEY_VERDICT = re.compile(
+    r"(?:\*\*)?(SURFACE|N/A|NO CODE\b|NO-GAP|AUDIT (?:COMPLETE|CORRECTED)\b)",
+    re.I,
+)
 
 RETRY = re.compile(r"[Rr]etry (?:only )?(?:predicate|condition|if|on|when)[^|]{0,400}")
 
@@ -273,7 +276,7 @@ def cmd_lint(since: str | None) -> int:
     print("  - an A/A null control (paired arms, same invocation), or")
     print("  - a counted mechanism (instructions/cycles/syscalls/allocs unchanged), or")
     print("  - a profile-first attribution (named frame, non-zero self-time, ceiling).")
-    print("\nThis repo audited at 79.3% VOID because rows without one of these are")
+    print("\nThis repo audited at 74.8% VOID because rows without one of these are")
     print("unfalsifiable. Do not add another.")
     return 1
 

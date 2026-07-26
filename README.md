@@ -1786,20 +1786,22 @@ FrankenFS tracks these edges lazily inside the commit path in `ffs-mvcc` and abo
 
 ## Performance Characteristics
 
-FrankenFS publishes benchmarks under `crates/*/benches/` (criterion-based) and dated baselines under `benchmarks/`. The headline numbers, all on commodity Linux hardware, are:
+FrankenFS publishes benchmarks under `crates/*/benches/` (criterion-based) and
+dated baselines under `benchmarks/`. The historical numbers below were collected
+on commodity Linux hardware.
 
-### Measured wins vs the kernel (`v0.2.0` performance campaign)
+### Historical performance evidence (`v0.2.0` campaign)
 
 The `v0.2.0` release consolidates a solo, negative-evidence-ledger-first
-optimization campaign. Every kept lever is measured against the mounted **kernel**
-filesystem (ext4 / btrfs), proven **byte-identical** before it is kept (btrfs
-images pass `btrfs-check`, ext4 images pass `e2fsck`), and gated on **median**
-self-time vs a **paired null control** (the identical arm run twice) in
-one honest same-worker A/B binary. Representative headline results:
+optimization campaign. The table mixes internal same-ELF mechanism A/Bs with
+mounted **kernel** comparisons; the cited ledger row is authoritative about which
+kind of comparison each result represents. Kept filesystem mutations were proven
+byte-identical before timing, with btrfs images checked by `btrfs check` and ext4
+images checked by `e2fsck`.
 
 | Subsystem | Lever | Result | Commit |
 |---|---|---|---|
-| Metadata / directory | Name-index closes the create existence-check `O(N²)` | **26× slower → kernel parity** | [`1fcd0b62`](https://github.com/Dicklesworthstone/frankenfs/commit/1fcd0b62) |
+| Metadata / directory | Name-index closes the create existence-check `O(N²)` | Generic-ELF campaign: **26× reduction to approximately kernel parity**; shipped-binary parity is not yet re-measured | [`1fcd0b62`](https://github.com/Dicklesworthstone/frankenfs/commit/1fcd0b62) |
 | Write allocation | Coalesce contiguous extents, `O(N²)→O(N)` | **120× at N=40k** | [`2aa92946`](https://github.com/Dicklesworthstone/frankenfs/commit/2aa92946) |
 | Allocator | Binary range-overlap reserved-check | **up to 3110×** | [`af91cc18`](https://github.com/Dicklesworthstone/frankenfs/commit/af91cc18) |
 | Journal replay | Memoize indirect-block resolution | fixes **2024×** re-read/mount | [`fe00c75e`](https://github.com/Dicklesworthstone/frankenfs/commit/fe00c75e) |
@@ -1808,24 +1810,73 @@ one honest same-worker A/B binary. Representative headline results:
 | Allocator | Skip re-reading unchanged bitmap for descriptor csum | **15.8× fewer delete preads** | [`b296dbdb`](https://github.com/Dicklesworthstone/frankenfs/commit/b296dbdb) |
 | Directory hash | Word-at-a-time `extent_root_namespace` hash (SWAR) | **7.14×** | [`96c27663`](https://github.com/Dicklesworthstone/frankenfs/commit/96c27663) |
 | MVCC | Skip per-read snapshot register/release | **5×** parallel random read | [`9376f4d6`](https://github.com/Dicklesworthstone/frankenfs/commit/9376f4d6) |
-| btrfs metadata | Fan-out gate the prefetch pool | **4.3×** (7× → 1.6× vs kernel) | [`18fb0e88`](https://github.com/Dicklesworthstone/frankenfs/commit/18fb0e88) |
-| CLI | jemalloc global allocator | create **1.26–1.6×**, now faster than kernel single-thread | [`14f443cb`](https://github.com/Dicklesworthstone/frankenfs/commit/14f443cb) |
-| btrfs read | Read directly into caller buffer | **1.37× warm, RSS halved, beats kernel** | [`54b0ae94`](https://github.com/Dicklesworthstone/frankenfs/commit/54b0ae94) |
+| btrfs metadata | Fan-out gate the prefetch pool | Generic-ELF campaign: **4.3×** internally (7× → 1.6× vs kernel); shipped-binary kernel gap is not yet re-measured | [`18fb0e88`](https://github.com/Dicklesworthstone/frankenfs/commit/18fb0e88) |
+| CLI | jemalloc global allocator | Generic-ELF source A/B: create **1.26–1.6×**; the old “faster than kernel” production wording is withdrawn pending a shipped-binary rerun | [`14f443cb`](https://github.com/Dicklesworthstone/frankenfs/commit/14f443cb) |
+| btrfs read | Read directly into caller buffer | Generic-ELF source A/B: **1.37× warm, RSS halved**; the old “beats kernel” production wording is withdrawn pending a shipped-binary rerun | [`54b0ae94`](https://github.com/Dicklesworthstone/frankenfs/commit/54b0ae94) |
 
-**Honesty methodology.** Claims are gated on the median-ratio 95% confidence
+**Build-identity correction (`bd-b9dug`, 2026-07-25).** Ordinary
+`cargo bench --profile release-perf` compiles FrankenFS code for Rust's generic
+x86-64 baseline, while the performance distribution produced by
+`scripts/build-perf.sh` uses fat LTO, `target-cpu=x86-64-v3`, and a CLI workload
+PGO profile. The campaign's previously published ratios therefore describe the
+generic benchmark ELF unless a row explicitly proves another executing ELF; they
+must not be presented as measurements of the binary shipped by that script.
+
+Fresh whole-binary checks on pinned `hz2` now identify both codegen and the
+executing ELF. The allocator ratio changed from generic
+**12.445408×** (`444f2807…a1cb3`) to witnessed-v3 **13.631067×**
+(`fc40f87b…41955`), a 9.53% increase. The production JBD2 writer ratio
+changed in the other direction, from generic **2.630522×**
+(`8695daa5…2f899`) to witnessed-v3 **2.605531×**
+(`f91979ff…8f433`), a 0.95% decrease. Every run preserved exact output and
+used an approximately 1.000× A/A null. Both v3 results remain decisive on
+their median-ratio CIs.
+
+An earlier claimed v3 allocator result (12.122× and an 11.6% absolute-time
+reduction) is withdrawn: its distinct ELF still self-reported
+`compile_avx2=false,compile_fma=false`. Local `RUSTFLAGS`, global Cargo
+`build.rustflags`, and a target-table Cargo config each failed to reach the
+top-level bench under RCH. A distinct ELF is therefore necessary but not
+sufficient evidence. The admitted route explicitly allowlisted `RUSTFLAGS`
+through RCH, and both remote rustc plus the executing binary reported
+AVX2+FMA. These v3 benchmark ELFs did **not** contain the CLI PGO profile.
+
+Accordingly:
+
+- Kernel-comparator wins remain historical generic-ELF results, but their
+  attribution to the shipped binary is withdrawn. No direction or correction
+  factor transfers to an exact v3+PGO workload without a rerun.
+- Kernel-comparator losses remain generic-ELF routing evidence. Until the exact
+  v3+PGO workload is rerun, none may support a “structural” or “irreducible”
+  frontier claim or be treated as an upper bound.
+- Internal algorithmic ratios remain valid historical generic-ELF, same-build
+  comparisons because both arms used one ELF. Fresh v3 reruns show that their
+  magnitudes can move in either direction, so they are not absolute
+  production-throughput claims.
+- No universal correction factor is applied. ISA/PGO sensitivity is
+  workload-specific; the two fresh ratios moved by -0.95% and +9.53%.
+
+The complete correction and retry contract are in
+[`docs/BD_B9DUG_ISA_CORRECTION.md`](docs/BD_B9DUG_ISA_CORRECTION.md).
+
+**Current honesty methodology.** New claims are gated on the median-ratio 95% confidence
 interval against a paired null control; coefficient of variation is reported
-as provenance but is never the decision gate. The `ffs-harness` benchmark
+as provenance but is never the decision gate. The corrected owned benchmark
 executables self-report their own SHA-256 as their first program line so the
 executing ELF, rather than an adjacent build artifact, identifies each run.
 Wins are not best-of-N; they are
 isomorphism-preserving (behaviour proven byte-identical before keeping), and
-every *rejected* lever is recorded — with its null-control result and a concrete
+every newly *rejected* lever is recorded—with its null-control result and a concrete
 retry condition — in the negative-evidence ledger
 (`docs/NEGATIVE_EVIDENCE.md`, `docs/PERF_CAMPAIGN_FINAL.md`) rather than quietly
-dropped. When honest scrutiny contradicted an earlier claim it was corrected in
-the open: a previously-reported "1.7× faster than kernel" cold-read row flipped
-sign under a corrected harness (frankenfs is actually ~1.42× slower there), and
-that finding is documented instead of buried. See the
+dropped. Historical rows predate this contract: the corrected 2026-07-25
+preflight found 205 of 274 rejected rows (74.8%) measurement-void, so this
+methodology is a forward gate rather than a blanket retroactive certification.
+When honest scrutiny contradicted an earlier claim,
+it was corrected in the open: a previously-reported "1.7× faster than kernel"
+cold-read row flipped
+sign under a corrected generic-ELF harness (about 1.42× slower there); that
+generic-ELF kernel gap is now also awaiting a shipped v3+PGO rerun. See the
 [CHANGELOG](CHANGELOG.md#v020--performance-campaign-2026-05-18--2026-07-11) for
 the full per-subsystem win list and the reject ledger.
 
@@ -1858,8 +1909,16 @@ the full per-subsystem win list and the reject ledger.
 ### Reproducing benchmarks
 
 ```bash
-# Run all benchmarks
+# Run portable diagnostic benchmarks. These generic x86-64 ELFs are not the
+# shipped v3+PGO binary and must not be published as production-equivalent.
 cargo bench --workspace
+
+# Run an x86-64-v3 benchmark through RCH. Publication still requires the
+# executing binary to print compile_avx2=true and compile_fma=true.
+RUSTFLAGS='-C target-cpu=x86-64-v3' \
+RCH_ENV_ALLOWLIST=RUSTFLAGS RCH_REQUIRE_REMOTE=1 \
+env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+cargo bench --profile release-perf -p ffs-alloc --bench inode_alloc_cursor
 
 # Single crate (e.g., MVCC WAL)
 cargo bench -p ffs-mvcc --bench wal_throughput
@@ -1867,12 +1926,18 @@ cargo bench -p ffs-mvcc --bench wal_throughput
 # Compare against a saved baseline
 ./scripts/benchmark.sh --compare benchmarks/baseline-2026-05-03.json
 
-# Build with the perf-tuned profile, keep debuginfo for flamegraphs
+# Build the portable diagnostic profile, keeping debuginfo for flamegraphs.
 cargo build --workspace --profile release-perf
 
 # Flamegraph workflow
 ./scripts/flamegraph_generate.sh --target all --samples 4000 --duration 120
 ```
+
+`scripts/build-perf.sh` documents the shipped CLI performance configuration
+(fat LTO + x86-64-v3 + PGO). A production-equivalent publication run must apply
+that complete configuration to the benchmark, self-report the executing ELF
+hash, prove output parity, and run the same-invocation A/A plus median-CI gate.
+The generic commands above deliberately do not satisfy that claim.
 
 ### Methodology
 

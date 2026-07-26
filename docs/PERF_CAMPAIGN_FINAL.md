@@ -8,12 +8,65 @@ result, and retry-condition. Detailed per-row prose lives in
 `docs/NEGATIVE_EVIDENCE.md` and `docs/progress/perf-negative-results.md`; the
 live frontier statement is at the top of `docs/PERF_CAMPAIGN_STATUS.md`.
 
+## 2026-07-25 build-identity correction (`bd-b9dug`)
+
+The historical campaign used ordinary `cargo bench --profile release-perf`
+binaries. Those compile FrankenFS code for Rust's generic x86-64 baseline, while
+the performance distribution produced by `scripts/build-perf.sh` uses fat LTO,
+`target-cpu=x86-64-v3`, and PGO trained on CLI create/lookup/rename/delete/walk
+workloads. Unless an individual row proves otherwise with its executing-ELF
+hash, every ratio in this document is therefore a **generic benchmark-ELF**
+measurement, not a measurement of the binary shipped by that script.
+
+The final same-worker checks ran on pinned `hz2` and required both a distinct
+executing-ELF hash and an in-binary AVX2+FMA witness. Allocator moved from
+generic **12.445408×** CI `[12.348123, 12.495432]` (ELF
+`444f2807ea2920cb2f90fb09a85c9b31c53091981eb3b76f6d9d4cf1895a1cb3`)
+to v3 **13.631067×** CI `[13.452977, 13.759302]` (ELF
+`fc40f87b2647fda9ac36501f673428c090f3d88b2d20136deca81e8c6ea41955`).
+Production JBD2 moved from generic **2.630522×** CI
+`[2.623337, 2.643932]` (ELF
+`8695daa5adfbbe17e9a823790ebc644b490f9738a41f44e93f7005b51ca2f899`)
+to v3 **2.605531×** CI `[2.597625, 2.618523]` (ELF
+`f91979ffaf94b61a589716314344f6ec006e31a3beffe01faaf817e8a208f433`).
+All four runs had exact behavior parity and approximately 1.000× A/A nulls.
+The source ratios therefore moved by +9.53% and -0.95% respectively while both
+verdicts remained decisive.
+
+The previously reported “v3” allocator ELF and its 12.122× / 11.6% claims are
+withdrawn. That binary had a distinct hash but self-reported
+`compile_avx2=false,compile_fma=false`: the local flag did not cross RCH.
+Two other Cargo-config routes failed the same witness. The admitted route used
+`RCH_ENV_ALLOWLIST=RUSTFLAGS`, and a verbose remote compiler probe plus the
+executing binaries both reported AVX2+FMA. These v3 ELFs did **not** carry the
+CLI PGO profile, so they are not exact production-binary certifications.
+
+| Historical claim class | Corrected status |
+| --- | --- |
+| Wins vs kernel | Retained as generic-ELF history; neither direction nor magnitude transfers to the shipped binary without a workload-matched v3+PGO rerun. |
+| Losses vs kernel | Retained as generic-ELF routing evidence, not an upper bound; the gap cannot justify “structural” or “irreducible” closure without a shipped-binary rerun. |
+| Internal source-lever A/B ratios | Retained as historical same-build, generic-ELF measurements because both arms used one ELF. Fresh v3 reruns replace the owned allocator and JBD2 publication numbers above and demonstrate that magnitudes can move in either direction. |
+| Absolute throughput and latency | Not production-equivalent until the exact v3+PGO executing ELF is rerun. |
+| Proposed blanket adjustment | Forbidden. ISA and PGO sensitivity is workload-specific; the two witnessed ratios moved by -0.95% and +9.53%. |
+
+Concrete retry predicate: for a v3 run through RCH, forward `RUSTFLAGS` through
+the explicit environment allowlist and require remote rustc plus the executing
+binary to report AVX2+FMA; a distinct ELF alone is insufficient. For exact
+production attribution, build the benchmark with the complete shipped v3+PGO
+configuration, self-report the executing ELF, prove exact output/fsck parity,
+then run same-invocation paired A/A and A/B and gate only on the median-ratio
+95% CI outside twice the null margin. Do not infer PGO identity from v3 alone.
+See `docs/BD_B9DUG_ISA_CORRECTION.md` for the full claim inventory and
+admissibility rule.
+
 - **Comparator:** the mounted kernel filesystem (ext4/btrfs).
 - **Methodology:** negative-evidence-ledger-first; profile-first (mechanism from
   the profile / code, not a guess); ONE lever per commit; behaviour parity proven
   byte-identical before keeping; honest same-worker A/B interleaved in ONE binary;
-  gate on **MEDIAN** self-time vs a paired null control (identical arm twice), cv<5%.
-- **Build:** STRICTLY remote-only —
+  gate on the **median-ratio 95% CI** vs a paired null control (identical arm
+  twice); CV is provenance and never a decision gate.
+- **Historical build:** STRICTLY remote-only, but generic x86-64 rather than the
+  shipped v3+PGO configuration —
   `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench`. rch
   degraded / no slot = SURFACE, never local cargo.
 - **Reusable lever models** (how each class of win was found/judged) are

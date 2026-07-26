@@ -80,6 +80,23 @@ fn self_identity() -> String {
     format!("{} ({} bytes) {}", encoded, bytes.len(), path.display())
 }
 
+fn print_codegen_isa() {
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "codegen_isa,target_arch=x86_64,compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse4_2={},runtime_avx2={},runtime_fma={}",
+        cfg!(target_feature = "sse2"),
+        cfg!(target_feature = "sse4.2"),
+        cfg!(target_feature = "avx2"),
+        cfg!(target_feature = "fma"),
+        std::arch::is_x86_feature_detected!("sse4.2"),
+        std::arch::is_x86_feature_detected!("avx2"),
+        std::arch::is_x86_feature_detected!("fma"),
+    );
+
+    #[cfg(not(target_arch = "x86_64"))]
+    println!("codegen_isa,target_arch={}", std::env::consts::ARCH);
+}
+
 fn make_device(bytes: usize) -> File {
     let name = CString::new("ffs-jbd2-write-combining").expect("memfd name");
     let fd = memfd_create(name.as_c_str(), MemFdCreateFlag::MFD_CLOEXEC)
@@ -336,6 +353,7 @@ fn print_gate(label: &str, null: &PairedStats, real: &PairedStats, direction_lab
 
 fn main() {
     println!("bench_elf_sha256={}", self_identity());
+    print_codegen_isa();
 
     let file = make_device(REGION_BYTES);
     let region = make_region();

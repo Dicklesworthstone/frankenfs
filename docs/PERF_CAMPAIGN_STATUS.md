@@ -1,5 +1,43 @@
 # Perf campaign status — read this first
 
+> ## ⚠️ 2026-07-25 BUILD-IDENTITY CORRECTION (`bd-b9dug`, GreenSpring)
+>
+> Ordinary `cargo bench --profile release-perf` built the historical campaign
+> ELFs for Rust's generic x86-64 baseline. The performance distribution produced
+> by `scripts/build-perf.sh` uses fat LTO, `target-cpu=x86-64-v3`, and CLI-workload
+> PGO. Unless a row proves another identity from the executing ELF itself, the
+> ratios below are **generic benchmark-ELF history**, not measurements of the
+> binary produced by the shipping performance script.
+>
+> Final pinned-worker checks on `hz2` required both a distinct executing ELF
+> and `compile_avx2=true,compile_fma=true`. Allocator changed from generic
+> **12.445408×** CI `[12.348123, 12.495432]` to witnessed-v3
+> **13.631067×** CI `[13.452977, 13.759302]` (+9.53%). Production
+> JBD2 changed from generic **2.630522×** CI `[2.623337, 2.643932]`
+> to witnessed-v3 **2.605531×** CI `[2.597625, 2.618523]`
+> (-0.95%). Exact output and approximately 1.000× A/A nulls held throughout.
+>
+> The earlier 12.122× “v3” allocator result and its 11.6% absolute-time claim
+> are withdrawn: its distinct ELF still reported AVX2/FMA false. Local
+> `RUSTFLAGS` and two Cargo-config routes did not reach the top-level bench
+> through RCH. The admitted route explicitly allowlisted `RUSTFLAGS`, and both
+> remote rustc plus the executing binary reported AVX2+FMA. The v3 builds did
+> not contain the CLI PGO profile.
+>
+> **Affected-claim restatement:** kernel wins remain generic-build history but
+> are not measured shipped-binary ratios; kernel losses remain generic-build
+> routing evidence, not upper bounds, and cannot support “structural” or
+> “irreducible” closure. Internal lever ratios remain historical same-ELF
+> measurements because both arms used one ELF; the fresh v3 reruns above replace
+> the owned allocator/JBD2 publication numbers. Absolute production attribution
+> remains unverified until the exact v3+PGO benchmark ELF is self-identified and
+> rerun. Do not apply a global correction; the witnessed ratios moved in opposite
+> directions. Retry v3 only with an explicit RCH environment allowlist and
+> AVX2+FMA compiler/binary witnesses. Exact v3+PGO attribution additionally
+> requires exact output/fsck parity, same-invocation A/A and A/B, and a
+> median-ratio 95% CI outside twice the null margin. CV is provenance, never a gate.
+> Full correction: `docs/BD_B9DUG_ISA_CORRECTION.md`.
+
 > ## ⭐ 2026-07-11 UNBLOCK + WIN (BlackThrush) — the "returnable-binary" gate was never real; mounted axis is OPEN
 >
 > The blocker cited across many rows ("rch can't ship the binary back → mounted

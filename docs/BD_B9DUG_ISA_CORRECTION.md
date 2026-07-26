@@ -1,11 +1,12 @@
 # bd-b9dug — the benchmarked binary is not the shipped binary
 
-**Lane L (ledger/low-burn), 2026-07-25. No worker was used to produce this document.**
+**Lane L (ledger/low-burn), 2026-07-25. Follow-up measured on pinned worker `hz2`.**
 
-Every published frankenfs performance ratio was measured on a binary that is **not**
-the one `scripts/build-perf.sh` produces. This document states the delta exactly,
-re-states the affected claims by class, and fixes the admissibility rule so the
-mismatch cannot be published silently again.
+Every frankenfs performance ratio published before this correction was measured on a
+binary that is **not** the one `scripts/build-perf.sh` produces. This follow-up measures
+the ISA-only residual for two owned benchmark families, re-states the affected claims,
+and fixes the admissibility rule so the mismatch cannot be published silently again.
+Exact v3+PGO production identity remains a separate, unmeasured gate.
 
 ---
 
@@ -28,16 +29,29 @@ description of what ships, and nothing in the bench path ever said so.
 
 ### Direct in-binary witness
 
-The `ffs-mvcc` bench harness now prints its own codegen configuration. From the
-2026-07-25 runs on `vmi1227854`:
+The owned allocator and JBD2 benchmark executables now print both the SHA-256 of the
+executing ELF and their compile-time/runtime ISA features. Both whole-binary pairs ran
+on `hz2`, pinned to CPU 6:
 
-```
-codegen_isa,target_arch=x86_64,compile_sse2=true,compile_sse4_2=false,
-            compile_avx2=false,runtime_sse4_2=true,runtime_avx2=true
-```
+| benchmark | build | executing ELF SHA-256 | compile-time witness |
+|---|---|---|---|
+| inode allocator | generic | `444f2807ea2920cb2f90fb09a85c9b31c53091981eb3b76f6d9d4cf1895a1cb3` | SSE2; no SSE4.2/AVX2/FMA |
+| inode allocator | v3 | `fc40f87b2647fda9ac36501f673428c090f3d88b2d20136deca81e8c6ea41955` | SSE2+SSE4.2+AVX2+FMA |
+| JBD2 writer | generic | `8695daa5adfbbe17e9a823790ebc644b490f9738a41f44e93f7005b51ca2f899` | SSE2; no SSE4.2/AVX2/FMA |
+| JBD2 writer | v3 | `f91979ffaf94b61a589716314344f6ec006e31a3beffe01faaf817e8a208f433` | SSE2+SSE4.2+AVX2+FMA |
 
-`compile_avx2=false` with `runtime_avx2=true`: the binary was compiled for a CPU far
-weaker than the one it ran on. This is not inference — the executing binary reported it.
+All four executions reported AVX2+FMA at runtime. The generic binaries therefore
+proved the mismatch directly; the v3 binaries proved that the correction reached
+`rustc`.
+
+Three apparent v3 routes were rejected before the valid pair. Local `RUSTFLAGS`
+without an RCH allowlist (job `j-29946774143631803`), Cargo global
+`build.rustflags` (job `j-29946774143631815`), and Cargo target-table rustflags
+(job `j-29947955108642846`, ELF
+`0b7d8ce475a0afcf2fc302f812533611e312adb73969de122fb9edb4ee8e3ef8`) all produced
+different ELFs that still self-reported `compile_avx2=false,compile_fma=false`.
+Those measurements are inadmissible as v3 evidence. A different ELF SHA is necessary,
+but it is not sufficient.
 
 ### Size of the effect, from evidence already in the repo
 
@@ -54,9 +68,19 @@ clean) and stacking:
 ⚠ **These are instruction counts, not wall clock.** The script says so explicitly:
 *"wall-clock was too noisy to see them."* This repo's own ledger carries the matching
 lesson — *"instructions alone (7–13%) with flat cycles = neutral"* (the scrub
-word→SIMD REJECT). So the **direction** of the correction is established and the
-**instruction magnitude** is measured, but the **wall-clock magnitude is unknown**.
-Do not convert 17.6% fewer instructions into 17.6% faster.
+word→SIMD REJECT). The historical instruction magnitude is measured, but it cannot be
+converted into the same wall-clock speedup.
+
+The new whole-binary wall-clock pairs show why no universal direction is admissible:
+
+| benchmark | generic ratio, median CI | v3 ratio, median CI | v3 ratio shift |
+|---|---:|---:|---:|
+| inode allocator scan/cursor | 12.445408× [12.348123, 12.495432] | 13.631067× [13.452977, 13.759302] | **+9.53%** |
+| JBD2 scalar/grouped writer | 2.630522× [2.623337, 2.643932] | 2.605531× [2.597625, 2.618523] | **−0.95%** |
+
+Each invocation included an A/A null control whose median CI contained 1.0, exact
+semantic parity, and a median-CI gate. The allocator ratio grew; the JBD2 ratio shrank.
+ISA effects are workload-dependent.
 
 ---
 
@@ -69,41 +93,38 @@ Every published ratio falls into one of three classes, and the correction differ
 Examples: allocator range-overlap **3110×**, journal replay **2024×**, extent
 coalescing **120×**, incremental crc32c **24.7×**, rmdir dir-emptiness, htree lookup.
 
-The FrankenFS arm ran on the weaker binary; the kernel arm is unaffected. The shipped
-binary is faster than the benchmarked one, therefore **these wins are UNDERSTATED** —
-the shipped advantage is at least what was published. **No claim needs to be withdrawn.**
-They should be quoted as *"≥ N× (measured on a baseline-ISA build; the shipped
-`build-perf.sh` binary retires ~18% fewer create instructions)"*.
+The historical ratios remain measurements of their named generic ELF, but the earlier
+inference that the shipped advantage is necessarily **at least** N× is withdrawn.
+Changing code generation can improve candidate and control paths by different amounts;
+the fresh JBD2 internal ratio shrank by 0.95% under v3. Quote these as
+*"N× on the recorded baseline-ISA ELF"*. A claim about the shipped binary requires a
+whole-binary v3+PGO rerun with its own null and median-CI gate.
 
 ### Class B — "FrankenFS is N× slower than the kernel" (losses)
 
 Examples: parallel metadata writes **8.3× slower at 8 threads**, multi-file parallel
 read **~2.9× slower**, mounted small-file create storm **4.599×**.
 
-Same direction, opposite consequence: the shipped binary is faster, so **these losses
-are OVERSTATED** — the real gap is smaller than published. This is the class that
-matters, because these numbers drive lever selection. An 8.3× gap that is really, say,
-7× changes nothing strategically, but it does mean **no loss in this class should be
-called "structural" or "irreducible" on the strength of a baseline-ISA measurement.**
-Campaign §3b names exactly this failure — constant factors from a downgraded ISA being
-ledgered as irreducible walls.
+The earlier blanket statement that these losses are **overstated** is also withdrawn.
+The historical `create-bench` experiment below is evidence that one named loss shrank,
+but it conflates profile, LTO, and ISA. It does not license the same conclusion for
+every loss. No loss should be called structural or irreducible on the strength of a
+baseline-ISA measurement, and no correction factor should be applied without a
+whole-binary rerun.
 
 ### Class C — internal A/B (candidate vs control, one binary)
 
 Examples: the 2026-07-25 wait-free publication gate **1.70–2.11× at 8 threads**, and
 essentially every KEEP/REJECT row in `docs/progress/perf-negative-results.md`.
 
-Both arms come from the same ELF, so **the ISA cancels and the ratio stands as
-measured.** What does *not* automatically transfer is the magnitude on the shipped
-binary: a lever whose benefit is compute-shaped can shrink under v3+PGO (the baseline it
-improves gets faster), while a lever whose benefit is contention-shaped can **grow** (the
-compute term shrinks, so the serialization term becomes a larger share of the whole).
+Both arms come from the same ELF, so the ratio stands as a measurement of that ELF.
+What does not transfer automatically is its magnitude on another binary. The two fresh
+pairs demonstrate both directions: allocator grew 9.53%, while JBD2 shrank 0.95%.
+Generic-ELF KEEP/REJECT decisions remain historical evidence, not shipped-binary
+claims.
 
-Applying that to this session's own result: the wait-free publication gate is
-contention-shaped — it removes a global mutex, and the two arms differ only in
-synchronization. Its 1.70× is **not** at risk from the ISA gap, and if anything the
-shipped binary should show a **larger** ratio. That is a prediction, not a measurement,
-and it is recorded here as such.
+`bd-bhh0i` is owner-escalated and outside this lane, so this audit makes no new
+prediction or rerun of that closed frontier.
 
 ### Not affected
 
@@ -125,69 +146,65 @@ behaviour-preserving and `e2fsck`-clean.
 > production if you want to" to **"this is how benchmarks should be built from now on."**
 > The *product* argument is untouched — see immediately below.
 
-**Still true, and unaffected by the fleet change: do not make `target-cpu=x86-64-v3` the
-default for the SHIPPED product build.** `build-perf.sh` explains why it is opt-in — v3
-requires a 2015+ CPU and removes the runtime scalar fallback FrankenFS deliberately
-keeps for older hardware. That is a portability decision about users' machines, not
-about our workers, so lifting the fleet constraint does not touch it.
-
-What *has* changed is the **benchmark** configuration. There is no longer any reason to
-measure at x86-64 baseline: doing so measures a binary nobody ships, on hardware that
-could have run the real one. Benchmarks should now be built with
-`RUSTFLAGS="-C target-cpu=x86-64-v3"`.
+The product remains whatever `scripts/build-perf.sh` produces: release-perf,
+`target-cpu=x86-64-v3`, and PGO. The fleet change does not silently make ordinary
+Cargo builds production-identical. It only makes v3 benchmark reruns schedulable.
 
 **And make the mismatch unpublishable either way:**
 
-1. **Every bench binary self-reports its codegen ISA**, as `ffs-mvcc/benches/wal_throughput.rs`
-   now does via `print_codegen_isa()`. One `cfg!(target_feature = ...)` line per binary.
+1. **Every bench binary self-reports its executing ELF SHA-256 and codegen ISA.**
+   One `cfg!(target_feature = ...)` line per binary is the minimum ISA witness.
 2. **Admissibility rule (new):** a performance ratio may not be published from a bench
    run whose output lacks a `codegen_isa` line. A ratio whose `compile_avx2` differs
    from the shipped configuration must carry the class-A/B/C qualifier above.
-3. **Reproducing production for a measurement** — no config change required, just the
-   documented invocation:
+3. **Building the v3/no-PGO half through RCH** requires explicit environment
+   forwarding:
    ```
-   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo bench --profile release-perf …   # v3, no PGO
-   scripts/build-perf.sh                                                       # v3 + PGO (ships)
+   RUSTFLAGS="-C target-cpu=x86-64-v3" \
+   RCH_ENV_ALLOWLIST=RUSTFLAGS \
+   RCH_REQUIRE_REMOTE=1 \
+   env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+     cargo bench --profile release-perf …
    ```
-   Any such run **must be pinned to an AVX2-capable worker** (`ovh-b` excluded) and must
-   report `codegen_isa` to prove the flag reached the compiler — same source and same
-   worker with a *different* ELF sha means codegen actually changed.
+   The route must first show `-C target-cpu=x86-64-v3` in remote verbose compiler
+   output, and the executing binary must report AVX2+FMA. A distinct SHA alone does not
+   prove v3. Exact shipped identity additionally requires the PGO stage from
+   `scripts/build-perf.sh`.
 4. **Do not gate on instruction count for an ISA A/B.** An ISA change retires more work
    per instruction, so fewer instructions is the mechanism, not a neutral proxy. Gate on
    wall/cycles (campaign §2.6).
 
 ---
 
-## 4. What this does not resolve — corrected
+## 4. Measured residual and remaining gap
 
-An earlier revision of this document said the wall-clock size of the gap was "still
-unmeasured". **That was wrong, and the correction matters.**
-`docs/NEGATIVE_EVIDENCE.md:128` (bd-b9dug, 2026-07-11) already ran an **interleaved,
-drift-cancelled** A/B of a production-ISA `create-bench` against the default build:
+An earlier revision said the wall-clock size of the gap was wholly unmeasured.
+`docs/NEGATIVE_EVIDENCE.md` (bd-b9dug, 2026-07-11) already carried an interleaved A/B
+of a production-ISA `create-bench` against the default build:
 
 > v3 is **1.18–1.40× faster** in absolute throughput at every thread count
 > (t1 74k→93k, t8 46k→54k), so the benchmark binary **UNDERSTATES production** and the
 > "8.3×@8t" gap is inflated.
 
-Two things follow, and they are exactly the re-statement in §2 arrived at independently
-a fortnight earlier — which is corroboration, not coincidence:
+That experiment remains useful for its named workload, but it compared
+`v3 + opt-3 + fat-LTO` with the default `release` profile (`opt-level="z"`), so it
+conflated profile, LTO, and ISA.
 
-- It confirms **Class B**: the published parallel-metadata-write loss is inflated.
-- It confirms the **Class C** reasoning about contention-shaped levers. The same row
-  reports the *scaling shape* is unchanged (v3 `t8/t1` = **0.58×** vs opt-z **0.62×**,
-  both negative) and concludes *"the contention is real + ISA-independent."* That is
-  direct evidence for the prediction in §2 that the wait-free publication gate's
-  1.70–2.11× is not at risk from the ISA gap.
+The fresh pairs isolate generic release-perf versus v3 release-perf:
 
-**What genuinely remains open is narrower than "the wall-clock gap".** That A/B compared
-`v3 + opt-3 + fat-LTO` against **the default `release` profile, which is `opt-level="z"`**
-— so it measures `opt-z → opt-3` *plus* fat-LTO *plus* the ISA, conflated. The
-benchmark profile `release-perf` **already has opt-3 and fat LTO**. So the ISA-only
-delta from `release-perf` to production is **strictly smaller than 1.18–1.40×**, and
-that residual is what is unmeasured.
+| benchmark arm | generic normalized median | v3 normalized median | observed change |
+|---|---:|---:|---:|
+| allocator full scan | 492.435 µs | 490.833 µs | 0.33% faster |
+| allocator cursor | 39.614 µs | 36.296 µs | 9.14% faster |
+| JBD2 scalar | 4.401601 ms | 4.373304 ms | 0.65% faster |
+| JBD2 grouped | 1.670168 ms | 1.680029 ms | 0.59% slower |
 
-Retry predicate for the residual: on an AVX2-capable pinned worker, build
-`--profile release-perf` with and without `-C target-cpu=x86-64-v3` from identical
-source, confirm the ELF shas differ (proving the flag reached the compiler), and gate on
-wall/cycles — never on instruction count. With `ovh-b` out of the `rust` tag this is now
-schedulable on any of 11 workers; it was not before.
+These are same-source, same-worker, pinned whole-binary observations. Each
+candidate/control decision is supported by its invocation's median CI; the absolute
+cross-binary medians are not promoted into a universal correction factor.
+
+What remains open is exact v3+PGO production identity and every workload not rerun
+here. Retry predicate: train and build the production PGO binary from the same source,
+record its executing ELF SHA and AVX2+FMA witness, then compare the same parity-checked
+workload on the same pinned worker with an in-invocation A/A null. Gate on wall/cycles
+median CI, never CV or instruction count.

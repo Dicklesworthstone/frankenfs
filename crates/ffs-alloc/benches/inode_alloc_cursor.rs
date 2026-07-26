@@ -69,6 +69,23 @@ fn self_identity() -> String {
     format!("{} ({} bytes) {}", encoded, bytes.len(), path.display())
 }
 
+fn print_codegen_isa() {
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "codegen_isa,target_arch=x86_64,compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse4_2={},runtime_avx2={},runtime_fma={}",
+        cfg!(target_feature = "sse2"),
+        cfg!(target_feature = "sse4.2"),
+        cfg!(target_feature = "avx2"),
+        cfg!(target_feature = "fma"),
+        std::arch::is_x86_feature_detected!("sse4.2"),
+        std::arch::is_x86_feature_detected!("avx2"),
+        std::arch::is_x86_feature_detected!("fma"),
+    );
+
+    #[cfg(not(target_arch = "x86_64"))]
+    println!("codegen_isa,target_arch={}", std::env::consts::ARCH);
+}
+
 fn seed_inode_bitmap() -> Vec<u8> {
     let mut bitmap = vec![0_u8; usize::try_from(INODES.div_ceil(8)).unwrap()];
     for idx in 0..RESERVED_INODES {
@@ -260,6 +277,7 @@ fn print_stats(label: &str, stats: &PairedStats) {
 
 fn main() {
     println!("bench_elf_sha256={}", self_identity());
+    print_codegen_isa();
 
     let baseline = restart_at_zero_allocs();
     let candidate = cursor_allocs();
