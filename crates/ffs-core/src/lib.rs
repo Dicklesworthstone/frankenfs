@@ -3970,6 +3970,27 @@ impl OpenFs {
         Self::open_with_options(cx, path, &OpenOptions::default())
     }
 
+    /// Replace an unused default MVCC store with an explicitly selected
+    /// publication mode for a same-process benchmark.
+    ///
+    /// This is deliberately narrow: callers must select the mode immediately
+    /// after [`Self::open`], before any transaction or snapshot exists. It lets
+    /// a harness construct control and candidate filesystems inside one
+    /// executing ELF without mutating process-global environment variables.
+    #[doc(hidden)]
+    pub fn set_empty_mvcc_publication_mode_for_bench(
+        &mut self,
+        mode: ffs_mvcc::sharded::PublicationMode,
+    ) -> Result<(), FfsError> {
+        if self.mvcc_store.version_count() != 0 || self.mvcc_store.active_snapshot_count() != 0 {
+            return Err(FfsError::Format(
+                "benchmark publication mode must be selected before MVCC use".to_owned(),
+            ));
+        }
+        self.mvcc_store = Arc::new(FsMvccStore::sharded_with_publication_mode(mode));
+        Ok(())
+    }
+
     /// Open a filesystem image with custom options.
     pub fn open_with_options(
         cx: &Cx,

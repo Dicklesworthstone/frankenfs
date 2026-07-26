@@ -55,6 +55,8 @@ use ffs_harness::{
         load_writeback_ordering_oracle,
     },
 };
+#[cfg(feature = "bhh0i_sharded_alloc")]
+use ffs_mvcc::sharded::PublicationMode;
 use ffs_ondisk::{
     BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4GroupDesc,
     Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, ext4::Ext4QuotaInodes, parse_dx_root,
@@ -763,6 +765,37 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         rounds: usize,
     },
+    /// Run the bd-bhh0i cutover decision as one self-contained invocation:
+    /// interleaved 1-thread Mutex/Mutex A/A followed by interleaved 8-thread
+    /// WaitFree/Mutex A/B, with a deterministic bootstrap median CI.
+    ///
+    /// Each arm needs its own byte-identical, non-reflink clone of one freshly
+    /// formatted ext4 image because the benchmark mutates it. All four images
+    /// must have the same SHA-256 and be no larger than 2 GiB. Flushes occur
+    /// after every timed round and are excluded from the statistic; the
+    /// resulting images remain available for e2fsck.
+    #[command(name = "create-bench-cutover-gate")]
+    CreateBenchCutoverGate {
+        /// Cloned ext4 image for the left A/A Mutex arm.
+        aa_lhs_image: PathBuf,
+        /// Cloned ext4 image for the right A/A Mutex arm.
+        aa_rhs_image: PathBuf,
+        /// Cloned ext4 image for the A/B Mutex control arm.
+        ab_base_image: PathBuf,
+        /// Cloned ext4 image for the A/B WaitFree candidate arm.
+        ab_candidate_image: PathBuf,
+        /// Absolute path of an existing directory to create files in.
+        dir: String,
+        /// Number of files created by each arm per paired round.
+        #[arg(long, default_value_t = 40_000)]
+        count: usize,
+        /// Parallel writers in the A/B pair. The A/A pair is always 1-thread.
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+        /// Interleaved paired rounds. Arm order alternates every round.
+        #[arg(long, default_value_t = 11)]
+        rounds: usize,
+    },
     /// Benchmark mkdir: create `count` subdirectories in `dir` + flush, timing
     /// total throughput. Each mkdir is an existence-check lookup + inode/dir
     /// alloc + parent insert + MVCC commit — exercises the name-index across a
@@ -1198,6 +1231,7 @@ impl Command {
             Self::WriteBench { .. } => "writebench",
             Self::LookupBench { .. } => "lookupbench",
             Self::CreateBench { .. } => "createbench",
+            Self::CreateBenchCutoverGate { .. } => "createbench-cutover-gate",
             Self::MkdirBench { .. } => "mkdirbench",
             Self::RmdirBench { .. } => "rmdirbench",
             Self::UnlinkBench { .. } => "unlinkbench",
@@ -1970,12 +2004,15 @@ fn run() -> Result<()> {
     let _run_guard = run_span.enter();
     let started = Instant::now();
 
-    info!(
-        target: "ffs::cli",
-        command = command_name,
-        log_format = log_format.as_str(),
-        "command_start"
-    );
+    let evidence_must_be_first = matches!(&cli.command, Command::CreateBenchCutoverGate { .. });
+    if !evidence_must_be_first {
+        info!(
+            target: "ffs::cli",
+            command = command_name,
+            log_format = log_format.as_str(),
+            "command_start"
+        );
+    }
 
     let result = match cli.command {
         Command::Inspect {
@@ -2019,6 +2056,23 @@ fn run() -> Result<()> {
             threads,
             rounds,
         } => createbench_cmd(&image, &dir, count, threads, rounds),
+        Command::CreateBenchCutoverGate {
+            aa_lhs_image,
+            aa_rhs_image,
+            ab_base_image,
+            ab_candidate_image,
+            dir,
+            count,
+            threads,
+            rounds,
+        } => createbench_cutover_gate_cmd(
+            [&aa_lhs_image, &aa_rhs_image],
+            [&ab_base_image, &ab_candidate_image],
+            &dir,
+            count,
+            threads,
+            rounds,
+        ),
         Command::MkdirBench { image, dir, count } => mkdirbench_cmd(&image, &dir, count),
         Command::RmdirBench { image, dir, count } => rmdirbench_cmd(&image, &dir, count),
         Command::UnlinkBench { image, dir, count } => unlinkbench_cmd(&image, &dir, count),
@@ -2510,7 +2564,7 @@ fn createbench_cmd(
     // Low-variance mode (`--rounds N > 1`). Everything below the historical
     // single-round paths, so `--rounds 1` reaches them untouched.
     if rounds > 1 {
-        return createbench_rounds(&cx, &mut open_fs, parent, count, threads, rounds);
+        return createbench_rounds(&cx, &open_fs, parent, count, threads, rounds);
     }
 
     // Parallel mode: each thread creates in its own subdir, so the only shared
@@ -2605,35 +2659,208 @@ fn createbench_cmd(
 /// starts fuller than round 1. That is why per-round lines are printed rather
 /// than a single aggregate — the caller alternates arms ACROSS rounds, which
 /// cancels the fill trend to first order, and can inspect it directly.
-/// SHA-256 of the executing binary, hashed in-process from `current_exe()`.
-fn elf_self_sha256() -> Result<String> {
+fn sha256_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(&mut acc, "{byte:02x}");
+            acc
+        })
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let exe = std::env::current_exe().context("current_exe")?;
-    let mut file = std::fs::File::open(&exe)
-        .with_context(|| format!("open {} for self-hash", exe.display()))?;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open {} for SHA-256", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0_u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).context("read self for hash")?;
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read {} for SHA-256", path.display()))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .fold(String::with_capacity(64), |mut acc, b| {
-            use std::fmt::Write as _;
-            let _ = write!(&mut acc, "{b:02x}");
-            acc
-        }))
+    Ok(sha256_hex(&hasher.finalize()))
+}
+
+/// Hash equal-size A/A and A/B input files in round-robin chunks. Sequentially
+/// scanning multi-gigabyte images immediately before the first observation
+/// gives the last path a page-cache recency advantage; interleaving bounds that
+/// skew to one 64 KiB chunk while still proving complete-byte identity.
+fn interleaved_file_sha256(paths: [&Path; 4]) -> Result<[String; 4]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        files.push(
+            std::fs::File::open(path)
+                .with_context(|| format!("open {} for interleaved SHA-256", path.display()))?,
+        );
+    }
+    let mut hashers: [Sha256; 4] = std::array::from_fn(|_| Sha256::new());
+    let mut buffers: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0_u8; 64 * 1024]);
+    loop {
+        let mut any_read = false;
+        for index in 0..paths.len() {
+            let n = files[index].read(&mut buffers[index]).with_context(|| {
+                format!("read {} for interleaved SHA-256", paths[index].display())
+            })?;
+            if n != 0 {
+                hashers[index].update(&buffers[index][..n]);
+                any_read = true;
+            }
+        }
+        if !any_read {
+            break;
+        }
+    }
+    Ok(hashers.map(|hasher| sha256_hex(&hasher.finalize())))
+}
+
+/// SHA-256 of the executing binary, hashed in-process from `current_exe()`.
+fn elf_self_sha256() -> Result<String> {
+    let exe = std::env::current_exe().context("current_exe")?;
+    file_sha256(&exe).with_context(|| format!("self-hash executing ELF {}", exe.display()))
+}
+
+#[derive(Clone, Copy)]
+struct BootstrapMedianCi {
+    median: f64,
+    low: f64,
+    high: f64,
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    values.sort_by(f64::total_cmp);
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 0 {
+        values[midpoint - 1].midpoint(values[midpoint])
+    } else {
+        values[midpoint]
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// Deterministic paired bootstrap over log ratios. The cutover verdict consumes
+/// only this median confidence interval; CV is neither computed nor consulted.
+fn bootstrap_median_ci(log_ratios: &[f64]) -> BootstrapMedianCi {
+    const RESAMPLES: usize = 20_000;
+    assert!(
+        !log_ratios.is_empty(),
+        "bootstrap median CI requires paired samples"
+    );
+    let mut state =
+        0xB440_10C1_2026_0726_u64 ^ u64::try_from(log_ratios.len()).expect("length fits u64");
+    let mut bootstrapped = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut sample = Vec::with_capacity(log_ratios.len());
+        for _ in log_ratios {
+            let draw =
+                splitmix64(&mut state) % u64::try_from(log_ratios.len()).expect("length fits u64");
+            sample.push(log_ratios[usize::try_from(draw).expect("draw fits usize")]);
+        }
+        bootstrapped.push(median(sample));
+    }
+    bootstrapped.sort_by(f64::total_cmp);
+    let low_index = RESAMPLES.saturating_mul(25) / 1000;
+    let high_index = RESAMPLES
+        .saturating_mul(975)
+        .div_ceil(1000)
+        .saturating_sub(1);
+    BootstrapMedianCi {
+        median: median(log_ratios.to_vec()).exp(),
+        low: bootstrapped[low_index].exp(),
+        high: bootstrapped[high_index].exp(),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn print_codegen_isa() {
+    println!(
+        "codegen_isa,target_arch=x86_64,compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse4_2={},runtime_avx2={},runtime_fma={}",
+        cfg!(target_feature = "sse2"),
+        cfg!(target_feature = "sse4.2"),
+        cfg!(target_feature = "avx2"),
+        cfg!(target_feature = "fma"),
+        std::is_x86_feature_detected!("sse4.2"),
+        std::is_x86_feature_detected!("avx2"),
+        std::is_x86_feature_detected!("fma"),
+    );
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn print_codegen_isa() {
+    println!("codegen_isa,target_arch=non_x86_64");
+}
+
+fn createbench_one_round(
+    cx: &Cx,
+    open_fs: &OpenFs,
+    parent: InodeNumber,
+    count: usize,
+    threads: usize,
+    round: usize,
+) -> Result<Duration> {
+    let per = if threads > 1 { count / threads } else { count };
+    let elapsed = if threads > 1 {
+        let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
+        for t in 0..threads {
+            let attr = open_fs
+                .mkdir(
+                    cx,
+                    parent,
+                    std::ffi::OsStr::new(&format!("t{t}_r{round}")),
+                    0o755,
+                    0,
+                    0,
+                )
+                .with_context(|| format!("failed to mkdir t{t}_r{round}"))?;
+            tdirs.push(attr.ino);
+        }
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            for (t, &tdir) in tdirs.iter().enumerate() {
+                let fs = &*open_fs;
+                s.spawn(move || {
+                    for i in 0..per {
+                        let name = format!("cb_{t}_{i:08}");
+                        fs.create(cx, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
+                            .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
+                    }
+                });
+            }
+        });
+        started.elapsed()
+    } else {
+        let started = Instant::now();
+        for i in 0..per {
+            let name = format!("cb_r{round}_{i:08}");
+            open_fs
+                .create(cx, parent, std::ffi::OsStr::new(&name), 0o644, 0, 0)
+                .with_context(|| format!("failed to create {name}"))?;
+        }
+        started.elapsed()
+    };
+    Ok(elapsed)
 }
 
 fn createbench_rounds(
     cx: &Cx,
-    open_fs: &mut OpenFs,
+    open_fs: &OpenFs,
     parent: InodeNumber,
     count: usize,
     threads: usize,
@@ -2651,45 +2878,7 @@ fn createbench_rounds(
     let per = if threads > 1 { count / threads } else { count };
     let per_round_total = per * threads.max(1);
     for round in 0..rounds {
-        let create_us = if threads > 1 {
-            let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
-            for t in 0..threads {
-                let attr = open_fs
-                    .mkdir(
-                        cx,
-                        parent,
-                        std::ffi::OsStr::new(&format!("t{t}_r{round}")),
-                        0o755,
-                        0,
-                        0,
-                    )
-                    .with_context(|| format!("failed to mkdir t{t}_r{round}"))?;
-                tdirs.push(attr.ino);
-            }
-            let started = Instant::now();
-            std::thread::scope(|s| {
-                for (t, &tdir) in tdirs.iter().enumerate() {
-                    let fs = &*open_fs;
-                    s.spawn(move || {
-                        for i in 0..per {
-                            let name = format!("cb_{t}_{i:08}");
-                            fs.create(cx, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
-                                .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
-                        }
-                    });
-                }
-            });
-            started.elapsed()
-        } else {
-            let started = Instant::now();
-            for i in 0..per {
-                let name = format!("cb_r{round}_{i:08}");
-                open_fs
-                    .create(cx, parent, std::ffi::OsStr::new(&name), 0o644, 0, 0)
-                    .with_context(|| format!("failed to create {name}"))?;
-            }
-            started.elapsed()
-        };
+        let create_us = createbench_one_round(cx, open_fs, parent, count, threads, round)?;
         let secs = create_us.as_secs_f64().max(1e-9);
         println!(
             "createbench_round,round={round},threads={threads},count={per_round_total},\
@@ -2709,6 +2898,322 @@ create_us={},creates_per_s={}",
         flush_started.elapsed().as_micros()
     );
     Ok(())
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+struct CreateBenchCutoverArm {
+    label: &'static str,
+    cx: Cx,
+    open_fs: OpenFs,
+    parent: InodeNumber,
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+impl CreateBenchCutoverArm {
+    fn open(
+        label: &'static str,
+        path: &Path,
+        dir_path: &str,
+        publication_mode: PublicationMode,
+    ) -> Result<Self> {
+        let cx = cli_cx();
+        let mut open_fs = OpenFs::open(&cx, path)
+            .with_context(|| format!("failed to open {label} image: {}", path.display()))?;
+        open_fs
+            .set_empty_mvcc_publication_mode_for_bench(publication_mode)
+            .with_context(|| format!("failed to select {label} publication mode"))?;
+        open_fs
+            .enable_writes(&cx)
+            .with_context(|| format!("failed to enable writes for {label}"))?;
+        open_fs.set_bhh0i_sharded_ops(true);
+
+        let mut parent = InodeNumber(1);
+        for comp in dir_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            let attr = open_fs
+                .lookup(&cx, parent, std::ffi::OsStr::new(comp))
+                .with_context(|| {
+                    format!("failed to resolve {dir_path} for {label} at component {comp:?}")
+                })?;
+            parent = attr.ino;
+        }
+        Ok(Self {
+            label,
+            cx,
+            open_fs,
+            parent,
+        })
+    }
+
+    fn time_and_flush(&self, count: usize, threads: usize, round: usize) -> Result<Duration> {
+        let elapsed =
+            createbench_one_round(&self.cx, &self.open_fs, self.parent, count, threads, round)?;
+        let flush_started = Instant::now();
+        self.open_fs
+            .sync_all_to_device(&self.cx)
+            .with_context(|| format!("failed to flush {} after round {round}", self.label))?;
+        println!(
+            "createbench_cutover_flush,arm={},round={round},flush_us={}",
+            self.label,
+            flush_started.elapsed().as_micros()
+        );
+        Ok(elapsed)
+    }
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+#[allow(clippy::too_many_arguments)]
+fn run_createbench_cutover_pair(
+    phase: &str,
+    logical_lhs: &CreateBenchCutoverArm,
+    logical_rhs: &CreateBenchCutoverArm,
+    count: usize,
+    threads: usize,
+    round: usize,
+    lhs_first: bool,
+) -> Result<f64> {
+    let (lhs_elapsed, rhs_elapsed) = if lhs_first {
+        (
+            logical_lhs.time_and_flush(count, threads, round)?,
+            logical_rhs.time_and_flush(count, threads, round)?,
+        )
+    } else {
+        let rhs = logical_rhs.time_and_flush(count, threads, round)?;
+        let lhs = logical_lhs.time_and_flush(count, threads, round)?;
+        (lhs, rhs)
+    };
+    let lhs_seconds = lhs_elapsed.as_secs_f64().max(1e-9);
+    let rhs_seconds = rhs_elapsed.as_secs_f64().max(1e-9);
+    let lhs_over_rhs = rhs_seconds / lhs_seconds;
+    println!(
+        "createbench_cutover_pair,phase={phase},round={round},order={},threads={threads},\
+lhs={},rhs={},lhs_us={},rhs_us={},lhs_over_rhs={lhs_over_rhs:.6}",
+        if lhs_first { "lhs_rhs" } else { "rhs_lhs" },
+        logical_lhs.label,
+        logical_rhs.label,
+        lhs_elapsed.as_micros(),
+        rhs_elapsed.as_micros(),
+    );
+    Ok(lhs_over_rhs.ln())
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+fn validate_cutover_images(paths: [&Path; 4]) -> Result<(u64, String)> {
+    const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let mut canonical_paths = BTreeSet::new();
+    #[cfg(unix)]
+    let mut file_identities = BTreeSet::new();
+    let mut image_size = None;
+    for path in paths {
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("canonicalize cutover image {}", path.display()))?;
+        if !canonical_paths.insert(canonical) {
+            bail!("cutover gate requires four distinct image files");
+        }
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("stat cutover image {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !file_identities.insert((metadata.dev(), metadata.ino())) {
+                bail!("cutover gate rejects hard-linked image paths");
+            }
+        }
+        let len = metadata.len();
+        if len > MAX_IMAGE_BYTES {
+            bail!(
+                "cutover image {} is {len} bytes; cap is {MAX_IMAGE_BYTES}",
+                path.display()
+            );
+        }
+        match image_size {
+            None => image_size = Some(len),
+            Some(expected) if expected == len => {}
+            Some(expected) => bail!(
+                "cutover images differ in size: expected {expected} bytes, {} is {len}",
+                path.display()
+            ),
+        }
+    }
+    let image_shas = interleaved_file_sha256(paths)?;
+    let expected_sha = &image_shas[0];
+    for (path, sha) in paths.iter().zip(image_shas.iter()).skip(1) {
+        if sha != expected_sha {
+            bail!(
+                "cutover images are not byte-identical: expected SHA-256 {expected_sha}, {} is {sha}",
+                path.display()
+            );
+        }
+    }
+    Ok((
+        image_size.context("cutover gate requires four image files")?,
+        expected_sha.clone(),
+    ))
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+fn measure_createbench_cutover(
+    null_images: [&PathBuf; 2],
+    decision_images: [&PathBuf; 2],
+    dir_path: &str,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<(BootstrapMedianCi, BootstrapMedianCi)> {
+    let null_lhs = CreateBenchCutoverArm::open(
+        "aa_mutex_lhs",
+        null_images[0],
+        dir_path,
+        PublicationMode::Mutex,
+    )?;
+    let null_rhs = CreateBenchCutoverArm::open(
+        "aa_mutex_rhs",
+        null_images[1],
+        dir_path,
+        PublicationMode::Mutex,
+    )?;
+    let mutex_control = CreateBenchCutoverArm::open(
+        "ab_mutex_base",
+        decision_images[0],
+        dir_path,
+        PublicationMode::Mutex,
+    )?;
+    let wait_free_candidate = CreateBenchCutoverArm::open(
+        "ab_wait_free_candidate",
+        decision_images[1],
+        dir_path,
+        PublicationMode::WaitFree,
+    )?;
+
+    let mut null_log_ratios = Vec::with_capacity(rounds);
+    let mut candidate_log_ratios = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        null_log_ratios.push(run_createbench_cutover_pair(
+            "aa",
+            &null_lhs,
+            &null_rhs,
+            count,
+            1,
+            round,
+            round % 2 == 0,
+        )?);
+        candidate_log_ratios.push(run_createbench_cutover_pair(
+            "ab",
+            &wait_free_candidate,
+            &mutex_control,
+            count,
+            threads,
+            round,
+            round % 2 != 0,
+        )?);
+    }
+    Ok((
+        bootstrap_median_ci(&null_log_ratios),
+        bootstrap_median_ci(&candidate_log_ratios),
+    ))
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+fn createbench_cutover_gate_cmd(
+    null_images: [&PathBuf; 2],
+    decision_images: [&PathBuf; 2],
+    dir_path: &str,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<()> {
+    let sha = elf_self_sha256().context("self-hash executing cutover ELF")?;
+    let worker = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("bench_evidence,binary_sha256={sha},worker={worker}");
+    print_codegen_isa();
+
+    if rounds < 5 {
+        bail!("cutover gate requires at least 5 paired rounds");
+    }
+    if threads < 2 {
+        bail!("cutover A/B requires at least 2 writer threads");
+    }
+    if count == 0 || count % threads != 0 {
+        bail!("count must be nonzero and divisible by threads");
+    }
+    let (image_size, image_sha256) = validate_cutover_images([
+        null_images[0].as_path(),
+        null_images[1].as_path(),
+        decision_images[0].as_path(),
+        decision_images[1].as_path(),
+    ])?;
+    println!(
+        "createbench_cutover_config,same_invocation=true,rounds={rounds},count={count},\
+aa_threads=1,ab_threads={threads},image_size={image_size},sharded_alloc=true,\
+input_image_sha256={image_sha256},gate_basis=bootstrap_median_ci,\
+bootstrap_resamples=20000,cv_used=false"
+    );
+
+    let (null_ci, candidate_ci) = measure_createbench_cutover(
+        null_images,
+        decision_images,
+        dir_path,
+        count,
+        threads,
+        rounds,
+    )?;
+    let null_log_margin = null_ci.low.ln().abs().max(null_ci.high.ln().abs());
+    let null_floor_ratio = null_log_margin.exp();
+    let twice_null_ratio = (2.0 * null_log_margin).exp();
+    let aa_inside_1_10 = (1.0 / 1.10..=1.10).contains(&null_ci.median);
+    let null_floor_le_1_15 = null_floor_ratio <= 1.15;
+    let ab_clears_twice_null = candidate_ci.low > twice_null_ratio;
+    let performance_admitted = aa_inside_1_10 && null_floor_le_1_15 && ab_clears_twice_null;
+
+    println!(
+        "createbench_cutover_median_ci,phase=aa,lhs_over_rhs_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        null_ci.median, null_ci.low, null_ci.high
+    );
+    println!(
+        "createbench_cutover_median_ci,phase=ab,candidate_over_base_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        candidate_ci.median, candidate_ci.low, candidate_ci.high
+    );
+    println!(
+        "createbench_cutover_decision,aa_inside_1_10={aa_inside_1_10},\
+null_floor_ratio={null_floor_ratio:.6},null_floor_le_1_15={null_floor_le_1_15},\
+twice_null_ratio={twice_null_ratio:.6},ab_ci_clears_twice_null={ab_clears_twice_null},\
+performance_admitted={performance_admitted},external_fsck_required=true,\
+gate_basis=bootstrap_median_ci,cv_used=false"
+    );
+    println!(
+        "createbench_cutover_expected_files,aa_each={},ab_each={}",
+        12_usize.saturating_add(count.saturating_mul(rounds)),
+        12_usize
+            .saturating_add(count.saturating_mul(rounds))
+            .saturating_add(threads.saturating_mul(rounds))
+    );
+    if performance_admitted {
+        Ok(())
+    } else {
+        bail!("cutover performance gate rejected the candidate; see decision row")
+    }
+}
+
+#[cfg(not(feature = "bhh0i_sharded_alloc"))]
+fn createbench_cutover_gate_cmd(
+    _null_images: [&PathBuf; 2],
+    _decision_images: [&PathBuf; 2],
+    _dir_path: &str,
+    _count: usize,
+    _threads: usize,
+    _rounds: usize,
+) -> Result<()> {
+    bail!("create-bench-cutover-gate requires --features bhh0i_sharded_alloc")
 }
 
 fn mkdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {

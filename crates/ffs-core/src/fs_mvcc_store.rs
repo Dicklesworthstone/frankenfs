@@ -8,7 +8,7 @@
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result as FfsResult};
-use ffs_mvcc::sharded::ShardedMvccStore;
+use ffs_mvcc::sharded::{PublicationMode, ShardedMvccStore};
 use ffs_mvcc::{
     BlockVersionStats, CommitError, EbrVersionStats, MergeProof, MvccStore, Transaction,
     TransactionOutcomeStats, TxnAbortReason,
@@ -46,6 +46,13 @@ impl FsMvccStore {
         // residual parallel-write gap (bd-bhh0i) is the global active_snapshots
         // lock, not shard count (docs/NEGATIVE_EVIDENCE.md).
         Self::Sharded(ShardedMvccStore::for_host_parallelism())
+    }
+
+    pub(super) fn sharded_with_publication_mode(mode: PublicationMode) -> Self {
+        Self::Sharded(ShardedMvccStore::with_publication_mode(
+            ShardedMvccStore::host_parallelism_shard_count(),
+            mode,
+        ))
     }
 
     pub(super) const fn is_sharded(&self) -> bool {

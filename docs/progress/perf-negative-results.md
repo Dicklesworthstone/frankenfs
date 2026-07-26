@@ -13,6 +13,153 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## bd-bhh0i cutover: wait-free publication is now the default after a 1.467327x final-source e2e win (2026-07-26, GreenSpring, MEASURED)
+
+The institutional preflight found the prior wait-free publication row and printed
+its exact remaining cutover predicate: one further end-to-end run whose A/A median
+is inside 1.10x, symmetric null floor is at most 1.15x, A/B effect clears twice that
+null margin, and both arms have real `e2fsck` parity. This run satisfies that
+predicate; it does not reopen the already-closed commit-primitive frontier.
+
+The cutover also repairs a measurement-contract gap in the earlier
+`create-bench --rounds` evidence. Those rows self-reported the executing ELF, but
+the control and candidate filesystems were still created in separate CLI
+invocations. The new `create-bench-cutover-gate` opens four filesystems in one
+process and selects `Mutex` or `WaitFree` explicitly on each empty MVCC store,
+without process-global environment mutation. Each of 11 rounds contains both a
+`Mutex`/`Mutex` A/A pair at one thread and a `WaitFree`/`Mutex` A/B pair at eight
+threads. Every round runs A/A then A/B, while the two arms inside each pair
+alternate order. Every timed arm creates exactly 40,000 files; image flushes,
+ELF hashing, and external fsck are outside the timed interval.
+The process computes a deterministic 20,000-resample paired bootstrap CI over
+median log ratios. It never computes or gates on CV.
+
+The final admitted process self-reported its executing ELF SHA-256 in-process as `2facbbb0f9a99a463abf7f761d7c870ddae0d8cad893be343562f080fca6dd43`.
+Every executable reported its SHA-256 as stdout line one from `current_exe()`
+inside the process, then witnessed compile-time and runtime SSE2, SSE4.2, AVX2,
+and FMA. The scoped local exception was used only for
+`cargo build -p ffs-cli --profile release-perf --features
+bhh0i_sharded_alloc` with `RUSTFLAGS=-C target-cpu=x86-64-v3`, reusing the repo's
+single `target/` directory. `/data` had 473G free before the final-source gate
+and 473G after all four fsck runs, safely above the 120G abort floor.
+
+### REJECTED instrument input: four independently formatted images
+
+The first full invocation used four separate `mke2fs` outputs. It correctly
+rejected itself:
+
+- A/A median **1.043360**, bootstrap median CI
+  **[0.997696, 2.577479]**, symmetric null floor **2.577479x**;
+- A/B median **1.397478**, CI **[1.369969, 1.557756]**; and
+- `performance_admitted=false`, because the null floor exceeded 1.15x and the
+  A/B lower bound did not clear the twice-null threshold **6.643396x**.
+
+This was an input-construction defect, not a publication-mode verdict.
+Independent ext4 UUID and directory-hash seeds let the A/A directory layouts
+diverge at high fill: from round 6 onward one nominally identical mutex image took
+2.0-2.59x as long. The counted post-run evidence agreed: both A/A arms had 440,012
+files and fsck rc 0, but occupied 55,634 versus 55,357 blocks; the A/B arms had
+440,100 files and fsck rc 0 but occupied 54,611 versus 54,545 blocks.
+
+**Retry predicate:** rerun only after cloning one byte-identical freshly formatted
+base image into all four paths outside timing, without reflink COW asymmetry, and
+prove all four pre-run image hashes equal. That predicate was immediately satisfied
+with non-reflink sparse copies; all four inputs had SHA-256
+`8e62d7e218d7b80c5c8c1936af1854b6fe9e423ca2b9b044eda93494681b2700`.
+
+### Preliminary cloned-input PASS
+
+Before the default flip and self-enforcing image validator were added, ELF
+`4bd8574e1c425049b3a80ae7a3aa6f66a42ac2e4765e282614dba6859d31c176`
+produced:
+
+| phase | median ratio | bootstrap median CI | decision threshold |
+|---|---:|---:|---:|
+| A/A, mutex lhs / mutex rhs | **0.989123** | **[0.956675, 0.997225]** | inside 1.10x; null floor **1.045287x** <= 1.15x |
+| A/B, wait-free / mutex throughput | **1.645237x** | **[1.420257, 1.934142]** | lower bound > twice-null **1.092626x** |
+
+External fsck then matched at 440,012 files / 55,566 blocks for both A/A images
+and 440,100 files / 54,611 blocks for both A/B images. This satisfied the
+pre-registered predicate, but the production default and the input guard changed
+the ELF afterward, so this is corroboration rather than the published
+final-source ratio.
+
+### REJECTED final-source validator: sequential full-image hashing
+
+The first hardened final-source ELF,
+`8060a799feef0583d7ddb5e822a598258af57b1c41642dc9dfd363b453715278`,
+correctly refused to publish its result:
+
+- A/A median **0.966427**, CI **[0.678536, 1.020347]**, null floor
+  **1.473762x**;
+- A/B median **1.413596**, CI **[1.221787, 1.529118]**; and
+- twice-null threshold **2.171975x**, therefore
+  `performance_admitted=false` and a nonzero process exit.
+
+The validator had read four complete 2GiB images sequentially immediately before
+timing, giving later paths a page-cache recency advantage. The A/A control named
+that mechanism: the same cloned inputs still produced a 47% null floor.
+
+**Retry predicate:** preserve complete in-process input hashing but stream one
+64KiB chunk from each image in round-robin order, bounding validation recency skew
+to one chunk rather than multiple GiB. Then reformat one base, copy it without
+reflinks, and rerun once. The final source implements and satisfies this predicate.
+
+### KEEP: final-source cloned-input cutover gate
+
+The final executable reported:
+
+`bench_evidence,binary_sha256=2facbbb0f9a99a463abf7f761d7c870ddae0d8cad893be343562f080fca6dd43,worker=thinkstation1`
+
+It rejected hard links and unequal image bytes in-process. Round-robin hashing
+proved all four fresh inputs had SHA-256
+`98b891ece5a76578e64c2996db119e121ef6f4bab671a79c76b16c69cf1e5c3a`.
+The final-source result was:
+
+| phase | median ratio | bootstrap median CI | decision threshold |
+|---|---:|---:|---:|
+| A/A, mutex lhs / mutex rhs | **0.985164** | **[0.964017, 1.006859]** | inside 1.10x; null floor **1.037326x** <= 1.15x |
+| A/B, wait-free / mutex throughput | **1.467327x** | **[1.342048, 1.619068]** | lower bound > twice-null **1.076045x** |
+
+The process emitted `aa_inside_1_10=true`, `null_floor_le_1_15=true`,
+`ab_ci_clears_twice_null=true`, and `performance_admitted=true`, then exited 0.
+External correctness passed on those exact admitted images:
+
+- both A/A images: `e2fsck -fn` rc 0, **440,012 files**, **55,859 blocks**; and
+- both A/B images: `e2fsck -fn` rc 0, **440,100 files**, **54,864 blocks**.
+
+The only fsck diagnostic was the non-fixing “extent tree could be narrower”
+suggestion; no structural, count, connectivity, reference-count, or group-summary
+error was reported. Ordering and tie-breaking are unchanged because both
+publication algorithms expose only the same contiguous commit-sequence prefix.
+Filesystem bytes and allocation counts match exactly within each A/A and A/B pair.
+Floating point and RNG are N/A.
+
+**DECISION:** KEEP the same-invocation cutover harness and make
+`PublicationMode::WaitFree` the production default. Setting
+`FFS_MVCC_WAITFREE_PUBLISH=mutex` (or `0`, `false`, `off`, or `no`) restores the
+compatibility mutex gate; `nospin` remains diagnostic. This final run supersedes
+the earlier default-OFF recommendation and is the first single invocation to
+satisfy every pre-registered performance and external-correctness criterion.
+Historical 1.44-1.57x separate-invocation results and the preliminary 1.645237x
+same-invocation result remain corroborating evidence, not the published
+final-source ratio.
+
+Strict-remote v3 validation passed the focused CLI check and the publication
+default/fallback unit test (1/1). A broad `-D warnings` CLI Clippy run reached
+the changed path; after its owned findings were repaired, the final rerun
+reported exactly 51 older CLI diagnostics and none on the cutover-owned
+surface. Targeted rustfmt remains blocked only by existing lines outside the
+owned hunks; the owned hunks and `git diff --check` are clean.
+
+**Retry predicate:** revisit the default only when the shipped target CPU,
+toolchain, publication algorithm, or workload changes, or when a production
+profile on an oversubscribed host makes aggregate cycles/CPU rather than wall
+throughput the discriminator. Require one witnessed-v3+PGO executing ELF, four
+byte-identical non-reflink input images, same-invocation interleaved A/A plus A/B,
+exact per-pair fsck file/block parity, and a bootstrap median wall/cycles CI that
+clears twice its own null log-margin. Never gate on CV.
+
 ## Send-stream primary-parent projection removed: 1.044838x whole-stream win (bd-btrfs-send-parent-index-azojl) - 2026-07-26 (GreenSpring, MEASURED)
 
 The institutional preflight first exited 2 on the existing parsed-`INODE_REF`
@@ -142,12 +289,12 @@ six minutes to release four fleet slots and is **not** counted as a performance 
 production-liveness verdict. That incident motivated the bounded liveness diagnostic;
 the final ELF then completed every pair on the same worker without firing it.
 
-**DECISION:** keep the persistent median-CI harness and retain the spinning
-`PublicationMode::WaitFree` submode. No production algorithm or default changes:
-when `FFS_MVCC_WAITFREE_PUBLISH` is absent, production still selects `Mutex`;
-`nospin` remains an explicit option for CPU-constrained or oversubscribed hosts.
-This result settles isolated wall throughput, not aggregate CPU efficiency on those
-hosts.
+**DECISION AT THIS SUBTEST:** keep the persistent median-CI harness and retain the
+spinning `PublicationMode::WaitFree` submode. This subtest itself made no production
+default change. The later final-source cutover row above now makes `WaitFree` the
+absent-variable default; `mutex` restores the compatibility gate and `nospin`
+remains an explicit option for CPU-constrained or oversubscribed hosts. This result
+settles isolated wall throughput, not aggregate CPU efficiency on those hosts.
 
 **Retry predicate:** revisit immediate parking only after a production profile on an
 oversubscribed or CPU-budgeted deployment makes aggregate cycles/CPU the
@@ -158,6 +305,12 @@ per-sample store construction and thread churn. If the new
 `persistent_commit_liveness_blocker` fires on an otherwise idle worker, first
 reproduce the reported arm/epoch under the existing publication-gate watchdog tests;
 do not infer a production deadlock from RCH stale-progress metadata alone.
+
+> **CUTOVER SUPERSESSION:** the chronological `bd-bhh0i` rows below correctly
+> record why the default was still OFF at each intermediate checkpoint. They are
+> historical state, not the current configuration. The final-source cutover row
+> above satisfied the remaining null-floor and real-fsck predicate; absent an
+> override, production now selects `PublicationMode::WaitFree`.
 
 ## ⚠ CORRECTION + CONFIRMATION — the e2e win replicates 3/3 (1.44-1.57x) but my "26 images all rc 0" was PARTLY VACUOUS; real count is 68 (bd-bhh0i) - 2026-07-26 (turn 14b, cc)
 

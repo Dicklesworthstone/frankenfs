@@ -259,15 +259,15 @@ impl CommitLockProbe for CommitLockProfile {
 /// synchronization used to reach that state (bd-bhh0i publication convoy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PublicationMode {
-    /// Production default: one global `Mutex<BTreeSet>` plus a `Condvar`, taken
-    /// on every commit that is not already covered by the watermark.
-    #[default]
+    /// Compatibility fallback: one global `Mutex<BTreeSet>` plus a `Condvar`,
+    /// taken on every commit that is not already covered by the watermark.
     Mutex,
-    /// Wait-free ordered publication: the committer stores its sequence into a
-    /// slot of a power-of-two ring and CAS-walks the contiguous ready prefix
-    /// forward. No mutex and no ordered-tree work on the common path; the
-    /// `Condvar` survives only as the parking path for a committer whose
-    /// predecessor has not published yet.
+    /// Production default: the committer stores its sequence into a slot of a
+    /// power-of-two ring and CAS-walks the contiguous ready prefix forward. No
+    /// mutex and no ordered-tree work on the common path; the `Condvar`
+    /// survives only as the parking path for a committer whose predecessor has
+    /// not published yet.
+    #[default]
     WaitFree,
     /// [`Self::WaitFree`] with the pre-park spin disabled: a committer whose
     /// predecessor has not published parks immediately instead of re-draining
@@ -283,18 +283,27 @@ pub enum PublicationMode {
 }
 
 impl PublicationMode {
-    /// Mode selected by `FFS_MVCC_WAITFREE_PUBLISH` (`1`/`true`/`on` enables the
-    /// wait-free gate). Absent or unset, the production `Mutex` gate is used, so
-    /// the default build is byte-identical to the pre-lever binary.
+    /// Mode selected by `FFS_MVCC_WAITFREE_PUBLISH`.
+    ///
+    /// The wait-free gate is the production default after the `bd-bhh0i`
+    /// cutover. `0`/`false`/`off`/`no`/`mutex` restore the compatibility gate;
+    /// `nospin` selects the diagnostic no-spin variant. An unrecognized or
+    /// non-Unicode override fails closed to the compatibility gate.
     #[must_use]
     pub fn from_env() -> Self {
         match std::env::var("FFS_MVCC_WAITFREE_PUBLISH") {
-            Ok(value) => match value.trim() {
-                "1" | "true" | "on" | "yes" => Self::WaitFree,
-                "nospin" | "no-spin" => Self::WaitFreeNoSpin,
-                _ => Self::Mutex,
-            },
-            Err(_) => Self::Mutex,
+            Ok(value) => Self::from_env_value(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::from_env_value(None),
+            Err(std::env::VarError::NotUnicode(_)) => Self::Mutex,
+        }
+    }
+
+    fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None | Some("1" | "true" | "on" | "yes") => Self::WaitFree,
+            Some("nospin" | "no-spin") => Self::WaitFreeNoSpin,
+            Some("0" | "false" | "off" | "no" | "mutex") => Self::Mutex,
+            Some(_) => Self::Mutex,
         }
     }
 }
@@ -1774,6 +1783,31 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn publication_mode_cutover_defaults_to_wait_free_with_mutex_fallback() {
+        assert_eq!(PublicationMode::default(), PublicationMode::WaitFree);
+        assert_eq!(
+            PublicationMode::from_env_value(None),
+            PublicationMode::WaitFree
+        );
+        for enabled in ["1", "true", "on", "yes"] {
+            assert_eq!(
+                PublicationMode::from_env_value(Some(enabled)),
+                PublicationMode::WaitFree
+            );
+        }
+        for fallback in ["0", "false", "off", "no", "mutex", "invalid"] {
+            assert_eq!(
+                PublicationMode::from_env_value(Some(fallback)),
+                PublicationMode::Mutex
+            );
+        }
+        assert_eq!(
+            PublicationMode::from_env_value(Some("nospin")),
+            PublicationMode::WaitFreeNoSpin
+        );
+    }
 
     fn make_store(shards: usize) -> ShardedMvccStore {
         ShardedMvccStore::new(shards)
