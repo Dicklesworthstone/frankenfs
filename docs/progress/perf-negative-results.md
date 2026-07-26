@@ -13,6 +13,76 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## ⭐ bd-bhh0i E2E CUTOVER GATE RUN — correctness PASSES 20/20, performance UNDECIDABLE; default stays OFF for a MEASURED reason (bd-bhh0i) - 2026-07-25 (turn 13, cc, scoped local-exec exception)
+
+Status: the gate that has been blocked since 2026-07-13 finally RAN. Correctness is
+an unambiguous pass. The performance question is **undecidable on this harness**, and
+the harness's own negative control proves it. `FFS_MVCC_WAITFREE_PUBLISH` stays
+default OFF — but the reason is now a measurement, not a blocker.
+
+SETUP. Orchestrator granted a scoped local-exec exception (one crate, not the
+workspace; image files under /data/tmp; 2 GiB cap; df recorded; abort under 120G).
+Binary `ffs-cli` SHA-256
+`71ddd314d3f52104d6a0546d81461326eb2cd2aff0df2d92bdc5cbd7f0d859c9`, built
+`--profile release-perf --features bhh0i_sharded_alloc` on the newly PINNED
+`nightly-2026-07-20`. Image: `mke2fs -t ext4 -F -q -b 4096 -N 65536`, 524288 blocks =
+2 GiB / 16 groups / 65536 inodes, verified by `dumpe2fs`. 20 runs = 2 thread counts x
+2 arms x 5 interleaved rounds, arm order ALTERNATING per round, FRESH image copy per
+run, `e2fsck -fn` + file count on EVERY run. Disk 233G -> 232G, floor 120G, never
+approached.
+
+⭐ DESIGN CHOICE THAT DECIDED THE OUTCOME: **1 thread is a built-in NEGATIVE
+CONTROL.** The ffs-mvcc micro A/B measured the lever as inert below 4 writers
+(1t 0.98-1.01x, 2t inside the null across three ELFs), so at 1t the two arms are the
+SAME code path in every respect that matters. Whatever the 1t arm reports is
+therefore harness noise by construction — no modelling required.
+
+| threads | off median c/s | on median c/s | median ratio | per-round ratios |
+|--------:|---------------:|--------------:|-------------:|------------------|
+| 1 (control) | 119,104 | 79,198 | **0.8118** | 0.476, 0.625, 0.812, 1.054, 1.090 |
+| 8 (test) | 87,469 | 93,473 | **1.0582** | 0.869, 1.035, 1.058, 1.131, 2.102 |
+
+**THE CONTROL DEVIATES FROM 1.0 BY UP TO 52%** (ratios 0.476 and 2.102 both appear).
+The 8-thread effect is **5.8%**. An instrument whose null swings 52% cannot resolve a
+6% effect. **VERDICT: UNDECIDABLE — not a win, not a loss.** Per-round ratio spread is
+2.29x (1t) and 2.42x (8t); arm CVs 21.4/36.5% and 11.3/19.8%.
+
+Anyone quoting "1.06x end-to-end" from this table would be quoting noise. So would
+anyone quoting "0.81x at 1 thread" as a regression. Both readings are inside the same
+floor.
+
+✅ CORRECTNESS — UNAMBIGUOUS PASS. **20 of 20 runs `e2fsck -fn` rc 0.** Exact file
+parity, identical in both arms in every round: **40,013 files at 1 thread and 40,021
+at 8 threads** (40,000 created + baseline). No divergence between the mutex gate and
+the wait-free gate on any run. That is the result the cutover gate existed to produce,
+and it is now in hand: **the wait-free publication gate is correct end-to-end on a real
+multi-group ext4 image under 8-way parallel create, validated by an independent fsck.**
+
+WHY THE END-TO-END EFFECT IS SMALL EVEN IF REAL (Amdahl, stated as reasoning not
+measurement): the micro A/B isolated `ShardedMvccStore::commit`, where publication is
+a dominant term. End-to-end, a create is inode alloc + directory insert + inode-table
+RMW + block bitmap + MVCC commit + a final whole-image flush. Publication is a small
+share of that, so a 1.70x on the commit primitive dilutes to low single digits on
+create throughput. Nothing here contradicts the primitive result; the two measure
+different things and both are correctly reported.
+
+WHY THIS HARNESS CANNOT RESOLVE IT, mechanically: each run copies a 2 GiB image and
+ends with a full `sync_all_to_device` flush, so run-to-run variance is dominated by
+page-cache and writeback state, not by the filesystem. Round 1 of each thread count is
+the low outlier in BOTH arms (64,883 and 63,378 c/s) — a cold-cache artifact the
+alternating order cannot cancel because it is per-round, not per-arm.
+
+RETRY PREDICATE (concrete). Re-decide only on a create-bench whose 1-thread negative
+control lands inside 1.10x, which requires removing the per-run image copy and the
+whole-image flush from the timed region — e.g. a tmpfs-backed image reused across
+rounds with the flush outside the timer — and >= 15 rounds. Absent that instrument,
+**do not flip the default and do not quote an end-to-end ratio for this lever.** The
+defensible claims are exactly two: the commit-primitive A/B (1.70-2.11x, decidable
+3/3, see the turn-12 rows) and correctness (20/20 e2fsck rc 0, exact parity).
+
+DEFAULT: stays **OFF**. Not blocked any more — measured. The flag is available for a
+deployment that has independently established the commit path is its bottleneck.
+
 ## bd-b9dug CORRECTED: every published frankenfs ratio came from a baseline-ISA binary that is NOT what ships; claims re-stated by class (bd-b9dug) - 2026-07-25 (Lane L, cc, no worker used)
 
 Full writeup: `docs/BD_B9DUG_ISA_CORRECTION.md`.

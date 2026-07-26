@@ -284,7 +284,19 @@ Mechanism, not just wall time — publication **mutex** wait p99 collapses
 in both arms (524287 / 524287). Exactly the split predicted in §4.1: the mechanism cost
 is removed, the semantic cost is untouched.
 
-Default stays **OFF** until an end-to-end `create-bench` + `e2fsck` gate passes.
+**The e2e gate has now RUN** (2026-07-25, scoped local-exec exception). Correctness is
+an unambiguous pass: **20 of 20 runs `e2fsck -fn` rc 0** with exact file parity
+(40,013 @1t, 40,021 @8t, identical in both arms every round) on a real 2 GiB /
+16-group / 65536-inode `mke2fs` image under 8-way parallel create. The performance
+question is **UNDECIDABLE on that harness** and its own negative control proves it: the
+1-thread arm — where the lever is inert by construction — swings **up to 52% from
+1.0**, while the 8-thread effect is **5.8%**. An instrument whose null moves 52%
+cannot resolve a 6% effect.
+
+Default stays **OFF** — no longer because the gate was blocked, but because the gate
+was run and returned "undecidable". The two defensible claims are the commit-primitive
+A/B (1.70–2.11×, decidable 3/3) and correctness. Full row and retry predicate in
+`docs/progress/perf-negative-results.md`.
 
 ### 4.4 Rank 2 re-run — **RE-WON and landed**
 
