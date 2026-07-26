@@ -13,6 +13,89 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## ⚠ CORRECTION + CONFIRMATION — the e2e win replicates 3/3 (1.44-1.57x) but my "26 images all rc 0" was PARTLY VACUOUS; real count is 68 (bd-bhh0i) - 2026-07-26 (turn 14b, cc)
+
+`bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`
+— self-reported IN-PROCESS by the executing ELF (`current_exe()`, outside the timed
+region) on every run below. Each decision row carries its own execution provenance;
+inheriting it from a neighbouring row is exactly the "a sha256sum beside the run"
+weakness the guard rejects.
+
+Two things, and the correction comes first because I published the bad claim.
+
+### CORRECTION: the fsck in v3/v4/v4b/v5 was verifying nothing
+
+The row below (`bb992934`) states "26 end-to-end images, all `e2fsck -fn` rc 0".
+**Withdrawn for v3/v4/v4b/v5.** Defect in MY harness, not in the product:
+`--rounds 2` x `--count 40000` = 80,000 creates against a **65,536-inode** image.
+Round 1 hits `NoSpace`, the worker threads panic, and the process dies **before**
+`sync_all_to_device`. Nothing was persisted, so every fsck in those runs checked a
+pristine 13-file seed image and returned rc 0. Reproduced directly:
+`create cb_5_00003086: NoSpace` -> `13/65536 files`.
+
+A green check that passes because it never reached the code under test. That is the
+exact failure class this campaign's ledger audit exists to find, and I walked into it
+in my own harness — in the same turn as a row praising the pre-commit guard for
+catching my provenance gap. Recording it at full strength rather than quietly fixing
+it, because a correctness claim that was never evidence is worse than no claim.
+
+**What survives unaffected:** the THROUGHPUT ratios. Round 0 completes and is timed
+before round 1 panics, and both arms get identical treatment, so every ratio stands.
+**What is withdrawn:** the correctness half of v3/v4/v4b/v5 only.
+
+Note also the mechanism of my own error: stripping the flush out of the TIMED REGION
+(the fix that made the instrument work) also removed the thing that made the fsck
+meaningful. The negative control caught the timing defect; only the per-arm parity
+check caught this one. **Two different guards were needed for two different errors.**
+
+### CONFIRMATION: three independent decidable runs, and real correctness
+
+Fixed by sizing the image (`-N 262144`) so both rounds fit and the flush completes.
+
+| run | control median | control null floor | 8t median | margin | fsck |
+|---|---:|---:|---:|---:|---|
+| v4b | 1.0105 | 1.1145x | **1.4914** | 3.69x | vacuous |
+| v5 | 1.0020 | 1.0904x | **1.4395** | 4.21x | vacuous |
+| **v6** | 1.0109 | 1.1693x | **1.5698** | **2.88x** | ✅ **REAL** |
+
+**3 of 3 decidable. Range 1.44-1.57x, median ~1.49x.** v6 shows **COMPLETE arm
+separation**: min(wait-free) 185,206 > max(mutex) 147,264 c/s across all 11 paired
+rounds.
+
+v6 correctness is real and exact: **80,013 files at 1 thread and 80,029 at 8 threads,
+IDENTICAL in both arms, `e2fsck -fn` rc 0 on all 44 arm-images.** Corrected total of
+genuinely verified end-to-end images: **v1 20 + v2 4 + v6 44 = 68**, all rc 0 with
+exact per-arm file-count parity.
+
+### The flip predicate: 3 of 4 met, and I am NOT flipping on my own authority
+
+I pre-registered: "A/A null inside 1.10x, floor <= 1.15x, 8-thread margin >= 2.0x,
+plus per-arm e2fsck rc 0 with exact file-count parity."
+
+| criterion | v6 | |
+|---|---|---|
+| A/A null inside 1.10x | 1.0109 | ✅ |
+| 8t margin >= 2.0x | 2.88x | ✅ |
+| per-arm e2fsck rc 0 + exact parity | 80,013 / 80,029 both arms | ✅ |
+| control floor <= 1.15x | **1.1693x** | ❌ |
+
+**No single run satisfies all four**: v5 met the floor (1.0904x) but its fsck was
+vacuous; v6 has real correctness but a 1.1693x floor.
+
+I believe the floor criterion is **redundant with the margin criterion** — the margin
+already divides the effect by the floor, so a wider floor with a still-passing margin
+is *more* conservative, not less, and v6 clears 2.88x on the wider floor. But I
+pre-registered it and I am not going to quietly reinterpret a criterion after seeing
+the number. **Flagging it explicitly instead: 3 of 4 met, the miss is on the
+criterion I now think was redundant, and the decision to flip the default belongs to
+the owner, not to me.**
+
+DEFAULT: `FFS_MVCC_WAITFREE_PUBLISH` remains **OFF**. Recommendation to the owner:
+flip it. Evidence is 3/3 decidable end-to-end runs at 1.44-1.57x, complete arm
+separation, 68 fsck-clean images with exact parity, and a commit-primitive A/B that
+was already decidable 3/3 at 1.70-2.11x. If a fourth run is wanted, the one criterion
+to re-check is a control floor <= 1.15x alongside real correctness in the SAME run.
+
 ## ⭐⭐⭐ bd-bhh0i E2E DECIDABLE AT LAST — wait-free publication gate is 1.49x at 8 threads end-to-end; instrument rebuilt from a 52% null floor to 1.1145x (bd-bhh0i / bd-kdmu4) - 2026-07-26 (turn 14, cc, MEASURED)
 
 Status: the end-to-end question that has been UNDECIDABLE through four instrument
