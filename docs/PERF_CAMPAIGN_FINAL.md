@@ -41,21 +41,48 @@ Two other Cargo-config routes failed the same witness. The admitted route used
 executing binaries both reported AVX2+FMA. These v3 ELFs did **not** carry the
 CLI PGO profile, so they are not exact production-binary certifications.
 
+The 2026-07-27 strict-remote closeout now supplies exact production-shaped
+v3+PGO evidence for one CLI lookup corpus. On pinned worker `ovh-a`, the
+generic release-perf CLI self-reported ELF
+`1d36a367ee3703d99a92b8af52387af2570787db4070065082185db681517764`;
+the final v3+PGO CLI self-reported ELF
+`7136d8bf768a222ec2e6985efbe25249131a274db3b9bc81a4394323265adc62`
+and embedded consumed-profile SHA
+`3dbce2b2fca971cacd1963d0aaeb867de10417761624a0c1236d01a6880860db`.
+Across 31 alternating `AAB`/`BAA` rounds of 200,000 lookups on the same
+8,003-entry image, generic median was **21,667 us** and v3+PGO median was
+**15,110 us**. Generic/v3+PGO was **1.437700x**, bootstrap median 95% CI
+**[1.414742, 1.494961]**, versus generic/generic A/A **0.994371x**, CI
+**[0.974583, 1.005166]**. The real lower bound cleared the twice-null
+threshold **1.052840x**; exact output signature and input SHA held, and CV was
+never computed. The training corpus used the shipping script's
+create/lookup/rename/delete/walk workload families at fixture-scaled counts,
+so this is not a claim of byte identity with an older opaque profile.
+
+The exact staged-source replay after lint cleanup rebuilt v3+PGO ELF
+`1cf9b1dc5c162760787fb3fe003fbcbcccf132c4a1f753376996ac871c5275af`,
+which consumed the same profile and preserved the same image SHA and output
+signature. It independently measured **1.495236x**, CI
+**[1.459215, 1.520699]**, versus its own **1.122973x** twice-null threshold;
+A/A was **1.032385x**, CI **[1.008930, 1.059704]**. The two admissible
+decisions remain separate rather than being pooled.
+
 | Historical claim class | Corrected status |
 | --- | --- |
 | Wins vs kernel | Retained as generic-ELF history; neither direction nor magnitude transfers to the shipped binary without a workload-matched v3+PGO rerun. |
 | Losses vs kernel | Retained as generic-ELF routing evidence, not an upper bound; the gap cannot justify “structural” or “irreducible” closure without a shipped-binary rerun. |
 | Internal source-lever A/B ratios | Retained as historical same-build, generic-ELF measurements because both arms used one ELF. Fresh v3 reruns replace the owned allocator and JBD2 publication numbers above and demonstrate that magnitudes can move in either direction. |
-| Absolute throughput and latency | Not production-equivalent until the exact v3+PGO executing ELF is rerun. |
-| Proposed blanket adjustment | Forbidden. ISA and PGO sensitivity is workload-specific; the two witnessed ratios moved by -0.95% and +9.53%. |
+| Absolute throughput and latency | Production-shaped only for the named 8,003-entry lookup corpus above. Every other workload still requires its own exact v3+PGO rerun. |
+| Proposed blanket adjustment | Forbidden. ISA and PGO sensitivity is workload-specific: the two ISA-only source ratios moved by -0.95% and +9.53%, while the named whole-CLI lookup moved by 1.437700x under v3+PGO. |
 
 Concrete retry predicate: for a v3 run through RCH, forward `RUSTFLAGS` through
 the explicit environment allowlist and require remote rustc plus the executing
 binary to report AVX2+FMA; a distinct ELF alone is insufficient. For exact
 production attribution, build the benchmark with the complete shipped v3+PGO
-configuration, self-report the executing ELF, prove exact output/fsck parity,
-then run same-invocation paired A/A and A/B and gate only on the median-ratio
-95% CI outside twice the null margin. Do not infer PGO identity from v3 alone.
+configuration, self-report the executing ELF and consumed profile SHA, prove
+exact output/fsck parity, then run same-invocation paired A/A and A/B and gate
+only on the median-ratio 95% CI outside twice the null margin. Do not infer PGO
+identity from v3 alone or transfer the lookup result to a kernel comparator.
 See `docs/BD_B9DUG_ISA_CORRECTION.md` for the full claim inventory and
 admissibility rule.
 

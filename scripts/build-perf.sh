@@ -50,7 +50,12 @@ TRAIN_IMG="${1:-${FFS_TRAIN_IMG:-}}"
 
 if [ "${SKIP_TRAIN:-0}" != "1" ]; then
   echo ">> [1/4] instrumented build (profile-generate, target-cpu=$TARGET_CPU)"
-  rm -rf "$PGO_DIR"; mkdir -p "$PGO_DIR"
+  if [ -d "$PGO_DIR" ] && find "$PGO_DIR" -mindepth 1 -print -quit | grep -q .; then
+    echo "!! refusing to mix a new training run with existing PGO artifacts in $PGO_DIR" >&2
+    echo "!! choose an empty PGO_DIR, or set SKIP_TRAIN=1 to reuse its merged.profdata" >&2
+    exit 1
+  fi
+  mkdir -p "$PGO_DIR"
   RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-generate=$PGO_DIR" \
     cargo build --profile "$PROFILE" -p "$BIN"
   INSTR="$OUT"
@@ -73,8 +78,20 @@ if [ "${SKIP_TRAIN:-0}" != "1" ]; then
   "$PROFDATA" merge -f "$PGO_DIR/list.txt" -o "$PGO_DIR/merged.profdata"
 fi
 
+[ -s "$PGO_DIR/merged.profdata" ] || {
+  echo "!! missing or empty merged PGO profile: $PGO_DIR/merged.profdata" >&2
+  exit 1
+}
+PROFILE_SHA256="$(sha256sum "$PGO_DIR/merged.profdata" | awk '{print $1}')"
+[ "${#PROFILE_SHA256}" -eq 64 ] || {
+  echo "!! failed to compute merged PGO profile SHA-256" >&2
+  exit 1
+}
+
 echo ">> [4/4] optimized build (profile-use + fat LTO + target-cpu=$TARGET_CPU)"
-RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-use=$PGO_DIR/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
+FFS_PGO_PROFILE_SHA256="$PROFILE_SHA256" \
+  RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-use=$PGO_DIR/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
   cargo build --profile "$PROFILE" -p "$BIN"
 
-echo ">> done: $OUT  (fat LTO + target-cpu=$TARGET_CPU + PGO)"
+echo ">> done: $OUT  (fat LTO + target-cpu=$TARGET_CPU + PGO profile=$PROFILE_SHA256)"
+"$OUT" bench-evidence

@@ -627,6 +627,12 @@ struct Cli {
     reason = "clap subcommands keep typed flag payloads inline for direct parsing"
 )]
 enum Command {
+    /// Print the executing CLI's benchmark identity.
+    ///
+    /// Hidden from normal help because this is a measurement-harness contract,
+    /// not an end-user filesystem operation.
+    #[command(name = "bench-evidence", hide = true)]
+    BenchEvidence,
     /// Inspect a filesystem image (ext4 or btrfs).
     Inspect {
         /// Path to the filesystem image.
@@ -1225,6 +1231,7 @@ enum DumpCommand {
 impl Command {
     const fn name(&self) -> &'static str {
         match self {
+            Self::BenchEvidence => "bench-evidence",
             Self::Inspect { .. } => "inspect",
             Self::Read { .. } => "read",
             Self::RandRead { .. } => "randread",
@@ -2004,7 +2011,10 @@ fn run() -> Result<()> {
     let _run_guard = run_span.enter();
     let started = Instant::now();
 
-    let evidence_must_be_first = matches!(&cli.command, Command::CreateBenchCutoverGate { .. });
+    let evidence_must_be_first = matches!(
+        &cli.command,
+        Command::BenchEvidence | Command::CreateBenchCutoverGate { .. }
+    );
     if !evidence_must_be_first {
         info!(
             target: "ffs::cli",
@@ -2015,6 +2025,7 @@ fn run() -> Result<()> {
     }
 
     let result = match cli.command {
+        Command::BenchEvidence => bench_evidence_cmd(),
         Command::Inspect {
             image,
             json,
@@ -2805,6 +2816,17 @@ fn print_codegen_isa() {
 #[cfg(not(target_arch = "x86_64"))]
 fn print_codegen_isa() {
     println!("codegen_isa,target_arch=non_x86_64");
+}
+
+fn bench_evidence_cmd() -> Result<()> {
+    let sha = elf_self_sha256()?;
+    println!("bench_evidence,binary_sha256={sha}");
+    print_codegen_isa();
+    println!(
+        "build_profile,pgo_profile_sha256={}",
+        option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+    );
+    Ok(())
 }
 
 fn createbench_one_round(

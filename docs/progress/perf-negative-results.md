@@ -13,6 +13,89 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Exact v3+PGO whole-CLI lookup closes the bd-b9dug build-identity gap for one corpus - 2026-07-27 (GreenSpring, KEEP / CLAIM CORRECTION)
+
+The institutional preflight found no prior rejected row on the exact
+`remote_pgo_training_driver in crates/ffs-cli/src/main.rs` surface. The harness
+then built and executed all three identities on one pinned strict-remote
+`ovh-a` worker:
+
+- generic `release-perf` control ELF
+  `1d36a367ee3703d99a92b8af52387af2570787db4070065082185db681517764`
+  self-reported compile-time SSE2 true and SSE4.2/AVX2/FMA false;
+- v3 profile-generation ELF
+  `16b0b3d621dac6742d3af29aeac235bddbc3b3fc191403e64354432b0f64582a`
+  self-reported compile-time SSE2/SSE4.2/AVX2/FMA true; and
+- final v3+PGO ELF
+  `7136d8bf768a222ec2e6985efbe25249131a274db3b9bc81a4394323265adc62`
+  self-reported compile-time SSE2/SSE4.2/AVX2/FMA true and embedded the
+  consumed merged-profile SHA-256
+  `3dbce2b2fca971cacd1963d0aaeb867de10417761624a0c1236d01a6880860db`.
+
+The final process printed
+`bench_evidence,binary_sha256=7136d8bf768a222ec2e6985efbe25249131a274db3b9bc81a4394323265adc62`
+as its in-process executing-ELF identity before the ISA/profile lines.
+
+All three reported runtime AVX2+FMA. The 28,739,968-byte profile merged 518
+run-prefixed raw profiles produced by the production CLI workload family:
+6,000 creates, 1,000,000 lookups, 2,000 renames, 2,000 deletes, and one walk.
+Counts were scaled to the checked-in 64 MiB fixture; the build otherwise used
+the shipping shape—fat-LTO `release-perf`, `target-cpu=x86-64-v3`,
+`profile-generate`, merge, and `profile-use`. This proves the consumed profile
+for this build, not byte identity with an older opaque profile.
+
+One parent invocation controlled 31 alternating `AAB`/`BAA` rounds. A/A was
+generic/generic; A/B used the midpoint of those two controls against the
+v3+PGO CLI. Each observation performed 200,000 lookups against the same
+8,003-entry image, SHA-256
+`7fab3cc32b282ef9a23ef5afb222cd472fc7f3751f630f6848ff46e96c9503a6`.
+Every arm returned the exact signature
+`lookupbench: 200000 lookups in / (8003 entries) -> 200000`.
+
+- generic median: **21,667 us**;
+- v3+PGO median: **15,110 us**;
+- generic/generic A/A median: **0.994371x**, deterministic bootstrap median
+  95% CI **[0.974583, 1.005166]**;
+- symmetric null floor: **1.026080x**; pre-registered twice-null threshold:
+  **1.052840x**; and
+- generic/v3+PGO median: **1.437700x**, 95% CI
+  **[1.414742, 1.494961]**, verdict **PGO_FASTER**.
+
+The post-lint exact-source replay rebuilt v3+PGO ELF
+`1cf9b1dc5c162760787fb3fe003fbcbcccf132c4a1f753376996ac871c5275af`,
+which self-reported the same consumed-profile SHA and ISA witness. It preserved
+the same image SHA and output signature. Generic median was **21,410 us**,
+v3+PGO median was **14,266 us**, and generic/v3+PGO was **1.495236x**, 95% CI
+**[1.459215, 1.520699]**. Its A/A was **1.032385x**, CI
+**[1.008930, 1.059704]**, so the symmetric null floor was **1.059704x** and
+the twice-null threshold was **1.122973x**. The real lower bound cleared that
+independent invocation's threshold. The two decisions are not pooled.
+
+**DECISION — KEEP THE HARNESS AND CORRECT THE CLAIMS.** The hidden
+`bench-evidence` CLI command hashes `current_exe()` from inside the executing
+process, reports compile/runtime ISA, and reports the consumed profile SHA.
+The same invocation owns the null and real arms, and the only decision gate is
+the deterministic 20,000-resample paired bootstrap median CI. CV is not
+computed. `scripts/build-perf.sh` now embeds the merged profile SHA in the
+final build and runs `bench-evidence`, so production-shaped identity is
+mechanically visible. Retraining also refuses a non-empty profile directory,
+and reuse refuses a missing or empty merged profile; stale artifacts therefore
+fail closed without recursive deletion.
+
+This result closes absolute generic-versus-production-shaped attribution only
+for the named lookup corpus. It does not contain a mounted-kernel arm, does not
+restate any kernel ratio, and does not adjust create/read/rename/delete or
+internal same-ELF lever ratios.
+
+**Retry predicate:** restate another historical claim only after the same
+source is trained and built through v3+PGO on one pinned worker, the executing
+process prints its ELF SHA, AVX2+FMA witness, and consumed-profile SHA, exact
+output/fsck parity holds as applicable, and same-invocation A/A plus A/B yields
+a bootstrap median wall/cycles CI clearing twice its own null log-margin. Add
+the mounted-kernel arm before changing a kernel claim. Never transfer this
+lookup ratio to another workload, gate on instruction count, or use CV as the
+decision rule.
+
 ## Historical 960x JBD2 group-commit claim is VOID: the FS path issues zero durability barriers (bd-fsync-journal-latency-gap-ptp4x) - 2026-07-26 (GreenSpring, VOID-MECHANISM / NO BENCH)
 
 The institutional preflight blocked a proposed cross-FsOp JBD2 group-commit

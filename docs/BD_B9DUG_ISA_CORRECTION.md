@@ -1,12 +1,15 @@
 # bd-b9dug — the benchmarked binary is not the shipped binary
 
-**Lane L (ledger/low-burn), 2026-07-25. Follow-up measured on pinned worker `hz2`.**
+**Initial audit: 2026-07-25, with ISA-only pairs on pinned worker `hz2`.
+Exact CLI lookup follow-up: 2026-07-27 on pinned worker `ovh-a`.**
 
-Every frankenfs performance ratio published before this correction was measured on a
-binary that is **not** the one `scripts/build-perf.sh` produces. This follow-up measures
-the ISA-only residual for two owned benchmark families, re-states the affected claims,
-and fixes the admissibility rule so the mismatch cannot be published silently again.
-Exact v3+PGO production identity remains a separate, unmeasured gate.
+Unless its row proves otherwise from the executing process, every historical
+frankenfs performance ratio published before this correction was measured on a
+binary that is **not** the one `scripts/build-perf.sh` produces. The first
+follow-up measured the ISA-only residual for two owned benchmark families. The
+second closes exact production-shaped v3+PGO identity for one CLI lookup
+workload. It does **not** convert unrelated generic-ELF or kernel-comparator
+claims into shipped-binary results.
 
 ---
 
@@ -53,6 +56,60 @@ different ELFs that still self-reported `compile_avx2=false,compile_fma=false`.
 Those measurements are inadmissible as v3 evidence. A different ELF SHA is necessary,
 but it is not sufficient.
 
+### Exact production-shaped CLI witness
+
+The 2026-07-27 gate exercised the complete `build-perf.sh` code-generation
+shape—fat-LTO `release-perf`, `target-cpu=x86-64-v3`, profile generation over
+the CLI create/lookup/rename/delete/walk workload family, profile merge, and
+profile use—on one pinned `ovh-a` worker:
+
+| role | executing ELF SHA-256 | compile-time ISA | embedded profile SHA-256 |
+|---|---|---|---|
+| generic release-perf control | `1d36a367ee3703d99a92b8af52387af2570787db4070065082185db681517764` | SSE2; no SSE4.2/AVX2/FMA | `none` |
+| v3 profile-generation CLI | `16b0b3d621dac6742d3af29aeac235bddbc3b3fc191403e64354432b0f64582a` | SSE2+SSE4.2+AVX2+FMA | `none` |
+| final v3+PGO CLI | `7136d8bf768a222ec2e6985efbe25249131a274db3b9bc81a4394323265adc62` | SSE2+SSE4.2+AVX2+FMA | `3dbce2b2fca971cacd1963d0aaeb867de10417761624a0c1236d01a6880860db` |
+| post-lint replay v3+PGO CLI | `1cf9b1dc5c162760787fb3fe003fbcbcccf132c4a1f753376996ac871c5275af` | SSE2+SSE4.2+AVX2+FMA | `3dbce2b2fca971cacd1963d0aaeb867de10417761624a0c1236d01a6880860db` |
+
+All three processes reported AVX2+FMA available at runtime. The merged
+28,739,968-byte profile was generated from 518 run-prefixed raw profiles. The
+checked-in 64 MiB fixture constrained the corpus to 6,000 creates, 1,000,000
+lookups, 2,000 renames, 2,000 deletes, and one walk; those are the shipping
+script's workload families at scaled counts, not a claim of byte identity with
+an older opaque training profile.
+
+One parent invocation then ran 31 alternating `AAB`/`BAA` rounds, where A/A was
+generic/generic and A/B was the midpoint of those controls versus v3+PGO. Each
+observation performed 200,000 lookups on the same 8,003-entry image. The image
+SHA-256 was
+`7fab3cc32b282ef9a23ef5afb222cd472fc7f3751f630f6848ff46e96c9503a6`;
+every arm returned the exact signature
+`lookupbench: 200000 lookups in / (8003 entries) -> 200000`.
+
+| statistic | result |
+|---|---:|
+| generic median wall time | 21,667 us |
+| v3+PGO median wall time | 15,110 us |
+| generic/generic A/A | 0.994371x, 95% CI [0.974583, 1.005166] |
+| symmetric A/A null floor | 1.026080x |
+| pre-registered twice-null threshold | 1.052840x |
+| generic/v3+PGO | **1.437700x**, 95% CI **[1.414742, 1.494961]** |
+| decision | **PGO_FASTER** |
+
+This is a wall-clock result, not an instruction-count inference. The
+deterministic 20,000-resample paired bootstrap median CI was the only decision
+gate; CV was not computed.
+
+After lint-driven helper extraction, the exact staged harness rebuilt the
+profile-use CLI and replayed the full gate rather than relying on compilation
+alone. The rebuilt ELF above again consumed the same profile and returned the
+same input SHA and output signature. Generic median was 21,410 us, v3+PGO
+median was 14,266 us, and generic/v3+PGO was **1.495236x**, 95% CI
+**[1.459215, 1.520699]**. Its A/A was 1.032385x, CI
+**[1.008930, 1.059704]**, giving a symmetric null floor of 1.059704x and a
+twice-null threshold of 1.122973x. The real lower bound cleared that
+invocation's own threshold. This confirmation is separately admissible; it
+does not replace the first measurement with a pooled estimate.
+
 ### Size of the effect, from evidence already in the repo
 
 `scripts/build-perf.sh`'s header records `perf stat` measurements (2026-07-03,
@@ -93,24 +150,26 @@ Every published ratio falls into one of three classes, and the correction differ
 Examples: allocator range-overlap **3110×**, journal replay **2024×**, extent
 coalescing **120×**, incremental crc32c **24.7×**, rmdir dir-emptiness, htree lookup.
 
-The historical ratios remain measurements of their named generic ELF, but the earlier
-inference that the shipped advantage is necessarily **at least** N× is withdrawn.
-Changing code generation can improve candidate and control paths by different amounts;
-the fresh JBD2 internal ratio shrank by 0.95% under v3. Quote these as
-*"N× on the recorded baseline-ISA ELF"*. A claim about the shipped binary requires a
-whole-binary v3+PGO rerun with its own null and median-CI gate.
+The historical ratios remain measurements of their named generic ELF, but the
+earlier inference that the shipped advantage is necessarily **at least** N× is
+withdrawn. Changing code generation can improve candidate and control paths by
+different amounts; the fresh JBD2 internal ratio shrank by 0.95% under v3.
+Quote these as *"N× on the recorded baseline-ISA ELF"*. The new lookup result
+certifies only generic-versus-v3+PGO FrankenFS lookup wall time; because it has
+no mounted-kernel arm, it does not restate any kernel ratio.
 
 ### Class B — "FrankenFS is N× slower than the kernel" (losses)
 
 Examples: parallel metadata writes **8.3× slower at 8 threads**, multi-file parallel
 read **~2.9× slower**, mounted small-file create storm **4.599×**.
 
-The earlier blanket statement that these losses are **overstated** is also withdrawn.
-The historical `create-bench` experiment below is evidence that one named loss shrank,
-but it conflates profile, LTO, and ISA. It does not license the same conclusion for
-every loss. No loss should be called structural or irreducible on the strength of a
-baseline-ISA measurement, and no correction factor should be applied without a
-whole-binary rerun.
+The earlier blanket statement that these losses are **overstated** is also
+withdrawn. The historical `create-bench` experiment below is evidence that one
+named loss shrank, and the exact lookup gate proves a 1.437700x effect for its
+named corpus. Neither licenses the same conclusion for every loss. No loss
+should be called structural or irreducible on the strength of a baseline-ISA
+measurement, and no correction factor should be applied without a
+workload-matched whole-binary rerun.
 
 ### Class C — internal A/B (candidate vs control, one binary)
 
@@ -123,8 +182,8 @@ pairs demonstrate both directions: allocator grew 9.53%, while JBD2 shrank 0.95%
 Generic-ELF KEEP/REJECT decisions remain historical evidence, not shipped-binary
 claims.
 
-`bd-bhh0i` is owner-escalated and outside this lane, so this audit makes no new
-prediction or rerun of that closed frontier.
+`bd-bhh0i` was completed separately. This audit neither re-derives nor changes
+that cutover result.
 
 ### Not affected
 
@@ -169,7 +228,11 @@ Cargo builds production-identical. It only makes v3 benchmark reruns schedulable
    The route must first show `-C target-cpu=x86-64-v3` in remote verbose compiler
    output, and the executing binary must report AVX2+FMA. A distinct SHA alone does not
    prove v3. Exact shipped identity additionally requires the PGO stage from
-   `scripts/build-perf.sh`.
+   `scripts/build-perf.sh`, and the executing binary must print the SHA-256 of
+   the merged profile it consumed. The script now embeds that profile SHA and
+   executes its hidden `bench-evidence` command after the final build. It also
+   refuses to retrain into a non-empty profile directory or reuse a missing
+   profile, so stale profile mixing fails closed without recursive deletion.
 4. **Do not gate on instruction count for an ISA A/B.** An ISA change retires more work
    per instruction, so fewer instructions is the mechanism, not a neutral proxy. Gate on
    wall/cycles (campaign §2.6).
@@ -203,8 +266,15 @@ These are same-source, same-worker, pinned whole-binary observations. Each
 candidate/control decision is supported by its invocation's median CI; the absolute
 cross-binary medians are not promoted into a universal correction factor.
 
-What remains open is exact v3+PGO production identity and every workload not rerun
-here. Retry predicate: train and build the production PGO binary from the same source,
-record its executing ELF SHA and AVX2+FMA witness, then compare the same parity-checked
-workload on the same pinned worker with an in-invocation A/A null. Gate on wall/cycles
-median CI, never CV or instruction count.
+Exact production-shaped v3+PGO identity is now closed for the 8,003-entry lookup
+workload: generic/v3+PGO was 1.437700x with CI [1.414742, 1.494961], while its
+A/A CI contained 1.0. Everything else remains open by workload, including
+mounted-kernel lookup and all create/read/rename/delete/kernel ratios.
+
+**Retry predicate for another claim:** train and build the production PGO
+binary from the same source, embed and print the consumed profile SHA, record
+the executing ELF SHA and AVX2+FMA witness, then compare the same
+parity-checked workload on the same pinned worker with a same-invocation A/A
+null. Gate on a wall/cycles bootstrap median CI clearing twice its own null
+log-margin, never CV or instruction count. For a kernel claim, include the
+mounted-kernel arm; the CLI-only lookup result cannot substitute for it.
