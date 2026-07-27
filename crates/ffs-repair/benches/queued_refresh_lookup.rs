@@ -8,9 +8,10 @@
 //! Null-controlled whole-callback A/B for queued repair group lookup/dedup.
 //!
 //! A repair-aware flush maps every committed block to a repair group. The
-//! first banked lever indexed valid disjoint ranges. This second A/B freezes
-//! that indexed + temporary-`BTreeSet` callback against compact `Vec`
-//! sort/dedup before changing production.
+//! first banked lever indexed valid disjoint ranges and the second replaced its
+//! temporary `BTreeSet` with compact `Vec` sort/dedup. This A/B freezes that
+//! production callback against hash membership plus deterministic sort-on-drain
+//! for the persistent queue.
 
 use asupersync::Cx;
 use ffs_block::RepairFlushLifecycle;
@@ -18,7 +19,7 @@ use ffs_repair::pipeline::{GroupConfig, QueuedRepairRefresh};
 use ffs_repair::storage::RepairGroupLayout;
 use ffs_types::{BlockNumber, GroupNumber};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::hint::black_box;
 use std::sync::Mutex;
@@ -228,6 +229,71 @@ impl CompactVecQueuedRepairRefresh {
     }
 }
 
+struct HashQueuedRepairRefresh {
+    ranges: Vec<GroupRange>,
+    queued_groups: Mutex<HashSet<GroupNumber>>,
+}
+
+impl HashQueuedRepairRefresh {
+    fn new(configs: &[GroupConfig]) -> Self {
+        let mut ranges = configs
+            .iter()
+            .map(|config| GroupRange {
+                group: config.layout.group,
+                start: config.source_first_block.0,
+                end: config.source_first_block.0 + u64::from(config.source_block_count),
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start);
+        Self {
+            ranges,
+            queued_groups: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn on_flush_committed(&self, blocks: &[BlockNumber]) {
+        let mut groups = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            if let Some(range) = self
+                .ranges
+                .partition_point(|range| range.start <= block.0)
+                .checked_sub(1)
+                .and_then(|index| self.ranges.get(index))
+                .filter(|range| block.0 < range.end)
+            {
+                groups.push(range.group);
+            }
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        if groups.is_empty() {
+            return;
+        }
+
+        let group_ids: Vec<u32> = groups.iter().map(|group| group.0).collect();
+        tracing::debug!(
+            target: "ffs::repair::refresh",
+            group_ids = ?group_ids,
+            block_count = blocks.len(),
+            "flush_triggers_refresh"
+        );
+
+        let mut queued = self.queued_groups.lock().expect("hash queue lock");
+        queued.reserve(groups.len());
+        for group in groups {
+            queued.insert(group);
+        }
+    }
+
+    fn drain(&self) -> Vec<GroupNumber> {
+        let mut queued = self.queued_groups.lock().expect("hash queue lock");
+        let mut groups = queued.drain().collect::<Vec<_>>();
+        drop(queued);
+        groups.sort_unstable();
+        groups
+    }
+}
+
 struct BenchState {
     cx: Cx,
     blocks: Vec<BlockNumber>,
@@ -235,6 +301,7 @@ struct BenchState {
     linear: LegacyQueuedRepairRefresh,
     baseline: IndexedTreeQueuedRepairRefresh,
     candidate: CompactVecQueuedRepairRefresh,
+    hash_candidate: HashQueuedRepairRefresh,
     production: QueuedRepairRefresh,
 }
 
@@ -329,6 +396,7 @@ fn build_state() -> BenchState {
         linear: LegacyQueuedRepairRefresh::new(&configs),
         baseline: IndexedTreeQueuedRepairRefresh::new(&configs),
         candidate: CompactVecQueuedRepairRefresh::new(&configs),
+        hash_candidate: HashQueuedRepairRefresh::new(&configs),
         production: QueuedRepairRefresh::from_group_configs(&configs),
     }
 }
@@ -344,8 +412,8 @@ fn checksum(groups: &[GroupNumber]) -> u64 {
 fn run_arm(state: &BenchState, arm: Arm) -> u64 {
     let groups = match arm {
         Arm::Baseline => {
-            state.baseline.on_flush_committed(&state.blocks);
-            state.baseline.drain()
+            state.candidate.on_flush_committed(&state.blocks);
+            state.candidate.drain()
         }
         Arm::Candidate => {
             state
@@ -528,14 +596,16 @@ fn main() {
 
     let state = build_state();
     let baseline = run_arm(&state, Arm::Baseline);
-    state.candidate.on_flush_committed(&state.blocks);
-    let candidate = checksum(&state.candidate.drain());
+    state.hash_candidate.on_flush_committed(&state.blocks);
+    let hash_candidate = checksum(&state.hash_candidate.drain());
+    state.baseline.on_flush_committed(&state.blocks);
+    let indexed_tree = checksum(&state.baseline.drain());
     state.linear.on_flush_committed(&state.blocks);
     let linear = checksum(&state.linear.drain());
     let production = run_arm(&state, Arm::Candidate);
     assert_eq!(
-        (linear, baseline, candidate, production),
-        (baseline, baseline, baseline, baseline),
+        (linear, indexed_tree, baseline, hash_candidate, production),
+        (baseline, baseline, baseline, baseline, baseline),
         "queued group outputs diverged"
     );
     let (linear_comparisons, indexed_comparisons, groups) = counted_mechanism(&state);
@@ -560,8 +630,8 @@ fn main() {
     );
     let null = paired(&state, Arm::Baseline, Arm::Baseline, batch);
     let real = paired(&state, Arm::Baseline, Arm::Candidate, batch);
-    print_stats("null_indexed_tree_indexed_tree", &null);
-    print_stats("real_indexed_tree_production_compact_vec", &real);
+    print_stats("null_persistent_tree_persistent_tree", &null);
+    print_stats("real_persistent_tree_persistent_hash", &real);
 
     let null_floor = null.ratio_ci.1.max(null.ratio_ci.0.recip());
     let twice_null_threshold = null_floor * null_floor;

@@ -13,7 +13,7 @@
 //! scrub range → corrupt blocks → group recovery → evidence → symbol refresh
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -342,7 +342,7 @@ struct GroupBlockRange {
 pub struct QueuedRepairRefresh {
     group_ranges: Arc<Vec<GroupBlockRange>>,
     group_ranges_are_disjoint: bool,
-    queued_groups: Arc<Mutex<BTreeSet<GroupNumber>>>,
+    queued_groups: Arc<Mutex<HashSet<GroupNumber>>>,
 }
 
 impl QueuedRepairRefresh {
@@ -373,7 +373,7 @@ impl QueuedRepairRefresh {
         Self {
             group_ranges: Arc::new(group_ranges),
             group_ranges_are_disjoint,
-            queued_groups: Arc::new(Mutex::new(BTreeSet::new())),
+            queued_groups: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -406,9 +406,9 @@ impl QueuedRepairRefresh {
             .queued_groups
             .lock()
             .map_err(|_| FfsError::RepairFailed("queued refresh mutex poisoned".to_owned()))?;
-        let groups = guard.iter().copied().collect();
-        guard.clear();
+        let mut groups = guard.drain().collect::<Vec<_>>();
         drop(guard);
+        groups.sort_unstable();
         Ok(groups)
     }
 
@@ -476,6 +476,7 @@ impl RepairFlushLifecycle for QueuedRepairRefresh {
                 .queued_groups
                 .lock()
                 .map_err(|_| FfsError::RepairFailed("queued refresh mutex poisoned".to_owned()))?;
+            queued.reserve(groups.len());
             for group in &groups {
                 queued.insert(*group);
             }

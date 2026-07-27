@@ -13,6 +13,73 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Queued repair persistent membership uses hash + deterministic drain - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior REJECT on
+`QueuedRepairRefresh::queued_groups`; the two immediately preceding repair
+keeps explicitly left this persistent `BTreeSet` unchanged. A pre-edit
+source-neutral model therefore froze the current indexed lookup, compact
+temporary `Vec`, persistent ordered tree, and deterministic drain against a
+persistent `HashSet` whose internal order is sorted only after draining.
+
+The pre-edit strict-remote x86-64-v3 release-perf process self-reported ELF
+`8cf25304d706befcc553f6654d39dd03f55d105a6797654569a70f2eab44939b`.
+It proved exact 512-group output/order parity and admitted the representation:
+tree/tree A/A bootstrap median 95% CI **[0.995205, 1.022097]**, symmetric null
+floor **1.022097x**, twice-null threshold **1.044682x**, and tree/hash median
+**1.360373x** with bootstrap median 95% CI **[1.345692, 1.371074]**.
+
+Production now stores queued group membership in a persistent
+`HashSet<GroupNumber>`, reserves for the incoming unique group batch, and
+retains the table allocation across drains. `drain_queued_groups` drains under
+the same mutex, drops the guard, and then sorts the result. Consequently the
+randomized internal bucket order never escapes. Ascending group order,
+duplicate suppression across and within callbacks, overlap first-input-match
+selection, debug event order, mutex-poison errors, and the critical
+drain/drop/process re-entry boundary are unchanged. Tie-breaking is unchanged;
+floating point and RNG are N/A.
+
+The final-source strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported
+`bench_evidence,binary_sha256=4746f4396e523f9e0e6469abb8cac156be448dfc71ab39f8061ca609e0c45e0f`.
+One invocation owned the parity proof, 41 alternating A/A+B rounds, and the
+decision. Frozen-tree/frozen-tree A/A median was **1.003447x**, deterministic
+20,000-resample bootstrap median 95% CI **[0.997756, 1.008698]**; the symmetric
+null floor was **1.008698x** and the pre-registered twice-null threshold was
+**1.017472x**. Frozen-tree/actual-production-callback median was **1.279996x**,
+bootstrap median 95% CI **[1.278681, 1.281732]**. The timed candidate arm called
+production `on_flush_committed` plus `drain_queued_groups`; the model and actual
+production callback also returned the same 512 ascending unique groups and
+checksum `7a8c925983737ede`.
+
+**KEEP, narrowly scoped.** This is a whole-callback result for 512 flushed
+blocks mapping to 512 unique groups in a 4,096-range / 1 GiB repair layout. It
+is not a PGO, mounted, whole-flush, self-healing pipeline, or kernel magnitude.
+The gate basis was bootstrap median CI over wall time; `cv_used_as_gate=false`
+and instructions were not decision inputs.
+
+Strict-remote focused queue tests passed **6/6**, including repeated blocks,
+unsorted disjoint ranges, overlap fallback, empty/out-of-range behavior, and
+the lock-release/re-entry invariant. Scoped `--no-deps -D warnings` Clippy
+passed after allowing only the reproduced baseline categories: two untouched
+nightly deprecations plus `needless_pass_by_value`,
+`manual_saturating_arithmetic`, and `unused_self` in untouched code. Targeted
+rustfmt and `git diff --check` passed. `/data` had **436G** free before every
+Cargo invocation; all builds were strict-remote and no local target directory
+was created.
+
+**Retry predicate:** restate an end-to-end or shipped magnitude only after a
+production-shaped self-healing profile attributes at least 5% of whole flush
+wall/cycles to queued repair notification and a same-worker whole-flush A/A+B
+gate proves identical durable state with a bootstrap median wall/cycles CI
+clearing twice its own null log-margin. Revisit the membership representation
+only if current production telemetry shows a materially smaller drain shape
+(p50 at most eight unique queued groups), a materially larger sparse table
+shape, or a fresh profile attributes at least 5% of callback wall/cycles to
+hashing or sort-on-drain. Then benchmark that exact cardinality against the
+retained frozen tree in one self-hashing invocation; never gate on CV or
+instructions.
+
 ## Btrfs-send final output buffer growth has a sub-null ideal ceiling - 2026-07-27 (GreenSpring, REJECT)
 
 The institutional candidate preflight found no prior rejected row on
