@@ -16,9 +16,9 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_btrfs::{
-    BTRFS_EXTENT_CSUM_OBJECTID, BTRFS_ITEM_EXTENT_CSUM, BTRFS_ITEM_EXTENT_DATA_REF, BtrfsBTree,
-    BtrfsExtentAllocator, BtrfsExtentDataRef, BtrfsKey, InMemoryCowBtrfsTree,
-    lookup_data_block_csum,
+    BTRFS_EXTENT_CSUM_OBJECTID, BTRFS_ITEM_EXTENT_CSUM, BTRFS_ITEM_EXTENT_DATA_REF,
+    BTRFS_ITEM_EXTENT_ITEM, BtrfsBTree, BtrfsExtentAllocator, BtrfsExtentDataRef, BtrfsExtentItem,
+    BtrfsKey, InMemoryCowBtrfsTree, lookup_data_block_csum,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -39,6 +39,11 @@ const MAX_NULL_FLOOR_RATIO: f64 = 1.025;
 const BACKREF_DELETE_COUNT: usize = 512;
 const BACKREF_DELETE_BYTENR: u64 = 3 << 30;
 const MIN_BACKREF_DELETE_SAVED_FRACTION: f64 = 0.05;
+const EXTENT_REFS_ITEMS: usize = 4096;
+const EXTENT_REFS_REPEATS: usize = 4;
+const EXTENT_REFS_BASE: u64 = 4 << 30;
+const EXTENT_REFS_OBSERVATIONS: usize = 3;
+const MIN_EXTENT_REFS_SAVED_FRACTION: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 struct BootstrapMedianCi {
@@ -663,6 +668,352 @@ fn backref_delete_contract(candidate_arm: BackrefDeleteArm) {
     decide_backref_delete_samples(mode, &samples);
 }
 
+type ExtentRefsOperation = fn(&BtrfsExtentAllocator, &[(u64, u64)]) -> u64;
+
+#[derive(Clone, Copy)]
+enum ExtentRefsArm {
+    BorrowedModel,
+    ProductionCandidate,
+}
+
+struct ExtentRefsSamples {
+    control_lhs_ns: Vec<f64>,
+    control_rhs_ns: Vec<f64>,
+    candidate_ns: Vec<f64>,
+    raw_pairs: String,
+}
+
+fn extent_refs_fixture() -> (BtrfsExtentAllocator, Vec<(u64, u64)>) {
+    let mut alloc = BtrfsExtentAllocator::new(1).expect("extent refs allocator");
+    let mut probes = Vec::with_capacity(EXTENT_REFS_ITEMS);
+    for index in 0..EXTENT_REFS_ITEMS {
+        let index = u64::try_from(index).expect("extent index fits in u64");
+        let bytenr = EXTENT_REFS_BASE + index * 4096;
+        let num_bytes = 4096 + (index % 4) * 4096;
+        let item = BtrfsExtentItem {
+            refs: 1 + index % 7,
+            generation: 100 + index,
+            flags: BtrfsExtentItem::FLAG_DATA,
+        };
+        alloc
+            .extent_tree_mut()
+            .insert(
+                BtrfsKey {
+                    objectid: bytenr,
+                    item_type: BTRFS_ITEM_EXTENT_ITEM,
+                    offset: num_bytes,
+                },
+                &item.to_bytes(),
+            )
+            .expect("insert extent item");
+        probes.push((bytenr, num_bytes));
+    }
+    (alloc, probes)
+}
+
+fn fold_extent_refs(digest: u64, refs: Option<u64>) -> u64 {
+    digest
+        .rotate_left(9)
+        .wrapping_mul(1_000_003)
+        .wrapping_add(refs.unwrap_or(u64::MAX))
+}
+
+fn materialized_extent_item_refs(
+    alloc: &BtrfsExtentAllocator,
+    bytenr: u64,
+    num_bytes: u64,
+) -> Option<u64> {
+    let key = BtrfsKey {
+        objectid: bytenr,
+        item_type: BTRFS_ITEM_EXTENT_ITEM,
+        offset: num_bytes,
+    };
+    alloc
+        .extent_tree()
+        .range(&key, &key)
+        .expect("materialized extent-item lookup")
+        .into_iter()
+        .next()
+        .and_then(|(_, data)| {
+            if data.len() >= 8 {
+                Some(u64::from_le_bytes(
+                    data[0..8].try_into().expect("eight-byte refcount"),
+                ))
+            } else {
+                None
+            }
+        })
+}
+
+fn borrowed_extent_item_refs(
+    alloc: &BtrfsExtentAllocator,
+    bytenr: u64,
+    num_bytes: u64,
+) -> Option<u64> {
+    let key = BtrfsKey {
+        objectid: bytenr,
+        item_type: BTRFS_ITEM_EXTENT_ITEM,
+        offset: num_bytes,
+    };
+    let mut refs = None;
+    alloc
+        .extent_tree()
+        .range_with(&key, &key, |_, data| {
+            if data.len() >= 8 {
+                refs = Some(u64::from_le_bytes(
+                    data[0..8].try_into().expect("eight-byte refcount"),
+                ));
+            }
+        })
+        .expect("borrowed extent-item lookup");
+    refs
+}
+
+#[inline(never)]
+fn materialized_extent_refs_batch(alloc: &BtrfsExtentAllocator, probes: &[(u64, u64)]) -> u64 {
+    let mut digest = 0_u64;
+    for _ in 0..EXTENT_REFS_REPEATS {
+        for &(bytenr, num_bytes) in probes {
+            digest = fold_extent_refs(
+                digest,
+                materialized_extent_item_refs(alloc, bytenr, num_bytes),
+            );
+        }
+    }
+    digest
+}
+
+#[inline(never)]
+fn borrowed_extent_refs_batch(alloc: &BtrfsExtentAllocator, probes: &[(u64, u64)]) -> u64 {
+    let mut digest = 0_u64;
+    for _ in 0..EXTENT_REFS_REPEATS {
+        for &(bytenr, num_bytes) in probes {
+            digest = fold_extent_refs(digest, borrowed_extent_item_refs(alloc, bytenr, num_bytes));
+        }
+    }
+    digest
+}
+
+#[inline(never)]
+fn production_extent_refs_batch(alloc: &BtrfsExtentAllocator, probes: &[(u64, u64)]) -> u64 {
+    let mut digest = 0_u64;
+    for _ in 0..EXTENT_REFS_REPEATS {
+        for &(bytenr, num_bytes) in probes {
+            let refs = alloc
+                .extent_item_refs(bytenr, num_bytes)
+                .expect("production extent-item lookup");
+            digest = fold_extent_refs(digest, refs);
+        }
+    }
+    digest
+}
+
+fn extent_refs_oracle() {
+    let mut alloc = BtrfsExtentAllocator::new(1).expect("extent refs oracle allocator");
+    let valid_bytenr = EXTENT_REFS_BASE;
+    let valid_num_bytes = 4096;
+    let valid_key = BtrfsKey {
+        objectid: valid_bytenr,
+        item_type: BTRFS_ITEM_EXTENT_ITEM,
+        offset: valid_num_bytes,
+    };
+    alloc
+        .extent_tree_mut()
+        .insert(
+            valid_key,
+            &BtrfsExtentItem {
+                refs: 17,
+                generation: 9,
+                flags: BtrfsExtentItem::FLAG_DATA,
+            }
+            .to_bytes(),
+        )
+        .expect("insert valid extent item");
+    let short_bytenr = EXTENT_REFS_BASE + 4096;
+    let short_key = BtrfsKey {
+        objectid: short_bytenr,
+        item_type: BTRFS_ITEM_EXTENT_ITEM,
+        offset: valid_num_bytes,
+    };
+    alloc
+        .extent_tree_mut()
+        .insert(short_key, b"short")
+        .expect("insert short extent item");
+
+    for &(bytenr, num_bytes, expected) in &[
+        (valid_bytenr, valid_num_bytes, Some(17)),
+        (short_bytenr, valid_num_bytes, None),
+        (EXTENT_REFS_BASE + 8192, valid_num_bytes, None),
+    ] {
+        assert_eq!(
+            materialized_extent_item_refs(&alloc, bytenr, num_bytes),
+            expected
+        );
+        assert_eq!(
+            borrowed_extent_item_refs(&alloc, bytenr, num_bytes),
+            expected
+        );
+        assert_eq!(
+            alloc
+                .extent_item_refs(bytenr, num_bytes)
+                .expect("production oracle lookup"),
+            expected
+        );
+    }
+}
+
+fn observe_extent_refs(
+    operation: ExtentRefsOperation,
+    alloc: &BtrfsExtentAllocator,
+    probes: &[(u64, u64)],
+    expected: u64,
+) -> f64 {
+    let mut best_ns = f64::INFINITY;
+    for _ in 0..EXTENT_REFS_OBSERVATIONS {
+        let started = Instant::now();
+        let output = operation(black_box(alloc), black_box(probes));
+        let elapsed_ns = started.elapsed().as_secs_f64() * 1e9;
+        assert_eq!(black_box(output), expected);
+        best_ns = best_ns.min(elapsed_ns);
+    }
+    best_ns
+}
+
+fn collect_extent_refs_samples(
+    candidate: ExtentRefsOperation,
+    alloc: &BtrfsExtentAllocator,
+    probes: &[(u64, u64)],
+    expected: u64,
+) -> ExtentRefsSamples {
+    let mut control_lhs_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut candidate_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut raw_pairs = String::new();
+    for pair_index in 0..DELETE_PAIRS {
+        let (lhs, rhs, candidate_ns_one, order) = if pair_index % 2 == 0 {
+            (
+                observe_extent_refs(materialized_extent_refs_batch, alloc, probes, expected),
+                observe_extent_refs(materialized_extent_refs_batch, alloc, probes, expected),
+                observe_extent_refs(candidate, alloc, probes, expected),
+                "AAB",
+            )
+        } else {
+            let candidate_ns_one = observe_extent_refs(candidate, alloc, probes, expected);
+            let rhs = observe_extent_refs(materialized_extent_refs_batch, alloc, probes, expected);
+            let lhs = observe_extent_refs(materialized_extent_refs_batch, alloc, probes, expected);
+            (lhs, rhs, candidate_ns_one, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate_ns_one);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{lhs:.3}:{rhs:.3}:{candidate_ns_one:.3}"
+        )
+        .expect("format extent refs A/A+B pair");
+    }
+    ExtentRefsSamples {
+        control_lhs_ns,
+        control_rhs_ns,
+        candidate_ns,
+        raw_pairs,
+    }
+}
+
+fn decide_extent_refs_samples(mode: &str, samples: &ExtentRefsSamples) {
+    let null_log_ratios = samples
+        .control_lhs_ns
+        .iter()
+        .zip(&samples.control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = samples
+        .control_lhs_ns
+        .iter()
+        .zip(&samples.control_rhs_ns)
+        .zip(&samples.candidate_ns)
+        .map(|((lhs, rhs), candidate_ns_one)| (lhs.midpoint(*rhs) / candidate_ns_one).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let saved_fraction_lower = (1.0 - speedup_summary.low.recip()).max(0.0);
+    let admitted = null_floor_ratio <= MAX_NULL_FLOOR_RATIO
+        && speedup_summary.low > twice_null_ratio
+        && saved_fraction_lower >= MIN_EXTENT_REFS_SAVED_FRACTION;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio > MAX_NULL_FLOOR_RATIO {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL_OR_FIVE_PERCENT"
+    };
+    println!(
+        "extent_item_refs_pairs,mode={mode},pairs={DELETE_PAIRS},observations_per_arm={EXTENT_REFS_OBSERVATIONS},observation_reducer=min,format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={}",
+        samples.raw_pairs
+    );
+    println!(
+        "extent_item_refs_ab,mode={mode},control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},saved_fraction_ci_lower={saved_fraction_lower:.6},minimum_saved_fraction={MIN_EXTENT_REFS_SAVED_FRACTION:.6},admitted={admitted},verdict={verdict},gate_metric=wall_ns,gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false,instructions_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
+    if !admitted {
+        std::process::exit(2);
+    }
+}
+
+fn extent_item_refs_contract(candidate_arm: ExtentRefsArm) {
+    print_bench_evidence_metadata();
+    print_codegen_isa();
+    extent_refs_oracle();
+
+    let (alloc, probes) = extent_refs_fixture();
+    let expected = materialized_extent_refs_batch(&alloc, &probes);
+    assert_eq!(
+        borrowed_extent_refs_batch(&alloc, &probes),
+        expected,
+        "borrowed extent refcounts changed values or probe order"
+    );
+    assert_eq!(
+        production_extent_refs_batch(&alloc, &probes),
+        expected,
+        "production extent refcounts changed values or probe order"
+    );
+    let (candidate, mode): (ExtentRefsOperation, &'static str) = match candidate_arm {
+        ExtentRefsArm::BorrowedModel => (borrowed_extent_refs_batch, "source_neutral_attribution"),
+        ExtentRefsArm::ProductionCandidate => {
+            (production_extent_refs_batch, "production_candidate")
+        }
+    };
+    let calls = EXTENT_REFS_ITEMS * EXTENT_REFS_REPEATS;
+    println!(
+        "extent_item_refs_parity,mode={mode},items={EXTENT_REFS_ITEMS},repeats={EXTENT_REFS_REPEATS},calls={calls},digest={expected:016x},ordering=probe_order,tie_breaking=na,floating_point=na,rng=na,valid_short_absent_oracle=pass"
+    );
+    println!(
+        "extent_item_refs_mechanism,mode={mode},materialized_result_vecs={calls},materialized_payload_vecs={calls},materialized_payload_bytes={},borrowed_result_vecs=0,borrowed_payload_vecs=0,borrowed_payload_bytes=0,attribution_scope=complete_public_lookup_batch,attribution_floor_fraction={MIN_EXTENT_REFS_SAVED_FRACTION:.6}",
+        calls * 24,
+    );
+    for _ in 0..3 {
+        assert_eq!(materialized_extent_refs_batch(&alloc, &probes), expected);
+        assert_eq!(candidate(&alloc, &probes), expected);
+    }
+    let samples = collect_extent_refs_samples(candidate, &alloc, &probes, expected);
+    decide_extent_refs_samples(mode, &samples);
+}
+
 /// Build a sorted-by-offset csum-tree item list: item `i` covers
 /// `CSUMS_PER_ITEM` sectors starting at disk bytenr `i * stride`.
 fn build_items() -> Vec<(BtrfsKey, Vec<u8>)> {
@@ -719,6 +1070,16 @@ fn linear(items: &[(BtrfsKey, Vec<u8>)], disk_bytenr: u64, sectorsize: usize) ->
 }
 
 fn bench_csum_lookup(c: &mut Criterion) {
+    if let Some(mode) = std::env::var_os("FFS_BTRFS_EXTENT_ITEM_REFS_GATE") {
+        match mode.to_str() {
+            Some("source-neutral") => extent_item_refs_contract(ExtentRefsArm::BorrowedModel),
+            Some("candidate") => extent_item_refs_contract(ExtentRefsArm::ProductionCandidate),
+            _ => {
+                panic!("FFS_BTRFS_EXTENT_ITEM_REFS_GATE must be source-neutral or candidate")
+            }
+        }
+        return;
+    }
     if let Some(mode) = std::env::var_os("FFS_BTRFS_BACKREF_DELETE_GATE") {
         match mode.to_str() {
             Some("source-neutral") => backref_delete_contract(BackrefDeleteArm::BorrowedModel),

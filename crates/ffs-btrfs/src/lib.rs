@@ -7555,14 +7555,17 @@ impl BtrfsExtentAllocator {
             item_type: BTRFS_ITEM_EXTENT_ITEM,
             offset: num_bytes,
         };
-        let items = self.extent_tree.range(&key, &key)?;
-        Ok(items.into_iter().next().and_then(|(_, data)| {
+        let mut refs = None;
+        self.extent_tree.range_with(&key, &key, |_, data| {
             if data.len() >= 8 {
-                Some(u64::from_le_bytes(data[0..8].try_into().ok()?))
-            } else {
-                None
+                refs = Some(u64::from_le_bytes(
+                    data[0..8]
+                        .try_into()
+                        .expect("extent refcount slice is exactly eight bytes"),
+                ));
             }
-        }))
+        })?;
+        Ok(refs)
     }
 
     pub fn get_extent_data_refs(

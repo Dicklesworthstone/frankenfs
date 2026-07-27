@@ -13,6 +13,94 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Borrowed extent-item refcount payload clears the null and 5% floors - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior decision on the exact
+`BtrfsExtentAllocator::extent_item_refs` surface. The broader ledger grep kept
+this exact-key read separate from the closed keyed-backref scan/delete rows:
+this function materialized an inclusive one-key `range` result only to read the
+first eight payload bytes.
+
+The production-shaped fixture stored 4,096 real `BTRFS_ITEM_EXTENT_ITEM`
+records and repeated their public lookups four times per observation. The
+materialized control therefore performed:
+
+- 16,384 public `extent_item_refs`-shaped calls;
+- 16,384 result-vector allocations;
+- 16,384 payload-vector allocations; and
+- 393,216 cloned payload bytes.
+
+The borrowed `range_with` path reduced all three materialization counts to
+zero. Both paths returned digest `31166e01c212cbd4` in the same probe order.
+A separate oracle proved identical valid-item values, short-item `None`,
+absent-item `None`, and production results.
+
+Before production changed, a source-neutral strict-remote x86-64-v3
+release-perf process on pinned `ovh-a` self-reported executing ELF SHA-256
+`aa34ba930d8e8e34aaa7ab166ee751658025d9c860b3e3ee277f8937612034d3`,
+worker `fixmydocuments`, and compile/runtime SSE2, SSE4.2, AVX2, and FMA. Its
+materialized/borrowed model measured:
+
+- median **1.206740x**;
+- deterministic 20,000-resample bootstrap median 95% CI
+  **[1.202154, 1.210859]**; and
+- saved-fraction lower bound **0.168160**.
+
+The same invocation's materialized/materialized A/A measured median
+**0.999289x**, CI **[0.996377, 1.000338]**, symmetric null floor
+**1.003636x**, and twice-null threshold **1.007286x**. This admitted the
+production edit but was not used as its final magnitude.
+
+Production now decodes the refcount inside `range_with` while the exact-key
+payload remains borrowed from the tree node. Inclusive key selection, tree
+errors, valid refcount values, short/absent `None`, ordering, and the
+side-effect-free read contract are unchanged. Tie-breaking, floating point,
+and RNG are N/A.
+
+The final actual-production invocation was independently linked. From inside
+the timed process it emitted `bench_evidence,binary_sha256=cec1a4f6321ebd10c3e11db867ebc29c6cac83a3d7648ac8f7087c817e1ee9e4,worker=fixmydocuments`.
+This x86-64-v3 release-perf ELF again ran on pinned `ovh-a` with
+compile/runtime SSE2, SSE4.2, AVX2, and FMA. It measured:
+
+- materialized/production-borrowed median **1.193053x**;
+- bootstrap median 95% CI **[1.186397, 1.194739]**;
+- saved-fraction lower bound **0.157112**;
+- same-invocation A/A median **0.999146x**;
+- A/A CI **[0.997507, 0.999695]**;
+- symmetric null floor **1.002499x**; and
+- twice-null threshold **1.005005x**.
+
+**KEEP, narrowly scoped.** The final lower bound cleared both twice-null and
+the pre-registered 5% saved-fraction floor. Each valid invocation owned 31
+alternating `AAB`/`BAA` pairs, min-of-three observations, exact parity, and
+its own deterministic bootstrap median wall-time decision. Results were not
+pooled. CV and instruction count were not decision inputs.
+
+One earlier command omitted `FFS_BTRFS_EXTENT_ITEM_REFS_GATE` from
+`RCH_ENV_ALLOWLIST`, so the remote process ran the ordinary Criterion suite
+instead of this contract. That invocation is invalid and unscored.
+
+Strict-remote `ffs-btrfs` library tests passed **374/374**, with one manual
+timing test intentionally ignored. Scoped library-plus-benchmark Clippy passed
+with every warning denied after allowing only the reproduced pre-existing
+`similar_names`, `too_long_first_doc_paragraph`, and `too_many_arguments`
+categories in untouched library code. Targeted rustfmt and `git diff --check`
+passed. `/data` had **393G or more** free before final Cargo invocations; every
+target remained worker-scoped and there was no local fallback.
+
+This is a 16,384-call internal lookup batch, not an ordinary single extent,
+whole free/reflink/purge, PGO, mounted, shipped, or kernel magnitude.
+
+**Retry predicate:** publish an end-to-end magnitude only after a production
+free, purge, or reflink profile observes the real call cardinality and
+attributes at least 5% of whole-operation wall/cycles to `extent_item_refs`.
+Then use that whole operation in one self-hashing same-worker
+x86-64-v3+PGO A/A+B invocation, preserve the exact final tree/image plus an
+independent `btrfs check` where applicable, and require a bootstrap median
+wall/cycles CI clearing twice its own null log-margin with at least a 5%
+saved-fraction lower bound. Never transfer this internal batch ratio or gate
+on CV/instructions.
+
 ## Ext4 names-only external result-vector merge is below the null and 5% floors - 2026-07-27 (GreenSpring, REJECT)
 
 The institutional preflight found no prior REJECT on the qualified
