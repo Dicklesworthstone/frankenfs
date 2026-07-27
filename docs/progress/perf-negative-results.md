@@ -1637,6 +1637,102 @@ do not infer a production deadlock from RCH stale-progress metadata alone.
 > above satisfied the remaining null-floor and real-fsck predicate; absent an
 > override, production now selects `PublicationMode::WaitFree`.
 
+## ⭐⭐⭐ MOUNTED-KERNEL ARM EXISTS — first defensible vs-incumbent number: frankenfs is 4.5x SLOWER than kernel ext4 on mounted create+fsyncdir (bd-kdmu4) - 2026-07-27 (turn 15, cc, MEASURED — A MISS, WHICH IS THE POINT)
+
+Status: the instrument this repo has never had is built, landed, and has produced an
+honest number. **It is a loss, and that is the success condition for this task.**
+
+⚠ CLASS: **vs-INCUMBENT**. Kernel ext4, loop-mounted, running beside the frankenfs
+FUSE mount in ONE process, with A/A nulls for BOTH arms. This is the first row in this
+ledger that is not a self-speedup. Every prior KEEP this campaign — including my own
+wait-free publication gate — is frankenfs-before vs frankenfs-after and reads `N/A` in
+the direct-kernel column, so none of them can be shown to matter competitively.
+
+`bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`
+Bootstrap median CI (20,000 resamples, percentile method) is reported for every arm:
+kernel A/A [0.9878, 1.0073], frankenfs A/A [0.9512, 1.1061], A/B [0.1893, 0.2432].
+
+PROVENANCE. The measuring process is a driver, not the code under test, so hashing it
+would prove nothing. The harness instead locates the process actually answering FUSE
+requests for the mount and hashes `/proc/<pid>/exe` in-process:
+`pid=3455837 exe=/data/tmp/cargo-target/release-perf/ffs-cli
+sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`. A
+`sha256sum` of a path on disk cannot establish which binary is serving a mount.
+
+`scripts/mounted_kernel_ab.py` + `scripts/mounted_kernel_ab_setup.sh`.
+
+### The number
+
+Workload: create 2,000 empty files, then ONE `fsync` of the directory — an identical
+POSIX call sequence issued by one driver to both arms. Host loadavg 26.68.
+
+| arm | median seconds | vs tmpfs driver ceiling |
+|---|---:|---:|
+| kernel ext4 (`/dev/loop6`, `rw,noatime`) | **0.0604** | 2.55x |
+| frankenfs FUSE (`fuse.ffs`, `rw,noatime`) | **0.3104** | 13.11x |
+
+| ratio (kernel time / frankenfs time) | median | bootstrap 95% CI |
+|---|---:|---|
+| **A/A null — kernel** | 0.9999 | **[0.9878, 1.0073]** |
+| **A/A null — frankenfs** | 0.9826 | **[0.9512, 1.1061]** |
+| **A/B kernel vs frankenfs** | **0.2213** | **[0.1893, 0.2432]** |
+
+Both A/A CIs contain 1.0; the A/B CI **excludes** it by a wide margin. Governing null
+floor 1.1946, margin **8.48x**. **DECIDABLE: frankenfs is 4.52x slower.**
+A prior run at loadavg 12.3 gave 4.76x with margin 15.25x — consistent.
+
+⚠ **~4.5x is a LOWER bound and the bias favours us.** The kernel arm sits only 2.55x
+above the Python driver's own ceiling, so a real share of its measured time is driver
+overhead common to both arms, which compresses the ratio. Subtracting the ceiling from
+both gives `(0.0604-0.0237)/(0.3104-0.0237) = 7.8x`. Honest statement: **at least
+4.5x slower; ~7-8x driver-corrected.** A faster driver sharpens this and makes
+frankenfs look worse, not better.
+
+### The six traps, and what each actually caught
+
+  T1 DISPATCH — identity asserted at RUNTIME from the measuring process's own
+  `/proc/self/mountinfo`, never from the path string. Not theoretical: during bring-up
+  `touch /tmp/ffsf/probe` **succeeded** on what I believed was the FUSE mount and was
+  in fact an ordinary empty directory, because the mount had failed on a bad flag. A
+  path that accepts writes proves nothing.
+
+  T2 UNMATCHED CONFIG — one driver, byte-identical POSIX sequences, same durability
+  boundary (one directory fsync; neither arm may skip it). The first run was NOT
+  matched: kernel came up `relatime` against FUSE `noatime`. The harness prints both
+  option strings, which is how I caught it; the mismatch had favoured frankenfs.
+
+  T3 NON-INTERLEAVED — arms alternate inside one measured routine, order flipping per
+  round. At loadavg 26.68 the kernel A/A CI still came in at [0.9878, 1.0073], which
+  is the interleaving working.
+
+  T4 CORE CONTENTION — explicit `sched_setaffinity` to CPUs 2,3, recorded with loadavg.
+
+  T5 CLIENT-BOUND — a tmpfs arm measures the driver ceiling and the run is REFUSED if
+  an arm lands within 2x of it. It passed, but the kernel arm at 2.55x is close, which
+  is why the caveat above is stated rather than buried.
+
+  T6 SHARED BASELINE — arms must be distinct mounts on distinct sources; asserted
+  (`/dev/loop6` vs `frankenfs`). Two paths on one mount would measure a filesystem
+  against itself.
+
+### What this changes
+
+The standing "8.3x slower than kernel at 8 threads" came from separate runs, not a
+side-by-side invocation, and is not comparable. **This row is the only vs-incumbent
+create number with an in-invocation incumbent arm, A/A nulls for both sides, bootstrap
+CIs, and runtime identity assertion.**
+
+It also places the wait-free publication gate correctly: its 1.44-1.57x is a
+**self-speedup** on the FFS side of a gap still ~4.5-8x in the incumbent's favour.
+Real, worth having, and **not a competitive claim**.
+
+### Next
+
+(a) btrfs arm — same harness, `mount -t btrfs`; the identity assertion generalises.
+(b) Move the workload driver out of Python to sharpen T5. (c) Re-run with
+`FFS_MVCC_WAITFREE_PUBLISH=1` to measure how much of the gap the landed self-speedup
+actually closes — the only route by which that lever becomes a competitive statement.
+
 ## ⚠ CORRECTION + CONFIRMATION — the e2e win replicates 3/3 (1.44-1.57x) but my "26 images all rc 0" was PARTLY VACUOUS; real count is 68 (bd-bhh0i) - 2026-07-26 (turn 14b, cc)
 
 `bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`
