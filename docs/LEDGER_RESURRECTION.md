@@ -165,13 +165,27 @@ what remains is a bounded O(1)-LRU cleanup, not a 4.8× resurrection.
 
 ### Rank 4 — Arc-share the hot ext4 inode (`NEGATIVE_EVIDENCE.md:838`)
 
-**Class: VOID-NONULL.** `Ext4Inode::clone` at ~8% self-time at 64t; A/B was
-`16834/18147/20918/17674` vs `20148/17377/17630/17011` "under box load ~20", base ahead
-in 3 of 4 trials. Spread is ±20% with no null control — undecidable as recorded. The
-row's *reasoning* is sound (self-time ≠ wall in an I/O-bound parallel section) and the
-ceiling is ~8% of a 64t read path, so the expected value is low. Retry only if a quiet
-pinned-worker A/A null on the read bench comes in below 1.02× **and** the read path is
-shown CPU-bound rather than pread-bound at the tested thread count.
+**CORRECTED 2026-07-27: curated false positive — superseded before this audit.**
+The original 64-thread A/B remains VOID-NONULL as recorded: it cannot decide whether
+the proposed Arc binding moved wall time under that noisy, bandwidth-bound workload.
+It does not describe current source, however. On 2026-06-29, `00a2bdb1` removed the
+hot-hit `Ext4Inode::clone` by borrowing the inode directly from the ArcSwap guard.
+The historical single-thread random-read result was **1.10×** (about 460,612 →
+507,541 IOPS), while the bandwidth-bound parallel arm remained neutral. On
+2026-07-13, `27c505c9` also removed the read-miss deep clone by moving the parsed
+inode into one `Arc` and sharing it with the slot.
+
+Current `read_into` therefore has neither mechanism rank 4 proposed re-testing: a hot
+hit is borrowed without a struct clone or refcount bump, and a read-only miss
+moves/shares rather than deep-cloning. The June ratio predates the campaign's
+in-process ELF SHA, same-invocation A/A, x86-64-v3+PGO, and median-CI contract, so it
+is historical landing evidence, not a current shipped-binary claim. **Do not re-run
+rank 4 as resurrection work.** Retry only if a fresh self-hashing v3+PGO profile on a
+named read workload attributes at least 5% of whole-operation wall/cycles to a
+remaining inode ownership/refcount operation in current source (for example, the
+writable-mount path that deliberately bypasses the read-only slot). Then require
+same-invocation A/A+B, exact read bytes/errors, and a bootstrap median-CI gate that
+clears twice its own null margin; never gate on CV.
 
 ### Rank 5 — `bd-cowbatch` btrfs create insert batching (`NEGATIVE_EVIDENCE.md:1439`)
 
@@ -214,16 +228,16 @@ bootstrap median-CI gate that clears twice its own null margin; never gate on CV
 | **Re-won** | **2 — rank 1: 1.70× at 8 threads; rank 2: 2.605531× witnessed-v3 on the production writer path (2.626589× generic)** |
 | Handed to the cod lane to re-run | 0 (rank 2 completed) |
 | Void but superseded — closed, not re-run | 1 (rank 3) |
-| Curated screen false positive — already shipped, not re-run | 1 (rank 5) |
+| Curated screen false positive — already shipped/superseded, not re-run | 2 (ranks 4 and 5) |
 
 **Resurrection yield: 2 of 2 runnable entries re-won.** The rank-1 row was void in the
 strongest sense — not "rejected on a bad gate" but **never measured at all**. Rank 2
 was the complementary failure: a large, real effect rejected solely by the obsolete
 CV gate despite a near-1.0× null. The corrected harness decided both without
-reinterpreting the other 203 void rows as wins. Rank 5 does not enter that yield: it
-was a KEEP family whose complete production realization preceded the audit by one
-month. Its presence in the mechanical VOID queue is retained as evidence that the
-screen is triage rather than truth.
+reinterpreting the other 203 void rows as wins. Ranks 4 and 5 do not enter that yield:
+both were KEEP families whose production realizations preceded the audit. Their
+presence in the mechanical VOID queue is retained as evidence that the screen is
+triage rather than truth.
 
 ### 4.1 Rank 1 re-run — profile attribution
 
@@ -377,7 +391,7 @@ sound rejections. `—` means the field is absent from the row, which for
 | 1 | `NEGATIVE_EVIDENCE.md:3739` — 2026-06-29 REFUTED (~0-gain): lookup_in_dir_block early-exit on match — measured neutral (CrimsonFox) | — | none recorded | 31.75% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 2 | `NEGATIVE_EVIDENCE.md:512` — (profile + REVERTED neutral) | 4.8x | none recorded | 15% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 3 | `NEGATIVE_EVIDENCE.md:21` — `bd-mounted-xattr-workload-gap-fr6iq` — list-64 direct wire retry / BronzeRabbit | — | recorded, unparsed | 8.96% | yes | **VOID-CV** — killed by the cv<5% gate, not by a measured regression |
-| 4 | `NEGATIVE_EVIDENCE.md:838` — 2026-06-22 NEG-LEVER: Arc-share the hot ext4 inode (kill the per-read clone) — wall-NEUTRAL, REVERTED (CrimsonFox cc/opus) | — | none recorded | 8% | yes | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
+| 4 | `NEGATIVE_EVIDENCE.md:838` — 2026-06-22 NEG-LEVER: Arc-share the hot ext4 inode (kill the per-read clone) — wall-NEUTRAL, REVERTED (CrimsonFox cc/opus) | — | none recorded | 8% | yes | **MECHANICAL VOID-NONULL / CURATED FALSE POSITIVE** — the old parallel A/B is void, but `00a2bdb1` later removed the hot-hit clone and `27c505c9` removed the miss clone before this audit; see corrected rank 4 |
 | 5 | `NEGATIVE_EVIDENCE.md:747` — 2026-06-22 scrub is ALLOCATION-bound, not validation-bound — parallelizing validation would NOT help (CrimsonFox cc/opus) | — | none recorded | 7.3% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 6 | `NEGATIVE_EVIDENCE.md:22` — `bd-fsync-journal-latency-gap-ptp4x` / `bd-opb6l` / `bd-mounted-xattr-workload-gap-fr6iq` — consolidated measured-frontier refresh / BronzeRabbit | — | none recorded | 5% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 7 | `progress/perf-negative-results.md:332` — btrfs runtime path swept for a byte-identical per-op lever — SATURATED (bd-kdmu4) - 2026-07-24 (turn 6, REJECT #2) | — | none recorded | 5% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
