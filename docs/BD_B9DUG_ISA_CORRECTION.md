@@ -1,7 +1,8 @@
 # bd-b9dug — the benchmarked binary is not the shipped binary
 
 **Initial audit: 2026-07-25, with ISA-only pairs on pinned worker `hz2`.
-Exact CLI lookup and create follow-ups: 2026-07-27 on pinned worker `ovh-a`.**
+Exact CLI lookup, create, and warm-read follow-ups: 2026-07-27 on pinned
+worker `ovh-a`.**
 
 Unless its row proves otherwise from the executing process, every historical
 frankenfs performance ratio published before this correction was measured on a
@@ -9,8 +10,10 @@ binary that is **not** the one `scripts/build-perf.sh` produces. The first
 follow-up measured the ISA-only residual for two owned benchmark families. The
 second closes exact production-shaped v3+PGO identity for one CLI lookup
 workload. A third measures the same build delta for one offline
-persisted-create workload. Neither converts unrelated generic-ELF or
-kernel-comparator claims into shipped-binary results.
+persisted-create workload. A fourth tests one warm sequential-read workload
+and correctly leaves its direction unresolved because the A/B interval does
+not clear the invocation's own A/A floor. None converts unrelated generic-ELF
+or kernel-comparator claims into shipped-binary results.
 
 ---
 
@@ -170,6 +173,66 @@ This is an offline, single-thread CLI image result. It is not a mounted FUSE
 create storm, a parallel-create cutover, an `e2fsck` result, or a kernel
 comparison.
 
+### Exact production-shaped warm sequential-read witness
+
+The read follow-up reused the current shipping PGO training shape on the same
+pinned strict-remote `ovh-a` worker. The training corpus contained 6,000
+creates, 1,000,000 lookups, 2,000 renames, 2,000 deletes, and one walk; it did
+**not** include this read workload. The resulting 28,783,720-byte merged
+profile was assembled from 518 run-prefixed raw profiles and had SHA-256
+`60b213e302a5b888c205cff8fd050a1b7b0cf4d9d9d849cecb9c98e2cbe02692`.
+
+| role | executing ELF SHA-256 | compile-time ISA | embedded profile SHA-256 |
+|---|---|---|---|
+| generic release-perf control | `deb2cc4693434e3fa7d292e2259f4be92eeddd9002513858cb7eb0083acf66d9` | SSE2; no SSE4.2/AVX2/FMA | `none` |
+| v3 profile-generation CLI | `5092a0e81137618d742fac4e47af332b68d21ea1f9167da4a271a49a624a5291` | SSE2+SSE4.2+AVX2+FMA | `none` |
+| final v3+PGO CLI | `ad55a58a0b2c0b5d3b75c586adcf960da8e94ed7f91ab9f68c208ecdb001587c` | SSE2+SSE4.2+AVX2+FMA | `60b213e302a5b888c205cff8fd050a1b7b0cf4d9d9d849cecb9c98e2cbe02692` |
+| exact-source replay v3+PGO CLI | `09928b976c66d4452f2e26d056a95c8ef5079dcf93c8e998ae1a1e9e226a685c` | SSE2+SSE4.2+AVX2+FMA | `60b213e302a5b888c205cff8fd050a1b7b0cf4d9d9d849cecb9c98e2cbe02692` |
+
+The immutable ext4 image had SHA-256
+`3905bfa23212cf8d5b9d3cf95beb7bb8fb519a0faa47189f606304fe5cb717fd`.
+Both binaries returned exactly 33,554,432 bytes for
+`/bd-b9dug-read.bin`, with payload SHA-256
+`edeadec8f638055689d5be63b4bcf2654fb64bf91fb6651e9a924f052a9c7db0`.
+Payload parity was checked outside timing, and the image hash was unchanged
+after the gate.
+
+Every timed child printed its executing ELF SHA, compile/runtime ISA, and
+consumed-profile SHA **inside that exact process** before its timer began. One
+parent invocation then owned two warmups per binary and 31 alternating
+`AAB`/`BAA` pairs. A/A was generic/generic; A/B compared the midpoint of those
+two controls with v3+PGO.
+
+| statistic | result |
+|---|---:|
+| generic median warm-read wall time | 8,398 us |
+| v3+PGO median warm-read wall time | 7,903 us |
+| generic/generic A/A | 1.037304x, 95% CI [0.903229, 1.168764] |
+| symmetric A/A null floor | 1.168764x |
+| pre-registered twice-null threshold | 1.366010x |
+| paired generic/v3+PGO | 1.009827x, 95% CI [0.928481, 1.070209] |
+| decision | **BLOCKED_NULL_FLOOR — no resolved direction** |
+
+The lower A/B wall-time median is descriptive only. Its paired bootstrap
+median CI overlaps 1.0 and does not approach the same-invocation null floor,
+so neither a speedup nor a slowdown is publishable. The gate never consulted
+CV or instruction count.
+
+After the owned Clippy cleanup, an exact-source replay rebuilt and
+self-identified the second v3+PGO ELF above and repeated the complete gate
+without pooling results. Generic median was 8,114 us and v3+PGO median was
+7,241 us. Generic/generic A/A was 0.963717x, 95% CI
+[0.856697, 1.094219], giving a 1.167274x symmetric null floor and a
+1.362528x twice-null threshold. Generic/v3+PGO was 1.068757x, 95% CI
+[1.009721, 1.220066]. Although that A/B interval is above 1.0, it does not
+clear even the invocation's own null floor, much less twice null. The replay
+therefore independently returned **BLOCKED_NULL_FLOOR**.
+
+This is a warm, offline, sequential 32 MiB CLI read from the worker's page
+cache. It is not a cold-cache run, a mounted FUSE read, a multi-file workload,
+an end-to-end kernel comparison, or evidence that a historical cold/mounted
+ratio has a particular correction factor.
+
 ### Size of the effect, from evidence already in the repo
 
 `scripts/build-perf.sh`'s header records `perf stat` measurements (2026-07-03,
@@ -226,8 +289,11 @@ read **~2.9× slower**, mounted small-file create storm **4.599×**.
 The earlier blanket statement that these losses are **overstated** is also
 withdrawn. The exact gates now prove a 1.437700x lookup effect and independently
 reproduced 1.155904x / 1.152540x persisted-create effects for their named
-offline CLI corpora. They do not
-license the same conclusion for every loss. In particular, the historical
+offline CLI corpora. The warm sequential-read gate, by contrast, resolves
+neither direction: 1.009827x with CI [0.928481, 1.070209] remained below its
+1.168764x A/A null floor; exact-source replay 1.068757x with CI
+[1.009721, 1.220066] remained below its 1.167274x null floor. These results do
+not license the same conclusion for every loss. In particular, the historical
 mounted small-file create-storm ratio remains a baseline-ISA measurement:
 transport, concurrency, durability, and kernel work differ from this
 single-thread offline create gate. No loss should be called structural or
@@ -329,19 +395,24 @@ These are same-source, same-worker, pinned whole-binary observations. Each
 candidate/control decision is supported by its invocation's median CI; the absolute
 cross-binary medians are not promoted into a universal correction factor.
 
-Exact production-shaped v3+PGO identity is now closed for two offline CLI
-workloads:
+Exact production-shaped v3+PGO identity has now been exercised for three
+offline CLI workloads:
 
 - 8,003-entry lookup: generic/v3+PGO **1.437700x**, CI
   **[1.414742, 1.494961]**; and
 - persisted 4,000-create batch: generic/v3+PGO **1.155904x**, CI
   **[1.135311, 1.178988]**; exact-source replay **1.152540x**, CI
-  **[1.137778, 1.178502]**.
+  **[1.137778, 1.178502]**; and
+- warm sequential 32 MiB read: paired generic/v3+PGO **1.009827x**, CI
+  **[0.928481, 1.070209]**, below its **1.168764x** A/A null floor;
+  exact-source replay **1.068757x**, CI **[1.009721, 1.220066]**, below
+  its **1.167274x** null floor.
 
-Each result cleared twice its own same-invocation A/A null margin. These
-measurements replace the vague claim that the production binary is merely
-"faster" for the named offline workloads. They do not restate mounted-kernel
-lookup/create ratios or any read/rename/delete/kernel ratio.
+The lookup and create effects cleared twice their own same-invocation A/A null
+margin. The read result did not, so it replaces the vague claim that
+production must be faster on read with an explicit unresolved warm-read
+result. None restates mounted-kernel lookup/create/read ratios or any
+rename/delete/kernel ratio.
 
 **Retry predicate for another claim:** train and build the production PGO
 binary from the same source, embed and print the consumed profile SHA, record
@@ -349,4 +420,7 @@ the executing ELF SHA and AVX2+FMA witness, then compare the same
 parity-checked workload on the same pinned worker with a same-invocation A/A
 null. Gate on a wall/cycles bootstrap median CI clearing twice its own null
 log-margin, never CV or instruction count. For a kernel claim, include the
-mounted-kernel arm; the CLI-only lookup result cannot substitute for it.
+mounted-kernel arm and independent filesystem validation; the CLI-only gates
+cannot substitute for it. For a cold-read claim, control cache state in every
+arm and repeat the whole gate until two independent invocations both clear
+their own twice-null thresholds.

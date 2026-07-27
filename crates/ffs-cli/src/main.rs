@@ -660,6 +660,13 @@ enum Command {
         /// Discard bytes (write to a sink) instead of stdout; report only the count.
         #[arg(long)]
         discard: bool,
+        /// Emit the in-process ELF/ISA/profile witness and timed read result.
+        ///
+        /// Hidden because this is the `bd-b9dug` measurement contract, not an
+        /// end-user read mode. It is valid only with `--discard`, keeping stdout
+        /// machine-readable instead of mixing evidence with file bytes.
+        #[arg(long, hide = true)]
+        bench_evidence: bool,
     },
     /// Random-read benchmark: open once, then read `count` random page-aligned
     /// blocks of `size` bytes from `path` (no FUSE) and report engine time,
@@ -2035,6 +2042,10 @@ fn run() -> Result<()> {
         Command::BenchEvidence
             | Command::CreateBenchCutoverGate { .. }
             | Command::ReadPoolCutoverGate { .. }
+            | Command::Read {
+                bench_evidence: true,
+                ..
+            }
     );
     if !evidence_must_be_first {
         info!(
@@ -2057,7 +2068,8 @@ fn run() -> Result<()> {
             image,
             path,
             discard,
-        } => read_file_cmd(&image, &path, discard),
+            bench_evidence,
+        } => read_file_cmd(&image, &path, discard, bench_evidence),
         Command::RandRead {
             image,
             path,
@@ -2485,7 +2497,23 @@ fn log_wal_recovery_telemetry(wal: &WalReplayInfoOutput) {
     );
 }
 
-fn read_file_cmd(path: &PathBuf, file_path: &str, discard: bool) -> Result<()> {
+fn read_file_cmd(
+    path: &PathBuf,
+    file_path: &str,
+    discard: bool,
+    bench_evidence: bool,
+) -> Result<()> {
+    if bench_evidence {
+        if !discard {
+            bail!("--bench-evidence requires --discard");
+        }
+        // This runs inside the exact child process that performs the timed read.
+        // Keep it before the timer so hashing the ELF proves identity without
+        // contaminating the read wall-time decision.
+        bench_evidence_cmd()?;
+    }
+    let bench_started = bench_evidence.then(Instant::now);
+
     // The per-stream output buffer size. A large buffer is a fresh anon
     // allocation whose pages the kernel faults + zero-fills on first write
     // (bd-zvn7r: 28.91% of cold-read *cycles* at 64 MiB = ~16,384 faulted pages).
@@ -2558,6 +2586,13 @@ fn read_file_cmd(path: &PathBuf, file_path: &str, discard: bool) -> Result<()> {
     }
     if discard {
         eprintln!("read {total} bytes from {file_path}");
+    }
+    if let Some(started) = bench_started {
+        println!(
+            "bd_b9dug_read_observation,path={file_path},bytes={total},duration_us={},\
+gate_metric=read_wall_us",
+            started.elapsed().as_micros()
+        );
     }
     Ok(())
 }

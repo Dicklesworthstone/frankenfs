@@ -13,6 +13,76 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Exact v3+PGO warm-read gate leaves no resolved ISA correction - 2026-07-27 (GreenSpring, CLAIM CORRECTION / NULL)
+
+The institutional preflight found no prior row on
+`bd_b9dug_whole_binary_read_gate`; the required family grep recovered the
+closed cold-read/copy/page-fault frontiers (`bd-ddryj`, `bd-q6k00`, and
+`bd-zvn7r`). None of their reopening conditions was met, so this work did not
+re-derive a read-path lever. It added only the missing whole-binary identity
+gate for the named warm sequential-read claim class.
+
+All Cargo stages were strict-remote and pinned to `ovh-a`. The generic
+release-perf process self-reported executing ELF
+`deb2cc4693434e3fa7d292e2259f4be92eeddd9002513858cb7eb0083acf66d9`,
+with SSE2 and without compile-time SSE4.2/AVX2/FMA. The profile-generation
+process self-reported ELF
+`5092a0e81137618d742fac4e47af332b68d21ea1f9167da4a271a49a624a5291`
+and compile/runtime AVX2+FMA. Its production-shaped corpus generated 518 raw
+profiles and a 28,783,720-byte merged profile with SHA-256
+`60b213e302a5b888c205cff8fd050a1b7b0cf4d9d9d849cecb9c98e2cbe02692`.
+The final v3+PGO process self-reported executing ELF
+`ad55a58a0b2c0b5d3b75c586adcf960da8e94ed7f91ab9f68c208ecdb001587c`,
+compile/runtime AVX2+FMA, and that exact consumed-profile SHA.
+
+The immutable input image SHA-256 was
+`3905bfa23212cf8d5b9d3cf95beb7bb8fb519a0faa47189f606304fe5cb717fd`.
+Both arms returned exactly 33,554,432 bytes with payload SHA-256
+`edeadec8f638055689d5be63b4bcf2654fb64bf91fb6651e9a924f052a9c7db0`;
+payload parity ran outside timing, and the image hash remained unchanged.
+Every timed child printed its ELF/ISA/profile identity from inside that exact
+process before starting its timer. One parent invocation then owned two
+warmups per binary and 31 alternating `AAB`/`BAA` rounds.
+
+Generic warm-read median was **8,398 us** and v3+PGO median was **7,903 us**.
+The paired generic/generic A/A median was **1.037304x**, deterministic
+20,000-resample bootstrap median 95% CI **[0.903229, 1.168764]**. Its symmetric
+null floor was therefore **1.168764x** and its pre-registered twice-null
+threshold was **1.366010x**. Paired generic/v3+PGO median was **1.009827x**,
+95% CI **[0.928481, 1.070209]**.
+
+**CLAIM CORRECTION / NULL, not a source REJECT.** The lower raw v3+PGO median
+is descriptive only: the paired A/B CI overlaps 1.0 and is wholly below the
+same-invocation null floor. No speedup, slowdown, or correction factor is
+admissible. The gate used read wall time and bootstrap median CI;
+`cv_used=false`; `instructions_used=false`. This is a warm offline sequential
+32 MiB CLI read, not a cold-cache, mounted FUSE, multi-file, or kernel
+comparison. Historical cold/mounted ratios remain measurements of their
+baseline-ISA ELFs and are now explicitly restated that way in
+`docs/BD_B9DUG_ISA_CORRECTION.md`.
+
+After the owned helper signature was tightened for scoped Clippy, an
+exact-source replay rebuilt v3+PGO ELF
+`09928b976c66d4452f2e26d056a95c8ef5079dcf93c8e998ae1a1e9e226a685c`.
+It self-reported the same ISA and consumed-profile identity, returned the same
+payload and immutable-image hashes, and repeated all 31 A/A+B pairs. Generic
+median was **8,114 us**, v3+PGO median was **7,241 us**, and paired A/B was
+**1.068757x**, 95% CI **[1.009721, 1.220066]**. Its A/A was **0.963717x**,
+95% CI **[0.856697, 1.094219]**, giving a **1.167274x** symmetric null floor
+and **1.362528x** twice-null threshold. The apparently positive A/B interval
+still failed even the invocation's own null floor, so the independent replay
+also returned **BLOCKED_NULL_FLOOR**. The two decisions are not pooled.
+
+**Retry predicate:** publish a cold or mounted read correction only after one
+same-worker invocation contains generic release-perf, exact v3+PGO, and the
+matched mounted-kernel arm; every timed FrankenFS child must self-report its
+executing ELF/profile SHA, all arms must return byte-identical payloads, and
+the image/filesystem must pass independent validation. A cold claim must
+control cache state for every arm. Require two independent complete
+invocations whose bootstrap median wall/cycles CIs each clear twice their own
+A/A null log-margin; never substitute CV, instruction count, this warm result,
+or an arithmetic factor from lookup/create.
+
 ## Btrfs free-path backref key projection - 2026-07-27 (GreenSpring, REJECT)
 
 The institutional exact-surface preflight found no prior REJECT on

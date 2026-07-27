@@ -151,6 +151,15 @@ fn sha256_file(path: &Path) -> String {
     encoded
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("format SHA-256");
+    }
+    encoded
+}
+
 fn run_cli_binary(binary: &Path, args: &[&str]) -> Output {
     Command::new(binary)
         .args(args)
@@ -342,6 +351,86 @@ fn csv_value<'a>(line: &'a str, key: &str) -> &'a str {
     line.split(',')
         .find_map(|field| field.strip_prefix(key))
         .unwrap_or_else(|| panic!("missing {key} in {line}"))
+}
+
+#[derive(Clone, Copy)]
+struct ReadObservation {
+    wall_us: f64,
+    bytes: u64,
+}
+
+fn read_observation(
+    binary: &Path,
+    image: &Path,
+    file_path: &str,
+    expected_evidence: &CliEvidence,
+) -> ReadObservation {
+    let image = image.to_str().expect("read image path is UTF-8");
+    let output = run_cli_binary(
+        binary,
+        &["read", image, file_path, "--discard", "--bench-evidence"],
+    );
+    assert!(
+        output.status.success(),
+        "read observation failed: binary={} status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("read observation stdout is UTF-8");
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    assert_eq!(
+        lines
+            .next()
+            .and_then(|line| line.strip_prefix("bench_evidence,binary_sha256=")),
+        Some(expected_evidence.binary_sha256.as_str()),
+        "timed read child executed an unexpected ELF"
+    );
+    assert_eq!(
+        lines.next(),
+        Some(expected_evidence.codegen_line.as_str()),
+        "timed read child changed its compile/runtime ISA witness"
+    );
+    assert_eq!(
+        lines
+            .next()
+            .and_then(|line| line.strip_prefix("build_profile,pgo_profile_sha256=")),
+        Some(expected_evidence.pgo_profile_sha256.as_str()),
+        "timed read child changed its consumed-profile identity"
+    );
+    let result = lines
+        .next()
+        .expect("timed read child emitted its observation");
+    assert!(
+        result.starts_with("bd_b9dug_read_observation,"),
+        "unexpected timed read result: {result}"
+    );
+    assert!(
+        lines.next().is_none(),
+        "timed read child emitted unexpected stdout after its result"
+    );
+    let wall_us = csv_value(result, "duration_us=")
+        .parse::<f64>()
+        .expect("read duration is numeric");
+    let bytes = csv_value(result, "bytes=")
+        .parse::<u64>()
+        .expect("read byte count is numeric");
+    assert!(wall_us > 0.0, "read duration must be positive");
+    ReadObservation { wall_us, bytes }
+}
+
+fn read_payload_signature(binary: &Path, image: &Path, file_path: &str) -> (usize, String) {
+    let image = image.to_str().expect("read image path is UTF-8");
+    let output = run_cli_binary(binary, &["read", image, file_path]);
+    assert!(
+        output.status.success(),
+        "read parity run failed: binary={} status={:?}\nstderr:\n{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.stdout.len(), sha256_bytes(&output.stdout))
 }
 
 struct CreateObservation {
@@ -1016,6 +1105,133 @@ bootstrap_resamples=20000,cv_used=false",
     );
 }
 
+struct ReadSamples {
+    anchor_us: Vec<f64>,
+    repeat_us: Vec<f64>,
+    candidate_us: Vec<f64>,
+    raw_pairs: String,
+}
+
+fn collect_read_samples(
+    generic: (&Path, &CliEvidence),
+    pgo: (&Path, &CliEvidence),
+    image: &Path,
+    file_path: &str,
+    expected_bytes: u64,
+    pairs: usize,
+) -> ReadSamples {
+    let mut anchor_us = Vec::with_capacity(pairs);
+    let mut repeat_us = Vec::with_capacity(pairs);
+    let mut candidate_us = Vec::with_capacity(pairs);
+    let mut raw_pairs = String::with_capacity(pairs.saturating_mul(64));
+    for pair in 0..pairs {
+        let observe_generic = || read_observation(generic.0, image, file_path, generic.1);
+        let observe_pgo = || read_observation(pgo.0, image, file_path, pgo.1);
+        let (anchor, repeat, candidate, order) = if pair % 2 == 0 {
+            (observe_generic(), observe_generic(), observe_pgo(), "AAB")
+        } else {
+            let candidate = observe_pgo();
+            let repeat = observe_generic();
+            let anchor = observe_generic();
+            (anchor, repeat, candidate, "BAA")
+        };
+        assert_eq!(
+            anchor.bytes, expected_bytes,
+            "generic anchor read was short"
+        );
+        assert_eq!(
+            repeat.bytes, expected_bytes,
+            "generic repeat read was short"
+        );
+        assert_eq!(
+            candidate.bytes, expected_bytes,
+            "v3+PGO candidate read was short"
+        );
+        anchor_us.push(anchor.wall_us);
+        repeat_us.push(repeat.wall_us);
+        candidate_us.push(candidate.wall_us);
+        if pair > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{:.3}:{:.3}:{:.3}",
+            anchor.wall_us, repeat.wall_us, candidate.wall_us
+        )
+        .expect("format whole-binary read pair");
+    }
+    ReadSamples {
+        anchor_us,
+        repeat_us,
+        candidate_us,
+        raw_pairs,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_read_gate(
+    identity: &LookupIdentity<'_>,
+    file_path: &str,
+    input_image_sha256: &str,
+    payload_bytes: usize,
+    payload_sha256: &str,
+    samples: ReadSamples,
+    pairs: usize,
+) {
+    let (null, pgo_ratio, null_floor_ratio, twice_null_ratio) = paired_ratio_summaries(
+        &samples.anchor_us,
+        &samples.repeat_us,
+        &samples.candidate_us,
+    );
+    let verdict = if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else if pgo_ratio.low > twice_null_ratio {
+        "PGO_FASTER"
+    } else if pgo_ratio.high < twice_null_ratio.recip() {
+        "PGO_SLOWER"
+    } else {
+        "INDETERMINATE_WITHIN_TWICE_NULL"
+    };
+    let generic_midpoints = samples
+        .anchor_us
+        .iter()
+        .zip(&samples.repeat_us)
+        .map(|(anchor, repeat)| anchor.midpoint(*repeat))
+        .collect::<Vec<_>>();
+    println!(
+        "bd_b9dug_read_identity,generic_binary_sha256={},pgo_binary_sha256={},\
+pgo_profile_sha256={},input_image={},input_image_sha256={input_image_sha256},\
+file={file_path},payload_bytes={payload_bytes},payload_sha256={payload_sha256}",
+        identity.generic.binary_sha256,
+        identity.pgo.binary_sha256,
+        identity.profile_sha256,
+        identity.image.display()
+    );
+    println!(
+        "bd_b9dug_read_pairs,pairs={pairs},format=order:generic_anchor_us:\
+generic_repeat_us:pgo_us,values={}",
+        samples.raw_pairs
+    );
+    println!(
+        "bd_b9dug_whole_binary_read,generic_median_us={:.3},pgo_median_us={:.3},\
+generic_aa_median={:.6},generic_aa_ci_low={:.6},generic_aa_ci_high={:.6},\
+null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},\
+generic_over_pgo_median={:.6},generic_over_pgo_ci_low={:.6},\
+generic_over_pgo_ci_high={:.6},verdict={verdict},same_invocation=true,\
+binary_hash_in_every_timed_child=true,gate_metric=read_wall_us,\
+gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false,\
+instructions_used=false",
+        median(generic_midpoints),
+        median(samples.candidate_us),
+        null.median,
+        null.low,
+        null.high,
+        pgo_ratio.median,
+        pgo_ratio.low,
+        pgo_ratio.high
+    );
+}
+
 /// Save the generic release-perf CLI on the pinned worker before a subsequent
 /// profile-use build replaces Cargo's output. The destination must be unique;
 /// this driver refuses to overwrite an earlier artifact.
@@ -1060,6 +1276,56 @@ fn bd_b9dug_store_generic_cli() {
         copied_evidence.binary_sha256,
         copied_evidence.codegen_line
     );
+
+    if let Some(read_image) = std::env::var_os("FFS_B9DUG_READ_IMAGE").map(PathBuf::from) {
+        const READ_BLOCKS: usize = 8_192;
+        const BLOCK_SIZE: usize = 4_096;
+        const READ_FILE: &str = "/bd-b9dug-read.bin";
+
+        assert!(
+            !read_image.exists(),
+            "refusing to overwrite read fixture {}",
+            read_image.display()
+        );
+        fs::create_dir_all(read_image.parent().expect("read image has parent"))
+            .expect("create read fixture directory");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../conformance/golden/ext4_dir_index_reference.ext4");
+        fs::copy(&fixture, &read_image).unwrap_or_else(|error| {
+            panic!(
+                "copy read fixture {} -> {}: {error}",
+                fixture.display(),
+                read_image.display()
+            )
+        });
+        let image = read_image.to_str().expect("read fixture path is UTF-8");
+        run_cli_binary_checked(
+            "prepare-read-fixture",
+            source,
+            &[
+                "write-bench",
+                image,
+                READ_FILE,
+                "--count",
+                &READ_BLOCKS.to_string(),
+                "--size",
+                &BLOCK_SIZE.to_string(),
+                "--create",
+            ],
+        );
+        let (bytes, payload_sha256) = read_payload_signature(source, &read_image, READ_FILE);
+        assert_eq!(
+            bytes,
+            READ_BLOCKS * BLOCK_SIZE,
+            "prepared read fixture has the wrong file size"
+        );
+        println!(
+            "bd_b9dug_read_fixture,path={},image_sha256={},file={READ_FILE},\
+bytes={bytes},payload_sha256={payload_sha256}",
+            read_image.display(),
+            sha256_file(&read_image)
+        );
+    }
 }
 
 /// Exercise the same CLI workload family as `scripts/build-perf.sh` with the
@@ -1160,6 +1426,80 @@ fn bd_b9dug_whole_binary_lookup_gate() {
         samples,
         PAIRS,
         LOOKUPS,
+    );
+}
+
+/// Production-shaped generic/PGO warm sequential-read decision. Every timed
+/// child self-reports the ELF/ISA/profile it actually executes before measuring
+/// one complete open/resolve/read, while this parent owns A/A and A/B ordering.
+#[test]
+#[ignore = "strict-remote bd-b9dug driver"]
+fn bd_b9dug_whole_binary_read_gate() {
+    const PAIRS: usize = 31;
+    const READ_FILE: &str = "/bd-b9dug-read.bin";
+
+    let generic = required_env_path("FFS_B9DUG_GENERIC_CLI");
+    let pgo = Path::new(env!("CARGO_BIN_EXE_ffs-cli"));
+    let image = required_env_path("FFS_B9DUG_READ_IMAGE");
+    let expected_profile = required_env("FFS_PGO_PROFILE_SHA256");
+    assert!(
+        expected_profile.len() == 64
+            && expected_profile
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "FFS_PGO_PROFILE_SHA256 must be a full SHA-256"
+    );
+
+    let generic_evidence = cli_evidence(&generic);
+    let pgo_evidence = cli_evidence(pgo);
+    assert_create_gate_identity(&generic_evidence, &pgo_evidence, &expected_profile);
+    let input_image_sha256 = sha256_file(&image);
+
+    let (generic_bytes, generic_payload_sha256) =
+        read_payload_signature(&generic, &image, READ_FILE);
+    let (pgo_bytes, pgo_payload_sha256) = read_payload_signature(pgo, &image, READ_FILE);
+    assert_eq!(
+        generic_bytes, pgo_bytes,
+        "generic and v3+PGO reads returned different byte counts"
+    );
+    assert_eq!(
+        generic_payload_sha256, pgo_payload_sha256,
+        "generic and v3+PGO reads returned different bytes"
+    );
+    let expected_bytes = u64::try_from(generic_bytes).expect("read payload length fits u64");
+
+    for _ in 0..2 {
+        let generic_warmup = read_observation(&generic, &image, READ_FILE, &generic_evidence);
+        let pgo_warmup = read_observation(pgo, &image, READ_FILE, &pgo_evidence);
+        assert_eq!(generic_warmup.bytes, expected_bytes);
+        assert_eq!(pgo_warmup.bytes, expected_bytes);
+    }
+    let samples = collect_read_samples(
+        (&generic, &generic_evidence),
+        (pgo, &pgo_evidence),
+        &image,
+        READ_FILE,
+        expected_bytes,
+        PAIRS,
+    );
+    assert_eq!(
+        sha256_file(&image),
+        input_image_sha256,
+        "read gate mutated its immutable input image"
+    );
+    report_read_gate(
+        &LookupIdentity {
+            generic: &generic_evidence,
+            pgo: &pgo_evidence,
+            profile_sha256: &expected_profile,
+            image: &image,
+        },
+        READ_FILE,
+        &input_image_sha256,
+        generic_bytes,
+        &generic_payload_sha256,
+        samples,
+        PAIRS,
     );
 }
 
