@@ -20,10 +20,10 @@
 use criterion::Criterion;
 use ffs_btrfs::{
     BTRFS_BLOCK_GROUP_DATA, BTRFS_CHUNK_TREE_OBJECTID, BTRFS_CSUM_TREE_OBJECTID,
-    BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_ITEM_EXTENT_ITEM,
-    BTRFS_ITEM_METADATA_ITEM, BTRFS_ITEM_TREE_BLOCK_REF, BTRFS_ROOT_TREE_OBJECTID,
-    BlockGroupFreeSpace, BtrfsBTree, BtrfsBlockGroupItem, BtrfsExtentAllocator, BtrfsKey,
-    ExtentAllocation, ExtentKey,
+    BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_ITEM_EXTENT_DATA_REF,
+    BTRFS_ITEM_EXTENT_ITEM, BTRFS_ITEM_METADATA_ITEM, BTRFS_ITEM_TREE_BLOCK_REF,
+    BTRFS_ROOT_TREE_OBJECTID, BlockGroupFreeSpace, BtrfsBTree, BtrfsBlockGroupItem,
+    BtrfsExtentAllocator, BtrfsExtentDataRef, BtrfsKey, ExtentAllocation, ExtentKey,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -41,6 +41,9 @@ const RECLAIM_MIN_SAMPLE_NS: u64 = 2_000_000;
 const RECLAIM_BOOTSTRAP_RESAMPLES: usize = 20_000;
 const RECLAIM_BOOTSTRAP_SEED: u64 = 0xF15A_1A11_2026_0727;
 const MIN_RECLAIM_SAVED_FRACTION: f64 = 0.05;
+const BACKREF_COUNT: usize = 4096;
+const BACKREF_BYTENR: u64 = 2 << 30;
+const BACKREF_BOOTSTRAP_SEED: u64 = 0xBACC_0EAF_2026_0727;
 
 /// Densely-packed allocated ranges: [BG_START, BG_START+EXT_SIZE),
 /// [BG_START+EXT_SIZE, ...), ... — sorted, non-overlapping, no internal gaps
@@ -469,7 +472,7 @@ struct ReclaimBenchState {
     referenced: HashSet<ExtentKey>,
 }
 
-struct ReclaimPairedStats {
+struct PairedStats {
     p50_a_ns: f64,
     p50_b_ns: f64,
     ratio_p50: f64,
@@ -699,7 +702,7 @@ fn reclaim_paired(
     arm_a: ReclaimArm,
     arm_b: ReclaimArm,
     batch: usize,
-) -> ReclaimPairedStats {
+) -> PairedStats {
     let mut times_a = Vec::with_capacity(RECLAIM_ROUNDS);
     let mut times_b = Vec::with_capacity(RECLAIM_ROUNDS);
     let mut ratios = Vec::with_capacity(RECLAIM_ROUNDS);
@@ -729,7 +732,7 @@ fn reclaim_paired(
         .map(|ratio| (ratio - mean) * (ratio - mean))
         .sum::<f64>()
         / (ratios.len() - 1) as f64;
-    ReclaimPairedStats {
+    PairedStats {
         p50_a_ns: reclaim_median(&times_a),
         p50_b_ns: reclaim_median(&times_b),
         ratio_p50,
@@ -739,7 +742,7 @@ fn reclaim_paired(
     }
 }
 
-fn print_reclaim_stats(label: &str, stats: &ReclaimPairedStats) {
+fn print_paired_stats(label: &str, stats: &PairedStats) {
     println!(
         "{label},rounds={RECLAIM_ROUNDS},min_of={RECLAIM_MIN_OF},p50_a_ns={:.0},p50_b_ns={:.0},ratio_p50={:.6},ratio_bootstrap_median_ci95=[{:.6},{:.6}],cv_pct={:.3},cv_used_as_gate=false,checksum={:016x}",
         stats.p50_a_ns,
@@ -809,8 +812,273 @@ fn reclaim_decision(candidate: ReclaimArm, mode: &str) {
         candidate,
         batch,
     );
-    print_reclaim_stats("null_materialized_materialized", &null);
-    print_reclaim_stats("real_materialized_borrowed", &real);
+    print_paired_stats("null_materialized_materialized", &null);
+    print_paired_stats("real_materialized_borrowed", &real);
+
+    let null_floor = null.ratio_ci.1.max(null.ratio_ci.0.recip());
+    let twice_null_threshold = null_floor * null_floor;
+    let saved_fraction_lower = (1.0 - real.ratio_ci.0.recip()).max(0.0);
+    let admitted = real.ratio_ci.0 > twice_null_threshold
+        && saved_fraction_lower >= MIN_RECLAIM_SAVED_FRACTION;
+    let verdict = if admitted {
+        "decidable_candidate_win"
+    } else {
+        "not_admitted"
+    };
+    println!(
+        "median_ci_gate={verdict},null_symmetric_floor={null_floor:.6},twice_null_threshold={twice_null_threshold:.6},real_ci_lower={:.6},real_ci_upper={:.6},saved_fraction_ci_lower={saved_fraction_lower:.6},minimum_saved_fraction={MIN_RECLAIM_SAVED_FRACTION:.6},gate_basis=bootstrap_median_wall_ci,cv_used_as_gate=false,instructions_used_as_gate=false",
+        real.ratio_ci.0, real.ratio_ci.1
+    );
+    if !admitted {
+        std::process::exit(2);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BackrefArm {
+    MaterializedControl,
+    BorrowedModel,
+    Production,
+}
+
+struct BackrefBenchState {
+    alloc: BtrfsExtentAllocator,
+}
+
+fn backref_range() -> (BtrfsKey, BtrfsKey) {
+    (
+        BtrfsKey {
+            objectid: BACKREF_BYTENR,
+            item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+            offset: 0,
+        },
+        BtrfsKey {
+            objectid: BACKREF_BYTENR,
+            item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+            offset: u64::MAX,
+        },
+    )
+}
+
+fn build_backref_state() -> BackrefBenchState {
+    let mut alloc = BtrfsExtentAllocator::new(1).expect("backref allocator");
+    for index in 0..BACKREF_COUNT {
+        let index = u64::try_from(index).expect("backref index fits in u64");
+        let key = BtrfsKey {
+            objectid: BACKREF_BYTENR,
+            item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+            offset: index,
+        };
+        let data_ref = BtrfsExtentDataRef {
+            root: 5 + index % 4,
+            objectid: 256 + index,
+            offset: index * 4096,
+            count: u32::try_from(index % 3 + 1).expect("backref count fits in u32"),
+        };
+        alloc
+            .extent_tree_mut()
+            .insert(key, &data_ref.to_bytes())
+            .expect("insert backref fixture");
+    }
+    BackrefBenchState { alloc }
+}
+
+/// Frozen production control: materialize each selected tree payload into its
+/// own `Vec`, then parse the owned bytes and discard that temporary allocation.
+fn materialized_backref_scan(state: &BackrefBenchState) -> Vec<BtrfsExtentDataRef> {
+    let (range_start, range_end) = backref_range();
+    let refs = state
+        .alloc
+        .extent_tree()
+        .range(&range_start, &range_end)
+        .expect("materialized backref range");
+    let mut result = Vec::new();
+    for (_, value) in refs {
+        if let Some(data_ref) = BtrfsExtentDataRef::from_bytes(&value) {
+            result.push(data_ref);
+        }
+    }
+    result
+}
+
+/// Source-neutral candidate model: parse the same ordered payloads while they
+/// are borrowed from tree nodes, retaining only the parsed fixed-size records.
+fn borrowed_backref_scan(state: &BackrefBenchState) -> Vec<BtrfsExtentDataRef> {
+    let (range_start, range_end) = backref_range();
+    let mut result = Vec::new();
+    state
+        .alloc
+        .extent_tree()
+        .range_with(&range_start, &range_end, |_, value| {
+            if let Some(data_ref) = BtrfsExtentDataRef::from_bytes(value) {
+                result.push(data_ref);
+            }
+        })
+        .expect("borrowed backref range");
+    result
+}
+
+fn backref_checksum(refs: &[BtrfsExtentDataRef]) -> u64 {
+    refs.iter().fold(0_u64, |digest, data_ref| {
+        digest
+            .wrapping_mul(1_000_003)
+            .wrapping_add(data_ref.root)
+            .rotate_left(7)
+            ^ data_ref.objectid
+            ^ data_ref.offset.rotate_right(11)
+            ^ u64::from(data_ref.count)
+    })
+}
+
+fn run_backref_arm(state: &BackrefBenchState, arm: BackrefArm) -> u64 {
+    let refs = match arm {
+        BackrefArm::MaterializedControl => materialized_backref_scan(state),
+        BackrefArm::BorrowedModel => borrowed_backref_scan(state),
+        BackrefArm::Production => state
+            .alloc
+            .get_extent_data_refs(BACKREF_BYTENR)
+            .expect("production backref scan"),
+    };
+    let refs = black_box(refs);
+    black_box(backref_checksum(&refs) ^ u64::try_from(refs.len()).unwrap_or(u64::MAX))
+}
+
+fn backref_sample(state: &BackrefBenchState, arm: BackrefArm, batch: usize) -> u64 {
+    let mut digest = 0_u64;
+    for iteration in 0..batch {
+        digest ^= run_backref_arm(black_box(state), black_box(arm))
+            .rotate_left(reclaim_rotation(iteration));
+    }
+    digest
+}
+
+fn backref_time_min(state: &BackrefBenchState, arm: BackrefArm, batch: usize) -> (u64, u64) {
+    let mut best = u64::MAX;
+    let mut digest = 0_u64;
+    for replicate in 0..RECLAIM_MIN_OF {
+        let started = Instant::now();
+        let observed = backref_sample(state, arm, batch);
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        best = best.min(elapsed.max(1));
+        digest ^= observed.rotate_left(reclaim_rotation(replicate));
+    }
+    (best, digest)
+}
+
+fn backref_calibrate_batch(state: &BackrefBenchState, candidate: BackrefArm) -> usize {
+    black_box(backref_sample(state, BackrefArm::MaterializedControl, 1));
+    black_box(backref_sample(state, candidate, 1));
+
+    let started = Instant::now();
+    black_box(backref_sample(state, candidate, 1));
+    let candidate_ns = u64::try_from(started.elapsed().as_nanos())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    usize::try_from(RECLAIM_MIN_SAMPLE_NS.div_ceil(candidate_ns))
+        .unwrap_or(usize::MAX)
+        .clamp(1, 64)
+}
+
+fn backref_paired(
+    state: &BackrefBenchState,
+    arm_a: BackrefArm,
+    arm_b: BackrefArm,
+    batch: usize,
+) -> PairedStats {
+    let mut times_a = Vec::with_capacity(RECLAIM_ROUNDS);
+    let mut times_b = Vec::with_capacity(RECLAIM_ROUNDS);
+    let mut ratios = Vec::with_capacity(RECLAIM_ROUNDS);
+    let mut digest = 0_u64;
+    for round in 0..RECLAIM_ROUNDS {
+        let ((elapsed_a, digest_a), (elapsed_b, digest_b)) = if round % 2 == 0 {
+            (
+                backref_time_min(state, arm_a, batch),
+                backref_time_min(state, arm_b, batch),
+            )
+        } else {
+            let b = backref_time_min(state, arm_b, batch);
+            let a = backref_time_min(state, arm_a, batch);
+            (a, b)
+        };
+        times_a.push(elapsed_a as f64);
+        times_b.push(elapsed_b as f64);
+        ratios.push(elapsed_a as f64 / elapsed_b.max(1) as f64);
+        digest ^= digest_a.rotate_left(reclaim_rotation(round));
+        digest ^= digest_b.rotate_right(reclaim_rotation(round));
+    }
+
+    let ratio_p50 = reclaim_median(&ratios);
+    let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    let variance = ratios
+        .iter()
+        .map(|ratio| (ratio - mean) * (ratio - mean))
+        .sum::<f64>()
+        / (ratios.len() - 1) as f64;
+    PairedStats {
+        p50_a_ns: reclaim_median(&times_a),
+        p50_b_ns: reclaim_median(&times_b),
+        ratio_p50,
+        ratio_ci: reclaim_bootstrap_median_ci(&ratios, BACKREF_BOOTSTRAP_SEED),
+        cv_pct: variance.sqrt() / mean * 100.0,
+        checksum: digest,
+    }
+}
+
+fn backref_mechanism_count(state: &BackrefBenchState) -> (usize, usize) {
+    let (range_start, range_end) = backref_range();
+    let entries = state
+        .alloc
+        .extent_tree()
+        .range(&range_start, &range_end)
+        .expect("count backref range");
+    let payload_bytes = entries.iter().map(|(_, payload)| payload.len()).sum();
+    (entries.len(), payload_bytes)
+}
+
+fn backref_decision(candidate: BackrefArm, mode: &str) {
+    let (binary_sha256, binary_bytes, binary_path) = self_sha256();
+    println!(
+        "bench_evidence,binary_sha256={binary_sha256},binary_bytes={binary_bytes},binary_path={binary_path},worker={}",
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned())
+    );
+    print_codegen_isa();
+
+    let state = build_backref_state();
+    let control = materialized_backref_scan(&state);
+    let model = borrowed_backref_scan(&state);
+    let production = state
+        .alloc
+        .get_extent_data_refs(BACKREF_BYTENR)
+        .expect("production backref parity");
+    assert_eq!(model, control, "borrowed backref output/order diverged");
+    assert_eq!(
+        production, control,
+        "production backref output/order diverged"
+    );
+    let output_checksum = backref_checksum(&control);
+    let (range_entries, materialized_payload_bytes) = backref_mechanism_count(&state);
+    println!(
+        "behavior_parity=exact,ordering=extent_tree_key_ascending,tie_breaking=na,floating_point=na,rng=na,parsed_backrefs={},output_checksum={output_checksum:016x}",
+        control.len()
+    );
+    println!(
+        "mechanism_count,range_entries={range_entries},materialized_payload_vecs={range_entries},materialized_payload_bytes={materialized_payload_bytes},borrowed_payload_vecs=0,parsed_output_records={}",
+        control.len()
+    );
+
+    let batch = backref_calibrate_batch(&state, candidate);
+    println!(
+        "bench_config,mode={mode},batch={batch},rounds={RECLAIM_ROUNDS},min_sample_ns={RECLAIM_MIN_SAMPLE_NS},min_of={RECLAIM_MIN_OF},bootstrap_resamples={RECLAIM_BOOTSTRAP_RESAMPLES},bootstrap_seed={BACKREF_BOOTSTRAP_SEED:016x}"
+    );
+    let null = backref_paired(
+        &state,
+        BackrefArm::MaterializedControl,
+        BackrefArm::MaterializedControl,
+        batch,
+    );
+    let real = backref_paired(&state, BackrefArm::MaterializedControl, candidate, batch);
+    print_paired_stats("null_backref_materialized_materialized", &null);
+    print_paired_stats("real_backref_materialized_borrowed", &real);
 
     let null_floor = null.ratio_ci.1.max(null.ratio_ci.0.recip());
     let twice_null_threshold = null_floor * null_floor;
@@ -838,6 +1106,14 @@ fn main() {
     }
     if std::env::args().any(|arg| arg == "--reclaim-production-decision-only") {
         reclaim_decision(ReclaimArm::Production, "actual_production_decision");
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--backref-attribution-only") {
+        backref_decision(BackrefArm::BorrowedModel, "source_neutral_attribution");
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--backref-production-decision-only") {
+        backref_decision(BackrefArm::Production, "actual_production_decision");
         return;
     }
 

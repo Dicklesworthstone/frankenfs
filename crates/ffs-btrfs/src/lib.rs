@@ -7579,13 +7579,13 @@ impl BtrfsExtentAllocator {
             item_type: BTRFS_ITEM_EXTENT_DATA_REF,
             offset: u64::MAX,
         };
-        let refs = self.extent_tree.range(&range_start, &range_end)?;
         let mut result = Vec::new();
-        for (_key, value) in refs {
-            if let Some(data_ref) = BtrfsExtentDataRef::from_bytes(&value) {
-                result.push(data_ref);
-            }
-        }
+        self.extent_tree
+            .range_with(&range_start, &range_end, |_, value| {
+                if let Some(data_ref) = BtrfsExtentDataRef::from_bytes(value) {
+                    result.push(data_ref);
+                }
+            })?;
         Ok(result)
     }
 

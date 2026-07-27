@@ -13,6 +13,82 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Btrfs keyed extent backrefs parse borrowed payloads - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior row on
+`BtrfsExtentAllocator::get_extent_data_refs`. The required family grep recovered
+the adjacent kept checksum-delete key projection, but no rejected backref
+parsing surface. A source-neutral harness therefore froze the exact inclusive
+`(bytenr, EXTENT_DATA_REF, 0..=u64::MAX)` range, ascending key order,
+`BtrfsExtentDataRef::from_bytes` validation, malformed-record skip behavior,
+and returned record vector while comparing the existing materializing range
+walk with a borrowed `range_with` walk.
+
+The pre-edit strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported ELF
+`544851737a95df49dbfc71d9bec4fbbc0e6ce1f7091cf0c8486a1fe97a196cb4`.
+All compile/runtime SSE2, SSE4.2, AVX2, and FMA checks were true. On 4,096 keyed
+backrefs, control, borrowed model, and then-current production returned the
+same 4,096 parsed records in the same order, checksum `7f3c7a247fc4a0b6`.
+The control materialized **4,096 temporary payload `Vec`s / 114,688 bytes**
+before retaining the fixed-size parsed records; the candidate materialized
+**0** temporary payload vectors while retaining the identical output vector.
+
+One invocation owned exact parity, the counted mechanism, and both timing
+controls. Materialized/materialized A/A median was **1.001039x**, deterministic
+20,000-resample bootstrap median 95% CI **[0.998937, 1.003046]**, yielding a
+symmetric null floor of **1.003046x** and a pre-registered twice-null threshold
+of **1.006100x**. Materialized/borrowed-model median was **2.192214x**,
+bootstrap median 95% CI **[2.187101, 2.195836]**; its saved-fraction lower
+bound was **0.542774**, clearing the 5% admission floor.
+
+Production `get_extent_data_refs` now parses each selected value while it is
+borrowed from its tree node and retains only the parsed `BtrfsExtentDataRef`.
+Inclusive range boundaries, ascending key traversal, parsed-record order,
+short/malformed payload omission, and returned errors are unchanged. A
+traversal error can populate only a local vector that is discarded with the
+`Err`, so no partial result or side effect escapes. Tie-breaking is
+unchanged/N/A; floating point and RNG are N/A.
+
+The final-source strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported
+`bench_evidence,binary_sha256=e9035b7a97ee51b7c1a674f12b83d367f88fbdd3f5fbf41ee683fa87a68142d1`.
+The same invocation again proved exact frozen-control/borrowed-model/
+actual-production record and order parity, counted the same
+**4,096 `Vec`s / 114,688 bytes to 0** mechanism, and ran 31 alternating-order
+paired rounds with min-of-three timing. Materialized/materialized A/A median
+was **0.997114x**, bootstrap median 95% CI **[0.990664, 1.007784]**; the
+symmetric null floor was **1.009424x** and the twice-null threshold
+**1.018936x**. Frozen-materialized/actual-production median was **2.601449x**,
+bootstrap median 95% CI **[2.574732, 2.617050]**, with a **0.611610**
+saved-fraction lower bound.
+
+**KEEP, narrowly scoped.** This is an isolated high-cardinality scan of 4,096
+keyed backrefs for one logical extent. It is not a typical one-ref extent,
+whole `BTRFS_IOC_LOGICAL_INO`, PGO, mounted, shipped, or kernel magnitude. The
+gate basis was bootstrap median CI over wall time; `cv_used=false` and
+`instructions_used=false`.
+
+Strict-remote focused keyed-ref tests passed **4/4**, covering first keyed-ref
+lookup, duplicate merge, count decrement/removal, and inline/keyed coexistence.
+Scoped `--no-deps -D warnings` Clippy passed after allowing only the reproduced
+pre-existing `similar_names`, `too_long_first_doc_paragraph`, and
+`too_many_arguments` categories in untouched code. Targeted rustfmt and
+`git diff --check` passed. `/data` had **436G** free before every Cargo
+invocation; all builds were strict-remote and no local target directory was
+created.
+
+**Retry predicate:** publish an end-to-end or shipped magnitude only after a
+production `BTRFS_IOC_LOGICAL_INO[_V2]` profile records the actual keyed-backref
+cardinality and attributes at least 5% of whole-ioctl wall/cycles to
+`get_extent_data_refs`; then run a same-worker whole-ioctl A/A+B gate with
+identical returned tuples and a bootstrap median wall/cycles CI clearing twice
+its own null log-margin. Revisit the remaining parsed-output vector only if a
+fresh profile attributes at least 5% to its allocation/growth and a caller-owned
+buffer or iterator can preserve the public API contract. Never transfer this
+4,096-ref ratio to ordinary one-ref extents; `cv_used=false`;
+`instructions_used=false`.
+
 ## Btrfs orphan reclaim borrows extent-tree keys - 2026-07-27 (GreenSpring, KEEP)
 
 The institutional preflight found no prior row on
