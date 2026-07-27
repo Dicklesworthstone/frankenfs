@@ -8955,8 +8955,107 @@ fn emit_write_chunks(builder: &mut SendStreamBuilder, path: &[u8], file_offset: 
     }
 }
 
+struct SendInodeLinkGroup {
+    ino: u64,
+    links: Vec<(u64, Vec<u8>)>,
+}
+
+enum SendInodeLinks {
+    Ordered(Vec<SendInodeLinkGroup>),
+    Gathered(BTreeMap<u64, Vec<(u64, Vec<u8>)>>),
+}
+
+impl SendInodeLinks {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordered(groups) => groups.len(),
+            Self::Gathered(groups) => groups.len(),
+        }
+    }
+
+    fn get(&self, ino: u64) -> Option<&[(u64, Vec<u8>)]> {
+        match self {
+            Self::Ordered(groups) => groups
+                .binary_search_by_key(&ino, |group| group.ino)
+                .ok()
+                .map(|index| groups[index].links.as_slice()),
+            Self::Gathered(groups) => groups.get(&ino).map(Vec::as_slice),
+        }
+    }
+
+    fn materialize_primary_parents(&self) -> BTreeMap<u64, (u64, Vec<u8>)> {
+        match self {
+            Self::Ordered(groups) => groups
+                .iter()
+                .filter_map(|group| {
+                    group
+                        .links
+                        .first()
+                        .map(|(parent, name)| (group.ino, (*parent, name.clone())))
+                })
+                .collect(),
+            Self::Gathered(groups) => groups
+                .iter()
+                .filter_map(|(&ino, links)| {
+                    links
+                        .first()
+                        .map(|(parent, name)| (ino, (*parent, name.clone())))
+                })
+                .collect(),
+        }
+    }
+}
+
+fn collect_send_inode_links<const FORCE_BTREE: bool>(items: &[BtrfsLeafEntry]) -> SendInodeLinks {
+    let monotone_objectids = !FORCE_BTREE
+        && items
+            .windows(2)
+            .all(|pair| pair[0].key.objectid <= pair[1].key.objectid);
+    if monotone_objectids {
+        let mut groups: Vec<SendInodeLinkGroup> =
+            Vec::with_capacity(items.len().saturating_add(1) / 2);
+        for entry in items {
+            if entry.key.item_type != BTRFS_ITEM_INODE_REF {
+                continue;
+            }
+            let Ok(refs) = parse_inode_refs(&entry.data) else {
+                continue;
+            };
+            if groups
+                .last()
+                .is_none_or(|group| group.ino != entry.key.objectid)
+            {
+                groups.push(SendInodeLinkGroup {
+                    ino: entry.key.objectid,
+                    links: Vec::new(),
+                });
+            }
+            let links = &mut groups.last_mut().expect("link group just inserted").links;
+            for inode_ref in refs {
+                // Preserve the existing parse-to-map ownership behavior. The
+                // representation lever changes only the outer index.
+                links.push((entry.key.offset, inode_ref.name.clone()));
+            }
+        }
+        return SendInodeLinks::Ordered(groups);
+    }
+
+    let mut gathered: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
+    for entry in items {
+        if entry.key.item_type == BTRFS_ITEM_INODE_REF
+            && let Ok(refs) = parse_inode_refs(&entry.data)
+        {
+            let links = gathered.entry(entry.key.objectid).or_default();
+            for inode_ref in refs {
+                links.push((entry.key.offset, inode_ref.name.clone()));
+            }
+        }
+    }
+    SendInodeLinks::Gathered(gathered)
+}
+
 fn primary_inode_link<'a, const MATERIALIZED: bool>(
-    inode_links: &'a BTreeMap<u64, Vec<(u64, Vec<u8>)>>,
+    inode_links: &'a SendInodeLinks,
     inode_parents: Option<&'a BTreeMap<u64, (u64, Vec<u8>)>>,
     ino: u64,
 ) -> Option<(u64, &'a [u8])> {
@@ -8966,7 +9065,7 @@ fn primary_inode_link<'a, const MATERIALIZED: bool>(
             .map(|(parent, name)| (*parent, name.as_slice()))
     } else {
         inode_links
-            .get(&ino)?
+            .get(ino)?
             .first()
             .map(|(parent, name)| (*parent, name.as_slice()))
     }
@@ -9083,7 +9182,7 @@ where
     // decompressor) so the slice below is always in uncompressed/logical space.
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<false, false, F>(
+    Ok(generate_send_stream_impl::<false, false, false, F>(
         items,
         subvol_name,
         subvol_uuid,
@@ -9109,7 +9208,7 @@ pub fn generate_send_stream_materialized_parent_index_control<F>(
 where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<true, false, F>(
+    Ok(generate_send_stream_impl::<true, false, false, F>(
         items,
         subvol_name,
         subvol_uuid,
@@ -9134,7 +9233,32 @@ pub fn generate_send_stream_btree_grouping_control<F>(
 where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<false, true, F>(
+    Ok(generate_send_stream_impl::<false, true, false, F>(
+        items,
+        subvol_name,
+        subvol_uuid,
+        ctransid,
+        read_extent,
+    ))
+}
+
+/// BTreeMap inode-links control for the same-ELF performance harness.
+///
+/// This is not a supported application API. It retains the pre-optimization
+/// outer link-map representation only when benchmark instrumentation is enabled.
+#[cfg(feature = "bench-instrumentation")]
+#[doc(hidden)]
+pub fn generate_send_stream_btree_inode_links_control<F>(
+    items: &[BtrfsLeafEntry],
+    subvol_name: &[u8],
+    subvol_uuid: &[u8; 16],
+    ctransid: u64,
+    read_extent: F,
+) -> Result<Vec<u8>, ParseError>
+where
+    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
+{
+    Ok(generate_send_stream_impl::<false, false, true, F>(
         items,
         subvol_name,
         subvol_uuid,
@@ -9147,6 +9271,7 @@ where
 fn generate_send_stream_impl<
     const MATERIALIZED_PRIMARY_PARENTS: bool,
     const FORCE_BTREE_INODE_GROUPS: bool,
+    const FORCE_BTREE_INODE_LINKS: bool,
     F,
 >(
     items: &[BtrfsLeafEntry],
@@ -9169,26 +9294,12 @@ where
     // into the same parent), and an inode can have several INODE_REF items
     // (links into different parents). Collect ALL (parent, name) links so hard
     // links beyond the first are emitted as `link` commands, not dropped.
-    let mut inode_links: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
-    for entry in items {
-        if entry.key.item_type == BTRFS_ITEM_INODE_REF {
-            if let Ok(refs) = parse_inode_refs(&entry.data) {
-                let links = inode_links.entry(entry.key.objectid).or_default();
-                for r in refs {
-                    links.push((entry.key.offset, r.name.clone()));
-                }
-            }
-        }
-    }
+    let inode_links = collect_send_inode_links::<FORCE_BTREE_INODE_LINKS>(items);
     // The primary link (first) drives path construction; the rest become hard
     // links. Production reads that link directly. The optional materialized
     // projection is compiled only for the same-ELF benchmark control.
-    let inode_parents = MATERIALIZED_PRIMARY_PARENTS.then(|| {
-        inode_links
-            .iter()
-            .filter_map(|(&ino, links)| links.first().map(|(p, n)| (ino, (*p, n.clone()))))
-            .collect::<BTreeMap<_, _>>()
-    });
+    let inode_parents =
+        MATERIALIZED_PRIMARY_PARENTS.then(|| inode_links.materialize_primary_parents());
     let primary_link_count = inode_parents
         .as_ref()
         .map_or_else(|| inode_links.len(), BTreeMap::len);
@@ -9484,7 +9595,7 @@ where
         // additional path. All parent dirs are already emitted, so the link path
         // resolves. (Directories cannot be hard-linked.)
         if file_type != ffs_types::S_IFDIR {
-            if let Some(links) = inode_links.get(&ino) {
+            if let Some(links) = inode_links.get(ino) {
                 for (parent, name) in links.iter().skip(1) {
                     let mut link_path = build_path(*parent, true);
                     // Relative to the subvol root: no leading slash for a link
@@ -23091,6 +23202,50 @@ mod tests {
             reassembled, decompressed,
             "send stream of a compressed extent must carry the full DECOMPRESSED data"
         );
+    }
+
+    #[test]
+    fn collect_send_inode_links_preserves_link_order_and_unsorted_fallback() {
+        #[expect(clippy::cast_possible_truncation)]
+        fn inode_ref_entry(ino: u64, parent: u64, index: u64, name: &[u8]) -> BtrfsLeafEntry {
+            let mut data = Vec::new();
+            data.extend_from_slice(&index.to_le_bytes());
+            data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            data.extend_from_slice(name);
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid: ino,
+                    item_type: BTRFS_ITEM_INODE_REF,
+                    offset: parent,
+                },
+                data,
+            }
+        }
+
+        let sorted = vec![
+            inode_ref_entry(257, 256, 2, b"first"),
+            inode_ref_entry(257, 300, 3, b"second"),
+            inode_ref_entry(258, 256, 4, b"third"),
+        ];
+        let expected_257 = vec![(256, b"first".to_vec()), (300, b"second".to_vec())];
+
+        let ordered = collect_send_inode_links::<false>(&sorted);
+        assert!(matches!(ordered, SendInodeLinks::Ordered(_)));
+        assert_eq!(ordered.get(257), Some(expected_257.as_slice()));
+
+        let forced_control = collect_send_inode_links::<true>(&sorted);
+        assert!(matches!(forced_control, SendInodeLinks::Gathered(_)));
+        assert_eq!(forced_control.get(257), Some(expected_257.as_slice()));
+
+        let unsorted = vec![
+            inode_ref_entry(258, 256, 4, b"third"),
+            inode_ref_entry(257, 256, 2, b"first"),
+            inode_ref_entry(258, 300, 5, b"fourth"),
+        ];
+        let expected_258 = vec![(256, b"third".to_vec()), (300, b"fourth".to_vec())];
+        let fallback = collect_send_inode_links::<false>(&unsorted);
+        assert!(matches!(fallback, SendInodeLinks::Gathered(_)));
+        assert_eq!(fallback.get(258), Some(expected_258.as_slice()));
     }
 
     /// bd-7ucz7: a child must never be emitted before its parent directory, even

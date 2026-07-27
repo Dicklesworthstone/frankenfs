@@ -17,7 +17,7 @@ use ffs_btrfs::{
 };
 #[cfg(feature = "bench-instrumentation")]
 use ffs_btrfs::{
-    generate_send_stream_btree_grouping_control,
+    generate_send_stream_btree_grouping_control, generate_send_stream_btree_inode_links_control,
     generate_send_stream_materialized_parent_index_control,
 };
 use rustc_hash::FxBuildHasher;
@@ -388,6 +388,33 @@ fn primary_parent_digest(parents: &BTreeMap<u64, (u64, Vec<u8>)>) -> String {
     hex
 }
 
+fn inode_links_digest(inode_links: &BTreeMap<u64, Vec<(u64, Vec<u8>)>>) -> String {
+    let mut hasher = Sha256::new();
+    for (ino, links) in inode_links {
+        hasher.update(ino.to_le_bytes());
+        hasher.update(
+            u64::try_from(links.len())
+                .expect("link count fits u64")
+                .to_le_bytes(),
+        );
+        for (parent, name) in links {
+            hasher.update(parent.to_le_bytes());
+            hasher.update(
+                u64::try_from(name.len())
+                    .expect("link name length fits u64")
+                    .to_le_bytes(),
+            );
+            hasher.update(name);
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("format inode-links SHA-256");
+    }
+    hex
+}
+
 fn observe_ns_per_iteration(mut operation: impl FnMut(), iterations: u32) -> f64 {
     let started = Instant::now();
     for _ in 0..iterations {
@@ -543,6 +570,348 @@ fn parent_index_attribution_only() {
         attribution_summary.low,
         attribution_summary.high,
         attribution_summary.median * 100.0,
+    );
+}
+
+/// Retry-predicate gate for the parsed-`INODE_REF` handoff row. This mode does
+/// not contain a candidate representation: it counts and times the complete
+/// current `inode_links` construction against duplicate current whole streams.
+///
+/// Production may change only if the stage's complete bootstrap median-CI
+/// lower bound reaches 5% of whole-stream wall and the same-invocation A/A
+/// symmetric null floor is at most 1.015x.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's parity, counted stage, A/A, and verdict protocol together"
+)]
+fn inode_links_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 8;
+    const STAGE_REPEATS: u32 = 32;
+    const MAX_NULL_FLOOR_RATIO: f64 = 1.015;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.05;
+
+    let items = build_deep_send_items();
+    let inode_links = collect_inode_links(&items);
+    let ref_items = items
+        .iter()
+        .filter(|entry| entry.key.item_type == BTRFS_ITEM_INODE_REF)
+        .count();
+    let parsed_links = inode_links.values().map(Vec::len).sum::<usize>();
+    let name_bytes = inode_links
+        .values()
+        .flat_map(|links| links.iter())
+        .map(|(_, name)| name.len())
+        .sum::<usize>();
+    let monotone_objectids = items
+        .windows(2)
+        .all(|pair| pair[0].key.objectid <= pair[1].key.objectid);
+    assert!(
+        monotone_objectids,
+        "deep-path fixture must exercise the ordered production input"
+    );
+    assert_eq!(
+        ref_items, parsed_links,
+        "fixture must carry exactly one parsed link per INODE_REF item"
+    );
+
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "inode_links_attribution_parity,ordered_input={monotone_objectids},ref_items={ref_items},map_entry_probes={ref_items},unique_inodes={},parsed_links={parsed_links},name_bytes={name_bytes},inode_links_sha256={},stream_bytes={},stream_sha256={},result=identical",
+        inode_links.len(),
+        inode_links_digest(&inode_links),
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(collect_inode_links(black_box(&items)));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut stage_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_stage = || {
+            observe_ns_per_iteration(
+                || {
+                    let current = collect_inode_links(black_box(&items));
+                    black_box(current);
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (lhs, rhs, stage, order) = if pair_index % 2 == 0 {
+            (observe_whole(), observe_whole(), observe_stage(), "AAS")
+        } else {
+            let stage = observe_stage();
+            let rhs = observe_whole();
+            let lhs = observe_whole();
+            (lhs, rhs, stage, "SAA")
+        };
+        whole_lhs_ns.push(lhs);
+        whole_rhs_ns.push(rhs);
+        stage_ns.push(stage);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{stage:.3}")
+            .expect("format inode-links attribution pair");
+    }
+
+    let null_log_ratios = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_log_ratios = stage_ns
+        .iter()
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|(stage, (lhs, rhs))| (stage / lhs.midpoint(*rhs)).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let attribution_summary = bootstrap_median_ci(&attribution_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let admitted = null_floor_ratio <= MAX_NULL_FLOOR_RATIO
+        && attribution_summary.low >= MIN_ATTRIBUTION_FRACTION;
+    let verdict = if admitted {
+        "ADMITTED_FOR_AB"
+    } else if null_floor_ratio > MAX_NULL_FLOOR_RATIO {
+        "BLOCKED_NULL_FLOOR"
+    } else {
+        "NOT_ADMITTED_BELOW_5_PERCENT"
+    };
+    println!(
+        "inode_links_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},stage_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:stage_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_links_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},stage_fraction_median={:.8},stage_fraction_ci_low={:.8},stage_fraction_ci_high={:.8},stage_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.2},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        attribution_summary.median,
+        attribution_summary.low,
+        attribution_summary.high,
+        attribution_summary.median * 100.0,
+    );
+}
+
+#[cfg(feature = "bench-instrumentation")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's parity, A/A, A/B, and verdict protocol together"
+)]
+fn inode_links_ab_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 8;
+    const MAX_NULL_FLOOR_RATIO: f64 = 1.015;
+
+    let items = build_deep_send_items();
+    let inode_links = collect_inode_links(&items);
+    let ref_items = items
+        .iter()
+        .filter(|entry| entry.key.item_type == BTRFS_ITEM_INODE_REF)
+        .count();
+    let parsed_links = inode_links.values().map(Vec::len).sum::<usize>();
+    let name_bytes = inode_links
+        .values()
+        .flat_map(|links| links.iter())
+        .map(|(_, name)| name.len())
+        .sum::<usize>();
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+
+    let control_stream = generate_send_stream_btree_inode_links_control(
+        &items,
+        subvol,
+        &uuid,
+        1,
+        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+    )
+    .expect("generate BTreeMap inode-links control stream");
+    let candidate_stream =
+        generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+            Ok(Vec::new())
+        })
+        .expect("generate ordered inode-links candidate stream");
+    assert_eq!(
+        control_stream, candidate_stream,
+        "ordered inode-links index changed the complete send stream"
+    );
+    println!(
+        "inode_links_ab_parity,ordered_input=true,map_entry_probes_removed={ref_items},unique_inodes={},parsed_links={parsed_links},name_bytes={name_bytes},stream_bytes={},control_sha256={},candidate_sha256={},result=identical",
+        inode_links.len(),
+        control_stream.len(),
+        sha256_hex(&control_stream),
+        sha256_hex(&candidate_stream),
+    );
+
+    for _ in 0..4 {
+        black_box(
+            generate_send_stream_btree_inode_links_control(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm BTreeMap inode-links control stream"),
+        );
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm ordered inode-links candidate stream"),
+        );
+    }
+
+    let mut control_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut candidate_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_control = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream_btree_inode_links_control(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate BTreeMap inode-links control stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_candidate = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate ordered inode-links candidate stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let (lhs, rhs, candidate, order) = if pair_index % 2 == 0 {
+            (
+                observe_control(),
+                observe_control(),
+                observe_candidate(),
+                "AAB",
+            )
+        } else {
+            let candidate = observe_candidate();
+            let rhs = observe_control();
+            let lhs = observe_control();
+            (lhs, rhs, candidate, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{candidate:.3}")
+            .expect("format inode-links A/A+B pair");
+    }
+
+    let null_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .zip(&candidate_ns)
+        .map(|((lhs, rhs), candidate)| (lhs.midpoint(*rhs) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio <= MAX_NULL_FLOOR_RATIO
+        && speedup_summary.low > twice_null_ratio
+        && speedup_summary.low > 1.0;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio > MAX_NULL_FLOOR_RATIO {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL"
+    };
+    println!(
+        "inode_links_ab_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_links_ab,control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
     );
 }
 
@@ -2010,6 +2379,23 @@ criterion_group!(
 );
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--inode-links-ab-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        #[cfg(feature = "bench-instrumentation")]
+        {
+            inode_links_ab_only();
+            return;
+        }
+        #[cfg(not(feature = "bench-instrumentation"))]
+        panic!("--inode-links-ab-only requires --features bench-instrumentation");
+    }
+    if std::env::args().any(|arg| arg == "--inode-links-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        inode_links_attribution_only();
+        return;
+    }
     if std::env::args().any(|arg| arg == "--send-cache-hasher-attribution-only") {
         print_bench_evidence_metadata();
         print_codegen_isa();

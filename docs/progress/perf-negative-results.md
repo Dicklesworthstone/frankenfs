@@ -13,6 +13,75 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Btrfs-send ordered inode-link groups replace the outer BTreeMap - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional candidate preflight matched the 2026-07-13 rejected
+parsed-`INODE_REF` name-handoff row. That prior row required either a materially
+quieter paired harness or proof that this handoff is a whole-send bottleneck.
+No production edit was made until a source-neutral attribution invocation
+satisfied that requirement.
+
+On the 3,048,915-byte deep-path fixture, the old `inode_links` construction
+performed 1,088 map-entry probes for 1,088 parsed links across 896 unique
+inodes and copied 5,312 name bytes. The pre-edit x86-64-v3 release-perf process
+self-reported ELF
+`b48117f27efd146c9e3e3d1dd550075db8b9dbef9fee3531317f164fb8850083`
+on pinned strict-remote `ovh-a`. Its same-invocation whole/whole A/A symmetric
+null floor was **1.008357x**. The complete link-map stage occupied
+**12.944545%** of whole-stream wall, with deterministic bootstrap median 95%
+CI **[12.829439%, 13.040409%]**. That lower bound cleared the pre-registered 5%
+admission floor.
+
+Production now uses a compact ordered `Vec<SendInodeLinkGroup>` when the
+tree-walk input is monotone by objectid. A binary search provides the same
+inode lookup contract without one BTreeMap node/probe per parsed
+`INODE_REF`. Public arbitrary-slice behavior remains exact: a monotonicity
+check routes non-monotone input through the original BTreeMap gather, including
+the original within-inode insertion order. This lever deliberately retains
+the existing parsed-name clone, so it does not mix in or re-derive the rejected
+clone-to-move handoff.
+
+The final source-exact invocation reported:
+
+- `bench_evidence,binary_sha256=1417e48797830580d83dfc5b24ea5021a2cb1d7dffc33e84e6e2769860750eb2`;
+- worker `fixmydocuments` (`ovh-a`), with compile/runtime SSE2, SSE4.2, AVX2,
+  and FMA all true;
+- BTreeMap/BTreeMap A/A median **0.999342x**, bootstrap median 95% CI
+  **[0.997662, 1.000983]**, symmetric null floor **1.002343x**, and
+  pre-registered twice-null threshold **1.004691x**; and
+- BTreeMap/ordered-group median **1.081022x**, bootstrap median 95% CI
+  **[1.077525, 1.084050]**, clearing twice-null across 31 alternating
+  `AAB`/`BAA` pairs with eight complete streams per observation.
+
+Control and candidate emitted the identical 3,048,915-byte stream, SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+The decision used the deterministic 20,000-resample bootstrap median CI over
+whole-stream wall time. CV and instruction count were not computed or
+consulted.
+
+**DECISION — KEEP.** Ordering is preserved: objectid groups remain sorted and
+links within each inode retain encounter order. First-link tie-breaking and
+hardlink emission are unchanged. Parse/error skipping, path construction,
+command attributes, CRCs, and complete stream bytes are identical. Floating
+point and RNG are N/A. This is witnessed v3 release-perf evidence, not PGO or
+shipped-binary magnitude evidence.
+
+Strict-remote correctness gates passed the focused ordered/fallback proof
+**1/1** and existing send-stream family **7/7**. Targeted rustfmt and
+`git diff --check` passed. Scoped Clippy reached the owned library and
+benchmark; all diagnostics were blame-confirmed pre-existing library/legacy
+bench debt outside this diff, and neither new function produced a diagnostic.
+
+**Retry predicate:** restate this magnitude as shipped only after the exact
+production PGO training profile is consumed by the same strict-remote
+whole-stream gate. Revisit the representation itself only if a production
+caller measurably supplies non-monotone objectids, or a fresh profile
+attributes at least 5% of whole wall/cycles to the binary-search/fallback
+branch. Any retry must retain the in-process ELF/ISA/profile witness, exact
+stream plus arbitrary-order fallback parity, at least 31 same-invocation
+alternating A/A+B pairs, and a bootstrap median wall/cycles CI clearing twice
+its own null log-margin. Never gate on CV or instruction count.
+
 ## Ext4 read-pool cap retained, quarter-nproc scaling corrected - 2026-07-27 (GreenSpring, KEEP / CLAIM CORRECTION)
 
 The institutional candidate preflight found the existing `bd-ddryj` row and
