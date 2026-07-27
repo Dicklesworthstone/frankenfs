@@ -341,6 +341,7 @@ struct GroupBlockRange {
 #[derive(Debug, Clone)]
 pub struct QueuedRepairRefresh {
     group_ranges: Arc<Vec<GroupBlockRange>>,
+    group_ranges_are_disjoint: bool,
     queued_groups: Arc<Mutex<BTreeSet<GroupNumber>>>,
 }
 
@@ -348,7 +349,7 @@ impl QueuedRepairRefresh {
     /// Build a queue adapter from repair group configurations.
     #[must_use]
     pub fn from_group_configs(groups: &[GroupConfig]) -> Self {
-        let ranges = groups
+        let ranges: Vec<GroupBlockRange> = groups
             .iter()
             .map(|cfg| GroupBlockRange {
                 group: cfg.layout.group,
@@ -356,8 +357,22 @@ impl QueuedRepairRefresh {
                 end: cfg.source_first_block.0 + u64::from(cfg.source_block_count),
             })
             .collect();
+        let mut indexed_ranges = ranges.clone();
+        indexed_ranges.sort_by_key(|range| range.start);
+        let group_ranges_are_disjoint = indexed_ranges
+            .windows(2)
+            .all(|pair| pair[0].end <= pair[1].start);
+        let group_ranges = if group_ranges_are_disjoint {
+            indexed_ranges
+        } else {
+            // Overlapping ranges are not a valid production layout, but the
+            // public constructor historically accepted them and selected the
+            // first matching input range. Preserve that tie-break exactly.
+            ranges
+        };
         Self {
-            group_ranges: Arc::new(ranges),
+            group_ranges: Arc::new(group_ranges),
+            group_ranges_are_disjoint,
             queued_groups: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -365,11 +380,18 @@ impl QueuedRepairRefresh {
     fn groups_for_blocks(&self, blocks: &[BlockNumber]) -> BTreeSet<GroupNumber> {
         let mut groups = BTreeSet::new();
         for block in blocks {
-            if let Some(range) = self
-                .group_ranges
-                .iter()
-                .find(|range| block.0 >= range.start && block.0 < range.end)
-            {
+            let range = if self.group_ranges_are_disjoint {
+                self.group_ranges
+                    .partition_point(|range| range.start <= block.0)
+                    .checked_sub(1)
+                    .and_then(|index| self.group_ranges.get(index))
+                    .filter(|range| block.0 < range.end)
+            } else {
+                self.group_ranges
+                    .iter()
+                    .find(|range| block.0 >= range.start && block.0 < range.end)
+            };
+            if let Some(range) = range {
                 groups.insert(range.group);
             }
         }
@@ -5355,6 +5377,70 @@ mod tests {
         // Second drain should be empty.
         let drained2 = queue.drain_queued_groups().expect("drain2");
         assert!(drained2.is_empty());
+    }
+
+    #[test]
+    fn queued_repair_refresh_indexes_disjoint_unsorted_ranges() {
+        let configs = [
+            GroupConfig {
+                layout: RepairGroupLayout::new(GroupNumber(2), BlockNumber(192), 64, 0, 4)
+                    .expect("layout2"),
+                source_first_block: BlockNumber(64),
+                source_block_count: 16,
+            },
+            GroupConfig {
+                layout: RepairGroupLayout::new(GroupNumber(0), BlockNumber(128), 64, 0, 4)
+                    .expect("layout0"),
+                source_first_block: BlockNumber(0),
+                source_block_count: 16,
+            },
+            GroupConfig {
+                layout: RepairGroupLayout::new(GroupNumber(1), BlockNumber(160), 64, 0, 4)
+                    .expect("layout1"),
+                source_first_block: BlockNumber(32),
+                source_block_count: 16,
+            },
+        ];
+        let queue = QueuedRepairRefresh::from_group_configs(&configs);
+        assert!(queue.group_ranges_are_disjoint);
+
+        let cx = Cx::for_testing();
+        queue
+            .on_flush_committed(&cx, &[BlockNumber(70), BlockNumber(1), BlockNumber(39)])
+            .expect("flush");
+        assert_eq!(
+            queue.drain_queued_groups().expect("drain"),
+            vec![GroupNumber(0), GroupNumber(1), GroupNumber(2)]
+        );
+    }
+
+    #[test]
+    fn queued_repair_refresh_preserves_first_match_for_overlapping_ranges() {
+        let configs = [
+            GroupConfig {
+                layout: RepairGroupLayout::new(GroupNumber(7), BlockNumber(64), 64, 0, 4)
+                    .expect("layout7"),
+                source_first_block: BlockNumber(0),
+                source_block_count: 16,
+            },
+            GroupConfig {
+                layout: RepairGroupLayout::new(GroupNumber(3), BlockNumber(96), 64, 0, 4)
+                    .expect("layout3"),
+                source_first_block: BlockNumber(8),
+                source_block_count: 16,
+            },
+        ];
+        let queue = QueuedRepairRefresh::from_group_configs(&configs);
+        assert!(!queue.group_ranges_are_disjoint);
+
+        let cx = Cx::for_testing();
+        queue
+            .on_flush_committed(&cx, &[BlockNumber(10)])
+            .expect("flush");
+        assert_eq!(
+            queue.drain_queued_groups().expect("drain"),
+            vec![GroupNumber(7)]
+        );
     }
 
     #[test]

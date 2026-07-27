@@ -95,3 +95,7 @@ harness = false
 [[bench]]
 name = "zero_scan_width"
 harness = false
+
+[[bench]]
+name = "queued_refresh_lookup"
+harness = false
