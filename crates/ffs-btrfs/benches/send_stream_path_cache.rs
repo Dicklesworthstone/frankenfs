@@ -8,14 +8,17 @@
 //! directory-depth reconstruction used to walk the same ancestors per inode.
 
 use criterion::{Criterion, criterion_group};
-#[cfg(feature = "bench-instrumentation")]
-use ffs_btrfs::generate_send_stream_materialized_parent_index_control;
 use ffs_btrfs::{
     BTRFS_FIRST_FREE_OBJECTID, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_INODE_REF,
     BTRFS_SEND_STREAM_MAGIC, BTRFS_SEND_STREAM_VERSION, BtrfsKey, BtrfsLeafEntry, SendAttr,
     SendCommand, build_chmod_command, build_chown_command, build_link_command, build_mkdir_command,
     build_mkfile_command, build_subvol_command, build_truncate_command, build_utimes_command,
     generate_send_stream, parse_inode_item, parse_inode_refs,
+};
+#[cfg(feature = "bench-instrumentation")]
+use ffs_btrfs::{
+    generate_send_stream_btree_grouping_control,
+    generate_send_stream_materialized_parent_index_control,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -546,6 +549,345 @@ fn group_send_inode_entries(items: &[BtrfsLeafEntry]) -> BTreeMap<u64, Vec<&Btrf
         inodes.entry(entry.key.objectid).or_default().push(entry);
     }
     inodes
+}
+
+fn inode_grouping_digest(inodes: &BTreeMap<u64, Vec<&BtrfsLeafEntry>>) -> String {
+    let mut hasher = Sha256::new();
+    for (ino, entries) in inodes {
+        hasher.update(ino.to_le_bytes());
+        hasher.update(
+            u64::try_from(entries.len())
+                .expect("group length fits u64")
+                .to_le_bytes(),
+        );
+        for entry in entries {
+            hasher.update(entry.key.objectid.to_le_bytes());
+            hasher.update([entry.key.item_type]);
+            hasher.update(entry.key.offset.to_le_bytes());
+            hasher.update(
+                u64::try_from(entry.data.len())
+                    .expect("entry length fits u64")
+                    .to_le_bytes(),
+            );
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("format inode-grouping SHA-256");
+    }
+    hex
+}
+
+/// Source-neutral admission gate for the complete inode-grouping pass in
+/// `generate_send_stream_impl`. There is no candidate production path in this
+/// invocation: it counts the current BTreeMap insertion stage against duplicate
+/// current whole-stream executions.
+fn inode_grouping_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const STAGE_REPEATS: u32 = 16;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.05;
+
+    let items = build_deep_send_items();
+    let grouped = group_send_inode_entries(&items);
+    let grouped_items = grouped.values().map(Vec::len).sum::<usize>();
+    assert_eq!(
+        grouped_items,
+        items.len(),
+        "grouping did not retain every fixture item exactly once"
+    );
+    for (&ino, entries) in &grouped {
+        assert!(
+            entries.iter().all(|entry| entry.key.objectid == ino),
+            "group contains an entry from another inode"
+        );
+    }
+
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "inode_grouping_attribution_parity,map_insertions={},grouped_inodes={},grouped_items={grouped_items},grouping_sha256={},stream_bytes={},stream_sha256={},result=identical",
+        items.len(),
+        grouped.len(),
+        inode_grouping_digest(&grouped),
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(group_send_inode_entries(black_box(&items)));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut grouping_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_grouping = || {
+            observe_ns_per_iteration(
+                || {
+                    let current = group_send_inode_entries(black_box(&items));
+                    black_box(current.len());
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (lhs, rhs, grouping, order) = if pair_index % 2 == 0 {
+            (observe_whole(), observe_whole(), observe_grouping(), "AAS")
+        } else {
+            let grouping = observe_grouping();
+            let rhs = observe_whole();
+            let lhs = observe_whole();
+            (lhs, rhs, grouping, "SAA")
+        };
+        whole_lhs_ns.push(lhs);
+        whole_rhs_ns.push(rhs);
+        grouping_ns.push(grouping);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{grouping:.3}")
+            .expect("format inode-grouping attribution pair");
+    }
+
+    let null_log_ratios = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_log_ratios = grouping_ns
+        .iter()
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|(grouping, (lhs, rhs))| (grouping / lhs.midpoint(*rhs)).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let attribution_summary = bootstrap_median_ci(&attribution_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let admitted = null_floor_ratio < 1.10 && attribution_summary.low >= MIN_ATTRIBUTION_FRACTION;
+    let verdict = if admitted {
+        "ADMITTED_FOR_AB"
+    } else if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else {
+        "NOT_ADMITTED_BELOW_5_PERCENT"
+    };
+    println!(
+        "inode_grouping_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},grouping_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:grouping_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_grouping_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_aa_null_floor_ratio={null_floor_ratio:.6},grouping_fraction_median={:.8},grouping_fraction_ci_low={:.8},grouping_fraction_ci_high={:.8},grouping_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.2},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        attribution_summary.median,
+        attribution_summary.low,
+        attribution_summary.high,
+        attribution_summary.median * 100.0,
+    );
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn inode_grouping_ab_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+
+    let items = build_deep_send_items();
+    let grouped = group_send_inode_entries(&items);
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+
+    let control_stream = generate_send_stream_btree_grouping_control(
+        &items,
+        subvol,
+        &uuid,
+        1,
+        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+    )
+    .expect("generate BTreeMap-grouping control stream");
+    let candidate_stream =
+        generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+            Ok(Vec::new())
+        })
+        .expect("generate contiguous-span candidate stream");
+    assert_eq!(
+        control_stream, candidate_stream,
+        "contiguous inode spans changed the complete send stream"
+    );
+    println!(
+        "inode_grouping_ab_parity,map_insertions_removed={},grouped_inodes={},stream_bytes={},control_sha256={},candidate_sha256={},result=identical",
+        items.len(),
+        grouped.len(),
+        control_stream.len(),
+        sha256_hex(&control_stream),
+        sha256_hex(&candidate_stream),
+    );
+
+    for _ in 0..4 {
+        black_box(
+            generate_send_stream_btree_grouping_control(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm BTreeMap-grouping control stream"),
+        );
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm contiguous-span candidate stream"),
+        );
+    }
+
+    let mut control_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut candidate_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_control = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream_btree_grouping_control(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate BTreeMap-grouping control stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_candidate = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate contiguous-span candidate stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let (lhs, rhs, candidate, order) = if pair_index % 2 == 0 {
+            (
+                observe_control(),
+                observe_control(),
+                observe_candidate(),
+                "AAB",
+            )
+        } else {
+            let candidate = observe_candidate();
+            let rhs = observe_control();
+            let lhs = observe_control();
+            (lhs, rhs, candidate, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{candidate:.3}")
+            .expect("format inode-grouping A/A+B pair");
+    }
+
+    let null_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .zip(&candidate_ns)
+        .map(|((lhs, rhs), candidate)| (lhs.midpoint(*rhs) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio < 1.10
+        && speedup_summary.low > twice_null_ratio
+        && speedup_summary.low > 1.0;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio >= 1.10 {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL"
+    };
+    println!(
+        "inode_grouping_ab_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_grouping_ab,control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
 }
 
 /// Source-neutral copy of the second full inode-item parse pass in
@@ -1176,6 +1518,23 @@ criterion_group!(
 );
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--inode-grouping-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        inode_grouping_attribution_only();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--inode-grouping-ab-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        #[cfg(feature = "bench-instrumentation")]
+        {
+            inode_grouping_ab_only();
+            return;
+        }
+        #[cfg(not(feature = "bench-instrumentation"))]
+        panic!("--inode-grouping-ab-only requires --features bench-instrumentation");
+    }
     if std::env::args().any(|arg| arg == "--inode-reparse-attribution-only") {
         print_bench_evidence_metadata();
         print_codegen_isa();

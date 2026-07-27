@@ -8972,6 +8972,84 @@ fn primary_inode_link<'a, const MATERIALIZED: bool>(
     }
 }
 
+enum SendInodeEntries<'a> {
+    Contiguous(&'a [BtrfsLeafEntry]),
+    Gathered(Vec<&'a BtrfsLeafEntry>),
+}
+
+enum SendInodeEntryIter<'items, 'group> {
+    Contiguous(std::slice::Iter<'items, BtrfsLeafEntry>),
+    Gathered(std::slice::Iter<'group, &'items BtrfsLeafEntry>),
+}
+
+impl<'items> Iterator for SendInodeEntryIter<'items, '_> {
+    type Item = &'items BtrfsLeafEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Contiguous(entries) => entries.next(),
+            Self::Gathered(entries) => entries.next().copied(),
+        }
+    }
+}
+
+impl<'items> SendInodeEntries<'items> {
+    fn iter(&self) -> SendInodeEntryIter<'items, '_> {
+        match self {
+            Self::Contiguous(entries) => SendInodeEntryIter::Contiguous(entries.iter()),
+            Self::Gathered(entries) => SendInodeEntryIter::Gathered(entries.iter()),
+        }
+    }
+}
+
+struct SendInodeGroup<'a> {
+    ino: u64,
+    entries: SendInodeEntries<'a>,
+}
+
+fn group_send_inode_entries<const FORCE_BTREE: bool>(
+    items: &[BtrfsLeafEntry],
+) -> Vec<SendInodeGroup<'_>> {
+    let monotone_objectids = !FORCE_BTREE
+        && items
+            .windows(2)
+            .all(|pair| pair[0].key.objectid <= pair[1].key.objectid);
+    if monotone_objectids {
+        let group_count = usize::from(!items.is_empty())
+            + items
+                .windows(2)
+                .filter(|pair| pair[0].key.objectid != pair[1].key.objectid)
+                .count();
+        let mut groups = Vec::with_capacity(group_count);
+        let mut start = 0;
+        while start < items.len() {
+            let ino = items[start].key.objectid;
+            let mut end = start + 1;
+            while end < items.len() && items[end].key.objectid == ino {
+                end += 1;
+            }
+            groups.push(SendInodeGroup {
+                ino,
+                entries: SendInodeEntries::Contiguous(&items[start..end]),
+            });
+            start = end;
+        }
+        return groups;
+    }
+
+    let mut gathered: BTreeMap<u64, Vec<&BtrfsLeafEntry>> = BTreeMap::new();
+    for entry in items {
+        gathered.entry(entry.key.objectid).or_default().push(entry);
+    }
+    gathered
+        .into_iter()
+        .map(|(ino, entries)| SendInodeGroup {
+            ino,
+            entries: SendInodeEntries::Gathered(entries),
+        })
+        .collect()
+}
+
 /// Generate a btrfs send stream from FS tree items.
 ///
 /// This function walks the given FS tree items and produces a valid send stream
@@ -9005,7 +9083,7 @@ where
     // decompressor) so the slice below is always in uncompressed/logical space.
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<false, F>(
+    Ok(generate_send_stream_impl::<false, false, F>(
         items,
         subvol_name,
         subvol_uuid,
@@ -9031,7 +9109,32 @@ pub fn generate_send_stream_materialized_parent_index_control<F>(
 where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<true, F>(
+    Ok(generate_send_stream_impl::<true, false, F>(
+        items,
+        subvol_name,
+        subvol_uuid,
+        ctransid,
+        read_extent,
+    ))
+}
+
+/// BTreeMap inode-grouping control for the same-ELF performance harness.
+///
+/// This is not a supported application API. It retains the pre-optimization
+/// grouping representation only when benchmark instrumentation is enabled.
+#[cfg(feature = "bench-instrumentation")]
+#[doc(hidden)]
+pub fn generate_send_stream_btree_grouping_control<F>(
+    items: &[BtrfsLeafEntry],
+    subvol_name: &[u8],
+    subvol_uuid: &[u8; 16],
+    ctransid: u64,
+    read_extent: F,
+) -> Result<Vec<u8>, ParseError>
+where
+    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
+{
+    Ok(generate_send_stream_impl::<false, true, F>(
         items,
         subvol_name,
         subvol_uuid,
@@ -9041,7 +9144,11 @@ where
 }
 
 #[expect(clippy::too_many_lines)]
-fn generate_send_stream_impl<const MATERIALIZED_PRIMARY_PARENTS: bool, F>(
+fn generate_send_stream_impl<
+    const MATERIALIZED_PRIMARY_PARENTS: bool,
+    const FORCE_BTREE_INODE_GROUPS: bool,
+    F,
+>(
     items: &[BtrfsLeafEntry],
     subvol_name: &[u8],
     subvol_uuid: &[u8; 16],
@@ -9141,11 +9248,11 @@ where
         path
     };
 
-    // Group items by objectid (inode)
-    let mut inodes: BTreeMap<u64, Vec<&BtrfsLeafEntry>> = BTreeMap::new();
-    for entry in items {
-        inodes.entry(entry.key.objectid).or_default().push(entry);
-    }
+    // Full tree walks and tree-log overlays produce key-ordered entries, so all
+    // items for one inode form a contiguous span. Borrow those spans directly
+    // instead of allocating a BTreeMap node plus Vec for every inode. Preserve
+    // the public function's arbitrary-slice behavior with the gathered fallback.
+    let inodes = group_send_inode_entries::<FORCE_BTREE_INODE_GROUPS>(items);
 
     // Emission order (bd-7ucz7): the receiver creates by PATH, so a parent
     // directory must already exist when its child is created. Emit DIRECTORIES
@@ -9154,9 +9261,11 @@ where
     // all present). Plain objectid order is parent-before-child for simple trees
     // but a rename can place a child under a higher-objectid dir, which would
     // emit the child before its parent and break the receive.
-    let mut dir_inos: Vec<u64> = Vec::new();
-    let mut other_inos: Vec<u64> = Vec::new();
-    for (&ino, entries) in &inodes {
+    let mut dir_groups: Vec<usize> = Vec::new();
+    let mut other_groups: Vec<usize> = Vec::new();
+    for (group_index, group) in inodes.iter().enumerate() {
+        let ino = group.ino;
+        let entries = &group.entries;
         if ino < BTRFS_FIRST_FREE_OBJECTID {
             continue;
         }
@@ -9169,9 +9278,9 @@ where
         };
         #[expect(clippy::cast_possible_truncation)]
         if (inode.mode as u16) & ffs_types::S_IFMT == ffs_types::S_IFDIR {
-            dir_inos.push(ino);
+            dir_groups.push(group_index);
         } else {
-            other_inos.push(ino);
+            other_groups.push(group_index);
         }
     }
     let mut depth_cache: HashMap<u64, usize> =
@@ -9218,12 +9327,17 @@ where
         depth_cache.insert(start, depth);
         depth
     };
-    dir_inos.sort_by_key(|&ino| (dir_depth(ino), ino));
-    let emit_order: Vec<u64> = dir_inos.into_iter().chain(other_inos).collect();
+    dir_groups.sort_by_key(|&group_index| {
+        let ino = inodes[group_index].ino;
+        (dir_depth(ino), ino)
+    });
+    let emit_order: Vec<usize> = dir_groups.into_iter().chain(other_groups).collect();
 
     // Process each inode
-    for &ino in &emit_order {
-        let entries = &inodes[&ino];
+    for &group_index in &emit_order {
+        let group = &inodes[group_index];
+        let ino = group.ino;
+        let entries = &group.entries;
         // Skip special inodes (< BTRFS_FIRST_FREE_OBJECTID)
         if ino < BTRFS_FIRST_FREE_OBJECTID {
             continue;
@@ -9514,6 +9628,79 @@ mod tests {
 
     const NODESIZE: u32 = 4096;
     const HEADER_SIZE: usize = 101;
+
+    #[test]
+    fn send_inode_grouping_spans_match_btree_fallback() {
+        fn entry(objectid: u64, item_type: u8, offset: u64, marker: u8) -> BtrfsLeafEntry {
+            BtrfsLeafEntry {
+                key: BtrfsKey {
+                    objectid,
+                    item_type,
+                    offset,
+                },
+                data: vec![marker],
+            }
+        }
+
+        fn signature(groups: &[SendInodeGroup<'_>]) -> Vec<(u64, Vec<(u8, u64, u8)>)> {
+            groups
+                .iter()
+                .map(|group| {
+                    (
+                        group.ino,
+                        group
+                            .entries
+                            .iter()
+                            .map(|entry| {
+                                (
+                                    entry.key.item_type,
+                                    entry.key.offset,
+                                    entry.data.first().copied().unwrap_or_default(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        }
+
+        let arbitrary = vec![
+            entry(258, BTRFS_ITEM_INODE_REF, 256, 1),
+            entry(256, BTRFS_ITEM_INODE_ITEM, 0, 2),
+            entry(258, BTRFS_ITEM_INODE_ITEM, 0, 3),
+            entry(257, BTRFS_ITEM_INODE_ITEM, 0, 4),
+            entry(256, BTRFS_ITEM_INODE_REF, 256, 5),
+        ];
+        let arbitrary_auto = group_send_inode_entries::<false>(&arbitrary);
+        let arbitrary_control = group_send_inode_entries::<true>(&arbitrary);
+        assert_eq!(
+            signature(&arbitrary_auto),
+            signature(&arbitrary_control),
+            "arbitrary input fallback changed group or within-group order"
+        );
+        assert!(
+            arbitrary_auto
+                .iter()
+                .all(|group| matches!(&group.entries, SendInodeEntries::Gathered(_))),
+            "non-monotone objectids must take the gathered fallback"
+        );
+
+        let mut sorted = arbitrary;
+        sorted.sort_by(|lhs, rhs| key_cmp(&lhs.key, &rhs.key));
+        let sorted_auto = group_send_inode_entries::<false>(&sorted);
+        let sorted_control = group_send_inode_entries::<true>(&sorted);
+        assert_eq!(
+            signature(&sorted_auto),
+            signature(&sorted_control),
+            "contiguous spans changed key order or group membership"
+        );
+        assert!(
+            sorted_auto
+                .iter()
+                .all(|group| matches!(&group.entries, SendInodeEntries::Contiguous(_))),
+            "key-ordered tree-walk input must borrow contiguous inode spans"
+        );
+    }
     const ITEM_SIZE: usize = 25;
     const KEY_PTR_SIZE: usize = 33;
 
