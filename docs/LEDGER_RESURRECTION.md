@@ -175,14 +175,32 @@ shown CPU-bound rather than pread-bound at the tested thread count.
 
 ### Rank 5 — `bd-cowbatch` btrfs create insert batching (`NEGATIVE_EVIDENCE.md:1439`)
 
-**Class: not void — an unlanded measured win blocked on a refactor.** `insert_many`
-measured **13.25×** vs sequential and **7.60×** vs the existing batched primitive on
-`btrfs_cow_write_mutation_256x4k`, proptest-hardened over 96 random cases. It is not
-wired into `btrfs_create` because a correct batch must consume the DIR_INDEX seq without
-inserting, detect and fall back on the rare DIR_ITEM hash collision, and keep the parent
-INODE_ITEM timestamp update separate. Projected: btrfs create 3.0×-slower-than-kernel →
-~2×. This is real, shovel-ready structural work in `ffs-core` — a peer-active file, so it
-needs an Agent Mail reservation before anyone starts.
+**CORRECTED 2026-07-26: curated false positive — already shipped before this audit.**
+The primitive row is not a rejected lever, and the original rank text incorrectly
+treated its production wiring as pending. The full realization had landed on
+2026-06-25:
+
+- `b5e22c17` routes `btrfs_create` through `insert_many_then_update`; its historical
+  result was **1.43×** over the pre-wiring baseline and narrowed the reported kernel
+  gap from 3.0× to 2.08×.
+- `d518312a` applies the same coalesced transaction to `btrfs_mkdir` (**1.45×**
+  historically).
+- `aee47f35` routes the common delete path through `remove_many` (**1.44×**
+  historically).
+- `f90648f5` batches the common rename path (**1.25×** historically), and
+  `820e0c30` subsequently fuses its remove/insert/update sequence into one COW
+  transaction.
+
+Current source still contains those production calls. The **13.25×** primitive ratio
+was never an unrealized end-to-end promise; it was the bulk
+`insert_many_then_update` microbenchmark ceiling. These June ratios predate the
+campaign's in-process ELF SHA, same-invocation A/A, x86-64-v3+PGO, and median-CI
+contract, so they are retained as historical landing evidence rather than restated as
+current shipped-binary claims. **Do not re-run rank 5 as resurrection work.** Retry
+only if a fresh self-hashing v3+PGO profile attributes at least 5% of whole-operation
+wall/cycles to residual repeated COW path cloning after the fused primitives, then
+require same-invocation A/A+B, exact tree/stream bytes and `btrfs-check` parity, and a
+bootstrap median-CI gate that clears twice its own null margin; never gate on CV.
 
 ---
 
@@ -196,12 +214,16 @@ needs an Agent Mail reservation before anyone starts.
 | **Re-won** | **2 — rank 1: 1.70× at 8 threads; rank 2: 2.605531× witnessed-v3 on the production writer path (2.626589× generic)** |
 | Handed to the cod lane to re-run | 0 (rank 2 completed) |
 | Void but superseded — closed, not re-run | 1 (rank 3) |
+| Curated screen false positive — already shipped, not re-run | 1 (rank 5) |
 
 **Resurrection yield: 2 of 2 runnable entries re-won.** The rank-1 row was void in the
 strongest sense — not "rejected on a bad gate" but **never measured at all**. Rank 2
 was the complementary failure: a large, real effect rejected solely by the obsolete
 CV gate despite a near-1.0× null. The corrected harness decided both without
-reinterpreting the other 203 void rows as wins.
+reinterpreting the other 203 void rows as wins. Rank 5 does not enter that yield: it
+was a KEEP family whose complete production realization preceded the audit by one
+month. Its presence in the mechanical VOID queue is retained as evidence that the
+screen is triage rather than truth.
 
 ### 4.1 Rank 1 re-run — profile attribution
 
@@ -363,7 +385,7 @@ sound rejections. `—` means the field is absent from the row, which for
 | 9 | `progress/perf-negative-results.md:987` — Mounted metadata storm (stat-walk) is getattr-round-trip-bound + adaptive-readdirplus REJECT - 2026-07-23 (bd-kdmu4 small-file-storm sub-lane) | — | none recorded | 1.5% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 10 | `progress/perf-negative-results.md:2634` — Seeded Do-Not-Retry Rows From Prior No-Gaps Work | — | none recorded | 0.1% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 11 | `NEGATIVE_EVIDENCE.md:6445` — 2026-07-12 (cont.) — bd-vpypn RESOLVED by existing evidence: extent-walk is µs-scale even at E65536 (rejection holds at high extent counts) | — | none recorded | 0.05% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
-| 12 | `NEGATIVE_EVIDENCE.md:1439` — 2026-06-25 bd-cowbatch HARDENED (proptest) + FS-wiring blocker surfaced (CrimsonFox cc/opus) | 13.25x | none recorded | — | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
+| 12 | `NEGATIVE_EVIDENCE.md:1439` — 2026-06-25 bd-cowbatch HARDENED (proptest) + FS-wiring blocker surfaced (CrimsonFox cc/opus) | 13.25x | none recorded | — | no | **MECHANICAL VOID-NONULL / CURATED FALSE POSITIVE** — the parser saw an A/B-shaped row without A/A, but source/history prove the KEEP family and its FS wiring had already shipped; see corrected rank 5 |
 | 13 | `progress/perf-negative-results.md:3447` — 2026-07-10 — Cold-read: contention scales with FOLIO INSERTIONS, not reads, not threads (bd-ddryj, BlackThrush/cc_ffs) | 12.2x | none recorded | — | yes | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 14 | `NEGATIVE_EVIDENCE.md:3686` — 2026-06-29 MEASURED: parallel ext4 create gap quantified vs kernel — 5.5x (the #1 gap, bd-bhh0i) — CrimsonFox | 5.5x | none recorded | — | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 15 | `NEGATIVE_EVIDENCE.md:292` — bd-bhh0i / SilverPine | 3.24x | none recorded | — | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
