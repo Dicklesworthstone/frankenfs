@@ -273,6 +273,14 @@ def candidate_match(
     all_hits = list(dict.fromkeys(surface_hits + candidate_hits))
     if not surface_hits or len(all_hits) < threshold:
         return None
+    # A caller who supplies a qualified function/module identifier is naming an
+    # exact surface, not merely a bag of generic nouns. Require that identifier
+    # (or a more-qualified member of its family) in the prior row. Without this,
+    # `generate_send_stream inode grouping BTreeMap` falsely matched an unrelated
+    # snapshot-diff row through only "inode", "BTreeMap", and "ordered".
+    qualified_surface = [word for word in surface_terms if "_" in word]
+    if qualified_surface and not any(word in surface_hits for word in qualified_surface):
+        return None
     # Target-surface matches dominate proposal wording when ranking results.
     return 100 * len(surface_hits) + len(all_hits), surface_hits, candidate_hits
 
@@ -563,6 +571,27 @@ def cmd_self_test() -> int:
                 3,
             )
             is None,
+        )
+    )
+    unrelated_map_row = row(
+        "REJECT Btrfs snapshot-diff dual-map fusion retained inode BTreeMap "
+        "entries in ordered form.",
+        "REJECT",
+    )
+    exact_send_row = row(
+        "REJECT generate_send_stream_impl inode grouping BTreeMap layout.",
+        "REJECT",
+    )
+    send_candidate = terms(
+        "replace BTreeMap inode grouping with an ordered-span representation"
+    )
+    send_surface = terms("generate_send_stream inode grouping BTreeMap")
+    checks.append(
+        (
+            "qualified surface rejects generic false positives",
+            candidate_match(unrelated_map_row, send_candidate, send_surface, 3) is None
+            and candidate_match(exact_send_row, send_candidate, send_surface, 3)
+            is not None,
         )
     )
     checks.append(

@@ -1886,8 +1886,11 @@ either a same-invocation A/A null control or a counted mechanism, and for a KEEP
 lacking a full SHA-256 self-reported by the executing ELF. A hash computed next
 to the run is deliberately not accepted. Candidate preflight also exits 2 when
 the target surface matches prior negative evidence and prints that row's retry
-predicate. `--audit` reproduces the whole-ledger census; `--self-test` validates
-the policy predicates without invoking Cargo.
+predicate. When `--surface` includes a qualified function or module identifier,
+at least one prior row must name that identifier family; generic terms such as a
+container type cannot make an unrelated frontier look closed. `--audit`
+reproduces the whole-ledger census; `--self-test` validates the policy predicates
+without invoking Cargo.
 When honest scrutiny contradicted an earlier claim,
 it was corrected in the open: a previously-reported "1.7× faster than kernel"
 cold-read row flipped
