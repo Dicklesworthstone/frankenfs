@@ -46,12 +46,13 @@ was read in full and adjudicated by hand; the §5 table is the mechanical screen
 > gave **205 void of 273 REJECT rows = 75.1%**, against the 219/276 = 79.3% published
 > below.
 >
-> **Live closeout:** after later ledger additions and explicit SURVEY classification for
-> audit-summary rows, the canonical preflight reports **205 void of 274 REJECT rows =
-> 74.8%**. The VOID numerator did not grow. Use 74.8% for the current corpus; 75.1% is
-> the earlier corrected snapshot and 79.3% is retained below as the original one-off
-> output. The finding is unchanged in substance — roughly three quarters of this repo's
-> rejections cannot decide anything.
+> **Live refresh 2026-07-27:** after seven further admissible decision rows, the
+> canonical preflight reports **205 void of 281 REJECT rows = 73.0%**. The VOID
+> numerator did not grow. This is the institutional gate working: the historical
+> debt remains, but new rows carried a same-invocation A/A or counted mechanism.
+> Use 73.0% for the current corpus; 74.8% is the 2026-07-26 closeout, 75.1% is the
+> earlier corrected snapshot, and 79.3% is retained below as the original one-off
+> output.
 
 | Metric | Count |
 |---|---:|
@@ -222,8 +223,8 @@ bootstrap median-CI gate that clears twice its own null margin; never gate on CV
 
 | Metric | Count |
 |---|---:|
-| Entries audited | 274 (live corrected parser) |
-| Void | 205 (74.8%) |
+| Entries audited | 281 (live corrected parser, 2026-07-27) |
+| Void | 205 (73.0%; numerator unchanged) |
 | Re-run under the corrected harness | 2 (ranks 1 and 2) |
 | **Re-won** | **2 — rank 1: 1.70× at 8 threads; rank 2: 2.605531× witnessed-v3 on the production writer path (2.626589× generic)** |
 | Handed to the cod lane to re-run | 0 (rank 2 completed) |
@@ -390,7 +391,7 @@ sound rejections. `—` means the field is absent from the row, which for
 |---:|---|---:|---:|---:|:--:|---|
 | 1 | `NEGATIVE_EVIDENCE.md:3739` — 2026-06-29 REFUTED (~0-gain): lookup_in_dir_block early-exit on match — measured neutral (CrimsonFox) | — | none recorded | 31.75% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 2 | `NEGATIVE_EVIDENCE.md:512` — (profile + REVERTED neutral) | 4.8x | none recorded | 15% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
-| 3 | `NEGATIVE_EVIDENCE.md:21` — `bd-mounted-xattr-workload-gap-fr6iq` — list-64 direct wire retry / BronzeRabbit | — | recorded, unparsed | 8.96% | yes | **VOID-CV** — killed by the cv<5% gate, not by a measured regression |
+| 3 | `NEGATIVE_EVIDENCE.md:21` — `bd-mounted-xattr-workload-gap-fr6iq` — list-64 direct wire retry / BronzeRabbit | — | A/A absolute null 1.332% median / 6.799% p95 | 8.96% | yes | **VALID-AB** — every arm passed the reported CV threshold; the 2.195% candidate median and its `[+1.040%, +2.942%]` bootstrap CI did not clear the explicit same-run A/A p95 null |
 | 4 | `NEGATIVE_EVIDENCE.md:838` — 2026-06-22 NEG-LEVER: Arc-share the hot ext4 inode (kill the per-read clone) — wall-NEUTRAL, REVERTED (CrimsonFox cc/opus) | — | none recorded | 8% | yes | **MECHANICAL VOID-NONULL / CURATED FALSE POSITIVE** — the old parallel A/B is void, but `00a2bdb1` later removed the hot-hit clone and `27c505c9` removed the miss clone before this audit; see corrected rank 4 |
 | 5 | `NEGATIVE_EVIDENCE.md:747` — 2026-06-22 scrub is ALLOCATION-bound, not validation-bound — parallelizing validation would NOT help (CrimsonFox cc/opus) | — | none recorded | 7.3% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
 | 6 | `NEGATIVE_EVIDENCE.md:22` — `bd-fsync-journal-latency-gap-ptp4x` / `bd-opb6l` / `bd-mounted-xattr-workload-gap-fr6iq` — consolidated measured-frontier refresh / BronzeRabbit | — | none recorded | 5% | no | **VOID-NONULL** — A/B rejection with no A/A null control recorded |
@@ -723,9 +724,10 @@ the complete training/profile-use flow and an explicit PGO identity.
 
 ## 7. Institutionalized anti-decay gate
 
-The corrected **205/274 = 74.8% VOID** census is now a forward invariant, not a
-one-time audit. `scripts/perf_ledger_preflight.py` implements three mechanical
-checks:
+The current **205/281 = 73.0% VOID** census is a monitored snapshot, not a one-time
+audit. The forward invariant is sharper: the **205-row VOID numerator must not grow**
+as new decisions are added. `scripts/perf_ledger_preflight.py` implements three
+mechanical checks:
 
 1. `--candidate "<lever>" --surface "<target>"` searches both canonical
    ledgers before a lever is proposed. A target-surface match against an earlier
@@ -766,7 +768,10 @@ implementation demonstrably hashes `current_exe` in process, and add a
 corresponding self-test before relying on it.
 
 Validation on 2026-07-26 was source-only because of the `/data` disk emergency:
-the thirteen policy self-checks passed, the live audit reproduced **274 REJECT /
+the thirteen policy self-checks passed, the then-live audit reproduced **274 REJECT /
 205 VOID (74.8%)**, and a known `SnapshotRegistry` publication candidate was
-blocked with the matching ledger rows and recorded retry predicate. No Cargo,
-RCH, benchmark, or test command was started.
+blocked with the matching ledger rows and recorded retry predicate. The
+2026-07-27 source-only refresh passed all fourteen checks and reported
+**281 REJECT / 205 VOID (73.0%)**: seven admissible decisions were added without
+adding an undecidable row. Neither validation needed Cargo, RCH, a benchmark, or
+a test binary.

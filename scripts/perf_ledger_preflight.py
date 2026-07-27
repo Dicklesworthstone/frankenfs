@@ -4,7 +4,7 @@
 Motivation (fleet broadcast 2, 2026-07-25): ledger integrity is not a one-time
 cleanup, it DECAYS. Repos that audited once and institutionalized the check sit at
 ~1.7% VOID; repos that never did sit at 25-91%. frankenfs currently audits at
-**74.8% VOID** (205 of 274 REJECT rows). This script is the institutionalization.
+**73.0% VOID** (205 of 281 REJECT rows). This script is the institutionalization.
 
 Four jobs, three exit classes:
 
@@ -119,7 +119,7 @@ KEEP_VERDICT = re.compile(
     r"(?:\*\*)?(?:⭐+\s*)?(KEEP|SHIPPED|LANDED|WIN\b|FLIPPED|PASS\b|CONFIRMED)", re.I
 )
 SURVEY_VERDICT = re.compile(
-    r"(?:\*\*)?(SURFACE|N/A|NO CODE\b|NO-GAP|AUDIT (?:COMPLETE|CORRECTED)\b)",
+    r"(?:\*\*)?(SURVEY\b|SURFACE|N/A|NO CODE\b|NO-GAP|AUDIT (?:COMPLETE|CORRECTED)\b)",
     re.I,
 )
 
@@ -525,6 +525,20 @@ def cmd_self_test() -> int:
                 f"KEEP: in-process executing ELF SHA-256 {sha}",
                 "KEEP",
             ).has_executing_elf_sha256(),
+        ),
+        (
+            "literal SURVEY verdict outranks REJECT wording in the surface",
+            verdict_of(
+                [
+                    "2026-07-27",
+                    "audit refresh",
+                    "281 REJECT decisions audited",
+                    "SURVEY / no performance lever",
+                ],
+                "audit refresh",
+                "",
+            )
+            == "SURVEY",
         ),
     ]
     candidate_row = row(

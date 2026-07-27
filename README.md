@@ -1869,9 +1869,10 @@ isomorphism-preserving (behaviour proven byte-identical before keeping), and
 every newly *rejected* lever is recorded—with its null-control result and a concrete
 retry condition — in the negative-evidence ledger
 (`docs/NEGATIVE_EVIDENCE.md`, `docs/PERF_CAMPAIGN_FINAL.md`) rather than quietly
-dropped. Historical rows predate this contract: the corrected 2026-07-25
-preflight found 205 of 274 rejected rows (74.8%) measurement-void, so this
-methodology is a forward gate rather than a blanket retroactive certification.
+dropped. Historical rows predate this contract: the current preflight finds 205
+of 281 rejected rows (73.0%) measurement-void. The numerator has stayed at 205
+while seven admissible decisions were added, so this methodology is a forward
+gate rather than a blanket retroactive certification.
 The contract is mechanically enforced in the staged index:
 
 ```bash
