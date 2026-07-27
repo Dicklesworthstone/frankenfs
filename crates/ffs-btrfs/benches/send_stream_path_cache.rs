@@ -20,10 +20,13 @@ use ffs_btrfs::{
     generate_send_stream_btree_grouping_control,
     generate_send_stream_materialized_parent_index_control,
 };
+use rustc_hash::FxBuildHasher;
 use sha2::{Digest, Sha256};
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::File;
+use std::hash::BuildHasher;
 use std::hint::black_box;
 use std::io::Read;
 use std::process::Command;
@@ -890,6 +893,495 @@ fn inode_grouping_ab_only() {
     );
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SendCacheCounts {
+    path_gets: usize,
+    path_inserts: usize,
+    depth_gets: usize,
+    depth_inserts: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SendCacheStageResult {
+    counts: SendCacheCounts,
+    emitted_paths: usize,
+    emitted_path_bytes: usize,
+    path_fold: u64,
+    exact_paths: Vec<(u8, u64, Vec<u8>)>,
+}
+
+fn send_inode_links_for_cache_stage(
+    items: &[BtrfsLeafEntry],
+) -> BTreeMap<u64, Vec<(u64, Vec<u8>)>> {
+    let mut inode_links: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
+    for entry in items {
+        if entry.key.item_type == BTRFS_ITEM_INODE_REF
+            && let Ok(refs) = parse_inode_refs(&entry.data)
+        {
+            let links = inode_links.entry(entry.key.objectid).or_default();
+            for inode_ref in refs {
+                links.push((entry.key.offset, inode_ref.name));
+            }
+        }
+    }
+    inode_links
+}
+
+fn send_inode_groups_for_cache_stage(items: &[BtrfsLeafEntry]) -> Vec<(u64, bool)> {
+    assert!(
+        items
+            .windows(2)
+            .all(|pair| pair[0].key.objectid <= pair[1].key.objectid),
+        "deep-path fixture must exercise production's contiguous-group route"
+    );
+
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < items.len() {
+        let ino = items[start].key.objectid;
+        let mut end = start + 1;
+        while end < items.len() && items[end].key.objectid == ino {
+            end += 1;
+        }
+        if ino >= BTRFS_FIRST_FREE_OBJECTID
+            && let Some(inode) = items[start..end]
+                .iter()
+                .find(|entry| entry.key.item_type == BTRFS_ITEM_INODE_ITEM)
+                .and_then(|entry| parse_inode_item(&entry.data).ok())
+        {
+            #[expect(clippy::cast_possible_truncation)]
+            let is_dir = (inode.mode as u16) & ffs_types::S_IFMT == ffs_types::S_IFDIR;
+            groups.push((ino, is_dir));
+        }
+        start = end;
+    }
+    groups
+}
+
+/// Source-neutral reproduction of the current send path/depth-cache stage.
+///
+/// `COLLECT_EXACT` is enabled only for the untimed parity/count pass. Timed
+/// calls black-box every constructed path; their compile-time-false observer
+/// branches add no counting, digesting, or exact-path clone work.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the source-neutral stage visibly isomorphic to production"
+)]
+fn send_path_depth_cache_stage<S: BuildHasher + Default, const COLLECT_EXACT: bool>(
+    groups: &[(u64, bool)],
+    inode_links: &BTreeMap<u64, Vec<(u64, Vec<u8>)>>,
+) -> SendCacheStageResult {
+    let cache_capacity = inode_links.len().saturating_add(1);
+    let mut path_cache =
+        HashMap::<u64, Vec<u8>, S>::with_capacity_and_hasher(cache_capacity, S::default());
+    path_cache.insert(BTRFS_FIRST_FREE_OBJECTID, Vec::new());
+    let mut path_gets = 0usize;
+    let mut path_inserts = usize::from(COLLECT_EXACT);
+    let mut build_path = |ino: u64, cache_terminal: bool| -> Vec<u8> {
+        if COLLECT_EXACT {
+            path_gets += 1;
+        }
+        if let Some(path) = path_cache.get(&ino) {
+            return path.clone();
+        }
+
+        let mut trail = Vec::new();
+        let mut current = ino;
+        let mut base_path = Vec::new();
+        loop {
+            if COLLECT_EXACT {
+                path_gets += 1;
+            }
+            if let Some(path) = path_cache.get(&current) {
+                base_path.clone_from(path);
+                break;
+            }
+            let Some((parent, name)) = inode_links.get(&current).and_then(|links| links.first())
+            else {
+                break;
+            };
+            trail.push((current, name.as_slice()));
+            if *parent == current || *parent == BTRFS_FIRST_FREE_OBJECTID {
+                break;
+            }
+            current = *parent;
+        }
+
+        let mut path = base_path;
+        let trail_len = trail.len();
+        for (position, (node, name)) in trail.iter().rev().enumerate() {
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            let terminal = position + 1 == trail_len;
+            if cache_terminal || !terminal {
+                if COLLECT_EXACT {
+                    path_inserts += 1;
+                }
+                path_cache.insert(*node, path.clone());
+            }
+        }
+        if trail.is_empty() && cache_terminal {
+            if COLLECT_EXACT {
+                path_inserts += 1;
+            }
+            path_cache.insert(ino, path.clone());
+        }
+        path
+    };
+
+    let mut dir_groups = Vec::new();
+    let mut other_groups = Vec::new();
+    for (group_index, (_, is_dir)) in groups.iter().enumerate() {
+        if *is_dir {
+            dir_groups.push(group_index);
+        } else {
+            other_groups.push(group_index);
+        }
+    }
+
+    let mut depth_cache =
+        HashMap::<u64, usize, S>::with_capacity_and_hasher(cache_capacity, S::default());
+    depth_cache.insert(BTRFS_FIRST_FREE_OBJECTID, 0);
+    let mut depth_gets = 0usize;
+    let mut depth_inserts = usize::from(COLLECT_EXACT);
+    let mut dir_depth = |start: u64| -> usize {
+        if COLLECT_EXACT {
+            depth_gets += 1;
+        }
+        if let Some(&depth) = depth_cache.get(&start) {
+            return depth;
+        }
+
+        let mut trail = Vec::new();
+        let mut current = start;
+        let mut base_depth = 0usize;
+        loop {
+            if COLLECT_EXACT {
+                depth_gets += 1;
+            }
+            if let Some(&depth) = depth_cache.get(&current) {
+                base_depth = depth;
+                break;
+            }
+            let Some((parent, _)) = inode_links.get(&current).and_then(|links| links.first())
+            else {
+                break;
+            };
+            if *parent == current || *parent == BTRFS_FIRST_FREE_OBJECTID {
+                break;
+            }
+            trail.push(current);
+            current = *parent;
+            if trail.len() > groups.len() {
+                let depth = trail.len();
+                if COLLECT_EXACT {
+                    depth_inserts += 1;
+                }
+                depth_cache.insert(start, depth);
+                return depth;
+            }
+        }
+
+        let mut depth = base_depth;
+        for node in trail.iter().rev() {
+            depth += 1;
+            if COLLECT_EXACT {
+                depth_inserts += 1;
+            }
+            depth_cache.insert(*node, depth);
+        }
+        if COLLECT_EXACT {
+            depth_gets += 1;
+        }
+        let depth = depth_cache.get(&start).copied().unwrap_or(base_depth);
+        if COLLECT_EXACT {
+            depth_inserts += 1;
+        }
+        depth_cache.insert(start, depth);
+        depth
+    };
+    dir_groups.sort_by_key(|&group_index| {
+        let ino = groups[group_index].0;
+        (dir_depth(ino), ino)
+    });
+
+    let mut emitted_paths = 0usize;
+    let mut emitted_path_bytes = 0usize;
+    let mut path_fold = 0u64;
+    let mut exact_paths = Vec::new();
+    for group_index in dir_groups.into_iter().chain(other_groups) {
+        let (ino, is_dir) = groups[group_index];
+        let path = build_path(ino, is_dir);
+        black_box(&path);
+        if COLLECT_EXACT {
+            emitted_paths += 1;
+            emitted_path_bytes = emitted_path_bytes.saturating_add(path.len());
+            path_fold = path_fold.rotate_left(7)
+                ^ ino.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ u64::try_from(path.len()).expect("path length fits u64");
+            exact_paths.push((0, ino, path.clone()));
+        }
+
+        if !is_dir && let Some(links) = inode_links.get(&ino) {
+            for (parent, name) in links.iter().skip(1) {
+                let mut link_path = build_path(*parent, true);
+                if !link_path.is_empty() {
+                    link_path.push(b'/');
+                }
+                link_path.extend_from_slice(name);
+                black_box(&link_path);
+                if COLLECT_EXACT {
+                    emitted_paths += 1;
+                    emitted_path_bytes = emitted_path_bytes.saturating_add(link_path.len());
+                    path_fold = path_fold.rotate_left(7)
+                        ^ parent.wrapping_mul(0xD6E8_FD9D_50A5_4A4D)
+                        ^ u64::try_from(link_path.len()).expect("link path length fits u64");
+                    exact_paths.push((1, *parent, link_path));
+                }
+            }
+        }
+    }
+
+    SendCacheStageResult {
+        counts: SendCacheCounts {
+            path_gets,
+            path_inserts,
+            depth_gets,
+            depth_inserts,
+        },
+        emitted_paths,
+        emitted_path_bytes,
+        path_fold,
+        exact_paths,
+    }
+}
+
+/// Retry-predicate gate for the ledger's earlier "rare bulk cache" closure.
+///
+/// One invocation owns whole/whole A/A, standard-hasher/standard-hasher A/A,
+/// and standard/Fx stage A/B. A production edit is admissible only when the
+/// cache stage is at least 5% of whole-stream wall by its complete median CI
+/// and the stage A/B clears twice its own null log-margin.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's parity, A/A, A/B, and verdict protocol together"
+)]
+fn send_cache_hasher_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const STAGE_REPEATS: u32 = 8;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.05;
+
+    let items = build_deep_send_items();
+    let inode_links = send_inode_links_for_cache_stage(&items);
+    let groups = send_inode_groups_for_cache_stage(&items);
+    let standard = send_path_depth_cache_stage::<RandomState, true>(&groups, &inode_links);
+    let fx = send_path_depth_cache_stage::<FxBuildHasher, true>(&groups, &inode_links);
+    assert_eq!(
+        standard, fx,
+        "standard and Fx cache stages changed paths, ordering, or operation counts"
+    );
+
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "send_cache_hasher_attribution_parity,path_gets={},path_inserts={},depth_gets={},depth_inserts={},emitted_paths={},emitted_path_bytes={},path_fold={:016x},stream_bytes={},stream_sha256={},result=identical",
+        standard.counts.path_gets,
+        standard.counts.path_inserts,
+        standard.counts.depth_gets,
+        standard.counts.depth_inserts,
+        standard.emitted_paths,
+        standard.emitted_path_bytes,
+        standard.path_fold,
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(send_path_depth_cache_stage::<RandomState, false>(
+            black_box(&groups),
+            black_box(&inode_links),
+        ));
+        black_box(send_path_depth_cache_stage::<FxBuildHasher, false>(
+            black_box(&groups),
+            black_box(&inode_links),
+        ));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut standard_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut standard_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut fx_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(112));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_standard = || {
+            observe_ns_per_iteration(
+                || {
+                    let result = send_path_depth_cache_stage::<RandomState, false>(
+                        black_box(&groups),
+                        black_box(&inode_links),
+                    );
+                    black_box(result);
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let observe_fx = || {
+            observe_ns_per_iteration(
+                || {
+                    let result = send_path_depth_cache_stage::<FxBuildHasher, false>(
+                        black_box(&groups),
+                        black_box(&inode_links),
+                    );
+                    black_box(result);
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (whole_lhs, whole_rhs, standard_lhs, standard_rhs, fx, order) = if pair_index % 2 == 0 {
+            (
+                observe_whole(),
+                observe_whole(),
+                observe_standard(),
+                observe_standard(),
+                observe_fx(),
+                "WWAAB",
+            )
+        } else {
+            let fx = observe_fx();
+            let standard_rhs = observe_standard();
+            let standard_lhs = observe_standard();
+            let whole_rhs = observe_whole();
+            let whole_lhs = observe_whole();
+            (
+                whole_lhs,
+                whole_rhs,
+                standard_lhs,
+                standard_rhs,
+                fx,
+                "BAAWW",
+            )
+        };
+        whole_lhs_ns.push(whole_lhs);
+        whole_rhs_ns.push(whole_rhs);
+        standard_lhs_ns.push(standard_lhs);
+        standard_rhs_ns.push(standard_rhs);
+        fx_ns.push(fx);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{whole_lhs:.3}:{whole_rhs:.3}:{standard_lhs:.3}:{standard_rhs:.3}:{fx:.3}"
+        )
+        .expect("format send-cache attribution pair");
+    }
+
+    let whole_null_logs = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let stage_null_logs = standard_lhs_ns
+        .iter()
+        .zip(&standard_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_logs = standard_lhs_ns
+        .iter()
+        .zip(&standard_rhs_ns)
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|((lhs, rhs), (whole_lhs, whole_rhs))| {
+            (lhs.midpoint(*rhs) / whole_lhs.midpoint(*whole_rhs)).ln()
+        })
+        .collect::<Vec<_>>();
+    let speedup_logs = standard_lhs_ns
+        .iter()
+        .zip(&standard_rhs_ns)
+        .zip(&fx_ns)
+        .map(|((lhs, rhs), fx)| (lhs.midpoint(*rhs) / fx).ln())
+        .collect::<Vec<_>>();
+    let whole_null = bootstrap_median_ci(&whole_null_logs);
+    let stage_null = bootstrap_median_ci(&stage_null_logs);
+    let attribution = bootstrap_median_ci(&attribution_logs);
+    let speedup = bootstrap_median_ci(&speedup_logs);
+    let whole_null_radius = whole_null.low.ln().abs().max(whole_null.high.ln().abs());
+    let stage_null_radius = stage_null.low.ln().abs().max(stage_null.high.ln().abs());
+    let whole_null_floor = whole_null_radius.exp();
+    let stage_null_floor = stage_null_radius.exp();
+    let twice_stage_null = (2.0 * stage_null_radius).exp();
+    let admitted = whole_null_floor < 1.10
+        && stage_null_floor < 1.10
+        && attribution.low >= MIN_ATTRIBUTION_FRACTION
+        && speedup.low > twice_stage_null;
+    let verdict = if admitted {
+        "ADMITTED_FOR_WHOLE_STREAM_AB"
+    } else if whole_null_floor >= 1.10 || stage_null_floor >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else if attribution.low < MIN_ATTRIBUTION_FRACTION {
+        "NOT_ADMITTED_BELOW_5_PERCENT"
+    } else {
+        "NOT_ADMITTED_BELOW_TWICE_NULL"
+    };
+    println!(
+        "send_cache_hasher_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},stage_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:standard_lhs_ns:standard_rhs_ns:fx_ns,values={raw_pairs}"
+    );
+    println!(
+        "send_cache_hasher_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_null_floor_ratio={whole_null_floor:.6},stage_aa_median={:.6},stage_aa_ci_low={:.6},stage_aa_ci_high={:.6},stage_null_floor_ratio={stage_null_floor:.6},twice_stage_null_ratio={twice_stage_null:.6},stage_fraction_median={:.8},stage_fraction_ci_low={:.8},stage_fraction_ci_high={:.8},stage_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.2},standard_over_fx_median={:.6},standard_over_fx_ci_low={:.6},standard_over_fx_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        whole_null.median,
+        whole_null.low,
+        whole_null.high,
+        stage_null.median,
+        stage_null.low,
+        stage_null.high,
+        attribution.median,
+        attribution.low,
+        attribution.high,
+        attribution.median * 100.0,
+        speedup.median,
+        speedup.low,
+        speedup.high,
+    );
+}
+
 /// Source-neutral copy of the second full inode-item parse pass in
 /// `generate_send_stream`. Classification has already parsed these same items;
 /// retaining that result would remove exactly this work.
@@ -1518,6 +2010,12 @@ criterion_group!(
 );
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--send-cache-hasher-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        send_cache_hasher_attribution_only();
+        return;
+    }
     if std::env::args().any(|arg| arg == "--inode-grouping-attribution-only") {
         print_bench_evidence_metadata();
         print_codegen_isa();

@@ -13,6 +13,92 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Btrfs-send path/depth cache Fx hashing clears attribution but not the whole-stream null floor - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional candidate preflight matched the earlier closed SipHash sweep:
+`generate_send_stream_impl`'s `path_cache` and `depth_cache` had been classified
+as rare/non-hot. Its printed escape condition required either materially
+quieter paired whole-send evidence or a counted whole-send bottleneck before
+any production edit.
+
+A source-neutral x86-64-v3 attribution mode in
+`send_stream_path_cache.rs` reproduced both cache algorithms without changing
+production. On the deep-path fixture it counted:
+
+- 2,880 path-cache gets and 129 inserts;
+- 639 depth-cache gets and 256 inserts; and
+- 1,089 emitted paths totaling 660,352 path bytes.
+
+The retained attribution harness was corrected during final diff review:
+inode classification is precomputed outside the timed region, while its
+compile-time-false timed route performs no counting, path folding, or exact-path
+cloning. It was then replayed after production had been restored and its
+temporary whole-stream control removed. That corrected final-source invocation
+was a same-invocation protocol owning duplicate whole/whole and stage/stage A/A controls plus the
+RandomState/FxBuildHasher stage comparison. The executing process self-reported
+ELF `9c0ad2942c734e291c4c6dfd02a95384a5c05f8c738aa0d37f9b0d0287ff4020`
+on pinned strict-remote `ovh-a`, with compile/runtime AVX2+FMA true. Results:
+
+- whole A/A median **0.980129x**, deterministic bootstrap median 95% CI
+  **[0.956172, 1.006992]**, symmetric null floor **1.045837x**;
+- stage A/A median **1.025608x**, CI **[1.009478, 1.032967]**, symmetric
+  null floor **1.032967x**, twice-null threshold **1.067020x**;
+- cache-stage / whole-stream fraction **24.261466%**, CI
+  **[23.723773%, 24.843648%]**; and
+- RandomState/FxBuildHasher stage median **1.310055x**, CI
+  **[1.292686, 1.336789]**.
+
+The attribution lower bound exceeded the pre-registered 5% floor, so the stale
+"non-hot" premise was falsified and one production-shaped whole-stream A/B was
+admitted. The temporary candidate changed only the hasher used by the two
+integer-key caches. A feature-gated control retained RandomState so both arms
+ran in one ELF. Before timing, the invocation asserted exact full-stream parity:
+both arms emitted 3,048,915 bytes with SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+The counted mechanism remained 3,904 total cache operations.
+
+The final strict-remote process self-reported ELF
+`bb3d992fd12cccd295b8e87561ef9dcb628f9639437bbeb54b3a0d38fa501414`
+on the same pinned worker, again with compile/runtime AVX2+FMA true. Across 31
+alternating `AAB`/`BAA` pairs:
+
+- RandomState/RandomState A/A median **0.985884x**, CI
+  **[0.952269, 1.012486]**;
+- symmetric null floor **1.050123x**, pre-registered twice-null threshold
+  **1.102758x**; and
+- RandomState/FxBuildHasher whole-stream median **1.038185x**, CI
+  **[1.023832, 1.061480]**.
+
+**DECISION — REJECT_BELOW_TWICE_NULL AND REVERT PRODUCTION.** The isolated
+mechanism is substantial and the whole-stream interval excludes 1.0, but its
+lower bound does not clear twice the invocation-local null margin. The
+production hasher edit and benchmark-only whole-stream control were removed;
+only the source-neutral, counted attribution mode remains. The decision used
+the deterministic 20,000-resample paired bootstrap median CI over wall time.
+CV and instruction count were not computed or consulted.
+
+Final-source gates were strict-remote on `ovh-a`: the focused send-stream suite
+passed **22/22**; scoped bench Clippy passed under `-D warnings` after allowing
+only the six reproduced pre-existing library/legacy-bench diagnostic
+categories; targeted rustfmt and `git diff --check` passed.
+
+Semantic proof: both cache key domains are internal inode numbers; map equality
+and lookup values are independent of the hasher; neither map is iterated for
+emission order; path construction, directory-depth ordering, command
+attributes, CRCs, and complete stream bytes matched exactly. Ordering is
+preserved, tie-breaking is unchanged, and floating point/RNG are N/A. This is
+witnessed v3 release-perf evidence, not PGO or shipped-binary evidence.
+
+**Retry predicate:** reopen only when a fresh production-shaped v3+PGO send
+profile attributes at least 5% of whole wall/cycles to these caches and either
+(a) a pinned same-worker A/A invocation demonstrates a symmetric null floor at
+or below **1.015x**, making the observed effect decision-capable, or (b) a
+materially different fixture counts at least **4x** the current 3,904 cache
+operations per 3,048,915 output bytes. Then require an in-process
+ELF/ISA/profile witness, exact full-stream parity, at least 31 alternating
+A/A+B pairs, and a bootstrap median wall/cycles CI clearing twice its own null
+log-margin. Never gate on CV or instruction count.
+
 ## Exact v3+PGO persisted-create gate corrects bd-b9dug for one offline corpus - 2026-07-27 (GreenSpring, KEEP / CLAIM CORRECTION)
 
 The institutional preflight found no prior rejected row on the exact
