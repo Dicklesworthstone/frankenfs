@@ -1229,15 +1229,16 @@ fn spawn_profile_report() {
             "profile_blocker=perf_permission_denied record_status={status} report_status={}",
             report.status
         );
-    } else if let (Some(commit_pct), Some(publish_pct)) = (
-        profile_self_time_pct(&text, "commit_with_probe"),
-        profile_self_time_pct(&text, "publish_with_probe"),
-    ) && commit_pct > 0.0
-        && publish_pct > 0.0
-    {
+    } else if let Some(publish_pct) = profile_self_time_pct(&text, "publish_wait_free") {
+        const ATTRIBUTION_FLOOR_PCT: f64 = 5.0;
+        let commit_pct = profile_self_time_pct(&text, "commit_with_probe").unwrap_or(0.0);
+        let admitted = publish_pct >= ATTRIBUTION_FLOOR_PCT;
         println!(
-            "profile_target_self_time,commit_with_probe_pct={commit_pct:.6},publish_with_probe_pct={publish_pct:.6},verified_nonzero=true"
+            "profile_target_self_time,commit_with_probe_pct={commit_pct:.6},publish_wait_free_pct={publish_pct:.6},attribution_floor_pct={ATTRIBUTION_FLOOR_PCT:.6},admitted={admitted}"
         );
+        if !admitted {
+            println!("profile_blocker=target_self_time_below_attribution_floor");
+        }
     } else {
         println!("profile_blocker=target_self_time_not_resolved");
     }
@@ -3449,6 +3450,14 @@ fn main() {
         }
         print_bench_evidence_metadata();
         print_codegen_isa();
+        if std::env::args().any(|arg| arg == "--profile-report-only") {
+            println!(
+                "profile_scope=source_attribution_only,ratio_published=false,aa_gate=not_applicable,gate_basis=numeric_self_time,cv_used_as_gate=false,instructions_used_as_gate=false"
+            );
+            assert_publication_mode_isomorphism();
+            spawn_profile_report();
+            return;
+        }
         if std::env::args().any(|arg| arg == "--persistent-spin-decision-only") {
             persistent_spin_decision_only();
             return;
