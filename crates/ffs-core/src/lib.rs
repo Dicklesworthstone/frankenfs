@@ -26238,13 +26238,11 @@ impl OpenFs {
             item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
             offset: last,
         };
-        let stale: Vec<BtrfsKey> = alloc
+        let mut stale = Vec::new();
+        alloc
             .csum_tree
-            .range(&lo, &hi)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
+            .range_with(&lo, &hi, |key, _| stale.push(key))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         for key in stale {
             alloc
                 .csum_tree
@@ -51300,19 +51298,56 @@ mod tests {
         fs.enable_writes(&cx).expect("enable writes");
 
         let data_bytenr = BTRFS_TEST_FILE_DATA_LOGICAL as u64;
+        let before_bytenr = data_bytenr - 4096;
+        let next_bytenr = data_bytenr + 4096;
+        let after_bytenr = data_bytenr + 8192;
+        {
+            let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
+            for bytenr in [before_bytenr, next_bytenr, after_bytenr] {
+                alloc
+                    .csum_tree
+                    .upsert(
+                        BtrfsKey {
+                            objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
+                            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
+                            offset: bytenr,
+                        },
+                        &u32::try_from(bytenr).unwrap_or_default().to_le_bytes(),
+                    )
+                    .expect("seed adjacent checksum item");
+            }
+        }
         assert!(
             csum_lookup_in_alloc(&fs, data_bytenr).is_some(),
             "seeded checksum present before removal"
         );
         {
             let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
-            OpenFs::btrfs_remove_extent_csums(&mut alloc, data_bytenr, 4096)
+            OpenFs::btrfs_remove_extent_csums(&mut alloc, data_bytenr, 8192)
                 .expect("remove csums for the freed range");
         }
         assert!(
             csum_lookup_in_alloc(&fs, data_bytenr).is_none(),
             "checksum for the freed range must be gone"
         );
+        let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+        let lo = BtrfsKey {
+            objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
+            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
+            offset: before_bytenr,
+        };
+        let hi = BtrfsKey {
+            offset: after_bytenr,
+            ..lo
+        };
+        let offsets = alloc
+            .csum_tree
+            .range(&lo, &hi)
+            .expect("scan adjacent checksum items")
+            .into_iter()
+            .map(|(key, _)| key.offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![before_bytenr, after_bytenr]);
     }
 
     #[test]
