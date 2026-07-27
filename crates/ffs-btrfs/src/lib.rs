@@ -7083,22 +7083,22 @@ impl BtrfsExtentAllocator {
                 item_type: BTRFS_ITEM_EXTENT_ITEM,
                 offset: u64::MAX,
             };
-            for (key, _) in self.extent_tree.range(&range_start, &range_end)? {
-                if key.objectid >= bg_end || key.item_type != BTRFS_ITEM_EXTENT_ITEM {
-                    continue;
-                }
-                let extent = ExtentKey {
-                    bytenr: key.objectid,
-                    num_bytes: key.offset,
-                };
-                if !referenced.contains(&extent) {
-                    orphaned.push(ExtentAllocation {
-                        bytenr: extent.bytenr,
-                        num_bytes: extent.num_bytes,
-                        block_group_start: bg.start,
-                    });
-                }
-            }
+            self.extent_tree
+                .range_with(&range_start, &range_end, |key, _| {
+                    if key.objectid < bg_end && key.item_type == BTRFS_ITEM_EXTENT_ITEM {
+                        let extent = ExtentKey {
+                            bytenr: key.objectid,
+                            num_bytes: key.offset,
+                        };
+                        if !referenced.contains(&extent) {
+                            orphaned.push(ExtentAllocation {
+                                bytenr: extent.bytenr,
+                                num_bytes: extent.num_bytes,
+                                block_group_start: bg.start,
+                            });
+                        }
+                    }
+                })?;
         }
 
         for extent in &orphaned {

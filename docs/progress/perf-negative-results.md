@@ -13,6 +13,81 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Btrfs orphan reclaim borrows extent-tree keys - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior row on
+`BtrfsExtentAllocator::reclaim_unreferenced_data_extents`. The required family
+grep recovered an unrelated rejected allocator gap-scan representation, whose
+reopening condition was not met, and left this clean-recovery payload
+materialization surface open. A source-neutral harness therefore froze the
+current inclusive extent-tree range, block-group and item-type filters,
+referenced-set lookup, and orphan output order while comparing the existing
+materializing `range` walk with a borrowed `range_with` walk.
+
+The pre-edit strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported ELF
+`b532ea27a5300e11869e432f11efd5714cb8f9eac36456f97fe0e6a9e962a51d`.
+All compile/runtime SSE2, SSE4.2, AVX2, and FMA checks were true. On 4,096
+referenced data extents and zero orphans, the frozen control and borrowed model
+returned exactly the same empty orphan sequence. The control materialized
+**4,096 payload `Vec`s / 217,088 bytes** that orphan classification never
+observed; the candidate materialized **0**. One invocation owned exact parity,
+the A/A null, and the A/B admission gate. Materialized/materialized A/A median
+was **1.004839x**, deterministic 20,000-resample bootstrap median 95% CI
+**[0.998378, 1.015259]**, yielding a symmetric null floor of **1.015259x** and
+a pre-registered twice-null threshold of **1.030752x**.
+Materialized/borrowed-model median was **1.865467x**, bootstrap median 95% CI
+**[1.851003, 1.877787]**; its saved-fraction lower bound was **0.459752**,
+clearing the 5% attribution/admission floor.
+
+Production now traverses the identical range through `range_with` and borrows
+each key while classifying it. It still accumulates all orphans before any
+delete, so a traversal error cannot partially mutate the tree. Block-group
+iteration, ascending tree-key traversal, inclusive range boundaries,
+`objectid < bg_end`, item-type filtering, referenced membership, orphan vector
+order, delayed deletion order, metadata-item exclusion, and the
+error-before-mutation boundary are unchanged. Tie-breaking is unchanged/N/A;
+floating point and RNG are N/A.
+
+The final-source strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported
+`bench_evidence,binary_sha256=4721ab125cadfa69047c274564caf0677f57e2b1edcda0fd4ad01584d8b60e46`.
+The same invocation proved exact frozen-control/borrowed-model/actual-production
+output and ordering, counted the same **4,096 `Vec`s / 217,088 bytes to 0**
+mechanism, and ran 31 alternating-order paired rounds with min-of-three timing.
+Materialized/materialized A/A median was **0.999775x**, bootstrap median 95% CI
+**[0.997404, 1.001660]**; the symmetric null floor was **1.002603x** and the
+twice-null threshold **1.005212x**. Frozen-materialized/actual-production
+median was **1.823254x**, bootstrap median 95% CI
+**[1.820986, 1.828589]**, with a **0.450847** saved-fraction lower bound.
+
+**KEEP, narrowly scoped.** This is a clean-recovery classification scan with
+4,096 referenced extents and no deletes. It is not an orphan-delete-heavy,
+whole-recovery, PGO, mounted, shipped, or kernel magnitude. The gate basis was
+bootstrap median CI over wall time; `cv_used=false` and
+`instructions_used=false`.
+
+Strict-remote focused reclaim tests passed **2/2**: orphan data extents are
+freed while referenced extents remain, and metadata extents remain untouched.
+Scoped `--no-deps -D warnings` Clippy passed after allowing only the reproduced
+pre-existing `similar_names`, `too_long_first_doc_paragraph`, and
+`too_many_arguments` categories in untouched code; all diagnostics introduced
+by the new harness were fixed. Targeted rustfmt and `git diff --check` passed.
+`/data` had **436G** free before every Cargo invocation; all builds were
+strict-remote and no local target directory was created.
+
+**Retry predicate:** restate an end-to-end or shipped magnitude only after a
+production recovery profile attributes at least 5% of whole-recovery
+wall/cycles to orphan classification on a named image and a same-worker
+whole-recovery A/A+B gate proves identical final tree/image plus `fsck` output,
+with its bootstrap median wall/cycles CI clearing twice its own null
+log-margin. Revisit this representation only if the `range_with` contract
+changes, a fresh profile attributes at least 5% of classification wall/cycles
+to a remaining key/orphan-vector allocation, or an orphan-delete-heavy shape
+dominates enough that deletion cost changes the observed ceiling. Benchmark
+that exact production shape in one self-hashing invocation; never gate on CV or
+instruction count.
+
 ## Queued repair persistent membership uses hash + deterministic drain - 2026-07-27 (GreenSpring, KEEP)
 
 The institutional preflight found no prior REJECT on
