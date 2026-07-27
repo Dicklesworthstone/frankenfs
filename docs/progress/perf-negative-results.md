@@ -13,6 +13,73 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Btrfs free-path backref key projection - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional exact-surface preflight found no prior REJECT on
+`BtrfsExtentAllocator::delete_backrefs_for_extent`. The required family grep
+did recover the older noisy `remove_many` frontier, so this attempt explicitly
+left the existing ascending per-key delete loop unchanged. It tested only
+whether the preliminary range scan should materialize `(key, Vec<u8>)` pairs or
+borrow each payload while retaining the same ordered key vector.
+
+The full-path fixture held 512 keyed `EXTENT_DATA_REF` items for one extent plus
+two out-of-range sentinels. Both arms deleted the same 512 keys in ascending
+tree order, produced deleted-key digest `d12155af72c1634f`, and retained the
+same two sentinels byte-for-byte. The materialized control cloned **512
+temporary payload `Vec`s / 14,336 bytes**; the borrowed projection cloned
+**0**. Tie-breaking was unchanged/N/A; floating point and RNG were N/A.
+
+A pre-edit source-neutral strict-remote pinned-`ovh-a` x86-64-v3 process
+self-reported
+`bench_evidence,binary_sha256=f444fdfd8119d6af411d846c33500f9568aa4fa01db935d37a5d160115a366d4`.
+Its full selection-plus-512-deletes model median was **1.071793x**, bootstrap
+median 95% CI **[1.055711, 1.081472]**, against same-invocation A/A median
+**1.003734x** with bootstrap median 95% CI **[0.985769, 1.016860]**, and a
+**1.034004x** twice-null threshold. The saved-fraction lower bound was
+**0.052771**, narrowly clearing the pre-registered 5% admission floor.
+
+The candidate was then installed in the actual production body and linked
+again. That final candidate process self-reported
+`bench_evidence,binary_sha256=e9434c725a553d7aab989a6f8bd1a571acd0429e6f3690bcd643f47b8d52403f`;
+compile/runtime SSE2, SSE4.2, AVX2, and FMA were all true. The same invocation
+again proved exact ordered-delete/final-tree parity and the **512 `Vec`s /
+14,336 bytes to 0** mechanism, but its A/A median was **0.974376x**, bootstrap
+median 95% CI **[0.962568, 0.995147]**. That yielded a **1.038887x** symmetric
+null floor and **1.079287x** twice-null threshold. Actual candidate median was
+only **1.043917x**, CI **[1.026145, 1.051577]**, with saved-fraction lower bound
+**0.025478**.
+
+**REJECT; production materialization restored.** The final candidate CI did
+not clear twice null, its lower-bound saving was below 5%, and the A/A floor
+itself exceeded the pre-registered 1.025 limit. The source-neutral admission
+was therefore insufficient to publish or retain a production lever. A
+`bench-instrumentation` replay remains behind
+`FFS_BTRFS_BACKREF_DELETE_GATE=candidate`; normal production continues to use
+the original materialized scan. This result is only a 512-backref internal
+free-path shape, not an ordinary one-ref extent, whole truncate/unlink,
+v3+PGO, mounted, shipped, or kernel magnitude. The decision used bootstrap
+median wall-time CIs; `cv_used=false`; `instructions_used=false`.
+
+After restoring production, strict-remote `free_extent`-filtered tests passed
+**7/7** with `bench-instrumentation` enabled. Scoped library-plus-benchmark
+Clippy passed under `--no-deps -D warnings` after the owned benchmark
+controller was split to satisfy `too_many_lines`; only the repository's known
+dependency deprecation warnings remained. Targeted rustfmt and
+`git diff --check` passed. `/data` had **436G** free before every Cargo
+invocation; all target output remained worker-scoped.
+
+**Retry predicate:** retry borrowed key projection only after a witnessed
+x86-64-v3+PGO production free/truncate profile both observes at least 512 keyed
+backrefs on the target extent and attributes at least 5% of whole-operation
+wall/cycles specifically to payload materialization in
+`delete_backrefs_for_extent`. Then use that observed cardinality in one
+same-worker self-hashing whole-operation A/A+B invocation, require exact final
+tree/image plus `btrfs check` parity, use min-of-three paired observations, and
+require the bootstrap median wall/cycles CI to clear twice its own null
+log-margin with a saved-fraction lower bound of at least 5%. The closed
+`remove_many` frontier remains out of scope unless its separate ledger retry
+predicate is independently met.
+
 ## Btrfs keyed extent backrefs parse borrowed payloads - 2026-07-27 (GreenSpring, KEEP)
 
 The institutional preflight found no prior row on

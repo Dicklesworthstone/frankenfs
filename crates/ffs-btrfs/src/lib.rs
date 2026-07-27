@@ -7676,6 +7676,43 @@ impl BtrfsExtentAllocator {
         }
         Ok(())
     }
+
+    /// Benchmark-only replay of the rejected borrowed-key backref deletion.
+    /// Production intentionally retains payload materialization because the
+    /// full-path median-CI gate did not clear its null floor.
+    ///
+    /// # Errors
+    /// Returns the same tree mutation error as production extent deletion.
+    #[cfg(feature = "bench-instrumentation")]
+    #[doc(hidden)]
+    pub fn bench_delete_backrefs_for_extent_borrowed_candidate(
+        &mut self,
+        bytenr: u64,
+        is_metadata: bool,
+    ) -> Result<(), BtrfsMutationError> {
+        let ref_item_type = if is_metadata {
+            BTRFS_ITEM_TREE_BLOCK_REF
+        } else {
+            BTRFS_ITEM_EXTENT_DATA_REF
+        };
+        let range_start = BtrfsKey {
+            objectid: bytenr,
+            item_type: ref_item_type,
+            offset: 0,
+        };
+        let range_end = BtrfsKey {
+            objectid: bytenr,
+            item_type: ref_item_type,
+            offset: u64::MAX,
+        };
+        let mut refs = Vec::new();
+        self.extent_tree
+            .range_with(&range_start, &range_end, |key, _| refs.push(key))?;
+        for key in refs {
+            self.extent_tree.delete(&key)?;
+        }
+        Ok(())
+    }
 }
 
 fn allocation_extent_range(key: BtrfsKey, metadata_nodesize: u64) -> Option<(u64, u64)> {

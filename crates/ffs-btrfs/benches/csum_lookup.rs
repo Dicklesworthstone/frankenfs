@@ -16,7 +16,8 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_btrfs::{
-    BTRFS_EXTENT_CSUM_OBJECTID, BTRFS_ITEM_EXTENT_CSUM, BtrfsBTree, BtrfsKey, InMemoryCowBtrfsTree,
+    BTRFS_EXTENT_CSUM_OBJECTID, BTRFS_ITEM_EXTENT_CSUM, BTRFS_ITEM_EXTENT_DATA_REF, BtrfsBTree,
+    BtrfsExtentAllocator, BtrfsExtentDataRef, BtrfsKey, InMemoryCowBtrfsTree,
     lookup_data_block_csum,
 };
 use sha2::{Digest, Sha256};
@@ -35,6 +36,9 @@ const DELETE_ITEMS: usize = 8;
 const DELETE_PAYLOAD_BYTES: usize = 16 * 1024 - 256;
 const DELETE_PAIRS: usize = 31;
 const MAX_NULL_FLOOR_RATIO: f64 = 1.025;
+const BACKREF_DELETE_COUNT: usize = 512;
+const BACKREF_DELETE_BYTENR: u64 = 3 << 30;
+const MIN_BACKREF_DELETE_SAVED_FRACTION: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 struct BootstrapMedianCi {
@@ -316,6 +320,349 @@ fn csum_delete_projection_contract() {
     );
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct BackrefDeleteOutput {
+    deleted: usize,
+    deleted_key_digest: u64,
+    remaining: Vec<(BtrfsKey, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy)]
+enum BackrefDeleteArm {
+    BorrowedModel,
+    RejectedCandidate,
+}
+
+fn backref_delete_range() -> (BtrfsKey, BtrfsKey) {
+    (
+        BtrfsKey {
+            objectid: BACKREF_DELETE_BYTENR,
+            item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+            offset: 0,
+        },
+        BtrfsKey {
+            objectid: BACKREF_DELETE_BYTENR,
+            item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+            offset: u64::MAX,
+        },
+    )
+}
+
+fn full_tree_range() -> (BtrfsKey, BtrfsKey) {
+    (
+        BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        },
+        BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        },
+    )
+}
+
+fn backref_delete_fixture() -> BtrfsExtentAllocator {
+    let mut alloc = BtrfsExtentAllocator::new(1).expect("backref delete allocator");
+    alloc
+        .extent_tree_mut()
+        .insert(
+            BtrfsKey {
+                objectid: BACKREF_DELETE_BYTENR - 1,
+                item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+                offset: u64::MAX,
+            },
+            b"before",
+        )
+        .expect("insert before-range sentinel");
+    for index in 0..BACKREF_DELETE_COUNT {
+        let index = u64::try_from(index).expect("backref index fits in u64");
+        let data_ref = BtrfsExtentDataRef {
+            root: 5 + index % 4,
+            objectid: 256 + index,
+            offset: index * 4096,
+            count: u32::try_from(index % 3 + 1).expect("backref count fits in u32"),
+        };
+        alloc
+            .extent_tree_mut()
+            .insert(
+                BtrfsKey {
+                    objectid: BACKREF_DELETE_BYTENR,
+                    item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+                    offset: index,
+                },
+                &data_ref.to_bytes(),
+            )
+            .expect("insert keyed backref");
+    }
+    alloc
+        .extent_tree_mut()
+        .insert(
+            BtrfsKey {
+                objectid: BACKREF_DELETE_BYTENR + 1,
+                item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+                offset: 0,
+            },
+            b"after",
+        )
+        .expect("insert after-range sentinel");
+    alloc
+}
+
+fn backref_key_digest(keys: &[BtrfsKey]) -> u64 {
+    keys.iter().fold(0_u64, |digest, key| {
+        digest
+            .wrapping_mul(1_000_003)
+            .wrapping_add(key.objectid)
+            .rotate_left(7)
+            ^ u64::from(key.item_type)
+            ^ key.offset.rotate_right(11)
+    })
+}
+
+fn remaining_tree(alloc: &BtrfsExtentAllocator) -> Vec<(BtrfsKey, Vec<u8>)> {
+    let (lo, hi) = full_tree_range();
+    alloc
+        .extent_tree()
+        .range(&lo, &hi)
+        .expect("read remaining extent tree")
+}
+
+#[inline(never)]
+fn materialized_backref_delete(mut alloc: BtrfsExtentAllocator) -> BackrefDeleteOutput {
+    let (lo, hi) = backref_delete_range();
+    let keys = alloc
+        .extent_tree()
+        .range(&lo, &hi)
+        .expect("materialize backref range")
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    let deleted_key_digest = backref_key_digest(&keys);
+    for key in &keys {
+        alloc
+            .extent_tree_mut()
+            .delete(key)
+            .expect("delete materialized backref key");
+    }
+    BackrefDeleteOutput {
+        deleted: keys.len(),
+        deleted_key_digest,
+        remaining: remaining_tree(&alloc),
+    }
+}
+
+#[inline(never)]
+fn borrowed_backref_delete_model(mut alloc: BtrfsExtentAllocator) -> BackrefDeleteOutput {
+    let (lo, hi) = backref_delete_range();
+    let mut keys = Vec::new();
+    alloc
+        .extent_tree()
+        .range_with(&lo, &hi, |key, _| keys.push(key))
+        .expect("project borrowed backref keys");
+    let deleted_key_digest = backref_key_digest(&keys);
+    for key in &keys {
+        alloc
+            .extent_tree_mut()
+            .delete(key)
+            .expect("delete borrowed backref key");
+    }
+    BackrefDeleteOutput {
+        deleted: keys.len(),
+        deleted_key_digest,
+        remaining: remaining_tree(&alloc),
+    }
+}
+
+#[inline(never)]
+fn rejected_candidate_backref_delete(mut alloc: BtrfsExtentAllocator) -> BackrefDeleteOutput {
+    alloc
+        .bench_delete_backrefs_for_extent_borrowed_candidate(BACKREF_DELETE_BYTENR, false)
+        .expect("rejected-candidate backref delete");
+    let keys = (0..BACKREF_DELETE_COUNT)
+        .map(|index| BtrfsKey {
+            objectid: BACKREF_DELETE_BYTENR,
+            item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+            offset: u64::try_from(index).expect("backref index fits in u64"),
+        })
+        .collect::<Vec<_>>();
+    BackrefDeleteOutput {
+        deleted: keys.len(),
+        deleted_key_digest: backref_key_digest(&keys),
+        remaining: remaining_tree(&alloc),
+    }
+}
+
+fn observe_backref_delete(
+    operation: fn(BtrfsExtentAllocator) -> BackrefDeleteOutput,
+) -> (f64, BackrefDeleteOutput) {
+    let alloc = backref_delete_fixture();
+    let started = Instant::now();
+    let output = operation(black_box(alloc));
+    (started.elapsed().as_secs_f64() * 1e9, black_box(output))
+}
+
+type BackrefDeleteOperation = fn(BtrfsExtentAllocator) -> BackrefDeleteOutput;
+
+struct BackrefDeleteSamples {
+    control_lhs_ns: Vec<f64>,
+    control_rhs_ns: Vec<f64>,
+    candidate_ns: Vec<f64>,
+    raw_pairs: String,
+}
+
+fn collect_backref_delete_samples(
+    candidate: BackrefDeleteOperation,
+    expected: &BackrefDeleteOutput,
+) -> BackrefDeleteSamples {
+    let mut control_lhs_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut candidate_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut raw_pairs = String::new();
+    for pair_index in 0..DELETE_PAIRS {
+        let (lhs, rhs, candidate_ns_one, order) = if pair_index % 2 == 0 {
+            let (lhs, lhs_output) = observe_backref_delete(materialized_backref_delete);
+            let (rhs, rhs_output) = observe_backref_delete(materialized_backref_delete);
+            let (candidate_ns_one, candidate_output) = observe_backref_delete(candidate);
+            assert_eq!(&lhs_output, expected);
+            assert_eq!(&rhs_output, expected);
+            assert_eq!(&candidate_output, expected);
+            (lhs, rhs, candidate_ns_one, "AAB")
+        } else {
+            let (candidate_ns_one, candidate_output) = observe_backref_delete(candidate);
+            let (rhs, rhs_output) = observe_backref_delete(materialized_backref_delete);
+            let (lhs, lhs_output) = observe_backref_delete(materialized_backref_delete);
+            assert_eq!(&candidate_output, expected);
+            assert_eq!(&rhs_output, expected);
+            assert_eq!(&lhs_output, expected);
+            (lhs, rhs, candidate_ns_one, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate_ns_one);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{lhs:.3}:{rhs:.3}:{candidate_ns_one:.3}"
+        )
+        .expect("format backref delete A/A/B pair");
+    }
+    BackrefDeleteSamples {
+        control_lhs_ns,
+        control_rhs_ns,
+        candidate_ns,
+        raw_pairs,
+    }
+}
+
+fn decide_backref_delete_samples(mode: &str, samples: &BackrefDeleteSamples) {
+    let null_log_ratios = samples
+        .control_lhs_ns
+        .iter()
+        .zip(&samples.control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = samples
+        .control_lhs_ns
+        .iter()
+        .zip(&samples.control_rhs_ns)
+        .zip(&samples.candidate_ns)
+        .map(|((lhs, rhs), candidate_ns_one)| (lhs.midpoint(*rhs) / candidate_ns_one).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let saved_fraction_lower = (1.0 - speedup_summary.low.recip()).max(0.0);
+    let admitted = null_floor_ratio <= MAX_NULL_FLOOR_RATIO
+        && speedup_summary.low > twice_null_ratio
+        && saved_fraction_lower >= MIN_BACKREF_DELETE_SAVED_FRACTION;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio > MAX_NULL_FLOOR_RATIO {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL_OR_FIVE_PERCENT"
+    };
+    println!(
+        "backref_delete_pairs,mode={mode},pairs={DELETE_PAIRS},format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={}",
+        samples.raw_pairs
+    );
+    println!(
+        "backref_delete_ab,mode={mode},control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},saved_fraction_ci_lower={saved_fraction_lower:.6},minimum_saved_fraction={MIN_BACKREF_DELETE_SAVED_FRACTION:.6},admitted={admitted},verdict={verdict},gate_metric=wall_ns,gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false,instructions_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
+    if !admitted {
+        std::process::exit(2);
+    }
+}
+
+fn backref_delete_contract(candidate_arm: BackrefDeleteArm) {
+    print_bench_evidence_metadata();
+    print_codegen_isa();
+
+    let expected = materialized_backref_delete(backref_delete_fixture());
+    assert_eq!(
+        borrowed_backref_delete_model(backref_delete_fixture()),
+        expected,
+        "borrowed backref deletion changed final tree or key order"
+    );
+    let (candidate, mode): (BackrefDeleteOperation, &'static str) = match candidate_arm {
+        BackrefDeleteArm::BorrowedModel => {
+            (borrowed_backref_delete_model, "source_neutral_attribution")
+        }
+        BackrefDeleteArm::RejectedCandidate => {
+            let actual = rejected_candidate_backref_delete(backref_delete_fixture());
+            assert_eq!(
+                actual, expected,
+                "rejected-candidate backref deletion changed final tree or key order"
+            );
+            (
+                rejected_candidate_backref_delete,
+                "rejected_candidate_replay",
+            )
+        }
+    };
+
+    let fixture = backref_delete_fixture();
+    let (lo, hi) = backref_delete_range();
+    let materialized = fixture
+        .extent_tree()
+        .range(&lo, &hi)
+        .expect("count materialized backref payloads");
+    let materialized_payload_bytes = materialized
+        .iter()
+        .map(|(_, payload)| payload.len())
+        .sum::<usize>();
+    assert_eq!(materialized.len(), BACKREF_DELETE_COUNT);
+    println!(
+        "backref_delete_parity,mode={mode},ordering=extent_tree_key_ascending,tie_breaking=na,floating_point=na,rng=na,deleted_keys={},deleted_key_digest={:016x},remaining_items={}",
+        expected.deleted,
+        expected.deleted_key_digest,
+        expected.remaining.len(),
+    );
+    println!(
+        "backref_delete_mechanism,materialized_payload_vecs={},materialized_payload_bytes={materialized_payload_bytes},borrowed_payload_vecs=0,retained_key_vecs={}",
+        materialized.len(),
+        expected.deleted,
+    );
+    let samples = collect_backref_delete_samples(candidate, &expected);
+    decide_backref_delete_samples(mode, &samples);
+}
+
 /// Build a sorted-by-offset csum-tree item list: item `i` covers
 /// `CSUMS_PER_ITEM` sectors starting at disk bytenr `i * stride`.
 fn build_items() -> Vec<(BtrfsKey, Vec<u8>)> {
@@ -372,6 +719,16 @@ fn linear(items: &[(BtrfsKey, Vec<u8>)], disk_bytenr: u64, sectorsize: usize) ->
 }
 
 fn bench_csum_lookup(c: &mut Criterion) {
+    if let Some(mode) = std::env::var_os("FFS_BTRFS_BACKREF_DELETE_GATE") {
+        match mode.to_str() {
+            Some("source-neutral") => backref_delete_contract(BackrefDeleteArm::BorrowedModel),
+            Some("candidate") => backref_delete_contract(BackrefDeleteArm::RejectedCandidate),
+            _ => {
+                panic!("FFS_BTRFS_BACKREF_DELETE_GATE must be source-neutral or candidate")
+            }
+        }
+        return;
+    }
     if std::env::var_os("FFS_BTRFS_CSUM_DELETE_GATE").is_some() {
         csum_delete_projection_contract();
     }
