@@ -5,13 +5,13 @@
     clippy::cast_sign_loss
 )]
 
-//! Null-controlled whole-callback A/B for queued repair group lookup/dedup.
+//! Null-controlled whole-callback A/B for queued repair logging overhead.
 //!
 //! A repair-aware flush maps every committed block to a repair group. The
-//! first banked lever indexed valid disjoint ranges and the second replaced its
-//! temporary `BTreeSet` with compact `Vec` sort/dedup. This A/B freezes that
-//! production callback against hash membership plus deterministic sort-on-drain
-//! for the persistent queue.
+//! banked callback indexes ranges, uses compact temporary dedup, and stores
+//! persistent membership in a hash set. This A/B freezes that implementation
+//! while comparing eager `Vec<u32>` materialization for its debug field with
+//! an allocation-free formatter that emits the exact same field text.
 
 use asupersync::Cx;
 use ffs_block::RepairFlushLifecycle;
@@ -34,11 +34,14 @@ const MIN_OF: usize = 3;
 const MIN_SAMPLE_NS: u64 = 2_000_000;
 const BOOTSTRAP_RESAMPLES: usize = 20_000;
 const BOOTSTRAP_SEED: u64 = 0xF5A1_9A2E_2026_0727;
+const MAX_NULL_FLOOR_RATIO: f64 = 1.025;
+const MIN_SAVED_FRACTION: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 enum Arm {
-    Baseline,
-    Candidate,
+    EagerControl,
+    LazyModel,
+    Production,
 }
 
 #[derive(Clone, Copy)]
@@ -46,6 +49,17 @@ struct GroupRange {
     group: GroupNumber,
     start: u64,
     end: u64,
+}
+
+struct LazyGroupIds<'a>(&'a [GroupNumber]);
+
+impl std::fmt::Debug for LazyGroupIds<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(|group| group.0))
+            .finish()
+    }
 }
 
 struct LegacyQueuedRepairRefresh {
@@ -251,7 +265,7 @@ impl HashQueuedRepairRefresh {
         }
     }
 
-    fn on_flush_committed(&self, blocks: &[BlockNumber]) {
+    fn groups_for_blocks(&self, blocks: &[BlockNumber]) -> Vec<GroupNumber> {
         let mut groups = Vec::with_capacity(blocks.len());
         for block in blocks {
             if let Some(range) = self
@@ -266,6 +280,19 @@ impl HashQueuedRepairRefresh {
         }
         groups.sort_unstable();
         groups.dedup();
+        groups
+    }
+
+    fn queue_groups(&self, groups: Vec<GroupNumber>) {
+        let mut queued = self.queued_groups.lock().expect("hash queue lock");
+        queued.reserve(groups.len());
+        for group in groups {
+            queued.insert(group);
+        }
+    }
+
+    fn on_flush_committed(&self, blocks: &[BlockNumber]) {
+        let groups = self.groups_for_blocks(blocks);
         if groups.is_empty() {
             return;
         }
@@ -278,11 +305,23 @@ impl HashQueuedRepairRefresh {
             "flush_triggers_refresh"
         );
 
-        let mut queued = self.queued_groups.lock().expect("hash queue lock");
-        queued.reserve(groups.len());
-        for group in groups {
-            queued.insert(group);
+        self.queue_groups(groups);
+    }
+
+    fn on_flush_committed_lazy(&self, blocks: &[BlockNumber]) {
+        let groups = self.groups_for_blocks(blocks);
+        if groups.is_empty() {
+            return;
         }
+
+        tracing::debug!(
+            target: "ffs::repair::refresh",
+            group_ids = ?LazyGroupIds(&groups),
+            block_count = blocks.len(),
+            "flush_triggers_refresh"
+        );
+
+        self.queue_groups(groups);
     }
 
     fn drain(&self) -> Vec<GroupNumber> {
@@ -411,11 +450,15 @@ fn checksum(groups: &[GroupNumber]) -> u64 {
 
 fn run_arm(state: &BenchState, arm: Arm) -> u64 {
     let groups = match arm {
-        Arm::Baseline => {
-            state.candidate.on_flush_committed(&state.blocks);
-            state.candidate.drain()
+        Arm::EagerControl => {
+            state.hash_candidate.on_flush_committed(&state.blocks);
+            state.hash_candidate.drain()
         }
-        Arm::Candidate => {
+        Arm::LazyModel => {
+            state.hash_candidate.on_flush_committed_lazy(&state.blocks);
+            state.hash_candidate.drain()
+        }
+        Arm::Production => {
             state
                 .production
                 .on_flush_committed(&state.cx, &state.blocks)
@@ -496,12 +539,12 @@ fn time_min(state: &BenchState, arm: Arm, batch: usize) -> (u64, u64) {
     (best, digest)
 }
 
-fn calibrate_batch(state: &BenchState) -> usize {
-    black_box(sample_arm(state, Arm::Baseline, 1));
-    black_box(sample_arm(state, Arm::Candidate, 1));
+fn calibrate_batch(state: &BenchState, candidate: Arm) -> usize {
+    black_box(sample_arm(state, Arm::EagerControl, 1));
+    black_box(sample_arm(state, candidate, 1));
 
     let started = Instant::now();
-    black_box(sample_arm(state, Arm::Candidate, 1));
+    black_box(sample_arm(state, candidate, 1));
     let candidate_ns = u64::try_from(started.elapsed().as_nanos())
         .unwrap_or(u64::MAX)
         .max(1);
@@ -586,7 +629,7 @@ fn print_stats(label: &str, stats: &PairedStats) {
     );
 }
 
-fn main() {
+fn run_decision(candidate: Arm, mode: &str) {
     let (binary_sha256, binary_bytes, binary_path) = self_sha256();
     println!(
         "bench_evidence,binary_sha256={binary_sha256},binary_bytes={binary_bytes},binary_path={binary_path},worker={}",
@@ -595,57 +638,95 @@ fn main() {
     print_codegen_isa();
 
     let state = build_state();
-    let baseline = run_arm(&state, Arm::Baseline);
-    state.hash_candidate.on_flush_committed(&state.blocks);
-    let hash_candidate = checksum(&state.hash_candidate.drain());
+    let eager_control = run_arm(&state, Arm::EagerControl);
+    let lazy_model = run_arm(&state, Arm::LazyModel);
     state.baseline.on_flush_committed(&state.blocks);
     let indexed_tree = checksum(&state.baseline.drain());
     state.linear.on_flush_committed(&state.blocks);
     let linear = checksum(&state.linear.drain());
-    let production = run_arm(&state, Arm::Candidate);
+    state.candidate.on_flush_committed(&state.blocks);
+    let compact_tree = checksum(&state.candidate.drain());
+    let production = run_arm(&state, Arm::Production);
     assert_eq!(
-        (linear, indexed_tree, baseline, hash_candidate, production),
-        (baseline, baseline, baseline, baseline, baseline),
+        (
+            linear,
+            indexed_tree,
+            compact_tree,
+            eager_control,
+            lazy_model,
+            production
+        ),
+        (
+            eager_control,
+            eager_control,
+            eager_control,
+            eager_control,
+            eager_control,
+            eager_control
+        ),
         "queued group outputs diverged"
     );
     let (linear_comparisons, indexed_comparisons, groups) = counted_mechanism(&state);
-    assert_eq!(checksum(&groups), baseline);
-    println!(
-        "behavior_parity=exact,ordering=group_number_ascending,tie_breaking=first_input_match_on_overlap,floating_point=na,rng=na,queued_groups={},output_checksum={baseline:016x}",
-        groups.len()
+    assert_eq!(checksum(&groups), eager_control);
+    let eager_group_ids = groups.iter().map(|group| group.0).collect::<Vec<_>>();
+    let eager_debug = format!("{eager_group_ids:?}");
+    let lazy_debug = format!("{:?}", LazyGroupIds(&groups));
+    assert_eq!(
+        eager_debug, lazy_debug,
+        "lazy group-id formatter changed the tracing field"
     );
     println!(
-        "mechanism_count,write_blocks={},repair_groups={},linear_range_comparisons={linear_comparisons},indexed_range_comparisons={indexed_comparisons},comparison_reduction={:.3}x,temporary_tree_insertions={},temporary_vec_pushes={},unique_groups={}",
+        "behavior_parity=exact,ordering=group_number_ascending,tie_breaking=first_input_match_on_overlap,floating_point=na,rng=na,queued_groups={},output_checksum={eager_control:016x},debug_field_format=exact,debug_field_bytes={}",
+        groups.len(),
+        eager_debug.len(),
+    );
+    println!(
+        "mechanism_count,write_blocks={},repair_groups={},linear_range_comparisons={linear_comparisons},indexed_range_comparisons={indexed_comparisons},comparison_reduction={:.3}x,temporary_tree_insertions={},temporary_vec_pushes={},unique_groups={},eager_log_vec_allocations=1,eager_log_ids_copied={},eager_log_bytes_copied={},lazy_log_vec_allocations=0,lazy_log_ids_copied=0",
         state.blocks.len(),
         state.ranges.len(),
         linear_comparisons as f64 / indexed_comparisons as f64,
         state.blocks.len(),
         state.blocks.len(),
-        groups.len()
+        groups.len(),
+        groups.len(),
+        groups.len() * std::mem::size_of::<u32>(),
     );
 
-    let batch = calibrate_batch(&state);
+    let batch = calibrate_batch(&state, candidate);
     println!(
-        "bench_config=batch={batch},rounds={ROUNDS},min_sample_ns={MIN_SAMPLE_NS},min_of={MIN_OF},bootstrap_resamples={BOOTSTRAP_RESAMPLES},bootstrap_seed={BOOTSTRAP_SEED:016x}"
+        "bench_config,mode={mode},batch={batch},rounds={ROUNDS},min_sample_ns={MIN_SAMPLE_NS},min_of={MIN_OF},bootstrap_resamples={BOOTSTRAP_RESAMPLES},bootstrap_seed={BOOTSTRAP_SEED:016x}"
     );
-    let null = paired(&state, Arm::Baseline, Arm::Baseline, batch);
-    let real = paired(&state, Arm::Baseline, Arm::Candidate, batch);
-    print_stats("null_persistent_tree_persistent_tree", &null);
-    print_stats("real_persistent_tree_persistent_hash", &real);
+    let null = paired(&state, Arm::EagerControl, Arm::EagerControl, batch);
+    let real = paired(&state, Arm::EagerControl, candidate, batch);
+    print_stats("null_eager_log_eager_log", &null);
+    print_stats("real_eager_log_lazy_log", &real);
 
     let null_floor = null.ratio_ci.1.max(null.ratio_ci.0.recip());
     let twice_null_threshold = null_floor * null_floor;
-    let candidate_win = real.ratio_ci.0 > twice_null_threshold;
-    let baseline_win = real.ratio_ci.1.recip() > twice_null_threshold;
-    let verdict = if candidate_win {
+    let saved_fraction_lower = (1.0 - real.ratio_ci.0.recip()).max(0.0);
+    let admitted = null_floor <= MAX_NULL_FLOOR_RATIO
+        && real.ratio_ci.0 > twice_null_threshold
+        && saved_fraction_lower >= MIN_SAVED_FRACTION;
+    let verdict = if admitted {
         "decidable_candidate_win"
-    } else if baseline_win {
-        "decidable_baseline_win"
+    } else if null_floor > MAX_NULL_FLOOR_RATIO {
+        "blocked_null_floor"
     } else {
-        "unresolved"
+        "not_admitted"
     };
     println!(
-        "median_ci_gate={verdict},null_symmetric_floor={null_floor:.6},twice_null_threshold={twice_null_threshold:.6},real_ci_lower={:.6},real_ci_upper={:.6},gate_basis=bootstrap_median_wall_ci,cv_used_as_gate=false,instructions_used_as_gate=false",
+        "median_ci_gate={verdict},admitted={admitted},null_symmetric_floor={null_floor:.6},maximum_null_floor={MAX_NULL_FLOOR_RATIO:.6},twice_null_threshold={twice_null_threshold:.6},real_ci_lower={:.6},real_ci_upper={:.6},saved_fraction_ci_lower={saved_fraction_lower:.6},minimum_saved_fraction={MIN_SAVED_FRACTION:.6},gate_basis=bootstrap_median_wall_ci,cv_used_as_gate=false,instructions_used_as_gate=false",
         real.ratio_ci.0, real.ratio_ci.1
     );
+    if !admitted {
+        std::process::exit(2);
+    }
+}
+
+fn main() {
+    if std::env::args().any(|arg| arg == "--log-attribution-only") {
+        run_decision(Arm::LazyModel, "source_neutral_attribution");
+        return;
+    }
+    run_decision(Arm::Production, "actual_production_decision");
 }

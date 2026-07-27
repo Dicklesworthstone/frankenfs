@@ -13,6 +13,78 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Lazy queued group-id tracing is below the whole-callback null floor - 2026-07-27 (GreenSpring, REJECT)
+
+The qualified institutional preflight found no prior REJECT on
+`queued_refresh_group_ids_debug_materialization`. A broader first key had
+matched the unrelated 2026-06-28 `ffs-core` repair write-set collection reject;
+the exact field/materialization key separated the callback-local logging
+surface without reopening that commit-path family.
+
+The retained source-neutral model froze every banked callback decision:
+disjoint-range indexing, compact temporary sort/dedup, persistent hash
+membership, deterministic drain order, overlap first-input-match fallback,
+mutex boundaries, and tracing event order. It changed only how the first debug
+event exposes group IDs. The control eagerly collected `Vec<u32>` before the
+event; the candidate supplied a lazy `DebugList` view over the already-sorted
+`GroupNumber` slice.
+
+The untimed proof covered 512 unique groups:
+
+- exact ascending queue output and checksum `7a8c925983737ede`;
+- exact 2,903-byte rendered debug-field text;
+- eager mechanism: **one allocation, 512 copied IDs, 2,048 copied bytes**; and
+- lazy mechanism: **zero allocations and zero copied IDs**.
+
+**Counted mechanism:** allocation count `1 -> 0`; copied-ID count `512 -> 0`;
+copied-byte count `2,048 -> 0`.
+
+One strict-remote invocation on pinned `ovh-a` built x86-64-v3 release-perf
+and executed ELF
+`aca3ce86968eef94b57cc108748f54430be594838216311cb50129c3ed74767d`.
+The process self-reported compile/runtime SSE2, SSE4.2, AVX2, and FMA. Its
+optional environment-only worker field printed `unknown`; the RCH selection
+and execution logs are the worker witness. `/data` had **436G** free before
+the build, and all target output remained worker-scoped.
+
+Across 41 alternating A/A+B rounds, each observation used min-of-three and a
+calibrated batch of 64 complete callback-plus-drain executions:
+
+- eager/eager A/A median **0.999851x**, deterministic bootstrap median 95% CI
+  **[0.999269, 1.000424]**;
+- symmetric null floor **1.000732x** and twice-null threshold **1.001464x**;
+- eager/lazy median **0.999772x**, CI **[0.999142, 1.001288]**; and
+- saved-fraction lower bound **0.000000**, versus the pre-registered 5% floor.
+
+In the same invocation, the A/A null-control median was **0.999851x** with a
+deterministic bootstrap median 95% CI **[0.999269, 1.000424]**.
+
+An unpooled exact-source replay self-reported ELF
+`290f17258dc9275bd143951cfac4d04280d1ee5505519e35e9d8865581049b51`
+and independently returned the same decision: eager/eager A/A
+**0.999408x [0.998450, 1.000148]**, symmetric null floor **1.001552x**,
+twice-null **1.003107x**, and eager/lazy **1.000178x [0.999386, 1.000652]**.
+Its saved-fraction lower bound was again **0.000000**. The two invocations are
+reported separately and were not pooled.
+
+**REJECT; no production edit.** Eliminating the allocation is real, but the
+complete callback does not move: both full A/B CIs remain inside their own
+twice-null thresholds and their lower-bound saving is zero. The source-neutral guard stays in
+`queued_refresh_lookup.rs`; production continues to materialize `group_ids`.
+This decision used only bootstrap median wall-time CI. CV was printed as
+provenance and was not a gate; instruction count was not used. This is neither
+PGO nor whole-flush, mounted, shipped, or kernel evidence.
+
+**Retry predicate:** retry only when a current production callback profile
+attributes at least 5% of whole-callback wall/cycles specifically to eager
+group-ID materialization, or production telemetry shows a materially different
+small callback shape (p50 at most eight unique groups) where allocation
+profiling names this `Vec`. Use that observed cardinality and tracing state in
+one self-hashing same-worker A/A+B invocation, preserve exact rendered field
+text and queue output, and require the bootstrap median wall/cycles CI to clear
+twice its own null log-margin with at least a 5% saved-fraction lower bound.
+Never gate on CV or instruction count.
+
 ## Exact v3+PGO warm-read gate leaves no resolved ISA correction - 2026-07-27 (GreenSpring, CLAIM CORRECTION / NULL)
 
 The institutional preflight found no prior row on
