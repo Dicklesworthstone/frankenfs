@@ -18,6 +18,7 @@ use ffs_btrfs::{
 #[cfg(feature = "bench-instrumentation")]
 use ffs_btrfs::{
     generate_send_stream_btree_grouping_control, generate_send_stream_btree_inode_links_control,
+    generate_send_stream_exact_capacity_oracle,
     generate_send_stream_materialized_parent_index_control,
 };
 use rustc_hash::FxBuildHasher;
@@ -421,6 +422,285 @@ fn observe_ns_per_iteration(mut operation: impl FnMut(), iterations: u32) -> f64
         operation();
     }
     started.elapsed().as_secs_f64() * 1e9 / f64::from(iterations)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BufferGrowthMechanism {
+    command_frames: usize,
+    capacity_changes: usize,
+    pointer_relocations: usize,
+    relocated_live_bytes: usize,
+    final_capacity: usize,
+}
+
+fn record_buffer_growth(
+    buffer: &Vec<u8>,
+    prior_capacity: usize,
+    prior_pointer: *const u8,
+    prior_len: usize,
+    mechanism: &mut BufferGrowthMechanism,
+) {
+    if buffer.capacity() == prior_capacity {
+        return;
+    }
+    mechanism.capacity_changes += 1;
+    if prior_len > 0 && buffer.as_ptr() != prior_pointer {
+        mechanism.pointer_relocations += 1;
+        mechanism.relocated_live_bytes += prior_len;
+    }
+}
+
+/// Replay the production builder's allocation sequence over an already
+/// generated stream. Command bytes are appended as one frame after the same
+/// `reserve(full_len)` call production makes; capacity evolution is therefore
+/// identical even though the individual frame fields are already serialized.
+fn count_output_buffer_growth(stream: &[u8]) -> BufferGrowthMechanism {
+    let header_len = BTRFS_SEND_STREAM_MAGIC.len() + std::mem::size_of::<u32>();
+    assert!(
+        stream.len() >= header_len,
+        "stream contains complete header"
+    );
+    assert_eq!(
+        &stream[..BTRFS_SEND_STREAM_MAGIC.len()],
+        BTRFS_SEND_STREAM_MAGIC,
+        "stream magic changed"
+    );
+
+    let mut buffer = Vec::new();
+    let mut mechanism = BufferGrowthMechanism::default();
+    for header_part in [
+        &stream[..BTRFS_SEND_STREAM_MAGIC.len()],
+        &stream[BTRFS_SEND_STREAM_MAGIC.len()..header_len],
+    ] {
+        let prior_capacity = buffer.capacity();
+        let prior_pointer = buffer.as_ptr();
+        let prior_len = buffer.len();
+        buffer.extend_from_slice(header_part);
+        record_buffer_growth(
+            &buffer,
+            prior_capacity,
+            prior_pointer,
+            prior_len,
+            &mut mechanism,
+        );
+    }
+
+    let mut position = header_len;
+    while position < stream.len() {
+        assert!(
+            stream.len().saturating_sub(position) >= 10,
+            "stream command header is complete"
+        );
+        let payload_len = usize::try_from(u32::from_le_bytes(
+            stream[position..position + 4]
+                .try_into()
+                .expect("command length field"),
+        ))
+        .expect("u32 command length fits usize");
+        let frame_len = 10usize
+            .checked_add(payload_len)
+            .expect("command frame length fits usize");
+        let frame_end = position
+            .checked_add(frame_len)
+            .expect("command frame end fits usize");
+        assert!(frame_end <= stream.len(), "command frame is complete");
+
+        let prior_capacity = buffer.capacity();
+        let prior_pointer = buffer.as_ptr();
+        let prior_len = buffer.len();
+        buffer.reserve(frame_len);
+        record_buffer_growth(
+            &buffer,
+            prior_capacity,
+            prior_pointer,
+            prior_len,
+            &mut mechanism,
+        );
+        buffer.extend_from_slice(&stream[position..frame_end]);
+        mechanism.command_frames += 1;
+        position = frame_end;
+    }
+
+    assert_eq!(buffer, stream, "growth replay changed stream bytes");
+    mechanism.final_capacity = buffer.capacity();
+    mechanism
+}
+
+#[cfg(feature = "bench-instrumentation")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's identity, mechanism, A/A, A/B, and verdict protocol together"
+)]
+fn send_buffer_growth_ceiling_ab_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const MAX_NULL_FLOOR_RATIO: f64 = 1.10;
+
+    let items = build_deep_send_items();
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let control_stream =
+        generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+            Ok(Vec::new())
+        })
+        .expect("generate zero-capacity control stream");
+    let exact_capacity = control_stream.len();
+    let oracle_stream = generate_send_stream_exact_capacity_oracle(
+        &items,
+        subvol,
+        &uuid,
+        1,
+        exact_capacity,
+        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+    )
+    .expect("generate exact-capacity oracle stream");
+    assert_eq!(
+        control_stream, oracle_stream,
+        "exact capacity changed send-stream bytes"
+    );
+
+    let input_payload_bytes = items.iter().map(|item| item.data.len()).sum::<usize>();
+    let mechanism = count_output_buffer_growth(&control_stream);
+    println!(
+        "send_buffer_growth_mechanism,input_items={},input_payload_bytes={input_payload_bytes},stream_bytes={exact_capacity},stream_over_input_ratio={:.6},command_frames={},capacity_changes={},pointer_relocations={},relocated_live_bytes={},relocated_over_stream_ratio={:.6},final_capacity={},stream_sha256={},result=identical",
+        items.len(),
+        exact_capacity as f64 / input_payload_bytes as f64,
+        mechanism.command_frames,
+        mechanism.capacity_changes,
+        mechanism.pointer_relocations,
+        mechanism.relocated_live_bytes,
+        mechanism.relocated_live_bytes as f64 / exact_capacity as f64,
+        mechanism.final_capacity,
+        sha256_hex(&control_stream),
+    );
+
+    for _ in 0..4 {
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm zero-capacity control stream"),
+        );
+        black_box(
+            generate_send_stream_exact_capacity_oracle(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                black_box(exact_capacity),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm exact-capacity oracle stream"),
+        );
+    }
+
+    let mut control_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut oracle_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_control = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate zero-capacity control stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_oracle = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream_exact_capacity_oracle(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        black_box(exact_capacity),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate exact-capacity oracle stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let (lhs, rhs, oracle, order) = if pair_index % 2 == 0 {
+            (
+                observe_control(),
+                observe_control(),
+                observe_oracle(),
+                "AAB",
+            )
+        } else {
+            let oracle = observe_oracle();
+            let rhs = observe_control();
+            let lhs = observe_control();
+            (lhs, rhs, oracle, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        oracle_ns.push(oracle);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{oracle:.3}")
+            .expect("format send-buffer A/A+B pair");
+    }
+
+    let null_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .zip(&oracle_ns)
+        .map(|((lhs, rhs), oracle)| (lhs.midpoint(*rhs) / oracle).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio < MAX_NULL_FLOOR_RATIO
+        && speedup_summary.low > twice_null_ratio
+        && speedup_summary.low > 1.0;
+    let verdict = if admitted {
+        "ADMIT_PRODUCTION_HINT_SEARCH"
+    } else if null_floor_ratio >= MAX_NULL_FLOOR_RATIO {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_IDEAL_CEILING_BELOW_TWICE_NULL"
+    };
+    println!(
+        "send_buffer_growth_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},format=order:control_lhs_ns:control_rhs_ns:oracle_ns,values={raw_pairs}"
+    );
+    println!(
+        "send_buffer_growth_ceiling,control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},twice_null_ratio={twice_null_ratio:.6},control_over_oracle_median={:.6},control_over_oracle_ci_low={:.6},control_over_oracle_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
 }
 
 /// Retry-predicate gate for bd-btrfs-send-parent-index-azojl. This invocation
@@ -2379,6 +2659,17 @@ criterion_group!(
 );
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--send-buffer-growth-ceiling-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        #[cfg(feature = "bench-instrumentation")]
+        {
+            send_buffer_growth_ceiling_ab_only();
+            return;
+        }
+        #[cfg(not(feature = "bench-instrumentation"))]
+        panic!("--send-buffer-growth-ceiling-only requires --features bench-instrumentation");
+    }
     if std::env::args().any(|arg| arg == "--inode-links-ab-only") {
         print_bench_evidence_metadata();
         print_codegen_isa();

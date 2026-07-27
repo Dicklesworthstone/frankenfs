@@ -8343,6 +8343,14 @@ impl SendStreamBuilder {
         }
     }
 
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+            has_header: false,
+            finalized: false,
+        }
+    }
+
     /// Write the stream header (magic + version).
     /// Must be called before adding any commands.
     pub fn write_header(&mut self) {
@@ -9182,11 +9190,40 @@ where
     // decompressor) so the slice below is always in uncompressed/logical space.
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<false, false, false, F>(
+    Ok(generate_send_stream_impl::<false, false, false, false, F>(
         items,
         subvol_name,
         subvol_uuid,
         ctransid,
+        0,
+        read_extent,
+    ))
+}
+
+/// Exact-capacity oracle for the same-ELF performance harness.
+///
+/// This is not a supported application API. It supplies the final stream size
+/// before generation only to bound the maximum possible gain from eliminating
+/// output-buffer growth; production has no such oracle.
+#[cfg(feature = "bench-instrumentation")]
+#[doc(hidden)]
+pub fn generate_send_stream_exact_capacity_oracle<F>(
+    items: &[BtrfsLeafEntry],
+    subvol_name: &[u8],
+    subvol_uuid: &[u8; 16],
+    ctransid: u64,
+    exact_capacity: usize,
+    read_extent: F,
+) -> Result<Vec<u8>, ParseError>
+where
+    F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
+{
+    Ok(generate_send_stream_impl::<false, false, false, true, F>(
+        items,
+        subvol_name,
+        subvol_uuid,
+        ctransid,
+        exact_capacity,
         read_extent,
     ))
 }
@@ -9208,11 +9245,12 @@ pub fn generate_send_stream_materialized_parent_index_control<F>(
 where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<true, false, false, F>(
+    Ok(generate_send_stream_impl::<true, false, false, false, F>(
         items,
         subvol_name,
         subvol_uuid,
         ctransid,
+        0,
         read_extent,
     ))
 }
@@ -9233,11 +9271,12 @@ pub fn generate_send_stream_btree_grouping_control<F>(
 where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<false, true, false, F>(
+    Ok(generate_send_stream_impl::<false, true, false, false, F>(
         items,
         subvol_name,
         subvol_uuid,
         ctransid,
+        0,
         read_extent,
     ))
 }
@@ -9258,11 +9297,12 @@ pub fn generate_send_stream_btree_inode_links_control<F>(
 where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    Ok(generate_send_stream_impl::<false, false, true, F>(
+    Ok(generate_send_stream_impl::<false, false, true, false, F>(
         items,
         subvol_name,
         subvol_uuid,
         ctransid,
+        0,
         read_extent,
     ))
 }
@@ -9272,18 +9312,24 @@ fn generate_send_stream_impl<
     const MATERIALIZED_PRIMARY_PARENTS: bool,
     const FORCE_BTREE_INODE_GROUPS: bool,
     const FORCE_BTREE_INODE_LINKS: bool,
+    const EXACT_OUTPUT_CAPACITY: bool,
     F,
 >(
     items: &[BtrfsLeafEntry],
     subvol_name: &[u8],
     subvol_uuid: &[u8; 16],
     ctransid: u64,
+    exact_output_capacity: usize,
     mut read_extent: F,
 ) -> Vec<u8>
 where
     F: FnMut(u64, u64, u64, u8) -> Result<Vec<u8>, ParseError>,
 {
-    let mut builder = SendStreamBuilder::new();
+    let mut builder = if EXACT_OUTPUT_CAPACITY {
+        SendStreamBuilder::with_capacity(exact_output_capacity)
+    } else {
+        SendStreamBuilder::new()
+    };
     builder.write_header();
 
     // Emit subvol command

@@ -13,6 +13,61 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Btrfs-send final output buffer growth has a sub-null ideal ceiling - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional candidate preflight found no prior rejected row on
+`SendStreamBuilder::new`. Before inventing an input-derived capacity heuristic,
+a feature-gated exact-capacity oracle bounded the entire output-buffer growth
+family. Production still starts with `Vec::new()`; only the explicit
+benchmark-instrumentation entry point knows the final stream length in advance.
+
+The retained harness replays the production allocation sequence over the exact
+stream framing and counts the mechanism. On the deep-path fixture, 4,549 command
+frames produced a 3,048,915-byte stream from 1,985 items / 159,712 input-payload
+bytes. The production builder changed capacity 19 times, relocated its pointer
+15 times, and moved 4,896,289 live bytes during those relocations. The oracle
+preallocated exactly 3,048,915 bytes and eliminated that entire mechanism.
+Control and oracle emitted the identical stream, SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+
+One strict-remote x86-64-v3 release-perf invocation on pinned `ovh-a`
+(`fixmydocuments`) self-reported executing ELF
+`c7e76568411ce85285cc7a1e91d93f6eb0e3c386756ef28a79939991c2de423d`.
+The same invocation owned the A/A null control and the ideal-capacity A/B.
+Across 31 alternating `AAB`/`BAA` pairs with two complete streams per
+observation (allocation-growth count **19 vs 0**):
+
+- zero-capacity/zero-capacity A/A median was **0.995559x**, deterministic
+  bootstrap median 95% CI **[0.992484, 1.002684]**;
+- the symmetric null floor was **1.007573x** and the pre-registered twice-null
+  threshold was **1.015203x**; and
+- zero-capacity/exact-capacity median was only **1.007404x**, bootstrap median
+  95% CI **[1.001732, 1.010988]**.
+
+**REJECT_IDEAL_CEILING_BELOW_TWICE_NULL.** Even an impossible production oracle
+cannot clear twice the invocation-local null margin, so no capacity estimate or
+production allocation change ships. Ordering, command framing, attributes,
+CRCs, and every output byte are identical; tie-breaking is unchanged/N/A;
+floating point and RNG are N/A. The gate used only the bootstrap median CI over
+whole-stream wall time; CV and instruction count were not computed or consulted.
+
+Focused strict-remote release-perf send-stream tests passed **22/22** with
+`bench-instrumentation` enabled. Targeted rustfmt and `git diff --check` passed;
+the only build diagnostics were pre-existing nightly deprecations in dependency
+crates outside this change. Scoped Clippy stopped before reaching `ffs-btrfs`
+on 23 promoted nightly errors in untouched `ffs-ondisk`; neither changed file
+produced a diagnostic.
+
+**Retry predicate:** reopen output preallocation only after a current
+production-shaped witnessed-v3+PGO profile attributes at least 5% of whole-send
+wall/cycles to `SendStreamBuilder`-originated allocation growth or relocation,
+or after allocator/growth-policy drift materially changes the counted mechanism.
+Then rerun this exact-capacity ceiling first in one self-hashing, pinned-worker
+invocation with exact stream parity and at least 31 alternating A/A+B pairs.
+Do not attempt a production hint unless the ceiling's bootstrap median
+wall/cycles CI clears twice its own null log-margin; never gate on CV or
+instructions.
+
 ## Btrfs-send ordered inode-link groups replace the outer BTreeMap - 2026-07-27 (GreenSpring, KEEP)
 
 The institutional candidate preflight matched the 2026-07-13 rejected
