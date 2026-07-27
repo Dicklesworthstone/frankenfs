@@ -5,11 +5,12 @@
     clippy::cast_sign_loss
 )]
 
-//! Null-controlled whole-callback A/B for queued repair group lookup.
+//! Null-controlled whole-callback A/B for queued repair group lookup/dedup.
 //!
 //! A repair-aware flush maps every committed block to a repair group. The
-//! frozen baseline linearly scans every configured source range; production
-//! indexes valid disjoint ranges and uses `slice::partition_point`.
+//! first banked lever indexed valid disjoint ranges. This second A/B freezes
+//! that indexed + temporary-`BTreeSet` callback against compact `Vec`
+//! sort/dedup before changing production.
 
 use asupersync::Cx;
 use ffs_block::RepairFlushLifecycle;
@@ -103,12 +104,138 @@ impl LegacyQueuedRepairRefresh {
     }
 }
 
+struct IndexedTreeQueuedRepairRefresh {
+    ranges: Vec<GroupRange>,
+    queued_groups: Mutex<BTreeSet<GroupNumber>>,
+}
+
+impl IndexedTreeQueuedRepairRefresh {
+    fn new(configs: &[GroupConfig]) -> Self {
+        let mut ranges = configs
+            .iter()
+            .map(|config| GroupRange {
+                group: config.layout.group,
+                start: config.source_first_block.0,
+                end: config.source_first_block.0 + u64::from(config.source_block_count),
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start);
+        Self {
+            ranges,
+            queued_groups: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    fn on_flush_committed(&self, blocks: &[BlockNumber]) {
+        let mut groups = BTreeSet::new();
+        for block in blocks {
+            if let Some(range) = self
+                .ranges
+                .partition_point(|range| range.start <= block.0)
+                .checked_sub(1)
+                .and_then(|index| self.ranges.get(index))
+                .filter(|range| block.0 < range.end)
+            {
+                groups.insert(range.group);
+            }
+        }
+        if groups.is_empty() {
+            return;
+        }
+
+        let group_ids: Vec<u32> = groups.iter().map(|group| group.0).collect();
+        tracing::debug!(
+            target: "ffs::repair::refresh",
+            group_ids = ?group_ids,
+            block_count = blocks.len(),
+            "flush_triggers_refresh"
+        );
+
+        let mut queued = self.queued_groups.lock().expect("indexed-tree queue lock");
+        for group in groups {
+            queued.insert(group);
+        }
+    }
+
+    fn drain(&self) -> Vec<GroupNumber> {
+        let mut queued = self.queued_groups.lock().expect("indexed-tree queue lock");
+        let groups = queued.iter().copied().collect();
+        queued.clear();
+        groups
+    }
+}
+
+struct CompactVecQueuedRepairRefresh {
+    ranges: Vec<GroupRange>,
+    queued_groups: Mutex<BTreeSet<GroupNumber>>,
+}
+
+impl CompactVecQueuedRepairRefresh {
+    fn new(configs: &[GroupConfig]) -> Self {
+        let mut ranges = configs
+            .iter()
+            .map(|config| GroupRange {
+                group: config.layout.group,
+                start: config.source_first_block.0,
+                end: config.source_first_block.0 + u64::from(config.source_block_count),
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start);
+        Self {
+            ranges,
+            queued_groups: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    fn on_flush_committed(&self, blocks: &[BlockNumber]) {
+        let mut groups = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            if let Some(range) = self
+                .ranges
+                .partition_point(|range| range.start <= block.0)
+                .checked_sub(1)
+                .and_then(|index| self.ranges.get(index))
+                .filter(|range| block.0 < range.end)
+            {
+                groups.push(range.group);
+            }
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        if groups.is_empty() {
+            return;
+        }
+
+        let group_ids: Vec<u32> = groups.iter().map(|group| group.0).collect();
+        tracing::debug!(
+            target: "ffs::repair::refresh",
+            group_ids = ?group_ids,
+            block_count = blocks.len(),
+            "flush_triggers_refresh"
+        );
+
+        let mut queued = self.queued_groups.lock().expect("compact-vec queue lock");
+        for group in groups {
+            queued.insert(group);
+        }
+    }
+
+    fn drain(&self) -> Vec<GroupNumber> {
+        let mut queued = self.queued_groups.lock().expect("compact-vec queue lock");
+        let groups = queued.iter().copied().collect();
+        queued.clear();
+        groups
+    }
+}
+
 struct BenchState {
     cx: Cx,
     blocks: Vec<BlockNumber>,
     ranges: Vec<GroupRange>,
-    baseline: LegacyQueuedRepairRefresh,
-    candidate: QueuedRepairRefresh,
+    linear: LegacyQueuedRepairRefresh,
+    baseline: IndexedTreeQueuedRepairRefresh,
+    candidate: CompactVecQueuedRepairRefresh,
+    production: QueuedRepairRefresh,
 }
 
 struct PairedStats {
@@ -199,8 +326,10 @@ fn build_state() -> BenchState {
                 end: config.source_first_block.0 + u64::from(config.source_block_count),
             })
             .collect(),
-        baseline: LegacyQueuedRepairRefresh::new(&configs),
-        candidate: QueuedRepairRefresh::from_group_configs(&configs),
+        linear: LegacyQueuedRepairRefresh::new(&configs),
+        baseline: IndexedTreeQueuedRepairRefresh::new(&configs),
+        candidate: CompactVecQueuedRepairRefresh::new(&configs),
+        production: QueuedRepairRefresh::from_group_configs(&configs),
     }
 }
 
@@ -220,11 +349,11 @@ fn run_arm(state: &BenchState, arm: Arm) -> u64 {
         }
         Arm::Candidate => {
             state
-                .candidate
+                .production
                 .on_flush_committed(&state.cx, &state.blocks)
                 .expect("candidate queue callback");
             state
-                .candidate
+                .production
                 .drain_queued_groups()
                 .expect("candidate queue drain")
         }
@@ -399,8 +528,16 @@ fn main() {
 
     let state = build_state();
     let baseline = run_arm(&state, Arm::Baseline);
-    let candidate = run_arm(&state, Arm::Candidate);
-    assert_eq!(baseline, candidate, "queued group outputs diverged");
+    state.candidate.on_flush_committed(&state.blocks);
+    let candidate = checksum(&state.candidate.drain());
+    state.linear.on_flush_committed(&state.blocks);
+    let linear = checksum(&state.linear.drain());
+    let production = run_arm(&state, Arm::Candidate);
+    assert_eq!(
+        (linear, baseline, candidate, production),
+        (baseline, baseline, baseline, baseline),
+        "queued group outputs diverged"
+    );
     let (linear_comparisons, indexed_comparisons, groups) = counted_mechanism(&state);
     assert_eq!(checksum(&groups), baseline);
     println!(
@@ -408,10 +545,13 @@ fn main() {
         groups.len()
     );
     println!(
-        "mechanism_count,write_blocks={},repair_groups={},linear_range_comparisons={linear_comparisons},indexed_range_comparisons={indexed_comparisons},comparison_reduction={:.3}x",
+        "mechanism_count,write_blocks={},repair_groups={},linear_range_comparisons={linear_comparisons},indexed_range_comparisons={indexed_comparisons},comparison_reduction={:.3}x,temporary_tree_insertions={},temporary_vec_pushes={},unique_groups={}",
         state.blocks.len(),
         state.ranges.len(),
-        linear_comparisons as f64 / indexed_comparisons as f64
+        linear_comparisons as f64 / indexed_comparisons as f64,
+        state.blocks.len(),
+        state.blocks.len(),
+        groups.len()
     );
 
     let batch = calibrate_batch(&state);
@@ -420,8 +560,8 @@ fn main() {
     );
     let null = paired(&state, Arm::Baseline, Arm::Baseline, batch);
     let real = paired(&state, Arm::Baseline, Arm::Candidate, batch);
-    print_stats("null_baseline_baseline", &null);
-    print_stats("real_baseline_candidate", &real);
+    print_stats("null_indexed_tree_indexed_tree", &null);
+    print_stats("real_indexed_tree_production_compact_vec", &real);
 
     let null_floor = null.ratio_ci.1.max(null.ratio_ci.0.recip());
     let twice_null_threshold = null_floor * null_floor;

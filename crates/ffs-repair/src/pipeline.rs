@@ -377,8 +377,8 @@ impl QueuedRepairRefresh {
         }
     }
 
-    fn groups_for_blocks(&self, blocks: &[BlockNumber]) -> BTreeSet<GroupNumber> {
-        let mut groups = BTreeSet::new();
+    fn groups_for_blocks(&self, blocks: &[BlockNumber]) -> Vec<GroupNumber> {
+        let mut groups = Vec::with_capacity(blocks.len());
         for block in blocks {
             let range = if self.group_ranges_are_disjoint {
                 self.group_ranges
@@ -392,9 +392,11 @@ impl QueuedRepairRefresh {
                     .find(|range| block.0 >= range.start && block.0 < range.end)
             };
             if let Some(range) = range {
-                groups.insert(range.group);
+                groups.push(range.group);
             }
         }
+        groups.sort_unstable();
+        groups.dedup();
         groups
     }
 
@@ -5366,10 +5368,10 @@ mod tests {
         }];
         let queue = QueuedRepairRefresh::from_group_configs(&configs);
 
-        // Block 10 is in group 0's source range.
+        // Repeated blocks in group 0's source range still queue it once.
         let cx = Cx::for_testing();
         queue
-            .on_flush_committed(&cx, &[BlockNumber(10)])
+            .on_flush_committed(&cx, &[BlockNumber(10), BlockNumber(11), BlockNumber(10)])
             .expect("flush");
         let drained = queue.drain_queued_groups().expect("drain");
         assert_eq!(drained, vec![GroupNumber(0)]);
