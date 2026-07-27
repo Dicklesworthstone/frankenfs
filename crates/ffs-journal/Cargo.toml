@@ -6,6 +6,9 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+bench-instrumentation = []
+
 [dependencies]
 asupersync = { workspace = true }
 crc32c = { workspace = true }

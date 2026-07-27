@@ -13,6 +13,79 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Grouped JBD2 run assembly is below the profile-admission floor - 2026-07-27 (GreenSpring, SURFACE / NOT ADMITTED)
+
+The institutional preflight passed the qualified surface
+`jbd2_same_transaction_run_assembly_memcpy_after_grouping`. The required family
+grep also recovered the existing same-transaction descriptor/data grouping and
+the closed cross-transaction group-commit and pwritev families, so this profile
+did not re-derive either frontier. It asked one narrower question: after
+grouping was kept, is assembling the contiguous descriptor-plus-payload buffer
+now expensive enough to justify scatter/gather?
+
+The retained report-only route exercises the actual grouped
+`Jbd2Writer::commit_transaction` path for 2,048 samples, each containing 64
+full-size payload blocks. Before profiling, the same process ran the frozen
+scalar-write oracle and grouped production path and asserted byte-for-byte
+equality over the 524,288-byte journal region.
+
+**Counted mechanism:** current assembly performs allocation count **1** and
+copies one 4 KiB descriptor plus 64 4 KiB payloads, **266,240 bytes total**, per
+descriptor group before the existing single contiguous device write.
+
+The final-source strict-remote x86-64-v3 release-perf process ran on pinned
+`vmi1149989` and self-reported executing ELF SHA-256 `75cb7e80d11bcda59006ec7ee7c291295d14f1279747af78215604b81467ea1a`
+(3,763,336 bytes), with compile/runtime SSE4.2, AVX2, and FMA. `/data` had
+**435G** free before the replay, and RCH used a worker-scoped target without
+local fallback.
+
+`perf record -F 999 -g --call-graph fp` followed by
+`perf report --children` attributed:
+
+- `jbd2_write_combining::run_production_commit`: **2.98%**;
+- `Cx::checkpoint`: **1.25%** and **0.84%** symbol variants;
+- `stamp_jbd2_tag_data_checksum`: **0.18%**; and
+- `assemble_jbd2_descriptor_data_run`: **0.12%**.
+
+**SURFACE / NOT ADMITTED; no production lever.** The named assembly frame is
+only **0.12%**, far below the pre-registered **5.00%** attribution floor. Even
+impossible elimination of the entire named frame is below campaign
+resolution, so no scatter/gather or pwritev candidate was implemented and no
+A/B ratio is published. The run explicitly reported
+`ratio_published=false`; A/A and bootstrap median-CI gates become applicable
+only after a candidate clears attribution. CV and instruction count were not
+decision inputs.
+
+An independent pre-Clippy-refactor invocation self-reported ELF
+`0c938e09eaa30fa52461326f26f6a485e8985a5cc699d5d410d6d29b6cc4ef82`
+and attributed **0.07%** to the same assembly frame. The final-source replay is
+the primary result; the two profiles are reported separately and were not
+pooled.
+
+The feature-gated named helper is retained as attribution infrastructure.
+Normal production builds request inlining, while `bench-instrumentation`
+forces a stable out-of-line frame. Descriptor/payload order, transaction
+boundaries, contiguous write count, checksums, journal bytes, and crash
+semantics are unchanged.
+
+Strict-remote focused tests passed **277/277**. Scoped library-plus-benchmark
+Clippy passed with only the reproduced `incompatible_msrv` category allowed;
+all-targets Clippy passed with the reproduced baseline categories
+`incompatible_msrv`, `significant_drop_tightening`, and `too_many_lines`
+allowed and every other warning denied. Targeted rustfmt and
+`git diff --check` passed.
+
+**Retry predicate:** retry run-copy elimination only when a fresh symbolized
+production-shaped profile attributes at least 5% children or self time to
+`assemble_jbd2_descriptor_data_run` on an observed descriptor-group
+cardinality. Then require one self-hashing same-worker x86-64-v3 A/A+B
+invocation, exact journal bytes plus crash/replay parity, a counted
+allocation/copy/syscall mechanism, and a bootstrap median wall/cycles CI
+clearing twice its own null log-margin with at least a 5% saved-fraction lower
+bound. Never gate on CV or instruction count, and do not reopen
+cross-transaction group commit unless its separate durability predicate is
+met.
+
 ## Lazy queued group-id tracing is below the whole-callback null floor - 2026-07-27 (GreenSpring, REJECT)
 
 The qualified institutional preflight found no prior REJECT on

@@ -28,6 +28,7 @@ use std::fs::File;
 use std::hint::black_box;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 const BLOCK_SIZE: usize = 4096;
@@ -351,9 +352,189 @@ fn print_gate(label: &str, null: &PairedStats, real: &PairedStats, direction_lab
     );
 }
 
+fn make_grouped_production_device(file: &File) -> ByteBlockDevice<FileByteDevice> {
+    let production_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    ByteBlockDevice::new(
+        FileByteDevice::open(&production_path).expect("open grouped memfd"),
+        u32::try_from(BLOCK_SIZE).expect("block size fits u32"),
+    )
+    .expect("build grouped block device")
+}
+
+fn profile_only() {
+    const PROFILE_SAMPLES: usize = 2_048;
+    let device_bytes = usize::try_from(DEVICE_BLOCKS)
+        .expect("device blocks fit usize")
+        .checked_mul(BLOCK_SIZE)
+        .expect("device byte length");
+    let file = make_device(device_bytes);
+    let grouped_device = make_grouped_production_device(&file);
+    let cx = Cx::for_testing();
+    let txn = make_transaction();
+    let mut checksum = 0_u64;
+    for sample in 0..PROFILE_SAMPLES {
+        checksum ^= black_box(run_production_commit(&grouped_device, &cx, &txn))
+            .rotate_left((sample % u64::BITS as usize) as u32);
+    }
+    black_box(checksum);
+}
+
+fn profile_percent(report: &str, symbol: &str) -> Option<f64> {
+    report
+        .lines()
+        .filter(|line| line.contains(symbol))
+        .filter_map(|line| {
+            line.split_whitespace().find_map(|field| {
+                field
+                    .strip_suffix('%')
+                    .and_then(|percent| percent.parse::<f64>().ok())
+            })
+        })
+        .reduce(f64::max)
+}
+
+fn spawn_profile_report() {
+    const ATTRIBUTION_FLOOR_PCT: f64 = 5.0;
+    let exe = std::env::current_exe().expect("bench executable");
+    let executable_name = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("bench executable file name");
+    let record = Command::new("perf")
+        .args([
+            "record",
+            "-q",
+            "-F",
+            "999",
+            "-g",
+            "--call-graph",
+            "fp",
+            "-o",
+            "-",
+        ])
+        .arg("--")
+        .arg(&exe)
+        .arg("--profile-only")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn();
+    let Ok(mut record) = record else {
+        println!("profile_blocker=perf_record_unavailable");
+        return;
+    };
+    let perf_data = record.stdout.take().expect("perf pipe");
+    let report = Command::new("perf")
+        .args([
+            "report",
+            "-q",
+            "--stdio",
+            "--children",
+            "-i",
+            "-",
+            "--percent-limit",
+            "0",
+            "--dsos",
+        ])
+        .arg(executable_name)
+        .env("DEBUGINFOD_URLS", "")
+        .stdin(Stdio::from(perf_data))
+        .output();
+    let Ok(report) = report else {
+        println!("profile_blocker=perf_report_unavailable");
+        let _ = record.wait();
+        return;
+    };
+    let Ok(record_status) = record.wait() else {
+        println!("profile_blocker=perf_record_wait_failed");
+        return;
+    };
+    let text = String::from_utf8_lossy(&report.stdout);
+    println!("profile_frame_table_begin\n{text}profile_frame_table_end");
+
+    let mut frames: Vec<(f64, String)> = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pct = fields.next()?.strip_suffix('%')?.parse::<f64>().ok()?;
+            let symbol = line.split("] ").nth(1).unwrap_or("?").trim();
+            Some((pct, symbol.chars().take(70).collect::<String>()))
+        })
+        .collect();
+    frames.sort_by(|a, b| b.0.total_cmp(&a.0));
+    frames.truncate(15);
+    let mut top = String::new();
+    for (pct, symbol) in &frames {
+        if !top.is_empty() {
+            top.push(';');
+        }
+        write!(&mut top, "{pct:.2}%={symbol}").expect("format top frame");
+    }
+    println!("profile_top_frames,mode=grouped_jbd2,frames={top}");
+
+    if !record_status.success() || !report.status.success() {
+        println!(
+            "profile_blocker=perf_permission_denied,record_status={record_status},report_status={}",
+            report.status
+        );
+        return;
+    }
+    let assembly_pct = profile_percent(&text, "assemble_jbd2_descriptor_data_run").unwrap_or(0.0);
+    let admitted = assembly_pct >= ATTRIBUTION_FLOOR_PCT;
+    println!(
+        "profile_target_attribution,assembly_children_pct={assembly_pct:.6},attribution_floor_pct={ATTRIBUTION_FLOOR_PCT:.6},admitted={admitted}"
+    );
+    if !admitted {
+        println!("profile_blocker=assembly_below_attribution_floor");
+    }
+}
+
+fn run_profile_report_only() {
+    println!(
+        "profile_scope=source_attribution_only,ratio_published=false,aa_gate=not_applicable,gate_basis=numeric_self_time,cv_used_as_gate=false,instructions_used_as_gate=false"
+    );
+    let device_bytes = usize::try_from(DEVICE_BLOCKS)
+        .expect("device blocks fit usize")
+        .checked_mul(BLOCK_SIZE)
+        .expect("device byte length");
+    let production_file = make_device(device_bytes);
+    let production_path = format!("/proc/self/fd/{}", production_file.as_raw_fd());
+    let scalar_device = ScalarWriteDevice(
+        ByteBlockDevice::new(
+            FileByteDevice::open(&production_path).expect("open scalar memfd"),
+            u32::try_from(BLOCK_SIZE).expect("block size fits u32"),
+        )
+        .expect("build scalar block device"),
+    );
+    let grouped_device = make_grouped_production_device(&production_file);
+    let cx = Cx::for_testing();
+    let txn = make_transaction();
+    black_box(run_production_commit(&scalar_device, &cx, &txn));
+    let scalar_journal = read_journal_bytes(&production_file);
+    black_box(run_production_commit(&grouped_device, &cx, &txn));
+    let grouped_journal = read_journal_bytes(&production_file);
+    assert_eq!(
+        scalar_journal, grouped_journal,
+        "production grouped journal bytes diverged from scalar"
+    );
+    println!(
+        "production_behavior_parity=exact,writes_per_txn={DATA_BLOCKS},journal_bytes={}",
+        scalar_journal.len()
+    );
+    spawn_profile_report();
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--profile-only") {
+        profile_only();
+        return;
+    }
     println!("bench_elf_sha256={}", self_identity());
     print_codegen_isa();
+    if std::env::args().any(|arg| arg == "--profile-report-only") {
+        run_profile_report_only();
+        return;
+    }
 
     let file = make_device(REGION_BYTES);
     let region = make_region();
@@ -404,11 +585,7 @@ fn main() {
         )
         .expect("build scalar block device"),
     );
-    let grouped_device = ByteBlockDevice::new(
-        FileByteDevice::open(&production_path).expect("open grouped memfd"),
-        u32::try_from(BLOCK_SIZE).expect("block size fits u32"),
-    )
-    .expect("build grouped block device");
+    let grouped_device = make_grouped_production_device(&production_file);
     assert!(!scalar_device.supports_contiguous_writes());
     assert!(grouped_device.supports_contiguous_writes());
 

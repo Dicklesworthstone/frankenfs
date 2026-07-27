@@ -1075,6 +1075,27 @@ pub struct Jbd2Writer {
     csum_seed: u32,
 }
 
+#[cfg_attr(feature = "bench-instrumentation", inline(never))]
+#[cfg_attr(not(feature = "bench-instrumentation"), inline)]
+fn assemble_jbd2_descriptor_data_run(
+    descriptor: &[u8],
+    chunk: &[(BlockNumber, bool, Cow<'_, [u8]>)],
+    block_size: usize,
+) -> Result<Vec<u8>> {
+    let run_len = chunk
+        .len()
+        .checked_add(1)
+        .and_then(|blocks| blocks.checked_mul(block_size))
+        .ok_or_else(|| FfsError::Format("JBD2 descriptor/data write length overflow".to_owned()))?;
+    let mut run = Vec::with_capacity(run_len);
+    run.extend_from_slice(descriptor);
+    for (_, _, padded) in chunk {
+        run.extend_from_slice(padded);
+    }
+    debug_assert_eq!(run.len(), run_len);
+    Ok(run)
+}
+
 impl Jbd2Writer {
     /// Create a writer for an empty journal region starting at `start_seq`.
     #[must_use]
@@ -1462,21 +1483,7 @@ impl Jbd2Writer {
                         });
 
                     if dev.supports_contiguous_writes() && physically_contiguous {
-                        let run_len = chunk
-                            .len()
-                            .checked_add(1)
-                            .and_then(|blocks| blocks.checked_mul(bs))
-                            .ok_or_else(|| {
-                                FfsError::Format(
-                                    "JBD2 descriptor/data write length overflow".to_owned(),
-                                )
-                            })?;
-                        let mut run = Vec::with_capacity(run_len);
-                        run.extend_from_slice(&desc);
-                        for (_, _, padded) in &chunk {
-                            run.extend_from_slice(padded);
-                        }
-                        debug_assert_eq!(run.len(), run_len);
+                        let run = assemble_jbd2_descriptor_data_run(&desc, &chunk, bs)?;
                         dev.write_contiguous_blocks(cx, desc_block, &run)?;
                     } else {
                         dev.write_block(cx, desc_block, &desc)?;
