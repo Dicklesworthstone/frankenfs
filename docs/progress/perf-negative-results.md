@@ -13,6 +13,82 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Ext4 names-only external result-vector merge is below the null and 5% floors - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional preflight found no prior REJECT on the qualified
+`Ext4ImageReader::list_xattr_names` external-vector merge surface. The family
+grep did recover two adjacent closed families and kept them separate:
+
+- the 2026-07-13 rejected second full-`Ext4Xattr` parser result vector; and
+- the list-24/list-64/list-128 direct-FUSE-wire retries.
+
+This experiment changed neither family. The actual production control parsed
+four inode-body names into its result, parsed 128 external-block names into a
+second `Vec<String>`, and moved those 128 string objects into the first vector
+with `extend`. The source-neutral model retained the same first vector and
+parser semantics but appended external names directly.
+
+The one-process proof covered:
+
+- exact complete output: 132 names, checksum `b5a030122573b5dd`;
+- exact ibody-first then external ordering;
+- all declared namespace prefixes plus the unknown prefix;
+- invalid UTF-8 lossiness;
+- the counted mechanism: **one temporary external vector and 128 moved
+  `String` objects to zero**; and
+- 31 alternating `AAB`/`BAA` pairs with min-of-three batch observations.
+
+The strict-remote pinned `vmi1149989` process self-reported x86-64-v3
+release-perf ELF SHA-256
+`a47eff4b6e296ed173cfee231fefbe57439d9c7673ddb36c43b61e8b7bd75fda`
+(15,477,760 bytes), with compile/runtime SSE2, SSE4.2, AVX2, and FMA.
+`/data` had 410G free before both Cargo requests, and RCH used only its remote
+worker-scoped target.
+
+Production/materialized over direct-append measured:
+
+- median **1.021639x**;
+- bootstrap median 95% CI **[1.017085, 1.035235]**; and
+- saved-fraction lower bound **0.016798**, below the required **0.05**.
+
+The same invocation's production/production A/A measured median
+**0.990247x**, bootstrap median CI **[0.970793, 1.005216]**, symmetric null
+floor **1.030085x** versus the maximum **1.025x**, and twice-null threshold
+**1.061076x**. The decision used only the deterministic 20,000-resample
+bootstrap median CI over wall time. CV and instruction count were not decision
+inputs.
+
+**REJECT before production edit.** The model failed the A/A floor, twice-null
+threshold, and 5% saved-fraction lower bound. Production still returns
+`parse_xattr_block_names` into a temporary vector and extends it. The hidden
+contract and feature-gated noinline attributes remain only so the rejected
+boundary is mechanically replayable; normal production behavior is unchanged.
+
+The current mounted list-128 profile remains useful context: it attributes
+25.24% self-time to `parse_xattr_entry_names`, but that number includes the
+whole per-name parser and string construction and does not attribute 5% to this
+top-level vector. A new report-only profile attempt was refused before
+execution because the pinned worker reached RCH queue timeout; strict remote
+prevented local fallback, so no new profile percentage is claimed.
+
+Strict-remote focused xattr tests passed **29/29**, and the adversarial xattr
+corpus passed **1/1**. The owned library-plus-benchmark Clippy target passed
+with every warning denied after allowing only eight categories reproduced in
+the untouched library before the benchmark was checked. The benchmark passed
+targeted rustfmt and `git diff --check`; whole-file `ext4.rs` rustfmt remains
+blocked by unrelated existing drift.
+
+**Retry predicate:** retry only when a fresh allocator/symbolized production
+profile directly attributes at least 5% of whole `list_xattr_names` wall/cycles
+to allocation, growth, movement, or drop of the temporary external result
+vector itself—not per-name strings or parsing—or when a real multi-inode caller
+batch exposes at least the same one-vector-per-inode fraction. Use that observed
+shape in one self-hashing same-worker v3+PGO A/A+B invocation and require exact
+ordered names/errors, an A/A symmetric floor at most 1.025x, a bootstrap median
+wall/cycles CI clearing twice its own null log-margin, and at least a 5%
+saved-fraction lower bound. The separate direct-wire predicate must also be met
+before reopening wire encoding. Never gate on CV or instruction count.
+
 ## Grouped JBD2 run assembly is below the profile-admission floor - 2026-07-27 (GreenSpring, SURFACE / NOT ADMITTED)
 
 The institutional preflight passed the qualified surface

@@ -5820,6 +5820,7 @@ impl Ext4ImageReader {
     /// per-value `Vec` allocations `listxattr` would immediately discard. Like
     /// the by-name finders (bd-abu3z), a corrupt UNRELATED value can no longer
     /// abort the name listing (a strict superset of a consistent inode's names).
+    #[cfg_attr(feature = "bench-instrumentation", inline(never))]
     pub fn list_xattr_names(
         &self,
         image: &[u8],
@@ -6395,6 +6396,7 @@ pub fn parse_xattr_block(block_data: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError
 /// region — so a corrupt UNRELATED value can no longer abort a `listxattr` (a
 /// strict superset of the names a consistent block resolves, consistent with
 /// the by-name finders, bd-abu3z).
+#[cfg_attr(feature = "bench-instrumentation", inline(never))]
 fn parse_xattr_entry_names(data: &[u8]) -> Result<Vec<String>, ParseError> {
     let mut names = Vec::new();
     let mut offset = 0_usize;
