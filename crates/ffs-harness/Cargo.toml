@@ -62,5 +62,9 @@ harness = false
 name = "ffs-harness"
 path = "src/main.rs"
 
+[[bin]]
+name = "ffs-mounted-kernel-bench"
+path = "src/bin/ffs_mounted_kernel_bench.rs"
+
 [lints]
 workspace = true

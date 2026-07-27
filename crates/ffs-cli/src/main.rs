@@ -8386,6 +8386,15 @@ fn start_mount_background_scrub(
 
 #[allow(clippy::too_many_lines)]
 fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) -> Result<()> {
+    if env_bool("FFS_MOUNT_BENCH_EVIDENCE", false)? {
+        let sha = elf_self_sha256().context("self-hash executing mounted benchmark ELF")?;
+        eprintln!("mount_bench_evidence,binary_sha256={sha}");
+        eprintln!(
+            "mount_build_profile,pgo_profile_sha256={}",
+            option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+        );
+    }
+
     let auto_unmount = env_bool("FFS_AUTO_UNMOUNT", true)?;
     let requested_runtime = options.runtime;
     let operation_id = mount_operation_id(

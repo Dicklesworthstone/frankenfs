@@ -13,6 +13,118 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Mounted-kernel Rust arm produces an honest ext4 warm-stat loss; btrfs remains null-blocked - 2026-07-27 (GreenSpring, vs-INCUMBENT instrument KEEP)
+
+This row banks an instrument, not a FrankenFS optimization or self-speedup.
+The mounted-kernel arm now runs two independent real-kernel mounts and two
+independent FrankenFS FUSE mounts in the same process. It therefore supplies
+both incumbent/candidate A/B and one A/A null control for each side without
+using a shared component as the baseline.
+
+The institutional preflight was run before this surface was opened. A broad
+`mounted stat` proposal correctly recovered the closed readdirplus/cache
+REJECT and its recorded reopening condition, so that lever was not re-derived. The qualified
+measurement-only surface passed:
+
+```text
+preflight: OK — no prior REJECT covers surface=[ffs_mounted_kernel_bench runtime mount identity ELF provenance interleaved comparator harness] proposal=[measurement-only four independent mount comparator driver with incumbent and candidate A/A]
+```
+
+### Runtime contract
+
+Each filesystem invocation owns four separately cloned images and four unique
+mountpoints. Before measuring, the harness proves:
+
+- `kernel_a` and `kernel_b` are real kernel `ext4` or `btrfs` mounts backed by
+  distinct declared loop devices, distinct image paths, and distinct mounted
+  superblock device identities;
+- `fuse_a` and `fuse_b` are `fuse.ffs` mounts backed by distinct images and
+  distinct daemon PIDs;
+- each FUSE daemon's in-process self-reported ELF SHA-256 equals both
+  `/proc/<pid>/exe` and the preflight-approved candidate SHA-256;
+- the executing Rust driver also self-hashes;
+- all four arms return identical payload SHA-256, length, mode, uid, gid, and
+  link count before timing; and
+- the kernel and FUSE arms use the common read-only `ro,noatime,nodev,nosuid`
+  contract. Ext4 additionally uses kernel `noload`; FrankenFS disables
+  background scrub and writeback cache. The workload performs no mutation, so
+  the matched durability contract is `read_only_no_mutation`.
+
+The driver pins itself to a quiet CPU and pins both serially exercised FUSE
+daemons to the same separate quiet physical CPU in the driver's last-level
+cache domain. It samples both SMT sibling sets and aborts if any selected
+physical core is above its pre-registered occupancy ceiling. One invocation
+then runs exactly 32 balanced four-arm rounds, interleaving all arms and
+rotating all orders equally. Each observation is the minimum of three
+executions of 2,000 warm `stat` calls. The decision input is wall time only. A
+deterministic 20,000-resample bootstrap median 95% CI gates each A/A control
+and the competitive ratio; `cv_used=false` and `instructions_used=false`.
+All requested filesystems run and write their raw report before a failed null
+gate returns exit 2.
+
+The measured candidate is the production-shaped x86-64-v3+PGO
+`release-perf` `ffs-cli`. Each FUSE daemon self-reported executing ELF
+SHA-256
+`9b5e0f5ffc2866a1e281abea72f7790bb58401815e296c307f722642b0d89e9c`
+and PGO profile SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The incumbent identity was Linux `6.17.0-35-generic`.
+The executing final-source harness self-reported ELF SHA-256 `7099f14070d0e78851e30988c5c55a825a54e259fe8afbf6ec8d06e998454e40`.
+
+### Honest result
+
+| Filesystem | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel bootstrap median 95% CI | Verdict |
+| --- | --- | --- | --- | --- |
+| ext4 | `0.998996x [0.998100, 1.000246]`, symmetric spread `1.001903x` | `0.999638x [0.998008, 1.001696]`, symmetric spread `1.001996x` | **`5.033559x [5.023263, 5.050188]` slower** | Honest; both null CIs contain 1 and both spreads are below `1.025x` |
+| btrfs | `1.001833x [0.999823, 1.003129]`, symmetric spread `1.003129x` | `0.996028x [0.994686, 0.998294]`, symmetric spread `1.005342x` | Not admissible (`4.931910x [4.921023, 4.943701]` observed internally) | **BLOCKED-NULL**; the FUSE A/A CI excludes 1 |
+
+The current correct claim is narrowly scoped: on this 2,000-operation
+read-only warm-stat workload, the production x86-64-v3+PGO FrankenFS FUSE
+mount is **5.033559x slower than kernel ext4, bootstrap median 95% CI
+[5.023263, 5.050188]**. There is no current admissible btrfs competitive
+number because its final-source A/A gate did not clear. This is direct
+vs-incumbent evidence: **0 wins / 1 loss / 0 neutral**, with btrfs unscored. It
+is not a self-speedup and no source lever was applied.
+
+All final-source arms returned payload SHA-256
+`edc918914d9862e5c2a6193ed293fe1de2f319a8b4124ee9acbcd4926b3f4189`
+with identical metadata across all four arms. The ext4 images passed
+post-unmount `e2fsck`; the btrfs images passed post-unmount `btrfs check`.
+The combined machine-readable report, including every raw wall sample, runtime
+identity, CPU/LLC placement, admitted ext4 row, and rejected btrfs row, is
+`/data/tmp/frankenfs-mounted-kernel/run_1785188339_332893/mounted-kernel-report.json`.
+
+### Bring-up results that were not admissible
+
+These outcomes shaped the fail-closed contract but are not competitive
+measurements:
+
+| Attempt | Result | Disposition and concrete retry predicate |
+| --- | --- | --- |
+| FUSE mountpoints under `/data/tmp` | `fusermount3: mount failed: Permission denied`; enforced AppArmor permits the mount helper under `/tmp/**`, not `/data/tmp/**`. | **BLOCKED-ENVIRONMENT.** Retry only with all images/evidence retained under `/data/tmp`, all four mountpoints under an allowed path, and otherwise identical mount options. The final runs satisfy this with `/tmp/frankenfs-mounted-kernel-mounts`. |
+| First ext4 run after mount-path correction | Selected FUSE CPU measured `36.7%` busy, above the `35%` preflight ceiling; no timed ratio was admitted. | **BLOCKED-CONTENTION.** Retry only after a fresh occupancy sample selects distinct driver/FUSE CPUs below the ceiling. Both final runs satisfy it. |
+| Early ext4 timing | Kernel A/A bootstrap median 95% CI `[1.001049, 1.003365]` excluded 1; no competitive point estimate was admitted. | **BLOCKED-NULL.** Retry only with a quiet pinned core and an exactly balanced four-order schedule whose kernel and FUSE A/A CIs both contain 1 and have symmetric spread at most `1.025x`. The final ext4 run satisfies it. |
+| 31-round ext4 prototype | It emitted `5.037058x [5.028123, 5.071204]` with clear nulls, but 31 rounds cannot balance four orders exactly. | **VOID-SCHEDULE; never publish or pool.** Retry only with a positive pair count divisible by four and equal counts for every arm position. The final 32-round ext4 run satisfies it. |
+| First btrfs identity check | Btrfs mountinfo exposed anonymous major:minor `0:124`, so looking that value up as a loop device failed before timing. | **BLOCKED-IDENTITY.** Retry only after resolving the declared mount source loop device through `/sys/class/block/<loop>/loop/backing_file` and proving it matches the arm image. The final btrfs run satisfies it. |
+| Early btrfs timing | Identical FUSE arms produced an approximately `1.273x` A/A point ratio when their daemons could land on different cores; no competitive point estimate was admitted. | **BLOCKED-NULL; never publish or pool.** Retry only with both serially exercised daemons pinned to the same quiet physical CPU plus the exact balanced schedule and the same `1.025x` CI gate. The final harness satisfies the placement predicate, though its final btrfs measurements remain null-blocked. |
+| Root-invoked driver | Elevating the whole driver caused the candidate mount to appear as generic `fuse`, so the required runtime `fuse.ffs` identity assertion stopped the run before timing. | **BLOCKED-IDENTITY.** Run the driver as the invoking user and elevate only the kernel mount/unmount commands internally. All later runs satisfy this predicate. |
+| Cross-CCD combined run, harness ELF `b89d11db87aa2ec0286b2c30bd62e80df2dd7a5e575b355ec5727e89866d9b91` | Clear A/A controls accompanied apparent ext4 `6.509070x [6.494282, 6.515157]` and btrfs `6.460477x [6.451439, 6.467185]` losses, but the driver ran on CPU 0 and FUSE on CPU 24 in different L3/CCD domains. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785187240_273792/mounted-kernel-report.json`. | **VOID-TOPOLOGY; never publish or pool.** Same-side A/A cannot detect a bias shared by both FUSE arms. Retry only when driver and FUSE cores share the same last-level-cache domain and both physical cores' SMT siblings are quiet. The final harness enforces this mechanically. |
+| Pre-final separate ext4 and btrfs runs, harness ELF `9a22b69b6da25ee28a14a22761d20d5c23d8dabadade1782819e216621606e08` | Clear A/A controls produced ext4 `4.998240x [4.991335, 5.011338]` and btrfs `4.951192x [4.947170, 4.956124]`. Reports: `/data/tmp/frankenfs-mounted-kernel/run_1785185833_160264/mounted-kernel-report.json` and `/data/tmp/frankenfs-mounted-kernel/run_1785185816_153813/mounted-kernel-report.json`. | **SUPERSEDED-SOURCE; retain internally, not the current claim.** Retry with the exact committed harness that mechanically requires same-LLC placement and preserves reports before returning exit 2. The final-source ext4 run satisfies this; final-source btrfs remains null-blocked. |
+| Same-LLC combined run, harness ELF `e63c31f663ba05a16d031e5e5d5c0356aae26836290639a399bf5f6f68267b39` | Ext4 cleared both nulls and observed `5.012652x [5.006774, 5.020606]`; btrfs FUSE A/A `0.998178x [0.996967, 0.998891]` excluded 1. The then-current error path returned before persisting the mixed-verdict report. | **BLOCKED-EVIDENCE for the combined artifact.** Retry only after every requested filesystem runs and the complete raw report is written before exit 2. Harness ELF `7099f140…54e40` implements that contract. |
+| First report-preserving combined run, harness ELF `7099f14070d0e78851e30988c5c55a825a54e259fe8afbf6ec8d06e998454e40` | Ext4 kernel A/A `[0.997289, 0.999878]` and btrfs FUSE A/A `[1.001021, 1.002657]` excluded 1, so neither observed competitive ratio was admitted. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785188310_331136/mounted-kernel-report.json`. | **BLOCKED-NULL.** The predeclared retry was a fresh zero-load placement in the same LLC with both SMT sibling sets guarded; the next unchanged-ELF invocation applied it. |
+| Second report-preserving combined run, same ELF | Ext4 cleared both A/A controls and admitted the current `5.033559x [5.023263, 5.050188]` loss. Btrfs FUSE A/A `[0.994686, 0.998294]` excluded 1, so its observed `4.931910x [4.921023, 4.943701]` ratio is unscored. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785188339_332893/mounted-kernel-report.json`. | **EXT4 HONEST / BTRFS BLOCKED-NULL.** Do not pool the btrfs point estimate with any other run. |
+| Third final-ELF btrfs attempt | FUSE A/A cleared, but kernel A/A `0.999286x [0.998196, 0.999924]` excluded 1; observed `4.960432x [4.958407, 4.963746]` remains unscored. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785188398_345293/mounted-kernel-report.json`. | **BLOCKED-NULL; stop this vein after three final-ELF rejects.** Retry btrfs only after continuous per-arm CPU attribution or another counted mechanism explains and removes the alternating kernel/FUSE A/A asymmetry; then require both same-invocation median CIs to contain 1. A fresh placement alone is no longer a sufficient retry predicate. |
+
+**KEEP the instrument. Retry predicate for replacing the ext4 number:** use the
+same four-independent-arm, same-invocation, runtime-identity,
+production-v3+PGO self-report, exact-parity, matched mount/durability,
+interleaved-order, same-LLC quiet-core contract; require both A/A bootstrap
+median 95% CIs to contain 1 with symmetric spread at most `1.025x`; and gate
+the new wall/cycles ratio on its bootstrap median CI with `cv_used=false` and
+`instructions_used=false`. For btrfs, first satisfy the stronger counted-attribution
+predicate in the final bring-up row. A different workload may add a separately
+scoped claim but does not supersede this warm-stat result.
+
 ## Borrowed extent-item refcount payload clears the null and 5% floors - 2026-07-27 (GreenSpring, KEEP)
 
 The institutional preflight found no prior decision on the exact
