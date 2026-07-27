@@ -1,15 +1,16 @@
 # bd-b9dug — the benchmarked binary is not the shipped binary
 
 **Initial audit: 2026-07-25, with ISA-only pairs on pinned worker `hz2`.
-Exact CLI lookup follow-up: 2026-07-27 on pinned worker `ovh-a`.**
+Exact CLI lookup and create follow-ups: 2026-07-27 on pinned worker `ovh-a`.**
 
 Unless its row proves otherwise from the executing process, every historical
 frankenfs performance ratio published before this correction was measured on a
 binary that is **not** the one `scripts/build-perf.sh` produces. The first
 follow-up measured the ISA-only residual for two owned benchmark families. The
 second closes exact production-shaped v3+PGO identity for one CLI lookup
-workload. It does **not** convert unrelated generic-ELF or kernel-comparator
-claims into shipped-binary results.
+workload. A third measures the same build delta for one offline
+persisted-create workload. Neither converts unrelated generic-ELF or
+kernel-comparator claims into shipped-binary results.
 
 ---
 
@@ -110,6 +111,65 @@ twice-null threshold of 1.122973x. The real lower bound cleared that
 invocation's own threshold. This confirmation is separately admissible; it
 does not replace the first measurement with a pooled estimate.
 
+### Exact production-shaped persisted-create witness
+
+The follow-up reused the shipping code-generation shape on the same pinned
+strict-remote `ovh-a` worker, but generated a workload-matched profile before
+measuring create. The profile-generation corpus contained 6,000 creates,
+1,000,000 lookups, 2,000 renames, 2,000 deletes, and one walk. The merged
+28,739,968-byte profile had SHA-256
+`ec01cb1f413a6fa7260df6de74a4b722b8200e957fd7804871429e2ac0075da4`.
+
+| role | executing ELF SHA-256 | compile-time ISA | embedded profile SHA-256 |
+|---|---|---|---|
+| generic release-perf control | `65bca08591dcdf4b8257f0386cbfcca4f9f4ac3624be4a96a837ea088c7f0866` | SSE2; no SSE4.2/AVX2/FMA | `none` |
+| v3 profile-generation CLI | `d1c03d4b19e09a554f865b020083dd5e744a8f5db6f4a180cae7a5302e4bad4a` | SSE2+SSE4.2+AVX2+FMA | `none` |
+| first final v3+PGO CLI | `1a0c7c419e658bfb73abef80c5621063598baf32e94f3a3e79e440cd7e236f03` | SSE2+SSE4.2+AVX2+FMA | `ec01cb1f413a6fa7260df6de74a4b722b8200e957fd7804871429e2ac0075da4` |
+| exact-source replay v3+PGO CLI | `b9915a20b1eef40e6627a9c2826b5713cc55ee493ba675ec6a67ad41b6455580` | SSE2+SSE4.2+AVX2+FMA | `ec01cb1f413a6fa7260df6de74a4b722b8200e957fd7804871429e2ac0075da4` |
+
+Each process self-reported its executing ELF hash and ISA/profile identity.
+The parent invocation ran 31 alternating `AAB`/`BAA` pairs. Before every
+observation it copied the exact checked-in source image, verified source and
+copy SHA-256
+`0de4b44cacb300d71cbf2b1ae1ef3eca7d56668bec25a8a0aad2faaea874c7cb`,
+then invoked `create-bench --count 2000 --threads 1 --rounds 2`. The primary
+persisted-wall observation is the sum of both create rounds plus the final
+image flush. Afterward the same child ELF reopened and walked the image. Every
+arm returned the exact semantic signature
+`walked 3 dirs + 4257 files (4260 entries, 0 stats, 0 bytes / 0.0 MiB @ 0 MiB/s)`.
+
+| statistic | result |
+|---|---:|
+| generic median persisted wall time | 22,829.5 us |
+| v3+PGO median persisted wall time | 19,622 us |
+| generic/generic A/A | 0.989621x, 95% CI [0.979910, 1.002842] |
+| symmetric A/A null floor | 1.020502x |
+| pre-registered twice-null threshold | 1.041424x |
+| generic/v3+PGO | **1.155904x**, 95% CI **[1.135311, 1.178988]** |
+| decision | **PGO_FASTER** |
+
+The secondary create-loop-only result agreed: generic/v3+PGO was
+**1.163197x**, 95% CI **[1.145606, 1.178757]**, against an A/A CI of
+**[0.977759, 1.000578]** and a 1.046011x twice-null threshold. It was not the
+decision metric. The primary gate was the deterministic 20,000-resample paired
+bootstrap median CI over persisted wall time; CV and instruction count were
+not computed or consulted.
+
+An exact-source replay rebuilt and self-identified the second v3+PGO ELF
+listed above, then repeated the complete gate in one new invocation. Its
+generic persisted-wall median was 22,406.5 us and its v3+PGO median was
+19,175 us. Generic/generic A/A was 0.993953x, 95% CI
+[0.985172, 1.037221], giving a 1.037221x symmetric null floor and a
+1.075828x twice-null threshold. Generic/v3+PGO was **1.152540x**, 95% CI
+**[1.137778, 1.178502]**, so the lower bound independently cleared that
+invocation's threshold. The secondary create-loop-only result was
+**1.157775x**, 95% CI **[1.144666, 1.186080]**. The replay is reported as a
+separate admissible decision and is not pooled with the first measurement.
+
+This is an offline, single-thread CLI image result. It is not a mounted FUSE
+create storm, a parallel-create cutover, an `e2fsck` result, or a kernel
+comparison.
+
 ### Size of the effect, from evidence already in the repo
 
 `scripts/build-perf.sh`'s header records `perf stat` measurements (2026-07-03,
@@ -164,12 +224,15 @@ Examples: parallel metadata writes **8.3× slower at 8 threads**, multi-file par
 read **~2.9× slower**, mounted small-file create storm **4.599×**.
 
 The earlier blanket statement that these losses are **overstated** is also
-withdrawn. The historical `create-bench` experiment below is evidence that one
-named loss shrank, and the exact lookup gate proves a 1.437700x effect for its
-named corpus. Neither licenses the same conclusion for every loss. No loss
-should be called structural or irreducible on the strength of a baseline-ISA
-measurement, and no correction factor should be applied without a
-workload-matched whole-binary rerun.
+withdrawn. The exact gates now prove a 1.437700x lookup effect and independently
+reproduced 1.155904x / 1.152540x persisted-create effects for their named
+offline CLI corpora. They do not
+license the same conclusion for every loss. In particular, the historical
+mounted small-file create-storm ratio remains a baseline-ISA measurement:
+transport, concurrency, durability, and kernel work differ from this
+single-thread offline create gate. No loss should be called structural or
+irreducible on the strength of a baseline-ISA measurement, and no correction
+factor should be applied without a workload-matched whole-binary rerun.
 
 ### Class C — internal A/B (candidate vs control, one binary)
 
@@ -266,10 +329,19 @@ These are same-source, same-worker, pinned whole-binary observations. Each
 candidate/control decision is supported by its invocation's median CI; the absolute
 cross-binary medians are not promoted into a universal correction factor.
 
-Exact production-shaped v3+PGO identity is now closed for the 8,003-entry lookup
-workload: generic/v3+PGO was 1.437700x with CI [1.414742, 1.494961], while its
-A/A CI contained 1.0. Everything else remains open by workload, including
-mounted-kernel lookup and all create/read/rename/delete/kernel ratios.
+Exact production-shaped v3+PGO identity is now closed for two offline CLI
+workloads:
+
+- 8,003-entry lookup: generic/v3+PGO **1.437700x**, CI
+  **[1.414742, 1.494961]**; and
+- persisted 4,000-create batch: generic/v3+PGO **1.155904x**, CI
+  **[1.135311, 1.178988]**; exact-source replay **1.152540x**, CI
+  **[1.137778, 1.178502]**.
+
+Each result cleared twice its own same-invocation A/A null margin. These
+measurements replace the vague claim that the production binary is merely
+"faster" for the named offline workloads. They do not restate mounted-kernel
+lookup/create ratios or any read/rename/delete/kernel ratio.
 
 **Retry predicate for another claim:** train and build the production PGO
 binary from the same source, embed and print the consumed profile SHA, record

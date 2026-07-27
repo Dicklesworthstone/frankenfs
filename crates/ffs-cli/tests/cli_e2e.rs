@@ -338,6 +338,151 @@ fn lookup_observation(binary: &Path, image: &Path, count: usize) -> (f64, String
     (duration_us, signature.to_owned())
 }
 
+fn csv_value<'a>(line: &'a str, key: &str) -> &'a str {
+    line.split(',')
+        .find_map(|field| field.strip_prefix(key))
+        .unwrap_or_else(|| panic!("missing {key} in {line}"))
+}
+
+struct CreateObservation {
+    create_us: f64,
+    persisted_us: f64,
+    state_signature: String,
+}
+
+fn create_bench_timings(stdout: &str, count: usize, rounds: usize) -> (f64, f64) {
+    let count_arg = count.to_string();
+    let rounds_arg = rounds.to_string();
+    let create_rounds = stdout
+        .lines()
+        .filter(|line| line.starts_with("createbench_round,"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        create_rounds.len(),
+        rounds,
+        "create observation did not report every requested round"
+    );
+    let mut create_us = 0.0;
+    for (round, line) in create_rounds.iter().enumerate() {
+        assert_eq!(
+            csv_value(line, "round="),
+            round.to_string(),
+            "create round order changed"
+        );
+        assert_eq!(csv_value(line, "threads="), "1");
+        assert_eq!(csv_value(line, "count="), count_arg);
+        create_us += csv_value(line, "create_us=")
+            .parse::<f64>()
+            .expect("create_us is numeric");
+    }
+    let flush_line = stdout
+        .lines()
+        .find(|line| line.starts_with("createbench_flush,"))
+        .expect("create observation flush line");
+    assert_eq!(csv_value(flush_line, "rounds="), rounds_arg);
+    let flush_us = csv_value(flush_line, "flush_us=")
+        .parse::<f64>()
+        .expect("flush_us is numeric");
+    (create_us, flush_us)
+}
+
+fn walk_state_signature(binary: &Path, image: &str) -> String {
+    let walk = run_cli_binary(binary, &["walk", image, "--no-stat"]);
+    assert!(
+        walk.status.success(),
+        "walk after create failed: binary={} status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        walk.status,
+        String::from_utf8_lossy(&walk.stdout),
+        String::from_utf8_lossy(&walk.stderr)
+    );
+    let walk_stderr = String::from_utf8(walk.stderr).expect("walk stderr is UTF-8");
+    let walk_line = walk_stderr
+        .lines()
+        .find(|line| line.starts_with("walked "))
+        .unwrap_or_else(|| panic!("walk result line missing from:\n{walk_stderr}"));
+    walk_line
+        .split_once(" [")
+        .expect("walk result contains mode/timing delimiter")
+        .0
+        .to_owned()
+}
+
+fn create_observation(
+    binary: &Path,
+    expected_binary_sha256: &str,
+    source_image: &Path,
+    source_image_sha256: &str,
+    working_image: &Path,
+    count: usize,
+    rounds: usize,
+) -> CreateObservation {
+    let copied_bytes = fs::copy(source_image, working_image).unwrap_or_else(|error| {
+        panic!(
+            "copy create input {} -> {}: {error}",
+            source_image.display(),
+            working_image.display()
+        )
+    });
+    assert_eq!(
+        copied_bytes,
+        fs::metadata(source_image)
+            .expect("create source image metadata")
+            .len(),
+        "create input copy length changed"
+    );
+    assert_eq!(
+        sha256_file(working_image),
+        source_image_sha256,
+        "create observation did not start from the exact source image"
+    );
+
+    let image = working_image
+        .to_str()
+        .expect("create working image path is UTF-8");
+    let count_arg = count.to_string();
+    let rounds_arg = rounds.to_string();
+    let output = run_cli_binary(
+        binary,
+        &[
+            "create-bench",
+            image,
+            "/",
+            "--count",
+            &count_arg,
+            "--threads",
+            "1",
+            "--rounds",
+            &rounds_arg,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "create observation failed: binary={} status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("create stdout is UTF-8");
+    let self_sha256 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("bench_evidence,binary_sha256="))
+        .expect("create observation self-reported executing ELF SHA");
+    assert_eq!(
+        self_sha256, expected_binary_sha256,
+        "create observation executed an unexpected ELF"
+    );
+    let (create_us, flush_us) = create_bench_timings(&stdout, count, rounds);
+    let state_signature = walk_state_signature(binary, image);
+
+    CreateObservation {
+        create_us,
+        persisted_us: create_us + flush_us,
+        state_signature,
+    }
+}
+
 fn bd_b9dug_run_id() -> String {
     let run_id = required_env("FFS_B9DUG_RUN_ID");
     assert!(
@@ -525,6 +670,275 @@ struct LookupIdentity<'a> {
     pgo: &'a CliEvidence,
     profile_sha256: &'a str,
     image: &'a Path,
+}
+
+struct CreateSamples {
+    anchor_persisted_us: Vec<f64>,
+    repeat_persisted_us: Vec<f64>,
+    candidate_persisted_us: Vec<f64>,
+    anchor_create_us: Vec<f64>,
+    repeat_create_us: Vec<f64>,
+    candidate_create_us: Vec<f64>,
+    reference_signature: String,
+    raw_persisted_pairs: String,
+    raw_create_pairs: String,
+}
+
+struct CreateInputs<'a> {
+    generic: &'a Path,
+    pgo: &'a Path,
+    generic_sha256: &'a str,
+    pgo_sha256: &'a str,
+    source_image: &'a Path,
+    source_image_sha256: &'a str,
+    anchor_image: &'a Path,
+    repeat_image: &'a Path,
+    candidate_image: &'a Path,
+}
+
+fn assert_create_gate_identity(generic: &CliEvidence, pgo: &CliEvidence, expected_profile: &str) {
+    assert_eq!(
+        generic.pgo_profile_sha256, "none",
+        "generic control must not embed profile-use identity"
+    );
+    assert_eq!(
+        pgo.pgo_profile_sha256, expected_profile,
+        "candidate did not embed the consumed profile SHA"
+    );
+    assert!(
+        generic.codegen_line.contains("compile_avx2=false")
+            && generic.codegen_line.contains("compile_fma=false"),
+        "generic control unexpectedly widened its compile-time ISA: {}",
+        generic.codegen_line
+    );
+    assert!(
+        pgo.codegen_line.contains("compile_avx2=true")
+            && pgo.codegen_line.contains("compile_fma=true"),
+        "profile-use candidate is not witnessed x86-64-v3: {}",
+        pgo.codegen_line
+    );
+}
+
+fn collect_create_samples(
+    inputs: &CreateInputs<'_>,
+    pairs: usize,
+    count: usize,
+    rounds: usize,
+) -> CreateSamples {
+    let mut anchor_persisted_us = Vec::with_capacity(pairs);
+    let mut repeat_persisted_us = Vec::with_capacity(pairs);
+    let mut candidate_persisted_us = Vec::with_capacity(pairs);
+    let mut anchor_create_us = Vec::with_capacity(pairs);
+    let mut repeat_create_us = Vec::with_capacity(pairs);
+    let mut candidate_create_us = Vec::with_capacity(pairs);
+    let mut reference_signature = None;
+    let mut raw_persisted_pairs = String::with_capacity(pairs.saturating_mul(72));
+    let mut raw_create_pairs = String::with_capacity(pairs.saturating_mul(72));
+    for pair in 0..pairs {
+        let observe_generic = |working_image: &Path| {
+            create_observation(
+                inputs.generic,
+                inputs.generic_sha256,
+                inputs.source_image,
+                inputs.source_image_sha256,
+                working_image,
+                count,
+                rounds,
+            )
+        };
+        let observe_pgo = || {
+            create_observation(
+                inputs.pgo,
+                inputs.pgo_sha256,
+                inputs.source_image,
+                inputs.source_image_sha256,
+                inputs.candidate_image,
+                count,
+                rounds,
+            )
+        };
+        let (anchor, repeat, candidate, order) = if pair % 2 == 0 {
+            (
+                observe_generic(inputs.anchor_image),
+                observe_generic(inputs.repeat_image),
+                observe_pgo(),
+                "AAB",
+            )
+        } else {
+            let candidate = observe_pgo();
+            let repeat = observe_generic(inputs.repeat_image);
+            let anchor = observe_generic(inputs.anchor_image);
+            (anchor, repeat, candidate, "BAA")
+        };
+        for signature in [
+            &anchor.state_signature,
+            &repeat.state_signature,
+            &candidate.state_signature,
+        ] {
+            if let Some(expected) = &reference_signature {
+                assert_eq!(
+                    signature, expected,
+                    "generic and PGO create outputs have different filesystem state"
+                );
+            } else {
+                reference_signature = Some(signature.clone());
+            }
+        }
+        anchor_persisted_us.push(anchor.persisted_us);
+        repeat_persisted_us.push(repeat.persisted_us);
+        candidate_persisted_us.push(candidate.persisted_us);
+        anchor_create_us.push(anchor.create_us);
+        repeat_create_us.push(repeat.create_us);
+        candidate_create_us.push(candidate.create_us);
+        if pair > 0 {
+            raw_persisted_pairs.push(';');
+            raw_create_pairs.push(';');
+        }
+        write!(
+            &mut raw_persisted_pairs,
+            "{order}:{:.3}:{:.3}:{:.3}",
+            anchor.persisted_us, repeat.persisted_us, candidate.persisted_us
+        )
+        .expect("format persisted-create pair");
+        write!(
+            &mut raw_create_pairs,
+            "{order}:{:.3}:{:.3}:{:.3}",
+            anchor.create_us, repeat.create_us, candidate.create_us
+        )
+        .expect("format create-loop pair");
+    }
+    CreateSamples {
+        anchor_persisted_us,
+        repeat_persisted_us,
+        candidate_persisted_us,
+        anchor_create_us,
+        repeat_create_us,
+        candidate_create_us,
+        reference_signature: reference_signature.expect("create state signature"),
+        raw_persisted_pairs,
+        raw_create_pairs,
+    }
+}
+
+fn paired_ratio_summaries(
+    anchor: &[f64],
+    repeat: &[f64],
+    candidate: &[f64],
+) -> (BootstrapMedianCi, BootstrapMedianCi, f64, f64) {
+    let null_log_ratios = anchor
+        .iter()
+        .zip(repeat)
+        .map(|(anchor, repeat)| (anchor / repeat).ln())
+        .collect::<Vec<_>>();
+    let candidate_log_ratios = anchor
+        .iter()
+        .zip(repeat)
+        .zip(candidate)
+        .map(|((anchor, repeat), candidate)| (anchor.midpoint(*repeat) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null = bootstrap_median_ci(&null_log_ratios);
+    let candidate_ratio = bootstrap_median_ci(&candidate_log_ratios);
+    let null_log_radius = null.low.ln().abs().max(null.high.ln().abs());
+    (
+        null,
+        candidate_ratio,
+        null_log_radius.exp(),
+        (2.0 * null_log_radius).exp(),
+    )
+}
+
+fn report_create_gate(
+    identity: &LookupIdentity<'_>,
+    samples: CreateSamples,
+    pairs: usize,
+    count: usize,
+    rounds: usize,
+) {
+    let (persisted_null, persisted_ratio, null_floor_ratio, twice_null_ratio) =
+        paired_ratio_summaries(
+            &samples.anchor_persisted_us,
+            &samples.repeat_persisted_us,
+            &samples.candidate_persisted_us,
+        );
+    let (create_null, create_ratio, create_null_floor_ratio, create_twice_null_ratio) =
+        paired_ratio_summaries(
+            &samples.anchor_create_us,
+            &samples.repeat_create_us,
+            &samples.candidate_create_us,
+        );
+    let verdict = if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else if persisted_ratio.low > twice_null_ratio {
+        "PGO_FASTER"
+    } else if persisted_ratio.high < twice_null_ratio.recip() {
+        "PGO_SLOWER"
+    } else {
+        "INDETERMINATE_WITHIN_TWICE_NULL"
+    };
+    let generic_persisted_midpoints = samples
+        .anchor_persisted_us
+        .iter()
+        .zip(&samples.repeat_persisted_us)
+        .map(|(anchor, repeat)| anchor.midpoint(*repeat))
+        .collect::<Vec<_>>();
+    let generic_create_midpoints = samples
+        .anchor_create_us
+        .iter()
+        .zip(&samples.repeat_create_us)
+        .map(|(anchor, repeat)| anchor.midpoint(*repeat))
+        .collect::<Vec<_>>();
+    println!(
+        "bd_b9dug_create_identity,generic_binary_sha256={},pgo_binary_sha256={},\
+pgo_profile_sha256={},input_image={},input_image_sha256={},output_signature={}",
+        identity.generic.binary_sha256,
+        identity.pgo.binary_sha256,
+        identity.profile_sha256,
+        identity.image.display(),
+        sha256_file(identity.image),
+        samples.reference_signature
+    );
+    println!(
+        "bd_b9dug_create_persisted_pairs,pairs={pairs},rounds_per_observation={rounds},\
+creates_per_round={count},format=order:generic_anchor_us:generic_repeat_us:pgo_us,values={}",
+        samples.raw_persisted_pairs
+    );
+    println!(
+        "bd_b9dug_create_loop_pairs,pairs={pairs},rounds_per_observation={rounds},\
+creates_per_round={count},format=order:generic_anchor_us:generic_repeat_us:pgo_us,values={}",
+        samples.raw_create_pairs
+    );
+    println!(
+        "bd_b9dug_whole_binary_create,generic_persisted_median_us={:.3},\
+pgo_persisted_median_us={:.3},generic_aa_median={:.6},\
+generic_aa_ci_low={:.6},generic_aa_ci_high={:.6},\
+null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},\
+generic_over_pgo_median={:.6},generic_over_pgo_ci_low={:.6},\
+generic_over_pgo_ci_high={:.6},create_loop_generic_median_us={:.3},\
+create_loop_pgo_median_us={:.3},create_loop_aa_median={:.6},\
+create_loop_aa_ci_low={:.6},create_loop_aa_ci_high={:.6},\
+create_loop_null_floor_ratio={create_null_floor_ratio:.6},\
+create_loop_twice_null_ratio={create_twice_null_ratio:.6},\
+create_loop_generic_over_pgo_median={:.6},create_loop_generic_over_pgo_ci_low={:.6},\
+create_loop_generic_over_pgo_ci_high={:.6},verdict={verdict},\
+gate_metric=persisted_wall_us,gate_basis=bootstrap_median_ci,\
+bootstrap_resamples=20000,cv_used=false",
+        median(generic_persisted_midpoints),
+        median(samples.candidate_persisted_us),
+        persisted_null.median,
+        persisted_null.low,
+        persisted_null.high,
+        persisted_ratio.median,
+        persisted_ratio.low,
+        persisted_ratio.high,
+        median(generic_create_midpoints),
+        median(samples.candidate_create_us),
+        create_null.median,
+        create_null.low,
+        create_null.high,
+        create_ratio.median,
+        create_ratio.low,
+        create_ratio.high,
+    );
 }
 
 fn report_lookup_gate(
@@ -746,6 +1160,101 @@ fn bd_b9dug_whole_binary_lookup_gate() {
         samples,
         PAIRS,
         LOOKUPS,
+    );
+}
+
+/// Production-shaped generic/PGO create decision. One parent process copies the
+/// same immutable image before every child observation, alternates `AAB`/`BAA`,
+/// and gates on persisted wall time (create rounds plus the final flush).
+#[test]
+#[ignore = "strict-remote bd-b9dug driver"]
+fn bd_b9dug_whole_binary_create_gate() {
+    const PAIRS: usize = 31;
+    const CREATES_PER_ROUND: usize = 2_000;
+    const ROUNDS: usize = 2;
+
+    let generic = required_env_path("FFS_B9DUG_GENERIC_CLI");
+    let pgo = Path::new(env!("CARGO_BIN_EXE_ffs-cli"));
+    let source_image = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/golden/ext4_dir_index_reference.ext4");
+    let create_dir = required_env_path("FFS_B9DUG_CREATE_DIR");
+    let run_id = bd_b9dug_run_id();
+    let expected_profile = required_env("FFS_PGO_PROFILE_SHA256");
+    assert!(
+        expected_profile.len() == 64
+            && expected_profile
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "FFS_PGO_PROFILE_SHA256 must be a full SHA-256"
+    );
+    fs::create_dir_all(&create_dir).expect("create bd-b9dug create artifact directory");
+    let anchor_image = create_dir.join(format!("create-{run_id}-anchor.ext4"));
+    let repeat_image = create_dir.join(format!("create-{run_id}-repeat.ext4"));
+    let candidate_image = create_dir.join(format!("create-{run_id}-candidate.ext4"));
+    for image in [&anchor_image, &repeat_image, &candidate_image] {
+        assert!(
+            !image.exists(),
+            "refusing to overwrite create-gate artifact {}",
+            image.display()
+        );
+    }
+
+    let generic_evidence = cli_evidence(&generic);
+    let pgo_evidence = cli_evidence(pgo);
+    assert_create_gate_identity(&generic_evidence, &pgo_evidence, &expected_profile);
+    let source_image_sha256 = sha256_file(&source_image);
+    let inputs = CreateInputs {
+        generic: &generic,
+        pgo,
+        generic_sha256: &generic_evidence.binary_sha256,
+        pgo_sha256: &pgo_evidence.binary_sha256,
+        source_image: &source_image,
+        source_image_sha256: &source_image_sha256,
+        anchor_image: &anchor_image,
+        repeat_image: &repeat_image,
+        candidate_image: &candidate_image,
+    };
+
+    create_observation(
+        inputs.generic,
+        inputs.generic_sha256,
+        inputs.source_image,
+        inputs.source_image_sha256,
+        inputs.anchor_image,
+        CREATES_PER_ROUND,
+        ROUNDS,
+    );
+    create_observation(
+        inputs.generic,
+        inputs.generic_sha256,
+        inputs.source_image,
+        inputs.source_image_sha256,
+        inputs.repeat_image,
+        CREATES_PER_ROUND,
+        ROUNDS,
+    );
+    create_observation(
+        inputs.pgo,
+        inputs.pgo_sha256,
+        inputs.source_image,
+        inputs.source_image_sha256,
+        inputs.candidate_image,
+        CREATES_PER_ROUND,
+        ROUNDS,
+    );
+
+    let samples = collect_create_samples(&inputs, PAIRS, CREATES_PER_ROUND, ROUNDS);
+    report_create_gate(
+        &LookupIdentity {
+            generic: &generic_evidence,
+            pgo: &pgo_evidence,
+            profile_sha256: &expected_profile,
+            image: &source_image,
+        },
+        samples,
+        PAIRS,
+        CREATES_PER_ROUND,
+        ROUNDS,
     );
 }
 
