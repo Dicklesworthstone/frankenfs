@@ -134,7 +134,7 @@ admissibility rule.
 | 0218b2d8 | same, btrfs hot-inode-extents slot | — | " |
 | 9bf25f7f / 6da40713 | ext4 depth>0 child-extent-block cache / extent-parse hoist | — | cache the child block across per-block accesses |
 | f2ca5cf4 / ee8d5208 | skip redundant readdir prefetch / bound readdirplus getattr fan-out | ~2.8x | avoid redundant work + cap the fan-out |
-| 7a6091a2 | bound ext4 data-read fan-out to a dedicated 16-wide pool (bd-ddryj) | — | see cold-read note below |
+| 7a6091a2 | bound ext4 data-read fan-out to a dedicated `min(nproc, 16)` pool (bd-ddryj; policy corrected 2026-07-27) | ~1.21x historical 64→16 profile; 1.248x v3 16→old-quarter-4 actual-binary gate (non-PGO) | cap page-cache lock contention without quartering smaller workers |
 
 ### Metadata / dir / parse
 | Commit | Lever | Ratio | Mechanism |
@@ -204,7 +204,13 @@ re-established honestly — loop-device serialization is a buffered-mode artifac
 ~41% of the best-config gap is benchmark-harness overhead, and the residual is
 kernel page-cache `xa_lock` contention from a shared `Arc<File>` (a shared-fd
 readahead artifact), not readahead/extents/copy. O_DIRECT buys 0% wall
-(**bd-kdmu4**, owner-gated). See `frankenfs-cold-read-honest-numbers`.
+(**bd-kdmu4**, owner-gated). The 2026-07-27 actual-binary cutover preserved the
+profile-backed 16-thread ceiling but corrected the default from
+`nproc/4` to `min(nproc, 16)`: on a 16-thread worker, the old 4-thread default
+was only 0.793x as fast as 16, while the corrected v3/non-PGO gate measured
+16 over 4 at 1.248x. These are offline internal ratios and do not rescale the
+historical mounted-kernel comparison. See `frankenfs-cold-read-honest-numbers`
+and `tests/artifacts/perf/2026-07-10_bd-ddryj_read_fanout_cap.md`.
 
 ### Peer-lane rejects (recorded, not solo-actionable)
 `3f02807f` nested Bw-tree message Arc · `de10e53c` fast-commit extent hint (dead

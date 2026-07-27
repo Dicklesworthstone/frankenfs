@@ -13,6 +13,98 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Ext4 read-pool cap retained, quarter-nproc scaling corrected - 2026-07-27 (GreenSpring, KEEP / CLAIM CORRECTION)
+
+The institutional candidate preflight found the existing `bd-ddryj` row and
+printed its unresolved predicate: the dedicated-pool binary itself had never
+been measured. The historical profile was still useful but narrower than its
+policy:
+
+- on the 64-thread profile host, 64-to-16 reduced
+  `native_queued_spin_lock_slowpath` self-time from **42.27% to 9.32%** and
+  improved cold wall by about **1.21x**;
+- production had generalized that point to
+  `(available_parallelism / 4).clamp(4, 16)`; and
+- the committed code had only been compile-tested. The reported ratio came
+  from an equivalent environment override in an older binary.
+
+A new hidden whole-binary gate self-hashes before doing work, verifies that a
+spawned `bench-evidence` child reports the same executing ELF, constructs a
+private deterministic ext4 file, proves exact candidate/control bytes, and
+owns A/A plus A/B in one invocation. It alternates order for 31 pairs, evicts
+the image with `POSIX_FADV_DONTNEED` before every child, and gates only on a
+deterministic 20,000-resample bootstrap median CI over wall time. CV and
+instruction count are not computed or consulted.
+
+The first v3 invocation exposed a policy error. On pinned strict-remote
+`ovh-a`, where `available_parallelism` is 16, the shipped default selected 4
+threads. Executing ELF
+`a21b26bcff6d8b6010fedac47930bbefc82a7eafb29fabad1122b8b1586f4118`
+measured:
+
+- default/default A/A median **0.983423x**, 95% CI
+  **[0.961861, 1.022792]**, symmetric null floor **1.039651x**; and
+- default-4 / explicit-16 median **0.793266x**, CI
+  **[0.772379, 0.808476]**.
+
+Quartering a smaller worker was decisively harmful. The default is now
+`min(available_parallelism, 16)`: preserve all available threads below the
+profiled ceiling and cap larger machines at 16. The dedicated-pool boundary
+and `FFS_READ_PARALLELISM` override are unchanged.
+
+A fresh, unpooled corrected-policy invocation admitted the change:
+
+- executing v3 release-perf ELF
+  `8f7039d78a42e5ca7aa79cf7fa0e5c80415b61971469465d0ca5e9d881003082`;
+- machine-readable in-process witness
+  `bench_evidence,binary_sha256=8f7039d78a42e5ca7aa79cf7fa0e5c80415b61971469465d0ca5e9d881003082`;
+- parent and identity child reported the same SHA; compile/runtime SSE4.2,
+  AVX2, and FMA were true; PGO profile SHA was `none`;
+- private image SHA-256
+  `144db18f7f7134058092a6d88768a285660001f3cf06a530ad1db729dc76a919`;
+- corrected-default/corrected-default A/A median **0.993140x**, bootstrap
+  median 95% CI **[0.986304, 1.002085]**, symmetric null floor
+  **1.013887x**, and twice-null threshold **1.027966x**;
+- corrected-default-16 / old-quarter-4 median **1.248257x**, CI
+  **[1.226142, 1.279943]**, clearing the threshold; and
+- both arms returned the identical 33,554,432-byte stream, all `0xA5`,
+  SHA-256
+  `edeadec8f638055689d5be63b4bcf2654fb64bf91fb6651e9a924f052a9c7db0`.
+
+Two subsequent exact-source invocations were deliberately given zero weight.
+One was rejected by a wide A/A CI of **[0.893182, 1.082108]**. The other
+passed the broad null bound but its A/B lower bound **1.036707x** did not clear
+its disturbance-inflated **1.086391x** twice-null threshold. A larger 128 MiB
+attempt never entered timing because the 64 MiB source image filled during
+setup. None was pooled with the admitted invocation.
+
+**DECISION — KEEP THE 16-THREAD CEILING, CORRECT THE SCALING RULE, AND RESTATE
+THE CLAIM.** The old 64-to-16 profile remains evidence for the ceiling on that
+host. The actual-binary 16-to-4 result refutes quarter scaling and the
+corrected 16-to-4 gate independently confirms the repair. The **1.248257x**
+ratio is witnessed v3 release-perf evidence on this offline ext4 workload, not
+a v3+PGO, mounted-FUSE, or kernel-ext4 result. Historical kernel ratios are not
+rescaled.
+
+Semantic proof: only worker count changes. Indexed segments retain their
+logical assembly order, candidate/control bytes and length are exact, and the
+pool remains isolated from scrub/walk/repair. Ordering is preserved.
+Tie-breaking is unchanged/N/A. Floating point and RNG are N/A.
+
+Strict-remote checks passed for `ffs-cli --all-targets`; focused CLI parsing and
+core topology tests passed. CLI Clippy passed with `-D warnings` after allowing
+only reproduced pre-existing categories. Core/workspace Clippy remains blocked
+by unrelated pre-existing pedantic/nursery debt.
+
+**Retry predicate:** revisit the width policy only when a production-shaped
+profile on a materially different worker/device attributes the residual to
+read-pool width and its optimum differs from `min(nproc, 16)`. Then require an
+in-process executing-ELF/ISA/profile witness, exact stream parity, at least 31
+same-invocation alternating A/A+B pairs, and a bootstrap median wall/cycles CI
+clearing twice its own null log-margin. Claim a shipped magnitude only after
+the exact production PGO profile is consumed. Never gate on CV or instruction
+count.
+
 ## Btrfs-send path/depth cache Fx hashing clears attribution but not the whole-stream null floor - 2026-07-27 (GreenSpring, REJECT)
 
 The institutional candidate preflight matched the earlier closed SipHash sweep:

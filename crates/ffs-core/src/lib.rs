@@ -3889,6 +3889,10 @@ enum Ext4IndirectReadJob<'buf> {
 
 static EXT4_READ_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
 
+fn bounded_read_parallelism(cpus: usize) -> usize {
+    cpus.clamp(1, 16)
+}
+
 /// Bounded worker pool for the ext4 data-read fan-out (bd-ddryj).
 ///
 /// The global rayon pool is `nproc` wide. Every worker `pread`s the same inode,
@@ -3896,7 +3900,10 @@ static EXT4_READ_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::syn
 /// xarray and serialize on its lock: `native_queued_spin_lock_slowpath` is
 /// 42.27% of self-time at 64 threads and 9.32% at 16. Bounding the fan-out is
 /// worth 1.21x on a cold 128 MiB extent read (null control 1.02x; 9/9 paired,
-/// p=0.0039), and warm reads prefer the same width, so there is no trade.
+/// p=0.0039), and warm reads prefer the same width. A later whole-binary gate
+/// caught the original `nproc / 4` scaling rule over-correcting on a 16-thread
+/// worker: 4 threads were 0.793x as fast as 16, with a bootstrap median CI of
+/// [0.772, 0.808]. Cap at 16 without reducing smaller machines below nproc.
 ///
 /// A DEDICATED pool, not a narrower global one: scrub, walk and repair share the
 /// global pool and are not read-bound. `FFS_READ_PARALLELISM` overrides the
@@ -3913,9 +3920,10 @@ fn ext4_read_pool() -> Option<&'static rayon::ThreadPool> {
                 .unwrap_or_else(|| {
                     let cpus =
                         std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-                    // 16 is the measured optimum on this 64-core box; the optimum is
-                    // contention-dependent, so scale with the machine rather than pin it.
-                    (cpus / 4).clamp(4, 16)
+                    // 16 is the measured optimum on the 64-thread profile host.
+                    // On a 16-thread worker, using all 16 decisively beat the old
+                    // quarter-width rule's 4; below the cap, preserve nproc.
+                    bounded_read_parallelism(cpus)
                 });
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -39760,6 +39768,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn read_pool_parallelism_caps_without_quartering_small_workers() {
+        assert_eq!(bounded_read_parallelism(0), 1);
+        assert_eq!(bounded_read_parallelism(1), 1);
+        assert_eq!(bounded_read_parallelism(4), 4);
+        assert_eq!(bounded_read_parallelism(16), 16);
+        assert_eq!(bounded_read_parallelism(64), 16);
+    }
 
     /// Capping and Arc-sharing the readdir snapshot page must not change the
     /// complete, ordered listing a paginating caller reconstructs — only the

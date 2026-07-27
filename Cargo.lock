@@ -962,6 +962,7 @@ dependencies = [
  "ffs-repair",
  "ffs-types",
  "libc",
+ "nix 0.29.0",
  "proptest",
  "rayon",
  "serde",

@@ -802,6 +802,24 @@ enum Command {
         #[arg(long, default_value_t = 11)]
         rounds: usize,
     },
+    /// Re-measure the corrected bounded read pool against the shipped
+    /// quarter-nproc rule in one self-hashing whole-binary invocation.
+    ///
+    /// Hidden because this is a campaign evidence gate, not an end-user
+    /// filesystem operation. The gate copies `fixture`, creates a dense file in
+    /// the copy, then runs child instances of this exact ELF with cold-cache
+    /// A/A and A/B arms.
+    #[command(name = "read-pool-cutover-gate", hide = true)]
+    ReadPoolCutoverGate {
+        /// Existing ext4 image copied and mutated to build the private fixture.
+        fixture: PathBuf,
+        /// Number of 4 KiB blocks in the dense read target.
+        #[arg(long, default_value_t = 8_192)]
+        blocks: usize,
+        /// Interleaved paired A/A and A/B rounds.
+        #[arg(long, default_value_t = 31)]
+        rounds: usize,
+    },
     /// Benchmark mkdir: create `count` subdirectories in `dir` + flush, timing
     /// total throughput. Each mkdir is an existence-check lookup + inode/dir
     /// alloc + parent insert + MVCC commit — exercises the name-index across a
@@ -1239,6 +1257,7 @@ impl Command {
             Self::LookupBench { .. } => "lookupbench",
             Self::CreateBench { .. } => "createbench",
             Self::CreateBenchCutoverGate { .. } => "createbench-cutover-gate",
+            Self::ReadPoolCutoverGate { .. } => "read-pool-cutover-gate",
             Self::MkdirBench { .. } => "mkdirbench",
             Self::RmdirBench { .. } => "rmdirbench",
             Self::UnlinkBench { .. } => "unlinkbench",
@@ -2013,7 +2032,9 @@ fn run() -> Result<()> {
 
     let evidence_must_be_first = matches!(
         &cli.command,
-        Command::BenchEvidence | Command::CreateBenchCutoverGate { .. }
+        Command::BenchEvidence
+            | Command::CreateBenchCutoverGate { .. }
+            | Command::ReadPoolCutoverGate { .. }
     );
     if !evidence_must_be_first {
         info!(
@@ -2084,6 +2105,11 @@ fn run() -> Result<()> {
             threads,
             rounds,
         ),
+        Command::ReadPoolCutoverGate {
+            fixture,
+            blocks,
+            rounds,
+        } => read_pool_cutover_gate_cmd(&fixture, blocks, rounds),
         Command::MkdirBench { image, dir, count } => mkdirbench_cmd(&image, &dir, count),
         Command::RmdirBench { image, dir, count } => rmdirbench_cmd(&image, &dir, count),
         Command::UnlinkBench { image, dir, count } => unlinkbench_cmd(&image, &dir, count),
@@ -3236,6 +3262,336 @@ fn createbench_cutover_gate_cmd(
     _rounds: usize,
 ) -> Result<()> {
     bail!("create-bench-cutover-gate requires --features bhh0i_sharded_alloc")
+}
+
+const READ_POOL_GATE_FILE: &str = "/read_pool_gate.bin";
+
+fn copy_read_pool_fixture(source: &Path) -> Result<PathBuf> {
+    use std::io::{BufReader, BufWriter, Write as _};
+
+    const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let source_len = std::fs::metadata(source)
+        .with_context(|| format!("stat read-pool fixture {}", source.display()))?
+        .len();
+    if source_len > MAX_IMAGE_BYTES {
+        bail!(
+            "read-pool fixture {} is {source_len} bytes; cap is {MAX_IMAGE_BYTES}",
+            source.display()
+        );
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    let destination = std::env::temp_dir().join(format!(
+        "frankenfs-read-pool-gate-{}-{nonce}.img",
+        std::process::id()
+    ));
+    let mut input = BufReader::new(
+        std::fs::File::open(source)
+            .with_context(|| format!("open read-pool fixture {}", source.display()))?,
+    );
+    let mut output = BufWriter::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .with_context(|| format!("create private read-pool image {}", destination.display()))?,
+    );
+    let copied = std::io::copy(&mut input, &mut output)
+        .with_context(|| format!("copy read-pool fixture to {}", destination.display()))?;
+    output
+        .flush()
+        .with_context(|| format!("flush private read-pool image {}", destination.display()))?;
+    if copied != source_len {
+        bail!("fixture copy was short: expected {source_len} bytes, copied {copied}");
+    }
+    Ok(destination)
+}
+
+fn run_read_pool_setup(exe: &Path, image: &Path, blocks: usize) -> Result<()> {
+    let output = std::process::Command::new(exe)
+        .arg("--log-format")
+        .arg("human")
+        .arg("write-bench")
+        .arg(image)
+        .arg(READ_POOL_GATE_FILE)
+        .arg("--count")
+        .arg(blocks.to_string())
+        .arg("--size")
+        .arg("4096")
+        .arg("--create")
+        .env("RUST_LOG", "error")
+        .output()
+        .with_context(|| format!("launch read-pool fixture setup from {}", exe.display()))?;
+    if !output.status.success() {
+        bail!(
+            "read-pool fixture setup failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn verify_read_pool_child_identity(exe: &Path, parent_sha256: &str) -> Result<()> {
+    let output = std::process::Command::new(exe)
+        .arg("bench-evidence")
+        .env("RUST_LOG", "error")
+        .output()
+        .with_context(|| format!("launch read-pool identity child from {}", exe.display()))?;
+    if !output.status.success() {
+        bail!(
+            "read-pool identity child failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let child_sha256 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("bench_evidence,binary_sha256="))
+        .and_then(|rest| rest.split(',').next())
+        .context("identity child omitted its in-process ELF SHA-256")?;
+    if child_sha256 != parent_sha256 {
+        bail!("read-pool parent/child ELF mismatch: parent {parent_sha256}, child {child_sha256}");
+    }
+    println!(
+        "read_pool_child_identity,parent_binary_sha256={parent_sha256},\
+child_binary_sha256={child_sha256},same_elf=true"
+    );
+    Ok(())
+}
+
+fn evict_read_pool_fixture(image: &Path) -> Result<()> {
+    use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open(image)
+        .with_context(|| format!("open {} for DONTNEED", image.display()))?;
+    posix_fadvise(
+        file.as_raw_fd(),
+        0,
+        0,
+        PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    )
+    .with_context(|| format!("POSIX_FADV_DONTNEED {}", image.display()))
+}
+
+struct ReadPoolChild {
+    elapsed: Duration,
+    stdout: Vec<u8>,
+}
+
+fn run_read_pool_child(
+    exe: &Path,
+    image: &Path,
+    threads: Option<usize>,
+    discard: bool,
+) -> Result<ReadPoolChild> {
+    evict_read_pool_fixture(image)?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--log-format")
+        .arg("human")
+        .arg("read")
+        .arg(image)
+        .arg(READ_POOL_GATE_FILE)
+        .env("RUST_LOG", "error");
+    if discard {
+        command.arg("--discard");
+    }
+    match threads {
+        Some(threads) => {
+            command.env("FFS_READ_PARALLELISM", threads.to_string());
+        }
+        None => {
+            command.env_remove("FFS_READ_PARALLELISM");
+        }
+    }
+    let started = Instant::now();
+    let output = command
+        .output()
+        .with_context(|| format!("launch read-pool child from {}", exe.display()))?;
+    let elapsed = started.elapsed();
+    if !output.status.success() {
+        bail!(
+            "read-pool child failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(ReadPoolChild {
+        elapsed,
+        stdout: output.stdout,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_read_pool_pair(
+    phase: &str,
+    exe: &Path,
+    image: &Path,
+    lhs_label: &str,
+    lhs_threads: Option<usize>,
+    rhs_label: &str,
+    rhs_threads: Option<usize>,
+    round: usize,
+    lhs_first: bool,
+) -> Result<f64> {
+    let (lhs, rhs) = if lhs_first {
+        (
+            run_read_pool_child(exe, image, lhs_threads, true)?,
+            run_read_pool_child(exe, image, rhs_threads, true)?,
+        )
+    } else {
+        let rhs = run_read_pool_child(exe, image, rhs_threads, true)?;
+        let lhs = run_read_pool_child(exe, image, lhs_threads, true)?;
+        (lhs, rhs)
+    };
+    let lhs_seconds = lhs.elapsed.as_secs_f64().max(1e-9);
+    let rhs_seconds = rhs.elapsed.as_secs_f64().max(1e-9);
+    let lhs_over_rhs = rhs_seconds / lhs_seconds;
+    println!(
+        "read_pool_cutover_pair,phase={phase},round={round},order={},lhs={lhs_label},\
+rhs={rhs_label},lhs_us={},rhs_us={},lhs_over_rhs={lhs_over_rhs:.6}",
+        if lhs_first { "lhs_rhs" } else { "rhs_lhs" },
+        lhs.elapsed.as_micros(),
+        rhs.elapsed.as_micros(),
+    );
+    Ok(lhs_over_rhs.ln())
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_pool_cutover_gate_cmd(fixture: &Path, blocks: usize, rounds: usize) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let sha = elf_self_sha256().context("self-hash executing read-pool gate ELF")?;
+    let worker = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("bench_evidence,binary_sha256={sha},worker={worker}");
+    print_codegen_isa();
+    println!(
+        "build_profile,pgo_profile_sha256={}",
+        option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+    );
+
+    if rounds < 5 {
+        bail!("read-pool cutover gate requires at least 5 paired rounds");
+    }
+    if blocks == 0 {
+        bail!("read-pool cutover gate requires at least one data block");
+    }
+    let expected_bytes = blocks
+        .checked_mul(4096)
+        .context("read-pool target byte count overflow")?;
+    let available_threads =
+        std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let candidate_threads = available_threads.min(16);
+    let old_quarter_threads = (available_threads / 4).clamp(4, 16);
+    if old_quarter_threads == candidate_threads {
+        bail!(
+            "read-pool A/B needs the old quarter-width rule ({old_quarter_threads}) to differ \
+             from the corrected production width ({candidate_threads}); nproc={available_threads}"
+        );
+    }
+
+    let exe = std::env::current_exe().context("resolve read-pool gate current_exe")?;
+    verify_read_pool_child_identity(&exe, &sha)?;
+    let image = copy_read_pool_fixture(fixture)?;
+    run_read_pool_setup(&exe, &image, blocks)?;
+    let image_sha256 = file_sha256(&image)?;
+
+    let candidate_bytes = run_read_pool_child(&exe, &image, None, false)?.stdout;
+    let control_bytes = run_read_pool_child(&exe, &image, Some(old_quarter_threads), false)?.stdout;
+    if candidate_bytes.len() != expected_bytes || control_bytes.len() != expected_bytes {
+        bail!(
+            "read-pool parity length mismatch: expected {expected_bytes}, candidate {}, control {}",
+            candidate_bytes.len(),
+            control_bytes.len()
+        );
+    }
+    if candidate_bytes != control_bytes {
+        bail!("read-pool candidate/control bytes differ");
+    }
+    if candidate_bytes.iter().any(|&byte| byte != 0xA5) {
+        bail!("read-pool fixture bytes differ from the deterministic 0xA5 payload");
+    }
+    let stream_sha256 = sha256_hex(&Sha256::digest(&candidate_bytes));
+    println!(
+        "read_pool_cutover_config,same_invocation=true,rounds={rounds},blocks={blocks},\
+bytes={expected_bytes},available_threads={available_threads},\
+candidate_default_threads={candidate_threads},control_old_quarter_threads={old_quarter_threads},\
+fixture={},private_image={},private_image_sha256={image_sha256},\
+stream_sha256={stream_sha256},exact_stream_parity=true,cold_cache=posix_fadvise_dontneed,\
+gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        fixture.display(),
+        image.display(),
+    );
+
+    let mut null_log_ratios = Vec::with_capacity(rounds);
+    let mut candidate_log_ratios = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        null_log_ratios.push(run_read_pool_pair(
+            "aa",
+            &exe,
+            &image,
+            "default_lhs",
+            None,
+            "default_rhs",
+            None,
+            round,
+            round % 2 == 0,
+        )?);
+        candidate_log_ratios.push(run_read_pool_pair(
+            "ab",
+            &exe,
+            &image,
+            "default_candidate",
+            None,
+            "old_quarter_control",
+            Some(old_quarter_threads),
+            round,
+            round % 2 != 0,
+        )?);
+    }
+
+    let null_ci = bootstrap_median_ci(&null_log_ratios);
+    let candidate_ci = bootstrap_median_ci(&candidate_log_ratios);
+    let null_log_margin = null_ci.low.ln().abs().max(null_ci.high.ln().abs());
+    let null_floor_ratio = null_log_margin.exp();
+    let twice_null_ratio = (2.0 * null_log_margin).exp();
+    let aa_inside_1_10 = (1.0 / 1.10..=1.10).contains(&null_ci.median);
+    let null_floor_le_1_15 = null_floor_ratio <= 1.15;
+    let ab_clears_twice_null = candidate_ci.low > twice_null_ratio;
+    let performance_admitted = aa_inside_1_10 && null_floor_le_1_15 && ab_clears_twice_null;
+    println!(
+        "read_pool_cutover_median_ci,phase=aa,lhs_over_rhs_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        null_ci.median, null_ci.low, null_ci.high
+    );
+    println!(
+        "read_pool_cutover_median_ci,phase=ab,candidate_over_control_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        candidate_ci.median, candidate_ci.low, candidate_ci.high
+    );
+    println!(
+        "read_pool_cutover_decision,aa_inside_1_10={aa_inside_1_10},\
+null_floor_ratio={null_floor_ratio:.6},null_floor_le_1_15={null_floor_le_1_15},\
+twice_null_ratio={twice_null_ratio:.6},ab_ci_clears_twice_null={ab_clears_twice_null},\
+performance_admitted={performance_admitted},gate_basis=bootstrap_median_ci,cv_used=false"
+    );
+    if performance_admitted {
+        Ok(())
+    } else {
+        bail!("read-pool performance gate rejected the candidate; see decision row")
+    }
 }
 
 fn mkdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
@@ -9510,6 +9866,36 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cli_parses_read_pool_cutover_gate() {
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "read-pool-cutover-gate",
+            "/tmp/ext4.img",
+            "--blocks",
+            "4096",
+            "--rounds",
+            "17",
+        ])
+        .expect("read-pool cutover gate should parse");
+
+        match cli.command {
+            Command::ReadPoolCutoverGate {
+                fixture,
+                blocks,
+                rounds,
+            } => {
+                assert_eq!(fixture, PathBuf::from("/tmp/ext4.img"));
+                assert_eq!(blocks, 4096);
+                assert_eq!(rounds, 17);
+            }
+            other => assert!(
+                matches!(other, Command::ReadPoolCutoverGate { .. }),
+                "expected read-pool cutover gate"
+            ),
+        }
+    }
     use tracing::{info, info_span};
     use tracing_subscriber::fmt::MakeWriter;
 
