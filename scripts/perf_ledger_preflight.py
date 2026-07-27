@@ -15,9 +15,12 @@ Four jobs, three exit classes:
                          or pick a different vein.
 
   --lint --staged        Pre-commit mode. Refuse a new or modified REJECT with neither
-                         an A/A null control nor a counted mechanism. Refuse a KEEP
-                         without an in-process self-report of the executing ELF's
-                         SHA-256. Policy failures exit 2; infrastructure failures 64.
+                         an A/A null control nor a counted mechanism. Numeric A/A
+                         decisions must record a bootstrap median CI. Refuse a KEEP
+                         without both that CI and an in-process self-report of the
+                         executing ELF's SHA-256. Refuse every CV gate, including one
+                         deferred into a retry predicate. Policy failures exit 2;
+                         infrastructure failures 64.
 
   --lint [--since REF]   Apply the same rules to the whole ledger or committed rows
                          added since REF.
@@ -110,6 +113,37 @@ EXECUTING_ELF_SHA256 = re.compile(
     re.I,
 )
 
+BOOTSTRAP = re.compile(r"\bbootstrap(?:ped|ping)?\b|\bresampl(?:e|ed|es|ing)\b", re.I)
+MEDIAN = re.compile(r"\bmedian\b", re.I)
+CONFIDENCE_INTERVAL = re.compile(r"\bCI\b|\bconfidence interval\b", re.I)
+CV_MENTION = re.compile(r"\bCVs?\b|\bcoefficients? of variation\b", re.I)
+CV_DISCLAIMER = re.compile(
+    r"\bcv_used\s*=\s*false\b|"
+    r"\b(?:no|not an?|without an?)\s+"
+    r"(?:CVs?|coefficients? of variation)\s+"
+    r"(?:gate|threshold|decision|input)\b|"
+    r"\b(?:never|not|no)\b[^.;|\n]{0,48}"
+    r"\b(?:gate(?:d|s|ing)?|input|decision|consult(?:ed|s|ing)?|used?)\b"
+    r"[^.;|\n]{0,48}\b(?:CVs?|coefficients? of variation)\b|"
+    r"\b(?:CVs?|coefficients? of variation)\b[^.;|\n]{0,48}"
+    r"\b(?:never|not|no)\b[^.;|\n]{0,48}"
+    r"\b(?:gate(?:d|s|ing)?|input|inputs|decision|consulted|used)\b",
+    re.I,
+)
+CV_GATE_WORD = re.compile(
+    r"\b(?:gate(?:d|s|ing)?|threshold|ceiling|admission|admitted|acceptance|"
+    r"accepted|rejection|rejected|decide(?:d|s)?|decision|verdict|required?|"
+    r"requirement|mandatory)\b",
+    re.I,
+)
+CV_COMPARISON = re.compile(
+    r"(?:\bCVs?\b|\bcoefficients? of variation\b)"
+    r"[^.;|\n]{0,40}(?:<=|>=|<|>|≤|≥|\bbelow\b|\bunder\b|\babove\b|\bover\b)"
+    r"|(?:<=|>=|<|>|≤|≥|\bbelow\b|\bunder\b|\babove\b|\bover\b)"
+    r"[^.;|\n]{0,40}(?:\bCVs?\b|\bcoefficients? of variation\b)",
+    re.I,
+)
+
 REJECT_VERDICT = re.compile(
     r"(?:\*\*)?(?:⭐+\s*)?(REJECT|REFUTED|NULL\b|INVALID|NO-SHIP|NOT[- ]A[- ]LEVER|"
     r"NEGATIVE\s*/|BLOCKED|REVERTED|NEG-LEVER)",
@@ -156,15 +190,64 @@ class Row:
         evidence = decision_evidence(self.text)
         if CONTRACT_COUNTED_MECHANISM.search(evidence):
             return True, "counted mechanism"
-        if (
-            CONTRACT_NULL_VALUE.search(evidence)
-            and SAME_INVOCATION_WITNESS.search(evidence)
-        ):
+        if self.has_same_invocation_null_control():
             return True, "same-invocation A/A null control"
         return False, "none"
 
+    def has_same_invocation_null_control(self) -> bool:
+        evidence = decision_evidence(self.text)
+        return bool(
+            CONTRACT_NULL_VALUE.search(evidence)
+            and SAME_INVOCATION_WITNESS.search(evidence)
+        )
+
     def has_executing_elf_sha256(self) -> bool:
         return bool(EXECUTING_ELF_SHA256.search(decision_evidence(self.text)))
+
+    def has_bootstrap_median_ci(self) -> bool:
+        evidence = decision_evidence(self.text)
+        return any(
+            BOOTSTRAP.search(clause)
+            and MEDIAN.search(clause)
+            and CONFIDENCE_INTERVAL.search(clause)
+            for clause in re.split(r"\n|\|", evidence)
+        )
+
+    def uses_cv_as_gate(self) -> bool:
+        # Unlike run evidence, the CV prohibition includes retry predicates: a
+        # newly-written row must not instruct the next agent to resurrect the old
+        # CV gate. Split into short clauses so an explicit "cv_used=false" does
+        # not accidentally excuse a positive CV threshold elsewhere in the row.
+        for clause in re.split(r"(?<=[.;])\s+|\n|\|", self.text):
+            if not CV_MENTION.search(clause):
+                continue
+            if CV_DISCLAIMER.search(clause):
+                continue
+            if CV_GATE_WORD.search(clause) or CV_COMPARISON.search(clause):
+                return True
+        return False
+
+
+def contract_violations(row: Row) -> list[str]:
+    """Return forward-contract violations for one staged decision row."""
+    bad: list[str] = []
+    if row.uses_cv_as_gate():
+        bad.append("CV is used as a gate or threshold (median CI is mandatory)")
+    if row.verdict == "REJECT":
+        ok, _ = row.reject_contract_basis()
+        if not ok:
+            bad.append("no A/A null control and no counted mechanism")
+        elif (
+            row.has_same_invocation_null_control()
+            and not row.has_bootstrap_median_ci()
+        ):
+            bad.append("numeric same-invocation A/A decision has no bootstrap median CI")
+    elif row.verdict == "KEEP":
+        if not row.has_executing_elf_sha256():
+            bad.append("no in-process self-report of the executing ELF's SHA-256")
+        if not row.has_bootstrap_median_ci():
+            bad.append("timed KEEP has no bootstrap median CI")
+    return bad
 
 
 def verdict_of(cells: list[str], title: str, body: str) -> str:
@@ -402,17 +485,9 @@ def cmd_lint(since: str | None, staged: bool) -> int:
                     if not touched.intersection(row_line_span(row)):
                         continue
                 checked[row.verdict] += 1
-                if row.verdict == "REJECT":
-                    ok, _ = row.reject_contract_basis()
-                    if not ok:
-                        bad.append((row, "no A/A null control and no counted mechanism"))
-                elif not row.has_executing_elf_sha256():
-                    bad.append(
-                        (
-                            row,
-                            "no in-process self-report of the executing ELF's SHA-256",
-                        )
-                    )
+                violations = contract_violations(row)
+                if violations:
+                    bad.append((row, "; ".join(violations)))
     except (OSError, RuntimeError) as exc:
         print(f"preflight lint: infrastructure failure: {exc}", file=sys.stderr)
         return 64
@@ -432,9 +507,11 @@ def cmd_lint(since: str | None, staged: bool) -> int:
     for row, why in bad:
         print(f"  {row.ref}\n    {row.text.splitlines()[0][:180]}\n    reason: {why}\n")
     print("A REJECT must record either:")
-    print("  - an A/A null control in the same invocation, or")
+    print("  - an A/A null control in the same invocation with a bootstrap median CI, or")
     print("  - a counted mechanism (instructions/cycles/syscalls/allocs/profile count).")
-    print("A KEEP must record a full SHA-256 self-reported by the executing ELF.")
+    print("A KEEP must record a bootstrap median CI and a full SHA-256")
+    print("self-reported by the executing ELF.")
+    print("CV may be reported as provenance, but it must never be a gate or threshold.")
     print("A neighboring sha256sum is not proof of which binary ran.")
     return 2
 
@@ -480,11 +557,50 @@ def cmd_self_test() -> int:
             .reject_contract_basis()[0],
         ),
         (
+            "A/A reject without bootstrap median CI violates the contract",
+            "bootstrap median CI"
+            in " ".join(
+                contract_violations(
+                    row(
+                        "REJECT: A/A null control 1.004 in the same invocation",
+                        "REJECT",
+                    )
+                )
+            ),
+        ),
+        (
+            "A/A reject with bootstrap median CI satisfies the timing contract",
+            not contract_violations(
+                row(
+                    "REJECT: A/A null control 1.004 in the same invocation; "
+                    "deterministic bootstrap median 95% CI [0.998, 1.009].",
+                    "REJECT",
+                )
+            ),
+        ),
+        (
+            "unrelated bootstrap and median statistics do not synthesize a CI",
+            not row(
+                "REJECT: bootstrap mean CI [0.99, 1.01] | "
+                "A/A null control median 1.004 in the same invocation",
+                "REJECT",
+            ).has_bootstrap_median_ci(),
+        ),
+        (
             "numeric profile admits reject as counted mechanism",
             row(
                 "REJECT: perf profile frame was 3.2% self",
                 "REJECT",
             ).reject_contract_basis()[0],
+        ),
+        (
+            "counted-mechanism reject does not invent a timing CI",
+            not contract_violations(
+                row(
+                    "REJECT: perf profile frame was 3.2% self",
+                    "REJECT",
+                )
+            ),
         ),
         (
             "A/A without same-invocation witness is refused",
@@ -533,6 +649,55 @@ def cmd_self_test() -> int:
                 f"KEEP: in-process executing ELF SHA-256 {sha}",
                 "KEEP",
             ).has_executing_elf_sha256(),
+        ),
+        (
+            "KEEP with self-hash but no bootstrap median CI is refused",
+            "bootstrap median CI"
+            in " ".join(
+                contract_violations(
+                    row(f"KEEP: bench_elf_sha256={sha}; ratio 1.08.", "KEEP")
+                )
+            ),
+        ),
+        (
+            "KEEP with self-hash and bootstrap median CI is admitted",
+            not contract_violations(
+                row(
+                    f"KEEP: bench_elf_sha256={sha}; deterministic bootstrap "
+                    "median 95% CI [1.06, 1.10].",
+                    "KEEP",
+                )
+            ),
+        ),
+        (
+            "positive CV gate is refused",
+            row(
+                "REJECT: perf profile frame was 3.2% self; CV gate passed at 4%.",
+                "REJECT",
+            ).uses_cv_as_gate(),
+        ),
+        (
+            "CV gate hidden in retry predicate is refused",
+            row(
+                "REJECT: perf profile frame was 3.2% self. "
+                "Retry only when all-arm CV < 5%.",
+                "REJECT",
+            ).uses_cv_as_gate(),
+        ),
+        (
+            "machine-readable CV non-use witness is admitted",
+            not row(
+                f"KEEP: bench_elf_sha256={sha}; deterministic bootstrap median "
+                "95% CI [1.06, 1.10]; cv_used=false.",
+                "KEEP",
+            ).uses_cv_as_gate(),
+        ),
+        (
+            "prose never-CV witness is admitted",
+            not row(
+                "REJECT: perf profile frame was 3.2% self; never gate on CV.",
+                "REJECT",
+            ).uses_cv_as_gate(),
         ),
         (
             "literal SURVEY verdict outranks REJECT wording in the surface",
@@ -612,7 +777,8 @@ def cmd_self_test() -> int:
 
 HOOK = """#!/usr/bin/env bash
 # frankenfs perf-ledger preflight (installed by scripts/perf_ledger_preflight.py)
-# Refuses a staged REJECT without A/A/count evidence and a staged KEEP without an
+# Refuses a staged REJECT without A/A/count evidence, any CV gate, and a timed
+# decision without bootstrap median-CI evidence. KEEP also requires an
 # executing-ELF SHA-256 self-report. See fleet broadcast 2, 2026-07-25.
 exec python3 "$(git rev-parse --show-toplevel)/scripts/perf_ledger_preflight.py" \\
      --lint --staged

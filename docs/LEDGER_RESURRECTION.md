@@ -726,7 +726,7 @@ the complete training/profile-use flow and an explicit PGO identity.
 
 The current **205/281 = 73.0% VOID** census is a monitored snapshot, not a one-time
 audit. The forward invariant is sharper: the **205-row VOID numerator must not grow**
-as new decisions are added. `scripts/perf_ledger_preflight.py` implements three
+as new decisions are added. `scripts/perf_ledger_preflight.py` implements four
 mechanical checks:
 
 1. `--candidate "<lever>" --surface "<target>"` searches both canonical
@@ -736,16 +736,23 @@ mechanical checks:
    the function, module, or benchmark surface they intend to touch.
 2. `--lint --staged` reads the Git index, not the potentially different shared
    working tree. A new or modified REJECT is blocked unless its row records
-   either an A/A null control from the same invocation or a counted mechanism
-   such as instructions, cycles, syscalls, allocations, or numeric profile
-   attribution. A future requirement written only in the retry clause is
-   excluded from the just-completed run's evidence.
-3. The same staged lint blocks a KEEP unless its row contains a full SHA-256
-   emitted from inside the executing process. The accepted machine-readable
-   witnesses are `bench_elf_sha256=...`,
+   either a counted mechanism such as instructions, cycles, syscalls,
+   allocations, or numeric profile attribution, or a numeric A/A null control
+   from the same invocation **plus a bootstrap median confidence interval**.
+   A future requirement written only in the retry clause is excluded from the
+   just-completed run's evidence.
+3. The same staged lint blocks a KEEP unless its row contains both a bootstrap
+   median confidence interval and a full SHA-256 emitted from inside the
+   executing process. The accepted machine-readable hash witnesses are
+   `bench_elf_sha256=...`,
    `bench_evidence,binary_sha256=...`, or an equivalently explicit
    executing-ELF self-report. An adjacent `sha256sum` is intentionally
    insufficient because it cannot prove which binary executed.
+4. A positive coefficient-of-variation gate or threshold is refused in every
+   new decision row. This includes a stale `CV < 5%` requirement deferred into
+   the retry predicate. CV may be reported as provenance only when the row
+   explicitly states that it was not a decision input; bootstrap median CI is
+   the timing gate.
 
 Policy failures use exit **2**; preflight infrastructure failures use exit
 **64** and fail closed. The active checkout installs this guard with:
@@ -756,8 +763,9 @@ python3 scripts/perf_ledger_preflight.py --install-hook
 
 The hook invokes `--lint --staged`, so unstaged peer edits cannot alter the
 commit decision and the old inert `HEAD...HEAD` comparison cannot silently pass.
-`--self-test` exercises the A/A, counted-mechanism, adjacent-hash rejection,
-in-process-hash acceptance, and surface-match predicates without Cargo.
+`--self-test` exercises the A/A, counted-mechanism, median-CI, forbidden-CV,
+adjacent-hash rejection, in-process-hash acceptance, and surface-match
+predicates without Cargo.
 `--audit` remains the reproducible whole-ledger census.
 
 This gate does not retroactively certify the 205 historical VOID rows and does
@@ -770,8 +778,28 @@ corresponding self-test before relying on it.
 Validation on 2026-07-26 was source-only because of the `/data` disk emergency:
 the thirteen policy self-checks passed, the then-live audit reproduced **274 REJECT /
 205 VOID (74.8%)**, and a known `SnapshotRegistry` publication candidate was
-blocked with the matching ledger rows and recorded retry predicate. The
+blocked with the matching ledger rows and recorded retry predicate. The first
 2026-07-27 source-only refresh passed all fourteen checks and reported
 **281 REJECT / 205 VOID (73.0%)**: seven admissible decisions were added without
-adding an undecidable row. Neither validation needed Cargo, RCH, a benchmark, or
-a test binary.
+adding an undecidable row. The `bd-qcjg5` hardening then passed all **25** policy
+checks and reported **285 REJECT / 205 VOID (71.9%)**. The four intervening
+REJECT decisions therefore did not grow the VOID numerator. Neither validation
+needed Cargo, RCH, a benchmark, or a test binary.
+
+### 2026-07-27 — `bd-qcjg5` median-CI-only gate hardening
+
+**CONTRACT KEEP (source-only):** the active staged-index preflight now makes the
+remaining Meta-Lever 2 decision rule mandatory. A timed KEEP cannot be written
+without both an executing-ELF self-report and a bootstrap median CI. A numeric
+same-invocation A/A REJECT cannot be written without a bootstrap median CI.
+Counted-mechanism REJECTs remain valid without invented timing evidence. Any
+positive CV gate or threshold fails, including one placed only in a retry
+predicate; explicit `cv_used=false` or equivalent provenance remains accepted.
+The hook still calls `--lint --staged`, so this policy change is immediately in
+the non-optional pre-commit path.
+
+**Retry predicate:** revisit these recognizers only if a real staged row with
+the complete executing-ELF/A/A/bootstrap-median-CI contract is falsely blocked,
+or a deliberately malformed synthetic row passes one of the 25 self-checks.
+Any grammar extension must add a failing-then-passing self-check before its
+marker is accepted.

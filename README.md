@@ -1882,15 +1882,18 @@ python3 scripts/perf_ledger_preflight.py \
 ```
 
 The installed pre-commit hook exits 2 for a new or modified REJECT lacking
-either a same-invocation A/A null control or a counted mechanism, and for a KEEP
-lacking a full SHA-256 self-reported by the executing ELF. A hash computed next
-to the run is deliberately not accepted. Candidate preflight also exits 2 when
-the target surface matches prior negative evidence and prints that row's retry
+either a counted mechanism or a same-invocation A/A null control with a
+bootstrap median CI. A KEEP requires both that median-CI evidence and a full
+SHA-256 self-reported by the executing ELF; a hash computed next to the run is
+deliberately not accepted. The hook also refuses a positive CV gate or
+threshold, including `CV < 5%` deferred into a retry predicate. CV may be
+reported only as non-decision provenance. Candidate preflight exits 2 when the
+target surface matches prior negative evidence and prints that row's retry
 predicate. When `--surface` includes a qualified function or module identifier,
 at least one prior row must name that identifier family; generic terms such as a
 container type cannot make an unrelated frontier look closed. `--audit`
-reproduces the whole-ledger census; `--self-test` validates the policy predicates
-without invoking Cargo.
+reproduces the whole-ledger census; `--self-test` validates the policy
+predicates without invoking Cargo.
 When honest scrutiny contradicted an earlier claim,
 it was corrected in the open: a previously-reported "1.7× faster than kernel"
 cold-read row flipped
