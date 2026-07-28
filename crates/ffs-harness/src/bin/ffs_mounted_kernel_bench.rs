@@ -4,12 +4,13 @@
 //!
 //! The harness owns four live mounts in one invocation:
 //! two byte-identical kernel filesystems and two byte-identical FrankenFS FUSE
-//! filesystems. A balanced schedule interleaves all four arms, so the two
-//! kernel mounts provide an incumbent A/A null and the two FUSE mounts provide
-//! a candidate A/A null. Competitive latency is reported only when both null
-//! confidence intervals are tight, mount identity is proven at runtime, the
-//! FUSE daemons self-report their executing ELF SHA-256, and untimed content
-//! and metadata parity pass.
+//! filesystems. A balanced physical-arm crossover interleaves all four mounts,
+//! so the two kernel mounts provide an incumbent A/A null and the two FUSE
+//! mounts provide a candidate A/A null without confounding either null with a
+//! fixed image or loop-device effect. Competitive latency is reported only
+//! when both crossover-block null confidence intervals are tight, mount
+//! identity is proven at runtime, the FUSE daemons self-report their executing
+//! ELF SHA-256, and untimed content and metadata parity pass.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
@@ -42,6 +43,11 @@ const MAX_FUSE_PREFLIGHT_BUSY: f64 = 0.35;
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
 const PARALLEL_THREADS: usize = 8;
 const PARALLEL_READ_FILE_BYTES: usize = 256 * 1024;
+const WARMUP_ROUNDS: usize = 8;
+const PHYSICAL_ROLE_CROSSOVER_ROUNDS: usize = 2;
+const ESTIMATOR_BLOCK_ROUNDS: usize = 4;
+const ESTIMATOR_BLOCK_DIVISOR: f64 = 4.0;
+const MAX_ARM_SETTLE_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FilesystemKind {
@@ -135,6 +141,7 @@ struct Config {
     observation_repeats: usize,
     image_size_mib: u64,
     maximum_null_ratio: f64,
+    arm_settle_ms: u64,
     output: Option<PathBuf>,
 }
 
@@ -150,6 +157,7 @@ impl Default for Config {
             observation_repeats: 3,
             image_size_mib: 256,
             maximum_null_ratio: 1.025,
+            arm_settle_ms: 100,
             output: None,
         }
     }
@@ -170,6 +178,15 @@ impl Arm {
             Self::KernelB => "kernel_b",
             Self::FuseA => "fuse_a",
             Self::FuseB => "fuse_b",
+        }
+    }
+
+    const fn crossover_peer(self) -> Self {
+        match self {
+            Self::KernelA => Self::KernelB,
+            Self::KernelB => Self::KernelA,
+            Self::FuseA => Self::FuseB,
+            Self::FuseB => Self::FuseA,
         }
     }
 }
@@ -253,7 +270,10 @@ struct FfsBinaryIdentity {
 
 #[derive(Debug)]
 struct TimedSamples {
+    /// Samples indexed by the counterbalanced logical A/B assignment.
     values: BTreeMap<Arm, Vec<u64>>,
+    /// The same samples indexed by the physical image/mount that executed.
+    physical_values: BTreeMap<Arm, Vec<u64>>,
     digests: BTreeMap<Arm, u64>,
 }
 
@@ -402,6 +422,7 @@ fn usage() {
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
            --maximum-null-ratio R         Max symmetric A/A CI spread (default 1.025)\n\
+           --arm-settle-ms N              Untimed delay after every arm (default 100)\n\
            --out PATH                     JSON report path (default inside run dir)\n\
            -h, --help                     Show this help"
     );
@@ -418,6 +439,20 @@ where
     value
         .parse::<T>()
         .map_err(|error| anyhow!("invalid value for {name}: {value}: {error}"))
+}
+
+fn parse_workload(value: &str) -> Result<Workload> {
+    match value {
+        "warm-stat" => Ok(Workload::WarmStat),
+        "parallel-metadata-write-8t" => Ok(Workload::ParallelMetadataWrite8),
+        "parallel-read-8t" => Ok(Workload::ParallelRead8),
+        "create-delete-storm" => Ok(Workload::CreateDeleteStorm),
+        "readdir-stat-8t" => Ok(Workload::ReaddirStat8),
+        "fsync-journal-commit" => Ok(Workload::FsyncJournalCommit),
+        _ => bail!(
+            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write-8t|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit"
+        ),
+    }
 }
 
 fn parse_args() -> Result<Option<Config>> {
@@ -448,17 +483,7 @@ fn parse_args() -> Result<Option<Config>> {
             }
             "--workload" => {
                 let value = parse_value::<String>(&args, &mut index, "--workload")?;
-                config.workload = match value.as_str() {
-                    "warm-stat" => Workload::WarmStat,
-                    "parallel-metadata-write-8t" => Workload::ParallelMetadataWrite8,
-                    "parallel-read-8t" => Workload::ParallelRead8,
-                    "create-delete-storm" => Workload::CreateDeleteStorm,
-                    "readdir-stat-8t" => Workload::ReaddirStat8,
-                    "fsync-journal-commit" => Workload::FsyncJournalCommit,
-                    _ => bail!(
-                        "unsupported --workload {value}; expected warm-stat|parallel-metadata-write-8t|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit"
-                    ),
-                };
+                config.workload = parse_workload(&value)?;
             }
             "--pairs" => config.pairs = parse_value(&args, &mut index, "--pairs")?,
             "--operations" => {
@@ -473,6 +498,9 @@ fn parse_args() -> Result<Option<Config>> {
             }
             "--maximum-null-ratio" => {
                 config.maximum_null_ratio = parse_value(&args, &mut index, "--maximum-null-ratio")?;
+            }
+            "--arm-settle-ms" => {
+                config.arm_settle_ms = parse_value(&args, &mut index, "--arm-settle-ms")?;
             }
             "--out" => config.output = Some(parse_value(&args, &mut index, "--out")?),
             other => bail!("unknown argument: {other}"),
@@ -514,6 +542,10 @@ fn parse_args() -> Result<Option<Config>> {
     ensure!(
         config.maximum_null_ratio > 1.0,
         "--maximum-null-ratio must exceed 1.0"
+    );
+    ensure!(
+        config.arm_settle_ms <= MAX_ARM_SETTLE_MS,
+        "--arm-settle-ms must be at most {MAX_ARM_SETTLE_MS}"
     );
     Ok(Some(config))
 }
@@ -1583,6 +1615,33 @@ fn observe(root: &Path, config: &Config, sequence: usize) -> Result<(u64, u64)> 
     Ok((best, expected_digest.unwrap_or(0)))
 }
 
+const fn physical_arm_for(logical_arm: Arm, round: usize) -> Arm {
+    if round % PHYSICAL_ROLE_CROSSOVER_ROUNDS == 0 {
+        logical_arm
+    } else {
+        logical_arm.crossover_peer()
+    }
+}
+
+fn quiesce_arm(root: &Path, config: &Config) -> Result<()> {
+    if config.workload.is_mutating() {
+        let output = Command::new("sync")
+            .arg("-f")
+            .arg(root)
+            .output()
+            .with_context(|| format!("syncfs quiescence for {}", root.display()))?;
+        ensure!(
+            output.status.success(),
+            "syncfs quiescence failed for {}: status={} stderr={}",
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    thread::sleep(Duration::from_millis(config.arm_settle_ms));
+    Ok(())
+}
+
 fn collect_samples(
     roots: &BTreeMap<Arm, PathBuf>,
     config: &Config,
@@ -1594,19 +1653,29 @@ fn collect_samples(
         (Arm::FuseA, 0_usize),
         (Arm::FuseB, 0_usize),
     ]);
-    for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
-        let root = roots
-            .get(&arm)
-            .ok_or_else(|| anyhow!("missing workload root for {}", arm.label()))?;
-        for _ in 0..2 {
-            let sequence = next_sequences[&arm];
+    for round in 0..WARMUP_ROUNDS {
+        for logical_arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
+            let physical_arm = physical_arm_for(logical_arm, round);
+            let root = roots
+                .get(&physical_arm)
+                .ok_or_else(|| anyhow!("missing workload root for {}", physical_arm.label()))?;
+            let sequence = next_sequences[&physical_arm];
             let (_, digest) = workload_batch(root, config, sequence)?;
-            *next_sequences.get_mut(&arm).expect("all arms initialized") += 1;
+            *next_sequences
+                .get_mut(&physical_arm)
+                .expect("all arms initialized") += 1;
             black_box(digest);
+            quiesce_arm(root, config)?;
         }
     }
 
     let mut values = BTreeMap::from([
+        (Arm::KernelA, Vec::with_capacity(config.pairs)),
+        (Arm::KernelB, Vec::with_capacity(config.pairs)),
+        (Arm::FuseA, Vec::with_capacity(config.pairs)),
+        (Arm::FuseB, Vec::with_capacity(config.pairs)),
+    ]);
+    let mut physical_values = BTreeMap::from([
         (Arm::KernelA, Vec::with_capacity(config.pairs)),
         (Arm::KernelB, Vec::with_capacity(config.pairs)),
         (Arm::FuseA, Vec::with_capacity(config.pairs)),
@@ -1618,24 +1687,32 @@ fn collect_samples(
             !interrupted.load(Ordering::Relaxed),
             "interrupted during timed workload"
         );
-        for arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
+        for logical_arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
+            let physical_arm = physical_arm_for(logical_arm, round);
             let root = roots
-                .get(&arm)
-                .ok_or_else(|| anyhow!("missing workload root for {}", arm.label()))?;
-            let sequence = next_sequences[&arm];
+                .get(&physical_arm)
+                .ok_or_else(|| anyhow!("missing workload root for {}", physical_arm.label()))?;
+            let sequence = next_sequences[&physical_arm];
             let (elapsed, digest) = observe(root, config, sequence)?;
-            *next_sequences.get_mut(&arm).expect("all arms initialized") += 1;
+            *next_sequences
+                .get_mut(&physical_arm)
+                .expect("all arms initialized") += 1;
             values
-                .get_mut(&arm)
+                .get_mut(&logical_arm)
                 .expect("all arms initialized")
                 .push(elapsed);
-            if let Some(expected) = digests.insert(arm, digest) {
+            physical_values
+                .get_mut(&physical_arm)
+                .expect("all physical arms initialized")
+                .push(elapsed);
+            if let Some(expected) = digests.insert(physical_arm, digest) {
                 ensure!(
                     expected == digest,
                     "{} workload digest changed across rounds",
-                    arm.label()
+                    physical_arm.label()
                 );
             }
+            quiesce_arm(root, config)?;
         }
     }
     let expected_digest = digests
@@ -1646,7 +1723,11 @@ fn collect_samples(
         digests.values().all(|digest| *digest == expected_digest),
         "workload result parity failed across mounted arms: {digests:?}"
     );
-    Ok(TimedSamples { values, digests })
+    Ok(TimedSamples {
+        values,
+        physical_values,
+        digests,
+    })
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -1691,19 +1772,27 @@ fn bootstrap_median_ci(log_ratios: &[f64], seed: u64) -> BootstrapMedianCi {
     }
 }
 
-fn paired_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f64>> {
+fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f64>> {
     ensure!(
         numerator.len() == denominator.len() && !numerator.is_empty(),
         "paired ratio arms must be non-empty and equal length"
     );
-    numerator
+    ensure!(
+        numerator.len() % ESTIMATOR_BLOCK_ROUNDS == 0,
+        "paired ratio arms must contain complete crossover blocks"
+    );
+    let per_round = numerator
         .iter()
         .zip(denominator)
         .map(|(&num, &den)| {
             ensure!(num > 0 && den > 0, "timed samples must be positive");
             Ok((num as f64).ln() - (den as f64).ln())
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(per_round
+        .chunks_exact(ESTIMATOR_BLOCK_ROUNDS)
+        .map(|block| block.iter().sum::<f64>() / ESTIMATOR_BLOCK_DIVISOR)
+        .collect())
 }
 
 fn competitive_log_ratios(samples: &TimedSamples) -> Result<Vec<f64>> {
@@ -1717,7 +1806,11 @@ fn competitive_log_ratios(samples: &TimedSamples) -> Result<Vec<f64>> {
             && kernel_a.len() == fuse_b.len(),
         "competitive arms must have equal sample counts"
     );
-    Ok(kernel_a
+    ensure!(
+        kernel_a.len() % ESTIMATOR_BLOCK_ROUNDS == 0,
+        "competitive arms must contain complete crossover blocks"
+    );
+    let per_round = kernel_a
         .iter()
         .zip(kernel_b)
         .zip(fuse_a.iter().zip(fuse_b))
@@ -1728,6 +1821,10 @@ fn competitive_log_ratios(samples: &TimedSamples) -> Result<Vec<f64>> {
                     - (kernel_right as f64).ln())
             },
         )
+        .collect::<Vec<_>>();
+    Ok(per_round
+        .chunks_exact(ESTIMATOR_BLOCK_ROUNDS)
+        .map(|block| block.iter().sum::<f64>() / ESTIMATOR_BLOCK_DIVISOR)
         .collect())
 }
 
@@ -2184,14 +2281,14 @@ fn fs_report(
 
     let samples = collect_samples(&roots, config, interrupted)?;
     let kernel_null = bootstrap_median_ci(
-        &paired_log_ratios(
+        &crossover_log_ratios(
             &samples.values[&Arm::KernelA],
             &samples.values[&Arm::KernelB],
         )?,
         0x4B45_524E_454C_4141,
     );
     let fuse_null = bootstrap_median_ci(
-        &paired_log_ratios(&samples.values[&Arm::FuseA], &samples.values[&Arm::FuseB])?,
+        &crossover_log_ratios(&samples.values[&Arm::FuseA], &samples.values[&Arm::FuseB])?,
         0x4655_5345_5F41_4141,
     );
     let fuse_over_kernel =
@@ -2204,7 +2301,7 @@ fn fs_report(
 
     for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
         println!(
-            "mounted_kernel_arm,filesystem={},workload={},arm={},median_wall_ns={:.0},samples={}",
+            "mounted_kernel_arm,filesystem={},workload={},assignment_arm={},median_wall_ns={:.0},samples={}",
             kind.label(),
             config.workload.label(),
             arm.label(),
@@ -2215,6 +2312,19 @@ fn fs_report(
                     .collect()
             ),
             samples.values[&arm].len(),
+        );
+        println!(
+            "mounted_kernel_physical_arm,filesystem={},workload={},physical_arm={},median_wall_ns={:.0},samples={}",
+            kind.label(),
+            config.workload.label(),
+            arm.label(),
+            median(
+                samples.physical_values[&arm]
+                    .iter()
+                    .map(|&value| value as f64)
+                    .collect()
+            ),
+            samples.physical_values[&arm].len(),
         );
     }
     println!(
@@ -2253,7 +2363,7 @@ fn fs_report(
         expected_initial_tree.bytes,
     );
     println!(
-        "mounted_kernel_null,filesystem={},workload={},arm=kernel,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},clear={}",
+        "mounted_kernel_null,filesystem={},workload={},arm=kernel,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
         kind.label(),
         config.workload.label(),
         kernel_null.median,
@@ -2261,10 +2371,11 @@ fn fs_report(
         kernel_null.high,
         kernel_null.symmetric_spread(),
         config.maximum_null_ratio,
+        config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         kernel_clear,
     );
     println!(
-        "mounted_kernel_null,filesystem={},workload={},arm=fuse,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},clear={}",
+        "mounted_kernel_null,filesystem={},workload={},arm=fuse,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
         kind.label(),
         config.workload.label(),
         fuse_null.median,
@@ -2272,15 +2383,17 @@ fn fs_report(
         fuse_null.high,
         fuse_null.symmetric_spread(),
         config.maximum_null_ratio,
+        config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         fuse_clear,
     );
     println!(
-        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},client_threads={},operations_per_observation={},pairs={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},admitted={},verdict={},gate_basis=bootstrap_median_ci,bootstrap_resamples={},cv_used=false,instructions_used=false",
+        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},client_threads={},operations_per_observation={},pairs={},crossover_blocks={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},admitted={},verdict={},gate_basis=four_round_balanced_crossover_bootstrap_median_ci,bootstrap_resamples={},cv_used=false,instructions_used=false",
         kind.label(),
         config.workload.label(),
         config.workload.client_threads(),
         config.operations,
         config.pairs,
+        config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         config.workload.observation_reducer(),
         config.observation_repeats,
         fuse_over_kernel.median,
@@ -2293,6 +2406,11 @@ fn fs_report(
 
     let raw_samples = samples
         .values
+        .iter()
+        .map(|(arm, values)| (arm.label().to_owned(), json!(values)))
+        .collect::<serde_json::Map<_, _>>();
+    let raw_physical_samples = samples
+        .physical_values
         .iter()
         .map(|(arm, values)| (arm.label().to_owned(), json!(values)))
         .collect::<serde_json::Map<_, _>>();
@@ -2348,6 +2466,17 @@ fn fs_report(
         "client_threads": config.workload.client_threads(),
         "operations_per_observation": config.operations,
         "pairs": config.pairs,
+        "crossover_blocks": config.pairs / ESTIMATOR_BLOCK_ROUNDS,
+        "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
+        "physical_role_crossover_rounds": PHYSICAL_ROLE_CROSSOVER_ROUNDS,
+        "warmup_rounds": WARMUP_ROUNDS,
+        "arm_settle_ms": config.arm_settle_ms,
+        "between_arm_quiescence": if config.workload.is_mutating() {
+            "sync -f physical mount outside timed interval, then settle"
+        } else {
+            "read-only; settle only"
+        },
+        "cache_regime": "identical balanced warm-cache rounds; no global cache drop",
         "observation_repeats": config.observation_repeats,
         "observation_reducer": config.workload.observation_reducer(),
         "identities": identities,
@@ -2376,6 +2505,7 @@ fn fs_report(
         },
         "pre_measurement_cpu_busy": contention,
         "raw_wall_ns": raw_samples,
+        "raw_physical_wall_ns": raw_physical_samples,
         "workload_digests": workload_digests,
         "kernel_aa": {
             "median": kernel_null.median,
@@ -2398,7 +2528,7 @@ fn fs_report(
         },
         "maximum_null_ratio": config.maximum_null_ratio,
         "gate_metric": "wall_ns",
-        "gate_basis": "bootstrap_median_ci",
+        "gate_basis": "four_round_balanced_crossover_bootstrap_median_ci",
         "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
         "cv_used": false,
         "instructions_used": false,
@@ -2527,7 +2657,7 @@ fn run() -> Result<Option<PathBuf>> {
 
     let free_after = free_bytes_on_data()?;
     let report = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "harness": "ffs-mounted-kernel-bench",
         "harness_binary_sha256": harness_sha,
         "ffs_cli": fs::canonicalize(&config.ffs_cli)?,
@@ -2568,7 +2698,20 @@ fn run() -> Result<Option<PathBuf>> {
         },
         "workload": config.workload.label(),
         "client_threads": config.workload.client_threads(),
-        "schedule": "balanced four-arm interleave with independent kernel and FUSE A/A",
+        "schedule": {
+            "kind": "balanced four-arm interleave with independent kernel and FUSE A/A",
+            "physical_role_assignment": "A/B physical mounts exchange logical roles every round",
+            "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
+            "physical_role_crossover_rounds": PHYSICAL_ROLE_CROSSOVER_ROUNDS,
+            "warmup_rounds": WARMUP_ROUNDS,
+            "arm_settle_ms": config.arm_settle_ms,
+            "mutating_quiescence": if config.workload.is_mutating() {
+                "sync -f physical mount outside timed interval"
+            } else {
+                "not applicable"
+            },
+            "cache_regime": "identical balanced warm-cache rounds; no global cache drop",
+        },
         "filesystems": filesystem_reports,
     });
     if let Some(parent) = output.parent() {
@@ -2616,6 +2759,36 @@ mod tests {
                         .iter()
                         .enumerate()
                         .filter_map(move |(index, candidate)| (*candidate == arm).then_some(index))
+                })
+                .collect();
+            assert_eq!(positions, BTreeSet::from([0, 1, 2, 3]));
+        }
+    }
+
+    #[test]
+    fn crossover_exchanges_physical_roles_and_preserves_side() {
+        assert_eq!(physical_arm_for(Arm::KernelA, 0), Arm::KernelA);
+        assert_eq!(physical_arm_for(Arm::KernelA, 1), Arm::KernelB);
+        assert_eq!(physical_arm_for(Arm::KernelB, 1), Arm::KernelA);
+        assert_eq!(physical_arm_for(Arm::FuseA, 0), Arm::FuseA);
+        assert_eq!(physical_arm_for(Arm::FuseA, 1), Arm::FuseB);
+        assert_eq!(physical_arm_for(Arm::FuseB, 1), Arm::FuseA);
+    }
+
+    #[test]
+    fn crossover_schedule_puts_every_physical_arm_in_every_position() {
+        for physical_arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+            let positions: BTreeSet<usize> = BALANCED_ORDERS
+                .iter()
+                .enumerate()
+                .flat_map(|(round, order)| {
+                    order
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(position, logical_arm)| {
+                            (physical_arm_for(*logical_arm, round) == physical_arm)
+                                .then_some(position)
+                        })
                 })
                 .collect();
             assert_eq!(positions, BTreeSet::from([0, 1, 2, 3]));
@@ -2673,14 +2846,24 @@ mod tests {
     }
 
     #[test]
+    fn crossover_null_cancels_fixed_physical_arm_bias() {
+        let logical_a = [100, 120, 100, 120];
+        let logical_b = [120, 100, 120, 100];
+        let ratios = crossover_log_ratios(&logical_a, &logical_b).expect("crossover ratios");
+        assert_eq!(ratios.len(), 1);
+        assert!(ratios.iter().all(|ratio| ratio.abs() < 1e-12));
+    }
+
+    #[test]
     fn competitive_ratio_uses_both_aa_arms() {
         let samples = TimedSamples {
             values: BTreeMap::from([
-                (Arm::KernelA, vec![10, 10]),
-                (Arm::KernelB, vec![10, 10]),
-                (Arm::FuseA, vec![40, 40]),
-                (Arm::FuseB, vec![40, 40]),
+                (Arm::KernelA, vec![10, 10, 10, 10]),
+                (Arm::KernelB, vec![10, 10, 10, 10]),
+                (Arm::FuseA, vec![40, 40, 40, 40]),
+                (Arm::FuseB, vec![40, 40, 40, 40]),
             ]),
+            physical_values: BTreeMap::new(),
             digests: BTreeMap::new(),
         };
         let ratios = competitive_log_ratios(&samples).expect("competitive ratios");
