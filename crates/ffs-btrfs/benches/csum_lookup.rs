@@ -17,8 +17,9 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_btrfs::{
     BTRFS_EXTENT_CSUM_OBJECTID, BTRFS_ITEM_EXTENT_CSUM, BTRFS_ITEM_EXTENT_DATA_REF,
-    BTRFS_ITEM_EXTENT_ITEM, BtrfsBTree, BtrfsExtentAllocator, BtrfsExtentDataRef, BtrfsExtentItem,
-    BtrfsKey, InMemoryCowBtrfsTree, lookup_data_block_csum,
+    BTRFS_ITEM_EXTENT_ITEM, BTRFS_ITEM_METADATA_ITEM, BtrfsBTree, BtrfsExtentAllocator,
+    BtrfsExtentDataRef, BtrfsExtentItem, BtrfsKey, BtrfsMutationError, InMemoryCowBtrfsTree,
+    lookup_data_block_csum,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -44,6 +45,11 @@ const EXTENT_REFS_REPEATS: usize = 4;
 const EXTENT_REFS_BASE: u64 = 4 << 30;
 const EXTENT_REFS_OBSERVATIONS: usize = 3;
 const MIN_EXTENT_REFS_SAVED_FRACTION: f64 = 0.05;
+const LOCATE_EXTENT_ITEMS: usize = 4096;
+const LOCATE_EXTENT_REPEATS: usize = 4;
+const LOCATE_EXTENT_BASE: u64 = 5 << 30;
+const LOCATE_EXTENT_OBSERVATIONS: usize = 3;
+const MIN_LOCATE_EXTENT_SAVED_FRACTION: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 struct BootstrapMedianCi {
@@ -1014,6 +1020,428 @@ fn extent_item_refs_contract(candidate_arm: ExtentRefsArm) {
     decide_extent_refs_samples(mode, &samples);
 }
 
+type LocateExtentOneOperation =
+    fn(&BtrfsExtentAllocator, u64, u64, bool) -> Result<BtrfsKey, BtrfsMutationError>;
+type LocateExtentOperation = fn(&BtrfsExtentAllocator, &[LocateExtentProbe]) -> u64;
+
+#[derive(Clone, Copy)]
+enum LocateExtentArm {
+    BorrowedModel,
+    ProductionCandidate,
+}
+
+#[derive(Clone, Copy)]
+struct LocateExtentProbe {
+    bytenr: u64,
+    num_bytes: u64,
+    is_metadata: bool,
+    expected: BtrfsKey,
+}
+
+struct LocateExtentSamples {
+    control_lhs_ns: Vec<f64>,
+    control_rhs_ns: Vec<f64>,
+    candidate_ns: Vec<f64>,
+    raw_pairs: String,
+}
+
+fn locate_extent_fixture() -> (BtrfsExtentAllocator, Vec<LocateExtentProbe>) {
+    let mut alloc = BtrfsExtentAllocator::new(1).expect("locate extent allocator");
+    let mut probes = Vec::with_capacity(LOCATE_EXTENT_ITEMS);
+    for index in 0..LOCATE_EXTENT_ITEMS {
+        let index = u64::try_from(index).expect("locate extent index fits in u64");
+        let bytenr = LOCATE_EXTENT_BASE + index * 4096;
+        let num_bytes = 4096 + (index % 4) * 4096;
+        let is_metadata = index % 2 == 0;
+        let key = BtrfsKey {
+            objectid: bytenr,
+            item_type: if is_metadata {
+                BTRFS_ITEM_METADATA_ITEM
+            } else {
+                BTRFS_ITEM_EXTENT_ITEM
+            },
+            offset: if is_metadata { index % 8 } else { num_bytes },
+        };
+        let item = BtrfsExtentItem {
+            refs: 1 + index % 7,
+            generation: 100 + index,
+            flags: if is_metadata {
+                BtrfsExtentItem::FLAG_TREE_BLOCK
+            } else {
+                BtrfsExtentItem::FLAG_DATA
+            },
+        };
+        alloc
+            .extent_tree_mut()
+            .insert(key, &item.to_bytes())
+            .expect("insert locate extent item");
+        probes.push(LocateExtentProbe {
+            bytenr,
+            num_bytes,
+            is_metadata,
+            expected: key,
+        });
+    }
+    (alloc, probes)
+}
+
+fn materialized_locate_extent_key(
+    alloc: &BtrfsExtentAllocator,
+    bytenr: u64,
+    num_bytes: u64,
+    is_metadata: bool,
+) -> Result<BtrfsKey, BtrfsMutationError> {
+    let item_type = if is_metadata {
+        BTRFS_ITEM_METADATA_ITEM
+    } else {
+        BTRFS_ITEM_EXTENT_ITEM
+    };
+    if is_metadata {
+        let lo = BtrfsKey {
+            objectid: bytenr,
+            item_type,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: bytenr,
+            item_type,
+            offset: u64::MAX,
+        };
+        alloc
+            .extent_tree()
+            .range(&lo, &hi)?
+            .into_iter()
+            .next()
+            .map(|(key, _)| key)
+            .ok_or(BtrfsMutationError::KeyNotFound)
+    } else {
+        let key = BtrfsKey {
+            objectid: bytenr,
+            item_type,
+            offset: num_bytes,
+        };
+        if alloc.extent_tree().range(&key, &key)?.is_empty() {
+            Err(BtrfsMutationError::KeyNotFound)
+        } else {
+            Ok(key)
+        }
+    }
+}
+
+fn borrowed_locate_extent_key(
+    alloc: &BtrfsExtentAllocator,
+    bytenr: u64,
+    num_bytes: u64,
+    is_metadata: bool,
+) -> Result<BtrfsKey, BtrfsMutationError> {
+    let item_type = if is_metadata {
+        BTRFS_ITEM_METADATA_ITEM
+    } else {
+        BTRFS_ITEM_EXTENT_ITEM
+    };
+    let lo = BtrfsKey {
+        objectid: bytenr,
+        item_type,
+        offset: if is_metadata { 0 } else { num_bytes },
+    };
+    let hi = BtrfsKey {
+        objectid: bytenr,
+        item_type,
+        offset: if is_metadata { u64::MAX } else { num_bytes },
+    };
+    let mut found = None;
+    alloc.extent_tree().range_with(&lo, &hi, |key, _| {
+        if found.is_none() {
+            found = Some(key);
+        }
+    })?;
+    found.ok_or(BtrfsMutationError::KeyNotFound)
+}
+
+fn production_locate_extent_key(
+    alloc: &BtrfsExtentAllocator,
+    bytenr: u64,
+    num_bytes: u64,
+    is_metadata: bool,
+) -> Result<BtrfsKey, BtrfsMutationError> {
+    alloc.bench_locate_extent_key(bytenr, num_bytes, is_metadata)
+}
+
+fn fold_located_extent_key(digest: u64, key: BtrfsKey) -> u64 {
+    digest
+        .rotate_left(9)
+        .wrapping_mul(1_000_003)
+        .wrapping_add(key.objectid)
+        .rotate_left(7)
+        .wrapping_add(u64::from(key.item_type))
+        .rotate_left(5)
+        .wrapping_add(key.offset)
+}
+
+#[inline(never)]
+fn materialized_locate_extent_batch(
+    alloc: &BtrfsExtentAllocator,
+    probes: &[LocateExtentProbe],
+) -> u64 {
+    locate_extent_batch(materialized_locate_extent_key, alloc, probes)
+}
+
+#[inline(never)]
+fn borrowed_locate_extent_batch(alloc: &BtrfsExtentAllocator, probes: &[LocateExtentProbe]) -> u64 {
+    locate_extent_batch(borrowed_locate_extent_key, alloc, probes)
+}
+
+#[inline(never)]
+fn production_locate_extent_batch(
+    alloc: &BtrfsExtentAllocator,
+    probes: &[LocateExtentProbe],
+) -> u64 {
+    locate_extent_batch(production_locate_extent_key, alloc, probes)
+}
+
+fn locate_extent_batch(
+    operation: LocateExtentOneOperation,
+    alloc: &BtrfsExtentAllocator,
+    probes: &[LocateExtentProbe],
+) -> u64 {
+    let mut digest = 0_u64;
+    for _ in 0..LOCATE_EXTENT_REPEATS {
+        for probe in probes {
+            let key = operation(alloc, probe.bytenr, probe.num_bytes, probe.is_metadata)
+                .expect("locate existing extent key");
+            assert_eq!(key, probe.expected);
+            digest = fold_located_extent_key(digest, key);
+        }
+    }
+    digest
+}
+
+fn locate_extent_oracle() {
+    let mut alloc = BtrfsExtentAllocator::new(1).expect("locate extent oracle allocator");
+    let payload = BtrfsExtentItem {
+        refs: 1,
+        generation: 9,
+        flags: BtrfsExtentItem::FLAG_TREE_BLOCK,
+    }
+    .to_bytes();
+    let metadata_bytenr = LOCATE_EXTENT_BASE;
+    let first_metadata_key = BtrfsKey {
+        objectid: metadata_bytenr,
+        item_type: BTRFS_ITEM_METADATA_ITEM,
+        offset: 1,
+    };
+    let later_metadata_key = BtrfsKey {
+        offset: 3,
+        ..first_metadata_key
+    };
+    alloc
+        .extent_tree_mut()
+        .insert(first_metadata_key, &payload)
+        .expect("insert first metadata key");
+    alloc
+        .extent_tree_mut()
+        .insert(later_metadata_key, &payload)
+        .expect("insert later metadata key");
+
+    let data_key = BtrfsKey {
+        objectid: LOCATE_EXTENT_BASE + 4096,
+        item_type: BTRFS_ITEM_EXTENT_ITEM,
+        offset: 8192,
+    };
+    alloc
+        .extent_tree_mut()
+        .insert(data_key, &payload)
+        .expect("insert data key");
+
+    for operation in [
+        materialized_locate_extent_key as LocateExtentOneOperation,
+        borrowed_locate_extent_key,
+        production_locate_extent_key,
+    ] {
+        assert_eq!(
+            operation(&alloc, metadata_bytenr, 4096, true),
+            Ok(first_metadata_key)
+        );
+        assert_eq!(
+            operation(&alloc, data_key.objectid, data_key.offset, false),
+            Ok(data_key)
+        );
+        assert_eq!(
+            operation(&alloc, data_key.objectid, 4096, false),
+            Err(BtrfsMutationError::KeyNotFound)
+        );
+        assert_eq!(
+            operation(&alloc, LOCATE_EXTENT_BASE + 8192, 4096, true),
+            Err(BtrfsMutationError::KeyNotFound)
+        );
+    }
+}
+
+fn observe_locate_extent(
+    operation: LocateExtentOperation,
+    alloc: &BtrfsExtentAllocator,
+    probes: &[LocateExtentProbe],
+    expected: u64,
+) -> f64 {
+    let mut best_ns = f64::INFINITY;
+    for _ in 0..LOCATE_EXTENT_OBSERVATIONS {
+        let started = Instant::now();
+        let output = operation(black_box(alloc), black_box(probes));
+        let elapsed_ns = started.elapsed().as_secs_f64() * 1e9;
+        assert_eq!(black_box(output), expected);
+        best_ns = best_ns.min(elapsed_ns);
+    }
+    best_ns
+}
+
+fn collect_locate_extent_samples(
+    candidate: LocateExtentOperation,
+    alloc: &BtrfsExtentAllocator,
+    probes: &[LocateExtentProbe],
+    expected: u64,
+) -> LocateExtentSamples {
+    let mut control_lhs_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut candidate_ns = Vec::with_capacity(DELETE_PAIRS);
+    let mut raw_pairs = String::new();
+    for pair_index in 0..DELETE_PAIRS {
+        let (lhs, rhs, candidate_ns_one, order) = if pair_index % 2 == 0 {
+            (
+                observe_locate_extent(materialized_locate_extent_batch, alloc, probes, expected),
+                observe_locate_extent(materialized_locate_extent_batch, alloc, probes, expected),
+                observe_locate_extent(candidate, alloc, probes, expected),
+                "AAB",
+            )
+        } else {
+            let candidate_ns_one = observe_locate_extent(candidate, alloc, probes, expected);
+            let rhs =
+                observe_locate_extent(materialized_locate_extent_batch, alloc, probes, expected);
+            let lhs =
+                observe_locate_extent(materialized_locate_extent_batch, alloc, probes, expected);
+            (lhs, rhs, candidate_ns_one, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate_ns_one);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{lhs:.3}:{rhs:.3}:{candidate_ns_one:.3}"
+        )
+        .expect("format locate extent A/A+B pair");
+    }
+    LocateExtentSamples {
+        control_lhs_ns,
+        control_rhs_ns,
+        candidate_ns,
+        raw_pairs,
+    }
+}
+
+fn decide_locate_extent_samples(mode: &str, samples: &LocateExtentSamples) {
+    let null_log_ratios = samples
+        .control_lhs_ns
+        .iter()
+        .zip(&samples.control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = samples
+        .control_lhs_ns
+        .iter()
+        .zip(&samples.control_rhs_ns)
+        .zip(&samples.candidate_ns)
+        .map(|((lhs, rhs), candidate_ns_one)| (lhs.midpoint(*rhs) / candidate_ns_one).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let saved_fraction_lower = (1.0 - speedup_summary.low.recip()).max(0.0);
+    let admitted = null_floor_ratio <= MAX_NULL_FLOOR_RATIO
+        && speedup_summary.low > twice_null_ratio
+        && saved_fraction_lower >= MIN_LOCATE_EXTENT_SAVED_FRACTION;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio > MAX_NULL_FLOOR_RATIO {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL_OR_FIVE_PERCENT"
+    };
+    println!(
+        "locate_extent_key_pairs,mode={mode},pairs={DELETE_PAIRS},observations_per_arm={LOCATE_EXTENT_OBSERVATIONS},observation_reducer=min,format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={}",
+        samples.raw_pairs
+    );
+    println!(
+        "locate_extent_key_ab,mode={mode},control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},saved_fraction_ci_lower={saved_fraction_lower:.6},minimum_saved_fraction={MIN_LOCATE_EXTENT_SAVED_FRACTION:.6},admitted={admitted},verdict={verdict},gate_metric=wall_ns,gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false,instructions_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
+    if !admitted {
+        std::process::exit(2);
+    }
+}
+
+fn locate_extent_key_contract(candidate_arm: LocateExtentArm) {
+    print_bench_evidence_metadata();
+    print_codegen_isa();
+    locate_extent_oracle();
+
+    let (alloc, probes) = locate_extent_fixture();
+    let expected = materialized_locate_extent_batch(&alloc, &probes);
+    assert_eq!(
+        borrowed_locate_extent_batch(&alloc, &probes),
+        expected,
+        "borrowed extent-key location changed keys or probe order"
+    );
+    assert_eq!(
+        production_locate_extent_batch(&alloc, &probes),
+        expected,
+        "production extent-key location changed keys or probe order"
+    );
+    let (candidate, mode): (LocateExtentOperation, &'static str) = match candidate_arm {
+        LocateExtentArm::BorrowedModel => {
+            (borrowed_locate_extent_batch, "source_neutral_attribution")
+        }
+        LocateExtentArm::ProductionCandidate => {
+            (production_locate_extent_batch, "production_candidate")
+        }
+    };
+    let calls = LOCATE_EXTENT_ITEMS * LOCATE_EXTENT_REPEATS;
+    let payload_len = BtrfsExtentItem {
+        refs: 1,
+        generation: 1,
+        flags: BtrfsExtentItem::FLAG_DATA,
+    }
+    .to_bytes()
+    .len();
+    println!(
+        "locate_extent_key_parity,mode={mode},items={LOCATE_EXTENT_ITEMS},data_items={},metadata_items={},repeats={LOCATE_EXTENT_REPEATS},calls={calls},digest={expected:016x},ordering=probe_order_and_first_metadata_key,tie_breaking=first_ascending_metadata_key,floating_point=na,rng=na,data_metadata_absent_oracle=pass",
+        LOCATE_EXTENT_ITEMS / 2,
+        LOCATE_EXTENT_ITEMS / 2,
+    );
+    println!(
+        "locate_extent_key_mechanism,mode={mode},materialized_result_vecs={calls},materialized_payload_vecs={calls},materialized_payload_bytes={},borrowed_result_vecs=0,borrowed_payload_vecs=0,borrowed_payload_bytes=0,attribution_scope=complete_location_lookup_batch,attribution_floor_fraction={MIN_LOCATE_EXTENT_SAVED_FRACTION:.6}",
+        calls * payload_len,
+    );
+    for _ in 0..3 {
+        assert_eq!(materialized_locate_extent_batch(&alloc, &probes), expected);
+        assert_eq!(candidate(&alloc, &probes), expected);
+    }
+    let samples = collect_locate_extent_samples(candidate, &alloc, &probes, expected);
+    decide_locate_extent_samples(mode, &samples);
+}
+
 /// Build a sorted-by-offset csum-tree item list: item `i` covers
 /// `CSUMS_PER_ITEM` sectors starting at disk bytenr `i * stride`.
 fn build_items() -> Vec<(BtrfsKey, Vec<u8>)> {
@@ -1070,6 +1498,16 @@ fn linear(items: &[(BtrfsKey, Vec<u8>)], disk_bytenr: u64, sectorsize: usize) ->
 }
 
 fn bench_csum_lookup(c: &mut Criterion) {
+    if let Some(mode) = std::env::var_os("FFS_BTRFS_LOCATE_EXTENT_KEY_GATE") {
+        match mode.to_str() {
+            Some("source-neutral") => locate_extent_key_contract(LocateExtentArm::BorrowedModel),
+            Some("candidate") => locate_extent_key_contract(LocateExtentArm::ProductionCandidate),
+            _ => {
+                panic!("FFS_BTRFS_LOCATE_EXTENT_KEY_GATE must be source-neutral or candidate")
+            }
+        }
+        return;
+    }
     if let Some(mode) = std::env::var_os("FFS_BTRFS_EXTENT_ITEM_REFS_GATE") {
         match mode.to_str() {
             Some("source-neutral") => extent_item_refs_contract(ExtentRefsArm::BorrowedModel),

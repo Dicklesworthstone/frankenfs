@@ -6921,34 +6921,38 @@ impl BtrfsExtentAllocator {
         } else {
             BTRFS_ITEM_EXTENT_ITEM
         };
-        if is_metadata {
-            let lo = BtrfsKey {
-                objectid: bytenr,
-                item_type,
-                offset: 0,
-            };
-            let hi = BtrfsKey {
-                objectid: bytenr,
-                item_type,
-                offset: u64::MAX,
-            };
-            self.extent_tree
-                .range(&lo, &hi)?
-                .into_iter()
-                .next()
-                .map(|(found_key, _)| found_key)
-                .ok_or(BtrfsMutationError::KeyNotFound)
-        } else {
-            let key = BtrfsKey {
-                objectid: bytenr,
-                item_type,
-                offset: num_bytes,
-            };
-            if self.extent_tree.range(&key, &key)?.is_empty() {
-                return Err(BtrfsMutationError::KeyNotFound);
+        let lo = BtrfsKey {
+            objectid: bytenr,
+            item_type,
+            offset: if is_metadata { 0 } else { num_bytes },
+        };
+        let hi = BtrfsKey {
+            objectid: bytenr,
+            item_type,
+            offset: if is_metadata { u64::MAX } else { num_bytes },
+        };
+        let mut found = None;
+        self.extent_tree.range_with(&lo, &hi, |key, _| {
+            if found.is_none() {
+                found = Some(key);
             }
-            Ok(key)
-        }
+        })?;
+        found.ok_or(BtrfsMutationError::KeyNotFound)
+    }
+
+    /// Benchmark-only access to the production extent-key location path.
+    ///
+    /// # Errors
+    /// Returns the same tree lookup or missing-key error as [`Self::free_extent`].
+    #[cfg(feature = "bench-instrumentation")]
+    #[doc(hidden)]
+    pub fn bench_locate_extent_key(
+        &self,
+        bytenr: u64,
+        num_bytes: u64,
+        is_metadata: bool,
+    ) -> Result<BtrfsKey, BtrfsMutationError> {
+        self.locate_extent_key(bytenr, num_bytes, is_metadata)
     }
 
     pub fn free_extent(

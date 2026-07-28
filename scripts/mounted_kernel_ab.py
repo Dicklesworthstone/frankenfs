@@ -186,6 +186,149 @@ def assert_identities(kernel: ArmIdentity, ffs: ArmIdentity) -> None:
         raise SystemExit(2)
 
 
+# --- workloads ------------------------------------------------------------
+# Every workload issues an IDENTICAL POSIX sequence to whichever arm it is handed
+# (T2). None of them branch on which filesystem they are talking to.
+
+def _threaded(fn, nthreads: int):
+    """Run `fn(tid)` on `nthreads` OS threads. Python releases the GIL inside the
+    blocking file syscalls these workloads make, so this really does exercise the
+    filesystem concurrently even though CPU-bound Python would not."""
+    import threading
+    errs: list[BaseException] = []
+
+    def wrap(tid: int) -> None:
+        try:
+            fn(tid)
+        except BaseException as exc:  # surfaced, never swallowed
+            errs.append(exc)
+
+    ts = [threading.Thread(target=wrap, args=(i,)) for i in range(nthreads)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    if errs:
+        raise errs[0]
+
+
+def wl_create(target: Path, count: int, threads: int) -> float:
+    """Metadata writes. `threads`>1 is the named 8-thread parallel-create gap."""
+    per = count // max(threads, 1)
+    for tid in range(threads):
+        (target / f"t{tid}").mkdir(exist_ok=True)
+    start = time.perf_counter()
+
+    def body(tid: int) -> None:
+        d = target / f"t{tid}"
+        for i in range(per):
+            fd = os.open(d / f"h_{i:07}", os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o644)
+            os.close(fd)
+
+    _threaded(body, threads)
+    dfd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return time.perf_counter() - start
+
+
+def wl_parallel_read(target: Path, count: int, threads: int) -> float:
+    """Multi-file parallel read — the ~2.9x gap with the pread copy tax."""
+    files = sorted(p for p in target.iterdir() if p.name.startswith("r_"))
+    if not files:
+        raise RuntimeError("parallel-read needs a prepared corpus (use --prepare)")
+    start = time.perf_counter()
+
+    def body(tid: int) -> None:
+        for f in files[tid::threads]:
+            fd = os.open(f, os.O_RDONLY)
+            try:
+                while os.read(fd, 1 << 20):
+                    pass
+            finally:
+                os.close(fd)
+
+    _threaded(body, threads)
+    return time.perf_counter() - start
+
+
+def wl_create_delete(target: Path, count: int, threads: int) -> float:
+    """Small-file create/delete storm (bd-opb6l)."""
+    start = time.perf_counter()
+    names = [target / f"s_{i:07}" for i in range(count)]
+    for n in names:
+        os.close(os.open(n, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o644))
+    for n in names:
+        os.unlink(n)
+    dfd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return time.perf_counter() - start
+
+
+def wl_readdir_stat(target: Path, count: int, threads: int) -> float:
+    """Large-directory readdir + stat of every entry (bd-57lae)."""
+    if not any(p.name.startswith("d_") for p in target.iterdir()):
+        raise RuntimeError("readdir-stat needs a prepared corpus (use --prepare)")
+    start = time.perf_counter()
+    total = 0
+    for entry in os.scandir(target):
+        st_ = entry.stat(follow_symlinks=False)
+        total += st_.st_size + 1
+    return time.perf_counter() - start
+
+
+def wl_fsync_latency(target: Path, count: int, threads: int) -> float:
+    """fsync/journal commit latency: write one block, fsync, repeated."""
+    path = target / "fsync_probe"
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    block = b"x" * 4096
+    try:
+        start = time.perf_counter()
+        for _ in range(count):
+            os.write(fd, block)
+            os.fsync(fd)
+        elapsed = time.perf_counter() - start
+    finally:
+        os.close(fd)
+        os.unlink(path)
+    return elapsed
+
+
+WORKLOADS = {
+    "create": wl_create,
+    "parallel-read": wl_parallel_read,
+    "create-delete": wl_create_delete,
+    "readdir-stat": wl_readdir_stat,
+    "fsync-latency": wl_fsync_latency,
+}
+
+PREPARE_PREFIX = {"parallel-read": "r_", "readdir-stat": "d_"}
+
+
+def prepare(target: Path, workload: str, count: int, size_kib: int = 64) -> None:
+    """Build the read/readdir corpus once, OUTSIDE any timed region."""
+    prefix = PREPARE_PREFIX.get(workload)
+    if prefix is None:
+        return
+    blob = b"z" * (size_kib * 1024) if prefix == "r_" else b""
+    for i in range(count):
+        p = target / f"{prefix}{i:07}"
+        if not p.exists():
+            with open(p, "wb") as fh:
+                if blob:
+                    fh.write(blob)
+    dfd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
 def workload(target: Path, count: int) -> float:
     """Identical POSIX sequence for every arm (T2). Returns seconds.
 
@@ -212,11 +355,28 @@ def clear(target: Path) -> None:
             entry.unlink()
 
 
+SELECTED = {"name": "create", "threads": 1}
+
+
+def clear_all(target: Path) -> None:
+    for entry in list(target.iterdir()):
+        if entry.name.startswith(("h_", "s_", "fsync_probe")):
+            entry.unlink()
+        elif entry.is_dir() and entry.name.startswith("t"):
+            for sub in list(entry.iterdir()):
+                sub.unlink()
+            entry.rmdir()
+
+
 def measure(target: Path, count: int) -> float:
+    fn = WORKLOADS[SELECTED["name"]]
     try:
-        return workload(target, count)
+        return fn(target, count, SELECTED["threads"])
     finally:
-        clear(target)
+        # read/readdir corpora are persistent fixtures and must NOT be cleared,
+        # or every round after the first would measure a different filesystem.
+        if SELECTED["name"] not in PREPARE_PREFIX:
+            clear_all(target)
 
 
 def paired(a: Path, b: Path, count: int, rounds: int) -> list[float]:
@@ -263,6 +423,8 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=2000)
     ap.add_argument("--rounds", type=int, default=11)
     ap.add_argument("--cpus", default=None, help="comma-separated CPU list (T4)")
+    ap.add_argument("--workload", default="create", choices=sorted(WORKLOADS))
+    ap.add_argument("--threads", type=int, default=1)
     args = ap.parse_args()
 
     # T4: explicit, recorded affinity.
@@ -272,6 +434,8 @@ def main() -> int:
     affinity = sorted(os.sched_getaffinity(0))
     load1 = os.getloadavg()[0]
 
+    SELECTED["name"] = args.workload
+    SELECTED["threads"] = max(1, args.threads)
     kernel = ArmIdentity("kernel-ext4", args.kernel)
     ffs = ArmIdentity("frankenfs-fuse", args.frankenfs)
     serving = serving_daemon_elf_sha256(ffs.mount_point or str(args.frankenfs))
@@ -285,6 +449,9 @@ def main() -> int:
               file=sys.stderr)
         raise SystemExit(4)
     assert_identities(kernel, ffs)
+
+    for arm_dir in (args.kernel, args.frankenfs):
+        prepare(arm_dir, args.workload, args.count)
 
     # T5: what can the driver itself do? If an arm approaches this, the number is
     # about Python and the page cache, not about a filesystem.
@@ -325,6 +492,7 @@ def main() -> int:
     print("mounted_ab_result," + json.dumps({
         "kernel_AA": k_null, "frankenfs_AA": f_null, "AB_kernel_over_frankenfs": ab,
         "governing_null_floor": floor, "margin_x": margin,
+        "workload": args.workload, "threads": SELECTED["threads"],
         "decidable": margin >= 2.0,
         "faster": ("frankenfs" if ab["median_ratio"] > 1 else "kernel-ext4"),
     }, sort_keys=True))
