@@ -1837,6 +1837,81 @@ do not infer a production deadlock from RCH stale-progress metadata alone.
 > above satisfied the remaining null-floor and real-fsck predicate; absent an
 > override, production now selects `PublicationMode::WaitFree`.
 
+## INSTRUMENT FIX for the three BLOCKED-NULL workloads: the kernel-side A/A failure is a SYSTEMATIC per-image bias, not variance — counterbalancing cancels it exactly (bd-opb6l / bd-57lae) - 2026-07-28 (turn 16, cc, MEASURED)
+
+CLASS: **instrument diagnostic**. Not a self-speedup and not a vs-incumbent claim —
+no FrankenFS code executes anywhere in this experiment. It is kernel-ext4 against
+kernel-ext4, so there is no candidate ELF to self-report: the incumbent is the
+comparator.
+
+Counterbalanced same-invocation A/A null control 0.999579x, bootstrap median CI [0.996553, 1.003571], spread 1.0070x, 20,000 resamples, interleaved A/A order-alternating.
+Uncounterbalanced same-invocation A/A null control 1.010414x direct and 0.992466x swapped, bootstrap median CI [0.982591, 1.018390] and [0.980826, 0.995819].
+`cv_used=false`; CV is never a gate here.
+
+CONTEXT. GreenSpring's five-workload mounted suite admitted two ratios and blocked
+three on A/A nulls. The proposed remedies were more rounds, larger batches, longer
+settle, cache equalisation. **Those address variance. This is bias, and averaging
+more samples of a biased comparison converges to the bias.**
+
+THE TELL, already present in GreenSpring's own data: the create/delete storm's
+KERNEL null was `1.009041x [1.001744, 1.013361]` — a confidence interval that
+**excludes 1.0**. Two byte-identical kernel ext4 mounts cannot differ systematically
+by chance.
+
+### Experiment (`scripts/kernel_null_counterbalance_diag.py`)
+
+Two byte-identical kernel ext4 images from the same `mke2fs` invocation, both
+mounted `rw,noatime`, on distinct loop devices, pinned to CPUs 2,3. Same 2,000-file
+create/delete storm, 15 paired rounds, execution order alternating.
+
+| configuration | median | bootstrap 95% CI | offset |
+|---|---:|---|---:|
+| run 1 direct (A = first image) | 1.010414 | [0.982591, 1.018390] | **+1.041%** |
+| run 1 swapped (roles exchanged) | 0.992466 | [0.980826, 0.995819] | **minus 0.753%** |
+| run 2 direct | 1.006652 | [0.994325, 1.018088] | **+0.665%** |
+| run 2 swapped | 0.994280 | [0.989667, 1.000804] | **minus 0.572%** |
+| **run 2 COUNTERBALANCED** | **0.999579** | **[0.996553, 1.003571]** | spread **1.0070x** |
+
+**The offset FLIPS SIGN when the two physical images exchange logical roles, in 2 of
+2 runs.** The asymmetry is bound to the physical image/mount — backing-store
+placement, loop-device state, resident cache — not to the logical arm, the ordering,
+or the workload. Magnitude 0.57 to 1.04%, matching the +0.90% GreenSpring measured.
+
+### Why counterbalancing is the fix, and why it is exact
+
+With a fixed multiplicative bias `p` per physical image, the direct ratio is
+`(p_a * T_A) / (p_b * T_B)` and the swapped ratio is `(p_b * T_A) / (p_a * T_B)`, so
+the geometric mean of the two is exactly `T_A / T_B`: the `p` factors cancel
+identically.
+
+**Exact cancellation per pair, not convergence.** That is why it succeeds where extra
+rounds cannot: extra rounds shrink the interval *around the biased point estimate*,
+which makes a blocked null MORE likely to exclude 1.0, not less.
+
+Demonstrated: counterbalanced null **0.999579 [0.996553, 1.003571], spread 1.0070x**
+— contains 1.0 and clears the 1.025x spread requirement in GreenSpring's own retry
+predicate with room to spare.
+
+### What this settles and what it does not
+
+It settles the KERNEL-side null failure, which is what blocked the create/delete
+storm and the large-directory readdir+stat — both of which passed their FUSE null.
+The multi-file parallel read failed BOTH nulls, so counterbalancing is necessary
+there but may not be sufficient: the FUSE-side null (`0.991734x [0.969409,
+1.036149]`, spread 1.036x) carries its own dispersion, which this experiment does
+not address.
+
+Nothing here changes the filesystem. **No tuning was done and none should be until
+the nulls pass** — the three raw ratios (1.203230x, 2.957531x, 4.212274x slower)
+remain unscoreable.
+
+### Handoff
+
+The four-arm Rust comparator is GreenSpring's file and already owns four mounts, so
+it can counterbalance without new mounts: alternate which physical kernel image
+serves the A-role across paired rounds and combine each pair by geometric mean; same
+for the two FUSE mounts. Raised on the campaign thread rather than edited directly.
+
 ## ⭐⭐⭐ MOUNTED-KERNEL ARM EXISTS — first defensible vs-incumbent number: frankenfs is 4.5x SLOWER than kernel ext4 on mounted create+fsyncdir (bd-kdmu4) - 2026-07-27 (turn 15, cc, MEASURED — A MISS, WHICH IS THE POINT)
 
 Status: the instrument this repo has never had is built, landed, and has produced an
