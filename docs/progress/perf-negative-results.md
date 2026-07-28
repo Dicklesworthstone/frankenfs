@@ -13,6 +13,94 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Mounted ext4 workload suite admits metadata and fsync ratios; three surfaces remain null-blocked - 2026-07-27 (GreenSpring, vs-INCUMBENT measurement)
+
+This is a direct-incumbent measurement row, not a FrankenFS before/after
+self-speedup and not a production tuning lever. The existing Rust comparator
+was extended with the five named workloads, then each workload ran against two
+independent real kernel-ext4 mounts and two independent FrankenFS FUSE mounts
+in one invocation. Every FUSE daemon self-reported the exact shipping-shaped
+x86-64-v3+PGO ELF, each mapped `/proc/<pid>/exe` hash matched that report, and
+the driver self-reported its own ELF. The balanced four-arm schedule supplied a
+kernel A/A and a FUSE A/A in every invocation. Every decision below therefore
+has numeric same-invocation A/A null controls with bootstrap median 95% CIs.
+Wall time and deterministic
+20,000-resample bootstrap median CIs were the only decision inputs;
+`cv_used=false` and `instructions_used=false`.
+For example, the admitted metadata invocation's same-invocation kernel A/A
+null control was `0.999980x`, with bootstrap median confidence interval
+`[0.989622, 1.007939]`.
+
+The common mount contract was `noatime,nodev,nosuid`. Read workloads were
+read-only (`noload` on kernel ext4); mutating workloads were read-write with
+kernel ext4 `data=ordered`. Durability was workload-specific and identical on
+both sides: eight directory fsyncs after parallel creates, no mutation for
+reads, `create -> fsyncdir -> delete -> fsyncdir` for the storm, and a 4 KiB
+positioned write plus `fsync` for every journal-latency operation. All reported
+invocations passed four-arm namespace/content parity and four post-unmount
+`e2fsck` checks.
+
+### Results
+
+| Workload | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| Parallel metadata writes, 8 threads, 512 creates/observation | `0.999980x [0.989622, 1.007939]`, spread `1.010487x` | `1.004105x [0.993961, 1.010532]`, spread `1.010532x` | **`1.942477x [1.654395, 2.069775]` slower** | **HONEST LOSS** |
+| Multi-file parallel read, 8 threads, 256 x 256 KiB, min of 3 | `0.966904x [0.933998, 1.008743]`, spread `1.070666x` | `0.991734x [0.969409, 1.036149]`, spread `1.036149x` | **No admissible ratio.** Apparent `1.203230x [1.162802, 1.239236]` is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Small-file create/delete storm, 2,000 files | `1.009041x [1.001744, 1.013361]`, spread `1.013361x` | `1.000952x [0.995548, 1.008376]`, spread `1.008376x` | **No admissible ratio.** Apparent `2.957531x [2.939013, 2.971326]` is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Large-directory readdir+stat, 8 threads, 32,768 entries, min of 3 | `0.990140x [0.975169, 1.009721]`, spread `1.025464x` | `1.000955x [0.996572, 1.007587]`, spread `1.007587x` | **No admissible ratio.** Apparent `4.212274x [4.068120, 4.290202]` is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Fsync/journal commit, 8 x 4 KiB write+fsync operations | `0.998159x [0.993763, 1.004863]`, spread `1.006276x` | `0.998367x [0.994864, 1.002099]`, spread `1.005162x` | **`0.994873x [0.992102, 0.999695]` kernel time**, equivalently **`1.005153x [1.000305, 1.007961]` faster** | **HONEST WIN** |
+
+The current direct-incumbent score for these five named ext4 surfaces is
+**1 win / 1 loss / 0 neutral / 3 unscored**. The admitted metadata loss replaces
+the separate-invocation 8.3x routing estimate for this exact workload. The
+earlier ~2.9x parallel-read and 4.599x storm estimates remain unverified rather
+than being silently converted into claims.
+
+### Provenance and blocked-null audit trail
+
+The measured FrankenFS executable was
+`7116aae15f64d47ce0703e9395f0ff64dcc4aa742c0735eb512fab0c20d9ff57`;
+it reported compile/runtime SSE4.2, AVX2, and FMA and PGO profile SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The admitted metadata report used driver ELF
+`c68355edf6ee4f6863652ae73b5b979382c01b8e942132aad94cc8400920c127`;
+its report is
+`/data/tmp/frankenfs-mounted-kernel-workloads/run_1785206871_2625082/mounted-kernel-report.json`.
+The final driver ELF was
+`b1aa15e3b331f6a0c607628f9f3b1b315fb8c54197627102f45a7cd90c954282`;
+the only semantic change between those drivers makes directory `st_size` an
+implementation-specific allocation detail rather than part of the logical
+tree hash. File lengths, paths, modes, ownership, link counts, contents,
+namespace parity, and offline checks remain mandatory. The admitted fsync
+report is
+`/data/tmp/frankenfs-mounted-kernel-workloads/run_1785207888_2762113/mounted-kernel-report.json`.
+
+Representative preserved blocked reports are:
+
+- parallel read:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785206977_2643668/mounted-kernel-report.json`;
+- create/delete storm:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785207688_2739056/mounted-kernel-report.json`;
+- large-directory readdir+stat:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785208004_2776442/mounted-kernel-report.json`.
+
+Longer and repeated attempts did not satisfy the retry predicate: 64-pair
+256-file and 1,024/2,048-file read variants, repeated storm invocations, and
+8,192/32,768-entry directory variants continued to alternate which physical
+kernel or FUSE A/A arm was biased. Their point estimates were not pooled or
+selected. Fifty-three GiB of image/report artifacts remain under
+`/data/tmp/frankenfs-mounted-kernel-workloads`; none was deleted.
+
+**Retry predicate for the three unscored workloads:** do not retry merely on
+another fresh placement on this shared host. First provide either an exclusive
+quiet mount-capable measurement host, or a counted instrument improvement that
+counterbalances physical image/mount identity or continuously attributes
+per-arm CPU contention. Then rerun the exact shipping-shaped ELF in one
+four-independent-arm invocation, preserve the matched settings and full
+parity/fsck contract, and require both kernel and FUSE A/A bootstrap median
+95% CIs to contain 1 with symmetric spread at most `1.025x` before admitting
+the competitive wall/cycles ratio. Never gate on CV or instruction count.
+
 ## Mounted-kernel Rust arm produces an honest ext4 warm-stat loss; btrfs remains null-blocked - 2026-07-27 (GreenSpring, vs-INCUMBENT instrument KEEP)
 
 This row banks an instrument, not a FrankenFS optimization or self-speedup.

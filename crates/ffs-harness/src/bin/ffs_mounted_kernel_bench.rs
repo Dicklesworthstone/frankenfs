@@ -19,7 +19,8 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{
@@ -39,6 +40,8 @@ const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
 const MAX_DRIVER_PREFLIGHT_BUSY: f64 = 0.20;
 const MAX_FUSE_PREFLIGHT_BUSY: f64 = 0.35;
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
+const PARALLEL_THREADS: usize = 8;
+const PARALLEL_READ_FILE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FilesystemKind {
@@ -69,11 +72,64 @@ enum RequestedFilesystems {
     Both,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Workload {
+    WarmStat,
+    ParallelMetadataWrite8,
+    ParallelRead8,
+    CreateDeleteStorm,
+    ReaddirStat8,
+    FsyncJournalCommit,
+}
+
+impl Workload {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::WarmStat => "warm_stat",
+            Self::ParallelMetadataWrite8 => "parallel_metadata_write_8t",
+            Self::ParallelRead8 => "parallel_read_multifile_8t",
+            Self::CreateDeleteStorm => "small_file_create_delete_storm",
+            Self::ReaddirStat8 => "large_directory_readdir_stat_8t",
+            Self::FsyncJournalCommit => "fsync_journal_commit",
+        }
+    }
+
+    const fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::ParallelMetadataWrite8 | Self::CreateDeleteStorm | Self::FsyncJournalCommit
+        )
+    }
+
+    const fn client_threads(self) -> usize {
+        match self {
+            Self::ParallelMetadataWrite8 | Self::ParallelRead8 | Self::ReaddirStat8 => {
+                PARALLEL_THREADS
+            }
+            Self::WarmStat | Self::CreateDeleteStorm | Self::FsyncJournalCommit => 1,
+        }
+    }
+
+    const fn durability(self) -> &'static str {
+        match self {
+            Self::ParallelMetadataWrite8 => "create_then_fsync_each_worker_directory",
+            Self::CreateDeleteStorm => "create_fsyncdir_delete_fsyncdir",
+            Self::FsyncJournalCommit => "write_4k_then_fsync_each_operation",
+            Self::WarmStat | Self::ParallelRead8 | Self::ReaddirStat8 => "read_only_no_mutation",
+        }
+    }
+
+    const fn observation_reducer(self) -> &'static str {
+        if self.is_mutating() { "single" } else { "min" }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     ffs_cli: PathBuf,
     artifact_root: PathBuf,
     filesystems: RequestedFilesystems,
+    workload: Workload,
     pairs: usize,
     operations: usize,
     observation_repeats: usize,
@@ -88,6 +144,7 @@ impl Default for Config {
             ffs_cli: PathBuf::new(),
             artifact_root: PathBuf::from("/data/tmp/frankenfs-mounted-kernel"),
             filesystems: RequestedFilesystems::Both,
+            workload: Workload::WarmStat,
             pairs: 32,
             operations: 2_000,
             observation_repeats: 3,
@@ -161,6 +218,7 @@ struct CpuTicks {
 #[derive(Clone, Debug)]
 struct CpuPlacement {
     driver_cpu: usize,
+    driver_cpus: Vec<usize>,
     fuse_cpus: Vec<usize>,
     driver_guard_cpus: BTreeSet<usize>,
     fuse_guard_cpus: BTreeSet<usize>,
@@ -176,6 +234,15 @@ struct ParityWitness {
     uid: u32,
     gid: u32,
     nlink: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TreeWitness {
+    sha256: String,
+    entries: u64,
+    regular_files: u64,
+    directories: u64,
+    bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,8 +280,8 @@ enum MountedArmKind {
 }
 
 impl MountedArm {
-    fn workload_path(&self) -> PathBuf {
-        self.mountpoint.join("payload.bin")
+    fn workload_root(&self) -> &Path {
+        &self.mountpoint
     }
 
     fn unmount(&mut self) -> Result<()> {
@@ -326,10 +393,13 @@ fn usage() {
          \n\
          Options:\n\
            --filesystem ext4|btrfs|both   Filesystem arm(s), default both\n\
+           --workload NAME                warm-stat | parallel-metadata-write-8t |\n\
+                                          parallel-read-8t | create-delete-storm |\n\
+                                          readdir-stat-8t | fsync-journal-commit\n\
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
-          --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32)\n\
-           --operations N                 stat calls per observation (default 2000)\n\
-           --observation-repeats N        min-of-N repeats (default 3)\n\
+           --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32)\n\
+           --operations N                 Workload operations per observation (default 2000)\n\
+           --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
            --maximum-null-ratio R         Max symmetric A/A CI spread (default 1.025)\n\
            --out PATH                     JSON report path (default inside run dir)\n\
@@ -376,6 +446,20 @@ fn parse_args() -> Result<Option<Config>> {
                     _ => bail!("unsupported --filesystem {value}; expected ext4|btrfs|both"),
                 };
             }
+            "--workload" => {
+                let value = parse_value::<String>(&args, &mut index, "--workload")?;
+                config.workload = match value.as_str() {
+                    "warm-stat" => Workload::WarmStat,
+                    "parallel-metadata-write-8t" => Workload::ParallelMetadataWrite8,
+                    "parallel-read-8t" => Workload::ParallelRead8,
+                    "create-delete-storm" => Workload::CreateDeleteStorm,
+                    "readdir-stat-8t" => Workload::ReaddirStat8,
+                    "fsync-journal-commit" => Workload::FsyncJournalCommit,
+                    _ => bail!(
+                        "unsupported --workload {value}; expected warm-stat|parallel-metadata-write-8t|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit"
+                    ),
+                };
+            }
             "--pairs" => config.pairs = parse_value(&args, &mut index, "--pairs")?,
             "--operations" => {
                 config.operations = parse_value(&args, &mut index, "--operations")?;
@@ -413,6 +497,15 @@ fn parse_args() -> Result<Option<Config>> {
     ensure!(
         config.observation_repeats > 0,
         "--observation-repeats must be positive"
+    );
+    ensure!(
+        !config.workload.is_mutating() || config.observation_repeats == 1,
+        "mutating workloads require --observation-repeats 1 so every timed row has one durability boundary"
+    );
+    ensure!(
+        config.workload.client_threads() == 1 || config.operations % PARALLEL_THREADS == 0,
+        "{} requires --operations divisible by {PARALLEL_THREADS}",
+        config.workload.label()
     );
     ensure!(
         (1..=MAX_IMAGE_MIB).contains(&config.image_size_mib),
@@ -544,7 +637,27 @@ fn write_deterministic_payload(path: &Path) -> Result<()> {
         .with_context(|| format!("sync fixture payload {}", path.display()))
 }
 
-fn create_fixture_tree(run_dir: &Path) -> Result<PathBuf> {
+fn write_fixture_file(path: &Path, bytes: usize, seed: usize) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create fixture file {}", path.display()))?;
+    let mut block = [0_u8; 4096];
+    for (index, byte) in block.iter_mut().enumerate() {
+        *byte = u8::try_from((index * 131 + seed * 29 + 17) % 251).expect("fixture byte fits u8");
+    }
+    let full_blocks = bytes / block.len();
+    let tail = bytes % block.len();
+    for _ in 0..full_blocks {
+        file.write_all(&block)
+            .with_context(|| format!("write fixture file {}", path.display()))?;
+    }
+    file.write_all(&block[..tail])
+        .with_context(|| format!("write fixture tail {}", path.display()))
+}
+
+fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
     let root = run_dir.join("fixture-root");
     fs::create_dir(&root).with_context(|| format!("create {}", root.display()))?;
     write_deterministic_payload(&root.join("payload.bin"))?;
@@ -555,6 +668,43 @@ fn create_fixture_tree(run_dir: &Path) -> Result<PathBuf> {
         b"frankenfs-mounted-kernel-v1\n",
     )
     .context("write fixture sentinel")?;
+    match config.workload {
+        Workload::WarmStat => {}
+        Workload::ParallelMetadataWrite8 => {
+            let parent = root.join("parallel-metadata");
+            fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
+            for worker in 0..PARALLEL_THREADS {
+                let path = parent.join(format!("worker-{worker}"));
+                fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;
+            }
+        }
+        Workload::ParallelRead8 => {
+            let parent = root.join("parallel-read");
+            fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
+            for index in 0..config.operations {
+                write_fixture_file(
+                    &parent.join(format!("read-{index:06}.bin")),
+                    PARALLEL_READ_FILE_BYTES,
+                    index,
+                )?;
+            }
+        }
+        Workload::CreateDeleteStorm => {
+            let path = root.join("create-delete-storm");
+            fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;
+        }
+        Workload::ReaddirStat8 => {
+            let parent = root.join("large-directory");
+            fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
+            for index in 0..config.operations {
+                File::create(parent.join(format!("entry-{index:08}")))
+                    .with_context(|| format!("create large-directory fixture entry {index}"))?;
+            }
+        }
+        Workload::FsyncJournalCommit => {
+            write_fixture_file(&root.join("fsync.bin"), 4096, 0xF5)?;
+        }
+    }
     Ok(root)
 }
 
@@ -746,8 +896,9 @@ fn wait_for_mount(
     }
 }
 
-fn assert_common_mount_options(info: &MountInfo, label: &str) -> Result<()> {
-    for required in ["ro", "noatime", "nodev", "nosuid"] {
+fn assert_common_mount_options(info: &MountInfo, label: &str, read_write: bool) -> Result<()> {
+    let access = if read_write { "rw" } else { "ro" };
+    for required in [access, "noatime", "nodev", "nosuid"] {
         ensure!(
             info.mount_options.contains(required) || info.super_options.contains(required),
             "{label} mount missing required option {required}: mount={:?} super={:?}",
@@ -755,9 +906,10 @@ fn assert_common_mount_options(info: &MountInfo, label: &str) -> Result<()> {
             info.super_options
         );
     }
+    let forbidden = if read_write { "ro" } else { "rw" };
     ensure!(
-        !info.mount_options.contains("rw") && !info.super_options.contains("rw"),
-        "{label} unexpectedly reports read-write mount options"
+        !info.mount_options.contains(forbidden) && !info.super_options.contains(forbidden),
+        "{label} unexpectedly reports {forbidden} mount options"
     );
     Ok(())
 }
@@ -800,6 +952,7 @@ fn mount_kernel(
     arm: Arm,
     image: &Path,
     mountpoint: &Path,
+    read_write: bool,
     interrupted: &AtomicBool,
 ) -> Result<MountedArm> {
     fs::create_dir(mountpoint)
@@ -808,9 +961,11 @@ fn mount_kernel(
         .with_context(|| format!("canonicalize mountpoint {}", mountpoint.display()))?;
     let expected_image = fs::canonicalize(image)
         .with_context(|| format!("canonicalize image {}", image.display()))?;
-    let options = match kind {
-        FilesystemKind::Ext4 => "loop,ro,noload,noatime,nodev,nosuid",
-        FilesystemKind::Btrfs => "loop,ro,noatime,nodev,nosuid",
+    let options = match (kind, read_write) {
+        (FilesystemKind::Ext4, false) => "loop,ro,noload,noatime,nodev,nosuid",
+        (FilesystemKind::Ext4, true) => "loop,rw,noatime,nodev,nosuid,data=ordered",
+        (FilesystemKind::Btrfs, false) => "loop,ro,noatime,nodev,nosuid",
+        (FilesystemKind::Btrfs, true) => "loop,rw,noatime,nodev,nosuid",
     };
     run_checked(
         Command::new("sudo")
@@ -827,7 +982,7 @@ fn mount_kernel(
         mount_info: info,
         kind: MountedArmKind::Kernel,
     };
-    assert_common_mount_options(&mounted.mount_info, arm.label())?;
+    assert_common_mount_options(&mounted.mount_info, arm.label(), read_write)?;
     ensure!(
         mounted.mount_info.filesystem_type == kind.label(),
         "{} incumbent identity mismatch: expected {}, observed {}",
@@ -913,10 +1068,15 @@ fn mount_fuse(
         .map(usize::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let mut child = Command::new("taskset")
+    let mut command = Command::new("taskset");
+    command
         .args(["-c", &cpu_list])
         .arg(&config.ffs_cli)
-        .arg("mount")
+        .arg("mount");
+    if config.workload.is_mutating() {
+        command.arg("--rw");
+    }
+    let mut child = command
         .arg("--no-background-scrub")
         .arg(image)
         .arg(mountpoint)
@@ -945,7 +1105,11 @@ fn mount_fuse(
             pgo_profile_sha256: String::new(),
         },
     };
-    assert_common_mount_options(&mounted.mount_info, arm.label())?;
+    assert_common_mount_options(
+        &mounted.mount_info,
+        arm.label(),
+        config.workload.is_mutating(),
+    )?;
     ensure!(
         mounted.mount_info.filesystem_type == "fuse.ffs",
         "{} FUSE identity mismatch: expected fuse.ffs, observed {}",
@@ -1007,6 +1171,77 @@ fn parity_witness(path: &Path) -> Result<ParityWitness> {
         uid: metadata.uid(),
         gid: metadata.gid(),
         nlink: metadata.nlink(),
+    })
+}
+
+fn tree_witness(root: &Path) -> Result<TreeWitness> {
+    let mut hasher = Sha256::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = 0_u64;
+    let mut regular_files = 0_u64;
+    let mut directories = 0_u64;
+    let mut bytes = 0_u64;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    while let Some(path) = pending.pop() {
+        if path != root && path.file_name().is_some_and(|name| name == "lost+found") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("tree parity metadata {}", path.display()))?;
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("tree parity path escaped root: {}", path.display()))?;
+        hasher.update(relative.as_os_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(metadata.mode().to_le_bytes());
+        hasher.update(metadata.uid().to_le_bytes());
+        hasher.update(metadata.gid().to_le_bytes());
+        hasher.update(metadata.nlink().to_le_bytes());
+        entries = entries.saturating_add(1);
+        if metadata.is_dir() {
+            // Directory st_size is an implementation-specific allocation detail:
+            // ext4 legitimately retains grown directory blocks after unlink.
+            directories = directories.saturating_add(1);
+            let mut children = fs::read_dir(&path)
+                .with_context(|| format!("tree parity readdir {}", path.display()))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .with_context(|| format!("tree parity collect {}", path.display()))?;
+            children.sort_by(|left, right| {
+                left.as_os_str()
+                    .as_bytes()
+                    .cmp(right.as_os_str().as_bytes())
+            });
+            pending.extend(children.into_iter().rev());
+        } else if metadata.is_file() {
+            hasher.update(metadata.len().to_le_bytes());
+            regular_files = regular_files.saturating_add(1);
+            bytes = bytes.saturating_add(metadata.len());
+            let mut file = File::open(&path)
+                .with_context(|| format!("tree parity open {}", path.display()))?;
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("tree parity read {}", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        } else {
+            bail!(
+                "tree parity fixture contains unsupported non-file entry {}",
+                path.display()
+            );
+        }
+        hasher.update([0xFF]);
+    }
+    Ok(TreeWitness {
+        sha256: hex::encode(hasher.finalize()),
+        entries,
+        regular_files,
+        directories,
+        bytes,
     })
 }
 
@@ -1073,11 +1308,268 @@ fn stat_batch(path: &Path, operations: usize) -> Result<(u64, u64)> {
     Ok((elapsed, digest))
 }
 
-fn observe(path: &Path, config: &Config) -> Result<(u64, u64)> {
+fn digest_path(path: &Path) -> u64 {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .as_bytes()
+        .iter()
+        .fold(0xCBF2_9CE4_8422_2325_u64, |digest, byte| {
+            (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3)
+        })
+}
+
+fn parallel_metadata_write_batch(
+    root: &Path,
+    operations: usize,
+    sequence: usize,
+) -> Result<(u64, u64)> {
+    let parent = root.join("parallel-metadata");
+    let per_worker = operations / PARALLEL_THREADS;
+    let started = Instant::now();
+    let digest = thread::scope(|scope| -> Result<u64> {
+        let mut handles = Vec::with_capacity(PARALLEL_THREADS);
+        for worker in 0..PARALLEL_THREADS {
+            let worker_dir = parent.join(format!("worker-{worker}"));
+            handles.push(scope.spawn(move || -> Result<u64> {
+                let mut digest = 0_u64;
+                for index in 0..per_worker {
+                    let path = worker_dir.join(format!("r{sequence:06}-{index:06}"));
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .with_context(|| format!("parallel metadata create {}", path.display()))?;
+                    digest ^= u64::try_from(index + 1)
+                        .unwrap_or(u64::MAX)
+                        .rotate_left(u32::try_from(worker * 7).unwrap_or(0));
+                }
+                Ok(digest)
+            }));
+        }
+        let mut digest = 0_u64;
+        for handle in handles {
+            digest ^= handle
+                .join()
+                .map_err(|_| anyhow!("parallel metadata worker panicked"))??;
+        }
+        Ok(digest)
+    })?;
+    for worker in 0..PARALLEL_THREADS {
+        let worker_dir = File::open(parent.join(format!("worker-{worker}")))
+            .with_context(|| format!("open metadata worker directory {worker}"))?;
+        worker_dir
+            .sync_all()
+            .with_context(|| format!("fsync metadata worker directory {worker}"))?;
+    }
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(digest);
+    Ok((
+        elapsed,
+        digest ^ u64::try_from(operations).unwrap_or(u64::MAX),
+    ))
+}
+
+fn parallel_read_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
+    let parent = root.join("parallel-read");
+    let started = Instant::now();
+    let mut paths = fs::read_dir(&parent)
+        .with_context(|| format!("parallel read readdir {}", parent.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("parallel read collect {}", parent.display()))?;
+    paths.sort_by(|left, right| {
+        left.as_os_str()
+            .as_bytes()
+            .cmp(right.as_os_str().as_bytes())
+    });
+    ensure!(
+        paths.len() == operations,
+        "parallel read fixture has {} files, expected {operations}",
+        paths.len()
+    );
+    let digest = thread::scope(|scope| -> Result<u64> {
+        let mut handles = Vec::with_capacity(PARALLEL_THREADS);
+        for worker in 0..PARALLEL_THREADS {
+            let paths = &paths;
+            handles.push(scope.spawn(move || -> Result<u64> {
+                let mut buffer = vec![0_u8; PARALLEL_READ_FILE_BYTES];
+                let mut digest = 0_u64;
+                for index in (worker..paths.len()).step_by(PARALLEL_THREADS) {
+                    let path = &paths[index];
+                    let file = File::open(path)
+                        .with_context(|| format!("parallel read open {}", path.display()))?;
+                    file.read_exact_at(&mut buffer, 0)
+                        .with_context(|| format!("parallel pread {}", path.display()))?;
+                    let row = u64::from(buffer[0])
+                        | (u64::from(buffer[buffer.len() / 2]) << 8)
+                        | (u64::from(buffer[buffer.len() - 1]) << 16)
+                        | u64::try_from(buffer.len())
+                            .unwrap_or(u64::MAX)
+                            .rotate_left(29)
+                        | u64::try_from(index).unwrap_or(u64::MAX).rotate_left(41);
+                    digest = digest.rotate_left(11) ^ row;
+                    black_box(&buffer);
+                }
+                Ok(digest)
+            }));
+        }
+        let mut digest = 0_u64;
+        for handle in handles {
+            digest ^= handle
+                .join()
+                .map_err(|_| anyhow!("parallel read worker panicked"))??;
+        }
+        Ok(digest)
+    })?;
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(digest);
+    Ok((elapsed, digest))
+}
+
+fn create_delete_storm_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
+    let parent = root.join("create-delete-storm");
+    let started = Instant::now();
+    let mut digest = 0_u64;
+    for index in 0..operations {
+        let path = parent.join(format!("storm-{index:08}"));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("storm create {}", path.display()))?;
+        digest ^= digest_path(&path);
+    }
+    File::open(&parent)
+        .with_context(|| format!("open storm directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync storm directory after create {}", parent.display()))?;
+    for index in 0..operations {
+        let path = parent.join(format!("storm-{index:08}"));
+        fs::remove_file(&path).with_context(|| format!("storm delete {}", path.display()))?;
+    }
+    File::open(&parent)
+        .with_context(|| format!("open storm directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync storm directory after delete {}", parent.display()))?;
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(digest);
+    Ok((
+        elapsed,
+        digest ^ u64::try_from(operations).unwrap_or(u64::MAX),
+    ))
+}
+
+fn readdir_stat_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
+    let parent = root.join("large-directory");
+    let started = Instant::now();
+    let paths = fs::read_dir(&parent)
+        .with_context(|| format!("large-directory readdir {}", parent.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("large-directory collect {}", parent.display()))?;
+    ensure!(
+        paths.len() == operations,
+        "large-directory fixture has {} entries, expected {operations}",
+        paths.len()
+    );
+    let digest = thread::scope(|scope| -> Result<u64> {
+        let mut handles = Vec::with_capacity(PARALLEL_THREADS);
+        for worker in 0..PARALLEL_THREADS {
+            let paths = &paths;
+            handles.push(scope.spawn(move || -> Result<u64> {
+                let mut digest = 0_u64;
+                for index in (worker..paths.len()).step_by(PARALLEL_THREADS) {
+                    let path = &paths[index];
+                    let metadata = fs::symlink_metadata(path)
+                        .with_context(|| format!("large-directory stat {}", path.display()))?;
+                    let row = metadata.len().wrapping_mul(0xD6E8_FEB8_6659_FD93)
+                        ^ u64::from(metadata.mode()).rotate_left(17)
+                        ^ metadata.nlink().rotate_left(31)
+                        ^ digest_path(path);
+                    digest = digest.wrapping_add(row);
+                }
+                Ok(digest)
+            }));
+        }
+        let mut digest = 0_u64;
+        for handle in handles {
+            digest = digest.wrapping_add(
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("readdir+stat worker panicked"))??,
+            );
+        }
+        Ok(digest)
+    })?;
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(digest);
+    Ok((elapsed, digest))
+}
+
+fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64, path: &Path) -> Result<()> {
+    while !bytes.is_empty() {
+        let written = file
+            .write_at(bytes, offset)
+            .with_context(|| format!("positioned write {}", path.display()))?;
+        ensure!(
+            written > 0,
+            "positioned write returned zero for {}",
+            path.display()
+        );
+        bytes = &bytes[written..];
+        offset = offset.saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+    }
+    Ok(())
+}
+
+fn fsync_journal_batch(root: &Path, operations: usize, sequence: usize) -> Result<(u64, u64)> {
+    let path = root.join("fsync.bin");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open fsync workload {}", path.display()))?;
+    let started = Instant::now();
+    let mut digest = 0_u64;
+    for index in 0..operations {
+        let value = u8::try_from((sequence * 37 + index * 17) % 251).expect("fsync byte fits u8");
+        let payload = [value; 4096];
+        write_all_at(&file, &payload, 0, &path)?;
+        file.sync_all()
+            .with_context(|| format!("fsync workload {}", path.display()))?;
+        digest ^= u64::from(value).rotate_left(u32::try_from(index % 64).unwrap_or(0));
+    }
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(digest);
+    Ok((
+        elapsed,
+        u64::try_from(operations)
+            .unwrap_or(u64::MAX)
+            .wrapping_mul(4096),
+    ))
+}
+
+fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<(u64, u64)> {
+    match config.workload {
+        Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations),
+        Workload::ParallelMetadataWrite8 => {
+            parallel_metadata_write_batch(root, config.operations, sequence)
+        }
+        Workload::ParallelRead8 => parallel_read_batch(root, config.operations),
+        Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations),
+        Workload::ReaddirStat8 => readdir_stat_batch(root, config.operations),
+        Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence),
+    }
+}
+
+fn observe(root: &Path, config: &Config, sequence: usize) -> Result<(u64, u64)> {
     let mut best = u64::MAX;
     let mut expected_digest = None;
-    for _ in 0..config.observation_repeats {
-        let (elapsed, digest) = stat_batch(path, config.operations)?;
+    for repeat in 0..config.observation_repeats {
+        let current_sequence = sequence
+            .saturating_mul(config.observation_repeats)
+            .saturating_add(repeat);
+        let (elapsed, digest) = workload_batch(root, config, current_sequence)?;
         if let Some(expected) = expected_digest {
             ensure!(
                 digest == expected,
@@ -1092,16 +1584,24 @@ fn observe(path: &Path, config: &Config) -> Result<(u64, u64)> {
 }
 
 fn collect_samples(
-    paths: &BTreeMap<Arm, PathBuf>,
+    roots: &BTreeMap<Arm, PathBuf>,
     config: &Config,
     interrupted: &AtomicBool,
 ) -> Result<TimedSamples> {
+    let mut next_sequences = BTreeMap::from([
+        (Arm::KernelA, 0_usize),
+        (Arm::KernelB, 0_usize),
+        (Arm::FuseA, 0_usize),
+        (Arm::FuseB, 0_usize),
+    ]);
     for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
-        let path = paths
+        let root = roots
             .get(&arm)
-            .ok_or_else(|| anyhow!("missing workload path for {}", arm.label()))?;
+            .ok_or_else(|| anyhow!("missing workload root for {}", arm.label()))?;
         for _ in 0..2 {
-            let (_, digest) = stat_batch(path, config.operations)?;
+            let sequence = next_sequences[&arm];
+            let (_, digest) = workload_batch(root, config, sequence)?;
+            *next_sequences.get_mut(&arm).expect("all arms initialized") += 1;
             black_box(digest);
         }
     }
@@ -1119,10 +1619,12 @@ fn collect_samples(
             "interrupted during timed workload"
         );
         for arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
-            let path = paths
+            let root = roots
                 .get(&arm)
-                .ok_or_else(|| anyhow!("missing workload path for {}", arm.label()))?;
-            let (elapsed, digest) = observe(path, config)?;
+                .ok_or_else(|| anyhow!("missing workload root for {}", arm.label()))?;
+            let sequence = next_sequences[&arm];
+            let (elapsed, digest) = observe(root, config, sequence)?;
+            *next_sequences.get_mut(&arm).expect("all arms initialized") += 1;
             values
                 .get_mut(&arm)
                 .expect("all arms initialized")
@@ -1136,6 +1638,14 @@ fn collect_samples(
             }
         }
     }
+    let expected_digest = digests
+        .get(&Arm::KernelA)
+        .copied()
+        .ok_or_else(|| anyhow!("kernel A workload digest missing"))?;
+    ensure!(
+        digests.values().all(|digest| *digest == expected_digest),
+        "workload result parity failed across mounted arms: {digests:?}"
+    );
     Ok(TimedSamples { values, digests })
 }
 
@@ -1336,7 +1846,7 @@ fn last_level_cache_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
     Ok(siblings)
 }
 
-fn select_cpu_placement() -> Result<CpuPlacement> {
+fn select_cpu_placement(client_threads: usize) -> Result<CpuPlacement> {
     let busy = sample_cpu_busy()?;
     let mut ranked: Vec<(usize, f64)> = busy.iter().map(|(&cpu, &load)| (cpu, load)).collect();
     ranked.sort_by(|left, right| {
@@ -1365,12 +1875,37 @@ fn select_cpu_placement() -> Result<CpuPlacement> {
         MAX_DRIVER_PREFLIGHT_BUSY * 100.0
     );
     let last_level_cache_cpus = last_level_cache_siblings(driver_cpu)?;
-    let mut excluded = driver_guard_cpus.clone();
-    let mut fuse_cpus = Vec::new();
-    let mut fuse_guard_cpus = BTreeSet::new();
-    for (cpu, load) in ranked {
+    let (fuse_cpus, fuse_guard_cpus) =
+        select_fuse_cpus(&ranked, &busy, &last_level_cache_cpus, &driver_guard_cpus)?;
+    let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
+        client_threads,
+        driver_cpu,
+        &ranked,
+        &busy,
+        &last_level_cache_cpus,
+        &fuse_guard_cpus,
+        driver_guard_cpus,
+    )?;
+    Ok(CpuPlacement {
+        driver_cpu,
+        driver_cpus,
+        fuse_cpus,
+        driver_guard_cpus,
+        fuse_guard_cpus,
+        last_level_cache_cpus,
+        busy_fractions: busy,
+    })
+}
+
+fn select_fuse_cpus(
+    ranked: &[(usize, f64)],
+    busy: &BTreeMap<usize, f64>,
+    last_level_cache_cpus: &BTreeSet<usize>,
+    driver_guard_cpus: &BTreeSet<usize>,
+) -> Result<(Vec<usize>, BTreeSet<usize>)> {
+    for &(cpu, load) in ranked {
         if !last_level_cache_cpus.contains(&cpu)
-            || excluded.contains(&cpu)
+            || driver_guard_cpus.contains(&cpu)
             || load > MAX_FUSE_PREFLIGHT_BUSY
         {
             continue;
@@ -1382,35 +1917,81 @@ fn select_cpu_placement() -> Result<CpuPlacement> {
         }) {
             continue;
         }
-        fuse_cpus.push(cpu);
-        fuse_guard_cpus = siblings;
-        excluded.extend(&fuse_guard_cpus);
         // Both identical FUSE daemons share one quiet physical CPU. The arms
         // execute serially, so this avoids cross-core scheduler asymmetry
         // without making the measured arms contend with each other. Requiring
         // the driver's LLC domain also avoids cross-CCD request/response bias.
-        if fuse_cpus.len() == 1 {
-            break;
+        return Ok((vec![cpu], siblings));
+    }
+    bail!(
+        "no non-sibling CPU in the driver's last-level-cache domain has every SMT thread below the FUSE contention limit"
+    )
+}
+
+fn select_driver_cpus(
+    client_threads: usize,
+    driver_cpu: usize,
+    ranked: &[(usize, f64)],
+    busy: &BTreeMap<usize, f64>,
+    last_level_cache_cpus: &BTreeSet<usize>,
+    fuse_guard_cpus: &BTreeSet<usize>,
+    mut driver_guard_cpus: BTreeSet<usize>,
+) -> Result<(Vec<usize>, BTreeSet<usize>)> {
+    let mut driver_cpus = vec![driver_cpu];
+    if client_threads > 1 {
+        for &(cpu, load) in ranked {
+            if driver_cpus.len() >= client_threads {
+                break;
+            }
+            if !last_level_cache_cpus.contains(&cpu)
+                || fuse_guard_cpus.contains(&cpu)
+                || driver_guard_cpus.contains(&cpu)
+                || load > MAX_DRIVER_PREFLIGHT_BUSY
+            {
+                continue;
+            }
+            let siblings = thread_siblings(cpu)?;
+            if siblings.iter().any(|sibling| {
+                busy.get(sibling)
+                    .is_none_or(|value| *value > MAX_DRIVER_PREFLIGHT_BUSY)
+            }) {
+                continue;
+            }
+            driver_cpus.push(cpu);
+            driver_guard_cpus.extend(siblings);
+        }
+        for cpu in driver_guard_cpus.clone() {
+            if driver_cpus.len() >= client_threads {
+                break;
+            }
+            if !driver_cpus.contains(&cpu)
+                && !fuse_guard_cpus.contains(&cpu)
+                && busy
+                    .get(&cpu)
+                    .is_some_and(|load| *load <= MAX_DRIVER_PREFLIGHT_BUSY)
+            {
+                driver_cpus.push(cpu);
+            }
         }
     }
     ensure!(
-        !fuse_cpus.is_empty(),
-        "no non-sibling CPU in the driver's last-level-cache domain has every SMT thread below the FUSE contention limit"
+        driver_cpus.len() == client_threads,
+        "LLC domain supplied only {} quiet client CPUs for a {client_threads}-thread workload",
+        driver_cpus.len()
     );
-    Ok(CpuPlacement {
-        driver_cpu,
-        fuse_cpus,
-        driver_guard_cpus,
-        fuse_guard_cpus,
-        last_level_cache_cpus,
-        busy_fractions: busy,
-    })
+    driver_cpus.sort_unstable();
+    Ok((driver_cpus, driver_guard_cpus))
 }
 
-fn pin_current_process(cpu: usize) -> Result<()> {
+fn pin_current_process(cpus: &[usize]) -> Result<()> {
+    let cpu_list = cpus
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     run_checked(
         Command::new("taskset")
-            .args(["-pc", &cpu.to_string(), &std::process::id().to_string()])
+            .args(["-pc", &cpu_list, &std::process::id().to_string()])
             .stdout(Stdio::null()),
         "pin mounted benchmark driver",
     )?;
@@ -1420,8 +2001,8 @@ fn pin_current_process(cpu: usize) -> Result<()> {
         .find_map(|line| line.strip_prefix("Cpus_allowed_list:\t"))
         .ok_or_else(|| anyhow!("Cpus_allowed_list missing from /proc/self/status"))?;
     ensure!(
-        parse_cpu_list(allowed)? == BTreeSet::from([cpu]),
-        "driver affinity did not resolve to cpu{cpu}: {allowed}"
+        parse_cpu_list(allowed)? == cpus.iter().copied().collect(),
+        "driver affinity did not resolve to {cpu_list}: {allowed}"
     );
     Ok(())
 }
@@ -1512,6 +2093,7 @@ fn fs_report(
             arm,
             &images[&arm],
             &mount_fs_dir.join(arm.label()),
+            config.workload.is_mutating(),
             interrupted,
         )?);
     }
@@ -1545,11 +2127,15 @@ fn fs_report(
 
     let identities: Vec<Value> = mounts.iter().map(MountedArm::identity_json).collect();
     let mut parity = BTreeMap::new();
-    let mut paths = BTreeMap::new();
+    let mut initial_trees = BTreeMap::new();
+    let mut roots = BTreeMap::new();
     for mount in &mounts {
-        let path = mount.workload_path();
-        parity.insert(mount.arm, parity_witness(&path)?);
-        paths.insert(mount.arm, path);
+        parity.insert(
+            mount.arm,
+            parity_witness(&mount.workload_root().join("payload.bin"))?,
+        );
+        initial_trees.insert(mount.arm, tree_witness(mount.workload_root())?);
+        roots.insert(mount.arm, mount.workload_root().to_path_buf());
     }
     let expected_parity = parity
         .get(&Arm::KernelA)
@@ -1558,6 +2144,17 @@ fn fs_report(
     ensure!(
         parity.values().all(|witness| witness == &expected_parity),
         "mounted parity mismatch for {}: {parity:?}",
+        kind.label()
+    );
+    let expected_initial_tree = initial_trees
+        .get(&Arm::KernelA)
+        .cloned()
+        .ok_or_else(|| anyhow!("kernel A initial tree witness missing"))?;
+    ensure!(
+        initial_trees
+            .values()
+            .all(|witness| witness == &expected_initial_tree),
+        "initial mounted tree parity mismatch for {}: {initial_trees:?}",
         kind.label()
     );
 
@@ -1585,7 +2182,7 @@ fn fs_report(
         );
     }
 
-    let samples = collect_samples(&paths, config, interrupted)?;
+    let samples = collect_samples(&roots, config, interrupted)?;
     let kernel_null = bootstrap_median_ci(
         &paired_log_ratios(
             &samples.values[&Arm::KernelA],
@@ -1607,8 +2204,9 @@ fn fs_report(
 
     for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
         println!(
-            "mounted_kernel_arm,filesystem={},arm={},median_wall_ns={:.0},samples={}",
+            "mounted_kernel_arm,filesystem={},workload={},arm={},median_wall_ns={:.0},samples={}",
             kind.label(),
+            config.workload.label(),
             arm.label(),
             median(
                 samples.values[&arm]
@@ -1620,8 +2218,9 @@ fn fs_report(
         );
     }
     println!(
-        "mounted_kernel_identity,filesystem={},kernel_release={},kernel_module={},kernel_arms=2,fuse_arms=2,fuse_binary_sha256={},mount_identity=pass,independent_arms=pass,options=ro+noatime+nodev+nosuid,durability=read_only_no_mutation",
+        "mounted_kernel_identity,filesystem={},workload={},kernel_release={},kernel_module={},kernel_arms=2,fuse_arms=2,fuse_binary_sha256={},mount_identity=pass,independent_arms=pass,options={}+noatime+nodev+nosuid,durability={}",
         kind.label(),
+        config.workload.label(),
         fs::read_to_string("/proc/sys/kernel/osrelease")
             .unwrap_or_default()
             .trim(),
@@ -1630,20 +2229,33 @@ fn fs_report(
             .iter()
             .next()
             .map_or("unavailable", String::as_str),
+        if config.workload.is_mutating() {
+            "rw"
+        } else {
+            "ro"
+        },
+        config.workload.durability(),
     );
     println!(
-        "mounted_kernel_parity,filesystem={},arms=4,file_sha256={},len={},mode={:o},uid={},gid={},nlink={},verdict=pass",
+        "mounted_kernel_parity,filesystem={},workload={},arms=4,file_sha256={},len={},mode={:o},uid={},gid={},nlink={},tree_sha256={},tree_entries={},tree_files={},tree_dirs={},tree_bytes={},verdict=pass",
         kind.label(),
+        config.workload.label(),
         expected_parity.file_sha256,
         expected_parity.len,
         expected_parity.mode,
         expected_parity.uid,
         expected_parity.gid,
         expected_parity.nlink,
+        expected_initial_tree.sha256,
+        expected_initial_tree.entries,
+        expected_initial_tree.regular_files,
+        expected_initial_tree.directories,
+        expected_initial_tree.bytes,
     );
     println!(
-        "mounted_kernel_null,filesystem={},arm=kernel,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},clear={}",
+        "mounted_kernel_null,filesystem={},workload={},arm=kernel,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},clear={}",
         kind.label(),
+        config.workload.label(),
         kernel_null.median,
         kernel_null.low,
         kernel_null.high,
@@ -1652,8 +2264,9 @@ fn fs_report(
         kernel_clear,
     );
     println!(
-        "mounted_kernel_null,filesystem={},arm=fuse,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},clear={}",
+        "mounted_kernel_null,filesystem={},workload={},arm=fuse,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},clear={}",
         kind.label(),
+        config.workload.label(),
         fuse_null.median,
         fuse_null.low,
         fuse_null.high,
@@ -1662,10 +2275,13 @@ fn fs_report(
         fuse_clear,
     );
     println!(
-        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload=warm_stat,operations_per_observation={},pairs={},observation_reducer=min_of_{},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},admitted={},verdict={},gate_basis=bootstrap_median_ci,bootstrap_resamples={},cv_used=false,instructions_used=false",
+        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},client_threads={},operations_per_observation={},pairs={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},admitted={},verdict={},gate_basis=bootstrap_median_ci,bootstrap_resamples={},cv_used=false,instructions_used=false",
         kind.label(),
+        config.workload.label(),
+        config.workload.client_threads(),
         config.operations,
         config.pairs,
+        config.workload.observation_reducer(),
         config.observation_repeats,
         fuse_over_kernel.median,
         fuse_over_kernel.low,
@@ -1686,6 +2302,39 @@ fn fs_report(
         .map(|(arm, digest)| (arm.label().to_owned(), json!(format!("{digest:016x}"))))
         .collect::<serde_json::Map<_, _>>();
 
+    let mut final_trees = BTreeMap::new();
+    for mount in &mounts {
+        final_trees.insert(mount.arm, tree_witness(mount.workload_root())?);
+    }
+    let expected_final_tree = final_trees
+        .get(&Arm::KernelA)
+        .cloned()
+        .ok_or_else(|| anyhow!("kernel A final tree witness missing"))?;
+    ensure!(
+        final_trees
+            .values()
+            .all(|witness| witness == &expected_final_tree),
+        "post-workload mounted tree parity mismatch for {}: {final_trees:?}",
+        kind.label()
+    );
+    if !config.workload.is_mutating() || config.workload == Workload::CreateDeleteStorm {
+        ensure!(
+            expected_final_tree == expected_initial_tree,
+            "{} changed the mounted tree despite a nonpersistent workload",
+            config.workload.label()
+        );
+    }
+    println!(
+        "mounted_kernel_post_parity,filesystem={},workload={},arms=4,tree_sha256={},tree_entries={},tree_files={},tree_dirs={},tree_bytes={},verdict=pass",
+        kind.label(),
+        config.workload.label(),
+        expected_final_tree.sha256,
+        expected_final_tree.entries,
+        expected_final_tree.regular_files,
+        expected_final_tree.directories,
+        expected_final_tree.bytes,
+    );
+
     for mount in mounts.iter_mut().rev() {
         mount.unmount()?;
     }
@@ -1695,11 +2344,12 @@ fn fs_report(
 
     Ok(json!({
         "filesystem": kind.label(),
-        "workload": "warm_stat",
+        "workload": config.workload.label(),
+        "client_threads": config.workload.client_threads(),
         "operations_per_observation": config.operations,
         "pairs": config.pairs,
         "observation_repeats": config.observation_repeats,
-        "observation_reducer": "min",
+        "observation_reducer": config.workload.observation_reducer(),
         "identities": identities,
         "parity": {
             "verdict": "pass",
@@ -1709,6 +2359,20 @@ fn fs_report(
             "uid": expected_parity.uid,
             "gid": expected_parity.gid,
             "nlink": expected_parity.nlink,
+            "initial_tree": {
+                "sha256": expected_initial_tree.sha256,
+                "entries": expected_initial_tree.entries,
+                "regular_files": expected_initial_tree.regular_files,
+                "directories": expected_initial_tree.directories,
+                "bytes": expected_initial_tree.bytes,
+            },
+            "final_tree": {
+                "sha256": expected_final_tree.sha256,
+                "entries": expected_final_tree.entries,
+                "regular_files": expected_final_tree.regular_files,
+                "directories": expected_final_tree.directories,
+                "bytes": expected_final_tree.bytes,
+            },
         },
         "pre_measurement_cpu_busy": contention,
         "raw_wall_ns": raw_samples,
@@ -1782,12 +2446,19 @@ fn run() -> Result<Option<PathBuf>> {
         .output
         .clone()
         .unwrap_or_else(|| run_dir.join("mounted-kernel-report.json"));
-    let fixture_root = create_fixture_tree(&run_dir)?;
-    let placement = select_cpu_placement()?;
-    pin_current_process(placement.driver_cpu)?;
+    let fixture_root = create_fixture_tree(&run_dir, &config)?;
+    let placement = select_cpu_placement(config.workload.client_threads())?;
+    pin_current_process(&placement.driver_cpus)?;
     println!(
-        "core_contention_preflight,driver_cpu={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},same_llc=true,llc_cpus={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
-        placement.driver_cpu,
+        "core_contention_preflight,workload={},client_threads={},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},same_llc=true,llc_cpus={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
+        config.workload.label(),
+        config.workload.client_threads(),
+        placement
+            .driver_cpus
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(":"),
         placement
             .driver_guard_cpus
             .iter()
@@ -1868,19 +2539,35 @@ fn run() -> Result<Option<PathBuf>> {
         "disk_free_before_bytes": free_before,
         "disk_free_after_bytes": free_after,
         "driver_cpu": placement.driver_cpu,
+        "driver_cpus": placement.driver_cpus,
         "fuse_cpus": placement.fuse_cpus,
         "driver_guard_cpus": placement.driver_guard_cpus,
         "fuse_guard_cpus": placement.fuse_guard_cpus,
         "last_level_cache_cpus": placement.last_level_cache_cpus,
         "initial_cpu_busy_fractions": placement.busy_fractions,
         "mount_contract": {
-            "kernel": "real kernel filesystem on read-only loop device",
+            "kernel": if config.workload.is_mutating() {
+                "real kernel filesystem on read-write loop device"
+            } else {
+                "real kernel filesystem on read-only loop device"
+            },
             "candidate": "FrankenFS FUSE",
-            "common": ["ro", "noatime", "nodev", "nosuid"],
-            "ext4_kernel_only": ["noload"],
+            "common": [
+                if config.workload.is_mutating() { "rw" } else { "ro" },
+                "noatime",
+                "nodev",
+                "nosuid"
+            ],
+            "ext4_kernel_only": if config.workload.is_mutating() {
+                json!(["data=ordered"])
+            } else {
+                json!(["noload"])
+            },
             "fuse_only": ["no_background_scrub", "writeback_cache_disabled"],
-            "durability": "read_only_no_mutation",
+            "durability": config.workload.durability(),
         },
+        "workload": config.workload.label(),
+        "client_threads": config.workload.client_threads(),
         "schedule": "balanced four-arm interleave with independent kernel and FUSE A/A",
         "filesystems": filesystem_reports,
     });
