@@ -27,6 +27,7 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -277,6 +278,8 @@ struct HostProvenance {
     allowed_cpus_before_pin: BTreeSet<usize>,
     cgroup_cpuset_effective: Option<String>,
     physical_cores: usize,
+    memory_bytes: u64,
+    numa_nodes: usize,
     runtime_features: BTreeSet<&'static str>,
 }
 
@@ -313,6 +316,28 @@ struct FfsBinaryIdentity {
     pgo_profile_sha256: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelEngineIdentity {
+    release: String,
+    artifact: PathBuf,
+    artifact_sha256: String,
+    runtime_notes_sha256: String,
+}
+
+#[derive(Debug)]
+struct WorkloadBatch {
+    elapsed_ns: u64,
+    digest: u64,
+    observed_worker_threads: Option<usize>,
+}
+
+#[derive(Debug)]
+struct Observation {
+    elapsed_ns: u64,
+    digest: u64,
+    observed_worker_threads: BTreeSet<usize>,
+}
+
 #[derive(Debug)]
 struct TimedSamples {
     /// Samples indexed by the counterbalanced logical A/B assignment.
@@ -320,6 +345,8 @@ struct TimedSamples {
     /// The same samples indexed by the physical image/mount that executed.
     physical_values: BTreeMap<Arm, Vec<u64>>,
     digests: BTreeMap<Arm, u64>,
+    /// Runtime-observed Linux worker-TID counts for each logical arm.
+    observed_worker_threads: BTreeMap<Arm, BTreeSet<usize>>,
 }
 
 #[derive(Debug)]
@@ -541,7 +568,7 @@ fn validate_config(config: &Config) -> Result<()> {
     );
     ensure!(
         config.client_threads() == 1 || config.operations % config.client_threads() == 0,
-        "{} requires --operations divisible by its {} actual client threads",
+        "{} requires --operations divisible by its {} requested client threads",
         config.workload.label(),
         config.client_threads()
     );
@@ -650,6 +677,84 @@ fn current_elf_sha256() -> Result<String> {
     let executable = env::current_exe().context("resolve current executable")?;
     file_sha256(&executable)
         .with_context(|| format!("self-hash executing ELF {}", executable.display()))
+}
+
+fn privileged_file_sha256(path: &Path) -> Result<String> {
+    if let Ok(sha256) = file_sha256(path) {
+        return Ok(sha256);
+    }
+    let output = Command::new("sudo")
+        .args(["-n", "sha256sum", "--"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("hash privileged artifact {}", path.display()))?;
+    ensure!(
+        output.status.success(),
+        "privileged SHA-256 failed for {}: status={} stderr={}",
+        path.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let stdout =
+        String::from_utf8(output.stdout).context("privileged sha256sum output is not UTF-8")?;
+    let sha256 = stdout
+        .split_ascii_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("privileged sha256sum returned no digest"))?
+        .to_owned();
+    ensure!(
+        is_sha256(&sha256),
+        "privileged sha256sum returned invalid digest for {}: {sha256}",
+        path.display()
+    );
+    Ok(sha256)
+}
+
+fn kernel_engine_identity(kind: FilesystemKind) -> Result<KernelEngineIdentity> {
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .context("read running kernel release")?
+        .trim()
+        .to_owned();
+    let module_artifact = Command::new("modinfo")
+        .args(["-n", kind.kernel_module()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| path.is_file());
+    let artifact = module_artifact
+        .or_else(|| {
+            [
+                PathBuf::from(format!("/boot/vmlinuz-{release}")),
+                PathBuf::from(format!("/usr/lib/modules/{release}/vmlinuz")),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+        })
+        .ok_or_else(|| anyhow!("running kernel artifact for {release} is unavailable"))?;
+    let runtime_notes = PathBuf::from(format!(
+        "/sys/module/{}/notes/.note.gnu.build-id",
+        kind.kernel_module()
+    ));
+    let runtime_notes = if runtime_notes.is_file() {
+        runtime_notes
+    } else {
+        PathBuf::from("/sys/kernel/notes")
+    };
+    let artifact_sha256 = privileged_file_sha256(&artifact)?;
+    let runtime_notes_sha256 = file_sha256(&runtime_notes)
+        .with_context(|| format!("hash runtime kernel notes {}", runtime_notes.display()))?;
+    ensure!(
+        is_sha256(&artifact_sha256) && is_sha256(&runtime_notes_sha256),
+        "kernel engine provenance did not produce two SHA-256 identities"
+    );
+    Ok(KernelEngineIdentity {
+        release,
+        artifact,
+        artifact_sha256,
+        runtime_notes_sha256,
+    })
 }
 
 fn unique_prefixed_line<'a>(content: &'a str, prefix: &str, label: &str) -> Result<&'a str> {
@@ -1436,20 +1541,35 @@ fn digest_path(path: &Path) -> u64 {
         })
 }
 
+fn current_linux_tid() -> Result<u32> {
+    let target = fs::read_link("/proc/thread-self").context("resolve current Linux thread ID")?;
+    target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("current Linux thread link has no TID: {}", target.display()))?
+        .parse::<u32>()
+        .with_context(|| format!("parse current Linux TID from {}", target.display()))
+}
+
 fn parallel_metadata_write_batch(
     root: &Path,
     operations: usize,
     sequence: usize,
     client_threads: usize,
-) -> Result<(u64, u64)> {
+) -> Result<WorkloadBatch> {
     let parent = root.join("parallel-metadata");
     let per_worker = operations / client_threads;
+    let (thread_id_sender, thread_id_receiver) = mpsc::channel();
     let started = Instant::now();
-    let digest = thread::scope(|scope| -> Result<u64> {
+    let (digest, observed_worker_threads) = thread::scope(|scope| -> Result<(u64, usize)> {
         let mut handles = Vec::with_capacity(client_threads);
         for worker in 0..client_threads {
             let worker_dir = parent.join(format!("worker-{worker}"));
+            let thread_id_sender = thread_id_sender.clone();
             handles.push(scope.spawn(move || -> Result<u64> {
+                thread_id_sender
+                    .send(current_linux_tid()?)
+                    .context("report parallel metadata worker TID")?;
                 let mut digest = 0_u64;
                 for index in 0..per_worker {
                     let path = worker_dir.join(format!("r{sequence:06}-{index:06}"));
@@ -1465,14 +1585,20 @@ fn parallel_metadata_write_batch(
                 Ok(digest)
             }));
         }
+        drop(thread_id_sender);
         let mut digest = 0_u64;
         for handle in handles {
             digest ^= handle
                 .join()
                 .map_err(|_| anyhow!("parallel metadata worker panicked"))??;
         }
-        Ok(digest)
+        let observed_thread_ids = thread_id_receiver.into_iter().collect::<BTreeSet<_>>();
+        Ok((digest, observed_thread_ids.len()))
     })?;
+    ensure!(
+        observed_worker_threads > 0,
+        "parallel metadata batch observed no worker threads"
+    );
     for worker in 0..client_threads {
         let worker_dir = File::open(parent.join(format!("worker-{worker}")))
             .with_context(|| format!("open metadata worker directory {worker}"))?;
@@ -1482,10 +1608,11 @@ fn parallel_metadata_write_batch(
     }
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     black_box(digest);
-    Ok((
-        elapsed,
-        digest ^ u64::try_from(operations).unwrap_or(u64::MAX),
-    ))
+    Ok(WorkloadBatch {
+        elapsed_ns: elapsed,
+        digest: digest ^ u64::try_from(operations).unwrap_or(u64::MAX),
+        observed_worker_threads: Some(observed_worker_threads),
+    })
 }
 
 fn reset_parallel_metadata_write_batch(
@@ -1730,41 +1857,57 @@ fn fsync_journal_batch(root: &Path, operations: usize, sequence: usize) -> Resul
     ))
 }
 
-fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<(u64, u64)> {
-    match config.workload {
-        Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations),
-        Workload::ParallelMetadataWrite => parallel_metadata_write_batch(
+fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<WorkloadBatch> {
+    if config.workload == Workload::ParallelMetadataWrite {
+        return parallel_metadata_write_batch(
             root,
             config.operations,
             sequence,
             config.client_threads(),
-        ),
-        Workload::ParallelRead8 => parallel_read_batch(root, config.operations),
-        Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations),
-        Workload::ReaddirStat8 => readdir_stat_batch(root, config.operations),
-        Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence),
+        );
     }
+    let (elapsed_ns, digest) = match config.workload {
+        Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations)?,
+        Workload::ParallelMetadataWrite => unreachable!("handled above"),
+        Workload::ParallelRead8 => parallel_read_batch(root, config.operations)?,
+        Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations)?,
+        Workload::ReaddirStat8 => readdir_stat_batch(root, config.operations)?,
+        Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence)?,
+    };
+    Ok(WorkloadBatch {
+        elapsed_ns,
+        digest,
+        observed_worker_threads: None,
+    })
 }
 
-fn observe(root: &Path, config: &Config, sequence: usize) -> Result<(u64, u64)> {
+fn observe(root: &Path, config: &Config, sequence: usize) -> Result<Observation> {
     let mut best = u64::MAX;
     let mut expected_digest = None;
+    let mut observed_worker_threads = BTreeSet::new();
     for repeat in 0..config.observation_repeats {
         let current_sequence = sequence
             .saturating_mul(config.observation_repeats)
             .saturating_add(repeat);
-        let (elapsed, digest) = workload_batch(root, config, current_sequence)?;
+        let batch = workload_batch(root, config, current_sequence)?;
         if let Some(expected) = expected_digest {
             ensure!(
-                digest == expected,
+                batch.digest == expected,
                 "timed workload digest changed within one arm"
             );
         } else {
-            expected_digest = Some(digest);
+            expected_digest = Some(batch.digest);
         }
-        best = best.min(elapsed);
+        if let Some(observed) = batch.observed_worker_threads {
+            observed_worker_threads.insert(observed);
+        }
+        best = best.min(batch.elapsed_ns);
     }
-    Ok((best, expected_digest.unwrap_or(0)))
+    Ok(Observation {
+        elapsed_ns: best,
+        digest: expected_digest.unwrap_or(0),
+        observed_worker_threads,
+    })
 }
 
 const fn physical_arm_for(logical_arm: Arm, round: usize) -> Arm {
@@ -1812,11 +1955,11 @@ fn collect_samples(
                 .get(&physical_arm)
                 .ok_or_else(|| anyhow!("missing workload root for {}", physical_arm.label()))?;
             let sequence = next_sequences[&physical_arm];
-            let (_, digest) = workload_batch(root, config, sequence)?;
+            let batch = workload_batch(root, config, sequence)?;
             *next_sequences
                 .get_mut(&physical_arm)
                 .expect("all arms initialized") += 1;
-            black_box(digest);
+            black_box(batch.digest);
             reset_workload_state(root, config, sequence)?;
             quiesce_arm(root, config)?;
         }
@@ -1835,6 +1978,12 @@ fn collect_samples(
         (Arm::FuseB, Vec::with_capacity(config.pairs)),
     ]);
     let mut digests = BTreeMap::new();
+    let mut observed_worker_threads = BTreeMap::from([
+        (Arm::KernelA, BTreeSet::new()),
+        (Arm::KernelB, BTreeSet::new()),
+        (Arm::FuseA, BTreeSet::new()),
+        (Arm::FuseB, BTreeSet::new()),
+    ]);
     for round in 0..config.pairs {
         ensure!(
             !interrupted.load(Ordering::Relaxed),
@@ -1846,21 +1995,25 @@ fn collect_samples(
                 .get(&physical_arm)
                 .ok_or_else(|| anyhow!("missing workload root for {}", physical_arm.label()))?;
             let sequence = next_sequences[&physical_arm];
-            let (elapsed, digest) = observe(root, config, sequence)?;
+            let observation = observe(root, config, sequence)?;
             *next_sequences
                 .get_mut(&physical_arm)
                 .expect("all arms initialized") += 1;
             values
                 .get_mut(&logical_arm)
                 .expect("all arms initialized")
-                .push(elapsed);
+                .push(observation.elapsed_ns);
             physical_values
                 .get_mut(&physical_arm)
                 .expect("all physical arms initialized")
-                .push(elapsed);
-            if let Some(expected) = digests.insert(physical_arm, digest) {
+                .push(observation.elapsed_ns);
+            observed_worker_threads
+                .get_mut(&logical_arm)
+                .expect("all arms initialized")
+                .extend(observation.observed_worker_threads);
+            if let Some(expected) = digests.insert(physical_arm, observation.digest) {
                 ensure!(
-                    expected == digest,
+                    expected == observation.digest,
                     "{} workload digest changed across rounds",
                     physical_arm.label()
                 );
@@ -1881,6 +2034,7 @@ fn collect_samples(
         values,
         physical_values,
         digests,
+        observed_worker_threads,
     })
 }
 
@@ -1924,6 +2078,22 @@ fn bootstrap_median_ci(log_ratios: &[f64], seed: u64) -> BootstrapMedianCi {
         low: bootstrapped[low_index].exp(),
         high: bootstrapped[high_index].exp(),
     }
+}
+
+fn null_log_margin(kernel: BootstrapMedianCi, fuse: BootstrapMedianCi) -> f64 {
+    [kernel.low, kernel.high, fuse.low, fuse.high]
+        .into_iter()
+        .map(|ratio| ratio.ln().abs())
+        .fold(0.0_f64, f64::max)
+}
+
+fn clears_twice_null_margin(
+    competitive: BootstrapMedianCi,
+    kernel_null: BootstrapMedianCi,
+    fuse_null: BootstrapMedianCi,
+) -> bool {
+    let required_log_margin = 2.0 * null_log_margin(kernel_null, fuse_null);
+    competitive.low.ln() > required_log_margin || -competitive.high.ln() > required_log_margin
 }
 
 fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f64>> {
@@ -2063,6 +2233,15 @@ fn self_allowed_cpus() -> Result<BTreeSet<usize>> {
     parse_cpu_list(allowed)
 }
 
+fn self_cpu_affinity_mask() -> Result<String> {
+    let status = fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed:\t"))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("Cpus_allowed missing from /proc/self/status"))
+}
+
 fn cgroup_cpuset_effective() -> Option<String> {
     let cgroup = fs::read_to_string("/proc/self/cgroup").ok()?;
     let mut candidates = Vec::new();
@@ -2118,6 +2297,28 @@ fn physical_core_count(cpus: &BTreeSet<usize>) -> Result<usize> {
     Ok(cores.len())
 }
 
+fn total_memory_bytes() -> Result<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").context("read /proc/meminfo")?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|value| value.split_ascii_whitespace().next())
+        .ok_or_else(|| anyhow!("MemTotal is missing from /proc/meminfo"))?
+        .parse::<u64>()
+        .context("parse MemTotal KiB")?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| anyhow!("MemTotal byte count overflow"))
+}
+
+fn numa_node_count() -> Result<usize> {
+    let nodes = parse_cpu_list(
+        &fs::read_to_string("/sys/devices/system/node/online")
+            .context("read online NUMA node list")?,
+    )?;
+    ensure!(!nodes.is_empty(), "host exposes no online NUMA nodes");
+    Ok(nodes.len())
+}
+
 fn host_provenance() -> Result<HostProvenance> {
     let online_cpus = parse_cpu_list(
         &fs::read_to_string("/sys/devices/system/cpu/online").context("read online CPU list")?,
@@ -2152,6 +2353,8 @@ fn host_provenance() -> Result<HostProvenance> {
             .to_owned(),
         cpu_model,
         physical_cores: physical_core_count(&online_cpus)?,
+        memory_bytes: total_memory_bytes()?,
+        numa_nodes: numa_node_count()?,
         online_cpus,
         allowed_cpus_before_pin,
         cgroup_cpuset_effective: cgroup_cpuset_effective(),
@@ -2417,7 +2620,7 @@ fn select_driver_cpus(
     }
     ensure!(
         driver_cpus.len() == target_cpu_count,
-        "{} domain supplied only {} quiet client CPUs; {target_cpu_count} needed for {client_threads} actual client threads",
+        "{} domain supplied only {} quiet client CPUs; {target_cpu_count} needed for {client_threads} requested client threads",
         context.scope.label(),
         driver_cpus.len(),
     );
@@ -2514,6 +2717,7 @@ fn fs_report(
     kind: FilesystemKind,
     config: &Config,
     expected_identity: &FfsBinaryIdentity,
+    host: &HostProvenance,
     run_dir: &Path,
     mount_run_dir: &Path,
     fixture_root: &Path,
@@ -2551,6 +2755,9 @@ fn fs_report(
         )?);
     }
     assert_independent_arms(&mounts)?;
+    let kernel_identity = kernel_engine_identity(kind)?;
+    let client_affinity_mask = self_cpu_affinity_mask()?;
+    let client_affinity_list = format_cpu_list(self_allowed_cpus()?);
 
     let fuse_shas: BTreeSet<String> = mounts
         .iter()
@@ -2665,7 +2872,36 @@ fn fs_report(
         kernel_null.contains_null() && kernel_null.symmetric_spread() <= config.maximum_null_ratio;
     let fuse_clear =
         fuse_null.contains_null() && fuse_null.symmetric_spread() <= config.maximum_null_ratio;
-    let admitted = kernel_clear && fuse_clear;
+    let observed_thread_union = samples
+        .observed_worker_threads
+        .values()
+        .flat_map(|values| values.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let worker_thread_observation_clear = config.workload != Workload::ParallelMetadataWrite
+        || (observed_thread_union.len() == 1
+            && samples
+                .observed_worker_threads
+                .values()
+                .all(|values| values.len() == 1));
+    let actual_observed_worker_threads = worker_thread_observation_clear
+        .then(|| observed_thread_union.iter().next().copied())
+        .flatten();
+    let admitted = kernel_clear && fuse_clear && worker_thread_observation_clear;
+    let twice_null_log_margin = 2.0 * null_log_margin(kernel_null, fuse_null);
+    let twice_null_ratio = twice_null_log_margin.exp();
+    let directional_claim_clear =
+        admitted && clears_twice_null_margin(fuse_over_kernel, kernel_null, fuse_null);
+    let verdict = if !worker_thread_observation_clear {
+        "BLOCKED_THREAD_OBSERVATION"
+    } else if !kernel_clear || !fuse_clear {
+        "BLOCKED_NULL"
+    } else if !directional_claim_clear {
+        "HONEST_NEUTRAL"
+    } else if fuse_over_kernel.median > 1.0 {
+        "HONEST_LOSS"
+    } else {
+        "HONEST_WIN"
+    };
     let kernel_median_wall_ns = median(
         [Arm::KernelA, Arm::KernelB]
             .into_iter()
@@ -2714,13 +2950,14 @@ fn fs_report(
         );
     }
     println!(
-        "mounted_kernel_identity,filesystem={},workload={},kernel_release={},kernel_module={},kernel_arms=2,fuse_arms=2,fuse_binary_sha256={},mount_identity=pass,independent_arms=pass,options={}+noatime+nodev+nosuid,durability={}",
+        "mounted_kernel_identity,filesystem={},workload={},kernel_release={},kernel_module={},kernel_engine_artifact={},kernel_engine_sha256={},kernel_runtime_notes_sha256={},kernel_arms=2,fuse_arms=2,fuse_binary_sha256={},mount_identity=pass,independent_arms=pass,options={}+noatime+nodev+nosuid,durability={}",
         kind.label(),
         config.workload.label(),
-        fs::read_to_string("/proc/sys/kernel/osrelease")
-            .unwrap_or_default()
-            .trim(),
+        kernel_identity.release,
         kind.kernel_module(),
+        kernel_identity.artifact.display(),
+        kernel_identity.artifact_sha256,
+        kernel_identity.runtime_notes_sha256,
         fuse_shas
             .iter()
             .next()
@@ -2749,6 +2986,21 @@ fn fs_report(
         expected_initial_tree.bytes,
     );
     if config.workload == Workload::ParallelMetadataWrite {
+        for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+            println!(
+                "mounted_kernel_worker_threads,filesystem={},workload={},assignment_arm={},requested={},runtime_observed_values={},observation_method=unique_linux_tids_reported_by_workers_inside_timed_batch,clear={}",
+                kind.label(),
+                config.workload.label(),
+                arm.label(),
+                config.client_threads(),
+                samples.observed_worker_threads[&arm]
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(":"),
+                worker_thread_observation_clear,
+            );
+        }
         println!(
             "mounted_kernel_state_reset,filesystem={},workload={},timed_files_per_arm_observation={},reset_files_per_arm_observation={},warmup_observations_per_arm={},measured_observations_per_arm={},reset_timing=excluded,post_reset_sync=sync_f,verdict=pass",
             kind.label(),
@@ -2784,10 +3036,12 @@ fn fs_report(
         fuse_clear,
     );
     println!(
-        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},client_threads={},operations_per_observation={},pairs={},crossover_blocks={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},admitted={},verdict={},gate_basis=four_round_balanced_crossover_bootstrap_median_ci,bootstrap_resamples={},cv_used=false,instructions_used=false",
+        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},requested_client_threads={},actual_observed_worker_threads={},operations_per_observation={},pairs={},crossover_blocks={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},twice_null_margin_ratio={:.6},directional_claim_clear={},admitted={},verdict={},gate_basis=four_round_balanced_crossover_bootstrap_median_ci_with_twice_null_log_margin,bootstrap_resamples={},cv_used=false,instructions_used=false",
         kind.label(),
         config.workload.label(),
         config.client_threads(),
+        actual_observed_worker_threads
+            .map_or_else(|| "not_observed".to_owned(), |value| value.to_string()),
         config.operations,
         config.pairs,
         config.pairs / ESTIMATOR_BLOCK_ROUNDS,
@@ -2796,15 +3050,19 @@ fn fs_report(
         fuse_over_kernel.median,
         fuse_over_kernel.low,
         fuse_over_kernel.high,
+        twice_null_ratio,
+        directional_claim_clear,
         admitted,
-        if admitted { "HONEST" } else { "BLOCKED_NULL" },
+        verdict,
         BOOTSTRAP_RESAMPLES,
     );
     println!(
-        "mounted_kernel_throughput,filesystem={},workload={},client_threads={},operations_per_observation={},kernel_median_wall_ns={kernel_median_wall_ns:.0},fuse_median_wall_ns={fuse_median_wall_ns:.0},kernel_operations_per_second={kernel_operations_per_second:.3},fuse_operations_per_second={fuse_operations_per_second:.3},diagnostic_only=true",
+        "mounted_kernel_throughput,filesystem={},workload={},requested_client_threads={},actual_observed_worker_threads={},operations_per_observation={},kernel_median_wall_ns={kernel_median_wall_ns:.0},fuse_median_wall_ns={fuse_median_wall_ns:.0},kernel_operations_per_second={kernel_operations_per_second:.3},fuse_operations_per_second={fuse_operations_per_second:.3},diagnostic_only=true",
         kind.label(),
         config.workload.label(),
         config.client_threads(),
+        actual_observed_worker_threads
+            .map_or_else(|| "not_observed".to_owned(), |value| value.to_string()),
         config.operations,
     );
 
@@ -2815,6 +3073,11 @@ fn fs_report(
         .collect::<serde_json::Map<_, _>>();
     let raw_physical_samples = samples
         .physical_values
+        .iter()
+        .map(|(arm, values)| (arm.label().to_owned(), json!(values)))
+        .collect::<serde_json::Map<_, _>>();
+    let observed_worker_threads_by_arm = samples
+        .observed_worker_threads
         .iter()
         .map(|(arm, values)| (arm.label().to_owned(), json!(values)))
         .collect::<serde_json::Map<_, _>>();
@@ -2869,16 +3132,106 @@ fn fs_report(
         validate_image(kind, image)?;
     }
 
-    Ok(json!({
+    let kernel_engine_identity_json = json!({
+        "release": kernel_identity.release,
+        "module": kind.kernel_module(),
+        "artifact": kernel_identity.artifact,
+        "artifact_sha256": kernel_identity.artifact_sha256,
+        "runtime_notes_sha256": kernel_identity.runtime_notes_sha256,
+    });
+    let parity_json = json!({
+        "verdict": "pass",
+        "file_sha256": expected_parity.file_sha256,
+        "len": expected_parity.len,
+        "mode": expected_parity.mode,
+        "uid": expected_parity.uid,
+        "gid": expected_parity.gid,
+        "nlink": expected_parity.nlink,
+        "initial_tree": {
+            "sha256": expected_initial_tree.sha256,
+            "entries": expected_initial_tree.entries,
+            "regular_files": expected_initial_tree.regular_files,
+            "directories": expected_initial_tree.directories,
+            "bytes": expected_initial_tree.bytes,
+        },
+        "final_tree": {
+            "sha256": expected_final_tree.sha256,
+            "entries": expected_final_tree.entries,
+            "regular_files": expected_final_tree.regular_files,
+            "directories": expected_final_tree.directories,
+            "bytes": expected_final_tree.bytes,
+        },
+    });
+    let host_wide_quiescence_json = if config.placement_scope == PlacementScope::HostWide {
+        json!({
+            "verdict": "clear",
+            "allowed_cpu_count": placement.allowed_cpus.len(),
+            "maximum_busy_fraction": MAX_DRIVER_PREFLIGHT_BUSY,
+            "busy_cpu_count_above_limit": 0,
+        })
+    } else {
+        json!("not_applicable")
+    };
+    let diagnostic_throughput_json = json!({
+        "gate_input": false,
+        "kernel_median_wall_ns": kernel_median_wall_ns,
+        "fuse_median_wall_ns": fuse_median_wall_ns,
+        "kernel_operations_per_second": kernel_operations_per_second,
+        "fuse_operations_per_second": fuse_operations_per_second,
+    });
+    let kernel_aa_json = json!({
+        "median": kernel_null.median,
+        "ci_low": kernel_null.low,
+        "ci_high": kernel_null.high,
+        "symmetric_spread": kernel_null.symmetric_spread(),
+        "clear": kernel_clear,
+    });
+    let fuse_aa_json = json!({
+        "median": fuse_null.median,
+        "ci_low": fuse_null.low,
+        "ci_high": fuse_null.high,
+        "symmetric_spread": fuse_null.symmetric_spread(),
+        "clear": fuse_clear,
+    });
+    let competitive_json = json!({
+        "median": fuse_over_kernel.median,
+        "ci_low": fuse_over_kernel.low,
+        "ci_high": fuse_over_kernel.high,
+        "twice_null_log_margin": twice_null_log_margin,
+        "twice_null_margin_ratio": twice_null_ratio,
+        "directional_claim_clear": directional_claim_clear,
+    });
+
+    let Value::Object(mut report) = json!({
         "filesystem": kind.label(),
         "workload": config.workload.label(),
-        "client_threads": config.client_threads(),
+        "host_identity": host.hostname,
+        "physical_cores": host.physical_cores,
+        "logical_threads": host.online_cpus.len(),
+        "memory_bytes": host.memory_bytes,
+        "numa_nodes": host.numa_nodes,
+        "runtime_detected_isa": runtime_isa_label(host),
+        "requested_client_threads": config.client_threads(),
+        "actual_observed_worker_threads": actual_observed_worker_threads,
+        "observed_worker_threads_by_arm": observed_worker_threads_by_arm,
+        "worker_thread_observation_method": if config.workload == Workload::ParallelMetadataWrite {
+            "unique Linux TIDs reported by workers inside each timed batch"
+        } else {
+            "not collected for this non-scaling workload"
+        },
+        "worker_thread_observation_clear": worker_thread_observation_clear,
+        "engine_sha256": {
+            "incumbent_kernel": kernel_identity.artifact_sha256,
+            "candidate_ffs": expected_identity.binary_sha256,
+        },
+        "client_affinity_mask": client_affinity_mask,
+        "client_affinity_list": client_affinity_list,
         "client_affinity_cpu_count": placement.driver_cpus.len(),
         "client_affinity_cpus": placement.driver_cpus,
-        "client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
+        "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "placement_scope": config.placement_scope.label(),
         "operations_per_observation": config.operations,
-        "operations_per_client_thread": config.operations / config.client_threads(),
+        "operations_per_requested_client_thread": config.operations / config.client_threads(),
         "pairs": config.pairs,
         "crossover_blocks": config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
@@ -2903,79 +3256,35 @@ fn fs_report(
         "observation_repeats": config.observation_repeats,
         "observation_reducer": config.workload.observation_reducer(),
         "identities": identities,
-        "parity": {
-            "verdict": "pass",
-            "file_sha256": expected_parity.file_sha256,
-            "len": expected_parity.len,
-            "mode": expected_parity.mode,
-            "uid": expected_parity.uid,
-            "gid": expected_parity.gid,
-            "nlink": expected_parity.nlink,
-            "initial_tree": {
-                "sha256": expected_initial_tree.sha256,
-                "entries": expected_initial_tree.entries,
-                "regular_files": expected_initial_tree.regular_files,
-                "directories": expected_initial_tree.directories,
-                "bytes": expected_initial_tree.bytes,
-            },
-            "final_tree": {
-                "sha256": expected_final_tree.sha256,
-                "entries": expected_final_tree.entries,
-                "regular_files": expected_final_tree.regular_files,
-                "directories": expected_final_tree.directories,
-                "bytes": expected_final_tree.bytes,
-            },
-        },
+    }) else {
+        unreachable!("JSON object literal must construct an object");
+    };
+    let Value::Object(measurement_evidence) = json!({
+        "kernel_engine_identity": kernel_engine_identity_json,
+        "parity": parity_json,
         "pre_measurement_cpu_busy": contention,
-        "host_wide_quiescence": if config.placement_scope == PlacementScope::HostWide {
-            json!({
-                "verdict": "clear",
-                "allowed_cpu_count": placement.allowed_cpus.len(),
-                "maximum_busy_fraction": MAX_DRIVER_PREFLIGHT_BUSY,
-                "busy_cpu_count_above_limit": 0,
-            })
-        } else {
-            json!("not_applicable")
-        },
+        "host_wide_quiescence": host_wide_quiescence_json,
         "raw_wall_ns": raw_samples,
         "raw_physical_wall_ns": raw_physical_samples,
-        "diagnostic_side_throughput": {
-            "gate_input": false,
-            "kernel_median_wall_ns": kernel_median_wall_ns,
-            "fuse_median_wall_ns": fuse_median_wall_ns,
-            "kernel_operations_per_second": kernel_operations_per_second,
-            "fuse_operations_per_second": fuse_operations_per_second,
-        },
+        "diagnostic_side_throughput": diagnostic_throughput_json,
         "workload_digests": workload_digests,
-        "kernel_aa": {
-            "median": kernel_null.median,
-            "ci_low": kernel_null.low,
-            "ci_high": kernel_null.high,
-            "symmetric_spread": kernel_null.symmetric_spread(),
-            "clear": kernel_clear,
-        },
-        "fuse_aa": {
-            "median": fuse_null.median,
-            "ci_low": fuse_null.low,
-            "ci_high": fuse_null.high,
-            "symmetric_spread": fuse_null.symmetric_spread(),
-            "clear": fuse_clear,
-        },
-        "fuse_over_kernel": {
-            "median": fuse_over_kernel.median,
-            "ci_low": fuse_over_kernel.low,
-            "ci_high": fuse_over_kernel.high,
-        },
+        "kernel_aa": kernel_aa_json,
+        "fuse_aa": fuse_aa_json,
+        "fuse_over_kernel": competitive_json,
         "maximum_null_ratio": config.maximum_null_ratio,
         "gate_metric": "wall_ns",
-        "gate_basis": "four_round_balanced_crossover_bootstrap_median_ci",
+        "gate_basis": "four_round_balanced_crossover_bootstrap_median_ci_with_twice_null_log_margin",
         "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
         "cv_used": false,
         "instructions_used": false,
         "admitted": admitted,
-        "verdict": if admitted { "honest" } else { "blocked_null" },
+        "verdict": verdict.to_ascii_lowercase(),
         "post_unmount_validation": "clean",
-    }))
+    }) else {
+        unreachable!("JSON object literal must construct an object");
+    };
+    report.extend(measurement_evidence);
+    Ok(Value::Object(report))
 }
 
 // Top-level preflight and evidence emission intentionally remain in one
@@ -2988,7 +3297,7 @@ fn run() -> Result<Option<PathBuf>> {
     let host = host_provenance()?;
     ensure!(
         config.client_threads() <= host.allowed_cpus_before_pin.len(),
-        "{} actual client threads exceed the pre-pin process allowance of {} logical CPUs",
+        "{} requested client threads exceed the pre-pin process allowance of {} logical CPUs",
         config.client_threads(),
         host.allowed_cpus_before_pin.len()
     );
@@ -3013,11 +3322,13 @@ fn run() -> Result<Option<PathBuf>> {
         host.runtime_features.contains("avx512f"),
     );
     println!(
-        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},client_threads_actually_used={},runtime_isa={},placement_scope={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
+        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},placement_scope={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
         host.hostname,
         host.cpu_model,
         host.physical_cores,
         host.online_cpus.len(),
+        host.memory_bytes,
+        host.numa_nodes,
         config.client_threads(),
         runtime_isa_label(&host),
         config.placement_scope.label(),
@@ -3048,7 +3359,7 @@ fn run() -> Result<Option<PathBuf>> {
     )?;
     pin_current_process(&placement.driver_cpus)?;
     println!(
-        "core_contention_preflight,workload={},client_threads_actually_used={},client_affinity_cpu_count={},client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
+        "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
         config.workload.label(),
         config.client_threads(),
         placement.driver_cpus.len(),
@@ -3088,6 +3399,7 @@ fn run() -> Result<Option<PathBuf>> {
             kind,
             &config,
             &ffs_binary_identity,
+            &host,
             &run_dir,
             &mount_run_dir,
             &fixture_root,
@@ -3104,7 +3416,7 @@ fn run() -> Result<Option<PathBuf>> {
 
     let free_after = free_bytes_on_data()?;
     let report = json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "harness": "ffs-mounted-kernel-bench",
         "harness_binary_sha256": harness_sha,
         "ffs_cli": fs::canonicalize(&config.ffs_cli)?,
@@ -3120,6 +3432,8 @@ fn run() -> Result<Option<PathBuf>> {
             "cpu_model": host.cpu_model,
             "physical_cores": host.physical_cores,
             "logical_threads": host.online_cpus.len(),
+            "memory_bytes": host.memory_bytes,
+            "numa_nodes": host.numa_nodes,
             "online_cpus": host.online_cpus,
             "pre_pin_allowed_cpus": host.allowed_cpus_before_pin,
             "pre_pin_allowed_cpu_count": host.allowed_cpus_before_pin.len(),
@@ -3136,7 +3450,7 @@ fn run() -> Result<Option<PathBuf>> {
         "driver_cpu": placement.driver_cpu,
         "driver_cpus": placement.driver_cpus,
         "client_affinity_cpu_count": placement.driver_cpus.len(),
-        "client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
+        "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "fuse_cpus": placement.fuse_cpus,
         "driver_guard_cpus": placement.driver_guard_cpus,
         "fuse_guard_cpus": placement.fuse_guard_cpus,
@@ -3164,8 +3478,8 @@ fn run() -> Result<Option<PathBuf>> {
             "durability": config.workload.durability(),
         },
         "workload": config.workload.label(),
-        "client_threads": config.client_threads(),
-        "client_threads_actually_used": config.client_threads(),
+        "requested_client_threads": config.client_threads(),
+        "actual_observed_worker_threads": "recorded per filesystem row",
         "placement_scope": config.placement_scope.label(),
         "schedule": {
             "kind": "balanced four-arm interleave with independent kernel and FUSE A/A",
@@ -3324,7 +3638,9 @@ mod tests {
         for worker in 0..2 {
             fs::create_dir(parent.join(format!("worker-{worker}"))).expect("worker directory");
         }
-        parallel_metadata_write_batch(temp.path(), 8, 7, 2).expect("create metadata batch");
+        let batch =
+            parallel_metadata_write_batch(temp.path(), 8, 7, 2).expect("create metadata batch");
+        assert_eq!(batch.observed_worker_threads, Some(2));
         reset_parallel_metadata_write_batch(temp.path(), 8, 7, 2).expect("reset metadata batch");
         for worker in 0..2 {
             assert_eq!(
@@ -3358,6 +3674,32 @@ mod tests {
     }
 
     #[test]
+    fn competitive_ci_must_clear_twice_the_worst_null_log_margin() {
+        let kernel_null = BootstrapMedianCi {
+            median: 1.0,
+            low: 0.99,
+            high: 1.01,
+        };
+        let fuse_null = BootstrapMedianCi {
+            median: 1.0,
+            low: 0.98,
+            high: 1.02,
+        };
+        let too_close = BootstrapMedianCi {
+            median: 1.03,
+            low: 1.025,
+            high: 1.035,
+        };
+        let clear = BootstrapMedianCi {
+            median: 1.08,
+            low: 1.06,
+            high: 1.10,
+        };
+        assert!(!clears_twice_null_margin(too_close, kernel_null, fuse_null));
+        assert!(clears_twice_null_margin(clear, kernel_null, fuse_null));
+    }
+
+    #[test]
     fn crossover_null_cancels_fixed_physical_arm_bias() {
         let logical_a = [100, 120, 100, 120];
         let logical_b = [120, 100, 120, 100];
@@ -3377,6 +3719,7 @@ mod tests {
             ]),
             physical_values: BTreeMap::new(),
             digests: BTreeMap::new(),
+            observed_worker_threads: BTreeMap::new(),
         };
         let ratios = competitive_log_ratios(&samples).expect("competitive ratios");
         assert!(ratios.iter().all(|ratio| (ratio.exp() - 4.0).abs() < 1e-12));
