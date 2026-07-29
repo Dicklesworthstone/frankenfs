@@ -13,6 +13,67 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Four-round physical-arm crossover clears all three blocked ext4 nulls - 2026-07-28 (GreenSpring, vs-INCUMBENT instrument KEEP)
+
+This is the final measured closeout for the three workloads that the original
+five-workload invocation left `BLOCKED-NULL`. It changes the comparator, not the
+filesystem. Each logical kernel and FUSE role crosses over both physical
+image/mount identities in a complete four-round Latin-schedule block. The
+estimator uses only complete blocks, after eight identically balanced warmup
+rounds, so fixed physical-image and schedule-position bias cancel rather than
+being averaged more precisely. Each final invocation used 128 rounds / 32
+complete crossover blocks, a 100 ms settle after every arm, pinned client and
+FUSE cores in one quiet LLC, and `sync -f` outside the timed interval after
+mutating an arm.
+
+### Final admitted results
+
+| Workload | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| Multi-file parallel read, 8 threads, 1,024 x 256 KiB, min of 3 | `0.998988x [0.992238, 1.007322]`, spread `1.007822x` | `1.000804x [0.996671, 1.003045]`, spread `1.003340x` | **`1.298761x [1.285335, 1.309185]` slower** | **HONEST LOSS** |
+| Small-file create/delete storm, 2,000 files | `1.010078x [0.994165, 1.016433]`, spread `1.016433x` | `1.003297x [0.996501, 1.008202]`, spread `1.008202x` | **`2.705229x [2.688109, 2.726206]` slower** | **HONEST LOSS** |
+| Large-directory readdir+stat, 8 threads, 65,536 entries, min of 3 | `1.002819x [0.982342, 1.023088]`, spread `1.023088x` | `0.999492x [0.998021, 1.002427]`, spread `1.002427x` | **`4.404952x [4.370993, 4.469923]` slower** | **HONEST LOSS** |
+
+Every A/A interval contains 1 and has symmetric spread at most `1.025x`; every
+competitive interval also clears twice the worst same-invocation null
+log-margin. Wall time and deterministic 20,000-resample bootstrap median CIs
+are the decision inputs; `cv_used=false` and `instructions_used=false`. The
+full five-workload ext4 score is therefore **1 win / 4 losses / 0 neutral / 0
+unscored**.
+
+The in-process harness self-report was
+`executing_elf_sha256=49e8db7462cc450c1d76e733ac7eb7cc29b0ddc41bd7c4768bf1b6cc65dcf1e6`.
+Both FUSE daemons self-reported production x86-64-v3+PGO ELF SHA-256
+`502c4c877d61de5bd9daac8b6826e1a67ab046e65e0c625b8c4dd5dc75b1d835`
+and PGO profile SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The preserved reports and their file SHA-256s are:
+
+- parallel read:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785266486_3211479/mounted-kernel-report.json`,
+  `b45fc69231501177777ece3adc139b01e327b1af4386196c068677729de371ac`;
+- create/delete storm:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785266581_3239624/mounted-kernel-report.json`,
+  `a1ad17787ed14f7d9eb1858e27181de4c07ef13fae486fd8993f935abee8ed1a`;
+- readdir+stat:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785266818_3348552/mounted-kernel-report.json`,
+  `23f19bd17410a2ad48d7df1a81d424181bf0efe6fbc0d03d3463462bff358d98`.
+
+The 2026-07-27 section immediately below and the later counterbalance
+diagnostic retain the failed-null history and its then-unscored point estimates;
+they do not describe the current measurement status.
+
+**Retry predicate for replacing any final ratio:** use a new shipping-shaped,
+self-reporting FrankenFS ELF and a self-reporting schema-v4 driver with
+host-wide exclusivity enabled. Preserve the same four independent mounts,
+four-round physical-role crossover, matched mount/durability settings,
+constant-state reset, full parity/fsck checks, and at least 32 complete blocks.
+Each row must record host/core/thread/RAM/NUMA/ISA provenance, runtime affinity,
+requested and actually observed worker threads, and incumbent/candidate
+SHA-256s. Require both same-invocation A/A bootstrap median CIs to contain 1
+with spread at most `1.025x`, and require the competitive CI to clear twice the
+worst null log-margin. Never pool blocked estimates or gate on CV/instructions.
+
 ## Mounted ext4 workload suite admits metadata and fsync ratios; three surfaces remain null-blocked - 2026-07-27 (GreenSpring, vs-INCUMBENT measurement)
 
 This is a direct-incumbent measurement row, not a FrankenFS before/after
