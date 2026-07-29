@@ -281,6 +281,22 @@ struct HostProvenance {
     memory_bytes: u64,
     numa_nodes: usize,
     runtime_features: BTreeSet<&'static str>,
+    cpu_frequency_policy: CpuFrequencyPolicy,
+}
+
+#[derive(Clone, Debug)]
+struct CpuFrequencyPolicy {
+    drivers: BTreeMap<usize, String>,
+    governors: BTreeMap<usize, String>,
+    energy_performance_preferences: BTreeMap<usize, String>,
+}
+
+impl CpuFrequencyPolicy {
+    fn governor_warning(&self) -> bool {
+        self.governors
+            .values()
+            .any(|governor| governor != "performance")
+    }
 }
 
 struct DriverPlacementContext<'a> {
@@ -2276,6 +2292,80 @@ fn cgroup_cpuset_effective() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn per_cpu_frequency_value(
+    cpus: &BTreeSet<usize>,
+    filename: &str,
+    required: bool,
+) -> Result<BTreeMap<usize, String>> {
+    let mut values = BTreeMap::new();
+    for &cpu in cpus {
+        let path = PathBuf::from(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/cpufreq/{filename}"
+        ));
+        match fs::read_to_string(&path) {
+            Ok(value) => {
+                let value = value.trim();
+                ensure!(
+                    !value.is_empty(),
+                    "CPU frequency policy file is empty: {}",
+                    path.display()
+                );
+                values.insert(cpu, value.to_owned());
+            }
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read CPU frequency policy {}", path.display()));
+            }
+        }
+    }
+    if required {
+        ensure!(
+            values.len() == cpus.len(),
+            "{filename} provenance covers {} of {} allowed CPUs",
+            values.len(),
+            cpus.len()
+        );
+    }
+    Ok(values)
+}
+
+fn cpu_frequency_policy(cpus: &BTreeSet<usize>) -> Result<CpuFrequencyPolicy> {
+    Ok(CpuFrequencyPolicy {
+        drivers: per_cpu_frequency_value(cpus, "scaling_driver", true)?,
+        governors: per_cpu_frequency_value(cpus, "scaling_governor", true)?,
+        energy_performance_preferences: per_cpu_frequency_value(
+            cpus,
+            "energy_performance_preference",
+            false,
+        )?,
+    })
+}
+
+fn distinct_frequency_values(values: &BTreeMap<usize, String>) -> String {
+    values
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn cpu_frequency_policy_json(policy: &CpuFrequencyPolicy) -> Value {
+    json!({
+        "drivers_by_cpu": policy.drivers,
+        "governors_by_cpu": policy.governors,
+        "energy_performance_preferences_by_cpu": policy.energy_performance_preferences,
+        "distinct_drivers": distinct_frequency_values(&policy.drivers),
+        "distinct_governors": distinct_frequency_values(&policy.governors),
+        "distinct_energy_performance_preferences": distinct_frequency_values(
+            &policy.energy_performance_preferences
+        ),
+        "non_performance_or_mixed_governor_warning": policy.governor_warning(),
+    })
+}
+
 fn cpu_topology_id(cpu: usize, name: &str) -> Result<usize> {
     let path = PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/topology/{name}"));
     fs::read_to_string(&path)
@@ -2346,6 +2436,7 @@ fn host_provenance() -> Result<HostProvenance> {
     .into_iter()
     .filter_map(|(name, detected)| detected.then_some(name))
     .collect();
+    let cpu_frequency_policy = cpu_frequency_policy(&allowed_cpus_before_pin)?;
     Ok(HostProvenance {
         hostname: fs::read_to_string("/proc/sys/kernel/hostname")
             .context("read hostname")?
@@ -2359,6 +2450,7 @@ fn host_provenance() -> Result<HostProvenance> {
         allowed_cpus_before_pin,
         cgroup_cpuset_effective: cgroup_cpuset_effective(),
         runtime_features,
+        cpu_frequency_policy,
     })
 }
 
@@ -3201,6 +3293,7 @@ fn fs_report(
         "twice_null_margin_ratio": twice_null_ratio,
         "directional_claim_clear": directional_claim_clear,
     });
+    let cpu_frequency_policy_json = cpu_frequency_policy_json(&host.cpu_frequency_policy);
 
     let Value::Object(mut report) = json!({
         "filesystem": kind.label(),
@@ -3211,6 +3304,7 @@ fn fs_report(
         "memory_bytes": host.memory_bytes,
         "numa_nodes": host.numa_nodes,
         "runtime_detected_isa": runtime_isa_label(host),
+        "cpu_frequency_policy": cpu_frequency_policy_json,
         "requested_client_threads": config.client_threads(),
         "actual_observed_worker_threads": actual_observed_worker_threads,
         "observed_worker_threads_by_arm": observed_worker_threads_by_arm,
@@ -3322,7 +3416,7 @@ fn run() -> Result<Option<PathBuf>> {
         host.runtime_features.contains("avx512f"),
     );
     println!(
-        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},placement_scope={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
+        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
         host.hostname,
         host.cpu_model,
         host.physical_cores,
@@ -3331,6 +3425,10 @@ fn run() -> Result<Option<PathBuf>> {
         host.numa_nodes,
         config.client_threads(),
         runtime_isa_label(&host),
+        distinct_frequency_values(&host.cpu_frequency_policy.drivers),
+        distinct_frequency_values(&host.cpu_frequency_policy.governors),
+        distinct_frequency_values(&host.cpu_frequency_policy.energy_performance_preferences),
+        host.cpu_frequency_policy.governor_warning(),
         config.placement_scope.label(),
         format_cpu_list(host.allowed_cpus_before_pin.iter().copied()),
         host.allowed_cpus_before_pin.len(),
@@ -3446,6 +3544,7 @@ fn run() -> Result<Option<PathBuf>> {
                 "fma": host.runtime_features.contains("fma"),
                 "avx512f": host.runtime_features.contains("avx512f"),
             },
+            "cpu_frequency_policy": cpu_frequency_policy_json(&host.cpu_frequency_policy),
         },
         "driver_cpu": placement.driver_cpu,
         "driver_cpus": placement.driver_cpus,
@@ -3697,6 +3796,18 @@ mod tests {
         };
         assert!(!clears_twice_null_margin(too_close, kernel_null, fuse_null));
         assert!(clears_twice_null_margin(clear, kernel_null, fuse_null));
+    }
+
+    #[test]
+    fn governor_warning_distinguishes_performance_from_dynamic_policy() {
+        let mut policy = CpuFrequencyPolicy {
+            drivers: BTreeMap::from([(0, "amd-pstate-epp".to_owned())]),
+            governors: BTreeMap::from([(0, "performance".to_owned())]),
+            energy_performance_preferences: BTreeMap::new(),
+        };
+        assert!(!policy.governor_warning());
+        policy.governors.insert(1, "powersave".to_owned());
+        assert!(policy.governor_warning());
     }
 
     #[test]
