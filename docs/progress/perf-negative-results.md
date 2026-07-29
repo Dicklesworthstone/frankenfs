@@ -13,6 +13,100 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Governor- and thread-attested mounted rerun admits storm; read and readdir remain null-blocked - 2026-07-29 (PurpleSnow, vs-INCUMBENT instrument KEEP)
+
+This rerun changes the instrument, not FrankenFS. The comparator now records
+the CPU frequency driver, governor, and energy-performance preference; requires
+five consecutive one-second host-wide samples below the contention ceiling
+both before placement and after mount/fixture setup; and refuses admission
+unless every logical arm repeatedly reports exactly the requested number of
+Linux worker TIDs. Serial workloads observe the pinned driver TID before and
+after every timed batch. Parallel workloads report worker TIDs from inside each
+timed batch. The production candidate stayed frozen across all three
+invocations.
+
+### Current candidate results
+
+| Workload | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| Multi-file parallel read, 8 threads, 1,024 x 256 KiB, min of 3 | `1.003535x [0.959197, 1.043999]`, spread `1.043999x` | `0.980314x [0.960412, 1.090015]`, spread `1.090015x` | **No admissible ratio.** Apparent `1.655303x [1.600913, 1.731016]` slower is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Small-file create/delete storm, 2,000 files | `0.999131x [0.979908, 1.014892]`, spread `1.020504x` | `1.003032x [0.994522, 1.006388]`, spread `1.006388x` | **`2.691204x [2.675323, 2.717540]` slower** | **HONEST LOSS** |
+| Large-directory readdir+stat, 8 threads, 65,536 entries, min of 3 | `1.000216x [0.962482, 1.041209]`, spread `1.041209x` | `1.001277x [0.999156, 1.005984]`, spread `1.005984x` | **No admissible ratio.** Apparent `4.502939x [4.432475, 4.580046]` slower is retained only as blocked evidence. | **BLOCKED-NULL** |
+
+The storm competitive interval clears twice the worst same-invocation null
+log-margin (`1.041428x`) and is admitted. Parallel read fails both nulls.
+Readdir+stat repeats the kernel-only asymmetry while its FUSE null passes.
+Therefore the current candidate's result on this three-workload rerun is
+**0 wins / 1 loss / 0 neutral / 2 unscored**. The 2026-07-28 results below
+remain frozen historical evidence for their different candidate ELF; they are
+not substituted for the current candidate's two failed-null invocations.
+
+All three runs used 128 rounds / 32 complete four-round physical-role
+crossover blocks, eight balanced warmup rounds, 20,000 deterministic bootstrap
+resamples, a 100 ms untimed arm settle, matched mount/durability options, full
+four-arm parity, and four clean offline `e2fsck` checks. Wall time and bootstrap
+median confidence intervals were the decision inputs; `cv_used=false` and
+`instructions_used=false`. Requested and actually observed client threads were
+`8/8`, `1/1`, and `8/8`, consistently on every arm.
+
+The host was `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, 32 physical
+cores / 64 logical threads, 231,691,894,784 bytes RAM, one NUMA node, runtime
+ISA `avx2+fma+sse2+sse4.2`, with no cpuset cap. Every CPU reported
+`amd-pstate-epp`, governor `powersave`, and EPP `balance_performance`; the
+non-performance-governor warning is preserved in every report. Runtime client
+affinity was:
+
+- read: CPUs `4:7:15:21:26:29:32:33`, mask `00000003,24208090`;
+- storm: CPU `14`, mask `00000000,00004000`;
+- readdir+stat: CPUs `1:10:27:29:34:39:44:45`, mask
+  `00003084,28000402`.
+
+The initial/post-mount quiet windows consumed `71/56`, `269/106`, and `5/250`
+one-second samples respectively. That wait history is evidence that a
+one-instant contention sample would not be an adequate admission mechanism on
+this host.
+
+The executing comparator self-reported
+`executing_elf_sha256=96ebd0ef4a95290dd1fad255472e21043e0a026816aeebfbdb56bfb0d792c181`.
+Both FUSE arms self-reported the frozen x86-64-v3+PGO candidate
+`93ed882e6e4771db82371c933af28d7a907a6efdcfb13f29357baf2b7befe7f6`
+with PGO profile
+`1410ff5d34f99faa10eeb2dbbcb08747a6acdccdb065a3e34b89396a43b40ab0`.
+The incumbent identity was kernel `6.17.0-35-generic`, ext4 module/runtime
+notes, and `/boot/vmlinuz-6.17.0-35-generic` SHA-256
+`01e534223c871bd6246e8d57fd8c8101205384d682a3a23b6a5577fe28997c41`.
+Preserved reports and file hashes:
+
+- read:
+  `/data/tmp/frankenfs-mounted-kernel-governor-rerun/parallel-read-observed-threads-report.json`,
+  `138a6be8c01b45bbb826e06321f5071a7215ec50625ec3c48d1ec05fc7e5adce`;
+- storm:
+  `/data/tmp/frankenfs-mounted-kernel-governor-rerun/create-delete-observed-threads-report.json`,
+  `12cd0fc5a7403c42ddc0e93fb70482e0c2dbb4a3ebc40ecce3b11ebb2048dcae`;
+- readdir+stat:
+  `/data/tmp/frankenfs-mounted-kernel-governor-rerun/readdir-stat-observed-threads-report.json`,
+  `00cd9aa7c9929a46f6db640c605b7802ea9acf7db497cb9d69f9340e55d26a48`.
+
+Instrument commit `e91cd59e` passed strict-remote exact-source tests **18/18**
+on `ovh-a`, scoped no-dependency Clippy with warnings denied except the
+pre-existing deprecation class, file rustfmt, and `git diff --check`. The first
+non-scoped Clippy command stopped only on 23 pre-existing `ffs-ondisk` lints
+before reaching the comparator; it is not a candidate failure.
+
+**Retry predicate for parallel read and readdir+stat:** do not rerun on another
+merely fresh placement or under the same unobserved dynamic-frequency regime.
+First obtain a machine-level exclusive lease that covers the complete timed
+routine and either (a) owner-authorized `performance` governor on every allowed
+CPU, recorded before and after the invocation, or (b) counted per-arm
+frequency-residency evidence that proves equivalent boost behavior. Also add
+per-four-round-block attribution for CPU migrations, minor/major faults, and
+host-wide busy samples throughout timing so a peer that starts after preflight
+cannot remain invisible. Then rerun the unchanged workload with exactly eight
+observed worker TIDs per arm and admit only if both A/A bootstrap median CIs
+contain 1 with spread at most `1.025x`, the competitive CI clears twice the
+worst null log-margin, and parity/fsck remain clean. Never pool the blocked
+point estimates.
+
 ## Four-round physical-arm crossover clears all three blocked ext4 nulls - 2026-07-28 (GreenSpring, vs-INCUMBENT instrument KEEP)
 
 This is the final measured closeout for the three workloads that the original
