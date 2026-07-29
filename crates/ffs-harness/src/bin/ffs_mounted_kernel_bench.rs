@@ -50,6 +50,7 @@ const PHYSICAL_ROLE_CROSSOVER_ROUNDS: usize = 2;
 const ESTIMATOR_BLOCK_ROUNDS: usize = 4;
 const ESTIMATOR_BLOCK_DIVISOR: f64 = 4.0;
 const MAX_ARM_SETTLE_MS: u64 = 10_000;
+const MAX_PRE_MEASUREMENT_SETTLE_MS: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FilesystemKind {
@@ -158,6 +159,7 @@ struct Config {
     image_size_mib: u64,
     maximum_null_ratio: f64,
     arm_settle_ms: u64,
+    pre_measurement_settle_ms: u64,
     client_threads: usize,
     placement_scope: PlacementScope,
     output: Option<PathBuf>,
@@ -182,6 +184,7 @@ impl Default for Config {
             image_size_mib: 256,
             maximum_null_ratio: 1.025,
             arm_settle_ms: 100,
+            pre_measurement_settle_ms: 1_000,
             client_threads: DEFAULT_PARALLEL_THREADS,
             placement_scope: PlacementScope::SameLlc,
             output: None,
@@ -513,6 +516,7 @@ fn usage() {
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
            --maximum-null-ratio R         Max symmetric A/A CI spread (default 1.025)\n\
            --arm-settle-ms N              Untimed delay after every arm (default 100)\n\
+           --pre-measurement-settle-ms N  Untimed delay after durable fixture setup (default 1000)\n\
            --out PATH                     JSON report path (default inside run dir)\n\
            -h, --help                     Show this help"
     );
@@ -600,6 +604,10 @@ fn validate_config(config: &Config) -> Result<()> {
         config.arm_settle_ms <= MAX_ARM_SETTLE_MS,
         "--arm-settle-ms must be at most {MAX_ARM_SETTLE_MS}"
     );
+    ensure!(
+        config.pre_measurement_settle_ms <= MAX_PRE_MEASUREMENT_SETTLE_MS,
+        "--pre-measurement-settle-ms must be at most {MAX_PRE_MEASUREMENT_SETTLE_MS}"
+    );
     Ok(())
 }
 
@@ -656,6 +664,10 @@ fn parse_args() -> Result<Option<Config>> {
             }
             "--arm-settle-ms" => {
                 config.arm_settle_ms = parse_value(&args, &mut index, "--arm-settle-ms")?;
+            }
+            "--pre-measurement-settle-ms" => {
+                config.pre_measurement_settle_ms =
+                    parse_value(&args, &mut index, "--pre-measurement-settle-ms")?;
             }
             "--out" => config.output = Some(parse_value(&args, &mut index, "--out")?),
             other => bail!("unknown argument: {other}"),
@@ -945,6 +957,16 @@ fn create_sized_file(path: &Path, size_mib: u64) -> Result<()> {
         .with_context(|| format!("size image {}", path.display()))
 }
 
+fn sync_image(path: &Path) -> Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open image for durability sync {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("durability sync image {}", path.display()))
+}
+
 fn run_checked(command: &mut Command, label: &str) -> Result<()> {
     let status = command.status().with_context(|| format!("spawn {label}"))?;
     ensure!(status.success(), "{label} failed: {status}");
@@ -982,6 +1004,7 @@ fn create_base_image(
         )?,
     }
     validate_image(kind, &image)?;
+    sync_image(&image)?;
     Ok(image)
 }
 
@@ -1022,6 +1045,7 @@ fn clone_images(
         let path = run_dir.join(format!("{}.{}.img", kind.label(), arm.label()));
         fs::copy(base, &path)
             .with_context(|| format!("clone {} to {}", base.display(), path.display()))?;
+        sync_image(&path)?;
         let actual_sha = file_sha256(&path)?;
         ensure!(
             actual_sha == expected_sha,
@@ -2899,6 +2923,7 @@ fn fs_report(
         kind.label()
     );
 
+    thread::sleep(Duration::from_millis(config.pre_measurement_settle_ms));
     let contention = sample_cpu_busy()?;
     if config.placement_scope == PlacementScope::HostWide {
         let mut busy_cpus = Vec::new();
@@ -3332,6 +3357,8 @@ fn fs_report(
         "physical_role_crossover_rounds": PHYSICAL_ROLE_CROSSOVER_ROUNDS,
         "warmup_rounds": WARMUP_ROUNDS,
         "arm_settle_ms": config.arm_settle_ms,
+        "pre_measurement_settle_ms": config.pre_measurement_settle_ms,
+        "pre_measurement_quiescence": "base and four cloned image files sync_all before mount, then untimed settle after mount identity and initial parity",
         "between_arm_quiescence": if config.workload.is_mutating() {
             if config.workload == Workload::ParallelMetadataWrite {
                 "remove exact timed create batch, verify empty worker directories, sync -f physical mount, then settle; all outside timed interval"
@@ -3587,6 +3614,8 @@ fn run() -> Result<Option<PathBuf>> {
             "physical_role_crossover_rounds": PHYSICAL_ROLE_CROSSOVER_ROUNDS,
             "warmup_rounds": WARMUP_ROUNDS,
             "arm_settle_ms": config.arm_settle_ms,
+            "pre_measurement_settle_ms": config.pre_measurement_settle_ms,
+            "pre_measurement_quiescence": "base and four cloned image files sync_all before mount, then untimed settle after mount identity and initial parity",
             "mutating_quiescence": if config.workload.is_mutating() {
                 if config.workload == Workload::ParallelMetadataWrite {
                     "remove exact timed create batch, verify empty worker directories, then sync -f; all outside timed interval"
