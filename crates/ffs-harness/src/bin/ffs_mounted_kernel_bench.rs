@@ -42,6 +42,10 @@ const CPU_SAMPLE_INTERVAL_MS: u64 = 1_000;
 const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(CPU_SAMPLE_INTERVAL_MS);
 const MAX_DRIVER_PREFLIGHT_BUSY: f64 = 0.20;
 const MAX_FUSE_PREFLIGHT_BUSY: f64 = 0.35;
+const DEFAULT_HOST_QUIET_SAMPLES: usize = 5;
+const DEFAULT_HOST_QUIET_TIMEOUT_MS: u64 = 300_000;
+const MAX_HOST_QUIET_SAMPLES: usize = 60;
+const MAX_HOST_QUIET_TIMEOUT_MS: u64 = 900_000;
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
 const DEFAULT_PARALLEL_THREADS: usize = 8;
 const MAX_CLIENT_THREADS: usize = 4096;
@@ -163,6 +167,8 @@ struct Config {
     pre_measurement_settle_ms: u64,
     client_threads: usize,
     placement_scope: PlacementScope,
+    host_quiet_samples: usize,
+    host_quiet_timeout_ms: u64,
     output: Option<PathBuf>,
 }
 
@@ -188,6 +194,8 @@ impl Default for Config {
             pre_measurement_settle_ms: 1_000,
             client_threads: DEFAULT_PARALLEL_THREADS,
             placement_scope: PlacementScope::SameLlc,
+            host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
+            host_quiet_timeout_ms: DEFAULT_HOST_QUIET_TIMEOUT_MS,
             output: None,
         }
     }
@@ -272,6 +280,14 @@ struct CpuPlacement {
     last_level_cache_cpus: BTreeSet<usize>,
     allowed_cpus: BTreeSet<usize>,
     busy_fractions: BTreeMap<usize, f64>,
+    initial_host_quiet_window: Option<HostQuietWindow>,
+}
+
+#[derive(Clone, Debug)]
+struct HostQuietWindow {
+    busy_fractions: BTreeMap<usize, f64>,
+    samples_observed: usize,
+    elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -518,6 +534,8 @@ fn usage() {
            --maximum-null-ratio R         Max symmetric A/A CI spread (default 1.025)\n\
            --arm-settle-ms N              Untimed delay after every arm (default 100)\n\
            --pre-measurement-settle-ms N  Untimed delay after durable fixture setup (default 1000)\n\
+           --host-quiet-samples N         Consecutive clear host-wide samples (default 5)\n\
+           --host-quiet-timeout-ms N      Fail-closed quiet-window timeout (default 300000)\n\
            --out PATH                     JSON report path (default inside run dir)\n\
            -h, --help                     Show this help"
     );
@@ -609,6 +627,19 @@ fn validate_config(config: &Config) -> Result<()> {
         config.pre_measurement_settle_ms <= MAX_PRE_MEASUREMENT_SETTLE_MS,
         "--pre-measurement-settle-ms must be at most {MAX_PRE_MEASUREMENT_SETTLE_MS}"
     );
+    ensure!(
+        (1..=MAX_HOST_QUIET_SAMPLES).contains(&config.host_quiet_samples),
+        "--host-quiet-samples must be in 1..={MAX_HOST_QUIET_SAMPLES}"
+    );
+    ensure!(
+        config.host_quiet_timeout_ms <= MAX_HOST_QUIET_TIMEOUT_MS,
+        "--host-quiet-timeout-ms must be at most {MAX_HOST_QUIET_TIMEOUT_MS}"
+    );
+    ensure!(
+        config.host_quiet_timeout_ms
+            >= CPU_SAMPLE_INTERVAL_MS.saturating_mul(config.host_quiet_samples as u64),
+        "--host-quiet-timeout-ms must cover at least --host-quiet-samples one-second samples"
+    );
     Ok(())
 }
 
@@ -669,6 +700,13 @@ fn parse_args() -> Result<Option<Config>> {
             "--pre-measurement-settle-ms" => {
                 config.pre_measurement_settle_ms =
                     parse_value(&args, &mut index, "--pre-measurement-settle-ms")?;
+            }
+            "--host-quiet-samples" => {
+                config.host_quiet_samples = parse_value(&args, &mut index, "--host-quiet-samples")?;
+            }
+            "--host-quiet-timeout-ms" => {
+                config.host_quiet_timeout_ms =
+                    parse_value(&args, &mut index, "--host-quiet-timeout-ms")?;
             }
             "--out" => config.output = Some(parse_value(&args, &mut index, "--out")?),
             other => bail!("unknown argument: {other}"),
@@ -2242,6 +2280,75 @@ fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>> {
     Ok(busy)
 }
 
+fn busy_cpus_above_limit(
+    busy: &BTreeMap<usize, f64>,
+    allowed_cpus: &BTreeSet<usize>,
+    limit: f64,
+) -> Result<Vec<(usize, f64)>> {
+    allowed_cpus
+        .iter()
+        .map(|cpu| {
+            let load = busy
+                .get(cpu)
+                .copied()
+                .ok_or_else(|| anyhow!("allowed cpu{cpu} disappeared during load sample"))?;
+            Ok((*cpu, load))
+        })
+        .filter_map(|row: Result<(usize, f64)>| match row {
+            Ok((cpu, load)) if load > limit => Some(Ok((cpu, load))),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn format_busy_cpus(cpus: &[(usize, f64)]) -> String {
+    if cpus.is_empty() {
+        return "none".to_owned();
+    }
+    cpus.iter()
+        .map(|(cpu, load)| format!("cpu{cpu}={:.1}%", load * 100.0))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn wait_for_host_quiet(
+    allowed_cpus: &BTreeSet<usize>,
+    required_clear_samples: usize,
+    timeout_ms: u64,
+    phase: &str,
+) -> Result<HostQuietWindow> {
+    let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut samples_observed = 0;
+    let mut consecutive_clear = 0;
+    loop {
+        let busy_fractions = sample_cpu_busy()?;
+        samples_observed += 1;
+        let busy_cpus =
+            busy_cpus_above_limit(&busy_fractions, allowed_cpus, MAX_DRIVER_PREFLIGHT_BUSY)?;
+        if busy_cpus.is_empty() {
+            consecutive_clear += 1;
+            if consecutive_clear >= required_clear_samples {
+                return Ok(HostQuietWindow {
+                    busy_fractions,
+                    samples_observed,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+        } else {
+            consecutive_clear = 0;
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "{phase} did not obtain {required_clear_samples} consecutive clear host-wide samples within {timeout_ms} ms after {samples_observed} samples; last busy CPUs above {:.1}%: {}",
+                MAX_DRIVER_PREFLIGHT_BUSY * 100.0,
+                format_busy_cpus(&busy_cpus)
+            );
+        }
+    }
+}
+
 fn parse_cpu_list(value: &str) -> Result<BTreeSet<usize>> {
     let mut cpus = BTreeSet::new();
     for range in value.trim().split(',').filter(|part| !part.is_empty()) {
@@ -2541,8 +2648,24 @@ fn select_cpu_placement(
     client_threads: usize,
     scope: PlacementScope,
     allowed_cpus: &BTreeSet<usize>,
+    host_quiet_samples: usize,
+    host_quiet_timeout_ms: u64,
 ) -> Result<CpuPlacement> {
-    let busy = sample_cpu_busy()?;
+    let initial_host_quiet_window = if scope == PlacementScope::HostWide {
+        Some(wait_for_host_quiet(
+            allowed_cpus,
+            host_quiet_samples,
+            host_quiet_timeout_ms,
+            "initial placement",
+        )?)
+    } else {
+        None
+    };
+    let busy = if let Some(window) = &initial_host_quiet_window {
+        window.busy_fractions.clone()
+    } else {
+        sample_cpu_busy()?
+    };
     let mut ranked: Vec<(usize, f64)> = busy
         .iter()
         .filter(|(cpu, _)| allowed_cpus.contains(cpu))
@@ -2556,16 +2679,9 @@ fn select_cpu_placement(
             ranked.len(),
             allowed_cpus.len()
         );
-        let busy_cpus = ranked
-            .iter()
-            .filter(|(_, load)| *load > MAX_DRIVER_PREFLIGHT_BUSY)
-            .map(|(cpu, load)| format!("cpu{cpu}={:.1}%", load * 100.0))
-            .collect::<Vec<_>>();
         ensure!(
-            busy_cpus.is_empty(),
-            "host-wide placement requires an exclusive quiet cpuset; busy CPUs above {:.1}%: {}",
-            MAX_DRIVER_PREFLIGHT_BUSY * 100.0,
-            busy_cpus.join(",")
+            busy_cpus_above_limit(&busy, allowed_cpus, MAX_DRIVER_PREFLIGHT_BUSY)?.is_empty(),
+            "host-wide quiet-window helper returned a busy final sample"
         );
     }
     ranked.sort_by(|left, right| {
@@ -2633,6 +2749,7 @@ fn select_cpu_placement(
         last_level_cache_cpus,
         allowed_cpus: allowed_cpus.clone(),
         busy_fractions: busy,
+        initial_host_quiet_window,
     })
 }
 
@@ -2925,28 +3042,30 @@ fn fs_report(
     );
 
     thread::sleep(Duration::from_millis(config.pre_measurement_settle_ms));
-    let contention = sample_cpu_busy()?;
-    if config.placement_scope == PlacementScope::HostWide {
-        let mut busy_cpus = Vec::new();
-        for cpu in &placement.allowed_cpus {
-            let load = contention
-                .get(cpu)
-                .copied()
-                .ok_or_else(|| anyhow!("allowed cpu{cpu} disappeared before measurement"))?;
-            if load > MAX_DRIVER_PREFLIGHT_BUSY {
-                busy_cpus.push(format!("cpu{cpu}={:.1}%", load * 100.0));
-            }
-        }
-        ensure!(
-            busy_cpus.is_empty(),
-            "host-wide cpuset lost exclusivity before measurement; busy CPUs above {:.1}%: {}",
-            MAX_DRIVER_PREFLIGHT_BUSY * 100.0,
-            busy_cpus.join(",")
-        );
+    let post_mount_host_quiet_window = if config.placement_scope == PlacementScope::HostWide {
+        Some(wait_for_host_quiet(
+            &placement.allowed_cpus,
+            config.host_quiet_samples,
+            config.host_quiet_timeout_ms,
+            "post-mount pre-measurement",
+        )?)
+    } else {
+        None
+    };
+    let contention = if let Some(window) = &post_mount_host_quiet_window {
+        window.busy_fractions.clone()
+    } else {
+        sample_cpu_busy()?
+    };
+    if let Some(window) = &post_mount_host_quiet_window {
         println!(
-            "host_wide_quiescence,allowed_cpu_count={},sample_interval_ms={},maximum_busy_fraction={:.3},busy_cpu_count_above_limit=0,verdict=clear",
+            "host_wide_quiescence,allowed_cpu_count={},sample_interval_ms={},required_consecutive_clear_samples={},samples_observed={},wait_ms={},timeout_ms={},maximum_busy_fraction={:.3},busy_cpu_count_above_limit=0,verdict=clear",
             placement.allowed_cpus.len(),
             CPU_SAMPLE_INTERVAL_MS,
+            config.host_quiet_samples,
+            window.samples_observed,
+            window.elapsed_ms,
+            config.host_quiet_timeout_ms,
             MAX_DRIVER_PREFLIGHT_BUSY,
         );
     }
@@ -3281,17 +3400,22 @@ fn fs_report(
             "bytes": expected_final_tree.bytes,
         },
     });
-    let host_wide_quiescence_json = if config.placement_scope == PlacementScope::HostWide {
-        json!({
-            "verdict": "clear",
-            "allowed_cpu_count": placement.allowed_cpus.len(),
-            "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
-            "maximum_busy_fraction": MAX_DRIVER_PREFLIGHT_BUSY,
-            "busy_cpu_count_above_limit": 0,
-        })
-    } else {
-        json!("not_applicable")
-    };
+    let host_wide_quiescence_json = post_mount_host_quiet_window.as_ref().map_or_else(
+        || json!("not_applicable"),
+        |window| {
+            json!({
+                "verdict": "clear",
+                "allowed_cpu_count": placement.allowed_cpus.len(),
+                "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
+                "required_consecutive_clear_samples": config.host_quiet_samples,
+                "samples_observed": window.samples_observed,
+                "wait_ms": window.elapsed_ms,
+                "timeout_ms": config.host_quiet_timeout_ms,
+                "maximum_busy_fraction": MAX_DRIVER_PREFLIGHT_BUSY,
+                "busy_cpu_count_above_limit": 0,
+            })
+        },
+    );
     let diagnostic_throughput_json = json!({
         "gate_input": false,
         "kernel_median_wall_ns": kernel_median_wall_ns,
@@ -3353,6 +3477,8 @@ fn fs_report(
         "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "placement_scope": config.placement_scope.label(),
         "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
+        "host_quiet_required_consecutive_samples": config.host_quiet_samples,
+        "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
         "operations_per_observation": config.operations,
         "operations_per_requested_client_thread": config.operations / config.client_threads(),
         "pairs": config.pairs,
@@ -3447,7 +3573,7 @@ fn run() -> Result<Option<PathBuf>> {
         host.runtime_features.contains("avx512f"),
     );
     println!(
-        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},cpu_busy_sample_interval_ms={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
+        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},cpu_busy_sample_interval_ms={},host_quiet_required_consecutive_samples={},host_quiet_timeout_ms={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
         host.hostname,
         host.cpu_model,
         host.physical_cores,
@@ -3462,6 +3588,8 @@ fn run() -> Result<Option<PathBuf>> {
         host.cpu_frequency_policy.governor_warning(),
         config.placement_scope.label(),
         CPU_SAMPLE_INTERVAL_MS,
+        config.host_quiet_samples,
+        config.host_quiet_timeout_ms,
         format_cpu_list(host.allowed_cpus_before_pin.iter().copied()),
         host.allowed_cpus_before_pin.len(),
         host.cgroup_cpuset_effective
@@ -3486,10 +3614,12 @@ fn run() -> Result<Option<PathBuf>> {
         config.client_threads(),
         config.placement_scope,
         &host.allowed_cpus_before_pin,
+        config.host_quiet_samples,
+        config.host_quiet_timeout_ms,
     )?;
     pin_current_process(&placement.driver_cpus)?;
     println!(
-        "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
+        "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},host_quiet_required_consecutive_samples={},initial_host_quiet_samples_observed={},initial_host_quiet_wait_ms={},host_quiet_timeout_ms={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
         config.workload.label(),
         config.client_threads(),
         placement.driver_cpus.len(),
@@ -3508,6 +3638,16 @@ fn run() -> Result<Option<PathBuf>> {
         config.placement_scope.label(),
         config.placement_scope == PlacementScope::SameLlc,
         format_cpu_list(placement.last_level_cache_cpus.iter().copied()),
+        config.host_quiet_samples,
+        placement
+            .initial_host_quiet_window
+            .as_ref()
+            .map_or(0, |window| window.samples_observed),
+        placement
+            .initial_host_quiet_window
+            .as_ref()
+            .map_or(0, |window| window.elapsed_ms),
+        config.host_quiet_timeout_ms,
         MAX_DRIVER_PREFLIGHT_BUSY,
         MAX_FUSE_PREFLIGHT_BUSY,
     );
@@ -3578,6 +3718,8 @@ fn run() -> Result<Option<PathBuf>> {
             },
             "cpu_frequency_policy": cpu_frequency_policy_json(&host.cpu_frequency_policy),
             "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
+            "host_quiet_required_consecutive_samples": config.host_quiet_samples,
+            "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
         },
         "driver_cpu": placement.driver_cpu,
         "driver_cpus": placement.driver_cpus,
@@ -3588,6 +3730,20 @@ fn run() -> Result<Option<PathBuf>> {
         "fuse_guard_cpus": placement.fuse_guard_cpus,
         "last_level_cache_cpus": placement.last_level_cache_cpus,
         "initial_cpu_busy_fractions": placement.busy_fractions,
+        "initial_host_wide_quiescence": placement.initial_host_quiet_window.as_ref().map_or_else(
+            || json!("not_applicable"),
+            |window| json!({
+                "verdict": "clear",
+                "allowed_cpu_count": placement.allowed_cpus.len(),
+                "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
+                "required_consecutive_clear_samples": config.host_quiet_samples,
+                "samples_observed": window.samples_observed,
+                "wait_ms": window.elapsed_ms,
+                "timeout_ms": config.host_quiet_timeout_ms,
+                "maximum_busy_fraction": MAX_DRIVER_PREFLIGHT_BUSY,
+                "busy_cpu_count_above_limit": 0,
+            }),
+        ),
         "mount_contract": {
             "kernel": if config.workload.is_mutating() {
                 "real kernel filesystem on read-write loop device"
@@ -3621,6 +3777,8 @@ fn run() -> Result<Option<PathBuf>> {
             "warmup_rounds": WARMUP_ROUNDS,
             "arm_settle_ms": config.arm_settle_ms,
             "pre_measurement_settle_ms": config.pre_measurement_settle_ms,
+            "host_quiet_required_consecutive_samples": config.host_quiet_samples,
+            "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
             "pre_measurement_quiescence": "base and four cloned image files sync_all before mount, then untimed settle after mount identity and initial parity",
             "mutating_quiescence": if config.workload.is_mutating() {
                 if config.workload == Workload::ParallelMetadataWrite {
@@ -3751,6 +3909,25 @@ mod tests {
         assert_eq!(
             parse_cpu_list("0-2,8,10-11").expect("parse CPU list"),
             BTreeSet::from([0, 1, 2, 8, 10, 11])
+        );
+    }
+
+    #[test]
+    fn host_quiet_classifier_is_strict_and_requires_every_allowed_cpu() {
+        let allowed = BTreeSet::from([0, 1]);
+        let busy = BTreeMap::from([(0, MAX_DRIVER_PREFLIGHT_BUSY), (1, 0.201)]);
+        assert_eq!(
+            busy_cpus_above_limit(&busy, &allowed, MAX_DRIVER_PREFLIGHT_BUSY)
+                .expect("classify busy CPUs"),
+            vec![(1, 0.201)]
+        );
+        assert!(
+            busy_cpus_above_limit(
+                &BTreeMap::from([(0, 0.0)]),
+                &allowed,
+                MAX_DRIVER_PREFLIGHT_BUSY
+            )
+            .is_err()
         );
     }
 
