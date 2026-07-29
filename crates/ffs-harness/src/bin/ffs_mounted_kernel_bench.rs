@@ -1487,6 +1487,68 @@ fn parallel_metadata_write_batch(
     ))
 }
 
+fn reset_parallel_metadata_write_batch(
+    root: &Path,
+    operations: usize,
+    sequence: usize,
+    client_threads: usize,
+) -> Result<()> {
+    let parent = root.join("parallel-metadata");
+    let per_worker = operations / client_threads;
+    let removed = thread::scope(|scope| -> Result<usize> {
+        let mut handles = Vec::with_capacity(client_threads);
+        for worker in 0..client_threads {
+            let worker_dir = parent.join(format!("worker-{worker}"));
+            handles.push(scope.spawn(move || -> Result<usize> {
+                for index in 0..per_worker {
+                    let path = worker_dir.join(format!("r{sequence:06}-{index:06}"));
+                    fs::remove_file(&path).with_context(|| {
+                        format!("reset parallel metadata file {}", path.display())
+                    })?;
+                }
+                Ok(per_worker)
+            }));
+        }
+        let mut removed = 0_usize;
+        for handle in handles {
+            removed += handle
+                .join()
+                .map_err(|_| anyhow!("parallel metadata reset worker panicked"))??;
+        }
+        Ok(removed)
+    })?;
+    ensure!(
+        removed == operations,
+        "parallel metadata reset removed {removed} files, expected {operations}"
+    );
+    for worker in 0..client_threads {
+        let worker_dir = parent.join(format!("worker-{worker}"));
+        ensure!(
+            fs::read_dir(&worker_dir)
+                .with_context(|| format!("inspect reset directory {}", worker_dir.display()))?
+                .next()
+                .transpose()
+                .with_context(|| format!("read reset directory {}", worker_dir.display()))?
+                .is_none(),
+            "parallel metadata reset left entries in {}",
+            worker_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn reset_workload_state(root: &Path, config: &Config, sequence: usize) -> Result<()> {
+    if config.workload == Workload::ParallelMetadataWrite {
+        reset_parallel_metadata_write_batch(
+            root,
+            config.operations,
+            sequence,
+            config.client_threads(),
+        )?;
+    }
+    Ok(())
+}
+
 fn parallel_read_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
     let parent = root.join("parallel-read");
     let started = Instant::now();
@@ -1754,6 +1816,7 @@ fn collect_samples(
                 .get_mut(&physical_arm)
                 .expect("all arms initialized") += 1;
             black_box(digest);
+            reset_workload_state(root, config, sequence)?;
             quiesce_arm(root, config)?;
         }
     }
@@ -1801,6 +1864,7 @@ fn collect_samples(
                     physical_arm.label()
                 );
             }
+            reset_workload_state(root, config, sequence)?;
             quiesce_arm(root, config)?;
         }
     }
@@ -2640,6 +2704,17 @@ fn fs_report(
         expected_initial_tree.directories,
         expected_initial_tree.bytes,
     );
+    if config.workload == Workload::ParallelMetadataWrite {
+        println!(
+            "mounted_kernel_state_reset,filesystem={},workload={},timed_files_per_arm_observation={},reset_files_per_arm_observation={},warmup_observations_per_arm={},measured_observations_per_arm={},reset_timing=excluded,post_reset_sync=sync_f,verdict=pass",
+            kind.label(),
+            config.workload.label(),
+            config.operations,
+            config.operations,
+            WARMUP_ROUNDS,
+            config.pairs,
+        );
+    }
     println!(
         "mounted_kernel_null,filesystem={},workload={},arm=kernel,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
         kind.label(),
@@ -2720,7 +2795,12 @@ fn fs_report(
         "post-workload mounted tree parity mismatch for {}: {final_trees:?}",
         kind.label()
     );
-    if !config.workload.is_mutating() || config.workload == Workload::CreateDeleteStorm {
+    if !config.workload.is_mutating()
+        || matches!(
+            config.workload,
+            Workload::ParallelMetadataWrite | Workload::CreateDeleteStorm
+        )
+    {
         ensure!(
             expected_final_tree == expected_initial_tree,
             "{} changed the mounted tree despite a nonpersistent workload",
@@ -2762,9 +2842,18 @@ fn fs_report(
         "warmup_rounds": WARMUP_ROUNDS,
         "arm_settle_ms": config.arm_settle_ms,
         "between_arm_quiescence": if config.workload.is_mutating() {
-            "sync -f physical mount outside timed interval, then settle"
+            if config.workload == Workload::ParallelMetadataWrite {
+                "remove exact timed create batch, verify empty worker directories, sync -f physical mount, then settle; all outside timed interval"
+            } else {
+                "sync -f physical mount outside timed interval, then settle"
+            }
         } else {
             "read-only; settle only"
+        },
+        "observation_start_state": if config.workload == Workload::ParallelMetadataWrite {
+            "empty per-thread worker directories"
+        } else {
+            "fixture-defined stable state"
         },
         "cache_regime": "identical balanced warm-cache rounds; no global cache drop",
         "observation_repeats": config.observation_repeats,
@@ -3032,7 +3121,11 @@ fn run() -> Result<Option<PathBuf>> {
             "warmup_rounds": WARMUP_ROUNDS,
             "arm_settle_ms": config.arm_settle_ms,
             "mutating_quiescence": if config.workload.is_mutating() {
-                "sync -f physical mount outside timed interval"
+                if config.workload == Workload::ParallelMetadataWrite {
+                    "remove exact timed create batch, verify empty worker directories, then sync -f; all outside timed interval"
+                } else {
+                    "sync -f physical mount outside timed interval"
+                }
             } else {
                 "not applicable"
             },
@@ -3167,6 +3260,26 @@ mod tests {
             DEFAULT_PARALLEL_THREADS
         );
         assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
+    }
+
+    #[test]
+    fn parallel_metadata_reset_restores_empty_worker_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parallel-metadata");
+        fs::create_dir(&parent).expect("parallel metadata parent");
+        for worker in 0..2 {
+            fs::create_dir(parent.join(format!("worker-{worker}"))).expect("worker directory");
+        }
+        parallel_metadata_write_batch(temp.path(), 8, 7, 2).expect("create metadata batch");
+        reset_parallel_metadata_write_batch(temp.path(), 8, 7, 2).expect("reset metadata batch");
+        for worker in 0..2 {
+            assert_eq!(
+                fs::read_dir(parent.join(format!("worker-{worker}")))
+                    .expect("read worker directory")
+                    .count(),
+                0
+            );
+        }
     }
 
     #[test]
