@@ -617,10 +617,9 @@ fn validate_config(config: &Config) -> Result<()> {
         "--client-threads must be in 1..={MAX_CLIENT_THREADS}"
     );
     ensure!(
-        config.client_threads() == 1 || config.operations % config.client_threads() == 0,
-        "{} requires --operations divisible by its {} requested client threads",
-        config.workload.label(),
-        config.client_threads()
+        config.operations >= config.client_threads(),
+        "{} requires at least one operation per requested client thread",
+        config.workload.label()
     );
     ensure!(
         (1..=MAX_IMAGE_MIB).contains(&config.image_size_mib),
@@ -1641,6 +1640,12 @@ fn current_linux_tid() -> Result<u32> {
         .with_context(|| format!("parse current Linux TID from {}", target.display()))
 }
 
+fn worker_operation_count(operations: usize, client_threads: usize, worker: usize) -> usize {
+    debug_assert!(client_threads > 0);
+    debug_assert!(worker < client_threads);
+    operations / client_threads + usize::from(worker < operations % client_threads)
+}
+
 fn parallel_metadata_write_batch(
     root: &Path,
     operations: usize,
@@ -1648,20 +1653,20 @@ fn parallel_metadata_write_batch(
     client_threads: usize,
 ) -> Result<WorkloadBatch> {
     let parent = root.join("parallel-metadata");
-    let per_worker = operations / client_threads;
     let (thread_id_sender, thread_id_receiver) = mpsc::channel();
     let started = Instant::now();
     let (digest, observed_worker_threads) = thread::scope(|scope| -> Result<(u64, usize)> {
         let mut handles = Vec::with_capacity(client_threads);
         for worker in 0..client_threads {
             let worker_dir = parent.join(format!("worker-{worker}"));
+            let worker_operations = worker_operation_count(operations, client_threads, worker);
             let thread_id_sender = thread_id_sender.clone();
             handles.push(scope.spawn(move || -> Result<u64> {
                 thread_id_sender
                     .send(current_linux_tid()?)
                     .context("report parallel metadata worker TID")?;
                 let mut digest = 0_u64;
-                for index in 0..per_worker {
+                for index in 0..worker_operations {
                     let path = worker_dir.join(format!("r{sequence:06}-{index:06}"));
                     OpenOptions::new()
                         .write(true)
@@ -1712,19 +1717,19 @@ fn reset_parallel_metadata_write_batch(
     client_threads: usize,
 ) -> Result<()> {
     let parent = root.join("parallel-metadata");
-    let per_worker = operations / client_threads;
     let removed = thread::scope(|scope| -> Result<usize> {
         let mut handles = Vec::with_capacity(client_threads);
         for worker in 0..client_threads {
             let worker_dir = parent.join(format!("worker-{worker}"));
+            let worker_operations = worker_operation_count(operations, client_threads, worker);
             handles.push(scope.spawn(move || -> Result<usize> {
-                for index in 0..per_worker {
+                for index in 0..worker_operations {
                     let path = worker_dir.join(format!("r{sequence:06}-{index:06}"));
                     fs::remove_file(&path).with_context(|| {
                         format!("reset parallel metadata file {}", path.display())
                     })?;
                 }
-                Ok(per_worker)
+                Ok(worker_operations)
             }));
         }
         let mut removed = 0_usize;
@@ -3300,6 +3305,20 @@ fn fs_report(
         );
     }
     if config.workload == Workload::ParallelMetadataWrite {
+        let operations_per_worker_min = config.operations / config.client_threads();
+        let workers_with_extra_operation = config.operations % config.client_threads();
+        let operations_per_worker_max =
+            operations_per_worker_min + usize::from(workers_with_extra_operation > 0);
+        println!(
+            "mounted_kernel_work_distribution,filesystem={},workload={},operations_per_observation={},requested_client_threads={},operations_per_worker_min={},operations_per_worker_max={},workers_with_extra_operation={},exact_total=true",
+            kind.label(),
+            config.workload.label(),
+            config.operations,
+            config.client_threads(),
+            operations_per_worker_min,
+            operations_per_worker_max,
+            workers_with_extra_operation,
+        );
         println!(
             "mounted_kernel_state_reset,filesystem={},workload={},timed_files_per_arm_observation={},reset_files_per_arm_observation={},warmup_observations_per_arm={},measured_observations_per_arm={},reset_timing=excluded,post_reset_sync=sync_f,verdict=pass",
             kind.label(),
@@ -3537,7 +3556,6 @@ fn fs_report(
         "host_quiet_required_consecutive_samples": config.host_quiet_samples,
         "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
         "operations_per_observation": config.operations,
-        "operations_per_requested_client_thread": config.operations / config.client_threads(),
         "pairs": config.pairs,
         "crossover_blocks": config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
@@ -3592,6 +3610,21 @@ fn fs_report(
         unreachable!("JSON object literal must construct an object");
     };
     report.extend(measurement_evidence);
+    let operations_per_worker_min = config.operations / config.client_threads();
+    let workers_with_extra_operation = config.operations % config.client_threads();
+    report.insert(
+        "operations_per_requested_client_thread_min".to_owned(),
+        json!(operations_per_worker_min),
+    );
+    report.insert(
+        "operations_per_requested_client_thread_max".to_owned(),
+        json!(operations_per_worker_min + usize::from(workers_with_extra_operation > 0)),
+    );
+    report.insert(
+        "requested_client_threads_with_extra_operation".to_owned(),
+        json!(workers_with_extra_operation),
+    );
+    report.insert("operation_distribution_exact_total".to_owned(), json!(true));
     Ok(Value::Object(report))
 }
 
@@ -4058,9 +4091,21 @@ mod tests {
             fs::create_dir(parent.join(format!("worker-{worker}"))).expect("worker directory");
         }
         let batch =
-            parallel_metadata_write_batch(temp.path(), 8, 7, 2).expect("create metadata batch");
+            parallel_metadata_write_batch(temp.path(), 9, 7, 2).expect("create metadata batch");
         assert_eq!(batch.observed_worker_threads, Some(2));
-        reset_parallel_metadata_write_batch(temp.path(), 8, 7, 2).expect("reset metadata batch");
+        assert_eq!(
+            fs::read_dir(parent.join("worker-0"))
+                .expect("read first worker directory")
+                .count(),
+            5
+        );
+        assert_eq!(
+            fs::read_dir(parent.join("worker-1"))
+                .expect("read second worker directory")
+                .count(),
+            4
+        );
+        reset_parallel_metadata_write_batch(temp.path(), 9, 7, 2).expect("reset metadata batch");
         for worker in 0..2 {
             assert_eq!(
                 fs::read_dir(parent.join(format!("worker-{worker}")))
@@ -4069,6 +4114,16 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn metadata_work_distribution_preserves_exact_non_divisible_total() {
+        let counts = (0..96)
+            .map(|worker| worker_operation_count(8192, 96, worker))
+            .collect::<Vec<_>>();
+        assert_eq!(counts.iter().sum::<usize>(), 8192);
+        assert_eq!(counts.iter().filter(|&&count| count == 86).count(), 32);
+        assert_eq!(counts.iter().filter(|&&count| count == 85).count(), 64);
     }
 
     #[test]
