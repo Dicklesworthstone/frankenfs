@@ -962,6 +962,10 @@ fn parse_mountinfo_line(line: &str) -> Result<MountInfo> {
     })
 }
 
+fn is_fuse_mountinfo_type(filesystem_type: &str) -> bool {
+    matches!(filesystem_type, "fuse" | "fuse.ffs")
+}
+
 fn find_mount(mountpoint: &Path) -> Result<Option<MountInfo>> {
     let target = fs::canonicalize(mountpoint)
         .with_context(|| format!("canonicalize mountpoint {}", mountpoint.display()))?;
@@ -1220,9 +1224,12 @@ fn mount_fuse(
         arm.label(),
         config.workload.is_mutating(),
     )?;
+    // Linux mountinfo may expose the requested FUSE subtype (`fuse.ffs`) or
+    // collapse it to the generic `fuse` type. Exact source, child PID/ELF,
+    // in-process SHA/PGO, image, and option checks below remain mandatory.
     ensure!(
-        mounted.mount_info.filesystem_type == "fuse.ffs",
-        "{} FUSE identity mismatch: expected fuse.ffs, observed {}",
+        is_fuse_mountinfo_type(&mounted.mount_info.filesystem_type),
+        "{} FUSE identity mismatch: expected fuse or fuse.ffs, observed {}",
         arm.label(),
         mounted.mount_info.filesystem_type
     );
@@ -3125,6 +3132,15 @@ mod tests {
         assert!(parsed.mount_options.contains("ro"));
         assert!(parsed.mount_options.contains("noatime"));
         assert!(parsed.super_options.contains("noload"));
+    }
+
+    #[test]
+    fn fuse_mountinfo_type_accepts_only_generic_or_ffs_subtype() {
+        assert!(is_fuse_mountinfo_type("fuse"));
+        assert!(is_fuse_mountinfo_type("fuse.ffs"));
+        assert!(!is_fuse_mountinfo_type("fuseblk"));
+        assert!(!is_fuse_mountinfo_type("fuse.other"));
+        assert!(!is_fuse_mountinfo_type("ext4"));
     }
 
     #[test]
