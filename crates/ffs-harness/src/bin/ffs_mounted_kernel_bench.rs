@@ -41,7 +41,8 @@ const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
 const MAX_DRIVER_PREFLIGHT_BUSY: f64 = 0.20;
 const MAX_FUSE_PREFLIGHT_BUSY: f64 = 0.35;
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
-const PARALLEL_THREADS: usize = 8;
+const DEFAULT_PARALLEL_THREADS: usize = 8;
+const MAX_CLIENT_THREADS: usize = 4096;
 const PARALLEL_READ_FILE_BYTES: usize = 256 * 1024;
 const WARMUP_ROUNDS: usize = 8;
 const PHYSICAL_ROLE_CROSSOVER_ROUNDS: usize = 2;
@@ -79,9 +80,24 @@ enum RequestedFilesystems {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlacementScope {
+    SameLlc,
+    HostWide,
+}
+
+impl PlacementScope {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SameLlc => "same_llc",
+            Self::HostWide => "host_wide",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Workload {
     WarmStat,
-    ParallelMetadataWrite8,
+    ParallelMetadataWrite,
     ParallelRead8,
     CreateDeleteStorm,
     ReaddirStat8,
@@ -92,7 +108,7 @@ impl Workload {
     const fn label(self) -> &'static str {
         match self {
             Self::WarmStat => "warm_stat",
-            Self::ParallelMetadataWrite8 => "parallel_metadata_write_8t",
+            Self::ParallelMetadataWrite => "parallel_metadata_write",
             Self::ParallelRead8 => "parallel_read_multifile_8t",
             Self::CreateDeleteStorm => "small_file_create_delete_storm",
             Self::ReaddirStat8 => "large_directory_readdir_stat_8t",
@@ -103,22 +119,21 @@ impl Workload {
     const fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::ParallelMetadataWrite8 | Self::CreateDeleteStorm | Self::FsyncJournalCommit
+            Self::ParallelMetadataWrite | Self::CreateDeleteStorm | Self::FsyncJournalCommit
         )
     }
 
-    const fn client_threads(self) -> usize {
+    const fn client_threads(self, configured: usize) -> usize {
         match self {
-            Self::ParallelMetadataWrite8 | Self::ParallelRead8 | Self::ReaddirStat8 => {
-                PARALLEL_THREADS
-            }
+            Self::ParallelMetadataWrite => configured,
+            Self::ParallelRead8 | Self::ReaddirStat8 => DEFAULT_PARALLEL_THREADS,
             Self::WarmStat | Self::CreateDeleteStorm | Self::FsyncJournalCommit => 1,
         }
     }
 
     const fn durability(self) -> &'static str {
         match self {
-            Self::ParallelMetadataWrite8 => "create_then_fsync_each_worker_directory",
+            Self::ParallelMetadataWrite => "create_then_fsync_each_worker_directory",
             Self::CreateDeleteStorm => "create_fsyncdir_delete_fsyncdir",
             Self::FsyncJournalCommit => "write_4k_then_fsync_each_operation",
             Self::WarmStat | Self::ParallelRead8 | Self::ReaddirStat8 => "read_only_no_mutation",
@@ -142,7 +157,15 @@ struct Config {
     image_size_mib: u64,
     maximum_null_ratio: f64,
     arm_settle_ms: u64,
+    client_threads: usize,
+    placement_scope: PlacementScope,
     output: Option<PathBuf>,
+}
+
+impl Config {
+    const fn client_threads(&self) -> usize {
+        self.workload.client_threads(self.client_threads)
+    }
 }
 
 impl Default for Config {
@@ -158,6 +181,8 @@ impl Default for Config {
             image_size_mib: 256,
             maximum_null_ratio: 1.025,
             arm_settle_ms: 100,
+            client_threads: DEFAULT_PARALLEL_THREADS,
+            placement_scope: PlacementScope::SameLlc,
             output: None,
         }
     }
@@ -241,6 +266,25 @@ struct CpuPlacement {
     fuse_guard_cpus: BTreeSet<usize>,
     last_level_cache_cpus: BTreeSet<usize>,
     busy_fractions: BTreeMap<usize, f64>,
+}
+
+#[derive(Clone, Debug)]
+struct HostProvenance {
+    hostname: String,
+    cpu_model: String,
+    online_cpus: BTreeSet<usize>,
+    allowed_cpus_before_pin: BTreeSet<usize>,
+    cgroup_cpuset_effective: Option<String>,
+    physical_cores: usize,
+    runtime_features: BTreeSet<&'static str>,
+}
+
+struct DriverPlacementContext<'a> {
+    scope: PlacementScope,
+    ranked: &'a [(usize, f64)],
+    busy: &'a BTreeMap<usize, f64>,
+    driver_domain: &'a BTreeSet<usize>,
+    fuse_guard_cpus: &'a BTreeSet<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -413,12 +457,14 @@ fn usage() {
          \n\
          Options:\n\
            --filesystem ext4|btrfs|both   Filesystem arm(s), default both\n\
-           --workload NAME                warm-stat | parallel-metadata-write-8t |\n\
+           --workload NAME                warm-stat | parallel-metadata-write |\n\
                                           parallel-read-8t | create-delete-storm |\n\
                                           readdir-stat-8t | fsync-journal-commit\n\
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
            --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32)\n\
            --operations N                 Workload operations per observation (default 2000)\n\
+           --client-threads N             Actual parallel-metadata worker threads (default 8)\n\
+           --placement-scope SCOPE        same-llc | host-wide (default same-llc)\n\
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
            --maximum-null-ratio R         Max symmetric A/A CI spread (default 1.025)\n\
@@ -444,15 +490,73 @@ where
 fn parse_workload(value: &str) -> Result<Workload> {
     match value {
         "warm-stat" => Ok(Workload::WarmStat),
-        "parallel-metadata-write-8t" => Ok(Workload::ParallelMetadataWrite8),
+        "parallel-metadata-write" | "parallel-metadata-write-8t" => {
+            Ok(Workload::ParallelMetadataWrite)
+        }
         "parallel-read-8t" => Ok(Workload::ParallelRead8),
         "create-delete-storm" => Ok(Workload::CreateDeleteStorm),
         "readdir-stat-8t" => Ok(Workload::ReaddirStat8),
         "fsync-journal-commit" => Ok(Workload::FsyncJournalCommit),
         _ => bail!(
-            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write-8t|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit"
+            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit"
         ),
     }
+}
+
+fn parse_placement_scope(value: &str) -> Result<PlacementScope> {
+    match value {
+        "same-llc" => Ok(PlacementScope::SameLlc),
+        "host-wide" => Ok(PlacementScope::HostWide),
+        _ => bail!("unsupported --placement-scope {value}; expected same-llc|host-wide"),
+    }
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    ensure!(
+        !config.ffs_cli.as_os_str().is_empty(),
+        "--ffs-cli is required"
+    );
+    ensure!(
+        config.ffs_cli.is_file(),
+        "ffs-cli does not exist: {}",
+        config.ffs_cli.display()
+    );
+    ensure!(
+        config.pairs >= 12 && config.pairs % BALANCED_ORDERS.len() == 0,
+        "--pairs must be a multiple of 4 and at least 12"
+    );
+    ensure!(config.operations > 0, "--operations must be positive");
+    ensure!(
+        config.observation_repeats > 0,
+        "--observation-repeats must be positive"
+    );
+    ensure!(
+        !config.workload.is_mutating() || config.observation_repeats == 1,
+        "mutating workloads require --observation-repeats 1 so every timed row has one durability boundary"
+    );
+    ensure!(
+        (1..=MAX_CLIENT_THREADS).contains(&config.client_threads()),
+        "--client-threads must be in 1..={MAX_CLIENT_THREADS}"
+    );
+    ensure!(
+        config.client_threads() == 1 || config.operations % config.client_threads() == 0,
+        "{} requires --operations divisible by its {} actual client threads",
+        config.workload.label(),
+        config.client_threads()
+    );
+    ensure!(
+        (1..=MAX_IMAGE_MIB).contains(&config.image_size_mib),
+        "--image-size-mib must be in 1..={MAX_IMAGE_MIB}"
+    );
+    ensure!(
+        config.maximum_null_ratio > 1.0,
+        "--maximum-null-ratio must exceed 1.0"
+    );
+    ensure!(
+        config.arm_settle_ms <= MAX_ARM_SETTLE_MS,
+        "--arm-settle-ms must be at most {MAX_ARM_SETTLE_MS}"
+    );
+    Ok(())
 }
 
 fn parse_args() -> Result<Option<Config>> {
@@ -489,6 +593,13 @@ fn parse_args() -> Result<Option<Config>> {
             "--operations" => {
                 config.operations = parse_value(&args, &mut index, "--operations")?;
             }
+            "--client-threads" => {
+                config.client_threads = parse_value(&args, &mut index, "--client-threads")?;
+            }
+            "--placement-scope" => {
+                let value = parse_value::<String>(&args, &mut index, "--placement-scope")?;
+                config.placement_scope = parse_placement_scope(&value)?;
+            }
             "--observation-repeats" => {
                 config.observation_repeats =
                     parse_value(&args, &mut index, "--observation-repeats")?;
@@ -508,45 +619,7 @@ fn parse_args() -> Result<Option<Config>> {
         index += 1;
     }
 
-    ensure!(
-        !config.ffs_cli.as_os_str().is_empty(),
-        "--ffs-cli is required"
-    );
-    ensure!(
-        config.ffs_cli.is_file(),
-        "ffs-cli does not exist: {}",
-        config.ffs_cli.display()
-    );
-    ensure!(
-        config.pairs >= 12 && config.pairs % BALANCED_ORDERS.len() == 0,
-        "--pairs must be a multiple of 4 and at least 12"
-    );
-    ensure!(config.operations > 0, "--operations must be positive");
-    ensure!(
-        config.observation_repeats > 0,
-        "--observation-repeats must be positive"
-    );
-    ensure!(
-        !config.workload.is_mutating() || config.observation_repeats == 1,
-        "mutating workloads require --observation-repeats 1 so every timed row has one durability boundary"
-    );
-    ensure!(
-        config.workload.client_threads() == 1 || config.operations % PARALLEL_THREADS == 0,
-        "{} requires --operations divisible by {PARALLEL_THREADS}",
-        config.workload.label()
-    );
-    ensure!(
-        (1..=MAX_IMAGE_MIB).contains(&config.image_size_mib),
-        "--image-size-mib must be in 1..={MAX_IMAGE_MIB}"
-    );
-    ensure!(
-        config.maximum_null_ratio > 1.0,
-        "--maximum-null-ratio must exceed 1.0"
-    );
-    ensure!(
-        config.arm_settle_ms <= MAX_ARM_SETTLE_MS,
-        "--arm-settle-ms must be at most {MAX_ARM_SETTLE_MS}"
-    );
+    validate_config(&config)?;
     Ok(Some(config))
 }
 
@@ -702,10 +775,10 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
     .context("write fixture sentinel")?;
     match config.workload {
         Workload::WarmStat => {}
-        Workload::ParallelMetadataWrite8 => {
+        Workload::ParallelMetadataWrite => {
             let parent = root.join("parallel-metadata");
             fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
-            for worker in 0..PARALLEL_THREADS {
+            for worker in 0..config.client_threads() {
                 let path = parent.join(format!("worker-{worker}"));
                 fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;
             }
@@ -760,19 +833,24 @@ fn create_base_image(
     kind: FilesystemKind,
     fixture_root: &Path,
     run_dir: &Path,
-    size_mib: u64,
+    config: &Config,
 ) -> Result<PathBuf> {
     let image = run_dir.join(format!("{}.base.img", kind.label()));
-    create_sized_file(&image, size_mib)?;
+    create_sized_file(&image, config.image_size_mib)?;
     match kind {
-        FilesystemKind::Ext4 => run_checked(
-            Command::new("mke2fs")
-                .args(["-t", "ext4", "-F", "-q", "-b", "4096"])
-                .arg("-d")
-                .arg(fixture_root)
-                .arg(&image),
-            "mke2fs ext4 fixture",
-        )?,
+        FilesystemKind::Ext4 => {
+            let mut command = Command::new("mke2fs");
+            command.args(["-t", "ext4", "-F", "-q", "-b", "4096"]);
+            if config.workload == Workload::ParallelMetadataWrite {
+                // A 2 GiB sweep image must retain enough inodes for
+                // (warmup + measured rounds) * operations unique creates.
+                command.args(["-i", "4096"]);
+            }
+            run_checked(
+                command.arg("-d").arg(fixture_root).arg(&image),
+                "mke2fs ext4 fixture",
+            )?;
+        }
         FilesystemKind::Btrfs => run_checked(
             Command::new("mkfs.btrfs")
                 .args(["-f", "-q", "-r"])
@@ -1354,13 +1432,14 @@ fn parallel_metadata_write_batch(
     root: &Path,
     operations: usize,
     sequence: usize,
+    client_threads: usize,
 ) -> Result<(u64, u64)> {
     let parent = root.join("parallel-metadata");
-    let per_worker = operations / PARALLEL_THREADS;
+    let per_worker = operations / client_threads;
     let started = Instant::now();
     let digest = thread::scope(|scope| -> Result<u64> {
-        let mut handles = Vec::with_capacity(PARALLEL_THREADS);
-        for worker in 0..PARALLEL_THREADS {
+        let mut handles = Vec::with_capacity(client_threads);
+        for worker in 0..client_threads {
             let worker_dir = parent.join(format!("worker-{worker}"));
             handles.push(scope.spawn(move || -> Result<u64> {
                 let mut digest = 0_u64;
@@ -1386,7 +1465,7 @@ fn parallel_metadata_write_batch(
         }
         Ok(digest)
     })?;
-    for worker in 0..PARALLEL_THREADS {
+    for worker in 0..client_threads {
         let worker_dir = File::open(parent.join(format!("worker-{worker}")))
             .with_context(|| format!("open metadata worker directory {worker}"))?;
         worker_dir
@@ -1420,13 +1499,13 @@ fn parallel_read_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
         paths.len()
     );
     let digest = thread::scope(|scope| -> Result<u64> {
-        let mut handles = Vec::with_capacity(PARALLEL_THREADS);
-        for worker in 0..PARALLEL_THREADS {
+        let mut handles = Vec::with_capacity(DEFAULT_PARALLEL_THREADS);
+        for worker in 0..DEFAULT_PARALLEL_THREADS {
             let paths = &paths;
             handles.push(scope.spawn(move || -> Result<u64> {
                 let mut buffer = vec![0_u8; PARALLEL_READ_FILE_BYTES];
                 let mut digest = 0_u64;
-                for index in (worker..paths.len()).step_by(PARALLEL_THREADS) {
+                for index in (worker..paths.len()).step_by(DEFAULT_PARALLEL_THREADS) {
                     let path = &paths[index];
                     let file = File::open(path)
                         .with_context(|| format!("parallel read open {}", path.display()))?;
@@ -1505,12 +1584,12 @@ fn readdir_stat_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
         paths.len()
     );
     let digest = thread::scope(|scope| -> Result<u64> {
-        let mut handles = Vec::with_capacity(PARALLEL_THREADS);
-        for worker in 0..PARALLEL_THREADS {
+        let mut handles = Vec::with_capacity(DEFAULT_PARALLEL_THREADS);
+        for worker in 0..DEFAULT_PARALLEL_THREADS {
             let paths = &paths;
             handles.push(scope.spawn(move || -> Result<u64> {
                 let mut digest = 0_u64;
-                for index in (worker..paths.len()).step_by(PARALLEL_THREADS) {
+                for index in (worker..paths.len()).step_by(DEFAULT_PARALLEL_THREADS) {
                     let path = &paths[index];
                     let metadata = fs::symlink_metadata(path)
                         .with_context(|| format!("large-directory stat {}", path.display()))?;
@@ -1584,9 +1663,12 @@ fn fsync_journal_batch(root: &Path, operations: usize, sequence: usize) -> Resul
 fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<(u64, u64)> {
     match config.workload {
         Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations),
-        Workload::ParallelMetadataWrite8 => {
-            parallel_metadata_write_batch(root, config.operations, sequence)
-        }
+        Workload::ParallelMetadataWrite => parallel_metadata_write_batch(
+            root,
+            config.operations,
+            sequence,
+            config.client_threads(),
+        ),
         Workload::ParallelRead8 => parallel_read_batch(root, config.operations),
         Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations),
         Workload::ReaddirStat8 => readdir_stat_batch(root, config.operations),
@@ -1893,6 +1975,126 @@ fn parse_cpu_list(value: &str) -> Result<BTreeSet<usize>> {
     Ok(cpus)
 }
 
+fn format_cpu_list(cpus: impl IntoIterator<Item = usize>) -> String {
+    cpus.into_iter()
+        .map(|cpu| cpu.to_string())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn self_allowed_cpus() -> Result<BTreeSet<usize>> {
+    let status = fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
+    let allowed = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:\t"))
+        .ok_or_else(|| anyhow!("Cpus_allowed_list missing from /proc/self/status"))?;
+    parse_cpu_list(allowed)
+}
+
+fn cgroup_cpuset_effective() -> Option<String> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut candidates = Vec::new();
+    for line in cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let _hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let relative = fields.next()?.trim_start_matches('/');
+        if controllers.is_empty() {
+            candidates.push(
+                Path::new("/sys/fs/cgroup")
+                    .join(relative)
+                    .join("cpuset.cpus.effective"),
+            );
+        } else if controllers.split(',').any(|name| name == "cpuset") {
+            candidates.push(
+                Path::new("/sys/fs/cgroup/cpuset")
+                    .join(relative)
+                    .join("cpuset.cpus.effective"),
+            );
+            candidates.push(
+                Path::new("/sys/fs/cgroup/cpuset")
+                    .join(relative)
+                    .join("cpuset.cpus"),
+            );
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn cpu_topology_id(cpu: usize, name: &str) -> Result<usize> {
+    let path = PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/topology/{name}"));
+    fs::read_to_string(&path)
+        .with_context(|| format!("read CPU topology {}", path.display()))?
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("parse CPU topology {}", path.display()))
+}
+
+fn physical_core_count(cpus: &BTreeSet<usize>) -> Result<usize> {
+    let mut cores = BTreeSet::new();
+    for &cpu in cpus {
+        cores.insert((
+            cpu_topology_id(cpu, "physical_package_id")?,
+            cpu_topology_id(cpu, "core_id")?,
+        ));
+    }
+    ensure!(!cores.is_empty(), "host exposes no physical CPU cores");
+    Ok(cores.len())
+}
+
+fn host_provenance() -> Result<HostProvenance> {
+    let online_cpus = parse_cpu_list(
+        &fs::read_to_string("/sys/devices/system/cpu/online").context("read online CPU list")?,
+    )?;
+    let allowed_cpus_before_pin = self_allowed_cpus()?;
+    ensure!(
+        allowed_cpus_before_pin.is_subset(&online_cpus),
+        "process CPU allowance includes offline CPUs"
+    );
+    let cpu_info = fs::read_to_string("/proc/cpuinfo").context("read /proc/cpuinfo")?;
+    let cpu_model = cpu_info
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            matches!(key.trim(), "model name" | "Hardware").then(|| value.trim().to_owned())
+        })
+        .ok_or_else(|| anyhow!("CPU model missing from /proc/cpuinfo"))?;
+    let runtime_features = [
+        ("sse2", std::is_x86_feature_detected!("sse2")),
+        ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
+        ("avx2", std::is_x86_feature_detected!("avx2")),
+        ("fma", std::is_x86_feature_detected!("fma")),
+        ("avx512f", std::is_x86_feature_detected!("avx512f")),
+    ]
+    .into_iter()
+    .filter_map(|(name, detected)| detected.then_some(name))
+    .collect();
+    Ok(HostProvenance {
+        hostname: fs::read_to_string("/proc/sys/kernel/hostname")
+            .context("read hostname")?
+            .trim()
+            .to_owned(),
+        cpu_model,
+        physical_cores: physical_core_count(&online_cpus)?,
+        online_cpus,
+        allowed_cpus_before_pin,
+        cgroup_cpuset_effective: cgroup_cpuset_effective(),
+        runtime_features,
+    })
+}
+
+fn runtime_isa_label(host: &HostProvenance) -> String {
+    host.runtime_features
+        .iter()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 fn thread_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
     let path = PathBuf::from(format!(
         "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
@@ -1943,9 +2145,18 @@ fn last_level_cache_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
     Ok(siblings)
 }
 
-fn select_cpu_placement(client_threads: usize) -> Result<CpuPlacement> {
+fn select_cpu_placement(
+    client_threads: usize,
+    scope: PlacementScope,
+    allowed_cpus: &BTreeSet<usize>,
+) -> Result<CpuPlacement> {
     let busy = sample_cpu_busy()?;
-    let mut ranked: Vec<(usize, f64)> = busy.iter().map(|(&cpu, &load)| (cpu, load)).collect();
+    let mut ranked: Vec<(usize, f64)> = busy
+        .iter()
+        .filter(|(cpu, _)| allowed_cpus.contains(cpu))
+        .map(|(&cpu, &load)| (cpu, load))
+        .collect();
+    ensure!(!ranked.is_empty(), "no allowed CPUs were sampled");
     ranked.sort_by(|left, right| {
         left.1
             .total_cmp(&right.1)
@@ -1953,7 +2164,10 @@ fn select_cpu_placement(client_threads: usize) -> Result<CpuPlacement> {
     });
     let mut driver = None;
     for &(cpu, load) in &ranked {
-        let siblings = thread_siblings(cpu)?;
+        let siblings = thread_siblings(cpu)?
+            .intersection(allowed_cpus)
+            .copied()
+            .collect::<BTreeSet<_>>();
         if siblings.iter().all(|sibling| {
             busy.get(sibling)
                 .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
@@ -1971,17 +2185,33 @@ fn select_cpu_placement(client_threads: usize) -> Result<CpuPlacement> {
         driver_busy * 100.0,
         MAX_DRIVER_PREFLIGHT_BUSY * 100.0
     );
-    let last_level_cache_cpus = last_level_cache_siblings(driver_cpu)?;
-    let (fuse_cpus, fuse_guard_cpus) =
-        select_fuse_cpus(&ranked, &busy, &last_level_cache_cpus, &driver_guard_cpus)?;
-    let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
-        client_threads,
-        driver_cpu,
+    let last_level_cache_cpus = last_level_cache_siblings(driver_cpu)?
+        .intersection(allowed_cpus)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let (fuse_cpus, fuse_guard_cpus) = select_fuse_cpus(
         &ranked,
         &busy,
         &last_level_cache_cpus,
-        &fuse_guard_cpus,
+        &driver_guard_cpus,
+        allowed_cpus,
+    )?;
+    let driver_domain = match scope {
+        PlacementScope::SameLlc => &last_level_cache_cpus,
+        PlacementScope::HostWide => allowed_cpus,
+    };
+    let driver_context = DriverPlacementContext {
+        scope,
+        ranked: &ranked,
+        busy: &busy,
+        driver_domain,
+        fuse_guard_cpus: &fuse_guard_cpus,
+    };
+    let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
+        client_threads,
+        driver_cpu,
         driver_guard_cpus,
+        &driver_context,
     )?;
     Ok(CpuPlacement {
         driver_cpu,
@@ -1999,6 +2229,7 @@ fn select_fuse_cpus(
     busy: &BTreeMap<usize, f64>,
     last_level_cache_cpus: &BTreeSet<usize>,
     driver_guard_cpus: &BTreeSet<usize>,
+    allowed_cpus: &BTreeSet<usize>,
 ) -> Result<(Vec<usize>, BTreeSet<usize>)> {
     for &(cpu, load) in ranked {
         if !last_level_cache_cpus.contains(&cpu)
@@ -2007,7 +2238,10 @@ fn select_fuse_cpus(
         {
             continue;
         }
-        let siblings = thread_siblings(cpu)?;
+        let siblings = thread_siblings(cpu)?
+            .intersection(allowed_cpus)
+            .copied()
+            .collect::<BTreeSet<_>>();
         if siblings.iter().any(|sibling| {
             busy.get(sibling)
                 .is_none_or(|value| *value > MAX_FUSE_PREFLIGHT_BUSY)
@@ -2028,28 +2262,45 @@ fn select_fuse_cpus(
 fn select_driver_cpus(
     client_threads: usize,
     driver_cpu: usize,
-    ranked: &[(usize, f64)],
-    busy: &BTreeMap<usize, f64>,
-    last_level_cache_cpus: &BTreeSet<usize>,
-    fuse_guard_cpus: &BTreeSet<usize>,
     mut driver_guard_cpus: BTreeSet<usize>,
+    context: &DriverPlacementContext<'_>,
 ) -> Result<(Vec<usize>, BTreeSet<usize>)> {
+    let available_cpu_count = context
+        .driver_domain
+        .difference(context.fuse_guard_cpus)
+        .count();
+    let target_cpu_count = client_threads.min(available_cpu_count);
+    ensure!(
+        target_cpu_count > 0,
+        "placement leaves no CPU for benchmark clients"
+    );
+    if context.scope == PlacementScope::SameLlc {
+        ensure!(
+            target_cpu_count == client_threads,
+            "LLC domain has only {available_cpu_count} non-FUSE CPUs for a {client_threads}-thread workload"
+        );
+    }
     let mut driver_cpus = vec![driver_cpu];
-    if client_threads > 1 {
-        for &(cpu, load) in ranked {
-            if driver_cpus.len() >= client_threads {
+    if target_cpu_count > 1 {
+        for &(cpu, load) in context.ranked {
+            if driver_cpus.len() >= target_cpu_count {
                 break;
             }
-            if !last_level_cache_cpus.contains(&cpu)
-                || fuse_guard_cpus.contains(&cpu)
+            if !context.driver_domain.contains(&cpu)
+                || context.fuse_guard_cpus.contains(&cpu)
                 || driver_guard_cpus.contains(&cpu)
                 || load > MAX_DRIVER_PREFLIGHT_BUSY
             {
                 continue;
             }
-            let siblings = thread_siblings(cpu)?;
+            let siblings = thread_siblings(cpu)?
+                .intersection(context.driver_domain)
+                .copied()
+                .collect::<BTreeSet<_>>();
             if siblings.iter().any(|sibling| {
-                busy.get(sibling)
+                context
+                    .busy
+                    .get(sibling)
                     .is_none_or(|value| *value > MAX_DRIVER_PREFLIGHT_BUSY)
             }) {
                 continue;
@@ -2058,12 +2309,13 @@ fn select_driver_cpus(
             driver_guard_cpus.extend(siblings);
         }
         for cpu in driver_guard_cpus.clone() {
-            if driver_cpus.len() >= client_threads {
+            if driver_cpus.len() >= target_cpu_count {
                 break;
             }
             if !driver_cpus.contains(&cpu)
-                && !fuse_guard_cpus.contains(&cpu)
-                && busy
+                && !context.fuse_guard_cpus.contains(&cpu)
+                && context
+                    .busy
                     .get(&cpu)
                     .is_some_and(|load| *load <= MAX_DRIVER_PREFLIGHT_BUSY)
             {
@@ -2072,9 +2324,10 @@ fn select_driver_cpus(
         }
     }
     ensure!(
-        driver_cpus.len() == client_threads,
-        "LLC domain supplied only {} quiet client CPUs for a {client_threads}-thread workload",
-        driver_cpus.len()
+        driver_cpus.len() == target_cpu_count,
+        "{} domain supplied only {} quiet client CPUs; {target_cpu_count} needed for {client_threads} actual client threads",
+        context.scope.label(),
+        driver_cpus.len(),
     );
     driver_cpus.sort_unstable();
     Ok((driver_cpus, driver_guard_cpus))
@@ -2180,7 +2433,7 @@ fn fs_report(
     let mount_fs_dir = mount_run_dir.join(kind.label());
     fs::create_dir(&mount_fs_dir)
         .with_context(|| format!("create mount directory {}", mount_fs_dir.display()))?;
-    let base = create_base_image(kind, fixture_root, &fs_dir, config.image_size_mib)?;
+    let base = create_base_image(kind, fixture_root, &fs_dir, config)?;
     let images = clone_images(kind, &base, &fs_dir)?;
 
     let mut mounts = Vec::with_capacity(4);
@@ -2298,6 +2551,24 @@ fn fs_report(
     let fuse_clear =
         fuse_null.contains_null() && fuse_null.symmetric_spread() <= config.maximum_null_ratio;
     let admitted = kernel_clear && fuse_clear;
+    let kernel_median_wall_ns = median(
+        [Arm::KernelA, Arm::KernelB]
+            .into_iter()
+            .flat_map(|arm| samples.values[&arm].iter().copied())
+            .map(|value| value as f64)
+            .collect(),
+    );
+    let fuse_median_wall_ns = median(
+        [Arm::FuseA, Arm::FuseB]
+            .into_iter()
+            .flat_map(|arm| samples.values[&arm].iter().copied())
+            .map(|value| value as f64)
+            .collect(),
+    );
+    let kernel_operations_per_second =
+        config.operations as f64 * 1_000_000_000.0 / kernel_median_wall_ns;
+    let fuse_operations_per_second =
+        config.operations as f64 * 1_000_000_000.0 / fuse_median_wall_ns;
 
     for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
         println!(
@@ -2390,7 +2661,7 @@ fn fs_report(
         "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},client_threads={},operations_per_observation={},pairs={},crossover_blocks={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},admitted={},verdict={},gate_basis=four_round_balanced_crossover_bootstrap_median_ci,bootstrap_resamples={},cv_used=false,instructions_used=false",
         kind.label(),
         config.workload.label(),
-        config.workload.client_threads(),
+        config.client_threads(),
         config.operations,
         config.pairs,
         config.pairs / ESTIMATOR_BLOCK_ROUNDS,
@@ -2402,6 +2673,13 @@ fn fs_report(
         admitted,
         if admitted { "HONEST" } else { "BLOCKED_NULL" },
         BOOTSTRAP_RESAMPLES,
+    );
+    println!(
+        "mounted_kernel_throughput,filesystem={},workload={},client_threads={},operations_per_observation={},kernel_median_wall_ns={kernel_median_wall_ns:.0},fuse_median_wall_ns={fuse_median_wall_ns:.0},kernel_operations_per_second={kernel_operations_per_second:.3},fuse_operations_per_second={fuse_operations_per_second:.3},diagnostic_only=true",
+        kind.label(),
+        config.workload.label(),
+        config.client_threads(),
+        config.operations,
     );
 
     let raw_samples = samples
@@ -2463,8 +2741,13 @@ fn fs_report(
     Ok(json!({
         "filesystem": kind.label(),
         "workload": config.workload.label(),
-        "client_threads": config.workload.client_threads(),
+        "client_threads": config.client_threads(),
+        "client_affinity_cpu_count": placement.driver_cpus.len(),
+        "client_affinity_cpus": placement.driver_cpus,
+        "client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
+        "placement_scope": config.placement_scope.label(),
         "operations_per_observation": config.operations,
+        "operations_per_client_thread": config.operations / config.client_threads(),
         "pairs": config.pairs,
         "crossover_blocks": config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
@@ -2506,6 +2789,13 @@ fn fs_report(
         "pre_measurement_cpu_busy": contention,
         "raw_wall_ns": raw_samples,
         "raw_physical_wall_ns": raw_physical_samples,
+        "diagnostic_side_throughput": {
+            "gate_input": false,
+            "kernel_median_wall_ns": kernel_median_wall_ns,
+            "fuse_median_wall_ns": fuse_median_wall_ns,
+            "kernel_operations_per_second": kernel_operations_per_second,
+            "fuse_operations_per_second": fuse_operations_per_second,
+        },
         "workload_digests": workload_digests,
         "kernel_aa": {
             "median": kernel_null.median,
@@ -2545,6 +2835,13 @@ fn run() -> Result<Option<PathBuf>> {
     let Some(config) = parse_args()? else {
         return Ok(None);
     };
+    let host = host_provenance()?;
+    ensure!(
+        config.client_threads() <= host.allowed_cpus_before_pin.len(),
+        "{} actual client threads exceed the pre-pin process allowance of {} logical CPUs",
+        config.client_threads(),
+        host.allowed_cpus_before_pin.len()
+    );
     let ffs_binary_identity = inspect_ffs_binary(&config.ffs_cli)?;
     let harness_sha = current_elf_sha256()?;
     println!("bench_evidence,binary_sha256={harness_sha}");
@@ -2553,15 +2850,32 @@ fn run() -> Result<Option<PathBuf>> {
         ffs_binary_identity.binary_sha256, ffs_binary_identity.pgo_profile_sha256
     );
     println!(
-        "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse4_2={},runtime_avx2={},runtime_fma={}",
+        "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse2={},runtime_sse4_2={},runtime_avx2={},runtime_fma={},runtime_avx512f={}",
         env::consts::ARCH,
         cfg!(target_feature = "sse2"),
         cfg!(target_feature = "sse4.2"),
         cfg!(target_feature = "avx2"),
         cfg!(target_feature = "fma"),
-        std::is_x86_feature_detected!("sse4.2"),
-        std::is_x86_feature_detected!("avx2"),
-        std::is_x86_feature_detected!("fma"),
+        host.runtime_features.contains("sse2"),
+        host.runtime_features.contains("sse4.2"),
+        host.runtime_features.contains("avx2"),
+        host.runtime_features.contains("fma"),
+        host.runtime_features.contains("avx512f"),
+    );
+    println!(
+        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},client_threads_actually_used={},runtime_isa={},placement_scope={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
+        host.hostname,
+        host.cpu_model,
+        host.physical_cores,
+        host.online_cpus.len(),
+        config.client_threads(),
+        runtime_isa_label(&host),
+        config.placement_scope.label(),
+        format_cpu_list(host.allowed_cpus_before_pin.iter().copied()),
+        host.allowed_cpus_before_pin.len(),
+        host.cgroup_cpuset_effective
+            .as_deref()
+            .unwrap_or("unavailable"),
     );
 
     let free_before = free_bytes_on_data()?;
@@ -2577,49 +2891,32 @@ fn run() -> Result<Option<PathBuf>> {
         .clone()
         .unwrap_or_else(|| run_dir.join("mounted-kernel-report.json"));
     let fixture_root = create_fixture_tree(&run_dir, &config)?;
-    let placement = select_cpu_placement(config.workload.client_threads())?;
+    let placement = select_cpu_placement(
+        config.client_threads(),
+        config.placement_scope,
+        &host.allowed_cpus_before_pin,
+    )?;
     pin_current_process(&placement.driver_cpus)?;
     println!(
-        "core_contention_preflight,workload={},client_threads={},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},same_llc=true,llc_cpus={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
+        "core_contention_preflight,workload={},client_threads_actually_used={},client_affinity_cpu_count={},client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
         config.workload.label(),
-        config.workload.client_threads(),
-        placement
-            .driver_cpus
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(":"),
-        placement
-            .driver_guard_cpus
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(":"),
+        config.client_threads(),
+        placement.driver_cpus.len(),
+        config.client_threads() as f64 / placement.driver_cpus.len() as f64,
+        format_cpu_list(placement.driver_cpus.iter().copied()),
+        format_cpu_list(placement.driver_guard_cpus.iter().copied()),
         placement.busy_fractions[&placement.driver_cpu],
-        placement
-            .fuse_cpus
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(":"),
-        placement
-            .fuse_guard_cpus
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(":"),
+        format_cpu_list(placement.fuse_cpus.iter().copied()),
+        format_cpu_list(placement.fuse_guard_cpus.iter().copied()),
         placement
             .fuse_cpus
             .iter()
             .map(|cpu| format!("{:.6}", placement.busy_fractions[cpu]))
             .collect::<Vec<_>>()
             .join(":"),
-        placement
-            .last_level_cache_cpus
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(":"),
+        config.placement_scope.label(),
+        config.placement_scope == PlacementScope::SameLlc,
+        format_cpu_list(placement.last_level_cache_cpus.iter().copied()),
         MAX_DRIVER_PREFLIGHT_BUSY,
         MAX_FUSE_PREFLIGHT_BUSY,
     );
@@ -2657,7 +2954,7 @@ fn run() -> Result<Option<PathBuf>> {
 
     let free_after = free_bytes_on_data()?;
     let report = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "harness": "ffs-mounted-kernel-bench",
         "harness_binary_sha256": harness_sha,
         "ffs_cli": fs::canonicalize(&config.ffs_cli)?,
@@ -2668,8 +2965,28 @@ fn run() -> Result<Option<PathBuf>> {
         "mount_root": mount_run_dir,
         "disk_free_before_bytes": free_before,
         "disk_free_after_bytes": free_after,
+        "host": {
+            "hostname": host.hostname,
+            "cpu_model": host.cpu_model,
+            "physical_cores": host.physical_cores,
+            "logical_threads": host.online_cpus.len(),
+            "online_cpus": host.online_cpus,
+            "pre_pin_allowed_cpus": host.allowed_cpus_before_pin,
+            "pre_pin_allowed_cpu_count": host.allowed_cpus_before_pin.len(),
+            "cgroup_cpuset_effective": host.cgroup_cpuset_effective,
+            "runtime_isa": runtime_isa_label(&host),
+            "runtime_features": {
+                "sse2": host.runtime_features.contains("sse2"),
+                "sse4_2": host.runtime_features.contains("sse4.2"),
+                "avx2": host.runtime_features.contains("avx2"),
+                "fma": host.runtime_features.contains("fma"),
+                "avx512f": host.runtime_features.contains("avx512f"),
+            },
+        },
         "driver_cpu": placement.driver_cpu,
         "driver_cpus": placement.driver_cpus,
+        "client_affinity_cpu_count": placement.driver_cpus.len(),
+        "client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "fuse_cpus": placement.fuse_cpus,
         "driver_guard_cpus": placement.driver_guard_cpus,
         "fuse_guard_cpus": placement.fuse_guard_cpus,
@@ -2697,7 +3014,9 @@ fn run() -> Result<Option<PathBuf>> {
             "durability": config.workload.durability(),
         },
         "workload": config.workload.label(),
-        "client_threads": config.workload.client_threads(),
+        "client_threads": config.client_threads(),
+        "client_threads_actually_used": config.client_threads(),
+        "placement_scope": config.placement_scope.label(),
         "schedule": {
             "kind": "balanced four-arm interleave with independent kernel and FUSE A/A",
             "physical_role_assignment": "A/B physical mounts exchange logical roles every round",
@@ -2822,6 +3141,16 @@ mod tests {
             parse_cpu_list("0-2,8,10-11").expect("parse CPU list"),
             BTreeSet::from([0, 1, 2, 8, 10, 11])
         );
+    }
+
+    #[test]
+    fn only_metadata_scaling_uses_configured_client_threads() {
+        assert_eq!(Workload::ParallelMetadataWrite.client_threads(96), 96);
+        assert_eq!(
+            Workload::ParallelRead8.client_threads(96),
+            DEFAULT_PARALLEL_THREADS
+        );
+        assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
     }
 
     #[test]
