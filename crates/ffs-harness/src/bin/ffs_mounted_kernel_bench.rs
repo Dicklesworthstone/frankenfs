@@ -150,6 +150,17 @@ impl Workload {
     const fn observation_reducer(self) -> &'static str {
         if self.is_mutating() { "single" } else { "min" }
     }
+
+    const fn worker_thread_observation_method(self) -> &'static str {
+        match self {
+            Self::ParallelMetadataWrite | Self::ParallelRead8 | Self::ReaddirStat8 => {
+                "unique Linux TIDs reported by workers inside each timed batch"
+            }
+            Self::WarmStat | Self::CreateDeleteStorm | Self::FsyncJournalCommit => {
+                "single Linux benchmark-driver TID observed before and after each timed batch"
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1756,8 +1767,9 @@ fn reset_workload_state(root: &Path, config: &Config, sequence: usize) -> Result
     Ok(())
 }
 
-fn parallel_read_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
+fn parallel_read_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> {
     let parent = root.join("parallel-read");
+    let (thread_id_sender, thread_id_receiver) = mpsc::channel();
     let started = Instant::now();
     let mut paths = fs::read_dir(&parent)
         .with_context(|| format!("parallel read readdir {}", parent.display()))?
@@ -1778,7 +1790,11 @@ fn parallel_read_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
         let mut handles = Vec::with_capacity(DEFAULT_PARALLEL_THREADS);
         for worker in 0..DEFAULT_PARALLEL_THREADS {
             let paths = &paths;
+            let thread_id_sender = thread_id_sender.clone();
             handles.push(scope.spawn(move || -> Result<u64> {
+                thread_id_sender
+                    .send(current_linux_tid()?)
+                    .context("report parallel read worker TID")?;
                 let mut buffer = vec![0_u8; PARALLEL_READ_FILE_BYTES];
                 let mut digest = 0_u64;
                 for index in (worker..paths.len()).step_by(DEFAULT_PARALLEL_THREADS) {
@@ -1800,6 +1816,7 @@ fn parallel_read_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
                 Ok(digest)
             }));
         }
+        drop(thread_id_sender);
         let mut digest = 0_u64;
         for handle in handles {
             digest ^= handle
@@ -1808,9 +1825,21 @@ fn parallel_read_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
         }
         Ok(digest)
     })?;
+    let observed_worker_threads = thread_id_receiver
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .len();
+    ensure!(
+        observed_worker_threads > 0,
+        "parallel read batch observed no worker threads"
+    );
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     black_box(digest);
-    Ok((elapsed, digest))
+    Ok(WorkloadBatch {
+        elapsed_ns: elapsed,
+        digest,
+        observed_worker_threads: Some(observed_worker_threads),
+    })
 }
 
 fn create_delete_storm_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
@@ -1846,8 +1875,9 @@ fn create_delete_storm_batch(root: &Path, operations: usize) -> Result<(u64, u64
     ))
 }
 
-fn readdir_stat_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
+fn readdir_stat_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> {
     let parent = root.join("large-directory");
+    let (thread_id_sender, thread_id_receiver) = mpsc::channel();
     let started = Instant::now();
     let paths = fs::read_dir(&parent)
         .with_context(|| format!("large-directory readdir {}", parent.display()))?
@@ -1863,7 +1893,11 @@ fn readdir_stat_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
         let mut handles = Vec::with_capacity(DEFAULT_PARALLEL_THREADS);
         for worker in 0..DEFAULT_PARALLEL_THREADS {
             let paths = &paths;
+            let thread_id_sender = thread_id_sender.clone();
             handles.push(scope.spawn(move || -> Result<u64> {
+                thread_id_sender
+                    .send(current_linux_tid()?)
+                    .context("report readdir+stat worker TID")?;
                 let mut digest = 0_u64;
                 for index in (worker..paths.len()).step_by(DEFAULT_PARALLEL_THREADS) {
                     let path = &paths[index];
@@ -1878,6 +1912,7 @@ fn readdir_stat_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
                 Ok(digest)
             }));
         }
+        drop(thread_id_sender);
         let mut digest = 0_u64;
         for handle in handles {
             digest = digest.wrapping_add(
@@ -1888,9 +1923,21 @@ fn readdir_stat_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
         }
         Ok(digest)
     })?;
+    let observed_worker_threads = thread_id_receiver
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .len();
+    ensure!(
+        observed_worker_threads > 0,
+        "readdir+stat batch observed no worker threads"
+    );
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     black_box(digest);
-    Ok((elapsed, digest))
+    Ok(WorkloadBatch {
+        elapsed_ns: elapsed,
+        digest,
+        observed_worker_threads: Some(observed_worker_threads),
+    })
 }
 
 fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64, path: &Path) -> Result<()> {
@@ -1937,26 +1984,37 @@ fn fsync_journal_batch(root: &Path, operations: usize, sequence: usize) -> Resul
 }
 
 fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<WorkloadBatch> {
-    if config.workload == Workload::ParallelMetadataWrite {
-        return parallel_metadata_write_batch(
-            root,
-            config.operations,
-            sequence,
-            config.client_threads(),
-        );
+    match config.workload {
+        Workload::ParallelMetadataWrite => {
+            return parallel_metadata_write_batch(
+                root,
+                config.operations,
+                sequence,
+                config.client_threads(),
+            );
+        }
+        Workload::ParallelRead8 => return parallel_read_batch(root, config.operations),
+        Workload::ReaddirStat8 => return readdir_stat_batch(root, config.operations),
+        Workload::WarmStat | Workload::CreateDeleteStorm | Workload::FsyncJournalCommit => {}
     }
+    let driver_tid_before = current_linux_tid()?;
     let (elapsed_ns, digest) = match config.workload {
         Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations)?,
-        Workload::ParallelMetadataWrite => unreachable!("handled above"),
-        Workload::ParallelRead8 => parallel_read_batch(root, config.operations)?,
+        Workload::ParallelMetadataWrite | Workload::ParallelRead8 | Workload::ReaddirStat8 => {
+            unreachable!("parallel workloads handled above")
+        }
         Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations)?,
-        Workload::ReaddirStat8 => readdir_stat_batch(root, config.operations)?,
         Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence)?,
     };
+    let driver_tid_after = current_linux_tid()?;
+    ensure!(
+        driver_tid_before == driver_tid_after,
+        "serial workload moved between Linux threads: {driver_tid_before} -> {driver_tid_after}"
+    );
     Ok(WorkloadBatch {
         elapsed_ns,
         digest,
-        observed_worker_threads: None,
+        observed_worker_threads: Some(1),
     })
 }
 
@@ -2173,6 +2231,16 @@ fn clears_twice_null_margin(
 ) -> bool {
     let required_log_margin = 2.0 * null_log_margin(kernel_null, fuse_null);
     competitive.low.ln() > required_log_margin || -competitive.high.ln() > required_log_margin
+}
+
+fn worker_thread_observation_is_clear(
+    observed_by_arm: &BTreeMap<Arm, BTreeSet<usize>>,
+    requested: usize,
+) -> bool {
+    let expected = BTreeSet::from([requested]);
+    [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB]
+        .into_iter()
+        .all(|arm| observed_by_arm.get(&arm) == Some(&expected))
 }
 
 fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f64>> {
@@ -3110,20 +3178,12 @@ fn fs_report(
         kernel_null.contains_null() && kernel_null.symmetric_spread() <= config.maximum_null_ratio;
     let fuse_clear =
         fuse_null.contains_null() && fuse_null.symmetric_spread() <= config.maximum_null_ratio;
-    let observed_thread_union = samples
-        .observed_worker_threads
-        .values()
-        .flat_map(|values| values.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let worker_thread_observation_clear = config.workload != Workload::ParallelMetadataWrite
-        || (observed_thread_union.len() == 1
-            && samples
-                .observed_worker_threads
-                .values()
-                .all(|values| values.len() == 1));
-    let actual_observed_worker_threads = worker_thread_observation_clear
-        .then(|| observed_thread_union.iter().next().copied())
-        .flatten();
+    let worker_thread_observation_clear = worker_thread_observation_is_clear(
+        &samples.observed_worker_threads,
+        config.client_threads(),
+    );
+    let actual_observed_worker_threads =
+        worker_thread_observation_clear.then_some(config.client_threads());
     let admitted = kernel_clear && fuse_clear && worker_thread_observation_clear;
     let twice_null_log_margin = 2.0 * null_log_margin(kernel_null, fuse_null);
     let twice_null_ratio = twice_null_log_margin.exp();
@@ -3223,22 +3283,23 @@ fn fs_report(
         expected_initial_tree.directories,
         expected_initial_tree.bytes,
     );
+    for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+        println!(
+            "mounted_kernel_worker_threads,filesystem={},workload={},assignment_arm={},requested={},runtime_observed_values={},observation_method={},clear={}",
+            kind.label(),
+            config.workload.label(),
+            arm.label(),
+            config.client_threads(),
+            samples.observed_worker_threads[&arm]
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(":"),
+            config.workload.worker_thread_observation_method(),
+            worker_thread_observation_clear,
+        );
+    }
     if config.workload == Workload::ParallelMetadataWrite {
-        for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
-            println!(
-                "mounted_kernel_worker_threads,filesystem={},workload={},assignment_arm={},requested={},runtime_observed_values={},observation_method=unique_linux_tids_reported_by_workers_inside_timed_batch,clear={}",
-                kind.label(),
-                config.workload.label(),
-                arm.label(),
-                config.client_threads(),
-                samples.observed_worker_threads[&arm]
-                    .iter()
-                    .map(usize::to_string)
-                    .collect::<Vec<_>>()
-                    .join(":"),
-                worker_thread_observation_clear,
-            );
-        }
         println!(
             "mounted_kernel_state_reset,filesystem={},workload={},timed_files_per_arm_observation={},reset_files_per_arm_observation={},warmup_observations_per_arm={},measured_observations_per_arm={},reset_timing=excluded,post_reset_sync=sync_f,verdict=pass",
             kind.label(),
@@ -3460,11 +3521,7 @@ fn fs_report(
         "requested_client_threads": config.client_threads(),
         "actual_observed_worker_threads": actual_observed_worker_threads,
         "observed_worker_threads_by_arm": observed_worker_threads_by_arm,
-        "worker_thread_observation_method": if config.workload == Workload::ParallelMetadataWrite {
-            "unique Linux TIDs reported by workers inside each timed batch"
-        } else {
-            "not collected for this non-scaling workload"
-        },
+        "worker_thread_observation_method": config.workload.worker_thread_observation_method(),
         "worker_thread_observation_clear": worker_thread_observation_clear,
         "engine_sha256": {
             "incumbent_kernel": kernel_identity.artifact_sha256,
@@ -3939,6 +3996,57 @@ mod tests {
             DEFAULT_PARALLEL_THREADS
         );
         assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
+    }
+
+    #[test]
+    fn thread_observation_requires_requested_count_in_every_arm() {
+        let mut observed = BTreeMap::from([
+            (Arm::KernelA, BTreeSet::from([8])),
+            (Arm::KernelB, BTreeSet::from([8])),
+            (Arm::FuseA, BTreeSet::from([8])),
+            (Arm::FuseB, BTreeSet::from([8])),
+        ]);
+        assert!(worker_thread_observation_is_clear(&observed, 8));
+        observed.get_mut(&Arm::KernelB).expect("kernel B").insert(7);
+        assert!(!worker_thread_observation_is_clear(&observed, 8));
+        observed.insert(Arm::KernelB, BTreeSet::from([8]));
+        assert!(!worker_thread_observation_is_clear(&observed, 1));
+        observed.remove(&Arm::FuseB);
+        assert!(!worker_thread_observation_is_clear(&observed, 8));
+    }
+
+    #[test]
+    fn fixed_parallel_workloads_report_eight_worker_tids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parallel_read = temp.path().join("parallel-read");
+        fs::create_dir(&parallel_read).expect("parallel read directory");
+        for index in 0..DEFAULT_PARALLEL_THREADS {
+            write_fixture_file(
+                &parallel_read.join(format!("read-{index:06}.bin")),
+                PARALLEL_READ_FILE_BYTES,
+                index,
+            )
+            .expect("parallel read fixture");
+        }
+        assert_eq!(
+            parallel_read_batch(temp.path(), DEFAULT_PARALLEL_THREADS)
+                .expect("parallel read batch")
+                .observed_worker_threads,
+            Some(DEFAULT_PARALLEL_THREADS)
+        );
+
+        let large_directory = temp.path().join("large-directory");
+        fs::create_dir(&large_directory).expect("large directory");
+        for index in 0..DEFAULT_PARALLEL_THREADS {
+            File::create(large_directory.join(format!("entry-{index:08}")))
+                .expect("large-directory fixture entry");
+        }
+        assert_eq!(
+            readdir_stat_batch(temp.path(), DEFAULT_PARALLEL_THREADS)
+                .expect("readdir+stat batch")
+                .observed_worker_threads,
+            Some(DEFAULT_PARALLEL_THREADS)
+        );
     }
 
     #[test]
