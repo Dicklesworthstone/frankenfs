@@ -265,6 +265,7 @@ struct CpuPlacement {
     driver_guard_cpus: BTreeSet<usize>,
     fuse_guard_cpus: BTreeSet<usize>,
     last_level_cache_cpus: BTreeSet<usize>,
+    allowed_cpus: BTreeSet<usize>,
     busy_fractions: BTreeMap<usize, f64>,
 }
 
@@ -2228,6 +2229,25 @@ fn select_cpu_placement(
         .map(|(&cpu, &load)| (cpu, load))
         .collect();
     ensure!(!ranked.is_empty(), "no allowed CPUs were sampled");
+    if scope == PlacementScope::HostWide {
+        ensure!(
+            ranked.len() == allowed_cpus.len(),
+            "host-wide placement sampled {} of {} allowed CPUs",
+            ranked.len(),
+            allowed_cpus.len()
+        );
+        let busy_cpus = ranked
+            .iter()
+            .filter(|(_, load)| *load > MAX_DRIVER_PREFLIGHT_BUSY)
+            .map(|(cpu, load)| format!("cpu{cpu}={:.1}%", load * 100.0))
+            .collect::<Vec<_>>();
+        ensure!(
+            busy_cpus.is_empty(),
+            "host-wide placement requires an exclusive quiet cpuset; busy CPUs above {:.1}%: {}",
+            MAX_DRIVER_PREFLIGHT_BUSY * 100.0,
+            busy_cpus.join(",")
+        );
+    }
     ranked.sort_by(|left, right| {
         left.1
             .total_cmp(&right.1)
@@ -2291,6 +2311,7 @@ fn select_cpu_placement(
         driver_guard_cpus,
         fuse_guard_cpus,
         last_level_cache_cpus,
+        allowed_cpus: allowed_cpus.clone(),
         busy_fractions: busy,
     })
 }
@@ -2580,6 +2601,29 @@ fn fs_report(
     );
 
     let contention = sample_cpu_busy()?;
+    if config.placement_scope == PlacementScope::HostWide {
+        let mut busy_cpus = Vec::new();
+        for cpu in &placement.allowed_cpus {
+            let load = contention
+                .get(cpu)
+                .copied()
+                .ok_or_else(|| anyhow!("allowed cpu{cpu} disappeared before measurement"))?;
+            if load > MAX_DRIVER_PREFLIGHT_BUSY {
+                busy_cpus.push(format!("cpu{cpu}={:.1}%", load * 100.0));
+            }
+        }
+        ensure!(
+            busy_cpus.is_empty(),
+            "host-wide cpuset lost exclusivity before measurement; busy CPUs above {:.1}%: {}",
+            MAX_DRIVER_PREFLIGHT_BUSY * 100.0,
+            busy_cpus.join(",")
+        );
+        println!(
+            "host_wide_quiescence,allowed_cpu_count={},maximum_busy_fraction={:.3},busy_cpu_count_above_limit=0,verdict=clear",
+            placement.allowed_cpus.len(),
+            MAX_DRIVER_PREFLIGHT_BUSY,
+        );
+    }
     for &cpu in &placement.driver_guard_cpus {
         let load = contention
             .get(&cpu)
@@ -2883,6 +2927,16 @@ fn fs_report(
             },
         },
         "pre_measurement_cpu_busy": contention,
+        "host_wide_quiescence": if config.placement_scope == PlacementScope::HostWide {
+            json!({
+                "verdict": "clear",
+                "allowed_cpu_count": placement.allowed_cpus.len(),
+                "maximum_busy_fraction": MAX_DRIVER_PREFLIGHT_BUSY,
+                "busy_cpu_count_above_limit": 0,
+            })
+        } else {
+            json!("not_applicable")
+        },
         "raw_wall_ns": raw_samples,
         "raw_physical_wall_ns": raw_physical_samples,
         "diagnostic_side_throughput": {
