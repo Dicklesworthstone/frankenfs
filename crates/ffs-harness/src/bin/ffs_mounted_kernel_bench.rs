@@ -38,7 +38,8 @@ const MAX_IMAGE_MIB: u64 = 2048;
 const PAYLOAD_BYTES: usize = 1024 * 1024;
 const MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
-const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
+const CPU_SAMPLE_INTERVAL_MS: u64 = 1_000;
+const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(CPU_SAMPLE_INTERVAL_MS);
 const MAX_DRIVER_PREFLIGHT_BUSY: f64 = 0.20;
 const MAX_FUSE_PREFLIGHT_BUSY: f64 = 0.35;
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
@@ -2943,8 +2944,9 @@ fn fs_report(
             busy_cpus.join(",")
         );
         println!(
-            "host_wide_quiescence,allowed_cpu_count={},maximum_busy_fraction={:.3},busy_cpu_count_above_limit=0,verdict=clear",
+            "host_wide_quiescence,allowed_cpu_count={},sample_interval_ms={},maximum_busy_fraction={:.3},busy_cpu_count_above_limit=0,verdict=clear",
             placement.allowed_cpus.len(),
+            CPU_SAMPLE_INTERVAL_MS,
             MAX_DRIVER_PREFLIGHT_BUSY,
         );
     }
@@ -3283,6 +3285,7 @@ fn fs_report(
         json!({
             "verdict": "clear",
             "allowed_cpu_count": placement.allowed_cpus.len(),
+            "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
             "maximum_busy_fraction": MAX_DRIVER_PREFLIGHT_BUSY,
             "busy_cpu_count_above_limit": 0,
         })
@@ -3349,6 +3352,7 @@ fn fs_report(
         "client_affinity_cpus": placement.driver_cpus,
         "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "placement_scope": config.placement_scope.label(),
+        "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
         "operations_per_observation": config.operations,
         "operations_per_requested_client_thread": config.operations / config.client_threads(),
         "pairs": config.pairs,
@@ -3443,7 +3447,7 @@ fn run() -> Result<Option<PathBuf>> {
         host.runtime_features.contains("avx512f"),
     );
     println!(
-        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
+        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},cpu_busy_sample_interval_ms={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
         host.hostname,
         host.cpu_model,
         host.physical_cores,
@@ -3457,6 +3461,7 @@ fn run() -> Result<Option<PathBuf>> {
         distinct_frequency_values(&host.cpu_frequency_policy.energy_performance_preferences),
         host.cpu_frequency_policy.governor_warning(),
         config.placement_scope.label(),
+        CPU_SAMPLE_INTERVAL_MS,
         format_cpu_list(host.allowed_cpus_before_pin.iter().copied()),
         host.allowed_cpus_before_pin.len(),
         host.cgroup_cpuset_effective
@@ -3572,6 +3577,7 @@ fn run() -> Result<Option<PathBuf>> {
                 "avx512f": host.runtime_features.contains("avx512f"),
             },
             "cpu_frequency_policy": cpu_frequency_policy_json(&host.cpu_frequency_policy),
+            "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
         },
         "driver_cpu": placement.driver_cpu,
         "driver_cpus": placement.driver_cpus,
