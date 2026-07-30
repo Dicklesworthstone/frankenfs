@@ -13,6 +13,112 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Exact-work scaling preflight kept; Threadripper sweep stops on its first FUSE null - 2026-07-29 (PurpleSnow, instrument KEEP / measurement BLOCKED-NULL)
+
+This turn changed the mounted comparator, not FrankenFS. Before opening a
+production lever, the planned scaling work itself was audited. The driver
+required `operations % client_threads == 0`, so the pre-registered 8,192
+operations would reject the 96-thread point. Commit `89fefe8b` replaced that
+constraint with a deterministic exact-total partition: each worker gets the
+quotient, and the first `operations % threads` workers get one additional
+operation. The identical partition is used by the timed create batch and its
+untimed reset.
+
+The counted contract is therefore:
+
+| Requested threads | Per-worker distribution | Exact timed/reset total |
+| --- | --- | --- |
+| 1 | `1 x 8,192` | 8,192 |
+| 96 | `32 x 86 + 64 x 85` | 8,192 |
+| 128 | `128 x 64` | 8,192 |
+
+The report records the minimum and maximum operations per worker, the number of
+workers receiving the remainder, and `operation_distribution_exact_total=true`.
+A regression test creates and removes a non-divisible 9-operation / 2-thread
+batch and separately proves the 8,192 / 96 partition. Strict-remote
+exact-source tests passed **19/19** on `ovh-a`; scoped no-dependency Clippy with
+warnings denied except the crate's reproduced deprecation class, file rustfmt,
+and `git diff --check` passed. This instrument correction is kept independently
+of the measurement outcome because it prevents the sweep from doing different
+total work at different thread counts.
+
+After the explicit `[trj] CLAIM frankenfs`, the frozen candidate and freshly
+built self-hashing driver started the pre-registered
+1/2/4/8/16/32/64/96/128 sweep. The invocation stopped at the required first
+failure:
+
+| Point | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | Competitive estimate | Decision |
+| --- | --- | --- | --- | --- |
+| ext4 parallel metadata write, 1 requested/observed worker, 8,192 operations | `1.006357x [0.996054, 1.019204]`, spread `1.019204x` | `1.006701x [1.003212, 1.014440]`, spread `1.014440x` | **No admissible ratio.** Apparent `3.029651x [3.008041, 3.066799]` is diagnostic only. | **BLOCKED-NULL** |
+
+The FUSE interval is narrower than the `1.025x` spread ceiling but excludes 1,
+so admission fails. Repeating the same point until it happens to contain 1
+would select on the null control. No thread-count points from 2 through 128 were
+run, no scaling curve exists, and the apparent competitive loss is not a
+campaign claim or a basis for production tuning. The exclusive machine was
+released immediately in `[trj] RELEASE frankenfs` message `6323`.
+
+All non-timing gates were clean. The invocation used 48 paired rounds / 12
+complete four-round physical-role crossover blocks, eight balanced warmups,
+20,000 deterministic bootstrap resamples, four independent mounts, matched
+mount/durability settings, and wall-time median confidence intervals.
+`cv_used=false` and `instructions_used=false`. Every arm completed exactly
+8,192 operations and repeatedly observed exactly one Linux worker TID.
+Initial and post-mount host-wide quiet gates passed, as did initial/final
+four-arm namespace/content parity and all four offline checks. Physical medians
+were:
+
+- kernel A/B: `168,499,134 ns` / `169,908,172 ns`;
+- FUSE A/B: `502,031,299 ns` / `499,437,890 ns`.
+
+The residual `1.005193x` physical FUSE-arm median offset is consistent with the
+failed FUSE null and remains unexplained even though logical roles crossed over
+the two physical mounts. That is a measurement-system result, not filesystem
+source evidence.
+
+Provenance:
+
+- host `threadripperje`, 64 physical cores / 128 logical threads,
+  536,069,869,568 bytes RAM, one NUMA node;
+- runtime ISA `avx2+fma+sse2+sse4.2`;
+- every CPU reported `amd-pstate-epp`, governor `performance`, and EPP
+  `performance`;
+- driver CPU 0 with SMT guard 0/64; both FUSE daemons on CPU 1 with guard 1/65;
+- initial quiet gate: five consecutive clear one-second samples after eight
+  observed samples / 8,006 ms; post-mount gate: five samples / 5,004 ms;
+- driver self-report
+  `executing_elf_sha256=b9c3cbeb95f7696ca567e9aa5778dfa18f4016daacaf90bd83b618ecdd9b353e`;
+- candidate ELF SHA-256
+  `2db6860eaa3e86abf28ba8d2f6a82eea99c873510430edf5b20eb1ee5ceb4f10`,
+  PGO profile SHA-256
+  `23108426f429eef45acf65c6eb0489a5a74d1fc8ef1401ed2cf8dbba31ee7307`;
+- incumbent kernel `6.17.0-41-generic`, `/boot/vmlinuz-6.17.0-41-generic`
+  SHA-256
+  `4a480bffbc34d52479023f0b9990f6ecfab3d0a325cf86c81e8b04d2a719a7a4`,
+  runtime notes SHA-256
+  `084b46c7dd63c2a8e23cf0e99aa41c97419de5dce98f37be6b5512635b9ed034`;
+- report
+  `/data/tmp/frankenfs-mounted-metadata-sweep/threads-1-attempt-7.json`,
+  SHA-256
+  `a5871ad197c77e003c5873d94e2cda084fa17f8b803942c449aca92183c8b82e`;
+- log
+  `/data/tmp/frankenfs-mounted-metadata-sweep/threads-1-attempt-7.log`,
+  SHA-256
+  `9d56026e38b0b2c7a0ba7cac648c4639484ae1c63c53f08f4830ea73f7abe4c3`.
+
+**Retry predicate:** do not rerun on a merely fresh placement, pool this
+failed-null estimate with another invocation, or change the candidate based on
+it. First add counted per-four-round attribution for physical FUSE mount
+identity, CPU migrations, minor/major faults, and host-wide busy state during
+timing, or otherwise identify and remove the measured physical FUSE-arm
+asymmetry. Then pre-register one new complete invocation starting at thread 1
+with the same frozen candidate/incumbent identities, exact-total work
+distribution, four independent arms, and physical-role crossover. Every point
+must have the requested worker count on every arm, both A/A median CIs
+containing 1 with spread at most `1.025x`, a competitive interval clearing
+twice the worst null log-margin, full parity, and clean offline checks.
+`cv_used=false`; instruction count remains provenance only.
+
 ## Governor- and thread-attested mounted rerun admits storm; read and readdir remain null-blocked - 2026-07-29 (PurpleSnow, vs-INCUMBENT instrument KEEP)
 
 This rerun changes the instrument, not FrankenFS. The comparator now records
