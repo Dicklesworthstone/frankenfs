@@ -13,7 +13,7 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
-## Unpinned timed threads, not host noise, were breaking the mounted A/A nulls; 2 scored rows become 4 - 2026-07-30 (BlackThrush, vs-INCUMBENT instrument KEEP)
+## Unpinned timed threads, not host noise, were breaking the mounted A/A nulls; all five rows now score - 2026-07-30 (BlackThrush, vs-INCUMBENT instrument KEEP)
 
 This row banks an instrument fix and four re-measured direct-incumbent rows. **No
 gate was loosened**: `--maximum-null-ratio` stays `1.025`, both A/A CIs must still
@@ -112,10 +112,23 @@ preserved rather than rediscovered every batch.
 | Small-file create/delete storm, 2,000 files | `0.996217x [0.985593, 1.007951]`, spread `1.014618x` | `0.995167x [0.988305, 1.004712]`, spread `1.011833x` | **`2.753659x [2.707500, 2.782302]` slower** | **HONEST LOSS** |
 | Multi-file parallel read, 8 threads, 256 x 256 KiB | `1.003293x [0.982553, 1.016450]`, spread `1.017757x` | `0.994130x [0.982397, 1.002347]`, spread `1.017918x` | **`1.287862x [1.269319, 1.307285]` slower** | **HONEST LOSS** |
 | Fsync/journal commit, 8 x 4 KiB | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `0.997098x [0.990808, 1.009108]` against a twice-null margin of `1.030661x` | **HONEST NEUTRAL** |
-| Parallel metadata writes, 8 threads, 512 creates | `0.999591x [.., ..]`, spread `1.052172x` (best of 4 runs) | spread `1.036214x` | Not admissible; blocked estimates `1.508913x`-`1.688491x` | **BLOCKED-NULL** |
+| Parallel metadata writes, 8 threads, 512 creates, **128 blocks** | `1.007184x [0.998479, 1.024316]`, spread `1.024316x` | `0.995707x [0.978797, 1.000111]`, spread `1.021662x` | **`1.510822x [1.493097, 1.539011]` slower** | **HONEST LOSS** |
+| Parallel metadata writes, replicate on a disjoint CPU set | `0.998642x [0.990286, 1.009556]`, spread `1.009809x` | `0.998780x [0.990819, 1.002688]`, spread `1.009266x` | **`1.513052x [1.490837, 1.534711]` slower** | **HONEST LOSS** |
 
-**The direct-incumbent score for these five ext4 surfaces is 0 wins / 3 losses /
-1 neutral / 1 unscored**, replacing the prior 1 win / 1 loss / 3 unscored.
+**The direct-incumbent score for these five ext4 surfaces is 0 wins / 4 losses /
+1 neutral / 0 unscored**, replacing the prior 1 win / 1 loss / 3 unscored.
+
+Metadata needed **128 crossover blocks** (`--pairs 512`), not the 32 that suffice
+for the other four. That is a precision increase, not a loosening: the estimand is
+unchanged and a median CI narrows as ~`1/sqrt(blocks)`. At 32 blocks its spread sat
+at `1.036x`-`1.090x` across four runs; at 128 blocks it is `1.024316x` and
+`1.009809x`, and the two runs agree on the effect to **0.15%**
+(`1.510822x` vs `1.513052x`) on **disjoint CPU sets** (`24,25,26,29,31,56,59,60`
+versus `0,1,5,6,33,34,35,39`), each clearing its own twice-null margin
+(`1.049223x`, `1.019714x`). The published `1.942477x` was therefore overstated by
+about 28%; the honest figure is **`1.512x` slower**, and the workload needs four
+times the blocks because its timed region is eight serialized ext4 journal commits
+whose latency is heavy-tailed.
 
 Two results are corrections against FrankenFS and must not be softened:
 
@@ -132,7 +145,7 @@ Two results are corrections against FrankenFS and must not be softened:
 Storm moved the other way: `2.957531x -> 2.753659x`, a smaller loss than the
 blocked estimate.
 
-### Metadata: a second unpinned thread, and an irreducible fsync tail so far
+### Metadata: a second unpinned thread, then a block-count shortfall
 
 `parallel_metadata_write_batch` performs all eight worker-directory `fsync`s on
 the **driver thread**, inside the timed region. On ext4 `data=ordered` each forces
@@ -144,11 +157,16 @@ contrast. The driver thread is now bound once at startup
 each worker's bind is its first action so the inherited single-CPU mask window is
 one syscall.
 
-That change did not rescue the row. Across **four** independent runs the metadata
-null is blocked with spreads `1.077930x`, `1.057067x`, `1.090403x`, `1.052172x`
-and effects `1.688491x`, `1.659983x`, `1.613519x`, `1.508913x` - the effect
-reproduces within ~12% while the **verdict is stable**. Note that every blocked
-estimate is *below* the published `1.942477x`, so that row was itself overstated.
+That change alone did not rescue the row at 32 blocks. Across **four** runs at
+`--pairs 128` the metadata null stayed blocked with spreads `1.077930x`,
+`1.057067x`, `1.090403x`, `1.052172x` and effects `1.688491x`, `1.659983x`,
+`1.613519x`, `1.508913x` - the effect reproduced while the **verdict was stable**,
+which by the fleet gate-audit criterion proves the cause physical rather than a
+gate artifact. Raising the block count to 128 (`--pairs 512`) then admitted it
+twice in a row, so the residual was a power shortfall on top of the driver-thread
+binding, not an irreducible property of the workload. Every blocked estimate was
+*below* the published `1.942477x`, and the two admitted values (`1.510822x`,
+`1.513052x`) sit at the bottom of that spread.
 
 The 2026-07-27 metadata null passed for a bad reason: its kernel arm's last
 quarter ran **2.64x** slower than its first (21.51 -> 56.80 ms), and only 8
@@ -181,21 +199,28 @@ across 24 null evaluations in 12 runs rather than assumed:
 | ratio-threshold-only | 8 | read 07-27 (x2), readdir 07-27, metadata (x5) |
 | both | 1 | metadata fuse, third run |
 
-The single straddle-only veto is a textbook instance: null median `1.009041x`,
-spread `1.013361x` comfortably inside `1.025x`, CI `[1.001744, 1.013361]` missing
-`1.0` by **0.17%**, vetoing a `2.957531x` effect whose deviation is **108.4%**
-against a 2x-half-width margin of **2.7%** - the effect cleared the margin **40x**.
-Storm's verdict then moved across three runs (blocked, pass, pass) while its
-effect reproduced within ~9%: the defect signature.
+The single straddle-only veto looked like a textbook instance: null median
+`1.009041x`, spread `1.013361x` comfortably inside `1.025x`, CI
+`[1.001744, 1.013361]` missing `1.0` by **0.17%**, vetoing a `2.957531x` effect
+whose deviation is **108.4%** against a 2x-half-width margin of **2.7%**.
 
-It does not explain this campaign's blocked rows. Read, readdir, and metadata all
-vetoed on the **ratio** threshold, 1 to 9 points over a 2.5% allowance, and
-metadata's verdict is stable at blocked 4/4 with a 2x-half-width of 10-17%. By the
-handoff's own stability criterion those are physical, so the harness was fixed
-rather than the gate. Under the corrected rule metadata would become decidable and
-would be a **LOSS** at `1.508913x`; no blocked row becomes a win, so the integrity
-check holds. The gate is therefore left unchanged in this row, and the straddle
-clause is flagged for a separate decision.
+**It is not a live gate defect, and an earlier draft of this row overstated it.**
+The handoff's test requires the *same* ELF; the storm verdict movement first cited
+here (blocked, pass, pass) spanned three different driver ELFs and both the
+unpinned and pinned instruments, so it does not isolate the gate. Re-run properly -
+one ELF `8c357460af...`, three reps, placement landing on `driver_cpus` 3, 28, and
+14 at differing load - storm passes **3/3** with spreads `1.022639x`, `1.011589x`,
+`1.016627x` and effects `2.760102x`, `2.780381x`, `2.795147x`, reproducing within
+**1.3%**. A stable verdict on a reproducible effect means the gate is sound; the
+07-27 veto was a single historical event produced by the unpinned instrument, not
+gate flakiness.
+
+The straddle clause therefore explains none of this campaign's blocked rows. Read,
+readdir, and metadata all vetoed on the **ratio** threshold, 1 to 9 points over a
+2.5% allowance, with stable verdicts. `contains_null` is the only straddle test in
+the file (`:377`) and is used at exactly two sites (`:3513`, `:3515`); the
+remaining hits are its own unit tests. The gate is left unchanged, correctly, and
+the clause is flagged as latent rather than active.
 
 ### Provenance
 
@@ -225,15 +250,16 @@ Every admitted ratio and every A/A null above is a deterministic 20,000-resample
 
 The executing driver hashed itself in process and printed `bench_evidence,binary_sha256=75b400a965010294f60c88cb3a591fd013248c92456e2fe13f7e2d01a5b3369b`; the driver-thread-bound follow-up printed `bench_evidence,binary_sha256=8c357460afc2edb061e4d17676f46435b0cb9b0102ec5597813843afafbb27aa`, and the candidate printed `bench_evidence,binary_sha256=f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`.
 
-**Retry predicate for parallel metadata writes:** do not retry on another merely
-fresh placement. First remove the driver-thread journal-commit tail from the timed
-region as a *measured* change - either have each worker `fsync` its own directory
-(which changes the durability shape and must be re-declared, not silently
-substituted), or instrument the tail's share of the batch and show it below 10% -
-then require both A/A spreads at most `1.025x` with intervals containing 1 over at
-least 32 crossover blocks, exact parity, and clean `e2fsck`. Never pool the blocked
-`1.509x`-`1.688x` estimates, and never restate `1.942477x`, which came from a run
-whose kernel arm drifted 2.64x within itself.
+**Retry predicate for all five rows:** re-measure only with every timed thread,
+driver included, bound to one CPU, and with at least 32 crossover blocks - 128 for
+parallel metadata writes, which does not resolve at 32. Require both A/A spreads at
+most `1.025x` with intervals containing 1, the effect clearing twice its own null
+log-margin, exact four-arm parity, and clean `e2fsck`. Never pool the blocked
+`1.509x`-`1.688x` metadata estimates, and never restate `1.942477x` or the
+withdrawn fsync `1.005153x` win. Before attributing any future null failure to the
+gate, reproduce the frankenlibc test with a **single** ELF across several cores:
+this campaign's first attempt compared different ELFs and wrongly implicated the
+gate.
 
 ## SURVEY: gate-audit handoff finds CI-straddle veto; no gate change or new scoreable rerun - 2026-07-29 (PurpleSnow, audit incomplete)
 
