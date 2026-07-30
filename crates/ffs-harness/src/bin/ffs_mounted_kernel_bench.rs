@@ -13,6 +13,8 @@
 //! ELF SHA-256, and untimed content and metadata parity pass.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use nix::sched::{CpuSet, sched_getcpu, sched_setaffinity};
+use nix::unistd::Pid;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -268,7 +270,7 @@ impl Workload {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Config {
     ffs_cli: PathBuf,
     artifact_root: PathBuf,
@@ -285,6 +287,12 @@ struct Config {
     placement_scope: PlacementScope,
     host_quiet_samples: usize,
     host_quiet_timeout_ms: u64,
+    /// Machine that produced the driver ELF, and the one that produced the
+    /// candidate ELF. `rch exec` has no artifact-retrieval mechanism, so both
+    /// binaries are built on a remote worker and copied here; a binary of
+    /// unknown origin is not evidence, so both are mandatory and recorded.
+    harness_builder: String,
+    candidate_builder: String,
     output: Option<PathBuf>,
 }
 
@@ -312,6 +320,8 @@ impl Default for Config {
             placement_scope: PlacementScope::SameLlc,
             host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
             host_quiet_timeout_ms: DEFAULT_HOST_QUIET_TIMEOUT_MS,
+            harness_builder: String::new(),
+            candidate_builder: String::new(),
             output: None,
         }
     }
@@ -481,6 +491,8 @@ struct WorkloadBatch {
     elapsed_ns: u64,
     digest: u64,
     observed_worker_threads: Option<usize>,
+    /// CPUs the timed threads were actually running on after being bound.
+    observed_worker_cpus: BTreeSet<usize>,
 }
 
 #[derive(Debug)]
@@ -488,6 +500,7 @@ struct Observation {
     elapsed_ns: u64,
     digest: u64,
     observed_worker_threads: BTreeSet<usize>,
+    observed_worker_cpus: BTreeSet<usize>,
 }
 
 #[derive(Debug)]
@@ -499,6 +512,8 @@ struct TimedSamples {
     digests: BTreeMap<Arm, u64>,
     /// Runtime-observed Linux worker-TID counts for each logical arm.
     observed_worker_threads: BTreeMap<Arm, BTreeSet<usize>>,
+    /// Runtime-observed running CPUs for each logical arm's timed threads.
+    observed_worker_cpus: BTreeMap<Arm, BTreeSet<usize>>,
 }
 
 #[derive(Debug)]
@@ -652,6 +667,8 @@ fn usage() {
            --pre-measurement-settle-ms N  Untimed delay after durable fixture setup (default 1000)\n\
            --host-quiet-samples N         Consecutive clear host-wide samples (default 5)\n\
            --host-quiet-timeout-ms N      Fail-closed quiet-window timeout (default 300000)\n\
+           --harness-builder ID           Machine that built this driver ELF (required)\n\
+           --candidate-builder ID         Machine that built the candidate ELF (required)\n\
            --out PATH                     JSON report path (default inside run dir)\n\
            -h, --help                     Show this help"
     );
@@ -704,6 +721,18 @@ fn validate_config(config: &Config) -> Result<()> {
         "ffs-cli does not exist: {}",
         config.ffs_cli.display()
     );
+    // `rch exec` has no artifact-retrieval mechanism, so both ELFs are built on
+    // a remote worker and copied to this host. Record which worker produced
+    // each one: a binary of unknown origin is not evidence.
+    for (value, flag) in [
+        (&config.harness_builder, "--harness-builder"),
+        (&config.candidate_builder, "--candidate-builder"),
+    ] {
+        ensure!(
+            !value.trim().is_empty(),
+            "{flag} is required: name the machine that built the ELF"
+        );
+    }
     ensure!(
         config.pairs >= 12 && config.pairs % BALANCED_ORDERS.len() == 0,
         "--pairs must be a multiple of 4 and at least 12"
@@ -815,6 +844,12 @@ fn parse_args() -> Result<Option<Config>> {
             "--pre-measurement-settle-ms" => {
                 config.pre_measurement_settle_ms =
                     parse_value(&args, &mut index, "--pre-measurement-settle-ms")?;
+            }
+            "--harness-builder" => {
+                config.harness_builder = parse_value(&args, &mut index, "--harness-builder")?;
+            }
+            "--candidate-builder" => {
+                config.candidate_builder = parse_value(&args, &mut index, "--candidate-builder")?;
             }
             "--host-quiet-samples" => {
                 config.host_quiet_samples = parse_value(&args, &mut index, "--host-quiet-samples")?;
@@ -1745,6 +1780,37 @@ fn current_linux_tid() -> Result<u32> {
         .with_context(|| format!("parse current Linux TID from {}", target.display()))
 }
 
+/// Distinct Linux TIDs and running CPUs reported by one batch's timed threads.
+#[derive(Debug)]
+struct WorkerObservation {
+    threads: usize,
+    cpus: BTreeSet<usize>,
+}
+
+impl WorkerObservation {
+    fn collect(receiver: mpsc::Receiver<(u32, usize)>) -> Self {
+        let reported = receiver.into_iter().collect::<Vec<_>>();
+        let threads = reported
+            .iter()
+            .map(|&(tid, _)| tid)
+            .collect::<BTreeSet<_>>()
+            .len();
+        Self {
+            threads,
+            cpus: reported.into_iter().map(|(_, cpu)| cpu).collect(),
+        }
+    }
+
+    fn ensure_non_empty(&self, label: &str) -> Result<()> {
+        ensure!(self.threads > 0, "{label} batch observed no worker threads");
+        ensure!(
+            !self.cpus.is_empty(),
+            "{label} batch observed no worker CPUs"
+        );
+        Ok(())
+    }
+}
+
 fn worker_operation_count(operations: usize, client_threads: usize, worker: usize) -> usize {
     debug_assert!(client_threads > 0);
     debug_assert!(worker < client_threads);
@@ -1756,19 +1822,24 @@ fn parallel_metadata_write_batch(
     operations: usize,
     sequence: usize,
     client_threads: usize,
+    pinning: &WorkerPinning,
 ) -> Result<WorkloadBatch> {
     let parent = root.join("parallel-metadata");
     let (thread_id_sender, thread_id_receiver) = mpsc::channel();
     let started = Instant::now();
-    let (digest, observed_worker_threads) = thread::scope(|scope| -> Result<(u64, usize)> {
+    let (digest, observed) = thread::scope(|scope| -> Result<(u64, WorkerObservation)> {
         let mut handles = Vec::with_capacity(client_threads);
         for worker in 0..client_threads {
             let worker_dir = parent.join(format!("worker-{worker}"));
             let worker_operations = worker_operation_count(operations, client_threads, worker);
             let thread_id_sender = thread_id_sender.clone();
             handles.push(scope.spawn(move || -> Result<u64> {
+                // Bind first: a freshly spawned thread inherits the driver
+                // thread's single-CPU mask, so this must be its first action to
+                // keep that window to one syscall.
+                let cpu = pinning.bind_current_thread(worker)?;
                 thread_id_sender
-                    .send(current_linux_tid()?)
+                    .send((current_linux_tid()?, cpu))
                     .context("report parallel metadata worker TID")?;
                 let mut digest = 0_u64;
                 for index in 0..worker_operations {
@@ -1792,13 +1863,9 @@ fn parallel_metadata_write_batch(
                 .join()
                 .map_err(|_| anyhow!("parallel metadata worker panicked"))??;
         }
-        let observed_thread_ids = thread_id_receiver.into_iter().collect::<BTreeSet<_>>();
-        Ok((digest, observed_thread_ids.len()))
+        Ok((digest, WorkerObservation::collect(thread_id_receiver)))
     })?;
-    ensure!(
-        observed_worker_threads > 0,
-        "parallel metadata batch observed no worker threads"
-    );
+    observed.ensure_non_empty("parallel metadata")?;
     for worker in 0..client_threads {
         let worker_dir = File::open(parent.join(format!("worker-{worker}")))
             .with_context(|| format!("open metadata worker directory {worker}"))?;
@@ -1811,7 +1878,8 @@ fn parallel_metadata_write_batch(
     Ok(WorkloadBatch {
         elapsed_ns: elapsed,
         digest: digest ^ u64::try_from(operations).unwrap_or(u64::MAX),
-        observed_worker_threads: Some(observed_worker_threads),
+        observed_worker_threads: Some(observed.threads),
+        observed_worker_cpus: observed.cpus,
     })
 }
 
@@ -1877,7 +1945,11 @@ fn reset_workload_state(root: &Path, config: &Config, sequence: usize) -> Result
     Ok(())
 }
 
-fn parallel_read_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> {
+fn parallel_read_batch(
+    root: &Path,
+    operations: usize,
+    pinning: &WorkerPinning,
+) -> Result<WorkloadBatch> {
     let parent = root.join("parallel-read");
     let (thread_id_sender, thread_id_receiver) = mpsc::channel();
     let started = Instant::now();
@@ -1902,8 +1974,9 @@ fn parallel_read_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> 
             let paths = &paths;
             let thread_id_sender = thread_id_sender.clone();
             handles.push(scope.spawn(move || -> Result<u64> {
+                let cpu = pinning.bind_current_thread(worker)?;
                 thread_id_sender
-                    .send(current_linux_tid()?)
+                    .send((current_linux_tid()?, cpu))
                     .context("report parallel read worker TID")?;
                 let mut buffer = vec![0_u8; PARALLEL_READ_FILE_BYTES];
                 let mut digest = 0_u64;
@@ -1935,20 +2008,15 @@ fn parallel_read_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> 
         }
         Ok(digest)
     })?;
-    let observed_worker_threads = thread_id_receiver
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .len();
-    ensure!(
-        observed_worker_threads > 0,
-        "parallel read batch observed no worker threads"
-    );
+    let observed = WorkerObservation::collect(thread_id_receiver);
+    observed.ensure_non_empty("parallel read")?;
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     black_box(digest);
     Ok(WorkloadBatch {
         elapsed_ns: elapsed,
         digest,
-        observed_worker_threads: Some(observed_worker_threads),
+        observed_worker_threads: Some(observed.threads),
+        observed_worker_cpus: observed.cpus,
     })
 }
 
@@ -1985,7 +2053,11 @@ fn create_delete_storm_batch(root: &Path, operations: usize) -> Result<(u64, u64
     ))
 }
 
-fn readdir_stat_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> {
+fn readdir_stat_batch(
+    root: &Path,
+    operations: usize,
+    pinning: &WorkerPinning,
+) -> Result<WorkloadBatch> {
     let parent = root.join("large-directory");
     let (thread_id_sender, thread_id_receiver) = mpsc::channel();
     let started = Instant::now();
@@ -2005,8 +2077,9 @@ fn readdir_stat_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> {
             let paths = &paths;
             let thread_id_sender = thread_id_sender.clone();
             handles.push(scope.spawn(move || -> Result<u64> {
+                let cpu = pinning.bind_current_thread(worker)?;
                 thread_id_sender
-                    .send(current_linux_tid()?)
+                    .send((current_linux_tid()?, cpu))
                     .context("report readdir+stat worker TID")?;
                 let mut digest = 0_u64;
                 for index in (worker..paths.len()).step_by(DEFAULT_PARALLEL_THREADS) {
@@ -2033,20 +2106,15 @@ fn readdir_stat_batch(root: &Path, operations: usize) -> Result<WorkloadBatch> {
         }
         Ok(digest)
     })?;
-    let observed_worker_threads = thread_id_receiver
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .len();
-    ensure!(
-        observed_worker_threads > 0,
-        "readdir+stat batch observed no worker threads"
-    );
+    let observed = WorkerObservation::collect(thread_id_receiver);
+    observed.ensure_non_empty("readdir+stat")?;
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     black_box(digest);
     Ok(WorkloadBatch {
         elapsed_ns: elapsed,
         digest,
-        observed_worker_threads: Some(observed_worker_threads),
+        observed_worker_threads: Some(observed.threads),
+        observed_worker_cpus: observed.cpus,
     })
 }
 
@@ -2093,7 +2161,12 @@ fn fsync_journal_batch(root: &Path, operations: usize, sequence: usize) -> Resul
     ))
 }
 
-fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<WorkloadBatch> {
+fn workload_batch(
+    root: &Path,
+    config: &Config,
+    sequence: usize,
+    pinning: &WorkerPinning,
+) -> Result<WorkloadBatch> {
     match config.workload {
         Workload::ParallelMetadataWrite => {
             return parallel_metadata_write_batch(
@@ -2101,12 +2174,16 @@ fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<Workl
                 config.operations,
                 sequence,
                 config.client_threads(),
+                pinning,
             );
         }
-        Workload::ParallelRead8 => return parallel_read_batch(root, config.operations),
-        Workload::ReaddirStat8 => return readdir_stat_batch(root, config.operations),
+        Workload::ParallelRead8 => return parallel_read_batch(root, config.operations, pinning),
+        Workload::ReaddirStat8 => return readdir_stat_batch(root, config.operations, pinning),
         Workload::WarmStat | Workload::CreateDeleteStorm | Workload::FsyncJournalCommit => {}
     }
+    // The driver thread is bound once at startup; reaffirm and capture it here
+    // so a serial batch still proves which CPU it ran on.
+    let driver_cpu = pinning.bind_driver_thread()?;
     let driver_tid_before = current_linux_tid()?;
     let (elapsed_ns, digest) = match config.workload {
         Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations)?,
@@ -2121,22 +2198,34 @@ fn workload_batch(root: &Path, config: &Config, sequence: usize) -> Result<Workl
         driver_tid_before == driver_tid_after,
         "serial workload moved between Linux threads: {driver_tid_before} -> {driver_tid_after}"
     );
+    let driver_cpu_after = observed_running_cpu()?;
+    ensure!(
+        driver_cpu == driver_cpu_after,
+        "serial workload migrated from cpu{driver_cpu} to cpu{driver_cpu_after}"
+    );
     Ok(WorkloadBatch {
         elapsed_ns,
         digest,
         observed_worker_threads: Some(1),
+        observed_worker_cpus: BTreeSet::from([driver_cpu]),
     })
 }
 
-fn observe(root: &Path, config: &Config, sequence: usize) -> Result<Observation> {
+fn observe(
+    root: &Path,
+    config: &Config,
+    sequence: usize,
+    pinning: &WorkerPinning,
+) -> Result<Observation> {
     let mut best = u64::MAX;
     let mut expected_digest = None;
     let mut observed_worker_threads = BTreeSet::new();
+    let mut observed_worker_cpus = BTreeSet::new();
     for repeat in 0..config.observation_repeats {
         let current_sequence = sequence
             .saturating_mul(config.observation_repeats)
             .saturating_add(repeat);
-        let batch = workload_batch(root, config, current_sequence)?;
+        let batch = workload_batch(root, config, current_sequence, pinning)?;
         if let Some(expected) = expected_digest {
             ensure!(
                 batch.digest == expected,
@@ -2148,12 +2237,14 @@ fn observe(root: &Path, config: &Config, sequence: usize) -> Result<Observation>
         if let Some(observed) = batch.observed_worker_threads {
             observed_worker_threads.insert(observed);
         }
+        observed_worker_cpus.extend(batch.observed_worker_cpus);
         best = best.min(batch.elapsed_ns);
     }
     Ok(Observation {
         elapsed_ns: best,
         digest: expected_digest.unwrap_or(0),
         observed_worker_threads,
+        observed_worker_cpus,
     })
 }
 
@@ -2184,17 +2275,15 @@ fn quiesce_arm(root: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn collect_samples(
+/// Untimed warmup on the same balanced crossover schedule as the measured
+/// rounds, so every arm enters measurement with an equally warmed cache and an
+/// equally advanced per-arm sequence counter.
+fn run_warmup_rounds(
     roots: &BTreeMap<Arm, PathBuf>,
     config: &Config,
-    interrupted: &AtomicBool,
-) -> Result<TimedSamples> {
-    let mut next_sequences = BTreeMap::from([
-        (Arm::KernelA, 0_usize),
-        (Arm::KernelB, 0_usize),
-        (Arm::FuseA, 0_usize),
-        (Arm::FuseB, 0_usize),
-    ]);
+    pinning: &WorkerPinning,
+    next_sequences: &mut BTreeMap<Arm, usize>,
+) -> Result<()> {
     for round in 0..WARMUP_ROUNDS {
         for logical_arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
             let physical_arm = physical_arm_for(logical_arm, round);
@@ -2202,7 +2291,7 @@ fn collect_samples(
                 .get(&physical_arm)
                 .ok_or_else(|| anyhow!("missing workload root for {}", physical_arm.label()))?;
             let sequence = next_sequences[&physical_arm];
-            let batch = workload_batch(root, config, sequence)?;
+            let batch = workload_batch(root, config, sequence, pinning)?;
             *next_sequences
                 .get_mut(&physical_arm)
                 .expect("all arms initialized") += 1;
@@ -2211,6 +2300,22 @@ fn collect_samples(
             quiesce_arm(root, config)?;
         }
     }
+    Ok(())
+}
+
+fn collect_samples(
+    roots: &BTreeMap<Arm, PathBuf>,
+    config: &Config,
+    pinning: &WorkerPinning,
+    interrupted: &AtomicBool,
+) -> Result<TimedSamples> {
+    let mut next_sequences = BTreeMap::from([
+        (Arm::KernelA, 0_usize),
+        (Arm::KernelB, 0_usize),
+        (Arm::FuseA, 0_usize),
+        (Arm::FuseB, 0_usize),
+    ]);
+    run_warmup_rounds(roots, config, pinning, &mut next_sequences)?;
 
     let mut values = BTreeMap::from([
         (Arm::KernelA, Vec::with_capacity(config.pairs)),
@@ -2231,6 +2336,12 @@ fn collect_samples(
         (Arm::FuseA, BTreeSet::new()),
         (Arm::FuseB, BTreeSet::new()),
     ]);
+    let mut observed_worker_cpus = BTreeMap::from([
+        (Arm::KernelA, BTreeSet::new()),
+        (Arm::KernelB, BTreeSet::new()),
+        (Arm::FuseA, BTreeSet::new()),
+        (Arm::FuseB, BTreeSet::new()),
+    ]);
     for round in 0..config.pairs {
         ensure!(
             !interrupted.load(Ordering::Relaxed),
@@ -2242,7 +2353,7 @@ fn collect_samples(
                 .get(&physical_arm)
                 .ok_or_else(|| anyhow!("missing workload root for {}", physical_arm.label()))?;
             let sequence = next_sequences[&physical_arm];
-            let observation = observe(root, config, sequence)?;
+            let observation = observe(root, config, sequence, pinning)?;
             *next_sequences
                 .get_mut(&physical_arm)
                 .expect("all arms initialized") += 1;
@@ -2258,6 +2369,10 @@ fn collect_samples(
                 .get_mut(&logical_arm)
                 .expect("all arms initialized")
                 .extend(observation.observed_worker_threads);
+            observed_worker_cpus
+                .get_mut(&logical_arm)
+                .expect("all arms initialized")
+                .extend(observation.observed_worker_cpus);
             if let Some(expected) = digests.insert(physical_arm, observation.digest) {
                 ensure!(
                     expected == observation.digest,
@@ -2282,6 +2397,7 @@ fn collect_samples(
         physical_values,
         digests,
         observed_worker_threads,
+        observed_worker_cpus,
     })
 }
 
@@ -2351,6 +2467,20 @@ fn worker_thread_observation_is_clear(
     [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB]
         .into_iter()
         .all(|arm| observed_by_arm.get(&arm) == Some(&expected))
+}
+
+/// Every arm's timed threads must have run on exactly the bound CPU set.
+///
+/// A thread that reported any other CPU means the single-CPU binding did not
+/// hold, which is the variance source the A/A nulls are sensitive to, so the
+/// run is not admissible.
+fn worker_cpu_pinning_is_clear(
+    observed_by_arm: &BTreeMap<Arm, BTreeSet<usize>>,
+    expected: &BTreeSet<usize>,
+) -> bool {
+    [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB]
+        .into_iter()
+        .all(|arm| observed_by_arm.get(&arm) == Some(expected))
 }
 
 fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f64>> {
@@ -3067,6 +3197,97 @@ fn pin_current_process(cpus: &[usize]) -> Result<()> {
     Ok(())
 }
 
+/// Reads the CPU the calling thread is currently executing on.
+///
+/// `/proc/thread-self/stat` reports `processor` as field 39. The `comm` field
+/// can contain spaces, so parsing starts after its closing parenthesis, where
+/// the next token is `state` (field 3).
+fn observed_running_cpu() -> Result<usize> {
+    let stat = fs::read_to_string("/proc/thread-self/stat")
+        .context("read /proc/thread-self/stat for the running CPU")?;
+    let after_comm = stat
+        .rsplit_once(')')
+        .ok_or_else(|| anyhow!("/proc/thread-self/stat has no comm terminator"))?
+        .1;
+    after_comm
+        .split_whitespace()
+        .nth(36)
+        .ok_or_else(|| anyhow!("/proc/thread-self/stat has no processor field"))?
+        .parse::<usize>()
+        .context("parse the running CPU from /proc/thread-self/stat")
+}
+
+/// One fixed CPU per timed thread.
+///
+/// `pin_current_process` only constrains the *process* to the placement's CPU
+/// set. That leaves the kernel free to place, and then migrate, each freshly
+/// spawned worker anywhere inside that set on every timed batch, so per-round
+/// L1/L2/LLC residency and SMT pairing vary. The variation is independent
+/// between the two same-type physical arms, so it does not cancel in the A/A
+/// crossover difference the way host-wide common-mode noise does, and it was
+/// what pushed the warm-cache A/A nulls past the admission gate. Binding worker
+/// `w` to one fixed CPU removes that degree of freedom, and it is applied
+/// identically in all four arms so it cannot bias the competitive ratio.
+#[derive(Clone, Debug)]
+struct WorkerPinning {
+    cpus: Vec<usize>,
+}
+
+impl WorkerPinning {
+    fn new(cpus: Vec<usize>) -> Result<Self> {
+        ensure!(
+            !cpus.is_empty(),
+            "timed-worker pinning requires at least one placement CPU"
+        );
+        Ok(Self { cpus })
+    }
+
+    fn cpu_for(&self, worker: usize) -> usize {
+        self.cpus[worker % self.cpus.len()]
+    }
+
+    /// The CPU set every timed thread of one batch is expected to report.
+    fn expected_cpus(&self, client_threads: usize) -> BTreeSet<usize> {
+        (0..client_threads).map(|w| self.cpu_for(w)).collect()
+    }
+
+    /// Binds the benchmark driver thread itself.
+    ///
+    /// The driver thread is not just a spawner: it enumerates directories, joins
+    /// the workers, and — for the parallel metadata workload — performs every
+    /// worker directory's `fsync` inside the timed region. On ext4 `data=ordered`
+    /// each of those forces a journal commit, so that serial tail is a large
+    /// fraction of the batch. Leaving it free to migrate across the placement set
+    /// reintroduced exactly the per-round variance the worker binding removes,
+    /// and it was what kept the parallel-metadata A/A null above the gate after
+    /// the workers were bound.
+    fn bind_driver_thread(&self) -> Result<usize> {
+        self.bind_current_thread(0)
+    }
+
+    /// Binds the calling thread to exactly one CPU and returns the CPU it is
+    /// running on afterwards, so the binding is proven rather than assumed.
+    fn bind_current_thread(&self, worker: usize) -> Result<usize> {
+        let cpu = self.cpu_for(worker);
+        let mut set = CpuSet::new();
+        set.set(cpu)
+            .with_context(|| format!("build single-CPU affinity mask for cpu{cpu}"))?;
+        sched_setaffinity(Pid::from_raw(0), &set)
+            .with_context(|| format!("bind timed worker {worker} to cpu{cpu}"))?;
+        // Parallel workers are spawned inside the timed region, so the
+        // confirmation runs there too. `sched_getcpu` is vDSO-backed and costs
+        // tens of nanoseconds; parsing `/proc/thread-self/stat` here would add
+        // back a variable fixed cost of exactly the kind this pinning removes.
+        let observed = sched_getcpu()
+            .with_context(|| format!("read running CPU for timed worker {worker}"))?;
+        ensure!(
+            observed == cpu,
+            "timed worker {worker} was bound to cpu{cpu} but is running on cpu{observed}"
+        );
+        Ok(observed)
+    }
+}
+
 fn free_bytes_on_data() -> Result<u64> {
     let output = Command::new("df")
         .args(["--output=avail", "-B1", "/data"])
@@ -3273,7 +3494,8 @@ fn fs_report(
         );
     }
 
-    let samples = collect_samples(&roots, config, interrupted)?;
+    let pinning = WorkerPinning::new(placement.driver_cpus.clone())?;
+    let samples = collect_samples(&roots, config, &pinning, interrupted)?;
     let kernel_null = bootstrap_median_ci(
         &crossover_log_ratios(
             &samples.values[&Arm::KernelA],
@@ -3295,6 +3517,9 @@ fn fs_report(
         &samples.observed_worker_threads,
         config.client_threads(),
     );
+    let expected_worker_cpus = pinning.expected_cpus(config.client_threads());
+    let worker_cpu_pinning_clear =
+        worker_cpu_pinning_is_clear(&samples.observed_worker_cpus, &expected_worker_cpus);
     let actual_observed_worker_threads =
         worker_thread_observation_clear.then_some(config.client_threads());
     let job_statement = config
@@ -3309,13 +3534,16 @@ fn fs_report(
     let semantic_work_contract = config
         .workload
         .semantic_work_contract(config.operations, config.client_threads());
-    let admitted = kernel_clear && fuse_clear && worker_thread_observation_clear;
+    let admitted =
+        kernel_clear && fuse_clear && worker_thread_observation_clear && worker_cpu_pinning_clear;
     let twice_null_log_margin = 2.0 * null_log_margin(kernel_null, fuse_null);
     let twice_null_ratio = twice_null_log_margin.exp();
     let directional_claim_clear =
         admitted && clears_twice_null_margin(fuse_over_kernel, kernel_null, fuse_null);
     let verdict = if !worker_thread_observation_clear {
         "BLOCKED_THREAD_OBSERVATION"
+    } else if !worker_cpu_pinning_clear {
+        "BLOCKED_WORKER_CPU_PINNING"
     } else if !kernel_clear || !fuse_clear {
         "BLOCKED_NULL"
     } else if !directional_claim_clear {
@@ -3441,6 +3669,15 @@ fn fs_report(
             config.workload.worker_thread_observation_method(),
             worker_thread_observation_clear,
         );
+        println!(
+            "mounted_kernel_worker_cpu_pinning,filesystem={},workload={},assignment_arm={},bound_cpus={},runtime_observed_cpus={},binding=one_fixed_cpu_per_timed_thread,method=sched_setaffinity_then_sched_getcpu,serial_arm_extra_check=proc_thread_self_stat_no_migration,clear={}",
+            kind.label(),
+            config.workload.label(),
+            arm.label(),
+            format_cpu_list(expected_worker_cpus.iter().copied()),
+            format_cpu_list(samples.observed_worker_cpus[&arm].iter().copied()),
+            worker_cpu_pinning_clear,
+        );
     }
     if config.workload == Workload::ParallelMetadataWrite {
         let operations_per_worker_min = config.operations / config.client_threads();
@@ -3534,6 +3771,11 @@ fn fs_report(
         .collect::<serde_json::Map<_, _>>();
     let observed_worker_threads_by_arm = samples
         .observed_worker_threads
+        .iter()
+        .map(|(arm, values)| (arm.label().to_owned(), json!(values)))
+        .collect::<serde_json::Map<_, _>>();
+    let observed_worker_cpus_by_arm = samples
+        .observed_worker_cpus
         .iter()
         .map(|(arm, values)| (arm.label().to_owned(), json!(values)))
         .collect::<serde_json::Map<_, _>>();
@@ -3728,6 +3970,10 @@ fn fs_report(
         "requested_client_threads": config.client_threads(),
         "actual_observed_worker_threads": actual_observed_worker_threads,
         "observed_worker_threads_by_arm": observed_worker_threads_by_arm,
+        "timed_worker_cpu_binding": "one_fixed_cpu_per_timed_thread",
+        "timed_worker_bound_cpus": expected_worker_cpus,
+        "observed_worker_cpus_by_arm": observed_worker_cpus_by_arm,
+        "worker_cpu_pinning_clear": worker_cpu_pinning_clear,
         "worker_thread_observation_method": config.workload.worker_thread_observation_method(),
         "worker_thread_observation_clear": worker_thread_observation_clear,
         "engine_sha256": {
@@ -3843,6 +4089,15 @@ fn run() -> Result<Option<PathBuf>> {
         "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,verdict=pass",
         ffs_binary_identity.binary_sha256, ffs_binary_identity.pgo_profile_sha256
     );
+    // Both ELFs are cross-built on an rch worker and copied here, so the
+    // executing host and the building host are different machines by design.
+    println!(
+        "binary_provenance,driver_elf_sha256={harness_sha},driver_built_on={},candidate_elf_sha256={},candidate_built_on={},executed_on={},retrieval=scp_from_rch_worker",
+        config.harness_builder,
+        ffs_binary_identity.binary_sha256,
+        config.candidate_builder,
+        host.hostname,
+    );
     println!(
         "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx={},compile_avx2={},compile_f16c={},compile_fma={},compile_avx512f={},compile_avx512bw={},runtime_sse2={},runtime_sse4_2={},runtime_avx={},runtime_avx2={},runtime_f16c={},runtime_fma={},runtime_avx512f={},runtime_avx512bw={}",
         env::consts::ARCH,
@@ -3909,6 +4164,13 @@ fn run() -> Result<Option<PathBuf>> {
         config.host_quiet_timeout_ms,
     )?;
     pin_current_process(&placement.driver_cpus)?;
+    let driver_pinning = WorkerPinning::new(placement.driver_cpus.clone())?;
+    let driver_thread_cpu = driver_pinning.bind_driver_thread()?;
+    println!(
+        "mounted_kernel_driver_thread_binding,requested_client_threads={},placement_cpus={},driver_thread_cpu={driver_thread_cpu},binding=one_fixed_cpu,reason=the_timed_region_includes_driver_thread_directory_fsyncs,verdict=bound",
+        config.client_threads(),
+        format_cpu_list(placement.driver_cpus.iter().copied()),
+    );
     println!(
         "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},host_quiet_required_consecutive_samples={},initial_host_quiet_samples_observed={},initial_host_quiet_wait_ms={},host_quiet_timeout_ms={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
         config.workload.label(),
@@ -3976,13 +4238,35 @@ fn run() -> Result<Option<PathBuf>> {
     }
 
     let free_after = free_bytes_on_data()?;
-    let report = json!({
+    // Built as two objects and merged: one `json!` literal carrying every
+    // top-level key exceeds the macro's recursion limit.
+    let timed_thread_binding_json = json!({
+        "driver_thread_cpu": driver_thread_cpu,
+        "driver_thread_binding": "one_fixed_cpu_for_the_whole_run",
+        "reason": "the timed region includes driver-thread directory fsyncs, so the driver thread is bound like every worker",
+    });
+    let binary_provenance_json = json!({
+        "driver_elf_sha256": harness_sha,
+        "driver_built_on": config.harness_builder,
+        "candidate_elf_sha256": ffs_binary_identity.binary_sha256,
+        "candidate_built_on": config.candidate_builder,
+        "executed_on": host.hostname,
+        "retrieval": "scp_from_rch_worker",
+        "note": "rch exec has no artifact-retrieval mechanism; both ELFs are built on a remote worker and copied to the executing host",
+    });
+    let Value::Object(identity_section) = json!({
         "schema_version": 5,
         "harness": "ffs-mounted-kernel-bench",
         "harness_binary_sha256": harness_sha,
         "ffs_cli": fs::canonicalize(&config.ffs_cli)?,
         "ffs_binary_sha256": ffs_binary_identity.binary_sha256,
         "ffs_pgo_profile_sha256": ffs_binary_identity.pgo_profile_sha256,
+        "timed_thread_binding": timed_thread_binding_json,
+        "binary_provenance": binary_provenance_json,
+    }) else {
+        unreachable!("JSON object literal must construct an object");
+    };
+    let report = json!({
         "kernel_release": fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),
         "artifact_root": run_dir,
         "mount_root": mount_run_dir,
@@ -4087,6 +4371,14 @@ fn run() -> Result<Option<PathBuf>> {
         },
         "filesystems": filesystem_reports,
     });
+    // Merge the identity section in; one `json!` literal carrying every
+    // top-level key exceeds the macro's recursion limit.
+    let Value::Object(report_map) = report else {
+        unreachable!("JSON object literal must construct an object");
+    };
+    let mut merged = identity_section;
+    merged.extend(report_map);
+    let report = Value::Object(merged);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create report parent {}", parent.display()))?;
@@ -4226,6 +4518,72 @@ mod tests {
     }
 
     #[test]
+    fn both_builder_identities_are_mandatory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let base = Config {
+            ffs_cli: cli,
+            harness_builder: "hz1".to_owned(),
+            candidate_builder: "hz2".to_owned(),
+            ..Config::default()
+        };
+        validate_config(&base).expect("both builders recorded");
+
+        let mut missing_driver = base.clone();
+        missing_driver.harness_builder = String::new();
+        assert!(validate_config(&missing_driver).is_err());
+
+        // Whitespace is not a recorded origin either.
+        let mut blank_candidate = base;
+        blank_candidate.candidate_builder = "   ".to_owned();
+        assert!(validate_config(&blank_candidate).is_err());
+    }
+
+    #[test]
+    fn worker_pinning_assigns_one_distinct_cpu_per_worker() {
+        let pinning = WorkerPinning::new(vec![4, 5, 6, 7]).expect("non-empty placement");
+        assert_eq!(pinning.cpu_for(0), 4);
+        assert_eq!(pinning.cpu_for(3), 7);
+        // Every worker of an eight-thread workload on four CPUs still resolves
+        // to a fixed CPU, so no worker is left free to migrate.
+        assert_eq!(pinning.cpu_for(4), 4);
+        assert_eq!(
+            pinning.expected_cpus(4),
+            BTreeSet::from([4, 5, 6, 7]),
+            "one worker per placement CPU"
+        );
+        assert_eq!(pinning.expected_cpus(2), BTreeSet::from([4, 5]));
+        assert!(WorkerPinning::new(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn worker_cpu_pinning_gate_requires_every_arm_on_the_bound_cpus() {
+        let expected = BTreeSet::from([4, 5, 6, 7]);
+        let clear = BTreeMap::from([
+            (Arm::KernelA, expected.clone()),
+            (Arm::KernelB, expected.clone()),
+            (Arm::FuseA, expected.clone()),
+            (Arm::FuseB, expected.clone()),
+        ]);
+        assert!(worker_cpu_pinning_is_clear(&clear, &expected));
+
+        // A thread that escaped its binding onto an unbound CPU blocks the run.
+        let mut escaped = clear.clone();
+        escaped.insert(Arm::FuseB, BTreeSet::from([4, 5, 6, 7, 12]));
+        assert!(!worker_cpu_pinning_is_clear(&escaped, &expected));
+
+        // So does an arm that never covered the full bound set.
+        let mut partial = clear.clone();
+        partial.insert(Arm::KernelA, BTreeSet::from([4, 5]));
+        assert!(!worker_cpu_pinning_is_clear(&partial, &expected));
+
+        let mut missing = clear;
+        missing.remove(&Arm::KernelB);
+        assert!(!worker_cpu_pinning_is_clear(&missing, &expected));
+    }
+
+    #[test]
     fn only_metadata_scaling_uses_configured_client_threads() {
         assert_eq!(Workload::ParallelMetadataWrite.client_threads(96), 96);
         assert_eq!(
@@ -4289,8 +4647,21 @@ mod tests {
         assert!(!worker_thread_observation_is_clear(&observed, 8));
     }
 
+    /// A pinning drawn from the CPUs this test process may actually use, so the
+    /// batch helpers exercise the real `sched_setaffinity` path anywhere.
+    fn test_pinning(threads: usize) -> WorkerPinning {
+        let cpus = self_allowed_cpus()
+            .expect("read this process's allowed CPUs")
+            .into_iter()
+            .take(threads)
+            .collect::<Vec<_>>();
+        WorkerPinning::new(cpus).expect("at least one allowed CPU")
+    }
+
     #[test]
-    fn fixed_parallel_workloads_report_eight_worker_tids() {
+    fn fixed_parallel_workloads_report_eight_worker_tids_on_their_bound_cpus() {
+        let pinning = test_pinning(DEFAULT_PARALLEL_THREADS);
+        let expected_cpus = pinning.expected_cpus(DEFAULT_PARALLEL_THREADS);
         let temp = tempfile::tempdir().expect("tempdir");
         let parallel_read = temp.path().join("parallel-read");
         fs::create_dir(&parallel_read).expect("parallel read directory");
@@ -4302,12 +4673,10 @@ mod tests {
             )
             .expect("parallel read fixture");
         }
-        assert_eq!(
-            parallel_read_batch(temp.path(), DEFAULT_PARALLEL_THREADS)
-                .expect("parallel read batch")
-                .observed_worker_threads,
-            Some(DEFAULT_PARALLEL_THREADS)
-        );
+        let read = parallel_read_batch(temp.path(), DEFAULT_PARALLEL_THREADS, &pinning)
+            .expect("parallel read batch");
+        assert_eq!(read.observed_worker_threads, Some(DEFAULT_PARALLEL_THREADS));
+        assert_eq!(read.observed_worker_cpus, expected_cpus);
 
         let large_directory = temp.path().join("large-directory");
         fs::create_dir(&large_directory).expect("large directory");
@@ -4315,12 +4684,13 @@ mod tests {
             File::create(large_directory.join(format!("entry-{index:08}")))
                 .expect("large-directory fixture entry");
         }
+        let readdir = readdir_stat_batch(temp.path(), DEFAULT_PARALLEL_THREADS, &pinning)
+            .expect("readdir+stat batch");
         assert_eq!(
-            readdir_stat_batch(temp.path(), DEFAULT_PARALLEL_THREADS)
-                .expect("readdir+stat batch")
-                .observed_worker_threads,
+            readdir.observed_worker_threads,
             Some(DEFAULT_PARALLEL_THREADS)
         );
+        assert_eq!(readdir.observed_worker_cpus, expected_cpus);
     }
 
     #[test]
@@ -4331,9 +4701,11 @@ mod tests {
         for worker in 0..2 {
             fs::create_dir(parent.join(format!("worker-{worker}"))).expect("worker directory");
         }
-        let batch =
-            parallel_metadata_write_batch(temp.path(), 9, 7, 2).expect("create metadata batch");
+        let pinning = test_pinning(2);
+        let batch = parallel_metadata_write_batch(temp.path(), 9, 7, 2, &pinning)
+            .expect("create metadata batch");
         assert_eq!(batch.observed_worker_threads, Some(2));
+        assert_eq!(batch.observed_worker_cpus, pinning.expected_cpus(2));
         assert_eq!(
             fs::read_dir(parent.join("worker-0"))
                 .expect("read first worker directory")
@@ -4447,6 +4819,7 @@ mod tests {
             physical_values: BTreeMap::new(),
             digests: BTreeMap::new(),
             observed_worker_threads: BTreeMap::new(),
+            observed_worker_cpus: BTreeMap::new(),
         };
         let ratios = competitive_log_ratios(&samples).expect("competitive ratios");
         assert!(ratios.iter().all(|ratio| (ratio.exp() - 4.0).abs() < 1e-12));

@@ -13,6 +13,228 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Unpinned timed threads, not host noise, were breaking the mounted A/A nulls; 2 scored rows become 4 - 2026-07-30 (BlackThrush, vs-INCUMBENT instrument KEEP)
+
+This row banks an instrument fix and four re-measured direct-incumbent rows. **No
+gate was loosened**: `--maximum-null-ratio` stays `1.025`, both A/A CIs must still
+contain 1, and the doubled-null-log-margin clearance is unchanged.
+
+### Which nulls were failing, on which mount, and why
+
+Recovered from the preserved `raw_wall_ns` arrays in the 2026-07-27 reports, all
+of which ran `--pairs 32`, i.e. only **8 crossover blocks**:
+
+| Workload | Mount | Median batch | Per-block \|log ratio\| RMS | A/A null 95% CI | Spread | Vetoing clause |
+| --- | --- | --- | --- | --- | --- | --- |
+| Parallel read, 256 x 256 KiB | kernel | 3.47 ms | 5.41% | `0.966904x [0.933998, 1.008743]` | **`1.070666x`** | ratio threshold |
+| Parallel read, 256 x 256 KiB | FUSE | 4.14 ms | 1.54% | `0.991734x [0.969409, 1.036149]` | **`1.036149x`** | ratio threshold |
+| readdir+stat, 32,768 entries | kernel | 27.70 ms | 6.86% | `0.990140x [0.975169, 1.009721]` | **`1.025464x`** | ratio threshold, by 0.05% |
+| Create/delete storm, 2,000 files | kernel | 92.41 ms | 2.14% | `1.009041x [1.001744, 1.013361]` | `1.013361x` | **CI-straddle only** |
+
+Four failing nulls across three workloads, in two modes. Read and readdir failed
+the **ratio** threshold with medians near 1 — variance, not bias. The storm null
+did **not** fail the ratio threshold at all; it failed only because its interval
+excluded 1. See the gate audit below for that one.
+
+### Physical cause: the timed threads were never bound to a CPU
+
+`pin_current_process` tasksets the *process* to `placement.driver_cpus`, which for
+an 8-thread workload is an **8-CPU set**. The eight workers are freshly spawned
+inside every timed batch, so the kernel chose their placement and migrated them
+mid-batch, independently on every round. That variance is independent between the
+two same-type physical arms, so it does not cancel in the A/A crossover
+difference, while it partly cancels in the competitive ratio, which averages both
+arms of a type within a round. The nulls broke; the ratios did not.
+
+It predicts the per-workload pattern exactly:
+
+- `client_threads() == 1` for storm and fsync, so `select_driver_cpus` returned a
+  **single** CPU and taskset already bound them. Neither failed the ratio gate.
+- `client_threads() == 8` for read, readdir, and metadata. Read and readdir are
+  cache-bound, so placement noise dominates them. Metadata is dominated by eight
+  directory `fsync`s per batch, so the same noise is a small fraction of its batch.
+- The kernel readdir arm's block RMS is 6.86% at 27.70 ms while the FUSE arm's is
+  0.93% at 116.56 ms: ~1.9 ms versus ~1.08 ms in *absolute* terms. Roughly
+  constant absolute jitter is the signature of a fixed-cost, high-variance
+  component, not a proportional slowdown.
+
+### Ruled out, with reasons
+
+- **Mount-option asymmetry.** Structurally impossible as a cause of a *same-type*
+  null: both kernel arms take one identical option string from a single `match`
+  arm (`ffs_mounted_kernel_bench.rs:1386-1389`) and both FUSE arms come from one
+  `Command` builder. Option asymmetry can only move the competitive ratio.
+- **Ordering effects between arms in one invocation.** `BALANCED_ORDERS` plus
+  `physical_arm_for` form a four-round Latin square: over one block each physical
+  arm occupies each of the four execution slots exactly once, and the
+  logical-to-physical assignment alternates every round. Summed over a block,
+  fixed physical-arm bias, execution-slot effects, and any linear time drift each
+  cancel to exactly zero (slot sums `0-2+3-1+2-0+1-3 = 0`; global time-index sums
+  `30 = 30`).
+- **Page-cache state carried between arms.** 226 GB RAM with 175 GB already in
+  page cache and no eviction pressure; the reproduction below recorded `pgsteal`
+  of 0-8k pages across whole runs. The fix that worked does not touch cache state.
+- **Governor.** Real and recorded (`amd-pstate-epp` / `powersave` /
+  `balance_performance` on all 64 CPUs), but not the dominant term: the FUSE
+  readdir arm ran under the identical governor on the identical CPUs with 7.4x
+  lower block RMS, and pinning fixed the null without touching the governor. The
+  host is shared with other agents, so the governor was deliberately not changed.
+
+### Reproduction outside the harness
+
+A standalone C replica (8 pthreads, same stride partition, same min-of-3 reducer,
+same four-round crossover, same estimator) drove two byte-identical kernel-ext4
+loop mounts built by `mke2fs -d` from one fixture, with the process `taskset` to 8
+CPUs exactly as the harness does. The only variable was whether each worker binds
+itself to one CPU.
+
+| Case | Median arm | Per-block RMS | A/A null 95% CI | Spread | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| readdir 65,536, unpinned | 40.88 ms | 6.49% | `1.002494x [0.978920, 1.031857]` | `1.031857x` | FAIL |
+| readdir 65,536, **pinned** | 34.54 ms | 1.90% | `0.993848x [0.985174, 1.000269]` | `1.015049x` | **PASS** |
+| readdir 65,536, unpinned (replicate) | 61.77 ms | 7.41% | `0.994255x [0.950493, 1.024059]` | `1.052086x` | FAIL |
+| readdir 65,536, **pinned** (replicate) | 34.88 ms | 3.44% | `0.991733x [0.981778, 1.009910]` | `1.018560x` | **PASS** |
+| read 1024 x 256 KiB, unpinned | 13.00 ms | 4.12% | `0.987347x [0.972331, 1.011465]` | `1.028457x` | FAIL |
+| read 1024 x 256 KiB, **pinned** | 12.57 ms | 2.13% | `0.995949x [0.991406, 1.004359]` | `1.008668x` | **PASS** |
+| read 256 x 256 KiB, unpinned | 3.09 ms | 5.74% | `0.998884x [0.981284, 1.031521]` | `1.031521x` | FAIL |
+| read 256 x 256 KiB, **pinned** | 2.73 ms | 3.96% | `1.005352x [0.987117, 1.015670]` | `1.015670x` | **PASS** |
+
+Four unpinned FAILs and four pinned PASSes across three shapes. Pinned medians
+also reproduce across invocations (34.54 / 34.88 ms) where unpinned ones did not
+(40.88 / 61.77 ms), and pinning made the arms 12-18% faster because locality is
+preserved rather than rediscovered every batch.
+
+### Re-measured rows, one driver ELF, `--pairs 128` (32 crossover blocks)
+
+| Workload | Kernel A/A | FUSE A/A | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| readdir+stat, 8 threads, 32,768 entries | `1.000904x [0.996822, 1.008448]`, spread `1.008448x` | `0.998792x [0.997503, 1.000626]`, spread `1.002503x` | **`4.967448x [4.946319, 4.989285]` slower** | **HONEST LOSS** |
+| Small-file create/delete storm, 2,000 files | `0.996217x [0.985593, 1.007951]`, spread `1.014618x` | `0.995167x [0.988305, 1.004712]`, spread `1.011833x` | **`2.753659x [2.707500, 2.782302]` slower** | **HONEST LOSS** |
+| Multi-file parallel read, 8 threads, 256 x 256 KiB | `1.003293x [0.982553, 1.016450]`, spread `1.017757x` | `0.994130x [0.982397, 1.002347]`, spread `1.017918x` | **`1.287862x [1.269319, 1.307285]` slower** | **HONEST LOSS** |
+| Fsync/journal commit, 8 x 4 KiB | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `0.997098x [0.990808, 1.009108]` against a twice-null margin of `1.030661x` | **HONEST NEUTRAL** |
+| Parallel metadata writes, 8 threads, 512 creates | `0.999591x [.., ..]`, spread `1.052172x` (best of 4 runs) | spread `1.036214x` | Not admissible; blocked estimates `1.508913x`-`1.688491x` | **BLOCKED-NULL** |
+
+**The direct-incumbent score for these five ext4 surfaces is 0 wins / 3 losses /
+1 neutral / 1 unscored**, replacing the prior 1 win / 1 loss / 3 unscored.
+
+Two results are corrections against FrankenFS and must not be softened:
+
+- **readdir and read losses grew** once admissible: `4.212274x -> 4.967448x` and
+  `1.203230x -> 1.287862x`. Pinning made the *kernel* arm faster by preserving
+  locality, so a correct instrument makes the incumbent look better. The old
+  blocked estimates flattered us. readdir replicated across two driver ELFs and
+  two windows at `4.967448x` and `5.026341x`, within 1.2%.
+- **The fsync `1.005153x` win does not survive.** It re-measures `0.997098x
+  [0.990808, 1.009108]` and `directional_claim_clear=false`, because the effect
+  must clear a twice-null margin of `1.030661x`. It was a sub-null-margin effect
+  and is **withdrawn**, not restated.
+
+Storm moved the other way: `2.957531x -> 2.753659x`, a smaller loss than the
+blocked estimate.
+
+### Metadata: a second unpinned thread, and an irreducible fsync tail so far
+
+`parallel_metadata_write_batch` performs all eight worker-directory `fsync`s on
+the **driver thread**, inside the timed region. On ext4 `data=ordered` each forces
+a journal commit, so that serial tail is a large fraction of a ~26 ms batch, and
+the first fix bound only the workers. Storm does the same journal-commit work on a
+thread the serial path already bound, and its null passes at `1.014618x` - a clean
+contrast. The driver thread is now bound once at startup
+(`mounted_kernel_driver_thread_binding`, observed `driver_thread_cpu=25`), and
+each worker's bind is its first action so the inherited single-CPU mask window is
+one syscall.
+
+That change did not rescue the row. Across **four** independent runs the metadata
+null is blocked with spreads `1.077930x`, `1.057067x`, `1.090403x`, `1.052172x`
+and effects `1.688491x`, `1.659983x`, `1.613519x`, `1.508913x` - the effect
+reproduces within ~12% while the **verdict is stable**. Note that every blocked
+estimate is *below* the published `1.942477x`, so that row was itself overstated.
+
+The 2026-07-27 metadata null passed for a bad reason: its kernel arm's last
+quarter ran **2.64x** slower than its first (21.51 -> 56.80 ms), and only 8
+crossover blocks plus a robust median kept that instability out of the interval.
+
+### Inert-regime control proves a bad window, not a bad change
+
+The driver-thread pass ran while the host was contended (six distinct gate
+refusals including a core at 100% busy, and one window offering only 4 quiet
+client CPUs). Fsync and storm are 1-thread workloads whose driver thread the
+serial path **already** bound, so the new binding is provably inert for them -
+they are a free null control. Both degraded anyway, by **+9.16pp** and
+**+12.07pp** of A/A spread, which can only be host contention. Meanwhile metadata,
+the only workload the change targets, posted its best spread of four runs. The
+contended pass is therefore not a valid comparison window, and the quiet-window
+results above stand.
+
+Reusable lesson: **when a lever has a regime where it is provably inert, run that
+regime as a free null control on the real harness.**
+
+### Gate audit: the CI-straddle veto is present and cost exactly one row
+
+`fs_report` ANDs `BootstrapMedianCi::contains_null()` (`low <= 1.0 && high >=
+1.0`) with the ratio threshold, so the straddle veto **is** in this gate. Tested
+across 24 null evaluations in 12 runs rather than assumed:
+
+| Veto class | Count | Cases |
+| --- | --- | --- |
+| **straddle-only** | **1** | storm 2026-07-27 kernel |
+| ratio-threshold-only | 8 | read 07-27 (x2), readdir 07-27, metadata (x5) |
+| both | 1 | metadata fuse, third run |
+
+The single straddle-only veto is a textbook instance: null median `1.009041x`,
+spread `1.013361x` comfortably inside `1.025x`, CI `[1.001744, 1.013361]` missing
+`1.0` by **0.17%**, vetoing a `2.957531x` effect whose deviation is **108.4%**
+against a 2x-half-width margin of **2.7%** - the effect cleared the margin **40x**.
+Storm's verdict then moved across three runs (blocked, pass, pass) while its
+effect reproduced within ~9%: the defect signature.
+
+It does not explain this campaign's blocked rows. Read, readdir, and metadata all
+vetoed on the **ratio** threshold, 1 to 9 points over a 2.5% allowance, and
+metadata's verdict is stable at blocked 4/4 with a 2x-half-width of 10-17%. By the
+handoff's own stability criterion those are physical, so the harness was fixed
+rather than the gate. Under the corrected rule metadata would become decidable and
+would be a **LOSS** at `1.508913x`; no blocked row becomes a win, so the integrity
+check holds. The gate is therefore left unchanged in this row, and the straddle
+clause is flagged for a separate decision.
+
+### Provenance
+
+Driver ELF `75b400a965010294f60c88cb3a591fd013248c92456e2fe13f7e2d01a5b3369b`
+built on rch worker **hz1**; the driver-thread-bound follow-up ELF is
+`8c357460afc2edb061e4d17676f46435b0cb9b0102ec5597813843afafbb27aa`, also hz1.
+Candidate ELF `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`
+built on **vmi1167313**, self-reporting compile+runtime SSE4.2/AVX2/FMA
+(x86-64-v3) and PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc` - the same
+profile the 2026-07-27 rows used, so the re-measurement is comparable. `rch exec`
+has no artifact-retrieval mechanism, so both ELFs were built remotely and copied
+to `thinkstation1`; the harness now requires `--harness-builder` and
+`--candidate-builder` and records them in `binary_provenance`. Every admitted run
+reports `worker_cpu_pinning_clear=true` with the observed CPU set exactly equal to
+the bound set, 4-arm tree/content parity, and `post_unmount_validation="clean"`.
+Gate basis was the wall-time bootstrap median CI throughout; `cv_used=false` and
+`instructions_used=false`.
+
+One label caveat: the banked artifacts print
+`method=sched_setaffinity_then_proc_thread_self_stat`, but the value in
+`observed_worker_cpus` came from vDSO `sched_getcpu` in both paths, with
+`/proc/thread-self/stat` used only for the serial arms' no-migration assertion.
+The literal was stale, not the mechanism, and is corrected in source.
+
+Every admitted ratio and every A/A null above is a deterministic 20,000-resample same-invocation bootstrap median 95% CI over wall time, with CV never a gate.
+
+The executing driver hashed itself in process and printed `bench_evidence,binary_sha256=75b400a965010294f60c88cb3a591fd013248c92456e2fe13f7e2d01a5b3369b`; the driver-thread-bound follow-up printed `bench_evidence,binary_sha256=8c357460afc2edb061e4d17676f46435b0cb9b0102ec5597813843afafbb27aa`, and the candidate printed `bench_evidence,binary_sha256=f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`.
+
+**Retry predicate for parallel metadata writes:** do not retry on another merely
+fresh placement. First remove the driver-thread journal-commit tail from the timed
+region as a *measured* change - either have each worker `fsync` its own directory
+(which changes the durability shape and must be re-declared, not silently
+substituted), or instrument the tail's share of the batch and show it below 10% -
+then require both A/A spreads at most `1.025x` with intervals containing 1 over at
+least 32 crossover blocks, exact parity, and clean `e2fsck`. Never pool the blocked
+`1.509x`-`1.688x` estimates, and never restate `1.942477x`, which came from a run
+whose kernel arm drifted 2.64x within itself.
+
 ## SURVEY: gate-audit handoff finds CI-straddle veto; no gate change or new scoreable rerun - 2026-07-29 (PurpleSnow, audit incomplete)
 
 The fleet gate audit found a real mechanism in the mounted comparator:

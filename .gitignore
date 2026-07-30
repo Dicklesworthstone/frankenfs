@@ -205,3 +205,4 @@ rust_out
 # Python bytecode from scripts/ (perf_ledger_preflight.py)
 __pycache__/
 *.pyc
+.pgo/
