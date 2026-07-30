@@ -13,6 +13,56 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## SURVEY: gate-audit handoff finds CI-straddle veto; no gate change or new scoreable rerun - 2026-07-29 (PurpleSnow, audit incomplete)
+
+The fleet gate audit found a real mechanism in the mounted comparator:
+`BootstrapMedianCi`'s interval-straddle predicate requires the A/A confidence
+interval to include `1.0`, and `fs_report` ANDs that result with the existing
+`1.025x` symmetric-spread ceiling. FrankenFS therefore does contain the
+CI-straddle veto identified by the fleet directive. This turn did
+**not** change that gate: the required same-ELF, different-core/lower-load
+reproduction has not yet been completed, so there is no evidence yet that the
+verdict moves randomly while the competitive effect remains stable.
+
+The owned, already-pushed instrument work is commit `bd2824b9`: schema v5 adds
+a realistic job statement, an exact-work contract, a chooser statement scoped
+to the recorded workload and hardware, an explicit same-invocation incumbent
+isolation proof, and runtime ISA positives and negatives. The frozen
+continuation candidate remains ELF
+`93ed882e6e4771db82371c933af28d7a907a6efdcfb13f29357baf2b7befe7f6`
+with PGO profile
+`1410ff5d34f99faa10eeb2dbbcb08747a6acdccdb065a3e34b89396a43b40ab0`.
+The exact requested jobs remain:
+
+- 256 files x 256 KiB, eight read workers, 64 MiB total, min of three;
+- 2,000 creates, one parent-directory fsync, 2,000 deletes, and a second
+  parent-directory fsync, one worker;
+- 32,768 directory entries plus 32,768 metadata reads, eight workers, min of
+  three.
+
+A companion owns active uncommitted CPU-pinning changes in
+`.gitignore`, `crates/ffs-harness/Cargo.toml`, and
+`crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs`. Those changes produced
+useful diagnostic evidence that fixed worker-to-CPU binding can clear the read
+and readdir A/A controls, but the diagnostic runs used candidate
+`f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`
+with the older `6a22...` PGO profile, same-LLC placement, and retry-selected
+attempts. They are not current-candidate campaign evidence and none of their
+competitive ratios is banked here. The dirty paths were preserved and were
+not staged, overwritten, or committed by PurpleSnow.
+
+**Single next step after reset:** obtain an explicit handoff of the pinning
+paths, finish the per-artifact origin and timed-instrumentation work-count
+audit, then pre-register two complete quiet-host placements using one final
+driver ELF and the frozen `93ed...` candidate. Retain both placements without
+selection. Change the straddle clause only if the competitive effects reproduce
+within 2.5% while a different subset of A/A controls passes; otherwise leave
+the gate intact and fix the physical A/A instability. Every eventual score
+still requires the effect CI to exclude `1.0`, clearance beyond twice the
+larger A/A half-width, both A/A medians within 2% if the fleet-corrected rule is
+evidence-activated, exact worker counts, matched work, parity, clean offline
+checks, and wall-time median-CI gating with `cv_used=false`.
+
 ## Exact-work scaling preflight kept; Threadripper sweep stops on its first FUSE null - 2026-07-29 (PurpleSnow, instrument KEEP / measurement BLOCKED-NULL)
 
 This turn changed the mounted comparator, not FrankenFS. Before opening a
