@@ -161,6 +161,111 @@ impl Workload {
             }
         }
     }
+
+    fn job_statement(self, operations: usize, client_threads: usize) -> String {
+        match self {
+            Self::WarmStat => format!(
+                "one warm-cache metadata report job: issue {operations} stat calls for one \
+                 mounted file and aggregate the observed metadata"
+            ),
+            Self::ParallelMetadataWrite => format!(
+                "one parallel namespace job: {client_threads} workers create exactly \
+                 {operations} empty files across private directories and fsync every worker \
+                 directory"
+            ),
+            Self::ParallelRead8 => format!(
+                "one warm-cache multi-file read job: enumerate and byte-sort {operations} \
+                 separate {PARALLEL_READ_FILE_BYTES}-byte files, then {client_threads} workers \
+                 open and pread every file exactly once ({} total bytes) and aggregate a \
+                 content digest",
+                operations.saturating_mul(PARALLEL_READ_FILE_BYTES)
+            ),
+            Self::CreateDeleteStorm => format!(
+                "one small-file namespace transaction job: serially create {operations} empty \
+                 files, fsync the parent directory, delete all {operations} files, and fsync \
+                 the parent directory again"
+            ),
+            Self::ReaddirStat8 => format!(
+                "one warm-cache large-directory report job: enumerate {operations} zero-byte \
+                 entries, then {client_threads} workers read metadata for every entry exactly \
+                 once and aggregate a metadata digest"
+            ),
+            Self::FsyncJournalCommit => format!(
+                "one durability job: perform {operations} 4096-byte positioned writes to one \
+                 mounted file and fsync after every write"
+            ),
+        }
+    }
+
+    fn chooser_statement(
+        self,
+        filesystem: FilesystemKind,
+        operations: usize,
+        requested_threads: usize,
+        observed_threads: Option<usize>,
+    ) -> String {
+        let observed = observed_threads
+            .map_or_else(|| "not admitted".to_owned(), |threads| threads.to_string());
+        format!(
+            "For operators choosing between FrankenFS FUSE and Linux kernel {} for \
+             workload={} on the recorded host, ISA, frequency policy, mount options, and \
+             warm-cache regime: this result applies only to operations={operations}, \
+             requested_worker_threads={requested_threads}, \
+             observed_worker_threads={observed}, and durability={}; do not generalize it to \
+             other filesystem, working-set, cache, thread, durability, mount, or hardware \
+             shapes.",
+            filesystem.label(),
+            self.label(),
+            self.durability()
+        )
+    }
+
+    fn semantic_work_contract(self, operations: usize, client_threads: usize) -> Value {
+        let common = json!({
+            "operations_parameter": operations,
+            "requested_worker_threads": client_threads,
+            "same_driver_implementation_for_all_four_arms": true,
+            "exact_work_required_for_admission": true,
+        });
+        let detail = match self {
+            Self::WarmStat => json!({
+                "stat_calls": operations,
+                "input_files": 1,
+            }),
+            Self::ParallelMetadataWrite => json!({
+                "files_created": operations,
+                "worker_directories_fsynced": client_threads,
+                "deterministic_remainder_partition": true,
+            }),
+            Self::ParallelRead8 => json!({
+                "files_enumerated": operations,
+                "files_opened": operations,
+                "positioned_reads": operations,
+                "bytes_per_file": PARALLEL_READ_FILE_BYTES,
+                "total_bytes_read": operations.saturating_mul(PARALLEL_READ_FILE_BYTES),
+            }),
+            Self::CreateDeleteStorm => json!({
+                "empty_files_created": operations,
+                "empty_files_deleted": operations,
+                "parent_directory_fsyncs": 2,
+            }),
+            Self::ReaddirStat8 => json!({
+                "directory_entries_enumerated": operations,
+                "metadata_reads": operations,
+                "fixture_entry_bytes": 0,
+            }),
+            Self::FsyncJournalCommit => json!({
+                "positioned_writes": operations,
+                "bytes_per_write": 4096,
+                "file_fsyncs": operations,
+                "total_bytes_written": operations.saturating_mul(4096),
+            }),
+        };
+        json!({
+            "common": common,
+            "workload_specific": detail,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -2634,9 +2739,12 @@ fn host_provenance() -> Result<HostProvenance> {
     let runtime_features = [
         ("sse2", std::is_x86_feature_detected!("sse2")),
         ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
+        ("avx", std::is_x86_feature_detected!("avx")),
         ("avx2", std::is_x86_feature_detected!("avx2")),
+        ("f16c", std::is_x86_feature_detected!("f16c")),
         ("fma", std::is_x86_feature_detected!("fma")),
         ("avx512f", std::is_x86_feature_detected!("avx512f")),
+        ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
     ]
     .into_iter()
     .filter_map(|(name, detected)| detected.then_some(name))
@@ -3189,6 +3297,18 @@ fn fs_report(
     );
     let actual_observed_worker_threads =
         worker_thread_observation_clear.then_some(config.client_threads());
+    let job_statement = config
+        .workload
+        .job_statement(config.operations, config.client_threads());
+    let chooser_statement = config.workload.chooser_statement(
+        kind,
+        config.operations,
+        config.client_threads(),
+        actual_observed_worker_threads,
+    );
+    let semantic_work_contract = config
+        .workload
+        .semantic_work_contract(config.operations, config.client_threads());
     let admitted = kernel_clear && fuse_clear && worker_thread_observation_clear;
     let twice_null_log_margin = 2.0 * null_log_margin(kernel_null, fuse_null);
     let twice_null_ratio = twice_null_log_margin.exp();
@@ -3271,6 +3391,24 @@ fn fs_report(
             "ro"
         },
         config.workload.durability(),
+    );
+    println!(
+        "mounted_kernel_job,filesystem={},workload={},operations={},requested_client_threads={},statement={job_statement:?}",
+        kind.label(),
+        config.workload.label(),
+        config.operations,
+        config.client_threads(),
+    );
+    println!(
+        "mounted_kernel_incumbent_isolation,filesystem={},candidate=FrankenFS_FUSE,incumbent=Linux_kernel_{},same_invocation=true,independent_physical_arms=true,runtime_isa={},verdict=pass",
+        kind.label(),
+        kind.label(),
+        runtime_isa_label(host),
+    );
+    println!(
+        "mounted_kernel_chooser,filesystem={},workload={},statement={chooser_statement:?}",
+        kind.label(),
+        config.workload.label(),
     );
     println!(
         "mounted_kernel_parity,filesystem={},workload={},arms=4,file_sha256={},len={},mode={:o},uid={},gid={},nlink={},tree_sha256={},tree_entries={},tree_files={},tree_dirs={},tree_bytes={},verdict=pass",
@@ -3457,6 +3595,48 @@ fn fs_report(
         "artifact_sha256": kernel_identity.artifact_sha256,
         "runtime_notes_sha256": kernel_identity.runtime_notes_sha256,
     });
+    let incumbent_isolation_proof_json = json!({
+        "verdict": "pass",
+        "candidate": {
+            "name": "FrankenFS FUSE",
+            "boundary": "Linux VFS through two independent FrankenFS FUSE mounts",
+            "physical_arms": ["fuse_a", "fuse_b"],
+            "executing_elf_sha256": expected_identity.binary_sha256,
+        },
+        "incumbent": {
+            "name": format!("Linux kernel {}", kind.label()),
+            "boundary": format!(
+                "Linux VFS through two independent in-kernel {} mounts",
+                kind.label()
+            ),
+            "physical_arms": ["kernel_a", "kernel_b"],
+            "release": kernel_identity.release,
+            "module": kind.kernel_module(),
+            "artifact": kernel_identity.artifact,
+            "artifact_sha256": kernel_identity.artifact_sha256,
+            "runtime_notes_sha256": kernel_identity.runtime_notes_sha256,
+        },
+        "same_invocation": true,
+        "same_harness_process": true,
+        "same_host": host.hostname,
+        "same_fixture_bytes": true,
+        "matched_mount_options": if config.workload.is_mutating() {
+            "rw+noatime+nodev+nosuid"
+        } else {
+            "ro+noatime+nodev+nosuid"
+        },
+        "runtime_detected_isa": runtime_isa_label(host),
+        "runtime_features": {
+            "sse2": host.runtime_features.contains("sse2"),
+            "sse4_2": host.runtime_features.contains("sse4.2"),
+            "avx": host.runtime_features.contains("avx"),
+            "avx2": host.runtime_features.contains("avx2"),
+            "f16c": host.runtime_features.contains("f16c"),
+            "fma": host.runtime_features.contains("fma"),
+            "avx512f": host.runtime_features.contains("avx512f"),
+            "avx512bw": host.runtime_features.contains("avx512bw"),
+        },
+    });
     let parity_json = json!({
         "verdict": "pass",
         "file_sha256": expected_parity.file_sha256,
@@ -3530,6 +3710,10 @@ fn fs_report(
     let Value::Object(mut report) = json!({
         "filesystem": kind.label(),
         "workload": config.workload.label(),
+        "job_statement": job_statement,
+        "semantic_work_contract": semantic_work_contract,
+        "chooser_statement": chooser_statement,
+        "incumbent_isolation_proof": incumbent_isolation_proof_json,
         "host_identity": host.hostname,
         "physical_cores": host.physical_cores,
         "logical_threads": host.online_cpus.len(),
@@ -3537,6 +3721,10 @@ fn fs_report(
         "numa_nodes": host.numa_nodes,
         "runtime_detected_isa": runtime_isa_label(host),
         "cpu_frequency_policy": cpu_frequency_policy_json,
+    }) else {
+        unreachable!("JSON object literal must construct an object");
+    };
+    let Value::Object(execution_shape) = json!({
         "requested_client_threads": config.client_threads(),
         "actual_observed_worker_threads": actual_observed_worker_threads,
         "observed_worker_threads_by_arm": observed_worker_threads_by_arm,
@@ -3555,6 +3743,11 @@ fn fs_report(
         "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
         "host_quiet_required_consecutive_samples": config.host_quiet_samples,
         "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
+    }) else {
+        unreachable!("JSON object literal must construct an object");
+    };
+    report.extend(execution_shape);
+    let Value::Object(methodology) = json!({
         "operations_per_observation": config.operations,
         "pairs": config.pairs,
         "crossover_blocks": config.pairs / ESTIMATOR_BLOCK_ROUNDS,
@@ -3585,6 +3778,7 @@ fn fs_report(
     }) else {
         unreachable!("JSON object literal must construct an object");
     };
+    report.extend(methodology);
     let Value::Object(measurement_evidence) = json!({
         "kernel_engine_identity": kernel_engine_identity_json,
         "parity": parity_json,
@@ -3650,17 +3844,24 @@ fn run() -> Result<Option<PathBuf>> {
         ffs_binary_identity.binary_sha256, ffs_binary_identity.pgo_profile_sha256
     );
     println!(
-        "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse2={},runtime_sse4_2={},runtime_avx2={},runtime_fma={},runtime_avx512f={}",
+        "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx={},compile_avx2={},compile_f16c={},compile_fma={},compile_avx512f={},compile_avx512bw={},runtime_sse2={},runtime_sse4_2={},runtime_avx={},runtime_avx2={},runtime_f16c={},runtime_fma={},runtime_avx512f={},runtime_avx512bw={}",
         env::consts::ARCH,
         cfg!(target_feature = "sse2"),
         cfg!(target_feature = "sse4.2"),
+        cfg!(target_feature = "avx"),
         cfg!(target_feature = "avx2"),
+        cfg!(target_feature = "f16c"),
         cfg!(target_feature = "fma"),
+        cfg!(target_feature = "avx512f"),
+        cfg!(target_feature = "avx512bw"),
         host.runtime_features.contains("sse2"),
         host.runtime_features.contains("sse4.2"),
+        host.runtime_features.contains("avx"),
         host.runtime_features.contains("avx2"),
+        host.runtime_features.contains("f16c"),
         host.runtime_features.contains("fma"),
         host.runtime_features.contains("avx512f"),
+        host.runtime_features.contains("avx512bw"),
     );
     println!(
         "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},cpu_busy_sample_interval_ms={},host_quiet_required_consecutive_samples={},host_quiet_timeout_ms={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
@@ -3776,7 +3977,7 @@ fn run() -> Result<Option<PathBuf>> {
 
     let free_after = free_bytes_on_data()?;
     let report = json!({
-        "schema_version": 4,
+        "schema_version": 5,
         "harness": "ffs-mounted-kernel-bench",
         "harness_binary_sha256": harness_sha,
         "ffs_cli": fs::canonicalize(&config.ffs_cli)?,
@@ -3802,9 +4003,12 @@ fn run() -> Result<Option<PathBuf>> {
             "runtime_features": {
                 "sse2": host.runtime_features.contains("sse2"),
                 "sse4_2": host.runtime_features.contains("sse4.2"),
+                "avx": host.runtime_features.contains("avx"),
                 "avx2": host.runtime_features.contains("avx2"),
+                "f16c": host.runtime_features.contains("f16c"),
                 "fma": host.runtime_features.contains("fma"),
                 "avx512f": host.runtime_features.contains("avx512f"),
+                "avx512bw": host.runtime_features.contains("avx512bw"),
             },
             "cpu_frequency_policy": cpu_frequency_policy_json(&host.cpu_frequency_policy),
             "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
@@ -4029,6 +4233,43 @@ mod tests {
             DEFAULT_PARALLEL_THREADS
         );
         assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
+    }
+
+    #[test]
+    fn realistic_job_and_chooser_statements_bound_claim_shape() {
+        let read = Workload::ParallelRead8.job_statement(1024, 8);
+        assert!(read.contains("1024 separate 262144-byte files"));
+        assert!(read.contains("268435456 total bytes"));
+        assert!(read.contains("8 workers"));
+
+        let storm = Workload::CreateDeleteStorm.job_statement(2000, 1);
+        assert!(storm.contains("create 2000 empty files"));
+        assert!(storm.contains("delete all 2000 files"));
+        assert!(storm.contains("fsync the parent directory again"));
+
+        let readdir = Workload::ReaddirStat8.job_statement(65_536, 8);
+        assert!(readdir.contains("enumerate 65536 zero-byte entries"));
+        assert!(readdir.contains("8 workers"));
+        assert!(readdir.contains("every entry exactly once"));
+
+        let chooser =
+            Workload::ParallelRead8.chooser_statement(FilesystemKind::Ext4, 1024, 8, Some(8));
+        assert!(
+            chooser
+                .starts_with("For operators choosing between FrankenFS FUSE and Linux kernel ext4")
+        );
+        assert!(chooser.contains("operations=1024"));
+        assert!(chooser.contains("requested_worker_threads=8"));
+        assert!(chooser.contains("observed_worker_threads=8"));
+        assert!(chooser.contains("do not generalize"));
+
+        let work = Workload::ParallelRead8.semantic_work_contract(1024, 8);
+        assert_eq!(work["workload_specific"]["positioned_reads"], 1024);
+        assert_eq!(work["workload_specific"]["total_bytes_read"], 268_435_456);
+        assert_eq!(
+            work["common"]["same_driver_implementation_for_all_four_arms"],
+            true
+        );
     }
 
     #[test]
