@@ -35,6 +35,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOOTSTRAP_RESAMPLES: usize = 20_000;
+const MAXIMUM_NULL_MEDIAN_DEVIATION: f64 = 0.02;
 const MIN_FREE_BYTES: u64 = 120 * 1024 * 1024 * 1024;
 const MAX_IMAGE_MIB: u64 = 2048;
 const PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -374,9 +375,19 @@ impl BootstrapMedianCi {
         self.high.max(1.0 / self.low)
     }
 
+    fn median_within_null_bias_limit(self) -> bool {
+        ((1.0 - MAXIMUM_NULL_MEDIAN_DEVIATION)..=(1.0 + MAXIMUM_NULL_MEDIAN_DEVIATION))
+            .contains(&self.median)
+    }
+
+    /// Telemetry only: CI straddling is deliberately not an admission input.
     fn contains_null(self) -> bool {
         self.low <= 1.0 && self.high >= 1.0
     }
+}
+
+fn null_control_is_clear(ci: BootstrapMedianCi, maximum_null_ratio: f64) -> bool {
+    ci.median_within_null_bias_limit() && ci.symmetric_spread() <= maximum_null_ratio
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3509,10 +3520,12 @@ fn fs_report(
     );
     let fuse_over_kernel =
         bootstrap_median_ci(&competitive_log_ratios(&samples)?, 0x4B45_524E_454C_4142);
-    let kernel_clear =
-        kernel_null.contains_null() && kernel_null.symmetric_spread() <= config.maximum_null_ratio;
-    let fuse_clear =
-        fuse_null.contains_null() && fuse_null.symmetric_spread() <= config.maximum_null_ratio;
+    let kernel_ci_contains_one = kernel_null.contains_null();
+    let fuse_ci_contains_one = fuse_null.contains_null();
+    let kernel_median_within_null_bias_limit = kernel_null.median_within_null_bias_limit();
+    let fuse_median_within_null_bias_limit = fuse_null.median_within_null_bias_limit();
+    let kernel_clear = null_control_is_clear(kernel_null, config.maximum_null_ratio);
+    let fuse_clear = null_control_is_clear(fuse_null, config.maximum_null_ratio);
     let worker_thread_observation_clear = worker_thread_observation_is_clear(
         &samples.observed_worker_threads,
         config.client_threads(),
@@ -3705,31 +3718,39 @@ fn fs_report(
         );
     }
     println!(
-        "mounted_kernel_null,filesystem={},workload={},arm=kernel,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
+        "mounted_kernel_null,filesystem={},workload={},arm=kernel,median={:.6},median_deviation_from_one={:.6},maximum_median_deviation={:.6},median_within_limit={},ci_low={:.6},ci_high={:.6},ci_contains_one={},ci_contains_one_gate_input=false,symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
         kind.label(),
         config.workload.label(),
         kernel_null.median,
+        (kernel_null.median - 1.0).abs(),
+        MAXIMUM_NULL_MEDIAN_DEVIATION,
+        kernel_median_within_null_bias_limit,
         kernel_null.low,
         kernel_null.high,
+        kernel_ci_contains_one,
         kernel_null.symmetric_spread(),
         config.maximum_null_ratio,
         config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         kernel_clear,
     );
     println!(
-        "mounted_kernel_null,filesystem={},workload={},arm=fuse,median={:.6},ci_low={:.6},ci_high={:.6},symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
+        "mounted_kernel_null,filesystem={},workload={},arm=fuse,median={:.6},median_deviation_from_one={:.6},maximum_median_deviation={:.6},median_within_limit={},ci_low={:.6},ci_high={:.6},ci_contains_one={},ci_contains_one_gate_input=false,symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
         kind.label(),
         config.workload.label(),
         fuse_null.median,
+        (fuse_null.median - 1.0).abs(),
+        MAXIMUM_NULL_MEDIAN_DEVIATION,
+        fuse_median_within_null_bias_limit,
         fuse_null.low,
         fuse_null.high,
+        fuse_ci_contains_one,
         fuse_null.symmetric_spread(),
         config.maximum_null_ratio,
         config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         fuse_clear,
     );
     println!(
-        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},requested_client_threads={},actual_observed_worker_threads={},operations_per_observation={},pairs={},crossover_blocks={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},twice_null_margin_ratio={:.6},directional_claim_clear={},admitted={},verdict={},gate_basis=four_round_balanced_crossover_bootstrap_median_ci_with_twice_null_log_margin,bootstrap_resamples={},cv_used=false,instructions_used=false",
+        "mounted_kernel_ratio,filesystem={},metric=wall_ns,workload={},requested_client_threads={},actual_observed_worker_threads={},operations_per_observation={},pairs={},crossover_blocks={},observation_reducer={},observation_repeats={},fuse_over_kernel_median={:.6},ci_low={:.6},ci_high={:.6},twice_null_margin_ratio={:.6},directional_claim_clear={},admitted={},verdict={},gate_basis=four_round_balanced_crossover_null_median_within_2pct_and_ci_spread_with_twice_widest_null_log_margin,bootstrap_resamples={},cv_used=false,instructions_used=false",
         kind.label(),
         config.workload.label(),
         config.client_threads(),
@@ -3927,15 +3948,25 @@ fn fs_report(
     });
     let kernel_aa_json = json!({
         "median": kernel_null.median,
+        "median_deviation_from_one": (kernel_null.median - 1.0).abs(),
+        "maximum_median_deviation": MAXIMUM_NULL_MEDIAN_DEVIATION,
+        "median_within_limit": kernel_median_within_null_bias_limit,
         "ci_low": kernel_null.low,
         "ci_high": kernel_null.high,
+        "ci_contains_one": kernel_ci_contains_one,
+        "ci_contains_one_gate_input": false,
         "symmetric_spread": kernel_null.symmetric_spread(),
         "clear": kernel_clear,
     });
     let fuse_aa_json = json!({
         "median": fuse_null.median,
+        "median_deviation_from_one": (fuse_null.median - 1.0).abs(),
+        "maximum_median_deviation": MAXIMUM_NULL_MEDIAN_DEVIATION,
+        "median_within_limit": fuse_median_within_null_bias_limit,
         "ci_low": fuse_null.low,
         "ci_high": fuse_null.high,
+        "ci_contains_one": fuse_ci_contains_one,
+        "ci_contains_one_gate_input": false,
         "symmetric_spread": fuse_null.symmetric_spread(),
         "clear": fuse_clear,
     });
@@ -4038,8 +4069,9 @@ fn fs_report(
         "fuse_aa": fuse_aa_json,
         "fuse_over_kernel": competitive_json,
         "maximum_null_ratio": config.maximum_null_ratio,
+        "maximum_null_median_deviation": MAXIMUM_NULL_MEDIAN_DEVIATION,
         "gate_metric": "wall_ns",
-        "gate_basis": "four_round_balanced_crossover_bootstrap_median_ci_with_twice_null_log_margin",
+        "gate_basis": "four_round_balanced_crossover_null_median_within_2pct_and_ci_spread_with_twice_widest_null_log_margin",
         "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
         "cv_used": false,
         "instructions_used": false,
@@ -4255,7 +4287,7 @@ fn run() -> Result<Option<PathBuf>> {
         "note": "rch exec has no artifact-retrieval mechanism; both ELFs are built on a remote worker and copied to the executing host",
     });
     let Value::Object(identity_section) = json!({
-        "schema_version": 5,
+        "schema_version": 6,
         "harness": "ffs-mounted-kernel-bench",
         "harness_binary_sha256": harness_sha,
         "ffs_cli": fs::canonicalize(&config.ffs_cli)?,
@@ -4746,18 +4778,108 @@ mod tests {
         assert_eq!(ci.median, 1.0);
         assert_eq!(ci.low, 1.0);
         assert_eq!(ci.high, 1.0);
+        assert!(ci.median_within_null_bias_limit());
         assert!(ci.contains_null());
         assert_eq!(ci.symmetric_spread(), 1.0);
+        assert!(null_control_is_clear(ci, 1.025));
     }
 
     #[test]
-    fn narrow_but_biased_null_is_not_clear() {
+    fn ci_straddle_is_telemetry_not_a_null_veto() {
         let ci = BootstrapMedianCi {
-            median: 1.02,
-            low: 1.01,
-            high: 1.03,
+            median: 1.009_041,
+            low: 1.001_744,
+            high: 1.013_361,
         };
         assert!(!ci.contains_null());
+        assert!(ci.median_within_null_bias_limit());
+        assert!(null_control_is_clear(ci, 1.025));
+    }
+
+    #[test]
+    fn null_median_two_percent_boundary_is_inclusive() {
+        let ci = |median| BootstrapMedianCi {
+            median,
+            low: 0.99,
+            high: 1.01,
+        };
+        assert!(ci(0.98).median_within_null_bias_limit());
+        assert!(ci(1.02).median_within_null_bias_limit());
+        assert!(!ci(0.979_999).median_within_null_bias_limit());
+        assert!(!ci(1.020_001).median_within_null_bias_limit());
+    }
+
+    #[test]
+    fn historical_three_row_gate_audit_yields_one_loss_and_no_wins() {
+        let rows = [
+            (
+                BootstrapMedianCi {
+                    median: 0.966_904,
+                    low: 0.933_998,
+                    high: 1.008_743,
+                },
+                BootstrapMedianCi {
+                    median: 0.991_734,
+                    low: 0.969_409,
+                    high: 1.036_149,
+                },
+                BootstrapMedianCi {
+                    median: 1.203_230,
+                    low: 1.162_802,
+                    high: 1.239_236,
+                },
+            ),
+            (
+                BootstrapMedianCi {
+                    median: 1.009_041,
+                    low: 1.001_744,
+                    high: 1.013_361,
+                },
+                BootstrapMedianCi {
+                    median: 1.000_952,
+                    low: 0.995_548,
+                    high: 1.008_376,
+                },
+                BootstrapMedianCi {
+                    median: 2.957_531,
+                    low: 2.939_013,
+                    high: 2.971_326,
+                },
+            ),
+            (
+                BootstrapMedianCi {
+                    median: 0.990_140,
+                    low: 0.975_169,
+                    high: 1.009_721,
+                },
+                BootstrapMedianCi {
+                    median: 1.000_955,
+                    low: 0.996_572,
+                    high: 1.007_587,
+                },
+                BootstrapMedianCi {
+                    median: 4.212_274,
+                    low: 4.068_120,
+                    high: 4.290_202,
+                },
+            ),
+        ];
+        let mut decidable = 0;
+        let mut wins = 0;
+        let mut losses = 0;
+        for (kernel_null, fuse_null, competitive) in rows {
+            let admitted = null_control_is_clear(kernel_null, 1.025)
+                && null_control_is_clear(fuse_null, 1.025);
+            if admitted && clears_twice_null_margin(competitive, kernel_null, fuse_null) {
+                decidable += 1;
+                if competitive.median < 1.0 {
+                    wins += 1;
+                } else {
+                    losses += 1;
+                }
+            }
+        }
+        assert_eq!((decidable, wins, losses), (1, 0, 1));
     }
 
     #[test]

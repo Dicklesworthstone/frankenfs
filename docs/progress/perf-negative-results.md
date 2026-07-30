@@ -13,6 +13,90 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Null medians now bound arm-order bias; CI straddling is telemetry - 2026-07-30 (PurpleSnow, vs-INCUMBENT gate correction)
+
+The fleet-level gate correction was explicitly authorized for this comparator.
+Schema v6 removes only the requirement that each A/A confidence interval contain
+`1.0`. A null control is now clear when both of these unchanged/bounded
+conditions hold:
+
+1. its median is in the inclusive range `[0.98, 1.02]`; and
+2. its symmetric CI spread remains at most `--maximum-null-ratio` (default
+   `1.025x`).
+
+The CI endpoints and whether they contain `1.0` remain in console and JSON
+telemetry, with `ci_contains_one_gate_input=false`. The effect must still clear
+**twice the widest null log-margin**. No identity, exact-work, worker-count,
+worker-pinning, host-quiescence, mount-option/durability, parity, offline-check,
+incumbent-isolation, or wall-time median-CI gate changed. The immediately
+following physical-diagnosis row remains valid, but its historical statement
+that both A/A CIs must contain `1.0` is superseded by this policy correction.
+
+### Three-row integrity reproduction
+
+The exact three previously unscored 2026-07-27 workload reports were evaluated
+with every recorded non-null gate and the `1.025x` spread ceiling held fixed.
+The controls use same-invocation A/A deterministic bootstrap median 95% CI estimates.
+For example, the storm controls were kernel
+`1.009041x [1.001744, 1.013361]` and FUSE
+`1.000952x [0.995548, 1.008376]`.
+
+| Workload | Replacement-null result | Effect-margin result | Counterfactual decision |
+| --- | --- | --- | --- |
+| Multi-file parallel read, 8 threads, 256 x 256 KiB | Still blocked: kernel median `0.966904x` is outside `[0.98, 1.02]`; spreads are also `1.070666x` / `1.036149x` | Clears (`1.203230x [1.162802, 1.239236]`) | **STILL BLOCKED** |
+| Small-file create/delete storm, 2,000 files | Clears: medians `1.009041x` / `1.000952x`, spreads `1.013361x` / `1.008376x` | Clears twice-null margin `1.026900x`; effect `2.957531x [2.939013, 2.971326]` | **LOSE** |
+| Large-directory readdir+stat, 8 threads, 32,768 entries | Still blocked: medians are in range, but kernel spread `1.025464x` remains above `1.025x` | Clears (`4.212274x [4.068120, 4.290202]`) | **STILL BLOCKED** |
+
+Therefore **1 previously vetoed row becomes decidable: 0 WIN / 1 LOSE**. The
+focused regression test
+`historical_three_row_gate_audit_yields_one_loss_and_no_wins` reproduces that
+count while exercising the retained twice-null-margin predicate.
+
+As a broader integrity check, all **44** retained
+`mounted-kernel-report.json` artifacts (**47** filesystem rows) were scanned.
+Six schema-v1 rows were straddle-only null rejects under the old predicate and
+clear the replacement null predicate plus the doubled effect margin:
+**0 WIN / 6 LOSE**. All six predate the current worker-CPU-pinning attestation,
+so this is counterfactual gate evidence, not permission to republish those old
+ratios. The current pinned five-workload bank already cleared the old predicate;
+its **0 wins / 4 losses / 1 neutral** score does not change. The correction
+produces no win and therefore shows none of the loosening signature that would
+invalidate it.
+
+### Validation and remote-build provenance
+
+The final source overlay passed the focused mounted-comparator suite **25/25**
+on strict-remote worker `vmi1153651` (RCH project hash
+`5d696f67726a27b7`). Scoped no-dependency Clippy with warnings denied passed on
+`hz1` (hash `ef5c2455acc23b8b`); the allowance was limited to the repository's
+pre-existing `fetch_update` deprecations. Edited-file rustfmt and
+`git diff --check` passed.
+
+The broader strict-remote `cargo test -p ffs-harness -- --nocapture` run
+(worker `vmi1153651`, hash `1794541a32a4a2ae`) passed **2,058/2,058** library
+tests, **3/3** main-binary tests, **25/25** mounted-comparator tests,
+**7/7** btrfs-kernel-reference tests, and **100/100** conformance tests
+(2 ignored). It then exited 101 in the unrelated compile-fail suite:
+`executed_evidence_cannot_be_directly_constructed` passed, while
+`executed_evidence_cannot_be_deserialized` differed from its committed stderr
+only because `trybuild` normalized the registry source to `$CARGO/...` in the
+golden but RCH emitted `$WORKSPACE/.rch-tmp/...`. Neither the compile-fail test
+nor its golden was in the overlay, and this policy correction does not bless or
+rewrite that unrelated snapshot.
+
+Workspace-wide strict-remote check (hash `c240c23f41290aee`) is independently
+blocked by pre-existing `ffs-btrfs` all-target bench wiring:
+`csum_lookup.rs` calls
+`bench_delete_backrefs_for_extent_borrowed_candidate` and
+`bench_locate_extent_key` although both methods are compiled only with the
+`bench-instrumentation` feature. Workspace fmt is likewise blocked by committed
+format drift outside the edited file. The identical base plus one-path clean
+overlay nevertheless produced four different displayed RCH hashes
+(`5d696f67726a27b7`, `c240c23f41290aee`, `ef5c2455acc23b8b`, and
+`1794541a32a4a2ae`) and cold targets, so command-stable target reuse did not
+engage; these hashes are reported rather than treating the cold builds as cache
+hits.
+
 ## Unpinned timed threads, not host noise, were breaking the mounted A/A nulls; all five rows now score - 2026-07-30 (BlackThrush, vs-INCUMBENT instrument KEEP)
 
 This row banks an instrument fix and four re-measured direct-incumbent rows. **No
