@@ -13,6 +13,78 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Be-tree metadata message buffer (lever 1) is REJECTED - correctness, not speed - 2026-07-31
+
+`FFS_EXT4_METADATA_BUFFER` buffered whole-block metadata messages across 64
+shards and drained them into ONE transaction at fsync, so 512 creates paid ~8
+commits instead of 512. Reverted in `f2dbb84a` (reverts `9ccee47a`); both touched
+files are byte-identical to the pre-lever state `cb66b18d`.
+
+### The control validates the instrument
+
+Mounted 512-pair / 128-crossover-block ext4 comparison against the in-kernel
+incumbent: a same-invocation four-arm crossover over four independent live
+mounts, worker pinning attested. Both A/A null controls below are same-invocation
+nulls taken in the very run that produced the ratio - kernel A/A null `1.012983x`
+and FUSE A/A null `1.002400x`, each a bootstrap median CI containing 1.0. Candidate
+ELF `47a5f86d...` built `target-cpu=x86-64-v3` + PGO profile `6a22cfcf...` - the
+SAME profile as the frozen bank candidate `f44b3dc4...`, so the lever source is
+the only delta and the `bd-b9dug` admissibility rule is satisfied.
+
+| Arm | FrankenFS / kernel ext4 | Kernel A/A | FUSE A/A | Decision |
+| --- | --- | --- | --- | --- |
+| control, buffer OFF | `1.507220x` `[1.494469, 1.524164]`, `directional_claim_clear=true`, `admitted=true` | `1.012983x` | `1.002400x` | reproduces bank |
+| banked reference | `1.510822x` `[1.493097, 1.539011]` | - | - | - |
+| lever, buffer ON | NO RATIO - failed a correctness gate | - | - | **REJECT** |
+
+The control lands **0.24%** from the banked row from a freshly built ELF and a
+freshly built driver. That is an independent reproduction of the banked
+parallel-metadata loss, and it means the lever arm's failure is the lever's.
+
+### Why it is rejected: acknowledged creates go missing
+
+```
+reset parallel metadata file .../fuse_a/parallel-metadata/worker-0/
+r000001-000000: No such file or directory (os error 2)
+```
+
+The harness removes exactly the files it created; one was already gone, in
+warmup round 1. This is **not** a concurrency race - it reproduces serially:
+
+| threads | buffer | result |
+| --- | --- | --- |
+| 8 | on | reset failure |
+| **1** | **on** | **reset failure** |
+| 1 | off | clean |
+
+An acknowledged create is invisible to a later lookup even single-threaded.
+That is precisely what `528adc44` ("honor buffered reads ... including for
+scopes that have an active transaction") was written to fix: a read inside a
+transaction-backed scope consulted only the committed MVCC snapshot, and a
+snapshot cannot name an uncommitted buffered message.
+
+### Removed rather than left default-off
+
+`d7495a16` reverted the FIX (`528adc44`) and restored "the pre-candidate
+implementation exactly", which left the UNFIXED buffer on HEAD -
+`crates/ffs-core/src/fs_mvcc_store.rs` at HEAD was byte-identical to `9ccee47a`.
+Dead-but-armed code: setting the env var turned on silent metadata loss at any
+thread count. Independently, the FIXED version measured `1.587108x`
+`[1.582255, 1.594626]`, about **5% worse** than the 1.51x baseline, so there was
+no performance case for carrying it either.
+
+### Retry predicate
+
+Do not retry whole-block message buffering on the ext4 metadata path until (a)
+every read path that can observe a buffered block consults the buffer - including
+transaction-backed scopes - proven by a mounted run at `--client-threads 1` AND
+`8` that completes its reset without a missing file, and (b) a profile shows the
+per-write `begin()+commit()` is actually a material share of create time. The
+`create-bench` probe at n=9/arm could not resolve it: within-arm spreads were
+1.17-1.22x, an ~18% floor, with `off` 48211/s vs `cap=4096` 47864/s. Amdahl also
+bounds the prize - `ext4_create` holds `ext4_alloc_state.write()` across its
+body, so buffering shortens a serialized region rather than removing it.
+
 ## Mounted 64 MiB bulk durable output is a current 2.201986x loss - 2026-07-31 (IvoryBison, vs-INCUMBENT measurement)
 
 This deliverable keeps one realistic mounted-comparator workload and makes no
