@@ -97,6 +97,66 @@ SAME_INVOCATION_WITNESS = re.compile(
     re.I,
 )
 
+# --- what makes a KEEP claim a *competitive* claim ---------------------------
+# A self-speedup says nothing about whether an operator should choose FrankenFS.
+# Only a ratio whose denominator is the incumbent, measured with the incumbent
+# arm LIVE in the same invocation, is a competitive claim. Three provenance
+# classes, deliberately ordered from strongest to weakest.
+
+_RATIO = r"\d+(?:\.\d+)?\s*(?:x|×)"
+_INCUMBENT_TOK = (
+    r"kernel[- ]?(?:ext4|btrfs)|(?:ext4|btrfs)[- ]kernel|kernel arm|kernel median|"
+    r"kernel_median|incumbent|vs\.? (?:the )?kernel|kernel throughput|kernel `?dd`?|"
+    r"kernel `?cat`?|real kernel|kernel mount"
+)
+INCUMBENT_RATIO = re.compile(
+    rf"(?:{_INCUMBENT_TOK})[^|\n]{{0,160}}?{_RATIO}"
+    rf"|{_RATIO}[^|\n]{{0,160}}?(?:{_INCUMBENT_TOK})",
+    re.I,
+)
+# The same-invocation witness must be the COMPARATOR INSTRUMENT, never a bare
+# "A/A/B": three rows (NEGATIVE_EVIDENCE.md:88/91/92) carry an A/A/B that is the
+# internal frozen-vs-candidate control, with the kernel number taken separately.
+# Accepting the bare token reports a self-speedup as a competitive claim.
+SAME_INVOCATION_INCUMBENT_ARM = re.compile(
+    r"mounted-kernel-report|four[- ]arm|four[- ]round|physical[- ]arm crossover|"
+    r"crossover block|owns four independent arms|four independent (?:live )?mounts|"
+    r"same[- ]invocation (?:A/A|null|deterministic|ext4|btrfs)|ffs_mounted_kernel_bench",
+    re.I,
+)
+
+# --- why an un-converted claim is un-converted -------------------------------
+# "No incumbent arm exists" and "nobody has measured it yet" are different debts.
+# Precedence matters: convertibility is decided by whether the CLAIM'S WORKLOAD is
+# expressible as a POSIX operation the incumbent also implements, NOT by which
+# internal subsystem implements it. A row that mentions MVCC while speeding up
+# create is convertible -- the comparator already has a create workload.
+NOT_A_FILESYSTEM_CLAIM = re.compile(
+    r"instrument[- ]only|KEEP the (?:vs-incumbent )?instrument|instrument KEEP|"
+    r"workload/instrument support only|no production tuning|no self-speedup lever|"
+    r"CLAIM CORRECTION|AUDIT (?:COMPLETE|CORRECTED)|ledger resurrection|methodolog|"
+    r"harness overhead|KEEP the (?:ext4 )?mounted-comparator workload|"
+    r"this row banks an instrument|no FrankenFS (?:optimization|before/a)|"
+    r"preflight|SURVEY",
+    re.I,
+)
+POSIX_REACHABLE_SURFACE = re.compile(
+    r"htree|dirent|readdir|lookup|create|unlink|rmdir|rename|mkdir|symlink|link\b|"
+    r"extent|bitmap|inode|allocat|xattr|fsync|journal|jbd2|checksum|crc32c|"
+    r"read path|write path|pread|pwrite|stat\b|getattr|truncate|block device|"
+    r"page cache|prefetch|readahead|superblock|group descriptor|snapshot|send[- ]stream",
+    re.I,
+)
+# Deliberately narrow: only surfaces where kernel ext4/btrfs offers no counterpart
+# operation at all, so no incumbent arm could ever be built.
+NO_INCUMBENT_SURFACE = re.compile(
+    r"RaptorQ|repair symbol|fountain[- ]cod|scrub[- ]ledger|repair confidence|"
+    r"durability autopilot|refresh polic|stale[- ]window|adaptive runtime|"
+    r"topology advisor|proof bundle|release gate|evidence event|ParityReport|"
+    r"expected loss|MergeProof|merge proof|ConflictPolicy|SafeMerge",
+    re.I,
+)
+
 FULL_SHA256 = r"[0-9a-f]{64}"
 EXECUTING_ELF_SHA256 = re.compile(
     rf"(?:bench_elf_sha256|executing_elf_sha256|current_exe_sha256)"
@@ -200,6 +260,26 @@ class Row:
             CONTRACT_NULL_VALUE.search(evidence)
             and SAME_INVOCATION_WITNESS.search(evidence)
         )
+
+    def incumbent_denominator(self) -> str:
+        """Provenance of this row's incumbent ratio, strongest class first."""
+        evidence = decision_evidence(self.text)
+        if not INCUMBENT_RATIO.search(evidence):
+            return "none"
+        if SAME_INVOCATION_INCUMBENT_ARM.search(evidence):
+            return "live_same_invocation"
+        return "quoted_or_adjacent"
+
+    def convertibility(self) -> str:
+        """Why an un-converted claim is un-converted."""
+        evidence = decision_evidence(self.text)
+        if NOT_A_FILESYSTEM_CLAIM.search(evidence):
+            return "not_a_filesystem_claim"
+        if POSIX_REACHABLE_SURFACE.search(evidence):
+            return "convertible_unmeasured"
+        if NO_INCUMBENT_SURFACE.search(evidence):
+            return "no_incumbent_arm_possible"
+        return "unclassified"
 
     def has_executing_elf_sha256(self) -> bool:
         return bool(EXECUTING_ELF_SHA256.search(decision_evidence(self.text)))
@@ -536,6 +616,36 @@ def cmd_audit() -> int:
     return 0
 
 
+def cmd_incumbent_audit(show: str | None) -> int:
+    """Three numbers: KEEP claims held, how many carry a LIVE same-invocation
+    incumbent ratio, how many do not -- then why the rest do not."""
+    from collections import Counter
+
+    keeps = [r for r in all_rows() if r.verdict == "KEEP"]
+    prov = Counter(r.incumbent_denominator() for r in keeps)
+    live = prov["live_same_invocation"]
+    print(f"keep_claims_total            {len(keeps)}")
+    print(f"  live_same_invocation       {live}")
+    print(f"  quoted_or_adjacent         {prov['quoted_or_adjacent']}")
+    print(f"  no_incumbent_ratio         {prov['none']}")
+    print(f"unconverted_total            {len(keeps) - live}")
+    unconverted = [r for r in keeps
+                   if r.incumbent_denominator() != "live_same_invocation"]
+    why = Counter(r.convertibility() for r in unconverted)
+    for key in ("convertible_unmeasured", "no_incumbent_arm_possible",
+                "not_a_filesystem_claim", "unclassified"):
+        print(f"  {key:<26s} {why[key]}")
+    if show:
+        for r in (keeps if show == "live_same_invocation"
+                  else unconverted):
+            if (r.incumbent_denominator() if show in
+                    ("live_same_invocation", "quoted_or_adjacent", "none")
+                    else r.convertibility()) == show:
+                head = re.sub(r"\s+", " ", r.text)[:150]
+                print(f"    {r.ref}  {head}")
+    return 0
+
+
 def cmd_self_test() -> int:
     sha = "a" * 64
     sample_path = ROOT / "docs" / "NEGATIVE_EVIDENCE.md"
@@ -820,6 +930,9 @@ def main() -> int:
     g.add_argument("--lint", action="store_true",
                    help="exit 2 if a decision row violates the evidence contract")
     g.add_argument("--audit", action="store_true", help="whole-ledger census")
+    g.add_argument("--incumbent-audit", action="store_true",
+                   help="how many KEEP claims carry a live same-invocation "
+                        "incumbent ratio, and why the rest do not")
     g.add_argument("--self-test", action="store_true",
                    help="exercise policy predicates without Cargo or fixtures")
     g.add_argument("--install-hook", action="store_true",
@@ -832,7 +945,11 @@ def main() -> int:
                     help="with --lint: inspect the staged index (pre-commit mode)")
     ap.add_argument("--threshold", type=int, default=3,
                     help="with --candidate: term overlap needed to call it covered")
+    ap.add_argument("--show", metavar="CLASS", default=None,
+                    help="with --incumbent-audit: list the rows in one class")
     a = ap.parse_args()
+    if a.incumbent_audit:
+        return cmd_incumbent_audit(a.show)
     if a.candidate:
         if not a.surface:
             print("preflight: --candidate requires --surface", file=sys.stderr)
