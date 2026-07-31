@@ -82,7 +82,7 @@ use ffs_types::{
     Snapshot,
 };
 use ffs_xattr::{XattrReadAccess, XattrWriteAccess};
-use fs_mvcc_store::{FsMvccBlockDevice, FsMvccStore, MetadataMessageBuffer};
+use fs_mvcc_store::{FsMvccBlockDevice, FsMvccStore};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -1272,10 +1272,6 @@ pub struct OpenFs {
     /// Shared across all snapshots/transactions that operate on this filesystem.
     /// Writes stage versions here; reads check here before falling back to device.
     mvcc_store: Arc<FsMvccStore>,
-    /// Bε metadata message buffer (lever 1), shared by every block adapter this
-    /// filesystem hands out so a buffered write is visible to all threads at
-    /// once. `None` unless `FFS_EXT4_METADATA_BUFFER` is set.
-    metadata_buffer: Option<Arc<MetadataMessageBuffer>>,
     /// Highest MVCC commit sequence durably checkpointed to this filesystem's
     /// base device. The mutex serializes concurrent fsync/flush calls so an older
     /// checkpoint cannot overwrite a newer one after its watermark publishes.
@@ -4248,8 +4244,6 @@ impl OpenFs {
             ext4_forced_read_only: AtomicBool::new(false),
             dev,
             mvcc_store,
-            metadata_buffer: Self::metadata_buffer_capacity()
-                .map(|capacity| Arc::new(MetadataMessageBuffer::new(capacity))),
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
             jbd2_writer: None,
             ext4_alloc_state: None,
@@ -17818,25 +17812,6 @@ impl OpenFs {
         *V.get_or_init(|| std::env::var_os("FFS_NO_HTREE_CREATE_DEDUP").is_none())
     }
 
-    /// Bε metadata message buffer capacity, in distinct blocks, or `None` when
-    /// the lever is off. `FFS_EXT4_METADATA_BUFFER=<n>` sets it; bare presence
-    /// takes the default. Off by default so the mounted A/B is one flag on one
-    /// ELF, exactly like the other levers on this path.
-    fn metadata_buffer_capacity() -> Option<usize> {
-        static V: OnceLock<Option<usize>> = OnceLock::new();
-        *V.get_or_init(|| {
-            let raw = std::env::var_os("FFS_EXT4_METADATA_BUFFER")?;
-            let parsed = raw.to_str().and_then(|v| v.parse::<usize>().ok());
-            match parsed {
-                Some(0) => None,
-                Some(n) => Some(n),
-                // Present but unparseable: take the default rather than silently
-                // disabling a lever the operator asked for.
-                None => Some(4096),
-            }
-        })
-    }
-
     /// Get a block device adapter for the underlying byte device, wrapped
     /// in MVCC versioning logic at the current latest snapshot.
     fn block_device_adapter(&self) -> FsMvccBlockDevice<CachedByteDeviceBlockAdapter<'_>> {
@@ -17867,19 +17842,12 @@ impl OpenFs {
             // removing a per-op serialization point from the parallel-write path
             // (bd-bhh0i). Env `FFS_WRITABLE_ADAPTER_REGISTER=1` restores the old
             // register+release round-trip for A/B.
-            let adapter = if Self::writable_adapter_register() {
+            if Self::writable_adapter_register() {
                 FsMvccBlockDevice::new(base, Arc::clone(&self.mvcc_store), snapshot)
                     .with_read_your_writes()
             } else {
                 FsMvccBlockDevice::new_unregistered(base, Arc::clone(&self.mvcc_store), snapshot)
                     .with_read_your_writes()
-            };
-            // Bε lever 1: every adapter shares ONE buffer, so a buffered write is
-            // immediately visible through any other adapter this filesystem hands
-            // out. Only writable mounts buffer; a RO mount never writes.
-            match self.metadata_buffer.as_ref() {
-                Some(buffer) => adapter.with_message_buffer(Arc::clone(buffer)),
-                None => adapter,
             }
         } else {
             // bd-eflng: a read-only filesystem never writes, so no version is
@@ -26913,15 +26881,6 @@ impl OpenFs {
         // WARN is the least-severe level any record here uses, so this never elides
         // a field a record would emit. Mirrors the `tracing::enabled!` guards in
         // ffs-mvcc.
-        // Bε lever 1: realize the amortization. Every metadata message buffered
-        // since the last boundary drains into ONE transaction here, BEFORE the
-        // device checkpoint below, so the checkpoint sees a complete image and
-        // `e2fsck` is clean. N buffered updates over M distinct blocks cost one
-        // commit of M writes instead of N commits.
-        if let Some(buffer) = self.metadata_buffer.as_ref() {
-            buffer.drain_into(&self.mvcc_store)?;
-        }
-
         let log_enabled = tracing::enabled!(target: "ffs::ext4::rw", tracing::Level::WARN);
         let operation_id = if log_enabled {
             Self::ext4_sync_operation_id(op, ino, datasync)
@@ -32627,12 +32586,6 @@ impl OpenFs {
     pub fn sync_all_to_device(&self, cx: &Cx) -> ffs_error::Result<()> {
         if !self.is_writable() {
             return Err(FfsError::ReadOnly);
-        }
-        // Bε lever 1: buffered metadata must become committed versions before
-        // anything walks the version store to build the on-disk image, or the
-        // checkpoint writes a filesystem missing every buffered update.
-        if let Some(buffer) = self.metadata_buffer.as_ref() {
-            buffer.drain_into(&self.mvcc_store)?;
         }
         let base_dev = self.direct_block_device_adapter();
         self.flush_mvcc_versions_to_device(cx, &base_dev)?;
@@ -38749,12 +38702,6 @@ impl FsOps for OpenFs {
             return Ok(());
         }
 
-        // Bε lever 1: buffered metadata must become committed versions before
-        // anything walks the version store to build the on-disk image, or the
-        // checkpoint writes a filesystem missing every buffered update.
-        if let Some(buffer) = self.metadata_buffer.as_ref() {
-            buffer.drain_into(&self.mvcc_store)?;
-        }
         // Flush committed MVCC block versions (covers ext4 metadata and any
         // file-data extents staged through the block-versioned path).
         let flushed = self.flush_mvcc_to_device(cx)?;

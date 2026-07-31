@@ -19,125 +19,6 @@ use std::sync::Arc;
 
 const MVCC_COMMIT_PRUNE_INTERVAL: u64 = 256;
 
-/// Number of independent buffer shards. A single mutex over the pending map
-/// would replace one serialization point (the MVCC commit) with another, so the
-/// buffer is striped by block number; each critical section is a hash lookup
-/// plus a 4 KiB memcpy.
-const MESSAGE_BUFFER_SHARDS: usize = 64;
-
-/// Bε-tree-style message buffer for small metadata updates (bd-bhh0i lever 1).
-///
-/// The mounted create path read-modify-writes the SAME few hot blocks once per
-/// file: for 512 creates into one directory that is 512 rewrites of one inode
-/// bitmap block and ~32 inode-table blocks, each one its own `begin()` +
-/// `commit()`. The updates are tiny (one bit; one 256-byte inode slot) and the
-/// block set is small — the exact shape a Bε-tree amortizes by buffering
-/// messages and flushing them in batches instead of pushing each one to its
-/// node immediately.
-///
-/// So writes land here instead of opening a transaction, and drain into ONE
-/// transaction at the durability boundary. The kernel cannot do this: ext4
-/// journals in-place metadata updates, so each one is ordered work it must
-/// perform. We only owe the operator durability at `fsync`.
-///
-/// **Visibility is not deferred, only durability.** The buffer is consulted
-/// ahead of the version store on every read through this adapter, and it is
-/// shared across adapters (one per `OpenFs`), so a buffered create is visible
-/// to every other thread immediately — which is what POSIX requires. What is
-/// deferred is the version-store commit and the device write, exactly the
-/// tradeoff `gdt_persistence_deferred()` already makes for group descriptors.
-///
-/// A crash before `fsync` loses buffered metadata. That is POSIX-legal and is
-/// the same exposure the existing group-descriptor deferral accepts.
-pub struct MetadataMessageBuffer {
-    shards: Vec<parking_lot::Mutex<rustc_hash::FxHashMap<BlockNumber, Vec<u8>>>>,
-    pending: std::sync::atomic::AtomicUsize,
-    /// Drain threshold in blocks, so a workload that never fsyncs cannot grow
-    /// the buffer without bound.
-    capacity: usize,
-}
-
-impl MetadataMessageBuffer {
-    #[must_use]
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            shards: (0..MESSAGE_BUFFER_SHARDS)
-                .map(|_| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
-                .collect(),
-            pending: std::sync::atomic::AtomicUsize::new(0),
-            capacity,
-        }
-    }
-
-    const fn shard_of(&self, block: BlockNumber) -> usize {
-        // Block numbers on the hot metadata path are near-consecutive, so the
-        // low bits are the discriminating ones.
-        (block.0 as usize) % MESSAGE_BUFFER_SHARDS
-    }
-
-    /// Buffer one whole-block message, replacing any earlier pending one for the
-    /// same block. Coalescing is the entire point: the 512th write of a block
-    /// supersedes the previous 511 and only the survivor is ever committed.
-    fn put(&self, block: BlockNumber, data: Vec<u8>) {
-        let shard = self.shard_of(block);
-        let mut map = self.shards[shard].lock();
-        if map.insert(block, data).is_none() {
-            self.pending
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    fn get(&self, block: BlockNumber) -> Option<Vec<u8>> {
-        let shard = self.shard_of(block);
-        self.shards[shard].lock().get(&block).cloned()
-    }
-
-    /// True once the buffer holds at least `capacity` distinct blocks.
-    fn is_full(&self) -> bool {
-        self.pending.load(std::sync::atomic::Ordering::Relaxed) >= self.capacity
-    }
-
-    /// Remove and return every pending message.
-    fn take_all(&self) -> Vec<(BlockNumber, Vec<u8>)> {
-        let mut drained = Vec::new();
-        for shard in &self.shards {
-            let mut map = shard.lock();
-            drained.extend(map.drain());
-        }
-        self.pending
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        drained
-    }
-
-    /// Number of blocks currently buffered (diagnostic).
-    #[must_use]
-    pub fn pending_blocks(&self) -> usize {
-        self.pending.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Drain every buffered message into ONE transaction and commit it. This is
-    /// where the amortization is realized: N buffered updates to M distinct
-    /// blocks cost one commit of M writes rather than N commits.
-    ///
-    /// # Errors
-    /// Returns the commit error if the batched transaction cannot commit.
-    pub fn drain_into(&self, store: &FsMvccStore) -> FfsResult<()> {
-        let drained = self.take_all();
-        if drained.is_empty() {
-            return Ok(());
-        }
-        let mut txn = store.begin();
-        for (block, data) in drained {
-            txn.stage_write(block, data);
-        }
-        let commit_seq = store
-            .commit(txn)
-            .map_err(|error| FfsError::Format(error.to_string()))?;
-        store.prune_after_commit_if_due(commit_seq);
-        Ok(())
-    }
-}
-
 /// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
 ///
 /// The enum is always owned behind `Arc`; boxing a variant would add another
@@ -413,9 +294,6 @@ pub struct FsMvccBlockDevice<D: BlockDevice> {
     store: Arc<FsMvccStore>,
     ownership: SnapshotOwnership,
     read_your_writes: bool,
-    /// Bε message buffer (lever 1). When attached, whole-block metadata writes
-    /// are buffered and coalesced instead of each opening its own transaction.
-    buffer: Option<Arc<MetadataMessageBuffer>>,
 }
 
 impl<D: BlockDevice> FsMvccBlockDevice<D> {
@@ -426,7 +304,6 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
             store,
             ownership: SnapshotOwnership::Inline { snapshot },
             read_your_writes: false,
-            buffer: None,
         }
     }
 
@@ -436,49 +313,7 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
             store,
             ownership: SnapshotOwnership::Unregistered { snapshot },
             read_your_writes: false,
-            buffer: None,
         }
-    }
-
-    /// Attach the Bε message buffer (lever 1). Whole-block writes are then
-    /// coalesced in memory and committed as one batch at the durability
-    /// boundary instead of one transaction each.
-    pub(super) fn with_message_buffer(mut self, buffer: Arc<MetadataMessageBuffer>) -> Self {
-        self.buffer = Some(buffer);
-        self
-    }
-
-    /// Read the current content of `block` through the same precedence a read
-    /// would see (buffer, then version store, then device), patch it, and buffer
-    /// the result. Used by both RMW entry points when the buffer is attached.
-    ///
-    /// The merge proof is deliberately dropped: a buffered block is never staged
-    /// in a concurrent transaction, so there is no first-committer-wins race for
-    /// a proof to resolve. Serialization happens on the buffer shard instead,
-    /// which is a hash lookup and a memcpy rather than a commit.
-    fn buffered_rmw(
-        &self,
-        cx: &Cx,
-        buffer: &Arc<MetadataMessageBuffer>,
-        block: BlockNumber,
-        patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
-    ) -> FfsResult<()> {
-        let mut data = match buffer.get(block) {
-            Some(buffered) => buffered,
-            None => match self
-                .store
-                .read_visible_block_buf(block, self.store.current_snapshot())
-            {
-                Some(buf) => buf.as_slice().to_vec(),
-                None => self.base.read_block(cx, block)?.into_inner(),
-            },
-        };
-        patch(&mut data)?;
-        buffer.put(block, data);
-        if buffer.is_full() {
-            buffer.drain_into(&self.store)?;
-        }
-        Ok(())
     }
 
     pub(super) fn with_read_your_writes(mut self) -> Self {
@@ -539,12 +374,6 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> FfsResult<BlockBuf> {
         if self.reads_base_directly() {
             return self.base.read_block(cx, block);
-        }
-        // A buffered message is newer than any committed version by
-        // construction, so it wins. This is what keeps VISIBILITY immediate
-        // while durability is deferred.
-        if let Some(buffered) = self.buffer.as_ref().and_then(|b| b.get(block)) {
-            return Ok(BlockBuf::new(buffered));
         }
         if let Some(buf) = self
             .store
@@ -683,15 +512,6 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
             ));
         }
 
-        // Bε: buffer the message instead of paying begin()+commit() per write.
-        if let Some(buffer) = self.buffer.as_ref() {
-            buffer.put(block, data.to_vec());
-            if buffer.is_full() {
-                buffer.drain_into(&self.store)?;
-            }
-            return Ok(());
-        }
-
         let mut txn = self.store.begin();
         txn.stage_write(block, data.to_vec());
         let commit_seq = self
@@ -713,9 +533,6 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
             return Err(FfsError::UnsupportedFeature(
                 "unregistered MVCC block device is read-only".to_owned(),
             ));
-        }
-        if let Some(buffer) = self.buffer.as_ref() {
-            return self.buffered_rmw(cx, buffer, block, patch);
         }
         // Begin the transaction FIRST, then read the base block AT the transaction's
         // snapshot (a read taken beforehand could observe an older version than the
@@ -763,9 +580,6 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
             return Err(FfsError::UnsupportedFeature(
                 "unregistered MVCC block device is read-only".to_owned(),
             ));
-        }
-        if let Some(buffer) = self.buffer.as_ref() {
-            return self.buffered_rmw(cx, buffer, block, patch);
         }
         // Same begin-first / read-base-at-snapshot contract as `rmw_block` (a
         // read taken before `begin` could observe an older version and silently
