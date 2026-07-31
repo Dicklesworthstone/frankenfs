@@ -125,6 +125,58 @@ backrefs, orphan reclaim, csum-tree cleanup, send-stream generation, queued repa
 `btrfs send` is a real incumbent operation, so send-stream rows are convertible in
 principle; we simply have no send arm.
 
+## Conversions performed
+
+### 2026-07-31 — README create existence-check "approximately kernel parity": **refuted**
+
+Ranked by load-bearing weight rather than ease: the top row of the README's `v0.2.0`
+table was the only claim in that table asserting we had reached the incumbent, and the
+whole table is the repo's public performance face.
+
+The workload that matches it is the mounted comparator's `create-delete-storm` — 2,000
+serial `O_CREAT|O_EXCL` creates into **one** directory, parent `fsync`, 2,000 deletes,
+second `fsync`. `O_EXCL` forces the existence check on every create, and one growing
+directory is the `O(N²)` shape the name-index addressed, so this is a direct test rather
+than a proxy.
+
+**Result: `2.753659x [2.707500, 2.782302]` slower than kernel ext4.** Both A/A nulls
+clear, the effect clears twice the widest null log-margin, threads observed 1/1 with
+pinning attested, replicated 3/3. The `26×` internal reduction stands; the parity half of
+the claim does not. README corrected in the same commit.
+
+### The attempted stronger test, and why it failed
+
+Whether the gap *grows* with directory size decides whether residual `O(N²)` remains.
+Three attempts at N=8,000, on driver `004e58a65160fd248b876e21e67bec63dbd9f8cd9d769d06582ee4308995868e`
+(built on `ovh-a` by `rch exec --base HEAD --clean-overlay --no-overlay`, self-hashed in
+process) against the frozen candidate `f44b3dc4…` (x86-64-v3, PGO `6a22cfcf…`), host
+`thinkstation1`, kernel `6.17.0-35-generic`:
+
+| Attempt | Crossover blocks | Kernel A/A median · spread | FUSE A/A spread | Verdict |
+| --- | --- | --- | --- | --- |
+| 1 | 32 | `0.981473x` · `1.031631x` | `1.012651x` | `BLOCKED_NULL` |
+| 2 | 32 | `0.986321x` · `1.033187x` | `1.024762x` | `BLOCKED_NULL` |
+| 3 | **128** | `0.984324x` · `1.027150x` | `1.004599x` | `BLOCKED_NULL` |
+
+Quadrupling the blocks moved the spread from `1.033187x` to `1.027150x`. Sampling noise
+would have fallen roughly as `1/sqrt(blocks)`, to about `1.017x`. It did not, and the
+kernel A/A median sat near `0.984` in all three — one physical kernel image is
+systematically about 1.6% faster than the other at this N.
+
+**Diagnosis: per-image history, not host noise.** The storm *mutates* its image. The
+four-round Latin square balances which logical role each physical arm plays, but each
+image still accumulates its own free-space fragmentation and journal state across rounds,
+and at N=8,000 that divergence exceeds the null ceiling. At N=2,000 the same instrument
+records a kernel A/A spread of `1.014618x`, well clear — the asymmetry is N-dependent.
+This is the same failure class as the per-image bias diagnosed on 2026-07-28.
+
+**Retry predicate.** Do not re-roll placements; three windows already produced the same
+signature, and re-rolling until a null clears is p-hacking. Retry only after the mutating
+workload resets both physical images to a byte-identical state between crossover blocks
+(re-`mke2fs` or restore from a pristine copy, outside the timed region), or after counted
+per-image free-space/journal-state attribution shows the divergence is bounded below the
+null ceiling. Never quote `3.24x`–`3.40x`; those three estimates are inadmissible.
+
 ## The standing rule this produces
 
 No ledger row may describe itself as a competitive result unless

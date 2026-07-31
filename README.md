@@ -1801,7 +1801,7 @@ images checked by `e2fsck`.
 
 | Subsystem | Lever | Result | Commit |
 |---|---|---|---|
-| Metadata / directory | Name-index closes the create existence-check `O(N²)` | Generic-ELF campaign: **26× reduction to approximately kernel parity**; shipped-binary parity is not yet re-measured | [`1fcd0b62`](https://github.com/Dicklesworthstone/frankenfs/commit/1fcd0b62) |
+| Metadata / directory | Name-index closes the create existence-check `O(N²)` | Generic-ELF campaign: **26× internal reduction**. ⚠️ The "approximately kernel parity" half of this claim is **withdrawn — measured false**: against a live kernel ext4 arm we are **`2.753659x` slower** on the matching workload. See [Converted claims](#converted-claims-measured-against-a-live-incumbent) | [`1fcd0b62`](https://github.com/Dicklesworthstone/frankenfs/commit/1fcd0b62) |
 | Write allocation | Coalesce contiguous extents, `O(N²)→O(N)` | **120× at N=40k** | [`2aa92946`](https://github.com/Dicklesworthstone/frankenfs/commit/2aa92946) |
 | Allocator | Binary range-overlap reserved-check | **up to 3110×** | [`af91cc18`](https://github.com/Dicklesworthstone/frankenfs/commit/af91cc18) |
 | Journal replay | Memoize indirect-block resolution | fixes **2024×** re-read/mount | [`fe00c75e`](https://github.com/Dicklesworthstone/frankenfs/commit/fe00c75e) |
@@ -1813,6 +1813,45 @@ images checked by `e2fsck`.
 | btrfs metadata | Fan-out gate the prefetch pool | Generic-ELF campaign: **4.3×** internally (7× → 1.6× vs kernel); shipped-binary kernel gap is not yet re-measured | [`18fb0e88`](https://github.com/Dicklesworthstone/frankenfs/commit/18fb0e88) |
 | CLI | jemalloc global allocator | Generic-ELF source A/B: create **1.26–1.6×**; the old “faster than kernel” production wording is withdrawn pending a shipped-binary rerun | [`14f443cb`](https://github.com/Dicklesworthstone/frankenfs/commit/14f443cb) |
 | btrfs read | Read directly into caller buffer | Generic-ELF source A/B: **1.37× warm, RSS halved**; the old “beats kernel” production wording is withdrawn pending a shipped-binary rerun | [`54b0ae94`](https://github.com/Dicklesworthstone/frankenfs/commit/54b0ae94) |
+
+#### Converted claims (measured against a live incumbent)
+
+Every row in the table above is an **internal** before/after: it compares FrankenFS to a
+previous FrankenFS, and says nothing about whether you should run FrankenFS instead of
+what you already run. Converting one means re-measuring it with kernel ext4 or kernel
+btrfs executing **live in the same invocation**. Of the 678 kept claims in our ledgers,
+**5 carry such a ratio** — see [`docs/INCUMBENT_RATIO_COVERAGE.md`](docs/INCUMBENT_RATIO_COVERAGE.md).
+
+**Converted, 2026-07-31: the create existence-check parity claim is refuted.**
+
+The first row's *"approximately kernel parity"* was the only claim in this table asserting
+we had caught the incumbent, which makes it the most load-bearing one here. Its matching
+workload is 2,000 serial `O_CREAT|O_EXCL` creates into one directory, an `fsync` of the
+parent, 2,000 deletes, and a second `fsync` — `O_EXCL` is exactly the existence check the
+name-index was built to make cheap, and one directory is exactly the growing-`N` shape.
+
+| | |
+| --- | --- |
+| **FrankenFS ÷ kernel ext4** | **`2.753659x` `[2.707500, 2.782302]` slower** |
+| Kernel A/A null | `0.996217x [0.985593, 1.007951]`, spread `1.014618x` |
+| FUSE A/A null | `0.995167x [0.988305, 1.004712]`, spread `1.011833x` |
+| Effect vs twice-widest-null margin | clears `1.029449x` |
+| Threads requested → **observed** | 1 → **1** on all four arms, pinning attested |
+| Replication | 3/3 on one driver ELF: `2.760102x`, `2.780381x`, `2.795147x` |
+
+We are not at parity. We are about 2.75 times slower. The `26×` internal reduction is
+real and stands; what it bought was a much faster FrankenFS, not a competitive one.
+
+**What could not be measured, and why it is not being quietly dropped.** The stronger
+version of this test — does the gap *grow* with directory size, which would mean residual
+`O(N²)` — was attempted three times at N=8,000 and refused all three times. The kernel A/A
+null spread came in at `1.031631`, `1.033187`, and `1.027150` against a `1.025` ceiling.
+Quadrupling the crossover blocks (32 → 128) barely moved it, so this is a **systematic
+asymmetry between the two physical kernel images at that N, not sampling noise** — the
+storm mutates its image, and the four-round Latin square balances arm *roles*, not the
+history each image accumulates across rounds. The three point estimates clustered at
+`3.24x`–`3.40x`. **They are not claims and must not be quoted.** Whether the gap grows
+with `N` is open.
 
 **Build-identity correction (`bd-b9dug`, 2026-07-25).** Ordinary
 `cargo bench --profile release-perf` compiles FrankenFS code for Rust's generic
