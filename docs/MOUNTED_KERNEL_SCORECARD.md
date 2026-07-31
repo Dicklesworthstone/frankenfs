@@ -100,6 +100,16 @@ sanity-checked against absolute time, not to support any claim.
   and it did not gate these runs. What did apply on every row: per-CPU busy fractions
   averaged over a **full one-second** interval, driver and FUSE busy-limit checks, SMT
   sibling guards on both, same-LLC placement, and a 1,000 ms pre-measurement settle.
+- **What the one host-wide-scoped window says about that caveat.** The 2026-07-29
+  governor-attested runs *did* run `--placement-scope host-wide` with the sustained
+  five-consecutive-one-second gate clearing (`samples_observed` 106 and 55). Only
+  **storm** was admitted there, at `2.691204x [2.675323, 2.717540]` and
+  `2.676393x [2.657974, 2.701633]` — same verdict as the row published above and within
+  about 3% of its `2.753659x`. That is corroboration of direction and rough magnitude,
+  **not** a controlled scope comparison: those runs used a different candidate
+  (`93ed…` / PGO `1410…`) and a different driver, and they predate worker pinning, which
+  is why read and readdir were `blocked_null` in the same window. No host-wide-scoped
+  admitted row exists for any of the other four workloads.
 - **The governor was recorded, not set.** All 64 CPUs ran `amd-pstate-epp` with the
   `powersave` governor; the host is shared with other agents, so it was deliberately
   left alone and `non_performance_or_mixed_governor_warning=true` is carried on every
