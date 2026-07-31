@@ -19788,6 +19788,70 @@ mod tests {
         assert_eq!(alloc.delayed_ref_count(), 0);
     }
 
+    /// bd-ftev0. The test above pins the allocator's fail-closed contract: given a
+    /// block group whose tally disagrees with the extent tree, freeing MUST refuse.
+    /// That contract is right, and it was firing on every real image, because mount
+    /// built exactly that inconsistent state — block groups seeded at `used_bytes =
+    /// 0` alongside a fully-loaded on-disk extent tree — so the first overwrite of
+    /// any `mkfs.btrfs`-written extent returned EIO.
+    ///
+    /// This pins the fix at the seam the mount path now uses: reconciling the tally
+    /// against the extent tree turns the same starting state into a legal free. The
+    /// underflow guard is not weakened — it is simply no longer reachable from a
+    /// correctly mounted filesystem.
+    #[test]
+    fn reconciled_block_group_accounting_makes_a_preexisting_extent_freeable_bd_ftev0() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        let bg_start = 0x10_0000;
+        // Exactly the mount-time seeding: total space known, used tally zero.
+        alloc.add_block_group(bg_start, make_data_bg(bg_start, 8192));
+        let key = BtrfsKey {
+            objectid: bg_start,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: 4096,
+        };
+        let extent_item = BtrfsExtentItem {
+            refs: 1,
+            generation: 1,
+            flags: 0,
+        };
+        // ...and an extent tree loaded from disk that says otherwise.
+        alloc
+            .extent_tree
+            .insert(key, &extent_item.to_bytes())
+            .expect("insert on-disk extent");
+        assert_eq!(
+            alloc.block_group(bg_start).expect("bg").used_bytes,
+            0,
+            "precondition: the tally starts blind to the on-disk extent"
+        );
+
+        let total = alloc
+            .sync_block_group_accounting()
+            .expect("reconcile against the extent tree");
+        assert_eq!(total, 4096, "grand total is the sum of on-disk extents");
+        assert_eq!(
+            alloc.block_group(bg_start).expect("bg").used_bytes,
+            4096,
+            "the tally now matches the extent the image actually contains"
+        );
+
+        // The same call that produced EIO before the fix.
+        alloc
+            .free_extent(bg_start, 4096, false)
+            .expect("freeing a pre-existing extent must succeed after reconciliation");
+        assert_eq!(alloc.block_group(bg_start).expect("bg").used_bytes, 0);
+        assert_eq!(
+            alloc
+                .extent_tree
+                .range(&key, &key)
+                .expect("extent lookup")
+                .len(),
+            0,
+            "a successful free removes the extent item"
+        );
+    }
+
     #[test]
     fn reclaim_unreferenced_data_extents_frees_orphans_only() {
         let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");

@@ -99,6 +99,65 @@ Filed as **`bd-ftev0`**. This is a **capability gap, not a performance result**,
 the btrfs suite: four losses and one caveated win are numbers, but a workload we cannot
 execute at all is a defect. Filed for triage rather than buried in a ratio table.
 
+### Root cause found, 2026-07-31 — mount builds an inconsistent allocator
+
+The write path is fully implemented for `offset > 0` and for mid-file overwrite; there is
+no `unimplemented!` anywhere on it. The `EIO` is a real invariant failure:
+
+1. At mount, `OpenFs` registers one block group per chunk with **`used_bytes = 0`**
+   (`ffs-core/src/lib.rs:7494-7517`) — except a synthetic 128 KiB reservation for a chunk
+   at logical 0, which no real `mkfs.btrfs` image has, since its first chunk starts at a
+   non-zero logical offset.
+2. Immediately below, the **real on-disk extent tree is loaded** (`bd-is7m1`), so every
+   `EXTENT_ITEM` the image already contains is present.
+3. The two now contradict each other: the extent tree says bytes are allocated, the
+   accounting says the group is empty. Nothing ever reads the on-disk
+   `BLOCK_GROUP_ITEM`s to seed the tally.
+4. The first overwrite of a pre-existing extent removes it, which calls
+   `free_extent` → `used_bytes.checked_sub(num_bytes)` on a zero tally → `None` →
+   `BrokenInvariant("block group used bytes underflow")` (`ffs-btrfs/src/lib.rs:6988`) →
+   `FfsError::Corruption` (`ffs-core:17235`) → **`EIO`** (`ffs-error:284`).
+
+The failure is not offset-specific — the reported "positioned write" is at offset 0. What
+makes it fire is that the write covers a full sector (so it is not inline) **and** an
+extent already exists there. Small inline writes never call `free_extent`, which is why
+btrfs writes appeared to work at all. ext4 is unaffected because it allocates against the
+real on-disk bitmaps read at mount, with no synthesized tally to underflow.
+
+The existing test `extent_allocator_adversarial_rejects_free_accounting_underflow`
+(`ffs-btrfs:19750`) asserts precisely this failure as a *fail-closed contract*. The
+contract is correct. The bug is that mount handed it an inconsistent state on every real
+image, so a guard meant for corruption was firing on healthy filesystems.
+
+**Fix — identified and pinned, not yet landed.** Call `sync_block_group_accounting()` at
+mount, immediately after the extent tree
+is loaded. That function already exists and is already run at commit; it recomputes each
+group's `used_bytes` as the sum of the `EXTENT_ITEM`/`METADATA_ITEM` lengths physically
+inside it — the same definition `btrfs check` enforces — so it is correct-by-construction
+rather than a running tally. Its own doc comment already noted that the mount-time tally
+is "seeded from a synthetic reservation, not the real on-disk figure".
+
+Two things it deliberately does not disturb: the reserved-prefix fence lives in
+`min_usable_offset`, which it does not touch; and allocation is unaffected because
+`alloc_extent` gap-searches the extent tree whenever `tail_verified` is false, which it is
+for every group at mount, so the bump cursor was only ever a hint.
+
+Pinned by `reconciled_block_group_accounting_makes_a_preexisting_extent_freeable_bd_ftev0`
+(`ffs-btrfs`), which builds the exact mount-time state and proves the same `free_extent`
+call succeeds once reconciled. The underflow guard is not weakened — it stops being
+reachable from a correctly mounted filesystem.
+
+**Why the one-line call is not committed yet.** Making it live regresses
+`btrfs_largest_contiguous_free_run_uses_allocator_gaps` (`ffs-core`), which asserts a
+fixture leaves exactly 64 free blocks. That figure was computed against the *un*-reconciled
+tally, so real accounting legitimately changes it — the test's expectation needs
+recomputing, not the fix reverting. Measured, not assumed: with the call in place
+`ffs-btrfs` is 375/375 and `ffs-core` is 1186 passed / 2 failed; running those two tests on
+clean `HEAD` with no overlay shows `fast_commit_del_range_apply_punches_and_frees_passes_e2fsck`
+already failing there (pre-existing, not ours) and the free-run test passing, which is what
+isolates the regression to this change. Next step is to recompute the expectation and land
+both together.
+
 ## Provenance
 
 - Driver ELF `4b0f0889e637481ac9aac15737ced66aee59a53efcd38c77ff3c0cbf396f6cdb`, built by

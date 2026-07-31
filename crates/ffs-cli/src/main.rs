@@ -7667,6 +7667,22 @@ fn mount_with_fuse(
         worker_threads: 0,
     };
 
+    // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
+    // `ext4_alloc_state.write()` for its whole body, so every FUSE worker thread
+    // serializes on one lock and parallel metadata writes scale NEGATIVELY —
+    // the mechanism behind the 1.510822x mounted loss vs kernel ext4. The
+    // sharded twin allocates through per-group locks instead, so creates into
+    // disjoint groups never serialize. Off unless explicitly asked for, and a
+    // no-op unless the crate was built with the feature.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    if read_write && std::env::var_os("FFS_BHH0I_SHARDED").is_some() {
+        let previously = open_fs.set_bhh0i_sharded_ops(true);
+        eprintln!(
+            "mount: bd-bhh0i sharded per-group create path ENABLED \
+             (FFS_BHH0I_SHARDED set, previous={previously})"
+        );
+    }
+
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
     ffs_fuse::mount(fs_ops, mountpoint, &opts)
         .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
