@@ -13,6 +13,64 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## READDIRPLUS negotiation is REJECTED - correct, but 2.2x SLOWER - 2026-07-31
+
+Self-generated lever, picked by the standing directive: profile the whole job,
+keep only entries the incumbent does NOT also pay, then attack the worst row.
+The kept entry was the FUSE per-op transport tax (62.44% of daemon CPU; in-kernel
+ext4 runs in the caller's context and pays none of it) and the worst row is
+`readdir-stat-8t` at `4.967448x`, which is 32,768 enumerate-then-stat round trips.
+
+The find looked ideal: `readdirplus` is fully implemented in `crates/ffs-fuse`
+(batched parallel getattr, 128/batch, bounded overshoot) and we already return a
+60s `ATTR_TTL`, but `init()` advertised only SPLICE and PASSTHROUGH - so the
+capability was never negotiated, the kernel only ever sent plain READDIR, and the
+handler was DEAD CODE. Adding `FUSE_DO_READDIRPLUS` should have let the kernel
+answer those 32,768 stats from its own dcache.
+
+It does not. Reverted; `crates/ffs-fuse/src/lib.rs` is unchanged on HEAD.
+
+### Correctness passed - this is purely a speed rejection
+
+Same tree enumerated with the capability on and off, 3,000 entries: entry-name
+lists byte-identical, per-entry `stat` output (size, mode, nlink) byte-identical,
+offline `e2fsck` rc=0. So the dead handler was not buggy, merely slower.
+
+### Counted mechanism: round trips went UP, not down
+
+Interleaved on/off/on/off, 8,000-entry enumerate-then-stat sweep, daemon syscall
+count from `/proc/<pid>/io` plus wall time for the sweep alone:
+
+| Capability | daemon syscall count / entry | sweep wall |
+| --- | --- | --- |
+| `DO_READDIRPLUS + READDIRPLUS_AUTO` | 2.08 | 129 ms / 142 ms |
+| off (baseline) | 2.01 | 135 ms / 129 ms |
+| `DO_READDIRPLUS` alone (always plus) | **4.88 / 4.89** | **287 ms / 310 ms** |
+| off (baseline) | 2.01 | 143 ms / 125 ms |
+
+Two distinct failures. **AUTO is inert**: the kernel's `fuse_use_readdirplus()`
+issues plus only when `ctx->pos == 0` or a prior lookup set `FUSE_I_ADVISE_RDPLUS`,
+so only the FIRST getdents batch of a large enumeration comes back with
+attributes and every remaining entry still round trips - 2.08 vs 2.01 is nothing.
+**Always-plus is a 2.2x LOSS**: the kernel does send READDIRPLUS, our handler
+computes attributes for every entry it returns, and the per-entry stats round trip
+anyway - so the attribute work is paid twice. Fatter replies also fill the client
+buffer after ~150-200 entries instead of more, so the enumeration needs more
+READDIR calls on top.
+
+Caveat on the counter: `/proc/<pid>/io` `syscr+syscw` counts the daemon's image
+`pread`s as well as `/dev/fuse` traffic, so it is an upper bound on round trips,
+not a pure round-trip count. The wall time is the honest arbiter and it agrees -
+287/310 ms against 125/143 ms.
+
+### Retry predicate
+
+Retry only after establishing WHY the kernel does not satisfy the following
+`stat` from the readdirplus-populated dcache, measured on a `/dev/fuse`-only
+counter (not `/proc/<pid>/io`) showing per-entry round trips actually FALL. Until
+that is understood, advertising the capability makes the worst row worse. Do not
+re-add `READDIRPLUS_AUTO` at all - it is measurably inert for large directories.
+
 ## PROFILE: the mounted metadata row is TRANSPORT-bound, so levers 1/3/4 are all capped below parity - 2026-07-31
 
 Why this exists: lever 1 was rejected on correctness, but that left open "would a
