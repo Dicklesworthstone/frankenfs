@@ -85,6 +85,30 @@ Candidate stays frozen at
 `6a22cfcf…`), the same candidate as the banked ext4 rows, so the btrfs result is
 comparable to them and the only thing that changed is the filesystem arm.
 
+## 2b. The same run also serves the largest incumbent-less claim family
+
+Separately auditing every ledger row that asserts `KEEP`, `MEASURED`, or `WIN` against
+its own *"Ratio vs ext4/btrfs-kernel"* column:
+
+| | count |
+| --- | --- |
+| rows asserting KEEP / MEASURED / WIN | 186 |
+| ...carrying **no** vs-incumbent ratio | **67 (36%)** |
+| ...of those, btrfs surfaces | **26** |
+| ...of those, ext4 surfaces | 11 |
+| ...other or unclassified | 30 |
+
+Those 67 are self-speedups: real, gated, reproducible internal A/B wins that say nothing
+about whether an operator should choose FrankenFS over the incumbent. The single most
+common recorded reason is literally *"no mounted/kernel comparator"*.
+
+The btrfs share of that backlog — extent-tree lookups, keyed backrefs, orphan reclaim,
+csum-tree cleanup, send-stream generation, queued repair — is **26 rows with no
+incumbent arm in existence**, because btrfs has never scored one. So the btrfs mounted
+comparator is not just the one satisfied predicate; it is the measurement that gives an
+incumbent denominator to the largest incumbent-less family we hold. Priorities 1 and 2
+point at the same run.
+
 ## 3. Predicates checked and *not* satisfied
 
 Recorded so they are not re-attempted on the strength of these corrections:
