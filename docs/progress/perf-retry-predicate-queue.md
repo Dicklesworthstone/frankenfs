@@ -109,6 +109,64 @@ comparator is not just the one satisfied predicate; it is the measurement that g
 incumbent denominator to the largest incumbent-less family we hold. Priorities 1 and 2
 point at the same run.
 
+## 2c. RESULT — btrfs scores for the first time, and it is a loss
+
+Run executed 2026-07-30 on `thinkstation1`. Report:
+`/data/tmp/frankenfs-mounted-btrfs/run_1785468561_3195198/mounted-kernel-report.json`
+(schema v6).
+
+| | |
+| --- | --- |
+| Workload | btrfs `warm-stat`, 2,000 warm `stat` calls per observation, 128 pairs / **32 crossover blocks**, min-of-3 |
+| **FrankenFS ÷ kernel btrfs** | **`4.977803x` `[4.949139, 5.014278]` slower** |
+| Kernel A/A null | `0.996700x [0.985991, 1.006978]`, spread `1.014208x`, `ci_contains_one=true` |
+| FUSE A/A null | `1.002699x [1.000474, 1.009358]`, spread `1.009358x`, **`ci_contains_one=false`** |
+| Effect margin | clears twice the widest null log-margin, `1.028617x`; `directional_claim_clear=true` |
+| Worker threads | requested 1, **observed 1** on all four arms; bound CPU `[30]`, observed CPU set equal to bound set |
+| Governor / EPP | `amd-pstate-epp` / `powersave` / `performance` |
+| Integrity | four-arm parity `pass`, `btrfs check --readonly` **clean**, incumbent isolation `pass` |
+| Absolute medians | kernel `4.606 ms`, FrankenFS `23.017 ms` (diagnostic, `gate_input=false`) |
+| Driver | `4b0f0889e637481ac9aac15737ced66aee59a53efcd38c77ff3c0cbf396f6cdb`, built by `rch exec --base HEAD --clean-overlay --no-overlay` on `ovh-a`, self-hashed in process |
+| Candidate | frozen `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`, x86-64-v3 + PGO `6a22cfcf…`, identical to the five banked ext4 rows |
+
+**Plain sentence: we lose.** On 2,000 warm `stat` calls against kernel btrfs, FrankenFS
+is about five times slower.
+
+### The disclosure that matters
+
+`fuse_aa.ci_contains_one` is **false**. Under the pre-`2198a47d` gate this run would
+have been `BLOCKED-NULL`, exactly like the three 2026-07-27 btrfs attempts. It is
+admitted **solely** on the schema-v6 median clause — median `1.002699x` inside
+`[0.98, 1.02]`, spread inside `1.025x`. This is the **first row in the campaign whose
+admission depends on the gate correction**, and anyone auditing the correction should
+start here.
+
+It is a **loss**. A relaxed gate that produces a new loss is not the loosening signature;
+a relaxed gate that produces a crop of new wins would be. That is the whole integrity
+argument for the correction, and this row is the first live test of it rather than a
+counterfactual re-score.
+
+### Corroboration, explicitly not pooling
+
+The three historical unadmitted btrfs estimates were `4.931910x`, `4.951192x`, and
+`4.960432x`. This admitted `4.977803x` sits within **0.9%** of them. That is what the
+queue predicted in section 2: the block was the gate, not the physics. Those three
+remain unpublishable and unpooled — this row stands on its own invocation.
+
+### Status: single run, replication pending
+
+One admitted invocation. A second was attempted immediately and the harness's own
+placement preflight **refused** it — *"no physical core has every SMT thread below the
+driver contention limit"* — because a co-tenant agent's build loaded the host. That is
+the fail-closed gate working, not a failed replicate. Until a second window lands, this
+row is a **single-invocation result** and must be described that way. Do not upgrade its
+language on the strength of the three historical estimates agreeing with it.
+
+Instrument caveat found while retrying: piping the driver through `tail` masks its exit
+code with `tail`'s, so a refused gate can read as success to a wrapper script. The retry
+harness now captures the driver's own exit code directly. The four-arm reports were never
+affected — this was my wrapper, not the comparator.
+
 ## 3. Predicates checked and *not* satisfied
 
 Recorded so they are not re-attempted on the strength of these corrections:
