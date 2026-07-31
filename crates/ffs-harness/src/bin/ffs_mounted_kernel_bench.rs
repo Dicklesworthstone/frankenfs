@@ -22,7 +22,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -53,6 +53,15 @@ const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
 const DEFAULT_PARALLEL_THREADS: usize = 8;
 const MAX_CLIENT_THREADS: usize = 4096;
 const PARALLEL_READ_FILE_BYTES: usize = 256 * 1024;
+const XATTR_INLINE_FILE: &str = "xattr-inline.bin";
+const XATTR_EXTERNAL_FILE: &str = "xattr-external.bin";
+const XATTR_MANY_FILE: &str = "xattr-many.bin";
+const XATTR_INLINE_NAME: &str = "user.inline";
+const XATTR_EXTERNAL_NAME: &str = "user.external";
+const XATTR_ABSENT_NAME: &str = "user.absent";
+const XATTR_INLINE_VALUE: &[u8] = b"inline-value";
+const XATTR_EXTERNAL_VALUE_BYTES: usize = 512;
+const XATTR_MANY_NAMES: usize = 24;
 const WARMUP_ROUNDS: usize = 8;
 const PHYSICAL_ROLE_CROSSOVER_ROUNDS: usize = 2;
 const ESTIMATOR_BLOCK_ROUNDS: usize = 4;
@@ -112,6 +121,7 @@ enum Workload {
     CreateDeleteStorm,
     ReaddirStat8,
     FsyncJournalCommit,
+    XattrGetListReport,
 }
 
 impl Workload {
@@ -123,6 +133,7 @@ impl Workload {
             Self::CreateDeleteStorm => "small_file_create_delete_storm",
             Self::ReaddirStat8 => "large_directory_readdir_stat_8t",
             Self::FsyncJournalCommit => "fsync_journal_commit",
+            Self::XattrGetListReport => "xattr_get_list_report",
         }
     }
 
@@ -137,7 +148,10 @@ impl Workload {
         match self {
             Self::ParallelMetadataWrite => configured,
             Self::ParallelRead8 | Self::ReaddirStat8 => DEFAULT_PARALLEL_THREADS,
-            Self::WarmStat | Self::CreateDeleteStorm | Self::FsyncJournalCommit => 1,
+            Self::WarmStat
+            | Self::CreateDeleteStorm
+            | Self::FsyncJournalCommit
+            | Self::XattrGetListReport => 1,
         }
     }
 
@@ -146,7 +160,10 @@ impl Workload {
             Self::ParallelMetadataWrite => "create_then_fsync_each_worker_directory",
             Self::CreateDeleteStorm => "create_fsyncdir_delete_fsyncdir",
             Self::FsyncJournalCommit => "write_4k_then_fsync_each_operation",
-            Self::WarmStat | Self::ParallelRead8 | Self::ReaddirStat8 => "read_only_no_mutation",
+            Self::WarmStat
+            | Self::ParallelRead8
+            | Self::ReaddirStat8
+            | Self::XattrGetListReport => "read_only_no_mutation",
         }
     }
 
@@ -159,7 +176,10 @@ impl Workload {
             Self::ParallelMetadataWrite | Self::ParallelRead8 | Self::ReaddirStat8 => {
                 "unique Linux TIDs reported by workers inside each timed batch"
             }
-            Self::WarmStat | Self::CreateDeleteStorm | Self::FsyncJournalCommit => {
+            Self::WarmStat
+            | Self::CreateDeleteStorm
+            | Self::FsyncJournalCommit
+            | Self::XattrGetListReport => {
                 "single Linux benchmark-driver TID observed before and after each timed batch"
             }
         }
@@ -196,6 +216,12 @@ impl Workload {
             Self::FsyncJournalCommit => format!(
                 "one durability job: perform {operations} 4096-byte positioned writes to one \
                  mounted file and fsync after every write"
+            ),
+            Self::XattrGetListReport => format!(
+                "one warm-cache xattr report job: repeat {operations} complete five-call \
+                 reports, each reading one inline value, reading one external-block value, \
+                 checking one absent name, listing one name, and listing {XATTR_MANY_NAMES} \
+                 names"
             ),
         }
     }
@@ -262,6 +288,18 @@ impl Workload {
                 "bytes_per_write": 4096,
                 "file_fsyncs": operations,
                 "total_bytes_written": operations.saturating_mul(4096),
+            }),
+            Self::XattrGetListReport => json!({
+                "complete_reports": operations,
+                "xattr_api_calls_per_report": 5,
+                "total_xattr_api_calls": operations.saturating_mul(5),
+                "inline_get_hits": operations,
+                "external_block_get_hits": operations,
+                "absent_get_lookups": operations,
+                "single_name_lists": operations,
+                "many_name_lists": operations,
+                "many_list_names": XATTR_MANY_NAMES,
+                "returned_names_and_values_validated_outside_timing": true,
             }),
         };
         json!({
@@ -484,6 +522,16 @@ struct TreeWitness {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct XattrWitness {
+    sha256: String,
+    inline_value_bytes: usize,
+    external_value_bytes: usize,
+    single_list_names: usize,
+    many_list_names: usize,
+    absent_lookup_none: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FfsBinaryIdentity {
     binary_sha256: String,
     pgo_profile_sha256: String,
@@ -665,7 +713,8 @@ fn usage() {
            --filesystem ext4|btrfs|both   Filesystem arm(s), default both\n\
            --workload NAME                warm-stat | parallel-metadata-write |\n\
                                           parallel-read-8t | create-delete-storm |\n\
-                                          readdir-stat-8t | fsync-journal-commit\n\
+                                          readdir-stat-8t | fsync-journal-commit |\n\
+                                          xattr-get-list-report\n\
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
            --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32)\n\
            --operations N                 Workload operations per observation (default 2000)\n\
@@ -708,8 +757,9 @@ fn parse_workload(value: &str) -> Result<Workload> {
         "create-delete-storm" => Ok(Workload::CreateDeleteStorm),
         "readdir-stat-8t" => Ok(Workload::ReaddirStat8),
         "fsync-journal-commit" => Ok(Workload::FsyncJournalCommit),
+        "xattr-get-list-report" => Ok(Workload::XattrGetListReport),
         _ => bail!(
-            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit"
+            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit|xattr-get-list-report"
         ),
     }
 }
@@ -794,6 +844,11 @@ fn validate_config(config: &Config) -> Result<()> {
         config.host_quiet_timeout_ms
             >= CPU_SAMPLE_INTERVAL_MS.saturating_mul(config.host_quiet_samples as u64),
         "--host-quiet-timeout-ms must cover at least --host-quiet-samples one-second samples"
+    );
+    ensure!(
+        config.workload != Workload::XattrGetListReport
+            || config.filesystems == RequestedFilesystems::Ext4,
+        "xattr-get-list-report currently requires --filesystem ext4 because its inline/external storage-shape proof is ext4-specific"
     );
     Ok(())
 }
@@ -1143,6 +1198,12 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
         Workload::FsyncJournalCommit => {
             write_fixture_file(&root.join("fsync.bin"), 4096, 0xF5)?;
         }
+        Workload::XattrGetListReport => {
+            for name in [XATTR_INLINE_FILE, XATTR_EXTERNAL_FILE, XATTR_MANY_FILE] {
+                File::create(root.join(name))
+                    .with_context(|| format!("create xattr fixture file {name}"))?;
+            }
+        }
     }
     Ok(root)
 }
@@ -1173,6 +1234,84 @@ fn run_checked(command: &mut Command, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn xattr_many_name(index: usize) -> String {
+    format!("user.item{index:02}")
+}
+
+fn xattr_external_value() -> Vec<u8> {
+    (0..XATTR_EXTERNAL_VALUE_BYTES)
+        .map(|index| b'A' + u8::try_from(index % 26).expect("alphabet index fits u8"))
+        .collect()
+}
+
+fn debugfs_set_xattr(image: &Path, file: &str, name: &str, value: &[u8]) -> Result<()> {
+    let value = std::str::from_utf8(value).context("debugfs fixture xattr must be ASCII")?;
+    run_checked(
+        Command::new("debugfs")
+            .args(["-w", "-R", &format!("ea_set /{file} {name} {value}")])
+            .arg(image)
+            .stdout(Stdio::null()),
+        &format!("debugfs set {name} on {file}"),
+    )
+}
+
+fn debugfs_file_acl_block(image: &Path, file: &str) -> Result<u64> {
+    let output = Command::new("debugfs")
+        .args(["-R", &format!("stat /{file}")])
+        .arg(image)
+        .output()
+        .with_context(|| format!("debugfs stat xattr fixture {file}"))?;
+    ensure!(
+        output.status.success(),
+        "debugfs stat xattr fixture {file} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let stdout = String::from_utf8(output.stdout).context("debugfs stat output is not UTF-8")?;
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("File ACL:"))
+        .ok_or_else(|| anyhow!("debugfs stat for {file} omitted File ACL"))
+        .and_then(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("parse debugfs File ACL for {file}"))
+        })
+}
+
+fn seed_ext4_xattr_fixture(image: &Path) -> Result<()> {
+    debugfs_set_xattr(
+        image,
+        XATTR_INLINE_FILE,
+        XATTR_INLINE_NAME,
+        XATTR_INLINE_VALUE,
+    )?;
+    debugfs_set_xattr(
+        image,
+        XATTR_EXTERNAL_FILE,
+        XATTR_EXTERNAL_NAME,
+        &xattr_external_value(),
+    )?;
+    for index in 0..XATTR_MANY_NAMES {
+        let name = xattr_many_name(index);
+        let value = format!("{index:02}");
+        debugfs_set_xattr(image, XATTR_MANY_FILE, &name, value.as_bytes())?;
+    }
+    ensure!(
+        debugfs_file_acl_block(image, XATTR_INLINE_FILE)? == 0,
+        "single small xattr unexpectedly escaped the ext4 inode body"
+    );
+    ensure!(
+        debugfs_file_acl_block(image, XATTR_EXTERNAL_FILE)? != 0,
+        "large xattr did not allocate an ext4 external xattr block"
+    );
+    ensure!(
+        debugfs_file_acl_block(image, XATTR_MANY_FILE)? != 0,
+        "24-name list fixture did not allocate an ext4 external xattr block"
+    );
+    Ok(())
+}
+
 fn create_base_image(
     kind: FilesystemKind,
     fixture_root: &Path,
@@ -1194,6 +1333,9 @@ fn create_base_image(
                 command.arg("-d").arg(fixture_root).arg(&image),
                 "mke2fs ext4 fixture",
             )?;
+            if config.workload == Workload::XattrGetListReport {
+                seed_ext4_xattr_fixture(&image)?;
+            }
         }
         FilesystemKind::Btrfs => run_checked(
             Command::new("mkfs.btrfs")
@@ -1708,6 +1850,81 @@ fn tree_witness(root: &Path) -> Result<TreeWitness> {
     })
 }
 
+fn list_xattr_names(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let mut names = xattr::list(path)
+        .with_context(|| format!("list xattrs for {}", path.display()))?
+        .map(OsStringExt::into_vec)
+        .collect::<Vec<_>>();
+    names.sort();
+    Ok(names)
+}
+
+fn required_xattr(path: &Path, name: &str) -> Result<Vec<u8>> {
+    xattr::get(path, name)
+        .with_context(|| format!("get xattr {name} from {}", path.display()))?
+        .ok_or_else(|| anyhow!("required xattr {name} absent from {}", path.display()))
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn xattr_witness(root: &Path) -> Result<XattrWitness> {
+    let inline_path = root.join(XATTR_INLINE_FILE);
+    let external_path = root.join(XATTR_EXTERNAL_FILE);
+    let many_path = root.join(XATTR_MANY_FILE);
+    let inline_value = required_xattr(&inline_path, XATTR_INLINE_NAME)?;
+    let external_value = required_xattr(&external_path, XATTR_EXTERNAL_NAME)?;
+    let absent_lookup_none = xattr::get(&inline_path, XATTR_ABSENT_NAME)
+        .with_context(|| format!("get absent xattr from {}", inline_path.display()))?
+        .is_none();
+    let single_names = list_xattr_names(&inline_path)?;
+    let many_names = list_xattr_names(&many_path)?;
+    let expected_many_names = (0..XATTR_MANY_NAMES)
+        .map(|index| xattr_many_name(index).into_bytes())
+        .collect::<Vec<_>>();
+    ensure!(
+        inline_value == XATTR_INLINE_VALUE,
+        "inline xattr value differs from fixture contract"
+    );
+    ensure!(
+        external_value == xattr_external_value(),
+        "external-block xattr value differs from fixture contract"
+    );
+    ensure!(
+        absent_lookup_none,
+        "absent xattr lookup unexpectedly returned a value"
+    );
+    ensure!(
+        single_names == [XATTR_INLINE_NAME.as_bytes().to_vec()],
+        "single-name xattr list differs from fixture contract: {single_names:?}"
+    );
+    ensure!(
+        many_names == expected_many_names,
+        "{XATTR_MANY_NAMES}-name xattr list differs from fixture contract"
+    );
+
+    let mut hasher = Sha256::new();
+    hash_length_prefixed(&mut hasher, &inline_value);
+    hash_length_prefixed(&mut hasher, &external_value);
+    hasher.update([u8::from(absent_lookup_none)]);
+    for name in &single_names {
+        hash_length_prefixed(&mut hasher, name);
+    }
+    for name in &many_names {
+        hash_length_prefixed(&mut hasher, name);
+    }
+    Ok(XattrWitness {
+        sha256: hex::encode(hasher.finalize()),
+        inline_value_bytes: inline_value.len(),
+        external_value_bytes: external_value.len(),
+        single_list_names: single_names.len(),
+        many_list_names: many_names.len(),
+        absent_lookup_none,
+    })
+}
+
 fn assert_independent_arms(mounts: &[MountedArm]) -> Result<()> {
     ensure!(mounts.len() == 4, "independence proof requires four mounts");
     let images: BTreeSet<PathBuf> = mounts.iter().map(|mount| mount.image.clone()).collect();
@@ -1765,6 +1982,55 @@ fn stat_batch(path: &Path, operations: usize) -> Result<(u64, u64)> {
             ^ metadata.nlink().rotate_left(31)
             ^ u64::try_from(index).unwrap_or(u64::MAX);
         digest = digest.rotate_left(9) ^ row;
+    }
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(digest);
+    Ok((elapsed, digest))
+}
+
+fn fold_xattr_bytes(mut digest: u64, bytes: &[u8]) -> u64 {
+    digest ^= u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    digest = digest.wrapping_mul(0x0000_0100_0000_01B3);
+    for byte in bytes {
+        digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    digest
+}
+
+fn fold_xattr_names(mut digest: u64, names: &[Vec<u8>]) -> u64 {
+    digest ^= u64::try_from(names.len()).unwrap_or(u64::MAX);
+    for name in names {
+        digest = fold_xattr_bytes(digest, name);
+    }
+    digest
+}
+
+fn xattr_get_list_report_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
+    let inline_path = root.join(XATTR_INLINE_FILE);
+    let external_path = root.join(XATTR_EXTERNAL_FILE);
+    let many_path = root.join(XATTR_MANY_FILE);
+    let mut digest = 0xCBF2_9CE4_8422_2325_u64;
+    let started = Instant::now();
+    for report in 0..operations {
+        let inline = xattr::get(black_box(&inline_path), XATTR_INLINE_NAME)
+            .with_context(|| format!("timed getxattr {}", inline_path.display()))?;
+        let external = xattr::get(black_box(&external_path), XATTR_EXTERNAL_NAME)
+            .with_context(|| format!("timed getxattr {}", external_path.display()))?;
+        let absent = xattr::get(black_box(&inline_path), XATTR_ABSENT_NAME)
+            .with_context(|| format!("timed absent getxattr {}", inline_path.display()))?;
+        let single_names = list_xattr_names(black_box(&inline_path))?;
+        let many_names = list_xattr_names(black_box(&many_path))?;
+
+        digest ^= u64::try_from(report).unwrap_or(u64::MAX).rotate_left(17);
+        digest = fold_xattr_bytes(digest, inline.as_deref().unwrap_or_default());
+        digest = fold_xattr_bytes(digest, external.as_deref().unwrap_or_default());
+        digest ^= if absent.is_none() {
+            0xA11C_E000_0000_0001
+        } else {
+            0xA11C_E000_0000_0000
+        };
+        digest = fold_xattr_names(digest, &single_names);
+        digest = fold_xattr_names(digest, &many_names);
     }
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     black_box(digest);
@@ -2190,7 +2456,10 @@ fn workload_batch(
         }
         Workload::ParallelRead8 => return parallel_read_batch(root, config.operations, pinning),
         Workload::ReaddirStat8 => return readdir_stat_batch(root, config.operations, pinning),
-        Workload::WarmStat | Workload::CreateDeleteStorm | Workload::FsyncJournalCommit => {}
+        Workload::WarmStat
+        | Workload::CreateDeleteStorm
+        | Workload::FsyncJournalCommit
+        | Workload::XattrGetListReport => {}
     }
     // The driver thread is bound once at startup; reaffirm and capture it here
     // so a serial batch still proves which CPU it ran on.
@@ -2203,6 +2472,7 @@ fn workload_batch(
         }
         Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations)?,
         Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence)?,
+        Workload::XattrGetListReport => xattr_get_list_report_batch(root, config.operations)?,
     };
     let driver_tid_after = current_linux_tid()?;
     ensure!(
@@ -3424,6 +3694,7 @@ fn fs_report(
     let identities: Vec<Value> = mounts.iter().map(MountedArm::identity_json).collect();
     let mut parity = BTreeMap::new();
     let mut initial_trees = BTreeMap::new();
+    let mut initial_xattrs = BTreeMap::new();
     let mut roots = BTreeMap::new();
     for mount in &mounts {
         parity.insert(
@@ -3431,6 +3702,9 @@ fn fs_report(
             parity_witness(&mount.workload_root().join("payload.bin"))?,
         );
         initial_trees.insert(mount.arm, tree_witness(mount.workload_root())?);
+        if config.workload == Workload::XattrGetListReport {
+            initial_xattrs.insert(mount.arm, xattr_witness(mount.workload_root())?);
+        }
         roots.insert(mount.arm, mount.workload_root().to_path_buf());
     }
     let expected_parity = parity
@@ -3453,6 +3727,20 @@ fn fs_report(
         "initial mounted tree parity mismatch for {}: {initial_trees:?}",
         kind.label()
     );
+    let expected_initial_xattr = if config.workload == Workload::XattrGetListReport {
+        let expected = initial_xattrs
+            .get(&Arm::KernelA)
+            .cloned()
+            .ok_or_else(|| anyhow!("kernel A initial xattr witness missing"))?;
+        ensure!(
+            initial_xattrs.values().all(|witness| witness == &expected),
+            "initial mounted xattr parity mismatch for {}: {initial_xattrs:?}",
+            kind.label()
+        );
+        Some(expected)
+    } else {
+        None
+    };
 
     thread::sleep(Duration::from_millis(config.pre_measurement_settle_ms));
     let post_mount_host_quiet_window = if config.placement_scope == PlacementScope::HostWide {
@@ -3667,6 +3955,19 @@ fn fs_report(
         expected_initial_tree.directories,
         expected_initial_tree.bytes,
     );
+    if let Some(xattr) = &expected_initial_xattr {
+        println!(
+            "mounted_kernel_xattr_parity,filesystem={},workload={},arms=4,xattr_sha256={},inline_value_bytes={},external_value_bytes={},single_list_names={},many_list_names={},absent_lookup_none={},external_storage_proof=debugfs_nonzero_file_acl_block,validation_timing=outside_measurement,verdict=pass",
+            kind.label(),
+            config.workload.label(),
+            xattr.sha256,
+            xattr.inline_value_bytes,
+            xattr.external_value_bytes,
+            xattr.single_list_names,
+            xattr.many_list_names,
+            xattr.absent_lookup_none,
+        );
+    }
     for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
         println!(
             "mounted_kernel_worker_threads,filesystem={},workload={},assignment_arm={},requested={},runtime_observed_values={},observation_method={},clear={}",
@@ -3821,6 +4122,28 @@ fn fs_report(
         "post-workload mounted tree parity mismatch for {}: {final_trees:?}",
         kind.label()
     );
+    let expected_final_xattr = if config.workload == Workload::XattrGetListReport {
+        let final_xattrs = mounts
+            .iter()
+            .map(|mount| Ok((mount.arm, xattr_witness(mount.workload_root())?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let expected = final_xattrs
+            .get(&Arm::KernelA)
+            .cloned()
+            .ok_or_else(|| anyhow!("kernel A final xattr witness missing"))?;
+        ensure!(
+            final_xattrs.values().all(|witness| witness == &expected),
+            "post-workload mounted xattr parity mismatch for {}: {final_xattrs:?}",
+            kind.label()
+        );
+        ensure!(
+            Some(&expected) == expected_initial_xattr.as_ref(),
+            "read-only xattr workload changed its returned names or values"
+        );
+        Some(expected)
+    } else {
+        None
+    };
     if !config.workload.is_mutating()
         || matches!(
             config.workload,
@@ -3843,6 +4166,14 @@ fn fs_report(
         expected_final_tree.directories,
         expected_final_tree.bytes,
     );
+    if let Some(xattr) = &expected_final_xattr {
+        println!(
+            "mounted_kernel_post_xattr_parity,filesystem={},workload={},arms=4,xattr_sha256={},validation_timing=outside_measurement,verdict=pass",
+            kind.label(),
+            config.workload.label(),
+            xattr.sha256,
+        );
+    }
 
     for mount in mounts.iter_mut().rev() {
         mount.unmount()?;
@@ -3900,6 +4231,26 @@ fn fs_report(
             "avx512bw": host.runtime_features.contains("avx512bw"),
         },
     });
+    let xattr_parity_json = match (&expected_initial_xattr, &expected_final_xattr) {
+        (Some(initial), Some(final_witness)) => json!({
+            "verdict": "pass",
+            "validation_timing": "outside_measurement",
+            "storage_shape_proof": {
+                "inline": "debugfs_file_acl_zero",
+                "external": "debugfs_file_acl_nonzero",
+                "many_name_list": "debugfs_file_acl_nonzero",
+            },
+            "initial_sha256": initial.sha256,
+            "final_sha256": final_witness.sha256,
+            "inline_value_bytes": initial.inline_value_bytes,
+            "external_value_bytes": initial.external_value_bytes,
+            "single_list_names": initial.single_list_names,
+            "many_list_names": initial.many_list_names,
+            "absent_lookup_none": initial.absent_lookup_none,
+        }),
+        (None, None) => json!("not_applicable"),
+        _ => unreachable!("xattr witnesses must be present at both parity boundaries"),
+    };
     let parity_json = json!({
         "verdict": "pass",
         "file_sha256": expected_parity.file_sha256,
@@ -3922,6 +4273,7 @@ fn fs_report(
             "directories": expected_final_tree.directories,
             "bytes": expected_final_tree.bytes,
         },
+        "xattr": xattr_parity_json,
     });
     let host_wide_quiescence_json = post_mount_host_quiet_window.as_ref().map_or_else(
         || json!("not_applicable"),
@@ -4623,6 +4975,7 @@ mod tests {
             DEFAULT_PARALLEL_THREADS
         );
         assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
+        assert_eq!(Workload::XattrGetListReport.client_threads(96), 1);
     }
 
     #[test]
@@ -4642,6 +4995,11 @@ mod tests {
         assert!(readdir.contains("8 workers"));
         assert!(readdir.contains("every entry exactly once"));
 
+        let xattr = Workload::XattrGetListReport.job_statement(2_000, 1);
+        assert!(xattr.contains("2000 complete five-call reports"));
+        assert!(xattr.contains("external-block value"));
+        assert!(xattr.contains("listing 24 names"));
+
         let chooser =
             Workload::ParallelRead8.chooser_statement(FilesystemKind::Ext4, 1024, 8, Some(8));
         assert!(
@@ -4660,6 +5018,48 @@ mod tests {
             work["common"]["same_driver_implementation_for_all_four_arms"],
             true
         );
+    }
+
+    #[test]
+    fn xattr_report_batch_matches_untimed_exact_witness() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in [XATTR_INLINE_FILE, XATTR_EXTERNAL_FILE, XATTR_MANY_FILE] {
+            File::create(temp.path().join(name)).expect("create xattr fixture file");
+        }
+        xattr::set(
+            temp.path().join(XATTR_INLINE_FILE),
+            XATTR_INLINE_NAME,
+            XATTR_INLINE_VALUE,
+        )
+        .expect("set inline xattr");
+        xattr::set(
+            temp.path().join(XATTR_EXTERNAL_FILE),
+            XATTR_EXTERNAL_NAME,
+            &xattr_external_value(),
+        )
+        .expect("set external xattr");
+        for index in 0..XATTR_MANY_NAMES {
+            xattr::set(
+                temp.path().join(XATTR_MANY_FILE),
+                xattr_many_name(index),
+                format!("{index:02}").as_bytes(),
+            )
+            .expect("set many-list xattr");
+        }
+
+        let witness = xattr_witness(temp.path()).expect("exact xattr witness");
+        assert_eq!(witness.inline_value_bytes, XATTR_INLINE_VALUE.len());
+        assert_eq!(witness.external_value_bytes, XATTR_EXTERNAL_VALUE_BYTES);
+        assert_eq!(witness.single_list_names, 1);
+        assert_eq!(witness.many_list_names, XATTR_MANY_NAMES);
+        assert!(witness.absent_lookup_none);
+
+        let (elapsed_ns, first_digest) =
+            xattr_get_list_report_batch(temp.path(), 2).expect("first xattr report");
+        let (_, second_digest) =
+            xattr_get_list_report_batch(temp.path(), 2).expect("second xattr report");
+        assert!(elapsed_ns > 0);
+        assert_eq!(first_digest, second_digest);
     }
 
     #[test]

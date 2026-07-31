@@ -13,6 +13,113 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Mounted xattr report is a current 6.059387x loss - 2026-07-30 (IvoryBison, vs-INCUMBENT measurement)
+
+This deliverable keeps one new mounted-comparator workload and makes no
+production-filesystem tuning claim. A real read-only xattr report repeats 5,000
+complete jobs. Each job performs five API calls through the Linux VFS:
+
+1. read a 12-byte inline xattr value;
+2. read a 512-byte external-block xattr value;
+3. check one absent xattr name;
+4. list a file with one xattr name; and
+5. list a file with 24 xattr names.
+
+The fixture proves the intended ext4 storage shapes outside timing with
+`debugfs`: the inline file has `File ACL: 0`, while the external-value and
+many-name files have nonzero external xattr blocks. Untimed exact witnesses
+validate every returned name and value, the absent lookup, and both list
+cardinalities before and after the timed region. The shared witness SHA-256 is
+`7aafc655fbff1cd5eae7a0d24acd44492cc1d253f1452cf18280c12fd880bdeb`;
+the full logical tree/content digest is also unchanged, and all four
+post-unmount `e2fsck` checks are clean.
+
+### Admitted direct-incumbent result
+
+| Workload | Kernel A/A null | FUSE A/A null | FrankenFS / kernel ext4 | Decision |
+| --- | --- | --- | --- | --- |
+| 5,000 complete xattr reports, one observed worker | `1.000756x [0.994355, 1.000847]`, spread `1.005677x`, clear | `0.999737x [0.998300, 1.001787]`, spread `1.001787x`, clear | **`6.059387x [6.036945, 6.071929]` slower**; twice-null margin `1.011385x` | **HONEST LOSS** |
+
+Both A/A medians are inside the corrected inclusive `[0.98, 1.02]` clause,
+both symmetric CI spreads are below `1.025x`, and CI straddling is telemetry,
+not a gate input. The competitive interval clears twice the widest null
+log-margin. The gate is wall-time deterministic-bootstrap median CI with
+20,000 resamples; `cv_used=false` and `instructions_used=false`. Diagnostic
+median batches were 85,553,446.5 ns for kernel ext4 and 518,425,656.5 ns for
+FrankenFS.
+
+**We lose: FrankenFS takes 6.059387 times the kernel-ext4 wall time for this
+complete xattr report job.**
+
+The run used 32 paired rounds / eight complete four-round physical crossover
+blocks, eight balanced warmups, three repeats per observation, and the minimum
+reducer. Requested and actual observed timed workers were `1/1` on every
+kernel-A, kernel-B, FUSE-A, and FUSE-B arm. The driver TID was observed on and
+bound to CPU 0; both FUSE daemons were guarded on CPU 1, with SMT siblings
+excluded. Mount options were matched at `ro,noatime,nodev,nosuid`; the kernel
+incumbent additionally used the required read-only `noload` semantic.
+
+### Identity and frequency provenance
+
+- Execution host: `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, 32
+  physical cores / 64 logical threads, 231,691,894,784 bytes RAM, one NUMA node,
+  Linux `6.17.0-35-generic`.
+- Runtime ISA: `avx+avx2+f16c+fma+sse2+sse4.2`.
+- CPU policy on all 64 CPUs: driver `amd-pstate-epp`, governor `powersave`, EPP
+  `performance`; the non-performance-governor warning is retained.
+- In-process driver ELF SHA-256:
+  `99a9684235ab1f923a30057ae23d92a6c88a19944c03246dd11fb122140d449b`
+  (built on remote worker `ovh-a`).
+- FrankenFS self-reported executing ELF SHA-256 `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`;
+  both daemon self-reports and both `/proc/<pid>/exe` hashes agree. PGO profile
+  SHA-256:
+  `6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+- Kernel incumbent artifact SHA-256:
+  `01e534223c871bd6246e8d57fd8c8101205384d682a3a23b6a5577fe28997c41`.
+
+The exact report is
+`/data/tmp/frankenfs-mounted-xattr-current/run_1785470336_3449697/mounted-kernel-report.json`
+with SHA-256
+`daac1522f778e4bbc963cfbff73cecff8fe896699e9eedb85fbb3104b2618ae1`.
+It uses same-LLC placement, a one-second CPU-contention sample, and records
+`host_wide_quiescence=not_applicable`, matching the current ext4 scorecard
+placement scope.
+
+A separately attempted host-wide run passed its initial requirement of five
+consecutive clear one-second samples only after 213 samples (213.1 seconds).
+After mount and fixture setup its second sustained gate found no five-sample
+clear window within 300 samples and 300 seconds. The harness failed closed
+before timing and emitted no row; that attempt is not pooled with, selected
+against, or used to strengthen the same-LLC result.
+
+### Build, validation, and retry predicate
+
+The driver build and focused validation used strict remote execution from
+source base `69346cd5` with
+`rch exec --base 69346cd5 --clean-overlay` and only `Cargo.toml`,
+`Cargo.lock`, `crates/ffs-harness/Cargo.toml`, and
+`crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs` overlaid. Remote
+`cargo check -j2 -p ffs-harness --bin ffs-mounted-kernel-bench` passed on
+`ovh-a`; the focused live-filesystem xattr witness/batch test passed on `hz1`.
+The release-perf driver was built on `ovh-a` and copied to the privileged
+execution host because RCH does not retrieve artifacts. There was no local
+Cargo fallback. A final strict-remote no-dependency Clippy attempt from current
+base `3cdd4cd6` reached `ffs-harness` on `hz1` but exited 101 on two pre-existing
+`fetch_update` deprecation errors in untouched
+`crates/ffs-harness/src/metrics.rs:94,100`; neither that file nor the warnings
+were in this clean overlay. Edited-file rustfmt and `git diff --check` pass.
+
+**Retry predicate:** replace this ratio only after the shipping candidate ELF,
+PGO profile, xattr implementation, or declared five-call job shape changes.
+Use the same four independent mounts, four-round crossover, corrected
+median-plus-spread null gate, doubled-null margin, exact xattr witnesses,
+observed TID/CPU attestation, in-process ELF identities, governor/host
+provenance, and clean offline checks. A host-wide replacement additionally
+requires both five-consecutive-sample gates to pass in the same invocation.
+Do not infer a source-level optimization from this aggregate gap; profile this
+exact job first, and never pool the failed host-wide attempt with an admitted
+row.
+
 ## Null medians now bound arm-order bias; CI straddling is telemetry - 2026-07-30 (PurpleSnow, vs-INCUMBENT gate correction)
 
 The fleet-level gate correction was explicitly authorized for this comparator.
