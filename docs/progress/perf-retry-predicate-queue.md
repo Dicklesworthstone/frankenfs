@@ -144,7 +144,8 @@ start here.
 It is a **loss**. A relaxed gate that produces a new loss is not the loosening signature;
 a relaxed gate that produces a crop of new wins would be. That is the whole integrity
 argument for the correction, and this row is the first live test of it rather than a
-counterfactual re-score.
+counterfactual re-score. The replicate below then clears the *old* gate unaided, so the
+btrfs finding itself does not rest on the correction — see "Replicated" below.
 
 ### Corroboration, explicitly not pooling
 
@@ -153,14 +154,37 @@ The three historical unadmitted btrfs estimates were `4.931910x`, `4.951192x`, a
 queue predicted in section 2: the block was the gate, not the physics. Those three
 remain unpublishable and unpooled — this row stands on its own invocation.
 
-### Status: single run, replication pending
+### Replicated — and the replicate does not need the gate correction
 
-One admitted invocation. A second was attempted immediately and the harness's own
-placement preflight **refused** it — *"no physical core has every SMT thread below the
-driver contention limit"* — because a co-tenant agent's build loaded the host. That is
-the fail-closed gate working, not a failed replicate. Until a second window lands, this
-row is a **single-invocation result** and must be described that way. Do not upgrade its
-language on the strength of the three historical estimates agreeing with it.
+Report: `/data/tmp/frankenfs-mounted-btrfs/run_1785468746_3222438/mounted-kernel-report.json`.
+
+| | Run 1 | Run 2 (replicate) |
+| --- | --- | --- |
+| Bound CPU | `[30]` | `[28]` |
+| **FrankenFS ÷ kernel btrfs** | `4.977803x [4.949139, 5.014278]` | `5.036433x [5.017720, 5.074796]` |
+| Kernel A/A | `0.996700x`, spread `1.014208x`, `ci_contains_one=true` | `1.000455x`, spread `1.002519x`, `ci_contains_one=true` |
+| FUSE A/A | `1.002699x`, spread `1.009358x`, **`ci_contains_one=false`** | `1.001758x`, spread `1.008016x`, **`ci_contains_one=true`** |
+| Twice-null margin | `1.028617x`, cleared | `1.016097x`, cleared |
+| Observed threads | 1/1 all arms, observed == bound | 1/1 all arms, observed == bound |
+| Parity / `btrfs check` | pass / clean | pass / clean |
+| Kernel · FrankenFS medians | `4.606 ms` · `23.017 ms` | `4.522 ms` · `22.738 ms` |
+
+The two invocations agree to **1.18%** on separate CPUs in separate windows.
+
+**The replicate clears the *old* gate as well** — both of its A/A CIs contain `1.0`. So
+the finding *"FrankenFS is roughly 5x slower than kernel btrfs on warm stat"* does **not**
+depend on the schema-v6 correction. The correction admitted run 1; an unrelaxed run
+independently confirms the same effect at the same magnitude.
+
+That is the strongest available evidence about the correction itself: its first live row
+is corroborated by a row that never needed it. Section 2's prediction — that the
+historical btrfs block was the gate and not the physics — now has a direct test rather
+than only a counterfactual. Five independent estimates of this surface (`4.931910x`,
+`4.951192x`, `4.960432x` historical and unadmitted; `4.977803x`, `5.036433x` admitted)
+span about **2%**.
+
+Still not pooled: the three historical values remain unpublishable, and the two admitted
+runs are reported separately rather than combined into one interval.
 
 Instrument caveat found while retrying: piping the driver through `tail` masks its exit
 code with `tail`'s, so a refused gate can read as success to a wrapper script. The retry
