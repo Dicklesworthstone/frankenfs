@@ -13,6 +13,77 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## PROFILE: the mounted metadata row is TRANSPORT-bound, so levers 1/3/4 are all capped below parity - 2026-07-31
+
+Why this exists: lever 1 was rejected on correctness, but that left open "would a
+correct version have won?". This profile answers it with arithmetic instead of
+another candidate. It also retires levers 3 and 4 for this row.
+
+### The budget, from the admitted same-invocation run
+
+The `1.507220x` control (same-invocation A/A nulls `1.012983x` kernel /
+`1.002400x` FUSE, bootstrap median CI `[1.494469, 1.524164]`, four-arm crossover)
+carries a per-op decomposition:
+
+| Quantity | Value |
+| --- | --- |
+| kernel arm, per op | `57.6 us` (its filesystem work runs in the callers' contexts across all 8 driver CPUs) |
+| FUSE arm, per op | `82.7 us` (served by ONE daemon CPU - `fuse_cpus=[6]` vs `driver_cpus` of 8) |
+| gap to close | `25.1 us` |
+| our filesystem core, CPU per create | **`7.5 us`** (`create-bench`, 1 thread, 20000 creates, user+sys) |
+
+**Deleting the entire filesystem layer leaves `82.7 - 7.5 = 75.2 us` against the
+kernel's `57.6 us` - still `1.31x` slower.** No lever that optimizes filesystem
+work can reach parity on this row. That covers lever 1 (buffer the commits),
+lever 3 (log-structure the metadata) and lever 4 (per-core arenas / lock-free
+inode alloc) alike.
+
+### Where the daemon's CPU actually goes
+
+`perf record -F 4999` on the FUSE daemon pinned to one CPU while 8 clients create
+files, 48,344 samples:
+
+| DSO | Share |
+| --- | --- |
+| `[kernel.kallsyms]` | **62.44%** |
+| `ffs-cli` (our code) | 24.43% |
+| `libc` (mostly 4 KiB `memmove`) | 12.82% |
+
+Top userspace symbols are flat - `lookup_in_dir_block` 1.88%, `ext4_add_dir_entry`
+1.50%, `Mutex::lock_contended` 1.34%, and **`ShardedMvccStore::commit` 1.04%**.
+That last one is lever 1's ENTIRE target: about **1%** of the cost on the path
+that loses. The kernel side is per-syscall and per-context-switch tax -
+`entry_SYSRETQ_unsafe_stack` 4.21%, SRSO mitigation thunks 2.66%, and ~7%+ of
+visible CFS scheduler work (`update_load_avg`, `reweight_entity`, `update_curr`,
+`psi_group_change`, `enqueue_task_fair`), plus `fuse_dev_do_read`.
+
+A corroborating in-process profile (`create-bench`, 8 threads, 1948 samples) puts
+the whole MVCC write path at `write_block` 4.25% inclusive / `commit` 4.07%
+inclusive / `prune_safe` 2.61% inclusive - so even measured generously and away
+from FUSE, lever 1's target is <=7%.
+
+### What this redirects to
+
+The headroom is the 62% kernel-side transport tax, i.e. round-trips on
+`/dev/fuse` and the context switch each one costs. That is lever 2's technology
+(io_uring, batched submission/completion) pointed at the FUSE TRANSPORT rather
+than at the data path. This host can host it: kernel `6.17.0-35-generic` has
+`CONFIG_FUSE_IO_URING=y` and a runtime knob `/sys/module/fuse/parameters/enable_uring`,
+currently `N`. The blocker is ours - the vendored `vendor/fuser` implements no
+ring protocol, so adopting it is real work, not a flag.
+
+Also unexplained and worth a separate look: 8.81% of the daemon's CPU is
+`__memmove_avx_unaligned_erms`, the largest single userspace item, consistent
+with whole 4 KiB block copies per metadata update.
+
+### Retry predicate
+
+Do not spend another candidate on reducing filesystem CPU for
+`parallel-metadata-write` until the per-op budget above is invalidated - i.e. a
+run where the FUSE daemon is NOT the single-CPU bottleneck, or where our
+filesystem CPU per create is shown to exceed ~25 us. Attack the transport first
+and re-derive this budget afterwards.
+
 ## Be-tree metadata message buffer (lever 1) is REJECTED - correctness, not speed - 2026-07-31
 
 `FFS_EXT4_METADATA_BUFFER` buffered whole-block metadata messages across 64
