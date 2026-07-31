@@ -209,3 +209,89 @@ Recorded so they are not re-attempted on the strength of these corrections:
   internal one-ELF A/B comparisons where the ISA cancels exactly (Class C). No REJECT is
   owed a retry merely because it predates the v3+PGO re-test; what it owes is the
   admissibility rule — no ratio publishable from a run lacking a `codegen_isa` line.
+
+## 4. Full sweep, 2026-07-31 — every retry predicate, not a sample
+
+Sections 1–3 examined the predicates I already knew about. This is the whole population,
+extracted mechanically from both ledgers with the shared parser:
+
+**179 rows carry a retry predicate** — 88 REJECT, 74 KEEP, 16 SURVEY, 1 unclassified.
+Bucketed by what each predicate *demands* (predicates can demand several things):
+
+| Predicate demands | rows | satisfied by the 2026-07-30/31 corrections? |
+| --- | --- | --- |
+| a witnessed v3+PGO profile attributing ≥5% of whole-operation time | 39 (15 REJECT) | **No** — see below |
+| CPU pinning or another counted mechanism | 32 | partly; see 4.3 |
+| an exclusive lease / owner-set governor / host-wide quiescence | 5 | **No** |
+| larger N or production parameter values | 4 | no attempt made |
+| both null CIs to contain `1.0` | 3 | superseded by the median clause |
+| a btrfs incumbent ratio to exist | 2 | **Yes — 4.1** |
+| a direct mounted comparator to exist | 2 | **Yes — 4.1** |
+| something else | 117 | not triggered by these corrections |
+
+### 4.1 Two rows whose predicate is now *evaluable*, and I evaluated it
+
+`bd-w3hol`, the `ffs-fuse` writeback-cache batch table
+(`perf-negative-results.md:6023` and `:6024`, both `Measured keep`). Predicate:
+
+> *"Retry only if a direct mounted write+fsync ext4/btrfs-kernel comparator shows
+> regression."*
+
+When those rows were written, no such comparator existed, so the clause was decorative.
+It now exists: `fsync-journal-commit` performs 8 × 4 KiB positioned writes with an
+`fsync` after each, through four independent live mounts.
+
+| | result | consequence for the row |
+| --- | --- | --- |
+| ext4 | `0.997098x [0.990808, 1.009108]`, `directional_claim_clear=false`, twice-null margin `1.030661x` | **no regression → both KEEPs stand.** Verdict unchanged, but for the first time it rests on a measurement instead of on the absence of an instrument. |
+| btrfs | **unrunnable** — the first positioned write returns `EIO` (`bd-ftev0`), 6/6 deterministic | the btrfs half of the predicate **cannot be evaluated at all**. The rows claim durability/lock semantics across both filesystems; on btrfs that claim is untestable until `bd-ftev0` is fixed. |
+
+Both rows stay KEEP. The btrfs half is now an open obligation attached to `bd-ftev0`
+rather than an unnoticed gap.
+
+### 4.2 A correction to section 2b of this file
+
+Section 2b said the btrfs comparator run *"is the measurement that gives an incumbent
+denominator to the largest incumbent-less family we hold"* — the 26 btrfs rows covering
+extent-tree lookups, keyed backrefs, orphan reclaim, csum-tree cleanup, send-stream
+generation, and queued repair.
+
+**That was too generous and I am withdrawing it.** The btrfs run produced ratios for five
+*workloads* (readdir+stat, warm stat, create/delete storm, parallel metadata writes,
+parallel read). None of those 26 rows names any of those five surfaces. Giving the
+filesystem an incumbent denominator does not give an incumbent denominator to every claim
+that mentions the filesystem. Those 26 rows are exactly as unconverted as they were
+before the run, and `docs/INCUMBENT_RATIO_COVERAGE.md` counts them that way.
+
+What the btrfs run actually discharged is narrower and still real: btrfs went from *zero*
+admitted competitive ratios to five, and the one satisfied predicate in section 2.
+
+### 4.3 `NEGATIVE_EVIDENCE.md:32` — superseded, **not** satisfied
+
+The read/readdir predicate demanded, as a hard conjunction, *"first hold a machine-level
+exclusive lease for the entire timed routine"*. Read and readdir subsequently scored in
+the 2026-07-30 pinned bank (`4.967448x` and `1.287862x`). **No exclusive lease was ever
+held**, and no per-block CPU-migration or page-fault counters were supplied.
+
+What happened instead is that the predicate's premise was refuted. It assumed the confound
+was co-tenancy and dynamic frequency; the counted mechanism showed the confound was
+*unpinned timed threads*, reproduced out-of-harness by a standalone C replica whose only
+variable was per-worker CPU binding, with the governor held identical across arms. That is
+a stronger result than the predicate asked for — but it is a **supersession**, and the
+distinction matters: a future reader must not conclude that an exclusive lease was
+obtained. The lease clause no longer describes a confound anyone has evidence for, so it
+is retired rather than satisfied.
+
+### 4.4 The 15 REJECTs naming v3+PGO are still blocked, and now I know exactly why
+
+Every one of the 15 is a **conjunction**: a witnessed v3+PGO ELF *and* a fresh production
+profile attributing at least 5% of whole-operation wall or cycles to the named surface.
+The ISA re-test supplies the ELF. It supplies no profile. All 15 remain blocked, and none
+of them is blocked *on the ISA correction* — they are blocked on profiling work nobody has
+done. Section 3's conclusion holds over the full population, not just the sample I checked.
+
+Two of them (`NEGATIVE_EVIDENCE.md:41`, `perf-negative-results.md:1275`) are blocked on
+something sharper and worth naming: they demand generic, exact v3+PGO, and matched
+mounted-kernel arms **in one same-worker gate**. The comparator accepts a single
+`--ffs-cli`, so it structurally cannot host a generic candidate arm and a v3+PGO candidate
+arm in one invocation. That is an *instrument* gap with a known fix, not an evidence gap.
