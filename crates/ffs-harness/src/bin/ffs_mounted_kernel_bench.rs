@@ -53,6 +53,9 @@ const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
 const DEFAULT_PARALLEL_THREADS: usize = 8;
 const MAX_CLIENT_THREADS: usize = 4096;
 const PARALLEL_READ_FILE_BYTES: usize = 256 * 1024;
+const BULK_DURABLE_FILE: &str = "bulk-durable.bin";
+const BULK_DURABLE_CHUNK_BYTES: usize = 1024 * 1024;
+const BULK_DURABLE_IMAGE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 const XATTR_INLINE_FILE: &str = "xattr-inline.bin";
 const XATTR_EXTERNAL_FILE: &str = "xattr-external.bin";
 const XATTR_MANY_FILE: &str = "xattr-many.bin";
@@ -121,6 +124,7 @@ enum Workload {
     CreateDeleteStorm,
     ReaddirStat8,
     FsyncJournalCommit,
+    BulkDurableWrite,
     XattrGetListReport,
 }
 
@@ -133,6 +137,7 @@ impl Workload {
             Self::CreateDeleteStorm => "small_file_create_delete_storm",
             Self::ReaddirStat8 => "large_directory_readdir_stat_8t",
             Self::FsyncJournalCommit => "fsync_journal_commit",
+            Self::BulkDurableWrite => "bulk_durable_write",
             Self::XattrGetListReport => "xattr_get_list_report",
         }
     }
@@ -140,7 +145,10 @@ impl Workload {
     const fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::ParallelMetadataWrite | Self::CreateDeleteStorm | Self::FsyncJournalCommit
+            Self::ParallelMetadataWrite
+                | Self::CreateDeleteStorm
+                | Self::FsyncJournalCommit
+                | Self::BulkDurableWrite
         )
     }
 
@@ -151,6 +159,7 @@ impl Workload {
             Self::WarmStat
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
+            | Self::BulkDurableWrite
             | Self::XattrGetListReport => 1,
         }
     }
@@ -160,6 +169,7 @@ impl Workload {
             Self::ParallelMetadataWrite => "create_then_fsync_each_worker_directory",
             Self::CreateDeleteStorm => "create_fsyncdir_delete_fsyncdir",
             Self::FsyncJournalCommit => "write_4k_then_fsync_each_operation",
+            Self::BulkDurableWrite => "overwrite_1m_chunks_then_single_file_fsync",
             Self::WarmStat
             | Self::ParallelRead8
             | Self::ReaddirStat8
@@ -179,6 +189,7 @@ impl Workload {
             Self::WarmStat
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
+            | Self::BulkDurableWrite
             | Self::XattrGetListReport => {
                 "single Linux benchmark-driver TID observed before and after each timed batch"
             }
@@ -216,6 +227,12 @@ impl Workload {
             Self::FsyncJournalCommit => format!(
                 "one durability job: perform {operations} 4096-byte positioned writes to one \
                  mounted file and fsync after every write"
+            ),
+            Self::BulkDurableWrite => format!(
+                "one bulk durable output job: overwrite one preallocated file with {operations} \
+                 sequential {BULK_DURABLE_CHUNK_BYTES}-byte positioned writes ({} total bytes), \
+                 then fsync the file once",
+                operations.saturating_mul(BULK_DURABLE_CHUNK_BYTES)
             ),
             Self::XattrGetListReport => format!(
                 "one warm-cache xattr report job: repeat {operations} complete five-call \
@@ -288,6 +305,15 @@ impl Workload {
                 "bytes_per_write": 4096,
                 "file_fsyncs": operations,
                 "total_bytes_written": operations.saturating_mul(4096),
+            }),
+            Self::BulkDurableWrite => json!({
+                "positioned_writes": operations,
+                "bytes_per_write": BULK_DURABLE_CHUNK_BYTES,
+                "file_fsyncs": 1,
+                "total_bytes_written": operations.saturating_mul(BULK_DURABLE_CHUNK_BYTES),
+                "preallocated_fixed_length_file": true,
+                "entire_file_overwritten": true,
+                "final_bytes_and_sha256_validated_outside_timing": true,
             }),
             Self::XattrGetListReport => json!({
                 "complete_reports": operations,
@@ -532,6 +558,13 @@ struct XattrWitness {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct BulkDurableWriteWitness {
+    sha256: String,
+    bytes: u64,
+    uniform_byte: Option<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FfsBinaryIdentity {
     binary_sha256: String,
     pgo_profile_sha256: String,
@@ -573,6 +606,8 @@ struct TimedSamples {
     observed_worker_threads: BTreeMap<Arm, BTreeSet<usize>>,
     /// Runtime-observed running CPUs for each logical arm's timed threads.
     observed_worker_cpus: BTreeMap<Arm, BTreeSet<usize>>,
+    /// Last sequence actually executed by every physical arm.
+    last_sequence: usize,
 }
 
 #[derive(Debug)]
@@ -714,7 +749,7 @@ fn usage() {
            --workload NAME                warm-stat | parallel-metadata-write |\n\
                                           parallel-read-8t | create-delete-storm |\n\
                                           readdir-stat-8t | fsync-journal-commit |\n\
-                                          xattr-get-list-report\n\
+                                          bulk-durable-write | xattr-get-list-report\n\
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
            --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32)\n\
            --operations N                 Workload operations per observation (default 2000)\n\
@@ -757,9 +792,10 @@ fn parse_workload(value: &str) -> Result<Workload> {
         "create-delete-storm" => Ok(Workload::CreateDeleteStorm),
         "readdir-stat-8t" => Ok(Workload::ReaddirStat8),
         "fsync-journal-commit" => Ok(Workload::FsyncJournalCommit),
+        "bulk-durable-write" => Ok(Workload::BulkDurableWrite),
         "xattr-get-list-report" => Ok(Workload::XattrGetListReport),
         _ => bail!(
-            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit|xattr-get-list-report"
+            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit|bulk-durable-write|xattr-get-list-report"
         ),
     }
 }
@@ -770,6 +806,12 @@ fn parse_placement_scope(value: &str) -> Result<PlacementScope> {
         "host-wide" => Ok(PlacementScope::HostWide),
         _ => bail!("unsupported --placement-scope {value}; expected same-llc|host-wide"),
     }
+}
+
+fn bulk_durable_total_bytes(operations: usize) -> Result<usize> {
+    operations
+        .checked_mul(BULK_DURABLE_CHUNK_BYTES)
+        .ok_or_else(|| anyhow!("bulk durable write byte count overflow for {operations} chunks"))
 }
 
 fn validate_config(config: &Config) -> Result<()> {
@@ -850,6 +892,30 @@ fn validate_config(config: &Config) -> Result<()> {
             || config.filesystems == RequestedFilesystems::Ext4,
         "xattr-get-list-report currently requires --filesystem ext4 because its inline/external storage-shape proof is ext4-specific"
     );
+    ensure!(
+        config.workload != Workload::BulkDurableWrite
+            || config.filesystems == RequestedFilesystems::Ext4,
+        "bulk-durable-write currently requires --filesystem ext4 so the first direct-incumbent row has one bounded filesystem scope"
+    );
+    if config.workload == Workload::BulkDurableWrite {
+        let payload_bytes = u64::try_from(bulk_durable_total_bytes(config.operations)?)
+            .context("bulk durable byte count does not fit u64")?;
+        let required_bytes = payload_bytes
+            .checked_add(u64::try_from(PAYLOAD_BYTES).expect("payload size fits u64"))
+            .and_then(|bytes| bytes.checked_add(BULK_DURABLE_IMAGE_HEADROOM_BYTES))
+            .ok_or_else(|| anyhow!("bulk durable fixture size overflow"))?;
+        let image_bytes = config
+            .image_size_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow!("image byte count overflow"))?;
+        ensure!(
+            required_bytes <= image_bytes,
+            "bulk-durable-write requires at least {} image bytes for {} payload bytes plus fixed fixture/headroom, but --image-size-mib={} provides {image_bytes}",
+            required_bytes,
+            payload_bytes,
+            config.image_size_mib
+        );
+    }
     Ok(())
 }
 
@@ -1197,6 +1263,13 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
         }
         Workload::FsyncJournalCommit => {
             write_fixture_file(&root.join("fsync.bin"), 4096, 0xF5)?;
+        }
+        Workload::BulkDurableWrite => {
+            write_fixture_file(
+                &root.join(BULK_DURABLE_FILE),
+                bulk_durable_total_bytes(config.operations)?,
+                0xB7,
+            )?;
         }
         Workload::XattrGetListReport => {
             for name in [XATTR_INLINE_FILE, XATTR_EXTERNAL_FILE, XATTR_MANY_FILE] {
@@ -1850,6 +1923,58 @@ fn tree_witness(root: &Path) -> Result<TreeWitness> {
     })
 }
 
+fn bulk_durable_sequence_byte(sequence: usize) -> u8 {
+    u8::try_from(((sequence % 251) * 37 + 113) % 251).expect("bulk durable sequence byte fits u8")
+}
+
+fn bulk_durable_write_witness(
+    root: &Path,
+    expected_bytes: usize,
+    expected_uniform_byte: Option<u8>,
+) -> Result<BulkDurableWriteWitness> {
+    let path = root.join(BULK_DURABLE_FILE);
+    let mut file = File::open(&path)
+        .with_context(|| format!("open bulk durable witness {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat bulk durable witness {}", path.display()))?;
+    let expected_bytes_u64 =
+        u64::try_from(expected_bytes).context("bulk durable witness length does not fit u64")?;
+    ensure!(
+        metadata.len() == expected_bytes_u64,
+        "bulk durable witness length is {}, expected {expected_bytes}",
+        metadata.len()
+    );
+    let mut hasher = Sha256::new();
+    let mut total_read = 0_usize;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read bulk durable witness {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if let Some(expected) = expected_uniform_byte {
+            ensure!(
+                buffer[..read].iter().all(|byte| *byte == expected),
+                "bulk durable witness contains a byte other than {expected}"
+            );
+        }
+        hasher.update(&buffer[..read]);
+        total_read = total_read.saturating_add(read);
+    }
+    ensure!(
+        total_read == expected_bytes,
+        "bulk durable witness read {total_read} bytes, expected {expected_bytes}"
+    );
+    Ok(BulkDurableWriteWitness {
+        sha256: hex::encode(hasher.finalize()),
+        bytes: metadata.len(),
+        uniform_byte: expected_uniform_byte,
+    })
+}
+
 fn list_xattr_names(path: &Path) -> Result<Vec<Vec<u8>>> {
     let mut names = xattr::list(path)
         .with_context(|| format!("list xattrs for {}", path.display()))?
@@ -2438,6 +2563,44 @@ fn fsync_journal_batch(root: &Path, operations: usize, sequence: usize) -> Resul
     ))
 }
 
+fn bulk_durable_write_batch(root: &Path, operations: usize, sequence: usize) -> Result<(u64, u64)> {
+    let path = root.join(BULK_DURABLE_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open bulk durable workload {}", path.display()))?;
+    let total_bytes = bulk_durable_total_bytes(operations)?;
+    let total_bytes_u64 =
+        u64::try_from(total_bytes).context("bulk durable byte count does not fit u64")?;
+    ensure!(
+        file.metadata()
+            .with_context(|| format!("stat bulk durable workload {}", path.display()))?
+            .len()
+            == total_bytes_u64,
+        "bulk durable workload file length differs from its exact work contract"
+    );
+    let value = bulk_durable_sequence_byte(sequence);
+    let payload = vec![value; BULK_DURABLE_CHUNK_BYTES];
+    let started = Instant::now();
+    for index in 0..operations {
+        let offset = index
+            .checked_mul(BULK_DURABLE_CHUNK_BYTES)
+            .ok_or_else(|| anyhow!("bulk durable write offset overflow"))?;
+        write_all_at(
+            &file,
+            black_box(&payload),
+            u64::try_from(offset).context("bulk durable write offset does not fit u64")?,
+            &path,
+        )?;
+    }
+    file.sync_all()
+        .with_context(|| format!("fsync bulk durable workload {}", path.display()))?;
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(&payload);
+    Ok((elapsed, total_bytes_u64))
+}
+
 fn workload_batch(
     root: &Path,
     config: &Config,
@@ -2459,6 +2622,7 @@ fn workload_batch(
         Workload::WarmStat
         | Workload::CreateDeleteStorm
         | Workload::FsyncJournalCommit
+        | Workload::BulkDurableWrite
         | Workload::XattrGetListReport => {}
     }
     // The driver thread is bound once at startup; reaffirm and capture it here
@@ -2472,6 +2636,7 @@ fn workload_batch(
         }
         Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations)?,
         Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence)?,
+        Workload::BulkDurableWrite => bulk_durable_write_batch(root, config.operations, sequence)?,
         Workload::XattrGetListReport => xattr_get_list_report_batch(root, config.operations)?,
     };
     let driver_tid_after = current_linux_tid()?;
@@ -2673,12 +2838,24 @@ fn collect_samples(
         digests.values().all(|digest| *digest == expected_digest),
         "workload result parity failed across mounted arms: {digests:?}"
     );
+    let expected_next_sequence = WARMUP_ROUNDS
+        .checked_add(config.pairs)
+        .ok_or_else(|| anyhow!("per-arm observation count overflow"))?;
+    ensure!(
+        next_sequences
+            .values()
+            .all(|sequence| *sequence == expected_next_sequence),
+        "balanced schedule advanced physical arms unevenly: {next_sequences:?}"
+    );
     Ok(TimedSamples {
         values,
         physical_values,
         digests,
         observed_worker_threads,
         observed_worker_cpus,
+        last_sequence: expected_next_sequence
+            .checked_sub(1)
+            .ok_or_else(|| anyhow!("per-arm final sequence underflow"))?,
     })
 }
 
@@ -3695,6 +3872,7 @@ fn fs_report(
     let mut parity = BTreeMap::new();
     let mut initial_trees = BTreeMap::new();
     let mut initial_xattrs = BTreeMap::new();
+    let mut initial_bulk_writes = BTreeMap::new();
     let mut roots = BTreeMap::new();
     for mount in &mounts {
         parity.insert(
@@ -3704,6 +3882,16 @@ fn fs_report(
         initial_trees.insert(mount.arm, tree_witness(mount.workload_root())?);
         if config.workload == Workload::XattrGetListReport {
             initial_xattrs.insert(mount.arm, xattr_witness(mount.workload_root())?);
+        }
+        if config.workload == Workload::BulkDurableWrite {
+            initial_bulk_writes.insert(
+                mount.arm,
+                bulk_durable_write_witness(
+                    mount.workload_root(),
+                    bulk_durable_total_bytes(config.operations)?,
+                    None,
+                )?,
+            );
         }
         roots.insert(mount.arm, mount.workload_root().to_path_buf());
     }
@@ -3735,6 +3923,22 @@ fn fs_report(
         ensure!(
             initial_xattrs.values().all(|witness| witness == &expected),
             "initial mounted xattr parity mismatch for {}: {initial_xattrs:?}",
+            kind.label()
+        );
+        Some(expected)
+    } else {
+        None
+    };
+    let expected_initial_bulk_write = if config.workload == Workload::BulkDurableWrite {
+        let expected = initial_bulk_writes
+            .get(&Arm::KernelA)
+            .cloned()
+            .ok_or_else(|| anyhow!("kernel A initial bulk-write witness missing"))?;
+        ensure!(
+            initial_bulk_writes
+                .values()
+                .all(|witness| witness == &expected),
+            "initial mounted bulk-write parity mismatch for {}: {initial_bulk_writes:?}",
             kind.label()
         );
         Some(expected)
@@ -3968,6 +4172,15 @@ fn fs_report(
             xattr.absent_lookup_none,
         );
     }
+    if let Some(bulk_write) = &expected_initial_bulk_write {
+        println!(
+            "mounted_kernel_bulk_durable_initial_parity,filesystem={},workload={},arms=4,file_sha256={},bytes={},validation_timing=outside_measurement,verdict=pass",
+            kind.label(),
+            config.workload.label(),
+            bulk_write.sha256,
+            bulk_write.bytes,
+        );
+    }
     for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
         println!(
             "mounted_kernel_worker_threads,filesystem={},workload={},assignment_arm={},requested={},runtime_observed_values={},observation_method={},clear={}",
@@ -4144,6 +4357,37 @@ fn fs_report(
     } else {
         None
     };
+    let expected_final_bulk_write = if config.workload == Workload::BulkDurableWrite {
+        let expected_byte = bulk_durable_sequence_byte(samples.last_sequence);
+        let expected_bytes = bulk_durable_total_bytes(config.operations)?;
+        let final_bulk_writes = mounts
+            .iter()
+            .map(|mount| {
+                Ok((
+                    mount.arm,
+                    bulk_durable_write_witness(
+                        mount.workload_root(),
+                        expected_bytes,
+                        Some(expected_byte),
+                    )?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let expected = final_bulk_writes
+            .get(&Arm::KernelA)
+            .cloned()
+            .ok_or_else(|| anyhow!("kernel A final bulk-write witness missing"))?;
+        ensure!(
+            final_bulk_writes
+                .values()
+                .all(|witness| witness == &expected),
+            "post-workload mounted bulk-write parity mismatch for {}: {final_bulk_writes:?}",
+            kind.label()
+        );
+        Some(expected)
+    } else {
+        None
+    };
     if !config.workload.is_mutating()
         || matches!(
             config.workload,
@@ -4172,6 +4416,18 @@ fn fs_report(
             kind.label(),
             config.workload.label(),
             xattr.sha256,
+        );
+    }
+    if let Some(bulk_write) = &expected_final_bulk_write {
+        println!(
+            "mounted_kernel_post_bulk_durable_parity,filesystem={},workload={},arms=4,file_sha256={},bytes={},uniform_byte={},validation_timing=outside_measurement,verdict=pass",
+            kind.label(),
+            config.workload.label(),
+            bulk_write.sha256,
+            bulk_write.bytes,
+            bulk_write
+                .uniform_byte
+                .expect("final bulk-write witness records its expected byte"),
         );
     }
 
@@ -4251,6 +4507,23 @@ fn fs_report(
         (None, None) => json!("not_applicable"),
         _ => unreachable!("xattr witnesses must be present at both parity boundaries"),
     };
+    let bulk_durable_write_parity_json =
+        match (&expected_initial_bulk_write, &expected_final_bulk_write) {
+            (Some(initial), Some(final_witness)) => json!({
+                "verdict": "pass",
+                "validation_timing": "outside_measurement",
+                "initial_sha256": initial.sha256,
+                "final_sha256": final_witness.sha256,
+                "bytes": final_witness.bytes,
+                "final_sequence": samples.last_sequence,
+                "final_uniform_byte": final_witness.uniform_byte,
+                "positioned_write_bytes": BULK_DURABLE_CHUNK_BYTES,
+                "file_fsyncs_per_observation": 1,
+                "entire_file_overwritten": true,
+            }),
+            (None, None) => json!("not_applicable"),
+            _ => unreachable!("bulk durable witnesses must be present at both parity boundaries"),
+        };
     let parity_json = json!({
         "verdict": "pass",
         "file_sha256": expected_parity.file_sha256,
@@ -4274,6 +4547,7 @@ fn fs_report(
             "bytes": expected_final_tree.bytes,
         },
         "xattr": xattr_parity_json,
+        "bulk_durable_write": bulk_durable_write_parity_json,
     });
     let host_wide_quiescence_json = post_mount_host_quiet_window.as_ref().map_or_else(
         || json!("not_applicable"),
@@ -4395,10 +4669,12 @@ fn fs_report(
         } else {
             "read-only; settle only"
         },
-        "observation_start_state": if config.workload == Workload::ParallelMetadataWrite {
-            "empty per-thread worker directories"
-        } else {
-            "fixture-defined stable state"
+        "observation_start_state": match config.workload {
+            Workload::ParallelMetadataWrite => "empty per-thread worker directories",
+            Workload::BulkDurableWrite => {
+                "preallocated fixed-length file; every observation overwrites every prior byte"
+            }
+            _ => "fixture-defined stable state",
         },
         "cache_regime": "identical balanced warm-cache rounds; no global cache drop",
         "observation_repeats": config.observation_repeats,
@@ -4968,6 +5244,33 @@ mod tests {
     }
 
     #[test]
+    fn bulk_durable_workload_requires_ext4_and_bounded_image_capacity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let base = Config {
+            ffs_cli: cli,
+            filesystems: RequestedFilesystems::Ext4,
+            workload: Workload::BulkDurableWrite,
+            operations: 64,
+            observation_repeats: 1,
+            image_size_mib: 256,
+            harness_builder: "hz1".to_owned(),
+            candidate_builder: "hz2".to_owned(),
+            ..Config::default()
+        };
+        validate_config(&base).expect("bounded ext4 bulk workload");
+
+        let mut btrfs = base.clone();
+        btrfs.filesystems = RequestedFilesystems::Btrfs;
+        assert!(validate_config(&btrfs).is_err());
+
+        let mut undersized = base;
+        undersized.image_size_mib = 128;
+        assert!(validate_config(&undersized).is_err());
+    }
+
+    #[test]
     fn only_metadata_scaling_uses_configured_client_threads() {
         assert_eq!(Workload::ParallelMetadataWrite.client_threads(96), 96);
         assert_eq!(
@@ -4975,6 +5278,7 @@ mod tests {
             DEFAULT_PARALLEL_THREADS
         );
         assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
+        assert_eq!(Workload::BulkDurableWrite.client_threads(96), 1);
         assert_eq!(Workload::XattrGetListReport.client_threads(96), 1);
     }
 
@@ -4994,6 +5298,11 @@ mod tests {
         assert!(readdir.contains("enumerate 65536 zero-byte entries"));
         assert!(readdir.contains("8 workers"));
         assert!(readdir.contains("every entry exactly once"));
+
+        let bulk_write = Workload::BulkDurableWrite.job_statement(64, 1);
+        assert!(bulk_write.contains("64 sequential 1048576-byte positioned writes"));
+        assert!(bulk_write.contains("67108864 total bytes"));
+        assert!(bulk_write.contains("fsync the file once"));
 
         let xattr = Workload::XattrGetListReport.job_statement(2_000, 1);
         assert!(xattr.contains("2000 complete five-call reports"));
@@ -5018,6 +5327,45 @@ mod tests {
             work["common"]["same_driver_implementation_for_all_four_arms"],
             true
         );
+
+        let bulk_work = Workload::BulkDurableWrite.semantic_work_contract(64, 1);
+        assert_eq!(bulk_work["workload_specific"]["positioned_writes"], 64);
+        assert_eq!(
+            bulk_work["workload_specific"]["total_bytes_written"],
+            67_108_864
+        );
+        assert_eq!(bulk_work["workload_specific"]["file_fsyncs"], 1);
+    }
+
+    #[test]
+    fn bulk_durable_batch_overwrites_every_byte_and_matches_untimed_witness() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let operations = 3;
+        write_fixture_file(
+            &temp.path().join(BULK_DURABLE_FILE),
+            bulk_durable_total_bytes(operations).expect("bulk byte count"),
+            0xB7,
+        )
+        .expect("bulk durable fixture");
+
+        let sequence = 7;
+        let (elapsed_ns, digest) =
+            bulk_durable_write_batch(temp.path(), operations, sequence).expect("bulk batch");
+        assert!(elapsed_ns > 0);
+        assert_eq!(digest, 3 * 1024 * 1024);
+
+        let witness = bulk_durable_write_witness(
+            temp.path(),
+            bulk_durable_total_bytes(operations).expect("bulk byte count"),
+            Some(bulk_durable_sequence_byte(sequence)),
+        )
+        .expect("exact final bulk witness");
+        assert_eq!(witness.bytes, 3 * 1024 * 1024);
+        assert_eq!(
+            witness.uniform_byte,
+            Some(bulk_durable_sequence_byte(sequence))
+        );
+        assert_eq!(witness.sha256.len(), 64);
     }
 
     #[test]
@@ -5342,6 +5690,7 @@ mod tests {
             digests: BTreeMap::new(),
             observed_worker_threads: BTreeMap::new(),
             observed_worker_cpus: BTreeMap::new(),
+            last_sequence: 0,
         };
         let ratios = competitive_log_ratios(&samples).expect("competitive ratios");
         assert!(ratios.iter().all(|ratio| (ratio.exp() - 4.0).abs() < 1e-12));

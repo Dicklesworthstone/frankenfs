@@ -13,6 +13,113 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Mounted 64 MiB bulk durable output is a current 2.201986x loss - 2026-07-31 (IvoryBison, vs-INCUMBENT measurement)
+
+This deliverable keeps one realistic mounted-comparator workload and makes no
+production-filesystem tuning claim. One job overwrites a preallocated 64 MiB
+file with 64 sequential 1 MiB positioned writes, then calls `fsync` on the file
+once. Payload allocation and fill happen before timing. Untimed witnesses prove
+the exact 67,108,864-byte initial and final file contents on all four mounts;
+the final file is uniformly byte `95` with SHA-256
+`1374a09b8b03a5e43ff90e52c8fd06d88a6a0134b990b58ba32c018e3e0ad82c`.
+Full tree/content parity and all four post-unmount `e2fsck` checks pass.
+
+### Admitted direct-incumbent result
+
+| Workload | Kernel A/A null | FUSE A/A null | FrankenFS / kernel ext4 | Decision |
+| --- | --- | --- | --- | --- |
+| 64 sequential 1 MiB overwrites plus one final file `fsync`, one observed worker | `1.000096x [0.993402, 1.006928]`, spread `1.006928x`, clear | `0.987647x [0.982082, 0.992391]`, spread `1.018245x`, clear | **`2.201986x [2.181190, 2.219212]` slower**; twice-null margin `1.036823x` | **HONEST LOSS** |
+
+Both A/A medians are inside the corrected inclusive `[0.98, 1.02]` clause,
+both symmetric CI spreads are below `1.025x`, and CI straddling is telemetry,
+not a gate input. The competitive interval clears twice the widest null
+log-margin. The gate is a wall-time deterministic-bootstrap median CI with
+20,000 resamples; `cv_used=false` and `instructions_used=false`. Diagnostic
+median batches were 106,764,850 ns for kernel ext4 and 240,221,050 ns for
+FrankenFS.
+
+**We lose: FrankenFS takes 2.201986 times the kernel-ext4 wall time for this
+complete 64 MiB durable-output job.**
+
+The admitted invocation used 2,048 paired rounds / 512 complete four-round
+physical crossover blocks, eight balanced warmups, and one observation per
+arm. Requested and actual observed timed workers were `1/1` on every kernel-A,
+kernel-B, FUSE-A, and FUSE-B arm. The benchmark-driver TID was both bound to and
+observed on CPU 27 throughout every arm; both FUSE daemons were guarded on CPU
+25, with SMT siblings excluded. Mount options were matched at
+`rw,noatime,nodev,nosuid`; kernel ext4 additionally reported `data=ordered`.
+The timed durability boundary is identical in all arms: all 64 writes followed
+by exactly one file `fsync`.
+
+### Identity and frequency provenance
+
+- Execution host: `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, 32
+  physical cores / 64 logical threads, 231,691,894,784 bytes RAM, one NUMA node,
+  Linux `6.17.0-35-generic`.
+- Runtime ISA: `avx+avx2+f16c+fma+sse2+sse4.2`.
+- CPU policy on all 64 CPUs: driver `amd-pstate-epp`, governor `powersave`, EPP
+  `performance`; the non-performance-governor warning is retained.
+- Driver emitted its in-process self-reported executing ELF SHA-256: `a0852814a9fab2f909512a346e2664940e335c49612247f58e23df83d841eeab`
+  (built on remote worker `ovh-a`).
+- FrankenFS self-reported executing ELF SHA-256 `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`;
+  both daemon self-reports and both `/proc/<pid>/exe` hashes agree. PGO profile
+  SHA-256:
+  `6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+- Kernel incumbent artifact SHA-256:
+  `01e534223c871bd6246e8d57fd8c8101205384d682a3a23b6a5577fe28997c41`.
+
+The exact admitted report is
+`/data/tmp/frankenfs-mounted-xattr-current/run_1785492391_3882038/mounted-kernel-report.json`
+with SHA-256
+`b1db0bc574fc8aec3c4955fcef0a1027610251cae8c8464ae49b58e11c8f824c`.
+It uses same-LLC placement and one-second CPU-contention sampling; sustained
+host-wide quiescence is explicitly not applicable to this same-LLC row.
+
+### Preserved blocked pilot
+
+The pre-registered 128-pair / 32-block pilot correctly emitted
+`BLOCKED_NULL`, not a scored ratio. Its diagnostic effect was `2.636181x
+[2.566631, 2.676452]`, but the kernel null spread was `1.055032x` and the
+FUSE null spread was `1.045671x`, both above `1.025x`; their medians
+(`0.992425x` and `0.991155x`) did pass the corrected median clause. That report
+is
+`/data/tmp/frankenfs-mounted-xattr-current/run_1785492075_3762184/mounted-kernel-report.json`
+with SHA-256
+`80cf2d58c7a4396eff6adc6d7526fc2eb4ffdf51e7f880d04f24dfa02c65a88d`.
+Before inspecting any high-N result, the single retry was registered at 512
+crossover blocks / 2,048 pairs. The two invocations are not pooled, and there
+will be no third null-selected retry.
+
+### Build, validation, and retry predicate
+
+The driver build and focused validation used strict remote execution from
+source base `8e0400ff` with `rch exec --base 8e0400ff --clean-overlay` and only
+`crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs` overlaid. Remote
+`cargo check -j2 -p ffs-harness --bin ffs-mounted-kernel-bench` passed on
+`ovh-a`; focused bulk-durable tests passed 2/2 there. The x86-64-v3
+release-perf driver was built on `ovh-a` and copied to the privileged execution
+host because RCH does not retrieve artifacts. There was no local Cargo fallback
+and no per-task Cargo target directory. The complete binary suite then passed
+28/28 on strict-remote worker `vmi1152480` from the same base and one-file clean
+overlay. Final no-dependency `-D warnings` Clippy reached `ffs-harness` on
+`vmi1227854` but exited 101 only on the pre-existing `fetch_update`
+deprecations in untouched `crates/ffs-harness/src/metrics.rs:94,100`; no
+diagnostic named the edited binary. (`ovh-a` was then inadmissible under stale
+disk-critical telemetry, and `vmi1152480` lacked the pinned nightly Clippy
+component; both attempts failed closed without local fallback.) Edited-file
+rustfmt and `git diff --check` pass.
+
+**Retry predicate:** replace this ratio only after the shipping candidate ELF,
+PGO profile, mounted-write implementation, or declared 64 MiB job shape
+changes. Use the same four independent mounts, four-round crossover, at least
+512 complete blocks, corrected median-plus-spread null gate, doubled-null
+margin, exact initial/final file witnesses, observed TID/CPU attestation,
+in-process ELF identities, governor/host provenance, matched durability, and
+four clean offline checks. A host-wide replacement additionally requires both
+sustained quiet gates to pass in the same invocation. Profile this admitted
+whole job before choosing a production lever; never pool the blocked pilot or
+select among repeated null attempts.
+
 ## Mounted xattr report is a current 6.059387x loss - 2026-07-30 (IvoryBison, vs-INCUMBENT measurement)
 
 This deliverable keeps one new mounted-comparator workload and makes no
