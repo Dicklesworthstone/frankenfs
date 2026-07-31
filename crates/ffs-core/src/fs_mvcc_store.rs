@@ -52,10 +52,6 @@ const MESSAGE_BUFFER_SHARDS: usize = 64;
 pub struct MetadataMessageBuffer {
     shards: Vec<parking_lot::Mutex<rustc_hash::FxHashMap<BlockNumber, Vec<u8>>>>,
     pending: std::sync::atomic::AtomicUsize,
-    /// Producers share this gate; a durability drain takes it exclusively.
-    /// This makes the drain a linearization point: no write can land in a
-    /// shard that has already been drained and then escape the current fsync.
-    drain_gate: RwLock<()>,
     /// Drain threshold in blocks, so a workload that never fsyncs cannot grow
     /// the buffer without bound.
     capacity: usize,
@@ -69,7 +65,6 @@ impl MetadataMessageBuffer {
                 .map(|_| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
                 .collect(),
             pending: std::sync::atomic::AtomicUsize::new(0),
-            drain_gate: RwLock::new(()),
             capacity,
         }
     }
@@ -84,11 +79,6 @@ impl MetadataMessageBuffer {
     /// same block. Coalescing is the entire point: the 512th write of a block
     /// supersedes the previous 511 and only the survivor is ever committed.
     fn put(&self, block: BlockNumber, data: Vec<u8>) {
-        let _producer = self.drain_gate.read();
-        self.put_while_gated(block, data);
-    }
-
-    fn put_while_gated(&self, block: BlockNumber, data: Vec<u8>) {
         let shard = self.shard_of(block);
         let mut map = self.shards[shard].lock();
         if map.insert(block, data).is_none() {
@@ -97,50 +87,9 @@ impl MetadataMessageBuffer {
         }
     }
 
-    pub(super) fn get(&self, block: BlockNumber) -> Option<Vec<u8>> {
-        let _producer = self.drain_gate.read();
+    fn get(&self, block: BlockNumber) -> Option<Vec<u8>> {
         let shard = self.shard_of(block);
         self.shards[shard].lock().get(&block).cloned()
-    }
-
-    /// Atomically patch one buffered block. Loading the committed/base value is
-    /// done outside the shard mutex, then the shard is checked again so a peer
-    /// that populated the block in the meantime wins and becomes our ancestor.
-    /// The producer gate remains held throughout, preventing a drain between
-    /// the ancestor read and publishing the replacement message.
-    fn rmw(
-        &self,
-        block: BlockNumber,
-        load_ancestor: impl FnOnce() -> FfsResult<Vec<u8>>,
-        patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
-    ) -> FfsResult<()> {
-        let _producer = self.drain_gate.read();
-        let shard = self.shard_of(block);
-
-        {
-            let mut map = self.shards[shard].lock();
-            if let Some(current) = map.get_mut(&block) {
-                let mut replacement = current.clone();
-                patch(&mut replacement)?;
-                *current = replacement;
-                return Ok(());
-            }
-        }
-
-        let ancestor = load_ancestor()?;
-        let mut map = self.shards[shard].lock();
-        if let Some(current) = map.get_mut(&block) {
-            let mut replacement = current.clone();
-            patch(&mut replacement)?;
-            *current = replacement;
-        } else {
-            let mut replacement = ancestor;
-            patch(&mut replacement)?;
-            map.insert(block, replacement);
-            self.pending
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(())
     }
 
     /// True once the buffer holds at least `capacity` distinct blocks.
@@ -149,13 +98,14 @@ impl MetadataMessageBuffer {
     }
 
     /// Remove and return every pending message.
-    fn take_all_while_gated(&self) -> Vec<(BlockNumber, Vec<u8>)> {
+    fn take_all(&self) -> Vec<(BlockNumber, Vec<u8>)> {
         let mut drained = Vec::new();
         for shard in &self.shards {
             let mut map = shard.lock();
             drained.extend(map.drain());
         }
-        self.pending.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.pending
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         drained
     }
 
@@ -172,26 +122,17 @@ impl MetadataMessageBuffer {
     /// # Errors
     /// Returns the commit error if the batched transaction cannot commit.
     pub fn drain_into(&self, store: &FsMvccStore) -> FfsResult<()> {
-        let _drain = self.drain_gate.write();
-        let drained = self.take_all_while_gated();
+        let drained = self.take_all();
         if drained.is_empty() {
             return Ok(());
         }
         let mut txn = store.begin();
-        // Keep the originals until commit succeeds so a rejected transaction
-        // can restore the buffer without losing acknowledged metadata writes.
-        for (block, data) in &drained {
-            txn.stage_write(*block, data.clone());
+        for (block, data) in drained {
+            txn.stage_write(block, data);
         }
-        let commit_seq = match store.commit(txn) {
-            Ok(commit_seq) => commit_seq,
-            Err(error) => {
-                for (block, data) in drained {
-                    self.put_while_gated(block, data);
-                }
-                return Err(FfsError::Format(error.to_string()));
-            }
-        };
+        let commit_seq = store
+            .commit(txn)
+            .map_err(|error| FfsError::Format(error.to_string()))?;
         store.prune_after_commit_if_due(commit_seq);
         Ok(())
     }
@@ -522,17 +463,18 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
         block: BlockNumber,
         patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
     ) -> FfsResult<()> {
-        buffer.rmw(
-            block,
-            || match self
+        let mut data = match buffer.get(block) {
+            Some(buffered) => buffered,
+            None => match self
                 .store
                 .read_visible_block_buf(block, self.store.current_snapshot())
             {
-                Some(buf) => Ok(buf.as_slice().to_vec()),
-                None => Ok(self.base.read_block(cx, block)?.into_inner()),
+                Some(buf) => buf.as_slice().to_vec(),
+                None => self.base.read_block(cx, block)?.into_inner(),
             },
-            patch,
-        )?;
+        };
+        patch(&mut data)?;
+        buffer.put(block, data);
         if buffer.is_full() {
             buffer.drain_into(&self.store)?;
         }
@@ -641,13 +583,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let mut any_visible = false;
         for delta in 0..count {
             let block = BlockNumber(start.0 + delta);
-            match self
-                .buffer
-                .as_ref()
-                .and_then(|buffer| buffer.get(block))
-                .map(BlockBuf::new)
-                .or_else(|| self.store.read_visible_block_buf(block, snap))
-            {
+            match self.store.read_visible_block_buf(block, snap) {
                 Some(buf) => {
                     visible.push(Some(buf));
                     any_visible = true;
@@ -705,13 +641,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let mut any_visible = false;
         for delta in 0..count_u64 {
             let block = BlockNumber(start.0 + delta);
-            match self
-                .buffer
-                .as_ref()
-                .and_then(|buffer| buffer.get(block))
-                .map(BlockBuf::new)
-                .or_else(|| self.store.read_visible_block_buf(block, snap))
-            {
+            match self.store.read_visible_block_buf(block, snap) {
                 Some(buf) => {
                     visible.push(Some(buf));
                     any_visible = true;

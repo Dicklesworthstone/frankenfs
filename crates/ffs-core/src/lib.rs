@@ -12019,22 +12019,7 @@ impl OpenFs {
             }
         }
 
-        // 2. A buffered metadata message is newer than every committed
-        //    version. This check is essential even for transaction-backed
-        //    scopes: the transaction snapshot cannot name a message that has
-        //    not reached the MVCC tree yet, but a preceding acknowledged FUSE
-        //    mutation must still be visible to this request.
-        if scope.tx.is_some() {
-            if let Some(buffered) = self
-                .metadata_buffer
-                .as_ref()
-                .and_then(|buffer| buffer.get(block))
-            {
-                return Ok(buffered);
-            }
-        }
-
-        // 3. Transaction-backed scopes read at their fixed snapshot for
+        // 2. Transaction-backed scopes read at their fixed snapshot for
         //    isolation. A no-tx scope's in-scope writes go to the MVCC store
         //    via `block_device_adapter` (committed at the *current* snapshot,
         //    i.e. seqs newer than the scope's begin snapshot); reading at the
@@ -12052,7 +12037,7 @@ impl OpenFs {
             }
         }
 
-        // 4. Fall back to the current-snapshot device view.
+        // 3. Fall back to the current-snapshot device view.
         self.read_current_block_vec_from_device(cx, block)
     }
 
@@ -12066,14 +12051,6 @@ impl OpenFs {
         cx: &Cx,
         block: BlockNumber,
     ) -> Result<Vec<u8>, FfsError> {
-        if let Some(buffered) = self
-            .metadata_buffer
-            .as_ref()
-            .and_then(|buffer| buffer.get(block))
-        {
-            return Ok(buffered);
-        }
-
         // Resolve at the MAX sentinel (the newest RETAINED version) rather than a
         // freshly captured `current_snapshot()`: the bd-bhh0i writable adapters are
         // unregistered, so pruning's watermark is the chain head and a concurrent
@@ -12117,18 +12094,7 @@ impl OpenFs {
             }
         }
 
-        // 2. Newest buffered message.
-        if scope.tx.is_some() {
-            if let Some(buffered) = self
-                .metadata_buffer
-                .as_ref()
-                .and_then(|buffer| buffer.get(block))
-            {
-                return Ok(Arc::<[u8]>::from(buffered));
-            }
-        }
-
-        // 3. Snapshot-visible MVCC version (transaction-backed scopes only —
+        // 2. Snapshot-visible MVCC version (transaction-backed scopes only —
         //    no-tx scopes must read at the current snapshot for read-your-writes;
         //    see read_block_with_scope and bd-bw90c).
         if scope.tx.is_some() {
@@ -12142,7 +12108,7 @@ impl OpenFs {
             }
         }
 
-        // 4. Device default adapter.
+        // 3. Device default adapter.
         let dev = self.block_device_adapter();
         Ok(Arc::<[u8]>::from(dev.read_block(cx, block)?.as_slice()))
     }
@@ -12166,15 +12132,6 @@ impl OpenFs {
         if let Some(tx) = &scope.tx {
             if let Some(staged) = tx.staged_write(block) {
                 return Ok(f(staged));
-            }
-        }
-        if scope.tx.is_some() {
-            if let Some(buffered) = self
-                .metadata_buffer
-                .as_ref()
-                .and_then(|buffer| buffer.get(block))
-            {
-                return Ok(f(&buffered));
             }
         }
         if scope.tx.is_some() {
@@ -12257,17 +12214,6 @@ impl OpenFs {
                     resolved.push(Some(staged.to_vec()));
                     any_overlay = true;
                     continue;
-                }
-                if scope.tx.is_some() {
-                    if let Some(buffered) = self
-                        .metadata_buffer
-                        .as_ref()
-                        .and_then(|buffer| buffer.get(block))
-                    {
-                        resolved.push(Some(buffered));
-                        any_overlay = true;
-                        continue;
-                    }
                 }
                 if let Some(snapshot) = overlay_snapshot {
                     if let Some(visible) = self.mvcc_store.read_visible(block, snapshot) {
@@ -12382,15 +12328,6 @@ impl OpenFs {
                 let block = BlockNumber(block_num);
                 if let Some(staged) = scope.tx.as_ref().and_then(|tx| tx.staged_write(block)) {
                     resolved.push(Some(staged.to_vec()));
-                    any_overlay = true;
-                    continue;
-                }
-                if let Some(buffered) = self
-                    .metadata_buffer
-                    .as_ref()
-                    .and_then(|buffer| buffer.get(block))
-                {
-                    resolved.push(Some(buffered));
                     any_overlay = true;
                     continue;
                 }
@@ -21522,20 +21459,6 @@ impl OpenFs {
 
             Ok(())
         })();
-
-        // Destructive metadata is deliberately not carried into the next
-        // create epoch. The mounted benchmark resets each create batch with
-        // parallel unlinks but has no fsyncdir between that reset and the next
-        // batch; leaving those removals buffered makes the following creates
-        // rebuild directories and inode tables on top of an uncommitted delete
-        // generation. Unlink/rmdir are outside the scored create region, so
-        // commit their coalesced messages eagerly while preserving Bε batching
-        // for the create burst itself.
-        if result.is_ok() {
-            if let Some(buffer) = self.metadata_buffer.as_ref() {
-                buffer.drain_into(&self.mvcc_store)?;
-            }
-        }
 
         result
     }
