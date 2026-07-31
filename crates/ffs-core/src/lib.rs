@@ -848,6 +848,105 @@ impl DirAllocBackend for SingleLockDirAlloc<'_> {
     }
 }
 
+/// Directory-growth backend that acquires the legacy allocation lock only for
+/// the rare operation that actually needs allocation state. Regular inserts
+/// into an existing directory block call only `dir_write_inode`, which needs a
+/// shared view of immutable geometry/group locators. This lets creates in
+/// different directories overlap after their inode allocation is complete.
+struct OnDemandDirAlloc<'a> {
+    alloc: &'a RwLock<Ext4AllocState>,
+}
+
+impl DirAllocBackend for OnDemandDirAlloc<'_> {
+    fn dir_geo(&self) -> FsGeometry {
+        self.alloc.read().geo.clone()
+    }
+
+    fn dir_alloc_blocks(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        count: u32,
+        hint: &ffs_alloc::AllocHint,
+    ) -> Result<ffs_alloc::BlockAlloc, FfsError> {
+        let mut alloc = self.alloc.write();
+        let Ext4AllocState {
+            geo,
+            groups,
+            persist_ctx,
+        } = &mut *alloc;
+        ffs_alloc::alloc_blocks_persist(cx, dev, geo, groups, count, hint, persist_ctx)
+    }
+
+    fn dir_write_inode(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        ino: InodeNumber,
+        inode: &Ext4Inode,
+        csum_seed: u32,
+    ) -> Result<(), FfsError> {
+        let alloc = self.alloc.read();
+        ffs_inode::write_inode(cx, dev, &alloc.geo, &alloc.groups, ino, inode, csum_seed)
+    }
+
+    fn dir_insert_extent(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        root_bytes: &mut [u8; 60],
+        extent: Ext4Extent,
+        ino: u32,
+        generation: u32,
+        tree_hint: ffs_alloc::AllocHint,
+    ) -> Result<(), FfsError> {
+        let mut alloc = self.alloc.write();
+        let Ext4AllocState {
+            geo,
+            groups,
+            persist_ctx,
+        } = &mut *alloc;
+        let mut tree_alloc = ffs_extent::GroupBlockAllocator {
+            cx,
+            dev,
+            geo,
+            groups,
+            hint: tree_hint,
+            pctx: persist_ctx,
+            ino,
+            generation,
+        };
+        ffs_btree::insert(cx, dev, root_bytes, extent, &mut tree_alloc)
+    }
+
+    fn dir_truncate_extents(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        root_bytes: &mut [u8; 60],
+        keep_blocks: u32,
+        ino: u32,
+        generation: u32,
+    ) -> Result<u64, FfsError> {
+        let mut alloc = self.alloc.write();
+        let Ext4AllocState {
+            geo,
+            groups,
+            persist_ctx,
+        } = &mut *alloc;
+        ffs_extent::truncate_extents(
+            cx,
+            dev,
+            root_bytes,
+            geo,
+            groups,
+            keep_blocks,
+            persist_ctx,
+            ffs_extent::ExtentOwner { ino, generation },
+        )
+    }
+}
+
 /// [`DirAllocBackend`] over the sharded per-group allocator — the lock-free
 /// growth path (bd-bhh0i). `geo` is snapshotted at construction (immutable).
 #[cfg(feature = "bhh0i_sharded_alloc")]
@@ -18608,39 +18707,43 @@ impl OpenFs {
             return Err(FfsError::Exists);
         }
 
-        let mut alloc = alloc_mutex.write();
-        let Ext4AllocState {
-            geo,
-            groups,
-            persist_ctx,
-        } = &mut *alloc;
-
-        // Allocate a new inode.
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
-        let (ino, new_inode) = ffs_inode::create_inode(
-            cx,
-            &block_dev,
-            geo,
-            groups,
-            mode | 0o100_000, // S_IFREG
-            uid,
-            gid,
-            parent_group,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-            persist_ctx,
-        )?;
+        // Serialize only the shared inode allocator. The directory mutation
+        // below is protected by the FUSE parent-inode guard and can proceed in
+        // parallel for each worker's private directory. Previously this write
+        // guard covered the entire create, making a multi-reader FUSE daemon
+        // collapse back to one effective server thread.
+        let (ino, new_inode) = {
+            let mut alloc = alloc_mutex.write();
+            let Ext4AllocState {
+                geo,
+                groups,
+                persist_ctx,
+            } = &mut *alloc;
+            let parent_group = GroupNumber(
+                u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
+                    .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
+            );
+            ffs_inode::create_inode(
+                cx,
+                &block_dev,
+                geo,
+                groups,
+                mode | 0o100_000, // S_IFREG
+                uid,
+                gid,
+                parent_group,
+                csum_seed,
+                tstamp_secs,
+                tstamp_nanos,
+                persist_ctx,
+            )?
+        };
 
         let attr = inode_to_attr(sb, ino, &new_inode);
 
-        // Add directory entry to parent.
-        // bd-bhh0i: single-lock caller wraps the alloc guard in a byte-identical
-        // SingleLock backend; dropped before the error branch re-borrows `alloc`.
-        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        // The common in-place directory insert needs no exclusive allocation
+        // state. Growth methods reacquire it on demand through this backend.
+        let mut backend = OnDemandDirAlloc { alloc: alloc_mutex };
         let add_result = self.ext4_add_dir_entry(
             cx,
             &mut backend,
@@ -18653,9 +18756,9 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         if let Err(err) = add_result {
             let mut rollback_inode = new_inode;
+            let mut alloc = alloc_mutex.write();
             let Ext4AllocState {
                 geo,
                 groups,

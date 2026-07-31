@@ -11,6 +11,7 @@ use nix::unistd::geteuid;
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
@@ -31,7 +32,7 @@ pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 /// up to MAX_WRITE_SIZE bytes in a write request, we use that value plus some extra space.
 const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 /// How requests should be filtered based on the calling UID.
 pub enum SessionACL {
     /// Allow requests from any user. Corresponds to the `allow_other` mount option.
@@ -65,6 +66,10 @@ pub struct Session<FS: Filesystem> {
     pub(crate) initialized: bool,
     /// True if the filesystem was destroyed (destroy operation done)
     pub(crate) destroyed: bool,
+    /// Shared one-shot guard for `Filesystem::destroy` across reader workers.
+    pub(crate) destroy_called: Arc<AtomicBool>,
+    /// Only the mount-owning session calls destroy from `Drop`; reader clones do not.
+    destroy_on_drop: bool,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -118,6 +123,8 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: 0,
             initialized: false,
             destroyed: false,
+            destroy_called: Arc::new(AtomicBool::new(false)),
+            destroy_on_drop: true,
         })
     }
 
@@ -135,13 +142,30 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: 0,
             initialized: false,
             destroyed: false,
+            destroy_called: Arc::new(AtomicBool::new(false)),
+            destroy_on_drop: true,
         }
     }
 
-    /// Run the session loop that receives kernel requests and dispatches them to method
-    /// calls into the filesystem. This read-dispatch-loop is non-concurrent to prevent
-    /// having multiple buffers (which take up much memory), but the filesystem methods
-    /// may run concurrent by spawning threads.
+    /// Receive and dispatch one request. Returns `false` when the channel is done.
+    fn dispatch_next(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+        match self.ch.receive(buf) {
+            Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
+                Some(req) => {
+                    req.dispatch(self);
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            Err(err) => match err.raw_os_error() {
+                Some(ENOENT | EINTR | EAGAIN) => Ok(true),
+                Some(ENODEV) => Ok(false),
+                _ => Err(err),
+            },
+        }
+    }
+
+    /// Run one read/dispatch loop.
     pub fn run(&mut self) -> io::Result<()> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
@@ -151,30 +175,76 @@ impl<FS: Filesystem> Session<FS> {
             std::mem::align_of::<abi::fuse_in_header>(),
         );
         loop {
-            // Read the next request from the given channel to kernel driver
-            // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive(buf) {
-                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
-                    // Dispatch request
-                    Some(req) => req.dispatch(self),
-                    // Quit loop on illegal request
-                    None => break,
-                },
-                Err(err) => match err.raw_os_error() {
-                    // Operation interrupted. Accordingly to FUSE, this is safe to retry
-                    Some(ENOENT) => continue,
-                    // Interrupted system call, retry
-                    Some(EINTR) => continue,
-                    // Explicitly try again
-                    Some(EAGAIN) => continue,
-                    // Filesystem was unmounted, quit the loop
-                    Some(ENODEV) => break,
-                    // Unhandled error
-                    _ => return Err(err),
-                },
+            if !self.dispatch_next(buf)? {
+                break;
             }
         }
         Ok(())
+    }
+
+    /// Run `worker_threads` independent readers on the same `/dev/fuse` channel.
+    ///
+    /// Initialization remains single-threaded because the kernel waits for the
+    /// INIT reply before issuing normal requests. After that handshake every
+    /// worker owns a clone of the filesystem handle and a private receive buffer;
+    /// concurrent `read(2)` calls on `/dev/fuse` are the kernel-supported FUSE
+    /// multi-thread dispatch model.
+    pub fn run_with_threads(&mut self, worker_threads: usize) -> io::Result<()>
+    where
+        FS: Clone + Send,
+    {
+        if worker_threads <= 1 {
+            return self.run();
+        }
+
+        let mut buffer = vec![0; BUFFER_SIZE];
+        let buf = aligned_sub_buf(
+            buffer.deref_mut(),
+            std::mem::align_of::<abi::fuse_in_header>(),
+        );
+        while !self.initialized {
+            if !self.dispatch_next(buf)? {
+                return Ok(());
+            }
+        }
+
+        let results = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_threads);
+            for _ in 0..worker_threads {
+                let mut worker = self.worker_clone();
+                handles.push(scope.spawn(move || worker.run()));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            match result {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        Ok(())
+    }
+
+    fn worker_clone(&self) -> Self
+    where
+        FS: Clone,
+    {
+        Self {
+            filesystem: self.filesystem.clone(),
+            ch: self.ch.clone(),
+            mount: Arc::clone(&self.mount),
+            allowed: self.allowed,
+            session_owner: self.session_owner,
+            proto_major: self.proto_major,
+            proto_minor: self.proto_minor,
+            initialized: self.initialized,
+            destroyed: false,
+            destroy_called: Arc::clone(&self.destroy_called),
+            destroy_on_drop: false,
+        }
     }
 
     /// Unmount the filesystem
@@ -227,7 +297,7 @@ impl<FS: 'static + Filesystem + Send> Session<FS> {
 
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
-        if !self.destroyed {
+        if self.destroy_on_drop && !self.destroy_called.swap(true, Ordering::AcqRel) {
             self.filesystem.destroy();
             self.destroyed = true;
         }
