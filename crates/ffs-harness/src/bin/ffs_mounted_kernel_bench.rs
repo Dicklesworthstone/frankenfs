@@ -3485,21 +3485,10 @@ fn select_cpu_placement(
         .intersection(allowed_cpus)
         .copied()
         .collect::<BTreeSet<_>>();
-    let fuse_cpu_count = if scope == PlacementScope::HostWide {
-        client_threads
-    } else {
-        1
-    };
-    let fuse_domain = if scope == PlacementScope::HostWide {
-        allowed_cpus
-    } else {
-        &last_level_cache_cpus
-    };
     let (fuse_cpus, fuse_guard_cpus) = select_fuse_cpus(
-        fuse_cpu_count,
         &ranked,
         &busy,
-        fuse_domain,
+        &last_level_cache_cpus,
         &driver_guard_cpus,
         allowed_cpus,
     )?;
@@ -3534,19 +3523,15 @@ fn select_cpu_placement(
 }
 
 fn select_fuse_cpus(
-    required_cpus: usize,
     ranked: &[(usize, f64)],
     busy: &BTreeMap<usize, f64>,
-    placement_domain: &BTreeSet<usize>,
+    last_level_cache_cpus: &BTreeSet<usize>,
     driver_guard_cpus: &BTreeSet<usize>,
     allowed_cpus: &BTreeSet<usize>,
 ) -> Result<(Vec<usize>, BTreeSet<usize>)> {
-    let mut selected = Vec::with_capacity(required_cpus);
-    let mut selected_guard_cpus = BTreeSet::new();
     for &(cpu, load) in ranked {
-        if !placement_domain.contains(&cpu)
+        if !last_level_cache_cpus.contains(&cpu)
             || driver_guard_cpus.contains(&cpu)
-            || selected_guard_cpus.contains(&cpu)
             || load > MAX_FUSE_PREFLIGHT_BUSY
         {
             continue;
@@ -3561,17 +3546,14 @@ fn select_fuse_cpus(
         }) {
             continue;
         }
-        selected.push(cpu);
-        selected_guard_cpus.extend(siblings);
-        if selected.len() == required_cpus {
-            // The two identical FUSE arms execute serially and therefore share
-            // this same physical-core set without contending with each other.
-            return Ok((selected, selected_guard_cpus));
-        }
+        // Both identical FUSE daemons share one quiet physical CPU. The arms
+        // execute serially, so this avoids cross-core scheduler asymmetry
+        // without making the measured arms contend with each other. Requiring
+        // the driver's LLC domain also avoids cross-CCD request/response bias.
+        return Ok((vec![cpu], siblings));
     }
     bail!(
-        "only {} of {required_cpus} required non-sibling FUSE CPUs were quiet in the placement domain",
-        selected.len()
+        "no non-sibling CPU in the driver's last-level-cache domain has every SMT thread below the FUSE contention limit"
     )
 }
 

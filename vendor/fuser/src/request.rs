@@ -158,17 +158,12 @@ impl<'a> Request<'a> {
             }
             // Filesystem destroyed
             ll::Operation::Destroy(x) => {
-                if !se
-                    .destroy_called
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
-                    se.filesystem.destroy();
-                }
+                se.filesystem.destroy();
                 se.destroyed = true;
                 return Ok(Some(x.reply()));
             }
             // Any operation is invalid after destroy
-            _ if se.destroy_called.load(std::sync::atomic::Ordering::Acquire) => {
+            _ if se.destroyed => {
                 warn!("Ignoring FUSE operation after destroy: {}", self.request);
                 return Err(Errno::EIO);
             }

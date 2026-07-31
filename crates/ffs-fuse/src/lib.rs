@@ -1995,7 +1995,6 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
 /// and ready for multi-threaded FUSE dispatch.  All `FsOps` calls go
 /// through `self.inner.ops` (which is `Arc<dyn FsOps>`), and lock-free
 /// [`AtomicMetrics`] are updated on every request.
-#[derive(Clone)]
 pub struct FrankenFuse {
     inner: Arc<FuseInner>,
 }
@@ -7103,26 +7102,19 @@ impl Filesystem for FrankenFuse {
             reply.error(errno);
             return;
         }
-        let result = {
-            // The server now dispatches independent kernel requests in parallel.
-            // Preserve same-directory mutation ordering while allowing creates in
-            // different directories to run on different FUSE workers.
-            let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
-            self.with_request_scope(&cx, RequestOp::Create, |cx, scope| {
-                let attr = self.inner.ops.create(
-                    cx,
-                    scope,
-                    InodeNumber(parent),
-                    name,
-                    mode as u16,
-                    req.uid(),
-                    req.gid(),
-                )?;
-                self.inner.ops.commit_request_scope(scope)?;
-                Ok(attr)
-            })
-        };
-        match result {
+        match self.with_request_scope(&cx, RequestOp::Create, |cx, scope| {
+            let attr = self.inner.ops.create(
+                cx,
+                scope,
+                InodeNumber(parent),
+                name,
+                mode as u16,
+                req.uid(),
+                req.gid(),
+            )?;
+            self.inner.ops.commit_request_scope(scope)?;
+            Ok(attr)
+        }) {
             Ok(attr) => {
                 reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
             }
@@ -7261,7 +7253,7 @@ pub fn mount(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
     fs.install_kernel_notifier(session.notifier());
-    session.run_with_threads(options.resolved_thread_count())?;
+    session.run()?;
     Ok(())
 }
 

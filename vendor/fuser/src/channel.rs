@@ -15,7 +15,7 @@ use crate::passthrough::BackingId;
 use crate::reply::ReplySender;
 
 /// A raw communication channel to the FUSE kernel driver
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Channel(Arc<File>);
 
 impl AsFd for Channel {
