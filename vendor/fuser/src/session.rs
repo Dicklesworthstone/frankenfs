@@ -11,6 +11,7 @@ use nix::unistd::geteuid;
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
@@ -31,7 +32,7 @@ pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 /// up to MAX_WRITE_SIZE bytes in a write request, we use that value plus some extra space.
 const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 /// How requests should be filtered based on the calling UID.
 pub enum SessionACL {
     /// Allow requests from any user. Corresponds to the `allow_other` mount option.
@@ -65,6 +66,18 @@ pub struct Session<FS: Filesystem> {
     pub(crate) initialized: bool,
     /// True if the filesystem was destroyed (destroy operation done)
     pub(crate) destroyed: bool,
+    /// One-shot destroy guard shared by classic and io_uring workers.
+    pub(crate) destroy_called: Arc<AtomicBool>,
+    /// Only the mount-owning session runs `Filesystem::destroy` from `Drop`.
+    destroy_on_drop: bool,
+    /// Serialize filesystem callbacks when transport workers are concurrent.
+    pub(crate) dispatch_lock: Option<Arc<Mutex<()>>>,
+    /// Request FUSE-over-io_uring during the INIT handshake.
+    pub(crate) io_uring_requested: bool,
+    /// The kernel accepted FUSE-over-io_uring for this connection.
+    pub(crate) io_uring_negotiated: bool,
+    /// Payload size advertised by every io_uring queue entry.
+    pub(crate) io_uring_payload_size: u32,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -118,6 +131,12 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: 0,
             initialized: false,
             destroyed: false,
+            destroy_called: Arc::new(AtomicBool::new(false)),
+            destroy_on_drop: true,
+            dispatch_lock: None,
+            io_uring_requested: false,
+            io_uring_negotiated: false,
+            io_uring_payload_size: 0,
         })
     }
 
@@ -135,7 +154,45 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: 0,
             initialized: false,
             destroyed: false,
+            destroy_called: Arc::new(AtomicBool::new(false)),
+            destroy_on_drop: true,
+            dispatch_lock: None,
+            io_uring_requested: false,
+            io_uring_negotiated: false,
+            io_uring_payload_size: 0,
         }
+    }
+
+    fn dispatch_request(&mut self, req: &Request<'_>) {
+        let dispatch_lock = self.dispatch_lock.clone();
+        if let Some(lock) = dispatch_lock {
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            req.dispatch(self);
+        } else {
+            req.dispatch(self);
+        }
+    }
+
+    fn dispatch_next(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+        match self.ch.receive(buf) {
+            Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
+                Some(req) => {
+                    self.dispatch_request(&req);
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            Err(err) => match err.raw_os_error() {
+                Some(ENOENT | EINTR | EAGAIN) => Ok(true),
+                Some(ENODEV) => Ok(false),
+                _ => Err(err),
+            },
+        }
+    }
+
+    pub(crate) fn run_classic_loop(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        while self.dispatch_next(buf)? {}
+        Ok(())
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -150,31 +207,70 @@ impl<FS: Filesystem> Session<FS> {
             buffer.deref_mut(),
             std::mem::align_of::<abi::fuse_in_header>(),
         );
-        loop {
-            // Read the next request from the given channel to kernel driver
-            // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive(buf) {
-                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
-                    // Dispatch request
-                    Some(req) => req.dispatch(self),
-                    // Quit loop on illegal request
-                    None => break,
-                },
-                Err(err) => match err.raw_os_error() {
-                    // Operation interrupted. Accordingly to FUSE, this is safe to retry
-                    Some(ENOENT) => continue,
-                    // Interrupted system call, retry
-                    Some(EINTR) => continue,
-                    // Explicitly try again
-                    Some(EAGAIN) => continue,
-                    // Filesystem was unmounted, quit the loop
-                    Some(ENODEV) => break,
-                    // Unhandled error
-                    _ => return Err(err),
-                },
+        self.run_classic_loop(buf)
+    }
+
+    /// Run a hybrid classic/io_uring session on Linux.
+    ///
+    /// INIT, interrupts, and notifications retain the classic `/dev/fuse`
+    /// channel. Once the kernel accepts `FUSE_OVER_IO_URING`, normal requests
+    /// use per-CPU rings. If the capability is unavailable, this falls back to
+    /// the classic loop without changing request semantics.
+    #[cfg(target_os = "linux")]
+    pub fn run_with_io_uring(&mut self, queue_depth: usize, payload_size: u32) -> io::Result<()>
+    where
+        FS: Clone + Send,
+    {
+        self.io_uring_requested = true;
+        self.io_uring_payload_size = payload_size;
+
+        let mut buffer = vec![0; BUFFER_SIZE];
+        let buf = aligned_sub_buf(
+            buffer.deref_mut(),
+            std::mem::align_of::<abi::fuse_in_header>(),
+        );
+        while !self.initialized {
+            if !self.dispatch_next(buf)? {
+                return Ok(());
             }
         }
-        Ok(())
+
+        if !self.io_uring_negotiated {
+            warn!("kernel declined FUSE-over-io_uring; using classic transport");
+            return self.run_classic_loop(buf);
+        }
+
+        self.dispatch_lock = Some(Arc::new(Mutex::new(())));
+        crate::io_uring::run_hybrid(self, queue_depth, payload_size, buf)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ring_worker_clone(&self) -> Self
+    where
+        FS: Clone,
+    {
+        Self {
+            filesystem: self.filesystem.clone(),
+            ch: self.ch.clone(),
+            mount: Arc::new(Mutex::new(None)),
+            allowed: self.allowed,
+            session_owner: self.session_owner,
+            proto_major: self.proto_major,
+            proto_minor: self.proto_minor,
+            initialized: self.initialized,
+            destroyed: self.destroyed,
+            destroy_called: Arc::clone(&self.destroy_called),
+            destroy_on_drop: false,
+            dispatch_lock: self.dispatch_lock.clone(),
+            io_uring_requested: self.io_uring_requested,
+            io_uring_negotiated: self.io_uring_negotiated,
+            io_uring_payload_size: self.io_uring_payload_size,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dispatch_ring_request(&mut self, req: &Request<'_>) {
+        self.dispatch_request(req);
     }
 
     /// Unmount the filesystem
@@ -195,7 +291,7 @@ impl<FS: Filesystem> Session<FS> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 /// A thread-safe object that can be used to unmount a Filesystem
 pub struct SessionUnmounter {
     mount: Arc<Mutex<Option<(PathBuf, Mount)>>>,
@@ -227,7 +323,7 @@ impl<FS: 'static + Filesystem + Send> Session<FS> {
 
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
-        if !self.destroyed {
+        if self.destroy_on_drop && !self.destroy_called.swap(true, Ordering::AcqRel) {
             self.filesystem.destroy();
             self.destroyed = true;
         }

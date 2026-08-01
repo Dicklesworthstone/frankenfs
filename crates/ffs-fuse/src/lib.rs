@@ -1299,6 +1299,22 @@ fn fuse_async_read_enabled() -> bool {
     })
 }
 
+/// Whether the blocking mount path should request FUSE-over-io_uring.
+///
+/// This stays opt-in until the mounted live-incumbent gate proves the new
+/// transport. The same binary therefore supplies both A/B arms: set
+/// `FFS_FUSE_IO_URING=1` for the candidate and leave it unset for control.
+#[cfg(target_os = "linux")]
+fn fuse_io_uring_enabled() -> bool {
+    matches!(
+        std::env::var("FFS_FUSE_IO_URING")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "on" | "true")
+    )
+}
+
 /// Build the `read`-request offload pool: `thread_count` dedicated threads
 /// (the same knob that already sizes `max_background`). Returns `None` when
 /// the lever is disabled or the pool cannot be built — callers then reply
@@ -1995,6 +2011,7 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
 /// and ready for multi-threaded FUSE dispatch.  All `FsOps` calls go
 /// through `self.inner.ops` (which is `Arc<dyn FsOps>`), and lock-free
 /// [`AtomicMetrics`] are updated on every request.
+#[derive(Clone)]
 pub struct FrankenFuse {
     inner: Arc<FuseInner>,
 }
@@ -7253,6 +7270,13 @@ pub fn mount(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
     fs.install_kernel_notifier(session.notifier());
+    #[cfg(target_os = "linux")]
+    if fuse_io_uring_enabled() {
+        session.run_with_io_uring(4, 128 * 1024)?;
+    } else {
+        session.run()?;
+    }
+    #[cfg(not(target_os = "linux"))]
     session.run()?;
     Ok(())
 }
