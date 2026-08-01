@@ -160,6 +160,64 @@ identically with the lever OFF and ON, so it is a HEAD bug, not a regression.
 Fix belongs in its own change: hand `(parent, name)` to a dedicated notifier
 thread so no invalidation is ever issued from a request handler.
 
+## REJECT: widening concurrent FUSE dispatch to the parallel-READ row - 0.839x - the opcode census says 73% of the row is in the exclusive set - 2026-08-01
+
+Attempt to widen the KEEP above to the rest of its family. `parallel-read-8t`
+(banked `1.287862x`) is the other read-only 8-thread row and `Read` is already in
+`Request::is_concurrency_safe()`, so it should have converted with zero new code.
+
+### Measurement (same rig, same ELF, same discipline as the KEEP above)
+
+256 x 256 KiB files, enumerate then 8 forked workers `pread` every file exactly
+once; 21 rounds, round 0 discarded, 20 observations per arm; deterministic
+20,000-resample bootstrap median 95% CI (seed `0x5EED`). Same executing ELF
+self-reported by both daemons:
+`mount_bench_evidence,binary_sha256=b7f0c1c6a371525f1a20a3b54e03f7eb3730b2f588a98543b049bc04d1d597c3`
+Wall time decided this row; `cv_used=false`, `instructions_used=false`.
+
+| daemon CPUs | fuse1 (control) | fuse8 (candidate) | **fuse1/fuse8** | 95% CI |
+| --- | --- | --- | --- | --- |
+| **56-63 (8, matched)** | 7.676 ms | 9.148 ms | **0.839141x** | **[0.814367, 0.870853]** |
+| **58 (1, as banked)** | 7.715 ms | 9.162 ms | **0.842005x** | **[0.822414, 0.912637]** |
+
+Both intervals exclude `1.0` on the losing side, and - unlike the metadata row -
+the verdict does **not** move with the daemon's CPU count. That is the tell.
+
+### Counted mechanism - and it refutes the obvious explanation
+
+`fuse:fuse_request_send` census on this arm's connection, 4 rounds of 256 files
+(the "byte-bound payload" guess is wrong - there is no payload):
+
+| opcode | requests | per round | gate class |
+| --- | --- | --- | --- |
+| **FUSE_OPEN** | 1024 | 256 | **exclusive** |
+| **FUSE_FLUSH** | 1024 | 256 | **exclusive** |
+| **FUSE_RELEASE** | 1024 | 256 | **exclusive** |
+| FUSE_GETXATTR | 1162 | ~290 | shared |
+| FUSE_LOOKUP | 258 | ~1 (cached) | shared |
+| **FUSE_READ** | **0** | **0** | - |
+
+Counted on the wire, not sampled - syscall count per round: 1058 syscalls vs 8193 for the readdir+stat row this same lever wins on.
+
+**Zero READ requests.** The 64 MiB never crosses `/dev/fuse` at all - the kernel
+serves every byte from its own page cache - so this row is not byte-bound and it
+is not `Read`-bound. Its FUSE traffic is ~1058 round trips per round of which
+**~768 (73%) are handle-lifecycle ops that `is_concurrency_safe()` deliberately
+puts in the EXCLUSIVE set.** Eight workers therefore queue on an exclusive
+`RwLock` for three quarters of the row's requests, which is exactly why the loss
+is the same size at 1 daemon CPU and at 8.
+
+### Scope rule this establishes
+
+Concurrent dispatch pays in proportion to the **share of a row's request mix that
+is in the shared set**, not to how parallel the client is. readdir+stat is ~100%
+shared (`GETXATTR`+`LOOKUP`) and wins 1.92x; parallel-read is 73% exclusive and
+loses 1.19x. Census the opcode mix before applying this lever to any new row.
+
+**Retry predicate:** re-test only after `Open`/`Flush`/`Release` are shown safe to
+move into the shared set (i.e. the file-handle table is proven concurrent), which
+would flip this row's mix from 73% exclusive to ~0%.
+
 ## SURVEY (no code change): one wasted `security.capability` round trip PER FILE on the default path - 2026-07-31
 
 Found while building the counter the READDIRPLUS retry predicate demanded. Not a
