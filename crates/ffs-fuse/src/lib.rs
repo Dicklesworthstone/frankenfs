@@ -1315,6 +1315,27 @@ fn fuse_io_uring_enabled() -> bool {
     )
 }
 
+/// How many concurrent FUSE dispatch workers the daemon should run.
+///
+/// The classic loop reads one request from `/dev/fuse`, services it, replies,
+/// and only then reads the next — so N client threads issuing metadata calls
+/// are funnelled through one server thread, while the in-kernel incumbent
+/// serves the same callers on N CPUs. `FFS_FUSE_WORKERS=N` runs N readers with
+/// a reader/writer dispatch gate: concurrency-safe reads overlap, mutations
+/// keep whole-session exclusion.
+///
+/// Returns `None` when unset/invalid/1, which selects the historical
+/// single-threaded loop, so the same binary supplies both A/B arms.
+fn fuse_dispatch_workers() -> Option<usize> {
+    let raw = std::env::var("FFS_FUSE_WORKERS").ok()?;
+    let requested = raw.trim().parse::<usize>().ok()?;
+    (requested > 1).then_some(requested.min(MAX_FUSE_DISPATCH_WORKERS))
+}
+
+/// Upper bound on `FFS_FUSE_WORKERS`; each worker owns a `BUFFER_SIZE` receive
+/// buffer, so an unbounded count would be an unbounded allocation.
+const MAX_FUSE_DISPATCH_WORKERS: usize = 64;
+
 /// Build the `read`-request offload pool: `thread_count` dedicated threads
 /// (the same knob that already sizes `max_background`). Returns `None` when
 /// the lever is disabled or the pool cannot be built — callers then reply
@@ -7273,11 +7294,17 @@ pub fn mount(
     #[cfg(target_os = "linux")]
     if fuse_io_uring_enabled() {
         session.run_with_io_uring(4, 128 * 1024)?;
+    } else if let Some(workers) = fuse_dispatch_workers() {
+        session.run_with_workers(workers)?;
     } else {
         session.run()?;
     }
     #[cfg(not(target_os = "linux"))]
-    session.run()?;
+    if let Some(workers) = fuse_dispatch_workers() {
+        session.run_with_workers(workers)?;
+    } else {
+        session.run()?;
+    }
     Ok(())
 }
 
@@ -7499,7 +7526,17 @@ pub fn mount_managed(
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
 
-    let session = fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?;
+    let session = match fuse_dispatch_workers() {
+        Some(workers) => {
+            info!(
+                mountpoint = %mountpoint.display(),
+                workers,
+                "FUSE dispatch workers enabled"
+            );
+            fuser::spawn_mount2_with_workers(fs, mountpoint, &fuse_opts, workers)?
+        }
+        None => fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?,
+    };
     notifier_owner.install_kernel_notifier(session.notifier());
 
     info!(mountpoint = %mountpoint.display(), "FUSE mount active");

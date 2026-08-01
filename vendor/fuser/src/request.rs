@@ -91,6 +91,40 @@ impl<'a> Request<'a> {
         })
     }
 
+    /// Whether this request may be dispatched concurrently with other
+    /// concurrency-safe requests.
+    ///
+    /// The set is deliberately narrow: it holds only operations that read
+    /// filesystem state and publish nothing. Every mutation, every handle
+    /// lifecycle operation (`Open`/`Release`/`Flush`), `Forget` (which retires
+    /// inode references a concurrent `Lookup` may be taking) and the session
+    /// handshake stay outside it, so they keep the exact whole-session
+    /// exclusion the single-threaded loop always gave them.
+    pub(crate) fn is_concurrency_safe(&self) -> bool {
+        let Ok(operation) = self.request.operation() else {
+            return false;
+        };
+        match operation {
+            ll::Operation::Lookup(_)
+            | ll::Operation::GetAttr(_)
+            | ll::Operation::ReadLink(_)
+            | ll::Operation::Read(_)
+            | ll::Operation::StatFs(_)
+            | ll::Operation::GetXAttr(_)
+            | ll::Operation::ListXAttr(_)
+            | ll::Operation::ReadDir(_)
+            | ll::Operation::Access(_)
+            | ll::Operation::BMap(_) => true,
+            #[cfg(feature = "abi-7-21")]
+            ll::Operation::ReadDirPlus(_) => true,
+            #[cfg(feature = "abi-7-24")]
+            ll::Operation::Lseek(_) => true,
+            #[cfg(feature = "abi-7-40")]
+            ll::Operation::Statx(_) => true,
+            _ => false,
+        }
+    }
+
     /// Dispatch request to the given filesystem.
     /// This calls the appropriate filesystem operation method for the
     /// request and sends back the returned reply to the kernel

@@ -12,7 +12,7 @@ use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
 
@@ -72,6 +72,10 @@ pub struct Session<FS: Filesystem> {
     destroy_on_drop: bool,
     /// Serialize filesystem callbacks when transport workers are concurrent.
     pub(crate) dispatch_lock: Option<Arc<Mutex<()>>>,
+    /// Reader/writer gate used by [`Session::run_with_workers`]: concurrency-safe
+    /// requests take it shared, everything else takes it exclusively. `None`
+    /// (the default) means single-threaded dispatch and costs nothing.
+    pub(crate) dispatch_gate: Option<Arc<RwLock<()>>>,
     /// Request FUSE-over-io_uring during the INIT handshake.
     pub(crate) io_uring_requested: bool,
     /// The kernel accepted FUSE-over-io_uring for this connection.
@@ -134,6 +138,7 @@ impl<FS: Filesystem> Session<FS> {
             destroy_called: Arc::new(AtomicBool::new(false)),
             destroy_on_drop: true,
             dispatch_lock: None,
+            dispatch_gate: None,
             io_uring_requested: false,
             io_uring_negotiated: false,
             io_uring_payload_size: 0,
@@ -157,6 +162,7 @@ impl<FS: Filesystem> Session<FS> {
             destroy_called: Arc::new(AtomicBool::new(false)),
             destroy_on_drop: true,
             dispatch_lock: None,
+            dispatch_gate: None,
             io_uring_requested: false,
             io_uring_negotiated: false,
             io_uring_payload_size: 0,
@@ -167,8 +173,19 @@ impl<FS: Filesystem> Session<FS> {
         let dispatch_lock = self.dispatch_lock.clone();
         if let Some(lock) = dispatch_lock {
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            return req.dispatch(self);
+        }
+        let dispatch_gate = self.dispatch_gate.clone();
+        let Some(gate) = dispatch_gate else {
+            return req.dispatch(self);
+        };
+        if req.is_concurrency_safe() {
+            let _shared = gate.read().unwrap_or_else(|poisoned| poisoned.into_inner());
             req.dispatch(self);
         } else {
+            let _exclusive = gate
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             req.dispatch(self);
         }
     }
@@ -208,6 +225,94 @@ impl<FS: Filesystem> Session<FS> {
             std::mem::align_of::<abi::fuse_in_header>(),
         );
         self.run_classic_loop(buf)
+    }
+
+    /// Run the session loop on `worker_count` concurrent dispatch threads.
+    ///
+    /// Every worker reads from the same `/dev/fuse` fd — the kernel hands each
+    /// blocked reader a different pending request — so `worker_count` requests
+    /// can be in flight at once instead of one. Requests are still ordered
+    /// against each other by [`Session::dispatch_request`]'s reader/writer
+    /// gate: concurrency-safe reads run in parallel, and everything else keeps
+    /// the whole-session exclusion of the single-threaded loop.
+    ///
+    /// INIT is always handled on this thread before any worker starts, so the
+    /// worker clones inherit a fully negotiated session.
+    pub fn run_with_workers(&mut self, worker_count: usize) -> io::Result<()>
+    where
+        FS: Clone + Send,
+    {
+        let mut buffer = vec![0; BUFFER_SIZE];
+        let buf = aligned_sub_buf(
+            buffer.deref_mut(),
+            std::mem::align_of::<abi::fuse_in_header>(),
+        );
+        if worker_count <= 1 {
+            return self.run_classic_loop(buf);
+        }
+        while !self.initialized {
+            if !self.dispatch_next(buf)? {
+                return Ok(());
+            }
+        }
+
+        self.dispatch_gate = Some(Arc::new(RwLock::new(())));
+        info!("FUSE dispatch workers: {worker_count}");
+        thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count - 1);
+            for index in 1..worker_count {
+                let mut worker = self.worker_clone();
+                workers.push(
+                    thread::Builder::new()
+                        .name(format!("fuse-dispatch-{index}"))
+                        .spawn_scoped(scope, move || {
+                            let mut worker_buffer = vec![0; BUFFER_SIZE];
+                            let worker_buf = aligned_sub_buf(
+                                worker_buffer.deref_mut(),
+                                std::mem::align_of::<abi::fuse_in_header>(),
+                            );
+                            worker.run_classic_loop(worker_buf)
+                        })?,
+                );
+            }
+            let primary = self.run_classic_loop(buf);
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!("FUSE dispatch worker failed: {error}"),
+                    Err(_) => warn!("FUSE dispatch worker panicked"),
+                }
+            }
+            primary
+        })
+    }
+
+    /// A handle onto the same connection and filesystem for a dispatch worker.
+    ///
+    /// The clone must never run `Filesystem::destroy` from `Drop` and must never
+    /// own the mount: both belong to the session that created the connection.
+    fn worker_clone(&self) -> Self
+    where
+        FS: Clone,
+    {
+        Self {
+            filesystem: self.filesystem.clone(),
+            ch: self.ch.clone(),
+            mount: Arc::new(Mutex::new(None)),
+            allowed: self.allowed,
+            session_owner: self.session_owner,
+            proto_major: self.proto_major,
+            proto_minor: self.proto_minor,
+            initialized: self.initialized,
+            destroyed: self.destroyed,
+            destroy_called: Arc::clone(&self.destroy_called),
+            destroy_on_drop: false,
+            dispatch_lock: self.dispatch_lock.clone(),
+            dispatch_gate: self.dispatch_gate.clone(),
+            io_uring_requested: self.io_uring_requested,
+            io_uring_negotiated: self.io_uring_negotiated,
+            io_uring_payload_size: self.io_uring_payload_size,
+        }
     }
 
     /// Run a hybrid classic/io_uring session on Linux.
@@ -262,6 +367,7 @@ impl<FS: Filesystem> Session<FS> {
             destroy_called: Arc::clone(&self.destroy_called),
             destroy_on_drop: false,
             dispatch_lock: self.dispatch_lock.clone(),
+            dispatch_gate: self.dispatch_gate.clone(),
             io_uring_requested: self.io_uring_requested,
             io_uring_negotiated: self.io_uring_negotiated,
             io_uring_payload_size: self.io_uring_payload_size,
@@ -355,6 +461,27 @@ impl BackgroundSession {
         let guard = thread::spawn(move || {
             let mut se = se;
             se.run()
+        });
+        Ok(BackgroundSession {
+            guard,
+            sender,
+            _mount: mount,
+        })
+    }
+
+    /// Like [`BackgroundSession::new`], but dispatches on `worker_count`
+    /// concurrent threads (see [`Session::run_with_workers`]). A count of 1 is
+    /// the historical single-threaded loop.
+    pub fn new_with_workers<FS: Filesystem + Clone + Send + 'static>(
+        se: Session<FS>,
+        worker_count: usize,
+    ) -> io::Result<BackgroundSession> {
+        let sender = se.ch.sender();
+        // Take the fuse_session, so that we can unmount it
+        let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
+        let guard = thread::spawn(move || {
+            let mut se = se;
+            se.run_with_workers(worker_count)
         });
         Ok(BackgroundSession {
             guard,

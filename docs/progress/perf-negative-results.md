@@ -13,6 +13,153 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## KEEP (default OFF): concurrent FUSE dispatch - readdir+stat 1.923x faster than the single-threaded loop, and 1.14x SLOWER on the banked 1-CPU daemon placement - 2026-08-01
+
+Lever chosen by profiling the whole readdir+stat job against the live kernel arm
+and asking, per cost, "does the incumbent pay this too?"
+
+### What the profile says (the 4.967x row)
+
+The banked worst row is `large_directory_readdir_stat_8t`. The daemon profile
+under that workload is 100% transport - `entry_SYSRETQ` 6.6%, `memmove` 5.1%,
+`fuse_dev_do_read` 3.6%, `fuse_copy_fill` 3.5%, plus scheduler and audit
+syscall entry/exit. No frankenfs symbol clears 1.2%.
+
+The per-`lstat` round trip is now named, with its caller. `kprobe:fuse_getxattr`
+with `kstack` over an 8-thread stat sweep of 8,192 warm entries:
+
+```
+fuse_getxattr / __vfs_getxattr / get_vfs_caps_from_disk /
+audit_copy_inode / __audit_inode / filename_lookup / vfs_statx / vfs_fstatat  : 8193
+```
+
+8,193 round trips for 8,192 `lstat`s = **1.000/entry**, all for
+`security.capability` (`kprobe:fuse_getxattr { @[str(arg1)] }` reports that one
+name and no other). The host has audit enabled (`auditctl -s`: `enabled 1`, two
+rules watching `/data/projects`), so `__audit_inode` fires on every path
+resolution.
+
+**The incumbent pays the same call and not the same cost.** During a kernel-arm
+sweep `get_vfs_caps_from_disk` is answered by `ext4_xattr_get` from the inode
+already in memory - no round trip - while `fuse_getxattr` stays at background
+level (196 host-wide vs 24,864 for the FUSE arm's own sweep). By the
+does-the-incumbent-pay-it test the transport is structural and it is ours.
+
+Round trips per stat cannot be reduced: on 6.17 nothing in the FUSE protocol
+suppresses a per-name xattr probe (`fc->no_getxattr` needs an `ENOSYS` reply and
+kills *all* xattr support; `FUSE_HANDLE_KILLPRIV_V2` only sets `S_NOSEC`, which
+gates `file_remove_privs` on the WRITE path and does nothing for this stack -
+this retires the fix proposed by the 2026-07-31 SURVEY row below for this row).
+What *is* reducible is how many of them can be in flight.
+
+### The structural gap
+
+`Session::run` reads one request from `/dev/fuse`, services it, replies, and
+only then reads the next. Eight client threads issuing 8,192 stats are funnelled
+through **one** server thread while in-kernel ext4 runs the same work inside the
+eight callers on eight CPUs. `run_with_threads` from `b08a03ca` was reverted
+five minutes later in `1040f2f6` with no ledger row, so HEAD dispatches serially.
+
+### Lever (one lever)
+
+`FFS_FUSE_WORKERS=N` runs N reader threads on the same `/dev/fuse` fd (the
+kernel hands each blocked reader a distinct pending request), gated by a
+reader/writer lock in `Session::dispatch_request`:
+
+- `Request::is_concurrency_safe()` = `Lookup | GetAttr | ReadLink | Read |
+  StatFs | GetXAttr | ListXAttr | ReadDir | ReadDirPlus | Access | BMap | Lseek
+  | Statx` take the gate **shared**;
+- everything else - every mutation, `Open`/`Release`/`Flush`, `Forget`, the
+  handshake - takes it **exclusively**, i.e. keeps the exact whole-session
+  exclusion the single-threaded loop always gave it.
+
+INIT is always serviced on the primary thread before any worker starts. Unset /
+`1` / invalid selects the historical loop and the gate is `None`, so the default
+path is byte-identical and the same ELF supplies both A/B arms. Wired into both
+`mount()` and `mount_managed()` (the mode the bench harness uses; the io_uring
+lever reached only `mount()` and so was unreachable from every measured run).
+
+### Measurement (one ELF, four arms live at once, interleaved, order rotates per round)
+
+8,192-entry `large-directory`, `readdir` then 8 forked workers `lstat` every
+entry once; 11 rounds, round 0 discarded; clients pinned to CPUs 24-31; both
+FUSE arms mounted simultaneously from byte-identical images and pinned to the
+same CPU set; `tmpfs` is the T5 driver-ceiling control.
+
+21 rounds, round 0 discarded, 20 observations per arm. Every interval below is a
+deterministic 20,000-resample bootstrap median 95% CI (seed `0x5EED`).
+Wall time decided this row; `cv_used=false`, `instructions_used=false`.
+
+| daemon CPUs | kernel ext4 median | fuse1 (control) | fuse8 (candidate) | **fuse1/fuse8** | 95% CI |
+| --- | --- | --- | --- | --- | --- |
+| **56-63 (8, matched)** | 3.792 ms | 33.006 ms | **17.162 ms** | **1.923233x faster** | **[1.895582, 1.970661]** |
+| **58 (1, as banked)** | 3.790 ms | 32.785 ms | 37.409 ms | **0.876400x (1.141x SLOWER)** | **[0.858258, 0.896773]** |
+
+Neither interval contains `1.0`, and they do not overlap each other. Against the
+live kernel arm the row moves `8.703447x [8.509252, 8.964847]` ->
+`4.525424x [4.424609, 4.639032]` at matched CPUs, and
+`8.649655x [8.463620, 8.963691]` -> `9.869528x [9.588661, 10.299974]` at one CPU.
+
+Both arms self-reported the SAME executing ELF in-process, from
+`elf_self_sha256()` under `FFS_MOUNT_BENCH_EVIDENCE=1`, printed by each daemon:
+`mount_bench_evidence,binary_sha256=b7f0c1c6a371525f1a20a3b54e03f7eb3730b2f588a98543b049bc04d1d597c3`
+Dispatch
+mode attested from `/proc/<pid>/task/*/comm` at runtime, not from a log: control
+**0** `fuse-dispatch-*` threads, candidate **7** plus the primary; both
+`taskset -cp` = the same CPU list. Raw per-round samples are kept alongside the
+run (`ab_samples_{8cpu,1cpu}.json`).
+
+### What this run does NOT claim
+
+`tmpfs / kernel` reads `1.005766x [0.970756, 1.031050]` and
+`0.994833x [0.966971, 1.035229]`: in this rig the **kernel arm sits on the
+driver's own ceiling**, so by T5 its number is client-bound and the
+`fuse/kernel` ratios above are upper bounds that must not be compared with the
+banked `4.967448x` (different corpus size, driver and placement). The decidable
+claim is the internal A/B - both FUSE arms are 4.5-8.7x above the ceiling.
+
+### Why the default stays OFF: the banked placement is where it loses
+
+`select_fuse_cpus` returns `vec![cpu]`. The banked readdir report
+(`run_1785384757_637562`) records `driver_cpus = [24,25,27,28,56,61,62,63]` and
+`fuse_cpus = [58]` - **8 CPUs of clients against 1 CPU of filesystem**, while the
+incumbent's filesystem code runs inside those 8 client threads. Every
+multi-threaded FrankenFS-vs-kernel row is measured under that 8:1 handicap, and
+it is exactly the regime where this lever is a 1.14x loss.
+
+**Next step (blocking a bankable number):** teach
+`ffs_mounted_kernel_bench` a `--fuse-cpus` knob so the daemon can be given the
+same CPU count as `--client-threads`, publish both placements, and only then
+re-run `--workload readdir-stat-8t`.
+
+### Correctness
+
+Read-only parity across all three arms: identical stat digest `271884288` over
+8,192 entries; `find -printf '%p %s %m %n %y'` identical between the two FUSE
+arms (**8,194 entries, empty diff**); offline `e2fsck -fn` **rc 0** on both
+images with identical `8206/262144 files, 34544/524288 blocks`. Formatting clean
+on the four touched files.
+
+### Blocked: pre-existing HEAD deadlock on the concurrent MUTATION path
+
+The mutation half of the correctness gate could not run - and the reason is not
+this lever. Eight threads doing `create/rename/unlink/rmdir/symlink` deadlock the
+mounted rw daemon **on the default single-threaded path too**:
+
+```
+daemon thread   state=D   wchan=fuse_reverse_inval_entry
+8 client threads state=S  wchan=request_wait_answer
+```
+
+`dispatch_unlink` and `dispatch_rmdir` call `notify_entry_invalidation` -
+`Notifier::inval_entry` - **before replying**, from the dispatch thread. The
+kernel holds the parent directory's inode lock across `fuse_unlink` while
+blocked in `request_wait_answer`; `fuse_reverse_inval_entry` wants that same
+lock. Circular wait. (`rename` already notifies after `reply.ok()`.) Reproduced
+identically with the lever OFF and ON, so it is a HEAD bug, not a regression.
+Fix belongs in its own change: hand `(parent, name)` to a dedicated notifier
+thread so no invalidation is ever issued from a request handler.
+
 ## SURVEY (no code change): one wasted `security.capability` round trip PER FILE on the default path - 2026-07-31
 
 Found while building the counter the READDIRPLUS retry predicate demanded. Not a
