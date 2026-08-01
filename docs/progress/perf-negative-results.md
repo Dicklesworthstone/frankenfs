@@ -13,6 +13,68 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## SURVEY (no code change): one wasted `security.capability` round trip PER FILE on the default path - 2026-07-31
+
+Found while building the counter the READDIRPLUS retry predicate demanded. Not a
+candidate yet - a located structural difference plus the reason it cannot be
+switched on safely today.
+
+### The counter
+
+`/proc/<pid>/io` conflates image `pread`s with FUSE traffic, so this uses the
+`fuse:fuse_request_send` tracepoint via bpftrace - a pure `/dev/fuse` opcode
+census. Enumerate-then-stat sweep over 4,000 entries, warm cache:
+
+| Opcode | readdirplus OFF (default) | readdirplus ON |
+| --- | --- | --- |
+| **GETXATTR** | **4030 = 1.008/entry** | 4036 = 1.009/entry |
+| GETATTR | **1** | 4001 = 1.000/entry |
+| READDIR / READDIRPLUS | 9 | 21 |
+
+`strace` of the daemon's `/dev/fuse` reads names the culprit: **482 requests for
+`security.capability` across 400 files** - one probe per file, and nothing else.
+
+### Two conclusions
+
+**The READDIRPLUS premise was wrong, and this proves it.** The default path
+already issues essentially ZERO per-entry GETATTR (1 for 4,000 entries) - the
+kernel serves those stats from cache, so the "32,768 stat round trips" that lever
+was aimed at never existed. Enabling readdirplus ADDED 4,000 GETATTRs, because
+the kernel does not accept the attributes in our replies and re-fetches every
+one. That is the mechanism behind its 2.2x loss, now visible at opcode level.
+
+**The real per-file tax is `security.capability`.** In-kernel ext4 answers it
+from the inode's cached xattr area with no round trip; for us it is a full FUSE
+round trip per file on every enumeration, every `ls -l`, `find`, `du` and
+`git status`. It is invisible to a CPU profile of our own code because the cost
+is transport, and it is exactly the class of structural difference the standing
+directive says to retain: the incumbent does NOT pay it.
+
+### Why it is NOT a one-line flag flip
+
+The kernel suppresses this probe per inode via `S_NOSEC`, which requires
+`SB_NOSEC` on the superblock, which FUSE sets only for a connection advertising
+`FUSE_HANDLE_KILLPRIV_V2`. Advertising that is a CONTRACT: the filesystem must
+itself clear setuid/setgid and `security.capability` on write, chown and file
+shortening. Two blockers, both real:
+
+- We implement none of it - no `killpriv` / suid-clearing path exists in
+  `crates/ffs-core` or `crates/ffs-fuse`. Advertising the flag without it is a
+  security regression: a setuid binary would survive an unprivileged write.
+- `FUSE_HANDLE_KILLPRIV_V2` is not even present in `vendor/fuser`
+  (`fuse_abi.rs` carries only `FUSE_HANDLE_KILLPRIV`, bit 19). A peer is
+  concurrently bumping `fuser` to `abi-7-42`, which is the range that would
+  supply it - coordinate before touching that vendor tree.
+
+### Next lever (in order)
+
+1. Implement the killpriv contract in the write/chown/shorten paths, with a test
+   proving a setuid file loses its bit on unprivileged write.
+2. Only then advertise `FUSE_HANDLE_KILLPRIV_V2` and re-run this opcode census;
+   the success condition is GETXATTR per entry dropping from ~1.0 to ~0.
+3. Re-measure `readdir-stat-8t` against the live kernel arm - currently
+   `4.967448x`, our worst row.
+
 ## READDIRPLUS negotiation is REJECTED - correct, but 2.2x SLOWER - 2026-07-31
 
 Self-generated lever, picked by the standing directive: profile the whole job,
