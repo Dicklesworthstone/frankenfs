@@ -195,6 +195,98 @@ capacity** proves the sharded per-group and superblock free-inode counters retur
 to their exact baseline after every reset, followed by `e2fsck -fn` rc 0; only
 then rerun this unchanged mounted four-arm comparator.
 
+## KEEP: concurrent FUSE dispatch at matched daemon CPUs - the worst banked row goes 4.803406x -> 3.467786x against LIVE kernel ext4, all four invocations admitted - 2026-08-02
+
+The `--fuse-cpus` row below finally has its number. A 2x2 (daemon CPUs x
+`FFS_FUSE_WORKERS`), four invocations from ONE ELF, every one of them admitted by
+the mounted comparator in a single quiet window, on a host whose benchmark CPUs
+both sampled `0.000000` busy at placement.
+
+### The 2x2
+
+| daemon CPUs | workers | kernel ms | FUSE ms | FrankenFS / kernel ext4, bootstrap median 95% CI | 2x null margin | kernel A/A | FUSE A/A |
+| ---: | --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 1 | off | 23.658 | 113.050 | `4.803406` `[4.784500, 4.817726]` | 1.014502 | 1.007225 | 1.002261 |
+| 1 | 8 | 22.982 | 121.008 | `5.281854` `[5.242662, 5.309511]` | 1.028074 | 1.006637 | 1.013940 |
+| 8 | off | 20.684 | 130.361 | `6.277800` `[6.254249, 6.309525]` | 1.020765 | 1.010329 | 1.000706 |
+| **8** | **8** | 20.589 | **71.577** | **`3.467786` `[3.442365, 3.483467]`** | 1.012223 | 1.006093 | 1.002107 |
+
+Every row `admitted=true`, `directional_claim_clear=true`, `verdict=HONEST_LOSS`,
+`cv_used=false`, `instructions_used=false`; all four A/A spreads are inside the
+`1.025` limit and every A/A interval contains 1.0.
+
+- **The lever's sign flips on daemon CPU count.** At one daemon CPU it is
+  `1.0996x SLOWER` (`4.803406` -> `5.281854`); at eight it is **`1.8103x FASTER`**
+  (`6.277800` -> `3.467786`). This confirms the 2026-08-01 internal A/B on the
+  real mounted comparator instead of a side rig.
+- **The row, control to best, in one window: `4.803406x` -> `3.467786x` =
+  1.3852x.** Our own arm alone: `113.050` -> `71.577 ms` = **1.5794x faster**.
+- **Still an HONEST LOSS.** `3.467786x` is not a win over ext4. At 8 readers we
+  serve 2.18 us/entry against the kernel's 0.63 us; the residual is the one
+  `security.capability` round trip per entry the incumbent answers from memory.
+
+### The control that mattered, and the prediction it broke
+
+The `8 CPU / workers off` arm was included because a serial session loop cannot
+use eight CPUs, so it should have moved nothing and thereby proved that any gain
+in the workers-on arm was the lever rather than the CPUs.
+
+**It moved 1.31x the WRONG way** (`113.050` -> `130.361 ms`). At `--fuse-cpus 1`
+the daemon owns a private physical core with its SMT sibling guarded idle
+(`fuse_cpus=[5]`); at `--fuse-cpus 8` it gets eight hyperthreads that each share a
+physical core with a client thread. **The matched-CPU placement is not the more
+generous one** — it trades a private core for contended siblings. So the honest
+decomposition is: placement costs 1.31x, the lever wins 1.8103x inside that
+placement, and the net against the same-window control is 1.3852x. Without this
+control the entire 1.3852x would have been credited to the lever.
+
+### Two confounds, stated rather than buried
+
+- At `--fuse-cpus > 1` the driver is placed first with an EMPTY fuse-guard set,
+  so the driver's own layout changes too: it landed on eight distinct physical
+  cores (`1:2:3:5:32:36:38:39`) instead of seven-plus-a-shared-sibling
+  (`0:1:2:3:4:6:7:35`), which is why the kernel arm also improved, `23.658` ->
+  `20.6 ms`. **Cross-placement ratio comparisons are therefore confounded**;
+  FUSE-arm absolute times and within-placement comparisons are not.
+- Placement is re-chosen per invocation, so the two 8-CPU runs used different
+  CCXs. Their kernel arms agree to **0.5%** (`20.684` vs `20.589 ms`), which is
+  what makes the within-placement comparison defensible.
+
+### Provenance
+
+Candidate ELF `7d0526c45fdf610d5402aec92f1fc6aacabf65a0abe85de8655a2fb9abc9ba7f`
+(x86-64-v3 + fat LTO + PGO
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`, the banked
+profile), driver ELF
+`d8786a0663dbc635f4e508bcc9ade6cb8cad22c0c7353f9a6280d28329628c65`. Each FUSE
+daemon printed its own executing ELF in process under `FFS_MOUNT_BENCH_EVIDENCE=1`:
+
+    mount_bench_evidence,binary_sha256=7d0526c45fdf610d5402aec92f1fc6aacabf65a0abe85de8655a2fb9abc9ba7f
+
+`proc_exe_sha256` matches on every arm. Four-arm parity `verdict=pass`, initial
+and final tree `a91834cf56bad86fc2d7324f41593e5b5b3794a76f9dbeab5dc0ff697f908c79`
+over 32,773 entries; `incumbent_isolation_proof=pass`; 8 observed worker threads
+on all four arms of all four invocations. Dispatch mode attested from
+`/proc/<pid>/task/*/comm` at runtime, not from a log: the workers-on daemons
+carried **7 `fuse-dispatch` threads** plus the primary. Reports under
+`/data/tmp/frankenfs-fusecpus/a1_c{1,8}_{off,on}/report.json`.
+
+### Relationship to the bank, and what is NOT restated
+
+The banked row stays `4.967448x`: it was taken with candidate `f44b3dc4…` and a
+different driver, and this session's control used a different ELF. The control
+reproduced it to **0.3% on our own arm** (`113.050` vs the banked `113.44 ms`);
+the ratio differs because the *kernel* arm ran 3.6% faster in the banked window
+(`22.84` vs `23.658 ms`). Do not restate `3.467786x` as replacing `4.967448x` —
+it is a different placement, and both must be published together.
+
+### Follow-up this makes obvious
+
+The effect's sign is a pure function of how many CPUs the daemon actually has, so
+the default should read `sched_getaffinity` at mount and enable readers only when
+the daemon holds more than one CPU: byte-identical to today in the one-CPU case
+that the banked rows measure, and the measured configuration above otherwise.
+
 ## NEXT LEVER, located but not yet attempted: `rmw_block` copies a whole 4 KiB block to change 256 bytes - 2026-08-02
 
 The 2026-07-31 metadata-row profile closed with an item it did not chase:
