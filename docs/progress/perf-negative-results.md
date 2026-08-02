@@ -89,6 +89,46 @@ capacity** proves the sharded per-group and superblock free-inode counters retur
 to their exact baseline after every reset, followed by `e2fsck -fn` rc 0; only
 then rerun this unchanged mounted four-arm comparator.
 
+## NEXT LEVER, located but not yet attempted: `rmw_block` copies a whole 4 KiB block to change 256 bytes - 2026-08-02
+
+The 2026-07-31 metadata-row profile closed with an item it did not chase:
+`__memmove_avx_unaligned_erms` at **8.81% of daemon CPU, the largest single
+userspace symbol**, "consistent with whole 4 KiB block copies per metadata
+update". This row names the exact code that produces it, so the next agent does
+not have to re-derive it. **Nothing is measured here and no effect is claimed.**
+
+`FsMvccBlockDevice::rmw_block` (`crates/ffs-core/src/fs_mvcc_store.rs`) is the
+read-modify-write path for the inode table, the inode and block bitmaps and the
+group-descriptor table. Per call it does:
+
+- `read_visible_block_buf(...)` then `buf.as_slice().to_vec()` — one whole-block
+  copy; or, when no version exists at the snapshot, `self.base.read_block(...)`
+  **and then** `device_base.clone()` — the read's own allocation plus a second
+  whole-block copy, because the pre-image must survive for the merge proof;
+- `patch(&mut data)`, which mutates a few bytes — an ext4 inode is 256 bytes of
+  a 4,096-byte block, a bitmap allocation is one bit;
+- stages the full 4,096-byte image as the new version.
+
+So a create that changes on the order of 256 bytes moves 4 KiB to 8 KiB through
+`memmove`, several times over (inode table, inode bitmap, block bitmap, GDT,
+superblock). **In-kernel ext4 dirties a buffer-head in place and copies a whole
+block only when JBD2 journals it**, so by the does-the-incumbent-pay-it test
+most of this copy is ours. It also lands on the one daemon CPU that bounds the
+`parallel-metadata-write` row, where our filesystem work is `7.5 us` of a
+`82.7 us` per-op budget.
+
+The shape of the change is to stage a range-scoped delta rather than a whole
+block: `rmw_block` is already handed `disjoint_ranges`, so the information
+needed to store `(range, bytes)` instead of a 4,096-byte image is present at the
+call site. That touches the ffs-mvcc read path (a version chain becomes a patch
+chain) and is not a small change.
+
+**Cheap first step, before any of that:** count bytes moved per create with a
+counter around the two copy sites and report bytes-per-create, which is a count
+and therefore decidable on a loaded host. Only if it is large is the ffs-mvcc
+restructuring worth proposing. Do not begin the restructuring on the strength of
+one profile symbol.
+
 ## CORRECTNESS FIX (no timing taken): unlink/rmdir stop re-notifying the kernel about the entry they just removed - deadlock reproduced and removed - 2026-08-02
 
 `26d122a6`. Self-generated lever, chosen by the standing rule "rank the job's
