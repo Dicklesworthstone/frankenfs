@@ -13,6 +13,117 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## CORRECTNESS FIX (no timing taken): unlink/rmdir stop re-notifying the kernel about the entry they just removed - deadlock reproduced and removed - 2026-08-02
+
+`26d122a6`. Self-generated lever, chosen by the standing rule "rank the job's
+costs and retain only the ones the incumbent does not also pay". This row records a
+correctness result; **no ratio is claimed and none was measured** — see the
+closing paragraph.
+
+### The redundancy
+
+`dispatch_unlink`/`dispatch_rmdir` issued `FUSE_NOTIFY_INVAL_ENTRY` for the entry
+they had just removed, from inside the request handler and **before** replying.
+On a successful `FUSE_UNLINK`/`FUSE_RMDIR` reply the kernel already runs
+`fuse_dir_changed()` and `fuse_entry_unlinked()`, which expire that dentry's
+cache entry, and the VFS then `d_delete`s it, so the notify asks the kernel to
+forget an entry it is in the middle of forgetting. In-kernel ext4 has no such
+channel at all.
+
+The lever was proposed on the theory that this is also **one extra `/dev/fuse`
+round trip per delete** on the `2.753659x` `create-delete-storm` row, which
+performs 2,000 deletes per job. **That theory is unproven and this row does not
+rest on it** — see "the counted mechanism that failed" below.
+
+### The deadlock, reproduced and removed
+
+The kernel holds the parent directory's inode lock across `fuse_unlink` while it
+waits in `request_wait_answer`; `fuse_reverse_inval_entry` wants that same lock.
+A notify issued from the handler before the reply is therefore a circular wait.
+
+Both arms from ONE binary via `FFS_FUSE_NOTIFY_UNLINK`, 8 threads x 150
+iterations of create+unlink+mkdir+rmdir on a mounted read-write ext4 image
+(`mke2fs -E root_owner=1000:1000`, 1 GiB, 65,536 inodes). The outcome is
+**categorical, not timed**, which is why it is valid on a host too loaded for any
+perf number:
+
+| arm | `FFS_FUSE_NOTIFY_UNLINK` | outcome |
+| --- | --- | --- |
+| lever (new default) | unset | **COMPLETED** 2,400 create+delete pairs in 2 s, all 8 workers rc=0, `/dl` empty, `e2fsck` **rc 0** (13/65536 files, 13020/262144 blocks) |
+| historical | `1` | **HUNG**: `daemon tid=2085471 state=D wchan=fuse_reverse_inval_entry`, connection `waiting=7` |
+
+The wait channel is read from `/proc/<tid>/wchan`, so the mechanism is observed
+from the kernel rather than inferred. `cargo test -p ffs-fuse --release`: **572
+passed / 0 failed** plus the doctest; `rustfmt` clean.
+
+A sharper finding than the recorded 2026-08-01 hang, which needed eight threads:
+**`rmdir` deadlocks single-threaded.** A serial loop of 200 `rmdir`s with
+`FFS_FUSE_NOTIFY_UNLINK=1` wedged the daemon on the same wait channel with 19
+requests queued, while a serial loop of 200 `unlink`s did not. So concurrency is
+not the trigger; it merely makes the `unlink` path hit it too. Both wedged
+daemons were released by aborting **their own** FUSE connection
+(`/sys/fs/fuse/connections/<minor>/abort`, minor read from
+`/proc/self/mountinfo` for our mountpoint) — a peer agent held a live
+`fuse.ffs` mount on this host throughout, on connection 167, and it was never
+touched.
+
+### The counted mechanism that failed, and why its zero difference means nothing
+
+The "one extra round trip per delete" theory was tested by counting the daemon's
+write syscalls from `/proc/<pid>/io` `syscw` across a fixed serial delete loop,
+both arms from one binary:
+
+| arm | op | n | writes | per op |
+| --- | --- | ---: | ---: | ---: |
+| lever | unlink | 200 | 1,000 | 5.000 |
+| lever | unlink | 400 | 2,000 | 5.000 |
+| lever | rmdir | 200 | 999 | 4.995 |
+| historical | unlink | 200 | 1,000 | 5.000 |
+| historical | rmdir | 200 | — | deadlocked |
+
+Stated for the contract in one line: on 200 serial unlinks the two arms record
+1,000 syscalls vs 1,000 — a zero difference, and the next paragraph is why that
+zero carries no information.
+
+Doubling the operation count doubles the writes exactly, so the counter is
+sensitive to *something* per-operation — but that something is the daemon's
+image `pwrite`s, not its `/dev/fuse` traffic. `Notifier::send` goes through
+`with_iovec` → `writev`, and so do the request replies, which is why the total
+does not move between arms and why five writes per delete is a suspiciously
+round number for a path that also replies to `LOOKUP` and `UNLINK`. **The
+instrument is blind to the quantity under test, so its zero difference neither
+confirms nor refutes the extra round trip.** It is recorded here so the next attempt does
+not repeat it: count `/dev/fuse` traffic with a counter that observes `writev`
+(the 2026-07-31 census used `strace` on the daemon; note `ptrace_scope=1` on
+this host, so `strace` must launch the daemon rather than attach to it).
+
+A first version of the deadlock test reported COMPLETED for **both** arms — every
+operation was failing with `Permission denied` because a plain `mke2fs` root
+inode is uid 0 and the client is uid 1000, and a workload whose every operation
+fails also finishes. The `e2fsck` block count being unchanged is what exposed
+it. The harness now creates its working directory as a gate and checks every
+worker's exit status, so an all-failures arm can no longer read as success.
+
+`rename` still notifies, after its reply, and is deliberately unchanged: it is
+not a deadlock source and its two round trips are a separate question.
+
+### What is NOT claimed
+
+**No performance effect is claimed, implied, or banked.** The round-trip theory
+that motivated the lever is unmeasured — the counter that was supposed to settle
+it could not see the quantity — and no mounted-comparator run was admissible on
+this host tonight (see the row below). The change stands on the correctness
+proof alone, which needs no perf number to justify it: it removes a reproduced
+deadlock. The command that must produce a perf verdict, if one is wanted:
+
+```
+ffs-mounted-kernel-bench --ffs-cli <v3+PGO elf> --filesystem ext4 \
+  --workload create-delete-storm --operations 2000 --pairs 128
+```
+run with `FFS_FUSE_NOTIFY_UNLINK` unset and `=1` from one ELF, on a host whose
+every CPU is quiet, with the historical arm's own admitted ratio reproducing the
+banked `2.753659x` before the lever arm is read.
+
 ## PENDING (no verdict): `--fuse-cpus` removes the 8:1 daemon handicap; the one window this session could not decide anything - 2026-08-02
 
 Instrument-only row: it banks a harness knob, committed as `b3eebca8`, and no
