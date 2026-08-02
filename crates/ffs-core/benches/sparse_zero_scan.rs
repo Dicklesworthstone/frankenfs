@@ -46,15 +46,9 @@ fn bench(c: &mut Criterion) {
         assert_eq!(byte_all_zero(block), unrolled4_all_zero(block));
         assert_eq!(word_all_zero(block), unrolled4_all_zero(block));
         let mut g = c.benchmark_group(format!("sparse_zero_{name}"));
-        g.bench_function("byte", |b| {
-            b.iter(|| black_box(byte_all_zero(black_box(block))))
-        });
-        g.bench_function("word", |b| {
-            b.iter(|| black_box(word_all_zero(black_box(block))))
-        });
-        g.bench_function("unrolled4", |b| {
-            b.iter(|| black_box(unrolled4_all_zero(black_box(block))))
-        });
+        g.bench_function("byte", |b| b.iter(|| black_box(byte_all_zero(black_box(block)))));
+        g.bench_function("word", |b| b.iter(|| black_box(word_all_zero(black_box(block)))));
+        g.bench_function("unrolled4", |b| b.iter(|| black_box(unrolled4_all_zero(black_box(block)))));
         g.finish();
     }
 }

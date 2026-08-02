@@ -13,6 +13,90 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT + REVERT: logical B-epsilon create messages double the mounted metadata gap - 2026-08-02
+
+This attempt did not repeat the rejected whole-block overlay below. It buffered
+logical `(parent, name, child inode, type, timestamp)` create messages across 64
+parent-striped interior-node shards, bounded the buffer at 4,096 messages, and
+drained each linear directory by reading its leaves once, applying the complete
+message run in memory, stamping each dirty leaf once, and publishing the final
+leaves plus parent inode in one MVCC transaction. Indexed or growing directories
+fell back to the mature one-create path. Namespace reads and conflicting
+mutations drained first; `fsyncdir`, sync, and unmount were durability boundaries.
+The production path was default-on with `FFS_EXT4_BE_CREATE_BUFFER=0` as a
+same-ELF kill switch. Implementation commit `333838e8` is fully reverted in this
+closeout because the live-kernel result is a large loss.
+
+Correctness was materially better than the earlier whole-block attempt. The
+focused strict-remote test
+`be_tree_create_messages_batch_at_fsyncdir_and_remain_findable` passed. A mounted
+one-thread diagnostic then completed 8 warmups plus 12 measured pairs with all
+512 acknowledged creates removed on every reset, exact four-arm tree parity, one
+observed and pinned worker per arm, and four clean offline `e2fsck` results. Its
+timing was intentionally underpowered and null-blocked; it is correctness
+evidence only. Report SHA-256
+`cedae694f71f266c12a7518deba17710cec1e189bb4555edb9687aeb3f854307`:
+`/data/tmp/frankenfs-be-create-score/diag-1t-r1/report.json`.
+
+The decisive mounted comparison used the unchanged frozen driver, ext4, 512
+creates, 8 observed/pinned workers, one private FUSE daemon CPU, 512 balanced
+four-arm pairs / 128 crossover blocks, and one durability boundary per timed
+observation. Candidate ELF
+`cd68a89a18b90664d97c6a7a03bc7bfd92d0f909746d1c671a5bc1523cc336d5`
+was built x86-64-v3 on `vmi1227854` with the banked PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`;
+driver ELF SHA-256 was
+`d8786a0663dbc635f4e508bcc9ade6cb8cad22c0c7353f9a6280d28329628c65`.
+
+| Same candidate ELF | FrankenFS / live kernel ext4 | Kernel A/A spread | FUSE A/A spread | Kernel / FUSE median wall |
+| --- | ---: | ---: | ---: | ---: |
+| B-epsilon ON (default) | `2.854120x [2.748979, 3.018131]` | `1.042877x` | `1.041383x` | `32.388 / 91.271 ms` |
+| B-epsilon OFF | `1.365410x [1.317870, 1.407852]` | `1.053137x` | `1.032855x` | `35.086 / 46.736 ms` |
+| Banked admitted reference | `1.510822x [1.493097, 1.539011]` | `1.024316x` | `1.021662x` | - |
+
+Each new ratio has its own same-invocation A/A null control with a deterministic
+20,000-resample bootstrap median CI. ON: kernel `1.014248x`
+`[0.996833, 1.042877]`, FUSE `1.006548x [0.968748, 1.041383]`. OFF: kernel
+`1.018520x [0.987281, 1.053137]`, FUSE `1.008744x [0.984245, 1.032855]`.
+
+Both new invocations are honestly `BLOCKED_NULL`, not admitted competitive
+claims: their A/A bootstrap spreads exceeded the frozen `1.025x` ceiling even
+though both null medians remained within 2% of one. They nevertheless reject
+the lever without a rerun. ON is nowhere near the target even at its `2.748979x`
+lower diagnostic bound, while OFF returns toward the live bank from the exact
+same ELF. ON/OFF is a **`2.090303x` ratio-of-ratios regression**, and the FUSE
+median itself is **`1.952917x` slower** with buffering. Both runs completed exact
+reset accounting, initial/final four-arm parity, worker-count and pinning proof,
+and four clean offline `e2fsck` checks. ON report SHA-256
+`13f5ad728dc462ad66b129bfafcf80a2fb98d2a6b1783f30f5e3ff98f740b8ec`:
+`/data/tmp/frankenfs-be-create-score/scored-8t-p512/report.json`. OFF report
+SHA-256
+`3385acaf0d9eb96988ff6e461f1c39c7d09d63f2e6b3d73573c28f71eccb20b5`:
+`/data/tmp/frankenfs-be-create-score/control-off-8t-p512/report.json`.
+
+The structural miss is scope: this shape batches only the final directory-leaf
+mutation. Every create still allocates and publishes its inode and allocation
+metadata, then the timed `fsyncdir` path pays the new leaf reconstruction and
+batch publication. It therefore adds a second materialization boundary without
+removing the dominant per-request path.
+
+Ordering was preserved by holding the parent-shard lock from duplicate checking
+through message append and by draining each parent in append order. Tie-breaking,
+floating point, and RNG are N/A. Mounted reset, tree parity, and offline checks
+are the behavioral-equivalence proof.
+
+**Decision in one line:** REJECT + REVERT - logical B-epsilon create buffering
+moved the live-kernel diagnostic from `1.365410x` OFF to `2.854120x` ON, so it
+more than doubled the gap instead of beating ext4.
+
+**Retry predicate:** do not retry directory-entry-only buffering. Reopen B-epsilon
+metadata only after an exact mounted whole-job profile shows inode allocation,
+bitmap updates, inode-table publication, directory insertion, and their MVCC
+commits together consume at least **40%** of timed FUSE wall, and a design buffers
+that complete logical create transaction (with lookup visibility) rather than
+adding a second `fsyncdir` materialization boundary. The next vein is transport,
+not another directory-leaf buffer.
+
 ## REJECT + REVERT: read-only concurrent handle lifecycle narrows but does not close `parallel-read-8t` - 2026-08-02
 
 The earlier concurrent-dispatch rejection required an opcode census before

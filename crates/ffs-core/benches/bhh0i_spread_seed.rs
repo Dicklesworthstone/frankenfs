@@ -34,11 +34,7 @@ fn cached_seed() -> u32 {
 
 fn bench_spread_seed(c: &mut Criterion) {
     // Isomorphism: both variants yield the same seed on this thread.
-    assert_eq!(
-        recompute_seed(),
-        cached_seed(),
-        "cached seed must equal recompute"
-    );
+    assert_eq!(recompute_seed(), cached_seed(), "cached seed must equal recompute");
 
     let mut group = c.benchmark_group("bhh0i_spread_seed");
     // Old: recompute the SipHash over `thread::current().id()` on every call.
