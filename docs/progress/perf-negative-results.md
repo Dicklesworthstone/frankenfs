@@ -13,6 +13,82 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT + REVERT: concurrent FUSE creates over the per-group allocator exhaust leaked free-inode counters - 2026-08-02
+
+Lever 4 from the live-incumbent metadata list exposed `FUSE_CREATE` to the
+existing `FFS_FUSE_WORKERS=8` reader pool so the default allocator arm serialized
+inside FrankenFS's whole-state allocation lock while
+`FFS_BHH0I_SHARDED=1` could reach the already-implemented per-group allocator.
+Everything else in the mutation set remained behind the whole-session exclusive
+gate. The source exposure is **REVERTED**: it cannot be shipped because the
+sharded arm does not complete the scored job.
+
+One v3+PGO ELF supplied both arms (SHA-256
+`311992e274df94155d883cc7175e933f41812fb99064769eb326548555ef403a`,
+PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`).
+Each invocation mounted two kernel-ext4 and two FrankenFS images on
+`fixmydocuments`, ran 8 pinned clients creating exactly 512 empty files across
+private directories and fsyncing every worker directory, and placed the FUSE
+daemon on the maximum 7 admissible sibling CPUs. There were 128 four-round
+crossover pairs; the gate used wall time, deterministic 20,000-resample median
+CIs, and same-invocation A/A nulls (`cv_used=false`,
+`instructions_used=false`).
+
+The global-lock control (`FFS_BHH0I_SHARDED` unset) completed and was admitted:
+
+Same-invocation A/A null control `1.001994x` was used as a gate input;
+deterministic 20,000-resample bootstrap median 95% CI
+`[0.992118, 1.022133]`. The sibling FrankenFS FUSE A/A null control was
+`0.997024x [0.992315, 1.001802]`; both are clear under the `1.025x`
+symmetric-spread limit.
+
+| quantity | result |
+| --- | ---: |
+| kernel median batch | 2.871270 ms |
+| FrankenFS median batch | 11.099821 ms |
+| FUSE / kernel | **`3.863792x [3.854198, 3.938998]` honest loss** |
+| kernel A/A spread | `1.022133x` (clear) |
+| FUSE A/A spread | `1.007745x` (clear) |
+| tree parity / post-unmount validation | pass / clean |
+
+Control report SHA-256:
+`b09803b187334b559ae483dd08f22dd06e28af7ee2a850d81421e9f3927d6998`
+at `/data/tmp/frankenfs-sharded-alloc-results-multi7/control/report.json`.
+The control's worse-than-banked ratio is itself useful mechanism evidence:
+allowing creates to queue concurrently behind the same whole-state lock exposes
+the allocator convoy instead of hiding it in the serial FUSE loop.
+
+The sharded arm used the identical binary and placement with only
+`FFS_BHH0I_SHARDED=1`. It failed during measured pair 127 with `ENOSPC` while
+creating `fuse_b/.../worker-7/r000127-000040`; therefore it has **no admissible
+timing** and no speedup is claimed. The workload deletes all 512 files between
+observations, so 65,000+ cumulative creates must not consume inode capacity.
+Read-only offline `e2fsck -fn` identifies the leak:
+
+| image | recorded free inodes | bitmap-counted free inodes | e2fsck |
+| --- | ---: | ---: | --- |
+| FrankenFS `fuse_a` | 488 | 65,512 | rc 4, errors remain |
+| FrankenFS `fuse_b` | 0 | 65,024 | rc 4, errors remain |
+| kernel `kernel_a` | - | - | rc 0, 24/65,536 files |
+| kernel `kernel_b` | - | - | rc 0, 24/65,536 files |
+
+The inode bitmaps were freed, but the sharded free-inode counters were not
+credited back; allocation eventually trusts the exhausted counters and rejects
+free bitmap slots. That is a correctness failure before it is a performance
+question. Ordering/tie-breaking/FP/RNG are N/A; the control's tree parity passed,
+and the candidate failed the required durability/isomorphism gate.
+
+**Decision in one line:** REJECT + REVERT - the only admitted arm remains
+`3.864x` slower than live kernel ext4, while the sharded candidate exhausts
+stale free-inode counters before the job finishes.
+
+**Retry predicate:** do not expose concurrent creates again until a
+same-filesystem create/delete churn test exceeding **2x the filesystem inode
+capacity** proves the sharded per-group and superblock free-inode counters return
+to their exact baseline after every reset, followed by `e2fsck -fn` rc 0; only
+then rerun this unchanged mounted four-arm comparator.
+
 ## CORRECTNESS FIX (no timing taken): unlink/rmdir stop re-notifying the kernel about the entry they just removed - deadlock reproduced and removed - 2026-08-02
 
 `26d122a6`. Self-generated lever, chosen by the standing rule "rank the job's
