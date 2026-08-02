@@ -13,6 +13,61 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT + REVERT: read-only concurrent handle lifecycle narrows but does not close `parallel-read-8t` - 2026-08-02
+
+The earlier concurrent-dispatch rejection required an opcode census before
+reopening this surface. That condition was met: over four rounds of 256 files,
+`FUSE_OPEN`, `FUSE_FLUSH`, and
+`FUSE_RELEASE` contributed 1,024 requests each, or about **73%** of the row's
+FUSE traffic, while `FUSE_READ` remained zero because the kernel page cache
+served the payload. Unlike the live ext4 incumbent, FrankenFS serialized all
+three stateless read-only lifecycle operations behind the session's exclusive
+dispatch gate. The candidate added an explicit fuser capability and admitted
+only those three opcodes to shared dispatch on read-only FrankenFS mounts;
+writable mounts retained the existing exclusive ordering. One focused remote
+test passed and proved the opt-in was read-only. The implementation and test
+are now fully reverted.
+
+**Counted mechanism:** the connection-filtered wire syscall count was 1,024
+`OPEN` + 1,024 `FLUSH` + 1,024 `RELEASE` requests across four rounds, versus
+zero `READ` requests; lifecycle operations were about 73% of all FUSE traffic.
+
+The executing candidate ELF self-reported SHA-256
+`82af3376f2edb2d4281c4d9da7f27f99f88c582577d42de2c180dfeaad9710db`
+in-process, with x86-64-v3 codegen and banked PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The live score kept all eight client threads and used the maximum currently
+admissible four FUSE workers on four isolated daemon CPUs after three preserved
+8-CPU attempts failed closed on host-quiescence or placement gates. It ran 128
+balanced four-arm crossover pairs over 256 separate 256 KiB files. Median wall
+time was 3.557990 ms for live Linux 6.17 ext4 and 3.806981 ms for FrankenFS.
+The admitted result was **`1.069612x` slower**, deterministic 20,000-resample
+bootstrap median 95% CI **`[1.061955, 1.076284]`**, verdict `HONEST_LOSS`.
+
+The **same-invocation A/A null controls** were kernel `1.001349`
+[`0.996232`, `1.003943`] and FUSE `0.993640`
+[`0.989095`, `1.005551`]; both null gates were clear. Eight timed worker threads
+used deterministic bootstrap median 95% CI values. Eight timed worker threads
+were observed and pinned in every arm. Initial/final four-arm tree parity passed
+with SHA-256
+`aac7d54d2c47af9e92c404f46f326941eaa5e86c8530e05d0f6521320dcebfb6`,
+all workload digests matched, and post-unmount offline validation was clean.
+Report SHA-256
+`3499de259d5369fb4a2d1f3aad3e45b55c20248a985f7a40bae64e38047b23f0`:
+`/data/tmp/frankenfs-handle-lifecycle-score-retry3-w4.knIlQy/report.json`.
+Ordering and file metadata were preserved by four-arm parity; tie-breaking,
+floating point, and RNG are N/A.
+
+**Decision in one line:** REJECT + REVERT - shared read-only handle lifecycle
+reduced the banked `1.287862x` gap to an admitted `1.069612x`, but FrankenFS
+still lost decisively to the live kernel and therefore did not meet the target.
+
+**Retry predicate:** do not retry this dispatch change unless the live harness
+can first allocate eight quiet daemon CPUs and a same-ELF 4-worker/8-worker
+diagnostic on this exact 8-client job shows the 8-worker median at least **8%**
+lower with a bootstrap 95% upper ratio below `0.93`; otherwise profile the
+remaining structural 6.2-7.6% gap and switch veins.
+
 ## REJECT + REVERT: `FUSE_HANDLE_KILLPRIV_V2` does not suppress audit GETXATTR traffic - 2026-08-02
 
 The worst scored mounted row, `large_directory_readdir_stat_8t`, was selected
