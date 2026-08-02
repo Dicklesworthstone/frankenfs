@@ -103,6 +103,12 @@ use tracing::{debug, error, info, trace, warn};
 // VFS types and FsOps trait are in vfs.rs, re-exported above.
 const LINUX_PATH_MAX: u64 = 4096;
 const LINUX_SYMLINK_TARGET_MAX: u64 = LINUX_PATH_MAX - 1;
+/// B-epsilon create buffers are striped by parent inode so independent
+/// directories never contend on one message-buffer mutex.
+const EXT4_BE_CREATE_BUFFER_SHARDS: usize = 64;
+/// Bound the logical message buffer. Once this many creates are pending, the
+/// next creator synchronously drains the tree before accepting more work.
+const EXT4_BE_CREATE_BUFFER_CAPACITY: u64 = 4096;
 const BTRFS_COMPRESSED_EXTENT_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 /// btrfs LZO segment framing aligns segment headers to the filesystem sector
 /// size (kernel `fs/btrfs/lzo.c`). FrankenFS assumes the default 4 KiB sector
@@ -130,6 +136,51 @@ thread_local! {
 enum BtrfsDeferredReadResult {
     Bytes(Vec<u8>),
     Done,
+}
+
+/// One logical namespace mutation held in a B-epsilon interior-node buffer.
+///
+/// Unlike the rejected whole-block buffer, this stores the operation itself,
+/// not a cloned 4 KiB image. A parent drain applies every message to its leaf
+/// block in memory, stamps that block once, and commits the final leaf plus the
+/// final parent inode once.
+#[derive(Clone)]
+struct Ext4BufferedCreate {
+    name: Vec<u8>,
+    child: InodeNumber,
+    file_type: Ext4FileType,
+    timestamp_secs: u64,
+    timestamp_nanos: u32,
+}
+
+/// Parent-keyed B-epsilon message buffers for mounted ext4 create bursts.
+///
+/// Each shard is an interior node: the parent inode is its pivot and the value
+/// is the ordered message run destined for that directory subtree. A drain
+/// holds the shard lock through publication, which is the linearization point
+/// against concurrent producers for the same parent.
+struct Ext4CreateMessageBuffer {
+    shards: Box<[Mutex<BTreeMap<InodeNumber, Vec<Ext4BufferedCreate>>>]>,
+    pending: AtomicU64,
+}
+
+impl Ext4CreateMessageBuffer {
+    fn new() -> Self {
+        Self {
+            shards: (0..EXT4_BE_CREATE_BUFFER_SHARDS)
+                .map(|_| Mutex::new(BTreeMap::new()))
+                .collect(),
+            pending: AtomicU64::new(0),
+        }
+    }
+
+    const fn shard_index(parent: InodeNumber) -> usize {
+        parent.0 as usize % EXT4_BE_CREATE_BUFFER_SHARDS
+    }
+
+    fn is_full(&self) -> bool {
+        self.pending.load(Ordering::Relaxed) >= EXT4_BE_CREATE_BUFFER_CAPACITY
+    }
 }
 
 enum BtrfsReadJob<'o> {
@@ -1281,6 +1332,10 @@ pub struct OpenFs {
     /// Shared across all snapshots/transactions that operate on this filesystem.
     /// Writes stage versions here; reads check here before falling back to device.
     mvcc_store: Arc<FsMvccStore>,
+    /// Logical B-epsilon message buffers for mounted ext4 create bursts.
+    /// Messages are grouped by parent directory and materialized at a namespace
+    /// read, a conflicting namespace mutation, `fsyncdir`, sync, or unmount.
+    ext4_create_messages: Ext4CreateMessageBuffer,
     /// Highest MVCC commit sequence durably checkpointed to this filesystem's
     /// base device. The mutex serializes concurrent fsync/flush calls so an older
     /// checkpoint cannot overwrite a newer one after its watermark publishes.
@@ -4563,6 +4618,7 @@ impl OpenFs {
             ext4_forced_read_only: AtomicBool::new(false),
             dev,
             mvcc_store,
+            ext4_create_messages: Ext4CreateMessageBuffer::new(),
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
             metadata_log,
             metadata_compactor: Mutex::new(None),
@@ -19077,6 +19133,259 @@ impl OpenFs {
             .map(|alloc| alloc.start))
     }
 
+    /// Runtime kill switch for the logical B-epsilon create buffer. The mounted
+    /// production path is enabled by default; `FFS_EXT4_BE_CREATE_BUFFER=0`
+    /// restores the immediate per-create directory update for an exact A/B on
+    /// one ELF.
+    fn ext4_be_create_buffer_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FFS_EXT4_BE_CREATE_BUFFER").map_or(true, |value| {
+                !matches!(
+                    value.to_str(),
+                    Some("0" | "false" | "FALSE" | "off" | "OFF")
+                )
+            })
+        })
+    }
+
+    /// Try the B-epsilon fast drain for one parent: apply every logical insert
+    /// to in-memory leaf images, then publish each final leaf plus the final
+    /// parent inode in one MVCC transaction. `Ok(false)` means the directory is
+    /// indexed or needs growth, so the caller must use the synchronous existing
+    /// insertion path. Nothing is published on that decline.
+    fn ext4_try_flush_create_messages_batch(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        messages: &[Ext4BufferedCreate],
+    ) -> ffs_error::Result<bool> {
+        if messages.is_empty() {
+            return Ok(true);
+        }
+
+        let alloc_mutex = self.require_alloc_state()?;
+        let alloc = alloc_mutex.read();
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+        // The common mounted workload uses private one-block linear
+        // directories. Preserve the mature split/rebuild implementation as the
+        // deterministic fallback for indexed directories and growth.
+        if parent_inode.has_htree_index() {
+            return Ok(false);
+        }
+
+        let extents =
+            self.ext4_write_extents_with_scope(cx, &RequestScope::empty(), &parent_inode)?;
+        let block_dev = self.block_device_adapter();
+        let mut leaves: Vec<(BlockNumber, Vec<u8>, bool)> = Vec::new();
+        for extent in extents.iter() {
+            if extent.is_unwritten() {
+                continue;
+            }
+            for block in Self::extent_phys_blocks(extent) {
+                leaves.push((block, block_dev.read_block(cx, block)?.into_inner(), false));
+            }
+        }
+        if leaves.is_empty() {
+            return Ok(false);
+        }
+
+        let reserved_tail = self.ext4_dir_reserved_tail();
+        for message in messages {
+            let child = u32::try_from(message.child.0)
+                .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+            let mut inserted = false;
+            for (_, leaf, dirty) in &mut leaves {
+                match ffs_dir::add_entry_tracked(
+                    leaf,
+                    child,
+                    &message.name,
+                    message.file_type,
+                    reserved_tail,
+                ) {
+                    Ok(_) => {
+                        *dirty = true;
+                        inserted = true;
+                        break;
+                    }
+                    Err(FfsError::NoSpace) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if !inserted {
+                // All edits above live only in local Vecs. Declining here is
+                // therefore atomic and the existing growth path can replay the
+                // complete logical run.
+                return Ok(false);
+            }
+        }
+
+        let parent_u32 = u32::try_from(parent.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+        for (_, leaf, dirty) in &mut leaves {
+            if *dirty {
+                // One full stamp after the batch is byte-identical to stamping
+                // after every logical edit, but computes the 4 KiB checksum once.
+                self.stamp_ext4_dir_block(leaf, parent_u32, parent_inode.generation);
+            }
+        }
+
+        let mut txn = self.mvcc_store.begin();
+        {
+            let tx_dev = TransactionBlockAdapter {
+                base: &block_dev,
+                tx: Mutex::new(&mut txn),
+            };
+            for (block, leaf, dirty) in &leaves {
+                if *dirty {
+                    tx_dev.write_block(cx, *block, leaf)?;
+                }
+            }
+
+            let mut parent_after = parent_inode;
+            let last = messages.last().expect("non-empty create message batch");
+            ffs_inode::touch_mtime_ctime(
+                &mut parent_after,
+                last.timestamp_secs,
+                last.timestamp_nanos,
+            );
+            let csum_seed = self
+                .ext4_superblock()
+                .ok_or_else(|| FfsError::Format("create buffer on non-ext4 filesystem".into()))?
+                .csum_seed();
+            ffs_inode::write_inode(
+                cx,
+                &tx_dev,
+                &alloc.geo,
+                &alloc.groups,
+                parent,
+                &parent_after,
+                csum_seed,
+            )?;
+        }
+        drop(alloc);
+
+        let commit_seq = self
+            .mvcc_store
+            .commit(txn)
+            .map_err(|error| FfsError::Format(error.to_string()))?;
+        self.prune_mvcc_after_commit_if_due(commit_seq);
+        Ok(true)
+    }
+
+    /// Conservative fallback for a message run that cannot be materialized in
+    /// existing linear leaves. This is the old path verbatim, one message at a
+    /// time; the caller removes each successfully published prefix so a later
+    /// retry can never duplicate it.
+    fn ext4_flush_one_create_message(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        message: &Ext4BufferedCreate,
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let mut alloc = alloc_mutex.write();
+        let parent_inode = self.read_inode(cx, parent)?;
+        let csum_seed = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("create buffer on non-ext4 filesystem".into()))?
+            .csum_seed();
+        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        self.ext4_add_dir_entry(
+            cx,
+            &mut backend,
+            parent,
+            &parent_inode,
+            &message.name,
+            message.child,
+            message.file_type,
+            csum_seed,
+            message.timestamp_secs,
+            message.timestamp_nanos,
+        )
+    }
+
+    fn ext4_flush_locked_create_messages(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        messages: &mut Vec<Ext4BufferedCreate>,
+    ) -> ffs_error::Result<usize> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        if self.ext4_try_flush_create_messages_batch(cx, parent, messages)? {
+            let flushed = messages.len();
+            messages.clear();
+            self.ext4_create_messages.pending.fetch_sub(
+                u64::try_from(flushed).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            return Ok(flushed);
+        }
+
+        let mut flushed = 0_usize;
+        while let Some(message) = messages.first().cloned() {
+            self.ext4_flush_one_create_message(cx, parent, &message)?;
+            messages.remove(0);
+            flushed += 1;
+            self.ext4_create_messages
+                .pending
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(flushed)
+    }
+
+    /// Drain one parent at a directory durability boundary.
+    fn ext4_flush_create_messages_for_parent(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+    ) -> ffs_error::Result<usize> {
+        if !Self::ext4_be_create_buffer_enabled() {
+            return Ok(0);
+        }
+        let shard_idx = Ext4CreateMessageBuffer::shard_index(parent);
+        let mut shard = self.ext4_create_messages.shards[shard_idx].lock();
+        let flushed = match shard.get_mut(&parent) {
+            Some(messages) => self.ext4_flush_locked_create_messages(cx, parent, messages)?,
+            None => 0,
+        };
+        if shard.get(&parent).is_some_and(Vec::is_empty) {
+            shard.remove(&parent);
+        }
+        Ok(flushed)
+    }
+
+    /// Drain every parent in deterministic shard/key order. Namespace reads and
+    /// non-create namespace mutations use this conservative fallback so every
+    /// acknowledged create is visible without teaching all read paths about an
+    /// uncommitted whole-block overlay.
+    fn ext4_flush_all_create_messages(&self, cx: &Cx) -> ffs_error::Result<usize> {
+        if !Self::ext4_be_create_buffer_enabled() {
+            return Ok(0);
+        }
+        let mut flushed = 0_usize;
+        for shard_mutex in &self.ext4_create_messages.shards {
+            let mut shard = shard_mutex.lock();
+            let parents: Vec<InodeNumber> = shard.keys().copied().collect();
+            for parent in parents {
+                if let Some(messages) = shard.get_mut(&parent) {
+                    flushed = flushed.saturating_add(
+                        self.ext4_flush_locked_create_messages(cx, parent, messages)?,
+                    );
+                }
+                if shard.get(&parent).is_some_and(Vec::is_empty) {
+                    shard.remove(&parent);
+                }
+            }
+        }
+        Ok(flushed)
+    }
+
     /// Require the ext4 alloc state to be present (i.e., writes enabled).
     fn require_alloc_state(&self) -> Result<&RwLock<Ext4AllocState>, FfsError> {
         if self.ext4_forced_read_only.load(Ordering::SeqCst) {
@@ -19091,7 +19400,7 @@ impl OpenFs {
     fn ext4_create(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
+        scope: &mut RequestScope,
         parent: InodeNumber,
         name: &[u8],
         mode: u16,
@@ -19099,6 +19408,16 @@ impl OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
+        // Only request-scoped mounted creates use the cross-request buffer.
+        // Direct library calls carry no transaction and retain their historical
+        // immediately-materialized namespace behavior.
+        let buffer_create = scope.tx.is_some() && Self::ext4_be_create_buffer_enabled();
+        if buffer_create && self.ext4_create_messages.is_full() {
+            // Budget exhaustion is deterministic: synchronously drain before
+            // accepting more messages. Concurrent producers can overshoot only
+            // by their bounded in-flight count.
+            self.ext4_flush_all_create_messages(cx)?;
+        }
         let alloc_mutex = self.require_alloc_state()?;
         let block_dev = self.block_device_adapter();
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
@@ -19112,6 +19431,22 @@ impl OpenFs {
         let parent_inode = self.read_inode(cx, parent)?;
         if !parent_inode.is_dir() {
             return Err(FfsError::NotDirectory);
+        }
+
+        // Hold the parent pivot's interior-node lock from duplicate validation
+        // through message publication. A flush of this parent uses the same
+        // lock, so an acknowledged create is either wholly before or wholly
+        // after that durability boundary.
+        let mut create_shard = buffer_create.then(|| {
+            let shard_idx = Ext4CreateMessageBuffer::shard_index(parent);
+            self.ext4_create_messages.shards[shard_idx].lock()
+        });
+        if create_shard.as_ref().is_some_and(|shard| {
+            shard
+                .get(&parent)
+                .is_some_and(|messages| messages.iter().any(|message| message.name == name))
+        }) {
+            return Err(FfsError::Exists);
         }
 
         // bd-bhh0i cutover: when the sharded toggle is on, route to the lock-free
@@ -19145,7 +19480,9 @@ impl OpenFs {
         let htree_dedup_covers = parent_inode.has_htree_index()
             && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && Self::htree_create_dedup_enabled();
-        if !htree_dedup_covers && self.lookup_name(cx, &parent_inode, name)?.is_some() {
+        if (buffer_create || !htree_dedup_covers)
+            && self.lookup_name(cx, &parent_inode, name)?.is_some()
+        {
             return Err(FfsError::Exists);
         }
 
@@ -19177,6 +19514,32 @@ impl OpenFs {
         )?;
 
         let attr = inode_to_attr(sb, ino, &new_inode);
+
+        if let Some(shard) = create_shard.as_mut() {
+            shard.entry(parent).or_default().push(Ext4BufferedCreate {
+                name: name.to_vec(),
+                child: ino,
+                file_type: ffs_ondisk::Ext4FileType::RegFile,
+                timestamp_secs: tstamp_secs,
+                timestamp_nanos: tstamp_nanos,
+            });
+            self.ext4_create_messages
+                .pending
+                .fetch_add(1, Ordering::Relaxed);
+            drop(alloc);
+            drop(create_shard);
+
+            trace!(
+                target: "ffs::write",
+                op = "create_be_buffered",
+                parent = parent.0,
+                ino = ino.0,
+                name = %String::from_utf8_lossy(name),
+                mode,
+                "file create appended to B-epsilon metadata buffer"
+            );
+            return Ok(attr);
+        }
 
         // Add directory entry to parent.
         // bd-bhh0i: single-lock caller wraps the alloc guard in a byte-identical
@@ -19384,6 +19747,12 @@ impl OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
+        // FUSE tags mknod as RequestOp::Create, the one operation intentionally
+        // exempted from the generic pre-request namespace drain. mknod itself is
+        // not buffered, so materialize any earlier regular creates first.
+        if self.ext4_create_messages.pending.load(Ordering::Relaxed) != 0 {
+            self.ext4_flush_all_create_messages(cx)?;
+        }
 
         let s_ifmt = mode & ffs_types::S_IFMT;
         // Map the file-type bits to the on-disk dir-entry type. Anything
@@ -27485,6 +27854,10 @@ impl OpenFs {
             return Err(FfsError::ReadOnly);
         }
 
+        if op == "fsyncdir" && self.ext4_create_messages.pending.load(Ordering::Relaxed) != 0 {
+            self.ext4_flush_create_messages_for_parent(cx, ino)?;
+        }
+
         if self.metadata_log.is_some() {
             let result = self.flush_ext4_metadata_log(cx);
             let duration_us = started
@@ -33198,6 +33571,9 @@ impl OpenFs {
     pub fn sync_all_to_device(&self, cx: &Cx) -> ffs_error::Result<()> {
         if !self.is_writable() {
             return Err(FfsError::ReadOnly);
+        }
+        if self.ext4_create_messages.pending.load(Ordering::Relaxed) != 0 {
+            self.ext4_flush_all_create_messages(cx)?;
         }
         let base_dev = self.direct_block_device_adapter();
         self.flush_mvcc_versions_to_device(cx, &base_dev)?;
@@ -39191,6 +39567,25 @@ impl FsOps for OpenFs {
     }
 
     fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+        // Reads or mutations of a directory namespace must observe every
+        // acknowledged logical create. Lifecycle operations (open/flush/release)
+        // and inode-only reads do not inspect directory leaves and deliberately
+        // leave the buffer intact, so a create/open/close burst still batches.
+        if self.ext4_create_messages.pending.load(Ordering::Relaxed) != 0
+            && matches!(
+                op,
+                RequestOp::Lookup
+                    | RequestOp::Readdir
+                    | RequestOp::Mkdir
+                    | RequestOp::Unlink
+                    | RequestOp::Rmdir
+                    | RequestOp::Rename
+                    | RequestOp::Link
+                    | RequestOp::Symlink
+            )
+        {
+            self.ext4_flush_all_create_messages(_cx)?;
+        }
         let (snapshot, tx) = if op.is_write() {
             // Write operations must use a transaction for isolation and atomicity.
             let txn = self.mvcc_store.begin();
@@ -39312,6 +39707,10 @@ impl FsOps for OpenFs {
     fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {
         if !self.is_writable() {
             return Ok(());
+        }
+
+        if self.ext4_create_messages.pending.load(Ordering::Relaxed) != 0 {
+            self.ext4_flush_all_create_messages(cx)?;
         }
 
         // Drain and join the home-location compactor before the final full
@@ -57928,6 +58327,72 @@ mod tests {
             csum_seed,
         )
         .expect("persist test inode");
+    }
+
+    #[test]
+    fn be_tree_create_messages_batch_at_fsyncdir_and_remain_findable() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let parent = fs
+            .mkdir(&cx, InodeNumber(2), OsStr::new("be-parent"), 0o755, 0, 0)
+            .expect("create linear parent")
+            .ino;
+        assert!(
+            !fs.read_inode(&cx, parent)
+                .expect("read parent")
+                .has_htree_index(),
+            "focused test must exercise the existing-leaf batch drain"
+        );
+
+        let mut created = Vec::new();
+        for index in 0..8 {
+            let name = format!("buffered-{index}");
+            let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Create)
+                .expect("begin mounted create scope");
+            let attr = <OpenFs as FsOps>::create(
+                &fs,
+                &cx,
+                &mut scope,
+                parent,
+                OsStr::new(&name),
+                0o644,
+                0,
+                0,
+            )
+            .expect("buffer logical create");
+            <OpenFs as FsOps>::commit_request_scope(&fs, &mut scope)
+                .expect("commit create request scope");
+            <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Create, scope)
+                .expect("end create request scope");
+            created.push((name, attr.ino));
+        }
+        assert_eq!(
+            fs.ext4_create_messages.pending.load(Ordering::Relaxed),
+            8,
+            "creates should remain logical messages until the directory boundary"
+        );
+
+        let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Fsyncdir)
+            .expect("begin fsyncdir scope");
+        <OpenFs as FsOps>::fsyncdir(&fs, &cx, &mut scope, parent, 0, false)
+            .expect("drain and persist buffered creates");
+        <OpenFs as FsOps>::commit_request_scope(&fs, &mut scope).expect("commit fsyncdir scope");
+        <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Fsyncdir, scope)
+            .expect("end fsyncdir scope");
+        assert_eq!(
+            fs.ext4_create_messages.pending.load(Ordering::Relaxed),
+            0,
+            "fsyncdir must drain the parent buffer"
+        );
+
+        for (name, ino) in created {
+            let found = fs
+                .lookup(&cx, parent, OsStr::new(&name))
+                .expect("buffered create visible after fsyncdir");
+            assert_eq!(found.ino, ino);
+        }
     }
 
     #[test]

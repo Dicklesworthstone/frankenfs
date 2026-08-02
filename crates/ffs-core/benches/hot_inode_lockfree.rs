@@ -32,7 +32,7 @@
 //!     cargo bench --profile release-perf -p ffs-core --bench hot_inode_lockfree
 
 use arc_swap::ArcSwapOption;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -66,7 +66,10 @@ impl ShardedMutexMap {
         self.shards[(key as usize) % SHARDS].lock().insert(key, val);
     }
     fn get(&self, key: u64) -> Option<u64> {
-        self.shards[(key as usize) % SHARDS].lock().get(&key).copied()
+        self.shards[(key as usize) % SHARDS]
+            .lock()
+            .get(&key)
+            .copied()
     }
 }
 
@@ -161,8 +164,7 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("hot_inode_complete_read_admission_256");
     for name in ["control_publish_a", "control_publish_b"] {
         g.bench_function(name, |b| {
-            let slot: Arc<ArcSwapOption<(u64, Arc<[u8; 256]>)>> =
-                Arc::new(ArcSwapOption::empty());
+            let slot: Arc<ArcSwapOption<(u64, Arc<[u8; 256]>)>> = Arc::new(ArcSwapOption::empty());
             b.iter(|| {
                 for key in 0..256u64 {
                     let parsed = Arc::new(black_box([key as u8; 256]));
