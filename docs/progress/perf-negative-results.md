@@ -13,6 +13,72 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT + REVERT: `FUSE_HANDLE_KILLPRIV_V2` does not suppress audit GETXATTR traffic - 2026-08-02
+
+The worst scored mounted row, `large_directory_readdir_stat_8t`, was selected
+because the whole-job profile and a kernel stack count found one userspace
+`security.capability` round trip per inode. In-kernel ext4 answers the same
+`get_vfs_caps_from_disk` audit query from its inode/xattr cache, while FrankenFS
+pays `/dev/fuse` transport. The proposed lever implemented the complete
+killpriv-v2 contract rather than advertising an unsafe flag: the vendored ABI
+carried the missing protocol bits, write/truncate/chown transactionally removed
+`security.capability`, and the kernel's hints cleared setuid plus executable
+setgid. Five focused remote tests passed. This code was used only to falsify the
+mechanism and is fully reverted.
+
+The connection-filtered `fuse:fuse_request_send` census is decisive. Over one
+warmed enumerate-plus-stat sweep of 32,768 entries, the same binary produced
+identical opcode counts with `FFS_FUSE_KILLPRIV_V2=0` and `=1`:
+
+| opcode | capability off | capability on |
+| --- | ---: | ---: |
+| `FUSE_GETXATTR` | **32,779** | **32,779** |
+| `FUSE_READDIR` | 66 | 66 |
+| `FUSE_OPENDIR` / `RELEASEDIR` / `STATFS` | 1 each | 1 each |
+
+**Counted mechanism:** the syscall count was **32,779 GETXATTR syscalls vs
+32,779 GETXATTR syscalls** with the capability off versus on.
+
+The candidate log confirms that the kernel accepted the capability. Thus
+`FUSE_HANDLE_KILLPRIV_V2` affects write-time privilege removal but does not
+suppress audit's read-side `get_vfs_caps_from_disk` probe on this Linux 6.17
+mount. Raw counts and mount identities are under
+`/data/tmp/frankenfs-killpriv-v2-opcodes.6rkgFh`; off/on count SHA-256 values are
+`7269998e8448a4ef88596f84298c878c2085899808b54cb4e4a69ec5b359e592`
+and `0269096336472b6ae3a67177c75060c95d8bcfd3f1873ddbd9a6fb30f7addde4`.
+
+The required live-incumbent score used candidate ELF
+`287d204450645a23503f584a3dceef390b5618c903fb05712afd562f39f6d301`
+(x86-64-v3, banked PGO
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`),
+eight FUSE workers on eight daemon CPUs, 32,768 operations, and 128 balanced
+crossover pairs. Median wall time was 20.664 ms for live kernel ext4 versus
+70.864 ms for FrankenFS: **`3.424952x` slower**, bootstrap 95% CI
+**`[3.409124, 3.431527]`**, admitted `HONEST_LOSS`. Kernel A/A was `1.004554`
+[`0.997570`, `1.009370`] and FUSE A/A was `1.002600` [`0.999739`, `1.004678`];
+both null gates were clear. Four-arm initial/final tree parity passed with hash
+`a91834cf56bad86fc2d7324f41593e5b5b3794a76f9dbeab5dc0ff697f908c79`,
+8 worker threads were observed in every arm, and all images passed offline
+`e2fsck -fn`. Report SHA-256
+`6c32eea13fbe207a25ded1fa9b498db5a6b06177b7c68a0328be2f3f08fb9e25`:
+`/data/tmp/frankenfs-killpriv-v2-score-retry1.XMqsIG/report.json`.
+Ordering and file metadata were preserved by four-arm parity; tie-breaking,
+floating point, and RNG are N/A.
+
+The **same-invocation A/A null controls** used deterministic bootstrap median 95% CI values:
+kernel `1.004554` [`0.997570`, `1.009370`] and FUSE `1.002600`
+[`0.999739`, `1.004678`].
+
+**Decision in one line:** REJECT + REVERT - negotiation succeeded but removed
+zero GETXATTR round trips, and the scored candidate remained `3.424952x` slower
+than live ext4; all seven source files are restored exactly to HEAD.
+
+**Retry predicate:** revisit killpriv as a performance lever only after a kernel
+or FUSE protocol change is first shown, by a connection-filtered census on this
+exact workload, to reduce `FUSE_GETXATTR` below **0.05 per entry**. Do not time
+another killpriv implementation while the count remains approximately one per
+entry.
+
 ## REJECT BEFORE EDIT: `rmw_block` range deltas are amortized flush work, not the metadata gap - 2026-08-02
 
 The pending row below hypothesized that `FsMvccBlockDevice::rmw_block` copied a
