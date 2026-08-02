@@ -13,6 +13,43 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT BEFORE EDIT: `rmw_block` range deltas are amortized flush work, not the metadata gap - 2026-08-02
+
+The pending row below hypothesized that `FsMvccBlockDevice::rmw_block` copied a
+whole 4 KiB block several times per create and required an exact call/byte count
+before any patch-chain redesign. That count rejects the premise. Uprobes covered
+every linked `rmw_block`, `rmw_block_bitmap_or`, `TransactionBlockAdapter::stage_rmw`,
+and `persist_group_desc_force_with_bitmap_overrides` symbol while one real
+`create-bench` process created 256 files and flushed the image. The only hits
+were **2** calls to the non-MVCC `ByteDeviceBlockAdapter::rmw_block` and the
+matching two GDT helper/closure calls. All MVCC RMW and staged-RMW probes were
+zero. The originating whole-job perf profile's broad libc `memmove` frame was
+**8.81% self**; the call count proves this proposed caller does not generate it
+per operation.
+
+Thus this surface moves at most `2 * 4096 = 8192` full-block bytes for the whole
+job, or **32 bytes amortized per create**, not 4-8 KiB several times per create.
+The group counters are deferred and persisted at flush; they are not a per-op
+MVCC patch chain. The instrumented ELF self-reported SHA-256
+`d99b144a51801685d739f887615dc71205b41bf84eb859fc8038f1bdfd910a06` and
+embedded PGO SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The mutated clone remained clean under offline `e2fsck -fn` (the advisory
+"extent tree could be narrower" optimization note is not corruption). Count
+artifact SHA-256
+`591ee5eac73dbd1bc35c94014fbf30d9a64d5f1e58dabdaadaff615c911e3af1`:
+`/data/tmp/frankenfs-rmw-count-20260802/rmw-count-256.txt`.
+
+**Decision in one line:** REJECT BEFORE EDIT - even impossible elimination of
+all observed `rmw_block` copies removes only 32 bytes per create and cannot close
+the banked live-incumbent metadata loss; no source or timing claim was made.
+
+**Retry predicate:** revisit range-delta storage only if a fresh count on the
+exact scored mounted workload observes at least **one MVCC `rmw_block` or
+`stage_rmw` per operation** and at least **4096 copied bytes per operation**, and
+a symbolized caller profile attributes at least 10% of whole-job self-time to
+those exact calls rather than diffuse full-version materialisation elsewhere.
+
 ## REJECT + REVERT: adaptive large-directory FUSE reply reservation does not beat live ext4 - 2026-08-02
 
 This was the first self-generated lever after the supplied four-lever list. A
