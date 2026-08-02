@@ -1299,6 +1299,38 @@ fn fuse_async_read_enabled() -> bool {
     })
 }
 
+/// Whether `unlink`/`rmdir` re-tell the kernel to forget the entry they just
+/// removed (default off; `FFS_FUSE_NOTIFY_UNLINK=1` restores it).
+///
+/// The dispatchers used to issue `FUSE_NOTIFY_INVAL_ENTRY` for that entry from
+/// inside the request handler, before replying. Both halves of that are wrong:
+///
+/// - **It is redundant.** On a successful `FUSE_UNLINK`/`FUSE_RMDIR` reply the
+///   kernel runs `fuse_dir_changed()` and `fuse_entry_unlinked()`, which expire
+///   that dentry's cache entry itself, and the VFS then `d_delete`s it. So the
+///   notify costs one extra `/dev/fuse` write per delete to ask for something
+///   already in progress. In-kernel ext4 has no such channel and pays nothing.
+/// - **It deadlocks.** The kernel holds the parent directory's inode lock
+///   across `fuse_unlink` while it waits in `request_wait_answer`, and
+///   `fuse_reverse_inval_entry` wants that same lock — a circular wait. This is
+///   the HEAD hang recorded on 2026-08-01 that blocks the concurrent-mutation
+///   correctness gate, reproduced with concurrent dispatch both off and on.
+///
+/// Kept behind an environment switch so one binary supplies both A/B arms.
+fn unlink_entry_invalidation_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FFS_FUSE_NOTIFY_UNLINK")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "on" | "true")
+        )
+    })
+}
+
 /// How many concurrent FUSE dispatch workers the daemon should run.
 ///
 /// The classic loop reads one request from `/dev/fuse`, services it, replies,
@@ -2209,6 +2241,11 @@ impl FrankenFuse {
         }
     }
 
+    /// Invalidate a cached entry the kernel does *not* already know is gone.
+    ///
+    /// Only `rename` needs this: the kernel keeps the source and destination
+    /// dentries meaningful across the operation. Deletions must not use it —
+    /// see [`unlink_entry_invalidation_enabled`].
     fn notify_entry_invalidation(&self, parent: u64, name: &OsStr) {
         let Some(notifier) = self.kernel_notifier() else {
             return;
@@ -5249,7 +5286,7 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_entry_invalidation(parent, name);
+        self.notify_removed_entry(parent, name);
         Ok(())
     }
 
@@ -5270,8 +5307,18 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_entry_invalidation(parent, name);
+        self.notify_removed_entry(parent, name);
         Ok(())
+    }
+
+    /// The deletion path's invalidation, which the kernel already performs.
+    ///
+    /// Off by default; `FFS_FUSE_NOTIFY_UNLINK=1` restores the historical
+    /// round trip so the same binary can supply both A/B arms.
+    fn notify_removed_entry(&self, parent: u64, name: &OsStr) {
+        if unlink_entry_invalidation_enabled() {
+            self.notify_entry_invalidation(parent, name);
+        }
     }
 
     #[allow(clippy::cast_possible_truncation)]
