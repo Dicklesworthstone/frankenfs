@@ -13,6 +13,75 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT + REVERT: adaptive large-directory FUSE reply reservation does not beat live ext4 - 2026-08-02
+
+This was the first self-generated lever after the supplied four-lever list. A
+whole-job paired `perf` capture of the exact 32,768-entry enumerate-then-stat
+shape separated costs paid by both arms from costs exclusive to the FrankenFS
+daemon. The client/kernel arms shared `__d_lookup_rcu` (9.40% kernel / 9.85%
+FUSE), `entry_SYSRETQ` (6.10% / 6.97%), and the C driver worker loop (4.13% /
+4.38%); those are not the structural gap. In the daemon-only samples the
+ranked leaders were:
+
+| exclusive daemon self-time | share |
+| --- | ---: |
+| `fuser::ll::reply::EntListBuf::push` | **10.24%** |
+| `prefetch_ext4_readdir_inode_table_blocks` | 9.64% |
+| libc `memmove` | 5.91% |
+| `ext4_inode_table_location` | 2.77% |
+| request dispatch | 2.31% |
+| lookup | 2.02% |
+
+The prefetch family is already shipped/mined. `EntListBuf::push` and its
+geometric buffer-growth copies are FUSE reply materialisation that in-kernel
+ext4 does not perform, so it was the first fresh structural entry. The profile
+is routing evidence rather than a scored timing result: two attempts to profile
+the scored harness correctly stopped at the busy-core guard, after which the
+same validated read-only images were exercised by a lower-overhead compiled C
+driver. The 128 alternating diagnostic pairs were 25.842 ms kernel versus
+30.560 ms FUSE (`1.182587x`), with 13,645 / 13,221 client samples and 819 daemon
+samples, zero lost. Capture SHA-256
+`6f58224cee923b04990e8e2df4806df81a94d27083501f3582538dda8f829a72`:
+`/data/tmp/frankenfs-whole-job-paired-profile-20260802-manual1/paired-cdriver-128.perf.data`.
+
+The candidate left small replies untouched, but once a reply crossed 4 KiB it
+reserved the ordinary 32 KiB response capacity in one step, capped at 64 KiB
+for unusually large requests. A focused remote unit test pinned the small,
+ordinary, and capped cases (1 passed / 0 failed). Ordering, entry bytes, padding,
+and overflow behavior were unchanged; tie-breaking / floating point / RNG are
+N/A. The mounted four-arm parity hash and post-unmount tree hash both passed,
+and all four images passed offline `e2fsck -fn`.
+
+One v3+PGO candidate ELF (SHA-256
+`d99b144a51801685d739f887615dc71205b41bf84eb859fc8038f1bdfd910a06`,
+PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`)
+ran beside two live Linux 6.17 ext4 mounts in the same invocation on
+`fixmydocuments`: 128 balanced crossover pairs, 32,768 entries, 8 observed and
+pinned client threads, one private FUSE CPU, same LLC, exact tree parity. Raw
+medians were 21.894 ms kernel and 25.661 ms FUSE, or **`1.132835x` slower** with
+bootstrap interval `[1.108349, 1.144753]`. This is diagnostic only because both
+A/A symmetric spreads missed the predeclared `1.025` ceiling: kernel
+median `0.997917` with bootstrap 95% CI `[0.972656, 1.004561]` and spread
+`1.028112`; FUSE median `0.999373` with bootstrap 95% CI
+`[0.967989, 1.027721]` and spread `1.033069`. Verdict `BLOCKED_NULL`,
+admitted=false. Report
+SHA-256 `88ed6e90a9b5e68294f182ab76f1eabcf9ff56d9f99d06a940a128a22d6d33b7`:
+`/data/tmp/frankenfs-entlist-reserve-scored-20260802/report.json`.
+
+**Decision in one line:** REJECT + REVERT - the candidate did not beat the live
+kernel, did not produce an admitted competitive result, and had no same-ELF
+control that could attribute the raw ratio to reservation; its source and test
+are fully reverted.
+
+**Retry predicate:** do not retry directory-reply preallocation unless a fresh
+quiet whole-job profile attributes at least **25% of daemon self-time** to
+`EntListBuf::push` plus its allocator copies. Then use one ELF with an A/B switch,
+require both A/A symmetric spreads at or below `1.025`, require the candidate's
+paired 95% lower speedup bound to exceed twice the widest null log-margin, and
+ship only if the admitted live-incumbent FUSE/kernel 95% **upper** bound is below
+`1.0`.
+
 ## REJECT + REVERT: concurrent FUSE creates over the per-group allocator exhaust leaked free-inode counters - 2026-08-02
 
 Lever 4 from the live-incumbent metadata list exposed `FUSE_CREATE` to the
