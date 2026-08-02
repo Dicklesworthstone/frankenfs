@@ -33,8 +33,8 @@ use ffs_alloc::{
     bitmap_largest_free_run, resolve_numa_allocation_goal, validate_numa_allocation_topology,
 };
 use ffs_block::{
-    BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
-    read_ext4_superblock_region,
+    BlockBuf, BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice,
+    read_btrfs_superblock_region, read_ext4_superblock_region,
 };
 use ffs_btrfs::{
     BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA, BTRFS_CHUNK_TREE_OBJECTID,
@@ -64,7 +64,9 @@ use ffs_journal::{
     ReplayOutcome, replay_fast_commit, replay_jbd2_segments_with_options, replay_jbd2_with_options,
 };
 use ffs_mvcc::persist::WalRecoveryReport;
+use ffs_mvcc::wal::{WalCommit, WalWrite};
 use ffs_mvcc::wal_replay::{ReplayOutcome as MvccReplayOutcome, TailPolicy, WalReplayEngine};
+use ffs_mvcc::wal_writer::{SyncPolicy, WalWriter, WalWriterConfig};
 use ffs_mvcc::{
     BlockVersionStats, CommitError, EbrVersionStats, MergeProof, MvccStore, Transaction,
     TransactionOutcomeStats,
@@ -92,6 +94,7 @@ use std::io::IoSliceMut;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
@@ -448,6 +451,11 @@ pub struct OpenOptions {
     /// When `Some`, the WAL is replayed at open time to restore committed MVCC
     /// state.  When `None` (default), the MVCC store starts empty.
     pub mvcc_wal_path: Option<std::path::PathBuf>,
+    /// Use `mvcc_wal_path` as the active append-only ext4 metadata log.
+    ///
+    /// Default off: a configured path remains recovery-only for existing API
+    /// callers. The mounted performance candidate enables both fields together.
+    pub metadata_log_enabled: bool,
     /// Replay policy for the MVCC WAL tail.
     ///
     /// Controls whether corrupt or truncated WAL tails are silently truncated
@@ -499,6 +507,7 @@ impl Default for OpenOptions {
             ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
             mount_mode: MountMode::Compat,
             mvcc_wal_path: None,
+            metadata_log_enabled: false,
             mvcc_replay_policy: TailPolicy::default(),
             external_journal_path: None,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
@@ -1276,6 +1285,15 @@ pub struct OpenFs {
     /// base device. The mutex serializes concurrent fsync/flush calls so an older
     /// checkpoint cannot overwrite a newer one after its watermark publishes.
     mvcc_flushed_through: Mutex<CommitSeq>,
+    /// Optional append-only metadata durability path.
+    ///
+    /// A sync batches every block newer than `logged_through`, adds the derived
+    /// ext4 allocation summaries, appends one CRC-protected WAL record, and
+    /// fsyncs that sequential file. Reads continue to use the MVCC index. The
+    /// owned compactor materializes WAL batches at home locations in parallel;
+    /// clean unmount joins it, writes a final checkpoint, then truncates the WAL.
+    metadata_log: Option<Mutex<MetadataLog>>,
+    metadata_compactor: Mutex<Option<MetadataCompactor>>,
     /// Optional JBD2 writer for ext4 compatibility-mode write path.
     ///
     /// When present, `commit_transaction_journaled` journals writes to the
@@ -2095,6 +2113,286 @@ impl ByteDeviceBlockAdapter<'_> {
         self.dev.read_exact_at(cx, ByteOffset(offset), &mut bytes)?;
         Ok(bytes)
     }
+}
+
+/// Read-your-writes block device used to assemble one metadata-WAL record.
+///
+/// MVCC checkpointing writes the latest dirty blocks into `writes`; the ext4
+/// summary builders then read those captured bitmap blocks and add the derived
+/// group-descriptor and superblock blocks to the same map. Nothing reaches the
+/// home device through this adapter: the only synchronous durability I/O is the
+/// final sequential WAL append.
+struct MetadataLogCaptureDevice<'a> {
+    base: ByteDeviceBlockAdapter<'a>,
+    prior_index: BTreeMap<BlockNumber, Arc<[u8]>>,
+    writes: RwLock<BTreeMap<BlockNumber, Vec<u8>>>,
+}
+
+impl<'a> MetadataLogCaptureDevice<'a> {
+    fn new(
+        dev: &'a dyn ByteDevice,
+        block_size: u32,
+        prior_index: BTreeMap<BlockNumber, Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            base: ByteDeviceBlockAdapter { dev, block_size },
+            prior_index,
+            writes: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    fn take_writes(&self) -> BTreeMap<BlockNumber, Vec<u8>> {
+        std::mem::take(&mut *self.writes.write())
+    }
+}
+
+impl BlockDevice for MetadataLogCaptureDevice<'_> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
+        if let Some(bytes) = self.writes.read().get(&block) {
+            return Ok(BlockBuf::new(bytes.clone()));
+        }
+        if let Some(bytes) = self.prior_index.get(&block) {
+            return Ok(BlockBuf::new(bytes.to_vec()));
+        }
+        self.base.read_block(cx, block)
+    }
+
+    fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<(), FfsError> {
+        let expected = usize::try_from(self.base.block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
+        if data.len() != expected {
+            return Err(FfsError::Format(format!(
+                "metadata-log capture block size mismatch: got={} expected={expected}",
+                data.len()
+            )));
+        }
+        if block.0 >= self.block_count() {
+            return Err(FfsError::Format(format!(
+                "metadata-log capture block out of range: block={} block_count={}",
+                block.0,
+                self.block_count()
+            )));
+        }
+        self.writes.write().insert(block, data.to_vec());
+        Ok(())
+    }
+
+    fn supports_contiguous_writes(&self) -> bool {
+        true
+    }
+
+    fn write_contiguous_blocks(
+        &self,
+        _cx: &Cx,
+        start: BlockNumber,
+        data: &[u8],
+    ) -> Result<(), FfsError> {
+        let block_size = usize::try_from(self.base.block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
+        if block_size == 0 || data.len() % block_size != 0 {
+            return Err(FfsError::Format(
+                "metadata-log capture length is not block aligned".to_owned(),
+            ));
+        }
+        let count = u64::try_from(data.len() / block_size)
+            .map_err(|_| FfsError::Format("block count does not fit u64".to_owned()))?;
+        let end = start
+            .0
+            .checked_add(count)
+            .ok_or_else(|| FfsError::Format("metadata-log capture range overflow".to_owned()))?;
+        if end > self.block_count() {
+            return Err(FfsError::Format(format!(
+                "metadata-log capture range out of bounds: start={} count={count}",
+                start.0
+            )));
+        }
+        let mut writes = self.writes.write();
+        for (delta, bytes) in data.chunks_exact(block_size).enumerate() {
+            let delta = u64::try_from(delta)
+                .map_err(|_| FfsError::Format("block delta does not fit u64".to_owned()))?;
+            writes.insert(BlockNumber(start.0 + delta), bytes.to_vec());
+        }
+        Ok(())
+    }
+
+    fn block_size(&self) -> u32 {
+        self.base.block_size
+    }
+
+    fn block_count(&self) -> u64 {
+        self.base.dev.len_bytes() / u64::from(self.base.block_size)
+    }
+
+    fn sync(&self, _cx: &Cx) -> Result<(), FfsError> {
+        Ok(())
+    }
+}
+
+type MetadataCompactionBatch = Vec<(BlockNumber, Arc<[u8]>)>;
+
+enum MetadataCompactionCommand {
+    Batch(MetadataCompactionBatch),
+    Shutdown,
+}
+
+/// Owned background compactor for the append-only metadata log.
+///
+/// The WAL is durable before a batch is enqueued. The worker may therefore
+/// coalesce arbitrarily many queued versions by block and materialize only the
+/// newest value at each home location. Shutdown is explicit and joined before
+/// the WAL checkpoint is truncated, so no orphan worker can outlive `OpenFs`.
+struct MetadataCompactor {
+    sender: std::sync::mpsc::Sender<MetadataCompactionCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl MetadataCompactor {
+    /// Keep home-location writeback out of the foreground durability burst.
+    ///
+    /// The WAL is already authoritative when a batch reaches this worker, so
+    /// waiting for a short quiet window is safe. It also lets the worker fold
+    /// the sibling directory-fsync batches from one parallel metadata job into
+    /// a single sorted checkpoint instead of racing those fsyncs for the image.
+    const QUIESCENCE_WINDOW: Duration = Duration::from_millis(10);
+
+    fn start(cx: &Cx, image_path: &Path, block_size: u32) -> Result<Self, FfsError> {
+        let byte_device = FileByteDevice::open(image_path)?;
+        let block_device = ByteBlockDevice::new(byte_device, block_size)?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_cx = cx.clone();
+        let join = std::thread::Builder::new()
+            .name("ffs-metadata-compact".to_owned())
+            .spawn(move || {
+                Self::run(&thread_cx, &block_device, &receiver);
+            })
+            .map_err(FfsError::from)?;
+        Ok(Self {
+            sender,
+            join: Some(join),
+        })
+    }
+
+    fn enqueue(&self, batch: MetadataCompactionBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        if self
+            .sender
+            .send(MetadataCompactionCommand::Batch(batch))
+            .is_err()
+        {
+            warn!(
+                target: "ffs::mvcc::metadata_log",
+                "metadata compactor stopped; WAL remains authoritative"
+            );
+        }
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.sender.send(MetadataCompactionCommand::Shutdown);
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+        {
+            warn!(
+                target: "ffs::mvcc::metadata_log",
+                "metadata compactor thread panicked; final checkpoint will retry all blocks"
+            );
+        }
+    }
+
+    fn run(
+        cx: &Cx,
+        device: &ByteBlockDevice<FileByteDevice>,
+        receiver: &std::sync::mpsc::Receiver<MetadataCompactionCommand>,
+    ) {
+        while let Ok(first) = receiver.recv() {
+            let mut stop_after_batch = false;
+            let mut latest = BTreeMap::<BlockNumber, Arc<[u8]>>::new();
+            match first {
+                MetadataCompactionCommand::Batch(batch) => {
+                    latest.extend(batch);
+                }
+                MetadataCompactionCommand::Shutdown => break,
+            }
+
+            loop {
+                match receiver.recv_timeout(Self::QUIESCENCE_WINDOW) {
+                    Ok(MetadataCompactionCommand::Batch(batch)) => latest.extend(batch),
+                    Ok(MetadataCompactionCommand::Shutdown) => {
+                        stop_after_batch = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        stop_after_batch = true;
+                        break;
+                    }
+                }
+            }
+
+            let blocks = latest.len();
+            match Self::compact_latest(cx, device, latest) {
+                Ok(()) => trace!(
+                    target: "ffs::mvcc::metadata_log",
+                    compacted_blocks = blocks,
+                    "metadata log background compaction complete"
+                ),
+                Err(error) => warn!(
+                    target: "ffs::mvcc::metadata_log",
+                    compacted_blocks = blocks,
+                    error = %error,
+                    "metadata log background compaction failed; WAL remains authoritative"
+                ),
+            }
+            if stop_after_batch {
+                break;
+            }
+        }
+    }
+
+    fn compact_latest(
+        cx: &Cx,
+        device: &ByteBlockDevice<FileByteDevice>,
+        latest: BTreeMap<BlockNumber, Arc<[u8]>>,
+    ) -> Result<(), FfsError> {
+        let mut run_start = None;
+        let mut run_next = 0_u64;
+        let mut run_data = Vec::new();
+        for (block, data) in latest {
+            if run_start.is_some() && block.0 != run_next {
+                device.write_contiguous_blocks(
+                    cx,
+                    run_start.take().expect("run start is present"),
+                    &run_data,
+                )?;
+                run_data.clear();
+            }
+            if run_start.is_none() {
+                run_start = Some(block);
+            }
+            run_data.extend_from_slice(&data);
+            run_next = block.0.saturating_add(1);
+        }
+        if let Some(start) = run_start {
+            device.write_contiguous_blocks(cx, start, &run_data)?;
+        }
+        if !run_data.is_empty() {
+            device.sync(cx)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MetadataCompactor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct MetadataLog {
+    writer: WalWriter,
+    logged_through: CommitSeq,
+    index: BTreeMap<BlockNumber, Arc<[u8]>>,
 }
 
 /// Adapter for ext4 external-journal replay.
@@ -4005,8 +4303,13 @@ impl OpenFs {
         path: impl AsRef<Path>,
         options: &OpenOptions,
     ) -> Result<Self, FfsError> {
-        let dev = FileByteDevice::open(path.as_ref())?;
-        Self::from_device(cx, Box::new(dev), options)
+        let path = path.as_ref();
+        let dev = FileByteDevice::open(path)?;
+        let fs = Self::from_device(cx, Box::new(dev), options)?;
+        if fs.metadata_log.is_some() {
+            fs.start_metadata_compactor(cx, path)?;
+        }
+        Ok(fs)
     }
 
     /// Open a filesystem from an already-opened device.
@@ -4215,6 +4518,22 @@ impl OpenFs {
         };
 
         let (mvcc_store, mvcc_wal_recovery) = Self::init_mvcc_store(options)?;
+        let metadata_log = if options.metadata_log_enabled && matches!(flavor, FsFlavor::Ext4(_)) {
+            options
+                .mvcc_wal_path
+                .as_deref()
+                .map(|path| {
+                    Self::open_metadata_log(
+                        path,
+                        mvcc_store.current_snapshot().high,
+                        mvcc_wal_recovery.as_ref(),
+                    )
+                    .map(Mutex::new)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         trace!(
             target: "ffs::mvcc",
             has_wal = mvcc_wal_recovery.is_some(),
@@ -4245,6 +4564,8 @@ impl OpenFs {
             dev,
             mvcc_store,
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
+            metadata_log,
+            metadata_compactor: Mutex::new(None),
             jbd2_writer: None,
             ext4_alloc_state: None,
             #[cfg(feature = "bhh0i_sharded_alloc")]
@@ -4367,6 +4688,8 @@ impl OpenFs {
             }
         }
 
+        fs.rebuild_metadata_log_index(cx)?;
+
         Ok(fs)
     }
 
@@ -4474,7 +4797,12 @@ impl OpenFs {
                 wal_path = %wal_path.display(),
                 "mvcc_wal_not_found"
             );
-            return Ok((Arc::new(FsMvccStore::single()), None));
+            let store = if options.metadata_log_enabled {
+                FsMvccStore::sharded()
+            } else {
+                FsMvccStore::single()
+            };
+            return Ok((Arc::new(store), None));
         }
 
         let wal_size = std::fs::metadata(wal_path).map_or(0, |m| m.len());
@@ -4483,7 +4811,12 @@ impl OpenFs {
                 wal_path = %wal_path.display(),
                 "mvcc_wal_empty"
             );
-            return Ok((Arc::new(FsMvccStore::single()), None));
+            let store = if options.metadata_log_enabled {
+                FsMvccStore::sharded()
+            } else {
+                FsMvccStore::single()
+            };
+            return Ok((Arc::new(store), None));
         }
 
         info!(
@@ -4567,6 +4900,105 @@ impl OpenFs {
                 Ok((Arc::new(FsMvccStore::single()), Some(recovery)))
             }
         }
+    }
+
+    fn open_metadata_log(
+        path: &Path,
+        latest_commit: CommitSeq,
+        recovery: Option<&WalRecoveryReport>,
+    ) -> Result<MetadataLog, FfsError> {
+        let existed = path.exists();
+        let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let config = WalWriterConfig {
+            sync_policy: SyncPolicy::Immediate,
+            verify_writes: false,
+            backpressure_threshold_bytes: 0,
+        };
+        let mut writer = if !existed || size == 0 {
+            let writer = WalWriter::create(path, config)?;
+            if !existed
+                && let Some(parent) = path.parent()
+                && let Ok(directory) = std::fs::File::open(parent)
+            {
+                directory.sync_all()?;
+            }
+            writer
+        } else {
+            let valid_bytes = recovery.map_or(size, |report| report.wal_valid_bytes);
+            let header_size = u64::try_from(ffs_mvcc::wal::HEADER_SIZE)
+                .map_err(|_| FfsError::Format("WAL header size does not fit u64".to_owned()))?;
+            if valid_bytes < header_size {
+                return Err(FfsError::Format(format!(
+                    "active metadata WAL has no valid header: path={} valid_bytes={valid_bytes}",
+                    path.display()
+                )));
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?;
+            if valid_bytes < size {
+                file.set_len(valid_bytes)?;
+                file.sync_all()?;
+            }
+            WalWriter::new(file, valid_bytes, config)
+        };
+        writer.set_last_commit_seq(latest_commit.0);
+        info!(
+            target: "ffs::mvcc::metadata_log",
+            wal_path = %path.display(),
+            latest_commit = latest_commit.0,
+            wal_bytes = writer.size(),
+            "append-only metadata log enabled"
+        );
+        Ok(MetadataLog {
+            writer,
+            logged_through: latest_commit,
+            index: BTreeMap::new(),
+        })
+    }
+
+    fn rebuild_metadata_log_index(&self, cx: &Cx) -> Result<(), FfsError> {
+        let Some(log_mutex) = &self.metadata_log else {
+            return Ok(());
+        };
+        let logged_through = log_mutex.lock().logged_through;
+        if logged_through == CommitSeq(0) {
+            return Ok(());
+        }
+        let capture =
+            MetadataLogCaptureDevice::new(self.dev.as_ref(), self.block_size(), BTreeMap::new());
+        let (_, recovered_through) =
+            self.mvcc_store
+                .flush_to_device_after(cx, &capture, CommitSeq(0))?;
+        if recovered_through < logged_through {
+            return Err(FfsError::Format(format!(
+                "metadata WAL index rebuilt only through {} but log is durable through {}",
+                recovered_through.0, logged_through.0
+            )));
+        }
+        let rebuilt = capture
+            .take_writes()
+            .into_iter()
+            .map(|(block, bytes)| (block, Arc::<[u8]>::from(bytes)))
+            .collect();
+        log_mutex.lock().index = rebuilt;
+        Ok(())
+    }
+
+    fn start_metadata_compactor(&self, cx: &Cx, image_path: &Path) -> Result<(), FfsError> {
+        if self.metadata_log.is_none() {
+            return Ok(());
+        }
+        let compactor = MetadataCompactor::start(cx, image_path, self.block_size())?;
+        *self.metadata_compactor.lock() = Some(compactor);
+        Ok(())
+    }
+
+    /// Whether the append-only metadata-log candidate is active.
+    #[must_use]
+    pub fn metadata_log_enabled(&self) -> bool {
+        self.metadata_log.is_some()
     }
 
     /// The block device backing this filesystem.
@@ -7235,6 +7667,98 @@ impl OpenFs {
                 .flush_to_device_after(cx, device, *flushed_through)?;
         *flushed_through = (*flushed_through).max(durable_through);
         Ok(flushed)
+    }
+
+    /// Append one durability record containing all metadata newer than the
+    /// previous log boundary, then hand the same immutable block images to the
+    /// background home-location compactor.
+    fn flush_ext4_metadata_log(&self, cx: &Cx) -> Result<usize, FfsError> {
+        let log_mutex = self.metadata_log.as_ref().ok_or_else(|| {
+            FfsError::Format("append-only metadata log is not enabled".to_owned())
+        })?;
+        let mut log = log_mutex.lock();
+        let capture =
+            MetadataLogCaptureDevice::new(self.dev.as_ref(), self.block_size(), log.index.clone());
+        let (mvcc_blocks, durable_through) =
+            self.mvcc_store
+                .flush_to_device_after(cx, &capture, log.logged_through)?;
+        if mvcc_blocks == 0 {
+            return Ok(0);
+        }
+
+        // The deferred GDT and superblock counters are part of the same atomic
+        // allocation state as the bitmap/inode-table versions. Build them on the
+        // capture device so crash replay never observes new bitmaps with stale
+        // summary counts.
+        self.ext4_capture_group_descriptors(cx, &capture)?;
+        self.ext4_sync_superblock_free_totals_to(cx, &capture)?;
+
+        let writes = capture
+            .take_writes()
+            .into_iter()
+            .map(|(block, data)| WalWrite { block, data })
+            .collect::<Vec<_>>();
+        let logged_blocks = writes.len();
+        let commit = WalCommit {
+            commit_seq: durable_through,
+            txn_id: ffs_types::TxnId(durable_through.0),
+            writes,
+        };
+        let append = log.writer.append_commit(&commit).map_err(FfsError::from)?;
+
+        // WAL durability precedes both index publication and compaction enqueue.
+        // If the process dies after append but before either step, replay rebuilds
+        // the index and the unchanged home blocks remain safely shadowed.
+        log.logged_through = log.logged_through.max(durable_through);
+        let batch = commit
+            .writes
+            .into_iter()
+            .map(|write| (write.block, Arc::<[u8]>::from(write.data)))
+            .collect::<MetadataCompactionBatch>();
+        for (block, data) in &batch {
+            log.index.insert(*block, Arc::clone(data));
+        }
+        drop(log);
+
+        if let Some(compactor) = self.metadata_compactor.lock().as_ref() {
+            compactor.enqueue(batch);
+        }
+        trace!(
+            target: "ffs::mvcc::metadata_log",
+            durable_through = durable_through.0,
+            mvcc_blocks,
+            logged_blocks,
+            wal_bytes = append.bytes_written,
+            "metadata WAL durability boundary complete"
+        );
+        Ok(logged_blocks)
+    }
+
+    fn shutdown_metadata_compactor(&self) {
+        if let Some(mut compactor) = self.metadata_compactor.lock().take() {
+            compactor.shutdown();
+        }
+    }
+
+    /// Retire the WAL only after every current MVCC version and derived ext4
+    /// summary has reached the base device and that device has synced.
+    fn checkpoint_metadata_log(&self) -> Result<(), FfsError> {
+        let Some(log_mutex) = &self.metadata_log else {
+            return Ok(());
+        };
+        let mut log = log_mutex.lock();
+        let header_size = u64::try_from(ffs_mvcc::wal::HEADER_SIZE)
+            .map_err(|_| FfsError::Format("WAL header size does not fit u64".to_owned()))?;
+        log.writer.file_mut().set_len(header_size)?;
+        log.writer.file_mut().sync_all()?;
+        log.index.clear();
+        info!(
+            target: "ffs::mvcc::metadata_log",
+            checkpoint_through = log.logged_through.0,
+            wal_bytes = header_size,
+            "metadata WAL compacted into base checkpoint"
+        );
+        Ok(())
     }
 
     /// Flush all committed MVCC block versions to the underlying image.
@@ -17971,6 +18495,58 @@ impl OpenFs {
             dev: self.dev.as_ref(),
             block_size: self.block_size(),
         };
+        self.ext4_write_group_descriptors_to(cx, alloc, &direct)?;
+        // The descriptors were written straight to the byte device above, bypassing
+        // the MVCC overlay, the base-block cache, AND the parsed-descriptor cache. The
+        // documented contract on `read_group_desc_with_scope` is that any code mutating
+        // group descriptors MUST clear `ext4_group_desc_cache` (line ~10097) — under
+        // deferral the GD block has no MVCC version, so `can_cache_ext4_writable_group_desc`
+        // is true and `read_group_desc` returns the STALE cached descriptor otherwise.
+        // Drop both caches so the next read reflects the freshly-written base
+        // (bd-cc-gdt-defer). Runs only at a durability boundary (or the rare e2compr
+        // write), so re-warm cost is amortized.
+        self.ext4_group_desc_cache.clear();
+        self.ext4_base_block_cache.clear();
+        Ok(())
+    }
+
+    fn ext4_capture_group_descriptors(
+        &self,
+        cx: &Cx,
+        capture: &dyn BlockDevice,
+    ) -> Result<(), FfsError> {
+        if !ffs_alloc::gdt_persistence_deferred() || !matches!(self.flavor, FsFlavor::Ext4(_)) {
+            return Ok(());
+        }
+        let alloc_mutex = self.require_alloc_state()?;
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        if self.bhh0i_sharded_ops_active() {
+            let sharded = self
+                .ext4_sharded_alloc
+                .as_ref()
+                .expect("sharded active implies present");
+            let sb = self.ext4_superblock().ok_or_else(|| {
+                FfsError::Format("sharded GDT capture: not an ext4 filesystem".to_owned())
+            })?;
+            let synthetic = Ext4AllocState {
+                geo: FsGeometry::from_superblock(sb),
+                groups: sharded.snapshot_group_stats(),
+                persist_ctx: self.ext4_persist_ctx_lockfree().ok_or_else(|| {
+                    FfsError::Format("sharded GDT capture: persist ctx unavailable".to_owned())
+                })?,
+            };
+            return self.ext4_write_group_descriptors_to(cx, &synthetic, capture);
+        }
+        let alloc = alloc_mutex.read();
+        self.ext4_write_group_descriptors_to(cx, &alloc, capture)
+    }
+
+    fn ext4_write_group_descriptors_to(
+        &self,
+        cx: &Cx,
+        alloc: &Ext4AllocState,
+        device: &dyn BlockDevice,
+    ) -> Result<(), FfsError> {
         for gidx in 0..alloc.groups.len() {
             let group = GroupNumber(
                 u32::try_from(gidx)
@@ -17993,12 +18569,12 @@ impl OpenFs {
             // touched groups that is the bulk of the flush. Byte-identical: the
             // override handed to persist_group_desc_force is unchanged.
             let inode_bitmap = if gs.free_inodes < alloc.geo.inodes_in_group(group) {
-                Some(direct.read_block(cx, gs.inode_bitmap_block)?.into_inner())
+                Some(device.read_block(cx, gs.inode_bitmap_block)?.into_inner())
             } else {
                 None
             };
             let block_bitmap = if gs.free_blocks < alloc.geo.blocks_in_group(group) {
-                Some(direct.read_block(cx, gs.block_bitmap_block)?.into_inner())
+                Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
             } else {
                 None
             };
@@ -18006,7 +18582,7 @@ impl OpenFs {
             let block_override = block_bitmap.as_deref();
             ffs_alloc::persist_group_desc_force(
                 cx,
-                &direct,
+                device,
                 &alloc.persist_ctx,
                 group,
                 gs,
@@ -18015,21 +18591,19 @@ impl OpenFs {
             )
             .map_err(|e| FfsError::Format(format!("flush GDT group {}: {e}", group.0)))?;
         }
-        // The descriptors were written straight to the byte device above, bypassing
-        // the MVCC overlay, the base-block cache, AND the parsed-descriptor cache. The
-        // documented contract on `read_group_desc_with_scope` is that any code mutating
-        // group descriptors MUST clear `ext4_group_desc_cache` (line ~10097) — under
-        // deferral the GD block has no MVCC version, so `can_cache_ext4_writable_group_desc`
-        // is true and `read_group_desc` returns the STALE cached descriptor otherwise.
-        // Drop both caches so the next read reflects the freshly-written base
-        // (bd-cc-gdt-defer). Runs only at a durability boundary (or the rare e2compr
-        // write), so re-warm cost is amortized.
-        self.ext4_group_desc_cache.clear();
-        self.ext4_base_block_cache.clear();
         Ok(())
     }
 
     fn ext4_sync_superblock_free_totals(&self, cx: &Cx) -> Result<(), FfsError> {
+        let block_dev = self.direct_block_device_adapter();
+        self.ext4_sync_superblock_free_totals_to(cx, &block_dev)
+    }
+
+    fn ext4_sync_superblock_free_totals_to(
+        &self,
+        cx: &Cx,
+        block_dev: &dyn BlockDevice,
+    ) -> Result<(), FfsError> {
         let (has_csum, is_64bit) = match &self.flavor {
             FsFlavor::Ext4(sb) => (sb.has_metadata_csum(), sb.is_64bit()),
             FsFlavor::Btrfs(_) => return Ok(()),
@@ -18076,7 +18650,6 @@ impl OpenFs {
         };
 
         let (sb_block, sb_off) = self.ext4_superblock_location();
-        let block_dev = self.direct_block_device_adapter();
         let mut block_data = block_dev.read_block(cx, sb_block)?.into_inner();
 
         #[allow(clippy::cast_possible_truncation)]
@@ -26910,6 +27483,45 @@ impl OpenFs {
                 "ext4_sync_rejected"
             );
             return Err(FfsError::ReadOnly);
+        }
+
+        if self.metadata_log.is_some() {
+            let result = self.flush_ext4_metadata_log(cx);
+            let duration_us = started
+                .map(|s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            return match result {
+                Ok(logged_blocks) => {
+                    info!(
+                        target: "ffs::ext4::rw",
+                        operation_id = %operation_id,
+                        scenario_id,
+                        outcome = "applied",
+                        ino = ino.0,
+                        datasync,
+                        duration_us,
+                        flushed_blocks = logged_blocks,
+                        durability = "append_only_metadata_wal",
+                        "ext4_sync_applied"
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!(
+                        target: "ffs::ext4::rw",
+                        operation_id = %operation_id,
+                        scenario_id,
+                        outcome = "rejected",
+                        error_class = "metadata_wal_failed",
+                        ino = ino.0,
+                        datasync,
+                        duration_us,
+                        error = %err,
+                        "ext4_sync_rejected"
+                    );
+                    Err(err)
+                }
+            };
         }
 
         // Keep the durable cursor private until the complete ext4 durability
@@ -38702,12 +39314,19 @@ impl FsOps for OpenFs {
             return Ok(());
         }
 
+        // Drain and join the home-location compactor before the final full
+        // checkpoint. The synchronous checkpoint remains authoritative even if
+        // an earlier background batch failed, and the WAL is retained unless the
+        // checkpoint and device sync both succeed.
+        self.shutdown_metadata_compactor();
+
         // Flush committed MVCC block versions (covers ext4 metadata and any
         // file-data extents staged through the block-versioned path).
         let flushed = self.flush_mvcc_to_device(cx)?;
         if flushed > 0 {
             info!(flushed_blocks = flushed, "flush_on_destroy");
         }
+        self.checkpoint_metadata_log()?;
 
         // btrfs commit-on-destroy: flush dirty COW trees to disk so
         // mutations performed through the mounted FUSE path survive
@@ -67362,6 +67981,94 @@ mod tests {
                 "e2fsck must accept after fsync (with_csum={with_csum}):\n{output}"
             );
         }
+    }
+
+    #[test]
+    fn append_only_metadata_log_replays_then_checkpoints_clean() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let image = tmp.path().join("metadata-log.ext4");
+        let wal = tmp.path().join("metadata-log.wal");
+        let file = std::fs::File::create(&image).expect("create image");
+        file.set_len(16 * 1024 * 1024).expect("size image");
+        drop(file);
+        let mkfs = std::process::Command::new("mkfs.ext4")
+            .args(["-F", "-b", "4096", image.to_str().expect("UTF-8 path")])
+            .output();
+        let Ok(mkfs) = mkfs else {
+            return;
+        };
+        if !mkfs.status.success() {
+            return;
+        }
+        let _ = std::process::Command::new("debugfs")
+            .args([
+                "-w",
+                "-R",
+                "set_inode_field / mode 040777",
+                image.to_str().expect("UTF-8 path"),
+            ])
+            .output();
+
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            mvcc_wal_path: Some(wal.clone()),
+            metadata_log_enabled: true,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::open_with_options(&cx, &image, &options).expect("open logged ext4");
+        fs.enable_writes(&cx).expect("enable writes");
+        let created = fs
+            .create(&cx, InodeNumber(2), OsStr::new("logged.txt"), 0o644, 0, 0)
+            .expect("create logged file");
+        fs.write(&cx, created.ino, 0, b"durable-through-wal")
+            .expect("write logged file");
+        fs.fsync(&cx, created.ino, 0, false).expect("WAL fsync");
+        assert!(
+            std::fs::metadata(&wal).expect("WAL metadata").len()
+                > u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
+            "fsync must append a non-empty WAL record"
+        );
+
+        // Simulate a process crash: stop the optional compactor, but deliberately
+        // do not call flush_on_destroy (the base image is not the authority).
+        fs.shutdown_metadata_compactor();
+        drop(fs);
+
+        let mut recovered =
+            OpenFs::open_with_options(&cx, &image, &options).expect("replay metadata WAL");
+        let report = recovered
+            .mvcc_wal_recovery()
+            .expect("recovery report after WAL fsync");
+        assert_eq!(report.commits_replayed, 1);
+        assert!(report.versions_replayed > 0);
+        recovered.enable_writes(&cx).expect("enable after replay");
+        let attr = recovered
+            .lookup(&cx, InodeNumber(2), OsStr::new("logged.txt"))
+            .expect("replayed name is visible");
+        assert_eq!(
+            recovered
+                .read(&cx, attr.ino, 0, 64)
+                .expect("read replayed file"),
+            b"durable-through-wal"
+        );
+
+        recovered
+            .flush_on_destroy(&cx)
+            .expect("compact and checkpoint WAL");
+        drop(recovered);
+        assert_eq!(
+            std::fs::metadata(&wal).expect("checkpointed WAL").len(),
+            u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
+            "clean checkpoint must retire the WAL tail"
+        );
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "e2fsck must accept the checkpointed image:\n{output}"
+        );
     }
 
     /// A COMPOUND ext4 data-op churn — extent growth, a sparse gap, in-place

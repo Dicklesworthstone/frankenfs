@@ -2645,7 +2645,14 @@ fn createbench_cmd(
         let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
         for t in 0..threads {
             let attr = open_fs
-                .mkdir(&cx, parent, std::ffi::OsStr::new(&format!("t{t}")), 0o755, 0, 0)
+                .mkdir(
+                    &cx,
+                    parent,
+                    std::ffi::OsStr::new(&format!("t{t}")),
+                    0o755,
+                    0,
+                    0,
+                )
                 .with_context(|| format!("failed to mkdir t{t}"))?;
             tdirs.push(attr.ino);
         }
@@ -8614,10 +8621,24 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
 
 fn open_filesystem_for_mount(image_path: &Path, options: &MountCmdOptions) -> Result<OpenFs> {
     let cx = cli_cx();
-    let open_opts = build_mount_open_options(options);
+    let mut open_opts = build_mount_open_options(options);
+    if options.read_write && std::env::var_os("FFS_EXT4_METADATA_LOG").is_some() {
+        open_opts.mvcc_wal_path = Some(image_path.with_extension("ffs-metadata-wal"));
+        open_opts.metadata_log_enabled = true;
+    }
     let open_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
         .map_err(anyhow::Error::new)
         .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
+    if open_fs.metadata_log_enabled() {
+        eprintln!(
+            "mount: append-only ext4 metadata WAL ENABLED ({})",
+            open_opts
+                .mvcc_wal_path
+                .as_deref()
+                .expect("enabled metadata log has a path")
+                .display()
+        );
+    }
     if !matches!(
         options.btrfs_mount_selection,
         BtrfsMountSelection::DefaultRoot
