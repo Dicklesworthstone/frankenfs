@@ -51,6 +51,8 @@ const MAX_HOST_QUIET_SAMPLES: usize = 60;
 const MAX_HOST_QUIET_TIMEOUT_MS: u64 = 900_000;
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
 const DEFAULT_PARALLEL_THREADS: usize = 8;
+/// One daemon CPU is what every banked row was measured at; see `Config::fuse_cpu_count`.
+const DEFAULT_FUSE_CPUS: usize = 1;
 const MAX_CLIENT_THREADS: usize = 4096;
 const PARALLEL_READ_FILE_BYTES: usize = 256 * 1024;
 const BULK_DURABLE_FILE: &str = "bulk-durable.bin";
@@ -349,6 +351,16 @@ struct Config {
     arm_settle_ms: u64,
     pre_measurement_settle_ms: u64,
     client_threads: usize,
+    /// Logical CPUs the FrankenFS daemon is pinned to.
+    ///
+    /// The default of one reproduces every banked row. It is also an asymmetry:
+    /// in the kernel arm the filesystem executes inside the client threads, so
+    /// in-kernel ext4 gets one CPU of filesystem capacity per client thread
+    /// while the FUSE arm gets one in total. Raising this matches the two arms'
+    /// filesystem CPU budgets; both placements must be published side by side,
+    /// and a number taken at one of them never replaces a number taken at the
+    /// other.
+    fuse_cpu_count: usize,
     placement_scope: PlacementScope,
     host_quiet_samples: usize,
     host_quiet_timeout_ms: u64,
@@ -382,6 +394,7 @@ impl Default for Config {
             arm_settle_ms: 100,
             pre_measurement_settle_ms: 1_000,
             client_threads: DEFAULT_PARALLEL_THREADS,
+            fuse_cpu_count: DEFAULT_FUSE_CPUS,
             placement_scope: PlacementScope::SameLlc,
             host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
             host_quiet_timeout_ms: DEFAULT_HOST_QUIET_TIMEOUT_MS,
@@ -478,6 +491,9 @@ struct CpuPlacement {
     fuse_cpus: Vec<usize>,
     driver_guard_cpus: BTreeSet<usize>,
     fuse_guard_cpus: BTreeSet<usize>,
+    /// How the daemon's CPUs relate to the clients', so a report can never be
+    /// read as if the two placements were interchangeable.
+    fuse_cpu_isolation: &'static str,
     last_level_cache_cpus: BTreeSet<usize>,
     allowed_cpus: BTreeSet<usize>,
     busy_fractions: BTreeMap<usize, f64>,
@@ -754,6 +770,9 @@ fn usage() {
            --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32)\n\
            --operations N                 Workload operations per observation (default 2000)\n\
            --client-threads N             Actual parallel-metadata worker threads (default 8)\n\
+           --fuse-cpus N                  CPUs pinned to the FrankenFS daemon (default 1;\n\
+                                          every banked row was taken at 1, and the kernel\n\
+                                          arm runs its filesystem on all client CPUs)\n\
            --placement-scope SCOPE        same-llc | host-wide (default same-llc)\n\
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
@@ -854,6 +873,10 @@ fn validate_config(config: &Config) -> Result<()> {
         "--client-threads must be in 1..={MAX_CLIENT_THREADS}"
     );
     ensure!(
+        (1..=MAX_CLIENT_THREADS).contains(&config.fuse_cpu_count),
+        "--fuse-cpus must be in 1..={MAX_CLIENT_THREADS}"
+    );
+    ensure!(
         config.operations >= config.client_threads(),
         "{} requires at least one operation per requested client thread",
         config.workload.label()
@@ -952,6 +975,9 @@ fn parse_args() -> Result<Option<Config>> {
             "--pairs" => config.pairs = parse_value(&args, &mut index, "--pairs")?,
             "--operations" => {
                 config.operations = parse_value(&args, &mut index, "--operations")?;
+            }
+            "--fuse-cpus" => {
+                config.fuse_cpu_count = parse_value(&args, &mut index, "--fuse-cpus")?;
             }
             "--client-threads" => {
                 config.client_threads = parse_value(&args, &mut index, "--client-threads")?;
@@ -3415,6 +3441,7 @@ fn last_level_cache_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
 
 fn select_cpu_placement(
     client_threads: usize,
+    fuse_cpu_count: usize,
     scope: PlacementScope,
     allowed_cpus: &BTreeSet<usize>,
     host_quiet_samples: usize,
@@ -3485,36 +3512,89 @@ fn select_cpu_placement(
         .intersection(allowed_cpus)
         .copied()
         .collect::<BTreeSet<_>>();
-    let (fuse_cpus, fuse_guard_cpus) = select_fuse_cpus(
-        &ranked,
-        &busy,
-        &last_level_cache_cpus,
-        &driver_guard_cpus,
-        allowed_cpus,
-    )?;
     let driver_domain = match scope {
         PlacementScope::SameLlc => &last_level_cache_cpus,
         PlacementScope::HostWide => allowed_cpus,
     };
-    let driver_context = DriverPlacementContext {
-        scope,
-        ranked: &ranked,
-        busy: &busy,
-        driver_domain,
-        fuse_guard_cpus: &fuse_guard_cpus,
-    };
-    let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
-        client_threads,
-        driver_cpu,
-        driver_guard_cpus,
-        &driver_context,
-    )?;
+    // One daemon CPU keeps the historical order: the daemon claims a private
+    // physical core first, then the clients fill in around its guarded sibling
+    // set. That is the placement every banked row was taken at, so its selection
+    // must stay byte-identical.
+    //
+    // More than one daemon CPU cannot use that order: a domain with C physical
+    // cores cannot hand private cores to both a C-thread client set and a
+    // C-CPU daemon. The clients are placed first — exactly as they are today —
+    // and the daemon then takes quiet CPUs the clients did not claim, which in
+    // a single last-level-cache domain are their SMT siblings. That is the
+    // conservative direction: the daemon shares execution resources with the
+    // very threads it serves rather than being handed free cores.
+    let (fuse_cpus, fuse_guard_cpus, driver_cpus, driver_guard_cpus, fuse_cpu_isolation) =
+        if fuse_cpu_count == 1 {
+            let (fuse_cpus, fuse_guard_cpus) = select_fuse_cpus(
+                &ranked,
+                &busy,
+                &last_level_cache_cpus,
+                &driver_guard_cpus,
+                allowed_cpus,
+            )?;
+            let driver_context = DriverPlacementContext {
+                scope,
+                ranked: &ranked,
+                busy: &busy,
+                driver_domain,
+                fuse_guard_cpus: &fuse_guard_cpus,
+            };
+            let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
+                client_threads,
+                driver_cpu,
+                driver_guard_cpus,
+                &driver_context,
+            )?;
+            (
+                fuse_cpus,
+                fuse_guard_cpus,
+                driver_cpus,
+                driver_guard_cpus,
+                "private_physical_core_clients_placed_after",
+            )
+        } else {
+            let driver_context = DriverPlacementContext {
+                scope,
+                ranked: &ranked,
+                busy: &busy,
+                driver_domain,
+                fuse_guard_cpus: &BTreeSet::new(),
+            };
+            let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
+                client_threads,
+                driver_cpu,
+                driver_guard_cpus,
+                &driver_context,
+            )?;
+            let claimed = driver_cpus.iter().copied().collect::<BTreeSet<_>>();
+            let (fuse_cpus, fuse_guard_cpus) = select_multi_fuse_cpus(
+                fuse_cpu_count,
+                &ranked,
+                &busy,
+                driver_domain,
+                &claimed,
+                allowed_cpus,
+            )?;
+            (
+                fuse_cpus,
+                fuse_guard_cpus,
+                driver_cpus,
+                driver_guard_cpus,
+                "shares_physical_cores_with_clients_placed_after",
+            )
+        };
     Ok(CpuPlacement {
         driver_cpu,
         driver_cpus,
         fuse_cpus,
         driver_guard_cpus,
         fuse_guard_cpus,
+        fuse_cpu_isolation,
         last_level_cache_cpus,
         allowed_cpus: allowed_cpus.clone(),
         busy_fractions: busy,
@@ -3555,6 +3635,57 @@ fn select_fuse_cpus(
     bail!(
         "no non-sibling CPU in the driver's last-level-cache domain has every SMT thread below the FUSE contention limit"
     )
+}
+
+/// Places a multi-CPU FUSE daemon in the CPUs the clients did not claim.
+///
+/// Only the daemon's own CPUs are required to be quiet here. The single-CPU
+/// selector additionally demands a quiet SMT sibling, but at this CPU count the
+/// siblings are the benchmark's own client threads: load put there by the job
+/// under measurement is the placement, not contamination. Foreign load is still
+/// excluded, because every candidate CPU must clear the same busy limit.
+fn select_multi_fuse_cpus(
+    count: usize,
+    ranked: &[(usize, f64)],
+    busy: &BTreeMap<usize, f64>,
+    driver_domain: &BTreeSet<usize>,
+    client_cpus: &BTreeSet<usize>,
+    allowed_cpus: &BTreeSet<usize>,
+) -> Result<(Vec<usize>, BTreeSet<usize>)> {
+    let mut chosen = Vec::with_capacity(count);
+    let mut used_cores = BTreeSet::new();
+    // Two passes so the daemon spreads over distinct physical cores whenever the
+    // domain still has them, and only doubles up on a core once it must.
+    for require_free_core in [true, false] {
+        for &(cpu, load) in ranked {
+            if chosen.len() == count {
+                break;
+            }
+            if !driver_domain.contains(&cpu)
+                || client_cpus.contains(&cpu)
+                || chosen.contains(&cpu)
+                || load > MAX_FUSE_PREFLIGHT_BUSY
+            {
+                continue;
+            }
+            if require_free_core && used_cores.contains(&cpu) {
+                continue;
+            }
+            used_cores.extend(thread_siblings(cpu)?.intersection(allowed_cpus).copied());
+            chosen.push(cpu);
+        }
+    }
+    ensure!(
+        chosen.len() == count,
+        "the driver's placement domain supplied only {} quiet non-client CPUs; {count} needed for the requested daemon CPU count",
+        chosen.len(),
+    );
+    let mut guards = BTreeSet::new();
+    for &cpu in &chosen {
+        guards.extend(thread_siblings(cpu)?.intersection(allowed_cpus).copied());
+    }
+    chosen.sort_unstable();
+    Ok((chosen, guards))
 }
 
 fn select_driver_cpus(
@@ -4818,6 +4949,7 @@ fn run() -> Result<Option<PathBuf>> {
     let fixture_root = create_fixture_tree(&run_dir, &config)?;
     let placement = select_cpu_placement(
         config.client_threads(),
+        config.fuse_cpu_count,
         config.placement_scope,
         &host.allowed_cpus_before_pin,
         config.host_quiet_samples,
@@ -4832,7 +4964,7 @@ fn run() -> Result<Option<PathBuf>> {
         format_cpu_list(placement.driver_cpus.iter().copied()),
     );
     println!(
-        "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},host_quiet_required_consecutive_samples={},initial_host_quiet_samples_observed={},initial_host_quiet_wait_ms={},host_quiet_timeout_ms={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
+        "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},requested_fuse_cpus={},fuse_cpu_isolation={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},host_quiet_required_consecutive_samples={},initial_host_quiet_samples_observed={},initial_host_quiet_wait_ms={},host_quiet_timeout_ms={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
         config.workload.label(),
         config.client_threads(),
         placement.driver_cpus.len(),
@@ -4841,6 +4973,8 @@ fn run() -> Result<Option<PathBuf>> {
         format_cpu_list(placement.driver_guard_cpus.iter().copied()),
         placement.busy_fractions[&placement.driver_cpu],
         format_cpu_list(placement.fuse_cpus.iter().copied()),
+        config.fuse_cpu_count,
+        placement.fuse_cpu_isolation,
         format_cpu_list(placement.fuse_guard_cpus.iter().copied()),
         placement
             .fuse_cpus
@@ -4964,6 +5098,8 @@ fn run() -> Result<Option<PathBuf>> {
         "client_affinity_cpu_count": placement.driver_cpus.len(),
         "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "fuse_cpus": placement.fuse_cpus,
+        "requested_fuse_cpus": config.fuse_cpu_count,
+        "fuse_cpu_isolation": placement.fuse_cpu_isolation,
         "driver_guard_cpus": placement.driver_guard_cpus,
         "fuse_guard_cpus": placement.fuse_guard_cpus,
         "last_level_cache_cpus": placement.last_level_cache_cpus,
