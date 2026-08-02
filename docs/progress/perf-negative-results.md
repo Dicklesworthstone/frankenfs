@@ -280,12 +280,30 @@ the ratio differs because the *kernel* arm ran 3.6% faster in the banked window
 (`22.84` vs `23.658 ms`). Do not restate `3.467786x` as replacing `4.967448x` —
 it is a different placement, and both must be published together.
 
-### Follow-up this makes obvious
+### The follow-up this seems to imply, and why it is WRONG
 
-The effect's sign is a pure function of how many CPUs the daemon actually has, so
-the default should read `sched_getaffinity` at mount and enable readers only when
-the daemon holds more than one CPU: byte-identical to today in the one-CPU case
-that the banked rows measure, and the measured configuration above otherwise.
+The sign flipping on daemon CPU count invites an obvious default: read
+`sched_getaffinity` at mount and enable readers whenever the daemon holds more
+than one CPU. **Do not do this.** The 2026-08-01 parallel-read rejection below
+measured `0.839141x` at **8 matched daemon CPUs** and `0.842005x` at one — its
+own words, "the loss is the same size at 1 daemon CPU and at 8" — because 73% of
+that row's requests (`OPEN`/`FLUSH`/`RELEASE`) take the dispatch gate
+**exclusively**, so the whole session serializes no matter how many readers
+exist. An affinity-gated default would trade this row's `1.8103x` for roughly a
+`1.19x` regression on parallel-read. CPU count decides the sign *within* a row
+whose mix is shared-set; it does not make the lever safe globally.
+
+There is also a memory cost that bars any generous default: each reader owns a
+`BUFFER_SIZE` = `MAX_WRITE_SIZE + 4096` = **16 MiB + 4 KiB** receive buffer, so
+8 readers is 128 MiB and the `MAX_FUSE_DISPATCH_WORKERS` ceiling of 64 would be
+1 GiB.
+
+**`FFS_FUSE_WORKERS` therefore stays default OFF and explicitly opt-in.** The
+real widening lever is to make `Open`/`Flush`/`Release` concurrency-safe so they
+stop taking the gate exclusively — that is what would move parallel-read's 73%
+exclusive share into the shared set and let this win generalize to its family.
+That is a file-handle-table change, not a dispatch change, and it needs its own
+row.
 
 ## NEXT LEVER, located but not yet attempted: `rmw_block` copies a whole 4 KiB block to change 256 bytes - 2026-08-02
 
