@@ -1299,22 +1299,6 @@ fn fuse_async_read_enabled() -> bool {
     })
 }
 
-/// Whether the blocking mount path should request FUSE-over-io_uring.
-///
-/// This stays opt-in until the mounted live-incumbent gate proves the new
-/// transport. The same binary therefore supplies both A/B arms: set
-/// `FFS_FUSE_IO_URING=1` for the candidate and leave it unset for control.
-#[cfg(target_os = "linux")]
-fn fuse_io_uring_enabled() -> bool {
-    matches!(
-        std::env::var("FFS_FUSE_IO_URING")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("1" | "on" | "true")
-    )
-}
-
 /// How many concurrent FUSE dispatch workers the daemon should run.
 ///
 /// The classic loop reads one request from `/dev/fuse`, services it, replies,
@@ -7291,15 +7275,6 @@ pub fn mount(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
     fs.install_kernel_notifier(session.notifier());
-    #[cfg(target_os = "linux")]
-    if fuse_io_uring_enabled() {
-        session.run_with_io_uring(4, 128 * 1024)?;
-    } else if let Some(workers) = fuse_dispatch_workers() {
-        session.run_with_workers(workers)?;
-    } else {
-        session.run()?;
-    }
-    #[cfg(not(target_os = "linux"))]
     if let Some(workers) = fuse_dispatch_workers() {
         session.run_with_workers(workers)?;
     } else {

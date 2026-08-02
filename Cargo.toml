@@ -77,7 +77,7 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 xattr = "1.6.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-fuser = { version = "0.17.0", features = ["abi-7-42"] }
+fuser = { version = "0.17.0", features = ["abi-7-40"] }
 zstd = "0.13.3"
 brotli = "8.0.2"
 # zlib-rs backend: a pure-safe-Rust reimplementation of zlib that inflates

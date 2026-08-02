@@ -13,6 +13,85 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT + REVERT: FUSE-over-io_uring on parallel metadata - diagnostic FUSE wall time 1.487x slower, null-blocked - 2026-08-01
+
+Lever 2 from the mounted-live-incumbent list: batch FUSE request submission and
+completion through Linux FUSE-over-io_uring instead of paying one classic
+`/dev/fuse` read/write round trip per request. The implementation used queue
+depth 4 and a 128 KiB payload per queue entry and stayed opt-in behind
+`FFS_FUSE_IO_URING=1` plus the kernel's `enable_uring=Y` switch.
+
+### Activation and behavioral proof
+
+This was not an environment-only A/B. The exact scored binary logged
+`kernel accepted FUSE-over-io_uring: queue_depth=4, payload_size=131072` on the
+standard blocking `mount` path used by `ffs-mounted-kernel-bench`; the managed
+path was wired and proved separately. A 32-create smoke test persisted all 32
+names (sorted-name SHA-256
+`e92f6a53507f6728ca8bd62d1dfb89ff3186ea13048e762e5c247de6e3ecb623`),
+unmounted cleanly, and passed offline `e2fsck -fn`. The kernel switch was
+restored to `N` after measurement.
+
+Isomorphism proof for the candidate: ordering stayed behind the same global
+dispatch lock and every request still entered `Request::dispatch`; tie-breaking,
+floating point and RNG are N/A; the mounted harness passed initial/final tree
+parity and post-unmount validation on all eight physical images across the two
+invocations.
+
+### Measurement against live kernel ext4
+
+Same frozen candidate ELF in both invocations,
+`431fa57ba7996a0a865dc20a505a7d2dcbac70bc9917d50cf720147fdf076b74`,
+PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`;
+same frozen mounted driver
+`b6fcf0c90c45b66a8ad0160dacf954bda58d535432163804900764e00777579f`.
+Each invocation ran four live independent arms (kernel A/B and FUSE A/B), 128
+balanced crossover pairs, 512 creates, eight observed/pinned client threads,
+one directory fsync per worker, on CPUs `24-31,56-63` (`same-llc`). Reports:
+
+Every reported interval is a 20,000-resample bootstrap median 95% CI;
+`cv_used=false` and instructions were not used. Each report contains its own
+same-invocation A/A null controls: classic kernel A/A 1.021933x and FUSE A/A
+0.981960x; io_uring kernel A/A 0.993509x and FUSE A/A 1.004114x.
+
+- classic control: `/data/tmp/frankenfs-io-uring-v2/control/report.json`,
+  SHA-256 `bb87eefbdcf1f7de9971ef177485a1a4a5d7b96d1fa21f7fdc166aa43cdb1442`;
+- io_uring candidate: `/data/tmp/frankenfs-io-uring-v2/candidate/report.json`,
+  SHA-256 `7b1aa1cc86605b2a4f972ec6bdfc27ffc7f40f8a12bab9203b01d82cdb2c9be3`.
+
+| transport | kernel median | FUSE median | FUSE / kernel | 95% CI | admission |
+| --- | ---: | ---: | ---: | ---: | --- |
+| classic control | 33.761 ms | 46.718 ms | 1.357088x | [1.297664, 1.438340] | BLOCKED_NULL |
+| io_uring | 33.551 ms | 69.450 ms | 2.097425x | [2.053373, 2.187929] | BLOCKED_NULL |
+
+Both ratios are diagnostic only: control kernel/FUSE symmetric A/A spreads
+were 1.084395/1.039428 and candidate spreads were 1.063001/1.030066, all above
+the required 1.025 where noted by the reports. Therefore this row makes no
+bankable competitive timing claim. It does supply a decisive engineering
+direction: with the live kernel arm flat within 0.7%, io_uring increased FUSE
+wall time by **1.486583x** and worsened the diagnostic incumbent ratio by
+**1.545533x**.
+
+### Decision and mechanism
+
+**REVERT.** The compiled/runtime io_uring surface, ABI 7.42 negotiation and
+dependency were removed; the later concurrent-dispatch lever remains intact.
+The rejected source module is deliberately unreferenced rather than deleted,
+because repository policy requires a separate explicit file-deletion grant.
+
+This implementation created a ring worker for every possible CPU, assembled
+each request into a fresh `Vec`, crossed an MPSC channel plus eventfd for every
+reply, and then serialized filesystem callbacks behind a mutex. For this
+small-metadata row those structural costs exceeded the classic syscall cost;
+there was no batching win to amortize them.
+
+**Retry predicate:** revisit only with a profile showing classic `/dev/fuse`
+submission/completion as the remaining exclusive gap *and* a design that uses
+only the daemon's assigned CPUs, keeps request buffers zero-copy through
+dispatch, and batches multiple reply commits per wakeup. Any retry still needs
+an admitted same-invocation live-incumbent gate.
+
 ## KEEP (default OFF): concurrent FUSE dispatch - readdir+stat 1.923x faster than the single-threaded loop, and 1.14x SLOWER on the banked 1-CPU daemon placement - 2026-08-01
 
 Lever chosen by profiling the whole readdir+stat job against the live kernel arm
@@ -76,8 +155,10 @@ reader/writer lock in `Session::dispatch_request`:
 INIT is always serviced on the primary thread before any worker starts. Unset /
 `1` / invalid selects the historical loop and the gate is `None`, so the default
 path is byte-identical and the same ELF supplies both A/B arms. Wired into both
-`mount()` and `mount_managed()` (the mode the bench harness uses; the io_uring
-lever reached only `mount()` and so was unreachable from every measured run).
+`mount()` and `mount_managed()`. The mounted-kernel harness actually invokes
+the standard `mount()` path; an earlier version of this ledger incorrectly
+called it managed. That distinction is proved for the io_uring rejection above
+by explicit kernel-acceptance logging on the scored standard path.
 
 ### Measurement (one ELF, four arms live at once, interleaved, order rotates per round)
 

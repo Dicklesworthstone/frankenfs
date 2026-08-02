@@ -47,8 +47,6 @@ use std::cmp::max;
 use std::cmp::min;
 
 mod channel;
-#[cfg(target_os = "linux")]
-mod io_uring;
 mod ll;
 mod mnt;
 mod notify;

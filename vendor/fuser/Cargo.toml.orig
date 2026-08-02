@@ -24,9 +24,6 @@ smallvec = "1.6.1"
 zerocopy = { version = "0.8", features = ["derive"] }
 nix = { version = "0.29.0", features = ["fs", "user"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7.13"
-
 [dev-dependencies]
 env_logger = "0.11.7"
 clap = { version = "4.4", features = ["cargo", "derive"] }
@@ -58,7 +55,6 @@ abi-7-30 = ["abi-7-29"]
 abi-7-31 = ["abi-7-30"]
 abi-7-36 = ["abi-7-31"]
 abi-7-40 = ["abi-7-36", "nix/ioctl"]
-abi-7-42 = ["abi-7-40"]
 
 [[example]]
 name = "poll"

@@ -8,52 +8,24 @@
 use crate::ll::{Errno, Response, fuse_abi as abi};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
-use std::io::IoSlice;
-#[cfg(feature = "abi-7-40")]
-use std::os::fd::BorrowedFd;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::Filesystem;
 use crate::PollHandle;
 use crate::channel::ChannelSender;
 use crate::ll::Request as _;
-#[cfg(feature = "abi-7-40")]
-use crate::passthrough::BackingId;
 #[cfg(feature = "abi-7-21")]
 use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplySender};
 use crate::session::{Session, SessionACL};
 use crate::{KernelConfig, ll};
 
-#[derive(Clone)]
-enum RequestSender {
-    Classic(ChannelSender),
-    Shared(Arc<dyn ReplySender>),
-}
-
-impl ReplySender for RequestSender {
-    fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
-        match self {
-            Self::Classic(sender) => sender.send(data),
-            Self::Shared(sender) => sender.send(data),
-        }
-    }
-
-    #[cfg(feature = "abi-7-40")]
-    fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
-        match self {
-            Self::Classic(sender) => sender.open_backing(fd),
-            Self::Shared(sender) => sender.open_backing(fd),
-        }
-    }
-}
-
 /// Request data structure
+#[derive(Debug)]
 pub struct Request<'a> {
-    /// Transport used to send this request's reply.
-    sender: RequestSender,
+    /// Channel sender for sending the reply.
+    ch: ChannelSender,
     /// Request raw data
     #[allow(unused)]
     data: &'a [u8],
@@ -64,18 +36,6 @@ pub struct Request<'a> {
 impl<'a> Request<'a> {
     /// Create a new request from the given data
     pub(crate) fn new(ch: ChannelSender, data: &'a [u8]) -> Option<Request<'a>> {
-        Self::parse(RequestSender::Classic(ch), data)
-    }
-
-    /// Create a request whose reply uses a non-classic transport.
-    pub(crate) fn new_with_sender(
-        sender: Arc<dyn ReplySender>,
-        data: &'a [u8],
-    ) -> Option<Request<'a>> {
-        Self::parse(RequestSender::Shared(sender), data)
-    }
-
-    fn parse(sender: RequestSender, data: &'a [u8]) -> Option<Request<'a>> {
         let request = match ll::AnyRequest::try_from(data) {
             Ok(request) => request,
             Err(err) => {
@@ -84,11 +44,7 @@ impl<'a> Request<'a> {
             }
         };
 
-        Some(Self {
-            sender,
-            data,
-            request,
-        })
+        Some(Self { ch, data, request })
     }
 
     /// Whether this request may be dispatched concurrently with other
@@ -137,7 +93,7 @@ impl<'a> Request<'a> {
             Ok(None) => return,
             Err(errno) => self.request.reply_err(errno),
         }
-        .with_iovec(unique, |iov| self.sender.send(iov));
+        .with_iovec(unique, |iov| self.ch.send(iov));
 
         if let Err(err) = res {
             warn!("Request {unique:?}: Failed to send reply: {err}");
@@ -215,23 +171,6 @@ impl<'a> Request<'a> {
                 se.filesystem
                     .init(self, &mut config)
                     .map_err(Errno::from_i32)?;
-
-                #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-                if se.io_uring_requested {
-                    match config.add_capabilities(abi::consts::FUSE_OVER_IO_URING) {
-                        Ok(()) => {
-                            let payload_size = se.io_uring_payload_size.max(8 * 1024);
-                            let _ = config.set_max_write(payload_size);
-                            let _ = config.set_max_readahead(payload_size);
-                            se.io_uring_negotiated = true;
-                        }
-                        Err(missing) => {
-                            debug!(
-                                "kernel did not offer FUSE-over-io_uring capability {missing:#x}"
-                            );
-                        }
-                    }
-                }
 
                 // Reply with our desired version and settings. If the kernel supports a
                 // larger major version, it'll re-send a matching init message. If it
@@ -461,7 +400,7 @@ impl<'a> Request<'a> {
                     x.offset(),
                     ReplyDirectory::new(
                         self.request.unique().into(),
-                        self.sender.clone(),
+                        self.ch.clone(),
                         x.size() as usize,
                     ),
                 );
@@ -639,7 +578,7 @@ impl<'a> Request<'a> {
                     x.offset(),
                     ReplyDirectoryPlus::new(
                         self.request.unique().into(),
-                        self.sender.clone(),
+                        self.ch.clone(),
                         x.size() as usize,
                     ),
                 );
@@ -716,7 +655,7 @@ impl<'a> Request<'a> {
     /// Create a reply object for this request that can be passed to the filesystem
     /// implementation and makes sure that a request is replied exactly once
     fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique().into(), self.sender.clone())
+        Reply::new(self.request.unique().into(), self.ch.clone())
     }
 
     /// Returns the unique identifier of this request
@@ -741,13 +680,5 @@ impl<'a> Request<'a> {
     #[inline]
     pub fn pid(&self) -> u32 {
         self.request.pid()
-    }
-}
-
-impl std::fmt::Debug for Request<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Request")
-            .field("request", &self.request)
-            .finish_non_exhaustive()
     }
 }

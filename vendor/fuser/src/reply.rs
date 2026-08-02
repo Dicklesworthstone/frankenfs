@@ -24,7 +24,6 @@ use std::fmt;
 use std::io::IoSlice;
 #[cfg(feature = "abi-7-40")]
 use std::os::fd::BorrowedFd;
-use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -39,17 +38,6 @@ pub trait ReplySender: Send + Sync + Unpin + 'static {
     /// Open a backing file
     #[cfg(feature = "abi-7-40")]
     fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId>;
-}
-
-impl<T: ReplySender + ?Sized> ReplySender for Arc<T> {
-    fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
-        (**self).send(data)
-    }
-
-    #[cfg(feature = "abi-7-40")]
-    fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
-        (**self).open_backing(fd)
-    }
 }
 
 impl fmt::Debug for Box<dyn ReplySender> {
