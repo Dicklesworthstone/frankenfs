@@ -13,6 +13,104 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## PENDING (no verdict): `--fuse-cpus` removes the 8:1 daemon handicap; the one window this session could not decide anything - 2026-08-02
+
+Instrument-only row: it banks a harness knob, committed as `b3eebca8`, and no
+FrankenFS optimization. The number the knob exists to produce is NOT in it. The 2026-08-01 dispatch entry below measured concurrent FUSE
+dispatch at **1.923x faster** on `readdir-stat-8t` with the daemon on eight CPUs
+and **1.141x slower** with it on one, and named the missing harness knob as the
+thing blocking a bankable result. This adds it.
+
+### Why the placement was worth changing
+
+`select_fuse_cpus` returned `vec![cpu]`. In the kernel arm the filesystem
+executes inside the client threads, so on an eight-thread row in-kernel ext4 has
+eight CPUs of filesystem capacity and FrankenFS has one — every multi-threaded
+banked row carries that 8:1 asymmetry. `--fuse-cpus N` defaults to 1 and at 1
+takes the identical former code path, so no banked row changes. Above 1 the
+clients are placed first, exactly as they are today, and the daemon then takes
+quiet CPUs the clients did not claim; inside one last-level-cache domain (16
+logical CPUs over 8 physical cores here) those are the clients' SMT siblings, so
+both arms occupy **the same eight physical cores** and the daemon runs on
+hyperthreads the kernel arm structurally cannot use for this job. That is a
+different resource contract, not a better one: reports carry
+`requested_fuse_cpus` and a `fuse_cpu_isolation` string
+(`private_physical_core_clients_placed_after` vs
+`shares_physical_cores_with_clients_placed_after`) so a number taken at one
+placement can never be restated as the other. Neither placement retires the
+other and the banked rows stay as they are.
+
+### The measurement attempt, and why it decided nothing
+
+One invocation completed before the host filled up: `readdir-stat-8t`,
+32,768 operations, 128 pairs, `--fuse-cpus 1`, `FFS_FUSE_WORKERS` unset — i.e.
+the control that had to reproduce the banked `4.967448x` before any candidate
+number could be read at all.
+
+| quantity | banked row | this window |
+| --- | ---: | ---: |
+| kernel median batch | 22.84 ms | 32.32 ms |
+| FrankenFS median batch | 113.44 ms | 208.39 ms |
+| fuse / kernel | `4.967448x` | `6.292487x` `[5.812018, 6.455416]` |
+| kernel A/A spread | `1.008448x` | **`1.031347x`** |
+| FUSE A/A spread | `1.002503x` | **`1.048235x`** |
+
+Both A/A nulls exceed the `1.025x` limit, `directional_claim_clear=false`,
+`verdict=blocked_null`, `admitted=false`. The two byte-identical FUSE mounts
+differed by 14% from each other (`fuse_a` 194.29 ms, `fuse_b` 221.53 ms). The
+placement preflight had passed — our own LLC CPUs sampled 0.051 busy — so the
+contention was shared L3/memory traffic from sibling agents on other CCDs, which
+a same-LLC per-CPU check cannot see. Host one-minute load went 14 -> 30 -> 87
+during the session. The remaining three invocations then fail-closed at
+placement (`no physical core has every SMT thread below the driver contention
+limit`) and produced no data.
+
+Estimator and provenance, each on one line:
+
+`fuse_over_kernel` deterministic 20,000-resample bootstrap median 95% CI = `6.292487x [5.812018, 6.455416]`; wall time is the gate, `cv_used=false`, `instructions_used=false`.
+
+Emitted by each FUSE daemon itself under `FFS_MOUNT_BENCH_EVIDENCE=1`, in process, not by a neighbouring `sha256sum`:
+
+    mount_bench_evidence,binary_sha256=d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8
+    mount_build_profile,pgo_profile_sha256=6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc
+
+**Nothing here is pooled, selected among, or reported as an effect.** The gate
+limit was not touched. Report preserved at
+`/data/tmp/frankenfs-fusecpus/c1_off/report.json`. Both FUSE daemons
+self-reported the executing ELF in process as SHA-256
+`d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8`, matching
+`/proc/<pid>/exe` (`proc_exe_sha256` identical on both arms), on PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc` — the banked
+profile — with `isa=x86-64-v3,verdict=pass`; driver ELF
+`d8786a0663dbc635f4e508bcc9ade6cb8cad22c0c7353f9a6280d28329628c65`. Four-arm
+tree parity passed (`a91834cf…`, 32,773 entries) and the daemon pinning was
+attested live from `/proc`: both daemons `Cpus_allowed_list: 29`, zero
+`fuse-dispatch` threads.
+
+### Method rule this establishes
+
+**A candidate placement number is unreadable until the control at the banked
+placement reproduces the banked row inside its twice-null margin, in the same
+window.** Running the candidate first and comparing it to a number from a
+different day would have shown a large apparent improvement here purely because
+this window is 1.4x slower end to end.
+
+### The command that must produce the verdict
+
+Four invocations from one ELF, on a host whose *every* CPU is quiet — not just
+the benchmark's — for five consecutive one-second samples:
+
+```
+ffs-mounted-kernel-bench --ffs-cli <v3+PGO elf> --filesystem ext4 \
+  --workload readdir-stat-8t --operations 32768 --pairs 128 \
+  --fuse-cpus {1,8} --harness-builder <host> --candidate-builder <host>
+```
+with `FFS_FUSE_WORKERS` unset and `=8`. `--fuse-cpus 8` + workers unset is the
+control that matters: a serial session loop cannot use eight CPUs, so it must
+move nothing, and any movement in `--fuse-cpus 8` + `FFS_FUSE_WORKERS=8` that it
+does not also show is the CPUs rather than the lever. Admission requires the
+`c1_off` control to land on `4.967448x` first.
+
 ## KEEP (default OFF, maintenance only): append-only ext4 metadata WAL + quiesced compactor - diagnostic live-incumbent ratio 1.502x -> 1.216-1.237x, null-blocked - 2026-08-02
 
 Lever 3 from the mounted-live-incumbent list replaces synchronous random
