@@ -13,6 +13,83 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## KEEP (default OFF, maintenance only): append-only ext4 metadata WAL + quiesced compactor - diagnostic live-incumbent ratio 1.502x -> 1.216-1.237x, null-blocked - 2026-08-02
+
+Lever 3 from the mounted-live-incumbent list replaces synchronous random
+home-block metadata checkpointing with an append-only CRC-protected MVCC WAL.
+`FFS_EXT4_METADATA_LOG=1` gives each writable ext4 mount a sidecar WAL; fsync
+captures the latest MVCC blocks plus derived group-descriptor/superblock
+summaries, appends and syncs one sequential commit, then publishes the
+read-your-writes index. An owned background compactor sorts/coalesces blocks and
+waits for a 10 ms quiet window before home-location writeback so it does not
+race sibling foreground fsyncs. Clean unmount joins the worker, performs one
+authoritative full checkpoint, and only then truncates the WAL to its header.
+
+### Crash and isomorphism proof
+
+Strict-remote `ffs-core` regression
+`append_only_metadata_log_replays_then_checkpoints_clean` passed: the test
+observed a non-empty WAL after fsync, simulated a crash without the final
+checkpoint, replayed exactly one committed record with the file contents
+visible, then checkpointed to a 16-byte header and passed `e2fsck -fn`. Both
+mounted candidate runs created independent sidecars for both FUSE arms; all
+four sidecars were 16 bytes after clean unmount. Initial/final tree parity and
+offline post-unmount validation passed for all four physical arms in every
+invocation.
+
+Ordering remains the MVCC commit-sequence order; last revision still wins for a
+block, and the compactor may only discard older block images after the newer WAL
+record is durable. Tie-breaking, floating point, and RNG are N/A.
+
+### Measurement against live kernel ext4
+
+Each invocation used the frozen mounted driver
+`b6fcf0c90c45b66a8ad0160dacf954bda58d535432163804900764e00777579f`,
+the same PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+four simultaneous independent arms (kernel A/B and FUSE A/B), 128 balanced
+crossover pairs, 512 creates, eight observed/pinned workers, and one directory
+fsync per worker under same-LLC placement. The control and first WAL run used
+the identical candidate ELF
+`e5efe9a592490492a783e18020a0a877786b8812514315d5904debd761d6f5ec`;
+the quiesced-compactor refinement used
+`d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8`.
+Both executing ELFs self-reported in process before the run:
+`bench_evidence,binary_sha256=e5efe9a592490492a783e18020a0a877786b8812514315d5904debd761d6f5ec`
+and
+`bench_evidence,binary_sha256=d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8`.
+
+| path | kernel median | FUSE median | FUSE / kernel | 95% CI | kernel/FUSE A/A spread | admission |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| same-ELF WAL-off control | 27.139 ms | 40.315 ms | 1.501579x | [1.456096, 1.532052] | 1.034486 / 1.015496 | BLOCKED_NULL |
+| same-ELF WAL-on | 29.502 ms | 34.371 ms | 1.216150x | [1.192461, 1.256547] | 1.082532 / 1.032545 | BLOCKED_NULL |
+| WAL-on, quiesced compactor | 22.044 ms | 29.574 ms | 1.237305x | [1.218937, 1.262013] | 1.029163 / 1.026533 | BLOCKED_NULL |
+
+Reports and SHA-256:
+
+- `/data/tmp/frankenfs-metadata-log/control/report.json`:
+  `18ad92c143af814b6e6adf7ce7b18c2e11d788a06798201c6fc323b84f68bc2c`;
+- `/data/tmp/frankenfs-metadata-log/candidate/report.json`:
+  `9d97c2e1b0ee4d5c35349e068d73cd0c902f2aed949cc055f7c63393490dc916`;
+- `/data/tmp/frankenfs-metadata-log/quiesced/report.json`:
+  `df6b99823ab7551ecdfeb1b758bd6d425beb2ee06764b7728165e7a2ed894c31`.
+
+Each reported interval is a 20,000-resample bootstrap median 95% CI;
+`cv_used=false`. Every invocation is null-blocked, so these are diagnostic
+maintenance results, not a scored competitive claim. The repeat feature-on
+ratios nevertheless move the structural gap from about 1.50x to about
+1.22-1.24x while preserving mounted parity and clean images.
+
+### Decision
+
+**KEEP DEFAULT OFF as a maintenance win; DO NOT BANK.** Sequential WAL
+durability and deferred/coalesced home writeback remove a material part of the
+random-checkpoint tax, but FrankenFS still trails the live incumbent by at least
+21.9% at the candidate CI lower bounds. The remaining loss is in the parallel
+create/allocator/commit body rather than home-location durability; proceed to
+per-core allocation arenas and lock-free inode allocation, and require an
+admitted live-incumbent run before changing this row to competitive KEEP.
+
 ## REJECT + REVERT: FUSE-over-io_uring on parallel metadata - diagnostic FUSE wall time 1.487x slower, null-blocked - 2026-08-01
 
 Lever 2 from the mounted-live-incumbent list: batch FUSE request submission and
