@@ -36,7 +36,9 @@ exact four-arm parity, clean post-unmount `btrfs check --readonly`, incumbent is
 
 - **readdir+stat: we lose badly.** The kernel enumerates and stats 32,768 entries in
   26.157 ms where we take 217.782 ms — our worst measured surface on any filesystem.
-- **Warm stat: we lose.** About five times slower, replicated on two CPUs.
+- **Warm stat: we lose.** About five times slower, replicated on two CPUs — and the ext4
+  bank now measures the same shape at `4.812194x`, within 3.4%, so this is the shared
+  per-request FUSE floor rather than anything about btrfs inode lookup.
 - **Create/delete storm: we lose.** About 2.36 times slower on a 2,000-file namespace
   transaction.
 - **Parallel metadata writes: we lose.** About 1.93 times slower with eight workers
@@ -292,7 +294,7 @@ row shows no number, because a fixed defect is not a result.
 | parallel read | `1.287862x` slower | **`0.894290x` / `0.830537x` faster** |
 | parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
 | fsync/journal commit | `0.997098x` neutral | **`1.976308x` slower** |
-| warm stat | not in the ext4 bank | `4.977803x` / `5.036433x` slower |
+| warm stat | `4.812194x` slower | `4.977803x` / `5.036433x` slower |
 
 The parallel-read row is the only sign change anywhere in either scorecard, which is
 another reason to resolve its mechanism before quoting it.

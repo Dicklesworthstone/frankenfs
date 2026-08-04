@@ -11,9 +11,10 @@ Latin-square physical-arm crossover. Every row carries **two same-invocation A/A
 controls** — one per filesystem type — and both are printed. A ratio above `1.0` means
 FrankenFS is **slower** than the kernel.
 
-All five ext4 surfaces now score. **0 wins / 4 losses / 1 neutral / 0 unscored.**
+All six ext4 surfaces now score. **0 wins / 5 losses / 1 neutral / 0 unscored.**
+(Warm stat added 2026-08-04 — it was the one shape btrfs banked and ext4 did not.)
 
-## The five rows
+## The six rows
 
 | Workload (the job as timed) | FrankenFS ÷ kernel ext4, bootstrap median 95% CI | Kernel A/A null | FUSE A/A null | Governor / EPP on every involved CPU | Worker threads requested → observed | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -22,6 +23,7 @@ All five ext4 surfaces now score. **0 wins / 4 losses / 1 neutral / 0 unscored.*
 | **Multi-file parallel read** — enumerate and byte-sort 256 × 256 KiB files, then 8 workers `pread` every file exactly once (ro) | **`1.287862x` `[1.269319, 1.307285]` slower** (twice-null margin `1.036157x`) | `1.003293x [0.982553, 1.016450]`, spread `1.017757x` | `0.994130x [0.982397, 1.002347]`, spread `1.017918x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **8 → 8** on all four arms, pinning attested | **LOSE** |
 | **Fsync/journal commit** — 8 × 4 KiB positioned writes to one file, `fsync` after each | `0.997098x [0.990808, 1.009108]` against a twice-null margin of **`1.030661x`**; `directional_claim_clear=false` | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **1 → 1** on all four arms, pinning attested | **NEUTRAL** |
 | **Parallel metadata writes** — 8 workers create exactly 512 empty files into private directories, then fsync every worker directory (**128 crossover blocks**) | **`1.510822x` `[1.493097, 1.539011]` slower** (twice-null margin `1.049223x`); replicated on a **disjoint CPU set** at `1.513052x [1.490837, 1.534711]`, agreeing to **0.15%** | `1.007184x [0.998479, 1.024316]`, spread `1.024316x` · replicate `0.998642x [0.990286, 1.009556]`, spread `1.009809x` | `0.995707x [0.978797, 1.000111]`, spread `1.021662x` · replicate `0.998780x [0.990819, 1.002688]`, spread `1.009266x` | `amd-pstate-epp` / `powersave` / **`performance`** (host EPP differed in this window; uniform across both metadata runs) | **8 → 8** on all four arms, pinning attested | **LOSE** |
+| **Warm stat** — issue 2,000 `stat` calls against one mounted file and aggregate the metadata (ro) | **`4.812194x` `[4.779087, 4.819425]` slower** (twice-null margin `1.035698x`) | `1.002547x` | `1.000593x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
 
 Admission required, per row: both A/A symmetric spreads at most `1.025x` with intervals
 containing `1.0`; the effect clearing **twice the widest null log-margin**; exact
@@ -39,6 +41,12 @@ rows satisfied all four. Wall time was the gate throughout — `cv_used=false`,
   threads, our narrowest gap, we are still about 29% slower.
 - **Fsync/journal commit: we neither win nor lose.** The measured `0.997098x` is a tie —
   it sits well inside the twice-null margin, so we are declaring no effect, not a win.
+- **Warm stat: we lose, and not because of btrfs.** About 4.81 times slower — the kernel
+  takes 4.42 ms for 2,000 warm `stat` calls where we take 21.30 ms. The btrfs bank measures the same shape
+  at `4.977803x`, so the two agree to within 3.4%: this loss is the shared per-request
+  FUSE floor, not btrfs inode lookup. That matters for where to spend effort — and it
+  means the btrfs readdir+stat excess over ext4 (`8.32x` vs `4.97x`) is the part that
+  really is btrfs-specific.
 - **Parallel metadata writes: we lose.** Eight workers creating 512 files and fsyncing
   their directories run about 1.51 times slower than ext4, reproduced twice on disjoint
   CPU sets.
@@ -84,6 +92,20 @@ sanity-checked against absolute time, not to support any claim.
   (`24,25,26,29,31,56,59,60` versus `0,1,5,6,33,34,35,39`) at `1.513052x`, agreeing with
   the banked `1.510822x` to **0.15%**.
 - **read** and **fsync** are each one admitted run at this exact shape.
+
+## Provenance of the warm-stat row (2026-08-04, differs from the other five)
+
+Candidate ELF `9e32e28f766368dd738c7d43e2d4f820a426394b0d1e72b6e565be622835408a`
+(x86-64-v3, PGO profile `5c6530a0261f658ed0ace2a9d8bef7c6c63b6f94b4b955e4f7ccba038e011e96`),
+driver ELF `8c1c4d35fd0a348e5e612d904f086567a4bd9f03a800127ff1ebedb6a2f2633f`, both
+self-hashed in process. `pairs=32`, `observation-repeats=3` reduced by `min`, parity
+`pass`, post-unmount `e2fsck` clean, `--placement-scope same-llc`.
+
+**This row's candidate is NOT the frozen `f44b3dc4…` / PGO `6a22cfcf…` the other five use** —
+it is a freshly trained profile, so the warm-stat number is not byte-identical-candidate
+comparable with them. It is directly comparable with the btrfs warm-stat row, which is the
+comparison it was taken for. Unlike the other five it also ran with every CPU on the
+`performance` governor, so it carries no mixed-governor warning.
 
 ## Scope and limits of these five claims
 
