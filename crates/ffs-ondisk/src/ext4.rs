@@ -1866,7 +1866,9 @@ pub fn bitmap_checksum_incremental(
         delta[(b / 8) as usize] |= 1u8 << (b % 8);
     }
     let suffix = checksum_len - byte_end;
-    Some(crate::crc_incremental::crc32c_update_region(old_csum, &delta, suffix))
+    Some(crate::crc_incremental::crc32c_update_region(
+        old_csum, &delta, suffix,
+    ))
 }
 
 pub fn stamp_block_bitmap_checksum(
@@ -2911,8 +2913,7 @@ impl Ext4Inode {
         // Only read if we have enough data (some truncated test inodes may be short).
         // AttrOnly skips this 60-byte copy for non-devices (the attr path reads
         // it only via device_number() for char/block-device rdev).
-        let need_extent_bytes =
-            ibody_parse != Ext4InodeIbodyParse::AttrOnly || is_device;
+        let need_extent_bytes = ibody_parse != Ext4InodeIbodyParse::AttrOnly || is_device;
         let extent_bytes = if !need_extent_bytes {
             // AttrOnly + non-device: skip the 60-byte copy entirely (empty).
             Ext4InodeBlockBytes::new()
@@ -5189,11 +5190,7 @@ impl Ext4ImageReader {
         logical_block: u32,
     ) -> Option<&Ext4ExtentIndex> {
         let p = indexes.partition_point(|idx| idx.logical_block <= logical_block);
-        if p == 0 {
-            None
-        } else {
-            Some(&indexes[p - 1])
-        }
+        if p == 0 { None } else { Some(&indexes[p - 1]) }
     }
 
     /// Recursive extent tree walker with a per-level child cache. Mirrors
@@ -5858,9 +5855,7 @@ impl Ext4ImageReader {
         name_index: u8,
         name: &[u8],
     ) -> Result<Option<Vec<u8>>, ParseError> {
-        if let Some((_, value, _inum)) =
-            find_ibody_xattr_by_index_name(inode, name_index, name)?
-        {
+        if let Some((_, value, _inum)) = find_ibody_xattr_by_index_name(inode, name_index, name)? {
             return Ok(Some(value));
         }
         if inode.file_acl != 0 {
@@ -6232,8 +6227,8 @@ fn find_xattr_value_matching(
                 field: "xattr_value",
                 reason: "value offset floor overflow",
             })?;
-    let v_off = usize::from(value_offs);
-    if v_off < min_value_offset {
+    let value_start = usize::from(value_offs);
+    if value_start < min_value_offset {
         return Err(ParseError::InvalidField {
             field: "xattr_value",
             reason: "value overlaps xattr header or entry table",
@@ -6242,10 +6237,12 @@ fn find_xattr_value_matching(
     let v_size = usize::try_from(value_size).map_err(|_| ParseError::IntegerConversion {
         field: "xattr_value_size",
     })?;
-    let v_end = v_off.checked_add(v_size).ok_or(ParseError::InvalidField {
-        field: "xattr_value",
-        reason: "value extends past data boundary",
-    })?;
+    let v_end = value_start
+        .checked_add(v_size)
+        .ok_or(ParseError::InvalidField {
+            field: "xattr_value",
+            reason: "value extends past data boundary",
+        })?;
     if v_end > value_base.len() {
         return Err(ParseError::InvalidField {
             field: "xattr_value",
@@ -6254,7 +6251,7 @@ fn find_xattr_value_matching(
     }
     Ok(Some((
         name_index,
-        value_base[v_off..v_end].to_vec(),
+        value_base[value_start..v_end].to_vec(),
         value_inum,
     )))
 }
@@ -7671,7 +7668,9 @@ fn dx_entry_block_raw(block: &[u8], count_offset: usize, idx: usize) -> Option<u
     let base = if idx == 0 {
         count_offset.checked_add(4)?
     } else {
-        count_offset.checked_add(idx.checked_mul(8)?)?.checked_add(4)?
+        count_offset
+            .checked_add(idx.checked_mul(8)?)?
+            .checked_add(4)?
     };
     read_le_u32(block, base).ok()
 }
@@ -7700,7 +7699,12 @@ fn dx_count_raw(block: &[u8], count_offset: usize) -> usize {
 /// Raw analogue of [`dx_find_leaf_idx`]: the rightmost entry with `hash <= target`,
 /// reading hashes on demand from `block` instead of a parsed slice.
 #[inline]
-fn dx_find_leaf_idx_raw(block: &[u8], count_offset: usize, count: usize, hash: u32) -> Option<usize> {
+fn dx_find_leaf_idx_raw(
+    block: &[u8],
+    count_offset: usize,
+    count: usize,
+    hash: u32,
+) -> Option<usize> {
     let mut lo = 0_usize;
     let mut hi = count;
     while lo < hi {
@@ -8236,8 +8240,8 @@ pub fn promote_dx_root_to_two_level(
     block_size: usize,
     has_metadata_csum: bool,
     large_dir: bool,
-    node_a_logical: u32,
-    node_b_logical: u32,
+    left_child_logical: u32,
+    right_child_logical: u32,
     csum_seed: u32,
     dir_ino: u32,
     generation: u32,
@@ -8279,11 +8283,11 @@ pub fn promote_dx_root_to_two_level(
     let root_entries = [
         Ext4DxEntry {
             hash: 0,
-            block: node_a_logical,
+            block: left_child_logical,
         },
         Ext4DxEntry {
             hash: split_hash,
-            block: node_b_logical,
+            block: right_child_logical,
         },
     ];
     let root_limit = dx_root_entry_limit(block_size, has_metadata_csum);
@@ -14839,7 +14843,9 @@ mod tests {
         for order in orders {
             let mut cache = ExtentResolveCache::default();
             for lb in order {
-                let uncached = reader.resolve_extent_with_tree(&image, &h, &tree, lb).unwrap();
+                let uncached = reader
+                    .resolve_extent_with_tree(&image, &h, &tree, lb)
+                    .unwrap();
                 let cached = reader
                     .resolve_extent_with_tree_cached(&image, &h, &tree, lb, &mut cache)
                     .unwrap();
@@ -15659,7 +15665,11 @@ mod tests {
         // Lay out xattr entries + values in one region. `value_base_start` is the
         // offset of this region within the finder's value_base (0 for the ibody
         // region after the 4-byte magic; 32 for the external block).
-        fn build_region(items: &[(u8, &[u8], &[u8])], value_base_start: usize, len: usize) -> Vec<u8> {
+        fn build_region(
+            items: &[(u8, &[u8], &[u8])],
+            value_base_start: usize,
+            len: usize,
+        ) -> Vec<u8> {
             let mut buf = vec![0_u8; len];
             let mut eo = 0_usize; // entry cursor (front)
             let mut vo = len; // value cursor (back)
@@ -15670,7 +15680,8 @@ mod tests {
                 buf[eo + 1] = *idx;
                 buf[eo + 2..eo + 4]
                     .copy_from_slice(&u16::try_from(value_base_start + vo).unwrap().to_le_bytes());
-                buf[eo + 8..eo + 12].copy_from_slice(&u32::try_from(val.len()).unwrap().to_le_bytes());
+                buf[eo + 8..eo + 12]
+                    .copy_from_slice(&u32::try_from(val.len()).unwrap().to_le_bytes());
                 buf[eo + 16..eo + 16 + name.len()].copy_from_slice(name);
                 eo = (eo + 16 + name.len() + 3) & !3;
             }
@@ -15680,7 +15691,11 @@ mod tests {
         // ibody: magic + region (values addressed from region start).
         let mut ibody = EXT4_XATTR_MAGIC.to_le_bytes().to_vec();
         ibody.extend(build_region(
-            &[(ffs_types::EXT4_XATTR_INDEX_SECURITY, b"selinux", b"sysadm_u:obj")],
+            &[(
+                ffs_types::EXT4_XATTR_INDEX_SECURITY,
+                b"selinux",
+                b"sysadm_u:obj",
+            )],
             0,
             252,
         ));
@@ -15750,12 +15765,21 @@ mod tests {
         ];
         for (ni, name) in cases {
             let new = reader.get_xattr(&image, &inode, *ni, name).unwrap();
-            assert_eq!(new, old_get(*ni, name), "get_xattr mismatch for index {ni} name {name:?}");
+            assert_eq!(
+                new,
+                old_get(*ni, name),
+                "get_xattr mismatch for index {ni} name {name:?}"
+            );
         }
         // Concrete spot-checks.
         assert_eq!(
             reader
-                .get_xattr(&image, &inode, ffs_types::EXT4_XATTR_INDEX_SECURITY, b"selinux")
+                .get_xattr(
+                    &image,
+                    &inode,
+                    ffs_types::EXT4_XATTR_INDEX_SECURITY,
+                    b"selinux"
+                )
                 .unwrap()
                 .as_deref(),
             Some(&b"sysadm_u:obj"[..])
@@ -15777,7 +15801,10 @@ mod tests {
             .iter()
             .map(Ext4Xattr::full_name)
             .collect();
-        assert_eq!(names_only, materialize_all, "list_xattr_names != materialize-all names");
+        assert_eq!(
+            names_only, materialize_all,
+            "list_xattr_names != materialize-all names"
+        );
         assert_eq!(
             names_only,
             vec![
@@ -23083,18 +23110,25 @@ mod bitmap_csum_incremental_verify {
     #[test]
     fn incremental_matches_full_prop() {
         let mut state = 0xABCD_1234u32;
-        let mut next = || { state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); state };
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
         let clusters = 32768u32; // 4096-byte bitmap, byte-aligned
         let seed = 0x1234_5678u32;
         let mut bitmap = vec![0u8; 4096];
-        for b in bitmap.iter_mut() { *b = (next() & 0xFF) as u8; }
+        for b in bitmap.iter_mut() {
+            *b = (next() & 0xFF) as u8;
+        }
         let mut checked = 0;
         for _ in 0..400 {
             let count = 1 + (next() % 900);
             let start = next() % (clusters - count);
             let old = block_bitmap_checksum_value(&bitmap, seed, clusters, 64);
             let mut newbm = bitmap.clone();
-            for bit in start..start + count { newbm[(bit / 8) as usize] ^= 1u8 << (bit % 8); }
+            for bit in start..start + count {
+                newbm[(bit / 8) as usize] ^= 1u8 << (bit % 8);
+            }
             let full = block_bitmap_checksum_value(&newbm, seed, clusters, 64);
             if let Some(inc) = bitmap_checksum_incremental(old, start, count, clusters, 64) {
                 assert_eq!(inc, full, "start={start} count={count}");
@@ -23102,7 +23136,10 @@ mod bitmap_csum_incremental_verify {
             }
             bitmap = newbm;
         }
-        assert!(checked > 50, "incremental exercised too few times: {checked}");
+        assert!(
+            checked > 50,
+            "incremental exercised too few times: {checked}"
+        );
     }
     #[test]
     fn incremental_none_for_16bit_desc() {
@@ -23116,14 +23153,19 @@ mod dir_csum_incremental_verify {
     #[test]
     fn incremental_matches_full_dir_stamp_prop() {
         let mut state = 0x51A7_3C9Fu32;
-        let mut next = || { state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); state };
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
         let bs = 4096usize;
         let coverage_end = bs - 12;
         let seed = 0xDEAD_BEEFu32;
         let ino = 42u32;
         let generation = 7u32;
         let mut block = vec![0u8; bs];
-        for b in block.iter_mut() { *b = (next() & 0xFF) as u8; }
+        for b in block.iter_mut() {
+            *b = (next() & 0xFF) as u8;
+        }
         stamp_dir_block_checksum(&mut block, seed, ino, generation);
         let mut checked = 0;
         for _ in 0..400 {
@@ -23131,17 +23173,25 @@ mod dir_csum_incremental_verify {
             let len = 1 + (next() as usize % 48);
             let start = (next() as usize) % (coverage_end - len);
             let mut new_bytes = vec![0u8; len];
-            for b in new_bytes.iter_mut() { *b = (next() & 0xFF) as u8; }
-            let delta: Vec<u8> = new_bytes.iter().zip(&block[start..start+len]).map(|(n,o)| n^o).collect();
+            for b in new_bytes.iter_mut() {
+                *b = (next() & 0xFF) as u8;
+            }
+            let delta: Vec<u8> = new_bytes
+                .iter()
+                .zip(&block[start..start + len])
+                .map(|(n, o)| n ^ o)
+                .collect();
             // apply the change to two copies
             let mut inc = block.clone();
-            inc[start..start+len].copy_from_slice(&new_bytes);
+            inc[start..start + len].copy_from_slice(&new_bytes);
             let mut full = inc.clone();
             // incremental tail update (inc still carries the OLD tail from `block`)
-            assert!(stamp_dir_block_checksum_incremental(&mut inc, start, &delta));
+            assert!(stamp_dir_block_checksum_incremental(
+                &mut inc, start, &delta
+            ));
             // full recompute oracle
             stamp_dir_block_checksum(&mut full, seed, ino, generation);
-            assert_eq!(&inc[bs-4..], &full[bs-4..], "start={start} len={len}");
+            assert_eq!(&inc[bs - 4..], &full[bs - 4..], "start={start} len={len}");
             block = full; // chain (like successive mutations)
             checked += 1;
         }
@@ -23150,7 +23200,13 @@ mod dir_csum_incremental_verify {
     #[test]
     fn incremental_rejects_out_of_coverage() {
         let mut block = vec![0u8; 4096];
-        assert!(!stamp_dir_block_checksum_incremental(&mut block, 4090, &[0u8; 8]));
-        assert!(!stamp_dir_block_checksum_incremental(&mut [0u8; 8], 0, &[0u8; 1]));
+        assert!(!stamp_dir_block_checksum_incremental(
+            &mut block, 4090, &[0u8; 8]
+        ));
+        assert!(!stamp_dir_block_checksum_incremental(
+            &mut [0u8; 8],
+            0,
+            &[0u8; 1]
+        ));
     }
 }

@@ -24,16 +24,14 @@ fn crc32c_byte_table() -> &'static [u32; 256] {
     static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
     TABLE.get_or_init(|| {
         let mut t = [0u32; 256];
-        let mut i = 0usize;
-        while i < 256 {
-            let mut c = i as u32;
+        for i in 0_u8..=u8::MAX {
+            let mut c = u32::from(i);
             let mut b = 0;
             while b < 8 {
                 c = if c & 1 != 0 { (c >> 1) ^ POLY } else { c >> 1 };
                 b += 1;
             }
-            t[i] = c;
-            i += 1;
+            t[usize::from(i)] = c;
         }
         t
     })
@@ -71,7 +69,10 @@ fn raw_crc32c(data: &[u8]) -> u32 {
         crc
     } else {
         let std = crc32c::crc32c(data);
-        std ^ 0xFFFF_FFFF ^ crc32c_shift_bits(0xFFFF_FFFF, (data.len() as u64) * 8)
+        let bit_len = u64::try_from(data.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8);
+        std ^ 0xFFFF_FFFF ^ crc32c_shift_bits(0xFFFF_FFFF, bit_len)
     }
 }
 
@@ -90,8 +91,8 @@ fn gf2_matrix_times(mat: &[u32; 32], vec: u32) -> u32 {
 }
 
 fn gf2_matrix_square(square: &mut [u32; 32], mat: &[u32; 32]) {
-    for n in 0..32 {
-        square[n] = gf2_matrix_times(mat, mat[n]);
+    for (slot, &column) in square.iter_mut().zip(mat) {
+        *slot = gf2_matrix_times(mat, column);
     }
 }
 
@@ -104,8 +105,8 @@ fn shift_operators() -> &'static [[u32; 32]; 40] {
         // ops[0] = operator for one zero bit.
         ops[0][0] = POLY;
         let mut row = 1u32;
-        for n in 1..32 {
-            ops[0][n] = row;
+        for slot in ops[0].iter_mut().skip(1) {
+            *slot = row;
             row <<= 1;
         }
         // ops[k+1] = ops[k]^2 (doubles the number of zero bits).
@@ -158,14 +159,14 @@ fn gf2_matrix_mul(a: &[u32; 32], b: &[u32; 32]) -> [u32; 32] {
 /// `n` — versus [`crc32c_shift_bits`]'s `popcount(8n)` products (1..≈15, avg ~8
 /// for a random offset in a 4 KiB block). ~64 KiB of static tables, built once.
 #[allow(clippy::type_complexity)]
-fn byte_shift_operators() -> &'static ([[u32; 32]; 256], [[u32; 32]; 256]) {
-    static TABLES: OnceLock<([[u32; 32]; 256], [[u32; 32]; 256])> = OnceLock::new();
+fn byte_shift_operators() -> &'static (Box<[[u32; 32]]>, Box<[[u32; 32]]>) {
+    static TABLES: OnceLock<(Box<[[u32; 32]]>, Box<[[u32; 32]]>)> = OnceLock::new();
     TABLES.get_or_init(|| {
         let ops = shift_operators();
         let op8 = ops[3]; // shift by 2^3 = 8 bits = 1 byte
         let op2048 = ops[11]; // shift by 2^11 = 2048 bits = 256 bytes
-        let mut lo = [[0u32; 32]; 256];
-        let mut hi = [[0u32; 32]; 256];
+        let mut lo = vec![[0u32; 32]; 256].into_boxed_slice();
+        let mut hi = vec![[0u32; 32]; 256].into_boxed_slice();
         lo[0] = gf2_identity();
         hi[0] = gf2_identity();
         for j in 1..256 {
@@ -183,13 +184,18 @@ fn byte_shift_operators() -> &'static ([[u32; 32]; 256], [[u32; 32]; 256]) {
 ///
 /// This is a raw running-CRC advance: given the running CRC after some prefix,
 /// it returns the running CRC after that prefix followed by `zero_bytes` zeros,
-/// without touching those bytes. Callers that CRC a block with a large trailing
-/// zero run (a freshly-built directory block: entries then a zero gap) can CRC
-/// only the non-zero prefix and shift over the rest.
+/// without touching those bytes.
+///
+/// Callers that CRC a block with a large trailing zero run (a freshly-built
+/// directory block: entries then a zero gap) can CRC only the non-zero prefix
+/// and shift over the rest.
 #[must_use]
 pub fn crc32c_shift_bytes(crc: u32, zero_bytes: usize) -> u32 {
     if zero_bytes >= 65536 {
-        return crc32c_shift_bits(crc, (zero_bytes as u64) * 8);
+        let zero_bits = u64::try_from(zero_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8);
+        return crc32c_shift_bits(crc, zero_bits);
     }
     let (lo, hi) = byte_shift_operators();
     let c = gf2_matrix_times(&lo[zero_bytes & 0xFF], crc);
@@ -232,12 +238,19 @@ mod tests {
             .collect();
         let suffix = orig.len() - start - new_bytes.len();
         let got = crc32c_update_region(old_crc, &delta, suffix);
-        assert_eq!(got, crc32c::crc32c(&after), "start={start} len={}", new_bytes.len());
+        assert_eq!(
+            got,
+            crc32c::crc32c(&after),
+            "start={start} len={}",
+            new_bytes.len()
+        );
     }
 
     #[test]
     fn incremental_matches_full_recompute_cases() {
-        let base: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(37) & 0xFF) as u8).collect();
+        let base: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(37) & 0xFF) as u8)
+            .collect();
         // single-byte, short-range, and boundary changes at various positions.
         check(&base, 0, &[0xFF]);
         check(&base, 4095, &[0x01]);
@@ -262,7 +275,9 @@ mod tests {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             state
         };
-        let base: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(101) & 0xFF) as u8).collect();
+        let base: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(101) & 0xFF) as u8)
+            .collect();
         for _ in 0..500 {
             // Sizes 1..=300 exercise both the byte-table (<= HW_RAW_CRC_MIN_LEN)
             // and hardware-crc (>) branches, spanning the create path's 256 B gate.
@@ -270,6 +285,19 @@ mod tests {
             let start = (next() as usize) % (base.len() - len);
             let new_bytes: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
             check(&base, start, &new_bytes);
+        }
+    }
+
+    #[test]
+    fn byte_shift_tables_match_bit_shift_at_factor_boundaries() {
+        for crc in [0, 0x1234_5678, u32::MAX] {
+            for zero_bytes in [0_u16, 1, 255, 256, 511, u16::MAX] {
+                assert_eq!(
+                    crc32c_shift_bytes(crc, usize::from(zero_bytes)),
+                    crc32c_shift_bits(crc, u64::from(zero_bytes) * 8),
+                    "crc={crc:#010x}, zero_bytes={zero_bytes}",
+                );
+            }
         }
     }
 }
