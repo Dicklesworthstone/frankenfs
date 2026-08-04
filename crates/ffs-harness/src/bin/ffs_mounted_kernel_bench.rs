@@ -915,11 +915,6 @@ fn validate_config(config: &Config) -> Result<()> {
             || config.filesystems == RequestedFilesystems::Ext4,
         "xattr-get-list-report currently requires --filesystem ext4 because its inline/external storage-shape proof is ext4-specific"
     );
-    ensure!(
-        config.workload != Workload::BulkDurableWrite
-            || config.filesystems == RequestedFilesystems::Ext4,
-        "bulk-durable-write currently requires --filesystem ext4 so the first direct-incumbent row has one bounded filesystem scope"
-    );
     if config.workload == Workload::BulkDurableWrite {
         let payload_bytes = u64::try_from(bulk_durable_total_bytes(config.operations)?)
             .context("bulk durable byte count does not fit u64")?;
@@ -5380,7 +5375,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_durable_workload_requires_ext4_and_bounded_image_capacity() {
+    fn bulk_durable_workload_accepts_each_filesystem_and_bounds_image_capacity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cli = temp.path().join("ffs-cli");
         fs::write(&cli, b"placeholder").expect("write placeholder candidate");
@@ -5399,7 +5394,11 @@ mod tests {
 
         let mut btrfs = base.clone();
         btrfs.filesystems = RequestedFilesystems::Btrfs;
-        assert!(validate_config(&btrfs).is_err());
+        validate_config(&btrfs).expect("bounded btrfs bulk workload");
+
+        let mut both = base.clone();
+        both.filesystems = RequestedFilesystems::Both;
+        validate_config(&both).expect("bounded dual-filesystem bulk workload");
 
         let mut undersized = base;
         undersized.image_size_mib = 128;
