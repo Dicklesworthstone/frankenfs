@@ -1238,7 +1238,13 @@ struct ReadonlyXattrCacheState {
 struct ReadonlyXattrValue {
     ino: InodeNumber,
     name: String,
-    value: Option<Vec<u8>>,
+    value: CachedXattrValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CachedXattrValue {
+    Missing,
+    Present(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -1248,7 +1254,7 @@ struct ReadonlyXattrList {
 }
 
 impl ReadonlyXattrCache {
-    fn value(&self, ino: InodeNumber, name: &str) -> Option<Option<Vec<u8>>> {
+    fn value(&self, ino: InodeNumber, name: &str) -> Option<CachedXattrValue> {
         let guard = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -1265,15 +1271,17 @@ impl ReadonlyXattrCache {
         value
     }
 
-    fn remember_value(&self, ino: InodeNumber, name: &str, value: &Option<Vec<u8>>) {
+    fn remember_value(&self, ino: InodeNumber, name: &str, value: Option<&[u8]>) {
         if ino.0 == 0
-            || name
-                .len()
-                .saturating_add(value.as_ref().map_or(0, Vec::len))
+            || name.len().saturating_add(value.map_or(0, <[u8]>::len))
                 > MAX_READONLY_XATTR_CACHE_VALUE_BYTES
         {
             return;
         }
+
+        let value = value.map_or(CachedXattrValue::Missing, |value| {
+            CachedXattrValue::Present(value.to_vec())
+        });
 
         let mut guard = match self.state.lock() {
             Ok(guard) => guard,
@@ -1287,7 +1295,7 @@ impl ReadonlyXattrCache {
             .iter_mut()
             .find(|entry| entry.ino == ino && entry.name == name)
         {
-            entry.value.clone_from(value);
+            entry.value = value;
             return;
         }
         if guard.values.len() == MAX_READONLY_XATTR_CACHE_ENTRIES {
@@ -1296,7 +1304,7 @@ impl ReadonlyXattrCache {
         guard.values.push(ReadonlyXattrValue {
             ino,
             name: name.to_owned(),
-            value: value.clone(),
+            value,
         });
     }
 
@@ -5601,7 +5609,10 @@ impl FrankenFuse {
         if self.inner.read_only
             && let Some(value) = self.inner.readonly_xattr_cache.value(ino, name)
         {
-            return Ok(value);
+            return Ok(match value {
+                CachedXattrValue::Missing => None,
+                CachedXattrValue::Present(value) => Some(value),
+            });
         }
 
         let value = self.with_request_scope(cx, RequestOp::Getxattr, |cx, _scope| {
@@ -5613,7 +5624,7 @@ impl FrankenFuse {
         if self.inner.read_only {
             self.inner
                 .readonly_xattr_cache
-                .remember_value(ino, name, &value);
+                .remember_value(ino, name, value.as_deref());
         }
         Ok(value)
     }
@@ -7584,12 +7595,18 @@ mod tests {
         let cache = ReadonlyXattrCache::default();
         let ino = InodeNumber(42);
 
-        cache.remember_value(ino, "user.color", &Some(b"blue".to_vec()));
-        cache.remember_value(ino, "user.absent", &None);
+        cache.remember_value(ino, "user.color", Some(b"blue"));
+        cache.remember_value(ino, "user.absent", None);
         cache.remember_list_payload(ino, b"user.color\0user.absent\0");
 
-        assert_eq!(cache.value(ino, "user.color"), Some(Some(b"blue".to_vec())));
-        assert_eq!(cache.value(ino, "user.absent"), Some(None));
+        assert_eq!(
+            cache.value(ino, "user.color"),
+            Some(CachedXattrValue::Present(b"blue".to_vec()))
+        );
+        assert_eq!(
+            cache.value(ino, "user.absent"),
+            Some(CachedXattrValue::Missing)
+        );
         assert_eq!(
             cache.list_payload(ino),
             Some(b"user.color\0user.absent\0".to_vec())
