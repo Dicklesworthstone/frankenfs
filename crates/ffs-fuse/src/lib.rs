@@ -54,6 +54,13 @@ const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
 const COALESCED_FETCH_MULTIPLIER: u32 = 4;
 const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
 const FUSE_MAX_READ_BYTES: u32 = 16 * 1024 * 1024;
+/// Permit the kernel to submit directory lookups and enumeration concurrently.
+///
+/// Linux serializes those operations unless the daemon explicitly advertises
+/// this capability. FrankenFS only does so when its multi-worker dispatcher is
+/// active: `Lookup`, `ReadDir`, and `ReadDirPlus` are read-only request classes
+/// there, while mutations and inode retirement retain the session-wide gate.
+const PARALLEL_DIROPS_CAPABILITY: u64 = fuse_consts::FUSE_PARALLEL_DIROPS;
 /// Ask the kernel to combine directory enumeration with entry attributes.
 ///
 /// `readdirplus` is already implemented below. Negotiating these capabilities
@@ -1262,6 +1269,8 @@ struct FuseInner {
     ops: Arc<dyn FsOps>,
     metrics: Arc<AtomicMetrics>,
     thread_count: usize,
+    worker_dispatch: bool,
+    parallel_dirops: bool,
     read_only: bool,
     mountpoint: Option<PathBuf>,
     kernel_notifier: Mutex<Option<fuser::Notifier>>,
@@ -1277,6 +1286,8 @@ impl std::fmt::Debug for FuseInner {
         f.debug_struct("FuseInner")
             .field("metrics", &self.metrics)
             .field("thread_count", &self.thread_count)
+            .field("worker_dispatch", &self.worker_dispatch)
+            .field("parallel_dirops", &self.parallel_dirops)
             .field("read_only", &self.read_only)
             .field("mountpoint", &self.mountpoint)
             .finish_non_exhaustive()
@@ -1992,6 +2003,8 @@ impl FrankenFuse {
                 ops: Arc::from(ops),
                 metrics: Arc::new(AtomicMetrics::new()),
                 thread_count,
+                worker_dispatch: options.worker_threads > 0,
+                parallel_dirops: options.worker_threads > 1,
                 read_only: options.read_only,
                 mountpoint: mountpoint.map(Path::to_path_buf),
                 kernel_notifier: Mutex::new(None),
@@ -5409,6 +5422,23 @@ fn check_access_permission(
 
 impl Filesystem for FrankenFuse {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
+        if self.inner.worker_dispatch {
+            let max_background = u16::try_from(self.inner.thread_count).unwrap_or(u16::MAX);
+            let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+            if let Err(nearest) = config.set_max_background(max_background) {
+                debug!(
+                    max_background,
+                    nearest, "kernel declined the FUSE worker request-queue depth"
+                );
+            }
+            if let Err(nearest) = config.set_congestion_threshold(congestion_threshold) {
+                debug!(
+                    congestion_threshold,
+                    nearest, "kernel declined the FUSE worker congestion threshold"
+                );
+            }
+        }
+
         let splice_caps = fuse_consts::FUSE_SPLICE_READ
             | fuse_consts::FUSE_SPLICE_WRITE
             | fuse_consts::FUSE_SPLICE_MOVE;
@@ -5426,6 +5456,16 @@ impl Filesystem for FrankenFuse {
                 missing,
                 "kernel declined one or more FUSE readdirplus capabilities"
             ),
+        }
+
+        if self.inner.parallel_dirops {
+            match config.add_capabilities(PARALLEL_DIROPS_CAPABILITY) {
+                Ok(()) => debug!("FUSE parallel directory operations enabled"),
+                Err(missing) => debug!(
+                    missing,
+                    "kernel declined the FUSE parallel directory operations capability"
+                ),
+            }
         }
 
         match config.set_max_stack_depth(1) {
@@ -6721,16 +6761,6 @@ fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
     if options.writeback_cache.is_enabled() {
         opts.push(MountOption::CUSTOM("writeback_cache".to_owned()));
     }
-    if options.worker_threads > 0 {
-        let max_background = options.resolved_thread_count();
-        let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
-        opts.push(MountOption::CUSTOM(format!(
-            "max_background={max_background}"
-        )));
-        opts.push(MountOption::CUSTOM(format!(
-            "congestion_threshold={congestion_threshold}"
-        )));
-    }
 
     opts
 }
@@ -7097,6 +7127,54 @@ mod tests {
             READDIRPLUS_CAPABILITIES & fuse_consts::FUSE_SPLICE_READ,
             0,
             "directory metadata negotiation must not change the read-data transport"
+        );
+    }
+
+    #[test]
+    fn parallel_dirops_is_advertised_only_for_multi_worker_dispatch() {
+        let one_worker_options = MountOptions {
+            worker_threads: 1,
+            ..MountOptions::default()
+        };
+        let parallel_options = MountOptions {
+            worker_threads: 2,
+            ..MountOptions::default()
+        };
+
+        assert!(
+            !FrankenFuse::with_options(Box::new(MinimalTestFs), &MountOptions::default())
+                .inner
+                .parallel_dirops
+        );
+        assert!(
+            !FrankenFuse::with_options(Box::new(MinimalTestFs), &MountOptions::default())
+                .inner
+                .worker_dispatch
+        );
+        assert!(
+            FrankenFuse::with_options(Box::new(MinimalTestFs), &one_worker_options)
+                .inner
+                .worker_dispatch
+        );
+        assert!(
+            !FrankenFuse::with_options(Box::new(MinimalTestFs), &one_worker_options)
+                .inner
+                .parallel_dirops
+        );
+        assert!(
+            FrankenFuse::with_options(Box::new(MinimalTestFs), &parallel_options)
+                .inner
+                .parallel_dirops
+        );
+        assert_eq!(
+            PARALLEL_DIROPS_CAPABILITY,
+            fuse_consts::FUSE_PARALLEL_DIROPS
+        );
+        assert_eq!(
+            PARALLEL_DIROPS_CAPABILITY
+                & (fuse_consts::FUSE_SPLICE_READ | fuse_consts::FUSE_DO_READDIRPLUS),
+            0,
+            "parallel directory dispatch must not alter data-copy or readdirplus negotiation"
         );
     }
 
@@ -17355,6 +17433,8 @@ mod tests {
             ops: Arc::new(MinimalTestFs),
             metrics: Arc::new(AtomicMetrics::new()),
             thread_count: 4,
+            worker_dispatch: true,
+            parallel_dirops: true,
             read_only: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
@@ -17726,7 +17806,7 @@ mod tests {
     }
 
     #[test]
-    fn build_mount_options_includes_queue_tuning_when_worker_threads_explicit() {
+    fn build_mount_options_moves_worker_queue_tuning_to_the_init_handshake() {
         let opts = MountOptions {
             read_only: true,
             allow_other: false,
@@ -17736,16 +17816,11 @@ mod tests {
             worker_threads: 8,
         };
         let mount_opts = build_mount_options(&opts);
-        assert!(
-            mount_opts
-                .iter()
-                .any(|o| matches!(o, MountOption::CUSTOM(v) if v == "max_background=8"))
-        );
-        assert!(
-            mount_opts
-                .iter()
-                .any(|o| matches!(o, MountOption::CUSTOM(v) if v == "congestion_threshold=6"))
-        );
+        assert!(mount_opts.iter().all(|option| {
+            !matches!(option, MountOption::CUSTOM(value)
+                if value.starts_with("max_background=")
+                    || value.starts_with("congestion_threshold="))
+        }));
     }
 
     #[test]
@@ -18423,9 +18498,7 @@ Subtype("ffs")
 DefaultPermissions
 NoAtime
 CUSTOM("max_read=16777216")
-AllowOther
-CUSTOM("max_background=4")
-CUSTOM("congestion_threshold=3")"#;
+AllowOther"#;
 
     fn mount_option_debug_lines(options: &[MountOption]) -> String {
         options
@@ -18705,6 +18778,8 @@ CUSTOM("congestion_threshold=3")"#;
             "metrics: AtomicMetrics { requests_total: 0, requests_ok: 0, requests_err: 0, ",
             "bytes_read: 0, requests_throttled: 0, requests_shed: 0 }, ",
             "thread_count: 2, ",
+            "worker_dispatch: true, ",
+            "parallel_dirops: true, ",
             "read_only: false, ",
             "mountpoint: None, ",
             ".. }"
@@ -18714,6 +18789,8 @@ CUSTOM("congestion_threshold=3")"#;
             ops: Arc::new(MinimalTestFs),
             metrics: Arc::new(AtomicMetrics::new()),
             thread_count: 2,
+            worker_dispatch: true,
+            parallel_dirops: true,
             read_only: false,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
