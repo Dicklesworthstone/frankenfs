@@ -27,7 +27,7 @@ use fuser::{
     TimeOrNow, consts as fuse_consts, fuse_forget_one,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::raw::c_int;
@@ -75,6 +75,10 @@ const BACKPRESSURE_SLEEP_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 const MOUNT_HANDLE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const XATTR_FLAG_CREATE: i32 = 0x1;
 const XATTR_FLAG_REPLACE: i32 = 0x2;
+/// Linux asks for this security xattr on metadata access and does not cache an
+/// absent result. Read-only FrankenFS images are immutable, so the daemon can
+/// safely memoize that negative answer and avoid repeating the format lookup.
+const SECURITY_CAPABILITY_XATTR: &str = "security.capability";
 const FS_IOC_FIEMAP: u32 = 0xC020_660B;
 const FIEMAP_HEADER_SIZE: usize = 32;
 const FIEMAP_EXTENT_SIZE: usize = 56;
@@ -1211,6 +1215,41 @@ impl ReadaheadManager {
     }
 }
 
+/// Per-mount cache of immutable inodes known to lack `security.capability`.
+///
+/// The kernel still sends each FUSE `GETXATTR` request, but read-only images
+/// cannot gain a capability xattr while mounted. Remembering only absence
+/// therefore skips redundant on-disk xattr parsing without making a positive
+/// capability value stale.
+#[derive(Default)]
+struct MissingCapabilityXattrs {
+    inodes: Mutex<HashSet<u64>>,
+}
+
+impl MissingCapabilityXattrs {
+    fn contains(&self, ino: InodeNumber) -> bool {
+        match self.inodes.lock() {
+            Ok(inodes) => inodes.contains(&ino.0),
+            Err(poisoned) => {
+                warn!("missing capability-xattr cache lock poisoned in contains, recovering");
+                poisoned.into_inner().contains(&ino.0)
+            }
+        }
+    }
+
+    fn remember(&self, ino: InodeNumber) {
+        match self.inodes.lock() {
+            Ok(mut inodes) => {
+                inodes.insert(ino.0);
+            }
+            Err(poisoned) => {
+                warn!("missing capability-xattr cache lock poisoned in remember, recovering");
+                poisoned.into_inner().insert(ino.0);
+            }
+        }
+    }
+}
+
 // ── Shared FUSE inner state ─────────────────────────────────────────────────
 
 /// Thread-safe shared state for the FUSE backend.
@@ -1230,6 +1269,7 @@ impl ReadaheadManager {
 /// | `kernel_notifier`  | `Mutex<Option<Notifier>>`           | leaf |
 /// | `access_predictor` | `AccessPredictor.state: Mutex`      | leaf |
 /// | `readahead`        | `ReadaheadManager.pending: Mutex`   | leaf |
+/// | `missing_capability_xattrs` | `MissingCapabilityXattrs.inodes: Mutex` | leaf |
 /// | `inode_locks`      | `FuseInodeLocks.table: Mutex`       | 0 (see bd-pfv55 doc on FuseInodeLocks for the per-inode `held` rank-1 sublock) |
 ///
 /// Production callers comply by **never nesting two subsystem
@@ -1247,6 +1287,7 @@ impl ReadaheadManager {
 /// | `AccessPredictor::invalidate_inode` | access_predictor | leaf-only                        |
 /// | `ReadaheadManager::insert/take` | readahead          | leaf-only                        |
 /// | `ReadaheadManager::invalidate_inode` | readahead       | leaf-only                        |
+/// | `MissingCapabilityXattrs::{contains,remember}` | missing_capability_xattrs | leaf-only |
 /// | `FuseInodeLocks::acquire`       | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeLocks::try_acquire`   | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeGuard::Drop`          | inode_locks        | rank 0 → rank 1 (nested)         |
@@ -1278,6 +1319,7 @@ struct FuseInner {
     backpressure: Option<Arc<BackpressureGate>>,
     access_predictor: AccessPredictor,
     readahead: ReadaheadManager,
+    missing_capability_xattrs: MissingCapabilityXattrs,
     inode_locks: Arc<FuseInodeLocks>,
 }
 
@@ -2012,6 +2054,7 @@ impl FrankenFuse {
                 backpressure,
                 access_predictor: AccessPredictor::default(),
                 readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+                missing_capability_xattrs: MissingCapabilityXattrs::default(),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
             }),
         }
@@ -5420,6 +5463,28 @@ fn check_access_permission(
     allowed
 }
 
+impl FrankenFuse {
+    fn getxattr_value(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<Option<Vec<u8>>> {
+        let is_capability_probe = self.inner.read_only && name == SECURITY_CAPABILITY_XATTR;
+        if is_capability_probe && self.inner.missing_capability_xattrs.contains(ino) {
+            return Ok(None);
+        }
+
+        let value = self.with_request_scope(cx, RequestOp::Getxattr, |cx, _scope| {
+            self.inner.ops.getxattr(cx, ino, name)
+        })?;
+        if is_capability_probe && value.is_none() {
+            self.inner.missing_capability_xattrs.remember(ino);
+        }
+        Ok(value)
+    }
+}
+
 impl Filesystem for FrankenFuse {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
         if self.inner.worker_dispatch {
@@ -5892,9 +5957,7 @@ impl Filesystem for FrankenFuse {
             return;
         };
         let cx = Self::cx_for_request();
-        match self.with_request_scope(&cx, RequestOp::Getxattr, |cx, _scope| {
-            self.inner.ops.getxattr(cx, InodeNumber(ino), name)
-        }) {
+        match self.getxattr_value(&cx, InodeNumber(ino), name) {
             Ok(Some(value)) => Self::reply_xattr_payload(size, &value, reply),
             Ok(None) => reply.error(Self::missing_xattr_errno()),
             Err(e) => {
@@ -7225,6 +7288,132 @@ mod tests {
         ) -> ffs_error::Result<Vec<u8>> {
             Ok(vec![])
         }
+    }
+
+    struct CountingMissingXattrFs {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FsOps for CountingMissingXattrFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn getxattr(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _name: &str,
+        ) -> ffs_error::Result<Option<Vec<u8>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn readonly_missing_capability_xattr_is_cached_without_aliasing_other_queries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fuse = FrankenFuse::with_options(
+            Box::new(CountingMissingXattrFs {
+                calls: Arc::clone(&calls),
+            }),
+            &MountOptions::default(),
+        );
+        let cx = FrankenFuse::cx_for_request();
+        let ino = InodeNumber(42);
+
+        assert!(
+            fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        assert!(
+            fuse.getxattr_value(&cx, ino, "user.mime")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fuse.getxattr_value(&cx, InodeNumber(43), SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        let rw_calls = Arc::new(AtomicUsize::new(0));
+        let rw_fuse = FrankenFuse::with_options(
+            Box::new(CountingMissingXattrFs {
+                calls: Arc::clone(&rw_calls),
+            }),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        assert!(
+            rw_fuse
+                .getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            rw_fuse
+                .getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(rw_calls.load(Ordering::Relaxed), 2);
     }
 
     fn existing_file_mountpoint() -> PathBuf {
@@ -17442,6 +17631,7 @@ mod tests {
             backpressure: None,
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+            missing_capability_xattrs: MissingCapabilityXattrs::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
@@ -18798,6 +18988,7 @@ AllowOther"#;
             backpressure: None,
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(8),
+            missing_capability_xattrs: MissingCapabilityXattrs::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
         let dbg = format!("{inner:?}");
