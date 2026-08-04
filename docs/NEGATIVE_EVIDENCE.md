@@ -6801,3 +6801,56 @@ round trips per path op, so the shared component of those losses is this probe, 
 FUSE dispatch floor. Re-derive the "shared floor" claim only from a run whose `requests_total` was
 produced by a build containing this fix — every request count banked before it under-reports memoized
 requests, on read-only mounts, by roughly the number of path-based metadata operations performed.
+### 2026-08-04 (LilacRaven) — bd-ha71t REJECT: `FUSE_HANDLE_KILLPRIV` does NOT suppress the per-path-op `security.capability` probe; counted mechanism, probe count unchanged 2001 -> 2001
+
+Follow-up to the mechanism row above, which established that Linux issues one uncached
+`getxattr(security.capability)` per path-based metadata operation and that this — not a generic
+per-request FUSE dispatch cost — is what the ~4.9x warm-stat row is made of.
+
+**Name confirmed, not inferred.** The previous row attributed the op by a `read_only`-gating
+argument. With the `trace!` lines from `bdd0fd1b` the name is now read directly off the running
+daemon: `getxattr answered from capability memo ino=13 name="security.capability"`, **20 hits for 20
+path stats**, and the root directory (`ino=1`) is probed too, so it is not file-specific. Exactly one
+probe per path-based metadata op, on files and directories alike.
+
+**Lever tested and REJECTED.** The one daemon-side mechanism that could plausibly stop the kernel
+asking is `FUSE_HANDLE_KILLPRIV` (vendored fuser `fuse_abi.rs:227`, "fs handles killing suid/sgid/cap
+on write/chown/trunc"), advertised at INIT. It is truthful to advertise on a **read-only** mount,
+where there is no write/chown/truncate to strip privileges from, so this was scoped to `read_only`
+and gated behind `FFS_HA71T_KILLPRIV` so both arms run from ONE ELF.
+
+| arm (same ELF, same image, 2001 path stats) | capability probes served | killpriv negotiated |
+|---|---|---|
+| flag off | **2001** | no |
+| flag on  | **2001** | yes (`FUSE handle-killpriv capability enabled`, no decline logged) |
+
+**Decision is on the counted mechanism — the probe count — not on time.** The counting instrument is
+the daemon's own `trace!` line, emitted once per served capability probe, and each served probe is one
+request/reply pair on the daemon's `/dev/fuse` channel: the syscall count on that channel is
+**unchanged, 2001 syscalls vs 2001**, flag off vs flag on. The kernel accepted the
+capability (the `Err(missing)` decline arm never fired) and kept sending exactly one probe per stat.
+Wall time is deliberately NOT the basis here and no ratio is banked: both arms ran with
+`RUST_LOG=ffs_fuse=trace`, which dominates a debug-build stat (36 903 ns/op off vs 32 727 ns/op on),
+so that difference is logging and host noise, not an effect.
+
+**Why the other obvious route is also closed, by kernel contract rather than by experiment.**
+Replying `ENOSYS` to getxattr makes the kernel set `fc->no_getxattr` and stop asking — but that flag
+is **per-connection and set by ANY `ENOSYS` reply regardless of the attribute name**, so it cannot be
+scoped to `security.capability`; using it would disable getxattr for the whole mount and take the
+xattr get/list report workload (`bd-ext4-xattr-row-unscored-a21dz`) with it. There is no per-name
+suppression available on this ABI.
+
+**What this means for the metadata rows.** On this host/kernel (`6.17.0-41-generic`, FUSE ABI 7.40
+via vendored fuser 0.17.0) the probe looks kernel-mandated and not suppressible from the daemon side.
+That makes the shared metadata component a genuine floor after all — but for a *specific, identified*
+reason (one kernel-driven capability probe per path op) rather than the bead's original "per-request
+FUSE dispatch floor". The remaining lever class is therefore **making that one round trip cheaper**
+(transport: worker dispatch, queue depth, splice), NOT eliminating it. Note the memo already makes
+the daemon-side answer nearly free, so the residue is pure FUSE transport.
+
+**Retry predicate.** Re-open if any of these becomes true: (a) a newer kernel caches a negative
+`security.capability` result for FUSE inodes, or exposes a per-name/`no-xattr-class` INIT flag;
+(b) the FUSE ABI gains a capability that lets a daemon declare "this inode has no security.* xattrs"
+so the kernel can cache it; (c) someone identifies the exact kernel call site issuing the probe on a
+cached-dentry `stat` and it turns out to be conditional on something we control. Do NOT re-test
+`FUSE_HANDLE_KILLPRIV` on this kernel — it is measured inert here.
