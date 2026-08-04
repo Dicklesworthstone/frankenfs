@@ -144,10 +144,13 @@ for every group at mount, so the bump cursor was only ever a hint.
 
 Pinned by `reconciled_block_group_accounting_makes_a_preexisting_extent_freeable_bd_ftev0`
 (`ffs-btrfs`), which builds the exact mount-time state and proves the same `free_extent`
-call succeeds once reconciled. That test is cited above as if it already existed; it did
-not, and `32dd093f` supplies it, including the negative case — unreconciled, the free must
-still fail closed with `BrokenInvariant`. The underflow guard is not weakened; it stops
-being reachable from a correctly mounted filesystem.
+call succeeds once reconciled. That test was written when this section was, then deleted
+by `3b48b7b6`, which rolled `crates/ffs-btrfs/src/lib.rs` back by 6066 lines; it is
+restored along with the rest of that file, and carries an added negative case —
+unreconciled, the free must still fail closed with `BrokenInvariant`, so an
+implementation that softened the guard instead of correcting the tally fails here. The
+underflow guard is not weakened; it stops being reachable from a correctly mounted
+filesystem.
 
 A second test lands with it: `btrfs_positioned_write_over_mkfs_populated_file_conforms`
 (`ffs-harness` conformance) reproduces the failing workload end to end — an image

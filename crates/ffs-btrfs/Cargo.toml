@@ -54,6 +54,11 @@ harness = false
 [[bench]]
 name = "csum_lookup"
 harness = false
+# Calls `bench_locate_extent_key` and
+# `bench_delete_backrefs_for_extent_borrowed_candidate`, both of which are
+# `#[cfg(feature = "bench-instrumentation")]`. Without this the target is built
+# by a bare `--all-targets` and fails on two missing methods.
+required-features = ["bench-instrumentation"]
 
 [[bench]]
 name = "floor_node_scan"
