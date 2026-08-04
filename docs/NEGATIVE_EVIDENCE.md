@@ -6737,3 +6737,67 @@ FRESH-OP SWEEP this turn (no clean lever found; recorded so they aren't re-swept
 **ext4 indirect (ext2/3-compat) block path swept (no lever):** the "sequential read re-reads the same indirect block" re-read lever is ALREADY landed — the hot indirect read plan passes (`read_ext4_indirect`/`_into`/`_segments_into`, e2compr cluster read) all use the memoized `resolve_indirect_block_memo` (holds the parsed indirect block across the pass; lib.rs:14185-14262/14673-14708/6079). The remaining non-memo `resolve_indirect_block` callers are one-shot single-block resolves (`resolve_extent` public API :12016, write-path allocation/overwrite :21649/:21871/:21949/:22986) where memoization gives nothing. Indirect metadata reads also hit the device block cache. Confirmed optimal — don't re-hunt indirect re-reads. **HOLD** on remote-only for this surface: this session landed 3 wins (cddbef1b + 1a345dfd + 96e07bb1) and mapped the rest to floor; genuine forward progress now requires the bd-bhh0i LOCAL cutover (greenlit prior session, fad8e7d7) or a caller-specified fresh workload/profile.
 
 **scrub/verify path swept (no lever):** the ext4 integrity/scrub path verifies per-block via the checksum axis, which is CLOSED (a5a97e12: `verify_inode_checksum` segmented 3-pass holds `&[u8]`, `compute_and_set_checksum` zero-in-place no-copy, jbd2 data/tail segmented); scrub throughput is I/O-bound (reads every block from the device), so the per-block CPU (segmented crc32c, HW) is a small fraction at floor. ffs-repair `symbol.rs` CRC is 24-byte erasure-header work, not a hot fs path. No CPU lever. **bd-bhh0i is now the SOLE remaining high-value lever and it is BLOCKED on one owner action**: `dcg allow system.disk:mkfs` (allowlist still empty as of this turn) — the agent cannot self-allowlist (the allow command contains the guarded token "mkfs"). Once run, the agent runs the full local gate (build flag-on/off ffs-cli remotely → mkfs scratch img → create-bench {1,2,4,8,16} → e2fsck -fn). Remote-only turns until then are HOLD/bounds, not fresh levers. (Crate-level sweep completed: `ffs-ext4` is a low-level group-descriptor/superblock codec — structs + tests, no hot per-op loop; bitmap free-count lives in ffs-alloc, peer, already range-optimized. Non-peer crates all mapped to floor.)
+### 2026-08-04 (LilacRaven) — MECHANISM FOUND for the ~4.9x warm-stat row (bd-warm-stat-is-the-fuse-floor-4wxw9): it is NOT a per-request FUSE floor, it is ONE uncached `getxattr` round trip per path-based metadata op — and the request counter was hiding it
+
+The warm-stat bead's premise ("what warm stat isolates is per-request FUSE round-trip plus inode
+lookup ... two filesystems losing by the same factor says the cost is in the shared path") is
+**correct that the cost is shared, and wrong that it is a floor.** Measured locally on a
+FrankenFS-mounted 256 MiB ext4 image (debug `ffs-cli`, so absolute ns are inflated ~2x vs the banked
+release-perf+PGO numbers; every claim below is a WITHIN-RUN contrast, and the instrument was
+controlled against kernel-backed paths in the same window):
+
+| probe (2000 ops each, same mount, same window) | ns/op | daemon CPU delta |
+|---|---|---|
+| `fstat(fd)` — attr only, no path walk | **1 337** | **0 ms** |
+| `fstat(rootdir fd)` — dir attr, no path walk | **1 287** | **0 ms** |
+| `stat(path)` — path walk + attr | 18 318 | 20 ms |
+| `access(path, F_OK)` | 16 774 | 20 ms |
+| `fstatat(rootfd, "payload.bin")` | 17 177 | 30 ms |
+| `stat(path)` of a NONEXISTENT child | 24 782 | 40 ms |
+| kernel-backed control `stat()` on tmpfs / ext4 | 2 407 / 2 568 | n/a |
+
+Readings. (1) **Attr caching already works and BEATS kernel ext4**: `fstat` is 1.34 us vs the kernel
+control's 2.57 us, with provably zero userspace dispatch (daemon CPU delta 0 ms, idle control also
+0 ms over the same duration). The 60 s `ATTR_TTL` is honored; `readdirplus` and `default_permissions`
+are already negotiated (`/proc/mounts` confirms `default_permissions` on the live mount). None of the
+usual FUSE metadata levers are the gap. (2) **Every NAME-resolving op costs ~17-19 us and provably
+dispatches** — the daemon burns 20 ms of CPU per 2 000 path stats and 0 ms when idle for the same
+wall duration, so the requests are real, not scheduler noise. (3) A nonexistent child costs 2
+dispatches, a resolved one costs 1.
+
+Which op? `total_requests` said **22** for 6 001 path stats, which is what made this invisible.
+`getxattr_value` (ffs-fuse/src/lib.rs) returned from the `security.capability` memo and from the
+read-only xattr value cache **before** `with_request_scope`, and `listxattr` did the same for its
+cached list payload — so a memoized answer was a full FUSE round trip that incremented no counter.
+Proof by an existing switch rather than by instrumentation: both memos are gated on
+`self.inner.read_only`, so a **read-write mount of the same image counted 2 005 requests for 2 000
+path stats** (vs 22 for 6 000 on the read-only mount). That is one counted `getxattr` per path stat,
+i.e. Linux issues an **uncached `security.capability` probe per path-based metadata operation**, and
+the userspace memo made the *answer* cheap while leaving the *round trip* — which is the whole
+~16 us.
+
+**INSTRUMENT-ONLY CHANGE — this row banks an instrument, not a ratio, and records no perf verdict**
+(no timing decision is made here, so there is deliberately no median CI; the numbers above are a
+counted mechanism — served-request counts and daemon CPU deltas — not a competitive claim).
+Provenance of the runs above: the FUSE daemon self-reported its executing ELF from inside the
+process via `FFS_MOUNT_BENCH_EVIDENCE=1` as
+`mount_bench_evidence,binary_sha256=1369c3fefc3df0eb008acba25c7fd2c222563332de17b38c14eb6db8353f3bca`
+with `mount_build_profile,pgo_profile_sha256=none` — a debug build, which is exactly why no ratio is
+banked from it. The code change: memo/cache hits now call a new
+`AtomicMetrics::record_memoized()` so a served request appears in `requests_total`, plus `trace!`
+lines naming the xattr on each memo path. The memo still spares the format layer — that is what it is
+for — it just no longer hides its own requests. Pinned by
+`memoized_xattr_answers_are_still_counted_as_served_requests` (5 probes -> 1 format-layer call but 5
+counted requests; a naive early-return-before-counting implementation reports 2 and fails).
+
+**NO PERF LEVER CLAIMED OR MEASURED HERE.** The obvious fix — answer `ENOSYS` so the kernel sets
+`fc->no_getxattr` and stops asking — is connection-wide and would disable xattrs outright, which the
+xattr get/list workload row forbids; a narrower mechanism has to be found and measured under the
+mounted comparator with the kernel arm live in the same invocation. Filed as its own bead.
+
+**Retry predicate / what this changes for other rows.** Any banked metadata ratio whose workload
+resolves paths (warm stat, readdir+stat, create/delete storm, parallel metadata) carries one of these
+round trips per path op, so the shared component of those losses is this probe, NOT an irreducible
+FUSE dispatch floor. Re-derive the "shared floor" claim only from a run whose `requests_total` was
+produced by a build containing this fix — every request count banked before it under-reports memoized
+requests, on read-only mounts, by roughly the number of path-based metadata operations performed.

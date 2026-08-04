@@ -884,6 +884,19 @@ impl AtomicMetrics {
         Self::saturating_add(&self.requests_err.0, 1);
     }
 
+    /// Record a request answered entirely from a daemon-side memo.
+    ///
+    /// The kernel still paid for a full FUSE round trip, so the request must
+    /// appear in `requests_total`. Counting only the requests that reach the
+    /// format layer made the mounted comparator's request count unusable as
+    /// evidence: a read-only mount reported 22 requests while actually serving
+    /// one memoized `security.capability` probe per path-based `stat`
+    /// (bd-warm-stat-is-the-fuse-floor-4wxw9).
+    fn record_memoized(&self) {
+        Self::saturating_add(&self.requests_total.0, 1);
+        Self::saturating_add(&self.requests_ok.0, 1);
+    }
+
     fn record_bytes_read(&self, n: u64) {
         Self::saturating_add(&self.bytes_read.0, n);
     }
@@ -5603,12 +5616,16 @@ impl FrankenFuse {
     ) -> ffs_error::Result<Option<Vec<u8>>> {
         let is_capability_probe = self.inner.read_only && name == SECURITY_CAPABILITY_XATTR;
         if is_capability_probe && self.inner.missing_capability_xattr.contains(ino) {
+            self.inner.metrics.record_memoized();
+            trace!(ino = ino.0, name, "getxattr answered from capability memo");
             return Ok(None);
         }
 
         if self.inner.read_only
             && let Some(value) = self.inner.readonly_xattr_cache.value(ino, name)
         {
+            self.inner.metrics.record_memoized();
+            trace!(ino = ino.0, name, "getxattr answered from read-only cache");
             return Ok(match value {
                 CachedXattrValue::Missing => None,
                 CachedXattrValue::Present(value) => Some(value),
@@ -6223,6 +6240,8 @@ impl Filesystem for FrankenFuse {
         if self.inner.read_only
             && let Some(payload) = self.inner.readonly_xattr_cache.list_payload(ino)
         {
+            self.inner.metrics.record_memoized();
+            trace!(ino = ino.0, "listxattr answered from read-only cache");
             Self::reply_xattr_payload(size, &payload, reply);
             return;
         }
@@ -7588,6 +7607,55 @@ mod tests {
                 .is_none()
         );
         assert_eq!(rw_calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// A memoized xattr answer is still a FUSE request the kernel round-tripped
+    /// for, so it must be counted (bd-warm-stat-is-the-fuse-floor-4wxw9).
+    ///
+    /// Linux issues one uncached `security.capability` probe per path-based
+    /// metadata operation. Because the read-only memo used to return before
+    /// `with_request_scope`, a mount serving 6,000 of them reported 22 total
+    /// requests, which made the mounted comparator's request count useless as
+    /// evidence for the warm-stat row. The format layer must still be spared
+    /// (that is what the memo is for), so this pins both halves: the memo
+    /// suppresses format-layer work but not the request count.
+    #[test]
+    fn memoized_xattr_answers_are_still_counted_as_served_requests() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fuse = FrankenFuse::with_options(
+            Box::new(CountingMissingXattrFs {
+                calls: Arc::clone(&calls),
+            }),
+            &MountOptions::default(),
+        );
+        let cx = FrankenFuse::cx_for_request();
+        let ino = InodeNumber(42);
+
+        for _ in 0..5 {
+            assert!(
+                fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // The memo still spares the format layer: one lookup, five requests.
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let snapshot = fuse.inner.metrics.snapshot();
+        assert_eq!(
+            snapshot.requests_total, 5,
+            "every memoized capability probe must appear in requests_total"
+        );
+        assert_eq!(snapshot.requests_ok, 5);
+        assert_eq!(snapshot.requests_err, 0);
+
+        // The generic read-only value cache must account the same way.
+        for _ in 0..3 {
+            assert!(fuse.getxattr_value(&cx, ino, "user.mime").unwrap().is_none());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let snapshot = fuse.inner.metrics.snapshot();
+        assert_eq!(snapshot.requests_total, 8);
+        assert_eq!(snapshot.requests_ok, 8);
     }
 
     #[test]
