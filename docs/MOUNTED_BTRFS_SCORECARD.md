@@ -13,8 +13,8 @@ measurement in one invocation against four independent live mounts (`kernel_a`,
 `kernel_b`, `fuse_a`, `fuse_b`) under a four-round Latin-square physical-arm crossover,
 carrying two same-invocation A/A null controls.
 
-**Score: 1 win / 4 losses / 0 neutral / 1 workload unscored** (its blocking defect is
-fixed and closed as of 2026-08-04; the run that would score it has not happened yet).
+**Score: 1 win / 5 losses / 0 neutral / 0 unscored.** The sixth workload was scored on
+2026-08-04 after the defect blocking it was fixed; the btrfs suite is now complete.
 
 ## The rows
 
@@ -25,7 +25,7 @@ fixed and closed as of 2026-08-04; the run that would score it has not happened 
 | **Small-file create/delete storm**, 2,000 files | **`2.358280x` `[2.322435, 2.430125]` slower** (margin `1.045128x`) | `0.996139x`, spread `1.018112x` | `0.992157x`, spread `1.022315x` | 1 → **1** | **LOSE** |
 | **Parallel metadata writes**, 512 creates, 8 threads, **128 blocks** | **`1.930090x` `[1.916623, 1.940038]` slower** (margin `1.019214x`) | `1.002214x`, spread `1.009562x` | `0.997250x`, spread `1.009114x` | 8 → **8** | **LOSE** |
 | **Multi-file parallel read**, 256 × 256 KiB, 8 threads | **`0.894290x` `[0.885022, 0.903489]` FASTER**; replicate **`0.830537x` `[0.823606, 0.835141]`** | `1.004459x` / `1.001984x` | `1.001891x` / `1.000228x` | 8 → **8** | **WIN — see caveat** |
-| **Fsync/journal commit**, 8 × 4 KiB | not yet measured | — | — | — | **UNSCORED — defect fixed (`bd-ftev0`), run pending `bd-score-btrfs-fsync-row-d98vj`** |
+| **Fsync/journal commit**, 8 × 4 KiB | **`1.976308x` `[1.969150, 1.977948]` slower** (margin `1.021437x`) | `0.999326x` | `1.000634x` | 1 → **1** | **LOSE** |
 
 Every admitted row: pinning attested with the observed CPU set equal to the bound set,
 exact four-arm parity, clean post-unmount `btrfs check --readonly`, incumbent isolation
@@ -43,9 +43,10 @@ exact four-arm parity, clean post-unmount `btrfs check --readonly`, incumbent is
   creating 512 files and fsyncing their directories.
 - **Parallel read: we are faster** — 10.6% and 16.9% faster across two runs — but I am
   not banking this as a campaign win yet, for the reason below.
-- **Fsync/journal commit: no number yet.** It could not run at all until 2026-08-04; the
-  defect is fixed and verified, but a fixed defect is not a result — the row is unscored
-  until a four-arm run produces one.
+- **Fsync/journal commit: we lose.** About 1.98 times slower — 101.5 ms per batch for the
+  kernel against 200.5 ms for us. This workload could not execute at all until
+  2026-08-04; it is the newest row and the only one taken with every CPU on the
+  `performance` governor.
 
 ## The win needs a mechanism before it counts
 
@@ -95,7 +96,7 @@ of this one. Until it runs:
 > reads, mechanism unresolved, and the measured FrankenFS arms did not verify data
 > checksums — the capability exists but is off by default."* Do not quote it as a bare win.
 
-## Was blocked: FrankenFS could not do positioned writes on btrfs (fixed 2026-08-04)
+## The row that could not run, and what it took to score it (2026-08-04)
 
 `fsync-journal-commit` failed **6/6 attempts**, deterministically, and not on a
 contention or null gate:
@@ -182,6 +183,32 @@ reconcile from, so its existing tally legitimately stands while every real image
 correct accounting. The guard is the more correct semantic, not a way around the
 expectation.
 
+### Scored, and it is a loss
+
+```
+fuse_over_kernel  median 1.9763082977790924  ci [1.9691498616922856, 1.9779483530792440]
+                  twice_null_margin_ratio 1.0214374  directional_claim_clear true
+kernel A/A 0.9993258   fuse A/A 1.0006339    (both medians within limit, both CIs contain 1.0)
+admitted true   verdict honest_loss   parity pass   post_unmount_validation clean
+pairs 32   crossover_blocks 8   threads requested 1 -> observed 1   pinning attested
+kernel median batch 101.5 ms   FrankenFS median batch 200.5 ms
+```
+
+Provenance: candidate ELF `9e32e28f766368dd738c7d43e2d4f820a426394b0d1e72b6e565be622835408a`
+(x86-64-v3, PGO profile `5c6530a0261f658ed0ace2a9d8bef7c6c63b6f94b4b955e4f7ccba038e011e96`),
+driver ELF `8c1c4d35fd0a348e5e612d904f086567a4bd9f03a800127ff1ebedb6a2f2633f`, both
+self-hashed in process and cross-checked against `/proc/self/exe`. Host `thinkstation1`,
+`--placement-scope same-llc` like every other row.
+
+**Two caveats this row carries that the other five do not.** Its candidate is a
+*freshly trained* PGO profile, not the bank's frozen `6a22cfcf…`, so it is **not
+byte-identical-candidate comparable** with the five ext4 rows — direction and rough
+magnitude transfer, an exact cross-scorecard delta does not. And it is the only row taken
+with every CPU on the `performance` governor
+(`non_performance_or_mixed_governor_warning=false`), where the others carry that warning.
+Both differences favour honesty about the comparison rather than the number itself: the
+row is a loss either way.
+
 **The workload now runs on a real four-arm mounted comparator** — this is the
 confirmation the unit and conformance probes could not give, since those exercise
 `OpenFs` in-process rather than a live FUSE mount:
@@ -264,7 +291,7 @@ row shows no number, because a fixed defect is not a result.
 | create/delete storm | `2.753659x` slower | `2.358280x` slower |
 | parallel read | `1.287862x` slower | **`0.894290x` / `0.830537x` faster** |
 | parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
-| fsync/journal commit | `0.997098x` neutral | **not yet measured — the `EIO` is fixed, the run is pending** |
+| fsync/journal commit | `0.997098x` neutral | **`1.976308x` slower** |
 | warm stat | not in the ext4 bank | `4.977803x` / `5.036433x` slower |
 
 The parallel-read row is the only sign change anywhere in either scorecard, which is
