@@ -129,7 +129,7 @@ The existing test `extent_allocator_adversarial_rejects_free_accounting_underflo
 contract is correct. The bug is that mount handed it an inconsistent state on every real
 image, so a guard meant for corruption was firing on healthy filesystems.
 
-**Fix — identified and pinned, not yet landed.** Call `sync_block_group_accounting()` at
+**Fix — landed in `32dd093f`, probes not yet run.** Call `sync_block_group_accounting()` at
 mount, immediately after the extent tree
 is loaded. That function already exists and is already run at commit; it recomputes each
 group's `used_bytes` as the sum of the `EXTENT_ITEM`/`METADATA_ITEM` lengths physically
@@ -144,19 +144,33 @@ for every group at mount, so the bump cursor was only ever a hint.
 
 Pinned by `reconciled_block_group_accounting_makes_a_preexisting_extent_freeable_bd_ftev0`
 (`ffs-btrfs`), which builds the exact mount-time state and proves the same `free_extent`
-call succeeds once reconciled. The underflow guard is not weakened — it stops being
-reachable from a correctly mounted filesystem.
+call succeeds once reconciled. That test is cited above as if it already existed; it did
+not, and `32dd093f` supplies it, including the negative case — unreconciled, the free must
+still fail closed with `BrokenInvariant`. The underflow guard is not weakened; it stops
+being reachable from a correctly mounted filesystem.
 
-**Why the one-line call is not committed yet.** Making it live regresses
-`btrfs_largest_contiguous_free_run_uses_allocator_gaps` (`ffs-core`), which asserts a
-fixture leaves exactly 64 free blocks. That figure was computed against the *un*-reconciled
-tally, so real accounting legitimately changes it — the test's expectation needs
-recomputing, not the fix reverting. Measured, not assumed: with the call in place
-`ffs-btrfs` is 375/375 and `ffs-core` is 1186 passed / 2 failed; running those two tests on
-clean `HEAD` with no overlay shows `fast_commit_del_range_apply_punches_and_frees_passes_e2fsck`
-already failing there (pre-existing, not ours) and the free-run test passing, which is what
-isolates the regression to this change. Next step is to recompute the expectation and land
-both together.
+A second test lands with it: `btrfs_positioned_write_over_mkfs_populated_file_conforms`
+(`ffs-harness` conformance) reproduces the failing workload end to end — an image
+populated by the format tool's `--rootdir` carrying a 4096-byte `fsync.bin`, then eight
+4 KiB positioned writes at offset 0, each followed by `fsync`, a readback equality check,
+and a size assertion.
+
+**The predicted regression did not materialize, and the call is committed.** The concern
+was that making it live regresses `btrfs_largest_contiguous_free_run_uses_allocator_gaps`
+(`ffs-core`), whose fixture asserts exactly 64 free blocks against the *un*-reconciled
+tally. The landed form guards the call on `extent_tree_items_loaded > 0`, and that
+fixture (`build_btrfs_fsops_image`) carries no extent tree at all — there is nothing to
+reconcile from, so its existing tally legitimately stands while every real image gets the
+correct accounting. The guard is the more correct semantic, not a way around the
+expectation.
+
+**Neither probe has run.** Both are blocked by
+`bd-ffs-mvcc-merge-dropped-merge-proof-api-y1ch7`: the workspace does not compile at HEAD,
+because `921831b7` deleted `ffs-mvcc` internals that `sharded.rs` still calls, so
+`ffs-btrfs` and `ffs-harness` cannot be built at all. Three clean-baseline runs on three
+workers died inside `ffs-mvcc`. This row stays **BLOCKED** — the fix is not established
+until those two tests are observed passing, and the row is not scoreable until a four-arm
+run produces it.
 
 ## Provenance
 
