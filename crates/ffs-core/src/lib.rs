@@ -29230,7 +29230,10 @@ impl OpenFs {
         Self::validate_single_path_component(name)?;
 
         let mut alloc = alloc_mutex.write();
-        self.btrfs_require_directory_inode(&alloc, parent_oid)?;
+        // The validation read is also the parent inode needed by the common
+        // batch path below. Reusing it avoids a second identical fs-tree lookup
+        // while all parallel creators wait on this allocation-state lock.
+        let validated_parent_inode = self.btrfs_require_directory_inode(&alloc, parent_oid)?;
 
         // ONE descent to the parent's DIR_ITEM leaf at hash(name) serves all three
         // checks the create path needs: corruption preflight (the payload parses),
@@ -29349,7 +29352,7 @@ impl OpenFs {
             // disjoint fields, applied in the SAME COW transaction as the four
             // inserts via insert_many_then_update. All parent-side ops (DIR_ITEM,
             // DIR_INDEX, the INODE_ITEM update) then COW the parent subtree once.
-            let mut parent_inode = self.btrfs_read_inode_from_tree(&alloc, parent_oid)?;
+            let mut parent_inode = validated_parent_inode;
             let size_delta = Self::btrfs_dir_entry_size_delta(name.len());
             parent_inode.size = i64::try_from(parent_inode.size)
                 .ok()
@@ -31809,12 +31812,12 @@ impl OpenFs {
         &self,
         alloc: &BtrfsAllocState,
         objectid: u64,
-    ) -> ffs_error::Result<()> {
+    ) -> ffs_error::Result<BtrfsInodeItem> {
         let inode = self.btrfs_read_inode_from_tree(alloc, objectid)?;
         if Self::btrfs_mode_to_file_type(inode.mode) != FileType::Directory {
             return Err(FfsError::NotDirectory);
         }
-        Ok(())
+        Ok(inode)
     }
 
     fn btrfs_preflight_dir_entry_insert(
