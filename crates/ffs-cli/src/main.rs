@@ -7685,7 +7685,7 @@ fn mount_with_fuse(
         auto_unmount,
         writeback_cache,
         ioctl_trace_path: None,
-        worker_threads: 0,
+        worker_threads: fuse_dispatch_workers_from_env()?,
     };
 
     // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
@@ -7707,6 +7707,18 @@ fn mount_with_fuse(
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
     ffs_fuse::mount(fs_ops, mountpoint, &opts)
         .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
+}
+
+fn fuse_dispatch_workers_from_env() -> Result<usize> {
+    parse_fuse_dispatch_workers(std::env::var("FFS_FUSE_WORKERS").ok().as_deref())
+}
+
+fn parse_fuse_dispatch_workers(value: Option<&str>) -> Result<usize> {
+    value.map_or(Ok(0), |value| {
+        value
+            .parse::<usize>()
+            .with_context(|| "FFS_FUSE_WORKERS must be an unsigned integer")
+    })
 }
 
 /// Parameters shared by managed and per-core mount paths.
@@ -7768,7 +7780,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
             auto_unmount: params.auto_unmount,
             writeback_cache: params.writeback_cache,
             ioctl_trace_path: None,
-            worker_threads: 0,
+            worker_threads: fuse_dispatch_workers_from_env()?,
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
@@ -9922,7 +9934,8 @@ mod tests {
         ext4_mount_replay_mode, ext4_recovery_detail, ext4_state_flag_names, filesystem_name,
         format_ext4_quota_inodes, format_ratio_thousandths, format_uuid,
         log_mount_runtime_rejected, log_mount_runtime_selected, mount_cmd, mount_operation_id,
-        open_filesystem_for_mount, parse_btrfs_mount_selection, read_ext4_group_desc_from_path,
+        open_filesystem_for_mount, parse_btrfs_mount_selection, parse_fuse_dispatch_workers,
+        read_ext4_group_desc_from_path,
         read_ext4_inode_from_path, read_file_region, start_mount_background_scrub,
         summarize_repair_staleness, unavailable_repair_info,
         validate_mount_adaptive_runtime_request_with_config,
@@ -10028,6 +10041,23 @@ mod tests {
             writeback_cache,
             console: MountConsoleConfig::default(),
         }
+    }
+
+    #[test]
+    fn fuse_dispatch_workers_env_parser_defaults_and_accepts_explicit_workers() {
+        assert_eq!(parse_fuse_dispatch_workers(None).unwrap(), 0);
+        assert_eq!(parse_fuse_dispatch_workers(Some("8")).unwrap(), 8);
+        assert_eq!(parse_fuse_dispatch_workers(Some("0")).unwrap(), 0);
+    }
+
+    #[test]
+    fn fuse_dispatch_workers_env_parser_rejects_non_numeric_values() {
+        let error = parse_fuse_dispatch_workers(Some("eight")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("FFS_FUSE_WORKERS must be an unsigned integer")
+        );
     }
 
     fn test_mount_runtime_config(mode: MountRuntimeMode) -> MountRuntimeConfig {

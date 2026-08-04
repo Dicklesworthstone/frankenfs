@@ -361,6 +361,12 @@ struct Config {
     /// and a number taken at one of them never replaces a number taken at the
     /// other.
     fuse_cpu_count: usize,
+    /// Optional FUSE request-dispatch worker count for the candidate daemon.
+    ///
+    /// Omitted preserves the banked serial dispatcher. When specified, the
+    /// value is injected into both FUSE A/A arms, so the null gate still
+    /// exercises exactly the candidate configuration being compared to Linux.
+    fuse_workers: Option<usize>,
     placement_scope: PlacementScope,
     host_quiet_samples: usize,
     host_quiet_timeout_ms: u64,
@@ -395,6 +401,7 @@ impl Default for Config {
             pre_measurement_settle_ms: 1_000,
             client_threads: DEFAULT_PARALLEL_THREADS,
             fuse_cpu_count: DEFAULT_FUSE_CPUS,
+            fuse_workers: None,
             placement_scope: PlacementScope::SameLlc,
             host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
             host_quiet_timeout_ms: DEFAULT_HOST_QUIET_TIMEOUT_MS,
@@ -773,6 +780,8 @@ fn usage() {
            --fuse-cpus N                  CPUs pinned to the FrankenFS daemon (default 1;\n\
                                           every banked row was taken at 1, and the kernel\n\
                                           arm runs its filesystem on all client CPUs)\n\
+           --fuse-workers N               FUSE request-dispatch workers for both FUSE A/A arms\n\
+                                          (default serial dispatcher; 0 selects serial explicitly)\n\
            --placement-scope SCOPE        same-llc | host-wide (default same-llc)\n\
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
@@ -877,6 +886,12 @@ fn validate_config(config: &Config) -> Result<()> {
         "--fuse-cpus must be in 1..={MAX_CLIENT_THREADS}"
     );
     ensure!(
+        config
+            .fuse_workers
+            .is_none_or(|workers| workers <= MAX_CLIENT_THREADS),
+        "--fuse-workers must be in 0..={MAX_CLIENT_THREADS}"
+    );
+    ensure!(
         config.operations >= config.client_threads(),
         "{} requires at least one operation per requested client thread",
         config.workload.label()
@@ -939,6 +954,10 @@ fn validate_config(config: &Config) -> Result<()> {
 
 fn parse_args() -> Result<Option<Config>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    parse_config_args(&args)
+}
+
+fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
     let mut config = Config::default();
     let mut index = 0;
     while index < args.len() {
@@ -948,14 +967,13 @@ fn parse_args() -> Result<Option<Config>> {
                 return Ok(None);
             }
             "--ffs-cli" => {
-                config.ffs_cli = parse_value::<PathBuf>(&args, &mut index, "--ffs-cli")?;
+                config.ffs_cli = parse_value::<PathBuf>(args, &mut index, "--ffs-cli")?;
             }
             "--artifact-root" => {
-                config.artifact_root =
-                    parse_value::<PathBuf>(&args, &mut index, "--artifact-root")?;
+                config.artifact_root = parse_value::<PathBuf>(args, &mut index, "--artifact-root")?;
             }
             "--filesystem" => {
-                let value = parse_value::<String>(&args, &mut index, "--filesystem")?;
+                let value = parse_value::<String>(args, &mut index, "--filesystem")?;
                 config.filesystems = match value.as_str() {
                     "ext4" => RequestedFilesystems::Ext4,
                     "btrfs" => RequestedFilesystems::Btrfs,
@@ -964,54 +982,57 @@ fn parse_args() -> Result<Option<Config>> {
                 };
             }
             "--workload" => {
-                let value = parse_value::<String>(&args, &mut index, "--workload")?;
+                let value = parse_value::<String>(args, &mut index, "--workload")?;
                 config.workload = parse_workload(&value)?;
             }
-            "--pairs" => config.pairs = parse_value(&args, &mut index, "--pairs")?,
+            "--pairs" => config.pairs = parse_value(args, &mut index, "--pairs")?,
             "--operations" => {
-                config.operations = parse_value(&args, &mut index, "--operations")?;
+                config.operations = parse_value(args, &mut index, "--operations")?;
             }
             "--fuse-cpus" => {
-                config.fuse_cpu_count = parse_value(&args, &mut index, "--fuse-cpus")?;
+                config.fuse_cpu_count = parse_value(args, &mut index, "--fuse-cpus")?;
+            }
+            "--fuse-workers" => {
+                config.fuse_workers = Some(parse_value(args, &mut index, "--fuse-workers")?);
             }
             "--client-threads" => {
-                config.client_threads = parse_value(&args, &mut index, "--client-threads")?;
+                config.client_threads = parse_value(args, &mut index, "--client-threads")?;
             }
             "--placement-scope" => {
-                let value = parse_value::<String>(&args, &mut index, "--placement-scope")?;
+                let value = parse_value::<String>(args, &mut index, "--placement-scope")?;
                 config.placement_scope = parse_placement_scope(&value)?;
             }
             "--observation-repeats" => {
                 config.observation_repeats =
-                    parse_value(&args, &mut index, "--observation-repeats")?;
+                    parse_value(args, &mut index, "--observation-repeats")?;
             }
             "--image-size-mib" => {
-                config.image_size_mib = parse_value(&args, &mut index, "--image-size-mib")?;
+                config.image_size_mib = parse_value(args, &mut index, "--image-size-mib")?;
             }
             "--maximum-null-ratio" => {
-                config.maximum_null_ratio = parse_value(&args, &mut index, "--maximum-null-ratio")?;
+                config.maximum_null_ratio = parse_value(args, &mut index, "--maximum-null-ratio")?;
             }
             "--arm-settle-ms" => {
-                config.arm_settle_ms = parse_value(&args, &mut index, "--arm-settle-ms")?;
+                config.arm_settle_ms = parse_value(args, &mut index, "--arm-settle-ms")?;
             }
             "--pre-measurement-settle-ms" => {
                 config.pre_measurement_settle_ms =
-                    parse_value(&args, &mut index, "--pre-measurement-settle-ms")?;
+                    parse_value(args, &mut index, "--pre-measurement-settle-ms")?;
             }
             "--harness-builder" => {
-                config.harness_builder = parse_value(&args, &mut index, "--harness-builder")?;
+                config.harness_builder = parse_value(args, &mut index, "--harness-builder")?;
             }
             "--candidate-builder" => {
-                config.candidate_builder = parse_value(&args, &mut index, "--candidate-builder")?;
+                config.candidate_builder = parse_value(args, &mut index, "--candidate-builder")?;
             }
             "--host-quiet-samples" => {
-                config.host_quiet_samples = parse_value(&args, &mut index, "--host-quiet-samples")?;
+                config.host_quiet_samples = parse_value(args, &mut index, "--host-quiet-samples")?;
             }
             "--host-quiet-timeout-ms" => {
                 config.host_quiet_timeout_ms =
-                    parse_value(&args, &mut index, "--host-quiet-timeout-ms")?;
+                    parse_value(args, &mut index, "--host-quiet-timeout-ms")?;
             }
-            "--out" => config.output = Some(parse_value(&args, &mut index, "--out")?),
+            "--out" => config.output = Some(parse_value(args, &mut index, "--out")?),
             other => bail!("unknown argument: {other}"),
         }
         index += 1;
@@ -1769,6 +1790,7 @@ fn mount_fuse(
         .args(["-c", &cpu_list])
         .arg(&config.ffs_cli)
         .arg("mount");
+    apply_fuse_dispatch_workers(&mut command, config.fuse_workers);
     if config.workload.is_mutating() {
         command.arg("--rw");
     }
@@ -1859,6 +1881,12 @@ fn mount_fuse(
     *mapped = proc_exe_sha256;
     *pgo = self_report.pgo_profile_sha256;
     Ok(mounted)
+}
+
+fn apply_fuse_dispatch_workers(command: &mut Command, fuse_workers: Option<usize>) {
+    if let Some(fuse_workers) = fuse_workers {
+        command.env("FFS_FUSE_WORKERS", fuse_workers.to_string());
+    }
 }
 
 fn parity_witness(path: &Path) -> Result<ParityWitness> {
@@ -5329,6 +5357,64 @@ mod tests {
         let mut blank_candidate = base;
         blank_candidate.candidate_builder = "   ".to_owned();
         assert!(validate_config(&blank_candidate).is_err());
+    }
+
+    #[test]
+    fn fuse_dispatch_worker_option_reaches_both_fuse_arms_only_when_requested() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let args = vec![
+            "--ffs-cli".to_owned(),
+            cli.display().to_string(),
+            "--harness-builder".to_owned(),
+            "hz1".to_owned(),
+            "--candidate-builder".to_owned(),
+            "hz2".to_owned(),
+            "--fuse-workers".to_owned(),
+            "8".to_owned(),
+        ];
+        let config = parse_config_args(&args)
+            .expect("parse fuse worker option")
+            .expect("normal invocation");
+        assert_eq!(config.fuse_workers, Some(8));
+
+        let mut enabled = Command::new("true");
+        apply_fuse_dispatch_workers(&mut enabled, config.fuse_workers);
+        let enabled_worker = enabled
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some("FFS_FUSE_WORKERS"))
+            .and_then(|(_, value)| value)
+            .expect("worker setting reaches FUSE launcher");
+        assert_eq!(enabled_worker, "8");
+
+        let mut banked = Command::new("true");
+        apply_fuse_dispatch_workers(&mut banked, Config::default().fuse_workers);
+        assert!(
+            banked
+                .get_envs()
+                .all(|(key, _)| key.to_str() != Some("FFS_FUSE_WORKERS")),
+            "omitting the option must preserve the serial banked dispatcher"
+        );
+    }
+
+    #[test]
+    fn fuse_dispatch_worker_option_rejects_more_than_supported_workers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let args = vec![
+            "--ffs-cli".to_owned(),
+            cli.display().to_string(),
+            "--harness-builder".to_owned(),
+            "hz1".to_owned(),
+            "--candidate-builder".to_owned(),
+            "hz2".to_owned(),
+            "--fuse-workers".to_owned(),
+            (MAX_CLIENT_THREADS + 1).to_string(),
+        ];
+        let error = parse_config_args(&args).expect_err("oversized worker count must fail");
+        assert!(error.to_string().contains("--fuse-workers"));
     }
 
     #[test]
