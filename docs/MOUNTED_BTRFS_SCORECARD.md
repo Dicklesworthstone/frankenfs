@@ -63,11 +63,24 @@ own intervals are ~2% wide, so something not captured by the nulls is moving bet
 windows.
 
 The specific worry is that per-block data checksumming is btrfs's headline feature.
-I checked the source: FrankenFS has **no read-side checksum verification** — every
-`crc32c`/csum path in `ffs-btrfs` builds csum items on the *write* side, and there is no
-verify equivalent in the btrfs read path or the FUSE layer. If the incumbent verifies on
-every read and we never do, this is not a like-for-like win; it is a different integrity
-contract.
+
+**Correction, 2026-08-04.** This section previously said FrankenFS has *no* read-side
+checksum verification and that no verify path exists. That was wrong: `bd-tkv2n` landed
+one on 2026-06-04 (`57d37c73`, with a perf pass in `e0aa5a1b`).
+`crates/ffs-core/src/lib.rs:10836` verifies every regular extent overlapping the read
+range against the csum tree for a datasum inode and returns `Corruption` → `EIO` before
+returning any bytes, exactly as the kernel does, and it carries its own corruption-planting
+negative test. The original audit grepped `ffs-btrfs`, where every `crc32c`/csum path is
+indeed write-side only; the verify lives in `ffs-core`.
+
+**The conclusion survives the correction, for a different reason.** The flag
+(`OpenOptions.btrfs_verify_data_on_read`) defaulted to `false` and was reachable from
+nowhere outside `ffs-core` — not the CLI, not the FUSE layer, not the harness. So no
+*mounted* configuration could verify, and this row's FUSE arms did not. A capability no
+mount can reach is, for benchmarking purposes, the same as not having one. The mount
+option now exists (`--btrfs-verify-data-on-read`,
+`bd-btrfs-no-read-side-csum-verify-xu3m6`) and is still off by default, so what this row
+measured is unchanged and the comparison is still not like-for-like.
 
 **But that does not settle it against us either.** This is a *warm-cache* workload, and
 kernel btrfs does not re-verify checksums on page-cache hits — it verifies on the disk
@@ -79,8 +92,8 @@ decide it**. That is a different workload and a separate row, not a silent subst
 of this one. Until it runs:
 
 > Quote this row as *"FrankenFS is faster than kernel btrfs on warm multi-file parallel
-> reads, mechanism unresolved, and FrankenFS performs no read-side checksum
-> verification."* Do not quote it as a bare win.
+> reads, mechanism unresolved, and the measured FrankenFS arms did not verify data
+> checksums — the capability exists but is off by default."* Do not quote it as a bare win.
 
 ## Was blocked: FrankenFS could not do positioned writes on btrfs (fixed 2026-08-04)
 

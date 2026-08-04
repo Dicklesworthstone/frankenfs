@@ -540,6 +540,8 @@ struct MountCmdOptions {
     ext4_verify_journal_checksums: bool,
     /// Use ephemeral (tree-log only) commit strategy instead of full durable commit.
     btrfs_rw_ephemeral_ok: bool,
+    /// Verify btrfs data checksums on every read, the way the kernel does.
+    btrfs_verify_data_on_read: bool,
     runtime: MountRuntimeConfig,
     adaptive_runtime: MountAdaptiveRuntimeConfig,
     adaptive_runtime_summary: MountAdaptiveRuntimeSummaryConfig,
@@ -1124,6 +1126,16 @@ enum Command {
         /// if the process crashes before unmount completes the final commit.
         #[arg(long = "btrfs-rw-ephemeral-ok")]
         btrfs_rw_ephemeral_ok: bool,
+        /// Verify btrfs data checksums on every read.
+        ///
+        /// Kernel btrfs always verifies a datasum extent's crc32c before
+        /// returning its bytes and reports EIO on a mismatch. FrankenFS has the
+        /// same check (`bd-tkv2n`) but it is off unless asked for, so by default
+        /// a mount returns whatever the device gave it. Turning this on trades
+        /// read throughput for that guarantee, and makes a read comparison
+        /// against kernel btrfs like-for-like.
+        #[arg(long = "btrfs-verify-data-on-read")]
+        btrfs_verify_data_on_read: bool,
     },
     /// Run a read-only integrity scan (scrub) on a filesystem image.
     Scrub {
@@ -2219,6 +2231,7 @@ fn run() -> Result<()> {
             subvol,
             snapshot,
             btrfs_rw_ephemeral_ok,
+            btrfs_verify_data_on_read,
         } => {
             let btrfs_mount_selection = parse_btrfs_mount_selection(subvol, snapshot)?;
             let background_scrub = MountBackgroundScrubConfig::resolve(
@@ -2255,6 +2268,7 @@ fn run() -> Result<()> {
                     },
                     ext4_verify_journal_checksums: !ext4_nojournal_checksum,
                     btrfs_rw_ephemeral_ok,
+                    btrfs_verify_data_on_read,
                     runtime: MountRuntimeConfig {
                         mode: runtime_mode,
                         managed_unmount_timeout_secs,
@@ -8660,6 +8674,7 @@ fn build_mount_open_options(options: &MountCmdOptions) -> OpenOptions {
         mount_mode: options.mount_mode,
         btrfs_mount_selection: options.btrfs_mount_selection.clone(),
         btrfs_rw_ephemeral_ok: options.btrfs_rw_ephemeral_ok,
+        btrfs_verify_data_on_read: options.btrfs_verify_data_on_read,
         ..OpenOptions::default()
     }
 }
@@ -10002,6 +10017,7 @@ mod tests {
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
             ext4_verify_journal_checksums: true,
             btrfs_rw_ephemeral_ok: false,
+            btrfs_verify_data_on_read: false,
             runtime: MountRuntimeConfig {
                 mode: MountRuntimeMode::Standard,
                 managed_unmount_timeout_secs: None,
@@ -13547,6 +13563,7 @@ mod tests {
                         allow_other: false,
                         read_write: true,
                         btrfs_rw_ephemeral_ok: false,
+                        btrfs_verify_data_on_read: false,
                         mount_mode: MountMode::Compat,
                         btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                         ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -13622,6 +13639,7 @@ mod tests {
                 allow_other: false,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
+                btrfs_verify_data_on_read: false,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -13657,6 +13675,7 @@ mod tests {
                 allow_other: false,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
+                btrfs_verify_data_on_read: false,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -13721,6 +13740,7 @@ mod tests {
             allow_other: false,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
+            btrfs_verify_data_on_read: false,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -13741,12 +13761,57 @@ mod tests {
         );
     }
 
+    /// bd-btrfs-no-read-side-csum-verify-xu3m6: `ffs-core` has verified btrfs
+    /// data checksums on read since `bd-tkv2n`, but the flag lived only on
+    /// `OpenOptions` — no mount could reach it, so every mounted FrankenFS
+    /// btrfs returned unverified bytes with no way to opt in. Both directions
+    /// are asserted: the flag must reach `OpenOptions` when asked for, and must
+    /// stay off when not, since a mount that silently started verifying would
+    /// change what every banked read row measured.
+    #[test]
+    fn build_mount_open_options_threads_btrfs_read_verification_both_ways() {
+        let options = |verify: bool| MountCmdOptions {
+            allow_other: false,
+            read_write: false,
+            btrfs_rw_ephemeral_ok: false,
+            btrfs_verify_data_on_read: verify,
+            mount_mode: MountMode::Compat,
+            btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+            ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
+            ext4_verify_journal_checksums: true,
+            runtime: MountRuntimeConfig {
+                mode: MountRuntimeMode::Standard,
+                managed_unmount_timeout_secs: None,
+            },
+            adaptive_runtime: MountAdaptiveRuntimeConfig::disabled(),
+            adaptive_runtime_summary: MountAdaptiveRuntimeSummaryConfig::disabled(),
+            background_scrub: test_mount_background_scrub_disabled(),
+            writeback_cache: MountWritebackCacheConfig::disabled(),
+            console: MountConsoleConfig::default(),
+        };
+
+        assert!(
+            build_mount_open_options(&options(true)).btrfs_verify_data_on_read,
+            "--btrfs-verify-data-on-read must reach OpenOptions"
+        );
+        assert!(
+            !build_mount_open_options(&options(false)).btrfs_verify_data_on_read,
+            "a mount must not verify unless asked to"
+        );
+        assert!(
+            !OpenOptions::default().btrfs_verify_data_on_read,
+            "the library default must stay off; flipping it silently would \
+             change what every banked read row measured"
+        );
+    }
+
     #[test]
     fn build_mount_open_options_threads_explicit_btrfs_subvolume_selection() {
         let open_options = build_mount_open_options(&MountCmdOptions {
             allow_other: false,
             read_write: true,
             btrfs_rw_ephemeral_ok: false,
+            btrfs_verify_data_on_read: false,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -13777,6 +13842,7 @@ mod tests {
             allow_other: false,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
+            btrfs_verify_data_on_read: false,
             mount_mode: MountMode::Native,
             btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-1".to_owned()),
             ext4_data_err_policy: Ext4DataErrPolicy::Abort,
@@ -13811,6 +13877,7 @@ mod tests {
                     allow_other: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
+                    btrfs_verify_data_on_read: false,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("missing".to_owned()),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -13854,6 +13921,7 @@ mod tests {
                     allow_other: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
+                    btrfs_verify_data_on_read: false,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot(
                         "missing-snapshot".to_owned(),
@@ -13898,6 +13966,7 @@ mod tests {
                     allow_other: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
+                    btrfs_verify_data_on_read: false,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -13959,6 +14028,7 @@ mod tests {
                     allow_other: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
+                    btrfs_verify_data_on_read: false,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-home".to_owned()),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
