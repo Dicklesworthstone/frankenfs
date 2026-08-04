@@ -188,6 +188,30 @@ impl WriteDependencyDag {
         result
     }
 
+    /// Visit nodes in reverse topological order together with their levels.
+    ///
+    /// This is the streaming counterpart to
+    /// [`Self::reverse_topological_order_with_levels`]. Production writeback
+    /// consumes each pair exactly once, so it can avoid materializing the
+    /// temporary vector while retaining the same malformed-DAG fallback and
+    /// child-before-parent ordering.
+    pub fn try_for_each_reverse_topological_with_levels<E, F>(&self, mut visit: F) -> Result<(), E>
+    where
+        F: FnMut(u64, u8) -> Result<(), E>,
+    {
+        let mut visited = HashSet::with_capacity(self.nodes.len());
+        let mut emitted = 0usize;
+        self.try_push_postorder_with_levels(self.root, &mut visited, &mut emitted, &mut visit)?;
+
+        if emitted != self.nodes.len() {
+            for block in self.nodes.keys().copied() {
+                self.try_push_postorder_with_levels(block, &mut visited, &mut emitted, &mut visit)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn push_postorder_with_levels(
         &self,
         block: u64,
@@ -207,6 +231,33 @@ impl WriteDependencyDag {
         }
 
         result.push((block, node.level));
+    }
+
+    fn try_push_postorder_with_levels<E, F>(
+        &self,
+        block: u64,
+        visited: &mut HashSet<u64>,
+        emitted: &mut usize,
+        visit: &mut F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(u64, u8) -> Result<(), E>,
+    {
+        if !visited.insert(block) {
+            return Ok(());
+        }
+
+        let Some(node) = self.nodes.get(&block) else {
+            return Ok(());
+        };
+
+        for child in &node.children {
+            self.try_push_postorder_with_levels(*child, visited, emitted, visit)?;
+        }
+
+        visit(block, node.level)?;
+        *emitted = emitted.saturating_add(1);
+        Ok(())
     }
 
     fn durable_block_set(&self) -> BTreeSet<u64> {
@@ -510,12 +561,25 @@ impl WritebackExecutor {
     where
         F: FnMut(u64, u8) -> Result<(), BtrfsMutationError>,
     {
-        // Stream (block, level) from the postorder walk itself: the level is
-        // read from the same node visited during ordering, so there is no
-        // second per-node probe of the node map inside the flush loop.
-        let order = self.dag.reverse_topological_order_with_levels();
-        let total = order.len();
+        let total = self.dag.node_count();
         let generation = self.dag.generation;
+        if !self.record_crash_points {
+            let mut flushed = 0usize;
+            self.dag
+                .try_for_each_reverse_topological_with_levels(|block, level| {
+                    flush_node(block, level)?;
+                    trace!(
+                        block,
+                        progress = flushed + 1,
+                        total,
+                        "writeback executor flushed node"
+                    );
+                    flushed = flushed.saturating_add(1);
+                    Ok(())
+                })?;
+            return Ok(());
+        }
+
         // The running durable-block set and the per-node `mark_durable` exist
         // solely to build crash points and verify WB-I1 (both test/verification
         // only). Production writeback never reads DAG durability, so skip the
@@ -523,45 +587,38 @@ impl WritebackExecutor {
         // per-node node-map `get_mut` — when crash tracking is off. Byte-identical
         // on disk: `flush_node` still runs for every (block, level) and the
         // durable flag is never serialized.
-        let mut durable_blocks = if self.record_crash_points {
-            self.crash_points.reserve(total.saturating_mul(2));
-            self.dag.durable_block_set()
-        } else {
-            BTreeSet::new()
-        };
+        self.crash_points.reserve(total.saturating_mul(2));
+        let mut durable_blocks = self.dag.durable_block_set();
+        let order = self.dag.reverse_topological_order_with_levels();
 
-        for (i, (block, level)) in order.into_iter().enumerate() {
+        for (flushed, (block, level)) in order.into_iter().enumerate() {
             // Record crash point before this flush (test/verification only)
-            if self.record_crash_points {
-                let pre_crash_id = format!("pre_flush_{}", block);
-                self.crash_points.push(CrashPoint::from_durable_blocks(
-                    &durable_blocks,
-                    pre_crash_id,
-                    false,
-                    generation,
-                ));
-            }
+            let pre_crash_id = format!("pre_flush_{}", block);
+            self.crash_points.push(CrashPoint::from_durable_blocks(
+                &durable_blocks,
+                pre_crash_id,
+                false,
+                generation,
+            ));
 
             // Flush the node
             flush_node(block, level)?;
 
             // Durability bookkeeping + post-flush crash point (test/verification
             // only): mark_durable mutates only the in-memory durable flag.
-            if self.record_crash_points {
-                self.dag.mark_durable(block)?;
-                durable_blocks.insert(block);
-                let post_crash_id = format!("post_flush_{}", block);
-                self.crash_points.push(CrashPoint::from_durable_blocks(
-                    &durable_blocks,
-                    post_crash_id,
-                    false,
-                    generation,
-                ));
-            }
+            self.dag.mark_durable(block)?;
+            durable_blocks.insert(block);
+            let post_crash_id = format!("post_flush_{}", block);
+            self.crash_points.push(CrashPoint::from_durable_blocks(
+                &durable_blocks,
+                post_crash_id,
+                false,
+                generation,
+            ));
 
             trace!(
                 block,
-                progress = i + 1,
+                progress = flushed + 1,
                 total,
                 "writeback executor flushed node"
             );
@@ -1445,6 +1502,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn streamed_reverse_topological_order_preserves_pairs_and_callback_errors() {
+        let tree = make_test_tree();
+        let dag = WriteDependencyDag::from_cow_tree(&tree, 100).expect("build dag");
+        let expected = dag.reverse_topological_order_with_levels();
+        let mut streamed = Vec::new();
+
+        dag.try_for_each_reverse_topological_with_levels(|block, level| {
+            streamed.push((block, level));
+            Ok::<(), ()>(())
+        })
+        .expect("streamed traversal succeeds");
+        assert_eq!(streamed, expected);
+
+        let error = dag.try_for_each_reverse_topological_with_levels(|_, _| Err("stop"));
+        assert_eq!(error, Err("stop"));
     }
 
     fn reverse_topological_order_btree_model(dag: &WriteDependencyDag) -> Vec<u64> {
