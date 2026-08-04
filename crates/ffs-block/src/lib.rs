@@ -14,7 +14,7 @@ use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_types::{
     BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset, CommitSeq,
-    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, TxnId,
+    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Snapshot, TxnId,
 };
 #[cfg(feature = "s3fifo")]
 use parking_lot::RwLock;
@@ -355,12 +355,7 @@ pub trait ByteDevice: Send + Sync {
     /// that is discarded on failure (e.g. a fresh block buffer read into and then
     /// dropped if the read fails). The default delegates to `read_exact_at`, so
     /// the bytes are identical on success.
-    fn read_exact_at_volatile(
-        &self,
-        cx: &Cx,
-        offset: ByteOffset,
-        buf: &mut [u8],
-    ) -> Result<()> {
+    fn read_exact_at_volatile(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
         self.read_exact_at(cx, offset, buf)
     }
 
@@ -452,6 +447,51 @@ pub struct FileByteDevice {
     file: Arc<File>,
     len: u64,
     writable: bool,
+    sync_state: Arc<FileDeviceSyncState>,
+}
+
+/// Write/sync epoch pair backing `FileByteDevice`'s clean-sync skip.
+///
+/// Invariant: `synced_epoch` only ever stores a `write_epoch` value that was
+/// read *before* a `sync_all` that then succeeded. Epoch equality in `sync`
+/// therefore proves no write syscall has been attempted on this backing file
+/// (through any clone of this device) since durability was last established,
+/// making the fsync a no-op that can be skipped exactly — the same reasoning
+/// kernel ext4 uses to skip the journal commit for an already-clean inode.
+/// `write_epoch` starts ahead of `synced_epoch` so the first `sync` after open
+/// always issues the syscall, covering writes made through other handles to
+/// the same path before or during open (e.g. mount-time journal replay).
+///
+/// Shared behind `Arc` so `Clone`d devices (which share the `File`) also share
+/// the dirty state.
+#[derive(Debug)]
+struct FileDeviceSyncState {
+    /// Advanced after every attempted write syscall (success or failure — a
+    /// failed `write_all_at` may have partially written).
+    write_epoch: AtomicU64,
+    /// The `write_epoch` observed immediately before the last successful
+    /// `sync_all`.
+    synced_epoch: AtomicU64,
+}
+
+/// Whether `FileByteDevice::sync` may skip the `fsync` syscall when no write
+/// has been attempted since the last successful sync. Default on; set
+/// `FFS_CLEAN_SYNC_SKIP=0` (or `off`/`false`) to force the old unconditional
+/// fsync (used to A/B the lever in a single binary). Parsed once.
+fn file_device_clean_sync_skip() -> bool {
+    use std::sync::OnceLock;
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        !matches!(
+            std::env::var("FFS_CLEAN_SYNC_SKIP")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("0" | "off" | "false")
+        )
+    })
 }
 
 /// Default size at or above which reads skip the per-read staging scratch in
@@ -521,7 +561,7 @@ thread_local! {
     /// metadata read stream does not allocate and zero-init a fresh buffer that
     /// the positioned read then overwrites in full. Grows only.
     static FILE_READ_STAGING: std::cell::RefCell<Vec<u8>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl FileByteDevice {
@@ -549,12 +589,26 @@ impl FileByteDevice {
             file: Arc::new(file),
             len,
             writable,
+            sync_state: Arc::new(FileDeviceSyncState {
+                write_epoch: AtomicU64::new(1),
+                synced_epoch: AtomicU64::new(0),
+            }),
         })
     }
 
     #[must_use]
     pub fn file(&self) -> &Arc<File> {
         &self.file
+    }
+
+    /// Test-only view of `(write_epoch, synced_epoch)` for the clean-sync
+    /// skip invariant.
+    #[cfg(test)]
+    fn sync_epochs(&self) -> (u64, u64) {
+        (
+            self.sync_state.write_epoch.load(Ordering::Acquire),
+            self.sync_state.synced_epoch.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -652,12 +706,7 @@ impl ByteDevice for FileByteDevice {
         Ok(())
     }
 
-    fn read_exact_at_volatile(
-        &self,
-        cx: &Cx,
-        offset: ByteOffset,
-        buf: &mut [u8],
-    ) -> Result<()> {
+    fn read_exact_at_volatile(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
         cx_checkpoint(cx)?;
         if buf.is_empty() {
             cx_checkpoint(cx)?;
@@ -807,14 +856,40 @@ impl ByteDevice for FileByteDevice {
             )));
         }
 
-        self.file.write_all_at(buf, offset.0)?;
+        let write_result = self.file.write_all_at(buf, offset.0);
+        // Advance the write epoch before surfacing any error: a failed
+        // `write_all_at` may have partially written, so it must dirty the
+        // device exactly like a success — `sync` can then never treat a
+        // partial write as clean.
+        self.sync_state.write_epoch.fetch_add(1, Ordering::Release);
+        write_result?;
         cx_checkpoint(cx)?;
         Ok(())
     }
 
     fn sync(&self, cx: &Cx) -> Result<()> {
         cx_checkpoint(cx)?;
+        let observed = self.sync_state.write_epoch.load(Ordering::Acquire);
+        if file_device_clean_sync_skip()
+            && observed == self.sync_state.synced_epoch.load(Ordering::Acquire)
+        {
+            // No write syscall has been attempted through this device (or any
+            // clone) since the last successful `sync_all`, so there is nothing
+            // new to make durable: POSIX fsync only covers writes completed
+            // before the call, and every completed write advanced the epoch
+            // before its caller could observe completion. Skipping the syscall
+            // saves the storage cache-flush (~400us on this class of host)
+            // that dominates no-op durability boundaries (unchanged-directory
+            // fsyncdir storms).
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
         self.file.sync_all()?;
+        // Publish at most the pre-sync observation; `fetch_max` keeps a
+        // concurrent sync that observed a newer epoch from being regressed.
+        self.sync_state
+            .synced_epoch
+            .fetch_max(observed, Ordering::AcqRel);
         cx_checkpoint(cx)?;
         Ok(())
     }
@@ -962,6 +1037,61 @@ pub trait BlockDevice: Send + Sync {
         self.write_block(cx, block, &data)
     }
 
+    /// Read-modify-write one block under a bit-level OR-merge proof, for a
+    /// monotone (set-only) allocation bitmap block.
+    ///
+    /// Like [`Self::rmw_block`] but the staged write is a whole-block bit OR
+    /// (`MergeProof::BitmapOr`) rather than a range-scoped overlay: two
+    /// concurrent allocators that SET the bits of disjoint blocks in the same
+    /// group bitmap block MERGE (`latest | staged`) even though adjacent free
+    /// blocks share a bitmap byte, which a byte-range hint cannot express. An
+    /// MVCC-backed device reads the base AT ITS TRANSACTION SNAPSHOT and stages
+    /// the OR proof; the default performs a plain read-modify-write and is
+    /// byte-identical for non-MVCC / externally-serialized devices.
+    ///
+    /// `patch` MUST only SET bits (allocation). A bit-clear (free) makes the OR
+    /// proof invalid and falls back to first-committer-wins, so this must never
+    /// be used on the free path.
+    fn rmw_block_bitmap_or(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let mut data = self.read_block(cx, block)?.into_inner();
+        patch(&mut data)?;
+        self.write_block(cx, block, &data)
+    }
+
+    /// The merge common-ancestor for `block` at `snapshot`: the block content as
+    /// of `snapshot`, plus the bytes to record as `staged_base` for a
+    /// proof-carrying stage into an EXTERNAL, already-begun transaction.
+    ///
+    /// The base MUST be resolved at THAT transaction's snapshot, not at this
+    /// device's own (possibly newer, read-your-writes) view — else a concurrent
+    /// writer's bits fold into the staged block and the OR-merge spuriously fails
+    /// its disjoint-new check. Returns `(content, base)` where `base` is `Some`
+    /// only when the store cannot re-derive the ancestor from its version chain
+    /// (i.e. the block has no version at `snapshot` and lives on the raw base
+    /// device). The default reads the current block and records no base — a
+    /// device with no MVCC overlay is snapshot-invariant and never participates
+    /// in a merge.
+    fn read_merge_ancestor_at_snapshot(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Result<(BlockBuf, Option<Vec<u8>>)> {
+        let _ = snapshot;
+        Ok((self.read_block(cx, block)?, None))
+    }
+
+    /// Returns true when `write_contiguous_blocks` collapses a run into fewer
+    /// device I/O operations than scalar `write_block` calls.
+    fn supports_contiguous_writes(&self) -> bool {
+        false
+    }
+
     /// Write a contiguous run of blocks starting at `start`. `data` holds the
     /// concatenated block contents (`data.len()` MUST be a multiple of
     /// `block_size()`); block `start + i` receives `data[i*bs .. (i+1)*bs]`.
@@ -1037,6 +1167,10 @@ impl<D: BlockDevice + ?Sized> BlockDevice for Arc<D> {
 
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
         (**self).write_block(cx, block, data)
+    }
+
+    fn supports_contiguous_writes(&self) -> bool {
+        (**self).supports_contiguous_writes()
     }
 
     fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
@@ -1428,6 +1562,10 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
         self.inner.write_all_at(cx, ByteOffset(offset), data)?;
         cx_checkpoint(cx)?;
         Ok(())
+    }
+
+    fn supports_contiguous_writes(&self) -> bool {
+        true
     }
 
     fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
@@ -5561,12 +5699,12 @@ impl<D: BlockDevice> ArcCache<D> {
         // 16-element) allocation + collect when the refresh debug target is
         // disabled (the default). `blocks` itself is still needed for
         // on_flush_committed, so only the preview is guarded.
-        let block_preview: Vec<u64> =
-            if tracing::enabled!(target: "ffs::repair::refresh", tracing::Level::DEBUG) {
-                blocks.iter().take(16).map(|block| block.0).collect()
-            } else {
-                Vec::new()
-            };
+        let block_preview: Vec<u64> = if tracing::enabled!(target: "ffs::repair::refresh", tracing::Level::DEBUG)
+        {
+            blocks.iter().take(16).map(|block| block.0).collect()
+        } else {
+            Vec::new()
+        };
         debug!(
             target: "ffs::repair::refresh",
             event = "flush_triggers_refresh",
@@ -7739,6 +7877,10 @@ mod tests {
             file: Arc::new(file),
             len: std::fs::metadata(&path).expect("metadata").len(),
             writable: false,
+            sync_state: Arc::new(FileDeviceSyncState {
+                write_epoch: AtomicU64::new(1),
+                synced_epoch: AtomicU64::new(0),
+            }),
         };
 
         dev.write_all_at(&cx, ByteOffset(9), &[])
@@ -7746,6 +7888,62 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).expect("read file"), [1_u8, 2, 3, 4]);
         assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 4);
+    }
+
+    #[test]
+    fn file_byte_device_first_sync_always_syncs_then_clean_syncs_skip() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clean-sync-skip.img");
+        std::fs::write(&path, [0_u8; 4096]).expect("seed file");
+        let dev = FileByteDevice::open(&path).expect("device");
+
+        // Fresh device: write epoch starts ahead of synced epoch so the first
+        // sync must issue the syscall (covers writes made through other
+        // handles to the same path, e.g. mount-time journal replay).
+        assert_eq!(dev.sync_epochs(), (1, 0));
+        dev.sync(&cx).expect("first sync");
+        assert_eq!(dev.sync_epochs(), (1, 1));
+
+        // Clean repeat: epochs already equal, sync stays Ok and publishes no
+        // new epoch (the syscall-skip branch).
+        dev.sync(&cx).expect("clean sync");
+        dev.sync(&cx).expect("clean sync again");
+        assert_eq!(dev.sync_epochs(), (1, 1));
+
+        // A write dirties the device; the next sync re-establishes equality.
+        dev.write_all_at(&cx, ByteOffset(0), &[7_u8; 512])
+            .expect("write");
+        assert_eq!(dev.sync_epochs(), (2, 1));
+        dev.sync(&cx).expect("post-write sync");
+        assert_eq!(dev.sync_epochs(), (2, 2));
+
+        // An empty write returns before the syscall and must not dirty.
+        dev.write_all_at(&cx, ByteOffset(0), &[])
+            .expect("empty write");
+        assert_eq!(dev.sync_epochs(), (2, 2));
+    }
+
+    #[test]
+    fn file_byte_device_clone_shares_sync_dirty_state() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clone-sync-state.img");
+        std::fs::write(&path, [0_u8; 4096]).expect("seed file");
+        let dev = FileByteDevice::open(&path).expect("device");
+        let clone = dev.clone();
+
+        dev.sync(&cx).expect("first sync");
+        assert_eq!(clone.sync_epochs(), (1, 1));
+
+        // A write through the clone dirties the original too (shared state):
+        // its next sync must observe the new epoch.
+        clone
+            .write_all_at(&cx, ByteOffset(1024), &[3_u8; 128])
+            .expect("clone write");
+        assert_eq!(dev.sync_epochs(), (2, 1));
+        dev.sync(&cx).expect("sync after clone write");
+        assert_eq!(clone.sync_epochs(), (2, 2));
     }
 
     #[test]

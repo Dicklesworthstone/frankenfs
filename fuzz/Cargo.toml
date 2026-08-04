@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 anyhow = "1.0.102"
-asupersync = "0.3.4"
+asupersync = "=0.3.4"
 brotli = "8.0"
 crc32c = "0.6.8"
 libc = "0.2.185"

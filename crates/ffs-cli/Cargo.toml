@@ -25,15 +25,17 @@ ffs-ondisk = { workspace = true }
 ffs-repair = { workspace = true }
 ffs-types = { workspace = true }
 libc = { workspace = true }
+nix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [features]
 # bd-bhh0i: build the sharded (lock-free) parallel-create path into ffs-core so the
 # create-bench can toggle it on (FFS_BHH0I_SHARDED=1) for the local A/B + e2fsck gate.
-bhh0i_sharded_alloc = ["ffs-core/bhh0i_sharded_alloc"]
+bhh0i_sharded_alloc = ["ffs-core/bhh0i_sharded_alloc", "ffs-fuse/bhh0i_sharded_alloc"]
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -6,6 +6,15 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# bd-bhh0i BUG 4: route the group block-bitmap allocation write through the
+# bit-level OR-merge RMW (`BlockDevice::rmw_block_bitmap_or`) so two concurrent
+# same-group allocators to disjoint blocks merge instead of first-committer-wins
+# conflicting on the shared bitmap block. Default OFF keeps the byte-identical
+# single-write path; enabled transitively by `ffs-core/bhh0i_sharded_alloc` for
+# the parallel-create cutover.
+bhh0i_sharded_alloc = []
+
 [dependencies]
 ffs-types = { workspace = true }
 ffs-error = { workspace = true }
@@ -17,6 +26,7 @@ smallvec = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "bitmap_ops"

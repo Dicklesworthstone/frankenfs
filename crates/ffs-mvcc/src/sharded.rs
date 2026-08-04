@@ -22,7 +22,7 @@ use parking_lot::{Condvar, Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, info, trace};
 
 /// Number of MVCC version-store shards to provision per available CPU.
@@ -250,10 +250,88 @@ impl CommitLockProbe for CommitLockProfile {
     }
 }
 
+/// Ordered-publication algorithm used by [`CommitPublicationGate`].
+///
+/// Both modes implement the SAME contract — `publish(seq)` returns only once
+/// `completed >= seq`, and `completed` only ever advances over a contiguous
+/// prefix — so they are indistinguishable to every reader, and the block bytes
+/// a snapshot resolves are identical under either. They differ only in the
+/// synchronization used to reach that state (bd-bhh0i publication convoy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublicationMode {
+    /// Compatibility fallback: one global `Mutex<BTreeSet>` plus a `Condvar`,
+    /// taken on every commit that is not already covered by the watermark.
+    Mutex,
+    /// Production default: the committer stores its sequence into a slot of a
+    /// power-of-two ring and CAS-walks the contiguous ready prefix forward. No
+    /// mutex and no ordered-tree work on the common path; the `Condvar`
+    /// survives only as the parking path for a committer whose predecessor has
+    /// not published yet.
+    #[default]
+    WaitFree,
+    /// [`Self::WaitFree`] with the pre-park spin disabled: a committer whose
+    /// predecessor has not published parks immediately instead of re-draining
+    /// `PUBLICATION_SPIN_ROUNDS` times.
+    ///
+    /// The spin trades CPU for wall time, and the trade is not obviously
+    /// correct: profiling the wait-free gate at 8 writers put
+    /// `publish_with_probe` at **16.33% self** against **5.85%** for the mutex
+    /// gate, because a futex wait accrues no CPU samples while a spin does. This
+    /// variant exists so the spin can be A/B'd against no-spin inside ONE binary
+    /// rather than argued about.
+    WaitFreeNoSpin,
+}
+
+impl PublicationMode {
+    /// Mode selected by `FFS_MVCC_WAITFREE_PUBLISH`.
+    ///
+    /// The wait-free gate is the production default after the `bd-bhh0i`
+    /// cutover. `0`/`false`/`off`/`no`/`mutex` restore the compatibility gate;
+    /// `nospin` selects the diagnostic no-spin variant. An unrecognized or
+    /// non-Unicode override fails closed to the compatibility gate.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("FFS_MVCC_WAITFREE_PUBLISH") {
+            Ok(value) => Self::from_env_value(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::from_env_value(None),
+            Err(std::env::VarError::NotUnicode(_)) => Self::Mutex,
+        }
+    }
+
+    fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None | Some("1" | "true" | "on" | "yes") => Self::WaitFree,
+            Some("nospin" | "no-spin") => Self::WaitFreeNoSpin,
+            Some("0" | "false" | "off" | "no" | "mutex") => Self::Mutex,
+            Some(_) => Self::Mutex,
+        }
+    }
+}
+
+/// Ring slots for [`PublicationMode::WaitFree`]. A slot is reusable once the
+/// watermark passes the sequence that previously occupied it, so the ring only
+/// has to exceed the number of commit sequences that can be allocated but not
+/// yet published — which is bounded by the number of threads inside `commit`.
+const PUBLICATION_RING_SLOTS: u64 = 1024;
+const PUBLICATION_RING_MASK: u64 = PUBLICATION_RING_SLOTS - 1;
+/// Re-drain attempts before a committer parks on the `Condvar`. A predecessor
+/// that has entered `commit` is only a few hundred nanoseconds from publishing,
+/// so a short spin usually beats a futex round trip; the parking path bounds the
+/// cost when it does not.
+const PUBLICATION_SPIN_ROUNDS: u32 = 64;
+
 struct CommitPublicationGate {
     completed_commit: AtomicU64,
     wait_lock: Mutex<PublicationState>,
     ready: Condvar,
+    mode: PublicationMode,
+    /// Ready-sequence ring for [`PublicationMode::WaitFree`]. Empty under
+    /// [`PublicationMode::Mutex`], which allocates nothing extra.
+    ring: Box<[AtomicU64]>,
+    /// Committers parked on `ready` under [`PublicationMode::WaitFree`]. Read
+    /// without the mutex so an advancing committer can skip the lock entirely
+    /// when nobody is waiting.
+    parked: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -263,11 +341,30 @@ struct PublicationState {
 }
 
 impl CommitPublicationGate {
+    /// Production always selects a mode explicitly (see
+    /// [`ShardedMvccStore::with_compression_policy`]); the gate tests use this
+    /// to build the default mutex gate directly.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_mode(PublicationMode::Mutex)
+    }
+
+    fn with_mode(mode: PublicationMode) -> Self {
+        let ring = match mode {
+            PublicationMode::Mutex => Vec::new(),
+            PublicationMode::WaitFree | PublicationMode::WaitFreeNoSpin => {
+                (0..PUBLICATION_RING_SLOTS)
+                    .map(|_| AtomicU64::new(0))
+                    .collect()
+            }
+        };
         Self {
             completed_commit: AtomicU64::new(0),
             wait_lock: Mutex::new(PublicationState::default()),
             ready: Condvar::new(),
+            mode,
+            ring: ring.into_boxed_slice(),
+            parked: AtomicUsize::new(0),
         }
     }
 
@@ -294,8 +391,18 @@ impl CommitPublicationGate {
     #[cfg_attr(feature = "bench-instrumentation", inline(never))]
     fn publish_with_probe<P: CommitLockProbe>(&self, commit_seq: CommitSeq, probe: &mut P) {
         let total_started = probe.start();
+        match self.mode {
+            PublicationMode::Mutex => self.publish_mutex(commit_seq, probe),
+            PublicationMode::WaitFree => {
+                self.publish_wait_free(commit_seq, probe, PUBLICATION_SPIN_ROUNDS);
+            }
+            PublicationMode::WaitFreeNoSpin => self.publish_wait_free(commit_seq, probe, 0),
+        }
+        probe.finish(CommitLockPhase::PublicationTotal, total_started);
+    }
+
+    fn publish_mutex<P: CommitLockProbe>(&self, commit_seq: CommitSeq, probe: &mut P) {
         if self.completed() >= commit_seq.0 {
-            probe.finish(CommitLockPhase::PublicationTotal, total_started);
             return;
         }
 
@@ -305,7 +412,6 @@ impl CommitPublicationGate {
         let mut lock_hold_started = probe.start();
         if self.completed() >= commit_seq.0 {
             probe.finish(CommitLockPhase::PublicationLockHold, lock_hold_started);
-            probe.finish(CommitLockPhase::PublicationTotal, total_started);
             return;
         }
 
@@ -317,7 +423,6 @@ impl CommitPublicationGate {
             }
             if self.completed() >= commit_seq.0 {
                 probe.finish(CommitLockPhase::PublicationLockHold, lock_hold_started);
-                probe.finish(CommitLockPhase::PublicationTotal, total_started);
                 return;
             }
 
@@ -329,6 +434,110 @@ impl CommitPublicationGate {
             lock_hold_started = probe.start();
             state.waiters = state.waiters.saturating_sub(1);
         }
+    }
+
+    /// Advance `completed_commit` over every contiguous sequence already present
+    /// in the ring. Any thread may run this; the CAS makes concurrent drains
+    /// idempotent. Returns whether this call moved the watermark.
+    ///
+    /// `next` is never 0 (sequences start at 1) and the ring is zero-initialized,
+    /// so an untouched slot can never be mistaken for a ready sequence. A slot is
+    /// only written once the watermark has passed its previous occupant
+    /// (`seq - PUBLICATION_RING_SLOTS`), so a stale value can never match `next`
+    /// either — the ring is ABA-free without tagging.
+    fn drain_ready_prefix(&self) -> bool {
+        if self.ring.is_empty() {
+            // `PublicationMode::Mutex` allocates no ring; the mutex path owns the
+            // watermark there and never calls this.
+            return false;
+        }
+        let mut advanced = false;
+        loop {
+            let current = self.completed_commit.load(Ordering::Acquire);
+            let next = current.wrapping_add(1);
+            let slot = usize::try_from(next & PUBLICATION_RING_MASK).unwrap_or(0);
+            if self.ring[slot].load(Ordering::Acquire) != next {
+                return advanced;
+            }
+            if self
+                .completed_commit
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::Acquire)
+                .is_ok()
+            {
+                advanced = true;
+            }
+        }
+    }
+
+    /// Wake any parked committers after the watermark moved.
+    ///
+    /// The `parked` load and the `completed_commit` CAS in [`Self::drain_ready_prefix`]
+    /// are both `SeqCst`, as are the parking side's `parked` increment and its
+    /// `completed_commit` re-check. That total order rules out a lost wakeup:
+    /// either the parker's increment precedes this load (so it is notified), or
+    /// this CAS precedes the parker's re-check (so it never sleeps).
+    fn notify_parked(&self) {
+        if self.parked.load(Ordering::SeqCst) > 0 {
+            let _state = self.wait_lock.lock();
+            self.ready.notify_all();
+        }
+    }
+
+    fn publish_wait_free<P: CommitLockProbe>(
+        &self,
+        commit_seq: CommitSeq,
+        probe: &mut P,
+        spin_rounds: u32,
+    ) {
+        let seq = commit_seq.0;
+        if self.completed() >= seq {
+            return;
+        }
+
+        // Claim the ring slot. It last held `seq - PUBLICATION_RING_SLOTS`, which
+        // is consumed once the watermark passes it. Sequences are allocated inside
+        // `commit` and published before it returns, so the number of allocated-but
+        // -unpublished sequences never exceeds the number of committing threads and
+        // this loop does not spin below ~1024 concurrent committers.
+        let lock_wait_started = probe.start();
+        while seq.saturating_sub(self.completed()) >= PUBLICATION_RING_SLOTS {
+            self.drain_ready_prefix();
+            std::hint::spin_loop();
+        }
+        probe.finish(CommitLockPhase::PublicationLockWait, lock_wait_started);
+
+        let hold_started = probe.start();
+        let slot = usize::try_from(seq & PUBLICATION_RING_MASK).unwrap_or(0);
+        self.ring[slot].store(seq, Ordering::Release);
+        if self.drain_ready_prefix() {
+            self.notify_parked();
+        }
+        probe.finish(CommitLockPhase::PublicationLockHold, hold_started);
+        if self.completed() >= seq {
+            return;
+        }
+
+        // A predecessor is still installing. Spin briefly, then park.
+        let prefix_wait_started = probe.start();
+        for _ in 0..spin_rounds {
+            std::hint::spin_loop();
+            if self.drain_ready_prefix() {
+                self.notify_parked();
+            }
+            if self.completed() >= seq {
+                probe.finish(CommitLockPhase::PublicationPrefixWait, prefix_wait_started);
+                return;
+            }
+        }
+
+        let mut state = self.wait_lock.lock();
+        self.parked.fetch_add(1, Ordering::SeqCst);
+        while self.completed_commit.load(Ordering::SeqCst) < seq {
+            self.ready.wait(&mut state);
+        }
+        self.parked.fetch_sub(1, Ordering::SeqCst);
+        drop(state);
+        probe.finish(CommitLockPhase::PublicationPrefixWait, prefix_wait_started);
     }
 }
 
@@ -509,6 +718,18 @@ impl ShardedMvccStore {
             .next_power_of_two()
     }
 
+    /// Create a new sharded store with an explicit ordered-publication mode.
+    ///
+    /// Only the synchronization used to advance the publication watermark
+    /// differs between modes; see [`PublicationMode`]. Benchmarks use this to
+    /// run both arms from ONE binary so an A/B cannot be confounded by codegen.
+    #[must_use]
+    pub fn with_publication_mode(shard_count: usize, mode: PublicationMode) -> Self {
+        let mut store = Self::with_compression_policy(shard_count, CompressionPolicy::default());
+        store.publication_gate = CommitPublicationGate::with_mode(mode);
+        store
+    }
+
     /// Create a new sharded store with a custom compression policy.
     #[must_use]
     pub fn with_compression_policy(shard_count: usize, policy: CompressionPolicy) -> Self {
@@ -523,7 +744,7 @@ impl ShardedMvccStore {
             shard_mask: u64::try_from(shard_count - 1).expect("shard mask fits in u64"),
             next_txn: AtomicU64::new(1),
             next_commit: AtomicU64::new(1),
-            publication_gate: CommitPublicationGate::new(),
+            publication_gate: CommitPublicationGate::with_mode(PublicationMode::from_env()),
             any_version_installed: AtomicBool::new(false),
             active_snapshots: RwLock::new(BTreeMap::new()),
             compression_policy: policy,
@@ -700,12 +921,20 @@ impl ShardedMvccStore {
         }
 
         let proof = txn.merge_proof(block).cloned().unwrap_or_default();
+        // A freshly-allocated block (two concurrent creates writing disjoint inode
+        // slots / group descriptors) has NO version at the shared snapshot, so the
+        // version chain yields an empty base and the range-overlay merge would
+        // spuriously reject on a length mismatch. Fall back to the base bytes the
+        // committing txn recorded during its RMW — the on-disk content both writers
+        // patched from, i.e. the true common ancestor (bd-bhh0i; the single-store
+        // path fixed the same way at `MvccStore::resolved_write_*`).
         let base = shard
             .versions
             .get(&block)
             .and_then(|versions| {
                 resolve_version_bytes_cow_at_or_before(versions, txn.snapshot().high)
             })
+            .or_else(|| txn.staged_base(block).map(std::borrow::Cow::Borrowed))
             .unwrap_or_default();
         let latest = shard
             .versions
@@ -824,6 +1053,7 @@ impl ShardedMvccStore {
         snapshot: Snapshot,
         bytes: Vec<u8>,
         merge_proof: Option<&MergeProof>,
+        staged_base: Option<&[u8]>,
     ) -> Vec<u8> {
         let observed = Self::latest_commit_seq_in_shard(shard, block);
         if observed <= snapshot.high {
@@ -831,10 +1061,17 @@ impl ShardedMvccStore {
         }
 
         let proof = merge_proof.cloned().unwrap_or_default();
+        // Same freshly-allocated-block base fallback as the preflight
+        // (`check_write_mergeable_locked`): install must rebuild the merged block
+        // from the SAME common ancestor the preflight validated against, or a
+        // disjoint-slot merge that the gate accepted would install unmerged bytes
+        // (clobbering the concurrent writer's slot) via the `merge_bytes` None
+        // fallback below (bd-bhh0i).
         let base = shard
             .versions
             .get(&block)
             .and_then(|versions| resolve_version_bytes_cow_at_or_before(versions, snapshot.high))
+            .or_else(|| staged_base.map(std::borrow::Cow::Borrowed))
             .unwrap_or_default();
         let latest = shard
             .versions
@@ -854,10 +1091,17 @@ impl ShardedMvccStore {
         block: BlockNumber,
         bytes: Vec<u8>,
         merge_proof: Option<&MergeProof>,
+        staged_base: Option<&[u8]>,
         ctx: CommitInstallContext,
     ) {
-        let version_bytes =
-            Self::merged_write_bytes_locked(shard, block, ctx.snapshot, bytes, merge_proof);
+        let version_bytes = Self::merged_write_bytes_locked(
+            shard,
+            block,
+            ctx.snapshot,
+            bytes,
+            merge_proof,
+            staged_base,
+        );
         let version_data = Self::build_version_data(
             shard.versions.get(&block),
             version_bytes,
@@ -1104,15 +1348,41 @@ impl ShardedMvccStore {
     /// the next checkpoint (and the WAL). Completes the OpenFs store interface so the
     /// sharded store is wireable.
     pub fn flush_to_device<D: BlockDevice>(&self, cx: &Cx, device: &D) -> FfsResult<usize> {
+        self.flush_to_device_after(cx, device, CommitSeq(0))
+            .map(|(flushed, _)| flushed)
+    }
+
+    /// Flush versions committed after `flushed_through` and return the snapshot
+    /// through which the device is durable.
+    ///
+    /// The caller must serialize calls and advance its watermark only after this
+    /// method succeeds. Keeping that cursor at the filesystem/device boundary
+    /// lets the public [`Self::flush_to_device`] retain its full-checkpoint
+    /// semantics for callers that supply unrelated devices.
+    pub fn flush_to_device_after<D: BlockDevice>(
+        &self,
+        cx: &Cx,
+        device: &D,
+        flushed_through: CommitSeq,
+    ) -> FfsResult<(usize, CommitSeq)> {
         let snapshot = self.current_snapshot();
+        if snapshot.high <= flushed_through {
+            return Ok((0, snapshot.high));
+        }
         // Collect visible (block, bytes) across all shards (each under its read lock,
         // briefly), then sort + coalesce + write holding no shard lock.
         let mut items: Vec<(BlockNumber, Vec<u8>)> = Vec::new();
         for shard in &self.shards {
             let shard = shard.read();
             for (block, versions) in &shard.versions {
-                if let Some(bytes) =
-                    crate::resolve_version_bytes_at_or_before(versions, snapshot.high)
+                let Some(idx) = crate::newest_visible_index(versions, snapshot.high) else {
+                    continue;
+                };
+                if versions[idx].commit_seq <= flushed_through {
+                    continue;
+                }
+                if let Some(bytes) = compression::resolve_data_with(versions, idx, |v| &v.data)
+                    .map(std::borrow::Cow::into_owned)
                 {
                     items.push((*block, bytes));
                 }
@@ -1143,7 +1413,7 @@ impl ShardedMvccStore {
         if flushed > 0 {
             device.sync(cx)?;
         }
-        Ok(flushed)
+        Ok((flushed, snapshot.high))
     }
 
     /// Commit a transaction with first-committer-wins (FCW) conflict detection.
@@ -1238,6 +1508,7 @@ impl ShardedMvccStore {
                 block,
                 staged.bytes,
                 Some(&staged.merge_proof),
+                staged.base.as_deref(),
                 install_ctx,
             );
         }
@@ -1319,6 +1590,7 @@ impl ShardedMvccStore {
                 block,
                 staged.bytes,
                 Some(&staged.merge_proof),
+                staged.base.as_deref(),
                 install_ctx,
             );
         }
@@ -1509,10 +1781,142 @@ impl ShardedMvccStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn publication_mode_cutover_defaults_to_wait_free_with_mutex_fallback() {
+        assert_eq!(PublicationMode::default(), PublicationMode::WaitFree);
+        assert_eq!(
+            PublicationMode::from_env_value(None),
+            PublicationMode::WaitFree
+        );
+        for enabled in ["1", "true", "on", "yes"] {
+            assert_eq!(
+                PublicationMode::from_env_value(Some(enabled)),
+                PublicationMode::WaitFree
+            );
+        }
+        for fallback in ["0", "false", "off", "no", "mutex", "invalid"] {
+            assert_eq!(
+                PublicationMode::from_env_value(Some(fallback)),
+                PublicationMode::Mutex
+            );
+        }
+        assert_eq!(
+            PublicationMode::from_env_value(Some("nospin")),
+            PublicationMode::WaitFreeNoSpin
+        );
+    }
 
     fn make_store(shards: usize) -> ShardedMvccStore {
         ShardedMvccStore::new(shards)
+    }
+
+    #[derive(Debug)]
+    struct CheckpointDevice {
+        blocks: RwLock<HashMap<BlockNumber, Vec<u8>>>,
+        block_size: u32,
+        block_count: u64,
+    }
+
+    impl CheckpointDevice {
+        fn new(block_size: u32, block_count: u64) -> Self {
+            Self {
+                blocks: RwLock::new(HashMap::new()),
+                block_size,
+                block_count,
+            }
+        }
+    }
+
+    impl BlockDevice for CheckpointDevice {
+        fn read_block(
+            &self,
+            _cx: &Cx,
+            block: BlockNumber,
+        ) -> ffs_error::Result<ffs_block::BlockBuf> {
+            let data = self
+                .blocks
+                .read()
+                .get(&block)
+                .cloned()
+                .unwrap_or_else(|| vec![0_u8; self.block_size as usize]);
+            Ok(ffs_block::BlockBuf::new(data))
+        }
+
+        fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> ffs_error::Result<()> {
+            self.blocks.write().insert(block, data.to_vec());
+            Ok(())
+        }
+
+        fn block_size(&self) -> u32 {
+            self.block_size
+        }
+
+        fn block_count(&self) -> u64 {
+            self.block_count
+        }
+
+        fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn incremental_flush_writes_only_versions_after_watermark() {
+        const BS: u32 = 4096;
+        let cx = Cx::for_testing();
+        let store = make_store(4);
+        let dev = CheckpointDevice::new(BS, 64);
+
+        let mut initial = store.begin();
+        initial.stage_write(BlockNumber(10), vec![0x10; BS as usize]);
+        initial.stage_write(BlockNumber(11), vec![0x11; BS as usize]);
+        store.commit(initial).expect("initial commit");
+        let (initial_flushed, initial_through) = store
+            .flush_to_device_after(&cx, &dev, CommitSeq(0))
+            .expect("initial checkpoint");
+        assert_eq!(initial_flushed, 2);
+
+        let mut changed = store.begin();
+        changed.stage_write(BlockNumber(11), vec![0xBB; BS as usize]);
+        changed.stage_write(BlockNumber(20), vec![0xCC; BS as usize]);
+        store.commit(changed).expect("changed commit");
+        let (incremental_flushed, incremental_through) = store
+            .flush_to_device_after(&cx, &dev, initial_through)
+            .expect("incremental checkpoint");
+        assert_eq!(incremental_flushed, 2);
+        assert!(incremental_through > initial_through);
+
+        let blocks = dev.blocks.read();
+        assert_eq!(
+            blocks.get(&BlockNumber(10)).unwrap(),
+            &vec![0x10; BS as usize],
+            "unchanged durable block must remain byte-identical"
+        );
+        assert_eq!(
+            blocks.get(&BlockNumber(11)).unwrap(),
+            &vec![0xBB; BS as usize]
+        );
+        assert_eq!(
+            blocks.get(&BlockNumber(20)).unwrap(),
+            &vec![0xCC; BS as usize]
+        );
+        drop(blocks);
+
+        let (repeat_flushed, repeat_through) = store
+            .flush_to_device_after(&cx, &dev, incremental_through)
+            .expect("idempotent checkpoint");
+        assert_eq!(repeat_flushed, 0);
+        assert_eq!(repeat_through, incremental_through);
+
+        let unrelated = CheckpointDevice::new(BS, 64);
+        assert_eq!(
+            store.flush_to_device(&cx, &unrelated).unwrap(),
+            3,
+            "public full-checkpoint API must not inherit another device's cursor"
+        );
     }
 
     #[test]
@@ -1713,6 +2117,91 @@ mod tests {
             "SHARDED_PUBLISH_GOLDEN|ready_prefix=2,3|release=1|completed={}",
             gate.completed()
         );
+    }
+
+    /// Both publication modes must be indistinguishable: every publisher returns
+    /// only once its own sequence is covered, and the watermark advances over a
+    /// contiguous prefix, so no snapshot taken under one mode could observe a
+    /// state the other cannot produce. Shuffled concurrent publication is the
+    /// adversarial case — it forces out-of-order arrivals, which is exactly where
+    /// the wait-free ring and the mutex/BTreeSet gate could diverge.
+    #[test]
+    fn commit_publication_gate_wait_free_matches_mutex_under_shuffled_publish() {
+        const SEQS: u64 = 2000;
+        const THREADS: u64 = 8;
+
+        for mode in [
+            PublicationMode::Mutex,
+            PublicationMode::WaitFree,
+            PublicationMode::WaitFreeNoSpin,
+        ] {
+            let gate = Arc::new(CommitPublicationGate::with_mode(mode));
+            let mut handles = Vec::new();
+            for thread in 0..THREADS {
+                let gate = Arc::clone(&gate);
+                handles.push(std::thread::spawn(move || {
+                    // Strided: each thread owns a non-contiguous subset, so
+                    // within every round the arrival order is whatever the
+                    // scheduler picks — the out-of-order case the ring and the
+                    // BTreeSet could diverge on. Ascending per thread keeps the
+                    // set collectively publishable: a thread parked on seq `s`
+                    // only waits on predecessors owned by threads that are not
+                    // themselves waiting on `s`.
+                    let mut seq = thread.saturating_add(1);
+                    while seq <= SEQS {
+                        gate.publish(CommitSeq(seq));
+                        // Publishing returns only when the caller's own sequence
+                        // is covered — the contract both modes share.
+                        assert!(
+                            gate.completed() >= seq,
+                            "{mode:?}: publish returned before covering {seq}"
+                        );
+                        seq = seq.saturating_add(THREADS);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("publisher joined");
+            }
+            assert_eq!(gate.completed(), SEQS, "{mode:?}: final watermark");
+            assert!(
+                gate.wait_lock.lock().ready_commits.is_empty(),
+                "{mode:?}: buffered remnants"
+            );
+            assert_eq!(gate.parked.load(Ordering::SeqCst), 0, "{mode:?}: leaked waiter");
+        }
+    }
+
+    /// A wait-free publisher must never expose a gap: at every observation the
+    /// watermark is a contiguous prefix, so a reader resolving at `completed`
+    /// sees a state in which every earlier commit is installed.
+    ///
+    /// White-box on purpose. `publish` BLOCKS until the caller's own sequence is
+    /// covered — that is the contract — so a single thread cannot drive an
+    /// out-of-order case through it. Staging the ring directly and calling the
+    /// drain is the only way to observe the prefix rule without a second thread.
+    #[test]
+    fn commit_publication_gate_wait_free_advances_only_over_contiguous_prefix() {
+        let gate = CommitPublicationGate::with_mode(PublicationMode::WaitFree);
+        let slot = |seq: u64| usize::try_from(seq & PUBLICATION_RING_MASK).expect("ring slot");
+
+        gate.ring[slot(3)].store(3, Ordering::Release);
+        assert!(!gate.drain_ready_prefix(), "3 must not publish ahead of 1, 2");
+        assert_eq!(gate.completed(), 0);
+
+        gate.ring[slot(2)].store(2, Ordering::Release);
+        assert!(!gate.drain_ready_prefix(), "2 must not publish ahead of 1");
+        assert_eq!(gate.completed(), 0);
+
+        // 1 arrives: the whole contiguous 1..=3 prefix retires in one drain.
+        gate.publish(CommitSeq(1));
+        assert_eq!(gate.completed(), 3);
+        assert_eq!(gate.parked.load(Ordering::SeqCst), 0);
+
+        gate.publish(CommitSeq(1));
+        assert_eq!(gate.completed(), 3, "duplicate publish is a no-op");
+        gate.publish(CommitSeq(3));
+        assert_eq!(gate.completed(), 3, "already-covered publish is a no-op");
     }
 
     #[test]

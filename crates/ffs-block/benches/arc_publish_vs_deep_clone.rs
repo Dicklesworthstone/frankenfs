@@ -30,34 +30,45 @@ fn payload(xattr_len: usize) -> Payload {
 }
 
 fn bench_publish(c: &mut Criterion) {
+    // The heap field exists to be deep-cloned by the "old" arm; assert its
+    // shape here (outside timing) so the payload contract is checked and read.
+    assert_eq!(payload(64).xattr.len(), 64);
     let mut group = c.benchmark_group("inode_publish_arc_vs_clone");
     group.sample_size(50);
     // xattr_len 0 = the common no-xattr inode; larger = inodes carrying xattrs.
     for xattr_len in [0_usize, 64, 512] {
         // OLD: deep-clone the value into the slot Arc, keep the original locally.
-        group.bench_with_input(BenchmarkId::new("deep_clone", xattr_len), &xattr_len, |b, &n| {
-            b.iter_batched(
-                || payload(n),
-                |parsed| {
-                    let slot = Arc::new(("k", Arc::new(parsed.clone())));
-                    let local = parsed; // original kept for the current read
-                    black_box((slot, local.pod[0]));
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("deep_clone", xattr_len),
+            &xattr_len,
+            |b, &n| {
+                b.iter_batched(
+                    || payload(n),
+                    |parsed| {
+                        let slot = Arc::new(("k", Arc::new(parsed.clone())));
+                        let local = parsed; // original kept for the current read
+                        black_box((slot, local.pod[0]));
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
         // NEW: move into one Arc, share with the slot via a refcount clone, borrow it.
-        group.bench_with_input(BenchmarkId::new("arc_move_share", xattr_len), &xattr_len, |b, &n| {
-            b.iter_batched(
-                || payload(n),
-                |parsed| {
-                    let arc = Arc::new(parsed);
-                    let slot = Arc::new(("k", Arc::clone(&arc)));
-                    black_box((slot, arc.as_ref().pod[0]));
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("arc_move_share", xattr_len),
+            &xattr_len,
+            |b, &n| {
+                b.iter_batched(
+                    || payload(n),
+                    |parsed| {
+                        let arc = Arc::new(parsed);
+                        let slot = Arc::new(("k", Arc::clone(&arc)));
+                        black_box((slot, arc.as_ref().pod[0]));
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
     }
     group.finish();
 }

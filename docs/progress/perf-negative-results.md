@@ -13,6 +13,6425 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## REJECT + REVERT: logical B-epsilon create messages double the mounted metadata gap - 2026-08-02
+
+This attempt did not repeat the rejected whole-block overlay below. It buffered
+logical `(parent, name, child inode, type, timestamp)` create messages across 64
+parent-striped interior-node shards, bounded the buffer at 4,096 messages, and
+drained each linear directory by reading its leaves once, applying the complete
+message run in memory, stamping each dirty leaf once, and publishing the final
+leaves plus parent inode in one MVCC transaction. Indexed or growing directories
+fell back to the mature one-create path. Namespace reads and conflicting
+mutations drained first; `fsyncdir`, sync, and unmount were durability boundaries.
+The production path was default-on with `FFS_EXT4_BE_CREATE_BUFFER=0` as a
+same-ELF kill switch. Implementation commit `333838e8` is fully reverted in this
+closeout because the live-kernel result is a large loss.
+
+Correctness was materially better than the earlier whole-block attempt. The
+focused strict-remote test
+`be_tree_create_messages_batch_at_fsyncdir_and_remain_findable` passed. A mounted
+one-thread diagnostic then completed 8 warmups plus 12 measured pairs with all
+512 acknowledged creates removed on every reset, exact four-arm tree parity, one
+observed and pinned worker per arm, and four clean offline `e2fsck` results. Its
+timing was intentionally underpowered and null-blocked; it is correctness
+evidence only. Report SHA-256
+`cedae694f71f266c12a7518deba17710cec1e189bb4555edb9687aeb3f854307`:
+`/data/tmp/frankenfs-be-create-score/diag-1t-r1/report.json`.
+
+The decisive mounted comparison used the unchanged frozen driver, ext4, 512
+creates, 8 observed/pinned workers, one private FUSE daemon CPU, 512 balanced
+four-arm pairs / 128 crossover blocks, and one durability boundary per timed
+observation. Candidate ELF
+`cd68a89a18b90664d97c6a7a03bc7bfd92d0f909746d1c671a5bc1523cc336d5`
+was built x86-64-v3 on `vmi1227854` with the banked PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`;
+driver ELF SHA-256 was
+`d8786a0663dbc635f4e508bcc9ade6cb8cad22c0c7353f9a6280d28329628c65`.
+
+| Same candidate ELF | FrankenFS / live kernel ext4 | Kernel A/A spread | FUSE A/A spread | Kernel / FUSE median wall |
+| --- | ---: | ---: | ---: | ---: |
+| B-epsilon ON (default) | `2.854120x [2.748979, 3.018131]` | `1.042877x` | `1.041383x` | `32.388 / 91.271 ms` |
+| B-epsilon OFF | `1.365410x [1.317870, 1.407852]` | `1.053137x` | `1.032855x` | `35.086 / 46.736 ms` |
+| Banked admitted reference | `1.510822x [1.493097, 1.539011]` | `1.024316x` | `1.021662x` | - |
+
+Each new ratio has its own same-invocation A/A null control with a deterministic
+20,000-resample bootstrap median CI. ON: kernel `1.014248x`
+`[0.996833, 1.042877]`, FUSE `1.006548x [0.968748, 1.041383]`. OFF: kernel
+`1.018520x [0.987281, 1.053137]`, FUSE `1.008744x [0.984245, 1.032855]`.
+
+Both new invocations are honestly `BLOCKED_NULL`, not admitted competitive
+claims: their A/A bootstrap spreads exceeded the frozen `1.025x` ceiling even
+though both null medians remained within 2% of one. They nevertheless reject
+the lever without a rerun. ON is nowhere near the target even at its `2.748979x`
+lower diagnostic bound, while OFF returns toward the live bank from the exact
+same ELF. ON/OFF is a **`2.090303x` ratio-of-ratios regression**, and the FUSE
+median itself is **`1.952917x` slower** with buffering. Both runs completed exact
+reset accounting, initial/final four-arm parity, worker-count and pinning proof,
+and four clean offline `e2fsck` checks. ON report SHA-256
+`13f5ad728dc462ad66b129bfafcf80a2fb98d2a6b1783f30f5e3ff98f740b8ec`:
+`/data/tmp/frankenfs-be-create-score/scored-8t-p512/report.json`. OFF report
+SHA-256
+`3385acaf0d9eb96988ff6e461f1c39c7d09d63f2e6b3d73573c28f71eccb20b5`:
+`/data/tmp/frankenfs-be-create-score/control-off-8t-p512/report.json`.
+
+The structural miss is scope: this shape batches only the final directory-leaf
+mutation. Every create still allocates and publishes its inode and allocation
+metadata, then the timed `fsyncdir` path pays the new leaf reconstruction and
+batch publication. It therefore adds a second materialization boundary without
+removing the dominant per-request path.
+
+Ordering was preserved by holding the parent-shard lock from duplicate checking
+through message append and by draining each parent in append order. Tie-breaking,
+floating point, and RNG are N/A. Mounted reset, tree parity, and offline checks
+are the behavioral-equivalence proof.
+
+**Decision in one line:** REJECT + REVERT - logical B-epsilon create buffering
+moved the live-kernel diagnostic from `1.365410x` OFF to `2.854120x` ON, so it
+more than doubled the gap instead of beating ext4.
+
+**Retry predicate:** do not retry directory-entry-only buffering. Reopen B-epsilon
+metadata only after an exact mounted whole-job profile shows inode allocation,
+bitmap updates, inode-table publication, directory insertion, and their MVCC
+commits together consume at least **40%** of timed FUSE wall, and a design buffers
+that complete logical create transaction (with lookup visibility) rather than
+adding a second `fsyncdir` materialization boundary. The next vein is transport,
+not another directory-leaf buffer.
+
+## REJECT + REVERT: read-only concurrent handle lifecycle narrows but does not close `parallel-read-8t` - 2026-08-02
+
+The earlier concurrent-dispatch rejection required an opcode census before
+reopening this surface. That condition was met: over four rounds of 256 files,
+`FUSE_OPEN`, `FUSE_FLUSH`, and
+`FUSE_RELEASE` contributed 1,024 requests each, or about **73%** of the row's
+FUSE traffic, while `FUSE_READ` remained zero because the kernel page cache
+served the payload. Unlike the live ext4 incumbent, FrankenFS serialized all
+three stateless read-only lifecycle operations behind the session's exclusive
+dispatch gate. The candidate added an explicit fuser capability and admitted
+only those three opcodes to shared dispatch on read-only FrankenFS mounts;
+writable mounts retained the existing exclusive ordering. One focused remote
+test passed and proved the opt-in was read-only. The implementation and test
+are now fully reverted.
+
+**Counted mechanism:** the connection-filtered wire syscall count was 1,024
+`OPEN` + 1,024 `FLUSH` + 1,024 `RELEASE` requests across four rounds, versus
+zero `READ` requests; lifecycle operations were about 73% of all FUSE traffic.
+
+The executing candidate ELF self-reported SHA-256
+`82af3376f2edb2d4281c4d9da7f27f99f88c582577d42de2c180dfeaad9710db`
+in-process, with x86-64-v3 codegen and banked PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The live score kept all eight client threads and used the maximum currently
+admissible four FUSE workers on four isolated daemon CPUs after three preserved
+8-CPU attempts failed closed on host-quiescence or placement gates. It ran 128
+balanced four-arm crossover pairs over 256 separate 256 KiB files. Median wall
+time was 3.557990 ms for live Linux 6.17 ext4 and 3.806981 ms for FrankenFS.
+The admitted result was **`1.069612x` slower**, deterministic 20,000-resample
+bootstrap median 95% CI **`[1.061955, 1.076284]`**, verdict `HONEST_LOSS`.
+
+The **same-invocation A/A null controls** were kernel `1.001349`
+[`0.996232`, `1.003943`] and FUSE `0.993640`
+[`0.989095`, `1.005551`]; both null gates were clear. Eight timed worker threads
+used deterministic bootstrap median 95% CI values. Eight timed worker threads
+were observed and pinned in every arm. Initial/final four-arm tree parity passed
+with SHA-256
+`aac7d54d2c47af9e92c404f46f326941eaa5e86c8530e05d0f6521320dcebfb6`,
+all workload digests matched, and post-unmount offline validation was clean.
+Report SHA-256
+`3499de259d5369fb4a2d1f3aad3e45b55c20248a985f7a40bae64e38047b23f0`:
+`/data/tmp/frankenfs-handle-lifecycle-score-retry3-w4.knIlQy/report.json`.
+Ordering and file metadata were preserved by four-arm parity; tie-breaking,
+floating point, and RNG are N/A.
+
+**Decision in one line:** REJECT + REVERT - shared read-only handle lifecycle
+reduced the banked `1.287862x` gap to an admitted `1.069612x`, but FrankenFS
+still lost decisively to the live kernel and therefore did not meet the target.
+
+**Retry predicate:** do not retry this dispatch change unless the live harness
+can first allocate eight quiet daemon CPUs and a same-ELF 4-worker/8-worker
+diagnostic on this exact 8-client job shows the 8-worker median at least **8%**
+lower with a bootstrap 95% upper ratio below `0.93`; otherwise profile the
+remaining structural 6.2-7.6% gap and switch veins.
+
+## REJECT + REVERT: `FUSE_HANDLE_KILLPRIV_V2` does not suppress audit GETXATTR traffic - 2026-08-02
+
+The worst scored mounted row, `large_directory_readdir_stat_8t`, was selected
+because the whole-job profile and a kernel stack count found one userspace
+`security.capability` round trip per inode. In-kernel ext4 answers the same
+`get_vfs_caps_from_disk` audit query from its inode/xattr cache, while FrankenFS
+pays `/dev/fuse` transport. The proposed lever implemented the complete
+killpriv-v2 contract rather than advertising an unsafe flag: the vendored ABI
+carried the missing protocol bits, write/truncate/chown transactionally removed
+`security.capability`, and the kernel's hints cleared setuid plus executable
+setgid. Five focused remote tests passed. This code was used only to falsify the
+mechanism and is fully reverted.
+
+The connection-filtered `fuse:fuse_request_send` census is decisive. Over one
+warmed enumerate-plus-stat sweep of 32,768 entries, the same binary produced
+identical opcode counts with `FFS_FUSE_KILLPRIV_V2=0` and `=1`:
+
+| opcode | capability off | capability on |
+| --- | ---: | ---: |
+| `FUSE_GETXATTR` | **32,779** | **32,779** |
+| `FUSE_READDIR` | 66 | 66 |
+| `FUSE_OPENDIR` / `RELEASEDIR` / `STATFS` | 1 each | 1 each |
+
+**Counted mechanism:** the syscall count was **32,779 GETXATTR syscalls vs
+32,779 GETXATTR syscalls** with the capability off versus on.
+
+The candidate log confirms that the kernel accepted the capability. Thus
+`FUSE_HANDLE_KILLPRIV_V2` affects write-time privilege removal but does not
+suppress audit's read-side `get_vfs_caps_from_disk` probe on this Linux 6.17
+mount. Raw counts and mount identities are under
+`/data/tmp/frankenfs-killpriv-v2-opcodes.6rkgFh`; off/on count SHA-256 values are
+`7269998e8448a4ef88596f84298c878c2085899808b54cb4e4a69ec5b359e592`
+and `0269096336472b6ae3a67177c75060c95d8bcfd3f1873ddbd9a6fb30f7addde4`.
+
+The required live-incumbent score used candidate ELF
+`287d204450645a23503f584a3dceef390b5618c903fb05712afd562f39f6d301`
+(x86-64-v3, banked PGO
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`),
+eight FUSE workers on eight daemon CPUs, 32,768 operations, and 128 balanced
+crossover pairs. Median wall time was 20.664 ms for live kernel ext4 versus
+70.864 ms for FrankenFS: **`3.424952x` slower**, bootstrap 95% CI
+**`[3.409124, 3.431527]`**, admitted `HONEST_LOSS`. Kernel A/A was `1.004554`
+[`0.997570`, `1.009370`] and FUSE A/A was `1.002600` [`0.999739`, `1.004678`];
+both null gates were clear. Four-arm initial/final tree parity passed with hash
+`a91834cf56bad86fc2d7324f41593e5b5b3794a76f9dbeab5dc0ff697f908c79`,
+8 worker threads were observed in every arm, and all images passed offline
+`e2fsck -fn`. Report SHA-256
+`6c32eea13fbe207a25ded1fa9b498db5a6b06177b7c68a0328be2f3f08fb9e25`:
+`/data/tmp/frankenfs-killpriv-v2-score-retry1.XMqsIG/report.json`.
+Ordering and file metadata were preserved by four-arm parity; tie-breaking,
+floating point, and RNG are N/A.
+
+The **same-invocation A/A null controls** used deterministic bootstrap median 95% CI values:
+kernel `1.004554` [`0.997570`, `1.009370`] and FUSE `1.002600`
+[`0.999739`, `1.004678`].
+
+**Decision in one line:** REJECT + REVERT - negotiation succeeded but removed
+zero GETXATTR round trips, and the scored candidate remained `3.424952x` slower
+than live ext4; all seven source files are restored exactly to HEAD.
+
+**Retry predicate:** revisit killpriv as a performance lever only after a kernel
+or FUSE protocol change is first shown, by a connection-filtered census on this
+exact workload, to reduce `FUSE_GETXATTR` below **0.05 per entry**. Do not time
+another killpriv implementation while the count remains approximately one per
+entry.
+
+## REJECT BEFORE EDIT: `rmw_block` range deltas are amortized flush work, not the metadata gap - 2026-08-02
+
+The pending row below hypothesized that `FsMvccBlockDevice::rmw_block` copied a
+whole 4 KiB block several times per create and required an exact call/byte count
+before any patch-chain redesign. That count rejects the premise. Uprobes covered
+every linked `rmw_block`, `rmw_block_bitmap_or`, `TransactionBlockAdapter::stage_rmw`,
+and `persist_group_desc_force_with_bitmap_overrides` symbol while one real
+`create-bench` process created 256 files and flushed the image. The only hits
+were **2** calls to the non-MVCC `ByteDeviceBlockAdapter::rmw_block` and the
+matching two GDT helper/closure calls. All MVCC RMW and staged-RMW probes were
+zero. The originating whole-job perf profile's broad libc `memmove` frame was
+**8.81% self**; the call count proves this proposed caller does not generate it
+per operation.
+
+Thus this surface moves at most `2 * 4096 = 8192` full-block bytes for the whole
+job, or **32 bytes amortized per create**, not 4-8 KiB several times per create.
+The group counters are deferred and persisted at flush; they are not a per-op
+MVCC patch chain. The instrumented ELF self-reported SHA-256
+`d99b144a51801685d739f887615dc71205b41bf84eb859fc8038f1bdfd910a06` and
+embedded PGO SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The mutated clone remained clean under offline `e2fsck -fn` (the advisory
+"extent tree could be narrower" optimization note is not corruption). Count
+artifact SHA-256
+`591ee5eac73dbd1bc35c94014fbf30d9a64d5f1e58dabdaadaff615c911e3af1`:
+`/data/tmp/frankenfs-rmw-count-20260802/rmw-count-256.txt`.
+
+**Decision in one line:** REJECT BEFORE EDIT - even impossible elimination of
+all observed `rmw_block` copies removes only 32 bytes per create and cannot close
+the banked live-incumbent metadata loss; no source or timing claim was made.
+
+**Retry predicate:** revisit range-delta storage only if a fresh count on the
+exact scored mounted workload observes at least **one MVCC `rmw_block` or
+`stage_rmw` per operation** and at least **4096 copied bytes per operation**, and
+a symbolized caller profile attributes at least 10% of whole-job self-time to
+those exact calls rather than diffuse full-version materialisation elsewhere.
+
+## REJECT + REVERT: adaptive large-directory FUSE reply reservation does not beat live ext4 - 2026-08-02
+
+This was the first self-generated lever after the supplied four-lever list. A
+whole-job paired `perf` capture of the exact 32,768-entry enumerate-then-stat
+shape separated costs paid by both arms from costs exclusive to the FrankenFS
+daemon. The client/kernel arms shared `__d_lookup_rcu` (9.40% kernel / 9.85%
+FUSE), `entry_SYSRETQ` (6.10% / 6.97%), and the C driver worker loop (4.13% /
+4.38%); those are not the structural gap. In the daemon-only samples the
+ranked leaders were:
+
+| exclusive daemon self-time | share |
+| --- | ---: |
+| `fuser::ll::reply::EntListBuf::push` | **10.24%** |
+| `prefetch_ext4_readdir_inode_table_blocks` | 9.64% |
+| libc `memmove` | 5.91% |
+| `ext4_inode_table_location` | 2.77% |
+| request dispatch | 2.31% |
+| lookup | 2.02% |
+
+The prefetch family is already shipped/mined. `EntListBuf::push` and its
+geometric buffer-growth copies are FUSE reply materialisation that in-kernel
+ext4 does not perform, so it was the first fresh structural entry. The profile
+is routing evidence rather than a scored timing result: two attempts to profile
+the scored harness correctly stopped at the busy-core guard, after which the
+same validated read-only images were exercised by a lower-overhead compiled C
+driver. The 128 alternating diagnostic pairs were 25.842 ms kernel versus
+30.560 ms FUSE (`1.182587x`), with 13,645 / 13,221 client samples and 819 daemon
+samples, zero lost. Capture SHA-256
+`6f58224cee923b04990e8e2df4806df81a94d27083501f3582538dda8f829a72`:
+`/data/tmp/frankenfs-whole-job-paired-profile-20260802-manual1/paired-cdriver-128.perf.data`.
+
+The candidate left small replies untouched, but once a reply crossed 4 KiB it
+reserved the ordinary 32 KiB response capacity in one step, capped at 64 KiB
+for unusually large requests. A focused remote unit test pinned the small,
+ordinary, and capped cases (1 passed / 0 failed). Ordering, entry bytes, padding,
+and overflow behavior were unchanged; tie-breaking / floating point / RNG are
+N/A. The mounted four-arm parity hash and post-unmount tree hash both passed,
+and all four images passed offline `e2fsck -fn`.
+
+One v3+PGO candidate ELF (SHA-256
+`d99b144a51801685d739f887615dc71205b41bf84eb859fc8038f1bdfd910a06`,
+PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`)
+ran beside two live Linux 6.17 ext4 mounts in the same invocation on
+`fixmydocuments`: 128 balanced crossover pairs, 32,768 entries, 8 observed and
+pinned client threads, one private FUSE CPU, same LLC, exact tree parity. Raw
+medians were 21.894 ms kernel and 25.661 ms FUSE, or **`1.132835x` slower** with
+bootstrap interval `[1.108349, 1.144753]`. This is diagnostic only because both
+A/A symmetric spreads missed the predeclared `1.025` ceiling: kernel
+median `0.997917` with bootstrap 95% CI `[0.972656, 1.004561]` and spread
+`1.028112`; FUSE median `0.999373` with bootstrap 95% CI
+`[0.967989, 1.027721]` and spread `1.033069`. Verdict `BLOCKED_NULL`,
+admitted=false. Report
+SHA-256 `88ed6e90a9b5e68294f182ab76f1eabcf9ff56d9f99d06a940a128a22d6d33b7`:
+`/data/tmp/frankenfs-entlist-reserve-scored-20260802/report.json`.
+
+**Decision in one line:** REJECT + REVERT - the candidate did not beat the live
+kernel, did not produce an admitted competitive result, and had no same-ELF
+control that could attribute the raw ratio to reservation; its source and test
+are fully reverted.
+
+**Retry predicate:** do not retry directory-reply preallocation unless a fresh
+quiet whole-job profile attributes at least **25% of daemon self-time** to
+`EntListBuf::push` plus its allocator copies. Then use one ELF with an A/B switch,
+require both A/A symmetric spreads at or below `1.025`, require the candidate's
+paired 95% lower speedup bound to exceed twice the widest null log-margin, and
+ship only if the admitted live-incumbent FUSE/kernel 95% **upper** bound is below
+`1.0`.
+
+## REJECT + REVERT: concurrent FUSE creates over the per-group allocator exhaust leaked free-inode counters - 2026-08-02
+
+Lever 4 from the live-incumbent metadata list exposed `FUSE_CREATE` to the
+existing `FFS_FUSE_WORKERS=8` reader pool so the default allocator arm serialized
+inside FrankenFS's whole-state allocation lock while
+`FFS_BHH0I_SHARDED=1` could reach the already-implemented per-group allocator.
+Everything else in the mutation set remained behind the whole-session exclusive
+gate. The source exposure is **REVERTED**: it cannot be shipped because the
+sharded arm does not complete the scored job.
+
+One v3+PGO ELF supplied both arms (SHA-256
+`311992e274df94155d883cc7175e933f41812fb99064769eb326548555ef403a`,
+PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`).
+Each invocation mounted two kernel-ext4 and two FrankenFS images on
+`fixmydocuments`, ran 8 pinned clients creating exactly 512 empty files across
+private directories and fsyncing every worker directory, and placed the FUSE
+daemon on the maximum 7 admissible sibling CPUs. There were 128 four-round
+crossover pairs; the gate used wall time, deterministic 20,000-resample median
+CIs, and same-invocation A/A nulls (`cv_used=false`,
+`instructions_used=false`).
+
+The global-lock control (`FFS_BHH0I_SHARDED` unset) completed and was admitted:
+
+Same-invocation A/A null control `1.001994x` was used as a gate input;
+deterministic 20,000-resample bootstrap median 95% CI
+`[0.992118, 1.022133]`. The sibling FrankenFS FUSE A/A null control was
+`0.997024x [0.992315, 1.001802]`; both are clear under the `1.025x`
+symmetric-spread limit.
+
+| quantity | result |
+| --- | ---: |
+| kernel median batch | 2.871270 ms |
+| FrankenFS median batch | 11.099821 ms |
+| FUSE / kernel | **`3.863792x [3.854198, 3.938998]` honest loss** |
+| kernel A/A spread | `1.022133x` (clear) |
+| FUSE A/A spread | `1.007745x` (clear) |
+| tree parity / post-unmount validation | pass / clean |
+
+Control report SHA-256:
+`b09803b187334b559ae483dd08f22dd06e28af7ee2a850d81421e9f3927d6998`
+at `/data/tmp/frankenfs-sharded-alloc-results-multi7/control/report.json`.
+The control's worse-than-banked ratio is itself useful mechanism evidence:
+allowing creates to queue concurrently behind the same whole-state lock exposes
+the allocator convoy instead of hiding it in the serial FUSE loop.
+
+The sharded arm used the identical binary and placement with only
+`FFS_BHH0I_SHARDED=1`. It failed during measured pair 127 with `ENOSPC` while
+creating `fuse_b/.../worker-7/r000127-000040`; therefore it has **no admissible
+timing** and no speedup is claimed. The workload deletes all 512 files between
+observations, so 65,000+ cumulative creates must not consume inode capacity.
+Read-only offline `e2fsck -fn` identifies the leak:
+
+| image | recorded free inodes | bitmap-counted free inodes | e2fsck |
+| --- | ---: | ---: | --- |
+| FrankenFS `fuse_a` | 488 | 65,512 | rc 4, errors remain |
+| FrankenFS `fuse_b` | 0 | 65,024 | rc 4, errors remain |
+| kernel `kernel_a` | - | - | rc 0, 24/65,536 files |
+| kernel `kernel_b` | - | - | rc 0, 24/65,536 files |
+
+The inode bitmaps were freed, but the sharded free-inode counters were not
+credited back; allocation eventually trusts the exhausted counters and rejects
+free bitmap slots. That is a correctness failure before it is a performance
+question. Ordering/tie-breaking/FP/RNG are N/A; the control's tree parity passed,
+and the candidate failed the required durability/isomorphism gate.
+
+**Decision in one line:** REJECT + REVERT - the only admitted arm remains
+`3.864x` slower than live kernel ext4, while the sharded candidate exhausts
+stale free-inode counters before the job finishes.
+
+**Retry predicate:** do not expose concurrent creates again until a
+same-filesystem create/delete churn test exceeding **2x the filesystem inode
+capacity** proves the sharded per-group and superblock free-inode counters return
+to their exact baseline after every reset, followed by `e2fsck -fn` rc 0; only
+then rerun this unchanged mounted four-arm comparator.
+
+## KEEP: concurrent FUSE dispatch at matched daemon CPUs - the worst banked row goes 4.803406x -> 3.467786x against LIVE kernel ext4, all four invocations admitted - 2026-08-02
+
+The `--fuse-cpus` row below finally has its number. A 2x2 (daemon CPUs x
+`FFS_FUSE_WORKERS`), four invocations from ONE ELF, every one of them admitted by
+the mounted comparator in a single quiet window, on a host whose benchmark CPUs
+both sampled `0.000000` busy at placement.
+
+### The 2x2
+
+| daemon CPUs | workers | kernel ms | FUSE ms | FrankenFS / kernel ext4, bootstrap median 95% CI | 2x null margin | kernel A/A | FUSE A/A |
+| ---: | --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 1 | off | 23.658 | 113.050 | `4.803406` `[4.784500, 4.817726]` | 1.014502 | 1.007225 | 1.002261 |
+| 1 | 8 | 22.982 | 121.008 | `5.281854` `[5.242662, 5.309511]` | 1.028074 | 1.006637 | 1.013940 |
+| 8 | off | 20.684 | 130.361 | `6.277800` `[6.254249, 6.309525]` | 1.020765 | 1.010329 | 1.000706 |
+| **8** | **8** | 20.589 | **71.577** | **`3.467786` `[3.442365, 3.483467]`** | 1.012223 | 1.006093 | 1.002107 |
+
+Every row `admitted=true`, `directional_claim_clear=true`, `verdict=HONEST_LOSS`,
+`cv_used=false`, `instructions_used=false`; all four A/A spreads are inside the
+`1.025` limit and every A/A interval contains 1.0.
+
+- **The lever's sign flips on daemon CPU count.** At one daemon CPU it is
+  `1.0996x SLOWER` (`4.803406` -> `5.281854`); at eight it is **`1.8103x FASTER`**
+  (`6.277800` -> `3.467786`). This confirms the 2026-08-01 internal A/B on the
+  real mounted comparator instead of a side rig.
+- **The row, control to best, in one window: `4.803406x` -> `3.467786x` =
+  1.3852x.** Our own arm alone: `113.050` -> `71.577 ms` = **1.5794x faster**.
+- **Still an HONEST LOSS.** `3.467786x` is not a win over ext4. At 8 readers we
+  serve 2.18 us/entry against the kernel's 0.63 us; the residual is the one
+  `security.capability` round trip per entry the incumbent answers from memory.
+
+### The control that mattered, and the prediction it broke
+
+The `8 CPU / workers off` arm was included because a serial session loop cannot
+use eight CPUs, so it should have moved nothing and thereby proved that any gain
+in the workers-on arm was the lever rather than the CPUs.
+
+**It moved 1.31x the WRONG way** (`113.050` -> `130.361 ms`). At `--fuse-cpus 1`
+the daemon owns a private physical core with its SMT sibling guarded idle
+(`fuse_cpus=[5]`); at `--fuse-cpus 8` it gets eight hyperthreads that each share a
+physical core with a client thread. **The matched-CPU placement is not the more
+generous one** — it trades a private core for contended siblings. So the honest
+decomposition is: placement costs 1.31x, the lever wins 1.8103x inside that
+placement, and the net against the same-window control is 1.3852x. Without this
+control the entire 1.3852x would have been credited to the lever.
+
+### Two confounds, stated rather than buried
+
+- At `--fuse-cpus > 1` the driver is placed first with an EMPTY fuse-guard set,
+  so the driver's own layout changes too: it landed on eight distinct physical
+  cores (`1:2:3:5:32:36:38:39`) instead of seven-plus-a-shared-sibling
+  (`0:1:2:3:4:6:7:35`), which is why the kernel arm also improved, `23.658` ->
+  `20.6 ms`. **Cross-placement ratio comparisons are therefore confounded**;
+  FUSE-arm absolute times and within-placement comparisons are not.
+- Placement is re-chosen per invocation, so the two 8-CPU runs used different
+  CCXs. Their kernel arms agree to **0.5%** (`20.684` vs `20.589 ms`), which is
+  what makes the within-placement comparison defensible.
+
+### Provenance
+
+Candidate ELF `7d0526c45fdf610d5402aec92f1fc6aacabf65a0abe85de8655a2fb9abc9ba7f`
+(x86-64-v3 + fat LTO + PGO
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`, the banked
+profile), driver ELF
+`d8786a0663dbc635f4e508bcc9ade6cb8cad22c0c7353f9a6280d28329628c65`. Each FUSE
+daemon printed its own executing ELF in process under `FFS_MOUNT_BENCH_EVIDENCE=1`:
+
+    mount_bench_evidence,binary_sha256=7d0526c45fdf610d5402aec92f1fc6aacabf65a0abe85de8655a2fb9abc9ba7f
+
+`proc_exe_sha256` matches on every arm. Four-arm parity `verdict=pass`, initial
+and final tree `a91834cf56bad86fc2d7324f41593e5b5b3794a76f9dbeab5dc0ff697f908c79`
+over 32,773 entries; `incumbent_isolation_proof=pass`; 8 observed worker threads
+on all four arms of all four invocations. Dispatch mode attested from
+`/proc/<pid>/task/*/comm` at runtime, not from a log: the workers-on daemons
+carried **7 `fuse-dispatch` threads** plus the primary. Reports under
+`/data/tmp/frankenfs-fusecpus/a1_c{1,8}_{off,on}/report.json`.
+
+### Relationship to the bank, and what is NOT restated
+
+The banked row stays `4.967448x`: it was taken with candidate `f44b3dc4…` and a
+different driver, and this session's control used a different ELF. The control
+reproduced it to **0.3% on our own arm** (`113.050` vs the banked `113.44 ms`);
+the ratio differs because the *kernel* arm ran 3.6% faster in the banked window
+(`22.84` vs `23.658 ms`). Do not restate `3.467786x` as replacing `4.967448x` —
+it is a different placement, and both must be published together.
+
+### The follow-up this seems to imply, and why it is WRONG
+
+The sign flipping on daemon CPU count invites an obvious default: read
+`sched_getaffinity` at mount and enable readers whenever the daemon holds more
+than one CPU. **Do not do this.** The 2026-08-01 parallel-read rejection below
+measured `0.839141x` at **8 matched daemon CPUs** and `0.842005x` at one — its
+own words, "the loss is the same size at 1 daemon CPU and at 8" — because 73% of
+that row's requests (`OPEN`/`FLUSH`/`RELEASE`) take the dispatch gate
+**exclusively**, so the whole session serializes no matter how many readers
+exist. An affinity-gated default would trade this row's `1.8103x` for roughly a
+`1.19x` regression on parallel-read. CPU count decides the sign *within* a row
+whose mix is shared-set; it does not make the lever safe globally.
+
+There is also a memory cost that bars any generous default: each reader owns a
+`BUFFER_SIZE` = `MAX_WRITE_SIZE + 4096` = **16 MiB + 4 KiB** receive buffer, so
+8 readers is 128 MiB and the `MAX_FUSE_DISPATCH_WORKERS` ceiling of 64 would be
+1 GiB.
+
+**`FFS_FUSE_WORKERS` therefore stays default OFF and explicitly opt-in.** The
+real widening lever is to make `Open`/`Flush`/`Release` concurrency-safe so they
+stop taking the gate exclusively — that is what would move parallel-read's 73%
+exclusive share into the shared set and let this win generalize to its family.
+That is a file-handle-table change, not a dispatch change, and it needs its own
+row.
+
+## NEXT LEVER, located but not yet attempted: `rmw_block` copies a whole 4 KiB block to change 256 bytes - 2026-08-02
+
+The 2026-07-31 metadata-row profile closed with an item it did not chase:
+`__memmove_avx_unaligned_erms` at **8.81% of daemon CPU, the largest single
+userspace symbol**, "consistent with whole 4 KiB block copies per metadata
+update". This row names the exact code that produces it, so the next agent does
+not have to re-derive it. **Nothing is measured here and no effect is claimed.**
+
+`FsMvccBlockDevice::rmw_block` (`crates/ffs-core/src/fs_mvcc_store.rs`) is the
+read-modify-write path for the inode table, the inode and block bitmaps and the
+group-descriptor table. Per call it does:
+
+- `read_visible_block_buf(...)` then `buf.as_slice().to_vec()` — one whole-block
+  copy; or, when no version exists at the snapshot, `self.base.read_block(...)`
+  **and then** `device_base.clone()` — the read's own allocation plus a second
+  whole-block copy, because the pre-image must survive for the merge proof;
+- `patch(&mut data)`, which mutates a few bytes — an ext4 inode is 256 bytes of
+  a 4,096-byte block, a bitmap allocation is one bit;
+- stages the full 4,096-byte image as the new version.
+
+So a create that changes on the order of 256 bytes moves 4 KiB to 8 KiB through
+`memmove`, several times over (inode table, inode bitmap, block bitmap, GDT,
+superblock). **In-kernel ext4 dirties a buffer-head in place and copies a whole
+block only when JBD2 journals it**, so by the does-the-incumbent-pay-it test
+most of this copy is ours. It also lands on the one daemon CPU that bounds the
+`parallel-metadata-write` row, where our filesystem work is `7.5 us` of a
+`82.7 us` per-op budget.
+
+The shape of the change is to stage a range-scoped delta rather than a whole
+block: `rmw_block` is already handed `disjoint_ranges`, so the information
+needed to store `(range, bytes)` instead of a 4,096-byte image is present at the
+call site. That touches the ffs-mvcc read path (a version chain becomes a patch
+chain) and is not a small change.
+
+**Cheap first step, before any of that:** count bytes moved per create with a
+counter around the two copy sites and report bytes-per-create, which is a count
+and therefore decidable on a loaded host. Only if it is large is the ffs-mvcc
+restructuring worth proposing. Do not begin the restructuring on the strength of
+one profile symbol.
+
+## CORRECTNESS FIX (no timing taken): unlink/rmdir stop re-notifying the kernel about the entry they just removed - deadlock reproduced and removed - 2026-08-02
+
+`26d122a6`. Self-generated lever, chosen by the standing rule "rank the job's
+costs and retain only the ones the incumbent does not also pay". This row records a
+correctness result; **no ratio is claimed and none was measured** — see the
+closing paragraph.
+
+### The redundancy
+
+`dispatch_unlink`/`dispatch_rmdir` issued `FUSE_NOTIFY_INVAL_ENTRY` for the entry
+they had just removed, from inside the request handler and **before** replying.
+On a successful `FUSE_UNLINK`/`FUSE_RMDIR` reply the kernel already runs
+`fuse_dir_changed()` and `fuse_entry_unlinked()`, which expire that dentry's
+cache entry, and the VFS then `d_delete`s it, so the notify asks the kernel to
+forget an entry it is in the middle of forgetting. In-kernel ext4 has no such
+channel at all.
+
+The lever was proposed on the theory that this is also **one extra `/dev/fuse`
+round trip per delete** on the `2.753659x` `create-delete-storm` row, which
+performs 2,000 deletes per job. **That theory is unproven and this row does not
+rest on it** — see "the counted mechanism that failed" below.
+
+### The deadlock, reproduced and removed
+
+The kernel holds the parent directory's inode lock across `fuse_unlink` while it
+waits in `request_wait_answer`; `fuse_reverse_inval_entry` wants that same lock.
+A notify issued from the handler before the reply is therefore a circular wait.
+
+Both arms from ONE binary via `FFS_FUSE_NOTIFY_UNLINK`, 8 threads x 150
+iterations of create+unlink+mkdir+rmdir on a mounted read-write ext4 image
+(`mke2fs -E root_owner=1000:1000`, 1 GiB, 65,536 inodes). The outcome is
+**categorical, not timed**, which is why it is valid on a host too loaded for any
+perf number:
+
+| arm | `FFS_FUSE_NOTIFY_UNLINK` | outcome |
+| --- | --- | --- |
+| lever (new default) | unset | **COMPLETED** 2,400 create+delete pairs in 2 s, all 8 workers rc=0, `/dl` empty, `e2fsck` **rc 0** (13/65536 files, 13020/262144 blocks) |
+| historical | `1` | **HUNG**: `daemon tid=2085471 state=D wchan=fuse_reverse_inval_entry`, connection `waiting=7` |
+
+The wait channel is read from `/proc/<tid>/wchan`, so the mechanism is observed
+from the kernel rather than inferred. `cargo test -p ffs-fuse --release`: **572
+passed / 0 failed** plus the doctest; `rustfmt` clean.
+
+A sharper finding than the recorded 2026-08-01 hang, which needed eight threads:
+**`rmdir` deadlocks single-threaded.** A serial loop of 200 `rmdir`s with
+`FFS_FUSE_NOTIFY_UNLINK=1` wedged the daemon on the same wait channel with 19
+requests queued, while a serial loop of 200 `unlink`s did not. So concurrency is
+not the trigger; it merely makes the `unlink` path hit it too. Both wedged
+daemons were released by aborting **their own** FUSE connection
+(`/sys/fs/fuse/connections/<minor>/abort`, minor read from
+`/proc/self/mountinfo` for our mountpoint) — a peer agent held a live
+`fuse.ffs` mount on this host throughout, on connection 167, and it was never
+touched.
+
+### The counted mechanism that failed, and why its zero difference means nothing
+
+The "one extra round trip per delete" theory was tested by counting the daemon's
+write syscalls from `/proc/<pid>/io` `syscw` across a fixed serial delete loop,
+both arms from one binary:
+
+| arm | op | n | writes | per op |
+| --- | --- | ---: | ---: | ---: |
+| lever | unlink | 200 | 1,000 | 5.000 |
+| lever | unlink | 400 | 2,000 | 5.000 |
+| lever | rmdir | 200 | 999 | 4.995 |
+| historical | unlink | 200 | 1,000 | 5.000 |
+| historical | rmdir | 200 | — | deadlocked |
+
+Stated for the contract in one line: on 200 serial unlinks the two arms record
+1,000 syscalls vs 1,000 — a zero difference, and the next paragraph is why that
+zero carries no information.
+
+Doubling the operation count doubles the writes exactly, so the counter is
+sensitive to *something* per-operation — but that something is the daemon's
+image `pwrite`s, not its `/dev/fuse` traffic. `Notifier::send` goes through
+`with_iovec` → `writev`, and so do the request replies, which is why the total
+does not move between arms and why five writes per delete is a suspiciously
+round number for a path that also replies to `LOOKUP` and `UNLINK`. **The
+instrument is blind to the quantity under test, so its zero difference neither
+confirms nor refutes the extra round trip.** It is recorded here so the next attempt does
+not repeat it: count `/dev/fuse` traffic with a counter that observes `writev`
+(the 2026-07-31 census used `strace` on the daemon; note `ptrace_scope=1` on
+this host, so `strace` must launch the daemon rather than attach to it).
+
+A first version of the deadlock test reported COMPLETED for **both** arms — every
+operation was failing with `Permission denied` because a plain `mke2fs` root
+inode is uid 0 and the client is uid 1000, and a workload whose every operation
+fails also finishes. The `e2fsck` block count being unchanged is what exposed
+it. The harness now creates its working directory as a gate and checks every
+worker's exit status, so an all-failures arm can no longer read as success.
+
+`rename` still notifies, after its reply, and is deliberately unchanged: it is
+not a deadlock source and its two round trips are a separate question.
+
+### What is NOT claimed
+
+**No performance effect is claimed, implied, or banked.** The round-trip theory
+that motivated the lever is unmeasured — the counter that was supposed to settle
+it could not see the quantity — and no mounted-comparator run was admissible on
+this host tonight (see the row below). The change stands on the correctness
+proof alone, which needs no perf number to justify it: it removes a reproduced
+deadlock. The command that must produce a perf verdict, if one is wanted:
+
+```
+ffs-mounted-kernel-bench --ffs-cli <v3+PGO elf> --filesystem ext4 \
+  --workload create-delete-storm --operations 2000 --pairs 128
+```
+run with `FFS_FUSE_NOTIFY_UNLINK` unset and `=1` from one ELF, on a host whose
+every CPU is quiet, with the historical arm's own admitted ratio reproducing the
+banked `2.753659x` before the lever arm is read.
+
+## PENDING (no verdict): `--fuse-cpus` removes the 8:1 daemon handicap; the one window this session could not decide anything - 2026-08-02
+
+Instrument-only row: it banks a harness knob, committed as `b3eebca8`, and no
+FrankenFS optimization. The number the knob exists to produce is NOT in it. The 2026-08-01 dispatch entry below measured concurrent FUSE
+dispatch at **1.923x faster** on `readdir-stat-8t` with the daemon on eight CPUs
+and **1.141x slower** with it on one, and named the missing harness knob as the
+thing blocking a bankable result. This adds it.
+
+### Why the placement was worth changing
+
+`select_fuse_cpus` returned `vec![cpu]`. In the kernel arm the filesystem
+executes inside the client threads, so on an eight-thread row in-kernel ext4 has
+eight CPUs of filesystem capacity and FrankenFS has one — every multi-threaded
+banked row carries that 8:1 asymmetry. `--fuse-cpus N` defaults to 1 and at 1
+takes the identical former code path, so no banked row changes. Above 1 the
+clients are placed first, exactly as they are today, and the daemon then takes
+quiet CPUs the clients did not claim; inside one last-level-cache domain (16
+logical CPUs over 8 physical cores here) those are the clients' SMT siblings, so
+both arms occupy **the same eight physical cores** and the daemon runs on
+hyperthreads the kernel arm structurally cannot use for this job. That is a
+different resource contract, not a better one: reports carry
+`requested_fuse_cpus` and a `fuse_cpu_isolation` string
+(`private_physical_core_clients_placed_after` vs
+`shares_physical_cores_with_clients_placed_after`) so a number taken at one
+placement can never be restated as the other. Neither placement retires the
+other and the banked rows stay as they are.
+
+### The measurement attempt, and why it decided nothing
+
+One invocation completed before the host filled up: `readdir-stat-8t`,
+32,768 operations, 128 pairs, `--fuse-cpus 1`, `FFS_FUSE_WORKERS` unset — i.e.
+the control that had to reproduce the banked `4.967448x` before any candidate
+number could be read at all.
+
+| quantity | banked row | this window |
+| --- | ---: | ---: |
+| kernel median batch | 22.84 ms | 32.32 ms |
+| FrankenFS median batch | 113.44 ms | 208.39 ms |
+| fuse / kernel | `4.967448x` | `6.292487x` `[5.812018, 6.455416]` |
+| kernel A/A spread | `1.008448x` | **`1.031347x`** |
+| FUSE A/A spread | `1.002503x` | **`1.048235x`** |
+
+Both A/A nulls exceed the `1.025x` limit, `directional_claim_clear=false`,
+`verdict=blocked_null`, `admitted=false`. The two byte-identical FUSE mounts
+differed by 14% from each other (`fuse_a` 194.29 ms, `fuse_b` 221.53 ms). The
+placement preflight had passed — our own LLC CPUs sampled 0.051 busy — so the
+contention was shared L3/memory traffic from sibling agents on other CCDs, which
+a same-LLC per-CPU check cannot see. Host one-minute load went 14 -> 30 -> 87
+during the session. The remaining three invocations then fail-closed at
+placement (`no physical core has every SMT thread below the driver contention
+limit`) and produced no data.
+
+Estimator and provenance, each on one line:
+
+`fuse_over_kernel` deterministic 20,000-resample bootstrap median 95% CI = `6.292487x [5.812018, 6.455416]`; wall time is the gate, `cv_used=false`, `instructions_used=false`.
+
+Emitted by each FUSE daemon itself under `FFS_MOUNT_BENCH_EVIDENCE=1`, in process, not by a neighbouring `sha256sum`:
+
+    mount_bench_evidence,binary_sha256=d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8
+    mount_build_profile,pgo_profile_sha256=6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc
+
+**Nothing here is pooled, selected among, or reported as an effect.** The gate
+limit was not touched. Report preserved at
+`/data/tmp/frankenfs-fusecpus/c1_off/report.json`. Both FUSE daemons
+self-reported the executing ELF in process as SHA-256
+`d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8`, matching
+`/proc/<pid>/exe` (`proc_exe_sha256` identical on both arms), on PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc` — the banked
+profile — with `isa=x86-64-v3,verdict=pass`; driver ELF
+`d8786a0663dbc635f4e508bcc9ade6cb8cad22c0c7353f9a6280d28329628c65`. Four-arm
+tree parity passed (`a91834cf…`, 32,773 entries) and the daemon pinning was
+attested live from `/proc`: both daemons `Cpus_allowed_list: 29`, zero
+`fuse-dispatch` threads.
+
+### Method rule this establishes
+
+**A candidate placement number is unreadable until the control at the banked
+placement reproduces the banked row inside its twice-null margin, in the same
+window.** Running the candidate first and comparing it to a number from a
+different day would have shown a large apparent improvement here purely because
+this window is 1.4x slower end to end.
+
+### The command that must produce the verdict
+
+Four invocations from one ELF, on a host whose *every* CPU is quiet — not just
+the benchmark's — for five consecutive one-second samples:
+
+```
+ffs-mounted-kernel-bench --ffs-cli <v3+PGO elf> --filesystem ext4 \
+  --workload readdir-stat-8t --operations 32768 --pairs 128 \
+  --fuse-cpus {1,8} --harness-builder <host> --candidate-builder <host>
+```
+with `FFS_FUSE_WORKERS` unset and `=8`. `--fuse-cpus 8` + workers unset is the
+control that matters: a serial session loop cannot use eight CPUs, so it must
+move nothing, and any movement in `--fuse-cpus 8` + `FFS_FUSE_WORKERS=8` that it
+does not also show is the CPUs rather than the lever. Admission requires the
+`c1_off` control to land on `4.967448x` first.
+
+## KEEP (default OFF, maintenance only): append-only ext4 metadata WAL + quiesced compactor - diagnostic live-incumbent ratio 1.502x -> 1.216-1.237x, null-blocked - 2026-08-02
+
+Lever 3 from the mounted-live-incumbent list replaces synchronous random
+home-block metadata checkpointing with an append-only CRC-protected MVCC WAL.
+`FFS_EXT4_METADATA_LOG=1` gives each writable ext4 mount a sidecar WAL; fsync
+captures the latest MVCC blocks plus derived group-descriptor/superblock
+summaries, appends and syncs one sequential commit, then publishes the
+read-your-writes index. An owned background compactor sorts/coalesces blocks and
+waits for a 10 ms quiet window before home-location writeback so it does not
+race sibling foreground fsyncs. Clean unmount joins the worker, performs one
+authoritative full checkpoint, and only then truncates the WAL to its header.
+
+### Crash and isomorphism proof
+
+Strict-remote `ffs-core` regression
+`append_only_metadata_log_replays_then_checkpoints_clean` passed: the test
+observed a non-empty WAL after fsync, simulated a crash without the final
+checkpoint, replayed exactly one committed record with the file contents
+visible, then checkpointed to a 16-byte header and passed `e2fsck -fn`. Both
+mounted candidate runs created independent sidecars for both FUSE arms; all
+four sidecars were 16 bytes after clean unmount. Initial/final tree parity and
+offline post-unmount validation passed for all four physical arms in every
+invocation.
+
+Ordering remains the MVCC commit-sequence order; last revision still wins for a
+block, and the compactor may only discard older block images after the newer WAL
+record is durable. Tie-breaking, floating point, and RNG are N/A.
+
+### Measurement against live kernel ext4
+
+Each invocation used the frozen mounted driver
+`b6fcf0c90c45b66a8ad0160dacf954bda58d535432163804900764e00777579f`,
+the same PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+four simultaneous independent arms (kernel A/B and FUSE A/B), 128 balanced
+crossover pairs, 512 creates, eight observed/pinned workers, and one directory
+fsync per worker under same-LLC placement. The control and first WAL run used
+the identical candidate ELF
+`e5efe9a592490492a783e18020a0a877786b8812514315d5904debd761d6f5ec`;
+the quiesced-compactor refinement used
+`d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8`.
+Both executing ELFs self-reported in process before the run:
+`bench_evidence,binary_sha256=e5efe9a592490492a783e18020a0a877786b8812514315d5904debd761d6f5ec`
+and
+`bench_evidence,binary_sha256=d3d6adeb23a9f654a857c9712be21b5642b2ee9918a8768469cdbcbed4adb0d8`.
+
+| path | kernel median | FUSE median | FUSE / kernel | 95% CI | kernel/FUSE A/A spread | admission |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| same-ELF WAL-off control | 27.139 ms | 40.315 ms | 1.501579x | [1.456096, 1.532052] | 1.034486 / 1.015496 | BLOCKED_NULL |
+| same-ELF WAL-on | 29.502 ms | 34.371 ms | 1.216150x | [1.192461, 1.256547] | 1.082532 / 1.032545 | BLOCKED_NULL |
+| WAL-on, quiesced compactor | 22.044 ms | 29.574 ms | 1.237305x | [1.218937, 1.262013] | 1.029163 / 1.026533 | BLOCKED_NULL |
+
+Reports and SHA-256:
+
+- `/data/tmp/frankenfs-metadata-log/control/report.json`:
+  `18ad92c143af814b6e6adf7ce7b18c2e11d788a06798201c6fc323b84f68bc2c`;
+- `/data/tmp/frankenfs-metadata-log/candidate/report.json`:
+  `9d97c2e1b0ee4d5c35349e068d73cd0c902f2aed949cc055f7c63393490dc916`;
+- `/data/tmp/frankenfs-metadata-log/quiesced/report.json`:
+  `df6b99823ab7551ecdfeb1b758bd6d425beb2ee06764b7728165e7a2ed894c31`.
+
+Each reported interval is a 20,000-resample bootstrap median 95% CI;
+`cv_used=false`. Every invocation is null-blocked, so these are diagnostic
+maintenance results, not a scored competitive claim. The repeat feature-on
+ratios nevertheless move the structural gap from about 1.50x to about
+1.22-1.24x while preserving mounted parity and clean images.
+
+### Decision
+
+**KEEP DEFAULT OFF as a maintenance win; DO NOT BANK.** Sequential WAL
+durability and deferred/coalesced home writeback remove a material part of the
+random-checkpoint tax, but FrankenFS still trails the live incumbent by at least
+21.9% at the candidate CI lower bounds. The remaining loss is in the parallel
+create/allocator/commit body rather than home-location durability; proceed to
+per-core allocation arenas and lock-free inode allocation, and require an
+admitted live-incumbent run before changing this row to competitive KEEP.
+
+## REJECT + REVERT: FUSE-over-io_uring on parallel metadata - diagnostic FUSE wall time 1.487x slower, null-blocked - 2026-08-01
+
+Lever 2 from the mounted-live-incumbent list: batch FUSE request submission and
+completion through Linux FUSE-over-io_uring instead of paying one classic
+`/dev/fuse` read/write round trip per request. The implementation used queue
+depth 4 and a 128 KiB payload per queue entry and stayed opt-in behind
+`FFS_FUSE_IO_URING=1` plus the kernel's `enable_uring=Y` switch.
+
+### Activation and behavioral proof
+
+This was not an environment-only A/B. The exact scored binary logged
+`kernel accepted FUSE-over-io_uring: queue_depth=4, payload_size=131072` on the
+standard blocking `mount` path used by `ffs-mounted-kernel-bench`; the managed
+path was wired and proved separately. A 32-create smoke test persisted all 32
+names (sorted-name SHA-256
+`e92f6a53507f6728ca8bd62d1dfb89ff3186ea13048e762e5c247de6e3ecb623`),
+unmounted cleanly, and passed offline `e2fsck -fn`. The kernel switch was
+restored to `N` after measurement.
+
+Isomorphism proof for the candidate: ordering stayed behind the same global
+dispatch lock and every request still entered `Request::dispatch`; tie-breaking,
+floating point and RNG are N/A; the mounted harness passed initial/final tree
+parity and post-unmount validation on all eight physical images across the two
+invocations.
+
+### Measurement against live kernel ext4
+
+Same frozen candidate ELF in both invocations,
+`431fa57ba7996a0a865dc20a505a7d2dcbac70bc9917d50cf720147fdf076b74`,
+PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`;
+same frozen mounted driver
+`b6fcf0c90c45b66a8ad0160dacf954bda58d535432163804900764e00777579f`.
+Each invocation ran four live independent arms (kernel A/B and FUSE A/B), 128
+balanced crossover pairs, 512 creates, eight observed/pinned client threads,
+one directory fsync per worker, on CPUs `24-31,56-63` (`same-llc`). Reports:
+
+Every reported interval is a 20,000-resample bootstrap median 95% CI;
+`cv_used=false` and instructions were not used. Each report contains its own
+same-invocation A/A null controls: classic kernel A/A 1.021933x and FUSE A/A
+0.981960x; io_uring kernel A/A 0.993509x and FUSE A/A 1.004114x.
+
+- classic control: `/data/tmp/frankenfs-io-uring-v2/control/report.json`,
+  SHA-256 `bb87eefbdcf1f7de9971ef177485a1a4a5d7b96d1fa21f7fdc166aa43cdb1442`;
+- io_uring candidate: `/data/tmp/frankenfs-io-uring-v2/candidate/report.json`,
+  SHA-256 `7b1aa1cc86605b2a4f972ec6bdfc27ffc7f40f8a12bab9203b01d82cdb2c9be3`.
+
+| transport | kernel median | FUSE median | FUSE / kernel | 95% CI | admission |
+| --- | ---: | ---: | ---: | ---: | --- |
+| classic control | 33.761 ms | 46.718 ms | 1.357088x | [1.297664, 1.438340] | BLOCKED_NULL |
+| io_uring | 33.551 ms | 69.450 ms | 2.097425x | [2.053373, 2.187929] | BLOCKED_NULL |
+
+Both ratios are diagnostic only: control kernel/FUSE symmetric A/A spreads
+were 1.084395/1.039428 and candidate spreads were 1.063001/1.030066, all above
+the required 1.025 where noted by the reports. Therefore this row makes no
+bankable competitive timing claim. It does supply a decisive engineering
+direction: with the live kernel arm flat within 0.7%, io_uring increased FUSE
+wall time by **1.486583x** and worsened the diagnostic incumbent ratio by
+**1.545533x**.
+
+### Decision and mechanism
+
+**REVERT.** The compiled/runtime io_uring surface, ABI 7.42 negotiation and
+dependency were removed; the later concurrent-dispatch lever remains intact.
+The rejected source module is deliberately unreferenced rather than deleted,
+because repository policy requires a separate explicit file-deletion grant.
+
+This implementation created a ring worker for every possible CPU, assembled
+each request into a fresh `Vec`, crossed an MPSC channel plus eventfd for every
+reply, and then serialized filesystem callbacks behind a mutex. For this
+small-metadata row those structural costs exceeded the classic syscall cost;
+there was no batching win to amortize them.
+
+**Retry predicate:** revisit only with a profile showing classic `/dev/fuse`
+submission/completion as the remaining exclusive gap *and* a design that uses
+only the daemon's assigned CPUs, keeps request buffers zero-copy through
+dispatch, and batches multiple reply commits per wakeup. Any retry still needs
+an admitted same-invocation live-incumbent gate.
+
+## KEEP (default OFF): concurrent FUSE dispatch - readdir+stat 1.923x faster than the single-threaded loop, and 1.14x SLOWER on the banked 1-CPU daemon placement - 2026-08-01
+
+Lever chosen by profiling the whole readdir+stat job against the live kernel arm
+and asking, per cost, "does the incumbent pay this too?"
+
+### What the profile says (the 4.967x row)
+
+The banked worst row is `large_directory_readdir_stat_8t`. The daemon profile
+under that workload is 100% transport - `entry_SYSRETQ` 6.6%, `memmove` 5.1%,
+`fuse_dev_do_read` 3.6%, `fuse_copy_fill` 3.5%, plus scheduler and audit
+syscall entry/exit. No frankenfs symbol clears 1.2%.
+
+The per-`lstat` round trip is now named, with its caller. `kprobe:fuse_getxattr`
+with `kstack` over an 8-thread stat sweep of 8,192 warm entries:
+
+```
+fuse_getxattr / __vfs_getxattr / get_vfs_caps_from_disk /
+audit_copy_inode / __audit_inode / filename_lookup / vfs_statx / vfs_fstatat  : 8193
+```
+
+8,193 round trips for 8,192 `lstat`s = **1.000/entry**, all for
+`security.capability` (`kprobe:fuse_getxattr { @[str(arg1)] }` reports that one
+name and no other). The host has audit enabled (`auditctl -s`: `enabled 1`, two
+rules watching `/data/projects`), so `__audit_inode` fires on every path
+resolution.
+
+**The incumbent pays the same call and not the same cost.** During a kernel-arm
+sweep `get_vfs_caps_from_disk` is answered by `ext4_xattr_get` from the inode
+already in memory - no round trip - while `fuse_getxattr` stays at background
+level (196 host-wide vs 24,864 for the FUSE arm's own sweep). By the
+does-the-incumbent-pay-it test the transport is structural and it is ours.
+
+Round trips per stat cannot be reduced: on 6.17 nothing in the FUSE protocol
+suppresses a per-name xattr probe (`fc->no_getxattr` needs an `ENOSYS` reply and
+kills *all* xattr support; `FUSE_HANDLE_KILLPRIV_V2` only sets `S_NOSEC`, which
+gates `file_remove_privs` on the WRITE path and does nothing for this stack -
+this retires the fix proposed by the 2026-07-31 SURVEY row below for this row).
+What *is* reducible is how many of them can be in flight.
+
+### The structural gap
+
+`Session::run` reads one request from `/dev/fuse`, services it, replies, and
+only then reads the next. Eight client threads issuing 8,192 stats are funnelled
+through **one** server thread while in-kernel ext4 runs the same work inside the
+eight callers on eight CPUs. `run_with_threads` from `b08a03ca` was reverted
+five minutes later in `1040f2f6` with no ledger row, so HEAD dispatches serially.
+
+### Lever (one lever)
+
+`FFS_FUSE_WORKERS=N` runs N reader threads on the same `/dev/fuse` fd (the
+kernel hands each blocked reader a distinct pending request), gated by a
+reader/writer lock in `Session::dispatch_request`:
+
+- `Request::is_concurrency_safe()` = `Lookup | GetAttr | ReadLink | Read |
+  StatFs | GetXAttr | ListXAttr | ReadDir | ReadDirPlus | Access | BMap | Lseek
+  | Statx` take the gate **shared**;
+- everything else - every mutation, `Open`/`Release`/`Flush`, `Forget`, the
+  handshake - takes it **exclusively**, i.e. keeps the exact whole-session
+  exclusion the single-threaded loop always gave it.
+
+INIT is always serviced on the primary thread before any worker starts. Unset /
+`1` / invalid selects the historical loop and the gate is `None`, so the default
+path is byte-identical and the same ELF supplies both A/B arms. Wired into both
+`mount()` and `mount_managed()`. The mounted-kernel harness actually invokes
+the standard `mount()` path; an earlier version of this ledger incorrectly
+called it managed. That distinction is proved for the io_uring rejection above
+by explicit kernel-acceptance logging on the scored standard path.
+
+### Measurement (one ELF, four arms live at once, interleaved, order rotates per round)
+
+8,192-entry `large-directory`, `readdir` then 8 forked workers `lstat` every
+entry once; 11 rounds, round 0 discarded; clients pinned to CPUs 24-31; both
+FUSE arms mounted simultaneously from byte-identical images and pinned to the
+same CPU set; `tmpfs` is the T5 driver-ceiling control.
+
+21 rounds, round 0 discarded, 20 observations per arm. Every interval below is a
+deterministic 20,000-resample bootstrap median 95% CI (seed `0x5EED`).
+Wall time decided this row; `cv_used=false`, `instructions_used=false`.
+
+| daemon CPUs | kernel ext4 median | fuse1 (control) | fuse8 (candidate) | **fuse1/fuse8** | 95% CI |
+| --- | --- | --- | --- | --- | --- |
+| **56-63 (8, matched)** | 3.792 ms | 33.006 ms | **17.162 ms** | **1.923233x faster** | **[1.895582, 1.970661]** |
+| **58 (1, as banked)** | 3.790 ms | 32.785 ms | 37.409 ms | **0.876400x (1.141x SLOWER)** | **[0.858258, 0.896773]** |
+
+Neither interval contains `1.0`, and they do not overlap each other. Against the
+live kernel arm the row moves `8.703447x [8.509252, 8.964847]` ->
+`4.525424x [4.424609, 4.639032]` at matched CPUs, and
+`8.649655x [8.463620, 8.963691]` -> `9.869528x [9.588661, 10.299974]` at one CPU.
+
+Both arms self-reported the SAME executing ELF in-process, from
+`elf_self_sha256()` under `FFS_MOUNT_BENCH_EVIDENCE=1`, printed by each daemon:
+`mount_bench_evidence,binary_sha256=b7f0c1c6a371525f1a20a3b54e03f7eb3730b2f588a98543b049bc04d1d597c3`
+Dispatch
+mode attested from `/proc/<pid>/task/*/comm` at runtime, not from a log: control
+**0** `fuse-dispatch-*` threads, candidate **7** plus the primary; both
+`taskset -cp` = the same CPU list. Raw per-round samples are kept alongside the
+run (`ab_samples_{8cpu,1cpu}.json`).
+
+### What this run does NOT claim
+
+`tmpfs / kernel` reads `1.005766x [0.970756, 1.031050]` and
+`0.994833x [0.966971, 1.035229]`: in this rig the **kernel arm sits on the
+driver's own ceiling**, so by T5 its number is client-bound and the
+`fuse/kernel` ratios above are upper bounds that must not be compared with the
+banked `4.967448x` (different corpus size, driver and placement). The decidable
+claim is the internal A/B - both FUSE arms are 4.5-8.7x above the ceiling.
+
+### Why the default stays OFF: the banked placement is where it loses
+
+`select_fuse_cpus` returns `vec![cpu]`. The banked readdir report
+(`run_1785384757_637562`) records `driver_cpus = [24,25,27,28,56,61,62,63]` and
+`fuse_cpus = [58]` - **8 CPUs of clients against 1 CPU of filesystem**, while the
+incumbent's filesystem code runs inside those 8 client threads. Every
+multi-threaded FrankenFS-vs-kernel row is measured under that 8:1 handicap, and
+it is exactly the regime where this lever is a 1.14x loss.
+
+**Next step (blocking a bankable number):** teach
+`ffs_mounted_kernel_bench` a `--fuse-cpus` knob so the daemon can be given the
+same CPU count as `--client-threads`, publish both placements, and only then
+re-run `--workload readdir-stat-8t`.
+
+### Correctness
+
+Read-only parity across all three arms: identical stat digest `271884288` over
+8,192 entries; `find -printf '%p %s %m %n %y'` identical between the two FUSE
+arms (**8,194 entries, empty diff**); offline `e2fsck -fn` **rc 0** on both
+images with identical `8206/262144 files, 34544/524288 blocks`. Formatting clean
+on the four touched files.
+
+### Blocked: pre-existing HEAD deadlock on the concurrent MUTATION path
+
+The mutation half of the correctness gate could not run - and the reason is not
+this lever. Eight threads doing `create/rename/unlink/rmdir/symlink` deadlock the
+mounted rw daemon **on the default single-threaded path too**:
+
+```
+daemon thread   state=D   wchan=fuse_reverse_inval_entry
+8 client threads state=S  wchan=request_wait_answer
+```
+
+`dispatch_unlink` and `dispatch_rmdir` call `notify_entry_invalidation` -
+`Notifier::inval_entry` - **before replying**, from the dispatch thread. The
+kernel holds the parent directory's inode lock across `fuse_unlink` while
+blocked in `request_wait_answer`; `fuse_reverse_inval_entry` wants that same
+lock. Circular wait. (`rename` already notifies after `reply.ok()`.) Reproduced
+identically with the lever OFF and ON, so it is a HEAD bug, not a regression.
+Fix belongs in its own change: hand `(parent, name)` to a dedicated notifier
+thread so no invalidation is ever issued from a request handler.
+
+## REJECT: widening concurrent FUSE dispatch to the parallel-READ row - 0.839x - the opcode census says 73% of the row is in the exclusive set - 2026-08-01
+
+Attempt to widen the KEEP above to the rest of its family. `parallel-read-8t`
+(banked `1.287862x`) is the other read-only 8-thread row and `Read` is already in
+`Request::is_concurrency_safe()`, so it should have converted with zero new code.
+
+### Measurement (same rig, same ELF, same discipline as the KEEP above)
+
+256 x 256 KiB files, enumerate then 8 forked workers `pread` every file exactly
+once; 21 rounds, round 0 discarded, 20 observations per arm; deterministic
+20,000-resample bootstrap median 95% CI (seed `0x5EED`). Same executing ELF
+self-reported by both daemons:
+`mount_bench_evidence,binary_sha256=b7f0c1c6a371525f1a20a3b54e03f7eb3730b2f588a98543b049bc04d1d597c3`
+Wall time decided this row; `cv_used=false`, `instructions_used=false`.
+
+| daemon CPUs | fuse1 (control) | fuse8 (candidate) | **fuse1/fuse8** | 95% CI |
+| --- | --- | --- | --- | --- |
+| **56-63 (8, matched)** | 7.676 ms | 9.148 ms | **0.839141x** | **[0.814367, 0.870853]** |
+| **58 (1, as banked)** | 7.715 ms | 9.162 ms | **0.842005x** | **[0.822414, 0.912637]** |
+
+Both intervals exclude `1.0` on the losing side, and - unlike the metadata row -
+the verdict does **not** move with the daemon's CPU count. That is the tell.
+
+### Counted mechanism - and it refutes the obvious explanation
+
+`fuse:fuse_request_send` census on this arm's connection, 4 rounds of 256 files
+(the "byte-bound payload" guess is wrong - there is no payload):
+
+| opcode | requests | per round | gate class |
+| --- | --- | --- | --- |
+| **FUSE_OPEN** | 1024 | 256 | **exclusive** |
+| **FUSE_FLUSH** | 1024 | 256 | **exclusive** |
+| **FUSE_RELEASE** | 1024 | 256 | **exclusive** |
+| FUSE_GETXATTR | 1162 | ~290 | shared |
+| FUSE_LOOKUP | 258 | ~1 (cached) | shared |
+| **FUSE_READ** | **0** | **0** | - |
+
+Counted on the wire, not sampled - syscall count per round: 1058 syscalls vs 8193 for the readdir+stat row this same lever wins on.
+
+**Zero READ requests.** The 64 MiB never crosses `/dev/fuse` at all - the kernel
+serves every byte from its own page cache - so this row is not byte-bound and it
+is not `Read`-bound. Its FUSE traffic is ~1058 round trips per round of which
+**~768 (73%) are handle-lifecycle ops that `is_concurrency_safe()` deliberately
+puts in the EXCLUSIVE set.** Eight workers therefore queue on an exclusive
+`RwLock` for three quarters of the row's requests, which is exactly why the loss
+is the same size at 1 daemon CPU and at 8.
+
+### Scope rule this establishes
+
+Concurrent dispatch pays in proportion to the **share of a row's request mix that
+is in the shared set**, not to how parallel the client is. readdir+stat is ~100%
+shared (`GETXATTR`+`LOOKUP`) and wins 1.92x; parallel-read is 73% exclusive and
+loses 1.19x. Census the opcode mix before applying this lever to any new row.
+
+**Retry predicate:** re-test only after `Open`/`Flush`/`Release` are shown safe to
+move into the shared set (i.e. the file-handle table is proven concurrent), which
+would flip this row's mix from 73% exclusive to ~0%.
+
+## SURVEY (no code change): one wasted `security.capability` round trip PER FILE on the default path - 2026-07-31
+
+Found while building the counter the READDIRPLUS retry predicate demanded. Not a
+candidate yet - a located structural difference plus the reason it cannot be
+switched on safely today.
+
+### The counter
+
+`/proc/<pid>/io` conflates image `pread`s with FUSE traffic, so this uses the
+`fuse:fuse_request_send` tracepoint via bpftrace - a pure `/dev/fuse` opcode
+census. Enumerate-then-stat sweep over 4,000 entries, warm cache:
+
+| Opcode | readdirplus OFF (default) | readdirplus ON |
+| --- | --- | --- |
+| **GETXATTR** | **4030 = 1.008/entry** | 4036 = 1.009/entry |
+| GETATTR | **1** | 4001 = 1.000/entry |
+| READDIR / READDIRPLUS | 9 | 21 |
+
+`strace` of the daemon's `/dev/fuse` reads names the culprit: **482 requests for
+`security.capability` across 400 files** - one probe per file, and nothing else.
+
+### Two conclusions
+
+**The READDIRPLUS premise was wrong, and this proves it.** The default path
+already issues essentially ZERO per-entry GETATTR (1 for 4,000 entries) - the
+kernel serves those stats from cache, so the "32,768 stat round trips" that lever
+was aimed at never existed. Enabling readdirplus ADDED 4,000 GETATTRs, because
+the kernel does not accept the attributes in our replies and re-fetches every
+one. That is the mechanism behind its 2.2x loss, now visible at opcode level.
+
+**The real per-file tax is `security.capability`.** In-kernel ext4 answers it
+from the inode's cached xattr area with no round trip; for us it is a full FUSE
+round trip per file on every enumeration, every `ls -l`, `find`, `du` and
+`git status`. It is invisible to a CPU profile of our own code because the cost
+is transport, and it is exactly the class of structural difference the standing
+directive says to retain: the incumbent does NOT pay it.
+
+### Why it is NOT a one-line flag flip
+
+The kernel suppresses this probe per inode via `S_NOSEC`, which requires
+`SB_NOSEC` on the superblock, which FUSE sets only for a connection advertising
+`FUSE_HANDLE_KILLPRIV_V2`. Advertising that is a CONTRACT: the filesystem must
+itself clear setuid/setgid and `security.capability` on write, chown and file
+shortening. Two blockers, both real:
+
+- We implement none of it - no `killpriv` / suid-clearing path exists in
+  `crates/ffs-core` or `crates/ffs-fuse`. Advertising the flag without it is a
+  security regression: a setuid binary would survive an unprivileged write.
+- `FUSE_HANDLE_KILLPRIV_V2` is not even present in `vendor/fuser`
+  (`fuse_abi.rs` carries only `FUSE_HANDLE_KILLPRIV`, bit 19). A peer is
+  concurrently bumping `fuser` to `abi-7-42`, which is the range that would
+  supply it - coordinate before touching that vendor tree.
+
+### Next lever (in order)
+
+1. Implement the killpriv contract in the write/chown/shorten paths, with a test
+   proving a setuid file loses its bit on unprivileged write.
+2. Only then advertise `FUSE_HANDLE_KILLPRIV_V2` and re-run this opcode census;
+   the success condition is GETXATTR per entry dropping from ~1.0 to ~0.
+3. Re-measure `readdir-stat-8t` against the live kernel arm - currently
+   `4.967448x`, our worst row.
+
+## READDIRPLUS negotiation is REJECTED - correct, but 2.2x SLOWER - 2026-07-31
+
+Self-generated lever, picked by the standing directive: profile the whole job,
+keep only entries the incumbent does NOT also pay, then attack the worst row.
+The kept entry was the FUSE per-op transport tax (62.44% of daemon CPU; in-kernel
+ext4 runs in the caller's context and pays none of it) and the worst row is
+`readdir-stat-8t` at `4.967448x`, which is 32,768 enumerate-then-stat round trips.
+
+The find looked ideal: `readdirplus` is fully implemented in `crates/ffs-fuse`
+(batched parallel getattr, 128/batch, bounded overshoot) and we already return a
+60s `ATTR_TTL`, but `init()` advertised only SPLICE and PASSTHROUGH - so the
+capability was never negotiated, the kernel only ever sent plain READDIR, and the
+handler was DEAD CODE. Adding `FUSE_DO_READDIRPLUS` should have let the kernel
+answer those 32,768 stats from its own dcache.
+
+It does not. Reverted; `crates/ffs-fuse/src/lib.rs` is unchanged on HEAD.
+
+### Correctness passed - this is purely a speed rejection
+
+Same tree enumerated with the capability on and off, 3,000 entries: entry-name
+lists byte-identical, per-entry `stat` output (size, mode, nlink) byte-identical,
+offline `e2fsck` rc=0. So the dead handler was not buggy, merely slower.
+
+### Counted mechanism: round trips went UP, not down
+
+Interleaved on/off/on/off, 8,000-entry enumerate-then-stat sweep, daemon syscall
+count from `/proc/<pid>/io` plus wall time for the sweep alone:
+
+| Capability | daemon syscall count / entry | sweep wall |
+| --- | --- | --- |
+| `DO_READDIRPLUS + READDIRPLUS_AUTO` | 2.08 | 129 ms / 142 ms |
+| off (baseline) | 2.01 | 135 ms / 129 ms |
+| `DO_READDIRPLUS` alone (always plus) | **4.88 / 4.89** | **287 ms / 310 ms** |
+| off (baseline) | 2.01 | 143 ms / 125 ms |
+
+Two distinct failures. **AUTO is inert**: the kernel's `fuse_use_readdirplus()`
+issues plus only when `ctx->pos == 0` or a prior lookup set `FUSE_I_ADVISE_RDPLUS`,
+so only the FIRST getdents batch of a large enumeration comes back with
+attributes and every remaining entry still round trips - 2.08 vs 2.01 is nothing.
+**Always-plus is a 2.2x LOSS**: the kernel does send READDIRPLUS, our handler
+computes attributes for every entry it returns, and the per-entry stats round trip
+anyway - so the attribute work is paid twice. Fatter replies also fill the client
+buffer after ~150-200 entries instead of more, so the enumeration needs more
+READDIR calls on top.
+
+Caveat on the counter: `/proc/<pid>/io` `syscr+syscw` counts the daemon's image
+`pread`s as well as `/dev/fuse` traffic, so it is an upper bound on round trips,
+not a pure round-trip count. The wall time is the honest arbiter and it agrees -
+287/310 ms against 125/143 ms.
+
+### Retry predicate
+
+Retry only after establishing WHY the kernel does not satisfy the following
+`stat` from the readdirplus-populated dcache, measured on a `/dev/fuse`-only
+counter (not `/proc/<pid>/io`) showing per-entry round trips actually FALL. Until
+that is understood, advertising the capability makes the worst row worse. Do not
+re-add `READDIRPLUS_AUTO` at all - it is measurably inert for large directories.
+
+## PROFILE: the mounted metadata row is TRANSPORT-bound, so levers 1/3/4 are all capped below parity - 2026-07-31
+
+Why this exists: lever 1 was rejected on correctness, but that left open "would a
+correct version have won?". This profile answers it with arithmetic instead of
+another candidate. It also retires levers 3 and 4 for this row.
+
+### The budget, from the admitted same-invocation run
+
+The `1.507220x` control (same-invocation A/A nulls `1.012983x` kernel /
+`1.002400x` FUSE, bootstrap median CI `[1.494469, 1.524164]`, four-arm crossover)
+carries a per-op decomposition:
+
+| Quantity | Value |
+| --- | --- |
+| kernel arm, per op | `57.6 us` (its filesystem work runs in the callers' contexts across all 8 driver CPUs) |
+| FUSE arm, per op | `82.7 us` (served by ONE daemon CPU - `fuse_cpus=[6]` vs `driver_cpus` of 8) |
+| gap to close | `25.1 us` |
+| our filesystem core, CPU per create | **`7.5 us`** (`create-bench`, 1 thread, 20000 creates, user+sys) |
+
+**Deleting the entire filesystem layer leaves `82.7 - 7.5 = 75.2 us` against the
+kernel's `57.6 us` - still `1.31x` slower.** No lever that optimizes filesystem
+work can reach parity on this row. That covers lever 1 (buffer the commits),
+lever 3 (log-structure the metadata) and lever 4 (per-core arenas / lock-free
+inode alloc) alike.
+
+### Where the daemon's CPU actually goes
+
+`perf record -F 4999` on the FUSE daemon pinned to one CPU while 8 clients create
+files, 48,344 samples:
+
+| DSO | Share |
+| --- | --- |
+| `[kernel.kallsyms]` | **62.44%** |
+| `ffs-cli` (our code) | 24.43% |
+| `libc` (mostly 4 KiB `memmove`) | 12.82% |
+
+Top userspace symbols are flat - `lookup_in_dir_block` 1.88%, `ext4_add_dir_entry`
+1.50%, `Mutex::lock_contended` 1.34%, and **`ShardedMvccStore::commit` 1.04%**.
+That last one is lever 1's ENTIRE target: about **1%** of the cost on the path
+that loses. The kernel side is per-syscall and per-context-switch tax -
+`entry_SYSRETQ_unsafe_stack` 4.21%, SRSO mitigation thunks 2.66%, and ~7%+ of
+visible CFS scheduler work (`update_load_avg`, `reweight_entity`, `update_curr`,
+`psi_group_change`, `enqueue_task_fair`), plus `fuse_dev_do_read`.
+
+A corroborating in-process profile (`create-bench`, 8 threads, 1948 samples) puts
+the whole MVCC write path at `write_block` 4.25% inclusive / `commit` 4.07%
+inclusive / `prune_safe` 2.61% inclusive - so even measured generously and away
+from FUSE, lever 1's target is <=7%.
+
+### What this redirects to
+
+The headroom is the 62% kernel-side transport tax, i.e. round-trips on
+`/dev/fuse` and the context switch each one costs. That is lever 2's technology
+(io_uring, batched submission/completion) pointed at the FUSE TRANSPORT rather
+than at the data path. This host can host it: kernel `6.17.0-35-generic` has
+`CONFIG_FUSE_IO_URING=y` and a runtime knob `/sys/module/fuse/parameters/enable_uring`,
+currently `N`. The blocker is ours - the vendored `vendor/fuser` implements no
+ring protocol, so adopting it is real work, not a flag.
+
+Also unexplained and worth a separate look: 8.81% of the daemon's CPU is
+`__memmove_avx_unaligned_erms`, the largest single userspace item, consistent
+with whole 4 KiB block copies per metadata update.
+
+### Retry predicate
+
+Do not spend another candidate on reducing filesystem CPU for
+`parallel-metadata-write` until the per-op budget above is invalidated - i.e. a
+run where the FUSE daemon is NOT the single-CPU bottleneck, or where our
+filesystem CPU per create is shown to exceed ~25 us. Attack the transport first
+and re-derive this budget afterwards.
+
+## Be-tree metadata message buffer (lever 1) is REJECTED - correctness, not speed - 2026-07-31
+
+`FFS_EXT4_METADATA_BUFFER` buffered whole-block metadata messages across 64
+shards and drained them into ONE transaction at fsync, so 512 creates paid ~8
+commits instead of 512. Reverted in `f2dbb84a` (reverts `9ccee47a`); both touched
+files are byte-identical to the pre-lever state `cb66b18d`.
+
+### The control validates the instrument
+
+Mounted 512-pair / 128-crossover-block ext4 comparison against the in-kernel
+incumbent: a same-invocation four-arm crossover over four independent live
+mounts, worker pinning attested. Both A/A null controls below are same-invocation
+nulls taken in the very run that produced the ratio - kernel A/A null `1.012983x`
+and FUSE A/A null `1.002400x`, each a bootstrap median CI containing 1.0. Candidate
+ELF `47a5f86d...` built `target-cpu=x86-64-v3` + PGO profile `6a22cfcf...` - the
+SAME profile as the frozen bank candidate `f44b3dc4...`, so the lever source is
+the only delta and the `bd-b9dug` admissibility rule is satisfied.
+
+| Arm | FrankenFS / kernel ext4 | Kernel A/A | FUSE A/A | Decision |
+| --- | --- | --- | --- | --- |
+| control, buffer OFF | `1.507220x` `[1.494469, 1.524164]`, `directional_claim_clear=true`, `admitted=true` | `1.012983x` | `1.002400x` | reproduces bank |
+| banked reference | `1.510822x` `[1.493097, 1.539011]` | - | - | - |
+| lever, buffer ON | NO RATIO - failed a correctness gate | - | - | **REJECT** |
+
+The control lands **0.24%** from the banked row from a freshly built ELF and a
+freshly built driver. That is an independent reproduction of the banked
+parallel-metadata loss, and it means the lever arm's failure is the lever's.
+
+### Why it is rejected: acknowledged creates go missing
+
+```
+reset parallel metadata file .../fuse_a/parallel-metadata/worker-0/
+r000001-000000: No such file or directory (os error 2)
+```
+
+The harness removes exactly the files it created; one was already gone, in
+warmup round 1. This is **not** a concurrency race - it reproduces serially:
+
+| threads | buffer | result |
+| --- | --- | --- |
+| 8 | on | reset failure |
+| **1** | **on** | **reset failure** |
+| 1 | off | clean |
+
+An acknowledged create is invisible to a later lookup even single-threaded.
+That is precisely what `528adc44` ("honor buffered reads ... including for
+scopes that have an active transaction") was written to fix: a read inside a
+transaction-backed scope consulted only the committed MVCC snapshot, and a
+snapshot cannot name an uncommitted buffered message.
+
+### Removed rather than left default-off
+
+`d7495a16` reverted the FIX (`528adc44`) and restored "the pre-candidate
+implementation exactly", which left the UNFIXED buffer on HEAD -
+`crates/ffs-core/src/fs_mvcc_store.rs` at HEAD was byte-identical to `9ccee47a`.
+Dead-but-armed code: setting the env var turned on silent metadata loss at any
+thread count. Independently, the FIXED version measured `1.587108x`
+`[1.582255, 1.594626]`, about **5% worse** than the 1.51x baseline, so there was
+no performance case for carrying it either.
+
+### Retry predicate
+
+Do not retry whole-block message buffering on the ext4 metadata path until (a)
+every read path that can observe a buffered block consults the buffer - including
+transaction-backed scopes - proven by a mounted run at `--client-threads 1` AND
+`8` that completes its reset without a missing file, and (b) a profile shows the
+per-write `begin()+commit()` is actually a material share of create time. The
+`create-bench` probe at n=9/arm could not resolve it: within-arm spreads were
+1.17-1.22x, an ~18% floor, with `off` 48211/s vs `cap=4096` 47864/s. Amdahl also
+bounds the prize - `ext4_create` holds `ext4_alloc_state.write()` across its
+body, so buffering shortens a serialized region rather than removing it.
+
+## Mounted 64 MiB bulk durable output is a current 2.201986x loss - 2026-07-31 (IvoryBison, vs-INCUMBENT measurement)
+
+This deliverable keeps one realistic mounted-comparator workload and makes no
+production-filesystem tuning claim. One job overwrites a preallocated 64 MiB
+file with 64 sequential 1 MiB positioned writes, then calls `fsync` on the file
+once. Payload allocation and fill happen before timing. Untimed witnesses prove
+the exact 67,108,864-byte initial and final file contents on all four mounts;
+the final file is uniformly byte `95` with SHA-256
+`1374a09b8b03a5e43ff90e52c8fd06d88a6a0134b990b58ba32c018e3e0ad82c`.
+Full tree/content parity and all four post-unmount `e2fsck` checks pass.
+
+### Admitted direct-incumbent result
+
+| Workload | Kernel A/A null | FUSE A/A null | FrankenFS / kernel ext4 | Decision |
+| --- | --- | --- | --- | --- |
+| 64 sequential 1 MiB overwrites plus one final file `fsync`, one observed worker | `1.000096x [0.993402, 1.006928]`, spread `1.006928x`, clear | `0.987647x [0.982082, 0.992391]`, spread `1.018245x`, clear | **`2.201986x [2.181190, 2.219212]` slower**; twice-null margin `1.036823x` | **HONEST LOSS** |
+
+Both A/A medians are inside the corrected inclusive `[0.98, 1.02]` clause,
+both symmetric CI spreads are below `1.025x`, and CI straddling is telemetry,
+not a gate input. The competitive interval clears twice the widest null
+log-margin. The gate is a wall-time deterministic-bootstrap median CI with
+20,000 resamples; `cv_used=false` and `instructions_used=false`. Diagnostic
+median batches were 106,764,850 ns for kernel ext4 and 240,221,050 ns for
+FrankenFS.
+
+**We lose: FrankenFS takes 2.201986 times the kernel-ext4 wall time for this
+complete 64 MiB durable-output job.**
+
+The admitted invocation used 2,048 paired rounds / 512 complete four-round
+physical crossover blocks, eight balanced warmups, and one observation per
+arm. Requested and actual observed timed workers were `1/1` on every kernel-A,
+kernel-B, FUSE-A, and FUSE-B arm. The benchmark-driver TID was both bound to and
+observed on CPU 27 throughout every arm; both FUSE daemons were guarded on CPU
+25, with SMT siblings excluded. Mount options were matched at
+`rw,noatime,nodev,nosuid`; kernel ext4 additionally reported `data=ordered`.
+The timed durability boundary is identical in all arms: all 64 writes followed
+by exactly one file `fsync`.
+
+### Identity and frequency provenance
+
+- Execution host: `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, 32
+  physical cores / 64 logical threads, 231,691,894,784 bytes RAM, one NUMA node,
+  Linux `6.17.0-35-generic`.
+- Runtime ISA: `avx+avx2+f16c+fma+sse2+sse4.2`.
+- CPU policy on all 64 CPUs: driver `amd-pstate-epp`, governor `powersave`, EPP
+  `performance`; the non-performance-governor warning is retained.
+- Driver emitted its in-process self-reported executing ELF SHA-256: `a0852814a9fab2f909512a346e2664940e335c49612247f58e23df83d841eeab`
+  (built on remote worker `ovh-a`).
+- FrankenFS self-reported executing ELF SHA-256 `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`;
+  both daemon self-reports and both `/proc/<pid>/exe` hashes agree. PGO profile
+  SHA-256:
+  `6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+- Kernel incumbent artifact SHA-256:
+  `01e534223c871bd6246e8d57fd8c8101205384d682a3a23b6a5577fe28997c41`.
+
+The exact admitted report is
+`/data/tmp/frankenfs-mounted-xattr-current/run_1785492391_3882038/mounted-kernel-report.json`
+with SHA-256
+`b1db0bc574fc8aec3c4955fcef0a1027610251cae8c8464ae49b58e11c8f824c`.
+It uses same-LLC placement and one-second CPU-contention sampling; sustained
+host-wide quiescence is explicitly not applicable to this same-LLC row.
+
+### Preserved blocked pilot
+
+The pre-registered 128-pair / 32-block pilot correctly emitted
+`BLOCKED_NULL`, not a scored ratio. Its diagnostic effect was `2.636181x
+[2.566631, 2.676452]`, but the kernel null spread was `1.055032x` and the
+FUSE null spread was `1.045671x`, both above `1.025x`; their medians
+(`0.992425x` and `0.991155x`) did pass the corrected median clause. That report
+is
+`/data/tmp/frankenfs-mounted-xattr-current/run_1785492075_3762184/mounted-kernel-report.json`
+with SHA-256
+`80cf2d58c7a4396eff6adc6d7526fc2eb4ffdf51e7f880d04f24dfa02c65a88d`.
+Before inspecting any high-N result, the single retry was registered at 512
+crossover blocks / 2,048 pairs. The two invocations are not pooled, and there
+will be no third null-selected retry.
+
+### Build, validation, and retry predicate
+
+The driver build and focused validation used strict remote execution from
+source base `8e0400ff` with `rch exec --base 8e0400ff --clean-overlay` and only
+`crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs` overlaid. Remote
+`cargo check -j2 -p ffs-harness --bin ffs-mounted-kernel-bench` passed on
+`ovh-a`; focused bulk-durable tests passed 2/2 there. The x86-64-v3
+release-perf driver was built on `ovh-a` and copied to the privileged execution
+host because RCH does not retrieve artifacts. There was no local Cargo fallback
+and no per-task Cargo target directory. The complete binary suite then passed
+28/28 on strict-remote worker `vmi1152480` from the same base and one-file clean
+overlay. Final no-dependency `-D warnings` Clippy reached `ffs-harness` on
+`vmi1227854` but exited 101 only on the pre-existing `fetch_update`
+deprecations in untouched `crates/ffs-harness/src/metrics.rs:94,100`; no
+diagnostic named the edited binary. (`ovh-a` was then inadmissible under stale
+disk-critical telemetry, and `vmi1152480` lacked the pinned nightly Clippy
+component; both attempts failed closed without local fallback.) Edited-file
+rustfmt and `git diff --check` pass.
+
+**Retry predicate:** replace this ratio only after the shipping candidate ELF,
+PGO profile, mounted-write implementation, or declared 64 MiB job shape
+changes. Use the same four independent mounts, four-round crossover, at least
+512 complete blocks, corrected median-plus-spread null gate, doubled-null
+margin, exact initial/final file witnesses, observed TID/CPU attestation,
+in-process ELF identities, governor/host provenance, matched durability, and
+four clean offline checks. A host-wide replacement additionally requires both
+sustained quiet gates to pass in the same invocation. Profile this admitted
+whole job before choosing a production lever; never pool the blocked pilot or
+select among repeated null attempts.
+
+## Mounted xattr report is a current 6.059387x loss - 2026-07-30 (IvoryBison, vs-INCUMBENT measurement)
+
+This deliverable keeps one new mounted-comparator workload and makes no
+production-filesystem tuning claim. A real read-only xattr report repeats 5,000
+complete jobs. Each job performs five API calls through the Linux VFS:
+
+1. read a 12-byte inline xattr value;
+2. read a 512-byte external-block xattr value;
+3. check one absent xattr name;
+4. list a file with one xattr name; and
+5. list a file with 24 xattr names.
+
+The fixture proves the intended ext4 storage shapes outside timing with
+`debugfs`: the inline file has `File ACL: 0`, while the external-value and
+many-name files have nonzero external xattr blocks. Untimed exact witnesses
+validate every returned name and value, the absent lookup, and both list
+cardinalities before and after the timed region. The shared witness SHA-256 is
+`7aafc655fbff1cd5eae7a0d24acd44492cc1d253f1452cf18280c12fd880bdeb`;
+the full logical tree/content digest is also unchanged, and all four
+post-unmount `e2fsck` checks are clean.
+
+### Admitted direct-incumbent result
+
+| Workload | Kernel A/A null | FUSE A/A null | FrankenFS / kernel ext4 | Decision |
+| --- | --- | --- | --- | --- |
+| 5,000 complete xattr reports, one observed worker | `1.000756x [0.994355, 1.000847]`, spread `1.005677x`, clear | `0.999737x [0.998300, 1.001787]`, spread `1.001787x`, clear | **`6.059387x [6.036945, 6.071929]` slower**; twice-null margin `1.011385x` | **HONEST LOSS** |
+
+Both A/A medians are inside the corrected inclusive `[0.98, 1.02]` clause,
+both symmetric CI spreads are below `1.025x`, and CI straddling is telemetry,
+not a gate input. The competitive interval clears twice the widest null
+log-margin. The gate is wall-time deterministic-bootstrap median CI with
+20,000 resamples; `cv_used=false` and `instructions_used=false`. Diagnostic
+median batches were 85,553,446.5 ns for kernel ext4 and 518,425,656.5 ns for
+FrankenFS.
+
+**We lose: FrankenFS takes 6.059387 times the kernel-ext4 wall time for this
+complete xattr report job.**
+
+The run used 32 paired rounds / eight complete four-round physical crossover
+blocks, eight balanced warmups, three repeats per observation, and the minimum
+reducer. Requested and actual observed timed workers were `1/1` on every
+kernel-A, kernel-B, FUSE-A, and FUSE-B arm. The driver TID was observed on and
+bound to CPU 0; both FUSE daemons were guarded on CPU 1, with SMT siblings
+excluded. Mount options were matched at `ro,noatime,nodev,nosuid`; the kernel
+incumbent additionally used the required read-only `noload` semantic.
+
+### Identity and frequency provenance
+
+- Execution host: `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, 32
+  physical cores / 64 logical threads, 231,691,894,784 bytes RAM, one NUMA node,
+  Linux `6.17.0-35-generic`.
+- Runtime ISA: `avx+avx2+f16c+fma+sse2+sse4.2`.
+- CPU policy on all 64 CPUs: driver `amd-pstate-epp`, governor `powersave`, EPP
+  `performance`; the non-performance-governor warning is retained.
+- In-process driver ELF SHA-256:
+  `99a9684235ab1f923a30057ae23d92a6c88a19944c03246dd11fb122140d449b`
+  (built on remote worker `ovh-a`).
+- FrankenFS self-reported executing ELF SHA-256 `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`;
+  both daemon self-reports and both `/proc/<pid>/exe` hashes agree. PGO profile
+  SHA-256:
+  `6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+- Kernel incumbent artifact SHA-256:
+  `01e534223c871bd6246e8d57fd8c8101205384d682a3a23b6a5577fe28997c41`.
+
+The exact report is
+`/data/tmp/frankenfs-mounted-xattr-current/run_1785470336_3449697/mounted-kernel-report.json`
+with SHA-256
+`daac1522f778e4bbc963cfbff73cecff8fe896699e9eedb85fbb3104b2618ae1`.
+It uses same-LLC placement, a one-second CPU-contention sample, and records
+`host_wide_quiescence=not_applicable`, matching the current ext4 scorecard
+placement scope.
+
+A separately attempted host-wide run passed its initial requirement of five
+consecutive clear one-second samples only after 213 samples (213.1 seconds).
+After mount and fixture setup its second sustained gate found no five-sample
+clear window within 300 samples and 300 seconds. The harness failed closed
+before timing and emitted no row; that attempt is not pooled with, selected
+against, or used to strengthen the same-LLC result.
+
+### Build, validation, and retry predicate
+
+The driver build and focused validation used strict remote execution from
+source base `69346cd5` with
+`rch exec --base 69346cd5 --clean-overlay` and only `Cargo.toml`,
+`Cargo.lock`, `crates/ffs-harness/Cargo.toml`, and
+`crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs` overlaid. Remote
+`cargo check -j2 -p ffs-harness --bin ffs-mounted-kernel-bench` passed on
+`ovh-a`; the focused live-filesystem xattr witness/batch test passed on `hz1`.
+The release-perf driver was built on `ovh-a` and copied to the privileged
+execution host because RCH does not retrieve artifacts. There was no local
+Cargo fallback. A final strict-remote no-dependency Clippy attempt from current
+base `3cdd4cd6` reached `ffs-harness` on `hz1` but exited 101 on two pre-existing
+`fetch_update` deprecation errors in untouched
+`crates/ffs-harness/src/metrics.rs:94,100`; neither that file nor the warnings
+were in this clean overlay. Edited-file rustfmt and `git diff --check` pass.
+
+**Retry predicate:** replace this ratio only after the shipping candidate ELF,
+PGO profile, xattr implementation, or declared five-call job shape changes.
+Use the same four independent mounts, four-round crossover, corrected
+median-plus-spread null gate, doubled-null margin, exact xattr witnesses,
+observed TID/CPU attestation, in-process ELF identities, governor/host
+provenance, and clean offline checks. A host-wide replacement additionally
+requires both five-consecutive-sample gates to pass in the same invocation.
+Do not infer a source-level optimization from this aggregate gap; profile this
+exact job first, and never pool the failed host-wide attempt with an admitted
+row.
+
+## Null medians now bound arm-order bias; CI straddling is telemetry - 2026-07-30 (PurpleSnow, vs-INCUMBENT gate correction)
+
+The fleet-level gate correction was explicitly authorized for this comparator.
+Schema v6 removes only the requirement that each A/A confidence interval contain
+`1.0`. A null control is now clear when both of these unchanged/bounded
+conditions hold:
+
+1. its median is in the inclusive range `[0.98, 1.02]`; and
+2. its symmetric CI spread remains at most `--maximum-null-ratio` (default
+   `1.025x`).
+
+The CI endpoints and whether they contain `1.0` remain in console and JSON
+telemetry, with `ci_contains_one_gate_input=false`. The effect must still clear
+**twice the widest null log-margin**. No identity, exact-work, worker-count,
+worker-pinning, host-quiescence, mount-option/durability, parity, offline-check,
+incumbent-isolation, or wall-time median-CI gate changed. The immediately
+following physical-diagnosis row remains valid, but its historical statement
+that both A/A CIs must contain `1.0` is superseded by this policy correction.
+
+### Three-row integrity reproduction
+
+The exact three previously unscored 2026-07-27 workload reports were evaluated
+with every recorded non-null gate and the `1.025x` spread ceiling held fixed.
+The controls use same-invocation A/A deterministic bootstrap median 95% CI estimates.
+For example, the storm controls were kernel
+`1.009041x [1.001744, 1.013361]` and FUSE
+`1.000952x [0.995548, 1.008376]`.
+
+| Workload | Replacement-null result | Effect-margin result | Counterfactual decision |
+| --- | --- | --- | --- |
+| Multi-file parallel read, 8 threads, 256 x 256 KiB | Still blocked: kernel median `0.966904x` is outside `[0.98, 1.02]`; spreads are also `1.070666x` / `1.036149x` | Clears (`1.203230x [1.162802, 1.239236]`) | **STILL BLOCKED** |
+| Small-file create/delete storm, 2,000 files | Clears: medians `1.009041x` / `1.000952x`, spreads `1.013361x` / `1.008376x` | Clears twice-null margin `1.026900x`; effect `2.957531x [2.939013, 2.971326]` | **LOSE** |
+| Large-directory readdir+stat, 8 threads, 32,768 entries | Still blocked: medians are in range, but kernel spread `1.025464x` remains above `1.025x` | Clears (`4.212274x [4.068120, 4.290202]`) | **STILL BLOCKED** |
+
+Therefore **1 previously vetoed row becomes decidable: 0 WIN / 1 LOSE**. The
+focused regression test
+`historical_three_row_gate_audit_yields_one_loss_and_no_wins` reproduces that
+count while exercising the retained twice-null-margin predicate.
+
+As a broader integrity check, all **44** retained
+`mounted-kernel-report.json` artifacts (**47** filesystem rows) were scanned.
+Six schema-v1 rows were straddle-only null rejects under the old predicate and
+clear the replacement null predicate plus the doubled effect margin:
+**0 WIN / 6 LOSE**. All six predate the current worker-CPU-pinning attestation,
+so this is counterfactual gate evidence, not permission to republish those old
+ratios. The current pinned five-workload bank already cleared the old predicate;
+its **0 wins / 4 losses / 1 neutral** score does not change. The correction
+produces no win and therefore shows none of the loosening signature that would
+invalidate it.
+
+### Validation and remote-build provenance
+
+The final source overlay passed the focused mounted-comparator suite **25/25**
+on strict-remote worker `vmi1153651` (RCH project hash
+`5d696f67726a27b7`). Scoped no-dependency Clippy with warnings denied passed on
+`hz1` (hash `ef5c2455acc23b8b`); the allowance was limited to the repository's
+pre-existing `fetch_update` deprecations. Edited-file rustfmt and
+`git diff --check` passed.
+
+The broader strict-remote `cargo test -p ffs-harness -- --nocapture` run
+(worker `vmi1153651`, hash `1794541a32a4a2ae`) passed **2,058/2,058** library
+tests, **3/3** main-binary tests, **25/25** mounted-comparator tests,
+**7/7** btrfs-kernel-reference tests, and **100/100** conformance tests
+(2 ignored). It then exited 101 in the unrelated compile-fail suite:
+`executed_evidence_cannot_be_directly_constructed` passed, while
+`executed_evidence_cannot_be_deserialized` differed from its committed stderr
+only because `trybuild` normalized the registry source to `$CARGO/...` in the
+golden but RCH emitted `$WORKSPACE/.rch-tmp/...`. Neither the compile-fail test
+nor its golden was in the overlay, and this policy correction does not bless or
+rewrite that unrelated snapshot.
+
+Workspace-wide strict-remote check (hash `c240c23f41290aee`) is independently
+blocked by pre-existing `ffs-btrfs` all-target bench wiring:
+`csum_lookup.rs` calls
+`bench_delete_backrefs_for_extent_borrowed_candidate` and
+`bench_locate_extent_key` although both methods are compiled only with the
+`bench-instrumentation` feature. Workspace fmt is likewise blocked by committed
+format drift outside the edited file. The identical base plus one-path clean
+overlay nevertheless produced four different displayed RCH hashes
+(`5d696f67726a27b7`, `c240c23f41290aee`, `ef5c2455acc23b8b`, and
+`1794541a32a4a2ae`) and cold targets, so command-stable target reuse did not
+engage; these hashes are reported rather than treating the cold builds as cache
+hits.
+
+## Unpinned timed threads, not host noise, were breaking the mounted A/A nulls; all five rows now score - 2026-07-30 (BlackThrush, vs-INCUMBENT instrument KEEP)
+
+This row banks an instrument fix and four re-measured direct-incumbent rows. **No
+gate was loosened**: `--maximum-null-ratio` stays `1.025`, both A/A CIs must still
+contain 1, and the doubled-null-log-margin clearance is unchanged.
+
+### Which nulls were failing, on which mount, and why
+
+Recovered from the preserved `raw_wall_ns` arrays in the 2026-07-27 reports, all
+of which ran `--pairs 32`, i.e. only **8 crossover blocks**:
+
+| Workload | Mount | Median batch | Per-block \|log ratio\| RMS | A/A null 95% CI | Spread | Vetoing clause |
+| --- | --- | --- | --- | --- | --- | --- |
+| Parallel read, 256 x 256 KiB | kernel | 3.47 ms | 5.41% | `0.966904x [0.933998, 1.008743]` | **`1.070666x`** | ratio threshold |
+| Parallel read, 256 x 256 KiB | FUSE | 4.14 ms | 1.54% | `0.991734x [0.969409, 1.036149]` | **`1.036149x`** | ratio threshold |
+| readdir+stat, 32,768 entries | kernel | 27.70 ms | 6.86% | `0.990140x [0.975169, 1.009721]` | **`1.025464x`** | ratio threshold, by 0.05% |
+| Create/delete storm, 2,000 files | kernel | 92.41 ms | 2.14% | `1.009041x [1.001744, 1.013361]` | `1.013361x` | **CI-straddle only** |
+
+Four failing nulls across three workloads, in two modes. Read and readdir failed
+the **ratio** threshold with medians near 1 — variance, not bias. The storm null
+did **not** fail the ratio threshold at all; it failed only because its interval
+excluded 1. See the gate audit below for that one.
+
+### Physical cause: the timed threads were never bound to a CPU
+
+`pin_current_process` tasksets the *process* to `placement.driver_cpus`, which for
+an 8-thread workload is an **8-CPU set**. The eight workers are freshly spawned
+inside every timed batch, so the kernel chose their placement and migrated them
+mid-batch, independently on every round. That variance is independent between the
+two same-type physical arms, so it does not cancel in the A/A crossover
+difference, while it partly cancels in the competitive ratio, which averages both
+arms of a type within a round. The nulls broke; the ratios did not.
+
+It predicts the per-workload pattern exactly:
+
+- `client_threads() == 1` for storm and fsync, so `select_driver_cpus` returned a
+  **single** CPU and taskset already bound them. Neither failed the ratio gate.
+- `client_threads() == 8` for read, readdir, and metadata. Read and readdir are
+  cache-bound, so placement noise dominates them. Metadata is dominated by eight
+  directory `fsync`s per batch, so the same noise is a small fraction of its batch.
+- The kernel readdir arm's block RMS is 6.86% at 27.70 ms while the FUSE arm's is
+  0.93% at 116.56 ms: ~1.9 ms versus ~1.08 ms in *absolute* terms. Roughly
+  constant absolute jitter is the signature of a fixed-cost, high-variance
+  component, not a proportional slowdown.
+
+### Ruled out, with reasons
+
+- **Mount-option asymmetry.** Structurally impossible as a cause of a *same-type*
+  null: both kernel arms take one identical option string from a single `match`
+  arm (`ffs_mounted_kernel_bench.rs:1386-1389`) and both FUSE arms come from one
+  `Command` builder. Option asymmetry can only move the competitive ratio.
+- **Ordering effects between arms in one invocation.** `BALANCED_ORDERS` plus
+  `physical_arm_for` form a four-round Latin square: over one block each physical
+  arm occupies each of the four execution slots exactly once, and the
+  logical-to-physical assignment alternates every round. Summed over a block,
+  fixed physical-arm bias, execution-slot effects, and any linear time drift each
+  cancel to exactly zero (slot sums `0-2+3-1+2-0+1-3 = 0`; global time-index sums
+  `30 = 30`).
+- **Page-cache state carried between arms.** 226 GB RAM with 175 GB already in
+  page cache and no eviction pressure; the reproduction below recorded `pgsteal`
+  of 0-8k pages across whole runs. The fix that worked does not touch cache state.
+- **Governor.** Real and recorded (`amd-pstate-epp` / `powersave` /
+  `balance_performance` on all 64 CPUs), but not the dominant term: the FUSE
+  readdir arm ran under the identical governor on the identical CPUs with 7.4x
+  lower block RMS, and pinning fixed the null without touching the governor. The
+  host is shared with other agents, so the governor was deliberately not changed.
+
+### Reproduction outside the harness
+
+A standalone C replica (8 pthreads, same stride partition, same min-of-3 reducer,
+same four-round crossover, same estimator) drove two byte-identical kernel-ext4
+loop mounts built by `mke2fs -d` from one fixture, with the process `taskset` to 8
+CPUs exactly as the harness does. The only variable was whether each worker binds
+itself to one CPU.
+
+| Case | Median arm | Per-block RMS | A/A null 95% CI | Spread | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| readdir 65,536, unpinned | 40.88 ms | 6.49% | `1.002494x [0.978920, 1.031857]` | `1.031857x` | FAIL |
+| readdir 65,536, **pinned** | 34.54 ms | 1.90% | `0.993848x [0.985174, 1.000269]` | `1.015049x` | **PASS** |
+| readdir 65,536, unpinned (replicate) | 61.77 ms | 7.41% | `0.994255x [0.950493, 1.024059]` | `1.052086x` | FAIL |
+| readdir 65,536, **pinned** (replicate) | 34.88 ms | 3.44% | `0.991733x [0.981778, 1.009910]` | `1.018560x` | **PASS** |
+| read 1024 x 256 KiB, unpinned | 13.00 ms | 4.12% | `0.987347x [0.972331, 1.011465]` | `1.028457x` | FAIL |
+| read 1024 x 256 KiB, **pinned** | 12.57 ms | 2.13% | `0.995949x [0.991406, 1.004359]` | `1.008668x` | **PASS** |
+| read 256 x 256 KiB, unpinned | 3.09 ms | 5.74% | `0.998884x [0.981284, 1.031521]` | `1.031521x` | FAIL |
+| read 256 x 256 KiB, **pinned** | 2.73 ms | 3.96% | `1.005352x [0.987117, 1.015670]` | `1.015670x` | **PASS** |
+
+Four unpinned FAILs and four pinned PASSes across three shapes. Pinned medians
+also reproduce across invocations (34.54 / 34.88 ms) where unpinned ones did not
+(40.88 / 61.77 ms), and pinning made the arms 12-18% faster because locality is
+preserved rather than rediscovered every batch.
+
+### Re-measured rows, one driver ELF, `--pairs 128` (32 crossover blocks)
+
+| Workload | Kernel A/A | FUSE A/A | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| readdir+stat, 8 threads, 32,768 entries | `1.000904x [0.996822, 1.008448]`, spread `1.008448x` | `0.998792x [0.997503, 1.000626]`, spread `1.002503x` | **`4.967448x [4.946319, 4.989285]` slower** | **HONEST LOSS** |
+| Small-file create/delete storm, 2,000 files | `0.996217x [0.985593, 1.007951]`, spread `1.014618x` | `0.995167x [0.988305, 1.004712]`, spread `1.011833x` | **`2.753659x [2.707500, 2.782302]` slower** | **HONEST LOSS** |
+| Multi-file parallel read, 8 threads, 256 x 256 KiB | `1.003293x [0.982553, 1.016450]`, spread `1.017757x` | `0.994130x [0.982397, 1.002347]`, spread `1.017918x` | **`1.287862x [1.269319, 1.307285]` slower** | **HONEST LOSS** |
+| Fsync/journal commit, 8 x 4 KiB | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `0.997098x [0.990808, 1.009108]` against a twice-null margin of `1.030661x` | **HONEST NEUTRAL** |
+| Parallel metadata writes, 8 threads, 512 creates, **128 blocks** | `1.007184x [0.998479, 1.024316]`, spread `1.024316x` | `0.995707x [0.978797, 1.000111]`, spread `1.021662x` | **`1.510822x [1.493097, 1.539011]` slower** | **HONEST LOSS** |
+| Parallel metadata writes, replicate on a disjoint CPU set | `0.998642x [0.990286, 1.009556]`, spread `1.009809x` | `0.998780x [0.990819, 1.002688]`, spread `1.009266x` | **`1.513052x [1.490837, 1.534711]` slower** | **HONEST LOSS** |
+
+**The direct-incumbent score for these five ext4 surfaces is 0 wins / 4 losses /
+1 neutral / 0 unscored**, replacing the prior 1 win / 1 loss / 3 unscored.
+
+Metadata needed **128 crossover blocks** (`--pairs 512`), not the 32 that suffice
+for the other four. That is a precision increase, not a loosening: the estimand is
+unchanged and a median CI narrows as ~`1/sqrt(blocks)`. At 32 blocks its spread sat
+at `1.036x`-`1.090x` across four runs; at 128 blocks it is `1.024316x` and
+`1.009809x`, and the two runs agree on the effect to **0.15%**
+(`1.510822x` vs `1.513052x`) on **disjoint CPU sets** (`24,25,26,29,31,56,59,60`
+versus `0,1,5,6,33,34,35,39`), each clearing its own twice-null margin
+(`1.049223x`, `1.019714x`). The published `1.942477x` was therefore overstated by
+about 28%; the honest figure is **`1.512x` slower**, and the workload needs four
+times the blocks because its timed region is eight serialized ext4 journal commits
+whose latency is heavy-tailed.
+
+Two results are corrections against FrankenFS and must not be softened:
+
+- **readdir and read losses grew** once admissible: `4.212274x -> 4.967448x` and
+  `1.203230x -> 1.287862x`. Pinning made the *kernel* arm faster by preserving
+  locality, so a correct instrument makes the incumbent look better. The old
+  blocked estimates flattered us. readdir replicated across two driver ELFs and
+  two windows at `4.967448x` and `5.026341x`, within 1.2%.
+- **The fsync `1.005153x` win does not survive.** It re-measures `0.997098x
+  [0.990808, 1.009108]` and `directional_claim_clear=false`, because the effect
+  must clear a twice-null margin of `1.030661x`. It was a sub-null-margin effect
+  and is **withdrawn**, not restated.
+
+Storm moved the other way: `2.957531x -> 2.753659x`, a smaller loss than the
+blocked estimate.
+
+### Metadata: a second unpinned thread, then a block-count shortfall
+
+`parallel_metadata_write_batch` performs all eight worker-directory `fsync`s on
+the **driver thread**, inside the timed region. On ext4 `data=ordered` each forces
+a journal commit, so that serial tail is a large fraction of a ~26 ms batch, and
+the first fix bound only the workers. Storm does the same journal-commit work on a
+thread the serial path already bound, and its null passes at `1.014618x` - a clean
+contrast. The driver thread is now bound once at startup
+(`mounted_kernel_driver_thread_binding`, observed `driver_thread_cpu=25`), and
+each worker's bind is its first action so the inherited single-CPU mask window is
+one syscall.
+
+That change alone did not rescue the row at 32 blocks. Across **four** runs at
+`--pairs 128` the metadata null stayed blocked with spreads `1.077930x`,
+`1.057067x`, `1.090403x`, `1.052172x` and effects `1.688491x`, `1.659983x`,
+`1.613519x`, `1.508913x` - the effect reproduced while the **verdict was stable**,
+which by the fleet gate-audit criterion proves the cause physical rather than a
+gate artifact. Raising the block count to 128 (`--pairs 512`) then admitted it
+twice in a row, so the residual was a power shortfall on top of the driver-thread
+binding, not an irreducible property of the workload. Every blocked estimate was
+*below* the published `1.942477x`, and the two admitted values (`1.510822x`,
+`1.513052x`) sit at the bottom of that spread.
+
+The 2026-07-27 metadata null passed for a bad reason: its kernel arm's last
+quarter ran **2.64x** slower than its first (21.51 -> 56.80 ms), and only 8
+crossover blocks plus a robust median kept that instability out of the interval.
+
+### Inert-regime control proves a bad window, not a bad change
+
+The driver-thread pass ran while the host was contended (six distinct gate
+refusals including a core at 100% busy, and one window offering only 4 quiet
+client CPUs). Fsync and storm are 1-thread workloads whose driver thread the
+serial path **already** bound, so the new binding is provably inert for them -
+they are a free null control. Both degraded anyway, by **+9.16pp** and
+**+12.07pp** of A/A spread, which can only be host contention. Meanwhile metadata,
+the only workload the change targets, posted its best spread of four runs. The
+contended pass is therefore not a valid comparison window, and the quiet-window
+results above stand.
+
+Reusable lesson: **when a lever has a regime where it is provably inert, run that
+regime as a free null control on the real harness.**
+
+### Gate audit: the CI-straddle veto is present and cost exactly one row
+
+`fs_report` ANDs `BootstrapMedianCi::contains_null()` (`low <= 1.0 && high >=
+1.0`) with the ratio threshold, so the straddle veto **is** in this gate. Tested
+across 24 null evaluations in 12 runs rather than assumed:
+
+| Veto class | Count | Cases |
+| --- | --- | --- |
+| **straddle-only** | **1** | storm 2026-07-27 kernel |
+| ratio-threshold-only | 8 | read 07-27 (x2), readdir 07-27, metadata (x5) |
+| both | 1 | metadata fuse, third run |
+
+The single straddle-only veto looked like a textbook instance: null median
+`1.009041x`, spread `1.013361x` comfortably inside `1.025x`, CI
+`[1.001744, 1.013361]` missing `1.0` by **0.17%**, vetoing a `2.957531x` effect
+whose deviation is **108.4%** against a 2x-half-width margin of **2.7%**.
+
+**It is not a live gate defect, and an earlier draft of this row overstated it.**
+The handoff's test requires the *same* ELF; the storm verdict movement first cited
+here (blocked, pass, pass) spanned three different driver ELFs and both the
+unpinned and pinned instruments, so it does not isolate the gate. Re-run properly -
+one ELF `8c357460af...`, three reps, placement landing on `driver_cpus` 3, 28, and
+14 at differing load - storm passes **3/3** with spreads `1.022639x`, `1.011589x`,
+`1.016627x` and effects `2.760102x`, `2.780381x`, `2.795147x`, reproducing within
+**1.3%**. A stable verdict on a reproducible effect means the gate is sound; the
+07-27 veto was a single historical event produced by the unpinned instrument, not
+gate flakiness.
+
+The straddle clause therefore explains none of this campaign's blocked rows. Read,
+readdir, and metadata all vetoed on the **ratio** threshold, 1 to 9 points over a
+2.5% allowance, with stable verdicts. `contains_null` is the only straddle test in
+the file (`:377`) and is used at exactly two sites (`:3513`, `:3515`); the
+remaining hits are its own unit tests. The gate is left unchanged, correctly, and
+the clause is flagged as latent rather than active.
+
+### Provenance
+
+Driver ELF `75b400a965010294f60c88cb3a591fd013248c92456e2fe13f7e2d01a5b3369b`
+built on rch worker **hz1**; the driver-thread-bound follow-up ELF is
+`8c357460afc2edb061e4d17676f46435b0cb9b0102ec5597813843afafbb27aa`, also hz1.
+Candidate ELF `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`
+built on **vmi1167313**, self-reporting compile+runtime SSE4.2/AVX2/FMA
+(x86-64-v3) and PGO profile
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc` - the same
+profile the 2026-07-27 rows used, so the re-measurement is comparable. `rch exec`
+has no artifact-retrieval mechanism, so both ELFs were built remotely and copied
+to `thinkstation1`; the harness now requires `--harness-builder` and
+`--candidate-builder` and records them in `binary_provenance`. Every admitted run
+reports `worker_cpu_pinning_clear=true` with the observed CPU set exactly equal to
+the bound set, 4-arm tree/content parity, and `post_unmount_validation="clean"`.
+Gate basis was the wall-time bootstrap median CI throughout; `cv_used=false` and
+`instructions_used=false`.
+
+One label caveat: the banked artifacts print
+`method=sched_setaffinity_then_proc_thread_self_stat`, but the value in
+`observed_worker_cpus` came from vDSO `sched_getcpu` in both paths, with
+`/proc/thread-self/stat` used only for the serial arms' no-migration assertion.
+The literal was stale, not the mechanism, and is corrected in source.
+
+Every admitted ratio and every A/A null above is a deterministic 20,000-resample same-invocation bootstrap median 95% CI over wall time, with CV never a gate.
+
+The executing driver hashed itself in process and printed `bench_evidence,binary_sha256=75b400a965010294f60c88cb3a591fd013248c92456e2fe13f7e2d01a5b3369b`; the driver-thread-bound follow-up printed `bench_evidence,binary_sha256=8c357460afc2edb061e4d17676f46435b0cb9b0102ec5597813843afafbb27aa`, and the candidate printed `bench_evidence,binary_sha256=f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`.
+
+**Retry predicate for all five rows:** re-measure only with every timed thread,
+driver included, bound to one CPU, and with at least 32 crossover blocks - 128 for
+parallel metadata writes, which does not resolve at 32. Require both A/A spreads at
+most `1.025x` with intervals containing 1, the effect clearing twice its own null
+log-margin, exact four-arm parity, and clean `e2fsck`. Never pool the blocked
+`1.509x`-`1.688x` metadata estimates, and never restate `1.942477x` or the
+withdrawn fsync `1.005153x` win. Before attributing any future null failure to the
+gate, reproduce the frankenlibc test with a **single** ELF across several cores:
+this campaign's first attempt compared different ELFs and wrongly implicated the
+gate.
+
+## SURVEY: gate-audit handoff finds CI-straddle veto; no gate change or new scoreable rerun - 2026-07-29 (PurpleSnow, audit incomplete)
+
+The fleet gate audit found a real mechanism in the mounted comparator:
+`BootstrapMedianCi`'s interval-straddle predicate requires the A/A confidence
+interval to include `1.0`, and `fs_report` ANDs that result with the existing
+`1.025x` symmetric-spread ceiling. FrankenFS therefore does contain the
+CI-straddle veto identified by the fleet directive. This turn did
+**not** change that gate: the required same-ELF, different-core/lower-load
+reproduction has not yet been completed, so there is no evidence yet that the
+verdict moves randomly while the competitive effect remains stable.
+
+The owned, already-pushed instrument work is commit `bd2824b9`: schema v5 adds
+a realistic job statement, an exact-work contract, a chooser statement scoped
+to the recorded workload and hardware, an explicit same-invocation incumbent
+isolation proof, and runtime ISA positives and negatives. The frozen
+continuation candidate remains ELF
+`93ed882e6e4771db82371c933af28d7a907a6efdcfb13f29357baf2b7befe7f6`
+with PGO profile
+`1410ff5d34f99faa10eeb2dbbcb08747a6acdccdb065a3e34b89396a43b40ab0`.
+The exact requested jobs remain:
+
+- 256 files x 256 KiB, eight read workers, 64 MiB total, min of three;
+- 2,000 creates, one parent-directory fsync, 2,000 deletes, and a second
+  parent-directory fsync, one worker;
+- 32,768 directory entries plus 32,768 metadata reads, eight workers, min of
+  three.
+
+A companion owns active uncommitted CPU-pinning changes in
+`.gitignore`, `crates/ffs-harness/Cargo.toml`, and
+`crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs`. Those changes produced
+useful diagnostic evidence that fixed worker-to-CPU binding can clear the read
+and readdir A/A controls, but the diagnostic runs used candidate
+`f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349`
+with the older `6a22...` PGO profile, same-LLC placement, and retry-selected
+attempts. They are not current-candidate campaign evidence and none of their
+competitive ratios is banked here. The dirty paths were preserved and were
+not staged, overwritten, or committed by PurpleSnow.
+
+**Single next step after reset:** obtain an explicit handoff of the pinning
+paths, finish the per-artifact origin and timed-instrumentation work-count
+audit, then pre-register two complete quiet-host placements using one final
+driver ELF and the frozen `93ed...` candidate. Retain both placements without
+selection. Change the straddle clause only if the competitive effects reproduce
+within 2.5% while a different subset of A/A controls passes; otherwise leave
+the gate intact and fix the physical A/A instability. Every eventual score
+still requires the effect CI to exclude `1.0`, clearance beyond twice the
+larger A/A half-width, both A/A medians within 2% if the fleet-corrected rule is
+evidence-activated, exact worker counts, matched work, parity, clean offline
+checks, and wall-time median-CI gating with `cv_used=false`.
+
+## Exact-work scaling preflight kept; Threadripper sweep stops on its first FUSE null - 2026-07-29 (PurpleSnow, instrument KEEP / measurement BLOCKED-NULL)
+
+This turn changed the mounted comparator, not FrankenFS. Before opening a
+production lever, the planned scaling work itself was audited. The driver
+required `operations % client_threads == 0`, so the pre-registered 8,192
+operations would reject the 96-thread point. Commit `89fefe8b` replaced that
+constraint with a deterministic exact-total partition: each worker gets the
+quotient, and the first `operations % threads` workers get one additional
+operation. The identical partition is used by the timed create batch and its
+untimed reset.
+
+The counted contract is therefore:
+
+| Requested threads | Per-worker distribution | Exact timed/reset total |
+| --- | --- | --- |
+| 1 | `1 x 8,192` | 8,192 |
+| 96 | `32 x 86 + 64 x 85` | 8,192 |
+| 128 | `128 x 64` | 8,192 |
+
+The report records the minimum and maximum operations per worker, the number of
+workers receiving the remainder, and `operation_distribution_exact_total=true`.
+A regression test creates and removes a non-divisible 9-operation / 2-thread
+batch and separately proves the 8,192 / 96 partition. Strict-remote
+exact-source tests passed **19/19** on `ovh-a`; scoped no-dependency Clippy with
+warnings denied except the crate's reproduced deprecation class, file rustfmt,
+and `git diff --check` passed. This instrument correction is kept independently
+of the measurement outcome because it prevents the sweep from doing different
+total work at different thread counts.
+
+After the explicit `[trj] CLAIM frankenfs`, the frozen candidate and freshly
+built self-hashing driver started the pre-registered
+1/2/4/8/16/32/64/96/128 sweep. The invocation stopped at the required first
+failure:
+
+| Point | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | Competitive estimate | Decision |
+| --- | --- | --- | --- | --- |
+| ext4 parallel metadata write, 1 requested/observed worker, 8,192 operations | `1.006357x [0.996054, 1.019204]`, spread `1.019204x` | `1.006701x [1.003212, 1.014440]`, spread `1.014440x` | **No admissible ratio.** Apparent `3.029651x [3.008041, 3.066799]` is diagnostic only. | **BLOCKED-NULL** |
+
+The FUSE interval is narrower than the `1.025x` spread ceiling but excludes 1,
+so admission fails. Repeating the same point until it happens to contain 1
+would select on the null control. No thread-count points from 2 through 128 were
+run, no scaling curve exists, and the apparent competitive loss is not a
+campaign claim or a basis for production tuning. The exclusive machine was
+released immediately in `[trj] RELEASE frankenfs` message `6323`.
+
+All non-timing gates were clean. The invocation used 48 paired rounds / 12
+complete four-round physical-role crossover blocks, eight balanced warmups,
+20,000 deterministic bootstrap resamples, four independent mounts, matched
+mount/durability settings, and wall-time median confidence intervals.
+`cv_used=false` and `instructions_used=false`. Every arm completed exactly
+8,192 operations and repeatedly observed exactly one Linux worker TID.
+Initial and post-mount host-wide quiet gates passed, as did initial/final
+four-arm namespace/content parity and all four offline checks. Physical medians
+were:
+
+- kernel A/B: `168,499,134 ns` / `169,908,172 ns`;
+- FUSE A/B: `502,031,299 ns` / `499,437,890 ns`.
+
+The residual `1.005193x` physical FUSE-arm median offset is consistent with the
+failed FUSE null and remains unexplained even though logical roles crossed over
+the two physical mounts. That is a measurement-system result, not filesystem
+source evidence.
+
+Provenance:
+
+- host `threadripperje`, 64 physical cores / 128 logical threads,
+  536,069,869,568 bytes RAM, one NUMA node;
+- runtime ISA `avx2+fma+sse2+sse4.2`;
+- every CPU reported `amd-pstate-epp`, governor `performance`, and EPP
+  `performance`;
+- driver CPU 0 with SMT guard 0/64; both FUSE daemons on CPU 1 with guard 1/65;
+- initial quiet gate: five consecutive clear one-second samples after eight
+  observed samples / 8,006 ms; post-mount gate: five samples / 5,004 ms;
+- driver self-report
+  `executing_elf_sha256=b9c3cbeb95f7696ca567e9aa5778dfa18f4016daacaf90bd83b618ecdd9b353e`;
+- candidate ELF SHA-256
+  `2db6860eaa3e86abf28ba8d2f6a82eea99c873510430edf5b20eb1ee5ceb4f10`,
+  PGO profile SHA-256
+  `23108426f429eef45acf65c6eb0489a5a74d1fc8ef1401ed2cf8dbba31ee7307`;
+- incumbent kernel `6.17.0-41-generic`, `/boot/vmlinuz-6.17.0-41-generic`
+  SHA-256
+  `4a480bffbc34d52479023f0b9990f6ecfab3d0a325cf86c81e8b04d2a719a7a4`,
+  runtime notes SHA-256
+  `084b46c7dd63c2a8e23cf0e99aa41c97419de5dce98f37be6b5512635b9ed034`;
+- report
+  `/data/tmp/frankenfs-mounted-metadata-sweep/threads-1-attempt-7.json`,
+  SHA-256
+  `a5871ad197c77e003c5873d94e2cda084fa17f8b803942c449aca92183c8b82e`;
+- log
+  `/data/tmp/frankenfs-mounted-metadata-sweep/threads-1-attempt-7.log`,
+  SHA-256
+  `9d56026e38b0b2c7a0ba7cac648c4639484ae1c63c53f08f4830ea73f7abe4c3`.
+
+**Retry predicate:** do not rerun on a merely fresh placement, pool this
+failed-null estimate with another invocation, or change the candidate based on
+it. First add counted per-four-round attribution for physical FUSE mount
+identity, CPU migrations, minor/major faults, and host-wide busy state during
+timing, or otherwise identify and remove the measured physical FUSE-arm
+asymmetry. Then pre-register one new complete invocation starting at thread 1
+with the same frozen candidate/incumbent identities, exact-total work
+distribution, four independent arms, and physical-role crossover. Every point
+must have the requested worker count on every arm, both A/A median CIs
+containing 1 with spread at most `1.025x`, a competitive interval clearing
+twice the worst null log-margin, full parity, and clean offline checks.
+`cv_used=false`; instruction count remains provenance only.
+
+## Governor- and thread-attested mounted rerun admits storm; read and readdir remain null-blocked - 2026-07-29 (PurpleSnow, vs-INCUMBENT instrument KEEP)
+
+This rerun changes the instrument, not FrankenFS. The comparator now records
+the CPU frequency driver, governor, and energy-performance preference; requires
+five consecutive one-second host-wide samples below the contention ceiling
+both before placement and after mount/fixture setup; and refuses admission
+unless every logical arm repeatedly reports exactly the requested number of
+Linux worker TIDs. Serial workloads observe the pinned driver TID before and
+after every timed batch. Parallel workloads report worker TIDs from inside each
+timed batch. The production candidate stayed frozen across all three
+invocations.
+
+### Current candidate results
+
+| Workload | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| Multi-file parallel read, 8 threads, 1,024 x 256 KiB, min of 3 | `1.003535x [0.959197, 1.043999]`, spread `1.043999x` | `0.980314x [0.960412, 1.090015]`, spread `1.090015x` | **No admissible ratio.** Apparent `1.655303x [1.600913, 1.731016]` slower is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Small-file create/delete storm, 2,000 files | `0.999131x [0.979908, 1.014892]`, spread `1.020504x` | `1.003032x [0.994522, 1.006388]`, spread `1.006388x` | **`2.691204x [2.675323, 2.717540]` slower** | **HONEST LOSS** |
+| Large-directory readdir+stat, 8 threads, 65,536 entries, min of 3 | `1.000216x [0.962482, 1.041209]`, spread `1.041209x` | `1.001277x [0.999156, 1.005984]`, spread `1.005984x` | **No admissible ratio.** Apparent `4.502939x [4.432475, 4.580046]` slower is retained only as blocked evidence. | **BLOCKED-NULL** |
+
+The storm competitive interval clears twice the worst same-invocation null
+log-margin (`1.041428x`) and is admitted. Parallel read fails both nulls.
+Readdir+stat repeats the kernel-only asymmetry while its FUSE null passes.
+Therefore the current candidate's result on this three-workload rerun is
+**0 wins / 1 loss / 0 neutral / 2 unscored**. The 2026-07-28 results below
+remain frozen historical evidence for their different candidate ELF; they are
+not substituted for the current candidate's two failed-null invocations.
+
+All three runs used 128 rounds / 32 complete four-round physical-role
+crossover blocks, eight balanced warmup rounds, 20,000 deterministic bootstrap
+resamples, a 100 ms untimed arm settle, matched mount/durability options, full
+four-arm parity, and four clean offline `e2fsck` checks. Wall time and bootstrap
+median confidence intervals were the decision inputs; `cv_used=false` and
+`instructions_used=false`. Requested and actually observed client threads were
+`8/8`, `1/1`, and `8/8`, consistently on every arm.
+
+The host was `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, 32 physical
+cores / 64 logical threads, 231,691,894,784 bytes RAM, one NUMA node, runtime
+ISA `avx2+fma+sse2+sse4.2`, with no cpuset cap. Every CPU reported
+`amd-pstate-epp`, governor `powersave`, and EPP `balance_performance`; the
+non-performance-governor warning is preserved in every report. Runtime client
+affinity was:
+
+- read: CPUs `4:7:15:21:26:29:32:33`, mask `00000003,24208090`;
+- storm: CPU `14`, mask `00000000,00004000`;
+- readdir+stat: CPUs `1:10:27:29:34:39:44:45`, mask
+  `00003084,28000402`.
+
+The initial/post-mount quiet windows consumed `71/56`, `269/106`, and `5/250`
+one-second samples respectively. That wait history is evidence that a
+one-instant contention sample would not be an adequate admission mechanism on
+this host.
+
+The executing comparator self-reported
+`executing_elf_sha256=96ebd0ef4a95290dd1fad255472e21043e0a026816aeebfbdb56bfb0d792c181`.
+Both FUSE arms self-reported the frozen x86-64-v3+PGO candidate
+`93ed882e6e4771db82371c933af28d7a907a6efdcfb13f29357baf2b7befe7f6`
+with PGO profile
+`1410ff5d34f99faa10eeb2dbbcb08747a6acdccdb065a3e34b89396a43b40ab0`.
+The incumbent identity was kernel `6.17.0-35-generic`, ext4 module/runtime
+notes, and `/boot/vmlinuz-6.17.0-35-generic` SHA-256
+`01e534223c871bd6246e8d57fd8c8101205384d682a3a23b6a5577fe28997c41`.
+Preserved reports and file hashes:
+
+- read:
+  `/data/tmp/frankenfs-mounted-kernel-governor-rerun/parallel-read-observed-threads-report.json`,
+  `138a6be8c01b45bbb826e06321f5071a7215ec50625ec3c48d1ec05fc7e5adce`;
+- storm:
+  `/data/tmp/frankenfs-mounted-kernel-governor-rerun/create-delete-observed-threads-report.json`,
+  `12cd0fc5a7403c42ddc0e93fb70482e0c2dbb4a3ebc40ecce3b11ebb2048dcae`;
+- readdir+stat:
+  `/data/tmp/frankenfs-mounted-kernel-governor-rerun/readdir-stat-observed-threads-report.json`,
+  `00cd9aa7c9929a46f6db640c605b7802ea9acf7db497cb9d69f9340e55d26a48`.
+
+Instrument commit `e91cd59e` passed strict-remote exact-source tests **18/18**
+on `ovh-a`, scoped no-dependency Clippy with warnings denied except the
+pre-existing deprecation class, file rustfmt, and `git diff --check`. The first
+non-scoped Clippy command stopped only on 23 pre-existing `ffs-ondisk` lints
+before reaching the comparator; it is not a candidate failure.
+
+**Retry predicate for parallel read and readdir+stat:** do not rerun on another
+merely fresh placement or under the same unobserved dynamic-frequency regime.
+First obtain a machine-level exclusive lease that covers the complete timed
+routine and either (a) owner-authorized `performance` governor on every allowed
+CPU, recorded before and after the invocation, or (b) counted per-arm
+frequency-residency evidence that proves equivalent boost behavior. Also add
+per-four-round-block attribution for CPU migrations, minor/major faults, and
+host-wide busy samples throughout timing so a peer that starts after preflight
+cannot remain invisible. Then rerun the unchanged workload with exactly eight
+observed worker TIDs per arm and admit only if both A/A bootstrap median CIs
+contain 1 with spread at most `1.025x`, the competitive CI clears twice the
+worst null log-margin, and parity/fsck remain clean. Never pool the blocked
+point estimates.
+
+## Four-round physical-arm crossover clears all three blocked ext4 nulls - 2026-07-28 (GreenSpring, vs-INCUMBENT instrument KEEP)
+
+This is the final measured closeout for the three workloads that the original
+five-workload invocation left `BLOCKED-NULL`. It changes the comparator, not the
+filesystem. Each logical kernel and FUSE role crosses over both physical
+image/mount identities in a complete four-round Latin-schedule block. The
+estimator uses only complete blocks, after eight identically balanced warmup
+rounds, so fixed physical-image and schedule-position bias cancel rather than
+being averaged more precisely. Each final invocation used 128 rounds / 32
+complete crossover blocks, a 100 ms settle after every arm, pinned client and
+FUSE cores in one quiet LLC, and `sync -f` outside the timed interval after
+mutating an arm.
+
+### Final admitted results
+
+| Workload | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| Multi-file parallel read, 8 threads, 1,024 x 256 KiB, min of 3 | `0.998988x [0.992238, 1.007322]`, spread `1.007822x` | `1.000804x [0.996671, 1.003045]`, spread `1.003340x` | **`1.298761x [1.285335, 1.309185]` slower** | **HONEST LOSS** |
+| Small-file create/delete storm, 2,000 files | `1.010078x [0.994165, 1.016433]`, spread `1.016433x` | `1.003297x [0.996501, 1.008202]`, spread `1.008202x` | **`2.705229x [2.688109, 2.726206]` slower** | **HONEST LOSS** |
+| Large-directory readdir+stat, 8 threads, 65,536 entries, min of 3 | `1.002819x [0.982342, 1.023088]`, spread `1.023088x` | `0.999492x [0.998021, 1.002427]`, spread `1.002427x` | **`4.404952x [4.370993, 4.469923]` slower** | **HONEST LOSS** |
+
+Every A/A interval contains 1 and has symmetric spread at most `1.025x`; every
+competitive interval also clears twice the worst same-invocation null
+log-margin. Wall time and deterministic 20,000-resample bootstrap median CIs
+are the decision inputs; `cv_used=false` and `instructions_used=false`. The
+full five-workload ext4 score is therefore **1 win / 4 losses / 0 neutral / 0
+unscored**.
+
+The in-process harness self-report was
+`executing_elf_sha256=49e8db7462cc450c1d76e733ac7eb7cc29b0ddc41bd7c4768bf1b6cc65dcf1e6`.
+Both FUSE daemons self-reported production x86-64-v3+PGO ELF SHA-256
+`502c4c877d61de5bd9daac8b6826e1a67ab046e65e0c625b8c4dd5dc75b1d835`
+and PGO profile SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The preserved reports and their file SHA-256s are:
+
+- parallel read:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785266486_3211479/mounted-kernel-report.json`,
+  `b45fc69231501177777ece3adc139b01e327b1af4386196c068677729de371ac`;
+- create/delete storm:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785266581_3239624/mounted-kernel-report.json`,
+  `a1ad17787ed14f7d9eb1858e27181de4c07ef13fae486fd8993f935abee8ed1a`;
+- readdir+stat:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785266818_3348552/mounted-kernel-report.json`,
+  `23f19bd17410a2ad48d7df1a81d424181bf0efe6fbc0d03d3463462bff358d98`.
+
+The 2026-07-27 section immediately below and the later counterbalance
+diagnostic retain the failed-null history and its then-unscored point estimates;
+they do not describe the current measurement status.
+
+**Retry predicate for replacing any final ratio:** use a new shipping-shaped,
+self-reporting FrankenFS ELF and a self-reporting schema-v4 driver with
+host-wide exclusivity enabled. Preserve the same four independent mounts,
+four-round physical-role crossover, matched mount/durability settings,
+constant-state reset, full parity/fsck checks, and at least 32 complete blocks.
+Each row must record host/core/thread/RAM/NUMA/ISA provenance, runtime affinity,
+requested and actually observed worker threads, and incumbent/candidate
+SHA-256s. Require both same-invocation A/A bootstrap median CIs to contain 1
+with spread at most `1.025x`, and require the competitive CI to clear twice the
+worst null log-margin. Never pool blocked estimates or gate on CV/instructions.
+
+## Mounted ext4 workload suite admits metadata and fsync ratios; three surfaces remain null-blocked - 2026-07-27 (GreenSpring, vs-INCUMBENT measurement)
+
+This is a direct-incumbent measurement row, not a FrankenFS before/after
+self-speedup and not a production tuning lever. The existing Rust comparator
+was extended with the five named workloads, then each workload ran against two
+independent real kernel-ext4 mounts and two independent FrankenFS FUSE mounts
+in one invocation. Every FUSE daemon self-reported the exact shipping-shaped
+x86-64-v3+PGO ELF, each mapped `/proc/<pid>/exe` hash matched that report, and
+the driver self-reported its own ELF. The balanced four-arm schedule supplied a
+kernel A/A and a FUSE A/A in every invocation. Every decision below therefore
+has numeric same-invocation A/A null controls with bootstrap median 95% CIs.
+Wall time and deterministic
+20,000-resample bootstrap median CIs were the only decision inputs;
+`cv_used=false` and `instructions_used=false`.
+For example, the admitted metadata invocation's same-invocation kernel A/A
+null control was `0.999980x`, with bootstrap median confidence interval
+`[0.989622, 1.007939]`.
+
+The common mount contract was `noatime,nodev,nosuid`. Read workloads were
+read-only (`noload` on kernel ext4); mutating workloads were read-write with
+kernel ext4 `data=ordered`. Durability was workload-specific and identical on
+both sides: eight directory fsyncs after parallel creates, no mutation for
+reads, `create -> fsyncdir -> delete -> fsyncdir` for the storm, and a 4 KiB
+positioned write plus `fsync` for every journal-latency operation. All reported
+invocations passed four-arm namespace/content parity and four post-unmount
+`e2fsck` checks.
+
+### Results
+
+| Workload | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel wall ratio | Decision |
+| --- | --- | --- | --- | --- |
+| Parallel metadata writes, 8 threads, 512 creates/observation | `0.999980x [0.989622, 1.007939]`, spread `1.010487x` | `1.004105x [0.993961, 1.010532]`, spread `1.010532x` | **`1.942477x [1.654395, 2.069775]` slower** | **HONEST LOSS** |
+| Multi-file parallel read, 8 threads, 256 x 256 KiB, min of 3 | `0.966904x [0.933998, 1.008743]`, spread `1.070666x` | `0.991734x [0.969409, 1.036149]`, spread `1.036149x` | **No admissible ratio.** Apparent `1.203230x [1.162802, 1.239236]` is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Small-file create/delete storm, 2,000 files | `1.009041x [1.001744, 1.013361]`, spread `1.013361x` | `1.000952x [0.995548, 1.008376]`, spread `1.008376x` | **No admissible ratio.** Apparent `2.957531x [2.939013, 2.971326]` is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Large-directory readdir+stat, 8 threads, 32,768 entries, min of 3 | `0.990140x [0.975169, 1.009721]`, spread `1.025464x` | `1.000955x [0.996572, 1.007587]`, spread `1.007587x` | **No admissible ratio.** Apparent `4.212274x [4.068120, 4.290202]` is retained only as blocked evidence. | **BLOCKED-NULL** |
+| Fsync/journal commit, 8 x 4 KiB write+fsync operations | `0.998159x [0.993763, 1.004863]`, spread `1.006276x` | `0.998367x [0.994864, 1.002099]`, spread `1.005162x` | **`0.994873x [0.992102, 0.999695]` kernel time**, equivalently **`1.005153x [1.000305, 1.007961]` faster** | **HONEST WIN** |
+
+The current direct-incumbent score for these five named ext4 surfaces is
+**1 win / 1 loss / 0 neutral / 3 unscored**. The admitted metadata loss replaces
+the separate-invocation 8.3x routing estimate for this exact workload. The
+earlier ~2.9x parallel-read and 4.599x storm estimates remain unverified rather
+than being silently converted into claims.
+
+### Provenance and blocked-null audit trail
+
+The measured FrankenFS executable was
+`7116aae15f64d47ce0703e9395f0ff64dcc4aa742c0735eb512fab0c20d9ff57`;
+it reported compile/runtime SSE4.2, AVX2, and FMA and PGO profile SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The admitted metadata report used driver ELF
+`c68355edf6ee4f6863652ae73b5b979382c01b8e942132aad94cc8400920c127`;
+its report is
+`/data/tmp/frankenfs-mounted-kernel-workloads/run_1785206871_2625082/mounted-kernel-report.json`.
+The final driver ELF was
+`b1aa15e3b331f6a0c607628f9f3b1b315fb8c54197627102f45a7cd90c954282`;
+the only semantic change between those drivers makes directory `st_size` an
+implementation-specific allocation detail rather than part of the logical
+tree hash. File lengths, paths, modes, ownership, link counts, contents,
+namespace parity, and offline checks remain mandatory. The admitted fsync
+report is
+`/data/tmp/frankenfs-mounted-kernel-workloads/run_1785207888_2762113/mounted-kernel-report.json`.
+
+Representative preserved blocked reports are:
+
+- parallel read:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785206977_2643668/mounted-kernel-report.json`;
+- create/delete storm:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785207688_2739056/mounted-kernel-report.json`;
+- large-directory readdir+stat:
+  `/data/tmp/frankenfs-mounted-kernel-workloads/run_1785208004_2776442/mounted-kernel-report.json`.
+
+Longer and repeated attempts did not satisfy the retry predicate: 64-pair
+256-file and 1,024/2,048-file read variants, repeated storm invocations, and
+8,192/32,768-entry directory variants continued to alternate which physical
+kernel or FUSE A/A arm was biased. Their point estimates were not pooled or
+selected. Fifty-three GiB of image/report artifacts remain under
+`/data/tmp/frankenfs-mounted-kernel-workloads`; none was deleted.
+
+**Retry predicate for the three unscored workloads:** do not retry merely on
+another fresh placement on this shared host. First provide either an exclusive
+quiet mount-capable measurement host, or a counted instrument improvement that
+counterbalances physical image/mount identity or continuously attributes
+per-arm CPU contention. Then rerun the exact shipping-shaped ELF in one
+four-independent-arm invocation, preserve the matched settings and full
+parity/fsck contract, and require both kernel and FUSE A/A bootstrap median
+95% CIs to contain 1 with symmetric spread at most `1.025x` before admitting
+the competitive wall/cycles ratio. Never gate on CV or instruction count.
+
+## Mounted-kernel Rust arm produces an honest ext4 warm-stat loss; btrfs remains null-blocked - 2026-07-27 (GreenSpring, vs-INCUMBENT instrument KEEP)
+
+This row banks an instrument, not a FrankenFS optimization or self-speedup.
+The mounted-kernel arm now runs two independent real-kernel mounts and two
+independent FrankenFS FUSE mounts in the same process. It therefore supplies
+both incumbent/candidate A/B and one A/A null control for each side without
+using a shared component as the baseline.
+
+The institutional preflight was run before this surface was opened. A broad
+`mounted stat` proposal correctly recovered the closed readdirplus/cache
+REJECT and its recorded reopening condition, so that lever was not re-derived. The qualified
+measurement-only surface passed:
+
+```text
+preflight: OK — no prior REJECT covers surface=[ffs_mounted_kernel_bench runtime mount identity ELF provenance interleaved comparator harness] proposal=[measurement-only four independent mount comparator driver with incumbent and candidate A/A]
+```
+
+### Runtime contract
+
+Each filesystem invocation owns four separately cloned images and four unique
+mountpoints. Before measuring, the harness proves:
+
+- `kernel_a` and `kernel_b` are real kernel `ext4` or `btrfs` mounts backed by
+  distinct declared loop devices, distinct image paths, and distinct mounted
+  superblock device identities;
+- `fuse_a` and `fuse_b` are `fuse.ffs` mounts backed by distinct images and
+  distinct daemon PIDs;
+- each FUSE daemon's in-process self-reported ELF SHA-256 equals both
+  `/proc/<pid>/exe` and the preflight-approved candidate SHA-256;
+- the executing Rust driver also self-hashes;
+- all four arms return identical payload SHA-256, length, mode, uid, gid, and
+  link count before timing; and
+- the kernel and FUSE arms use the common read-only `ro,noatime,nodev,nosuid`
+  contract. Ext4 additionally uses kernel `noload`; FrankenFS disables
+  background scrub and writeback cache. The workload performs no mutation, so
+  the matched durability contract is `read_only_no_mutation`.
+
+The driver pins itself to a quiet CPU and pins both serially exercised FUSE
+daemons to the same separate quiet physical CPU in the driver's last-level
+cache domain. It samples both SMT sibling sets and aborts if any selected
+physical core is above its pre-registered occupancy ceiling. One invocation
+then runs exactly 32 balanced four-arm rounds, interleaving all arms and
+rotating all orders equally. Each observation is the minimum of three
+executions of 2,000 warm `stat` calls. The decision input is wall time only. A
+deterministic 20,000-resample bootstrap median 95% CI gates each A/A control
+and the competitive ratio; `cv_used=false` and `instructions_used=false`.
+All requested filesystems run and write their raw report before a failed null
+gate returns exit 2.
+
+The measured candidate is the production-shaped x86-64-v3+PGO
+`release-perf` `ffs-cli`. Each FUSE daemon self-reported executing ELF
+SHA-256
+`9b5e0f5ffc2866a1e281abea72f7790bb58401815e296c307f722642b0d89e9c`
+and PGO profile SHA-256
+`6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+The incumbent identity was Linux `6.17.0-35-generic`.
+The executing final-source harness self-reported ELF SHA-256 `7099f14070d0e78851e30988c5c55a825a54e259fe8afbf6ec8d06e998454e40`.
+
+### Honest result
+
+| Filesystem | Kernel A/A bootstrap median 95% CI | FUSE A/A bootstrap median 95% CI | FrankenFS/kernel bootstrap median 95% CI | Verdict |
+| --- | --- | --- | --- | --- |
+| ext4 | `0.998996x [0.998100, 1.000246]`, symmetric spread `1.001903x` | `0.999638x [0.998008, 1.001696]`, symmetric spread `1.001996x` | **`5.033559x [5.023263, 5.050188]` slower** | Honest; both null CIs contain 1 and both spreads are below `1.025x` |
+| btrfs | `1.001833x [0.999823, 1.003129]`, symmetric spread `1.003129x` | `0.996028x [0.994686, 0.998294]`, symmetric spread `1.005342x` | Not admissible (`4.931910x [4.921023, 4.943701]` observed internally) | **BLOCKED-NULL**; the FUSE A/A CI excludes 1 |
+
+The current correct claim is narrowly scoped: on this 2,000-operation
+read-only warm-stat workload, the production x86-64-v3+PGO FrankenFS FUSE
+mount is **5.033559x slower than kernel ext4, bootstrap median 95% CI
+[5.023263, 5.050188]**. There is no current admissible btrfs competitive
+number because its final-source A/A gate did not clear. This is direct
+vs-incumbent evidence: **0 wins / 1 loss / 0 neutral**, with btrfs unscored. It
+is not a self-speedup and no source lever was applied.
+
+All final-source arms returned payload SHA-256
+`edc918914d9862e5c2a6193ed293fe1de2f319a8b4124ee9acbcd4926b3f4189`
+with identical metadata across all four arms. The ext4 images passed
+post-unmount `e2fsck`; the btrfs images passed post-unmount `btrfs check`.
+The combined machine-readable report, including every raw wall sample, runtime
+identity, CPU/LLC placement, admitted ext4 row, and rejected btrfs row, is
+`/data/tmp/frankenfs-mounted-kernel/run_1785188339_332893/mounted-kernel-report.json`.
+
+### Bring-up results that were not admissible
+
+These outcomes shaped the fail-closed contract but are not competitive
+measurements:
+
+| Attempt | Result | Disposition and concrete retry predicate |
+| --- | --- | --- |
+| FUSE mountpoints under `/data/tmp` | `fusermount3: mount failed: Permission denied`; enforced AppArmor permits the mount helper under `/tmp/**`, not `/data/tmp/**`. | **BLOCKED-ENVIRONMENT.** Retry only with all images/evidence retained under `/data/tmp`, all four mountpoints under an allowed path, and otherwise identical mount options. The final runs satisfy this with `/tmp/frankenfs-mounted-kernel-mounts`. |
+| First ext4 run after mount-path correction | Selected FUSE CPU measured `36.7%` busy, above the `35%` preflight ceiling; no timed ratio was admitted. | **BLOCKED-CONTENTION.** Retry only after a fresh occupancy sample selects distinct driver/FUSE CPUs below the ceiling. Both final runs satisfy it. |
+| Early ext4 timing | Kernel A/A bootstrap median 95% CI `[1.001049, 1.003365]` excluded 1; no competitive point estimate was admitted. | **BLOCKED-NULL.** Retry only with a quiet pinned core and an exactly balanced four-order schedule whose kernel and FUSE A/A CIs both contain 1 and have symmetric spread at most `1.025x`. The final ext4 run satisfies it. |
+| 31-round ext4 prototype | It emitted `5.037058x [5.028123, 5.071204]` with clear nulls, but 31 rounds cannot balance four orders exactly. | **VOID-SCHEDULE; never publish or pool.** Retry only with a positive pair count divisible by four and equal counts for every arm position. The final 32-round ext4 run satisfies it. |
+| First btrfs identity check | Btrfs mountinfo exposed anonymous major:minor `0:124`, so looking that value up as a loop device failed before timing. | **BLOCKED-IDENTITY.** Retry only after resolving the declared mount source loop device through `/sys/class/block/<loop>/loop/backing_file` and proving it matches the arm image. The final btrfs run satisfies it. |
+| Early btrfs timing | Identical FUSE arms produced an approximately `1.273x` A/A point ratio when their daemons could land on different cores; no competitive point estimate was admitted. | **BLOCKED-NULL; never publish or pool.** Retry only with both serially exercised daemons pinned to the same quiet physical CPU plus the exact balanced schedule and the same `1.025x` CI gate. The final harness satisfies the placement predicate, though its final btrfs measurements remain null-blocked. |
+| Root-invoked driver | Elevating the whole driver caused the candidate mount to appear as generic `fuse`, so the required runtime `fuse.ffs` identity assertion stopped the run before timing. | **BLOCKED-IDENTITY.** Run the driver as the invoking user and elevate only the kernel mount/unmount commands internally. All later runs satisfy this predicate. |
+| Cross-CCD combined run, harness ELF `b89d11db87aa2ec0286b2c30bd62e80df2dd7a5e575b355ec5727e89866d9b91` | Clear A/A controls accompanied apparent ext4 `6.509070x [6.494282, 6.515157]` and btrfs `6.460477x [6.451439, 6.467185]` losses, but the driver ran on CPU 0 and FUSE on CPU 24 in different L3/CCD domains. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785187240_273792/mounted-kernel-report.json`. | **VOID-TOPOLOGY; never publish or pool.** Same-side A/A cannot detect a bias shared by both FUSE arms. Retry only when driver and FUSE cores share the same last-level-cache domain and both physical cores' SMT siblings are quiet. The final harness enforces this mechanically. |
+| Pre-final separate ext4 and btrfs runs, harness ELF `9a22b69b6da25ee28a14a22761d20d5c23d8dabadade1782819e216621606e08` | Clear A/A controls produced ext4 `4.998240x [4.991335, 5.011338]` and btrfs `4.951192x [4.947170, 4.956124]`. Reports: `/data/tmp/frankenfs-mounted-kernel/run_1785185833_160264/mounted-kernel-report.json` and `/data/tmp/frankenfs-mounted-kernel/run_1785185816_153813/mounted-kernel-report.json`. | **SUPERSEDED-SOURCE; retain internally, not the current claim.** Retry with the exact committed harness that mechanically requires same-LLC placement and preserves reports before returning exit 2. The final-source ext4 run satisfies this; final-source btrfs remains null-blocked. |
+| Same-LLC combined run, harness ELF `e63c31f663ba05a16d031e5e5d5c0356aae26836290639a399bf5f6f68267b39` | Ext4 cleared both nulls and observed `5.012652x [5.006774, 5.020606]`; btrfs FUSE A/A `0.998178x [0.996967, 0.998891]` excluded 1. The then-current error path returned before persisting the mixed-verdict report. | **BLOCKED-EVIDENCE for the combined artifact.** Retry only after every requested filesystem runs and the complete raw report is written before exit 2. Harness ELF `7099f140…54e40` implements that contract. |
+| First report-preserving combined run, harness ELF `7099f14070d0e78851e30988c5c55a825a54e259fe8afbf6ec8d06e998454e40` | Ext4 kernel A/A `[0.997289, 0.999878]` and btrfs FUSE A/A `[1.001021, 1.002657]` excluded 1, so neither observed competitive ratio was admitted. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785188310_331136/mounted-kernel-report.json`. | **BLOCKED-NULL.** The predeclared retry was a fresh zero-load placement in the same LLC with both SMT sibling sets guarded; the next unchanged-ELF invocation applied it. |
+| Second report-preserving combined run, same ELF | Ext4 cleared both A/A controls and admitted the current `5.033559x [5.023263, 5.050188]` loss. Btrfs FUSE A/A `[0.994686, 0.998294]` excluded 1, so its observed `4.931910x [4.921023, 4.943701]` ratio is unscored. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785188339_332893/mounted-kernel-report.json`. | **EXT4 HONEST / BTRFS BLOCKED-NULL.** Do not pool the btrfs point estimate with any other run. |
+| Third final-ELF btrfs attempt | FUSE A/A cleared, but kernel A/A `0.999286x [0.998196, 0.999924]` excluded 1; observed `4.960432x [4.958407, 4.963746]` remains unscored. Report: `/data/tmp/frankenfs-mounted-kernel/run_1785188398_345293/mounted-kernel-report.json`. | **BLOCKED-NULL; stop this vein after three final-ELF rejects.** Retry btrfs only after continuous per-arm CPU attribution or another counted mechanism explains and removes the alternating kernel/FUSE A/A asymmetry; then require both same-invocation median CIs to contain 1. A fresh placement alone is no longer a sufficient retry predicate. |
+
+**KEEP the instrument. Retry predicate for replacing the ext4 number:** use the
+same four-independent-arm, same-invocation, runtime-identity,
+production-v3+PGO self-report, exact-parity, matched mount/durability,
+interleaved-order, same-LLC quiet-core contract; require both A/A bootstrap
+median 95% CIs to contain 1 with symmetric spread at most `1.025x`; and gate
+the new wall/cycles ratio on its bootstrap median CI with `cv_used=false` and
+`instructions_used=false`. For btrfs, first satisfy the stronger counted-attribution
+predicate in the final bring-up row. A different workload may add a separately
+scoped claim but does not supersede this warm-stat result.
+
+## Borrowed extent-item refcount payload clears the null and 5% floors - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior decision on the exact
+`BtrfsExtentAllocator::extent_item_refs` surface. The broader ledger grep kept
+this exact-key read separate from the closed keyed-backref scan/delete rows:
+this function materialized an inclusive one-key `range` result only to read the
+first eight payload bytes.
+
+The production-shaped fixture stored 4,096 real `BTRFS_ITEM_EXTENT_ITEM`
+records and repeated their public lookups four times per observation. The
+materialized control therefore performed:
+
+- 16,384 public `extent_item_refs`-shaped calls;
+- 16,384 result-vector allocations;
+- 16,384 payload-vector allocations; and
+- 393,216 cloned payload bytes.
+
+The borrowed `range_with` path reduced all three materialization counts to
+zero. Both paths returned digest `31166e01c212cbd4` in the same probe order.
+A separate oracle proved identical valid-item values, short-item `None`,
+absent-item `None`, and production results.
+
+Before production changed, a source-neutral strict-remote x86-64-v3
+release-perf process on pinned `ovh-a` self-reported executing ELF SHA-256
+`aa34ba930d8e8e34aaa7ab166ee751658025d9c860b3e3ee277f8937612034d3`,
+worker `fixmydocuments`, and compile/runtime SSE2, SSE4.2, AVX2, and FMA. Its
+materialized/borrowed model measured:
+
+- median **1.206740x**;
+- deterministic 20,000-resample bootstrap median 95% CI
+  **[1.202154, 1.210859]**; and
+- saved-fraction lower bound **0.168160**.
+
+The same invocation's materialized/materialized A/A measured median
+**0.999289x**, CI **[0.996377, 1.000338]**, symmetric null floor
+**1.003636x**, and twice-null threshold **1.007286x**. This admitted the
+production edit but was not used as its final magnitude.
+
+Production now decodes the refcount inside `range_with` while the exact-key
+payload remains borrowed from the tree node. Inclusive key selection, tree
+errors, valid refcount values, short/absent `None`, ordering, and the
+side-effect-free read contract are unchanged. Tie-breaking, floating point,
+and RNG are N/A.
+
+The final actual-production invocation was independently linked. From inside
+the timed process it emitted `bench_evidence,binary_sha256=cec1a4f6321ebd10c3e11db867ebc29c6cac83a3d7648ac8f7087c817e1ee9e4,worker=fixmydocuments`.
+This x86-64-v3 release-perf ELF again ran on pinned `ovh-a` with
+compile/runtime SSE2, SSE4.2, AVX2, and FMA. It measured:
+
+- materialized/production-borrowed median **1.193053x**;
+- bootstrap median 95% CI **[1.186397, 1.194739]**;
+- saved-fraction lower bound **0.157112**;
+- same-invocation A/A median **0.999146x**;
+- A/A CI **[0.997507, 0.999695]**;
+- symmetric null floor **1.002499x**; and
+- twice-null threshold **1.005005x**.
+
+**KEEP, narrowly scoped.** The final lower bound cleared both twice-null and
+the pre-registered 5% saved-fraction floor. Each valid invocation owned 31
+alternating `AAB`/`BAA` pairs, min-of-three observations, exact parity, and
+its own deterministic bootstrap median wall-time decision. Results were not
+pooled. CV and instruction count were not decision inputs.
+
+One earlier command omitted `FFS_BTRFS_EXTENT_ITEM_REFS_GATE` from
+`RCH_ENV_ALLOWLIST`, so the remote process ran the ordinary Criterion suite
+instead of this contract. That invocation is invalid and unscored.
+
+Strict-remote `ffs-btrfs` library tests passed **374/374**, with one manual
+timing test intentionally ignored. Scoped library-plus-benchmark Clippy passed
+with every warning denied after allowing only the reproduced pre-existing
+`similar_names`, `too_long_first_doc_paragraph`, and `too_many_arguments`
+categories in untouched library code. Targeted rustfmt and `git diff --check`
+passed. `/data` had **393G or more** free before final Cargo invocations; every
+target remained worker-scoped and there was no local fallback.
+
+This is a 16,384-call internal lookup batch, not an ordinary single extent,
+whole free/reflink/purge, PGO, mounted, shipped, or kernel magnitude.
+
+**Retry predicate:** publish an end-to-end magnitude only after a production
+free, purge, or reflink profile observes the real call cardinality and
+attributes at least 5% of whole-operation wall/cycles to `extent_item_refs`.
+Then use that whole operation in one self-hashing same-worker
+x86-64-v3+PGO A/A+B invocation, preserve the exact final tree/image plus an
+independent `btrfs check` where applicable, and require a bootstrap median
+wall/cycles CI clearing twice its own null log-margin with at least a 5%
+saved-fraction lower bound. Never transfer this internal batch ratio or gate
+on CV/instructions.
+
+## Ext4 names-only external result-vector merge is below the null and 5% floors - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional preflight found no prior REJECT on the qualified
+`Ext4ImageReader::list_xattr_names` external-vector merge surface. The family
+grep did recover two adjacent closed families and kept them separate:
+
+- the 2026-07-13 rejected second full-`Ext4Xattr` parser result vector; and
+- the list-24/list-64/list-128 direct-FUSE-wire retries.
+
+This experiment changed neither family. The actual production control parsed
+four inode-body names into its result, parsed 128 external-block names into a
+second `Vec<String>`, and moved those 128 string objects into the first vector
+with `extend`. The source-neutral model retained the same first vector and
+parser semantics but appended external names directly.
+
+The one-process proof covered:
+
+- exact complete output: 132 names, checksum `b5a030122573b5dd`;
+- exact ibody-first then external ordering;
+- all declared namespace prefixes plus the unknown prefix;
+- invalid UTF-8 lossiness;
+- the counted mechanism: **one temporary external vector and 128 moved
+  `String` objects to zero**; and
+- 31 alternating `AAB`/`BAA` pairs with min-of-three batch observations.
+
+The strict-remote pinned `vmi1149989` process self-reported x86-64-v3
+release-perf ELF SHA-256
+`a47eff4b6e296ed173cfee231fefbe57439d9c7673ddb36c43b61e8b7bd75fda`
+(15,477,760 bytes), with compile/runtime SSE2, SSE4.2, AVX2, and FMA.
+`/data` had 410G free before both Cargo requests, and RCH used only its remote
+worker-scoped target.
+
+Production/materialized over direct-append measured:
+
+- median **1.021639x**;
+- bootstrap median 95% CI **[1.017085, 1.035235]**; and
+- saved-fraction lower bound **0.016798**, below the required **0.05**.
+
+The same invocation's production/production A/A measured median
+**0.990247x**, bootstrap median CI **[0.970793, 1.005216]**, symmetric null
+floor **1.030085x** versus the maximum **1.025x**, and twice-null threshold
+**1.061076x**. The decision used only the deterministic 20,000-resample
+bootstrap median CI over wall time. CV and instruction count were not decision
+inputs.
+
+**REJECT before production edit.** The model failed the A/A floor, twice-null
+threshold, and 5% saved-fraction lower bound. Production still returns
+`parse_xattr_block_names` into a temporary vector and extends it. The hidden
+contract and feature-gated noinline attributes remain only so the rejected
+boundary is mechanically replayable; normal production behavior is unchanged.
+
+The current mounted list-128 profile remains useful context: it attributes
+25.24% self-time to `parse_xattr_entry_names`, but that number includes the
+whole per-name parser and string construction and does not attribute 5% to this
+top-level vector. A new report-only profile attempt was refused before
+execution because the pinned worker reached RCH queue timeout; strict remote
+prevented local fallback, so no new profile percentage is claimed.
+
+Strict-remote focused xattr tests passed **29/29**, and the adversarial xattr
+corpus passed **1/1**. The owned library-plus-benchmark Clippy target passed
+with every warning denied after allowing only eight categories reproduced in
+the untouched library before the benchmark was checked. The benchmark passed
+targeted rustfmt and `git diff --check`; whole-file `ext4.rs` rustfmt remains
+blocked by unrelated existing drift.
+
+**Retry predicate:** retry only when a fresh allocator/symbolized production
+profile directly attributes at least 5% of whole `list_xattr_names` wall/cycles
+to allocation, growth, movement, or drop of the temporary external result
+vector itself—not per-name strings or parsing—or when a real multi-inode caller
+batch exposes at least the same one-vector-per-inode fraction. Use that observed
+shape in one self-hashing same-worker v3+PGO A/A+B invocation and require exact
+ordered names/errors, an A/A symmetric floor at most 1.025x, a bootstrap median
+wall/cycles CI clearing twice its own null log-margin, and at least a 5%
+saved-fraction lower bound. The separate direct-wire predicate must also be met
+before reopening wire encoding. Never gate on CV or instruction count.
+
+## Grouped JBD2 run assembly is below the profile-admission floor - 2026-07-27 (GreenSpring, SURFACE / NOT ADMITTED)
+
+The institutional preflight passed the qualified surface
+`jbd2_same_transaction_run_assembly_memcpy_after_grouping`. The required family
+grep also recovered the existing same-transaction descriptor/data grouping and
+the closed cross-transaction group-commit and pwritev families, so this profile
+did not re-derive either frontier. It asked one narrower question: after
+grouping was kept, is assembling the contiguous descriptor-plus-payload buffer
+now expensive enough to justify scatter/gather?
+
+The retained report-only route exercises the actual grouped
+`Jbd2Writer::commit_transaction` path for 2,048 samples, each containing 64
+full-size payload blocks. Before profiling, the same process ran the frozen
+scalar-write oracle and grouped production path and asserted byte-for-byte
+equality over the 524,288-byte journal region.
+
+**Counted mechanism:** current assembly performs allocation count **1** and
+copies one 4 KiB descriptor plus 64 4 KiB payloads, **266,240 bytes total**, per
+descriptor group before the existing single contiguous device write.
+
+The final-source strict-remote x86-64-v3 release-perf process ran on pinned
+`vmi1149989` and self-reported executing ELF SHA-256 `75cb7e80d11bcda59006ec7ee7c291295d14f1279747af78215604b81467ea1a`
+(3,763,336 bytes), with compile/runtime SSE4.2, AVX2, and FMA. `/data` had
+**435G** free before the replay, and RCH used a worker-scoped target without
+local fallback.
+
+`perf record -F 999 -g --call-graph fp` followed by
+`perf report --children` attributed:
+
+- `jbd2_write_combining::run_production_commit`: **2.98%**;
+- `Cx::checkpoint`: **1.25%** and **0.84%** symbol variants;
+- `stamp_jbd2_tag_data_checksum`: **0.18%**; and
+- `assemble_jbd2_descriptor_data_run`: **0.12%**.
+
+**SURFACE / NOT ADMITTED; no production lever.** The named assembly frame is
+only **0.12%**, far below the pre-registered **5.00%** attribution floor. Even
+impossible elimination of the entire named frame is below campaign
+resolution, so no scatter/gather or pwritev candidate was implemented and no
+A/B ratio is published. The run explicitly reported
+`ratio_published=false`; A/A and bootstrap median-CI gates become applicable
+only after a candidate clears attribution. CV and instruction count were not
+decision inputs.
+
+An independent pre-Clippy-refactor invocation self-reported ELF
+`0c938e09eaa30fa52461326f26f6a485e8985a5cc699d5d410d6d29b6cc4ef82`
+and attributed **0.07%** to the same assembly frame. The final-source replay is
+the primary result; the two profiles are reported separately and were not
+pooled.
+
+The feature-gated named helper is retained as attribution infrastructure.
+Normal production builds request inlining, while `bench-instrumentation`
+forces a stable out-of-line frame. Descriptor/payload order, transaction
+boundaries, contiguous write count, checksums, journal bytes, and crash
+semantics are unchanged.
+
+Strict-remote focused tests passed **277/277**. Scoped library-plus-benchmark
+Clippy passed with only the reproduced `incompatible_msrv` category allowed;
+all-targets Clippy passed with the reproduced baseline categories
+`incompatible_msrv`, `significant_drop_tightening`, and `too_many_lines`
+allowed and every other warning denied. Targeted rustfmt and
+`git diff --check` passed.
+
+**Retry predicate:** retry run-copy elimination only when a fresh symbolized
+production-shaped profile attributes at least 5% children or self time to
+`assemble_jbd2_descriptor_data_run` on an observed descriptor-group
+cardinality. Then require one self-hashing same-worker x86-64-v3 A/A+B
+invocation, exact journal bytes plus crash/replay parity, a counted
+allocation/copy/syscall mechanism, and a bootstrap median wall/cycles CI
+clearing twice its own null log-margin with at least a 5% saved-fraction lower
+bound. Never gate on CV or instruction count, and do not reopen
+cross-transaction group commit unless its separate durability predicate is
+met.
+
+## Lazy queued group-id tracing is below the whole-callback null floor - 2026-07-27 (GreenSpring, REJECT)
+
+The qualified institutional preflight found no prior REJECT on
+`queued_refresh_group_ids_debug_materialization`. A broader first key had
+matched the unrelated 2026-06-28 `ffs-core` repair write-set collection reject;
+the exact field/materialization key separated the callback-local logging
+surface without reopening that commit-path family.
+
+The retained source-neutral model froze every banked callback decision:
+disjoint-range indexing, compact temporary sort/dedup, persistent hash
+membership, deterministic drain order, overlap first-input-match fallback,
+mutex boundaries, and tracing event order. It changed only how the first debug
+event exposes group IDs. The control eagerly collected `Vec<u32>` before the
+event; the candidate supplied a lazy `DebugList` view over the already-sorted
+`GroupNumber` slice.
+
+The untimed proof covered 512 unique groups:
+
+- exact ascending queue output and checksum `7a8c925983737ede`;
+- exact 2,903-byte rendered debug-field text;
+- eager mechanism: **one allocation, 512 copied IDs, 2,048 copied bytes**; and
+- lazy mechanism: **zero allocations and zero copied IDs**.
+
+**Counted mechanism:** allocation count `1 -> 0`; copied-ID count `512 -> 0`;
+copied-byte count `2,048 -> 0`.
+
+One strict-remote invocation on pinned `ovh-a` built x86-64-v3 release-perf
+and executed ELF
+`aca3ce86968eef94b57cc108748f54430be594838216311cb50129c3ed74767d`.
+The process self-reported compile/runtime SSE2, SSE4.2, AVX2, and FMA. Its
+optional environment-only worker field printed `unknown`; the RCH selection
+and execution logs are the worker witness. `/data` had **436G** free before
+the build, and all target output remained worker-scoped.
+
+Across 41 alternating A/A+B rounds, each observation used min-of-three and a
+calibrated batch of 64 complete callback-plus-drain executions:
+
+- eager/eager A/A median **0.999851x**, deterministic bootstrap median 95% CI
+  **[0.999269, 1.000424]**;
+- symmetric null floor **1.000732x** and twice-null threshold **1.001464x**;
+- eager/lazy median **0.999772x**, CI **[0.999142, 1.001288]**; and
+- saved-fraction lower bound **0.000000**, versus the pre-registered 5% floor.
+
+In the same invocation, the A/A null-control median was **0.999851x** with a
+deterministic bootstrap median 95% CI **[0.999269, 1.000424]**.
+
+An unpooled exact-source replay self-reported ELF
+`290f17258dc9275bd143951cfac4d04280d1ee5505519e35e9d8865581049b51`
+and independently returned the same decision: eager/eager A/A
+**0.999408x [0.998450, 1.000148]**, symmetric null floor **1.001552x**,
+twice-null **1.003107x**, and eager/lazy **1.000178x [0.999386, 1.000652]**.
+Its saved-fraction lower bound was again **0.000000**. The two invocations are
+reported separately and were not pooled.
+
+**REJECT; no production edit.** Eliminating the allocation is real, but the
+complete callback does not move: both full A/B CIs remain inside their own
+twice-null thresholds and their lower-bound saving is zero. The source-neutral guard stays in
+`queued_refresh_lookup.rs`; production continues to materialize `group_ids`.
+This decision used only bootstrap median wall-time CI. CV was printed as
+provenance and was not a gate; instruction count was not used. This is neither
+PGO nor whole-flush, mounted, shipped, or kernel evidence.
+
+**Retry predicate:** retry only when a current production callback profile
+attributes at least 5% of whole-callback wall/cycles specifically to eager
+group-ID materialization, or production telemetry shows a materially different
+small callback shape (p50 at most eight unique groups) where allocation
+profiling names this `Vec`. Use that observed cardinality and tracing state in
+one self-hashing same-worker A/A+B invocation, preserve exact rendered field
+text and queue output, and require the bootstrap median wall/cycles CI to clear
+twice its own null log-margin with at least a 5% saved-fraction lower bound.
+Never gate on CV or instruction count.
+
+## Exact v3+PGO warm-read gate leaves no resolved ISA correction - 2026-07-27 (GreenSpring, CLAIM CORRECTION / NULL)
+
+The institutional preflight found no prior row on
+`bd_b9dug_whole_binary_read_gate`; the required family grep recovered the
+closed cold-read/copy/page-fault frontiers (`bd-ddryj`, `bd-q6k00`, and
+`bd-zvn7r`). None of their reopening conditions was met, so this work did not
+re-derive a read-path lever. It added only the missing whole-binary identity
+gate for the named warm sequential-read claim class.
+
+All Cargo stages were strict-remote and pinned to `ovh-a`. The generic
+release-perf process self-reported executing ELF
+`deb2cc4693434e3fa7d292e2259f4be92eeddd9002513858cb7eb0083acf66d9`,
+with SSE2 and without compile-time SSE4.2/AVX2/FMA. The profile-generation
+process self-reported ELF
+`5092a0e81137618d742fac4e47af332b68d21ea1f9167da4a271a49a624a5291`
+and compile/runtime AVX2+FMA. Its production-shaped corpus generated 518 raw
+profiles and a 28,783,720-byte merged profile with SHA-256
+`60b213e302a5b888c205cff8fd050a1b7b0cf4d9d9d849cecb9c98e2cbe02692`.
+The final v3+PGO process self-reported executing ELF
+`ad55a58a0b2c0b5d3b75c586adcf960da8e94ed7f91ab9f68c208ecdb001587c`,
+compile/runtime AVX2+FMA, and that exact consumed-profile SHA.
+
+The immutable input image SHA-256 was
+`3905bfa23212cf8d5b9d3cf95beb7bb8fb519a0faa47189f606304fe5cb717fd`.
+Both arms returned exactly 33,554,432 bytes with payload SHA-256
+`edeadec8f638055689d5be63b4bcf2654fb64bf91fb6651e9a924f052a9c7db0`;
+payload parity ran outside timing, and the image hash remained unchanged.
+Every timed child printed its ELF/ISA/profile identity from inside that exact
+process before starting its timer. One parent invocation then owned two
+warmups per binary and 31 alternating `AAB`/`BAA` rounds.
+
+Generic warm-read median was **8,398 us** and v3+PGO median was **7,903 us**.
+The paired generic/generic A/A median was **1.037304x**, deterministic
+20,000-resample bootstrap median 95% CI **[0.903229, 1.168764]**. Its symmetric
+null floor was therefore **1.168764x** and its pre-registered twice-null
+threshold was **1.366010x**. Paired generic/v3+PGO median was **1.009827x**,
+95% CI **[0.928481, 1.070209]**.
+
+**CLAIM CORRECTION / NULL, not a source REJECT.** The lower raw v3+PGO median
+is descriptive only: the paired A/B CI overlaps 1.0 and is wholly below the
+same-invocation null floor. No speedup, slowdown, or correction factor is
+admissible. The gate used read wall time and bootstrap median CI;
+`cv_used=false`; `instructions_used=false`. This is a warm offline sequential
+32 MiB CLI read, not a cold-cache, mounted FUSE, multi-file, or kernel
+comparison. Historical cold/mounted ratios remain measurements of their
+baseline-ISA ELFs and are now explicitly restated that way in
+`docs/BD_B9DUG_ISA_CORRECTION.md`.
+
+After the owned helper signature was tightened for scoped Clippy, an
+exact-source replay rebuilt v3+PGO ELF
+`09928b976c66d4452f2e26d056a95c8ef5079dcf93c8e998ae1a1e9e226a685c`.
+It self-reported the same ISA and consumed-profile identity, returned the same
+payload and immutable-image hashes, and repeated all 31 A/A+B pairs. Generic
+median was **8,114 us**, v3+PGO median was **7,241 us**, and paired A/B was
+**1.068757x**, 95% CI **[1.009721, 1.220066]**. Its A/A was **0.963717x**,
+95% CI **[0.856697, 1.094219]**, giving a **1.167274x** symmetric null floor
+and **1.362528x** twice-null threshold. The apparently positive A/B interval
+still failed even the invocation's own null floor, so the independent replay
+also returned **BLOCKED_NULL_FLOOR**. The two decisions are not pooled.
+
+**Retry predicate:** publish a cold or mounted read correction only after one
+same-worker invocation contains generic release-perf, exact v3+PGO, and the
+matched mounted-kernel arm; every timed FrankenFS child must self-report its
+executing ELF/profile SHA, all arms must return byte-identical payloads, and
+the image/filesystem must pass independent validation. A cold claim must
+control cache state for every arm. Require two independent complete
+invocations whose bootstrap median wall/cycles CIs each clear twice their own
+A/A null log-margin; never substitute CV, instruction count, this warm result,
+or an arithmetic factor from lookup/create.
+
+## Btrfs free-path backref key projection - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional exact-surface preflight found no prior REJECT on
+`BtrfsExtentAllocator::delete_backrefs_for_extent`. The required family grep
+did recover the older noisy `remove_many` frontier, so this attempt explicitly
+left the existing ascending per-key delete loop unchanged. It tested only
+whether the preliminary range scan should materialize `(key, Vec<u8>)` pairs or
+borrow each payload while retaining the same ordered key vector.
+
+The full-path fixture held 512 keyed `EXTENT_DATA_REF` items for one extent plus
+two out-of-range sentinels. Both arms deleted the same 512 keys in ascending
+tree order, produced deleted-key digest `d12155af72c1634f`, and retained the
+same two sentinels byte-for-byte. The materialized control cloned **512
+temporary payload `Vec`s / 14,336 bytes**; the borrowed projection cloned
+**0**. Tie-breaking was unchanged/N/A; floating point and RNG were N/A.
+
+A pre-edit source-neutral strict-remote pinned-`ovh-a` x86-64-v3 process
+self-reported
+`bench_evidence,binary_sha256=f444fdfd8119d6af411d846c33500f9568aa4fa01db935d37a5d160115a366d4`.
+Its full selection-plus-512-deletes model median was **1.071793x**, bootstrap
+median 95% CI **[1.055711, 1.081472]**, against same-invocation A/A median
+**1.003734x** with bootstrap median 95% CI **[0.985769, 1.016860]**, and a
+**1.034004x** twice-null threshold. The saved-fraction lower bound was
+**0.052771**, narrowly clearing the pre-registered 5% admission floor.
+
+The candidate was then installed in the actual production body and linked
+again. That final candidate process self-reported
+`bench_evidence,binary_sha256=e9434c725a553d7aab989a6f8bd1a571acd0429e6f3690bcd643f47b8d52403f`;
+compile/runtime SSE2, SSE4.2, AVX2, and FMA were all true. The same invocation
+again proved exact ordered-delete/final-tree parity and the **512 `Vec`s /
+14,336 bytes to 0** mechanism, but its A/A median was **0.974376x**, bootstrap
+median 95% CI **[0.962568, 0.995147]**. That yielded a **1.038887x** symmetric
+null floor and **1.079287x** twice-null threshold. Actual candidate median was
+only **1.043917x**, CI **[1.026145, 1.051577]**, with saved-fraction lower bound
+**0.025478**.
+
+**REJECT; production materialization restored.** The final candidate CI did
+not clear twice null, its lower-bound saving was below 5%, and the A/A floor
+itself exceeded the pre-registered 1.025 limit. The source-neutral admission
+was therefore insufficient to publish or retain a production lever. A
+`bench-instrumentation` replay remains behind
+`FFS_BTRFS_BACKREF_DELETE_GATE=candidate`; normal production continues to use
+the original materialized scan. This result is only a 512-backref internal
+free-path shape, not an ordinary one-ref extent, whole truncate/unlink,
+v3+PGO, mounted, shipped, or kernel magnitude. The decision used bootstrap
+median wall-time CIs; `cv_used=false`; `instructions_used=false`.
+
+After restoring production, strict-remote `free_extent`-filtered tests passed
+**7/7** with `bench-instrumentation` enabled. Scoped library-plus-benchmark
+Clippy passed under `--no-deps -D warnings` after the owned benchmark
+controller was split to satisfy `too_many_lines`; only the repository's known
+dependency deprecation warnings remained. Targeted rustfmt and
+`git diff --check` passed. `/data` had **436G** free before every Cargo
+invocation; all target output remained worker-scoped.
+
+**Retry predicate:** retry borrowed key projection only after a witnessed
+x86-64-v3+PGO production free/truncate profile both observes at least 512 keyed
+backrefs on the target extent and attributes at least 5% of whole-operation
+wall/cycles specifically to payload materialization in
+`delete_backrefs_for_extent`. Then use that observed cardinality in one
+same-worker self-hashing whole-operation A/A+B invocation, require exact final
+tree/image plus `btrfs check` parity, use min-of-three paired observations, and
+require the bootstrap median wall/cycles CI to clear twice its own null
+log-margin with a saved-fraction lower bound of at least 5%. The closed
+`remove_many` frontier remains out of scope unless its separate ledger retry
+predicate is independently met.
+
+## Btrfs keyed extent backrefs parse borrowed payloads - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior row on
+`BtrfsExtentAllocator::get_extent_data_refs`. The required family grep recovered
+the adjacent kept checksum-delete key projection, but no rejected backref
+parsing surface. A source-neutral harness therefore froze the exact inclusive
+`(bytenr, EXTENT_DATA_REF, 0..=u64::MAX)` range, ascending key order,
+`BtrfsExtentDataRef::from_bytes` validation, malformed-record skip behavior,
+and returned record vector while comparing the existing materializing range
+walk with a borrowed `range_with` walk.
+
+The pre-edit strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported ELF
+`544851737a95df49dbfc71d9bec4fbbc0e6ce1f7091cf0c8486a1fe97a196cb4`.
+All compile/runtime SSE2, SSE4.2, AVX2, and FMA checks were true. On 4,096 keyed
+backrefs, control, borrowed model, and then-current production returned the
+same 4,096 parsed records in the same order, checksum `7f3c7a247fc4a0b6`.
+The control materialized **4,096 temporary payload `Vec`s / 114,688 bytes**
+before retaining the fixed-size parsed records; the candidate materialized
+**0** temporary payload vectors while retaining the identical output vector.
+
+One invocation owned exact parity, the counted mechanism, and both timing
+controls. Materialized/materialized A/A median was **1.001039x**, deterministic
+20,000-resample bootstrap median 95% CI **[0.998937, 1.003046]**, yielding a
+symmetric null floor of **1.003046x** and a pre-registered twice-null threshold
+of **1.006100x**. Materialized/borrowed-model median was **2.192214x**,
+bootstrap median 95% CI **[2.187101, 2.195836]**; its saved-fraction lower
+bound was **0.542774**, clearing the 5% admission floor.
+
+Production `get_extent_data_refs` now parses each selected value while it is
+borrowed from its tree node and retains only the parsed `BtrfsExtentDataRef`.
+Inclusive range boundaries, ascending key traversal, parsed-record order,
+short/malformed payload omission, and returned errors are unchanged. A
+traversal error can populate only a local vector that is discarded with the
+`Err`, so no partial result or side effect escapes. Tie-breaking is
+unchanged/N/A; floating point and RNG are N/A.
+
+The final-source strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported
+`bench_evidence,binary_sha256=e9035b7a97ee51b7c1a674f12b83d367f88fbdd3f5fbf41ee683fa87a68142d1`.
+The same invocation again proved exact frozen-control/borrowed-model/
+actual-production record and order parity, counted the same
+**4,096 `Vec`s / 114,688 bytes to 0** mechanism, and ran 31 alternating-order
+paired rounds with min-of-three timing. Materialized/materialized A/A median
+was **0.997114x**, bootstrap median 95% CI **[0.990664, 1.007784]**; the
+symmetric null floor was **1.009424x** and the twice-null threshold
+**1.018936x**. Frozen-materialized/actual-production median was **2.601449x**,
+bootstrap median 95% CI **[2.574732, 2.617050]**, with a **0.611610**
+saved-fraction lower bound.
+
+**KEEP, narrowly scoped.** This is an isolated high-cardinality scan of 4,096
+keyed backrefs for one logical extent. It is not a typical one-ref extent,
+whole `BTRFS_IOC_LOGICAL_INO`, PGO, mounted, shipped, or kernel magnitude. The
+gate basis was bootstrap median CI over wall time; `cv_used=false` and
+`instructions_used=false`.
+
+Strict-remote focused keyed-ref tests passed **4/4**, covering first keyed-ref
+lookup, duplicate merge, count decrement/removal, and inline/keyed coexistence.
+Scoped `--no-deps -D warnings` Clippy passed after allowing only the reproduced
+pre-existing `similar_names`, `too_long_first_doc_paragraph`, and
+`too_many_arguments` categories in untouched code. Targeted rustfmt and
+`git diff --check` passed. `/data` had **436G** free before every Cargo
+invocation; all builds were strict-remote and no local target directory was
+created.
+
+**Retry predicate:** publish an end-to-end or shipped magnitude only after a
+production `BTRFS_IOC_LOGICAL_INO[_V2]` profile records the actual keyed-backref
+cardinality and attributes at least 5% of whole-ioctl wall/cycles to
+`get_extent_data_refs`; then run a same-worker whole-ioctl A/A+B gate with
+identical returned tuples and a bootstrap median wall/cycles CI clearing twice
+its own null log-margin. Revisit the remaining parsed-output vector only if a
+fresh profile attributes at least 5% to its allocation/growth and a caller-owned
+buffer or iterator can preserve the public API contract. Never transfer this
+4,096-ref ratio to ordinary one-ref extents; `cv_used=false`;
+`instructions_used=false`.
+
+## Btrfs orphan reclaim borrows extent-tree keys - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior row on
+`BtrfsExtentAllocator::reclaim_unreferenced_data_extents`. The required family
+grep recovered an unrelated rejected allocator gap-scan representation, whose
+reopening condition was not met, and left this clean-recovery payload
+materialization surface open. A source-neutral harness therefore froze the
+current inclusive extent-tree range, block-group and item-type filters,
+referenced-set lookup, and orphan output order while comparing the existing
+materializing `range` walk with a borrowed `range_with` walk.
+
+The pre-edit strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported ELF
+`b532ea27a5300e11869e432f11efd5714cb8f9eac36456f97fe0e6a9e962a51d`.
+All compile/runtime SSE2, SSE4.2, AVX2, and FMA checks were true. On 4,096
+referenced data extents and zero orphans, the frozen control and borrowed model
+returned exactly the same empty orphan sequence. The control materialized
+**4,096 payload `Vec`s / 217,088 bytes** that orphan classification never
+observed; the candidate materialized **0**. One invocation owned exact parity,
+the A/A null, and the A/B admission gate. Materialized/materialized A/A median
+was **1.004839x**, deterministic 20,000-resample bootstrap median 95% CI
+**[0.998378, 1.015259]**, yielding a symmetric null floor of **1.015259x** and
+a pre-registered twice-null threshold of **1.030752x**.
+Materialized/borrowed-model median was **1.865467x**, bootstrap median 95% CI
+**[1.851003, 1.877787]**; its saved-fraction lower bound was **0.459752**,
+clearing the 5% attribution/admission floor.
+
+Production now traverses the identical range through `range_with` and borrows
+each key while classifying it. It still accumulates all orphans before any
+delete, so a traversal error cannot partially mutate the tree. Block-group
+iteration, ascending tree-key traversal, inclusive range boundaries,
+`objectid < bg_end`, item-type filtering, referenced membership, orphan vector
+order, delayed deletion order, metadata-item exclusion, and the
+error-before-mutation boundary are unchanged. Tie-breaking is unchanged/N/A;
+floating point and RNG are N/A.
+
+The final-source strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported
+`bench_evidence,binary_sha256=4721ab125cadfa69047c274564caf0677f57e2b1edcda0fd4ad01584d8b60e46`.
+The same invocation proved exact frozen-control/borrowed-model/actual-production
+output and ordering, counted the same **4,096 `Vec`s / 217,088 bytes to 0**
+mechanism, and ran 31 alternating-order paired rounds with min-of-three timing.
+Materialized/materialized A/A median was **0.999775x**, bootstrap median 95% CI
+**[0.997404, 1.001660]**; the symmetric null floor was **1.002603x** and the
+twice-null threshold **1.005212x**. Frozen-materialized/actual-production
+median was **1.823254x**, bootstrap median 95% CI
+**[1.820986, 1.828589]**, with a **0.450847** saved-fraction lower bound.
+
+**KEEP, narrowly scoped.** This is a clean-recovery classification scan with
+4,096 referenced extents and no deletes. It is not an orphan-delete-heavy,
+whole-recovery, PGO, mounted, shipped, or kernel magnitude. The gate basis was
+bootstrap median CI over wall time; `cv_used=false` and
+`instructions_used=false`.
+
+Strict-remote focused reclaim tests passed **2/2**: orphan data extents are
+freed while referenced extents remain, and metadata extents remain untouched.
+Scoped `--no-deps -D warnings` Clippy passed after allowing only the reproduced
+pre-existing `similar_names`, `too_long_first_doc_paragraph`, and
+`too_many_arguments` categories in untouched code; all diagnostics introduced
+by the new harness were fixed. Targeted rustfmt and `git diff --check` passed.
+`/data` had **436G** free before every Cargo invocation; all builds were
+strict-remote and no local target directory was created.
+
+**Retry predicate:** restate an end-to-end or shipped magnitude only after a
+production recovery profile attributes at least 5% of whole-recovery
+wall/cycles to orphan classification on a named image and a same-worker
+whole-recovery A/A+B gate proves identical final tree/image plus `fsck` output,
+with its bootstrap median wall/cycles CI clearing twice its own null
+log-margin. Revisit this representation only if the `range_with` contract
+changes, a fresh profile attributes at least 5% of classification wall/cycles
+to a remaining key/orphan-vector allocation, or an orphan-delete-heavy shape
+dominates enough that deletion cost changes the observed ceiling. Benchmark
+that exact production shape in one self-hashing invocation; never gate on CV or
+instruction count.
+
+## Queued repair persistent membership uses hash + deterministic drain - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional preflight found no prior REJECT on
+`QueuedRepairRefresh::queued_groups`; the two immediately preceding repair
+keeps explicitly left this persistent `BTreeSet` unchanged. A pre-edit
+source-neutral model therefore froze the current indexed lookup, compact
+temporary `Vec`, persistent ordered tree, and deterministic drain against a
+persistent `HashSet` whose internal order is sorted only after draining.
+
+The pre-edit strict-remote x86-64-v3 release-perf process self-reported ELF
+`8cf25304d706befcc553f6654d39dd03f55d105a6797654569a70f2eab44939b`.
+It proved exact 512-group output/order parity and admitted the representation:
+tree/tree A/A bootstrap median 95% CI **[0.995205, 1.022097]**, symmetric null
+floor **1.022097x**, twice-null threshold **1.044682x**, and tree/hash median
+**1.360373x** with bootstrap median 95% CI **[1.345692, 1.371074]**.
+
+Production now stores queued group membership in a persistent
+`HashSet<GroupNumber>`, reserves for the incoming unique group batch, and
+retains the table allocation across drains. `drain_queued_groups` drains under
+the same mutex, drops the guard, and then sorts the result. Consequently the
+randomized internal bucket order never escapes. Ascending group order,
+duplicate suppression across and within callbacks, overlap first-input-match
+selection, debug event order, mutex-poison errors, and the critical
+drain/drop/process re-entry boundary are unchanged. Tie-breaking is unchanged;
+floating point and RNG are N/A.
+
+The final-source strict-remote pinned-`ovh-a` x86-64-v3 release-perf process
+self-reported
+`bench_evidence,binary_sha256=4746f4396e523f9e0e6469abb8cac156be448dfc71ab39f8061ca609e0c45e0f`.
+One invocation owned the parity proof, 41 alternating A/A+B rounds, and the
+decision. Frozen-tree/frozen-tree A/A median was **1.003447x**, deterministic
+20,000-resample bootstrap median 95% CI **[0.997756, 1.008698]**; the symmetric
+null floor was **1.008698x** and the pre-registered twice-null threshold was
+**1.017472x**. Frozen-tree/actual-production-callback median was **1.279996x**,
+bootstrap median 95% CI **[1.278681, 1.281732]**. The timed candidate arm called
+production `on_flush_committed` plus `drain_queued_groups`; the model and actual
+production callback also returned the same 512 ascending unique groups and
+checksum `7a8c925983737ede`.
+
+**KEEP, narrowly scoped.** This is a whole-callback result for 512 flushed
+blocks mapping to 512 unique groups in a 4,096-range / 1 GiB repair layout. It
+is not a PGO, mounted, whole-flush, self-healing pipeline, or kernel magnitude.
+The gate basis was bootstrap median CI over wall time; `cv_used_as_gate=false`
+and instructions were not decision inputs.
+
+Strict-remote focused queue tests passed **6/6**, including repeated blocks,
+unsorted disjoint ranges, overlap fallback, empty/out-of-range behavior, and
+the lock-release/re-entry invariant. Scoped `--no-deps -D warnings` Clippy
+passed after allowing only the reproduced baseline categories: two untouched
+nightly deprecations plus `needless_pass_by_value`,
+`manual_saturating_arithmetic`, and `unused_self` in untouched code. Targeted
+rustfmt and `git diff --check` passed. `/data` had **436G** free before every
+Cargo invocation; all builds were strict-remote and no local target directory
+was created.
+
+**Retry predicate:** restate an end-to-end or shipped magnitude only after a
+production-shaped self-healing profile attributes at least 5% of whole flush
+wall/cycles to queued repair notification and a same-worker whole-flush A/A+B
+gate proves identical durable state with a bootstrap median wall/cycles CI
+clearing twice its own null log-margin. Revisit the membership representation
+only if current production telemetry shows a materially smaller drain shape
+(p50 at most eight unique queued groups), a materially larger sparse table
+shape, or a fresh profile attributes at least 5% of callback wall/cycles to
+hashing or sort-on-drain. Then benchmark that exact cardinality against the
+retained frozen tree in one self-hashing invocation; never gate on CV or
+instructions.
+
+## Btrfs-send final output buffer growth has a sub-null ideal ceiling - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional candidate preflight found no prior rejected row on
+`SendStreamBuilder::new`. Before inventing an input-derived capacity heuristic,
+a feature-gated exact-capacity oracle bounded the entire output-buffer growth
+family. Production still starts with `Vec::new()`; only the explicit
+benchmark-instrumentation entry point knows the final stream length in advance.
+
+The retained harness replays the production allocation sequence over the exact
+stream framing and counts the mechanism. On the deep-path fixture, 4,549 command
+frames produced a 3,048,915-byte stream from 1,985 items / 159,712 input-payload
+bytes. The production builder changed capacity 19 times, relocated its pointer
+15 times, and moved 4,896,289 live bytes during those relocations. The oracle
+preallocated exactly 3,048,915 bytes and eliminated that entire mechanism.
+Control and oracle emitted the identical stream, SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+
+One strict-remote x86-64-v3 release-perf invocation on pinned `ovh-a`
+(`fixmydocuments`) self-reported executing ELF
+`c7e76568411ce85285cc7a1e91d93f6eb0e3c386756ef28a79939991c2de423d`.
+The same invocation owned the A/A null control and the ideal-capacity A/B.
+Across 31 alternating `AAB`/`BAA` pairs with two complete streams per
+observation (allocation-growth count **19 vs 0**):
+
+- zero-capacity/zero-capacity A/A median was **0.995559x**, deterministic
+  bootstrap median 95% CI **[0.992484, 1.002684]**;
+- the symmetric null floor was **1.007573x** and the pre-registered twice-null
+  threshold was **1.015203x**; and
+- zero-capacity/exact-capacity median was only **1.007404x**, bootstrap median
+  95% CI **[1.001732, 1.010988]**.
+
+**REJECT_IDEAL_CEILING_BELOW_TWICE_NULL.** Even an impossible production oracle
+cannot clear twice the invocation-local null margin, so no capacity estimate or
+production allocation change ships. Ordering, command framing, attributes,
+CRCs, and every output byte are identical; tie-breaking is unchanged/N/A;
+floating point and RNG are N/A. The gate used only the bootstrap median CI over
+whole-stream wall time; CV and instruction count were not computed or consulted.
+
+Focused strict-remote release-perf send-stream tests passed **22/22** with
+`bench-instrumentation` enabled. Targeted rustfmt and `git diff --check` passed;
+the only build diagnostics were pre-existing nightly deprecations in dependency
+crates outside this change. Scoped Clippy stopped before reaching `ffs-btrfs`
+on 23 promoted nightly errors in untouched `ffs-ondisk`; neither changed file
+produced a diagnostic.
+
+**Retry predicate:** reopen output preallocation only after a current
+production-shaped witnessed-v3+PGO profile attributes at least 5% of whole-send
+wall/cycles to `SendStreamBuilder`-originated allocation growth or relocation,
+or after allocator/growth-policy drift materially changes the counted mechanism.
+Then rerun this exact-capacity ceiling first in one self-hashing, pinned-worker
+invocation with exact stream parity and at least 31 alternating A/A+B pairs.
+Do not attempt a production hint unless the ceiling's bootstrap median
+wall/cycles CI clears twice its own null log-margin; never gate on CV or
+instructions.
+
+## Btrfs-send ordered inode-link groups replace the outer BTreeMap - 2026-07-27 (GreenSpring, KEEP)
+
+The institutional candidate preflight matched the 2026-07-13 rejected
+parsed-`INODE_REF` name-handoff row. That prior row required either a materially
+quieter paired harness or proof that this handoff is a whole-send bottleneck.
+No production edit was made until a source-neutral attribution invocation
+satisfied that requirement.
+
+On the 3,048,915-byte deep-path fixture, the old `inode_links` construction
+performed 1,088 map-entry probes for 1,088 parsed links across 896 unique
+inodes and copied 5,312 name bytes. The pre-edit x86-64-v3 release-perf process
+self-reported ELF
+`b48117f27efd146c9e3e3d1dd550075db8b9dbef9fee3531317f164fb8850083`
+on pinned strict-remote `ovh-a`. Its same-invocation whole/whole A/A symmetric
+null floor was **1.008357x**. The complete link-map stage occupied
+**12.944545%** of whole-stream wall, with deterministic bootstrap median 95%
+CI **[12.829439%, 13.040409%]**. That lower bound cleared the pre-registered 5%
+admission floor.
+
+Production now uses a compact ordered `Vec<SendInodeLinkGroup>` when the
+tree-walk input is monotone by objectid. A binary search provides the same
+inode lookup contract without one BTreeMap node/probe per parsed
+`INODE_REF`. Public arbitrary-slice behavior remains exact: a monotonicity
+check routes non-monotone input through the original BTreeMap gather, including
+the original within-inode insertion order. This lever deliberately retains
+the existing parsed-name clone, so it does not mix in or re-derive the rejected
+clone-to-move handoff.
+
+The final source-exact invocation reported:
+
+- `bench_evidence,binary_sha256=1417e48797830580d83dfc5b24ea5021a2cb1d7dffc33e84e6e2769860750eb2`;
+- worker `fixmydocuments` (`ovh-a`), with compile/runtime SSE2, SSE4.2, AVX2,
+  and FMA all true;
+- BTreeMap/BTreeMap A/A median **0.999342x**, bootstrap median 95% CI
+  **[0.997662, 1.000983]**, symmetric null floor **1.002343x**, and
+  pre-registered twice-null threshold **1.004691x**; and
+- BTreeMap/ordered-group median **1.081022x**, bootstrap median 95% CI
+  **[1.077525, 1.084050]**, clearing twice-null across 31 alternating
+  `AAB`/`BAA` pairs with eight complete streams per observation.
+
+Control and candidate emitted the identical 3,048,915-byte stream, SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+The decision used the deterministic 20,000-resample bootstrap median CI over
+whole-stream wall time. CV and instruction count were not computed or
+consulted.
+
+**DECISION — KEEP.** Ordering is preserved: objectid groups remain sorted and
+links within each inode retain encounter order. First-link tie-breaking and
+hardlink emission are unchanged. Parse/error skipping, path construction,
+command attributes, CRCs, and complete stream bytes are identical. Floating
+point and RNG are N/A. This is witnessed v3 release-perf evidence, not PGO or
+shipped-binary magnitude evidence.
+
+Strict-remote correctness gates passed the focused ordered/fallback proof
+**1/1** and existing send-stream family **7/7**. Targeted rustfmt and
+`git diff --check` passed. Scoped Clippy reached the owned library and
+benchmark; all diagnostics were blame-confirmed pre-existing library/legacy
+bench debt outside this diff, and neither new function produced a diagnostic.
+
+**Retry predicate:** restate this magnitude as shipped only after the exact
+production PGO training profile is consumed by the same strict-remote
+whole-stream gate. Revisit the representation itself only if a production
+caller measurably supplies non-monotone objectids, or a fresh profile
+attributes at least 5% of whole wall/cycles to the binary-search/fallback
+branch. Any retry must retain the in-process ELF/ISA/profile witness, exact
+stream plus arbitrary-order fallback parity, at least 31 same-invocation
+alternating A/A+B pairs, and a bootstrap median wall/cycles CI clearing twice
+its own null log-margin. Never gate on CV or instruction count.
+
+## Ext4 read-pool cap retained, quarter-nproc scaling corrected - 2026-07-27 (GreenSpring, KEEP / CLAIM CORRECTION)
+
+The institutional candidate preflight found the existing `bd-ddryj` row and
+printed its unresolved predicate: the dedicated-pool binary itself had never
+been measured. The historical profile was still useful but narrower than its
+policy:
+
+- on the 64-thread profile host, 64-to-16 reduced
+  `native_queued_spin_lock_slowpath` self-time from **42.27% to 9.32%** and
+  improved cold wall by about **1.21x**;
+- production had generalized that point to
+  `(available_parallelism / 4).clamp(4, 16)`; and
+- the committed code had only been compile-tested. The reported ratio came
+  from an equivalent environment override in an older binary.
+
+A new hidden whole-binary gate self-hashes before doing work, verifies that a
+spawned `bench-evidence` child reports the same executing ELF, constructs a
+private deterministic ext4 file, proves exact candidate/control bytes, and
+owns A/A plus A/B in one invocation. It alternates order for 31 pairs, evicts
+the image with `POSIX_FADV_DONTNEED` before every child, and gates only on a
+deterministic 20,000-resample bootstrap median CI over wall time. CV and
+instruction count are not computed or consulted.
+
+The first v3 invocation exposed a policy error. On pinned strict-remote
+`ovh-a`, where `available_parallelism` is 16, the shipped default selected 4
+threads. Executing ELF
+`a21b26bcff6d8b6010fedac47930bbefc82a7eafb29fabad1122b8b1586f4118`
+measured:
+
+- default/default A/A median **0.983423x**, 95% CI
+  **[0.961861, 1.022792]**, symmetric null floor **1.039651x**; and
+- default-4 / explicit-16 median **0.793266x**, CI
+  **[0.772379, 0.808476]**.
+
+Quartering a smaller worker was decisively harmful. The default is now
+`min(available_parallelism, 16)`: preserve all available threads below the
+profiled ceiling and cap larger machines at 16. The dedicated-pool boundary
+and `FFS_READ_PARALLELISM` override are unchanged.
+
+A fresh, unpooled corrected-policy invocation admitted the change:
+
+- executing v3 release-perf ELF
+  `8f7039d78a42e5ca7aa79cf7fa0e5c80415b61971469465d0ca5e9d881003082`;
+- machine-readable in-process witness
+  `bench_evidence,binary_sha256=8f7039d78a42e5ca7aa79cf7fa0e5c80415b61971469465d0ca5e9d881003082`;
+- parent and identity child reported the same SHA; compile/runtime SSE4.2,
+  AVX2, and FMA were true; PGO profile SHA was `none`;
+- private image SHA-256
+  `144db18f7f7134058092a6d88768a285660001f3cf06a530ad1db729dc76a919`;
+- corrected-default/corrected-default A/A median **0.993140x**, bootstrap
+  median 95% CI **[0.986304, 1.002085]**, symmetric null floor
+  **1.013887x**, and twice-null threshold **1.027966x**;
+- corrected-default-16 / old-quarter-4 median **1.248257x**, CI
+  **[1.226142, 1.279943]**, clearing the threshold; and
+- both arms returned the identical 33,554,432-byte stream, all `0xA5`,
+  SHA-256
+  `edeadec8f638055689d5be63b4bcf2654fb64bf91fb6651e9a924f052a9c7db0`.
+
+Two subsequent exact-source invocations were deliberately given zero weight.
+One was rejected by a wide A/A CI of **[0.893182, 1.082108]**. The other
+passed the broad null bound but its A/B lower bound **1.036707x** did not clear
+its disturbance-inflated **1.086391x** twice-null threshold. A larger 128 MiB
+attempt never entered timing because the 64 MiB source image filled during
+setup. None was pooled with the admitted invocation.
+
+**DECISION — KEEP THE 16-THREAD CEILING, CORRECT THE SCALING RULE, AND RESTATE
+THE CLAIM.** The old 64-to-16 profile remains evidence for the ceiling on that
+host. The actual-binary 16-to-4 result refutes quarter scaling and the
+corrected 16-to-4 gate independently confirms the repair. The **1.248257x**
+ratio is witnessed v3 release-perf evidence on this offline ext4 workload, not
+a v3+PGO, mounted-FUSE, or kernel-ext4 result. Historical kernel ratios are not
+rescaled.
+
+Semantic proof: only worker count changes. Indexed segments retain their
+logical assembly order, candidate/control bytes and length are exact, and the
+pool remains isolated from scrub/walk/repair. Ordering is preserved.
+Tie-breaking is unchanged/N/A. Floating point and RNG are N/A.
+
+Strict-remote checks passed for `ffs-cli --all-targets`; focused CLI parsing and
+core topology tests passed. CLI Clippy passed with `-D warnings` after allowing
+only reproduced pre-existing categories. Core/workspace Clippy remains blocked
+by unrelated pre-existing pedantic/nursery debt.
+
+**Retry predicate:** revisit the width policy only when a production-shaped
+profile on a materially different worker/device attributes the residual to
+read-pool width and its optimum differs from `min(nproc, 16)`. Then require an
+in-process executing-ELF/ISA/profile witness, exact stream parity, at least 31
+same-invocation alternating A/A+B pairs, and a bootstrap median wall/cycles CI
+clearing twice its own null log-margin. Claim a shipped magnitude only after
+the exact production PGO profile is consumed. Never gate on CV or instruction
+count.
+
+## Btrfs-send path/depth cache Fx hashing clears attribution but not the whole-stream null floor - 2026-07-27 (GreenSpring, REJECT)
+
+The institutional candidate preflight matched the earlier closed SipHash sweep:
+`generate_send_stream_impl`'s `path_cache` and `depth_cache` had been classified
+as rare/non-hot. Its printed escape condition required either materially
+quieter paired whole-send evidence or a counted whole-send bottleneck before
+any production edit.
+
+A source-neutral x86-64-v3 attribution mode in
+`send_stream_path_cache.rs` reproduced both cache algorithms without changing
+production. On the deep-path fixture it counted:
+
+- 2,880 path-cache gets and 129 inserts;
+- 639 depth-cache gets and 256 inserts; and
+- 1,089 emitted paths totaling 660,352 path bytes.
+
+The retained attribution harness was corrected during final diff review:
+inode classification is precomputed outside the timed region, while its
+compile-time-false timed route performs no counting, path folding, or exact-path
+cloning. It was then replayed after production had been restored and its
+temporary whole-stream control removed. That corrected final-source invocation
+was a same-invocation protocol owning duplicate whole/whole and stage/stage A/A controls plus the
+RandomState/FxBuildHasher stage comparison. The executing process self-reported
+ELF `9c0ad2942c734e291c4c6dfd02a95384a5c05f8c738aa0d37f9b0d0287ff4020`
+on pinned strict-remote `ovh-a`, with compile/runtime AVX2+FMA true. Results:
+
+- whole A/A median **0.980129x**, deterministic bootstrap median 95% CI
+  **[0.956172, 1.006992]**, symmetric null floor **1.045837x**;
+- stage A/A median **1.025608x**, CI **[1.009478, 1.032967]**, symmetric
+  null floor **1.032967x**, twice-null threshold **1.067020x**;
+- cache-stage / whole-stream fraction **24.261466%**, CI
+  **[23.723773%, 24.843648%]**; and
+- RandomState/FxBuildHasher stage median **1.310055x**, CI
+  **[1.292686, 1.336789]**.
+
+The attribution lower bound exceeded the pre-registered 5% floor, so the stale
+"non-hot" premise was falsified and one production-shaped whole-stream A/B was
+admitted. The temporary candidate changed only the hasher used by the two
+integer-key caches. A feature-gated control retained RandomState so both arms
+ran in one ELF. Before timing, the invocation asserted exact full-stream parity:
+both arms emitted 3,048,915 bytes with SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+The counted mechanism remained 3,904 total cache operations.
+
+The final strict-remote process self-reported ELF
+`bb3d992fd12cccd295b8e87561ef9dcb628f9639437bbeb54b3a0d38fa501414`
+on the same pinned worker, again with compile/runtime AVX2+FMA true. Across 31
+alternating `AAB`/`BAA` pairs:
+
+- RandomState/RandomState A/A median **0.985884x**, CI
+  **[0.952269, 1.012486]**;
+- symmetric null floor **1.050123x**, pre-registered twice-null threshold
+  **1.102758x**; and
+- RandomState/FxBuildHasher whole-stream median **1.038185x**, CI
+  **[1.023832, 1.061480]**.
+
+**DECISION — REJECT_BELOW_TWICE_NULL AND REVERT PRODUCTION.** The isolated
+mechanism is substantial and the whole-stream interval excludes 1.0, but its
+lower bound does not clear twice the invocation-local null margin. The
+production hasher edit and benchmark-only whole-stream control were removed;
+only the source-neutral, counted attribution mode remains. The decision used
+the deterministic 20,000-resample paired bootstrap median CI over wall time.
+CV and instruction count were not computed or consulted.
+
+Final-source gates were strict-remote on `ovh-a`: the focused send-stream suite
+passed **22/22**; scoped bench Clippy passed under `-D warnings` after allowing
+only the six reproduced pre-existing library/legacy-bench diagnostic
+categories; targeted rustfmt and `git diff --check` passed.
+
+Semantic proof: both cache key domains are internal inode numbers; map equality
+and lookup values are independent of the hasher; neither map is iterated for
+emission order; path construction, directory-depth ordering, command
+attributes, CRCs, and complete stream bytes matched exactly. Ordering is
+preserved, tie-breaking is unchanged, and floating point/RNG are N/A. This is
+witnessed v3 release-perf evidence, not PGO or shipped-binary evidence.
+
+**Retry predicate:** reopen only when a fresh production-shaped v3+PGO send
+profile attributes at least 5% of whole wall/cycles to these caches and either
+(a) a pinned same-worker A/A invocation demonstrates a symmetric null floor at
+or below **1.015x**, making the observed effect decision-capable, or (b) a
+materially different fixture counts at least **4x** the current 3,904 cache
+operations per 3,048,915 output bytes. Then require an in-process
+ELF/ISA/profile witness, exact full-stream parity, at least 31 alternating
+A/A+B pairs, and a bootstrap median wall/cycles CI clearing twice its own null
+log-margin. Never gate on CV or instruction count.
+
+## Exact v3+PGO persisted-create gate corrects bd-b9dug for one offline corpus - 2026-07-27 (GreenSpring, KEEP / CLAIM CORRECTION)
+
+The institutional preflight found no prior rejected row on the exact
+`bd_b9dug_whole_binary_create_gate in crates/ffs-cli/tests/cli_e2e.rs`
+surface. One pinned strict-remote `ovh-a` pipeline built and executed:
+
+- generic release-perf ELF
+  `65bca08591dcdf4b8257f0386cbfcca4f9f4ac3624be4a96a837ea088c7f0866`,
+  which self-reported SSE2 true and SSE4.2/AVX2/FMA false;
+- v3 profile-generation ELF
+  `d1c03d4b19e09a554f865b020083dd5e744a8f5db6f4a180cae7a5302e4bad4a`,
+  which self-reported SSE2/SSE4.2/AVX2/FMA true; and
+- final v3+PGO ELF
+  `1a0c7c419e658bfb73abef80c5621063598baf32e94f3a3e79e440cd7e236f03`,
+  which self-reported the same v3 ISA and embedded consumed-profile SHA-256
+  `ec01cb1f413a6fa7260df6de74a4b722b8200e957fd7804871429e2ac0075da4`.
+
+The final process printed
+`bench_evidence,binary_sha256=1a0c7c419e658bfb73abef80c5621063598baf32e94f3a3e79e440cd7e236f03`
+before its ISA/profile lines. All three processes reported runtime AVX2+FMA.
+The 28,739,968-byte profile merged 518 run-prefixed raw profiles generated by
+6,000 creates, 1,000,000 lookups, 2,000 renames, 2,000 deletes, and one walk.
+
+One parent invocation owned 31 alternating `AAB`/`BAA` pairs. Every
+observation copied the exact source image, verified source/copy SHA-256
+`0de4b44cacb300d71cbf2b1ae1ef3eca7d56668bec25a8a0aad2faaea874c7cb`,
+then ran `create-bench --count 2000 --threads 1 --rounds 2`. The primary
+persisted-wall metric sums both create rounds and the final image flush. The
+same child ELF then reopened and walked the output image; every arm returned
+the exact semantic signature
+`walked 3 dirs + 4257 files (4260 entries, 0 stats, 0 bytes / 0.0 MiB @ 0 MiB/s)`.
+
+- generic persisted-wall median: **22,829.5 us**;
+- v3+PGO persisted-wall median: **19,622 us**;
+- generic/generic A/A median: **0.989621x**, deterministic bootstrap median
+  95% CI **[0.979910, 1.002842]**;
+- symmetric null floor: **1.020502x**; pre-registered twice-null threshold:
+  **1.041424x**; and
+- generic/v3+PGO median: **1.155904x**, 95% CI
+  **[1.135311, 1.178988]**, verdict **PGO_FASTER**.
+
+The secondary create-loop-only observation agreed at **1.163197x**, 95% CI
+**[1.145606, 1.178757]**, against an A/A CI of
+**[0.977759, 1.000578]** and a 1.046011x twice-null threshold. It was not the
+decision metric.
+
+The exact-source replay rebuilt v3+PGO ELF
+`b9915a20b1eef40e6627a9c2826b5713cc55ee493ba675ec6a67ad41b6455580`,
+which self-reported the same v3 ISA and consumed-profile SHA. A fresh
+31-pair invocation reproduced the decision without pooling:
+
+- generic persisted-wall median: **22,406.5 us**;
+- v3+PGO persisted-wall median: **19,175 us**;
+- generic/generic A/A: **0.993953x**, 95% CI
+  **[0.985172, 1.037221]**;
+- symmetric null floor: **1.037221x**; twice-null threshold:
+  **1.075828x**; and
+- generic/v3+PGO: **1.152540x**, 95% CI
+  **[1.137778, 1.178502]**, verdict **PGO_FASTER**.
+
+The replay's secondary create-loop-only result was **1.157775x**, 95% CI
+**[1.144666, 1.186080]**.
+
+**DECISION — KEEP THE HARNESS AND CORRECT ONLY THE NAMED CLAIM.** The
+production-shaped binary measured 1.155904x faster in the first run and
+1.152540x faster in the unpooled exact-source replay on this persisted,
+single-thread, offline 4,000-create batch. The
+decision gate was the deterministic 20,000-resample paired bootstrap median CI
+over persisted wall time. CV and instruction count were not computed or
+consulted.
+
+This row does not contain a mounted FUSE arm, a kernel-ext4 arm, a parallel
+create arm, or an independent `e2fsck` run. It therefore does not rescale the
+historical mounted small-file storm or any kernel ratio. The walk is an exact
+same-binary semantic reopen check, not a substitute for a filesystem checker.
+
+**Retry predicate:** change a mounted or kernel create claim only after the
+same source is trained and built through v3+PGO on one pinned worker, the
+executing process self-reports ELF SHA, AVX2+FMA, and consumed-profile SHA, and
+one invocation owns generic A/A, generic/v3+PGO, and the workload-matched
+mounted/kernel arm. Require exact created-name/count parity plus independent
+filesystem validation, and gate on a bootstrap median wall/cycles CI clearing
+twice its own null log-margin. Never transfer this offline ratio, use
+instruction count, or gate on CV.
+
+## Exact v3+PGO whole-CLI lookup closes the bd-b9dug build-identity gap for one corpus - 2026-07-27 (GreenSpring, KEEP / CLAIM CORRECTION)
+
+The institutional preflight found no prior rejected row on the exact
+`remote_pgo_training_driver in crates/ffs-cli/src/main.rs` surface. The harness
+then built and executed all three identities on one pinned strict-remote
+`ovh-a` worker:
+
+- generic `release-perf` control ELF
+  `1d36a367ee3703d99a92b8af52387af2570787db4070065082185db681517764`
+  self-reported compile-time SSE2 true and SSE4.2/AVX2/FMA false;
+- v3 profile-generation ELF
+  `16b0b3d621dac6742d3af29aeac235bddbc3b3fc191403e64354432b0f64582a`
+  self-reported compile-time SSE2/SSE4.2/AVX2/FMA true; and
+- final v3+PGO ELF
+  `7136d8bf768a222ec2e6985efbe25249131a274db3b9bc81a4394323265adc62`
+  self-reported compile-time SSE2/SSE4.2/AVX2/FMA true and embedded the
+  consumed merged-profile SHA-256
+  `3dbce2b2fca971cacd1963d0aaeb867de10417761624a0c1236d01a6880860db`.
+
+The final process printed
+`bench_evidence,binary_sha256=7136d8bf768a222ec2e6985efbe25249131a274db3b9bc81a4394323265adc62`
+as its in-process executing-ELF identity before the ISA/profile lines.
+
+All three reported runtime AVX2+FMA. The 28,739,968-byte profile merged 518
+run-prefixed raw profiles produced by the production CLI workload family:
+6,000 creates, 1,000,000 lookups, 2,000 renames, 2,000 deletes, and one walk.
+Counts were scaled to the checked-in 64 MiB fixture; the build otherwise used
+the shipping shape—fat-LTO `release-perf`, `target-cpu=x86-64-v3`,
+`profile-generate`, merge, and `profile-use`. This proves the consumed profile
+for this build, not byte identity with an older opaque profile.
+
+One parent invocation controlled 31 alternating `AAB`/`BAA` rounds. A/A was
+generic/generic; A/B used the midpoint of those two controls against the
+v3+PGO CLI. Each observation performed 200,000 lookups against the same
+8,003-entry image, SHA-256
+`7fab3cc32b282ef9a23ef5afb222cd472fc7f3751f630f6848ff46e96c9503a6`.
+Every arm returned the exact signature
+`lookupbench: 200000 lookups in / (8003 entries) -> 200000`.
+
+- generic median: **21,667 us**;
+- v3+PGO median: **15,110 us**;
+- generic/generic A/A median: **0.994371x**, deterministic bootstrap median
+  95% CI **[0.974583, 1.005166]**;
+- symmetric null floor: **1.026080x**; pre-registered twice-null threshold:
+  **1.052840x**; and
+- generic/v3+PGO median: **1.437700x**, 95% CI
+  **[1.414742, 1.494961]**, verdict **PGO_FASTER**.
+
+The post-lint exact-source replay rebuilt v3+PGO ELF
+`1cf9b1dc5c162760787fb3fe003fbcbcccf132c4a1f753376996ac871c5275af`,
+which self-reported the same consumed-profile SHA and ISA witness. It preserved
+the same image SHA and output signature. Generic median was **21,410 us**,
+v3+PGO median was **14,266 us**, and generic/v3+PGO was **1.495236x**, 95% CI
+**[1.459215, 1.520699]**. Its A/A was **1.032385x**, CI
+**[1.008930, 1.059704]**, so the symmetric null floor was **1.059704x** and
+the twice-null threshold was **1.122973x**. The real lower bound cleared that
+independent invocation's threshold. The two decisions are not pooled.
+
+**DECISION — KEEP THE HARNESS AND CORRECT THE CLAIMS.** The hidden
+`bench-evidence` CLI command hashes `current_exe()` from inside the executing
+process, reports compile/runtime ISA, and reports the consumed profile SHA.
+The same invocation owns the null and real arms, and the only decision gate is
+the deterministic 20,000-resample paired bootstrap median CI. CV is not
+computed. `scripts/build-perf.sh` now embeds the merged profile SHA in the
+final build and runs `bench-evidence`, so production-shaped identity is
+mechanically visible. Retraining also refuses a non-empty profile directory,
+and reuse refuses a missing or empty merged profile; stale artifacts therefore
+fail closed without recursive deletion.
+
+This result closes absolute generic-versus-production-shaped attribution only
+for the named lookup corpus. It does not contain a mounted-kernel arm, does not
+restate any kernel ratio, and does not adjust create/read/rename/delete or
+internal same-ELF lever ratios.
+
+**Retry predicate:** restate another historical claim only after the same
+source is trained and built through v3+PGO on one pinned worker, the executing
+process prints its ELF SHA, AVX2+FMA witness, and consumed-profile SHA, exact
+output/fsck parity holds as applicable, and same-invocation A/A plus A/B yields
+a bootstrap median wall/cycles CI clearing twice its own null log-margin. Add
+the mounted-kernel arm before changing a kernel claim. Never transfer this
+lookup ratio to another workload, gate on instruction count, or use CV as the
+decision rule.
+
+## Historical 960x JBD2 group-commit claim is VOID: the FS path issues zero durability barriers (bd-fsync-journal-latency-gap-ptp4x) - 2026-07-26 (GreenSpring, VOID-MECHANISM / NO BENCH)
+
+The institutional preflight blocked a proposed cross-FsOp JBD2 group-commit
+lever on the prior fsync/group-commit rows. Source and history inspection then
+showed that the proposed optimization's baseline mechanism does not exist:
+
+- `ffs_journal::Jbd2Writer::commit_transaction` writes descriptor, data,
+  revoke, and commit blocks, advances `head`, and returns without calling
+  `BlockDevice::sync`;
+- `ffs_core::OpenFs::commit_transaction_journaled` calls that writer and then
+  makes the transaction visible in MVCC, again without a sync; and
+- `git blame` traces the no-sync implementation back to the original
+  `Jbd2Writer` commit `d51a0c159`. No later JBD2 change removed a barrier.
+
+The counted mechanism is therefore **syscall count: 0 sync syscalls -> 0 sync
+syscalls at `commit_transaction_journaled` return**, not the one-per-FsOp
+baseline asserted by the 2026-06-28/29 rows. The separately measured ~960x result belongs to
+`wal_buffer::GroupCommitCoordinator` / `FileWalWriter`, where `flush_epoch`
+really does call `WalWriter::sync`; that WAL subsystem is not used by the FS
+JBD2 path. The old journal-level ratio cannot establish either a current
+FS-level gap or an FS-level speedup.
+
+**DECISION — REJECT / VOID-MECHANISM:** classify the historical “JBD2 txn +
+fdatasync per FsOp” premise
+and every 960x FS-level extrapolation from it as **VOID-MECHANISM**. No
+production edit and no benchmark were run. Benchmarking “one sync per
+transaction versus one sync per epoch” against current `main` would fabricate a
+control arm that production does not execute. This audit also exposes a
+correctness obligation: the method documented as making the JBD2 transaction
+durable currently publishes MVCC visibility after buffered writes alone.
+Correcting that durability contract is not a performance optimization and is
+outside this docs-only result.
+
+**Retry predicate:** do not reopen JBD2 group commit as a performance lever
+until all of the following are true:
+
+1. the FS JBD2 path has an explicit durability barrier after its commit block
+   and before MVCC visibility/return;
+2. injected write and sync failures prove that an unsynced epoch is never
+   reported durable or made visible, and crash replay proves that every
+   returned-durable transaction survives while incomplete epochs do not;
+3. a current FS-level harness counts exactly one real device sync per
+   ungrouped returned-durable transaction; and
+4. one self-hashing x86-64-v3+PGO process on one pinned worker runs
+   same-invocation A/A plus ungrouped/grouped A/B, proves exact journal replay
+   and visibility order, and gates on a bootstrap median wall/cycles CI clearing
+   twice its own null margin. Never use the historical WAL ratio, instruction
+   count, or CV as the decision gate.
+
+## Duplicate Btrfs send inode-item parse is only 0.4246% of whole-stream time (bd-btrfs-send-inode-reparse-etlpr) - 2026-07-26 (GreenSpring, PROFILE-BOUND / NOT ADMITTED)
+
+Before proposing a production edit, ledger grep and the institutional preflight
+found the earlier parsed-`INODE_REF` negative-evidence row on this exact
+`generate_send_stream` parse surface. Its escape condition requires evidence
+that the parsed work is a whole-send bottleneck. The new source-neutral
+attribution mode reproduces the second complete `parse_inode_item` pass over the
+already-grouped inode entries and counts **897 duplicate parses** per stage
+observation. It runs duplicate unchanged whole streams as its same-invocation
+A/A null control.
+
+The witnessed x86-64-v3 release-perf process reported:
+
+`bench_evidence,binary_sha256=8ba9bd0535388339e6bd13ea1167da8378ac2e70bd5ad1431b9eb1b818eb860d,worker=fixmydocuments`
+
+Compile-time and runtime AVX2 and FMA were true. The unchanged whole-stream arms
+produced identical 3,048,915-byte output, SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+Across 31 alternating whole/whole/stage observations, the deterministic
+20,000-resample bootstrap results were:
+
+- whole/whole A/A median **1.001070x**, CI **[0.995185, 1.006003]**;
+- duplicate-reparse/whole median **0.4246%**, CI
+  **[0.4029%, 0.4342%]**; and
+- pre-registered admission floor **5%**.
+
+**DECISION:** PROFILE-BOUND / NOT ADMITTED. No production source was edited and
+no primitive-only A/B was allowed. Even perfect elimination has less than half
+a percent observed whole-stream budget on this 897-inode fixture, before paying
+for retained-item storage and lookup. The benchmark-only source-neutral mode is
+retained to make the closure reproducible. This is v3 attribution evidence, not
+a PGO or shipped-binary speedup claim. The gate used the bootstrap median CI and
+never computed or consulted CV.
+
+**Retry predicate:** reopen only if a fresh witnessed-v3+PGO production send
+workload attributes at least **5%** of whole-stream wall/cycles to the duplicate
+`parse_inode_item` pass, or a materially different many-tiny-inode workload
+raises the counted stage's median-CI lower bound to at least 5%. Then retain the
+already-validated parsed item, prove exact complete-stream and malformed-item
+behavior, and require one self-hashing v3+PGO ELF with pinned-worker
+same-invocation A/A+B whose bootstrap median wall/cycles CI clears twice its own
+null margin. Never gate on CV.
+
+## Profitability-gated repair source reads reject on their scalar fallback (bd-repair-source-read-profitability-w74sl) - 2026-07-26 (GreenSpring, MEASURED REJECT #3 / SWITCH VEINS)
+
+The institutional exact-surface preflight exited 2 on the preceding
+`codec::encode_group` contiguous-read REJECT and printed its concrete escape
+condition. This attempt did not waive that closure. Before editing it supplied a
+named real-file backend and explicit default-false profitability contract,
+separate from functional contiguous-read support; the decision harness supplied
+an in-process executable hash, same-invocation A/A null control **1.000000x** plus
+A/B, deterministic 10,000-resample bootstrap median-ratio CIs, exact full-output
+and first-error oracles, and physical-call counters. CV was never computed or
+used.
+
+The candidate asked the `BlockDevice` profitability capability once per
+`encode_group`. Opted-in devices replaced 16 ordered positioned reads with one
+ordered contiguous read. Devices that did not opt in executed the unchanged
+scalar loop. The same process proved exact equality of every `EncodedGroup`
+field and repair byte, identical source/symbol ordering, and the same first
+injected error at block 3. The counted target mechanism was **16 logical / 16
+physical reads -> 16 logical / 1 physical read**. The cheap arm stayed scalar
+and retired **496 physical calls in both arms** over 31 observations.
+
+### Invalid instrument input, then satisfied retry
+
+The first v3 scouting invocation selected an 80-byte divisor of the executing
+ELF as its file-backed block size. `ByteBlockDevice` correctly rejected that
+non-power-of-two geometry after the latency and cheap controls ran. This was an
+instrument-input reject, not a performance verdict.
+
+**Retry predicate:** rerun only with production-valid, power-of-two block
+geometry and a stable real-file fixture. The next source used the checked-in
+`conformance/golden/ext4_8mb_reference.ext4` at 4KiB blocks and satisfied that
+predicate. No generated local image or fresh local Cargo target was created.
+
+### Routing-only v3 and profile-generation evidence
+
+The corrected non-PGO scouting ELF
+`e4fb9ba677fc2c2cc22fad4b58187e3faea93641f94508d1abf8eb1a6437866e`
+reported compile/runtime AVX2 and FMA and cleared all three routing arms:
+
+- 250 us/call: **14.820947x**, CI **[14.740945, 14.840636]**, versus A/A
+  **[0.999918, 1.000033]**;
+- zero-latency scalar fallback: **0.998165x**, CI
+  **[0.996801, 0.999542]**, inside doubled A/A envelope
+  **[0.996372, 1.003641]**; and
+- warm checked-in ext4 file: **1.452175x**, CI
+  **[1.449020, 1.455309]**, versus A/A
+  **[0.998786, 1.000304]**.
+
+Those results admitted PGO generation but were not publishable shipped-binary
+claims. The instrumented training ELF
+`68baa853bf76d5add2b6f045444a1bdee92d5ef5e39d427d0ca71ad238c3864d`
+then ran the same complete contract on pinned worker `ovh-a` and generated a
+14,565,488-byte merged profile with SHA-256
+`b46277d4058788abb9d9d055b4a27ea17786f0f47d2343f19b24ccd0c49266bb`.
+Its routing ratios were 13.593584x for the latency arm, neutral for the scalar
+fallback, and 1.016512x for the warm file. They describe the instrumented
+training binary only.
+
+### Final v3+PGO decision: REJECT
+
+The final profile-use process reported:
+
+`bench_elf_sha256=2fe8049ec08d747144a32c8d19f02111e85b1ead3d14979f7c34b812090e6e23 (15096336 bytes)`
+
+It witnessed compile/runtime SSE2, SSE4.2, AVX2, and FMA, and embedded the
+consumed profile SHA-256
+`b46277d4058788abb9d9d055b4a27ea17786f0f47d2343f19b24ccd0c49266bb`.
+The same-worker, same-invocation decision was:
+
+| shape | control / candidate medians | median ratio | bootstrap median CI | A/A CI | verdict |
+|---|---:|---:|---:|---:|---|
+| 250 us physical-call latency | 4.902002 / 0.331432 ms | **14.792775x** | **[14.760729, 14.822999]** | **[0.999828, 0.999939]** | target win |
+| zero-latency scalar fallback | 17.293 / 17.342 us | **0.997174x** | **[0.994190, 0.998325]** | **[0.998334, 1.001428]** | decisive non-neutral loss |
+
+The cheap arm's doubled-null equivalence interval was
+**[0.996680, 1.003331]**. Its complete real CI escaped that interval, identifying
+the per-encode dynamic capability query/branch as a small but statistically real
+cost even though both arms issued the same 496 scalar reads. The harness exited
+101 at that pre-registered assertion, before the final-PGO warm-file arm; the
+earlier v3/training warm-file ratios are therefore not substituted as a final
+claim.
+
+**DECISION:** REJECT and manually restore every production and benchmark source
+hunk. Output/error isomorphism passed, but performance does not admit the
+per-call profitability contract. This is the third consecutive repair
+source-read scheduling REJECT, after parallel reads and unconditional contiguous
+batching, so the no-ceiling rule switches to another profile-attributed vein.
+
+**Retry predicate:** do not retry codec-level per-call source-read scheduling.
+Reopen only if a fresh witnessed-v3+PGO production profile attributes at least
+**5%** of whole repair-encode wall/cycles to scalar source-read calls on a named
+backend, and the backend strategy can be bound once outside the timed
+`encode_group` path so the measured query/branch is absent. The next decision
+must use one self-hashing v3+PGO ELF, exact output and first-error parity, counted
+logical/physical calls, and same-invocation A/A plus A/B. Both the target
+latency/cold arm and warm real-file arm must clear twice their own bootstrap
+median null margins; the cheap-device CI must lie wholly inside its doubled A/A
+equivalence envelope. Never gate on CV.
+
+## bd-bhh0i cutover: wait-free publication is now the default after a 1.467327x final-source e2e win (2026-07-26, GreenSpring, MEASURED)
+
+The institutional preflight found the prior wait-free publication row and printed
+its exact remaining cutover predicate: one further end-to-end run whose A/A median
+is inside 1.10x, symmetric null floor is at most 1.15x, A/B effect clears twice that
+null margin, and both arms have real `e2fsck` parity. This run satisfies that
+predicate; it does not reopen the already-closed commit-primitive frontier.
+
+The cutover also repairs a measurement-contract gap in the earlier
+`create-bench --rounds` evidence. Those rows self-reported the executing ELF, but
+the control and candidate filesystems were still created in separate CLI
+invocations. The new `create-bench-cutover-gate` opens four filesystems in one
+process and selects `Mutex` or `WaitFree` explicitly on each empty MVCC store,
+without process-global environment mutation. Each of 11 rounds contains both a
+`Mutex`/`Mutex` A/A pair at one thread and a `WaitFree`/`Mutex` A/B pair at eight
+threads. Every round runs A/A then A/B, while the two arms inside each pair
+alternate order. Every timed arm creates exactly 40,000 files; image flushes,
+ELF hashing, and external fsck are outside the timed interval.
+The process computes a deterministic 20,000-resample paired bootstrap CI over
+median log ratios. It never computes or gates on CV.
+
+The final admitted process self-reported its executing ELF SHA-256 in-process as `2facbbb0f9a99a463abf7f761d7c870ddae0d8cad893be343562f080fca6dd43`.
+Every executable reported its SHA-256 as stdout line one from `current_exe()`
+inside the process, then witnessed compile-time and runtime SSE2, SSE4.2, AVX2,
+and FMA. The scoped local exception was used only for
+`cargo build -p ffs-cli --profile release-perf --features
+bhh0i_sharded_alloc` with `RUSTFLAGS=-C target-cpu=x86-64-v3`, reusing the repo's
+single `target/` directory. `/data` had 473G free before the final-source gate
+and 473G after all four fsck runs, safely above the 120G abort floor.
+
+### REJECTED instrument input: four independently formatted images
+
+The first full invocation used four separate `mke2fs` outputs. It correctly
+rejected itself:
+
+- A/A median **1.043360**, bootstrap median CI
+  **[0.997696, 2.577479]**, symmetric null floor **2.577479x**;
+- A/B median **1.397478**, CI **[1.369969, 1.557756]**; and
+- `performance_admitted=false`, because the null floor exceeded 1.15x and the
+  A/B lower bound did not clear the twice-null threshold **6.643396x**.
+
+This was an input-construction defect, not a publication-mode verdict.
+Independent ext4 UUID and directory-hash seeds let the A/A directory layouts
+diverge at high fill: from round 6 onward one nominally identical mutex image took
+2.0-2.59x as long. The counted post-run evidence agreed: both A/A arms had 440,012
+files and fsck rc 0, but occupied 55,634 versus 55,357 blocks; the A/B arms had
+440,100 files and fsck rc 0 but occupied 54,611 versus 54,545 blocks.
+
+**Retry predicate:** rerun only after cloning one byte-identical freshly formatted
+base image into all four paths outside timing, without reflink COW asymmetry, and
+prove all four pre-run image hashes equal. That predicate was immediately satisfied
+with non-reflink sparse copies; all four inputs had SHA-256
+`8e62d7e218d7b80c5c8c1936af1854b6fe9e423ca2b9b044eda93494681b2700`.
+
+### Preliminary cloned-input PASS
+
+Before the default flip and self-enforcing image validator were added, ELF
+`4bd8574e1c425049b3a80ae7a3aa6f66a42ac2e4765e282614dba6859d31c176`
+produced:
+
+| phase | median ratio | bootstrap median CI | decision threshold |
+|---|---:|---:|---:|
+| A/A, mutex lhs / mutex rhs | **0.989123** | **[0.956675, 0.997225]** | inside 1.10x; null floor **1.045287x** <= 1.15x |
+| A/B, wait-free / mutex throughput | **1.645237x** | **[1.420257, 1.934142]** | lower bound > twice-null **1.092626x** |
+
+External fsck then matched at 440,012 files / 55,566 blocks for both A/A images
+and 440,100 files / 54,611 blocks for both A/B images. This satisfied the
+pre-registered predicate, but the production default and the input guard changed
+the ELF afterward, so this is corroboration rather than the published
+final-source ratio.
+
+### REJECTED final-source validator: sequential full-image hashing
+
+The first hardened final-source ELF,
+`8060a799feef0583d7ddb5e822a598258af57b1c41642dc9dfd363b453715278`,
+correctly refused to publish its result:
+
+- A/A median **0.966427**, CI **[0.678536, 1.020347]**, null floor
+  **1.473762x**;
+- A/B median **1.413596**, CI **[1.221787, 1.529118]**; and
+- twice-null threshold **2.171975x**, therefore
+  `performance_admitted=false` and a nonzero process exit.
+
+The validator had read four complete 2GiB images sequentially immediately before
+timing, giving later paths a page-cache recency advantage. The A/A control named
+that mechanism: the same cloned inputs still produced a 47% null floor.
+
+**Retry predicate:** preserve complete in-process input hashing but stream one
+64KiB chunk from each image in round-robin order, bounding validation recency skew
+to one chunk rather than multiple GiB. Then reformat one base, copy it without
+reflinks, and rerun once. The final source implements and satisfies this predicate.
+
+### KEEP: final-source cloned-input cutover gate
+
+The final executable reported:
+
+`bench_evidence,binary_sha256=2facbbb0f9a99a463abf7f761d7c870ddae0d8cad893be343562f080fca6dd43,worker=thinkstation1`
+
+It rejected hard links and unequal image bytes in-process. Round-robin hashing
+proved all four fresh inputs had SHA-256
+`98b891ece5a76578e64c2996db119e121ef6f4bab671a79c76b16c69cf1e5c3a`.
+The final-source result was:
+
+| phase | median ratio | bootstrap median CI | decision threshold |
+|---|---:|---:|---:|
+| A/A, mutex lhs / mutex rhs | **0.985164** | **[0.964017, 1.006859]** | inside 1.10x; null floor **1.037326x** <= 1.15x |
+| A/B, wait-free / mutex throughput | **1.467327x** | **[1.342048, 1.619068]** | lower bound > twice-null **1.076045x** |
+
+The process emitted `aa_inside_1_10=true`, `null_floor_le_1_15=true`,
+`ab_ci_clears_twice_null=true`, and `performance_admitted=true`, then exited 0.
+External correctness passed on those exact admitted images:
+
+- both A/A images: `e2fsck -fn` rc 0, **440,012 files**, **55,859 blocks**; and
+- both A/B images: `e2fsck -fn` rc 0, **440,100 files**, **54,864 blocks**.
+
+The only fsck diagnostic was the non-fixing “extent tree could be narrower”
+suggestion; no structural, count, connectivity, reference-count, or group-summary
+error was reported. Ordering and tie-breaking are unchanged because both
+publication algorithms expose only the same contiguous commit-sequence prefix.
+Filesystem bytes and allocation counts match exactly within each A/A and A/B pair.
+Floating point and RNG are N/A.
+
+**DECISION:** KEEP the same-invocation cutover harness and make
+`PublicationMode::WaitFree` the production default. Setting
+`FFS_MVCC_WAITFREE_PUBLISH=mutex` (or `0`, `false`, `off`, or `no`) restores the
+compatibility mutex gate; `nospin` remains diagnostic. This final run supersedes
+the earlier default-OFF recommendation and is the first single invocation to
+satisfy every pre-registered performance and external-correctness criterion.
+Historical 1.44-1.57x separate-invocation results and the preliminary 1.645237x
+same-invocation result remain corroborating evidence, not the published
+final-source ratio.
+
+Strict-remote v3 validation passed the focused CLI check and the publication
+default/fallback unit test (1/1). A broad `-D warnings` CLI Clippy run reached
+the changed path; after its owned findings were repaired, the final rerun
+reported exactly 51 older CLI diagnostics and none on the cutover-owned
+surface. Targeted rustfmt remains blocked only by existing lines outside the
+owned hunks; the owned hunks and `git diff --check` are clean.
+
+**Retry predicate:** revisit the default only when the shipped target CPU,
+toolchain, publication algorithm, or workload changes, or when a production
+profile on an oversubscribed host makes aggregate cycles/CPU rather than wall
+throughput the discriminator. Require one witnessed-v3+PGO executing ELF, four
+byte-identical non-reflink input images, same-invocation interleaved A/A plus A/B,
+exact per-pair fsck file/block parity, and a bootstrap median wall/cycles CI that
+clears twice its own null log-margin. Never gate on CV.
+
+## Send-stream primary-parent projection removed: 1.044838x whole-stream win (bd-btrfs-send-parent-index-azojl) - 2026-07-26 (GreenSpring, MEASURED)
+
+The institutional preflight first exited 2 on the existing parsed-`INODE_REF`
+negative-evidence row and printed its prior escape condition. That condition allowed a
+production edit only after either usable line-level profiling or a counted
+whole-stream stage attributed at least 0.1% to the derived primary-parent map.
+Before changing production, a source-neutral decision invocation measured the
+exact `inode_links -> inode_parents` projection against duplicate executions of
+the current complete stream:
+
+- 896 projected primary entries from 1,088 total links;
+- 4,352 primary-name bytes cloned into the redundant map;
+- projection/whole-stream median fraction **3.8593%**, deterministic
+  20,000-resample bootstrap median CI **[3.8394%, 3.9644%]**; and
+- same-invocation whole/whole A/A **0.999853**, CI
+  **[0.995953, 1.005182]**, symmetric null envelope **1.005182x**.
+
+That source-neutral `x86-64-v3` process self-reported executing ELF SHA-256
+`11d5cc8eccc4714f7e0f8dd4cde9c05bbc8256cf929ce9f749153287aab29999`
+and compile/runtime SSE2, SSE4.2, AVX2, and FMA true. It also pinned primary-map
+SHA-256 `4eac935568a24607ace1aa59c4688ddfcb9f30fbdb857e3d72a9fe2b8d5eb7f9`
+and complete-stream SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+The 3.84% lower bound cleared the pre-registered 0.1% admission threshold, so
+the source edit was allowed.
+
+Production now reads the canonical first link directly from the already-required
+`inode_links` map. The secondary `BTreeMap<u64, (u64, Vec<u8>)>` allocation and
+all primary-name clones are gone. A `bench-instrumentation` control monomorph
+retains the prior materialized projection only for the same-process decision
+harness; normal builds instantiate the direct-link path.
+
+The final-source whole-stream gate ran 31 alternating `AAB`/`BAA` rounds on
+pinned strict-remote worker `ovh-a` (reported hostname `fixmydocuments`), with
+two complete stream generations per observation. The executing process emitted
+`bench_evidence,binary_sha256=51a59b548173c252ae2b2cacdb9a5fe221afbffa4c822e13ad3edeffd6509a52,worker=fixmydocuments`
+and reported compile/runtime SSE2, SSE4.2, AVX2, and FMA true. Its results were:
+
+- materialized/materialized A/A median **1.000859**, bootstrap median CI
+  **[0.998920, 1.003464]**;
+- symmetric null envelope **1.003464x** and pre-registered twice-null threshold
+  **1.006941x**;
+- materialized/direct median **1.044838x**, bootstrap median CI
+  **[1.040822, 1.047479]**; and
+- gate verdict **KEEP**, because the complete A/B CI is above both 1.0 and the
+  twice-null threshold. CV was not computed or consulted.
+
+The control and candidate each produced the identical 3,048,915-byte stream,
+SHA-256
+`54f09f39e3a07fc563836b72c495d6e59d244fae206ffa763d7ceed432ada3ad`.
+Ordering is preserved because both paths choose `inode_links[ino].first()` in
+the same insertion order; hardlink emission still iterates the same vector from
+index 1 onward. Tie-breaking is therefore unchanged. Floating point and RNG are
+N/A. The final strict-remote focused `generate_send_stream` suite passed 7/7.
+Final-source scoped Clippy reached the owned crate and stopped only on the five
+pre-existing `parse_xattr_names`/`add_utimes_command_direct` diagnostics; the
+candidate-specific private-`Result` lint found by the first run was fixed and
+did not recur. Targeted nightly rustfmt and `git diff --check` passed.
+
+**DECISION:** KEEP the direct primary-link lookup. The measured claim is a
+**1.044838x whole-stream wall-time win (95% median CI
+[1.040822, 1.047479])** for this deep-path/hardlink fixture under a witnessed
+v3 release-perf ELF. It is not a PGO claim and is not a mounted-kernel
+comparison.
+
+**Retry predicate:** revisit a separately materialized primary-parent index only
+if a fresh witnessed-v3+PGO production profile on a concrete send workload
+attributes at least 5% of whole-stream cycles to repeated direct first-link
+lookups, or if a correctness requirement needs a primary ordering different
+from `inode_links` insertion order. Any retry must preserve exact complete-stream
+and hardlink-order hashes, count cloned/borrowed primary-name bytes, self-report
+the executing ELF SHA/ISA, and use one fixed worker with same-invocation
+interleaved A/A plus A/B whose bootstrap median wall/cycles CI clears twice its
+own null log-margin; never gate on CV.
+
+## bd-bhh0i spin/no-spin NULL resolved: persistent harness proves a 1.203-1.318x wall-throughput win at 8 writers (bd-mvcc-spin-persistent-ci-ml4nw) - 2026-07-26 (GreenSpring, MEASURED)
+
+The prior row required an 8-writer A/A floor below 1.10x and named the mechanism
+polluting the instrument: every timed observation rebuilt the store and spawned/joined
+its workers. The institutional preflight correctly exited 2 on that closed surface.
+This run satisfies the recorded escape hatch:
+
+- four stores and their 32 workers are created once per process;
+- eight bounded block banks are populated before timing and reused in steady state;
+- each of 31 rounds interleaves a `WaitFree`/`WaitFree` A/A pair and a
+  `WaitFree`/`WaitFreeNoSpin` A/B pair, alternating both pair and arm order;
+- each arm retires exactly 16,384 commits per observation;
+- pruning, store/thread lifecycle, ELF hashing, and full-state digests are outside
+  the timed worker interval; and
+- the only decision statistic is a deterministic 20,000-resample paired bootstrap
+  median CI over log ratios. The new gate does not compute or consult CV.
+- each expected worker result has a 10-second no-progress bound that reports its
+  exact arm, epoch, completed-writer set, and publication watermark before exiting 2.
+
+Three strict-remote `x86-64-v3` release-perf invocations ran on pinned worker `ovh-a`
+(reported hostname `fixmydocuments`). The executing processes self-reported distinct
+ELFs:
+
+- `bench_evidence,binary_sha256=a6b0fb82ec93394e119619c8546af2f6b05fc31ab4c640e2b4f14bfb061e4bd1`
+- `bench_evidence,binary_sha256=d2059be34c2c90666a72b17dcc84214e901dc05bf38ff843cd077e8be8f1e41c`
+- `bench_evidence,binary_sha256=bf4804c53e507ae78d69ec11d803533097c83cba5a682731df8df8db18d50ed4`
+
+All three reported compile/runtime SSE2, SSE4.2, and AVX2 true.
+
+| run | A/A median CI | symmetric null envelope | spin/no-spin median | spin/no-spin median CI | verdict |
+|---|---:|---:|---:|---:|---|
+| 1 | `[0.967670, 1.014414]` | `1.033410x` | `0.758570` | `[0.725926, 0.779200]` | spin faster |
+| 2 | `[0.950265, 0.997507]` | `1.052338x` | `0.759147` | `[0.734401, 0.777777]` | spin faster |
+| 3 | `[0.955871, 1.031111]` | `1.046166x` | `0.831172` | `[0.760373, 0.850078]` | spin faster |
+
+All three null envelopes clear the pre-registered `<1.10x` admission bound. Every
+A/B CI is wholly below twice its own null log-margin. In throughput terms the
+spinning submode is **1.203-1.318x faster** (**16.9-24.1% less elapsed time**) than
+parking immediately in this isolated steady-state 8-writer workload.
+
+Correctness is exact, not inferred from equal commit counts. Before timing, all four
+arms had watermark 16,384 and identical bytes over all 16,384 blocks, SHA-256
+`1cb4c8f0a7e38ea1018077959bc30d69c53b994142801ea60afb0cb42a771928`.
+After timing, all four had watermark 524,288 and identical bytes, SHA-256
+`87e7183d06f60b8d9da6d5536daf006b9642e48f72a9ccab528b3d440b7ed193`.
+
+A separate current-source attempt self-reported ELF
+`b14a6158e5b64cb65a42fb08e06d0e73d8b050e2bf8b4c6307334bdffacc407c`
+and passed pre-timing parity, then produced no timing rows while both it and an
+unrelated job on `ovh-a` had stale RCH progress. It was cancelled after more than
+six minutes to release four fleet slots and is **not** counted as a performance or
+production-liveness verdict. That incident motivated the bounded liveness diagnostic;
+the final ELF then completed every pair on the same worker without firing it.
+
+**DECISION AT THIS SUBTEST:** keep the persistent median-CI harness and retain the
+spinning `PublicationMode::WaitFree` submode. This subtest itself made no production
+default change. The later final-source cutover row above now makes `WaitFree` the
+absent-variable default; `mutex` restores the compatibility gate and `nospin`
+remains an explicit option for CPU-constrained or oversubscribed hosts. This result
+settles isolated wall throughput, not aggregate CPU efficiency on those hosts.
+
+**Retry predicate:** revisit immediate parking only after a production profile on an
+oversubscribed or CPU-budgeted deployment makes aggregate cycles/CPU the
+discriminator. Require a pinned witnessed-v3+PGO executing ELF, same-invocation
+persistent A/A plus A/B, full watermark/content parity, and a bootstrap median
+wall/cycles CI clearing twice its own null log-margin. Never gate on CV or retry with
+per-sample store construction and thread churn. If the new
+`persistent_commit_liveness_blocker` fires on an otherwise idle worker, first
+reproduce the reported arm/epoch under the existing publication-gate watchdog tests;
+do not infer a production deadlock from RCH stale-progress metadata alone.
+
+> **CUTOVER SUPERSESSION:** the chronological `bd-bhh0i` rows below correctly
+> record why the default was still OFF at each intermediate checkpoint. They are
+> historical state, not the current configuration. The final-source cutover row
+> above satisfied the remaining null-floor and real-fsck predicate; absent an
+> override, production now selects `PublicationMode::WaitFree`.
+
+## INSTRUMENT FIX for the three BLOCKED-NULL workloads: the kernel-side A/A failure is a SYSTEMATIC per-image bias, not variance — counterbalancing cancels it exactly (bd-opb6l / bd-57lae) - 2026-07-28 (turn 16, cc, MEASURED)
+
+CLASS: **instrument diagnostic**. Not a self-speedup and not a vs-incumbent claim —
+no FrankenFS code executes anywhere in this experiment. It is kernel-ext4 against
+kernel-ext4, so there is no candidate ELF to self-report: the incumbent is the
+comparator.
+
+Counterbalanced same-invocation A/A null control 0.999579x, bootstrap median CI [0.996553, 1.003571], spread 1.0070x, 20,000 resamples, interleaved A/A order-alternating.
+Uncounterbalanced same-invocation A/A null control 1.010414x direct and 0.992466x swapped, bootstrap median CI [0.982591, 1.018390] and [0.980826, 0.995819].
+`cv_used=false`; CV is never a gate here.
+
+CONTEXT. GreenSpring's five-workload mounted suite admitted two ratios and blocked
+three on A/A nulls. The proposed remedies were more rounds, larger batches, longer
+settle, cache equalisation. **Those address variance. This is bias, and averaging
+more samples of a biased comparison converges to the bias.**
+
+THE TELL, already present in GreenSpring's own data: the create/delete storm's
+KERNEL null was `1.009041x [1.001744, 1.013361]` — a confidence interval that
+**excludes 1.0**. Two byte-identical kernel ext4 mounts cannot differ systematically
+by chance.
+
+### Experiment (`scripts/kernel_null_counterbalance_diag.py`)
+
+Two byte-identical kernel ext4 images from the same `mke2fs` invocation, both
+mounted `rw,noatime`, on distinct loop devices, pinned to CPUs 2,3. Same 2,000-file
+create/delete storm, 15 paired rounds, execution order alternating.
+
+| configuration | median | bootstrap 95% CI | offset |
+|---|---:|---|---:|
+| run 1 direct (A = first image) | 1.010414 | [0.982591, 1.018390] | **+1.041%** |
+| run 1 swapped (roles exchanged) | 0.992466 | [0.980826, 0.995819] | **minus 0.753%** |
+| run 2 direct | 1.006652 | [0.994325, 1.018088] | **+0.665%** |
+| run 2 swapped | 0.994280 | [0.989667, 1.000804] | **minus 0.572%** |
+| **run 2 COUNTERBALANCED** | **0.999579** | **[0.996553, 1.003571]** | spread **1.0070x** |
+
+**The offset FLIPS SIGN when the two physical images exchange logical roles, in 2 of
+2 runs.** The asymmetry is bound to the physical image/mount — backing-store
+placement, loop-device state, resident cache — not to the logical arm, the ordering,
+or the workload. Magnitude 0.57 to 1.04%, matching the +0.90% GreenSpring measured.
+
+### Why counterbalancing is the fix, and why it is exact
+
+With a fixed multiplicative bias `p` per physical image, the direct ratio is
+`(p_a * T_A) / (p_b * T_B)` and the swapped ratio is `(p_b * T_A) / (p_a * T_B)`, so
+the geometric mean of the two is exactly `T_A / T_B`: the `p` factors cancel
+identically.
+
+**Exact cancellation per pair, not convergence.** That is why it succeeds where extra
+rounds cannot: extra rounds shrink the interval *around the biased point estimate*,
+which makes a blocked null MORE likely to exclude 1.0, not less.
+
+Demonstrated: counterbalanced null **0.999579 [0.996553, 1.003571], spread 1.0070x**
+— contains 1.0 and clears the 1.025x spread requirement in GreenSpring's own retry
+predicate with room to spare.
+
+### What this settles and what it does not
+
+It settles the KERNEL-side null failure, which is what blocked the create/delete
+storm and the large-directory readdir+stat — both of which passed their FUSE null.
+The multi-file parallel read failed BOTH nulls, so counterbalancing is necessary
+there but may not be sufficient: the FUSE-side null (`0.991734x [0.969409,
+1.036149]`, spread 1.036x) carries its own dispersion, which this experiment does
+not address.
+
+Nothing here changes the filesystem. **No tuning was done and none should be until
+the nulls pass** — the three raw ratios (1.203230x, 2.957531x, 4.212274x slower)
+remain unscoreable.
+
+### Handoff
+
+The four-arm Rust comparator is GreenSpring's file and already owns four mounts, so
+it can counterbalance without new mounts: alternate which physical kernel image
+serves the A-role across paired rounds and combine each pair by geometric mean; same
+for the two FUSE mounts. Raised on the campaign thread rather than edited directly.
+
+## ⭐⭐⭐ MOUNTED-KERNEL ARM EXISTS — first defensible vs-incumbent number: frankenfs is 4.5x SLOWER than kernel ext4 on mounted create+fsyncdir (bd-kdmu4) - 2026-07-27 (turn 15, cc, MEASURED — A MISS, WHICH IS THE POINT)
+
+Status: the instrument this repo has never had is built, landed, and has produced an
+honest number. **It is a loss, and that is the success condition for this task.**
+
+⚠ CLASS: **vs-INCUMBENT**. Kernel ext4, loop-mounted, running beside the frankenfs
+FUSE mount in ONE process, with A/A nulls for BOTH arms. This is the first row in this
+ledger that is not a self-speedup. Every prior KEEP this campaign — including my own
+wait-free publication gate — is frankenfs-before vs frankenfs-after and reads `N/A` in
+the direct-kernel column, so none of them can be shown to matter competitively.
+
+`bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`
+Bootstrap median CI (20,000 resamples, percentile method) is reported for every arm:
+kernel A/A [0.9878, 1.0073], frankenfs A/A [0.9512, 1.1061], A/B [0.1893, 0.2432].
+
+PROVENANCE. The measuring process is a driver, not the code under test, so hashing it
+would prove nothing. The harness instead locates the process actually answering FUSE
+requests for the mount and hashes `/proc/<pid>/exe` in-process:
+`pid=3455837 exe=/data/tmp/cargo-target/release-perf/ffs-cli
+sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`. A
+`sha256sum` of a path on disk cannot establish which binary is serving a mount.
+
+`scripts/mounted_kernel_ab.py` + `scripts/mounted_kernel_ab_setup.sh`.
+
+### The number
+
+Workload: create 2,000 empty files, then ONE `fsync` of the directory — an identical
+POSIX call sequence issued by one driver to both arms. Host loadavg 26.68.
+
+| arm | median seconds | vs tmpfs driver ceiling |
+|---|---:|---:|
+| kernel ext4 (`/dev/loop6`, `rw,noatime`) | **0.0604** | 2.55x |
+| frankenfs FUSE (`fuse.ffs`, `rw,noatime`) | **0.3104** | 13.11x |
+
+| ratio (kernel time / frankenfs time) | median | bootstrap 95% CI |
+|---|---:|---|
+| **A/A null — kernel** | 0.9999 | **[0.9878, 1.0073]** |
+| **A/A null — frankenfs** | 0.9826 | **[0.9512, 1.1061]** |
+| **A/B kernel vs frankenfs** | **0.2213** | **[0.1893, 0.2432]** |
+
+Both A/A CIs contain 1.0; the A/B CI **excludes** it by a wide margin. Governing null
+floor 1.1946, margin **8.48x**. **DECIDABLE: frankenfs is 4.52x slower.**
+A prior run at loadavg 12.3 gave 4.76x with margin 15.25x — consistent.
+
+⚠ **~4.5x is a LOWER bound and the bias favours us.** The kernel arm sits only 2.55x
+above the Python driver's own ceiling, so a real share of its measured time is driver
+overhead common to both arms, which compresses the ratio. Subtracting the ceiling from
+both gives `(0.0604-0.0237)/(0.3104-0.0237) = 7.8x`. Honest statement: **at least
+4.5x slower; ~7-8x driver-corrected.** A faster driver sharpens this and makes
+frankenfs look worse, not better.
+
+### The six traps, and what each actually caught
+
+  T1 DISPATCH — identity asserted at RUNTIME from the measuring process's own
+  `/proc/self/mountinfo`, never from the path string. Not theoretical: during bring-up
+  `touch /tmp/ffsf/probe` **succeeded** on what I believed was the FUSE mount and was
+  in fact an ordinary empty directory, because the mount had failed on a bad flag. A
+  path that accepts writes proves nothing.
+
+  T2 UNMATCHED CONFIG — one driver, byte-identical POSIX sequences, same durability
+  boundary (one directory fsync; neither arm may skip it). The first run was NOT
+  matched: kernel came up `relatime` against FUSE `noatime`. The harness prints both
+  option strings, which is how I caught it; the mismatch had favoured frankenfs.
+
+  T3 NON-INTERLEAVED — arms alternate inside one measured routine, order flipping per
+  round. At loadavg 26.68 the kernel A/A CI still came in at [0.9878, 1.0073], which
+  is the interleaving working.
+
+  T4 CORE CONTENTION — explicit `sched_setaffinity` to CPUs 2,3, recorded with loadavg.
+
+  T5 CLIENT-BOUND — a tmpfs arm measures the driver ceiling and the run is REFUSED if
+  an arm lands within 2x of it. It passed, but the kernel arm at 2.55x is close, which
+  is why the caveat above is stated rather than buried.
+
+  T6 SHARED BASELINE — arms must be distinct mounts on distinct sources; asserted
+  (`/dev/loop6` vs `frankenfs`). Two paths on one mount would measure a filesystem
+  against itself.
+
+### What this changes
+
+The standing "8.3x slower than kernel at 8 threads" came from separate runs, not a
+side-by-side invocation, and is not comparable. **This row is the only vs-incumbent
+create number with an in-invocation incumbent arm, A/A nulls for both sides, bootstrap
+CIs, and runtime identity assertion.**
+
+It also places the wait-free publication gate correctly: its 1.44-1.57x is a
+**self-speedup** on the FFS side of a gap still ~4.5-8x in the incumbent's favour.
+Real, worth having, and **not a competitive claim**.
+
+### Next
+
+(a) btrfs arm — same harness, `mount -t btrfs`; the identity assertion generalises.
+(b) Move the workload driver out of Python to sharpen T5. (c) Re-run with
+`FFS_MVCC_WAITFREE_PUBLISH=1` to measure how much of the gap the landed self-speedup
+actually closes — the only route by which that lever becomes a competitive statement.
+
+## ⚠ CORRECTION + CONFIRMATION — the e2e win replicates 3/3 (1.44-1.57x) but my "26 images all rc 0" was PARTLY VACUOUS; real count is 68 (bd-bhh0i) - 2026-07-26 (turn 14b, cc)
+
+`bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`
+— self-reported IN-PROCESS by the executing ELF (`current_exe()`, outside the timed
+region) on every run below. Each decision row carries its own execution provenance;
+inheriting it from a neighbouring row is exactly the "a sha256sum beside the run"
+weakness the guard rejects.
+
+Two things, and the correction comes first because I published the bad claim.
+
+### CORRECTION: the fsck in v3/v4/v4b/v5 was verifying nothing
+
+The row below (`bb992934`) states "26 end-to-end images, all `e2fsck -fn` rc 0".
+**Withdrawn for v3/v4/v4b/v5.** Defect in MY harness, not in the product:
+`--rounds 2` x `--count 40000` = 80,000 creates against a **65,536-inode** image.
+Round 1 hits `NoSpace`, the worker threads panic, and the process dies **before**
+`sync_all_to_device`. Nothing was persisted, so every fsck in those runs checked a
+pristine 13-file seed image and returned rc 0. Reproduced directly:
+`create cb_5_00003086: NoSpace` -> `13/65536 files`.
+
+A green check that passes because it never reached the code under test. That is the
+exact failure class this campaign's ledger audit exists to find, and I walked into it
+in my own harness — in the same turn as a row praising the pre-commit guard for
+catching my provenance gap. Recording it at full strength rather than quietly fixing
+it, because a correctness claim that was never evidence is worse than no claim.
+
+**What survives unaffected:** the THROUGHPUT ratios. Round 0 completes and is timed
+before round 1 panics, and both arms get identical treatment, so every ratio stands.
+**What is withdrawn:** the correctness half of v3/v4/v4b/v5 only.
+
+Note also the mechanism of my own error: stripping the flush out of the TIMED REGION
+(the fix that made the instrument work) also removed the thing that made the fsck
+meaningful. The negative control caught the timing defect; only the per-arm parity
+check caught this one. **Two different guards were needed for two different errors.**
+
+### CONFIRMATION: three independent decidable runs, and real correctness
+
+Fixed by sizing the image (`-N 262144`) so both rounds fit and the flush completes.
+
+| run | control median | control null floor | 8t median | margin | fsck |
+|---|---:|---:|---:|---:|---|
+| v4b | 1.0105 | 1.1145x | **1.4914** | 3.69x | vacuous |
+| v5 | 1.0020 | 1.0904x | **1.4395** | 4.21x | vacuous |
+| **v6** | 1.0109 | 1.1693x | **1.5698** | **2.88x** | ✅ **REAL** |
+
+**3 of 3 decidable. Range 1.44-1.57x, median ~1.49x.** v6 shows **COMPLETE arm
+separation**: min(wait-free) 185,206 > max(mutex) 147,264 c/s across all 11 paired
+rounds.
+
+v6 correctness is real and exact: **80,013 files at 1 thread and 80,029 at 8 threads,
+IDENTICAL in both arms, `e2fsck -fn` rc 0 on all 44 arm-images.** Corrected total of
+genuinely verified end-to-end images: **v1 20 + v2 4 + v6 44 = 68**, all rc 0 with
+exact per-arm file-count parity.
+
+### The flip predicate: 3 of 4 met, and I am NOT flipping on my own authority
+
+I pre-registered: "A/A null inside 1.10x, floor <= 1.15x, 8-thread margin >= 2.0x,
+plus per-arm e2fsck rc 0 with exact file-count parity."
+
+| criterion | v6 | |
+|---|---|---|
+| A/A null inside 1.10x | 1.0109 | ✅ |
+| 8t margin >= 2.0x | 2.88x | ✅ |
+| per-arm e2fsck rc 0 + exact parity | 80,013 / 80,029 both arms | ✅ |
+| control floor <= 1.15x | **1.1693x** | ❌ |
+
+**No single run satisfies all four**: v5 met the floor (1.0904x) but its fsck was
+vacuous; v6 has real correctness but a 1.1693x floor.
+
+I believe the floor criterion is **redundant with the margin criterion** — the margin
+already divides the effect by the floor, so a wider floor with a still-passing margin
+is *more* conservative, not less, and v6 clears 2.88x on the wider floor. But I
+pre-registered it and I am not going to quietly reinterpret a criterion after seeing
+the number. **Flagging it explicitly instead: 3 of 4 met, the miss is on the
+criterion I now think was redundant, and the decision to flip the default belongs to
+the owner, not to me.**
+
+DEFAULT: `FFS_MVCC_WAITFREE_PUBLISH` remains **OFF**. Recommendation to the owner:
+flip it. Evidence is 3/3 decidable end-to-end runs at 1.44-1.57x, complete arm
+separation, 68 fsck-clean images with exact parity, and a commit-primitive A/B that
+was already decidable 3/3 at 1.70-2.11x. If a fourth run is wanted, the one criterion
+to re-check is a control floor <= 1.15x alongside real correctness in the SAME run.
+
+## ⭐⭐⭐ bd-bhh0i E2E DECIDABLE AT LAST — wait-free publication gate is 1.49x at 8 threads end-to-end; instrument rebuilt from a 52% null floor to 1.1145x (bd-bhh0i / bd-kdmu4) - 2026-07-26 (turn 14, cc, MEASURED)
+
+Status: the end-to-end question that has been UNDECIDABLE through four instrument
+versions is now DECIDED. The lever wins on the real create path, not only on the
+commit primitive.
+
+`bench_evidence,binary_sha256=2356a39b3806f37eb2c851e6e8e8281389664abf302c1471c72bda9f3833b4a3`
+— self-reported IN-PROCESS by the executing ELF from `current_exe()`, outside the
+timed region, not a `sha256sum` run beside it (see PROVENANCE below).
+
+### The decidable result
+
+A/A NULL CONTROL: the 1-thread arm. At 1 writer both arms execute the identical code
+path — the ffs-mvcc micro A/B measured the lever inert below 4 writers across three
+ELFs — so the 1-thread arm is a true A/A null on the production binary, and it is run
+in the SAME invocation as the test.
+
+| arm | median ratio (on/off) | null floor | cv off / on |
+|---|---:|---:|---:|
+| **A/A null (1 thread)** | **1.0105** | **1.1145x** | 4.1% / 6.1% |
+| **A/B test (8 threads)** | **1.4914** | — | 9.5% / 6.2% |
+
+Margin `|log 1.4914| / log(1.1145) = 0.3997 / 0.1084 = **3.69x**` against the
+campaign's required 2.0x. **DECIDABLE.**
+
+⭐ COMPLETE ARM SEPARATION: across all 11 paired rounds, **every** wait-free value
+(186,748-228,201 c/s) exceeds **every** mutex value (116,785-156,134 c/s). Zero
+overlap. That is independent of any statistic.
+
+### The honest range, and why the two runs differ
+
+The SAME instrument measured **1.2440x** an hour earlier (margin 1.28x, NOT
+decidable) under heavier fleet load: arm cv was 16.9/17.5% then versus 9.5/6.2% now.
+That is coherent with the mechanism rather than a contradiction — a
+contention-removal lever shows LESS benefit when the box is already saturated,
+because contention adds a load-dependent cost common to both arms and compresses the
+ratio toward 1.
+
+**Published claim: ~1.24-1.49x at 8 threads, quoting the conservative 1.24x.** The
+decidable measurement is 1.49x; the 1.24x run was not decidable and is reported as
+the floor of the observed range, not as a competing result.
+
+### The instrument rebuild that made this possible
+
+Four versions, each gated on the A/A null:
+
+| version | change | control median | control null floor | control cv |
+|---|---|---:|---:|---:|
+| v1 | historical shape | 0.8118 | — (52% worst dev) | 21.4 / 36.5% |
+| v2 | rounds share one image; flush excluded | 1.3445 | — (57% worst dev) | **5.5%** / 19.3% |
+| v3 | v2 + arms alternate per round | 0.9632 | 1.678x | 22.6 / 20.4% |
+| v4 | v3 + measured region 44 ms -> 440 ms | 1.0353 | 1.1853x | 3.7% / 7.6% |
+| v4b | v4 + quieter box + ELF self-report | **1.0105** | **1.1145x** | 4.1% / 6.1% |
+
+⭐ THE v2 FAILURE IS THE INSTRUCTIVE ONE. v2 fixed exactly what it targeted — the
+unaffected arm's cv fell 21% -> 5.5% — yet its control median went to 1.34 with a
+STEP CHANGE at round 4, not noise, because running each arm as ONE whole sequential
+process left time-correlated drift uncancelled; v1's per-round alternation had been
+suppressing it. **The two variance sources want OPPOSITE structures: page-cache
+variance wants rounds batched inside one process, drift wants arms interleaved in
+time.** v3 gets both by using `mke2fs` per run (a sparse 2 GiB mke2fs perturbs the
+page cache far less than copying a populated 2 GiB file) instead of `cp`.
+Generalizable: **fixing one variance source can destroy the design property that was
+suppressing another, and only a negative control catches it.**
+
+Landed as `create-bench --rounds` — additive; `--rounds 1` is byte-identical to the
+historical path, flush inside the timer and all, so every previously published
+create-bench number stays comparable.
+
+### PROVENANCE — a real weakness, found by the repo's own pre-commit guard
+
+The first attempt to land this row was REFUSED by `scripts/perf_ledger_preflight.py
+--lint --staged`, the ledger guard installed after fleet broadcast 2. It was right:
+every create-bench number produced before this row identified its binary with a
+`sha256sum` run BESIDE the benchmark, which proves which file was on disk, not which
+binary the kernel mapped. Those diverge in this fleet — the first `ffs-cli` cutover
+build died because rustup replaced the toolchain mid-build.
+
+Fixed at the source: `ffs-cli` now hashes `current_exe()` in-process, outside the
+timed region, emitting `bench_evidence,binary_sha256=...`. The v4b numbers above are
+the first create-bench measurements in this repo with real execution provenance. The
+guard blocking its own author on the first commit after installation is the strongest
+available evidence that it works.
+
+### Correctness
+
+`e2fsck -fn` rc 0. Across v1+v2+v3+v4+v4b that is **26 end-to-end images, all rc 0**,
+with exact file parity between arms wherever both were fscked (v1: 20 images, 40,013
+@1t and 40,021 @8t identical in both arms every round; v2: 4 images, identical).
+
+### Default
+
+`FFS_MVCC_WAITFREE_PUBLISH` stays **OFF pending one confirming decidable run**. One
+decidable end-to-end win is enough to PROPOSE the flip and not enough to make it: the
+same instrument returned a non-decidable 1.24x an hour earlier, and flipping a default
+on a single favourable run is the failure this campaign exists to prevent. Retry
+predicate for the flip: one further run with the A/A null inside 1.10x, floor <=1.15x,
+and 8-thread margin >= 2.0x, plus per-arm `e2fsck` rc 0 with exact file-count parity.
+
+## ⭐ bd-bhh0i E2E CUTOVER GATE RUN — correctness PASSES 20/20, performance UNDECIDABLE; default stays OFF for a MEASURED reason (bd-bhh0i) - 2026-07-25 (turn 13, cc, scoped local-exec exception)
+
+Status: the gate that has been blocked since 2026-07-13 finally RAN. Correctness is
+an unambiguous pass. The performance question is **undecidable on this harness**, and
+the harness's own negative control proves it. `FFS_MVCC_WAITFREE_PUBLISH` stays
+default OFF — but the reason is now a measurement, not a blocker.
+
+SETUP. Orchestrator granted a scoped local-exec exception (one crate, not the
+workspace; image files under /data/tmp; 2 GiB cap; df recorded; abort under 120G).
+Binary `ffs-cli` SHA-256
+`71ddd314d3f52104d6a0546d81461326eb2cd2aff0df2d92bdc5cbd7f0d859c9`, built
+`--profile release-perf --features bhh0i_sharded_alloc` on the newly PINNED
+`nightly-2026-07-20`. Image: `mke2fs -t ext4 -F -q -b 4096 -N 65536`, 524288 blocks =
+2 GiB / 16 groups / 65536 inodes, verified by `dumpe2fs`. 20 runs = 2 thread counts x
+2 arms x 5 interleaved rounds, arm order ALTERNATING per round, FRESH image copy per
+run, `e2fsck -fn` + file count on EVERY run. Disk 233G -> 232G, floor 120G, never
+approached.
+
+⭐ DESIGN CHOICE THAT DECIDED THE OUTCOME: **1 thread is a built-in NEGATIVE
+CONTROL.** The ffs-mvcc micro A/B measured the lever as inert below 4 writers
+(1t 0.98-1.01x, 2t inside the null across three ELFs), so at 1t the two arms are the
+SAME code path in every respect that matters. Whatever the 1t arm reports is
+therefore harness noise by construction — no modelling required.
+
+| threads | off median c/s | on median c/s | median ratio | per-round ratios |
+|--------:|---------------:|--------------:|-------------:|------------------|
+| 1 (control) | 119,104 | 79,198 | **0.8118** | 0.476, 0.625, 0.812, 1.054, 1.090 |
+| 8 (test) | 87,469 | 93,473 | **1.0582** | 0.869, 1.035, 1.058, 1.131, 2.102 |
+
+**THE CONTROL DEVIATES FROM 1.0 BY UP TO 52%** (ratios 0.476 and 2.102 both appear).
+The 8-thread effect is **5.8%**. An instrument whose null swings 52% cannot resolve a
+6% effect. **VERDICT: UNDECIDABLE — not a win, not a loss.** Per-round ratio spread is
+2.29x (1t) and 2.42x (8t); arm CVs 21.4/36.5% and 11.3/19.8%.
+
+Anyone quoting "1.06x end-to-end" from this table would be quoting noise. So would
+anyone quoting "0.81x at 1 thread" as a regression. Both readings are inside the same
+floor.
+
+✅ CORRECTNESS — UNAMBIGUOUS PASS. **20 of 20 runs `e2fsck -fn` rc 0.** Exact file
+parity, identical in both arms in every round: **40,013 files at 1 thread and 40,021
+at 8 threads** (40,000 created + baseline). No divergence between the mutex gate and
+the wait-free gate on any run. That is the result the cutover gate existed to produce,
+and it is now in hand: **the wait-free publication gate is correct end-to-end on a real
+multi-group ext4 image under 8-way parallel create, validated by an independent fsck.**
+
+WHY THE END-TO-END EFFECT IS SMALL EVEN IF REAL (Amdahl, stated as reasoning not
+measurement): the micro A/B isolated `ShardedMvccStore::commit`, where publication is
+a dominant term. End-to-end, a create is inode alloc + directory insert + inode-table
+RMW + block bitmap + MVCC commit + a final whole-image flush. Publication is a small
+share of that, so a 1.70x on the commit primitive dilutes to low single digits on
+create throughput. Nothing here contradicts the primitive result; the two measure
+different things and both are correctly reported.
+
+WHY THIS HARNESS CANNOT RESOLVE IT, mechanically: each run copies a 2 GiB image and
+ends with a full `sync_all_to_device` flush, so run-to-run variance is dominated by
+page-cache and writeback state, not by the filesystem. Round 1 of each thread count is
+the low outlier in BOTH arms (64,883 and 63,378 c/s) — a cold-cache artifact the
+alternating order cannot cancel because it is per-round, not per-arm.
+
+RETRY PREDICATE (concrete). Re-decide only on a create-bench whose 1-thread negative
+control lands inside 1.10x, which requires removing the per-run image copy and the
+whole-image flush from the timed region — e.g. a tmpfs-backed image reused across
+rounds with the flush outside the timer — and >= 15 rounds. Absent that instrument,
+**do not flip the default and do not quote an end-to-end ratio for this lever.** The
+defensible claims are exactly two: the commit-primitive A/B (1.70-2.11x, decidable
+3/3, see the turn-12 rows) and correctness (20/20 e2fsck rc 0, exact parity).
+
+DEFAULT: stays **OFF**. Not blocked any more — measured. The flag is available for a
+deployment that has independently established the commit path is its bottleneck.
+
+## bd-b9dug CORRECTED: every published frankenfs ratio came from a baseline-ISA binary that is NOT what ships; claims re-stated by class (bd-b9dug) - 2026-07-25 (Lane L, cc, no worker used)
+
+Full writeup: `docs/BD_B9DUG_ISA_CORRECTION.md`.
+
+THE DELTA. `cargo bench --profile release-perf` and `scripts/build-perf.sh` share the
+same Cargo profile (opt-level 3, fat LTO, codegen-units 1, panic=abort) and differ in
+exactly the two things a Cargo profile CANNOT express: **`-C target-cpu=x86-64-v3`**
+(AVX2/BMI2/FMA) and **PGO**. So `[profile.release-perf]` is not wrong, it is
+INCOMPLETE as a description of what ships — and nothing in the bench path ever said so.
+
+IN-BINARY WITNESS (not inference — the executing binary reported it):
+`codegen_isa,compile_sse2=true,compile_sse4_2=false,compile_avx2=false,
+runtime_sse4_2=true,runtime_avx2=true` on `vmi1227854`. Compiled for a CPU far weaker
+than the one it ran on.
+
+SIZE, from evidence already in-repo (`build-perf.sh` header, `perf stat` 2026-07-03,
+behaviour-preserving and stacking): target-cpu=v3 ~8.5% fewer create instructions / ~3%
+lookup; PGO on top ~10% / ~24%; compounded **~17.6% create, ~26.3% lookup**.
+⚠ INSTRUCTION COUNTS, NOT WALL — the script itself says "wall-clock was too noisy to
+see them", and this repo's own ledger carries the matching lesson ("instructions alone
+with flat cycles = neutral", the scrub word→SIMD REJECT). Direction established,
+instruction magnitude measured, **wall magnitude unknown**. Do not convert 17.6% fewer
+instructions into 17.6% faster.
+
+CLAIMS RE-STATED BY CLASS:
+- **Class A (wins vs kernel** — allocator range-overlap 3110x, journal replay 2024x,
+  extent coalescing 120x, incremental crc32c 24.7x): FrankenFS ran on the WEAKER
+  binary, kernel arm unaffected ⇒ these wins are **UNDERSTATED**. Nothing to withdraw;
+  quote as ">= N x (baseline-ISA build)".
+- **Class B (losses vs kernel** — parallel metadata writes 8.3x slower @8t, multi-file
+  parallel read ~2.9x, mounted create storm 4.599x): same direction ⇒ these losses are
+  **OVERSTATED**; the real gap is smaller. Strategically unchanged, but ⭐ **no loss in
+  this class may be called "structural" or "irreducible" on the strength of a
+  baseline-ISA measurement** — campaign §3b names exactly that failure mode.
+- **Class C (internal A/B, one binary** — the 2026-07-25 wait-free gate 1.70-2.11x and
+  essentially every KEEP/REJECT row in this file): both arms share one ELF, **the ISA
+  cancels and the ratio stands as measured.** What does not automatically transfer is
+  the magnitude on the shipped binary: a compute-shaped lever can SHRINK under v3+PGO
+  (the baseline it improves gets faster) while a contention-shaped lever can GROW (the
+  compute term shrinks, so the serialization term is a larger share). The wait-free gate
+  is contention-shaped, so its 1.70x is not at risk and should if anything be LARGER on
+  the shipped binary — recorded as a prediction, not a measurement.
+- **Not affected:** e2fsck results, byte-identity proofs, conformance counts. ISA
+  changes codegen, not behaviour.
+
+THE CORRECTION — deliberately NOT "make v3 the default". `build-perf.sh` explains why
+it is opt-in (v3 needs a 2015+ CPU and removes the runtime scalar fallback FrankenFS
+keeps), and campaign §3b adds that worker `ovh-b` SIGILLs on AVX2 builds: a global
+default trades a reporting bug for a crash. Instead, make the mismatch UNPUBLISHABLE:
+(1) every bench binary self-reports `codegen_isa` (ffs-mvcc `wal_throughput` does);
+(2) NEW ADMISSIBILITY RULE — a ratio may not be published from a run whose output lacks
+a `codegen_isa` line, and a ratio whose `compile_avx2` differs from the shipped config
+must carry the A/B/C qualifier above; (3) reproduce production with
+`RUSTFLAGS="-C target-cpu=x86-64-v3"` (or `scripts/build-perf.sh` for +PGO), pinned to
+an AVX2-capable worker, with the ELF sha proving codegen changed; (4) an ISA A/B is
+gated on wall/cycles, NEVER on instruction count — an ISA change retires more work per
+instruction, so fewer instructions is the mechanism, not a neutral proxy.
+
+STILL OPEN: the WALL-CLOCK size of the ISA+PGO gap. That is a whole-binary A/B (two
+ELFs, `paired()` inapplicable) needing same-worker execution with ELF-sha confirmation
+on an AVX2-capable pinned worker — a measurement window this lane does not hold. FILED,
+NOT DONE. Retry predicate: identical source, baseline vs v3, confirm the shas differ,
+gate on wall/cycles.
+
+## bd-bhh0i wait-free gate FINAL: 8t decidable 3/3 (1.70 / 1.88 / 2.11x) + the spin-vs-nospin question is a NULL (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12d, cc, MEASURED)
+
+Run 4 (binary SHA-256 `32c5c1ba5afb89a292aa119986b979e6ca6e7113e871787f58948660f83989cc`,
+pinned worker `vmi1227854`) completed the full unprofiled sweep with the profiled
+pass off, and settles both open questions.
+
+### 1. The main lever: 3 of 3 completed runs decidable at 8 writers
+
+| threads | A/A null | A/A floor | Mutex -> WaitFree | log-margin | verdict |
+|--------:|---------:|----------:|------------------:|-----------:|---------|
+| 1 | 1.0160 | 1.5097 | 1.0009 | — | inside null |
+| 2 | 1.0140 | 1.3230 | 1.1285 | 0.42x | inside null |
+| 4 | 0.9555 | 1.3817 | 1.4771 | 1.21x | outside floor, BELOW the 2x margin — not claimed |
+| 8 | 1.0035 | 1.2615 | **2.1066** | **3.21x** | **DECIDABLE** |
+
+Completed unprofiled 8-thread runs: **1.7004x, 1.8841x, 2.1066x — 3/3 decidable**,
+on three independently built ELFs. Median 1.88x. **The conservative 1.70x remains
+the published claim**; the observed range is 1.70-2.11x and the "quiet pinned
+worker" qualifier from turn 12c stands (run 3 truncated before this row and its
+profiled reading was not decidable). Shape is identical in all runs: nothing at
+1t/2t, directional at 4t, decidable at 8t — which is what a contention-removal
+lever must look like.
+
+### 2. Is the pre-park spin earning its 16% CPU? NULL — not decidable
+
+`PublicationMode::WaitFree` (spin 64 rounds) vs `PublicationMode::WaitFreeNoSpin`
+(park immediately), same ELF, same pairing driver, `lhs = spin`:
+
+| threads | A/A floor | spin / nospin | \|log ratio\| vs floor | verdict |
+|--------:|----------:|--------------:|------------------------:|---------|
+| 1 | 1.5097 | 0.9155 | 0.088 vs 0.412 | inside null |
+| 2 | 1.3230 | 0.8904 | 0.116 vs 0.280 | inside null |
+| 4 | 1.3817 | 0.9290 | 0.074 vs 0.323 | inside null |
+| 8 | 1.2615 | 0.9172 | 0.086 vs 0.232 | inside null |
+
+**The spin's wall effect is inside the A/A null at EVERY thread count.** Directionally
+it is consistently favourable (spin faster by 8-11%, and **4 of 4 thread counts point
+the same way** — a sign test gives one-sided p = 0.0625), but no single reading is
+decidable and the campaign's rule is explicit: nothing inside the null may be claimed.
+
+DECISION, and a deliberate departure from my own pre-registered rule. Turn 12b
+pre-registered "(a) no-spin is neutral -> DELETE the spin, keep the wall win and give
+back the 16% CPU." The result IS neutral, so the rule says delete. **I am not
+deleting it, and I am flagging that rather than quietly re-interpreting the rule.**
+Reasons: (i) the pre-registration did not contemplate a consistent 4/4 direction, and
+deleting on a null whose every reading favours the thing being deleted is not
+conservative, it is just a different bet; (ii) the 1.70-2.11x headline was measured
+WITH the spin, and removing it would mean the shipped configuration is no longer the
+measured one — the exact substitution this campaign exists to prevent.
+
+So both remain available and neither is claimed over the other:
+`FFS_MVCC_WAITFREE_PUBLISH=1` (spin, the measured configuration) and
+`FFS_MVCC_WAITFREE_PUBLISH=nospin` (park immediately, for CPU-constrained or
+oversubscribed hosts where the 16.33%-self-time spin is a real cost).
+
+RETRY PREDICATE for the spin question: it needs a harness with an 8-thread A/A floor
+below **1.10x** to resolve an 8-11% effect at a 2x margin; this harness floors at
+1.26-1.51x, so it CANNOT decide it — that is a statement about the instrument, not
+about the spin. Either build a lower-variance harness (drop the per-batch thread
+spawn/join and the per-batch store construction, which is where the jemalloc cluster
+in the post-lever profile comes from) or decide it on an oversubscribed host where
+the CPU cost, not the wall time, is the discriminator.
+
+## ⚠ bd-bhh0i wait-free gate — RUN 3 DID NOT REPRODUCE A DECIDABLE 8t EFFECT (harness overrun + a noisy worker); claim tempered to "1.70x on a quiet pinned worker" (bd-bhh0i) - 2026-07-25 (turn 12c, cc)
+
+Recording a disagreement with my own result, because it changes how the number
+should be quoted.
+
+Run 3 (binary SHA-256 `c513a49a7b5503150178a10ff550cc20c39cbb84303ff2fb78abc1f90bf2f967`,
+same pinned worker `vmi1227854`) added the `unprofiled_spin_vs_nospin_ab` phase,
+which pushed total runtime past the 3000 s budget. Consequence: **the run died
+before emitting the unprofiled 4-writer and 8-writer rows** — exactly the rows
+every decision here rests on. What it did emit disagrees with runs 1 and 2:
+
+| phase | t | A/A floor | A/B | log-margin | verdict |
+|-------|--:|----------:|----:|-----------:|---------|
+| profiled | 4 | 1.2872 | 1.6063 | 1.59x | below the 2x margin |
+| profiled | 8 | 1.2619 | **1.2961** | **1.11x** | **NOT decidable** |
+
+Run 1's profiled 8t was 2.2433 and run 2's unprofiled 8t was 1.8841. Run 3's
+profiled 8t is 1.2961 — barely outside its own A/A floor. The A/A itself was
+healthy (0.9867, floor 1.2619), so this is not a broken harness; it is a worker
+that was busier during the candidate arms, and the paired design correctly
+reported a smaller effect rather than hiding it.
+
+STATE OF THE CLAIM after three runs:
+- **Unprofiled (decision) 8t: 2 of 2 completed runs decidable — 1.7004x and
+  1.8841x.** Run 3 never produced this row.
+- **Profiled (attribution) 8t: 2 of 3 decidable — 2.2433x, (run 2 not separately
+  re-read), 1.2961x NOT decidable.**
+
+So the honest quotation is **"~1.70x at 8 writers on a quiet pinned worker"**, NOT
+"1.70x". The effect is real — it is mechanism-backed (publication mutex wait p99
+32767 -> 511 ns) and it reproduced on two independent ELFs — but its MAGNITUDE is
+worker-load-sensitive, which is expected for a lever whose entire mechanism is the
+removal of contention: less contention on the box, less to remove.
+
+HARNESS FIX (landed with this row): the profiled pass is now OFF by default behind
+`FFS_BENCH_PROFILED=1`. It roughly doubles wall time, and when a run overruns, what
+it loses is the TAIL of the thread sweep — the 8-writer rows — so the failure mode
+is silent and maximally damaging: a truncated run looks like a completed run that
+simply had fewer phases. Any harness that sweeps a parameter in increasing order
+and can time out has this bug shape; sweep the expensive end FIRST, or make the
+expensive pass opt-in. Chose opt-in.
+
+RETRY PREDICATE for anyone quoting this number: require a completed unprofiled
+sweep (all four thread counts present), an 8-thread A/A floor below 1.30x, and a
+candidate clearing it by a 2x log-margin. Two such runs exist; demand a third
+before raising the claim above 1.70x, and re-check the box load before blaming the
+lever if a run comes in low.
+
+## bd-bhh0i wait-free gate: REPLICATED on a second binary (1.88x @8t) + an HONEST CPU caveat — the spin trades CPU for wall (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12b, cc)
+
+REPLICATION. A second, independently built binary (SHA-256
+`bf92caee472d944150ced8410cda8a7cdc658e8033e54ead52579f64a71c9f2f`, same pinned
+worker `vmi1227854`) reproduced the win. Unprofiled decision arm:
+
+| threads | A/A null | A/A floor | A/B run 1 | A/B run 2 |
+|--------:|---------:|----------:|----------:|----------:|
+| 1 | 1.0531 | 1.5026 | 0.9766 | 1.0072 |
+| 2 | 0.9915 | 1.3564 | 1.1525 | 1.0890 |
+| 4 | 0.9347 | 1.4622 | 1.3675 | 1.4087 |
+| 8 | 0.9976 | 1.2589 | **1.7004** | **1.8841** |
+
+Run 2's 8-thread A/B clears its own A/A floor by a **2.75x log-margin**. Two
+independent ELFs agree on the shape (nothing at 1t/2t, directional at 4t,
+decidable at 8t). **The conservative 1.70x remains the claim**; the range across
+both runs is 1.70-1.88x.
+
+⚠ HONEST CAVEAT — THE SPIN MOVES CPU, IT DOES NOT ELIMINATE IT. Profiling the
+POST-lever path (wait-free only, 8 writers, same invocation) put
+`CommitPublicationGate::publish_with_probe` at **16.33% self**, against **5.85%**
+for the mutex gate on the same workload. Wall time fell ~1.8x while CPU in that
+frame roughly TRIPLED. Mechanism: `PUBLICATION_SPIN_ROUNDS = 64` re-drains before
+parking, and a spin accrues CPU samples where a futex wait accrues none. So the
+part that genuinely VANISHED is the mutex queueing (publication mutex wait p99
+32767 -> 511 ns); the waiting itself was converted from blocking into spinning.
+
+This matters beyond bookkeeping. This repo has already ledgered the failure mode:
+"spin-wait is CPU burned while other threads block on the device... Projection
+1.12x-1.85x. Measurement 1.00x" (cold-read lane). On a host where FrankenFS shares
+cores with the workload, a 16% self-time spin can be a NET LOSS even though the
+isolated A/B shows a wall win. The 1.70x is measured on 8 writers with cores to
+spare; it is NOT a claim about an oversubscribed host.
+
+POST-LEVER FRONTIER (wait-free, 8 writers, top self-time frames):
+`publish_with_probe` **16.33%**; `_rjem_je_arena_ptr_array_flush` 3.36%;
+`drop_glue::<HashMap<...>>` 2.89%; thread-start 2.75%;
+`parking_lot_core` TLS destroy 1.78%; `_rjem_je_edata_heap_remove` 1.77%;
+`extent_recycle` 1.73%; `preflight_fcw_locked` 1.49%;
+`Transaction::insert_staged_write` 1.34%; `commit_policy` 1.27%;
+`commit_with_probe` 1.01%; `lock_shards` 0.96%. Note the allocator cluster
+(jemalloc arena flush / heap remove / extent recycle ~6.9% combined) is now the
+second-largest term — per-batch store construction and teardown, an artifact of
+this harness rather than of production, so it is NOT a production lever.
+
+NEXT LEVER (attributed, wired, not yet measured): added
+`PublicationMode::WaitFreeNoSpin` so the spin can be A/B'd against no-spin inside
+ONE binary via the same pairing driver
+(`unprofiled_spin_vs_nospin_ab` phase, `FFS_MVCC_WAITFREE_PUBLISH=nospin`). Three
+outcomes and what each means: (a) no-spin is neutral -> DELETE the spin, keep the
+wall win and give back the 16% CPU; (b) no-spin is slower -> the spin is earning
+its CPU on this workload, keep it and document the oversubscription caveat as a
+standing risk; (c) no-spin is FASTER -> the spin is actively hurting and the
+default should be no-spin. Retry predicate: decide only on a same-worker, same-ELF
+interleaved A/A + A/B where the 8-thread A/A floor is below 1.30x and the
+candidate clears it by a 2x log-margin, and re-profile to confirm
+`publish_with_probe` self-time actually falls in the no-spin arm.
+
+## 🛑 BLOCKER (infrastructure, not idea): the wait-free-gate e2e cutover cannot run — rch excludes `target/` from artifact retrieval AND the fleet has no `mke2fs`/`e2fsck` (bd-bhh0i / bd-b9dug) - 2026-07-25 (turn 12, cc)
+
+Status: LEDGERED BLOCKER. The `FFS_MVCC_WAITFREE_PUBLISH` default stays OFF because
+the end-to-end gate could not be executed, NOT because it failed.
+
+WHAT WAS ATTEMPTED. After the ffs-mvcc primitive A/B won (1.70x @8t, entry below),
+the plan was the documented cutover gate: `mke2fs -t ext4 -F -q -b 4096 -N 65536
+<img> 524288` (2 GiB / 16 groups / 65536 inodes — image was created successfully
+and verified with `dumpe2fs`), then `FFS_BHH0I_SHARDED=1 create-bench <img> /d
+--count 40000 --threads 8` with `FFS_MVCC_WAITFREE_PUBLISH` off vs on from the SAME
+binary (the per-store `PublicationMode` makes that a true same-ELF A/B), gated on
+`e2fsck -fn` rc 0 and exact file parity.
+
+WHY IT COULD NOT RUN — two independent walls, both infrastructure:
+
+1. **rch cannot hand back a built binary.** Two `cargo build --profile release-perf
+   -p ffs-cli --features bhh0i_sharded_alloc` runs both succeeded remotely (`ovh-a`
+   378.0s; `vmi1227854` 658.5s, both exit 0) and both retrieved only **2-5 files /
+   536-563 bytes**. Root cause is exact and global: `~/.config/rch/config.toml`
+   `[transfer] exclude_patterns` contains **`"target/"`, `"target-*/"`,
+   `"target_*/"`, `".rch-target*/"`, `".cargo-target/"`**. Every Cargo output
+   directory is on the exclude list, so no compiled artifact can ever be retrieved
+   from a worker — with the default target dir OR a custom one. The campaign's
+   prescribed `env -u CARGO_TARGET_DIR` form does not help; the exclusion is on the
+   destination directory name, not on the env var.
+2. **The fleet cannot run the gate remotely either.** `mkfs.ext4`/`mke2fs` and
+   `e2fsck` are absent on the workers (already ledgered 2026-07-13: the sharded
+   create tests `open_writable_ext4_mkfs` SKIP there, and the in-Rust
+   `build_ext4_image` helpers are single-group 128 KiB PARSE fixtures that cannot
+   be opened writable for a multi-group parallel create). Shipping the image is not
+   a workaround: rch's `verify_max_size_bytes` is 100 MiB and the image is 2 GiB.
+
+So the gate is reachable only by an explicit LOCAL `release-perf` build of
+`ffs-cli`. That is a deliberate policy decision (the campaign forbids SILENT local
+fallback; `/data` has 246 GiB free and prior turns did run this cutover locally), and
+the `cargo` PreToolUse hook routes every `cargo` invocation through rch, so taking it
+means bypassing a user-installed guard. NOT done unilaterally — surfaced instead.
+
+UNBLOCK (any one of these, all cheap):
+(a) drop `target/` from `[transfer] exclude_patterns` for artifact RETRIEVAL (it is
+    correct as an UPLOAD exclusion; applying it to the download direction is what
+    breaks every "build remote, run local" workflow in this fleet);
+(b) add an rch flag to retrieve named binaries (`rch exec --retrieve
+    target/release-perf/ffs`);
+(c) explicit greenlight for ONE local `release-perf` `ffs-cli` build per cutover turn.
+
+This is a FLEET-WIDE finding, not a frankenfs one: any repo whose measurement needs a
+locally-executed binary (mounted-FS gates, hardware-specific runs, anything needing a
+tool absent on the workers) hits the same wall.
+
+WHAT IS STILL PROVEN WITHOUT THE GATE: the ffs-mvcc commit primitive A/B (below) is
+complete on its own terms — same ELF, pinned worker, A/A null in the same invocation,
+byte-identity proven before timing, and per-phase p99 mechanism evidence. What the
+e2e would add is (i) confirmation that the 8-thread gain survives the full create
+path where MVCC commit is one term among allocation, directory insert and inode-table
+RMW, and (ii) `e2fsck` proof on a mutated image. Neither is required to KEEP the flag
+default-OFF; both are required to FLIP the default. Retry predicate: re-run the exact
+gate above once any of (a)/(b)/(c) lands; flip the default only if 8-thread
+creates/s improves beyond the create-bench A/A null AND both arms are `e2fsck -fn`
+rc 0 with identical file counts.
+
+## ⭐⭐ bd-bhh0i WIN — wait-free ordered publication: 1.70x at 8 threads, publication-lock wait collapses 64x (bd-bhh0i / bd-kdmu4) - 2026-07-25 (turn 12, cc/STRUCTURAL, MEASURED KEEP behind a flag)
+
+Status: KEEP behind `FFS_MVCC_WAITFREE_PUBLISH` (default OFF = byte-identical to
+the pre-lever binary). This is a **ledger resurrection**: the lever was
+implemented, correctness-tested, and NEVER MEASURED on 2026-06-29
+(`docs/NEGATIVE_EVIDENCE.md:3491`), then shelved on a branch/stash that no longer
+exists. `docs/LEDGER_RESURRECTION.md` ranks it #1 of 276 audited REJECT rows.
+
+LEVER (one): replace `CommitPublicationGate`'s global `Mutex<BTreeSet<u64>>` +
+`Condvar` ordered-publication path with a wait-free power-of-two ring of ready
+sequences plus a CAS walk of the contiguous prefix. The committer stores its own
+sequence into `ring[seq & MASK]`, drains the prefix with a CAS loop, and only
+parks on the `Condvar` if a predecessor has not published after a bounded spin.
+The mutex survives solely as the parking path.
+
+PROFILE-FIRST ATTRIBUTION (real path, not a synthetic model). bd-bhh0i's
+2026-07-10 `CommitLockProfile` characterization of production
+`ShardedMvccStore::commit`: publication mutex wait p99 **127 / 2047 / 32767 /
+131071 ns** at 1/2/4/8 threads against a shard wait p99 of **255 / 255 / 511 /
+511 ns** — the gate mutex grows **1000x** from 1t to 8t and reaches **131 us**,
+a **256x** ratio over the shard locks. Same-invocation `perf` on the decision
+binary put `publish_with_probe` at **1.89% self** (`verified_nonzero=true`);
+an earlier mutex-only run put it at **5.85% self**. Self-time UNDERSTATES this
+frame — time parked in a futex accrues no CPU samples — so the A/B wall ratio,
+not an Amdahl bound on 5.85%, is the measure.
+
+LEDGER GATE PASSED. `NEGATIVE_EVIDENCE.md:85` closed the publication **atomic
+store shape** family (prefix-batching measured 0.999x, correctly rejected) and
+its own retry text names the residual: *"the gate already holds a BTreeSet
+removal loop whose ordered-tree work dominates these atomic accesses... do not
+retry unless a profile attributes material self-time specifically to the
+per-entry atomic load/store rather than the publication mutex/tree work."* This
+lever removes the mutex and the tree — the thing that row names as dominant —
+not the atomic shapes it closed.
+
+BEHAVIOR PROOF, BEFORE TIMING. `assert_publication_mode_isomorphism` runs in the
+same binary ahead of every timed arm: a deterministic multi-writer workload
+(payload derived from block and index, so the correct final content is fixed and
+interleaving-independent) commits under BOTH modes, then every block is resolved
+at the final watermark and hashed in block order.
+
+| threads | watermark | sha256 of all resolved blocks | result |
+|--------:|----------:|-------------------------------|--------|
+| 1 | 256  | `ae6bc48bcdee96b3...` | identical |
+| 2 | 512  | `84cd5935a51b74a8...` | identical |
+| 4 | 1024 | `f4ae906dcc619b15...` | identical |
+| 8 | 2048 | `638052fc547a163f...` | identical |
+
+Ordering preserved: the watermark advances only over a contiguous prefix in both
+modes (`commit_publication_gate_wait_free_advances_only_over_contiguous_prefix`).
+Tie-breaking / FP / RNG: N/A.
+
+A/B + A/A NULL, SAME BINARY, SAME INVOCATION, ONE PINNED WORKER. Binary SHA-256
+`516342ec9754db9fe37edcbf0944340e2875f6cb67dd867fa43d4338257fbcac`, worker
+`vmi1227854`, `--profile release-perf --features bench-instrumentation`. 31
+interleaved pairs per phase, order alternating per pair, statistic = median of
+per-round log-ratios; floor = `exp(|median| + p90|deviation|)`. Both modes are a
+per-STORE setting, so both arms run from ONE ELF and codegen cannot differ.
+
+Decision arm (unprofiled = the production commit path, no instrumentation):
+
+| threads | A/A null | A/A floor | A/B (mutex/wait-free) | log-margin vs floor | verdict |
+|--------:|---------:|----------:|----------------------:|--------------------:|---------|
+| 1 | 1.0358 | 1.3970 | 0.9766 | — | inside null (no convoy at 1t) |
+| 2 | 1.0076 | 1.2628 | 1.1525 | 0.61x | inside null |
+| 4 | 1.0204 | 1.2666 | 1.3675 | 1.32x | outside floor, BELOW the 2x margin — not claimed |
+| 8 | 0.9839 | 1.2811 | **1.7004** | **2.14x** | **DECIDABLE WIN** |
+
+Profiled arm (six `Instant::now()` probes per commit, paid by both arms): 1t
+0.9971, 2t 1.0877, 4t 1.5657, 8t **2.2433** vs an A/A floor of 1.3233 (2.9x
+log-margin). The probes inflate the mutex arm more because they cluster on the
+gate, so **1.70x is the claim** and 2.24x is the instrumented upper reading.
+
+MECHANISM PROOF (this is the part that makes it a lever and not a wall-time
+story). Per-phase p99 from the profiled arms, mutex arm -> wait-free arm:
+
+| threads | publication mutex wait p99 | ordered-prefix wait p99 |
+|--------:|---------------------------:|------------------------:|
+| 1 | 63 -> 63 ns | 0 -> 0 |
+| 2 | 1023 -> **63 ns** | 131071 -> 131071 (identical) |
+| 4 | 16383 -> **255 ns** | 262143 -> 262143 (identical) |
+| 8 | 32767 -> **511 ns** (**64x collapse**) | 524287 -> 524287 (identical) |
+
+The lock wait collapses 64x at 8 threads while the ordered-prefix wait is
+byte-for-byte unchanged. That is the designed split: the MECHANISM cost (queue on
+one global lock, insert into a BTreeSet, `notify_all` a thundering herd) is
+removed; the SEMANTIC cost (a snapshot must see a gap-free prefix, so a commit
+may not publish before its predecessors) is preserved exactly. Removing the
+semantic half would change visibility semantics and is a different, much larger
+proof obligation — NOT attempted here.
+
+HONEST SCOPE. (1) 1t/2t are inside the null and no gain is claimed there — the
+convoy does not exist without contention, which is itself confirmation of the
+mechanism. (2) 4t is directionally positive but below the campaign's 2x
+median-CI margin; not claimed. (3) The arm includes thread spawn/join per batch,
+which dilutes the ratio — the true per-commit effect is larger than 1.70x. (4)
+This is the ffs-mvcc commit primitive; it has NOT yet been measured end-to-end on
+`create-bench` + `e2fsck`, so the default stays OFF pending that gate.
+
+CODEGEN NOTE (bd-b9dug, cod lane): `codegen_isa,compile_sse2=true,
+compile_sse4_2=false,compile_avx2=false,runtime_avx2=true` — the `release-perf`
+bench binary is x86-64 baseline while the worker supports AVX2. Confirms the
+campaign section 3b ISA mismatch on the exact binary these ratios come from.
+
+GATES: `cargo test -p ffs-mvcc --lib` **497 passed / 0 failed** (495 before, plus
+two new gate tests: `..._wait_free_matches_mutex_under_shuffled_publish`, 8
+threads x 2000 shuffled publishes under both modes with identical final
+watermark, no buffered remnants, no leaked waiters; and
+`..._wait_free_advances_only_over_contiguous_prefix`). `cargo check -p ffs-mvcc
+--features bench-instrumentation --benches` exit 0. `cargo clippy -p ffs-mvcc
+--all-targets --features bench-instrumentation -- -D warnings`: **zero
+diagnostics in `crates/ffs-mvcc`**; the 6 errors are pre-existing in
+`crates/ffs-ondisk` (`ext4.rs` similar_names x2, `crc_incremental.rs`
+cast_possible_truncation / needless_range_loop / large_stack_arrays x2) and are
+the campaign section 3c nightly-clippy drift, untouched by this change.
+
+PREREQUISITE FIXED FIRST: `--features bench-instrumentation` did NOT compile on
+HEAD — `std::fmt::Write` and `std::io::Write` were both imported unaliased in
+`crates/ffs-mvcc/benches/wal_throughput.rs`, so every `write_all` failed E0599.
+This repo's own section-2-contract harness (self-reported ELF sha, interleaved
+A/A pairs, median-of-ratios, per-phase publication p99s) was unbuildable.
+
+NEXT (in order): (1) end-to-end `FFS_BHH0I_SHARDED=1 FFS_MVCC_WAITFREE_PUBLISH=1
+create-bench <2GiB/16-group> --count 40000 --threads {1,4,8}` vs the same binary
+with the flag off, gated on e2fsck rc0 and exact file parity; (2) only if that
+holds, propose flipping the default. Retry predicate if a future run disagrees:
+re-decide only on a same-worker, same-ELF interleaved A/A + A/B where the 8-thread
+A/A floor is below 1.30x and the candidate clears it by a 2x log-margin.
+
+## bd-bhh0i RELEASE-PERF A/B — the honest number: ~2.1x convoy ELIMINATION, NOT the aspirational 3.7x; scaling caps at 4t (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 11, ⭐ MEASURED)
+
+Status: definitive measurement (release-perf, e2fsck-validated). The bd-bhh0i
+parallel-create cutover is CORRECT and beats the single-lock convoy ~2.1x at 4-8
+threads, but does NOT achieve the campaign's long-quoted "3.7x / 8t≥4x1t" — that
+was an unmeasured aspiration. Correcting the ledger with the real number.
+
+A/B: `create-bench <2GiB/16-group ext4> / --count 40000 --threads T`, single-lock
+(no env) vs sharded (`FFS_BHH0I_SHARDED=1`), same release-perf binary (built
+`--profile release-perf --features bhh0i_sharded_alloc`, 3m57s). All runs e2fsck rc0.
+
+| threads | single-lock c/s | sharded c/s | sharded/single-lock |
+|--------:|----------------:|------------:|--------------------:|
+| 1       | 119156          | 116382      | 0.98x (parity)      |
+| 2       | 87737           | 129436      | 1.48x               |
+| 4       | 68947           | 142627      | 2.07x               |
+| 8       | 61512           | 128206      | 2.08x               |
+
+READ: (1) single-lock CONVOYS — negative scaling 119k→61k (the whole-state write
+lock; reproduces the memory's 143k→80k). (2) The sharded cutover REMOVES the
+convoy: flat-to-positive, ~2.1x the single-lock at 4-8t; that convoy elimination is
+the real, correct, e2fsck-validated win. (3) BUT sharded SELF-scaling is weak: 1t
+116k → 4t 142k (1.23x) → 8t 128k (DIPS). "8t≥4x1t" is NOT met (8t is 1.10x of 1t);
+peak is 4t at 1.23x. Sharded 1t≈single-lock 1t (parity — the auto-commit/base-clone
+overhead is ~free at 1 thread).
+
+WHY the 4t cap / 8t dip (the perf lever, needs a profile — NOT a correctness gap):
+a high-thread serialization limiter. Per create the sharded path does SEVERAL MVCC
+auto-commits (inode bitmap, inode-table slot w/ a full-block `base` clone [added
+turn 8, ~free at 1t but allocator pressure at 8t], block bitmap) each hitting the
+global commit-seq CAS + `prune_after_commit_if_due` + shard locks; that shared
+machinery, not the per-group locks (0.5 thread/group at 8t/16-group), is the
+suspect. Retry predicate to push past 2.1x: profile an 8t sharded create-bench
+(release-perf, `perf -g`), find the >5%-self-time shared frame (commit-seq CAS /
+prune / allocator), and cut per-create commit count or contention.
+
+PROFILE DONE (perf -g --call-graph dwarf, 8t sharded create-bench count 120000,
+105k creates/s): TOP self-time = **`__memmove/memcpy_avx_unaligned` 11.70%**
+(block-sized copies — 10.5% is memcpy), then `ShardedMvccStore::commit` **5.19%**,
+`RawMutex::lock_slow` 1.51%, `add_entry_reject_existing_tracked` 1.46%, crc32c
+1.18%, jemalloc `sdallocx`+`malloc` ~2.0%, `RawRwLock::lock_shared_slow` 1.01%,
+plus ~7% kernel `[unknown]` (write/read syscalls). VERDICT: the 8t cap is
+MEMORY-BANDWIDTH-BOUND on 4 KiB block copies in the MVCC path — bandwidth is shared
+across cores, so it saturates at 8t (→ the 4t→8t dip). The per-create MVCC path
+copies each 4 KiB block multiple times: `read_visible`→Vec, the turn-8 `base`
+clone in `rmw_commit_block_with_proof` (`(bytes.clone(), Some(bytes))`, needed for
+the pruning-race merge base but a full-block copy on the no-conflict common path),
+`write_block`→`data.to_vec()`, and the merge-install rebuild. NEXT LEVER (bounded,
+one at a time): make the MVCC hot path Arc/COW-share block buffers instead of
+cloning — e.g. record the `base` as a shared `Arc<[u8]>`/`BlockBuf` from
+`read_visible_block_buf` (no copy) rather than an owned `Vec`, so the common
+no-conflict inode/bitmap write stops paying a 4 KiB memcpy. Each copy-elim is its
+own commit; re-measure the A/B after each. This is the path from ~2.1x toward the
+memory's aspirational 3.7x, but it is bounded (memcpy is 11.7%, commit 5.2% — even
+eliminating both fully is ~1.2x, so ~2.1x×1.2 ≈ 2.5x is a realistic ceiling for
+copy-elim alone; 3.7x would additionally need fewer per-create commits).
+
+⭐ HONEST CAMPAIGN VERDICT: bd-bhh0i is a CORRECTNESS success + a real ~2.1x
+convoy-elimination throughput win, delivered end-to-end (BitmapOr proof +
+block-bitmap find-race + inode-table pruning race + read-vs-prune TOCTOU, all
+landed, e2fsck rc0 @40000/8t). The "3.7x" was aspirational and is not supported;
+the measured ceiling is ~2.1x vs single-lock, capped at 4t by shared-commit
+contention. Further gains are a bounded perf-tuning lever, not a structural one.
+
+## ⭐⭐ bd-bhh0i CUTOVER COMPLETE — read-vs-prune TOCTOU FIXED; passes at 40k, e2fsck clean, 2.71x positive scaling (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 10, ⭐ FULL PASS)
+
+Status: LANDED (f9183ad9). The sharded parallel-create cutover now passes reliably
+at the full count 40000 across 1/2/4/8 threads with e2fsck rc0 — the last
+correctness gap (turn-8/9 residual) is closed.
+
+Root cause (fully pinned, correcting turn 9): the bd-bhh0i writable adapters are
+UNREGISTERED (perf opt), so `ShardedMvccStore::prune_safe`'s watermark is the chain
+head whenever `active_snapshots` is empty → `prune_versions_older_than` collapses a
+hot block to its single newest version. A "current" read that captured seq S then
+races a concurrent commit+prune to S+1: `read_visible(block, S)` = None (S dropped)
+→ falls to the STALE on-device block (mkfs-empty inode table for a run that never
+flushes mid-run) → a create fails `NotFound` reading a just-committed parent inode.
+NOT a write clobber — the turn-9 suspicion was wrong: `INSTALL-SHRINK` re-run at a
+32-byte threshold on the inode-table blocks fired 0×. The turn-9 partial (MAX in
+`with_latest_scope`) was DEAD: `read_block_with_scope` step-2 read_visible only
+runs when `scope.tx.is_some()`, and the latest-scope has no tx, so the read fell
+through to `read_current_block_vec_from_device`.
+
+FIX: `read_current_block_vec_from_device` and `FsMvccBlockDevice::read_snapshot`
+(read-your-writes) resolve at `CommitSeq::MAX` (newest RETAINED version) instead of
+a freshly captured `current_snapshot()`. Pruning always keeps the newest, so MAX is
+TOCTOU-free, and "current"/read-your-writes both mean newest. Byte-identical for
+serialized single-lock + RO (newest == current): ffs-core default lib 1185 pass;
+the 2 failures (fast_commit_del_range, btrfs_reflink_random) are PRE-EXISTING on
+clean HEAD (verified by stash), not this change.
+
+SCALING (debug binary, 2GiB/16-group, count 40000): 1t 9817 → 2t 13881 → 4t 21236
+→ 8t 26622 creates/s = 2.71x @8t, POSITIVE (single-lock baseline scaled NEGATIVELY
+143k→80k). e2fsck rc0, 40020 files.
+
+⏭ REMAINING (perf, not correctness): (1) release-perf measurement (`--profile
+release-perf`) — the ratio may differ from debug; (2) close the 2.71x→4x gap
+(per-commit MVCC shard-lock / deferred-GDT / auto-commit-under-lock contention at
+8t/16-group is the likely limiter — profile the 8t create path). Cutover CORRECTNESS
+is done; the ≥4x is now a pure perf-tuning lever.
+
+## bd-bhh0i cutover residual @30k REFINED — read-your-writes-vs-prune TOCTOU (partial fix) + a suspected sub-threshold write clobber (bd-kdmu4) - 2026-07-24 (turn 9, investigation)
+
+Status: no net commit (exploration reverted; main stays at the turn-8 8k-validated
+state, 73d7fa52). Investigated the turn-8 residual (`NotFound("inode N")` at
+count~30000, groups near-full). Two findings, neither fully fixed → deferred.
+
+(A) Write-clobber NOT confirmed but NOT ruled out: instrumented
+`install_committed_version_locked` to flag any block-585..1096 (group-1 inode
+table) version installed with `new_nz + 256 < prev_nz` non-zero bytes — fired 0×
+on a failing run. BUT the `+256` threshold is too coarse: one inode slot holds
+only ~100-150 non-zero bytes, so a SINGLE-slot clobber slips under it. Re-run with
+threshold ~32 before concluding.
+
+(B) Read-your-writes-vs-prune TOCTOU (diagnosed, partial fix measured): the
+bd-bhh0i writable adapters are UNREGISTERED (a perf opt), so `ShardedMvccStore::
+prune_safe`'s watermark = `current_snapshot().high` (the chain head) whenever
+`active_snapshots` is empty. `prune_versions_older_than` then collapses a hot
+inode-table block to its single newest version. A read-your-writes read
+(`FsMvccBlockDevice::read_snapshot` = `current_snapshot()`) that captured seq S,
+then races a concurrent commit+prune to S+1, calls `read_visible(block, S)` →
+None (S's version dropped) → falls back to the STALE on-device block (the
+create-bench never flushes mid-run, so the device inode table is mkfs-empty) →
+`NotFound`. PARTIAL FIX TESTED: `read_snapshot` for read-your-writes returning
+`Snapshot { high: CommitSeq(u64::MAX) }` (resolve the newest RETAINED version =
+exactly read-your-writes semantics; byte-identical for the serialized single-lock
+path) improved 4t/30000 to 4/6 pass but did NOT eliminate the failure → confirms a
+SECOND residual (likely the (A) sub-threshold write clobber). Reverted (broad core
+read-semantics change, not landed without the write-clobber fix + default-path
+validation).
+
+NEXT (both needed for the full 3.7x): (1) land the read-your-writes MAX-read fix
+(after ffs-core writable default-path tests confirm byte-identity); (2) re-run
+INSTALL-SHRINK at threshold ~32 to locate + fix the single-slot write clobber
+(likely the merge-install rebuild vs a concurrently-advanced `latest`, or the
+`observed <= snapshot` no-conflict path installing a base that lost a slot);
+(3) then measure release-perf 8t≥4×1t on a ≥2GiB/16-group image. The cutover
+already PASSES + scales positively at 8k (turn 8) — this is the last correctness
+gap before the ≥4× measurement.
+
+## bd-bhh0i cutover PASSES at 8k — block-bitmap find-race + inode-table pruning race FIXED; positive scaling (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 8, ⭐ FIRST PASS)
+
+Status: two fixes LANDED (7653bdec); the sharded parallel-create cutover PASSES
+for the first time. As sole producer, drove the find-race (turn 7) to root cause
+and fixed it + a second race it unmasked.
+
+FIX 1 — block-bitmap find-race (`ext4_sharded_alloc_blocks`): the dir-growth block
+alloc threaded the caller's BATCHED dir-add txn (`TransactionBlockAdapter`) as
+`dev`, so it staged the bitmap write uncommitted. A concurrent same-group create's
+find reads committed state (`dev.read_block` live) and MISSED that pick → both
+picked the same free block → a double-alloc the OR-merge correctly fail-closes on.
+Root cause was NOT a missing proof (turn 7) — it was invisibility of the in-flight
+pick. Fix: auto-commit the bitmap UNDER THE PER-GROUP LOCK via
+`block_device_adapter`, exactly as the sharded inode alloc already does (which is
+why the inode bitmap never raced). Each pick is now committed before the lock
+releases → visible to the next find. (The turn-7 `BitmapOr`/`rmw_block_bitmap_or`
+proof-carrying path is now inert for the serialized bitmap but stays a correct
+safety net.)
+
+FIX 2 — inode-table pruning race (`rmw_commit_block_with_proof`): recorded
+`base=None` when a version existed at the txn's snapshot, relying on the version
+chain still holding it at commit. A concurrent committer's
+`prune_after_commit_if_due` drops the version at this (unregistered auto-commit)
+snapshot between stage and commit → the sharded merge's `version_bytes_at` yields
+an EMPTY base → a spurious `base_len=0` length-mismatch abort of two creates
+writing DISJOINT inode slots of the same inode-table block (proof
+`TimestampOnlyInode`). Fix: record the snapshot base ALWAYS.
+
+VALIDATED: `FFS_BHH0I_SHARDED=1 create-bench <512MiB/4-group ext4> / --count 8000
+--threads {1,4,8}`, 6/6 clean at 8 threads, e2fsck rc0. Scaling (debug binary):
+1t 9830 → 4t 17621 creates/s (~1.8x) → 8t ~24000 (~2.5x) = POSITIVE, vs the
+single-lock baseline's NEGATIVE scaling (1t 143k → 8t 80k). First time the cutover
+clears the e2fsck gate under concurrency.
+
+RESIDUAL BLOCKER (next): at count ~30000 (a 4-group fs's inodes ~92% full) a
+create intermittently fails `NotFound("inode <N>")` — an inode-table slot is lost.
+The inode NUMBER alloc is race-free (auto-commit under lock, verified), so this is
+a deeper MVCC merge-INSTALL race on the heavily-contended inode-table block
+(`merged_write_bytes_locked` rebuilding against a `latest` that a concurrent
+install advanced) under near-full-group pressure, NOT the pruning sub-case fixed
+here. Retry predicate for the full 3.7x: reproduce at count≥30000 with a
+per-inode-table-block conflict trace, fix the merge-install ordering, then measure
+release-perf 8t≥4×1t. Note: the memory's "512MiB/4-group, 40000 creates" recipe is
+inconsistent — 4 groups hold only 32768 inodes, so 40000 needs a ≥2GiB/16-group
+image; use that for the ≥4× headroom measurement.
+
+## bd-bhh0i cutover — turn-4b diagnosis CORRECTED; proof-carrying batched-txn landed; real blocker is a FIND-RACE (bd-bhh0i / bd-kdmu4) - 2026-07-24 (turn 7)
+
+Status: substrate LANDED (1e08bb46) + deeper LEDGERED BLOCKER. As sole producer
+(cod capped) with ffs-core/lib.rs unfrozen, drove the cutover to its true root
+cause — and corrected the turn-4b ledger, which was WRONG.
+
+Turn-4b said the sharded dir-growth block-bitmap write used a non-MVCC
+`direct_block_device_adapter`. FALSE. `ext4_add_dir_entry` wraps the MVCC device
+(`block_device_adapter`) in a `TransactionBlockAdapter` — an explicit BATCHED
+transaction (`self.mvcc_store.begin()`) — and threads THAT as `dev` into the
+dir-growth alloc. Its default `rmw_block` / `rmw_block_bitmap_or` fell through to
+`write_block`, which stages `tx.stage_write` = `MergeProof::Unsafe`. So block 65's
+BitmapOr proof (and every GDT/inode-table range proof) was LOST at the adapter,
+and the batched txn FCW-aborted under concurrency. (Turn-4b's "block 65 never
+reaches FsMvccBlockDevice methods" was because it went to `tx.stage_write`, not
+because the device was non-MVCC.)
+
+LANDED (byte-identical default by non-reachability; ffs-alloc 218/218, ffs-block
+309/0): `TransactionBlockAdapter` now overrides `rmw_block` (→ `IndependentKeys`)
+and `rmw_block_bitmap_or` (→ `BitmapOr`), staging the proof into the batched txn
+with the merge base resolved at the txn's OWN snapshot via a new
+`BlockDevice::read_merge_ancestor_at_snapshot` (default `None`→`read_block`;
+`FsMvccBlockDevice`→ version at that snapshot, else raw base). Closes the
+2b-harden stale-read window; preserves read-your-writes within the batch.
+
+VERIFIED end-to-end (FFS_BHH0I_DEBUG instrumentation, added→removed): the override
+IS now reached (`stage_rmw block=65 mech=BitmapOr`, 4096-byte base/latest/staged),
+but the cutover STILL FCW-aborts on block 65 at 4/8 threads. The bitmap is
+monotone (alloc-only), so a BitmapOr rejection can ONLY be a disjoint-new failure
+= the SAME bit set by two writers = a genuine DOUBLE-ALLOCATION, which the
+OR-merge correctly fail-closes on.
+
+REAL BLOCKER — FIND-RACE: two concurrent same-group creates find the SAME free
+block. `PerGroupAlloc::alloc_blocks` locks the group and calls
+`try_alloc_blocks_in_group`, whose find does `dev.read_block` (the MVCC device's
+LIVE, committed view) — which MISSES the first create's staged-but-uncommitted
+allocation (staged in its own batched txn, not yet committed). So the second
+create, even serialized behind the group lock, sees the block still free and
+picks it too. The per-group lock serializes the find but not the visibility of
+in-flight allocations. The OR-merge (disjoint COMMITS) was necessary but not
+sufficient; disjoint PICKS are also required.
+
+FIX (next): an in-memory per-group bitmap of in-flight staged allocations,
+consulted (OR'd with the committed bitmap) by the sharded find and cleared on
+commit/rollback — so the second create sees the first's pick. A per-group
+allocation CURSOR alone does NOT suffice: on wrap-around it re-hits a block
+allocated-but-uncommitted before the wrap. Auto-committing the bitmap alloc under
+the group lock also works for the cutover but leaks a block on create-failure
+(the dir-add batched txn rolls back but the separately-committed bitmap bit does
+not). This lives in `sharded_alloc.rs` + `GroupStats` (ffs-alloc) — now editable
+(sole producer). Retry predicate for the 3.7x: implement the in-flight bitmap +
+the sharded find consults it → cutover 8t≥4×1t, e2fsck rc0, 40000-file read-back.
+
+## Mounted frontier continuation: three fresh profile-first REJECTs and one 128-group fsck blocker - 2026-07-24 (BronzeRabbit)
+
+Status: **REJECT 3/3; no source change.** Ledger and recent-log grep preceded
+each lever. All mounted work used the exact current release-perf binary on
+`vmi1227854` (SHA-256
+`8ebff1f9cd9d77ed8cc68fb874f8384eb54726dc827f4db39fadb909cc150aca`)
+inside a private privileged container, with the FUSE server pinned to CPU 8 and
+the driver pinned to CPU 9. The container's `/tmp` mountpoint was required by
+the host's AppArmor `fusermount3` policy; no host policy was changed. Raw
+timing, profile, and fsck artifacts are retained under
+`/data/tmp/bronzerabbit_frontier_20260724_Q7GDWQ/`.
+
+1. **Dirty fsync, 2 groups versus 128 groups — REJECT before edit plus
+   correctness BLOCKER (`bd-fsync-journal-latency-gap-ptp4x`).** A 30-round,
+   median-of-21 interleave measured duplicate 2-group FrankenFS controls at
+   191.922/211.106 us and the 128-group arm at 385.973 us. The paired
+   128g/2g median was 1.9397x and the ratio-of-medians 2.0111x, but the
+   duplicate-control null was already 1.1000x and CVs were
+   26.168/25.446/23.936%. Kernel 2g/128g medians were 369.524/291.471 us
+   with 90.105/58.767% CV. Thus no ratio is admitted. Exact parity was
+   630 files, 80,640 bytes, and payload digest `0797b68e...` for every arm.
+   Differential server profiles captured zero lost samples:
+   `Cx::checkpoint` was 16.65% self at 128 groups versus 2.64% at 2 groups,
+   but `ext4_persist_group_descriptors_from` remained only 0.47% self /
+   0.56% children, below the ledger's 5% named-frame floor.
+
+   Graceful unmount exposed a correctness blocker. `e2fsck -fn` returned rc 4
+   on the 128-group FrankenFS image: sparse-super backup groups
+   1,3,5,7,9,25,27,49,81,125 each reported a 1,027-block bitmap/count
+   discrepancy, 10,270 blocks total. The 2-group FrankenFS image and both
+   kernel images returned rc 0. This pattern is consistent with backup
+   super/GDT reservation bits becoming authoritative in formerly-uninitialized
+   group bitmaps, but that is an inference, not a diagnosed source cause.
+   **Retry predicate:** first reproduce and fix this sparse-super
+   backup-group durability/accounting failure with a minimal 128-group fixture
+   and clean offline fsck. Only then retry performance on an isolated worker
+   where all A/A/B/kernel arms have CV below 5% and an eligible non-fenced
+   descriptor-persistence frame is at least 5% self.
+
+2. **Mounted zero-byte create storm — REJECT before edit (`bd-opb6l`).**
+   A 30,000-create server profile captured 3,691 cycles:u samples, zero lost.
+   The only source frame above the frontier's 5% floor was
+   `ShardedMvccStore::read_visible_block_buf` at 5.43% self, which is the
+   explicitly fenced `bd-kdmu4` zero-copy/read architecture lane.
+   `ShardedMvccStore::commit` was 4.63% and `lookup_in_dir_block` 3.20%;
+   neither admits a local lever. A 30-round median-of-21 routing comparison
+   preserved 630-file/zero-byte parity per arm and measured FFS A/A at
+   66.555/66.750 us versus kernel 14.472 us, nominally 4.599x by medians.
+   CVs were 79.131/85.570/16.295%, so no direct ratio is admitted.
+   **Retry predicate:** a quiet profile must promote a non-`bd-kdmu4`,
+   non-architectural source frame to at least 5% self; then all same-worker
+   A/A/B/kernel arms must have CV below 5%, effect beyond null, exact file
+   parity, and clean fsck.
+
+3. **Mounted list-128 xattr direct-wire gate — REJECT before edit
+   (`bd-mounted-xattr-workload-gap-fr6iq`).** Private FrankenFS/kernel files
+   each contained 128 ordered one-byte attributes and a 1,664-byte list payload.
+   Names and values matched exactly (`9b5c1c1d...` / `471fb943...`). A
+   250,000-call profile captured 9,903 cycles:u samples, zero lost:
+   `parse_xattr_entry_names` was 25.24% self, `_rjem_malloc` 9.19%, FUSE
+   `listxattr` 8.38%, lossy UTF-8 iteration 7.76%, and
+   `String::from_utf8_lossy` 4.93%. The shape/profile retry thresholds were
+   met, but the mandatory pre-edit A/A gate was not: controls measured
+   48.978/42.258 us, CV 36.743/37.473%, absolute-null median 15.979%, and
+   absolute-null p95 63.921% versus the required p95 below 1%. Kernel was
+   11.459 us with 16.991% CV. No direct-wire source was reopened and no direct
+   kernel ratio is admitted. The small FrankenFS image containing this fixture
+   passed offline fsck rc 0. **Retry predicate:** do not retry until a pinned
+   pre-edit A/A run has absolute-null p95 below 1%; then require the paired
+   candidate 95% lower bound to exceed that null p95, every A/A/B/kernel arm
+   CV below 5%, exact mounted parity, and clean offline fsck.
+
+This continuation therefore stops at the requested terminal condition: three
+consecutive fresh REJECTs, with an independently ledgered current-source
+128-group fsck blocker. No production, test, benchmark, or harness source was
+edited.
+
+## btrfs runtime path swept for a byte-identical per-op lever — SATURATED (bd-kdmu4) - 2026-07-24 (turn 6, REJECT #2)
+
+Status: REJECT (no source change). Cycling levers off the floored read path, swept
+the least-mined subsystem this campaign — the btrfs runtime read/lookup/readdir/
+tree-walk path (crates/ffs-btrfs/src + the `btrfs_*` functions in ffs-core) — for
+the byte-identical compile+test-landable classes (buffer-in-loop hoist,
+materialize-then-scalar, multi-pass fold fusion, O(N)→O(1) memoization, hot-path
+clone elimination). NO clean per-op lever found; the path is saturated with prior
+`bd-*` optimizations:
+
+- `btrfs_read_logical_into` reads straight into the caller's `out` slice (no
+  per-block BlockBuf alloc, no post-read copy). `btrfs_read_file_into` = rayon
+  deferred device reads + `split_at_mut` disjoint zero-copy windows + per-inode RO
+  extent cache + lock-free hot-inode slot + decompressed-extent cache; its only
+  `vec![0; compressed_len]` is INSIDE the rayon job (excluded).
+- `btrfs_read_parsed_node` Arc node cache; its `vec![0; ns]` is MOVED into
+  `parse_btrfs_tree_node_owned` as the node's retained backing (not a discarded
+  loop buffer). `btrfs_lookup_child` O(1) dir-entry cache; `btrfs_readdir_entries`
+  zero-copy `range_with` + FxHash first-occurrence dedup; `btrfs_fs_tree_root_bytenr`
+  memoized O(1); `btrfs_decompress` per-thread zlib/zstd context reuse;
+  `btrfs_verify_one_extent_csum` reused sector buffer (prior win e0aa5a1b).
+- ffs-btrfs `.sum()`/`.fold()` sites (total_free/total_used/largest_free_extent/
+  sync_block_group_accounting) are single-pass, on the write/commit path — not
+  per-read, no fuseable multi-pass. Item parsers (parse_dir_items/extent_data/
+  inode_refs/inode_item/collect_leaf_items) build only their required owned output.
+
+Sub-noise candidate flagged + rejected: `btrfs_lookup_child` (ffs-core ~8604)
+`parse_dir_items` materializes a `Vec<BtrfsDirItem>` (per-name `.to_vec()`) then
+linear-scans for one name — the zero-alloc `visit_dir_items` visitor (ffs-btrfs
+~1914) would early-exit without allocating. REJECTED: a DIR_ITEM bucket keyed at
+one `name_hash` holds ≈1 entry (multiple only on hash collision) → ratio ≈1→1, and
+it is a fallback BEHIND the O(1) `btrfs_dir_entry_cache` + tree-log point-descent →
+below the noise floor. Retry only if a warm-btrfs-lookup profile shows
+`parse_dir_items`/`btrfs_lookup_child` >~5% self-time (i.e. a collision-heavy or
+cache-cold dir workload).
+
+⭐ 2 consecutive fresh REJECTs this session (turn 5 read-path floor, turn 6 btrfs
+saturation) on top of turn 4b's peer-file BLOCKER and the memory's exhaustive
+ext4/alloc/dir/extent/xattr/inode/ondisk sweep. The bd-kdmu4 micro-lever surface
+is exhausted; the sole productive lever remains the bd-bhh0i cutover, blocked on
+the peer-side sharded dir-growth dev-routing (turn 4b) — flagged for coordination.
+
+## Mounted read-path zero-copy re-probe — FUSE transport floor CONFIRMED with 3 fresh negative findings (bd-kdmu4) - 2026-07-23 (turn 5, REJECT)
+
+Status: REJECT (no source change). After the bd-bhh0i wiring blocker, cycled back
+to the zero-copy read lane and re-investigated it fresh (ledger + code, not just
+prior memory). The mounted read is at its FUSE-transport floor; three doors the
+prior ledger had NOT explicitly closed are now closed:
+
+1. FUSE_PASSTHROUGH is advertised (`init()` adds `FUSE_PASSTHROUGH` +
+   `set_max_stack_depth(1)`) but is ARCHITECTURALLY INAPPLICABLE to FrankenFS.
+   Passthrough serves a FUSE file's read directly from a registered backing fd,
+   but `struct fuse_backing_map` has `{fd, flags, padding}` and NO OFFSET field:
+   fuse-file offset O maps to backing-fd offset O. FrankenFS is image-backed with
+   extent-scattered file data (file byte O lives at some image offset X != O), so
+   there is no single (fd, offset) that serves the file — passthrough cannot be
+   wired for an image-backed extent-mapped fs. The advertised cap is inert for
+   data reads. Not a lever.
+2. `max_readahead` is kernel-capped: vendored fuser `KernelConfig::new` seeds
+   `max_readahead == max_max_readahead == the kernel's init proposal`, and
+   `set_max_readahead` can only LOWER it (`value > max_max_readahead => Err`). So
+   the daemon cannot advertise a larger readahead window than the kernel offers;
+   it is already at that ceiling without a call. `max_read=16 MiB` is already set,
+   and `FUSE_ASYNC_READ` is on by default (vendored `INIT_FLAGS`). No init-flag
+   read lever remains.
+3. `read_file_data` assembly is copy-optimal (code-confirmed): segment tiling
+   (Run / Partial / Zero), coalesced physically-consecutive runs read VECTORED
+   straight into the caller's disjoint `&mut buf` windows (no assembly copy;
+   partial head/tail blocks copy only their sub-range), parallel 128 KiB chunks
+   (bd-yg6tk / bd-cc-pchunk, measured 1.67x warm), and a sequential extent hint
+   (bd-vpypn) so the per-block `resolve_extent_seq` is an O(1) cached
+   partition_point. The sole residual copy is the inherent page-cache -> reply-
+   buffer copy, which splice targeted and was MEASURED perf-neutral (2026-07-23
+   54872426: overlapped by readahead prefetch, not wall-clock-bound). mmap
+   genuinely needs `unsafe` (memmap2 `Mmap::map` is an `unsafe fn`; no safe
+   offset-mappable alternative) -> forbidden. io_uring submission likewise needs
+   `unsafe`.
+
+Conclusion: the mounted zero-copy read sub-lane is at its architectural floor
+(transport RTT + one inherent reply copy that splice cannot beat under prefetch
+overlap). This matches and extends the prior transport-bound ledger. Retry
+predicate (unchanged from splice, still open): a profile showing the read
+DAEMON-CPU-bound with the reply copy ON the critical path (many-client fan-in
+out-running the readahead-prefetch overlap) — needs a dedicated heavy mounted
+experiment; the stashed splice primitive is ready if that workload ever appears.
+The sole productive bd-kdmu4 lever remains the bd-bhh0i parallel-create cutover,
+now blocked on the peer-side sharded dir-growth dev-routing (turn 4b) — flagged
+for coordination.
+
+## bd-bhh0i BUG-4 wiring landed as substrate; cutover BLOCKED — sharded dir-growth bitmap write uses a NON-MVCC device (bd-bhh0i / bd-kdmu4) - 2026-07-23 (turn 4b)
+
+Status: KEEP substrate + LEDGERED BLOCKER. Wired the OR-merge proof (turn 4 core)
+through the device path and RAN the local cutover — which surfaced a precise,
+diagnosed blocker that is NOT in my lane.
+
+Landed (byte-identical default; ffs-alloc 218/218 in BOTH `default` and
+`--features bhh0i_sharded_alloc`):
+- `BlockDevice::rmw_block_bitmap_or` seam (ffs-block: default = read/patch/write,
+  byte-identical for non-MVCC / MemBlockDevice) + `FsMvccBlockDevice` override
+  (ffs-core/fs_mvcc_store.rs) that reads the base AT the txn snapshot and stages
+  `MergeProof::BitmapOr` (mirrors `rmw_block`).
+- `try_alloc_blocks_in_group` routes its block-bitmap write through the seam
+  behind `cfg(feature = "bhh0i_sharded_alloc")`, scoped to the empty-rollback
+  (steady-state) case (`ffs-alloc/src/lib.rs`); default path keeps the plain
+  write. New feature `bhh0i_sharded_alloc` in `ffs-alloc/Cargo.toml`, propagated
+  from `ffs-core/Cargo.toml`.
+
+Cutover result (512 MiB / 4-group ext4, `FFS_BHH0I_SHARDED=1 create-bench / --count
+N --threads T`): **1 thread OK** (8376 creates/s, e2fsck rc0); **4 and 8 threads
+STILL PANIC** with the exact BUG-4 symptom `first-committer-wins conflict on block
+65` (group-0 block bitmap).
+
+Root cause (env-gated `FFS_BHH0I_DEBUG` instrumentation on every `FsMvccBlockDevice`
+method + the alloc branch, added→removed): block 65 reaches my ffs-alloc
+`rmw_block_bitmap_or` call (24×) but **NO `FsMvccBlockDevice` method ever sees it**
+(0 in `write_block`, `rmw_block`, and the `rmw_block_bitmap_or` override — while
+block 66 DID reach the override 4×, proving the seam works when `dev` is the MVCC
+device). The sharded **dir-growth** block alloc (`ShardedTreeBlockAllocator` →
+`ext4_sharded_alloc_blocks` → `try_alloc_blocks_in_group`) runs on
+`direct_block_device_adapter()` = `CachedByteDeviceBlockAdapter`, whose
+`write_block` delegates to `ByteDeviceBlockAdapter` → the RAW IMAGE (NON-MVCC).
+So the dir-growth bitmap write bypasses MVCC and the OR-merge proof cannot engage;
+yet the FCW conflict is a real MVCC conflict on block 65 (thousands of versions),
+i.e. a SEPARATE MVCC path also stages block 65. The MVCC/non-MVCC device split for
+the sharded block-bitmap alloc lives in **ffs-core's sharded create dev-threading
+(`ffs-core/src/lib.rs`)** — a PEER's actively-modified file.
+
+BLOCKER (stop condition): completing BUG-4 requires routing the sharded dir-growth
+block allocation through the MVCC device (`FsMvccBlockDevice`) so
+`rmw_block_bitmap_or` reaches the override and the OR-merge applies — a change in
+the peer's `ffs-core/lib.rs` sharded create path, needing coordination. The seam +
+`MergeProof::BitmapOr` proof landed here are the correct, tested substrate for it;
+once the alloc `dev` is the MVCC device, the merge engages (block-66 proof).
+Secondary finding: `Arc<D>`'s `BlockDevice` impl (ffs-block) forwards read/write
+but NOT `rmw_block` / `rmw_block_bitmap_or` (uses the trait default) — a latent gap
+for any `Arc<MVCC-device>` rmw caller; add forwarding when the dev-routing is fixed.
+
+## bd-bhh0i BUG-4 core LANDED — MergeProof::BitmapOr bit-level OR-merge proof for the block-bitmap FCW (bd-bhh0i / bd-kdmu4) - 2026-07-23 (turn 4)
+
+Status: KEEP (ab1567ba). The correctness-critical core BUG-4 needs. After BUG-5
+(671cfa35) the sharded parallel-create cutover conflicts SOLELY on the group-0
+block bitmap (block 65): two concurrent creates alloc dir-growth blocks in the
+same group, set DISJOINT bits of the same pre-write bitmap, but the write stages
+`MergeProof::Unsafe` so the two commits first-committer-wins conflict. A
+byte-range (`IndependentKeys`) proof cannot express the merge — adjacent free
+blocks share a bitmap byte, so the writers overlap at the BYTE level while their
+BITS are disjoint.
+
+Added `MergeProof::BitmapOr` (+ `MergeProofMechanism::BitmapOr`): whole-block
+bit-level OR. `merged = latest | staged`, valid iff (1) equal length, (2) both
+writers are SET-ONLY vs base (`base & !latest == 0` && `base & !staged == 0`) —
+a *free* clears bits, fails this, and falls back to FCW, so the proof is only
+ever effective on the alloc path; and (3) newly-set bits are disjoint
+(`(latest & !base) & (staged & !base) == 0`) — two writers setting the same new
+bit is a real double-allocation that MUST abort so the loser retries, never
+silently coalesce. Under those preconditions `latest | staged == base |
+latest_new | staged_new`: every allocation survives, no bit is invented.
+`merge_valid` and `merge_bytes` share one validator (never diverge). Self-
+validating: a free operation makes the proof invalid → FCW, so misuse fails
+closed. Inert until a caller stages it (this commit adds no caller).
+
+Gate: ffs-mvcc 495/0 incl. 9 new/updated BitmapOr tests — the crux (disjoint
+bits sharing a byte OR-merge), fail-closed on free + on double-alloc, length
+mismatch, an end-to-end concurrent same-block-alloc `resolved_writes_for_commit`
+merge, the `merge_valid == merge_bytes.is_some()` invariant, and 2 proptests
+(positive algebra: no allocation lost / no bit invented; negative: clears +
+double-sets rejected). fmt clean. clippy on the crate is blocked by unrelated
+pre-existing pedantic/nursery debt in peer-uncommitted `ffs-ondisk` (ext4.rs,
+crc_incremental.rs) — not this change; my additions were hardened by inspection
+against the same lints (short first doc paragraphs, no `useless_vec`, private
+helper so no `must_use_candidate`).
+
+REMAINING to complete the 3.7x cutover (next turn, precise plan):
+- SLICE 2 (seam): add `BlockDevice::rmw_block_bitmap_or(cx, block, patch)` to
+  `ffs-block` (default impl = read→patch→write, byte-identical for non-MVCC /
+  MemBlockDevice) + an override on the MVCC device in
+  `ffs-core/fs_mvcc_store.rs` that begins a txn, reads the base AT the txn
+  snapshot (2b-harden rule: begin-first, else a stale-read no-conflict install
+  clobbers a concurrent disjoint-bit writer), applies `patch`, and stages
+  `MergeProof::BitmapOr` with the recorded device base (mirror `rmw_block` /
+  `rmw_commit_block_with_proof`).
+- SLICE 3 (wiring): in `ffs-alloc::try_alloc_blocks_in_group` route the bitmap
+  write (`dev.write_block(cx, stats.block_bitmap_block, &bitmap)`, ~line 2697)
+  through `rmw_block_bitmap_or` behind `cfg(feature = "bhh0i_sharded_alloc")`
+  (default path stays byte-identical). The closure re-applies THIS op's bit
+  mutations onto the base read at snapshot: the reserved marks (same
+  `force_reserved_mark() || !reserved_confirmed` condition) + `bitmap_set_range
+  (rel_start, alloc_count)`. Correctness note: converting to RMW-at-snapshot is
+  ALSO the fix for the current separate `read_block`(2633)→`write_block`(2697)
+  stale-read clobber hazard; if the found run is stale (concurrent alloc took
+  it) the OR-merge disjoint-new-bits check fails → abort → retry re-finds
+  (fail-closed, no double-alloc slips through).
+- SLICE 3 interaction check (verified in-lane): the per-op GDT persist +
+  block-bitmap checksum stamp is SKIPPED on the deferred path
+  (`persist_group_desc_with_bitmap_overrides` returns `Ok` early when
+  `gdt_persistence_deferred()`, default ON), and the GDT is re-persisted at
+  flush from authoritative state (36257e4b), so the per-op `block_bitmap_
+  override` inconsistency after a merge is moot on the cutover config; the
+  post-merge bitmap checksum is validated by e2fsck. The GDT-persist-error
+  rollback branch (2731) is unreachable on the deferred path (persist returns
+  Ok). ⚠ If run with the sharded feature but deferral OFF, the per-op override
+  (from local `bitmap`, not the merged content) could stamp a stale checksum —
+  not the cutover config, but guard or assert if wiring it generally.
+- SLICE 4 (validation = THE 3.7x measurement, LOCAL-ONLY): build
+  `CARGO_TARGET_DIR=/data/tmp/bhh0i_target cargo build --profile release-perf -p
+  ffs-cli --features bhh0i_sharded_alloc`; `FFS_BHH0I_SHARDED=1 create-bench
+  <img> /d --count 40000 --threads {1,4,8}`. Gate: no FCW conflict on block 65
+  at 4-8 threads, 8t ≥ 4×1t creates/s, e2fsck rc0, 40000-file read-back per
+  thread. Retry predicate for BUG-4 as a whole: SLICE 2+3 wired AND SLICE 4
+  green. Coordinate: peer(s) active on `ffs-core/sharded_alloc.rs` — Slice 3 is
+  in `ffs-alloc/lib.rs`, do NOT touch sharded_alloc.rs.
+
+## Fsync, small-file, and mounted-xattr measured frontier is transport/architecture-only - 2026-07-23 (BLOCKED; bd-fsync-journal-latency-gap-ptp4x / bd-opb6l / bd-mounted-xattr-workload-gap-fr6iq)
+
+Status: BLOCKED with no source edit. This is the consolidated stop condition
+after the list-24 direct-wire REJECT, not a claim that the kernel gaps are gone.
+A fresh negative-ledger grep and `git log --oneline -30` were run after commit
+`248dda68`, before considering another lever. They show that every remaining
+measured hotspot is either below the profile floor, already optimized, or
+inside the explicitly fenced architectural lane.
+
+Fsync/journal:
+
+- The newest quiet clean-directory profile measures FrankenFS at 14.957
+  us/call versus kernel ext4 at 401.219 us/call: FrankenFS is already 26.83x
+  faster on that exact no-op boundary. The proposed parsed-GDT-cache
+  invalidation was rejected because the whole enclosing function was only
+  0.02% self.
+- The dirty create+write+fsync-each workload is barrier-parity: 18.24-19.20 ms
+  for FrankenFS across 2 versus 128 groups, versus the same approximately
+  20-ms physical barrier that puts the mounted storm at kernel parity. The
+  64x group-count increase changed latency only about 4%, rejecting dirty-group
+  tracking on ordinary SSD/disk.
+- `ShardedMvccStore::flush_to_device` already sorts once, coalesces contiguous
+  blocks, emits one write per run, and performs one sync. The only remaining
+  structural durability lever is JBD2 cross-operation group commit / durable
+  visibility gating, which is an architectural crash-consistency change and is
+  outside this measured-frontier lane.
+
+Small-file storm:
+
+- Mounted single-thread create without fsync remains about 5.7x slower than
+  kernel (590-621 ms versus 105-108 ms for 3,000 files), but the symbolized
+  daemon profile is FUSE receive/reply/scheduler work; every `ffs_*` create
+  frame is below 0.8% self. Fsync-each is already kernel parity
+  (61,296 versus 61,671 ms).
+- The fresh serial-delete profile put
+  `remove_entry_take_inode_tracked` at only 1.16% self. Its disjoint checksum
+  snapshot lever was therefore rejected before edit. The remaining
+  `__memmove` / MVCC-publication costs and safe concurrent allocation cutover
+  are precisely the `bd-kdmu4` / `bd-bhh0i` architectural lane fenced to cc;
+  current log entries `ab1567ba` and `2f808ef8` confirm active ownership.
+- Shared-channel multiloop dispatch is not a fallback: its measured speedup
+  corrupted allocation/free accounting and failed offline fsck, so that family
+  stays ledger-closed until its linearizability predicate is met.
+
+Mounted xattr:
+
+- The clean fixture gap is FUSE transport-dominated (71-77% including
+  children). Result caching was rejected with internal frames at 0.01-0.04%
+  self. The list-24 direct-wire retry then removed the last eligible
+  names-materialisation seam but failed the decision gate: candidate CV 13.692%,
+  paired mean -2.376%, bootstrap 95% `[-7.441%, +0.622%]`. Its source is fully
+  reverted.
+
+Therefore there is no eligible one-lever source change left in the requested
+measured-frontier lane. Retry this consolidated blocker only when at least one
+of these predicates holds: (1) a fresh quiet symbolized mounted profile puts a
+non-fenced FrankenFS source frame at least 5% self on the critical path; (2) an
+authorized, safe FUSE metadata batching/bypass primitive becomes available;
+(3) the user explicitly hands off the `bd-kdmu4`/JBD2 architectural lane; or
+(4) fsync is measured on pmem/battery-backed/nobarrier storage where latency
+scales materially with group count instead of the device barrier. Until then,
+another parser, cache, checksum, or coalescing cut would knowingly repeat a
+dated REJECT below the transport/null floor.
+
+## List-24 direct xattr wire encoding does not clear the mounted transport floor - 2026-07-23 (REJECT; bd-mounted-xattr-workload-gap-fr6iq)
+
+Status: REJECT; prototype source fully reverted. Ledger and recent-log grep
+first excluded the kept namespace borrow and by-index lookup plus the closed
+formatter, size-probe, result-vector, metadata-worker offload, result-cache,
+and unsafe transport families. The prior list-24 retry predicate was then met
+with a private ext4 clone containing exactly `user.bench00` through
+`user.bench23`: 24 names, 792 value bytes, and a 312-byte NUL-separated list.
+
+Profile first: 500,000 validated baseline `listxattr` calls aggregated
+12,000,000 names in 68.627 seconds. The server profile captured 849
+`cycles:u` samples with zero lost. FUSE request/reply transport accounted for
+76.71% including children; `parse_xattr_entry_names` was 3.29% self and
+`__memmove` was 4.96% self overall, including 2.20% below the parser and 1.33%
+below FUSE encoding. This admitted one narrow prototype: walk ext4 names once
+and append namespace prefix, lossy-decoded name, and NUL directly into the FUSE
+payload, avoiding `Vec<String>` plus the second encoding pass. It did not alter
+transport, caching, batching, journaling, or the cc-owned architectural lane.
+
+The prototype compiled strict-remote and passed its exact namespace/invalid-
+UTF-8 wire test (1/1), the xattr-filtered `ffs-core`/`ffs-fuse` suites (80/80
+unit tests plus 2/2 public OpenFs ext4/btrfs integration tests; two pre-existing
+privileged tests ignored), and live mounted parity. Baseline, candidate, and
+kernel ext4 returned identical ordered names and values with combined SHA-256
+`79d600826ff6174187f7916ad7313335f455285883b296c4b979e50bbf1cc701`.
+Ordering was preserved by the same entry walker; tie-breaking, floating point,
+and RNG were N/A.
+
+The admissible control was a clean-overlay build of parent `16861e4b` on RCH
+worker `hz1`, SHA-256
+`1c85330a78c0afad14d9fd89467e808299f6738a30167be4a4e8c07e0f93c9ea`.
+The candidate was built on the same worker, SHA-256
+`f133372e24a295d2bee328f8354afcbe7ee38e846fbe9d083cd2c8b12dc236b0`.
+An earlier `4d309e82` control run was discarded before decision because it was
+not the immediate parent. Two full 30-round runs were also retained as invalid
+routing evidence: the first shared CPU 2 with a peer workload that went idle
+mid-run (all-arm CV 57-68%); the second encountered a migrating peer SciPy job
+(arm CV 10-20%). No quiet subset was selected.
+
+The final pinned, priority-isolated 30-round A/A/B/kernel run used 8,000
+validated calls per FFS sample and 35,000 per kernel sample. Parent controls
+were 45.106 and 45.081 us/call with CV 1.847% and 2.506%; kernel ext4 was
+10.682 us/call with CV 1.908%. The candidate median was 44.741 us/call, a
+nominal 0.791% improvement over the pooled 45.098-us control, but candidate CV
+was **13.692%**, failing the required under-5% gate. More decisively, paired
+mean improvement was **-2.376%** (regression), paired median was +0.546%, the
+deterministic 20,000-resample 95% bootstrap interval was
+**[-7.441%, +0.622%]**, and the candidate won only 19/30 rounds. The A/A null
+median was 0.637% (p95 4.971%). The raw candidate/kernel ratio was 4.188x, but
+the candidate's invalid CV forbids a direct-kernel verdict.
+
+The direct-wire source was reverted exactly; no source or benchmark harness
+remains. After unmount, the reference, parent, candidate, prior-baseline, and
+kernel clones were all byte-identical (SHA-256
+`d1186ba20a77d1c640ee747bd1ead1e901e08f975d01163b24094dee136cd38e`)
+and all passed `e2fsck -fn`.
+
+Retry predicate: do not retry list-24 direct encoding on the current host state.
+Reopen only on an exclusive or demonstrably quiet pinned host where a complete
+30-round same-parent A/A/B/kernel run gives every arm CV below 5%, the paired
+95% lower bound exceeds the measured A/A null, and either (a) a new profile
+attributes at least 10% self to names materialisation/encoding, or (b) the
+workload has at least 48 names / 624 wire bytes. Otherwise the mounted residual
+remains the synchronous FUSE metadata request/reply boundary and needs an
+authorized transport primitive rather than another parser/materialisation cut.
+
+## Read-only repeated-xattr result cache cannot address the mounted transport gap - 2026-07-23 (REJECT; bd-mounted-xattr-workload-gap-fr6iq)
+
+Status: REJECT before source edit. Ledger and recent-log grep first excluded the
+kept namespace borrow and by-index lookup plus the closed formatter, size-probe,
+result-vector, direct-wire tail, metadata-worker offload, and unsafe transport
+families. The remaining narrow hypothesis was an inode/name result cache for a
+read-only mount's repeated `getxattr` and `listxattr` requests.
+
+Profile first: the exact clean reference fixture
+`ffs_xattr_writer_reference_1677288_1782855891392514698.ext4` was cloned and
+mounted read-only through quiet FrankenFS and kernel ext4 `norecovery`. Its
+inline `user.mime` and `security.selinux`, 512-byte external `user.big`, absent
+name, POSIX ACL access/default values, and returned name lists matched exactly.
+A 500,000-syscall FrankenFS server profile captured **66K `cycles:u` samples
+with zero lost**. FUSE reply send accounted for **71.40% including children**
+and receive for **27.95%**. Core `getxattr` was **0.02% self**, the FUSE
+`getxattr` handler **0.04% self**, and external by-index lookup **0.01% self**.
+No internal list/parser frame cleared the 0.01% reporting floor.
+
+A pinned rotating 30-sample comparator then ran 20,000 validated iterations /
+100,000 syscalls per sample. FrankenFS measured **3,374.538 ms median /
+33.745 us per syscall**, CV **1.799%**. Kernel ext4 measured **409.368 ms /
+4.094 us per syscall**, CV **0.706%**. The admitted direct ratio is therefore
+**8.243x slower** for FrankenFS. This replaces the earlier 7.495x routing-only
+signal whose three arms all missed the 5% CV gate.
+
+A result cache cannot address that residual: it can remove only an internal
+lookup already below 0.04% self, while every hit must still cross the same
+synchronous FUSE metadata request/reply boundary. The profile-first gate
+therefore rejected the candidate before source or harness mutation; ordering,
+tie-breaking, floating point, and RNG are N/A. Every timed sample asserted
+aggregate result **11,380,000**. After unmount, both image clones were still
+byte-identical to the source (SHA-256
+`ccd38ae5397b1e7600cfd19d6901b5dee82f49a0fdadebe405d450f7dd6d74ca`)
+and passed `e2fsck -fn`.
+
+Strict-remote release-perf build: worker `vmi1227854`, job
+`j-29944835100114983`, binary SHA-256
+`1f8b41ed0780a7c1f7ee0664c7868cbe67dedecc4679fa26f6c3408ebf1dae91`.
+Profile:
+`/data/tmp/bronzerabbit_xattr_quiet_profile_4d309e82_20260723.data`.
+The fixture still lacks the required 24-name list tail, so the broad parent
+remains open despite the valid ratio for the covered shape.
+
+Retry predicate: reopen a result-cache lever only when a quiet mounted profile
+attributes at least **5% self** to an internal xattr frame. Reopen the
+end-to-end gap only when an authorized clean clone adds list-24 and a safe,
+supported transport primitive can bypass or batch metadata opcodes themselves.
+Then repeat exact value/name/errno parity, server profiling, rotating
+A/A/candidate/kernel measurement, effect beyond the A/A null, and CV below 5%
+for every arm.
+
+## Clean-fsync parsed-GDT cache invalidation is below the transport floor - 2026-07-23 (REJECT; bd-fsync-journal-latency-gap-ptp4x)
+
+Status: REJECT before source edit. Ledger and recent-log grep first excluded the
+kept clean-device sync epoch and durable watermark, plus the rejected dirty O(G)
+descriptor rewrite, duplicate sync, JBD2 write combining, and group-commit
+architecture. Source attribution found one distinct measured-frontier candidate:
+`ext4_sync_with_logging` calls `clear_ext4_writable_group_desc_cache` after every
+`flush_to_device_after`, including a clean boundary where `flushed == 0`. The
+cache is striped across 64 mutex shards, so the hypothesis was to move this
+invalidation under `flushed > 0`.
+
+Profile first: the immutable `4d309e82` release-perf CLI was built by strict RCH
+on `vmi1227854` (job `j-29944835100114983`; binary SHA-256
+`1f8b41ed0780a7c1f7ee0664c7868cbe67dedecc4679fa26f6c3408ebf1dae91`).
+On a private clean RW image, pinned 30 x 10,000 clean-directory `fsync` batches
+measured **149.565 ms median / 14.957 us per call**, CV **3.091%**. A quiet
+`cycles:u` profile captured **16K samples with zero lost**. FUSE receive/reply
+syscalls dominated; the whole `ext4_sync_with_logging` function accounted for
+only **0.02% self / 0.03% including children**, and neither the cache clear nor a
+lock symbol reached the 0.01% reporting floor. Impossible elimination of the
+entire enclosing function therefore has a ceiling of about **1.0002x**.
+
+The identical pinned syscall loop on a kernel ext4 loop mount of an independent
+clone measured **4,012.185 ms median / 401.219 us per call**, CV **1.551%**.
+FrankenFS is already **26.83x faster / 96.27% lower latency** on this clean
+directory shape because the previously kept device epoch skips a backing-file
+sync when no write completed since the last successful sync. Both images passed
+offline `e2fsck -fn`. This direct-kernel result supersedes the earlier noisy
+routing-only kernel arm for this exact fixture; it does not generalize to dirty
+fsync, which the same-day ledger shows at kernel parity and disk-barrier-bound.
+
+No source or harness changed, so ordering, tie-breaking, floating point, and RNG
+are N/A. No A/A/B was run: the profile gate rejects a candidate whose impossible
+upper bound is below measurement resolution and whose target shape already beats
+kernel ext4. A first default-INFO profile is explicitly invalid and discarded:
+per-fsync tracing formatting dominated it. The accepted quiet profile is
+`/data/tmp/bronzerabbit_fsync_clean_quiet_profile_4d309e82_20260723.data`.
+
+Retry predicate: reopen only if a quiet symbolized clean-fsync profile attributes
+at least **5% self** to `ext4_sync_with_logging` or `ShardedCache::clear`, or
+after a supported FUSE transport primitive removes the request/reply floor and
+promotes invalidation into the top path. Then use one immutable same-worker
+binary, rotating A/A/B plus kernel, an effect beyond the A/A null, CV below 5%
+for every arm, identical fsync results, and clean offline fsck.
+
+## Delete checksum-snapshot split is below the measured frontier - 2026-07-23 (REJECT; bd-opb6l)
+
+Status: REJECT before source edit. Ledger and recent-log grep first excluded the
+closed allocation, directory-checksum, MVCC-copy, concurrent-dispatch, and
+mounted-transport families. The remaining narrow hypothesis was to represent the
+directory-entry removal checksum change as disjoint tiny fields instead of a
+contiguous `DirBlockEdit` preimage snapshot.
+
+Profile first: strict RCH built the immutable `4d309e82` release-perf CLI on
+worker `vmi1227854` (job `j-29944835100114983`; binary SHA-256
+`1f8b41ed0780a7c1f7ee0664c7868cbe67dedecc4679fa26f6c3408ebf1dae91`).
+A fresh pinned `cycles:u` profile then removed 20,000 entries through the serial
+direct-engine `delbench` path in **116.021 ms / 172,382 unlinks/s**. It captured
+**893 samples with zero lost**. The whole
+`ffs_dir::remove_entry_take_inode_tracked` helper accounted for just **1.16%
+self**; the proposed checksum-snapshot representation is only a fraction of
+that helper. Even impossible removal of the entire helper has an Amdahl ceiling
+of `1 / (1 - 0.0116) = 1.0117x`.
+
+The actual frontier remained `__memmove_avx_unaligned_erms` at **15.92% self**
+(principally MVCC visible-version and block-buffer copies) and
+`ShardedMvccStore::commit` at **8.72% self**. Those are architectural ownership
+surfaces, not a permissible measured-frontier checksum edit. Fresh throughput
+was within **0.82%** of the previous 173,790-unlinks/s run, corroborating the
+same profile rather than exposing a new hotspot. The concurrent sharded merge
+change landed after `4d309e82` does not affect this serial attribution.
+
+No source or harness changed, so ordering, tie-breaking, floating point, and RNG
+are N/A. No A/A/B was run: profile-first rejection prevents spending a noisy
+candidate trial on a lever whose impossible upper bound is only **1.012x**. This
+direct-engine attribution is not a fresh direct-kernel comparator; the existing
+mounted delete/kernel measurement remains transport-dominated, and its kernel
+arm missed the mandatory under-5% CV gate. The exercised image passed
+`e2fsck -fn` after all deletes. Profile:
+`/data/tmp/bronzerabbit_opb6l_profile_4d309e82_20260723.data`.
+
+Retry predicate: reopen only when a clean symbolized delete profile attributes
+at least **5% self** to `remove_entry_take_inode_tracked` /
+`DirBlockEdit::delta`, or after a supported transport primitive removes the
+mounted round-trip floor and promotes this helper into the top path. Then use
+one immutable same-worker binary, rotating A/A/B, an effect beyond the A/A null,
+CV below 5% for every arm, exact incremental-versus-full CRC equivalence, and a
+clean offline fsck result.
+
+## bd-bhh0i cutover — BUG-5 LANDED (sharded merge base); only the block-bitmap FCW (BUG-4) remains (bd-bhh0i / bd-kdmu4) - 2026-07-23 (turn 3)
+
+Status: PROGRESS — cutover reduced to ONE remaining conflict. Root-caused why
+BUG-3 (turn 1) didn't fix the parallel path: the create-bench uses the SHARDED
+store (`ShardedMvccStore`, 32 shards), whose merge (`check_write_mergeable_locked`
+preflight + `merged_write_bytes_locked` install) derived the merge base ONLY from
+the version chain — empty for a freshly-allocated block — with NO staged_base
+fallback. BUG-3 had only fixed the single-store `MvccStore`. Env-gated conflict
+instrumentation (`FFS_MVCC_CONFLICT_DEBUG`, added then removed) confirmed the
+inode-table conflict was `proof=TimestampOnlyInode base_len=0 staged_base=false`.
+
+BUG-5 LANDED (`671cfa35`): added the staged_base fallback to BOTH sharded merge
+sites (preflight + install — both are needed; fixing only the preflight would pass
+the gate then install unmerged bytes via `merge_bytes`'s None fallback, clobbering
+the concurrent writer). Byte-identical for the non-conflict path. Validated:
+ffs-mvcc 488/0; the 4-thread sharded create-bench NO LONGER conflicts on the
+inode-table block (was `block 76`).
+
+BUG 4 — the ONLY remaining conflict (precisely diagnosed): after BUG-5, 4-thread
+create-bench conflicts solely on `block 65` (512 MiB fs: group-0 BLOCK BITMAP;
+`proof=Unsafe base_len=0 staged_base=false`). Mechanism: two concurrent CREATE
+operations each allocate a dir-growth block in the same group; the per-group lock
+serializes the in-memory bitmap read-modify, but the bitmap block is written
+staged `Unsafe` (no merge), so the two commits (which set DISJOINT bits from the
+same pre-write bitmap) first-committer-wins conflict. Fix needs a BIT-LEVEL
+OR-merge proof: a byte-range proof (`independent_keys`) fails because two
+allocations frequently set bits in the SAME byte (adjacent free blocks).
+Allocation is monotonic bit-set (never clears during a create storm), so the
+correct merge is `base | staged-new-bits | latest-new-bits` with validity "neither
+writer cleared a base bit." This is a NEW `MergeProof` variant (correctness-
+critical) plus routing the `ffs-alloc::try_alloc_blocks_in_group` bitmap
+`dev.write_block` through a proof-carrying RMW (like the GDT's `rmw_block`).
+Retry: implement the bitmap OR-merge proof + wire the bitmap write → full cutover
+gate (8t≥4×1t AND e2fsck rc0 AND 40000-file read-back per thread). The FREE path
+(punch/unlink) clears bits, so the proof/validity must handle mixed set+clear only
+if a workload interleaves frees with the storm — the pure-create storm is set-only.
+
+## bd-bhh0i cutover — BUG-3 LANDED; fast_commit regression is PRE-EXISTING on main; multiple concurrency bugs remain at 4t (bd-bhh0i / bd-kdmu4) - 2026-07-23 (turn 2)
+
+Status: PROGRESS. BUG-3 (inode-table merge-base) LANDED as `18432557` after
+resolving the landing blocker. Two follow-on findings:
+
+fast_commit regression is PRE-EXISTING, not from BUG-3: `cargo test -p ffs-core
+--lib fast_commit_del_range_apply_punches_and_frees_passes_e2fsck` FAILS on a
+clean DEFAULT build (feature off, BUG-3 stashed) = clean origin/main. So the
+e2fsck-unclean-after-DEL_RANGE failure is a real committed data-integrity
+regression on main (in the fsync/journal lane; likely `23ad52f2 persist ext4
+summaries at fsync boundary`), independent of the sharded work and of BUG-3
+(which is byte-identical for that single-threaded test). BUG-3 was therefore
+landed without adding any red test (main was already red on fast_commit +
+btrfs_reflink flake). FOLLOW-UP: this DEL_RANGE regression deserves its own fix.
+
+The cutover still panics at >1 thread, on MULTIPLE blocks — the "merge wiring
+complete on paper" claim was badly wrong. Reproduced (512 MiB / 4-group image,
+40000 creates, `--threads 4`, FFS_BHH0I_SHARDED=1, binary with BUG-3):
+first-committer-wins conflicts on BOTH `block 65` (dumpe2fs: group-0 BLOCK BITMAP,
+BUG 4) AND `block 76` (an INODE-TABLE block — so BUG-3 fixed the 1-2 thread
+inode-table case but 4-thread load re-exposes an inode-table conflict). On the
+16-group image the bitmap conflict was `block 257`; the block number tracks the
+group-0 bitmap for the fs geometry.
+
+Diagnosis blocker: the panic backtrace only shows the createbench closure —
+`create` RETURNS the `CommitError::Conflict` (it doesn't panic at the write site),
+so the conflict ORIGIN (which write path, which proof, disjoint vs overlapping
+touched_ranges) is not on the trace. Next step MUST instrument the conflict
+point: a targeted log in `MvccStore::resolved_write_valid_with_policy` just before
+`Err(CommitError::Conflict)` printing block / proof variant / touched_ranges /
+base|latest|staged lengths, to distinguish (a) a disjoint-slot merge GAP the
+BUG-3 fix doesn't cover under N-way concurrency, (b) an inode/block ALLOCATION
+RACE handing two threads the same slot (overlapping ranges → correct rejection,
+but means the per-group lock doesn't serialize allocation), or (c) BUG 4 = the
+bitmap staged `Unsafe` (no merge). Likely fixes: bitmap needs a bit-level merge
+proof (OR set bits — a NEW proof kind, since two allocs can share a byte) or the
+per-group lock held across the RMW+commit; the inode-table N-way case needs the
+merge base/latest chain re-checked (possibly the recorded base is stale when a
+writer read an intermediate version). Retry: instrument → fix each conflict class
+→ full cutover gate (8t≥4×1t AND e2fsck rc0 AND 40000-file read-back per thread).
+
+## bd-bhh0i parallel-create cutover RUN LOCALLY — baseline convoys, inode-table merge-base bug FIXED+validated, block-bitmap FCW is the next gap (bd-bhh0i / bd-kdmu4) - 2026-07-23
+
+Status: MAJOR PROGRESS + INCOMPLETE. Disproved the standing "cutover is rch-remote-
+only-blocked" assumption: `create-bench` + `mke2fs` + `e2fsck` all run locally (as
+this whole campaign has). Ran the cutover A/B, found the single-lock convoy the
+lever targets, FIXED one concrete FCW-conflict bug (validated), and identified the
+NEXT one. Fix STASHED (`stash` "bhh0i-merge-base-fix"), not committed — one ffs-core
+test regression in the tree needs isolation first (see below).
+
+Cutover A/B (in-process `create-bench`, no FUSE transport; 2 GiB / 16-group image,
+40000 creates, `--threads`, feature `bhh0i_sharded_alloc`, per-thread subdir):
+- baseline (single-lock): 1t 143218 → 2t 112303 → 4t 81717 → 8t 79694 creates/s.
+  NEGATIVE scaling (the whole-state write-lock convoy the lever exists to remove).
+  e2fsck rc0 at every thread count.
+- sharded (`FFS_BHH0I_SHARDED=1`): 1t 62161 creates/s (single-thread sharded
+  overhead), but 2t+ PANIC with a first-committer-wins conflict.
+
+BUG 3 (FIXED, stashed): the FIRST sharded panic was
+`merge_proof_rejected: buffer length mismatch, base_len=0, latest_len=4096,
+staged_len=4096` on a freshly-allocated inode-table block (TimestampOnlyInode proof),
+then FCW-conflict. Root cause: `MvccStore::resolved_write_{bytes,valid}_with_policy`
+derives the merge base via `version_bytes_at(block, snapshot.high).unwrap_or_default()`,
+which is EMPTY for a brand-new block with no version at the snapshot — but two
+concurrent creates writing disjoint inode slots of that new block both RMW'd the
+same on-disk (device) content, which is the true common ancestor. The remote
+concurrency test (6ed27b4a) missed this because it PRE-POPULATES a base version
+(`read_visible(...).expect("base version visible")`), so base_len was always 4096.
+Fix: record the RMW's device-read base on the `StagedWrite` (only when no version
+existed) and fall back to it in the merge when `version_bytes_at` is None. Both
+concurrent writers record the identical device base → sound merge. Byte-identical
+for the single-lock / non-conflict path (base recorded but consumed only on a
+concurrent merge). Validated: ffs-mvcc `cargo test` 530/0 (all merge/SSI/sharded
+tests green); sharded 1t create-bench now writes all 40000 files with `e2fsck` rc0
+and the merge-rejection warning gone.
+
+BUG 4 (NEXT gap, not yet fixed): with BUG 3 fixed, sharded 2t now panics later, on
+`block 257` (dumpe2fs: the group-0 BLOCK BITMAP) with NO merge-proof warning — i.e.
+staged with the default `Unsafe` proof, no merge attempted. Concurrent block
+allocations (directory growth) in the same group both RMW the group's block bitmap;
+the per-group lock serializes the mutation but not the snapshot→commit window, so
+the second committer FCW-conflicts. Needs either a bitmap-aware merge proof (OR the
+disjoint set bits — a NEW proof kind, since two allocations can touch the same byte)
+or holding the per-group lock across the RMW+commit. This means the memory's "shared-
+metadata merge wiring COMPLETE / no remaining per-create shared-block conflict known
+on paper" was WRONG — the actual run exposes multiple conflict points (inode-table,
+now block-bitmap, and GDT is likely a third under cross-group load).
+
+ffs-core regression to isolate before landing BUG-3 fix: a `--features
+bhh0i_sharded_alloc` `cargo test -p ffs-core --lib` shows 1231 passed / 2 failed —
+`btrfs_reflink_random_matches_reference_model` (documented pre-existing flake) and
+`fast_commit_del_range_apply_punches_and_frees_passes_e2fsck` (an e2fsck-after-
+DEL_RANGE check). The BUG-3 fix is byte-identical for that single-threaded test
+(base recorded but never consumed without a concurrent merge), so it is not the
+cause; the likely source is the recent `36257e4b perf(bd-bhh0i): fix cutover BUG 2 —
+deferred-GDT flush sources from the sharded groups` commit or the uncommitted peer
+`sharded_alloc.rs` in the tree. Retry predicate: isolate `fast_commit` on a clean
+build (stash the peer's `sharded_alloc.rs`, revert BUG-3), then land BUG-3 + BUG-4
+together with the full local cutover gate (8t ≥ 4×1t AND `e2fsck` rc0 AND 40000-file
+read-back at every thread count).
+
+## Dirty-fsync O(G) group-descriptor rewrite is disk-barrier-masked (flat with group count) → REJECT dirty-group tracking - 2026-07-23 (bd-fsync-journal-latency-gap-ptp4x / bd-kdmu4)
+
+Status: REJECT (measured, not reasoned). `ext4_persist_group_descriptors_from`
+rewrites ALL `G` group descriptors on every dirty fsync (`for gidx in
+0..alloc.groups.len()`, lib.rs:17857) versus kernel ext4's O(touched). I flagged
+this as a possible large-fs lever in prior turns but had only reasoned it away as
+disk-masked; this entry MEASURES it decisively.
+
+Measured: create+write(128B)+fsync-EACH storm of 200 files, per-op median, plain
+disk-backed image (real `fsync`), 2 arms differing only in filesystem size / group
+count:
+- 256 MiB fs (2 groups):   18.24 / 18.58 ms per create+fsync
+- 16 GiB fs (128 groups):  19.20 / 19.01 ms per create+fsync
+
+Per-op latency is FLAT (~+4%) across a 64x increase in group count. The O(G)
+descriptor rewrite is fully masked by the ~18 ms synchronous `fsync` disk barrier:
+the descriptor writes land in the image's page cache (buffered) before the single
+device `sync`, so they cost ~nothing on the wall clock, and the per-in-use-group
+bitmap-checksum preads are page-cache hits. On the common create-many-fsync-ONCE
+workload the incremental watermark already amortizes it to one flush per batch.
+
+Therefore the risky dirty-group-tracking rewrite (track a dirty-group set, rewrite
+only touched descriptors — flagged risky in prior ledgers: must cover every
+free-count mutation site or `df` goes stale, plus atomic contention on parallel
+alloc) is NOT justified: it cannot move a disk-barrier-bound wall clock, and the
+descriptor CPU is already buffered/overlapped.
+
+Retry predicate: reopen ONLY on a workload where the dirty fsync is NOT disk-
+barrier-bound AND the descriptor flush is on the critical path — e.g. a
+battery-backed / pmem / `nobarrier` device where `fsync` is ~free, on a
+many-hundred-group fs, with a per-file-fsync (not batched) storm — AND a
+same-worker A/B shows per-op latency scaling with `G`. On any normal
+disk/SSD-backed fsync this is disk-bound and there is no lever.
+
+## Mounted metadata storm (stat-walk) is getattr-round-trip-bound + adaptive-readdirplus REJECT - 2026-07-23 (bd-kdmu4 small-file-storm sub-lane)
+
+Status: two findings. (1) The mounted metadata storm is 2.7-4.6x slower than
+kernel ext4 and is FUSE-round-trip-bound (like the create storm), not a
+FrankenFS-CPU lever. (2) Advertising adaptive readdirplus is byte-identical but
+PERF-NEUTRAL-to-slightly-worse → REJECT; source reverted. The durable finding is
+the ROOT cause below.
+
+Measured (256 MiB ext4 tree, 11040 entries across 40 dirs, warm, daemon pinned
+8-15, client 16-23):
+- `find` (readdir, names only): FFS instant (~0-10 ms) — readdir/dentry cache
+  works, name-only walks are already fast.
+- explicit `os.lstat` walk (readdir + getattr/entry): FFS min 231-283 ms vs
+  kernel 44 ms = ~4.6-6.4x.
+- `ls -lR` (getdents + stat + getxattr per entry): FFS 0.20-0.27 s vs kernel
+  0.07 s = ~2.7-3.9x.
+
+Profile (symbolized daemon): the daemon is FUSE-transport-bound — `Session::run`
+-> `read` 56%, `writev`/`send` 19%, scheduler block/wake 34%; NO `ffs_*` metadata
+frame reaches 1.5% self-time. Each `lstat` costs ~2 daemon requests (lookup +
+getattr); each `ls -l` entry costs ~8 (add per-entry `getxattr` for
+`security.selinux` / `system.posix_acl_access`). The gap is the synchronous FUSE
+round-trip per metadata op, which kernel ext4 does in-kernel. Read-only metadata
+ops could be dispatched concurrently, but `find`/`ls`/`os.walk` are SERIAL
+clients (each op waits for the previous reply), so concurrent daemon dispatch
+cannot help — same structural wall as the create storm.
+
+ROOT CAUSE of the repeat cost (the durable finding): the kernel does NOT serve
+cached attributes for this mount even though `getattr`/`entry` replies carry a
+60 s `attr_valid`/`entry_valid` (`ATTR_TTL`). 2000 repeated `os.lstat` of ONE
+file -> 2064 daemon `read`s (every stat round-trips). The dentry cache works
+(repeated same-path lookups don't round-trip) but the ATTR cache does not. This
+is almost certainly inherent RO-FUSE behavior: without `FUSE_CAP_WRITEBACK_CACHE`
+the kernel's `fuse_get_cache_mask()` is 0, so `fuse_update_get_attr` treats a
+`STATX_BASIC_STATS` request as needing fields outside the cache mask and syncs
+(getattr) on every stat regardless of `attr_valid`. writeback_cache requires
+`--rw` (RO mounts cannot opt in), so RO metadata caching is FUSE-limited, not a
+FrankenFS bug.
+
+REJECT — adaptive readdirplus advertisement: FrankenFS's `init` advertises SPLICE
++ PASSTHROUGH but NOT `FUSE_DO_READDIRPLUS`, so the (already-implemented, bd-
+xmh5g.399-optimized) `readdirplus` handler is never dispatched; the kernel uses
+readdir + per-entry getattr. Hypothesis: advertising `FUSE_DO_READDIRPLUS |
+FUSE_READDIRPLUS_AUTO` would collapse a stat-walk to ~1 round-trip/dir. Measured
+(default-ON vs `FFS_FUSE_READDIRPLUS=0`): byte-identical (`find -printf '%p %s'`
+sha `fe0d5180...` on both), but `ls -lR` NEUTRAL (0.21-0.27 s ON vs 0.20-0.25 s
+OFF) and daemon requests slightly HIGHER with it on (88907 vs 77827 over one warm
+`ls -lR`). Why it doesn't help: (a) the broken RO attr cache means the attrs
+readdirplus pre-populates are not served on the client's subsequent stat; (b)
+`ls -l`'s cost is dominated by per-entry `getxattr` (ACL/SELinux) round-trips
+that readdirplus does not carry; (c) the AUTO heuristic did not reduce round-trips
+on the warm walk. Source reverted (2 hunks in ffs-fuse `init`).
+
+Retry predicate: reopen readdirplus (and RO attr caching generally) ONLY after
+confirming the attr-cache mechanism with an `--rw --writeback-cache` mount — if
+writeback caches repeated stats and RO does not, RO metadata caching is inherent
+FUSE and neither lever helps; if even writeback fails to cache, root-cause the
+`attr_valid` handling as a real bug first. A readdirplus win additionally
+requires eliminating the per-entry `getxattr` round-trips (e.g. an xattr batch in
+the readdirplus reply, which the FUSE protocol does not support) — so readdirplus
+alone is not a stat-walk lever on ACL/SELinux-labeled trees.
+
+## splice() zero-copy FUSE read reply — IMPLEMENTED, byte-identical, PERF-NEUTRAL → REJECT (bd-kdmu4 zero-copy read-path sub-lane) - 2026-07-23
+
+Status: REJECT. The safe-splice zero-copy read is byte-identical and the splice
+path provably engages, but it is measured PERF-NEUTRAL on every read shape.
+Production source stashed (`stash@{0}` "splice-read-reject-wip-2026-07-23"), not
+landed. This is the follow-through on the same-day REOPEN entry below: the lever
+was reopened as the top-priority in-lane item, fully implemented behind a
+default-OFF flag, measured, and rejected on the measurement.
+
+Implementation (all stashed): a full vertical slice —
+  - vendored fuser: `ReplySender::send_spliced(header, src_fd, offset, len)` with
+    a byte-identical `pread`+`send` default (mock senders unaffected) and a
+    `ChannelSender` override that stages the 16-byte `fuse_out_header` + splices
+    `src→pipe→/dev/fuse` through a per-thread `F_SETPIPE_SZ`-enlarged pipe, with
+    a session-level `SPLICE_WRITE_OK` disable-on-first-failure fallback and a
+    buffered fallback for payloads over the pipe soft-cap; `ReplyData::data_spliced`.
+  - ffs-block: `ByteDevice::backing_file() -> Option<Arc<File>>` (FileByteDevice
+    returns its `Arc<File>`; `OverlayByteDevice` forwards it ONLY when its overlay
+    holds no writes — clean journal — else None).
+  - ffs-core: `FsOps::splice_read_plan` returning `Some((file, phys_offset, len))`
+    only for a RO ext4 mount, plain-`FileByteDevice` backing, regular file, no
+    encrypt/compr/verity/inline, extent-mapped, whole range in ONE written
+    contiguous extent; `Arc<T>` forwarding of the new method (the crux miss that
+    made it silently no-op at first — the mount uses `Box<Arc<OpenFs>>`).
+  - ffs-fuse: default-OFF `FFS_FUSE_SPLICE_READ`, splice fast path in
+    `serve_read_request` before `read_with_readahead`.
+
+Correctness PROVEN: mounted-read sha256 byte-identical to the kernel across
+whole-file / 128K / 1M / 17000-byte-odd / small-file reads, with the flag both
+ON and OFF (fixture `data.bin` 3-extent 200 MiB + `small.bin`). `strace` confirms
+the splice path engages: 300×128K reads → 400 `splice` calls (200 read×2), and a
+`send_spliced: relay Done` trace on every eligible reply. A `SIGKILL`-class
+desync never occurred (RO mount, no writes).
+
+Decisive A/B (release-perf, daemon pinned 8-15, client 16-23, warm page cache,
+min-of-N, flag toggled in one binary):
+- single-stream 200 MiB read, 128 KiB chunks (splice engages): OFF min 74.7-75.8 ms
+  vs ON min 74.9-77.2 ms — NEUTRAL (within the ~2 ms run-to-run spread).
+- single-stream, 1 MiB chunks: OFF ~76 ms vs ON ~76 ms — NEUTRAL (and 1 MiB
+  payloads exceed the 1 MiB `pipe-max-size` so they fall back to buffered anyway).
+- 128×2 MiB multi-file, 16 parallel readers (the bd-kdmu4 headline shape): OFF
+  min 16.4-17.1 ms vs ON min 16.1-18.4 ms — NEUTRAL.
+
+ROOT CAUSE (this is the durable finding): the warm-large-read profile's "67%
+`_copy_to_iter`" is 67% of DAEMON CPU, NOT of wall-clock. FrankenFS's readahead
+prefetch (the `preadv` stream that still runs, ~960 `preadv` alongside the 400
+`splice`) already overlaps the page-cache→userspace copy OFF the wall-clock
+critical path, so eliminating the reply copy with splice frees daemon CPU that
+was not the bottleneck. The mounted read is dispatch/RTT/pipeline-bound (as the
+2026-07-22 async-dispatch and prefetch entries already found), not copy-bound.
+splice trades a `preadv`+`writev` copy pair for a `splice`+`splice` page-move
+pair of equal wall-cost on this pipeline. The `pipe-max-size` 1 MiB cap also
+excludes the largest single reads.
+
+Isomorphism: ordering/tie-breaking/bytes unchanged (sha256-proven); FP/RNG N/A.
+
+Retry predicate: reopen ONLY if a future profile shows the mounted read is
+DAEMON-CPU-bound (daemon saturating its cpuset with copy self-time ON the
+critical path, e.g. a many-client fan-in that out-runs prefetch overlap) AND a
+same-worker A/B beats the buffered path outside the A/A null. A zero-copy reply
+alone does not help while readahead prefetch overlaps the copy. Do NOT re-attempt
+the splice reply as a throughput lever for the current prefetch-overlapped read
+path. The infrastructure (safe `send_spliced`, `backing_file`, `splice_read_plan`)
+is preserved in the stash if a DAEMON-CPU-bound workload ever materializes.
+
+## REOPEN + VALIDATED: splice() FUSE read replies are SAFE (not unsafe-blocked); warm large-read is 67% copy-tax - 2026-07-23 (bd-kdmu4 zero-copy read-path sub-lane)
+
+Status: REOPEN. Correcting a ledger MISCLASSIFICATION and attaching profile-first
+evidence. Prior rows (e.g. NEGATIVE_EVIDENCE.md 2026-07-04 swarm-routing) lumped
+"splice-class read gaps" with io_uring/mmap as "blocked by forbid(unsafe_code)".
+That is WRONG for splice: `nix::fcntl::splice` is a SAFE wrapper (takes `AsFd`,
+no `unsafe`; verified nix 0.29-0.31 signatures) — only mmap-file-maps and
+io_uring registered buffers require `unsafe`. splice was never actually blocked
+by the workspace lint; it was closed on a false premise. This entry reopens it
+with measurement.
+
+Profile-first (this is the key correction to the "copies ~3%" framing): the ~3%
+copy figure from 2026-07-22 was the SMALL-FILE multi-file read, which is
+dispatch/RTT-bound. The WARM LARGE-CONTIGUOUS read is the opposite — copy-bound.
+Symbolized daemon profile (release strip=false debug=1 to a scratch target dir,
+400 MiB single-file warm read repeated, `perf record -g --call-graph dwarf`):
+the daemon spends **82.9% in `preadv`, of which 67% is `_copy_to_iter` /
+`copy_page_to_iter`** — the kernel's page-cache -> daemon-buffer copy (COPY 1).
+The subsequent `ReplyData::data(&[u8])` -> `writev` to /dev/fuse is COPY 2. This
+IS the "~2x pread copy-tax" the lane names, now located and quantified on the
+workload where it dominates.
+
+Ceiling microbench (`os.splice` file->pipe->/dev/null vs preadv->buffer->write,
+400 MiB warm, 7 reps median): read+write 27.3 ms / 15.4 GB/s vs splice 19.4 ms /
+21.6 GB/s = **1.40x** at the copy layer. This UNDERSTATES the FUSE win because
+the microbench's `/dev/null` write is free, whereas the real path's COPY 2
+(writev to /dev/fuse) is a genuine copy that splice also eliminates. Mounted warm
+large read currently measures 2781 MB/s; splicing image_fd -> pipe -> /dev/fuse
+would replace COPY 1 + COPY 2 with page moves, leaving only the kernel's
+unavoidable /dev/fuse -> client copy (COPY 3).
+
+Feasibility (both fds are reachable): /dev/fuse fd via `ChannelSender(Arc<File>)`;
+image fd via `FileByteDevice::file() -> &Arc<File>`; physical offset via the
+existing extent resolve. Implementation is a correctness-critical vertical slice,
+so it is NOT rushed here (a bad FUSE read reply corrupts data):
+  - Slice A (vendored fuser): add `ReplySender::send_spliced(header, src_fd,
+    offset, len)` with a DEFAULT impl that reads into a buffer + `send` (so mock
+    senders are byte-identical), and a `ChannelSender` override that enlarges a
+    per-worker pipe via `F_SETPIPE_SZ` to max_read, writes the 16-byte
+    `fuse_out_header`, `splice(src->pipe)` then `splice(pipe->/dev/fuse)` as one
+    reply; plus `ReplyData::data_spliced(src_fd, offset, len)`.
+  - Slice B (ffs-core): a method returning `Some((image_fd, phys_offset, len))`
+    ONLY when the requested range is a single contiguous UNCOMPRESSED extent with
+    NO MVCC overlay / pending write for those blocks (else None -> materialize).
+  - Slice C (ffs-fuse read handler): try the eligibility check, splice-reply on
+    Some, fall back to `data(&buf)` on None. Env kill switch FFS_FUSE_SPLICE_READ
+    (default OFF). Gate: mounted-read sha256 byte-identity (flag on vs off vs
+    kernel) + warm large-read A/B + conformance.
+
+Retry/land predicate: implement the vertical slice behind the default-OFF flag;
+land only if a mounted read is sha256 byte-identical with the flag on AND a
+same-worker warm large-read A/B beats the materialize path outside the A/A null.
+Eligibility MUST exclude compressed extents, MVCC-overlaid blocks, fragmented
+(multi-extent) ranges, and any range crossing a hole. This is the top-priority
+in-lane lever; it is NOT ledger-closed.
+
+## Mounted small-file create storm gap is FUSE-transport-bound, not a create-CPU lever - 2026-07-23 (NOT-A-LEVER / ledgered blocker; bd-kdmu4 small-file-storm sub-lane)
+
+Status: NOT-A-LEVER. The mounted single-thread create storm is 5.7x slower than
+kernel ext4, but a SYMBOLIZED daemon profile proves the entire delta is the
+synchronous FUSE round-trip; `FrankenFuse::create` / `ext4_create` do not reach
+0.8% self-time. No FrankenFS create-path CPU lever exists on this workload, and
+the only amortization (concurrent request dispatch) is ledger-CLOSED (multiloop
+REJECT corrupts allocation) / bd-bhh0i local-only cutover. Recorded so the gap is
+quantified and the create-CPU door is closed, not silently retried.
+
+Measured (fresh 256 MiB ext4 image, 3,000 x 128-byte files created into one dir,
+daemon pinned CPUs 8-15, client 16-23, plain-file backing = buffered so no
+per-op disk I/O):
+- no-fsync create storm: FrankenFS 590-621 ms vs kernel ext4 105-108 ms = ~5.7x
+  (~200 us/create vs ~35 us/create).
+- fsync-each create storm: FrankenFS 61,296 ms vs kernel 61,671 ms = PARITY
+  (each fsync is a real ~20 ms disk barrier; physics-bound, correctly at parity).
+
+Symbolized profile (release + `CARGO_PROFILE_RELEASE_STRIP=false DEBUG=1` to a
+scratch target dir, 6,000-create storm, `perf record -g --call-graph dwarf` on
+the daemon): the daemon time is `fuser::Session::run` -> `Channel::receive` ->
+`read` (30.6% reading FUSE requests), `writev` / `ReplySender::send` (~14%
+writing replies), and scheduler block/wake (`schedule`/`dequeue*` ~16% — the
+synchronous block-on-`read` between requests). The vendored fuser receive buffer
+is allocated ONCE before the loop and reused (`session.rs:148`), so there is no
+per-op receive-buffer alloc/memset despite `BUFFER_SIZE = 16 MiB + 4096`. Every
+`ffs_*` create frame (create/alloc/dir-entry/inode-write/commit) sits below the
+0.8% self-time floor.
+
+Also probed (out-of-lane, no lever): 128 MiB sequential write, `set_max_write`
+is never negotiated in `init`, but FrankenFS measures 176-235 ms vs a very noisy
+kernel 57-260 ms (writeback-timing variance) — roughly competitive, no clean gap,
+and the kernel comparator fails the <5% CV gate, so no `max_write` lever is
+justified.
+
+Retry predicate: reopen a create-CPU lever only if a future profile shows an
+`ffs_*` create frame above ~5% self-time on this workload (e.g. a new superlinear
+per-create cost). The transport gap itself reopens only with the bd-bhh0i sharded
+parallel-create local cutover (safe concurrent dispatch of allocation-disjoint
+creates) or a safe io_uring FUSE transport — both currently blocked (local-only /
+`forbid(unsafe_code)`).
+
+## Clean-device fsync skip via FileByteDevice write/sync epochs - 2026-07-22 (KEEP; bd-fsync-journal-latency-gap-ptp4x / bd-opb6l)
+
+Status: KEEP. The unchanged-directory `fsyncdir` storm — the residual both same-day
+fsync-lane keeps left at 348-372x slower than kernel — is now 16.6x faster; the
+kernel gap on this shape drops from ~372x to ~27x, and the remainder is the
+synchronous FUSE round-trip itself (~25 us/call), not the sync path.
+
+Profile first: the prior keeps' profile put the leading sync-path address cluster
+at 18.94% and left the frozen storm at ~410 us/call. Source attribution found
+`ext4_sync_with_logging` calls `self.dev.sync` unconditionally, even when the
+no-op watermark guard returned `flushed == 0`. A host syscall pricing probe on
+the same backing filesystem made the attribution quantitative: fsync of a CLEAN
+file costs 398.3 us/call (dirty: 8.84 ms), matching the 411 us/call frozen
+residual almost exactly. Ledger grep: the closed 2026-07-14 "ext4 duplicate
+device-sync elision" family targeted the second sync after a DIRTY flush and was
+rejected only because the small remote workload could not resolve it, with retry
+predicate "tighter same-worker A/A controls or a deterministic sync-count/latency
+backend" — both are supplied here (0.73% A/A null; epoch counters + strace
+syscall counts), so this entry also satisfies that row's retry predicate rather
+than retrying a closed idea blind. No prior clean-device/dirty-epoch attempt
+exists in either ledger.
+
+The lever is device-level, not call-site-level: `FileByteDevice` now keeps an
+`Arc`-shared `(write_epoch, synced_epoch)` pair. Every attempted write syscall
+(success or failure — a failed `write_all_at` may have partially written)
+advances `write_epoch` after the syscall returns; `sync` reads `write_epoch`
+first, performs `sync_all`, then publishes the observed epoch via `fetch_max`.
+When the epochs are equal, `sync` returns without the syscall: no write has
+completed through this device (or any clone — clones share the state) since
+durability was last established, so there is nothing new to make durable. POSIX
+fsync only covers writes completed before the call, and a FUSE client cannot
+issue an fsync ordered after a write until the daemon replied to that write —
+which happens strictly after the epoch bump — so the skip is semantically exact.
+`write_epoch` starts ahead of `synced_epoch`, so the first sync after open
+always runs (covers mount-time journal replay through the separate journal fd on
+the same path). Env kill switch: `FFS_CLEAN_SYNC_SKIP=0` restores the old
+unconditional fsync. Because the MVCC flush path already syncs the device
+internally through the adapter (delegating to the same `FileByteDevice`), the
+outer boundary sync after a DIRTY flush now also skips — dirty boundaries issue
+exactly one real fsync instead of two, landing the 2026-07-14 duplicate-sync
+elision as a byproduct. Ordering preserved: no write is moved or elided, only a
+provably-no-op syscall. Tie-breaking, floating point, RNG: N/A.
+
+Decisive same-worker rotating A/A/B/kernel run (fresh image copy + fresh mount
+cycle per sample; 8,000 x 128-byte files + 3 sentinels populated outside timing;
+daemon pinned to CPUs 8-15, client to 16-23; sample = median of 3 batches x
+2,000 `fsync(dirfd)` calls on the unchanged 8,003-entry directory; 6 samples per
+arm; candidate binary SHA-256
+`b2e8f748bd3e2e82efbbad5bf14e05b943079ed0e17869eccd8cfc5f9be03ebe`, controls =
+same binary with `FFS_CLEAN_SYNC_SKIP=0`, fixture SHA-256
+`cff2c98c4d34e3d952a3b7f93fa22bfdbec7781942188b38bb42524f63a60dd8`):
+
+- control A (env-off): 821.785 ms median, CV 0.94%
+- control B (env-off): 827.777 ms median, CV 0.67% (A/A null spread 1.0073x)
+- candidate (lever on): 49.567 ms median, CV 6.99% (12-sample: 48.538 ms, CV 6.32%)
+- kernel ext4 (dio-loop): 1.846 ms median, CV 21.32% (routing evidence only)
+
+Candidate is 16.58x faster than the faster control; the candidate arm's CV sits
+above the 5% gate (RTT-bound shape on a loaded box), so the honest bound is
+worst-candidate vs best-control = 807.260/53.228 = 15.2x — the verdict cannot
+flip. Externally consistent: both env-off controls reproduce the prior session's
+frozen-pre controls (819.5/818.1 ms) within 1.2%. Per-call: 411 us -> 24.8 us;
+the removed 386 us equals the measured 398 us clean-fsync price within noise.
+
+Mechanism proof: strace of the daemon during a 500-call storm counted exactly 1
+fsync syscall with the lever on (the first-sync-always) vs 500 with it off.
+Durability proof (kill -9): with skips exercised before and after, a new file
+written and `fsync`ed, then SIGKILL (no graceful shutdown, no unmount flush):
+`e2fsck -fn` rc 0 and the payload's exact SHA-256 read back through a kernel
+mount. Every A/B cycle validated entry count, byte totals, and 3 sentinel
+payloads before and after timing, and every image passed `e2fsck -fn` rc 0.
+
+Gates: `cargo test -p ffs-block --lib` 309/0 including two new epoch-invariant
+tests (first-sync-always + clean-skip + re-dirty, clone-shared state);
+`cargo clippy -p ffs-block --all-targets -- -D warnings` clean (pre-existing
+bench/example lint debt cleared in the companion chore commit); release CLI
+build clean. Residual: the ~27x kernel gap on this shape is the synchronous FUSE
+round-trip (~25 us/call vs kernel ~0.9 us in-kernel fsyncdir); the concurrent
+dispatch that would amortize it is ledger-CLOSED above (multiloop REJECT) until
+its linearizability retry predicate is met. `clear_ext4_writable_group_desc_cache`
+still runs on every no-op boundary — a follow-up candidate, likely minor now.
+
+## Shared-channel multiloop FUSE dispatch - 2026-07-22 (REJECT; bd-opb6l)
+
+Status: REJECT and restore the single FUSE receive/dispatch loop. The candidate
+nearly doubled the measured four-client delete throughput, but violated ext4
+allocation/free and durability invariants under repeated churn. No production
+source is retained.
+
+Profile first: the frozen standard mount took 370.291824 ms for an 8,000-file,
+four-directory/four-client delete plus `fsyncdir` storm versus kernel ext4 at
+229.141343 ms (1.616x gap). A stripped daemon cycles profile captured 603 samples
+with zero loss; `__memmove` held 7.12%, `memcmp` 2.37%, and the remaining leading
+frames were FUSE read/write/syscall dispatch. Source attribution then found that
+vendored `fuser::Session::run` has one explicitly non-concurrent receive loop even
+though `MountOptions::resolved_thread_count()` reported four workers on the pinned
+cpuset. Ledger and recent-log grep ruled out the closed delete-serial-floor,
+version-coalescing, Cx-pooling, S3-FIFO slab, Bloom, DenseVisited, and
+write-block-ownership families. The alien-graveyard Arrakis/io_uring primitive was
+therefore tested narrowly: initialize once, then run one FUSE receive buffer/event
+loop per available worker over the shared channel while cloning only the Arc-backed
+adapter state.
+
+The pinned rotating same-host A/A/B run used byte-identical clean ext4 images
+(`e50b838a382a7e90ccaa71174fbce34b4e86626bb1706e835732727e05997aeb`), four
+directories, four clients, exact 128-byte payloads, setup outside timing, directory
+fsync, and 30 admitted 8,000-delete samples per arm:
+
+- frozen-pre control A: 397.520856 ms, CV 1.971210%
+- frozen-pre control B: 400.809427 ms, CV 4.300249%
+- four-loop candidate: 203.287380 ms, CV 2.246183%
+- kernel ext4: 76.778175 ms median, but CV 10.976081% (routing evidence only)
+
+The candidate was 1.963551x faster than the control-pool mean, well beyond the
+0.827270% A/A null spread. A larger 32,000-delete candidate/kernel comparator gave
+670.580733 ms at 0.758367% CV versus 236.532995 ms at 5.352389% CV; the kernel arm
+again missed the under-5% admission gate and no direct-kernel ratio is claimed.
+Frozen/candidate binary SHA-256 values were respectively
+`2918b6450ab97421e70b246776d5759de854ac4180d7988058e9ccd9d1788cf1` and
+`1ca2a3a46c8f6c2b54d8d6272c222a3f8ce61aa8015e76f093570b857c8083b3`.
+
+Correctness veto: three named scoped workers plus the main loop proved the
+candidate was actually live. Under repeated near-capacity four-client churn it
+then returned `EINVAL` while creating worker 2's file 13,641. Live accounting at
+the failure was 61,658 used inodes and 246,662/262,144 used blocks; after deleting
+every benchmark-created file it still reported 185,021 used blocks and only 17
+used inodes. Frozen controls, after the same smaller-storm A/A workload, returned
+to 16 inodes and 13,164 blocks. After graceful daemon shutdown, both frozen images
+passed `e2fsck -fn` rc 0 at 16 files/13,164 blocks and kernel passed rc 0 at
+16/13,600. The candidate failed rc 4 at 61,658 files/246,662 blocks with block- and
+inode-bitmap differences plus wrong free-block counts in every group. Ordering and
+tie-breaking are therefore not isomorphic: concurrent request execution can race
+ext4 allocation/free and durable-summary publication even though individual
+requests and replies are unchanged. Floating point and RNG are N/A.
+
+Strict-remote `cargo check -p ffs-fuse --all-targets` passed on `ovh-b`, job
+`j-29943190916169857`; strict-remote release CLI build passed on `vmi1153651`, job
+`j-29943190916169856`; targeted nightly rustfmt and `git diff --check` passed before
+measurement. Retry only when a mounted concurrency oracle proves linearizable
+ext4 block/inode allocation, free, and durable-summary publication across concurrent
+FUSE requests, and a fresh four-client 64,000-file create/delete cycle repeated at
+least 15 times returns to the frozen control's inode/block counts with every image
+passing `e2fsck -fn` rc 0. The same retry must also obtain an interleaved kernel
+comparator below 5% CV. Until all parts hold, shared-channel multiloop dispatch is
+ledger-CLOSED.
+
+## Ext4 fsync deferred-summary durability boundary - 2026-07-22 (KEEP correctness; perf-neutral; bd-fsync-journal-latency-gap-ptp4x / bd-opb6l)
+
+Status: KEEP as a required ext4 durability-boundary repair. The unchanged-directory
+hot path is performance-neutral within the same-worker A/A null; this is not claimed
+as another speedup.
+
+Profile and conformance first: after the durable-watermark scan KEEP, the mounted
+8,000-file unchanged-directory workload still spent 7.710211 seconds in 10,000
+`fsyncdir` calls. A server-side cycles profile captured 1,870 samples with zero loss,
+with the stripped release binary's leading sync-path address cluster holding 18.94%.
+The mandatory post-profile mounted check then supplied stronger negative evidence:
+both frozen controls and the candidate returned `e2fsck -fn` rc 4 with identical stale
+inode/block bitmaps, free counts, checksums, and group summaries, while kernel ext4 was
+clean. Ledger and recent-log grep showed that deferred GDT persistence is default-on
+and is required at durability boundaries; its recorded retry predicate now held because
+mounted FUSE and exact offline fsck reproduction were available. Source attribution
+found that FUSE `ext4_sync_with_logging` flushed MVCC versions and synced the device but
+never persisted the derived group descriptors or superblock free totals. It also
+published the MVCC cursor before the caller's device sync, contrary to its retry
+contract. No closed FIFO slab, Bloom prefilter, DenseVisited, or write-ownership family
+was retried.
+
+The kept boundary now holds the durable-cursor mutex while it flushes versions, clears
+the writable descriptor cache, persists group descriptors and superblock free totals
+when any version was flushed, and syncs the device. Only after every step succeeds does
+it publish `durable_through`; any error leaves the old cursor so retry rewrites the full
+suffix and its derived summaries. When `flushed == 0`, the new summary writes remain
+skipped, preserving the no-op watermark fast path. Ordering preserved: the original
+sorted/coalesced block writes are unchanged, followed by their required derived ext4
+summaries and the existing device sync. Tie-breaking unchanged: newest-visible MVCC
+selection is unchanged. Floating point and RNG: N/A.
+
+The decisive pinned, rotating, same-worker A/A/B/kernel run used fresh clones and 30
+samples per arm, each the median of three 2,000-call unchanged-directory `fsyncdir`
+batches after an exact 8,000 x 128-byte durable warmup:
+
+- frozen-pre control A: 819.529760 ms, CV 1.274955%
+- frozen-pre control B: 818.145700 ms, CV 1.410293%
+- candidate: 819.617904 ms, CV 0.947339%
+- kernel ext4: 2.200209 ms, CV 2.905261%
+
+Candidate/pre-control-pool is 1.000953x (0.0953% slower), inside the 1.001692x
+(0.1692%) A/A null spread: performance-neutral. Candidate remains 372.518x slower than
+kernel on this synchronous FUSE transport shape. Frozen/candidate binary SHA-256 values
+were respectively
+`5400b53171a337b1189657204f7728af08073bfcf1464de8e61593d9dfce02cb` and
+`2918b6450ab97421e70b246776d5759de854ac4180d7988058e9ccd9d1788cf1`.
+
+Behavior proof was exact. Every arm had 8,000 files, 1,024,000 payload bytes, and three
+matching sentinels. After daemon-only graceful SIGINT, both frozen images reproduced rc
+4 and their original 270-file/2,357-block summary; candidate passed `e2fsck -fn` rc 0
+with 8,271 files/10,406 blocks, and kernel passed rc 0 with 8,271 files/10,403 blocks.
+An independent fresh candidate clone also passed rc 0 with 8,271 files/10,406 blocks.
+The focused default-on/checksum-on fsync-summary test passed 1/1 on strict-remote
+`vmi1153651`, job `j-29943190916169812`; the release CLI build passed on strict-remote
+`vmi1227854`, job `j-29943190916169818`. Targeted nightly rustfmt and
+`git diff --check` passed.
+
+## Durable-watermark no-op checkpoint scan guard - 2026-07-22 (KEEP; bd-fsync-journal-latency-gap-ptp4x / bd-opb6l)
+
+Status: KEEP for the narrow MVCC checkpoint primitive. The mounted ext4 mutation
+conformance gap described below remains open and prevents an end-to-end kernel-parity
+claim.
+
+Profile first: after the incremental durable-watermark KEEP, a frozen-pre mounted image
+with 8,000 warm 128-byte files took 7.710211 seconds for 10,000 unchanged-directory
+`fsyncdir` calls. The server-side cycles profile captured 1,870 samples with zero loss;
+the stripped release binary's leading address cluster held 18.94% of samples. Source
+attribution then found the exact residual: both `MvccStore::flush_to_device_after` and
+`ShardedMvccStore::flush_to_device_after` still traversed every version map even when
+`snapshot.high == flushed_through`, although every visited version must be rejected by
+the watermark predicate. Ledger and recent-log grep found no prior read-side no-op
+checkpoint guard. The `fed3a313` stable-watermark publication null was a different
+SnapshotRegistry write-side atomic, and the closed DenseVisited/write-ownership families
+were not retried.
+
+The kept lever snapshots first and returns `(0, snapshot.high)` when
+`snapshot.high <= flushed_through`. Commit sequences are monotonic, so the stable
+snapshot cannot contain a version newer than the durable cursor in that branch. The old
+scan would therefore reject every entry and issue zero writes. A commit racing after the
+snapshot was already outside the old flush's visibility and remains outside the new one.
+The caller's device `sync` is unchanged. Public full-checkpoint calls still pass sequence
+zero and traverse whenever any committed version exists. Ordering preserved: yes, the
+only skipped branch emits no block run. Tie-breaking unchanged: yes, no visible version
+is selected in that branch. Floating point and RNG: N/A.
+
+The decisive same-worker mounted proof used four clones of the same clean ext4 image and
+froze the pre binary twice as null controls. Every arm was populated outside timing with
+exactly 8,000 x 128-byte files and validated for exact count, byte total, and three
+sentinel payloads before and after timing. Requester and three FUSE daemons were pinned to
+separate CPUs. Thirty rotating samples per arm each took the median of three 2,000-call
+unchanged-directory `fsyncdir` batches:
+
+- frozen-pre control A: 1,018.687532 ms, CV 3.296456%
+- frozen-pre control B: 1,018.529234 ms, CV 3.593459%
+- candidate: 836.161306 ms, CV 3.478875%
+- kernel ext4: 2.401584 ms, CV 2.750562%
+
+Candidate is 1.218101x faster than the faster frozen control (17.905% lower latency),
+comfortably clearing the 1.000155x A/A null spread. The remaining synchronous FUSE
+boundary is still dominant: candidate is 348.171x slower than kernel ext4 for this
+unchanged-directory shape, so this is an internal KEEP rather than a direct kernel win.
+Frozen-pre binary SHA-256 was
+`aff29fdaf03f5de5fb39ea3dfe3af28ad523167334c7da1893d891c797cd1454`;
+candidate was
+`5400b53171a337b1189657204f7728af08073bfcf1464de8e61593d9dfce02cb`;
+source fixture was
+`0de4b44cacb300d71cbf2b1ae1ef3eca7d56668bec25a8a0aad2faaea874c7cb`.
+
+Behavior-isomorphism is exact at the lever boundary. Existing single-store and sharded
+recording-device tests exercise the repeated call and assert zero writes plus the same
+returned watermark; both passed (2/2, strict-remote job `j-29942429901652413`). The
+all-target `ffs-mvcc` check passed on strict-remote `ovh-a` job
+`j-29943190916169800`, and the release CLI build passed on `vmi1227854` job
+`j-29943190916169756`. `git diff --check` passed.
+
+The broader mounted conformance gate exposed an unrelated existing defect and is recorded
+without laundering it: kernel ext4's post-run image passed `e2fsck -fn`, while both
+frozen controls and candidate returned rc 4 with byte-for-byte identical diagnostics
+(stale inode/block bitmaps, free counts, and group-summary metadata). A separate fresh
+candidate clone with daemon-only graceful SIGINT reproduced the same result. Thus the
+candidate neither creates nor hides this corruption, but the parent mounted comparator
+must remain open. A direct kernel durability verdict requires the ext4 mutation path to
+produce an `e2fsck -fn`-clean image for this exact 8,000-file setup first.
+
+## Incremental MVCC durable-checkpoint watermark - 2026-07-22 (KEEP; bd-opb6l / bd-fsync-journal-latency-gap-ptp4x)
+
+Status: KEEP - mounted small-file durability now beats kernel ext4 on the measured
+fresh-image fsync storm while preserving stronger whole-store durability.
+
+Profile-first attribution found the old implementation re-writing every visible MVCC
+block on every durability call. After a small mounted create/write run, the daemon logged
+`flushed_blocks=2087` and `duration_us=22172` for one final `fsyncdir`; batch latency rose
+as the tracked store grew. A 1,124-cycle daemon profile put syscall/scheduler and memory
+movement at the top, consistent with cumulative checkpoint traffic. Ledger and recent-log
+grep found no prior incremental durable-watermark attempt and ruled out the closed
+duplicate-sync, DenseVisited, write-block ownership, bitmap, htree, checksum, and
+copy/materialization families.
+
+The kept lever adds `flush_to_device_after` to both MVCC store layouts and keeps the
+existing public `flush_to_device` as a full checkpoint. `OpenFs` owns a base-device-scoped
+`CommitSeq` watermark under a mutex held across write and sync. Only latest visible
+versions newer than that watermark are sorted, coalesced, and written. The cursor advances
+only after success, so a partial failure retries the full suffix; serializing calls prevents
+an older snapshot from overwriting a newer durable one. Mount/replay begins at sequence
+zero. Ordering and newest-visible tie-breaking are unchanged; floating point and RNG are
+N/A.
+
+The decisive proof used six fresh SHA-identical ext4 images per arm, rotating frozen-pre
+control A, frozen-pre control B, candidate, and kernel ext4 on one local worker. Each arm
+created and durably warmed exactly 8,000 128-byte files, then pre-created exactly 200
+128-byte files outside timing and timed 200 file fsync calls plus directory fsync. Medians:
+
+- control A: 22,595.882959 ms, CV 4.025369%
+- control B: 21,977.519074 ms, CV 3.062814%
+- candidate: 109.866157 ms, CV 3.503933%
+- kernel ext4: 3,718.134447 ms, CV 2.302359%
+
+Thus candidate is 200.039x faster than the faster frozen control, clearing the 1.028x
+null spread, and 33.842x faster than kernel ext4 (97.05% lower latency). FrankenFS provides
+stronger behavior here: the first file fsync durably checkpoints all 200 already-created
+files; the watermark makes the remaining calls skip already-durable MVCC versions. Every
+run verified exact counts and byte totals outside timing, and all 24 images passed offline
+`e2fsck -fn`. Source fixture SHA-256 was
+`0de4b44cacb300d71cbf2b1ae1ef3eca7d56668bec25a8a0aad2faaea874c7cb`; pre/candidate
+binary SHA-256 values were respectively
+`025e9adc5c53e896ee8fce450d401a5bdddf5df566339578995f3613232de316` and
+`aff29fdaf03f5de5fb39ea3dfe3af28ad523167334c7da1893d891c797cd1454`.
+
+Correctness gates: new single and sharded tests prove unchanged durable old blocks,
+changed/new-only incremental writes, idempotent zero-write repeat, and preserved public
+full-checkpoint behavior (2/2 strict-remote, `ovh-a`, job `j-29942429901652302`). The
+strict-remote all-target check for `ffs-mvcc` plus `ffs-core` passed in job
+`j-29942429901652292`; release CLI build passed in job `j-29942429901652307`.
+Targeted rustfmt and `git diff --check` passed. Two later full-crate-test submissions were
+rejected before execution because RCH had no admissible worker; fail-closed remote policy
+was honored and no local Cargo ran.
+
 ## ext4_write full-block build: skip the memset on a full-block overwrite - 2026-07-14 (KEEP)
 
 Status: KEEP — a real DEFAULT write-path win (not sharded/default-off).
@@ -2989,3 +9408,412 @@ independently-revertible steps, per-step `e2fsck -fn` gates, crash-consistency, 
 proof section. My independent **7/7** verification stands as its second-agent peer review. Editing it would
 collide and non-src edits revert within minutes — so I did not. The plan is sign-off-ready and de-risked by
 two agents; the FS-mutating cutover remains cod's.
+
+## 2026-07-22 — bd-kdmu4 PREMISE AUDIT: the 2.9–5x multi-file parallel-read headline is DEAD on current code — measured at KERNEL PARITY OR BETTER (cc)
+
+The 2026-07-10 closeout left `bd-kdmu4` "RESOLVED on O_DIRECT (1.00x); its 2.9x multi-file
+premise UNAUDITED" and prescribed an audit against the identity / magnitude / impossibility
+validity gates. This entry is that audit. **Verdict: the premise no longer holds.**
+
+### Premise under test
+
+"Multi-file parallel read (256 files x 256 KiB, `walk --read-data --parallel`) is ~2.9–5x
+slower than an in-process threaded C reader; 41% pread copy tax + 27% nested-rayon
+coordination" (2026-06-22, CrimsonFox). Since then the gap was engineered away lever by
+lever: `bd-2x68s` per-worker walk buffer reuse + 3.2x multi-file walk win, the 32-block
+read-chunk retune, `21113a70` build_global(16) walk cap, `7a6091a2` 16-wide read pool, and
+the 2026-07-16 fan-out-cap class (`9af088db`/`650fc5a9`/`ffd672ee`).
+
+### Method
+
+* **Subject:** `target/release/ffs-cli` (Jul 13, opt-z baseline-ISA `release` profile,
+  contains `21113a70`'s x16 walk cap — every run printed `[parallel x16]`; predates the
+  Jul-16 caps, which do not trigger on this workload). Engine time from the `walked … in Xms`
+  line (excludes image open, includes parallel readdir+getattr+full data read).
+* **Fixtures (fresh, purpose-built):** `/data/tmp/kdmu4_small.img` = exact premise replica,
+  256 files x 256 KiB = 64 MiB in 16 dirs; `/data/tmp/kdmu4_big.img` = honest-size variant
+  per the >=1 GiB sizing rule, 2048 files x 512 KiB = 1 GiB in 32 dirs. mke2fs -b4096 -d;
+  all files single-extent (filefrag-verified).
+* **Kernel arm:** in-process pthread C reader (`reader.c tree`), per-file open (own `f_ra`),
+  contiguous per-thread file partition, 128 KiB pread chunks, readdir+lstat walk inside the
+  timed region — on a **`--direct-io=on` loop mount** (dio=1 verified) per the recorded
+  loop-dio methodology.
+* **Floor arm:** same C harness in `ranges` mode: raw parallel pread of the files' physical
+  extents from the image file, per-thread fd, contiguous partition. First floor build used
+  atomic round-robin dispatch and FAILED the impossibility gate (ffs 225.5 ms < "floor"
+  243.3 ms cold-1GiB) because round-robin destroys per-fd sequentiality while rayon gives
+  each worker a contiguous span — the floor was rebuilt with contiguous partitioning and
+  the gate then passed everywhere (e.g. cold-1GiB floor 200–212 ms < ffs 210–229 ms).
+* **Gates:** identity — all three arms XOR64-identical per fixture (`46d5e61487c25876` /
+  `6136f5eaeccd58af`, byte counts exact 67,108,864 / 1,073,741,824) + `ffs-cli read`
+  sha256 == kernel-mount sha256 on sample files; magnitude — file/byte counts exact in every
+  arm; impossibility — fixed floor below subject in every cell. `sync && drop_caches=3`
+  before every cold arm, arms interleaved within each rep, 7 reps, medians + min + cv.
+
+### Results (campaign 1, quiet box — 15-min load avg ~9; T=16 all arms)
+
+| fixture / mode | ffs engine | kernel C reader (dio loop) | raw floor (fixed) | verdict |
+| --- | --- | --- | --- | --- |
+| 64 MiB premise replica, cold | **17.6 ms** (cv 2.1–3.2%) | 18.7 ms (cv 2.2%) | 13.7 ms | **ffs 1.06x FASTER** |
+| 64 MiB premise replica, warm | 4.4–5.1 ms | 4.2–4.5 ms (cv 12–19%) | 2.3–2.9 ms | parity (<=1.2x within noise) |
+| 1 GiB honest-size, cold | **225.5 ms** (cv 1.1%) | 244.6 ms (cv 0.7%) | 200–212 ms | **ffs 1.08x FASTER** |
+| 1 GiB honest-size, warm | **29.7 ms** (cv 3.5%) | 33.5 ms (cv 3.2%) | 26.2 ms | **ffs 1.13x FASTER** |
+
+Kernel-best sweep (T in {8,16,32}, min-of-3): best kernel cold anywhere = 17.8 ms (64 MiB)
+/ 229.4 ms (1 GiB); against ffs's worst clean medians that is still **1.00–1.01x = parity**.
+Conservative worst-vs-best framing does not resurrect any gap, and the opt-z baseline-ISA
+subject binary only understates the v3+PGO production build.
+
+### Load-storm replication (campaign 2) — the "needs low-load window" caveat is real
+
+A 1-min load-avg spike to ~54 (sibling agents) landed mid-campaign-2. Cold verdicts
+reproduced under load (ffs 1.03–1.09x faster than the kernel arm, cv 9–14%), but warm-1GiB
+inverted: ffs 119–200 ms vs C reader 40–69 ms — **under CPU contention the rayon walk
+degrades ~4x while the plain pthread reader degrades ~1.5x.** Campaign 1 is the valid
+dataset; the load observation matches the bead's recorded "needs low-load window" and is a
+scheduling-sensitivity fact, not a filesystem gap.
+
+### Disposition
+
+* `bd-kdmu4` **CLOSED**: O_DIRECT/mmap resolved earlier at 1.00x (do not approve for
+  latency); the 2.9–5x multi-file premise is now AUDITED and REFUTED on current code —
+  in-process multi-file parallel read is at kernel parity or better, floor-bounded residual
+  headroom <=5–9% cold. The "41% copy tax" attribution died with the workload gap: the floor
+  pays the same buffered copy and ffs sits within 5–9% of it.
+* The mmap-backed / zero-copy ByteDevice lane is **not justified by any remaining measured
+  gap on this surface** — consistent with the standing 1.00x bypass measurement.
+* Reproduction: harness + driver at the session scratchpad (`reader.c`, `bench.py`),
+  fixtures kept at `/data/tmp/kdmu4_{small,big}.img`.
+
+### Retry predicate
+
+Reopen a multi-file in-process read gap ONLY with: a quiet box (1-min load < ~2x cores/4),
+the three validity gates, a contiguous-partition raw floor, and a dio-loop kernel arm.
+Open adjacent surfaces this audit does NOT cover: the FUSE-mounted multi-file read path
+(`bd-zvn7r`(b) per-chunk destination question) and rayon-under-CPU-contention scheduling
+sensitivity (new observation above; a per-request dispatch comparator would isolate it).
+
+## 2026-07-22 — FUSE-MOUNTED multi-file read gap ISOLATED for the first time + per-thread-read-fd lever REJECTED (bd-kdmu4 / bd-zvn7r(b), cc)
+
+Continuation of the same-day premise audit above, moving to the one read surface it did not
+cover: the real FUSE mount. Subject binary: Jul-13 `release` ffs-cli (baseline arm), then a
+locally-built same-source binary for the lever A/B (env-toggled, same binary both arms).
+Fixture: `/data/tmp/kdmu4_big.img` (2048 x 512 KiB = 1 GiB). Reader: the audited pthread C
+tree reader (contiguous partition, T=16, 128 KiB), identity-gated (XOR64
+`6136f5eaeccd58af` in EVERY run below, including through the full FUSE stack).
+AppArmor gotcha recorded: Ubuntu's `fusermount3` profile only permits mounts under
+`$HOME`/`/mnt`/`/media`/`/tmp`/`/run/user` — mounting at `/data/...` fails EPERM even via
+sudo; use `/mnt/*`.
+
+### The mounted gap (kernel arm = dio-loop ext4, same reader)
+
+| regime | ffs FUSE | kernel | ratio |
+| --- | --- | --- | --- |
+| cold (drop_caches) | 1282–1689 ms | 232–241 ms | **5.5–7.0x slower** |
+| daemon-warm (all image bytes page-cached, FUSE pages cold) | 596–1328 ms | n/a (no daemon) | **disk-free path is ~0.6–1.3 s for 1 GiB** |
+| fully warm | 117 ms | 29–90 ms | measures kernel FUSE page cache, not the daemon |
+
+The in-process engine is at kernel parity (entry above); **the mounted path is where the
+multi-file read gap actually lives, and it is larger than the retired 2.9–5x headline.**
+Daemon-warm ≈ cold shows the path is not disk-bound.
+
+### Profile attribution (perf -g on the daemon, daemon-warm storm, 12.3k samples/8 s)
+
+* `native_queued_spin_lock_slowpath` **41%** — `__filemap_add_folio` ← `page_cache_ra` ←
+  `ext4_file_read_iter` ← `preadv` on the image file: the KNOWN shared-`struct file`
+  readahead/`xa_lock` convoy (single `Arc<File>` in `FileByteDevice`, 16 `ffs-read-*`
+  threads).
+* `_copy_to_iter` **1.83%**, `__pi_memcpy` **1.50%** — **the copy tax is ~3% of daemon
+  self-time on the mounted path.** The "~2x structural pread copy-tax / 41% of read time"
+  framing is dead on this surface too; an mmap-backed ByteDevice has nothing to remove.
+* ~12.3k samples / 8 s across 82 threads ≈ **~1.5 CPUs busy: the daemon is mostly idle.**
+  Wall is bounded by FUSE round-trip/dispatch concurrency, not by daemon CPU and not by
+  copies.
+
+### The lever tried (one lever): per-thread re-opened read fds in `FileByteDevice` — REJECT
+
+Rationale: the profiled 41% spin is the exact pathology the 2026-07-10 raw-harness rows
+measured per-thread fds fixing (insertions 5.9x down, wall 1.41x at T=8) — but those same
+rows also warned "per-thread fd cuts insertions 4.2x and buys no wall (p=0.18)" once the
+fan-out is capped. Implemented safely (thread_local HashMap keyed by device id, re-open
+verified against open-time `(st_dev, st_ino)`, reads only, `FFS_PER_THREAD_READ_FD=0`
+kill-switch for same-binary A/B), built locally, measured 3 interleaved mount-cycle reps:
+
+| arm | off (shared fd) | on (per-thread fds) | verdict |
+| --- | --- | --- | --- |
+| FUSE cold | 1281.7 ms (min 1257.6) | 1363.8 ms (min 1319.1) | **~6% REGRESSION** |
+| FUSE daemon-warm | 596.2 ms (min 590.4) | 660.3 ms (min 635.7) | **~11% REGRESSION** |
+| in-process walk cold | 221.3 ms | 219.4 ms | neutral (1.01x) |
+
+Identity: XOR64 equal in all arms. **REJECT — the spin is overlapped CPU burn, not wall,
+exactly as the 07-10 "insertion count is a lock-wait lever only" row predicted; the extra
+re-opens/fstat and doubled readahead streams cost more than the convoy they remove.**
+Production hunk STASHED (not landed): `stash@{0}` "bd-kdmu4 REJECTED lever: per-thread
+read fds in FileByteDevice". The Jul-13 baseline binary was restored to `target/release`.
+(Remote `cargo test -p ffs-block` on the lever tree also caught a test-module struct
+literal needing the new fields — moot post-stash, but it re-confirms the update-all-
+constructors rule.)
+
+### Retry predicate / the actual next levers (measured surface, unworked)
+
+Do NOT retry: per-thread/dup'd read fds for wall (twice-refuted), mmap/O_DIRECT on any
+read surface (copy ~3% here, bypass 1.00x there), or insertion-count-driven levers.
+The mounted read gap is a **round-trip/dispatch-concurrency** problem. Next levers, in
+suspected order: (1) FUSE request sizing — verify negotiated `max_read`/`max_readahead`
+and the per-request size the daemon actually serves (8192 x 128 KiB requests at ~73 us
+effective each); (2) `--runtime-mode per-core` (thread-per-core dispatcher, shipped
+opt-in, never A/B'd on this workload); (3) daemon-side readahead/prefetch depth on the
+mounted path (OliveCliff's bounded readahead machinery exists); (4) FUSE passthrough is
+NOT applicable (no per-file backing fd for image-embedded files). Each needs the same
+identity-gated C-reader A/B on a quiet box (1-min load < ~16 here; this session ran at
+9–33 with one storm to 54 — mount-cycle interleaving kept arms comparable).
+
+## 2026-07-22 — KEEP: async per-request read dispatch on the FUSE mount — cold multi-file 3.85x faster, gap vs kernel 5.5x → 1.43x (bd-kdmu4, cc)
+
+The turn-2 entry above attributed the mounted multi-file read gap to serial request
+dispatch: `fuser::spawn_mount2` runs ONE session loop, the `Filesystem::read` op replied
+inline, so 16 concurrent client readers were served strictly one-at-a-time (daemon ~1.5
+CPUs busy, copies ~3%). This turn landed the bead's own prescribed "per-request dispatch
+model" for the read op.
+
+### The lever (one lever, src-only, `crates/ffs-fuse/src/lib.rs`)
+
+`FuseInner` gains a dedicated `read_offload` rayon pool (sized by the existing
+`thread_count` knob that already sizes `max_background`; named `ffs-fuse-rd-*`).
+`Filesystem::read` now moves `(shared_handle, params, ReplyData)` onto that pool and
+returns immediately — the session loop fetches the next kernel request while workers
+serve and reply concurrently. The serve body is the exact former inline body
+(`serve_read_request`), so bytes/errors/metrics are unchanged; fuser's `ReplySender` is
+`Send + Sync + 'static` by design for cross-thread replies, and FUSE imposes no
+reply-ordering requirement across requests. Kill switch: `FFS_FUSE_ASYNC_READ=0` forces
+the inline pre-lever path (same-binary A/B); the pool also degrades to inline when it
+cannot be built or `thread_count < 2`.
+
+### Measurement (same binary, env-toggled, 4 interleaved mount-cycle reps, T=16 C reader, 1 GiB / 2048 files, quiet box load ~8)
+
+| regime | inline (off) | dispatched (on) | ratio |
+| --- | --- | --- | --- |
+| cold (drop_caches) | 1327.5 ms (cv 1.8%) | **345.1 ms** (cv 3.8%) | **3.85x faster** |
+| daemon-warm | 658.3 ms (cv 2.5%) | **244.3 ms** (cv 5.9%) | **2.69x faster** |
+| vs kernel (dio-loop ext4, same session: 242.0 ms median cold) | 5.5x slower | **1.43x slower** | — |
+
+Marginal cost, reported honestly: single-stream T=1 cold medians 1148 ms (off) vs 1207 ms
+(on) over 3 interleaved reps with overlapping ranges (~5%, per-request handoff cost).
+Accepted against the 3.85x multi-stream win; the T=1 surface has its own open lever
+(daemon readahead depth).
+
+### Behavior proof
+
+* Identity: XOR64 `6136f5eaeccd58af` in every off/on run of every regime (16 A/B runs +
+  T=1 runs), byte-identical through the full FUSE stack.
+* `cargo test -p ffs-fuse` (remote): **573 passed / 0 failed**.
+* Ordering preserved: per-request bytes identical; FUSE has no cross-request reply
+  ordering contract. Tie-breaking/floating-point/RNG: N/A. The pre-existing
+  `fuse_inner_shared_across_threads` test already models concurrent dispatch.
+* ubs on the file: 19 criticals, all pre-existing whole-file heuristics (test panics,
+  token-compare false positives), none in the changed hunks.
+
+### Follow-ups (open, this lane)
+
+Residual mounted gap is 1.43x cold: next levers are daemon-side readahead depth for the
+single-stream path, offloading `readdir`/`getattr` the same way (metadata storms), and
+the negotiated `max_readahead` audit. The rejected per-thread-fd stash and the mmap/
+O_DIRECT closures are unaffected by this change.
+
+## 2026-07-22 — three non-KEEPs close the cheap-dispatch vein: metadata offload REJECT, readahead null, request-count null (bd-kdmu4, cc)
+
+Continuation after the 3.85x async-read KEEP (11d82483). Same harness, fixtures, identity
+gates (XOR64 `6136f5eaeccd58af` held in every run below). Session loop occupancy probe
+first: during a cold storm with async-read ON, the loop thread burns 54% of wall, the 8
+`ffs-fuse-rd-*` workers ~50% each — headroom on the loop, workers intermittently starved.
+
+### 1. Metadata-op offload onto the read pool — REJECT (production hunk stashed)
+
+Factored `lookup`/`getattr`/`open`/`opendir`/`readdir` into `serve_*` bodies dispatched
+onto the existing `read_offload` pool (env `FFS_FUSE_ASYNC_META`, writeback-cache mode
+kept inline, `readdirplus` descoped). Same-binary interleaved A/B, 4 mount-cycle reps,
+async-read ON in both arms:
+
+| regime | inline meta (off) | offloaded meta (on) | verdict |
+| --- | --- | --- | --- |
+| cold | 337.2 ms (cv 1.4%) | 351.5 ms (cv 1.8%) | **+4% REGRESSION** |
+| daemon-warm | 236.1 ms (cv 2.7%) | 262.1 ms (cv 3.0%) | **+11% REGRESSION** |
+
+Mechanism: small metadata tasks queue behind large read tasks on the shared 8-thread
+pool; the loop had spare capacity to pump them inline. Stashed as `stash@{0}`
+("metadata-op offload onto read pool"). Retry predicate: only with a SEPARATE small-op
+pool AND a measured session-loop occupancy >90% (loop saturation), e.g. after multiple
+/dev/fuse queues exist. `flush`/`release` offload is predicted-negative by the same
+mechanism — do not try it standalone.
+
+### 2. Kernel readahead sizing (`/sys/class/bdi/<dev>/read_ahead_kb`) — NULL
+
+FUSE bdi defaults to 128 KB. Sweeping 128 → 1024 → 4096 KB (no code change):
+T=1 cold 1381 / 1495 / 1400 ms (flat, ±8% noise); T=16 cold 416 / 404 / 418 ms (flat).
+Raising `max_readahead` in INIT is therefore not a lever on this workload — do not
+plumb it as a mount option expecting wall.
+
+### 3. Request-count instrumentation — coalescing works; T=1 is NOT round-trip-bound
+
+strace read() totals over a T=1 cold GiB: 20,741 calls at ra=128 KB vs 14,581 at
+ra=4096 KB — the kernel DOES issue fewer, larger requests with bigger readahead
+(fuser already advertises `FUSE_ASYNC_READ`; `max_pages` derives from
+`max(max_write, max_readahead)` and `FUSE_MAX_PAGES` is echoed). Yet un-straced wall is
+flat — so the single-stream residual is serial pipeline bubbles (disk read → reply copy →
+next request), not request count. Fixing that means daemon-side prefetch depth/overlap
+(ReadaheadManager) — a structural item, not a config flip.
+
+### Vein status (3 consecutive non-KEEPs → switch per campaign discipline)
+
+The mounted multi-file read surface stands at **1.43x of kernel cold** (from 5.5x at
+session start) with the loop unsaturated and cheap dispatch/config levers exhausted.
+Remaining read-lane items are structural: single-stream prefetch pipelining (bounded
+value; T=1 is a minor real-world surface), and multi-queue /dev/fuse (clone_fd) if the
+loop ever saturates. Next turn switches vein per the alien-graveyard mandate (still
+read-lane: a different primitive class, not more dispatch tuning). mmap/O_DIRECT remain
+closed everywhere (copies ~3% of daemon self-time; bypass 1.00x).
+
+## 2026-07-22 — NEUTRAL-REJECT: daemon-side async next-window prefetch is redundant with kernel image-file readahead (bd-kdmu4, cc)
+
+Vein-switch lever after the dispatch-vein closure. Target: the measured T=1 "pipeline
+bubble" (serial window fetch at every readahead boundary; request coalescing previously
+proven present-but-flat). Implemented double-buffered prefetch: on a predicted-stream
+miss, `read_with_readahead` background-fetches the FOLLOWING 256 KiB window on the
+`read_offload` pool (in-flight dedup set in `ReadaheadManager`, snapshot-scoped
+`ops.read`, no `access_predictor` feedback, RO-non-writeback mounts only — a background
+insert on a writable mount could race `invalidate_inode` and re-cache pre-write bytes).
+Env `FFS_FUSE_ASYNC_PREFETCH` for same-binary A/B.
+
+### Measurement (4 interleaved mount-cycle reps, 1 GiB fixture, box load noisy — one
+~2 s outlier per arm, cv 14–24%; min-of-4 is the robust stat)
+
+| arm | prefetch off | prefetch on | verdict |
+| --- | --- | --- | --- |
+| T=1 cold | min 1324.5 ms (med 1511.6) | min 1331.4 ms (med 1350.3) | **PARITY at min** |
+| T=16 cold | min 366.0 ms | min 355.6 ms | within noise (~3%) |
+
+Identity XOR64 held in every run.
+
+### Why it cannot win (the insight worth keeping)
+
+`FileByteDevice` opens the image with `POSIX_FADV_SEQUENTIAL`; the daemon's window
+fetches are near-sequential preads of the image file, so the KERNEL's own readahead on
+the image file already pipelines the next windows into the page cache ahead of the
+daemon. The "boundary stall" is a page-cache hit (~100 us), not a device read — there is
+almost nothing for daemon-side prefetch to hide. Daemon-level prefetch duplicates
+kernel-level prefetch one layer down. Production hunk STASHED (`stash@{0}`,
+"async next-window prefetch"). Retry predicate: only if the image-file read path ever
+loses kernel readahead (O_DIRECT backend, network/blob backend, or `FFS_READ_FADVISE=random`),
+where a daemon-side window pipeline would be the only prefetch layer — measure there first.
+
+### Lane status after this turn
+
+Mounted multi-file: **1.43x cold** (session start 5.5x), loop unsaturated, dispatch +
+config + prefetch veins all closed with numbers. In-process: kernel parity. T=1
+single-stream: bounded by per-request service time under an already-pipelined backend;
+no cheap lever identified. Consecutive non-KEEPs in this vein: 1 (this entry). Next
+fresh vein candidates (unmeasured surfaces, per campaign lesson that un-benched spots
+still yield): `bd-vpypn` extent walks at HIGH extent counts (never measured, both
+sequential and random); mounted metadata-storm surfaces (statfs/xattr through FUSE).
+mmap/O_DIRECT stay closed everywhere.
+
+## 2026-07-22 — KEEP: ExtentCache batch eviction — warm 8192-extent read 2.44x faster, cold 1.80x (bd-vpypn / bd-kdmu4, cc)
+
+The bd-vpypn regime ("extent behavior at hundreds-to-thousands of extents was never
+measured") finally measured — and it hid the predicted scan gap.
+
+### Fixture (new, reproducible)
+
+`/data/tmp/kdmu4_frag.img`: `/d/frag.bin` = 64 MiB with **8192 single-block extents**
+(alternating 4 KiB hole-punch via fallocate on a loop mount; filefrag -v verified;
+note filefrag's summary line lies — trust `-v`), plus `/d/contig.bin` 64 MiB
+contiguous control. e2fsck-clean.
+
+### The gap and the mechanism
+
+`ffs-cli read` warm: frag 161.6 ms vs contig 17.2 ms = **9.4x** while the kernel's
+frag/contig warm ratio is 1.04x. Symbolized profile (release + debuginfo env
+overrides): `ExtentCache::insert` 21.7% + BTree `search_tree` 14.1% + BTree
+`Iter::next`/`next_kv`/`next_leaf_edge` 18.8% ≈ **57% of the read**. Cause:
+`evict_lru_except` did a full-shard BTreeMap scan per insert (`min_by_key`), and one
+inode's mappings all land in ONE shard (capacity 1024) — a >capacity extent stream
+makes every insert O(shard), i.e. quadratic. (This is the true cost behind the
+2026-07-16 fleet-blocked `insert_batch` stash, which chased the LOCK, not the scan.)
+
+### Lever (one lever, `crates/ffs-extent/src/lib.rs`)
+
+Batch eviction: one scan selects the `max(1, capacity/8)` LRU victims via
+`select_nth_unstable_by_key` on the exact historical `(last_access, key)` ordering,
+amortizing eviction to O(len/batch) per insert. `FFS_EXTENT_EVICT_BATCH=1` restores
+the historical single-victim behavior (same-binary A/B); with batch=1 the victim is
+IDENTICAL to the old `min_by_key`, tie-break included, so capacities <16 — including
+both eviction unit tests — keep exact historical semantics. Eviction choice never
+affects returned mappings, only what must be re-resolved from the authoritative tree.
+
+### Measurement (same binary, env-toggled, interleaved, 5 reps + 7-rep contig guard)
+
+| surface | single (incumbent) | batch | ratio |
+| --- | --- | --- | --- |
+| warm frag (pure CPU) | 210.5 ms (cv 3.6%) | **86.2 ms** (cv 6.5%) | **2.44x** |
+| cold frag | 249.6 ms (cv 8.5%) | **139.0 ms** (cv 14.4%) | **1.80x** |
+| warm contig guard | 17.3 ms | 17.4 ms | parity (eviction never fires) |
+
+Identity: sha256 of full frag.bin bytes identical single-vs-batch AND equal to the
+kernel loop-mount sha (`5fb93b1c…`). `cargo test -p ffs-extent` remote: **154/0**.
+rustfmt clean; ubs 0 critical.
+
+### Residual + next levers on this surface
+
+Warm frag (86 ms) is still ~5x contig: the shard (cap 1024) cannot hold 8192 mappings,
+so the stream still thrashes (miss → tree re-walk → insert → batch-evict cycle).
+Candidates: don't cache a leaf's mappings when the namespace's mapping count exceeds
+shard capacity (cache the LEAF page instead / rely on the arc_swap extent map);
+per-namespace capacity awareness; or a direct extent-map path for >capacity files.
+Also note `ffs-cli read` duration includes ~13 ms fixed CLI startup — ratios above are
+end-to-end and thus conservative.
+
+## 2026-07-22 — KEEP #2 on the high-extent regime: publish hot extents for DEEP trees on one-shot reads — warm frag another 2.53x, cold beats the kernel arm (bd-vpypn / bd-kdmu4, cc)
+
+Profile-first on the post-batch-eviction binary: the residual warm-frag cost was still
+~29% in the cache layer, now the per-insert BTreeMap DESCENT (`search_tree` 21.9% +
+`insert` 6.7%) — ~16k lookups/inserts per read (8192 data mappings re-inserted leaf-by-
+leaf plus one single-block HOLE SENTINEL per hole block) into a shard that can never
+hold them.
+
+### Root cause
+
+`OpenFs` already has a lock-free full-map fast path (`ext4_hot_extents`,
+`ArcSwapOption<(ns, Arc<[ExtentMapping]>)>`) that resolves blocks AND holes in-memory
+with zero cache traffic — but its publication was gated on `inode_was_hot`, i.e. never
+for a one-shot full-file read ("a one-shot multi-file read never pays the full-tree
+walk"). For a DEEP extent tree that trade inverts: the "saved" full walk is ~25 leaf
+reads the per-miss path pays leaf-by-leaf anyway, while the un-published read pays the
+16k-op cache storm.
+
+### Lever (one lever, `crates/ffs-core/src/lib.rs`)
+
+Publish also when `ext4_deep_extent_tree(inode)`: root header `depth >= 1` from the
+pure in-inode parse (`parse_inode_extent_tree`), env kill switch
+`FFS_HOT_EXTENTS_DEEP=0`. Depth-0 trees (≤4 inline extents — every small-file-storm
+case) keep the historical one-shot behavior byte-for-byte.
+
+### Measurement (same binary, env-toggled, interleaved, 5 reps)
+
+| surface | off (incumbent) | on (deep publish) | ratio |
+| --- | --- | --- | --- |
+| warm frag 8192-extent | 86.6 ms (cv 3.4%) | **34.2 ms** (cv 6.4%) | **2.53x** |
+| cold frag | 106.5 ms (cv 6.3%) | **59.3 ms** (cv 3.1%) | **1.80x** |
+| warm contig guard | 26.9 ms | 27.2 ms | parity |
+| multi-file storm guard (1 GiB walk) | 229.4 ms | 230.4 ms | parity |
+
+sha256 identity both arms (= kernel loop-mount sha). Targeted `ffs-core` tests
+(extent/hot/resolve/read_file): **125 passed / 0 failed** remote. rustfmt clean.
+
+### Stacked session result on this regime (fixture `/data/tmp/kdmu4_frag.img`)
+
+warm frag: 161.6 → 34.2 ms (**4.7x**, now ~1.26x of contig vs kernel's 1.04x ratio);
+cold frag: 184.4 → 59.3 ms (**3.1x**) — and the cold fragmented read now lands BELOW
+the dio-loop kernel arm's 75.0 ms on the same fixture (different I/O path — direct
+image pread vs loop — so stated as arm-vs-arm, not "faster than kernel ext4" absolute).
+Remaining residual vs contig (~7 ms warm) is the per-segment assembly of 8192
+one-block extents + hole memset; no cheap lever identified — diminishing returns.

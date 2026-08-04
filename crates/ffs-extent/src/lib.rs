@@ -406,7 +406,17 @@ pub fn allocate_extent(
     owner: ExtentOwner,
 ) -> Result<ExtentMapping> {
     allocate_extent_inner(
-        cx, dev, root_bytes, geo, groups, logical_start, count, hint, pctx, owner, false,
+        cx,
+        dev,
+        root_bytes,
+        geo,
+        groups,
+        logical_start,
+        count,
+        hint,
+        pctx,
+        owner,
+        false,
     )
 }
 
@@ -431,7 +441,17 @@ pub fn allocate_extent_coalescing(
     owner: ExtentOwner,
 ) -> Result<ExtentMapping> {
     allocate_extent_inner(
-        cx, dev, root_bytes, geo, groups, logical_start, count, hint, pctx, owner, true,
+        cx,
+        dev,
+        root_bytes,
+        geo,
+        groups,
+        logical_start,
+        count,
+        hint,
+        pctx,
+        owner,
+        true,
     )
 }
 
@@ -1446,6 +1466,21 @@ fn shard_index(ns: u64) -> usize {
     ((mixed >> 32) as usize) % EXTENT_CACHE_SHARDS
 }
 
+/// Eviction batch size for a shard of the given capacity: `max(1, capacity/8)`
+/// by default, overridable via `FFS_EXTENT_EVICT_BATCH` (parsed once; `1`
+/// forces the historical one-victim-per-insert behavior for same-binary A/B).
+fn extent_evict_batch(capacity: usize) -> usize {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    let overridden = *OVERRIDE.get_or_init(|| {
+        std::env::var("FFS_EXTENT_EVICT_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+    });
+    overridden.unwrap_or_else(|| (capacity / 8).max(1))
+}
+
 struct ExtentCacheInner {
     /// Entries keyed by `(namespace, logical_start)`.
     ///
@@ -1769,21 +1804,42 @@ impl ExtentCacheInner {
         self.entries.remove(&key);
     }
 
-    /// Evict the unique LRU victim: oldest `last_access`, then smallest key.
+    /// Evict the least-recent entries: oldest `last_access`, then smallest key.
     /// This runs only on insert-at-capacity, keeping the hot hit path read-only
     /// apart from atomics.
+    ///
+    /// Evicts a BATCH of `max(1, capacity / 8)` victims in ONE scan (overridable
+    /// via `FFS_EXTENT_EVICT_BATCH`; `1` restores the historical single-victim
+    /// behavior). The former one-victim-per-insert form re-scanned the whole
+    /// shard's BTreeMap on EVERY insert once a shard was full, which is
+    /// quadratic when one namespace streams in more mappings than the shard
+    /// holds — profiled at ~57% of a warm 8192-extent single-file read
+    /// (`ExtentCache::insert` + BTree search/iter, bd-vpypn 2026-07-22). One
+    /// scan per `batch` inserts amortizes that to O(len/batch) per insert. The
+    /// victim ORDER is unchanged — `select_nth_unstable_by_key` uses the exact
+    /// `(last_access, key)` ordering of the old `min_by_key`, so with batch=1
+    /// (and thus for capacities < 16, including every eviction unit test) the
+    /// evicted row is identical to the historical victim, tie-break included.
+    /// Eviction choice never affects returned mappings — only which entries
+    /// must be re-resolved from the authoritative extent tree later.
     fn evict_lru_except(&mut self, protected_key: (u64, u32)) {
-        let Some(key) = self
+        let over = self.entries.len().saturating_sub(self.capacity);
+        let batch = extent_evict_batch(self.capacity).max(over);
+        let mut rows: Vec<(u64, (u64, u32))> = self
             .entries
             .iter()
             .filter(|&(&key, _)| key != protected_key)
-            .min_by_key(|&(&key, entry)| (entry.last_access.load(Ordering::Relaxed), key))
-            .map(|(&key, _)| key)
-        else {
+            .map(|(&key, entry)| (entry.last_access.load(Ordering::Relaxed), key))
+            .collect();
+        if rows.is_empty() {
             return;
-        };
-        self.entries.remove(&key);
-        atomic_saturating_add(&self.evictions, 1);
+        }
+        let k = batch.clamp(1, rows.len());
+        rows.select_nth_unstable_by_key(k - 1, |&(last_access, key)| (last_access, key));
+        for &(_, key) in &rows[..k] {
+            self.entries.remove(&key);
+        }
+        atomic_saturating_add(&self.evictions, u64::try_from(k).unwrap_or(u64::MAX));
     }
 }
 

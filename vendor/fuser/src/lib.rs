@@ -1028,3 +1028,20 @@ pub fn spawn_mount2<'a, FS: Filesystem + Send + 'static + 'a, P: AsRef<Path>>(
     check_option_conflicts(options)?;
     Session::new(filesystem, mountpoint.as_ref(), options).and_then(|se| se.spawn())
 }
+
+/// Like [`spawn_mount2`], but dispatches kernel requests on `worker_count`
+/// concurrent threads. A count of 1 keeps the historical single-threaded loop.
+pub fn spawn_mount2_with_workers<
+    'a,
+    FS: Filesystem + Clone + Send + 'static + 'a,
+    P: AsRef<Path>,
+>(
+    filesystem: FS,
+    mountpoint: P,
+    options: &[MountOption],
+    worker_count: usize,
+) -> io::Result<BackgroundSession> {
+    check_option_conflicts(options)?;
+    let session = Session::new(filesystem, mountpoint.as_ref(), options)?;
+    BackgroundSession::new_with_workers(session, worker_count)
+}

@@ -10,9 +10,12 @@
     clippy::if_not_else
 )]
 
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 fn emit_scenario_result(scenario_id: &str, outcome: &str, detail: Option<&str>) {
     match detail {
@@ -112,6 +115,1487 @@ fn run_ffs_cli(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("failed to execute ffs-cli")
+}
+
+fn required_env_path(name: &str) -> PathBuf {
+    std::env::var_os(name).map_or_else(
+        || panic!("{name} must be set for the ignored bd-b9dug driver"),
+        PathBuf::from,
+    )
+}
+
+fn required_env(name: &str) -> String {
+    std::env::var(name)
+        .unwrap_or_else(|_| panic!("{name} must be set for the ignored bd-b9dug driver"))
+}
+
+fn sha256_file(path: &Path) -> String {
+    let mut file =
+        fs::File::open(path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("format SHA-256");
+    }
+    encoded
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("format SHA-256");
+    }
+    encoded
+}
+
+fn run_cli_binary(binary: &Path, args: &[&str]) -> Output {
+    Command::new(binary)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("execute {}: {error}", binary.display()))
+}
+
+fn run_cli_binary_checked(label: &str, binary: &Path, args: &[&str]) -> Output {
+    let output = run_cli_binary(binary, args);
+    assert!(
+        output.status.success(),
+        "{label} failed for {} {:?}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        args,
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!(
+        "bd_b9dug_training_step,label={label},status=ok\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+struct CliEvidence {
+    binary_sha256: String,
+    pgo_profile_sha256: String,
+    codegen_line: String,
+}
+
+fn cli_evidence(binary: &Path) -> CliEvidence {
+    let output = run_cli_binary_checked("bench_evidence", binary, &["bench-evidence"]);
+    let stdout = String::from_utf8(output.stdout).expect("bench-evidence stdout is UTF-8");
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let identity = lines.next().expect("bench-evidence identity line");
+    let binary_sha256 = identity
+        .strip_prefix("bench_evidence,binary_sha256=")
+        .expect("bench-evidence stdout line one is the in-process ELF SHA")
+        .to_owned();
+    assert!(
+        binary_sha256.len() == 64 && binary_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid in-process ELF SHA-256: {binary_sha256}"
+    );
+    let codegen_line = lines
+        .next()
+        .expect("bench-evidence codegen line")
+        .to_owned();
+    assert!(
+        codegen_line.starts_with("codegen_isa,"),
+        "invalid codegen witness: {codegen_line}"
+    );
+    let build_profile = lines.next().expect("bench-evidence build-profile line");
+    let pgo_profile_sha256 = build_profile
+        .strip_prefix("build_profile,pgo_profile_sha256=")
+        .expect("bench-evidence PGO profile line")
+        .to_owned();
+    CliEvidence {
+        binary_sha256,
+        pgo_profile_sha256,
+        codegen_line,
+    }
+}
+
+fn find_llvm_profdata() -> PathBuf {
+    if let Some(path) = std::env::var_os("LLVM_PROFDATA") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "LLVM_PROFDATA is not a file: {}",
+            path.display()
+        );
+        return path;
+    }
+
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .expect("RUSTUP_HOME or HOME is set");
+    let toolchains = rustup_home.join("toolchains");
+    let mut candidates = fs::read_dir(&toolchains)
+        .unwrap_or_else(|error| panic!("read {}: {error}", toolchains.display()))
+        .map(|entry| {
+            entry
+                .expect("read rustup toolchain entry")
+                .path()
+                .join("lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata")
+        })
+        .filter(|candidate| candidate.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().unwrap_or_else(|| {
+        panic!(
+            "llvm-profdata unavailable under {}; install llvm-tools-preview",
+            toolchains.display()
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+struct BootstrapMedianCi {
+    median: f64,
+    low: f64,
+    high: f64,
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    assert!(!values.is_empty(), "median requires a non-empty sample");
+    values.sort_by(f64::total_cmp);
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 0 {
+        values[midpoint - 1].midpoint(values[midpoint])
+    } else {
+        values[midpoint]
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn bootstrap_median_ci(log_ratios: &[f64]) -> BootstrapMedianCi {
+    const RESAMPLES: usize = 20_000;
+    assert!(
+        !log_ratios.is_empty(),
+        "bootstrap median CI requires paired observations"
+    );
+    let mut state =
+        0xB9D0_6202_6072_7001_u64 ^ u64::try_from(log_ratios.len()).expect("length fits u64");
+    let mut bootstrapped = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut sample = Vec::with_capacity(log_ratios.len());
+        for _ in log_ratios {
+            let draw =
+                splitmix64(&mut state) % u64::try_from(log_ratios.len()).expect("length fits u64");
+            sample.push(log_ratios[usize::try_from(draw).expect("draw fits usize")]);
+        }
+        bootstrapped.push(median(sample));
+    }
+    bootstrapped.sort_by(f64::total_cmp);
+    let low_index = RESAMPLES.saturating_mul(25) / 1000;
+    let high_index = RESAMPLES
+        .saturating_mul(975)
+        .div_ceil(1000)
+        .saturating_sub(1);
+    BootstrapMedianCi {
+        median: median(log_ratios.to_vec()).exp(),
+        low: bootstrapped[low_index].exp(),
+        high: bootstrapped[high_index].exp(),
+    }
+}
+
+fn lookup_observation(binary: &Path, image: &Path, count: usize) -> (f64, String) {
+    let image = image.to_str().expect("lookup image path is UTF-8");
+    let count = count.to_string();
+    let output = run_cli_binary(binary, &["lookup-bench", image, "/", "--count", &count]);
+    assert!(
+        output.status.success(),
+        "lookup observation failed: binary={} status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("lookup stderr is UTF-8");
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("lookupbench:") && line.contains(" found in "))
+        .unwrap_or_else(|| panic!("lookup result line missing from:\n{stderr}"));
+    let (signature, elapsed) = line
+        .split_once(" found in ")
+        .expect("lookup result contains elapsed delimiter");
+    let duration_us = elapsed
+        .split_once(" us")
+        .expect("lookup result contains microsecond suffix")
+        .0
+        .parse::<f64>()
+        .expect("lookup duration is numeric");
+    assert!(duration_us > 0.0, "lookup duration must be positive");
+    (duration_us, signature.to_owned())
+}
+
+fn csv_value<'a>(line: &'a str, key: &str) -> &'a str {
+    line.split(',')
+        .find_map(|field| field.strip_prefix(key))
+        .unwrap_or_else(|| panic!("missing {key} in {line}"))
+}
+
+#[derive(Clone, Copy)]
+struct ReadObservation {
+    wall_us: f64,
+    bytes: u64,
+}
+
+fn read_observation(
+    binary: &Path,
+    image: &Path,
+    file_path: &str,
+    expected_evidence: &CliEvidence,
+) -> ReadObservation {
+    let image = image.to_str().expect("read image path is UTF-8");
+    let output = run_cli_binary(
+        binary,
+        &["read", image, file_path, "--discard", "--bench-evidence"],
+    );
+    assert!(
+        output.status.success(),
+        "read observation failed: binary={} status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("read observation stdout is UTF-8");
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    assert_eq!(
+        lines
+            .next()
+            .and_then(|line| line.strip_prefix("bench_evidence,binary_sha256=")),
+        Some(expected_evidence.binary_sha256.as_str()),
+        "timed read child executed an unexpected ELF"
+    );
+    assert_eq!(
+        lines.next(),
+        Some(expected_evidence.codegen_line.as_str()),
+        "timed read child changed its compile/runtime ISA witness"
+    );
+    assert_eq!(
+        lines
+            .next()
+            .and_then(|line| line.strip_prefix("build_profile,pgo_profile_sha256=")),
+        Some(expected_evidence.pgo_profile_sha256.as_str()),
+        "timed read child changed its consumed-profile identity"
+    );
+    let result = lines
+        .next()
+        .expect("timed read child emitted its observation");
+    assert!(
+        result.starts_with("bd_b9dug_read_observation,"),
+        "unexpected timed read result: {result}"
+    );
+    assert!(
+        lines.next().is_none(),
+        "timed read child emitted unexpected stdout after its result"
+    );
+    let wall_us = csv_value(result, "duration_us=")
+        .parse::<f64>()
+        .expect("read duration is numeric");
+    let bytes = csv_value(result, "bytes=")
+        .parse::<u64>()
+        .expect("read byte count is numeric");
+    assert!(wall_us > 0.0, "read duration must be positive");
+    ReadObservation { wall_us, bytes }
+}
+
+fn read_payload_signature(binary: &Path, image: &Path, file_path: &str) -> (usize, String) {
+    let image = image.to_str().expect("read image path is UTF-8");
+    let output = run_cli_binary(binary, &["read", image, file_path]);
+    assert!(
+        output.status.success(),
+        "read parity run failed: binary={} status={:?}\nstderr:\n{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.stdout.len(), sha256_bytes(&output.stdout))
+}
+
+struct CreateObservation {
+    create_us: f64,
+    persisted_us: f64,
+    state_signature: String,
+}
+
+fn create_bench_timings(stdout: &str, count: usize, rounds: usize) -> (f64, f64) {
+    let count_arg = count.to_string();
+    let rounds_arg = rounds.to_string();
+    let create_rounds = stdout
+        .lines()
+        .filter(|line| line.starts_with("createbench_round,"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        create_rounds.len(),
+        rounds,
+        "create observation did not report every requested round"
+    );
+    let mut create_us = 0.0;
+    for (round, line) in create_rounds.iter().enumerate() {
+        assert_eq!(
+            csv_value(line, "round="),
+            round.to_string(),
+            "create round order changed"
+        );
+        assert_eq!(csv_value(line, "threads="), "1");
+        assert_eq!(csv_value(line, "count="), count_arg);
+        create_us += csv_value(line, "create_us=")
+            .parse::<f64>()
+            .expect("create_us is numeric");
+    }
+    let flush_line = stdout
+        .lines()
+        .find(|line| line.starts_with("createbench_flush,"))
+        .expect("create observation flush line");
+    assert_eq!(csv_value(flush_line, "rounds="), rounds_arg);
+    let flush_us = csv_value(flush_line, "flush_us=")
+        .parse::<f64>()
+        .expect("flush_us is numeric");
+    (create_us, flush_us)
+}
+
+fn walk_state_signature(binary: &Path, image: &str) -> String {
+    let walk = run_cli_binary(binary, &["walk", image, "--no-stat"]);
+    assert!(
+        walk.status.success(),
+        "walk after create failed: binary={} status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        walk.status,
+        String::from_utf8_lossy(&walk.stdout),
+        String::from_utf8_lossy(&walk.stderr)
+    );
+    let walk_stderr = String::from_utf8(walk.stderr).expect("walk stderr is UTF-8");
+    let walk_line = walk_stderr
+        .lines()
+        .find(|line| line.starts_with("walked "))
+        .unwrap_or_else(|| panic!("walk result line missing from:\n{walk_stderr}"));
+    walk_line
+        .split_once(" [")
+        .expect("walk result contains mode/timing delimiter")
+        .0
+        .to_owned()
+}
+
+fn create_observation(
+    binary: &Path,
+    expected_binary_sha256: &str,
+    source_image: &Path,
+    source_image_sha256: &str,
+    working_image: &Path,
+    count: usize,
+    rounds: usize,
+) -> CreateObservation {
+    let copied_bytes = fs::copy(source_image, working_image).unwrap_or_else(|error| {
+        panic!(
+            "copy create input {} -> {}: {error}",
+            source_image.display(),
+            working_image.display()
+        )
+    });
+    assert_eq!(
+        copied_bytes,
+        fs::metadata(source_image)
+            .expect("create source image metadata")
+            .len(),
+        "create input copy length changed"
+    );
+    assert_eq!(
+        sha256_file(working_image),
+        source_image_sha256,
+        "create observation did not start from the exact source image"
+    );
+
+    let image = working_image
+        .to_str()
+        .expect("create working image path is UTF-8");
+    let count_arg = count.to_string();
+    let rounds_arg = rounds.to_string();
+    let output = run_cli_binary(
+        binary,
+        &[
+            "create-bench",
+            image,
+            "/",
+            "--count",
+            &count_arg,
+            "--threads",
+            "1",
+            "--rounds",
+            &rounds_arg,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "create observation failed: binary={} status={:?}\nstdout:\n{}\nstderr:\n{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("create stdout is UTF-8");
+    let self_sha256 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("bench_evidence,binary_sha256="))
+        .expect("create observation self-reported executing ELF SHA");
+    assert_eq!(
+        self_sha256, expected_binary_sha256,
+        "create observation executed an unexpected ELF"
+    );
+    let (create_us, flush_us) = create_bench_timings(&stdout, count, rounds);
+    let state_signature = walk_state_signature(binary, image);
+
+    CreateObservation {
+        create_us,
+        persisted_us: create_us + flush_us,
+        state_signature,
+    }
+}
+
+fn bd_b9dug_run_id() -> String {
+    let run_id = required_env("FFS_B9DUG_RUN_ID");
+    assert!(
+        !run_id.is_empty()
+            && run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "FFS_B9DUG_RUN_ID must be a non-empty safe identifier"
+    );
+    run_id
+}
+
+fn prepare_pgo_training_image(profile_dir: &Path, run_id: &str) -> PathBuf {
+    fs::create_dir_all(profile_dir).expect("create remote PGO profile directory");
+    let training_image = profile_dir.join(format!("training-{run_id}.ext4"));
+    assert!(
+        !training_image.exists(),
+        "refusing to overwrite training image {}",
+        training_image.display()
+    );
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/golden/ext4_dir_index_reference.ext4");
+    fs::copy(&fixture, &training_image).unwrap_or_else(|error| {
+        panic!(
+            "copy PGO fixture {} -> {}: {error}",
+            fixture.display(),
+            training_image.display()
+        )
+    });
+    training_image
+}
+
+fn run_pgo_training_workload(binary: &Path, training_image: &Path) {
+    let image = training_image
+        .to_str()
+        .expect("training image path is UTF-8");
+    run_cli_binary_checked(
+        "create",
+        binary,
+        &[
+            "create-bench",
+            image,
+            "/",
+            "--count",
+            "3000",
+            "--threads",
+            "1",
+            "--rounds",
+            "2",
+        ],
+    );
+    run_cli_binary_checked(
+        "lookup",
+        binary,
+        &["lookup-bench", image, "/", "--count", "1000000"],
+    );
+    run_cli_binary_checked(
+        "rename",
+        binary,
+        &["rename-bench", image, "/", "--count", "2000"],
+    );
+    run_cli_binary_checked(
+        "delete",
+        binary,
+        &["delbench", image, "/", "--count", "2000"],
+    );
+    run_cli_binary_checked("walk", binary, &["walk", image, "--no-stat"]);
+}
+
+fn raw_profiles_for_run(profile_dir: &Path, run_id: &str) -> Vec<PathBuf> {
+    let raw_prefix = format!("bd-b9dug-{run_id}-");
+    let mut raw_profiles = fs::read_dir(profile_dir)
+        .expect("read remote PGO profile directory")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "profraw")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&raw_prefix))
+        })
+        .collect::<Vec<_>>();
+    raw_profiles.sort();
+    assert!(
+        raw_profiles.len() >= 6,
+        "expected one raw profile per CLI child, found {} under {} with prefix {raw_prefix}",
+        raw_profiles.len(),
+        profile_dir.display()
+    );
+    raw_profiles
+}
+
+fn merge_raw_profiles(profile_dir: &Path, run_id: &str, raw_profiles: &[PathBuf]) -> PathBuf {
+    let merged = profile_dir.join(format!("merged-{run_id}.profdata"));
+    assert!(
+        !merged.exists(),
+        "refusing to overwrite merged profile {}",
+        merged.display()
+    );
+    let merge = Command::new(find_llvm_profdata())
+        .args(["merge", "-o"])
+        .arg(&merged)
+        .args(raw_profiles)
+        .output()
+        .expect("run llvm-profdata merge");
+    assert!(
+        merge.status.success(),
+        "llvm-profdata merge failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        merge.status,
+        String::from_utf8_lossy(&merge.stdout),
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    merged
+}
+
+struct LookupSamples {
+    anchor_us: Vec<f64>,
+    repeat_us: Vec<f64>,
+    candidate_us: Vec<f64>,
+    reference_signature: String,
+    raw_pairs: String,
+}
+
+fn collect_lookup_samples(
+    generic: &Path,
+    pgo: &Path,
+    image: &Path,
+    pairs: usize,
+    lookups: usize,
+) -> LookupSamples {
+    let mut anchor_us = Vec::with_capacity(pairs);
+    let mut repeat_us = Vec::with_capacity(pairs);
+    let mut candidate_us = Vec::with_capacity(pairs);
+    let mut reference_signature = None;
+    let mut raw_pairs = String::with_capacity(pairs.saturating_mul(64));
+    for pair in 0..pairs {
+        let (anchor, repeat, candidate, order) = if pair % 2 == 0 {
+            (
+                lookup_observation(generic, image, lookups),
+                lookup_observation(generic, image, lookups),
+                lookup_observation(pgo, image, lookups),
+                "AAB",
+            )
+        } else {
+            let candidate = lookup_observation(pgo, image, lookups);
+            let repeat = lookup_observation(generic, image, lookups);
+            let anchor = lookup_observation(generic, image, lookups);
+            (anchor, repeat, candidate, "BAA")
+        };
+        for signature in [&anchor.1, &repeat.1, &candidate.1] {
+            if let Some(expected) = &reference_signature {
+                assert_eq!(
+                    signature, expected,
+                    "generic and PGO binaries observed different lookup results"
+                );
+            } else {
+                reference_signature = Some(signature.clone());
+            }
+        }
+        anchor_us.push(anchor.0);
+        repeat_us.push(repeat.0);
+        candidate_us.push(candidate.0);
+        if pair > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{:.3}:{:.3}:{:.3}",
+            anchor.0, repeat.0, candidate.0
+        )
+        .expect("format whole-binary lookup pair");
+    }
+    LookupSamples {
+        anchor_us,
+        repeat_us,
+        candidate_us,
+        reference_signature: reference_signature.expect("lookup signature"),
+        raw_pairs,
+    }
+}
+
+struct LookupIdentity<'a> {
+    generic: &'a CliEvidence,
+    pgo: &'a CliEvidence,
+    profile_sha256: &'a str,
+    image: &'a Path,
+}
+
+struct CreateSamples {
+    anchor_persisted_us: Vec<f64>,
+    repeat_persisted_us: Vec<f64>,
+    candidate_persisted_us: Vec<f64>,
+    anchor_create_us: Vec<f64>,
+    repeat_create_us: Vec<f64>,
+    candidate_create_us: Vec<f64>,
+    reference_signature: String,
+    raw_persisted_pairs: String,
+    raw_create_pairs: String,
+}
+
+struct CreateInputs<'a> {
+    generic: &'a Path,
+    pgo: &'a Path,
+    generic_sha256: &'a str,
+    pgo_sha256: &'a str,
+    source_image: &'a Path,
+    source_image_sha256: &'a str,
+    anchor_image: &'a Path,
+    repeat_image: &'a Path,
+    candidate_image: &'a Path,
+}
+
+fn assert_create_gate_identity(generic: &CliEvidence, pgo: &CliEvidence, expected_profile: &str) {
+    assert_eq!(
+        generic.pgo_profile_sha256, "none",
+        "generic control must not embed profile-use identity"
+    );
+    assert_eq!(
+        pgo.pgo_profile_sha256, expected_profile,
+        "candidate did not embed the consumed profile SHA"
+    );
+    assert!(
+        generic.codegen_line.contains("compile_avx2=false")
+            && generic.codegen_line.contains("compile_fma=false"),
+        "generic control unexpectedly widened its compile-time ISA: {}",
+        generic.codegen_line
+    );
+    assert!(
+        pgo.codegen_line.contains("compile_avx2=true")
+            && pgo.codegen_line.contains("compile_fma=true"),
+        "profile-use candidate is not witnessed x86-64-v3: {}",
+        pgo.codegen_line
+    );
+}
+
+fn collect_create_samples(
+    inputs: &CreateInputs<'_>,
+    pairs: usize,
+    count: usize,
+    rounds: usize,
+) -> CreateSamples {
+    let mut anchor_persisted_us = Vec::with_capacity(pairs);
+    let mut repeat_persisted_us = Vec::with_capacity(pairs);
+    let mut candidate_persisted_us = Vec::with_capacity(pairs);
+    let mut anchor_create_us = Vec::with_capacity(pairs);
+    let mut repeat_create_us = Vec::with_capacity(pairs);
+    let mut candidate_create_us = Vec::with_capacity(pairs);
+    let mut reference_signature = None;
+    let mut raw_persisted_pairs = String::with_capacity(pairs.saturating_mul(72));
+    let mut raw_create_pairs = String::with_capacity(pairs.saturating_mul(72));
+    for pair in 0..pairs {
+        let observe_generic = |working_image: &Path| {
+            create_observation(
+                inputs.generic,
+                inputs.generic_sha256,
+                inputs.source_image,
+                inputs.source_image_sha256,
+                working_image,
+                count,
+                rounds,
+            )
+        };
+        let observe_pgo = || {
+            create_observation(
+                inputs.pgo,
+                inputs.pgo_sha256,
+                inputs.source_image,
+                inputs.source_image_sha256,
+                inputs.candidate_image,
+                count,
+                rounds,
+            )
+        };
+        let (anchor, repeat, candidate, order) = if pair % 2 == 0 {
+            (
+                observe_generic(inputs.anchor_image),
+                observe_generic(inputs.repeat_image),
+                observe_pgo(),
+                "AAB",
+            )
+        } else {
+            let candidate = observe_pgo();
+            let repeat = observe_generic(inputs.repeat_image);
+            let anchor = observe_generic(inputs.anchor_image);
+            (anchor, repeat, candidate, "BAA")
+        };
+        for signature in [
+            &anchor.state_signature,
+            &repeat.state_signature,
+            &candidate.state_signature,
+        ] {
+            if let Some(expected) = &reference_signature {
+                assert_eq!(
+                    signature, expected,
+                    "generic and PGO create outputs have different filesystem state"
+                );
+            } else {
+                reference_signature = Some(signature.clone());
+            }
+        }
+        anchor_persisted_us.push(anchor.persisted_us);
+        repeat_persisted_us.push(repeat.persisted_us);
+        candidate_persisted_us.push(candidate.persisted_us);
+        anchor_create_us.push(anchor.create_us);
+        repeat_create_us.push(repeat.create_us);
+        candidate_create_us.push(candidate.create_us);
+        if pair > 0 {
+            raw_persisted_pairs.push(';');
+            raw_create_pairs.push(';');
+        }
+        write!(
+            &mut raw_persisted_pairs,
+            "{order}:{:.3}:{:.3}:{:.3}",
+            anchor.persisted_us, repeat.persisted_us, candidate.persisted_us
+        )
+        .expect("format persisted-create pair");
+        write!(
+            &mut raw_create_pairs,
+            "{order}:{:.3}:{:.3}:{:.3}",
+            anchor.create_us, repeat.create_us, candidate.create_us
+        )
+        .expect("format create-loop pair");
+    }
+    CreateSamples {
+        anchor_persisted_us,
+        repeat_persisted_us,
+        candidate_persisted_us,
+        anchor_create_us,
+        repeat_create_us,
+        candidate_create_us,
+        reference_signature: reference_signature.expect("create state signature"),
+        raw_persisted_pairs,
+        raw_create_pairs,
+    }
+}
+
+fn paired_ratio_summaries(
+    anchor: &[f64],
+    repeat: &[f64],
+    candidate: &[f64],
+) -> (BootstrapMedianCi, BootstrapMedianCi, f64, f64) {
+    let null_log_ratios = anchor
+        .iter()
+        .zip(repeat)
+        .map(|(anchor, repeat)| (anchor / repeat).ln())
+        .collect::<Vec<_>>();
+    let candidate_log_ratios = anchor
+        .iter()
+        .zip(repeat)
+        .zip(candidate)
+        .map(|((anchor, repeat), candidate)| (anchor.midpoint(*repeat) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null = bootstrap_median_ci(&null_log_ratios);
+    let candidate_ratio = bootstrap_median_ci(&candidate_log_ratios);
+    let null_log_radius = null.low.ln().abs().max(null.high.ln().abs());
+    (
+        null,
+        candidate_ratio,
+        null_log_radius.exp(),
+        (2.0 * null_log_radius).exp(),
+    )
+}
+
+fn report_create_gate(
+    identity: &LookupIdentity<'_>,
+    samples: CreateSamples,
+    pairs: usize,
+    count: usize,
+    rounds: usize,
+) {
+    let (persisted_null, persisted_ratio, null_floor_ratio, twice_null_ratio) =
+        paired_ratio_summaries(
+            &samples.anchor_persisted_us,
+            &samples.repeat_persisted_us,
+            &samples.candidate_persisted_us,
+        );
+    let (create_null, create_ratio, create_null_floor_ratio, create_twice_null_ratio) =
+        paired_ratio_summaries(
+            &samples.anchor_create_us,
+            &samples.repeat_create_us,
+            &samples.candidate_create_us,
+        );
+    let verdict = if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else if persisted_ratio.low > twice_null_ratio {
+        "PGO_FASTER"
+    } else if persisted_ratio.high < twice_null_ratio.recip() {
+        "PGO_SLOWER"
+    } else {
+        "INDETERMINATE_WITHIN_TWICE_NULL"
+    };
+    let generic_persisted_midpoints = samples
+        .anchor_persisted_us
+        .iter()
+        .zip(&samples.repeat_persisted_us)
+        .map(|(anchor, repeat)| anchor.midpoint(*repeat))
+        .collect::<Vec<_>>();
+    let generic_create_midpoints = samples
+        .anchor_create_us
+        .iter()
+        .zip(&samples.repeat_create_us)
+        .map(|(anchor, repeat)| anchor.midpoint(*repeat))
+        .collect::<Vec<_>>();
+    println!(
+        "bd_b9dug_create_identity,generic_binary_sha256={},pgo_binary_sha256={},\
+pgo_profile_sha256={},input_image={},input_image_sha256={},output_signature={}",
+        identity.generic.binary_sha256,
+        identity.pgo.binary_sha256,
+        identity.profile_sha256,
+        identity.image.display(),
+        sha256_file(identity.image),
+        samples.reference_signature
+    );
+    println!(
+        "bd_b9dug_create_persisted_pairs,pairs={pairs},rounds_per_observation={rounds},\
+creates_per_round={count},format=order:generic_anchor_us:generic_repeat_us:pgo_us,values={}",
+        samples.raw_persisted_pairs
+    );
+    println!(
+        "bd_b9dug_create_loop_pairs,pairs={pairs},rounds_per_observation={rounds},\
+creates_per_round={count},format=order:generic_anchor_us:generic_repeat_us:pgo_us,values={}",
+        samples.raw_create_pairs
+    );
+    println!(
+        "bd_b9dug_whole_binary_create,generic_persisted_median_us={:.3},\
+pgo_persisted_median_us={:.3},generic_aa_median={:.6},\
+generic_aa_ci_low={:.6},generic_aa_ci_high={:.6},\
+null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},\
+generic_over_pgo_median={:.6},generic_over_pgo_ci_low={:.6},\
+generic_over_pgo_ci_high={:.6},create_loop_generic_median_us={:.3},\
+create_loop_pgo_median_us={:.3},create_loop_aa_median={:.6},\
+create_loop_aa_ci_low={:.6},create_loop_aa_ci_high={:.6},\
+create_loop_null_floor_ratio={create_null_floor_ratio:.6},\
+create_loop_twice_null_ratio={create_twice_null_ratio:.6},\
+create_loop_generic_over_pgo_median={:.6},create_loop_generic_over_pgo_ci_low={:.6},\
+create_loop_generic_over_pgo_ci_high={:.6},verdict={verdict},\
+gate_metric=persisted_wall_us,gate_basis=bootstrap_median_ci,\
+bootstrap_resamples=20000,cv_used=false",
+        median(generic_persisted_midpoints),
+        median(samples.candidate_persisted_us),
+        persisted_null.median,
+        persisted_null.low,
+        persisted_null.high,
+        persisted_ratio.median,
+        persisted_ratio.low,
+        persisted_ratio.high,
+        median(generic_create_midpoints),
+        median(samples.candidate_create_us),
+        create_null.median,
+        create_null.low,
+        create_null.high,
+        create_ratio.median,
+        create_ratio.low,
+        create_ratio.high,
+    );
+}
+
+fn report_lookup_gate(
+    identity: &LookupIdentity<'_>,
+    samples: LookupSamples,
+    pairs: usize,
+    lookups: usize,
+) {
+    let null_log_ratios = samples
+        .anchor_us
+        .iter()
+        .zip(&samples.repeat_us)
+        .map(|(anchor, repeat)| (anchor / repeat).ln())
+        .collect::<Vec<_>>();
+    let pgo_log_ratios = samples
+        .anchor_us
+        .iter()
+        .zip(&samples.repeat_us)
+        .zip(&samples.candidate_us)
+        .map(|((anchor, repeat), candidate)| (anchor.midpoint(*repeat) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null = bootstrap_median_ci(&null_log_ratios);
+    let pgo_ratio = bootstrap_median_ci(&pgo_log_ratios);
+    let null_log_radius = null.low.ln().abs().max(null.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    assert!(
+        null_floor_ratio < 1.10,
+        "whole-binary lookup A/A null is too noisy: {null_floor_ratio:.6}x"
+    );
+    let verdict = if pgo_ratio.low > twice_null_ratio {
+        "PGO_FASTER"
+    } else if pgo_ratio.high < twice_null_ratio.recip() {
+        "PGO_SLOWER"
+    } else {
+        "INDETERMINATE_WITHIN_TWICE_NULL"
+    };
+    let generic_midpoints = samples
+        .anchor_us
+        .iter()
+        .zip(&samples.repeat_us)
+        .map(|(anchor, repeat)| anchor.midpoint(*repeat))
+        .collect::<Vec<_>>();
+    println!(
+        "bd_b9dug_whole_binary_identity,generic_binary_sha256={},\
+pgo_binary_sha256={},pgo_profile_sha256={},lookup_image={},lookup_image_sha256={},\
+output_signature={}",
+        identity.generic.binary_sha256,
+        identity.pgo.binary_sha256,
+        identity.profile_sha256,
+        identity.image.display(),
+        sha256_file(identity.image),
+        samples.reference_signature
+    );
+    println!(
+        "bd_b9dug_whole_binary_pairs,pairs={pairs},lookups_per_observation={lookups},\
+format=order:generic_anchor_us:generic_repeat_us:pgo_us,values={}",
+        samples.raw_pairs
+    );
+    println!(
+        "bd_b9dug_whole_binary_lookup,generic_median_us={:.3},pgo_median_us={:.3},\
+generic_aa_median={:.6},generic_aa_ci_low={:.6},generic_aa_ci_high={:.6},\
+null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},\
+generic_over_pgo_median={:.6},generic_over_pgo_ci_low={:.6},\
+generic_over_pgo_ci_high={:.6},verdict={verdict},gate_basis=bootstrap_median_ci,\
+bootstrap_resamples=20000,cv_used=false",
+        median(generic_midpoints),
+        median(samples.candidate_us),
+        null.median,
+        null.low,
+        null.high,
+        pgo_ratio.median,
+        pgo_ratio.low,
+        pgo_ratio.high
+    );
+}
+
+struct ReadSamples {
+    anchor_us: Vec<f64>,
+    repeat_us: Vec<f64>,
+    candidate_us: Vec<f64>,
+    raw_pairs: String,
+}
+
+fn collect_read_samples(
+    generic: (&Path, &CliEvidence),
+    pgo: (&Path, &CliEvidence),
+    image: &Path,
+    file_path: &str,
+    expected_bytes: u64,
+    pairs: usize,
+) -> ReadSamples {
+    let mut anchor_us = Vec::with_capacity(pairs);
+    let mut repeat_us = Vec::with_capacity(pairs);
+    let mut candidate_us = Vec::with_capacity(pairs);
+    let mut raw_pairs = String::with_capacity(pairs.saturating_mul(64));
+    for pair in 0..pairs {
+        let observe_generic = || read_observation(generic.0, image, file_path, generic.1);
+        let observe_pgo = || read_observation(pgo.0, image, file_path, pgo.1);
+        let (anchor, repeat, candidate, order) = if pair % 2 == 0 {
+            (observe_generic(), observe_generic(), observe_pgo(), "AAB")
+        } else {
+            let candidate = observe_pgo();
+            let repeat = observe_generic();
+            let anchor = observe_generic();
+            (anchor, repeat, candidate, "BAA")
+        };
+        assert_eq!(
+            anchor.bytes, expected_bytes,
+            "generic anchor read was short"
+        );
+        assert_eq!(
+            repeat.bytes, expected_bytes,
+            "generic repeat read was short"
+        );
+        assert_eq!(
+            candidate.bytes, expected_bytes,
+            "v3+PGO candidate read was short"
+        );
+        anchor_us.push(anchor.wall_us);
+        repeat_us.push(repeat.wall_us);
+        candidate_us.push(candidate.wall_us);
+        if pair > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{:.3}:{:.3}:{:.3}",
+            anchor.wall_us, repeat.wall_us, candidate.wall_us
+        )
+        .expect("format whole-binary read pair");
+    }
+    ReadSamples {
+        anchor_us,
+        repeat_us,
+        candidate_us,
+        raw_pairs,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_read_gate(
+    identity: &LookupIdentity<'_>,
+    file_path: &str,
+    input_image_sha256: &str,
+    payload_bytes: usize,
+    payload_sha256: &str,
+    samples: ReadSamples,
+    pairs: usize,
+) {
+    let (null, pgo_ratio, null_floor_ratio, twice_null_ratio) = paired_ratio_summaries(
+        &samples.anchor_us,
+        &samples.repeat_us,
+        &samples.candidate_us,
+    );
+    let verdict = if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else if pgo_ratio.low > twice_null_ratio {
+        "PGO_FASTER"
+    } else if pgo_ratio.high < twice_null_ratio.recip() {
+        "PGO_SLOWER"
+    } else {
+        "INDETERMINATE_WITHIN_TWICE_NULL"
+    };
+    let generic_midpoints = samples
+        .anchor_us
+        .iter()
+        .zip(&samples.repeat_us)
+        .map(|(anchor, repeat)| anchor.midpoint(*repeat))
+        .collect::<Vec<_>>();
+    println!(
+        "bd_b9dug_read_identity,generic_binary_sha256={},pgo_binary_sha256={},\
+pgo_profile_sha256={},input_image={},input_image_sha256={input_image_sha256},\
+file={file_path},payload_bytes={payload_bytes},payload_sha256={payload_sha256}",
+        identity.generic.binary_sha256,
+        identity.pgo.binary_sha256,
+        identity.profile_sha256,
+        identity.image.display()
+    );
+    println!(
+        "bd_b9dug_read_pairs,pairs={pairs},format=order:generic_anchor_us:\
+generic_repeat_us:pgo_us,values={}",
+        samples.raw_pairs
+    );
+    println!(
+        "bd_b9dug_whole_binary_read,generic_median_us={:.3},pgo_median_us={:.3},\
+generic_aa_median={:.6},generic_aa_ci_low={:.6},generic_aa_ci_high={:.6},\
+null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},\
+generic_over_pgo_median={:.6},generic_over_pgo_ci_low={:.6},\
+generic_over_pgo_ci_high={:.6},verdict={verdict},same_invocation=true,\
+binary_hash_in_every_timed_child=true,gate_metric=read_wall_us,\
+gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false,\
+instructions_used=false",
+        median(generic_midpoints),
+        median(samples.candidate_us),
+        null.median,
+        null.low,
+        null.high,
+        pgo_ratio.median,
+        pgo_ratio.low,
+        pgo_ratio.high
+    );
+}
+
+/// Save the generic release-perf CLI on the pinned worker before a subsequent
+/// profile-use build replaces Cargo's output. The destination must be unique;
+/// this driver refuses to overwrite an earlier artifact.
+#[test]
+#[ignore = "strict-remote bd-b9dug driver"]
+fn bd_b9dug_store_generic_cli() {
+    let source = Path::new(env!("CARGO_BIN_EXE_ffs-cli"));
+    let destination = required_env_path("FFS_B9DUG_GENERIC_CLI");
+    assert!(
+        !destination.exists(),
+        "refusing to overwrite generic CLI artifact {}",
+        destination.display()
+    );
+    fs::create_dir_all(destination.parent().expect("generic CLI has parent"))
+        .expect("create generic CLI artifact directory");
+
+    let source_evidence = cli_evidence(source);
+    assert_eq!(
+        source_evidence.pgo_profile_sha256, "none",
+        "generic control unexpectedly embeds a PGO profile"
+    );
+    fs::copy(source, &destination).unwrap_or_else(|error| {
+        panic!(
+            "copy generic CLI {} -> {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    });
+    let copied_evidence = cli_evidence(&destination);
+    assert_eq!(
+        source_evidence.binary_sha256, copied_evidence.binary_sha256,
+        "copied generic CLI changed bytes"
+    );
+    assert_eq!(
+        source_evidence.binary_sha256,
+        sha256_file(&destination),
+        "in-process and adjacent generic CLI hashes disagree"
+    );
+    println!(
+        "bd_b9dug_generic_stored,path={},binary_sha256={},codegen={}",
+        destination.display(),
+        copied_evidence.binary_sha256,
+        copied_evidence.codegen_line
+    );
+
+    if let Some(read_image) = std::env::var_os("FFS_B9DUG_READ_IMAGE").map(PathBuf::from) {
+        const READ_BLOCKS: usize = 8_192;
+        const BLOCK_SIZE: usize = 4_096;
+        const READ_FILE: &str = "/bd-b9dug-read.bin";
+
+        assert!(
+            !read_image.exists(),
+            "refusing to overwrite read fixture {}",
+            read_image.display()
+        );
+        fs::create_dir_all(read_image.parent().expect("read image has parent"))
+            .expect("create read fixture directory");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../conformance/golden/ext4_dir_index_reference.ext4");
+        fs::copy(&fixture, &read_image).unwrap_or_else(|error| {
+            panic!(
+                "copy read fixture {} -> {}: {error}",
+                fixture.display(),
+                read_image.display()
+            )
+        });
+        let image = read_image.to_str().expect("read fixture path is UTF-8");
+        run_cli_binary_checked(
+            "prepare-read-fixture",
+            source,
+            &[
+                "write-bench",
+                image,
+                READ_FILE,
+                "--count",
+                &READ_BLOCKS.to_string(),
+                "--size",
+                &BLOCK_SIZE.to_string(),
+                "--create",
+            ],
+        );
+        let (bytes, payload_sha256) = read_payload_signature(source, &read_image, READ_FILE);
+        assert_eq!(
+            bytes,
+            READ_BLOCKS * BLOCK_SIZE,
+            "prepared read fixture has the wrong file size"
+        );
+        println!(
+            "bd_b9dug_read_fixture,path={},image_sha256={},file={READ_FILE},\
+bytes={bytes},payload_sha256={payload_sha256}",
+            read_image.display(),
+            sha256_file(&read_image)
+        );
+    }
+}
+
+/// Exercise the same CLI workload family as `scripts/build-perf.sh` with the
+/// instrumented production binary, then merge only this run's raw profiles.
+#[test]
+#[ignore = "strict-remote bd-b9dug driver"]
+fn bd_b9dug_remote_pgo_training_driver() {
+    let run_id = bd_b9dug_run_id();
+    let profile_dir = required_env_path("FFS_B9DUG_PROFILE_DIR");
+    let training_image = prepare_pgo_training_image(&profile_dir, &run_id);
+    let binary = Path::new(env!("CARGO_BIN_EXE_ffs-cli"));
+    let evidence = cli_evidence(binary);
+    assert_eq!(
+        evidence.pgo_profile_sha256, "none",
+        "profile-generation binary must not claim profile-use"
+    );
+    assert!(
+        evidence.codegen_line.contains("compile_avx2=true")
+            && evidence.codegen_line.contains("compile_fma=true"),
+        "profile-generation binary is not witnessed x86-64-v3: {}",
+        evidence.codegen_line
+    );
+    run_pgo_training_workload(binary, &training_image);
+    let raw_profiles = raw_profiles_for_run(&profile_dir, &run_id);
+    let merged = merge_raw_profiles(&profile_dir, &run_id, &raw_profiles);
+    let merged_bytes = fs::metadata(&merged)
+        .expect("merged profile metadata")
+        .len();
+    let merged_sha256 = sha256_file(&merged);
+    println!(
+        "pgo_profile_generated,path={},bytes={merged_bytes},sha256={merged_sha256},\
+training_cli_sha256={},training_image={},training_image_sha256={},raw_profiles={},\
+corpus=create:6000+lookup:1000000+rename:2000+delete:2000+walk",
+        merged.display(),
+        evidence.binary_sha256,
+        training_image.display(),
+        sha256_file(&training_image),
+        raw_profiles.len()
+    );
+}
+
+/// One parent process controls the generic/generic A/A and generic/PGO lookup
+/// observations. The decision consumes only a deterministic bootstrap median
+/// confidence interval; CV is deliberately never computed.
+#[test]
+#[ignore = "strict-remote bd-b9dug driver"]
+fn bd_b9dug_whole_binary_lookup_gate() {
+    const PAIRS: usize = 31;
+    const LOOKUPS: usize = 200_000;
+
+    let generic = required_env_path("FFS_B9DUG_GENERIC_CLI");
+    let pgo = Path::new(env!("CARGO_BIN_EXE_ffs-cli"));
+    let image = required_env_path("FFS_B9DUG_LOOKUP_IMAGE");
+    let expected_profile = required_env("FFS_PGO_PROFILE_SHA256");
+    assert!(
+        expected_profile.len() == 64
+            && expected_profile
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "FFS_PGO_PROFILE_SHA256 must be a full SHA-256"
+    );
+
+    let generic_evidence = cli_evidence(&generic);
+    let pgo_evidence = cli_evidence(pgo);
+    assert_eq!(
+        generic_evidence.pgo_profile_sha256, "none",
+        "generic control must not embed profile-use identity"
+    );
+    assert_eq!(
+        pgo_evidence.pgo_profile_sha256, expected_profile,
+        "candidate did not embed the consumed profile SHA"
+    );
+    assert!(
+        generic_evidence.codegen_line.contains("compile_avx2=false")
+            && generic_evidence.codegen_line.contains("compile_fma=false"),
+        "generic control unexpectedly widened its compile-time ISA: {}",
+        generic_evidence.codegen_line
+    );
+    assert!(
+        pgo_evidence.codegen_line.contains("compile_avx2=true")
+            && pgo_evidence.codegen_line.contains("compile_fma=true"),
+        "profile-use candidate is not witnessed x86-64-v3: {}",
+        pgo_evidence.codegen_line
+    );
+
+    for _ in 0..2 {
+        lookup_observation(&generic, &image, 50_000);
+        lookup_observation(pgo, &image, 50_000);
+    }
+    let samples = collect_lookup_samples(&generic, pgo, &image, PAIRS, LOOKUPS);
+    report_lookup_gate(
+        &LookupIdentity {
+            generic: &generic_evidence,
+            pgo: &pgo_evidence,
+            profile_sha256: &expected_profile,
+            image: &image,
+        },
+        samples,
+        PAIRS,
+        LOOKUPS,
+    );
+}
+
+/// Production-shaped generic/PGO warm sequential-read decision. Every timed
+/// child self-reports the ELF/ISA/profile it actually executes before measuring
+/// one complete open/resolve/read, while this parent owns A/A and A/B ordering.
+#[test]
+#[ignore = "strict-remote bd-b9dug driver"]
+fn bd_b9dug_whole_binary_read_gate() {
+    const PAIRS: usize = 31;
+    const READ_FILE: &str = "/bd-b9dug-read.bin";
+
+    let generic = required_env_path("FFS_B9DUG_GENERIC_CLI");
+    let pgo = Path::new(env!("CARGO_BIN_EXE_ffs-cli"));
+    let image = required_env_path("FFS_B9DUG_READ_IMAGE");
+    let expected_profile = required_env("FFS_PGO_PROFILE_SHA256");
+    assert!(
+        expected_profile.len() == 64
+            && expected_profile
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "FFS_PGO_PROFILE_SHA256 must be a full SHA-256"
+    );
+
+    let generic_evidence = cli_evidence(&generic);
+    let pgo_evidence = cli_evidence(pgo);
+    assert_create_gate_identity(&generic_evidence, &pgo_evidence, &expected_profile);
+    let input_image_sha256 = sha256_file(&image);
+
+    let (generic_bytes, generic_payload_sha256) =
+        read_payload_signature(&generic, &image, READ_FILE);
+    let (pgo_bytes, pgo_payload_sha256) = read_payload_signature(pgo, &image, READ_FILE);
+    assert_eq!(
+        generic_bytes, pgo_bytes,
+        "generic and v3+PGO reads returned different byte counts"
+    );
+    assert_eq!(
+        generic_payload_sha256, pgo_payload_sha256,
+        "generic and v3+PGO reads returned different bytes"
+    );
+    let expected_bytes = u64::try_from(generic_bytes).expect("read payload length fits u64");
+
+    for _ in 0..2 {
+        let generic_warmup = read_observation(&generic, &image, READ_FILE, &generic_evidence);
+        let pgo_warmup = read_observation(pgo, &image, READ_FILE, &pgo_evidence);
+        assert_eq!(generic_warmup.bytes, expected_bytes);
+        assert_eq!(pgo_warmup.bytes, expected_bytes);
+    }
+    let samples = collect_read_samples(
+        (&generic, &generic_evidence),
+        (pgo, &pgo_evidence),
+        &image,
+        READ_FILE,
+        expected_bytes,
+        PAIRS,
+    );
+    assert_eq!(
+        sha256_file(&image),
+        input_image_sha256,
+        "read gate mutated its immutable input image"
+    );
+    report_read_gate(
+        &LookupIdentity {
+            generic: &generic_evidence,
+            pgo: &pgo_evidence,
+            profile_sha256: &expected_profile,
+            image: &image,
+        },
+        READ_FILE,
+        &input_image_sha256,
+        generic_bytes,
+        &generic_payload_sha256,
+        samples,
+        PAIRS,
+    );
+}
+
+/// Production-shaped generic/PGO create decision. One parent process copies the
+/// same immutable image before every child observation, alternates `AAB`/`BAA`,
+/// and gates on persisted wall time (create rounds plus the final flush).
+#[test]
+#[ignore = "strict-remote bd-b9dug driver"]
+fn bd_b9dug_whole_binary_create_gate() {
+    const PAIRS: usize = 31;
+    const CREATES_PER_ROUND: usize = 2_000;
+    const ROUNDS: usize = 2;
+
+    let generic = required_env_path("FFS_B9DUG_GENERIC_CLI");
+    let pgo = Path::new(env!("CARGO_BIN_EXE_ffs-cli"));
+    let source_image = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/golden/ext4_dir_index_reference.ext4");
+    let create_dir = required_env_path("FFS_B9DUG_CREATE_DIR");
+    let run_id = bd_b9dug_run_id();
+    let expected_profile = required_env("FFS_PGO_PROFILE_SHA256");
+    assert!(
+        expected_profile.len() == 64
+            && expected_profile
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "FFS_PGO_PROFILE_SHA256 must be a full SHA-256"
+    );
+    fs::create_dir_all(&create_dir).expect("create bd-b9dug create artifact directory");
+    let anchor_image = create_dir.join(format!("create-{run_id}-anchor.ext4"));
+    let repeat_image = create_dir.join(format!("create-{run_id}-repeat.ext4"));
+    let candidate_image = create_dir.join(format!("create-{run_id}-candidate.ext4"));
+    for image in [&anchor_image, &repeat_image, &candidate_image] {
+        assert!(
+            !image.exists(),
+            "refusing to overwrite create-gate artifact {}",
+            image.display()
+        );
+    }
+
+    let generic_evidence = cli_evidence(&generic);
+    let pgo_evidence = cli_evidence(pgo);
+    assert_create_gate_identity(&generic_evidence, &pgo_evidence, &expected_profile);
+    let source_image_sha256 = sha256_file(&source_image);
+    let inputs = CreateInputs {
+        generic: &generic,
+        pgo,
+        generic_sha256: &generic_evidence.binary_sha256,
+        pgo_sha256: &pgo_evidence.binary_sha256,
+        source_image: &source_image,
+        source_image_sha256: &source_image_sha256,
+        anchor_image: &anchor_image,
+        repeat_image: &repeat_image,
+        candidate_image: &candidate_image,
+    };
+
+    create_observation(
+        inputs.generic,
+        inputs.generic_sha256,
+        inputs.source_image,
+        inputs.source_image_sha256,
+        inputs.anchor_image,
+        CREATES_PER_ROUND,
+        ROUNDS,
+    );
+    create_observation(
+        inputs.generic,
+        inputs.generic_sha256,
+        inputs.source_image,
+        inputs.source_image_sha256,
+        inputs.repeat_image,
+        CREATES_PER_ROUND,
+        ROUNDS,
+    );
+    create_observation(
+        inputs.pgo,
+        inputs.pgo_sha256,
+        inputs.source_image,
+        inputs.source_image_sha256,
+        inputs.candidate_image,
+        CREATES_PER_ROUND,
+        ROUNDS,
+    );
+
+    let samples = collect_create_samples(&inputs, PAIRS, CREATES_PER_ROUND, ROUNDS);
+    report_create_gate(
+        &LookupIdentity {
+            generic: &generic_evidence,
+            pgo: &pgo_evidence,
+            profile_sha256: &expected_profile,
+            image: &source_image,
+        },
+        samples,
+        PAIRS,
+        CREATES_PER_ROUND,
+        ROUNDS,
+    );
 }
 
 #[test]

@@ -18,13 +18,15 @@ const INODE: usize = 256;
 const OFF: usize = 512; // an inode slot offset within the block
 
 fn block(bs: usize) -> Vec<u8> {
-    (0..bs).map(|i| (i & 0xff) as u8).collect()
+    (0..bs)
+        .map(|i| u8::try_from(i & 0xff).expect("masked to u8"))
+        .collect()
 }
 
 fn patch() -> [u8; INODE] {
     let mut p = [0_u8; INODE];
     for (i, b) in p.iter_mut().enumerate() {
-        *b = (i as u8) | 1;
+        *b = u8::try_from(i & 0xff).expect("masked to u8") | 1;
     }
     p
 }

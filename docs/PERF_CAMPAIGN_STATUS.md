@@ -1,5 +1,72 @@
 # Perf campaign status — read this first
 
+> ## ⚠️ 2026-07-25 BUILD-IDENTITY CORRECTION (`bd-b9dug`, GreenSpring)
+>
+> Ordinary `cargo bench --profile release-perf` built the historical campaign
+> ELFs for Rust's generic x86-64 baseline. The performance distribution produced
+> by `scripts/build-perf.sh` uses fat LTO, `target-cpu=x86-64-v3`, and CLI-workload
+> PGO. Unless a row proves another identity from the executing ELF itself, the
+> ratios below are **generic benchmark-ELF history**, not measurements of the
+> binary produced by the shipping performance script.
+>
+> Final pinned-worker checks on `hz2` required both a distinct executing ELF
+> and `compile_avx2=true,compile_fma=true`. Allocator changed from generic
+> **12.445408×** CI `[12.348123, 12.495432]` to witnessed-v3
+> **13.631067×** CI `[13.452977, 13.759302]` (+9.53%). Production
+> JBD2 changed from generic **2.630522×** CI `[2.623337, 2.643932]`
+> to witnessed-v3 **2.605531×** CI `[2.597625, 2.618523]`
+> (-0.95%). Exact output and approximately 1.000× A/A nulls held throughout.
+>
+> The earlier 12.122× “v3” allocator result and its 11.6% absolute-time claim
+> are withdrawn: its distinct ELF still reported AVX2/FMA false. Local
+> `RUSTFLAGS` and two Cargo-config routes did not reach the top-level bench
+> through RCH. The admitted route explicitly allowlisted `RUSTFLAGS`, and both
+> remote rustc plus the executing binary reported AVX2+FMA. The v3 builds did
+> not contain the CLI PGO profile. They remain ISA-only evidence.
+>
+> **2026-07-27 exact lookup closeout:** a strict-remote, pinned-`ovh-a`
+> pipeline generated a 28,739,968-byte profile from the production CLI
+> create/lookup/rename/delete/walk workload family and consumed it in a
+> witnessed v3+PGO CLI. Generic ELF
+> `1d36a367ee3703d99a92b8af52387af2570787db4070065082185db681517764`
+> and v3+PGO ELF
+> `7136d8bf768a222ec2e6985efbe25249131a274db3b9bc81a4394323265adc62`
+> self-reported their identities; the candidate embedded merged-profile SHA
+> `3dbce2b2fca971cacd1963d0aaeb867de10417761624a0c1236d01a6880860db`.
+> On one 8,003-entry image, 31 alternating `AAB`/`BAA` rounds of 200,000
+> lookups gave generic **21,667 us** versus v3+PGO **15,110 us**:
+> generic/v3+PGO **1.437700x**, bootstrap median 95% CI
+> **[1.414742, 1.494961]**. The generic/generic A/A was **0.994371x**,
+> CI **[0.974583, 1.005166]**; the real lower bound cleared the
+> pre-registered twice-null threshold **1.052840x**. Exact found-count/signature
+> and input-image SHA held. CV was not computed.
+>
+> The exact staged-source replay after lint cleanup independently passed:
+> rebuilt v3+PGO ELF
+> `1cf9b1dc5c162760787fb3fe003fbcbcccf132c4a1f753376996ac871c5275af`
+> consumed the same profile and produced the same signature/image SHA.
+> Generic/v3+PGO was **1.495236x**, CI **[1.459215, 1.520699]**,
+> clearing that invocation's **1.122973x** twice-null threshold. Its A/A
+> was **1.032385x**, CI **[1.008930, 1.059704]**. The two decisions are
+> reported separately, not pooled.
+>
+> **Affected-claim restatement:** kernel wins remain generic-build history but
+> are not measured shipped-binary ratios; kernel losses remain generic-build
+> routing evidence, not upper bounds, and cannot support “structural” or
+> “irreducible” closure. Internal lever ratios remain historical same-ELF
+> measurements because both arms used one ELF; the fresh v3 reruns above replace
+> the owned allocator/JBD2 publication numbers. Absolute production-shaped
+> attribution is now verified only for the named lookup corpus; it has no
+> mounted-kernel arm and cannot correct any kernel ratio or unrelated workload.
+> Do not apply a global correction; the witnessed ratios moved in opposite
+> directions and lookup has its own larger effect. Retry v3 only with an
+> explicit RCH environment allowlist and AVX2+FMA compiler/binary witnesses.
+> Exact v3+PGO attribution additionally requires an embedded consumed-profile
+> SHA, exact output/fsck parity as applicable, same-invocation A/A and A/B, and
+> a median-ratio 95% CI outside twice the null margin. CV is provenance, never
+> a gate.
+> Full correction: `docs/BD_B9DUG_ISA_CORRECTION.md`.
+
 > ## ⭐ 2026-07-11 UNBLOCK + WIN (BlackThrush) — the "returnable-binary" gate was never real; mounted axis is OPEN
 >
 > The blocker cited across many rows ("rch can't ship the binary back → mounted

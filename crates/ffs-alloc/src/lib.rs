@@ -2694,6 +2694,27 @@ pub fn try_alloc_blocks_in_group(
             BitmapOverride::full(&bitmap)
         };
 
+        // Route the bitmap write through the bit-level OR-merge RMW so two
+        // concurrent same-group allocators to DISJOINT blocks merge instead of
+        // first-committer-wins conflicting on the shared group bitmap block
+        // (bd-bhh0i BUG 4). The closure re-applies ONLY this op's alloc range
+        // onto the base the device reads at its OWN txn snapshot — an
+        // RMW-at-snapshot that also closes the stale-read clobber window the
+        // separate read_block(above)/write_block had. Scoped to the empty-
+        // rollback (steady-state: reserved bits already marked) case so the
+        // merged content is exactly `base | alloc_range`; the rare
+        // unconfirmed-reserved path keeps the plain write. Default (non-sharded)
+        // builds are byte-identical.
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        if rollback_clear_bits.is_empty() {
+            dev.rmw_block_bitmap_or(cx, stats.block_bitmap_block, &mut |base_bitmap| {
+                bitmap_set_range(base_bitmap, rel_start, alloc_count);
+                Ok(())
+            })?;
+        } else {
+            dev.write_block(cx, stats.block_bitmap_block, &bitmap)?;
+        }
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
         dev.write_block(cx, stats.block_bitmap_block, &bitmap)?;
         let previous_free_blocks = stats.free_blocks;
         let previous_largest_free_run = stats.block_largest_free_run;

@@ -1,5 +1,13 @@
 # bd-bhh0i — Parallel metadata-write scaling: implementation plan
 
+> **2026-07-26 scope clarification:** the 2026-07-13 default-OFF verdict below
+> is the historical sharded-allocator cutover result. It does not describe the
+> separate MVCC commit-publication mode. The later same-invocation, cloned-image
+> gate satisfied its null-floor, twice-null, and real-fsck predicates, so
+> `PublicationMode::WaitFree` is now the production default with `mutex` as the
+> explicit fallback. See the newest `bd-bhh0i` rows in
+> `docs/progress/perf-negative-results.md` and `docs/NEGATIVE_EVIDENCE.md`.
+
 ## ⛔ 2026-07-13 LOCAL CUTOVER GATE FAILED — NEGATIVE RESULT (toggle stays default-OFF)
 
 The sharded-allocator cutover is fully built + wired + remote-validated (bd_bhh0i

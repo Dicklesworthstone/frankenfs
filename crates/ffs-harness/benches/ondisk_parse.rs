@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use asupersync::Cx;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
 use ffs_btrfs::{BtrfsDirItem, BtrfsInodeItem, BtrfsInodeRef};
 use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions, RequestScope};
 use ffs_harness::load_sparse_fixture;
@@ -13,7 +13,9 @@ use ffs_ondisk::{
     verify_btrfs_superblock_checksum, verify_btrfs_tree_block_checksum,
 };
 use ffs_types::{BlockNumber, InodeNumber};
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,23 @@ use tempfile::NamedTempFile;
 const BTRFS_BENCH_BLOCK_SIZE: usize = 4096;
 const BTRFS_HEADER_SIZE: usize = 101;
 const BTRFS_KEY_PTR_SIZE: usize = 33;
+
+fn self_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    format!("{} ({} bytes) {}", encoded, bytes.len(), path.display())
+}
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1336,4 +1355,9 @@ criterion_group!(
     bench_ext4_chksum_4kb,
     bench_ext4_runtime_htree_lookup_ab,
 );
-criterion_main!(ondisk);
+
+fn main() {
+    println!("bench_elf_sha256={}", self_identity());
+    ondisk();
+    Criterion::default().configure_from_args().final_summary();
+}

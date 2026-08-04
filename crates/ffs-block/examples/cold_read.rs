@@ -96,12 +96,10 @@ use std::time::Instant;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: cold_read <path> [chunk_kib] [threads]");
-    let chunk: usize = args
+    let path = args
         .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024)
-        * 1024;
+        .expect("usage: cold_read <path> [chunk_kib] [threads]");
+    let chunk: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1024) * 1024;
     let threads: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
     // 4th arg: access pattern — "seq" (default) sweeps each thread's contiguous
     // range; "rand" does `len/chunk` reads at random chunk-aligned offsets across
@@ -122,7 +120,11 @@ fn main() {
     for t in 0..threads {
         let dev = Arc::clone(&dev);
         let begin = per * t as u64;
-        let end = if t + 1 == threads { len } else { per * (t as u64 + 1) };
+        let end = if t + 1 == threads {
+            len
+        } else {
+            per * (t as u64 + 1)
+        };
         let pat_rand = rand;
         handles.push(std::thread::spawn(move || {
             let cx = Cx::for_testing();
@@ -131,13 +133,20 @@ fn main() {
             if pat_rand {
                 // Per-thread LCG (deterministic, no rand dep); each thread issues
                 // `nchunks/threads` reads at random chunk-aligned offsets.
-                let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (t as u64).wrapping_mul(0x1234_5);
+                let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (t as u64).wrapping_mul(0x0001_2345);
                 let reads = (nchunks / threads as u64).max(1);
                 for _ in 0..reads {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                    let slot = if nchunks == 0 { 0 } else { (state >> 33) % nchunks };
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let slot = if nchunks == 0 {
+                        0
+                    } else {
+                        (state >> 33) % nchunks
+                    };
                     let off = slot * chunk as u64;
-                    let n = std::cmp::min(chunk as u64, len - off) as usize;
+                    let n = usize::try_from(std::cmp::min(chunk as u64, len - off))
+                        .expect("chunk fits usize");
                     dev.read_exact_at(&cx, ByteOffset(off), &mut buf[..n])
                         .expect("read");
                     let mut i = 0;
@@ -150,7 +159,8 @@ fn main() {
             }
             let mut off = begin;
             while off < end {
-                let n = std::cmp::min(chunk as u64, end - off) as usize;
+                let n = usize::try_from(std::cmp::min(chunk as u64, end - off))
+                    .expect("chunk fits usize");
                 dev.read_exact_at(&cx, ByteOffset(off), &mut buf[..n])
                     .expect("read");
                 // Touch one byte per page so the read is not elided and pages fault.

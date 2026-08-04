@@ -7,7 +7,7 @@
 //! It exercises `generate_send_stream` exactly where parent-chain PATH and
 //! directory-depth reconstruction used to walk the same ancestors per inode.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
 use ffs_btrfs::{
     BTRFS_FIRST_FREE_OBJECTID, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_INODE_REF,
     BTRFS_SEND_STREAM_MAGIC, BTRFS_SEND_STREAM_VERSION, BtrfsKey, BtrfsLeafEntry, SendAttr,
@@ -15,8 +15,23 @@ use ffs_btrfs::{
     build_mkfile_command, build_subvol_command, build_truncate_command, build_utimes_command,
     generate_send_stream, parse_inode_item, parse_inode_refs,
 };
+#[cfg(feature = "bench-instrumentation")]
+use ffs_btrfs::{
+    generate_send_stream_btree_grouping_control, generate_send_stream_btree_inode_links_control,
+    generate_send_stream_exact_capacity_oracle,
+    generate_send_stream_materialized_parent_index_control,
+};
+use rustc_hash::FxBuildHasher;
+use sha2::{Digest, Sha256};
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
+use std::fs::File;
+use std::hash::BuildHasher;
 use std::hint::black_box;
+use std::io::Read;
+use std::process::Command;
+use std::time::Instant;
 
 const DEPTH: u64 = 128;
 const FILES: u64 = 768;
@@ -24,6 +39,109 @@ const ROOT_INO: u64 = BTRFS_FIRST_FREE_OBJECTID;
 const FIRST_DIR_INO: u64 = ROOT_INO + 1;
 const FIRST_FILE_INO: u64 = FIRST_DIR_INO + DEPTH;
 const BTRFS_SEND_CRC32C_POLY: u32 = 0x82F6_3B78;
+
+#[derive(Clone, Copy)]
+struct BootstrapMedianCi {
+    median: f64,
+    low: f64,
+    high: f64,
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    values.sort_by(f64::total_cmp);
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 0 {
+        values[midpoint - 1].midpoint(values[midpoint])
+    } else {
+        values[midpoint]
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn bootstrap_median_ci(log_ratios: &[f64]) -> BootstrapMedianCi {
+    const RESAMPLES: usize = 20_000;
+    assert!(
+        !log_ratios.is_empty(),
+        "bootstrap median CI requires paired samples"
+    );
+    let mut state =
+        0xB7F5_5EAD_2026_0726_u64 ^ u64::try_from(log_ratios.len()).expect("sample count fits u64");
+    let mut bootstrapped = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut sample = Vec::with_capacity(log_ratios.len());
+        for _ in log_ratios {
+            let draw = splitmix64(&mut state)
+                % u64::try_from(log_ratios.len()).expect("sample count fits u64");
+            sample.push(log_ratios[usize::try_from(draw).expect("draw fits usize")]);
+        }
+        bootstrapped.push(median(sample));
+    }
+    bootstrapped.sort_by(f64::total_cmp);
+    let low_index = RESAMPLES.saturating_mul(25) / 1000;
+    let high_index = RESAMPLES
+        .saturating_mul(975)
+        .div_ceil(1000)
+        .saturating_sub(1);
+    BootstrapMedianCi {
+        median: median(log_ratios.to_vec()).exp(),
+        low: bootstrapped[low_index].exp(),
+        high: bootstrapped[high_index].exp(),
+    }
+}
+
+fn print_bench_evidence_metadata() {
+    let exe = std::env::current_exe().expect("bench executable");
+    let mut file = File::open(&exe).expect("open bench executable for hashing");
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer).expect("hash bench executable");
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    let worker = Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let digest = hasher.finalize();
+    let mut sha256 = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut sha256, "{byte:02x}").expect("format bench executable hash");
+    }
+    println!("bench_evidence,binary_sha256={sha256},worker={worker}");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn print_codegen_isa() {
+    println!(
+        "codegen_isa,target_arch=x86_64,compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse4_2={},runtime_avx2={},runtime_fma={}",
+        cfg!(target_feature = "sse2"),
+        cfg!(target_feature = "sse4.2"),
+        cfg!(target_feature = "avx2"),
+        cfg!(target_feature = "fma"),
+        std::is_x86_feature_detected!("sse4.2"),
+        std::is_x86_feature_detected!("avx2"),
+        std::is_x86_feature_detected!("fma"),
+    );
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn print_codegen_isa() {
+    println!("codegen_isa,target_arch=non_x86_64");
+}
 
 #[derive(Debug, Clone, Default)]
 struct LegacySendStreamBuilder {
@@ -210,6 +328,2043 @@ fn build_deep_send_items() -> Vec<BtrfsLeafEntry> {
     }
 
     items
+}
+
+fn collect_inode_links(items: &[BtrfsLeafEntry]) -> BTreeMap<u64, Vec<(u64, Vec<u8>)>> {
+    let mut inode_links: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
+    for entry in items {
+        if entry.key.item_type == BTRFS_ITEM_INODE_REF {
+            if let Ok(refs) = parse_inode_refs(&entry.data) {
+                let links = inode_links.entry(entry.key.objectid).or_default();
+                for inode_ref in refs {
+                    links.push((entry.key.offset, inode_ref.name.clone()));
+                }
+            }
+        }
+    }
+    inode_links
+}
+
+/// Exact source-neutral copy of the production projection under review. This is
+/// the complete allocation/clone stage the proposed lever would remove.
+fn project_primary_parents(
+    inode_links: &BTreeMap<u64, Vec<(u64, Vec<u8>)>>,
+) -> BTreeMap<u64, (u64, Vec<u8>)> {
+    inode_links
+        .iter()
+        .filter_map(|(&ino, links)| {
+            links
+                .first()
+                .map(|(parent, name)| (ino, (*parent, name.clone())))
+        })
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("format SHA-256");
+    }
+    hex
+}
+
+fn primary_parent_digest(parents: &BTreeMap<u64, (u64, Vec<u8>)>) -> String {
+    let mut hasher = Sha256::new();
+    for (ino, (parent, name)) in parents {
+        hasher.update(ino.to_le_bytes());
+        hasher.update(parent.to_le_bytes());
+        hasher.update(
+            u64::try_from(name.len())
+                .expect("name length fits u64")
+                .to_le_bytes(),
+        );
+        hasher.update(name);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("format parent-index SHA-256");
+    }
+    hex
+}
+
+fn inode_links_digest(inode_links: &BTreeMap<u64, Vec<(u64, Vec<u8>)>>) -> String {
+    let mut hasher = Sha256::new();
+    for (ino, links) in inode_links {
+        hasher.update(ino.to_le_bytes());
+        hasher.update(
+            u64::try_from(links.len())
+                .expect("link count fits u64")
+                .to_le_bytes(),
+        );
+        for (parent, name) in links {
+            hasher.update(parent.to_le_bytes());
+            hasher.update(
+                u64::try_from(name.len())
+                    .expect("link name length fits u64")
+                    .to_le_bytes(),
+            );
+            hasher.update(name);
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("format inode-links SHA-256");
+    }
+    hex
+}
+
+fn observe_ns_per_iteration(mut operation: impl FnMut(), iterations: u32) -> f64 {
+    let started = Instant::now();
+    for _ in 0..iterations {
+        operation();
+    }
+    started.elapsed().as_secs_f64() * 1e9 / f64::from(iterations)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BufferGrowthMechanism {
+    command_frames: usize,
+    capacity_changes: usize,
+    pointer_relocations: usize,
+    relocated_live_bytes: usize,
+    final_capacity: usize,
+}
+
+fn record_buffer_growth(
+    buffer: &Vec<u8>,
+    prior_capacity: usize,
+    prior_pointer: *const u8,
+    prior_len: usize,
+    mechanism: &mut BufferGrowthMechanism,
+) {
+    if buffer.capacity() == prior_capacity {
+        return;
+    }
+    mechanism.capacity_changes += 1;
+    if prior_len > 0 && buffer.as_ptr() != prior_pointer {
+        mechanism.pointer_relocations += 1;
+        mechanism.relocated_live_bytes += prior_len;
+    }
+}
+
+/// Replay the production builder's allocation sequence over an already
+/// generated stream. Command bytes are appended as one frame after the same
+/// `reserve(full_len)` call production makes; capacity evolution is therefore
+/// identical even though the individual frame fields are already serialized.
+fn count_output_buffer_growth(stream: &[u8]) -> BufferGrowthMechanism {
+    let header_len = BTRFS_SEND_STREAM_MAGIC.len() + std::mem::size_of::<u32>();
+    assert!(
+        stream.len() >= header_len,
+        "stream contains complete header"
+    );
+    assert_eq!(
+        &stream[..BTRFS_SEND_STREAM_MAGIC.len()],
+        BTRFS_SEND_STREAM_MAGIC,
+        "stream magic changed"
+    );
+
+    let mut buffer = Vec::new();
+    let mut mechanism = BufferGrowthMechanism::default();
+    for header_part in [
+        &stream[..BTRFS_SEND_STREAM_MAGIC.len()],
+        &stream[BTRFS_SEND_STREAM_MAGIC.len()..header_len],
+    ] {
+        let prior_capacity = buffer.capacity();
+        let prior_pointer = buffer.as_ptr();
+        let prior_len = buffer.len();
+        buffer.extend_from_slice(header_part);
+        record_buffer_growth(
+            &buffer,
+            prior_capacity,
+            prior_pointer,
+            prior_len,
+            &mut mechanism,
+        );
+    }
+
+    let mut position = header_len;
+    while position < stream.len() {
+        assert!(
+            stream.len().saturating_sub(position) >= 10,
+            "stream command header is complete"
+        );
+        let payload_len = usize::try_from(u32::from_le_bytes(
+            stream[position..position + 4]
+                .try_into()
+                .expect("command length field"),
+        ))
+        .expect("u32 command length fits usize");
+        let frame_len = 10usize
+            .checked_add(payload_len)
+            .expect("command frame length fits usize");
+        let frame_end = position
+            .checked_add(frame_len)
+            .expect("command frame end fits usize");
+        assert!(frame_end <= stream.len(), "command frame is complete");
+
+        let prior_capacity = buffer.capacity();
+        let prior_pointer = buffer.as_ptr();
+        let prior_len = buffer.len();
+        buffer.reserve(frame_len);
+        record_buffer_growth(
+            &buffer,
+            prior_capacity,
+            prior_pointer,
+            prior_len,
+            &mut mechanism,
+        );
+        buffer.extend_from_slice(&stream[position..frame_end]);
+        mechanism.command_frames += 1;
+        position = frame_end;
+    }
+
+    assert_eq!(buffer, stream, "growth replay changed stream bytes");
+    mechanism.final_capacity = buffer.capacity();
+    mechanism
+}
+
+#[cfg(feature = "bench-instrumentation")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's identity, mechanism, A/A, A/B, and verdict protocol together"
+)]
+fn send_buffer_growth_ceiling_ab_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const MAX_NULL_FLOOR_RATIO: f64 = 1.10;
+
+    let items = build_deep_send_items();
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let control_stream =
+        generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+            Ok(Vec::new())
+        })
+        .expect("generate zero-capacity control stream");
+    let exact_capacity = control_stream.len();
+    let oracle_stream = generate_send_stream_exact_capacity_oracle(
+        &items,
+        subvol,
+        &uuid,
+        1,
+        exact_capacity,
+        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+    )
+    .expect("generate exact-capacity oracle stream");
+    assert_eq!(
+        control_stream, oracle_stream,
+        "exact capacity changed send-stream bytes"
+    );
+
+    let input_payload_bytes = items.iter().map(|item| item.data.len()).sum::<usize>();
+    let mechanism = count_output_buffer_growth(&control_stream);
+    println!(
+        "send_buffer_growth_mechanism,input_items={},input_payload_bytes={input_payload_bytes},stream_bytes={exact_capacity},stream_over_input_ratio={:.6},command_frames={},capacity_changes={},pointer_relocations={},relocated_live_bytes={},relocated_over_stream_ratio={:.6},final_capacity={},stream_sha256={},result=identical",
+        items.len(),
+        exact_capacity as f64 / input_payload_bytes as f64,
+        mechanism.command_frames,
+        mechanism.capacity_changes,
+        mechanism.pointer_relocations,
+        mechanism.relocated_live_bytes,
+        mechanism.relocated_live_bytes as f64 / exact_capacity as f64,
+        mechanism.final_capacity,
+        sha256_hex(&control_stream),
+    );
+
+    for _ in 0..4 {
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm zero-capacity control stream"),
+        );
+        black_box(
+            generate_send_stream_exact_capacity_oracle(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                black_box(exact_capacity),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm exact-capacity oracle stream"),
+        );
+    }
+
+    let mut control_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut oracle_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_control = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate zero-capacity control stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_oracle = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream_exact_capacity_oracle(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        black_box(exact_capacity),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate exact-capacity oracle stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let (lhs, rhs, oracle, order) = if pair_index % 2 == 0 {
+            (
+                observe_control(),
+                observe_control(),
+                observe_oracle(),
+                "AAB",
+            )
+        } else {
+            let oracle = observe_oracle();
+            let rhs = observe_control();
+            let lhs = observe_control();
+            (lhs, rhs, oracle, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        oracle_ns.push(oracle);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{oracle:.3}")
+            .expect("format send-buffer A/A+B pair");
+    }
+
+    let null_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .zip(&oracle_ns)
+        .map(|((lhs, rhs), oracle)| (lhs.midpoint(*rhs) / oracle).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio < MAX_NULL_FLOOR_RATIO
+        && speedup_summary.low > twice_null_ratio
+        && speedup_summary.low > 1.0;
+    let verdict = if admitted {
+        "ADMIT_PRODUCTION_HINT_SEARCH"
+    } else if null_floor_ratio >= MAX_NULL_FLOOR_RATIO {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_IDEAL_CEILING_BELOW_TWICE_NULL"
+    };
+    println!(
+        "send_buffer_growth_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},format=order:control_lhs_ns:control_rhs_ns:oracle_ns,values={raw_pairs}"
+    );
+    println!(
+        "send_buffer_growth_ceiling,control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},twice_null_ratio={twice_null_ratio:.6},control_over_oracle_median={:.6},control_over_oracle_ci_low={:.6},control_over_oracle_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
+}
+
+/// Retry-predicate gate for bd-btrfs-send-parent-index-azojl. This invocation
+/// does not contain a candidate production path: it only counts the exact
+/// projection stage against duplicate executions of the current whole stream.
+fn parent_index_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const STAGE_REPEATS: u32 = 16;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.001;
+
+    let items = build_deep_send_items();
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let inode_links = collect_inode_links(&items);
+    let parents = project_primary_parents(&inode_links);
+    assert_eq!(parents.len(), inode_links.len());
+    for (ino, links) in &inode_links {
+        let (expected_parent, expected_name) =
+            links.first().expect("fixture inode has at least one link");
+        let (actual_parent, actual_name) = &parents[ino];
+        assert_eq!(actual_parent, expected_parent, "primary parent changed");
+        assert_eq!(actual_name, expected_name, "primary name changed");
+    }
+
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "parent_index_attribution_parity,inodes={},links={},primary_name_bytes={},parent_index_sha256={},stream_bytes={},stream_sha256={},result=identical",
+        parents.len(),
+        inode_links.values().map(Vec::len).sum::<usize>(),
+        parents.values().map(|(_, name)| name.len()).sum::<usize>(),
+        primary_parent_digest(&parents),
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(project_primary_parents(black_box(&inode_links)));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut projection_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_projection = || {
+            observe_ns_per_iteration(
+                || {
+                    let primary = project_primary_parents(black_box(&inode_links));
+                    black_box(primary.len());
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (lhs, rhs, projection, order) = if pair_index % 2 == 0 {
+            (
+                observe_whole(),
+                observe_whole(),
+                observe_projection(),
+                "AAS",
+            )
+        } else {
+            let projection = observe_projection();
+            let rhs = observe_whole();
+            let lhs = observe_whole();
+            (lhs, rhs, projection, "SAA")
+        };
+        whole_lhs_ns.push(lhs);
+        whole_rhs_ns.push(rhs);
+        projection_ns.push(projection);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{projection:.3}")
+            .expect("format attribution pair");
+    }
+
+    let null_log_ratios = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_log_ratios = projection_ns
+        .iter()
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|(projection, (lhs, rhs))| (projection / lhs.midpoint(*rhs)).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let attribution_summary = bootstrap_median_ci(&attribution_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let admitted = null_floor_ratio < 1.10 && attribution_summary.low >= MIN_ATTRIBUTION_FRACTION;
+    let verdict = if admitted {
+        "ADMITTED_FOR_AB"
+    } else if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else {
+        "NOT_ADMITTED_BELOW_0_1_PERCENT"
+    };
+    println!(
+        "parent_index_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},projection_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:projection_ns,values={raw_pairs}"
+    );
+    println!(
+        "parent_index_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_aa_null_floor_ratio={null_floor_ratio:.6},projection_fraction_median={:.8},projection_fraction_ci_low={:.8},projection_fraction_ci_high={:.8},projection_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.4},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        attribution_summary.median,
+        attribution_summary.low,
+        attribution_summary.high,
+        attribution_summary.median * 100.0,
+    );
+}
+
+/// Retry-predicate gate for the parsed-`INODE_REF` handoff row. This mode does
+/// not contain a candidate representation: it counts and times the complete
+/// current `inode_links` construction against duplicate current whole streams.
+///
+/// Production may change only if the stage's complete bootstrap median-CI
+/// lower bound reaches 5% of whole-stream wall and the same-invocation A/A
+/// symmetric null floor is at most 1.015x.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's parity, counted stage, A/A, and verdict protocol together"
+)]
+fn inode_links_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 8;
+    const STAGE_REPEATS: u32 = 32;
+    const MAX_NULL_FLOOR_RATIO: f64 = 1.015;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.05;
+
+    let items = build_deep_send_items();
+    let inode_links = collect_inode_links(&items);
+    let ref_items = items
+        .iter()
+        .filter(|entry| entry.key.item_type == BTRFS_ITEM_INODE_REF)
+        .count();
+    let parsed_links = inode_links.values().map(Vec::len).sum::<usize>();
+    let name_bytes = inode_links
+        .values()
+        .flat_map(|links| links.iter())
+        .map(|(_, name)| name.len())
+        .sum::<usize>();
+    let monotone_objectids = items
+        .windows(2)
+        .all(|pair| pair[0].key.objectid <= pair[1].key.objectid);
+    assert!(
+        monotone_objectids,
+        "deep-path fixture must exercise the ordered production input"
+    );
+    assert_eq!(
+        ref_items, parsed_links,
+        "fixture must carry exactly one parsed link per INODE_REF item"
+    );
+
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "inode_links_attribution_parity,ordered_input={monotone_objectids},ref_items={ref_items},map_entry_probes={ref_items},unique_inodes={},parsed_links={parsed_links},name_bytes={name_bytes},inode_links_sha256={},stream_bytes={},stream_sha256={},result=identical",
+        inode_links.len(),
+        inode_links_digest(&inode_links),
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(collect_inode_links(black_box(&items)));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut stage_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_stage = || {
+            observe_ns_per_iteration(
+                || {
+                    let current = collect_inode_links(black_box(&items));
+                    black_box(current);
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (lhs, rhs, stage, order) = if pair_index % 2 == 0 {
+            (observe_whole(), observe_whole(), observe_stage(), "AAS")
+        } else {
+            let stage = observe_stage();
+            let rhs = observe_whole();
+            let lhs = observe_whole();
+            (lhs, rhs, stage, "SAA")
+        };
+        whole_lhs_ns.push(lhs);
+        whole_rhs_ns.push(rhs);
+        stage_ns.push(stage);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{stage:.3}")
+            .expect("format inode-links attribution pair");
+    }
+
+    let null_log_ratios = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_log_ratios = stage_ns
+        .iter()
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|(stage, (lhs, rhs))| (stage / lhs.midpoint(*rhs)).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let attribution_summary = bootstrap_median_ci(&attribution_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let admitted = null_floor_ratio <= MAX_NULL_FLOOR_RATIO
+        && attribution_summary.low >= MIN_ATTRIBUTION_FRACTION;
+    let verdict = if admitted {
+        "ADMITTED_FOR_AB"
+    } else if null_floor_ratio > MAX_NULL_FLOOR_RATIO {
+        "BLOCKED_NULL_FLOOR"
+    } else {
+        "NOT_ADMITTED_BELOW_5_PERCENT"
+    };
+    println!(
+        "inode_links_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},stage_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:stage_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_links_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},stage_fraction_median={:.8},stage_fraction_ci_low={:.8},stage_fraction_ci_high={:.8},stage_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.2},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        attribution_summary.median,
+        attribution_summary.low,
+        attribution_summary.high,
+        attribution_summary.median * 100.0,
+    );
+}
+
+#[cfg(feature = "bench-instrumentation")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's parity, A/A, A/B, and verdict protocol together"
+)]
+fn inode_links_ab_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 8;
+    const MAX_NULL_FLOOR_RATIO: f64 = 1.015;
+
+    let items = build_deep_send_items();
+    let inode_links = collect_inode_links(&items);
+    let ref_items = items
+        .iter()
+        .filter(|entry| entry.key.item_type == BTRFS_ITEM_INODE_REF)
+        .count();
+    let parsed_links = inode_links.values().map(Vec::len).sum::<usize>();
+    let name_bytes = inode_links
+        .values()
+        .flat_map(|links| links.iter())
+        .map(|(_, name)| name.len())
+        .sum::<usize>();
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+
+    let control_stream = generate_send_stream_btree_inode_links_control(
+        &items,
+        subvol,
+        &uuid,
+        1,
+        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+    )
+    .expect("generate BTreeMap inode-links control stream");
+    let candidate_stream =
+        generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+            Ok(Vec::new())
+        })
+        .expect("generate ordered inode-links candidate stream");
+    assert_eq!(
+        control_stream, candidate_stream,
+        "ordered inode-links index changed the complete send stream"
+    );
+    println!(
+        "inode_links_ab_parity,ordered_input=true,map_entry_probes_removed={ref_items},unique_inodes={},parsed_links={parsed_links},name_bytes={name_bytes},stream_bytes={},control_sha256={},candidate_sha256={},result=identical",
+        inode_links.len(),
+        control_stream.len(),
+        sha256_hex(&control_stream),
+        sha256_hex(&candidate_stream),
+    );
+
+    for _ in 0..4 {
+        black_box(
+            generate_send_stream_btree_inode_links_control(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm BTreeMap inode-links control stream"),
+        );
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm ordered inode-links candidate stream"),
+        );
+    }
+
+    let mut control_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut candidate_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_control = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream_btree_inode_links_control(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate BTreeMap inode-links control stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_candidate = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate ordered inode-links candidate stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let (lhs, rhs, candidate, order) = if pair_index % 2 == 0 {
+            (
+                observe_control(),
+                observe_control(),
+                observe_candidate(),
+                "AAB",
+            )
+        } else {
+            let candidate = observe_candidate();
+            let rhs = observe_control();
+            let lhs = observe_control();
+            (lhs, rhs, candidate, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{candidate:.3}")
+            .expect("format inode-links A/A+B pair");
+    }
+
+    let null_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .zip(&candidate_ns)
+        .map(|((lhs, rhs), candidate)| (lhs.midpoint(*rhs) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio <= MAX_NULL_FLOOR_RATIO
+        && speedup_summary.low > twice_null_ratio
+        && speedup_summary.low > 1.0;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio > MAX_NULL_FLOOR_RATIO {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL"
+    };
+    println!(
+        "inode_links_ab_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_links_ab,control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},maximum_null_floor_ratio={MAX_NULL_FLOOR_RATIO:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
+}
+
+fn group_send_inode_entries(items: &[BtrfsLeafEntry]) -> BTreeMap<u64, Vec<&BtrfsLeafEntry>> {
+    let mut inodes: BTreeMap<u64, Vec<&BtrfsLeafEntry>> = BTreeMap::new();
+    for entry in items {
+        inodes.entry(entry.key.objectid).or_default().push(entry);
+    }
+    inodes
+}
+
+fn inode_grouping_digest(inodes: &BTreeMap<u64, Vec<&BtrfsLeafEntry>>) -> String {
+    let mut hasher = Sha256::new();
+    for (ino, entries) in inodes {
+        hasher.update(ino.to_le_bytes());
+        hasher.update(
+            u64::try_from(entries.len())
+                .expect("group length fits u64")
+                .to_le_bytes(),
+        );
+        for entry in entries {
+            hasher.update(entry.key.objectid.to_le_bytes());
+            hasher.update([entry.key.item_type]);
+            hasher.update(entry.key.offset.to_le_bytes());
+            hasher.update(
+                u64::try_from(entry.data.len())
+                    .expect("entry length fits u64")
+                    .to_le_bytes(),
+            );
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("format inode-grouping SHA-256");
+    }
+    hex
+}
+
+/// Source-neutral admission gate for the complete inode-grouping pass in
+/// `generate_send_stream_impl`. There is no candidate production path in this
+/// invocation: it counts the current BTreeMap insertion stage against duplicate
+/// current whole-stream executions.
+fn inode_grouping_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const STAGE_REPEATS: u32 = 16;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.05;
+
+    let items = build_deep_send_items();
+    let grouped = group_send_inode_entries(&items);
+    let grouped_items = grouped.values().map(Vec::len).sum::<usize>();
+    assert_eq!(
+        grouped_items,
+        items.len(),
+        "grouping did not retain every fixture item exactly once"
+    );
+    for (&ino, entries) in &grouped {
+        assert!(
+            entries.iter().all(|entry| entry.key.objectid == ino),
+            "group contains an entry from another inode"
+        );
+    }
+
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "inode_grouping_attribution_parity,map_insertions={},grouped_inodes={},grouped_items={grouped_items},grouping_sha256={},stream_bytes={},stream_sha256={},result=identical",
+        items.len(),
+        grouped.len(),
+        inode_grouping_digest(&grouped),
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(group_send_inode_entries(black_box(&items)));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut grouping_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_grouping = || {
+            observe_ns_per_iteration(
+                || {
+                    let current = group_send_inode_entries(black_box(&items));
+                    black_box(current.len());
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (lhs, rhs, grouping, order) = if pair_index % 2 == 0 {
+            (observe_whole(), observe_whole(), observe_grouping(), "AAS")
+        } else {
+            let grouping = observe_grouping();
+            let rhs = observe_whole();
+            let lhs = observe_whole();
+            (lhs, rhs, grouping, "SAA")
+        };
+        whole_lhs_ns.push(lhs);
+        whole_rhs_ns.push(rhs);
+        grouping_ns.push(grouping);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{grouping:.3}")
+            .expect("format inode-grouping attribution pair");
+    }
+
+    let null_log_ratios = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_log_ratios = grouping_ns
+        .iter()
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|(grouping, (lhs, rhs))| (grouping / lhs.midpoint(*rhs)).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let attribution_summary = bootstrap_median_ci(&attribution_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let admitted = null_floor_ratio < 1.10 && attribution_summary.low >= MIN_ATTRIBUTION_FRACTION;
+    let verdict = if admitted {
+        "ADMITTED_FOR_AB"
+    } else if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else {
+        "NOT_ADMITTED_BELOW_5_PERCENT"
+    };
+    println!(
+        "inode_grouping_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},grouping_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:grouping_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_grouping_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_aa_null_floor_ratio={null_floor_ratio:.6},grouping_fraction_median={:.8},grouping_fraction_ci_low={:.8},grouping_fraction_ci_high={:.8},grouping_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.2},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        attribution_summary.median,
+        attribution_summary.low,
+        attribution_summary.high,
+        attribution_summary.median * 100.0,
+    );
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn inode_grouping_ab_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+
+    let items = build_deep_send_items();
+    let grouped = group_send_inode_entries(&items);
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+
+    let control_stream = generate_send_stream_btree_grouping_control(
+        &items,
+        subvol,
+        &uuid,
+        1,
+        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+    )
+    .expect("generate BTreeMap-grouping control stream");
+    let candidate_stream =
+        generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+            Ok(Vec::new())
+        })
+        .expect("generate contiguous-span candidate stream");
+    assert_eq!(
+        control_stream, candidate_stream,
+        "contiguous inode spans changed the complete send stream"
+    );
+    println!(
+        "inode_grouping_ab_parity,map_insertions_removed={},grouped_inodes={},stream_bytes={},control_sha256={},candidate_sha256={},result=identical",
+        items.len(),
+        grouped.len(),
+        control_stream.len(),
+        sha256_hex(&control_stream),
+        sha256_hex(&candidate_stream),
+    );
+
+    for _ in 0..4 {
+        black_box(
+            generate_send_stream_btree_grouping_control(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm BTreeMap-grouping control stream"),
+        );
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm contiguous-span candidate stream"),
+        );
+    }
+
+    let mut control_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut candidate_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_control = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream_btree_grouping_control(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate BTreeMap-grouping control stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_candidate = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate contiguous-span candidate stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let (lhs, rhs, candidate, order) = if pair_index % 2 == 0 {
+            (
+                observe_control(),
+                observe_control(),
+                observe_candidate(),
+                "AAB",
+            )
+        } else {
+            let candidate = observe_candidate();
+            let rhs = observe_control();
+            let lhs = observe_control();
+            (lhs, rhs, candidate, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{candidate:.3}")
+            .expect("format inode-grouping A/A+B pair");
+    }
+
+    let null_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .zip(&candidate_ns)
+        .map(|((lhs, rhs), candidate)| (lhs.midpoint(*rhs) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio < 1.10
+        && speedup_summary.low > twice_null_ratio
+        && speedup_summary.low > 1.0;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio >= 1.10 {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL"
+    };
+    println!(
+        "inode_grouping_ab_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_grouping_ab,control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SendCacheCounts {
+    path_gets: usize,
+    path_inserts: usize,
+    depth_gets: usize,
+    depth_inserts: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SendCacheStageResult {
+    counts: SendCacheCounts,
+    emitted_paths: usize,
+    emitted_path_bytes: usize,
+    path_fold: u64,
+    exact_paths: Vec<(u8, u64, Vec<u8>)>,
+}
+
+fn send_inode_links_for_cache_stage(
+    items: &[BtrfsLeafEntry],
+) -> BTreeMap<u64, Vec<(u64, Vec<u8>)>> {
+    let mut inode_links: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
+    for entry in items {
+        if entry.key.item_type == BTRFS_ITEM_INODE_REF
+            && let Ok(refs) = parse_inode_refs(&entry.data)
+        {
+            let links = inode_links.entry(entry.key.objectid).or_default();
+            for inode_ref in refs {
+                links.push((entry.key.offset, inode_ref.name));
+            }
+        }
+    }
+    inode_links
+}
+
+fn send_inode_groups_for_cache_stage(items: &[BtrfsLeafEntry]) -> Vec<(u64, bool)> {
+    assert!(
+        items
+            .windows(2)
+            .all(|pair| pair[0].key.objectid <= pair[1].key.objectid),
+        "deep-path fixture must exercise production's contiguous-group route"
+    );
+
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < items.len() {
+        let ino = items[start].key.objectid;
+        let mut end = start + 1;
+        while end < items.len() && items[end].key.objectid == ino {
+            end += 1;
+        }
+        if ino >= BTRFS_FIRST_FREE_OBJECTID
+            && let Some(inode) = items[start..end]
+                .iter()
+                .find(|entry| entry.key.item_type == BTRFS_ITEM_INODE_ITEM)
+                .and_then(|entry| parse_inode_item(&entry.data).ok())
+        {
+            #[expect(clippy::cast_possible_truncation)]
+            let is_dir = (inode.mode as u16) & ffs_types::S_IFMT == ffs_types::S_IFDIR;
+            groups.push((ino, is_dir));
+        }
+        start = end;
+    }
+    groups
+}
+
+/// Source-neutral reproduction of the current send path/depth-cache stage.
+///
+/// `COLLECT_EXACT` is enabled only for the untimed parity/count pass. Timed
+/// calls black-box every constructed path; their compile-time-false observer
+/// branches add no counting, digesting, or exact-path clone work.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the source-neutral stage visibly isomorphic to production"
+)]
+fn send_path_depth_cache_stage<S: BuildHasher + Default, const COLLECT_EXACT: bool>(
+    groups: &[(u64, bool)],
+    inode_links: &BTreeMap<u64, Vec<(u64, Vec<u8>)>>,
+) -> SendCacheStageResult {
+    let cache_capacity = inode_links.len().saturating_add(1);
+    let mut path_cache =
+        HashMap::<u64, Vec<u8>, S>::with_capacity_and_hasher(cache_capacity, S::default());
+    path_cache.insert(BTRFS_FIRST_FREE_OBJECTID, Vec::new());
+    let mut path_gets = 0usize;
+    let mut path_inserts = usize::from(COLLECT_EXACT);
+    let mut build_path = |ino: u64, cache_terminal: bool| -> Vec<u8> {
+        if COLLECT_EXACT {
+            path_gets += 1;
+        }
+        if let Some(path) = path_cache.get(&ino) {
+            return path.clone();
+        }
+
+        let mut trail = Vec::new();
+        let mut current = ino;
+        let mut base_path = Vec::new();
+        loop {
+            if COLLECT_EXACT {
+                path_gets += 1;
+            }
+            if let Some(path) = path_cache.get(&current) {
+                base_path.clone_from(path);
+                break;
+            }
+            let Some((parent, name)) = inode_links.get(&current).and_then(|links| links.first())
+            else {
+                break;
+            };
+            trail.push((current, name.as_slice()));
+            if *parent == current || *parent == BTRFS_FIRST_FREE_OBJECTID {
+                break;
+            }
+            current = *parent;
+        }
+
+        let mut path = base_path;
+        let trail_len = trail.len();
+        for (position, (node, name)) in trail.iter().rev().enumerate() {
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            let terminal = position + 1 == trail_len;
+            if cache_terminal || !terminal {
+                if COLLECT_EXACT {
+                    path_inserts += 1;
+                }
+                path_cache.insert(*node, path.clone());
+            }
+        }
+        if trail.is_empty() && cache_terminal {
+            if COLLECT_EXACT {
+                path_inserts += 1;
+            }
+            path_cache.insert(ino, path.clone());
+        }
+        path
+    };
+
+    let mut dir_groups = Vec::new();
+    let mut other_groups = Vec::new();
+    for (group_index, (_, is_dir)) in groups.iter().enumerate() {
+        if *is_dir {
+            dir_groups.push(group_index);
+        } else {
+            other_groups.push(group_index);
+        }
+    }
+
+    let mut depth_cache =
+        HashMap::<u64, usize, S>::with_capacity_and_hasher(cache_capacity, S::default());
+    depth_cache.insert(BTRFS_FIRST_FREE_OBJECTID, 0);
+    let mut depth_gets = 0usize;
+    let mut depth_inserts = usize::from(COLLECT_EXACT);
+    let mut dir_depth = |start: u64| -> usize {
+        if COLLECT_EXACT {
+            depth_gets += 1;
+        }
+        if let Some(&depth) = depth_cache.get(&start) {
+            return depth;
+        }
+
+        let mut trail = Vec::new();
+        let mut current = start;
+        let mut base_depth = 0usize;
+        loop {
+            if COLLECT_EXACT {
+                depth_gets += 1;
+            }
+            if let Some(&depth) = depth_cache.get(&current) {
+                base_depth = depth;
+                break;
+            }
+            let Some((parent, _)) = inode_links.get(&current).and_then(|links| links.first())
+            else {
+                break;
+            };
+            if *parent == current || *parent == BTRFS_FIRST_FREE_OBJECTID {
+                break;
+            }
+            trail.push(current);
+            current = *parent;
+            if trail.len() > groups.len() {
+                let depth = trail.len();
+                if COLLECT_EXACT {
+                    depth_inserts += 1;
+                }
+                depth_cache.insert(start, depth);
+                return depth;
+            }
+        }
+
+        let mut depth = base_depth;
+        for node in trail.iter().rev() {
+            depth += 1;
+            if COLLECT_EXACT {
+                depth_inserts += 1;
+            }
+            depth_cache.insert(*node, depth);
+        }
+        if COLLECT_EXACT {
+            depth_gets += 1;
+        }
+        let depth = depth_cache.get(&start).copied().unwrap_or(base_depth);
+        if COLLECT_EXACT {
+            depth_inserts += 1;
+        }
+        depth_cache.insert(start, depth);
+        depth
+    };
+    dir_groups.sort_by_key(|&group_index| {
+        let ino = groups[group_index].0;
+        (dir_depth(ino), ino)
+    });
+
+    let mut emitted_paths = 0usize;
+    let mut emitted_path_bytes = 0usize;
+    let mut path_fold = 0u64;
+    let mut exact_paths = Vec::new();
+    for group_index in dir_groups.into_iter().chain(other_groups) {
+        let (ino, is_dir) = groups[group_index];
+        let path = build_path(ino, is_dir);
+        black_box(&path);
+        if COLLECT_EXACT {
+            emitted_paths += 1;
+            emitted_path_bytes = emitted_path_bytes.saturating_add(path.len());
+            path_fold = path_fold.rotate_left(7)
+                ^ ino.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ u64::try_from(path.len()).expect("path length fits u64");
+            exact_paths.push((0, ino, path.clone()));
+        }
+
+        if !is_dir && let Some(links) = inode_links.get(&ino) {
+            for (parent, name) in links.iter().skip(1) {
+                let mut link_path = build_path(*parent, true);
+                if !link_path.is_empty() {
+                    link_path.push(b'/');
+                }
+                link_path.extend_from_slice(name);
+                black_box(&link_path);
+                if COLLECT_EXACT {
+                    emitted_paths += 1;
+                    emitted_path_bytes = emitted_path_bytes.saturating_add(link_path.len());
+                    path_fold = path_fold.rotate_left(7)
+                        ^ parent.wrapping_mul(0xD6E8_FD9D_50A5_4A4D)
+                        ^ u64::try_from(link_path.len()).expect("link path length fits u64");
+                    exact_paths.push((1, *parent, link_path));
+                }
+            }
+        }
+    }
+
+    SendCacheStageResult {
+        counts: SendCacheCounts {
+            path_gets,
+            path_inserts,
+            depth_gets,
+            depth_inserts,
+        },
+        emitted_paths,
+        emitted_path_bytes,
+        path_fold,
+        exact_paths,
+    }
+}
+
+/// Retry-predicate gate for the ledger's earlier "rare bulk cache" closure.
+///
+/// One invocation owns whole/whole A/A, standard-hasher/standard-hasher A/A,
+/// and standard/Fx stage A/B. A production edit is admissible only when the
+/// cache stage is at least 5% of whole-stream wall by its complete median CI
+/// and the stage A/B clears twice its own null log-margin.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one invocation's parity, A/A, A/B, and verdict protocol together"
+)]
+fn send_cache_hasher_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const STAGE_REPEATS: u32 = 8;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.05;
+
+    let items = build_deep_send_items();
+    let inode_links = send_inode_links_for_cache_stage(&items);
+    let groups = send_inode_groups_for_cache_stage(&items);
+    let standard = send_path_depth_cache_stage::<RandomState, true>(&groups, &inode_links);
+    let fx = send_path_depth_cache_stage::<FxBuildHasher, true>(&groups, &inode_links);
+    assert_eq!(
+        standard, fx,
+        "standard and Fx cache stages changed paths, ordering, or operation counts"
+    );
+
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "send_cache_hasher_attribution_parity,path_gets={},path_inserts={},depth_gets={},depth_inserts={},emitted_paths={},emitted_path_bytes={},path_fold={:016x},stream_bytes={},stream_sha256={},result=identical",
+        standard.counts.path_gets,
+        standard.counts.path_inserts,
+        standard.counts.depth_gets,
+        standard.counts.depth_inserts,
+        standard.emitted_paths,
+        standard.emitted_path_bytes,
+        standard.path_fold,
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(send_path_depth_cache_stage::<RandomState, false>(
+            black_box(&groups),
+            black_box(&inode_links),
+        ));
+        black_box(send_path_depth_cache_stage::<FxBuildHasher, false>(
+            black_box(&groups),
+            black_box(&inode_links),
+        ));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut standard_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut standard_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut fx_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(112));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_standard = || {
+            observe_ns_per_iteration(
+                || {
+                    let result = send_path_depth_cache_stage::<RandomState, false>(
+                        black_box(&groups),
+                        black_box(&inode_links),
+                    );
+                    black_box(result);
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let observe_fx = || {
+            observe_ns_per_iteration(
+                || {
+                    let result = send_path_depth_cache_stage::<FxBuildHasher, false>(
+                        black_box(&groups),
+                        black_box(&inode_links),
+                    );
+                    black_box(result);
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (whole_lhs, whole_rhs, standard_lhs, standard_rhs, fx, order) = if pair_index % 2 == 0 {
+            (
+                observe_whole(),
+                observe_whole(),
+                observe_standard(),
+                observe_standard(),
+                observe_fx(),
+                "WWAAB",
+            )
+        } else {
+            let fx = observe_fx();
+            let standard_rhs = observe_standard();
+            let standard_lhs = observe_standard();
+            let whole_rhs = observe_whole();
+            let whole_lhs = observe_whole();
+            (
+                whole_lhs,
+                whole_rhs,
+                standard_lhs,
+                standard_rhs,
+                fx,
+                "BAAWW",
+            )
+        };
+        whole_lhs_ns.push(whole_lhs);
+        whole_rhs_ns.push(whole_rhs);
+        standard_lhs_ns.push(standard_lhs);
+        standard_rhs_ns.push(standard_rhs);
+        fx_ns.push(fx);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(
+            &mut raw_pairs,
+            "{order}:{whole_lhs:.3}:{whole_rhs:.3}:{standard_lhs:.3}:{standard_rhs:.3}:{fx:.3}"
+        )
+        .expect("format send-cache attribution pair");
+    }
+
+    let whole_null_logs = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let stage_null_logs = standard_lhs_ns
+        .iter()
+        .zip(&standard_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_logs = standard_lhs_ns
+        .iter()
+        .zip(&standard_rhs_ns)
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|((lhs, rhs), (whole_lhs, whole_rhs))| {
+            (lhs.midpoint(*rhs) / whole_lhs.midpoint(*whole_rhs)).ln()
+        })
+        .collect::<Vec<_>>();
+    let speedup_logs = standard_lhs_ns
+        .iter()
+        .zip(&standard_rhs_ns)
+        .zip(&fx_ns)
+        .map(|((lhs, rhs), fx)| (lhs.midpoint(*rhs) / fx).ln())
+        .collect::<Vec<_>>();
+    let whole_null = bootstrap_median_ci(&whole_null_logs);
+    let stage_null = bootstrap_median_ci(&stage_null_logs);
+    let attribution = bootstrap_median_ci(&attribution_logs);
+    let speedup = bootstrap_median_ci(&speedup_logs);
+    let whole_null_radius = whole_null.low.ln().abs().max(whole_null.high.ln().abs());
+    let stage_null_radius = stage_null.low.ln().abs().max(stage_null.high.ln().abs());
+    let whole_null_floor = whole_null_radius.exp();
+    let stage_null_floor = stage_null_radius.exp();
+    let twice_stage_null = (2.0 * stage_null_radius).exp();
+    let admitted = whole_null_floor < 1.10
+        && stage_null_floor < 1.10
+        && attribution.low >= MIN_ATTRIBUTION_FRACTION
+        && speedup.low > twice_stage_null;
+    let verdict = if admitted {
+        "ADMITTED_FOR_WHOLE_STREAM_AB"
+    } else if whole_null_floor >= 1.10 || stage_null_floor >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else if attribution.low < MIN_ATTRIBUTION_FRACTION {
+        "NOT_ADMITTED_BELOW_5_PERCENT"
+    } else {
+        "NOT_ADMITTED_BELOW_TWICE_NULL"
+    };
+    println!(
+        "send_cache_hasher_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},stage_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:standard_lhs_ns:standard_rhs_ns:fx_ns,values={raw_pairs}"
+    );
+    println!(
+        "send_cache_hasher_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_null_floor_ratio={whole_null_floor:.6},stage_aa_median={:.6},stage_aa_ci_low={:.6},stage_aa_ci_high={:.6},stage_null_floor_ratio={stage_null_floor:.6},twice_stage_null_ratio={twice_stage_null:.6},stage_fraction_median={:.8},stage_fraction_ci_low={:.8},stage_fraction_ci_high={:.8},stage_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.2},standard_over_fx_median={:.6},standard_over_fx_ci_low={:.6},standard_over_fx_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        whole_null.median,
+        whole_null.low,
+        whole_null.high,
+        stage_null.median,
+        stage_null.low,
+        stage_null.high,
+        attribution.median,
+        attribution.low,
+        attribution.high,
+        attribution.median * 100.0,
+        speedup.median,
+        speedup.low,
+        speedup.high,
+    );
+}
+
+/// Source-neutral copy of the second full inode-item parse pass in
+/// `generate_send_stream`. Classification has already parsed these same items;
+/// retaining that result would remove exactly this work.
+fn reparse_send_inode_items(inodes: &BTreeMap<u64, Vec<&BtrfsLeafEntry>>) -> (usize, u64) {
+    let mut parsed = 0_usize;
+    let mut digest = 0_u64;
+    for (&ino, entries) in inodes {
+        if ino < BTRFS_FIRST_FREE_OBJECTID {
+            continue;
+        }
+        let Some(inode) = entries
+            .iter()
+            .find(|entry| entry.key.item_type == BTRFS_ITEM_INODE_ITEM)
+            .and_then(|entry| parse_inode_item(&entry.data).ok())
+        else {
+            continue;
+        };
+        parsed += 1;
+        digest = digest
+            .rotate_left(7)
+            .wrapping_add(ino)
+            .wrapping_add(inode.generation)
+            .wrapping_add(inode.size)
+            .wrapping_add(u64::from(inode.mode))
+            .wrapping_add(inode.mtime_sec)
+            .wrapping_add(u64::from(inode.mtime_nsec));
+    }
+    (parsed, digest)
+}
+
+/// Retry-predicate gate for the prior broad `generate_send_stream` parse row.
+/// There is no candidate path in this invocation: it attributes the exact
+/// redundant parse pass against duplicate current whole-stream executions.
+fn inode_reparse_attribution_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+    const STAGE_REPEATS: u32 = 64;
+    const MIN_ATTRIBUTION_FRACTION: f64 = 0.05;
+
+    let items = build_deep_send_items();
+    let inodes = group_send_inode_entries(&items);
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let (parsed_inodes, parse_digest) = reparse_send_inode_items(&inodes);
+    assert_eq!(
+        parsed_inodes,
+        usize::try_from(DEPTH + FILES + 1).expect("fixture inode count fits usize"),
+        "source-neutral parse pass did not cover every fixture inode"
+    );
+
+    let stream_a = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate first current stream");
+    let stream_b = generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+        Ok(Vec::new())
+    })
+    .expect("generate duplicate current stream");
+    assert_eq!(stream_a, stream_b, "duplicate current streams differ");
+    println!(
+        "inode_reparse_attribution_parity,parsed_inodes={parsed_inodes},parse_digest={parse_digest:016x},stream_bytes={},stream_sha256={},result=identical",
+        stream_a.len(),
+        sha256_hex(&stream_a),
+    );
+
+    for _ in 0..4 {
+        black_box(reparse_send_inode_items(black_box(&inodes)));
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm current whole stream"),
+        );
+    }
+
+    let mut whole_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut whole_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut reparse_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_whole = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate current whole stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_reparse = || {
+            observe_ns_per_iteration(
+                || {
+                    let observation = reparse_send_inode_items(black_box(&inodes));
+                    black_box(observation);
+                },
+                STAGE_REPEATS,
+            )
+        };
+        let (lhs, rhs, reparse, order) = if pair_index % 2 == 0 {
+            (observe_whole(), observe_whole(), observe_reparse(), "AAS")
+        } else {
+            let reparse = observe_reparse();
+            let rhs = observe_whole();
+            let lhs = observe_whole();
+            (lhs, rhs, reparse, "SAA")
+        };
+        whole_lhs_ns.push(lhs);
+        whole_rhs_ns.push(rhs);
+        reparse_ns.push(reparse);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{reparse:.3}")
+            .expect("format inode-reparse attribution pair");
+    }
+
+    let null_log_ratios = whole_lhs_ns
+        .iter()
+        .zip(&whole_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let attribution_log_ratios = reparse_ns
+        .iter()
+        .zip(whole_lhs_ns.iter().zip(&whole_rhs_ns))
+        .map(|(reparse, (lhs, rhs))| (reparse / lhs.midpoint(*rhs)).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let attribution_summary = bootstrap_median_ci(&attribution_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let admitted = null_floor_ratio < 1.10 && attribution_summary.low >= MIN_ATTRIBUTION_FRACTION;
+    let verdict = if admitted {
+        "ADMITTED_FOR_AB"
+    } else if null_floor_ratio >= 1.10 {
+        "BLOCKED_NULL_FLOOR"
+    } else {
+        "NOT_ADMITTED_BELOW_5_PERCENT"
+    };
+    println!(
+        "inode_reparse_attribution_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},reparse_repeats={STAGE_REPEATS},format=order:whole_lhs_ns:whole_rhs_ns:reparse_ns,values={raw_pairs}"
+    );
+    println!(
+        "inode_reparse_attribution,whole_aa_median={:.6},whole_aa_ci_low={:.6},whole_aa_ci_high={:.6},whole_aa_null_floor_ratio={null_floor_ratio:.6},reparse_fraction_median={:.8},reparse_fraction_ci_low={:.8},reparse_fraction_ci_high={:.8},reparse_pct_median={:.4},minimum_fraction={MIN_ATTRIBUTION_FRACTION:.2},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        attribution_summary.median,
+        attribution_summary.low,
+        attribution_summary.high,
+        attribution_summary.median * 100.0,
+    );
+}
+
+#[cfg(feature = "bench-instrumentation")]
+fn parent_index_ab_only() {
+    const PAIRS: usize = 31;
+    const WHOLE_REPEATS: u32 = 2;
+
+    let items = build_deep_send_items();
+    let uuid = [0x5a_u8; 16];
+    let subvol: &[u8] = b"bench_subvol";
+    let inode_links = collect_inode_links(&items);
+
+    let control_stream = generate_send_stream_materialized_parent_index_control(
+        &items,
+        subvol,
+        &uuid,
+        1,
+        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+    )
+    .expect("generate materialized-primary-parent control stream");
+    let candidate_stream =
+        generate_send_stream(&items, subvol, &uuid, 1, |_bytenr, _len, _ram, _comp| {
+            Ok(Vec::new())
+        })
+        .expect("generate direct-primary-link candidate stream");
+    assert_eq!(
+        control_stream, candidate_stream,
+        "direct primary-link lookup changed the complete send stream"
+    );
+    println!(
+        "parent_index_ab_parity,inodes={},links={},primary_name_bytes={},stream_bytes={},control_sha256={},candidate_sha256={},result=identical",
+        inode_links.len(),
+        inode_links.values().map(Vec::len).sum::<usize>(),
+        inode_links
+            .values()
+            .filter_map(|links| links.first())
+            .map(|(_, name)| name.len())
+            .sum::<usize>(),
+        control_stream.len(),
+        sha256_hex(&control_stream),
+        sha256_hex(&candidate_stream),
+    );
+
+    for _ in 0..4 {
+        black_box(
+            generate_send_stream_materialized_parent_index_control(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm materialized-primary-parent control stream"),
+        );
+        black_box(
+            generate_send_stream(
+                black_box(&items),
+                black_box(subvol),
+                black_box(&uuid),
+                black_box(1),
+                |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+            )
+            .expect("warm direct-primary-link candidate stream"),
+        );
+    }
+
+    let mut control_lhs_ns = Vec::with_capacity(PAIRS);
+    let mut control_rhs_ns = Vec::with_capacity(PAIRS);
+    let mut candidate_ns = Vec::with_capacity(PAIRS);
+    let mut raw_pairs = String::with_capacity(PAIRS.saturating_mul(72));
+    for pair_index in 0..PAIRS {
+        let observe_control = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream_materialized_parent_index_control(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate materialized-primary-parent control stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let observe_candidate = || {
+            observe_ns_per_iteration(
+                || {
+                    let stream = generate_send_stream(
+                        black_box(&items),
+                        black_box(subvol),
+                        black_box(&uuid),
+                        black_box(1),
+                        |_bytenr, _len, _ram, _comp| Ok(Vec::new()),
+                    )
+                    .expect("generate direct-primary-link candidate stream");
+                    black_box(stream.len());
+                },
+                WHOLE_REPEATS,
+            )
+        };
+        let (lhs, rhs, candidate, order) = if pair_index % 2 == 0 {
+            (
+                observe_control(),
+                observe_control(),
+                observe_candidate(),
+                "AAB",
+            )
+        } else {
+            let candidate = observe_candidate();
+            let rhs = observe_control();
+            let lhs = observe_control();
+            (lhs, rhs, candidate, "BAA")
+        };
+        control_lhs_ns.push(lhs);
+        control_rhs_ns.push(rhs);
+        candidate_ns.push(candidate);
+        if pair_index > 0 {
+            raw_pairs.push(';');
+        }
+        write!(&mut raw_pairs, "{order}:{lhs:.3}:{rhs:.3}:{candidate:.3}")
+            .expect("format parent-index A/A+B pair");
+    }
+
+    let null_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .map(|(lhs, rhs)| (lhs / rhs).ln())
+        .collect::<Vec<_>>();
+    let speedup_log_ratios = control_lhs_ns
+        .iter()
+        .zip(&control_rhs_ns)
+        .zip(&candidate_ns)
+        .map(|((lhs, rhs), candidate)| (lhs.midpoint(*rhs) / candidate).ln())
+        .collect::<Vec<_>>();
+    let null_summary = bootstrap_median_ci(&null_log_ratios);
+    let speedup_summary = bootstrap_median_ci(&speedup_log_ratios);
+    let null_log_radius = null_summary
+        .low
+        .ln()
+        .abs()
+        .max(null_summary.high.ln().abs());
+    let null_floor_ratio = null_log_radius.exp();
+    let twice_null_ratio = (2.0 * null_log_radius).exp();
+    let admitted = null_floor_ratio < 1.10
+        && speedup_summary.low > twice_null_ratio
+        && speedup_summary.low > 1.0;
+    let verdict = if admitted {
+        "KEEP"
+    } else if null_floor_ratio >= 1.10 {
+        "REJECT_NULL_FLOOR"
+    } else {
+        "REJECT_BELOW_TWICE_NULL"
+    };
+    println!(
+        "parent_index_ab_pairs,pairs={PAIRS},whole_repeats={WHOLE_REPEATS},format=order:control_lhs_ns:control_rhs_ns:candidate_ns,values={raw_pairs}"
+    );
+    println!(
+        "parent_index_ab,control_aa_median={:.6},control_aa_ci_low={:.6},control_aa_ci_high={:.6},control_aa_null_floor_ratio={null_floor_ratio:.6},twice_null_ratio={twice_null_ratio:.6},control_over_candidate_median={:.6},control_over_candidate_ci_low={:.6},control_over_candidate_ci_high={:.6},admitted={admitted},verdict={verdict},gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        null_summary.median,
+        null_summary.low,
+        null_summary.high,
+        speedup_summary.median,
+        speedup_summary.low,
+        speedup_summary.high,
+    );
 }
 
 fn legacy_generate_send_stream_for_fixture(
@@ -502,4 +2657,81 @@ criterion_group!(
     bench_send_stream_path_cache,
     bench_send_stream_crc32c
 );
-criterion_main!(send_stream_path_cache);
+
+fn main() {
+    if std::env::args().any(|arg| arg == "--send-buffer-growth-ceiling-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        #[cfg(feature = "bench-instrumentation")]
+        {
+            send_buffer_growth_ceiling_ab_only();
+            return;
+        }
+        #[cfg(not(feature = "bench-instrumentation"))]
+        panic!("--send-buffer-growth-ceiling-only requires --features bench-instrumentation");
+    }
+    if std::env::args().any(|arg| arg == "--inode-links-ab-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        #[cfg(feature = "bench-instrumentation")]
+        {
+            inode_links_ab_only();
+            return;
+        }
+        #[cfg(not(feature = "bench-instrumentation"))]
+        panic!("--inode-links-ab-only requires --features bench-instrumentation");
+    }
+    if std::env::args().any(|arg| arg == "--inode-links-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        inode_links_attribution_only();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--send-cache-hasher-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        send_cache_hasher_attribution_only();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--inode-grouping-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        inode_grouping_attribution_only();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--inode-grouping-ab-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        #[cfg(feature = "bench-instrumentation")]
+        {
+            inode_grouping_ab_only();
+            return;
+        }
+        #[cfg(not(feature = "bench-instrumentation"))]
+        panic!("--inode-grouping-ab-only requires --features bench-instrumentation");
+    }
+    if std::env::args().any(|arg| arg == "--inode-reparse-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        inode_reparse_attribution_only();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--parent-index-attribution-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        parent_index_attribution_only();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--parent-index-ab-only") {
+        print_bench_evidence_metadata();
+        print_codegen_isa();
+        #[cfg(feature = "bench-instrumentation")]
+        {
+            parent_index_ab_only();
+            return;
+        }
+        #[cfg(not(feature = "bench-instrumentation"))]
+        panic!("--parent-index-ab-only requires --features bench-instrumentation");
+    }
+    send_stream_path_cache();
+}

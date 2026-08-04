@@ -1,4 +1,94 @@
-# bd-ddryj — parked lever: bound the cold-read fan-out
+# bd-ddryj — bounded ext4 read-pool cutover
+
+## 2026-07-27 actual-binary correction and closeout
+
+The parked status below is historical. Commit `7a6091a2` subsequently landed a
+dedicated ext4 data-read pool, but its default
+`(available_parallelism / 4).clamp(4, 16)` had only been inferred from a
+64-thread profile. It had not been run as the modified `ffs-cli` ELF. A new
+whole-binary gate found that the cap was right and the quarter-width scaling
+rule was wrong.
+
+The original attribution remains valid and hardware-scoped:
+
+- on the 64-thread profile host, reducing fan-out from 64 to 16 reduced
+  `native_queued_spin_lock_slowpath` self-time from **42.27% to 9.32%** and
+  improved the cold workload by about **1.21x**;
+- that evidence supports a ceiling at 16 on that host; and
+- it does not support reducing every smaller machine to one quarter of its
+  available threads.
+
+The first self-hashing whole-binary invocation on strict-remote `ovh-a`
+exercised the then-shipped rule on a 16-thread worker. It measured the default
+4-thread pool against an explicit 16-thread control:
+
+- executing v3 ELF
+  `a21b26bcff6d8b6010fedac47930bbefc82a7eafb29fabad1122b8b1586f4118`;
+- A/A median **0.983423x**, bootstrap median 95% CI
+  **[0.961861, 1.022792]**, symmetric null floor **1.039651x**;
+- default-4 / explicit-16 median **0.793266x**, CI
+  **[0.772379, 0.808476]**.
+
+Thus the shipped default was decisively slower on that worker. Production now
+uses `min(available_parallelism, 16)`: all available threads below the cap,
+with the measured 16-thread ceiling above it. The environment override remains
+unchanged.
+
+The corrected policy was then admitted by a fresh, unpooled invocation:
+
+- executing v3 release-perf ELF
+  `8f7039d78a42e5ca7aa79cf7fa0e5c80415b61971469465d0ca5e9d881003082`;
+- the parent and its `bench-evidence` child self-reported the same ELF SHA;
+- compile/runtime SSE4.2, AVX2, and FMA were true; PGO profile SHA was `none`;
+- one parent owned **31 alternating A/A and A/B pairs** over a private 32 MiB
+  file, with `posix_fadvise(POSIX_FADV_DONTNEED)` before every child;
+- corrected-default/corrected-default A/A median **0.993140x**, deterministic
+  20,000-resample bootstrap median 95% CI **[0.986304, 1.002085]**,
+  symmetric null floor **1.013887x**, and pre-registered twice-null threshold
+  **1.027966x**;
+- corrected-default-16 / old-quarter-4 median **1.248257x**, CI
+  **[1.226142, 1.279943]**, clearing the threshold; and
+- both arms returned exactly 33,554,432 bytes, all `0xA5`, SHA-256
+  `edeadec8f638055689d5be63b4bcf2654fb64bf91fb6651e9a924f052a9c7db0`.
+
+The gate used wall time and the bootstrap median CI. It did not compute or
+consult CV or instruction count. Ordering is preserved because indexed read
+segments are assembled in logical offset order regardless of worker count.
+Tie-breaking, floating point, and RNG are N/A.
+
+Two later exact-source 32 MiB invocations were rejected by their own
+invocation-local thresholds and were not pooled with the admitted run. One had
+an A/A CI of **[0.893182, 1.082108]**; the other had an A/A CI of
+**[0.959416, 1.038661]** and an A/B lower bound of **1.036707x**, below its
+**1.086391x** twice-null floor after a visible worker disturbance. A 128 MiB
+attempt never reached timing because the 64 MiB source image filled at about
+55 MiB. These runs have zero weight in the performance claim.
+
+The admitted magnitude is witnessed x86-64-v3 release-perf evidence, **not a
+v3+PGO or mounted-kernel ratio**. The historical 64-to-16 profile remains the
+evidence for the ceiling. The new 16-to-4 whole-binary result corrects the
+topology policy; it does not rescale any historical kernel comparator.
+
+Focused strict-remote tests passed for the CLI parser and the core topology
+bound. Strict-remote `cargo check -p ffs-cli --all-targets` passed. CLI Clippy
+passed with `-D warnings` after allowing only reproduced pre-existing
+diagnostic categories; workspace/core Clippy remains blocked by unrelated
+pre-existing debt.
+
+**Retry predicate:** revisit the default width only when a production-shaped
+profile on a materially different worker/device attributes the residual to
+read-pool width and its optimum differs from `min(nproc, 16)`. Require an
+in-process executing-ELF/ISA/profile witness, exact stream parity, at least 31
+same-invocation alternating A/A+B pairs, and a bootstrap median wall/cycles CI
+clearing twice its own null log-margin. Restate the magnitude as shipped only
+after the exact production PGO profile is consumed. Never gate on CV or
+instruction count.
+
+## Historical 2026-07-10 parked record
+
+The text below is retained as the original investigation record. Statements
+that the lever was not applied, that quarter-width scaling was preferred, or
+that the binary remained unmeasured are superseded by the closeout above.
 
 Parked 2026-07-10 by BlackThrush (`cc_ffs`). **Not applied. Not compiled. Not perf-measured
 in-tree.** Parked per the disk-constraint fallback ("design the lever, save the patch under

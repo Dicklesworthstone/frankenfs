@@ -191,7 +191,11 @@ fn bench_read_block_staged_vs_direct(c: &mut Criterion) {
         a.make_mut().copy_from_slice(&staging);
         let mut b = BlockBuf::zeroed(BLOCK_SIZE);
         b.make_mut().copy_from_slice(&src);
-        assert_eq!(a.as_slice(), b.as_slice(), "read_block strategy changed bytes");
+        assert_eq!(
+            a.as_slice(),
+            b.as_slice(),
+            "read_block strategy changed bytes"
+        );
     }
 
     c.bench_function("read_block_staged_a", |b| {

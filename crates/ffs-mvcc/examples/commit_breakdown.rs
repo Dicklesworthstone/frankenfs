@@ -19,7 +19,10 @@ use ffs_types::BlockNumber;
 use std::time::Instant;
 
 fn main() {
-    let ops: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    let ops: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200_000);
     let payload = vec![0xAB_u8; 4096];
 
     // A: begin + drop
@@ -55,6 +58,12 @@ fn main() {
 
     println!("# single-thread per-op cost decomposition (ns/op), distinct blocks, ops={ops}");
     println!("A begin+drop            = {a:8.0} ns/op   (Transaction alloc)");
-    println!("B begin+stage+drop      = {b:8.0} ns/op   (+stage = {:.0} ns: write_set + 4KiB payload)", b - a);
-    println!("C begin+stage+commit    = {c:8.0} ns/op   (+install/publish = {:.0} ns: version store)", c - b);
+    println!(
+        "B begin+stage+drop      = {b:8.0} ns/op   (+stage = {:.0} ns: write_set + 4KiB payload)",
+        b - a
+    );
+    println!(
+        "C begin+stage+commit    = {c:8.0} ns/op   (+install/publish = {:.0} ns: version store)",
+        c - b
+    );
 }

@@ -182,7 +182,10 @@ fn sharded_concurrent_same_block_fcw_exactly_one_winner_bd_cc_parwrite_verify() 
                 store.commit(txn).is_ok()
             }));
         }
-        let winners: usize = handles.into_iter().map(|h| h.join().unwrap() as usize).sum();
+        let winners: usize = handles
+            .into_iter()
+            .map(|h| h.join().unwrap() as usize)
+            .sum();
         assert_eq!(
             winners, 1,
             "round {round}: FCW broke under concurrency — {winners} winners (expected exactly 1; >1 = lost-update corruption)"
@@ -245,8 +248,14 @@ fn sharded_read_gap_methods_match_bd_cc_shardread() {
 
     let snap = store.current_snapshot();
     let bytes = store.read_visible(block, snap).expect("visible bytes");
-    let buf = store.read_visible_block_buf(block, snap).expect("visible buf");
-    assert_eq!(buf.as_slice(), bytes.as_slice(), "block_buf must match read_visible bytes");
+    let buf = store
+        .read_visible_block_buf(block, snap)
+        .expect("visible buf");
+    assert_eq!(
+        buf.as_slice(),
+        bytes.as_slice(),
+        "block_buf must match read_visible bytes"
+    );
     assert_eq!(bytes, data);
     assert_eq!(store.read_visible_physical(block, snap), Some(block));
     assert!(store.read_visible_physical(BN(99), snap).is_none());
@@ -316,5 +325,7 @@ fn sharded_flush_to_device_checkpoints_committed_blocks_bd_cc_shardflush() {
             "block {b} bytes must be on device byte-exact"
         );
     }
-    eprintln!("sharded flush_to_device checkpointed {flushed} blocks byte-exact (3-run + 1 separated)");
+    eprintln!(
+        "sharded flush_to_device checkpointed {flushed} blocks byte-exact (3-run + 1 separated)"
+    );
 }

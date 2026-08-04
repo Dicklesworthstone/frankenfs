@@ -1,4 +1,21 @@
 [toolchain]
-channel = "nightly"
+# PINNED 2026-07-25. Was `channel = "nightly"`, which floats.
+#
+# Two failures forced this, and the second is the decisive one:
+#  1. A lint promotion around 2026-07-21 turned ~34 clippy lints red on pre-existing
+#     code fleet-wide. That matters more here than in most repos because
+#     `[workspace.lints.clippy] pedantic/nursery = "deny"` are passed to `cargo
+#     build` as `--deny=...`, so a promotion breaks the BUILD, not just `cargo clippy`.
+#  2. A floating channel can be replaced BY RUSTUP MID-BUILD. On 2026-07-25 the
+#     local ffs-cli release-perf build died at the final crate with
+#     `could not execute process .../nightly-x86_64-unknown-linux-gnu/bin/rustc
+#     (never executed): No such file or directory` while rustup swapped the
+#     toolchain underneath it (binaries restamped 23:33:49-23:34:10, rustc moving
+#     da86f4d07 2026-07-24 -> 008fa22ce 2026-07-25).
+#
+# nightly-2026-07-20 is the newest pre-breakage nightly; franken_whisper and
+# frankensearch already use it. Unpin only with a deliberate sweep of the promoted
+# lints (bd-g9l54), not incidentally.
+channel = "nightly-2026-07-20"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

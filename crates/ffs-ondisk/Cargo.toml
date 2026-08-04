@@ -16,6 +16,10 @@ smallvec = { workspace = true }
 rustc-hash = "2"
 criterion = { workspace = true }
 proptest = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+bench-instrumentation = []
 
 [[bench]]
 name = "casefold_key"

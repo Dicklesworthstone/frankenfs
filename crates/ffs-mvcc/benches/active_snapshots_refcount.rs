@@ -100,28 +100,36 @@ fn bench_refcount(c: &mut Criterion) {
         let mut group = c.benchmark_group(format!("mvcc_active_snapshots_refcount_{label}"));
         group.sample_size(20);
         for threads in [1_usize, 2, 4, 8] {
-            group.bench_with_input(BenchmarkId::new("current_write_lock", threads), &threads, |b, &t| {
-                b.iter(|| {
-                    run(
-                        t,
-                        Arc::new(CurrentMap::new(BTreeMap::new())),
-                        current_register,
-                        current_release,
-                        distinct,
-                    )
-                });
-            });
-            group.bench_with_input(BenchmarkId::new("atomic_read_fastpath", threads), &threads, |b, &t| {
-                b.iter(|| {
-                    run(
-                        t,
-                        Arc::new(AtomicMap::new(BTreeMap::new())),
-                        atomic_register,
-                        atomic_release,
-                        distinct,
-                    )
-                });
-            });
+            group.bench_with_input(
+                BenchmarkId::new("current_write_lock", threads),
+                &threads,
+                |b, &t| {
+                    b.iter(|| {
+                        run(
+                            t,
+                            Arc::new(CurrentMap::new(BTreeMap::new())),
+                            current_register,
+                            current_release,
+                            distinct,
+                        )
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("atomic_read_fastpath", threads),
+                &threads,
+                |b, &t| {
+                    b.iter(|| {
+                        run(
+                            t,
+                            Arc::new(AtomicMap::new(BTreeMap::new())),
+                            atomic_register,
+                            atomic_release,
+                            distinct,
+                        )
+                    });
+                },
+            );
         }
         group.finish();
     }

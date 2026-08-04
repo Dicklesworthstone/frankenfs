@@ -10,20 +10,22 @@
 //!   - fetch_add  : models `next_commit` (the irreducible global counter)
 //!   - rwlock_read: models the current `effective_policy` RwLock read
 //!   - atomic_load: models the proposed AtomicU8 lock-free policy read
+//!
 //! Reports per-op ns at each thread count; scaling (8t/1t, 32t/1t) shows
 //! contention. If rwlock_read >> fetch_add at 32t, the AtomicU8 lever is real;
 //! if rwlock_read ~ fetch_add, the floor is the counter and the lever is moot.
 
 use parking_lot::RwLock;
+use std::fmt::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
-fn bench<F: Fn() -> u64 + Send + Sync + 'static>(threads: usize, per: u64, op: Arc<F>) -> f64 {
+fn bench<F: Fn() -> u64 + Send + Sync + 'static>(threads: usize, per: u64, op: &Arc<F>) -> f64 {
     let barrier = Arc::new(std::sync::Barrier::new(threads + 1));
     let mut handles = Vec::new();
     for _ in 0..threads {
-        let op = Arc::clone(&op);
+        let op = Arc::clone(op);
         let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
             barrier.wait();
@@ -44,7 +46,10 @@ fn bench<F: Fn() -> u64 + Send + Sync + 'static>(threads: usize, per: u64, op: A
 }
 
 fn main() {
-    let per: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(20_000_000);
+    let per: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000_000);
 
     let counter = Arc::new(AtomicU64::new(0));
     let rwlock = Arc::new(RwLock::new(1u8));
@@ -57,7 +62,9 @@ fn main() {
     let a1 = Arc::clone(&atom8);
     let atomic_load = Arc::new(move || u64::from(a1.load(Ordering::Relaxed)));
 
-    println!("# per-op ns of global commit accesses at T threads (lower=better; flat across T=no contention)");
+    println!(
+        "# per-op ns of global commit accesses at T threads (lower=better; flat across T=no contention)"
+    );
     for (name, mk) in [
         ("fetch_add  (next_commit, UNAVOIDABLE)", 0u8),
         ("rwlock_read(effective_policy, current)", 1u8),
@@ -67,14 +74,14 @@ fn main() {
         let mut base = 0.0;
         for (idx, &t) in [1usize, 8, 32].iter().enumerate() {
             let ns = match mk {
-                0 => bench(t, per / t as u64, Arc::clone(&fetch_add)),
-                1 => bench(t, per / t as u64, Arc::clone(&rwlock_read)),
-                _ => bench(t, per / t as u64, Arc::clone(&atomic_load)),
+                0 => bench(t, per / t as u64, &fetch_add),
+                1 => bench(t, per / t as u64, &rwlock_read),
+                _ => bench(t, per / t as u64, &atomic_load),
             };
             if idx == 0 {
                 base = ns;
             }
-            row.push_str(&format!("  {t}t={ns:6.2}ns({:.1}x)", ns / base));
+            let _ = write!(row, "  {t}t={ns:6.2}ns({:.1}x)", ns / base);
         }
         println!("{row}");
     }

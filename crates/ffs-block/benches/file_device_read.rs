@@ -125,12 +125,12 @@ fn main_bench(c: &mut Criterion) {
     let mut preadv_out = vec![0_u8; VSPAN];
     let mut preadv_iov = [IoSliceMut::new(&mut preadv_out)];
     let preadv_read = nix::sys::uio::preadv(&raw, &mut preadv_iov, 0).expect("preadv parity");
-    let mut pread_out = vec![0_u8; VSPAN];
-    let pread_read = nix::sys::uio::pread(&raw, &mut pread_out, 0).expect("pread parity");
+    let mut scalar_out = vec![0_u8; VSPAN];
+    let scalar_read = nix::sys::uio::pread(&raw, &mut scalar_out, 0).expect("pread parity");
     assert_eq!(preadv_read, VSPAN);
-    assert_eq!(pread_read, preadv_read);
-    assert_eq!(pread_out, preadv_out);
-    assert_eq!(pread_out, data[..VSPAN]);
+    assert_eq!(scalar_read, preadv_read);
+    assert_eq!(scalar_out, preadv_out);
+    assert_eq!(scalar_out, data[..VSPAN]);
 
     let mut single = c.benchmark_group("file_device_single_iovec_128k");
     for control in ["preadv_one_iovec_a", "preadv_one_iovec_b"] {

@@ -11,7 +11,7 @@ rust-version.workspace = true
 # production keeps the single alloc `RwLock` (byte-identical). Enabling it
 # compiles the `sharded_alloc` primitive + its tests so the decomposition can be
 # Loom/bench/cargo-validated remote-only before the (local-e2fsck-gated) cutover.
-bhh0i_sharded_alloc = []
+bhh0i_sharded_alloc = ["ffs-alloc/bhh0i_sharded_alloc"]
 
 [dependencies]
 rustc-hash = "2"

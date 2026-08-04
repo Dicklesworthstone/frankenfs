@@ -9,6 +9,7 @@ use crate::ll::{Errno, Response, fuse_abi as abi};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 use crate::Filesystem;
 use crate::PollHandle;
@@ -23,7 +24,7 @@ use crate::{KernelConfig, ll};
 /// Request data structure
 #[derive(Debug)]
 pub struct Request<'a> {
-    /// Channel sender for sending the reply
+    /// Channel sender for sending the reply.
     ch: ChannelSender,
     /// Request raw data
     #[allow(unused)]
@@ -44,6 +45,40 @@ impl<'a> Request<'a> {
         };
 
         Some(Self { ch, data, request })
+    }
+
+    /// Whether this request may be dispatched concurrently with other
+    /// concurrency-safe requests.
+    ///
+    /// The set is deliberately narrow: it holds only operations that read
+    /// filesystem state and publish nothing. Every mutation, every handle
+    /// lifecycle operation (`Open`/`Release`/`Flush`), `Forget` (which retires
+    /// inode references a concurrent `Lookup` may be taking) and the session
+    /// handshake stay outside it, so they keep the exact whole-session
+    /// exclusion the single-threaded loop always gave them.
+    pub(crate) fn is_concurrency_safe(&self) -> bool {
+        let Ok(operation) = self.request.operation() else {
+            return false;
+        };
+        match operation {
+            ll::Operation::Lookup(_)
+            | ll::Operation::GetAttr(_)
+            | ll::Operation::ReadLink(_)
+            | ll::Operation::Read(_)
+            | ll::Operation::StatFs(_)
+            | ll::Operation::GetXAttr(_)
+            | ll::Operation::ListXAttr(_)
+            | ll::Operation::ReadDir(_)
+            | ll::Operation::Access(_)
+            | ll::Operation::BMap(_) => true,
+            #[cfg(feature = "abi-7-21")]
+            ll::Operation::ReadDirPlus(_) => true,
+            #[cfg(feature = "abi-7-24")]
+            ll::Operation::Lseek(_) => true,
+            #[cfg(feature = "abi-7-40")]
+            ll::Operation::Statx(_) => true,
+            _ => false,
+        }
     }
 
     /// Dispatch request to the given filesystem.
@@ -158,12 +193,14 @@ impl<'a> Request<'a> {
             }
             // Filesystem destroyed
             ll::Operation::Destroy(x) => {
-                se.filesystem.destroy();
+                if !se.destroy_called.swap(true, Ordering::AcqRel) {
+                    se.filesystem.destroy();
+                }
                 se.destroyed = true;
                 return Ok(Some(x.reply()));
             }
             // Any operation is invalid after destroy
-            _ if se.destroyed => {
+            _ if se.destroy_called.load(Ordering::Acquire) => {
                 warn!("Ignoring FUSE operation after destroy: {}", self.request);
                 return Err(Errno::EIO);
             }

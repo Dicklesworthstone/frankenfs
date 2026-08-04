@@ -6,6 +6,14 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# bd-bhh0i mounted cutover. Without this, the sharded per-group create path is
+# `#[cfg]`d out of every FUSE binary, so a mounted workload has no way to reach
+# it and all threads serialize on the single `ext4_alloc_state` write lock —
+# which is why mounted parallel metadata writes scale negatively. Default OFF;
+# `ffs-cli` forwards it and the runtime toggle still has to be flipped.
+bhh0i_sharded_alloc = ["ffs-core/bhh0i_sharded_alloc"]
+
 [dependencies]
 asupersync = { workspace = true }
 ffs-core = { workspace = true }

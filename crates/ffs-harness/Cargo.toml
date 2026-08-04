@@ -23,12 +23,17 @@ ffs-types = { workspace = true }
 # directly too, so it stays available to them transitively.
 fuser = { workspace = true }
 hex = { workspace = true }
+# `ffs-mounted-kernel-bench` binds every timed worker thread to exactly one CPU
+# via `nix::sched::sched_setaffinity`; the workspace forbids `unsafe_code`, so
+# the safe wrapper (and its `sched` feature) is a runtime dependency.
+nix = { workspace = true, features = ["sched"] }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+xattr = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }
@@ -61,6 +66,10 @@ harness = false
 [[bin]]
 name = "ffs-harness"
 path = "src/main.rs"
+
+[[bin]]
+name = "ffs-mounted-kernel-bench"
+path = "src/bin/ffs_mounted_kernel_bench.rs"
 
 [lints]
 workspace = true

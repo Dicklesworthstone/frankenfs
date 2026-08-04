@@ -24,6 +24,8 @@ use asupersync::raptorq::decoder::{
 use asupersync::raptorq::gf256::{Gf256, gf256_add_slice, gf256_addmul_slice, gf256_mul_slice};
 use asupersync::raptorq::rfc6330::{next_prime_ge, try_tuple};
 use asupersync::raptorq::systematic::{EmittedSymbol, SystematicEncoder, SystematicParams};
+#[cfg(any(test, feature = "bench-instrumentation"))]
+use ffs_block::BlockBuf;
 use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
@@ -92,8 +94,24 @@ pub fn encode_group(
 ) -> Result<EncodedGroup> {
     let block_size = device.block_size();
     let seed = repair_seed(fs_uuid, group);
+    let source_symbols = read_source_symbols_serial(cx, device, first_block, source_block_count)?;
 
-    // Read source blocks into symbol buffers.
+    finish_encode_group(
+        &source_symbols,
+        block_size,
+        seed,
+        repair_count,
+        group,
+        source_block_count,
+    )
+}
+
+fn read_source_symbols_serial(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    first_block: BlockNumber,
+    source_block_count: u32,
+) -> Result<Vec<Vec<u8>>> {
     let mut source_symbols: Vec<Vec<u8>> = Vec::with_capacity(source_block_count as usize);
     for i in 0..u64::from(source_block_count) {
         let block_num = BlockNumber(first_block.0.checked_add(i).ok_or_else(|| {
@@ -105,9 +123,58 @@ pub fn encode_group(
         let buf = device.read_block(cx, block_num)?;
         source_symbols.push(buf.into_inner());
     }
+    Ok(source_symbols)
+}
 
+#[cfg(any(test, feature = "bench-instrumentation"))]
+fn read_source_symbols_batched_candidate(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    first_block: BlockNumber,
+    source_block_count: u32,
+) -> Result<Vec<Vec<u8>>> {
+    let count = u64::from(source_block_count);
+
+    // Keep the scalar path for zero/one-block groups, devices without a
+    // contiguous-read implementation, and ranges that would fail address/device
+    // bounds validation. The fallback deliberately retains the old per-block
+    // check/read ordering and error text.
+    let Some(last_block) = first_block.0.checked_add(count.saturating_sub(1)) else {
+        return read_source_symbols_serial(cx, device, first_block, source_block_count);
+    };
+    if count <= 1
+        || !device.supports_contiguous_reads()
+        || last_block >= device.block_count()
+        || device.block_size() == 0
+    {
+        return read_source_symbols_serial(cx, device, first_block, source_block_count);
+    }
+
+    // File-backed devices collapse this into one positioned vectored read.
+    // BlockBuf order is identical to scalar block order, and unsupported
+    // devices never pay setup/allocation overhead for this path.
+    let block_size = usize::try_from(device.block_size())
+        .map_err(|_| FfsError::Format("encode_group: block size does not fit usize".to_owned()))?;
+    let source_count = usize::try_from(source_block_count).map_err(|_| {
+        FfsError::Format("encode_group: source count does not fit usize".to_owned())
+    })?;
+    let mut blocks = (0..source_count)
+        .map(|_| BlockBuf::zeroed(block_size))
+        .collect::<Vec<_>>();
+    device.read_contiguous_blocks(cx, first_block, &mut blocks)?;
+    Ok(blocks.into_iter().map(BlockBuf::into_inner).collect())
+}
+
+fn finish_encode_group(
+    source_symbols: &[Vec<u8>],
+    block_size: u32,
+    seed: u64,
+    repair_count: u32,
+    group: GroupNumber,
+    source_block_count: u32,
+) -> Result<EncodedGroup> {
     let repair_symbols = emit_projected_repair_symbols(
-        &source_symbols,
+        source_symbols,
         block_size as usize,
         seed,
         repair_count as usize,
@@ -121,6 +188,35 @@ pub fn encode_group(
         seed,
         repair_symbols,
     })
+}
+
+/// Rejected contiguous-read candidate retained for same-ELF benchmark controls.
+///
+/// This is compiled only when the explicit benchmark-instrumentation feature is
+/// enabled; production [`encode_group`] retains serial source reads.
+#[cfg(feature = "bench-instrumentation")]
+#[doc(hidden)]
+pub fn encode_group_batched_read_candidate(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    fs_uuid: &[u8; 16],
+    group: GroupNumber,
+    first_block: BlockNumber,
+    source_block_count: u32,
+    repair_count: u32,
+) -> Result<EncodedGroup> {
+    let block_size = device.block_size();
+    let seed = repair_seed(fs_uuid, group);
+    let source_symbols =
+        read_source_symbols_batched_candidate(cx, device, first_block, source_block_count)?;
+    finish_encode_group(
+        &source_symbols,
+        block_size,
+        seed,
+        repair_count,
+        group,
+        source_block_count,
+    )
 }
 
 fn emit_projected_repair_symbols(
@@ -1261,6 +1357,58 @@ mod tests {
         }
     }
 
+    struct FailingReadDevice {
+        block_size: u32,
+        fail_blocks: Vec<u64>,
+        reads: Mutex<Vec<u64>>,
+    }
+
+    impl FailingReadDevice {
+        fn new(block_size: u32, fail_blocks: Vec<u64>) -> Self {
+            Self {
+                block_size,
+                fail_blocks,
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BlockDevice for FailingReadDevice {
+        fn read_block(&self, _cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            self.reads.lock().push(block.0);
+            if self.fail_blocks.contains(&block.0) {
+                return Err(FfsError::Io(std::io::Error::other(format!(
+                    "injected read failure at block {}",
+                    block.0
+                ))));
+            }
+            Ok(BlockBuf::new(vec![
+                block.0.to_le_bytes()[0];
+                self.block_size as usize
+            ]))
+        }
+
+        fn supports_contiguous_reads(&self) -> bool {
+            true
+        }
+
+        fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<()> {
+            Err(FfsError::ReadOnly)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.block_size
+        }
+
+        fn block_count(&self) -> u64 {
+            u64::MAX
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+    }
+
     impl BlockDevice for MemBlockDevice {
         fn read_block(&self, _cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
             self.read_count.fetch_add(1, Ordering::Relaxed);
@@ -1271,6 +1419,10 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| vec![0u8; self.block_size as usize]);
             Ok(BlockBuf::new(data))
+        }
+
+        fn supports_contiguous_reads(&self) -> bool {
+            true
         }
 
         fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
@@ -1351,6 +1503,55 @@ mod tests {
             assert!(!sym.is_source);
             assert_eq!(sym.data.len(), block_size as usize);
         }
+    }
+
+    #[test]
+    fn encode_source_read_batch_preserves_block_order_and_bytes() {
+        let cx = Cx::for_testing();
+        let source_count = 16;
+        let device = setup_device(source_count, 64);
+
+        let serial =
+            read_source_symbols_serial(&cx, &device, BlockNumber(0), source_count).unwrap();
+        let batched =
+            read_source_symbols_batched_candidate(&cx, &device, BlockNumber(0), source_count)
+                .unwrap();
+
+        assert_eq!(serial, batched);
+        assert_eq!(
+            device.read_count(),
+            usize::try_from(source_count).unwrap() * 2
+        );
+    }
+
+    #[test]
+    fn encode_source_read_batch_preserves_first_error_in_block_order() {
+        let cx = Cx::for_testing();
+        let device = FailingReadDevice::new(64, vec![2, 5]);
+
+        let error = read_source_symbols_batched_candidate(&cx, &device, BlockNumber(0), 8)
+            .expect_err("batched source reads must return the first indexed read error");
+
+        assert_eq!(
+            error.to_string(),
+            "I/O error: injected read failure at block 2"
+        );
+    }
+
+    #[test]
+    fn encode_source_read_batch_preserves_error_before_later_address_overflow() {
+        let cx = Cx::for_testing();
+        let first = u64::MAX - 1;
+        let device = FailingReadDevice::new(64, vec![first]);
+
+        let error = read_source_symbols_batched_candidate(&cx, &device, BlockNumber(first), 3)
+            .expect_err("earlier device error must precede later address overflow");
+
+        assert_eq!(
+            error.to_string(),
+            format!("I/O error: injected read failure at block {first}")
+        );
+        assert_eq!(*device.reads.lock(), vec![first]);
     }
 
     #[test]

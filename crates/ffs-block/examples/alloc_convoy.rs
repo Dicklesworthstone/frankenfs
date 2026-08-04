@@ -32,7 +32,9 @@ fn run(threads: usize, per: usize, sz: usize) -> f64 {
                     // just the alloc — exposes mmap_lock/page-table convoy.
                     let mut p = 0;
                     while p < sz {
-                        s[p] = (i as u8).wrapping_add(1);
+                        s[p] = u8::try_from(i & 0xff)
+                            .expect("masked to u8")
+                            .wrapping_add(1);
                         acc = acc.wrapping_add(u64::from(s[p]));
                         p += 4096;
                     }
@@ -65,12 +67,14 @@ fn main() {
         if rest.is_empty() {
             // 4K (control, arena), 64K (arena), 128K (== glibc mmap threshold),
             // 256K (clearly mmap'd). The read path chunks at 128K (32 blocks).
-            vec![4096, 65536, 131072, 262144]
+            vec![4096, 65_536, 131_072, 262_144]
         } else {
             rest
         }
     };
-    println!("# parallel scaling of alloc+per-page-touch by buffer size (1/T decay = perfect; flat ~1.0 = convoy)");
+    println!(
+        "# parallel scaling of alloc+per-page-touch by buffer size (1/T decay = perfect; flat ~1.0 = convoy)"
+    );
     for &sz in &sizes {
         let per = (work / sz).max(1000);
         let _ = run(1, per / 20, sz); // warm arenas for this size

@@ -55,6 +55,8 @@ use ffs_harness::{
         load_writeback_ordering_oracle,
     },
 };
+#[cfg(feature = "bhh0i_sharded_alloc")]
+use ffs_mvcc::sharded::PublicationMode;
 use ffs_ondisk::{
     BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4GroupDesc,
     Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, ext4::Ext4QuotaInodes, parse_dx_root,
@@ -625,6 +627,12 @@ struct Cli {
     reason = "clap subcommands keep typed flag payloads inline for direct parsing"
 )]
 enum Command {
+    /// Print the executing CLI's benchmark identity.
+    ///
+    /// Hidden from normal help because this is a measurement-harness contract,
+    /// not an end-user filesystem operation.
+    #[command(name = "bench-evidence", hide = true)]
+    BenchEvidence,
     /// Inspect a filesystem image (ext4 or btrfs).
     Inspect {
         /// Path to the filesystem image.
@@ -652,6 +660,13 @@ enum Command {
         /// Discard bytes (write to a sink) instead of stdout; report only the count.
         #[arg(long)]
         discard: bool,
+        /// Emit the in-process ELF/ISA/profile witness and timed read result.
+        ///
+        /// Hidden because this is the `bd-b9dug` measurement contract, not an
+        /// end-user read mode. It is valid only with `--discard`, keeping stdout
+        /// machine-readable instead of mixing evidence with file bytes.
+        #[arg(long, hide = true)]
+        bench_evidence: bool,
     },
     /// Random-read benchmark: open once, then read `count` random page-aligned
     /// blocks of `size` bytes from `path` (no FUSE) and report engine time,
@@ -744,6 +759,73 @@ enum Command {
         /// own subdir, isolating the MVCC commit-lock contention). 1 = serial.
         #[arg(long, default_value_t = 1)]
         threads: usize,
+        /// Repeat the create phase `rounds` times in ONE process against ONE
+        /// image, timing each round's creates SEPARATELY and flushing once at
+        /// the end.
+        ///
+        /// `--rounds 1` (the default) is byte-identical to the historical
+        /// behaviour, flush inside the timer and all, so every previously
+        /// published create-bench number stays comparable.
+        ///
+        /// `--rounds N > 1` exists because the historical shape cannot decide a
+        /// small effect: it needs a fresh 2 GiB image copy per run (thread
+        /// subdirs `t{t}` collide on reuse) and it times the whole-image flush,
+        /// so run-to-run variance is page-cache and writeback dominated rather
+        /// than filesystem dominated. The bd-bhh0i cutover gate measured a
+        /// 1-thread NEGATIVE CONTROL swinging 52% on that shape, which cannot
+        /// resolve the ~6% effect under test. Rounds share one image (no copy)
+        /// and exclude the flush, leaving the create loop as the signal.
+        #[arg(long, default_value_t = 1)]
+        rounds: usize,
+    },
+    /// Run the bd-bhh0i cutover decision as one self-contained invocation:
+    /// interleaved 1-thread Mutex/Mutex A/A followed by interleaved 8-thread
+    /// WaitFree/Mutex A/B, with a deterministic bootstrap median CI.
+    ///
+    /// Each arm needs its own byte-identical, non-reflink clone of one freshly
+    /// formatted ext4 image because the benchmark mutates it. All four images
+    /// must have the same SHA-256 and be no larger than 2 GiB. Flushes occur
+    /// after every timed round and are excluded from the statistic; the
+    /// resulting images remain available for e2fsck.
+    #[command(name = "create-bench-cutover-gate")]
+    CreateBenchCutoverGate {
+        /// Cloned ext4 image for the left A/A Mutex arm.
+        aa_lhs_image: PathBuf,
+        /// Cloned ext4 image for the right A/A Mutex arm.
+        aa_rhs_image: PathBuf,
+        /// Cloned ext4 image for the A/B Mutex control arm.
+        ab_base_image: PathBuf,
+        /// Cloned ext4 image for the A/B WaitFree candidate arm.
+        ab_candidate_image: PathBuf,
+        /// Absolute path of an existing directory to create files in.
+        dir: String,
+        /// Number of files created by each arm per paired round.
+        #[arg(long, default_value_t = 40_000)]
+        count: usize,
+        /// Parallel writers in the A/B pair. The A/A pair is always 1-thread.
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+        /// Interleaved paired rounds. Arm order alternates every round.
+        #[arg(long, default_value_t = 11)]
+        rounds: usize,
+    },
+    /// Re-measure the corrected bounded read pool against the shipped
+    /// quarter-nproc rule in one self-hashing whole-binary invocation.
+    ///
+    /// Hidden because this is a campaign evidence gate, not an end-user
+    /// filesystem operation. The gate copies `fixture`, creates a dense file in
+    /// the copy, then runs child instances of this exact ELF with cold-cache
+    /// A/A and A/B arms.
+    #[command(name = "read-pool-cutover-gate", hide = true)]
+    ReadPoolCutoverGate {
+        /// Existing ext4 image copied and mutated to build the private fixture.
+        fixture: PathBuf,
+        /// Number of 4 KiB blocks in the dense read target.
+        #[arg(long, default_value_t = 8_192)]
+        blocks: usize,
+        /// Interleaved paired A/A and A/B rounds.
+        #[arg(long, default_value_t = 31)]
+        rounds: usize,
     },
     /// Benchmark mkdir: create `count` subdirectories in `dir` + flush, timing
     /// total throughput. Each mkdir is an existence-check lookup + inode/dir
@@ -1174,12 +1256,15 @@ enum DumpCommand {
 impl Command {
     const fn name(&self) -> &'static str {
         match self {
+            Self::BenchEvidence => "bench-evidence",
             Self::Inspect { .. } => "inspect",
             Self::Read { .. } => "read",
             Self::RandRead { .. } => "randread",
             Self::WriteBench { .. } => "writebench",
             Self::LookupBench { .. } => "lookupbench",
             Self::CreateBench { .. } => "createbench",
+            Self::CreateBenchCutoverGate { .. } => "createbench-cutover-gate",
+            Self::ReadPoolCutoverGate { .. } => "read-pool-cutover-gate",
             Self::MkdirBench { .. } => "mkdirbench",
             Self::RmdirBench { .. } => "rmdirbench",
             Self::UnlinkBench { .. } => "unlinkbench",
@@ -1952,14 +2037,27 @@ fn run() -> Result<()> {
     let _run_guard = run_span.enter();
     let started = Instant::now();
 
-    info!(
-        target: "ffs::cli",
-        command = command_name,
-        log_format = log_format.as_str(),
-        "command_start"
+    let evidence_must_be_first = matches!(
+        &cli.command,
+        Command::BenchEvidence
+            | Command::CreateBenchCutoverGate { .. }
+            | Command::ReadPoolCutoverGate { .. }
+            | Command::Read {
+                bench_evidence: true,
+                ..
+            }
     );
+    if !evidence_must_be_first {
+        info!(
+            target: "ffs::cli",
+            command = command_name,
+            log_format = log_format.as_str(),
+            "command_start"
+        );
+    }
 
     let result = match cli.command {
+        Command::BenchEvidence => bench_evidence_cmd(),
         Command::Inspect {
             image,
             json,
@@ -1970,7 +2068,8 @@ fn run() -> Result<()> {
             image,
             path,
             discard,
-        } => read_file_cmd(&image, &path, discard),
+            bench_evidence,
+        } => read_file_cmd(&image, &path, discard, bench_evidence),
         Command::RandRead {
             image,
             path,
@@ -1994,7 +2093,35 @@ fn run() -> Result<()> {
             count,
             seed,
         } => lookupbench_cmd(&image, &dir, count, seed),
-        Command::CreateBench { image, dir, count, threads } => createbench_cmd(&image, &dir, count, threads),
+        Command::CreateBench {
+            image,
+            dir,
+            count,
+            threads,
+            rounds,
+        } => createbench_cmd(&image, &dir, count, threads, rounds),
+        Command::CreateBenchCutoverGate {
+            aa_lhs_image,
+            aa_rhs_image,
+            ab_base_image,
+            ab_candidate_image,
+            dir,
+            count,
+            threads,
+            rounds,
+        } => createbench_cutover_gate_cmd(
+            [&aa_lhs_image, &aa_rhs_image],
+            [&ab_base_image, &ab_candidate_image],
+            &dir,
+            count,
+            threads,
+            rounds,
+        ),
+        Command::ReadPoolCutoverGate {
+            fixture,
+            blocks,
+            rounds,
+        } => read_pool_cutover_gate_cmd(&fixture, blocks, rounds),
         Command::MkdirBench { image, dir, count } => mkdirbench_cmd(&image, &dir, count),
         Command::RmdirBench { image, dir, count } => rmdirbench_cmd(&image, &dir, count),
         Command::UnlinkBench { image, dir, count } => unlinkbench_cmd(&image, &dir, count),
@@ -2370,7 +2497,23 @@ fn log_wal_recovery_telemetry(wal: &WalReplayInfoOutput) {
     );
 }
 
-fn read_file_cmd(path: &PathBuf, file_path: &str, discard: bool) -> Result<()> {
+fn read_file_cmd(
+    path: &PathBuf,
+    file_path: &str,
+    discard: bool,
+    bench_evidence: bool,
+) -> Result<()> {
+    if bench_evidence {
+        if !discard {
+            bail!("--bench-evidence requires --discard");
+        }
+        // This runs inside the exact child process that performs the timed read.
+        // Keep it before the timer so hashing the ELF proves identity without
+        // contaminating the read wall-time decision.
+        bench_evidence_cmd()?;
+    }
+    let bench_started = bench_evidence.then(Instant::now);
+
     // The per-stream output buffer size. A large buffer is a fresh anon
     // allocation whose pages the kernel faults + zero-fills on first write
     // (bd-zvn7r: 28.91% of cold-read *cycles* at 64 MiB = ~16,384 faulted pages).
@@ -2444,6 +2587,13 @@ fn read_file_cmd(path: &PathBuf, file_path: &str, discard: bool) -> Result<()> {
     if discard {
         eprintln!("read {total} bytes from {file_path}");
     }
+    if let Some(started) = bench_started {
+        println!(
+            "bd_b9dug_read_observation,path={file_path},bytes={total},duration_us={},\
+gate_metric=read_wall_us",
+            started.elapsed().as_micros()
+        );
+    }
     Ok(())
 }
 
@@ -2454,7 +2604,13 @@ fn read_file_cmd(path: &PathBuf, file_path: &str, discard: bool) -> Result<()> {
 /// a kernel random `pread` loop. Random access does one extent-map lookup per
 /// read (sequential `read` coalesces runs), so this exercises the per-lookup
 /// path (e.g. the `ffs-extent` cache) that sequential reads hide (bd-7f6yr).
-fn createbench_cmd(path: &PathBuf, dir_path: &str, count: usize, threads: usize) -> Result<()> {
+fn createbench_cmd(
+    path: &PathBuf,
+    dir_path: &str,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<()> {
     let cx = cli_cx();
     let mut open_fs = OpenFs::open(&cx, path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
@@ -2477,13 +2633,26 @@ fn createbench_cmd(path: &PathBuf, dir_path: &str, count: usize, threads: usize)
             .with_context(|| format!("failed to resolve {dir_path} at component {comp:?}"))?;
         parent = attr.ino;
     }
+    // Low-variance mode (`--rounds N > 1`). Everything below the historical
+    // single-round paths, so `--rounds 1` reaches them untouched.
+    if rounds > 1 {
+        return createbench_rounds(&cx, &open_fs, parent, count, threads, rounds);
+    }
+
     // Parallel mode: each thread creates in its own subdir, so the only shared
     // contention is the MVCC commit lock — isolating whether writes scale.
     if threads > 1 {
         let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
         for t in 0..threads {
             let attr = open_fs
-                .mkdir(&cx, parent, std::ffi::OsStr::new(&format!("t{t}")), 0o755, 0, 0)
+                .mkdir(
+                    &cx,
+                    parent,
+                    std::ffi::OsStr::new(&format!("t{t}")),
+                    0o755,
+                    0,
+                    0,
+                )
                 .with_context(|| format!("failed to mkdir t{t}"))?;
             tdirs.push(attr.ino);
         }
@@ -2549,6 +2718,922 @@ fn createbench_cmd(path: &PathBuf, dir_path: &str, count: usize, threads: usize)
         creates_per_s as u64
     );
     Ok(())
+}
+
+/// Repeat the create phase in one process against one image, timing each round's
+/// creates alone and flushing once at the end.
+///
+/// Why this exists: the historical shape times creates AND a whole-image
+/// `sync_all_to_device`, and needs a fresh image per run because the `t{t}`
+/// thread subdirs collide on reuse. Both make the measurement page-cache and
+/// writeback bound. On the bd-bhh0i cutover gate that produced a 1-thread
+/// negative control — where the lever under test is provably inert — swinging
+/// **52%**, against a ~6% effect under test. An instrument whose null moves 52%
+/// cannot decide 6%.
+///
+/// Rounds share one image so no copy is needed, and the flush is reported
+/// separately so it stops contributing variance to the statistic.
+///
+/// Rounds are NOT independent: the filesystem fills monotonically, so round N
+/// starts fuller than round 1. That is why per-round lines are printed rather
+/// than a single aggregate — the caller alternates arms ACROSS rounds, which
+/// cancels the fill trend to first order, and can inspect it directly.
+fn sha256_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(&mut acc, "{byte:02x}");
+            acc
+        })
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open {} for SHA-256", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0_u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read {} for SHA-256", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(sha256_hex(&hasher.finalize()))
+}
+
+/// Hash equal-size A/A and A/B input files in round-robin chunks. Sequentially
+/// scanning multi-gigabyte images immediately before the first observation
+/// gives the last path a page-cache recency advantage; interleaving bounds that
+/// skew to one 64 KiB chunk while still proving complete-byte identity.
+fn interleaved_file_sha256(paths: [&Path; 4]) -> Result<[String; 4]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        files.push(
+            std::fs::File::open(path)
+                .with_context(|| format!("open {} for interleaved SHA-256", path.display()))?,
+        );
+    }
+    let mut hashers: [Sha256; 4] = std::array::from_fn(|_| Sha256::new());
+    let mut buffers: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0_u8; 64 * 1024]);
+    loop {
+        let mut any_read = false;
+        for index in 0..paths.len() {
+            let n = files[index].read(&mut buffers[index]).with_context(|| {
+                format!("read {} for interleaved SHA-256", paths[index].display())
+            })?;
+            if n != 0 {
+                hashers[index].update(&buffers[index][..n]);
+                any_read = true;
+            }
+        }
+        if !any_read {
+            break;
+        }
+    }
+    Ok(hashers.map(|hasher| sha256_hex(&hasher.finalize())))
+}
+
+/// SHA-256 of the executing binary, hashed in-process from `current_exe()`.
+fn elf_self_sha256() -> Result<String> {
+    let exe = std::env::current_exe().context("current_exe")?;
+    file_sha256(&exe).with_context(|| format!("self-hash executing ELF {}", exe.display()))
+}
+
+#[derive(Clone, Copy)]
+struct BootstrapMedianCi {
+    median: f64,
+    low: f64,
+    high: f64,
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    values.sort_by(f64::total_cmp);
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 0 {
+        values[midpoint - 1].midpoint(values[midpoint])
+    } else {
+        values[midpoint]
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// Deterministic paired bootstrap over log ratios. The cutover verdict consumes
+/// only this median confidence interval; CV is neither computed nor consulted.
+fn bootstrap_median_ci(log_ratios: &[f64]) -> BootstrapMedianCi {
+    const RESAMPLES: usize = 20_000;
+    assert!(
+        !log_ratios.is_empty(),
+        "bootstrap median CI requires paired samples"
+    );
+    let mut state =
+        0xB440_10C1_2026_0726_u64 ^ u64::try_from(log_ratios.len()).expect("length fits u64");
+    let mut bootstrapped = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut sample = Vec::with_capacity(log_ratios.len());
+        for _ in log_ratios {
+            let draw =
+                splitmix64(&mut state) % u64::try_from(log_ratios.len()).expect("length fits u64");
+            sample.push(log_ratios[usize::try_from(draw).expect("draw fits usize")]);
+        }
+        bootstrapped.push(median(sample));
+    }
+    bootstrapped.sort_by(f64::total_cmp);
+    let low_index = RESAMPLES.saturating_mul(25) / 1000;
+    let high_index = RESAMPLES
+        .saturating_mul(975)
+        .div_ceil(1000)
+        .saturating_sub(1);
+    BootstrapMedianCi {
+        median: median(log_ratios.to_vec()).exp(),
+        low: bootstrapped[low_index].exp(),
+        high: bootstrapped[high_index].exp(),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn print_codegen_isa() {
+    println!(
+        "codegen_isa,target_arch=x86_64,compile_sse2={},compile_sse4_2={},compile_avx2={},compile_fma={},runtime_sse4_2={},runtime_avx2={},runtime_fma={}",
+        cfg!(target_feature = "sse2"),
+        cfg!(target_feature = "sse4.2"),
+        cfg!(target_feature = "avx2"),
+        cfg!(target_feature = "fma"),
+        std::is_x86_feature_detected!("sse4.2"),
+        std::is_x86_feature_detected!("avx2"),
+        std::is_x86_feature_detected!("fma"),
+    );
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn print_codegen_isa() {
+    println!("codegen_isa,target_arch=non_x86_64");
+}
+
+fn bench_evidence_cmd() -> Result<()> {
+    let sha = elf_self_sha256()?;
+    println!("bench_evidence,binary_sha256={sha}");
+    print_codegen_isa();
+    println!(
+        "build_profile,pgo_profile_sha256={}",
+        option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+    );
+    Ok(())
+}
+
+fn createbench_one_round(
+    cx: &Cx,
+    open_fs: &OpenFs,
+    parent: InodeNumber,
+    count: usize,
+    threads: usize,
+    round: usize,
+) -> Result<Duration> {
+    let per = if threads > 1 { count / threads } else { count };
+    let elapsed = if threads > 1 {
+        let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
+        for t in 0..threads {
+            let attr = open_fs
+                .mkdir(
+                    cx,
+                    parent,
+                    std::ffi::OsStr::new(&format!("t{t}_r{round}")),
+                    0o755,
+                    0,
+                    0,
+                )
+                .with_context(|| format!("failed to mkdir t{t}_r{round}"))?;
+            tdirs.push(attr.ino);
+        }
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            for (t, &tdir) in tdirs.iter().enumerate() {
+                let fs = &*open_fs;
+                s.spawn(move || {
+                    for i in 0..per {
+                        let name = format!("cb_{t}_{i:08}");
+                        fs.create(cx, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
+                            .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
+                    }
+                });
+            }
+        });
+        started.elapsed()
+    } else {
+        let started = Instant::now();
+        for i in 0..per {
+            let name = format!("cb_r{round}_{i:08}");
+            open_fs
+                .create(cx, parent, std::ffi::OsStr::new(&name), 0o644, 0, 0)
+                .with_context(|| format!("failed to create {name}"))?;
+        }
+        started.elapsed()
+    };
+    Ok(elapsed)
+}
+
+fn createbench_rounds(
+    cx: &Cx,
+    open_fs: &OpenFs,
+    parent: InodeNumber,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<()> {
+    // Self-report the EXECUTING ELF's SHA-256. A `sha256sum` run beside the
+    // benchmark proves which file exists on disk, not which binary the kernel
+    // actually mapped — the two diverge whenever a concurrent build replaces the
+    // file mid-run, which has happened in this fleet. Hash `current_exe()` from
+    // inside the measuring process, outside the timed region.
+    match elf_self_sha256() {
+        Ok(sha) => println!("bench_evidence,binary_sha256={sha}"),
+        Err(err) => println!("bench_evidence,binary_sha256=unavailable,error={err}"),
+    }
+    let per = if threads > 1 { count / threads } else { count };
+    let per_round_total = per * threads.max(1);
+    for round in 0..rounds {
+        let create_us = createbench_one_round(cx, open_fs, parent, count, threads, round)?;
+        let secs = create_us.as_secs_f64().max(1e-9);
+        println!(
+            "createbench_round,round={round},threads={threads},count={per_round_total},\
+create_us={},creates_per_s={}",
+            create_us.as_micros(),
+            (per_round_total as f64 / secs) as u64
+        );
+    }
+    // One flush for the whole run, timed and reported separately so it can be
+    // read but never contributes to the per-round statistic.
+    let flush_started = Instant::now();
+    open_fs
+        .sync_all_to_device(cx)
+        .with_context(|| "failed to flush creates".to_string())?;
+    println!(
+        "createbench_flush,rounds={rounds},flush_us={}",
+        flush_started.elapsed().as_micros()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+struct CreateBenchCutoverArm {
+    label: &'static str,
+    cx: Cx,
+    open_fs: OpenFs,
+    parent: InodeNumber,
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+impl CreateBenchCutoverArm {
+    fn open(
+        label: &'static str,
+        path: &Path,
+        dir_path: &str,
+        publication_mode: PublicationMode,
+    ) -> Result<Self> {
+        let cx = cli_cx();
+        let mut open_fs = OpenFs::open(&cx, path)
+            .with_context(|| format!("failed to open {label} image: {}", path.display()))?;
+        open_fs
+            .set_empty_mvcc_publication_mode_for_bench(publication_mode)
+            .with_context(|| format!("failed to select {label} publication mode"))?;
+        open_fs
+            .enable_writes(&cx)
+            .with_context(|| format!("failed to enable writes for {label}"))?;
+        open_fs.set_bhh0i_sharded_ops(true);
+
+        let mut parent = InodeNumber(1);
+        for comp in dir_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            let attr = open_fs
+                .lookup(&cx, parent, std::ffi::OsStr::new(comp))
+                .with_context(|| {
+                    format!("failed to resolve {dir_path} for {label} at component {comp:?}")
+                })?;
+            parent = attr.ino;
+        }
+        Ok(Self {
+            label,
+            cx,
+            open_fs,
+            parent,
+        })
+    }
+
+    fn time_and_flush(&self, count: usize, threads: usize, round: usize) -> Result<Duration> {
+        let elapsed =
+            createbench_one_round(&self.cx, &self.open_fs, self.parent, count, threads, round)?;
+        let flush_started = Instant::now();
+        self.open_fs
+            .sync_all_to_device(&self.cx)
+            .with_context(|| format!("failed to flush {} after round {round}", self.label))?;
+        println!(
+            "createbench_cutover_flush,arm={},round={round},flush_us={}",
+            self.label,
+            flush_started.elapsed().as_micros()
+        );
+        Ok(elapsed)
+    }
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+#[allow(clippy::too_many_arguments)]
+fn run_createbench_cutover_pair(
+    phase: &str,
+    logical_lhs: &CreateBenchCutoverArm,
+    logical_rhs: &CreateBenchCutoverArm,
+    count: usize,
+    threads: usize,
+    round: usize,
+    lhs_first: bool,
+) -> Result<f64> {
+    let (lhs_elapsed, rhs_elapsed) = if lhs_first {
+        (
+            logical_lhs.time_and_flush(count, threads, round)?,
+            logical_rhs.time_and_flush(count, threads, round)?,
+        )
+    } else {
+        let rhs = logical_rhs.time_and_flush(count, threads, round)?;
+        let lhs = logical_lhs.time_and_flush(count, threads, round)?;
+        (lhs, rhs)
+    };
+    let lhs_seconds = lhs_elapsed.as_secs_f64().max(1e-9);
+    let rhs_seconds = rhs_elapsed.as_secs_f64().max(1e-9);
+    let lhs_over_rhs = rhs_seconds / lhs_seconds;
+    println!(
+        "createbench_cutover_pair,phase={phase},round={round},order={},threads={threads},\
+lhs={},rhs={},lhs_us={},rhs_us={},lhs_over_rhs={lhs_over_rhs:.6}",
+        if lhs_first { "lhs_rhs" } else { "rhs_lhs" },
+        logical_lhs.label,
+        logical_rhs.label,
+        lhs_elapsed.as_micros(),
+        rhs_elapsed.as_micros(),
+    );
+    Ok(lhs_over_rhs.ln())
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+fn validate_cutover_images(paths: [&Path; 4]) -> Result<(u64, String)> {
+    const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let mut canonical_paths = BTreeSet::new();
+    #[cfg(unix)]
+    let mut file_identities = BTreeSet::new();
+    let mut image_size = None;
+    for path in paths {
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("canonicalize cutover image {}", path.display()))?;
+        if !canonical_paths.insert(canonical) {
+            bail!("cutover gate requires four distinct image files");
+        }
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("stat cutover image {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !file_identities.insert((metadata.dev(), metadata.ino())) {
+                bail!("cutover gate rejects hard-linked image paths");
+            }
+        }
+        let len = metadata.len();
+        if len > MAX_IMAGE_BYTES {
+            bail!(
+                "cutover image {} is {len} bytes; cap is {MAX_IMAGE_BYTES}",
+                path.display()
+            );
+        }
+        match image_size {
+            None => image_size = Some(len),
+            Some(expected) if expected == len => {}
+            Some(expected) => bail!(
+                "cutover images differ in size: expected {expected} bytes, {} is {len}",
+                path.display()
+            ),
+        }
+    }
+    let image_shas = interleaved_file_sha256(paths)?;
+    let expected_sha = &image_shas[0];
+    for (path, sha) in paths.iter().zip(image_shas.iter()).skip(1) {
+        if sha != expected_sha {
+            bail!(
+                "cutover images are not byte-identical: expected SHA-256 {expected_sha}, {} is {sha}",
+                path.display()
+            );
+        }
+    }
+    Ok((
+        image_size.context("cutover gate requires four image files")?,
+        expected_sha.clone(),
+    ))
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+fn measure_createbench_cutover(
+    null_images: [&PathBuf; 2],
+    decision_images: [&PathBuf; 2],
+    dir_path: &str,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<(BootstrapMedianCi, BootstrapMedianCi)> {
+    let null_lhs = CreateBenchCutoverArm::open(
+        "aa_mutex_lhs",
+        null_images[0],
+        dir_path,
+        PublicationMode::Mutex,
+    )?;
+    let null_rhs = CreateBenchCutoverArm::open(
+        "aa_mutex_rhs",
+        null_images[1],
+        dir_path,
+        PublicationMode::Mutex,
+    )?;
+    let mutex_control = CreateBenchCutoverArm::open(
+        "ab_mutex_base",
+        decision_images[0],
+        dir_path,
+        PublicationMode::Mutex,
+    )?;
+    let wait_free_candidate = CreateBenchCutoverArm::open(
+        "ab_wait_free_candidate",
+        decision_images[1],
+        dir_path,
+        PublicationMode::WaitFree,
+    )?;
+
+    let mut null_log_ratios = Vec::with_capacity(rounds);
+    let mut candidate_log_ratios = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        null_log_ratios.push(run_createbench_cutover_pair(
+            "aa",
+            &null_lhs,
+            &null_rhs,
+            count,
+            1,
+            round,
+            round % 2 == 0,
+        )?);
+        candidate_log_ratios.push(run_createbench_cutover_pair(
+            "ab",
+            &wait_free_candidate,
+            &mutex_control,
+            count,
+            threads,
+            round,
+            round % 2 != 0,
+        )?);
+    }
+    Ok((
+        bootstrap_median_ci(&null_log_ratios),
+        bootstrap_median_ci(&candidate_log_ratios),
+    ))
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+fn createbench_cutover_gate_cmd(
+    null_images: [&PathBuf; 2],
+    decision_images: [&PathBuf; 2],
+    dir_path: &str,
+    count: usize,
+    threads: usize,
+    rounds: usize,
+) -> Result<()> {
+    let sha = elf_self_sha256().context("self-hash executing cutover ELF")?;
+    let worker = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("bench_evidence,binary_sha256={sha},worker={worker}");
+    print_codegen_isa();
+
+    if rounds < 5 {
+        bail!("cutover gate requires at least 5 paired rounds");
+    }
+    if threads < 2 {
+        bail!("cutover A/B requires at least 2 writer threads");
+    }
+    if count == 0 || count % threads != 0 {
+        bail!("count must be nonzero and divisible by threads");
+    }
+    let (image_size, image_sha256) = validate_cutover_images([
+        null_images[0].as_path(),
+        null_images[1].as_path(),
+        decision_images[0].as_path(),
+        decision_images[1].as_path(),
+    ])?;
+    println!(
+        "createbench_cutover_config,same_invocation=true,rounds={rounds},count={count},\
+aa_threads=1,ab_threads={threads},image_size={image_size},sharded_alloc=true,\
+input_image_sha256={image_sha256},gate_basis=bootstrap_median_ci,\
+bootstrap_resamples=20000,cv_used=false"
+    );
+
+    let (null_ci, candidate_ci) = measure_createbench_cutover(
+        null_images,
+        decision_images,
+        dir_path,
+        count,
+        threads,
+        rounds,
+    )?;
+    let null_log_margin = null_ci.low.ln().abs().max(null_ci.high.ln().abs());
+    let null_floor_ratio = null_log_margin.exp();
+    let twice_null_ratio = (2.0 * null_log_margin).exp();
+    let aa_inside_1_10 = (1.0 / 1.10..=1.10).contains(&null_ci.median);
+    let null_floor_le_1_15 = null_floor_ratio <= 1.15;
+    let ab_clears_twice_null = candidate_ci.low > twice_null_ratio;
+    let performance_admitted = aa_inside_1_10 && null_floor_le_1_15 && ab_clears_twice_null;
+
+    println!(
+        "createbench_cutover_median_ci,phase=aa,lhs_over_rhs_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        null_ci.median, null_ci.low, null_ci.high
+    );
+    println!(
+        "createbench_cutover_median_ci,phase=ab,candidate_over_base_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        candidate_ci.median, candidate_ci.low, candidate_ci.high
+    );
+    println!(
+        "createbench_cutover_decision,aa_inside_1_10={aa_inside_1_10},\
+null_floor_ratio={null_floor_ratio:.6},null_floor_le_1_15={null_floor_le_1_15},\
+twice_null_ratio={twice_null_ratio:.6},ab_ci_clears_twice_null={ab_clears_twice_null},\
+performance_admitted={performance_admitted},external_fsck_required=true,\
+gate_basis=bootstrap_median_ci,cv_used=false"
+    );
+    println!(
+        "createbench_cutover_expected_files,aa_each={},ab_each={}",
+        12_usize.saturating_add(count.saturating_mul(rounds)),
+        12_usize
+            .saturating_add(count.saturating_mul(rounds))
+            .saturating_add(threads.saturating_mul(rounds))
+    );
+    if performance_admitted {
+        Ok(())
+    } else {
+        bail!("cutover performance gate rejected the candidate; see decision row")
+    }
+}
+
+#[cfg(not(feature = "bhh0i_sharded_alloc"))]
+fn createbench_cutover_gate_cmd(
+    _null_images: [&PathBuf; 2],
+    _decision_images: [&PathBuf; 2],
+    _dir_path: &str,
+    _count: usize,
+    _threads: usize,
+    _rounds: usize,
+) -> Result<()> {
+    bail!("create-bench-cutover-gate requires --features bhh0i_sharded_alloc")
+}
+
+const READ_POOL_GATE_FILE: &str = "/read_pool_gate.bin";
+
+fn copy_read_pool_fixture(source: &Path) -> Result<PathBuf> {
+    use std::io::{BufReader, BufWriter, Write as _};
+
+    const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let source_len = std::fs::metadata(source)
+        .with_context(|| format!("stat read-pool fixture {}", source.display()))?
+        .len();
+    if source_len > MAX_IMAGE_BYTES {
+        bail!(
+            "read-pool fixture {} is {source_len} bytes; cap is {MAX_IMAGE_BYTES}",
+            source.display()
+        );
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    let destination = std::env::temp_dir().join(format!(
+        "frankenfs-read-pool-gate-{}-{nonce}.img",
+        std::process::id()
+    ));
+    let mut input = BufReader::new(
+        std::fs::File::open(source)
+            .with_context(|| format!("open read-pool fixture {}", source.display()))?,
+    );
+    let mut output = BufWriter::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .with_context(|| format!("create private read-pool image {}", destination.display()))?,
+    );
+    let copied = std::io::copy(&mut input, &mut output)
+        .with_context(|| format!("copy read-pool fixture to {}", destination.display()))?;
+    output
+        .flush()
+        .with_context(|| format!("flush private read-pool image {}", destination.display()))?;
+    if copied != source_len {
+        bail!("fixture copy was short: expected {source_len} bytes, copied {copied}");
+    }
+    Ok(destination)
+}
+
+fn run_read_pool_setup(exe: &Path, image: &Path, blocks: usize) -> Result<()> {
+    let output = std::process::Command::new(exe)
+        .arg("--log-format")
+        .arg("human")
+        .arg("write-bench")
+        .arg(image)
+        .arg(READ_POOL_GATE_FILE)
+        .arg("--count")
+        .arg(blocks.to_string())
+        .arg("--size")
+        .arg("4096")
+        .arg("--create")
+        .env("RUST_LOG", "error")
+        .output()
+        .with_context(|| format!("launch read-pool fixture setup from {}", exe.display()))?;
+    if !output.status.success() {
+        bail!(
+            "read-pool fixture setup failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn verify_read_pool_child_identity(exe: &Path, parent_sha256: &str) -> Result<()> {
+    let output = std::process::Command::new(exe)
+        .arg("bench-evidence")
+        .env("RUST_LOG", "error")
+        .output()
+        .with_context(|| format!("launch read-pool identity child from {}", exe.display()))?;
+    if !output.status.success() {
+        bail!(
+            "read-pool identity child failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let child_sha256 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("bench_evidence,binary_sha256="))
+        .and_then(|rest| rest.split(',').next())
+        .context("identity child omitted its in-process ELF SHA-256")?;
+    if child_sha256 != parent_sha256 {
+        bail!("read-pool parent/child ELF mismatch: parent {parent_sha256}, child {child_sha256}");
+    }
+    println!(
+        "read_pool_child_identity,parent_binary_sha256={parent_sha256},\
+child_binary_sha256={child_sha256},same_elf=true"
+    );
+    Ok(())
+}
+
+fn evict_read_pool_fixture(image: &Path) -> Result<()> {
+    use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open(image)
+        .with_context(|| format!("open {} for DONTNEED", image.display()))?;
+    posix_fadvise(
+        file.as_raw_fd(),
+        0,
+        0,
+        PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    )
+    .with_context(|| format!("POSIX_FADV_DONTNEED {}", image.display()))
+}
+
+struct ReadPoolChild {
+    elapsed: Duration,
+    stdout: Vec<u8>,
+}
+
+fn run_read_pool_child(
+    exe: &Path,
+    image: &Path,
+    threads: Option<usize>,
+    discard: bool,
+) -> Result<ReadPoolChild> {
+    evict_read_pool_fixture(image)?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--log-format")
+        .arg("human")
+        .arg("read")
+        .arg(image)
+        .arg(READ_POOL_GATE_FILE)
+        .env("RUST_LOG", "error");
+    if discard {
+        command.arg("--discard");
+    }
+    match threads {
+        Some(threads) => {
+            command.env("FFS_READ_PARALLELISM", threads.to_string());
+        }
+        None => {
+            command.env_remove("FFS_READ_PARALLELISM");
+        }
+    }
+    let started = Instant::now();
+    let output = command
+        .output()
+        .with_context(|| format!("launch read-pool child from {}", exe.display()))?;
+    let elapsed = started.elapsed();
+    if !output.status.success() {
+        bail!(
+            "read-pool child failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(ReadPoolChild {
+        elapsed,
+        stdout: output.stdout,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_read_pool_pair(
+    phase: &str,
+    exe: &Path,
+    image: &Path,
+    lhs_label: &str,
+    lhs_threads: Option<usize>,
+    rhs_label: &str,
+    rhs_threads: Option<usize>,
+    round: usize,
+    lhs_first: bool,
+) -> Result<f64> {
+    let (lhs, rhs) = if lhs_first {
+        (
+            run_read_pool_child(exe, image, lhs_threads, true)?,
+            run_read_pool_child(exe, image, rhs_threads, true)?,
+        )
+    } else {
+        let rhs = run_read_pool_child(exe, image, rhs_threads, true)?;
+        let lhs = run_read_pool_child(exe, image, lhs_threads, true)?;
+        (lhs, rhs)
+    };
+    let lhs_seconds = lhs.elapsed.as_secs_f64().max(1e-9);
+    let rhs_seconds = rhs.elapsed.as_secs_f64().max(1e-9);
+    let lhs_over_rhs = rhs_seconds / lhs_seconds;
+    println!(
+        "read_pool_cutover_pair,phase={phase},round={round},order={},lhs={lhs_label},\
+rhs={rhs_label},lhs_us={},rhs_us={},lhs_over_rhs={lhs_over_rhs:.6}",
+        if lhs_first { "lhs_rhs" } else { "rhs_lhs" },
+        lhs.elapsed.as_micros(),
+        rhs.elapsed.as_micros(),
+    );
+    Ok(lhs_over_rhs.ln())
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_pool_cutover_gate_cmd(fixture: &Path, blocks: usize, rounds: usize) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let sha = elf_self_sha256().context("self-hash executing read-pool gate ELF")?;
+    let worker = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("bench_evidence,binary_sha256={sha},worker={worker}");
+    print_codegen_isa();
+    println!(
+        "build_profile,pgo_profile_sha256={}",
+        option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+    );
+
+    if rounds < 5 {
+        bail!("read-pool cutover gate requires at least 5 paired rounds");
+    }
+    if blocks == 0 {
+        bail!("read-pool cutover gate requires at least one data block");
+    }
+    let expected_bytes = blocks
+        .checked_mul(4096)
+        .context("read-pool target byte count overflow")?;
+    let available_threads =
+        std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let candidate_threads = available_threads.min(16);
+    let old_quarter_threads = (available_threads / 4).clamp(4, 16);
+    if old_quarter_threads == candidate_threads {
+        bail!(
+            "read-pool A/B needs the old quarter-width rule ({old_quarter_threads}) to differ \
+             from the corrected production width ({candidate_threads}); nproc={available_threads}"
+        );
+    }
+
+    let exe = std::env::current_exe().context("resolve read-pool gate current_exe")?;
+    verify_read_pool_child_identity(&exe, &sha)?;
+    let image = copy_read_pool_fixture(fixture)?;
+    run_read_pool_setup(&exe, &image, blocks)?;
+    let image_sha256 = file_sha256(&image)?;
+
+    let candidate_bytes = run_read_pool_child(&exe, &image, None, false)?.stdout;
+    let control_bytes = run_read_pool_child(&exe, &image, Some(old_quarter_threads), false)?.stdout;
+    if candidate_bytes.len() != expected_bytes || control_bytes.len() != expected_bytes {
+        bail!(
+            "read-pool parity length mismatch: expected {expected_bytes}, candidate {}, control {}",
+            candidate_bytes.len(),
+            control_bytes.len()
+        );
+    }
+    if candidate_bytes != control_bytes {
+        bail!("read-pool candidate/control bytes differ");
+    }
+    if candidate_bytes.iter().any(|&byte| byte != 0xA5) {
+        bail!("read-pool fixture bytes differ from the deterministic 0xA5 payload");
+    }
+    let stream_sha256 = sha256_hex(&Sha256::digest(&candidate_bytes));
+    println!(
+        "read_pool_cutover_config,same_invocation=true,rounds={rounds},blocks={blocks},\
+bytes={expected_bytes},available_threads={available_threads},\
+candidate_default_threads={candidate_threads},control_old_quarter_threads={old_quarter_threads},\
+fixture={},private_image={},private_image_sha256={image_sha256},\
+stream_sha256={stream_sha256},exact_stream_parity=true,cold_cache=posix_fadvise_dontneed,\
+gate_basis=bootstrap_median_ci,bootstrap_resamples=20000,cv_used=false",
+        fixture.display(),
+        image.display(),
+    );
+
+    let mut null_log_ratios = Vec::with_capacity(rounds);
+    let mut candidate_log_ratios = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        null_log_ratios.push(run_read_pool_pair(
+            "aa",
+            &exe,
+            &image,
+            "default_lhs",
+            None,
+            "default_rhs",
+            None,
+            round,
+            round % 2 == 0,
+        )?);
+        candidate_log_ratios.push(run_read_pool_pair(
+            "ab",
+            &exe,
+            &image,
+            "default_candidate",
+            None,
+            "old_quarter_control",
+            Some(old_quarter_threads),
+            round,
+            round % 2 != 0,
+        )?);
+    }
+
+    let null_ci = bootstrap_median_ci(&null_log_ratios);
+    let candidate_ci = bootstrap_median_ci(&candidate_log_ratios);
+    let null_log_margin = null_ci.low.ln().abs().max(null_ci.high.ln().abs());
+    let null_floor_ratio = null_log_margin.exp();
+    let twice_null_ratio = (2.0 * null_log_margin).exp();
+    let aa_inside_1_10 = (1.0 / 1.10..=1.10).contains(&null_ci.median);
+    let null_floor_le_1_15 = null_floor_ratio <= 1.15;
+    let ab_clears_twice_null = candidate_ci.low > twice_null_ratio;
+    let performance_admitted = aa_inside_1_10 && null_floor_le_1_15 && ab_clears_twice_null;
+    println!(
+        "read_pool_cutover_median_ci,phase=aa,lhs_over_rhs_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        null_ci.median, null_ci.low, null_ci.high
+    );
+    println!(
+        "read_pool_cutover_median_ci,phase=ab,candidate_over_control_median={:.6},\
+bootstrap_median_ci95_low={:.6},bootstrap_median_ci95_high={:.6}",
+        candidate_ci.median, candidate_ci.low, candidate_ci.high
+    );
+    println!(
+        "read_pool_cutover_decision,aa_inside_1_10={aa_inside_1_10},\
+null_floor_ratio={null_floor_ratio:.6},null_floor_le_1_15={null_floor_le_1_15},\
+twice_null_ratio={twice_null_ratio:.6},ab_ci_clears_twice_null={ab_clears_twice_null},\
+performance_admitted={performance_admitted},gate_basis=bootstrap_median_ci,cv_used=false"
+    );
+    if performance_admitted {
+        Ok(())
+    } else {
+        bail!("read-pool performance gate rejected the candidate; see decision row")
+    }
 }
 
 fn mkdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
@@ -6589,6 +7674,22 @@ fn mount_with_fuse(
         worker_threads: 0,
     };
 
+    // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
+    // `ext4_alloc_state.write()` for its whole body, so every FUSE worker thread
+    // serializes on one lock and parallel metadata writes scale NEGATIVELY —
+    // the mechanism behind the 1.510822x mounted loss vs kernel ext4. The
+    // sharded twin allocates through per-group locks instead, so creates into
+    // disjoint groups never serialize. Off unless explicitly asked for, and a
+    // no-op unless the crate was built with the feature.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    if read_write && std::env::var_os("FFS_BHH0I_SHARDED").is_some() {
+        let previously = open_fs.set_bhh0i_sharded_ops(true);
+        eprintln!(
+            "mount: bd-bhh0i sharded per-group create path ENABLED \
+             (FFS_BHH0I_SHARDED set, previous={previously})"
+        );
+    }
+
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
     ffs_fuse::mount(fs_ops, mountpoint, &opts)
         .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
@@ -7308,6 +8409,15 @@ fn start_mount_background_scrub(
 
 #[allow(clippy::too_many_lines)]
 fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) -> Result<()> {
+    if env_bool("FFS_MOUNT_BENCH_EVIDENCE", false)? {
+        let sha = elf_self_sha256().context("self-hash executing mounted benchmark ELF")?;
+        eprintln!("mount_bench_evidence,binary_sha256={sha}");
+        eprintln!(
+            "mount_build_profile,pgo_profile_sha256={}",
+            option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+        );
+    }
+
     let auto_unmount = env_bool("FFS_AUTO_UNMOUNT", true)?;
     let requested_runtime = options.runtime;
     let operation_id = mount_operation_id(
@@ -7511,10 +8621,24 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
 
 fn open_filesystem_for_mount(image_path: &Path, options: &MountCmdOptions) -> Result<OpenFs> {
     let cx = cli_cx();
-    let open_opts = build_mount_open_options(options);
+    let mut open_opts = build_mount_open_options(options);
+    if options.read_write && std::env::var_os("FFS_EXT4_METADATA_LOG").is_some() {
+        open_opts.mvcc_wal_path = Some(image_path.with_extension("ffs-metadata-wal"));
+        open_opts.metadata_log_enabled = true;
+    }
     let open_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
         .map_err(anyhow::Error::new)
         .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
+    if open_fs.metadata_log_enabled() {
+        eprintln!(
+            "mount: append-only ext4 metadata WAL ENABLED ({})",
+            open_opts
+                .mvcc_wal_path
+                .as_deref()
+                .expect("enabled metadata log has a path")
+                .display()
+        );
+    }
     if !matches!(
         options.btrfs_mount_selection,
         BtrfsMountSelection::DefaultRoot
@@ -8823,6 +9947,36 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cli_parses_read_pool_cutover_gate() {
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "read-pool-cutover-gate",
+            "/tmp/ext4.img",
+            "--blocks",
+            "4096",
+            "--rounds",
+            "17",
+        ])
+        .expect("read-pool cutover gate should parse");
+
+        match cli.command {
+            Command::ReadPoolCutoverGate {
+                fixture,
+                blocks,
+                rounds,
+            } => {
+                assert_eq!(fixture, PathBuf::from("/tmp/ext4.img"));
+                assert_eq!(blocks, 4096);
+                assert_eq!(rounds, 17);
+            }
+            other => assert!(
+                matches!(other, Command::ReadPoolCutoverGate { .. }),
+                "expected read-pool cutover gate"
+            ),
+        }
+    }
     use tracing::{info, info_span};
     use tracing_subscriber::fmt::MakeWriter;
 

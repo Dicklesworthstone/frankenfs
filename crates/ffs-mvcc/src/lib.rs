@@ -24,9 +24,7 @@ use ffs_repair::evidence::{
 };
 use ffs_types::{BlockNumber, CommitSeq, Snapshot, TxnId};
 use parking_lot::{Mutex, RwLock};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -61,7 +59,7 @@ impl BlockVersion {
     #[must_use]
     pub fn bytes_inline(&self) -> Option<&[u8]> {
         match &self.data {
-            VersionData::Full(bytes) => Some(bytes.as_slice()),
+            VersionData::Full(bytes) => Some(bytes),
             _ => None,
         }
     }
@@ -97,8 +95,6 @@ pub struct MergeByteRange {
     pub start: usize,
     pub len: usize,
 }
-
-pub type MergeByteRanges = SmallVec<[MergeByteRange; 1]>;
 
 impl MergeByteRange {
     #[must_use]
@@ -150,53 +146,17 @@ pub enum MergeProof {
         base_len: usize,
     },
     IndependentKeys {
-        touched_ranges: MergeByteRanges,
+        touched_ranges: Vec<MergeByteRange>,
     },
     NonOverlappingExtents {
-        touched_ranges: MergeByteRanges,
+        touched_ranges: Vec<MergeByteRange>,
     },
     TimestampOnlyInode {
-        touched_ranges: MergeByteRanges,
+        touched_ranges: Vec<MergeByteRange>,
     },
 }
 
 impl MergeProof {
-    #[must_use]
-    pub fn independent_key_range(start: usize, len: usize) -> Self {
-        Self::IndependentKeys {
-            touched_ranges: smallvec![MergeByteRange::new(start, len)],
-        }
-    }
-
-    /// `IndependentKeys` proof over a set of `(start, len)` byte ranges — the
-    /// multi-range form of [`Self::independent_key_range`]. Used for a block whose
-    /// concurrent writers each touch a distinct fixed-size record slot (e.g. one
-    /// group descriptor within the shared GDT block), so disjoint-slot writers
-    /// merge instead of first-committer-wins conflicting.
-    #[must_use]
-    pub fn independent_keys(ranges: &[(usize, usize)]) -> Self {
-        Self::IndependentKeys {
-            touched_ranges: ranges
-                .iter()
-                .map(|&(start, len)| MergeByteRange::new(start, len))
-                .collect(),
-        }
-    }
-
-    #[must_use]
-    pub fn non_overlapping_extent_range(start: usize, len: usize) -> Self {
-        Self::NonOverlappingExtents {
-            touched_ranges: smallvec![MergeByteRange::new(start, len)],
-        }
-    }
-
-    #[must_use]
-    pub fn timestamp_only_inode_range(start: usize, len: usize) -> Self {
-        Self::TimestampOnlyInode {
-            touched_ranges: smallvec![MergeByteRange::new(start, len)],
-        }
-    }
-
     #[must_use]
     pub fn mechanism(&self) -> MergeProofMechanism {
         match self {
@@ -208,34 +168,30 @@ impl MergeProof {
         }
     }
 
-    /// Whether [`Self::merge_bytes`] would succeed for these inputs, WITHOUT
-    /// allocating or building the merged block.
-    ///
-    /// The FCW *preflight* conflict check only needs a yes/no answer. Building
-    /// the merged buffer there (then discarding it and rebuilding it at install
-    /// time) wastes a block-sized allocation + copy per conflicting block on the
-    /// contended commit path, under the shard lock. `merge_valid(..) ==
-    /// merge_bytes(..).is_some()` by construction: both run the identical
-    /// validators; only `merge_bytes` additionally materializes the output.
-    pub(crate) fn merge_valid(&self, base: &[u8], latest: &[u8], staged: &[u8]) -> bool {
-        match self {
-            Self::Unsafe | Self::DisjointBlocks => false,
-            Self::AppendOnly { base_len } => {
-                append_only_merge_valid(*base_len, base, latest, staged)
-            }
-            Self::IndependentKeys { touched_ranges }
-            | Self::NonOverlappingExtents { touched_ranges }
-            | Self::TimestampOnlyInode { touched_ranges } => {
-                merge_non_overlapping_ranges_valid(touched_ranges, base, latest, staged, self)
-            }
-        }
-    }
-
     pub(crate) fn merge_bytes(&self, base: &[u8], latest: &[u8], staged: &[u8]) -> Option<Vec<u8>> {
         match self {
             Self::Unsafe | Self::DisjointBlocks => None,
             Self::AppendOnly { base_len } => {
-                if !append_only_merge_valid(*base_len, base, latest, staged) {
+                if *base_len > base.len() || *base_len > latest.len() || *base_len > staged.len() {
+                    warn!(
+                        target: "ffs::mvcc::merge",
+                        proof = "AppendOnly",
+                        base_len = *base_len,
+                        actual_base = base.len(),
+                        actual_latest = latest.len(),
+                        actual_staged = staged.len(),
+                        "merge_proof_rejected: base_len exceeds buffer size"
+                    );
+                    return None;
+                }
+                let prefix = &base[..*base_len];
+                if latest[..*base_len] != *prefix || staged[..*base_len] != *prefix {
+                    warn!(
+                        target: "ffs::mvcc::merge",
+                        proof = "AppendOnly",
+                        base_len = *base_len,
+                        "merge_proof_rejected: prefix mismatch (base region was modified)"
+                    );
                     return None;
                 }
                 let mut merged = latest.to_vec();
@@ -251,35 +207,6 @@ impl MergeProof {
     }
 }
 
-/// Validate an `AppendOnly` merge (base_len bounds + unchanged common prefix)
-/// without building the merged block. Shared by `merge_valid` (preflight) and
-/// `merge_bytes` (install) so the two can never diverge.
-fn append_only_merge_valid(base_len: usize, base: &[u8], latest: &[u8], staged: &[u8]) -> bool {
-    if base_len > base.len() || base_len > latest.len() || base_len > staged.len() {
-        warn!(
-            target: "ffs::mvcc::merge",
-            proof = "AppendOnly",
-            base_len,
-            actual_base = base.len(),
-            actual_latest = latest.len(),
-            actual_staged = staged.len(),
-            "merge_proof_rejected: base_len exceeds buffer size"
-        );
-        return false;
-    }
-    let prefix = &base[..base_len];
-    if latest[..base_len] != *prefix || staged[..base_len] != *prefix {
-        warn!(
-            target: "ffs::mvcc::merge",
-            proof = "AppendOnly",
-            base_len,
-            "merge_proof_rejected: prefix mismatch (base region was modified)"
-        );
-        return false;
-    }
-    true
-}
-
 /// Extract the variant name from a `MergeProof` for diagnostic logging.
 fn merge_proof_variant_name(proof: &MergeProof) -> &'static str {
     match proof {
@@ -292,18 +219,13 @@ fn merge_proof_variant_name(proof: &MergeProof) -> &'static str {
     }
 }
 
-/// Validate a range-overlay merge (`IndependentKeys` / `NonOverlappingExtents`
-/// / `TimestampOnlyInode`) WITHOUT building the merged block. Returns `true`
-/// iff [`merge_non_overlapping_ranges`] would return `Some`. Shared by
-/// `merge_valid` (preflight) and `merge_non_overlapping_ranges` (install) so the
-/// yes/no decision can never diverge from the materialized output.
-fn merge_non_overlapping_ranges_valid(
+fn merge_non_overlapping_ranges(
     touched_ranges: &[MergeByteRange],
     base: &[u8],
     latest: &[u8],
     staged: &[u8],
     proof: &MergeProof,
-) -> bool {
+) -> Option<Vec<u8>> {
     let variant = merge_proof_variant_name(proof);
     if latest.len() != base.len() || staged.len() != base.len() {
         warn!(
@@ -314,7 +236,7 @@ fn merge_non_overlapping_ranges_valid(
             staged_len = staged.len(),
             "merge_proof_rejected: buffer length mismatch"
         );
-        return false;
+        return None;
     }
     if !ranges_are_pairwise_disjoint(touched_ranges) {
         warn!(
@@ -323,10 +245,10 @@ fn merge_non_overlapping_ranges_valid(
             range_count = touched_ranges.len(),
             "merge_proof_rejected: touched ranges overlap"
         );
-        return false;
+        return None;
     }
 
-    // Every declared range must fit within the block before we slice it.
+    let mut expected_staged = base.to_vec();
     for range in touched_ranges {
         if range.end() > base.len() {
             warn!(
@@ -337,45 +259,25 @@ fn merge_non_overlapping_ranges_valid(
                 base_len = base.len(),
                 "merge_proof_rejected: range exceeds block size"
             );
-            return false;
+            return None;
         }
+        expected_staged[range.start..range.end()]
+            .copy_from_slice(&staged[range.start..range.end()]);
     }
 
-    // Strict validation: if the staged block modified ANYTHING outside the
-    // declared touched_ranges, the proof is invalid and we must abort. This is
-    // exactly `base`-with-staged-ranges-overlaid == `staged`, i.e. `staged`
-    // matches `base` in the *complement* of the touched ranges. Comparing the
-    // complement gaps directly avoids materializing a full-block `expected`
-    // buffer (one block-sized allocation + copy) on the contended merge path,
-    // which runs under the shard lock. The ranges are pairwise disjoint
-    // (checked above); sort by start so the gaps between them are well-formed
-    // (`ordered` is a stack SmallVec for the common single-range case).
-    let mut ordered: MergeByteRanges = touched_ranges.iter().copied().collect();
-    ordered.sort_unstable_by_key(|range| range.start);
-    let mut cursor = 0usize;
-    for range in &ordered {
-        if staged[cursor..range.start] != base[cursor..range.start] {
-            warn!(
-                target: "ffs::mvcc::merge",
-                proof_variant = %variant,
-                range_count = touched_ranges.len(),
-                "merge_proof_rejected: staged block modified bytes outside declared touched_ranges"
-            );
-            return false;
-        }
-        cursor = range.end();
-    }
-    if staged[cursor..] != base[cursor..] {
+    // Strict validation: if the staged block modified ANYTHING outside
+    // the declared touched_ranges, the proof is invalid and we must abort.
+    if expected_staged != staged {
         warn!(
             target: "ffs::mvcc::merge",
             proof_variant = %variant,
             range_count = touched_ranges.len(),
             "merge_proof_rejected: staged block modified bytes outside declared touched_ranges"
         );
-        return false;
+        return None;
     }
 
-    // True conflict: `latest` must not have modified any declared range vs base.
+    let mut merged = latest.to_vec();
     for range in touched_ranges {
         if latest[range.start..range.end()] != base[range.start..range.end()] {
             warn!(
@@ -385,24 +287,8 @@ fn merge_non_overlapping_ranges_valid(
                 range_end = range.end(),
                 "merge_proof_rejected: latest version modified the same byte range (true conflict)"
             );
-            return false;
+            return None;
         }
-    }
-    true
-}
-
-fn merge_non_overlapping_ranges(
-    touched_ranges: &[MergeByteRange],
-    base: &[u8],
-    latest: &[u8],
-    staged: &[u8],
-    proof: &MergeProof,
-) -> Option<Vec<u8>> {
-    if !merge_non_overlapping_ranges_valid(touched_ranges, base, latest, staged, proof) {
-        return None;
-    }
-    let mut merged = latest.to_vec();
-    for range in touched_ranges {
         merged[range.start..range.end()].copy_from_slice(&staged[range.start..range.end()]);
     }
     Some(merged)
@@ -457,73 +343,21 @@ pub(crate) fn newest_visible_index_by<T>(
         .checked_sub(1)
 }
 
-pub(crate) fn resolve_version_bytes_cow_at_or_before(
-    versions: &[BlockVersion],
-    visible_high: CommitSeq,
-) -> Option<std::borrow::Cow<'_, [u8]>> {
-    let idx = newest_visible_index(versions, visible_high)?;
-    compression::resolve_data_with(versions, idx, |version| &version.data)
-}
-
 pub(crate) fn resolve_version_bytes_at_or_before(
     versions: &[BlockVersion],
     visible_high: CommitSeq,
 ) -> Option<Vec<u8>> {
-    resolve_version_bytes_cow_at_or_before(versions, visible_high).map(std::borrow::Cow::into_owned)
+    let idx = newest_visible_index(versions, visible_high)?;
+    compression::resolve_data_with(versions, idx, |version| &version.data)
+        .map(std::borrow::Cow::into_owned)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StagedWrite {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) merge_proof: MergeProof,
-}
-
-type StagedWrites = SmallVec<[(BlockNumber, StagedWrite); 4]>;
-
-fn staged_write_pos(
-    staged_writes: &[(BlockNumber, StagedWrite)],
-    block: BlockNumber,
-) -> Result<usize, usize> {
-    staged_writes.binary_search_by_key(&block, |(candidate, _)| *candidate)
-}
-
-#[derive(Clone, Copy)]
-pub struct WriteSet<'a> {
-    staged_writes: &'a [(BlockNumber, StagedWrite)],
-}
-
-impl<'a> WriteSet<'a> {
-    #[must_use]
-    pub fn len(self) -> usize {
-        self.staged_writes.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(self) -> bool {
-        self.staged_writes.is_empty()
-    }
-
-    #[must_use]
-    pub fn contains_key(self, block: &BlockNumber) -> bool {
-        staged_write_pos(self.staged_writes, *block).is_ok()
-    }
-
-    #[must_use]
-    pub fn keys(self) -> impl DoubleEndedIterator<Item = &'a BlockNumber> + ExactSizeIterator + 'a {
-        self.staged_writes.iter().map(|(block, _)| block)
-    }
-
-    #[must_use]
-    fn key_span(self) -> Option<(BlockNumber, BlockNumber)> {
-        Some((self.staged_writes.first()?.0, self.staged_writes.last()?.0))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: TxnId,
     pub snapshot: Snapshot,
-    staged_writes: StagedWrites,
+    writes: BTreeMap<BlockNumber, Vec<u8>>,
+    merge_proofs: BTreeMap<BlockNumber, MergeProof>,
     /// Blocks read during the transaction's lifetime.  Each entry maps
     /// the block to the `CommitSeq` of the version that was read (or
     /// `CommitSeq(0)` if the block had no version at that snapshot).
@@ -541,71 +375,6 @@ pub struct Transaction {
     cow_orphans: BTreeSet<BlockNumber>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct TransactionSerde {
-    id: TxnId,
-    snapshot: Snapshot,
-    writes: BTreeMap<BlockNumber, Vec<u8>>,
-    #[serde(default)]
-    merge_proofs: BTreeMap<BlockNumber, MergeProof>,
-    reads: BTreeMap<BlockNumber, CommitSeq>,
-    cow_writes: BTreeMap<BlockNumber, CowRewriteIntent>,
-    cow_orphans: BTreeSet<BlockNumber>,
-}
-
-impl Serialize for Transaction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let writes = self
-            .staged_writes
-            .iter()
-            .map(|(block, staged)| (*block, staged.bytes.clone()))
-            .collect();
-        let merge_proofs = self
-            .staged_writes
-            .iter()
-            .map(|(block, staged)| (*block, staged.merge_proof.clone()))
-            .collect();
-        TransactionSerde {
-            id: self.id,
-            snapshot: self.snapshot,
-            writes,
-            merge_proofs,
-            reads: self.reads.clone(),
-            cow_writes: self.cow_writes.clone(),
-            cow_orphans: self.cow_orphans.clone(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Transaction {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let mut helper = TransactionSerde::deserialize(deserializer)?;
-        let staged_writes = helper
-            .writes
-            .into_iter()
-            .map(|(block, bytes)| {
-                let merge_proof = helper.merge_proofs.remove(&block).unwrap_or_default();
-                (block, StagedWrite { bytes, merge_proof })
-            })
-            .collect();
-        Ok(Self {
-            id: helper.id,
-            snapshot: helper.snapshot,
-            staged_writes,
-            reads: helper.reads,
-            cow_writes: helper.cow_writes,
-            cow_orphans: helper.cow_orphans,
-        })
-    }
-}
-
 impl Transaction {
     /// Create a new transaction at the given snapshot.
     #[must_use]
@@ -613,7 +382,8 @@ impl Transaction {
         Self {
             id,
             snapshot,
-            staged_writes: StagedWrites::new(),
+            writes: BTreeMap::new(),
+            merge_proofs: BTreeMap::new(),
             reads: BTreeMap::new(),
             cow_writes: BTreeMap::new(),
             cow_orphans: BTreeSet::new(),
@@ -642,14 +412,8 @@ impl Transaction {
         bytes: Vec<u8>,
         merge_proof: MergeProof,
     ) {
-        self.insert_staged_write(block, StagedWrite { bytes, merge_proof });
-    }
-
-    fn insert_staged_write(&mut self, block: BlockNumber, staged: StagedWrite) {
-        match staged_write_pos(&self.staged_writes, block) {
-            Ok(idx) => self.staged_writes[idx] = (block, staged),
-            Err(idx) => self.staged_writes.insert(idx, (block, staged)),
-        }
+        self.writes.insert(block, bytes);
+        self.merge_proofs.insert(block, merge_proof);
     }
 
     fn stage_cow_rewrite(
@@ -674,24 +438,18 @@ impl Transaction {
                 "cow_orphan_staged_for_free"
             );
         }
-        self.insert_staged_write(
-            logical,
-            StagedWrite {
-                bytes,
-                merge_proof: MergeProof::Unsafe,
-            },
-        );
+        self.writes.insert(logical, bytes);
+        self.merge_proofs.insert(logical, MergeProof::Unsafe);
     }
 
     #[must_use]
     pub fn staged_write(&self, block: BlockNumber) -> Option<&[u8]> {
-        let idx = staged_write_pos(&self.staged_writes, block).ok()?;
-        Some(self.staged_writes[idx].1.bytes.as_slice())
+        self.writes.get(&block).map(Vec::as_slice)
     }
 
     #[must_use]
     pub fn pending_writes(&self) -> usize {
-        self.staged_writes.len()
+        self.writes.len()
     }
 
     /// Record that `block` was read at version `version_seq`.
@@ -726,28 +484,30 @@ impl Transaction {
 
     /// The set of blocks this transaction will write.
     #[must_use]
-    pub fn write_set(&self) -> WriteSet<'_> {
-        WriteSet {
-            staged_writes: &self.staged_writes,
-        }
+    pub fn write_set(&self) -> &BTreeMap<BlockNumber, Vec<u8>> {
+        &self.writes
     }
 
     #[must_use]
     pub fn merge_proof(&self, block: BlockNumber) -> Option<&MergeProof> {
-        let idx = staged_write_pos(&self.staged_writes, block).ok()?;
-        Some(&self.staged_writes[idx].1.merge_proof)
+        self.merge_proofs.get(&block)
     }
 
-    pub(crate) fn into_staged_writes(self) -> StagedWrites {
+    pub(crate) fn into_writes_and_merge_proofs(
+        self,
+    ) -> (
+        BTreeMap<BlockNumber, Vec<u8>>,
+        BTreeMap<BlockNumber, MergeProof>,
+    ) {
         assert!(
             self.cow_writes.is_empty(),
-            "COW writes silently dropped by into_staged_writes"
+            "COW writes silently dropped by into_writes_and_merge_proofs"
         );
         assert!(
             self.cow_orphans.is_empty(),
-            "COW orphans silently dropped by into_staged_writes"
+            "COW orphans silently dropped by into_writes_and_merge_proofs"
         );
-        self.staged_writes
+        (self.writes, self.merge_proofs)
     }
 
     #[must_use]
@@ -890,18 +650,6 @@ impl SsiDangerousStructure {
     }
 }
 
-fn btree_map_key_span<V>(map: &BTreeMap<BlockNumber, V>) -> Option<(BlockNumber, BlockNumber)> {
-    Some((*map.first_key_value()?.0, *map.last_key_value()?.0))
-}
-
-fn btree_set_key_span(set: &BTreeSet<BlockNumber>) -> Option<(BlockNumber, BlockNumber)> {
-    Some((*set.first()?, *set.last()?))
-}
-
-fn key_in_span(key: BlockNumber, span: (BlockNumber, BlockNumber)) -> bool {
-    span.0 <= key && key <= span.1
-}
-
 fn ssi_incoming_edge(txn: &Transaction, record: &CommittedTxnRecord) -> Option<SsiRwEdge> {
     // rw-antidependency: a block the committed txn READ and we WRITE. This is a
     // set intersection of `record.read_set` and our `write_set`. Both are sorted
@@ -920,20 +668,13 @@ fn ssi_incoming_edge(txn: &Transaction, record: &CommittedTxnRecord) -> Option<S
         write_version: CommitSeq(0),
     };
     if write_set.len() < read_set.len() {
-        let read_span = btree_map_key_span(read_set)?;
-        write_set.keys().find_map(|&block| {
-            if key_in_span(block, read_span) {
-                read_set.get(&block).map(|&rv| mk(block, rv))
-            } else {
-                None
-            }
-        })
+        write_set
+            .keys()
+            .find_map(|&block| read_set.get(&block).map(|&rv| mk(block, rv)))
     } else {
-        let write_span = write_set.key_span()?;
-        read_set.iter().find_map(|(&block, &rv)| {
-            (key_in_span(block, write_span) && write_set.contains_key(&block))
-                .then(|| mk(block, rv))
-        })
+        read_set
+            .iter()
+            .find_map(|(&block, &rv)| write_set.contains_key(&block).then(|| mk(block, rv)))
     }
 }
 
@@ -952,19 +693,13 @@ fn ssi_outgoing_edge(txn: &Transaction, record: &CommittedTxnRecord) -> Option<S
         write_version: record.commit_seq,
     };
     if write_set.len() < read_set.len() {
-        let read_span = btree_map_key_span(read_set)?;
-        write_set.iter().find_map(|&block| {
-            if key_in_span(block, read_span) {
-                read_set.get(&block).map(|&rv| mk(block, rv))
-            } else {
-                None
-            }
-        })
+        write_set
+            .iter()
+            .find_map(|&block| read_set.get(&block).map(|&rv| mk(block, rv)))
     } else {
-        let write_span = btree_set_key_span(write_set)?;
-        read_set.iter().find_map(|(&block, &rv)| {
-            (key_in_span(block, write_span) && write_set.contains(&block)).then(|| mk(block, rv))
-        })
+        read_set
+            .iter()
+            .find_map(|(&block, &rv)| write_set.contains(&block).then(|| mk(block, rv)))
     }
 }
 
@@ -1614,8 +1349,8 @@ impl MvccEvidenceSink {
 pub struct MvccStore {
     pub(crate) next_txn: u64,
     pub(crate) next_commit: u64,
-    pub(crate) versions: FxHashMap<BlockNumber, Vec<BlockVersion>>,
-    pub(crate) physical_versions: FxHashMap<BlockNumber, Vec<PhysicalBlockVersion>>,
+    pub(crate) versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
+    pub(crate) physical_versions: BTreeMap<BlockNumber, Vec<PhysicalBlockVersion>>,
     /// Active snapshots: each entry is a `CommitSeq` from which a reader is
     /// still potentially reading.  The set uses a `BTreeMap` so that the
     /// minimum (oldest active snapshot) can be obtained in O(log n).
@@ -1673,8 +1408,8 @@ impl MvccStore {
         Self {
             next_txn: 1,
             next_commit: 1,
-            versions: FxHashMap::default(),
-            physical_versions: FxHashMap::default(),
+            versions: BTreeMap::new(),
+            physical_versions: BTreeMap::new(),
             active_snapshots: BTreeMap::new(),
             force_advanced_releases: BTreeMap::new(),
             ssi_log: Vec::new(),
@@ -1771,11 +1506,9 @@ impl MvccStore {
         for versions in self.versions.values() {
             for (idx, version) in versions.iter().enumerate() {
                 match &version.data {
-                    VersionData::Full(bytes) => {
-                        stats.full_versions += 1;
-                        stats.bytes_stored += bytes.len();
-                    }
-                    VersionData::Zstd(bytes) | VersionData::Brotli(bytes) => {
+                    VersionData::Full(bytes)
+                    | VersionData::Zstd(bytes)
+                    | VersionData::Brotli(bytes) => {
                         stats.full_versions += 1;
                         stats.bytes_stored += bytes.len();
                     }
@@ -1917,7 +1650,8 @@ impl MvccStore {
         let txn = Transaction {
             id: TxnId(self.next_txn),
             snapshot: self.current_snapshot(),
-            staged_writes: StagedWrites::new(),
+            writes: BTreeMap::new(),
+            merge_proofs: BTreeMap::new(),
             reads: BTreeMap::new(),
             cow_writes: BTreeMap::new(),
             cow_orphans: BTreeSet::new(),
@@ -2386,19 +2120,10 @@ impl MvccStore {
         self.apply_fcw_commit(txn)
     }
 
-    fn version_bytes_at(
-        &self,
-        block: BlockNumber,
-        visible_high: CommitSeq,
-    ) -> Option<std::borrow::Cow<'_, [u8]>> {
-        // Conflict-merge only reads these bytes (`merge_bytes(&base, &latest, ..)`),
-        // so return a borrow for the common uncompressed `Full` version instead of
-        // cloning it into a fresh Vec; compressed versions still own their
-        // decompressed bytes. Byte-identical; `&Cow` deref-coerces to `&[u8]`.
-        self.versions.get(&block).and_then(|versions| {
-            let idx = newest_visible_index(versions, visible_high)?;
-            compression::resolve_data_with(versions, idx, |v| &v.data)
-        })
+    fn version_bytes_at(&self, block: BlockNumber, visible_high: CommitSeq) -> Option<Vec<u8>> {
+        self.versions
+            .get(&block)
+            .and_then(|versions| resolve_version_bytes_at_or_before(versions, visible_high))
     }
 
     fn resolved_write_bytes(
@@ -2446,53 +2171,6 @@ impl MvccStore {
             })
     }
 
-    /// Preflight validity check mirroring [`Self::resolved_write_bytes_with_policy`]
-    /// but returning only a yes/no answer, WITHOUT building the merged block.
-    /// The FCW preflight discards the merged bytes (it merely gates the commit);
-    /// the install path (`resolved_write_bytes`) rebuilds them. Skipping the
-    /// merged-output allocation here removes one block-sized alloc + copy per
-    /// conflicting block on the contended commit path. Equivalent to
-    /// `resolved_write_bytes_with_policy(..).is_ok()` by construction
-    /// (`merge_valid == merge_bytes(..).is_some()`).
-    fn resolved_write_valid_with_policy(
-        &self,
-        txn: &Transaction,
-        block: BlockNumber,
-        effective: ConflictPolicy,
-    ) -> Result<(), CommitError> {
-        let staged = txn
-            .staged_write(block)
-            .ok_or_else(|| CommitError::DurabilityFailure {
-                detail: format!("write_set keys must have staged bytes: {block:?}"),
-            })?;
-        let observed = self.latest_commit_seq(block);
-        if observed <= txn.snapshot.high {
-            return Ok(());
-        }
-        if effective == ConflictPolicy::Strict {
-            return Err(CommitError::Conflict {
-                block,
-                snapshot: txn.snapshot.high,
-                observed,
-            });
-        }
-
-        let proof = txn.merge_proof(block).cloned().unwrap_or_default();
-        let base = self
-            .version_bytes_at(block, txn.snapshot.high)
-            .unwrap_or_default();
-        let latest = self.version_bytes_at(block, observed).unwrap_or_default();
-        if proof.merge_valid(&base, &latest, staged) {
-            Ok(())
-        } else {
-            Err(CommitError::Conflict {
-                block,
-                snapshot: txn.snapshot.high,
-                observed,
-            })
-        }
-    }
-
     /// Extract the short variant name from a `MergeProof`'s debug representation.
     fn merge_proof_variant_name(proof: &MergeProof) -> String {
         merge_proof_variant_name(proof).to_owned()
@@ -2528,7 +2206,7 @@ impl MvccStore {
         }
 
         if self
-            .resolved_write_valid_with_policy(txn, block, effective)
+            .resolved_write_bytes_with_policy(txn, block, effective)
             .is_ok()
         {
             let bytes_len = txn.staged_write(block).map_or(0, <[u8]>::len);
@@ -2588,27 +2266,19 @@ impl MvccStore {
 
         let chain_cap = self.compression_policy.max_chain_length;
         let prev_effective = self.effective_policy();
-        // Only Adaptive consumes the contention metrics (`effective_policy` reads
-        // them to select a strategy; no production caller reads them otherwise).
-        // Under a fixed policy (default SafeMerge) the per-commit `record_commit` +
-        // `select_policy` (2-3x/commit under Adaptive) + policy-switch/sample
-        // emissions are dead CPU — skip them. Sibling of the sharded-store gate
-        // (73174f5b). Merge telemetry (`mvcc_merge_applied`) stays ungated since
-        // merges also occur under SafeMerge.
-        let record_metrics = matches!(self.conflict_policy, ConflictPolicy::Adaptive);
         let mut had_conflict = false;
         let mut merge_succeeded = false;
         let mut merged_block_count: usize = 0;
         let mut combined_write_bytes: usize = 0;
         let mut merge_variants: BTreeSet<String> = BTreeSet::new();
 
-        for &block in txn.write_set().keys() {
-            let latest = self.latest_commit_seq(block);
+        for block in txn.writes.keys() {
+            let latest = self.latest_commit_seq(*block);
             if latest > txn.snapshot.high {
                 had_conflict = true;
                 let resolution_started = Instant::now();
                 let resolution =
-                    self.preflight_resolve_block_conflict(txn, block, latest, prev_effective);
+                    self.preflight_resolve_block_conflict(txn, *block, latest, prev_effective);
                 let resolution_latency_us =
                     u64::try_from(resolution_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 self.runtime_metrics
@@ -2621,52 +2291,45 @@ impl MvccStore {
                         merge_variants.insert(variant);
                     }
                     Err(err) => {
-                        if record_metrics {
-                            self.contention_metrics.record_commit(
-                                self.adaptive_config.ema_alpha,
-                                true,
-                                false,
-                                true,
-                            );
-                            self.contention_metrics.last_selected = Some(
-                                self.contention_metrics.select_policy(&self.adaptive_config),
-                            );
-                            self.maybe_emit_policy_switch(prev_effective);
-                        }
+                        self.contention_metrics.record_commit(
+                            self.adaptive_config.ema_alpha,
+                            true,
+                            false,
+                            true,
+                        );
+                        self.contention_metrics.last_selected =
+                            Some(self.contention_metrics.select_policy(&self.adaptive_config));
+                        self.maybe_emit_policy_switch(prev_effective);
                         return Err(err);
                     }
                 }
             }
             if let Some(cap) = chain_cap {
-                if let Err(err) = self.enforce_chain_pressure(txn.id, block, cap) {
+                if let Err(err) = self.enforce_chain_pressure(txn.id, *block, cap) {
                     // Chain backpressure abort — still record the commit attempt.
-                    if record_metrics {
-                        self.contention_metrics.record_commit(
-                            self.adaptive_config.ema_alpha,
-                            had_conflict,
-                            merge_succeeded,
-                            true,
-                        );
-                        self.contention_metrics.last_selected =
-                            Some(self.contention_metrics.select_policy(&self.adaptive_config));
-                    }
+                    self.contention_metrics.record_commit(
+                        self.adaptive_config.ema_alpha,
+                        had_conflict,
+                        merge_succeeded,
+                        true,
+                    );
+                    self.contention_metrics.last_selected =
+                        Some(self.contention_metrics.select_policy(&self.adaptive_config));
                     return Err(err);
                 }
             }
         }
 
         // Record successful preflight (no abort).
-        if record_metrics {
-            self.contention_metrics.record_commit(
-                self.adaptive_config.ema_alpha,
-                had_conflict,
-                merge_succeeded,
-                false,
-            );
-            // Update hysteresis state so the next select_policy call has a stable incumbent.
-            self.contention_metrics.last_selected =
-                Some(self.contention_metrics.select_policy(&self.adaptive_config));
-        }
+        self.contention_metrics.record_commit(
+            self.adaptive_config.ema_alpha,
+            had_conflict,
+            merge_succeeded,
+            false,
+        );
+        // Update hysteresis state so the next select_policy call has a stable incumbent.
+        self.contention_metrics.last_selected =
+            Some(self.contention_metrics.select_policy(&self.adaptive_config));
 
         // mvcc_merge_applied — emit after successful merge commit preflight.
         if merged_block_count > 0 {
@@ -2687,15 +2350,13 @@ impl MvccStore {
             );
         }
 
-        if record_metrics {
-            self.maybe_emit_policy_switch(prev_effective);
+        self.maybe_emit_policy_switch(prev_effective);
 
-            // Periodic contention sample (every 100 commits).
-            if self.contention_metrics.total_commits % 100 == 0
-                && self.contention_metrics.total_commits > 0
-            {
-                self.emit_contention_sample();
-            }
+        // Periodic contention sample (every 100 commits).
+        if self.contention_metrics.total_commits % 100 == 0
+            && self.contention_metrics.total_commits > 0
+        {
+            self.emit_contention_sample();
         }
 
         Ok(())
@@ -2721,54 +2382,10 @@ impl MvccStore {
             return Err((error, txn));
         }
 
-        // Resolve conflicts before moving staged writes out of the transaction.
-        // The common no-conflict path stays borrow-only until the commit is
-        // known to succeed, so aborts still return the original transaction
-        // while successful commits can move owned staged bytes into storage.
-        let snapshot_high = txn.snapshot.high;
-        let effective = self.effective_policy();
-        let mut merged_writes = BTreeMap::new();
-        for (block, staged) in &txn.staged_writes {
-            let block = *block;
-            let observed = self.latest_commit_seq(block);
-            if observed <= snapshot_high {
-                continue;
-            }
-            if effective == ConflictPolicy::Strict {
-                return Err((
-                    CommitError::Conflict {
-                        block,
-                        snapshot: snapshot_high,
-                        observed,
-                    },
-                    txn,
-                ));
-            }
-
-            let base = self
-                .version_bytes_at(block, snapshot_high)
-                .unwrap_or_default();
-            let latest = self.version_bytes_at(block, observed).unwrap_or_default();
-            match staged
-                .merge_proof
-                .merge_bytes(&base, &latest, &staged.bytes)
-            {
-                Some(merged) => {
-                    merged_writes.insert(block, merged);
-                }
-                None => {
-                    return Err((
-                        CommitError::Conflict {
-                            block,
-                            snapshot: snapshot_high,
-                            observed,
-                        },
-                        txn,
-                    ));
-                }
-            }
-        }
-
+        let resolved_writes = match self.resolved_writes_for_commit(&txn) {
+            Ok(writes) => writes,
+            Err(error) => return Err((error, txn)),
+        };
         let commit_seq = match self.next_commit_seq() {
             Ok(seq) => seq,
             Err(error) => return Err((error, txn)),
@@ -2776,27 +2393,21 @@ impl MvccStore {
         let chain_cap = self.compression_policy.max_chain_length;
         let Transaction {
             id: txn_id,
-            staged_writes,
+            snapshot: _,
+            writes: _,
+            merge_proofs: _,
+            reads: _,
             cow_writes,
             cow_orphans,
-            ..
         } = txn;
         let dedup_enabled = self.compression_policy.dedup_identical;
-        let store_full = matches!(self.compression_policy.algo, CompressionAlgo::None);
 
-        for (block, staged) in staged_writes {
-            let version_bytes = merged_writes.remove(&block).unwrap_or(staged.bytes);
-            // Move the owned bytes straight into `Full` for the no-compression
-            // store (the prior path re-`to_vec`d them in `compress_data`). Dedup
-            // and non-`None` compression keep their existing output.
-            let version_data =
-                if dedup_enabled && self.is_identical_to_latest(block, &version_bytes) {
-                    VersionData::Identical
-                } else if store_full {
-                    VersionData::full(version_bytes)
-                } else {
-                    self.compress_data(&version_bytes)
-                };
+        for (block, version_bytes) in resolved_writes {
+            let version_data = if dedup_enabled {
+                self.maybe_dedup(block, &version_bytes)
+            } else {
+                self.compress_data(&version_bytes)
+            };
 
             self.versions.entry(block).or_default().push(BlockVersion {
                 block,
@@ -2822,65 +2433,9 @@ impl MvccStore {
                 self.enforce_physical_chain_cap(block, cap);
             }
         }
-        debug_assert!(merged_writes.is_empty());
 
         let deferred = Self::collect_cow_deferred_frees(&cow_writes, cow_orphans);
         Ok((commit_seq, deferred))
-    }
-
-    /// Whether `bytes` is byte-identical to the latest committed version of
-    /// `block` — the dedup-`Identical` predicate, factored out of `maybe_dedup`
-    /// so the commit apply path can test it without re-`to_vec`ing the data.
-    fn is_identical_to_latest(&self, block: BlockNumber, bytes: &[u8]) -> bool {
-        let Some(versions) = self.versions.get(&block) else {
-            return false;
-        };
-        if versions.is_empty() {
-            return false;
-        }
-        compression::resolve_data_with(versions, versions.len() - 1, |v| &v.data)
-            .is_some_and(|existing| existing.as_ref() == bytes)
-    }
-
-    #[inline]
-    fn merged_writes_after_preflight(
-        &self,
-        txn: &Transaction,
-    ) -> Result<BTreeMap<BlockNumber, Vec<u8>>, CommitError> {
-        let snapshot_high = txn.snapshot.high;
-        let effective = self.effective_policy();
-        let mut merged_writes = BTreeMap::new();
-        for (block, staged) in &txn.staged_writes {
-            let block = *block;
-            let observed = self.latest_commit_seq(block);
-            if observed <= snapshot_high {
-                continue;
-            }
-            if effective == ConflictPolicy::Strict {
-                return Err(CommitError::Conflict {
-                    block,
-                    snapshot: snapshot_high,
-                    observed,
-                });
-            }
-
-            let base = self
-                .version_bytes_at(block, snapshot_high)
-                .unwrap_or_default();
-            let latest = self.version_bytes_at(block, observed).unwrap_or_default();
-            let Some(merged) = staged
-                .merge_proof
-                .merge_bytes(&base, &latest, &staged.bytes)
-            else {
-                return Err(CommitError::Conflict {
-                    block,
-                    snapshot: snapshot_high,
-                    observed,
-                });
-            };
-            merged_writes.insert(block, merged);
-        }
-        Ok(merged_writes)
     }
 
     #[allow(clippy::result_large_err)]
@@ -2898,11 +2453,11 @@ impl MvccStore {
             Err(e) => return Err((e, txn)),
         };
 
-        let mut merged_writes = match self.merged_writes_after_preflight(&txn) {
+        let resolved_writes = match self.resolved_writes_for_commit(&txn) {
             Ok(writes) => writes,
             Err(error) => return Err((error, txn)),
         };
-
+        let write_keys: BTreeSet<BlockNumber> = txn.write_set().keys().copied().collect();
         let commit_seq = match self.next_commit_seq() {
             Ok(seq) => seq,
             Err(error) => return Err((error, txn)),
@@ -2911,31 +2466,20 @@ impl MvccStore {
         let Transaction {
             id: txn_id,
             snapshot,
-            staged_writes,
+            writes: _,
+            merge_proofs: _,
             reads,
             cow_writes,
             cow_orphans,
         } = txn;
         let dedup_enabled = self.compression_policy.dedup_identical;
-        let store_full = matches!(self.compression_policy.algo, CompressionAlgo::None);
-        let write_keys: BTreeSet<BlockNumber> =
-            staged_writes.iter().map(|(block, _)| *block).collect();
 
-        for (block, staged) in staged_writes {
-            let version_bytes = merged_writes.remove(&block).unwrap_or(staged.bytes);
-            let version_data =
-                if dedup_enabled && self.is_identical_to_latest(block, &version_bytes) {
-                    trace!(
-                        block = block.0,
-                        bytes_saved = version_bytes.len(),
-                        "version_dedup: identical to previous"
-                    );
-                    VersionData::Identical
-                } else if store_full {
-                    VersionData::full(version_bytes)
-                } else {
-                    self.compress_data(&version_bytes)
-                };
+        for (block, version_bytes) in resolved_writes {
+            let version_data = if dedup_enabled {
+                self.maybe_dedup(block, &version_bytes)
+            } else {
+                self.compress_data(&version_bytes)
+            };
 
             self.versions.entry(block).or_default().push(BlockVersion {
                 block,
@@ -2961,7 +2505,6 @@ impl MvccStore {
                 self.enforce_physical_chain_cap(block, cap);
             }
         }
-        debug_assert!(merged_writes.is_empty());
 
         let read_set_size = reads.len();
         let write_set_size = write_keys.len();
@@ -3013,14 +2556,14 @@ impl MvccStore {
 
     pub(crate) fn compress_data(&self, new_bytes: &[u8]) -> VersionData {
         match self.compression_policy.algo {
-            compression::CompressionAlgo::None => VersionData::full(new_bytes.to_vec()),
+            compression::CompressionAlgo::None => VersionData::Full(new_bytes.to_vec()),
             compression::CompressionAlgo::Zstd { level } => {
                 if let Ok(compressed) = zstd::encode_all(new_bytes, level)
                     && compressed.len() < new_bytes.len()
                 {
                     return VersionData::Zstd(compressed);
                 }
-                VersionData::full(new_bytes.to_vec())
+                VersionData::Full(new_bytes.to_vec())
             }
             compression::CompressionAlgo::Brotli { level } => {
                 let mut compressed = Vec::new();
@@ -3035,7 +2578,7 @@ impl MvccStore {
                 {
                     return VersionData::Brotli(compressed);
                 }
-                VersionData::full(new_bytes.to_vec())
+                VersionData::Full(new_bytes.to_vec())
             }
         }
     }
@@ -3071,7 +2614,7 @@ impl MvccStore {
             target: "ffs::ssi",
             txn_id = txn.id.0,
             read_set_size = txn.reads.len(),
-            write_set_size = txn.staged_writes.len(),
+            write_set_size = txn.writes.len(),
             checks_performed,
             "ssi_two_edge_check_clean"
         );
@@ -3139,6 +2682,7 @@ impl MvccStore {
             let new_watermark = self
                 .watermark()
                 .unwrap_or_else(|| self.current_snapshot().high);
+            let versions_eligible = self.versions_eligible_at_watermark(new_watermark);
             info!(
                 target: "ffs::mvcc::gc",
                 block = block.0,
@@ -3147,24 +2691,14 @@ impl MvccStore {
                 new_watermark = new_watermark.0,
                 "chain_pressure_force_advance_oldest_snapshot"
             );
-            // Same O(tracked_blocks) evidence-only scan as the release_snapshot
-            // path — gate on a real `enabled!` check so it never runs when the
-            // evidence target is disabled (a lazy field expr is insufficient
-            // under the dynamic EnvFilter; see the note in `release_snapshot`).
-            // Gated at DEBUG, not INFO: the default `info` filter must NOT pay
-            // this per-commit O(tracked_blocks) scan (it was ~46% of delete CPU
-            // under the default filter). Enable explicitly with
-            // `RUST_LOG=ffs::mvcc::evidence=debug` for the diagnostic.
-            if tracing::enabled!(target: "ffs::mvcc::evidence", tracing::Level::DEBUG) {
-                debug!(
-                    target: "ffs::mvcc::evidence",
-                    event = "snapshot_advanced",
-                    old_commit_seq = forced_snapshot.0,
-                    new_commit_seq = new_watermark.0,
-                    versions_eligible = self.versions_eligible_at_watermark(new_watermark),
-                    trigger = "chain_pressure"
-                );
-            }
+            info!(
+                target: "ffs::mvcc::evidence",
+                event = "snapshot_advanced",
+                old_commit_seq = forced_snapshot.0,
+                new_commit_seq = new_watermark.0,
+                versions_eligible,
+                trigger = "chain_pressure"
+            );
             if !self.chain_trim_blocked_by_snapshot(block, new_watermark) {
                 return Ok(());
             }
@@ -3306,7 +2840,7 @@ impl MvccStore {
                 compression::resolve_data_with(versions, keep_from, |v| &v.data)
             {
                 let full_data = full_data.into_owned();
-                versions[keep_from].data = VersionData::full(full_data);
+                versions[keep_from].data = VersionData::Full(full_data);
             }
         }
     }
@@ -3367,18 +2901,6 @@ impl MvccStore {
         self.versions.get(&block).and_then(|versions| {
             let idx = newest_visible_index(versions, snapshot.high)?;
             compression::resolve_data_with(versions, idx, |v| &v.data)
-        })
-    }
-
-    #[must_use]
-    pub fn read_visible_block_buf(
-        &self,
-        block: BlockNumber,
-        snapshot: Snapshot,
-    ) -> Option<BlockBuf> {
-        self.versions.get(&block).and_then(|versions| {
-            let idx = newest_visible_index(versions, snapshot.high)?;
-            compression::resolve_block_buf_with(versions, idx, |v| &v.data)
         })
     }
 
@@ -3454,22 +2976,17 @@ impl MvccStore {
         let snapshot = self.current_snapshot();
         let mut flushed = 0usize;
 
-        // `versions` is an FxHashMap (bd-mvccmap: O(1) commit/read entry vs the
-        // old BTreeMap's O(log N)), so collect + sort the blocks here to restore
-        // ASCENDING order before coalescing — flush is once per sync, so this one
-        // O(N log N) sort is amortized over many O(1) per-op commits. Then
-        // coalesce maximal runs of contiguous blocks and write each run with a
-        // single `write_contiguous_blocks` (one ranged device write) instead of
-        // one `write_block` per block. Bytes/locations identical to the scalar
-        // path (bd-ryqep), so the on-disk state is unchanged.
+        // `versions` is a BTreeMap, so this iterates in ascending block order.
+        // Coalesce maximal runs of contiguous blocks and write each run with a
+        // single `write_contiguous_blocks` (one ranged device write for a
+        // byte-backed device) instead of one `write_block` per block. The bytes
+        // and locations are identical to the scalar path, so the final on-disk
+        // state is unchanged (bd-ryqep).
         let mut run_start: Option<BlockNumber> = None;
         let mut run_next: u64 = 0; // next block number that would continue the run
         let mut run_buf: Vec<u8> = Vec::new();
 
-        let mut sorted_versions: Vec<(&BlockNumber, &Vec<BlockVersion>)> =
-            self.versions.iter().collect();
-        sorted_versions.sort_unstable_by_key(|(block, _)| **block);
-        for (block, versions) in sorted_versions {
+        for (block, versions) in &self.versions {
             // Binary-search the newest visible version instead of an O(n) reverse
             // linear scan; identical index for an ascending-ordered chain.
             let Some(idx) = newest_visible_index(versions, snapshot.high) else {
@@ -3618,29 +3135,14 @@ impl MvccStore {
                 let new_watermark = self
                     .watermark()
                     .unwrap_or_else(|| self.current_snapshot().high);
-                // `versions_eligible_at_watermark` is an O(tracked_blocks) scan
-                // of every version chain, and it feeds ONLY this evidence log
-                // field. It MUST be skipped when the evidence target is
-                // disabled. A lazy `info!` field expression is NOT enough: the
-                // `fmt`+`EnvFilter` subscriber registers the callsite as
-                // `Interest::sometimes`, so tracing evaluates the field then
-                // filters at runtime — the full scan still ran on EVERY write
-                // commit (71% of write-path self-time; ~5x slower 4 KiB writes).
-                // Gate on a real runtime `enabled!` check so the scan only runs
-                // when a subscriber will actually record the event. Gated at
-                // DEBUG, not INFO: the default `info` filter must NOT pay this
-                // per-commit O(tracked_blocks) scan (it dominated write- and
-                // delete-commit CPU under the default filter). Enable with
-                // `RUST_LOG=ffs::mvcc::evidence=debug` for the diagnostic.
-                if new_watermark.0 > old_commit_seq
-                    && tracing::enabled!(target: "ffs::mvcc::evidence", tracing::Level::DEBUG)
-                {
-                    debug!(
+                if new_watermark.0 > old_commit_seq {
+                    let versions_eligible = self.versions_eligible_at_watermark(new_watermark);
+                    info!(
                         target: "ffs::mvcc::evidence",
                         event = "snapshot_advanced",
                         old_commit_seq,
                         new_commit_seq = new_watermark.0,
-                        versions_eligible = self.versions_eligible_at_watermark(new_watermark),
+                        versions_eligible,
                         trigger = "release_snapshot"
                     );
                 }
@@ -3697,37 +3199,26 @@ impl MvccStore {
     ///
     /// Returns the watermark that was used.
     pub fn prune_safe(&mut self) -> CommitSeq {
+        let old_count = self.version_count();
         let wm = self
             .watermark()
             .unwrap_or_else(|| self.current_snapshot().high);
-        // `version_count()` is an O(tracked_blocks) scan, and it runs TWICE here
-        // (before + after) ONLY to compute `freed`/`remaining` for the debug
-        // trace below. Same disabled-log O(N) antipattern as the per-commit scan
-        // fixed in the write path (b1619f0b): gate both scans behind a real
-        // `enabled!` check so they never run when the gc logs are off (a lazy
-        // field expr is insufficient under the dynamic EnvFilter). Enabling
-        // TRACE implies DEBUG, so the DEBUG check covers both branches. The
-        // actual pruning (`prune_versions_older_than`) always runs.
-        let log_counts = tracing::enabled!(tracing::Level::DEBUG);
-        let old_count = if log_counts { self.version_count() } else { 0 };
         self.prune_versions_older_than(wm);
-        if log_counts {
-            let new_count = self.version_count();
-            let freed = old_count.saturating_sub(new_count);
-            if freed > 0 {
-                debug!(
-                    watermark = wm.0,
-                    versions_freed = freed,
-                    versions_remaining = new_count,
-                    "watermark_advance: pruned old versions"
-                );
-            } else {
-                trace!(
-                    watermark = wm.0,
-                    versions_count = new_count,
-                    "gc_eligible: no versions to prune"
-                );
-            }
+        let new_count = self.version_count();
+        let freed = old_count.saturating_sub(new_count);
+        if freed > 0 {
+            debug!(
+                watermark = wm.0,
+                versions_freed = freed,
+                versions_remaining = new_count,
+                "watermark_advance: pruned old versions"
+            );
+        } else {
+            trace!(
+                watermark = wm.0,
+                versions_count = new_count,
+                "gc_eligible: no versions to prune"
+            );
         }
         if !self.active_snapshots.is_empty() {
             trace!(
@@ -4220,12 +3711,6 @@ enum SnapshotOwnership {
     Inline { snapshot: Snapshot },
     /// Snapshot managed by a SnapshotHandle (RAII, auto-released on drop).
     Handle { handle: SnapshotHandle },
-    /// Snapshot NOT registered on the store (bd-eflng). Used by read-only
-    /// adapters where no writes occur, so no version is ever pruned and the
-    /// active-snapshot ref-counting is pure overhead. Registering/releasing it
-    /// would take the store *write* lock on every adapter construction/drop,
-    /// serializing concurrent readers. Drop does nothing.
-    Unregistered { snapshot: Snapshot },
 }
 
 #[derive(Debug)]
@@ -4257,22 +3742,6 @@ impl<D: BlockDevice> MvccBlockDevice<D> {
             base,
             store,
             ownership: SnapshotOwnership::Inline { snapshot },
-            read_your_writes: false,
-        }
-    }
-
-    /// Construct a read-only adapter that does NOT register its snapshot on the
-    /// store (bd-eflng). Safe only for immutable/read-only filesystem views:
-    /// registration exists to hold back version pruning for live readers, but
-    /// with no writers nothing is ever pruned, and no MVCC overlay version can
-    /// become visible. Reads therefore go straight to the base device instead of
-    /// taking a store read lock for a guaranteed-miss overlay probe.
-    #[must_use]
-    pub fn new_unregistered(base: D, store: Arc<RwLock<MvccStore>>, snapshot: Snapshot) -> Self {
-        Self {
-            base,
-            store,
-            ownership: SnapshotOwnership::Unregistered { snapshot },
             read_your_writes: false,
         }
     }
@@ -4311,8 +3780,7 @@ impl<D: BlockDevice> MvccBlockDevice<D> {
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         match &self.ownership {
-            SnapshotOwnership::Inline { snapshot }
-            | SnapshotOwnership::Unregistered { snapshot } => *snapshot,
+            SnapshotOwnership::Inline { snapshot } => *snapshot,
             SnapshotOwnership::Handle { handle } => handle.snapshot(),
         }
     }
@@ -4325,13 +3793,6 @@ impl<D: BlockDevice> MvccBlockDevice<D> {
         } else {
             self.snapshot()
         }
-    }
-
-    /// Unregistered devices are used only for immutable/read-only filesystem
-    /// views: no writer can create MVCC overlay versions, so every overlay probe
-    /// is a guaranteed miss. Treat that mode as a direct base-device view.
-    fn reads_base_directly(&self) -> bool {
-        matches!(&self.ownership, SnapshotOwnership::Unregistered { .. }) && !self.read_your_writes
     }
 
     /// Shared reference to the MVCC store.
@@ -4357,8 +3818,8 @@ impl<D: BlockDevice> Drop for MvccBlockDevice<D> {
                     "mvcc snapshot was not registered or already released: {snapshot:?}"
                 );
             }
-            SnapshotOwnership::Unregistered { .. } | SnapshotOwnership::Handle { .. } => {
-                // No inline registration was acquired here.
+            SnapshotOwnership::Handle { .. } => {
+                // SnapshotHandle's own Drop handles release.
             }
         }
     }
@@ -4366,19 +3827,12 @@ impl<D: BlockDevice> Drop for MvccBlockDevice<D> {
 
 impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> ffs_error::Result<BlockBuf> {
-        if self.reads_base_directly() {
-            return self.base.read_block(cx, block);
-        }
-
         let snap = self.read_snapshot();
         // Check version store first (shared lock, no I/O).
         {
             let guard = self.store.read();
-            if let Some(buf) = guard.read_visible_block_buf(block, snap) {
-                // Full uncompressed versions now share the stored aligned block
-                // buffer (`Arc::clone`), while compressed versions still
-                // materialize exactly the decompressed bytes into a fresh buffer.
-                return Ok(buf);
+            if let Some(bytes) = guard.read_visible(block, snap) {
+                return Ok(BlockBuf::new(bytes.to_vec()));
             }
         }
         // Fall back to base device (no lock held).
@@ -4405,9 +3859,6 @@ impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
             .0
             .checked_add(count)
             .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
-        if self.reads_base_directly() {
-            return self.base.read_contiguous_blocks(cx, start, bufs);
-        }
         let snap = self.read_snapshot();
 
         // Single pass under one read guard at a single snapshot: capture the
@@ -4416,15 +3867,15 @@ impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
         // the whole range (rather than re-fetching per block as the prior
         // per-block `read_block` loop did) also keeps the contiguous read
         // internally consistent under `read_your_writes`.
-        let mut visible: Vec<Option<BlockBuf>> = Vec::with_capacity(bufs.len());
+        let mut visible: Vec<Option<Vec<u8>>> = Vec::with_capacity(bufs.len());
         let mut any_visible = false;
         {
             let guard = self.store.read();
             for delta in 0..count {
                 let block = BlockNumber(start.0 + delta);
-                match guard.read_visible_block_buf(block, snap) {
-                    Some(buf) => {
-                        visible.push(Some(buf));
+                match guard.read_visible(block, snap) {
+                    Some(bytes) => {
+                        visible.push(Some(bytes.into_owned()));
                         any_visible = true;
                     }
                     None => visible.push(None),
@@ -4443,8 +3894,8 @@ impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
         // block. Per-block bytes are identical to the prior path.
         let mut idx = 0usize;
         while idx < bufs.len() {
-            if let Some(buf) = visible[idx].take() {
-                bufs[idx] = buf;
+            if let Some(bytes) = visible[idx].take() {
+                bufs[idx] = BlockBuf::new(bytes);
                 idx += 1;
                 continue;
             }
@@ -4459,88 +3910,7 @@ impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
         Ok(())
     }
 
-    fn read_contiguous_into(
-        &self,
-        cx: &Cx,
-        start: BlockNumber,
-        dst: &mut [u8],
-    ) -> ffs_error::Result<()> {
-        let bs = self.block_size() as usize;
-        if bs == 0 || dst.len() % bs != 0 {
-            return Err(FfsError::Format(
-                "read_contiguous_into: dst length must be a multiple of block size".to_owned(),
-            ));
-        }
-        if dst.is_empty() {
-            return Ok(());
-        }
-        let count = dst.len() / bs;
-        let count_u64 = u64::try_from(count)
-            .map_err(|_| FfsError::Format("block range exceeds u64".to_owned()))?;
-        start
-            .0
-            .checked_add(count_u64)
-            .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
-        if self.reads_base_directly() {
-            return self.base.read_contiguous_into(cx, start, dst);
-        }
-        let snap = self.read_snapshot();
-
-        // Capture MVCC-visible blocks once under a single read guard at one
-        // snapshot (mirrors `read_contiguous_blocks`), then read the remaining
-        // base-resident gaps directly into the matching `dst` sub-slices.
-        let mut visible: Vec<Option<BlockBuf>> = Vec::with_capacity(count);
-        let mut any_visible = false;
-        {
-            let guard = self.store.read();
-            for delta in 0..count_u64 {
-                let block = BlockNumber(start.0 + delta);
-                match guard.read_visible_block_buf(block, snap) {
-                    Some(buf) => {
-                        visible.push(Some(buf));
-                        any_visible = true;
-                    }
-                    None => visible.push(None),
-                }
-            }
-        }
-
-        // Fast path: nothing overlaid — one ranged base read straight into dst.
-        if !any_visible {
-            return self.base.read_contiguous_into(cx, start, dst);
-        }
-
-        let n = count;
-        let mut idx = 0usize;
-        while idx < n {
-            if let Some(buf) = visible[idx].take() {
-                dst[idx * bs..(idx + 1) * bs].copy_from_slice(buf.as_slice());
-                idx += 1;
-                continue;
-            }
-            let run_start = idx;
-            while idx < n && visible[idx].is_none() {
-                idx += 1;
-            }
-            let run_start_u64 = u64::try_from(run_start)
-                .map_err(|_| FfsError::Format("block range exceeds u64".to_owned()))?;
-            let run_block_start = BlockNumber(start.0 + run_start_u64);
-            self.base.read_contiguous_into(
-                cx,
-                run_block_start,
-                &mut dst[run_start * bs..idx * bs],
-            )?;
-        }
-        Ok(())
-    }
-
     fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> ffs_error::Result<()> {
-        if self.reads_base_directly() {
-            return Err(FfsError::UnsupportedFeature(
-                "unregistered MVCC block device is read-only".to_owned(),
-            ));
-        }
-
         // Stage into a new single-block transaction and commit immediately.
         // For batched writes, callers should use the MvccStore API directly.
         let mut guard = self.store.write();
@@ -4611,17 +3981,11 @@ mod tests {
             let high = next() % (cur + 4); // span below, within, and above the chain
             let bin = newest_visible_index_by(&seqs, CommitSeq(high), |s| CommitSeq(*s));
             let reff = reference(&seqs, high);
-            assert_eq!(
-                bin, reff,
-                "binary != reverse-scan for chain {seqs:?} high {high}"
-            );
+            assert_eq!(bin, reff, "binary != reverse-scan for chain {seqs:?} high {high}");
             fold(bin.map_or(u64::MAX, |i| i as u64), &mut digest);
             fold(high, &mut digest);
         }
-        assert_eq!(
-            digest, 17_052_713_067_055_689_022,
-            "golden visibility-index digest changed"
-        );
+        assert_eq!(digest, 17_052_713_067_055_689_022, "golden visibility-index digest changed");
     }
 
     /// Simple in-memory block device for testing `MvccBlockDevice`.
@@ -4888,24 +4252,6 @@ mod tests {
             }
             Ok(())
         }
-        fn read_contiguous_into(
-            &self,
-            _cx: &Cx,
-            start: BlockNumber,
-            dst: &mut [u8],
-        ) -> ffs_error::Result<()> {
-            let bs = self.block_size as usize;
-            if bs == 0 || dst.len() % bs != 0 {
-                return Err(ffs_error::FfsError::Format(
-                    "test read_contiguous_into requires whole blocks".to_owned(),
-                ));
-            }
-            self.ranged_runs.write().push(dst.len() / bs);
-            for (i, chunk) in dst.chunks_mut(bs).enumerate() {
-                chunk.copy_from_slice(&self.one(BlockNumber(start.0 + i as u64)));
-            }
-            Ok(())
-        }
         fn block_size(&self) -> u32 {
             self.block_size
         }
@@ -4932,21 +4278,13 @@ mod tests {
 
         let base = ReadRunCountingDevice::new(BS, N);
         for b in 0..N {
-            base.write_block(
-                &cx,
-                BlockNumber(b),
-                &vec![u8::try_from(b % 251).unwrap(); BS as usize],
-            )
-            .expect("seed base");
+            base.write_block(&cx, BlockNumber(b), &vec![u8::try_from(b % 251).unwrap(); BS as usize])
+                .expect("seed base");
         }
 
         // Overlay exactly one block in the MVCC store with distinct bytes.
         let store = Arc::new(RwLock::new(MvccStore::new()));
-        seed_block(
-            &mut store.write(),
-            BlockNumber(OVERLAY),
-            &vec![0xEE; BS as usize],
-        );
+        seed_block(&mut store.write(), BlockNumber(OVERLAY), &vec![0xEE; BS as usize]);
         let snap = store.read().current_snapshot();
         let dev = MvccBlockDevice::new(base, Arc::clone(&store), snap);
 
@@ -4954,23 +4292,15 @@ mod tests {
         let old_bufs: Vec<BlockBuf> = (0..N)
             .map(|i| dev.read_block(&cx, BlockNumber(i)).expect("read"))
             .collect();
-        let old_scalar = dev
-            .base()
-            .scalar_reads
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let old_scalar = dev.base().scalar_reads.load(std::sync::atomic::Ordering::SeqCst);
 
         // New: single contiguous read.
         dev.base().reset();
-        let mut new_bufs: Vec<BlockBuf> = (0..N)
-            .map(|_| BlockBuf::new(vec![0_u8; BS as usize]))
-            .collect();
+        let mut new_bufs: Vec<BlockBuf> = (0..N).map(|_| BlockBuf::new(vec![0_u8; BS as usize])).collect();
         dev.read_contiguous_blocks(&cx, BlockNumber(0), &mut new_bufs)
             .expect("contiguous read");
         let new_ranged = dev.base().ranged_runs.read().len();
-        let new_scalar = dev
-            .base()
-            .scalar_reads
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let new_scalar = dev.base().scalar_reads.load(std::sync::atomic::Ordering::SeqCst);
 
         // ISOMORPHISM: byte-identical per-block, including the overlaid block.
         for i in 0..new_bufs.len() {
@@ -4990,16 +4320,14 @@ mod tests {
         }
         let golden = hex_lower(&hasher.finalize());
         assert_eq!(
-            golden, "6631d26c4e6e0d7f6f0414c59844ae2afcca85b291177918dabba0ccf8fbd9ca",
+            golden,
+            "6631d26c4e6e0d7f6f0414c59844ae2afcca85b291177918dabba0ccf8fbd9ca",
             "golden contiguous-read digest changed"
         );
 
         // SCORE: 63 scalar base reads (one per gap block) → 2 ranged reads
         // (the gap runs either side of the overlaid block).
-        assert_eq!(
-            old_scalar, 63,
-            "prior path: one scalar base read per gap block"
-        );
+        assert_eq!(old_scalar, 63, "prior path: one scalar base read per gap block");
         assert_eq!(new_ranged, 2, "two maximal gap runs around the overlay");
         assert_eq!(new_scalar, 0, "no scalar base reads on the coalesced path");
         let read_op_ratio = old_scalar as f64 / new_ranged as f64;
@@ -5007,84 +4335,6 @@ mod tests {
             read_op_ratio >= 2.0,
             "Score {read_op_ratio} must clear 2.0 (got {old_scalar} -> {new_ranged})"
         );
-    }
-
-    #[test]
-    fn mvcc_contiguous_read_into_coalesces_base_gaps_score() {
-        use sha2::{Digest, Sha256};
-        const BS: u32 = 512;
-        const N: u64 = 64;
-        const OVERLAY: u64 = 32;
-        let cx = test_cx();
-        let block_count = usize::try_from(N).expect("test block count fits usize");
-        let block_size = BS as usize;
-
-        let base = ReadRunCountingDevice::new(BS, N);
-        for b in 0..N {
-            base.write_block(
-                &cx,
-                BlockNumber(b),
-                &vec![u8::try_from(b % 251).unwrap(); block_size],
-            )
-            .expect("seed base");
-        }
-
-        let store = Arc::new(RwLock::new(MvccStore::new()));
-        seed_block(
-            &mut store.write(),
-            BlockNumber(OVERLAY),
-            &vec![0xEE; block_size],
-        );
-        let snap = store.read().current_snapshot();
-        let dev = MvccBlockDevice::new(base, Arc::clone(&store), snap);
-
-        let old_bufs: Vec<BlockBuf> = (0..N)
-            .map(|i| dev.read_block(&cx, BlockNumber(i)).expect("read"))
-            .collect();
-        let old_scalar = dev
-            .base()
-            .scalar_reads
-            .load(std::sync::atomic::Ordering::SeqCst);
-
-        dev.base().reset();
-        let mut out = vec![0_u8; block_count * block_size];
-        dev.read_contiguous_into(&cx, BlockNumber(0), &mut out)
-            .expect("contiguous read into");
-        let new_ranged = dev.base().ranged_runs.read().len();
-        let new_scalar = dev
-            .base()
-            .scalar_reads
-            .load(std::sync::atomic::Ordering::SeqCst);
-
-        for (i, expected) in old_bufs.iter().enumerate() {
-            let start = i * block_size;
-            assert_eq!(
-                expected.as_slice(),
-                &out[start..start + block_size],
-                "block {i} bytes diverged"
-            );
-        }
-        let overlay_start =
-            usize::try_from(OVERLAY).expect("overlay index fits usize") * block_size;
-        assert_eq!(
-            &out[overlay_start..overlay_start + block_size],
-            &[0xEE; BS as usize]
-        );
-
-        let mut hasher = Sha256::new();
-        hasher.update(&out);
-        let golden = hex_lower(&hasher.finalize());
-        assert_eq!(
-            golden, "6631d26c4e6e0d7f6f0414c59844ae2afcca85b291177918dabba0ccf8fbd9ca",
-            "golden contiguous-read-into digest changed"
-        );
-
-        assert_eq!(
-            old_scalar, 63,
-            "prior path: one scalar base read per gap block"
-        );
-        assert_eq!(new_ranged, 2, "two maximal gap runs around the overlay");
-        assert_eq!(new_scalar, 0, "no scalar base reads on the coalesced path");
     }
 
     fn hex_lower(bytes: &[u8]) -> String {
@@ -5101,7 +4351,9 @@ mod tests {
     }
 
     fn independent_range_proof(start: usize, len: usize) -> MergeProof {
-        MergeProof::independent_key_range(start, len)
+        MergeProof::IndependentKeys {
+            touched_ranges: vec![MergeByteRange::new(start, len)],
+        }
     }
 
     #[derive(Debug)]
@@ -5185,173 +4437,6 @@ mod tests {
     }
 
     #[test]
-    fn ranges_are_pairwise_disjoint_detects_overlap() {
-        let r = MergeByteRange::new;
-        // Disjoint, non-touching ranges.
-        assert!(ranges_are_pairwise_disjoint(&[r(0, 4), r(10, 4), r(20, 4)]));
-        // Adjacent half-open ranges [0,4) and [4,8) do not overlap.
-        assert!(ranges_are_pairwise_disjoint(&[r(0, 4), r(4, 4)]));
-        // An overlapping pair is rejected.
-        assert!(!ranges_are_pairwise_disjoint(&[r(0, 5), r(4, 4)]));
-        // Overlap between non-adjacent entries (first and third) is still caught.
-        assert!(!ranges_are_pairwise_disjoint(&[
-            r(0, 100),
-            r(200, 4),
-            r(50, 4)
-        ]));
-        // Empty and single-range inputs are trivially disjoint.
-        assert!(ranges_are_pairwise_disjoint(&[]));
-        assert!(ranges_are_pairwise_disjoint(&[r(0, 4)]));
-    }
-
-    #[test]
-    fn merge_non_overlapping_ranges_overlays_disjoint_and_rejects_conflicts() {
-        let r = MergeByteRange::new;
-        let proof = MergeProof::default(); // label only
-        let base = vec![0_u8; 8];
-
-        // Clean 3-way merge: latest changed [4,8), staged changed declared [0,4).
-        let mut latest = base.clone();
-        latest[4..8].copy_from_slice(&[9, 9, 9, 9]);
-        let mut staged = base.clone();
-        staged[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        let merged = merge_non_overlapping_ranges(&[r(0, 4)], &base, &latest, &staged, &proof)
-            .expect("disjoint writers merge");
-        assert_eq!(merged, vec![1, 2, 3, 4, 9, 9, 9, 9]);
-
-        // Size mismatch is rejected.
-        assert!(
-            merge_non_overlapping_ranges(&[r(0, 4)], &base, &base[..4], &staged, &proof).is_none()
-        );
-        // Overlapping touched ranges are rejected.
-        assert!(
-            merge_non_overlapping_ranges(&[r(0, 5), r(4, 4)], &base, &latest, &staged, &proof)
-                .is_none()
-        );
-        // A range exceeding the block is rejected.
-        assert!(
-            merge_non_overlapping_ranges(&[r(4, 8)], &base, &latest, &staged, &proof).is_none()
-        );
-
-        // Integrity: staged modified a byte OUTSIDE the declared range -> rejected.
-        let mut sneaky = staged.clone();
-        sneaky[7] = 42;
-        assert!(
-            merge_non_overlapping_ranges(&[r(0, 4)], &base, &latest, &sneaky, &proof).is_none()
-        );
-
-        // True conflict: latest also modified the declared range -> rejected.
-        let mut latest_conflict = base.clone();
-        latest_conflict[0..4].copy_from_slice(&[5, 5, 5, 5]);
-        assert!(
-            merge_non_overlapping_ranges(&[r(0, 4)], &base, &latest_conflict, &staged, &proof)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn merge_non_overlapping_ranges_handles_multiple_unsorted_ranges() {
-        let r = MergeByteRange::new;
-        let proof = MergeProof::default();
-        // 16-byte block; staged touches two declared ranges given OUT OF ORDER
-        // ([8,12) then [0,4)) — exercises the complement-gap sort path.
-        let base = vec![0_u8; 16];
-        let mut latest = base.clone();
-        latest[4..8].copy_from_slice(&[7, 7, 7, 7]); // latest touches a gap range
-        let mut staged = base.clone();
-        staged[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        staged[8..12].copy_from_slice(&[5, 6, 7, 8]);
-
-        let merged =
-            merge_non_overlapping_ranges(&[r(8, 4), r(0, 4)], &base, &latest, &staged, &proof)
-                .expect("two disjoint declared ranges merge");
-        let mut expect = base.clone();
-        expect[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        expect[4..8].copy_from_slice(&[7, 7, 7, 7]);
-        expect[8..12].copy_from_slice(&[5, 6, 7, 8]);
-        assert_eq!(merged, expect);
-
-        // A byte modified in a complement gap BETWEEN two declared ranges is
-        // caught (staged touched byte 6, outside both declared ranges).
-        let mut sneaky = staged.clone();
-        sneaky[6] = 42;
-        assert!(
-            merge_non_overlapping_ranges(&[r(8, 4), r(0, 4)], &base, &latest, &sneaky, &proof)
-                .is_none()
-        );
-        // A byte modified in the trailing complement (after the last range) is caught.
-        let mut trailing = staged.clone();
-        trailing[15] = 99;
-        assert!(
-            merge_non_overlapping_ranges(&[r(8, 4), r(0, 4)], &base, &latest, &trailing, &proof)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn merge_valid_matches_merge_bytes_is_some() {
-        let r = MergeByteRange::new;
-        let base = vec![0_u8; 8];
-        let mut latest = base.clone();
-        latest[4..8].copy_from_slice(&[9, 9, 9, 9]);
-        let mut staged = base.clone();
-        staged[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        let mut staged_sneaky = staged.clone();
-        staged_sneaky[7] = 42; // modified outside declared range
-        let mut latest_conflict = base.clone();
-        latest_conflict[0..4].copy_from_slice(&[5, 5, 5, 5]); // true conflict
-
-        // (proof, base, latest, staged) cases spanning every decision branch.
-        let ap = MergeProof::AppendOnly { base_len: 1 };
-        let ind = MergeProof::independent_key_range(0, 4);
-        let cases: Vec<(MergeProof, &[u8], &[u8], &[u8])> = vec![
-            (MergeProof::Unsafe, &base, &latest, &staged),
-            (MergeProof::DisjointBlocks, &base, &latest, &staged),
-            (ind.clone(), &base, &latest, &staged),           // clean merge
-            (ind.clone(), &base, &latest, &staged_sneaky),    // outside-range reject
-            (ind.clone(), &base, &latest_conflict, &staged),  // true-conflict reject
-            (ind.clone(), &base, &base[..4], &staged),        // size mismatch reject
-            (MergeProof::non_overlapping_extent_range(0, 5), &base, &latest, &staged), // overlaps latest range? no; still valid check
-            (ap.clone(), b"abc", b"abcX", b"abcY"),           // append clean
-            (ap.clone(), b"abc", b"Xbc!", b"abcY"),           // append prefix reject
-            (MergeProof::AppendOnly { base_len: 10 }, b"abc", b"abcX", b"abcY"), // oversized base_len
-        ];
-        for (i, (proof, b, l, s)) in cases.iter().enumerate() {
-            assert_eq!(
-                proof.merge_valid(b, l, s),
-                proof.merge_bytes(b, l, s).is_some(),
-                "case {i}: merge_valid disagrees with merge_bytes().is_some() for {proof:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn merge_bytes_append_only_rejects_oversized_base_and_prefix_changes() {
-        let base = b"abc".to_vec();
-        let proof = MergeProof::AppendOnly { base_len: 3 };
-
-        // Clean append: both writers extended the common prefix "abc"; the merge
-        // keeps latest and concatenates staged's suffix.
-        assert_eq!(
-            proof
-                .merge_bytes(&base, b"abcX", b"abcY")
-                .expect("append-only merge"),
-            b"abcXY"
-        );
-
-        // base_len larger than a buffer is rejected.
-        assert!(
-            MergeProof::AppendOnly { base_len: 10 }
-                .merge_bytes(&base, b"abcX", b"abcY")
-                .is_none()
-        );
-
-        // A modified snapshot prefix (not a pure append) is rejected on either side.
-        assert!(proof.merge_bytes(&base, b"Xbc!", b"abcY").is_none());
-        assert!(proof.merge_bytes(&base, b"abcX", b"Zbc!").is_none());
-    }
-
-    #[test]
     fn merge_proof_unsafe_rejects_merge() {
         let merged = MergeProof::Unsafe.merge_bytes(&[0], &[0, 1], &[0, 2]);
         assert!(merged.is_none(), "unsafe proof must fall back to FCW");
@@ -5389,6 +4474,7 @@ mod tests {
 
     #[test]
     fn merge_proof_mechanism_collapses_labels_to_two_merge_algorithms() {
+        let range = vec![MergeByteRange::new(2, 2)];
         let cases = vec![
             (MergeProof::Unsafe, MergeProofMechanism::NoSameBlockMerge),
             (
@@ -5400,15 +4486,21 @@ mod tests {
                 MergeProofMechanism::AppendOnly,
             ),
             (
-                MergeProof::independent_key_range(2, 2),
+                MergeProof::IndependentKeys {
+                    touched_ranges: range.clone(),
+                },
                 MergeProofMechanism::RangeOverlay,
             ),
             (
-                MergeProof::non_overlapping_extent_range(2, 2),
+                MergeProof::NonOverlappingExtents {
+                    touched_ranges: range.clone(),
+                },
                 MergeProofMechanism::RangeOverlay,
             ),
             (
-                MergeProof::timestamp_only_inode_range(2, 2),
+                MergeProof::TimestampOnlyInode {
+                    touched_ranges: range,
+                },
                 MergeProofMechanism::RangeOverlay,
             ),
         ];
@@ -5421,9 +4513,15 @@ mod tests {
     #[test]
     fn range_overlay_labels_share_the_same_byte_algorithm() {
         let proofs = vec![
-            MergeProof::independent_key_range(2, 2),
-            MergeProof::non_overlapping_extent_range(2, 2),
-            MergeProof::timestamp_only_inode_range(2, 2),
+            MergeProof::IndependentKeys {
+                touched_ranges: vec![MergeByteRange::new(2, 2)],
+            },
+            MergeProof::NonOverlappingExtents {
+                touched_ranges: vec![MergeByteRange::new(2, 2)],
+            },
+            MergeProof::TimestampOnlyInode {
+                touched_ranges: vec![MergeByteRange::new(2, 2)],
+            },
         ];
 
         for proof in proofs {
@@ -5437,9 +4535,15 @@ mod tests {
     #[test]
     fn range_overlay_labels_reject_undeclared_byte_changes() {
         let proofs = vec![
-            MergeProof::independent_key_range(2, 2),
-            MergeProof::non_overlapping_extent_range(2, 2),
-            MergeProof::timestamp_only_inode_range(2, 2),
+            MergeProof::IndependentKeys {
+                touched_ranges: vec![MergeByteRange::new(2, 2)],
+            },
+            MergeProof::NonOverlappingExtents {
+                touched_ranges: vec![MergeByteRange::new(2, 2)],
+            },
+            MergeProof::TimestampOnlyInode {
+                touched_ranges: vec![MergeByteRange::new(2, 2)],
+            },
         ];
 
         for proof in proofs {
@@ -5450,40 +4554,6 @@ mod tests {
                 "proof label {proof:?} must reject changes outside touched_ranges"
             );
         }
-    }
-
-    #[test]
-    fn merge_proof_inline_ranges_preserve_serde_golden_bd_6tooy() {
-        use sha2::{Digest, Sha256};
-
-        let proofs = vec![
-            MergeProof::independent_key_range(0, 2),
-            MergeProof::non_overlapping_extent_range(2, 2),
-            MergeProof::timestamp_only_inode_range(1, 1),
-        ];
-        let json = serde_json::to_string(&proofs).expect("serialize proof golden");
-        let digest = hex_lower(&Sha256::digest(json.as_bytes()));
-        println!("bd_6tooy_merge_proof_serde_sha256={digest}");
-
-        assert_eq!(
-            json,
-            r#"[{"IndependentKeys":{"touched_ranges":[{"start":0,"len":2}]}},{"NonOverlappingExtents":{"touched_ranges":[{"start":2,"len":2}]}},{"TimestampOnlyInode":{"touched_ranges":[{"start":1,"len":1}]}}]"#,
-            "inline range storage must preserve the prior Vec-backed serde shape"
-        );
-        assert_eq!(
-            digest, "e3a0f052016fa83985a7b1968c06b0d21589999a1e441915fff89c2d8c88a324",
-            "golden SHA changed for merge proof range serialization"
-        );
-    }
-
-    #[test]
-    fn validate_transaction_id_rejects_reserved_ids() {
-        // Ordinary ids validate.
-        assert!(validate_transaction_id(TxnId(1)).is_ok());
-        assert!(validate_transaction_id(TxnId(u64::MAX - 1)).is_ok());
-        // 0 (uninitialized / no-transaction) and u64::MAX (sentinel) are reserved.
-        assert!(validate_transaction_id(TxnId(0)).is_err());
-        assert!(validate_transaction_id(TxnId(u64::MAX)).is_err());
     }
 
     #[test]
@@ -5528,145 +4598,6 @@ mod tests {
             matches!(err, CommitError::Conflict { block: b, .. } if b == block),
             "expected strict FCW conflict, got {err:?}"
         );
-    }
-
-    #[test]
-    fn commit_ssi_move_through_preserves_full_bytes_and_golden_bd_9m1g4() {
-        use sha2::{Digest, Sha256};
-
-        let mut store = MvccStore::with_compression_policy(CompressionPolicy {
-            dedup_identical: false,
-            max_chain_length: None,
-            algo: CompressionAlgo::None,
-        });
-        let block_a = BlockNumber(31);
-        let block_b = BlockNumber(32);
-        let bytes_a = vec![0xA5; 16];
-        let bytes_b = vec![0x5A; 8];
-
-        let mut txn = store.begin();
-        txn.stage_write(block_a, bytes_a.clone());
-        txn.stage_write(block_b, bytes_b.clone());
-
-        let commit_seq = store.commit_ssi(txn).expect("SSI commit");
-        assert_eq!(commit_seq, CommitSeq(1));
-
-        let chain_a = store.versions.get(&block_a).expect("block_a chain");
-        let chain_b = store.versions.get(&block_b).expect("block_b chain");
-        let VersionData::Full(stored_a) = &chain_a[0].data else {
-            panic!("block_a should store full bytes");
-        };
-        let VersionData::Full(stored_b) = &chain_b[0].data else {
-            panic!("block_b should store full bytes");
-        };
-        assert_eq!(stored_a.as_slice(), bytes_a.as_slice());
-        assert_eq!(stored_b.as_slice(), bytes_b.as_slice());
-
-        let record = store.ssi_log.last().expect("SSI record");
-        assert_eq!(record.read_set.len(), 0);
-        assert_eq!(record.write_set, BTreeSet::from([block_a, block_b]));
-
-        let mut hasher = Sha256::new();
-        hasher.update(commit_seq.0.to_le_bytes());
-        for (block, bytes) in [
-            (block_a, stored_a.as_slice()),
-            (block_b, stored_b.as_slice()),
-        ] {
-            hasher.update(block.0.to_le_bytes());
-            let len = u64::try_from(bytes.len()).expect("test bytes length fits u64");
-            hasher.update(len.to_le_bytes());
-            hasher.update(bytes);
-        }
-        let read_set_len =
-            u64::try_from(record.read_set.len()).expect("test read-set length fits u64");
-        hasher.update(read_set_len.to_le_bytes());
-        for block in &record.write_set {
-            hasher.update(block.0.to_le_bytes());
-        }
-        let golden = hex_lower(&hasher.finalize());
-        assert_eq!(
-            golden, "dc236d4739346b0642de6982db3bf2afee6019b1f4637fd65699f7a8e6e984be",
-            "SSI move-through golden digest changed"
-        );
-    }
-
-    #[test]
-    fn commit_ssi_move_through_preserves_append_only_merge_bd_9m1g4() {
-        let mut store = MvccStore::new();
-        let block = BlockNumber(33);
-        seed_block(&mut store, block, &[0]);
-
-        let mut first = store.begin();
-        let mut second = store.begin();
-        first.stage_write_with_proof(block, vec![0, 1], append_only_proof(1));
-        second.stage_write_with_proof(block, vec![0, 2], append_only_proof(1));
-
-        store.commit_ssi(first).expect("first append");
-        store.commit_ssi(second).expect("second append merges");
-
-        let snapshot = store.current_snapshot();
-        let visible = store.read_visible(block, snapshot).expect("visible bytes");
-        assert_eq!(visible.as_ref(), &[0, 1, 2]);
-
-        let chain = store.versions.get(&block).expect("block chain");
-        let VersionData::Full(stored) = &chain[2].data else {
-            panic!("merged SSI append should store full bytes");
-        };
-        assert_eq!(stored.as_slice(), &[0, 1, 2]);
-    }
-
-    #[test]
-    fn commit_ssi_move_through_returns_original_txn_on_fcw_conflict_bd_9m1g4() {
-        let mut store = MvccStore::new();
-        store.set_conflict_policy(ConflictPolicy::Strict);
-        let block = BlockNumber(34);
-        seed_block(&mut store, block, &[0]);
-
-        let mut first = store.begin();
-        let mut second = store.begin();
-        first.stage_write(block, vec![0, 1]);
-        second.stage_write(block, vec![0, 2]);
-
-        store.commit_ssi(first).expect("first write");
-
-        let (err, returned) = store
-            .commit_ssi_internal(second)
-            .expect_err("strict FCW conflict");
-        assert!(
-            matches!(err, CommitError::Conflict { block: b, .. } if b == block),
-            "expected strict FCW conflict, got {err:?}"
-        );
-        assert_eq!(returned.pending_writes(), 1);
-        assert_eq!(returned.staged_write(block), Some(&[0, 2][..]));
-
-        let snapshot = store.current_snapshot();
-        let visible = store.read_visible(block, snapshot).expect("visible bytes");
-        assert_eq!(visible.as_ref(), &[0, 1]);
-    }
-
-    #[test]
-    fn apply_fcw_commit_returns_original_writes_on_conflict_bd_csfbv() {
-        let mut store = MvccStore::new();
-        store.set_conflict_policy(ConflictPolicy::Strict);
-        let block = BlockNumber(8);
-        seed_block(&mut store, block, &[0]);
-
-        let mut first = store.begin();
-        let mut second = store.begin();
-        first.stage_write(block, vec![0, 1]);
-        second.stage_write(block, vec![0, 2]);
-
-        store.commit(first).expect("first write commits");
-
-        let (err, returned) = store
-            .commit_fcw_internal(second)
-            .expect_err("strict policy must reject stale write");
-        assert!(
-            matches!(err, CommitError::Conflict { block: b, .. } if b == block),
-            "expected strict FCW conflict, got {err:?}"
-        );
-        assert_eq!(returned.pending_writes(), 1);
-        assert_eq!(returned.staged_write(block), Some(&[0, 2][..]));
     }
 
     #[test]
@@ -5939,76 +4870,6 @@ mod tests {
 
         let buf = dev.read_block(&cx, BlockNumber(3)).expect("read block 3");
         assert_eq!(buf.as_slice(), &[0xAB; 512]);
-    }
-
-    #[test]
-    fn unregistered_mvcc_device_is_direct_read_only_view_bd_xmh5g_416() {
-        let cx = test_cx();
-        let block = BlockNumber(3);
-        let base = MemBlockDevice::new(512, 16);
-        base.write_block(&cx, block, &[0xAB; 512])
-            .expect("seed base");
-
-        let store = Arc::new(RwLock::new(MvccStore::new()));
-        {
-            let mut guard = store.write();
-            let mut txn = guard.begin();
-            txn.stage_write(block, vec![0xCD; 512]);
-            guard.commit(txn).expect("seed overlay");
-        }
-        let snap = store.read().current_snapshot();
-        let dev = MvccBlockDevice::new_unregistered(base, Arc::clone(&store), snap);
-
-        let buf = dev.read_block(&cx, block).expect("direct read-only read");
-        assert_eq!(
-            buf.as_slice(),
-            &[0xAB; 512],
-            "unregistered/read-only mode must bypass MVCC overlay probes"
-        );
-
-        let err = dev
-            .write_block(&cx, block, &[0xEF; 512])
-            .expect_err("unregistered mode is a read-only base-device view");
-        assert!(
-            matches!(err, FfsError::UnsupportedFeature(_)),
-            "unexpected error kind: {err:?}"
-        );
-    }
-
-    #[test]
-    fn mvcc_device_read_shares_uncompressed_full_version_buffer_bd_xmh5g_394() {
-        let cx = test_cx();
-        let block = BlockNumber(4);
-        let store = Arc::new(RwLock::new(MvccStore::new()));
-        {
-            let mut guard = store.write();
-            let mut txn = guard.begin();
-            txn.stage_write(block, vec![0xCD; 512]);
-            guard.commit(txn).expect("commit");
-        }
-
-        let snap = store.read().current_snapshot();
-        let shared = {
-            let guard = store.read();
-            let versions = guard.versions.get(&block).expect("block chain");
-            let VersionData::Full(shared) = &versions[0].data else {
-                panic!("uncompressed commit should store shared full bytes");
-            };
-            let shared = Arc::clone(shared);
-            drop(guard);
-            shared
-        };
-        let stored = BlockBuf::from_shared_aligned(shared);
-
-        let base = MemBlockDevice::new(512, 16);
-        let dev = MvccBlockDevice::new(base, Arc::clone(&store), snap);
-        let read = dev.read_block(&cx, block).expect("read");
-
-        assert_eq!(read.as_slice(), &[0xCD; 512]);
-        assert!(
-            read.shares_storage_with(&stored),
-            "uncompressed MVCC read_block should share VersionData::Full storage"
-        );
     }
 
     #[test]
@@ -7732,7 +6593,7 @@ mod tests {
             block: BlockNumber(1),
             commit_seq: CommitSeq(1),
             writer: TxnId(1),
-            data: VersionData::full(vec![0xA5; 8]),
+            data: VersionData::Full(vec![0xA5; 8]),
         }]);
         reclaimer.collect();
 
@@ -9428,51 +8289,6 @@ mod tests {
     }
 
     #[test]
-    fn read_visible_block_buf_shares_full_block_correctly_under_concurrency() {
-        // bd-xmh5g.394 made VersionData::Full(Arc<AlignedVec>) and
-        // read_visible_block_buf SHARE that buffer (BlockBuf::from_shared_aligned,
-        // Arc::clone) instead of copying it. This is the conformance guard the new
-        // shared-Arc read path lacked: concurrent readers of one uncompressed Full
-        // block must each get a BlockBuf with the EXACT stored bytes — the shared
-        // Arc must never corrupt or tear the data. (MvccStore::new defaults to
-        // algo: None => Full; the assertion holds even if a version is compressed,
-        // since the contract is "a read returns the written bytes".)
-        let mut store = MvccStore::new();
-        let block = BlockNumber(7);
-        let data: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
-
-        let mut txn = store.begin();
-        txn.stage_write(block, data.clone());
-        store.commit(txn).expect("commit");
-        let snap = store.current_snapshot();
-
-        // Single-threaded: the shared BlockBuf matches the stored bytes and the
-        // materialized read_visible Vec.
-        let shared = store
-            .read_visible_block_buf(block, snap)
-            .expect("visible block buf");
-        assert_eq!(shared.as_slice(), data.as_slice());
-        assert_eq!(
-            store.read_visible(block, snap).unwrap().as_ref(),
-            data.as_slice()
-        );
-
-        // Concurrency: 8 threads share the same Full Arc; every read returns the bytes.
-        std::thread::scope(|s| {
-            for _ in 0..8 {
-                let store = &store;
-                let data = &data;
-                s.spawn(move || {
-                    for _ in 0..20_000 {
-                        let buf = store.read_visible_block_buf(block, snap).expect("visible");
-                        assert_eq!(buf.as_slice(), data.as_slice());
-                    }
-                });
-            }
-        });
-    }
-
-    #[test]
     fn registry_gc_respects_oldest_active_snapshot() {
         let registry = Arc::new(SnapshotRegistry::new());
         let mut store = MvccStore::new();
@@ -10068,7 +8884,7 @@ mod tests {
                 block: BlockNumber(42),
                 commit_seq: CommitSeq(5),
                 writer: TxnId(1),
-                data: VersionData::full(vec![0xDE; 64]),
+                data: VersionData::Full(vec![0xDE; 64]),
             }],
         );
 
@@ -10131,7 +8947,7 @@ mod tests {
             block: BlockNumber(0),
             commit_seq: CommitSeq(1),
             writer: TxnId(1),
-            data: VersionData::full(vec![0xAA; 64]),
+            data: VersionData::Full(vec![0xAA; 64]),
         };
         assert_eq!(v.bytes_inline().unwrap(), &[0xAA; 64]);
     }
@@ -10303,7 +9119,7 @@ mod tests {
             block: BlockNumber(42),
             commit_seq: CommitSeq(7),
             writer: TxnId(3),
-            data: VersionData::full(vec![0xBE; 16]),
+            data: VersionData::Full(vec![0xBE; 16]),
         };
         let json = serde_json::to_string(&v).expect("serialize");
         let parsed: BlockVersion = serde_json::from_str(&json).expect("deserialize");
@@ -10319,7 +9135,7 @@ mod tests {
             block: BlockNumber(0),
             commit_seq: CommitSeq(1),
             writer: TxnId(1),
-            data: VersionData::full(vec![1, 2, 3]),
+            data: VersionData::Full(vec![1, 2, 3]),
         };
         let v2 = v.clone();
         assert_eq!(v, v2);
@@ -10417,18 +9233,9 @@ mod tests {
         let mut txn = Transaction::new(TxnId(42), store.current_snapshot());
         txn.stage_write(BlockNumber(5), vec![0xAA; 8]);
         let json = serde_json::to_string(&txn).expect("serialize");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
-        assert!(value.get("writes").is_some());
-        assert!(value.get("merge_proofs").is_some());
-        assert!(value.get("staged_writes").is_none());
         let parsed: Transaction = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.id(), TxnId(42));
         assert_eq!(parsed.pending_writes(), 1);
-        assert_eq!(parsed.staged_write(BlockNumber(5)), Some(&[0xAA; 8][..]));
-        assert_eq!(
-            parsed.merge_proof(BlockNumber(5)),
-            Some(&MergeProof::Unsafe)
-        );
     }
 
     #[test]
@@ -11383,295 +10190,6 @@ mod tests {
         assert!(
             matches!(err, CommitError::SsiConflict { pivot_block, .. } if pivot_block == BlockNumber(0)),
             "expected SsiConflict on block 0, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn ssi_disjoint_key_spans_do_not_create_edges() {
-        let mut pivot = Transaction::new(TxnId(10), Snapshot { high: CommitSeq(0) });
-        for block in 0..192_u64 {
-            pivot.record_read(BlockNumber(block), CommitSeq(1));
-        }
-        pivot.stage_write(BlockNumber(1_000_000), vec![1; 64]);
-
-        let record = CommittedTxnRecord {
-            txn_id: TxnId(11),
-            commit_seq: CommitSeq(1),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(2_000_000)]),
-            read_set: (10_000..10_192)
-                .map(|block| (BlockNumber(block), CommitSeq(1)))
-                .collect(),
-        };
-
-        assert!(ssi_incoming_edge(&pivot, &record).is_none());
-        assert!(ssi_outgoing_edge(&pivot, &record).is_none());
-        let (checks_performed, dangerous_structure) =
-            detect_ssi_dangerous_structure(&pivot, [&record]);
-        assert_eq!(checks_performed, 1);
-        assert!(dangerous_structure.is_none());
-    }
-
-    fn one_read_set(block: u64) -> BTreeMap<BlockNumber, CommitSeq> {
-        std::iter::once((BlockNumber(block), CommitSeq(1))).collect()
-    }
-
-    #[test]
-    fn ssi_incoming_edge_attributes_reader_and_writer_correctly() {
-        // The pivot WROTE block 5; the committed record READ block 5. The record's
-        // read is anti the pivot's write -> an incoming rw-edge to the pivot, with
-        // reader = the record and writer = the pivot.
-        let mut pivot = Transaction::new(TxnId(70), Snapshot { high: CommitSeq(0) });
-        pivot.stage_write(BlockNumber(5), vec![1; 64]);
-
-        let record = CommittedTxnRecord {
-            txn_id: TxnId(71),
-            commit_seq: CommitSeq(3),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::new(),
-            read_set: one_read_set(5),
-        };
-        let edge = ssi_incoming_edge(&pivot, &record).expect("incoming edge on block 5");
-        assert_eq!(edge.block, BlockNumber(5));
-        assert_eq!(edge.reader_txn, TxnId(71), "the record is the reader");
-        assert_eq!(edge.writer_txn, TxnId(70), "the pivot is the writer");
-    }
-
-    #[test]
-    fn ssi_outgoing_edge_attributes_reader_and_writer_correctly() {
-        // The pivot READ block 5; the committed record WROTE block 5. The pivot's
-        // read is anti the record's write -> an outgoing rw-edge from the pivot,
-        // with reader = the pivot and writer = the record (mirror of incoming).
-        let mut pivot = Transaction::new(TxnId(80), Snapshot { high: CommitSeq(0) });
-        pivot.record_read(BlockNumber(5), CommitSeq(1));
-
-        let record = CommittedTxnRecord {
-            txn_id: TxnId(81),
-            commit_seq: CommitSeq(3),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(5)]),
-            read_set: one_read_set(99),
-        };
-        let edge = ssi_outgoing_edge(&pivot, &record).expect("outgoing edge on block 5");
-        assert_eq!(edge.block, BlockNumber(5));
-        assert_eq!(edge.reader_txn, TxnId(80), "the pivot is the reader");
-        assert_eq!(edge.writer_txn, TxnId(81), "the record is the writer");
-    }
-
-    #[test]
-    fn ssi_single_rw_edge_is_not_a_dangerous_structure() {
-        let mut pivot = Transaction::new(TxnId(30), Snapshot { high: CommitSeq(0) });
-        pivot.record_read(BlockNumber(0), CommitSeq(11));
-        pivot.record_read(BlockNumber(1), CommitSeq(12));
-        pivot.stage_write(BlockNumber(2), vec![1; 64]);
-        pivot.stage_write(BlockNumber(3), vec![1; 64]);
-
-        // Only an OUTGOING edge (pivot.read ∩ record.write = {0}): the pivot read
-        // block 0 and this record wrote it; the record reads nothing the pivot
-        // wrote. One edge is not a pivot.
-        let outgoing_only = CommittedTxnRecord {
-            txn_id: TxnId(31),
-            commit_seq: CommitSeq(5),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(0)]),
-            read_set: one_read_set(99),
-        };
-        assert!(ssi_incoming_edge(&pivot, &outgoing_only).is_none());
-        assert!(ssi_outgoing_edge(&pivot, &outgoing_only).is_some());
-        assert!(
-            detect_ssi_dangerous_structure(&pivot, [&outgoing_only])
-                .1
-                .is_none()
-        );
-
-        // Only an INCOMING edge (record.read ∩ pivot.write = {2}): this record read
-        // block 2 and the pivot wrote it; the record writes nothing the pivot read.
-        let incoming_only = CommittedTxnRecord {
-            txn_id: TxnId(32),
-            commit_seq: CommitSeq(5),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(99)]),
-            read_set: one_read_set(2),
-        };
-        assert!(ssi_incoming_edge(&pivot, &incoming_only).is_some());
-        assert!(ssi_outgoing_edge(&pivot, &incoming_only).is_none());
-        assert!(
-            detect_ssi_dangerous_structure(&pivot, [&incoming_only])
-                .1
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn ssi_skips_records_visible_in_snapshot() {
-        // Pivot's snapshot already includes everything up to CommitSeq(5).
-        let mut pivot = Transaction::new(TxnId(40), Snapshot { high: CommitSeq(5) });
-        pivot.record_read(BlockNumber(0), CommitSeq(1));
-        pivot.record_read(BlockNumber(1), CommitSeq(1));
-        pivot.stage_write(BlockNumber(2), vec![1; 64]);
-        pivot.stage_write(BlockNumber(3), vec![1; 64]);
-
-        // A record committed at/before the snapshot high is already visible, so
-        // it forms no rw-edge even though its key spans would otherwise create
-        // both an incoming and an outgoing edge.
-        let visible = CommittedTxnRecord {
-            txn_id: TxnId(41),
-            commit_seq: CommitSeq(5),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(0), BlockNumber(1)]),
-            read_set: [
-                (BlockNumber(2), CommitSeq(1)),
-                (BlockNumber(3), CommitSeq(1)),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        let (checks_performed, dangerous) = detect_ssi_dangerous_structure(&pivot, [&visible]);
-        assert_eq!(checks_performed, 0, "a snapshot-visible record is skipped");
-        assert!(
-            dangerous.is_none(),
-            "no dangerous structure from a record the txn already observed"
-        );
-    }
-
-    #[test]
-    fn ssi_empty_write_set_is_never_a_dangerous_structure() {
-        // A read-only transaction (no writes) can never be the pivot of a
-        // write-skew; detect returns immediately without examining any records.
-        let mut reader = Transaction::new(TxnId(50), Snapshot { high: CommitSeq(0) });
-        reader.record_read(BlockNumber(0), CommitSeq(1));
-        reader.record_read(BlockNumber(1), CommitSeq(1));
-
-        // This record writes blocks the reader read (would form an incoming edge),
-        // but with no write set the reader is never the pivot.
-        let record = CommittedTxnRecord {
-            txn_id: TxnId(51),
-            commit_seq: CommitSeq(5),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(0), BlockNumber(1)]),
-            read_set: one_read_set(2),
-        };
-        let (checks_performed, dangerous) = detect_ssi_dangerous_structure(&reader, [&record]);
-        assert_eq!(
-            checks_performed, 0,
-            "no records examined for a read-only txn"
-        );
-        assert!(dangerous.is_none());
-    }
-
-    #[test]
-    fn ssi_detect_stops_at_first_completed_dangerous_structure() {
-        // The pivot reads block 0 and writes block 2.
-        let mut pivot = Transaction::new(TxnId(90), Snapshot { high: CommitSeq(0) });
-        pivot.record_read(BlockNumber(0), CommitSeq(1));
-        pivot.stage_write(BlockNumber(2), vec![1; 64]);
-
-        // rec1 alone completes BOTH edges: it writes block 0 (pivot read it ->
-        // outgoing) AND reads block 2 (pivot wrote it -> incoming).
-        let rec1 = CommittedTxnRecord {
-            txn_id: TxnId(91),
-            commit_seq: CommitSeq(5),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(0)]),
-            read_set: one_read_set(2),
-        };
-        // rec2 would also form both edges, but detect must stop before examining it.
-        let rec2 = CommittedTxnRecord {
-            txn_id: TxnId(92),
-            commit_seq: CommitSeq(6),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(0)]),
-            read_set: one_read_set(2),
-        };
-
-        let (checks, dangerous) = detect_ssi_dangerous_structure(&pivot, [&rec1, &rec2]);
-        assert!(
-            dangerous.is_some(),
-            "rec1 alone forms the dangerous structure"
-        );
-        assert_eq!(checks, 1, "detect returns at rec1 without examining rec2");
-    }
-
-    #[test]
-    fn ssi_dangerous_structure_accumulates_edges_across_records() {
-        let mut pivot = Transaction::new(TxnId(60), Snapshot { high: CommitSeq(0) });
-        pivot.record_read(BlockNumber(0), CommitSeq(1));
-        pivot.stage_write(BlockNumber(2), vec![1; 64]);
-
-        // Record 1 writes a block the pivot read -> only an incoming edge.
-        let rec1 = CommittedTxnRecord {
-            txn_id: TxnId(61),
-            commit_seq: CommitSeq(5),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(0)]),
-            read_set: one_read_set(99),
-        };
-        // Record 2 reads a block the pivot wrote -> only an outgoing edge.
-        let rec2 = CommittedTxnRecord {
-            txn_id: TxnId(62),
-            commit_seq: CommitSeq(6),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(99)]),
-            read_set: one_read_set(2),
-        };
-
-        // Neither record alone is a dangerous structure.
-        assert!(detect_ssi_dangerous_structure(&pivot, [&rec1]).1.is_none());
-        assert!(detect_ssi_dangerous_structure(&pivot, [&rec2]).1.is_none());
-        // Together they form the pivot: incoming from rec1, outgoing from rec2.
-        let (checks, dangerous) = detect_ssi_dangerous_structure(&pivot, [&rec1, &rec2]);
-        assert_eq!(checks, 2, "both records are examined");
-        assert!(
-            dangerous.is_some(),
-            "edges from two distinct records form a dangerous structure"
-        );
-    }
-
-    #[test]
-    fn ssi_span_guard_preserves_min_intersection_tiebreaks() {
-        use sha2::{Digest, Sha256};
-
-        let mut pivot = Transaction::new(TxnId(20), Snapshot { high: CommitSeq(0) });
-        pivot.record_read(BlockNumber(0), CommitSeq(11));
-        pivot.record_read(BlockNumber(1), CommitSeq(12));
-        pivot.stage_write(BlockNumber(2), vec![1; 64]);
-        pivot.stage_write(BlockNumber(3), vec![1; 64]);
-
-        let record = CommittedTxnRecord {
-            txn_id: TxnId(21),
-            commit_seq: CommitSeq(5),
-            snapshot: Snapshot { high: CommitSeq(0) },
-            write_set: BTreeSet::from([BlockNumber(0), BlockNumber(1)]),
-            read_set: [
-                (BlockNumber(2), CommitSeq(13)),
-                (BlockNumber(3), CommitSeq(14)),
-            ]
-            .into_iter()
-            .collect(),
-        };
-
-        let (checks_performed, dangerous_structure) =
-            detect_ssi_dangerous_structure(&pivot, [&record]);
-        let dangerous_structure = dangerous_structure.expect("both rw edges");
-        assert_eq!(checks_performed, 1);
-        assert_eq!(dangerous_structure.incoming.block, BlockNumber(2));
-        assert_eq!(dangerous_structure.incoming.read_version, CommitSeq(13));
-        assert_eq!(dangerous_structure.outgoing.block, BlockNumber(0));
-        assert_eq!(dangerous_structure.outgoing.read_version, CommitSeq(11));
-        assert_eq!(dangerous_structure.outgoing.write_version, CommitSeq(5));
-
-        let mut hasher = Sha256::new();
-        hasher.update(checks_performed.to_le_bytes());
-        hasher.update(dangerous_structure.incoming.block.0.to_le_bytes());
-        hasher.update(dangerous_structure.incoming.read_version.0.to_le_bytes());
-        hasher.update(dangerous_structure.incoming.write_version.0.to_le_bytes());
-        hasher.update(dangerous_structure.outgoing.block.0.to_le_bytes());
-        hasher.update(dangerous_structure.outgoing.read_version.0.to_le_bytes());
-        hasher.update(dangerous_structure.outgoing.write_version.0.to_le_bytes());
-        let golden = hex_lower(&hasher.finalize());
-        assert_eq!(
-            golden, "1800c846028c2f980ca158d0ea6c41114d05e293588da3cbd25ad3b8f001eb37",
-            "SSI span-guard golden digest changed"
         );
     }
 

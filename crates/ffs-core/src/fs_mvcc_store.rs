@@ -8,7 +8,7 @@
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result as FfsResult};
-use ffs_mvcc::sharded::ShardedMvccStore;
+use ffs_mvcc::sharded::{PublicationMode, ShardedMvccStore};
 use ffs_mvcc::{
     BlockVersionStats, CommitError, EbrVersionStats, MergeProof, MvccStore, Transaction,
     TransactionOutcomeStats, TxnAbortReason,
@@ -46,6 +46,13 @@ impl FsMvccStore {
         // residual parallel-write gap (bd-bhh0i) is the global active_snapshots
         // lock, not shard count (docs/NEGATIVE_EVIDENCE.md).
         Self::Sharded(ShardedMvccStore::for_host_parallelism())
+    }
+
+    pub(super) fn sharded_with_publication_mode(mode: PublicationMode) -> Self {
+        Self::Sharded(ShardedMvccStore::with_publication_mode(
+            ShardedMvccStore::host_parallelism_shard_count(),
+            mode,
+        ))
     }
 
     pub(super) const fn is_sharded(&self) -> bool {
@@ -185,12 +192,26 @@ impl FsMvccStore {
     {
         let mut txn = self.begin();
         let snapshot = txn.snapshot();
-        let mut data = match self.read_visible(block, snapshot) {
-            Some(bytes) => bytes,
-            None => read_base()?,
+        // The merge common ancestor is this block's content at the txn's snapshot:
+        // the resident version if one exists, else the base-device bytes. Record it
+        // as `staged_base` ALWAYS — do NOT rely on the version chain still holding
+        // it at commit time. A concurrent committer's `prune_after_commit_if_due`
+        // can drop the version at this (unregistered auto-commit) snapshot between
+        // stage and commit, after which the sharded merge's `version_bytes_at`
+        // yields an EMPTY base → a spurious length-mismatch abort of a disjoint
+        // range-overlay (e.g. two creates writing different inode slots of the same
+        // inode-table block). Recording the base makes the merge independent of
+        // pruning (bd-bhh0i BUG-4 inode-table pruning race). The extra block-sized
+        // clone is only consumed on a same-block conflict.
+        let (mut data, base) = match self.read_visible(block, snapshot) {
+            Some(bytes) => (bytes.clone(), Some(bytes)),
+            None => {
+                let device_base = read_base()?;
+                (device_base.clone(), Some(device_base))
+            }
         };
         patch(&mut data)?;
-        txn.stage_write_with_proof(block, data, proof);
+        txn.stage_write_with_proof_and_base(block, data, proof, base);
         let commit_seq = self
             .commit(txn)
             .map_err(|error| FfsError::Format(error.to_string()))?;
@@ -198,10 +219,17 @@ impl FsMvccStore {
         Ok(())
     }
 
-    pub(super) fn flush_to_device<D: BlockDevice>(&self, cx: &Cx, device: &D) -> FfsResult<usize> {
+    pub(super) fn flush_to_device_after<D: BlockDevice>(
+        &self,
+        cx: &Cx,
+        device: &D,
+        flushed_through: CommitSeq,
+    ) -> FfsResult<(usize, CommitSeq)> {
         match self {
-            Self::Single(lock) => lock.read().flush_to_device(cx, device),
-            Self::Sharded(store) => store.flush_to_device(cx, device),
+            Self::Single(lock) => lock
+                .read()
+                .flush_to_device_after(cx, device, flushed_through),
+            Self::Sharded(store) => store.flush_to_device_after(cx, device, flushed_through),
         }
     }
 
@@ -310,7 +338,16 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
 
     fn read_snapshot(&self) -> Snapshot {
         if self.read_your_writes {
-            self.store.current_snapshot()
+            // Read-your-writes wants the LATEST committed content. Resolve at the
+            // MAX sentinel (newest RETAINED version) rather than a freshly fetched
+            // `current_snapshot()`, which has a TOCTOU with pruning: bd-bhh0i
+            // writable adapters are unregistered, so the prune watermark is the
+            // chain head — a concurrent commit+prune between capturing `current`
+            // and `read_visible` drops the captured version and the read falls to
+            // the stale on-device block (bd-bhh0i BUG-4 read-your-writes vs prune).
+            Snapshot {
+                high: CommitSeq(u64::MAX),
+            }
         } else {
             self.snapshot()
         }
@@ -503,9 +540,17 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // no version at the snapshot, the block is still on the base device.
         let mut txn = self.store.begin();
         let snapshot = txn.snapshot();
-        let mut data = match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => buf.as_slice().to_vec(),
-            None => self.base.read_block(cx, block)?.into_inner(),
+        // Record the base-device content when no version exists at the snapshot,
+        // so concurrent disjoint-range writers to the SAME freshly-allocated
+        // block (e.g. two creates touching different group descriptors of a new
+        // GDT block) merge instead of FCW-conflicting (bd-bhh0i; the version
+        // chain gives an empty base otherwise).
+        let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
+            Some(buf) => (buf.as_slice().to_vec(), None),
+            None => {
+                let device_base = self.base.read_block(cx, block)?.into_inner();
+                (device_base.clone(), Some(device_base))
+            }
         };
         patch(&mut data)?;
         // Empty hint → identical to `write_block` (default `Unsafe` proof, no merge).
@@ -516,13 +561,71 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         } else {
             MergeProof::independent_keys(disjoint_ranges)
         };
-        txn.stage_write_with_proof(block, data, proof);
+        txn.stage_write_with_proof_and_base(block, data, proof, base);
         let commit_seq = self
             .store
             .commit(txn)
             .map_err(|error| FfsError::Format(error.to_string()))?;
         self.store.prune_after_commit_if_due(commit_seq);
         Ok(())
+    }
+
+    fn rmw_block_bitmap_or(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
+    ) -> FfsResult<()> {
+        if self.reads_base_directly() {
+            return Err(FfsError::UnsupportedFeature(
+                "unregistered MVCC block device is read-only".to_owned(),
+            ));
+        }
+        // Same begin-first / read-base-at-snapshot contract as `rmw_block` (a
+        // read taken before `begin` could observe an older version and silently
+        // clobber a concurrent disjoint-bit writer). `patch` is the caller's
+        // set-only bit mutation (allocation); staging `MergeProof::BitmapOr`
+        // lets two concurrent allocators to disjoint blocks of the SAME group
+        // bitmap block merge (`latest | staged`) instead of first-committer-wins
+        // conflicting, even when their bits share a byte (bd-bhh0i BUG 4).
+        let mut txn = self.store.begin();
+        let snapshot = txn.snapshot();
+        let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
+            Some(buf) => (buf.as_slice().to_vec(), None),
+            None => {
+                let device_base = self.base.read_block(cx, block)?.into_inner();
+                (device_base.clone(), Some(device_base))
+            }
+        };
+        patch(&mut data)?;
+        txn.stage_write_with_proof_and_base(block, data, MergeProof::BitmapOr, base);
+        let commit_seq = self
+            .store
+            .commit(txn)
+            .map_err(|error| FfsError::Format(error.to_string()))?;
+        self.store.prune_after_commit_if_due(commit_seq);
+        Ok(())
+    }
+
+    fn read_merge_ancestor_at_snapshot(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> FfsResult<(BlockBuf, Option<Vec<u8>>)> {
+        // Resolve the ancestor at the CALLER's snapshot, independent of this
+        // device's own read-your-writes view. A version at `snapshot` → the store
+        // re-derives the base from its chain (record no base); otherwise the block
+        // is only on the raw base device → return its bytes AND record them as
+        // `staged_base` (mirrors the auto-commit rmw path).
+        match self.store.read_visible_block_buf(block, snapshot) {
+            Some(buf) => Ok((buf, None)),
+            None => {
+                let device = self.base.read_block(cx, block)?;
+                let base = device.as_slice().to_vec();
+                Ok((device, Some(base)))
+            }
+        }
     }
 
     fn block_size(&self) -> u32 {
