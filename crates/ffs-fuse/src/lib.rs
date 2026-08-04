@@ -2298,14 +2298,14 @@ impl FrankenFuse {
             })
             .map_err(|error| error.to_errno())?;
 
-        for entry in &entries {
+        for entry in entries.iter() {
             #[cfg(unix)]
             let _ = OsStr::from_bytes(&entry.name);
             #[cfg(not(unix))]
             let _ = entry.name_str();
         }
 
-        Ok(entries)
+        Ok(entries.to_vec())
     }
 
     /// Execute readlink without a live mount.
