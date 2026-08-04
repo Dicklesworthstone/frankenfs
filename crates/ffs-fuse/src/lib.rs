@@ -54,6 +54,13 @@ const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
 const COALESCED_FETCH_MULTIPLIER: u32 = 4;
 const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
 const FUSE_MAX_READ_BYTES: u32 = 16 * 1024 * 1024;
+/// Ask the kernel to combine directory enumeration with entry attributes.
+///
+/// `readdirplus` is already implemented below. Negotiating these capabilities
+/// lets the kernel choose it for metadata-heavy walks, avoiding a later
+/// lookup/getattr round-trip for entries whose attributes the caller needs.
+const READDIRPLUS_CAPABILITIES: u64 =
+    fuse_consts::FUSE_DO_READDIRPLUS | fuse_consts::FUSE_READDIRPLUS_AUTO;
 const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
 const MAX_ACCESS_PREDICTOR_ENTRIES: usize = 4096;
 const BACKPRESSURE_THROTTLE_DELAY: Duration = Duration::from_millis(5);
@@ -5413,6 +5420,14 @@ impl Filesystem for FrankenFuse {
             ),
         }
 
+        match config.add_capabilities(READDIRPLUS_CAPABILITIES) {
+            Ok(()) => debug!("FUSE readdirplus capabilities enabled"),
+            Err(missing) => debug!(
+                missing,
+                "kernel declined one or more FUSE readdirplus capabilities"
+            ),
+        }
+
         match config.set_max_stack_depth(1) {
             Ok(_) => match config.add_capabilities(fuse_consts::FUSE_PASSTHROUGH) {
                 Ok(()) => debug!("FUSE passthrough capability enabled"),
@@ -7071,6 +7086,19 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn readdirplus_capabilities_enable_only_directory_metadata_coalescing() {
+        assert_eq!(
+            READDIRPLUS_CAPABILITIES,
+            fuse_consts::FUSE_DO_READDIRPLUS | fuse_consts::FUSE_READDIRPLUS_AUTO
+        );
+        assert_eq!(
+            READDIRPLUS_CAPABILITIES & fuse_consts::FUSE_SPLICE_READ,
+            0,
+            "directory metadata negotiation must not change the read-data transport"
+        );
+    }
 
     /// Minimal FsOps test helper for tests that don't need real filesystem behavior.
     struct MinimalTestFs;
