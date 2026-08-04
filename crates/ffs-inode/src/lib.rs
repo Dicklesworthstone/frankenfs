@@ -375,7 +375,7 @@ pub fn create_inode(
         checksum: 0,
         version_hi: 0,
         projid: 0,
-        extent_bytes,
+        extent_bytes: extent_bytes.into(),
         xattr_ibody: Vec::new(),
         number: 0,
     };
@@ -769,6 +769,11 @@ pub fn delete_inode(
         inode.file_acl = 0;
     }
 
+    // Capture the file type before the mode is cleared: freeing a directory
+    // inode must decrement its group's `bg_used_dirs_count` (bd-0y7jp), and
+    // that decision is unrecoverable once `mode` is zeroed below.
+    let was_directory = (inode.mode & S_IFMT) == S_IFDIR;
+
     // Set deletion time.
     #[allow(clippy::cast_possible_truncation)]
     {
@@ -783,7 +788,7 @@ pub fn delete_inode(
     write_inode(cx, dev, geo, groups, ino, inode, csum_seed)?;
 
     // Free the inode in the bitmap.
-    ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, pctx)?;
+    ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, was_directory, pctx)?;
 
     Ok(())
 }
