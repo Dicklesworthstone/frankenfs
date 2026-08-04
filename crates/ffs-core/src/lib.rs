@@ -26825,6 +26825,29 @@ impl OpenFs {
     /// csum tree (bd-x3fcu), so a committed csum tree never carries checksums
     /// for extents that no longer exist (which `btrfs check` would flag). A
     /// no-op for ranges with no recorded checksums (e.g. NODATASUM data).
+    /// Drop the data checksums covering `[disk_bytenr, disk_bytenr +
+    /// disk_num_bytes)`, truncating or splitting any item that only partially
+    /// overlaps it.
+    ///
+    /// One `EXTENT_CSUM` item holds up to
+    /// [`ffs_btrfs::max_data_csums_per_item`] checksums — about 16 MiB of data
+    /// at a 16 KiB nodesize — and is keyed by the disk bytenr of the FIRST
+    /// sector it covers. So an item whose key sits *before* the freed range can
+    /// still hold that range's checksums. Deleting only the items whose key
+    /// falls inside the range therefore leaves checksums behind for bytes whose
+    /// extent is gone, and `btrfs check` reports exactly that:
+    ///
+    /// ```text
+    /// csum exists for 13631488-14684160 but there is no extent record
+    /// ERROR: errors found in csum tree
+    /// ```
+    ///
+    /// That was reachable from any overwrite of a file whose extent shared a
+    /// csum item with its neighbours (bd-btrfs-orphaned-csum-items-bmksa). This
+    /// mirrors the kernel's `btrfs_del_csums`: every *overlapping* item is
+    /// removed, and whichever prefix and suffix lie outside the freed range are
+    /// re-inserted as items of their own, so neighbouring extents keep their
+    /// checksums.
     fn btrfs_remove_extent_csums(
         alloc: &mut BtrfsAllocState,
         disk_bytenr: u64,
@@ -26833,27 +26856,88 @@ impl OpenFs {
         if disk_bytenr == 0 || disk_num_bytes == 0 {
             return Ok(());
         }
-        let last = disk_bytenr.saturating_add(disk_num_bytes.saturating_sub(1));
+        let sectorsize = u64::from(alloc.sectorsize);
+        if sectorsize == 0 {
+            return Err(FfsError::Format("btrfs sectorsize must be non-zero".into()));
+        }
+        let csum_size = u64::try_from(ffs_btrfs::BTRFS_CRC32C_CSUM_SIZE)
+            .map_err(|_| FfsError::Format("csum size does not fit u64".into()))?;
+        let remove_end = disk_bytenr.saturating_add(disk_num_bytes);
+
+        // An item starting up to (max_csums_per_item - 1) sectors before the
+        // range can still reach into it, so the scan must begin that far back.
+        let max_span = u64::try_from(ffs_btrfs::max_data_csums_per_item(alloc.nodesize))
+            .unwrap_or(1)
+            .saturating_mul(sectorsize);
+        let scan_lo = disk_bytenr.saturating_sub(max_span.saturating_sub(sectorsize));
         let lo = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
             item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
-            offset: disk_bytenr,
+            offset: scan_lo,
         };
         let hi = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
             item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
-            offset: last,
+            offset: remove_end.saturating_sub(1),
         };
-        let mut stale = Vec::new();
+
+        let mut overlapping: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
         alloc
             .csum_tree
-            .range_with(&lo, &hi, |key, _| stale.push(key))
+            .range_with(&lo, &hi, |key, value| {
+                let sectors = u64::try_from(value.len()).unwrap_or(0) / csum_size;
+                let item_end = key.offset.saturating_add(sectors.saturating_mul(sectorsize));
+                // Half-open overlap: an item ending exactly at the range start
+                // covers none of it.
+                if item_end > disk_bytenr && key.offset < remove_end {
+                    overlapping.push((key, value.to_vec()));
+                }
+            })
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        for key in stale {
+
+        for (key, value) in overlapping {
             alloc
                 .csum_tree
                 .delete(&key)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+            // Sectors of this item that lie before the freed range survive,
+            // keyed where the item already was.
+            if key.offset < disk_bytenr {
+                let keep = usize::try_from((disk_bytenr - key.offset) / sectorsize * csum_size)
+                    .unwrap_or(0)
+                    .min(value.len());
+                if keep > 0 {
+                    alloc
+                        .csum_tree
+                        .insert(key, &value[..keep])
+                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                }
+            }
+
+            // Sectors at or after the end of the freed range survive too, but
+            // must be re-keyed to the first sector they now cover.
+            let item_sectors = u64::try_from(value.len()).unwrap_or(0) / csum_size;
+            let item_end = key.offset.saturating_add(item_sectors.saturating_mul(sectorsize));
+            if item_end > remove_end {
+                let skip_sectors = remove_end.saturating_sub(key.offset).div_ceil(sectorsize);
+                let skip = usize::try_from(skip_sectors.saturating_mul(csum_size))
+                    .unwrap_or(value.len())
+                    .min(value.len());
+                if skip < value.len() {
+                    let suffix_key = BtrfsKey {
+                        objectid: key.objectid,
+                        item_type: key.item_type,
+                        offset: key
+                            .offset
+                            .saturating_add(skip_sectors.saturating_mul(sectorsize)),
+                    };
+                    alloc
+                        .csum_tree
+                        .insert(suffix_key, &value[skip..])
+                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                }
+            }
         }
         Ok(())
     }
@@ -52002,6 +52086,87 @@ mod tests {
             .map(|(key, _)| key.offset)
             .collect::<Vec<_>>();
         assert_eq!(offsets, vec![before_bytenr, after_bytenr]);
+    }
+
+    /// bd-btrfs-orphaned-csum-items-bmksa: one `EXTENT_CSUM` item covers up to
+    /// ~4064 sectors and is keyed by the first sector it covers, so freeing an
+    /// extent in the MIDDLE of an item must truncate and re-key that item, not
+    /// skip it (which orphans the freed range's checksums) and not delete it
+    /// whole (which throws away the neighbours'). The sibling test above only
+    /// ever builds single-sector items, which is why this went unnoticed until
+    /// `btrfs check` reported "csum exists for 13631488-14684160 but there is
+    /// no extent record" after a mounted overwrite.
+    #[test]
+    fn btrfs_remove_extent_csums_splits_a_multi_sector_item_bd_orphaned_csums() {
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            btrfs_rw_ephemeral_ok: true,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_btrfs_csum_image())),
+            &opts,
+        )
+        .expect("open csum image");
+        fs.enable_writes(&cx).expect("enable writes");
+
+        let base = BTRFS_TEST_FILE_DATA_LOGICAL as u64;
+        let sector = 4096_u64;
+        // One item covering four consecutive sectors, each with a checksum that
+        // identifies its sector so a mis-slice is visible rather than silent.
+        let csums: [[u8; 4]; 4] = [
+            [0xA0, 0xA1, 0xA2, 0xA3],
+            [0xB0, 0xB1, 0xB2, 0xB3],
+            [0xC0, 0xC1, 0xC2, 0xC3],
+            [0xD0, 0xD1, 0xD2, 0xD3],
+        ];
+        let key = BtrfsKey {
+            objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
+            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
+            offset: base,
+        };
+        {
+            let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
+            alloc
+                .csum_tree
+                .upsert(key, &csums.concat())
+                .expect("seed one four-sector checksum item");
+        }
+
+        // Free the two middle sectors: an interior hole, which forces both a
+        // truncate of the prefix and a re-key of the suffix.
+        {
+            let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
+            OpenFs::btrfs_remove_extent_csums(&mut alloc, base + sector, 2 * sector)
+                .expect("remove csums for the freed interior range");
+        }
+
+        let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+        let lo = BtrfsKey {
+            offset: 0,
+            ..key
+        };
+        let hi = BtrfsKey {
+            offset: u64::MAX,
+            ..key
+        };
+        let items = alloc.csum_tree.range(&lo, &hi).expect("scan csum tree");
+        let found: Vec<(u64, Vec<u8>)> = items
+            .into_iter()
+            .filter(|(k, _)| k.offset >= base && k.offset < base + 4 * sector)
+            .map(|(k, v)| (k.offset, v))
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![
+                (base, csums[0].to_vec()),
+                (base + 3 * sector, csums[3].to_vec()),
+            ],
+            "the untouched first and last sectors must keep their checksums, at \
+             their own keys, and the two freed sectors must keep none"
+        );
     }
 
     #[test]
