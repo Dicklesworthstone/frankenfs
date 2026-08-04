@@ -70,6 +70,8 @@ const READDIRPLUS_CAPABILITIES: u64 =
     fuse_consts::FUSE_DO_READDIRPLUS | fuse_consts::FUSE_READDIRPLUS_AUTO;
 const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
 const MAX_ACCESS_PREDICTOR_ENTRIES: usize = 4096;
+const MAX_READONLY_XATTR_CACHE_ENTRIES: usize = 32;
+const MAX_READONLY_XATTR_CACHE_VALUE_BYTES: usize = 64 * 1024;
 const BACKPRESSURE_THROTTLE_DELAY: Duration = Duration::from_millis(5);
 const BACKPRESSURE_SLEEP_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 const MOUNT_HANDLE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1215,6 +1217,135 @@ impl ReadaheadManager {
     }
 }
 
+/// Bounded memoization for xattr reads from immutable mounts.
+///
+/// The kernel must still issue an individual FUSE request for every xattr
+/// operation, but immutable images cannot change an xattr while mounted.  Keep
+/// parsing and external-xattr-block reads out of repeated requests without
+/// extending that assumption to read-write mounts.
+#[derive(Debug, Default)]
+struct ReadonlyXattrCache {
+    state: Mutex<ReadonlyXattrCacheState>,
+}
+
+#[derive(Debug, Default)]
+struct ReadonlyXattrCacheState {
+    values: Vec<ReadonlyXattrValue>,
+    lists: Vec<ReadonlyXattrList>,
+}
+
+#[derive(Debug)]
+struct ReadonlyXattrValue {
+    ino: InodeNumber,
+    name: String,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct ReadonlyXattrList {
+    ino: InodeNumber,
+    payload: Vec<u8>,
+}
+
+impl ReadonlyXattrCache {
+    fn value(&self, ino: InodeNumber, name: &str) -> Option<Option<Vec<u8>>> {
+        let guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("ReadonlyXattrCache state lock poisoned in value, recovering");
+                poisoned.into_inner()
+            }
+        };
+        let value = guard
+            .values
+            .iter()
+            .find(|entry| entry.ino == ino && entry.name == name)
+            .map(|entry| entry.value.clone());
+        drop(guard);
+        value
+    }
+
+    fn remember_value(&self, ino: InodeNumber, name: &str, value: &Option<Vec<u8>>) {
+        if ino.0 == 0
+            || name
+                .len()
+                .saturating_add(value.as_ref().map_or(0, Vec::len))
+                > MAX_READONLY_XATTR_CACHE_VALUE_BYTES
+        {
+            return;
+        }
+
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("ReadonlyXattrCache state lock poisoned in remember_value, recovering");
+                poisoned.into_inner()
+            }
+        };
+        if let Some(entry) = guard
+            .values
+            .iter_mut()
+            .find(|entry| entry.ino == ino && entry.name == name)
+        {
+            entry.value.clone_from(value);
+            return;
+        }
+        if guard.values.len() == MAX_READONLY_XATTR_CACHE_ENTRIES {
+            let _ = guard.values.remove(0);
+        }
+        guard.values.push(ReadonlyXattrValue {
+            ino,
+            name: name.to_owned(),
+            value: value.clone(),
+        });
+    }
+
+    fn list_payload(&self, ino: InodeNumber) -> Option<Vec<u8>> {
+        let guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("ReadonlyXattrCache state lock poisoned in list_payload, recovering");
+                poisoned.into_inner()
+            }
+        };
+        let payload = guard
+            .lists
+            .iter()
+            .find(|entry| entry.ino == ino)
+            .map(|entry| entry.payload.clone());
+        drop(guard);
+        payload
+    }
+
+    fn remember_list_payload(&self, ino: InodeNumber, payload: &[u8]) {
+        if ino.0 == 0 || payload.len() > MAX_READONLY_XATTR_CACHE_VALUE_BYTES {
+            return;
+        }
+
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!(
+                    "ReadonlyXattrCache state lock poisoned in remember_list_payload, recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        if let Some(entry) = guard.lists.iter_mut().find(|entry| entry.ino == ino) {
+            entry.payload.clear();
+            entry.payload.extend_from_slice(payload);
+            return;
+        }
+        if guard.lists.len() == MAX_READONLY_XATTR_CACHE_ENTRIES {
+            let _ = guard.lists.remove(0);
+        }
+        guard.lists.push(ReadonlyXattrList {
+            ino,
+            payload: payload.to_vec(),
+        });
+    }
+}
+
 /// Lock-free cache of the most recently observed missing capability xattr.
 ///
 /// The kernel still sends each FUSE `GETXATTR` request, but read-only images
@@ -1249,7 +1380,7 @@ impl LastMissingCapabilityXattr {
 ///
 /// # Subsystem lock-ordering invariant (bd-omus6)
 ///
-/// Four subsystem locks live inside this struct, each guarding
+/// Five subsystem locks live inside this struct, each guarding
 /// independent state:
 ///
 /// | Field              | Inner lock                          | Rank |
@@ -1257,6 +1388,7 @@ impl LastMissingCapabilityXattr {
 /// | `kernel_notifier`  | `Mutex<Option<Notifier>>`           | leaf |
 /// | `access_predictor` | `AccessPredictor.state: Mutex`      | leaf |
 /// | `readahead`        | `ReadaheadManager.pending: Mutex`   | leaf |
+/// | `readonly_xattr_cache` | `ReadonlyXattrCache.state: Mutex` | leaf |
 /// | `missing_capability_xattr` | `LastMissingCapabilityXattr.inode: AtomicU64` | leaf |
 /// | `inode_locks`      | `FuseInodeLocks.table: Mutex`       | 0 (see bd-pfv55 doc on FuseInodeLocks for the per-inode `held` rank-1 sublock) |
 ///
@@ -1275,6 +1407,7 @@ impl LastMissingCapabilityXattr {
 /// | `AccessPredictor::invalidate_inode` | access_predictor | leaf-only                        |
 /// | `ReadaheadManager::insert/take` | readahead          | leaf-only                        |
 /// | `ReadaheadManager::invalidate_inode` | readahead       | leaf-only                        |
+/// | `ReadonlyXattrCache` methods    | readonly_xattr_cache | leaf-only                      |
 /// | `LastMissingCapabilityXattr::{contains,remember}` | missing_capability_xattr | leaf-only |
 /// | `FuseInodeLocks::acquire`       | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeLocks::try_acquire`   | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
@@ -1307,6 +1440,7 @@ struct FuseInner {
     backpressure: Option<Arc<BackpressureGate>>,
     access_predictor: AccessPredictor,
     readahead: ReadaheadManager,
+    readonly_xattr_cache: ReadonlyXattrCache,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
 }
@@ -2042,6 +2176,7 @@ impl FrankenFuse {
                 backpressure,
                 access_predictor: AccessPredictor::default(),
                 readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+                readonly_xattr_cache: ReadonlyXattrCache::default(),
                 missing_capability_xattr: LastMissingCapabilityXattr::default(),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
             }),
@@ -5463,11 +5598,22 @@ impl FrankenFuse {
             return Ok(None);
         }
 
+        if self.inner.read_only
+            && let Some(value) = self.inner.readonly_xattr_cache.value(ino, name)
+        {
+            return Ok(value);
+        }
+
         let value = self.with_request_scope(cx, RequestOp::Getxattr, |cx, _scope| {
             self.inner.ops.getxattr(cx, ino, name)
         })?;
         if is_capability_probe && value.is_none() {
             self.inner.missing_capability_xattr.remember(ino);
+        }
+        if self.inner.read_only {
+            self.inner
+                .readonly_xattr_cache
+                .remember_value(ino, name, &value);
         }
         Ok(value)
     }
@@ -6062,12 +6208,24 @@ impl Filesystem for FrankenFuse {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let ino = InodeNumber(ino);
+        if self.inner.read_only
+            && let Some(payload) = self.inner.readonly_xattr_cache.list_payload(ino)
+        {
+            Self::reply_xattr_payload(size, &payload, reply);
+            return;
+        }
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Listxattr, |cx, _scope| {
-            self.inner.ops.listxattr(cx, InodeNumber(ino))
+            self.inner.ops.listxattr(cx, ino)
         }) {
             Ok(names) => {
                 let payload = Self::encode_xattr_names(&names);
+                if self.inner.read_only {
+                    self.inner
+                        .readonly_xattr_cache
+                        .remember_list_payload(ino, &payload);
+                }
                 Self::reply_xattr_payload(size, &payload, reply);
             }
             Err(e) => {
@@ -6075,7 +6233,7 @@ impl Filesystem for FrankenFuse {
                     &FuseErrorContext {
                         error: &e,
                         operation: "listxattr",
-                        ino,
+                        ino: ino.0,
                         offset: None,
                     },
                     reply,
@@ -7344,7 +7502,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_missing_capability_xattr_is_cached_without_aliasing_other_queries() {
+    fn readonly_xattr_values_are_memoized_without_caching_zero_inode_or_rw_mounts() {
         let calls = Arc::new(AtomicUsize::new(0));
         let fuse = FrankenFuse::with_options(
             Box::new(CountingMissingXattrFs {
@@ -7383,7 +7541,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert!(
             fuse.getxattr_value(&cx, InodeNumber(0), SECURITY_CAPABILITY_XATTR)
                 .unwrap()
@@ -7394,7 +7552,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
 
         let rw_calls = Arc::new(AtomicUsize::new(0));
         let rw_fuse = FrankenFuse::with_options(
@@ -7419,6 +7577,25 @@ mod tests {
                 .is_none()
         );
         assert_eq!(rw_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn readonly_xattr_cache_retains_values_lists_and_missing_results() {
+        let cache = ReadonlyXattrCache::default();
+        let ino = InodeNumber(42);
+
+        cache.remember_value(ino, "user.color", &Some(b"blue".to_vec()));
+        cache.remember_value(ino, "user.absent", &None);
+        cache.remember_list_payload(ino, b"user.color\0user.absent\0");
+
+        assert_eq!(cache.value(ino, "user.color"), Some(Some(b"blue".to_vec())));
+        assert_eq!(cache.value(ino, "user.absent"), Some(None));
+        assert_eq!(
+            cache.list_payload(ino),
+            Some(b"user.color\0user.absent\0".to_vec())
+        );
+        assert_eq!(cache.value(InodeNumber(0), "user.color"), None);
+        assert_eq!(cache.list_payload(InodeNumber(0)), None);
     }
 
     fn existing_file_mountpoint() -> PathBuf {
@@ -17636,6 +17813,7 @@ mod tests {
             backpressure: None,
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+            readonly_xattr_cache: ReadonlyXattrCache::default(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
@@ -18993,6 +19171,7 @@ AllowOther"#;
             backpressure: None,
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(8),
+            readonly_xattr_cache: ReadonlyXattrCache::default(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
