@@ -13,6 +13,42 @@ met by new profile evidence.
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
 
+## Benchmark-admission blocker: btrfs unlink avoids a redundant inode lookup, but no production candidate is available - 2026-08-04
+
+`bd-btrfs-create-delete-storm-2p36x-w57dg` reuses the initial pre-mutation
+`btrfs_read_inode_from_tree` in `btrfs_unlink_impl` instead of performing a
+second child-inode lookup after the adjustment.  The validated `nlink - 1`
+transition is the only intervening link-count mutation, so `nlink <= 1` is
+exactly the post-adjustment zero-link/purge predicate.  The same bead adds a
+64-file create/delete test that requires every final unlink to remove both the
+directory entry and inode.
+
+No mounted-kernel ratio is claimed.  The only locally available driver/candidate
+pair was driver SHA-256
+`004e58a65160fd248b876e21e67bec63dbd9f8cd9d769d06582ee4308995868` and
+candidate SHA-256
+`86e25c6c47eee8bc2ac8e81f2d7be14b843ffc59188d0e69adada25f61898e6d`.
+The exact btrfs 2,000-operation, 12-pair invocation refused before mounting:
+
+```
+mounted_kernel_gate,error=candidate is not the x86-64-v3 production ISA: missing compile_sse4_2=true
+```
+
+The required strict-remote targeted test also could not reach the new test:
+the transferred workspace has unrelated `ffs-core` type/API errors at 5904,
+5934, 13244, 15903, 16152, 16319, 16449, 19450, and 19517.  Full remote
+`cargo check --all-targets` separately stopped in the unrelated
+`ffs-journal` descriptor-decode bench API, and full remote Clippy stopped on
+pre-existing `ffs-ondisk` diagnostics.  These are blockers, not evidence for
+or against this lever.
+
+**Retry predicate:** provide a freshly built, executing x86-64-v3 + PGO
+candidate whose in-process SHA-256 and profile identity satisfy the harness, then
+run the btrfs create/delete storm with 2,000 operations in one four-arm
+invocation.  Require both A/A median-CIs to contain 1 before interpreting the
+candidate/kernel ratio; do not reuse the baseline-ISA artifact that failed
+identity admission.
+
 ## REJECT + REVERT: logical B-epsilon create messages double the mounted metadata gap - 2026-08-02
 
 This attempt did not repeat the rejected whole-block overlay below. It buffered

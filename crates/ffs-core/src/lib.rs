@@ -21552,10 +21552,11 @@ impl OpenFs {
         // Drop the removed link (-1 for both files and directories).
         self.btrfs_adjust_nlink(&mut alloc, child_oid, -1)?;
 
-        // If nlink reached 0, purge the orphaned inode and all its data.
-        let child_inode = self.btrfs_read_inode_from_tree(&alloc, child_oid)?;
-        if child_inode.nlink == 0 {
-            debug_assert!(child_will_be_purged);
+        // `btrfs_adjust_nlink` was validated above and is the only mutation of
+        // this inode's link count in this transaction. Reuse the pre-mutation
+        // nlink decision instead of performing a second B-tree inode lookup on
+        // every unlink.
+        if child_will_be_purged {
             self.btrfs_purge_inode(&mut alloc, child_oid)?;
         }
 
@@ -59537,6 +59538,46 @@ mod tests {
             ops.getattr(&cx, &mut RequestScope::empty(), attr.ino)
                 .is_err()
         );
+    #[test]
+    fn btrfs_write_create_delete_storm_purges_every_single_link_inode() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+        let root = InodeNumber(1);
+        let mut created = Vec::new();
+
+        for index in 0..64 {
+            let name = format!("storm-{index:03}.tmp");
+            let attr = ops
+                .create(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    root,
+                    OsStr::new(&name),
+                    0o644,
+                    0,
+                    0,
+                )
+                .unwrap_or_else(|err| panic!("create {name}: {err:?}"));
+            created.push((name, attr.ino));
+        }
+
+        for (name, ino) in &created {
+            ops.unlink(&cx, &mut RequestScope::empty(), root, OsStr::new(name))
+                .unwrap_or_else(|err| panic!("unlink {name}: {err:?}"));
+            let err = ops
+                .getattr(&cx, &mut RequestScope::empty(), *ino)
+                .expect_err("the final unlink must purge the inode");
+            assert_eq!(err.to_errno(), libc::ENOENT, "purged {name}");
+        }
+
+        for (name, _) in &created {
+            let err = ops
+                .lookup(&cx, &mut RequestScope::empty(), root, OsStr::new(name))
+                .expect_err("the unlinked directory entry must be absent");
+            assert_eq!(err.to_errno(), libc::ENOENT, "removed {name}");
+        }
+    }
+
     }
 
     #[test]
