@@ -91,13 +91,13 @@ struct HistogramState {
 }
 
 fn saturating_fetch_add_i64(value: &AtomicI64, delta: i64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(delta))
     });
 }
 
 fn saturating_fetch_add_u64(value: &AtomicU64, delta: u64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(delta))
     });
 }

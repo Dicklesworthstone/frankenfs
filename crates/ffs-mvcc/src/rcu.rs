@@ -42,7 +42,7 @@ use tracing::{debug, info, trace, warn};
 
 fn saturating_increment(counter: &AtomicU64) -> u64 {
     loop {
-        match counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        match counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         }) {
             Ok(previous) => return previous.saturating_add(1),

@@ -39,7 +39,7 @@ use tracing::{debug, error, info, trace, warn};
 
 fn saturating_increment_atomic(counter: &AtomicU64, ordering: Ordering) -> u64 {
     loop {
-        if let Ok(previous) = counter.fetch_update(ordering, Ordering::Relaxed, |current| {
+        if let Ok(previous) = counter.try_update(ordering, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         }) {
             return previous.saturating_add(1);
@@ -4129,7 +4129,7 @@ impl Drop for StoreBackedFlushPin {
 
         if self
             .active_flush_pins
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             })
             .is_err()

@@ -19,7 +19,7 @@ use tracing::{info, trace};
 
 fn saturating_increment_relaxed(counter: &AtomicU64) {
     while counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         })
         .is_err()

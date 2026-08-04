@@ -64,7 +64,7 @@ impl EpochCounter {
     pub fn advance(&self) -> u64 {
         match self
             .value
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             }) {
             Ok(prev) => prev + 1,
@@ -326,7 +326,7 @@ static NEXT_CORE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[allow(deprecated)]
 fn allocate_core_id(counter: &AtomicU64) -> usize {
-    let id = match counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let id = match counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         current.checked_add(1)
     }) {
         Ok(previous) | Err(previous) => previous,
@@ -541,7 +541,7 @@ impl EpochManager {
     fn increment_commits_in_epoch(&self) -> u64 {
         match self
             .commits_in_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(1))
             }) {
             Ok(previous) => previous.saturating_add(1),

@@ -31,7 +31,7 @@ fn hammer_fetch_update(threads: usize) {
             scope.spawn(move || {
                 for _ in 0..PER_THREAD {
                     let v = ctr
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
                         .expect("counter does not overflow in-bench");
                     black_box(v);
                 }
@@ -55,7 +55,7 @@ fn hammer_margin_guarded(threads: usize) {
                     let v = if ctr.load(Ordering::Relaxed) < u64::MAX - MARGIN {
                         ctr.fetch_add(1, Ordering::SeqCst)
                     } else {
-                        ctr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
+                        ctr.try_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
                             .expect("counter does not overflow in-bench")
                     };
                     black_box(v);

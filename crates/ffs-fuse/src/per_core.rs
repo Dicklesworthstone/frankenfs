@@ -62,7 +62,7 @@ impl CoreMetrics {
     )]
     fn saturating_add_u64(counter: &AtomicU64, delta: u64) {
         while counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(delta))
             })
             .is_err()
@@ -77,7 +77,7 @@ impl CoreMetrics {
     )]
     fn saturating_add_i64(counter: &AtomicI64, delta: i64) {
         while counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(delta))
             })
             .is_err()
@@ -92,7 +92,7 @@ impl CoreMetrics {
     )]
     fn saturating_decrement_nonnegative_i64(counter: &AtomicI64) {
         while counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(1).max(0))
             })
             .is_err()

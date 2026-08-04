@@ -964,7 +964,7 @@ impl ShardedMvccStore {
         // real but end-to-end negligible (this atomic is <0.5% of a commit).
         match self
             .next_commit
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(1)
             }) {
             Ok(prev) => Ok(CommitSeq(prev)),
@@ -977,7 +977,7 @@ impl ShardedMvccStore {
     fn next_txn_id(&self) -> Result<TxnId, CommitError> {
         match self
             .next_txn
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 if (1..u64::MAX).contains(&current) {
                     Some(current + 1)
                 } else {

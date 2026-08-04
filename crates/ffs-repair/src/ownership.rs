@@ -591,7 +591,7 @@ fn ymd_to_days(year: u64, month: u64, day: u64) -> u64 {
 
 fn next_temp_file_nonce(counter: &AtomicU64) -> std::io::Result<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map_err(|_| std::io::Error::other("repair ownership temporary file nonce exhausted"))
