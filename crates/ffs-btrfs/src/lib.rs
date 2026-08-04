@@ -15116,6 +15116,76 @@ mod tests {
         assert_eq!(alloc.delayed_ref_count(), 0);
     }
 
+    /// bd-ftev0: the state above — a block group whose tally says "empty" while
+    /// the extent tree says "allocated" — is exactly what mount used to build,
+    /// because block groups are registered from the chunk map before the
+    /// on-disk extent tree is walked. Every overwrite of a file that came from
+    /// the image then hit the underflow guard and surfaced as `EIO`.
+    ///
+    /// `sync_block_group_accounting` is the reconciliation: it recomputes each
+    /// group's `used_bytes` as the sum of the allocation items physically
+    /// inside it, which is the definition `btrfs check` enforces. Freeing the
+    /// pre-existing extent must then succeed, and the tally must land back at
+    /// zero — the guard is not weakened, it stops being reachable from a
+    /// correctly loaded filesystem.
+    #[test]
+    fn reconciled_block_group_accounting_makes_a_preexisting_extent_freeable_bd_ftev0() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        let bg_start = 0x10_0000;
+        alloc.add_block_group(bg_start, make_data_bg(bg_start, 8192));
+        let key = BtrfsKey {
+            objectid: bg_start,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: 4096,
+        };
+        let extent_item = BtrfsExtentItem {
+            refs: 1,
+            generation: 1,
+            flags: 0,
+        };
+        alloc
+            .extent_tree
+            .insert(key, &extent_item.to_bytes())
+            .expect("insert the extent the image already carried");
+
+        // Negative case: this is the mount-time state, and it fails closed.
+        assert_eq!(
+            alloc
+                .free_extent(bg_start, 4096, false)
+                .expect_err("unreconciled accounting must still fail closed"),
+            BtrfsMutationError::BrokenInvariant("block group used bytes underflow")
+        );
+
+        let accounted = alloc
+            .sync_block_group_accounting()
+            .expect("reconcile block group accounting");
+        assert_eq!(
+            accounted, 4096,
+            "reconciliation must account the extent the extent tree already holds"
+        );
+        assert_eq!(
+            alloc.block_group(bg_start).expect("bg").used_bytes,
+            4096,
+            "the group's tally must match its allocation items"
+        );
+
+        alloc
+            .free_extent(bg_start, 4096, false)
+            .expect("freeing a pre-existing extent must succeed once reconciled");
+
+        let bg = alloc.block_group(bg_start).expect("bg");
+        assert_eq!(bg.used_bytes, 0, "freeing the only extent empties the group");
+        assert_eq!(bg.total_bytes, 8192, "capacity is untouched by the free");
+        assert!(
+            alloc
+                .extent_tree
+                .range(&key, &key)
+                .expect("extent lookup")
+                .is_empty(),
+            "a successful free removes the extent item"
+        );
+    }
+
     #[test]
     fn reclaim_unreferenced_data_extents_frees_orphans_only() {
         let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");

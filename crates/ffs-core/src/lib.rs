@@ -6053,6 +6053,36 @@ impl OpenFs {
             0
         };
 
+        // ── Reconcile block-group accounting with the loaded extent tree ─────
+        //
+        // The block groups above were synthesized from the chunk map with a
+        // synthetic `used_bytes` (zero, or the reserved prefix for a chunk
+        // rooted at logical 0) because the extent tree had not been walked yet.
+        // Every extent the image already carried was therefore invisible to the
+        // allocator's accounting, so the first `free_extent` of a pre-existing
+        // extent underflowed `used_bytes` and raised
+        // `BrokenInvariant("block group used bytes underflow")` — surfacing at
+        // the mount as EIO on the very first overwrite of any file that came
+        // from the image (bd-ftev0). Recomputing `used_bytes` as the sum of the
+        // group's allocation items is exactly what `btrfs check` does, and is
+        // what the commit path already does before writing BLOCK_GROUP_ITEMs.
+        //
+        // Only meaningful once real extent items are loaded: with an empty
+        // extent tree (synthetic fixtures) the sum is zero and the synthetic
+        // reservation is the better estimate. The allocation fence itself lives
+        // in `min_usable_offset`, which this does not touch, so the bytenr-0
+        // sentinel protection (bd-5aybu) is unaffected either way.
+        if extent_tree_items_loaded > 0 {
+            let accounted = extent_alloc
+                .sync_block_group_accounting()
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            debug!(
+                target: "ffs::write",
+                accounted_bytes_used = accounted,
+                "reconciled block group accounting with on-disk extent tree"
+            );
+        }
+
         info!(
             target: "ffs::write",
             nodesize,

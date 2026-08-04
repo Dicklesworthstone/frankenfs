@@ -2731,6 +2731,42 @@ fn open_btrfs_mkfs(size_mb: u64) -> (OpenFs, tempfile::TempDir, std::path::PathB
     (fs, tmp, image)
 }
 
+/// Build a btrfs image whose root directory already contains `name` holding
+/// `contents`, using `mkfs.btrfs -r` exactly the way the mounted comparator
+/// seeds its workload fixtures (bd-ftev0).
+fn open_btrfs_mkfs_rootdir(
+    size_mb: u64,
+    name: &str,
+    contents: &[u8],
+) -> (OpenFs, tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::TempDir::new().expect("tmpdir for btrfs rootdir image");
+    let rootdir = tmp.path().join("rootdir");
+    std::fs::create_dir_all(&rootdir).expect("create btrfs rootdir fixture");
+    std::fs::write(rootdir.join(name), contents).expect("write btrfs rootdir fixture file");
+
+    let image = tmp.path().join("conformance-rootdir.btrfs");
+    let file = std::fs::File::create(&image).expect("create btrfs rootdir image");
+    file.set_len(size_mb.max(128) * 1024 * 1024)
+        .expect("size btrfs rootdir image");
+    drop(file);
+
+    let mkfs = std::process::Command::new("mkfs.btrfs")
+        .args(["-f", "-q", "-r"])
+        .arg(&rootdir)
+        .arg(&image)
+        .output()
+        .expect("spawn mkfs.btrfs -r");
+    assert!(
+        mkfs.status.success(),
+        "mkfs.btrfs -r failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&mkfs.stdout),
+        String::from_utf8_lossy(&mkfs.stderr)
+    );
+
+    let fs = open_btrfs_image(&image);
+    (fs, tmp, image)
+}
+
 fn mkfs_writable_ext4_image(size_mb: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::TempDir::new().expect("tmpdir for writable ext4");
     let image = tmp.path().join("conformance.ext4");
@@ -3725,6 +3761,56 @@ fn btrfs_fallocate_does_not_prealloc_over_live_data_conforms() {
         .read(&cx, attr.ino, 0, 8192)
         .expect("read live btrfs file after overlapping prealloc");
     assert_eq!(readback, live);
+}
+
+/// bd-ftev0: the mounted comparator's `fsync-journal-commit` workload rewrites a
+/// file that `mkfs.btrfs -r` placed in the image, and every positioned write
+/// returned `EIO`. The file already owns a data extent that mkfs allocated, so
+/// this exercises the overwrite path (free the old extent, allocate a new one)
+/// rather than the fresh-file path the other btrfs write tests cover.
+#[test]
+fn btrfs_positioned_write_over_mkfs_populated_file_conforms() {
+    let cx = Cx::for_testing();
+    let seed = [0xF5_u8; 4096];
+    let (mut fs, _tmp, _image) = open_btrfs_mkfs_rootdir(512, "fsync.bin", &seed);
+    fs.enable_writes(&cx)
+        .expect("enable writes on btrfs rootdir-populated image");
+
+    let attr = fs
+        .lookup(&cx, InodeNumber(1), OsStr::new("fsync.bin"))
+        .expect("lookup mkfs-populated btrfs file");
+    assert_eq!(attr.size, 4096, "fixture file should carry mkfs content");
+    assert_eq!(
+        fs.read(&cx, attr.ino, 0, 4096)
+            .expect("read mkfs-populated btrfs file"),
+        seed,
+        "fixture content must differ from every payload written below"
+    );
+
+    // Eight 4 KiB positioned writes to offset 0, exactly like the workload.
+    for index in 0..8_u8 {
+        let payload = [index.wrapping_mul(17).wrapping_add(3); 4096];
+        let written = fs
+            .write(&cx, attr.ino, 0, &payload)
+            .unwrap_or_else(|err| panic!("positioned write {index} over btrfs file: {err}"));
+        assert_eq!(written, 4096, "short positioned write on iteration {index}");
+        fs.fsync(&cx, attr.ino, 0, false)
+            .unwrap_or_else(|err| panic!("fsync after positioned write {index}: {err}"));
+        let readback = fs
+            .read(&cx, attr.ino, 0, 4096)
+            .unwrap_or_else(|err| panic!("read back positioned write {index}: {err}"));
+        assert_eq!(
+            readback, payload,
+            "iteration {index} must observe its own bytes, not the previous content"
+        );
+        assert_eq!(
+            fs.getattr(&cx, attr.ino)
+                .unwrap_or_else(|err| panic!("getattr after write {index}: {err}"))
+                .size,
+            4096,
+            "overwriting in place must not change the file size on iteration {index}"
+        );
+    }
 }
 
 #[test]
