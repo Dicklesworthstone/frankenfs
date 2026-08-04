@@ -182,7 +182,40 @@ reconcile from, so its existing tally legitimately stands while every real image
 correct accounting. The guard is the more correct semantic, not a way around the
 expectation.
 
-**Both probes now pass** (they were blocked for several hours by
+**The workload now runs on a real four-arm mounted comparator** — this is the
+confirmation the unit and conformance probes could not give, since those exercise
+`OpenFs` in-process rather than a live FUSE mount:
+
+```
+mounted_kernel_incumbent_isolation,...,same_invocation=true,independent_physical_arms=true,verdict=pass
+mounted_kernel_parity,...,arms=4,verdict=pass          (byte-identical trees, all four arms)
+mounted_kernel_post_parity,...,arms=4,verdict=pass     (still identical after the writes)
+worker threads 1 -> 1 observed on every arm, pinning attested
+```
+
+No `EIO` anywhere. **The run was still refused**, at the post-unmount integrity gate:
+
+```
+csum exists for 13631488-14684160 but there is no extent record
+ERROR: errors found in csum tree
+mounted_kernel_gate,error=btrfs check --readonly failed: exit status: 1
+```
+
+A FrankenFS btrfs mount that performs overwrites leaves orphaned csum items, so the image
+it unmounts is not `btrfs check` clean — filed as `bd-btrfs-orphaned-csum-items-bmksa`
+(P1), now blocking this row. That is not a `bd-ftev0` regression: before the fix the first
+write returned `EIO`, so nothing was written and nothing could be orphaned; the fix made
+the path reachable and this came with it.
+
+The run did produce a ratio its statistical gates admitted — `1.959886x`
+`[1.959096, 1.974165]`, `HONEST_LOSS` — and it is deliberately **not banked here**. A run
+that fails its integrity gate does not yield a publishable number however clean its
+statistics look, and this one is thin besides: `pairs=12` against the bank's 32,
+`observation-repeats=1`, and a freshly trained PGO profile rather than the frozen
+candidate, so it is not candidate-comparable with the five ext4 rows. It is recorded on
+the bead as evidence of direction, not as a row.
+
+**Both correctness probes pass** (they were blocked for several hours by
 `bd-bulk-revert-incident-24k-lines-w5hkf`, which left the workspace uncompilable):
 
 ```
