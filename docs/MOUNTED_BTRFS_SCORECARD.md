@@ -13,7 +13,8 @@ measurement in one invocation against four independent live mounts (`kernel_a`,
 `kernel_b`, `fuse_a`, `fuse_b`) under a four-round Latin-square physical-arm crossover,
 carrying two same-invocation A/A null controls.
 
-**Score: 1 win / 4 losses / 0 neutral / 1 workload blocked by a functional defect.**
+**Score: 1 win / 4 losses / 0 neutral / 1 workload unscored** (its blocking defect is
+fixed and closed as of 2026-08-04; the run that would score it has not happened yet).
 
 ## The rows
 
@@ -24,7 +25,7 @@ carrying two same-invocation A/A null controls.
 | **Small-file create/delete storm**, 2,000 files | **`2.358280x` `[2.322435, 2.430125]` slower** (margin `1.045128x`) | `0.996139x`, spread `1.018112x` | `0.992157x`, spread `1.022315x` | 1 → **1** | **LOSE** |
 | **Parallel metadata writes**, 512 creates, 8 threads, **128 blocks** | **`1.930090x` `[1.916623, 1.940038]` slower** (margin `1.019214x`) | `1.002214x`, spread `1.009562x` | `0.997250x`, spread `1.009114x` | 8 → **8** | **LOSE** |
 | **Multi-file parallel read**, 256 × 256 KiB, 8 threads | **`0.894290x` `[0.885022, 0.903489]` FASTER**; replicate **`0.830537x` `[0.823606, 0.835141]`** | `1.004459x` / `1.001984x` | `1.001891x` / `1.000228x` | 8 → **8** | **WIN — see caveat** |
-| **Fsync/journal commit**, 8 × 4 KiB | not measurable | — | — | — | **BLOCKED — functional defect, below** |
+| **Fsync/journal commit**, 8 × 4 KiB | not yet measured | — | — | — | **UNSCORED — defect fixed (`bd-ftev0`), run pending `bd-score-btrfs-fsync-row-d98vj`** |
 
 Every admitted row: pinning attested with the observed CPU set equal to the bound set,
 exact four-arm parity, clean post-unmount `btrfs check --readonly`, incumbent isolation
@@ -42,8 +43,9 @@ exact four-arm parity, clean post-unmount `btrfs check --readonly`, incumbent is
   creating 512 files and fsyncing their directories.
 - **Parallel read: we are faster** — 10.6% and 16.9% faster across two runs — but I am
   not banking this as a campaign win yet, for the reason below.
-- **Fsync/journal commit: we cannot run it at all** on btrfs. That is a defect, not a
-  slow number.
+- **Fsync/journal commit: no number yet.** It could not run at all until 2026-08-04; the
+  defect is fixed and verified, but a fixed defect is not a result — the row is unscored
+  until a four-arm run produces one.
 
 ## The win needs a mechanism before it counts
 
@@ -80,7 +82,7 @@ of this one. Until it runs:
 > reads, mechanism unresolved, and FrankenFS performs no read-side checksum
 > verification."* Do not quote it as a bare win.
 
-## Blocked: FrankenFS cannot do positioned writes on btrfs
+## Was blocked: FrankenFS could not do positioned writes on btrfs (fixed 2026-08-04)
 
 `fsync-journal-commit` failed **6/6 attempts**, deterministically, and not on a
 contention or null gate:
@@ -167,13 +169,23 @@ reconcile from, so its existing tally legitimately stands while every real image
 correct accounting. The guard is the more correct semantic, not a way around the
 expectation.
 
-**Neither probe has run.** Both are blocked by
-`bd-ffs-mvcc-merge-dropped-merge-proof-api-y1ch7`: the workspace does not compile at HEAD,
-because `921831b7` deleted `ffs-mvcc` internals that `sharded.rs` still calls, so
-`ffs-btrfs` and `ffs-harness` cannot be built at all. Three clean-baseline runs on three
-workers died inside `ffs-mvcc`. This row stays **BLOCKED** — the fix is not established
-until those two tests are observed passing, and the row is not scoreable until a four-arm
-run produces it.
+**Both probes now pass** (they were blocked for several hours by
+`bd-bulk-revert-incident-24k-lines-w5hkf`, which left the workspace uncompilable):
+
+```
+test btrfs_positioned_write_over_mkfs_populated_file_conforms ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 102 filtered out; finished in 0.12s
+
+test tests::reconciled_block_group_accounting_makes_a_preexisting_extent_freeable_bd_ftev0 ... ok
+test result: ok. 1 passed; 0 failed; 375 filtered out
+```
+
+`bd-ftev0` is closed on that evidence. **The row is still unscored**, and this is a
+capability fix rather than a measurement: producing the ratio needs a four-arm mounted
+comparator run with the kernel incumbent live in the same invocation, both A/A nulls, the
+observed thread count and a self-reported ELF hash — which needs root for the kernel arms
+and a quiet window. Tracked as `bd-score-btrfs-fsync-row-d98vj`. Until that run exists the
+row shows no number, because a fixed defect is not a result.
 
 ## Provenance
 
@@ -206,7 +218,7 @@ run produces it.
 | create/delete storm | `2.753659x` slower | `2.358280x` slower |
 | parallel read | `1.287862x` slower | **`0.894290x` / `0.830537x` faster** |
 | parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
-| fsync/journal commit | `0.997098x` neutral | **cannot run — `EIO`** |
+| fsync/journal commit | `0.997098x` neutral | **not yet measured — the `EIO` is fixed, the run is pending** |
 | warm stat | not in the ext4 bank | `4.977803x` / `5.036433x` slower |
 
 The parallel-read row is the only sign change anywhere in either scorecard, which is
