@@ -10,11 +10,13 @@
 pub mod per_core;
 
 use asupersync::Cx;
+#[cfg(test)]
+use ffs_core::ReaddirPage;
 use ffs_core::{
     BackpressureDecision, BackpressureGate, BtrfsQgroupLimitRequest, BtrfsTreeSearchKey,
-    DirEntry as FfsDirEntry, FIEMAP_EXTENT_UNWRITTEN, FiemapExtent,
-    FileType as FfsFileType, FsOps, FsStat, FsxattrInfo, InodeAttr, ReleaseRequest, RequestOp,
-    RequestScope, SeekWhence, SetAttrRequest, XattrSetMode,
+    DirEntry as FfsDirEntry, FIEMAP_EXTENT_UNWRITTEN, FiemapExtent, FileType as FfsFileType, FsOps,
+    FsStat, FsxattrInfo, InodeAttr, ReleaseRequest, RequestOp, RequestScope, SeekWhence,
+    SetAttrRequest, XattrSetMode,
 };
 use ffs_error::FfsError;
 use ffs_types::{EXT4_EXTENTS_FL, InodeNumber};
@@ -1910,6 +1912,7 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
 /// and ready for multi-threaded FUSE dispatch.  All `FsOps` calls go
 /// through `self.inner.ops` (which is `Arc<dyn FsOps>`), and lock-free
 /// [`AtomicMetrics`] are updated on every request.
+#[derive(Clone)]
 pub struct FrankenFuse {
     inner: Arc<FuseInner>,
 }
@@ -5655,7 +5658,7 @@ impl Filesystem for FrankenFuse {
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                for entry in &entries {
+                for entry in entries.iter() {
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -5709,7 +5712,7 @@ impl Filesystem for FrankenFuse {
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                for entry in &entries {
+                for entry in entries.iter() {
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -6799,7 +6802,11 @@ pub fn mount(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
     fs.install_kernel_notifier(session.notifier());
-    session.run()?;
+    if options.worker_threads > 0 {
+        session.run_with_workers(options.resolved_thread_count())?;
+    } else {
+        session.run()?;
+    }
     Ok(())
 }
 
@@ -6817,7 +6824,16 @@ pub fn mount_background(
     let fuse_opts = build_mount_options(options);
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     let notifier_owner = fs.shared_handle();
-    let session = fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?;
+    let session = if options.worker_threads > 0 {
+        fuser::spawn_mount2_with_workers(
+            fs,
+            mountpoint,
+            &fuse_opts,
+            options.resolved_thread_count(),
+        )?
+    } else {
+        fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?
+    };
     notifier_owner.install_kernel_notifier(session.notifier());
     Ok(session)
 }
@@ -7021,7 +7037,16 @@ pub fn mount_managed(
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
 
-    let session = fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?;
+    let session = if config.options.worker_threads > 0 {
+        fuser::spawn_mount2_with_workers(
+            fs,
+            mountpoint,
+            &fuse_opts,
+            config.options.resolved_thread_count(),
+        )?
+    } else {
+        fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?
+    };
     notifier_owner.install_kernel_notifier(session.notifier());
 
     info!(mountpoint = %mountpoint.display(), "FUSE mount active");
@@ -7073,8 +7098,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
-            Ok(vec![])
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
         }
         fn read(
             &self,
@@ -8369,7 +8394,7 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+        ) -> ffs_error::Result<ReaddirPage> {
             unreachable!("opendir validation only calls getattr")
         }
 
@@ -8575,7 +8600,7 @@ mod tests {
                 _scope: &mut RequestScope,
                 _ino: InodeNumber,
                 _offset: u64,
-            ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            ) -> ffs_error::Result<ReaddirPage> {
                 unreachable!()
             }
             fn read(
@@ -9315,8 +9340,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
-            Ok(vec![])
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
         }
 
         fn read(
@@ -14189,8 +14214,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
-            Ok(vec![])
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
         }
 
         fn read(
@@ -14347,8 +14372,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
-            Ok(vec![])
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
         }
 
         fn read(
@@ -14764,17 +14789,17 @@ mod tests {
             _scope: &mut RequestScope,
             ino: InodeNumber,
             offset: u64,
-        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+        ) -> ffs_error::Result<ReaddirPage> {
             self.calls
                 .lock()
                 .expect("lock mutation calls")
                 .push(MutationCall::Readdir { ino, offset });
-            Ok(vec![FfsDirEntry {
+            Ok(ReaddirPage::new(vec![FfsDirEntry {
                 ino: InodeNumber(404),
                 offset: offset + 1,
                 kind: FfsFileType::RegularFile,
                 name: b"entry.txt".to_vec(),
-            }])
+            }]))
         }
 
         fn read(
@@ -15991,8 +16016,8 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
-            Ok(vec![])
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
         }
 
         fn read(
@@ -17079,6 +17104,19 @@ mod tests {
         assert_send_sync::<FrankenFuse>();
         assert_send_sync::<FuseInner>();
         assert_send_sync::<AtomicMetrics>();
+    }
+
+    #[test]
+    fn franken_fuse_clone_preserves_shared_dispatch_configuration() {
+        let options = MountOptions {
+            worker_threads: 4,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(Box::new(MinimalTestFs), &options);
+        let clone = fuse.clone();
+
+        assert_eq!(clone.thread_count(), 4);
+        assert!(std::ptr::eq(clone.metrics(), fuse.metrics()));
     }
 
     #[test]
