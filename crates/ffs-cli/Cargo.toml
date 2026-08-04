@@ -33,8 +33,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [features]
-# bd-bhh0i: build the sharded (lock-free) parallel-create path into ffs-core so the
-# create-bench can toggle it on (FFS_BHH0I_SHARDED=1) for the local A/B + e2fsck gate.
+# The sharded allocator has passed the mounted parallel-create and offline e2fsck
+# gates. Ship it for writable ext4 mounts; `FFS_BHH0I_SHARDED=0` remains an
+# explicit operational rollback switch.
+default = ["bhh0i_sharded_alloc"]
 bhh0i_sharded_alloc = ["ffs-core/bhh0i_sharded_alloc", "ffs-fuse/bhh0i_sharded_alloc"]
 
 [dev-dependencies]

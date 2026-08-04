@@ -7693,20 +7693,37 @@ fn mount_with_fuse(
     // serializes on one lock and parallel metadata writes scale NEGATIVELY —
     // the mechanism behind the 1.510822x mounted loss vs kernel ext4. The
     // sharded twin allocates through per-group locks instead, so creates into
-    // disjoint groups never serialize. Off unless explicitly asked for, and a
-    // no-op unless the crate was built with the feature.
+    // disjoint groups never serialize. It is the shipping default; operators
+    // can explicitly roll back with `FFS_BHH0I_SHARDED=0`.
     #[cfg(feature = "bhh0i_sharded_alloc")]
-    if read_write && std::env::var_os("FFS_BHH0I_SHARDED").is_some() {
+    if read_write
+        && sharded_create_enabled_from_env(std::env::var("FFS_BHH0I_SHARDED").ok().as_deref())?
+    {
         let previously = open_fs.set_bhh0i_sharded_ops(true);
         eprintln!(
             "mount: bd-bhh0i sharded per-group create path ENABLED \
-             (FFS_BHH0I_SHARDED set, previous={previously})"
+             (set FFS_BHH0I_SHARDED=0 for rollback, previous={previously})"
         );
     }
 
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
     ffs_fuse::mount(fs_ops, mountpoint, &opts)
         .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
+}
+
+/// Resolve the operational rollback switch for the validated sharded ext4
+/// create path. Absence means the shipping default is enabled; only an explicit
+/// false value disables it, so an accidental non-empty value cannot silently
+/// select the slower global allocator.
+#[cfg(feature = "bhh0i_sharded_alloc")]
+fn sharded_create_enabled_from_env(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("1" | "true") => Ok(true),
+        Some("0" | "false") => Ok(false),
+        Some(value) => {
+            bail!("FFS_BHH0I_SHARDED must be one of 0, 1, false, or true; got {value:?}")
+        }
+    }
 }
 
 fn fuse_dispatch_workers_from_env() -> Result<usize> {
@@ -9935,9 +9952,8 @@ mod tests {
         format_ext4_quota_inodes, format_ratio_thousandths, format_uuid,
         log_mount_runtime_rejected, log_mount_runtime_selected, mount_cmd, mount_operation_id,
         open_filesystem_for_mount, parse_btrfs_mount_selection, parse_fuse_dispatch_workers,
-        read_ext4_group_desc_from_path,
-        read_ext4_inode_from_path, read_file_region, start_mount_background_scrub,
-        summarize_repair_staleness, unavailable_repair_info,
+        read_ext4_group_desc_from_path, read_ext4_inode_from_path, read_file_region,
+        start_mount_background_scrub, summarize_repair_staleness, unavailable_repair_info,
         validate_mount_adaptive_runtime_request_with_config,
         validate_mount_writeback_cache_request,
     };
@@ -10058,6 +10074,19 @@ mod tests {
                 .to_string()
                 .contains("FFS_FUSE_WORKERS must be an unsigned integer")
         );
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn sharded_create_mount_default_has_an_explicit_validated_rollback() {
+        assert!(super::sharded_create_enabled_from_env(None).unwrap());
+        assert!(super::sharded_create_enabled_from_env(Some("1")).unwrap());
+        assert!(super::sharded_create_enabled_from_env(Some("true")).unwrap());
+        assert!(!super::sharded_create_enabled_from_env(Some("0")).unwrap());
+        assert!(!super::sharded_create_enabled_from_env(Some("false")).unwrap());
+
+        let error = super::sharded_create_enabled_from_env(Some("enabled")).unwrap_err();
+        assert!(error.to_string().contains("FFS_BHH0I_SHARDED"));
     }
 
     fn test_mount_runtime_config(mode: MountRuntimeMode) -> MountRuntimeConfig {
