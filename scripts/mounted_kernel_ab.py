@@ -299,12 +299,33 @@ def wl_fsync_latency(target: Path, count: int, threads: int) -> float:
     return elapsed
 
 
+def wl_bulk_durable_write(target: Path, count: int, threads: int) -> float:
+    """Overwrite a preallocated file with 1 MiB positioned writes, then fsync once."""
+    del threads
+    path = target / "bulk_durable_probe"
+    chunk = b"b" * (1 << 20)
+    total_bytes = count * len(chunk)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        os.ftruncate(fd, total_bytes)
+        start = time.perf_counter()
+        for index in range(count):
+            os.pwrite(fd, chunk, index * len(chunk))
+        os.fsync(fd)
+        elapsed = time.perf_counter() - start
+    finally:
+        os.close(fd)
+        os.unlink(path)
+    return elapsed
+
+
 WORKLOADS = {
     "create": wl_create,
     "parallel-read": wl_parallel_read,
     "create-delete": wl_create_delete,
     "readdir-stat": wl_readdir_stat,
     "fsync-latency": wl_fsync_latency,
+    "bulk-durable-write": wl_bulk_durable_write,
 }
 
 PREPARE_PREFIX = {"parallel-read": "r_", "readdir-stat": "d_"}
