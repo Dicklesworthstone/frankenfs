@@ -4,6 +4,7 @@
 //! test harness) consume. Format-specific implementations (ext4, btrfs) live
 //! behind the [`FsOps`] trait so that callers are filesystem-agnostic.
 
+use crate::fs_mvcc_store::FsMvccStore;
 use asupersync::Cx;
 use ffs_error::FfsError;
 use ffs_types::{CommitSeq, InodeNumber, Snapshot};
@@ -151,6 +152,101 @@ impl DirEntry {
     }
 }
 
+/// Shared page returned by [`FsOps::readdir`].
+///
+/// The page holds an `Arc` to the full directory snapshot plus a visible range.
+/// Hot FUSE callers can iterate the slice without cloning each `DirEntry` name,
+/// while tests and convenience wrappers can still materialize an owned `Vec`
+/// when they need one.
+#[derive(Debug, Clone)]
+pub struct ReaddirPage {
+    entries: Arc<Vec<DirEntry>>,
+    start: usize,
+    end: usize,
+}
+
+impl ReaddirPage {
+    /// Construct a page covering an owned vector.
+    #[must_use]
+    pub fn new(entries: Vec<DirEntry>) -> Self {
+        let end = entries.len();
+        Self {
+            entries: Arc::new(entries),
+            start: 0,
+            end,
+        }
+    }
+
+    /// Construct a page over a shared full listing.
+    #[must_use]
+    pub(crate) fn from_shared(entries: Arc<Vec<DirEntry>>, start: usize, end: usize) -> Self {
+        debug_assert!(start <= end);
+        debug_assert!(end <= entries.len());
+        Self {
+            entries,
+            start,
+            end,
+        }
+    }
+
+    /// Return the visible page slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[DirEntry] {
+        &self.entries[self.start..self.end]
+    }
+
+    /// Iterate over the visible entries without cloning.
+    pub fn iter(&self) -> std::slice::Iter<'_, DirEntry> {
+        self.as_slice().iter()
+    }
+
+    /// Number of visible entries in this page.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Whether this page contains no visible entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Materialize the visible entries as an owned vector.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<DirEntry> {
+        self.as_slice().to_vec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_entries_with(&self, entries: &Arc<Vec<DirEntry>>) -> bool {
+        Arc::ptr_eq(&self.entries, entries)
+    }
+}
+
+impl From<Vec<DirEntry>> for ReaddirPage {
+    fn from(entries: Vec<DirEntry>) -> Self {
+        Self::new(entries)
+    }
+}
+
+impl std::ops::Deref for ReaddirPage {
+    type Target = [DirEntry];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a ReaddirPage {
+    type Item = &'a DirEntry;
+    type IntoIter = std::slice::Iter<'a, DirEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// A single extent returned by [`FsOps::fiemap`].
 ///
 /// Mirrors `struct fiemap_extent` from `<linux/fiemap.h>`. All offsets and
@@ -169,8 +265,19 @@ pub struct FiemapExtent {
 
 /// FIEMAP extent flag: this extent is the last in the file.
 pub const FIEMAP_EXTENT_LAST: u32 = 0x0001;
+/// FIEMAP extent flag: data cannot be read while the fs is unmounted (e.g. it
+/// is compressed/encoded on disk).
+pub const FIEMAP_EXTENT_ENCODED: u32 = 0x0008;
+/// FIEMAP extent flag: extent offsets may not be block aligned.
+pub const FIEMAP_EXTENT_NOT_ALIGNED: u32 = 0x0100;
+/// FIEMAP extent flag: data is mixed with metadata (inline). Implies
+/// `FIEMAP_EXTENT_NOT_ALIGNED`.
+pub const FIEMAP_EXTENT_DATA_INLINE: u32 = 0x0200;
 /// FIEMAP extent flag: this extent is unwritten / preallocated.
 pub const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x0800;
+/// FIEMAP extent flag: the disk extent is shared with other files (reflink /
+/// snapshot — the extent's refcount is greater than one).
+pub const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
 
 /// Seek whence for [`FsOps::lseek`].
 ///
@@ -221,6 +328,7 @@ impl SeekWhence {
 /// These operation tags let `FsOps` implementations choose an MVCC policy per
 /// request (for example: read-snapshot only vs. begin write transaction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum RequestOp {
     Getattr,
     Statfs,
@@ -255,60 +363,85 @@ pub enum RequestOp {
     IoctlWrite,
 }
 
+const fn request_op_bit(op: RequestOp) -> u32 {
+    1_u32 << op.as_index()
+}
+
 impl RequestOp {
+    /// Number of request operation variants.
+    pub const COUNT: usize = Self::IoctlWrite as usize + 1;
+    const METADATA_WRITE_MASK: u32 = request_op_bit(Self::Create)
+        | request_op_bit(Self::Mkdir)
+        | request_op_bit(Self::Unlink)
+        | request_op_bit(Self::Rmdir)
+        | request_op_bit(Self::Rename)
+        | request_op_bit(Self::Link)
+        | request_op_bit(Self::Symlink)
+        | request_op_bit(Self::Setattr)
+        | request_op_bit(Self::Setxattr)
+        | request_op_bit(Self::Removexattr)
+        | request_op_bit(Self::IoctlWrite);
+    const WRITE_MASK: u32 = Self::METADATA_WRITE_MASK
+        | request_op_bit(Self::Fsync)
+        | request_op_bit(Self::Fsyncdir)
+        | request_op_bit(Self::Fallocate)
+        | request_op_bit(Self::Write)
+        | request_op_bit(Self::RepairWriteback);
+
+    /// Dense operation index for hot-path policy tables.
+    #[must_use]
+    pub const fn as_index(self) -> usize {
+        self as usize
+    }
+
     /// Whether this operation mutates the filesystem.
     #[must_use]
     pub const fn is_write(self) -> bool {
-        matches!(
-            self,
-            Self::Create
-                | Self::Mkdir
-                | Self::Unlink
-                | Self::Rmdir
-                | Self::Rename
-                | Self::Link
-                | Self::Symlink
-                | Self::Fallocate
-                | Self::Setattr
-                | Self::Setxattr
-                | Self::Removexattr
-                | Self::Write
-                | Self::RepairWriteback
-                | Self::IoctlWrite
-                | Self::Fsync
-                | Self::Fsyncdir
-        )
+        (Self::WRITE_MASK & request_op_bit(self)) != 0
     }
 
     /// Whether this operation is a metadata-only write.
     #[must_use]
     pub const fn is_metadata_write(self) -> bool {
-        matches!(
-            self,
-            Self::Create
-                | Self::Mkdir
-                | Self::Unlink
-                | Self::Rmdir
-                | Self::Rename
-                | Self::Link
-                | Self::Symlink
-                | Self::Setattr
-                | Self::Setxattr
-                | Self::Removexattr
-                | Self::IoctlWrite
-        )
+        (Self::METADATA_WRITE_MASK & request_op_bit(self)) != 0
     }
 }
 
-/// MVCC scope acquired for a single VFS request.
+/// Commit boundary policy carried by an MVCC request scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestCommitMode {
+    /// The current FUSE behavior: commit before the request returns.
+    PerRequest,
+    /// A caller is deliberately holding the scope across several writes and
+    /// will commit it at a flush/fsync/release boundary.
+    DeferredUntilFlush,
+}
+
+impl Default for RequestCommitMode {
+    fn default() -> Self {
+        Self::PerRequest
+    }
+}
+
+/// MVCC scope acquired for a single VFS request or an explicit writeback batch.
 ///
 /// Current read-only implementations can return an empty scope. Future write
 /// implementations may attach a transaction captured at request
 /// start so that begin/end hooks can manage commit/abort semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestScope {
     pub snapshot: Option<Snapshot>,
     pub tx: Option<ffs_mvcc::Transaction>,
+    #[serde(default)]
+    pub commit_mode: RequestCommitMode,
+    /// Set by callers (e.g. `readdirplus`) that immediately `getattr` every
+    /// returned entry themselves, so the readdir-internal inode-table prefetch
+    /// fan-out is pure duplicate work (a second parallel pass over the same
+    /// blocks the caller's getattr fan-out already reads). Default `false`
+    /// preserves the prefetch for plain-`readdir`-then-stat callers (e.g. a
+    /// `find | xargs stat` walk) that DO benefit from the cache warm.
+    #[serde(default)]
+    pub skip_readdir_prefetch: bool,
 }
 
 impl RequestScope {
@@ -318,6 +451,8 @@ impl RequestScope {
         Self {
             snapshot: None,
             tx: None,
+            commit_mode: RequestCommitMode::PerRequest,
+            skip_readdir_prefetch: false,
         }
     }
 
@@ -327,20 +462,52 @@ impl RequestScope {
         Self {
             snapshot: Some(snapshot),
             tx: None,
+            commit_mode: RequestCommitMode::PerRequest,
+            skip_readdir_prefetch: false,
         }
+    }
+
+    /// Create a scope around an existing write transaction.
+    #[must_use]
+    pub fn with_transaction(tx: ffs_mvcc::Transaction) -> Self {
+        Self {
+            snapshot: Some(tx.snapshot()),
+            tx: Some(tx),
+            commit_mode: RequestCommitMode::PerRequest,
+            skip_readdir_prefetch: false,
+        }
+    }
+
+    /// Mark this write scope as intentionally held until a flush boundary.
+    pub fn defer_commit_until_flush(&mut self) {
+        self.commit_mode = RequestCommitMode::DeferredUntilFlush;
+    }
+
+    /// Whether this scope is a deliberate writeback batch.
+    #[must_use]
+    pub const fn is_deferred_until_flush(&self) -> bool {
+        matches!(self.commit_mode, RequestCommitMode::DeferredUntilFlush)
+    }
+
+    /// Number of currently staged block writes.
+    #[must_use]
+    pub fn pending_write_count(&self) -> usize {
+        self.tx
+            .as_ref()
+            .map_or(0, ffs_mvcc::Transaction::pending_writes)
     }
 
     /// Commit the transaction if one is present.
     ///
     /// Returns the commit sequence on success, or an error if the commit failed.
     /// Returns `Ok(CommitSeq(0))` if no transaction was attached.
-    pub fn commit_if_write(
+    pub(crate) fn commit_if_write(
         &mut self,
-        mvcc_store: &parking_lot::RwLock<ffs_mvcc::MvccStore>,
+        mvcc_store: &FsMvccStore,
     ) -> ffs_error::Result<CommitSeq> {
         self.tx.take().map_or(Ok(CommitSeq(0)), |tx| {
             let tx_id = tx.id().0;
-            mvcc_store.write().commit(tx).map_err(|error| match error {
+            mvcc_store.commit(tx).map_err(|error| match error {
                 ffs_mvcc::CommitError::Conflict { block, .. }
                 | ffs_mvcc::CommitError::ChainBackpressure { block, .. } => {
                     ffs_error::FfsError::MvccConflict {
@@ -599,7 +766,7 @@ pub trait FsOps: Send + Sync {
         scope: &mut RequestScope,
         ino: InodeNumber,
         offset: u64,
-    ) -> ffs_error::Result<Vec<DirEntry>>;
+    ) -> ffs_error::Result<ReaddirPage>;
 
     /// Read file data.
     ///
@@ -2163,6 +2330,7 @@ pub trait FsOps: Send + Sync {
     /// extents. FUSE dispatch resolves the caller's source fd to `src_ino`
     /// first. `src_length == 0` means "to source EOF". Returns
     /// `FfsError::ReadOnly` for read-only mounts.
+    #[allow(clippy::too_many_arguments)]
     fn clone_file_range(
         &self,
         _cx: &Cx,
@@ -2490,7 +2658,7 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         scope: &mut RequestScope,
         ino: InodeNumber,
         offset: u64,
-    ) -> ffs_error::Result<Vec<DirEntry>> {
+    ) -> ffs_error::Result<ReaddirPage> {
         self.as_ref().readdir(cx, scope, ino, offset)
     }
 
@@ -3363,7 +3531,7 @@ mod tests {
             _scope: &mut RequestScope,
             _ino: InodeNumber,
             _offset: u64,
-        ) -> ffs_error::Result<Vec<DirEntry>> {
+        ) -> ffs_error::Result<ReaddirPage> {
             Err(FfsError::UnsupportedFeature(
                 "readdir fixture path is not supported".to_owned(),
             ))
