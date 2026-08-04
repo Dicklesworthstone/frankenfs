@@ -123,7 +123,6 @@ enum Workload {
     WarmStat,
     ParallelMetadataWrite,
     ParallelRead8,
-    ParallelRead8ColdCache,
     CreateDeleteStorm,
     ReaddirStat8,
     FsyncJournalCommit,
@@ -137,7 +136,6 @@ impl Workload {
             Self::WarmStat => "warm_stat",
             Self::ParallelMetadataWrite => "parallel_metadata_write",
             Self::ParallelRead8 => "parallel_read_multifile_8t",
-            Self::ParallelRead8ColdCache => "parallel_read_multifile_8t_cold_cache",
             Self::CreateDeleteStorm => "small_file_create_delete_storm",
             Self::ReaddirStat8 => "large_directory_readdir_stat_8t",
             Self::FsyncJournalCommit => "fsync_journal_commit",
@@ -159,9 +157,7 @@ impl Workload {
     const fn client_threads(self, configured: usize) -> usize {
         match self {
             Self::ParallelMetadataWrite => configured,
-            Self::ParallelRead8 | Self::ParallelRead8ColdCache | Self::ReaddirStat8 => {
-                DEFAULT_PARALLEL_THREADS
-            }
+            Self::ParallelRead8 | Self::ReaddirStat8 => DEFAULT_PARALLEL_THREADS,
             Self::WarmStat
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
@@ -178,7 +174,6 @@ impl Workload {
             Self::BulkDurableWrite => "overwrite_1m_chunks_then_single_file_fsync",
             Self::WarmStat
             | Self::ParallelRead8
-            | Self::ParallelRead8ColdCache
             | Self::ReaddirStat8
             | Self::XattrGetListReport => "read_only_no_mutation",
         }
@@ -190,10 +185,9 @@ impl Workload {
 
     const fn worker_thread_observation_method(self) -> &'static str {
         match self {
-            Self::ParallelMetadataWrite
-            | Self::ParallelRead8
-            | Self::ParallelRead8ColdCache
-            | Self::ReaddirStat8 => "unique Linux TIDs reported by workers inside each timed batch",
+            Self::ParallelMetadataWrite | Self::ParallelRead8 | Self::ReaddirStat8 => {
+                "unique Linux TIDs reported by workers inside each timed batch"
+            }
             Self::WarmStat
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
@@ -220,13 +214,6 @@ impl Workload {
                  separate {PARALLEL_READ_FILE_BYTES}-byte files, then {client_threads} workers \
                  open and pread every file exactly once ({} total bytes) and aggregate a \
                  content digest",
-                operations.saturating_mul(PARALLEL_READ_FILE_BYTES)
-            ),
-            Self::ParallelRead8ColdCache => format!(
-                "one cold-cache multi-file read job: before every timed batch, sync and write 3 \
-                 to /proc/sys/vm/drop_caches; then enumerate and byte-sort {operations} separate \
-                 {PARALLEL_READ_FILE_BYTES}-byte files, and have {client_threads} workers open \
-                 and pread every file exactly once ({} total bytes) and aggregate a content digest",
                 operations.saturating_mul(PARALLEL_READ_FILE_BYTES)
             ),
             Self::CreateDeleteStorm => format!(
@@ -270,14 +257,13 @@ impl Workload {
         format!(
             "For operators choosing between FrankenFS FUSE and Linux kernel {} for \
              workload={} on the recorded host, ISA, frequency policy, mount options, and \
-             {} regime: this result applies only to operations={operations}, \
+             warm-cache regime: this result applies only to operations={operations}, \
              requested_worker_threads={requested_threads}, \
              observed_worker_threads={observed}, and durability={}; do not generalize it to \
              other filesystem, working-set, cache, thread, durability, mount, or hardware \
              shapes.",
             filesystem.label(),
             self.label(),
-            self.cache_regime_label(),
             self.durability()
         )
     }
@@ -305,15 +291,6 @@ impl Workload {
                 "positioned_reads": operations,
                 "bytes_per_file": PARALLEL_READ_FILE_BYTES,
                 "total_bytes_read": operations.saturating_mul(PARALLEL_READ_FILE_BYTES),
-            }),
-            Self::ParallelRead8ColdCache => json!({
-                "files_enumerated": operations,
-                "files_opened": operations,
-                "positioned_reads": operations,
-                "bytes_per_file": PARALLEL_READ_FILE_BYTES,
-                "total_bytes_read": operations.saturating_mul(PARALLEL_READ_FILE_BYTES),
-                "cache_clear_before_every_timed_batch": "sync; write 3 to /proc/sys/vm/drop_caches",
-                "warmup_batches": 0,
             }),
             Self::CreateDeleteStorm => json!({
                 "empty_files_created": operations,
@@ -357,34 +334,6 @@ impl Workload {
             "common": common,
             "workload_specific": detail,
         })
-    }
-
-    const fn uses_cold_cache(self) -> bool {
-        matches!(self, Self::ParallelRead8ColdCache)
-    }
-
-    const fn warmup_rounds(self) -> usize {
-        if self.uses_cold_cache() {
-            0
-        } else {
-            WARMUP_ROUNDS
-        }
-    }
-
-    const fn cache_regime_label(self) -> &'static str {
-        if self.uses_cold_cache() {
-            "cold-cache (sync then write 3 to /proc/sys/vm/drop_caches before every timed batch)"
-        } else {
-            "warm-cache"
-        }
-    }
-
-    const fn cache_regime_provenance(self) -> &'static str {
-        if self.uses_cold_cache() {
-            "cold-cache: warmups disabled; before every timed batch run sync, then write 3 to /proc/sys/vm/drop_caches outside the timed interval"
-        } else {
-            "identical balanced warm-cache rounds; no global cache drop"
-        }
     }
 }
 
@@ -814,8 +763,7 @@ fn usage() {
          Options:\n\
            --filesystem ext4|btrfs|both   Filesystem arm(s), default both\n\
            --workload NAME                warm-stat | parallel-metadata-write |\n\
-                                          parallel-read-8t | parallel-read-8t-cold-cache |\n\
-                                          create-delete-storm |\n\
+                                          parallel-read-8t | create-delete-storm |\n\
                                           readdir-stat-8t | fsync-journal-commit |\n\
                                           bulk-durable-write | xattr-get-list-report\n\
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
@@ -860,14 +808,13 @@ fn parse_workload(value: &str) -> Result<Workload> {
             Ok(Workload::ParallelMetadataWrite)
         }
         "parallel-read-8t" => Ok(Workload::ParallelRead8),
-        "parallel-read-8t-cold-cache" => Ok(Workload::ParallelRead8ColdCache),
         "create-delete-storm" => Ok(Workload::CreateDeleteStorm),
         "readdir-stat-8t" => Ok(Workload::ReaddirStat8),
         "fsync-journal-commit" => Ok(Workload::FsyncJournalCommit),
         "bulk-durable-write" => Ok(Workload::BulkDurableWrite),
         "xattr-get-list-report" => Ok(Workload::XattrGetListReport),
         _ => bail!(
-            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|parallel-read-8t-cold-cache|create-delete-storm|readdir-stat-8t|fsync-journal-commit|bulk-durable-write|xattr-get-list-report"
+            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|create-delete-storm|readdir-stat-8t|fsync-journal-commit|bulk-durable-write|xattr-get-list-report"
         ),
     }
 }
@@ -1312,7 +1259,7 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
                 fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;
             }
         }
-        Workload::ParallelRead8 | Workload::ParallelRead8ColdCache => {
+        Workload::ParallelRead8 => {
             let parent = root.join("parallel-read");
             fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
             for index in 0..config.operations {
@@ -2691,9 +2638,7 @@ fn workload_batch(
                 pinning,
             );
         }
-        Workload::ParallelRead8 | Workload::ParallelRead8ColdCache => {
-            return parallel_read_batch(root, config.operations, pinning);
-        }
+        Workload::ParallelRead8 => return parallel_read_batch(root, config.operations, pinning),
         Workload::ReaddirStat8 => return readdir_stat_batch(root, config.operations, pinning),
         Workload::WarmStat
         | Workload::CreateDeleteStorm
@@ -2707,10 +2652,7 @@ fn workload_batch(
     let driver_tid_before = current_linux_tid()?;
     let (elapsed_ns, digest) = match config.workload {
         Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations)?,
-        Workload::ParallelMetadataWrite
-        | Workload::ParallelRead8
-        | Workload::ParallelRead8ColdCache
-        | Workload::ReaddirStat8 => {
+        Workload::ParallelMetadataWrite | Workload::ParallelRead8 | Workload::ReaddirStat8 => {
             unreachable!("parallel workloads handled above")
         }
         Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations)?,
@@ -2750,9 +2692,6 @@ fn observe(
         let current_sequence = sequence
             .saturating_mul(config.observation_repeats)
             .saturating_add(repeat);
-        if config.workload.uses_cold_cache() {
-            clear_linux_page_cache()?;
-        }
         let batch = workload_batch(root, config, current_sequence, pinning)?;
         if let Some(expected) = expected_digest {
             ensure!(
@@ -2804,15 +2743,15 @@ fn quiesce_arm(root: &Path, config: &Config) -> Result<()> {
 }
 
 /// Untimed warmup on the same balanced crossover schedule as the measured
-/// rounds. Cold-cache workloads intentionally skip these reads so no timed
-/// batch receives a cache residency advantage from harness warmup.
+/// rounds, so every arm enters measurement with an equally warmed cache and an
+/// equally advanced per-arm sequence counter.
 fn run_warmup_rounds(
     roots: &BTreeMap<Arm, PathBuf>,
     config: &Config,
     pinning: &WorkerPinning,
     next_sequences: &mut BTreeMap<Arm, usize>,
 ) -> Result<()> {
-    for round in 0..config.workload.warmup_rounds() {
+    for round in 0..WARMUP_ROUNDS {
         for logical_arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
             let physical_arm = physical_arm_for(logical_arm, round);
             let root = roots
@@ -2829,23 +2768,6 @@ fn run_warmup_rounds(
         }
     }
     Ok(())
-}
-
-/// Clear the Linux page cache before a cold-cache timed batch. This is
-/// deliberately outside the measured interval and fails closed when the
-/// harness lacks the privilege required to write the global cache control.
-fn clear_linux_page_cache() -> Result<()> {
-    let sync = Command::new("sync")
-        .output()
-        .context("sync before cold-cache timed batch")?;
-    ensure!(
-        sync.status.success(),
-        "sync before cold-cache timed batch failed: status={} stderr={}",
-        sync.status,
-        String::from_utf8_lossy(&sync.stderr).trim()
-    );
-    fs::write("/proc/sys/vm/drop_caches", "3\n")
-        .context("write 3 to /proc/sys/vm/drop_caches before cold-cache timed batch")
 }
 
 fn collect_samples(
@@ -2937,9 +2859,7 @@ fn collect_samples(
         digests.values().all(|digest| *digest == expected_digest),
         "workload result parity failed across mounted arms: {digests:?}"
     );
-    let expected_next_sequence = config
-        .workload
-        .warmup_rounds()
+    let expected_next_sequence = WARMUP_ROUNDS
         .checked_add(config.pairs)
         .ok_or_else(|| anyhow!("per-arm observation count overflow"))?;
     ensure!(
@@ -4862,7 +4782,7 @@ fn fs_report(
         "crossover_blocks": config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
         "physical_role_crossover_rounds": PHYSICAL_ROLE_CROSSOVER_ROUNDS,
-        "warmup_rounds": config.workload.warmup_rounds(),
+        "warmup_rounds": WARMUP_ROUNDS,
         "arm_settle_ms": config.arm_settle_ms,
         "pre_measurement_settle_ms": config.pre_measurement_settle_ms,
         "pre_measurement_quiescence": "base and four cloned image files sync_all before mount, then untimed settle after mount identity and initial parity",
@@ -4882,7 +4802,7 @@ fn fs_report(
             }
             _ => "fixture-defined stable state",
         },
-        "cache_regime": config.workload.cache_regime_provenance(),
+        "cache_regime": "identical balanced warm-cache rounds; no global cache drop",
         "observation_repeats": config.observation_repeats,
         "observation_reducer": config.workload.observation_reducer(),
         "identities": identities,
@@ -5223,7 +5143,7 @@ fn run() -> Result<Option<PathBuf>> {
             "physical_role_assignment": "A/B physical mounts exchange logical roles every round",
             "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
             "physical_role_crossover_rounds": PHYSICAL_ROLE_CROSSOVER_ROUNDS,
-            "warmup_rounds": config.workload.warmup_rounds(),
+            "warmup_rounds": WARMUP_ROUNDS,
             "arm_settle_ms": config.arm_settle_ms,
             "pre_measurement_settle_ms": config.pre_measurement_settle_ms,
             "host_quiet_required_consecutive_samples": config.host_quiet_samples,
@@ -5238,7 +5158,7 @@ fn run() -> Result<Option<PathBuf>> {
             } else {
                 "not applicable"
             },
-            "cache_regime": config.workload.cache_regime_provenance(),
+            "cache_regime": "identical balanced warm-cache rounds; no global cache drop",
         },
         "filesystems": filesystem_reports,
     });
@@ -5492,36 +5412,9 @@ mod tests {
             Workload::ParallelRead8.client_threads(96),
             DEFAULT_PARALLEL_THREADS
         );
-        assert_eq!(
-            Workload::ParallelRead8ColdCache.client_threads(96),
-            DEFAULT_PARALLEL_THREADS
-        );
         assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
         assert_eq!(Workload::BulkDurableWrite.client_threads(96), 1);
         assert_eq!(Workload::XattrGetListReport.client_threads(96), 1);
-    }
-
-    #[test]
-    fn cold_parallel_read_is_a_separate_no_warmup_cache_clearing_workload() {
-        let cold = parse_workload("parallel-read-8t-cold-cache")
-            .expect("cold parallel read workload must parse");
-        assert_eq!(cold, Workload::ParallelRead8ColdCache);
-        assert_eq!(cold.label(), "parallel_read_multifile_8t_cold_cache");
-        assert!(cold.uses_cold_cache());
-        assert_eq!(cold.warmup_rounds(), 0);
-        assert!(
-            cold.cache_regime_provenance()
-                .contains("write 3 to /proc/sys/vm/drop_caches")
-        );
-
-        let warm = Workload::ParallelRead8;
-        assert!(!warm.uses_cold_cache());
-        assert_eq!(warm.warmup_rounds(), WARMUP_ROUNDS);
-        assert_ne!(cold.label(), warm.label());
-        assert_eq!(
-            cold.semantic_work_contract(1024, DEFAULT_PARALLEL_THREADS)["workload_specific"]["warmup_batches"],
-            0
-        );
     }
 
     #[test]
