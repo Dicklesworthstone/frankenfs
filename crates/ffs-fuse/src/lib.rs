@@ -27,7 +27,7 @@ use fuser::{
     TimeOrNow, consts as fuse_consts, fuse_forget_one,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::raw::c_int;
@@ -1215,37 +1215,25 @@ impl ReadaheadManager {
     }
 }
 
-/// Per-mount cache of immutable inodes known to lack `security.capability`.
+/// Lock-free cache of the most recently observed missing capability xattr.
 ///
 /// The kernel still sends each FUSE `GETXATTR` request, but read-only images
-/// cannot gain a capability xattr while mounted. Remembering only absence
-/// therefore skips redundant on-disk xattr parsing without making a positive
-/// capability value stale.
+/// cannot gain a capability xattr while mounted. Caching one inode bounds the
+/// mount's memory while covering the repeated-stat case without adding a mutex
+/// to every kernel-issued probe.
 #[derive(Default)]
-struct MissingCapabilityXattrs {
-    inodes: Mutex<HashSet<u64>>,
+struct LastMissingCapabilityXattr {
+    inode: AtomicU64,
 }
 
-impl MissingCapabilityXattrs {
+impl LastMissingCapabilityXattr {
     fn contains(&self, ino: InodeNumber) -> bool {
-        match self.inodes.lock() {
-            Ok(inodes) => inodes.contains(&ino.0),
-            Err(poisoned) => {
-                warn!("missing capability-xattr cache lock poisoned in contains, recovering");
-                poisoned.into_inner().contains(&ino.0)
-            }
-        }
+        ino.0 != 0 && self.inode.load(Ordering::Acquire) == ino.0
     }
 
     fn remember(&self, ino: InodeNumber) {
-        match self.inodes.lock() {
-            Ok(mut inodes) => {
-                inodes.insert(ino.0);
-            }
-            Err(poisoned) => {
-                warn!("missing capability-xattr cache lock poisoned in remember, recovering");
-                poisoned.into_inner().insert(ino.0);
-            }
+        if ino.0 != 0 {
+            self.inode.store(ino.0, Ordering::Release);
         }
     }
 }
@@ -1269,7 +1257,7 @@ impl MissingCapabilityXattrs {
 /// | `kernel_notifier`  | `Mutex<Option<Notifier>>`           | leaf |
 /// | `access_predictor` | `AccessPredictor.state: Mutex`      | leaf |
 /// | `readahead`        | `ReadaheadManager.pending: Mutex`   | leaf |
-/// | `missing_capability_xattrs` | `MissingCapabilityXattrs.inodes: Mutex` | leaf |
+/// | `missing_capability_xattr` | `LastMissingCapabilityXattr.inode: AtomicU64` | leaf |
 /// | `inode_locks`      | `FuseInodeLocks.table: Mutex`       | 0 (see bd-pfv55 doc on FuseInodeLocks for the per-inode `held` rank-1 sublock) |
 ///
 /// Production callers comply by **never nesting two subsystem
@@ -1287,7 +1275,7 @@ impl MissingCapabilityXattrs {
 /// | `AccessPredictor::invalidate_inode` | access_predictor | leaf-only                        |
 /// | `ReadaheadManager::insert/take` | readahead          | leaf-only                        |
 /// | `ReadaheadManager::invalidate_inode` | readahead       | leaf-only                        |
-/// | `MissingCapabilityXattrs::{contains,remember}` | missing_capability_xattrs | leaf-only |
+/// | `LastMissingCapabilityXattr::{contains,remember}` | missing_capability_xattr | leaf-only |
 /// | `FuseInodeLocks::acquire`       | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeLocks::try_acquire`   | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeGuard::Drop`          | inode_locks        | rank 0 → rank 1 (nested)         |
@@ -1319,7 +1307,7 @@ struct FuseInner {
     backpressure: Option<Arc<BackpressureGate>>,
     access_predictor: AccessPredictor,
     readahead: ReadaheadManager,
-    missing_capability_xattrs: MissingCapabilityXattrs,
+    missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
 }
 
@@ -2054,7 +2042,7 @@ impl FrankenFuse {
                 backpressure,
                 access_predictor: AccessPredictor::default(),
                 readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
-                missing_capability_xattrs: MissingCapabilityXattrs::default(),
+                missing_capability_xattr: LastMissingCapabilityXattr::default(),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
             }),
         }
@@ -5471,7 +5459,7 @@ impl FrankenFuse {
         name: &str,
     ) -> ffs_error::Result<Option<Vec<u8>>> {
         let is_capability_probe = self.inner.read_only && name == SECURITY_CAPABILITY_XATTR;
-        if is_capability_probe && self.inner.missing_capability_xattrs.contains(ino) {
+        if is_capability_probe && self.inner.missing_capability_xattr.contains(ino) {
             return Ok(None);
         }
 
@@ -5479,7 +5467,7 @@ impl FrankenFuse {
             self.inner.ops.getxattr(cx, ino, name)
         })?;
         if is_capability_probe && value.is_none() {
-            self.inner.missing_capability_xattrs.remember(ino);
+            self.inner.missing_capability_xattr.remember(ino);
         }
         Ok(value)
     }
@@ -7390,6 +7378,23 @@ mod tests {
                 .is_none()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert!(
+            fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert!(
+            fuse.getxattr_value(&cx, InodeNumber(0), SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fuse.getxattr_value(&cx, InodeNumber(0), SECURITY_CAPABILITY_XATTR)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
 
         let rw_calls = Arc::new(AtomicUsize::new(0));
         let rw_fuse = FrankenFuse::with_options(
@@ -17631,7 +17636,7 @@ mod tests {
             backpressure: None,
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
-            missing_capability_xattrs: MissingCapabilityXattrs::default(),
+            missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
@@ -18988,7 +18993,7 @@ AllowOther"#;
             backpressure: None,
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(8),
-            missing_capability_xattrs: MissingCapabilityXattrs::default(),
+            missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
         let dbg = format!("{inner:?}");
