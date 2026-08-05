@@ -418,6 +418,14 @@ struct Config {
     /// value is injected into both FUSE A/A arms, so the null gate still
     /// exercises exactly the candidate configuration being compared to Linux.
     fuse_workers: Option<usize>,
+    /// Second candidate configuration mounted in the same window (bd-3tqgc).
+    ///
+    /// Omitted keeps the banked four-arm shape byte for byte. When present the
+    /// harness mounts two more FUSE arms from the SAME ELF, differing only by
+    /// the recorded runtime knobs, and reports a within-window paired
+    /// candidate-vs-candidate ratio in which the window effect cancels the way
+    /// the kernel arm already cancels host drift for `fuse_over_kernel`.
+    candidate_comparison: Option<CandidateComparison>,
     placement_scope: PlacementScope,
     host_quiet_samples: usize,
     host_quiet_timeout_ms: u64,
@@ -430,9 +438,63 @@ struct Config {
     output: Option<PathBuf>,
 }
 
+/// The second candidate configuration of a same-window A/B (bd-3tqgc).
+///
+/// It is deliberately expressed as a set of environment overrides rather than a
+/// second binary: the whole point of the estimator is that both arms execute
+/// ONE ELF, so the only admissible difference is a runtime knob the daemon
+/// resolves and reports back.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CandidateComparison {
+    /// Extra environment applied only to the candidate-B daemons.
+    env: Vec<(String, String)>,
+}
+
+impl CandidateComparison {
+    /// Whether the two candidate configurations are meant to differ at all.
+    ///
+    /// Empty means the run is the estimator's own A/A null control: four FUSE
+    /// arms with identical configuration, where the candidate-vs-candidate
+    /// ratio must come out at 1.0 or the instrument is not trustworthy.
+    fn configurations_differ(&self) -> bool {
+        !self.env.is_empty()
+    }
+
+    fn env_json(&self) -> Value {
+        Value::Object(
+            self.env
+                .iter()
+                .map(|(key, value)| (key.clone(), json!(value)))
+                .collect(),
+        )
+    }
+}
+
 impl Config {
     const fn client_threads(&self) -> usize {
         self.workload.client_threads(self.client_threads)
+    }
+
+    const fn compares_candidates(&self) -> bool {
+        self.candidate_comparison.is_some()
+    }
+
+    /// Whether the two candidate configurations are meant to differ.
+    ///
+    /// False for a four-arm run (there is only one candidate configuration) and
+    /// for the estimator's A/A null control.
+    fn candidate_configurations_differ(&self) -> bool {
+        self.candidate_comparison
+            .as_ref()
+            .is_some_and(CandidateComparison::configurations_differ)
+    }
+
+    /// Environment applied to the daemons of a given arm.
+    fn arm_env(&self, arm: Arm) -> &[(String, String)] {
+        match (arm, self.candidate_comparison.as_ref()) {
+            (Arm::CandidateBA | Arm::CandidateBB, Some(comparison)) => &comparison.env,
+            _ => &[],
+        }
     }
 }
 
@@ -453,6 +515,7 @@ impl Default for Config {
             client_threads: DEFAULT_PARALLEL_THREADS,
             fuse_cpu_count: DEFAULT_FUSE_CPUS,
             fuse_workers: None,
+            candidate_comparison: None,
             placement_scope: PlacementScope::SameLlc,
             host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
             host_quiet_timeout_ms: DEFAULT_HOST_QUIET_TIMEOUT_MS,
@@ -469,6 +532,10 @@ enum Arm {
     KernelB,
     FuseA,
     FuseB,
+    /// First replica of the second candidate configuration (bd-3tqgc).
+    CandidateBA,
+    /// Second replica of the second candidate configuration (bd-3tqgc).
+    CandidateBB,
 }
 
 impl Arm {
@@ -478,6 +545,8 @@ impl Arm {
             Self::KernelB => "kernel_b",
             Self::FuseA => "fuse_a",
             Self::FuseB => "fuse_b",
+            Self::CandidateBA => "fuse_candidate_b_a",
+            Self::CandidateBB => "fuse_candidate_b_b",
         }
     }
 
@@ -487,6 +556,8 @@ impl Arm {
             Self::KernelB => Self::KernelA,
             Self::FuseA => Self::FuseB,
             Self::FuseB => Self::FuseA,
+            Self::CandidateBA => Self::CandidateBB,
+            Self::CandidateBB => Self::CandidateBA,
         }
     }
 }
@@ -497,6 +568,147 @@ const BALANCED_ORDERS: [[Arm; 4]; 4] = [
     [Arm::KernelB, Arm::FuseB, Arm::KernelA, Arm::FuseA],
     [Arm::FuseA, Arm::KernelA, Arm::FuseB, Arm::KernelB],
 ];
+
+/// Six-arm schedule for a same-window candidate-vs-candidate comparison.
+///
+/// A Williams square over the six arms: every arm occupies every position
+/// exactly once (so position bias cancels the way it does in the four-arm
+/// schedule), and every ordered pair of arms is adjacent exactly once (so
+/// first-order carryover between neighbouring arms cancels too). Both
+/// properties are asserted in the unit tests rather than trusted.
+///
+/// Constructed from the zig-zag base row `0,1,5,2,4,3` cyclically shifted; its
+/// adjacent index differences are `1,4,3,2,5`, all five non-zero residues, which
+/// is exactly the Williams condition.
+const CANDIDATE_BALANCED_ORDERS: [[Arm; 6]; 6] = [
+    [
+        Arm::KernelA,
+        Arm::FuseA,
+        Arm::CandidateBB,
+        Arm::CandidateBA,
+        Arm::FuseB,
+        Arm::KernelB,
+    ],
+    [
+        Arm::FuseA,
+        Arm::CandidateBA,
+        Arm::KernelA,
+        Arm::KernelB,
+        Arm::CandidateBB,
+        Arm::FuseB,
+    ],
+    [
+        Arm::CandidateBA,
+        Arm::KernelB,
+        Arm::FuseA,
+        Arm::FuseB,
+        Arm::KernelA,
+        Arm::CandidateBB,
+    ],
+    [
+        Arm::KernelB,
+        Arm::FuseB,
+        Arm::CandidateBA,
+        Arm::CandidateBB,
+        Arm::FuseA,
+        Arm::KernelA,
+    ],
+    [
+        Arm::FuseB,
+        Arm::CandidateBB,
+        Arm::KernelB,
+        Arm::KernelA,
+        Arm::CandidateBA,
+        Arm::FuseA,
+    ],
+    [
+        Arm::CandidateBB,
+        Arm::KernelA,
+        Arm::FuseB,
+        Arm::FuseA,
+        Arm::KernelB,
+        Arm::CandidateBA,
+    ],
+];
+
+/// Order in which the Williams rows are visited across one schedule period.
+///
+/// Deliberately not a plain repetition of `0..6`. [`physical_arm_for`]
+/// exchanges physical roles on odd rounds, so with six rows each row would be
+/// pinned to a fixed round parity: physical `kernel_a` would then only ever
+/// occupy the positions where logical `kernel_a` sits on even rows or logical
+/// `kernel_b` sits on odd rows — three of six positions, measured. The
+/// schedule would still look balanced by logical arm while quietly favouring
+/// one image. Rotating the row index on the second pass gives every row one
+/// even and one odd round, so every physical arm reaches every position.
+const CANDIDATE_ROW_SEQUENCE: [usize; 12] = [0, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 0];
+
+const FOUR_ARM_SET: [Arm; 4] = [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB];
+const SIX_ARM_SET: [Arm; 6] = [
+    Arm::KernelA,
+    Arm::KernelB,
+    Arm::FuseA,
+    Arm::FuseB,
+    Arm::CandidateBA,
+    Arm::CandidateBB,
+];
+const CANDIDATE_A_ARMS: [Arm; 2] = [Arm::FuseA, Arm::FuseB];
+const CANDIDATE_B_ARMS: [Arm; 2] = [Arm::CandidateBA, Arm::CandidateBB];
+const KERNEL_ARMS: [Arm; 2] = [Arm::KernelA, Arm::KernelB];
+const BOTH_CANDIDATE_FUSE_ARMS: [Arm; 4] = [
+    Arm::FuseA,
+    Arm::FuseB,
+    Arm::CandidateBA,
+    Arm::CandidateBB,
+];
+
+/// Every mounted arm of a run, in a stable order.
+const fn measured_arms(candidate_comparison: bool) -> &'static [Arm] {
+    if candidate_comparison {
+        &SIX_ARM_SET
+    } else {
+        &FOUR_ARM_SET
+    }
+}
+
+/// The FUSE arms of a run: two daemons normally, four when a second candidate
+/// configuration is mounted alongside the first.
+const fn fuse_arms(candidate_comparison: bool) -> &'static [Arm] {
+    if candidate_comparison {
+        &BOTH_CANDIDATE_FUSE_ARMS
+    } else {
+        &CANDIDATE_A_ARMS
+    }
+}
+
+/// Balanced visiting order for one measured round.
+fn balanced_order(candidate_comparison: bool, round: usize) -> &'static [Arm] {
+    if candidate_comparison {
+        &CANDIDATE_BALANCED_ORDERS[CANDIDATE_ROW_SEQUENCE[round % CANDIDATE_ROW_SEQUENCE.len()]]
+    } else {
+        &BALANCED_ORDERS[round % BALANCED_ORDERS.len()]
+    }
+}
+
+/// Rounds after which the balanced schedule repeats.
+const fn balanced_order_count(candidate_comparison: bool) -> usize {
+    if candidate_comparison {
+        CANDIDATE_ROW_SEQUENCE.len()
+    } else {
+        BALANCED_ORDERS.len()
+    }
+}
+
+/// Round count that completes both the balanced schedule and the estimator
+/// blocks it is chunked into, so `--pairs` must be a multiple of it.
+const fn schedule_period(candidate_comparison: bool) -> usize {
+    let orders = balanced_order_count(candidate_comparison);
+    let mut multiple = orders;
+    while multiple % ESTIMATOR_BLOCK_ROUNDS != 0 {
+        multiple += orders;
+    }
+    multiple
+}
 
 #[derive(Clone, Copy, Debug)]
 struct BootstrapMedianCi {
@@ -644,6 +856,16 @@ struct FfsBinaryIdentity {
     pgo_profile_sha256: String,
 }
 
+/// Everything a mounted FUSE daemon reports about itself at startup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FfsMountSelfReport {
+    identity: FfsBinaryIdentity,
+    /// Verbatim `mount_candidate_knobs,...` line: the effective values of the
+    /// runtime knobs, resolved by the daemon through the functions its hot
+    /// paths call rather than echoed back from its environment.
+    runtime_knobs: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct KernelEngineIdentity {
     release: String,
@@ -703,6 +925,10 @@ enum MountedArmKind {
         self_reported_sha256: String,
         proc_exe_sha256: String,
         pgo_profile_sha256: String,
+        /// Effective runtime knobs this daemon reported at startup.
+        runtime_knobs: String,
+        /// Environment this arm was launched with beyond the shared baseline.
+        candidate_env: Vec<(String, String)>,
     },
 }
 
@@ -770,7 +996,8 @@ impl MountedArm {
                 self_reported_sha256,
                 proc_exe_sha256,
                 pgo_profile_sha256,
-                ..
+                runtime_knobs,
+                candidate_env,
             } => {
                 let mut object = base.as_object().cloned().unwrap_or_default();
                 object.insert("stdout_log".to_owned(), json!(stdout_log));
@@ -782,6 +1009,19 @@ impl MountedArm {
                 );
                 object.insert("proc_exe_sha256".to_owned(), json!(proc_exe_sha256));
                 object.insert("pgo_profile_sha256".to_owned(), json!(pgo_profile_sha256));
+                object.insert(
+                    "self_reported_runtime_knobs".to_owned(),
+                    json!(runtime_knobs),
+                );
+                object.insert(
+                    "candidate_env".to_owned(),
+                    Value::Object(
+                        candidate_env
+                            .iter()
+                            .map(|(key, value)| (key.clone(), json!(value)))
+                            .collect(),
+                    ),
+                );
                 Value::Object(object)
             }
         }
@@ -826,7 +1066,15 @@ fn usage() {
                                           readdir-stat-8t | fsync-journal-commit |\n\
                                           bulk-durable-write | xattr-get-list-report\n\
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
-           --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32)\n\
+           --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32;\n\
+                                          with a candidate comparison the schedule period is\n\
+                                          12, so pairs must be a multiple of 12, default 36)\n\
+           --candidate-b-env K=V          Mount two MORE FUSE arms from the same ELF with this\n\
+                                          extra environment, and report a within-window paired\n\
+                                          candidate-vs-candidate ratio (repeatable; keys must\n\
+                                          start with FFS_)\n\
+           --candidate-aa                 Same six-arm shape with IDENTICAL candidate\n\
+                                          configurations: the estimator's own A/A null control\n\
            --operations N                 Workload operations per observation (default 2000)\n\
            --client-threads N             Actual parallel-metadata worker threads (default 8)\n\
            --fuse-cpus N                  CPUs pinned to the FrankenFS daemon (default 1;\n\
@@ -917,10 +1165,25 @@ fn validate_config(config: &Config) -> Result<()> {
             "{flag} is required: name the machine that built the ELF"
         );
     }
+    let period = schedule_period(config.compares_candidates());
     ensure!(
-        config.pairs >= 12 && config.pairs % BALANCED_ORDERS.len() == 0,
-        "--pairs must be a multiple of 4 and at least 12"
+        config.pairs >= 12 && config.pairs % period == 0,
+        "--pairs must be a multiple of {period} and at least 12"
     );
+    if let Some(comparison) = &config.candidate_comparison {
+        let mut keys = BTreeSet::new();
+        for (key, _) in &comparison.env {
+            ensure!(
+                key.starts_with("FFS_"),
+                "--candidate-b-env key {key} must start with FFS_: the two candidate arms differ \
+                 by a FrankenFS runtime knob on one ELF, not by their process environment at large"
+            );
+            ensure!(
+                keys.insert(key.clone()),
+                "--candidate-b-env {key} was given more than once"
+            );
+        }
+    }
     ensure!(config.operations > 0, "--operations must be positive");
     ensure!(
         config.observation_repeats > 0,
@@ -1010,8 +1273,20 @@ fn parse_args() -> Result<Option<Config>> {
     parse_config_args(&args)
 }
 
+fn parse_candidate_env_assignment(value: &str) -> Result<(String, String)> {
+    let (key, assigned) = value
+        .split_once('=')
+        .ok_or_else(|| anyhow!("--candidate-b-env expects KEY=VALUE, got {value}"))?;
+    ensure!(
+        !key.is_empty(),
+        "--candidate-b-env expects a non-empty key, got {value}"
+    );
+    Ok((key.to_owned(), assigned.to_owned()))
+}
+
 fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
     let mut config = Config::default();
+    let mut pairs_explicit = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1038,7 +1313,23 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
                 let value = parse_value::<String>(args, &mut index, "--workload")?;
                 config.workload = parse_workload(&value)?;
             }
-            "--pairs" => config.pairs = parse_value(args, &mut index, "--pairs")?,
+            "--pairs" => {
+                config.pairs = parse_value(args, &mut index, "--pairs")?;
+                pairs_explicit = true;
+            }
+            "--candidate-b-env" => {
+                let value = parse_value::<String>(args, &mut index, "--candidate-b-env")?;
+                config
+                    .candidate_comparison
+                    .get_or_insert_with(CandidateComparison::default)
+                    .env
+                    .push(parse_candidate_env_assignment(&value)?);
+            }
+            "--candidate-aa" => {
+                config
+                    .candidate_comparison
+                    .get_or_insert_with(CandidateComparison::default);
+            }
             "--operations" => {
                 config.operations = parse_value(args, &mut index, "--operations")?;
             }
@@ -1089,6 +1380,13 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
             other => bail!("unknown argument: {other}"),
         }
         index += 1;
+    }
+
+    // The six-arm schedule only closes on a multiple of 12 rounds, so the
+    // four-arm default of 32 is not expressible there. Take the smallest legal
+    // count above it rather than silently running an unbalanced schedule.
+    if config.compares_candidates() && !pairs_explicit {
+        config.pairs = 36;
     }
 
     validate_config(&config)?;
@@ -1548,10 +1846,11 @@ fn clone_images(
     kind: FilesystemKind,
     base: &Path,
     run_dir: &Path,
+    arms: &[Arm],
 ) -> Result<BTreeMap<Arm, PathBuf>> {
     let expected_sha = file_sha256(base)?;
     let mut images = BTreeMap::new();
-    for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+    for &arm in arms {
         let path = run_dir.join(format!("{}.{}.img", kind.label(), arm.label()));
         fs::copy(base, &path)
             .with_context(|| format!("clone {} to {}", base.display(), path.display()))?;
@@ -1774,7 +2073,7 @@ fn mount_kernel(
     Ok(mounted)
 }
 
-fn parse_mount_self_report(log_path: &Path) -> Result<FfsBinaryIdentity> {
+fn parse_mount_self_report(log_path: &Path) -> Result<FfsMountSelfReport> {
     let content = fs::read_to_string(log_path)
         .with_context(|| format!("read FUSE mount log {}", log_path.display()))?;
     let binary_sha256 = unique_prefixed_line(
@@ -1797,9 +2096,22 @@ fn parse_mount_self_report(log_path: &Path) -> Result<FfsBinaryIdentity> {
         is_sha256(&pgo_profile_sha256),
         "FUSE mount is not running a PGO production build: {pgo_profile_sha256}"
     );
-    Ok(FfsBinaryIdentity {
-        binary_sha256,
-        pgo_profile_sha256,
+    // Not optional: a daemon that cannot report which knob values it actually
+    // resolved cannot participate in a candidate-vs-candidate comparison, and
+    // an ELF too old to emit the line is exactly the bd-d9378 failure this
+    // evidence exists to catch.
+    let runtime_knobs = unique_prefixed_line(
+        &content,
+        "mount_candidate_knobs,",
+        "FUSE mount effective runtime knobs",
+    )?
+    .to_owned();
+    Ok(FfsMountSelfReport {
+        identity: FfsBinaryIdentity {
+            binary_sha256,
+            pgo_profile_sha256,
+        },
+        runtime_knobs,
     })
 }
 
@@ -1838,12 +2150,16 @@ fn mount_fuse(
         .map(usize::to_string)
         .collect::<Vec<_>>()
         .join(",");
+    let candidate_env = config.arm_env(arm).to_vec();
     let mut command = Command::new("taskset");
     command
         .args(["-c", &cpu_list])
         .arg(&config.ffs_cli)
         .arg("mount");
     apply_fuse_dispatch_workers(&mut command, config.fuse_workers);
+    for (key, value) in &candidate_env {
+        command.env(key, value);
+    }
     if config.workload.is_mutating() {
         command.arg("--rw");
     }
@@ -1874,6 +2190,8 @@ fn mount_fuse(
             self_reported_sha256: String::new(),
             proc_exe_sha256: String::new(),
             pgo_profile_sha256: String::new(),
+            runtime_knobs: String::new(),
+            candidate_env,
         },
     };
     assert_common_mount_options(
@@ -1912,12 +2230,12 @@ fn mount_fuse(
     let proc_exe_sha256 = file_sha256(&PathBuf::from(format!("/proc/{child_id}/exe")))
         .with_context(|| format!("hash mapped FUSE executable for pid {child_id}"))?;
     ensure!(
-        self_report.binary_sha256 == proc_exe_sha256,
+        self_report.identity.binary_sha256 == proc_exe_sha256,
         "{} self-reported ELF differs from /proc/{child_id}/exe",
         arm.label(),
     );
     ensure!(
-        &self_report == expected_identity,
+        &self_report.identity == expected_identity,
         "{} runtime daemon identity differs from the v3+PGO preflight",
         arm.label()
     );
@@ -1925,15 +2243,67 @@ fn mount_fuse(
         self_reported_sha256: reported,
         proc_exe_sha256: mapped,
         pgo_profile_sha256: pgo,
+        runtime_knobs: knobs,
         ..
     } = &mut mounted.kind
     else {
         unreachable!("constructed FUSE mount");
     };
-    *reported = self_report.binary_sha256;
+    *reported = self_report.identity.binary_sha256;
     *mapped = proc_exe_sha256;
-    *pgo = self_report.pgo_profile_sha256;
+    *pgo = self_report.identity.pgo_profile_sha256;
+    *knobs = self_report.runtime_knobs;
     Ok(mounted)
+}
+
+/// Proof that the two candidate configurations are what the run claims.
+///
+/// The estimator's whole value comes from both arms executing one ELF and
+/// differing only by a runtime knob. Two ways that can silently fail: the
+/// replicas of one configuration disagree with each other (then the "A/A" null
+/// is not a null), or the two configurations agree (then a supposed A/B is
+/// measuring nothing — the bd-d9378 failure, where the ELF predated the flag
+/// and ignored it). Both are checked against what the daemons resolved, not
+/// against what the harness intended.
+fn candidate_knob_divergence(
+    mounts: &[MountedArm],
+    configurations_differ: bool,
+) -> Result<(String, String)> {
+    let knobs_for = |arms: &[Arm], label: &str| -> Result<String> {
+        let reported: BTreeSet<String> = mounts
+            .iter()
+            .filter(|mount| arms.contains(&mount.arm))
+            .filter_map(|mount| match &mount.kind {
+                MountedArmKind::Fuse { runtime_knobs, .. } => Some(runtime_knobs.clone()),
+                MountedArmKind::Kernel => None,
+            })
+            .collect();
+        ensure!(
+            reported.len() == 1,
+            "candidate {label} replicas reported different effective runtime knobs: {reported:?}"
+        );
+        reported
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("candidate {label} reported no runtime knobs"))
+    };
+    let candidate_a = knobs_for(&CANDIDATE_A_ARMS, "A")?;
+    let candidate_b = knobs_for(&CANDIDATE_B_ARMS, "B")?;
+    if configurations_differ {
+        ensure!(
+            candidate_a != candidate_b,
+            "the two candidate configurations resolved IDENTICAL runtime knobs ({candidate_a}); \
+             the requested override never reached a knob this ELF reads, so the run would compare \
+             a configuration against itself"
+        );
+    } else {
+        ensure!(
+            candidate_a == candidate_b,
+            "the candidate A/A null control resolved DIFFERENT runtime knobs: {candidate_a} vs \
+             {candidate_b}"
+        );
+    }
+    Ok((candidate_a, candidate_b))
 }
 
 fn apply_fuse_dispatch_workers(command: &mut Command, fuse_workers: Option<usize>) {
@@ -2152,16 +2522,21 @@ fn xattr_witness(root: &Path) -> Result<XattrWitness> {
     })
 }
 
-fn assert_independent_arms(mounts: &[MountedArm]) -> Result<()> {
-    ensure!(mounts.len() == 4, "independence proof requires four mounts");
+fn assert_independent_arms(mounts: &[MountedArm], expected_fuse_arms: usize) -> Result<()> {
+    let expected = 2 + expected_fuse_arms;
+    ensure!(
+        mounts.len() == expected,
+        "independence proof requires {expected} mounts, found {}",
+        mounts.len()
+    );
     let images: BTreeSet<PathBuf> = mounts.iter().map(|mount| mount.image.clone()).collect();
     let mountpoints: BTreeSet<PathBuf> = mounts
         .iter()
         .map(|mount| mount.mountpoint.clone())
         .collect();
     ensure!(
-        images.len() == 4 && mountpoints.len() == 4,
-        "mounted arms do not own four distinct images and mountpoints"
+        images.len() == expected && mountpoints.len() == expected,
+        "mounted arms do not own {expected} distinct images and mountpoints"
     );
 
     let kernel_devices: BTreeSet<String> = mounts
@@ -2192,8 +2567,8 @@ fn assert_independent_arms(mounts: &[MountedArm]) -> Result<()> {
         })
         .collect();
     ensure!(
-        fuse_devices.len() == 2 && fuse_pids.len() == 2,
-        "FUSE A/A arms share a mount device or daemon process"
+        fuse_devices.len() == expected_fuse_arms && fuse_pids.len() == expected_fuse_arms,
+        "FUSE arms share a mount device or daemon process"
     );
     Ok(())
 }
@@ -2841,7 +3216,7 @@ fn run_warmup_rounds(
     next_sequences: &mut BTreeMap<Arm, usize>,
 ) -> Result<()> {
     for round in 0..config.workload.warmup_rounds() {
-        for logical_arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
+        for &logical_arm in balanced_order(config.compares_candidates(), round) {
             let physical_arm = physical_arm_for(logical_arm, round);
             let root = roots
                 .get(&physical_arm)
@@ -2882,45 +3257,30 @@ fn collect_samples(
     pinning: &WorkerPinning,
     interrupted: &AtomicBool,
 ) -> Result<TimedSamples> {
-    let mut next_sequences = BTreeMap::from([
-        (Arm::KernelA, 0_usize),
-        (Arm::KernelB, 0_usize),
-        (Arm::FuseA, 0_usize),
-        (Arm::FuseB, 0_usize),
-    ]);
+    let arms = measured_arms(config.compares_candidates());
+    let mut next_sequences: BTreeMap<Arm, usize> =
+        arms.iter().map(|&arm| (arm, 0_usize)).collect();
     run_warmup_rounds(roots, config, pinning, &mut next_sequences)?;
 
-    let mut values = BTreeMap::from([
-        (Arm::KernelA, Vec::with_capacity(config.pairs)),
-        (Arm::KernelB, Vec::with_capacity(config.pairs)),
-        (Arm::FuseA, Vec::with_capacity(config.pairs)),
-        (Arm::FuseB, Vec::with_capacity(config.pairs)),
-    ]);
-    let mut physical_values = BTreeMap::from([
-        (Arm::KernelA, Vec::with_capacity(config.pairs)),
-        (Arm::KernelB, Vec::with_capacity(config.pairs)),
-        (Arm::FuseA, Vec::with_capacity(config.pairs)),
-        (Arm::FuseB, Vec::with_capacity(config.pairs)),
-    ]);
+    let mut values: BTreeMap<Arm, Vec<u64>> = arms
+        .iter()
+        .map(|&arm| (arm, Vec::with_capacity(config.pairs)))
+        .collect();
+    let mut physical_values: BTreeMap<Arm, Vec<u64>> = arms
+        .iter()
+        .map(|&arm| (arm, Vec::with_capacity(config.pairs)))
+        .collect();
     let mut digests = BTreeMap::new();
-    let mut observed_worker_threads = BTreeMap::from([
-        (Arm::KernelA, BTreeSet::new()),
-        (Arm::KernelB, BTreeSet::new()),
-        (Arm::FuseA, BTreeSet::new()),
-        (Arm::FuseB, BTreeSet::new()),
-    ]);
-    let mut observed_worker_cpus = BTreeMap::from([
-        (Arm::KernelA, BTreeSet::new()),
-        (Arm::KernelB, BTreeSet::new()),
-        (Arm::FuseA, BTreeSet::new()),
-        (Arm::FuseB, BTreeSet::new()),
-    ]);
+    let mut observed_worker_threads: BTreeMap<Arm, BTreeSet<usize>> =
+        arms.iter().map(|&arm| (arm, BTreeSet::new())).collect();
+    let mut observed_worker_cpus: BTreeMap<Arm, BTreeSet<usize>> =
+        arms.iter().map(|&arm| (arm, BTreeSet::new())).collect();
     for round in 0..config.pairs {
         ensure!(
             !interrupted.load(Ordering::Relaxed),
             "interrupted during timed workload"
         );
-        for logical_arm in BALANCED_ORDERS[round % BALANCED_ORDERS.len()] {
+        for &logical_arm in balanced_order(config.compares_candidates(), round) {
             let physical_arm = physical_arm_for(logical_arm, round);
             let root = roots
                 .get(&physical_arm)
@@ -3049,11 +3409,11 @@ fn clears_twice_null_margin(
 fn worker_thread_observation_is_clear(
     observed_by_arm: &BTreeMap<Arm, BTreeSet<usize>>,
     requested: usize,
+    arms: &[Arm],
 ) -> bool {
     let expected = BTreeSet::from([requested]);
-    [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB]
-        .into_iter()
-        .all(|arm| observed_by_arm.get(&arm) == Some(&expected))
+    arms.iter()
+        .all(|arm| observed_by_arm.get(arm) == Some(&expected))
 }
 
 /// Every arm's timed threads must have run on exactly the bound CPU set.
@@ -3064,10 +3424,31 @@ fn worker_thread_observation_is_clear(
 fn worker_cpu_pinning_is_clear(
     observed_by_arm: &BTreeMap<Arm, BTreeSet<usize>>,
     expected: &BTreeSet<usize>,
+    arms: &[Arm],
 ) -> bool {
-    [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB]
-        .into_iter()
-        .all(|arm| observed_by_arm.get(&arm) == Some(expected))
+    arms.iter()
+        .all(|arm| observed_by_arm.get(arm) == Some(expected))
+}
+
+/// Gate for the candidate-vs-candidate estimator itself.
+///
+/// When the two candidate configurations are deliberately identical, the
+/// cross-pair ratio is a null and has to land at 1.0 within the same bar every
+/// other A/A null clears — that null is what makes any later
+/// candidate-vs-candidate number worth reading. When they differ the ratio is
+/// the estimate, not a null, and this is vacuously true.
+fn candidate_cross_null_is_clear(
+    configurations_differ: bool,
+    ratio: Option<BootstrapMedianCi>,
+    maximum_null_ratio: f64,
+) -> bool {
+    if configurations_differ {
+        return true;
+    }
+    match ratio {
+        Some(ratio) => null_control_is_clear(ratio, maximum_null_ratio),
+        None => true,
+    }
 }
 
 fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f64>> {
@@ -3093,37 +3474,68 @@ fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f6
         .collect())
 }
 
-fn competitive_log_ratios(samples: &TimedSamples) -> Result<Vec<f64>> {
-    let kernel_a = &samples.values[&Arm::KernelA];
-    let kernel_b = &samples.values[&Arm::KernelB];
-    let fuse_a = &samples.values[&Arm::FuseA];
-    let fuse_b = &samples.values[&Arm::FuseB];
+/// Within-window paired log ratio between two A/A arm pairs.
+///
+/// Each round contributes the difference of the two pairs' mean log wall time,
+/// so anything common to the whole round — host drift, thermal state, whatever
+/// else moved between windows — cancels before the ratio is formed. Blocks of
+/// [`ESTIMATOR_BLOCK_ROUNDS`] rounds are then averaged so one bootstrap sample
+/// is a complete balanced crossover block.
+///
+/// `fuse_over_kernel` uses it with the FUSE and kernel pairs; a
+/// candidate-vs-candidate comparison uses it with the two candidate pairs, and
+/// gets exactly the same cancellation for free. That is the whole point of
+/// bd-3tqgc: the arms it compares ran in the SAME window, so the 4.71%
+/// cross-window spread that swamped every remaining metadata lever never
+/// enters the estimate.
+fn paired_group_log_ratios(
+    samples: &TimedSamples,
+    numerator: [Arm; 2],
+    denominator: [Arm; 2],
+) -> Result<Vec<f64>> {
+    let series = |arm: Arm| -> Result<&Vec<u64>> {
+        samples
+            .values
+            .get(&arm)
+            .ok_or_else(|| anyhow!("missing timed samples for {}", arm.label()))
+    };
+    let numerator_left = series(numerator[0])?;
+    let numerator_right = series(numerator[1])?;
+    let denominator_left = series(denominator[0])?;
+    let denominator_right = series(denominator[1])?;
     ensure!(
-        kernel_a.len() == kernel_b.len()
-            && kernel_a.len() == fuse_a.len()
-            && kernel_a.len() == fuse_b.len(),
-        "competitive arms must have equal sample counts"
+        numerator_left.len() == numerator_right.len()
+            && numerator_left.len() == denominator_left.len()
+            && numerator_left.len() == denominator_right.len(),
+        "paired arms must have equal sample counts"
     );
     ensure!(
-        kernel_a.len() % ESTIMATOR_BLOCK_ROUNDS == 0,
-        "competitive arms must contain complete crossover blocks"
+        !numerator_left.is_empty() && numerator_left.len() % ESTIMATOR_BLOCK_ROUNDS == 0,
+        "paired arms must contain complete crossover blocks"
     );
-    let per_round = kernel_a
+    let per_round = numerator_left
         .iter()
-        .zip(kernel_b)
-        .zip(fuse_a.iter().zip(fuse_b))
-        .map(
-            |((&kernel_left, &kernel_right), (&fuse_left, &fuse_right))| {
-                0.5 * ((fuse_left as f64).ln() + (fuse_right as f64).ln()
-                    - (kernel_left as f64).ln()
-                    - (kernel_right as f64).ln())
-            },
-        )
-        .collect::<Vec<_>>();
+        .zip(numerator_right)
+        .zip(denominator_left.iter().zip(denominator_right))
+        .map(|((&num_left, &num_right), (&den_left, &den_right))| {
+            ensure!(
+                num_left > 0 && num_right > 0 && den_left > 0 && den_right > 0,
+                "timed samples must be positive"
+            );
+            Ok(0.5
+                * ((num_left as f64).ln() + (num_right as f64).ln()
+                    - (den_left as f64).ln()
+                    - (den_right as f64).ln()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(per_round
         .chunks_exact(ESTIMATOR_BLOCK_ROUNDS)
         .map(|block| block.iter().sum::<f64>() / ESTIMATOR_BLOCK_DIVISOR)
         .collect())
+}
+
+fn competitive_log_ratios(samples: &TimedSamples) -> Result<Vec<f64>> {
+    paired_group_log_ratios(samples, CANDIDATE_A_ARMS, KERNEL_ARMS)
 }
 
 fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>> {
@@ -3678,7 +4090,6 @@ fn select_cpu_placement(
             let (fuse_cpus, fuse_guard_cpus) = select_multi_fuse_cpus(
                 fuse_cpu_count,
                 &ranked,
-                &busy,
                 driver_domain,
                 &claimed,
                 allowed_cpus,
@@ -3746,11 +4157,12 @@ fn select_fuse_cpus(
 /// selector additionally demands a quiet SMT sibling, but at this CPU count the
 /// siblings are the benchmark's own client threads: load put there by the job
 /// under measurement is the placement, not contamination. Foreign load is still
-/// excluded, because every candidate CPU must clear the same busy limit.
+/// excluded, because every candidate CPU must clear the same busy limit — the
+/// per-CPU load carried in `ranked`, which is the same measurement the quiet
+/// window produced.
 fn select_multi_fuse_cpus(
     count: usize,
     ranked: &[(usize, f64)],
-    busy: &BTreeMap<usize, f64>,
     driver_domain: &BTreeSet<usize>,
     client_cpus: &BTreeSet<usize>,
     allowed_cpus: &BTreeSet<usize>,
@@ -4057,11 +4469,14 @@ fn fs_report(
     let mount_fs_dir = mount_run_dir.join(kind.label());
     fs::create_dir(&mount_fs_dir)
         .with_context(|| format!("create mount directory {}", mount_fs_dir.display()))?;
+    let compares_candidates = config.compares_candidates();
+    let arms = measured_arms(compares_candidates);
+    let candidate_arms = fuse_arms(compares_candidates);
     let base = create_base_image(kind, fixture_root, &fs_dir, config)?;
-    let images = clone_images(kind, &base, &fs_dir)?;
+    let images = clone_images(kind, &base, &fs_dir, arms)?;
 
-    let mut mounts = Vec::with_capacity(4);
-    for arm in [Arm::KernelA, Arm::KernelB] {
+    let mut mounts = Vec::with_capacity(arms.len());
+    for arm in KERNEL_ARMS {
         mounts.push(mount_kernel(
             kind,
             arm,
@@ -4071,7 +4486,7 @@ fn fs_report(
             interrupted,
         )?);
     }
-    for arm in [Arm::FuseA, Arm::FuseB] {
+    for &arm in candidate_arms {
         mounts.push(mount_fuse(
             config,
             expected_identity,
@@ -4082,7 +4497,7 @@ fn fs_report(
             interrupted,
         )?);
     }
-    assert_independent_arms(&mounts)?;
+    assert_independent_arms(&mounts, candidate_arms.len())?;
     let kernel_identity = kernel_engine_identity(kind)?;
     let client_affinity_mask = self_cpu_affinity_mask()?;
     let client_affinity_list = format_cpu_list(self_allowed_cpus()?);
@@ -4099,8 +4514,14 @@ fn fs_report(
         .collect();
     ensure!(
         fuse_shas.len() == 1,
-        "FUSE A/A arms executed different ELFs: {fuse_shas:?}"
+        "FUSE arms executed different ELFs: {fuse_shas:?}"
     );
+    // With a second candidate configuration mounted, the single-ELF check above
+    // is the load-bearing half of "one ELF, two configurations"; this is the
+    // other half.
+    let candidate_knobs = compares_candidates
+        .then(|| candidate_knob_divergence(&mounts, config.candidate_configurations_differ()))
+        .transpose()?;
 
     let identities: Vec<Value> = mounts.iter().map(MountedArm::identity_json).collect();
     let mut parity = BTreeMap::new();
@@ -4246,19 +4667,53 @@ fn fs_report(
     );
     let fuse_over_kernel =
         bootstrap_median_ci(&competitive_log_ratios(&samples)?, 0x4B45_524E_454C_4142);
+    // Second candidate configuration: its own A/A null, and the within-window
+    // paired ratio against the first configuration.
+    let candidate_b_null = compares_candidates
+        .then(|| -> Result<BootstrapMedianCi> {
+            Ok(bootstrap_median_ci(
+                &crossover_log_ratios(
+                    &samples.values[&Arm::CandidateBA],
+                    &samples.values[&Arm::CandidateBB],
+                )?,
+                0x4341_4E44_425F_4141,
+            ))
+        })
+        .transpose()?;
+    let candidate_b_over_candidate_a = compares_candidates
+        .then(|| -> Result<BootstrapMedianCi> {
+            Ok(bootstrap_median_ci(
+                &paired_group_log_ratios(&samples, CANDIDATE_B_ARMS, CANDIDATE_A_ARMS)?,
+                0x4341_4E44_425F_4142,
+            ))
+        })
+        .transpose()?;
     let kernel_ci_contains_one = kernel_null.contains_null();
     let fuse_ci_contains_one = fuse_null.contains_null();
     let kernel_median_within_null_bias_limit = kernel_null.median_within_null_bias_limit();
     let fuse_median_within_null_bias_limit = fuse_null.median_within_null_bias_limit();
     let kernel_clear = null_control_is_clear(kernel_null, config.maximum_null_ratio);
     let fuse_clear = null_control_is_clear(fuse_null, config.maximum_null_ratio);
+    let candidate_b_clear =
+        candidate_b_null.is_none_or(|ci| null_control_is_clear(ci, config.maximum_null_ratio));
+    // When the two candidate configurations are deliberately identical, the
+    // cross-pair ratio is itself a null and has to clear the same bar. That is
+    // the gate for the new estimator: if a four-FUSE-arm A/A cannot come out at
+    // 1.0, no candidate-vs-candidate number taken with this instrument means
+    // anything.
+    let candidate_cross_null_clear = candidate_cross_null_is_clear(
+        config.candidate_configurations_differ(),
+        candidate_b_over_candidate_a,
+        config.maximum_null_ratio,
+    );
     let worker_thread_observation_clear = worker_thread_observation_is_clear(
         &samples.observed_worker_threads,
         config.client_threads(),
+        arms,
     );
     let expected_worker_cpus = pinning.expected_cpus(config.client_threads());
     let worker_cpu_pinning_clear =
-        worker_cpu_pinning_is_clear(&samples.observed_worker_cpus, &expected_worker_cpus);
+        worker_cpu_pinning_is_clear(&samples.observed_worker_cpus, &expected_worker_cpus, arms);
     let actual_observed_worker_threads =
         worker_thread_observation_clear.then_some(config.client_threads());
     let job_statement = config
@@ -4273,17 +4728,34 @@ fn fs_report(
     let semantic_work_contract = config
         .workload
         .semantic_work_contract(config.operations, config.client_threads());
-    let admitted =
-        kernel_clear && fuse_clear && worker_thread_observation_clear && worker_cpu_pinning_clear;
+    let admitted = kernel_clear
+        && fuse_clear
+        && candidate_b_clear
+        && candidate_cross_null_clear
+        && worker_thread_observation_clear
+        && worker_cpu_pinning_clear;
     let twice_null_log_margin = 2.0 * null_log_margin(kernel_null, fuse_null);
     let twice_null_ratio = twice_null_log_margin.exp();
     let directional_claim_clear =
         admitted && clears_twice_null_margin(fuse_over_kernel, kernel_null, fuse_null);
+    // The candidate-vs-candidate claim is bounded by the two candidate nulls,
+    // not the kernel one: those are the arms it is built from.
+    let candidate_twice_null_log_margin = candidate_b_null
+        .map(|candidate_b| 2.0 * null_log_margin(fuse_null, candidate_b))
+        .unwrap_or_default();
+    let candidate_claim_clear = admitted
+        && config.candidate_configurations_differ()
+        && match (candidate_b_over_candidate_a, candidate_b_null) {
+            (Some(ratio), Some(candidate_b)) => {
+                clears_twice_null_margin(ratio, fuse_null, candidate_b)
+            }
+            _ => false,
+        };
     let verdict = if !worker_thread_observation_clear {
         "BLOCKED_THREAD_OBSERVATION"
     } else if !worker_cpu_pinning_clear {
         "BLOCKED_WORKER_CPU_PINNING"
-    } else if !kernel_clear || !fuse_clear {
+    } else if !kernel_clear || !fuse_clear || !candidate_b_clear || !candidate_cross_null_clear {
         "BLOCKED_NULL"
     } else if !directional_claim_clear {
         "HONEST_NEUTRAL"
@@ -4291,6 +4763,19 @@ fn fs_report(
         "HONEST_LOSS"
     } else {
         "HONEST_WIN"
+    };
+    let candidate_verdict = if !compares_candidates {
+        "NOT_APPLICABLE"
+    } else if !admitted {
+        verdict
+    } else if !config.candidate_configurations_differ() {
+        "CANDIDATE_AA_NULL_CLEAR"
+    } else if !candidate_claim_clear {
+        "CANDIDATE_NEUTRAL"
+    } else if candidate_b_over_candidate_a.is_some_and(|ratio| ratio.median > 1.0) {
+        "CANDIDATE_B_SLOWER"
+    } else {
+        "CANDIDATE_B_FASTER"
     };
     let kernel_median_wall_ns = median(
         [Arm::KernelA, Arm::KernelB]
@@ -4311,7 +4796,7 @@ fn fs_report(
     let fuse_operations_per_second =
         config.operations as f64 * 1_000_000_000.0 / fuse_median_wall_ns;
 
-    for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+    for &arm in arms {
         println!(
             "mounted_kernel_arm,filesystem={},workload={},assignment_arm={},median_wall_ns={:.0},samples={}",
             kind.label(),
@@ -4340,7 +4825,7 @@ fn fs_report(
         );
     }
     println!(
-        "mounted_kernel_identity,filesystem={},workload={},kernel_release={},kernel_module={},kernel_engine_artifact={},kernel_engine_sha256={},kernel_runtime_notes_sha256={},kernel_arms=2,fuse_arms=2,fuse_binary_sha256={},mount_identity=pass,independent_arms=pass,options={}+noatime+nodev+nosuid,durability={}",
+        "mounted_kernel_identity,filesystem={},workload={},kernel_release={},kernel_module={},kernel_engine_artifact={},kernel_engine_sha256={},kernel_runtime_notes_sha256={},kernel_arms=2,fuse_arms={},fuse_binary_sha256={},mount_identity=pass,independent_arms=pass,options={}+noatime+nodev+nosuid,durability={}",
         kind.label(),
         config.workload.label(),
         kernel_identity.release,
@@ -4348,6 +4833,7 @@ fn fs_report(
         kernel_identity.artifact.display(),
         kernel_identity.artifact_sha256,
         kernel_identity.runtime_notes_sha256,
+        candidate_arms.len(),
         fuse_shas
             .iter()
             .next()
@@ -4378,9 +4864,10 @@ fn fs_report(
         config.workload.label(),
     );
     println!(
-        "mounted_kernel_parity,filesystem={},workload={},arms=4,file_sha256={},len={},mode={:o},uid={},gid={},nlink={},tree_sha256={},tree_entries={},tree_files={},tree_dirs={},tree_bytes={},verdict=pass",
+        "mounted_kernel_parity,filesystem={},workload={},arms={},file_sha256={},len={},mode={:o},uid={},gid={},nlink={},tree_sha256={},tree_entries={},tree_files={},tree_dirs={},tree_bytes={},verdict=pass",
         kind.label(),
         config.workload.label(),
+        arms.len(),
         expected_parity.file_sha256,
         expected_parity.len,
         expected_parity.mode,
@@ -4395,9 +4882,10 @@ fn fs_report(
     );
     if let Some(xattr) = &expected_initial_xattr {
         println!(
-            "mounted_kernel_xattr_parity,filesystem={},workload={},arms=4,xattr_sha256={},inline_value_bytes={},external_value_bytes={},single_list_names={},many_list_names={},absent_lookup_none={},external_storage_proof=debugfs_nonzero_file_acl_block,validation_timing=outside_measurement,verdict=pass",
+            "mounted_kernel_xattr_parity,filesystem={},workload={},arms={},xattr_sha256={},inline_value_bytes={},external_value_bytes={},single_list_names={},many_list_names={},absent_lookup_none={},external_storage_proof=debugfs_nonzero_file_acl_block,validation_timing=outside_measurement,verdict=pass",
             kind.label(),
             config.workload.label(),
+            arms.len(),
             xattr.sha256,
             xattr.inline_value_bytes,
             xattr.external_value_bytes,
@@ -4408,14 +4896,15 @@ fn fs_report(
     }
     if let Some(bulk_write) = &expected_initial_bulk_write {
         println!(
-            "mounted_kernel_bulk_durable_initial_parity,filesystem={},workload={},arms=4,file_sha256={},bytes={},validation_timing=outside_measurement,verdict=pass",
+            "mounted_kernel_bulk_durable_initial_parity,filesystem={},workload={},arms={},file_sha256={},bytes={},validation_timing=outside_measurement,verdict=pass",
             kind.label(),
             config.workload.label(),
+            arms.len(),
             bulk_write.sha256,
             bulk_write.bytes,
         );
     }
-    for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+    for &arm in arms {
         println!(
             "mounted_kernel_worker_threads,filesystem={},workload={},assignment_arm={},requested={},runtime_observed_values={},observation_method={},clear={}",
             kind.label(),
@@ -4518,6 +5007,67 @@ fn fs_report(
         verdict,
         BOOTSTRAP_RESAMPLES,
     );
+    if let (Some(candidate_b), Some(candidate_ratio), Some((knobs_a, knobs_b))) = (
+        candidate_b_null,
+        candidate_b_over_candidate_a,
+        candidate_knobs.as_ref(),
+    ) {
+        println!(
+            "mounted_kernel_null,filesystem={},workload={},arm=fuse_candidate_b,median={:.6},median_deviation_from_one={:.6},maximum_median_deviation={:.6},median_within_limit={},ci_low={:.6},ci_high={:.6},ci_contains_one={},ci_contains_one_gate_input=false,symmetric_spread={:.6},maximum={:.6},crossover_blocks={},estimator=four_round_balanced_crossover_bootstrap_median_ci,clear={}",
+            kind.label(),
+            config.workload.label(),
+            candidate_b.median,
+            (candidate_b.median - 1.0).abs(),
+            MAXIMUM_NULL_MEDIAN_DEVIATION,
+            candidate_b.median_within_null_bias_limit(),
+            candidate_b.low,
+            candidate_b.high,
+            candidate_b.contains_null(),
+            candidate_b.symmetric_spread(),
+            config.maximum_null_ratio,
+            config.pairs / ESTIMATOR_BLOCK_ROUNDS,
+            candidate_b_clear,
+        );
+        println!(
+            "mounted_kernel_candidate_identity,filesystem={},workload={},workload_arms={},candidate_a_arms={},candidate_b_arms={},one_elf=true,elf_sha256={},candidate_a_runtime_knobs={:?},candidate_b_runtime_knobs={:?},candidate_b_env={:?},configurations_differ={},knob_divergence_proof=daemon_self_reported_effective_values,verdict=pass",
+            kind.label(),
+            config.workload.label(),
+            arms.len(),
+            CANDIDATE_A_ARMS.map(Arm::label).join(":"),
+            CANDIDATE_B_ARMS.map(Arm::label).join(":"),
+            expected_identity.binary_sha256,
+            knobs_a,
+            knobs_b,
+            config
+                .candidate_comparison
+                .as_ref()
+                .map(|comparison| comparison
+                    .env
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(","))
+                .unwrap_or_default(),
+            config.candidate_configurations_differ(),
+        );
+        println!(
+            "mounted_kernel_candidate_ratio,filesystem={},metric=wall_ns,workload={},pairs={},crossover_blocks={},schedule=six_arm_williams_square,same_window=true,candidate_b_over_candidate_a_median={:.6},ci_low={:.6},ci_high={:.6},twice_null_margin_ratio={:.6},minimum_decidable_effect_ratio={:.6},achieved_resolution_ratio={:.6},candidate_claim_clear={},admitted={},verdict={},gate_basis=within_window_paired_candidate_crossover_gated_on_both_candidate_aa_nulls,bootstrap_resamples={}",
+            kind.label(),
+            config.workload.label(),
+            config.pairs,
+            config.pairs / ESTIMATOR_BLOCK_ROUNDS,
+            candidate_ratio.median,
+            candidate_ratio.low,
+            candidate_ratio.high,
+            candidate_twice_null_log_margin.exp(),
+            candidate_twice_null_log_margin.exp(),
+            candidate_ratio.symmetric_spread(),
+            candidate_claim_clear,
+            admitted,
+            candidate_verdict,
+            BOOTSTRAP_RESAMPLES,
+        );
+    }
     println!(
         "mounted_kernel_throughput,filesystem={},workload={},requested_client_threads={},actual_observed_worker_threads={},operations_per_observation={},kernel_median_wall_ns={kernel_median_wall_ns:.0},fuse_median_wall_ns={fuse_median_wall_ns:.0},kernel_operations_per_second={kernel_operations_per_second:.3},fuse_operations_per_second={fuse_operations_per_second:.3},diagnostic_only=true",
         kind.label(),
@@ -4635,9 +5185,10 @@ fn fs_report(
         );
     }
     println!(
-        "mounted_kernel_post_parity,filesystem={},workload={},arms=4,tree_sha256={},tree_entries={},tree_files={},tree_dirs={},tree_bytes={},verdict=pass",
+        "mounted_kernel_post_parity,filesystem={},workload={},arms={},tree_sha256={},tree_entries={},tree_files={},tree_dirs={},tree_bytes={},verdict=pass",
         kind.label(),
         config.workload.label(),
+        arms.len(),
         expected_final_tree.sha256,
         expected_final_tree.entries,
         expected_final_tree.regular_files,
@@ -4646,17 +5197,19 @@ fn fs_report(
     );
     if let Some(xattr) = &expected_final_xattr {
         println!(
-            "mounted_kernel_post_xattr_parity,filesystem={},workload={},arms=4,xattr_sha256={},validation_timing=outside_measurement,verdict=pass",
+            "mounted_kernel_post_xattr_parity,filesystem={},workload={},arms={},xattr_sha256={},validation_timing=outside_measurement,verdict=pass",
             kind.label(),
             config.workload.label(),
+            arms.len(),
             xattr.sha256,
         );
     }
     if let Some(bulk_write) = &expected_final_bulk_write {
         println!(
-            "mounted_kernel_post_bulk_durable_parity,filesystem={},workload={},arms=4,file_sha256={},bytes={},uniform_byte={},validation_timing=outside_measurement,verdict=pass",
+            "mounted_kernel_post_bulk_durable_parity,filesystem={},workload={},arms={},file_sha256={},bytes={},uniform_byte={},validation_timing=outside_measurement,verdict=pass",
             kind.label(),
             config.workload.label(),
+            arms.len(),
             bulk_write.sha256,
             bulk_write.bytes,
             bulk_write
@@ -4838,6 +5391,63 @@ fn fs_report(
         "twice_null_margin_ratio": twice_null_ratio,
         "directional_claim_clear": directional_claim_clear,
     });
+    let candidate_b_aa_json = candidate_b_null.map_or_else(
+        || json!("not_applicable"),
+        |candidate_b| {
+            json!({
+                "median": candidate_b.median,
+                "median_deviation_from_one": (candidate_b.median - 1.0).abs(),
+                "maximum_median_deviation": MAXIMUM_NULL_MEDIAN_DEVIATION,
+                "median_within_limit": candidate_b.median_within_null_bias_limit(),
+                "ci_low": candidate_b.low,
+                "ci_high": candidate_b.high,
+                "ci_contains_one": candidate_b.contains_null(),
+                "ci_contains_one_gate_input": false,
+                "symmetric_spread": candidate_b.symmetric_spread(),
+                "clear": candidate_b_clear,
+            })
+        },
+    );
+    let candidate_comparison_json = match (
+        &config.candidate_comparison,
+        candidate_b_over_candidate_a,
+        candidate_knobs.as_ref(),
+    ) {
+        (Some(comparison), Some(ratio), Some((knobs_a, knobs_b))) => json!({
+            "estimator": "within_window_paired_candidate_crossover",
+            "why": "the candidate arms run inside the same balanced schedule, so the window \
+                    effect cancels between them exactly as the kernel arm cancels host drift \
+                    for fuse_over_kernel (bd-3tqgc)",
+            "schedule": "six_arm_williams_square",
+            "same_window": true,
+            "one_elf": true,
+            "elf_sha256": expected_identity.binary_sha256,
+            "candidate_a_arms": CANDIDATE_A_ARMS.map(Arm::label),
+            "candidate_b_arms": CANDIDATE_B_ARMS.map(Arm::label),
+            "candidate_b_env": comparison.env_json(),
+            "configurations_differ": comparison.configurations_differ(),
+            "candidate_a_runtime_knobs": knobs_a,
+            "candidate_b_runtime_knobs": knobs_b,
+            "knob_divergence_proof": "daemon_self_reported_effective_values",
+            "candidate_b_over_candidate_a": {
+                "median": ratio.median,
+                "ci_low": ratio.low,
+                "ci_high": ratio.high,
+                "symmetric_spread": ratio.symmetric_spread(),
+            },
+            // What this instrument can and cannot decide, so the next lever is
+            // not spent finding out the hard way.
+            "resolution": {
+                "achieved_resolution_ratio": ratio.symmetric_spread(),
+                "minimum_decidable_effect_ratio": candidate_twice_null_log_margin.exp(),
+                "twice_candidate_null_log_margin": candidate_twice_null_log_margin,
+            },
+            "candidate_aa_null_clear": candidate_cross_null_clear,
+            "candidate_claim_clear": candidate_claim_clear,
+            "verdict": candidate_verdict.to_ascii_lowercase(),
+        }),
+        _ => json!("not_applicable"),
+    };
     let cpu_frequency_policy_json = cpu_frequency_policy_json(&host.cpu_frequency_policy);
 
     let Value::Object(mut report) = json!({
@@ -4890,10 +5500,21 @@ fn fs_report(
         "crossover_blocks": config.pairs / ESTIMATOR_BLOCK_ROUNDS,
         "estimator_block_rounds": ESTIMATOR_BLOCK_ROUNDS,
         "physical_role_crossover_rounds": PHYSICAL_ROLE_CROSSOVER_ROUNDS,
+        "measured_arms": arms.iter().map(|arm| arm.label()).collect::<Vec<_>>(),
+        "balanced_schedule": if compares_candidates {
+            "six_arm_williams_square"
+        } else {
+            "four_arm_latin_square"
+        },
+        "balanced_schedule_orders": balanced_order_count(compares_candidates),
+        "balanced_schedule_period_rounds": schedule_period(compares_candidates),
         "warmup_rounds": config.workload.warmup_rounds(),
         "arm_settle_ms": config.arm_settle_ms,
         "pre_measurement_settle_ms": config.pre_measurement_settle_ms,
-        "pre_measurement_quiescence": "base and four cloned image files sync_all before mount, then untimed settle after mount identity and initial parity",
+        "pre_measurement_quiescence": format!(
+            "base and {} cloned image files sync_all before mount, then untimed settle after mount identity and initial parity",
+            arms.len()
+        ),
         "between_arm_quiescence": if config.workload.is_mutating() {
             if config.workload == Workload::ParallelMetadataWrite {
                 "remove exact timed create batch, verify empty worker directories, sync -f physical mount, then settle; all outside timed interval"
@@ -4929,6 +5550,8 @@ fn fs_report(
         "workload_digests": workload_digests,
         "kernel_aa": kernel_aa_json,
         "fuse_aa": fuse_aa_json,
+        "fuse_candidate_b_aa": candidate_b_aa_json,
+        "candidate_comparison": candidate_comparison_json,
         "fuse_over_kernel": competitive_json,
         "maximum_null_ratio": config.maximum_null_ratio,
         "maximum_null_median_deviation": MAXIMUM_NULL_MEDIAN_DEVIATION,
@@ -5315,7 +5938,7 @@ mod tests {
 
     #[test]
     fn balanced_orders_put_every_arm_in_every_position() {
-        for arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+        for arm in FOUR_ARM_SET {
             let positions: BTreeSet<usize> = BALANCED_ORDERS
                 .iter()
                 .flat_map(|order| {
@@ -5330,6 +5953,78 @@ mod tests {
     }
 
     #[test]
+    fn candidate_schedule_visits_every_arm_once_in_every_position() {
+        for order in CANDIDATE_BALANCED_ORDERS {
+            assert_eq!(
+                order.iter().copied().collect::<BTreeSet<_>>(),
+                SIX_ARM_SET.into_iter().collect::<BTreeSet<_>>(),
+                "every round must run every arm exactly once"
+            );
+        }
+        for arm in SIX_ARM_SET {
+            let positions: BTreeSet<usize> = CANDIDATE_BALANCED_ORDERS
+                .iter()
+                .flat_map(|order| {
+                    order
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, candidate)| (*candidate == arm).then_some(index))
+                })
+                .collect();
+            assert_eq!(positions, BTreeSet::from([0, 1, 2, 3, 4, 5]));
+        }
+    }
+
+    /// The six-arm schedule must also balance first-order carryover: with six
+    /// arms per round an unbalanced order would leave one candidate arm always
+    /// executing right after the same neighbour, which is a bias the paired
+    /// estimator cannot cancel. A plain cyclic rotation would pass the
+    /// position test above and fail this one.
+    #[test]
+    fn candidate_schedule_is_a_williams_square() {
+        let mut adjacent = BTreeMap::new();
+        for order in CANDIDATE_BALANCED_ORDERS {
+            for pair in order.windows(2) {
+                *adjacent.entry((pair[0], pair[1])).or_insert(0_usize) += 1;
+            }
+        }
+        assert_eq!(
+            adjacent.len(),
+            SIX_ARM_SET.len() * (SIX_ARM_SET.len() - 1),
+            "every ordered pair of distinct arms must be adjacent somewhere"
+        );
+        assert!(
+            adjacent.values().all(|&count| count == 1),
+            "every ordered pair must be adjacent exactly once: {adjacent:?}"
+        );
+    }
+
+    #[test]
+    fn schedule_period_covers_both_the_square_and_the_estimator_blocks() {
+        assert_eq!(schedule_period(false), 4);
+        assert_eq!(schedule_period(true), 12);
+        assert_eq!(balanced_order_count(true), 12);
+        assert_eq!(measured_arms(true).len(), 6);
+        assert_eq!(fuse_arms(true).len(), 4);
+        assert_eq!(fuse_arms(false).len(), 2);
+        // The four-arm schedule must stay byte-identical to the banked one.
+        assert_eq!(balanced_order(false, 5), BALANCED_ORDERS[1]);
+        assert_eq!(balanced_order(true, 7), CANDIDATE_BALANCED_ORDERS[2]);
+        // Every Williams row is visited twice per period, once on each parity.
+        let mut parities: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for (round, &row) in CANDIDATE_ROW_SEQUENCE.iter().enumerate() {
+            parities.entry(row).or_default().insert(round % 2);
+        }
+        assert_eq!(parities.len(), CANDIDATE_BALANCED_ORDERS.len());
+        assert!(
+            parities
+                .values()
+                .all(|seen| *seen == BTreeSet::from([0, 1])),
+            "each row must run on both round parities: {parities:?}"
+        );
+    }
+
+    #[test]
     fn crossover_exchanges_physical_roles_and_preserves_side() {
         assert_eq!(physical_arm_for(Arm::KernelA, 0), Arm::KernelA);
         assert_eq!(physical_arm_for(Arm::KernelA, 1), Arm::KernelB);
@@ -5341,7 +6036,7 @@ mod tests {
 
     #[test]
     fn crossover_schedule_puts_every_physical_arm_in_every_position() {
-        for physical_arm in [Arm::KernelA, Arm::KernelB, Arm::FuseA, Arm::FuseB] {
+        for physical_arm in FOUR_ARM_SET {
             let positions: BTreeSet<usize> = BALANCED_ORDERS
                 .iter()
                 .enumerate()
@@ -5357,6 +6052,36 @@ mod tests {
                 .collect();
             assert_eq!(positions, BTreeSet::from([0, 1, 2, 3]));
         }
+    }
+
+    #[test]
+    fn candidate_crossover_schedule_puts_every_physical_arm_in_every_position() {
+        for physical_arm in SIX_ARM_SET {
+            let positions: BTreeSet<usize> = (0..schedule_period(true))
+                .flat_map(|round| {
+                    balanced_order(true, round)
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(position, logical_arm)| {
+                            (physical_arm_for(*logical_arm, round) == physical_arm)
+                                .then_some(position)
+                        })
+                })
+                .collect();
+            assert_eq!(positions, BTreeSet::from([0, 1, 2, 3, 4, 5]));
+        }
+        // Every physical arm must also execute the same number of times per
+        // period, or the "balanced" schedule silently favours one image.
+        let mut executions = BTreeMap::new();
+        for round in 0..schedule_period(true) {
+            for &logical_arm in balanced_order(true, round) {
+                *executions
+                    .entry(physical_arm_for(logical_arm, round))
+                    .or_insert(0_usize) += 1;
+            }
+        }
+        assert_eq!(executions.len(), SIX_ARM_SET.len());
+        assert!(executions.values().all(|&count| count == schedule_period(true)));
     }
 
     #[test]
@@ -5517,27 +6242,67 @@ mod tests {
     #[test]
     fn worker_cpu_pinning_gate_requires_every_arm_on_the_bound_cpus() {
         let expected = BTreeSet::from([4, 5, 6, 7]);
-        let clear = BTreeMap::from([
-            (Arm::KernelA, expected.clone()),
-            (Arm::KernelB, expected.clone()),
-            (Arm::FuseA, expected.clone()),
-            (Arm::FuseB, expected.clone()),
-        ]);
-        assert!(worker_cpu_pinning_is_clear(&clear, &expected));
+        let clear: BTreeMap<Arm, BTreeSet<usize>> = FOUR_ARM_SET
+            .into_iter()
+            .map(|arm| (arm, expected.clone()))
+            .collect();
+        assert!(worker_cpu_pinning_is_clear(
+            &clear,
+            &expected,
+            &FOUR_ARM_SET
+        ));
 
         // A thread that escaped its binding onto an unbound CPU blocks the run.
         let mut escaped = clear.clone();
         escaped.insert(Arm::FuseB, BTreeSet::from([4, 5, 6, 7, 12]));
-        assert!(!worker_cpu_pinning_is_clear(&escaped, &expected));
+        assert!(!worker_cpu_pinning_is_clear(
+            &escaped,
+            &expected,
+            &FOUR_ARM_SET
+        ));
 
         // So does an arm that never covered the full bound set.
         let mut partial = clear.clone();
         partial.insert(Arm::KernelA, BTreeSet::from([4, 5]));
-        assert!(!worker_cpu_pinning_is_clear(&partial, &expected));
+        assert!(!worker_cpu_pinning_is_clear(
+            &partial,
+            &expected,
+            &FOUR_ARM_SET
+        ));
 
-        let mut missing = clear;
+        let mut missing = clear.clone();
         missing.remove(&Arm::KernelB);
-        assert!(!worker_cpu_pinning_is_clear(&missing, &expected));
+        assert!(!worker_cpu_pinning_is_clear(
+            &missing,
+            &expected,
+            &FOUR_ARM_SET
+        ));
+
+        // The extra candidate arms are gated too: a four-arm-clear map is not
+        // clear for a six-arm run, so the added arms cannot skip the check.
+        assert!(!worker_cpu_pinning_is_clear(&clear, &expected, &SIX_ARM_SET));
+        let six: BTreeMap<Arm, BTreeSet<usize>> = SIX_ARM_SET
+            .into_iter()
+            .map(|arm| (arm, expected.clone()))
+            .collect();
+        assert!(worker_cpu_pinning_is_clear(&six, &expected, &SIX_ARM_SET));
+        let mut candidate_escaped = six;
+        candidate_escaped.insert(Arm::CandidateBB, BTreeSet::from([4, 5, 6, 7, 12]));
+        assert!(!worker_cpu_pinning_is_clear(
+            &candidate_escaped,
+            &expected,
+            &SIX_ARM_SET
+        ));
+        assert!(!worker_thread_observation_is_clear(
+            &BTreeMap::from([
+                (Arm::KernelA, BTreeSet::from([8])),
+                (Arm::KernelB, BTreeSet::from([8])),
+                (Arm::FuseA, BTreeSet::from([8])),
+                (Arm::FuseB, BTreeSet::from([8])),
+            ]),
+            8,
+            &SIX_ARM_SET
+        ));
     }
 
     #[test]
@@ -5746,13 +6511,29 @@ mod tests {
             (Arm::FuseA, BTreeSet::from([8])),
             (Arm::FuseB, BTreeSet::from([8])),
         ]);
-        assert!(worker_thread_observation_is_clear(&observed, 8));
+        assert!(worker_thread_observation_is_clear(
+            &observed,
+            8,
+            &FOUR_ARM_SET
+        ));
         observed.get_mut(&Arm::KernelB).expect("kernel B").insert(7);
-        assert!(!worker_thread_observation_is_clear(&observed, 8));
+        assert!(!worker_thread_observation_is_clear(
+            &observed,
+            8,
+            &FOUR_ARM_SET
+        ));
         observed.insert(Arm::KernelB, BTreeSet::from([8]));
-        assert!(!worker_thread_observation_is_clear(&observed, 1));
+        assert!(!worker_thread_observation_is_clear(
+            &observed,
+            1,
+            &FOUR_ARM_SET
+        ));
         observed.remove(&Arm::FuseB);
-        assert!(!worker_thread_observation_is_clear(&observed, 8));
+        assert!(!worker_thread_observation_is_clear(
+            &observed,
+            8,
+            &FOUR_ARM_SET
+        ));
     }
 
     /// A pinning drawn from the CPUs this test process may actually use, so the
@@ -6022,5 +6803,317 @@ mod tests {
         };
         let ratios = competitive_log_ratios(&samples).expect("competitive ratios");
         assert!(ratios.iter().all(|ratio| (ratio.exp() - 4.0).abs() < 1e-12));
+    }
+
+    fn candidate_samples(
+        candidate_a: [[u64; 4]; 2],
+        candidate_b: [[u64; 4]; 2],
+    ) -> TimedSamples {
+        TimedSamples {
+            values: BTreeMap::from([
+                (Arm::KernelA, vec![10, 10, 10, 10]),
+                (Arm::KernelB, vec![10, 10, 10, 10]),
+                (Arm::FuseA, candidate_a[0].to_vec()),
+                (Arm::FuseB, candidate_a[1].to_vec()),
+                (Arm::CandidateBA, candidate_b[0].to_vec()),
+                (Arm::CandidateBB, candidate_b[1].to_vec()),
+            ]),
+            physical_values: BTreeMap::new(),
+            digests: BTreeMap::new(),
+            observed_worker_threads: BTreeMap::new(),
+            observed_worker_cpus: BTreeMap::new(),
+            last_sequence: 0,
+        }
+    }
+
+    /// This is the whole reason bd-3tqgc exists: a window effect that scales
+    /// every arm of a round must leave the candidate-vs-candidate ratio
+    /// untouched, because both candidate configurations ran inside that window.
+    /// A cross-window estimator (comparing candidate A's rounds against
+    /// candidate B's rounds taken later) would report the window instead.
+    #[test]
+    fn candidate_ratio_cancels_a_window_effect_that_a_cross_window_estimator_reports() {
+        // Rounds 2 and 3 are 20% slower for everything on the host.
+        let window = [1.0_f64, 1.0, 1.2, 1.2];
+        let scale = |base: u64| -> [u64; 4] {
+            let mut scaled = [0_u64; 4];
+            for (slot, factor) in scaled.iter_mut().zip(window) {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    *slot = (base as f64 * factor).round() as u64;
+                }
+            }
+            scaled
+        };
+        let samples = candidate_samples(
+            [scale(1000), scale(1000)],
+            [scale(1100), scale(1100)],
+        );
+        let ratios = paired_group_log_ratios(&samples, CANDIDATE_B_ARMS, CANDIDATE_A_ARMS)
+            .expect("candidate ratios");
+        assert_eq!(ratios.len(), 1);
+        assert!(
+            (ratios[0].exp() - 1.1).abs() < 1e-9,
+            "the 10% candidate effect must survive the window, got {}",
+            ratios[0].exp()
+        );
+
+        // The same numbers read across windows: candidate A measured in the
+        // quiet rounds, candidate B in the slow ones. That is what the current
+        // sequential-window practice does, and it reports 1.32 instead of 1.10.
+        let candidate_a_quiet = f64::from(1000_u16).ln();
+        let candidate_b_slow = f64::from(1320_u16).ln();
+        assert!(((candidate_b_slow - candidate_a_quiet).exp() - 1.32).abs() < 1e-9);
+    }
+
+    #[test]
+    fn candidate_ratio_is_exactly_one_when_both_configurations_are_identical() {
+        let arm = [900, 1100, 950, 1050];
+        let samples = candidate_samples([arm, arm], [arm, arm]);
+        let ratios = paired_group_log_ratios(&samples, CANDIDATE_B_ARMS, CANDIDATE_A_ARMS)
+            .expect("candidate ratios");
+        assert!(ratios.iter().all(|ratio| ratio.abs() < 1e-12));
+        let ci = bootstrap_median_ci(&ratios, 11);
+        assert!(candidate_cross_null_is_clear(false, Some(ci), 1.025));
+    }
+
+    #[test]
+    fn candidate_aa_null_must_land_at_one_but_only_gates_the_identical_case() {
+        let drifted = BootstrapMedianCi {
+            median: 1.06,
+            low: 1.05,
+            high: 1.07,
+        };
+        // Two configurations that are supposed to be identical but measure 6%
+        // apart mean the instrument is not measuring the knob.
+        assert!(!candidate_cross_null_is_clear(false, Some(drifted), 1.025));
+        // The same interval is a legitimate estimate when they do differ.
+        assert!(candidate_cross_null_is_clear(true, Some(drifted), 1.025));
+        assert!(candidate_cross_null_is_clear(false, None, 1.025));
+
+        // A candidate claim is only decidable once it clears twice the worse of
+        // the two CANDIDATE nulls: the kernel null is irrelevant here.
+        let candidate_a_null = BootstrapMedianCi {
+            median: 1.0,
+            low: 0.995,
+            high: 1.005,
+        };
+        let candidate_b_null = BootstrapMedianCi {
+            median: 1.0,
+            low: 0.99,
+            high: 1.01,
+        };
+        let inside_floor = BootstrapMedianCi {
+            median: 1.015,
+            low: 1.012,
+            high: 1.018,
+        };
+        let outside_floor = BootstrapMedianCi {
+            median: 1.05,
+            low: 1.04,
+            high: 1.06,
+        };
+        assert!(!clears_twice_null_margin(
+            inside_floor,
+            candidate_a_null,
+            candidate_b_null
+        ));
+        assert!(clears_twice_null_margin(
+            outside_floor,
+            candidate_a_null,
+            candidate_b_null
+        ));
+    }
+
+    #[test]
+    fn candidate_comparison_selects_the_six_arm_schedule_and_a_legal_round_count() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let base = vec![
+            "--ffs-cli".to_owned(),
+            cli.display().to_string(),
+            "--harness-builder".to_owned(),
+            "hz1".to_owned(),
+            "--candidate-builder".to_owned(),
+            "hz2".to_owned(),
+        ];
+
+        let banked = parse_config_args(&base)
+            .expect("parse banked invocation")
+            .expect("normal invocation");
+        assert!(!banked.compares_candidates());
+        assert_eq!(banked.pairs, 32);
+        assert_eq!(measured_arms(banked.compares_candidates()).len(), 4);
+
+        let mut compared = base.clone();
+        compared.extend([
+            "--candidate-b-env".to_owned(),
+            "FFS_D9378_COUNT_MEMOIZED=0".to_owned(),
+        ]);
+        let config = parse_config_args(&compared)
+            .expect("parse candidate comparison")
+            .expect("normal invocation");
+        assert!(config.compares_candidates());
+        assert!(config.candidate_configurations_differ());
+        assert_eq!(
+            config.arm_env(Arm::CandidateBA),
+            [("FFS_D9378_COUNT_MEMOIZED".to_owned(), "0".to_owned())]
+        );
+        // The first candidate configuration must stay the untouched baseline.
+        assert!(config.arm_env(Arm::FuseA).is_empty());
+        assert!(config.arm_env(Arm::KernelA).is_empty());
+        // The banked default of 32 does not complete the six-arm square.
+        assert_eq!(config.pairs, 36);
+
+        let mut null_control = base.clone();
+        null_control.push("--candidate-aa".to_owned());
+        let control = parse_config_args(&null_control)
+            .expect("parse candidate A/A control")
+            .expect("normal invocation");
+        assert!(control.compares_candidates());
+        assert!(!control.candidate_configurations_differ());
+        assert!(control.arm_env(Arm::CandidateBA).is_empty());
+
+        // An explicit round count that does not complete the square is refused
+        // rather than silently truncated.
+        let mut unbalanced = compared.clone();
+        unbalanced.extend(["--pairs".to_owned(), "32".to_owned()]);
+        let error = parse_config_args(&unbalanced).expect_err("32 rounds cannot balance six arms");
+        assert!(error.to_string().contains("multiple of 12"));
+
+        let mut balanced = compared.clone();
+        balanced.extend(["--pairs".to_owned(), "24".to_owned()]);
+        assert_eq!(
+            parse_config_args(&balanced)
+                .expect("24 rounds balance six arms")
+                .expect("normal invocation")
+                .pairs,
+            24
+        );
+
+        // Only FrankenFS runtime knobs may differ between the arms.
+        let mut foreign = base.clone();
+        foreign.extend([
+            "--candidate-b-env".to_owned(),
+            "LD_PRELOAD=/tmp/evil.so".to_owned(),
+        ]);
+        assert!(parse_config_args(&foreign).is_err());
+
+        let mut malformed = base;
+        malformed.extend(["--candidate-b-env".to_owned(), "FFS_NO_VALUE".to_owned()]);
+        assert!(parse_config_args(&malformed).is_err());
+    }
+
+    fn fuse_mount_for_test(arm: Arm, runtime_knobs: &str) -> MountedArm {
+        let child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn placeholder daemon");
+        MountedArm {
+            arm,
+            mountpoint: PathBuf::from(format!("/nonexistent/mount/{}", arm.label())),
+            image: PathBuf::from(format!("/nonexistent/image/{}", arm.label())),
+            mount_info: MountInfo {
+                major_minor: "0:0".to_owned(),
+                mountpoint: PathBuf::from("/nonexistent"),
+                root: "/".to_owned(),
+                mount_options: BTreeSet::new(),
+                filesystem_type: "fuse".to_owned(),
+                source: "frankenfs".to_owned(),
+                super_options: BTreeSet::new(),
+            },
+            kind: MountedArmKind::Fuse {
+                child,
+                stdout_log: PathBuf::from("/nonexistent/stdout.log"),
+                stderr_log: PathBuf::from("/nonexistent/stderr.log"),
+                self_reported_sha256: String::new(),
+                proc_exe_sha256: String::new(),
+                pgo_profile_sha256: String::new(),
+                runtime_knobs: runtime_knobs.to_owned(),
+                candidate_env: Vec::new(),
+            },
+        }
+    }
+
+    /// The bd-d9378 failure, reproduced as a test: the env var was set, the ELF
+    /// ignored it, and both "arms" ran the identical configuration. A naive
+    /// implementation that trusts the harness's intent passes such a run and
+    /// publishes a 1.0 as if it had measured something.
+    #[test]
+    fn candidate_knob_divergence_rejects_arms_that_resolved_the_same_configuration() {
+        let counted = "count_memoized_requests=true,fuse_dispatch_workers=0";
+        let uncounted = "count_memoized_requests=false,fuse_dispatch_workers=0";
+        let diverged = vec![
+            fuse_mount_for_test(Arm::FuseA, counted),
+            fuse_mount_for_test(Arm::FuseB, counted),
+            fuse_mount_for_test(Arm::CandidateBA, uncounted),
+            fuse_mount_for_test(Arm::CandidateBB, uncounted),
+        ];
+        assert_eq!(
+            candidate_knob_divergence(&diverged, true).expect("configurations diverged"),
+            (counted.to_owned(), uncounted.to_owned())
+        );
+
+        let ignored_override = vec![
+            fuse_mount_for_test(Arm::FuseA, counted),
+            fuse_mount_for_test(Arm::FuseB, counted),
+            fuse_mount_for_test(Arm::CandidateBA, counted),
+            fuse_mount_for_test(Arm::CandidateBB, counted),
+        ];
+        let error = candidate_knob_divergence(&ignored_override, true)
+            .expect_err("an ELF that ignored the knob must fail the run closed");
+        assert!(error.to_string().contains("IDENTICAL runtime knobs"));
+
+        // The A/A control has the opposite requirement.
+        candidate_knob_divergence(&ignored_override, false).expect("A/A control agrees");
+        assert!(candidate_knob_divergence(&diverged, false).is_err());
+
+        // Replicas of one configuration disagreeing is never acceptable.
+        let split_replicas = vec![
+            fuse_mount_for_test(Arm::FuseA, counted),
+            fuse_mount_for_test(Arm::FuseB, uncounted),
+            fuse_mount_for_test(Arm::CandidateBA, uncounted),
+            fuse_mount_for_test(Arm::CandidateBB, uncounted),
+        ];
+        assert!(candidate_knob_divergence(&split_replicas, true).is_err());
+    }
+
+    #[test]
+    fn mount_self_report_requires_the_effective_runtime_knob_line() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sha = "a".repeat(64);
+        let pgo = "b".repeat(64);
+        let complete = temp.path().join("complete.log");
+        fs::write(
+            &complete,
+            format!(
+                "mount_bench_evidence,binary_sha256={sha}\n\
+                 mount_build_profile,pgo_profile_sha256={pgo}\n\
+                 mount_candidate_knobs,count_memoized_requests=true,fuse_dispatch_workers=0\n"
+            ),
+        )
+        .expect("write mount log");
+        let report = parse_mount_self_report(&complete).expect("parse self report");
+        assert_eq!(report.identity.binary_sha256, sha);
+        assert_eq!(
+            report.runtime_knobs,
+            "count_memoized_requests=true,fuse_dispatch_workers=0"
+        );
+
+        // An ELF too old to report its effective knobs cannot be an arm of a
+        // candidate comparison, so the run fails at mount rather than at
+        // publication.
+        let legacy = temp.path().join("legacy.log");
+        fs::write(
+            &legacy,
+            format!(
+                "mount_bench_evidence,binary_sha256={sha}\n\
+                 mount_build_profile,pgo_profile_sha256={pgo}\n"
+            ),
+        )
+        .expect("write legacy mount log");
+        assert!(parse_mount_self_report(&legacy).is_err());
     }
 }
