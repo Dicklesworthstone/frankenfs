@@ -6970,3 +6970,57 @@ not a reproducibility interval, and on this row it understates cross-window spre
 decidable on this row, the fix is more crossover blocks / pairs *interleaved within one window*, or
 an in-process paired estimator — not more repeats of the same shape, since windows A and C each
 already passed every null gate while disagreeing by 4.71%.
+### 2026-08-04 (LilacRaven) — bd-d9378 RESOLVED NULL: the `record_memoized` counter costs nothing measurable on `readdir-stat-8t`; same-ELF A/B, `0.23%` against a `4.71%` instrument floor
+
+Closes the suspicion I raised two rows above, this time by measurement rather than by inference.
+
+**Design.** The counter path is a PER-STORE field (`FuseInner::count_memoized_requests`, landed
+`a7192121`), not a `cfg`, so both arms run from **ONE ELF** and the ISA/PGO provenance cancels
+between them. ELF under test
+`38eece541053bbe1da63098d0b85ad37c9cb92b09f1ba80ada5897f6ed3bcd7e`, PGO profile
+`5c6530a0261f658ed0ace2a9d8bef7c6c63b6f94b4b955e4f7ccba038e011e96`, `compile_avx2=true`
+`runtime_avx2=true`. The driver **fails closed** unless `FFS_D9378_COUNT_MEMOIZED` is actually
+present in the ELF, so the earlier invalid-arm failure mode cannot recur. Both arms:
+`ffs-mounted-kernel-bench`, ext4, `readdir-stat-8t`, `operations=32768`, `--pairs 32`,
+`client-threads 8`, image 1024 MiB, incumbent kernel live in the same invocation, decision by
+bootstrap median CI over 20 000 resamples, `cv_used=false`.
+
+| arm | `fuse_over_kernel` median | bootstrap median CI | kernel A/A | FUSE A/A | verdict |
+|---|---|---|---|---|---|
+| counter **off** (`=0`) | `5.219658x` | [5.217375, 5.268615] | 0.997201 clear | 0.999385 clear | admitted |
+| counter **on** (default) | `5.231748x` | [5.162397, 5.335599] | 1.000097 clear | 0.993359 clear | admitted |
+
+Same invocation four-arm crossover in both arms; A/A null control kernel 0.997201 and A/A null
+control FUSE 0.999385 in the off arm, both within the 2% median limit with bootstrap median CI
+[0.990712, 1.005930] and [0.996483, 1.009383].
+
+**Result: NULL — no cost detected, and the row could not have seen one this small anyway.**
+on/off = `5.231748 / 5.219658` = **1.00232**, i.e. **0.23%**, and the on-arm CI [5.1624, 5.3356]
+comfortably contains the off-arm median 5.2197. For scale, the row immediately above measures the
+cross-window spread of a byte-identical ELF on this same workload at **4.71%**, and this run's own
+`twice_null_margin_ratio` is 1.041202. The observed delta is roughly **20x below the instrument's
+resolution**. Two contended `saturating_add` CAS loops per path-based metadata op are simply not
+visible against a ~5.2x FUSE-vs-kernel wall-time gap.
+
+**Disposition: KEEP THE COUNTER AS IS, at its default-on setting.** This is the bead's own stated
+acceptance branch ("if the cost is inside the null margin, close with the negative-evidence row and
+keep the counter"). Explicitly NOT doing the per-core refactor of `requests_total`, and explicitly
+NOT swapping `saturating_add` for `fetch_add`: both were contingency plans for a cost that does not
+exist at this scale, and either would be an unmeasured change to a shared metrics path. The
+instrument is what made the `security.capability` mechanism visible at all — a read-only mount
+serving 6 001 path stats reported 22 requests before `bdd0fd1b` — and it is now shown to be free.
+
+**Retry predicate.** Re-open only if the counter path is measured on a workload where per-request
+overhead is a much larger fraction of the total than it is here, e.g. a hypothetical row whose FUSE
+arm is within ~1.2x of the kernel arm, or if `requests_total` acquires additional per-request work
+beyond these two increments. Do NOT re-run this A/B on `readdir-stat-8t`: the effect is below the
+floor and re-running it is reading noise.
+
+**Method note worth carrying.** The `FFS_D9378_COUNT_MEMOIZED` opt-out is an instrumentation seam
+for this measurement, not a supported tuning knob; it defaults on and only the exact spellings
+`0/false/off/no` disable it, pinned by
+`memoized_request_counting_defaults_on_and_only_exact_opt_outs_disable_it` (which asserts `offf`,
+`no thanks` and `disable` do NOT disable) and
+`memoized_request_counting_flag_gates_the_counter_in_both_arms` (which pins both arms, because a
+flag wired inverted or ignored would make an A/B compare two identical arms and silently report
+"no cost" — exactly the failure the first attempt at this A/B actually hit).
