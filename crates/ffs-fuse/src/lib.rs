@@ -46,6 +46,29 @@ use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
+/// Whether memo-served requests increment `requests_total` (bd-d9378).
+///
+/// Defaults to `true` — the honest count is the shipping behaviour. Only the
+/// exact strings `0`, `false`, `off` and `no` disable it, so a typo cannot
+/// silently un-instrument a production mount. This exists so the A/B that
+/// measures the counter's cost on the per-path-op `security.capability` probe
+/// can run both arms from one ELF; it is not a supported tuning knob.
+fn count_memoized_requests_from_env() -> bool {
+    count_memoized_requests_from_value(std::env::var("FFS_D9378_COUNT_MEMOIZED").ok().as_deref())
+}
+
+/// Pure half of [`count_memoized_requests_from_env`], so the opt-out spelling
+/// is testable without mutating process-global environment from a test thread.
+fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
+    match value {
+        Some(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
 /// Default TTL for cached attributes and entries.
 ///
 /// Read-only images are immutable, so a generous TTL is safe.
@@ -1455,6 +1478,13 @@ struct FuseInner {
     worker_dispatch: bool,
     parallel_dirops: bool,
     read_only: bool,
+    /// Whether a memo-served request increments `requests_total` (bd-d9378).
+    ///
+    /// A per-store field rather than a `cfg` so both A/B arms run from ONE ELF
+    /// and the ISA/PGO provenance cancels between them. Default on: the honest
+    /// count is the shipping behaviour, and this exists to measure what it
+    /// costs on the per-path-op capability probe, not to make it optional.
+    count_memoized_requests: bool,
     mountpoint: Option<PathBuf>,
     kernel_notifier: Mutex<Option<fuser::Notifier>>,
     ioctl_trace: Option<IoctlTraceProbe>,
@@ -2191,6 +2221,7 @@ impl FrankenFuse {
                 worker_dispatch: options.worker_threads > 0,
                 parallel_dirops: options.worker_threads > 1,
                 read_only: options.read_only,
+                count_memoized_requests: count_memoized_requests_from_env(),
                 mountpoint: mountpoint.map(Path::to_path_buf),
                 kernel_notifier: Mutex::new(None),
                 ioctl_trace: options.ioctl_trace_path.clone().map(IoctlTraceProbe::new),
@@ -5616,7 +5647,9 @@ impl FrankenFuse {
     ) -> ffs_error::Result<Option<Vec<u8>>> {
         let is_capability_probe = self.inner.read_only && name == SECURITY_CAPABILITY_XATTR;
         if is_capability_probe && self.inner.missing_capability_xattr.contains(ino) {
-            self.inner.metrics.record_memoized();
+            if self.inner.count_memoized_requests {
+                self.inner.metrics.record_memoized();
+            }
             trace!(ino = ino.0, name, "getxattr answered from capability memo");
             return Ok(None);
         }
@@ -5624,7 +5657,9 @@ impl FrankenFuse {
         if self.inner.read_only
             && let Some(value) = self.inner.readonly_xattr_cache.value(ino, name)
         {
-            self.inner.metrics.record_memoized();
+            if self.inner.count_memoized_requests {
+                self.inner.metrics.record_memoized();
+            }
             trace!(ino = ino.0, name, "getxattr answered from read-only cache");
             return Ok(match value {
                 CachedXattrValue::Missing => None,
@@ -6240,7 +6275,9 @@ impl Filesystem for FrankenFuse {
         if self.inner.read_only
             && let Some(payload) = self.inner.readonly_xattr_cache.list_payload(ino)
         {
-            self.inner.metrics.record_memoized();
+            if self.inner.count_memoized_requests {
+                self.inner.metrics.record_memoized();
+            }
             trace!(ino = ino.0, "listxattr answered from read-only cache");
             Self::reply_xattr_payload(size, &payload, reply);
             return;
@@ -7607,6 +7644,73 @@ mod tests {
                 .is_none()
         );
         assert_eq!(rw_calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// The bd-d9378 A/B opt-out defaults ON and only the exact opt-out spellings
+    /// disable it, so a typo cannot silently un-instrument a production mount.
+    #[test]
+    fn memoized_request_counting_defaults_on_and_only_exact_opt_outs_disable_it() {
+        // Absent, empty, and anything unrecognised must keep counting.
+        assert!(count_memoized_requests_from_value(None));
+        assert!(count_memoized_requests_from_value(Some("")));
+        assert!(count_memoized_requests_from_value(Some("1")));
+        assert!(count_memoized_requests_from_value(Some("true")));
+        // The negative case a typo'd implementation would get wrong: these must
+        // NOT be read as opt-outs.
+        assert!(count_memoized_requests_from_value(Some("offf")));
+        assert!(count_memoized_requests_from_value(Some("no thanks")));
+        assert!(count_memoized_requests_from_value(Some("disable")));
+
+        for opt_out in ["0", "false", "off", "no", "  OFF  ", "False"] {
+            assert!(
+                !count_memoized_requests_from_value(Some(opt_out)),
+                "{opt_out:?} must disable memoized-request counting"
+            );
+        }
+    }
+
+    /// The flag must actually gate the counter in BOTH directions. If it were
+    /// wired inverted or ignored, the bd-d9378 A/B would measure two identical
+    /// arms and silently report "no cost", so both arms are pinned here.
+    #[test]
+    fn memoized_request_counting_flag_gates_the_counter_in_both_arms() {
+        fn probe_four_times(count_memoized_requests: bool) -> (usize, u64) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut fuse = FrankenFuse::with_options(
+                Box::new(CountingMissingXattrFs {
+                    calls: Arc::clone(&calls),
+                }),
+                &MountOptions::default(),
+            );
+            // Flip the per-store field on this freshly built store; the process
+            // environment is left alone so parallel tests are unaffected.
+            Arc::get_mut(&mut fuse.inner)
+                .expect("freshly constructed FuseInner Arc is unique")
+                .count_memoized_requests = count_memoized_requests;
+
+            let cx = FrankenFuse::cx_for_request();
+            let ino = InodeNumber(7);
+            for _ in 0..4 {
+                assert!(
+                    fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            (
+                calls.load(Ordering::Relaxed),
+                fuse.inner.metrics.snapshot().requests_total,
+            )
+        }
+
+        // The first probe misses the memo and goes through the real request
+        // path, so it is counted in BOTH arms; the 3 that follow are memo hits.
+        // Default arm: one format-layer lookup, all 4 served probes counted.
+        assert_eq!(probe_four_times(true), (1, 4));
+        // Opt-out arm: identical format-layer work, and only the one genuine
+        // request counted — the 3 memo hits leave the shared counters alone.
+        // That difference of exactly 3 is what the A/B prices.
+        assert_eq!(probe_four_times(false), (1, 1));
     }
 
     /// A memoized xattr answer is still a FUSE request the kernel round-tripped
@@ -17892,6 +17996,7 @@ mod tests {
             worker_dispatch: true,
             parallel_dirops: true,
             read_only: true,
+            count_memoized_requests: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
             ioctl_trace: None,
@@ -19250,6 +19355,7 @@ AllowOther"#;
             worker_dispatch: true,
             parallel_dirops: true,
             read_only: false,
+            count_memoized_requests: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
             ioctl_trace: None,
