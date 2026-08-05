@@ -6919,3 +6919,54 @@ smear the table's provenance. Whether to re-bank the whole ext4 table on the cur
 deliberate decision for the scorecard owner, not a side effect of this run. Report preserved at
 `/data/tmp/lilac-readdir-stat32-20260804/report.json`; attempt 1 at
 `/data/tmp/lilac-readdir-stat-20260804/report.json`.
+### 2026-08-04 (LilacRaven) — INVALID A/B, and the free cross-window A/A it accidentally produced: the SAME ELF admits at `5.015699x` and at `5.251849x` with non-overlapping CIs
+
+**First, the error, because it invalidates a run.** The first bd-d9378 A/B was INVALID and its numbers
+must not be used. The driver script reused an existing `release-perf` binary when one was present
+(`if [ ! -x ... ]`), and that binary was built at 20:08 — an hour BEFORE the flag landed in `a7192121`
+at 21:09. `strings -a` on the ELF under test returns **zero** occurrences of
+`FFS_D9378_COUNT_MEMOIZED`, so the env var was ignored and BOTH "arms" were the identical pre-flag
+binary. The rerun always rebuilds and now **fails closed** unless the flag symbol is present in the
+ELF, which is the guard that should have been there from the start.
+
+**What it accidentally bought: a rigorous, free A/A of one ELF across three separate windows.** All
+three runs are `ffs-mounted-kernel-bench`, ext4, `readdir-stat-8t`, `operations=32768`, `--pairs 32`,
+`client-threads 8`, image 1024 MiB, host `thinkstation1`, candidate ELF
+`be5137009ecd125c8ccd74844c7803f2cd8f87205946cad2be7486b448974a4a` (self-reported in-process,
+identical in all three), incumbent kernel live in the same invocation, decision by bootstrap median
+CI over 20 000 resamples:
+
+| window | `fuse_over_kernel` median | bootstrap median CI | kernel A/A spread | FUSE A/A spread | verdict |
+|---|---|---|---|---|---|
+| A | `5.015699x` | [4.996497, 5.027581] | 1.013222 | 1.006240 | **admitted** |
+| B | `5.379904x` | [5.101723, 7.089810] | 1.039115 | 1.026092 | BLOCKED_NULL |
+| C | `5.251849x` | [5.239011, 5.278118] | 1.015468 | 1.013080 | **admitted** |
+
+Same invocation four-arm crossover throughout; A/A null control kernel 0.997811 and A/A null control
+FUSE 0.996844 in window C, both inside the 2% median limit with bootstrap median CI [0.990085,
+1.005399] and [0.986699, 0.999605] respectively.
+
+⭐ **The result: two ADMITTED runs of a byte-identical binary differ by 4.71% and their CIs do not
+overlap.** Window A says `5.015699x` [4.9965, 5.0276]; window C says `5.251849x` [5.2390, 5.2781].
+Both cleared every gate the harness has. An admitted row's CI is therefore an **intra-run** interval,
+not a reproducibility interval, and on this row it understates cross-window spread by roughly 5x.
+
+**Three consequences, and one retraction of my own.**
+
+1. 🛑 **Retracting my own suspicion from the row above.** I flagged that `bdd0fd1b`'s two CAS-loop
+   increments might have caused the ~1% gap between `5.015699x` and the banked `4.967448x`. That
+   gap is **well inside** the 4.71% cross-window spread now measured on the identical ELF, so the
+   evidence does not support the suspicion. The counter may still cost something — bd-d9378 exists
+   to measure it — but nothing observed so far is attributable to it, and the earlier row's
+   non-overlapping-CI argument was simply not a valid inference.
+2. **Do not difference admitted medians across runs on this row at the few-percent level.** That
+   includes comparing any new run to the banked `4.967448x`. Cross-run deltas below ~5% on
+   `readdir-stat-8t` are indistinguishable from window effects.
+3. **A lever on this row must be measured as a SAME-WINDOW A/B from one ELF**, which is exactly what
+   bd-d9378's per-store flag is for, or it must clear ~5%. A lever worth 1–2% is not measurable here
+   with the current instrument, and claiming one would be reading noise.
+
+**Retry predicate for the instrument itself:** if a future change wants to make few-percent effects
+decidable on this row, the fix is more crossover blocks / pairs *interleaved within one window*, or
+an in-process paired estimator — not more repeats of the same shape, since windows A and C each
+already passed every null gate while disagreeing by 4.71%.
