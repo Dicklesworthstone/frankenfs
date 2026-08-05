@@ -6283,7 +6283,9 @@ mod tests {
             "each retrieval mode needs its own note"
         );
         assert!(
-            !RetrievalProvenance::BuiltInPlace.note().contains("copied to"),
+            !RetrievalProvenance::BuiltInPlace
+                .note()
+                .contains("copied to"),
             "an in-place build must not describe itself as copied in"
         );
     }
