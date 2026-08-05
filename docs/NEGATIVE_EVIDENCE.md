@@ -7098,6 +7098,17 @@ bad one — the honest reading is that the six-arm shape removes the *window* te
 is therefore the cheap dial: the next agent who needs a tighter gate should buy pairs (multiples of
 12) rather than invent a new estimator.
 
+**A third A/A run at 48 pairs, added because pairs turned out to be cheap.** Same ELF, same
+workload, `--pairs 48`, `crossover_blocks=12`: candidate A/A median `0.997821`, bootstrap median CI
+[0.995877, 1.001066] over 20 000 resamples, `achieved_resolution_ratio=1.004140`,
+`minimum_decidable_effect_ratio=1.010689`, `CANDIDATE_AA_NULL_CLEAR`, `fuse_over_kernel`
+`5.166241x` [5.1537, 5.1860]. So the gate dropped from `2.80%`/`4.87%` at 24 pairs to **`1.07%` at
+48 pairs**, for ~5 minutes of machine time. That is far more than the `sqrt(2)` a doubling buys, so
+the honest reading is that it mixes pair count with window quality — this run's kernel A/A margin
+was `1.014255` against `1.025913`/`1.028881` in the two 24-pair runs. **Treat `~1%` as the best case
+in a quiet window and `~3-5%` as what a mediocre window delivers**, and read each run's own
+`minimum_decidable_effect_ratio` rather than assuming either.
+
 **Disposition: KEEP, default off.** The four-arm shape is retained byte-for-byte when
 `--candidate-aa`/`--candidate-b-env` are omitted, so no banked row changes meaning. Also worth
 recording: these two runs put `fuse_over_kernel` at `5.120920x` and `5.135008x` on a workload the
