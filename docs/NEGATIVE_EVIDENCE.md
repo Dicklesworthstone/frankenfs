@@ -7024,3 +7024,88 @@ for this measurement, not a supported tuning knob; it defaults on and only the e
 `memoized_request_counting_flag_gates_the_counter_in_both_arms` (which pins both arms, because a
 flag wired inverted or ignored would make an A/B compare two identical arms and silently report
 "no cost" — exactly the failure the first attempt at this A/B actually hit).
+
+### 2026-08-05 (SapphireBirch) — bd-3tqgc KEEP (instrument, not a lever): the six-arm same-window candidate-vs-candidate estimator clears its own A/A control and decides `~3%` effects on `readdir-stat-8t`, against the `4.71%` cross-window spread it was built to beat
+
+Not a lever. This row characterizes the instrument that the metadata-lever class was blocked on, so
+the next agent knows what size of lever it can now decide and at what price.
+
+**Contract evidence, one fact per line so it is machine-checkable.**
+Executing driver ELF, self-reported in process at startup: `bench_evidence,binary_sha256=62a33fcff0437552bab793adc042e24b910d5f25435b535df43fefa3dc14cb56`.
+Same-invocation A/A null control, candidate-vs-candidate arm: median 1.007630, bootstrap median CI [0.994785, 1.019454] over 20 000 resamples.
+Same-invocation A/A null control, FUSE arm: median 1.002698, bootstrap median CI [0.996990, 1.013284] over 20 000 resamples.
+Same-invocation A/A null control, kernel incumbent arm: median 0.993080, bootstrap median CI [0.985865, 1.010253] over 20 000 resamples.
+
+**Why it exists.** The row above measured a byte-identical ELF twice on this workload in two
+windows and got `5.015699x` and `5.251849x` with non-overlapping CIs — a **4.71%** reproducibility
+spread, five times wider than an admitted run's own CI. Every remaining metadata lever
+(worker dispatch, queue depth, splice, `--fuse-cpus`) is plausibly worth a few percent, so measuring
+one arm per window was reading noise. `e2b9b38f` added a second candidate configuration from the
+**same ELF**, scheduled as a six-arm Williams square
+(`kernel_a/kernel_b/fuse_a/fuse_b/fuse_candidate_b_a/fuse_candidate_b_b`), and estimates
+candidate-vs-candidate as a within-round paired contrast where the window effect cancels the way the
+kernel arm already cancels host drift.
+
+**Both runs.** `ffs-mounted-kernel-bench` driver ELF
+`62a33fcff0437552bab793adc042e24b910d5f25435b535df43fefa3dc14cb56` (rebuilt from `f580a40d` and
+reproduced bit-for-bit), candidate ELF
+`bcf2bc80f02154aa16681b87c64e1beddab996b20cc0bb5ec911b5743133c9d1`, PGO profile
+`5c6530a0261f658ed0ace2a9d8bef7c6c63b6f94b4b955e4f7ccba038e011e96` (the bank's profile),
+`compile_avx2=true`/`runtime_avx2=true`, both built on `thinkstation1` and reported as
+`retrieval=built_in_place_on_executing_host` (bd-38c87 — the field used to hardcode a copy from an
+rch worker). Kernel `6.17.0-41-generic`, ext4, `readdir-stat-8t`, `operations=32768`,
+`client-threads 8` observed 8, image 1024 MiB, `--pairs 24` (the six-arm schedule period is 12, so
+the four-arm bank's 32 is not a legal pair count here), `--fuse-cpus` default 1, bootstrap median CI
+over 20 000 resamples, `cv_used=false`, pre- and post-parity `tree_sha256` identical across all six
+arms.
+
+| run | candidate B | `candidate_b_over_candidate_a` | CI | min decidable | candidate verdict | `fuse_over_kernel` |
+|---|---|---|---|---|---|---|
+| A/A null control | *(no overrides)* | `1.007630` | [0.994785, 1.019454] | `1.048670` | `CANDIDATE_AA_NULL_CLEAR` | `5.120920x` [5.0335, 5.1579] |
+| inert-flag demo | `FFS_D9378_COUNT_MEMOIZED=0` | `1.006895` | [1.005587, 1.015070] | `1.028000` | `CANDIDATE_NEUTRAL` | `5.135008x` [5.0725, 5.1664] |
+
+Both runs `admitted=true` on every pre-existing gate plus the two new ones: all three A/A nulls clear
+(A/A run: kernel `0.993080`, FUSE `1.002698`, candidate-B `1.004920`; flag run: kernel `0.992933`,
+FUSE `1.000200`, candidate-B `1.000263`, all within the 2% median limit), thread observation 8→8,
+worker CPU pinning attested for all six arms.
+
+**Acceptance (2) — the estimator's own null passes.** With empty overrides the two candidate
+configurations resolved *identical* daemon-self-reported knobs
+(`count_memoized_requests=true,fuse_dispatch_workers=0`), `configurations_differ=false`, and the
+cross-pair ratio came out at `1.007630` with a CI containing 1.0. The identity check is enforced in
+**both** directions: an A/A that resolved different knobs is a hard error, and a deliberate A/B whose
+override never reached a knob this ELF reads is also a hard error — the exact failure mode that made
+the first bd-d9378 A/B invalid.
+
+**Acceptance (3) — the known-inert flag reads as inert.** Disabling the memoized-request counter
+moved the candidate ratio to `1.006895`, i.e. **0.69% slower with the counter off**, which is both
+sign-wrong for a counter that costs something and inside the resolution. `candidate_claim_clear=false`
+→ `CANDIDATE_NEUTRAL`. Note the CI [1.005587, 1.015070] does *not* contain 1.0 while the verdict is
+still neutral: that is the gate working as designed — a claim must clear twice the worse of the two
+candidate A/A null margins (`1.028000`), not merely exclude 1.0. Consistent with bd-d9378's
+cross-window `0.23%`.
+
+**Acceptance (4) — the resolution actually achieved.** At 24 pairs the estimator's CI half-width is
+**±1.5% to ±1.9%**, and the claim gate — `2 x` the worse candidate null log-margin — lands at
+**2.80% in a good window and 4.87% in a mediocre one**. So: an effect of **≥5% is decidable in any
+admitted window; 3% is decidable in a good one; 2% is not decidable at this pair count**. Against a
+`4.71%` cross-window spread that is roughly a 1.7x improvement in the good case and a wash in the
+bad one — the honest reading is that the six-arm shape removes the *window* term but not the
+*within-window* term, and the residual gate is set by how quiet the box was.
+
+**The cost collapsed, which is the more useful finding.** A six-arm run at 24 pairs takes **2m28s**
+(A/A) and **2m23s** (flag) end to end, versus the ~15-17 min a four-arm 32-pair run took. Pair count
+is therefore the cheap dial: the next agent who needs a tighter gate should buy pairs (multiples of
+12) rather than invent a new estimator.
+
+**Disposition: KEEP, default off.** The four-arm shape is retained byte-for-byte when
+`--candidate-aa`/`--candidate-b-env` are omitted, so no banked row changes meaning. Also worth
+recording: these two runs put `fuse_over_kernel` at `5.120920x` and `5.135008x` on a workload the
+scorecard banks at `4.967448x` — a different candidate ELF and a different kernel, and both inside
+the known `4.71%` cross-window spread, so the bank is **not** restated here.
+
+**Retry predicate.** Re-open the instrument only if (a) a lever worth less than ~3% must be decided,
+in which case buy pairs first and re-characterize before touching the estimator, or (b) a
+candidate-vs-candidate A/A comes out *outside* its own null on some other workload, which would mean
+the six-arm schedule does not balance that workload's carryover. Do NOT re-run the
+`FFS_D9378_COUNT_MEMOIZED` demo: it is a null control, not a lever.
