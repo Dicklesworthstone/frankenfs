@@ -8459,6 +8459,17 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             "mount_build_profile,pgo_profile_sha256={}",
             option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
         );
+        // Effective values of the runtime knobs a same-window
+        // candidate-vs-candidate A/B may vary (bd-3tqgc), each resolved through
+        // the function the runtime itself calls. The comparator requires this
+        // line and requires the two candidate configurations to disagree on it,
+        // so an ELF that predates a knob — the bd-d9378 failure — fails the run
+        // closed instead of silently comparing a configuration against itself.
+        eprintln!(
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={}",
+            ffs_fuse::count_memoized_requests_enabled(),
+            fuse_dispatch_workers_from_env()?,
+        );
     }
 
     let auto_unmount = env_bool("FFS_AUTO_UNMOUNT", true)?;

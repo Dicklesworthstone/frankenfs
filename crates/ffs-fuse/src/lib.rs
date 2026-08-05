@@ -57,6 +57,21 @@ fn count_memoized_requests_from_env() -> bool {
     count_memoized_requests_from_value(std::env::var("FFS_D9378_COUNT_MEMOIZED").ok().as_deref())
 }
 
+/// Effective value of the memoized-request counter for this process, resolved
+/// through the exact function the store constructor calls.
+///
+/// A same-window candidate-vs-candidate A/B (bd-3tqgc) runs two daemons from
+/// ONE ELF that differ only by a runtime knob, so it has to prove the two
+/// configurations actually diverged. Echoing the environment back would not
+/// prove that: bd-d9378 published an A/B whose ELF predated this flag, so the
+/// variable was set, ignored, and both "arms" ran the identical configuration.
+/// Reporting the parsed value from the consuming code path fails that run
+/// closed instead.
+#[must_use]
+pub fn count_memoized_requests_enabled() -> bool {
+    count_memoized_requests_from_env()
+}
+
 /// Pure half of [`count_memoized_requests_from_env`], so the opt-out spelling
 /// is testable without mutating process-global environment from a test thread.
 fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
