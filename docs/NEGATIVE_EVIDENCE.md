@@ -6854,3 +6854,68 @@ the daemon-side answer nearly free, so the residue is pure FUSE transport.
 so the kernel can cache it; (c) someone identifies the exact kernel call site issuing the probe on a
 cached-dentry `stat` and it turns out to be conditional on something we control. Do NOT re-test
 `FUSE_HANDLE_KILLPRIV` on this kernel — it is measured inert here.
+### 2026-08-04 (LilacRaven) — bd-ext4-readdir-stat-5x-3k3hn: the ext4 readdir-stat-8t blocked_null row is ADMITTED at last; `5.015699x` [4.996497, 5.027581], both A/A nulls clear
+
+The prior attempt on this row (`1dbbcc43`, INIT-handshake queue depth + explicit multiworker
+`FUSE_PARALLEL_DIROPS`) was BLOCKED_NULL with FUSE A/A spread `1.110540x` against a `1.025` limit.
+With the Codex panes usage-walled the host was quiet enough to retry, and the row now admits.
+
+**Two attempts, same two ELFs, no rebuild between them — pair count was the whole story.**
+
+| attempt | pairs | kernel A/A spread | FUSE A/A spread | verdict |
+|---|---|---|---|---|
+| 1 | 12 (the documented MINIMUM) | `1.019670` clear | `1.028819` **fails by 0.4pp** | BLOCKED_NULL |
+| 2 | 32 (the default) | `1.012360` clear | `1.005674` clear | **admitted** |
+
+Attempt 1 was my own error: I ran `--pairs 12` to shorten the window. The gate is a **bootstrap
+median CI** spread, so pair count sets its width directly; at 12 pairs the FUSE arm's CI was simply
+too wide to decide, at 32 it is not. ⭐ Reusable: **do not economise on `--pairs` on this
+instrument.** A blocked null at the minimum pair count is a sample-size verdict, not a noise verdict,
+and re-running it at the default is far cheaper than chasing host quiescence.
+
+**Admitted result.** The kernel incumbent arm ran live in the same invocation as the candidate, interleaved four-arm, and the decision is a bootstrap median CI: ratio median 5.015699x, bootstrap median CI [4.996497, 5.027581], 20000 resamples; A/A null control kernel 0.998475 and A/A null control FUSE 1.001611, both bootstrap median CI clear of the 1.025 limit.
+
+`fuse_over_kernel` **median `5.015699x`, bootstrap median CI
+[4.996497, 5.027581]** (20 000 resamples), twice-null margin ratio `1.024872`,
+`directional_claim_clear=true`, `admitted=true`, `verdict=honest_loss`, gate metric `wall_ns`,
+`cv_used=false`. Kernel A/A `0.998475` [0.987791, 1.000852]; FUSE A/A `1.001611`
+[0.999437, 1.005674]. Diagnostic only: kernel 1 379 122 ops/s vs FrankenFS 275 657 ops/s.
+
+**Provenance.** Host `thinkstation1`; candidate ELF **self-reported from inside the process** as
+`bench_evidence,binary_sha256=be5137009ecd125c8ccd74844c7803f2cd8f87205946cad2be7486b448974a4a`,
+PGO profile `5c6530a0261f658ed0ace2a9d8bef7c6c63b6f94b4b955e4f7ccba038e011e96`, runtime ISA
+`avx+avx2+f16c+fma+sse2+sse4.2` (v3 gate pass); incumbent kernel ELF
+`4a480bffbc34d52479023f0b9990f6ecfab3d0a325cf86c81e8b04d2a719a7a4`; `operations=32768`,
+`observation_repeats=3`, requested 8 → **runtime-observed 8** worker threads on all four arms with
+one fixed CPU per timed thread (`sched_getcpu` plus a no-migration check); parity `pass` across all
+four arms (`tree_sha256 a91834cf…`, 32 773 entries) and post-run parity `pass` with e2fsck clean on
+all four images; incumbent isolation `same_invocation=true`.
+
+⚠ **This row is NOT a drop-in replacement for the banked `4.967448x` [4.946319, 4.989285], and the
+two must not be differenced casually.** Two confounds move in the same direction and neither is
+controlled here:
+
+1. **Kernel drift.** The bank was taken on `6.17.0-35-generic`; this host now runs
+   `6.17.0-41-generic`. The incumbent arm is different software.
+2. 🛑 **A regression I may have introduced myself.** This candidate contains `bdd0fd1b`
+   (`record_memoized`), which adds two `saturating_add` increments — each a **CAS retry loop**, not
+   a single `fetch_add` — on the memoized-xattr path. The row above established that Linux issues
+   **one `security.capability` probe per path-based metadata op**, so on this workload that is two
+   contended CAS loops on the same two shared counters, ×32 768 operations, ×8 concurrent worker
+   threads. `CacheLinePadded` prevents false sharing between counters but does nothing about true
+   sharing of one counter across eight threads. The observed CIs do not overlap (mine
+   [4.9965, 5.0276] vs the bank's [4.9463, 4.9893]), i.e. ~1% worse.
+
+**No attribution is claimed between those two causes — that would need an A/B this run cannot
+provide.** Filed as its own bead with the A/B predicate (one ELF, per-store flag, counter path on
+vs off) so the counter cost is measured rather than argued. If it proves real, the fix is to route
+these counts through the existing per-core metrics rather than to drop the instrument: the counter
+is what made the whole `security.capability` mechanism visible in the first place, and an
+uninstrumented daemon is how that mechanism stayed hidden.
+
+**Scorecard deliberately NOT edited.** `docs/MOUNTED_KERNEL_SCORECARD.md` carries one host+kernel
+line for the entire table (`6.17.0-35-generic`); dropping a `6.17.0-41-generic` row into it would
+smear the table's provenance. Whether to re-bank the whole ext4 table on the current kernel is a
+deliberate decision for the scorecard owner, not a side effect of this run. Report preserved at
+`/data/tmp/lilac-readdir-stat32-20260804/report.json`; attempt 1 at
+`/data/tmp/lilac-readdir-stat-20260804/report.json`.
