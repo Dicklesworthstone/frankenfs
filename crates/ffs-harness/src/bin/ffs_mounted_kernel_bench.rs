@@ -1110,6 +1110,63 @@ where
         .map_err(|error| anyhow!("invalid value for {name}: {value}: {error}"))
 }
 
+/// How the two ELFs under measurement reached the host that executed them.
+///
+/// `rch exec` has no artifact-retrieval mechanism, so an ELF built on a remote
+/// worker has to be copied here — that is the usual case and it used to be the
+/// only one the report could express, as a hardcoded string. A build that runs
+/// ON the executing host is equally legitimate (the mounted run is local-only
+/// anyway), and a report that claims it was copied from a worker records a
+/// provenance that did not happen. A false provenance line is worse than a
+/// coarse one: it is the field a later reader uses to decide whether two rows
+/// share a binary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetrievalProvenance {
+    /// Both ELFs were built somewhere else and copied here.
+    ScpFromBuilder,
+    /// Both ELFs were built on the machine that ran the measurement.
+    BuiltInPlace,
+    /// One of each — recorded distinctly rather than rounded to either.
+    Mixed,
+}
+
+impl RetrievalProvenance {
+    /// Classify by comparing each builder name against the executing host.
+    fn classify(harness_builder: &str, candidate_builder: &str, executing_host: &str) -> Self {
+        let local = |builder: &str| builder.trim().eq_ignore_ascii_case(executing_host.trim());
+        match (local(harness_builder), local(candidate_builder)) {
+            (true, true) => Self::BuiltInPlace,
+            (false, false) => Self::ScpFromBuilder,
+            _ => Self::Mixed,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ScpFromBuilder => "scp_from_rch_worker",
+            Self::BuiltInPlace => "built_in_place_on_executing_host",
+            Self::Mixed => "mixed_scp_from_rch_worker_and_built_in_place",
+        }
+    }
+
+    const fn note(self) -> &'static str {
+        match self {
+            Self::ScpFromBuilder => {
+                "rch exec has no artifact-retrieval mechanism; both ELFs are built on a remote \
+                 worker and copied to the executing host"
+            }
+            Self::BuiltInPlace => {
+                "both ELFs were built on the machine that executed the measurement; nothing was \
+                 copied in"
+            }
+            Self::Mixed => {
+                "one ELF was built on the executing host and the other on a remote worker and \
+                 copied in; compare the per-ELF builder fields, not this summary"
+            }
+        }
+    }
+}
+
 fn parse_workload(value: &str) -> Result<Workload> {
     match value {
         "warm-stat" => Ok(Workload::WarmStat),
@@ -5606,14 +5663,20 @@ fn run() -> Result<Option<PathBuf>> {
         "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,verdict=pass",
         ffs_binary_identity.binary_sha256, ffs_binary_identity.pgo_profile_sha256
     );
-    // Both ELFs are cross-built on an rch worker and copied here, so the
-    // executing host and the building host are different machines by design.
+    // Where each ELF was built is recorded, and whether it had to be copied
+    // here is derived from that rather than assumed: see `RetrievalProvenance`.
+    let retrieval = RetrievalProvenance::classify(
+        &config.harness_builder,
+        &config.candidate_builder,
+        &host.hostname,
+    );
     println!(
-        "binary_provenance,driver_elf_sha256={harness_sha},driver_built_on={},candidate_elf_sha256={},candidate_built_on={},executed_on={},retrieval=scp_from_rch_worker",
+        "binary_provenance,driver_elf_sha256={harness_sha},driver_built_on={},candidate_elf_sha256={},candidate_built_on={},executed_on={},retrieval={}",
         config.harness_builder,
         ffs_binary_identity.binary_sha256,
         config.candidate_builder,
         host.hostname,
+        retrieval.label(),
     );
     println!(
         "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx={},compile_avx2={},compile_f16c={},compile_fma={},compile_avx512f={},compile_avx512bw={},runtime_sse2={},runtime_sse4_2={},runtime_avx={},runtime_avx2={},runtime_f16c={},runtime_fma={},runtime_avx512f={},runtime_avx512bw={}",
@@ -5771,8 +5834,8 @@ fn run() -> Result<Option<PathBuf>> {
         "candidate_elf_sha256": ffs_binary_identity.binary_sha256,
         "candidate_built_on": config.candidate_builder,
         "executed_on": host.hostname,
-        "retrieval": "scp_from_rch_worker",
-        "note": "rch exec has no artifact-retrieval mechanism; both ELFs are built on a remote worker and copied to the executing host",
+        "retrieval": retrieval.label(),
+        "note": retrieval.note(),
     });
     let Value::Object(identity_section) = json!({
         "schema_version": 6,
@@ -6162,6 +6225,67 @@ mod tests {
         let mut blank_candidate = base;
         blank_candidate.candidate_builder = "   ".to_owned();
         assert!(validate_config(&blank_candidate).is_err());
+    }
+
+    #[test]
+    fn retrieval_provenance_is_derived_from_the_builders_not_assumed() {
+        // The remote case, which used to be the only string the report could
+        // emit.
+        assert_eq!(
+            RetrievalProvenance::classify("hz1", "hz2", "thinkstation1"),
+            RetrievalProvenance::ScpFromBuilder
+        );
+        // A build that ran on the executing host was previously reported as
+        // copied in from an rch worker, which is a provenance that did not
+        // happen.
+        assert_eq!(
+            RetrievalProvenance::classify("thinkstation1", "thinkstation1", "thinkstation1"),
+            RetrievalProvenance::BuiltInPlace
+        );
+        assert_eq!(
+            RetrievalProvenance::classify("ThinkStation1", " thinkstation1 ", "thinkstation1"),
+            RetrievalProvenance::BuiltInPlace,
+            "hostname comparison is case- and whitespace-insensitive"
+        );
+        // One of each is recorded as such rather than rounded to whichever is
+        // more convenient.
+        assert_eq!(
+            RetrievalProvenance::classify("hz1", "thinkstation1", "thinkstation1"),
+            RetrievalProvenance::Mixed
+        );
+        assert_eq!(
+            RetrievalProvenance::classify("thinkstation1", "hz2", "thinkstation1"),
+            RetrievalProvenance::Mixed
+        );
+
+        // Every classification says something different, in both fields: a
+        // shared label or note would defeat the point of deriving it.
+        let labels = [
+            RetrievalProvenance::ScpFromBuilder,
+            RetrievalProvenance::BuiltInPlace,
+            RetrievalProvenance::Mixed,
+        ]
+        .map(RetrievalProvenance::label);
+        let notes = [
+            RetrievalProvenance::ScpFromBuilder,
+            RetrievalProvenance::BuiltInPlace,
+            RetrievalProvenance::Mixed,
+        ]
+        .map(RetrievalProvenance::note);
+        assert_eq!(
+            labels.iter().collect::<BTreeSet<_>>().len(),
+            labels.len(),
+            "each retrieval mode needs its own label"
+        );
+        assert_eq!(
+            notes.iter().collect::<BTreeSet<_>>().len(),
+            notes.len(),
+            "each retrieval mode needs its own note"
+        );
+        assert!(
+            !RetrievalProvenance::BuiltInPlace.note().contains("copied to"),
+            "an in-place build must not describe itself as copied in"
+        );
     }
 
     #[test]
