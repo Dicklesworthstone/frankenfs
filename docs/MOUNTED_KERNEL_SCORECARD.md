@@ -11,10 +11,12 @@ Latin-square physical-arm crossover. Every row carries **two same-invocation A/A
 controls** — one per filesystem type — and both are printed. A ratio above `1.0` means
 FrankenFS is **slower** than the kernel.
 
-All six ext4 surfaces now score. **0 wins / 5 losses / 1 neutral / 0 unscored.**
-(Warm stat added 2026-08-04 — it was the one shape btrfs banked and ext4 did not.)
+All seven ext4 surfaces now score. **0 wins / 6 losses / 1 neutral / 0 unscored.**
+(Warm stat added 2026-08-04 — it was the one shape btrfs banked and ext4 did not.
+Xattr get/list report added 2026-08-05, bd-ext4-xattr-row-unscored-a21dz — the harness
+could already run it and neither scorecard carried it.)
 
-## The six rows
+## The rows
 
 | Workload (the job as timed) | FrankenFS ÷ kernel ext4, bootstrap median 95% CI | Kernel A/A null | FUSE A/A null | Governor / EPP on every involved CPU | Worker threads requested → observed | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -24,12 +26,25 @@ All six ext4 surfaces now score. **0 wins / 5 losses / 1 neutral / 0 unscored.**
 | **Fsync/journal commit** — 8 × 4 KiB positioned writes to one file, `fsync` after each | `0.997098x [0.990808, 1.009108]` against a twice-null margin of **`1.030661x`**; `directional_claim_clear=false` | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **1 → 1** on all four arms, pinning attested | **NEUTRAL** |
 | **Parallel metadata writes** — 8 workers create exactly 512 empty files into private directories, then fsync every worker directory (**128 crossover blocks**) | **`1.510822x` `[1.493097, 1.539011]` slower** (twice-null margin `1.049223x`); replicated on a **disjoint CPU set** at `1.513052x [1.490837, 1.534711]`, agreeing to **0.15%** | `1.007184x [0.998479, 1.024316]`, spread `1.024316x` · replicate `0.998642x [0.990286, 1.009556]`, spread `1.009809x` | `0.995707x [0.978797, 1.000111]`, spread `1.021662x` · replicate `0.998780x [0.990819, 1.002688]`, spread `1.009266x` | `amd-pstate-epp` / `powersave` / **`performance`** (host EPP differed in this window; uniform across both metadata runs) | **8 → 8** on all four arms, pinning attested | **LOSE** |
 | **Warm stat** — issue 2,000 `stat` calls against one mounted file and aggregate the metadata (ro) | **`4.812194x` `[4.779087, 4.819425]` slower** (twice-null margin `1.035698x`) | `1.002547x` | `1.000593x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
+| **Xattr get/list report** — repeat 2,000 five-call reports: read one inline value, read one external-block value, check one absent name, list one name, list 24 names (ro) | **`5.749816x` `[5.725990, 5.756846]` slower** (twice-null margin `1.009130x`) | `0.999678x [0.996487, 1.002264]`, spread `1.003525x` | `1.000266x [0.995466, 1.001873]`, spread `1.004555x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
 
 Admission required, per row: both A/A symmetric spreads at most `1.025x` with intervals
 containing `1.0`; the effect clearing **twice the widest null log-margin**; exact
 four-arm tree and content parity; and a clean offline `e2fsck` after unmount. All five
 rows satisfied all four. Wall time was the gate throughout — `cv_used=false`,
 `instructions_used=false` — over deterministic 20,000-resample bootstrap median CIs.
+
+**The xattr row was measured later than the rest and does not share their window.** It was
+taken 2026-08-05 on kernel `6.17.0-41-generic` (the other rows: `6.17.0-35-generic`) with
+candidate ELF `bcf2bc80f02154aa16681b87c64e1beddab996b20cc0bb5ec911b5743133c9d1`, PGO
+profile `5c6530a0261f658ed0ace2a9d8bef7c6c63b6f94b4b955e4f7ccba038e011e96`, 32 pairs / 8
+crossover blocks, `observation_reducer=min` over 3 repeats. Its own kernel arm is live in
+its own invocation, so the ratio stands on its own; it is **not** pooled with the rows
+above and must not be diffed against them as if one window produced both.
+
+**Btrfs: UNRUNNABLE for this workload, by the harness's own refusal**, not by omission —
+`xattr-get-list-report currently requires --filesystem ext4 because its inline/external
+storage-shape proof is ext4-specific`. Recorded the way the btrfs fsync row was.
 
 ## One sentence per row
 
