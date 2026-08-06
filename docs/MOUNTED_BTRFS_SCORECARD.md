@@ -1,5 +1,27 @@
 # Btrfs scorecard: FrankenFS FUSE against the incumbent, Linux kernel btrfs
 
+> ## ⛔ NO ROW IN THIS FILE DESCRIBES FRANKENFS AT `HEAD`
+>
+> Every row here predates the current tree — the five 2026-07-31 rows on the frozen
+> `f44b3dc4…` candidate, the warm-stat row on `9e32e28f…` — and none has been re-measured.
+>
+> This file needs the warning **more** than the ext4 one, because the commits landed since
+> are all in the btrfs write path: `839eb708` (the durable commit built leaves it could not
+> serialize, so `fsync` returned EINVAL and the unmount flush failed identically — data was
+> never persisted above roughly 18 MiB per transaction), `241093de` and `9d64f4a1` (a write
+> failing with ENOSPC destroyed the data it could not replace), and `7fac4779` (extent splits
+> now reference the shared extent instead of copying it, removing a read and an allocation
+> from every overwrite-split). The last one changes the write path's I/O profile directly.
+>
+> **No figure below may be presented as "FrankenFS today" until re-measured on a current
+> ELF.** Quote them as historical, with their ELF, or not at all.
+>
+> The `bd-4sull` rule in the [ext4 scorecard](MOUNTED_KERNEL_SCORECARD.md) applies here
+> unchanged: `core_contention_preflight … verdict=clear` certifies only that no competing
+> load sat on the placement CPUs when sampling began. It is **not** evidence that a new run
+> is comparable to a banked one — measured, the incumbent arm moved 8.26% between two runs
+> that both printed `verdict=clear`.
+
 **Date:** 2026-07-31 · **Host:** `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX,
 32C/64T, 231.7 GB RAM, 1 NUMA node · **Kernel:** 6.17.0-35-generic · **Bead:** `bd-opb6l`
 

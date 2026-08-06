@@ -1,5 +1,53 @@
 # Mounted-kernel scorecard: FrankenFS FUSE against the incumbent, Linux kernel ext4
 
+> ## ⛔ NO ROW IN THIS FILE DESCRIBES FRANKENFS AT `HEAD`
+>
+> **Every row here was measured on an ELF that predates the current tree**, and none has been
+> re-measured since. The provenance, row by row:
+>
+> | Rows | Candidate ELF | Measured |
+> | --- | --- | --- |
+> | readdir+stat, create/delete storm, parallel read, fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
+> | Warm stat | `9e32e28f…` | 2026-08-04 |
+> | Xattr get/list report, bulk durable write | `bcf2bc80…` | 2026-08-05 |
+>
+> Since the newest of those, **three btrfs correctness commits have landed** — `839eb708`
+> (durable commit could not serialize its own leaves: `fsync` EINVAL and a failed unmount
+> flush, so data was never persisted), `241093de` and `9d64f4a1` (a write that failed with
+> ENOSPC destroyed the data it could not replace), and `7fac4779` (extent splits reference
+> the shared extent instead of copying it, which removes a read and an allocation from every
+> overwrite-split). The last of those changes the write path's I/O profile, so it can move
+> these numbers in either direction.
+>
+> **Therefore: no figure below may be presented as "FrankenFS today" until it is re-measured
+> on a current ELF.** Quote them as historical, with their ELF, or not at all. This is not a
+> hedge about precision — it is that the binary these describe no longer exists in the tree.
+
+> ## ⚠ A CLEAR PREFLIGHT IS NOT EVIDENCE OF COMPARABILITY (`bd-4sull`)
+>
+> `core_contention_preflight … verdict=clear` certifies that **no competing load sat on the
+> placement CPUs at the moment sampling started**. It does not certify that a run is
+> comparable to a *previously banked* one, and it must never be cited as if it did.
+>
+> Measured, not argued: two 2,048-pair runs of the **identical** candidate ELF, PGO, kernel
+> and governor both printed `verdict=clear` with five consecutive clear samples and
+> `driver_busy_fraction=0.000000` — and the incumbent arm still moved **8.26%** between them
+> (77.31 ms → 83.69 ms), carrying the published ratio from `2.898298x` to `2.655365x`, a
+> 9.15% swing with non-overlapping intervals and roughly 3x the row's own admission margin.
+> FrankenFS's own arm moved −1.30%. The entire difference was the incumbent.
+>
+> The gate cannot see this by construction: it samples CPU busy fractions on the placement
+> CPUs immediately before the run, so it is blind to page-cache state, writeback backlog,
+> thermal and boost history, and everything else that carries across invocation boundaries.
+>
+> **The rule, which applies to every banked row in every repo, not just this file:**
+> a row's A/A nulls and twice-null margin bound **within-invocation** error only. Cross-window
+> reproducibility is a *separate, unmeasured* quantity unless a second same-ELF run exists.
+> Where one does, quote the observed spread; where none does, quote the worst spread the
+> campaign has measured. Only two figures exist so far: **4.71%** on one workload and
+> **9.15%** on bulk durable write. A later measurement that disagrees with a banked row by
+> less than that is **not** a regression, an improvement, or a disagreement — it is unresolved.
+
 **Date:** 2026-07-30 · **Host:** `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX,
 32C/64T, 231.7 GB RAM, 1 NUMA node · **Kernel:** 6.17.0-35-generic · **Bead:** `bd-opb6l`
 
@@ -89,11 +137,22 @@ whether the same ELF re-measures to the same ratio next window, and here it does
 bulk-durable figure is marked superseded — both are admitted under one contract, so
 choosing between them would be selection, not measurement.
 
-**Btrfs bulk durable write: UNRUNNABLE — and unlike the xattr row, by a DEFECT, not a
-policy.** The btrfs arm dies before any measurement with `fsync bulk durable workload
-…/btrfs/fuse_a/bulk-durable.bin: Invalid argument (os error 22)`, while the ext4 arm of the
-identical invocation completes. Filed as `bd-cjqhh`; the row stays unscored on btrfs until
-that EINVAL is fixed or proven to be a legitimate unsupported-operation answer.
+**Btrfs bulk durable write: UNMEASURED — no longer unrunnable.** The defect that blocked it
+is FIXED (`bd-cjqhh`, closed 2026-08-06 in `839eb708`): the durable commit built leaves it
+could not serialize, so `fsync` returned EINVAL and the unmount flush failed the same way,
+meaning the data was never persisted at all. A mounted 64 MiB run — the full comparator job
+shape — now completes with `fsync` OK and every chunk byte-identical across unmount and
+remount.
+
+**What is missing is the measurement, not the capability.** No btrfs bulk-durable-write ratio
+has been taken since the fix, so this scorecard carries no such row and none may be quoted.
+The prior text here read "UNRUNNABLE … by a DEFECT" and was correct when written; it is
+retained only in history. For the record, the failure it described was
+`fsync bulk durable workload …/btrfs/fuse_a/bulk-durable.bin: Invalid argument (os error 22)`
+while the ext4 arm of the identical invocation completed.
+
+Producing the row needs a quiet window and a v3+PGO build; it is measurement work, tracked
+under the perf umbrella, and it is explicitly NOT claimed here.
 
 ## One sentence per row
 
