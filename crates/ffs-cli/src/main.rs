@@ -749,6 +749,37 @@ enum Command {
         #[arg(long, default_value_t = 0x9E37_79B9_7F4A_7C15)]
         seed: u64,
     },
+    /// Benchmark STEADY-STATE readdir: open the image once, pay every one-time
+    /// setup cost OUTSIDE the timed region, then re-enumerate one directory
+    /// `iters` times and report per-entry cost.
+    ///
+    /// This exists because `walk` cannot answer the question it looks like it
+    /// answers. `walk` is a one-pass sweep in a fresh process, so its wall time
+    /// includes building the btrfs read-plan index — measured at ~18% of a
+    /// btrfs readdir-only walk's self time (bd-3zx2x). A mounted filesystem
+    /// pays that once at mount and then serves thousands of readdirs, so a
+    /// `walk` number is not comparable to a mounted readdir row. Here the index
+    /// prewarm and the first enumeration both happen before the clock starts,
+    /// so what is timed is what a mount actually repeats.
+    #[command(name = "readdir-bench")]
+    ReaddirBench {
+        /// Path to the filesystem image.
+        image: PathBuf,
+        /// Absolute path of the directory to re-enumerate (default: root).
+        #[arg(long, default_value = "/")]
+        dir: String,
+        /// Timed enumerations of `dir`.
+        #[arg(long, default_value_t = 50)]
+        iters: usize,
+        /// Untimed enumerations before the clock starts, on top of the index
+        /// prewarm — so lazily-built caches are warm and steady state is what
+        /// gets measured.
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+        /// Emit one machine-readable line instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
     /// Benchmark metadata WRITES: `enable_writes`, then create `count` empty
     /// files in `dir` and FLUSH the overlay to the image (`sync_all_to_device`),
     /// timing the whole thing. Each create is existence-check lookup + inode
@@ -1281,6 +1312,7 @@ impl Command {
             Self::RandRead { .. } => "randread",
             Self::WriteBench { .. } => "writebench",
             Self::LookupBench { .. } => "lookupbench",
+            Self::ReaddirBench { .. } => "readdirbench",
             Self::CreateBench { .. } => "createbench",
             Self::CreateBenchCutoverGate { .. } => "createbench-cutover-gate",
             Self::ReadPoolCutoverGate { .. } => "read-pool-cutover-gate",
@@ -2112,6 +2144,13 @@ fn run() -> Result<()> {
             count,
             seed,
         } => lookupbench_cmd(&image, &dir, count, seed),
+        Command::ReaddirBench {
+            image,
+            dir,
+            iters,
+            warmup,
+            json,
+        } => readdirbench_cmd(&image, &dir, iters, warmup, json),
         Command::CreateBench {
             image,
             dir,
@@ -3748,6 +3787,113 @@ fn renamebench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
         "renamebench: {count} renames in {dir_path} -> {renamed} renamed in {duration_us} us = {} renames/s",
         renames_per_s as u64
     );
+    Ok(())
+}
+
+/// Steady-state readdir: everything a mount pays ONCE is paid outside the clock.
+///
+/// The timed region is only the repeated paginated enumeration of one directory,
+/// which is what a mounted filesystem actually repeats. Open, index prewarm and
+/// `warmup` full enumerations all happen first. Reports per-entry cost so btrfs
+/// and ext4 images built from the same seed tree are directly comparable.
+fn readdirbench_cmd(
+    path: &PathBuf,
+    dir_path: &str,
+    iters: usize,
+    warmup: usize,
+    json: bool,
+) -> Result<()> {
+    use std::time::Instant;
+
+    if iters == 0 {
+        bail!("--iters must be at least 1");
+    }
+    let cx = cli_cx();
+    let open_fs = OpenFs::open(&cx, path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+
+    // One-time index construction is exactly what this bench exists to exclude:
+    // it is ~18% of a btrfs readdir-only `walk`'s self time, and a mount pays it
+    // once at mount rather than per enumeration (bd-3zx2x).
+    if matches!(&open_fs.flavor, FsFlavor::Btrfs(_)) {
+        open_fs
+            .prewarm_btrfs_read_plan_index(&cx)
+            .context("failed to prewarm btrfs read-plan index")?;
+    }
+
+    let mut ino = InodeNumber(1);
+    for comp in dir_path.split('/').filter(|c| !c.is_empty()) {
+        let attr = open_fs
+            .lookup(&cx, ino, std::ffi::OsStr::new(comp))
+            .with_context(|| format!("failed to resolve {dir_path} at component {comp:?}"))?;
+        ino = attr.ino;
+    }
+
+    // One full paginated enumeration. Returns the entry count so the per-entry
+    // figure divides by what was actually produced, not by an assumed total.
+    let enumerate = || -> Result<usize> {
+        let mut seen = 0_usize;
+        let mut off = 0_u64;
+        loop {
+            let page = open_fs
+                .readdir(&cx, ino, off)
+                .with_context(|| format!("failed to readdir {dir_path} at offset {off}"))?;
+            if page.is_empty() {
+                break;
+            }
+            seen += page.len();
+            let exhausted = off.saturating_add(1);
+            off = page.last().map_or(exhausted, |entry| entry.offset);
+        }
+        Ok(seen)
+    };
+
+    for _ in 0..warmup {
+        enumerate()?;
+    }
+    let entries = enumerate()?;
+    if entries == 0 {
+        bail!("{dir_path} enumerated 0 entries — nothing to measure");
+    }
+
+    let start = Instant::now();
+    let mut total_entries = 0_usize;
+    for _ in 0..iters {
+        total_entries += enumerate()?;
+    }
+    let elapsed = start.elapsed();
+
+    let per_entry_ns = elapsed.as_secs_f64() * 1e9 / (total_entries as f64);
+    let per_iter_us = elapsed.as_secs_f64() * 1e6 / (iters as f64);
+    if json {
+        println!(
+            "{{\"readdir_bench\":{{\"image\":{:?},\"dir\":{:?},\"entries\":{},\"iters\":{},\
+             \"warmup\":{},\"total_ns\":{},\"ns_per_entry\":{:.3},\"us_per_enumeration\":{:.3},\
+             \"index_prewarm\":\"outside_timed_region\"}}}}",
+            path.display().to_string(),
+            dir_path,
+            entries,
+            iters,
+            warmup,
+            elapsed.as_nanos(),
+            per_entry_ns,
+            per_iter_us,
+        );
+    } else {
+        println!(
+            "readdir-bench {}: {} entries x {} iters (warmup {}, index prewarm outside the clock)",
+            path.display(),
+            entries,
+            iters,
+            warmup
+        );
+        println!(
+            "  {:.3} ns/entry   {:.3} us/enumeration   {:.3} ms total",
+            per_entry_ns,
+            per_iter_us,
+            elapsed.as_secs_f64() * 1e3
+        );
+    }
     Ok(())
 }
 
