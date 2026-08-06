@@ -26117,11 +26117,41 @@ impl OpenFs {
     ) -> ffs_error::Result<u64> {
         let alloc_size = u64::try_from(data.len())
             .map_err(|_| FfsError::InvalidGeometry("aligned extent length overflow".into()))?;
-        let allocation = alloc
+        let disk_bytenr = alloc
             .extent_alloc
             .alloc_data(alloc_size)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        let disk_bytenr = allocation.bytenr;
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            .bytenr;
+        self.btrfs_emit_aligned_extent_at(
+            cx,
+            alloc,
+            canonical,
+            aligned_offset,
+            data,
+            is_datasum,
+            disk_bytenr,
+        )
+    }
+
+    /// `btrfs_emit_aligned_extent`, but writing into an ALREADY-ALLOCATED extent.
+    ///
+    /// Split out for bd-72tn8: an overwrite must secure its replacement space
+    /// before it destroys what it is replacing, so the caller allocates first and
+    /// hands the reservation down. Every failure path still frees `disk_bytenr`,
+    /// so an aborted emit leaks nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn btrfs_emit_aligned_extent_at(
+        &self,
+        cx: &Cx,
+        alloc: &mut BtrfsAllocState,
+        canonical: u64,
+        aligned_offset: u64,
+        data: &[u8],
+        is_datasum: bool,
+        disk_bytenr: u64,
+    ) -> ffs_error::Result<u64> {
+        let alloc_size = u64::try_from(data.len())
+            .map_err(|_| FfsError::InvalidGeometry("aligned extent length overflow".into()))?;
 
         if let Err(e) = self.btrfs_write_logical(cx, disk_bytenr, data) {
             let _ = alloc
@@ -29154,6 +29184,26 @@ impl OpenFs {
                 .map_err(|_| FfsError::InvalidGeometry("rmw data offset overflow".into()))?;
             merged[data_off..data_off + data.len()].copy_from_slice(data);
 
+            // Secure the replacement extent BEFORE destroying what it replaces
+            // (bd-72tn8). The removal below is not reversible: it drops this
+            // inode's EXTENT_DATA items and refcounts. If the allocation that
+            // follows it failed — ENOSPC is an ordinary, recoverable answer a
+            // caller is entitled to read as "nothing happened" — the old data was
+            // already gone, i_size was left untouched, and the range silently read
+            // back as a hole full of zeros.
+            //
+            // Reserving first can return ENOSPC where the old order would have
+            // squeezed by on the space the removal itself frees. That is the
+            // correct trade and matches the kernel, which reserves up front: a
+            // spurious ENOSPC is recoverable, destroyed data is not.
+            let merged_len = u64::try_from(merged.len())
+                .map_err(|_| FfsError::InvalidGeometry("merged write length overflow".into()))?;
+            let reserved_bytenr = alloc
+                .extent_alloc
+                .alloc_data(merged_len)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                .bytenr;
+
             // Replace any extents in the aligned range. Because all extents are
             // sector-aligned, the split boundaries here are aligned too, so the
             // re-inserted left/right remnants stay aligned.
@@ -29165,27 +29215,38 @@ impl OpenFs {
                 // prove an empty intersection.
                 0
             } else {
-                self.btrfs_remove_overlapping_extent_data(
+                match self.btrfs_remove_overlapping_extent_data(
                     cx,
                     &mut alloc,
                     canonical,
                     aligned_start,
                     aligned_end,
-                )?
+                ) {
+                    Ok(delta) => delta,
+                    Err(e) => {
+                        // Nothing was destroyed, so give the reservation back
+                        // rather than leaking it for the life of the mount.
+                        let _ = alloc
+                            .extent_alloc
+                            .free_extent(reserved_bytenr, merged_len, false);
+                        return Err(e);
+                    }
+                }
             };
             let nbytes_after_remove =
                 Self::btrfs_apply_nbytes_delta(inode.nbytes, removed_nbytes_delta)?;
 
-            // Emit the single sector-aligned extent (alloc + write + backref +
-            // per-sector csums) covering [aligned_start, aligned_end).
+            // Emit into the extent reserved above (write + backref + per-sector
+            // csums) covering [aligned_start, aligned_end).
             let is_datasum = inode.flags & BTRFS_INODE_NODATASUM == 0;
-            let emitted_nbytes = self.btrfs_emit_aligned_extent(
+            let emitted_nbytes = self.btrfs_emit_aligned_extent_at(
                 cx,
                 &mut alloc,
                 canonical,
                 aligned_start,
                 &merged,
                 is_datasum,
+                reserved_bytenr,
             )?;
             nbytes_after_remove
                 .checked_add(emitted_nbytes)
@@ -67922,6 +67983,78 @@ mod tests {
             )
             .expect("read src");
         assert_eq!(src_got, payload, "the shared source must not be modified");
+    }
+
+    /// bd-72tn8 ROOT CAUSE: a write that fails with ENOSPC must leave the file
+    /// byte-for-byte unchanged.
+    ///
+    /// `btrfs_write` removes the extents overlapping the write range and only
+    /// then allocates and emits the replacement. `btrfs_emit_aligned_extent`
+    /// rolls back its own partial work, but nothing undoes the removal — so a
+    /// write that runs out of space destroys the data it was going to replace
+    /// and reports a recoverable error. i_size is untouched, so the hole reads
+    /// back as zeros: the caller sees ENOSPC, which it is entitled to treat as
+    /// "nothing happened", and silently loses the old contents.
+    #[test]
+    fn btrfs_write_that_hits_enospc_leaves_the_file_unchanged_bd_72tn8() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        const BS: usize = 4096;
+
+        let victim = fs
+            .create(&cx, root, OsStr::new("victim.bin"), 0o644, 0, 0)
+            .expect("create victim");
+        let payload: Vec<u8> = (0..8 * BS).map(|i| (1 + i % 250) as u8).collect();
+        fs.write(&cx, victim.ino, 0, &payload)
+            .expect("write victim");
+
+        // Consume the remaining space so the next overwrite cannot allocate.
+        // Step the chunk size down to a single block: stopping at the first
+        // ENOSPC of a large chunk leaves enough room for the overwrite below to
+        // succeed, which makes this test pass without exercising anything.
+        let filler = fs
+            .create(&cx, root, OsStr::new("filler.bin"), 0o644, 0, 0)
+            .expect("create filler");
+        let mut at = 0_u64;
+        for blocks in [16_usize, 4, 1] {
+            let chunk = vec![0xEE_u8; blocks * BS];
+            loop {
+                match fs.write(&cx, filler.ino, at, &chunk) {
+                    Ok(_) => at += chunk.len() as u64,
+                    Err(ref e) if e.to_errno() == libc::ENOSPC => break,
+                    Err(e) => panic!("filler write: {e}"),
+                }
+                assert!(at < 64 * 1024 * 1024, "filler never hit ENOSPC");
+            }
+        }
+
+        // The write must need MORE space than it frees, or it just reuses the
+        // extent it removed and never reaches the allocator's failure path: this
+        // one overwrites the victim's last two blocks and runs well past EOF, so
+        // it frees 2 blocks and needs 8.
+        let overwrite = vec![0x5A_u8; 8 * BS];
+        let err = fs.write(&cx, victim.ino, (6 * BS) as u64, &overwrite);
+        assert!(
+            err.is_err() && err.as_ref().unwrap_err().to_errno() == libc::ENOSPC,
+            "fixture did not exhaust space: the overwrite returned {err:?}, so this \
+             test would pass vacuously"
+        );
+
+        // ENOSPC means the write did not happen. Every byte must be as before —
+        // including the two blocks the write would have replaced.
+        let got = fs
+            .read(&cx, victim.ino, 0, u32::try_from(8 * BS).expect("fits u32"))
+            .expect("read victim");
+        let ndiff = (0..payload.len()).filter(|&i| got[i] != payload[i]).count();
+        assert_eq!(
+            ndiff,
+            0,
+            "a write that failed with ENOSPC destroyed {} bytes, first at {}",
+            ndiff,
+            (0..payload.len())
+                .find(|&i| got[i] != payload[i])
+                .unwrap_or_default()
+        );
     }
 
     /// bd-72tn8, reduced from the proptest counterexample: a write that fully
