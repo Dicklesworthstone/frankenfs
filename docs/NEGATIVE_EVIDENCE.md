@@ -6801,6 +6801,50 @@ round trips per path op, so the shared component of those losses is this probe, 
 FUSE dispatch floor. Re-derive the "shared floor" claim only from a run whose `requests_total` was
 produced by a build containing this fix — every request count banked before it under-reports memoized
 requests, on read-only mounts, by roughly the number of path-based metadata operations performed.
+### 2026-08-06 (PlumRiver) — bd-ha71t REJECT: an additive `never,exit` audit rule scoped to the measurement mountpoint does NOT suppress the probe; counted mechanism, 502 probes vs 502
+
+**Counted mechanism, decided on the count and not on time: 502 syscalls vs 502** on the daemon's
+`/dev/fuse` channel, same ELF, same image, same 500 cached-dentry path stats, arms run
+back-to-back in one script. Wall time is deliberately not the basis: debug build, tracing on, loud
+shared host.
+
+The row above identified the call site as `__audit_inode` → `audit_copy_inode` →
+`get_vfs_caps_from_disk` during `filename_lookup`, and proposed as the strictly-better option a
+narrowing that removes the tax from measurement mounts *without* weakening the `/data/projects`
+guard. The purely ADDITIVE form of that was tested and is inert:
+
+```
+-a never,exit -F arch=b64 -S newfstatat -S statx -F dir=/tmp/
+```
+
+| arm | audit rules | probes for 500 cached-dentry path stats |
+| --- | --- | --- |
+| A | as found | **502** |
+| B | as found **+** the `never,exit` rule above | **502** |
+
+**Why it cannot work, which is the transferable part.** `never,exit` is an EXIT-filter rule: it is
+evaluated when the syscall returns. The inode collection that issues the probe happens during
+`filename_lookup`, i.e. while the syscall is still running. By the time the exit filter could
+suppress the record, the capability fetch has already been round-tripped to the daemon. No
+exit-filter rule can prevent work that precedes it, so this whole shape of fix is closed, not just
+this instance of it.
+
+**Safety of the experiment.** The rule was additive: nothing was deleted, and the
+`/data/projects` watch and destructive-syscall rule were untouched throughout. The ruleset was
+snapshotted before, the added rule removed on any exit via a trap, and the final ruleset diffed
+against the snapshot — `RULESET RESTORED EXACTLY: yes`. No FrankenFS code was changed, so the
+xattr get/list regression gate does not apply to this row; it remains mandatory for any change
+that touches xattr replies.
+
+**Retry predicate.** Do not retry any exit-filter (`never,exit` / `-F dir=` / `-F path=`) variant
+for this probe on this kernel — the ordering argument above rules out the entire class. The one
+untested option left is to REPLACE the broad `-w /data/projects -p wa` watch (which carries no
+syscall mask and therefore arms every syscall, creating an audit context on stat-family calls)
+with an equivalent rule carrying an explicit write-syscall mask. That is a MODIFICATION of a fleet
+safety rule rather than an addition, so it needs the human's explicit authorization before it is
+tested, and it must be shown to leave the `/data/projects` write and destructive-syscall coverage
+intact.
+
 ### 2026-08-06 (PlumRiver) — bd-ha71t MECHANISM, retry-predicate clause (c) SATISFIED: the per-path-op `security.capability` probe comes from the AUDIT subsystem, not from FUSE or an LSM permission check — and it is a property of THIS HOST's audit rules
 
 **Counted mechanism, decided on the count and not on time: 501 syscalls vs 2** on the daemon's
