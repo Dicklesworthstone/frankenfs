@@ -54,8 +54,16 @@ artifacts/
 
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
-proptest-regressions/
 test_meminfo
+
+# proptest-regressions/ is NOT ephemeral and is deliberately tracked (bd-72tn8).
+# It holds the seeds of every counterexample proptest has ever found here, and
+# proptest replays them before generating novel cases — so checking it in is what
+# makes a rare property failure reproduce deterministically for everyone instead
+# of resurfacing as "flakiness" once a month. Ignoring it threw away every
+# counterexample this repo produced, including a real btrfs reflink data
+# divergence that took a 512-case run to rediscover. proptest's own generated
+# header says to check the file in.
 
 # Agent session ephemeral files
 SESSION_TODO.md

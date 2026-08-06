@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fe58edc82914cb623f204dbdff16a4ac562c9266d0b6d2d6c3fb624644fd6017 # shrinks to max_items = 7, prefill = [22, 0, 137, 138, 191, 1, 53, 139, 54, 140, 205, 246, 191, 186, 53, 53, 53, 55, 2, 56, 6, 26, 82, 123, 98, 52, 135, 122, 50, 121, 107, 386, 298, 246, 198, 200, 311, 208, 118, 21, 204, 223, 202, 173, 372, 352, 251, 262, 180, 271, 317, 350, 282, 293, 322, 161, 153], del = [343, 236, 11, 204, 173, 40, 316, 123, 276, 317, 41, 246, 186, 232, 331, 93, 130, 49, 242, 211, 89, 263, 41, 28, 385, 163, 358, 191, 4, 22, 51, 243, 253, 61, 201, 245, 285, 390, 148, 327, 86]

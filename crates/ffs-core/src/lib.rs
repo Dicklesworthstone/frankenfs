@@ -67848,6 +67848,161 @@ mod tests {
         (fs, cx)
     }
 
+    /// bd-72tn8: a partial-block write into a REFLINKED region must preserve the
+    /// bytes on either side of it.
+    ///
+    /// `btrfs_reflink_random_matches_reference_model` finds this, but only as a
+    /// 14-operation sequence whose failure reads as flakiness. Reduced: clone a
+    /// file, then write into the middle of one shared block. The write cannot go
+    /// in place — the extent is shared — so it must read the block, splice, and
+    /// emit a private copy. Losing the head means a reflinked file silently
+    /// returns bytes that were never written to it.
+    #[test]
+    fn btrfs_partial_write_over_shared_extent_preserves_head_bd_72tn8() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        const BS: usize = 4096;
+        const BLOCKS: usize = 8;
+
+        let src = fs
+            .create(&cx, root, OsStr::new("rl-src.bin"), 0o644, 0, 0)
+            .expect("create src");
+        let dst = fs
+            .create(&cx, root, OsStr::new("rl-dst.bin"), 0o644, 0, 0)
+            .expect("create dst");
+
+        let payload: Vec<u8> = (0..BLOCKS * BS).map(|i| (i % 251) as u8).collect();
+        fs.write(&cx, src.ino, 0, &payload).expect("write src");
+
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            dst.ino,
+            src.ino,
+            0,
+            (BLOCKS * BS) as u64,
+            0,
+        )
+        .expect("clone whole src into dst");
+
+        let mut model = payload.clone();
+        let off = 3 * BS + 1000;
+        let buf = vec![0xA5_u8; 2000];
+        fs.write(&cx, dst.ino, off as u64, &buf)
+            .expect("partial-block write into the shared region");
+        model[off..off + buf.len()].copy_from_slice(&buf);
+
+        let got = fs
+            .read(
+                &cx,
+                dst.ino,
+                0,
+                u32::try_from(BLOCKS * BS).expect("fits u32"),
+            )
+            .expect("read dst");
+        let ndiff = (0..model.len()).filter(|&i| got[i] != model[i]).count();
+        assert_eq!(
+            ndiff,
+            0,
+            "{} bytes differ, first at {}",
+            ndiff,
+            (0..model.len())
+                .find(|&i| got[i] != model[i])
+                .unwrap_or_default()
+        );
+
+        // The source must be untouched — a COW write to the clone must not
+        // reach back through the shared extent.
+        let src_got = fs
+            .read(
+                &cx,
+                src.ino,
+                0,
+                u32::try_from(BLOCKS * BS).expect("fits u32"),
+            )
+            .expect("read src");
+        assert_eq!(src_got, payload, "the shared source must not be modified");
+    }
+
+    /// bd-72tn8, reduced from the proptest counterexample: a write that fully
+    /// covers the tail of a SHARED region must overwrite all of it.
+    ///
+    /// The random model shrank only to 21 operations, but its arithmetic pins
+    /// the defect: the clone landed a shared region ending at 184320, the final
+    /// write spanned 153878..192513 — covering that end completely — and exactly
+    /// the last 122 bytes of the shared region, 184198..184320, still read back
+    /// as the old shared contents. Stale bytes surviving a write that covered
+    /// them is the data-integrity failure. The offsets below are that case's.
+    #[test]
+    fn btrfs_write_over_tail_of_shared_region_leaves_no_stale_bytes_bd_72tn8() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+
+        let f2 = fs
+            .create(&cx, root, OsStr::new("t-src.bin"), 0o644, 0, 0)
+            .expect("create src");
+        let f0 = fs
+            .create(&cx, root, OsStr::new("t-dst.bin"), 0o644, 0, 0)
+            .expect("create dst");
+
+        // Source sized to an UNALIGNED length, as in the counterexample.
+        const SRC_LEN: usize = 163_841;
+        let src_bytes: Vec<u8> = (0..SRC_LEN).map(|i| (1 + i % 250) as u8).collect();
+        fs.write(&cx, f2.ino, 0, &src_bytes).expect("fill src");
+
+        // Clone src[73728 .. 73728+77824] to dst@106496, so the shared region
+        // ends exactly at 184320.
+        const SRC_OFF: u64 = 73_728;
+        const CLONE_LEN: u64 = 77_824;
+        const DST_OFF: u64 = 106_496;
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            f0.ino,
+            f2.ino,
+            SRC_OFF,
+            CLONE_LEN,
+            DST_OFF,
+        )
+        .expect("clone into dst");
+
+        let mut model = vec![0_u8; usize::try_from(DST_OFF).expect("fits usize")];
+        model.extend_from_slice(
+            &src_bytes[usize::try_from(SRC_OFF).expect("fits usize")
+                ..usize::try_from(SRC_OFF + CLONE_LEN).expect("fits usize")],
+        );
+
+        // The write that fully covers the shared region's tail and runs past it.
+        const W_OFF: usize = 153_878;
+        const W_LEN: usize = 38_635;
+        let buf = vec![0_u8; W_LEN];
+        fs.write(&cx, f0.ino, W_OFF as u64, &buf)
+            .expect("write over the shared tail");
+        if W_OFF + W_LEN > model.len() {
+            model.resize(W_OFF + W_LEN, 0);
+        }
+        model[W_OFF..W_OFF + W_LEN].copy_from_slice(&buf);
+
+        let got = fs
+            .read(
+                &cx,
+                f0.ino,
+                0,
+                u32::try_from(model.len()).expect("fits u32"),
+            )
+            .expect("read dst");
+        let ndiff = (0..model.len()).filter(|&i| got[i] != model[i]).count();
+        assert_eq!(
+            ndiff,
+            0,
+            "{} bytes differ, first at {}",
+            ndiff,
+            (0..model.len())
+                .find(|&i| got[i] != model[i])
+                .unwrap_or_default()
+        );
+    }
+
     /// Format a real btrfs image with btrfs-progs and open it writable. Returns
     /// `None` only when the format tool is unavailable (test skips); if the tool
     /// runs but FrankenFS cannot open the resulting image, this panics so the

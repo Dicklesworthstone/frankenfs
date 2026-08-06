@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8ebc5f9559105f1c08a229bb8a0b7031300cb42c661a43c2f12ef45d8d910bee # shrinks to n_items = 1, bytenr = 0, objectids = [1, 17994772544689327027, 6266556428480508290, 12671987420256821092, 14947946597288558671, 4105613275934473168, 8197652482979918456, 8498679908283453998], item_types = [188, 134, 223, 233, 113, 184, 144, 146], key_offsets = [10385839007231877167, 5196706510480874361, 2622855910242639118, 11093292668845189310, 5515880585705060171, 12575280155915549518, 3119670283932706397, 4204501370218639154]
