@@ -392,6 +392,12 @@ impl Workload {
 struct Config {
     ffs_cli: PathBuf,
     artifact_root: PathBuf,
+    /// Reusable root for the bulk scratch (arm images + fixture tree).
+    ///
+    /// Defaults to `<artifact_root>/scratch` and is CLEARED at the start of
+    /// every run, so disk sits at one run's worth instead of growing 5-11 GiB
+    /// per invocation (bd-v0igv). The per-run directory still holds the report.
+    scratch_root: Option<PathBuf>,
     filesystems: RequestedFilesystems,
     workload: Workload,
     pairs: usize,
@@ -475,6 +481,14 @@ impl Config {
         self.workload.client_threads(self.client_threads)
     }
 
+    /// Where the bulk scratch lives: `--scratch-root` if given, else a fixed
+    /// `scratch` directory beside the per-run report directories.
+    fn scratch_root(&self) -> PathBuf {
+        self.scratch_root
+            .clone()
+            .unwrap_or_else(|| self.artifact_root.join("scratch"))
+    }
+
     const fn compares_candidates(&self) -> bool {
         self.candidate_comparison.is_some()
     }
@@ -503,6 +517,7 @@ impl Default for Config {
         Self {
             ffs_cli: PathBuf::new(),
             artifact_root: PathBuf::from("/data/tmp/frankenfs-mounted-kernel"),
+            scratch_root: None,
             filesystems: RequestedFilesystems::Both,
             workload: Workload::WarmStat,
             pairs: 32,
@@ -1356,6 +1371,10 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
             }
             "--artifact-root" => {
                 config.artifact_root = parse_value::<PathBuf>(args, &mut index, "--artifact-root")?;
+            }
+            "--scratch-root" => {
+                config.scratch_root =
+                    Some(parse_value::<PathBuf>(args, &mut index, "--scratch-root")?);
             }
             "--filesystem" => {
                 let value = parse_value::<String>(args, &mut index, "--filesystem")?;
@@ -4601,6 +4620,67 @@ fn free_bytes_on_data() -> Result<u64> {
         .ok_or_else(|| anyhow!("could not parse available bytes from df"))
 }
 
+/// Marker written into a reusable scratch root, so clearing one can never touch
+/// a directory this harness did not create.
+const SCRATCH_MARKER: &str = ".ffs-mounted-kernel-scratch";
+
+/// Prepare the reusable scratch root that holds this run's arm images and
+/// fixture tree.
+///
+/// Every invocation used to mint `run_<epoch>_<pid>/` and fill it with one
+/// 1 GiB image PER ARM plus a base, and nothing ever removed them: 5-11 GiB per
+/// invocation, unbounded (bd-v0igv found 133 GiB of them). The per-arm images
+/// are deterministic intermediates — every run rebuilds them from `mke2fs` or
+/// `mkfs.btrfs` before it measures anything, and no banked row cites one — so a
+/// per-run directory buys nothing for them. The small `report.json` still gets
+/// its own per-run directory; only the bulk is reused.
+///
+/// The pristine-image guarantee is preserved rather than traded away:
+/// `create_sized_file` keeps its `create_new(true)`, so a stale image can still
+/// never be measured. This clears the scratch root FIRST, which is what makes
+/// the fresh creates succeed. It refuses to clear anything lacking
+/// [`SCRATCH_MARKER`], so a mistyped `--scratch-root` cannot remove data this
+/// harness did not write.
+fn prepare_scratch_dir(root: &Path) -> Result<PathBuf> {
+    ensure!(
+        root.is_absolute() && root.starts_with("/data/tmp"),
+        "scratch root must be an absolute path below /data/tmp"
+    );
+    let marker = root.join(SCRATCH_MARKER);
+    if root.exists() {
+        ensure!(
+            marker.is_file(),
+            "refusing to reuse {} as a scratch root: it has no {SCRATCH_MARKER} marker, so this \
+             harness did not create it",
+            root.display()
+        );
+        for entry in
+            fs::read_dir(root).with_context(|| format!("read scratch root {}", root.display()))?
+        {
+            let entry = entry.with_context(|| format!("read entry in {}", root.display()))?;
+            if entry.file_name() == SCRATCH_MARKER {
+                continue;
+            }
+            let path = entry.path();
+            let removed = if entry
+                .file_type()
+                .with_context(|| format!("stat {}", path.display()))?
+                .is_dir()
+            {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            removed.with_context(|| format!("clear stale scratch entry {}", path.display()))?;
+        }
+    } else {
+        fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+        fs::write(&marker, b"ffs-mounted-kernel-bench reusable scratch root\n")
+            .with_context(|| format!("write {}", marker.display()))?;
+    }
+    Ok(root.to_path_buf())
+}
+
 fn create_run_dir(root: &Path) -> Result<PathBuf> {
     ensure!(
         root.is_absolute() && root.starts_with("/data/tmp"),
@@ -4653,13 +4733,13 @@ fn fs_report(
     config: &Config,
     expected_identity: &FfsBinaryIdentity,
     host: &HostProvenance,
-    run_dir: &Path,
+    scratch_dir: &Path,
     mount_run_dir: &Path,
     fixture_root: &Path,
     placement: &CpuPlacement,
     interrupted: &AtomicBool,
 ) -> Result<Value> {
-    let fs_dir = run_dir.join(kind.label());
+    let fs_dir = scratch_dir.join(kind.label());
     fs::create_dir(&fs_dir).with_context(|| format!("create {}", fs_dir.display()))?;
     let mount_fs_dir = mount_run_dir.join(kind.label());
     fs::create_dir(&mount_fs_dir)
@@ -5873,7 +5953,11 @@ fn run() -> Result<Option<PathBuf>> {
         .output
         .clone()
         .unwrap_or_else(|| run_dir.join("mounted-kernel-report.json"));
-    let fixture_root = create_fixture_tree(&run_dir, &config)?;
+    // The report keeps its per-run directory; the arm images and fixture tree —
+    // the 5-11 GiB of it — go in a scratch root that every run reuses and
+    // clears (bd-v0igv).
+    let scratch_dir = prepare_scratch_dir(&config.scratch_root())?;
+    let fixture_root = create_fixture_tree(&scratch_dir, &config)?;
     let placement = select_cpu_placement(
         config.client_threads(),
         config.fuse_cpu_count,
@@ -5944,7 +6028,7 @@ fn run() -> Result<Option<PathBuf>> {
             &config,
             &ffs_binary_identity,
             &host,
-            &run_dir,
+            &scratch_dir,
             &mount_run_dir,
             &fixture_root,
             &placement,
@@ -5990,6 +6074,11 @@ fn run() -> Result<Option<PathBuf>> {
     let report = json!({
         "kernel_release": fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),
         "artifact_root": run_dir,
+        // Recorded distinctly from artifact_root: the scratch root is REUSED and
+        // cleared by the next run, so a later reader must not expect this run's
+        // images to still be there (bd-v0igv).
+        "scratch_root": scratch_dir,
+        "scratch_root_lifetime": "reused_and_cleared_by_the_next_run",
         "mount_root": mount_run_dir,
         "disk_free_before_bytes": free_before,
         "disk_free_after_bytes": free_after,
@@ -6448,6 +6537,49 @@ mod tests {
         assert!(
             select_private_core_cpus(4, &ranked, &domain, &BTreeSet::new(), &siblings).is_none()
         );
+    }
+
+    #[test]
+    fn scratch_root_is_reused_but_only_ever_clears_a_directory_it_marked() {
+        // The scratch root is required to live under /data/tmp, so this test
+        // works there rather than in a tempdir, under a unique name.
+        let root = PathBuf::from(format!(
+            "/data/tmp/ffs-scratch-guard-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        // First use creates the root and its marker.
+        let prepared = prepare_scratch_dir(&root).expect("create a fresh scratch root");
+        assert_eq!(prepared, root);
+        assert!(root.join(SCRATCH_MARKER).is_file());
+
+        // A second run clears the previous run's bulk but keeps the marker, so
+        // create_sized_file's create_new(true) still succeeds on a fresh image
+        // and can never be handed a stale one.
+        fs::write(root.join("ext4.base.img"), b"stale").expect("write stale image");
+        fs::create_dir(root.join("fixture-root")).expect("stale fixture tree");
+        prepare_scratch_dir(&root).expect("reuse the scratch root");
+        assert!(!root.join("ext4.base.img").exists());
+        assert!(!root.join("fixture-root").exists());
+        assert!(root.join(SCRATCH_MARKER).is_file());
+
+        // A directory this harness did not create is refused, not cleared.
+        let foreign = root.join("foreign");
+        fs::create_dir(&foreign).expect("create foreign dir");
+        let precious = foreign.join("someone-elses-data");
+        fs::write(&precious, b"do not delete").expect("write foreign data");
+        let error = prepare_scratch_dir(&foreign).expect_err("no marker means refuse");
+        assert!(
+            error.to_string().contains(SCRATCH_MARKER),
+            "the refusal must name the missing marker, got: {error}"
+        );
+        assert!(precious.is_file(), "foreign data must survive the refusal");
+
+        // A path outside /data/tmp is refused before anything is inspected.
+        assert!(prepare_scratch_dir(Path::new("/tmp/ffs-scratch-guard")).is_err());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
