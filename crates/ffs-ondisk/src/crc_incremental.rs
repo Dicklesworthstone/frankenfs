@@ -177,10 +177,11 @@ fn byte_shift_operators() -> &'static (Box<[[u32; 32]]>, Box<[[u32; 32]]>) {
     })
 }
 
-/// Advance `crc` as if `zero_bytes` zero bytes were appended, in constant time
-/// (two matrix-vector products) for any `zero_bytes < 65536` — covering every
-/// ext4/btrfs block size. Falls back to the bit-decomposition shift for larger
-/// counts (never reached for ≤64 KiB blocks).
+/// Advance `crc` as if `zero_bytes` zero bytes were appended.
+///
+/// Constant time (two matrix-vector products) for any `zero_bytes < 65536`, which
+/// covers every ext4/btrfs block size. Falls back to the bit-decomposition shift
+/// for larger counts, never reached for ≤64 KiB blocks.
 ///
 /// This is a raw running-CRC advance: given the running CRC after some prefix,
 /// it returns the running CRC after that prefix followed by `zero_bytes` zeros,

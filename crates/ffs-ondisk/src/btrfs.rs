@@ -1332,10 +1332,10 @@ fn validate_next_key(
     field: &'static str,
     reason: &'static str,
 ) -> Result<(), ParseError> {
-    if let Some(previous) = previous {
-        if btrfs_key_cmp(&previous, &current) != Ordering::Less {
-            return Err(ParseError::InvalidField { field, reason });
-        }
+    if let Some(previous) = previous
+        && btrfs_key_cmp(&previous, &current) != Ordering::Less
+    {
+        return Err(ParseError::InvalidField { field, reason });
     }
     Ok(())
 }
@@ -1423,13 +1423,13 @@ impl BtrfsHeader {
         block_size: usize,
         expected_bytenr: Option<u64>,
     ) -> Result<(), ParseError> {
-        if let Some(expected) = expected_bytenr {
-            if self.bytenr != expected {
-                return Err(ParseError::InvalidField {
-                    field: "bytenr",
-                    reason: "header bytenr does not match expected",
-                });
-            }
+        if let Some(expected) = expected_bytenr
+            && self.bytenr != expected
+        {
+            return Err(ParseError::InvalidField {
+                field: "bytenr",
+                reason: "header bytenr does not match expected",
+            });
         }
 
         if self.level > BTRFS_MAX_LEVEL {
@@ -1588,7 +1588,8 @@ pub fn parse_leaf_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsItem>), P
     let mut items: Vec<BtrfsItem> = Vec::with_capacity(nritems);
     let mut previous_key = None;
     let item_table = &block[BTRFS_HEADER_SIZE..items_end];
-    for item in item_table.chunks_exact(BTRFS_ITEM_SIZE) {
+    let (item_rows, _) = item_table.as_chunks::<BTRFS_ITEM_SIZE>();
+    for item in item_rows {
         let key = parse_ordered_key(
             item,
             0,
@@ -1704,7 +1705,8 @@ pub fn parse_internal_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsKeyPt
     let mut ptrs = Vec::with_capacity(nritems);
     let mut previous_key = None;
     let key_ptr_table = &block[BTRFS_HEADER_SIZE..table_end];
-    for key_ptr in key_ptr_table.chunks_exact(BTRFS_KEY_PTR_SIZE) {
+    let (key_ptr_rows, _) = key_ptr_table.as_chunks::<BTRFS_KEY_PTR_SIZE>();
+    for key_ptr in key_ptr_rows {
         let key = parse_ordered_key(
             key_ptr,
             0,

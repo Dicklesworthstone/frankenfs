@@ -1824,9 +1824,11 @@ pub fn verify_inode_bitmap_checksum(
 }
 
 /// Incrementally recompute a bitmap's descriptor checksum after a contiguous bit
-/// range `[start_bit, start_bit+count_bits)` was flipped (allocation sets 0→1,
-/// free clears 1→0 — both cases mean the CRC delta over the touched bytes is
-/// exactly the range mask, so no before/after byte capture is needed).
+/// range was flipped.
+///
+/// The range is `[start_bit, start_bit+count_bits)`. Allocation sets 0→1 and free
+/// clears 1→0; both cases mean the CRC delta over the touched bytes is exactly the
+/// range mask, so no before/after byte capture is needed.
 ///
 /// Returns `None` (caller must full-recompute) when incremental is not
 /// applicable: `desc_size < 64` (only the low 16 bits are stored, so the full
@@ -2287,11 +2289,13 @@ pub fn stamp_dir_block_checksum(dir_block: &mut [u8], csum_seed: u32, ino: u32, 
 }
 
 /// `ext4_chksum(seed, data)` that skips a large trailing zero run algebraically
-/// instead of streaming it. Two ext4 metadata regions are a short live prefix
-/// followed by a long zero tail: a freshly-built directory block (mkdir's initial
-/// `.`/`..` block, a newly-allocated leaf, a large-slack insert = entries then a
-/// ~4 KiB zero gap) and a partially-full group's block/inode bitmap (allocators
-/// fill bottom-up, so the high blocks/inodes — the tail bytes — are still 0).
+/// instead of streaming it.
+///
+/// Two ext4 metadata regions are a short live prefix followed by a long zero tail:
+/// a freshly-built directory block (mkdir's initial `.`/`..` block, a newly
+/// allocated leaf, or a large-slack insert — entries then a ~4 KiB zero gap) and a
+/// partially-full group's block/inode bitmap (allocators fill bottom-up, so the
+/// high blocks/inodes — the tail bytes — are still 0).
 /// Since `crc(prefix ++ zeros) = crc32c_shift_bytes(crc(prefix), N)`, a 4-wide
 /// reverse zero-scan finds the content boundary and the zero tail costs one
 /// GF(2) shift instead of a full CRC. Falls back to a straight CRC when the
@@ -3520,13 +3524,13 @@ fn parse_extent_index(
         let leaf_hi = u64::from(u16::from_le_bytes([e[8], e[9]]));
         let leaf_block = leaf_lo | (leaf_hi << 32);
 
-        if let Some(prev) = indexes.last() {
-            if logical_block <= prev.logical_block {
-                return Err(ParseError::InvalidField {
-                    field: "extent_indexes",
-                    reason: "index entries not strictly sorted by logical_block",
-                });
-            }
+        if let Some(prev) = indexes.last()
+            && logical_block <= prev.logical_block
+        {
+            return Err(ParseError::InvalidField {
+                field: "extent_indexes",
+                reason: "index entries not strictly sorted by logical_block",
+            });
         }
 
         indexes.push(Ext4ExtentIndex {
@@ -3730,6 +3734,12 @@ fn validate_dir_block_slice_len(block: &[u8], block_size: u32) -> Result<(), Par
 /// checksum tail (if any). Callbacks that only need to inspect entries (e.g.
 /// name lookup) avoid `parse_dir_block`'s per-entry name `Vec` allocations
 /// while seeing exactly the same entries in the same order.
+// 104 lines against a 100-line lint threshold. The body is ONE linear walk of an
+// on-disk directory block in which nearly every line is a distinct field
+// validation returning its own named `ParseError`. Extracting a helper would put
+// the field checks somewhere other than the walk that establishes their
+// preconditions, which is the property a reader of a parser most needs (bd-g9l54).
+#[allow(clippy::too_many_lines)]
 fn walk_dir_block_entries(
     block: &[u8],
     block_size: u32,
@@ -4949,18 +4959,21 @@ pub struct Ext4ImageReader {
 /// already read+parsed child across a sequential walk of consecutive logical
 /// blocks (the read / readdir / lookup hot loops).
 ///
-/// For a depth-0 (inline leaf) inode this is never touched — the common case my
-/// `resolve_extent_with_tree` hoist already covers. For a depth ≥ 1 tree,
-/// `walk_extent_tree` re-reads AND re-parses (heap-allocating `Vec<Ext4Extent>`
-/// + sort/overlap validation) the child index/leaf block on EVERY logical block,
-/// even though consecutive blocks overwhelmingly fall under the same index entry
-/// (one 4 KiB extent leaf covers up to ~340 extents). This cache holds the last
-/// child parsed at each tree level (indexed by `remaining_depth`, ≤
-/// `MAX_EXTENT_DEPTH`); when the next block resolves to the same `leaf_block`,
-/// the parsed child is reused instead of re-read + re-parsed. Behaviour is
-/// identical: a cached child was validated when first parsed and the underlying
-/// image block is immutable, so reuse yields the same result the per-block
-/// re-parse would have.
+/// For a depth-0 (inline leaf) inode this is never touched — the common case the
+/// `resolve_extent_with_tree` hoist already covers.
+///
+/// For a depth ≥ 1 tree, `walk_extent_tree` re-reads AND re-parses the child
+/// index/leaf block on EVERY logical block (heap-allocating a `Vec<Ext4Extent>`
+/// and re-running sort/overlap validation), even though consecutive blocks
+/// overwhelmingly fall under the same index entry: one 4 KiB extent leaf covers
+/// up to ~340 extents.
+///
+/// This cache holds the last child parsed at each tree level (indexed by
+/// `remaining_depth`, ≤ `MAX_EXTENT_DEPTH`); when the next block resolves to the
+/// same `leaf_block`, the parsed child is reused instead of re-read and
+/// re-parsed. Behaviour is identical: a cached child was validated when first
+/// parsed and the underlying image block is immutable, so reuse yields the same
+/// result the per-block re-parse would have.
 #[derive(Debug, Default)]
 pub struct ExtentResolveCache {
     /// `levels[d]` = the child `(leaf_block, header, tree)` last read by an
@@ -6177,8 +6190,8 @@ fn find_xattr_value_matching(
     matches: impl Fn(u8, &[u8]) -> bool,
 ) -> Result<Option<(u8, Vec<u8>, u32)>, ParseError> {
     let mut offset = 0_usize;
-    // (name_index, value_offs, value_inum, value_size) of the matched entry.
-    let mut matched: Option<(u8, u16, u32, u32)> = None;
+    // (name_index, value_offs, value_inum, value_size) of the entry that hit.
+    let mut hit: Option<(u8, u16, u32, u32)> = None;
     let entries_region_end = loop {
         if offset + 4 > data.len() {
             break offset;
@@ -6202,13 +6215,13 @@ fn find_xattr_value_matching(
                 reason: "name extends past data boundary",
             });
         }
-        if matched.is_none() && matches(name_index, &data[name_start..name_end]) {
-            matched = Some((name_index, value_offs, value_inum, value_size));
+        if hit.is_none() && matches(name_index, &data[name_start..name_end]) {
+            hit = Some((name_index, value_offs, value_inum, value_size));
         }
         offset = (name_end + 3) & !3;
     };
 
-    let Some((name_index, value_offs, value_inum, value_size)) = matched else {
+    let Some((name_index, value_offs, value_inum, value_size)) = hit else {
         return Ok(None);
     };
 
@@ -6300,10 +6313,11 @@ pub fn find_xattr_block_value_by_name(
 }
 
 /// Find one inode-body xattr by split `(name_index, name)` without materializing
-/// the rest. Direct-match counterpart of [`find_ibody_xattr_by_name`] for
-/// callers (e.g. `getxattr` by index+name) that already hold the on-disk name
-/// index and suffix. Matches exactly `entry.name_index == name_index &&
-/// entry.name == name`.
+/// the rest.
+///
+/// Direct-match counterpart of [`find_ibody_xattr_by_name`] for callers (e.g.
+/// `getxattr` by index+name) that already hold the on-disk name index and suffix.
+/// Matches exactly `entry.name_index == name_index && entry.name == name`.
 pub fn find_ibody_xattr_by_index_name(
     inode: &Ext4Inode,
     name_index: u8,
@@ -6449,9 +6463,11 @@ pub fn parse_xattr_block_names(block_data: &[u8]) -> Result<Vec<String>, ParseEr
     parse_xattr_entry_names(&block_data[32..])
 }
 
-/// Names-only counterpart of [`parse_ibody_xattrs`] for `listxattr`: returns the
-/// inode-body attribute full names without materialising values. An empty ibody
-/// (missing/mismatched magic) yields no names, exactly as `parse_ibody_xattrs`.
+/// Names-only counterpart of [`parse_ibody_xattrs`] for `listxattr`.
+///
+/// Returns the inode-body attribute full names without materialising values. An
+/// empty ibody (missing or mismatched magic) yields no names, exactly as
+/// `parse_ibody_xattrs` does.
 pub fn parse_ibody_xattr_names(inode: &Ext4Inode) -> Result<Vec<String>, ParseError> {
     if inode.xattr_ibody.len() < 4 {
         return Ok(Vec::new());
@@ -7630,6 +7646,7 @@ fn build_htree_directory_stamped_with_large_dir_inner(
 }
 
 /// Find the rightmost entry index whose hash is <= target_hash.
+#[must_use]
 pub fn dx_find_leaf_idx(entries: &[Ext4DxEntry], hash: u32) -> usize {
     // Binary search: find rightmost entry where entry.hash <= hash
     let mut lo = 0_usize;
@@ -7772,6 +7789,10 @@ pub enum HtreeFindResult {
 /// entry — only "found", "not in index", or "index unusable". Callers gate on
 /// the directory's INDEX flag and choose their not-found policy (trust the index
 /// vs. linear fallback for a possibly-stale index).
+// 107 lines against a 100-line lint threshold, for the same reason as
+// `walk_dir_block_entries`: one descent through the htree where each step's
+// validation is what licenses the next read (bd-g9l54).
+#[allow(clippy::too_many_lines)]
 fn htree_find_entry_inner<F, H, B>(
     block_size: u32,
     hash_seed: &[u32; 4],
@@ -8235,6 +8256,7 @@ pub enum HtreeSplitFallback {
 /// wiring are the remaining work. Validated in isolation by
 /// `promote_dx_root_to_two_level_routes_every_entry`.
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn promote_dx_root_to_two_level(
     dx_root_block: &[u8],
     block_size: usize,
