@@ -2814,6 +2814,20 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EINVAL);
             return;
         };
+        // Unconditional, at the kernel boundary, BEFORE any memo or cache can
+        // answer and hide it (bd-ha71t step 1). The existing trace lines sit on
+        // the memo hit paths, so they say nothing on a read-write mount — which
+        // is precisely the configuration where the per-path-op probe was counted.
+        // The attribution of the metadata floor to `security.capability` rested
+        // on a gating argument rather than a captured opcode; this is what lets
+        // the name be read off a real mount instead of inferred.
+        trace!(
+            target: "ffs::fuse::xattr_probe",
+            ino,
+            name,
+            size,
+            "fuse getxattr from kernel"
+        );
         let cx = Self::cx_for_request();
         match self.getxattr_value(&cx, InodeNumber(ino), name) {
             Ok(Some(value)) => Self::reply_xattr_payload(size, &value, reply),
@@ -4415,7 +4429,11 @@ mod tests {
 
         // The generic read-only value cache must account the same way.
         for _ in 0..3 {
-            assert!(fuse.getxattr_value(&cx, ino, "user.mime").unwrap().is_none());
+            assert!(
+                fuse.getxattr_value(&cx, ino, "user.mime")
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         let snapshot = fuse.inner.metrics.snapshot();
