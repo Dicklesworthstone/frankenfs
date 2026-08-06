@@ -4093,13 +4093,21 @@ fn select_cpu_placement(
     // set. That is the placement every banked row was taken at, so its selection
     // must stay byte-identical.
     //
-    // More than one daemon CPU cannot use that order: a domain with C physical
-    // cores cannot hand private cores to both a C-thread client set and a
-    // C-CPU daemon. The clients are placed first — exactly as they are today —
-    // and the daemon then takes quiet CPUs the clients did not claim, which in
-    // a single last-level-cache domain are their SMT siblings. That is the
-    // conservative direction: the daemon shares execution resources with the
-    // very threads it serves rather than being handed free cores.
+    // More than one daemon CPU is tried the same way FIRST and only falls back
+    // when the domain genuinely cannot supply it. Inside one last-level-cache
+    // domain it usually cannot — C physical cores cannot host both a C-thread
+    // client set and a C-CPU daemon privately — and then the clients are placed
+    // first, exactly as they are today, with the daemon taking quiet CPUs they
+    // did not claim, which in that domain are their SMT siblings.
+    //
+    // The fallback is NOT a neutral choice, which is why the private attempt now
+    // comes first: bd-svhrq measured the serial dispatcher failing its OWN A/A
+    // null in 4 of 4 runs taken under the sibling-sharing placement, at 4 and 8
+    // daemon CPUs, at both scopes, and worse at 48 pairs than at 24. Host-wide
+    // scope on a 32-core box can seat 8 clients and 8 daemon CPUs on distinct
+    // physical cores; refusing to even try meant no wide-cpuset run could be
+    // admitted. Either way the placement is reported, so a row can never be read
+    // as if the two placements were interchangeable.
     let (fuse_cpus, fuse_guard_cpus, driver_cpus, driver_guard_cpus, fuse_cpu_isolation) =
         if fuse_cpu_count == 1 {
             let (fuse_cpus, fuse_guard_cpus) = select_fuse_cpus(
@@ -4127,6 +4135,28 @@ fn select_cpu_placement(
                 fuse_guard_cpus,
                 driver_cpus,
                 driver_guard_cpus,
+                "private_physical_core_clients_placed_after",
+            )
+        } else if let Some((fuse_cpus, fuse_guard_cpus, driver_cpus, guarded)) =
+            place_daemon_on_private_cores(
+                fuse_cpu_count,
+                client_threads,
+                driver_cpu,
+                &driver_guard_cpus,
+                &PrivateCorePlacementContext {
+                    scope,
+                    ranked: &ranked,
+                    busy: &busy,
+                    driver_domain,
+                    allowed_cpus,
+                },
+            )?
+        {
+            (
+                fuse_cpus,
+                fuse_guard_cpus,
+                driver_cpus,
+                guarded,
                 "private_physical_core_clients_placed_after",
             )
         } else {
@@ -4258,6 +4288,114 @@ fn select_multi_fuse_cpus(
     }
     chosen.sort_unstable();
     Ok((chosen, guards))
+}
+
+/// Everything `place_daemon_on_private_cores` needs that it does not own.
+struct PrivateCorePlacementContext<'a> {
+    scope: PlacementScope,
+    ranked: &'a [(usize, f64)],
+    busy: &'a BTreeMap<usize, f64>,
+    driver_domain: &'a BTreeSet<usize>,
+    allowed_cpus: &'a BTreeSet<usize>,
+}
+
+/// Try the one-daemon-CPU placement order for a multi-CPU daemon: the daemon
+/// claims private physical cores first, then the clients fill in around the
+/// guarded sibling set.
+///
+/// Returns `Ok(None)` — not an error — when the domain cannot supply that many
+/// private cores, or when the clients then do not fit. Both are ordinary
+/// outcomes inside one last-level-cache domain, and the caller falls back to the
+/// clients-first placement rather than failing the run.
+fn place_daemon_on_private_cores(
+    fuse_cpu_count: usize,
+    client_threads: usize,
+    driver_cpu: usize,
+    driver_guard_cpus: &BTreeSet<usize>,
+    context: &PrivateCorePlacementContext<'_>,
+) -> Result<Option<(Vec<usize>, BTreeSet<usize>, Vec<usize>, BTreeSet<usize>)>> {
+    let mut siblings = BTreeMap::new();
+    for &(cpu, _) in context.ranked {
+        if context.driver_domain.contains(&cpu) {
+            siblings.insert(
+                cpu,
+                thread_siblings(cpu)?
+                    .intersection(context.allowed_cpus)
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+            );
+        }
+    }
+    let Some((fuse_cpus, fuse_guard_cpus)) = select_private_core_cpus(
+        fuse_cpu_count,
+        context.ranked,
+        context.driver_domain,
+        driver_guard_cpus,
+        &siblings,
+    ) else {
+        return Ok(None);
+    };
+    let driver_context = DriverPlacementContext {
+        scope: context.scope,
+        ranked: context.ranked,
+        busy: context.busy,
+        driver_domain: context.driver_domain,
+        fuse_guard_cpus: &fuse_guard_cpus,
+    };
+    // The clients not fitting around a private daemon is a reason to fall back,
+    // not a reason to fail: the clients-first placement may still seat them.
+    let Ok((driver_cpus, guarded)) = select_driver_cpus(
+        client_threads,
+        driver_cpu,
+        driver_guard_cpus.clone(),
+        &driver_context,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((fuse_cpus, fuse_guard_cpus, driver_cpus, guarded)))
+}
+
+/// Pick `count` quiet CPUs on pairwise-distinct physical cores, avoiding every
+/// CPU the driver thread already guards.
+///
+/// Pure so it can be tested without sysfs: `siblings` maps a CPU to its SMT
+/// sibling set. `None` means the domain has no such placement — the caller must
+/// treat that as "fall back", never as "good enough", because a daemon sharing a
+/// physical core with the clients it serves is exactly the configuration whose
+/// A/A null bd-svhrq found unstable.
+fn select_private_core_cpus(
+    count: usize,
+    ranked: &[(usize, f64)],
+    domain: &BTreeSet<usize>,
+    reserved: &BTreeSet<usize>,
+    siblings: &BTreeMap<usize, BTreeSet<usize>>,
+) -> Option<(Vec<usize>, BTreeSet<usize>)> {
+    let mut chosen = Vec::with_capacity(count);
+    let mut guards = BTreeSet::new();
+    for &(cpu, load) in ranked {
+        if chosen.len() == count {
+            break;
+        }
+        if !domain.contains(&cpu)
+            || reserved.contains(&cpu)
+            || guards.contains(&cpu)
+            || load > MAX_FUSE_PREFLIGHT_BUSY
+        {
+            continue;
+        }
+        let core = siblings.get(&cpu)?;
+        // A core is only private if NONE of its threads is spoken for.
+        if core.iter().any(|sibling| reserved.contains(sibling)) {
+            continue;
+        }
+        guards.extend(core.iter().copied());
+        chosen.push(cpu);
+    }
+    if chosen.len() < count {
+        return None;
+    }
+    chosen.sort_unstable();
+    Some((chosen, guards))
 }
 
 fn select_driver_cpus(
@@ -6225,6 +6363,91 @@ mod tests {
         let mut blank_candidate = base;
         blank_candidate.candidate_builder = "   ".to_owned();
         assert!(validate_config(&blank_candidate).is_err());
+    }
+
+    /// Eight physical cores, two SMT threads each: cpu N pairs with cpu N + 8.
+    fn smt_pairs(cores: usize) -> BTreeMap<usize, BTreeSet<usize>> {
+        (0..cores * 2)
+            .map(|cpu| {
+                let core = cpu % cores;
+                (cpu, BTreeSet::from([core, core + cores]))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn private_core_selection_never_puts_two_daemon_cpus_on_one_physical_core() {
+        let siblings = smt_pairs(8);
+        let domain: BTreeSet<usize> = (0..16).collect();
+        let ranked: Vec<(usize, f64)> = (0..16).map(|cpu| (cpu, 0.0)).collect();
+
+        let (chosen, guards) =
+            select_private_core_cpus(4, &ranked, &domain, &BTreeSet::new(), &siblings)
+                .expect("8 free cores can seat 4 private daemon CPUs");
+        assert_eq!(chosen.len(), 4);
+        let cores: BTreeSet<usize> = chosen.iter().map(|cpu| cpu % 8).collect();
+        assert_eq!(
+            cores.len(),
+            4,
+            "each daemon CPU needs its own physical core"
+        );
+        for &cpu in &chosen {
+            assert!(
+                guards.contains(&(cpu % 8)) && guards.contains(&(cpu % 8 + 8)),
+                "both SMT threads of a claimed core must be guarded"
+            );
+        }
+    }
+
+    #[test]
+    fn private_core_selection_declines_rather_than_sharing_a_core_with_the_driver() {
+        let siblings = smt_pairs(8);
+        let domain: BTreeSet<usize> = (0..16).collect();
+        let ranked: Vec<(usize, f64)> = (0..16).map(|cpu| (cpu, 0.0)).collect();
+
+        // The driver guards one whole core; its sibling must not be handed out
+        // even though that sibling is itself unreserved.
+        let reserved = BTreeSet::from([0, 8]);
+        let (chosen, _) = select_private_core_cpus(7, &ranked, &domain, &reserved, &siblings)
+            .expect("the other 7 cores are still free");
+        assert!(
+            !chosen.contains(&0) && !chosen.contains(&8),
+            "the driver's core is off limits on both threads"
+        );
+
+        // Asking for more private cores than exist declines instead of doubling
+        // up — the caller falls back to the clients-first placement.
+        assert!(
+            select_private_core_cpus(8, &ranked, &domain, &reserved, &siblings).is_none(),
+            "7 free cores cannot seat 8 private daemon CPUs"
+        );
+    }
+
+    #[test]
+    fn private_core_selection_skips_busy_cpus_and_cpus_outside_the_domain() {
+        let siblings = smt_pairs(8);
+        // Only half the machine is in the placement domain.
+        let domain: BTreeSet<usize> = (0..4).chain(8..12).collect();
+        let mut ranked: Vec<(usize, f64)> = (0..16).map(|cpu| (cpu, 0.0)).collect();
+        ranked[1].1 = MAX_FUSE_PREFLIGHT_BUSY + 0.1;
+        ranked[9].1 = MAX_FUSE_PREFLIGHT_BUSY + 0.1;
+
+        let (chosen, _) =
+            select_private_core_cpus(3, &ranked, &domain, &BTreeSet::new(), &siblings)
+                .expect("cores 0, 2 and 3 remain");
+        assert!(
+            chosen.iter().all(|cpu| domain.contains(cpu)),
+            "no CPU outside the domain may be chosen"
+        );
+        assert!(
+            !chosen.contains(&1),
+            "a CPU over the daemon contention limit is not quiet enough to choose"
+        );
+        // Core 1 is busy on cpu1 but its sibling cpu9 is also busy, so only
+        // three private cores are actually available in this domain.
+        assert!(
+            select_private_core_cpus(4, &ranked, &domain, &BTreeSet::new(), &siblings).is_none()
+        );
     }
 
     #[test]
