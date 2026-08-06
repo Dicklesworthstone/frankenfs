@@ -175,8 +175,8 @@ grep -E "^\s+(BTRFS_IOC_|EXT4_IOC_|FS_IOC_|FI)" crates/ffs-fuse/src/lib.rs | gre
 # Result: 84
 
 # btrfs functions in ffs-core
-grep -c "fn btrfs_" crates/ffs-core/src/lib.rs
-# Result: 371
+rg -n "fn btrfs_" crates/ffs-core/src/lib.rs crates/ffs-core/src/fs_ops.rs | wc -l
+# Result: 568
 
 # FEATURE_PARITY.md coverage
 grep "97.*97" FEATURE_PARITY.md

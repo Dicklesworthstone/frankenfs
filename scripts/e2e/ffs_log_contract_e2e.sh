@@ -55,6 +55,10 @@ RCH_ARTIFACT_RETRIEVAL_GRACE_SECS="${RCH_ARTIFACT_RETRIEVAL_GRACE_SECS:-8}"
 RCH_CAPTURE_VISIBILITY="${FFS_LOG_CONTRACT_RCH_VISIBILITY:-${RCH_VISIBILITY:-summary}}"
 SELF_CHECK="${FFS_LOG_CONTRACT_SELF_CHECK:-0}"
 SKIP_SELF_CHECK="${FFS_LOG_CONTRACT_SKIP_SELF_CHECK:-0}"
+CORE_SRC_FILES=(
+    crates/ffs-core/src/lib.rs
+    crates/ffs-core/src/fs_ops.rs
+)
 LOG_ROOT="${REPO_ROOT}/artifacts/e2e"
 mkdir -p "$LOG_ROOT"
 LOG_DIR="$(mktemp -d "$LOG_ROOT/$(date +%Y%m%d_%H%M%S)_ffs_log_contract_XXXXXX")"
@@ -253,21 +257,21 @@ echo "=== Scenario: log_contract_field_coverage ==="
 MISSING_FIELDS=""
 
 # Check that ffs-core uses operation_id in btrfs RW path
-if grep -rq 'operation_id' crates/ffs-core/src/lib.rs; then
+if grep -q 'operation_id' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_FIELDS="${MISSING_FIELDS}ffs-core:operation_id "
 fi
 
 # Check that ffs-core uses scenario_id
-if grep -rq 'scenario_id' crates/ffs-core/src/lib.rs; then
+if grep -q 'scenario_id' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_FIELDS="${MISSING_FIELDS}ffs-core:scenario_id "
 fi
 
 # Check that ffs-core uses outcome field
-if grep -rq 'outcome' crates/ffs-core/src/lib.rs; then
+if grep -q 'outcome' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_FIELDS="${MISSING_FIELDS}ffs-core:outcome "
@@ -292,7 +296,7 @@ echo "=== Scenario: log_contract_outcome_vocabulary ==="
 # Check that outcome values in ffs-core match the canonical vocabulary
 # (start, applied, rejected, completed, failed, skipped)
 UNKNOWN_OUTCOMES=""
-for outcome_val in $(grep -oP 'outcome\s*=\s*"([^"]*)"' crates/ffs-core/src/lib.rs 2>/dev/null | sed 's/.*"\(.*\)"/\1/' | sort -u); do
+for outcome_val in $(grep -h -oP 'outcome\s*=\s*"([^"]*)"' "${CORE_SRC_FILES[@]}" 2>/dev/null | sed 's/.*"\(.*\)"/\1/' | sort -u); do
     case "$outcome_val" in
         start|applied|rejected|completed|failed|skipped|runtime_mode_selected|runtime_mode_rejected|runtime_mode_completed)
             # Known values (including legacy CLI mount values)
@@ -398,7 +402,7 @@ fi
 
 echo "=== Scenario: log_contract_duration_convention ==="
 # Check that ffs-core uses duration_us (not duration_ms) for the canonical field
-if grep -rq 'duration_us' crates/ffs-core/src/lib.rs; then
+if grep -q 'duration_us' "${CORE_SRC_FILES[@]}"; then
     log_scenario "log_contract_duration_convention" "PASS"
 else
     log_scenario "log_contract_duration_convention" "PASS" "note: duration_us_not_found_in_ffs_core"
@@ -420,37 +424,37 @@ fi
 echo "=== Scenario: log_contract_sync_flush_fields ==="
 MISSING_SYNC_FIELDS=""
 
-if grep -q 'EXT4_RW_SCENARIO_FLUSH' crates/ffs-core/src/lib.rs; then
+if grep -q 'EXT4_RW_SCENARIO_FLUSH' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_SYNC_FIELDS="${MISSING_SYNC_FIELDS}ext4_flush_scenario "
 fi
 
-if grep -q 'EXT4_RW_SCENARIO_FSYNC' crates/ffs-core/src/lib.rs; then
+if grep -q 'EXT4_RW_SCENARIO_FSYNC' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_SYNC_FIELDS="${MISSING_SYNC_FIELDS}ext4_fsync_scenario "
 fi
 
-if grep -q 'EXT4_RW_SCENARIO_FSYNCDIR' crates/ffs-core/src/lib.rs; then
+if grep -q 'EXT4_RW_SCENARIO_FSYNCDIR' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_SYNC_FIELDS="${MISSING_SYNC_FIELDS}ext4_fsyncdir_scenario "
 fi
 
-if grep -q 'BTRFS_RW_SCENARIO_FLUSH' crates/ffs-core/src/lib.rs; then
+if grep -q 'BTRFS_RW_SCENARIO_FLUSH' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_SYNC_FIELDS="${MISSING_SYNC_FIELDS}btrfs_flush_scenario "
 fi
 
-if grep -q 'durability_boundary' crates/ffs-core/src/lib.rs; then
+if grep -q 'durability_boundary' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_SYNC_FIELDS="${MISSING_SYNC_FIELDS}durability_boundary_field "
 fi
 
-if grep -q 'error_class' crates/ffs-core/src/lib.rs; then
+if grep -q 'error_class' "${CORE_SRC_FILES[@]}"; then
     :
 else
     MISSING_SYNC_FIELDS="${MISSING_SYNC_FIELDS}error_class_field "
