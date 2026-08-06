@@ -580,15 +580,14 @@ fn order_levels_digest(order: &[(u64, u8)]) -> u64 {
 /// Faithful to `execute`'s old path: build the block order once, then read each
 /// node's level via a per-node `node_level` probe folded inline (no re-collect).
 fn digest_order_then_relookup(dag: &WriteDependencyDag) -> u64 {
-    dag.reverse_topological_order().into_iter().fold(
-        0xcbf2_9ce4_8422_2325_u64,
-        |acc, block| {
+    dag.reverse_topological_order()
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |acc, block| {
             let level = dag.node_level(block).unwrap_or(0);
             acc.wrapping_mul(0x100_0000_01b3)
                 .wrapping_add(block)
                 .wrapping_add(u64::from(level))
-        },
-    )
+        })
 }
 
 /// Faithful to `execute`'s new path: the level rides along from the postorder
@@ -682,14 +681,13 @@ fn flush_loop_mark(dag: &mut WriteDependencyDag) -> u64 {
 /// execute-style flush loop with the durability bookkeeping skipped (matches
 /// production after this change, crash tracking off).
 fn flush_loop_no_mark(dag: &WriteDependencyDag) -> u64 {
-    dag.reverse_topological_order_with_levels().into_iter().fold(
-        0xcbf2_9ce4_8422_2325_u64,
-        |acc, (block, level)| {
+    dag.reverse_topological_order_with_levels()
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |acc, (block, level)| {
             acc.wrapping_mul(0x100_0000_01b3)
                 .wrapping_add(block)
                 .wrapping_add(u64::from(level))
-        },
-    )
+        })
 }
 
 fn bench_writeback_execute_durability(c: &mut Criterion) {

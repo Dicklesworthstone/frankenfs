@@ -2974,6 +2974,20 @@ pub enum BtrfsMutationError {
     NoSpace,
     BrokenInvariant(&'static str),
     AddressOverflow,
+    /// A node's items do not fit its on-disk size.
+    ///
+    /// Carries the tree `owner` and the arithmetic because the single most
+    /// expensive thing about this failure is not knowing WHICH tree overflowed
+    /// (bd-cjqhh sat undiagnosed behind a bare "node overflow: data"). `needed`
+    /// is the serialized size the items require, `capacity` what the node has.
+    NodeOverflow {
+        owner: u64,
+        level: u8,
+        nritems: usize,
+        needed: usize,
+        capacity: usize,
+        largest_item: usize,
+    },
 }
 
 impl std::fmt::Display for BtrfsMutationError {
@@ -2987,6 +3001,18 @@ impl std::fmt::Display for BtrfsMutationError {
             Self::NoSpace => write!(f, "no space left in matching block groups"),
             Self::BrokenInvariant(msg) => write!(f, "broken invariant: {msg}"),
             Self::AddressOverflow => write!(f, "address overflow"),
+            Self::NodeOverflow {
+                owner,
+                level,
+                nritems,
+                needed,
+                capacity,
+                largest_item,
+            } => write!(
+                f,
+                "node overflow: tree owner {owner} level {level} has {nritems} items needing \
+                 {needed} bytes in a {capacity}-byte node (largest item {largest_item} bytes)"
+            ),
         }
     }
 }
@@ -3097,6 +3123,55 @@ pub struct BtrfsNodeSerializeParams {
     pub child_min_keys: Vec<BtrfsKey>,
 }
 
+/// The `NodeOverflow` a leaf's items justify, with the arithmetic filled in.
+///
+/// Split out of `serialize` so the diagnostic can be detailed without pushing
+/// that function past its line budget.
+fn leaf_overflow_error(items: &[BtrfsTreeItem], owner: u64, nodesize: usize) -> BtrfsMutationError {
+    BtrfsMutationError::NodeOverflow {
+        owner,
+        level: 0,
+        nritems: items.len(),
+        needed: items
+            .iter()
+            .map(|it| BTRFS_ITEM_SIZE + it.data.len())
+            .sum::<usize>()
+            .saturating_add(BTRFS_HEADER_SIZE),
+        capacity: nodesize,
+        largest_item: items.iter().map(|it| it.data.len()).max().unwrap_or(0),
+    }
+}
+
+/// Write the fixed btrfs node-header fields into `buf`.
+///
+/// The checksum at `0..32` is deliberately left alone — it is computed last,
+/// over the finished node.
+fn write_node_header_fields(buf: &mut [u8], params: &BtrfsNodeSerializeParams) {
+    buf[0x20..0x30].copy_from_slice(&params.fsid);
+    buf[0x30..0x38].copy_from_slice(&params.bytenr.to_le_bytes());
+    buf[0x38..0x40].copy_from_slice(&params.flags.to_le_bytes());
+    buf[0x40..0x50].copy_from_slice(&params.chunk_tree_uuid);
+    buf[0x50..0x58].copy_from_slice(&params.generation.to_le_bytes());
+    buf[0x58..0x60].copy_from_slice(&params.owner.to_le_bytes());
+}
+
+/// The `NodeOverflow` an internal node's key-pointers justify.
+fn internal_overflow_error(
+    children: usize,
+    owner: u64,
+    level: u8,
+    nodesize: usize,
+) -> BtrfsMutationError {
+    BtrfsMutationError::NodeOverflow {
+        owner,
+        level,
+        nritems: children,
+        needed: BTRFS_HEADER_SIZE.saturating_add(children.saturating_mul(BTRFS_KEY_PTR_SIZE)),
+        capacity: nodesize,
+        largest_item: BTRFS_KEY_PTR_SIZE,
+    }
+}
+
 impl BtrfsCowNode {
     /// Serialize this node to on-disk btrfs format.
     ///
@@ -3113,20 +3188,7 @@ impl BtrfsCowNode {
         }
 
         let mut buf = vec![0u8; nodesize];
-
-        // Write header fields (skip checksum at 0..32, computed last)
-        // fsid at 0x20
-        buf[0x20..0x30].copy_from_slice(&params.fsid);
-        // bytenr at 0x30
-        buf[0x30..0x38].copy_from_slice(&params.bytenr.to_le_bytes());
-        // flags at 0x38
-        buf[0x38..0x40].copy_from_slice(&params.flags.to_le_bytes());
-        // chunk_tree_uuid at 0x40
-        buf[0x40..0x50].copy_from_slice(&params.chunk_tree_uuid);
-        // generation at 0x50
-        buf[0x50..0x58].copy_from_slice(&params.generation.to_le_bytes());
-        // owner at 0x58
-        buf[0x58..0x60].copy_from_slice(&params.owner.to_le_bytes());
+        write_node_header_fields(&mut buf, params);
 
         match self {
             Self::Leaf { items } => {
@@ -3141,16 +3203,18 @@ impl BtrfsCowNode {
                 let mut item_offset = BTRFS_HEADER_SIZE;
                 let mut data_end = nodesize;
 
+                let overflow = || leaf_overflow_error(items, params.owner, nodesize);
+
                 for item in items {
                     // Check space for item descriptor
                     if item_offset + BTRFS_ITEM_SIZE > data_end {
-                        return Err(BtrfsMutationError::InvalidConfig("node overflow: items"));
+                        return Err(overflow());
                     }
                     // Check space for item data
                     let data_size = item.data.len();
                     if data_end < data_size || data_end - data_size < item_offset + BTRFS_ITEM_SIZE
                     {
-                        return Err(BtrfsMutationError::InvalidConfig("node overflow: data"));
+                        return Err(overflow());
                     }
 
                     // Write item data from tail
@@ -3199,7 +3263,12 @@ impl BtrfsCowNode {
                 let mut kp_offset = BTRFS_HEADER_SIZE;
                 for (i, child_ptr) in children.iter().enumerate() {
                     if kp_offset + BTRFS_KEY_PTR_SIZE > nodesize {
-                        return Err(BtrfsMutationError::InvalidConfig("node overflow: key-ptrs"));
+                        return Err(internal_overflow_error(
+                            children.len(),
+                            params.owner,
+                            params.level,
+                            nodesize,
+                        ));
                     }
 
                     // key (17 bytes): btrfs requires key_ptr[i].key to be the
@@ -3719,19 +3788,36 @@ impl InMemoryCowBtrfsTree {
             let is_exact = items
                 .get(idx)
                 .is_some_and(|e| key_cmp(&e.key, &entry.key) == Ordering::Equal);
-            // Mirror `leaf_exceeds_capacity` for items + the new entry, without
-            // mutating: a replace (is_exact) never grows, so it never splits.
-            let new_len = items.len().saturating_add(1);
-            let would_split = if is_exact || new_len <= 1 {
+            // Mirror `leaf_exceeds_capacity` for the post-mutation leaf, without
+            // mutating. A replace does NOT add an item, but it DOES change the
+            // byte total by the difference between the old and new payloads —
+            // item data is variable-length, so a replace can grow the leaf past
+            // the node budget (bd-cjqhh). Treating `is_exact` as "never splits"
+            // is what let an unserializable leaf reach writeback.
+            let new_len = if is_exact {
+                items.len()
+            } else {
+                items.len().saturating_add(1)
+            };
+            let new_bytes = {
+                let current = Self::leaf_serialized_bytes(items);
+                if is_exact {
+                    let old_data = items.get(idx).map_or(0, |e| e.data.len());
+                    current
+                        .saturating_sub(old_data)
+                        .saturating_add(entry.data.len())
+                } else {
+                    current.saturating_add(BTRFS_ITEM_SIZE + entry.data.len())
+                }
+            };
+            let would_split = if new_len <= 1 {
                 false
             } else if new_len > self.max_items {
                 true
             } else if self.leaf_byte_budget == usize::MAX {
                 false
             } else {
-                Self::leaf_serialized_bytes(items)
-                    .saturating_add(BTRFS_ITEM_SIZE + entry.data.len())
-                    > self.leaf_byte_budget
+                new_bytes > self.leaf_byte_budget
             };
             (idx, is_exact, would_split)
         };
@@ -4239,6 +4325,18 @@ impl InMemoryCowBtrfsTree {
         items.iter().map(|it| BTRFS_ITEM_SIZE + it.data.len()).sum()
     }
 
+    /// Whether a leaf is well-filled by BYTES, the dual of `min_items`.
+    ///
+    /// `min_items` is `max_items / 2`, so the byte analogue is half the leaf byte
+    /// budget. Always false when no budget is configured, which keeps the pure
+    /// item-count invariant intact for every tree that does not use one.
+    fn leaf_is_byte_full(&self, items: &[BtrfsTreeItem]) -> bool {
+        if self.leaf_byte_budget == usize::MAX {
+            return false;
+        }
+        Self::leaf_serialized_bytes(items).saturating_mul(2) >= self.leaf_byte_budget
+    }
+
     fn leaf_exceeds_capacity(&self, items: &[BtrfsTreeItem]) -> bool {
         if items.len() <= 1 {
             return false;
@@ -4433,17 +4531,22 @@ impl InMemoryCowBtrfsTree {
                     offset = entry.key.offset,
                     "btrfs_cow_update_leaf"
                 );
+                // A replace CAN grow the leaf: item payloads are variable-length,
+                // so writing longer data over a shorter item adds bytes exactly
+                // like an insert does. Falling through to the shared
+                // capacity-and-split tail below is what makes that safe. Taking
+                // an early `split: None` return here — on the false premise that
+                // "a replace never grows" — is bd-cjqhh: the oversized leaf lived
+                // in memory until writeback refused to serialize it, surfacing as
+                // EINVAL on fsync and, worse, as a failed flush on unmount, so
+                // the data was never persisted at all.
                 existing.data = entry.data;
-                let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
-                return Ok(InsertResult {
-                    node_id: new_id,
-                    split: None,
-                });
+            } else {
+                return Err(BtrfsMutationError::KeyAlreadyExists);
             }
-            return Err(BtrfsMutationError::KeyAlreadyExists);
+        } else {
+            items.insert(idx, entry);
         }
-
-        items.insert(idx, entry);
         // Split when the leaf exceeds EITHER the item-count cap OR the serialized
         // byte budget (bd-6uyto). The byte check is what keeps a leaf of larger
         // items (INODE_ITEM, inline EXTENT_DATA, long DIR names) from overflowing
@@ -4775,7 +4878,7 @@ impl InMemoryCowBtrfsTree {
         }
 
         let child_keys = self.node_key_count(children[child_idx])?;
-        if child_keys >= self.min_items {
+        if child_keys >= self.min_items || self.node_is_byte_full(children[child_idx])? {
             return Ok(false);
         }
 
@@ -4844,7 +4947,7 @@ impl InMemoryCowBtrfsTree {
             }
         }
 
-        if child_idx > 0 {
+        if child_idx > 0 && self.merged_leaf_fits(children[child_idx - 1], children[child_idx])? {
             let old_left = children[child_idx - 1];
             let old_child = children[child_idx];
             let merged = self.merge_adjacent_nodes(children[child_idx - 1], children[child_idx])?;
@@ -4856,7 +4959,9 @@ impl InMemoryCowBtrfsTree {
             self.retire_node(old_left);
             self.retire_node(old_child);
             debug!(merged_child = child_idx - 1, "btrfs_cow_delete_merge_left");
-        } else {
+        } else if child_idx + 1 < children.len()
+            && self.merged_leaf_fits(children[child_idx], children[child_idx + 1])?
+        {
             let old_child = children[child_idx];
             let old_right = children[child_idx + 1];
             let merged = self.merge_adjacent_nodes(children[child_idx], children[child_idx + 1])?;
@@ -4869,8 +4974,48 @@ impl InMemoryCowBtrfsTree {
             self.retire_node(old_child);
             self.retire_node(old_right);
             debug!(merged_child = child_idx, "btrfs_cow_delete_merge_right");
+        } else {
+            // Neither neighbour can absorb this child without overflowing a node
+            // (bd-cjqhh). Leaving it item-sparse is the correct outcome: btrfs
+            // itself enforces no minimum leaf fill, and an under-filled leaf is
+            // merely wasteful, whereas an over-full one cannot be serialized at
+            // all and fails the whole transaction — taking the durable commit,
+            // and the unmount flush behind it, down with it.
+            debug!(
+                child_idx,
+                child_keys, "btrfs_cow_delete_merge_declined_byte_budget"
+            );
+            return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Whether merging two adjacent leaves would still fit the byte budget.
+    ///
+    /// Always true without a budget (the pure item-count model is unchanged) and
+    /// for internal nodes, whose key-pointers are fixed-size and already bounded
+    /// by `max_items`.
+    fn merged_leaf_fits(&self, left_id: u64, right_id: u64) -> Result<bool, BtrfsMutationError> {
+        if self.leaf_byte_budget == usize::MAX {
+            return Ok(true);
+        }
+        match (self.node_ref(left_id)?, self.node_ref(right_id)?) {
+            (BtrfsCowNode::Leaf { items: left }, BtrfsCowNode::Leaf { items: right }) => {
+                let combined = Self::leaf_serialized_bytes(left)
+                    .saturating_add(Self::leaf_serialized_bytes(right));
+                Ok(combined <= self.leaf_byte_budget)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    /// Whether a node is well-filled by BYTES, so item-count underflow does not
+    /// apply to it. Internal nodes are never byte-full (they are count-bounded).
+    fn node_is_byte_full(&self, node_id: u64) -> Result<bool, BtrfsMutationError> {
+        match self.node_ref(node_id)? {
+            BtrfsCowNode::Leaf { items } => Ok(self.leaf_is_byte_full(items)),
+            BtrfsCowNode::Internal { .. } => Ok(false),
+        }
     }
 
     fn delete_from(
@@ -5064,7 +5209,17 @@ impl InMemoryCowBtrfsTree {
     ) -> Result<(), BtrfsMutationError> {
         match self.node_ref(node_id)? {
             BtrfsCowNode::Leaf { items } => {
-                if !is_root && items.len() < self.min_items {
+                // Minimum leaf FILL is not an invariant of a byte-budgeted tree,
+                // and btrfs itself enforces no such minimum. Once leaves split on
+                // serialized bytes (bd-6uyto), a leaf holding a few large items
+                // is both full and item-sparse; and once a merge may be declined
+                // because the combined leaf would overflow a node (bd-cjqhh), a
+                // leaf can stay item-sparse indefinitely. Enforcing `min_items`
+                // there would reject correct trees. Trees with no byte budget
+                // keep the strict count invariant unchanged.
+                let count_underflow =
+                    self.leaf_byte_budget == usize::MAX && !is_root && items.len() < self.min_items;
+                if count_underflow {
                     return Err(BtrfsMutationError::BrokenInvariant(
                         "non-root leaf underflow",
                     ));
@@ -11759,6 +11914,202 @@ mod tests {
         finite_budget
             .validate_invariants()
             .expect("finite invariants");
+    }
+
+    /// Every node of `tree` must fit a real `nodesize`-byte btrfs node.
+    ///
+    /// This is the check the durable-commit path performs, reproduced without a
+    /// mount: an in-memory leaf that outgrew its budget is structurally fine to
+    /// the tree's own invariants and is only rejected here, at serialization.
+    fn assert_every_node_serializes(tree: &InMemoryCowBtrfsTree, nodesize: u32) {
+        use crate::writeback::WriteDependencyDag;
+        let dag = WriteDependencyDag::from_cow_tree(tree, 7).expect("writeback dag");
+        for (block, level) in dag.blocks_with_levels() {
+            let node = tree.node_snapshot(block).expect("node snapshot");
+            let children = match &node {
+                BtrfsCowNode::Leaf { .. } => Vec::new(),
+                BtrfsCowNode::Internal { children, .. } => children.clone(),
+            };
+            let params = BtrfsNodeSerializeParams {
+                fsid: [0x11; 16],
+                chunk_tree_uuid: [0x22; 16],
+                bytenr: 0x10_000 + block * u64::from(nodesize),
+                flags: 0,
+                generation: 7,
+                owner: BTRFS_FS_TREE_OBJECTID,
+                nodesize,
+                level,
+                child_generations: vec![7; children.len()],
+                child_bytenrs: children.clone(),
+                child_min_keys: Vec::new(),
+            };
+            let buf = node.serialize(&params).unwrap_or_else(|e| {
+                panic!("node {block} at level {level} does not fit a {nodesize}-byte node: {e}")
+            });
+            assert_eq!(buf.len(), nodesize as usize);
+        }
+    }
+
+    /// bd-cjqhh: a replace that GROWS an item must split the leaf.
+    ///
+    /// Item payloads are variable-length, so writing longer data over a shorter
+    /// item adds bytes exactly like an insert. The replace branch used to return
+    /// `split: None` unconditionally, on the premise that a replace never grows,
+    /// so the oversized leaf survived in memory until writeback refused to
+    /// serialize it — EINVAL on fsync, and a failed flush on unmount that meant
+    /// the data was never persisted at all.
+    #[test]
+    fn growing_replace_splits_the_leaf_bd_cjqhh() {
+        const NODESIZE: u32 = 16_384;
+        let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
+        let mut tree = InMemoryCowBtrfsTree::new(64)
+            .expect("tree")
+            .with_leaf_byte_budget(budget);
+
+        for i in 0..8_u64 {
+            tree.insert(test_key(i), b"seed").expect("seed insert");
+        }
+        assert_eq!(tree.root_level(), 0, "the seed items fit in one leaf");
+
+        // 8 x (25 + 3000) = 24,200 bytes against a 16,283-byte budget: the leaf
+        // cannot hold these and the tree must grow a level instead.
+        let grown = vec![0xCD_u8; 3000];
+        for i in 0..8_u64 {
+            tree.update(&test_key(i), &grown).expect("growing replace");
+        }
+
+        assert!(
+            tree.root_level() > 0,
+            "a leaf grown past its byte budget by replaces must split, not overflow"
+        );
+        tree.validate_invariants().expect("invariants after growth");
+        assert_every_node_serializes(&tree, NODESIZE);
+
+        for i in 0..8_u64 {
+            assert_eq!(
+                tree.find(&test_key(i)).expect("find grown item"),
+                Some(grown.clone()),
+                "every grown value must survive the split"
+            );
+        }
+    }
+
+    /// The same defect reached through the staged single-leaf fast path, which
+    /// carried its own copy of the "a replace never grows" premise.
+    #[test]
+    fn growing_replace_on_the_staged_root_leaf_splits_bd_cjqhh() {
+        const NODESIZE: u32 = 16_384;
+        let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
+        let mut tree = InMemoryCowBtrfsTree::new(64)
+            .expect("tree")
+            .with_leaf_byte_budget(budget);
+
+        // Two rounds so the second one mutates a leaf the tree itself staged.
+        for i in 0..6_u64 {
+            tree.insert(test_key(i), b"x").expect("seed insert");
+        }
+        let grown = vec![0xAB_u8; 4000];
+        for i in 0..6_u64 {
+            tree.update(&test_key(i), &grown).expect("growing replace");
+        }
+
+        assert!(tree.root_level() > 0, "staged-leaf replace must also split");
+        tree.validate_invariants().expect("invariants");
+        assert_every_node_serializes(&tree, NODESIZE);
+    }
+
+    /// bd-cjqhh, the half that actually fires in production: deleting from a
+    /// byte-budgeted tree must not MERGE two leaves into an unserializable one.
+    ///
+    /// Leaves holding few large items (the csum tree's `EXTENT_CSUM` items are
+    /// ~1 KiB and up) are permanently below `min_items`, so every delete looked
+    /// like an underflow and rebalancing merged neighbours on item count alone.
+    /// Overwriting a file frees its old extents, which deletes their checksums —
+    /// so the mounted 64 MiB bulk-durable job merged two byte-full csum leaves
+    /// into a 17,833-byte leaf and the commit could no longer serialize it:
+    /// EINVAL on fsync, and the same failure on the unmount flush behind it.
+    #[test]
+    fn delete_does_not_merge_leaves_past_the_byte_budget_bd_cjqhh() {
+        const NODESIZE: u32 = 16_384;
+        let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
+        let mut tree = InMemoryCowBtrfsTree::new(64)
+            .expect("tree")
+            .with_leaf_byte_budget(budget);
+
+        // 40 x (25 + 800) = 33,000 bytes over a 16,283-byte budget: the tree
+        // splits into byte-full leaves that each hold ~20 items, permanently
+        // under min_items = 32.
+        let item = vec![0x7E_u8; 800];
+        for i in 0..40_u64 {
+            tree.insert(test_key(i), &item).expect("insert");
+        }
+        assert!(tree.root_level() > 0, "the items must span several leaves");
+        assert_every_node_serializes(&tree, NODESIZE);
+
+        // Every one of these deletes leaves its leaf below min_items, which is
+        // exactly what used to trigger a merge.
+        for i in (0..40_u64).step_by(3) {
+            tree.delete(&test_key(i)).expect("delete");
+            tree.validate_invariants()
+                .expect("invariants during deletes");
+            assert_every_node_serializes(&tree, NODESIZE);
+        }
+
+        // Survivors are intact and still reachable.
+        for i in 0..40_u64 {
+            let found = tree.find(&test_key(i)).expect("find");
+            if i % 3 == 0 {
+                assert!(found.is_none(), "deleted key {i} must be gone");
+            } else {
+                assert_eq!(found, Some(item.clone()), "key {i} must survive");
+            }
+        }
+    }
+
+    /// Without a byte budget the pure item-count rebalance is unchanged — the
+    /// fix must not stop ordinary trees from merging.
+    #[test]
+    fn delete_still_merges_when_no_byte_budget_is_configured_bd_cjqhh() {
+        let mut tree = InMemoryCowBtrfsTree::new(4).expect("tree");
+        for i in 0..12_u64 {
+            tree.insert(test_key(i), b"v").expect("insert");
+        }
+        let level_before = tree.root_level();
+        assert!(level_before > 0, "12 items must span several leaves");
+        for i in 0..9_u64 {
+            tree.delete(&test_key(i)).expect("delete");
+        }
+        tree.validate_invariants().expect("invariants");
+        assert!(
+            tree.root_level() < level_before,
+            "an unbudgeted tree must still collapse via merges on delete"
+        );
+    }
+
+    /// A replace that SHRINKS an item must not split — the byte accounting has
+    /// to be a real difference, not "assume it grew".
+    #[test]
+    fn shrinking_replace_does_not_split_bd_cjqhh() {
+        const NODESIZE: u32 = 16_384;
+        let mut tree = InMemoryCowBtrfsTree::new(64)
+            .expect("tree")
+            .with_leaf_byte_budget(NODESIZE as usize - BTRFS_HEADER_SIZE);
+
+        for i in 0..4_u64 {
+            tree.insert(test_key(i), &vec![0x5A_u8; 3000])
+                .expect("large seed insert");
+        }
+        let level_before = tree.root_level();
+        for i in 0..4_u64 {
+            tree.update(&test_key(i), b"small")
+                .expect("shrinking replace");
+        }
+        assert!(
+            tree.root_level() <= level_before,
+            "shrinking replaces must never force a split"
+        );
+        tree.validate_invariants().expect("invariants");
+        assert_every_node_serializes(&tree, NODESIZE);
     }
 
     #[test]

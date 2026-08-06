@@ -26888,7 +26888,9 @@ impl OpenFs {
             .csum_tree
             .range_with(&lo, &hi, |key, value| {
                 let sectors = u64::try_from(value.len()).unwrap_or(0) / csum_size;
-                let item_end = key.offset.saturating_add(sectors.saturating_mul(sectorsize));
+                let item_end = key
+                    .offset
+                    .saturating_add(sectors.saturating_mul(sectorsize));
                 // Half-open overlap: an item ending exactly at the range start
                 // covers none of it.
                 if item_end > disk_bytenr && key.offset < remove_end {
@@ -26920,7 +26922,9 @@ impl OpenFs {
             // Sectors at or after the end of the freed range survive too, but
             // must be re-keyed to the first sector they now cover.
             let item_sectors = u64::try_from(value.len()).unwrap_or(0) / csum_size;
-            let item_end = key.offset.saturating_add(item_sectors.saturating_mul(sectorsize));
+            let item_end = key
+                .offset
+                .saturating_add(item_sectors.saturating_mul(sectorsize));
             if item_end > remove_end {
                 let skip_sectors = remove_end.saturating_sub(key.offset).div_ceil(sectorsize);
                 let skip = usize::try_from(skip_sectors.saturating_mul(csum_size))
@@ -28733,8 +28737,16 @@ impl OpenFs {
                 let fst_max_items = usize::try_from(u64::from(nodesize).saturating_sub(101) / 64)
                     .unwrap_or(5)
                     .max(5);
+                // The byte budget is what makes the single-leaf fallback below
+                // actually work (bd-cjqhh). `fst_max_items` is a 64-byte-per-item
+                // estimate; a FREE_SPACE_BITMAP item is far larger than that, so
+                // without a budget an oversized leaf stays at level 0, slips past
+                // the `root_level() == 0` guard, and fails the ENTIRE transaction
+                // at serialize_node — instead of splitting, tripping the guard,
+                // and leaving the free-space tree not-VALID as designed.
                 let mut fst_tree = InMemoryCowBtrfsTree::new(fst_max_items)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                    .with_leaf_byte_budget((nodesize as usize).saturating_sub(101));
                 for (key, value) in &items {
                     fst_tree
                         .insert(*key, value)
@@ -48204,10 +48216,7 @@ mod tests {
         }
 
         let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
-        let lo = BtrfsKey {
-            offset: 0,
-            ..key
-        };
+        let lo = BtrfsKey { offset: 0, ..key };
         let hi = BtrfsKey {
             offset: u64::MAX,
             ..key
