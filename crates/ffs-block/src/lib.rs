@@ -171,7 +171,7 @@ impl AlignedVec {
         }
 
         let len = bytes.len();
-        if (bytes.as_ptr() as usize) % alignment == 0 {
+        if (bytes.as_ptr() as usize).is_multiple_of(alignment) {
             return Self {
                 storage: bytes,
                 start: 0,
@@ -971,7 +971,7 @@ pub trait BlockDevice: Send + Sync {
     fn read_contiguous_into(&self, cx: &Cx, start: BlockNumber, dst: &mut [u8]) -> Result<()> {
         cx_checkpoint(cx)?;
         let bs = self.block_size() as usize;
-        if bs == 0 || dst.len() % bs != 0 {
+        if bs == 0 || !dst.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
                 "read_contiguous_into: dst length must be a multiple of block size".to_owned(),
             ));
@@ -1103,7 +1103,7 @@ pub trait BlockDevice: Send + Sync {
     fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
         cx_checkpoint(cx)?;
         let bs = self.block_size() as usize;
-        if bs == 0 || data.len() % bs != 0 {
+        if bs == 0 || !data.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
                 "write_contiguous_blocks: data length must be a multiple of block size".to_owned(),
             ));
@@ -1500,7 +1500,7 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
         cx_checkpoint(cx)?;
         let block_size = usize::try_from(self.block_size)
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
-        if block_size == 0 || dst.len() % block_size != 0 {
+        if block_size == 0 || !dst.len().is_multiple_of(block_size) {
             return Err(FfsError::Format(
                 "read_contiguous_into: dst length must be a multiple of block size".to_owned(),
             ));
@@ -1572,7 +1572,7 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
         cx_checkpoint(cx)?;
         let block_size = usize::try_from(self.block_size)
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
-        if block_size == 0 || data.len() % block_size != 0 {
+        if block_size == 0 || !data.len().is_multiple_of(block_size) {
             return Err(FfsError::Format(
                 "write_contiguous_blocks: data length must be a multiple of block size".to_owned(),
             ));

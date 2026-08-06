@@ -314,12 +314,12 @@ impl DirtyTracker {
     }
 
     fn clear_dirty(&mut self, block: BlockNumber, seq: u64) {
-        if let Some(entry) = self.by_block.get(&block).copied() {
-            if entry.seq == seq {
-                self.by_block.remove(&block);
-                let _ = self.by_age.remove(&(entry.seq, block));
-                self.dirty_bytes = self.dirty_bytes.saturating_sub(entry.bytes);
-            }
+        if let Some(entry) = self.by_block.get(&block).copied()
+            && entry.seq == seq
+        {
+            self.by_block.remove(&block);
+            let _ = self.by_age.remove(&(entry.seq, block));
+            self.dirty_bytes = self.dirty_bytes.saturating_sub(entry.bytes);
         }
     }
 
@@ -2002,7 +2002,7 @@ impl ArcState {
     #[cfg(feature = "s3fifo")]
     fn s3_emit_summary_if_due(&self) {
         let accesses = self.hits.saturating_add(self.misses);
-        if accesses == 0 || accesses % 1024 != 0 {
+        if accesses == 0 || !accesses.is_multiple_of(1024) {
             return;
         }
         info!(
