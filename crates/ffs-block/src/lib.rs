@@ -30,8 +30,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "s3fifo")]
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
@@ -2853,11 +2853,12 @@ mod tests {
             assert_eq!(indexed_t1_clean, expected_t1_clean);
             assert_eq!(indexed_t2_clean, expected_t2_clean);
             assert_eq!(
-                state.next_pressure_victim(),
-                expected_t1_clean
-                    .first()
-                    .copied()
-                    .or_else(|| expected_t2_clean.first().copied())
+                state.oldest_clean_resident(ArcList::T1),
+                expected_t1_clean.first().copied()
+            );
+            assert_eq!(
+                state.oldest_clean_resident(ArcList::T2),
+                expected_t2_clean.first().copied()
             );
         }
     }
@@ -5410,6 +5411,60 @@ mod tests {
         cache.evict(BlockNumber(0));
         let metrics = cache.metrics();
         assert_eq!(metrics.resident, 0);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn arc_cache_explicit_clean_evict_invalidates_fast_residents() {
+        const BLOCK_SIZE: u32 = 4096;
+        const TARGET: BlockNumber = BlockNumber(0);
+        const CACHED_BYTE: u8 = 0xA1;
+        const BACKING_BYTE: u8 = 0xB2;
+
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(BLOCK_SIZE as usize * 4);
+        let dev = ByteBlockDevice::new(mem, BLOCK_SIZE).expect("device");
+        dev.write_block(&cx, TARGET, &[CACHED_BYTE; BLOCK_SIZE as usize])
+            .expect("seed backing block");
+
+        let counted = CountingBlockDevice::new(dev);
+        let cache = ArcCache::new(counted, 400).expect("fast-path cache");
+
+        let cold = cache.read_block(&cx, TARGET).expect("cold read");
+        assert_eq!(cold.as_slice(), &[CACHED_BYTE; BLOCK_SIZE as usize]);
+        assert_eq!(cache.inner().read_count(), 1);
+
+        let global_fast = cache.read_block(&cx, TARGET).expect("global fast read");
+        assert_eq!(global_fast.as_slice(), &[CACHED_BYTE; BLOCK_SIZE as usize]);
+        assert_eq!(
+            cache.inner().read_count(),
+            1,
+            "global fast resident must bypass the backing device"
+        );
+
+        cache
+            .inner()
+            .inner
+            .write_block(&cx, TARGET, &[BACKING_BYTE; BLOCK_SIZE as usize])
+            .expect("mutate backing block behind cache");
+
+        let thread_fast = cache.read_block(&cx, TARGET).expect("thread fast read");
+        assert_eq!(thread_fast.as_slice(), &[CACHED_BYTE; BLOCK_SIZE as usize]);
+        assert_eq!(
+            cache.inner().read_count(),
+            1,
+            "thread-local fast resident must bypass the backing device"
+        );
+
+        cache.evict(TARGET);
+
+        let refreshed = cache.read_block(&cx, TARGET).expect("read after eviction");
+        assert_eq!(refreshed.as_slice(), &[BACKING_BYTE; BLOCK_SIZE as usize]);
+        assert_eq!(
+            cache.inner().read_count(),
+            2,
+            "read after explicit eviction must consult the backing device"
+        );
     }
 
     #[test]
@@ -10131,7 +10186,7 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
 
     #[cfg(not(feature = "s3fifo"))]
     #[test]
-    fn arc_state_clean_index_preserves_dirty_front_victim_order() {
+    fn arc_state_clean_index_tracks_dirty_front_across_trim() {
         let mut state = ArcState::new(8);
         for block in 0..8_u64 {
             arc_access(&mut state, BlockNumber(block));
@@ -10147,16 +10202,25 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
             );
         }
 
-        assert_eq!(state.next_pressure_victim(), Some(BlockNumber(6)));
+        assert_eq!(
+            state.oldest_clean_resident(ArcList::T1),
+            Some(BlockNumber(6))
+        );
+        assert_eq!(state.oldest_clean_resident(ArcList::T2), None);
 
         state.set_target_capacity(2);
         let batch = state.trim_to_capacity();
         assert_eq!(batch.evicted_blocks, 2);
         assert_eq!(state.resident_len(), 6);
-        assert_eq!(state.next_pressure_victim(), None);
+        assert_eq!(state.oldest_clean_resident(ArcList::T1), None);
+        assert_eq!(state.oldest_clean_resident(ArcList::T2), None);
 
         state.clear_dirty_unconditional(BlockNumber(0));
-        assert_eq!(state.next_pressure_victim(), Some(BlockNumber(0)));
+        assert_eq!(
+            state.oldest_clean_resident(ArcList::T1),
+            Some(BlockNumber(0))
+        );
+        assert_eq!(state.oldest_clean_resident(ArcList::T2), None);
     }
 
     // ── Capacity-1 boundary tests ───────────────────────────────────────

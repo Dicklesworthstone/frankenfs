@@ -3814,6 +3814,20 @@ impl<D: BlockDevice> BlockCache for ArcCache<D> {
             return;
         }
 
+        #[cfg(feature = "s3fifo")]
+        let mutation_guard = {
+            let target_present = guard.t1.contains(&block)
+                || guard.t2.contains(&block)
+                || guard.resident.contains_key(&block)
+                || matches!(guard.loc.get(&block), Some(ArcList::B1 | ArcList::B2));
+            // The state mutex is already held when mutation becomes visible. A
+            // fast reader that completed its epoch/active validation before this
+            // point linearizes before eviction. Once active is incremented, fast
+            // readers fall back to the state mutex and can only observe the
+            // post-eviction state after this critical section releases it.
+            target_present.then(|| self.begin_s3_fast_mutation())
+        };
+
         let mut removed = false;
         #[cfg(not(feature = "s3fifo"))]
         guard.remove_resident_recency(block);
@@ -3821,6 +3835,13 @@ impl<D: BlockDevice> BlockCache for ArcCache<D> {
         removed |= ArcState::remove_from_list(&mut guard.t2, block);
         removed |= guard.remove_ghost_block(block);
         removed |= guard.resident.remove(&block).is_some();
+        #[cfg(feature = "s3fifo")]
+        if removed {
+            if let Some(handle) = guard.access_count.remove(&block) {
+                handle.invalidate();
+            }
+            guard.fast_invalidations.push(block);
+        }
         guard.clear_dirty_unconditional(block);
         let _ = guard.loc.remove(&block);
 
@@ -3830,7 +3851,20 @@ impl<D: BlockDevice> BlockCache for ArcCache<D> {
         } else {
             false
         };
+        #[cfg(feature = "s3fifo")]
+        let fast_invalidations = if mutation_guard.is_some() {
+            guard.take_fast_invalidations()
+        } else {
+            Vec::new()
+        };
         drop(guard);
+        #[cfg(feature = "s3fifo")]
+        if let Some(mutation_guard) = mutation_guard {
+            self.apply_s3_fast_resident_updates(fast_invalidations, None);
+            // Dropping last advances the epoch and re-enables the fast path;
+            // thread-local entries from before eviction can no longer match.
+            drop(mutation_guard);
+        }
 
         if evicted {
             trace!(event = "cache_evict_clean", block = block.0);
