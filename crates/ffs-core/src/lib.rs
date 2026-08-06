@@ -68287,6 +68287,105 @@ mod tests {
         );
     }
 
+    /// bd-72tn8: a failed write whose range spans SEVERAL extents must not
+    /// destroy any of them.
+    ///
+    /// COVERAGE, NOT A GATE — stated plainly because it looks like one. This
+    /// test passes with the reference split disabled, i.e. it does NOT reproduce
+    /// the 8192-byte residual it was written for. The write here covers its
+    /// extents completely, so they leave no remnants, so the old path had
+    /// nothing to allocate and nothing to fail on. Reproducing the residual
+    /// needs the write to reserve successfully AND a later extent's remnant
+    /// allocation to fail, which is a narrow space window I did not manage to
+    /// construct deterministically.
+    ///
+    /// What actually gates the structural change is
+    /// `btrfs_middle_overwrite_leaves_two_views_of_one_extent_bd_72tn8`: it fails
+    /// when splitting-by-reference is disabled, because the old path freed the
+    /// original extent and gave each half a fresh private one. That, plus the
+    /// removal no longer allocating at all, is why the residual is gone — the
+    /// failure site was deleted rather than made recoverable.
+    #[test]
+    fn btrfs_failed_multi_extent_write_destroys_nothing_bd_72tn8() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        const BS: usize = 4096;
+
+        let victim = fs
+            .create(&cx, root, OsStr::new("multi.bin"), 0o644, 0, 0)
+            .expect("create victim");
+
+        // Four SEPARATE extents, written one at a time so each is its own
+        // EXTENT_DATA item rather than one contiguous run.
+        let mut payload = Vec::new();
+        for block in 0..4_u64 {
+            let chunk = vec![(0xA0 + block) as u8; 2 * BS];
+            fs.write(&cx, victim.ino, block * 2 * BS as u64, &chunk)
+                .expect("seed write");
+            payload.extend_from_slice(&chunk);
+        }
+        let extents_before = {
+            let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("alloc state");
+            let alloc = alloc_mutex.read();
+            let canonical = fs.btrfs_canonical_inode(victim.ino).expect("canonical");
+            OpenFs::btrfs_extent_data_items(&alloc, canonical)
+                .expect("extent items")
+                .len()
+        };
+        assert!(
+            extents_before >= 2,
+            "fixture needs several extents to exercise the multi-extent path, got {extents_before}"
+        );
+
+        // Exhaust the filesystem, stepping down to single blocks so nothing is
+        // left that would let the overwrite below quietly succeed.
+        let filler = fs
+            .create(&cx, root, OsStr::new("multi_filler.bin"), 0o644, 0, 0)
+            .expect("create filler");
+        let mut at = 0_u64;
+        for blocks in [16_usize, 4, 1] {
+            let chunk = vec![0xEE_u8; blocks * BS];
+            loop {
+                match fs.write(&cx, filler.ino, at, &chunk) {
+                    Ok(_) => at += chunk.len() as u64,
+                    Err(ref e) if e.to_errno() == libc::ENOSPC => break,
+                    Err(e) => panic!("filler write: {e}"),
+                }
+                assert!(at < 64 * 1024 * 1024, "filler never hit ENOSPC");
+            }
+        }
+
+        // One write across ALL of them, extending past EOF so it needs more
+        // space than it frees.
+        let err = fs.write(&cx, victim.ino, 0, &vec![0x5A_u8; 12 * BS]);
+        assert!(
+            err.is_err() && err.as_ref().unwrap_err().to_errno() == libc::ENOSPC,
+            "fixture did not exhaust space: the overwrite returned {err:?}, so this \
+             test would pass vacuously"
+        );
+
+        let got = ops
+            .read(
+                &cx,
+                &mut RequestScope::empty(),
+                victim.ino,
+                0,
+                u32::try_from(payload.len()).expect("fits u32"),
+            )
+            .expect("read victim");
+        let ndiff = (0..payload.len()).filter(|&i| got[i] != payload[i]).count();
+        assert_eq!(
+            ndiff,
+            0,
+            "a failed multi-extent write destroyed {} bytes, first at {}",
+            ndiff,
+            (0..payload.len())
+                .find(|&i| got[i] != payload[i])
+                .unwrap_or_default()
+        );
+    }
+
     /// bd-72tn8, reduced from the proptest counterexample: a write that fully
     /// covers the tail of a SHARED region must overwrite all of it.
     ///
