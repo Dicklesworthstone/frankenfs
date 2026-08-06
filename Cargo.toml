@@ -31,7 +31,13 @@ exclude = ["vendor/fuser"]
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankenfs"
-rust-version = "1.85"
+# Corrected 2026-08-05 (bd-g9l54). "1.85" was never true: rust-toolchain.toml pins
+# nightly-2026-07-20 (rustc 1.99), the crates are edition 2024, and the code calls
+# APIs stabilized in 1.95 (`Atomic{I64,U64}::try_update`, and the per-core and FUSE
+# store paths). `clippy::incompatible_msrv` was reporting exactly that mismatch, so
+# the fix is to stop declaring a floor the workspace does not support — not to
+# silence the lint.
+rust-version = "1.95"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

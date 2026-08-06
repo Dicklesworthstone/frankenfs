@@ -75,13 +75,12 @@ pub fn count_memoized_requests_enabled() -> bool {
 /// Pure half of [`count_memoized_requests_from_env`], so the opt-out spelling
 /// is testable without mutating process-global environment from a test thread.
 fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
-    match value {
-        Some(raw) => !matches!(
+    value.is_none_or(|raw| {
+        !matches!(
             raw.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
-        ),
-        None => true,
-    }
+        )
+    })
 }
 
 /// Default TTL for cached attributes and entries.
@@ -1486,6 +1485,14 @@ impl LastMissingCapabilityXattr {
 /// table → per-inode held nesting on `FuseInodeLocks`) are
 /// documented and regression-tested separately:
 /// `lock_ordering_under_concurrent_acquire_and_drop` (bd-pfv55).
+// `struct_excessive_bools` targets confusing wide APIs — a caller passing four
+// positional `bool`s. This struct is PRIVATE and is never built positionally;
+// every field is named at its single construction site and read as
+// `self.<name>`. Grouping the four into a nested flags struct would rewrite 274
+// references for no behavioural or readability gain, so the lint is answered
+// here rather than obeyed (bd-g9l54). If this type ever becomes public, or
+// gains a positional constructor, do the refactor instead of widening this.
+#[allow(clippy::struct_excessive_bools)]
 struct FuseInner {
     ops: Arc<dyn FsOps>,
     metrics: Arc<AtomicMetrics>,
@@ -2554,7 +2561,7 @@ impl FrankenFuse {
             })
             .map_err(|error| error.to_errno())?;
 
-        for entry in entries.iter() {
+        for entry in &entries {
             #[cfg(unix)]
             let _ = OsStr::from_bytes(&entry.name);
             #[cfg(not(unix))]
@@ -5990,7 +5997,7 @@ impl Filesystem for FrankenFuse {
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                for entry in entries.iter() {
+                for entry in &entries {
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -6044,7 +6051,7 @@ impl Filesystem for FrankenFuse {
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                for entry in entries.iter() {
+                for entry in &entries {
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -7256,14 +7263,14 @@ impl MountHandle {
                 );
                 break;
             }
-            if let Some(session) = self.session.as_ref() {
-                if session.guard.is_finished() {
-                    warn!(
-                        mountpoint = %self.mountpoint.display(),
-                        "fuse background session ended without explicit shutdown"
-                    );
-                    break;
-                }
+            if let Some(session) = self.session.as_ref()
+                && session.guard.is_finished()
+            {
+                warn!(
+                    mountpoint = %self.mountpoint.display(),
+                    "fuse background session ended without explicit shutdown"
+                );
+                break;
             }
             std::thread::sleep(MOUNT_HANDLE_WAIT_POLL_INTERVAL);
         }

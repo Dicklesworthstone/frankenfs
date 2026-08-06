@@ -36,7 +36,7 @@ fn bench_degraded_throughput_warning(c: &mut Criterion) {
     c.bench_function("degraded_throughput_warning_mixed", |b| {
         let mut i = 0_u64;
         b.iter(|| {
-            let op = if i % 3 == 0 {
+            let op = if i.is_multiple_of(3) {
                 RequestOp::Write
             } else {
                 RequestOp::Read
@@ -66,7 +66,7 @@ fn bench_degraded_throughput_critical(c: &mut Criterion) {
     c.bench_function("degraded_throughput_critical_mixed", |b| {
         let mut i = 0_u64;
         b.iter(|| {
-            let op = if i % 3 == 0 {
+            let op = if i.is_multiple_of(3) {
                 RequestOp::Write
             } else {
                 RequestOp::Read

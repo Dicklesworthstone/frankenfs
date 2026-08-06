@@ -472,10 +472,13 @@ fn bench_listxattr_size_probe_payload_elision(c: &mut Criterion) {
         .collect();
     let encoded = encode_xattr_names_control(&names);
     assert_eq!(encoded.len(), xattr_names_encoded_len(&names));
-    assert_eq!(
-        encoded.iter().filter(|&&byte| byte == 0).count(),
-        names.len()
-    );
+    // Assert the exact wire bytes rather than counting NUL separators: it pins
+    // the order and the payload too, not just how many terminators there are.
+    let expected: Vec<u8> = names
+        .iter()
+        .flat_map(|name| name.as_bytes().iter().copied().chain(std::iter::once(0)))
+        .collect();
+    assert_eq!(encoded, expected);
 
     let mut group = c.benchmark_group("mount_runtime_listxattr_size_probe_24");
     group.sample_size(30);
