@@ -776,6 +776,21 @@ enum Command {
         /// gets measured.
         #[arg(long, default_value_t = 3)]
         warmup: usize,
+        /// Enable writes before measuring, selecting the code path a read-write
+        /// MOUNT uses.
+        ///
+        /// This is not a detail. `btrfs_readdir_entries` branches on whether
+        /// alloc state is loaded: with writes enabled it scans the COW fs tree
+        /// across the DIR_ITEM..DIR_INDEX span and dedups by name; read-only it
+        /// serves from the prebuilt read-plan index. Every in-process readdir
+        /// measurement taken so far used the read-only path, while the mounted
+        /// comparator mounts `--rw` — so without this switch the bench can
+        /// report a path the mount never executes (bd-3zx2x).
+        ///
+        /// Loads alloc state only; the timed region still just enumerates, so
+        /// the image is not mutated.
+        #[arg(long)]
+        rw: bool,
         /// Emit one machine-readable line instead of prose.
         #[arg(long)]
         json: bool,
@@ -2149,8 +2164,9 @@ fn run() -> Result<()> {
             dir,
             iters,
             warmup,
+            rw,
             json,
-        } => readdirbench_cmd(&image, &dir, iters, warmup, json),
+        } => readdirbench_cmd(&image, &dir, iters, warmup, rw, json),
         Command::CreateBench {
             image,
             dir,
@@ -3801,6 +3817,7 @@ fn readdirbench_cmd(
     dir_path: &str,
     iters: usize,
     warmup: usize,
+    rw: bool,
     json: bool,
 ) -> Result<()> {
     use std::time::Instant;
@@ -3809,8 +3826,15 @@ fn readdirbench_cmd(
         bail!("--iters must be at least 1");
     }
     let cx = cli_cx();
-    let open_fs = OpenFs::open(&cx, path)
+    let mut open_fs = OpenFs::open(&cx, path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
+    if rw {
+        // Selects the COW-tree readdir path, which is what a read-write mount
+        // executes. Untimed: only the enumerations below are measured.
+        open_fs
+            .enable_writes(&cx)
+            .context("failed to enable writes (alloc state)")?;
+    }
 
     // One-time index construction is exactly what this bench exists to exclude:
     // it is ~18% of a btrfs readdir-only `walk`'s self time, and a mount pays it
