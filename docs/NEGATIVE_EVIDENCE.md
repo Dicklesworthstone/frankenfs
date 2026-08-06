@@ -7182,3 +7182,64 @@ at more than one daemon CPU — the harness never reached its
 clients), so the first thing to try is a placement that gives the daemon private physical cores,
 not more pairs: 48 pairs was already tried and made the serial null worse. Until then, do not re-run
 this A/B at `--fuse-cpus > 1`; it will block again.
+
+### 2026-08-05 (SapphireBirch) — bd-svhrq KEEP (harness fix, measured): the serial dispatcher was not unstable, its PLACEMENT was — private-core daemon placement takes the serial arm's own A/A null from `1.094` to `1.019`
+
+Direct follow-up to the row above, and it retires that row's mechanism hypothesis in favour of a
+duller cause.
+
+**Contract evidence, one fact per line so it is machine-checkable.**
+Executing driver ELF, self-reported in process at startup: `bench_evidence,binary_sha256=924bdc1f1b82a9b3c1dcf34f596faae9ad968d11a51ae3783a8a6e3a893c33d0`.
+Same-invocation A/A null control, serial FUSE arm, private cores: median 0.995887, bootstrap median CI [0.980965, 1.015918] over 20 000 resamples.
+Same-invocation A/A null control, candidate arm, private cores: median 0.998105, bootstrap median CI [0.986225, 1.012683] over 20 000 resamples.
+Same-invocation A/A null control, kernel incumbent arm, private cores: median 0.996526, bootstrap median CI [0.981975, 1.001440] over 20 000 resamples.
+
+**Defect.** `place_cpus` only attempted the private-physical-core order when `--fuse-cpus` was 1.
+Above that it went straight to the clients-first fallback, and that fallback's selector excludes the
+client CPUs but **not their SMT siblings**, so a multi-CPU daemon always landed on the siblings of
+the very threads it serves. Every one of the five runs in the row above reports
+`fuse_cpu_isolation=shares_physical_cores_with_clients_placed_after` for that reason. The comment in
+the code justified it — one last-level-cache domain with C cores cannot seat both a C-thread client
+set and a C-CPU daemon privately — but that argument only holds inside an LLC domain, and this host
+is a 32-core Threadripper where **host-wide** scope can seat 8 clients and 8 daemon CPUs on distinct
+physical cores. The harness never tried.
+
+**Fix (`7ce6e3ef`).** `place_daemon_on_private_cores` attempts the daemon-first order above one CPU
+and returns `Ok(None)` — not an error — when the domain cannot supply the cores or the clients then
+do not fit, so a same-LLC run behaves exactly as before and `--fuse-cpus 1` is untouched. The core
+selector is pure and unit-tested without sysfs: a core counts as private only when **none** of its
+SMT threads is spoken for.
+
+**Measured effect, same ELF, same workload, same 8-CPU host-wide cpuset, 24 pairs.** The serial
+arm's own A/A null spread:
+
+| placement | serial arm A/A | candidate arm A/A | kernel A/A |
+|---|---|---|---|
+| shares SMT siblings with clients | 1.094147 / 1.065028 / 1.034738 ✗ | 1.018024 / 1.051457 / 1.021343 | 1.020175 / 1.074008 / 1.008243 |
+| private physical cores | **1.019405 clear** | 1.013967 clear | 1.018356 clear |
+
+So **serial dispatch is not inherently unstable on a multi-CPU cpuset** — it was unstable because it
+shared execution resources with the threads it served. That is the answer to bd-svhrq acceptance
+branch (b), in the negative, and it means the `~1.9x` workers effect in the row above stays
+unclaimed rather than becoming explicable by "the incumbent is broken".
+
+**Still not admitted, and the residual is a different null each run.** At 24 pairs the private-core
+A/A run blocked on the **cross-pair** candidate null (0.985242, spread `1.040331` against the
+`1.025` limit) and the private-core lever run blocked on the serial arm again (spread `1.047796`,
+kernel `1.025095` marginal). Margins moved from `~1.09` to `~1.04`; the documented dial is pairs.
+
+**The 48-pair confirmation did not run, for an infrastructure reason, stated rather than papered
+over.** Both 48-pair attempts died on the host-quiet gate — `host-wide` scope requires the *whole*
+box quiet and a foreign `python3 files_scan` was pinning `cpu48` at `88.9%` (`cpu16=60.6%`). No
+number was produced and none is reported. Note the coupling this exposes: private-core placement at
+this client-thread count is only reachable at host-wide scope, and host-wide scope is the hardest
+quiet gate on a shared box.
+
+**Disposition: KEEP the fix.** It strictly widens what the instrument can attempt, reports which
+placement it got either way, and leaves every banked one-CPU row's placement byte-identical.
+
+**Retry predicate.** Re-run the 48-pair private-core A/A and the `FFS_FUSE_WORKERS=4` A/B when the
+host is quiet enough for host-wide scope to pass its preflight. If the cross-pair null still will
+not clear at 48 pairs under private cores, the next question is not more pairs but whether 8 daemon
+CPUs is simply a high-variance configuration for this workload — in which case say so and stop
+buying pairs.
