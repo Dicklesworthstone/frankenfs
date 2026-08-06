@@ -670,12 +670,8 @@ const SIX_ARM_SET: [Arm; 6] = [
 const CANDIDATE_A_ARMS: [Arm; 2] = [Arm::FuseA, Arm::FuseB];
 const CANDIDATE_B_ARMS: [Arm; 2] = [Arm::CandidateBA, Arm::CandidateBB];
 const KERNEL_ARMS: [Arm; 2] = [Arm::KernelA, Arm::KernelB];
-const BOTH_CANDIDATE_FUSE_ARMS: [Arm; 4] = [
-    Arm::FuseA,
-    Arm::FuseB,
-    Arm::CandidateBA,
-    Arm::CandidateBB,
-];
+const BOTH_CANDIDATE_FUSE_ARMS: [Arm; 4] =
+    [Arm::FuseA, Arm::FuseB, Arm::CandidateBA, Arm::CandidateBB];
 
 /// Every mounted arm of a run, in a stable order.
 const fn measured_arms(candidate_comparison: bool) -> &'static [Arm] {
@@ -1576,18 +1572,32 @@ fn kernel_engine_identity(kind: FilesystemKind) -> Result<KernelEngineIdentity> 
 }
 
 fn unique_prefixed_line<'a>(content: &'a str, prefix: &str, label: &str) -> Result<&'a str> {
+    optional_prefixed_line(content, prefix, label)?
+        .ok_or_else(|| anyhow!("{label} was not reported"))
+}
+
+/// A line the log is allowed to omit, but never allowed to make ambiguous.
+///
+/// Absence is a fact about the emitting binary that a caller may legitimately
+/// tolerate. Two disagreeing lines is a broken log, and silently picking one of
+/// them would be inventing an observation, so that stays an error either way.
+fn optional_prefixed_line<'a>(
+    content: &'a str,
+    prefix: &str,
+    label: &str,
+) -> Result<Option<&'a str>> {
     let mut matches = content
         .lines()
         .filter_map(|line| line.strip_prefix(prefix))
         .map(str::trim);
-    let value = matches
-        .next()
-        .ok_or_else(|| anyhow!("{label} was not reported"))?;
+    let Some(value) = matches.next() else {
+        return Ok(None);
+    };
     ensure!(
         matches.next().is_none(),
         "{label} was reported more than once"
     );
-    Ok(value)
+    Ok(Some(value))
 }
 
 fn inspect_ffs_binary(path: &Path) -> Result<FfsBinaryIdentity> {
@@ -2149,7 +2159,14 @@ fn mount_kernel(
     Ok(mounted)
 }
 
-fn parse_mount_self_report(log_path: &Path) -> Result<FfsMountSelfReport> {
+/// What a daemon that never reported its effective knobs is recorded as.
+///
+/// Never an empty string and never a plausible-looking knob list: a reader must
+/// be able to tell "this ELF predates knob self-reporting" from "these were the
+/// knobs", because the second would be a fabricated observation.
+const UNREPORTED_RUNTIME_KNOBS: &str = "unreported_by_this_elf";
+
+fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsMountSelfReport> {
     let content = fs::read_to_string(log_path)
         .with_context(|| format!("read FUSE mount log {}", log_path.display()))?;
     let binary_sha256 = unique_prefixed_line(
@@ -2172,16 +2189,28 @@ fn parse_mount_self_report(log_path: &Path) -> Result<FfsMountSelfReport> {
         is_sha256(&pgo_profile_sha256),
         "FUSE mount is not running a PGO production build: {pgo_profile_sha256}"
     );
-    // Not optional: a daemon that cannot report which knob values it actually
-    // resolved cannot participate in a candidate-vs-candidate comparison, and
-    // an ELF too old to emit the line is exactly the bd-d9378 failure this
-    // evidence exists to catch.
-    let runtime_knobs = unique_prefixed_line(
+    // A daemon that cannot report which knob values it actually resolved must
+    // never be an arm of a candidate-vs-candidate comparison: an ELF too old to
+    // emit the line is exactly the bd-d9378 failure this evidence exists to
+    // catch, where the requested override reached nothing the ELF reads. A
+    // single-configuration run has no divergence to prove, so it may mount such
+    // an ELF — the only way a historical build can be re-measured at all — and
+    // records the absence instead of a knob list.
+    let runtime_knobs = match optional_prefixed_line(
         &content,
         "mount_candidate_knobs,",
         "FUSE mount effective runtime knobs",
-    )?
-    .to_owned();
+    )? {
+        Some(knobs) => knobs.to_owned(),
+        None => {
+            ensure!(
+                !knobs_required,
+                "FUSE mount effective runtime knobs was not reported: this ELF predates knob \
+                 self-reporting, so it cannot be an arm of a candidate-vs-candidate comparison"
+            );
+            UNREPORTED_RUNTIME_KNOBS.to_owned()
+        }
+    };
     Ok(FfsMountSelfReport {
         identity: FfsBinaryIdentity {
             binary_sha256,
@@ -2302,7 +2331,7 @@ fn mount_fuse(
         } => (child.id(), stderr_log.clone()),
         MountedArmKind::Kernel => unreachable!("constructed FUSE mount"),
     };
-    let self_report = parse_mount_self_report(&stderr_log)?;
+    let self_report = parse_mount_self_report(&stderr_log, config.compares_candidates())?;
     let proc_exe_sha256 = file_sha256(&PathBuf::from(format!("/proc/{child_id}/exe")))
         .with_context(|| format!("hash mapped FUSE executable for pid {child_id}"))?;
     ensure!(
@@ -3334,8 +3363,7 @@ fn collect_samples(
     interrupted: &AtomicBool,
 ) -> Result<TimedSamples> {
     let arms = measured_arms(config.compares_candidates());
-    let mut next_sequences: BTreeMap<Arm, usize> =
-        arms.iter().map(|&arm| (arm, 0_usize)).collect();
+    let mut next_sequences: BTreeMap<Arm, usize> = arms.iter().map(|&arm| (arm, 0_usize)).collect();
     run_warmup_rounds(roots, config, pinning, &mut next_sequences)?;
 
     let mut values: BTreeMap<Arm, Vec<u64>> = arms
@@ -6349,13 +6377,12 @@ mod tests {
         for physical_arm in SIX_ARM_SET {
             let positions: BTreeSet<usize> = (0..schedule_period(true))
                 .flat_map(|round| {
-                    balanced_order(true, round)
-                        .iter()
-                        .enumerate()
-                        .filter_map(move |(position, logical_arm)| {
+                    balanced_order(true, round).iter().enumerate().filter_map(
+                        move |(position, logical_arm)| {
                             (physical_arm_for(*logical_arm, round) == physical_arm)
                                 .then_some(position)
-                        })
+                        },
+                    )
                 })
                 .collect();
             assert_eq!(positions, BTreeSet::from([0, 1, 2, 3, 4, 5]));
@@ -6371,7 +6398,11 @@ mod tests {
             }
         }
         assert_eq!(executions.len(), SIX_ARM_SET.len());
-        assert!(executions.values().all(|&count| count == schedule_period(true)));
+        assert!(
+            executions
+                .values()
+                .all(|&count| count == schedule_period(true))
+        );
     }
 
     #[test]
@@ -6761,7 +6792,11 @@ mod tests {
 
         // The extra candidate arms are gated too: a four-arm-clear map is not
         // clear for a six-arm run, so the added arms cannot skip the check.
-        assert!(!worker_cpu_pinning_is_clear(&clear, &expected, &SIX_ARM_SET));
+        assert!(!worker_cpu_pinning_is_clear(
+            &clear,
+            &expected,
+            &SIX_ARM_SET
+        ));
         let six: BTreeMap<Arm, BTreeSet<usize>> = SIX_ARM_SET
             .into_iter()
             .map(|arm| (arm, expected.clone()))
@@ -7286,10 +7321,7 @@ mod tests {
         assert!(ratios.iter().all(|ratio| (ratio.exp() - 4.0).abs() < 1e-12));
     }
 
-    fn candidate_samples(
-        candidate_a: [[u64; 4]; 2],
-        candidate_b: [[u64; 4]; 2],
-    ) -> TimedSamples {
+    fn candidate_samples(candidate_a: [[u64; 4]; 2], candidate_b: [[u64; 4]; 2]) -> TimedSamples {
         TimedSamples {
             values: BTreeMap::from([
                 (Arm::KernelA, vec![10, 10, 10, 10]),
@@ -7326,10 +7358,7 @@ mod tests {
             }
             scaled
         };
-        let samples = candidate_samples(
-            [scale(1000), scale(1000)],
-            [scale(1100), scale(1100)],
-        );
+        let samples = candidate_samples([scale(1000), scale(1000)], [scale(1100), scale(1100)]);
         let ratios = paired_group_log_ratios(&samples, CANDIDATE_B_ARMS, CANDIDATE_A_ARMS)
             .expect("candidate ratios");
         assert_eq!(ratios.len(), 1);
@@ -7576,7 +7605,7 @@ mod tests {
             ),
         )
         .expect("write mount log");
-        let report = parse_mount_self_report(&complete).expect("parse self report");
+        let report = parse_mount_self_report(&complete, true).expect("parse self report");
         assert_eq!(report.identity.binary_sha256, sha);
         assert_eq!(
             report.runtime_knobs,
@@ -7595,6 +7624,44 @@ mod tests {
             ),
         )
         .expect("write legacy mount log");
-        assert!(parse_mount_self_report(&legacy).is_err());
+        assert!(parse_mount_self_report(&legacy, true).is_err());
+
+        // A single-configuration run has no knob divergence to prove, so it may
+        // re-measure a historical ELF — and records the absence verbatim rather
+        // than a knob list it never observed.
+        let tolerated = parse_mount_self_report(&legacy, false).expect("parse legacy self report");
+        assert_eq!(tolerated.runtime_knobs, UNREPORTED_RUNTIME_KNOBS);
+        assert!(!UNREPORTED_RUNTIME_KNOBS.is_empty());
+        assert!(!UNREPORTED_RUNTIME_KNOBS.contains('='));
+
+        // Tolerating absence must not tolerate ambiguity: two disagreeing knob
+        // lines is a broken log under either requirement.
+        let ambiguous = temp.path().join("ambiguous.log");
+        fs::write(
+            &ambiguous,
+            format!(
+                "mount_bench_evidence,binary_sha256={sha}\n\
+                 mount_build_profile,pgo_profile_sha256={pgo}\n\
+                 mount_candidate_knobs,count_memoized_requests=true\n\
+                 mount_candidate_knobs,count_memoized_requests=false\n"
+            ),
+        )
+        .expect("write ambiguous mount log");
+        assert!(parse_mount_self_report(&ambiguous, false).is_err());
+        assert!(parse_mount_self_report(&ambiguous, true).is_err());
+    }
+
+    /// The sentinel must fail an A/B on its own, independently of the mount-time
+    /// gate — two historical daemons both reporting "unreported" are identical,
+    /// not different, so they can never masquerade as a divergent A/B.
+    #[test]
+    fn unreported_knobs_cannot_pass_a_candidate_comparison() {
+        let mounts = vec![
+            fuse_mount_for_test(Arm::FuseA, UNREPORTED_RUNTIME_KNOBS),
+            fuse_mount_for_test(Arm::FuseB, UNREPORTED_RUNTIME_KNOBS),
+            fuse_mount_for_test(Arm::CandidateBA, UNREPORTED_RUNTIME_KNOBS),
+            fuse_mount_for_test(Arm::CandidateBB, UNREPORTED_RUNTIME_KNOBS),
+        ];
+        assert!(candidate_knob_divergence(&mounts, true).is_err());
     }
 }
