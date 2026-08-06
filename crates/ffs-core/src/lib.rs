@@ -27117,7 +27117,27 @@ impl OpenFs {
                 BtrfsExtentData::Regular { extent_type, .. }
                     if extent_type == BTRFS_FILE_EXTENT_PREALLOC
             );
-            let materialized = if is_prealloc {
+            // A REGULAR extent backed by real disk is split BY REFERENCE: both
+            // halves keep the original's `disk_bytenr`/`disk_num_bytes` and just
+            // narrow `extent_offset`/`num_bytes` to their own file range, exactly
+            // as the kernel splits a file extent item. Nothing is copied and
+            // nothing is allocated, which is what removes bd-72tn8's failure mode
+            // rather than recovering from it — the old path materialized each
+            // remnant into a fresh private extent, so a split could fail on a full
+            // or fragmented filesystem after the original was already gone.
+            //
+            // Holes (`disk_bytenr == 0`), PREALLOC, and inline extents keep the
+            // old handling: a hole has nothing to reference, prealloc re-inserts
+            // reservations, and an inline extent's bytes live in the item itself.
+            let reference_split = matches!(
+                extent,
+                BtrfsExtentData::Regular {
+                    extent_type,
+                    disk_bytenr,
+                    ..
+                } if extent_type == BTRFS_FILE_EXTENT_REG && disk_bytenr > 0
+            );
+            let materialized = if is_prealloc || reference_split {
                 Vec::new()
             } else {
                 self.btrfs_materialize_extent(cx, &extent)?
@@ -27135,7 +27155,47 @@ impl OpenFs {
             // file kept a hole where a remnant was never rebuilt. Holding the
             // original until both remnants are safely in place means a failure
             // can be rolled back to exactly the prior state.
-            if is_prealloc {
+            if reference_split {
+                let surviving = Self::btrfs_split_extent_by_reference(
+                    alloc,
+                    canonical,
+                    &key,
+                    &extent,
+                    overlap_start,
+                    overlap_end,
+                    logical_end,
+                    &mut nbytes_delta,
+                )?;
+                // Refcount follows the number of items now pointing at the disk
+                // extent. One surviving half simply inherits the original's
+                // reference. Two halves are two items, so the extent gains one.
+                // Zero halves fall through to the drop below.
+                if surviving == 2
+                    && let BtrfsExtentData::Regular {
+                        disk_bytenr,
+                        disk_num_bytes,
+                        extent_offset,
+                        ..
+                    } = extent
+                {
+                    let ref_offset = key.offset.wrapping_sub(extent_offset);
+                    alloc
+                        .extent_alloc
+                        .add_data_extent_ref(
+                            disk_bytenr,
+                            disk_num_bytes,
+                            BTRFS_FS_TREE_OBJECTID,
+                            canonical,
+                            ref_offset,
+                        )
+                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                }
+                if surviving > 0 {
+                    // The original's reference lives on in the surviving half or
+                    // halves, so it must NOT be dropped.
+                    continue;
+                }
+            } else if is_prealloc {
                 let left_nbytes = Self::btrfs_insert_prealloc_extent_segment(
                     alloc,
                     canonical,
@@ -27201,24 +27261,120 @@ impl OpenFs {
                 extent_offset,
                 ..
             } = extent
+                && disk_bytenr > 0
             {
-                if disk_bytenr > 0 {
-                    // u64-wrapping backref offset (matches the clone path, so a
-                    // partially-reflinked extent's backref hashes identically).
-                    let ref_offset = key.offset.wrapping_sub(extent_offset);
-                    Self::btrfs_free_or_drop_extent_ref(
-                        alloc,
-                        disk_bytenr,
-                        disk_num_bytes,
-                        canonical,
-                        ref_offset,
-                        true,
-                    )?;
-                }
+                // u64-wrapping backref offset (matches the clone path, so a
+                // partially-reflinked extent's backref hashes identically).
+                let ref_offset = key.offset.wrapping_sub(extent_offset);
+                Self::btrfs_free_or_drop_extent_ref(
+                    alloc,
+                    disk_bytenr,
+                    disk_num_bytes,
+                    canonical,
+                    ref_offset,
+                    true,
+                )?;
             }
         }
 
         Ok(nbytes_delta)
+    }
+
+    /// Re-insert the non-overlapping halves of a split extent as VIEWS onto the
+    /// same disk extent, and report how many halves survived (0, 1, or 2).
+    ///
+    /// This is the kernel's file-extent split: `disk_bytenr`, `disk_num_bytes`,
+    /// `ram_bytes` and `compression` are inherited untouched, and only
+    /// `extent_offset`/`num_bytes` narrow to each half's file range. No data is
+    /// read and no space is allocated, so the split cannot fail for want of it.
+    ///
+    /// Both halves resolve to the same backref key — the left keeps the original
+    /// file offset and `extent_offset`, and the right advances both by the same
+    /// amount, so `file_offset - extent_offset` is invariant. That is what lets
+    /// the caller account for the reference count by counting items.
+    #[allow(clippy::too_many_arguments)]
+    fn btrfs_split_extent_by_reference(
+        alloc: &mut BtrfsAllocState,
+        canonical: u64,
+        key: &BtrfsKey,
+        extent: &BtrfsExtentData,
+        overlap_start: u64,
+        overlap_end: u64,
+        logical_end: u64,
+        nbytes_delta: &mut i128,
+    ) -> ffs_error::Result<u32> {
+        let BtrfsExtentData::Regular {
+            generation,
+            ram_bytes,
+            extent_type,
+            compression,
+            disk_bytenr,
+            disk_num_bytes,
+            extent_offset,
+            ..
+        } = *extent
+        else {
+            return Err(FfsError::Format(
+                "reference split requires a regular extent".into(),
+            ));
+        };
+
+        let mut surviving = 0_u32;
+        let mut emit = |file_offset: u64,
+                        view_offset: u64,
+                        num_bytes: u64,
+                        alloc: &mut BtrfsAllocState,
+                        nbytes_delta: &mut i128|
+         -> ffs_error::Result<()> {
+            if num_bytes == 0 {
+                return Ok(());
+            }
+            let half = BtrfsExtentData::Regular {
+                generation,
+                ram_bytes,
+                extent_type,
+                compression,
+                disk_bytenr,
+                disk_num_bytes,
+                extent_offset: view_offset,
+                num_bytes,
+            };
+            let half_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: file_offset,
+            };
+            alloc
+                .fs_tree
+                .insert(half_key, &half.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            Self::btrfs_accumulate_nbytes_delta(nbytes_delta, i128::from(num_bytes))?;
+            surviving = surviving.saturating_add(1);
+            Ok(())
+        };
+
+        // Head: [key.offset, overlap_start) — same start, so the same view offset.
+        emit(
+            key.offset,
+            extent_offset,
+            overlap_start.saturating_sub(key.offset),
+            alloc,
+            nbytes_delta,
+        )?;
+        // Tail: [overlap_end, logical_end) — the view advances by the same
+        // distance the file offset did.
+        let tail_view = extent_offset
+            .checked_add(overlap_end.saturating_sub(key.offset))
+            .ok_or_else(|| FfsError::InvalidGeometry("split tail view offset overflow".into()))?;
+        emit(
+            overlap_end,
+            tail_view,
+            logical_end.saturating_sub(overlap_end),
+            alloc,
+            nbytes_delta,
+        )?;
+
+        Ok(surviving)
     }
 
     /// Put a just-deleted EXTENT_DATA item back verbatim after a failed split.
@@ -78977,8 +79133,20 @@ mod tests {
         ops.write(&cx, &mut RequestScope::empty(), ino, 4096, &[0xFF_u8; 2048])
             .expect("overwriting a shared extent must succeed (drop, not refuse)");
 
-        // The shared extent kept refs == 1 (dropped, not freed outright).
-        assert_extent_refs_dropped_to_one(&fs, disk_bytenr, disk_num_bytes);
+        // The shared extent is still referenced and MUST NOT have been freed —
+        // that is the bd-xkvcm property. Since bd-72tn8 a partial overwrite
+        // splits the file extent BY REFERENCE, so the surviving head remains a
+        // view onto this same disk extent and inherits the reference: the count
+        // stays 2 rather than dropping to 1. Under the old behaviour the head was
+        // copied into a private extent and this inode's reference was dropped.
+        // Both are safe; only this one avoids copying the head.
+        assert_extent_refs(
+            &fs,
+            disk_bytenr,
+            disk_num_bytes,
+            2,
+            "a partial overwrite must leave the surviving head referencing the shared extent",
+        );
 
         // The overwritten region reads back the new bytes; the rest is intact.
         let read = ops
@@ -78987,6 +79155,28 @@ mod tests {
         assert_eq!(&read[0..4096], &[0x5A_u8; 4096], "head untouched");
         assert_eq!(&read[4096..6144], &[0xFF_u8; 2048], "overwritten region");
         assert_eq!(&read[6144..8192], &[0x5A_u8; 2048], "tail untouched");
+
+        // And the property the bead actually exists for: when NOTHING of the
+        // shared extent survives the overwrite, this inode's reference is DROPPED
+        // and the extent is not freed out from under the other holder. Without
+        // this case the assertion above would no longer test the drop path at all.
+        let (ino_full, _orig, full_bytenr, full_num_bytes) =
+            btrfs_make_shared_extent_file(&fs, &cx, "shared_ow_full.bin");
+        ops.write(
+            &cx,
+            &mut RequestScope::empty(),
+            ino_full,
+            0,
+            &[0xEE_u8; 8192],
+        )
+        .expect("overwriting the whole shared extent must succeed");
+        assert_extent_refs(
+            &fs,
+            full_bytenr,
+            full_num_bytes,
+            1,
+            "a total overwrite must DROP this inode's ref (2 -> 1), never free the shared extent",
+        );
     }
 
     /// Test helper: create a btrfs file with an 8 KiB regular data extent and
@@ -79079,6 +79269,105 @@ mod tests {
     /// Assert the EXTENT_ITEM at (disk_bytenr, disk_num_bytes) now has refs == 1
     /// — i.e. the shared-extent free DROPPED this inode's reference rather than
     /// freeing the whole extent (which would delete the EXTENT_ITEM -> None).
+    fn assert_extent_refs(
+        fs: &OpenFs,
+        disk_bytenr: u64,
+        disk_num_bytes: u64,
+        expected: u64,
+        why: &str,
+    ) {
+        let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("btrfs alloc state");
+        let alloc = alloc_mutex.read();
+        let refs = alloc
+            .extent_alloc
+            .extent_item_refs(disk_bytenr, disk_num_bytes)
+            .expect("read EXTENT_ITEM refs");
+        assert_eq!(
+            refs,
+            Some(expected),
+            "{why} — a None here means the EXTENT_ITEM was FREED, which is the bd-xkvcm bug"
+        );
+    }
+
+    /// bd-72tn8: a middle overwrite leaves TWO views of one disk extent, so that
+    /// extent's reference count must become 2 — one per surviving file extent
+    /// item.
+    ///
+    /// `btrfs_overwrite_passes_btrfs_check_bd_pb0ey` covers the same shape with
+    /// the real `btrfs check`, which is what caught the first attempt at this
+    /// (it emitted a duplicate backref record instead of one record with count
+    /// 2). But that test `return`s silently when btrfs-progs is missing, so the
+    /// arithmetic needs pinning by a test that always runs.
+    #[test]
+    fn btrfs_middle_overwrite_leaves_two_views_of_one_extent_bd_72tn8() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+        let attr = fs
+            .create(
+                &cx,
+                InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID)),
+                OsStr::new("two_views.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create");
+
+        let original = vec![0x11_u8; 65536];
+        ops.write(&cx, &mut RequestScope::empty(), attr.ino, 0, &original)
+            .expect("initial write");
+
+        let (disk_bytenr, disk_num_bytes) = {
+            let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("alloc state");
+            let alloc = alloc_mutex.read();
+            let canonical = fs.btrfs_canonical_inode(attr.ino).expect("canonical");
+            let items = OpenFs::btrfs_extent_data_items(&alloc, canonical).expect("extent items");
+            let (_, extent) = items.first().expect("one extent after the initial write");
+            match extent {
+                BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    disk_num_bytes,
+                    ..
+                } => (*disk_bytenr, *disk_num_bytes),
+                BtrfsExtentData::Inline { .. } => panic!("expected a regular extent"),
+            }
+        };
+        assert_extent_refs(
+            &fs,
+            disk_bytenr,
+            disk_num_bytes,
+            1,
+            "a freshly written extent has exactly one reference",
+        );
+
+        // Overwrite the middle: head [0,16K) and tail [32K,64K) both survive as
+        // views onto the ORIGINAL extent, so it gains a reference.
+        ops.write(
+            &cx,
+            &mut RequestScope::empty(),
+            attr.ino,
+            16384,
+            &vec![0x22_u8; 16384],
+        )
+        .expect("middle overwrite");
+
+        assert_extent_refs(
+            &fs,
+            disk_bytenr,
+            disk_num_bytes,
+            2,
+            "head and tail are two file extent items over one disk extent, so refs must be 2",
+        );
+
+        let mut expected = original.clone();
+        expected[16384..32768].fill(0x22);
+        let read = ops
+            .read(&cx, &mut RequestScope::empty(), attr.ino, 0, 65536)
+            .expect("read back");
+        assert_eq!(read, expected, "split-by-reference must preserve the bytes");
+    }
+
+    #[allow(dead_code)]
     fn assert_extent_refs_dropped_to_one(fs: &OpenFs, disk_bytenr: u64, disk_num_bytes: u64) {
         let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("btrfs alloc state");
         let alloc = alloc_mutex.read();

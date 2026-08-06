@@ -6444,6 +6444,9 @@ impl BtrfsExtentAllocator {
         objectid: u64,
         offset: u64,
     ) -> Result<(), BtrfsMutationError> {
+        const EXTENT_ITEM_HEADER: usize = 24; // refs(8) + generation(8) + flags(8)
+        const DATA_REF_PAYLOAD: usize = 28;
+
         let item_key = BtrfsKey {
             objectid: bytenr,
             item_type: BTRFS_ITEM_EXTENT_ITEM,
@@ -6463,6 +6466,38 @@ impl BtrfsExtentAllocator {
             .checked_add(1)
             .ok_or(BtrfsMutationError::AddressOverflow)?;
         value[0..8].copy_from_slice(&new_refs.to_le_bytes());
+
+        // Merge into the INLINE EXTENT_DATA_REF first when it already describes
+        // this exact triple. `insert_data_extent_item` writes the first backref
+        // inline, so a second reference to the same (root, objectid, offset) —
+        // which is exactly what splitting one file extent into two views of the
+        // same disk extent produces (bd-72tn8) — must bump that inline count.
+        // Adding a keyed item beside it instead makes `btrfs check` report
+        // "Extent back ref already exists ... referencer count mismatch": btrfs
+        // wants ONE record with count 2, not two records with count 1.
+        let inline_start = EXTENT_ITEM_HEADER + 1;
+        let inline_end = inline_start + DATA_REF_PAYLOAD;
+        if value.len() >= inline_end
+            && value[EXTENT_ITEM_HEADER] == BTRFS_ITEM_EXTENT_DATA_REF
+            && let Some(inline) = BtrfsExtentDataRef::from_bytes(&value[inline_start..inline_end])
+            && inline.root == root
+            && inline.objectid == objectid
+            && inline.offset == offset
+        {
+            let merged = BtrfsExtentDataRef {
+                root,
+                objectid,
+                offset,
+                count: inline
+                    .count
+                    .checked_add(1)
+                    .ok_or(BtrfsMutationError::AddressOverflow)?,
+            };
+            value[inline_start..inline_end].copy_from_slice(&merged.to_bytes());
+            self.extent_tree.update(&item_key, &value)?;
+            return Ok(());
+        }
+
         self.extent_tree.update(&item_key, &value)?;
 
         let ref_key = BtrfsKey {
@@ -6611,7 +6646,21 @@ impl BtrfsExtentAllocator {
                     Some(dr)
                         if dr.root == root && dr.objectid == objectid && dr.offset == offset =>
                     {
-                        value.drain(cursor..payload_end);
+                        // Mirror the keyed path: an inline ref can also hold
+                        // count > 1 once add_data_extent_ref has merged into it
+                        // (bd-72tn8). Draining it whole would erase the remaining
+                        // references while EXTENT_ITEM.refs still counts them,
+                        // leaving a later decrement with no backref to find.
+                        if dr.count > 1 {
+                            let decremented = BtrfsExtentDataRef {
+                                count: dr.count - 1,
+                                ..dr
+                            };
+                            value[payload_start..payload_end]
+                                .copy_from_slice(&decremented.to_bytes());
+                        } else {
+                            value.drain(cursor..payload_end);
+                        }
                         found = true;
                         break;
                     }
