@@ -6801,6 +6801,96 @@ round trips per path op, so the shared component of those losses is this probe, 
 FUSE dispatch floor. Re-derive the "shared floor" claim only from a run whose `requests_total` was
 produced by a build containing this fix — every request count banked before it under-reports memoized
 requests, on read-only mounts, by roughly the number of path-based metadata operations performed.
+### 2026-08-06 (PlumRiver) — bd-ha71t MECHANISM, retry-predicate clause (c) SATISFIED: the per-path-op `security.capability` probe comes from the AUDIT subsystem, not from FUSE or an LSM permission check — and it is a property of THIS HOST's audit rules
+
+**Counted mechanism, decided on the count and not on time: 501 syscalls vs 2** on the daemon's
+`/dev/fuse` channel — 500 path-based `stat` calls against the same already-cached inode cost 501
+request/reply pairs, while 500 `fstat()` calls on an open fd to that same inode cost 2. Wall time
+is deliberately not the basis: both sweeps ran on a debug build with tracing enabled on a loud
+shared host.
+
+The 2026-08-04 row below closed this lever with "the probe looks kernel-mandated and not
+suppressible from the daemon side", and left a retry predicate whose clause (c) reopens it if
+"someone identifies the exact kernel call site issuing the probe on a cached-dentry `stat` and it
+turns out to be conditional on something we control". Both halves are now established.
+
+**Cached-dentry half, measured.** One mount, three sweeps, counted at the daemon's own FUSE
+boundary (new unconditional trace at the `getxattr` callback, `a599d467` — the pre-existing traces
+sat on memo-hit paths and emit nothing on a read-write mount):
+
+| sweep | probes |
+| --- | --- |
+| 500 path stats of 500 DISTINCT files | 501 |
+| 500 path stats of **ONE** file (dentry and attrs already cached) | **501** |
+| 500 `fstat()` on an open fd (no path walk) | **2** |
+
+So it is not per-LOOKUP and not per-inode: it is one probe per path RESOLUTION, on an already
+cached dentry. The attribute cache is working — that single probe is the entire round-trip cost of
+a warm path stat.
+
+**Counted mechanism, on the daemon's `/dev/fuse` channel.** Each served probe is one request/reply
+pair, so the decision here rests on the count and not on time: the same 500 operations against the
+same inode cost **501 syscalls vs 2** — path-based `stat` against `fstat()` on an open fd. The
+path-walking form pays a round trip per call; the non-path form pays essentially none. Wall time is
+deliberately not the basis: both sweeps ran on a debug build with tracing enabled on a loud shared
+host.
+
+**The call site, captured with `bpftrace` on `fuse_getxattr` during the cached-dentry sweep:**
+
+```
+fuse_getxattr / __vfs_getxattr / get_vfs_caps_from_disk /
+audit_copy_inode / __audit_inode / filename_lookup / vfs_statx /
+vfs_fstatat / __do_sys_newfstatat / do_syscall_64        : 300 of 300 stats
+```
+
+It is **Linux audit**, collecting file capabilities into the audit record during path resolution.
+It is not a permission check, not an LSM label fetch, and nothing FUSE asks for.
+
+**Conditional on something we control.** `auditctl -s` reports `enabled 1`, and `auditctl -l`
+shows this host carries path-based rules over the agent working tree:
+
+```
+-w /data/projects -p wa -k data_projects_writes
+-a always,exit -F arch=b64 -S rename,rmdir,unlink,unlinkat,renameat,renameat2 -F dir=/data/projects/ -F success=1 -F key=data_projects_destruct
+```
+
+A path-based rule forces per-lookup inode collection for syscalls that could match, because the
+kernel cannot evaluate `-F dir=` until it has resolved and collected the inode — which is why the
+probe fires for mounts outside `/data/projects` too (the sweeps above mounted under `/tmp`).
+
+**Why it hits FrankenFS and not the incumbent — the asymmetry, and the reason this matters for
+every metadata row.** The same `get_vfs_caps_from_disk` path runs for in-kernel filesystems: it
+fired continuously host-wide during a control window, while a native ext4 path stat cost
+**2.83 us** in total. For an in-kernel filesystem the capability fetch is a cached inode xattr
+read. For FUSE it becomes a full userspace round trip — one per path-based metadata op.
+
+So the "shared FUSE metadata floor" that warm stat (4.81x ext4 / 4.98x btrfs, agreeing to 3.4%)
+and the readdir+stat rows are built on is, in substantial part, **an artifact of this measurement
+host's audit configuration**, which taxes FUSE per path lookup and in-kernel filesystems
+essentially not at all. Every banked metadata row inherits it.
+
+**NOTHING IS CLAIMED OR CHANGED HERE.** No ratio is quoted and no lever is banked: the size of the
+effect is unmeasured, because measuring it means running with those audit rules inactive, and they
+are fleet safety infrastructure watching the shared agent working tree. Disabling or narrowing them
+is a host-wide, security-relevant change affecting every agent on this box and is **not** something
+to do unilaterally — it needs the human's decision. The 2.83 us native figure and the debug-build
+per-stat timings are diagnostic only, taken with tracing enabled on a loud host, and are not
+comparable to anything.
+
+**What this does change, immediately and for free:** the mechanism row below should no longer be
+read as "the metadata floor is FUSE dispatch" or as "kernel-mandated and unavoidable". It is one
+audit-driven capability fetch per path resolution, and its cost to FrankenFS is a measurement-
+environment property as much as a filesystem property.
+
+**Retry / next steps.** (i) Ask the human whether a measurement window with the `/data/projects`
+audit rules inactive is permissible; if so, re-measure warm stat and readdir+stat on a current ELF
+in a quiet window and report the delta as the size of the artifact. (ii) Independently, check
+whether an audit rule can be scoped so path resolution outside `/data/projects` collects no inode
+(e.g. narrowing the watch), which would remove the tax from measurement mounts without weakening
+the guard on the source tree. (iii) `FUSE_HANDLE_KILLPRIV` stays REJECTED and must not be re-tested
+on this kernel — it is measured inert, and now visibly irrelevant, since the probe is not
+write-privilege related at all.
+
 ### 2026-08-04 (LilacRaven) — bd-ha71t REJECT: `FUSE_HANDLE_KILLPRIV` does NOT suppress the per-path-op `security.capability` probe; counted mechanism, probe count unchanged 2001 -> 2001
 
 Follow-up to the mechanism row above, which established that Linux issues one uncached
