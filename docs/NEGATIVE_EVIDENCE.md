@@ -7120,3 +7120,65 @@ in which case buy pairs first and re-characterize before touching the estimator,
 candidate-vs-candidate A/A comes out *outside* its own null on some other workload, which would mean
 the six-arm schedule does not balance that workload's carryover. Do NOT re-run the
 `FFS_D9378_COUNT_MEMOIZED` demo: it is a null control, not a lever.
+
+### 2026-08-05 (SapphireBirch) — bd-ext4-readdir-stat-5x REJECT: FUSE dispatch workers lose `3.6%` at the banked one-CPU daemon cpuset, and every wider cpuset is UNDECIDABLE because the *serial* arm fails its own A/A null there — the apparent `1.7-2.0x` is NOT a result
+
+First lever measured with the six-arm same-window estimator (bd-3tqgc, row above). Five runs, one
+ELF, kernel ext4 incumbent live in every invocation.
+
+**Contract evidence, one fact per line so it is machine-checkable.**
+Executing driver ELF, self-reported in process at startup: `bench_evidence,binary_sha256=62a33fcff0437552bab793adc042e24b910d5f25435b535df43fefa3dc14cb56`.
+Same-invocation A/A null control, decisive run, candidate arm: median 0.990394, bootstrap median CI [0.982566, 1.003580] over 20 000 resamples.
+Same-invocation A/A null control, decisive run, FUSE arm: median 0.996257, bootstrap median CI [0.987111, 1.003704] over 20 000 resamples.
+Same-invocation A/A null control, decisive run, kernel incumbent arm: median 0.999923, bootstrap median CI [0.993996, 1.014884] over 20 000 resamples.
+
+**Lever.** `FFS_FUSE_WORKERS=4` (multi-worker FUSE dispatch) as candidate B against the default
+serial dispatch (`fuse_dispatch_workers=0`) as candidate A, on ELF
+`bcf2bc80f02154aa16681b87c64e1beddab996b20cc0bb5ec911b5743133c9d1`, ext4 `readdir-stat-8t`,
+`operations=32768`, 8 observed client threads, image 1024 MiB, kernel `6.17.0-41-generic`. Knob
+divergence proven from the daemon's self-reported effective values in every run (`0` vs `4`), so no
+arm can silently be a copy of the other.
+
+| daemon cpuset | pairs | candidate B/A | serial arm A/A | workers arm A/A | admitted |
+|---|---|---|---|---|---|
+| 1 CPU, same-LLC | 24 | **1.036018** [1.0247, 1.0432] | 0.996257 clear | 0.990394 clear | **yes** — `CANDIDATE_NEUTRAL` |
+| 4 CPU, same-LLC | 24 | 0.499511 | spread 1.094147 ✗ | 1.018024 clear | no — `BLOCKED_NULL` |
+| 8 CPU, same-LLC | 24 | 0.502954 | spread 1.065028 ✗ | spread 1.051457 ✗ | no — `BLOCKED_NULL` |
+| 4 CPU, same-LLC | 48 | 0.524839 | median dev 2.35% ✗ | spread 1.028053 ✗ | no — `BLOCKED_NULL` |
+| 8 CPU, host-wide | 48 | 0.590425 | spread 1.034738 ✗ | 1.021343 clear | no — `BLOCKED_NULL` |
+
+**The one admitted row is a loss.** At the daemon CPU budget every banked row was measured with
+(`--fuse-cpus 1`), four dispatch workers are **3.6% slower** than serial dispatch, `CI [1.024695,
+1.043226]` against a `1.035801` gate, so it is formally `CANDIDATE_NEUTRAL` and directionally
+negative. `fuse_over_kernel` in that run was `5.108308x`, `HONEST_LOSS`, admitted. **This does not
+reproduce the inherited "`FFS_FUSE_WORKERS` won `1.923x` on readdir+stat" folklore**, which was
+cross-window and at an unrecorded pinning; at one daemon CPU the lever is negative.
+
+**The four wide-cpuset runs are INADMISSIBLE and their `0.50-0.59` ratios are NOT published.**
+Every one failed the pre-existing A/A gate, and their own `achieved_resolution_ratio` is `1.76-2.18`
+(i.e. plus or minus `76-118%`). No gate was relaxed to rescue them and none should be.
+
+**Mechanism hypothesis, which is the useful part.** In all four wide runs the arm that failed its
+own A/A null is the **serial** one (4 of 4), while the workers arm cleared in 3 of 4; at 48 pairs the
+serial arm got *worse*, not better (median deviation `2.35%`, past the `2%` limit), so this is a
+property of the configuration and not thin data. Two identically configured serial mounts in the
+same window disagree by more than the gate allows as soon as the daemon has more than one CPU. The
+inadmissible `fuse_over_kernel` numbers point the same way — `5.11x` at 1 CPU versus `5.45x`,
+`5.52x`, `6.59x`, `6.63x` at 4-8 CPUs — i.e. **widening the daemon cpuset appears to make the
+default serial dispatcher both slower and unstable**, which would mean the landed `--fuse-cpus`
+control is not a free win for the current dispatcher. Stated as a hypothesis on purpose: it rests on
+blocked runs.
+
+**Disposition: REJECT the lever as configured; do NOT flip any default.** Also do not read the
+`~1.9x` as a shipped win — the honest statement is that the comparison is undecidable at wide
+cpusets because the incumbent arm is unstable there. Independently, `frankenfs-fuse-dispatch-concurrency`
+records `FFS_FUSE_WORKERS` LOSING `0.839x` on parallel-read, so even a decisive readdir win would not
+justify a global default.
+
+**Retry predicate.** Re-open when a placement exists in which the *serial* arm's own A/A null clears
+at more than one daemon CPU — the harness never reached its
+`private_physical_core_clients_placed_after` branch in any of these runs (all five report
+`shares_physical_cores_with_clients_placed_after`, i.e. the daemon shares SMT siblings with the
+clients), so the first thing to try is a placement that gives the daemon private physical cores,
+not more pairs: 48 pairs was already tried and made the serial null worse. Until then, do not re-run
+this A/B at `--fuse-cpus > 1`; it will block again.
