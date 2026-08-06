@@ -27126,28 +27126,15 @@ impl OpenFs {
                 .fs_tree
                 .delete(&key)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            if let BtrfsExtentData::Regular {
-                disk_bytenr,
-                disk_num_bytes,
-                extent_offset,
-                ..
-            } = extent
-            {
-                if disk_bytenr > 0 {
-                    // u64-wrapping backref offset (matches the clone path, so a
-                    // partially-reflinked extent's backref hashes identically).
-                    let ref_offset = key.offset.wrapping_sub(extent_offset);
-                    Self::btrfs_free_or_drop_extent_ref(
-                        alloc,
-                        disk_bytenr,
-                        disk_num_bytes,
-                        canonical,
-                        ref_offset,
-                        true,
-                    )?;
-                }
-            }
 
+            // The original's disk extent is NOT freed yet (bd-72tn8). Rebuilding
+            // the non-overlapping head/tail allocates, and allocation can fail on
+            // a full or fragmented filesystem — a total-free pre-flight cannot
+            // predict it, because each remnant needs a CONTIGUOUS run. Freeing
+            // first made that failure destructive: the caller got ENOSPC and the
+            // file kept a hole where a remnant was never rebuilt. Holding the
+            // original until both remnants are safely in place means a failure
+            // can be rolled back to exactly the prior state.
             if is_prealloc {
                 let left_nbytes = Self::btrfs_insert_prealloc_extent_segment(
                     alloc,
@@ -27171,26 +27158,113 @@ impl OpenFs {
                     FfsError::InvalidGeometry("right segment offset overflow".into())
                 })?;
 
-                let left_nbytes = self.btrfs_insert_regular_extent_segment(
+                // Rebuild the head, then the tail. Either allocation can fail on a
+                // full or fragmented filesystem, so both are undone on failure and
+                // the original item is put back exactly as it was — the caller then
+                // sees ENOSPC over an unchanged file instead of a hole.
+                let left_nbytes = match self.btrfs_insert_regular_extent_segment(
                     cx,
                     alloc,
                     canonical,
                     key.offset,
                     &materialized[..left_len],
-                )?;
-                Self::btrfs_accumulate_nbytes_delta(&mut nbytes_delta, i128::from(left_nbytes))?;
-                let right_nbytes = self.btrfs_insert_regular_extent_segment(
+                ) {
+                    Ok(nbytes) => nbytes,
+                    Err(e) => {
+                        Self::btrfs_restore_extent_item(alloc, &key, &extent_bytes);
+                        return Err(e);
+                    }
+                };
+                let right_nbytes = match self.btrfs_insert_regular_extent_segment(
                     cx,
                     alloc,
                     canonical,
                     overlap_end,
                     &materialized[right_start..],
-                )?;
+                ) {
+                    Ok(nbytes) => nbytes,
+                    Err(e) => {
+                        Self::btrfs_discard_extent_segment(alloc, canonical, key.offset);
+                        Self::btrfs_restore_extent_item(alloc, &key, &extent_bytes);
+                        return Err(e);
+                    }
+                };
+                Self::btrfs_accumulate_nbytes_delta(&mut nbytes_delta, i128::from(left_nbytes))?;
                 Self::btrfs_accumulate_nbytes_delta(&mut nbytes_delta, i128::from(right_nbytes))?;
+            }
+
+            // Both remnants are in place, so the original's reference can finally
+            // go. Doing this last is what makes the failure paths above recoverable.
+            if let BtrfsExtentData::Regular {
+                disk_bytenr,
+                disk_num_bytes,
+                extent_offset,
+                ..
+            } = extent
+            {
+                if disk_bytenr > 0 {
+                    // u64-wrapping backref offset (matches the clone path, so a
+                    // partially-reflinked extent's backref hashes identically).
+                    let ref_offset = key.offset.wrapping_sub(extent_offset);
+                    Self::btrfs_free_or_drop_extent_ref(
+                        alloc,
+                        disk_bytenr,
+                        disk_num_bytes,
+                        canonical,
+                        ref_offset,
+                        true,
+                    )?;
+                }
             }
         }
 
         Ok(nbytes_delta)
+    }
+
+    /// Put a just-deleted EXTENT_DATA item back verbatim after a failed split.
+    ///
+    /// Its disk extent was deliberately not freed yet, so re-inserting the item
+    /// restores the exact prior state. Best-effort: if the metadata insert itself
+    /// fails there is nothing further to be done, and the caller is already
+    /// returning the original error.
+    fn btrfs_restore_extent_item(alloc: &mut BtrfsAllocState, key: &BtrfsKey, item: &[u8]) {
+        let _ = alloc.fs_tree.insert(*key, item);
+    }
+
+    /// Undo a remnant segment inserted moments ago: drop its EXTENT_DATA item and
+    /// free the extent it allocated, so a failed split leaks neither.
+    fn btrfs_discard_extent_segment(
+        alloc: &mut BtrfsAllocState,
+        canonical: u64,
+        logical_offset: u64,
+    ) {
+        let key = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: logical_offset,
+        };
+        let Some(bytes) = alloc.fs_tree.get(&key) else {
+            return;
+        };
+        if let Ok(BtrfsExtentData::Regular {
+            disk_bytenr,
+            disk_num_bytes,
+            extent_offset,
+            ..
+        }) = parse_extent_data(&bytes)
+            && disk_bytenr > 0
+        {
+            let ref_offset = logical_offset.wrapping_sub(extent_offset);
+            let _ = Self::btrfs_free_or_drop_extent_ref(
+                alloc,
+                disk_bytenr,
+                disk_num_bytes,
+                canonical,
+                ref_offset,
+                true,
+            );
+        }
+        let _ = alloc.fs_tree.delete(&key);
     }
 
     fn btrfs_extent_data_items(
