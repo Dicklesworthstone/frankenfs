@@ -11,10 +11,11 @@ Latin-square physical-arm crossover. Every row carries **two same-invocation A/A
 controls** — one per filesystem type — and both are printed. A ratio above `1.0` means
 FrankenFS is **slower** than the kernel.
 
-All seven ext4 surfaces now score. **0 wins / 6 losses / 1 neutral / 0 unscored.**
+All eight ext4 surfaces now score. **0 wins / 7 losses / 1 neutral / 0 unscored.**
 (Warm stat added 2026-08-04 — it was the one shape btrfs banked and ext4 did not.
-Xattr get/list report added 2026-08-05, bd-ext4-xattr-row-unscored-a21dz — the harness
-could already run it and neither scorecard carried it.)
+Xattr get/list report and bulk durable write added 2026-08-05,
+bd-ext4-xattr-row-unscored-a21dz and bd-bulk-durable-write-unscored-orfck — the harness
+could already run both and neither scorecard carried either.)
 
 ## The rows
 
@@ -27,6 +28,7 @@ could already run it and neither scorecard carried it.)
 | **Parallel metadata writes** — 8 workers create exactly 512 empty files into private directories, then fsync every worker directory (**128 crossover blocks**) | **`1.510822x` `[1.493097, 1.539011]` slower** (twice-null margin `1.049223x`); replicated on a **disjoint CPU set** at `1.513052x [1.490837, 1.534711]`, agreeing to **0.15%** | `1.007184x [0.998479, 1.024316]`, spread `1.024316x` · replicate `0.998642x [0.990286, 1.009556]`, spread `1.009809x` | `0.995707x [0.978797, 1.000111]`, spread `1.021662x` · replicate `0.998780x [0.990819, 1.002688]`, spread `1.009266x` | `amd-pstate-epp` / `powersave` / **`performance`** (host EPP differed in this window; uniform across both metadata runs) | **8 → 8** on all four arms, pinning attested | **LOSE** |
 | **Warm stat** — issue 2,000 `stat` calls against one mounted file and aggregate the metadata (ro) | **`4.812194x` `[4.779087, 4.819425]` slower** (twice-null margin `1.035698x`) | `1.002547x` | `1.000593x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
 | **Xattr get/list report** — repeat 2,000 five-call reports: read one inline value, read one external-block value, check one absent name, list one name, list 24 names (ro) | **`5.749816x` `[5.725990, 5.756846]` slower** (twice-null margin `1.009130x`) | `0.999678x [0.996487, 1.002264]`, spread `1.003525x` | `1.000266x [0.995466, 1.001873]`, spread `1.004555x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
+| **Bulk durable write** — overwrite one preallocated 64 MiB file with 64 sequential 1 MiB positioned writes, then one file `fsync` (**2,048 pairs / 512 crossover blocks**) | **`2.898298x` `[2.874382, 2.920502]` slower** (twice-null margin `1.035235x`) | `1.001588x [0.997161, 1.009249]`, spread `1.009249x` | `0.989118x [0.982835, 0.994415]`, spread `1.017465x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
 
 Admission required, per row: both A/A symmetric spreads at most `1.025x` with intervals
 containing `1.0`; the effect clearing **twice the widest null log-margin**; exact
@@ -45,6 +47,27 @@ above and must not be diffed against them as if one window produced both.
 **Btrfs: UNRUNNABLE for this workload, by the harness's own refusal**, not by omission —
 `xattr-get-list-report currently requires --filesystem ext4 because its inline/external
 storage-shape proof is ext4-specific`. Recorded the way the btrfs fsync row was.
+
+**The bulk durable write row also stands in its own window** (2026-08-05, kernel
+`6.17.0-41-generic`, candidate ELF `bcf2bc80…`), and it needed **2,048 pairs** to be
+admitted: this workload's variance is the durability boundary itself, since a mutating
+workload is forced to `--observation-repeats 1` and has no min-of-3 to lean on. The
+progression is worth recording so nobody re-derives it — 32 pairs blocked on both null
+medians, 64 pairs fixed the medians but left spreads at `1.034978`/`1.053581`, 512 pairs
+reached `1.021700`/`1.027309` (still over the `1.025` limit by a hair), and 2,048 pairs
+cleared at `1.009249`/`1.017465`.
+
+⚠ **This row is `2.898298x` where the 2026-07-31 ledger row measured `2.201986x`** for the
+same job shape — about **32% worse**. Different candidate ELF, different kernel, different
+window, so it is *not* proof of a regression, but it is the same instrument and contract on
+both sides and the gap is far outside either interval. Filed as `bd-2i2ez` to be resolved by
+measurement rather than assumed either way. The older figure should not be quoted as current.
+
+**Btrfs bulk durable write: UNRUNNABLE — and unlike the xattr row, by a DEFECT, not a
+policy.** The btrfs arm dies before any measurement with `fsync bulk durable workload
+…/btrfs/fuse_a/bulk-durable.bin: Invalid argument (os error 22)`, while the ext4 arm of the
+identical invocation completes. Filed as `bd-cjqhh`; the row stays unscored on btrfs until
+that EINVAL is fixed or proven to be a legitimate unsupported-operation answer.
 
 ## One sentence per row
 
