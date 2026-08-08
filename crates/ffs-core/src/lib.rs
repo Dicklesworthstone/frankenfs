@@ -54944,6 +54944,118 @@ mod tests {
         concurrent_create_delete_counter_check_bd_y2t0r(false);
     }
 
+    /// bd-5vis3: is the un-prewarmed btrfs stat cost per-inode DESCENT work over
+    /// already-cached nodes, or is the 512-node cache THRASHING?
+    ///
+    /// Those have opposite fixes — a descent memo versus a bigger/smarter cache —
+    /// and bd-3zx2x's 15.61x prewarm-on-versus-off measurement cannot tell them
+    /// apart, because it only times the two arms. This counts what actually
+    /// happens: node-cache lookups per stat and their hit rate.
+    ///
+    /// It also VALIDATES the counters added in 5ebd43b0, which until now had never
+    /// been observed producing a number. `perf` is unavailable on this host
+    /// (`perf_event_paranoid=4`), so counters are the instrument available.
+    ///
+    /// Skips cleanly when btrfs-progs is absent or cannot bake a populated image,
+    /// matching every other fixture-dependent test here.
+    #[test]
+    fn btrfs_stat_without_prewarm_is_descent_work_not_cache_thrash_bd_5vis3() {
+        let Some((fs, entries)) = open_populated_btrfs_readonly_bd_5vis3(48) else {
+            return; // btrfs-progs unavailable, or no rootdir support
+        };
+        let cx = Cx::for_testing();
+        assert!(
+            entries >= 8,
+            "fixture must hold enough inodes to be meaningful, got {entries}"
+        );
+
+        // Stat every entry with NO prewarm, so each getattr resolves its inode
+        // through the fs-tree exactly as the FUSE mount does.
+        let (lookups_before, hits_before) = crate::btrfs_node_cache_counters();
+        let root = InodeNumber(1);
+        let listing = fs.readdir(&cx, root, 0).expect("readdir root");
+        let mut stats = 0_u64;
+        for entry in &listing {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
+            if fs.getattr(&cx, entry.ino).is_ok() {
+                stats += 1;
+            }
+        }
+        let (lookups_after, hits_after) = crate::btrfs_node_cache_counters();
+        let lookups = lookups_after.saturating_sub(lookups_before);
+        let hits = hits_after.saturating_sub(hits_before);
+        assert!(stats > 0, "no entry could be stat'd");
+        assert!(
+            lookups > 0,
+            "the node-cache counters never moved across {stats} stats — the \
+             instrument is not wired to the path it claims to measure (bd-5vis3)"
+        );
+
+        let per_stat = lookups as f64 / stats as f64;
+        let hit_rate = hits as f64 / lookups as f64;
+        println!(
+            "bd-5vis3: {stats} stats, {lookups} node lookups ({per_stat:.2}/stat), \
+             {hits} hits ({:.1}%)",
+            hit_rate * 100.0
+        );
+
+        // THE DISCRIMINATOR. A descent over cached nodes re-walks root+interior
+        // per inode, so lookups/stat stays small and MOST resolve from cache. A
+        // thrashing cache would show a hit rate collapsing toward zero, meaning
+        // the fix is cache sizing rather than a descent memo. The bound is loose
+        // on purpose: this asserts WHICH REGIME the path is in, not a number to
+        // regress against, and a small fixture's first-touch misses are real.
+        assert!(
+            hit_rate > 0.25,
+            "node-cache hit rate {:.1}% across {stats} stats ({per_stat:.2} \
+             lookups/stat) — that is cache THRASHING, not descent-over-cached-nodes. \
+             bd-5vis3's leaf-memo design targets the wrong mechanism if this holds \
+             on a large fixture; re-check before implementing it.",
+            hit_rate * 100.0
+        );
+    }
+
+    /// Build a small btrfs image with a populated root and open it READ-ONLY (the
+    /// mode where the parsed-node cache is active), returning the fs and the file
+    /// count. `None` when btrfs-progs is missing or cannot bake a directory in.
+    fn open_populated_btrfs_readonly_bd_5vis3(files: usize) -> Option<(OpenFs, usize)> {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir(&seed).ok()?;
+        for i in 0..files {
+            std::fs::write(seed.join(format!("f{i:05}")), b"x").ok()?;
+        }
+        let image = tmp.path().join("bd5vis3.btrfs");
+        let f = std::fs::File::create(&image).ok()?;
+        f.set_len(512 * 1024 * 1024).ok()?;
+        drop(f);
+        // `--rootdir` bakes the seed tree in without a mount. Not every
+        // btrfs-progs build has it; absence is a skip, not a failure.
+        let out = std::process::Command::new("mkfs.btrfs")
+            .args(["-f", "-q", "--rootdir"])
+            .arg(&seed)
+            .arg(&image)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let cx = Cx::for_testing();
+        let data = std::fs::read(&image).ok()?;
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(data)),
+            &OpenOptions::default(),
+        )
+        .ok()?;
+        // Keep `tmp` alive for the fs's lifetime by leaking it: the device owns a
+        // copy of the bytes, but the temp dir must outlive any lazy path use.
+        std::mem::forget(tmp);
+        Some((fs, files))
+    }
+
     /// bd-y2t0r audit: the ORDERING that makes recovery-time inode frees safe.
     ///
     /// `maybe_recover_ext4_orphans` and `free_fast_commit_deleted_inode` both
