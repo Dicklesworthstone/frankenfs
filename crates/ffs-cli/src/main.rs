@@ -4356,6 +4356,29 @@ fn walk_one_dir(
 /// its worker threads, so the cold per-directory metadata reads overlap (the
 /// single-threaded walk serializes them and understates frankenfs's throughput).
 #[allow(clippy::too_many_lines)]
+/// Whether `walk` prewarms the btrfs read-plan index. Default ON, i.e. every
+/// existing invocation is unchanged.
+///
+/// `FFS_BTRFS_PREWARM_READ_PLAN=0` suppresses it, and exists to make ONE
+/// measurement possible (bd-3zx2x). The index turns `btrfs_read_inode_attr` into
+/// an O(1) map hit; without it every stat is an O(log N) fs-tree descent. The
+/// mounted comparator never prewarms — `prewarm_btrfs_read_plan_index` has only
+/// two call sites, `readdirbench_cmd` and this one, both in-process — so every
+/// in-process result on bd-3zx2x was taken in a configuration the banked
+/// mounted rows never ran in. That may be why six successive hypotheses about
+/// the btrfs readdir+stat excess were each refuted in process while the excess
+/// itself stayed put.
+///
+/// Suppressing the prewarm makes the instrument resolve inodes the way the mount
+/// does, so the A/B attributes the excess or kills the explanation. It is a
+/// measurement toggle, not a tuning knob: nothing should depend on it being off.
+fn btrfs_read_plan_prewarm_enabled() -> bool {
+    !std::env::var("FFS_BTRFS_PREWARM_READ_PLAN").is_ok_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    })
+}
+
 fn walk_cmd(path: &PathBuf, no_stat: bool, parallel: bool, read_data: bool) -> Result<()> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4409,7 +4432,7 @@ fn walk_cmd(path: &PathBuf, no_stat: bool, parallel: bool, read_data: bool) -> R
     // during the walk. (The prefetch above is orthogonal: it warms getattr and
     // stays on for the stat walk.)
     open_fs.set_readonly_lookup_cache_disabled(true);
-    if matches!(&open_fs.flavor, FsFlavor::Btrfs(_)) {
+    if matches!(&open_fs.flavor, FsFlavor::Btrfs(_)) && btrfs_read_plan_prewarm_enabled() {
         open_fs
             .prewarm_btrfs_read_plan_index(&cx)
             .context("failed to prewarm btrfs walk plan index")?;
