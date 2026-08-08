@@ -54565,17 +54565,107 @@ mod tests {
     ///
     /// This test drives the same shape through the DIRECT in-process path —
     /// `OpenFs::unlink`, i.e. `with_latest_scope` — and the counters stay exact.
-    /// Because the leak is one-per-delete, 768 operations would already show it, so
-    /// the failure is **path-specific, not scale-specific**: this path is clean and
-    /// the defect lives somewhere the mounted arm goes and this does not.
     ///
-    /// The concrete difference to chase: the FUSE handler
-    /// (`ffs-fuse` `unlink`) wraps the same `FsOps::unlink` in
-    /// `with_request_scope` and then calls `commit_request_scope`, where this test
-    /// uses `with_latest_scope`. That scope-commit path is the next place to look.
+    /// Its sibling `request_scope_create_delete_cycles_..._bd_pbyu0` drives the
+    /// identical workload through the per-request scope path the FUSE daemon uses,
+    /// at 20,000 allocations across multiple inode groups, and is ALSO clean. So
+    /// both in-process paths are correct at comparator-like volume, and whatever
+    /// bd-pbyu0 is, it needs something only the mounted arm has — the live FUSE
+    /// mount, the daemon's unmount/`flush_on_destroy` path, or the cloned-from-base
+    /// image the comparator mounts rather than a freshly formatted one.
     ///
     /// Keep this test regardless of how `bd-pbyu0` is fixed: it pins that the
     /// direct path is correct, so a fix elsewhere cannot silently regress it.
+    /// bd-pbyu0: the same create/delete cycles driven through the PER-REQUEST
+    /// SCOPE path that the FUSE daemon uses, rather than `with_latest_scope`.
+    ///
+    /// The direct-path sibling test below is clean, which proved the leak is
+    /// path-specific rather than scale-specific. This isolates the one structural
+    /// difference between the two: `ffs-fuse`'s `unlink` handler wraps the same
+    /// `FsOps::unlink` in `begin_request_scope` / `commit_request_scope` /
+    /// `end_request_scope`, one scope per operation. Everything else — the same
+    /// `ext4_unlink_impl`, `delete_inode`, `free_inode_persist` — is shared.
+    ///
+    /// ⚠ It does NOT reproduce, at 512 MiB / 40 cycles / 500 files = 20,000
+    /// allocations. So the per-request scope commit is ELIMINATED as the cause,
+    /// and so is scale. Kept as the second negative control: between them these
+    /// two tests pin both in-process paths as correct at comparator-like volume.
+    #[test]
+    fn request_scope_create_delete_cycles_keep_free_inode_counters_exact_bd_pbyu0() {
+        // 512 MiB gives ~4 inode groups. Size matters: the comparator's damage was
+        // in groups #5-#13 driven to ZERO free, which can only happen once
+        // allocation SWEEPS ACROSS groups, and a 64 MiB image is a single group so
+        // it cannot express the condition at all.
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(512) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // Enough allocations to walk past one group's worth of inodes even if
+        // nothing is reused, which is the state the corrupt image was in.
+        const FILES_PER_CYCLE: usize = 500;
+        const CYCLES: usize = 40;
+
+        // One scope per operation, opened and committed exactly as the FUSE
+        // handlers do, so the only thing that differs from the direct-path test is
+        // the scope lifecycle.
+        let mut scoped = |op: RequestOp,
+                          run: &mut dyn FnMut(&mut RequestScope) -> ffs_error::Result<()>|
+         -> ffs_error::Result<()> {
+            let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, op)?;
+            let result = run(&mut scope).and_then(|()| {
+                <OpenFs as FsOps>::commit_request_scope(&fs, &mut scope).map(|_| ())
+            });
+            let end = <OpenFs as FsOps>::end_request_scope(&fs, &cx, op, scope);
+            result.and(end)
+        };
+
+        for cycle in 0..CYCLES {
+            for index in 0..FILES_PER_CYCLE {
+                let name = format!("scoped-{cycle:03}-{index:04}");
+                scoped(RequestOp::Create, &mut |scope| {
+                    <OpenFs as FsOps>::create(&fs, &cx, scope, root, OsStr::new(&name), 0o644, 0, 0)
+                        .map(|_| ())
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "scoped create {name} failed on cycle {cycle}: {error}. ENOSPC here \
+                         on a filesystem this empty is the allocation-side face of the \
+                         bd-pbyu0 counter drift."
+                    )
+                });
+            }
+            for index in 0..FILES_PER_CYCLE {
+                let name = format!("scoped-{cycle:03}-{index:04}");
+                scoped(RequestOp::Unlink, &mut |scope| {
+                    <OpenFs as FsOps>::unlink(&fs, &cx, scope, root, OsStr::new(&name))
+                })
+                .unwrap_or_else(|error| panic!("scoped unlink {name} failed: {error}"));
+            }
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush to device");
+        let image = tmp.path().join("scoped-storm.ext4");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(
+            !output.contains("Free inodes count wrong"),
+            "group descriptor free-inode counters drifted from the bitmaps after \
+             {CYCLES} x {FILES_PER_CYCLE} create/delete cycles driven through PER-REQUEST \
+             SCOPES (bd-pbyu0). The direct-path sibling test is clean, so this isolates the \
+             defect to per-request scope commit:\n{output}"
+        );
+        assert!(
+            clean,
+            "e2fsck must accept the image after request-scoped create/delete cycles \
+             (bd-pbyu0):\n{output}"
+        );
+    }
+
     #[test]
     fn direct_path_create_delete_cycles_keep_free_inode_counters_exact_not_a_bd_pbyu0_repro() {
         let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
