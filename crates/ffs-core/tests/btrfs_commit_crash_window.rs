@@ -139,8 +139,15 @@ fn build_baseline(dir: &Path, size_mb: u64) -> Option<PathBuf> {
     let dev = FileByteDevice::open(&image).expect("open baseline device");
     let fs = open_rw(&cx, Box::new(dev)).expect("open baseline image");
     for i in 0..BASELINE_FILES {
-        fs.create(&cx, BTRFS_ROOT_DIR, OsStr::new(&baseline_name(i)), 0o644, 0, 0)
-            .expect("create baseline file");
+        fs.create(
+            &cx,
+            BTRFS_ROOT_DIR,
+            OsStr::new(&baseline_name(i)),
+            0o644,
+            0,
+            0,
+        )
+        .expect("create baseline file");
     }
     FsOps::flush_on_destroy(&fs, &cx).expect("baseline commit must succeed");
     drop(fs);
@@ -155,9 +162,7 @@ fn assert_baseline_survives(cx: &Cx, path: &Path, context: &str) {
     });
     for i in 0..BASELINE_FILES {
         fs.lookup(cx, BTRFS_ROOT_DIR, OsStr::new(&baseline_name(i)))
-            .unwrap_or_else(|e| {
-                panic!("{context}: committed file {} lost: {e}", baseline_name(i))
-            });
+            .unwrap_or_else(|e| panic!("{context}: committed file {} lost: {e}", baseline_name(i)));
     }
 }
 
@@ -177,8 +182,15 @@ fn run_crash_window(baseline: &Path, work: &Path, allowed: usize) -> usize {
         let fs = open_rw(&cx, Box::new(dev)).expect("open work image");
         for i in 0..DOOMED_FILES {
             // A create is pure in-memory tree work; it must not fail here.
-            fs.create(&cx, BTRFS_ROOT_DIR, OsStr::new(&doomed_name(i)), 0o644, 0, 0)
-                .expect("create doomed file");
+            fs.create(
+                &cx,
+                BTRFS_ROOT_DIR,
+                OsStr::new(&doomed_name(i)),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create doomed file");
         }
         // May succeed (crash point past the end of the commit) or fail (crash
         // inside it). Both are legal; what is NOT legal is an unmountable image.

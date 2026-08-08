@@ -20407,6 +20407,162 @@ mod tests {
     // ── Extent allocator edge-case tests ──────────────────────────────
 
     #[test]
+    /// bd-mqb9t: freeing the live trees' extent items at the top of a commit
+    /// must NOT hand their space back inside that same commit.
+    ///
+    /// `remove_metadata_items_owned_by_roots` deletes the extent items of the
+    /// trees the on-disk superblock still points at, so the newly serialized
+    /// extent tree carries no stale entries. The allocator derives free space
+    /// purely from extent items, so before the pin those addresses read as free
+    /// immediately — and the transaction's own node writes landed on the live
+    /// filesystem.
+    #[test]
+    fn freed_live_tree_blocks_are_not_reallocated_in_the_same_transaction_bd_mqb9t() {
+        const BG: u64 = 0x10_0000;
+        const NODESIZE: u64 = 16_384;
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.set_nodesize(NODESIZE);
+        alloc.add_block_group(BG, make_meta_bg(BG, 0x100_0000));
+
+        // Stand in for the trees the committed superblock points at.
+        let live: Vec<u64> = (0..4)
+            .map(|_| {
+                alloc
+                    .alloc_metadata_for_tree(NODESIZE, BTRFS_FS_TREE_OBJECTID, 0)
+                    .expect("seed live tree block")
+                    .bytenr
+            })
+            .collect();
+
+        // Top of the next commit: their items go, so the extent tree we write
+        // describes only live blocks.
+        let removed = alloc
+            .remove_metadata_items_owned_by_roots(&[BTRFS_FS_TREE_OBJECTID])
+            .expect("remove stale items");
+        assert_eq!(removed, live.len(), "every seeded item must be removed");
+        for &bytenr in &live {
+            assert!(
+                alloc.is_pinned(bytenr),
+                "block {bytenr} is still the on-disk filesystem and must be pinned"
+            );
+        }
+
+        // Now allocate this transaction's replacement nodes. None may land on a
+        // block the superblock still references.
+        for _ in 0..16 {
+            let got = alloc
+                .alloc_metadata_for_tree(NODESIZE, BTRFS_FS_TREE_OBJECTID, 0)
+                .expect("allocate replacement node")
+                .bytenr;
+            assert!(
+                !live.contains(&got),
+                "allocated {got} over a block the committed superblock still points at"
+            );
+        }
+    }
+
+    /// bd-mqb9t: and the space IS reclaimed — one transaction later.
+    ///
+    /// The release is the superblock write's counterpart: before it the old
+    /// trees are the filesystem, after it they are garbage. If the pin were
+    /// permanent this would be a space leak instead of a correctness fix.
+    #[test]
+    fn pinned_blocks_are_released_after_the_superblock_commits_bd_mqb9t() {
+        const BG: u64 = 0x10_0000;
+        const NODESIZE: u64 = 16_384;
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.set_nodesize(NODESIZE);
+        alloc.add_block_group(BG, make_meta_bg(BG, 0x100_0000));
+
+        let live = alloc
+            .alloc_metadata_for_tree(NODESIZE, BTRFS_FS_TREE_OBJECTID, 0)
+            .expect("seed")
+            .bytenr;
+        alloc
+            .remove_metadata_items_owned_by_roots(&[BTRFS_FS_TREE_OBJECTID])
+            .expect("remove");
+        assert!(alloc.is_pinned(live));
+
+        // Superblock lands: this transaction's trees are now the filesystem.
+        alloc.release_pinned_after_superblock_commit();
+        assert!(
+            !alloc.is_pinned(live),
+            "a block the superblock no longer points at must become reusable"
+        );
+    }
+
+    /// bd-mqb9t: allocations that skip the EXTENT_ITEM must still be protected —
+    /// from each other, and across the transaction that publishes them.
+    ///
+    /// The extent tree's and root tree's own nodes never get an extent item
+    /// (bd-4nz82), so without a pin nothing at all keeps a later allocation off
+    /// them. They must also survive ONE rotation, because they stay live until
+    /// the NEXT transaction's superblock lands.
+    #[test]
+    fn skip_extent_item_allocations_are_pinned_for_two_generations_bd_mqb9t() {
+        const BG: u64 = 0x10_0000;
+        const NODESIZE: u64 = 16_384;
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.set_nodesize(NODESIZE);
+        alloc.add_block_group(BG, make_meta_bg(BG, 0x100_0000));
+
+        let root_a = alloc
+            .alloc_metadata_for_root_tree(NODESIZE, 0)
+            .expect("root tree node")
+            .bytenr;
+        let extent_a = alloc
+            .alloc_metadata_for_extent_tree(NODESIZE, 0)
+            .expect("extent tree node")
+            .bytenr;
+        assert_ne!(root_a, extent_a, "two live nodes cannot share an address");
+        assert!(alloc.is_pinned(root_a) && alloc.is_pinned(extent_a));
+
+        // Transaction 1 commits: root_a/extent_a are now THE filesystem, so they
+        // must stay pinned even though the pinned set rotated.
+        alloc.release_pinned_after_superblock_commit();
+        assert!(
+            alloc.is_pinned(root_a) && alloc.is_pinned(extent_a),
+            "the just-published root/extent tree is live and must stay pinned"
+        );
+
+        // Transaction 2 allocates its own copies; they must not collide.
+        let root_b = alloc
+            .alloc_metadata_for_root_tree(NODESIZE, 0)
+            .expect("root tree node 2")
+            .bytenr;
+        assert!(
+            root_b != root_a && root_b != extent_a,
+            "transaction 2 allocated {root_b} over a live tree block"
+        );
+
+        // Transaction 2 commits: generation 1's blocks are finally free.
+        alloc.release_pinned_after_superblock_commit();
+        assert!(
+            !alloc.is_pinned(root_a) && !alloc.is_pinned(extent_a),
+            "two-generations-old blocks must be reclaimed, or the pin leaks space"
+        );
+        assert!(alloc.is_pinned(root_b), "generation 2 is still live");
+    }
+
+    /// The gap finder needs a sorted, DISJOINT range list; unioning extent items
+    /// with pinned extents can produce duplicates and overlaps (bd-mqb9t).
+    #[test]
+    fn coalesce_ranges_merges_overlaps_and_duplicates_bd_mqb9t() {
+        assert_eq!(coalesce_ranges(vec![]), vec![]);
+        // Disjoint input passes through untouched.
+        assert_eq!(
+            coalesce_ranges(vec![(0, 10), (20, 10)]),
+            vec![(0, 10), (20, 10)]
+        );
+        // Exact duplicate (a pinned block whose extent item still exists).
+        assert_eq!(coalesce_ranges(vec![(0, 10), (0, 10)]), vec![(0, 10)]);
+        // Overlap, touching, and a range fully contained in the previous one.
+        assert_eq!(coalesce_ranges(vec![(0, 10), (5, 10)]), vec![(0, 15)]);
+        assert_eq!(coalesce_ranges(vec![(0, 10), (10, 5)]), vec![(0, 15)]);
+        assert_eq!(coalesce_ranges(vec![(0, 100), (10, 5)]), vec![(0, 100)]);
+    }
+
+    #[test]
     fn alloc_metadata_no_metadata_bg_fails() {
         let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
         // Only add a data block group, no metadata.

@@ -29205,19 +29205,22 @@ impl OpenFs {
         // blocks pinned, which is what makes a commit that fails part-way a
         // no-op against the on-disk filesystem rather than the thing that
         // destroys it. This call must stay AFTER the superblock write+sync and
-        // must not run on any error path.
-        let released = alloc.extent_alloc.release_pinned_after_superblock_commit();
+        // must not run on any error path. The allocation lock was released above
+        // for the superblock I/O, so retake it just for the rotation.
+        {
+            let mut alloc = alloc_mutex.write();
+            let released = alloc.extent_alloc.release_pinned_after_superblock_commit();
+            debug!(
+                target: "ffs::btrfs::writeback",
+                operation_id,
+                released_pinned_extents = released,
+                still_pinned = alloc.extent_alloc.pinned_extent_count(),
+                "pinned_extents_rotated"
+            );
+        }
 
         // Record superblock commit (for crash point tracking)
         executor.commit_superblock();
-
-        debug!(
-            target: "ffs::btrfs::writeback",
-            operation_id,
-            released_pinned_extents = released,
-            still_pinned = alloc.extent_alloc.pinned_extent_count(),
-            "pinned_extents_rotated"
-        );
 
         info!(
             target: "ffs::btrfs::writeback",
