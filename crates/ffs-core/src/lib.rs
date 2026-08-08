@@ -22205,12 +22205,15 @@ impl OpenFs {
                             tstamp_secs,
                             persist_ctx,
                         )?;
-                        let loc = ffs_inode::locate_inode(child_ino, geo, groups).ok_or_else(
-                            || FfsError::Corruption {
-                                block: 0,
-                                detail: format!("sharded unlink: inode {child_ino} out of range"),
-                            },
-                        )?;
+                        let loc =
+                            ffs_inode::locate_inode(child_ino, geo, groups).ok_or_else(|| {
+                                FfsError::Corruption {
+                                    block: 0,
+                                    detail: format!(
+                                        "sharded unlink: inode {child_ino} out of range"
+                                    ),
+                                }
+                            })?;
                         ffs_inode::write_inode_at_slot_scoped(
                             cx,
                             tx_dev,
@@ -54655,22 +54658,38 @@ mod tests {
     /// workload, so this is attributable to the sharded path rather than to
     /// concurrent removal being unsupported generally.
     ///
-    /// Mechanism, and it is a specific gap rather than a mystery: concurrent
-    /// ALLOCATION merges because the alloc path stages its bitmap update under
-    /// `MergeProof::BitmapOr` (`rmw_block_bitmap_or`, ffs-alloc:2710), so two
-    /// threads setting different bits in one bitmap block combine instead of
-    /// conflicting. The FREE path has no counterpart — it writes the whole bitmap
-    /// block with `write_block`, so two threads CLEARING different bits in the
-    /// same block first-committer-wins against each other. Finishing this needs a
-    /// clear-bits merge proof (the AND-NOT dual of `BitmapOr`) wired into the
-    /// inode-free path.
+    /// ⚠ THE ORIGINAL BITMAP DIAGNOSIS WAS WRONG, and the correction is the whole
+    /// reason this doc comment is long. The conflict was attributed to the inode
+    /// BITMAP lacking a clear-bits merge proof. Adding the layout dump below
+    /// measured it instead:
+    ///
+    ///     group 0: block_bitmap=33 inode_bitmap=35 inode_table=37
+    ///     group 1: block_bitmap=34 inode_bitmap=36 inode_table=2085
+    ///
+    /// Every reported conflict is on 37, 38 or 2085 — the inode TABLES (38 is
+    /// table+1). The inode bitmaps, 35 and 36, have never appeared in one. The
+    /// bitmap gap was real and is now fixed (`MergeProof::BitmapDelta`), but it
+    /// was not what blocks this test.
+    ///
+    /// REMAINING MECHANISM, partly fixed: an inode-table block holds 16 inodes at
+    /// 256 bytes each, so workers deleting different inodes share a block while
+    /// their slots stay disjoint. The delete path's zeroed-inode write-back now
+    /// stages a slot-scoped proof (`write_inode_at_slot_scoped`), matching what
+    /// the sharded CREATE path already did. Conflicts persist on 37/38, so at
+    /// least one more writer to those blocks still stages an opaque whole-block
+    /// write. The leading suspect, UNVERIFIED: each unlink also updates its PARENT
+    /// directory's inode (mtime/ctime) via plain `write_inode`, and the eight
+    /// per-worker directories `w0..w7` were created consecutively, so all eight
+    /// parent inodes land in ONE table block — exactly block 37. Confirm that
+    /// before wiring anything: `ext4_sharded_write_inode` already exists for
+    /// parent-inode updates on the create side.
     ///
     /// Note the shipping default is OFF (`bd-pbyu0`), so this affects only an
     /// explicit `FFS_BHH0I_SHARDED=1` opt-in. Un-`ignore` this test as part of the
     /// fix — it is the acceptance gate for re-enabling the default.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: sharded free path lacks a clear-bits merge proof; conflicts under concurrency"]
+    #[ignore = "bd-y2t0r: sharded delete still FCW-conflicts on the inode TABLE (blocks 37/2085), not the bitmap; see doc comment"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }

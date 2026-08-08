@@ -1000,8 +1000,7 @@ pub fn release_inode_storage(
     now_secs: u64,
     pctx: &ffs_alloc::PersistCtx,
 ) -> Result<bool> {
-    let is_dir =
-        release_inode_storage_inner(cx, dev, geo, groups, ino, inode, now_secs, pctx)?;
+    let is_dir = release_inode_storage_inner(cx, dev, geo, groups, ino, inode, now_secs, pctx)?;
 
     // Write the zeroed-out inode to disk.
     write_inode(cx, dev, geo, groups, ino, inode, csum_seed)?;
