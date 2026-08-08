@@ -1,27 +1,36 @@
 # Mounted-kernel scorecard: FrankenFS FUSE against the incumbent, Linux kernel ext4
 
-> ## ⛔ NO ROW IN THIS FILE DESCRIBES FRANKENFS AT `HEAD`
+> ## ⛔ ONE ROW DESCRIBES FRANKENFS AT `HEAD`. THE OTHER SEVEN DO NOT.
 >
-> **Every row here was measured on an ELF that predates the current tree**, and none has been
-> re-measured since. The provenance, row by row:
+> **readdir+stat was re-measured 2026-08-08** on candidate `913c36a4…` (PGO `b30de364…`,
+> x86-64-v3 attested) after `bd-plkzd` corrected its fixture, twice, both admitted. **Every
+> other row here was measured on an ELF that predates the current tree** and none has been
+> re-measured. The provenance, row by row:
 >
 > | Rows | Candidate ELF | Measured |
 > | --- | --- | --- |
-> | readdir+stat, create/delete storm, parallel read, fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
+> | **readdir+stat** | **`913c36a4…`** | **2026-08-08 (current)** |
+> | create/delete storm, parallel read, fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
 > | Warm stat | `9e32e28f…` | 2026-08-04 |
 > | Xattr get/list report, bulk durable write | `bcf2bc80…` | 2026-08-05 |
 >
-> Since the newest of those, **three btrfs correctness commits have landed** — `839eb708`
-> (durable commit could not serialize its own leaves: `fsync` EINVAL and a failed unmount
-> flush, so data was never persisted), `241093de` and `9d64f4a1` (a write that failed with
-> ENOSPC destroyed the data it could not replace), and `7fac4779` (extent splits reference
-> the shared extent instead of copying it, which removes a read and an allocation from every
-> overwrite-split). The last of those changes the write path's I/O profile, so it can move
-> these numbers in either direction.
+> ⚠ The re-measured readdir+stat row is **not** comparable with the other seven as if one
+> window produced them: it uses a freshly trained PGO profile (`b30de364…`, not the bank's
+> `5c6530a0…` — the banked profile was destroyed, see `bd-v0igv`), a different kernel, and a
+> corrected fixture. It supersedes its own predecessor; it does not re-baseline the others.
 >
-> **Therefore: no figure below may be presented as "FrankenFS today" until it is re-measured
-> on a current ELF.** Quote them as historical, with their ELF, or not at all. This is not a
-> hedge about precision — it is that the binary these describe no longer exists in the tree.
+> Since the newest of the **stale** rows, **three btrfs correctness commits have landed** —
+> `839eb708` (durable commit could not serialize its own leaves: `fsync` EINVAL and a failed
+> unmount flush, so data was never persisted), `241093de` and `9d64f4a1` (a write that failed
+> with ENOSPC destroyed the data it could not replace), and `7fac4779` (extent splits
+> reference the shared extent instead of copying it, which removes a read and an allocation
+> from every overwrite-split). The last of those changes the write path's I/O profile, so it
+> can move those numbers in either direction.
+>
+> **Therefore: no figure below EXCEPT readdir+stat may be presented as "FrankenFS today"
+> until it is re-measured on a current ELF.** Quote the rest as historical, with their ELF, or
+> not at all. This is not a hedge about precision — it is that the binary those seven describe
+> no longer exists in the tree.
 
 > ## ⚠ A CLEAR PREFLIGHT IS NOT EVIDENCE OF COMPARABILITY (`bd-4sull`)
 >
@@ -44,9 +53,20 @@
 > a row's A/A nulls and twice-null margin bound **within-invocation** error only. Cross-window
 > reproducibility is a *separate, unmeasured* quantity unless a second same-ELF run exists.
 > Where one does, quote the observed spread; where none does, quote the worst spread the
-> campaign has measured. Only two same-ELF figures exist so far: **4.71%** on one workload and
-> **9.15%** on bulk durable write. A later measurement that disagrees with a banked row by
-> less than that is **not** a regression, an improvement, or a disagreement — it is unresolved.
+> campaign has measured. Three same-ELF figures now exist: **4.71%** on one workload,
+> **9.15%** on bulk durable write, and **2.73%** on readdir+stat (2026-08-08, the first row
+> banked *with* its spread rather than having it discovered later). A later measurement that
+> disagrees with a banked row by less than that is **not** a regression, an improvement, or a
+> disagreement — it is unresolved.
+>
+> **The readdir+stat pair is the cleanest demonstration of why this rule exists.** Two
+> back-to-back admitted runs of the identical ELF, both `verdict=clear`, measured `4.052605x`
+> and `4.163402x`. That **2.73%** spread is larger than run 1's own CI width (**1.84%**) and
+> larger than its twice-null admission margin (**3.24%** — comparable, and the intervals
+> barely overlap at all). And the split repeats the campaign's pattern: the incumbent arm
+> moved **−3.40%** between the two runs while FrankenFS moved **−1.19%**. Since these ran
+> back-to-back they share thermal and cache history, so 2.73% is a **lower bound** on this
+> row's true cross-window spread, not a measurement of it.
 >
 > **The incumbent's own drift is larger than either figure.** Across three gate-clear windows
 > on one kernel, the kernel ext4 arm of the bulk-durable-write shape moved 77.31 → 83.69 →
@@ -76,7 +96,7 @@ could already run both and neither scorecard carried either.)
 
 | Workload (the job as timed) | FrankenFS ÷ kernel ext4, bootstrap median 95% CI | Kernel A/A null | FUSE A/A null | Governor / EPP on every involved CPU | Worker threads requested → observed | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| **Large-directory readdir+stat** — enumerate 32,768 zero-byte entries, then 8 workers stat every entry exactly once (ro) | **`4.967448x` `[4.946319, 4.989285]` slower** (clears its twice-null margin of `1.016968x`) | `1.000904x [0.996822, 1.008448]`, spread `1.008448x` | `0.998792x [0.997503, 1.000626]`, spread `1.002503x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **8 → 8** on all four arms, pinning attested | **LOSE** |
+| **Large-directory readdir+stat** — enumerate 32,768 zero-byte entries, then 8 workers stat every entry exactly once (ro) | **≈`4.1x` slower** — two admitted same-ELF runs, `4.052605x [4.034231, 4.108783]` and `4.163402x [4.106308, 4.196759]`, margins `1.032372x`/`1.038028x`. **Quote the `2.73%` spread, not either CI.** ⛔ SUPERSEDES the pre-`bd-plkzd` `4.967448x`, measured on an unindexed fixture | run 1 `1.006371x [0.998838, 1.016057]` · run 2 `1.005559x [0.981512, 1.010438]` | run 1 `1.001235x [0.999309, 1.003556]` · run 2 `0.999527x [0.997275, 1.008144]` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **8 → 8** on all four arms, pinning attested | **LOSE** |
 | **Small-file create/delete storm** — serially create 2,000 empty files, fsync the parent, delete all 2,000, fsync again | **`2.753659x` `[2.707500, 2.782302]` slower** (twice-null margin `1.029449x`) | `0.996217x [0.985593, 1.007951]`, spread `1.014618x` | `0.995167x [0.988305, 1.004712]`, spread `1.011833x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **1 → 1** on all four arms, pinning attested | **LOSE** |
 | **Multi-file parallel read** — enumerate and byte-sort 256 × 256 KiB files, then 8 workers `pread` every file exactly once (ro) | **`1.287862x` `[1.269319, 1.307285]` slower** (twice-null margin `1.036157x`) | `1.003293x [0.982553, 1.016450]`, spread `1.017757x` | `0.994130x [0.982397, 1.002347]`, spread `1.017918x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **8 → 8** on all four arms, pinning attested | **LOSE** |
 | **Fsync/journal commit** — 8 × 4 KiB positioned writes to one file, `fsync` after each | `0.997098x [0.990808, 1.009108]` against a twice-null margin of **`1.030661x`**; `directional_claim_clear=false` | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **1 → 1** on all four arms, pinning attested | **NEUTRAL** |
@@ -192,7 +212,19 @@ under the perf umbrella, and it is explicitly NOT claimed here.
 ## One sentence per row
 
 - **Large-directory readdir+stat: we lose.** The kernel finishes the same 32,768-entry
-  stat sweep about five times faster, and this is the worst surface we have measured.
+  stat sweep about **four** times faster (28.0–29.0 ms against our 115.6–117.0 ms).
+  Re-measured 2026-08-08 on a corrected, genuinely htree-indexed fixture (`bd-plkzd`); the
+  old "about five times" figure came from a fixture no real ext4 filesystem has and is
+  withdrawn. ⚠ **The correction moved this number in our favour, and the delta is NOT
+  attributable to the fixture** — the candidate ELF, the PGO profile, the kernel version and
+  the window all changed too. What the recorded absolutes do narrow: our arm moved `+3.1%`
+  against the old row while the *kernel* arm moved `+26.9%`, and the kernel arm does not
+  execute our binary, so the ELF and profile change cannot explain any of it. A plausible
+  mechanism — untested, and it would mean this bead's stated direction was backwards — is
+  that an htree makes `readdir` return **hash** order, scattering the subsequent stat pass
+  across the inode table, where a linear directory returns creation order and therefore
+  walks it sequentially. Settling that needs a same-window A/B of the two fixture
+  constructions on one ELF, which is `bd-pb85e`.
 - **Small-file create/delete storm: we lose.** Creating and deleting 2,000 files with
   two directory fsyncs takes us about 2.75 times as long as ext4.
 - **Multi-file parallel read: we lose.** Even on warm-cache reads of 256 files across 8
@@ -245,7 +277,7 @@ transcription. **Every future row must carry both**; `scripts/perf_ledger_prefli
 
 | Workload | Kernel median batch | FrankenFS median batch |
 | --- | --- | --- |
-| Large-directory readdir+stat, 32,768 entries | 22.84 ms | 113.44 ms |
+| Large-directory readdir+stat, 32,768 entries | **28.98 / 27.99 ms** (runs 1/2) | **117.00 / 115.62 ms** (runs 1/2) |
 | Small-file create/delete storm, 2,000 files | 100.99 ms | 276.60 ms |
 | Multi-file parallel read, 256 × 256 KiB | 3.11 ms | 4.01 ms |
 | Fsync/journal commit, 8 × 4 KiB | 145.49 ms | 145.08 ms |

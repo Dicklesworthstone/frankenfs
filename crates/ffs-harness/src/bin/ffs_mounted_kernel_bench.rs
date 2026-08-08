@@ -1897,9 +1897,21 @@ fn create_base_image(
         FilesystemKind::Ext4 => {
             let mut command = Command::new("mke2fs");
             command.args(["-t", "ext4", "-F", "-q", "-b", "4096"]);
-            if config.workload == Workload::ParallelMetadataWrite {
+            if config.workload == Workload::ParallelMetadataWrite
+                || SeededFixture::for_workload(config.workload).is_some()
+            {
                 // A 2 GiB sweep image must retain enough inodes for
                 // (warmup + measured rounds) * operations unique creates.
+                //
+                // The seeded workloads need this for a reason bd-plkzd introduced
+                // and bd-c5210 inherited: their entries are now created AFTER
+                // mkfs, through a mount, so mke2fs sizes the inode table from its
+                // default ratio (one inode per 16 KiB) with no idea how many files
+                // are coming. A 32,768-entry readdir-stat run on the 256 MiB
+                // default image gets ~16k inodes and dies MID-SEED with ENOSPC,
+                // after the mkfs and the mount — the most expensive place to fail.
+                // Before bd-plkzd, `mke2fs -d` saw the populated tree and sized or
+                // refused up front, so the failure mode did not exist.
                 command.args(["-i", "4096"]);
             }
             run_checked(
