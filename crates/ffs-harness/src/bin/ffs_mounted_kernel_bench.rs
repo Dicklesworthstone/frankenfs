@@ -441,6 +441,12 @@ struct Config {
     /// unknown origin is not evidence, so both are mandatory and recorded.
     harness_builder: String,
     candidate_builder: String,
+    /// How the large fixture directory is constructed (bd-pb85e).
+    ///
+    /// Defaults to the only bankable form. `Baked` restores the pre-bd-plkzd
+    /// unindexed construction so both can be measured in one window on one ELF,
+    /// and forces `BLOCKED_UNFAIR_FIXTURE` so it can never be quoted as a row.
+    fixture_construction: FixtureConstruction,
     output: Option<PathBuf>,
 }
 
@@ -536,6 +542,7 @@ impl Default for Config {
             host_quiet_timeout_ms: DEFAULT_HOST_QUIET_TIMEOUT_MS,
             harness_builder: String::new(),
             candidate_builder: String::new(),
+            fixture_construction: FixtureConstruction::Seeded,
             output: None,
         }
     }
@@ -1094,6 +1101,9 @@ fn usage() {
            --fuse-workers N               FUSE request-dispatch workers for both FUSE A/A arms\n\
                                           (default serial dispatcher; 0 selects serial explicitly)\n\
            --placement-scope SCOPE        same-llc | host-wide (default same-llc)\n\
+           --fixture-construction MODE    seeded | baked (default seeded). `baked` restores the\n\
+                                          pre-bd-plkzd unindexed fixture for ATTRIBUTION ONLY and\n\
+                                          FORCES the BLOCKED_UNFAIR_FIXTURE verdict (bd-pb85e)\n\
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
            --maximum-null-ratio R         Max symmetric A/A CI spread (default 1.025)\n\
@@ -1413,6 +1423,10 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
             }
             "--client-threads" => {
                 config.client_threads = parse_value(args, &mut index, "--client-threads")?;
+            }
+            "--fixture-construction" => {
+                let value = parse_value::<String>(args, &mut index, "--fixture-construction")?;
+                config.fixture_construction = parse_fixture_construction(&value)?;
             }
             "--placement-scope" => {
                 let value = parse_value::<String>(args, &mut index, "--placement-scope")?;
@@ -1735,6 +1749,7 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
             // into it without running as root.
             let parent = root.join("parallel-read");
             fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
+            bake_fixture_entries_if_requested(config, SeededFixture::ParallelRead, &parent)?;
         }
         Workload::CreateDeleteStorm => {
             let path = root.join("create-delete-storm");
@@ -1760,6 +1775,7 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
             // seeding step write into it without running as root.
             let parent = root.join("large-directory");
             fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
+            bake_fixture_entries_if_requested(config, SeededFixture::LargeDirectory, &parent)?;
         }
         Workload::FsyncJournalCommit => {
             write_fixture_file(&root.join("fsync.bin"), 4096, 0xF5)?;
@@ -1779,6 +1795,29 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
         }
     }
     Ok(root)
+}
+
+/// Populate a fixture directory in the HOST tree under `--fixture-construction
+/// baked`, so `mke2fs -d` writes the entries into the base image (bd-pb85e).
+///
+/// Under the default `seeded` this is a no-op and the directory is left empty for
+/// `seed_fixture_through_mount`, exactly as bd-plkzd left it. The entries are
+/// produced by `SeededFixture::create_entry` — the SAME code the seeded path uses
+/// — so the two constructions differ in mechanism and in nothing else. That is
+/// what makes the A/B an attribution rather than another confounded comparison:
+/// same names, same bytes, same count, same everything except who wrote them.
+fn bake_fixture_entries_if_requested(
+    config: &Config,
+    fixture: SeededFixture,
+    parent: &Path,
+) -> Result<()> {
+    if config.fixture_construction != FixtureConstruction::Baked {
+        return Ok(());
+    }
+    for index in 0..config.operations {
+        fixture.create_entry(parent, index)?;
+    }
+    Ok(())
 }
 
 fn create_sized_file(path: &Path, size_mib: u64) -> Result<()> {
@@ -2019,6 +2058,60 @@ fn ensure_ext4_directory_is_htree_indexed(image: &Path, dir: &str) -> Result<()>
 /// baked in with `mke2fs -d`, because `mke2fs -d` writes linear directory blocks
 /// and never builds ext4's htree (bd-plkzd for readdir+stat, bd-c5210 for
 /// parallel read).
+/// How a large fixture directory's entries are put into the base image.
+///
+/// This exists to ATTRIBUTE a measurement, not to offer a choice (bd-pb85e).
+/// bd-plkzd replaced the baked construction with through-mount seeding because
+/// `mke2fs -d` writes linear directory blocks and never builds ext4's htree, and
+/// the ext4 readdir+stat row moved ~18% IN FRANKENFS'S FAVOUR across that change.
+/// Four things moved at once (fixture, candidate ELF, PGO profile, kernel), so no
+/// one can say how much of the 18% the fixture was — and a movement in our own
+/// favour is exactly the kind that must not be banked on a confounded comparison.
+///
+/// Restoring the baked path lets both constructions run in ONE window on ONE ELF,
+/// which removes every confounder except the fixture. That is the entire purpose.
+///
+/// ⛔ `Baked` is KNOWN-UNFAIR and can never produce a bankable row: it is exactly
+/// the defect bd-plkzd fixed. The harness therefore fails closed — a baked run is
+/// forced to the `BLOCKED_UNFAIR_FIXTURE` verdict regardless of how the numbers
+/// come out, so it can be read for attribution and never quoted as a scorecard
+/// row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FixtureConstruction {
+    /// Entries created through a kernel mount of the base image, so each
+    /// filesystem builds its own native directory index. The only bankable form.
+    #[default]
+    Seeded,
+    /// Entries baked into the host tree so `mke2fs -d` writes them — the
+    /// pre-bd-plkzd construction. Measurement-only, never bankable.
+    Baked,
+}
+
+impl FixtureConstruction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Seeded => "seeded",
+            Self::Baked => "baked",
+        }
+    }
+
+    const fn is_bankable(self) -> bool {
+        matches!(self, Self::Seeded)
+    }
+}
+
+fn parse_fixture_construction(value: &str) -> Result<FixtureConstruction> {
+    match value {
+        "seeded" => Ok(FixtureConstruction::Seeded),
+        "baked" => Ok(FixtureConstruction::Baked),
+        other => bail!(
+            "--fixture-construction must be `seeded` or `baked`, got `{other}`. \
+             `baked` restores the pre-bd-plkzd unindexed fixture for ATTRIBUTION ONLY \
+             (bd-pb85e) and forces the BLOCKED_UNFAIR_FIXTURE verdict."
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SeededFixture {
     /// `large-directory`: `operations` empty entries (bd-plkzd).
@@ -5185,11 +5278,22 @@ fn fs_report(
     // so the two arms were not the same filesystem shape. The ext4 index is then
     // ASSERTED, not assumed.
     if let Some(fixture) = SeededFixture::for_workload(config.workload) {
-        seed_fixture_through_mount(kind, &base, fixture, config.operations, interrupted)?;
-        if kind == FilesystemKind::Ext4 {
-            ensure_ext4_directory_is_htree_indexed(&base, fixture.dir_name())?;
+        if config.fixture_construction == FixtureConstruction::Baked {
+            // bd-pb85e: the entries are already in the image, written by
+            // `mke2fs -d` from the host tree. Seeding again would double them, and
+            // the htree assertion is deliberately NOT run — a baked ext4 directory
+            // is linear and unindexed BY CONSTRUCTION, which is the property being
+            // measured. Asserting it here would just fail the run and destroy the
+            // comparison. The fail-closed verdict, not this assertion, is what
+            // stops a baked run being banked.
+            validate_image(kind, &base)?;
+        } else {
+            seed_fixture_through_mount(kind, &base, fixture, config.operations, interrupted)?;
+            if kind == FilesystemKind::Ext4 {
+                ensure_ext4_directory_is_htree_indexed(&base, fixture.dir_name())?;
+            }
+            validate_image(kind, &base)?;
         }
-        validate_image(kind, &base)?;
     }
     let images = clone_images(kind, &base, &fs_dir, arms)?;
 
@@ -5469,7 +5573,15 @@ fn fs_report(
             }
             _ => false,
         };
-    let verdict = if !worker_thread_observation_clear {
+    // bd-pb85e: a baked fixture is the known-unfair construction bd-plkzd removed
+    // — an unindexed ext4 directory that forces every lookup into an O(N) scan.
+    // It is restored ONLY so the fixture effect can be attributed in one window on
+    // one ELF, so this is checked FIRST and unconditionally: no combination of
+    // clear nulls, clear placement or a favourable ratio can produce a bankable
+    // verdict from it. Fail closed, not by convention or by a reviewer noticing.
+    let verdict = if !config.fixture_construction.is_bankable() {
+        "BLOCKED_UNFAIR_FIXTURE"
+    } else if !worker_thread_observation_clear {
         "BLOCKED_THREAD_OBSERVATION"
     } else if !worker_cpu_pinning_clear {
         "BLOCKED_WORKER_CPU_PINNING"
@@ -6205,6 +6317,13 @@ fn fs_report(
         "client_affinity_cpus": placement.driver_cpus,
         "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "placement_scope": config.placement_scope.label(),
+        // bd-pb85e: which construction built the fixture, and whether a row from
+        // this run may be banked at all. Recorded unconditionally, including on
+        // the default seeded path, so a reader never has to infer it from the
+        // absence of a field — a banked row's provenance should not depend on
+        // remembering which flag was in force the day it was taken.
+        "fixture_construction": config.fixture_construction.label(),
+        "fixture_construction_bankable": config.fixture_construction.is_bankable(),
         "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
         "host_quiet_required_consecutive_samples": config.host_quiet_samples,
         "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
@@ -7260,6 +7379,64 @@ mod tests {
                 .contains("copied to"),
             "an in-place build must not describe itself as copied in"
         );
+    }
+
+    /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
+    /// keeps it from becoming a scorecard row must be mechanical rather than a
+    /// convention someone remembers.
+    #[test]
+    fn baked_fixture_construction_is_parsed_and_can_never_be_banked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let base_args = |mode: &str| {
+            vec![
+                "--ffs-cli".to_owned(),
+                cli.display().to_string(),
+                "--harness-builder".to_owned(),
+                "hz1".to_owned(),
+                "--candidate-builder".to_owned(),
+                "hz2".to_owned(),
+                "--fixture-construction".to_owned(),
+                mode.to_owned(),
+            ]
+        };
+
+        let baked = parse_config_args(&base_args("baked"))
+            .expect("parse baked fixture construction")
+            .expect("normal invocation");
+        assert_eq!(baked.fixture_construction, FixtureConstruction::Baked);
+        assert!(
+            !baked.fixture_construction.is_bankable(),
+            "a baked fixture is the known-unfair pre-bd-plkzd construction and must \
+             never be bankable, whatever the numbers come out at"
+        );
+
+        let seeded = parse_config_args(&base_args("seeded"))
+            .expect("parse seeded fixture construction")
+            .expect("normal invocation");
+        assert_eq!(seeded.fixture_construction, FixtureConstruction::Seeded);
+        assert!(seeded.fixture_construction.is_bankable());
+
+        // The DEFAULT is the bankable one. If this ever inverts, every row taken
+        // without the flag silently becomes unfair, which is the exact defect
+        // bd-plkzd fixed.
+        let defaulted = parse_config_args(&[
+            "--ffs-cli".to_owned(),
+            cli.display().to_string(),
+            "--harness-builder".to_owned(),
+            "hz1".to_owned(),
+            "--candidate-builder".to_owned(),
+            "hz2".to_owned(),
+        ])
+        .expect("parse without the flag")
+        .expect("normal invocation");
+        assert_eq!(defaulted.fixture_construction, FixtureConstruction::Seeded);
+
+        // An unknown mode is refused rather than silently defaulted — a typo must
+        // not quietly produce a run of the wrong construction.
+        assert!(parse_fixture_construction("indexed").is_err());
+        assert!(parse_fixture_construction("").is_err());
     }
 
     #[test]
