@@ -19,6 +19,26 @@ use std::sync::Arc;
 
 const MVCC_COMMIT_PRUNE_INTERVAL: u64 = 256;
 
+/// Convert a commit failure into an `FfsError`, PRESERVING a first-committer-wins
+/// conflict as the typed [`FfsError::MvccConflict`] instead of flattening it into
+/// an opaque `Format` string.
+///
+/// The type is what makes an optimistic retry possible: a caller whose patch is
+/// replayable needs to distinguish "someone else committed this block first, try
+/// again" from "this write is malformed", and those are not distinguishable once
+/// both are a string. `MvccConflict` already maps to `EAGAIN`, which is the right
+/// errno for a caller that does NOT retry, so nothing downstream regresses
+/// (bd-y2t0r).
+fn commit_error_to_ffs(error: &CommitError) -> FfsError {
+    match error {
+        CommitError::Conflict { block, .. } => FfsError::MvccConflict {
+            tx: 0,
+            block: block.0,
+        },
+        other => FfsError::Format(other.to_string()),
+    }
+}
+
 /// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
 ///
 /// The enum is always owned behind `Arc`; boxing a variant would add another
@@ -214,7 +234,7 @@ impl FsMvccStore {
         txn.stage_write_with_proof_and_base(block, data, proof, base);
         let commit_seq = self
             .commit(txn)
-            .map_err(|error| FfsError::Format(error.to_string()))?;
+            .map_err(|error| commit_error_to_ffs(&error))?;
         self.prune_after_commit_if_due(commit_seq);
         Ok(())
     }
@@ -517,7 +537,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let commit_seq = self
             .store
             .commit(txn)
-            .map_err(|error| FfsError::Format(error.to_string()))?;
+            .map_err(|error| commit_error_to_ffs(&error))?;
         self.store.prune_after_commit_if_due(commit_seq);
         Ok(())
     }
@@ -578,7 +598,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let commit_seq = self
             .store
             .commit(txn)
-            .map_err(|error| FfsError::Format(error.to_string()))?;
+            .map_err(|error| commit_error_to_ffs(&error))?;
         self.store.prune_after_commit_if_due(commit_seq);
         Ok(())
     }
@@ -628,7 +648,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let commit_seq = self
             .store
             .commit(txn)
-            .map_err(|error| FfsError::Format(error.to_string()))?;
+            .map_err(|error| commit_error_to_ffs(&error))?;
         self.store.prune_after_commit_if_due(commit_seq);
         Ok(())
     }
@@ -677,7 +697,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let commit_seq = self
             .store
             .commit(txn)
-            .map_err(|error| FfsError::Format(error.to_string()))?;
+            .map_err(|error| commit_error_to_ffs(&error))?;
         self.store.prune_after_commit_if_due(commit_seq);
         Ok(())
     }

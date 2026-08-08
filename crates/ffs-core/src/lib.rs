@@ -54880,7 +54880,6 @@ mod tests {
     /// complete on partial evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: the FCW refusal is CORRECT (latest_modified_declared_range on one inode slot) — needs a retry, not a merge proof"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }

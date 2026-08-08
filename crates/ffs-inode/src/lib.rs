@@ -1169,21 +1169,53 @@ pub fn write_inode_at_slot_scoped(
     serialize_inode_with_checksum(inode, inode_size, ino, csum_seed, raw);
     let slot: &[u8] = raw;
 
-    dev.rmw_block(
-        cx,
-        loc.block,
-        &[(loc.byte_offset, inode_size)],
-        &mut |block_data| {
-            if loc.byte_offset + inode_size > block_data.len() {
-                return Err(FfsError::Corruption {
-                    block: loc.block.0,
-                    detail: "inode extends beyond block boundary".into(),
-                });
+    // Retry a first-committer-wins conflict, bounded (bd-y2t0r).
+    //
+    // A concurrent writer can legitimately win this block: inode numbers are
+    // REUSED, so one thread freeing inode N (zeroing its slot) races another
+    // allocating N and writing it. Those touch the same bytes, so the merge proof
+    // correctly REFUSES — measured, as `latest_modified_declared_range` over
+    // exactly one `inode_size` slot. The refusal is right; propagating it as a
+    // hard error is not. Optimistic concurrency requires the loser to retry.
+    //
+    // Replaying is sound HERE because this patch is idempotent: `slot` is
+    // serialized before the loop from the caller's inode and does not depend on
+    // the block's current contents, so re-applying it to a base re-read at a
+    // FRESH snapshot yields the correct block, including whatever the winner
+    // wrote elsewhere in it. That property is specific to this writer — a patch
+    // that incremented a counter or OR-ed a bit read from the block would be
+    // wrong to replay — which is why the retry lives here rather than inside
+    // `rmw_block`, where it would silently apply to every proof-carrying writer.
+    //
+    // Bounded rather than unbounded: a conflict that survives this many attempts
+    // is contention severe enough that the caller should see it, and an unbounded
+    // loop would convert a livelock into a hang.
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt = 0;
+    loop {
+        let outcome = dev.rmw_block(
+            cx,
+            loc.block,
+            &[(loc.byte_offset, inode_size)],
+            &mut |block_data| {
+                if loc.byte_offset + inode_size > block_data.len() {
+                    return Err(FfsError::Corruption {
+                        block: loc.block.0,
+                        detail: "inode extends beyond block boundary".into(),
+                    });
+                }
+                block_data[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(slot);
+                Ok(())
+            },
+        );
+        match outcome {
+            Err(FfsError::MvccConflict { .. }) if attempt + 1 < MAX_ATTEMPTS => {
+                attempt += 1;
+                cx_checkpoint(cx)?;
             }
-            block_data[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(slot);
-            Ok(())
-        },
-    )
+            other => return other,
+        }
+    }
 }
 
 // ── Timestamps ──────────────────────────────────────────────────────────────
@@ -1299,6 +1331,77 @@ mod tests {
         }
     }
 
+    /// Device that refuses the first `conflicts` RMW attempts with a
+    /// first-committer-wins conflict, then succeeds — the shape a concurrent
+    /// winner produces (bd-y2t0r).
+    ///
+    /// It also records how many times the patch ran and what the block held at
+    /// each attempt, which is what makes the replay-correctness assertion
+    /// possible: a retry that re-applied the patch to a STALE base would silently
+    /// discard the winner's bytes, and only checking the final block against a
+    /// base that CHANGED between attempts can catch that.
+    struct ConflictingRmwDevice {
+        inner: MemBlockDevice,
+        remaining_conflicts: Mutex<u32>,
+        attempts: Mutex<u32>,
+        /// Written into the block before the final (successful) attempt, standing
+        /// in for the concurrent winner's own write elsewhere in the block.
+        winner_mark: Mutex<Option<(usize, Vec<u8>)>>,
+    }
+
+    impl BlockDevice for ConflictingRmwDevice {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn rmw_block(
+            &self,
+            cx: &Cx,
+            block: BlockNumber,
+            _disjoint_ranges: &[(usize, usize)],
+            patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>,
+        ) -> Result<()> {
+            *self.attempts.lock().unwrap() += 1;
+            let mut remaining = self.remaining_conflicts.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                // On the last refusal, land the "winner's" bytes so the retry
+                // re-reads a base that genuinely changed underneath it.
+                if *remaining == 0
+                    && let Some((at, bytes)) = self.winner_mark.lock().unwrap().take()
+                {
+                    let mut data = self.inner.read_block(cx, block)?.into_inner();
+                    data[at..at + bytes.len()].copy_from_slice(&bytes);
+                    self.inner.write_block(cx, block, &data)?;
+                }
+                return Err(FfsError::MvccConflict {
+                    tx: 0,
+                    block: block.0,
+                });
+            }
+            drop(remaining);
+            let mut data = self.inner.read_block(cx, block)?.into_inner();
+            patch(&mut data)?;
+            self.inner.write_block(cx, block, &data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+    }
+
     struct ReadFailingBlockDevice {
         inner: MemBlockDevice,
         fail_block: BlockNumber,
@@ -1399,6 +1502,106 @@ mod tests {
                 reserved_confirmed: std::sync::OnceLock::new(),
             })
             .collect()
+    }
+
+    /// bd-y2t0r: a first-committer-wins conflict on the inode slot must be
+    /// RETRIED, and the retry must re-apply the patch to a base re-read after the
+    /// winner committed — not to the stale base the first attempt saw.
+    ///
+    /// The conflict is legitimate: inode numbers are reused, so a thread freeing
+    /// inode N races a thread allocating N, both writing the same slot bytes. The
+    /// merge proof correctly refuses; propagating that refusal as a hard error is
+    /// what broke the sharded delete path.
+    #[test]
+    fn slot_scoped_inode_write_retries_a_first_committer_wins_conflict_bd_y2t0r() {
+        let cx = test_cx();
+        let block_size = 4096_usize;
+        let inode_size = 256_usize;
+        let loc = InodeLocation {
+            block: BlockNumber(37),
+            byte_offset: 7 * 256,
+        };
+        // The "winner" writes a DIFFERENT slot of the same block while we are
+        // conflicting. A correct retry must preserve it.
+        let winner_at = 3 * 256;
+        let winner_bytes = vec![0xAB_u8; inode_size];
+
+        let dev = ConflictingRmwDevice {
+            inner: MemBlockDevice::new(block_size as u32),
+            remaining_conflicts: Mutex::new(2),
+            attempts: Mutex::new(0),
+            winner_mark: Mutex::new(Some((winner_at, winner_bytes.clone()))),
+        };
+        dev.inner
+            .write_block(&cx, loc.block, &vec![0u8; block_size])
+            .expect("seed block");
+
+        let inode = representative_inode();
+        write_inode_at_slot_scoped(&cx, &dev, loc, inode_size, InodeNumber(120), &inode, 0)
+            .expect("a retryable conflict must not surface as an error");
+
+        assert_eq!(
+            *dev.attempts.lock().unwrap(),
+            3,
+            "two refusals then one success"
+        );
+        let final_block = dev.inner.read_block(&cx, loc.block).expect("read back");
+        let data = final_block.as_slice();
+        // The winner's bytes survived: the retry re-read the base rather than
+        // replaying onto the stale one.
+        assert_eq!(
+            &data[winner_at..winner_at + inode_size],
+            &winner_bytes[..],
+            "the retry must not clobber the concurrent winner's slot"
+        );
+        // And our own slot landed.
+        let mut expected = vec![0u8; inode_size];
+        serialize_inode_with_checksum(&inode, inode_size, InodeNumber(120), 0, &mut expected);
+        assert_eq!(
+            &data[loc.byte_offset..loc.byte_offset + inode_size],
+            &expected[..],
+            "our inode slot must be written after the retry"
+        );
+    }
+
+    /// The retry is BOUNDED: sustained conflict surfaces to the caller instead of
+    /// spinning forever, so a livelock cannot become a hang.
+    #[test]
+    fn slot_scoped_inode_write_gives_up_on_sustained_conflict_bd_y2t0r() {
+        let cx = test_cx();
+        let dev = ConflictingRmwDevice {
+            inner: MemBlockDevice::new(4096),
+            remaining_conflicts: Mutex::new(u32::MAX),
+            attempts: Mutex::new(0),
+            winner_mark: Mutex::new(None),
+        };
+        dev.inner
+            .write_block(&cx, BlockNumber(37), &vec![0u8; 4096])
+            .expect("seed block");
+
+        let inode = representative_inode();
+        let error = write_inode_at_slot_scoped(
+            &cx,
+            &dev,
+            InodeLocation {
+                block: BlockNumber(37),
+                byte_offset: 0,
+            },
+            256,
+            InodeNumber(120),
+            &inode,
+            0,
+        )
+        .expect_err("sustained conflict must surface");
+        assert!(
+            matches!(error, FfsError::MvccConflict { .. }),
+            "the caller must see the conflict, not a rewritten error: {error:?}"
+        );
+        let attempts = *dev.attempts.lock().unwrap();
+        assert!(
+            (1..=16).contains(&attempts),
+            "retry must be bounded, took {attempts} attempts"
+        );
     }
 
     fn representative_inode() -> Ext4Inode {
