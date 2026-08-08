@@ -54880,7 +54880,7 @@ mod tests {
     /// complete on partial evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: FLAKY; refusal captured as IndependentKeys 4096/4096/4096 — a range conflict, not a lost ancestor"]
+    #[ignore = "bd-y2t0r: the FCW refusal is CORRECT (latest_modified_declared_range on one inode slot) — needs a retry, not a merge proof"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }
@@ -54979,11 +54979,11 @@ mod tests {
         impl Drop for DowngradeReport {
             fn drop(&mut self) {
                 let delta = ffs_mvcc::proof_downgrade_count().saturating_sub(self.0);
-                let (refusals, last) = ffs_mvcc::merge_refusal_report();
+                let (refusals, last, reason) = ffs_mvcc::merge_refusal_report();
                 println!(
                     "bd-y2t0r: merge-proof downgrades during this workload: {delta} \
                      (non-zero => some writer plain-write_blocks a proof-scoped block); \
-                     merge refusals: {} (last: {last:?})",
+                     merge refusals: {} (last: {last:?}, reason: {reason:?})",
                     refusals.saturating_sub(self.1)
                 );
                 // The refusal shape is the discriminator. base_len == 0 or short

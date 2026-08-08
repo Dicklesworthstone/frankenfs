@@ -67,6 +67,22 @@ pub fn proof_downgrade_count() -> u64 {
 static LAST_MERGE_REFUSAL: Mutex<Option<(&'static str, usize, usize, usize)>> = Mutex::new(None);
 static MERGE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
+/// Which validator branch refused the most recent merge, and the byte range it
+/// blamed (bd-y2t0r).
+///
+/// The lengths in [`LAST_MERGE_REFUSAL`] separated "ancestor resolution failed"
+/// from "the ranges were not disjoint". They cannot separate the FOUR ways a
+/// range proof can be refused, and those have opposite fixes: `latest` having
+/// modified a declared range is a TRUE conflict whose correct answer is a retry,
+/// while `staged` having modified bytes outside its declared ranges means the
+/// proof under-declares and the fix is in the staging path. Recording the branch
+/// is the difference between fixing the right layer and fixing another one.
+static LAST_REFUSAL_REASON: Mutex<Option<(&'static str, usize, usize)>> = Mutex::new(None);
+
+fn note_refusal_reason(reason: &'static str, start: usize, len: usize) {
+    *LAST_REFUSAL_REASON.lock() = Some((reason, start, len));
+}
+
 pub(crate) fn record_merge_refusal(
     proof: &MergeProof,
     base_len: usize,
@@ -82,12 +98,18 @@ pub(crate) fn record_merge_refusal(
     ));
 }
 
-/// Refusal count and the most recent refusal's shape.
+/// Refusal count, the most recent refusal's shape, and which validator branch
+/// refused it.
 #[must_use]
-pub fn merge_refusal_report() -> (u64, Option<(&'static str, usize, usize, usize)>) {
+pub fn merge_refusal_report() -> (
+    u64,
+    Option<(&'static str, usize, usize, usize)>,
+    Option<(&'static str, usize, usize)>,
+) {
     (
         MERGE_REFUSALS.load(Ordering::Relaxed),
         *LAST_MERGE_REFUSAL.lock(),
+        *LAST_REFUSAL_REASON.lock(),
     )
 }
 
@@ -567,6 +589,7 @@ fn merge_non_overlapping_ranges_valid(
         return false;
     }
     if !ranges_are_pairwise_disjoint(touched_ranges) {
+        note_refusal_reason("declared_ranges_overlap", 0, touched_ranges.len());
         warn!(
             target: "ffs::mvcc::merge",
             proof_variant = %variant,
@@ -579,6 +602,7 @@ fn merge_non_overlapping_ranges_valid(
     // Every declared range must fit within the block before we slice it.
     for range in touched_ranges {
         if range.end() > base.len() {
+            note_refusal_reason("range_exceeds_block", range.start, range.len);
             warn!(
                 target: "ffs::mvcc::merge",
                 proof_variant = %variant,
@@ -605,6 +629,11 @@ fn merge_non_overlapping_ranges_valid(
     let mut cursor = 0usize;
     for range in &ordered {
         if staged[cursor..range.start] != base[cursor..range.start] {
+            note_refusal_reason(
+                "staged_modified_outside_ranges",
+                cursor,
+                range.start - cursor,
+            );
             warn!(
                 target: "ffs::mvcc::merge",
                 proof_variant = %variant,
@@ -616,6 +645,11 @@ fn merge_non_overlapping_ranges_valid(
         cursor = range.end();
     }
     if staged[cursor..] != base[cursor..] {
+        note_refusal_reason(
+            "staged_modified_outside_ranges_tail",
+            cursor,
+            base.len() - cursor,
+        );
         warn!(
             target: "ffs::mvcc::merge",
             proof_variant = %variant,
@@ -628,6 +662,7 @@ fn merge_non_overlapping_ranges_valid(
     // True conflict: `latest` must not have modified any declared range vs base.
     for range in touched_ranges {
         if latest[range.start..range.end()] != base[range.start..range.end()] {
+            note_refusal_reason("latest_modified_declared_range", range.start, range.len);
             warn!(
                 target: "ffs::mvcc::merge",
                 proof_variant = %variant,
