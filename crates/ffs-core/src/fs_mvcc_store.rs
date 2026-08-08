@@ -545,8 +545,21 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // block (e.g. two creates touching different group descriptors of a new
         // GDT block) merge instead of FCW-conflicting (bd-bhh0i; the version
         // chain gives an empty base otherwise).
+        // Record the ancestor as `staged_base` ALWAYS, including when the store
+        // holds a version at the snapshot. Relying on the version chain to still
+        // hold it at commit time is what breaks: a concurrent
+        // `prune_after_commit_if_due` can drop it between stage and commit, the
+        // merge then resolves an EMPTY base, and a disjoint write is aborted on a
+        // spurious length mismatch. `rmw_commit_block_with_proof` above already
+        // records unconditionally for this exact reason (bd-bhh0i's inode-table
+        // pruning race); these three device-level RMW paths were left behind, and
+        // the gap only shows under enough load for a snapshot to age past a prune
+        // (bd-y2t0r, block 2085).
         let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => (buf.as_slice().to_vec(), None),
+            Some(buf) => {
+                let resident = buf.as_slice().to_vec();
+                (resident.clone(), Some(resident))
+            }
             None => {
                 let device_base = self.base.read_block(cx, block)?.into_inner();
                 (device_base.clone(), Some(device_base))
@@ -590,8 +603,21 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // conflicting, even when their bits share a byte (bd-bhh0i BUG 4).
         let mut txn = self.store.begin();
         let snapshot = txn.snapshot();
+        // Record the ancestor as `staged_base` ALWAYS, including when the store
+        // holds a version at the snapshot. Relying on the version chain to still
+        // hold it at commit time is what breaks: a concurrent
+        // `prune_after_commit_if_due` can drop it between stage and commit, the
+        // merge then resolves an EMPTY base, and a disjoint write is aborted on a
+        // spurious length mismatch. `rmw_commit_block_with_proof` above already
+        // records unconditionally for this exact reason (bd-bhh0i's inode-table
+        // pruning race); these three device-level RMW paths were left behind, and
+        // the gap only shows under enough load for a snapshot to age past a prune
+        // (bd-y2t0r, block 2085).
         let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => (buf.as_slice().to_vec(), None),
+            Some(buf) => {
+                let resident = buf.as_slice().to_vec();
+                (resident.clone(), Some(resident))
+            }
             None => {
                 let device_base = self.base.read_block(cx, block)?.into_inner();
                 (device_base.clone(), Some(device_base))
@@ -626,8 +652,21 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // snapshot is what lets the merge see the true common ancestor.
         let mut txn = self.store.begin();
         let snapshot = txn.snapshot();
+        // Record the ancestor as `staged_base` ALWAYS, including when the store
+        // holds a version at the snapshot. Relying on the version chain to still
+        // hold it at commit time is what breaks: a concurrent
+        // `prune_after_commit_if_due` can drop it between stage and commit, the
+        // merge then resolves an EMPTY base, and a disjoint write is aborted on a
+        // spurious length mismatch. `rmw_commit_block_with_proof` above already
+        // records unconditionally for this exact reason (bd-bhh0i's inode-table
+        // pruning race); these three device-level RMW paths were left behind, and
+        // the gap only shows under enough load for a snapshot to age past a prune
+        // (bd-y2t0r, block 2085).
         let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => (buf.as_slice().to_vec(), None),
+            Some(buf) => {
+                let resident = buf.as_slice().to_vec();
+                (resident.clone(), Some(resident))
+            }
             None => {
                 let device_base = self.base.read_block(cx, block)?.into_inner();
                 (device_base.clone(), Some(device_base))

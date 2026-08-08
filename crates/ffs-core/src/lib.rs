@@ -3032,13 +3032,33 @@ impl TransactionBlockAdapter<'_, '_> {
     ) -> Result<(), FfsError> {
         let mut tx = self.tx.lock();
         let snapshot = tx.snapshot();
-        let (ancestor, base) = self
+        let (ancestor, _device_base) = self
             .base
             .read_merge_ancestor_at_snapshot(cx, block, snapshot)?;
+        // Record the common ancestor as `staged_base` ALWAYS, not only when the
+        // store held no version at the snapshot. `read_merge_ancestor_at_snapshot`
+        // reports a base only in that second case, on the reasoning that the store
+        // can re-derive the ancestor from its version chain otherwise — but it can
+        // only do so while the version is STILL THERE at commit time. A concurrent
+        // committer's `prune_after_commit_if_due` can drop it between stage and
+        // commit, after which the merge resolves an EMPTY base and rejects on a
+        // length mismatch: a spurious abort of a perfectly disjoint write.
+        //
+        // `rmw_commit_block_with_proof` already records unconditionally for exactly
+        // this reason (bd-bhh0i's inode-table pruning race); this path was left
+        // behind. Symptom, and why it went unnoticed: it needs a transaction open
+        // long enough for its snapshot to age past a prune, so it is invisible
+        // when lightly loaded and reproducible under a full test suite —
+        // bd-y2t0r's surviving conflicts on block 2085 had snapshot gaps of
+        // 77-178 commits, against 1-2 for the contention this proof was built for.
+        //
+        // Cost is one block-sized clone per RMW; it is only consumed on a
+        // same-block conflict, and the alternative is aborting valid work.
+        let ancestor_bytes = ancestor.as_slice().to_vec();
         let already_staged = tx.staged_write(block).is_some();
         let mut data = match tx.staged_write(block) {
             Some(staged) => staged.to_vec(),
-            None => ancestor.into_inner(),
+            None => ancestor_bytes.clone(),
         };
         patch(&mut data)?;
         // A transaction may RMW the SAME block more than once — an unlink writes
@@ -3080,7 +3100,7 @@ impl TransactionBlockAdapter<'_, '_> {
         } else {
             proof
         };
-        tx.stage_write_with_proof_and_base(block, data, effective, base);
+        tx.stage_write_with_proof_and_base(block, data, effective, Some(ancestor_bytes));
         Ok(())
     }
 }
@@ -54738,32 +54758,32 @@ mod tests {
     /// Gated on the feature because the routing it exercises does not exist
     /// without it; the runtime toggle is set explicitly since it now defaults off
     /// (bd-pbyu0).
-    /// ⛔ **STILL `#[ignore]`d: PASSES STANDALONE, FAILS UNDER FULL-SUITE LOAD.**
-    /// Two real defects were found and fixed below and the failure moved twice,
-    /// but the gate is not green and must not be read as such.
+    /// ⛔ **STILL `#[ignore]`d, now because it is FLAKY rather than reliably red.**
+    /// Measured across four full-suite runs after the third fix: 3 passed, 1
+    /// failed. Three defects have been found and fixed and the failure has moved
+    /// three times, but a 3-of-4 gate is not a gate.
     ///
-    ///     cargo test -p ffs-core --features bhh0i_sharded_alloc --lib bd_y2t0r
-    ///         -> ok (both variants), reproducibly
-    ///     the same test inside the full 1246-test suite
-    ///         -> FCW conflict on block 2085, reproducibly
+    /// WHAT THE THIRD FIX ACTUALLY DID, stated by signature rather than by tally,
+    /// because the tally alone would not distinguish "fixed" from "got luckier".
+    /// Before it, every surviving conflict was on block 2085 with snapshot gaps of
+    /// 77-178 commits. After it, the single failure was on block 39 with a gap of
+    /// ONE. Those are different mechanisms: a wide gap means a transaction whose
+    /// snapshot aged past a prune (the base-resolution class, now addressed by
+    /// recording `staged_base` unconditionally), while a gap of one means two
+    /// writers genuinely racing for the same block. The prune class appears to be
+    /// gone and a contention residual remains. Four runs is a small sample and
+    /// this reading should be re-checked, not trusted outright.
     ///
-    /// A load-dependent pass is not a pass: the whole point of this gate is
-    /// behaviour under contention, and the full suite supplies more of it than
-    /// the test does alone. Un-ignore it only when the full-suite run is green.
+    /// WHAT IS LEFT: a residual FCW on an inode-table block under true
+    /// contention, despite both writers declaring disjoint slots. Worth checking
+    /// first, and UNVERIFIED: whether some third writer to that block in the same
+    /// transaction stages an opaque whole-block write, which would drag the
+    /// accumulated proof down to `Unsafe` through the mixed-proof fallback in
+    /// `stage_rmw`. Measure which writers touch the block in one txn before
+    /// wiring anything — every previous diagnosis on this bead was wrong until
+    /// measured.
     ///
-    /// WHAT IS LEFT, with the evidence that points at it. The surviving conflicts
-    /// are all on 2085 — group 1's inode table — and their snapshot gaps are two
-    /// orders of magnitude wider than the ones that were fixed (77-178 commits
-    /// versus 1-2). That is the signature of a transaction held open long enough
-    /// for its snapshot to age, not of two writers racing on adjacent slots, so
-    /// the next suspect is base resolution rather than another missing range:
-    /// `check_write_mergeable_locked` resolves the merge ancestor from the version
-    /// chain at the txn's snapshot, and a version pruned under that snapshot yields
-    /// an empty base, which fails the length check and rejects the merge. The
-    /// read-vs-prune interaction bd-bhh0i hit before is the thing to rule out
-    /// first. UNVERIFIED — measure it, do not wire from this paragraph.
-    ///
-    /// The two defects already fixed, both measured rather than inferred:
+    /// The three defects already fixed, all measured rather than inferred:
     ///
     /// 1. The parent-inode write. Every unlink writes its parent directory's
     ///    inode with `write_inode`, rewriting the parent's whole table block. Two
@@ -54774,6 +54794,14 @@ mod tests {
     ///    while the proof did not, so the second call declared a range narrower
     ///    than the bytes changed and the validator correctly rejected it. Ranges
     ///    are now unioned.
+    /// 3. Unconditional `staged_base`. `stage_rmw` and the three
+    ///    `FsMvccBlockDevice` RMW paths recorded a merge ancestor only when the
+    ///    store held no version at the snapshot, trusting the version chain to
+    ///    still hold it at commit. A concurrent `prune_after_commit_if_due` drops
+    ///    it, the merge then resolves an EMPTY base, and a disjoint write aborts
+    ///    on a spurious length mismatch. `rmw_commit_block_with_proof` already
+    ///    recorded unconditionally for exactly this reason (bd-bhh0i's
+    ///    inode-table pruning race); these four paths were left behind.
     ///
     /// THE FIRST DIAGNOSIS ON THIS BEAD WAS WRONG, which is why the layout dump
     /// below is permanent. The failure was attributed to the inode BITMAP lacking
@@ -54811,7 +54839,7 @@ mod tests {
     /// complete on partial evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: passes standalone, FCW-conflicts on block 2085 under full-suite load; see doc comment"]
+    #[ignore = "bd-y2t0r: FLAKY — 3 of 4 full-suite runs pass; residual contention conflict on an inode-table block"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }
