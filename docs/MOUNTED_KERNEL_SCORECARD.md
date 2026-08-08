@@ -393,9 +393,23 @@ comparison it was taken for. Unlike the other five it also ran with every CPU on
   `f44b3dc40b987f36c19a64dfdded3b1890a105cd26a3098cee46eee2b3540349` (x86-64-v3, PGO
   profile `6a22cfcf…`, built on `vmi1167313`); driver ELF `75b400a9…` for the first four
   rows and `8c357460…` for both metadata rows, both built on `hz1`. Every arm
-  self-hashed in process. Reports live under
+  self-hashed in process.
+- ⛔ **Reports NO LONGER retained.** This bullet used to say the reports live under
   `/data/tmp/frankenfs-mounted-kernel-nullfix/run_*/mounted-kernel-report.json`
-  (schema v5).
+  (schema v5). That tree is **gone** — verified 2026-08-08: the directory does not
+  exist, no `mounted-kernel-report*.json` survives anywhere under `/data/tmp`, and
+  the volume moved from ~90% full to 696G free. The disk-pressure reclaimer did not
+  distinguish the ~1.4 MiB of reports from the ~133 GiB of regenerable arm images,
+  and the `.sbh-protect` marker that now guards report directories
+  (`protect_report_dir_from_reclaim`) landed after these runs (bd-v0igv).
+  **What this does and does not mean:** the ELF hashes, PGO profile, builder hosts
+  and per-arm self-hashing above were transcribed into this document at the time and
+  are unaffected. What is unavailable is the raw report JSON behind them, so these
+  rows can no longer be re-derived from their artifacts or re-examined for fields
+  the scorecard did not transcribe. Do not read the dead path as evidence the rows
+  were fabricated, and do not treat them as re-verifiable — they are transcribed
+  results whose backing artifact is lost. The btrfs scorecard carries the identical
+  loss for all six of its rows.
 - **Placement scope was `same_llc`, not host-wide.** `host_wide_quiescence` reads
   `not_applicable` on all five rows: the sustained five-consecutive-one-second host-wide
   quiet gate exists in the harness but only engages under `--placement-scope host-wide`,
