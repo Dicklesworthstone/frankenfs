@@ -1,6 +1,6 @@
 # Mounted-kernel scorecard: FrankenFS FUSE against the incumbent, Linux kernel ext4
 
-> ## ⛔ THREE ROWS DESCRIBE FRANKENFS AT `HEAD`. THE OTHER FIVE DO NOT.
+> ## ⛔ FOUR ROWS DESCRIBE FRANKENFS AT `HEAD`. THE OTHER FOUR DO NOT.
 >
 > **readdir+stat, parallel read and warm stat were re-measured 2026-08-08** on candidate
 > `913c36a4…` (PGO `b30de364…`, x86-64-v3 attested) — each twice, all admitted, the last of
@@ -11,7 +11,8 @@
 > | Rows | Candidate ELF | Measured |
 > | --- | --- | --- |
 > | **readdir+stat**, **parallel read**, **warm stat** | **`913c36a4…`** | **2026-08-08 (current)** |
-> | create/delete storm, fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
+| **create/delete storm** | **`edbaeb4e…`** | **2026-08-08 (current, post-`bd-pbyu0` fix)** |
+> | fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
 > > | Xattr get/list report, bulk durable write | `bcf2bc80…` | 2026-08-05 |
 >
 > ⚠ The re-measured readdir+stat row is **not** comparable with the other seven as if one
@@ -27,10 +28,17 @@
 > from every overwrite-split). The last of those changes the write path's I/O profile, so it
 > can move those numbers in either direction.
 >
-> **Therefore: no figure below EXCEPT readdir+stat, parallel read and warm stat may be
-> presented as "FrankenFS today" until it is re-measured on a current ELF.** Quote the rest as
-> historical, with their ELF, or not at all. This is not a hedge about precision — it is that
-> the binary those five describe no longer exists in the tree.
+> **Therefore: no figure below EXCEPT readdir+stat, parallel read, warm stat and create/delete
+> storm may be presented as "FrankenFS today" until it is re-measured on a current ELF.** Quote
+> the rest as historical, with their ELF, or not at all. This is not a hedge about precision —
+> it is that the binary those four describe no longer exists in the tree.
+>
+> ⚠ **Every MUTATING row banked before 2026-08-08 was measured with the `bd-bhh0i` sharded
+> create path active, which leaked one inode per delete from the group-descriptor counters
+> (`bd-pbyu0`, now defaulted off).** Storm has been re-measured on the fixed candidate;
+> **fsync/journal, parallel metadata and bulk durable write have not**, and were taken on a
+> filesystem whose inode accounting was drifting mid-run. The read-only rows never mount
+> `--rw` and are unaffected.
 
 > ## ⚠ A CLEAR PREFLIGHT IS NOT EVIDENCE OF COMPARABILITY (`bd-4sull`)
 >
@@ -142,7 +150,7 @@ could already run both and neither scorecard carried either.)
 | Workload (the job as timed) | FrankenFS ÷ kernel ext4, bootstrap median 95% CI | Kernel A/A null | FUSE A/A null | Governor / EPP on every involved CPU | Worker threads requested → observed | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
 | **Large-directory readdir+stat** — enumerate 32,768 zero-byte entries, then 8 workers stat every entry exactly once (ro) | **≈`4.1x` slower** — two admitted same-ELF runs, `4.052605x [4.034231, 4.108783]` and `4.163402x [4.106308, 4.196759]`, margins `1.032372x`/`1.038028x`. **Quote the `2.73%` spread, not either CI.** ⛔ SUPERSEDES the pre-`bd-plkzd` `4.967448x`, measured on an unindexed fixture | run 1 `1.006371x [0.998838, 1.016057]` · run 2 `1.005559x [0.981512, 1.010438]` | run 1 `1.001235x [0.999309, 1.003556]` · run 2 `0.999527x [0.997275, 1.008144]` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **8 → 8** on all four arms, pinning attested | **LOSE** |
-| **Small-file create/delete storm** — serially create 2,000 empty files, fsync the parent, delete all 2,000, fsync again | **`2.753659x` `[2.707500, 2.782302]` slower** (twice-null margin `1.029449x`) | `0.996217x [0.985593, 1.007951]`, spread `1.014618x` | `0.995167x [0.988305, 1.004712]`, spread `1.011833x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **1 → 1** on all four arms, pinning attested | **LOSE** |
+| **Small-file create/delete storm** — serially create 2,000 empty files, fsync the parent, delete all 2,000, fsync again | **`2.862033x` `[2.724405, 2.888338]` slower** (twice-null margin `1.048084x`), re-measured 2026-08-08 on candidate `edbaeb4e…`. ⛔ SUPERSEDES `2.753659x`. ⚠ **ONE admitted run — no pair yet**, so quote it to the campaign's worst measured spread, not this CI. A second run measured `2.869817x` (0.27% away) but was `BLOCKED_NULL` and is corroboration only | `0.999400x` (run 2, blocked) | `1.003846x` (run 2, blocked) | `amd-pstate-epp` / **`performance`** / `performance` | **1 → 1** on all four arms, pinning attested | **LOSE** |
 | **Multi-file parallel read** — enumerate and byte-sort 256 × 256 KiB files, then 8 workers `pread` every file exactly once (ro) | **≈`0.98x` — a TIE, not a win.** Two admitted same-ELF runs, `0.986316x [0.981390, 0.989874]` and `0.978203x [0.968511, 0.981821]`; neither clears its margin (`1.016961x`/`1.020212x`), `directional_claim_clear=false` on both. Spread `0.83%`. ⛔ SUPERSEDES `1.287862x`, measured on an unindexed fixture and a since-destroyed ELF | run 1 `0.995873x [0.991626, 1.005511]` · run 2 `1.004181x [0.993028, 1.010056]` | run 1 `1.000388x [0.997640, 1.004583]` · run 2 `1.001259x [0.995212, 1.005430]` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **8 → 8** on all four arms, pinning attested | **NEUTRAL** |
 | **Fsync/journal commit** — 8 × 4 KiB positioned writes to one file, `fsync` after each | `0.997098x [0.990808, 1.009108]` against a twice-null margin of **`1.030661x`**; `directional_claim_clear=false` | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **1 → 1** on all four arms, pinning attested | **NEUTRAL** |
 | **Parallel metadata writes** — 8 workers create exactly 512 empty files into private directories, then fsync every worker directory (**128 crossover blocks**) | **`1.510822x` `[1.493097, 1.539011]` slower** (twice-null margin `1.049223x`); replicated on a **disjoint CPU set** at `1.513052x [1.490837, 1.534711]`, agreeing to **0.15%** | `1.007184x [0.998479, 1.024316]`, spread `1.024316x` · replicate `0.998642x [0.990286, 1.009556]`, spread `1.009809x` | `0.995707x [0.978797, 1.000111]`, spread `1.021662x` · replicate `0.998780x [0.990819, 1.002688]`, spread `1.009266x` | `amd-pstate-epp` / `powersave` / **`performance`** (host EPP differed in this window; uniform across both metadata runs) | **8 → 8** on all four arms, pinning attested | **LOSE** |
@@ -339,7 +347,7 @@ transcription. **Every future row must carry both**; `scripts/perf_ledger_prefli
 | Workload | Kernel median batch | FrankenFS median batch |
 | --- | --- | --- |
 | Large-directory readdir+stat, 32,768 entries | **28.98 / 27.99 ms** (runs 1/2) | **117.00 / 115.62 ms** (runs 1/2) |
-| Small-file create/delete storm, 2,000 files | 100.99 ms | 276.60 ms |
+| Small-file create/delete storm, 2,000 files | **94.807 ms** (2026-08-08; was 100.99 ms) | **264.732 ms** (2026-08-08; was 276.60 ms) |
 | Multi-file parallel read, 256 × 256 KiB | **3.803 / 3.917 ms** (runs 1/2, 2026-08-08; was 3.11 ms) | **3.809 / 3.847 ms** (runs 1/2; was 4.01 ms) |
 | Fsync/journal commit, 8 × 4 KiB | 145.49 ms | 145.08 ms |
 | Parallel metadata writes, 512 creates | 29.30 ms | 42.31 ms |
