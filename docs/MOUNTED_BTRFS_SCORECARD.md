@@ -1,11 +1,11 @@
 # Btrfs scorecard: FrankenFS FUSE against the incumbent, Linux kernel btrfs
 
-> ## ⛔ ONE ROW DESCRIBES FRANKENFS AT `HEAD`. THE OTHER FIVE DO NOT.
+> ## ⛔ THREE ROWS DESCRIBE FRANKENFS AT `HEAD`. THE OTHER THREE DO NOT.
 >
-> **readdir+stat was re-measured 2026-08-08** on candidate `913c36a4…` (PGO `b30de364…`,
-> x86-64-v3 attested), twice, both admitted, after `bd-plkzd` corrected its fixture. The
-> other five predate the current tree — four 2026-07-31 rows on the frozen `f44b3dc4…`
-> candidate, the warm-stat row on `9e32e28f…` — and none has been re-measured.
+> **readdir+stat, parallel read and warm stat were re-measured 2026-08-08** on candidate
+> `913c36a4…` (PGO `b30de364…`, x86-64-v3 attested) — each twice, all admitted. The other
+> three predate the current tree (2026-07-31, frozen `f44b3dc4…`) and none has been
+> re-measured.
 >
 > This file needs the warning **more** than the ext4 one, because the commits landed since
 > are all in the btrfs write path: `839eb708` (the durable commit built leaves it could not
@@ -15,8 +15,8 @@
 > now reference the shared extent instead of copying it, removing a read and an allocation
 > from every overwrite-split). The last one changes the write path's I/O profile directly.
 >
-> **No figure below EXCEPT readdir+stat may be presented as "FrankenFS today" until
-> re-measured on a current ELF.** Quote the rest as historical, with their ELF, or not at all.
+> **No figure below EXCEPT readdir+stat, parallel read and warm stat may be presented as
+> "FrankenFS today" until re-measured on a current ELF.** Quote the rest as historical, with their ELF, or not at all.
 > The re-measured row uses a freshly trained PGO profile (`b30de364…`, not the bank's
 > `5c6530a0…`, which was destroyed — `bd-v0igv`) and a different kernel, so it supersedes its
 > own predecessor without re-baselining the others.
@@ -64,7 +64,7 @@ inadmissible and the row's section explains why the gate could not see it.
 | Workload | FrankenFS ÷ kernel btrfs | Kernel A/A | FUSE A/A | Threads req → obs | Verdict |
 | --- | --- | --- | --- | --- | --- |
 | **Large-directory readdir+stat**, 32,768 entries | **≈`7.7x` slower** — two admitted same-ELF runs, `7.753405x [7.733049, 7.764217]` and `7.649395x [7.617712, 7.728683]`, margins `1.011133x`/`1.011514x`. **Quote the `1.36%` spread, not either CI.** ⛔ SUPERSEDES `8.322812x`, measured on a fixture whose ext4 twin was unindexed (`bd-plkzd`) | run 1 `0.999027x`, spread `1.005551x` · run 2 clear | run 1 `0.999403x`, spread `1.003652x` · run 2 clear | 8 → **8** | **LOSE** |
-| **Warm stat**, 2,000 calls | **`4.977803x` `[4.949139, 5.014278]` slower**; replicate **`5.036433x` `[5.017720, 5.074796]`** | `0.996700x` / `1.000455x` | `1.002699x` / `1.001758x` | 1 → **1** | **LOSE** |
+| **Warm stat**, 2,000 calls | **≈`4.77–4.80x` slower.** Two admitted same-ELF runs on a current candidate, `4.769886x [4.736506, 4.801735]` and `4.802719x [4.775460, 4.816630]`, margins `1.040608x`/`1.021556x`, spread `0.69%`. ⛔ SUPERSEDES `4.977803x` / `5.036433x` — the new pair is ~4% lower on a current ELF | run 1 `0.994703x`, spread `1.020102x` · run 2 `0.999117x` | run 1 `0.993281x`, spread `1.017402x` · run 2 `0.998908x` | 1 → **1** | **LOSE** |
 | **Small-file create/delete storm**, 2,000 files | **`2.358280x` `[2.322435, 2.430125]` slower** (margin `1.045128x`) | `0.996139x`, spread `1.018112x` | `0.992157x`, spread `1.022315x` | 1 → **1** | **LOSE** |
 | **Parallel metadata writes**, 512 creates, 8 threads, **128 blocks** | **`1.930090x` `[1.916623, 1.940038]` slower** (margin `1.019214x`) | `1.002214x`, spread `1.009562x` | `0.997250x`, spread `1.009114x` | 8 → **8** | **LOSE** |
 | **Multi-file parallel read**, 256 × 256 KiB, 8 threads | **≈`0.89–0.93x` FASTER — CONFIRMED in a verified-quiet window.** Two admitted runs, `0.893282x [0.891253, 0.896649]` and `0.927352x [0.923351, 0.930643]`, both `HONEST_WIN`, both `directional_claim_clear=true`, spread `3.81%`. **Quote the spread, not either CI.** Run 1 lands `0.11%` from the banked `0.894290x` on a *different* fixture construction. ⚠ Two EARLIER runs the same day under a peer's CPU load returned `1.019622x` NEUTRAL / `0.961107x` WIN — **inadmissible, see below** | quiet run 1 `1.002400x`, run 2 `1.003917x` | quiet run 1 `1.001901x`, run 2 `0.999706x` | 8 → **8** | **WIN** |
@@ -89,7 +89,7 @@ was transcription, never measurement.
 | --- | --- | --- |
 | Large-directory readdir+stat, 32,768 entries | **27.772 / 27.796 ms** (runs 1/2, 2026-08-08; was 26.157 ms) | **214.816 / 212.881 ms** (runs 1/2; was 217.782 ms) |
 | Fsync/journal commit, 8 × 4 KiB | 101.5 ms | 200.5 ms |
-| Warm stat, 2,000 calls | ⛔ **not recorded** | ⛔ **not recorded** |
+| Warm stat, 2,000 calls | **4.569 / 4.556 ms** (runs 1/2, 2026-08-08); banked run ⛔ **not recorded** | **21.916 / 21.910 ms** (runs 1/2); banked run ⛔ **not recorded** |
 | Small-file create/delete storm, 2,000 files | ⛔ **not recorded** | ⛔ **not recorded** |
 | Parallel metadata writes, 512 creates | ⛔ **not recorded** | ⛔ **not recorded** |
 | Multi-file parallel read, 256 × 256 KiB | **4.742 / 4.143 ms** (quiet runs 1/2); contended runs 3.887/3.943 ⛔ inadmissible; banked run ⛔ **not recorded** | **4.311 / 3.820 ms** (quiet runs 1/2); contended runs 3.917/3.787 ⛔ inadmissible; banked run ⛔ **not recorded** |
@@ -114,9 +114,14 @@ runs are recorded above precisely so this cannot recur for them.
   26.157 ms / 217.782 ms for `8.322812x`. Note which arm moved: ours improved `1.4%` while
   the incumbent slowed `6.2%`, so most of the `8.32x → 7.75x` change is the kernel's, not
   ours, and none of it is attributable to the fixture alone (`bd-pb85e`).
-- **Warm stat: we lose.** About five times slower, replicated on two CPUs — and the ext4
-  bank now measures the same shape at `4.812194x`, within 3.4%, so this is the shared
-  per-request FUSE floor rather than anything about btrfs inode lookup.
+- **Warm stat: we lose.** About `4.8` times slower, re-measured 2026-08-08 as an admitted
+  pair on a current ELF (`4.769886x` / `4.802719x`, spread `0.69%`); the banked
+  `4.977803x` / `5.036433x` is superseded. The ext4 twin, measured in the SAME invocations,
+  lands at `4.812789x` / `4.864714x` — **within `1.3%`** of these. Two filesystems with
+  entirely different metadata layouts agreeing that closely is the strongest evidence yet
+  that this row measures the shared per-request FUSE floor rather than anything about btrfs
+  inode lookup. The absolutes say the same thing: our arm is `21.91` ms on btrfs and
+  `21.89` ms on ext4, a `0.1%` difference, while the two kernel arms differ by `1.2%`.
 - **Create/delete storm: we lose.** About 2.36 times slower on a 2,000-file namespace
   transaction.
 - **Parallel metadata writes: we lose.** About 1.93 times slower with eight workers

@@ -1,18 +1,18 @@
 # Mounted-kernel scorecard: FrankenFS FUSE against the incumbent, Linux kernel ext4
 
-> ## ⛔ ONE ROW DESCRIBES FRANKENFS AT `HEAD`. THE OTHER SEVEN DO NOT.
+> ## ⛔ THREE ROWS DESCRIBE FRANKENFS AT `HEAD`. THE OTHER FIVE DO NOT.
 >
-> **readdir+stat was re-measured 2026-08-08** on candidate `913c36a4…` (PGO `b30de364…`,
-> x86-64-v3 attested) after `bd-plkzd` corrected its fixture, twice, both admitted. **Every
-> other row here was measured on an ELF that predates the current tree** and none has been
-> re-measured. The provenance, row by row:
+> **readdir+stat, parallel read and warm stat were re-measured 2026-08-08** on candidate
+> `913c36a4…` (PGO `b30de364…`, x86-64-v3 attested) — each twice, all admitted, the last of
+> them under the during-run external-load gate (`bd-bt2dy`). **Every other row here was
+> measured on an ELF that predates the current tree** and none has been re-measured. The
+> provenance, row by row:
 >
 > | Rows | Candidate ELF | Measured |
 > | --- | --- | --- |
-> | **readdir+stat** | **`913c36a4…`** | **2026-08-08 (current)** |
-> | create/delete storm, parallel read, fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
-> | Warm stat | `9e32e28f…` | 2026-08-04 |
-> | Xattr get/list report, bulk durable write | `bcf2bc80…` | 2026-08-05 |
+> | **readdir+stat**, **parallel read**, **warm stat** | **`913c36a4…`** | **2026-08-08 (current)** |
+> | create/delete storm, fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
+> > | Xattr get/list report, bulk durable write | `bcf2bc80…` | 2026-08-05 |
 >
 > ⚠ The re-measured readdir+stat row is **not** comparable with the other seven as if one
 > window produced them: it uses a freshly trained PGO profile (`b30de364…`, not the bank's
@@ -27,10 +27,10 @@
 > from every overwrite-split). The last of those changes the write path's I/O profile, so it
 > can move those numbers in either direction.
 >
-> **Therefore: no figure below EXCEPT readdir+stat may be presented as "FrankenFS today"
-> until it is re-measured on a current ELF.** Quote the rest as historical, with their ELF, or
-> not at all. This is not a hedge about precision — it is that the binary those seven describe
-> no longer exists in the tree.
+> **Therefore: no figure below EXCEPT readdir+stat, parallel read and warm stat may be
+> presented as "FrankenFS today" until it is re-measured on a current ELF.** Quote the rest as
+> historical, with their ELF, or not at all. This is not a hedge about precision — it is that
+> the binary those five describe no longer exists in the tree.
 
 > ## ⚠ A CLEAR PREFLIGHT IS NOT EVIDENCE OF COMPARABILITY (`bd-4sull`)
 >
@@ -72,10 +72,12 @@
 > a row's A/A nulls and twice-null margin bound **within-invocation** error only. Cross-window
 > reproducibility is a *separate, unmeasured* quantity unless a second same-ELF run exists.
 > Where one does, quote the observed spread; where none does, quote the worst spread the
-> campaign has measured. Five same-ELF figures now exist: **4.71%** on one workload,
+> campaign has measured. Eight same-ELF figures now exist: **4.71%** on one workload,
 > **9.15%** on bulk durable write, **2.73%** on ext4 readdir+stat, **1.36%** on btrfs
-> readdir+stat and **0.83%** on ext4 parallel read (the last three 2026-08-08, the first rows
-> banked *with* their spread rather than having it discovered later). A later measurement that disagrees with a banked row by less than that
+> readdir+stat, **0.83%** on ext4 parallel read, **6.09%** on btrfs parallel read under
+> co-tenant load and **3.81%** on the same row in a quiet window, **1.08%** on ext4 warm stat
+> and **0.69%** on btrfs warm stat (all the 2026-08-08 ones banked *with* their spread rather
+> than having it discovered later). A later measurement that disagrees with a banked row by less than that
 > is **not** a regression, an improvement, or a disagreement — it is unresolved.
 >
 > **The readdir+stat pair is the cleanest demonstration of why this rule exists.** Two
@@ -101,6 +103,8 @@
 > | ext4 readdir+stat | 2.73% | 1.84% | yes |
 > | btrfs readdir+stat | 1.36% | 0.40% | yes |
 > | ext4 parallel read | 0.83% | 0.86% | **no** |
+> | ext4 warm stat | 1.08% | 0.88% | yes |
+> | btrfs warm stat | 0.69% | 1.37% | **no** |
 >
 > So the spread is *often* the larger quantity but not reliably, and neither number bounds the
 > other. That is not a weakening of the rule — it is the reason the rule is stated as
@@ -142,7 +146,7 @@ could already run both and neither scorecard carried either.)
 | **Multi-file parallel read** — enumerate and byte-sort 256 × 256 KiB files, then 8 workers `pread` every file exactly once (ro) | **≈`0.98x` — a TIE, not a win.** Two admitted same-ELF runs, `0.986316x [0.981390, 0.989874]` and `0.978203x [0.968511, 0.981821]`; neither clears its margin (`1.016961x`/`1.020212x`), `directional_claim_clear=false` on both. Spread `0.83%`. ⛔ SUPERSEDES `1.287862x`, measured on an unindexed fixture and a since-destroyed ELF | run 1 `0.995873x [0.991626, 1.005511]` · run 2 `1.004181x [0.993028, 1.010056]` | run 1 `1.000388x [0.997640, 1.004583]` · run 2 `1.001259x [0.995212, 1.005430]` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **8 → 8** on all four arms, pinning attested | **NEUTRAL** |
 | **Fsync/journal commit** — 8 × 4 KiB positioned writes to one file, `fsync` after each | `0.997098x [0.990808, 1.009108]` against a twice-null margin of **`1.030661x`**; `directional_claim_clear=false` | `1.001860x [0.991465, 1.004642]`, spread `1.008609x` | `0.997807x [0.991484, 1.015215]`, spread `1.015215x` | `amd-pstate-epp` / `powersave` / `balance_performance` | **1 → 1** on all four arms, pinning attested | **NEUTRAL** |
 | **Parallel metadata writes** — 8 workers create exactly 512 empty files into private directories, then fsync every worker directory (**128 crossover blocks**) | **`1.510822x` `[1.493097, 1.539011]` slower** (twice-null margin `1.049223x`); replicated on a **disjoint CPU set** at `1.513052x [1.490837, 1.534711]`, agreeing to **0.15%** | `1.007184x [0.998479, 1.024316]`, spread `1.024316x` · replicate `0.998642x [0.990286, 1.009556]`, spread `1.009809x` | `0.995707x [0.978797, 1.000111]`, spread `1.021662x` · replicate `0.998780x [0.990819, 1.002688]`, spread `1.009266x` | `amd-pstate-epp` / `powersave` / **`performance`** (host EPP differed in this window; uniform across both metadata runs) | **8 → 8** on all four arms, pinning attested | **LOSE** |
-| **Warm stat** — issue 2,000 `stat` calls against one mounted file and aggregate the metadata (ro) | **`4.812194x` `[4.779087, 4.819425]` slower** (twice-null margin `1.035698x`) | `1.002547x` | `1.000593x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
+| **Warm stat** — issue 2,000 `stat` calls against one mounted file and aggregate the metadata (ro) | **≈`4.81–4.86x` slower.** Two admitted same-ELF runs on a current candidate, `4.812789x [4.805600, 4.847893]` and `4.864714x [4.855028, 4.976741]`, margins `1.025305x`/`1.036618x`, spread `1.08%`. **Quote the spread, not either CI.** Reproduces the banked `4.812194x` to within `0.01%` on run 1 | run 1 `1.001140x`, spread `1.012573x` · run 2 `1.009427x` | run 1 `1.003030x`, spread `1.009207x` · run 2 `0.993159x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
 | **Xattr get/list report** — repeat 2,000 five-call reports: read one inline value, read one external-block value, check one absent name, list one name, list 24 names (ro) | **`5.749816x` `[5.725990, 5.756846]` slower** (twice-null margin `1.009130x`) | `0.999678x [0.996487, 1.002264]`, spread `1.003525x` | `1.000266x [0.995466, 1.001873]`, spread `1.004555x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
 | **Bulk durable write** — overwrite one preallocated 64 MiB file with 64 sequential 1 MiB positioned writes, then one file `fsync` (**2,048 pairs / 512 crossover blocks**) | **`2.898298x` `[2.874382, 2.920502]` slower** (twice-null margin `1.035235x`) — ⚠ **this interval is within-invocation only; a second admitted run of the identical ELF measured `2.655365x`, so quote this row as ≈`2.7–2.9x`, never to its own CI** | `1.001588x [0.997161, 1.009249]`, spread `1.009249x` | `0.989118x [0.982835, 0.994415]`, spread `1.017465x` | `amd-pstate-epp` / **`performance`** / `performance` (uniform, no mixed-governor warning) | **1 → 1** on all four arms, pinning attested | **LOSE** |
 
@@ -339,7 +343,7 @@ transcription. **Every future row must carry both**; `scripts/perf_ledger_prefli
 | Multi-file parallel read, 256 × 256 KiB | **3.803 / 3.917 ms** (runs 1/2, 2026-08-08; was 3.11 ms) | **3.809 / 3.847 ms** (runs 1/2; was 4.01 ms) |
 | Fsync/journal commit, 8 × 4 KiB | 145.49 ms | 145.08 ms |
 | Parallel metadata writes, 512 creates | 29.30 ms | 42.31 ms |
-| Warm stat, 2,000 calls | 4.42 ms | 21.30 ms |
+| Warm stat, 2,000 calls | **4.532 / 4.502 ms** (runs 1/2, 2026-08-08; was 4.42 ms) | **21.893 / 21.891 ms** (runs 1/2; was 21.30 ms) |
 | Xattr get/list report, 2,000 five-call reports | ⛔ **not recorded** | ⛔ **not recorded** |
 | Bulk durable write, 64 × 1 MiB + fsync | 77.31 ms | 225.31 ms |
 
