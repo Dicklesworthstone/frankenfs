@@ -54944,6 +54944,66 @@ mod tests {
         concurrent_create_delete_counter_check_bd_y2t0r(false);
     }
 
+    /// bd-y2t0r audit: the ORDERING that makes recovery-time inode frees safe.
+    ///
+    /// `maybe_recover_ext4_orphans` and `free_fast_commit_deleted_inode` both
+    /// free inodes through `delete_inode` against the single-lock `groups` array
+    /// — the same shape that leaked in unlink and in rename. They are NOT
+    /// defects, and the reason is purely ordering: both run inside
+    /// `from_device`/`open_with_options` (fast-commit apply and orphan recovery
+    /// sit a few lines apart in that constructor), while `ext4_sharded_alloc` is
+    /// not built until `enable_writes`, which seeds it by CLONING
+    /// `alloc_state.groups`. A recovery free is therefore already reflected in
+    /// the array the sharded records are cloned from; there is no second writer
+    /// and nothing to diverge.
+    ///
+    /// That safety is entirely load-bearing on the ordering, and nothing else
+    /// enforces it. If the sharded structure is ever built earlier — at mount, or
+    /// lazily on first write — both recovery paths silently become instances of
+    /// bd-pbyu0, leaking one inode per recovered orphan with no test failing.
+    /// This pins the invariant so that change fails HERE, next to the reasoning,
+    /// instead of surfacing later as an e2fsck-dirty image.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn sharded_records_do_not_exist_until_enable_writes_bd_y2t0r() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("ordering.ext4");
+        let f = std::fs::File::create(&image).expect("create image");
+        f.set_len(16 * 1024 * 1024).expect("size image");
+        drop(f);
+        let out = std::process::Command::new("mkfs.ext4")
+            .args(["-F", "-b", "4096", image.to_str().unwrap()])
+            .output();
+        if !matches!(out, Ok(ref o) if o.status.success()) {
+            return; // e2fsprogs unavailable
+        }
+
+        let cx = Cx::for_testing();
+        let data = std::fs::read(&image).expect("read image");
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(data)), &opts)
+            .expect("open ext4");
+
+        // Orphan recovery and fast-commit apply have already run inside
+        // `from_device` at this point.
+        assert!(
+            fs.ext4_sharded_alloc.is_none(),
+            "the sharded per-group records must NOT exist during mount-time \
+             recovery — recovery frees inodes into the single-lock groups array, \
+             and their safety depends on that array being the only writer until \
+             `enable_writes` clones it (bd-y2t0r audit)"
+        );
+
+        fs.enable_writes(&cx).expect("enable writes");
+        assert!(
+            fs.ext4_sharded_alloc.is_some(),
+            "…and they must exist afterwards, or this test is asserting nothing"
+        );
+    }
+
     /// bd-y2t0r audit: RENAME-OVER-EXISTING is a delete path too, and it was
     /// never routed through the sharded records.
     ///
