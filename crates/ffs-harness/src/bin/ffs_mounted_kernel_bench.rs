@@ -27,7 +27,7 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -3913,6 +3913,73 @@ fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>> {
     Ok(busy)
 }
 
+/// A CPU outside the placement set counts as carrying EXTERNAL load above this
+/// busy fraction (bd-bt2dy).
+///
+/// Calibrated against the two real windows that motivated this, both sampled by
+/// the harness itself: the contended window had 5 off-placement CPUs above `0.2`
+/// (one pinned at `1.000`, off-placement mean `0.081`), the quiet window had 0
+/// (max `0.170`, mean `0.028`). `0.25` sits above the quiet window's worst CPU
+/// and far below the contended window's, so the two separate cleanly.
+const EXTERNAL_BUSY_CPU_FRACTION: f64 = 0.25;
+
+/// How many off-placement CPUs may carry external load before a run is refused.
+/// Two is deliberately permissive — a lone background daemon does not invalidate
+/// a measurement — while the case that flipped a published verdict showed five.
+const MAX_EXTERNAL_BUSY_CPUS: usize = 2;
+
+/// Verdict for one during-run external-load sample.
+///
+/// Split out as a pure function so the policy is testable without spawning a
+/// thread or needing a busy machine.
+fn external_busy_cpu_count(
+    busy: &BTreeMap<usize, f64>,
+    placement_cpus: &BTreeSet<usize>,
+    limit_fraction: f64,
+) -> usize {
+    busy.iter()
+        .filter(|(cpu, _)| !placement_cpus.contains(*cpu))
+        .filter(|(_, load)| **load > limit_fraction)
+        .count()
+}
+
+/// Accumulated external-load evidence for one run (bd-bt2dy).
+#[derive(Debug, Default, Clone)]
+struct ExternalLoadWitness {
+    samples: usize,
+    max_busy_cpus: usize,
+    /// Samples whose busy-CPU count exceeded the limit.
+    over_limit_samples: usize,
+    /// Largest off-placement mean busy fraction seen in any single sample.
+    peak_mean_busy: f64,
+}
+
+impl ExternalLoadWitness {
+    fn observe(&mut self, busy: &BTreeMap<usize, f64>, placement: &BTreeSet<usize>, limit: usize) {
+        self.samples += 1;
+        let count = external_busy_cpu_count(busy, placement, EXTERNAL_BUSY_CPU_FRACTION);
+        self.max_busy_cpus = self.max_busy_cpus.max(count);
+        if count > limit {
+            self.over_limit_samples += 1;
+        }
+        let off: Vec<f64> = busy
+            .iter()
+            .filter(|(cpu, _)| !placement.contains(*cpu))
+            .map(|(_, load)| *load)
+            .collect();
+        if !off.is_empty() {
+            let mean = off.iter().sum::<f64>() / off.len() as f64;
+            if mean > self.peak_mean_busy {
+                self.peak_mean_busy = mean;
+            }
+        }
+    }
+
+    const fn clean(&self, limit: usize) -> bool {
+        self.over_limit_samples == 0 && self.max_busy_cpus <= limit
+    }
+}
+
 fn busy_cpus_above_limit(
     busy: &BTreeMap<usize, f64>,
     allowed_cpus: &BTreeSet<usize>,
@@ -6350,6 +6417,39 @@ fn run() -> Result<Option<PathBuf>> {
         RequestedFilesystems::Btrfs => vec![FilesystemKind::Btrfs],
         RequestedFilesystems::Both => vec![FilesystemKind::Ext4, FilesystemKind::Btrfs],
     };
+    // bd-bt2dy: sample EXTERNAL load for the whole measured region, not just once
+    // before it. The pre-run gate gets the placement CPUs right and is blind to
+    // everything else on the socket; a peer's build on other cores flipped a
+    // published verdict (bd-ws9dg) while `core_contention_preflight` correctly
+    // reported `verdict=clear`. Bandwidth, LLC and boost budget are shared even
+    // when the placement cores are idle.
+    let external_load_stop = Arc::new(AtomicBool::new(false));
+    let external_load_witness = Arc::new(Mutex::new(ExternalLoadWitness::default()));
+    let sampler_placement: BTreeSet<usize> = placement
+        .driver_cpus
+        .iter()
+        .chain(placement.driver_guard_cpus.iter())
+        .chain(placement.fuse_cpus.iter())
+        .chain(placement.fuse_guard_cpus.iter())
+        .copied()
+        .collect();
+    let sampler = {
+        let stop = Arc::clone(&external_load_stop);
+        let witness = Arc::clone(&external_load_witness);
+        let placement_cpus = sampler_placement.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // Errors here must never fail a run: this is evidence, not a gate
+                // input, until the verdict below reads it.
+                if let Ok(busy) = sample_cpu_busy() {
+                    if let Some(mut w) = witness.lock().ok() {
+                        w.observe(&busy, &placement_cpus, MAX_EXTERNAL_BUSY_CPUS);
+                    }
+                }
+            }
+        })
+    };
+
     let mut filesystem_reports = Vec::with_capacity(requested.len());
     let mut blocked_filesystems = Vec::new();
     for kind in requested {
@@ -6371,6 +6471,31 @@ fn run() -> Result<Option<PathBuf>> {
             blocked_filesystems.push(kind.label());
         }
     }
+
+    external_load_stop.store(true, Ordering::Relaxed);
+    let _ = sampler.join();
+    let external_load = external_load_witness
+        .lock()
+        .map(|w| w.clone())
+        .unwrap_or_default();
+    let external_load_clean = external_load.clean(MAX_EXTERNAL_BUSY_CPUS);
+    println!(
+        "external_load_during_run,samples={},max_external_busy_cpus={},over_limit_samples={},\
+         peak_off_placement_mean_busy={:.6},busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
+         placement_cpus_excluded={},verdict={}",
+        external_load.samples,
+        external_load.max_busy_cpus,
+        external_load.over_limit_samples,
+        external_load.peak_mean_busy,
+        EXTERNAL_BUSY_CPU_FRACTION,
+        MAX_EXTERNAL_BUSY_CPUS,
+        sampler_placement.len(),
+        if external_load_clean {
+            "clear"
+        } else {
+            "CONTENDED"
+        }
+    );
 
     let free_after = free_bytes_on_data()?;
     // Built as two objects and merged: one `json!` literal carrying every
@@ -6450,6 +6575,21 @@ fn run() -> Result<Option<PathBuf>> {
         "fuse_guard_cpus": placement.fuse_guard_cpus,
         "last_level_cache_cpus": placement.last_level_cache_cpus,
         "initial_cpu_busy_fractions": placement.busy_fractions,
+        // bd-bt2dy: the DURING-run external-load witness, recorded whether or not
+        // it is clean so a later reader can disqualify a banked row without
+        // re-running it. The pre-run fields above describe the placement CPUs at
+        // one instant; these describe everything else for the whole measured region.
+        "external_load_during_run": json!({
+            "samples": external_load.samples,
+            "max_external_busy_cpus": external_load.max_busy_cpus,
+            "over_limit_samples": external_load.over_limit_samples,
+            "peak_off_placement_mean_busy": external_load.peak_mean_busy,
+            "busy_cpu_fraction_limit": EXTERNAL_BUSY_CPU_FRACTION,
+            "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
+            "placement_cpus_excluded": sampler_placement.len(),
+            "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
+            "verdict": if external_load_clean { "clear" } else { "contended" },
+        }),
         "initial_host_wide_quiescence": placement.initial_host_quiet_window.as_ref().map_or_else(
             || json!("not_applicable"),
             |window| json!({
@@ -6537,6 +6677,28 @@ fn run() -> Result<Option<PathBuf>> {
         blocked_filesystems.is_empty(),
         "A/A null gate blocked filesystem(s) {}; report preserved at {}",
         blocked_filesystems.join(","),
+        output.display()
+    );
+    // bd-bt2dy: refuse the run if EXTERNAL load contended the socket during the
+    // measured region. Ordered after the A/A gate deliberately — a row that fails
+    // its nulls should say so first — and fails closed like every other gate here,
+    // because the alternative is what happened on 2026-08-08: two admitted runs
+    // under a peer's build returned opposite verdicts and one was published.
+    // The report is written before this check, so a refused run is still
+    // diagnosable from its own external_load_during_run block.
+    ensure!(
+        external_load_clean,
+        "external load contended the socket during the measured region: \
+         {} of {} samples exceeded {} off-placement CPUs above {:.0}% busy (peak {}), \
+         peak off-placement mean busy {:.1}%. The placement CPUs may well have been idle — \
+         that is what the pre-run gate checks — but memory bandwidth, LLC and boost budget \
+         are socket-wide. Re-run in a quiet window. Report preserved at {}",
+        external_load.over_limit_samples,
+        external_load.samples,
+        MAX_EXTERNAL_BUSY_CPUS,
+        EXTERNAL_BUSY_CPU_FRACTION * 100.0,
+        external_load.max_busy_cpus,
+        external_load.peak_mean_busy * 100.0,
         output.display()
     );
     Ok(Some(output))
@@ -7973,6 +8135,111 @@ mod tests {
         // "debugfs said nothing" as success is not a control at all.
         assert!(!htree_dump_reports_indexed(""));
         assert!(!htree_dump_reports_indexed("debugfs: command not found\n"));
+    }
+
+    /// bd-bt2dy: the during-run external-load policy, calibrated on the two REAL
+    /// windows that motivated it rather than on invented numbers. Both figure sets
+    /// are the harness's own `pre_measurement_cpu_busy` from the reports of
+    /// 2026-08-08: the contended window (a peer's build) and the quiet one whose
+    /// re-run confirmed the btrfs parallel-read win.
+    #[test]
+    fn external_load_policy_separates_the_two_real_windows_bd_bt2dy() {
+        let placement: BTreeSet<usize> = [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39]
+            .into_iter()
+            .collect();
+
+        // Contended: five off-placement CPUs above 0.2, one pinned at 1.000.
+        let mut contended: BTreeMap<usize, f64> = BTreeMap::new();
+        for cpu in 0..64 {
+            contended.insert(cpu, 0.01);
+        }
+        for (cpu, load) in [(16, 1.000), (19, 0.61), (48, 0.44), (51, 0.33), (54, 0.26)] {
+            contended.insert(cpu, load);
+        }
+
+        // Quiet: nothing off-placement above 0.170.
+        let mut quiet: BTreeMap<usize, f64> = BTreeMap::new();
+        for cpu in 0..64 {
+            quiet.insert(cpu, 0.02);
+        }
+        quiet.insert(16, 0.170);
+        quiet.insert(19, 0.09);
+
+        assert_eq!(
+            external_busy_cpu_count(&contended, &placement, EXTERNAL_BUSY_CPU_FRACTION),
+            5,
+            "the contended window's five loaded off-placement CPUs must all be seen"
+        );
+        assert_eq!(
+            external_busy_cpu_count(&quiet, &placement, EXTERNAL_BUSY_CPU_FRACTION),
+            0,
+            "the quiet window's worst off-placement CPU (0.170) sits below the 0.25 limit, \
+             so a quiet run must not be refused"
+        );
+
+        // Load ON the placement CPUs is the pre-run gate's business, not this one:
+        // the bench itself saturates them, so counting them would refuse every run.
+        let mut bench_running: BTreeMap<usize, f64> = BTreeMap::new();
+        for cpu in 0..64 {
+            bench_running.insert(cpu, 0.01);
+        }
+        for cpu in &placement {
+            bench_running.insert(*cpu, 1.0);
+        }
+        assert_eq!(
+            external_busy_cpu_count(&bench_running, &placement, EXTERNAL_BUSY_CPU_FRACTION),
+            0,
+            "a fully busy placement set is the bench doing its job and must never count \
+             as external load"
+        );
+    }
+
+    /// bd-bt2dy: the witness must refuse a run that was contended for even one
+    /// sample, and must accept one that never was.
+    #[test]
+    fn external_load_witness_fails_closed_on_any_over_limit_sample_bd_bt2dy() {
+        let placement: BTreeSet<usize> = (0..8).collect();
+        let mut busy_quiet: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        busy_quiet.insert(3, 0.99); // placement CPU: the bench, ignored
+        let mut busy_loaded: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        for cpu in [20, 21, 22, 23] {
+            busy_loaded.insert(cpu, 0.8);
+        }
+
+        let mut clean = ExternalLoadWitness::default();
+        for _ in 0..10 {
+            clean.observe(&busy_quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        }
+        assert!(clean.clean(MAX_EXTERNAL_BUSY_CPUS));
+        assert_eq!(clean.samples, 10);
+        assert_eq!(clean.max_busy_cpus, 0);
+
+        // One contended sample in an otherwise clean run is enough to refuse it —
+        // a burst is exactly what flipped the verdict in bd-ws9dg.
+        let mut spiked = ExternalLoadWitness::default();
+        for _ in 0..9 {
+            spiked.observe(&busy_quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        }
+        spiked.observe(&busy_loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        assert!(
+            !spiked.clean(MAX_EXTERNAL_BUSY_CPUS),
+            "a single over-limit sample must refuse the run"
+        );
+        assert_eq!(spiked.over_limit_samples, 1);
+        assert_eq!(spiked.max_busy_cpus, 4);
+        assert!(spiked.peak_mean_busy > 0.0);
+
+        // Exactly at the limit is permitted: two busy off-placement CPUs is the
+        // documented tolerance for ordinary background daemons.
+        let mut at_limit: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        at_limit.insert(30, 0.9);
+        at_limit.insert(31, 0.9);
+        let mut edge = ExternalLoadWitness::default();
+        edge.observe(&at_limit, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        assert!(
+            edge.clean(MAX_EXTERNAL_BUSY_CPUS),
+            "2 busy CPUs is at the limit, not over it"
+        );
     }
 
     /// bd-c5210: every workload whose fixture directory `mke2fs -d` would bake in
