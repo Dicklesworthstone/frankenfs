@@ -15,10 +15,15 @@
 # Usage: pbyu0_mounted_repro.sh <ffs-cli> [cycles] [files-per-cycle] [image-mib]
 set -u -o pipefail
 
-FFS_CLI="${1:?usage: pbyu0_mounted_repro.sh <ffs-cli> [cycles] [files] [mib]}"
+FFS_CLI="${1:?usage: pbyu0_mounted_repro.sh <ffs-cli> [cycles] [files] [mib] [kib-per-file]}"
 CYCLES="${2:-40}"
 FILES="${3:-2000}"
 MIB="${4:-2048}"
+# bd-y2t0r: bytes written to each file before deleting it. ZERO by default, which
+# is what bd-pbyu0 was reproduced with — and precisely why that reproduction showed
+# inode-count errors and ZERO block-count errors: empty files free no data blocks.
+# Pass a non-zero value to exercise the BLOCK side of the same accounting path.
+KIB="${5:-0}"
 
 BASE=$(mktemp -d "${TMPDIR:-/data/tmp}/ffs-pbyu0-repro-XXXXXX")
 chmod 0755 "$BASE"   # mktemp gives 0700; FUSE needs the mountpoint path traversable
@@ -60,10 +65,18 @@ cycle=0
 while [ "$cycle" -lt "$CYCLES" ]; do
   i=0
   while [ "$i" -lt "$FILES" ]; do
-    : > "$DIR/storm-$(printf '%05d' "$i")" || {
+    f="$DIR/storm-$(printf '%05d' "$i")"
+    if [ "$KIB" -gt 0 ]; then
+      head -c "$((KIB * 1024))" /dev/zero > "$f" || {
+        echo "CREATE FAILED at cycle $cycle file $i — ENOSPC face of bd-pbyu0"
+        break 2
+      }
+    else
+    : > "$f" || {
       echo "CREATE FAILED at cycle $cycle file $i — this is the ENOSPC face of bd-pbyu0"
       break 2
     }
+    fi
     i=$((i + 1))
   done
   i=0
@@ -82,5 +95,6 @@ echo ">> unmounted after $cycle cycles"
 
 echo ">> post-unmount e2fsck"
 e2fsck -fn "$IMG" 2>&1 | grep -E "Free inodes count wrong|Free blocks count wrong|clean|WARNING" | head -15
+echo "   (inode-count errors: $(e2fsck -fn "$IMG" 2>&1 | grep -c 'Free inodes count wrong'), block-count errors: $(e2fsck -fn "$IMG" 2>&1 | grep -c 'Free blocks count wrong'), KiB/file=$KIB)"
 e2fsck -fn "$IMG" >/dev/null 2>&1 && echo "   RESULT: clean (did NOT reproduce)" \
                                   || echo "   RESULT: DIRTY (reproduced bd-pbyu0)"
