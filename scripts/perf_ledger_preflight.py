@@ -18,9 +18,11 @@ Four jobs, three exit classes:
                          an A/A null control nor a counted mechanism. Numeric A/A
                          decisions must record a bootstrap median CI. Refuse a KEEP
                          without both that CI and an in-process self-report of the
-                         executing ELF's SHA-256. Refuse every CV gate, including one
-                         deferred into a retry predicate. Policy failures exit 2;
-                         infrastructure failures 64.
+                         executing ELF's SHA-256. Refuse a competitive row (live
+                         same-invocation incumbent arm) that records only its ratio and
+                         not both arms' ABSOLUTE medians — bd-4sull item 3. Refuse every
+                         CV gate, including one deferred into a retry predicate. Policy
+                         failures exit 2; infrastructure failures 64.
 
   --lint [--since REF]   Apply the same rules to the whole ledger or committed rows
                          added since REF.
@@ -154,6 +156,36 @@ NO_INCUMBENT_SURFACE = re.compile(
     r"durability autopilot|refresh polic|stale[- ]window|adaptive runtime|"
     r"topology advisor|proof bundle|release gate|evidence event|ParityReport|"
     r"expected loss|MergeProof|merge proof|ConflictPolicy|SafeMerge",
+    re.I,
+)
+
+# --- absolute arm medians on a competitive row (bd-4sull item 3) -------------
+# A ratio is a QUOTIENT: on its own it cannot say which arm moved. Measured, not
+# argued -- the incumbent arm of one banked shape drifted +18.3% (77.31 -> 83.69
+# -> 91.43 ms) across three gate-clear windows on one kernel while FrankenFS held
+# to 1.4%, so a re-run disagreeing with a banked row says nothing until the arms
+# are separated. That decomposition is only possible when BOTH absolute medians
+# are on record. The harness already prints them on its `mounted_kernel_throughput`
+# line; the historical gap was transcription, and rows that missed it (the ext4
+# xattr row, four of six btrfs rows) are now permanently un-diagnosable because
+# their reports were deleted (bd-v0igv). So: a row making a live same-invocation
+# incumbent claim must carry an absolute median for each arm.
+_DURATION = r"\d[\d,]*(?:\.\d+)?\s*(?:ns|[uµ]s|ms|s(?:ec(?:onds?)?)?)\b"
+_INCUMBENT_ARM_TOK = r"kernel|incumbent"
+_CANDIDATE_ARM_TOK = r"fuse|frankenfs|ffs|candidate|ours?|we\b"
+# Either the machine field straight off the harness line, or prose naming the arm
+# and a duration within a short window (kept tight so an unrelated sentence in the
+# same cell cannot satisfy it).
+INCUMBENT_ABSOLUTE_MEDIAN = re.compile(
+    rf"kernel_median_wall_ns\s*[:=]\s*\d"
+    rf"|(?:{_INCUMBENT_ARM_TOK})[^|\n]{{0,60}}median[^|\n]{{0,60}}{_DURATION}"
+    rf"|median[^|\n]{{0,40}}(?:{_INCUMBENT_ARM_TOK})[^|\n]{{0,60}}{_DURATION}",
+    re.I,
+)
+CANDIDATE_ABSOLUTE_MEDIAN = re.compile(
+    rf"fuse_median_wall_ns\s*[:=]\s*\d"
+    rf"|(?:{_CANDIDATE_ARM_TOK})[^|\n]{{0,60}}median[^|\n]{{0,60}}{_DURATION}"
+    rf"|median[^|\n]{{0,40}}(?:{_CANDIDATE_ARM_TOK})[^|\n]{{0,60}}{_DURATION}",
     re.I,
 )
 
@@ -293,6 +325,23 @@ class Row:
             for clause in re.split(r"\n|\|", evidence)
         )
 
+    def missing_absolute_arm_medians(self) -> list[str]:
+        """Arms whose ABSOLUTE median this competitive row fails to record.
+
+        Empty for any row that is not a live same-invocation incumbent claim --
+        the requirement is about decomposing a *competitive ratio*, so it does not
+        apply to internal A/B rows, which have no incumbent arm to separate.
+        """
+        if self.incumbent_denominator() != "live_same_invocation":
+            return []
+        evidence = decision_evidence(self.text)
+        missing = []
+        if not INCUMBENT_ABSOLUTE_MEDIAN.search(evidence):
+            missing.append("incumbent")
+        if not CANDIDATE_ABSOLUTE_MEDIAN.search(evidence):
+            missing.append("candidate")
+        return missing
+
     def uses_cv_as_gate(self) -> bool:
         # Unlike run evidence, the CV prohibition includes retry predicates: a
         # newly-written row must not instruct the next agent to resurrect the old
@@ -313,6 +362,14 @@ def contract_violations(row: Row) -> list[str]:
     bad: list[str] = []
     if row.uses_cv_as_gate():
         bad.append("CV is used as a gate or threshold (median CI is mandatory)")
+    missing_arms = row.missing_absolute_arm_medians()
+    if missing_arms:
+        bad.append(
+            "competitive row records no absolute median for the "
+            + " and ".join(missing_arms)
+            + " arm (bd-4sull item 3: a ratio alone cannot say which arm moved; "
+            "the harness prints kernel_median_wall_ns / fuse_median_wall_ns)"
+        )
     if row.verdict == "REJECT":
         ok, _ = row.reject_contract_basis()
         if not ok:
@@ -875,6 +932,70 @@ def cmd_self_test() -> int:
             list(row_line_span(Row(sample_path, 17, "one row\n", "KEEP"))) == [17],
         )
     )
+
+    # --- bd-4sull item 3: absolute arm medians on a competitive row ----------
+    competitive = (
+        "KEEP: four-arm mounted-kernel-report crossover, FrankenFS is 2.898298x "
+        "slower than kernel ext4, deterministic bootstrap median 95% CI "
+        "[2.874382, 2.920502]. executing_elf_sha256: " + sha + ". "
+    )
+    checks.extend(
+        [
+            (
+                "competitive row without either absolute arm median is refused",
+                row(competitive, "KEEP").missing_absolute_arm_medians()
+                == ["incumbent", "candidate"],
+            ),
+            (
+                "recording only the incumbent arm still names the candidate arm",
+                row(
+                    competitive + "kernel median batch 77.31 ms.", "KEEP"
+                ).missing_absolute_arm_medians() == ["candidate"],
+            ),
+            (
+                "both prose arm medians satisfy the requirement",
+                not row(
+                    competitive
+                    + "kernel median batch 77.31 ms, FrankenFS median batch 225.31 ms.",
+                    "KEEP",
+                ).missing_absolute_arm_medians(),
+            ),
+            (
+                "the raw harness throughput fields satisfy the requirement",
+                not row(
+                    competitive
+                    + "kernel_median_wall_ns=77310000,fuse_median_wall_ns=225310000",
+                    "KEEP",
+                ).missing_absolute_arm_medians(),
+            ),
+            (
+                "the requirement fires through contract_violations on a staged KEEP",
+                any(
+                    "absolute median" in v
+                    for v in contract_violations(row(competitive, "KEEP"))
+                ),
+            ),
+            (
+                "an internal A/B row has no incumbent arm and is exempt",
+                not row(
+                    "KEEP: same-invocation A/A null control 1.004, candidate is "
+                    "1.70x faster than the frozen control, deterministic bootstrap "
+                    "median 95% CI [1.62, 1.79]. executing_elf_sha256: " + sha,
+                    "KEEP",
+                ).missing_absolute_arm_medians(),
+            ),
+            (
+                "a future retry clause does not supply the medians",
+                row(
+                    competitive
+                    + "Retry only when kernel median batch is under 77.31 ms and "
+                    "FrankenFS median batch is under 225.31 ms.",
+                    "KEEP",
+                ).missing_absolute_arm_medians() == ["incumbent", "candidate"],
+            ),
+        ]
+    )
+
     failures = [name for name, passed in checks if not passed]
     if failures:
         print("preflight self-test: FAILED", file=sys.stderr)
@@ -889,7 +1010,9 @@ HOOK = """#!/usr/bin/env bash
 # frankenfs perf-ledger preflight (installed by scripts/perf_ledger_preflight.py)
 # Refuses a staged REJECT without A/A/count evidence, any CV gate, and a timed
 # decision without bootstrap median-CI evidence. KEEP also requires an
-# executing-ELF SHA-256 self-report. See fleet broadcast 2, 2026-07-25.
+# executing-ELF SHA-256 self-report. A competitive row must also record both
+# arms' absolute medians, not only the ratio (bd-4sull item 3).
+# See fleet broadcast 2, 2026-07-25.
 exec python3 "$(git rev-parse --show-toplevel)/scripts/perf_ledger_preflight.py" \\
      --lint --staged
 """

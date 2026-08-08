@@ -44,9 +44,16 @@
 > a row's A/A nulls and twice-null margin bound **within-invocation** error only. Cross-window
 > reproducibility is a *separate, unmeasured* quantity unless a second same-ELF run exists.
 > Where one does, quote the observed spread; where none does, quote the worst spread the
-> campaign has measured. Only two figures exist so far: **4.71%** on one workload and
+> campaign has measured. Only two same-ELF figures exist so far: **4.71%** on one workload and
 > **9.15%** on bulk durable write. A later measurement that disagrees with a banked row by
 > less than that is **not** a regression, an improvement, or a disagreement — it is unresolved.
+>
+> **The incumbent's own drift is larger than either figure.** Across three gate-clear windows
+> on one kernel, the kernel ext4 arm of the bulk-durable-write shape moved 77.31 → 83.69 →
+> 91.43 ms, **`+18.3%`**, while FrankenFS held 225.31 / 222.39 / 222.22 ms (`1.4%`). Since a
+> ratio row is a quotient, that is the floor on how much a re-run can differ from a banked row
+> for reasons that have nothing to do with our code. Recorded absolute arm medians are what
+> make this decomposable — see the required-per-row table below.
 
 **Date:** 2026-07-30 · **Host:** `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX,
 32C/64T, 231.7 GB RAM, 1 NUMA node · **Kernel:** 6.17.0-35-generic · **Bead:** `bd-opb6l`
@@ -130,6 +137,34 @@ larger-pair runs agreeing to `1.3%`. The kernel ext4 arm holds 77.05 / 77.31 / 7
 then moves to 83.69 ms, `+8.26%`. Between the two admitted runs our arm moved `−1.30%` and
 the incumbent moved `+8.26%`, so **the whole ratio swing is the incumbent, not us.**
 
+⚠⚠⚠ **A fifth run extends the incumbent's range to `+18.3%`** (recovered 2026-08-08 from
+the surviving `bd-2i2ez` window-1 log, the only comparator log that outlived the scratch
+deletion). Same workload shape (`bulk_durable_write`, 64 ops/observation, 2,048 pairs, 512
+crossover blocks), same kernel `6.17.0-41-generic`, same `performance`/`performance`, and it
+too printed `verdict=clear` with `driver_busy_fraction=0.000000` /
+`fuse_busy_fractions=0.000000` and was admitted `HONEST_LOSS`:
+
+| Window | Kernel arm | FrankenFS arm | Ratio | Candidate ELF |
+| --- | --- | --- | --- | --- |
+| 21:46 | 77.31 ms | 225.31 ms | `2.898298x` | `bcf2bc80…` |
+| 22:57 | 83.69 ms | 222.39 ms | `2.655365x` | `bcf2bc80…` |
+| 2026-08-06 w1 | **91.43 ms** | 222.22 ms | `2.430234x` | **`d34b21c0…`** |
+
+**Read this carefully, because half of it counts and half of it does not.** The third run's
+candidate ELF is *different*, so its **ratio is not a same-ELF replicate** and must not be
+folded into the `9.15%` figure — that number still stands on the two `bcf2bc80…` runs alone.
+But the **kernel arm does not execute our binary at all**, so its absolute median is a
+legitimate third observation of the incumbent: 77.31 → 83.69 → 91.43 ms, a monotone `+18.3%`
+climb across three gate-clear windows on one kernel, while our arm sat at 225.31 / 222.39 /
+222.22 ms, agreeing to `1.4%`. The one confound worth naming is that the arms run
+interleaved in the crossover, so a different candidate could in principle change the
+interference the kernel arm sees — but our arm measured 222.22 ms here, inside the banked
+222–232 ms band, so the co-load was comparable.
+
+**The incumbent-side drift is therefore larger than this file previously said, and it is
+the recorded absolute medians that made it visible.** Had the xattr row carried its own,
+the same question could be asked of it; it cannot.
+
 The consequence is general and not specific to this row: **the admission contract bounds
 within-invocation error only.** A/A nulls and the twice-null margin say nothing about
 whether the same ELF re-measures to the same ratio next window, and here it does not, by
@@ -192,10 +227,21 @@ moved `4.212274x → 4.967448x` and read moved `1.203230x → 1.287862x`. Pinnin
 *kernel* arm faster by preserving locality, so a correct instrument flatters the
 incumbent. Storm moved the other way, `2.957531x → 2.753659x`.
 
-## Diagnostic side numbers (recorded, never a gate)
+## Absolute arm medians — REQUIRED per row, never a gate (`bd-4sull` item 3)
 
-`gate_input=false` for every value in this table. They are here so the ratios can be
-sanity-checked against absolute time, not to support any claim.
+**Not a gate and not a claim** — `gate_input=false` for every value here. But **required
+to be recorded**, which is a different thing from being optional: a row that banks only its
+ratio cannot be diagnosed later, because a ratio is a quotient and cannot say which arm
+moved. That is not hypothetical. The 2026-07-31 bulk-durable-write row transcribed only its
+ratio; when it disagreed with the 2026-08-05 row by 32%, answering "was that us or the
+incumbent?" required an entire re-run (`bd-2i2ez`) that a recorded kernel-arm median would
+have made arithmetic. The report it would have come from has since been deleted
+(`bd-v0igv`), so that number is gone permanently.
+
+The harness already emits both, on the `mounted_kernel_throughput` line as
+`kernel_median_wall_ns` and `fuse_median_wall_ns`. The gap was never measurement — it was
+transcription. **Every future row must carry both**; `scripts/perf_ledger_preflight.py
+--lint` refuses a new mounted-comparator ledger row that omits them.
 
 | Workload | Kernel median batch | FrankenFS median batch |
 | --- | --- | --- |
@@ -204,6 +250,16 @@ sanity-checked against absolute time, not to support any claim.
 | Multi-file parallel read, 256 × 256 KiB | 3.11 ms | 4.01 ms |
 | Fsync/journal commit, 8 × 4 KiB | 145.49 ms | 145.08 ms |
 | Parallel metadata writes, 512 creates | 29.30 ms | 42.31 ms |
+| Warm stat, 2,000 calls | 4.42 ms | 21.30 ms |
+| Xattr get/list report, 2,000 five-call reports | ⛔ **not recorded** | ⛔ **not recorded** |
+| Bulk durable write, 64 × 1 MiB + fsync | 77.31 ms | 225.31 ms |
+
+**The xattr row is the one that got away.** It was banked with its ratio only, and its
+report was deleted with the rest of the comparator scratch (`bd-v0igv`) before this
+requirement existed. Nothing in the tree or in surviving logs carries either arm's absolute
+median for it, so the row cannot be diagnosed the way bulk durable write was — its `5.749816x`
+is un-decomposable into "our cost" and "the incumbent's cost" until it is re-run. **1 of 8
+rows is unrecoverable; the other 7 are complete.**
 
 ## Replication
 

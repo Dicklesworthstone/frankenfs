@@ -54,6 +54,33 @@ exact four-arm parity, clean post-unmount `btrfs check --readonly`, incumbent is
 `pass`, wall-time bootstrap median CI as the gate (`cv_used=false`,
 `instructions_used=false`), effect clearing twice the widest null log-margin.
 
+## Absolute arm medians — REQUIRED per row, never a gate (`bd-4sull` item 3)
+
+**Not a gate and not a claim** (`gate_input=false`), but **required to be recorded**. A row
+that banks only its ratio cannot be diagnosed later: a ratio is a quotient and cannot say
+which arm moved. The ext4 bank has already paid for this — the incumbent arm of one shape
+drifted `+18.3%` across three gate-clear windows while our arm held to `1.4%`, which was
+only decomposable because both absolutes were on record. The harness emits both on the
+`mounted_kernel_throughput` line (`kernel_median_wall_ns`, `fuse_median_wall_ns`); the gap
+was transcription, never measurement.
+
+| Workload | Kernel median batch | FrankenFS median batch |
+| --- | --- | --- |
+| Large-directory readdir+stat, 32,768 entries | 26.157 ms | 217.782 ms |
+| Fsync/journal commit, 8 × 4 KiB | 101.5 ms | 200.5 ms |
+| Warm stat, 2,000 calls | ⛔ **not recorded** | ⛔ **not recorded** |
+| Small-file create/delete storm, 2,000 files | ⛔ **not recorded** | ⛔ **not recorded** |
+| Parallel metadata writes, 512 creates | ⛔ **not recorded** | ⛔ **not recorded** |
+| Multi-file parallel read, 256 × 256 KiB | ⛔ **not recorded** | ⛔ **not recorded** |
+
+**4 of 6 rows are unrecoverable.** Their reports were deleted with the comparator scratch
+(`bd-v0igv`) before this requirement existed, and no surviving log carries either arm's
+median for them. The cost lands hardest on **parallel read**, the campaign's only
+`honest_win` against a real kernel incumbent: it is exactly the row where "did we get
+faster, or did the incumbent get slower in that window?" is the question a reader will ask,
+and it is exactly the row that cannot answer it. Re-running it is tracked with the win's
+existing mechanism requirement.
+
 ## One sentence per row
 
 - **readdir+stat: we lose badly.** The kernel enumerates and stats 32,768 entries in
@@ -303,9 +330,15 @@ row shows no number, because a fixed defect is not a result.
   still a full one-second per-CPU average with SMT sibling guards and driver/FUSE busy
   limits, and the preflight refused several windows outright rather than timing through
   them.
-- Reports retained at
-  `/data/tmp/frankenfs-mounted-btrfs/run_*/mounted-kernel-report.json`; run images were
-  deleted after each run, which is why the whole artifact tree is ~150 MB.
+- ⛔ **Reports NO LONGER retained.** This bullet used to point at
+  `/data/tmp/frankenfs-mounted-btrfs/run_*/mounted-kernel-report.json`. That tree is **gone**
+  (verified 2026-08-08: the path does not exist, and a `/data/tmp`-wide search finds exactly
+  one surviving `mounted-kernel-report.json` in the repo, belonging to an unrelated
+  `bd-2i2ez` ext4 window). Run images were deleted after each run as stated, but the reports
+  went with them. This is why four of the six rows above cannot have their absolute arm
+  medians recovered, and it is the concrete damage behind `bd-v0igv` — the scratch cleanup
+  must preserve reports, and until it demonstrably does, anything a scorecard needs has to be
+  transcribed into the scorecard itself rather than referenced by path.
 
 ## Comparison with ext4, same candidate, same instrument
 
