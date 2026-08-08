@@ -947,6 +947,12 @@ pub fn truncate_indirect_blocks(
 
 /// Delete an inode: truncate all extents, free the inode, zero the on-disk data.
 #[expect(clippy::too_many_arguments)]
+/// Delete `ino`: release its storage, then free the inode itself.
+///
+/// Equivalent to [`release_inode_storage`] followed by
+/// [`ffs_alloc::free_inode_persist`], and that split is deliberate — see
+/// `release_inode_storage` for why a caller might want the two halves separately
+/// (bd-y2t0r).
 pub fn delete_inode(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -958,6 +964,42 @@ pub fn delete_inode(
     now_secs: u64,
     pctx: &ffs_alloc::PersistCtx,
 ) -> Result<()> {
+    let is_dir =
+        release_inode_storage(cx, dev, geo, groups, ino, inode, csum_seed, now_secs, pctx)?;
+    ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, is_dir, pctx)
+}
+
+/// Release everything an inode owns — data blocks, indirect metadata, any
+/// external xattr block — and write the zeroed inode back, WITHOUT freeing the
+/// inode number itself. Returns whether the inode was a directory, which the
+/// caller needs to pass to whichever inode-free primitive it uses.
+///
+/// Split out of [`delete_inode`] for bd-y2t0r. When the bd-bhh0i sharded
+/// allocator is active, inode allocation goes through the per-group sharded
+/// records while `free_inode_persist` credits the single-lock `GroupStats` array,
+/// and the descriptor flush reads only the sharded snapshot — so the free is
+/// written to a structure nothing reads, leaking one inode per delete
+/// (bd-pbyu0). The sharded caller therefore needs the storage release and the
+/// inode free as separate steps so it can route the latter through
+/// `PerGroupAlloc::free_inode`.
+///
+/// Note the asymmetry, which is measured rather than assumed: BLOCK frees stay
+/// here on the single-lock path deliberately. File data blocks are allocated and
+/// freed through the same structure, so they never diverge — a storm freeing
+/// ~4800 real data blocks leaves block counts exact while inode counts drift one
+/// per delete. Only the inode free has two writers, so only it needs routing.
+#[allow(clippy::too_many_arguments)]
+pub fn release_inode_storage(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    ino: InodeNumber,
+    inode: &mut Ext4Inode,
+    csum_seed: u32,
+    now_secs: u64,
+    pctx: &ffs_alloc::PersistCtx,
+) -> Result<bool> {
     cx_checkpoint(cx)?;
 
     // Capture the directory bit before the inode fields are zeroed below: ext4
@@ -1034,10 +1076,9 @@ pub fn delete_inode(
     // Write the zeroed-out inode to disk.
     write_inode(cx, dev, geo, groups, ino, inode, csum_seed)?;
 
-    // Free the inode in the bitmap.
-    ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, is_dir, pctx)?;
-
-    Ok(())
+    // The inode number itself is NOT freed here — that is the caller's step, so a
+    // sharded caller can route it through the per-group records (bd-y2t0r).
+    Ok(is_dir)
 }
 
 // ── Timestamps ──────────────────────────────────────────────────────────────
@@ -1311,7 +1352,8 @@ mod tests {
         assert_eq!(buf, expected);
 
         // And the serialized slot parses back to the same inode (core fields).
-        let parsed = Ext4Inode::parse_from_bytes(&buf[..inode_size]).expect("parse serialized inode");
+        let parsed =
+            Ext4Inode::parse_from_bytes(&buf[..inode_size]).expect("parse serialized inode");
         assert_eq!(parsed.mode, inode.mode);
         assert_eq!(parsed.size, inode.size);
         assert_eq!(parsed.links_count, inode.links_count);

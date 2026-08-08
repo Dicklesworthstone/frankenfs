@@ -22148,23 +22148,59 @@ impl OpenFs {
             }
 
             {
+                // bd-y2t0r / bd-pbyu0: when the sharded per-group allocator is
+                // active, inode ALLOCATION debits the sharded records and the
+                // descriptor flush reads `sharded.snapshot_group_stats()`. A free
+                // that credits the single-lock `groups` array is therefore written
+                // to a structure nothing reads, leaking exactly one inode per
+                // delete until the group descriptors read zero free and allocation
+                // returns ENOSPC on an empty filesystem.
+                //
+                // So split the delete: release the inode's storage against the
+                // single-lock array (block frees are measured safe there — data
+                // blocks are allocated and freed through the same structure and
+                // never diverge), then free the inode NUMBER through whichever
+                // structure allocated it.
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                let sharded_inode_free = self.bhh0i_sharded_ops_active();
+                #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                let sharded_inode_free = false;
+
                 let Ext4AllocState {
                     geo,
                     groups,
                     persist_ctx,
                 } = &mut *alloc;
                 if child_upd.links_count == 0 {
-                    ffs_inode::delete_inode(
-                        cx,
-                        tx_dev,
-                        geo,
-                        groups,
-                        child_ino,
-                        &mut child_upd,
-                        csum_seed,
-                        tstamp_secs,
-                        persist_ctx,
-                    )?;
+                    if sharded_inode_free {
+                        let is_dir = ffs_inode::release_inode_storage(
+                            cx,
+                            tx_dev,
+                            geo,
+                            groups,
+                            child_ino,
+                            &mut child_upd,
+                            csum_seed,
+                            tstamp_secs,
+                            persist_ctx,
+                        )?;
+                        #[cfg(feature = "bhh0i_sharded_alloc")]
+                        self.ext4_sharded_free_inode(cx, tx_dev, child_ino, is_dir)?;
+                        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                        let _ = is_dir;
+                    } else {
+                        ffs_inode::delete_inode(
+                            cx,
+                            tx_dev,
+                            geo,
+                            groups,
+                            child_ino,
+                            &mut child_upd,
+                            csum_seed,
+                            tstamp_secs,
+                            persist_ctx,
+                        )?;
+                    }
                 } else {
                     ffs_inode::write_inode(
                         cx, tx_dev, geo, groups, child_ino, &child_upd, csum_seed,
