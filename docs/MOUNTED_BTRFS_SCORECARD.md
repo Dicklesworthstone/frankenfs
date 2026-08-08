@@ -164,14 +164,39 @@ nulls is moving between windows." That something is now the entire result.
    decomposed into "we were fast" versus "the incumbent was slow." This is the exact cost
    this file warned about when it marked this row's absolutes ⛔ not recorded — and it landed
    on the one row where it hurts most.
-3. **The btrfs extent layout under the two fixture constructions is UNVERIFIED.**
-   `scripts/cmp_extent_layout_probe.sh` proved the ext4 layouts identical, but `debugfs` is
-   ext4-only and btrfs is COW with its own allocator. A layout difference between the
-   `-r`-seeded image and through-the-mount creation would be an independent confound on a
-   read benchmark.
+3. ✅ **The btrfs extent layout HAS now been probed** (`scripts/cmp_btrfs_layout_probe.sh`)
+   and the answer splits in two. Fragmentation is identical — exactly one extent per file
+   under both constructions — but the **physical ordering is not**. Seeded-through-the-mount
+   lays the files out in perfect ascending name order; the `-r` seed scrambles them:
+
+   | file | `-r` seed | through mount |
+   | --- | --- | --- |
+   | read-000000 | 3584 | 3328 |
+   | read-000001 | 3328 | 3392 |
+   | read-000002 | 3456 | 3456 |
+   | read-000003 | 3712 | 3520 |
+
+   The workload sorts by name before reading, so the seeded fixture walks the disk forwards
+   while the baked one jumps around — materially different jobs once readahead is involved.
+   Mechanism, verified not guessed: the `-r` seeder copies in **host readdir order**, and the
+   host directory is ext4 with an htree, so it inherits that filesystem's **hash order** as
+   its physical layout. (`mke2fs -d` does not do this — ext4 comes out in name order under
+   both constructions, which is why the ext4 probe did not predict this.)
+
+   **So layout is ELIMINATED as an explanation for the run-1-vs-run-2 disagreement** — both
+   used the seeded construction and byte-identical images. But it is **CONFIRMED as a
+   disqualifying confound between the banked wins and the new numbers**: the banked
+   `0.894290x` / `0.830537x` were measured against a scrambled fixture and the new figures
+   against a sequential one. Those are not the same benchmark, and the move from "win" to
+   "unresolved" cannot be read as a change in FrankenFS.
+
+   The seeded construction is the correct one — a real btrfs filesystem populated by writing
+   files has them in write order, not in another filesystem's hash order — so this row needs
+   re-baselining from scratch rather than comparison with its predecessor.
 
 **What would settle it:** the same pair in a genuinely quiet window with no co-tenant load,
-at higher pair counts, plus a btrfs layout probe. Until then this row scores nothing.
+and if the spread survives that, higher pair counts or an admission that this row is not
+decidable by this instrument. Until then this row scores nothing.
 
 The specific worry is that per-block data checksumming is btrfs's headline feature.
 
