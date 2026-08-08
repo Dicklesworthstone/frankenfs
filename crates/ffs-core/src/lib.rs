@@ -6081,6 +6081,9 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?
             .csum_seed();
         let mut alloc = self.load_ext4_alloc_state(cx)?;
+        // bd-age6i: snapshot before `delete_inode` frees the inode + its blocks in
+        // this TRANSIENT state, so the deltas can be folded into the live one.
+        let counts_before = Self::ext4_snapshot_group_counts(&alloc);
         let block_dev = self.direct_block_device_adapter();
         let (now_secs, _) = Self::now_timestamp();
         inode.links_count = 0;
@@ -6103,6 +6106,10 @@ impl OpenFs {
         if ffs_alloc::gdt_persistence_deferred() {
             self.ext4_persist_group_descriptors_from(cx, &alloc)?;
         }
+        // …and credit the LIVE alloc state with the same free, else the next
+        // durability boundary flushes the pre-delete counts back over it
+        // (bd-age6i).
+        self.ext4_merge_recovery_alloc_into_live(&counts_before, &alloc);
         // The recovery writes bypassed the read-only caches; drop them so later
         // reads observe the freed inode + bitmaps (mirrors orphan recovery).
         self.extent_cache.invalidate_all();
@@ -6556,6 +6563,10 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?
             .csum_seed();
         let mut alloc = self.load_ext4_alloc_state(cx)?;
+        // bd-age6i: the punch below frees blocks in this TRANSIENT state; snapshot
+        // the pre-punch counts so the deltas can be folded back into the live
+        // alloc state (see ext4_merge_recovery_alloc_into_live).
+        let counts_before = Self::ext4_snapshot_group_counts(&alloc);
         let block_dev = self.direct_block_device_adapter();
 
         let mut any_freed = false;
@@ -6649,6 +6660,11 @@ impl OpenFs {
             if ffs_alloc::gdt_persistence_deferred() {
                 self.ext4_persist_group_descriptors_from(cx, &alloc)?;
             }
+            // …and credit the LIVE alloc state with the same free, or the next
+            // durability boundary rewrites the pre-punch counts over what was just
+            // persisted and e2fsck sees a group/superblock free count short by
+            // exactly the punched blocks (bd-age6i).
+            self.ext4_merge_recovery_alloc_into_live(&counts_before, &alloc);
             // The recovery writes bypassed the read-only caches (group_desc /
             // inode_table / file_data); drop them so later reads see the freed
             // bitmaps and rewritten inodes, mirroring orphan recovery.
@@ -18574,6 +18590,87 @@ impl OpenFs {
         }
         let alloc = alloc_mutex.read();
         self.ext4_persist_group_descriptors_from(cx, &alloc)
+    }
+
+    /// Per-group free-count snapshot of a TRANSIENT recovery allocation state,
+    /// taken before the recovery pass mutates it (see
+    /// [`Self::ext4_merge_recovery_alloc_into_live`]).
+    fn ext4_snapshot_group_counts(alloc: &Ext4AllocState) -> Vec<(u32, u32, u32)> {
+        alloc
+            .groups
+            .iter()
+            .map(|g| (g.free_blocks, g.free_inodes, g.used_dirs))
+            .collect()
+    }
+
+    /// Fold a transient recovery allocation state's free-count changes back into
+    /// the LIVE (writes-enabled) `ext4_alloc_state` (bd-age6i).
+    ///
+    /// The fast-commit recovery paths (DEL_RANGE punch+free, zero-link inode
+    /// free) run against a state freshly loaded from the on-disk descriptors and
+    /// then persist those descriptors themselves. That is enough for the image on
+    /// device — but under GDT-persistence deferral (the default) the LIVE alloc
+    /// state is the authoritative source for every LATER durability boundary:
+    /// `ext4_flush_group_descriptors` rewrites all descriptors from it and
+    /// `ext4_sync_superblock_free_totals` recomputes `s_free_blocks_count` /
+    /// `s_free_inodes_count` as its sum. The live state never saw the recovery
+    /// free, so the next flush writes the stale PRE-free counts back over the
+    /// freshly persisted ones while the bitmaps keep the blocks free — e2fsck
+    /// then reports "Free blocks count wrong for group #N (X, counted=X+freed)"
+    /// plus the matching superblock total.
+    ///
+    /// Apply the per-group deltas the recovery pass produced. Deltas (not a
+    /// wholesale copy) so any live-only state stays intact, and a no-op when
+    /// writes are not enabled — then the transient state is the only one and the
+    /// descriptors it persisted stand.
+    ///
+    /// (Scope: the single-lock `groups` array. With the default-off
+    /// `bhh0i_sharded_alloc` path ACTIVE the durability boundary sources its
+    /// counts from the sharded per-group records instead, so a recovery free
+    /// would need the same credit there; fast-commit recovery does not run under
+    /// an active sharded create path today.)
+    fn ext4_merge_recovery_alloc_into_live(
+        &self,
+        before: &[(u32, u32, u32)],
+        after: &Ext4AllocState,
+    ) {
+        let Some(live_lock) = self.ext4_alloc_state.as_ref() else {
+            return; // read-only / no writable state to keep in sync
+        };
+        let mut live = live_lock.write();
+        for (idx, &(prev_free_blocks, prev_free_inodes, prev_used_dirs)) in
+            before.iter().enumerate()
+        {
+            let Some(now) = after.groups.get(idx) else {
+                continue;
+            };
+            let d_blocks = i64::from(now.free_blocks) - i64::from(prev_free_blocks);
+            let d_inodes = i64::from(now.free_inodes) - i64::from(prev_free_inodes);
+            let d_dirs = i64::from(now.used_dirs) - i64::from(prev_used_dirs);
+            if d_blocks == 0 && d_inodes == 0 && d_dirs == 0 {
+                continue;
+            }
+            let Some(live_group) = live.groups.get_mut(idx) else {
+                continue;
+            };
+            live_group.free_blocks =
+                Self::apply_group_count_delta(live_group.free_blocks, d_blocks);
+            live_group.free_inodes =
+                Self::apply_group_count_delta(live_group.free_inodes, d_inodes);
+            live_group.used_dirs = Self::apply_group_count_delta(live_group.used_dirs, d_dirs);
+            if d_blocks != 0 {
+                // Freeing only grows the group's largest contiguous free run, so
+                // drop the memoized hint rather than trying to recompute it here
+                // (mirrors `free_blocks_in_group`).
+                live_group.invalidate_block_largest_free_run();
+            }
+        }
+    }
+
+    /// Saturating `u32 + i64` for a group free/used counter.
+    fn apply_group_count_delta(current: u32, delta: i64) -> u32 {
+        let next = i64::from(current).saturating_add(delta);
+        u32::try_from(next.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX)
     }
 
     /// Write every group descriptor straight to the byte device from the given
