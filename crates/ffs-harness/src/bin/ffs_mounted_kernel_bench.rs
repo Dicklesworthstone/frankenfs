@@ -1718,15 +1718,23 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
             }
         }
         Workload::ParallelRead8 | Workload::ParallelRead8ColdCache => {
+            // EMPTY on purpose (bd-c5210), for exactly the reason `large-directory`
+            // below is. Baking the 256 files in here means `mke2fs -d` writes them
+            // into linear directory blocks and never builds the htree — measured:
+            // the same 256 `read-%06d.bin` entries come back "Not a hash-indexed
+            // directory" when baked and "Hash Version: 1" when created through a
+            // mount, at 8192 bytes, i.e. two blocks and past the threshold where a
+            // real ext4 indexes. btrfs has no analogue, so the two arms were again
+            // built by mechanisms with different indexing outcomes. This matters
+            // inside the timed region: `parallel_read_batch` starts its clock, then
+            // does one `File::open` per file — 256 path lookups measured.
+            //
+            // Caller-owned for the same reason as `large-directory`: a fresh mkfs
+            // root is uid 0 and `mke2fs -d` preserves the host tree's ownership, so
+            // creating it here as the caller is what lets the seeding step write
+            // into it without running as root.
             let parent = root.join("parallel-read");
             fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
-            for index in 0..config.operations {
-                write_fixture_file(
-                    &parent.join(format!("read-{index:06}.bin")),
-                    PARALLEL_READ_FILE_BYTES,
-                    index,
-                )?;
-            }
         }
         Workload::CreateDeleteStorm => {
             let path = root.join("create-delete-storm");
@@ -1926,17 +1934,60 @@ fn htree_dump_reports_indexed(output: &str) -> bool {
     output.lines().any(|line| line.contains("Hash Version"))
 }
 
-/// Fail closed unless `/large-directory` on an ext4 image is genuinely
-/// hash-indexed (bd-plkzd).
+/// The block size `create_base_image` formats ext4 with. An ext4 directory only
+/// converts to an htree once it outgrows a single block, so this is also the
+/// threshold below which "not indexed" is the CORRECT state, not a defect.
+const EXT4_FIXTURE_BLOCK_BYTES: u64 = 4096;
+
+/// Directory byte size from `debugfs stat`, used to decide whether an htree is
+/// expected at all.
+fn debugfs_directory_size(image: &Path, dir: &str) -> Result<u64> {
+    let output = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("stat /{dir}"))
+        .arg(image)
+        .output()
+        .with_context(|| format!("run debugfs stat /{dir} on {}", image.display()))?;
+    let combined = String::from_utf8_lossy(&output.stdout);
+    combined
+        .split_whitespace()
+        .skip_while(|token| !token.starts_with("Size:"))
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("debugfs stat /{dir} reported no parsable Size:\n{combined}"))
+}
+
+/// Fail closed unless an ext4 fixture directory that is BIG ENOUGH TO BE INDEXED
+/// genuinely is (bd-plkzd, generalized for bd-c5210).
 ///
 /// `dir_index` in the superblock feature set only says the filesystem MAY have
 /// htrees; it says nothing about whether this directory got one. Asserting the
 /// directory itself is the whole point: the fixture defect this guards against
 /// was invisible for exactly as long as nobody looked past the feature flag.
-fn ensure_ext4_large_directory_is_htree_indexed(image: &Path) -> Result<()> {
+///
+/// The size precondition is not a loophole, it is the control's correctness. ext4
+/// converts a directory to an htree only once it outgrows one block, so a small
+/// directory is legitimately unindexed and a real ext4 would leave it that way —
+/// measured: a 3-entry directory comes back "Not a hash-indexed directory" whether
+/// it was baked by `mke2fs -d` or created through a mount, while a 256-entry one
+/// (8192 bytes, two blocks) differs between them. Asserting unconditionally would
+/// fail a legitimately small `--operations` run; asserting only above one block
+/// makes the check track the actual ext4 rule.
+fn ensure_ext4_directory_is_htree_indexed(image: &Path, dir: &str) -> Result<()> {
+    let size = debugfs_directory_size(image, dir)?;
+    if size <= EXT4_FIXTURE_BLOCK_BYTES {
+        // Fits in one block: ext4 would not index it either. Say so out loud, so a
+        // silently-skipped control is never mistaken for a passing one.
+        eprintln!(
+            "note: ext4 /{dir} is {size} bytes (<= one {EXT4_FIXTURE_BLOCK_BYTES}-byte block), \
+             so no htree is expected and none is required; the index control does not apply \
+             at this --operations count"
+        );
+        return Ok(());
+    }
     let output = Command::new("debugfs")
         .arg("-R")
-        .arg("htree_dump /large-directory")
+        .arg(format!("htree_dump /{dir}"))
         .arg(image)
         .output()
         .with_context(|| format!("run debugfs htree_dump on {}", image.display()))?;
@@ -1944,15 +1995,64 @@ fn ensure_ext4_large_directory_is_htree_indexed(image: &Path) -> Result<()> {
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     ensure!(
         htree_dump_reports_indexed(&combined),
-        "ext4 /large-directory is NOT hash-indexed, so every lookup is an O(N) scan and \
-         this row would describe a directory shape no real ext4 filesystem has (bd-plkzd). \
-         debugfs said:\n{combined}"
+        "ext4 /{dir} is {size} bytes — past the one-block threshold, so a real ext4 would \
+         have built an htree — but it is NOT hash-indexed, so every lookup is an O(N) scan \
+         and this row would describe a directory shape no real ext4 filesystem has \
+         (bd-plkzd / bd-c5210). debugfs said:\n{combined}"
     );
     Ok(())
 }
 
-/// Create the large-directory entries THROUGH a kernel mount of the base image,
-/// so each filesystem builds its own native directory index (bd-plkzd).
+/// A fixture directory whose entries must be created THROUGH a mount rather than
+/// baked in with `mke2fs -d`, because `mke2fs -d` writes linear directory blocks
+/// and never builds ext4's htree (bd-plkzd for readdir+stat, bd-c5210 for
+/// parallel read).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeededFixture {
+    /// `large-directory`: `operations` empty entries (bd-plkzd).
+    LargeDirectory,
+    /// `parallel-read`: `operations` files of `PARALLEL_READ_FILE_BYTES` carrying
+    /// the SAME deterministic per-index payload `write_fixture_file` baked in
+    /// before (bd-c5210). The bytes are load-bearing, not incidental —
+    /// `parallel_read_batch` folds them into a content digest that four-arm parity
+    /// compares, so any change here shows up as a parity failure, not a silent
+    /// drift.
+    ParallelRead,
+}
+
+impl SeededFixture {
+    const fn for_workload(workload: Workload) -> Option<Self> {
+        match workload {
+            Workload::ReaddirStat8 => Some(Self::LargeDirectory),
+            Workload::ParallelRead8 | Workload::ParallelRead8ColdCache => Some(Self::ParallelRead),
+            _ => None,
+        }
+    }
+
+    const fn dir_name(self) -> &'static str {
+        match self {
+            Self::LargeDirectory => "large-directory",
+            Self::ParallelRead => "parallel-read",
+        }
+    }
+
+    fn create_entry(self, parent: &Path, index: usize) -> Result<()> {
+        match self {
+            Self::LargeDirectory => File::create(parent.join(format!("entry-{index:08}")))
+                .map(drop)
+                .with_context(|| format!("create large-directory entry {index} through the mount")),
+            Self::ParallelRead => write_fixture_file(
+                &parent.join(format!("read-{index:06}.bin")),
+                PARALLEL_READ_FILE_BYTES,
+                index,
+            )
+            .with_context(|| format!("create parallel-read file {index} through the mount")),
+        }
+    }
+}
+
+/// Create a fixture directory's entries THROUGH a kernel mount of the base image,
+/// so each filesystem builds its own native directory index (bd-plkzd, bd-c5210).
 ///
 /// Seeding through the KERNEL rather than through FrankenFS is deliberate: the
 /// incumbent is the reference implementation of the on-disk layout, and it keeps
@@ -1960,9 +2060,10 @@ fn ensure_ext4_large_directory_is_htree_indexed(image: &Path) -> Result<()> {
 /// write defect could shape the very fixture the FrankenFS read arm is then
 /// measured on. Runs on the base image BEFORE it is cloned to the arms, so all
 /// four arms still measure a byte-identical filesystem.
-fn seed_readdir_fixture_through_mount(
+fn seed_fixture_through_mount(
     kind: FilesystemKind,
     image: &Path,
+    fixture: SeededFixture,
     operations: usize,
     interrupted: &AtomicBool,
 ) -> Result<()> {
@@ -1982,28 +2083,28 @@ fn seed_readdir_fixture_through_mount(
             .args(["-n", "mount", "-t", kind.label(), "-o", options])
             .arg(image)
             .arg(&mount_dir),
-        &format!("mount {} to seed readdir fixture", kind.label()),
+        &format!(
+            "mount {} to seed the {} fixture",
+            kind.label(),
+            fixture.dir_name()
+        ),
     )?;
     wait_for_mount(&mount_dir, None, interrupted)?;
 
-    let parent = mount_dir.join("large-directory");
-    let seed_result = (0..operations).try_for_each(|index| {
-        File::create(parent.join(format!("entry-{index:08}")))
-            .map(drop)
-            .with_context(|| format!("create large-directory entry {index} through the mount"))
-    });
+    let parent = mount_dir.join(fixture.dir_name());
+    let seed_result = (0..operations).try_for_each(|index| fixture.create_entry(&parent, index));
 
     // Unmount before reporting a seeding failure, or the loop device leaks and
     // every later arm inherits a broken scratch dir.
     let synced = seed_result.and_then(|()| {
         run_checked(
             &mut Command::new("sync"),
-            "sync after seeding readdir fixture",
+            "sync after seeding the fixture directory",
         )
     });
     let unmounted = run_checked(
         Command::new("sudo").args(["-n", "umount"]).arg(&mount_dir),
-        "unmount readdir fixture seed mount",
+        "unmount fixture seed mount",
     );
     synced?;
     unmounted?;
@@ -4945,16 +5046,17 @@ fn fs_report(
     let arms = measured_arms(compares_candidates);
     let candidate_arms = fuse_arms(compares_candidates);
     let base = create_base_image(kind, fixture_root, &fs_dir, config)?;
-    // bd-plkzd: the large directory is seeded THROUGH a kernel mount of the base
-    // image, before cloning, so each filesystem builds its own native directory
-    // index and all four arms still clone from one byte-identical image. Baking
-    // the entries in with `mke2fs -d` left ext4 with a linear, unindexed
-    // directory while btrfs got a normal one, so the two arms were not the same
-    // filesystem shape. The ext4 index is then ASSERTED, not assumed.
-    if config.workload == Workload::ReaddirStat8 {
-        seed_readdir_fixture_through_mount(kind, &base, config.operations, interrupted)?;
+    // bd-plkzd / bd-c5210: fixture directories large enough to be indexed are
+    // seeded THROUGH a kernel mount of the base image, before cloning, so each
+    // filesystem builds its own native directory index and all four arms still
+    // clone from one byte-identical image. Baking the entries in with `mke2fs -d`
+    // left ext4 with a linear, unindexed directory while btrfs got a normal one,
+    // so the two arms were not the same filesystem shape. The ext4 index is then
+    // ASSERTED, not assumed.
+    if let Some(fixture) = SeededFixture::for_workload(config.workload) {
+        seed_fixture_through_mount(kind, &base, fixture, config.operations, interrupted)?;
         if kind == FilesystemKind::Ext4 {
-            ensure_ext4_large_directory_is_htree_indexed(&base)?;
+            ensure_ext4_directory_is_htree_indexed(&base, fixture.dir_name())?;
         }
         validate_image(kind, &base)?;
     }
@@ -7859,6 +7961,113 @@ mod tests {
         // "debugfs said nothing" as success is not a control at all.
         assert!(!htree_dump_reports_indexed(""));
         assert!(!htree_dump_reports_indexed("debugfs: command not found\n"));
+    }
+
+    /// bd-c5210: every workload whose fixture directory `mke2fs -d` would bake in
+    /// must be seeded through the mount instead, and no other workload may be.
+    /// The list is the whole finding — it came from measuring each fixture shape
+    /// (scripts/cmp_fixture_audit.sh), not from reading the code.
+    #[test]
+    fn only_the_indexable_fixture_directories_are_seeded_through_the_mount_bd_c5210() {
+        assert_eq!(
+            SeededFixture::for_workload(Workload::ReaddirStat8),
+            Some(SeededFixture::LargeDirectory)
+        );
+        // Both parallel-read variants share one fixture, so both must be covered;
+        // the cold-cache arm is the one where an unindexed lookup becomes real I/O.
+        assert_eq!(
+            SeededFixture::for_workload(Workload::ParallelRead8),
+            Some(SeededFixture::ParallelRead)
+        );
+        assert_eq!(
+            SeededFixture::for_workload(Workload::ParallelRead8ColdCache),
+            Some(SeededFixture::ParallelRead)
+        );
+
+        // The rest are clean for a reason, not by luck: parallel-metadata-write and
+        // create-delete-storm bake EMPTY directories and create through the mount at
+        // measure time; warm-stat adds no directory; fsync and bulk-durable are one
+        // file each at the fixture root; xattr is three files at the root, measured
+        // unindexed on BOTH construction paths (the audit's negative control).
+        for workload in [
+            Workload::WarmStat,
+            Workload::ParallelMetadataWrite,
+            Workload::CreateDeleteStorm,
+            Workload::FsyncJournalCommit,
+            Workload::BulkDurableWrite,
+            Workload::XattrGetListReport,
+        ] {
+            assert_eq!(
+                SeededFixture::for_workload(workload),
+                None,
+                "{workload:?} has no directory that mke2fs -d could leave unindexed; \
+                 seeding it through a mount would add a mount for nothing"
+            );
+        }
+
+        assert_eq!(SeededFixture::LargeDirectory.dir_name(), "large-directory");
+        assert_eq!(SeededFixture::ParallelRead.dir_name(), "parallel-read");
+    }
+
+    /// bd-c5210: moving the parallel-read files from `mke2fs -d` to the mount must
+    /// not change a single byte of their contents. `parallel_read_batch` folds them
+    /// into a digest that four-arm parity compares, so a payload drift here would
+    /// surface as a parity failure rather than as anything legible.
+    #[test]
+    fn seeding_parallel_read_through_the_mount_writes_the_same_bytes_as_before_bd_c5210() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let seeded = temp.path().join("seeded");
+        let baked = temp.path().join("baked");
+        fs::create_dir(&seeded).expect("seeded dir");
+        fs::create_dir(&baked).expect("baked dir");
+
+        for index in [0_usize, 1, 7, 255] {
+            SeededFixture::ParallelRead
+                .create_entry(&seeded, index)
+                .expect("seed one parallel-read file through the fixture factory");
+            // The pre-bd-c5210 call, verbatim from the old create_fixture_tree arm.
+            write_fixture_file(
+                &baked.join(format!("read-{index:06}.bin")),
+                PARALLEL_READ_FILE_BYTES,
+                index,
+            )
+            .expect("bake one parallel-read file the old way");
+
+            let name = format!("read-{index:06}.bin");
+            let from_seed = fs::read(seeded.join(&name)).expect("read seeded file");
+            let from_bake = fs::read(baked.join(&name)).expect("read baked file");
+            assert_eq!(
+                from_seed.len(),
+                PARALLEL_READ_FILE_BYTES,
+                "the seeded file must keep its size"
+            );
+            assert_eq!(
+                from_seed, from_bake,
+                "seeded and baked payloads must be byte-identical for file {index}"
+            );
+        }
+
+        // And the names must still be what the workload's readdir + sort expects.
+        let mut names: Vec<String> = fs::read_dir(&seeded)
+            .expect("list seeded dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "read-000000.bin".to_owned(),
+                "read-000001.bin".to_owned(),
+                "read-000007.bin".to_owned(),
+                "read-000255.bin".to_owned(),
+            ]
+        );
     }
 
     #[test]
