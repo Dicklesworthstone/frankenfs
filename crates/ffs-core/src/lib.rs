@@ -7948,7 +7948,7 @@ impl OpenFs {
         let root_items = self.walk_btrfs_root_tree(cx)?;
         let mut root_tree = InMemoryCowBtrfsTree::new(max_items)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
-            .with_leaf_byte_budget((nodesize as usize).saturating_sub(101));
+            .with_node_byte_budget((nodesize as usize).saturating_sub(101));
         for item in &root_items {
             let tree_item = BtrfsTreeItem {
                 key: BtrfsKey {
@@ -7973,7 +7973,7 @@ impl OpenFs {
         let items = self.walk_btrfs_fs_tree(cx)?;
         let mut fs_tree = InMemoryCowBtrfsTree::new(max_items)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
-            .with_leaf_byte_budget((nodesize as usize).saturating_sub(101));
+            .with_node_byte_budget((nodesize as usize).saturating_sub(101));
 
         // Find the highest objectid in use so we can mint new ones.
         let mut max_objectid = BTRFS_FIRST_FREE_OBJECTID;
@@ -8162,7 +8162,7 @@ impl OpenFs {
             // EXTENT_CSUM items are variable-size (many block checksums per item),
             // so — like fs_tree/root_tree — this tree needs the byte budget or a leaf
             // overflows `nodesize` on serialization at commit (bd-6uyto/bd-cc-btrfs-syncpersist).
-            .with_leaf_byte_budget((nodesize as usize).saturating_sub(101));
+            .with_node_byte_budget((nodesize as usize).saturating_sub(101));
         if let Some(csum_root_entry) = root_items.iter().find(|item| {
             item.key.objectid == BTRFS_CSUM_TREE_OBJECTID
                 && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
@@ -29006,7 +29006,7 @@ impl OpenFs {
                 // and leaving the free-space tree not-VALID as designed.
                 let mut fst_tree = InMemoryCowBtrfsTree::new(fst_max_items)
                     .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                    .with_leaf_byte_budget((nodesize as usize).saturating_sub(101));
+                    .with_node_byte_budget((nodesize as usize).saturating_sub(101));
                 for (key, value) in &items {
                     fst_tree
                         .insert(*key, value)
@@ -30019,7 +30019,7 @@ impl OpenFs {
         let max_items = ((alloc.nodesize as usize).saturating_sub(101) / 25).max(3);
         let mut subvol_tree = InMemoryCowBtrfsTree::new(max_items)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
-            .with_leaf_byte_budget((alloc.nodesize as usize).saturating_sub(101));
+            .with_node_byte_budget((alloc.nodesize as usize).saturating_sub(101));
         let root_dir = BtrfsInodeItem {
             generation: alloc.generation,
             size: 0,
@@ -30158,7 +30158,7 @@ impl OpenFs {
         let max_items = ((alloc.nodesize as usize).saturating_sub(101) / 25).max(3);
         let mut snap_tree = InMemoryCowBtrfsTree::new(max_items)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
-            .with_leaf_byte_budget((alloc.nodesize as usize).saturating_sub(101));
+            .with_node_byte_budget((alloc.nodesize as usize).saturating_sub(101));
         for (key, data) in &source_items {
             snap_tree
                 .insert(*key, data)

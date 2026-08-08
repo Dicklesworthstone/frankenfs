@@ -3417,6 +3417,18 @@ pub struct InMemoryCowBtrfsTree {
     /// `nodesize` on serialization (bd-6uyto). Defaults to `usize::MAX` (count
     /// cap only) for callers that don't set a nodesize-derived budget.
     leaf_byte_budget: usize,
+    /// Maximum key-pointers (== children) an INTERNAL node may hold.
+    ///
+    /// An internal node serializes as `BTRFS_HEADER_SIZE` plus one fixed
+    /// 33-byte `BTRFS_KEY_PTR_SIZE` entry per child, so its capacity is
+    /// `(nodesize - header) / 33` — NOT `max_items`, which is the *leaf* slot
+    /// count `(nodesize - header) / 25`. Splitting internal nodes on the leaf
+    /// count let a 16 KiB fs tree grow 652-child internal nodes needing 21,617
+    /// bytes, which writeback could not serialize: the whole transaction failed
+    /// mid-commit and the image was left unmountable (bd-giw9n). Defaults to
+    /// `max_items + 1`, which is exactly the pre-existing count-only bound, so
+    /// trees without a nodesize-derived budget are unchanged.
+    max_children: usize,
     root: u64,
     allocator: Box<dyn BtrfsAllocator>,
     deferred_frees: Vec<u64>,
@@ -3456,6 +3468,10 @@ impl InMemoryCowBtrfsTree {
             max_items,
             min_items: max_items / 2,
             leaf_byte_budget: usize::MAX,
+            // `keys.len() <= max_items` is the historical internal-node bound and
+            // `children.len() == keys.len() + 1`, so `max_items + 1` reproduces it
+            // byte-for-byte until a node byte budget is configured.
+            max_children: max_items.saturating_add(1),
             root,
             allocator,
             deferred_frees: Vec::new(),
@@ -3466,13 +3482,36 @@ impl InMemoryCowBtrfsTree {
         })
     }
 
-    /// Set the per-leaf serialized-byte budget (`nodesize - BTRFS_HEADER_SIZE`)
-    /// so leaves split before they overflow an on-disk node (bd-6uyto). Builder
-    /// style; the tree must be empty (call right after construction).
+    /// Set the per-node serialized-byte budget (`nodesize - BTRFS_HEADER_SIZE`)
+    /// so no node can outgrow an on-disk block.
+    ///
+    /// The one budget bounds both node kinds, because both are the same physical
+    /// block with the same header — they only differ in what an entry costs:
+    /// - a LEAF splits once its items exceed `budget` bytes (`BTRFS_ITEM_SIZE +
+    ///   data.len()` each), since real items vary in size (bd-6uyto);
+    /// - an INTERNAL node splits once it exceeds `budget / BTRFS_KEY_PTR_SIZE`
+    ///   children, since each key-pointer is a fixed 33 bytes (bd-giw9n).
+    ///
+    /// Builder style; the tree must be empty (call right after construction).
     #[must_use]
-    pub fn with_leaf_byte_budget(mut self, budget: usize) -> Self {
+    pub fn with_node_byte_budget(mut self, budget: usize) -> Self {
         self.leaf_byte_budget = budget.max(1);
+        // Floor of 3: a 2-child cap would split a 3-child node into a left with
+        // 2 children and a right with 1 child and 0 keys, which is degenerate.
+        // Three keeps every post-split internal node at >= 2 children.
+        self.max_children = (budget / BTRFS_KEY_PTR_SIZE).max(3);
         self
+    }
+
+    /// Fewest separator keys a NON-ROOT internal node may hold.
+    ///
+    /// The dual of `min_items` for key-pointers: a node capped at
+    /// `max_children` children holds `max_children - 1` keys when full, so half
+    /// full is `(max_children - 1) / 2`. With the default `max_children =
+    /// max_items + 1` this is exactly `max_items / 2 == min_items`, so
+    /// count-only trees keep their existing invariant.
+    fn min_internal_keys(&self) -> usize {
+        self.max_children.saturating_sub(1) / 2
     }
 
     /// Smallest key in the subtree rooted at `block` — the first key of its
@@ -4621,7 +4660,11 @@ impl InMemoryCowBtrfsTree {
             children.insert(idx + 1, right_child);
         }
 
-        if keys.len() <= self.max_items {
+        // Bound by CHILDREN, not by `max_items`: an internal node's on-disk cost
+        // is one fixed 33-byte key-pointer per child, so the leaf slot count is
+        // the wrong budget and let internal nodes grow past what a node can hold
+        // (bd-giw9n).
+        if children.len() <= self.max_children {
             let new_id = self.alloc_node(BtrfsCowNode::Internal { keys, children })?;
             return Ok(InsertResult {
                 node_id: new_id,
@@ -4877,14 +4920,19 @@ impl InMemoryCowBtrfsTree {
             return Ok(false);
         }
 
+        // The underflow floor is per node KIND: leaves use `min_items`, internal
+        // nodes the key-pointer analogue. Using the leaf floor for an internal
+        // node makes a freshly split internal node (~`max_children / 2` children)
+        // look underfull the moment it is created (bd-giw9n).
+        let min_keys = self.node_min_keys(children[child_idx])?;
         let child_keys = self.node_key_count(children[child_idx])?;
-        if child_keys >= self.min_items || self.node_is_byte_full(children[child_idx])? {
+        if child_keys >= min_keys || self.node_is_byte_full(children[child_idx])? {
             return Ok(false);
         }
 
         if child_idx > 0 {
             let left_keys = self.node_key_count(children[child_idx - 1])?;
-            if left_keys > self.min_items {
+            if left_keys > min_keys {
                 let old_left = children[child_idx - 1];
                 let old_child = children[child_idx];
                 let (new_left, new_child) =
@@ -4913,7 +4961,7 @@ impl InMemoryCowBtrfsTree {
 
         if child_idx + 1 < children.len() {
             let right_keys = self.node_key_count(children[child_idx + 1])?;
-            if right_keys > self.min_items {
+            if right_keys > min_keys {
                 let old_child = children[child_idx];
                 let old_right = children[child_idx + 1];
                 let (new_child, new_right) =
@@ -4947,7 +4995,7 @@ impl InMemoryCowBtrfsTree {
             }
         }
 
-        if child_idx > 0 && self.merged_leaf_fits(children[child_idx - 1], children[child_idx])? {
+        if child_idx > 0 && self.merged_node_fits(children[child_idx - 1], children[child_idx])? {
             let old_left = children[child_idx - 1];
             let old_child = children[child_idx];
             let merged = self.merge_adjacent_nodes(children[child_idx - 1], children[child_idx])?;
@@ -4960,17 +5008,32 @@ impl InMemoryCowBtrfsTree {
             self.retire_node(old_child);
             debug!(merged_child = child_idx - 1, "btrfs_cow_delete_merge_left");
         } else if child_idx + 1 < children.len()
-            && self.merged_leaf_fits(children[child_idx], children[child_idx + 1])?
+            && self.merged_node_fits(children[child_idx], children[child_idx + 1])?
         {
             let old_child = children[child_idx];
             let old_right = children[child_idx + 1];
             let merged = self.merge_adjacent_nodes(children[child_idx], children[child_idx + 1])?;
             children[child_idx] = merged;
             children.remove(child_idx + 1);
-            // child_idx == 0: the merged node is the new first child (no separator
-            // to its left in this node — its minimum propagates up via the parent),
-            // so only the separator between the merged pair is removed.
+            // The separator between the merged pair is gone.
             keys.remove(child_idx);
+            // Unlike the merge-LEFT case, the merged node inherits the minimum of
+            // the child we just deleted FROM, so that minimum may have shifted and
+            // `keys[child_idx - 1]` can be stale. Refresh it. (child_idx == 0 has
+            // no separator to its left; its minimum propagates up via the parent.)
+            //
+            // Reachable only when merge-left was declined, which is why it stayed
+            // latent: without a byte budget merge-left always wins for
+            // `child_idx > 0`. bd-cjqhh opened the decline path for leaves and
+            // bd-giw9n opened it for internal nodes, where it surfaced as
+            // "internal separator mismatch" on a mass delete.
+            if child_idx > 0 {
+                keys[child_idx - 1] = self.first_key(children[child_idx])?.ok_or(
+                    BtrfsMutationError::BrokenInvariant(
+                        "internal separator child must contain a key",
+                    ),
+                )?;
+            }
             self.retire_node(old_child);
             self.retire_node(old_right);
             debug!(merged_child = child_idx, "btrfs_cow_delete_merge_right");
@@ -4990,12 +5053,25 @@ impl InMemoryCowBtrfsTree {
         Ok(true)
     }
 
-    /// Whether merging two adjacent leaves would still fit the byte budget.
+    /// Fewest keys the node at `node_id` may hold when it is not the root.
     ///
-    /// Always true without a budget (the pure item-count model is unchanged) and
-    /// for internal nodes, whose key-pointers are fixed-size and already bounded
-    /// by `max_items`.
-    fn merged_leaf_fits(&self, left_id: u64, right_id: u64) -> Result<bool, BtrfsMutationError> {
+    /// Leaves are bounded by items (`min_items`), internal nodes by key-pointers
+    /// (`min_internal_keys`). The two coincide for a count-only tree.
+    fn node_min_keys(&self, node_id: u64) -> Result<usize, BtrfsMutationError> {
+        match self.node_ref(node_id)? {
+            BtrfsCowNode::Leaf { .. } => Ok(self.min_items),
+            BtrfsCowNode::Internal { .. } => Ok(self.min_internal_keys()),
+        }
+    }
+
+    /// Whether merging two adjacent nodes would still fit one on-disk node.
+    ///
+    /// Always true without a budget (the pure item-count model is unchanged).
+    /// Leaves are measured in serialized bytes; internal nodes in children,
+    /// since a merge that exceeded `max_children` would rebuild exactly the
+    /// unserializable node the split bound exists to prevent (bd-giw9n) — the
+    /// delete-side twin of the leaf merge overflow fixed in bd-cjqhh.
+    fn merged_node_fits(&self, left_id: u64, right_id: u64) -> Result<bool, BtrfsMutationError> {
         if self.leaf_byte_budget == usize::MAX {
             return Ok(true);
         }
@@ -5005,6 +5081,16 @@ impl InMemoryCowBtrfsTree {
                     .saturating_add(Self::leaf_serialized_bytes(right));
                 Ok(combined <= self.leaf_byte_budget)
             }
+            (
+                BtrfsCowNode::Internal {
+                    children: left_children,
+                    ..
+                },
+                BtrfsCowNode::Internal {
+                    children: right_children,
+                    ..
+                },
+            ) => Ok(left_children.len().saturating_add(right_children.len()) <= self.max_children),
             _ => Ok(true),
         }
     }
@@ -5264,9 +5350,20 @@ impl InMemoryCowBtrfsTree {
                         "internal node child count mismatch",
                     ));
                 }
-                if !is_root && keys.len() < self.min_items {
+                if !is_root && keys.len() < self.min_internal_keys() {
                     return Err(BtrfsMutationError::BrokenInvariant(
                         "non-root internal underflow",
+                    ));
+                }
+                // The in-memory dual of the writeback serializer's capacity
+                // check. Catching an over-wide internal node here fails the
+                // transaction while it is still purely in memory, instead of
+                // mid-commit once nodes are already on disk (bd-giw9n). The
+                // serializer still reports the precise arithmetic and the owning
+                // tree; this one only has to hold the line.
+                if children.len() > self.max_children {
+                    return Err(BtrfsMutationError::BrokenInvariant(
+                        "internal node exceeds key-pointer capacity",
                     ));
                 }
                 for window in keys.windows(2) {
@@ -11939,7 +12036,7 @@ mod tests {
 
         let mut finite_budget = InMemoryCowBtrfsTree::new(3)
             .expect("finite budget tree")
-            .with_leaf_byte_budget(BTRFS_ITEM_SIZE + 1);
+            .with_node_byte_budget(BTRFS_ITEM_SIZE + 1);
         finite_budget
             .insert(test_key(1), b"a")
             .expect("finite insert 1");
@@ -12013,7 +12110,7 @@ mod tests {
         let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
         let mut tree = InMemoryCowBtrfsTree::new(64)
             .expect("tree")
-            .with_leaf_byte_budget(budget);
+            .with_node_byte_budget(budget);
 
         for i in 0..8_u64 {
             tree.insert(test_key(i), b"seed").expect("seed insert");
@@ -12051,7 +12148,7 @@ mod tests {
         let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
         let mut tree = InMemoryCowBtrfsTree::new(64)
             .expect("tree")
-            .with_leaf_byte_budget(budget);
+            .with_node_byte_budget(budget);
 
         // Two rounds so the second one mutates a leaf the tree itself staged.
         for i in 0..6_u64 {
@@ -12083,7 +12180,7 @@ mod tests {
         let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
         let mut tree = InMemoryCowBtrfsTree::new(64)
             .expect("tree")
-            .with_leaf_byte_budget(budget);
+            .with_node_byte_budget(budget);
 
         // 40 x (25 + 800) = 33,000 bytes over a 16,283-byte budget: the tree
         // splits into byte-full leaves that each hold ~20 items, permanently
@@ -12115,6 +12212,133 @@ mod tests {
         }
     }
 
+    /// bd-giw9n: an INTERNAL node must split on its key-pointer capacity, not on
+    /// the leaf slot count.
+    ///
+    /// A leaf slot is `BTRFS_ITEM_SIZE` (25) and a key-pointer is
+    /// `BTRFS_KEY_PTR_SIZE` (33), so a node fits 32% fewer children than items.
+    /// Splitting internal nodes on `max_items` therefore let a 16 KiB fs tree
+    /// build 652-child internal nodes; writeback could not serialize them, the
+    /// unmount commit failed after nodes were already on disk, and the image
+    /// would not mount again — every file in it lost, not just the new ones.
+    #[test]
+    fn internal_nodes_split_on_key_pointer_capacity_bd_giw9n() {
+        const NODESIZE: u32 = 4096;
+        let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
+        let max_children = budget / BTRFS_KEY_PTR_SIZE; // 121
+        let max_items = budget / BTRFS_ITEM_SIZE; // 159 — the WRONG bound
+        assert!(
+            max_children < max_items,
+            "the whole defect is that the two bounds differ"
+        );
+
+        let mut tree = InMemoryCowBtrfsTree::new(max_items)
+            .expect("tree")
+            .with_node_byte_budget(budget);
+
+        // 1 KiB items => ~3 per leaf, so 400 items span ~134 leaves. That is
+        // above the 121-child capacity but below the 160 children the leaf-slot
+        // bound allowed, which is exactly the window the defect lived in.
+        let item = vec![0xC3_u8; 1000];
+        for i in 0..400_u64 {
+            tree.insert(test_key(i), &item).expect("insert");
+            tree.validate_invariants()
+                .expect("invariants during growth");
+        }
+
+        // The direct statement of the invariant: no node may exceed capacity.
+        let dag = crate::writeback::WriteDependencyDag::from_cow_tree(&tree, 9).expect("dag");
+        let mut internal_nodes = 0_usize;
+        for (block, _level) in dag.blocks_with_levels() {
+            if let BtrfsCowNode::Internal { children, .. } =
+                tree.node_snapshot(block).expect("node snapshot")
+            {
+                internal_nodes += 1;
+                assert!(
+                    children.len() <= max_children,
+                    "internal node {block} has {} children, over the {max_children} \
+                     a {NODESIZE}-byte node can hold",
+                    children.len()
+                );
+            }
+        }
+        assert!(
+            internal_nodes >= 2,
+            "the tree must actually have split past one internal node \
+             (got {internal_nodes})"
+        );
+
+        // And the end-to-end consequence: every node serializes.
+        assert_every_node_serializes(&tree, NODESIZE);
+
+        // Splitting on the tighter bound must not lose or reorder anything.
+        for i in 0..400_u64 {
+            assert_eq!(
+                tree.find(&test_key(i)).expect("find"),
+                Some(item.clone()),
+                "key {i} must survive the internal splits"
+            );
+        }
+    }
+
+    /// bd-giw9n, the delete side: rebalancing must not merge two internal nodes
+    /// back into one that exceeds the key-pointer capacity — the exact twin of
+    /// the leaf merge overflow fixed in bd-cjqhh.
+    #[test]
+    fn delete_does_not_merge_internal_nodes_past_capacity_bd_giw9n() {
+        const NODESIZE: u32 = 4096;
+        let budget = NODESIZE as usize - BTRFS_HEADER_SIZE;
+        let mut tree = InMemoryCowBtrfsTree::new(budget / BTRFS_ITEM_SIZE)
+            .expect("tree")
+            .with_node_byte_budget(budget);
+
+        let item = vec![0x5D_u8; 1000];
+        for i in 0..500_u64 {
+            tree.insert(test_key(i), &item).expect("insert");
+        }
+        assert!(tree.root_level() >= 2, "need a tree with internal siblings");
+
+        // Deleting most of the items drives repeated rebalancing, which is where
+        // an unguarded merge would rebuild an over-wide internal node.
+        for i in (0..500_u64).step_by(2) {
+            tree.delete(&test_key(i)).expect("delete");
+            tree.validate_invariants()
+                .expect("invariants during deletes");
+        }
+        assert_every_node_serializes(&tree, NODESIZE);
+
+        for i in 0..500_u64 {
+            let found = tree.find(&test_key(i)).expect("find");
+            if i % 2 == 0 {
+                assert!(found.is_none(), "deleted key {i} must be gone");
+            } else {
+                assert_eq!(found, Some(item.clone()), "key {i} must survive");
+            }
+        }
+    }
+
+    /// Provenance probe for the separator failure the bd-giw9n delete test hit:
+    /// an UNBUDGETED tree, where every bd-giw9n bound is provably identical to
+    /// the pre-fix one (`max_children == max_items + 1`, `min_internal_keys() ==
+    /// min_items`), must survive the same mass-delete pattern.
+    #[test]
+    fn mass_delete_keeps_separators_consistent_in_a_deep_tree_bd_giw9n() {
+        let mut tree = InMemoryCowBtrfsTree::new(4).expect("tree");
+        for i in 0..200_u64 {
+            tree.insert(test_key(i), b"v").expect("insert");
+        }
+        assert!(tree.root_level() >= 2, "need a deep tree");
+        for i in (0..200_u64).step_by(2) {
+            tree.delete(&test_key(i)).expect("delete");
+            tree.validate_invariants()
+                .unwrap_or_else(|e| panic!("invariants after deleting {i}: {e}"));
+        }
+        for i in 0..200_u64 {
+            let found = tree.find(&test_key(i)).expect("find");
+            assert_eq!(found.is_none(), i % 2 == 0, "key {i} survival");
+        }
+    }
+
     /// Without a byte budget the pure item-count rebalance is unchanged — the
     /// fix must not stop ordinary trees from merging.
     #[test]
@@ -12142,7 +12366,7 @@ mod tests {
         const NODESIZE: u32 = 16_384;
         let mut tree = InMemoryCowBtrfsTree::new(64)
             .expect("tree")
-            .with_leaf_byte_budget(NODESIZE as usize - BTRFS_HEADER_SIZE);
+            .with_node_byte_budget(NODESIZE as usize - BTRFS_HEADER_SIZE);
 
         for i in 0..4_u64 {
             tree.insert(test_key(i), &vec![0x5A_u8; 3000])
