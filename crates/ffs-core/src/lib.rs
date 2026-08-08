@@ -1761,6 +1761,28 @@ const EXT4_BASE_BLOCK_CACHE_LIMIT: usize = 1024;
 /// 8 MiB; the hot upper-tree nodes (root + internal) are read first on every
 /// descent, so even a modest cap captures the bulk of the repeated-read win.
 const BTRFS_TREE_NODE_CACHE_LIMIT: usize = 512;
+
+/// Diagnostic counters for the read-only btrfs tree-node cache (bd-5vis3).
+///
+/// bd-3zx2x measured un-prewarmed btrfs stat at 3.69 us/entry against 0.24 with
+/// the read-plan index, and the proposed explanation — that the residual is
+/// per-inode DESCENT machinery over already-cached nodes rather than device I/O
+/// — was inferred from reading the code, not profiled. `perf` is unavailable
+/// here (`perf_event_paranoid=4`), so these count the thing the inference
+/// actually claims: node lookups per stat, and how many are cache hits. A sweep
+/// costing ~3 lookups per entry at a high hit rate confirms the descent reading;
+/// a low hit rate would mean cache thrashing instead, which is a different fix.
+static BTRFS_NODE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static BTRFS_NODE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the [`BTRFS_NODE_LOOKUPS`] / [`BTRFS_NODE_CACHE_HITS`] pair.
+#[must_use]
+pub fn btrfs_node_cache_counters() -> (u64, u64) {
+    (
+        BTRFS_NODE_LOOKUPS.load(std::sync::atomic::Ordering::Relaxed),
+        BTRFS_NODE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 const BTRFS_DIR_ENTRY_CACHE_LIMIT: usize = 4096;
 
 /// Max entries in the read-only decompressed compressed-extent cache
@@ -8699,7 +8721,11 @@ impl OpenFs {
         logical: u64,
     ) -> Result<Arc<BtrfsParsedNode>, ParseError> {
         let cacheable = self.btrfs_alloc_state.is_none();
+        if cacheable {
+            BTRFS_NODE_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if cacheable && let Some(node) = self.btrfs_parsed_node_cache.get(&logical) {
+            BTRFS_NODE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Hit: skip device read + checksum verification + structural parse.
             // `get` clones the Arc out under the shard lock, which is then
             // released — no guard is held across the return.

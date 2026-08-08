@@ -4571,6 +4571,20 @@ fn walk_cmd(path: &PathBuf, no_stat: bool, parallel: bool, read_data: bool) -> R
         "walked {dirs} dirs + {files} files ({total} entries, {stats} stats, {bytes} bytes / \
          {mb:.1} MiB @ {mb_s:.0} MiB/s) [{mode}] in {elapsed:?} ({per_entry_us:.2} us/entry)"
     );
+    // bd-5vis3: node lookups per stat, and their hit rate. `perf` is unavailable
+    // on this host, so this is how the "the residual is descent machinery over
+    // already-cached nodes, not device I/O" reading gets tested rather than
+    // asserted. ~3 lookups/entry at a high hit rate confirms it; a low hit rate
+    // would mean the 512-node cache is thrashing, which is a different fix.
+    let (node_lookups, node_hits) = ffs_core::btrfs_node_cache_counters();
+    if node_lookups > 0 {
+        let per_stat = node_lookups as f64 / stats.max(1) as f64;
+        let hit_rate = node_hits as f64 / node_lookups as f64 * 100.0;
+        eprintln!(
+            "btrfs node cache: {node_lookups} lookups ({per_stat:.2}/stat), \
+             {node_hits} hits ({hit_rate:.1}%)"
+        );
+    }
     Ok(())
 }
 
