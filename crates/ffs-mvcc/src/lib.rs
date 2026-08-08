@@ -55,6 +55,42 @@ pub fn proof_downgrade_count() -> u64 {
     PROOF_DOWNGRADES.load(Ordering::Relaxed)
 }
 
+/// Most recent merge refusal: `(proof variant, base_len, latest_len,
+/// staged_len)` (bd-y2t0r).
+///
+/// Same reason the downgrade counter exists rather than a log line: the workload
+/// that produces these runs worker threads inside a parallel test suite, where a
+/// thread-scoped subscriber misses them and a global one cannot be installed.
+/// The lengths are the diagnostic — an empty or short `base` means ancestor
+/// resolution failed, while three full-length buffers under a range proof means
+/// the declared ranges overlapped in byte terms.
+static LAST_MERGE_REFUSAL: Mutex<Option<(&'static str, usize, usize, usize)>> = Mutex::new(None);
+static MERGE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_merge_refusal(
+    proof: &MergeProof,
+    base_len: usize,
+    latest_len: usize,
+    staged_len: usize,
+) {
+    saturating_increment_atomic(&MERGE_REFUSALS, Ordering::Relaxed);
+    *LAST_MERGE_REFUSAL.lock() = Some((
+        merge_proof_variant_name(proof),
+        base_len,
+        latest_len,
+        staged_len,
+    ));
+}
+
+/// Refusal count and the most recent refusal's shape.
+#[must_use]
+pub fn merge_refusal_report() -> (u64, Option<(&'static str, usize, usize, usize)>) {
+    (
+        MERGE_REFUSALS.load(Ordering::Relaxed),
+        *LAST_MERGE_REFUSAL.lock(),
+    )
+}
+
 fn saturating_increment_atomic(counter: &AtomicU64, ordering: Ordering) -> u64 {
     loop {
         if let Ok(previous) = counter.fetch_update(ordering, Ordering::Relaxed, |current| {

@@ -54880,7 +54880,7 @@ mod tests {
     /// complete on partial evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: FLAKY — 6 of 7 full-suite runs pass; residual is NOT the proof-downgrade class (measured 0)"]
+    #[ignore = "bd-y2t0r: FLAKY; refusal captured as IndependentKeys 4096/4096/4096 — a range conflict, not a lost ancestor"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }
@@ -54975,19 +54975,29 @@ mod tests {
         // panic propagates out of `thread::scope`, so any read placed after it is
         // skipped on exactly the runs whose number is wanted. Drop still runs
         // during unwind, so the count reaches the log on the failing path too.
-        struct DowngradeReport(u64);
+        struct DowngradeReport(u64, u64);
         impl Drop for DowngradeReport {
             fn drop(&mut self) {
                 let delta = ffs_mvcc::proof_downgrade_count().saturating_sub(self.0);
+                let (refusals, last) = ffs_mvcc::merge_refusal_report();
                 println!(
                     "bd-y2t0r: merge-proof downgrades during this workload: {delta} \
-                     (non-zero => some writer plain-write_blocks a proof-scoped block; \
-                     the counter is process-wide, so a parallel suite may attribute \
-                     a few from other tests)"
+                     (non-zero => some writer plain-write_blocks a proof-scoped block); \
+                     merge refusals: {} (last: {last:?})",
+                    refusals.saturating_sub(self.1)
                 );
+                // The refusal shape is the discriminator. base_len == 0 or short
+                // means ancestor resolution failed; three full-length buffers
+                // under a range proof means the declared ranges overlapped in
+                // BYTE terms even though the inode slots were distinct. Both
+                // counters are process-wide, so a parallel suite may attribute a
+                // few from other tests.
             }
         }
-        let _downgrade_report = DowngradeReport(ffs_mvcc::proof_downgrade_count());
+        let _downgrade_report = DowngradeReport(
+            ffs_mvcc::proof_downgrade_count(),
+            ffs_mvcc::merge_refusal_report().0,
+        );
 
         let fs = std::sync::Arc::new(fs);
         std::thread::scope(|scope| {

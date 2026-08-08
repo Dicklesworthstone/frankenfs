@@ -943,6 +943,18 @@ impl ShardedMvccStore {
         if proof.merge_valid(&base, &latest, staged) {
             Ok(())
         } else {
+            // bd-y2t0r: capture WHY a merge was refused, not just that it was.
+            // The surviving conflict on that bead is a refusal despite both
+            // writers declaring disjoint inode slots, and the two live
+            // explanations need different fixes: an empty or short `base` means
+            // ancestor resolution failed (the prune class), whereas full-length
+            // buffers with a range proof means the ranges themselves were not
+            // disjoint in BYTE terms. The lengths distinguish those immediately
+            // and are otherwise invisible — the validators log their reason
+            // through `tracing`, which nothing captures under a parallel test
+            // suite (measured: a `RUST_LOG` run on that gate observed nothing
+            // because no subscriber is installed).
+            crate::record_merge_refusal(&proof, base.len(), latest.len(), staged.len());
             Err(CommitError::Conflict {
                 block,
                 snapshot: txn.snapshot().high,
