@@ -49,6 +49,16 @@
 > CPUs immediately before the run, so it is blind to page-cache state, writeback backlog,
 > thermal and boost history, and everything else that carries across invocation boundaries.
 >
+> ⭐ **2026-08-08: this was demonstrated flipping a verdict, not merely shifting a ratio.**
+> Two btrfs parallel-read runs, same ELF and same fixture, minutes apart, both
+> `verdict=clear`, returned `1.019622x` NEUTRAL and `0.961107x` WIN — non-overlapping
+> intervals, `6.09%` spread. A peer's `pytest` was running on CPUs *outside* the placement
+> set; the placement CPUs were genuinely idle (max busy `0.020`), so the gate was **correct**
+> and still useless, because bandwidth, LLC and boost budget are socket-wide. Re-run in a
+> window whose external load was sampled every 3 s throughout, the row is a stable win 2/2
+> (`0.893282x`, `0.927352x`, spread `3.81%`). Fix tracked as `bd-bt2dy`; sampler in
+> `scripts/sample_external_load.sh`.
+>
 > **The rule, which applies to every banked row in every repo, not just this file:**
 > a row's A/A nulls and twice-null margin bound **within-invocation** error only. Cross-window
 > reproducibility is a *separate, unmeasured* quantity unless a second same-ELF run exists.

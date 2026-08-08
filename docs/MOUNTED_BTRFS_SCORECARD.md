@@ -53,10 +53,11 @@ measurement in one invocation against four independent live mounts (`kernel_a`,
 `kernel_b`, `fuse_a`, `fuse_b`) under a four-round Latin-square physical-arm crossover,
 carrying two same-invocation A/A null controls.
 
-**Score: 0 confirmed wins / 5 losses / 0 neutral / 1 UNRESOLVED.** The campaign's only
-`honest_win` — parallel read — did not reproduce stably on re-measurement (2026-08-08): two
-admitted runs minutes apart returned opposite verdicts with non-overlapping intervals. It is
-neither confirmed nor withdrawn; see its row.
+**Score: 1 win / 5 losses / 0 neutral / 0 unscored.** The campaign's only `honest_win` —
+parallel read — was re-measured on 2026-08-08 and **CONFIRMED** at ≈`0.89–0.93x`, 2/2
+admitted in a verified-quiet window. It briefly scored UNRESOLVED earlier the same day on
+two runs taken under a peer's CPU load, which returned opposite verdicts; those are
+inadmissible and the row's section explains why the gate could not see it.
 
 ## The rows
 
@@ -66,7 +67,7 @@ neither confirmed nor withdrawn; see its row.
 | **Warm stat**, 2,000 calls | **`4.977803x` `[4.949139, 5.014278]` slower**; replicate **`5.036433x` `[5.017720, 5.074796]`** | `0.996700x` / `1.000455x` | `1.002699x` / `1.001758x` | 1 → **1** | **LOSE** |
 | **Small-file create/delete storm**, 2,000 files | **`2.358280x` `[2.322435, 2.430125]` slower** (margin `1.045128x`) | `0.996139x`, spread `1.018112x` | `0.992157x`, spread `1.022315x` | 1 → **1** | **LOSE** |
 | **Parallel metadata writes**, 512 creates, 8 threads, **128 blocks** | **`1.930090x` `[1.916623, 1.940038]` slower** (margin `1.019214x`) | `1.002214x`, spread `1.009562x` | `0.997250x`, spread `1.009114x` | 8 → **8** | **LOSE** |
-| **Multi-file parallel read**, 256 × 256 KiB, 8 threads | ⚠ **UNRESOLVED — the verdict is not stable.** Banked (old fixture): `0.894290x` / `0.830537x` FASTER. Re-measured 2026-08-08 on the corrected fixture, two admitted runs minutes apart: `1.019622x [1.007602, 1.062585]` **NEUTRAL** and `0.961107x [0.958445, 0.971937]` **WIN**. Non-overlapping intervals, opposite verdicts, spread **6.09%**. Neither confirms nor withdraws the win | run 1 `1.004979x`, run 2 clear | run 1 `1.005096x`, run 2 clear | 8 → **8** | **UNRESOLVED** |
+| **Multi-file parallel read**, 256 × 256 KiB, 8 threads | **≈`0.89–0.93x` FASTER — CONFIRMED in a verified-quiet window.** Two admitted runs, `0.893282x [0.891253, 0.896649]` and `0.927352x [0.923351, 0.930643]`, both `HONEST_WIN`, both `directional_claim_clear=true`, spread `3.81%`. **Quote the spread, not either CI.** Run 1 lands `0.11%` from the banked `0.894290x` on a *different* fixture construction. ⚠ Two EARLIER runs the same day under a peer's CPU load returned `1.019622x` NEUTRAL / `0.961107x` WIN — **inadmissible, see below** | quiet run 1 `1.002400x`, run 2 `1.003917x` | quiet run 1 `1.001901x`, run 2 `0.999706x` | 8 → **8** | **WIN** |
 | **Fsync/journal commit**, 8 × 4 KiB | **`1.976308x` `[1.969150, 1.977948]` slower** (margin `1.021437x`) | `0.999326x` | `1.000634x` | 1 → **1** | **LOSE** |
 
 Every admitted row: pinning attested with the observed CPU set equal to the bound set,
@@ -91,7 +92,7 @@ was transcription, never measurement.
 | Warm stat, 2,000 calls | ⛔ **not recorded** | ⛔ **not recorded** |
 | Small-file create/delete storm, 2,000 files | ⛔ **not recorded** | ⛔ **not recorded** |
 | Parallel metadata writes, 512 creates | ⛔ **not recorded** | ⛔ **not recorded** |
-| Multi-file parallel read, 256 × 256 KiB | **3.887 / 3.943 ms** (2026-08-08 runs 1/2); banked run ⛔ **not recorded** | **3.917 / 3.787 ms** (2026-08-08 runs 1/2); banked run ⛔ **not recorded** |
+| Multi-file parallel read, 256 × 256 KiB | **4.742 / 4.143 ms** (quiet runs 1/2); contended runs 3.887/3.943 ⛔ inadmissible; banked run ⛔ **not recorded** | **4.311 / 3.820 ms** (quiet runs 1/2); contended runs 3.917/3.787 ⛔ inadmissible; banked run ⛔ **not recorded** |
 
 **3 of 6 rows have no absolutes at all**, and one more — parallel read — has current
 figures but **not** for its banked run. Those reports were deleted with the comparator
@@ -127,39 +128,54 @@ runs are recorded above precisely so this cannot recur for them.
   2026-08-04; it is the newest row and the only one taken with every CPU on the
   `performance` governor.
 
-## The win did not survive re-measurement — and the statistics ARE the weak part
+## The win is CONFIRMED — and the near-miss is the more useful lesson
 
-⛔ **Updated 2026-08-08. This section previously read "the statistics are not the weak
-part." That is now false, and the old text is withdrawn.**
+⭐ **Resolved 2026-08-08 (`bd-ws9dg`). The win stands, at ≈`0.89–0.93x`.** Two admitted runs
+in a window whose external load was sampled *continuously*, not just at the gate:
 
-Re-measured on the corrected fixture (`bd-c5210`) with a current ELF, two admitted runs
-**minutes apart on one machine, one ELF, one kernel, one governor**:
-
-| Run | Ratio | 95% CI | Margin | Verdict |
+| Window | Run | Ratio | 95% CI | Verdict |
 | --- | --- | --- | --- | --- |
-| 1 | `1.019622x` | [1.007602, 1.062585] | `1.034273x` | `HONEST_NEUTRAL` — slightly slower |
-| 2 | `0.961107x` | [0.958445, 0.971937] | `1.021503x` | `HONEST_WIN` — 3.9% faster |
+| **quiet** | 1 | `0.893282x` | [0.891253, 0.896649] | **`HONEST_WIN`** |
+| **quiet** | 2 | `0.927352x` | [0.923351, 0.930643] | **`HONEST_WIN`** |
+| contended | 1 | `1.019622x` | [1.007602, 1.062585] | `HONEST_NEUTRAL` ⛔ inadmissible |
+| contended | 2 | `0.961107x` | [0.958445, 0.971937] | `HONEST_WIN` ⛔ inadmissible |
 
-**The intervals do not overlap and the verdicts disagree.** Spread `6.09%` — the largest
-same-ELF spread the campaign has measured, larger than the `4.71%` and `9.15%` figures that
-motivated `bd-4sull`, and roughly 6x the CI width either run reports. One run says we win
-this workload; the other says we lose it slightly. Both passed every admission gate.
+In the quiet window the verdict is **stable 2/2** and the spread is `3.81%`. Under a peer's
+CPU load, two runs of the *same ELF and same fixture* straddled the margin and returned
+**opposite verdicts** with non-overlapping intervals, spread `6.09%`.
 
-**So the banked `0.894290x` / `0.830537x` is neither confirmed nor withdrawn.** The row is
-UNRESOLVED. It cannot be quoted as a win, and it must not be quoted as a refutation either.
+**And quiet run 1 lands `0.11%` from the banked `0.894290x`** — measured on a *different*
+fixture construction, months apart. That agreement is why the win is restored rather than
+merely un-withdrawn.
 
-The earlier text saw this coming and did not act on it hard enough: it noted the banked
-pair's own `7.7%` spread against ~2%-wide intervals and said "something not captured by the
-nulls is moving between windows." That something is now the entire result.
+### The near-miss: this file said the win was gone, and it was wrong
 
-**Three caveats before anyone concludes the win is gone.**
+Earlier on 2026-08-08 this section read "the win did not survive re-measurement" and scored
+the row UNRESOLVED, on the strength of the two contended runs. That was premature. The
+contended pair was **inadmissible evidence** and should not have been banked at all — the
+lesson is not that the win was fragile, but that the *instrument* was, in a way its own gate
+could not see.
 
-1. **Both new runs ran under a peer's `pytest` load** (254% CPU, started 06:54:19). The
-   *placement* CPUs stayed quiet — max busy `0.020`, mean `0.006` across CPUs 0-7/32-39 — so
-   the arms had idle cores. But the load sat elsewhere on the same socket (CPUs 16, 19, 48,
-   51 and 54 all above 20%), and memory bandwidth, LLC and boost budget are shared. That is
-   precisely the interference a start-of-run preflight is blind to, and it is a live
-   candidate for the `6.09%` spread.
+**Why the gate cleared anyway, which is the transferable part.** The peer's `pytest` (254%
+CPU) never touched the placement CPUs: max busy `0.020`, mean `0.006` across 0-7/32-39. The
+preflight legitimately reported `verdict=clear`, because by its own definition the window
+*was* clear. The load sat elsewhere on the same socket (CPUs 16, 19, 48, 51, 54 above 20%),
+and memory bandwidth, LLC capacity and boost budget are socket-wide. **A start-of-run,
+placement-CPU-only gate cannot certify a measurement window.** `bd-4sull` argued this from
+drift; this row demonstrates it flipping a verdict.
+
+**The ratio is robust where the absolutes are not** — the crossover design earning its keep.
+Between the two quiet runs the kernel arm moved `−12.6%` (4.742 → 4.143 ms) while the ratio
+moved only `+3.81%`. Common-mode effects cancel in the quotient; what the contention did was
+hit the two arms *asymmetrically*, which no amount of averaging removes. Curiously both
+absolute arms are **slower** in the quiet window than under load, consistent with deeper
+C-state residency on an idle box — untested, and irrelevant to the ratio.
+
+**Two caveats that remain live.**
+
+1. ~~Co-tenant load~~ — **RESOLVED**: this was the cause. Verified by re-running with
+   external CPU sampled every 3 s throughout (median `113.5%` of a `6400%` box, i.e. ~1.8%
+   utilisation, no excursions).
 2. **The banked runs' absolute arm medians were never recorded**, so the old wins cannot be
    decomposed into "we were fast" versus "the incumbent was slow." This is the exact cost
    this file warned about when it marked this row's absolutes ⛔ not recorded — and it landed
@@ -430,15 +446,14 @@ row shows no number, because a fixed defect is not a result.
 | --- | --- | --- |
 | readdir+stat **(both re-measured 2026-08-08, corrected fixture)** | ≈`4.1x` slower (`4.052605x` / `4.163402x`) | **`7.753405x` slower** |
 | create/delete storm | `2.753659x` slower | `2.358280x` slower |
-| parallel read **(both re-measured 2026-08-08)** | ≈`0.98x` NEUTRAL (`0.986316x` / `0.978203x`) | ⚠ UNRESOLVED (`1.019622x` / `0.961107x`, opposite verdicts) |
+| parallel read **(both re-measured 2026-08-08)** | ≈`0.98x` NEUTRAL (`0.986316x` / `0.978203x`) | **≈`0.89–0.93x` FASTER** (`0.893282x` / `0.927352x`, quiet window, 2/2 WIN) |
 | parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
 | fsync/journal commit | `0.997098x` neutral | **`1.976308x` slower** |
 | warm stat | `4.812194x` slower | `4.977803x` / `5.036433x` slower |
 
-The parallel-read row used to be the only sign change anywhere in either scorecard. On
-re-measurement that is no longer a clean statement: the ext4 side is now a tie rather than a
-loss, and the btrfs side returned opposite verdicts on two runs minutes apart. Resolve it in
-a quiet window before quoting anything from this line.
+The parallel-read row remains the only sign change anywhere in either scorecard, and it
+survived re-measurement: btrfs is a confirmed win, while the ext4 side moved from a loss to a
+tie. Both sides were re-measured 2026-08-08 on the corrected fixture and a current ELF.
 
 ⚠️ **Do not confuse the retired `8.322812x` readdir+stat figure with the retired "8.3x"
 folklore.** That folklore was ext4 parallel-metadata-writes derived from separate,
