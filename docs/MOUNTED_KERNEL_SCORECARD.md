@@ -56,8 +56,17 @@
 > set; the placement CPUs were genuinely idle (max busy `0.020`), so the gate was **correct**
 > and still useless, because bandwidth, LLC and boost budget are socket-wide. Re-run in a
 > window whose external load was sampled every 3 s throughout, the row is a stable win 2/2
-> (`0.893282x`, `0.927352x`, spread `3.81%`). Fix tracked as `bd-bt2dy`; sampler in
-> `scripts/sample_external_load.sh`.
+> (`0.893282x`, `0.927352x`, spread `3.81%`).
+>
+> ✅ **FIXED (`bd-bt2dy`, 2026-08-08).** The harness now samples external load for the whole
+> measured region and **fails closed**, and every report carries an `external_load_during_run`
+> block whether clean or not — so a row banked from here on can be disqualified by a later
+> reader without re-running it. Verified both ways on live runs: a quiet box passes
+> (`samples=37, max_external_busy_cpus=2, verdict=clear`), and four off-placement CPUs pinned
+> at 100% are refused (`23/23 samples over limit, verdict=CONTENDED`). In that refused run the
+> **pre-run gate saw the placement CPUs at `0.011` busy and would have declared the window
+> clear** — the exact failure, reproduced deliberately and caught. ⚠ Rows banked BEFORE this
+> carry no such block, and its absence is itself informative.
 >
 > **The rule, which applies to every banked row in every repo, not just this file:**
 > a row's A/A nulls and twice-null margin bound **within-invocation** error only. Cross-window
