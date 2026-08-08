@@ -1,9 +1,11 @@
 # Btrfs scorecard: FrankenFS FUSE against the incumbent, Linux kernel btrfs
 
-> ## ⛔ NO ROW IN THIS FILE DESCRIBES FRANKENFS AT `HEAD`
+> ## ⛔ ONE ROW DESCRIBES FRANKENFS AT `HEAD`. THE OTHER FIVE DO NOT.
 >
-> Every row here predates the current tree — the five 2026-07-31 rows on the frozen
-> `f44b3dc4…` candidate, the warm-stat row on `9e32e28f…` — and none has been re-measured.
+> **readdir+stat was re-measured 2026-08-08** on candidate `913c36a4…` (PGO `b30de364…`,
+> x86-64-v3 attested), twice, both admitted, after `bd-plkzd` corrected its fixture. The
+> other five predate the current tree — four 2026-07-31 rows on the frozen `f44b3dc4…`
+> candidate, the warm-stat row on `9e32e28f…` — and none has been re-measured.
 >
 > This file needs the warning **more** than the ext4 one, because the commits landed since
 > are all in the btrfs write path: `839eb708` (the durable commit built leaves it could not
@@ -13,14 +15,24 @@
 > now reference the shared extent instead of copying it, removing a read and an allocation
 > from every overwrite-split). The last one changes the write path's I/O profile directly.
 >
-> **No figure below may be presented as "FrankenFS today" until re-measured on a current
-> ELF.** Quote them as historical, with their ELF, or not at all.
+> **No figure below EXCEPT readdir+stat may be presented as "FrankenFS today" until
+> re-measured on a current ELF.** Quote the rest as historical, with their ELF, or not at all.
+> The re-measured row uses a freshly trained PGO profile (`b30de364…`, not the bank's
+> `5c6530a0…`, which was destroyed — `bd-v0igv`) and a different kernel, so it supersedes its
+> own predecessor without re-baselining the others.
 >
 > The `bd-4sull` rule in the [ext4 scorecard](MOUNTED_KERNEL_SCORECARD.md) applies here
 > unchanged: `core_contention_preflight … verdict=clear` certifies only that no competing
 > load sat on the placement CPUs when sampling began. It is **not** evidence that a new run
 > is comparable to a banked one — measured, the incumbent arm moved 8.26% between two runs
 > that both printed `verdict=clear`.
+>
+> This file now carries its own instance. The two admitted readdir+stat runs above spread
+> **1.36%**, against run 1's own CI width of **0.40%** — the spread is 3.4x the interval that
+> would have been quoted. And it is a useful counter-example to the campaign's usual pattern:
+> here the **incumbent was flat** (`+0.09%`) and **our** arm carried the movement (`−0.90%`),
+> the reverse of the ext4 pair taken minutes earlier. Cross-run variance is reliably larger
+> than the within-invocation CI; *which arm carries it* is not fixed.
 
 **Date:** 2026-07-31 · **Host:** `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX,
 32C/64T, 231.7 GB RAM, 1 NUMA node · **Kernel:** 6.17.0-35-generic · **Bead:** `bd-opb6l`
@@ -42,7 +54,7 @@ carrying two same-invocation A/A null controls.
 
 | Workload | FrankenFS ÷ kernel btrfs | Kernel A/A | FUSE A/A | Threads req → obs | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| **Large-directory readdir+stat**, 32,768 entries | **`8.322812x` `[8.289845, 8.358508]` slower** (margin `1.011474x`) | `0.999544x`, spread `1.004004x` | `0.999278x`, spread `1.005721x` | 8 → **8** | **LOSE** |
+| **Large-directory readdir+stat**, 32,768 entries | **≈`7.7x` slower** — two admitted same-ELF runs, `7.753405x [7.733049, 7.764217]` and `7.649395x [7.617712, 7.728683]`, margins `1.011133x`/`1.011514x`. **Quote the `1.36%` spread, not either CI.** ⛔ SUPERSEDES `8.322812x`, measured on a fixture whose ext4 twin was unindexed (`bd-plkzd`) | run 1 `0.999027x`, spread `1.005551x` · run 2 clear | run 1 `0.999403x`, spread `1.003652x` · run 2 clear | 8 → **8** | **LOSE** |
 | **Warm stat**, 2,000 calls | **`4.977803x` `[4.949139, 5.014278]` slower**; replicate **`5.036433x` `[5.017720, 5.074796]`** | `0.996700x` / `1.000455x` | `1.002699x` / `1.001758x` | 1 → **1** | **LOSE** |
 | **Small-file create/delete storm**, 2,000 files | **`2.358280x` `[2.322435, 2.430125]` slower** (margin `1.045128x`) | `0.996139x`, spread `1.018112x` | `0.992157x`, spread `1.022315x` | 1 → **1** | **LOSE** |
 | **Parallel metadata writes**, 512 creates, 8 threads, **128 blocks** | **`1.930090x` `[1.916623, 1.940038]` slower** (margin `1.019214x`) | `1.002214x`, spread `1.009562x` | `0.997250x`, spread `1.009114x` | 8 → **8** | **LOSE** |
@@ -66,7 +78,7 @@ was transcription, never measurement.
 
 | Workload | Kernel median batch | FrankenFS median batch |
 | --- | --- | --- |
-| Large-directory readdir+stat, 32,768 entries | 26.157 ms | 217.782 ms |
+| Large-directory readdir+stat, 32,768 entries | **27.772 / 27.796 ms** (runs 1/2, 2026-08-08; was 26.157 ms) | **214.816 / 212.881 ms** (runs 1/2; was 217.782 ms) |
 | Fsync/journal commit, 8 × 4 KiB | 101.5 ms | 200.5 ms |
 | Warm stat, 2,000 calls | ⛔ **not recorded** | ⛔ **not recorded** |
 | Small-file create/delete storm, 2,000 files | ⛔ **not recorded** | ⛔ **not recorded** |
@@ -84,7 +96,11 @@ existing mechanism requirement.
 ## One sentence per row
 
 - **readdir+stat: we lose badly.** The kernel enumerates and stats 32,768 entries in
-  26.157 ms where we take 217.782 ms — our worst measured surface on any filesystem.
+  27.772 ms where we take 214.816 ms — our worst measured surface on any filesystem.
+  Re-measured 2026-08-08 on the corrected fixture (`bd-plkzd`); the superseded row read
+  26.157 ms / 217.782 ms for `8.322812x`. Note which arm moved: ours improved `1.4%` while
+  the incumbent slowed `6.2%`, so most of the `8.32x → 7.75x` change is the kernel's, not
+  ours, and none of it is attributable to the fixture alone (`bd-pb85e`).
 - **Warm stat: we lose.** About five times slower, replicated on two CPUs — and the ext4
   bank now measures the same shape at `4.812194x`, within 3.4%, so this is the shared
   per-request FUSE floor rather than anything about btrfs inode lookup.
@@ -344,7 +360,7 @@ row shows no number, because a fixed defect is not a result.
 
 | Workload | vs kernel ext4 | vs kernel btrfs |
 | --- | --- | --- |
-| readdir+stat | `4.967448x` slower | **`8.322812x` slower** |
+| readdir+stat **(both re-measured 2026-08-08, corrected fixture)** | ≈`4.1x` slower (`4.052605x` / `4.163402x`) | **`7.753405x` slower** |
 | create/delete storm | `2.753659x` slower | `2.358280x` slower |
 | parallel read | `1.287862x` slower | **`0.894290x` / `0.830537x` faster** |
 | parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
@@ -354,8 +370,32 @@ row shows no number, because a fixed defect is not a result.
 The parallel-read row is the only sign change anywhere in either scorecard, which is
 another reason to resolve its mechanism before quoting it.
 
-⚠️ **Do not confuse the `8.322812x` readdir+stat figure with the retired "8.3x"
+⚠️ **Do not confuse the retired `8.322812x` readdir+stat figure with the retired "8.3x"
 folklore.** That folklore was ext4 parallel-metadata-writes derived from separate,
-unmatched runs and is withdrawn. This is btrfs readdir+stat from a matched
-same-invocation four-arm crossover with both nulls gated. The numeric collision is
+unmatched runs and is withdrawn. The `8.322812x` was btrfs readdir+stat from a matched
+same-invocation four-arm crossover with both nulls gated — legitimate on its own terms, and
+now itself superseded by `7.753405x` on the corrected fixture. The numeric collision was
 coincidental.
+
+### The btrfs-specific readdir+stat excess GREW when the fixture was fixed (`bd-3zx2x`)
+
+`bd-3zx2x` exists to attribute the btrfs excess over its ext4 twin. On the corrected
+fixtures, measured on ONE candidate ELF (`913c36a4…`) in one session, that quantity is
+**larger**, not smaller:
+
+| | btrfs | ext4 | ratio-of-ratios |
+| --- | --- | --- | --- |
+| Banked (unindexed ext4 fixture, ELF `f44b3dc4…`) | `8.322812x` | `4.967448x` | **`1.675x`** |
+| Corrected (ELF `913c36a4…`, 2026-08-08) | `7.753405x` / `7.649395x` | `4.052605x` / `4.163402x` | **`1.875x`** (bounds `1.837`–`1.913`) |
+
+**This confirms `bd-plkzd`'s stated direction.** It predicted the unindexed ext4 fixture
+inflated the ext4 ratio and therefore *understated* the btrfs/ext4 ratio-of-ratios, and warned
+that the defect must not be offered as the explanation for `bd-3zx2x`. Both hold: the excess
+`bd-3zx2x` is chasing is **real and about 12% larger** than the banked figure suggested, so
+fixing the fixture removes an excuse rather than the phenomenon.
+
+Both sides of each row are same-ELF, so the ratio-of-ratios is an internally consistent
+comparison in both the old and new rows. It is *not* immune to window drift: all four runs
+were separate invocations minutes apart, the ext4 pair spread `2.73%` and the btrfs pair
+`1.36%`, which is where the `1.837`–`1.913` bounds come from. The excess clears that band
+comfortably; `1.675x` does not fall inside it.

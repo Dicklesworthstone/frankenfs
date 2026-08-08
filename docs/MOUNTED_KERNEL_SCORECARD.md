@@ -53,11 +53,11 @@
 > a row's A/A nulls and twice-null margin bound **within-invocation** error only. Cross-window
 > reproducibility is a *separate, unmeasured* quantity unless a second same-ELF run exists.
 > Where one does, quote the observed spread; where none does, quote the worst spread the
-> campaign has measured. Three same-ELF figures now exist: **4.71%** on one workload,
-> **9.15%** on bulk durable write, and **2.73%** on readdir+stat (2026-08-08, the first row
-> banked *with* its spread rather than having it discovered later). A later measurement that
-> disagrees with a banked row by less than that is **not** a regression, an improvement, or a
-> disagreement — it is unresolved.
+> campaign has measured. Four same-ELF figures now exist: **4.71%** on one workload,
+> **9.15%** on bulk durable write, **2.73%** on ext4 readdir+stat and **1.36%** on btrfs
+> readdir+stat (both 2026-08-08, the first rows banked *with* their spread rather than having
+> it discovered later). A later measurement that disagrees with a banked row by less than that
+> is **not** a regression, an improvement, or a disagreement — it is unresolved.
 >
 > **The readdir+stat pair is the cleanest demonstration of why this rule exists.** Two
 > back-to-back admitted runs of the identical ELF, both `verdict=clear`, measured `4.052605x`
@@ -67,6 +67,12 @@
 > moved **−3.40%** between the two runs while FrankenFS moved **−1.19%**. Since these ran
 > back-to-back they share thermal and cache history, so 2.73% is a **lower bound** on this
 > row's true cross-window spread, not a measurement of it.
+>
+> ⚠ **But do not promote "the variance is the incumbent's" to a law.** The btrfs readdir+stat
+> pair, run minutes later on the same box, spread **1.36%** with the incumbent essentially
+> flat (`+0.09%`) and **our** arm carrying it (`−0.90%`) — the reverse split. What replicates
+> across all four pairs is that the cross-run spread exceeds the within-invocation CI; *which
+> arm carries it* does not.
 >
 > **The incumbent's own drift is larger than either figure.** Across three gate-clear windows
 > on one kernel, the kernel ext4 arm of the bulk-durable-write shape moved 77.31 → 83.69 →
@@ -220,11 +226,16 @@ under the perf umbrella, and it is explicitly NOT claimed here.
   the window all changed too. What the recorded absolutes do narrow: our arm moved `+3.1%`
   against the old row while the *kernel* arm moved `+26.9%`, and the kernel arm does not
   execute our binary, so the ELF and profile change cannot explain any of it. A plausible
-  mechanism — untested, and it would mean this bead's stated direction was backwards — is
-  that an htree makes `readdir` return **hash** order, scattering the subsequent stat pass
-  across the inode table, where a linear directory returns creation order and therefore
-  walks it sequentially. Settling that needs a same-window A/B of the two fixture
-  constructions on one ELF, which is `bd-pb85e`.
+  mechanism, untested: an htree makes `readdir` return **hash** order, scattering the
+  subsequent stat pass across the inode table, where a linear directory returns creation
+  order — which is also inode-allocation order — and therefore walks it sequentially. On that
+  reading the old fixture flattered the *incumbent*, which is what inflated our published
+  loss. **`bd-plkzd`'s predicted direction is confirmed**: it said the defect inflates the
+  ext4 ratio and therefore *understates* the btrfs/ext4 ratio-of-ratios, and on the corrected
+  fixtures that quantity moves `1.675x → 1.887x`. Only its intermediate phrasing ("inflates
+  the ext4 arm") is imprecise — **both** arms were faster on the unindexed fixture; the
+  kernel arm was just disproportionately so, which shrank the denominator. Attribution still
+  needs a same-window A/B of the two fixture constructions on one ELF: `bd-pb85e`.
 - **Small-file create/delete storm: we lose.** Creating and deleting 2,000 files with
   two directory fsyncs takes us about 2.75 times as long as ext4.
 - **Multi-file parallel read: we lose.** Even on warm-cache reads of 256 files across 8
