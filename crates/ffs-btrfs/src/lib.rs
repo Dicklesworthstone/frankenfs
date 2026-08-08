@@ -2499,6 +2499,60 @@ pub fn walk_tree_floor_with_nodes(
     floor_descend(node_provider, root_logical, nodesize, &target, 0)
 }
 
+/// The floor entry for `target` WITHIN one already-parsed leaf: the last item
+/// whose key is `<= target`, or `None` when every key in the leaf exceeds it.
+///
+/// Extracted from `floor_descend`'s leaf arm so a caller holding a leaf can
+/// resolve against it without re-descending (bd-5vis3). Returns `None` for an
+/// internal node rather than erroring — callers pass leaves.
+///
+/// ⚠ CORRECTNESS PRECONDITION FOR REUSE. Answering from a retained leaf is only
+/// equivalent to a full descent when `target` lies within that leaf's own key
+/// span, i.e. `first_key <= target <= last_key`. Leaves partition the ordered key
+/// space, so under that condition every key `<= target` that is `>= first_key`
+/// lives in this leaf and the greatest is the tree-wide floor. OUTSIDE the span
+/// it is NOT equivalent: for `target > last_key` the true floor may be `last_key`
+/// or may sit in a later leaf, and this function cannot tell which. A caller
+/// reusing a leaf MUST check the span first.
+pub fn floor_in_leaf(
+    node: &BtrfsParsedNode,
+    target: &BtrfsKey,
+) -> Result<Option<BtrfsLeafEntry>, ParseError> {
+    let BtrfsParsedNode::Leaf { block, items } = node else {
+        return Ok(None);
+    };
+    let block = block.as_ref();
+    // Leaf items are sorted ascending by key; the floor is the last item
+    // `<= target`. Binary-search to it instead of scanning the whole node
+    // (a 16 KiB leaf packs hundreds of items, and a floor descent visits
+    // one node per tree level on every read_file extent fetch — bd-hv6ww,
+    // the within-node dual of bd-6u6xb). O(items) -> O(log items).
+    let pp = items.partition_point(|item| key_cmp(&item.key, target) != Ordering::Greater);
+    if pp == 0 {
+        return Ok(None);
+    }
+    let item = &items[pp - 1];
+    let off = usize::try_from(item.data_offset).map_err(|_| ParseError::IntegerConversion {
+        field: "data_offset",
+    })?;
+    let sz = usize::try_from(item.data_size)
+        .map_err(|_| ParseError::IntegerConversion { field: "data_size" })?;
+    let end = off.checked_add(sz).ok_or(ParseError::InvalidField {
+        field: "data_offset",
+        reason: "overflow",
+    })?;
+    if end > block.len() {
+        return Err(ParseError::InvalidField {
+            field: "data_offset",
+            reason: "item data extends past block",
+        });
+    }
+    Ok(Some(BtrfsLeafEntry {
+        key: item.key,
+        data: block[off..end].to_vec(),
+    }))
+}
+
 fn floor_descend(
     node_provider: &mut dyn FnMut(u64) -> Result<Arc<BtrfsParsedNode>, ParseError>,
     logical: u64,
@@ -2535,39 +2589,7 @@ fn floor_descend(
 
     let node = node_provider(logical)?;
     match node.as_ref() {
-        BtrfsParsedNode::Leaf { block, items } => {
-            let block = block.as_ref();
-            // Leaf items are sorted ascending by key; the floor is the last item
-            // `<= target`. Binary-search to it instead of scanning the whole node
-            // (a 16 KiB leaf packs hundreds of items, and a floor descent visits
-            // one node per tree level on every read_file extent fetch — bd-hv6ww,
-            // the within-node dual of bd-6u6xb). O(items) -> O(log items).
-            let pp = items.partition_point(|item| key_cmp(&item.key, target) != Ordering::Greater);
-            if pp == 0 {
-                return Ok(None);
-            }
-            let item = &items[pp - 1];
-            let off =
-                usize::try_from(item.data_offset).map_err(|_| ParseError::IntegerConversion {
-                    field: "data_offset",
-                })?;
-            let sz = usize::try_from(item.data_size)
-                .map_err(|_| ParseError::IntegerConversion { field: "data_size" })?;
-            let end = off.checked_add(sz).ok_or(ParseError::InvalidField {
-                field: "data_offset",
-                reason: "overflow",
-            })?;
-            if end > block.len() {
-                return Err(ParseError::InvalidField {
-                    field: "data_offset",
-                    reason: "item data extends past block",
-                });
-            }
-            Ok(Some(BtrfsLeafEntry {
-                key: item.key,
-                data: block[off..end].to_vec(),
-            }))
-        }
+        BtrfsParsedNode::Leaf { .. } => floor_in_leaf(node.as_ref(), target),
         BtrfsParsedNode::Internal { ptrs } => {
             // Key-ptrs are sorted ascending by key (each key is the child
             // subtree's minimum); the floor child is the rightmost whose key is
