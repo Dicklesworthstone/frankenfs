@@ -54775,13 +54775,28 @@ mod tests {
     /// this reading should be re-checked, not trusted outright.
     ///
     /// WHAT IS LEFT: a residual FCW on an inode-table block under true
-    /// contention, despite both writers declaring disjoint slots. Worth checking
-    /// first, and UNVERIFIED: whether some third writer to that block in the same
-    /// transaction stages an opaque whole-block write, which would drag the
-    /// accumulated proof down to `Unsafe` through the mixed-proof fallback in
-    /// `stage_rmw`. Measure which writers touch the block in one txn before
-    /// wiring anything — every previous diagnosis on this bead was wrong until
-    /// measured.
+    /// contention, despite both writers declaring disjoint slots.
+    ///
+    /// ⛔ THE PROOF-DOWNGRADE EXPLANATION IS REFUTED — MEASURED, not argued. The
+    /// suspect was a third writer staging an opaque whole-block write to that
+    /// block in the same transaction, which would drag the accumulated proof down
+    /// to `Unsafe`. `ffs_mvcc::proof_downgrade_count()` counts exactly that, and
+    /// it reads ZERO across this workload on both the sharded and single-lock
+    /// variants under full-suite load. No writer takes the plain path here at
+    /// all, so the class cannot explain the residual and should not be
+    /// re-proposed. That makes five hypotheses on this bead killed by
+    /// measurement; the counter and its Drop-guard report stay so the sixth is
+    /// cheaper to test.
+    ///
+    /// Whatever remains is therefore NOT a missing or lost proof. The untested
+    /// direction is the merge itself: two writers with genuinely disjoint,
+    /// correctly-declared slot ranges whose merge is nonetheless refused. That
+    /// points at `check_write_mergeable_locked`'s inputs rather than at the
+    /// staging paths — the `latest` resolution, or a range that is disjoint in
+    /// the inode-slot sense but not in the byte sense (an inode straddling a
+    /// boundary, or a checksum/padding region written outside the declared
+    /// range). Measure before wiring: every previous diagnosis on this bead was
+    /// wrong until measured.
     ///
     /// The three defects already fixed, all measured rather than inferred:
     ///
@@ -54839,7 +54854,7 @@ mod tests {
     /// complete on partial evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: FLAKY — 3 of 4 full-suite runs pass; residual contention conflict on an inode-table block"]
+    #[ignore = "bd-y2t0r: FLAKY — 6 of 7 full-suite runs pass; residual is NOT the proof-downgrade class (measured 0)"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }
@@ -54923,6 +54938,30 @@ mod tests {
             },
         );
         let layout = std::sync::Arc::new(layout);
+        // bd-y2t0r: the leading suspect for the residual conflict is a plain
+        // whole-block `write_block` discarding a slot-scoped proof another writer
+        // established for the same inode-table block. Sampling the process-wide
+        // downgrade counter across the workload answers that directly. A counter
+        // rather than a log because the workers are threads inside a parallel test
+        // suite, where a thread-scoped subscriber sees nothing and a global one
+        // cannot be installed from a single test.
+        // Reported from a Drop guard, not inline after the workload: a worker
+        // panic propagates out of `thread::scope`, so any read placed after it is
+        // skipped on exactly the runs whose number is wanted. Drop still runs
+        // during unwind, so the count reaches the log on the failing path too.
+        struct DowngradeReport(u64);
+        impl Drop for DowngradeReport {
+            fn drop(&mut self) {
+                let delta = ffs_mvcc::proof_downgrade_count().saturating_sub(self.0);
+                println!(
+                    "bd-y2t0r: merge-proof downgrades during this workload: {delta} \
+                     (non-zero => some writer plain-write_blocks a proof-scoped block; \
+                     the counter is process-wide, so a parallel suite may attribute \
+                     a few from other tests)"
+                );
+            }
+        }
+        let _downgrade_report = DowngradeReport(ffs_mvcc::proof_downgrade_count());
 
         let fs = std::sync::Arc::new(fs);
         std::thread::scope(|scope| {

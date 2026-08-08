@@ -37,6 +37,24 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
+/// Process-wide count of merge proofs discarded by a later plain whole-block
+/// write to the same block within one transaction.
+///
+/// A diagnostic, not a metric anyone should tune on. A non-zero value means some
+/// writer called plain `write_block` on a block another writer had proof-scoped,
+/// so that block silently reverted to first-committer-wins — see
+/// `Transaction::insert_staged_write` for why that downgrade is correct and why
+/// it is nonetheless worth surfacing.
+static PROOF_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`PROOF_DOWNGRADES`]. Exposed so a test can assert on the downgrade
+/// happening across worker threads, which no thread-scoped tracing subscriber
+/// can observe.
+#[must_use]
+pub fn proof_downgrade_count() -> u64 {
+    PROOF_DOWNGRADES.load(Ordering::Relaxed)
+}
+
 fn saturating_increment_atomic(counter: &AtomicU64, ordering: Ordering) -> u64 {
     loop {
         if let Ok(previous) = counter.fetch_update(ordering, Ordering::Relaxed, |current| {
@@ -914,6 +932,15 @@ impl Transaction {
                 if previous.merge_proof != MergeProof::Unsafe
                     && staged.merge_proof == MergeProof::Unsafe
                 {
+                    // Counted as well as logged, because the log is unreadable
+                    // where it matters most. The workload that exposes this
+                    // (bd-y2t0r's gate) runs 8 worker threads inside a parallel
+                    // test suite: `with_default` is thread-scoped so it misses the
+                    // workers, and a global subscriber cannot be installed
+                    // reliably from one test among many in a shared process. A
+                    // process-wide counter is readable from any thread by the test
+                    // that cares, with no subscriber at all.
+                    saturating_increment_atomic(&PROOF_DOWNGRADES, Ordering::Relaxed);
                     warn!(
                         target: "ffs::mvcc::merge",
                         block = block.0,
