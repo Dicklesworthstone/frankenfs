@@ -22259,7 +22259,51 @@ impl OpenFs {
             ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
             {
                 let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-                ffs_inode::write_inode(cx, tx_dev, geo, groups, parent, &parent_upd, csum_seed)?;
+                // The parent-inode update is the OTHER whole-block write on this
+                // path, and measurement says it is the one that actually blocked
+                // the sharded cutover's concurrency gate. `write_inode` rewrites
+                // the parent's entire inode-table block, so two workers whose
+                // PARENT directories share a table block first-committer-wins
+                // against each other on every unlink — even though the two
+                // directories are unrelated and their 256-byte slots are disjoint.
+                //
+                // Measured, not inferred (the gate's layout dump):
+                //     w0..w3 = inodes 13-16 -> table block 37
+                //     w4..w7 = inodes 17-20 -> table block 38
+                // and every conflict the gate reported was on 37 or 38, each
+                // worker failing on its OWN parent's block. 16 inodes share a
+                // 4 KiB block at 256 bytes each, so this collides for any workload
+                // whose directories were created together — which is precisely the
+                // parallel-metadata shape the sharded allocator exists to serve.
+                //
+                // Staging the parent's slot through `rmw_block` declares the exact
+                // bytes touched, so disjoint-slot writers merge. It stays INSIDE
+                // the transaction (unlike `ext4_sharded_write_inode`, which
+                // auto-commits to the store), preserving unlink's atomicity.
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                let sharded_parent_write = self.bhh0i_sharded_ops_active();
+                #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                let sharded_parent_write = false;
+
+                if sharded_parent_write {
+                    let loc = ffs_inode::locate_inode(parent, geo, groups).ok_or_else(|| {
+                        FfsError::Corruption {
+                            block: 0,
+                            detail: format!("sharded unlink: parent inode {parent} out of range"),
+                        }
+                    })?;
+                    ffs_inode::write_inode_at_slot_scoped(
+                        cx,
+                        tx_dev,
+                        loc,
+                        usize::from(geo.inode_size),
+                        parent,
+                        &parent_upd,
+                        csum_seed,
+                    )?;
+                } else {
+                    ffs_inode::write_inode(cx, tx_dev, geo, groups, parent, &parent_upd, csum_seed)?;
+                }
             }
 
             trace!(
@@ -54646,50 +54690,53 @@ mod tests {
     /// Gated on the feature because the routing it exercises does not exist
     /// without it; the runtime toggle is set explicitly since it now defaults off
     /// (bd-pbyu0).
-    /// ⛔ **KNOWN FAILING — `#[ignore]`d deliberately, tracked on `bd-y2t0r`.**
+    /// ⭐ THIS TEST WAS `#[ignore]`d AND FAILING FOR TWO COMMITS. What made it
+    /// pass is worth keeping written down, because the first diagnosis was wrong
+    /// and the layout dump below is what corrected it.
     ///
-    /// The sharded delete routing is correct SINGLE-THREADED (both mounted repro
-    /// variants are e2fsck-clean) but conflicts under concurrency:
-    ///
-    ///     worker 4 unlink f00-050: first-committer-wins conflict on block 38:
-    ///     snapshot=CommitSeq(3908), observed=CommitSeq(3909)
-    ///
-    /// and the `..._under_single_lock_...` control beside it PASSES the identical
-    /// workload, so this is attributable to the sharded path rather than to
-    /// concurrent removal being unsupported generally.
-    ///
-    /// ⚠ THE ORIGINAL BITMAP DIAGNOSIS WAS WRONG, and the correction is the whole
-    /// reason this doc comment is long. The conflict was attributed to the inode
-    /// BITMAP lacking a clear-bits merge proof. Adding the layout dump below
-    /// measured it instead:
+    /// The failure was attributed to the inode BITMAP lacking a clear-bits merge
+    /// proof. That was inferred from the shape of the failure, never measured.
+    /// Measuring it — printing the group layout into the panic — said otherwise:
     ///
     ///     group 0: block_bitmap=33 inode_bitmap=35 inode_table=37
     ///     group 1: block_bitmap=34 inode_bitmap=36 inode_table=2085
+    ///     w0..w3 = inodes 13-16 -> table block 37
+    ///     w4..w7 = inodes 17-20 -> table block 38
     ///
-    /// Every reported conflict is on 37, 38 or 2085 — the inode TABLES (38 is
-    /// table+1). The inode bitmaps, 35 and 36, have never appeared in one. The
-    /// bitmap gap was real and is now fixed (`MergeProof::BitmapDelta`), but it
-    /// was not what blocks this test.
+    /// Every conflict was on 37 or 38 — inode TABLE blocks — and each worker
+    /// failed on ITS OWN parent directory's block. The bitmaps, 35 and 36, never
+    /// appeared in one. A 4 KiB block holds 16 inodes at 256 bytes, so the eight
+    /// per-worker directories, created consecutively, shared just two blocks.
     ///
-    /// REMAINING MECHANISM, partly fixed: an inode-table block holds 16 inodes at
-    /// 256 bytes each, so workers deleting different inodes share a block while
-    /// their slots stay disjoint. The delete path's zeroed-inode write-back now
-    /// stages a slot-scoped proof (`write_inode_at_slot_scoped`), matching what
-    /// the sharded CREATE path already did. Conflicts persist on 37/38, so at
-    /// least one more writer to those blocks still stages an opaque whole-block
-    /// write. The leading suspect, UNVERIFIED: each unlink also updates its PARENT
-    /// directory's inode (mtime/ctime) via plain `write_inode`, and the eight
-    /// per-worker directories `w0..w7` were created consecutively, so all eight
-    /// parent inodes land in ONE table block — exactly block 37. Confirm that
-    /// before wiring anything: `ext4_sharded_write_inode` already exists for
-    /// parent-inode updates on the create side.
+    /// THE ACTUAL MECHANISM: every unlink writes its parent directory's inode
+    /// (mtime/ctime) with `write_inode`, which rewrites the parent's whole
+    /// inode-table block and therefore stages an opaque whole-block write. Two
+    /// workers whose unrelated parent directories share a table block then
+    /// first-committer-wins against each other on every single unlink, even
+    /// though their 256-byte slots are disjoint. Both that write and the deleted
+    /// child's zeroed write-back now go through `write_inode_at_slot_scoped`,
+    /// which declares the exact bytes touched so disjoint slots merge.
     ///
-    /// Note the shipping default is OFF (`bd-pbyu0`), so this affects only an
-    /// explicit `FFS_BHH0I_SHARDED=1` opt-in. Un-`ignore` this test as part of the
-    /// fix — it is the acceptance gate for re-enabling the default.
+    /// This generalizes past the test: any parallel-metadata workload whose
+    /// directories were created together collides the same way, which is exactly
+    /// the shape the sharded allocator exists to serve.
+    ///
+    /// The `MergeProof::BitmapDelta` work from the wrong diagnosis was kept: the
+    /// inode bitmap really did have no merge proof in either direction, so it
+    /// would have conflicted as soon as this stopped masking it.
+    ///
+    /// The `..._under_single_lock_...` control beside this test runs the identical
+    /// workload and must keep passing — without it a failure here would be
+    /// unattributable between "the sharded routing is broken" and "concurrent
+    /// removal was never supported at all".
+    ///
+    /// ⚠ The shipping default is still OFF (`bd-pbyu0`). This test green is
+    /// necessary but NOT sufficient to flip it: the parallel-metadata comparator
+    /// row that justifies the sharded path has not been re-measured with deletes
+    /// routed, and bd-pbyu0 shipped a P0 precisely because a cutover was declared
+    /// complete on partial evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: sharded delete still FCW-conflicts on the inode TABLE (blocks 37/2085), not the bitmap; see doc comment"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }
@@ -54751,6 +54798,20 @@ mod tests {
                         stats.inode_bitmap_block.0,
                         stats.inode_table_block.0,
                     ));
+                }
+                // Every unlink also writes its PARENT directory's inode, so the
+                // parents' table blocks belong in the map as much as the group
+                // layout does — a conflict on a parent's block is otherwise
+                // indistinguishable from one on a deleted child's.
+                if let Some(sb) = fs.ext4_superblock() {
+                    let geo = FsGeometry::from_superblock(sb);
+                    out.push_str("\n  worker dirs (the unlink PARENT inodes):");
+                    for (worker, dir) in dirs.iter().enumerate() {
+                        let block = sharded
+                            .inode_location(*dir, &geo)
+                            .map_or_else(|| "?".to_owned(), |loc| loc.block.0.to_string());
+                        out.push_str(&format!("\n    w{worker}: ino={} table_block={block}", dir.0));
+                    }
                 }
                 out
             },

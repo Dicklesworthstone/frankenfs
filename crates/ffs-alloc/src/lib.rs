@@ -246,11 +246,7 @@ fn fill_inode_bitmap_padding_with_clear_undo(
     }
 }
 
-fn bitmap_set_with_clear_undo(
-    bitmap: &mut [u8],
-    idx: u32,
-    undo_clear: &mut impl Extend<u32>,
-) {
+fn bitmap_set_with_clear_undo(bitmap: &mut [u8], idx: u32, undo_clear: &mut impl Extend<u32>) {
     if !bitmap_get(bitmap, idx) {
         bitmap_set(bitmap, idx);
         undo_clear.extend([idx]);
@@ -3873,7 +3869,10 @@ pub fn free_inode_in_group(
     if bit_idx >= inodes_in_group {
         return Err(FfsError::Corruption {
             block: 0,
-            detail: format!("inode {} is outside group {} inode capacity", ino.0, group.0),
+            detail: format!(
+                "inode {} is outside group {} inode capacity",
+                ino.0, group.0
+            ),
         });
     }
     if !bitmap_get(&bitmap, bit_idx) {
@@ -5792,7 +5791,8 @@ mod tests {
             let mut groups_a = make_groups(&geo);
             seed_gdt_block(&dev_a, &pctx, &groups_a);
             let alloc_a =
-                alloc_blocks_persist(&cx, &dev_a, &geo, &mut groups_a, count, &hint, &pctx).unwrap();
+                alloc_blocks_persist(&cx, &dev_a, &geo, &mut groups_a, count, &hint, &pctx)
+                    .unwrap();
 
             // Replica path: sharded free_blocks_in_group, seeded + allocated
             // identically so the ONLY difference is the free implementation.
@@ -5800,12 +5800,19 @@ mod tests {
             let mut groups_b = make_groups(&geo);
             seed_gdt_block(&dev_b, &pctx, &groups_b);
             let alloc_b =
-                alloc_blocks_persist(&cx, &dev_b, &geo, &mut groups_b, count, &hint, &pctx).unwrap();
+                alloc_blocks_persist(&cx, &dev_b, &geo, &mut groups_b, count, &hint, &pctx)
+                    .unwrap();
             assert_eq!(alloc_a.start, alloc_b.start, "identical alloc precondition");
             assert_eq!(alloc_a.count, alloc_b.count);
 
             free_blocks_persist(
-                &cx, &dev_a, &geo, &mut groups_a, alloc_a.start, alloc_a.count, &pctx,
+                &cx,
+                &dev_a,
+                &geo,
+                &mut groups_a,
+                alloc_a.start,
+                alloc_a.count,
+                &pctx,
             )
             .unwrap();
 
@@ -5836,8 +5843,12 @@ mod tests {
             );
 
             // On-disk bitmap block + GDT block byte-identical.
-            let bmp_a = dev_a.read_block(&cx, groups_a[gidx].block_bitmap_block).unwrap();
-            let bmp_b = dev_b.read_block(&cx, groups_b[gidx].block_bitmap_block).unwrap();
+            let bmp_a = dev_a
+                .read_block(&cx, groups_a[gidx].block_bitmap_block)
+                .unwrap();
+            let bmp_b = dev_b
+                .read_block(&cx, groups_b[gidx].block_bitmap_block)
+                .unwrap();
             assert_eq!(
                 bmp_a.as_slice(),
                 bmp_b.as_slice(),
@@ -5896,21 +5907,36 @@ mod tests {
             let dev_a = MemBlockDevice::new(4096);
             let mut groups_a = make_groups(&geo);
             seed_gdt_block(&dev_a, &pctx, &groups_a);
-            let alloc_a =
-                alloc_inode_persist(&cx, &dev_a, &geo, &mut groups_a, GroupNumber(0), is_dir, &pctx)
-                    .unwrap();
+            let alloc_a = alloc_inode_persist(
+                &cx,
+                &dev_a,
+                &geo,
+                &mut groups_a,
+                GroupNumber(0),
+                is_dir,
+                &pctx,
+            )
+            .unwrap();
 
             // Replica: sharded free_inode_in_group, seeded + allocated identically.
             let dev_b = MemBlockDevice::new(4096);
             let mut groups_b = make_groups(&geo);
             seed_gdt_block(&dev_b, &pctx, &groups_b);
-            let alloc_b =
-                alloc_inode_persist(&cx, &dev_b, &geo, &mut groups_b, GroupNumber(0), is_dir, &pctx)
-                    .unwrap();
+            let alloc_b = alloc_inode_persist(
+                &cx,
+                &dev_b,
+                &geo,
+                &mut groups_b,
+                GroupNumber(0),
+                is_dir,
+                &pctx,
+            )
+            .unwrap();
             assert_eq!(alloc_a.ino, alloc_b.ino, "identical alloc precondition");
             assert_eq!(alloc_a.group, alloc_b.group);
 
-            free_inode_persist(&cx, &dev_a, &geo, &mut groups_a, alloc_a.ino, is_dir, &pctx).unwrap();
+            free_inode_persist(&cx, &dev_a, &geo, &mut groups_a, alloc_a.ino, is_dir, &pctx)
+                .unwrap();
 
             let gidx = alloc_b.group.0 as usize;
             free_inode_in_group(
@@ -5938,8 +5964,12 @@ mod tests {
                 "inode_search_start (csum={has_metadata_csum}, dir={is_dir})"
             );
 
-            let bmp_a = dev_a.read_block(&cx, groups_a[gidx].inode_bitmap_block).unwrap();
-            let bmp_b = dev_b.read_block(&cx, groups_b[gidx].inode_bitmap_block).unwrap();
+            let bmp_a = dev_a
+                .read_block(&cx, groups_a[gidx].inode_bitmap_block)
+                .unwrap();
+            let bmp_b = dev_b
+                .read_block(&cx, groups_b[gidx].inode_bitmap_block)
+                .unwrap();
             assert_eq!(
                 bmp_a.as_slice(),
                 bmp_b.as_slice(),

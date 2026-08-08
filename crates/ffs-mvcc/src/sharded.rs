@@ -352,11 +352,10 @@ impl CommitPublicationGate {
     fn with_mode(mode: PublicationMode) -> Self {
         let ring = match mode {
             PublicationMode::Mutex => Vec::new(),
-            PublicationMode::WaitFree | PublicationMode::WaitFreeNoSpin => {
-                (0..PUBLICATION_RING_SLOTS)
-                    .map(|_| AtomicU64::new(0))
-                    .collect()
-            }
+            PublicationMode::WaitFree | PublicationMode::WaitFreeNoSpin => (0
+                ..PUBLICATION_RING_SLOTS)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
         };
         Self {
             completed_commit: AtomicU64::new(0),
@@ -2168,7 +2167,11 @@ mod tests {
                 gate.wait_lock.lock().ready_commits.is_empty(),
                 "{mode:?}: buffered remnants"
             );
-            assert_eq!(gate.parked.load(Ordering::SeqCst), 0, "{mode:?}: leaked waiter");
+            assert_eq!(
+                gate.parked.load(Ordering::SeqCst),
+                0,
+                "{mode:?}: leaked waiter"
+            );
         }
     }
 
@@ -2186,7 +2189,10 @@ mod tests {
         let slot = |seq: u64| usize::try_from(seq & PUBLICATION_RING_MASK).expect("ring slot");
 
         gate.ring[slot(3)].store(3, Ordering::Release);
-        assert!(!gate.drain_ready_prefix(), "3 must not publish ahead of 1, 2");
+        assert!(
+            !gate.drain_ready_prefix(),
+            "3 must not publish ahead of 1, 2"
+        );
         assert_eq!(gate.completed(), 0);
 
         gate.ring[slot(2)].store(2, Ordering::Release);

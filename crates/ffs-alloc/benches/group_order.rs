@@ -147,7 +147,9 @@ fn bench_order_build_eliminated(c: &mut Criterion) {
     for &group_count in &[1024_u32, 4096, 16384] {
         let geo = make_geometry(group_count);
         group.bench_function(format!("full_order_build_{group_count}"), |b| {
-            b.iter(|| black_box(allocation_group_order(black_box(&geo), black_box(&hint)).unwrap()));
+            b.iter(|| {
+                black_box(allocation_group_order(black_box(&geo), black_box(&hint)).unwrap())
+            });
         });
         group.bench_function(format!("goal_group_only_{group_count}"), |b| {
             b.iter(|| {

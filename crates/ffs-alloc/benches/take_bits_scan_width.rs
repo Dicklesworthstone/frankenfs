@@ -5,13 +5,15 @@
 //! all-MAX-word skip lever (same as the contiguous finder). Run once as
 //! baseline, once after the production 4-wide skip; compare medians.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-alloc --bench take_bits_scan_width
-use criterion::{Criterion, criterion_group, criterion_main, BatchSize};
-use std::hint::black_box;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ffs_alloc::bench_take_free_bits_cyclic;
+use std::hint::black_box;
 fn bench(c: &mut Criterion) {
     let nbits = 65536u32;
     let mut template = vec![0xFFu8; (nbits / 8) as usize];
-    for byte in 8180..8192 { template[byte] = 0; } // free bits near the end
+    for byte in 8180..8192 {
+        template[byte] = 0;
+    } // free bits near the end
     c.bench_function("take_bits_mostly_alloc_n8", |b| {
         b.iter_batched(
             || template.clone(),

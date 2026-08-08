@@ -47,7 +47,11 @@ fn apply_word(word: u64, run: &mut u32, best: &mut u32) {
 fn run_word(bitmap: &[u8]) -> u32 {
     let (mut best, mut run) = (0u32, 0u32);
     for chunk in bitmap.chunks_exact(8) {
-        apply_word(u64::from_le_bytes(chunk.try_into().unwrap()), &mut run, &mut best);
+        apply_word(
+            u64::from_le_bytes(chunk.try_into().unwrap()),
+            &mut run,
+            &mut best,
+        );
     }
     best
 }
@@ -71,7 +75,11 @@ fn run_unrolled4(bitmap: &[u8]) -> u32 {
         apply_word(w3, &mut run, &mut best);
     }
     for chunk in chunks.remainder().chunks_exact(8) {
-        apply_word(u64::from_le_bytes(chunk.try_into().unwrap()), &mut run, &mut best);
+        apply_word(
+            u64::from_le_bytes(chunk.try_into().unwrap()),
+            &mut run,
+            &mut best,
+        );
     }
     best
 }
@@ -91,7 +99,9 @@ fn bench(c: &mut Criterion) {
         assert_eq!(run_word(bm), run_unrolled4(bm));
         let mut g = c.benchmark_group(format!("bitmap_run_{name}"));
         g.bench_function("word", |b| b.iter(|| black_box(run_word(black_box(bm)))));
-        g.bench_function("unrolled4", |b| b.iter(|| black_box(run_unrolled4(black_box(bm)))));
+        g.bench_function("unrolled4", |b| {
+            b.iter(|| black_box(run_unrolled4(black_box(bm))))
+        });
         g.finish();
     }
 }
