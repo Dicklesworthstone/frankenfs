@@ -3035,12 +3035,45 @@ impl TransactionBlockAdapter<'_, '_> {
         let (ancestor, base) = self
             .base
             .read_merge_ancestor_at_snapshot(cx, block, snapshot)?;
+        let already_staged = tx.staged_write(block).is_some();
         let mut data = match tx.staged_write(block) {
             Some(staged) => staged.to_vec(),
             None => ancestor.into_inner(),
         };
         patch(&mut data)?;
-        tx.stage_write_with_proof_and_base(block, data, proof, base);
+        // A transaction may RMW the SAME block more than once — an unlink writes
+        // the deleted child's zeroed inode and its parent directory's inode, and a
+        // 4 KiB table block holds 16 inodes, so the two frequently land together.
+        // The staged bytes accumulate across those calls, but the proof does not:
+        // staging the second call's range alone would declare a range narrower than
+        // the bytes actually changed, and the merge validator rightly rejects a
+        // staged block that differs from base OUTSIDE its declared ranges. The
+        // result was an FCW conflict on exactly the blocks this proof exists to
+        // merge (bd-y2t0r, blocks 37/38), visible only under load — a lightly
+        // loaded run usually commits between the two writes.
+        //
+        // So accumulate: union the declared ranges when both proofs are
+        // range-based, keep a repeated whole-block bitmap proof as-is (its delta
+        // accumulates against the same base, which is what the algorithm already
+        // computes), and fall back to `Unsafe` for any mixed pair rather than
+        // asserting a proof neither call can support. `Unsafe` costs a
+        // first-committer-wins conflict, never a wrong merge.
+        let effective = if already_staged {
+            match (tx.merge_proof(block), &proof) {
+                (Some(MergeProof::IndependentKeys { touched_ranges: prev }), MergeProof::IndependentKeys { touched_ranges: next }) => {
+                    let mut ranges: Vec<(usize, usize)> =
+                        prev.iter().map(|r| (r.start, r.len)).collect();
+                    ranges.extend(next.iter().map(|r| (r.start, r.len)));
+                    MergeProof::independent_keys(&ranges)
+                }
+                (Some(prev), next) if prev == next => proof.clone(),
+                (None, _) => proof.clone(),
+                _ => MergeProof::Unsafe,
+            }
+        } else {
+            proof
+        };
+        tx.stage_write_with_proof_and_base(block, data, effective, base);
         Ok(())
     }
 }
