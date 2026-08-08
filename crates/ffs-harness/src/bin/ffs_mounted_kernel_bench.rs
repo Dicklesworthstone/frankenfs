@@ -1733,12 +1733,25 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
             fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;
         }
         Workload::ReaddirStat8 => {
+            // EMPTY on purpose (bd-plkzd). Populating it here means the entries
+            // are baked in by `mke2fs -d`, which writes linear directory blocks
+            // and never builds the htree — measured: `debugfs htree_dump` on a
+            // 32,768-entry fixture built that way reports "Not a hash-indexed
+            // directory" even though `dir_index` is in the feature set. Every
+            // lookup in the ext4 arm then degrades to an O(N) scan, so the sweep
+            // is O(N^2) and the row describes a directory shape no real ext4
+            // filesystem has. btrfs has no analogue (DIR_ITEM/DIR_INDEX are
+            // inherent to the format), so the two arms were not the same
+            // filesystem shape.
+            //
+            // The entries are created through a kernel mount instead, by
+            // `seed_readdir_fixture_through_mount`, before the base image is
+            // cloned to the arms. The directory must be caller-owned — a fresh
+            // mkfs root is uid 0, and `mke2fs -d` preserves the host tree's
+            // ownership, so creating it here as the caller is what lets the
+            // seeding step write into it without running as root.
             let parent = root.join("large-directory");
             fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
-            for index in 0..config.operations {
-                File::create(parent.join(format!("entry-{index:08}")))
-                    .with_context(|| format!("create large-directory fixture entry {index}"))?;
-            }
         }
         Workload::FsyncJournalCommit => {
             write_fixture_file(&root.join("fsync.bin"), 4096, 0xF5)?;
@@ -1900,6 +1913,102 @@ fn create_base_image(
     validate_image(kind, &image)?;
     sync_image(&image)?;
     Ok(image)
+}
+
+/// Whether `debugfs htree_dump` output describes a hash-indexed directory.
+///
+/// Split out from the command invocation so the decision is unit-testable
+/// without root, a loop device, or e2fsprogs. debugfs prints its banner to the
+/// same stream, and reports a plain `htree_dump: Not a hash-indexed directory`
+/// for a linear one, so presence of the root-node `Hash Version` line is the
+/// discriminator (bd-plkzd).
+fn htree_dump_reports_indexed(output: &str) -> bool {
+    output.lines().any(|line| line.contains("Hash Version"))
+}
+
+/// Fail closed unless `/large-directory` on an ext4 image is genuinely
+/// hash-indexed (bd-plkzd).
+///
+/// `dir_index` in the superblock feature set only says the filesystem MAY have
+/// htrees; it says nothing about whether this directory got one. Asserting the
+/// directory itself is the whole point: the fixture defect this guards against
+/// was invisible for exactly as long as nobody looked past the feature flag.
+fn ensure_ext4_large_directory_is_htree_indexed(image: &Path) -> Result<()> {
+    let output = Command::new("debugfs")
+        .arg("-R")
+        .arg("htree_dump /large-directory")
+        .arg(image)
+        .output()
+        .with_context(|| format!("run debugfs htree_dump on {}", image.display()))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    ensure!(
+        htree_dump_reports_indexed(&combined),
+        "ext4 /large-directory is NOT hash-indexed, so every lookup is an O(N) scan and \
+         this row would describe a directory shape no real ext4 filesystem has (bd-plkzd). \
+         debugfs said:\n{combined}"
+    );
+    Ok(())
+}
+
+/// Create the large-directory entries THROUGH a kernel mount of the base image,
+/// so each filesystem builds its own native directory index (bd-plkzd).
+///
+/// Seeding through the KERNEL rather than through FrankenFS is deliberate: the
+/// incumbent is the reference implementation of the on-disk layout, and it keeps
+/// the candidate out of fixture construction entirely — otherwise a FrankenFS
+/// write defect could shape the very fixture the FrankenFS read arm is then
+/// measured on. Runs on the base image BEFORE it is cloned to the arms, so all
+/// four arms still measure a byte-identical filesystem.
+fn seed_readdir_fixture_through_mount(
+    kind: FilesystemKind,
+    image: &Path,
+    operations: usize,
+    interrupted: &AtomicBool,
+) -> Result<()> {
+    let mount_dir = image
+        .parent()
+        .ok_or_else(|| anyhow!("base image {} has no parent", image.display()))?
+        .join("seed-mnt");
+    fs::create_dir(&mount_dir)
+        .with_context(|| format!("create seed mountpoint {}", mount_dir.display()))?;
+
+    let options = match kind {
+        FilesystemKind::Ext4 => "loop,rw,noatime,nodev,nosuid,data=ordered",
+        FilesystemKind::Btrfs => "loop,rw,noatime,nodev,nosuid",
+    };
+    run_checked(
+        Command::new("sudo")
+            .args(["-n", "mount", "-t", kind.label(), "-o", options])
+            .arg(image)
+            .arg(&mount_dir),
+        &format!("mount {} to seed readdir fixture", kind.label()),
+    )?;
+    wait_for_mount(&mount_dir, None, interrupted)?;
+
+    let parent = mount_dir.join("large-directory");
+    let seed_result = (0..operations).try_for_each(|index| {
+        File::create(parent.join(format!("entry-{index:08}")))
+            .map(drop)
+            .with_context(|| format!("create large-directory entry {index} through the mount"))
+    });
+
+    // Unmount before reporting a seeding failure, or the loop device leaks and
+    // every later arm inherits a broken scratch dir.
+    let synced = seed_result.and_then(|()| {
+        run_checked(
+            &mut Command::new("sync"),
+            "sync after seeding readdir fixture",
+        )
+    });
+    let unmounted = run_checked(
+        Command::new("sudo").args(["-n", "umount"]).arg(&mount_dir),
+        "unmount readdir fixture seed mount",
+    );
+    synced?;
+    unmounted?;
+
+    Ok(())
 }
 
 fn validate_image(kind: FilesystemKind, image: &Path) -> Result<()> {
@@ -4776,6 +4885,19 @@ fn fs_report(
     let arms = measured_arms(compares_candidates);
     let candidate_arms = fuse_arms(compares_candidates);
     let base = create_base_image(kind, fixture_root, &fs_dir, config)?;
+    // bd-plkzd: the large directory is seeded THROUGH a kernel mount of the base
+    // image, before cloning, so each filesystem builds its own native directory
+    // index and all four arms still clone from one byte-identical image. Baking
+    // the entries in with `mke2fs -d` left ext4 with a linear, unindexed
+    // directory while btrfs got a normal one, so the two arms were not the same
+    // filesystem shape. The ext4 index is then ASSERTED, not assumed.
+    if config.workload == Workload::ReaddirStat8 {
+        seed_readdir_fixture_through_mount(kind, &base, config.operations, interrupted)?;
+        if kind == FilesystemKind::Ext4 {
+            ensure_ext4_large_directory_is_htree_indexed(&base)?;
+        }
+        validate_image(kind, &base)?;
+    }
     let images = clone_images(kind, &base, &fs_dir, arms)?;
 
     let mut mounts = Vec::with_capacity(arms.len());
@@ -7588,6 +7710,34 @@ mod tests {
             fuse_mount_for_test(Arm::CandidateBB, uncounted),
         ];
         assert!(candidate_knob_divergence(&split_replicas, true).is_err());
+    }
+
+    /// bd-plkzd: the htree control must accept a real indexed dump and reject
+    /// the exact string `mke2fs -d` fixtures produce.
+    ///
+    /// Both samples are verbatim debugfs 1.47.2 output captured while
+    /// reproducing `create_base_image`'s ext4 path at 32,768 entries — the
+    /// linear one is what the comparator was silently measuring.
+    #[test]
+    fn htree_dump_discriminates_indexed_from_linear_directories_bd_plkzd() {
+        let linear = "debugfs 1.47.2 (1-Jan-2025)\nhtree_dump: Not a hash-indexed directory\n";
+        assert!(
+            !htree_dump_reports_indexed(linear),
+            "an unindexed directory must FAIL the control — this exact output is what \
+             `mke2fs -d` produces and what went unnoticed"
+        );
+
+        let indexed = "debugfs 1.47.2 (1-Jan-2025)\nRoot node dump:\n\t Reserved zero: 0\n\t \
+                       Hash Version: 1\n\t Info length: 8\n\t Indirect levels: 1\n";
+        assert!(
+            htree_dump_reports_indexed(indexed),
+            "a genuinely hash-indexed directory must PASS"
+        );
+
+        // Empty / missing output is a failure, not a pass: a control that treats
+        // "debugfs said nothing" as success is not a control at all.
+        assert!(!htree_dump_reports_indexed(""));
+        assert!(!htree_dump_reports_indexed("debugfs: command not found\n"));
     }
 
     #[test]
