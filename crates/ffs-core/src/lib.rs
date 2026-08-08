@@ -29123,8 +29123,25 @@ impl OpenFs {
         // Final fsync to ensure superblock is durable
         self.dev.sync(cx)?;
 
+        // THE LINEARIZATION POINT HAS PASSED (bd-mqb9t). Only now are the trees
+        // this transaction replaced actually dead, so only now may the allocator
+        // hand out the space they occupied. Everything above ran with those
+        // blocks pinned, which is what makes a commit that fails part-way a
+        // no-op against the on-disk filesystem rather than the thing that
+        // destroys it. This call must stay AFTER the superblock write+sync and
+        // must not run on any error path.
+        let released = alloc.extent_alloc.release_pinned_after_superblock_commit();
+
         // Record superblock commit (for crash point tracking)
         executor.commit_superblock();
+
+        debug!(
+            target: "ffs::btrfs::writeback",
+            operation_id,
+            released_pinned_extents = released,
+            still_pinned = alloc.extent_alloc.pinned_extent_count(),
+            "pinned_extents_rotated"
+        );
 
         info!(
             target: "ffs::btrfs::writeback",

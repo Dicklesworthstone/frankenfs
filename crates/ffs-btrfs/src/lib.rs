@@ -6357,6 +6357,40 @@ pub struct BtrfsExtentAllocator {
     /// bytes and allocates straight into it, aliasing existing tree nodes
     /// (`btrfs check` then reports parent-transid mismatches — part of bd-x36qn).
     nodesize: u64,
+    /// Extents that must NOT be handed out even though the extent tree does not
+    /// describe them — btrfs's "pinned extents", the mechanism that makes a
+    /// transaction atomic (bd-mqb9t).
+    ///
+    /// Two disjoint populations land here, and both are invisible to the gap
+    /// finder (which derives free space purely from extent-tree items):
+    ///
+    /// 1. Blocks of the trees the CURRENTLY COMMITTED superblock points at,
+    ///    whose extent items `remove_metadata_items_owned_by_roots` deletes at
+    ///    the top of a commit so the newly serialized extent tree carries no
+    ///    stale entries. Deleting the item makes the space look free
+    ///    immediately; without a pin, this transaction's own node writes land on
+    ///    the live root/fs tree and a commit that then fails leaves an image the
+    ///    superblock still references but no longer describes.
+    /// 2. Allocations made with `skip_extent_item` (the extent tree's and root
+    ///    tree's own nodes), which by design never get an extent item at all, so
+    ///    nothing else would keep a later allocation off them.
+    ///
+    /// `pinned_release_after_commit` on each entry is what makes this exactly
+    /// two generations deep: population 1 dies the moment this transaction's
+    /// superblock lands, population 2 becomes population 1 for the next
+    /// transaction. `release_pinned_after_superblock_commit` performs that
+    /// rotation and MUST be called only after the superblock write succeeds.
+    pinned: BTreeMap<u64, PinnedExtent>,
+}
+
+/// An extent held out of allocation by `BtrfsExtentAllocator::pinned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinnedExtent {
+    num_bytes: u64,
+    /// True while this extent belongs to the transaction being built; it is
+    /// still live after that transaction commits, so the pin survives one
+    /// rotation and is dropped by the next one.
+    live_after_commit: bool,
 }
 
 /// Default btrfs node size (16 KiB), used until the real superblock value is set.
@@ -6373,7 +6407,78 @@ impl BtrfsExtentAllocator {
             extent_refcounts: BTreeMap::new(),
             generation,
             nodesize: BTRFS_DEFAULT_NODESIZE,
+            pinned: BTreeMap::new(),
         })
+    }
+
+    /// Hold `bytenr..bytenr + num_bytes` out of allocation (bd-mqb9t).
+    ///
+    /// `live_after_commit` distinguishes the two pin populations documented on
+    /// the `pinned` field: `false` for a block the current on-disk superblock
+    /// still references and this transaction is replacing, `true` for a block
+    /// this transaction just allocated without an extent item.
+    fn pin_extent(&mut self, bytenr: u64, num_bytes: u64, live_after_commit: bool) {
+        if bytenr == 0 || num_bytes == 0 {
+            return;
+        }
+        let entry = self.pinned.entry(bytenr).or_insert(PinnedExtent {
+            num_bytes,
+            live_after_commit,
+        });
+        // A re-pin only ever widens the hold: keep the larger span, and keep the
+        // longer lifetime, so a pin can never be silently shortened.
+        entry.num_bytes = entry.num_bytes.max(num_bytes);
+        entry.live_after_commit |= live_after_commit;
+        // Deliberately does NOT invalidate the tail cursors. Adding a pin never
+        // invalidates a cursor that already points past every known allocation:
+        // `remove_metadata_items_owned_by_roots` pins blocks BELOW the cursor and
+        // invalidates once for the whole batch, and an allocation pins the extent
+        // it just handed out, which the bump pointer has already moved past.
+        // Only RELEASING pins frees space behind the cursor, and that path
+        // invalidates.
+    }
+
+    /// Rotate the pinned set one generation. **Call only after the new
+    /// superblock has been written and synced.**
+    ///
+    /// That write is the transaction's linearization point: before it, the old
+    /// trees are the filesystem and must stay intact; after it, they are dead
+    /// and their space is genuinely reusable, while the blocks this transaction
+    /// allocated without extent items become the ones that must be protected.
+    /// Returns how many extents were released.
+    ///
+    /// Calling this on a FAILED commit would reintroduce exactly the defect it
+    /// exists to prevent, so the failure path deliberately leaves the pins in
+    /// place: the old trees are still the filesystem.
+    pub fn release_pinned_after_superblock_commit(&mut self) -> usize {
+        let before = self.pinned.len();
+        self.pinned.retain(|_, pin| pin.live_after_commit);
+        for pin in self.pinned.values_mut() {
+            pin.live_after_commit = false;
+        }
+        let released = before.saturating_sub(self.pinned.len());
+        if released > 0 {
+            self.invalidate_tail_cursors();
+            debug!(
+                target: "ffs::btrfs::alloc",
+                released,
+                still_pinned = self.pinned.len(),
+                "pinned_extents_released"
+            );
+        }
+        released
+    }
+
+    /// Number of extents currently pinned. Test/diagnostic accessor.
+    #[must_use]
+    pub fn pinned_extent_count(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// Whether `bytenr` is currently held out of allocation. Test accessor.
+    #[must_use]
+    pub fn is_pinned(&self, bytenr: u64) -> bool {
+        self.pinned.contains_key(&bytenr)
     }
 
     /// Drop every skinny `METADATA_ITEM` whose inline `TREE_BLOCK_REF` names one
@@ -6421,6 +6526,17 @@ impl BtrfsExtentAllocator {
         })?;
         let removed = to_remove.len();
         for key in to_remove {
+            // PIN BEFORE DELETE (bd-mqb9t). These blocks are the trees the
+            // on-disk superblock still points at; the delete is only so the
+            // extent tree we serialize later describes just live blocks. Without
+            // the pin the space reads as free the instant the item is gone, and
+            // this transaction's own node writes overwrite the filesystem it has
+            // not replaced yet. The pin is released by
+            // `release_pinned_after_superblock_commit`, i.e. once the superblock
+            // no longer points here.
+            if let Some((start, len)) = allocation_extent_range(key, self.nodesize) {
+                self.pin_extent(start, len, false);
+            }
             self.extent_tree.delete(&key)?;
         }
         if removed > 0 {
@@ -7051,10 +7167,29 @@ impl BtrfsExtentAllocator {
             };
             let extents = self.extent_tree.range(&range_start, &range_end)?;
 
-            let allocated_ranges: Vec<(u64, u64)> = extents
+            let mut allocated_ranges: Vec<(u64, u64)> = extents
                 .iter()
                 .filter_map(|(key, _)| allocation_extent_range(*key, self.nodesize))
                 .collect();
+
+            // Pinned extents are occupied even though no extent item says so:
+            // the blocks of the trees the committed superblock still points at,
+            // and this transaction's own extent/root-tree nodes (bd-mqb9t).
+            // Merging them here is what keeps the gap finder — and, through
+            // `last_extent_end` below, the tail-cursor fast path — from handing
+            // out space that is still in use. `first_gap_at_or_after` requires a
+            // sorted, non-overlapping list, so re-sort and coalesce after the
+            // merge; both inputs are individually sorted but interleave.
+            let pinned_here: Vec<(u64, u64)> = self
+                .pinned
+                .range(bg_base..bg_end)
+                .map(|(start, pin)| (*start, pin.num_bytes))
+                .collect();
+            if !pinned_here.is_empty() {
+                allocated_ranges.extend(pinned_here);
+                allocated_ranges.sort_unstable();
+                allocated_ranges = coalesce_ranges(allocated_ranges);
+            }
 
             // Forward search from the bump-pointer offset; if that finds
             // nothing and we started mid-group, wrap around to the
@@ -7173,6 +7308,15 @@ impl BtrfsExtentAllocator {
                 delta = num_bytes,
                 "bg_accounting"
             );
+        }
+
+        // An allocation that skips the EXTENT_ITEM (the extent tree's and root
+        // tree's own nodes) leaves nothing in the extent tree to keep a later
+        // allocation off it. Pin it so it is protected for the rest of this
+        // transaction AND through the next one, since it stays live until that
+        // transaction's superblock lands (bd-mqb9t).
+        if skip_extent_item {
+            self.pin_extent(bytenr, num_bytes, true);
         }
 
         // Queue delayed ref.
@@ -8046,6 +8190,31 @@ fn allocation_extent_range(key: BtrfsKey, metadata_nodesize: u64) -> Option<(u64
 /// `cursor` advances past the allocated prefix every call — pay O(log E + tail)
 /// instead of O(E) per allocation, i.e. O(N log N) to fill a group instead of
 /// O(N^2) (bd-8fbka). Result is identical to scanning from index 0.
+/// Merge a SORTED `(start, len)` list into non-overlapping ranges.
+///
+/// `first_gap_at_or_after` relies on its input being sorted and disjoint (its
+/// `partition_point` predicate is only monotonic then). Extent items are
+/// naturally disjoint, but unioning them with the pinned set can produce
+/// duplicates and overlaps — a pinned block whose extent item still exists
+/// appears in both (bd-mqb9t).
+fn coalesce_ranges(sorted: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, len) in sorted {
+        let end = start.saturating_add(len);
+        match out.last_mut() {
+            // Overlapping or touching the previous range: extend it. Ranges are
+            // sorted by start, so `start >= prev_start` and the union is
+            // contiguous from `prev_start` to the larger end.
+            Some((prev_start, prev_len)) if start <= prev_start.saturating_add(*prev_len) => {
+                let prev_end = prev_start.saturating_add(*prev_len);
+                *prev_len = end.max(prev_end).saturating_sub(*prev_start);
+            }
+            _ => out.push((start, len)),
+        }
+    }
+    out
+}
+
 fn first_gap_at_or_after(
     allocated_ranges: &[(u64, u64)],
     mut cursor: u64,
