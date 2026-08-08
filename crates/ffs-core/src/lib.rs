@@ -25006,17 +25006,64 @@ impl OpenFs {
                     persist_ctx,
                 } = &mut *alloc;
                 if ex_upd.links_count == 0 {
-                    ffs_inode::delete_inode(
-                        cx,
-                        &block_dev,
-                        geo,
-                        groups,
-                        existing_ino,
-                        &mut ex_upd,
-                        csum_seed,
-                        tstamp_secs,
-                        persist_ctx,
-                    )?;
+                    // bd-y2t0r: rename-over-existing IS a delete path. When the
+                    // clobbered target's last link goes, its inode must be freed
+                    // through whichever structure ALLOCATED it, exactly as unlink
+                    // does. Freeing it into the single-lock `groups` while the
+                    // descriptor flush reads `sharded.snapshot_group_stats()`
+                    // leaks one inode per clobbering rename — measured at exactly
+                    // 200 over 200 renames, e2fsck-dirty, which is bd-pbyu0's
+                    // signature in a path that bead never listed.
+                    #[cfg(feature = "bhh0i_sharded_alloc")]
+                    let sharded_inode_free = self.bhh0i_sharded_ops_active();
+                    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                    let sharded_inode_free = false;
+
+                    if sharded_inode_free {
+                        let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
+                            cx,
+                            &block_dev,
+                            geo,
+                            groups,
+                            existing_ino,
+                            &mut ex_upd,
+                            tstamp_secs,
+                            persist_ctx,
+                        )?;
+                        let loc = ffs_inode::locate_inode(existing_ino, geo, groups).ok_or_else(
+                            || FfsError::Corruption {
+                                block: 0,
+                                detail: format!(
+                                    "sharded rename: inode {existing_ino} out of range"
+                                ),
+                            },
+                        )?;
+                        ffs_inode::write_inode_at_slot_scoped(
+                            cx,
+                            &block_dev,
+                            loc,
+                            usize::from(geo.inode_size),
+                            existing_ino,
+                            &ex_upd,
+                            csum_seed,
+                        )?;
+                        #[cfg(feature = "bhh0i_sharded_alloc")]
+                        self.ext4_sharded_free_inode(cx, &block_dev, existing_ino, is_dir)?;
+                        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                        let _ = is_dir;
+                    } else {
+                        ffs_inode::delete_inode(
+                            cx,
+                            &block_dev,
+                            geo,
+                            groups,
+                            existing_ino,
+                            &mut ex_upd,
+                            csum_seed,
+                            tstamp_secs,
+                            persist_ctx,
+                        )?;
+                    }
                 } else {
                     ffs_inode::write_inode(
                         cx,
@@ -54895,6 +54942,79 @@ mod tests {
     #[test]
     fn concurrent_create_delete_under_single_lock_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(false);
+    }
+
+    /// bd-y2t0r audit: RENAME-OVER-EXISTING is a delete path too, and it was
+    /// never routed through the sharded records.
+    ///
+    /// The bead listed orphan recovery, fast-commit replay and file shortening as
+    /// the paths still to audit for the alloc.groups-versus-sharded-snapshot
+    /// divergence. `ext4_rename` was on nobody's list, yet
+    /// `rename(a, b)` where `b` exists drops `b`'s link count to zero and frees
+    /// its inode — through plain `delete_inode` against the single-lock `groups`
+    /// array, with no sharded branch anywhere in the function.
+    ///
+    /// That is bd-pbyu0 exactly: allocation debits the sharded per-group records
+    /// and the descriptor flush reads `sharded.snapshot_group_stats()`, so a free
+    /// credited to `groups` lands in a structure nothing reads. One leaked inode
+    /// per clobbering rename, e2fsck-dirty, and eventually ENOSPC on a filesystem
+    /// with free inodes.
+    ///
+    /// The single-lock control is the attribution: it runs the identical workload
+    /// and must stay clean, so a failure here is the sharded routing rather than
+    /// rename accounting being broken generally.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn rename_over_existing_frees_the_target_inode_through_the_sharded_records_bd_y2t0r() {
+        rename_over_existing_counter_check_bd_y2t0r(true);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn rename_over_existing_under_single_lock_keeps_counters_exact_bd_y2t0r() {
+        rename_over_existing_counter_check_bd_y2t0r(false);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn rename_over_existing_counter_check_bd_y2t0r(sharded: bool) {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        assert!(!fs.set_bhh0i_sharded_ops(sharded));
+
+        // Each cycle creates a victim and a source, then renames source over
+        // victim — freeing exactly one inode per cycle.
+        const CYCLES: usize = 200;
+        for cycle in 0..CYCLES {
+            let victim = format!("victim-{cycle:04}");
+            let source = format!("source-{cycle:04}");
+            fs.create(&cx, root, OsStr::new(&victim), 0o644, 0, 0)
+                .unwrap_or_else(|error| panic!("create {victim}: {error}"));
+            fs.create(&cx, root, OsStr::new(&source), 0o644, 0, 0)
+                .unwrap_or_else(|error| panic!("create {source}: {error}"));
+            fs.rename(&cx, root, OsStr::new(&source), root, OsStr::new(&victim))
+                .unwrap_or_else(|error| panic!("rename {source} -> {victim}: {error}"));
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush to device");
+        let image = tmp.path().join("rename-over-existing.ext4");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(
+            !output.contains("Free inodes count wrong"),
+            "rename-over-existing leaked free-inode counters with sharded={sharded} \
+             ({CYCLES} clobbering renames). The target inode's free must reach the \
+             SAME structure that allocated it (bd-y2t0r / bd-pbyu0):\n{output}"
+        );
+        assert!(
+            clean,
+            "e2fsck must accept the image after {CYCLES} clobbering renames \
+             (sharded={sharded}):\n{output}"
+        );
     }
 
     #[cfg(feature = "bhh0i_sharded_alloc")]
