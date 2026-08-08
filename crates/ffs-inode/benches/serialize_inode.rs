@@ -8,7 +8,7 @@
 //! isolates the per-call heap-alloc cost that `write_inode` runs on every
 //! create/mkdir/rename/unlink inode write.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_inode::{serialize_inode, serialize_inode_into};
 use ffs_ondisk::ext4::Ext4Inode;
 use std::hint::black_box;

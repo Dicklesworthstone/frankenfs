@@ -14,9 +14,9 @@
 //! This bench is that rejection's retained guard. Both forms are bit-identical.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-inode --bench locate_inode
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_alloc::{FsGeometry, GroupStats};
-use ffs_inode::{locate_inode, InodeLocation};
+use ffs_inode::{InodeLocation, locate_inode};
 use ffs_types::{BlockNumber, GroupNumber, InodeNumber};
 use std::hint::black_box;
 
@@ -65,7 +65,11 @@ fn make_groups(geo: &FsGeometry) -> Vec<GroupStats> {
 }
 
 /// Original division/modulo form (pre-strength-reduction), inlined for A/B.
-fn locate_inode_div(ino: InodeNumber, geo: &FsGeometry, groups: &[GroupStats]) -> Option<InodeLocation> {
+fn locate_inode_div(
+    ino: InodeNumber,
+    geo: &FsGeometry,
+    groups: &[GroupStats],
+) -> Option<InodeLocation> {
     if ino.0 == 0 || geo.inodes_per_group == 0 || geo.block_size == 0 || geo.inode_size == 0 {
         return None;
     }
@@ -103,8 +107,12 @@ fn bench_locate(c: &mut Criterion) {
         b.iter(|| {
             let mut acc = 0u64;
             for &ino in &inos {
-                if let Some(loc) = locate_inode_div(black_box(ino), black_box(&geo), black_box(&groups)) {
-                    acc = acc.wrapping_add(loc.block.0).wrapping_add(loc.byte_offset as u64);
+                if let Some(loc) =
+                    locate_inode_div(black_box(ino), black_box(&geo), black_box(&groups))
+                {
+                    acc = acc
+                        .wrapping_add(loc.block.0)
+                        .wrapping_add(loc.byte_offset as u64);
                 }
             }
             black_box(acc)
@@ -114,8 +122,11 @@ fn bench_locate(c: &mut Criterion) {
         b.iter(|| {
             let mut acc = 0u64;
             for &ino in &inos {
-                if let Some(loc) = locate_inode(black_box(ino), black_box(&geo), black_box(&groups)) {
-                    acc = acc.wrapping_add(loc.block.0).wrapping_add(loc.byte_offset as u64);
+                if let Some(loc) = locate_inode(black_box(ino), black_box(&geo), black_box(&groups))
+                {
+                    acc = acc
+                        .wrapping_add(loc.block.0)
+                        .wrapping_add(loc.byte_offset as u64);
                 }
             }
             black_box(acc)
