@@ -4818,6 +4818,66 @@ fn prepare_scratch_dir(root: &Path) -> Result<PathBuf> {
     Ok(root.to_path_buf())
 }
 
+/// Marker that tells the host's disk-pressure reclaimer (`sbh`) to skip a
+/// subtree; `sbh protect <path>` writes exactly this file and nothing else, so
+/// writing it directly costs nothing and adds no dependency on sbh being present.
+const RECLAIM_PROTECT_MARKER: &str = ".sbh-protect";
+
+/// Protect the directory holding this run's REPORT from disk-pressure
+/// reclamation (bd-v0igv).
+///
+/// Measured, not precautionary. `/data/tmp` sat at 90% when bd-v0igv enumerated 46
+/// comparator reports as KEEP (1.4 MiB total, against 133 GiB of regenerable arm
+/// images). By 2026-08-08 the images were gone — good — and so were 45 of the 46
+/// reports. Two banked rows now cite provenance that no longer exists: the
+/// 2026-07-31 bulk-durable row's `mounted-kernel-report.json`, and the entire
+/// `frankenfs-mounted-btrfs/run_*` tree the btrfs scorecard pointed at for all six
+/// of its rows. A report is ~48 KiB and is the only artifact here that cannot be
+/// rebuilt; the images are deterministic intermediates every run remakes from
+/// scratch. Reclaiming the rebuildable thing while eating the unrebuildable one is
+/// exactly backwards.
+///
+/// The marker protects a SUBTREE, so it goes on the report's own directory and
+/// emphatically NOT on the artifact root: the scratch root defaults to
+/// `<artifact_root>/scratch`, a sibling of the per-run report directories, and
+/// protecting their common parent would make the 5–11 GiB of arm images
+/// unreclaimable — the precise outcome bd-v0igv exists to prevent. Scratch must
+/// stay reclaimable; it is cleared by the next run anyway.
+///
+/// Best-effort: a run must not fail because a marker could not be written.
+fn protect_report_dir_from_reclaim(report_dir: &Path, scratch_root: &Path) {
+    if report_dir.starts_with(scratch_root) {
+        // An --output inside the scratch root would drag the arm images under the
+        // protection marker. Say so rather than silently pinning 5-11 GiB.
+        eprintln!(
+            "warning: report directory {} is inside the scratch root {}; not writing a \
+             {RECLAIM_PROTECT_MARKER} marker, because it would also protect the \
+             regenerable arm images. Move --output outside the scratch root to keep \
+             the report durable.",
+            report_dir.display(),
+            scratch_root.display()
+        );
+        return;
+    }
+    let marker = report_dir.join(RECLAIM_PROTECT_MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Err(error) = fs::write(
+        &marker,
+        b"frankenfs mounted-comparator report (bd-v0igv). The arm images are\n\
+          regenerable and live in the scratch root, which is NOT protected; the\n\
+          report here cannot be rebuilt and is cited as provenance by the perf\n\
+          scorecards. Written by ffs-mounted-kernel-bench, equivalent to `sbh protect`.\n",
+    ) {
+        eprintln!(
+            "warning: could not write {} ({error}); this run's report is reclaimable \
+             under disk pressure",
+            marker.display()
+        );
+    }
+}
+
 fn create_run_dir(root: &Path) -> Result<PathBuf> {
     ensure!(
         root.is_absolute() && root.starts_with("/data/tmp"),
@@ -6107,6 +6167,12 @@ fn run() -> Result<Option<PathBuf>> {
     // the 5-11 GiB of it — go in a scratch root that every run reuses and
     // clears (bd-v0igv).
     let scratch_dir = prepare_scratch_dir(&config.scratch_root())?;
+    // Mark the report's directory (not the artifact root, not scratch) so the
+    // host's disk-pressure reclaimer keeps the one artifact that cannot be
+    // rebuilt. 45 of 46 banked comparator reports were already lost this way.
+    if let Some(report_dir) = output.parent() {
+        protect_report_dir_from_reclaim(report_dir, &scratch_dir);
+    }
     let fixture_root = create_fixture_tree(&scratch_dir, &config)?;
     let placement = select_cpu_placement(
         config.client_threads(),
@@ -6731,6 +6797,61 @@ mod tests {
 
         // A path outside /data/tmp is refused before anything is inspected.
         assert!(prepare_scratch_dir(Path::new("/tmp/ffs-scratch-guard")).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// bd-v0igv: the reclaim-protection marker must land on the REPORT's
+    /// directory and never anywhere that contains the arm images. The marker
+    /// protects a subtree, so getting this wrong does not lose a report — it
+    /// pins 5-11 GiB of regenerable images per run, which is the exact problem
+    /// bd-v0igv was filed about.
+    #[test]
+    fn reclaim_protection_marks_the_report_dir_and_refuses_to_pin_the_scratch_root() {
+        let root = PathBuf::from(format!(
+            "/data/tmp/ffs-protect-guard-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let scratch = root.join("scratch");
+        let run_dir = root.join("run_1_1");
+        fs::create_dir_all(&scratch).expect("scratch");
+        fs::create_dir_all(&run_dir).expect("run dir");
+
+        // The normal shape: report dir is a SIBLING of scratch, so it is marked
+        // and scratch is left reclaimable.
+        protect_report_dir_from_reclaim(&run_dir, &scratch);
+        assert!(
+            run_dir.join(RECLAIM_PROTECT_MARKER).is_file(),
+            "the report's own directory must be protected"
+        );
+        assert!(
+            !scratch.join(RECLAIM_PROTECT_MARKER).exists(),
+            "the scratch root holds the regenerable images and must stay reclaimable"
+        );
+        assert!(
+            !root.join(RECLAIM_PROTECT_MARKER).exists(),
+            "protecting the artifact root would protect scratch too, since the marker \
+             covers a subtree — that is the failure this test exists to catch"
+        );
+
+        // Idempotent: a second call does not rewrite or duplicate the marker.
+        let first = fs::read(run_dir.join(RECLAIM_PROTECT_MARKER)).expect("marker body");
+        protect_report_dir_from_reclaim(&run_dir, &scratch);
+        assert_eq!(
+            fs::read(run_dir.join(RECLAIM_PROTECT_MARKER)).expect("marker body"),
+            first
+        );
+
+        // An --output aimed inside the scratch root is REFUSED, not honoured:
+        // marking there would drag the arm images under the protection.
+        let inside = scratch.join("nested");
+        fs::create_dir_all(&inside).expect("nested scratch dir");
+        protect_report_dir_from_reclaim(&inside, &scratch);
+        assert!(
+            !inside.join(RECLAIM_PROTECT_MARKER).exists(),
+            "a report directory inside the scratch root must not be marked"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
