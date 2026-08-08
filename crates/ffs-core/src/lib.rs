@@ -54553,6 +54553,80 @@ mod tests {
         Some((fs, snapshot, tmp))
     }
 
+    /// ⚠ **This test PASSES and `bd-pbyu0` is NOT fixed.** It is negative evidence,
+    /// not a reproduction — do not read a green run here as the bug being closed.
+    ///
+    /// `bd-pbyu0`: the mounted comparator's `create-delete-storm` leaves BOTH
+    /// FrankenFS arms `e2fsck`-dirty with 11 "Free inodes count wrong" errors each
+    /// while both kernel arms are clean — ten whole groups claiming ZERO free
+    /// inodes while all 8192 of each are free in the bitmap, a drift of exactly one
+    /// per file deleted. On a smaller image the drift exhausts the descriptors and
+    /// allocation starts failing ENOSPC on an empty filesystem.
+    ///
+    /// This test drives the same shape through the DIRECT in-process path —
+    /// `OpenFs::unlink`, i.e. `with_latest_scope` — and the counters stay exact.
+    /// Because the leak is one-per-delete, 768 operations would already show it, so
+    /// the failure is **path-specific, not scale-specific**: this path is clean and
+    /// the defect lives somewhere the mounted arm goes and this does not.
+    ///
+    /// The concrete difference to chase: the FUSE handler
+    /// (`ffs-fuse` `unlink`) wraps the same `FsOps::unlink` in
+    /// `with_request_scope` and then calls `commit_request_scope`, where this test
+    /// uses `with_latest_scope`. That scope-commit path is the next place to look.
+    ///
+    /// Keep this test regardless of how `bd-pbyu0` is fixed: it pins that the
+    /// direct path is correct, so a fix elsewhere cannot silently regress it.
+    #[test]
+    fn direct_path_create_delete_cycles_keep_free_inode_counters_exact_not_a_bd_pbyu0_repro() {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        const FILES_PER_CYCLE: usize = 64;
+        const CYCLES: usize = 12;
+
+        for cycle in 0..CYCLES {
+            for index in 0..FILES_PER_CYCLE {
+                let name = format!("storm-{cycle:03}-{index:04}");
+                fs.create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "create {name} failed on cycle {cycle}: {error}. A failure here \
+                             (especially ENOSPC on a filesystem this empty) is the \
+                             allocation-side face of the bd-pbyu0 counter drift."
+                        )
+                    });
+            }
+            for index in 0..FILES_PER_CYCLE {
+                let name = format!("storm-{cycle:03}-{index:04}");
+                fs.unlink(&cx, root, OsStr::new(&name))
+                    .unwrap_or_else(|error| panic!("unlink {name} failed: {error}"));
+            }
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush to device");
+        let image = tmp.path().join("storm.ext4");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(
+            !output.contains("Free inodes count wrong"),
+            "the DIRECT path drifted its group free-inode counters after \
+             {CYCLES} x {FILES_PER_CYCLE} create/delete cycles. This test is bd-pbyu0's \
+             negative control: if it starts failing, the defect has spread to the direct \
+             path too.\n{output}"
+        );
+        assert!(
+            clean,
+            "e2fsck must accept the image after repeated create/delete cycles on the \
+             direct path (bd-pbyu0 negative control):\n{output}"
+        );
+    }
+
     fn reopen_ext4_after_crash(dev: &TestDevice) -> OpenFs {
         let cx = Cx::for_testing();
         let opts = OpenOptions {
