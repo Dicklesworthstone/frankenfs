@@ -6705,8 +6705,17 @@ fn mount_with_fuse(
     // serializes on one lock and parallel metadata writes scale NEGATIVELY —
     // the mechanism behind the 1.510822x mounted loss vs kernel ext4. The
     // sharded twin allocates through per-group locks instead, so creates into
-    // disjoint groups never serialize. It is the shipping default; operators
-    // can explicitly roll back with `FFS_BHH0I_SHARDED=0`.
+    // disjoint groups never serialize.
+    //
+    // ⛔ OPT-IN ONLY as of bd-pbyu0 (2026-08-08). This was the shipping default
+    // and had to be turned off: the cutover covers CREATE but not DELETE, so
+    // creates debit the sharded per-group records while ordinary unlink credits
+    // the single-lock `alloc.groups` array — and the descriptor flush reads only
+    // `sharded.snapshot_group_stats()`. Every delete's free therefore landed in a
+    // structure the flush never reads, leaking exactly one inode per delete,
+    // leaving the image e2fsck-dirty and eventually returning ENOSPC on an empty
+    // filesystem. Re-enable the default only once unlink routes its inode free
+    // through the sharded records.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     if read_write
         && sharded_create_enabled_from_env(std::env::var("FFS_BHH0I_SHARDED").ok().as_deref())?
@@ -6728,10 +6737,38 @@ fn mount_with_fuse(
 /// false value disables it, so an accidental non-empty value cannot silently
 /// select the slower global allocator.
 #[cfg(feature = "bhh0i_sharded_alloc")]
+/// Whether `mount --rw` should route creates through the bd-bhh0i sharded
+/// per-group allocator.
+///
+/// ⛔ **Default flipped to OFF (bd-pbyu0).** It was `None => true`, i.e. enabled
+/// unless the operator opted out. That shipped a data-integrity defect by
+/// default: the cutover is INCOMPLETE. Creates debit the sharded per-group
+/// records and `ext4_flush_group_descriptors` writes descriptors from
+/// `sharded.snapshot_group_stats()`, but ORDINARY UNLINK still credits the
+/// single-lock `alloc.groups` array — `ext4_sharded_free_inode` exists and is
+/// wired only into create-rollback paths, never into `ext4_unlink_impl`. So every
+/// delete's free is written to a structure the flush never reads.
+///
+/// Measured, one variable, same script and workload (scripts/pbyu0_mounted_repro.sh):
+///
+///     sharded ON  (the old default)   e2fsck DIRTY, 3000 inodes leaked over
+///                                     6 cycles x 500 files — exactly one per delete
+///     sharded OFF (FFS_BHH0I_SHARDED=0) e2fsck clean
+///
+/// On a small enough filesystem the drift exhausts the descriptors and allocation
+/// returns ENOSPC on a filesystem that is empty.
+///
+/// Turning this off costs the parallel-create scaling the sharded path exists to
+/// provide — a performance property. Leaving it on corrupts inode accounting on
+/// ordinary create/delete work — a correctness one. Until the delete side of the
+/// cutover lands, off is the only defensible default.
+///
+/// `FFS_BHH0I_SHARDED=1` still opts in explicitly, so the A/B and the perf work
+/// remain available.
 fn sharded_create_enabled_from_env(value: Option<&str>) -> Result<bool> {
     match value {
-        None | Some("1" | "true") => Ok(true),
-        Some("0" | "false") => Ok(false),
+        None | Some("0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
         Some(value) => {
             bail!("FFS_BHH0I_SHARDED must be one of 0, 1, false, or true; got {value:?}")
         }
@@ -9099,14 +9136,33 @@ mod tests {
         );
     }
 
+    /// bd-pbyu0: the sharded create path must be OFF unless explicitly requested.
+    ///
+    /// This assertion was inverted until 2026-08-08 — `None` meant enabled, so the
+    /// shipped `mount --rw` used a cutover whose delete side was never wired.
+    /// Creates debit the sharded per-group records and the descriptor flush reads
+    /// `sharded.snapshot_group_stats()`, while ordinary unlink credits the
+    /// single-lock `alloc.groups` array, so every delete's free went to a structure
+    /// the flush never reads: measured at exactly one leaked inode per delete,
+    /// e2fsck-dirty, and ENOSPC on an empty filesystem.
+    ///
+    /// Do NOT flip this back to `None => true` until unlink routes its inode free
+    /// through the sharded records and `scripts/pbyu0_mounted_repro.sh` is clean
+    /// with the sharded path ENABLED.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    fn sharded_create_mount_default_has_an_explicit_validated_rollback() {
-        assert!(super::sharded_create_enabled_from_env(None).unwrap());
-        assert!(super::sharded_create_enabled_from_env(Some("1")).unwrap());
-        assert!(super::sharded_create_enabled_from_env(Some("true")).unwrap());
+    fn sharded_create_mount_defaults_off_until_the_delete_side_lands_bd_pbyu0() {
+        assert!(
+            !super::sharded_create_enabled_from_env(None).unwrap(),
+            "the sharded create path must default OFF: its delete side is not wired \
+             and enabling it corrupts inode accounting (bd-pbyu0)"
+        );
         assert!(!super::sharded_create_enabled_from_env(Some("0")).unwrap());
         assert!(!super::sharded_create_enabled_from_env(Some("false")).unwrap());
+
+        // Still explicitly opt-in-able, so the A/B and the perf work stay available.
+        assert!(super::sharded_create_enabled_from_env(Some("1")).unwrap());
+        assert!(super::sharded_create_enabled_from_env(Some("true")).unwrap());
 
         let error = super::sharded_create_enabled_from_env(Some("enabled")).unwrap_err();
         assert!(error.to_string().contains("FFS_BHH0I_SHARDED"));
