@@ -54589,6 +54589,152 @@ mod tests {
         Some((fs, snapshot, tmp))
     }
 
+    /// bd-y2t0r: the sharded delete routing must hold up under CONCURRENT
+    /// create/delete from several threads, which is the workload the sharded
+    /// allocator exists for.
+    ///
+    /// The 40-second mounted repro that validated the fix is SINGLE-THREADED, and
+    /// "passes a single-threaded storm" is not "correct under the 8-thread
+    /// parallel-metadata workload it was built for". `PerGroupAlloc::free_inode`
+    /// locks only the group owning the inode — the intended design — so threads
+    /// deleting inodes in different groups should not serialise and must not
+    /// corrupt each other's counters.
+    ///
+    /// Each worker uses a PRIVATE subdirectory, mirroring the comparator's
+    /// parallel-metadata-write shape, so the directory itself is not the
+    /// contention point and the allocator is.
+    ///
+    /// Gated on the feature because the routing it exercises does not exist
+    /// without it; the runtime toggle is set explicitly since it now defaults off
+    /// (bd-pbyu0).
+    /// ⛔ **KNOWN FAILING — `#[ignore]`d deliberately, tracked on `bd-y2t0r`.**
+    ///
+    /// The sharded delete routing is correct SINGLE-THREADED (both mounted repro
+    /// variants are e2fsck-clean) but conflicts under concurrency:
+    ///
+    ///     worker 4 unlink f00-050: first-committer-wins conflict on block 38:
+    ///     snapshot=CommitSeq(3908), observed=CommitSeq(3909)
+    ///
+    /// and the `..._under_single_lock_...` control beside it PASSES the identical
+    /// workload, so this is attributable to the sharded path rather than to
+    /// concurrent removal being unsupported generally.
+    ///
+    /// Mechanism, and it is a specific gap rather than a mystery: concurrent
+    /// ALLOCATION merges because the alloc path stages its bitmap update under
+    /// `MergeProof::BitmapOr` (`rmw_block_bitmap_or`, ffs-alloc:2710), so two
+    /// threads setting different bits in one bitmap block combine instead of
+    /// conflicting. The FREE path has no counterpart — it writes the whole bitmap
+    /// block with `write_block`, so two threads CLEARING different bits in the
+    /// same block first-committer-wins against each other. Finishing this needs a
+    /// clear-bits merge proof (the AND-NOT dual of `BitmapOr`) wired into the
+    /// inode-free path.
+    ///
+    /// Note the shipping default is OFF (`bd-pbyu0`), so this affects only an
+    /// explicit `FFS_BHH0I_SHARDED=1` opt-in. Un-`ignore` this test as part of the
+    /// fix — it is the acceptance gate for re-enabling the default.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    #[ignore = "bd-y2t0r: sharded free path lacks a clear-bits merge proof; conflicts under concurrency"]
+    fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
+        concurrent_create_delete_counter_check_bd_y2t0r(true);
+    }
+
+    /// bd-y2t0r CONTROL: the identical concurrent workload on the SINGLE-LOCK
+    /// path.
+    ///
+    /// Without this the sharded variant's result is unattributable — a failure
+    /// could equally mean "the sharded delete routing breaks under concurrency"
+    /// or "concurrent removal was never supported on this path at all". Running
+    /// both distinguishes those, and neither answer is guessable from the code.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn concurrent_create_delete_under_single_lock_keeps_counters_exact_bd_y2t0r() {
+        concurrent_create_delete_counter_check_bd_y2t0r(false);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn concurrent_create_delete_counter_check_bd_y2t0r(sharded: bool) {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(256) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        assert!(
+            !fs.set_bhh0i_sharded_ops(sharded),
+            "the sharded toggle must default OFF (bd-pbyu0); this test sets it explicitly"
+        );
+
+        const THREADS: usize = 8;
+        const FILES: usize = 64;
+        const CYCLES: usize = 6;
+
+        // Private per-worker directories, created before the threads start.
+        let dirs: Vec<InodeNumber> = (0..THREADS)
+            .map(|worker| {
+                fs.mkdir(&cx, root, OsStr::new(&format!("w{worker}")), 0o755, 0, 0)
+                    .unwrap_or_else(|error| panic!("mkdir w{worker}: {error}"))
+                    .ino
+            })
+            .collect();
+
+        let fs = std::sync::Arc::new(fs);
+        std::thread::scope(|scope| {
+            for (worker, dir) in dirs.iter().enumerate() {
+                let fs = std::sync::Arc::clone(&fs);
+                let dir = *dir;
+                scope.spawn(move || {
+                    let cx = Cx::for_testing();
+                    // `as_ref()` is load-bearing: `Arc<OpenFs>` implements `FsOps`
+                    // itself, so a bare `fs.create(..)` binds to the TRAIT method
+                    // (which takes a `RequestScope`) rather than the inherent
+                    // scope-managing one this test means to exercise.
+                    let fs: &OpenFs = fs.as_ref();
+                    for cycle in 0..CYCLES {
+                        for index in 0..FILES {
+                            let name = format!("f{cycle:02}-{index:03}");
+                            fs.create(&cx, dir, OsStr::new(&name), 0o644, 0, 0)
+                                .unwrap_or_else(|error| {
+                                    panic!("worker {worker} create {name}: {error}")
+                                });
+                        }
+                        for index in 0..FILES {
+                            let name = format!("f{cycle:02}-{index:03}");
+                            fs.unlink(&cx, dir, OsStr::new(&name))
+                                .unwrap_or_else(|error| {
+                                    panic!("worker {worker} unlink {name}: {error}")
+                                });
+                        }
+                    }
+                });
+            }
+        });
+
+        fs.flush_mvcc_to_device(&cx).expect("flush to device");
+        let image = tmp.path().join("sharded-concurrent.ext4");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(
+            !output.contains("Free inodes count wrong"),
+            "sharded free-inode counters drifted under {THREADS} concurrent workers x \
+             {CYCLES} cycles x {FILES} files (bd-y2t0r). The single-threaded repro passes, \
+             so a failure here is a CONCURRENCY defect in the delete routing, not the \
+             routing itself:\n{output}"
+        );
+        assert!(
+            !output.contains("Free blocks count wrong"),
+            "sharded block counters drifted under concurrency (bd-y2t0r):\n{output}"
+        );
+        assert!(
+            clean,
+            "e2fsck must accept the image after concurrent sharded create/delete \
+             (bd-y2t0r):\n{output}"
+        );
+    }
+
     /// ⚠ **This test PASSES and `bd-pbyu0` is NOT fixed.** It is negative evidence,
     /// not a reproduction — do not read a green run here as the bug being closed.
     ///
