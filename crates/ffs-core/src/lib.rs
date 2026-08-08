@@ -8109,6 +8109,58 @@ impl OpenFs {
             0
         };
 
+        // ── Pin the live ROOT_TREE and EXTENT_TREE blocks (bd-mqb9t) ────────
+        //
+        // Every other tree we rewrite wholesale (fs, csum) has EXTENT_ITEMs on
+        // disk, so `remove_metadata_items_owned_by_roots` can pin its blocks at
+        // the top of each commit. These two cannot: their nodes are allocated
+        // with `skip_extent_item` (bd-4nz82), so an image FrankenFS wrote carries
+        // nothing in the extent tree describing them. Without a pin here, the
+        // first commit after mount sees their addresses as free, allocates fs-tree
+        // nodes over the root tree the superblock is still pointing at, and a
+        // commit that then fails leaves an image that will not mount.
+        //
+        // Walked rather than derived from the ROOT_ITEM bytenr because a tree is
+        // more than its root node. Best-effort: a walk failure here must not
+        // block the mount, and it only costs us the protection we had before.
+        let mut pinned_live_nodes = 0usize;
+        {
+            let mut pin_tree_nodes = |root_logical: u64, tree: &str| {
+                if root_logical == 0 {
+                    return;
+                }
+                match self.btrfs_tree_node_addresses(cx, root_logical) {
+                    Ok(addrs) => {
+                        for addr in addrs {
+                            extent_alloc.pin_live_tree_block(addr, u64::from(nodesize));
+                            pinned_live_nodes += 1;
+                        }
+                    }
+                    Err(e) => warn!(
+                        target: "ffs::write",
+                        error = %e,
+                        tree,
+                        root_logical,
+                        "could not walk tree to pin its live blocks; \
+                         a failed commit could overwrite them"
+                    ),
+                }
+            };
+            pin_tree_nodes(sb.root, "root_tree");
+            if let Some(entry) = root_items.iter().find(|e| {
+                e.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
+                    && e.key.item_type == BTRFS_ITEM_ROOT_ITEM
+            }) && let Ok(root_item) = parse_root_item(&entry.data)
+            {
+                pin_tree_nodes(root_item.bytenr, "extent_tree");
+            }
+        }
+        debug!(
+            target: "ffs::write",
+            pinned_live_nodes,
+            "pinned live root/extent tree blocks for commit atomicity"
+        );
+
         // ── Reconcile block-group accounting with the loaded extent tree ─────
         //
         // bd-ftev0: the block groups above are seeded from the chunk map with a
@@ -8523,6 +8575,30 @@ impl OpenFs {
 
         walk_tree_parallel_with_nodes(&provider, root_logical, nodesize)
             .map_err(|e| parse_to_ffs_error(&e))
+    }
+
+    /// Logical addresses of every node in the tree rooted at `root_logical`.
+    ///
+    /// The tree walker asks its node provider for each node it descends into, so
+    /// recording the provider's argument enumerates the tree's blocks. Used to
+    /// pin the live root/extent trees, whose nodes carry no EXTENT_ITEM and are
+    /// therefore invisible to the allocator (bd-mqb9t). Serial rather than
+    /// parallel: it runs twice at mount and needs a plain `&mut` accumulator.
+    fn btrfs_tree_node_addresses(&self, cx: &Cx, root_logical: u64) -> Result<Vec<u64>, FfsError> {
+        let nodesize = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?
+            .nodesize;
+        let mut seen = Vec::new();
+        {
+            let mut provider = |logical: u64| {
+                seen.push(logical);
+                self.btrfs_read_parsed_node(cx, logical)
+            };
+            ffs_btrfs::walk_tree_with_nodes(&mut provider, root_logical, nodesize)
+                .map_err(|e| parse_to_ffs_error(&e))?;
+        }
+        Ok(seen)
     }
 
     /// Read a raw `ns`-byte btrfs tree node at physical address `phys`, serving

@@ -6469,6 +6469,19 @@ impl BtrfsExtentAllocator {
         released
     }
 
+    /// Pin a block belonging to a tree the CURRENTLY COMMITTED superblock points
+    /// at, so this transaction cannot allocate over it (bd-mqb9t).
+    ///
+    /// For trees whose nodes carry no `EXTENT_ITEM` — the root tree and the
+    /// extent tree, which allocate with `skip_extent_item` — nothing else in the
+    /// allocator knows the block is in use, so a mount must declare them. The
+    /// pin is released by the first `release_pinned_after_superblock_commit`,
+    /// which is exactly when the superblock stops pointing at them.
+    pub fn pin_live_tree_block(&mut self, bytenr: u64, num_bytes: u64) {
+        self.pin_extent(bytenr, num_bytes, false);
+        self.invalidate_tail_cursors();
+    }
+
     /// Number of extents currently pinned. Test/diagnostic accessor.
     #[must_use]
     pub fn pinned_extent_count(&self) -> usize {
