@@ -26,9 +26,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asupersync::Cx;
-use ffs_block::{ByteDevice, ByteOffset, FileByteDevice};
+use ffs_block::{ByteDevice, FileByteDevice};
 use ffs_core::{FsOps, OpenFs, OpenOptions};
-use ffs_types::InodeNumber;
+use ffs_types::{ByteOffset, InodeNumber};
 
 /// btrfs's first free objectid — the fs-tree root directory inode.
 const BTRFS_ROOT_DIR: InodeNumber = InodeNumber(256);
