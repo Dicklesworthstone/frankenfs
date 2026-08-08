@@ -1063,6 +1063,36 @@ pub trait BlockDevice: Send + Sync {
         self.write_block(cx, block, &data)
     }
 
+    /// Read-modify-write one block under a bit-level DELTA merge proof, for a
+    /// bitmap block whose concurrent writers both allocate and free.
+    ///
+    /// The general form of [`Self::rmw_block_bitmap_or`]: it drops that method's
+    /// set-only requirement, so `patch` may set bits, clear bits, or both. Two
+    /// concurrent writers MERGE (`latest ^ staged ^ base`) as long as they
+    /// changed disjoint BITS; changing the same bit still first-committer-wins,
+    /// because relative to one shared base that can only be a double-allocation
+    /// or a double-free.
+    ///
+    /// Use this — not `rmw_block_bitmap_or` — for any bitmap whose alloc and free
+    /// paths can run concurrently against one block. The ext4 INODE bitmap is
+    /// exactly that under the sharded allocator (`create` sets a bit while a
+    /// concurrent `unlink` clears another in the same block), and an OR proof
+    /// cannot express it in either direction (bd-y2t0r).
+    ///
+    /// An MVCC-backed device reads the base AT ITS TRANSACTION SNAPSHOT and stages
+    /// the delta proof; the default performs a plain read-modify-write and is
+    /// byte-identical for non-MVCC / externally-serialized devices.
+    fn rmw_block_bitmap_delta(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let mut data = self.read_block(cx, block)?.into_inner();
+        patch(&mut data)?;
+        self.write_block(cx, block, &data)
+    }
+
     /// The merge common-ancestor for `block` at `snapshot`: the block content as
     /// of `snapshot`, plus the bytes to record as `staged_base` for a
     /// proof-carrying stage into an EXTERNAL, already-begun transaction.
@@ -1167,6 +1197,51 @@ impl<D: BlockDevice + ?Sized> BlockDevice for Arc<D> {
 
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
         (**self).write_block(cx, block, data)
+    }
+
+    // The four merge-proof-carrying methods below MUST be forwarded explicitly.
+    // Each has a default body that performs a plain read-modify-write, so an
+    // `Arc<D>` that inherited those defaults would silently DOWNGRADE every proof
+    // to `MergeProof::Unsafe` — the wrapped device's merge implementation is never
+    // reached, no error is raised, and the only symptom is first-committer-wins
+    // conflicts under concurrency that the proof was added to prevent. That is
+    // precisely the failure bd-y2t0r spent a cycle diagnosing, so forwarding is
+    // load-bearing rather than tidiness.
+    fn rmw_block(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        disjoint_ranges: &[(usize, usize)],
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        (**self).rmw_block(cx, block, disjoint_ranges, patch)
+    }
+
+    fn rmw_block_bitmap_or(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        (**self).rmw_block_bitmap_or(cx, block, patch)
+    }
+
+    fn rmw_block_bitmap_delta(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        (**self).rmw_block_bitmap_delta(cx, block, patch)
+    }
+
+    fn read_merge_ancestor_at_snapshot(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Result<(BlockBuf, Option<Vec<u8>>)> {
+        (**self).read_merge_ancestor_at_snapshot(cx, block, snapshot)
     }
 
     fn supports_contiguous_writes(&self) -> bool {

@@ -1000,6 +1000,33 @@ pub fn release_inode_storage(
     now_secs: u64,
     pctx: &ffs_alloc::PersistCtx,
 ) -> Result<bool> {
+    let is_dir =
+        release_inode_storage_inner(cx, dev, geo, groups, ino, inode, now_secs, pctx)?;
+
+    // Write the zeroed-out inode to disk.
+    write_inode(cx, dev, geo, groups, ino, inode, csum_seed)?;
+
+    // The inode number itself is NOT freed here — that is the caller's step, so a
+    // sharded caller can route it through the per-group records (bd-y2t0r).
+    Ok(is_dir)
+}
+
+/// Everything `release_inode_storage` does EXCEPT the final inode write-back:
+/// frees data blocks / indirect metadata / any external xattr block and zeroes
+/// the in-memory inode. Shared verbatim by `release_inode_storage` and
+/// [`release_inode_storage_deferring_writeback`] so the two can never diverge in
+/// what they release.
+#[expect(clippy::too_many_arguments)]
+fn release_inode_storage_inner(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    ino: InodeNumber,
+    inode: &mut Ext4Inode,
+    now_secs: u64,
+    pctx: &ffs_alloc::PersistCtx,
+) -> Result<bool> {
     cx_checkpoint(cx)?;
 
     // Capture the directory bit before the inode fields are zeroed below: ext4
@@ -1073,12 +1100,91 @@ pub fn release_inode_storage(
     inode.size = 0;
     inode.blocks = 0;
 
-    // Write the zeroed-out inode to disk.
-    write_inode(cx, dev, geo, groups, ino, inode, csum_seed)?;
-
-    // The inode number itself is NOT freed here — that is the caller's step, so a
-    // sharded caller can route it through the per-group records (bd-y2t0r).
     Ok(is_dir)
+}
+
+/// [`release_inode_storage`] minus its final inode write-back.
+///
+/// The two halves are split for the same reason `delete_inode` was split from
+/// `release_inode_storage` (bd-y2t0r): the caller must be able to choose HOW the
+/// inode's slot reaches the device. `write_inode` reads the whole inode-table
+/// block and writes it back wholesale, which stages `MergeProof::Unsafe` — so two
+/// threads deleting inodes that share an inode-table block first-committer-wins
+/// against each other even though their 256-byte slots are disjoint. That is
+/// measured, not hypothetical: it is what blocked the sharded cutover's
+/// concurrent create/delete gate, on blocks 37 and 2085 (the inode TABLES of
+/// groups 0 and 1), while the inode bitmaps never conflicted at all.
+///
+/// The sharded delete path therefore calls this and then stages the slot itself
+/// under a slot-scoped merge proof, exactly as the sharded CREATE path already
+/// does. `inode` is left holding the zeroed post-delete state the caller must
+/// write; nothing else is deferred.
+///
+/// Returns whether the inode was a directory, like `release_inode_storage`.
+#[expect(clippy::too_many_arguments)]
+pub fn release_inode_storage_deferring_writeback(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    ino: InodeNumber,
+    inode: &mut Ext4Inode,
+    now_secs: u64,
+    pctx: &ffs_alloc::PersistCtx,
+) -> Result<bool> {
+    release_inode_storage_inner(cx, dev, geo, groups, ino, inode, now_secs, pctx)
+}
+
+/// Write an inode to a known location under a SLOT-SCOPED merge proof.
+///
+/// Byte-for-byte the same block content as [`write_inode_at`]; the difference is
+/// how the write is staged. `write_inode_at` reads the block and writes it back
+/// whole, which an MVCC device can only record as an opaque whole-block write
+/// (`MergeProof::Unsafe`). This routes through [`BlockDevice::rmw_block`] with
+/// the inode's own `(byte_offset, inode_size)` as the declared range, so two
+/// threads writing DIFFERENT inode slots of one table block merge instead of
+/// first-committer-wins conflicting. The declared range is exactly the bytes
+/// patched, so the proof is true by construction.
+///
+/// On a non-MVCC or externally-serialized device the default `rmw_block` is a
+/// plain read-modify-write, making this identical to `write_inode_at`.
+pub fn write_inode_at_slot_scoped(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    loc: InodeLocation,
+    inode_size: usize,
+    ino: InodeNumber,
+    inode: &Ext4Inode,
+    csum_seed: u32,
+) -> Result<()> {
+    cx_checkpoint(cx)?;
+
+    let mut stack_buf = [0u8; 256];
+    let mut heap_buf: Vec<u8>;
+    let raw: &mut [u8] = if inode_size <= stack_buf.len() {
+        &mut stack_buf[..inode_size]
+    } else {
+        heap_buf = vec![0u8; inode_size];
+        &mut heap_buf
+    };
+    serialize_inode_with_checksum(inode, inode_size, ino, csum_seed, raw);
+    let slot: &[u8] = raw;
+
+    dev.rmw_block(
+        cx,
+        loc.block,
+        &[(loc.byte_offset, inode_size)],
+        &mut |block_data| {
+            if loc.byte_offset + inode_size > block_data.len() {
+                return Err(FfsError::Corruption {
+                    block: loc.block.0,
+                    detail: "inode extends beyond block boundary".into(),
+                });
+            }
+            block_data[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(slot);
+            Ok(())
+        },
+    )
 }
 
 // ── Timestamps ──────────────────────────────────────────────────────────────

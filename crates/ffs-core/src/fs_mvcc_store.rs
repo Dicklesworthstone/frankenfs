@@ -607,6 +607,42 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         Ok(())
     }
 
+    fn rmw_block_bitmap_delta(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
+    ) -> FfsResult<()> {
+        if self.reads_base_directly() {
+            return Err(FfsError::UnsupportedFeature(
+                "unregistered MVCC block device is read-only".to_owned(),
+            ));
+        }
+        // Identical begin-first / read-base-at-snapshot contract as
+        // `rmw_block_bitmap_or`; only the staged proof differs. `patch` may set
+        // AND clear bits, so two threads whose create and unlink land in the same
+        // inode-bitmap block merge on disjoint bits instead of first-committer-wins
+        // conflicting (bd-y2t0r). Recording the base when no version exists at the
+        // snapshot is what lets the merge see the true common ancestor.
+        let mut txn = self.store.begin();
+        let snapshot = txn.snapshot();
+        let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
+            Some(buf) => (buf.as_slice().to_vec(), None),
+            None => {
+                let device_base = self.base.read_block(cx, block)?.into_inner();
+                (device_base.clone(), Some(device_base))
+            }
+        };
+        patch(&mut data)?;
+        txn.stage_write_with_proof_and_base(block, data, MergeProof::BitmapDelta, base);
+        let commit_seq = self
+            .store
+            .commit(txn)
+            .map_err(|error| FfsError::Format(error.to_string()))?;
+        self.store.prune_after_commit_if_due(commit_seq);
+        Ok(())
+    }
+
     fn read_merge_ancestor_at_snapshot(
         &self,
         cx: &Cx,

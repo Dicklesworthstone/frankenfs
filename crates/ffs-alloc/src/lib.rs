@@ -3537,6 +3537,29 @@ pub fn try_alloc_inode_in_group_persist_core(
     } else {
         BitmapOverride::full(&bitmap)
     };
+    // Route the inode-bitmap write through the bit-level DELTA merge RMW so this
+    // allocation merges with a CONCURRENT FREE of a different inode in the same
+    // bitmap block instead of first-committer-wins conflicting (bd-y2t0r). The
+    // block-bitmap path above uses the set-only `BitmapOr`; the inode bitmap
+    // cannot, because `create` and `unlink` run against it concurrently and an OR
+    // proof rejects the free's cleared bit outright. The closure re-applies ONLY
+    // this op's single bit onto the base the device reads at its OWN txn snapshot
+    // — an RMW-at-snapshot that also closes the stale-read clobber window the
+    // separate read_block(above)/write_block had. Scoped to the steady-state case
+    // where that one bit IS the whole change (the group-0 reserved prefix and the
+    // first-write padding fill keep the plain write, exactly as the block path
+    // scopes itself to an empty rollback). Default (non-sharded) builds are
+    // byte-identical.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    if rollback_clear_bits.len() == 1 && rollback_clear_bits[0] == idx {
+        dev.rmw_block_bitmap_delta(cx, bitmap_block, &mut |base_bitmap| {
+            bitmap_set(base_bitmap, idx);
+            Ok(())
+        })?;
+    } else {
+        dev.write_block(cx, bitmap_block, &bitmap)?;
+    }
+    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
     dev.write_block(cx, bitmap_block, &bitmap)?;
     let previous_used_dirs = stats.used_dirs;
     stats.advance_inode_search_start(idx, inodes_in_group);
@@ -3871,6 +3894,26 @@ pub fn free_inode_in_group(
     bitmap_clear(&mut bitmap, bit_idx);
     let inode_bitmap_override =
         BitmapOverride::from_flipped_bit_range(&bitmap, bit_idx, 1, pctx.inodes_per_group);
+    // The free counterpart to the allocation write in
+    // `try_alloc_inode_in_group_persist_core`, and the direction that had NO merge
+    // proof at all before bd-y2t0r: a plain `write_block` stages
+    // `MergeProof::Unsafe`, so two threads CLEARING different bits of one inode
+    // bitmap block first-committer-wins against each other, as does a free racing
+    // a concurrent create. `BitmapDelta` merges all three of those on disjoint
+    // bits while still rejecting a genuine double-free of the same bit. The
+    // validation above proved this bit is currently set, so the closure's single
+    // `bitmap_clear` is the complete delta.
+    //
+    // Only the per-group (sharded) free is routed. The single-lock
+    // `free_inode_persist` keeps its plain write: the alloc `RwLock` serialises
+    // that path, so it has no concurrent same-block writer to merge with, and
+    // default builds stay byte-identical.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    dev.rmw_block_bitmap_delta(cx, bitmap_block, &mut |base_bitmap| {
+        bitmap_clear(base_bitmap, bit_idx);
+        Ok(())
+    })?;
+    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
     dev.write_block(cx, bitmap_block, &bitmap)?;
     let previous_used_dirs = stats.used_dirs;
     stats.rewind_inode_search_start_on_free(bit_idx);

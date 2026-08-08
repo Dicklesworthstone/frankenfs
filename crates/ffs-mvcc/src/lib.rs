@@ -137,6 +137,13 @@ pub enum MergeProofMechanism {
     /// staged`, even when their bits share a byte (a byte-range overlay cannot
     /// express this). Valid only when neither writer cleared a base bit.
     BitmapOr,
+    /// Bit-level merge of an allocation-bitmap block whose concurrent writers
+    /// both SET and CLEAR bits.
+    ///
+    /// Generalizes [`Self::BitmapOr`] by dropping its set-only (monotone)
+    /// precondition: the merge is `base ^ latest_delta ^ staged_delta`, valid
+    /// whenever the two writers changed disjoint BIT SETS in either direction.
+    BitmapDelta,
 }
 
 /// Evidence label used when a same-block FCW conflict might be mergeable.
@@ -178,6 +185,31 @@ pub enum MergeProof {
     /// writers setting the same new bit is a real double-allocation that must
     /// abort, not merge). Carries no ranges: the algorithm is whole-block.
     BitmapOr,
+    /// Bit-level merge for a bitmap block whose concurrent writers both ALLOCATE
+    /// and FREE — the general form of [`Self::BitmapOr`].
+    ///
+    /// `BitmapOr` requires both writers to be set-only, which holds for a bitmap
+    /// touched exclusively by allocation. The ext4 INODE bitmap is not such a
+    /// block: under the sharded allocator, one thread's `create` sets a bit in it
+    /// while another thread's `unlink` clears a different bit in the same block,
+    /// and adjacent inodes share a byte. Neither an OR proof (the free cleared a
+    /// base bit) nor its AND-NOT dual (the alloc set one) can express that merge,
+    /// so both fall back to first-committer-wins — which is the whole defect
+    /// (bd-y2t0r).
+    ///
+    /// This proof validates the one property that actually matters and is
+    /// direction-agnostic: the two writers changed DISJOINT SETS OF BITS. Under
+    /// that precondition each writer's delta can be replayed onto the other's
+    /// result in either order, so the merge is `base ^ latest_delta ^
+    /// staged_delta`, i.e. `latest ^ staged ^ base`. Overlap is rejected, and
+    /// every overlap is a genuine bug rather than a merge to be recovered: two
+    /// writers that both changed bit `i` relative to one shared `base` necessarily
+    /// made the SAME change there (both landed on `!base_i`), so an overlap is
+    /// either a double-allocation or a double-free. Both must abort so the loser
+    /// retries.
+    ///
+    /// Carries no ranges: the algorithm is whole-block.
+    BitmapDelta,
 }
 
 impl MergeProof {
@@ -226,6 +258,7 @@ impl MergeProof {
             | Self::NonOverlappingExtents { .. }
             | Self::TimestampOnlyInode { .. } => MergeProofMechanism::RangeOverlay,
             Self::BitmapOr => MergeProofMechanism::BitmapOr,
+            Self::BitmapDelta => MergeProofMechanism::BitmapDelta,
         }
     }
 
@@ -250,6 +283,7 @@ impl MergeProof {
                 merge_non_overlapping_ranges_valid(touched_ranges, base, latest, staged, self)
             }
             Self::BitmapOr => bitmap_or_merge_valid(base, latest, staged),
+            Self::BitmapDelta => bitmap_delta_merge_valid(base, latest, staged),
         }
     }
 
@@ -279,6 +313,21 @@ impl MergeProof {
                 let mut merged = latest.to_vec();
                 for (m, &s) in merged.iter_mut().zip(staged.iter()) {
                     *m |= s;
+                }
+                Some(merged)
+            }
+            Self::BitmapDelta => {
+                if !bitmap_delta_merge_valid(base, latest, staged) {
+                    return None;
+                }
+                // Validity guarantees equal lengths and that the two writers'
+                // changed-bit sets are disjoint, so replaying the staged delta
+                // (`base ^ staged`) onto `latest` cannot disturb a bit `latest`
+                // itself changed: `latest ^ base ^ staged` == `base` with BOTH
+                // deltas applied, independent of order.
+                let mut merged = latest.to_vec();
+                for ((m, &b), &s) in merged.iter_mut().zip(base.iter()).zip(staged.iter()) {
+                    *m ^= b ^ s;
                 }
                 Some(merged)
             }
@@ -325,7 +374,59 @@ fn merge_proof_variant_name(proof: &MergeProof) -> &'static str {
         MergeProof::NonOverlappingExtents { .. } => "NonOverlappingExtents",
         MergeProof::TimestampOnlyInode { .. } => "TimestampOnlyInode",
         MergeProof::BitmapOr => "BitmapOr",
+        MergeProof::BitmapDelta => "BitmapDelta",
     }
+}
+
+/// Validate a bit-level delta merge for a bitmap block whose writers both set
+/// and clear bits, WITHOUT building the merged block.
+///
+/// Returns `true` iff [`MergeProof::merge_bytes`] would produce `latest ^ staged
+/// ^ base`. Shared by `merge_valid` (preflight) and `merge_bytes` (install) so
+/// the yes/no decision can never diverge from the materialized output.
+///
+/// Two preconditions, both bit-level and hence uncatchable by a byte-range
+/// proof:
+///
+/// - **Equal length** across base/latest/staged — a bitmap block is fixed-size.
+/// - **Disjoint changed bits**: `(latest ^ base) & (staged ^ base) == 0`. This is
+///   direction-agnostic, which is exactly what [`bitmap_or_merge_valid`] is not:
+///   a bit counts as changed whether it was set or cleared, so an allocation in
+///   one writer and a free in the other merge as long as they touched different
+///   bits.
+///
+/// Unlike `BitmapOr` there is deliberately NO monotonicity check. That check
+/// gives `BitmapOr` a useful secondary property — it fails loudly if the proof is
+/// ever staged on a free — which this proof cannot have, because admitting frees
+/// is its entire purpose. The safety argument therefore rests solely on
+/// disjointness, and every rejected overlap is a real defect rather than a merge
+/// worth recovering. There are exactly two such defects: two writers that both
+/// changed bit `i` relative to one shared `base` necessarily agree on the new
+/// value there (both `!base_i`), so an overlap is a double-allocation or a
+/// double-free, never an allocation racing a free of the same bit.
+fn bitmap_delta_merge_valid(base: &[u8], latest: &[u8], staged: &[u8]) -> bool {
+    if latest.len() != base.len() || staged.len() != base.len() {
+        warn!(
+            target: "ffs::mvcc::merge",
+            proof = "BitmapDelta",
+            base_len = base.len(),
+            latest_len = latest.len(),
+            staged_len = staged.len(),
+            "merge_proof_rejected: buffer length mismatch"
+        );
+        return false;
+    }
+    for ((&b, &l), &s) in base.iter().zip(latest.iter()).zip(staged.iter()) {
+        if ((l ^ b) & (s ^ b)) != 0 {
+            warn!(
+                target: "ffs::mvcc::merge",
+                proof = "BitmapDelta",
+                "merge_proof_rejected: writers changed the same bit (double-allocation or double-free)"
+            );
+            return false;
+        }
+    }
+    true
 }
 
 /// Validate a bit-level OR merge for a monotone (set-only) allocation-bitmap
@@ -3513,6 +3614,7 @@ mod tests {
                 MergeProofMechanism::RangeOverlay,
             ),
             (MergeProof::BitmapOr, MergeProofMechanism::BitmapOr),
+            (MergeProof::BitmapDelta, MergeProofMechanism::BitmapDelta),
         ];
 
         for (proof, mechanism) in cases {
@@ -3569,6 +3671,106 @@ mod tests {
                 .merge_bytes(&base, &latest, &staged)
                 .is_none(),
             "two writers setting the same new bit is a double-allocation; must reject"
+        );
+    }
+
+    #[test]
+    fn bitmap_delta_merges_a_concurrent_alloc_and_free_sharing_a_byte() {
+        // THE bd-y2t0r CASE, and the one neither BitmapOr nor an AND-NOT dual can
+        // express: one thread's `create` SET bit 2 while another thread's `unlink`
+        // CLEARED bit 0 of the same inode-bitmap byte. Both must survive.
+        let base = vec![0b0000_0011_u8, 0xFF];
+        let latest = vec![0b0000_0111_u8, 0xFF]; // create: + bit 2
+        let staged = vec![0b0000_0010_u8, 0xFF]; // unlink: - bit 0
+        let merged = MergeProof::BitmapDelta
+            .merge_bytes(&base, &latest, &staged)
+            .expect("an alloc and a free of DIFFERENT bits must merge");
+        assert_eq!(merged, vec![0b0000_0110_u8, 0xFF]);
+
+        // And the merge is order-independent: swapping which writer is `latest`
+        // must yield the identical block, or the result would depend on commit
+        // interleaving.
+        let swapped = MergeProof::BitmapDelta
+            .merge_bytes(&base, &staged, &latest)
+            .expect("merge must be symmetric in latest/staged");
+        assert_eq!(swapped, merged);
+    }
+
+    #[test]
+    fn bitmap_delta_merges_two_concurrent_frees_sharing_a_byte() {
+        // The AND-NOT direction: two threads unlink different inodes whose bits
+        // share a byte. Before bd-y2t0r this was a plain `write_block`, so the
+        // second committer lost its free and leaked an inode (bd-pbyu0).
+        let base = vec![0b0000_1111_u8];
+        let latest = vec![0b0000_1110_u8]; // - bit 0
+        let staged = vec![0b0000_1101_u8]; // - bit 1
+        let merged = MergeProof::BitmapDelta
+            .merge_bytes(&base, &latest, &staged)
+            .expect("two frees of different bits must merge");
+        assert_eq!(merged, vec![0b0000_1100_u8]);
+    }
+
+    #[test]
+    fn bitmap_delta_subsumes_the_bitmap_or_allocation_case() {
+        // Where BitmapOr is valid, BitmapDelta must agree with it exactly — the
+        // delta proof is a generalization, not a different answer.
+        let base = vec![0b0000_0001_u8, 0x00];
+        let latest = vec![0b0000_0011_u8, 0x00];
+        let staged = vec![0b0000_0101_u8, 0x00];
+        assert_eq!(
+            MergeProof::BitmapDelta.merge_bytes(&base, &latest, &staged),
+            MergeProof::BitmapOr.merge_bytes(&base, &latest, &staged),
+        );
+    }
+
+    #[test]
+    fn bitmap_delta_rejects_a_double_allocation_and_a_double_free() {
+        // Both overlap cases are genuine defects that MUST abort so the loser
+        // retries; neither is a merge to be recovered.
+        //
+        // Note there are exactly TWO of them, not three: relative to one shared
+        // `base`, two writers that both differ from it at bit i necessarily agree
+        // with each other there (both are `!base_i`), so an alloc CANNOT overlap a
+        // free on the same bit. A create racing the unlink of the very same inode
+        // is serialized by the base, not by this proof.
+        //
+        // Double-allocation: both writers newly set bit 3.
+        assert!(
+            MergeProof::BitmapDelta
+                .merge_bytes(&[0b0000_0001_u8], &[0b0000_1001_u8], &[0b0000_1001_u8])
+                .is_none(),
+            "two writers setting the same new bit is a double-allocation"
+        );
+        // Double-free: both writers clear bit 1.
+        assert!(
+            MergeProof::BitmapDelta
+                .merge_bytes(&[0b0000_0011_u8], &[0b0000_0001_u8], &[0b0000_0001_u8])
+                .is_none(),
+            "two writers clearing the same bit is a double-free"
+        );
+    }
+
+    #[test]
+    fn bitmap_delta_admits_a_writer_that_changed_nothing() {
+        // An empty delta touches no bit, so it can never overlap. This matters
+        // because a conflicting block is not always a conflicting WRITE: a txn may
+        // restage a block it did not actually modify, and that must not abort a
+        // concurrent free.
+        let base = vec![0b0000_0011_u8];
+        let unchanged = base.clone();
+        let freeing = vec![0b0000_0001_u8]; // - bit 1
+        let merged = MergeProof::BitmapDelta
+            .merge_bytes(&base, &unchanged, &freeing)
+            .expect("a no-op writer has an empty delta and must never block a merge");
+        assert_eq!(merged, freeing);
+    }
+
+    #[test]
+    fn bitmap_delta_rejects_length_mismatch() {
+        assert!(
+            MergeProof::BitmapDelta
+                .merge_bytes(&[0, 0, 0, 0], &[0, 1], &[0, 0, 0, 2])
+                .is_none()
         );
     }
 
@@ -8797,6 +8999,74 @@ mod tests {
             let mut dbl = zbase.clone();
             dbl[idx] = 0b0000_0010;
             prop_assert!(proof.merge_bytes(&zbase, &dbl, &dbl).is_none());
+        }
+
+        /// Algebra of the [`MergeProof::BitmapDelta`] merge: for any two writers
+        /// with disjoint CHANGED bits — in either direction, set or cleared — the
+        /// merge applies both deltas exactly, is independent of which writer
+        /// committed first, and changes no bit neither writer touched.
+        ///
+        /// The masks are arbitrary, so this covers the mixed alloc/free case that
+        /// `BitmapOr` cannot express and that bd-y2t0r's concurrent create/delete
+        /// workload actually produces.
+        #[test]
+        fn proptest_bitmap_delta_merges_disjoint_changed_bits(
+            base in prop::collection::vec(any::<u8>(), 8),
+            a_mask in prop::collection::vec(any::<u8>(), 8),
+            b_mask in prop::collection::vec(any::<u8>(), 8),
+        ) {
+            // latest flips the A bits; staged flips the B bits minus A, so the two
+            // changed-bit sets are disjoint by construction. XOR flips in BOTH
+            // directions: wherever base is 1 this clears (a free), wherever base
+            // is 0 it sets (an allocation).
+            let a: Vec<u8> = a_mask.clone();
+            let b: Vec<u8> = b_mask.iter().zip(&a).map(|(&x, &y)| x & !y).collect();
+            let latest: Vec<u8> = base.iter().zip(&a).map(|(&x, &m)| x ^ m).collect();
+            let staged: Vec<u8> = base.iter().zip(&b).map(|(&x, &m)| x ^ m).collect();
+
+            let proof = MergeProof::BitmapDelta;
+            prop_assert!(proof.merge_valid(&base, &latest, &staged));
+            let merged = proof
+                .merge_bytes(&base, &latest, &staged)
+                .expect("disjoint changed bits must delta-merge");
+            for i in 0..base.len() {
+                // Both deltas applied, exactly.
+                prop_assert_eq!(merged[i], base[i] ^ a[i] ^ b[i]);
+                // Each writer's own changed bits survive with ITS value.
+                prop_assert_eq!(merged[i] & a[i], latest[i] & a[i]);
+                prop_assert_eq!(merged[i] & b[i], staged[i] & b[i]);
+                // Bits neither writer touched keep the base value.
+                let untouched = !(a[i] | b[i]);
+                prop_assert_eq!(merged[i] & untouched, base[i] & untouched);
+            }
+
+            // Commit order must not change the result, or the merged block would
+            // depend on interleaving.
+            let swapped = proof.merge_bytes(&base, &staged, &latest);
+            prop_assert_eq!(swapped.as_ref(), Some(&merged));
+        }
+
+        /// Any shared changed bit must reject the delta merge, and `merge_valid`
+        /// must agree with `merge_bytes` on the rejection.
+        #[test]
+        fn proptest_bitmap_delta_rejects_a_shared_changed_bit(
+            base in prop::collection::vec(any::<u8>(), 8),
+            pick in 0usize..8,
+            bit in 0u32..8,
+        ) {
+            let proof = MergeProof::BitmapDelta;
+            let idx = pick % base.len();
+            let mask = 1u8 << bit;
+
+            // Both writers flip the SAME bit: a double-allocation when that bit is
+            // clear in base, a double-free when it is set. Either way it must abort.
+            let mut both = base.clone();
+            both[idx] ^= mask;
+            prop_assert!(proof.merge_bytes(&base, &both, &both).is_none());
+            prop_assert_eq!(
+                proof.merge_valid(&base, &both, &both),
+                proof.merge_bytes(&base, &both, &both).is_some()
+            );
         }
 
         /// Invariant: snapshot isolation — a snapshot sees only versions committed

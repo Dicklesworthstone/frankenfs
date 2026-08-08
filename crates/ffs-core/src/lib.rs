@@ -2984,6 +2984,15 @@ impl BlockDevice for TransactionBlockAdapter<'_, '_> {
         self.stage_rmw(cx, block, MergeProof::BitmapOr, patch)
     }
 
+    fn rmw_block_bitmap_delta(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<(), FfsError>,
+    ) -> Result<(), FfsError> {
+        self.stage_rmw(cx, block, MergeProof::BitmapDelta, patch)
+    }
+
     fn block_size(&self) -> u32 {
         self.base.block_size()
     }
@@ -22173,16 +22182,43 @@ impl OpenFs {
                 } = &mut *alloc;
                 if child_upd.links_count == 0 {
                     if sharded_inode_free {
-                        let is_dir = ffs_inode::release_inode_storage(
+                        // Release storage WITHOUT the inode write-back, then stage
+                        // the zeroed slot under a slot-scoped merge proof. The
+                        // write-back is split out because `write_inode` rewrites
+                        // the whole inode-table block, staging an opaque
+                        // whole-block write: two workers deleting inodes that
+                        // share a table block then first-committer-wins against
+                        // each other even though their slots are disjoint. That is
+                        // measured — the concurrent gate below failed on blocks 37
+                        // and 2085, the inode TABLES of groups 0 and 1, while the
+                        // inode bitmaps (35/36) never appeared in a conflict at
+                        // all. The sharded CREATE path already stages this exact
+                        // proof via `ext4_sharded_stage_inode_slot`; this is the
+                        // delete-side counterpart it never had.
+                        let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
                             cx,
                             tx_dev,
                             geo,
                             groups,
                             child_ino,
                             &mut child_upd,
-                            csum_seed,
                             tstamp_secs,
                             persist_ctx,
+                        )?;
+                        let loc = ffs_inode::locate_inode(child_ino, geo, groups).ok_or_else(
+                            || FfsError::Corruption {
+                                block: 0,
+                                detail: format!("sharded unlink: inode {child_ino} out of range"),
+                            },
+                        )?;
+                        ffs_inode::write_inode_at_slot_scoped(
+                            cx,
+                            tx_dev,
+                            loc,
+                            usize::from(geo.inode_size),
+                            child_ino,
+                            &child_upd,
+                            csum_seed,
                         )?;
                         #[cfg(feature = "bhh0i_sharded_alloc")]
                         self.ext4_sharded_free_inode(cx, tx_dev, child_ino, is_dir)?;
@@ -54678,10 +54714,35 @@ mod tests {
             })
             .collect();
 
+        // An FCW conflict reports only a BLOCK NUMBER, and every metadata block on
+        // this path lives within a few blocks of every other, so a bare number is
+        // not attributable to a structure without this map. Carrying it into the
+        // panic turned a guess into a measurement once already (bd-y2t0r: the
+        // conflict was read as the inode bitmap when it was in fact elsewhere), so
+        // it stays in the test rather than being deleted after the fix.
+        let layout = fs.ext4_sharded_alloc.as_ref().map_or_else(
+            || "sharded alloc unavailable".to_owned(),
+            |sharded| {
+                let mut out = String::from("group layout (block numbers):");
+                for gidx in 0..sharded.group_count().min(4) {
+                    let stats = sharded.lock_group(gidx);
+                    out.push_str(&format!(
+                        "\n  group {gidx}: block_bitmap={} inode_bitmap={} inode_table={}",
+                        stats.block_bitmap_block.0,
+                        stats.inode_bitmap_block.0,
+                        stats.inode_table_block.0,
+                    ));
+                }
+                out
+            },
+        );
+        let layout = std::sync::Arc::new(layout);
+
         let fs = std::sync::Arc::new(fs);
         std::thread::scope(|scope| {
             for (worker, dir) in dirs.iter().enumerate() {
                 let fs = std::sync::Arc::clone(&fs);
+                let layout = std::sync::Arc::clone(&layout);
                 let dir = *dir;
                 scope.spawn(move || {
                     let cx = Cx::for_testing();
@@ -54695,14 +54756,14 @@ mod tests {
                             let name = format!("f{cycle:02}-{index:03}");
                             fs.create(&cx, dir, OsStr::new(&name), 0o644, 0, 0)
                                 .unwrap_or_else(|error| {
-                                    panic!("worker {worker} create {name}: {error}")
+                                    panic!("worker {worker} create {name}: {error}\n{layout}")
                                 });
                         }
                         for index in 0..FILES {
                             let name = format!("f{cycle:02}-{index:03}");
                             fs.unlink(&cx, dir, OsStr::new(&name))
                                 .unwrap_or_else(|error| {
-                                    panic!("worker {worker} unlink {name}: {error}")
+                                    panic!("worker {worker} unlink {name}: {error}\n{layout}")
                                 });
                         }
                     }
