@@ -41,7 +41,9 @@ e2fsck -fn "$IMG" >/dev/null 2>&1 && echo "   clean" || { echo "   DIRTY BEFORE 
 
 # FFS_AUTO_UNMOUNT=0 as the comparator sets it: auto_unmount forces allow_other,
 # which needs user_allow_other in /etc/fuse.conf and otherwise fails EPERM.
-FFS_AUTO_UNMOUNT=0 "$FFS_CLI" mount --rw --no-background-scrub "$IMG" "$MNT" \
+env FFS_AUTO_UNMOUNT=0 \
+  ${FFS_BHH0I_SHARDED+FFS_BHH0I_SHARDED="$FFS_BHH0I_SHARDED"} \
+  "$FFS_CLI" mount --rw --no-background-scrub "$IMG" "$MNT" \
   >"$BASE/daemon.out" 2>"$BASE/daemon.err" &
 DAEMON=$!
 
