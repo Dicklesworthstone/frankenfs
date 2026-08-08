@@ -893,7 +893,38 @@ impl Transaction {
 
     fn insert_staged_write(&mut self, block: BlockNumber, staged: StagedWrite) {
         match staged_write_pos(&self.staged_writes, block) {
-            Ok(idx) => self.staged_writes[idx] = (block, staged),
+            Ok(idx) => {
+                // A transaction that stages the same block twice keeps only the
+                // LAST proof. So a plain `stage_write` — which carries
+                // `MergeProof::Unsafe` — silently discards a merge proof an
+                // earlier proof-carrying write established for this block, and the
+                // block reverts to first-committer-wins with nothing in the type
+                // system or the logs to say so. The cost lands far away, as an
+                // unexplained FCW conflict on a block whose writers were in fact
+                // disjoint (bd-y2t0r: a residual conflict on an inode-table block
+                // survived slot-scoping both known writers of it).
+                //
+                // This is a real hazard rather than a bookkeeping nicety: a
+                // whole-block write MUST invalidate a range proof, so the
+                // downgrade is correct and cannot simply be suppressed. What is
+                // missing is visibility — the offending writer is whoever called
+                // plain `write_block` on a block someone else proof-staged, and
+                // there is otherwise no way to find them short of bisecting.
+                let previous = &self.staged_writes[idx].1;
+                if previous.merge_proof != MergeProof::Unsafe
+                    && staged.merge_proof == MergeProof::Unsafe
+                {
+                    warn!(
+                        target: "ffs::mvcc::merge",
+                        block = block.0,
+                        discarded_proof = merge_proof_variant_name(&previous.merge_proof),
+                        "staged_write_downgraded_proof: a plain whole-block write replaced a merge \
+                         proof on a block already staged in this transaction; this block will now \
+                         first-committer-wins"
+                    );
+                }
+                self.staged_writes[idx] = (block, staged);
+            }
             Err(idx) => self.staged_writes.insert(idx, (block, staged)),
         }
     }
