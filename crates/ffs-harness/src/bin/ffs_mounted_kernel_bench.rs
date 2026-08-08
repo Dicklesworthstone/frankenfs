@@ -3923,10 +3923,38 @@ fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>> {
 /// and far below the contended window's, so the two separate cleanly.
 const EXTERNAL_BUSY_CPU_FRACTION: f64 = 0.25;
 
-/// How many off-placement CPUs may carry external load before a run is refused.
-/// Two is deliberately permissive — a lone background daemon does not invalidate
-/// a measurement — while the case that flipped a published verdict showed five.
+/// How many off-placement CPUs may carry external load before a SAMPLE counts as
+/// contended. Two is deliberately permissive — a lone background daemon does not
+/// invalidate a measurement — while the case that flipped a published verdict
+/// showed five.
 const MAX_EXTERNAL_BUSY_CPUS: usize = 2;
+
+/// Fraction of contended samples above which a run is refused.
+///
+/// ⚠ The first version of this gate refused a run on a SINGLE contended sample.
+/// That was wrong, and it was measured to be wrong within the hour, on real runs:
+///
+///   synthetic sustained load (the shape that flipped a verdict)   23/23 = 100.0%
+///   quiet box, warm-stat run 1                                     2/71 =   2.8%
+///   quiet box, warm-stat run 2                                     1/70 =   1.4%
+///
+/// Both quiet-box runs were refused, and neither had a co-tenant — just ordinary
+/// background churn on a 64-thread machine. Transient blips sit at or below 3%;
+/// genuine contention sat at 100%. `0.10` separates them by more than 3x either
+/// way.
+///
+/// This is a policy correction, not a convenience threshold, and the distinction
+/// is real: a median-of-32-pairs crossover estimator is *designed* to absorb a
+/// perturbation touching a couple of pairs, whereas sustained load biases every
+/// pair. The two cases differ in kind, not merely in degree.
+const MAX_CONTENDED_SAMPLE_FRACTION: f64 = 0.10;
+
+/// Consecutive contended samples that refuse a run regardless of the fraction.
+///
+/// The fraction alone is blind to a short, dense burst inside a long run: three
+/// back-to-back contended samples is a real event, not sampling noise, even when
+/// it is 3% of a 100-sample run.
+const MAX_CONSECUTIVE_CONTENDED_SAMPLES: usize = 3;
 
 /// Verdict for one during-run external-load sample.
 ///
@@ -3950,6 +3978,11 @@ struct ExternalLoadWitness {
     max_busy_cpus: usize,
     /// Samples whose busy-CPU count exceeded the limit.
     over_limit_samples: usize,
+    /// Longest run of consecutive contended samples — the signal that separates a
+    /// dense burst from scattered background churn.
+    max_consecutive_over_limit: usize,
+    /// Live counter feeding `max_consecutive_over_limit`.
+    current_consecutive: usize,
     /// Largest off-placement mean busy fraction seen in any single sample.
     peak_mean_busy: f64,
 }
@@ -3961,6 +3994,12 @@ impl ExternalLoadWitness {
         self.max_busy_cpus = self.max_busy_cpus.max(count);
         if count > limit {
             self.over_limit_samples += 1;
+            self.current_consecutive += 1;
+            self.max_consecutive_over_limit = self
+                .max_consecutive_over_limit
+                .max(self.current_consecutive);
+        } else {
+            self.current_consecutive = 0;
         }
         let off: Vec<f64> = busy
             .iter()
@@ -3975,8 +4014,21 @@ impl ExternalLoadWitness {
         }
     }
 
-    const fn clean(&self, limit: usize) -> bool {
-        self.over_limit_samples == 0 && self.max_busy_cpus <= limit
+    /// Fraction of samples that were contended.
+    fn contended_fraction(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        self.over_limit_samples as f64 / self.samples as f64
+    }
+
+    /// A run is refused only for SUSTAINED contention: too large a share of the
+    /// measured region, or a dense burst inside it. Scattered single samples on a
+    /// busy-ish shared box are tolerated, because the crossover estimator absorbs
+    /// a perturbation touching a couple of pairs.
+    fn clean(&self) -> bool {
+        self.contended_fraction() <= MAX_CONTENDED_SAMPLE_FRACTION
+            && self.max_consecutive_over_limit < MAX_CONSECUTIVE_CONTENDED_SAMPLES
     }
 }
 
@@ -6478,17 +6530,23 @@ fn run() -> Result<Option<PathBuf>> {
         .lock()
         .map(|w| w.clone())
         .unwrap_or_default();
-    let external_load_clean = external_load.clean(MAX_EXTERNAL_BUSY_CPUS);
+    let external_load_clean = external_load.clean();
     println!(
         "external_load_during_run,samples={},max_external_busy_cpus={},over_limit_samples={},\
+         contended_fraction={:.4},max_consecutive_over_limit={},\
          peak_off_placement_mean_busy={:.6},busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
+         max_contended_fraction_limit={:.2},max_consecutive_limit={},\
          placement_cpus_excluded={},verdict={}",
         external_load.samples,
         external_load.max_busy_cpus,
         external_load.over_limit_samples,
+        external_load.contended_fraction(),
+        external_load.max_consecutive_over_limit,
         external_load.peak_mean_busy,
         EXTERNAL_BUSY_CPU_FRACTION,
         MAX_EXTERNAL_BUSY_CPUS,
+        MAX_CONTENDED_SAMPLE_FRACTION,
+        MAX_CONSECUTIVE_CONTENDED_SAMPLES,
         sampler_placement.len(),
         if external_load_clean {
             "clear"
@@ -6583,9 +6641,13 @@ fn run() -> Result<Option<PathBuf>> {
             "samples": external_load.samples,
             "max_external_busy_cpus": external_load.max_busy_cpus,
             "over_limit_samples": external_load.over_limit_samples,
+            "contended_fraction": external_load.contended_fraction(),
+            "max_consecutive_over_limit": external_load.max_consecutive_over_limit,
             "peak_off_placement_mean_busy": external_load.peak_mean_busy,
             "busy_cpu_fraction_limit": EXTERNAL_BUSY_CPU_FRACTION,
             "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
+            "max_contended_fraction_limit": MAX_CONTENDED_SAMPLE_FRACTION,
+            "max_consecutive_limit": MAX_CONSECUTIVE_CONTENDED_SAMPLES,
             "placement_cpus_excluded": sampler_placement.len(),
             "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
             "verdict": if external_load_clean { "clear" } else { "contended" },
@@ -6689,14 +6751,19 @@ fn run() -> Result<Option<PathBuf>> {
     ensure!(
         external_load_clean,
         "external load contended the socket during the measured region: \
-         {} of {} samples exceeded {} off-placement CPUs above {:.0}% busy (peak {}), \
-         peak off-placement mean busy {:.1}%. The placement CPUs may well have been idle — \
-         that is what the pre-run gate checks — but memory bandwidth, LLC and boost budget \
-         are socket-wide. Re-run in a quiet window. Report preserved at {}",
+         {} of {} samples ({:.1}%, limit {:.0}%) had more than {} off-placement CPUs above \
+         {:.0}% busy, longest consecutive run {} (limit {}), peak {} busy CPUs, peak \
+         off-placement mean busy {:.1}%. The placement CPUs may well have been idle — that is \
+         what the pre-run gate checks — but memory bandwidth, LLC and boost budget are \
+         socket-wide. Re-run in a quiet window. Report preserved at {}",
         external_load.over_limit_samples,
         external_load.samples,
+        external_load.contended_fraction() * 100.0,
+        MAX_CONTENDED_SAMPLE_FRACTION * 100.0,
         MAX_EXTERNAL_BUSY_CPUS,
         EXTERNAL_BUSY_CPU_FRACTION * 100.0,
+        external_load.max_consecutive_over_limit,
+        MAX_CONSECUTIVE_CONTENDED_SAMPLES,
         external_load.max_busy_cpus,
         external_load.peak_mean_busy * 100.0,
         output.display()
@@ -8194,10 +8261,11 @@ mod tests {
         );
     }
 
-    /// bd-bt2dy: the witness must refuse a run that was contended for even one
-    /// sample, and must accept one that never was.
+    /// bd-bt2dy: the witness accepts a clean run and refuses a SUSTAINED-contended
+    /// one. (An earlier version refused on a single sample; see the
+    /// transient-versus-sustained test below for why that was wrong.)
     #[test]
-    fn external_load_witness_fails_closed_on_any_over_limit_sample_bd_bt2dy() {
+    fn external_load_witness_fails_closed_on_sustained_contention_bd_bt2dy() {
         let placement: BTreeSet<usize> = (0..8).collect();
         let mut busy_quiet: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
         busy_quiet.insert(3, 0.99); // placement CPU: the bench, ignored
@@ -8210,24 +8278,23 @@ mod tests {
         for _ in 0..10 {
             clean.observe(&busy_quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
         }
-        assert!(clean.clean(MAX_EXTERNAL_BUSY_CPUS));
+        assert!(clean.clean());
         assert_eq!(clean.samples, 10);
         assert_eq!(clean.max_busy_cpus, 0);
 
-        // One contended sample in an otherwise clean run is enough to refuse it —
-        // a burst is exactly what flipped the verdict in bd-ws9dg.
-        let mut spiked = ExternalLoadWitness::default();
-        for _ in 0..9 {
-            spiked.observe(&busy_quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        // Sustained contention refuses: the synthetic negative test's shape.
+        let mut sustained = ExternalLoadWitness::default();
+        for _ in 0..23 {
+            sustained.observe(&busy_loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
         }
-        spiked.observe(&busy_loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
         assert!(
-            !spiked.clean(MAX_EXTERNAL_BUSY_CPUS),
-            "a single over-limit sample must refuse the run"
+            !sustained.clean(),
+            "100% contended samples must refuse the run"
         );
-        assert_eq!(spiked.over_limit_samples, 1);
-        assert_eq!(spiked.max_busy_cpus, 4);
-        assert!(spiked.peak_mean_busy > 0.0);
+        assert_eq!(sustained.over_limit_samples, 23);
+        assert_eq!(sustained.max_consecutive_over_limit, 23);
+        assert_eq!(sustained.max_busy_cpus, 4);
+        assert!(sustained.peak_mean_busy > 0.0);
 
         // Exactly at the limit is permitted: two busy off-placement CPUs is the
         // documented tolerance for ordinary background daemons.
@@ -8236,9 +8303,81 @@ mod tests {
         at_limit.insert(31, 0.9);
         let mut edge = ExternalLoadWitness::default();
         edge.observe(&at_limit, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        assert!(edge.clean(), "2 busy CPUs is at the limit, not over it");
+    }
+
+    /// bd-bt2dy: the SUSTAINED-versus-TRANSIENT correction, pinned against the
+    /// three real datasets that produced it.
+    ///
+    /// The first version of this gate refused on a single contended sample, and it
+    /// was measured wrong within the hour: it rejected two consecutive warm-stat
+    /// runs on an idle box, on 2 of 71 and 1 of 70 samples respectively, with no
+    /// co-tenant present — just ordinary background churn across 60 watched CPUs.
+    /// A median-of-32-pairs crossover absorbs a perturbation touching a couple of
+    /// pairs; sustained load biases every pair. This test holds that line.
+    #[test]
+    fn external_load_tolerates_transient_blips_but_not_sustained_load_bd_bt2dy() {
+        let placement: BTreeSet<usize> = (0..4).collect();
+        let quiet: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        let mut loaded: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        for cpu in [16, 19, 48, 51] {
+            loaded.insert(cpu, 1.0);
+        }
+
+        // Replay a run's contended/total counts with the contended samples spread
+        // out, which is what the quiet box actually produced — background churn,
+        // not a burst.
+        let replay = |over: usize, total: usize| -> ExternalLoadWitness {
+            let mut w = ExternalLoadWitness::default();
+            let stride = if over == 0 { total + 1 } else { total / over };
+            for i in 0..total {
+                if over > 0 && i % stride == 0 && w.over_limit_samples < over {
+                    w.observe(&loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
+                } else {
+                    w.observe(&quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+                }
+            }
+            w
+        };
+
+        // warm-stat run 1: 2 of 71 = 2.8%. It was REFUSED by the first version;
+        // it must pass now. This assertion is the whole point of the correction.
+        let r1 = replay(2, 71);
+        assert_eq!(r1.over_limit_samples, 2);
         assert!(
-            edge.clean(MAX_EXTERNAL_BUSY_CPUS),
-            "2 busy CPUs is at the limit, not over it"
+            r1.clean(),
+            "2 of 71 scattered contended samples on an idle box must not refuse a run"
+        );
+
+        // warm-stat run 2: 1 of 70 = 1.4%.
+        assert!(replay(1, 70).clean(), "1 of 70 must not refuse a run");
+
+        // The synthetic negative test: 23 of 23 = 100%, must still refuse.
+        assert!(
+            !replay(23, 23).clean(),
+            "sustained contention must still refuse"
+        );
+
+        // The fraction boundary, both sides.
+        assert!(replay(10, 100).clean(), "10% is the limit, not over it");
+        assert!(!replay(11, 100).clean(), "11% exceeds the fraction limit");
+
+        // A dense burst refuses even when the fraction is small: three consecutive
+        // contended samples is 3% of a 100-sample run — under the fraction limit —
+        // but is a real event rather than sampling noise.
+        let mut burst = ExternalLoadWitness::default();
+        for i in 0..100 {
+            if (40..43).contains(&i) {
+                burst.observe(&loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
+            } else {
+                burst.observe(&quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+            }
+        }
+        assert_eq!(burst.max_consecutive_over_limit, 3);
+        assert!(burst.contended_fraction() < MAX_CONTENDED_SAMPLE_FRACTION);
+        assert!(
+            !burst.clean(),
+            "3 consecutive contended samples must refuse even at 3% of the run"
         );
     }
 
