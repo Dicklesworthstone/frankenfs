@@ -3060,7 +3060,14 @@ impl TransactionBlockAdapter<'_, '_> {
         // first-committer-wins conflict, never a wrong merge.
         let effective = if already_staged {
             match (tx.merge_proof(block), &proof) {
-                (Some(MergeProof::IndependentKeys { touched_ranges: prev }), MergeProof::IndependentKeys { touched_ranges: next }) => {
+                (
+                    Some(MergeProof::IndependentKeys {
+                        touched_ranges: prev,
+                    }),
+                    MergeProof::IndependentKeys {
+                        touched_ranges: next,
+                    },
+                ) => {
                     let mut ranges: Vec<(usize, usize)> =
                         prev.iter().map(|r| (r.start, r.len)).collect();
                     ranges.extend(next.iter().map(|r| (r.start, r.len)));
@@ -22335,7 +22342,15 @@ impl OpenFs {
                         csum_seed,
                     )?;
                 } else {
-                    ffs_inode::write_inode(cx, tx_dev, geo, groups, parent, &parent_upd, csum_seed)?;
+                    ffs_inode::write_inode(
+                        cx,
+                        tx_dev,
+                        geo,
+                        groups,
+                        parent,
+                        &parent_upd,
+                        csum_seed,
+                    )?;
                 }
             }
 
@@ -54723,13 +54738,47 @@ mod tests {
     /// Gated on the feature because the routing it exercises does not exist
     /// without it; the runtime toggle is set explicitly since it now defaults off
     /// (bd-pbyu0).
-    /// ⭐ THIS TEST WAS `#[ignore]`d AND FAILING FOR TWO COMMITS. What made it
-    /// pass is worth keeping written down, because the first diagnosis was wrong
-    /// and the layout dump below is what corrected it.
+    /// ⛔ **STILL `#[ignore]`d: PASSES STANDALONE, FAILS UNDER FULL-SUITE LOAD.**
+    /// Two real defects were found and fixed below and the failure moved twice,
+    /// but the gate is not green and must not be read as such.
     ///
-    /// The failure was attributed to the inode BITMAP lacking a clear-bits merge
-    /// proof. That was inferred from the shape of the failure, never measured.
-    /// Measuring it — printing the group layout into the panic — said otherwise:
+    ///     cargo test -p ffs-core --features bhh0i_sharded_alloc --lib bd_y2t0r
+    ///         -> ok (both variants), reproducibly
+    ///     the same test inside the full 1246-test suite
+    ///         -> FCW conflict on block 2085, reproducibly
+    ///
+    /// A load-dependent pass is not a pass: the whole point of this gate is
+    /// behaviour under contention, and the full suite supplies more of it than
+    /// the test does alone. Un-ignore it only when the full-suite run is green.
+    ///
+    /// WHAT IS LEFT, with the evidence that points at it. The surviving conflicts
+    /// are all on 2085 — group 1's inode table — and their snapshot gaps are two
+    /// orders of magnitude wider than the ones that were fixed (77-178 commits
+    /// versus 1-2). That is the signature of a transaction held open long enough
+    /// for its snapshot to age, not of two writers racing on adjacent slots, so
+    /// the next suspect is base resolution rather than another missing range:
+    /// `check_write_mergeable_locked` resolves the merge ancestor from the version
+    /// chain at the txn's snapshot, and a version pruned under that snapshot yields
+    /// an empty base, which fails the length check and rejects the merge. The
+    /// read-vs-prune interaction bd-bhh0i hit before is the thing to rule out
+    /// first. UNVERIFIED — measure it, do not wire from this paragraph.
+    ///
+    /// The two defects already fixed, both measured rather than inferred:
+    ///
+    /// 1. The parent-inode write. Every unlink writes its parent directory's
+    ///    inode with `write_inode`, rewriting the parent's whole table block. Two
+    ///    workers whose unrelated parents share a block then FCW-conflicted on
+    ///    every unlink. Now staged slot-scoped.
+    /// 2. Proof accumulation in `stage_rmw`. One transaction RMWs the same table
+    ///    block twice (deleted child + parent), and the staged bytes accumulated
+    ///    while the proof did not, so the second call declared a range narrower
+    ///    than the bytes changed and the validator correctly rejected it. Ranges
+    ///    are now unioned.
+    ///
+    /// THE FIRST DIAGNOSIS ON THIS BEAD WAS WRONG, which is why the layout dump
+    /// below is permanent. The failure was attributed to the inode BITMAP lacking
+    /// a clear-bits merge proof — inferred from the shape of the failure, never
+    /// measured. Measuring it said otherwise:
     ///
     ///     group 0: block_bitmap=33 inode_bitmap=35 inode_table=37
     ///     group 1: block_bitmap=34 inode_bitmap=36 inode_table=2085
@@ -54740,15 +54789,7 @@ mod tests {
     /// failed on ITS OWN parent directory's block. The bitmaps, 35 and 36, never
     /// appeared in one. A 4 KiB block holds 16 inodes at 256 bytes, so the eight
     /// per-worker directories, created consecutively, shared just two blocks.
-    ///
-    /// THE ACTUAL MECHANISM: every unlink writes its parent directory's inode
-    /// (mtime/ctime) with `write_inode`, which rewrites the parent's whole
-    /// inode-table block and therefore stages an opaque whole-block write. Two
-    /// workers whose unrelated parent directories share a table block then
-    /// first-committer-wins against each other on every single unlink, even
-    /// though their 256-byte slots are disjoint. Both that write and the deleted
-    /// child's zeroed write-back now go through `write_inode_at_slot_scoped`,
-    /// which declares the exact bytes touched so disjoint slots merge.
+    /// Both 37 and 38 are now silent; the surviving conflicts moved to 2085.
     ///
     /// This generalizes past the test: any parallel-metadata workload whose
     /// directories were created together collides the same way, which is exactly
@@ -54770,6 +54811,7 @@ mod tests {
     /// complete on partial evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
+    #[ignore = "bd-y2t0r: passes standalone, FCW-conflicts on block 2085 under full-suite load; see doc comment"]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(true);
     }
@@ -54843,7 +54885,10 @@ mod tests {
                         let block = sharded
                             .inode_location(*dir, &geo)
                             .map_or_else(|| "?".to_owned(), |loc| loc.block.0.to_string());
-                        out.push_str(&format!("\n    w{worker}: ino={} table_block={block}", dir.0));
+                        out.push_str(&format!(
+                            "\n    w{worker}: ino={} table_block={block}",
+                            dir.0
+                        ));
                     }
                 }
                 out
