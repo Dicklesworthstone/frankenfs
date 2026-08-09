@@ -55049,7 +55049,7 @@ mod tests {
     /// captured before the threads start. A mismatch is the memo, not the tree.
     #[test]
     fn btrfs_floor_memo_is_correct_under_concurrent_sweeps_bd_5vis3() {
-        let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(64) else {
+        let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(3000) else {
             return; // btrfs-progs unavailable
         };
         let cx = Cx::for_testing();
