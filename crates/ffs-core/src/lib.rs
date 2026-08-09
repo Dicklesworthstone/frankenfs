@@ -8870,6 +8870,8 @@ impl OpenFs {
             let memo = self.btrfs_floor_leaf_memo.lock();
             if let Some(memo) = memo.as_ref()
                 && memo.root_logical == root_logical
+                && ffs_btrfs::key_cmp(&memo.first_key, &target) != std::cmp::Ordering::Greater
+                && ffs_btrfs::key_cmp(&target, &memo.last_key) != std::cmp::Ordering::Greater
             {
                 let leaf = Arc::clone(&memo.leaf);
                 drop(memo);
@@ -55046,10 +55048,24 @@ mod tests {
     /// threads deliberately sweep in DIFFERENT orders so their spans disagree.
     ///
     /// Attribution: every thread must agree with the single-threaded answers
-    /// captured before the threads start. A mismatch is the memo, not the tree.
+    /// captured before the threads start, WITH THE MEMO DISABLED, so the
+    /// comparison is against the descent path rather than against the memo
+    /// agreeing with itself.
+    ///
+    /// ⚠ WHAT THIS TEST DOES NOT COVER, established by negative control rather
+    /// than assumed: it does NOT guard the span check. Removing that check
+    /// entirely — the change that makes the memo serve leaves it does not own —
+    /// leaves this test GREEN, at 64 entries and still at 3,000. The sweep here
+    /// keeps landing in the leaf the previous descent reached, so an unguarded
+    /// memo happens to answer correctly. The guard for the span check is
+    /// `btrfs_stat_without_prewarm_...`, which fails loudly (7 of 48 entries
+    /// resolving) because a wrong memo makes `getattr` FAIL rather than lie.
+    ///
+    /// So: this test covers concurrent access to a shared memo. It does not cover
+    /// memo correctness. Do not treat it as the latter.
     #[test]
     fn btrfs_floor_memo_is_correct_under_concurrent_sweeps_bd_5vis3() {
-        let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(3000) else {
+        let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(64) else {
             return; // btrfs-progs unavailable
         };
         let cx = Cx::for_testing();
