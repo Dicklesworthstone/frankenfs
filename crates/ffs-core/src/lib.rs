@@ -55056,15 +55056,30 @@ mod tests {
         };
         let cx = Cx::for_testing();
         let root = InodeNumber(1);
-        let listing = fs.readdir(&cx, root, 0).expect("readdir root");
-        let inos: Vec<InodeNumber> = listing
-            .iter()
-            .filter(|e| e.name != b"." && e.name != b"..")
-            .map(|e| e.ino)
-            .collect();
+        // readdir returns ONE PAGE, so page through it. The 48-file test never
+        // needed this because its listing fit in a single page; at 20k entries a
+        // single call returns ~510 and silently under-samples the sweep.
+        let mut inos: Vec<InodeNumber> = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            let page = fs.readdir(&cx, root, offset).expect("readdir root");
+            if page.is_empty() {
+                break;
+            }
+            let next = page.last().map_or(offset + 1, |e| e.offset);
+            for entry in &page {
+                if entry.name != b"." && entry.name != b".." {
+                    inos.push(entry.ino);
+                }
+            }
+            if next <= offset {
+                break;
+            }
+            offset = next;
+        }
         assert!(
             inos.len() >= files / 2,
-            "fixture under-populated: {}",
+            "fixture under-populated: {} of {files}",
             inos.len()
         );
 
