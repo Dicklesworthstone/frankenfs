@@ -1321,6 +1321,14 @@ pub struct OpenFs {
     /// create-bench A/B + e2fsck gate.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     bhh0i_sharded_ops: std::sync::atomic::AtomicBool,
+    /// Set once the sharded allocator has handed out anything (bd-y2t0r).
+    ///
+    /// Exists to make an invariant CHECKED that currently holds by accident: all
+    /// three production call sites set `bhh0i_sharded_ops` once at open/mount and
+    /// nothing ever clears it, so "which structure debited this block" is
+    /// answerable from the toggle. A block-accounting fix depends on that, and an
+    /// unenforced assumption of exactly this kind is what produced bd-pbyu0.
+    bhh0i_sharded_alloc_happened: std::sync::atomic::AtomicBool,
     /// Read-only ext4 group descriptor cache.
     ///
     /// The writable path bypasses this cache because group descriptor counters
@@ -4710,6 +4718,7 @@ impl OpenFs {
             ext4_sharded_alloc: None,
             #[cfg(feature = "bhh0i_sharded_alloc")]
             bhh0i_sharded_ops: std::sync::atomic::AtomicBool::new(false),
+            bhh0i_sharded_alloc_happened: std::sync::atomic::AtomicBool::new(false),
             ext4_group_desc_cache: ShardedCache::new(),
             ext4_inode_table_locations: OnceLock::new(),
             ext4_inode_table_block_cache: ShardedCache::new(),
@@ -19101,8 +19110,40 @@ impl OpenFs {
     /// their lock-free twins. No-op with the feature off. Returns the previous value.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     pub fn set_bhh0i_sharded_ops(&self, enabled: bool) -> bool {
-        self.bhh0i_sharded_ops
-            .swap(enabled, std::sync::atomic::Ordering::Relaxed)
+        let previous = self
+            .bhh0i_sharded_ops
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        // bd-y2t0r: changing this AFTER the sharded allocator has handed anything
+        // out breaks the only way to know which structure debited a block, and a
+        // block free routed on the new value would credit a structure that never
+        // debited it — an OVER-credit, which is the dangerous direction of this
+        // error (the current dir-block leak is the safe direction: it under-counts
+        // free space and surfaces in e2fsck, where an over-credit hands out a
+        // block already in use).
+        //
+        // A debug assertion rather than a hard refusal: in production all three
+        // call sites set this once at open/mount and nothing clears it, so this
+        // can only fire in a test, which is exactly where a violation would be
+        // introduced. Release builds pay nothing.
+        debug_assert!(
+            previous == enabled
+                || !self
+                    .bhh0i_sharded_alloc_happened
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            "bd-y2t0r: the sharded toggle changed after the sharded allocator had \
+             already handed out blocks or inodes. Block accounting cannot then tell \
+             which structure holds the debit, and a later free would credit the \
+             wrong one. Set the toggle before the first operation."
+        );
+        previous
+    }
+
+    /// Record that the sharded allocator has handed something out, arming the
+    /// toggle-change assertion above (bd-y2t0r).
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn note_sharded_alloc_happened(&self) {
+        self.bhh0i_sharded_alloc_happened
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the sharded create path is currently routable (toggle on AND the
@@ -19147,6 +19188,7 @@ impl OpenFs {
         hint: &ffs_alloc::AllocHint,
         count: u32,
     ) -> Result<Option<ffs_alloc::BlockAlloc>, FfsError> {
+        self.note_sharded_alloc_happened();
         let sharded = self.ext4_sharded_alloc.as_ref().ok_or(FfsError::ReadOnly)?;
         let sb = self.ext4_superblock().ok_or_else(|| {
             FfsError::Format("sharded block alloc: not an ext4 filesystem".into())
@@ -19239,6 +19281,7 @@ impl OpenFs {
         target: GroupNumber,
         is_directory: bool,
     ) -> Result<Option<ffs_alloc::InodeAlloc>, FfsError> {
+        self.note_sharded_alloc_happened();
         let sharded = self.ext4_sharded_alloc.as_ref().ok_or(FfsError::ReadOnly)?;
         let sb = self.ext4_superblock().ok_or_else(|| {
             FfsError::Format("sharded inode alloc: not an ext4 filesystem".into())
