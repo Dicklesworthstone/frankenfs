@@ -55037,6 +55037,84 @@ mod tests {
         concurrent_create_delete_counter_check_bd_y2t0r(false);
     }
 
+    /// bd-5vis3: the floor-leaf memo must be correct under CONCURRENCY, because
+    /// the mounted comparator row this bead owes is an 8-thread readdir+stat and
+    /// the memo has only ever been exercised single-threaded.
+    ///
+    /// One memo is shared by every thread, so concurrent sweeps constantly evict
+    /// each other's retained leaf. That is fine for throughput — a miss is just a
+    /// descent — but it is exactly the shape that turns a subtly wrong span check
+    /// into corrupt metadata under load and nothing under a single thread. The
+    /// threads deliberately sweep in DIFFERENT orders so their spans disagree.
+    ///
+    /// Attribution: every thread must agree with the single-threaded answers
+    /// captured before the threads start. A mismatch is the memo, not the tree.
+    #[test]
+    fn btrfs_floor_memo_is_correct_under_concurrent_sweeps_bd_5vis3() {
+        let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(64) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(1);
+        let listing = fs.readdir(&cx, root, 0).expect("readdir root");
+        let inos: Vec<InodeNumber> = listing
+            .iter()
+            .filter(|e| e.name != b"." && e.name != b"..")
+            .map(|e| e.ino)
+            .collect();
+        assert!(inos.len() >= 8, "fixture too small: {}", inos.len());
+
+        // Ground truth, single-threaded, memo active.
+        let expected: Vec<(InodeNumber, Option<(InodeNumber, u64, u64)>)> = inos
+            .iter()
+            .map(|ino| {
+                (
+                    *ino,
+                    fs.getattr(&cx, *ino)
+                        .ok()
+                        .map(|a| (a.ino, a.size, a.blocks)),
+                )
+            })
+            .collect();
+
+        let fs = std::sync::Arc::new(fs);
+        let expected = std::sync::Arc::new(expected);
+        std::thread::scope(|scope| {
+            for worker in 0..8_usize {
+                let fs = std::sync::Arc::clone(&fs);
+                let expected = std::sync::Arc::clone(&expected);
+                scope.spawn(move || {
+                    let cx = Cx::for_testing();
+                    let fs: &OpenFs = fs.as_ref();
+                    for pass in 0..4 {
+                        // Each worker walks a different rotation, and odd passes
+                        // run backwards, so no two threads share a span pattern.
+                        let rotate = worker * 7 + pass;
+                        for step in 0..expected.len() {
+                            let idx = if pass % 2 == 0 {
+                                (step + rotate) % expected.len()
+                            } else {
+                                expected.len() - 1 - ((step + rotate) % expected.len())
+                            };
+                            let (ino, want) = &expected[idx];
+                            let got = fs
+                                .getattr(&cx, *ino)
+                                .ok()
+                                .map(|a| (a.ino, a.size, a.blocks));
+                            assert_eq!(
+                                &got, want,
+                                "worker {worker} pass {pass} disagreed on inode {} — the \
+                                 floor-leaf memo returned a different answer under \
+                                 concurrency than a single-threaded sweep (bd-5vis3)",
+                                ino.0
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     /// bd-5vis3: the floor-leaf memo A/B on a fixture deep enough to matter.
     ///
     /// The landed measurement used 48 files, whose tree is shallow enough that
