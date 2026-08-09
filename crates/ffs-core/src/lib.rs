@@ -55059,6 +55059,7 @@ mod tests {
         let cx = Cx::for_testing();
         let root = InodeNumber(1);
         let mut inos: Vec<InodeNumber> = Vec::new();
+        let mut names: Vec<Vec<u8>> = Vec::new();
         let mut offset = 0_u64;
         loop {
             let page = fs.readdir(&cx, root, offset).expect("readdir root");
@@ -55069,6 +55070,7 @@ mod tests {
             for entry in &page {
                 if entry.name != b"." && entry.name != b".." {
                     inos.push(entry.ino);
+                    names.push(entry.name.clone());
                 }
             }
             if next <= offset {
@@ -55101,6 +55103,41 @@ mod tests {
                 })
                 .collect()
         };
+
+        // getattr is only ONE of four callers of the memoized descent. The others
+        // are `btrfs_lookup_child` (name -> inode), `btrfs_read_file_into` (file
+        // DATA via EXTENT_DATA) and `btrfs_fiemap_extent_items`. A memo defect on
+        // the read path corrupts file CONTENT, which is far worse than a wrong
+        // stat, and — measured — the entire rest of the ffs-core suite passes with
+        // the span check removed, so nothing else guards those paths.
+        let probe: Vec<&Vec<u8>> = names.iter().step_by(names.len().max(1) / 64 + 1).collect();
+        let read_sweep = |disabled: bool| -> Vec<(Option<InodeNumber>, Option<Vec<u8>>)> {
+            fs.set_btrfs_floor_memo_disabled(disabled);
+            probe
+                .iter()
+                .map(|name| {
+                    let child = fs
+                        .lookup(&cx, root, std::ffi::OsStr::from_bytes(name))
+                        .ok()
+                        .map(|attr| attr.ino);
+                    let data = child.and_then(|ino| fs.read(&cx, ino, 0, 4096).ok());
+                    (child, data)
+                })
+                .collect()
+        };
+        let reads_without = read_sweep(true);
+        let reads_with = read_sweep(false);
+        assert!(
+            reads_without
+                .iter()
+                .all(|(ino, data)| ino.is_some() && data.is_some()),
+            "the descent path failed to look up or read a probe file — fixture or \
+             walker broken, not the memo"
+        );
+        assert_eq!(
+            reads_with, reads_without,
+            "the floor-leaf memo changed a LOOKUP result or file CONTENT (bd-5vis3)"
+        );
 
         let without = sweep(true);
         let with = sweep(false);
@@ -55510,7 +55547,10 @@ mod tests {
         let seed = tmp.path().join("seed");
         std::fs::create_dir(&seed).ok()?;
         for i in 0..files {
-            std::fs::write(seed.join(format!("f{i:05}")), b"x").ok()?;
+            // Distinct content per file: identical bytes would make an extent
+            // mix-up invisible to a content comparison (bd-5vis3).
+            let body = format!("file-{i:05}-{}\n", "ab".repeat(1 + (i % 7)));
+            std::fs::write(seed.join(format!("f{i:05}")), body.as_bytes()).ok()?;
         }
         let image = tmp.path().join("bd5vis3.btrfs");
         let f = std::fs::File::create(&image).ok()?;
@@ -55606,7 +55646,10 @@ mod tests {
         let seed = tmp.path().join("seed");
         std::fs::create_dir(&seed).ok()?;
         for i in 0..files {
-            std::fs::write(seed.join(format!("f{i:05}")), b"x").ok()?;
+            // Distinct content per file: identical bytes would make an extent
+            // mix-up invisible to a content comparison (bd-5vis3).
+            let body = format!("file-{i:05}-{}\n", "ab".repeat(1 + (i % 7)));
+            std::fs::write(seed.join(format!("f{i:05}")), body.as_bytes()).ok()?;
         }
         let image = tmp.path().join("bd5vis3.btrfs");
         let f = std::fs::File::create(&image).ok()?;
