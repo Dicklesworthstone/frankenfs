@@ -1584,6 +1584,18 @@ pub struct OpenFs {
     /// by `BTRFS_TREE_NODE_CACHE_LIMIT` (the hot upper nodes are read first, so
     /// a small cache captures most of the benefit).
     btrfs_parsed_node_cache: ShardedCache<u64, Arc<BtrfsParsedNode>>,
+    /// Last leaf a floor descent reached, reusable when the next target lands in
+    /// its key span (bd-5vis3).
+    ///
+    /// The node cache already serves every LEVEL of a descent from memory —
+    /// measured 96% hit rate — so the residual cost is the descent machinery
+    /// itself: a cache lookup plus a binary search per level, per inode. A sweep
+    /// over consecutive objectids keeps hitting the same leaf, so remembering one
+    /// collapses those levels to a single in-leaf search.
+    ///
+    /// Bounded by construction: ONE leaf, not a structure that grows with the
+    /// filesystem — which is the property bd-5vis3 exists to preserve.
+    btrfs_floor_leaf_memo: Mutex<Option<BtrfsFloorLeafMemo>>,
     /// Read-only per-directory name→child_objectid map (the btrfs analog of the
     /// ext4 present-index). On a read-only mount the directory is immutable, so a
     /// map built once from readdir serves `btrfs_lookup_child` name resolution in
@@ -1760,6 +1772,17 @@ const EXT4_BASE_BLOCK_CACHE_LIMIT: usize = 1024;
 /// read-only mount (bd-jgx7u). At a 16 KiB nodesize this caps the cache near
 /// 8 MiB; the hot upper-tree nodes (root + internal) are read first on every
 /// descent, so even a modest cap captures the bulk of the repeated-read win.
+/// A leaf retained from the last floor descent, plus the key span it owns
+/// (bd-5vis3). Serving a target inside `[first_key, last_key]` from `leaf` is
+/// equivalent to re-descending; outside it, it is not — see
+/// `ffs_btrfs::floor_in_leaf`.
+struct BtrfsFloorLeafMemo {
+    root_logical: u64,
+    first_key: ffs_ondisk::btrfs::BtrfsKey,
+    last_key: ffs_ondisk::btrfs::BtrfsKey,
+    leaf: Arc<BtrfsParsedNode>,
+}
+
 const BTRFS_TREE_NODE_CACHE_LIMIT: usize = 512;
 
 /// Diagnostic counters for the read-only btrfs tree-node cache (bd-5vis3).
@@ -4704,6 +4727,7 @@ impl OpenFs {
             btrfs_fs_tree_root_fast: AtomicU64::new(0),
             btrfs_verified_dir_inode: AtomicU64::new(0),
             btrfs_parsed_node_cache: ShardedCache::new(),
+            btrfs_floor_leaf_memo: Mutex::new(None),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
@@ -8818,9 +8842,57 @@ impl OpenFs {
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
         let nodesize = ctx.nodesize;
-        let mut provider = |logical: u64| self.btrfs_read_parsed_node(cx, logical);
-        walk_tree_floor_with_nodes(&mut provider, root_logical, nodesize, target)
-            .map_err(|e| parse_to_ffs_error(&e))
+
+        // bd-5vis3: serve from the retained leaf when the target lies inside its
+        // key SPAN. Leaves partition the ordered key space, so within the span
+        // every key <= target that is >= first_key lives in this leaf and the
+        // greatest is the tree-wide floor — identical to descending. Outside the
+        // span it is NOT identical (for target > last_key the floor may be
+        // last_key or may sit in a later leaf), so the span check is the whole
+        // correctness argument and must not be relaxed.
+        //
+        // Read-only mounts ONLY, matching `btrfs_read_parsed_node`: COW reuses
+        // physical addresses across commits when writes are enabled, so a
+        // retained leaf would go stale.
+        let memoizable = self.btrfs_alloc_state.is_none();
+        if memoizable {
+            let memo = self.btrfs_floor_leaf_memo.lock();
+            if let Some(memo) = memo.as_ref()
+                && memo.root_logical == root_logical
+                && ffs_btrfs::key_cmp(&memo.first_key, &target) != std::cmp::Ordering::Greater
+                && ffs_btrfs::key_cmp(&target, &memo.last_key) != std::cmp::Ordering::Greater
+            {
+                let leaf = Arc::clone(&memo.leaf);
+                drop(memo);
+                return ffs_btrfs::floor_in_leaf(leaf.as_ref(), &target)
+                    .map_err(|e| parse_to_ffs_error(&e));
+            }
+        }
+
+        // A floor descent follows one child per level, root -> leaf, so the LAST
+        // node the provider hands back is the leaf it landed on. Capturing it
+        // here avoids changing the walker's signature to report it.
+        let mut reached: Option<Arc<BtrfsParsedNode>> = None;
+        let mut provider = |logical: u64| {
+            let node = self.btrfs_read_parsed_node(cx, logical)?;
+            reached = Some(Arc::clone(&node));
+            Ok(node)
+        };
+        let entry = walk_tree_floor_with_nodes(&mut provider, root_logical, nodesize, target)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        if memoizable
+            && let Some(node) = reached
+            && let BtrfsParsedNode::Leaf { items, .. } = node.as_ref()
+            && let (Some(first), Some(last)) = (items.first(), items.last())
+        {
+            *self.btrfs_floor_leaf_memo.lock() = Some(BtrfsFloorLeafMemo {
+                root_logical,
+                first_key: first.key,
+                last_key: last.key,
+                leaf: Arc::clone(&node),
+            });
+        }
+        Ok(entry)
     }
 
     /// Resolve the mounted subvolume's fs-tree root and run a floor descent on it
@@ -54991,6 +55063,42 @@ mod tests {
             lookups > 0,
             "the node-cache counters never moved across {stats} stats — the \
              instrument is not wired to the path it claims to measure (bd-5vis3)"
+        );
+
+        // ORDER-DIFFERENTIAL, the memo's specific failure mode. The memo serves
+        // only when a target lands inside the retained leaf's span, so a reverse
+        // sweep alternates in and out of that span in a different pattern than a
+        // forward one. If the span check were wrong — serving a target the leaf
+        // does not own — the two orders would disagree. Same inputs, two
+        // traversal orders, identical answers required.
+        let mut forward = Vec::with_capacity(listing.len());
+        for entry in &listing {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
+            forward.push((
+                entry.ino,
+                fs.getattr(&cx, entry.ino)
+                    .ok()
+                    .map(|a| (a.ino, a.size, a.blocks)),
+            ));
+        }
+        let mut reverse = Vec::with_capacity(forward.len());
+        for entry in listing.iter().rev() {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
+            reverse.push((
+                entry.ino,
+                fs.getattr(&cx, entry.ino)
+                    .ok()
+                    .map(|a| (a.ino, a.size, a.blocks)),
+            ));
+        }
+        reverse.reverse();
+        assert_eq!(
+            forward, reverse,
+            "getattr disagreed between forward and reverse traversal — the floor-leaf              memo served a target outside the leaf it actually owns (bd-5vis3)"
         );
 
         let per_stat = lookups as f64 / stats as f64;

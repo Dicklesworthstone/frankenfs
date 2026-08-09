@@ -2978,7 +2978,15 @@ fn collect_leaf_item_batch(
     Ok(())
 }
 
-fn key_cmp(lhs: &BtrfsKey, rhs: &BtrfsKey) -> Ordering {
+/// Canonical btrfs key ordering: `(objectid, item_type, offset)` ascending.
+///
+/// Public because [`floor_in_leaf`]'s correctness precondition is stated in terms
+/// of it — a caller reusing a retained leaf must check `first_key <= target <=
+/// last_key`, and cannot do so without the same comparator the tree is sorted by.
+/// `BtrfsKey` deliberately does not derive `Ord`: the on-disk ordering is a
+/// format property, not a derived one, and deriving it would silently follow
+/// field declaration order.
+pub fn key_cmp(lhs: &BtrfsKey, rhs: &BtrfsKey) -> Ordering {
     lhs.objectid
         .cmp(&rhs.objectid)
         .then_with(|| lhs.item_type.cmp(&rhs.item_type))
