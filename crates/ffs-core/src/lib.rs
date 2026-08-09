@@ -55425,6 +55425,105 @@ mod tests {
         );
     }
 
+    /// Build a populated btrfs image once and return its raw bytes, so several
+    /// arms can each open a COLD `OpenFs` from the same image (bd-5vis3).
+    ///
+    /// Re-opening per arm is what removes the warm-cache confound that inflated
+    /// the first A/B: caches live on `OpenFs`, so a second arm run against the
+    /// same instance inherits everything the first one warmed.
+    fn build_populated_btrfs_bytes_bd_5vis3(files: usize) -> Option<Vec<u8>> {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir(&seed).ok()?;
+        for i in 0..files {
+            std::fs::write(seed.join(format!("f{i:05}")), b"x").ok()?;
+        }
+        let image = tmp.path().join("bd5vis3.btrfs");
+        let f = std::fs::File::create(&image).ok()?;
+        f.set_len(512 * 1024 * 1024).ok()?;
+        drop(f);
+        let out = std::process::Command::new("mkfs.btrfs")
+            .args(["-f", "-q", "--rootdir"])
+            .arg(&seed)
+            .arg(&image)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        std::fs::read(&image).ok()
+    }
+
+    /// bd-5vis3: does the memo still pay in the PRODUCTION configuration, where
+    /// the read-only attr cache is active?
+    ///
+    /// The isolated A/B disables that cache to measure the memo alone. Production
+    /// does not, and the cache answers a repeat stat of the same inode without
+    /// touching the tree — so the memo's marginal value could be much smaller
+    /// than 3.73x, or absent. That is the number that decides whether this ships
+    /// enabled, and it had never been measured.
+    ///
+    /// Each arm opens a COLD `OpenFs` from the same image bytes: caches live on
+    /// the instance, and reusing one hands the second arm everything the first
+    /// warmed — the exact confound that inflated the first A/B to a withdrawn
+    /// 30.9x.
+    #[test]
+    #[ignore = "bd-5vis3: measurement, not a gate — builds a large btrfs fixture"]
+    fn btrfs_floor_memo_still_pays_with_the_attr_cache_active_bd_5vis3_prod() {
+        let Some(bytes) = build_populated_btrfs_bytes_bd_5vis3(20_000) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+
+        let mut arm = |memo_disabled: bool| -> (u64, std::time::Duration, u64) {
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes.clone())),
+                &OpenOptions::default(),
+            )
+            .expect("open btrfs");
+            fs.set_btrfs_floor_memo_disabled(memo_disabled);
+            let root = InodeNumber(1);
+            let mut inos: Vec<InodeNumber> = Vec::new();
+            let mut offset = 0_u64;
+            loop {
+                let page = fs.readdir(&cx, root, offset).expect("readdir");
+                if page.is_empty() {
+                    break;
+                }
+                let next = page.last().map_or(offset + 1, |e| e.offset);
+                for e in &page {
+                    if e.name != b"." && e.name != b".." {
+                        inos.push(e.ino);
+                    }
+                }
+                if next <= offset {
+                    break;
+                }
+                offset = next;
+            }
+            let (l0, _) = crate::btrfs_node_cache_counters();
+            let start = std::time::Instant::now();
+            let mut ok = 0_u64;
+            for ino in &inos {
+                if fs.getattr(&cx, *ino).is_ok() {
+                    ok += 1;
+                }
+            }
+            let elapsed = start.elapsed();
+            let (l1, _) = crate::btrfs_node_cache_counters();
+            (ok, elapsed, l1.saturating_sub(l0))
+        };
+
+        let (ok_off, t_off, look_off) = arm(true);
+        let (ok_on, t_on, look_on) = arm(false);
+        assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
+        println!(
+            "bd-5vis3 PRODUCTION CONFIG (attr cache ON, cold fs per arm, {ok_on} inodes)\n               memo OFF: {t_off:?}  {look_off} lookups\n  memo ON : {t_on:?}  {look_on} lookups\n               wall {:.3}x",
+            t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+    }
+
     /// Build a small btrfs image with a populated root and open it READ-ONLY (the
     /// mode where the parsed-node cache is active), returning the fs and the file
     /// count. `None` when btrfs-progs is missing or cannot bake a directory in.
