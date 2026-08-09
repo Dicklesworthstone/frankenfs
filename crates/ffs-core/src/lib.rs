@@ -8870,8 +8870,6 @@ impl OpenFs {
             let memo = self.btrfs_floor_leaf_memo.lock();
             if let Some(memo) = memo.as_ref()
                 && memo.root_logical == root_logical
-                && ffs_btrfs::key_cmp(&memo.first_key, &target) != std::cmp::Ordering::Greater
-                && ffs_btrfs::key_cmp(&target, &memo.last_key) != std::cmp::Ordering::Greater
             {
                 let leaf = Arc::clone(&memo.leaf);
                 drop(memo);
