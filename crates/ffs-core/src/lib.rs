@@ -8825,6 +8825,14 @@ impl OpenFs {
     #[cfg(test)]
     fn btrfs_test_clear_node_cache(&self) {
         self.btrfs_parsed_node_cache.clear();
+        // The floor-leaf memo retains a leaf INDEPENDENTLY of this cache
+        // (bd-5vis3), so clearing only the cache no longer produces a cold
+        // descent: a following lookup inside the retained leaf's span is served
+        // without reading a node at all. Every caller of this helper exists to
+        // measure per-op descent structure against cold reads, so the memo must
+        // go with it — otherwise the next read-count test written against this
+        // helper silently measures a warm path and reports too few reads.
+        *self.btrfs_floor_leaf_memo.lock() = None;
     }
 
     /// Targeted-descent counterpart to [`walk_btrfs_tree`](Self::walk_btrfs_tree):
