@@ -55527,7 +55527,85 @@ mod tests {
         );
     }
 
-    /// bd-5vis3: does the memo HURT a random-access workload?    /// bd-5vis3: does the memo HURT a random-access workload?
+    /// bd-3zx2x + bd-5vis3: THREE arms on ONE fixture — read-plan index, bounded
+    /// memo, and neither.
+    ///
+    /// bd-3zx2x attributed the btrfs readdir+stat excess to the un-prewarmed
+    /// per-inode descent, measured as a 15.61x gap between prewarm-on and
+    /// prewarm-off. bd-5vis3 then built a bounded memo to remove that descent
+    /// without the index's unbounded footprint. What has never been measured is
+    /// the two against each other on the SAME fixture, which is the claim that
+    /// actually matters: does one retained leaf capture what a
+    /// whole-filesystem index buys?
+    ///
+    /// Cold fs per arm, attr cache disabled in all three so the comparison is
+    /// between the three resolution strategies and nothing else.
+    #[test]
+    #[ignore = "bd-3zx2x/bd-5vis3: measurement, not a gate — builds a large btrfs fixture"]
+    fn btrfs_index_versus_memo_versus_neither_bd_3zx2x() {
+        let Some(bytes) = build_populated_btrfs_bytes_bd_5vis3(20_000) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+
+        let mut arm = |prewarm: bool, memo: bool| -> (u64, std::time::Duration, u64) {
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes.clone())),
+                &OpenOptions::default(),
+            )
+            .expect("open btrfs");
+            fs.set_readonly_lookup_cache_disabled(true);
+            fs.set_btrfs_floor_memo_disabled(!memo);
+            if prewarm {
+                fs.prewarm_btrfs_read_plan_index(&cx).expect("prewarm");
+            }
+            let root = InodeNumber(1);
+            let mut inos: Vec<InodeNumber> = Vec::new();
+            let mut offset = 0_u64;
+            loop {
+                let page = fs.readdir(&cx, root, offset).expect("readdir");
+                if page.is_empty() {
+                    break;
+                }
+                let next = page.last().map_or(offset + 1, |e| e.offset);
+                for e in &page {
+                    if e.name != b"." && e.name != b".." {
+                        inos.push(e.ino);
+                    }
+                }
+                if next <= offset {
+                    break;
+                }
+                offset = next;
+            }
+            let (l0, _) = crate::btrfs_node_cache_counters();
+            let start = std::time::Instant::now();
+            let mut ok = 0_u64;
+            for ino in &inos {
+                if fs.getattr(&cx, *ino).is_ok() {
+                    ok += 1;
+                }
+            }
+            let elapsed = start.elapsed();
+            let (l1, _) = crate::btrfs_node_cache_counters();
+            (ok, elapsed, l1.saturating_sub(l0))
+        };
+
+        let (n0, t_neither, look_neither) = arm(false, false);
+        let (n1, t_memo, look_memo) = arm(false, true);
+        let (n2, t_index, look_index) = arm(true, false);
+        assert_eq!(n0, n1);
+        assert_eq!(n1, n2);
+        println!(
+            "bd-3zx2x THREE-ARM ({n0} inodes, attr cache off, cold fs each)\n               neither      : {t_neither:?}  {look_neither} lookups\n               memo (1 leaf): {t_memo:?}  {look_memo} lookups\n               index (whole): {t_index:?}  {look_index} lookups\n               memo vs neither {:.3}x, index vs neither {:.3}x, memo/index {:.3}x",
+            t_neither.as_secs_f64() / t_memo.as_secs_f64().max(f64::MIN_POSITIVE),
+            t_neither.as_secs_f64() / t_index.as_secs_f64().max(f64::MIN_POSITIVE),
+            t_memo.as_secs_f64() / t_index.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+    }
+
+    /// bd-5vis3: does the memo HURT a random-access workload?    /// bd-5vis3: does the memo HURT a random-access workload?    /// bd-5vis3: does the memo HURT a random-access workload?
     ///
     /// Every claim about this lever so far is a sequential sweep, where the memo
     /// hits constantly. The opposite case is the one that matters for shipping it
