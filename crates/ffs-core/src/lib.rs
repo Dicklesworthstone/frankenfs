@@ -55837,7 +55837,48 @@ mod tests {
     }
 
     #[cfg(feature = "bhh0i_sharded_alloc")]
+    /// ⛔ KNOWN FAILING, `#[ignore]`d — a REAL defect found 2026-08-09, not a
+    /// flaky test. Renaming a DIRECTORY over an existing directory leaks a free
+    /// BLOCK per rename on the sharded path.
+    ///
+    ///     200 dir-over-dir renames, sharded:
+    ///       Free blocks count wrong for group #0 (13884, counted=14084)
+    ///     the single-lock control on the identical workload: CLEAN
+    ///
+    /// Drift is exactly 200 over 200 renames — one block per clobbered directory,
+    /// which is the target directory's own data block.
+    ///
+    /// MECHANISM, and it contradicts a finding this bead previously banked. The
+    /// rename fix routes only the INODE free through the sharded records and
+    /// leaves block frees on the single-lock path, because ab757b85 measured that
+    /// data blocks never diverge — allocated and freed through the same
+    /// structure. That holds for FILE data blocks. It does NOT hold for a
+    /// DIRECTORY's block, which the sharded dir-growth allocator
+    /// (`ext4_sharded_alloc_dir_block`) allocates from the sharded records while
+    /// `release_inode_storage_deferring_writeback` frees it against the
+    /// single-lock array. Same divergence as bd-pbyu0, on the block side.
+    ///
+    /// ⚠ LIKELY NOT RENAME-SPECIFIC: `rmdir` uses the same
+    /// `release_inode_storage_deferring_writeback`, so removing a
+    /// sharded-allocated directory should leak identically. The concurrency gate
+    /// never caught it because that workload creates and deletes FILES, whose
+    /// blocks come from the ordinary allocator. UNVERIFIED — check rmdir before
+    /// fixing, because it decides whether the fix belongs in rename or in the
+    /// shared release path.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    #[ignore = "bd-y2t0r: dir-over-dir rename leaks a free block on the sharded path; see doc comment"]
+    fn rename_over_existing_directory_leaks_a_block_bd_y2t0r() {
+        rename_over_existing_counter_check_bd_y2t0r_inner(true, true);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
     fn rename_over_existing_counter_check_bd_y2t0r(sharded: bool) {
+        rename_over_existing_counter_check_bd_y2t0r_inner(sharded, false);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn rename_over_existing_counter_check_bd_y2t0r_inner(sharded: bool, dirs_too: bool) {
         let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
             return; // e2fsprogs unavailable
         };
@@ -55857,6 +55898,24 @@ mod tests {
                 .unwrap_or_else(|error| panic!("create {source}: {error}"));
             fs.rename(&cx, root, OsStr::new(&source), root, OsStr::new(&victim))
                 .unwrap_or_else(|error| panic!("rename {source} -> {victim}: {error}"));
+
+            if dirs_too {
+                // DIRECTORY over DIRECTORY takes a different branch: `expect_dir`
+                // routes through `ext4_dir_link_dec`, and freeing the target credits
+                // `used_dirs` as well as the inode count. That is a SEPARATE
+                // accounting field reached through the same sharded seam, and a defect
+                // in it surfaces as an e2fsck directory-count error rather than a
+                // free-inode drift — which the file-only version of this test could
+                // not have detected.
+                let dvictim = format!("dvictim-{cycle:04}");
+                let dsource = format!("dsource-{cycle:04}");
+                fs.mkdir(&cx, root, OsStr::new(&dvictim), 0o755, 0, 0)
+                    .unwrap_or_else(|error| panic!("mkdir {dvictim}: {error}"));
+                fs.mkdir(&cx, root, OsStr::new(&dsource), 0o755, 0, 0)
+                    .unwrap_or_else(|error| panic!("mkdir {dsource}: {error}"));
+                fs.rename(&cx, root, OsStr::new(&dsource), root, OsStr::new(&dvictim))
+                    .unwrap_or_else(|error| panic!("rename dir {dsource} -> {dvictim}: {error}"));
+            }
         }
 
         fs.flush_mvcc_to_device(&cx).expect("flush to device");
@@ -55865,6 +55924,13 @@ mod tests {
         let Some((clean, output)) = run_e2fsck(&image) else {
             return; // e2fsck unavailable
         };
+        assert!(
+            !output.contains("Directories count wrong"),
+            "rename-over-existing-DIRECTORY drifted the per-group directory count \
+             with sharded={sharded}: the sharded inode free must decrement used_dirs \
+             for a directory target, exactly as the single-lock path does \
+             (bd-y2t0r):\n{output}"
+        );
         assert!(
             !output.contains("Free inodes count wrong"),
             "rename-over-existing leaked free-inode counters with sharded={sharded} \
