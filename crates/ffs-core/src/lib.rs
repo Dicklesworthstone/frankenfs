@@ -55037,6 +55037,85 @@ mod tests {
         concurrent_create_delete_counter_check_bd_y2t0r(false);
     }
 
+    /// bd-5vis3: DIRECT differential — every inode must resolve identically with
+    /// the memo on and off, on a fixture large enough to span several leaves,
+    /// queried in an order that is not the key order.
+    ///
+    /// This is the test that justifies shipping the memo enabled by default. The
+    /// other two do not: the descent test catches a broken memo only because a
+    /// wrong answer happens to make `getattr` FAIL there, and the concurrency
+    /// test was proven by negative control not to guard the span check at all.
+    /// Neither compares the memo's answers against the descent's.
+    ///
+    /// The scrambled order is the point. A sequential sweep stays inside one
+    /// leaf, which is exactly the case an unguarded memo answers correctly by
+    /// luck; stepping by a stride coprime to the entry count forces repeated
+    /// crossings of leaf boundaries, where a wrong span check must diverge.
+    #[test]
+    fn btrfs_floor_memo_answers_match_the_descent_path_bd_5vis3() {
+        let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(4000) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(1);
+        let mut inos: Vec<InodeNumber> = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            let page = fs.readdir(&cx, root, offset).expect("readdir root");
+            if page.is_empty() {
+                break;
+            }
+            let next = page.last().map_or(offset + 1, |e| e.offset);
+            for entry in &page {
+                if entry.name != b"." && entry.name != b".." {
+                    inos.push(entry.ino);
+                }
+            }
+            if next <= offset {
+                break;
+            }
+            offset = next;
+        }
+        assert!(inos.len() >= 500, "fixture too small: {}", inos.len());
+
+        // Stride coprime with the length: visits every entry exactly once while
+        // jumping across leaves on every step.
+        let n = inos.len();
+        let stride = 977.min(n.saturating_sub(1)).max(1);
+        let order: Vec<InodeNumber> = (0..n).map(|i| inos[(i * stride) % n]).collect();
+
+        // Without this the FIRST sweep populates the read-only attr cache and the
+        // SECOND is served from it, never reaching the memo — the differential
+        // would compare the attr cache against itself and pass unconditionally.
+        // Verified: with it left on, removing the span check entirely still left
+        // this test green.
+        fs.set_readonly_lookup_cache_disabled(true);
+        let sweep = |disabled: bool| -> Vec<Option<(InodeNumber, u64, u64)>> {
+            fs.set_btrfs_floor_memo_disabled(disabled);
+            order
+                .iter()
+                .map(|ino| {
+                    fs.getattr(&cx, *ino)
+                        .ok()
+                        .map(|a| (a.ino, a.size, a.blocks))
+                })
+                .collect()
+        };
+
+        let without = sweep(true);
+        let with = sweep(false);
+        assert!(
+            without.iter().all(Option::is_some),
+            "the descent path itself failed to resolve some inode — the fixture or \
+             the walker is broken, not the memo"
+        );
+        assert_eq!(
+            with, without,
+            "the floor-leaf memo disagreed with the descent path on a scrambled \
+             sweep across leaf boundaries (bd-5vis3)"
+        );
+    }
+
     /// bd-5vis3: the floor-leaf memo must be correct under CONCURRENCY, because
     /// the mounted comparator row this bead owes is an 8-thread readdir+stat and
     /// the memo has only ever been exercised single-threaded.
@@ -55186,6 +55265,11 @@ mod tests {
             inos.len()
         );
 
+        // The read-only per-inode ATTR CACHE sits in front of the tree in
+        // `btrfs_read_inode_attr`, so leaving it on means the second arm is served
+        // from it and never reaches the memo at all — the two arms would differ by
+        // cache warmth, not by the memo. Disable it so this measures what it says.
+        fs.set_readonly_lookup_cache_disabled(true);
         let mut arm = |disabled: bool| {
             fs.set_btrfs_floor_memo_disabled(disabled);
             let (l0, h0) = crate::btrfs_node_cache_counters();
