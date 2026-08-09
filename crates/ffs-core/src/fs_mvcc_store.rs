@@ -39,7 +39,62 @@ fn commit_error_to_ffs(error: &CommitError) -> FfsError {
     }
 }
 
-/// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
+#[cfg(test)]
+mod commit_error_mapping_tests {
+    use super::commit_error_to_ffs;
+    use ffs_error::FfsError;
+    use ffs_mvcc::CommitError;
+    use ffs_types::{BlockNumber, CommitSeq};
+
+    /// bd-y2t0r: a first-committer-wins conflict must surface as `EAGAIN`, and
+    /// this pins that deliberately rather than leaving it incidental.
+    ///
+    /// It is also a BEHAVIOUR CHANGE worth stating plainly: before the retry work
+    /// these conflicts were flattened into `FfsError::Format`, which maps to
+    /// `EINVAL`. `EINVAL` says the caller passed something invalid, which is
+    /// false — nothing about the request was wrong, another writer simply
+    /// committed the same block first. `EAGAIN` says "try again", which is what
+    /// actually happened and what a caller can act on.
+    ///
+    /// Any caller that does NOT retry now surfaces `EAGAIN` where it previously
+    /// surfaced `EINVAL`. That is an improvement, but it is a change, and a
+    /// client keying on `EINVAL` for this case would need updating.
+    #[test]
+    fn a_first_committer_wins_conflict_maps_to_eagain_not_einval() {
+        let conflict = CommitError::Conflict {
+            block: BlockNumber(38),
+            snapshot: CommitSeq(1),
+            observed: CommitSeq(2),
+        };
+        let mapped = commit_error_to_ffs(&conflict);
+        assert!(
+            matches!(mapped, FfsError::MvccConflict { block: 38, .. }),
+            "a conflict must keep its type and its block: {mapped:?}"
+        );
+        assert_eq!(
+            mapped.to_errno(),
+            libc::EAGAIN,
+            "a transient conflict must be retryable, not reported as a bad argument"
+        );
+        assert_ne!(
+            mapped.to_errno(),
+            libc::EINVAL,
+            "EINVAL was the PREVIOUS mapping and is wrong: the request was valid"
+        );
+    }
+
+    /// Everything that is not a conflict keeps its previous shape, so the typed
+    /// mapping did not widen beyond the one case that needed it.
+    #[test]
+    fn non_conflict_commit_failures_stay_format_errors() {
+        let other = CommitError::DurabilityFailure {
+            detail: "wal write failed".to_owned(),
+        };
+        assert!(matches!(commit_error_to_ffs(&other), FfsError::Format(_)));
+    }
+}
+
+/// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API./// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
 ///
 /// The enum is always owned behind `Arc`; boxing a variant would add another
 /// hot-path indirection without reducing the outer handle size.
