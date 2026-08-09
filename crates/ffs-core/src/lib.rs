@@ -1596,6 +1596,13 @@ pub struct OpenFs {
     /// Bounded by construction: ONE leaf, not a structure that grows with the
     /// filesystem — which is the property bd-5vis3 exists to preserve.
     btrfs_floor_leaf_memo: Mutex<Option<BtrfsFloorLeafMemo>>,
+    /// Kill switch for the floor-leaf memo (bd-5vis3).
+    ///
+    /// A new cache on a metadata READ path deserves one: it makes the A/B
+    /// measurable in a single process on one image, and if the memo were ever
+    /// implicated in a wrong-metadata report it can be taken out without a
+    /// rebuild. Default off (memo enabled).
+    btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool,
     /// Read-only per-directory name→child_objectid map (the btrfs analog of the
     /// ext4 present-index). On a read-only mount the directory is immutable, so a
     /// map built once from readdir serves `btrfs_lookup_child` name resolution in
@@ -4728,6 +4735,7 @@ impl OpenFs {
             btrfs_verified_dir_inode: AtomicU64::new(0),
             btrfs_parsed_node_cache: ShardedCache::new(),
             btrfs_floor_leaf_memo: Mutex::new(None),
+            btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(false),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
@@ -8854,7 +8862,10 @@ impl OpenFs {
         // Read-only mounts ONLY, matching `btrfs_read_parsed_node`: COW reuses
         // physical addresses across commits when writes are enabled, so a
         // retained leaf would go stale.
-        let memoizable = self.btrfs_alloc_state.is_none();
+        let memoizable = self.btrfs_alloc_state.is_none()
+            && !self
+                .btrfs_floor_memo_disabled
+                .load(std::sync::atomic::Ordering::Relaxed);
         if memoizable {
             let memo = self.btrfs_floor_leaf_memo.lock();
             if let Some(memo) = memo.as_ref()
@@ -34250,6 +34261,16 @@ impl OpenFs {
     /// neither built nor grown during the sweep — every probe would miss, so they
     /// are pure overhead. Correctness is unchanged: a later `lookup`/re-`getattr`
     /// simply takes the uncached htree/inode-read path.
+    /// Disable (or re-enable) the btrfs floor-leaf memo (bd-5vis3). See
+    /// `btrfs_floor_memo_disabled`.
+    pub fn set_btrfs_floor_memo_disabled(&self, disabled: bool) {
+        self.btrfs_floor_memo_disabled
+            .store(disabled, std::sync::atomic::Ordering::Relaxed);
+        if disabled {
+            *self.btrfs_floor_leaf_memo.lock() = None;
+        }
+    }
+
     pub fn set_readonly_lookup_cache_disabled(&self, disabled: bool) {
         self.readonly_lookup_cache_disabled
             .store(disabled, std::sync::atomic::Ordering::Relaxed);
@@ -55014,6 +55035,71 @@ mod tests {
     #[test]
     fn concurrent_create_delete_under_single_lock_keeps_counters_exact_bd_y2t0r() {
         concurrent_create_delete_counter_check_bd_y2t0r(false);
+    }
+
+    /// bd-5vis3: the floor-leaf memo A/B on a fixture deep enough to matter.
+    ///
+    /// The landed measurement used 48 files, whose tree is shallow enough that
+    /// only ~2 levels collapse. The quantity this bead promised was measured on a
+    /// 32,770-entry directory, where a descent crosses more levels and there is
+    /// correspondingly more to remove. This runs BOTH arms in one process against
+    /// ONE image, toggling only the memo, so nothing but the memo differs.
+    ///
+    /// `#[ignore]`d because building the fixture costs real time; it is a
+    /// measurement, not a gate. Run explicitly:
+    ///   cargo test -p ffs-core --lib bd_5vis3_large -- --ignored --nocapture
+    #[test]
+    #[ignore = "bd-5vis3: measurement, not a gate — builds a large btrfs fixture"]
+    fn btrfs_floor_memo_ab_on_a_large_fixture_bd_5vis3_large() {
+        let Some((fs, files)) = open_populated_btrfs_readonly_bd_5vis3(20_000) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(1);
+        let listing = fs.readdir(&cx, root, 0).expect("readdir root");
+        let inos: Vec<InodeNumber> = listing
+            .iter()
+            .filter(|e| e.name != b"." && e.name != b"..")
+            .map(|e| e.ino)
+            .collect();
+        assert!(
+            inos.len() >= files / 2,
+            "fixture under-populated: {}",
+            inos.len()
+        );
+
+        let mut arm = |disabled: bool| {
+            fs.set_btrfs_floor_memo_disabled(disabled);
+            let (l0, h0) = crate::btrfs_node_cache_counters();
+            let start = std::time::Instant::now();
+            let mut ok = 0_u64;
+            for ino in &inos {
+                if fs.getattr(&cx, *ino).is_ok() {
+                    ok += 1;
+                }
+            }
+            let elapsed = start.elapsed();
+            let (l1, h1) = crate::btrfs_node_cache_counters();
+            (ok, elapsed, l1.saturating_sub(l0), h1.saturating_sub(h0))
+        };
+
+        // Memo OFF first so its arm is not handed a cache warmed by the other.
+        let (ok_off, t_off, lookups_off, hits_off) = arm(true);
+        let (ok_on, t_on, lookups_on, hits_on) = arm(false);
+        assert_eq!(ok_off, ok_on, "both arms must stat the same inodes");
+
+        println!(
+            "bd-5vis3 LARGE ({} inodes)\n  memo OFF: {t_off:?}  {lookups_off} lookups              ({:.2}/stat), {hits_off} hits\n  memo ON : {t_on:?}  {lookups_on} lookups              ({:.2}/stat), {hits_on} hits\n  lookups {:.2}x fewer, wall {:.3}x",
+            ok_on,
+            lookups_off as f64 / ok_off.max(1) as f64,
+            lookups_on as f64 / ok_on.max(1) as f64,
+            lookups_off as f64 / lookups_on.max(1) as f64,
+            t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+        assert!(
+            lookups_on < lookups_off,
+            "the memo must reduce node lookups: on={lookups_on} off={lookups_off}"
+        );
     }
 
     /// bd-5vis3: is the un-prewarmed btrfs stat cost per-inode DESCENT work over
