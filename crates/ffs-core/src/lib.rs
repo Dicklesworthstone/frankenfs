@@ -55425,7 +55425,81 @@ mod tests {
         );
     }
 
-    /// Build a populated btrfs image once and return its raw bytes, so several
+    /// bd-5vis3: does the memo HURT a random-access workload?
+    ///
+    /// Every claim about this lever so far is a sequential sweep, where the memo
+    /// hits constantly. The opposite case is the one that matters for shipping it
+    /// enabled by default: on random access it mostly MISSES, and a miss is not
+    /// free — it costs a mutex acquire and two key comparisons on every descent,
+    /// paid before falling through to the walk it was trying to avoid.
+    ///
+    /// I have asserted "random access would see less benefit" repeatedly without
+    /// checking it does not see a LOSS. This checks. A ratio meaningfully below
+    /// 1.0 would mean the default-on setting taxes workloads that never benefit.
+    ///
+    /// Cold fs per arm, attr cache disabled so the memo is what is being measured
+    /// rather than the cache in front of it.
+    #[test]
+    #[ignore = "bd-5vis3: measurement, not a gate — builds a large btrfs fixture"]
+    fn btrfs_floor_memo_does_not_tax_random_access_bd_5vis3_random() {
+        let Some(bytes) = build_populated_btrfs_bytes_bd_5vis3(8_000) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+
+        let mut arm = |memo_disabled: bool| -> (u64, std::time::Duration) {
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes.clone())),
+                &OpenOptions::default(),
+            )
+            .expect("open btrfs");
+            fs.set_btrfs_floor_memo_disabled(memo_disabled);
+            fs.set_readonly_lookup_cache_disabled(true);
+            let root = InodeNumber(1);
+            let mut inos: Vec<InodeNumber> = Vec::new();
+            let mut offset = 0_u64;
+            loop {
+                let page = fs.readdir(&cx, root, offset).expect("readdir");
+                if page.is_empty() {
+                    break;
+                }
+                let next = page.last().map_or(offset + 1, |e| e.offset);
+                for e in &page {
+                    if e.name != b"." && e.name != b".." {
+                        inos.push(e.ino);
+                    }
+                }
+                if next <= offset {
+                    break;
+                }
+                offset = next;
+            }
+            // A large stride coprime with the length maximises leaf crossings, so
+            // the memo misses nearly every time — the worst case for it.
+            let n = inos.len();
+            let stride = 4099.min(n.saturating_sub(1)).max(1);
+            let order: Vec<InodeNumber> = (0..n).map(|i| inos[(i * stride) % n]).collect();
+            let start = std::time::Instant::now();
+            let mut ok = 0_u64;
+            for ino in &order {
+                if fs.getattr(&cx, *ino).is_ok() {
+                    ok += 1;
+                }
+            }
+            (ok, start.elapsed())
+        };
+
+        let (ok_off, t_off) = arm(true);
+        let (ok_on, t_on) = arm(false);
+        assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
+        let ratio = t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE);
+        println!(
+            "bd-5vis3 RANDOM ACCESS ({ok_on} inodes, worst case for the memo)\n               memo OFF: {t_off:?}\n  memo ON : {t_on:?}\n  memo is {ratio:.3}x              (below 1.0 means the memo TAXES this workload)"
+        );
+    }
+
+    /// Build a populated btrfs image once and return its raw bytes, so several    /// Build a populated btrfs image once and return its raw bytes, so several
     /// arms can each open a COLD `OpenFs` from the same image (bd-5vis3).
     ///
     /// Re-opening per arm is what removes the warm-cache confound that inflated
