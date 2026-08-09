@@ -55062,7 +55062,12 @@ mod tests {
             .collect();
         assert!(inos.len() >= 8, "fixture too small: {}", inos.len());
 
-        // Ground truth, single-threaded, memo active.
+        // Ground truth must come from the memo-DISABLED path. Capturing it with
+        // the memo active makes the comparison circular: a memo that is
+        // systematically wrong agrees with itself, and the test passes while
+        // metadata is corrupt. Verified by negative control — with the span check
+        // removed, the circular version of this test still passed.
+        fs.set_btrfs_floor_memo_disabled(true);
         let expected: Vec<(InodeNumber, Option<(InodeNumber, u64, u64)>)> = inos
             .iter()
             .map(|ino| {
@@ -55074,6 +55079,12 @@ mod tests {
                 )
             })
             .collect();
+        assert!(
+            expected.iter().all(|(_, attr)| attr.is_some()),
+            "every entry must stat on the descent path before the memo is judged \
+             against it"
+        );
+        fs.set_btrfs_floor_memo_disabled(false);
 
         let fs = std::sync::Arc::new(fs);
         let expected = std::sync::Arc::new(expected);
@@ -55235,7 +55246,19 @@ mod tests {
         let (lookups_after, hits_after) = crate::btrfs_node_cache_counters();
         let lookups = lookups_after.saturating_sub(lookups_before);
         let hits = hits_after.saturating_sub(hits_before);
-        assert!(stats > 0, "no entry could be stat'd");
+        // Every entry must resolve, not merely one. A wrong memo makes getattr
+        // FAIL here rather than return bad data, so `stats > 0` passed while 41 of
+        // 48 lookups were failing — measured via a negative control that removed
+        // the span check.
+        let expected_stats = listing
+            .iter()
+            .filter(|e| e.name != b"." && e.name != b"..")
+            .count() as u64;
+        assert_eq!(
+            stats, expected_stats,
+            "only {stats} of {expected_stats} entries stat'd — inode resolution is \
+             failing, which is what a wrong floor-leaf memo looks like (bd-5vis3)"
+        );
         assert!(
             lookups > 0,
             "the node-cache counters never moved across {stats} stats — the \
