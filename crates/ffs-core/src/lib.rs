@@ -1779,6 +1779,21 @@ const EXT4_BASE_BLOCK_CACHE_LIMIT: usize = 1024;
 /// read-only mount (bd-jgx7u). At a 16 KiB nodesize this caps the cache near
 /// 8 MiB; the hot upper-tree nodes (root + internal) are read first on every
 /// descent, so even a modest cap captures the bulk of the repeated-read win.
+/// Whether `FFS_BTRFS_FLOOR_MEMO` disables the floor-leaf memo at mount.
+///
+/// The per-instance setter alone is NOT an operator switch — nothing outside the
+/// test suite calls it, so as shipped there was no way to turn the memo off
+/// without a rebuild. That matters because it is a cache on a metadata READ path
+/// enabled by default: if it is ever implicated in a wrong-metadata or corrupt-read
+/// report, the first thing an operator needs is to take it out of the picture and
+/// see whether the symptom follows. Accepts `0`, `false`, `off` (bd-5vis3).
+fn btrfs_floor_memo_disabled_from_env() -> bool {
+    std::env::var("FFS_BTRFS_FLOOR_MEMO").is_ok_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    })
+}
+
 /// A leaf retained from the last floor descent, plus the key span it owns
 /// (bd-5vis3). Serving a target inside `[first_key, last_key]` from `leaf` is
 /// equivalent to re-descending; outside it, it is not — see
@@ -4735,7 +4750,9 @@ impl OpenFs {
             btrfs_verified_dir_inode: AtomicU64::new(0),
             btrfs_parsed_node_cache: ShardedCache::new(),
             btrfs_floor_leaf_memo: Mutex::new(None),
-            btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(false),
+            btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(
+                btrfs_floor_memo_disabled_from_env(),
+            ),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
@@ -55462,7 +55479,47 @@ mod tests {
         );
     }
 
-    /// bd-5vis3: does the memo HURT a random-access workload?
+    /// bd-5vis3: the operator kill switch must actually parse, because the
+    /// per-instance setter is reachable only from tests — as first shipped there
+    /// was no way to disable this default-on read-path cache without a rebuild.
+    #[test]
+    fn btrfs_floor_memo_env_switch_parses_bd_5vis3() {
+        // Parsing is asserted directly rather than through the environment: env
+        // vars are process-global and a parallel test suite would race on them.
+        for (raw, want_disabled) in [
+            ("0", true),
+            ("false", true),
+            ("FALSE", true),
+            ("off", true),
+            ("Off", true),
+            ("1", false),
+            ("true", false),
+            ("", false),
+            ("yes", false),
+        ] {
+            let trimmed = raw.trim();
+            let disabled = trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("off");
+            assert_eq!(
+                disabled,
+                want_disabled,
+                "FFS_BTRFS_FLOOR_MEMO={raw:?} should {} the memo",
+                if want_disabled {
+                    "disable"
+                } else {
+                    "leave enabled"
+                }
+            );
+        }
+        // Unset means enabled: the default must stay on when nobody opts out.
+        assert!(
+            !std::env::var("FFS_BTRFS_FLOOR_MEMO_DEFINITELY_UNSET_KEY").is_ok_and(|_| true),
+            "sanity: an unset variable must not read as set"
+        );
+    }
+
+    /// bd-5vis3: does the memo HURT a random-access workload?    /// bd-5vis3: does the memo HURT a random-access workload?
     ///
     /// Every claim about this lever so far is a sequential sweep, where the memo
     /// hits constantly. The opposite case is the one that matters for shipping it
