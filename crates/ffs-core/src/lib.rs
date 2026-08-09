@@ -55696,6 +55696,82 @@ mod tests {
         );
     }
 
+    /// bd-y2t0r: does the sharded path actually go FASTER now that deletes are
+    /// routed? An in-process check, so a scarce quiet window is not spent finding
+    /// out that it does not.
+    ///
+    /// This is NOT the acceptance row. That is the mounted parallel-metadata
+    /// comparator against kernel ext4, and nothing here substitutes for it: no
+    /// FUSE, no kernel arm, no A/A null, one run per arm. What it CAN do is
+    /// falsify cheaply — the sharded path exists to remove a single
+    /// `ext4_alloc_state.write()` that serialises 8 FUSE workers on create, so if
+    /// it is not faster than the single lock on an 8-thread create/delete storm
+    /// in process, the mounted row will not rescue it and the window is better
+    /// spent elsewhere.
+    ///
+    /// Each arm builds its OWN filesystem. Sharing one would hand the second arm
+    /// a warmed instance, which is exactly the confound that produced a withdrawn
+    /// 30.9x on bd-5vis3.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    #[ignore = "bd-y2t0r: measurement, not a gate — 8-thread storm per arm"]
+    fn sharded_vs_single_lock_parallel_metadata_in_process_bd_y2t0r() {
+        let mut arm = |sharded: bool| -> Option<std::time::Duration> {
+            let (fs, _dev, _tmp) = open_writable_ext4_mkfs_with_device(256)?;
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            assert!(!fs.set_bhh0i_sharded_ops(sharded));
+
+            const THREADS: usize = 8;
+            const FILES: usize = 64;
+            const CYCLES: usize = 6;
+            let dirs: Vec<InodeNumber> = (0..THREADS)
+                .map(|w| {
+                    fs.mkdir(&cx, root, OsStr::new(&format!("w{w}")), 0o755, 0, 0)
+                        .expect("mkdir")
+                        .ino
+                })
+                .collect();
+
+            let fs = std::sync::Arc::new(fs);
+            let start = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for (worker, dir) in dirs.iter().enumerate() {
+                    let fs = std::sync::Arc::clone(&fs);
+                    let dir = *dir;
+                    scope.spawn(move || {
+                        let cx = Cx::for_testing();
+                        let fs: &OpenFs = fs.as_ref();
+                        for cycle in 0..CYCLES {
+                            for index in 0..FILES {
+                                let name = format!("f{cycle:02}-{index:03}");
+                                fs.create(&cx, dir, OsStr::new(&name), 0o644, 0, 0)
+                                    .unwrap_or_else(|e| panic!("worker {worker} create: {e}"));
+                            }
+                            for index in 0..FILES {
+                                let name = format!("f{cycle:02}-{index:03}");
+                                fs.unlink(&cx, dir, OsStr::new(&name))
+                                    .unwrap_or_else(|e| panic!("worker {worker} unlink: {e}"));
+                            }
+                        }
+                    });
+                }
+            });
+            Some(start.elapsed())
+        };
+
+        let Some(single) = arm(false) else {
+            return; // e2fsprogs unavailable
+        };
+        let Some(shard) = arm(true) else {
+            return;
+        };
+        let ratio = single.as_secs_f64() / shard.as_secs_f64().max(f64::MIN_POSITIVE);
+        println!(
+            "bd-y2t0r IN-PROCESS 8t create/delete storm (NOT the acceptance row)\n               single-lock: {single:?}\n  sharded    : {shard:?}\n  sharded is {ratio:.3}x              the single-lock throughput"
+        );
+    }
+
     #[cfg(feature = "bhh0i_sharded_alloc")]
     fn concurrent_create_delete_counter_check_bd_y2t0r(sharded: bool) {
         let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(256) else {
