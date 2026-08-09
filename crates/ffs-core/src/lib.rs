@@ -55837,7 +55837,64 @@ mod tests {
     }
 
     #[cfg(feature = "bhh0i_sharded_alloc")]
-    /// ⛔ KNOWN FAILING, `#[ignore]`d — a REAL defect found 2026-08-09, not a
+    /// bd-y2t0r: is the dir-block leak RENAME-specific, or does plain `rmdir`
+    /// leak too? This decides where the fix belongs — in rename, or in the shared
+    /// `release_inode_storage_deferring_writeback` path both use.
+    ///
+    /// ⛔ ANSWERED, AND IT LEAKS — `#[ignore]`d as a known defect, not a flaky
+    /// test. 200 mkdir/rmdir cycles on the sharded path:
+    ///
+    ///     Free blocks count wrong for group #0 (14087, counted=14287)
+    ///
+    /// Drift exactly 200 over 200 cycles, matching the dir-over-dir rename leak
+    /// one for one. So the divergence is NOT rename-specific: it lives in
+    /// `release_inode_storage_deferring_writeback`, which both rename and rmdir
+    /// use, and EVERY directory removal on the sharded path leaks its block.
+    ///
+    /// The fix therefore belongs in the shared release path — route a directory's
+    /// own block free through the sharded records when the sharded path is active
+    /// — and NOT in rename, which is where it would have gone had this come back
+    /// clean.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    #[ignore = "bd-y2t0r: rmdir leaks a dir block on the sharded path — same defect as dir rename; see doc comment"]
+    fn rmdir_of_a_sharded_allocated_directory_does_not_leak_blocks_bd_y2t0r() {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        assert!(!fs.set_bhh0i_sharded_ops(true));
+
+        const CYCLES: usize = 200;
+        for cycle in 0..CYCLES {
+            let name = format!("rd-{cycle:04}");
+            fs.mkdir(&cx, root, OsStr::new(&name), 0o755, 0, 0)
+                .unwrap_or_else(|e| panic!("mkdir {name}: {e}"));
+            fs.rmdir(&cx, root, OsStr::new(&name))
+                .unwrap_or_else(|e| panic!("rmdir {name}: {e}"));
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush");
+        let image = tmp.path().join("rmdir-sharded.ext4");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            !output.contains("Free blocks count wrong"),
+            "rmdir of a sharded-allocated directory leaked free BLOCKS over \
+             {CYCLES} cycles — so the dir-block divergence is NOT rename-specific \
+             and the fix belongs in the shared release path, not in rename \
+             (bd-y2t0r):\n{output}"
+        );
+        assert!(
+            clean,
+            "e2fsck must accept the image after {CYCLES} mkdir/rmdir:\n{output}"
+        );
+    }
+
+    /// ⛔ KNOWN FAILING, `#[ignore]`d — a REAL defect found 2026-08-09, not a    /// ⛔ KNOWN FAILING, `#[ignore]`d — a REAL defect found 2026-08-09, not a
     /// flaky test. Renaming a DIRECTORY over an existing directory leaks a free
     /// BLOCK per rename on the sharded path.
     ///
