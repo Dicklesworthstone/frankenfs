@@ -1216,7 +1216,9 @@ fn parse_placement_scope(value: &str) -> Result<PlacementScope> {
         "same-llc" => Ok(PlacementScope::SameLlc),
         "host-wide" => Ok(PlacementScope::HostWide),
         "balanced-square" => Ok(PlacementScope::BalancedSquare),
-        _ => bail!("unsupported --placement-scope {value}; expected same-llc|host-wide|balanced-square"),
+        _ => bail!(
+            "unsupported --placement-scope {value}; expected same-llc|host-wide|balanced-square"
+        ),
     }
 }
 
@@ -1248,10 +1250,8 @@ fn validate_config(config: &Config) -> Result<()> {
             "{flag} is required: name the machine that built the ELF"
         );
     }
-    let period = balanced_scope_schedule_period(
-        config.placement_scope,
-        config.compares_candidates(),
-    );
+    let period =
+        balanced_scope_schedule_period(config.placement_scope, config.compares_candidates());
     ensure!(
         config.pairs >= 12 && config.pairs % period == 0,
         "--pairs must be a multiple of {period} and at least 12"
@@ -1362,11 +1362,12 @@ fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-const fn balanced_scope_schedule_period(
-    scope: PlacementScope,
-    compares_candidates: bool,
-) -> usize {
-    if scope == PlacementScope::BalancedSquare {
+// `matches!` rather than `==`/`!=`: `PartialEq::eq` is not callable in a `const
+// fn` (E0015), while a pattern match on a fieldless enum is. Same predicate,
+// same result, and it keeps both helpers `const` so the schedule period stays a
+// compile-time constant.
+const fn balanced_scope_schedule_period(scope: PlacementScope, compares_candidates: bool) -> usize {
+    if matches!(scope, PlacementScope::BalancedSquare) {
         schedule_period(false)
     } else {
         schedule_period(compares_candidates)
@@ -1374,7 +1375,7 @@ const fn balanced_scope_schedule_period(
 }
 
 const fn balanced_scope_allows_candidates(scope: PlacementScope, compares: bool) -> bool {
-    scope != PlacementScope::BalancedSquare || !compares
+    !matches!(scope, PlacementScope::BalancedSquare) || !compares
 }
 
 fn balanced_square_margin_is_valid(scope: PlacementScope, maximum_null_ratio: f64) -> bool {
@@ -4625,7 +4626,12 @@ fn select_cpu_placement(
         .copied()
         .collect::<BTreeSet<_>>();
     let driver_domain = match scope {
-        PlacementScope::SameLlc => &last_level_cache_cpus,
+        // Balanced-square is a BUSY-HOST variant of same-LLC placement, not a
+        // different placement: it changes how the schedule defends against
+        // contention, not which CPUs the arms sit on. Sharing SameLlc's domain
+        // keeps it consistent with the `same_llc` field the preflight line
+        // already reports for both (bd-owajb).
+        PlacementScope::SameLlc | PlacementScope::BalancedSquare => &last_level_cache_cpus,
         PlacementScope::HostWide => allowed_cpus,
     };
     // One daemon CPU keeps the historical order: the daemon claims a private
@@ -7545,19 +7551,39 @@ mod tests {
             PlacementScope::BalancedSquare
         );
         assert_eq!(PlacementScope::BalancedSquare.label(), "balanced_square");
-        assert!(balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.02));
-        assert!(!balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.025));
-        assert!(balanced_square_margin_is_valid(PlacementScope::SameLlc, 1.025));
+        assert!(balanced_square_margin_is_valid(
+            PlacementScope::BalancedSquare,
+            1.02
+        ));
+        assert!(!balanced_square_margin_is_valid(
+            PlacementScope::BalancedSquare,
+            1.025
+        ));
+        assert!(balanced_square_margin_is_valid(
+            PlacementScope::SameLlc,
+            1.025
+        ));
         assert_eq!(
             balanced_scope_schedule_period(PlacementScope::BalancedSquare, true),
             4
         );
-        assert!(!balanced_scope_allows_candidates(PlacementScope::BalancedSquare, true));
-        assert!(balanced_scope_allows_candidates(PlacementScope::BalancedSquare, false));
+        assert!(!balanced_scope_allows_candidates(
+            PlacementScope::BalancedSquare,
+            true
+        ));
+        assert!(balanced_scope_allows_candidates(
+            PlacementScope::BalancedSquare,
+            false
+        ));
         assert_eq!(
             placement_evidence_mode(PlacementScope::BalancedSquare),
             "busy_host_balanced_square_with_posthoc_aa_nulls"
         );
+        assert_eq!(
+            placement_evidence_mode(PlacementScope::SameLlc),
+            "same_llc"
+        );
+        assert_eq!(placement_evidence_mode(PlacementScope::HostWide), "host_wide");
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
