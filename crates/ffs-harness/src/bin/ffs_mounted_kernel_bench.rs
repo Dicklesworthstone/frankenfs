@@ -7547,8 +7547,22 @@ mod tests {
 
     #[test]
     fn balanced_square_scope_skips_host_wide_precondition_bd_fleet() {
-        assert_eq!(parse_placement_scope("same-llc").unwrap(), PlacementScope::SameLlc);
-        assert_eq!(parse_placement_scope("host-wide").unwrap(), PlacementScope::HostWide);
+        assert_ne!(
+            PlacementScope::SameLlc.label(),
+            placement_evidence_mode(PlacementScope::SameLlc)
+        );
+        assert_ne!(
+            PlacementScope::HostWide.label(),
+            placement_evidence_mode(PlacementScope::HostWide)
+        );
+        assert_eq!(
+            parse_placement_scope("same-llc").unwrap(),
+            PlacementScope::SameLlc
+        );
+        assert_eq!(
+            parse_placement_scope("host-wide").unwrap(),
+            PlacementScope::HostWide
+        );
         assert_eq!(
             parse_placement_scope("balanced-square").unwrap(),
             PlacementScope::BalancedSquare
@@ -7579,15 +7593,23 @@ mod tests {
             PlacementScope::BalancedSquare,
             false
         ));
+        // `label()` and `placement_evidence_mode()` are deliberately DIFFERENT
+        // strings: the first names the scope, the second names how that scope
+        // establishes the run was clean. Asserting the label's value here is what
+        // made this test red on arrival — the function has never returned bare
+        // "same_llc"/"host_wide" for these two arms.
         assert_eq!(
             placement_evidence_mode(PlacementScope::BalancedSquare),
             "busy_host_balanced_square_with_posthoc_aa_nulls"
         );
         assert_eq!(
             placement_evidence_mode(PlacementScope::SameLlc),
-            "same_llc"
+            "same_llc_contention_preflight"
         );
-        assert_eq!(placement_evidence_mode(PlacementScope::HostWide), "host_wide");
+        assert_eq!(
+            placement_evidence_mode(PlacementScope::HostWide),
+            "host_wide_quiescence_preflight"
+        );
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
