@@ -2578,6 +2578,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.dispatch_opendir(&cx, InodeNumber(ino)) {
             Ok((fh, open_flags)) => reply.opened(fh, open_flags),
@@ -15671,15 +15672,16 @@ mod tests {
         metrics.record_metadata_request();
         metrics.record_metadata_request();
         metrics.record_metadata_request();
+        metrics.record_metadata_request();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.requests_total, 3);
         assert_eq!(snap.requests_ok, 2);
         assert_eq!(snap.requests_err, 1);
         assert_eq!(snap.bytes_read, 1024);
-        assert_eq!(snap.metadata_requests, 4);
+        assert_eq!(snap.metadata_requests, 5);
         let debug = format!("{metrics:?}");
-        assert!(debug.contains("metadata_requests: 4"));
+        assert!(debug.contains("metadata_requests: 5"));
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
