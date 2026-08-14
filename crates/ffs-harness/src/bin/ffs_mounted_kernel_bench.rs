@@ -107,6 +107,9 @@ enum RequestedFilesystems {
 enum PlacementScope {
     SameLlc,
     HostWide,
+    /// Busy-host mode: use the balanced crossover schedule and post-hoc A/A
+    /// nulls instead of an unsatisfiable host-wide quiet precondition.
+    BalancedSquare,
 }
 
 impl PlacementScope {
@@ -114,6 +117,7 @@ impl PlacementScope {
         match self {
             Self::SameLlc => "same_llc",
             Self::HostWide => "host_wide",
+            Self::BalancedSquare => "balanced_square",
         }
     }
 }
@@ -1100,7 +1104,7 @@ fn usage() {
                                           arm runs its filesystem on all client CPUs)\n\
            --fuse-workers N               FUSE request-dispatch workers for both FUSE A/A arms\n\
                                           (default serial dispatcher; 0 selects serial explicitly)\n\
-           --placement-scope SCOPE        same-llc | host-wide (default same-llc)\n\
+           --placement-scope SCOPE        same-llc | host-wide | balanced-square (default same-llc)\n\
            --fixture-construction MODE    seeded | baked (default seeded). `baked` restores the\n\
                                           pre-bd-plkzd unindexed fixture for ATTRIBUTION ONLY and\n\
                                           FORCES the BLOCKED_UNFAIR_FIXTURE verdict (bd-pb85e)\n\
@@ -1211,7 +1215,8 @@ fn parse_placement_scope(value: &str) -> Result<PlacementScope> {
     match value {
         "same-llc" => Ok(PlacementScope::SameLlc),
         "host-wide" => Ok(PlacementScope::HostWide),
-        _ => bail!("unsupported --placement-scope {value}; expected same-llc|host-wide"),
+        "balanced-square" => Ok(PlacementScope::BalancedSquare),
+        _ => bail!("unsupported --placement-scope {value}; expected same-llc|host-wide|balanced-square"),
     }
 }
 
@@ -6626,7 +6631,10 @@ fn run() -> Result<Option<PathBuf>> {
             .collect::<Vec<_>>()
             .join(":"),
         config.placement_scope.label(),
-        config.placement_scope == PlacementScope::SameLlc,
+        matches!(
+            config.placement_scope,
+            PlacementScope::SameLlc | PlacementScope::BalancedSquare
+        ),
         format_cpu_list(placement.last_level_cache_cpus.iter().copied()),
         config.host_quiet_samples,
         placement
@@ -7482,6 +7490,15 @@ mod tests {
         assert!(absolute_arm_medians_are_valid(1.0, 1.0));
         assert!(!absolute_arm_medians_are_valid(0.0, 1.0));
         assert!(!absolute_arm_medians_are_valid(f64::NAN, 1.0));
+    }
+
+    #[test]
+    fn balanced_square_scope_skips_host_wide_precondition_bd_fleet() {
+        assert_eq!(
+            parse_placement_scope("balanced-square").unwrap(),
+            PlacementScope::BalancedSquare
+        );
+        assert_eq!(PlacementScope::BalancedSquare.label(), "balanced_square");
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
