@@ -2560,6 +2560,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Open, |cx, scope| {
             self.inner.ops.open(cx, scope, InodeNumber(ino), flags)
@@ -15673,15 +15674,16 @@ mod tests {
         metrics.record_metadata_request();
         metrics.record_metadata_request();
         metrics.record_metadata_request();
+        metrics.record_metadata_request();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.requests_total, 3);
         assert_eq!(snap.requests_ok, 2);
         assert_eq!(snap.requests_err, 1);
         assert_eq!(snap.bytes_read, 1024);
-        assert_eq!(snap.metadata_requests, 5);
+        assert_eq!(snap.metadata_requests, 6);
         let debug = format!("{metrics:?}");
-        assert!(debug.contains("metadata_requests: 5"));
+        assert!(debug.contains("metadata_requests: 6"));
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
