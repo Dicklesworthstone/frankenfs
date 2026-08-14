@@ -6592,7 +6592,7 @@ fn run() -> Result<Option<PathBuf>> {
         host.runtime_features.contains("avx512bw"),
     );
     println!(
-        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},cpu_busy_sample_interval_ms={},host_quiet_required_consecutive_samples={},host_quiet_timeout_ms={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
+        "baseline_host,hostname={},cpu_model={},physical_cores={},logical_threads={},memory_bytes={},numa_nodes={},requested_client_threads={},runtime_isa={},cpu_frequency_drivers={},scaling_governors={},energy_performance_preferences={},non_performance_or_mixed_governor_warning={},placement_scope={},placement_evidence_mode={},cpu_busy_sample_interval_ms={},host_quiet_required_consecutive_samples={},host_quiet_timeout_ms={},pre_pin_allowed_cpus={},pre_pin_allowed_cpu_count={},cgroup_cpuset_effective={}",
         host.hostname,
         host.cpu_model,
         host.physical_cores,
@@ -6606,6 +6606,7 @@ fn run() -> Result<Option<PathBuf>> {
         distinct_frequency_values(&host.cpu_frequency_policy.energy_performance_preferences),
         host.cpu_frequency_policy.governor_warning(),
         config.placement_scope.label(),
+        placement_evidence_mode(config.placement_scope),
         CPU_SAMPLE_INTERVAL_MS,
         config.host_quiet_samples,
         config.host_quiet_timeout_ms,
@@ -6656,7 +6657,7 @@ fn run() -> Result<Option<PathBuf>> {
         format_cpu_list(placement.driver_cpus.iter().copied()),
     );
     println!(
-        "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},requested_fuse_cpus={},fuse_cpu_isolation={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},same_llc={},llc_cpus={},host_quiet_required_consecutive_samples={},initial_host_quiet_samples_observed={},initial_host_quiet_wait_ms={},host_quiet_timeout_ms={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
+        "core_contention_preflight,workload={},requested_client_threads={},client_affinity_cpu_count={},requested_client_threads_per_affinity_cpu={:.6},driver_cpus={},driver_guard_cpus={},driver_busy_fraction={:.6},fuse_cpus={},requested_fuse_cpus={},fuse_cpu_isolation={},fuse_guard_cpus={},fuse_busy_fractions={},placement_scope={},placement_evidence_mode={},same_llc={},llc_cpus={},host_quiet_required_consecutive_samples={},initial_host_quiet_samples_observed={},initial_host_quiet_wait_ms={},host_quiet_timeout_ms={},driver_limit={:.3},fuse_limit={:.3},verdict=clear",
         config.workload.label(),
         config.client_threads(),
         placement.driver_cpus.len(),
@@ -6675,6 +6676,7 @@ fn run() -> Result<Option<PathBuf>> {
             .collect::<Vec<_>>()
             .join(":"),
         config.placement_scope.label(),
+        placement_evidence_mode(config.placement_scope),
         matches!(
             config.placement_scope,
             PlacementScope::SameLlc | PlacementScope::BalancedSquare
