@@ -7547,10 +7547,13 @@ mod tests {
 
     #[test]
     fn balanced_square_scope_skips_host_wide_precondition_bd_fleet() {
+        assert_eq!(parse_placement_scope("same-llc").unwrap(), PlacementScope::SameLlc);
+        assert_eq!(parse_placement_scope("host-wide").unwrap(), PlacementScope::HostWide);
         assert_eq!(
             parse_placement_scope("balanced-square").unwrap(),
             PlacementScope::BalancedSquare
         );
+        assert!(parse_placement_scope("host").is_err());
         assert_eq!(PlacementScope::BalancedSquare.label(), "balanced_square");
         assert!(balanced_square_margin_is_valid(
             PlacementScope::BalancedSquare,
