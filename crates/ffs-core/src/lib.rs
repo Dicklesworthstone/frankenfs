@@ -18781,7 +18781,10 @@ impl OpenFs {
         // on-disk GDs, not this array), so flushing the descriptors from it would
         // re-write stale (still-UNINIT, still-full) group descriptors and clobber the
         // sharded-updated on-disk GDs → e2fsck-dirty. Source the descriptors from a
-        // snapshot of the sharded records instead (geo + pctx derived lock-free).
+        // snapshot of the sharded records instead (geo + pctx derived lock-free) —
+        // RECONCILED with the single-lock array's own movement, which is equally
+        // real and equally invisible from the other side (bd-y2t0r; see
+        // `PerGroupAlloc::reconciled_group_stats`).
         #[cfg(feature = "bhh0i_sharded_alloc")]
         if self.bhh0i_sharded_ops_active() {
             let sharded = self
@@ -18791,9 +18794,10 @@ impl OpenFs {
             let sb = self.ext4_superblock().ok_or_else(|| {
                 FfsError::Format("sharded GDT flush: not an ext4 filesystem".into())
             })?;
+            let live = self.ext4_single_lock_group_counts();
             let synthetic = Ext4AllocState {
                 geo: FsGeometry::from_superblock(sb),
-                groups: sharded.snapshot_group_stats(),
+                groups: sharded.reconciled_group_stats(&live),
                 persist_ctx: self.ext4_persist_ctx_lockfree().ok_or_else(|| {
                     FfsError::Format("sharded GDT flush: persist ctx unavailable".into())
                 })?,
@@ -18802,6 +18806,22 @@ impl OpenFs {
         }
         let alloc = alloc_mutex.read();
         self.ext4_persist_group_descriptors_from(cx, &alloc)
+    }
+
+    /// Snapshot the single-lock `alloc.groups` counters for reconciliation
+    /// against the sharded records (bd-y2t0r).
+    ///
+    /// Takes the `Ext4AllocState` read lock and RELEASES it before returning, so
+    /// the caller never holds it while locking a sharded group record. That is
+    /// deliberate: the sharded path acquires per-group locks with no alloc lock
+    /// held, and holding the alloc lock across a group lock here would introduce
+    /// the only acquisition order that could ever pair them.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn ext4_single_lock_group_counts(&self) -> Vec<crate::sharded_alloc::SeedCounts> {
+        self.ext4_alloc_state.as_ref().map_or_else(Vec::new, |lock| {
+            let alloc = lock.read();
+            crate::sharded_alloc::SeedCounts::snapshot(&alloc.groups)
+        })
     }
 
     /// Per-group free-count snapshot of a TRANSIENT recovery allocation state,
@@ -18836,11 +18856,15 @@ impl OpenFs {
     /// writes are not enabled — then the transient state is the only one and the
     /// descriptors it persisted stand.
     ///
-    /// (Scope: the single-lock `groups` array. With the default-off
-    /// `bhh0i_sharded_alloc` path ACTIVE the durability boundary sources its
-    /// counts from the sharded per-group records instead, so a recovery free
-    /// would need the same credit there; fast-commit recovery does not run under
-    /// an active sharded create path today.)
+    /// (Scope: the single-lock `groups` array. Under the default-off
+    /// `bhh0i_sharded_alloc` path this is now sufficient rather than merely
+    /// unreachable: the durability boundary reads the sharded records RECONCILED
+    /// against this array's movement (bd-y2t0r, `reconciled_group_stats`), so a
+    /// delta credited here reaches the descriptors whichever path is active. It
+    /// was previously true only because fast-commit recovery runs inside
+    /// `from_device`, before `enable_writes` builds the sharded records at all —
+    /// an ordering pinned by
+    /// `sharded_records_do_not_exist_until_enable_writes_bd_y2t0r`.)
     fn ext4_merge_recovery_alloc_into_live(
         &self,
         before: &[(u32, u32, u32)],
@@ -18939,9 +18963,13 @@ impl OpenFs {
             let sb = self.ext4_superblock().ok_or_else(|| {
                 FfsError::Format("sharded GDT capture: not an ext4 filesystem".to_owned())
             })?;
+            let live = self.ext4_single_lock_group_counts();
             let synthetic = Ext4AllocState {
                 geo: FsGeometry::from_superblock(sb),
-                groups: sharded.snapshot_group_stats(),
+                // Reconciled for the same reason the flush is (bd-y2t0r): a
+                // capture that disagreed with the flush would hand a checker a
+                // different filesystem than the one on the device.
+                groups: sharded.reconciled_group_stats(&live),
                 persist_ctx: self.ext4_persist_ctx_lockfree().ok_or_else(|| {
                     FfsError::Format("sharded GDT capture: persist ctx unavailable".to_owned())
                 })?,
@@ -19029,13 +19057,20 @@ impl OpenFs {
         // runs at a quiesced durability boundary. Without this the persisted superblock
         // free counts diverge from the (sharded-updated) group descriptors → e2fsck
         // "free count wrong" (default-off/toggle-off → the unchanged single-lock fold).
+        // The fold is over the RECONCILED counts — the same state
+        // `ext4_flush_group_descriptors` writes the descriptors from — because the
+        // single-lock array's movement is invisible to the sharded records
+        // (bd-y2t0r). Folding the bare sharded totals here while the descriptors
+        // carried the reconciled counts would make the superblock disagree with
+        // its own group descriptors.
         #[cfg(feature = "bhh0i_sharded_alloc")]
         let sharded_totals: Option<(u64, u64)> = self.bhh0i_sharded_ops_active().then(|| {
+            let live = self.ext4_single_lock_group_counts();
             let t = self
                 .ext4_sharded_alloc
                 .as_ref()
                 .expect("sharded active implies present")
-                .total_free();
+                .reconciled_total_free(&live);
             (t.blocks, t.inodes)
         });
         #[cfg(not(feature = "bhh0i_sharded_alloc"))]
@@ -55962,20 +55997,23 @@ mod tests {
     /// leak too? This decides where the fix belongs — in rename, or in the shared
     /// `release_inode_storage_deferring_writeback` path both use.
     ///
-    /// ⛔ ANSWERED, AND IT LEAKS — `#[ignore]`d as a known defect, not a flaky
-    /// test. 200 mkdir/rmdir cycles on the sharded path:
+    /// ⛔ ANSWERED, AND IT LEAKED. 200 mkdir/rmdir cycles on the sharded path:
     ///
     ///     Free blocks count wrong for group #0 (14087, counted=14287)
     ///
     /// Drift exactly 200 over 200 cycles, matching the dir-over-dir rename leak
     /// one for one. So the divergence is NOT rename-specific: it lives in
     /// `release_inode_storage_deferring_writeback`, which both rename and rmdir
-    /// use, and EVERY directory removal on the sharded path leaks its block.
+    /// use, and EVERY directory removal on the sharded path leaked its block.
     ///
-    /// The fix therefore belongs in the shared release path — route a directory's
-    /// own block free through the sharded records when the sharded path is active
-    /// — and NOT in rename, which is where it would have gone had this come back
-    /// clean.
+    /// ✅ FIXED, and NOT where that reading predicted. The answer was not a
+    /// sharded-aware free threaded through the extent walk: the walk frees
+    /// against the single-lock array, which is the correct structure for it to
+    /// use — what was missing is that the durability boundary never READ that
+    /// array while the sharded path was active. `reconciled_group_stats` folds
+    /// the single-lock array's delta into the flushed counts, which closes this
+    /// case, the dir-over-dir rename case, and the retained-file OVER-count in
+    /// one place instead of at three call sites.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
     fn rmdir_of_a_sharded_allocated_directory_does_not_leak_blocks_bd_y2t0r() {
@@ -56014,38 +56052,216 @@ mod tests {
         );
     }
 
-    /// ⛔ KNOWN FAILING, `#[ignore]`d — a REAL defect found 2026-08-09, not a    /// ⛔ KNOWN FAILING, `#[ignore]`d — a REAL defect found 2026-08-09, not a
-    /// flaky test. Renaming a DIRECTORY over an existing directory leaks a free
-    /// BLOCK per rename on the sharded path.
+    /// bd-y2t0r: is the block-side divergence only about FREES, or does it cover
+    /// single-lock ALLOCATIONS too?
+    ///
+    /// Every block-side observation banked on this bead so far came from a
+    /// workload that allocated and freed the same blocks inside one mount, where
+    /// a lost single-lock delta cancels itself and the descriptors come out
+    /// exact. `ab757b85` measured 4 cycles x 300 files x 16 KiB with ZERO
+    /// block-count errors and that result was read as "file data blocks do not
+    /// diverge". A storm that DELETES everything it creates cannot distinguish
+    /// "the two structures agree" from "both deltas were lost and happened to
+    /// sum to zero".
+    ///
+    /// This workload keeps its files. With the sharded path active,
+    /// `ext4_flush_group_descriptors` sources every descriptor from
+    /// `sharded.snapshot_group_stats()`, while `ext4_write`'s data-block
+    /// allocation debits the single-lock `alloc.groups` array through
+    /// `alloc_blocks_persist`. If that debit never reaches the flushed
+    /// descriptors, the image claims blocks are free while their bitmap bits are
+    /// set — an OVER-count, the dangerous direction of this accounting error and
+    /// the mirror of the dir-block leak (which under-counts).
+    ///
+    /// The single-lock control runs the identical workload, so a failure here is
+    /// attributable to the sharded routing rather than to the write path.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn retained_file_data_blocks_reach_the_flushed_descriptors_bd_y2t0r() {
+        retained_file_data_block_check_bd_y2t0r(true);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn retained_file_data_blocks_under_single_lock_keep_counters_exact_bd_y2t0r() {
+        retained_file_data_block_check_bd_y2t0r(false);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn retained_file_data_block_check_bd_y2t0r(sharded: bool) {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        assert!(!fs.set_bhh0i_sharded_ops(sharded));
+
+        // 200 files x 16 KiB = 800 data blocks that are NEVER freed, so a lost
+        // single-lock debit cannot cancel against a lost credit.
+        const FILES: usize = 200;
+        let payload = vec![0xD7_u8; 16 * 1024];
+        for index in 0..FILES {
+            let name = format!("keep-{index:04}");
+            let created = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .unwrap_or_else(|error| panic!("create {name}: {error}"));
+            fs.write(&cx, created.ino, 0, &payload)
+                .unwrap_or_else(|error| panic!("write {name}: {error}"));
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush to device");
+        let image = tmp.path().join("retained-file-data.ext4");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(
+            !output.contains("Free blocks count wrong"),
+            "retained file data blocks did not reach the flushed group descriptors \
+             with sharded={sharded}: {FILES} files x 16 KiB were written and kept, so \
+             the descriptors must account for every allocated block. A drift here is \
+             an OVER-count — the descriptors claim free blocks whose bitmap bits are \
+             set (bd-y2t0r):\n{output}"
+        );
+        assert!(
+            clean,
+            "e2fsck must accept the image after {FILES} retained 16 KiB files \
+             (sharded={sharded}):\n{output}"
+        );
+    }
+
+    /// bd-y2t0r: the composite gate for the block-side reconciliation — BOTH
+    /// structures move, in BOTH directions, inside one mount.
+    ///
+    /// Each of the narrower tests on this bead can be passed by a fix that is
+    /// wrong in a way the others do not probe: routing the directory-block free
+    /// through the sharded records satisfies the rmdir and dir-rename cases while
+    /// leaving retained file data over-counted; flushing the single-lock array
+    /// instead satisfies the file cases while dropping every sharded create.
+    /// This workload does all four things at once —
+    ///
+    ///   * `mkdir`  → sharded records debited (dir block + inode + `used_dirs`)
+    ///   * `write`  → single-lock array debited (file data blocks)
+    ///   * `rmdir`  → single-lock array credited (the dir's own block, via the
+    ///                extent walk) AND sharded records credited (the inode)
+    ///   * `unlink` → single-lock array credited (file data blocks)
+    ///
+    /// — and leaves live objects of both kinds behind, so nothing cancels. Only
+    /// counts that carry every one of those deltas match the bitmaps e2fsck
+    /// recomputes.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn mixed_directory_and_file_churn_keeps_every_counter_exact_bd_y2t0r() {
+        mixed_churn_counter_check_bd_y2t0r(true);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn mixed_directory_and_file_churn_under_single_lock_keeps_every_counter_exact_bd_y2t0r() {
+        mixed_churn_counter_check_bd_y2t0r(false);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn mixed_churn_counter_check_bd_y2t0r(sharded: bool) {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        assert!(!fs.set_bhh0i_sharded_ops(sharded));
+
+        const ROUNDS: usize = 120;
+        let payload = vec![0x5C_u8; 8 * 1024]; // 2 data blocks per file
+        for round in 0..ROUNDS {
+            let dir = format!("d-{round:04}");
+            fs.mkdir(&cx, root, OsStr::new(&dir), 0o755, 0, 0)
+                .unwrap_or_else(|error| panic!("mkdir {dir}: {error}"));
+
+            let kept = format!("kept-{round:04}");
+            let kept_ino = fs
+                .create(&cx, root, OsStr::new(&kept), 0o644, 0, 0)
+                .unwrap_or_else(|error| panic!("create {kept}: {error}"))
+                .ino;
+            fs.write(&cx, kept_ino, 0, &payload)
+                .unwrap_or_else(|error| panic!("write {kept}: {error}"));
+
+            let doomed = format!("doomed-{round:04}");
+            let doomed_ino = fs
+                .create(&cx, root, OsStr::new(&doomed), 0o644, 0, 0)
+                .unwrap_or_else(|error| panic!("create {doomed}: {error}"))
+                .ino;
+            fs.write(&cx, doomed_ino, 0, &payload)
+                .unwrap_or_else(|error| panic!("write {doomed}: {error}"));
+            fs.unlink(&cx, root, OsStr::new(&doomed))
+                .unwrap_or_else(|error| panic!("unlink {doomed}: {error}"));
+
+            // Half the directories are removed, half survive, so neither the
+            // sharded nor the single-lock delta nets out to zero.
+            if round % 2 == 0 {
+                fs.rmdir(&cx, root, OsStr::new(&dir))
+                    .unwrap_or_else(|error| panic!("rmdir {dir}: {error}"));
+            }
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush to device");
+        let image = tmp.path().join("mixed-churn.ext4");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        for symptom in [
+            "Free blocks count wrong",
+            "Free inodes count wrong",
+            "Directories count wrong",
+        ] {
+            assert!(
+                !output.contains(symptom),
+                "mixed directory+file churn drifted a counter ({symptom}) with \
+                 sharded={sharded} over {ROUNDS} rounds. Every delta on BOTH \
+                 structures must reach the flushed descriptors and the superblock \
+                 totals (bd-y2t0r):\n{output}"
+            );
+        }
+        assert!(
+            clean,
+            "e2fsck must accept the image after {ROUNDS} mixed rounds \
+             (sharded={sharded}):\n{output}"
+        );
+    }
+
+    /// A REAL defect found 2026-08-09, now FIXED. Renaming a DIRECTORY over an
+    /// existing directory leaked a free BLOCK per rename on the sharded path.
     ///
     ///     200 dir-over-dir renames, sharded:
     ///       Free blocks count wrong for group #0 (13884, counted=14084)
     ///     the single-lock control on the identical workload: CLEAN
     ///
-    /// Drift is exactly 200 over 200 renames — one block per clobbered directory,
-    /// which is the target directory's own data block.
+    /// Drift was exactly 200 over 200 renames — one block per clobbered
+    /// directory, which is the target directory's own data block.
     ///
-    /// MECHANISM, and it contradicts a finding this bead previously banked. The
-    /// rename fix routes only the INODE free through the sharded records and
-    /// leaves block frees on the single-lock path, because ab757b85 measured that
-    /// data blocks never diverge — allocated and freed through the same
-    /// structure. That holds for FILE data blocks. It does NOT hold for a
-    /// DIRECTORY's block, which the sharded dir-growth allocator
-    /// (`ext4_sharded_alloc_dir_block`) allocates from the sharded records while
-    /// `release_inode_storage_deferring_writeback` frees it against the
-    /// single-lock array. Same divergence as bd-pbyu0, on the block side.
+    /// MECHANISM. The directory's block is allocated by the sharded dir-growth
+    /// allocator (`ext4_sharded_alloc_dir_block`, debiting the sharded records)
+    /// and freed by `release_inode_storage_deferring_writeback` (crediting the
+    /// single-lock array), while the descriptor flush read ONLY the sharded
+    /// snapshot — so the credit landed in a structure nothing read. The fix folds
+    /// the single-lock array's delta into the flushed counts
+    /// (`PerGroupAlloc::reconciled_group_stats`) rather than re-routing the free,
+    /// because the extent walk that performs it spans arbitrary groups and the
+    /// single-lock array is the right structure for it to use.
     ///
-    /// ⚠ LIKELY NOT RENAME-SPECIFIC: `rmdir` uses the same
-    /// `release_inode_storage_deferring_writeback`, so removing a
-    /// sharded-allocated directory should leak identically. The concurrency gate
-    /// never caught it because that workload creates and deletes FILES, whose
-    /// blocks come from the ordinary allocator. UNVERIFIED — check rmdir before
-    /// fixing, because it decides whether the fix belongs in rename or in the
-    /// shared release path.
+    /// Kept as a PAIR with the file-target variant and with the single-lock
+    /// control: a regression that hit only the directory branch, or only the
+    /// sharded arm, stays attributable.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
     fn rename_over_existing_directory_does_not_leak_a_block_bd_y2t0r() {
         rename_over_existing_counter_check_bd_y2t0r_inner(true, true);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn rename_over_existing_directory_under_single_lock_keeps_counters_exact_bd_y2t0r() {
+        rename_over_existing_counter_check_bd_y2t0r_inner(false, true);
     }
 
     #[cfg(feature = "bhh0i_sharded_alloc")]

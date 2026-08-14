@@ -38,6 +38,16 @@ struct GroupLock {
 /// deadlock-free and linearizable.
 pub(crate) struct PerGroupAlloc {
     groups: Vec<GroupLock>,
+    /// The per-group free counts these records were SEEDED with at
+    /// `enable_writes`, i.e. the state the single-lock `Ext4AllocState.groups`
+    /// array held at the same instant (the sharded records are a clone of it).
+    ///
+    /// Load-bearing for [`Self::reconciled_group_stats`]: both structures stay
+    /// live and mutate independently while only the sharded snapshot is read at
+    /// the durability boundary, so the single-lock array's contribution is
+    /// recoverable only as a DELTA against this common origin. Immutable after
+    /// construction (bd-y2t0r).
+    seed: Vec<SeedCounts>,
 }
 
 impl PerGroupAlloc {
@@ -45,6 +55,7 @@ impl PerGroupAlloc {
     /// `Ext4AllocState` holds, moving each group's stats behind its own lock
     /// (no clone; identical initial state).
     pub(crate) fn from_group_stats(groups: Vec<GroupStats>) -> Self {
+        let seed = groups.iter().map(SeedCounts::of).collect();
         Self {
             groups: groups
                 .into_iter()
@@ -52,6 +63,7 @@ impl PerGroupAlloc {
                     stats: Mutex::new(stats),
                 })
                 .collect(),
+            seed,
         }
     }
 
@@ -132,8 +144,80 @@ impl PerGroupAlloc {
     /// `ext4_flush_group_descriptors` must source the descriptors from HERE or it
     /// writes stale (still-UNINIT, still-full) descriptors → e2fsck-dirty. Exact at a
     /// quiesced flush boundary (same semantics as [`Self::total_free`]).
+    ///
+    /// The flush does not consume this directly: the single-lock array stays live
+    /// too, so it goes through [`Self::reconciled_group_stats`], which is this
+    /// snapshot plus that array's movement (bd-y2t0r).
     pub(crate) fn snapshot_group_stats(&self) -> Vec<GroupStats> {
         self.groups.iter().map(|g| g.stats.lock().clone()).collect()
+    }
+
+    /// [`Self::snapshot_group_stats`] with the single-lock array's contribution
+    /// folded back in — the counts the durability boundary must actually persist
+    /// while the sharded path is active (bd-y2t0r).
+    ///
+    /// WHY A DELTA AND NOT EITHER SNAPSHOT. With the sharded path active BOTH
+    /// structures are live and each is mutated by a disjoint set of operations:
+    /// the sharded records take directory-growth block allocations and every
+    /// inode allocation/free, while `alloc.groups` takes file data-block
+    /// allocations, the extent-walk frees inside `release_inode_storage` (a
+    /// directory's own block and its htree nodes), and external xattr blocks.
+    /// Neither structure alone describes the filesystem. Persisting the sharded
+    /// snapshot alone drops every single-lock delta, which is the measured
+    /// bd-y2t0r defect in both directions: a removed directory's block free is
+    /// lost (under-count, e2fsck-dirty, eventually ENOSPC) and a retained file's
+    /// data-block debit is lost (over-count, the dangerous direction — the
+    /// descriptors offer blocks whose bitmap bits are set).
+    ///
+    /// Both structures were seeded from the SAME array at `enable_writes`, so
+    /// `sharded_now + (single_lock_now - seed)` reconstructs the total effect of
+    /// both. No operation debits both structures — the sharded wrappers
+    /// (`ext4_sharded_alloc_blocks` / `_free_blocks` / `_alloc_inode` /
+    /// `_free_inode`) touch only these records and the single-lock primitives
+    /// touch only `alloc.groups` — so no delta is counted twice.
+    ///
+    /// The bitmaps on the device are the authority for what is actually
+    /// allocated and are shared by both paths, so this reconciles COUNTS only;
+    /// the descriptor flush re-derives bitmap checksums and the UNINIT flags from
+    /// the device bytes plus these counts.
+    ///
+    /// `live` is the caller's snapshot of the single-lock counts, taken and
+    /// released BEFORE this call so no group lock is ever held while the
+    /// `Ext4AllocState` read lock is (see [`SeedCounts::snapshot`]). A group
+    /// missing from `live` (shorter slice) keeps the sharded value.
+    pub(crate) fn reconciled_group_stats(&self, live: &[SeedCounts]) -> Vec<GroupStats> {
+        let mut out = self.snapshot_group_stats();
+        for (gidx, stats) in out.iter_mut().enumerate() {
+            let (Some(seed), Some(live)) = (self.seed.get(gidx), live.get(gidx)) else {
+                continue;
+            };
+            stats.free_blocks = apply_delta(stats.free_blocks, seed.free_blocks, live.free_blocks);
+            stats.free_inodes = apply_delta(stats.free_inodes, seed.free_inodes, live.free_inodes);
+            stats.used_dirs = apply_delta(stats.used_dirs, seed.used_dirs, live.used_dirs);
+        }
+        out
+    }
+
+    /// [`Self::total_free`] over the reconciled counts — the superblock free
+    /// totals must be folded from the same state the group descriptors are
+    /// written from, or the two disagree and e2fsck reports the superblock wrong
+    /// even when every descriptor is right (bd-y2t0r).
+    pub(crate) fn reconciled_total_free(&self, live: &[SeedCounts]) -> FreeTotals {
+        let mut blocks = 0_u64;
+        let mut inodes = 0_u64;
+        for (gidx, group) in self.groups.iter().enumerate() {
+            let stats = group.stats.lock();
+            let (free_blocks, free_inodes) = match (self.seed.get(gidx), live.get(gidx)) {
+                (Some(seed), Some(live)) => (
+                    apply_delta(stats.free_blocks, seed.free_blocks, live.free_blocks),
+                    apply_delta(stats.free_inodes, seed.free_inodes, live.free_inodes),
+                ),
+                _ => (stats.free_blocks, stats.free_inodes),
+            };
+            blocks += u64::from(free_blocks);
+            inodes += u64::from(free_inodes);
+        }
+        FreeTotals { blocks, inodes }
     }
 
     /// Per-group free counts, snapshotted one group-lock at a time — the input a
@@ -389,6 +473,52 @@ impl PerGroupAlloc {
         let inode_table_block = self.groups[gidx].stats.lock().inode_table_block.0;
         let block = ffs_types::BlockNumber(inode_table_block.checked_add(block_offset)?);
         Some(ffs_inode::InodeLocation { block, byte_offset })
+    }
+}
+
+/// One group's reconcilable counters, as [`PerGroupAlloc::reconciled_group_stats`]
+/// reads them off both structures (bd-y2t0r). These three are exactly the
+/// `GroupStats` fields that describe ALLOCATION STATE and therefore diverge when
+/// two structures are mutated independently; every other field is either
+/// immutable mkfs layout (the bitmap/table locators) or re-derived from the
+/// device at flush (the bitmap checksums and the UNINIT flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeedCounts {
+    pub(crate) free_blocks: u32,
+    pub(crate) free_inodes: u32,
+    pub(crate) used_dirs: u32,
+}
+
+impl SeedCounts {
+    pub(crate) fn of(stats: &GroupStats) -> Self {
+        Self {
+            free_blocks: stats.free_blocks,
+            free_inodes: stats.free_inodes,
+            used_dirs: stats.used_dirs,
+        }
+    }
+
+    /// Snapshot the single-lock array's counts. Callers take this under the
+    /// `Ext4AllocState` read lock and RELEASE that lock before touching the
+    /// sharded records, so the two lock classes are never held at once and no
+    /// acquisition order can form between them.
+    pub(crate) fn snapshot(groups: &[GroupStats]) -> Vec<Self> {
+        groups.iter().map(Self::of).collect()
+    }
+}
+
+/// Apply the single-lock array's movement since the seed to the sharded value.
+///
+/// Saturating in both directions: the sum can only leave `u32` if the two
+/// structures together released or consumed more than the group holds, which is
+/// a corrupt state rather than an arithmetic one, and clamping keeps the flushed
+/// descriptor inside its field width instead of wrapping to a wildly wrong count.
+fn apply_delta(sharded: u32, seed: u32, live: u32) -> u32 {
+    let reconciled = i64::from(sharded) + i64::from(live) - i64::from(seed);
+    if reconciled <= 0 {
+        0
+    } else {
+        u32::try_from(reconciled).unwrap_or(u32::MAX)
     }
 }
 
@@ -695,6 +825,153 @@ mod tests {
                 "group {g} must be unchanged"
             );
         }
+    }
+
+    /// bd-y2t0r: the reconciliation must apply the single-lock array's MOVEMENT,
+    /// not either structure's absolute value.
+    ///
+    /// The three wrong implementations this pins against, each of which produces
+    /// a plausible-looking number:
+    ///   * flush the sharded snapshot alone      → 97 (loses the single-lock -5)
+    ///   * flush the single-lock array alone     → 95 (loses the sharded -3)
+    ///   * add the two absolute counts           → 192 (double-counts the seed)
+    /// Only `seed + both deltas` = 92 is the state the bitmaps describe.
+    #[test]
+    fn reconciled_group_stats_applies_the_single_lock_delta_bd_y2t0r() {
+        let seed: Vec<GroupStats> = (0..2).map(|g| sample_group(g, 100, 40)).collect();
+        let mut live = SeedCounts::snapshot(&seed);
+        let sharded = PerGroupAlloc::from_group_stats(seed);
+
+        // The sharded path consumed 3 blocks and 1 inode in group 0.
+        {
+            let mut g0 = sharded.lock_group(0);
+            g0.free_blocks -= 3;
+            g0.free_inodes -= 1;
+        }
+        // The single-lock path consumed 5 more blocks in group 0 (a file write),
+        // and RELEASED 2 blocks in group 1 (a directory's own block, freed
+        // through the extent walk).
+        live[0].free_blocks -= 5;
+        live[1].free_blocks += 2;
+
+        let reconciled = sharded.reconciled_group_stats(&live);
+        assert_eq!(
+            reconciled[0].free_blocks, 92,
+            "group 0 must carry BOTH the sharded -3 and the single-lock -5"
+        );
+        assert_eq!(
+            reconciled[0].free_inodes, 39,
+            "an untouched single-lock counter must leave the sharded value alone"
+        );
+        assert_eq!(
+            reconciled[1].free_blocks, 102,
+            "a single-lock FREE must be credited too — that is the dir-block leak"
+        );
+        // The records themselves are untouched: reconciliation is a read.
+        assert_eq!(sharded.lock_group(0).free_blocks, 97);
+    }
+
+    /// The A/A control for the arithmetic above: with the single-lock array still
+    /// at its seed, reconciliation must be the identity on every counter. A
+    /// version that double-counted, or that copied the live array over the
+    /// sharded one, cannot pass this and the delta test at the same time.
+    #[test]
+    fn reconciled_group_stats_is_the_identity_when_the_single_lock_array_never_moved_bd_y2t0r() {
+        let seed: Vec<GroupStats> = (0..3).map(|g| sample_group(g, 500, 80)).collect();
+        let live = SeedCounts::snapshot(&seed);
+        let sharded = PerGroupAlloc::from_group_stats(seed);
+        {
+            let mut g1 = sharded.lock_group(1);
+            g1.free_blocks -= 7;
+            g1.used_dirs += 1;
+        }
+        let reconciled = sharded.reconciled_group_stats(&live);
+        let plain = sharded.snapshot_group_stats();
+        for (gidx, (r, p)) in reconciled.iter().zip(plain.iter()).enumerate() {
+            assert_eq!(r.free_blocks, p.free_blocks, "group {gidx} free_blocks");
+            assert_eq!(r.free_inodes, p.free_inodes, "group {gidx} free_inodes");
+            assert_eq!(r.used_dirs, p.used_dirs, "group {gidx} used_dirs");
+        }
+    }
+
+    /// `used_dirs` reconciles like the free counts: a directory removed through
+    /// the single-lock path must decrement the count the descriptors are written
+    /// from, or e2fsck reports "Directories count wrong".
+    #[test]
+    fn reconciled_group_stats_reconciles_used_dirs_bd_y2t0r() {
+        let mut seed = vec![sample_group(0, 100, 40)];
+        seed[0].used_dirs = 5;
+        let mut live = SeedCounts::snapshot(&seed);
+        let sharded = PerGroupAlloc::from_group_stats(seed);
+        sharded.lock_group(0).used_dirs += 2; // two sharded mkdirs
+        live[0].used_dirs -= 1; // one single-lock rmdir
+        assert_eq!(sharded.reconciled_group_stats(&live)[0].used_dirs, 6);
+    }
+
+    /// The superblock fold and the descriptor flush must describe the SAME
+    /// filesystem — they are separate consumers of the same reconciliation, and a
+    /// disagreement between them is its own e2fsck error even when every
+    /// descriptor is individually right (bd-y2t0r).
+    #[test]
+    fn reconciled_total_free_agrees_with_the_reconciled_group_stats_bd_y2t0r() {
+        let seed: Vec<GroupStats> = (0..4).map(|g| sample_group(g, 1_000, 200)).collect();
+        let mut live = SeedCounts::snapshot(&seed);
+        let sharded = PerGroupAlloc::from_group_stats(seed);
+        for g in 0..4usize {
+            let mut rec = sharded.lock_group(g);
+            rec.free_blocks -= u32::try_from(g).expect("small") * 3;
+            rec.free_inodes -= 1;
+            live[g].free_blocks -= 11;
+            live[g].free_inodes += 2;
+        }
+        let per_group = sharded.reconciled_group_stats(&live);
+        let expect_blocks: u64 = per_group.iter().map(|g| u64::from(g.free_blocks)).sum();
+        let expect_inodes: u64 = per_group.iter().map(|g| u64::from(g.free_inodes)).sum();
+        let totals = sharded.reconciled_total_free(&live);
+        assert_eq!(totals.blocks, expect_blocks);
+        assert_eq!(totals.inodes, expect_inodes);
+    }
+
+    /// A delta that would take a counter outside `u32` clamps instead of
+    /// wrapping. Wrapping would turn a small accounting inconsistency into a
+    /// descriptor claiming ~4 billion free blocks — the allocator would then hand
+    /// out blocks that do not exist.
+    #[test]
+    fn reconciled_group_stats_clamps_instead_of_wrapping_bd_y2t0r() {
+        let seed = vec![sample_group(0, 10, 10)];
+        let mut live = SeedCounts::snapshot(&seed);
+        let sharded = PerGroupAlloc::from_group_stats(seed);
+        live[0].free_blocks -= 10; // single-lock consumed everything...
+        sharded.lock_group(0).free_blocks -= 4; // ...and so did the sharded path
+        assert_eq!(sharded.reconciled_group_stats(&live)[0].free_blocks, 0);
+
+        // Upper end: a seed of 0 with the single-lock array at u32::MAX and a
+        // non-zero sharded count sums PAST u32::MAX, so this half only passes if
+        // the sum is computed wider than u32 and then clamped.
+        let seed_hi = vec![sample_group(1, 5, 0)];
+        let mut live_hi = SeedCounts::snapshot(&seed_hi);
+        live_hi[0].free_blocks = u32::MAX;
+        let sharded_hi = PerGroupAlloc::from_group_stats(seed_hi);
+        sharded_hi.lock_group(0).free_blocks += 3; // 8 + (MAX - 5) > u32::MAX
+        assert_eq!(
+            sharded_hi.reconciled_group_stats(&live_hi)[0].free_blocks,
+            u32::MAX
+        );
+    }
+
+    /// A shorter `live` slice (a group the caller could not snapshot) leaves that
+    /// group's sharded value alone rather than indexing out of bounds.
+    #[test]
+    fn reconciled_group_stats_tolerates_a_short_live_slice_bd_y2t0r() {
+        let seed: Vec<GroupStats> = (0..3).map(|g| sample_group(g, 100, 10)).collect();
+        let mut live = SeedCounts::snapshot(&seed);
+        live.truncate(1);
+        let sharded = PerGroupAlloc::from_group_stats(seed);
+        live[0].free_blocks -= 4;
+        let reconciled = sharded.reconciled_group_stats(&live);
+        assert_eq!(reconciled[0].free_blocks, 96);
+        assert_eq!(reconciled[1].free_blocks, 100);
+        assert_eq!(reconciled[2].free_blocks, 100);
     }
 
     #[test]
