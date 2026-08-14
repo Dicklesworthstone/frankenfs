@@ -7576,6 +7576,8 @@ mod tests {
         assert!(parse_placement_scope("HOST-WIDE").is_err());
         assert!(parse_placement_scope("same-llc!").is_err());
         assert!(parse_placement_scope("balanced-square/").is_err());
+        assert!(parse_placement_scope("same-llc ").is_err());
+        assert!(parse_placement_scope("host-wide\n").is_err());
         assert_eq!(PlacementScope::BalancedSquare.label(), "balanced_square");
         assert!(balanced_square_margin_is_valid(
             PlacementScope::BalancedSquare,
