@@ -6470,6 +6470,11 @@ fn fs_report(
         "candidate_comparison": candidate_comparison_json,
         "fuse_over_kernel": competitive_json,
         "maximum_null_ratio": config.maximum_null_ratio,
+        "balanced_square_null_bound": if config.placement_scope == PlacementScope::BalancedSquare {
+            Some(1.02)
+        } else {
+            None
+        },
         "maximum_null_median_deviation": MAXIMUM_NULL_MEDIAN_DEVIATION,
         "gate_metric": "wall_ns",
         "gate_basis": "four_round_balanced_crossover_null_median_within_2pct_and_ci_spread_with_twice_widest_null_log_margin",
