@@ -7465,3 +7465,42 @@ actual removal and re-measurement.
 over a 32,770-entry stat sweep. At 0.02 lookups per stat it is off the hot path and cannot explain
 the loss, but a 0% hit rate is either a cache that cannot serve this pattern or one that is
 mis-keyed.
+
+## METHODOLOGY — 2026-08-14 — the external-load veto's own metric does not predict the ratio (n=5, no quiet anchor) (DarkMeadow)
+
+**Not a lever, not a row, and NOT a gate change** — a measurement of the instrument, recorded so the
+next person to touch `external_load_during_run` starts from data.
+
+**Question.** Every mounted row attempted on this host today was refused by that gate (>2
+off-placement CPUs above 25% busy for >10% of samples) while the estimator's own A/A nulls came out
+clear. The comparator is already a four-arm balanced crossover, so the veto is an absolute
+quietness *precondition* layered on a paired design. Does the ratio actually move with load?
+
+**Method.** Five back-to-back runs of the identical workload and ELF (ext4
+`large_directory_readdir_stat_8t`, 32,768 entries, `pairs=12`, 8 observed threads; candidate
+`a53bfa88…`, x86-64-v3, PGO `6a22cfcf…`, BUILT_IN_PLACE, `thinkstation1`, kernel `6.17.0-41`), each
+recording its own load metrics.
+
+| run | ratio | max_busy_cpus | peak off-placement busy | kernel ms | FUSE ms |
+|---|---|---|---|---|---|
+| 1 | `3.941912` | 20 | 25.6% | 32.36 | 126.19 |
+| 2 | `3.882481` | 29 | 35.7% | 32.53 | 127.29 |
+| 3 | `3.866605` | 44 | 37.1% | 31.76 | 122.58 |
+| 4 | `4.116410` | 17 | 23.7% | 31.64 | 128.50 |
+| 5 | `3.870034` | 9 | 16.4% | 31.34 | 120.46 |
+
+**Result.** Load varied **4.9x**; the ratio spread **6.46%** with **r(busy, ratio) = −0.35** — weak
+and the *wrong sign*. The two extreme-load runs (44 and 9 busy CPUs) differ by **0.09%**. Per arm,
+`r(busy, kernel) = +0.32` and `r(busy, FUSE) = +0.01`: the arm that moves most is the one that does
+not track load.
+
+**⚠ Why this does not license relaxing anything.** `contended_fraction` was `1.0000` in all five —
+by the gate's definition every run was fully contended, so this is contended-vs-contended with **no
+quiet anchor**. It refutes "the ratio degrades progressively with load across the contended range".
+It cannot refute "contended runs differ systematically from quiet ones", which is what the veto
+asserts. n=5 with no repeats at fixed load is weak (r=−0.35 at n=5 is not significant).
+
+**Retry predicate.** Add ≥2 runs in a genuinely quiet window (`contended_fraction` near 0) and
+compare them against this contended cluster. The integrity check is already favourable either way:
+every row this gate vetoes for these workloads is an `HONEST_LOSS`, so admitting them cannot
+manufacture a win — the specific failure mode AGENTS.md warns gate changes for.
