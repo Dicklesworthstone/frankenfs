@@ -2438,6 +2438,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
@@ -2491,6 +2492,7 @@ impl Filesystem for FrankenFuse {
         _mask: u32,
         reply: ReplyStatx,
     ) {
+        self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
