@@ -9409,14 +9409,17 @@ impl OpenFs {
         // cache; the FxHashMap-backed ShardedCache makes the get O(1). A ONE-PASS
         // walk visits each inode once, so every probe misses — opt out via the same
         // flag as the ext4 attr cache (the fresh tree/index read below is unchanged).
-        let use_attr_cache = !self
-            .readonly_lookup_cache_disabled
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let read_plan = self.btrfs_cached_read_plan_index();
+        let use_attr_cache = btrfs_attr_cache_enabled(
+            read_plan.is_some(),
+            self.readonly_lookup_cache_disabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         if use_attr_cache && let Some(attr) = self.ext4_inode_attr_cache.get(&canonical) {
             return Ok(attr);
         }
 
-        let attr = if let Some(index) = self.btrfs_cached_read_plan_index()
+        let attr = if let Some(index) = read_plan
             && let Some(inode) = index.inodes.get(&canonical)
         {
             self.btrfs_inode_attr_from_item(ino, inode.clone())?
@@ -15061,6 +15064,10 @@ impl OpenFs {
         }
         Ok(buf)
     }
+}
+
+fn btrfs_attr_cache_enabled(read_plan_present: bool, cache_disabled: bool) -> bool {
+    !read_plan_present && !cache_disabled
 }
 
 /// Fast all-zero test for hole/sparse detection on the write path.
@@ -43581,6 +43588,13 @@ mod tests {
             1,
             "the read-only cache should suppress the second descriptor-block read"
         );
+    }
+
+    #[test]
+    fn btrfs_read_plan_skips_redundant_attr_cache_bd_3zx2x() {
+        assert!(!btrfs_attr_cache_enabled(true, false));
+        assert!(!btrfs_attr_cache_enabled(false, true));
+        assert!(btrfs_attr_cache_enabled(false, false));
     }
 
     #[test]
