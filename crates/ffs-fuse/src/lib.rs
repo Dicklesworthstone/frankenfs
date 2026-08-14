@@ -2639,6 +2639,7 @@ impl Filesystem for FrankenFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         let Ok(fs_offset) = u64::try_from(offset) else {
             warn!(ino, offset, "readdir: negative offset");
@@ -2693,6 +2694,7 @@ impl Filesystem for FrankenFuse {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         let Ok(fs_offset) = u64::try_from(offset) else {
             warn!(ino, offset, "readdirplus: negative offset");
@@ -15668,15 +15670,16 @@ mod tests {
         metrics.record_metadata_request();
         metrics.record_metadata_request();
         metrics.record_metadata_request();
+        metrics.record_metadata_request();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.requests_total, 3);
         assert_eq!(snap.requests_ok, 2);
         assert_eq!(snap.requests_err, 1);
         assert_eq!(snap.bytes_read, 1024);
-        assert_eq!(snap.metadata_requests, 3);
+        assert_eq!(snap.metadata_requests, 4);
         let debug = format!("{metrics:?}");
-        assert!(debug.contains("metadata_requests: 3"));
+        assert!(debug.contains("metadata_requests: 4"));
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
