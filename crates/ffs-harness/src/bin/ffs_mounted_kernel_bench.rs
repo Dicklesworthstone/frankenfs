@@ -1256,6 +1256,10 @@ fn validate_config(config: &Config) -> Result<()> {
         config.pairs >= 12 && config.pairs % period == 0,
         "--pairs must be a multiple of {period} and at least 12"
     );
+    ensure!(
+        balanced_scope_allows_candidates(config.placement_scope, config.compares_candidates()),
+        "balanced-square does not support six-arm candidate comparison"
+    );
     if let Some(comparison) = &config.candidate_comparison {
         let mut keys = BTreeSet::new();
         for (key, _) in &comparison.env {
@@ -1367,6 +1371,10 @@ const fn balanced_scope_schedule_period(
     } else {
         schedule_period(compares_candidates)
     }
+}
+
+const fn balanced_scope_allows_candidates(scope: PlacementScope, compares: bool) -> bool {
+    scope != PlacementScope::BalancedSquare || !compares
 }
 
 fn balanced_square_margin_is_valid(scope: PlacementScope, maximum_null_ratio: f64) -> bool {
@@ -7528,6 +7536,8 @@ mod tests {
             balanced_scope_schedule_period(PlacementScope::BalancedSquare, true),
             4
         );
+        assert!(!balanced_scope_allows_candidates(PlacementScope::BalancedSquare, true));
+        assert!(balanced_scope_allows_candidates(PlacementScope::BalancedSquare, false));
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
