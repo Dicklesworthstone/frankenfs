@@ -881,6 +881,9 @@ pub struct AtomicMetrics {
     pub requests_ok: CacheLinePadded<AtomicU64>,
     pub requests_err: CacheLinePadded<AtomicU64>,
     pub bytes_read: CacheLinePadded<AtomicU64>,
+    /// Successful path-based metadata requests (getattr/statx) observed at
+    /// the FUSE boundary, including memo-served replies (bd-0c4av).
+    pub metadata_requests: CacheLinePadded<AtomicU64>,
     /// Requests delayed by backpressure throttling.
     pub requests_throttled: CacheLinePadded<AtomicU64>,
     /// Requests rejected (shed) by backpressure.
@@ -906,6 +909,7 @@ impl AtomicMetrics {
             requests_ok: CacheLinePadded(AtomicU64::new(0)),
             requests_err: CacheLinePadded(AtomicU64::new(0)),
             bytes_read: CacheLinePadded(AtomicU64::new(0)),
+            metadata_requests: CacheLinePadded(AtomicU64::new(0)),
             requests_throttled: CacheLinePadded(AtomicU64::new(0)),
             requests_shed: CacheLinePadded(AtomicU64::new(0)),
         }
@@ -938,6 +942,10 @@ impl AtomicMetrics {
         Self::saturating_add(&self.bytes_read.0, n);
     }
 
+    pub fn record_metadata_request(&self) {
+        Self::saturating_add(&self.metadata_requests.0, 1);
+    }
+
     fn record_throttled(&self) {
         Self::saturating_add(&self.requests_throttled.0, 1);
     }
@@ -954,6 +962,7 @@ impl AtomicMetrics {
             requests_ok: self.requests_ok.0.load(Ordering::Relaxed),
             requests_err: self.requests_err.0.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.0.load(Ordering::Relaxed),
+            metadata_requests: self.metadata_requests.0.load(Ordering::Relaxed),
             requests_throttled: self.requests_throttled.0.load(Ordering::Relaxed),
             requests_shed: self.requests_shed.0.load(Ordering::Relaxed),
         }
@@ -987,6 +996,7 @@ pub struct MetricsSnapshot {
     pub requests_ok: u64,
     pub requests_err: u64,
     pub bytes_read: u64,
+    pub metadata_requests: u64,
     /// Requests delayed by backpressure throttling.
     pub requests_throttled: u64,
     /// Requests rejected (shed) by backpressure.
@@ -15650,12 +15660,14 @@ mod tests {
         metrics.record_ok();
         metrics.record_err();
         metrics.record_bytes_read(1024);
+        metrics.record_metadata_request();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.requests_total, 3);
         assert_eq!(snap.requests_ok, 2);
         assert_eq!(snap.requests_err, 1);
         assert_eq!(snap.bytes_read, 1024);
+        assert_eq!(snap.metadata_requests, 1);
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
