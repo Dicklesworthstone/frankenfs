@@ -190,8 +190,13 @@ struct MountRuntimeConfig {
 
 impl MountRuntimeConfig {
     fn validate(self) -> Result<Self> {
+        if self.mode == MountRuntimeMode::PerCore {
+            bail!(
+                "--runtime-mode per-core runtime is unavailable: its dispatcher does not route FUSE requests"
+            );
+        }
         if self.mode == MountRuntimeMode::Standard && self.managed_unmount_timeout_secs.is_some() {
-            bail!("--managed-unmount-timeout-secs requires --runtime-mode managed or per-core");
+            bail!("--managed-unmount-timeout-secs requires --runtime-mode managed");
         }
         Ok(self)
     }
@@ -1049,23 +1054,23 @@ enum Command {
         ///   on unmount or signal.
         /// - `managed`: background mount with lifecycle control, graceful Ctrl+C
         ///   shutdown, and final metrics logging.
-        /// - `per-core`: managed mount with thread-per-core dispatch. Sets worker
-        ///   threads to match detected cores and logs per-core metrics on shutdown.
+        /// - `per-core`: unavailable until its dispatcher routes FUSE requests;
+        ///   selecting it fails closed rather than reporting ordinary worker-pool
+        ///   behavior as per-core dispatch.
         /// - Kernel FUSE `writeback_cache` mode is default-off in V1.x and only
         ///   enabled by `--writeback-cache` after the audit gate, ordering
         ///   oracle, crash/replay oracle, runtime guard, and host/lane evidence
         ///   accept.
         #[arg(long = "runtime-mode", value_enum, default_value_t = MountRuntimeMode::Standard)]
         runtime_mode: MountRuntimeMode,
-        /// Graceful unmount timeout for managed/per-core modes (seconds).
+        /// Graceful unmount timeout for managed mode (seconds).
         ///
         /// Invalid when used with `--runtime-mode standard`.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         managed_unmount_timeout_secs: Option<u64>,
-        /// Enable adaptive managed/per-core runtime controls after evidence validation.
+        /// Enable adaptive managed runtime controls after evidence validation.
         ///
-        /// Requires `--runtime-mode managed` or `--runtime-mode per-core` and
-        /// `--adaptive-runtime-manifest`.
+        /// Requires `--runtime-mode managed` and `--adaptive-runtime-manifest`.
         #[arg(long = "adaptive-runtime")]
         adaptive_runtime: bool,
         /// Adaptive runtime evidence manifest accepted by `ffs-harness`.
@@ -1081,12 +1086,12 @@ enum Command {
         /// Write adaptive runtime shutdown evidence as concise Markdown.
         #[arg(long = "adaptive-runtime-summary-md")]
         adaptive_runtime_summary_md: Option<PathBuf>,
-        /// Enable the operator runtime console for this managed/per-core mount.
+        /// Enable the operator runtime console for this managed mount.
         ///
         /// On shutdown the console emits a bounded, redacted, schema-pinned
         /// `runtime_console_report` artifact (request counters, throttled/shed
         /// counts, degradation level, per-core distribution, cleanup status).
-        /// Requires `--runtime-mode managed` or `--runtime-mode per-core`.
+        /// Requires `--runtime-mode managed`.
         /// Console output is operational observability only: it never promotes
         /// `swarm.responsiveness` or `adaptive_runtime` readiness.
         #[arg(long = "console")]
@@ -12189,9 +12194,7 @@ mod tests {
         .expect_err("standard mode with managed timeout should fail");
         let message = format!("{err:#}");
         assert!(
-            message.contains(
-                "--managed-unmount-timeout-secs requires --runtime-mode managed or per-core"
-            ),
+            message.contains("--managed-unmount-timeout-secs requires --runtime-mode managed"),
             "unexpected validation message: {message}"
         );
     }
@@ -12841,7 +12844,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_cmd_per_core_mode_fails_at_image_open_not_validation() {
+    fn mount_cmd_per_core_mode_rejects_inert_dispatcher_before_opening_image() {
         let _guard = log_contract_guard();
         let err = mount_cmd(
             &PathBuf::from("/definitely/missing.img"),
@@ -12866,11 +12869,11 @@ mod tests {
                 console: MountConsoleConfig::default(),
             },
         )
-        .expect_err("per-core mode with missing image should fail at open");
+        .expect_err("per-core mode without a request-routing dispatcher must reject");
         let message = format!("{err:#}");
         assert!(
-            message.contains("failed to open filesystem image"),
-            "expected image-open failure, got: {message}"
+            message.contains("per-core runtime is unavailable"),
+            "expected inert-dispatch rejection, got: {message}"
         );
     }
 
@@ -13823,14 +13826,14 @@ mod tests {
     }
 
     #[test]
-    fn mount_per_core_config_accepts_timeout() {
-        let cfg = MountRuntimeConfig {
+    fn mount_per_core_config_rejects_inert_dispatcher() {
+        let err = MountRuntimeConfig {
             mode: MountRuntimeMode::PerCore,
             managed_unmount_timeout_secs: Some(60),
         }
         .validate()
-        .expect("per-core mode with timeout should validate");
-        assert_eq!(cfg.managed_unmount_timeout_secs(), 60);
+        .expect_err("per-core must stay unavailable without request routing");
+        assert!(format!("{err:#}").contains("per-core runtime is unavailable"));
     }
 
     #[test]
