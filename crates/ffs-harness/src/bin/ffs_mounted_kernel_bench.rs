@@ -6232,6 +6232,11 @@ fn fs_report(
     });
     let competitive_json = json!({
         "median": fuse_over_kernel.median,
+        // Keep both absolute arms beside the quotient.  A cross-window drift
+        // diagnosis is impossible from the ratio alone because incumbent
+        // volatility is multiplied into it (bd-4sull).
+        "fuse_median_wall_ns": fuse_median_wall_ns,
+        "kernel_median_wall_ns": kernel_median_wall_ns,
         "ci_low": fuse_over_kernel.low,
         "ci_high": fuse_over_kernel.high,
         "twice_null_log_margin": twice_null_log_margin,
