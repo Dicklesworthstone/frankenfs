@@ -7423,3 +7423,45 @@ private physical core.
 quotable figure. The cheap next step needs no window at all: `ffs-cli readdir-bench` across
 2k/8k/32k entries in process, to see whether per-entry cost grows with N in the filesystem layer or
 only under the mount.
+
+## ATTRIBUTION — 2026-08-14 — btrfs readdir+stat: the filesystem layer is 4.1% of the mounted cost (DarkMeadow)
+
+**Not a lever and not a row** — an attribution, measured in process with no mount, no incumbent, no
+quiet window and no gate, so nothing here is a competitive claim.
+
+**What was measured:** the comparator preserves its arm images, so
+`/data/tmp/ffs-mkb-darkmeadow/scratch/images/btrfs.fuse_a.img` is the *same* 32,768-entry btrfs
+image the refused mounted run enumerated (built through a kernel mount, one `File::create` per
+entry). One process, one ELF (`23e9706c…`, x86-64-v3, PGO `6a22cfcf…`):
+
+| in-process, 32,770 entries | per entry | total |
+|---|---|---|
+| `readdir-bench --iters 3` (steady state) | `0.0152 us` | `499.5 us`/enumeration |
+| `walk --no-stat` (incl. one-time index build) | `0.19 us` | `6.13 ms` |
+| `walk` (readdir + stat) | `0.26 us` | `8.60 ms` |
+| → the stat half | `0.075 us` | `2.47 ms` |
+
+**Against the mounted arms** of the same-shape refused run (inadmissible as a row; used only as an
+attribution numerator): FrankenFS FUSE `211.998 ms` = `6.470 us/entry`, kernel btrfs `27.702 ms` =
+`0.845 us/entry`.
+
+**Result:** the entire in-process job — *including* the one-time read-plan index build a mount
+amortises — is `8.60 ms` against `211.998 ms` mounted. **The filesystem layer is 4.1% of the mounted
+cost; ~96% is the mount path.** Our whole in-process job is also 3.2x faster than the kernel's whole
+mounted arm.
+
+**It also closes the scaling question:** mounted per-entry cost grows ~60% from 2,000 to 32,768
+entries while in-process cost is flat-to-better at 2x the entries (`0.0152` vs the `0.0167–0.0206`
+measured at 16,000; stat `0.075` vs `0.12`). The growth is in the mount path, not the filesystem.
+
+**Owner named by arithmetic:** `6.470 − 0.075 − 0.015 ≈ 6.38 us/entry` of pure mount-path cost.
+`bd-ha71t` measured one uncached `getxattr(security.capability)` round trip per path-based metadata
+op, so each entry costs TWO FUSE round trips; two at ~3.2 us accounts for the 6.38 with nothing left
+over. Removing the probe would take this workload from ~6.47 to ~3.2 us/entry and ~7.7x to ~3.9x —
+a quantified prize for `bd-ha71t` on the campaign's WORST row, stated as arithmetic pending an
+actual removal and re-measurement.
+
+**Loose thread, recorded not chased:** `walk` reports `btrfs node cache: 782 lookups, 0 hits (0.0%)`
+over a 32,770-entry stat sweep. At 0.02 lookups per stat it is off the hot path and cannot explain
+the loss, but a 0% hit rate is either a cache that cannot serve this pattern or one that is
+mis-keyed.

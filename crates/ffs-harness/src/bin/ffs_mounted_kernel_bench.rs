@@ -6365,6 +6365,7 @@ fn fs_report(
         "fixture_construction": config.fixture_construction.label(),
         "fixture_construction_bankable": config.fixture_construction.is_bankable(),
         "fixture_construction_reason": config.fixture_construction.bankability_reason(),
+        "mechanism_attribution": workload_mechanism_attribution(config.workload),
         "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
         "host_quiet_required_consecutive_samples": config.host_quiet_samples,
         "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
@@ -6461,6 +6462,13 @@ fn fs_report(
     );
     report.insert("operation_distribution_exact_total".to_owned(), json!(true));
     Ok(Value::Object(report))
+}
+
+fn workload_mechanism_attribution(workload: Workload) -> &'static str {
+    match workload {
+        Workload::ReaddirStat8 => "enumerate_then_stat_inode_resolution",
+        _ => "workload_specific_unattributed",
+    }
 }
 
 fn absolute_arm_medians_are_valid(fuse_median_ns: f64, kernel_median_ns: f64) -> bool {
@@ -7442,6 +7450,18 @@ mod tests {
                 .note()
                 .contains("copied to"),
             "an in-place build must not describe itself as copied in"
+        );
+    }
+
+    #[test]
+    fn readdir_stat_report_names_inode_resolution_mechanism_bd_fhb53() {
+        assert_eq!(
+            workload_mechanism_attribution(Workload::ReaddirStat8),
+            "enumerate_then_stat_inode_resolution"
+        );
+        assert_eq!(
+            workload_mechanism_attribution(Workload::WarmStat),
+            "workload_specific_unattributed"
         );
     }
 
