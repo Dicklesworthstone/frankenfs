@@ -6392,6 +6392,7 @@ fn fs_report(
         "client_affinity_cpus": placement.driver_cpus,
         "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "placement_scope": config.placement_scope.label(),
+        "placement_evidence_mode": placement_evidence_mode(config.placement_scope),
         // bd-pb85e: which construction built the fixture, and whether a row from
         // this run may be banked at all. Recorded unconditionally, including on
         // the default seeded path, so a reader never has to infer it from the
@@ -6498,6 +6499,14 @@ fn fs_report(
     );
     report.insert("operation_distribution_exact_total".to_owned(), json!(true));
     Ok(Value::Object(report))
+}
+
+const fn placement_evidence_mode(scope: PlacementScope) -> &'static str {
+    match scope {
+        PlacementScope::BalancedSquare => "busy_host_balanced_square_with_posthoc_aa_nulls",
+        PlacementScope::SameLlc => "same_llc_contention_preflight",
+        PlacementScope::HostWide => "host_wide_quiescence_preflight",
+    }
 }
 
 fn workload_mechanism_attribution(workload: Workload) -> &'static str {
@@ -7538,6 +7547,10 @@ mod tests {
         );
         assert!(!balanced_scope_allows_candidates(PlacementScope::BalancedSquare, true));
         assert!(balanced_scope_allows_candidates(PlacementScope::BalancedSquare, false));
+        assert_eq!(
+            placement_evidence_mode(PlacementScope::BalancedSquare),
+            "busy_host_balanced_square_with_posthoc_aa_nulls"
+        );
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
