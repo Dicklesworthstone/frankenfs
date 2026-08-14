@@ -2234,6 +2234,44 @@ fn cli_mount_nonexistent_image_reports_error() {
     emit_scenario_result("cli_mount_missing_image_error", "PASS", None);
 }
 
+/// The per-core mode used to construct an unconnected dispatcher, then start a
+/// regular managed mount. Reject it at the command boundary before opening the
+/// image: otherwise the CLI advertises a routing model that serves no request.
+///
+/// This is intentionally a binary-level regression rather than a direct call
+/// to `MountRuntimeConfig::validate`, so Clap parsing and the public `ffs mount`
+/// surface cannot bypass the fail-closed guard (bd-fuse-per-core-mount-dispatch-inert-qai4n).
+#[test]
+fn cli_mount_per_core_rejects_inert_dispatcher_before_image_open() {
+    let tmpdir = tempfile::tempdir().expect("create temp dir");
+    let missing_image = tmpdir.path().join("no_such.img");
+    let mountpoint = tmpdir.path().join("mnt");
+    fs::create_dir(&mountpoint).expect("create mountpoint dir");
+
+    let output = run_ffs_cli(&[
+        "mount",
+        "--runtime-mode",
+        "per-core",
+        missing_image.to_str().expect("temp path is UTF-8"),
+        mountpoint.to_str().expect("temp path is UTF-8"),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "an inert per-core dispatcher must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("per-core runtime is unavailable"),
+        "the CLI must name the unavailable dispatcher, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to open filesystem image"),
+        "validation must run before image I/O, got: {stderr}"
+    );
+    emit_scenario_result("cli_mount_per_core_inert_dispatcher_rejected", "PASS", None);
+}
+
 #[test]
 fn cli_mount_managed_unmount_timeout_rejected_in_standard_mode() {
     // AGENTS.md / CLI help documents that `--managed-unmount-timeout-secs`
