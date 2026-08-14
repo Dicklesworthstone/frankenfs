@@ -800,6 +800,49 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Benchmark STEADY-STATE getattr: open the image once, enumerate one
+    /// directory outside the clock, then re-stat all of its entries `iters`
+    /// times across `threads` workers and report per-entry cost.
+    ///
+    /// The readdir sibling of this bench exists because `walk` includes a
+    /// one-time index build; this one exists because `walk` cannot vary
+    /// CONCURRENCY over entries. `walk --parallel` splits work by DIRECTORY, so
+    /// on a single large directory — which is the shape of every large-directory
+    /// readdir+stat row — it runs one worker and measures nothing about
+    /// concurrent metadata reads (bd-3zx2x: that artifact read as 1.40x
+    /// "negative scaling" until the parallelism was checked).
+    ///
+    /// The mounted comparator drives 8 client threads against a one-CPU daemon,
+    /// so a per-request cost that only appears under concurrent requests is
+    /// invisible to every serial in-process instrument this campaign has. This
+    /// bench makes that difference measurable without a mount, a kernel arm or a
+    /// quiet window.
+    #[command(name = "stat-bench")]
+    StatBench {
+        /// Path to the filesystem image.
+        image: PathBuf,
+        /// Absolute path of the directory whose entries are re-stat'ed.
+        #[arg(long, default_value = "/")]
+        dir: String,
+        /// Timed sweeps over every entry of `dir`.
+        #[arg(long, default_value_t = 5)]
+        iters: usize,
+        /// Untimed sweeps before the clock starts, so lazily-built caches are
+        /// warm and steady state is what gets measured.
+        #[arg(long, default_value_t = 2)]
+        warmup: usize,
+        /// Worker threads splitting each sweep's entries. 1 = serial.
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+        /// Enable writes before measuring, selecting the code path a read-write
+        /// MOUNT uses — the same switch and the same reason as `readdir-bench
+        /// --rw`. The timed region only stats, so the image is not mutated.
+        #[arg(long)]
+        rw: bool,
+        /// Emit one machine-readable line instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
     /// Benchmark metadata WRITES: `enable_writes`, then create `count` empty
     /// files in `dir` and FLUSH the overlay to the image (`sync_all_to_device`),
     /// timing the whole thing. Each create is existence-check lookup + inode
@@ -1333,6 +1376,7 @@ impl Command {
             Self::WriteBench { .. } => "writebench",
             Self::LookupBench { .. } => "lookupbench",
             Self::ReaddirBench { .. } => "readdirbench",
+            Self::StatBench { .. } => "statbench",
             Self::CreateBench { .. } => "createbench",
             Self::CreateBenchCutoverGate { .. } => "createbench-cutover-gate",
             Self::ReadPoolCutoverGate { .. } => "read-pool-cutover-gate",
@@ -2172,6 +2216,15 @@ fn run() -> Result<()> {
             rw,
             json,
         } => readdirbench_cmd(&image, &dir, iters, warmup, rw, json),
+        Command::StatBench {
+            image,
+            dir,
+            iters,
+            warmup,
+            threads,
+            rw,
+            json,
+        } => statbench_cmd(&image, &dir, iters, warmup, threads, rw, json),
         Command::CreateBench {
             image,
             dir,
@@ -3920,6 +3973,184 @@ fn readdirbench_cmd(
             "  {:.3} ns/entry   {:.3} us/enumeration   {:.3} ms total",
             per_entry_ns,
             per_iter_us,
+            elapsed.as_secs_f64() * 1e3
+        );
+    }
+    Ok(())
+}
+
+/// Steady-state getattr, with concurrency as a dial.
+///
+/// Everything a mount pays once — open, alloc state, the btrfs read-plan index,
+/// the enumeration that produces the inode list — happens outside the clock. The
+/// timed region is `iters` sweeps of `getattr` over the same entry set, split
+/// across `threads` workers, which is the per-request work a mounted stat
+/// repeats minus the FUSE transport.
+///
+/// Why this exists rather than reusing `walk --parallel`: that flag parallelises
+/// across DIRECTORIES, so on a single large directory it runs exactly one worker.
+/// Comparing it against a serial walk therefore measures thread-pool setup, not
+/// concurrent metadata reads — an artifact that read as 1.40x "negative scaling"
+/// on btrfs until the parallelism was actually checked (bd-3zx2x). Here the split
+/// is across ENTRIES, so `--threads 8` really issues eight concurrent getattrs.
+fn statbench_cmd(
+    path: &PathBuf,
+    dir_path: &str,
+    iters: usize,
+    warmup: usize,
+    threads: usize,
+    rw: bool,
+    json: bool,
+) -> Result<()> {
+    use std::time::Instant;
+
+    if iters == 0 {
+        bail!("--iters must be at least 1");
+    }
+    if threads == 0 {
+        bail!("--threads must be at least 1");
+    }
+    let cx = cli_cx();
+    let mut open_fs = OpenFs::open(&cx, path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    if rw {
+        open_fs
+            .enable_writes(&cx)
+            .context("failed to enable writes (alloc state)")?;
+    }
+    if matches!(&open_fs.flavor, FsFlavor::Btrfs(_)) {
+        open_fs
+            .prewarm_btrfs_read_plan_index(&cx)
+            .context("failed to prewarm btrfs read-plan index")?;
+    }
+
+    let mut ino = InodeNumber(1);
+    for comp in dir_path.split('/').filter(|c| !c.is_empty()) {
+        let attr = open_fs
+            .lookup(&cx, ino, std::ffi::OsStr::new(comp))
+            .with_context(|| format!("failed to resolve {dir_path} at component {comp:?}"))?;
+        ino = attr.ino;
+    }
+
+    // Enumerate ONCE, outside the clock: the inode list is the bench's input,
+    // not part of what it measures. `.`/`..` are excluded so the entry count is
+    // the number of distinct inodes actually stat'ed.
+    let mut inodes: Vec<InodeNumber> = Vec::new();
+    let mut off = 0_u64;
+    loop {
+        let page = open_fs
+            .readdir(&cx, ino, off)
+            .with_context(|| format!("failed to readdir {dir_path} at offset {off}"))?;
+        if page.is_empty() {
+            break;
+        }
+        for entry in &page {
+            if entry.name != b"." && entry.name != b".." {
+                inodes.push(entry.ino);
+            }
+        }
+        let exhausted = off.saturating_add(1);
+        off = page.last().map_or(exhausted, |entry| entry.offset);
+    }
+    if inodes.is_empty() {
+        bail!("{dir_path} enumerated 0 stat-able entries — nothing to measure");
+    }
+
+    let fs_ref = &open_fs;
+    // Count the getattrs actually issued rather than assuming `entries * iters`.
+    // The per-entry figure divides by work DONE, so a split that duplicated a
+    // chunk across workers or dropped one would show up in the reported total
+    // instead of silently scaling the answer.
+    let performed = std::sync::atomic::AtomicU64::new(0);
+    let performed_ref = &performed;
+    let sweep = |slice: &[InodeNumber]| -> Result<()> {
+        let cx = cli_cx();
+        let mut local = 0_u64;
+        for &entry in slice {
+            let _attr = fs_ref
+                .getattr(&cx, entry)
+                .with_context(|| format!("failed to getattr inode {}", entry.0))?;
+            local += 1;
+        }
+        performed_ref.fetch_add(local, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    };
+    // The chunking is identical in the serial and threaded paths so the only
+    // difference between `--threads 1` and `--threads N` is how many workers run
+    // it — otherwise a comparison across thread counts would also be comparing
+    // two different traversal orders.
+    let chunk_size = inodes.len().div_ceil(threads).max(1);
+    let run_sweep = || -> Result<()> {
+        if threads == 1 {
+            return sweep(&inodes);
+        }
+        let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+        let err_ref = &first_err;
+        // `&sweep` rather than `sweep`: a `move` closure would take the sweep
+        // closure by value into the FIRST spawned worker, leaving none for the
+        // rest. A shared reference is `Copy`, so every worker gets one.
+        let sweep_ref = &sweep;
+        std::thread::scope(|scope| {
+            for chunk in inodes.chunks(chunk_size) {
+                scope.spawn(move || {
+                    if let Err(error) = sweep_ref(chunk) {
+                        let mut guard = err_ref.lock().expect("stat-bench error slot poisoned");
+                        if guard.is_none() {
+                            *guard = Some(error);
+                        }
+                    }
+                });
+            }
+        });
+        let pending = first_err
+            .into_inner()
+            .expect("stat-bench error slot poisoned");
+        pending.map_or(Ok(()), Err)
+    };
+
+    for _ in 0..warmup {
+        run_sweep()?;
+    }
+
+    performed.store(0, std::sync::atomic::Ordering::Relaxed);
+    let start = Instant::now();
+    for _ in 0..iters {
+        run_sweep()?;
+    }
+    let elapsed = start.elapsed();
+    let stats = performed.load(std::sync::atomic::Ordering::Relaxed);
+
+    let per_entry_ns = elapsed.as_secs_f64() * 1e9 / (stats as f64);
+    let per_sweep_us = elapsed.as_secs_f64() * 1e6 / (iters as f64);
+    if json {
+        println!(
+            "{{\"stat_bench\":{{\"image\":{:?},\"dir\":{:?},\"entries\":{},\"iters\":{},\
+             \"warmup\":{},\"threads\":{},\"rw\":{},\"stats_performed\":{},\"total_ns\":{},\
+             \"ns_per_entry\":{:.3},\"us_per_sweep\":{:.3},\"setup\":\"outside_timed_region\"}}}}",
+            path.display().to_string(),
+            dir_path,
+            inodes.len(),
+            iters,
+            warmup,
+            threads,
+            rw,
+            stats,
+            elapsed.as_nanos(),
+            per_entry_ns,
+            per_sweep_us,
+        );
+    } else {
+        println!(
+            "stat-bench {}: {} entries x {} iters, {} thread(s), rw={} (warmup {}, setup outside the clock)",
+            path.display(),
+            inodes.len(),
+            iters,
+            threads,
+            rw,
+            warmup
+        );
+        println!(
+            "  {per_entry_ns:.3} ns/entry   {per_sweep_us:.3} us/sweep   {:.3} ms total   {stats} getattrs",
             elapsed.as_secs_f64() * 1e3
         );
     }
@@ -7716,6 +7947,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                         requests_ok: 0,
                         requests_err: 0,
                         bytes_read: 0,
+                        metadata_requests: 0,
                         requests_throttled: 0,
                         requests_shed: 0,
                     },

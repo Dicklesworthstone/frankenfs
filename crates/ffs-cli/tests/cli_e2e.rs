@@ -1753,6 +1753,100 @@ fn cli_info_ext4_shows_superblock() {
     }
 }
 
+/// `stat-bench` must divide by the getattrs it ACTUALLY issued, and adding
+/// workers must not change how many that is (bd-3zx2x).
+///
+/// This is the assertion that makes the instrument trustworthy rather than
+/// merely plausible. The two ways a threaded split goes wrong both produce a
+/// believable-looking per-entry number and neither shows up in a wall-clock
+/// check: give every worker the whole list and the bench does `threads x` the
+/// work while reporting the same entry count (per-entry cost inflates), or
+/// spawn workers over a stale chunk list and some entries are never stat'ed
+/// (per-entry cost deflates). Requiring `stats_performed == entries * iters` at
+/// BOTH thread counts catches duplication and truncation in the same assertion,
+/// and requiring the same `entries` at both catches a split that changes the
+/// measured set.
+#[test]
+fn cli_stat_bench_counts_the_getattrs_it_issues_at_every_thread_count() {
+    if !cli_prerequisites_available() {
+        eprintln!("SKIP: mkfs.ext4 or debugfs not available");
+        return;
+    }
+
+    let tmpdir = tempfile::tempdir().expect("create temp dir");
+    let image = create_minimal_ext4_image(tmpdir.path(), 4);
+    let image_arg = image.to_str().expect("image path is UTF-8");
+    const ITERS: u64 = 3;
+
+    let observe = |threads: &str| -> (u64, u64) {
+        let output = run_ffs_cli(&[
+            "stat-bench",
+            image_arg,
+            "--dir",
+            "/",
+            "--iters",
+            "3",
+            "--warmup",
+            "1",
+            "--threads",
+            threads,
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "stat-bench --threads {threads} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("stat-bench stdout is UTF-8");
+        let line = stdout
+            .lines()
+            .find(|line| line.contains("\"stat_bench\""))
+            .unwrap_or_else(|| panic!("stat-bench JSON line missing from:\n{stdout}"));
+        let field = |key: &str| -> u64 {
+            let needle = format!("\"{key}\":");
+            let rest = line
+                .split_once(needle.as_str())
+                .unwrap_or_else(|| panic!("stat-bench JSON has no {key}: {line}"))
+                .1;
+            rest.split(|c: char| !c.is_ascii_digit())
+                .find(|part| !part.is_empty())
+                .unwrap_or_else(|| panic!("stat-bench {key} is not numeric: {line}"))
+                .parse()
+                .unwrap_or_else(|_| panic!("stat-bench {key} does not parse: {line}"))
+        };
+        (field("entries"), field("stats_performed"))
+    };
+
+    let (serial_entries, serial_stats) = observe("1");
+    let (threaded_entries, threaded_stats) = observe("4");
+
+    assert!(
+        serial_entries > 0,
+        "the fixture root must contain at least one stat-able entry"
+    );
+    assert_eq!(
+        serial_entries, threaded_entries,
+        "adding workers changed the measured entry set"
+    );
+    assert_eq!(
+        serial_stats,
+        serial_entries * ITERS,
+        "serial stat-bench must issue exactly entries x iters getattrs"
+    );
+    assert_eq!(
+        threaded_stats,
+        threaded_entries * ITERS,
+        "threaded stat-bench must issue exactly entries x iters getattrs — a chunk \
+         handed to every worker inflates this, a dropped chunk deflates it, and both \
+         silently rescale the reported per-entry cost"
+    );
+    emit_scenario_result(
+        "cli_stat_bench_counts_the_getattrs_it_issues_at_every_thread_count",
+        "PASS",
+        None,
+    );
+}
+
 #[test]
 fn cli_fsck_ext4_clean_image() {
     if !cli_prerequisites_available() {
