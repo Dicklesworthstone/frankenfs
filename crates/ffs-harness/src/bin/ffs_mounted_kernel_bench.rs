@@ -5228,9 +5228,16 @@ fn create_run_dir(root: &Path) -> Result<PathBuf> {
     fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("system time predates Unix epoch")?
-        .as_secs();
-    let run_dir = root.join(format!("run_{epoch}_{}", std::process::id()));
+        .context("system time predates Unix epoch")?;
+    // Sub-second uniqueness matters when a measurement script retries a
+    // rejected invocation in the same second: reports must never collide even
+    // when the PID is reused by a wrapper (bd-v0igv).
+    let run_dir = root.join(format!(
+        "run_{}_{}_{}",
+        epoch.as_secs(),
+        epoch.subsec_nanos(),
+        std::process::id()
+    ));
     fs::create_dir(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
     Ok(run_dir)
 }
@@ -7358,6 +7365,13 @@ mod tests {
             scratch_image_dir(run).unwrap(),
             Path::new("/data/tmp/comparator/images")
         );
+    }
+
+    #[test]
+    fn run_directory_rejects_non_artifact_roots_bd_v0igv() {
+        let error = create_run_dir(Path::new("relative-artifacts"))
+            .expect_err("measurement artifacts must not escape /data/tmp");
+        assert!(error.to_string().contains("absolute path below /data/tmp"));
     }
 
     #[test]
