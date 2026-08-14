@@ -1768,6 +1768,8 @@ fn cli_info_ext4_shows_superblock() {
 /// measured set.
 #[test]
 fn cli_stat_bench_counts_the_getattrs_it_issues_at_every_thread_count() {
+    const ITERS: u64 = 3;
+
     if !cli_prerequisites_available() {
         eprintln!("SKIP: mkfs.ext4 or debugfs not available");
         return;
@@ -1776,7 +1778,6 @@ fn cli_stat_bench_counts_the_getattrs_it_issues_at_every_thread_count() {
     let tmpdir = tempfile::tempdir().expect("create temp dir");
     let image = create_minimal_ext4_image(tmpdir.path(), 4);
     let image_arg = image.to_str().expect("image path is UTF-8");
-    const ITERS: u64 = 3;
 
     let observe = |threads: &str| -> (u64, u64) {
         let output = run_ffs_cli(&[

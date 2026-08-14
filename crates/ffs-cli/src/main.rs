@@ -3993,23 +3993,19 @@ fn readdirbench_cmd(
 /// concurrent metadata reads — an artifact that read as 1.40x "negative scaling"
 /// on btrfs until the parallelism was actually checked (bd-3zx2x). Here the split
 /// is across ENTRIES, so `--threads 8` really issues eight concurrent getattrs.
-fn statbench_cmd(
+/// Everything [`statbench_cmd`] pays before its clock starts: open the image,
+/// optionally take the read-write path, prewarm the btrfs read-plan index,
+/// resolve the directory, and enumerate it ONCE into the inode list the timed
+/// sweeps re-stat.
+///
+/// Split out so the timed region and the setup that must stay outside it are not
+/// interleaved in one long function — the boundary between them is the whole
+/// point of this bench.
+fn statbench_prepare(
     path: &PathBuf,
     dir_path: &str,
-    iters: usize,
-    warmup: usize,
-    threads: usize,
     rw: bool,
-    json: bool,
-) -> Result<()> {
-    use std::time::Instant;
-
-    if iters == 0 {
-        bail!("--iters must be at least 1");
-    }
-    if threads == 0 {
-        bail!("--threads must be at least 1");
-    }
+) -> Result<(OpenFs, Vec<InodeNumber>)> {
     let cx = cli_cx();
     let mut open_fs = OpenFs::open(&cx, path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
@@ -4055,6 +4051,27 @@ fn statbench_cmd(
     if inodes.is_empty() {
         bail!("{dir_path} enumerated 0 stat-able entries — nothing to measure");
     }
+    Ok((open_fs, inodes))
+}
+
+fn statbench_cmd(
+    path: &PathBuf,
+    dir_path: &str,
+    iters: usize,
+    warmup: usize,
+    threads: usize,
+    rw: bool,
+    json: bool,
+) -> Result<()> {
+    use std::time::Instant;
+
+    if iters == 0 {
+        bail!("--iters must be at least 1");
+    }
+    if threads == 0 {
+        bail!("--threads must be at least 1");
+    }
+    let (open_fs, inodes) = statbench_prepare(path, dir_path, rw)?;
 
     let fs_ref = &open_fs;
     // Count the getattrs actually issued rather than assuming `entries * iters`.
