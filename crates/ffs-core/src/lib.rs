@@ -1781,6 +1781,12 @@ type BtrfsCsumItems = Vec<(BtrfsKey, Vec<u8>)>;
 
 const EXT4_FILE_DATA_BLOCK_CACHE_LIMIT: usize = 256;
 const EXT4_INODE_ATTR_CACHE_LIMIT: usize = 65536;
+/// Maximum number of immutable btrfs inode attributes retained by the
+/// read-only resolver.  This is deliberately smaller than the ext4 limit:
+/// btrfs inode resolution is an on-disk tree descent, so a bounded cache can
+/// amortize repeated lookups without turning mount memory into a function of
+/// filesystem size (bd-5vis3).
+const BTRFS_INODE_ATTR_CACHE_LIMIT: usize = 4096;
 const EXT4_BASE_BLOCK_CACHE_LIMIT: usize = 1024;
 
 /// Maximum number of btrfs tree nodes cached by physical address on a
@@ -9422,7 +9428,7 @@ impl OpenFs {
             self.ext4_inode_attr_cache.insert_within(
                 canonical,
                 attr.clone(),
-                EXT4_INODE_ATTR_CACHE_LIMIT,
+                BTRFS_INODE_ATTR_CACHE_LIMIT,
             );
         }
         Ok(attr)
@@ -43575,6 +43581,13 @@ mod tests {
             1,
             "the read-only cache should suppress the second descriptor-block read"
         );
+    }
+
+    #[test]
+    fn btrfs_inode_attr_cache_has_a_fixed_mount_memory_bound_bd_5vis3() {
+        assert!(BTRFS_INODE_ATTR_CACHE_LIMIT > 0);
+        assert!(BTRFS_INODE_ATTR_CACHE_LIMIT < EXT4_INODE_ATTR_CACHE_LIMIT);
+        assert_eq!(BTRFS_INODE_ATTR_CACHE_LIMIT, 4096);
     }
 
     #[test]
