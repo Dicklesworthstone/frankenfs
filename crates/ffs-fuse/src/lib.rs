@@ -983,6 +983,7 @@ impl std::fmt::Debug for AtomicMetrics {
             .field("requests_ok", &s.requests_ok)
             .field("requests_err", &s.requests_err)
             .field("bytes_read", &s.bytes_read)
+            .field("metadata_requests", &s.metadata_requests)
             .field("requests_throttled", &s.requests_throttled)
             .field("requests_shed", &s.requests_shed)
             .finish()
@@ -15668,6 +15669,8 @@ mod tests {
         assert_eq!(snap.requests_err, 1);
         assert_eq!(snap.bytes_read, 1024);
         assert_eq!(snap.metadata_requests, 1);
+        let debug = format!("{metrics:?}");
+        assert!(debug.contains("metadata_requests: 1"));
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
