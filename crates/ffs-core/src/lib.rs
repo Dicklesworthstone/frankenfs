@@ -55978,7 +55978,6 @@ mod tests {
     /// clean.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: rmdir leaks a dir block on the sharded path — same defect as dir rename; see doc comment"]
     fn rmdir_of_a_sharded_allocated_directory_does_not_leak_blocks_bd_y2t0r() {
         let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
             return; // e2fsprogs unavailable
@@ -56045,8 +56044,7 @@ mod tests {
     /// shared release path.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    #[ignore = "bd-y2t0r: dir-over-dir rename leaks a free block on the sharded path; see doc comment"]
-    fn rename_over_existing_directory_leaks_a_block_bd_y2t0r() {
+    fn rename_over_existing_directory_does_not_leak_a_block_bd_y2t0r() {
         rename_over_existing_counter_check_bd_y2t0r_inner(true, true);
     }
 
