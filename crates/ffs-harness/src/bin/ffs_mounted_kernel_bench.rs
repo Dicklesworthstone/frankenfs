@@ -2105,6 +2105,13 @@ impl FixtureConstruction {
     const fn is_bankable(self) -> bool {
         matches!(self, Self::Seeded)
     }
+
+    const fn bankability_reason(self) -> &'static str {
+        match self {
+            Self::Seeded => "seeded_through_mount",
+            Self::Baked => "baked_with_mke2fs_d_known_unfair",
+        }
+    }
 }
 
 fn parse_fixture_construction(value: &str) -> Result<FixtureConstruction> {
@@ -6357,6 +6364,7 @@ fn fs_report(
         // remembering which flag was in force the day it was taken.
         "fixture_construction": config.fixture_construction.label(),
         "fixture_construction_bankable": config.fixture_construction.is_bankable(),
+        "fixture_construction_reason": config.fixture_construction.bankability_reason(),
         "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
         "host_quiet_required_consecutive_samples": config.host_quiet_samples,
         "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
@@ -7474,12 +7482,20 @@ mod tests {
             "a baked fixture is the known-unfair pre-bd-plkzd construction and must \
              never be bankable, whatever the numbers come out at"
         );
+        assert_eq!(
+            baked.fixture_construction.bankability_reason(),
+            "baked_with_mke2fs_d_known_unfair"
+        );
 
         let seeded = parse_config_args(&base_args("seeded"))
             .expect("parse seeded fixture construction")
             .expect("normal invocation");
         assert_eq!(seeded.fixture_construction, FixtureConstruction::Seeded);
         assert!(seeded.fixture_construction.is_bankable());
+        assert_eq!(
+            seeded.fixture_construction.bankability_reason(),
+            "seeded_through_mount"
+        );
 
         // The DEFAULT is the bankable one. If this ever inverts, every row taken
         // without the flag silently becomes unfair, which is the exact defect
