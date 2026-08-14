@@ -7377,3 +7377,49 @@ host is quiet enough for host-wide scope to pass its preflight. If the cross-pai
 not clear at 48 pairs under private cores, the next question is not more pairs but whether 8 daemon
 CPUs is simply a high-variance configuration for this workload — in which case say so and stop
 buying pairs.
+
+## REFUSED ROW — 2026-08-14 — btrfs readdir+stat re-measured on a CURRENT ELF: 7.728937x, inadmissible on external load (DarkMeadow)
+
+**Lever:** none — this is a re-measurement, not a candidate. The btrfs scorecard header requires
+every row to be re-taken on a current ELF; this is that attempt for the campaign's worst single
+ratio (`bd-3zx2x`).
+
+**Hypothesis:** the banked `7.753405x` / `7.649395x` large-directory readdir+stat loss still
+describes FrankenFS at HEAD, after the btrfs write-path commits since 2026-08-08 and after
+`bd-y2t0r`'s allocation-accounting reconciliation.
+
+**Measured (INADMISSIBLE — do not bank, do not quote as a row, do not call anything a regression
+from it):** `fuse_over_kernel_median 7.728937` CI `[7.564989, 7.836175]`, twice-null margin
+`1.026447`, estimator `admitted=true`, `verdict=HONEST_LOSS`; kernel A/A `0.996812` (spread
+`1.013137`, clear), FUSE A/A `0.995724` (spread `1.011971`, clear); kernel median `27.702 ms`
+against FrankenFS `211.998 ms` over 32,768 entries, `pairs=32`, 8 client threads requested and
+**8 observed**; parity, post-parity, mount-identity and independent-arm checks all pass.
+
+**Why rejected:** the harness's own `external_load_during_run` gate returned `verdict=CONTENDED` —
+85 of 85 samples over the limit, peak 20 busy CPUs against a limit of 2, `contended_fraction=1.0000`
+against `0.10`. The *placement* CPUs were clear (`core_contention_preflight verdict=clear`, driver
+busy `1.0%`, daemon busy `4.1%`); memory bandwidth, LLC and boost budget are socket-wide, which is
+exactly what that gate exists to catch. **The gate is correct and was not relaxed.** Blocker is
+foreign load from sibling campaigns on this shared host (`frankensearch_q` 700–1200%, three
+`smartedgar` at ~90%), not anything about FrankenFS.
+
+**Second refused observation, new to `bd-3zx2x`:** the same invocation at the default 2,000 entries
+gave `3.527364x` `[3.451929, 3.549051]` (kernel `2.315 ms`, FrankenFS `8.094 ms`, both nulls clear,
+same refusal). Per entry the kernel gets ~27% **cheaper** as the directory grows (1.157 → 0.845 µs)
+while FrankenFS gets ~60% **more expensive** (4.047 → 6.470 µs). The excess grows with N rather than
+amortising — a different shape from anything the bead has tested.
+
+**Provenance:** candidate ELF `23e9706c30e45f39f08663d40b69765ab1b141b4d157f663e8ae3199ebca8f1d`,
+x86-64-v3 attested, PGO profile `6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`
+(the frozen profile behind the banked ext4 rows), self-hashed in process and cross-checked against
+its on-disk path; both ELFs `BUILT_IN_PLACE` (rch has no artifact retrieval and the mounted run is
+local-only). Host `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX 32C/64T, 1 NUMA node, all 64
+CPUs `performance`/`amd-pstate-epp` with `non_performance_or_mixed_governor_warning=false`, kernel
+`6.17.0-41-generic`, `btrfs.ko` sha256 `0acb7af5…`, `--placement-scope same-llc`, daemon on a
+private physical core.
+
+**Retry predicate:** re-run when the box is quiet enough for `external_load_during_run` to clear
+(≤2 off-placement CPUs above 25% busy for ≥90% of samples). Until then the banked pair stands as the
+quotable figure. The cheap next step needs no window at all: `ffs-cli readdir-bench` across
+2k/8k/32k entries in process, to see whether per-entry cost grows with N in the filesystem layer or
+only under the mount.
