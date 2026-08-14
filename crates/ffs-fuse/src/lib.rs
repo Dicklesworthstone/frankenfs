@@ -2461,6 +2461,7 @@ impl Filesystem for FrankenFuse {
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
         // F_OK (existence check) always succeeds if we can get attributes
         // R_OK/W_OK/X_OK check read/write/execute permissions
+        self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
@@ -15664,15 +15665,16 @@ mod tests {
         metrics.record_err();
         metrics.record_bytes_read(1024);
         metrics.record_metadata_request();
+        metrics.record_metadata_request();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.requests_total, 3);
         assert_eq!(snap.requests_ok, 2);
         assert_eq!(snap.requests_err, 1);
         assert_eq!(snap.bytes_read, 1024);
-        assert_eq!(snap.metadata_requests, 1);
+        assert_eq!(snap.metadata_requests, 2);
         let debug = format!("{metrics:?}");
-        assert!(debug.contains("metadata_requests: 1"));
+        assert!(debug.contains("metadata_requests: 2"));
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
