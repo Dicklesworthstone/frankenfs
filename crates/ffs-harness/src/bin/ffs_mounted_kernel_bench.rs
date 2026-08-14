@@ -6366,6 +6366,7 @@ fn fs_report(
         "fixture_construction_bankable": config.fixture_construction.is_bankable(),
         "fixture_construction_reason": config.fixture_construction.bankability_reason(),
         "mechanism_attribution": workload_mechanism_attribution(config.workload),
+        "mechanism_attribution_owner": workload_mechanism_owner(config.workload),
         "cpu_busy_sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
         "host_quiet_required_consecutive_samples": config.host_quiet_samples,
         "host_quiet_timeout_ms": config.host_quiet_timeout_ms,
@@ -6468,6 +6469,13 @@ fn workload_mechanism_attribution(workload: Workload) -> &'static str {
     match workload {
         Workload::ReaddirStat8 => "enumerate_then_stat_inode_resolution",
         _ => "workload_specific_unattributed",
+    }
+}
+
+fn workload_mechanism_owner(workload: Workload) -> &'static str {
+    match workload {
+        Workload::ReaddirStat8 => "btrfs_inode_resolution_or_shared_fuse_floor",
+        _ => "unattributed",
     }
 }
 
@@ -7462,6 +7470,10 @@ mod tests {
         assert_eq!(
             workload_mechanism_attribution(Workload::WarmStat),
             "workload_specific_unattributed"
+        );
+        assert_eq!(
+            workload_mechanism_owner(Workload::ReaddirStat8),
+            "btrfs_inode_resolution_or_shared_fuse_floor"
         );
     }
 
