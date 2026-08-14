@@ -1248,7 +1248,10 @@ fn validate_config(config: &Config) -> Result<()> {
             "{flag} is required: name the machine that built the ELF"
         );
     }
-    let period = schedule_period(config.compares_candidates());
+    let period = balanced_scope_schedule_period(
+        config.placement_scope,
+        config.compares_candidates(),
+    );
     ensure!(
         config.pairs >= 12 && config.pairs % period == 0,
         "--pairs must be a multiple of {period} and at least 12"
@@ -1353,6 +1356,17 @@ fn validate_config(config: &Config) -> Result<()> {
         );
     }
     Ok(())
+}
+
+const fn balanced_scope_schedule_period(
+    scope: PlacementScope,
+    compares_candidates: bool,
+) -> usize {
+    if scope == PlacementScope::BalancedSquare {
+        schedule_period(false)
+    } else {
+        schedule_period(compares_candidates)
+    }
 }
 
 fn balanced_square_margin_is_valid(scope: PlacementScope, maximum_null_ratio: f64) -> bool {
@@ -7510,6 +7524,10 @@ mod tests {
         assert!(balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.02));
         assert!(!balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.025));
         assert!(balanced_square_margin_is_valid(PlacementScope::SameLlc, 1.025));
+        assert_eq!(
+            balanced_scope_schedule_period(PlacementScope::BalancedSquare, true),
+            4
+        );
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
