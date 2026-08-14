@@ -1930,7 +1930,14 @@ fn create_base_image(
     run_dir: &Path,
     config: &Config,
 ) -> Result<PathBuf> {
-    let image = run_dir.join(format!("{}.base.img", kind.label()));
+    // Images are deterministic intermediates rebuilt on every invocation. Keep
+    // one reusable image directory beside the per-run report directory so
+    // repeated comparator runs cannot grow scratch space without bound
+    // (bd-v0igv). Concurrent runs are unsupported by the host-quiet gate.
+    let image_dir = scratch_image_dir(run_dir)?;
+    fs::create_dir_all(&image_dir)
+        .with_context(|| format!("create image directory {}", image_dir.display()))?;
+    let image = image_dir.join(format!("{}.base.img", kind.label()));
     create_sized_file(&image, config.image_size_mib)?;
     match kind {
         FilesystemKind::Ext4 => {
@@ -2250,9 +2257,12 @@ fn clone_images(
     arms: &[Arm],
 ) -> Result<BTreeMap<Arm, PathBuf>> {
     let expected_sha = file_sha256(base)?;
+    let image_dir = scratch_image_dir(run_dir)?;
+    fs::create_dir_all(&image_dir)
+        .with_context(|| format!("create image directory {}", image_dir.display()))?;
     let mut images = BTreeMap::new();
     for &arm in arms {
-        let path = run_dir.join(format!("{}.{}.img", kind.label(), arm.label()));
+        let path = image_dir.join(format!("{}.{}.img", kind.label(), arm.label()));
         fs::copy(base, &path)
             .with_context(|| format!("clone {} to {}", base.display(), path.display()))?;
         sync_image(&path)?;
@@ -2265,6 +2275,13 @@ fn clone_images(
         images.insert(arm, path);
     }
     Ok(images)
+}
+
+fn scratch_image_dir(run_dir: &Path) -> Result<PathBuf> {
+    run_dir
+        .parent()
+        .map(|parent| parent.join("images"))
+        .ok_or_else(|| anyhow!("artifact run directory has no scratch parent"))
 }
 
 fn mountinfo_unescape(value: &str) -> String {
@@ -7316,6 +7333,15 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scratch_images_live_beside_per_run_reports_bd_v0igv() {
+        let run = Path::new("/data/tmp/comparator/run_1_1");
+        assert_eq!(
+            scratch_image_dir(run).unwrap(),
+            Path::new("/data/tmp/comparator/images")
+        );
     }
 
     #[test]
