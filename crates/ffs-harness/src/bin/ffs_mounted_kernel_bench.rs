@@ -1304,6 +1304,10 @@ fn validate_config(config: &Config) -> Result<()> {
         "--maximum-null-ratio must exceed 1.0"
     );
     ensure!(
+        balanced_square_margin_is_valid(config.placement_scope, config.maximum_null_ratio),
+        "balanced-square requires --maximum-null-ratio <= 1.02"
+    );
+    ensure!(
         config.arm_settle_ms <= MAX_ARM_SETTLE_MS,
         "--arm-settle-ms must be at most {MAX_ARM_SETTLE_MS}"
     );
@@ -1349,6 +1353,10 @@ fn validate_config(config: &Config) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn balanced_square_margin_is_valid(scope: PlacementScope, maximum_null_ratio: f64) -> bool {
+    scope != PlacementScope::BalancedSquare || maximum_null_ratio <= 1.02
 }
 
 fn parse_args() -> Result<Option<Config>> {
@@ -7499,6 +7507,9 @@ mod tests {
             PlacementScope::BalancedSquare
         );
         assert_eq!(PlacementScope::BalancedSquare.label(), "balanced_square");
+        assert!(balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.02));
+        assert!(!balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.025));
+        assert!(balanced_square_margin_is_valid(PlacementScope::SameLlc, 1.025));
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
