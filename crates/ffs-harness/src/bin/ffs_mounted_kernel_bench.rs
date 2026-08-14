@@ -6934,6 +6934,7 @@ fn run() -> Result<Option<PathBuf>> {
         "requested_client_threads": config.client_threads(),
         "actual_observed_worker_threads": "recorded per filesystem row",
         "placement_scope": config.placement_scope.label(),
+        "placement_evidence_mode": placement_evidence_mode(config.placement_scope),
         "schedule": {
             "kind": "balanced four-arm interleave with independent kernel and FUSE A/A",
             "physical_role_assignment": "A/B physical mounts exchange logical roles every round",
