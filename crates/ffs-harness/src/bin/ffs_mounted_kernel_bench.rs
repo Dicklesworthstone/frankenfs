@@ -6243,6 +6243,10 @@ fn fs_report(
         "twice_null_margin_ratio": twice_null_ratio,
         "directional_claim_clear": directional_claim_clear,
     });
+    ensure!(
+        absolute_arm_medians_are_valid(fuse_median_wall_ns, kernel_median_wall_ns),
+        "competitive ratio requires finite, non-zero absolute arm medians"
+    );
     let candidate_b_aa_json = candidate_b_null.map_or_else(
         || json!("not_applicable"),
         |candidate_b| {
@@ -6442,6 +6446,13 @@ fn fs_report(
     );
     report.insert("operation_distribution_exact_total".to_owned(), json!(true));
     Ok(Value::Object(report))
+}
+
+fn absolute_arm_medians_are_valid(fuse_median_ns: f64, kernel_median_ns: f64) -> bool {
+    fuse_median_ns.is_finite()
+        && kernel_median_ns.is_finite()
+        && fuse_median_ns > 0.0
+        && kernel_median_ns > 0.0
 }
 
 // Top-level preflight and evidence emission intentionally remain in one
@@ -7410,6 +7421,13 @@ mod tests {
                 .contains("copied to"),
             "an in-place build must not describe itself as copied in"
         );
+    }
+
+    #[test]
+    fn competitive_ratio_requires_absolute_arm_medians_bd_4sull() {
+        assert!(absolute_arm_medians_are_valid(1.0, 1.0));
+        assert!(!absolute_arm_medians_are_valid(0.0, 1.0));
+        assert!(!absolute_arm_medians_are_valid(f64::NAN, 1.0));
     }
 
     /// bd-pb85e: the baked fixture is restored for attribution, so the thing that
