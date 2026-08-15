@@ -494,10 +494,19 @@ pub struct OpenOptions {
     pub btrfs_rw_ephemeral_ok: bool,
     /// Verify btrfs file data against the csum tree on every read (bd-tkv2n).
     ///
-    /// Defaults on to match the kernel integrity contract. When off,
-    /// reads of a `datasum` inode verify the covered on-disk sectors against the
-    /// csum tree and return EIO on a mismatch, matching the kernel. Opt-in to
-    /// avoid a read-path regression while the path matures.
+    /// **Defaults ON**, to match the kernel integrity contract. When on, a read
+    /// of a `datasum` inode verifies the covered on-disk sectors against the
+    /// csum tree and fails with [`FfsError::Corruption`] (EIO at the mount
+    /// boundary) before returning any data, matching the kernel. When off, the
+    /// sectors are returned unverified. An inode carrying
+    /// `BTRFS_INODE_NODATASUM` is exempt either way.
+    ///
+    /// The opt-out is retained because the read-path cost of verification is
+    /// still UNMEASURED. `bd-btrfs-verify-default-decision-v81jt` was to decide
+    /// this default from a measured cold/warm on-vs-off delta and is still
+    /// open, so a read row measured before the default flipped describes
+    /// verify=OFF and is NOT configuration-comparable to one measured after it
+    /// (bd-6kpp4). Pass the flag explicitly in anything that measures.
     pub btrfs_verify_data_on_read: bool,
 }
 
@@ -11147,11 +11156,12 @@ impl OpenFs {
                 Ok(())
             };
 
-        // Verify data checksums on read (bd-tkv2n), opt-in via
+        // Verify data checksums on read (bd-tkv2n), opt-OUT via
         // OpenOptions.btrfs_verify_data_on_read. For a datasum inode, verify the
         // regular extents overlapping the read range against the csum tree and
         // return EIO (Corruption) on a mismatch — matching the kernel — before
-        // any data is returned. Off by default, so normal reads are unchanged.
+        // any data is returned. ON by default, so a plain read pays this cost;
+        // the read rows banked before the default flipped did not (bd-6kpp4).
         if self.btrfs_verify_data_on_read && inode.flags & BTRFS_INODE_NODATASUM == 0 {
             let verify_sectorsize = self
                 .btrfs_superblock()
@@ -49037,13 +49047,25 @@ mod tests {
             "expected a corruption error, got {err:?}"
         );
 
-        // With verify-on-read OFF (default), the same corrupt read returns data.
-        let fs_off = OpenFs::from_device(
-            &cx,
-            Box::new(TestDevice::from_vec(corrupt)),
-            &OpenOptions::default(),
-        )
-        .expect("open corrupted image (verify off)");
+        // With verify-on-read explicitly OFF, the same corrupt read returns data.
+        //
+        // This arm must CONSTRUCT the flag rather than lean on OpenOptions::default().
+        // It used to say `&OpenOptions::default()` with the comment "OFF (default)",
+        // which was true when the test was written and silently stopped being true
+        // when the product default flipped to on (bd-6kpp4): the arm then opened with
+        // verification ON and no longer tested the opt-out at all. The opt-out is
+        // exactly what the still-unmeasured verify-cost delta will be measured
+        // against, so it needs coverage that a default flip cannot move.
+        let opts_off = OpenOptions {
+            btrfs_verify_data_on_read: false,
+            ..OpenOptions::default()
+        };
+        assert!(
+            !opts_off.btrfs_verify_data_on_read,
+            "the verify-off arm must be off regardless of the product default"
+        );
+        let fs_off = OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(corrupt)), &opts_off)
+            .expect("open corrupted image (verify off)");
         let ops_off: &dyn FsOps = &fs_off;
         let data_off = ops_off
             .read(&cx, &mut RequestScope::empty(), InodeNumber(257), 0, 22)
