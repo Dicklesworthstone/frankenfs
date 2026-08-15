@@ -32,6 +32,9 @@ met by new profile evidence.
 - If benchmark execution is intentionally deferred, record the command that must
   produce the verdict.
 - Rejected ideas require a concrete retry predicate, not a vague "try later."
+- **Record the machine.** Every timed row names its execution host — `RCH_WORKER=<id>`
+  for a remote run, `same_host=<hostname>` for a local mounted-comparator run. A row
+  that does not is worker-scoped; see the note at the top of this file.
 
 ## Benchmark-admission blocker: btrfs unlink avoids a redundant inode lookup, but no production candidate is available - 2026-08-04
 

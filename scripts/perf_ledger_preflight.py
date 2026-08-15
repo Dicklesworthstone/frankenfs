@@ -450,6 +450,31 @@ class Row:
         return False
 
 
+def structure_violations(row: Row) -> list[str]:
+    """A STRUCTURE row is exempt from the decision contract, so it must not be
+    carrying a decision. This closes the only evasion route the exemption opens:
+    dropping the date and bead id from a heading to escape the KEEP contract."""
+    evidence = decision_evidence(row.text)
+    carries = [
+        name
+        for name, rx in (
+            ("a vs-incumbent ratio", INCUMBENT_RATIO),
+            ("an executing-ELF SHA-256", EXECUTING_ELF_SHA256),
+        )
+        if rx.search(evidence)
+    ]
+    if row.has_bootstrap_median_ci():
+        carries.append("a bootstrap median CI")
+    if not carries:
+        return []
+    return [
+        "unattributable decision: this heading names neither a date nor a bead id, "
+        "so it is treated as document structure and exempted from the decision "
+        "contract, but it carries " + " and ".join(carries) + ". Give the heading "
+        "its date or bead id so it is linted as the decision row it is."
+    ]
+
+
 def contract_violations(row: Row) -> list[str]:
     """Return forward-contract violations for one staged decision row."""
     bad: list[str] = []
@@ -496,8 +521,49 @@ def contract_violations(row: Row) -> list[str]:
     return bad
 
 
+# --- document structure is not a decision (bd-eqm8s) -------------------------
+# The last-resort branch of verdict_of() scans the whole BODY for a verdict word,
+# case-insensitively. That makes any prose containing the word "keep" a banked KEEP:
+# the '## Rules' section of perf-negative-results.md says "record the exact
+# keep/reject/pending status" and was classified KEEP, so editing the ledger's own
+# rules list made --lint --staged demand a bootstrap CI and an ELF SHA-256 from it.
+#
+# A banked decision is ATTRIBUTABLE: to WHEN it was decided (a date) or to the work
+# item it decided (a bead id). A heading carrying neither is document structure.
+# Table rows are never affected -- their date lives in cell 0.
+#
+# Measured before/after over both ledgers (1209 rows): exactly 5 heading entries
+# carry neither, and all 5 improve.
+#   KEEP    -> STRUCTURE  perf-negative-results.md  'Rules'
+#   KEEP    -> STRUCTURE  perf-negative-results.md  'Seeded Do-Not-Retry Rows From Prior No-Gaps Work'
+#   KEEP    -> STRUCTURE  NEGATIVE_EVIDENCE.md      'Also characterized (NOT landed) - MVCC prune ...'
+#   UNKNOWN -> STRUCTURE  perf-negative-results.md  'Gauntlet Release-Readiness Scorecard'
+#   UNKNOWN -> STRUCTURE  perf-negative-results.md  'Current Campaign Rows'
+# The first two are prose containers. The third is an explicitly NOT-landed
+# characterized candidate -- it was never kept, so KEEP was wrong there too.
+#
+# REJECTED alternative, measured, do not retry: "require the verdict word in the
+# body fallback to be UPPERCASE and standalone". It reclassifies 217 of 1209 rows,
+# because legitimate entries narrate in lowercase ("frankenfs dominates", "we keep
+# the lever"). A fix that moves 217 rows to correct 1 is not a fix.
+#
+# This cannot become an evasion route ("drop the date to dodge the KEEP contract"):
+# a structure row whose body carries decision evidence is refused outright below.
+TITLE_DATE = re.compile(r"20\d{2}-\d{2}-\d{2}")
+TITLE_BEAD = re.compile(r"\bbd-[a-z0-9]", re.I)
+
+
+def is_document_structure(cells: list[str], title: str) -> bool:
+    """A heading entry attributable to neither a date nor a bead id."""
+    if cells:  # a table row: its date is cell 0
+        return False
+    return not TITLE_DATE.search(title) and not TITLE_BEAD.search(title)
+
+
 def verdict_of(cells: list[str], title: str, body: str) -> str:
     """Verdict from the table's Verdict column, else the prose title, else the body."""
+    if is_document_structure(cells, title):
+        return "STRUCTURE"
     for idx in (3, 2, 4):
         if idx < len(cells):
             head = cells[idx][:400]
@@ -694,11 +760,12 @@ def changed_line_numbers(
 
 
 def ledger_text(path: Path, *, staged: bool, at_head: bool) -> str:
-    rel = path.relative_to(ROOT).as_posix()
-    if staged:
-        return git_capture(["show", f":{rel}"])
-    if at_head:
-        return git_capture(["show", f"HEAD:{rel}"])
+    # Only the git-backed reads need a repo-relative path. Computing it eagerly made
+    # a plain filesystem read raise for any ledger outside ROOT, which is exactly the
+    # shape the ratchet and structure tests use.
+    if staged or at_head:
+        rel = path.relative_to(ROOT).as_posix()
+        return git_capture(["show", f"{'' if staged else 'HEAD'}:{rel}"])
     return path.read_text(errors="replace")
 
 
@@ -713,6 +780,7 @@ def cmd_lint(since: str | None, staged: bool) -> int:
         return 64
     bad: list[tuple[Row, str]] = []
     checked = {"REJECT": 0, "KEEP": 0}
+    structure_checked = 0
     selective = staged or since is not None
     try:
         for path, lvl in LEDGERS:
@@ -725,6 +793,16 @@ def cmd_lint(since: str | None, staged: bool) -> int:
                 continue
             text = ledger_text(path, staged=staged, at_head=since is not None)
             for row in parse_text(path, text, lvl):
+                if row.verdict == "STRUCTURE":
+                    if touched is not None and not touched.intersection(
+                        row_line_span(row)
+                    ):
+                        continue
+                    structure_checked += 1
+                    violations = structure_violations(row)
+                    if violations:
+                        bad.append((row, "; ".join(violations)))
+                    continue
                 if row.verdict not in checked:
                     continue
                 if touched is not None:
@@ -739,15 +817,18 @@ def cmd_lint(since: str | None, staged: bool) -> int:
         return 64
 
     scope = "staged index" if staged else (f"committed since {since}" if since else "whole ledger")
-    total = sum(checked.values())
+    total = sum(checked.values()) + structure_checked
+    structure_note = (
+        f", {structure_checked} document-structure" if structure_checked else ""
+    )
     if not bad:
         print(
-            f"preflight lint: OK — {total} decision row(s) in {scope} "
-            f"({checked['REJECT']} REJECT, {checked['KEEP']} KEEP)"
+            f"preflight lint: OK — {total} row(s) in {scope} "
+            f"({checked['REJECT']} REJECT, {checked['KEEP']} KEEP{structure_note})"
         )
         return 0
     print(
-        f"preflight lint: BLOCKED — {len(bad)} of {total} decision row(s) "
+        f"preflight lint: BLOCKED — {len(bad)} of {total} row(s) "
         f"in {scope} violate the ledger contract:\n"
     )
     for row, why in bad:
@@ -1369,6 +1450,85 @@ def cmd_self_test() -> int:
         ]
     )
     checks.extend(_worker_scope_ratchet_checks())
+
+    # --- document structure is not a decision (bd-eqm8s) ---------------------
+    # The bug: prose saying "record the exact keep/reject/pending status" was
+    # classified KEEP by the body-scan fallback, so touching the ledger's own rules
+    # list demanded a bootstrap CI from it.
+    rules_body = (
+        "- One lever per row.\n"
+        "- Record the benchmark surface, result, and exact keep/reject/pending status.\n"
+        "- Rejected ideas require a concrete retry predicate.\n"
+    )
+    checks.extend(
+        [
+            (
+                "prose whose body merely mentions keep/reject is NOT a decision row",
+                verdict_of([], "Rules", rules_body) == "STRUCTURE",
+            ),
+            (
+                "a dated heading is still a decision row",
+                verdict_of([], "2026-06-22 KEEP: htree fast path", rules_body) == "KEEP",
+            ),
+            (
+                "a bead-attributed heading with no date is still a decision row",
+                verdict_of([], "`bd-4w2mf` — REJECT: no lever", "body") == "REJECT",
+            ),
+            (
+                "a table row is never treated as document structure "
+                "(its date is in cell 0, not the title)",
+                not is_document_structure(
+                    ["2026-07-31", "`bd-kvmfd`", "surface", "KEEP", "2.20x"],
+                    "`bd-kvmfd`",
+                ),
+            ),
+            (
+                "the body fallback still classifies an undated BEAD row from its body",
+                verdict_of([], "`bd-zvn7r` follow-up", "we REJECT this lever") == "REJECT",
+            ),
+            (
+                "evasion closed: an unattributable heading carrying a vs-incumbent "
+                "ratio is refused, not exempted",
+                "unattributable decision"
+                in " ".join(
+                    structure_violations(
+                        Row(
+                            sample_path,
+                            1,
+                            "### Some prose heading\n\nFrankenFS is 3.4x the kernel "
+                            "ext4 median.",
+                            "STRUCTURE",
+                        )
+                    )
+                ),
+            ),
+            (
+                "evasion closed: an unattributable heading carrying an ELF SHA-256 "
+                "is refused",
+                "unattributable decision"
+                in " ".join(
+                    structure_violations(
+                        Row(
+                            sample_path,
+                            1,
+                            f"### Some prose heading\n\nexecuting ELF sha256 {sha}.",
+                            "STRUCTURE",
+                        )
+                    )
+                ),
+            ),
+            (
+                "genuine prose carrying no decision evidence is left alone",
+                not structure_violations(
+                    Row(sample_path, 1, "### Rules\n" + rules_body, "STRUCTURE")
+                ),
+            ),
+            (
+                "the live ledgers hold exactly the 5 measured structure sections",
+                sum(1 for r in all_rows() if r.verdict == "STRUCTURE") == 5,
+            ),
+        ]
+    )
 
     failures = [name for name, passed in checks if not passed]
     if failures:
