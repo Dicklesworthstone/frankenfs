@@ -237,6 +237,14 @@ pub mod consts {
     pub const FUSE_NO_OPENDIR_SUPPORT: u64 = 1 << 24; // kernel supports zero-message opendir
     #[cfg(feature = "abi-7-30")]
     pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25; // only invalidate cached pages on explicit request
+    // fs handles killing suid/sgid/cap on write/chown/trunc, V2 semantics
+    // (Linux 5.12+, `FUSE_HANDLE_KILLPRIV_V2` in linux/fuse.h). Distinct from
+    // FUSE_HANDLE_KILLPRIV above: V1 asks the fs to do the stripping itself, V2
+    // additionally lets the KERNEL skip its own `security.capability` fetch.
+    // Added for bd-ha71t. Linux-only: bit 28 is `FUSE_EXCHANGE_DATA` on macOS,
+    // which is why this is cfg'd rather than sitting with the others.
+    #[cfg(all(feature = "abi-7-31", not(target_os = "macos")))]
+    pub const FUSE_HANDLE_KILLPRIV_V2: u64 = 1 << 28;
     #[cfg(feature = "abi-7-36")]
     pub const FUSE_INIT_EXT: u64 = 1 << 30; // extended fuse_init_in request
     #[cfg(feature = "abi-7-36")]

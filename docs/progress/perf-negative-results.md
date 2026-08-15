@@ -9876,3 +9876,40 @@ the dio-loop kernel arm's 75.0 ms on the same fixture (different I/O path — di
 image pread vs loop — so stated as arm-vs-arm, not "faster than kernel ext4" absolute).
 Remaining residual vs contig (~7 ms warm) is the per-segment assembly of 8192
 one-block extents + hole memset; no cheap lever identified — diminishing returns.
+
+## 2026-08-15 — REJECT: FUSE_HANDLE_KILLPRIV_V2 does not suppress the per-path-op security.capability probe (bd-ha71t, AzureBay)
+
+Lever: negotiate `FUSE_HANDLE_KILLPRIV_V2` (bit 28, Linux 5.12+) at FUSE INIT, on the
+hypothesis that V2 — unlike V1, which this bead already measured inert — additionally
+lets the kernel skip its own `security.capability` fetch, killing the ~16 us probe paid
+on every path-based metadata op.
+
+Measured, COUNTED MECHANISM (no timing claim, so no quiet window is needed and the
+trace overhead cannot confound it): probes counted at the unconditional
+`ffs::fuse::xattr_probe` trace, which sits at the kernel boundary BEFORE any memo can
+answer. One ELF, arms selected by env so no rebuild sits between them; fixture baked
+into the image with `mkfs.ext4 -d` (a fresh mkfs root is uid 0 and the caller cannot
+otherwise create files in the mount); dentry cache dropped before each arm so every
+stat is a real path resolution.
+
+    arm off: V2 not negotiated,  2000 path stats -> 4000 probes -> 4000 probes
+    arm on : V2 reported ENABLED, 2000 path stats -> 4000 probes -> 4000 probes
+
+i.e. 4000 probes -> 4000 probes, unchanged, on the security.capability name.
+
+REJECTED: identical counts. The positive control is that the kernel ACCEPTED the
+capability — the daemon logged "FUSE handle-killpriv-v2 capability enabled" — so this
+is a genuine null, not a flag that never applied.
+
+Incidental correction to this bead's premise: the rate is TWO probes per path-based
+stat (4000/2000), not one.
+
+Harness `scripts`-local `ha71t_probe_count.sh` + `ffs-cli mount`; host `thinkstation1`,
+kernel `6.17.0-41-generic`; run LOCALLY (mounts FUSE, so no rch worker took part and
+none is quotable). Debug build — irrelevant to a count.
+
+Retry predicate: only on a kernel that documents `security.capability` suppression for
+path-resolution ops, or a FUSE ABI flag that lets a daemon declare an inode has no
+`security.*` xattrs so the kernel can cache the negative. Do NOT re-test V2 on 6.17 —
+measured inert. Experimental wiring reverted; the ABI constant is kept in the vendored
+fuser so the next attempt does not rediscover that it was missing.

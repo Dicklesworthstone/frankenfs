@@ -92,7 +92,20 @@ CONTRACT_COUNTED_MECHANISM = re.compile(
     r"syscall count|strace counted|\d+ vs \d+ fsync|"
     r"allocation count|alloc count|faults? unchanged|callgrind|"
     r"\d+(?:\.\d+)?%\s+self|"
-    r"\b\d[\d,]*\s+(?:instructions?|cycles?|syscalls?|allocations?|faults?)"
+    # `requests?`/`probes?` added 2026-08-15 (bd-ha71t). The noun list was
+    # instruction/cycle/syscall-shaped and could not express the most objective
+    # counted mechanism a FUSE filesystem has: the number of REQUESTS the kernel
+    # issues to the daemon. A getxattr probe count is exactly as deterministic as
+    # a syscall count — it is read off an unconditional trace at the kernel
+    # boundary — and rejecting a lever on "4000 probes -> 4000 probes" is a
+    # stronger result than any wall-clock null, because it needs no quiet window.
+    #
+    # This is a gate FIX, not a widening: measured over the whole ledger at the
+    # time of the change, it admitted ZERO previously-failing REJECT rows (232
+    # failing before, 232 after). It buys expressiveness for new rows only, so it
+    # cannot launder existing debt.
+    r"\b\d[\d,]*\s+(?:instructions?|cycles?|syscalls?|allocations?|faults?"
+    r"|requests?|probes?)"
     r"[^|\n]{0,80}(?:vs|->|→|to)\s*\d[\d,]*",
     re.I,
 )
@@ -770,8 +783,20 @@ def ledger_text(path: Path, *, staged: bool, at_head: bool) -> str:
 
 
 def row_line_span(row: Row) -> range:
-    """Physical source lines occupied by a row, excluding a trailing-newline phantom."""
-    return range(row.line, row.line + max(1, len(row.text.splitlines())))
+    """Physical source lines occupied by a row, excluding a trailing-newline phantom.
+
+    Trailing BLANK lines are excluded too (bd-ha71t). A row's body runs until the
+    next heading, so it absorbs the blank separator before that heading. Appending
+    a new entry therefore added a line inside the PREVIOUS row's span and marked it
+    "touched", forcing an untouched historical row through the forward contract —
+    i.e. you could not append a compliant row without first repairing whatever came
+    before it. The contract is meant to bind new and modified rows only, so the
+    separator is not part of either neighbour.
+    """
+    lines = row.text.splitlines()
+    while len(lines) > 1 and not lines[-1].strip():
+        lines.pop()
+    return range(row.line, row.line + max(1, len(lines)))
 
 
 def cmd_lint(since: str | None, staged: bool) -> int:
@@ -1446,6 +1471,41 @@ def cmd_self_test() -> int:
             (
                 "the ratchet baseline matches the flagged set in the live ledgers",
                 len(worker_scoped_rows()) == WORKER_SCOPE_BASELINE,
+            ),
+        ]
+    )
+    checks.extend(
+        [
+            (
+                "a FUSE request/probe count is a counted mechanism (bd-ha71t)",
+                row(
+                    "REJECT: FUSE_HANDLE_KILLPRIV_V2 negotiated ENABLED and inert — "
+                    "4000 probes -> 4000 probes for 2000 path stats.",
+                    "REJECT",
+                )
+                .reject_contract_basis()[0],
+            ),
+            (
+                "the word 'probes' alone is still not a counted mechanism",
+                not row(
+                    "REJECT: the capability probes did not go away.", "REJECT"
+                )
+                .reject_contract_basis()[0],
+            ),
+            (
+                "a request count needs BOTH sides, not just one number",
+                not row("REJECT: we measured 4000 requests.", "REJECT")
+                .reject_contract_basis()[0],
+            ),
+            (
+                "a row's span excludes the blank separator before the next heading "
+                "(bd-ha71t: appending a row must not mark the previous one touched)",
+                row_line_span(Row(sample_path, 10, "### t\nbody\n\n\n", "REJECT"))
+                == range(10, 12),
+            ),
+            (
+                "a row that is only a heading still occupies one line",
+                row_line_span(Row(sample_path, 10, "### t", "REJECT")) == range(10, 11),
             ),
         ]
     )

@@ -118,6 +118,7 @@ const XATTR_FLAG_REPLACE: i32 = 0x2;
 /// absent result. Read-only FrankenFS images are immutable, so the daemon can
 /// safely memoize that negative answer and avoid repeating the format lookup.
 const SECURITY_CAPABILITY_XATTR: &str = "security.capability";
+
 const FS_IOC_FIEMAP: u32 = 0xC020_660B;
 const FIEMAP_HEADER_SIZE: usize = 32;
 const FIEMAP_EXTENT_SIZE: usize = 56;
@@ -2478,6 +2479,13 @@ impl Filesystem for FrankenFuse {
             }
         }
 
+        // bd-ha71t: FUSE_HANDLE_KILLPRIV_V2 was negotiated here experimentally and
+        // is MEASURED INERT against the per-path-op `security.capability` probe —
+        // 4000 probes for 2000 path stats with the kernel reporting the capability
+        // ENABLED, identical to the 4000 without it. Experimental wiring reverted;
+        // the constant remains in the vendored ABI so the next kernel can be
+        // re-tested without rediscovering that it was missing. Do not re-negotiate
+        // it here expecting a probe reduction on this kernel.
         match config.set_max_stack_depth(1) {
             Ok(_) => match config.add_capabilities(fuse_consts::FUSE_PASSTHROUGH) {
                 Ok(()) => debug!("FUSE passthrough capability enabled"),
