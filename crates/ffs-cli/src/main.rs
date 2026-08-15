@@ -7131,6 +7131,10 @@ fn build_mount_per_core_shutdown_observation(
 
 fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>) -> Result<()> {
     let mount_started = std::time::SystemTime::now();
+    let filesystem = match &open_fs.flavor {
+        FsFlavor::Ext4(_) => "ext4",
+        FsFlavor::Btrfs(_) => "btrfs",
+    };
     let config = MountConfig {
         options: MountOptions {
             read_only: !params.read_write,
@@ -7174,7 +7178,12 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
 
     let metrics = handle.wait();
     let mount_ended = std::time::SystemTime::now();
-    log_mount_shutdown_metrics(params.operation_id, params.scenario_id, &metrics);
+    log_mount_shutdown_metrics(
+        params.operation_id,
+        params.scenario_id,
+        filesystem,
+        &metrics,
+    );
     emit_mount_console(
         params.console,
         &mount_console_observation(
@@ -7408,12 +7417,14 @@ fn wire_ctrlc_shutdown(handle: &ffs_fuse::MountHandle) -> Result<()> {
 fn log_mount_shutdown_metrics(
     operation_id: &str,
     scenario_id: &str,
+    filesystem: &str,
     metrics: &ffs_fuse::MetricsSnapshot,
 ) {
     info!(
         target: "ffs::cli::mount",
         operation_id,
         scenario_id,
+        filesystem,
         outcome = "managed_mount_shutdown",
         requests_total = metrics.requests_total,
         requests_ok = metrics.requests_ok,
