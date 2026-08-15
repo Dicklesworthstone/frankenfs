@@ -494,7 +494,7 @@ pub struct OpenOptions {
     pub btrfs_rw_ephemeral_ok: bool,
     /// Verify btrfs file data against the csum tree on every read (bd-tkv2n).
     ///
-    /// Defaults off: reads return data unverified (existing behavior). When on,
+    /// Defaults on to match the kernel integrity contract. When off,
     /// reads of a `datasum` inode verify the covered on-disk sectors against the
     /// csum tree and return EIO on a mismatch, matching the kernel. Opt-in to
     /// avoid a read-path regression while the path matures.
@@ -517,7 +517,7 @@ impl Default for OpenOptions {
             ext4_verify_journal_checksums: true,
             numa_allocation_policy: NumaAllocationPolicy::Disabled,
             btrfs_rw_ephemeral_ok: false,
-            btrfs_verify_data_on_read: false,
+            btrfs_verify_data_on_read: true,
         }
     }
 }
@@ -48996,6 +48996,7 @@ mod tests {
     fn btrfs_verify_data_on_read_detects_corruption_bd_tkv2n() {
         let cx = Cx::for_testing();
         let image = build_btrfs_csum_image();
+        assert!(OpenOptions::default().btrfs_verify_data_on_read);
         let opts_on = OpenOptions {
             btrfs_verify_data_on_read: true,
             ..OpenOptions::default()
