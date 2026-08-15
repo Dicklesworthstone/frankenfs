@@ -5,6 +5,26 @@ campaign, including pending attempts that have not yet received a benchmark
 verdict. Rejected rows are not to be retried unless their retry predicate is
 met by new profile evidence.
 
+> **WORKER-SCOPED RATIOS (2026-08-15, `bd-4w2mf`).** A row that does not name the
+> machine it ran on is **worker-scoped**: valid *on an unrecorded machine*, never
+> comparable to a row measured elsewhere. The same cell measured `1.2693x` on one rch
+> worker and `0.0093x` on another — a 13.6x swing — with **both A/A nulls passing**,
+> because a null controls within-invocation noise only and is blind to between-worker
+> CPU model, cache, memory bandwidth and contention. `rch` also fails **open to local**
+> when the fleet is saturated, so two `rch exec` calls minutes apart can straddle two
+> machines silently.
+>
+> This re-scopes; it does **not** retract. No row here is known multi-worker and the
+> campaign already required same-invocation arms, so these are most likely
+> valid-but-unattributed rather than split across machines — the defect is that the row
+> cannot prove which. Per-row repair is impossible: zero run `report.json` files
+> survive, so no host is recoverable and inventing one would be worse than the gap.
+>
+> **18** rows in this file quote a vs-incumbent ratio and name no host (148 more in
+> `docs/NEGATIVE_EVIDENCE.md`). List them with
+> `python3 scripts/perf_ledger_preflight.py --worker-scope --list`; that count is a
+> ratchet the preflight enforces, and it may only fall.
+
 ## Rules
 
 - One lever per row.

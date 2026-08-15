@@ -29,6 +29,15 @@ Four jobs, three exit classes:
 
   --audit                Whole-ledger census (the §1 audit, re-runnable).
 
+  --worker-scope [--list]
+                         Retroactive half of the worker-identity gate, which is
+                         otherwise forward-only. Flags every banked KEEP that quotes a
+                         vs-incumbent ratio but names no execution host as WORKER-SCOPED
+                         (re-scoped, not retracted) and ratchets the count so it can only
+                         fall. Exit 2 when the count rises above the baseline, when a row
+                         admits scheduling across several workers, or when the count fell
+                         and the baseline was not lowered to match.
+
   --self-test            Exercise the policy predicates without Cargo or fixtures.
 
 Wire staged lint into the active checkout with `--install-hook`.
@@ -205,6 +214,57 @@ EXECUTING_ELF_SHA256 = re.compile(
     re.I,
 )
 
+# A row that does not name the machine it ran on cannot be compared to any other
+# row. Measuring one cubic splu cell on two different rch workers produced 1.2693x
+# and 0.0093x -- a 13.6x swing -- with BOTH A/A nulls passing, because the null only
+# controls within-invocation noise and is blind to between-worker differences in CPU
+# model, cache, memory bandwidth and contention. Worker identity is therefore
+# provenance, not decoration. Searched over the whole row, not decision_evidence(),
+# because provenance lives in the trailing column.
+WORKER_IDENTITY = re.compile(
+    r"\bRCH_WORKERS?\s*=\s*`?[A-Za-z0-9][A-Za-z0-9._-]*`?"
+    r"|\bworkers?\s*[:=]?\s*`[A-Za-z0-9][A-Za-z0-9._-]*`"
+    r"|\bpinned\s+(?:to\s+)?`[A-Za-z0-9][A-Za-z0-9._-]*`"
+    r"|\b(?:host_identity|same_host|executed_on|hostname)\s*[:=]\s*"
+    r"`?[A-Za-z0-9][A-Za-z0-9._-]*`?",
+    re.I,
+)
+
+# A run that was allowed to schedule across more than one worker cannot place both
+# arms on the same machine by construction, so the comparison is inadmissible
+# regardless of how clean its null looks.
+MULTI_WORKER = re.compile(
+    r"\bRCH_WORKERS?\s*=\s*`?[A-Za-z0-9][A-Za-z0-9._-]*\s*,",
+    re.I,
+)
+
+# --- the retroactive half: rows banked before the gate existed ---------------
+# The WORKER_IDENTITY check above is FORWARD-only -- it inspects the staged index,
+# so it can never reach a row that was already committed. Census run 2026-08-15
+# through this module's own parser (never a line grep: a prior one-off script in
+# this repo mis-split '##' entries at their '###' subsections and published a wrong
+# void figure, 79.3 -> 75.1):
+#
+#   rows parsed 1209 | KEEP 686 (595 unnamed) | REJECT 318 (261) | SURVEY 143 (132)
+#   rows explicitly allowing MULTIPLE workers: 0
+#
+# The sharp set is narrower than "unnamed": a KEEP that quotes no vs-incumbent
+# ratio makes no competitive claim, so an unknown host costs it nothing. A KEEP
+# that DOES quote one is asking to be compared, and cannot be.
+#
+# These rows are re-scoped, NOT retracted. 0 rows are known multi-worker and the
+# campaign law already required same-invocation arms, so most are almost certainly
+# worker-SCOPED (valid, unknown machine) rather than INVALID (arms split across
+# machines). The defect is that the row cannot prove which. Per-row recovery was
+# checked and is impossible: zero run report.json files survive under /data/tmp
+# (sbh reaped them), so no host can be recovered for any banked row, and inventing
+# one would be worse than the gap.
+#
+# This number is a RATCHET, not a target. It may only fall, and it falls exactly
+# one way: a row gains the host it ran on. Raising it means an unnamed competitive
+# claim got committed past the forward gate, which is the defect itself.
+WORKER_SCOPE_BASELINE = 166
+
 BOOTSTRAP = re.compile(r"\bbootstrap(?:ped|ping)?\b|\bresampl(?:e|ed|es|ing)\b", re.I)
 MEDIAN = re.compile(r"\bmedian\b", re.I)
 CONFIDENCE_INTERVAL = re.compile(r"\bCI\b|\bconfidence interval\b", re.I)
@@ -269,7 +329,7 @@ class Row:
 
     @property
     def ref(self) -> str:
-        return f"{self.path.relative_to(ROOT)}:{self.line}"
+        return f"{_display_path(self.path)}:{self.line}"
 
     def admissible(self) -> tuple[bool, str]:
         if NULL_CONTROL.search(self.text):
@@ -315,6 +375,39 @@ class Row:
 
     def has_executing_elf_sha256(self) -> bool:
         return bool(EXECUTING_ELF_SHA256.search(decision_evidence(self.text)))
+
+    def has_worker_identity(self) -> bool:
+        return bool(WORKER_IDENTITY.search(self.text))
+
+    def allows_multiple_workers(self) -> bool:
+        return bool(MULTI_WORKER.search(self.text))
+
+    @property
+    def title(self) -> str:
+        """Stable identity for a row across edits that shift line numbers.
+
+        A table row is identified by its Bead/surface cell (cell 1), an entry by
+        its heading text -- both are the first physical line, which parse_text()
+        puts at the head of `text` for either shape.
+        """
+        first = self.text.splitlines()[0] if self.text else ""
+        if first.startswith("| 2026"):
+            cells = [c.strip() for c in first.strip().strip("|").split(" | ")]
+            return cells[1] if len(cells) > 1 else cells[0]
+        return first.lstrip("#").strip()
+
+    def is_worker_scoped_ratio(self) -> bool:
+        """A banked competitive claim that cannot name the machine it ran on.
+
+        KEEP + quotes a vs-incumbent ratio + no worker/host identity. Deliberately
+        NARROWER than "unnamed": an unnamed KEEP that quotes no incumbent ratio is
+        making no cross-machine comparison, so it is not in scope here.
+        """
+        return (
+            self.verdict == "KEEP"
+            and not self.has_worker_identity()
+            and bool(INCUMBENT_RATIO.search(decision_evidence(self.text)))
+        )
 
     def has_bootstrap_median_ci(self) -> bool:
         evidence = decision_evidence(self.text)
@@ -369,6 +462,22 @@ def contract_violations(row: Row) -> list[str]:
             + " and ".join(missing_arms)
             + " arm (bd-4sull item 3: a ratio alone cannot say which arm moved; "
             "the harness prints kernel_median_wall_ns / fuse_median_wall_ns)"
+        )
+    if row.allows_multiple_workers():
+        bad.append(
+            "the run was allowed to schedule across more than one worker "
+            "(RCH_WORKERS lists several), so its arms cannot be same-worker by "
+            "construction; pin a single worker and re-run"
+        )
+    timed = row.verdict == "KEEP" or (
+        row.verdict == "REJECT" and row.has_same_invocation_null_control()
+    )
+    if timed and not row.has_worker_identity():
+        bad.append(
+            "no worker/host identity recorded (a passing A/A null does not make a "
+            "cross-worker comparison valid: the same cell measured 1.2693x on one "
+            "worker and 0.0093x on another with both nulls passing; an unnamed row "
+            "cannot be compared to any other row)"
         )
     if row.verdict == "REJECT":
         ok, _ = row.reject_contract_basis()
@@ -653,6 +762,83 @@ def cmd_lint(since: str | None, staged: bool) -> int:
     return 2
 
 
+def _display_path(path: Path) -> str:
+    """Repo-relative when possible. A ledger can sit outside ROOT under test, and a
+    reporting helper must never be the thing that raises."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def worker_scoped_rows(rows: list[Row] | None = None) -> list[Row]:
+    return [r for r in (all_rows() if rows is None else rows) if r.is_worker_scoped_ratio()]
+
+
+def cmd_worker_scope(list_rows: bool) -> int:
+    """Enumerate and ratchet the banked competitive rows that name no host.
+
+    This is the retroactive counterpart to the staged WORKER_IDENTITY check. It
+    flags those rows as worker-scoped -- readable to a human via --list, and
+    enforced as a monotone ratchet so the count can only fall.
+    """
+    rows = all_rows()
+    scoped = worker_scoped_rows(rows)
+    multi = [r for r in rows if r.allows_multiple_workers()]
+    n = len(scoped)
+
+    from collections import Counter
+
+    per_file = Counter(_display_path(r.path) for r in scoped)
+    print(f"rows_parsed              {len(rows)}")
+    print(f"keep_rows                {sum(1 for r in rows if r.verdict == 'KEEP')}")
+    print(f"worker_scoped_ratio_rows {n}")
+    for f, k in sorted(per_file.items()):
+        print(f"  {f:<40s} {k}")
+    print(f"known_multi_worker_rows  {len(multi)}")
+    print(f"ratchet_baseline         {WORKER_SCOPE_BASELINE}")
+
+    if list_rows:
+        print("\nflagged worker-scoped (KEEP quoting a vs-incumbent ratio, no host named):")
+        for r in scoped:
+            print(f"  {r.ref}\n    {r.title[:160]}")
+
+    if multi:
+        print(
+            f"\nworker-scope: BLOCKED — {len(multi)} row(s) admit scheduling across "
+            "several workers, so their arms cannot be same-machine by construction:"
+        )
+        for r in multi:
+            print(f"  {r.ref}\n    {r.title[:160]}")
+        return 2
+
+    if n > WORKER_SCOPE_BASELINE:
+        print(
+            f"\nworker-scope: BLOCKED — {n} worker-scoped competitive rows exceeds the "
+            f"{WORKER_SCOPE_BASELINE}-row ratchet by {n - WORKER_SCOPE_BASELINE}. A new "
+            "banked ratio row named no execution host. Record the host it ran on "
+            "(`RCH_WORKER=<id>`, or `same_host=<hostname>` for a local mounted run); "
+            "do not raise the baseline."
+        )
+        return 2
+
+    if n < WORKER_SCOPE_BASELINE:
+        print(
+            f"\nworker-scope: RATCHET LOOSE — {n} < baseline {WORKER_SCOPE_BASELINE}. "
+            f"Rows gained their host; lower WORKER_SCOPE_BASELINE to {n} in this file "
+            "so the gain cannot be silently given back."
+        )
+        return 2
+
+    print(
+        f"\nworker-scope: OK — {n} row(s) at the ratchet. Each is worker-SCOPED, not "
+        "retracted: its arms were same-invocation by campaign law and no row is known "
+        "multi-worker, but the machine is unrecorded, so it is not comparable to a row "
+        "measured elsewhere."
+    )
+    return 0
+
+
 def cmd_audit() -> int:
     rows = all_rows()
     from collections import Counter
@@ -703,6 +889,71 @@ def cmd_incumbent_audit(show: str | None) -> int:
     return 0
 
 
+def _worker_scope_ratchet_checks() -> list[tuple[str, bool]]:
+    """Drive cmd_worker_scope end to end against a synthetic ledger.
+
+    The predicate tests above prove the row classifier. These prove the GATE: that
+    the exit code actually moves. A classifier that is right while the gate always
+    returns 0 is the failure mode worth catching, and only an end-to-end run sees it.
+    """
+    import io
+    import tempfile
+    from contextlib import redirect_stdout
+
+    sha = "a" * 64
+    named = "### 2026-08-15 — KEEP: named\n\nKEEP: 3.4x vs kernel ext4, bootstrap "
+    named += f"median 95% CI [3.2, 3.6]; sha256 {sha}. RCH_WORKER=vmi1227854.\n"
+    unnamed = "### 2026-08-15 — KEEP: unnamed\n\nKEEP: 3.4x vs kernel ext4, bootstrap "
+    unnamed += f"median 95% CI [3.2, 3.6]; sha256 {sha}.\n"
+    multi = "### 2026-08-15 — KEEP: multi\n\nKEEP: 3.4x vs kernel ext4; sha256 "
+    multi += f"{sha}. RCH_WORKERS=ovh-a,hz2.\n"
+
+    saved_ledgers, saved_baseline = LEDGERS[:], WORKER_SCOPE_BASELINE
+    results: list[tuple[str, bool]] = []
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "synthetic-ledger.md"
+
+            def run(body: str, baseline: int) -> int:
+                global WORKER_SCOPE_BASELINE
+                ledger.write_text("# Synthetic ledger\n\n" + body)
+                LEDGERS[:] = [(ledger, 3)]
+                WORKER_SCOPE_BASELINE = baseline
+                with redirect_stdout(io.StringIO()):
+                    return cmd_worker_scope(True)
+
+            results = [
+                (
+                    "ratchet: a ledger sitting at its baseline passes",
+                    run(named + unnamed, 1) == 0,
+                ),
+                (
+                    "ratchet: one MORE unnamed competitive row is blocked",
+                    run(named + unnamed + unnamed.replace("unnamed", "unnamed2"), 1) == 2,
+                ),
+                (
+                    "ratchet: adding a row that NAMES its worker is not blocked",
+                    run(named + unnamed + named.replace("named", "named2"), 1) == 0,
+                ),
+                (
+                    "ratchet: a count BELOW baseline is blocked until the baseline drops",
+                    run(named, 1) == 2,
+                ),
+                (
+                    "ratchet: a multi-worker row is refused even at the baseline",
+                    run(named + unnamed + multi, 1) == 2,
+                ),
+                (
+                    "ratchet: --list on a ledger outside the repo root does not raise",
+                    run(unnamed, 1) == 0,
+                ),
+            ]
+    finally:
+        LEDGERS[:] = saved_ledgers
+        globals()["WORKER_SCOPE_BASELINE"] = saved_baseline
+    return results
+
+
 def cmd_self_test() -> int:
     sha = "a" * 64
     sample_path = ROOT / "docs" / "NEGATIVE_EVIDENCE.md"
@@ -724,6 +975,52 @@ def cmd_self_test() -> int:
             .reject_contract_basis()[0],
         ),
         (
+            "timed row with no worker identity is refused",
+            "worker/host identity"
+            in " ".join(
+                contract_violations(
+                    row(
+                        "KEEP: median 1.21, deterministic bootstrap median 95% CI "
+                        f"[1.19, 1.23]; in-process self-reported ELF sha256 {sha}.",
+                        "KEEP",
+                    )
+                )
+            ),
+        ),
+        (
+            "a named pinned worker satisfies the provenance rule",
+            "worker/host identity"
+            not in " ".join(
+                contract_violations(
+                    row(
+                        "KEEP: median 1.21, deterministic bootstrap median 95% CI "
+                        f"[1.19, 1.23]; in-process self-reported ELF sha256 {sha}. "
+                        "Strict-remote pinned `ovh-a`.",
+                        "KEEP",
+                    )
+                )
+            ),
+        ),
+        (
+            "a local same_host row also satisfies the provenance rule",
+            row(
+                "mounted comparator, same_host=thinkstation1", "KEEP"
+            ).has_worker_identity(),
+        ),
+        (
+            "a multi-worker run is refused outright",
+            "more than one worker"
+            in " ".join(
+                contract_violations(
+                    row("KEEP: RCH_WORKERS=ovh-a,hz2 median 1.21", "KEEP")
+                )
+            ),
+        ),
+        (
+            "a single-worker RCH_WORKER is not mistaken for a multi-worker run",
+            not row("RCH_WORKER=vmi1227854", "KEEP").allows_multiple_workers(),
+        ),
+        (
             "A/A reject without bootstrap median CI violates the contract",
             "bootstrap median CI"
             in " ".join(
@@ -740,7 +1037,8 @@ def cmd_self_test() -> int:
             not contract_violations(
                 row(
                     "REJECT: A/A null control 1.004 in the same invocation; "
-                    "deterministic bootstrap median 95% CI [0.998, 1.009].",
+                    "deterministic bootstrap median 95% CI [0.998, 1.009]. "
+                    "Strict-remote pinned `ovh-a`.",
                     "REJECT",
                 )
             ),
@@ -831,7 +1129,7 @@ def cmd_self_test() -> int:
             not contract_violations(
                 row(
                     f"KEEP: bench_elf_sha256={sha}; deterministic bootstrap "
-                    "median 95% CI [1.06, 1.10].",
+                    "median 95% CI [1.06, 1.10]. RCH_WORKER=vmi1227854.",
                     "KEEP",
                 )
             ),
@@ -996,6 +1294,82 @@ def cmd_self_test() -> int:
         ]
     )
 
+    # --- the retroactive worker-scope flag (bd-4w2mf) ------------------------
+    # The scope is deliberately narrower than "unnamed KEEP" (595 rows) -- it is
+    # the 166 that quote a vs-incumbent ratio. The negative cases below are the
+    # ones a naive "flag every unnamed KEEP" implementation gets wrong.
+    unnamed_ratio = (
+        "KEEP: FrankenFS readdir+stat is 4.98x the kernel ext4 median, "
+        f"deterministic bootstrap median 95% CI [4.81, 5.12]; ELF sha256 {sha}."
+    )
+    checks.extend(
+        [
+            (
+                "an unnamed KEEP quoting an incumbent ratio is flagged worker-scoped",
+                row(unnamed_ratio, "KEEP").is_worker_scoped_ratio(),
+            ),
+            (
+                "the same row naming its worker is NOT flagged",
+                not row(
+                    unnamed_ratio + " RCH_WORKER=vmi1227854.", "KEEP"
+                ).is_worker_scoped_ratio(),
+            ),
+            (
+                "a local mounted row naming same_host is NOT flagged",
+                not row(
+                    unnamed_ratio + " Host `thinkstation1`, same_host=thinkstation1.",
+                    "KEEP",
+                ).is_worker_scoped_ratio(),
+            ),
+            (
+                "an unnamed KEEP with NO incumbent ratio is NOT flagged "
+                "(a self-speedup makes no cross-machine claim)",
+                not row(
+                    "KEEP: candidate is 1.70x faster than the frozen control, "
+                    f"deterministic bootstrap median 95% CI [1.62, 1.79]; sha256 {sha}.",
+                    "KEEP",
+                ).is_worker_scoped_ratio(),
+            ),
+            (
+                "an unnamed REJECT quoting an incumbent ratio is NOT flagged "
+                "(the scope is banked competitive CLAIMS)",
+                not row(unnamed_ratio, "REJECT").is_worker_scoped_ratio(),
+            ),
+            (
+                "an incumbent ratio that appears only in a future retry clause "
+                "does not make the row a banked competitive claim",
+                not row(
+                    "KEEP: instrument only, no production tuning. Retry once the "
+                    "kernel ext4 arm lands within 1.20x of the FUSE mount.",
+                    "KEEP",
+                ).is_worker_scoped_ratio(),
+            ),
+            (
+                "a table row is identified by its bead/surface cell, not its date",
+                Row(
+                    sample_path,
+                    1,
+                    "| 2026-07-31 | `bd-mounted-bulk-durable-write-kvmfd` | surface | "
+                    "KEEP | 2.20x | n/a | n/a | gates |",
+                    "KEEP",
+                ).title
+                == "`bd-mounted-bulk-durable-write-kvmfd`",
+            ),
+            (
+                "an entry row is identified by its heading text without the hashes",
+                Row(
+                    sample_path, 1, "### 2026-07-22 — KEEP: async read dispatch\nbody", "KEEP"
+                ).title
+                == "2026-07-22 — KEEP: async read dispatch",
+            ),
+            (
+                "the ratchet baseline matches the flagged set in the live ledgers",
+                len(worker_scoped_rows()) == WORKER_SCOPE_BASELINE,
+            ),
+        ]
+    )
+    checks.extend(_worker_scope_ratchet_checks())
+
     failures = [name for name, passed in checks if not passed]
     if failures:
         print("preflight self-test: FAILED", file=sys.stderr)
@@ -1013,8 +1387,13 @@ HOOK = """#!/usr/bin/env bash
 # executing-ELF SHA-256 self-report. A competitive row must also record both
 # arms' absolute medians, not only the ratio (bd-4sull item 3).
 # See fleet broadcast 2, 2026-07-25.
-exec python3 "$(git rev-parse --show-toplevel)/scripts/perf_ledger_preflight.py" \\
-     --lint --staged
+set -e
+PREFLIGHT="$(git rev-parse --show-toplevel)/scripts/perf_ledger_preflight.py"
+python3 "$PREFLIGHT" --lint --staged
+# Retroactive half: the staged lint cannot see a row that is already committed, so
+# also hold the worker-scope ratchet. A commit may not raise the count of banked
+# competitive rows that name no execution host.
+python3 "$PREFLIGHT" --worker-scope >/dev/null
 """
 
 
@@ -1053,6 +1432,9 @@ def main() -> int:
     g.add_argument("--lint", action="store_true",
                    help="exit 2 if a decision row violates the evidence contract")
     g.add_argument("--audit", action="store_true", help="whole-ledger census")
+    g.add_argument("--worker-scope", action="store_true",
+                   help="ratchet the banked competitive rows that name no "
+                        "execution host (retroactive half of the worker gate)")
     g.add_argument("--incumbent-audit", action="store_true",
                    help="how many KEEP claims carry a live same-invocation "
                         "incumbent ratio, and why the rest do not")
@@ -1070,7 +1452,11 @@ def main() -> int:
                     help="with --candidate: term overlap needed to call it covered")
     ap.add_argument("--show", metavar="CLASS", default=None,
                     help="with --incumbent-audit: list the rows in one class")
+    ap.add_argument("--list", action="store_true",
+                    help="with --worker-scope: print every flagged row")
     a = ap.parse_args()
+    if a.worker_scope:
+        return cmd_worker_scope(a.list)
     if a.incumbent_audit:
         return cmd_incumbent_audit(a.show)
     if a.candidate:

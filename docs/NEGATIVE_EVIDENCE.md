@@ -10,6 +10,28 @@ here that points to the detailed progress ledger.
 > `docs/PERF_CAMPAIGN_FINAL.md`. All 5 axes closed; HOLD, no more solo
 > lever-hunting. The detailed prose rows below remain the source of truth.
 
+> **WORKER-SCOPED RATIOS (2026-08-15, `bd-4w2mf`).** A row that does not name the
+> machine it ran on is **worker-scoped**: read it as valid *on an unrecorded
+> machine*, never as comparable to a row measured elsewhere. Measuring one cell on
+> two different rch workers produced `1.2693x` and `0.0093x` — a 13.6x swing — with
+> **both A/A nulls passing**, because a null controls within-invocation noise only
+> and is blind to between-worker CPU model, cache, memory bandwidth and contention.
+> `rch` also fails **open to local** when the fleet is saturated, so two `rch exec`
+> calls minutes apart can straddle two machines silently.
+>
+> This re-scopes; it does **not** retract. No row in either ledger is known
+> multi-worker, and the campaign already required same-invocation arms, so these are
+> most likely valid-but-unattributed rather than split across machines — the defect
+> is that the row cannot prove which. Per-row repair was attempted and is impossible:
+> zero run `report.json` files survive, so no host is recoverable and inventing one
+> would be worse than the gap.
+>
+> **166** banked KEEP rows quote a vs-incumbent ratio and name no host (148 here, 18
+> in `docs/progress/perf-negative-results.md`). List them with
+> `python3 scripts/perf_ledger_preflight.py --worker-scope --list`; that count is a
+> ratchet the preflight enforces, and it may only fall. New rows are refused outright
+> by `--lint --staged` unless they record their host.
+
 ## 2026-06-21 Verification
 
 > **Current `bd-bhh0i` default:** rows are chronological. Any older row below
