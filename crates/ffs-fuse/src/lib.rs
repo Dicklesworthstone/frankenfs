@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
@@ -884,6 +884,18 @@ pub struct AtomicMetrics {
     /// Successful path-based metadata requests (getattr/statx) observed at
     /// the FUSE boundary, including memo-served replies (bd-0c4av).
     pub metadata_requests: CacheLinePadded<AtomicU64>,
+    /// Number of `Getattr` request-scope dispatches completed by the daemon.
+    pub getattr_dispatch_count: CacheLinePadded<AtomicU64>,
+    /// Cumulative daemon dispatch time for `Getattr` request scopes, in ns.
+    pub getattr_dispatch_nanos: CacheLinePadded<AtomicU64>,
+    /// Number of `Getxattr` request-scope dispatches completed by the daemon.
+    pub getxattr_dispatch_count: CacheLinePadded<AtomicU64>,
+    /// Cumulative daemon dispatch time for `Getxattr` request scopes, in ns.
+    pub getxattr_dispatch_nanos: CacheLinePadded<AtomicU64>,
+    /// Number of `Readdir` request-scope dispatches completed by the daemon.
+    pub readdir_dispatch_count: CacheLinePadded<AtomicU64>,
+    /// Cumulative daemon dispatch time for `Readdir` request scopes, in ns.
+    pub readdir_dispatch_nanos: CacheLinePadded<AtomicU64>,
     /// Requests delayed by backpressure throttling.
     pub requests_throttled: CacheLinePadded<AtomicU64>,
     /// Requests rejected (shed) by backpressure.
@@ -910,6 +922,12 @@ impl AtomicMetrics {
             requests_err: CacheLinePadded(AtomicU64::new(0)),
             bytes_read: CacheLinePadded(AtomicU64::new(0)),
             metadata_requests: CacheLinePadded(AtomicU64::new(0)),
+            getattr_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            getattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
+            getxattr_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            getxattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
+            readdir_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            readdir_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             requests_throttled: CacheLinePadded(AtomicU64::new(0)),
             requests_shed: CacheLinePadded(AtomicU64::new(0)),
         }
@@ -946,6 +964,25 @@ impl AtomicMetrics {
         Self::saturating_add(&self.metadata_requests.0, 1);
     }
 
+    fn record_dispatch_duration(&self, op: RequestOp, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        match op {
+            RequestOp::Getattr => {
+                Self::saturating_add(&self.getattr_dispatch_count.0, 1);
+                Self::saturating_add(&self.getattr_dispatch_nanos.0, nanos);
+            }
+            RequestOp::Getxattr => {
+                Self::saturating_add(&self.getxattr_dispatch_count.0, 1);
+                Self::saturating_add(&self.getxattr_dispatch_nanos.0, nanos);
+            }
+            RequestOp::Readdir => {
+                Self::saturating_add(&self.readdir_dispatch_count.0, 1);
+                Self::saturating_add(&self.readdir_dispatch_nanos.0, nanos);
+            }
+            _ => {}
+        }
+    }
+
     fn record_throttled(&self) {
         Self::saturating_add(&self.requests_throttled.0, 1);
     }
@@ -963,6 +1000,12 @@ impl AtomicMetrics {
             requests_err: self.requests_err.0.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.0.load(Ordering::Relaxed),
             metadata_requests: self.metadata_requests.0.load(Ordering::Relaxed),
+            getattr_dispatch_count: self.getattr_dispatch_count.0.load(Ordering::Relaxed),
+            getattr_dispatch_nanos: self.getattr_dispatch_nanos.0.load(Ordering::Relaxed),
+            getxattr_dispatch_count: self.getxattr_dispatch_count.0.load(Ordering::Relaxed),
+            getxattr_dispatch_nanos: self.getxattr_dispatch_nanos.0.load(Ordering::Relaxed),
+            readdir_dispatch_count: self.readdir_dispatch_count.0.load(Ordering::Relaxed),
+            readdir_dispatch_nanos: self.readdir_dispatch_nanos.0.load(Ordering::Relaxed),
             requests_throttled: self.requests_throttled.0.load(Ordering::Relaxed),
             requests_shed: self.requests_shed.0.load(Ordering::Relaxed),
         }
@@ -984,6 +1027,12 @@ impl std::fmt::Debug for AtomicMetrics {
             .field("requests_err", &s.requests_err)
             .field("bytes_read", &s.bytes_read)
             .field("metadata_requests", &s.metadata_requests)
+            .field("getattr_dispatch_count", &s.getattr_dispatch_count)
+            .field("getattr_dispatch_nanos", &s.getattr_dispatch_nanos)
+            .field("getxattr_dispatch_count", &s.getxattr_dispatch_count)
+            .field("getxattr_dispatch_nanos", &s.getxattr_dispatch_nanos)
+            .field("readdir_dispatch_count", &s.readdir_dispatch_count)
+            .field("readdir_dispatch_nanos", &s.readdir_dispatch_nanos)
             .field("requests_throttled", &s.requests_throttled)
             .field("requests_shed", &s.requests_shed)
             .finish()
@@ -998,6 +1047,12 @@ pub struct MetricsSnapshot {
     pub requests_err: u64,
     pub bytes_read: u64,
     pub metadata_requests: u64,
+    pub getattr_dispatch_count: u64,
+    pub getattr_dispatch_nanos: u64,
+    pub getxattr_dispatch_count: u64,
+    pub getxattr_dispatch_nanos: u64,
+    pub readdir_dispatch_count: u64,
+    pub readdir_dispatch_nanos: u64,
     /// Requests delayed by backpressure throttling.
     pub requests_throttled: u64,
     /// Requests rejected (shed) by backpressure.
@@ -5568,6 +5623,8 @@ mod tests {
         assert_eq!(s.requests_ok, 0);
         assert_eq!(s.requests_err, 0);
         assert_eq!(s.bytes_read, 0);
+        assert_eq!(s.readdir_dispatch_count, 0);
+        assert_eq!(s.readdir_dispatch_nanos, 0);
         assert_eq!(s.requests_throttled, 0);
         assert_eq!(s.requests_shed, 0);
     }
@@ -14821,7 +14878,10 @@ mod tests {
             "active: false, ",
             "shutdown: false, ",
             "metrics: MetricsSnapshot { requests_total: 0, requests_ok: 0, requests_err: 0, ",
-            "bytes_read: 0, requests_throttled: 0, requests_shed: 0 }, ",
+            "bytes_read: 0, metadata_requests: 0, getattr_dispatch_count: 0, ",
+            "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
+            "requests_throttled: 0, requests_shed: 0 }, ",
             "unmount_timeout: 30s }"
         );
 
@@ -15682,8 +15742,46 @@ mod tests {
         assert_eq!(snap.requests_err, 1);
         assert_eq!(snap.bytes_read, 1024);
         assert_eq!(snap.metadata_requests, 6);
+        assert_eq!(snap.getattr_dispatch_count, 0);
+        assert_eq!(snap.getattr_dispatch_nanos, 0);
+        assert_eq!(snap.getxattr_dispatch_count, 0);
+        assert_eq!(snap.getxattr_dispatch_nanos, 0);
+        assert_eq!(snap.readdir_dispatch_count, 0);
+        assert_eq!(snap.readdir_dispatch_nanos, 0);
         let debug = format!("{metrics:?}");
         assert!(debug.contains("metadata_requests: 6"));
+    }
+
+    #[test]
+    fn request_scope_records_metadata_and_readdir_dispatch_timing() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, false);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+
+        let _ =
+            fuse.with_request_scope(
+                &cx,
+                RequestOp::Getattr,
+                |_cx, _scope| Ok::<(), FfsError>(()),
+            );
+        let _ = fuse.with_request_scope(&cx, RequestOp::Getxattr, |_cx, _scope| {
+            Ok::<(), FfsError>(())
+        });
+        let _ =
+            fuse.with_request_scope(
+                &cx,
+                RequestOp::Readdir,
+                |_cx, _scope| Ok::<(), FfsError>(()),
+            );
+
+        let snap = fuse.metrics().snapshot();
+        assert_eq!(snap.getattr_dispatch_count, 1);
+        assert_eq!(snap.getxattr_dispatch_count, 1);
+        assert_eq!(snap.readdir_dispatch_count, 1);
+        assert!(snap.getattr_dispatch_nanos > 0);
+        assert!(snap.getxattr_dispatch_nanos > 0);
+        assert!(snap.readdir_dispatch_nanos > 0);
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
@@ -15834,6 +15932,13 @@ AllowOther"#;
             requests_ok: 7,
             requests_err: 3,
             bytes_read: 4096,
+            metadata_requests: 6,
+            getattr_dispatch_count: 4,
+            getattr_dispatch_nanos: 400,
+            getxattr_dispatch_count: 2,
+            getxattr_dispatch_nanos: 200,
+            readdir_dispatch_count: 3,
+            readdir_dispatch_nanos: 300,
             requests_throttled: 0,
             requests_shed: 0,
         };
@@ -15845,6 +15950,13 @@ AllowOther"#;
             requests_ok: 6,
             requests_err: 4,
             bytes_read: 4096,
+            metadata_requests: 6,
+            getattr_dispatch_count: 4,
+            getattr_dispatch_nanos: 400,
+            getxattr_dispatch_count: 2,
+            getxattr_dispatch_nanos: 200,
+            readdir_dispatch_count: 3,
+            readdir_dispatch_nanos: 300,
             requests_throttled: 0,
             requests_shed: 0,
         };
@@ -16046,7 +16158,10 @@ AllowOther"#;
         const FUSE_INNER_DEBUG_GOLDEN: &str = concat!(
             "FuseInner { ",
             "metrics: AtomicMetrics { requests_total: 0, requests_ok: 0, requests_err: 0, ",
-            "bytes_read: 0, requests_throttled: 0, requests_shed: 0 }, ",
+            "bytes_read: 0, metadata_requests: 0, getattr_dispatch_count: 0, ",
+            "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
+            "requests_throttled: 0, requests_shed: 0 }, ",
             "thread_count: 2, ",
             "worker_dispatch: true, ",
             "parallel_dirops: true, ",

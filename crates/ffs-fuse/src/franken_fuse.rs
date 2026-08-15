@@ -2893,35 +2893,41 @@ impl FrankenFuse {
     where
         F: FnOnce(&Cx, &mut RequestScope) -> ffs_error::Result<T>,
     {
-        let mut scope = match self.inner.ops.begin_request_scope(cx, op) {
-            Ok(scope) => scope,
+        let started = Instant::now();
+        let result = match self.inner.ops.begin_request_scope(cx, op) {
+            Ok(mut scope) => {
+                let op_result = f(cx, &mut scope);
+                let end_result = self.inner.ops.end_request_scope(cx, op, scope);
+
+                match (op_result, end_result) {
+                    (Ok(value), Ok(())) => {
+                        self.inner.metrics.record_ok();
+                        Ok(value)
+                    }
+                    (Ok(_), Err(end_err)) => {
+                        self.inner.metrics.record_err();
+                        Err(end_err)
+                    }
+                    (Err(op_err), Ok(())) => {
+                        self.inner.metrics.record_err();
+                        Err(op_err)
+                    }
+                    (Err(op_err), Err(end_err)) => {
+                        self.inner.metrics.record_err();
+                        warn!(?op, error = %end_err, "request scope cleanup failed after operation error");
+                        Err(op_err)
+                    }
+                }
+            }
             Err(e) => {
                 self.inner.metrics.record_err();
-                return Err(e);
+                Err(e)
             }
         };
-        let op_result = f(cx, &mut scope);
-        let end_result = self.inner.ops.end_request_scope(cx, op, scope);
-
-        match (op_result, end_result) {
-            (Ok(value), Ok(())) => {
-                self.inner.metrics.record_ok();
-                Ok(value)
-            }
-            (Ok(_), Err(end_err)) => {
-                self.inner.metrics.record_err();
-                Err(end_err)
-            }
-            (Err(op_err), Ok(())) => {
-                self.inner.metrics.record_err();
-                Err(op_err)
-            }
-            (Err(op_err), Err(end_err)) => {
-                self.inner.metrics.record_err();
-                warn!(?op, error = %end_err, "request scope cleanup failed after operation error");
-                Err(op_err)
-            }
-        }
+        self.inner
+            .metrics
+            .record_dispatch_duration(op, started.elapsed());
+        result
     }
 
     fn dispatch_opendir(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<(u64, u32)> {
