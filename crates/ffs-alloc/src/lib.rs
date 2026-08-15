@@ -132,7 +132,7 @@ fn bitmap_fill_range(bitmap: &mut [u8], start: u32, count: u32, set: bool) {
     let end = start.saturating_add(count);
     let mut idx = start;
     // Leading partial byte up to the next byte boundary.
-    while idx < end && idx % 8 != 0 {
+    while idx < end && !idx.is_multiple_of(8) {
         set_or_clear_bit(bitmap, idx, set);
         idx += 1;
     }
@@ -291,14 +291,18 @@ fn highest_set_bit_index(bitmap: &[u8], count: u32) -> Option<u32> {
     while end >= 8 {
         let word = u64::from_le_bytes(bitmap[end - 8..end].try_into().unwrap());
         if word != 0 {
-            return Some(((end - 8) * 8) as u32 + (63 - word.leading_zeros()));
+            // `63 - leading_zeros()` IS `ilog2()` for a non-zero value — that is
+            // its definition, and both lower to the same `bsr`/`lzcnt`. Renaming,
+            // not rewriting, the bit scan. Both sites are guarded non-zero, which
+            // is exactly `ilog2`'s precondition.
+            return Some(((end - 8) * 8) as u32 + word.ilog2());
         }
         end -= 8;
     }
     for byte_idx in (0..end).rev() {
         let byte = bitmap[byte_idx];
         if byte != 0 {
-            return Some((byte_idx * 8) as u32 + (7 - byte.leading_zeros()));
+            return Some((byte_idx * 8) as u32 + byte.ilog2());
         }
     }
     None
@@ -327,14 +331,15 @@ pub fn bitmap_count_free(bitmap: &[u8], count: u32) -> u32 {
     let remainder = count % 8;
     let mut free = 0u32;
 
-    let mut chunks = bitmap[..full_bytes].chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
+    // `as_chunks::<8>()` splits identically to `chunks_exact(8)` + `.remainder()`
+    // — same prefix, same tail, same order — so the zero-count is unchanged
+    // (bd-3ao0l).
+    let (chunks, chunks_rest) = bitmap[..full_bytes].as_chunks::<8>();
+    for chunk in chunks {
+        let word = u64::from_le_bytes(*chunk);
         free += (!word).count_ones();
     }
-    for &byte in chunks.remainder() {
+    for &byte in chunks_rest {
         free += byte.count_zeros();
     }
 
@@ -360,7 +365,7 @@ pub fn bitmap_find_free(bitmap: &[u8], count: u32, start: u32) -> Option<u32> {
 }
 
 fn bitmap_find_free_range(bitmap: &[u8], mut idx: u32, end: u32) -> Option<u32> {
-    while idx < end && idx % 8 != 0 {
+    while idx < end && !idx.is_multiple_of(8) {
         let byte_idx = (idx / 8) as usize;
         let &byte = bitmap.get(byte_idx)?;
         if (byte >> (idx % 8)) & 1 == 0 {
@@ -478,7 +483,7 @@ where
 {
     let mut taken = 0;
 
-    while idx < end && idx % 8 != 0 {
+    while idx < end && !idx.is_multiple_of(8) {
         let byte_idx = (idx / 8) as usize;
         let Some(byte) = bitmap.get_mut(byte_idx) else {
             return taken;
@@ -629,8 +634,8 @@ pub fn bitmap_largest_free_run(bitmap: &[u8], count: u32) -> u32 {
     // mass-alloc the block bitmap is mostly all-`MAX`, so this is ~1.27x on the
     // per-block-alloc `largest_free_run` recompute (bench `bitmap_run_width`);
     // mixed sub-blocks fall through to the exact per-word path.
-    let mut quads = bitmap[..word_bytes].chunks_exact(32);
-    for block in &mut quads {
+    let (quads, quads_rest) = bitmap[..word_bytes].as_chunks::<32>();
+    for block in quads {
         let w0 = u64::from_le_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_le_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_le_bytes(block[16..24].try_into().unwrap());
@@ -644,8 +649,8 @@ pub fn bitmap_largest_free_run(bitmap: &[u8], count: u32) -> u32 {
         apply_word_zero_run(w2, &mut run, &mut best);
         apply_word_zero_run(w3, &mut run, &mut best);
     }
-    for chunk in quads.remainder().chunks_exact(8) {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in quads_rest.as_chunks::<8>().0 {
+        let word = u64::from_le_bytes(*chunk);
         apply_word_zero_run(word, &mut run, &mut best);
     }
 
@@ -659,13 +664,13 @@ pub fn bitmap_largest_free_run(bitmap: &[u8], count: u32) -> u32 {
         run = 0;
     }
 
-    if remainder > 0 {
-        if let Some(&byte) = bitmap.get(full_bytes) {
-            let mask = u8::MAX >> (8 - remainder);
-            let bounded_byte = byte | !mask;
-            apply_byte_zero_run(BYTE_ZERO_RUNS[bounded_byte as usize], &mut run, &mut best);
-        }
-        // No bitmap byte for the remainder → cannot extend; leave `best` unchanged.
+    // No bitmap byte for the remainder → cannot extend; leave `best` unchanged.
+    if remainder > 0
+        && let Some(&byte) = bitmap.get(full_bytes)
+    {
+        let mask = u8::MAX >> (8 - remainder);
+        let bounded_byte = byte | !mask;
+        apply_byte_zero_run(BYTE_ZERO_RUNS[bounded_byte as usize], &mut run, &mut best);
     }
 
     best
@@ -720,7 +725,7 @@ fn bitmap_find_contiguous_linear(bitmap: &[u8], count: u32, n: u32, start: u32) 
     let mut run_len = 0u32;
     let mut idx = start;
 
-    while idx < count && idx % 8 != 0 {
+    while idx < count && !idx.is_multiple_of(8) {
         if bitmap_get(bitmap, idx) {
             idx += 1;
             run_start = idx;
@@ -775,7 +780,7 @@ fn bitmap_find_contiguous_linear(bitmap: &[u8], count: u32, n: u32, start: u32) 
     }
 
     while idx < count {
-        if idx % 8 == 0 && (idx + 8) <= count {
+        if idx.is_multiple_of(8) && (idx + 8) <= count {
             let byte_idx = (idx / 8) as usize;
             match bitmap.get(byte_idx).copied() {
                 None | Some(0xFF) => {
@@ -1841,6 +1846,18 @@ pub fn reserved_blocks_in_group(
 }
 
 /// Check if a relative block offset in a group is reserved.
+///
+/// SUPERSEDED, and deliberately kept rather than deleted (bd-3ao0l): the
+/// allocator no longer asks this per candidate block. `try_alloc_blocks_in_group`
+/// instead marks every entry of `reserved_blocks_in_group` SET in its working
+/// bitmap copy before scanning, so the ordinary free-bit search skips them for
+/// free — no per-candidate binary search on the alloc path at all.
+///
+/// This is NOT a missing check. If you arrived here from clippy's `dead_code` and
+/// were about to wire it back in, the reserved blocks are already excluded; doing
+/// both would just pay for the search twice. Deleting it needs express permission
+/// per AGENTS.md, so it stays with this note instead.
+#[allow(dead_code)]
 #[must_use]
 fn is_reserved(reserved: &[u32], rel_block: u32) -> bool {
     reserved.binary_search(&rel_block).is_ok()
@@ -2083,7 +2100,7 @@ fn bitmap_checksum_incremental_from_flipped_bit_range(
 }
 
 fn fill_flipped_bit_delta(delta: &mut [u8], local_start: u32, bit_count: u32) {
-    if local_start == 0 && bit_count % 8 == 0 {
+    if local_start == 0 && bit_count.is_multiple_of(8) {
         delta.fill(u8::MAX);
     } else {
         for bit in local_start..local_start + bit_count {
@@ -2639,7 +2656,7 @@ pub fn try_alloc_blocks_in_group(
     // correctness does not depend on this fast path. `FFS_ALLOC_FORCE_RESERVED_MARK`
     // forces the old always-mark behaviour (A/B baseline / safety escape hatch).
     if force_reserved_mark() || stats.reserved_confirmed.get().is_none() {
-        for &r in reserved.iter() {
+        for &r in reserved {
             bitmap_set_with_clear_undo(&mut bitmap, r, &mut rollback_clear_bits);
         }
         if rollback_clear_bits.is_empty() {
@@ -2741,7 +2758,7 @@ pub fn try_alloc_blocks_in_group(
             dev,
             pctx,
             group,
-            &stats,
+            stats,
             Some(&block_bitmap_override),
             None,
         ) {
@@ -3050,7 +3067,7 @@ pub fn free_blocks_in_group(
         dev,
         pctx,
         group,
-        &stats,
+        stats,
         Some(&block_bitmap_override),
         None,
     ) {
@@ -3926,7 +3943,7 @@ pub fn free_inode_in_group(
         dev,
         pctx,
         group,
-        &stats,
+        stats,
         None,
         Some(&inode_bitmap_override),
     ) {
