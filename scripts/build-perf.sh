@@ -70,6 +70,44 @@ fi
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 OUT="$TARGET_DIR/${PROFILE}/${BIN}"
 
+# --- cargo must be a REAL cargo, not the rch offload shim ---------------------
+#
+# OBSERVED DEFECT, 2026-08-15 (same session as the shared-target-dir defect above):
+# `command -v cargo` on this host resolves to /home/ubuntu/.local/bin/cargo, an rch
+# shim that transparently ships the build to a remote worker. Two runs of this
+# script were silently offloaded to worker vmi1153651 before it was noticed.
+#
+# That is fatal HERE specifically, and quietly: rch has no artifact-retrieval
+# mechanism, so a remote build leaves NOTHING in the local target dir. Stage [1/4]
+# then "succeeds", $INSTR does not exist, every training command is `|| true` so
+# they all no-op, no .profraw is ever written, and the run dies much later at the
+# empty-profile check -- roughly twenty minutes downstream of the actual cause.
+#
+# This script exists to produce a LOCAL binary: its output is measured by
+# ffs-mounted-kernel-bench, which mounts FUSE against the live kernel in one
+# process and must run on this machine. So resolve cargo through rustup, which
+# honours rust-toolchain.toml (pinned nightly-2026-07-20) and returns the real
+# toolchain binary. Note `ls ~/.rustup/toolchains/nightly-*/bin/cargo | head -1`
+# is NOT a substitute -- it sorts the FLOATING `nightly` ahead of the pin.
+CARGO="${FFS_CARGO:-}"
+if [ -z "$CARGO" ] && command -v rustup >/dev/null 2>&1; then
+  CARGO="$(rustup which cargo 2>/dev/null || true)"
+fi
+[ -x "${CARGO:-}" ] || CARGO="$(command -v cargo || true)"
+if [ -z "$CARGO" ]; then
+  echo "!! no cargo found" >&2
+  exit 1
+fi
+case "$CARGO" in
+  "$HOME"/.local/bin/*)
+    echo "!! resolved cargo is the rch offload shim ($CARGO); a remote build leaves" >&2
+    echo "!! no local binary and this script's output must be measured locally." >&2
+    echo "!! Install the rustup toolchain or set FFS_CARGO to a real cargo." >&2
+    exit 1
+    ;;
+esac
+echo ">> using cargo: $CARGO"
+
 # Locate llvm-profdata (rustup component OR system).
 PROFDATA="$(find "${RUSTUP_HOME:-$HOME/.rustup}" -name llvm-profdata 2>/dev/null | head -1)"
 [ -z "$PROFDATA" ] && PROFDATA="$(command -v llvm-profdata llvm-profdata-18 2>/dev/null | head -1)"
@@ -97,8 +135,13 @@ if [ "${SKIP_TRAIN:-0}" != "1" ]; then
   # environment even if this script is sourced or that guard is edited later.
   env -u CARGO_TARGET_DIR \
     RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-generate=$PGO_DIR" \
-    cargo build --profile "$PROFILE" -p "$BIN" --target-dir "$TARGET_DIR"
+    "$CARGO" build --profile "$PROFILE" -p "$BIN" --target-dir "$TARGET_DIR"
   INSTR="$OUT"
+  [ -x "$INSTR" ] || {
+    echo "!! instrumented build produced no local binary at $INSTR" >&2
+    echo "!! (a remotely-offloaded build leaves nothing here; see the cargo note above)" >&2
+    exit 1
+  }
 
   if [ -z "$TRAIN_IMG" ]; then
     SRC="$(ls -1 ./*.img /data/tmp/*ext*.img 2>/dev/null | head -1 || true)"
@@ -161,7 +204,7 @@ echo ">> [4/4] optimized build (profile-use + fat LTO + target-cpu=$TARGET_CPU)"
 env -u CARGO_TARGET_DIR \
   FFS_PGO_PROFILE_SHA256="$PROFILE_SHA256" \
   RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-use=$PGO_DIR/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
-  cargo build --profile "$PROFILE" -p "$BIN" --target-dir "$TARGET_DIR"
+  "$CARGO" build --profile "$PROFILE" -p "$BIN" --target-dir "$TARGET_DIR"
 
 echo ">> done: $OUT  (fat LTO + target-cpu=$TARGET_CPU + PGO profile=$PROFILE_SHA256)"
 "$OUT" bench-evidence
