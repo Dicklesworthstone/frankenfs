@@ -244,11 +244,16 @@ comparison is still not like-for-like.
 > `1c85fc23` (00:15) set `OpenOptions::default().btrfs_verify_data_on_read` to **true** —
 > the product default — and `e54146ee` (00:28) followed in the harness `Config`.
 >
-> Consequence for this file: **every banked mounted btrfs read row above, including the
-> only `honest_win`, was measured under verify=OFF — a configuration that no longer
-> ships.** The rows are re-scoped, not retracted: they remain valid measurements of the
-> arms that ran, and they are the baseline the verify=ON cost has to be measured against.
-> But a NEW run is not configuration-comparable to them unless it passes
+> Consequence for this file, scoped precisely rather than blanket-applied: the flag gates
+> verification of **file data** against the csum tree for `datasum` inodes, so it can only
+> affect a row that actually reads file data. Of the six rows above that is **exactly one —
+> multi-file parallel read, the only `honest_win`.** Warm stat, readdir+stat and
+> create/delete storm are metadata-only; parallel metadata writes, fsync/journal commit and
+> bulk durable write are write-side. Those five are unaffected and need no re-scoping.
+>
+> The parallel-read row is re-scoped, not retracted: it remains a valid measurement of the
+> arms that ran, and it is the baseline the verify=ON cost has to be measured against. But
+> a NEW run of it is not configuration-comparable unless it passes
 > `--btrfs-verify-data-on-read false` explicitly, because the harness now defaults to
 > **true**.
 >
