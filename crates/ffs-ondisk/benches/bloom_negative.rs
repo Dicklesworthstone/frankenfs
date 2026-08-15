@@ -24,7 +24,7 @@ impl Bloom {
     fn new(n: usize, bits_per: usize, k: u32) -> Self {
         let want = (n * bits_per).max(64);
         let m = want.next_power_of_two();
-        Bloom {
+        Self {
             bits: vec![0u64; m / 64],
             m,
             k,
@@ -39,7 +39,12 @@ impl Bloom {
     fn insert(&mut self, name: &[u8]) {
         let h = Self::hash(name);
         let mask = self.m - 1;
-        let (h1, h2) = (h as usize, (h >> 32) as usize | 1);
+        // Truncating to usize is the intent: both halves are masked to `m - 1`
+        // below, and `m` is a power of two well inside usize on any target here.
+        let (h1, h2) = (
+            usize::try_from(h & (usize::MAX as u64)).unwrap_or(usize::MAX),
+            usize::try_from((h >> 32) & (usize::MAX as u64)).unwrap_or(usize::MAX) | 1,
+        );
         for i in 0..self.k as usize {
             let bit = h1.wrapping_add(i.wrapping_mul(h2)) & mask;
             self.bits[bit >> 6] |= 1u64 << (bit & 63);
@@ -49,7 +54,12 @@ impl Bloom {
     fn contains(&self, name: &[u8]) -> bool {
         let h = Self::hash(name);
         let mask = self.m - 1;
-        let (h1, h2) = (h as usize, (h >> 32) as usize | 1);
+        // Truncating to usize is the intent: both halves are masked to `m - 1`
+        // below, and `m` is a power of two well inside usize on any target here.
+        let (h1, h2) = (
+            usize::try_from(h & (usize::MAX as u64)).unwrap_or(usize::MAX),
+            usize::try_from((h >> 32) & (usize::MAX as u64)).unwrap_or(usize::MAX) | 1,
+        );
         for i in 0..self.k as usize {
             let bit = h1.wrapping_add(i.wrapping_mul(h2)) & mask;
             if self.bits[bit >> 6] & (1u64 << (bit & 63)) == 0 {
@@ -81,23 +91,23 @@ fn bench(c: &mut Criterion) {
         let fp = absent.iter().filter(|a| bloom.contains(a)).count();
         assert_eq!(absent.iter().filter(|a| set.contains(*a)).count(), 0);
 
-        let label = format!("n{}", n);
+        let label = format!("n{n}");
         g.bench_function(format!("hashset/{label}"), |b| {
             b.iter(|| {
                 let mut miss = 0usize;
                 for a in black_box(&absent) {
-                    miss += (!black_box(&set).contains(a.as_slice())) as usize;
+                    miss += usize::from(!black_box(&set).contains(a.as_slice()));
                 }
-                black_box(miss)
-            })
+                black_box(miss);
+            });
         });
         g.bench_function(format!("bloom/{label}"), |b| {
             b.iter(|| {
                 let mut miss = 0usize;
                 for a in black_box(&absent) {
-                    miss += (!black_box(&bloom).contains(a.as_slice())) as usize;
+                    miss += usize::from(!black_box(&bloom).contains(a.as_slice()));
                 }
-                black_box(miss)
+                black_box(miss);
             })
         });
         let _ = fp;

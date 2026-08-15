@@ -21,12 +21,13 @@ fn bench(c: &mut Criterion) {
         .iter()
         .enumerate()
         .map(|(i, n)| {
+            let idx = u32::try_from(i).expect("fixture entry index fits u32");
             let h = if i % 8 == 0 {
-                (i as u32 / 8).wrapping_mul(0x9E37_79B1)
+                (idx / 8).wrapping_mul(0x9E37_79B1)
             } else {
-                (i as u32).wrapping_mul(0x9E37_79B1) ^ 0x5BD1_E995
+                idx.wrapping_mul(0x9E37_79B1) ^ 0x5BD1_E995
             };
-            (h, i as u32 + 12, 1u8, n.as_slice())
+            (h, idx + 12, 1u8, n.as_slice())
         })
         .collect();
 
@@ -46,7 +47,7 @@ fn bench(c: &mut Criterion) {
                 black_box(v)
             },
             BatchSize::SmallInput,
-        )
+        );
     });
     g.bench_function("unstable", |bch| {
         bch.iter_batched(
@@ -56,7 +57,7 @@ fn bench(c: &mut Criterion) {
                 black_box(v)
             },
             BatchSize::SmallInput,
-        )
+        );
     });
     g.finish();
 }

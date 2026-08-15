@@ -91,10 +91,10 @@ fn build_present_index_map_only(keys: &[Vec<u8>]) -> (FxHashSet<Vec<u8>>, Presen
 }
 
 fn known_absent(names: &FxHashSet<Vec<u8>>, present: Option<&PresentMap>, name: &[u8]) -> bool {
-    match present {
-        Some(present) => !present.contains_key(name),
-        None => !names.contains(name),
-    }
+    present.map_or_else(
+        || !names.contains(name),
+        |present| !present.contains_key(name),
+    )
 }
 
 fn bench_present_index_build(c: &mut Criterion) {
@@ -152,13 +152,15 @@ fn bench_present_index_build(c: &mut Criterion) {
 // and get (read's deref).
 #[derive(Clone, Copy)]
 struct Val56 {
-    _a: u64,
+    /// Read by the get benches below to keep the load observable; the remaining
+    /// fields are deliberately unused padding that fixes the value at 56 bytes.
+    a: u64,
     _b: u64,
     _c: u64,
     _d: [u8; 32],
 }
 const V56: Val56 = Val56 {
-    _a: 1,
+    a: 1,
     _b: 2,
     _c: 3,
     _d: [7u8; 32],
@@ -202,7 +204,7 @@ fn bench_chain_value(c: &mut Criterion) {
             let mut acc = 0u64;
             for k in 0..N {
                 if let Some(v) = vec_map.get(&black_box(k)) {
-                    acc = acc.wrapping_add(v[0]._a);
+                    acc = acc.wrapping_add(v[0].a);
                 }
             }
             black_box(acc)
@@ -213,7 +215,7 @@ fn bench_chain_value(c: &mut Criterion) {
             let mut acc = 0u64;
             for k in 0..N {
                 if let Some(v) = sv_map.get(&black_box(k)) {
-                    acc = acc.wrapping_add(v[0]._a);
+                    acc = acc.wrapping_add(v[0].a);
                 }
             }
             black_box(acc)

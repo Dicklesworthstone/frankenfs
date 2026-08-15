@@ -156,7 +156,7 @@ fn bench(c: &mut Criterion) {
                         black_box(&starts),
                         black_box(&targets),
                     ))
-                })
+                });
             });
             g.bench_function("binary_b", |b| {
                 b.iter(|| {
@@ -165,7 +165,7 @@ fn bench(c: &mut Criterion) {
                         black_box(&starts),
                         black_box(&targets),
                     ))
-                })
+                });
             });
             g.bench_function("interp_hybrid", |b| {
                 b.iter(|| {
@@ -174,7 +174,7 @@ fn bench(c: &mut Criterion) {
                         black_box(&starts),
                         black_box(&targets),
                     ))
-                })
+                });
             });
             g.finish();
         }

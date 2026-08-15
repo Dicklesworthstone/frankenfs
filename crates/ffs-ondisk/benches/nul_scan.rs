@@ -58,10 +58,10 @@ fn bench(c: &mut Criterion) {
         ("none_256", &none[..]),
     ] {
         g.bench_with_input(format!("bytewise/{label}"), buf, |b, buf| {
-            b.iter(|| black_box(bytewise(black_box(buf))))
+            b.iter(|| black_box(bytewise(black_box(buf))));
         });
         g.bench_with_input(format!("swar/{label}"), buf, |b, buf| {
-            b.iter(|| black_box(swar(black_box(buf))))
+            b.iter(|| black_box(swar(black_box(buf))));
         });
     }
     g.finish();

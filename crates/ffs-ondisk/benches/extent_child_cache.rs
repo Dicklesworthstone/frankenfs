@@ -19,7 +19,7 @@
 //!   rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench extent_child_cache
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use ffs_ondisk::ext4::{Ext4Extent, ExtentTree, parse_extent_tree};
+use ffs_ondisk::ext4::{ExtentTree, parse_extent_tree};
 use std::hint::black_box;
 
 const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
@@ -62,7 +62,7 @@ fn walk_leaf(tree: &ExtentTree, logical_block: u32) -> Option<u64> {
 }
 
 fn child_for(lb: u32) -> usize {
-    if lb < SPLIT { 0 } else { 1 }
+    usize::from(lb >= SPLIT)
 }
 
 /// OLD: re-parse the chosen child block on every logical block.

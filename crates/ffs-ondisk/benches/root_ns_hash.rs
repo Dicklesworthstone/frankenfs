@@ -52,7 +52,10 @@ fn bench(c: &mut Criterion) {
     root[2..4].copy_from_slice(&2u16.to_le_bytes()); // eh_entries
     root[4..6].copy_from_slice(&4u16.to_le_bytes()); // eh_max
     for (i, b) in root.iter_mut().enumerate().skip(12) {
-        *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        *b = u8::try_from(i % 256)
+            .expect("i % 256 fits u8")
+            .wrapping_mul(31)
+            .wrapping_add(7);
     }
     // change-detection sanity: mutating any byte changes both hashes.
     let mut m = root;
@@ -62,10 +65,10 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("root_ns_hash");
     g.bench_function("bytewise_fnv", |b| {
-        b.iter(|| black_box(root_ns_bytewise(black_box(&root))))
+        b.iter(|| black_box(root_ns_bytewise(black_box(&root))));
     });
     g.bench_function("wordwise", |b| {
-        b.iter(|| black_box(root_ns_wordwise(black_box(&root))))
+        b.iter(|| black_box(root_ns_wordwise(black_box(&root))));
     });
     g.finish();
 }

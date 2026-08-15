@@ -80,10 +80,10 @@ fn bench(c: &mut Criterion) {
         ("long_33", cases[2]),
     ] {
         g.bench_function(format!("bytewise/{label}"), |b| {
-            b.iter(|| black_box(bytewise(black_box(x), black_box(y))))
+            b.iter(|| black_box(bytewise(black_box(x), black_box(y))));
         });
         g.bench_function(format!("swar/{label}"), |b| {
-            b.iter(|| black_box(swar(black_box(x), black_box(y))))
+            b.iter(|| black_box(swar(black_box(x), black_box(y))));
         });
     }
     g.finish();

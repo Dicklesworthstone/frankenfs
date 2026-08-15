@@ -19,9 +19,10 @@ fn depth0_root() -> [u8; 60] {
     r[6..8].copy_from_slice(&0u16.to_le_bytes()); // eh_depth = 0 (inline leaf)
     for i in 0..4 {
         let base = 12 + i * 12;
-        r[base..base + 4].copy_from_slice(&((i as u32) * 100).to_le_bytes()); // logical
+        let idx = u32::try_from(i).expect("fixture extent index fits u32");
+        r[base..base + 4].copy_from_slice(&(idx * 100).to_le_bytes()); // logical
         r[base + 4..base + 6].copy_from_slice(&50u16.to_le_bytes()); // len
-        r[base + 8..base + 12].copy_from_slice(&((i as u32) + 1000).to_le_bytes()); // start_lo
+        r[base + 8..base + 12].copy_from_slice(&(idx + 1000).to_le_bytes()); // start_lo
     }
     r
 }
@@ -35,14 +36,14 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("extent_meta_count_depth0");
     g.bench_function("parse_full", |b| {
         // ORIG: parse the whole tree (leaf extents) then discover depth==0.
-        b.iter(|| black_box(parse_extent_tree(black_box(&root)).unwrap().0.depth))
+        b.iter(|| black_box(parse_extent_tree(black_box(&root)).unwrap().0.depth));
     });
     g.bench_function("read_depth", |b| {
         // NEW: read eh_depth directly.
         b.iter(|| {
             let r = black_box(&root);
-            black_box(u16::from_le_bytes([r[6], r[7]]))
-        })
+            black_box(u16::from_le_bytes([r[6], r[7]]));
+        });
     });
     g.finish();
 }

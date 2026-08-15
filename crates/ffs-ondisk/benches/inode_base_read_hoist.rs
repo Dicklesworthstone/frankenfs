@@ -65,7 +65,10 @@ fn sum_arrayref(b: &[u8]) -> u32 {
 fn bench(c: &mut Criterion) {
     let mut buf = [0u8; 256];
     for (i, x) in buf.iter_mut().enumerate() {
-        *x = (i as u8).wrapping_mul(31).wrapping_add(7);
+        *x = u8::try_from(i % 256)
+            .expect("i % 256 fits u8")
+            .wrapping_mul(31)
+            .wrapping_add(7);
     }
     assert_eq!(sum_read_le(&buf), sum_arrayref(&buf), "isomorphism");
 
