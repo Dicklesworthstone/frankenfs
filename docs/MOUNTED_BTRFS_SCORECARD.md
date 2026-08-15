@@ -236,8 +236,25 @@ nowhere outside `ffs-core` — not the CLI, not the FUSE layer, not the harness.
 *mounted* configuration could verify, and this row's FUSE arms did not. A capability no
 mount can reach is, for benchmarking purposes, the same as not having one. The mount
 option now exists (`--btrfs-verify-data-on-read`,
-`bd-btrfs-no-read-side-csum-verify-xu3m6`) and is still off by default, so what this row
-measured is unchanged and the comparison is still not like-for-like.
+`bd-btrfs-no-read-side-csum-verify-xu3m6`), so what this row measured is unchanged and the
+comparison is still not like-for-like.
+
+> ⛔ **SUPERSEDED 2026-08-15 (`bd-6kpp4`): the default is no longer off.** This paragraph
+> previously ended "and is still off by default". Two commits the same day flipped it:
+> `1c85fc23` (00:15) set `OpenOptions::default().btrfs_verify_data_on_read` to **true** —
+> the product default — and `e54146ee` (00:28) followed in the harness `Config`.
+>
+> Consequence for this file: **every banked mounted btrfs read row above, including the
+> only `honest_win`, was measured under verify=OFF — a configuration that no longer
+> ships.** The rows are re-scoped, not retracted: they remain valid measurements of the
+> arms that ran, and they are the baseline the verify=ON cost has to be measured against.
+> But a NEW run is not configuration-comparable to them unless it passes
+> `--btrfs-verify-data-on-read false` explicitly, because the harness now defaults to
+> **true**.
+>
+> This was decided ahead of `bd-btrfs-verify-default-decision-v81jt`, the bead whose stated
+> purpose is to choose this default and which is still OPEN and blocked on the cold-cache
+> cost delta. That cost is still unmeasured.
 
 **But that does not settle it against us either.** This is a *warm-cache* workload, and
 kernel btrfs does not re-verify checksums on page-cache hits — it verifies on the disk
@@ -250,7 +267,45 @@ of this one. Until it runs:
 
 > Quote this row as *"FrankenFS is faster than kernel btrfs on warm multi-file parallel
 > reads, mechanism unresolved, and the measured FrankenFS arms did not verify data
-> checksums — the capability exists but is off by default."* Do not quote it as a bare win.
+> checksums — the capability existed but was off by default when this ran."* Do not quote
+> it as a bare win.
+
+### Cold-cache attempt 1 — REFUSED, no number published (2026-08-15, `bd-btrfs-parallel-read-win-mechanism-iwzrx`)
+
+The cold-cache arm (`parallel-read-8t-cold-cache`, added `3a5a5669`) **executed for the
+first time** and is mechanically sound: four live mounts, exact four-arm parity
+(`tree_sha256=c49f12e8…`, 261 entries / 68,157,468 bytes identical across arms), clean
+post-unmount `btrfs check --readonly` on all four, `incumbent_isolation_proof=pass`,
+threads 8→**8** observed, pinning `clear=true`. Host `thinkstation1`, kernel
+`6.17.0-41-generic`, candidate ELF `10a4a264…`, PGO profile `cc6c121c…`,
+`compile_avx2=true`; built and executed on the same host.
+
+**The run is INADMISSIBLE on two independent gates and nothing from it is quotable:**
+
+| Gate | Result |
+| --- | --- |
+| FUSE A/A null | median `0.985209` (inside 2%) but symmetric spread **`1.086963`** vs limit `1.025` → `clear=false` |
+| Kernel A/A null | median `0.998724`, spread `1.007234` → clear |
+| `external_load_during_run` | **`53/53` samples contended** (`contended_fraction=1.0000`, limit `0.10`), max 8 off-placement busy CPUs vs limit 2 |
+| Verdict | **`BLOCKED_NULL`**, `admitted=false`, `directional_claim_clear=false` |
+
+The ratio the run printed is deliberately **not** reproduced here as a result. Two reasons,
+either sufficient: the FUSE arm could not reproduce itself against itself, and the socket
+was contended for 100% of the measured region — the exact failure mode that made the
+2026-08-08 contended pair return opposite verdicts.
+
+**It also would not have answered the question even if admitted**, which is the more useful
+finding. The harness now defaults `--btrfs-verify-data-on-read` to **true** (`e54146ee`),
+so this run had checksum verification **ON** while the banked warm row it is meant to be
+compared against ran with it **OFF**. That changes two variables at once — cache regime
+*and* integrity contract — so it cannot attribute anything to cold cache. See `bd-6kpp4`.
+
+**What the next attempt must do:** pass `--btrfs-verify-data-on-read false` to isolate the
+cache regime against the banked row, and separately `true` for the like-for-like integrity
+comparison — a 2-cell design on one ELF, in a genuinely quiet window. A cold-cache A/A null
+may also be intrinsically wider than the `1.025` limit, since every batch pays a host-wide
+`drop_caches` and re-warms from a shared disk; if it is, this instrument cannot decide the
+question at 12 pairs and the gate, not the lever, is what needs revisiting.
 
 ## The row that could not run, and what it took to score it (2026-08-04)
 
