@@ -265,10 +265,12 @@ The question is genuinely open in both directions, and a **cold-cache read varia
 decide it**. That is a different workload and a separate row, not a silent substitution
 of this one. Until it runs:
 
-> Quote this row as *"FrankenFS is faster than kernel btrfs on warm multi-file parallel
+> Quote this row as *"FrankenFS is faster than kernel btrfs on **warm** multi-file parallel
 > reads, mechanism unresolved, and the measured FrankenFS arms did not verify data
-> checksums — the capability existed but was off by default when this ran."* Do not quote
-> it as a bare win.
+> checksums — the capability existed but was off by default when this ran. Two cold-cache
+> attempts both point the other way and both were refused for socket contention, so the
+> warm result may be cache-regime-specific."* Do not quote it as a bare win, and do not
+> generalise it to reads at large.
 
 ### Cold-cache attempt 1 — REFUSED, no number published (2026-08-15, `bd-btrfs-parallel-read-win-mechanism-iwzrx`)
 
@@ -300,12 +302,53 @@ so this run had checksum verification **ON** while the banked warm row it is mea
 compared against ran with it **OFF**. That changes two variables at once — cache regime
 *and* integrity contract — so it cannot attribute anything to cold cache. See `bd-6kpp4`.
 
-**What the next attempt must do:** pass `--btrfs-verify-data-on-read false` to isolate the
-cache regime against the banked row, and separately `true` for the like-for-like integrity
-comparison — a 2-cell design on one ELF, in a genuinely quiet window. A cold-cache A/A null
-may also be intrinsically wider than the `1.025` limit, since every batch pays a host-wide
-`drop_caches` and re-warms from a shared disk; if it is, this instrument cannot decide the
-question at 12 pairs and the gate, not the lever, is what needs revisiting.
+### Cold-cache attempt 2 — verify=OFF, internally CLEAN, refused only by socket contention
+
+Same ELF (`10a4a264…`), same PGO profile (`cc6c121c…`), same host, ~25 minutes later with
+host load down from ~10 to ~4, this time with `--btrfs-verify-data-on-read false` so the
+candidate configuration **matches the banked warm row** and only the cache regime differs.
+
+Everything the instrument controls internally came out clean:
+
+| Gate | Attempt 1 (verify=ON) | Attempt 2 (verify=OFF) |
+| --- | --- | --- |
+| kernel A/A null | `0.998724`, spread `1.007234` ✅ | `1.007592`, spread `1.023142` ✅ |
+| FUSE A/A null | `0.985209`, spread **`1.086963`** ❌ | `0.998246`, spread `1.022767` ✅ |
+| Four-arm parity | pass | pass (`tree_sha256=c49f12e8…`) |
+| `directional_claim_clear` | false | **true** (margin `1.046819`) |
+| `admitted` (null/pinning/parity) | false | **true** |
+| Instrument verdict | `BLOCKED_NULL` | **`HONEST_LOSS`** |
+| `external_load_during_run` | 53/53 contended ⛔ | 32/32 contended ⛔ |
+
+**Attempt 2 is refused by exactly one thing: the post-hoc socket-contention veto.** Peak 6
+off-placement busy CPUs against a limit of 2, peak off-placement mean busy 9.3%, 100% of
+samples over limit against a 10% limit.
+
+⛔ **Not bankable, recorded for direction only:** `1.392135x [1.351586, 1.394852]`
+(`kernel_median_wall_ns=60738067`, `fuse_median_wall_ns=84493550`). Attempt 1, with verify
+ON, printed a larger ratio on a failed null. **Neither is a result.**
+
+**One prior refuted, which is why attempt 2 was worth running.** The section above predicted
+a cold-cache A/A null might be *intrinsically* wider than `1.025`, because every timed batch
+pays a host-wide `drop_caches` and re-warms from a shared disk. Attempt 2's FUSE null came
+in at `1.022767` — inside the limit. **The instrument can produce a clean cold-cache null.**
+The blocker is socket contention from co-tenants, not the workload design, and attempt 1's
+dirty null was not intrinsic either.
+
+**What this points at, stated as a direction and not a claim.** With the *same* candidate
+configuration as the banked warm win, the cold-cache direction is a **loss**, where warm is
+a `0.89–0.93x` win. If that survives a quiet window, the warm win is a **cache-regime
+artifact** and the row must be restated — which is precisely the outcome
+`bd-btrfs-parallel-read-win-mechanism-iwzrx` was opened to force. It has not survived a
+quiet window yet, so the warm row stands as banked and this stays unresolved.
+
+**On the veto itself, without touching it.** Every run it has refused on this workload
+carries an instrument verdict of `HONEST_LOSS` or `BLOCKED_NULL` — never a win. Admitting
+them could not manufacture a win, only record a loss, so the risk is asymmetric. That is an
+argument for revisiting the gate's threshold *with its own evidence*, not for waiving it
+here: it was added because the 2026-08-08 contended pair returned opposite verdicts, and
+one contended run was published on the strength of it. The gate stays as it is; the runs
+stay refused.
 
 ## The row that could not run, and what it took to score it (2026-08-04)
 
