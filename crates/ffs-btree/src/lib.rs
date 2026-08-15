@@ -702,7 +702,15 @@ fn insert_inner(
     let child_block = indexes[child_pos].leaf_block;
     let old_separator = indexes[child_pos].logical_block;
 
-    let split = insert_descend(cx, dev, child_block, header.depth - 1, extent, alloc, coalesce)?;
+    let split = insert_descend(
+        cx,
+        dev,
+        child_block,
+        header.depth - 1,
+        extent,
+        alloc,
+        coalesce,
+    )?;
 
     // If the new extent became the first key in the child subtree,
     // the parent separator must be updated to match.

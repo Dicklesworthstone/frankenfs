@@ -18835,10 +18835,12 @@ impl OpenFs {
     /// the only acquisition order that could ever pair them.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     fn ext4_single_lock_group_counts(&self) -> Vec<crate::sharded_alloc::SeedCounts> {
-        self.ext4_alloc_state.as_ref().map_or_else(Vec::new, |lock| {
-            let alloc = lock.read();
-            crate::sharded_alloc::SeedCounts::snapshot(&alloc.groups)
-        })
+        self.ext4_alloc_state
+            .as_ref()
+            .map_or_else(Vec::new, |lock| {
+                let alloc = lock.read();
+                crate::sharded_alloc::SeedCounts::snapshot(&alloc.groups)
+            })
     }
 
     /// Per-group free-count snapshot of a TRANSIENT recovery allocation state,

@@ -408,7 +408,11 @@ mod tests {
         for (kind, expected) in cases {
             let err = FfsError::Io(std::io::Error::new(*kind, "synthetic"));
             // Synthetic io errors carry no raw OS errno, so the kind table runs.
-            assert_eq!(err.to_errno(), *expected, "wrong errno for ErrorKind {kind:?}");
+            assert_eq!(
+                err.to_errno(),
+                *expected,
+                "wrong errno for ErrorKind {kind:?}"
+            );
         }
     }
 

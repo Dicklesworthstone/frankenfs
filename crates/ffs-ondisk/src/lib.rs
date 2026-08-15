@@ -7,8 +7,8 @@
 //! superblock fields, plus btrfs superblocks, headers, leaf item tables,
 //! and internal node key-pointers.
 
-pub mod crc_incremental;
 pub mod btrfs;
+pub mod crc_incremental;
 pub mod ext4;
 
 pub use btrfs::{
@@ -33,22 +33,20 @@ pub use ext4::{
     Ext4ImageReader, Ext4IncompatFeatures, Ext4Inode, Ext4MmpBlock, Ext4MmpStatus,
     Ext4RoCompatFeatures, Ext4Superblock, Ext4Xattr, ExtentTree, FeatureDiagnostics,
     HtreeFindResult, HtreeLeafSplit, HtreeSplitFallback, InodeLocation, build_htree_directory,
-    build_htree_directory_for_rebuild,
-    build_htree_directory_stamped, build_htree_directory_stamped_with_large_dir,
+    build_htree_directory_for_rebuild, build_htree_directory_stamped,
+    build_htree_directory_stamped_with_large_dir,
     build_htree_directory_stamped_with_large_dir_casefold, build_htree_directory_with_large_dir,
     build_htree_directory_with_large_dir_casefold, choose_htree_leaf_split, dir_entry_rec_len,
     dx_hash, dx_root_entry_limit, ext4_casefold_key, ext4_casefold_name_diagnostics,
     ext4_casefold_names_collide, ext4_chksum, ext4_dx_block_csum, ext4_xattr_block_csum,
-    find_ibody_xattr_by_index_name, find_ibody_xattr_by_name,
-    find_xattr_block_value_by_index_name, find_xattr_block_value_by_name, htree_find_entry,
-    htree_find_entry_casefold, htree_leaf_logical_blocks, htree_target_leaf_block,
-    htree_target_leaf_block_casefold, is_reserved_inode, iter_dir_block, lookup_in_dir_block,
-    split_htree_leaf,
-    lookup_in_dir_block_casefold, pack_dir_block_entries, parse_dir_block, parse_dx_root,
-    parse_extent_tree, parse_ibody_xattr_names, parse_ibody_xattrs, parse_ibody_xattrs_with_inum,
-    parse_inode_extent_tree,
-    parse_xattr_block, parse_xattr_block_names, parse_xattr_block_with_inum,
-    stamp_block_bitmap_checksum,
+    find_ibody_xattr_by_index_name, find_ibody_xattr_by_name, find_xattr_block_value_by_index_name,
+    find_xattr_block_value_by_name, htree_find_entry, htree_find_entry_casefold,
+    htree_leaf_logical_blocks, htree_target_leaf_block, htree_target_leaf_block_casefold,
+    is_reserved_inode, iter_dir_block, lookup_in_dir_block, lookup_in_dir_block_casefold,
+    pack_dir_block_entries, parse_dir_block, parse_dx_root, parse_extent_tree,
+    parse_ibody_xattr_names, parse_ibody_xattrs, parse_ibody_xattrs_with_inum,
+    parse_inode_extent_tree, parse_xattr_block, parse_xattr_block_names,
+    parse_xattr_block_with_inum, split_htree_leaf, stamp_block_bitmap_checksum,
     stamp_dir_block_checksum, stamp_dx_block_checksum, stamp_extent_block_checksum,
     stamp_group_desc_checksum, stamp_inode_bitmap_checksum, stamp_xattr_block_checksum,
     verify_block_bitmap_checksum, verify_dir_block_checksum, verify_dx_block_checksum,

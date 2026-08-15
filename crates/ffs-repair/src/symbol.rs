@@ -124,10 +124,7 @@ impl RepairBlockHeader {
             });
         }
         if data[28..32].iter().any(|byte| *byte != 0) {
-            return Err(RepairParseError::ReservedNonZero {
-                offset: 28,
-                len: 4,
-            });
+            return Err(RepairParseError::ReservedNonZero { offset: 28, len: 4 });
         }
 
         Ok(Self {
@@ -255,10 +252,7 @@ impl RepairGroupDescExt {
             });
         }
         if data[44..48].iter().any(|byte| *byte != 0) {
-            return Err(RepairParseError::ReservedNonZero {
-                offset: 44,
-                len: 4,
-            });
+            return Err(RepairParseError::ReservedNonZero { offset: 44, len: 4 });
         }
 
         Ok(Self {
@@ -390,10 +384,7 @@ impl std::fmt::Display for RepairParseError {
                 )
             }
             Self::ReservedNonZero { offset, len } => {
-                write!(
-                    f,
-                    "reserved bytes must be zero: offset {offset}, len {len}"
-                )
+                write!(f, "reserved bytes must be zero: offset {offset}, len {len}")
             }
         }
     }
