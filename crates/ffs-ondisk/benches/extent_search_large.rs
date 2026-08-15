@@ -39,7 +39,7 @@
 //! E <= 256 falls straight through to `partition_point` (no common-case cost;
 //! real files are 1-few extents).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench extent_search_large
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 const INTERP_GATE: usize = 256;
@@ -150,14 +150,30 @@ fn bench(c: &mut Criterion) {
             // NULL CONTROL: partition_point registered twice; its ratio is the
             // noise floor. Any interp-vs-binary gap below binary-vs-binary is noise.
             g.bench_function("binary_a", |b| {
-                b.iter(|| black_box(run_batch(binary_pp, black_box(&starts), black_box(&targets))))
+                b.iter(|| {
+                    black_box(run_batch(
+                        binary_pp,
+                        black_box(&starts),
+                        black_box(&targets),
+                    ))
+                })
             });
             g.bench_function("binary_b", |b| {
-                b.iter(|| black_box(run_batch(binary_pp, black_box(&starts), black_box(&targets))))
+                b.iter(|| {
+                    black_box(run_batch(
+                        binary_pp,
+                        black_box(&starts),
+                        black_box(&targets),
+                    ))
+                })
             });
             g.bench_function("interp_hybrid", |b| {
                 b.iter(|| {
-                    black_box(run_batch(interp_hybrid_pp, black_box(&starts), black_box(&targets)))
+                    black_box(run_batch(
+                        interp_hybrid_pp,
+                        black_box(&starts),
+                        black_box(&targets),
+                    ))
                 })
             });
             g.finish();

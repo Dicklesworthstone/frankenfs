@@ -5,7 +5,7 @@
 //! buffer (up to PATH_MAX) with no NUL scans to the end — the big-win case.
 //! A/B on a short path (fast symlink) and a long / no-NUL buffer (slow symlink).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench nul_scan
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 #[inline]

@@ -5,7 +5,7 @@
 //! time for EITHER byte via the classic has-zero-byte trick
 //! (`haszero(w) | haszero(w ^ broadcast('/'))`). This isolates that primitive.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench path_validate
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 /// Production form: two independent `contains` scans.

@@ -163,11 +163,7 @@ fn parse_leaf_items_eager_coverage_model(block: &[u8]) -> Vec<ParsedLeafItemMode
         assert!(data_end <= block.len(), "payload lies inside block");
         if data_size_usize > 0 {
             assert!(
-                !eager_payload_range_collides(
-                    &mut payload_coverage,
-                    data_offset_usize,
-                    data_end
-                ),
+                !eager_payload_range_collides(&mut payload_coverage, data_offset_usize, data_end),
                 "payloads do not overlap"
             );
         }

@@ -225,5 +225,9 @@ fn bench_jbd2_legacy_tag_stamp(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_jbd2_data_block_prep, bench_jbd2_legacy_tag_stamp);
+criterion_group!(
+    benches,
+    bench_jbd2_data_block_prep,
+    bench_jbd2_legacy_tag_stamp
+);
 criterion_main!(benches);

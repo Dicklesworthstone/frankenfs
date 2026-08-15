@@ -80,7 +80,11 @@ fn bench(c: &mut Criterion) {
         bch.iter(|| {
             let mut acc = 0u64;
             for &b in &blocks {
-                acc += u64::from(new_path(black_box(b), black_box(sb_target), black_box(tb_sb)));
+                acc += u64::from(new_path(
+                    black_box(b),
+                    black_box(sb_target),
+                    black_box(tb_sb),
+                ));
             }
             black_box(acc);
         });

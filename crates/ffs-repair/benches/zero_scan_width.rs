@@ -54,13 +54,23 @@ fn bench(c: &mut Criterion) {
     early[0] = 1;
     let mut late = vec![0u8; 4096];
     late[4095] = 1;
-    for (name, block) in [("zero", &zero), ("nonzero_early", &early), ("nonzero_late", &late)] {
+    for (name, block) in [
+        ("zero", &zero),
+        ("nonzero_early", &early),
+        ("nonzero_late", &late),
+    ] {
         assert_eq!(zero_word(block), zero_unrolled4(block));
         assert_eq!(zero_byte(block), zero_unrolled4(block));
         let mut g = c.benchmark_group(format!("scrub_is_all_zero_{name}"));
-        g.bench_function("byte", |b| b.iter(|| black_box(zero_byte(black_box(block)))));
-        g.bench_function("word", |b| b.iter(|| black_box(zero_word(black_box(block)))));
-        g.bench_function("unrolled4", |b| b.iter(|| black_box(zero_unrolled4(black_box(block)))));
+        g.bench_function("byte", |b| {
+            b.iter(|| black_box(zero_byte(black_box(block))))
+        });
+        g.bench_function("word", |b| {
+            b.iter(|| black_box(zero_word(black_box(block))))
+        });
+        g.bench_function("unrolled4", |b| {
+            b.iter(|| black_box(zero_unrolled4(black_box(block))))
+        });
         g.finish();
     }
 }

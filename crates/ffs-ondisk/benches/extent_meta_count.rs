@@ -6,7 +6,7 @@
 //! see depth==0 and return 0. Reading `eh_depth` (root[6..8]) first skips that
 //! parse entirely. A/B the parse vs the direct depth read on a depth-0 inline root.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench extent_meta_count
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_ondisk::ext4::parse_extent_tree;
 use std::hint::black_box;
 

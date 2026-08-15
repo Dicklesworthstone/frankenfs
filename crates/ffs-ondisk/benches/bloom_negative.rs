@@ -7,7 +7,7 @@
 //! a negative lookup skips the set. Measure negative-contains: bloom vs HashSet
 //! across dir sizes (where does the cache-resident win appear?).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench bloom_negative
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rustc_hash::{FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::hint::black_box;
@@ -24,7 +24,11 @@ impl Bloom {
     fn new(n: usize, bits_per: usize, k: u32) -> Self {
         let want = (n * bits_per).max(64);
         let m = want.next_power_of_two();
-        Bloom { bits: vec![0u64; m / 64], m, k }
+        Bloom {
+            bits: vec![0u64; m / 64],
+            m,
+            k,
+        }
     }
     #[inline]
     fn hash(name: &[u8]) -> u64 {
@@ -60,8 +64,12 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("bloom_negative");
     for &n in &[1_000usize, 10_000, 100_000] {
         // Present set: "present_<i>"; absent queries: "absent_<i>".
-        let present: Vec<Vec<u8>> = (0..n).map(|i| format!("present_{i:08}").into_bytes()).collect();
-        let absent: Vec<Vec<u8>> = (0..1024).map(|i| format!("absent_{i:08}").into_bytes()).collect();
+        let present: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("present_{i:08}").into_bytes())
+            .collect();
+        let absent: Vec<Vec<u8>> = (0..1024)
+            .map(|i| format!("absent_{i:08}").into_bytes())
+            .collect();
 
         let mut set: FxHashSet<Vec<u8>> = FxHashSet::default();
         let mut bloom = Bloom::new(n, 10, 7);

@@ -90,11 +90,7 @@ fn build_present_index_map_only(keys: &[Vec<u8>]) -> (FxHashSet<Vec<u8>>, Presen
     (FxHashSet::default(), present)
 }
 
-fn known_absent(
-    names: &FxHashSet<Vec<u8>>,
-    present: Option<&PresentMap>,
-    name: &[u8],
-) -> bool {
+fn known_absent(names: &FxHashSet<Vec<u8>>, present: Option<&PresentMap>, name: &[u8]) -> bool {
     match present {
         Some(present) => !present.contains_key(name),
         None => !names.contains(name),

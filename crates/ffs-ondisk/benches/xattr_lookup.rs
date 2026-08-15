@@ -131,9 +131,10 @@ fn bench_getxattr_finder_by_index(c: &mut Criterion) {
         let by_name = find_xattr_block_value_by_name(&block, &target)
             .unwrap()
             .map(|(_, v, _)| v);
-        let by_index = find_xattr_block_value_by_index_name(&block, EXT4_XATTR_INDEX_USER, suffix_bytes)
-            .unwrap()
-            .map(|(_, v, _)| v);
+        let by_index =
+            find_xattr_block_value_by_index_name(&block, EXT4_XATTR_INDEX_USER, suffix_bytes)
+                .unwrap()
+                .map(|(_, v, _)| v);
         assert_eq!(by_name, by_index, "by-index finder diverged from by-name");
         assert!(by_name.is_some(), "target must be present");
 
@@ -173,5 +174,9 @@ fn bench_getxattr_finder_by_index(c: &mut Criterion) {
     }
 }
 
-criterion_group!(xattr_lookup, bench_xattr_lookup, bench_getxattr_finder_by_index);
+criterion_group!(
+    xattr_lookup,
+    bench_xattr_lookup,
+    bench_getxattr_finder_by_index
+);
 criterion_main!(xattr_lookup);

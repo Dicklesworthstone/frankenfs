@@ -8,7 +8,7 @@
 //! beat it on same-length names — the case-folding analogue of the `names_eq`
 //! SWAR exact-compare win (a092e533, 1.43x). A/B on representative names.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench casefold_cmp
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 #[inline]
@@ -58,9 +58,12 @@ fn swar(a: &[u8], b: &[u8]) -> bool {
 fn bench(c: &mut Criterion) {
     // Same-length case-variant pairs (a casefold match): differ only in case.
     let cases: [(&[u8], &[u8]); 3] = [
-        (b"File_00012345", b"file_00012345"),                 // 13 B
-        (b"MyDocument.TXT", b"mydocument.txt"),                 // 14 B
-        (b"A_Rather_Longer_DirEntry_Name.Dat", b"a_rather_longer_direntry_name.dat"), // 33 B
+        (b"File_00012345", b"file_00012345"),   // 13 B
+        (b"MyDocument.TXT", b"mydocument.txt"), // 14 B
+        (
+            b"A_Rather_Longer_DirEntry_Name.Dat",
+            b"a_rather_longer_direntry_name.dat",
+        ), // 33 B
     ];
     // Correctness: SWAR must match eq_ignore_ascii_case on all ASCII inputs.
     for (x, y) in &cases {
@@ -71,7 +74,11 @@ fn bench(c: &mut Criterion) {
     }
 
     let mut g = c.benchmark_group("casefold_cmp");
-    for (label, (x, y)) in [("short_13", cases[0]), ("mid_14", cases[1]), ("long_33", cases[2])] {
+    for (label, (x, y)) in [
+        ("short_13", cases[0]),
+        ("mid_14", cases[1]),
+        ("long_33", cases[2]),
+    ] {
         g.bench_function(format!("bytewise/{label}"), |b| {
             b.iter(|| black_box(bytewise(black_box(x), black_box(y))))
         });

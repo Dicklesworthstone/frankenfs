@@ -9,13 +9,19 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 fn bench(c: &mut Criterion) {
-    let bitmap4k = vec![0xA5u8; 4096];   // 32768-block group bitmap
-    let bitmap1k = vec![0xA5u8; 1024];   // 8192-inode group bitmap
-    let delta = vec![0xFFu8; 8];         // one 64-bit word changed (a small alloc)
+    let bitmap4k = vec![0xA5u8; 4096]; // 32768-block group bitmap
+    let bitmap1k = vec![0xA5u8; 1024]; // 8192-inode group bitmap
+    let delta = vec![0xFFu8; 8]; // one 64-bit word changed (a small alloc)
     let mut g = c.benchmark_group("bitmap_csum");
-    g.bench_function("full_recompute_4k", |b| b.iter(|| black_box(crc32c::crc32c(black_box(&bitmap4k)))));
-    g.bench_function("full_recompute_1k", |b| b.iter(|| black_box(crc32c::crc32c(black_box(&bitmap1k)))));
-    g.bench_function("crc_of_delta_8b", |b| b.iter(|| black_box(crc32c::crc32c(black_box(&delta)))));
+    g.bench_function("full_recompute_4k", |b| {
+        b.iter(|| black_box(crc32c::crc32c(black_box(&bitmap4k))))
+    });
+    g.bench_function("full_recompute_1k", |b| {
+        b.iter(|| black_box(crc32c::crc32c(black_box(&bitmap1k))))
+    });
+    g.bench_function("crc_of_delta_8b", |b| {
+        b.iter(|| black_box(crc32c::crc32c(black_box(&delta))))
+    });
     g.finish();
 
     // Zero-tail-aware block-bitmap checksum (production `block_bitmap_checksum_value`).
@@ -34,10 +40,24 @@ fn bench(c: &mut Criterion) {
     let full = vec![0xA5u8; 4096];
     let mut g2 = c.benchmark_group("bitmap_csum_value");
     g2.bench_function("full_straight", |b| {
-        b.iter(|| black_box(block_bitmap_checksum_value(black_box(&full), seed, clusters, desc)))
+        b.iter(|| {
+            black_box(block_bitmap_checksum_value(
+                black_box(&full),
+                seed,
+                clusters,
+                desc,
+            ))
+        })
     });
     g2.bench_function("partial_zeroaware", |b| {
-        b.iter(|| black_box(block_bitmap_checksum_value(black_box(&partial), seed, clusters, desc)))
+        b.iter(|| {
+            black_box(block_bitmap_checksum_value(
+                black_box(&partial),
+                seed,
+                clusters,
+                desc,
+            ))
+        })
     });
     g2.finish();
 }

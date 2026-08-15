@@ -7,7 +7,7 @@
 //! `read_fixed::<12>` is one check + const-offset array reads.
 //! A/B is production vs the reverted 4-read form (rebuild).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench extent_leaf_parse
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_ondisk::ext4::parse_extent_tree;
 use std::hint::black_box;
 

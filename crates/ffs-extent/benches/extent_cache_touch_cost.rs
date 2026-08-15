@@ -260,24 +260,14 @@ fn bench_cache(c: &mut Criterion) {
     group.bench_function("contains_then_insert_control", |b| {
         b.iter_batched(
             seed_insert_map,
-            |mut entries| {
-                black_box(run_insert_workload(
-                    black_box(&mut entries),
-                    insert_control,
-                ))
-            },
+            |mut entries| black_box(run_insert_workload(black_box(&mut entries), insert_control)),
             criterion::BatchSize::SmallInput,
         );
     });
     group.bench_function("insert_once_candidate", |b| {
         b.iter_batched(
             seed_insert_map,
-            |mut entries| {
-                black_box(run_insert_workload(
-                    black_box(&mut entries),
-                    insert_once,
-                ))
-            },
+            |mut entries| black_box(run_insert_workload(black_box(&mut entries), insert_once)),
             criterion::BatchSize::SmallInput,
         );
     });

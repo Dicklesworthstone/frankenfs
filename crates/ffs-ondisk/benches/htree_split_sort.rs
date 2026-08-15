@@ -8,13 +8,15 @@
 //! sort is in-place and faster. A/B on a realistic ~340-entry leaf of fat
 //! `(u32 hash, u32 ino, u8 ft, &[u8] name)` tuples (24-byte elements).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench htree_split_sort
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 fn bench(c: &mut Criterion) {
     // 340 entries — a full 4 KiB leaf. Scrambled hashes with deliberate ties
     // (every 8th entry collides) to exercise the stable/unstable difference.
-    let names: Vec<Vec<u8>> = (0..340).map(|i| format!("file_{i:08}").into_bytes()).collect();
+    let names: Vec<Vec<u8>> = (0..340)
+        .map(|i| format!("file_{i:08}").into_bytes())
+        .collect();
     let base: Vec<(u32, u32, u8, &[u8])> = names
         .iter()
         .enumerate()

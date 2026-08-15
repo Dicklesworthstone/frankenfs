@@ -6,7 +6,7 @@
 //! (`names_eq`) wins for same-length names (numbered / log / hash / maildir).
 //! A/B is production (`names_eq`) vs the reverted byte-slice `==` (rebuild).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench lookup_leaf_scan
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_ondisk::ext4::lookup_in_dir_block;
 use std::hint::black_box;
 
@@ -49,14 +49,28 @@ fn bench(c: &mut Criterion) {
     // A missing same-length name → scans every entry.
     let miss = b"cb_zzzzzzzz";
     assert_eq!(miss.len(), name_len);
-    assert!(lookup_in_dir_block(&block, bs as u32, miss).unwrap().is_none());
+    assert!(
+        lookup_in_dir_block(&block, bs as u32, miss)
+            .unwrap()
+            .is_none()
+    );
     // A present name (mid-block) still resolves.
     let hit = format!("cb_{:08}", entries / 2);
-    assert!(lookup_in_dir_block(&block, bs as u32, hit.as_bytes()).unwrap().is_some());
+    assert!(
+        lookup_in_dir_block(&block, bs as u32, hit.as_bytes())
+            .unwrap()
+            .is_some()
+    );
 
     let mut g = c.benchmark_group("lookup_leaf_scan");
     g.bench_function("miss_full_leaf", |b| {
-        b.iter(|| black_box(lookup_in_dir_block(black_box(&block), bs as u32, black_box(miss))))
+        b.iter(|| {
+            black_box(lookup_in_dir_block(
+                black_box(&block),
+                bs as u32,
+                black_box(miss),
+            ))
+        })
     });
     g.finish();
     eprintln!("leaf entries scanned per miss: {entries}");

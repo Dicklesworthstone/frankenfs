@@ -9,7 +9,7 @@
 //! array-ref reslice neutral (and read_fixed's COPY a net loss, as measured
 //! before). This A/B confirms whether the direct guard already elides.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench walk_header_read
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_types::{ensure_slice, read_le_u16, read_le_u32};
 use std::hint::black_box;
 
@@ -114,7 +114,12 @@ fn collect(block: &[u8], with_cap: bool) -> Vec<BenchEntry> {
         } else {
             Vec::new()
         };
-        v.push(BenchEntry { inode, rec_len: rec_len as u32, name_len, name });
+        v.push(BenchEntry {
+            inode,
+            rec_len: rec_len as u32,
+            name_len,
+            name,
+        });
         off += rec_len;
     }
     v
@@ -124,16 +129,29 @@ fn bench(c: &mut Criterion) {
     let block = make_block();
     assert_eq!(walk_checked(&block), walk_arrayref(&block));
     let mut g = c.benchmark_group("walk_header_read");
-    g.bench_function("checked", |b| b.iter(|| black_box(walk_checked(black_box(&block)))));
-    g.bench_function("arrayref", |b| b.iter(|| black_box(walk_arrayref(black_box(&block)))));
+    g.bench_function("checked", |b| {
+        b.iter(|| black_box(walk_checked(black_box(&block))))
+    });
+    g.bench_function("arrayref", |b| {
+        b.iter(|| black_box(walk_arrayref(black_box(&block))))
+    });
     g.finish();
 
     // parse_dir_block collect: Vec::new vs with_capacity (isolated realloc delta).
-    assert!(collect(&block, false) == collect(&block, true), "collect arms must agree");
+    assert!(
+        collect(&block, false) == collect(&block, true),
+        "collect arms must agree"
+    );
     let mut g = c.benchmark_group("dir_collect");
-    g.bench_function("vecnew_a", |b| b.iter(|| black_box(collect(black_box(&block), false))));
-    g.bench_function("vecnew_b", |b| b.iter(|| black_box(collect(black_box(&block), false))));
-    g.bench_function("withcap", |b| b.iter(|| black_box(collect(black_box(&block), true))));
+    g.bench_function("vecnew_a", |b| {
+        b.iter(|| black_box(collect(black_box(&block), false)))
+    });
+    g.bench_function("vecnew_b", |b| {
+        b.iter(|| black_box(collect(black_box(&block), false)))
+    });
+    g.bench_function("withcap", |b| {
+        b.iter(|| black_box(collect(black_box(&block), true)))
+    });
     g.finish();
 }
 

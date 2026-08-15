@@ -9,7 +9,7 @@
 //! NOT elided. The array-REF reslice does one check per entry. This is the
 //! honest baseline (the helpers, opaque limit) — NOT direct byte-indexing.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-dir --bench entry_header_read
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 const HDR: usize = 8;

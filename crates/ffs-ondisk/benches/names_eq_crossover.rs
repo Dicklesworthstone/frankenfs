@@ -6,7 +6,7 @@
 //! length >= 8 is all word-compares. A/B: LEGACY byte-tail (`names_eq_orig`) vs
 //! the NEW production `names_eq` (overlap) vs slice `==`, looped 256×/iter.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench names_eq_crossover
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_ondisk::ext4::names_eq;
 use std::hint::black_box;
 
@@ -37,7 +37,13 @@ fn names_eq_orig(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn bench(c: &mut Criterion) {
-    let sizes = [(11usize, "len_11"), (12, "len_12"), (13, "len_13"), (16, "len_16"), (21, "len_21")];
+    let sizes = [
+        (11usize, "len_11"),
+        (12, "len_12"),
+        (13, "len_13"),
+        (16, "len_16"),
+        (21, "len_21"),
+    ];
     let mut g = c.benchmark_group("names_eq_loop");
     for (len, label) in sizes {
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..N)

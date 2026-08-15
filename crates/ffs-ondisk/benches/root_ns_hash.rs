@@ -7,7 +7,7 @@
 //! an in-memory cache key (values need only be deterministic + change-on-mutation).
 //! A/B the two hash forms over a representative 60-byte extent root.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench root_ns_hash
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;

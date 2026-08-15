@@ -39,7 +39,9 @@ fn build_expected(n: usize) -> Vec<(u64, Vec<u8>)> {
     (0..n)
         .map(|i| {
             let block = 1_000 + i as u64; // strictly ascending, unique
-            let bytes = (0..BLOCK).map(|b| prng((i as u64) << 20 ^ b as u64)).collect();
+            let bytes = (0..BLOCK)
+                .map(|b| prng((i as u64) << 20 ^ b as u64))
+                .collect();
             (block, bytes)
         })
         .collect()

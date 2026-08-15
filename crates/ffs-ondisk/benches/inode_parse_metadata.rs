@@ -7,7 +7,7 @@
 //! per-create validation-stamp read — can use the metadata parse. A/B on a
 //! 256-byte inode with `extra_isize = 32` (96-byte ibody region).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench inode_parse_metadata
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_ondisk::ext4::Ext4Inode;
 use std::hint::black_box;
 
@@ -44,7 +44,10 @@ fn bench(c: &mut Criterion) {
     assert_eq!(full.mode, attr.mode);
     assert!(meta.xattr_ibody.is_empty());
     assert!(!full.xattr_ibody.is_empty());
-    assert!(attr.extent_bytes.is_empty(), "attr skips extents for a regular file");
+    assert!(
+        attr.extent_bytes.is_empty(),
+        "attr skips extents for a regular file"
+    );
     // But a DEVICE inode keeps extent_bytes so device_number() still works.
     let dev = make_device_inode();
     let dev_attr = Ext4Inode::parse_attr_from_bytes(&dev).expect("attr parse device");

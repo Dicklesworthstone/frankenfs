@@ -12,7 +12,9 @@ fn bench(c: &mut Criterion) {
     let uuid = [0x11u8; 16];
     let cached: u32 = 0xDEAD_BEEF;
     let mut g = c.benchmark_group("csum_seed");
-    g.bench_function("recompute_crc32c_uuid", |b| b.iter(|| black_box(crc32c::crc32c(black_box(&uuid)))));
+    g.bench_function("recompute_crc32c_uuid", |b| {
+        b.iter(|| black_box(crc32c::crc32c(black_box(&uuid))))
+    });
     g.bench_function("cached_read", |b| b.iter(|| black_box(cached)));
     g.finish();
 }

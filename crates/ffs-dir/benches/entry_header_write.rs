@@ -7,7 +7,7 @@
 //! (`&mut block[off..off+8] as &mut [u8; 8]`, one check + const-offset writes)
 //! win? Measure both, replicating the same-function length check.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-dir --bench entry_header_write
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 const HDR: usize = 8;
@@ -62,13 +62,27 @@ fn bench(c: &mut Criterion) {
     g.bench_function("checked", |bch| {
         bch.iter(|| {
             let off = black_box(100usize);
-            black_box(checked(black_box(&mut block), off, black_box(20), black_box(0x1234_5678), 11, 1))
+            black_box(checked(
+                black_box(&mut block),
+                off,
+                black_box(20),
+                black_box(0x1234_5678),
+                11,
+                1,
+            ))
         })
     });
     g.bench_function("arrayref", |bch| {
         bch.iter(|| {
             let off = black_box(100usize);
-            black_box(arrayref(black_box(&mut block), off, black_box(20), black_box(0x1234_5678), 11, 1))
+            black_box(arrayref(
+                black_box(&mut block),
+                off,
+                black_box(20),
+                black_box(0x1234_5678),
+                11,
+                1,
+            ))
         })
     });
     g.finish();

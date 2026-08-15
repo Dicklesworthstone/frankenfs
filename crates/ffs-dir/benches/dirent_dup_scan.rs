@@ -7,7 +7,7 @@
 //! A/B: the byte-slice `==` (which the annotation showed lowering to a byte-wise
 //! loop) vs a SWAR word-at-a-time compare (SIMD-within-register).
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-dir --bench dirent_dup_scan
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_dir::{add_entry, init_dir_block};
 use ffs_ondisk::Ext4FileType;
 use std::hint::black_box;
@@ -41,7 +41,12 @@ fn names_eq_swar(a: &[u8], b: &[u8]) -> bool {
 /// Scan a leaf for a live `name`, using the supplied compare. Mirrors
 /// `block_contains_live_name`'s loop (rec_len chase + per-entry name compare).
 #[inline]
-fn scan<F: Fn(&[u8], &[u8]) -> bool>(block: &[u8], name: &[u8], reserved_tail: usize, eq: F) -> bool {
+fn scan<F: Fn(&[u8], &[u8]) -> bool>(
+    block: &[u8],
+    name: &[u8],
+    reserved_tail: usize,
+    eq: F,
+) -> bool {
     let limit = block.len() - reserved_tail;
     let mut off = 0usize;
     while off + HDR <= limit {
@@ -53,7 +58,8 @@ fn scan<F: Fn(&[u8], &[u8]) -> bool>(block: &[u8], name: &[u8], reserved_tail: u
         if end > limit {
             break;
         }
-        let cur_ino = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        let cur_ino =
+            u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
         let cur_name_len = usize::from(block[off + 6]);
         let name_end = off + HDR + cur_name_len;
         if name_end <= end && cur_ino != 0 && eq(&block[off + HDR..name_end], name) {
@@ -79,7 +85,8 @@ fn scan_checked<F: Fn(&[u8], &[u8]) -> bool>(
         b.get(i..i + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
     };
     let rd32 = |b: &[u8], i: usize| -> Option<u32> {
-        b.get(i..i + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        b.get(i..i + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     };
     let limit = block.len() - reserved_tail;
     let mut off = 0usize;
@@ -94,7 +101,9 @@ fn scan_checked<F: Fn(&[u8], &[u8]) -> bool>(
         if end > limit {
             break;
         }
-        let Some(cur_ino) = rd32(block, off) else { break };
+        let Some(cur_ino) = rd32(block, off) else {
+            break;
+        };
         let cur_name_len = usize::from(block[off + 6]);
         let name_end = off + HDR + cur_name_len;
         if name_end <= end && cur_ino != 0 && eq(&block[off + HDR..name_end], name) {
@@ -148,7 +157,15 @@ fn bench(c: &mut Criterion) {
     let mut n = 3u32;
     loop {
         let name = format!("cb_{:08}", n);
-        if add_entry(&mut block, n, name.as_bytes(), Ext4FileType::RegFile, reserved_tail).is_err() {
+        if add_entry(
+            &mut block,
+            n,
+            name.as_bytes(),
+            Ext4FileType::RegFile,
+            reserved_tail,
+        )
+        .is_err()
+        {
             break;
         }
         n += 1;
@@ -168,15 +185,36 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("dirent_dup_scan");
     g.bench_function("slice_eq", |b| {
-        b.iter(|| black_box(scan(black_box(&block), black_box(miss), reserved_tail, |x, y| x == y)))
+        b.iter(|| {
+            black_box(scan(
+                black_box(&block),
+                black_box(miss),
+                reserved_tail,
+                |x, y| x == y,
+            ))
+        })
     });
     g.bench_function("swar", |b| {
-        b.iter(|| black_box(scan(black_box(&block), black_box(miss), reserved_tail, names_eq_swar)))
+        b.iter(|| {
+            black_box(scan(
+                black_box(&block),
+                black_box(miss),
+                reserved_tail,
+                names_eq_swar,
+            ))
+        })
     });
     // Checked-read (production read_u16_le style) + SWAR vs direct-index + SWAR:
     // isolates whether the Option-returning bounds-checked reads cost anything.
     g.bench_function("swar_checked_read", |b| {
-        b.iter(|| black_box(scan_checked(black_box(&block), black_box(miss), reserved_tail, names_eq_swar)))
+        b.iter(|| {
+            black_box(scan_checked(
+                black_box(&block),
+                black_box(miss),
+                reserved_tail,
+                names_eq_swar,
+            ))
+        })
     });
     g.finish();
 

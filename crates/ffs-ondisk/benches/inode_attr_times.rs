@@ -8,7 +8,7 @@
 //! what a compact InodeAttr would use). If the delta is large the design turn
 //! pays; if tiny, it does not.
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-cc rch exec -- cargo bench --profile release-perf -p ffs-ondisk --bench inode_attr_times
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_ondisk::ext4::Ext4Inode;
 use std::hint::black_box;
 
