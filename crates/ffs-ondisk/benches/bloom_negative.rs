@@ -108,7 +108,7 @@ fn bench(c: &mut Criterion) {
                     miss += usize::from(!black_box(&bloom).contains(a.as_slice()));
                 }
                 black_box(miss);
-            })
+            });
         });
         let _ = fp;
     }

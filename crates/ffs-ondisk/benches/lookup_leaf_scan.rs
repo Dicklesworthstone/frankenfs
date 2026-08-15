@@ -63,17 +63,21 @@ fn bench(c: &mut Criterion) {
             .is_some()
     );
 
-    let mut g = c.benchmark_group("lookup_leaf_scan");
-    g.bench_function("miss_full_leaf", |b| {
-        b.iter(|| {
-            black_box(lookup_in_dir_block(
-                black_box(&block),
-                bs_u32,
-                black_box(miss),
-            ))
+    // Scoped so the `BenchmarkGroup`'s significant `Drop` runs at `finish()`
+    // rather than at the end of the function (bd-3ao0l).
+    {
+        let mut g = c.benchmark_group("lookup_leaf_scan");
+        g.bench_function("miss_full_leaf", |b| {
+            b.iter(|| {
+                black_box(lookup_in_dir_block(
+                    black_box(&block),
+                    bs_u32,
+                    black_box(miss),
+                ))
+            });
         });
-    });
-    g.finish();
+        g.finish();
+    }
     eprintln!("leaf entries scanned per miss: {entries}");
 }
 

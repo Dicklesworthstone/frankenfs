@@ -60,10 +60,10 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("path_validate");
     for (label, n) in [("short_11", &short), ("mid_25", &mid), ("long_255", &long)] {
         g.bench_with_input(format!("two_pass/{label}"), n, |b, n| {
-            b.iter(|| black_box(contains_two_pass(black_box(n))))
+            b.iter(|| black_box(contains_two_pass(black_box(n))));
         });
         g.bench_with_input(format!("swar/{label}"), n, |b, n| {
-            b.iter(|| black_box(swar_one_pass(black_box(n))))
+            b.iter(|| black_box(swar_one_pass(black_box(n))));
         });
     }
     g.finish();

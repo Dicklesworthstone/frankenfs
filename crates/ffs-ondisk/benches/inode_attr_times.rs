@@ -45,7 +45,7 @@ fn bench(c: &mut Criterion) {
                 a.ctime_system_time(),
                 a.crtime_system_time(),
             ))
-        })
+        });
     });
     // Compact: 4 raw (secs, nsec) extractions (what a raw-time InodeAttr uses).
     g.bench_function("raw_full_x4", |b| {
@@ -57,7 +57,7 @@ fn bench(c: &mut Criterion) {
                 a.ctime_full(),
                 a.crtime_full(),
             ))
-        })
+        });
     });
     g.finish();
 }

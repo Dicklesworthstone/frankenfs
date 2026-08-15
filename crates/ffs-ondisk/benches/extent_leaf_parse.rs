@@ -21,11 +21,12 @@ fn build_leaf(n: u16) -> Vec<u8> {
     b[6..8].copy_from_slice(&0u16.to_le_bytes()); // eh_depth = 0 (leaf)
     for i in 0..usize::from(n) {
         let base = 12 + i * 12;
-        let logical = (i as u32) * 2; // sorted, gap so non-overlapping
+        let idx = u32::try_from(i).expect("fixture extent index fits u32");
+        let logical = idx * 2; // sorted, gap so non-overlapping
         b[base..base + 4].copy_from_slice(&logical.to_le_bytes());
         b[base + 4..base + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len = 1
         b[base + 6..base + 8].copy_from_slice(&0u16.to_le_bytes()); // start_hi
-        b[base + 8..base + 12].copy_from_slice(&((i as u32) + 1000).to_le_bytes()); // start_lo
+        b[base + 8..base + 12].copy_from_slice(&(idx + 1000).to_le_bytes()); // start_lo
     }
     b
 }
@@ -38,7 +39,7 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("extent_leaf_parse");
     g.bench_function("full_leaf_340", |b| {
-        b.iter(|| black_box(parse_extent_tree(black_box(&block)).unwrap()))
+        b.iter(|| black_box(parse_extent_tree(black_box(&block)).unwrap()));
     });
     g.finish();
 }

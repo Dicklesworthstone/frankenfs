@@ -39,13 +39,13 @@ fn walk_checked(block: &[u8]) -> u64 {
     while off + 8 <= block.len() {
         let inode = read_le_u32(block, off).unwrap();
         let rec_len = read_le_u16(block, off + 4).unwrap() as usize;
-        let name_len = ensure_slice(block, off + 6, 1).unwrap()[0] as u64;
-        let file_type = ensure_slice(block, off + 7, 1).unwrap()[0] as u64;
+        let name_len = u64::from(ensure_slice(block, off + 6, 1).unwrap()[0]);
+        let file_type = u64::from(ensure_slice(block, off + 7, 1).unwrap()[0]);
         if rec_len < 12 {
             break;
         }
         acc = acc
-            .wrapping_add(inode as u64)
+            .wrapping_add(u64::from(inode))
             .wrapping_add(name_len)
             .wrapping_add(file_type);
         off += rec_len;
@@ -65,13 +65,13 @@ fn walk_arrayref(block: &[u8]) -> u64 {
         };
         let inode = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
         let rec_len = u16::from_le_bytes([h[4], h[5]]) as usize;
-        let name_len = h[6] as u64;
-        let file_type = h[7] as u64;
+        let name_len = u64::from(h[6]);
+        let file_type = u64::from(h[7]);
         if rec_len < 12 {
             break;
         }
         acc = acc
-            .wrapping_add(inode as u64)
+            .wrapping_add(u64::from(inode))
             .wrapping_add(name_len)
             .wrapping_add(file_type);
         off += rec_len;
@@ -116,7 +116,7 @@ fn collect(block: &[u8], with_cap: bool) -> Vec<BenchEntry> {
         };
         v.push(BenchEntry {
             inode,
-            rec_len: rec_len as u32,
+            rec_len: u32::try_from(rec_len).expect("dir entry rec_len fits u32"),
             name_len,
             name,
         });
@@ -128,31 +128,38 @@ fn collect(block: &[u8], with_cap: bool) -> Vec<BenchEntry> {
 fn bench(c: &mut Criterion) {
     let block = make_block();
     assert_eq!(walk_checked(&block), walk_arrayref(&block));
-    let mut g = c.benchmark_group("walk_header_read");
-    g.bench_function("checked", |b| {
-        b.iter(|| black_box(walk_checked(black_box(&block))))
-    });
-    g.bench_function("arrayref", |b| {
-        b.iter(|| black_box(walk_arrayref(black_box(&block))))
-    });
-    g.finish();
+    // Each group in its own scope: `BenchmarkGroup` has a significant `Drop` and
+    // clippy wants its lifetime to end at `finish()` rather than run on to the end
+    // of the function.
+    {
+        let mut g = c.benchmark_group("walk_header_read");
+        g.bench_function("checked", |b| {
+            b.iter(|| black_box(walk_checked(black_box(&block))));
+        });
+        g.bench_function("arrayref", |b| {
+            b.iter(|| black_box(walk_arrayref(black_box(&block))));
+        });
+        g.finish();
+    }
 
     // parse_dir_block collect: Vec::new vs with_capacity (isolated realloc delta).
     assert!(
         collect(&block, false) == collect(&block, true),
         "collect arms must agree"
     );
-    let mut g = c.benchmark_group("dir_collect");
-    g.bench_function("vecnew_a", |b| {
-        b.iter(|| black_box(collect(black_box(&block), false)))
-    });
-    g.bench_function("vecnew_b", |b| {
-        b.iter(|| black_box(collect(black_box(&block), false)))
-    });
-    g.bench_function("withcap", |b| {
-        b.iter(|| black_box(collect(black_box(&block), true)))
-    });
-    g.finish();
+    {
+        let mut g = c.benchmark_group("dir_collect");
+        g.bench_function("vecnew_a", |b| {
+            b.iter(|| black_box(collect(black_box(&block), false)));
+        });
+        g.bench_function("vecnew_b", |b| {
+            b.iter(|| black_box(collect(black_box(&block), false)));
+        });
+        g.bench_function("withcap", |b| {
+            b.iter(|| black_box(collect(black_box(&block), true)));
+        });
+        g.finish();
+    }
 }
 
 criterion_group!(benches, bench);

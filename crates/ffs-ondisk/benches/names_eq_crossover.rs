@@ -48,7 +48,9 @@ fn bench(c: &mut Criterion) {
     for (len, label) in sizes {
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..N)
             .map(|k| {
-                let v: Vec<u8> = (0..len).map(|i| b'a' + ((i + k) % 26) as u8).collect();
+                let v: Vec<u8> = (0..len)
+                    .map(|i| b'a' + u8::try_from((i + k) % 26).expect("(i + k) % 26 fits u8"))
+                    .collect();
                 (v.clone(), v)
             })
             .collect();
@@ -62,7 +64,7 @@ fn bench(c: &mut Criterion) {
                     bch.iter(|| {
                         let mut acc = 0usize;
                         for (a, b) in black_box(&pairs) {
-                            acc += $f(black_box(&a[..]), black_box(&b[..])) as usize;
+                            acc += usize::from($f(black_box(&a[..]), black_box(&b[..])));
                         }
                         black_box(acc)
                     })

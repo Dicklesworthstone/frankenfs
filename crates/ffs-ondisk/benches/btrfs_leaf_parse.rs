@@ -211,7 +211,10 @@ fn chunked_item_table_digest(block: &[u8]) -> u64 {
     let nritems = usize::try_from(read_u32_at(block, NRITEMS_OFFSET)).expect("nritems fits");
     let items_end = BTRFS_HEADER_SIZE + nritems * BTRFS_ITEM_SIZE;
     let mut digest = 0_u64;
-    for item in block[BTRFS_HEADER_SIZE..items_end].chunks_exact(BTRFS_ITEM_SIZE) {
+    for item in block[BTRFS_HEADER_SIZE..items_end]
+        .as_chunks::<BTRFS_ITEM_SIZE>()
+        .0
+    {
         digest = digest.rotate_left(7) ^ read_u64_at(item, 0);
         digest = digest.rotate_left(7) ^ u64::from(item[8]);
         digest = digest.rotate_left(7) ^ read_u64_at(item, 9);
@@ -239,7 +242,10 @@ fn chunked_key_ptr_table_digest(block: &[u8]) -> u64 {
     let nritems = usize::try_from(read_u32_at(block, NRITEMS_OFFSET)).expect("nritems fits");
     let table_end = BTRFS_HEADER_SIZE + nritems * BTRFS_KEY_PTR_SIZE;
     let mut digest = 0_u64;
-    for key_ptr in block[BTRFS_HEADER_SIZE..table_end].chunks_exact(BTRFS_KEY_PTR_SIZE) {
+    for key_ptr in block[BTRFS_HEADER_SIZE..table_end]
+        .as_chunks::<BTRFS_KEY_PTR_SIZE>()
+        .0
+    {
         digest = digest.rotate_left(7) ^ read_u64_at(key_ptr, 0);
         digest = digest.rotate_left(7) ^ u64::from(key_ptr[8]);
         digest = digest.rotate_left(7) ^ read_u64_at(key_ptr, 9);
@@ -253,7 +259,10 @@ fn normalize_offsets_with_conversion_inside(block: &[u8]) -> u64 {
     let nritems = usize::try_from(read_u32_at(block, NRITEMS_OFFSET)).expect("nritems fits");
     let items_end = BTRFS_HEADER_SIZE + nritems * BTRFS_ITEM_SIZE;
     let mut digest = 0_u64;
-    for item in block[BTRFS_HEADER_SIZE..items_end].chunks_exact(BTRFS_ITEM_SIZE) {
+    for item in block[BTRFS_HEADER_SIZE..items_end]
+        .as_chunks::<BTRFS_ITEM_SIZE>()
+        .0
+    {
         let header_size = u32::try_from(BTRFS_HEADER_SIZE).expect("header size fits");
         let absolute = read_u32_at(item, 17)
             .checked_add(header_size)
@@ -268,7 +277,10 @@ fn normalize_offsets_with_conversion_hoisted(block: &[u8]) -> u64 {
     let items_end = BTRFS_HEADER_SIZE + nritems * BTRFS_ITEM_SIZE;
     let header_size = u32::try_from(BTRFS_HEADER_SIZE).expect("header size fits");
     let mut digest = 0_u64;
-    for item in block[BTRFS_HEADER_SIZE..items_end].chunks_exact(BTRFS_ITEM_SIZE) {
+    for item in block[BTRFS_HEADER_SIZE..items_end]
+        .as_chunks::<BTRFS_ITEM_SIZE>()
+        .0
+    {
         let absolute = read_u32_at(item, 17)
             .checked_add(header_size)
             .expect("fixture offset fits");

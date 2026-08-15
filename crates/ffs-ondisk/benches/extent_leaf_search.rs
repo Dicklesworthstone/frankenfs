@@ -45,6 +45,11 @@ fn resolve_depth1(index: &[(u32, u32)], leaf: &[(u32, u32)], target: u32) -> Opt
 // `Vec`, so `.take()` + store-back moves that owned enum out of the array and back
 // on every block, purely for the borrow checker (the leaf recursion never touches
 // `cache`). The lever borrows the leaf in place instead. Both are byte-identical.
+/// Models the parsed on-disk extent header. The fields are never read by these
+/// benches on purpose — the point is that the ORIG arm PARSES them per block
+/// while the lever does not, so removing them would delete the very work being
+/// measured. Same reasoning as `Tree::Index` below (bd-3ao0l).
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Hdr {
     magic: u16,
@@ -76,10 +81,10 @@ fn take_store(slot: &mut Slot, key: u64, target: u32) -> Option<usize> {
     r
 }
 fn borrow_in_place(slot: &Slot, key: u64, target: u32) -> Option<usize> {
-    if let Some((lb, _, Tree::Leaf(exts))) = slot {
-        if *lb == key {
-            return binary(exts, target);
-        }
+    if let Some((lb, _, Tree::Leaf(exts))) = slot
+        && *lb == key
+    {
+        return binary(exts, target);
     }
     None
 }
@@ -120,7 +125,7 @@ fn hint_seq(exts: &[(u32, u32)], total: u32) -> u64 {
     }
     acc
 }
-fn bench(c: &mut Criterion) {
+fn bench_search_cases(c: &mut Criterion) {
     // COMMON case first (e=1,2,4 with a FIRST-extent hit = linear's best case, and
     // the overwhelmingly common shape for real files), then the worst case the
     // original bench covered. `extent_leaf_lookup` runs per resolved block on EVERY
@@ -146,18 +151,22 @@ fn bench(c: &mut Criterion) {
         // NULL CONTROL: identical arm registered twice — its ratio is the noise
         // floor; any linear-vs-binary gap smaller than binary-vs-binary is noise.
         g.bench_function("binary_a", |b| {
-            b.iter(|| black_box(binary(black_box(&exts), black_box(target))))
+            b.iter(|| black_box(binary(black_box(&exts), black_box(target))));
         });
         g.bench_function("binary_b", |b| {
-            b.iter(|| black_box(binary(black_box(&exts), black_box(target))))
+            b.iter(|| black_box(binary(black_box(&exts), black_box(target))));
         });
         g.bench_function("linear", |b| {
-            b.iter(|| black_box(linear(black_box(&exts), black_box(target))))
+            b.iter(|| black_box(linear(black_box(&exts), black_box(target))));
         });
         g.finish();
     }
-    // Full depth-1 per-block resolution (index choose + leaf lookup) on a cache
-    // hit: the ENTIRE ffs-ondisk CPU budget for resolving one logical block.
+}
+
+/// Full depth-1 per-block resolution (index choose + leaf lookup) on a cache
+/// hit: the ENTIRE ffs-ondisk CPU budget for resolving one logical block.
+fn bench_resolve_vs_copy(c: &mut Criterion) {
+    // Compared against a warm 4 KiB block copy (the layer above) to show
     // Compared against a warm 4 KiB block copy (the layer above) to show
     // resolution is a small fraction of the read. index=256 children, leaf=256
     // extents (a heavily fragmented file — worst case for resolution cost).
@@ -174,7 +183,7 @@ fn bench(c: &mut Criterion) {
                 black_box(&leaf),
                 black_box(target),
             ))
-        })
+        });
     });
     g.bench_function("resolve_depth1_b", |b| {
         b.iter(|| {
@@ -183,18 +192,20 @@ fn bench(c: &mut Criterion) {
                 black_box(&leaf),
                 black_box(target),
             ))
-        })
+        });
     });
     g.bench_function("copy_4k_block", |b| {
         b.iter(|| {
             buf.copy_from_slice(black_box(&src));
             black_box(buf[0])
-        })
+        });
     });
     g.finish();
+}
 
-    // The extent-cache lever: take/store (current) vs borrow-in-place (candidate)
-    // on the depth-1 cache-HIT path. leaf=256 extents. Arms proven identical.
+/// The extent-cache lever: take/store (current) vs borrow-in-place (candidate)
+/// on the depth-1 cache-HIT path. leaf=256 extents. Arms proven identical.
+fn bench_cache_hit(c: &mut Criterion) {
     let key = 42u64;
     let hdr = Hdr {
         magic: 0xf30a,
@@ -219,7 +230,7 @@ fn bench(c: &mut Criterion) {
                 black_box(key),
                 black_box(tgt),
             ))
-        })
+        });
     });
     g.bench_function("take_store_b", |b| {
         b.iter(|| {
@@ -228,7 +239,7 @@ fn bench(c: &mut Criterion) {
                 black_box(key),
                 black_box(tgt),
             ))
-        })
+        });
     });
     g.bench_function("borrow_in_place", |b| {
         b.iter(|| {
@@ -237,13 +248,15 @@ fn bench(c: &mut Criterion) {
                 black_box(key),
                 black_box(tgt),
             ))
-        })
+        });
     });
     g.finish();
+}
 
-    // Sequential whole-file resolution: binary-per-block vs last-hit-hint. Files
-    // with E extents each covering 4 blocks, read block-by-block in order (the
-    // read engine's pattern). Arms proven identical over the full sweep.
+/// Sequential whole-file resolution: binary-per-block vs last-hit-hint. Files
+/// with E extents each covering 4 blocks, read block-by-block in order (the
+/// read engine's pattern). Arms proven identical over the full sweep.
+fn bench_resolve_seq(c: &mut Criterion) {
     for e in [1u32, 4, 64, 256] {
         let exts = make(e);
         let total = e * 4;
@@ -254,16 +267,28 @@ fn bench(c: &mut Criterion) {
         );
         let mut g = c.benchmark_group(format!("extent_resolve_seq_e{e}"));
         g.bench_function("binary_seq_a", |b| {
-            b.iter(|| black_box(binary_seq(black_box(&exts), black_box(total))))
+            b.iter(|| black_box(binary_seq(black_box(&exts), black_box(total))));
         });
         g.bench_function("binary_seq_b", |b| {
-            b.iter(|| black_box(binary_seq(black_box(&exts), black_box(total))))
+            b.iter(|| black_box(binary_seq(black_box(&exts), black_box(total))));
         });
         g.bench_function("hint_seq", |b| {
-            b.iter(|| black_box(hint_seq(black_box(&exts), black_box(total))))
+            b.iter(|| black_box(hint_seq(black_box(&exts), black_box(total))));
         });
         g.finish();
     }
 }
+
+/// Split into one function per group (bd-3ao0l): each `BenchmarkGroup` ends at
+/// its own `finish()` instead of living to the end of a 123-line `bench`, which
+/// is what `significant_drop_tightening` and `too_many_lines` were both pointing
+/// at. The four sections already had independent fixtures.
+fn bench(c: &mut Criterion) {
+    bench_search_cases(c);
+    bench_resolve_vs_copy(c);
+    bench_cache_hit(c);
+    bench_resolve_seq(c);
+}
+
 criterion_group!(benches, bench);
 criterion_main!(benches);

@@ -22,10 +22,10 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("dx_hash_transform");
     g.bench_function("short_13", |b| {
-        b.iter(|| black_box(dx_hash(1, black_box(&short[..]), black_box(&seed))))
+        b.iter(|| black_box(dx_hash(1, black_box(&short[..]), black_box(&seed))));
     });
     g.bench_function("long_40", |b| {
-        b.iter(|| black_box(dx_hash(1, black_box(&long[..]), black_box(&seed))))
+        b.iter(|| black_box(dx_hash(1, black_box(&long[..]), black_box(&seed))));
     });
     g.finish();
 }

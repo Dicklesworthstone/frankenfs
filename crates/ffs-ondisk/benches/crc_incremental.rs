@@ -43,7 +43,7 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("crc_bitmap_update");
     g.bench_function("full_recompute", |b| {
-        b.iter(|| black_box(crc32c::crc32c(black_box(&bitmap))))
+        b.iter(|| black_box(crc32c::crc32c(black_box(&bitmap))));
     });
     g.bench_function("incremental_8b", |b| {
         b.iter(|| {
@@ -52,7 +52,7 @@ fn bench(c: &mut Criterion) {
                 black_box(&delta),
                 black_box(suffix),
             ))
-        })
+        });
     });
     g.bench_function("incremental_128b", |b| {
         b.iter(|| {
@@ -61,7 +61,7 @@ fn bench(c: &mut Criterion) {
                 black_box(&delta2),
                 black_box(suffix2),
             ))
-        })
+        });
     });
     g.bench_function("incremental_avg_offsets", |b| {
         b.iter(|| {
@@ -70,7 +70,7 @@ fn bench(c: &mut Criterion) {
                 acc ^= crc32c_update_region(black_box(old_crc), black_box(&delta), black_box(s));
             }
             black_box(acc)
-        })
+        });
     });
     g.bench_function("incremental_worstcase", |b| {
         b.iter(|| {
@@ -79,7 +79,7 @@ fn bench(c: &mut Criterion) {
                 black_box(&delta),
                 black_box(worst_suffix),
             ))
-        })
+        });
     });
     g.finish();
 }

@@ -21,7 +21,10 @@ fn make_inode() -> [u8; 256] {
     b[128..130].copy_from_slice(&32u16.to_le_bytes()); // i_extra_isize = 32
     // Fill the ibody region [160..256] with non-zero bytes (no xattr magic).
     for (i, x) in b[160..256].iter_mut().enumerate() {
-        *x = (i as u8).wrapping_mul(7).wrapping_add(1);
+        *x = u8::try_from(i % 256)
+            .expect("i % 256 fits u8")
+            .wrapping_mul(7)
+            .wrapping_add(1);
     }
     b
 }
@@ -59,13 +62,13 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("inode_parse");
     g.bench_function("full", |b| {
-        b.iter(|| black_box(Ext4Inode::parse_from_bytes(black_box(&buf)).unwrap()))
+        b.iter(|| black_box(Ext4Inode::parse_from_bytes(black_box(&buf)).unwrap()));
     });
     g.bench_function("metadata", |b| {
-        b.iter(|| black_box(Ext4Inode::parse_metadata_from_bytes(black_box(&buf)).unwrap()))
+        b.iter(|| black_box(Ext4Inode::parse_metadata_from_bytes(black_box(&buf)).unwrap()));
     });
     g.bench_function("attr", |b| {
-        b.iter(|| black_box(Ext4Inode::parse_attr_from_bytes(black_box(&buf)).unwrap()))
+        b.iter(|| black_box(Ext4Inode::parse_attr_from_bytes(black_box(&buf)).unwrap()));
     });
     g.finish();
 }
