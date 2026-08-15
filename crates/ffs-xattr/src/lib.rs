@@ -222,18 +222,27 @@ fn build_inline_ibody_for_inode_state(
     Ok(out)
 }
 
+/// Borrowed-slice wrapper: clones to get a sortable owned `Vec`.
+///
+/// `#[cfg(test)]` because it has no production callers left (bd-3ao0l found it via
+/// clippy's `dead_code`). All four owning setxattr/removexattr callers moved to
+/// `build_external_block_owned` to skip this deep clone, which is the whole point
+/// of that split. It is kept, rather than removed, as the REFERENCE
+/// implementation the owned variant is differentially tested against — the owned
+/// one is a perf lever whose claim of byte-identical output was otherwise
+/// unverified.
+#[cfg(test)]
 fn build_external_block(block_len: usize, entries: &[Ext4Xattr]) -> Result<Vec<u8>> {
-    // Borrowed-slice wrapper (test / non-owning callers): clone to get a sortable
-    // owned Vec. The owning production callers use `build_external_block_owned`
-    // directly and skip this clone.
     build_external_block_owned(block_len, entries.to_vec())
 }
 
-/// Owned-entries variant of [`build_external_block`]: sorts the caller's Vec IN
-/// PLACE (no `entries.to_vec()` deep clone of every name+value) before encoding.
-/// The four production setxattr/removexattr callers own their `external_entries`
-/// and do not reuse it, so they hand it over here. Byte-identical output to
-/// `build_external_block` — same sort key, same encoding.
+/// Owned-entries variant: sorts the caller's `Vec` IN PLACE before encoding.
+///
+/// No `entries.to_vec()` deep clone of every name+value. The four production
+/// setxattr/removexattr callers own their `external_entries` and do not reuse it,
+/// so they hand it over here. Byte-identical output to the borrowed
+/// `build_external_block` wrapper — same sort key, same encoding — which
+/// `build_external_block_matches_the_owned_variant_byte_for_byte` verifies.
 fn build_external_block_owned(block_len: usize, mut entries: Vec<Ext4Xattr>) -> Result<Vec<u8>> {
     if block_len < EXTERNAL_HEADER_LEN {
         return Err(FfsError::Format(
@@ -697,13 +706,12 @@ pub fn xattr_exists_for_access(
         ));
     }
 
-    if let Some(block) = external_block {
-        if ffs_ondisk::find_xattr_block_value_by_name(block, full_name)
+    if let Some(block) = external_block
+        && ffs_ondisk::find_xattr_block_value_by_name(block, full_name)
             .map_err(|err| parse_to_ffs(&err))?
             .is_some()
-        {
-            return Ok(true);
-        }
+    {
+        return Ok(true);
     }
 
     Ok(false)
@@ -712,6 +720,84 @@ pub fn xattr_exists_for_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `build_external_block_owned`'s doc claims it produces "Byte-identical
+    /// output to `build_external_block` — same sort key, same encoding". Nothing
+    /// verified that, and the borrowed wrapper had drifted to zero callers, which
+    /// is how clippy's `dead_code` found it (bd-3ao0l).
+    ///
+    /// Keeping the wrapper and PROVING the claim is better than deleting it: the
+    /// owned variant exists purely as a perf lever (it sorts in place instead of
+    /// deep-cloning every name and value), and a lever whose equivalence to the
+    /// obvious implementation is unproven is exactly the kind of thing this
+    /// campaign is supposed to catch.
+    ///
+    /// Entries are supplied deliberately OUT OF ORDER and with names that collide
+    /// on length but not on bytes, so a divergent sort key would show up as a
+    /// different encoding rather than an identical one.
+    #[test]
+    fn build_external_block_matches_the_owned_variant_byte_for_byte() {
+        let entries = vec![
+            Ext4Xattr {
+                name_index: 1,
+                name: b"zulu".to_vec(),
+                value: b"third".to_vec(),
+            },
+            Ext4Xattr {
+                name_index: 1,
+                name: b"alfa".to_vec(),
+                value: b"first-value".to_vec(),
+            },
+            Ext4Xattr {
+                name_index: 7,
+                name: b"alfa".to_vec(),
+                value: b"same-name-other-index".to_vec(),
+            },
+            Ext4Xattr {
+                name_index: 1,
+                name: b"mike".to_vec(),
+                value: Vec::new(),
+            },
+        ];
+
+        for block_len in [256_usize, 1024, 4096] {
+            let borrowed = build_external_block(block_len, &entries)
+                .expect("borrowed variant encodes the block");
+            let owned = build_external_block_owned(block_len, entries.clone())
+                .expect("owned variant encodes the block");
+            assert_eq!(
+                borrowed, owned,
+                "the two encoders must agree byte-for-byte at block_len {block_len}"
+            );
+            assert_eq!(borrowed.len(), block_len, "encoded block fills block_len");
+        }
+    }
+
+    /// The borrowed wrapper must not mutate the caller's slice. It clones before
+    /// sorting; the owned variant sorts in place, which is the whole point of the
+    /// split, so a wrapper that accidentally sorted through the borrow would be a
+    /// silent aliasing bug for every non-owning caller.
+    #[test]
+    fn build_external_block_leaves_the_callers_entries_untouched() {
+        let entries = vec![
+            Ext4Xattr {
+                name_index: 1,
+                name: b"zulu".to_vec(),
+                value: b"z".to_vec(),
+            },
+            Ext4Xattr {
+                name_index: 1,
+                name: b"alfa".to_vec(),
+                value: b"a".to_vec(),
+            },
+        ];
+        let before = entries.clone();
+        let _ = build_external_block(1024, &entries).expect("encodes");
+        assert_eq!(
+            entries, before,
+            "the borrowed wrapper must clone, never sort the caller's slice"
+        );
+    }
 
     fn make_inode(ibody_len: usize) -> Ext4Inode {
         Ext4Inode {

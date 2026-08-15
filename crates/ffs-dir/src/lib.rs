@@ -153,7 +153,7 @@ fn validate_reserved_tail(block_len: usize, reserved_tail: usize) -> Result<usiz
                 "directory reserved tail must be 0 or at least 12 bytes".to_owned(),
             ));
         }
-        if reserved_tail % 4 != 0 {
+        if !reserved_tail.is_multiple_of(4) {
             return Err(FfsError::Format(
                 "directory reserved tail must be 4-byte aligned".to_owned(),
             ));
@@ -220,13 +220,13 @@ fn write_entry(
     // Reslice the header to a fixed-size array ref once (a single check, no
     // copy) and write the fields at const offsets through it (1.16x, bench
     // `entry_header_write`). Byte-identical to the 4 checked writes.
-    let header: &mut [u8; DIR_ENTRY_HEADER_LEN] =
-        (&mut block[offset..offset + DIR_ENTRY_HEADER_LEN])
-            .try_into()
-            .map_err(|_| FfsError::Corruption {
-                block: 0,
-                detail: "directory entry header slice".to_owned(),
-            })?;
+    let header: &mut [u8; DIR_ENTRY_HEADER_LEN] = (&mut block
+        [offset..offset + DIR_ENTRY_HEADER_LEN])
+        .try_into()
+        .map_err(|_| FfsError::Corruption {
+            block: 0,
+            detail: "directory entry header slice".to_owned(),
+        })?;
     header[0..4].copy_from_slice(&ino.to_le_bytes());
     header[4..6].copy_from_slice(&rec_len_u16.to_le_bytes());
     header[6] = name_len_u8;
@@ -240,9 +240,10 @@ fn write_entry(
     Ok(())
 }
 
-/// Largest changed-span (bytes) for which an *incremental* dir-block checksum
-/// update ([`ffs_ondisk::stamp_dir_block_checksum_incremental`]) beats a full
-/// ~4 KiB CRC recompute. Above this the caller must full-recompute.
+/// Largest changed-span (bytes) worth an *incremental* dir-block checksum update.
+///
+/// Above this span, [`ffs_ondisk::stamp_dir_block_checksum_incremental`] no
+/// longer beats a full ~4 KiB CRC recompute and the caller must full-recompute.
 ///
 /// An insert into a near-full block splits a small slack, so the changed span is
 /// ~one entry (tens of bytes) — well under this — capturing the common
@@ -287,10 +288,11 @@ pub fn add_entry(
     add_entry_tracked(block, ino, name, file_type, reserved_tail).map(|(off, _)| off)
 }
 
-/// Like [`add_entry`], but also returns an optional [`DirBlockEdit`] describing
-/// the changed byte span, so a `metadata_csum` caller can update the dir-block
-/// checksum tail *incrementally* instead of re-CRCing the whole block. The edit
-/// is `Some` only when the change span is small enough to win
+/// Like [`add_entry`], but also returns an optional [`DirBlockEdit`].
+///
+/// The edit describes the changed byte span, so a `metadata_csum` caller can
+/// update the dir-block checksum tail *incrementally* instead of re-CRCing the
+/// whole block. It is `Some` only when the change span is small enough to win
 /// ([`INCREMENTAL_DIR_CSUM_MAX_SPAN`]) — an insert into a near-empty block
 /// (huge slack + zero-fill) returns `None`, telling the caller to full-recompute.
 pub fn add_entry_tracked(
@@ -492,14 +494,35 @@ pub fn add_entry_reject_existing(
     file_type: Ext4FileType,
     reserved_tail: usize,
 ) -> Result<usize> {
-    add_entry_reject_existing_tracked(block, ino, name, file_type, reserved_tail).map(|(off, _)| off)
+    add_entry_reject_existing_tracked(block, ino, name, file_type, reserved_tail)
+        .map(|(off, _)| off)
+}
+
+/// First fitting slot for a new directory entry.
+///
+/// Recorded during the single scan of [`add_entry_reject_existing_tracked`] and
+/// applied only once the whole block is confirmed free of a live duplicate. Kept
+/// at module scope rather than inside that function because an item declared
+/// after statements reads as if it came into existence at that point, when it is
+/// in fact in scope from the start of the block.
+enum Slot {
+    Tombstone {
+        off: usize,
+        rec_len: usize,
+    },
+    Split {
+        off: usize,
+        actual: usize,
+        slack: usize,
+    },
 }
 
 /// Like [`add_entry_reject_existing`], but also returns an optional
-/// [`DirBlockEdit`] describing the changed byte span for an incremental
-/// `metadata_csum` tail update (see [`add_entry_tracked`]). The edit is `Some`
-/// only when the change span is small enough to win
-/// ([`INCREMENTAL_DIR_CSUM_MAX_SPAN`]).
+/// [`DirBlockEdit`] describing the changed byte span.
+///
+/// The span drives an incremental `metadata_csum` tail update (see
+/// [`add_entry_tracked`]). The edit is `Some` only when the change span is small
+/// enough to win ([`INCREMENTAL_DIR_CSUM_MAX_SPAN`]).
 pub fn add_entry_reject_existing_tracked(
     block: &mut [u8],
     ino: u32,
@@ -530,12 +553,6 @@ pub fn add_entry_reject_existing_tracked(
         return Err(FfsError::NoSpace);
     }
 
-    // First fitting slot, recorded during the scan and applied only once the
-    // whole block is confirmed free of a live duplicate.
-    enum Slot {
-        Tombstone { off: usize, rec_len: usize },
-        Split { off: usize, actual: usize, slack: usize },
-    }
     let mut slot: Option<Slot> = None;
 
     let mut off = 0usize;
@@ -683,12 +700,13 @@ pub fn remove_entry(block: &mut [u8], name: &[u8], reserved_tail: usize) -> Resu
     Ok(remove_entry_take_inode(block, name, reserved_tail)?.is_some())
 }
 
-/// Like [`remove_entry`], but on success returns the inode number of the entry
-/// that was removed (the value read from the matched dirent's `inode` field)
-/// instead of just a found/not-found bool. Lets a caller that needs the child
-/// inode — e.g. `unlink`/`rmdir`, which otherwise does a separate positive
-/// `lookup_name` (a second htree descent + leaf read + scan) just to learn it —
-/// collapse "find the child" and "remove the entry" into one descent + scan.
+/// Like [`remove_entry`], but returns the removed entry's inode number.
+///
+/// The value is read from the matched dirent's `inode` field, instead of just a
+/// found/not-found bool. This lets a caller that needs the child inode — e.g.
+/// `unlink`/`rmdir`, which otherwise does a separate positive `lookup_name` (a
+/// second htree descent + leaf read + scan) just to learn it — collapse "find the
+/// child" and "remove the entry" into one descent + scan.
 pub fn remove_entry_take_inode(
     block: &mut [u8],
     name: &[u8],
@@ -697,9 +715,10 @@ pub fn remove_entry_take_inode(
     Ok(remove_entry_take_inode_tracked(block, name, reserved_tail)?.map(|(ino, _)| ino))
 }
 
-/// Like [`remove_entry_take_inode`], but also returns a [`DirBlockEdit`]
-/// describing the exact byte span the removal changed, so a `metadata_csum`
-/// caller can update the dir-block checksum tail incrementally
+/// Like [`remove_entry_take_inode`], but also returns a [`DirBlockEdit`].
+///
+/// The edit describes the exact byte span the removal changed, so a
+/// `metadata_csum` caller can update the dir-block checksum tail incrementally
 /// ([`ffs_ondisk::stamp_dir_block_checksum_incremental`]) rather than re-CRCing
 /// the whole block. The removal touches at most two small disjoint fields (the
 /// predecessor's `rec_len` and the removed entry's 8-byte header), so the
@@ -786,10 +805,7 @@ pub fn remove_entry_take_inode_tracked(
             // and this entry's 8-byte header at `off`. `prev_off < off` (forward
             // scan), so the enclosing span is `[region_start, off + 8)`; the
             // untouched interior bytes yield a zero delta.
-            let region_start = match prev_off_opt {
-                Some(prev_off) => prev_off + 4,
-                None => off,
-            };
+            let region_start = prev_off_opt.map_or(off, |prev_off| prev_off + 4);
             let region_end = off + DIR_ENTRY_HEADER_LEN;
             let old_bytes = block[region_start..region_end].to_vec();
 
@@ -1506,7 +1522,11 @@ mod tests {
         // Invariant: always a multiple of 4 and large enough for header + name.
         for name_len in 0..=255usize {
             let r = required_rec_len(name_len);
-            assert_eq!(r % 4, 0, "rec_len must be 4-byte aligned (name_len {name_len})");
+            assert_eq!(
+                r % 4,
+                0,
+                "rec_len must be 4-byte aligned (name_len {name_len})"
+            );
             assert!(
                 r >= DIR_ENTRY_HEADER_LEN + name_len,
                 "rec_len must fit header + name (name_len {name_len})"
@@ -1754,7 +1774,10 @@ mod tests {
         let before2 = node2.clone();
         let err = add_entry(&mut node2, 42, b"new", Ext4FileType::RegFile, 0).unwrap_err();
         assert!(matches!(err, FfsError::NoSpace), "got {err:?}");
-        assert_eq!(node2, before2, "non-csum dx_node must not be reused as a deleted slot");
+        assert_eq!(
+            node2, before2,
+            "non-csum dx_node must not be reused as a deleted slot"
+        );
     }
 
     #[test]
@@ -2717,10 +2740,10 @@ mod tests {
             }
             // Optionally create a leading tombstone by removing the first added
             // entry, exercising the tombstone-reuse branch.
-            if reuse_tombstone {
-                if let Some(first) = preload.iter().find(|n| **n != new_name) {
-                    let _ = remove_entry(&mut block, first, reserved_tail);
-                }
+            if reuse_tombstone
+                && let Some(first) = preload.iter().find(|n| **n != new_name)
+            {
+                let _ = remove_entry(&mut block, first, reserved_tail);
             }
 
             // Stamp the pre-insert block fully (the on-disk starting state).
