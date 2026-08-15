@@ -7,9 +7,18 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# bd-bhh0i step 5: per-group ext4 allocator lock decomposition. Default OFF —
-# production keeps the single alloc `RwLock` (byte-identical). Enabling it
-# compiles the `sharded_alloc` primitive + its tests so the decomposition can be
+# bd-bhh0i step 5: per-group ext4 allocator lock decomposition.
+#
+# TWO SEPARATE SWITCHES, and conflating them is how bd-y2t0r's readers got the
+# wrong answer from either file alone:
+#   COMPILE-TIME (this feature)  — OFF for this crate on its own, ON via
+#       ffs-cli's `default`, so the shipped binary CONTAINS the sharded path.
+#   RUNTIME (`FFS_BHH0I_SHARDED`) — OFF unless explicitly set to 1. This is what
+#       decides whether a mount actually uses it, and it is the switch bd-pbyu0
+#       turned off. `sharded_create_enabled_from_env(None)` returns false.
+#
+# So: compiled in, not active by default. Enabling the feature also compiles the
+# `sharded_alloc` primitive + its tests so the decomposition can be
 # Loom/bench/cargo-validated remote-only before the (local-e2fsck-gated) cutover.
 bhh0i_sharded_alloc = ["ffs-alloc/bhh0i_sharded_alloc"]
 

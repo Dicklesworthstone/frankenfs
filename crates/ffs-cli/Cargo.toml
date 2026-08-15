@@ -33,9 +33,22 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [features]
-# The sharded allocator has passed the mounted parallel-create and offline e2fsck
-# gates. Ship it for writable ext4 mounts; `FFS_BHH0I_SHARDED=0` remains an
-# explicit operational rollback switch.
+# The sharded allocator is COMPILED IN by default but is NOT ACTIVE by default.
+#
+# This comment previously read "Ship it for writable ext4 mounts;
+# `FFS_BHH0I_SHARDED=0` remains an explicit operational rollback switch", which
+# says the opposite of what ships and is exactly the contradiction bd-y2t0r
+# flagged: ffs-core's own manifest says "Default OFF" and a reader of either file
+# alone draws the wrong conclusion.
+#
+# What is true after bd-pbyu0: the runtime switch is opt-IN, not opt-out.
+# `sharded_create_enabled_from_env(None)` returns false, so a mount uses the
+# single alloc `RwLock` unless started with `FFS_BHH0I_SHARDED=1`. bd-pbyu0
+# turned it off because delete credited the single-lock array while the
+# descriptor flush read the sharded snapshot, leaking one inode per delete.
+# The delete side has since landed and the mounted e2fsck probe passes
+# (bd-y2t0r); flipping the runtime default back on is a separate, still-open
+# decision that wants a measured parallel-metadata number behind it.
 default = ["bhh0i_sharded_alloc"]
 bhh0i_sharded_alloc = ["ffs-core/bhh0i_sharded_alloc", "ffs-fuse/bhh0i_sharded_alloc"]
 
