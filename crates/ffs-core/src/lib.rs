@@ -1643,10 +1643,13 @@ struct Ext4WriteExtentSnapshot {
 }
 
 struct BtrfsReadPlanIndex {
-    inodes: BTreeMap<u64, BtrfsInodeItem>,
-    extents: BTreeMap<u64, Arc<[(u64, BtrfsExtentData)]>>,
+    // These tables are only queried by inode number; their iteration order is
+    // never exposed. FxHashMap avoids the O(log n) lookup in the hot readdir /
+    // getattr path while `dir_items` below remains ordered for directory order.
+    inodes: rustc_hash::FxHashMap<u64, BtrfsInodeItem>,
+    extents: rustc_hash::FxHashMap<u64, Arc<[(u64, BtrfsExtentData)]>>,
     dir_items: BTreeMap<u64, Arc<[(BtrfsKey, Vec<u8>)]>>,
-    parents: BTreeMap<u64, u64>,
+    parents: rustc_hash::FxHashMap<u64, u64>,
 }
 
 /// Opaque per-directory validation token: the directory inode's change-time and
@@ -10584,10 +10587,11 @@ impl OpenFs {
 
     fn build_btrfs_read_plan_index(&self, cx: &Cx) -> ffs_error::Result<Arc<BtrfsReadPlanIndex>> {
         let items = self.walk_btrfs_fs_tree(cx)?;
-        let mut inodes = BTreeMap::new();
-        let mut extents: BTreeMap<u64, Vec<(u64, BtrfsExtentData)>> = BTreeMap::new();
+        let mut inodes = rustc_hash::FxHashMap::default();
+        let mut extents: rustc_hash::FxHashMap<u64, Vec<(u64, BtrfsExtentData)>> =
+            rustc_hash::FxHashMap::default();
         let mut dir_items: BTreeMap<u64, Vec<(BtrfsKey, Vec<u8>)>> = BTreeMap::new();
-        let mut parents = BTreeMap::new();
+        let mut parents = rustc_hash::FxHashMap::default();
 
         for item in items {
             match item.key.item_type {
@@ -46276,6 +46280,7 @@ mod tests {
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
         let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert!(fs.prewarm_btrfs_read_plan_index(&cx).unwrap());
 
         let ops: &dyn FsOps = &fs;
         let attr = ops
@@ -50793,6 +50798,7 @@ mod tests {
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
         let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert!(fs.prewarm_btrfs_read_plan_index(&cx).unwrap());
 
         let ops: &dyn FsOps = &fs;
         let result = ops
