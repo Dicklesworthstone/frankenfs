@@ -106,7 +106,31 @@ case "$CARGO" in
     exit 1
     ;;
 esac
+# Every other tool the build shells out to (rustc, rustdoc) is otherwise
+# resolved from PATH, where it is a RUSTUP PROXY, not a binary. That proxy
+# re-resolves the toolchain on every invocation, so a concurrent `rustup` run
+# anywhere on this shared box can change what "rustc" means in the middle of a
+# build. Observed 2026-08-15, in one run:
+#
+#   error[E0514]: found crate `thiserror` compiled by an incompatible version of rustc
+#   info: rolling back changes
+#   error: failed to install component: 'rust-docs-x86_64-unknown-linux-gnu',
+#          detected conflict: 'share/doc/rust/html'
+#
+# i.e. a component install by another agent failed and rolled back WHILE this
+# build was running, and the artifacts ended up compiled by two different rustcs.
+# rust-toolchain.toml already documents the same class of failure (a floating
+# `nightly` being restamped mid-build) as the reason the channel is pinned.
+#
+# Pinning the toolchain's own bin directory ahead of PATH and setting RUSTC
+# explicitly takes rustup out of the loop entirely for the duration of the build.
+TOOLCHAIN_BIN="$(dirname "$CARGO")"
+if [ -x "$TOOLCHAIN_BIN/rustc" ]; then
+  export RUSTC="$TOOLCHAIN_BIN/rustc"
+  export PATH="$TOOLCHAIN_BIN:$PATH"
+fi
 echo ">> using cargo: $CARGO"
+echo ">> using rustc: ${RUSTC:-<PATH>} ($("${RUSTC:-rustc}" --version 2>/dev/null))"
 
 # Locate llvm-profdata (rustup component OR system).
 PROFDATA="$(find "${RUSTUP_HOME:-$HOME/.rustup}" -name llvm-profdata 2>/dev/null | head -1)"
