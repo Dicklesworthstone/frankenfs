@@ -156,7 +156,7 @@ fn bench(c: &mut Criterion) {
     // Fill with same-length names "cb_00000001".. (11 bytes each).
     let mut n = 3u32;
     loop {
-        let name = format!("cb_{:08}", n);
+        let name = format!("cb_{n:08}");
         if add_entry(
             &mut block,
             n,
@@ -183,74 +183,79 @@ fn bench(c: &mut Criterion) {
         "header-read variants diverged",
     );
 
-    let mut g = c.benchmark_group("dirent_dup_scan");
-    g.bench_function("slice_eq", |b| {
-        b.iter(|| {
-            black_box(scan(
-                black_box(&block),
-                black_box(miss),
-                reserved_tail,
-                |x, y| x == y,
-            ))
-        })
-    });
-    g.bench_function("swar", |b| {
-        b.iter(|| {
-            black_box(scan(
-                black_box(&block),
-                black_box(miss),
-                reserved_tail,
-                names_eq_swar,
-            ))
-        })
-    });
-    // Checked-read (production read_u16_le style) + SWAR vs direct-index + SWAR:
-    // isolates whether the Option-returning bounds-checked reads cost anything.
-    g.bench_function("swar_checked_read", |b| {
-        b.iter(|| {
-            black_box(scan_checked(
-                black_box(&block),
-                black_box(miss),
-                reserved_tail,
-                names_eq_swar,
-            ))
-        })
-    });
-    g.finish();
+    // Scoped so each group's significant `Drop` runs at `finish()` (bd-3ao0l).
+    {
+        let mut g = c.benchmark_group("dirent_dup_scan");
+        g.bench_function("slice_eq", |b| {
+            b.iter(|| {
+                black_box(scan(
+                    black_box(&block),
+                    black_box(miss),
+                    reserved_tail,
+                    |x, y| x == y,
+                ))
+            });
+        });
+        g.bench_function("swar", |b| {
+            b.iter(|| {
+                black_box(scan(
+                    black_box(&block),
+                    black_box(miss),
+                    reserved_tail,
+                    names_eq_swar,
+                ))
+            });
+        });
+        // Checked-read (production read_u16_le style) + SWAR vs direct-index + SWAR:
+        // isolates whether the Option-returning bounds-checked reads cost anything.
+        g.bench_function("swar_checked_read", |b| {
+            b.iter(|| {
+                black_box(scan_checked(
+                    black_box(&block),
+                    black_box(miss),
+                    reserved_tail,
+                    names_eq_swar,
+                ))
+            });
+        });
+        g.finish();
+    }
 
-    let mut header_group = c.benchmark_group("block_contains_header_arrayref_203");
-    header_group.sample_size(10);
-    header_group.bench_function("checked_control_a", |b| {
-        b.iter(|| {
-            black_box(scan_checked(
-                black_box(&block),
-                black_box(miss),
-                reserved_tail,
-                names_eq_swar,
-            ))
-        })
-    });
-    header_group.bench_function("arrayref_candidate", |b| {
-        b.iter(|| {
-            black_box(scan_arrayref(
-                black_box(&block),
-                black_box(miss),
-                reserved_tail,
-                names_eq_swar,
-            ))
-        })
-    });
-    header_group.bench_function("checked_control_b", |b| {
-        b.iter(|| {
-            black_box(scan_checked(
-                black_box(&block),
-                black_box(miss),
-                reserved_tail,
-                names_eq_swar,
-            ))
-        })
-    });
-    header_group.finish();
+    {
+        let mut header_group = c.benchmark_group("block_contains_header_arrayref_203");
+        header_group.sample_size(10);
+        header_group.bench_function("checked_control_a", |b| {
+            b.iter(|| {
+                black_box(scan_checked(
+                    black_box(&block),
+                    black_box(miss),
+                    reserved_tail,
+                    names_eq_swar,
+                ))
+            });
+        });
+        header_group.bench_function("arrayref_candidate", |b| {
+            b.iter(|| {
+                black_box(scan_arrayref(
+                    black_box(&block),
+                    black_box(miss),
+                    reserved_tail,
+                    names_eq_swar,
+                ))
+            });
+        });
+        header_group.bench_function("checked_control_b", |b| {
+            b.iter(|| {
+                black_box(scan_checked(
+                    black_box(&block),
+                    black_box(miss),
+                    reserved_tail,
+                    names_eq_swar,
+                ))
+            });
+        });
+        header_group.finish();
+    }
     eprintln!("leaf entries scanned per call: {entries}");
 }
 

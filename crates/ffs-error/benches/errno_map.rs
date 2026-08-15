@@ -12,6 +12,13 @@ use ffs_error::FfsError;
 use std::hint::black_box;
 use std::io::ErrorKind;
 
+// `match_same_arms` wants `InvalidFilename` folded into the
+// `InvalidInput | InvalidData` arm. Deliberately not done (bd-3ao0l): this
+// function is a FROZEN COPY of the pre-split production mapper and exists solely
+// to be the A arm this benchmark diffs production against. Tidying its shape
+// edits the reference, so the comparison would no longer be measuring what it
+// claims to. The equivalent arm in the live mapper is fair game; this one is not.
+#[allow(clippy::match_same_arms)]
 #[inline(never)]
 fn frozen_to_errno(error: &FfsError) -> libc::c_int {
     match error {
@@ -232,19 +239,24 @@ fn bench_errno_map(c: &mut Criterion) {
         "raw-errno digest changed"
     );
 
-    let mut group = c.benchmark_group("errno_map_common_direct_variants");
-    group.sample_size(10);
-    group.throughput(Throughput::Elements(direct_errors.len() as u64));
-    group.bench_function("frozen_full_mapper_a", |b| {
-        b.iter(|| black_box(frozen_catalog_digest(black_box(&direct_errors))));
-    });
-    group.bench_function("production", |b| {
-        b.iter(|| black_box(production_catalog_digest(black_box(&direct_errors))));
-    });
-    group.bench_function("frozen_full_mapper_b", |b| {
-        b.iter(|| black_box(frozen_catalog_digest(black_box(&direct_errors))));
-    });
-    group.finish();
+    // Scoped so the group's significant `Drop` runs at `finish()` (bd-3ao0l).
+    {
+        let mut group = c.benchmark_group("errno_map_common_direct_variants");
+        group.sample_size(10);
+        group.throughput(Throughput::Elements(
+            u64::try_from(direct_errors.len()).expect("catalog length fits u64"),
+        ));
+        group.bench_function("frozen_full_mapper_a", |b| {
+            b.iter(|| black_box(frozen_catalog_digest(black_box(&direct_errors))));
+        });
+        group.bench_function("production", |b| {
+            b.iter(|| black_box(production_catalog_digest(black_box(&direct_errors))));
+        });
+        group.bench_function("frozen_full_mapper_b", |b| {
+            b.iter(|| black_box(frozen_catalog_digest(black_box(&direct_errors))));
+        });
+        group.finish();
+    }
 
     let mut group = c.benchmark_group("errno_map_raw_os_errors_64");
     group.sample_size(10);

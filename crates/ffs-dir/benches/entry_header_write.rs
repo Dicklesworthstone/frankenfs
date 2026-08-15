@@ -15,15 +15,20 @@ const HDR: usize = 8;
 /// Production shape: 4 bounds-checked slice writes after the end<=len check.
 #[inline]
 fn checked(block: &mut [u8], off: usize, rec_len: usize, ino: u32, nl: u8, ft: u8) -> bool {
-    let end = match off.checked_add(rec_len) {
-        Some(e) => e,
-        None => return false,
+    let Some(end) = off.checked_add(rec_len) else {
+        return false;
     };
     if end > block.len() || rec_len < HDR {
         return false;
     }
+    // Validated WITH the other guards, not between the writes: both arms gain the
+    // identical check, so the A/B delta this bench measures is unchanged and the
+    // "4 bounds-checked slice writes" shape it is named for stays intact.
+    let Ok(rec_len_u16) = u16::try_from(rec_len) else {
+        return false;
+    };
     block[off..off + 4].copy_from_slice(&ino.to_le_bytes());
-    block[off + 4..off + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+    block[off + 4..off + 6].copy_from_slice(&rec_len_u16.to_le_bytes());
     block[off + 6] = nl;
     block[off + 7] = ft;
     true
@@ -32,18 +37,21 @@ fn checked(block: &mut [u8], off: usize, rec_len: usize, ino: u32, nl: u8, ft: u
 /// Array-ref reslice: one bounds check (`try_into`), then const-offset writes.
 #[inline]
 fn arrayref(block: &mut [u8], off: usize, rec_len: usize, ino: u32, nl: u8, ft: u8) -> bool {
-    let end = match off.checked_add(rec_len) {
-        Some(e) => e,
-        None => return false,
+    let Some(end) = off.checked_add(rec_len) else {
+        return false;
     };
     if end > block.len() || rec_len < HDR {
         return false;
     }
+    // Same placement as `checked` above, so the two arms stay symmetric.
+    let Ok(rec_len_u16) = u16::try_from(rec_len) else {
+        return false;
+    };
     let Ok(h) = <&mut [u8; 8]>::try_from(&mut block[off..off + 8]) else {
         return false;
     };
     h[0..4].copy_from_slice(&ino.to_le_bytes());
-    h[4..6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+    h[4..6].copy_from_slice(&rec_len_u16.to_le_bytes());
     h[6] = nl;
     h[7] = ft;
     true
@@ -69,8 +77,8 @@ fn bench(c: &mut Criterion) {
                 black_box(0x1234_5678),
                 11,
                 1,
-            ))
-        })
+            ));
+        });
     });
     g.bench_function("arrayref", |bch| {
         bch.iter(|| {
@@ -82,8 +90,8 @@ fn bench(c: &mut Criterion) {
                 black_box(0x1234_5678),
                 11,
                 1,
-            ))
-        })
+            ));
+        });
     });
     g.finish();
 }

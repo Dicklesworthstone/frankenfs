@@ -53,8 +53,8 @@ fn walk_checked(block: &[u8], limit: usize) -> u64 {
             break;
         }
         let ino = read_u32_le(block, off).unwrap();
-        let name_len = block[off + 6] as u64;
-        acc = acc.wrapping_add(ino as u64).wrapping_add(name_len);
+        let name_len = u64::from(block[off + 6]);
+        acc = acc.wrapping_add(u64::from(ino)).wrapping_add(name_len);
         off += rec_len;
     }
     acc
@@ -75,8 +75,8 @@ fn walk_arrayref(block: &[u8], limit: usize) -> u64 {
             break;
         }
         let ino = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
-        let name_len = h[6] as u64;
-        acc = acc.wrapping_add(ino as u64).wrapping_add(name_len);
+        let name_len = u64::from(h[6]);
+        acc = acc.wrapping_add(u64::from(ino)).wrapping_add(name_len);
         off += rec_len;
     }
     acc
@@ -90,10 +90,10 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("entry_header_read");
     g.bench_function("checked", |b| {
-        b.iter(|| black_box(walk_checked(black_box(&block), black_box(limit))))
+        b.iter(|| black_box(walk_checked(black_box(&block), black_box(limit))));
     });
     g.bench_function("arrayref", |b| {
-        b.iter(|| black_box(walk_arrayref(black_box(&block), black_box(limit))))
+        b.iter(|| black_box(walk_arrayref(black_box(&block), black_box(limit))));
     });
     g.finish();
 }
