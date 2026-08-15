@@ -81,6 +81,9 @@ crates/*/target/
 
 # Beads history snapshots
 .beads/.br_history/
+# Local FrankenSQLite WAL certification sidecars (machine-local, regenerated)
+.beads/*wal-cert
+.beads/*wal-cert-head
 
 # Ephemeral VFS operation test output (empty files from debug runs)
 /FsOps
