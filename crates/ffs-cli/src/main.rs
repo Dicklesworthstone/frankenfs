@@ -36,7 +36,7 @@ use cmd_repair::{
 
 use anyhow::{Context, Result, bail};
 use asupersync::{Cx, SystemPressure};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
 use ffs_btrfs::BtrfsInodeItem;
 #[cfg(test)]
@@ -1231,11 +1231,13 @@ enum Command {
         ///
         /// Kernel btrfs always verifies a datasum extent's crc32c before
         /// returning its bytes and reports EIO on a mismatch. FrankenFS has the
-        /// same check (`bd-tkv2n`) but it is off unless asked for, so by default
-        /// a mount returns whatever the device gave it. Turning this on trades
-        /// read throughput for that guarantee, and makes a read comparison
-        /// against kernel btrfs like-for-like.
-        #[arg(long = "btrfs-verify-data-on-read")]
+        /// same check (`bd-tkv2n`) is enabled by default. Pass an explicit
+        /// `false` only when measuring the cost of the kernel-parity check.
+        #[arg(
+            long = "btrfs-verify-data-on-read",
+            default_value_t = true,
+            action = ArgAction::Set
+        )]
         btrfs_verify_data_on_read: bool,
     },
     /// Run a read-only integrity scan (scrub) on a filesystem image.
@@ -13193,8 +13195,7 @@ mod tests {
     /// `OpenOptions` — no mount could reach it, so every mounted FrankenFS
     /// btrfs returned unverified bytes with no way to opt in. Both directions
     /// are asserted: the flag must reach `OpenOptions` when asked for, and must
-    /// stay off when not, since a mount that silently started verifying would
-    /// change what every banked read row measured.
+    /// stay configurable for a measured opt-out.
     #[test]
     fn build_mount_open_options_threads_btrfs_read_verification_both_ways() {
         let options = |verify: bool| MountCmdOptions {
@@ -13223,12 +13224,11 @@ mod tests {
         );
         assert!(
             !build_mount_open_options(&options(false)).btrfs_verify_data_on_read,
-            "a mount must not verify unless asked to"
+            "an explicit false must disable verification for measurement"
         );
         assert!(
-            !super::OpenOptions::default().btrfs_verify_data_on_read,
-            "the library default must stay off; flipping it silently would \
-             change what every banked read row measured"
+            super::OpenOptions::default().btrfs_verify_data_on_read,
+            "the library default must match the kernel integrity contract"
         );
     }
 
@@ -13606,6 +13606,22 @@ mod tests {
                 assert_eq!(writeback_cache_ordering_oracle, None);
                 assert_eq!(writeback_cache_crash_replay_oracle, None);
             }
+            other => assert!(
+                matches!(other, Command::Mount { .. }),
+                "expected mount command"
+            ),
+        }
+    }
+
+    #[test]
+    fn mount_btrfs_data_verification_defaults_to_kernel_parity() {
+        let cli = Cli::try_parse_from(["ffs", "mount", "/img", "/mnt"])
+            .expect("mount should parse with defaults");
+        match cli.command {
+            Command::Mount {
+                btrfs_verify_data_on_read,
+                ..
+            } => assert!(btrfs_verify_data_on_read),
             other => assert!(
                 matches!(other, Command::Mount { .. }),
                 "expected mount command"
