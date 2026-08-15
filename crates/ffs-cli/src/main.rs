@@ -7101,32 +7101,69 @@ fn worker_count_from_usize(worker_count: usize) -> u32 {
     u32::try_from(worker_count).unwrap_or(u32::MAX)
 }
 
+/// Build the shutdown observation for the per-core runtime.
+///
+/// The per-core block is emitted ONLY when the dispatcher actually routed
+/// requests (`bd-fuse-per-core-mount-dispatch-inert-qai4n`).
+///
+/// `mount_with_per_core_fuse` constructs a `PerCoreDispatcher` but hands
+/// `mount_managed` a plain `FsOps`, so no request is ever routed through it. The
+/// dispatcher's counters are therefore permanently zero, and reporting them as an
+/// observation is not merely useless, it is FALSE in the most misleading
+/// direction available: `AggregateMetrics::imbalance_ratio()` returns `1.0` when
+/// max and min are both zero, so an inert dispatcher reports PERFECT per-core load
+/// balance. A reader of this summary would conclude thread-per-core routing ran
+/// and distributed work evenly across every core.
+///
+/// A measurement that cannot have happened must not be published, so when the
+/// dispatcher observed no requests the block is `None`. That is honest about the
+/// only thing this runtime currently does, which is size the FUSE worker pool to
+/// the core count — a real effect, reported as `worker_count`.
+///
+/// This is deliberately a runtime check on the counters rather than a hardcoded
+/// `None`: the day routing is actually wired up, this function starts publishing
+/// real distributions with no further change, and the test below is what keeps it
+/// honest in the meantime.
 fn build_mount_per_core_shutdown_observation(
     metrics: ffs_fuse::MetricsSnapshot,
     worker_count: u32,
     aggregate: &ffs_fuse::per_core::AggregateMetrics,
 ) -> MountAdaptiveRuntimeShutdownObservation {
-    let per_core_distribution = aggregate
-        .per_core
-        .iter()
-        .enumerate()
-        .map(|(core_id, core)| MountAdaptiveRuntimeCoreRequestSummary {
-            core_id: u32::try_from(core_id).unwrap_or(u32::MAX),
-            requests: core.requests,
-            cache_hits: core.cache_hits,
-            cache_misses: core.cache_misses,
-        })
-        .collect();
-    MountAdaptiveRuntimeShutdownObservation {
-        metrics,
-        worker_count,
-        per_core: Some(MountAdaptiveRuntimePerCoreObservation {
+    let per_core = per_core_routing_observed(aggregate).then(|| {
+        let per_core_distribution = aggregate
+            .per_core
+            .iter()
+            .enumerate()
+            .map(|(core_id, core)| MountAdaptiveRuntimeCoreRequestSummary {
+                core_id: u32::try_from(core_id).unwrap_or(u32::MAX),
+                requests: core.requests,
+                cache_hits: core.cache_hits,
+                cache_misses: core.cache_misses,
+            })
+            .collect();
+        MountAdaptiveRuntimePerCoreObservation {
             total_cache_hits: aggregate.total_cache_hits,
             total_cache_misses: aggregate.total_cache_misses,
             imbalance_ratio: aggregate.imbalance_ratio(),
             per_core_distribution,
-        }),
+        }
+    });
+    MountAdaptiveRuntimeShutdownObservation {
+        metrics,
+        worker_count,
+        per_core,
     }
+}
+
+/// Did the per-core dispatcher actually see traffic?
+///
+/// The aggregate totals are the only evidence that requests were routed. Cache
+/// counters alone are not sufficient — a dispatcher can be consulted for cache
+/// placement without owning the request — so this keys on request counts, and on
+/// the per-core rows as well as the total so a future partial wiring cannot report
+/// a total without a distribution.
+fn per_core_routing_observed(aggregate: &ffs_fuse::per_core::AggregateMetrics) -> bool {
+    aggregate.total_requests > 0 || aggregate.per_core.iter().any(|core| core.requests > 0)
 }
 
 fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>) -> Result<()> {
@@ -7282,17 +7319,26 @@ fn emit_per_core_mount_console(
     started_at: std::time::SystemTime,
     shutdown_at: std::time::SystemTime,
 ) -> Result<()> {
-    let per_core: Vec<MountConsoleCore> = aggregate
-        .per_core
-        .iter()
-        .enumerate()
-        .map(|(core_id, core)| MountConsoleCore {
-            core_id: u32::try_from(core_id).unwrap_or(u32::MAX),
-            requests: core.requests,
-            cache_hits: core.cache_hits,
-            cache_misses: core.cache_misses,
-        })
-        .collect();
+    // Same rule as the shutdown observation: publish a per-core row only when the
+    // dispatcher actually routed something. An inert dispatcher would otherwise
+    // print one zeroed row per core, which reads as "routing ran, evenly, and did
+    // nothing" rather than "routing never happened"
+    // (bd-fuse-per-core-mount-dispatch-inert-qai4n).
+    let per_core: Vec<MountConsoleCore> = if per_core_routing_observed(aggregate) {
+        aggregate
+            .per_core
+            .iter()
+            .enumerate()
+            .map(|(core_id, core)| MountConsoleCore {
+                core_id: u32::try_from(core_id).unwrap_or(u32::MAX),
+                requests: core.requests,
+                cache_hits: core.cache_hits,
+                cache_misses: core.cache_misses,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     emit_mount_console(
         params.console,
         &mount_console_observation(
@@ -7361,16 +7407,30 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
     let mount_ended = std::time::SystemTime::now();
 
     let aggregate = dispatcher.aggregate_metrics();
-    debug!(
-        target: "ffs::cli::mount",
-        operation_id = params.operation_id,
-        scenario_id = params.scenario_id,
-        imbalance_ratio = aggregate.imbalance_ratio(),
-        total_requests = aggregate.total_requests,
-        total_cache_hits = aggregate.total_cache_hits,
-        total_cache_misses = aggregate.total_cache_misses,
-        "per_core_aggregate_metrics"
-    );
+    let routing_observed = per_core_routing_observed(&aggregate);
+    if routing_observed {
+        debug!(
+            target: "ffs::cli::mount",
+            operation_id = params.operation_id,
+            scenario_id = params.scenario_id,
+            imbalance_ratio = aggregate.imbalance_ratio(),
+            total_requests = aggregate.total_requests,
+            total_cache_hits = aggregate.total_cache_hits,
+            total_cache_misses = aggregate.total_cache_misses,
+            "per_core_aggregate_metrics"
+        );
+    } else {
+        // Do not log an imbalance ratio computed from an inert dispatcher: it is
+        // 1.0 by construction and reads as perfect balance
+        // (bd-fuse-per-core-mount-dispatch-inert-qai4n).
+        debug!(
+            target: "ffs::cli::mount",
+            operation_id = params.operation_id,
+            scenario_id = params.scenario_id,
+            total_requests = 0,
+            "per_core_dispatcher_routed_nothing"
+        );
+    }
 
     info!(
         target: "ffs::cli::mount",
@@ -7382,7 +7442,9 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
         requests_err = metrics.requests_err,
         bytes_read = metrics.bytes_read,
         num_cores = dispatcher.num_cores(),
-        imbalance_ratio = aggregate.imbalance_ratio(),
+        // `imbalance_ratio` is reported only when routing was observed; see
+        // bd-fuse-per-core-mount-dispatch-inert-qai4n.
+        per_core_routing_observed = routing_observed,
         "per_core_mount_shutdown_complete"
     );
 
@@ -9856,6 +9918,140 @@ mod tests {
                 ffs_core::BackpressureDecision::Proceed
             );
         });
+    }
+
+    /// A `MetricsSnapshot` describing a mount that genuinely served requests.
+    ///
+    /// The point of these tests is the DISAGREEMENT between this and the
+    /// dispatcher's own counters, so the mount-level numbers must be non-zero.
+    fn served_mount_metrics(requests_total: u64) -> ffs_fuse::MetricsSnapshot {
+        ffs_fuse::MetricsSnapshot {
+            requests_total,
+            requests_ok: requests_total,
+            requests_err: 0,
+            bytes_read: 4096,
+            metadata_requests: requests_total,
+            getattr_dispatch_count: 0,
+            getattr_dispatch_nanos: 0,
+            getxattr_dispatch_count: 0,
+            getxattr_dispatch_nanos: 0,
+            lookup_dispatch_count: 0,
+            lookup_dispatch_nanos: 0,
+            readdir_dispatch_count: 0,
+            readdir_dispatch_nanos: 0,
+            requests_throttled: 0,
+            requests_shed: 0,
+        }
+    }
+
+    fn per_core_aggregate(per_core_requests: &[u64]) -> ffs_fuse::per_core::AggregateMetrics {
+        ffs_fuse::per_core::AggregateMetrics {
+            total_requests: per_core_requests.iter().sum(),
+            total_pending_requests: 0,
+            total_cache_hits: 0,
+            total_cache_misses: 0,
+            aggregate_hit_rate: 0.0,
+            per_core: per_core_requests
+                .iter()
+                .map(|&requests| ffs_fuse::per_core::CoreMetricsSnapshot {
+                    requests,
+                    pending_requests: 0,
+                    cache_hits: 0,
+                    cache_misses: 0,
+                    stolen_from: 0,
+                    stolen_to: 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// PARENT-RED (bd-fuse-per-core-mount-dispatch-inert-qai4n).
+    ///
+    /// `mount_with_per_core_fuse` builds a `PerCoreDispatcher` and then hands
+    /// `mount_managed` a plain `FsOps`, so nothing is ever routed through it. This
+    /// is that exact shape: the mount served 2,000 requests, the dispatcher saw
+    /// none. Before the fix this published a per-core block anyway.
+    ///
+    /// It is the `imbalance_ratio` that makes this a correctness bug rather than a
+    /// cosmetic one: `AggregateMetrics::imbalance_ratio()` returns 1.0 when max and
+    /// min are both zero, so the inert dispatcher reported PERFECT load balance
+    /// across every core.
+    #[test]
+    fn per_core_observation_is_omitted_when_the_dispatcher_routed_nothing() {
+        let aggregate = per_core_aggregate(&[0, 0, 0, 0]);
+
+        // The misleading value this test exists to keep out of the summary.
+        assert!(
+            (aggregate.imbalance_ratio() - 1.0).abs() < f64::EPSILON,
+            "precondition: an inert dispatcher reports perfect balance, which is \
+             why publishing it is a falsehood and not merely noise"
+        );
+
+        let observation = super::build_mount_per_core_shutdown_observation(
+            served_mount_metrics(2000),
+            4,
+            &aggregate,
+        );
+
+        assert!(
+            observation.per_core.is_none(),
+            "a mount that served 2000 requests while the dispatcher routed 0 must \
+             publish NO per-core routing observation; publishing one claims a \
+             thread-per-core distribution that never happened"
+        );
+        assert_eq!(
+            observation.metrics.requests_total, 2000,
+            "the mount's own metrics are real and must still be reported"
+        );
+        assert_eq!(
+            observation.worker_count, 4,
+            "worker_count is the one thing this runtime really does control"
+        );
+    }
+
+    /// The negative case a naive fix fails: hardcoding `per_core: None` would pass
+    /// the test above and silently discard real data once routing is wired up.
+    #[test]
+    fn per_core_observation_is_published_when_the_dispatcher_did_route() {
+        let aggregate = per_core_aggregate(&[5, 8]);
+        let observation = super::build_mount_per_core_shutdown_observation(
+            served_mount_metrics(13),
+            2,
+            &aggregate,
+        );
+
+        let per_core = observation
+            .per_core
+            .expect("a dispatcher that routed requests must publish its distribution");
+        assert_eq!(per_core.per_core_distribution.len(), 2);
+        assert_eq!(per_core.per_core_distribution[0].requests, 5);
+        assert_eq!(per_core.per_core_distribution[1].requests, 8);
+        assert!(
+            (per_core.imbalance_ratio - 1.6).abs() < 1e-9,
+            "a real 8:5 split must report its real imbalance, not 1.0"
+        );
+    }
+
+    /// Partial wiring must not be able to report a total with no distribution, nor
+    /// a distribution with no total.
+    #[test]
+    fn per_core_routing_is_observed_from_either_total_or_distribution() {
+        assert!(
+            !super::per_core_routing_observed(&per_core_aggregate(&[0, 0])),
+            "all-zero counters mean no routing was observed"
+        );
+        assert!(
+            super::per_core_routing_observed(&per_core_aggregate(&[0, 1])),
+            "a single routed request on one core counts as routing"
+        );
+
+        let mut total_only = per_core_aggregate(&[0, 0]);
+        total_only.total_requests = 7;
+        assert!(
+            super::per_core_routing_observed(&total_only),
+            "a non-zero total with an empty distribution is still evidence of \
+             routing and must not be silently dropped"
+        );
     }
 
     #[test]
