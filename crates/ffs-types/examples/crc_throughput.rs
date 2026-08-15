@@ -12,12 +12,26 @@ use std::time::Instant;
 
 fn main() {
     // 64 MiB buffer, non-trivial content so the crc actually churns.
-    let n = 64 * 1024 * 1024;
-    let buf: Vec<u8> = (0..n).map(|i| (i * 1103515245 + 12345) as u8).collect();
+    //
+    // The LCG is deliberately explicit `u32` wrapping arithmetic (bd-wc78p). It
+    // used to read `(i * 1103515245 + 12345) as u8` on an inferred `i32`, which
+    // OVERFLOWS: `i` reaches 67,108,863, so the multiply leaves `i32` range almost
+    // immediately and this example panicked outright in a debug build. It only
+    // appeared to work because it is documented to be run with `--release`, where
+    // the overflow wraps silently. Taking the low byte via `to_ne_bytes()` instead
+    // of `as u8` also keeps the generator free of lossy casts.
+    let n: u32 = 64 * 1024 * 1024;
+    let buf: Vec<u8> = (0..n)
+        .map(|i| {
+            i.wrapping_mul(1_103_515_245)
+                .wrapping_add(12_345)
+                .to_ne_bytes()[0]
+        })
+        .collect();
     // Warm.
     let _ = std::hint::black_box(crc32c(&buf[..1024]));
 
-    let iters = 20;
+    let iters: u32 = 20;
     let start = Instant::now();
     let mut acc = 0u32;
     for _ in 0..iters {
@@ -25,11 +39,15 @@ fn main() {
     }
     std::hint::black_box(acc);
     let secs = start.elapsed().as_secs_f64();
-    let gib = (n as f64 * iters as f64) / (1024.0 * 1024.0 * 1024.0);
+    let gib = (f64::from(n) * f64::from(iters)) / (1024.0 * 1024.0 * 1024.0);
     let gbps = gib / secs;
     println!(
         "crc32c: {gib:.2} GiB in {:.3}s = {gbps:.2} GiB/s  ({})",
         secs,
-        if gbps > 4.0 { "HARDWARE (SSE4.2) — no lever" } else { "SOFTWARE fallback — possible lever" }
+        if gbps > 4.0 {
+            "HARDWARE (SSE4.2) — no lever"
+        } else {
+            "SOFTWARE fallback — possible lever"
+        }
     );
 }

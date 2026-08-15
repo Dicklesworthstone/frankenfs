@@ -429,8 +429,29 @@ pub fn trim_nul_padded(bytes: &[u8]) -> String {
 
 #[must_use]
 pub fn all_zero_bytes(bytes: &[u8]) -> bool {
-    let mut cache_lines = bytes.chunks_exact(64);
-    for cache_line in &mut cache_lines {
+    // `as_chunks::<N>()` instead of `chunks_exact(N)` (bd-wc78p): with a CONST
+    // chunk size it hands back `&[[u8; N]]`, so the length is in the type and the
+    // per-chunk `try_into().expect(..)` disappears. `chunks_exact(N)` is also a
+    // denied pedantic lint here, which was breaking the workspace clippy gate.
+    //
+    // ISOMORPHISM (this is a banked perf lever, b77c7e8a / bd-a2x93 — the 4-lane
+    // unrolled zero scan — so the shape is preserved deliberately):
+    //   * split point: `as_chunks::<64>()` returns the same `len/64*64` prefix and
+    //     the same trailing remainder that `chunks_exact(64)` + `.remainder()` did.
+    //   * traversal order: unchanged, front to back.
+    //   * the four-lane unroll is character-for-character the same four
+    //     `u128::from_ne_bytes` loads OR-ed in the same order, so the instruction
+    //     mix the lever was measured on is preserved.
+    //   * early return: still on the first non-zero 64-byte line, then the first
+    //     non-zero 16-byte lane, so the number of bytes touched before a `false`
+    //     is identical for every input.
+    //   * endianness: still `from_ne_bytes`; the value is compared against 0, for
+    //     which byte order is irrelevant.
+    // Result equality is total, not just structural: the function is a pure
+    // predicate over "is every byte zero", and both forms visit every byte until
+    // the first non-zero one.
+    let (cache_lines, tail) = bytes.as_chunks::<64>();
+    for cache_line in cache_lines {
         let word0 = u128::from_ne_bytes(cache_line[0..16].try_into().expect("first 16-byte lane"));
         let word1 =
             u128::from_ne_bytes(cache_line[16..32].try_into().expect("second 16-byte lane"));
@@ -442,14 +463,13 @@ pub fn all_zero_bytes(bytes: &[u8]) -> bool {
         }
     }
 
-    let mut chunks = cache_lines.remainder().chunks_exact(16);
-    for chunk in &mut chunks {
-        let word = u128::from_ne_bytes(chunk.try_into().expect("16-byte chunk"));
-        if word != 0 {
+    let (lanes, rest) = tail.as_chunks::<16>();
+    for lane in lanes {
+        if u128::from_ne_bytes(*lane) != 0 {
             return false;
         }
     }
-    chunks.remainder().iter().all(|&byte| byte == 0)
+    rest.iter().all(|&byte| byte == 0)
 }
 
 #[must_use]
@@ -944,9 +964,17 @@ mod tests {
         assert_eq!(trim_nul_padded(raw), "ffs");
     }
 
+    /// Differential oracle for the unrolled zero scan.
+    ///
+    /// Extended to 258 for the `as_chunks` conversion (bd-wc78p): 160 only reached
+    /// two 64-byte cache lines, so it could not distinguish a bug in the
+    /// prefix/remainder split from one in the lane loop. 258 covers four full cache
+    /// lines plus every remainder shape (0..64), and walking a single non-zero byte
+    /// across every position pins the EARLY-RETURN boundary at each of the three
+    /// stages — 64-byte line, 16-byte lane, trailing bytes.
     #[test]
     fn all_zero_bytes_matches_scalar_scan() {
-        for len in 0_usize..160 {
+        for len in 0_usize..=258 {
             let mut bytes = vec![0_u8; len];
             assert!(all_zero_bytes(&bytes), "all-zero len {len}");
             for pos in 0..len {
@@ -957,6 +985,42 @@ mod tests {
                 );
                 bytes[pos] = 0;
             }
+        }
+    }
+
+    /// The bit position within a byte must not matter, and neither must the byte
+    /// position within its 16-byte lane. A `from_ne_bytes` load that dropped or
+    /// mis-ordered a lane would still pass a test that only ever sets `1` in the
+    /// first lane, so set every single-bit pattern at every offset of one full
+    /// cache line plus a partial one.
+    #[test]
+    fn all_zero_bytes_detects_every_single_bit_at_every_offset() {
+        let len = 64 + 16 + 7;
+        for pos in 0..len {
+            for bit in 0..8 {
+                let mut bytes = vec![0_u8; len];
+                bytes[pos] = 1_u8 << bit;
+                assert!(
+                    !all_zero_bytes(&bytes),
+                    "bit {bit} at byte {pos} of {len} must be detected"
+                );
+            }
+        }
+    }
+
+    /// The remainder path must not be skipped when the prefix is clean. A split
+    /// that dropped the tail would report an all-zero verdict for a buffer whose
+    /// ONLY non-zero byte is past the last full 64-byte line.
+    #[test]
+    fn all_zero_bytes_checks_the_tail_after_a_clean_prefix() {
+        for tail_len in 1_usize..64 {
+            let len = 128 + tail_len;
+            let mut bytes = vec![0_u8; len];
+            bytes[len - 1] = 0x80;
+            assert!(
+                !all_zero_bytes(&bytes),
+                "final byte of a {tail_len}-byte tail after two clean cache lines"
+            );
         }
     }
 
