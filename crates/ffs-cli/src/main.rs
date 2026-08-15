@@ -7441,6 +7441,20 @@ fn log_mount_shutdown_metrics(
         requests_shed = metrics.requests_shed,
         "managed_mount_shutdown_complete"
     );
+    if matches!(
+        std::env::var("FFS_MOUNT_BENCH_EVIDENCE").as_deref(),
+        Ok("1" | "true")
+    ) {
+        eprintln!(
+            "mount_dispatch_metrics,filesystem={filesystem},getattr_dispatch_count={},getattr_dispatch_nanos={},getxattr_dispatch_count={},getxattr_dispatch_nanos={},readdir_dispatch_count={},readdir_dispatch_nanos={}",
+            metrics.getattr_dispatch_count,
+            metrics.getattr_dispatch_nanos,
+            metrics.getxattr_dispatch_count,
+            metrics.getxattr_dispatch_nanos,
+            metrics.readdir_dispatch_count,
+            metrics.readdir_dispatch_nanos,
+        );
+    }
 }
 
 struct MountBackgroundScrubPlan {
