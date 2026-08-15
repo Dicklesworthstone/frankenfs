@@ -891,6 +891,19 @@ struct FfsMountSelfReport {
     runtime_knobs: String,
 }
 
+/// Cumulative daemon-side request-scope timings emitted only by a benchmarked
+/// FUSE mount at clean shutdown. They deliberately exclude client/FUSE-kernel
+/// transport time, making the remainder of a mounted row attributable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FfsDispatchMetrics {
+    getattr_dispatch_count: u64,
+    getattr_dispatch_nanos: u64,
+    getxattr_dispatch_count: u64,
+    getxattr_dispatch_nanos: u64,
+    readdir_dispatch_count: u64,
+    readdir_dispatch_nanos: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct KernelEngineIdentity {
     release: String,
@@ -2600,6 +2613,53 @@ fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsM
         },
         runtime_knobs,
     })
+}
+
+fn mount_dispatch_metric_value<'a>(payload: &'a str, name: &str) -> Result<&'a str> {
+    let mut values = payload
+        .split(',')
+        .filter_map(|field| field.split_once('='))
+        .filter_map(|(key, value)| (key == name).then_some(value));
+    let value = values
+        .next()
+        .ok_or_else(|| anyhow!("FUSE dispatch metrics omitted {name}"))?;
+    ensure!(
+        values.next().is_none(),
+        "FUSE dispatch metrics reported {name} more than once"
+    );
+    Ok(value)
+}
+
+fn parse_mount_dispatch_metrics(
+    log_path: &Path,
+    expected_filesystem: FilesystemKind,
+) -> Result<Option<FfsDispatchMetrics>> {
+    let content = fs::read_to_string(log_path)
+        .with_context(|| format!("read FUSE mount log {}", log_path.display()))?;
+    let Some(payload) = optional_prefixed_line(
+        &content,
+        "mount_dispatch_metrics,",
+        "FUSE dispatch metrics",
+    )? else {
+        return Ok(None);
+    };
+    ensure!(
+        mount_dispatch_metric_value(payload, "filesystem")? == expected_filesystem.label(),
+        "FUSE dispatch metrics filesystem does not match mounted image"
+    );
+    let parse = |name| {
+        mount_dispatch_metric_value(payload, name)?
+            .parse::<u64>()
+            .with_context(|| format!("parse FUSE dispatch metric {name}"))
+    };
+    Ok(Some(FfsDispatchMetrics {
+        getattr_dispatch_count: parse("getattr_dispatch_count")?,
+        getattr_dispatch_nanos: parse("getattr_dispatch_nanos")?,
+        getxattr_dispatch_count: parse("getxattr_dispatch_count")?,
+        getxattr_dispatch_nanos: parse("getxattr_dispatch_nanos")?,
+        readdir_dispatch_count: parse("readdir_dispatch_count")?,
+        readdir_dispatch_nanos: parse("readdir_dispatch_nanos")?,
+    }))
 }
 
 // Keep the lifecycle linear: every identity check must remain visibly between
@@ -6133,6 +6193,32 @@ fn fs_report(
     for mount in mounts.iter_mut().rev() {
         mount.unmount()?;
     }
+    let fuse_dispatch_metrics = mounts
+        .iter()
+        .filter_map(|mount| match &mount.kind {
+            MountedArmKind::Fuse { stderr_log, .. } => Some(
+                parse_mount_dispatch_metrics(stderr_log, kind).map(|metrics| {
+                    (
+                        mount.arm.label().to_owned(),
+                        metrics.map_or_else(
+                            || json!("unreported_by_this_elf"),
+                            |metrics| {
+                                json!({
+                                    "getattr_dispatch_count": metrics.getattr_dispatch_count,
+                                    "getattr_dispatch_nanos": metrics.getattr_dispatch_nanos,
+                                    "getxattr_dispatch_count": metrics.getxattr_dispatch_count,
+                                    "getxattr_dispatch_nanos": metrics.getxattr_dispatch_nanos,
+                                    "readdir_dispatch_count": metrics.readdir_dispatch_count,
+                                    "readdir_dispatch_nanos": metrics.readdir_dispatch_nanos,
+                                })
+                            },
+                        ),
+                    )
+                }),
+            ),
+            MountedArmKind::Kernel => None,
+        })
+        .collect::<Result<serde_json::Map<_, _>>>()?;
     for image in images.values() {
         validate_image(kind, image)?;
     }
@@ -6480,6 +6566,7 @@ fn fs_report(
         "raw_wall_ns": raw_samples,
         "raw_physical_wall_ns": raw_physical_samples,
         "diagnostic_side_throughput": diagnostic_throughput_json,
+        "fuse_dispatch_metrics": fuse_dispatch_metrics,
         "workload_digests": workload_digests,
         "kernel_aa": kernel_aa_json,
         "fuse_aa": fuse_aa_json,
@@ -9013,6 +9100,29 @@ mod tests {
         .expect("write ambiguous mount log");
         assert!(parse_mount_self_report(&ambiguous, false).is_err());
         assert!(parse_mount_self_report(&ambiguous, true).is_err());
+    }
+
+    #[test]
+    fn mount_dispatch_metrics_are_parsed_per_filesystem_arm_bd_fhb53() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("mount.log");
+        fs::write(
+            &log,
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
+        )
+        .expect("write mount log");
+
+        let metrics = parse_mount_dispatch_metrics(&log, FilesystemKind::Btrfs)
+            .expect("parse dispatch metrics")
+            .expect("metrics reported");
+        assert_eq!(metrics.getattr_dispatch_count, 20);
+        assert_eq!(metrics.getxattr_dispatch_nanos, 40);
+        assert_eq!(metrics.readdir_dispatch_count, 2);
+        assert!(parse_mount_dispatch_metrics(&log, FilesystemKind::Ext4).is_err());
+
+        fs::write(&log, "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20\n")
+            .expect("overwrite incomplete mount log");
+        assert!(parse_mount_dispatch_metrics(&log, FilesystemKind::Btrfs).is_err());
     }
 
     /// The sentinel must fail an A/B on its own, independently of the mount-time
