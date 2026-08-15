@@ -892,6 +892,15 @@ pub struct AtomicMetrics {
     pub getxattr_dispatch_count: CacheLinePadded<AtomicU64>,
     /// Cumulative daemon dispatch time for `Getxattr` request scopes, in ns.
     pub getxattr_dispatch_nanos: CacheLinePadded<AtomicU64>,
+    /// Number of `Lookup` request-scope dispatches completed by the daemon.
+    ///
+    /// Name resolution is the only path-based metadata op the other counters
+    /// do not cover, and it is where a format layer pays for inode
+    /// resolution; without it the readdir+stat attribution has a hole
+    /// exactly where btrfs is suspected to differ from ext4 (bd-zpc3q).
+    pub lookup_dispatch_count: CacheLinePadded<AtomicU64>,
+    /// Cumulative daemon dispatch time for `Lookup` request scopes, in ns.
+    pub lookup_dispatch_nanos: CacheLinePadded<AtomicU64>,
     /// Number of `Readdir` request-scope dispatches completed by the daemon.
     pub readdir_dispatch_count: CacheLinePadded<AtomicU64>,
     /// Cumulative daemon dispatch time for `Readdir` request scopes, in ns.
@@ -926,6 +935,8 @@ impl AtomicMetrics {
             getattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
+            lookup_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            lookup_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             readdir_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
             readdir_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             requests_throttled: CacheLinePadded(AtomicU64::new(0)),
@@ -975,6 +986,10 @@ impl AtomicMetrics {
                 Self::saturating_add(&self.getxattr_dispatch_count.0, 1);
                 Self::saturating_add(&self.getxattr_dispatch_nanos.0, nanos);
             }
+            RequestOp::Lookup => {
+                Self::saturating_add(&self.lookup_dispatch_count.0, 1);
+                Self::saturating_add(&self.lookup_dispatch_nanos.0, nanos);
+            }
             RequestOp::Readdir => {
                 Self::saturating_add(&self.readdir_dispatch_count.0, 1);
                 Self::saturating_add(&self.readdir_dispatch_nanos.0, nanos);
@@ -1004,6 +1019,8 @@ impl AtomicMetrics {
             getattr_dispatch_nanos: self.getattr_dispatch_nanos.0.load(Ordering::Relaxed),
             getxattr_dispatch_count: self.getxattr_dispatch_count.0.load(Ordering::Relaxed),
             getxattr_dispatch_nanos: self.getxattr_dispatch_nanos.0.load(Ordering::Relaxed),
+            lookup_dispatch_count: self.lookup_dispatch_count.0.load(Ordering::Relaxed),
+            lookup_dispatch_nanos: self.lookup_dispatch_nanos.0.load(Ordering::Relaxed),
             readdir_dispatch_count: self.readdir_dispatch_count.0.load(Ordering::Relaxed),
             readdir_dispatch_nanos: self.readdir_dispatch_nanos.0.load(Ordering::Relaxed),
             requests_throttled: self.requests_throttled.0.load(Ordering::Relaxed),
@@ -1031,6 +1048,8 @@ impl std::fmt::Debug for AtomicMetrics {
             .field("getattr_dispatch_nanos", &s.getattr_dispatch_nanos)
             .field("getxattr_dispatch_count", &s.getxattr_dispatch_count)
             .field("getxattr_dispatch_nanos", &s.getxattr_dispatch_nanos)
+            .field("lookup_dispatch_count", &s.lookup_dispatch_count)
+            .field("lookup_dispatch_nanos", &s.lookup_dispatch_nanos)
             .field("readdir_dispatch_count", &s.readdir_dispatch_count)
             .field("readdir_dispatch_nanos", &s.readdir_dispatch_nanos)
             .field("requests_throttled", &s.requests_throttled)
@@ -1051,6 +1070,8 @@ pub struct MetricsSnapshot {
     pub getattr_dispatch_nanos: u64,
     pub getxattr_dispatch_count: u64,
     pub getxattr_dispatch_nanos: u64,
+    pub lookup_dispatch_count: u64,
+    pub lookup_dispatch_nanos: u64,
     pub readdir_dispatch_count: u64,
     pub readdir_dispatch_nanos: u64,
     /// Requests delayed by backpressure throttling.
@@ -5623,6 +5644,8 @@ mod tests {
         assert_eq!(s.requests_ok, 0);
         assert_eq!(s.requests_err, 0);
         assert_eq!(s.bytes_read, 0);
+        assert_eq!(s.lookup_dispatch_count, 0);
+        assert_eq!(s.lookup_dispatch_nanos, 0);
         assert_eq!(s.readdir_dispatch_count, 0);
         assert_eq!(s.readdir_dispatch_nanos, 0);
         assert_eq!(s.requests_throttled, 0);
@@ -14880,6 +14903,7 @@ mod tests {
             "metrics: MetricsSnapshot { requests_total: 0, requests_ok: 0, requests_err: 0, ",
             "bytes_read: 0, metadata_requests: 0, getattr_dispatch_count: 0, ",
             "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
             "requests_throttled: 0, requests_shed: 0 }, ",
             "unmount_timeout: 30s }"
@@ -15746,6 +15770,8 @@ mod tests {
         assert_eq!(snap.getattr_dispatch_nanos, 0);
         assert_eq!(snap.getxattr_dispatch_count, 0);
         assert_eq!(snap.getxattr_dispatch_nanos, 0);
+        assert_eq!(snap.lookup_dispatch_count, 0);
+        assert_eq!(snap.lookup_dispatch_nanos, 0);
         assert_eq!(snap.readdir_dispatch_count, 0);
         assert_eq!(snap.readdir_dispatch_nanos, 0);
         let debug = format!("{metrics:?}");
@@ -15769,6 +15795,8 @@ mod tests {
             Ok::<(), FfsError>(())
         });
         let _ =
+            fuse.with_request_scope(&cx, RequestOp::Lookup, |_cx, _scope| Ok::<(), FfsError>(()));
+        let _ =
             fuse.with_request_scope(
                 &cx,
                 RequestOp::Readdir,
@@ -15778,10 +15806,37 @@ mod tests {
         let snap = fuse.metrics().snapshot();
         assert_eq!(snap.getattr_dispatch_count, 1);
         assert_eq!(snap.getxattr_dispatch_count, 1);
+        assert_eq!(snap.lookup_dispatch_count, 1);
         assert_eq!(snap.readdir_dispatch_count, 1);
         assert!(snap.getattr_dispatch_nanos > 0);
         assert!(snap.getxattr_dispatch_nanos > 0);
+        assert!(snap.lookup_dispatch_nanos > 0);
         assert!(snap.readdir_dispatch_nanos > 0);
+    }
+
+    /// A readdir+stat attribution is only usable if name resolution is a
+    /// separate line item: a `Lookup` scope must not land on the `Getattr`
+    /// counters, or btrfs inode-resolution cost would be invisible inside
+    /// attribute-fetch time (bd-zpc3q).
+    #[test]
+    fn lookup_dispatch_timing_is_not_folded_into_getattr() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, false);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+
+        for _ in 0..3 {
+            let _ = fuse
+                .with_request_scope(&cx, RequestOp::Lookup, |_cx, _scope| Ok::<(), FfsError>(()));
+        }
+
+        let snap = fuse.metrics().snapshot();
+        assert_eq!(snap.lookup_dispatch_count, 3);
+        assert!(snap.lookup_dispatch_nanos > 0);
+        assert_eq!(snap.getattr_dispatch_count, 0);
+        assert_eq!(snap.getattr_dispatch_nanos, 0);
+        assert_eq!(snap.getxattr_dispatch_count, 0);
+        assert_eq!(snap.readdir_dispatch_count, 0);
     }
 
     // ── MountOptions thread count resolution ─────────────────────────────
@@ -15937,6 +15992,8 @@ AllowOther"#;
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
             getxattr_dispatch_nanos: 200,
+            lookup_dispatch_count: 5,
+            lookup_dispatch_nanos: 500,
             readdir_dispatch_count: 3,
             readdir_dispatch_nanos: 300,
             requests_throttled: 0,
@@ -15955,6 +16012,8 @@ AllowOther"#;
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
             getxattr_dispatch_nanos: 200,
+            lookup_dispatch_count: 5,
+            lookup_dispatch_nanos: 500,
             readdir_dispatch_count: 3,
             readdir_dispatch_nanos: 300,
             requests_throttled: 0,
@@ -15982,6 +16041,15 @@ AllowOther"#;
             "requests_ok: 1, ",
             "requests_err: 0, ",
             "bytes_read: 512, ",
+            "metadata_requests: 0, ",
+            "getattr_dispatch_count: 0, ",
+            "getattr_dispatch_nanos: 0, ",
+            "getxattr_dispatch_count: 0, ",
+            "getxattr_dispatch_nanos: 0, ",
+            "lookup_dispatch_count: 0, ",
+            "lookup_dispatch_nanos: 0, ",
+            "readdir_dispatch_count: 0, ",
+            "readdir_dispatch_nanos: 0, ",
             "requests_throttled: 1, ",
             "requests_shed: 0",
             " }"
@@ -16160,6 +16228,7 @@ AllowOther"#;
             "metrics: AtomicMetrics { requests_total: 0, requests_ok: 0, requests_err: 0, ",
             "bytes_read: 0, metadata_requests: 0, getattr_dispatch_count: 0, ",
             "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
             "requests_throttled: 0, requests_shed: 0 }, ",
             "thread_count: 2, ",

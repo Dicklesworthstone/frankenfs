@@ -900,6 +900,8 @@ struct FfsDispatchMetrics {
     getattr_dispatch_nanos: u64,
     getxattr_dispatch_count: u64,
     getxattr_dispatch_nanos: u64,
+    lookup_dispatch_count: u64,
+    lookup_dispatch_nanos: u64,
     readdir_dispatch_count: u64,
     readdir_dispatch_nanos: u64,
 }
@@ -2636,11 +2638,9 @@ fn parse_mount_dispatch_metrics(
 ) -> Result<Option<FfsDispatchMetrics>> {
     let content = fs::read_to_string(log_path)
         .with_context(|| format!("read FUSE mount log {}", log_path.display()))?;
-    let Some(payload) = optional_prefixed_line(
-        &content,
-        "mount_dispatch_metrics,",
-        "FUSE dispatch metrics",
-    )? else {
+    let Some(payload) =
+        optional_prefixed_line(&content, "mount_dispatch_metrics,", "FUSE dispatch metrics")?
+    else {
         return Ok(None);
     };
     ensure!(
@@ -2657,6 +2657,8 @@ fn parse_mount_dispatch_metrics(
         getattr_dispatch_nanos: parse("getattr_dispatch_nanos")?,
         getxattr_dispatch_count: parse("getxattr_dispatch_count")?,
         getxattr_dispatch_nanos: parse("getxattr_dispatch_nanos")?,
+        lookup_dispatch_count: parse("lookup_dispatch_count")?,
+        lookup_dispatch_nanos: parse("lookup_dispatch_nanos")?,
         readdir_dispatch_count: parse("readdir_dispatch_count")?,
         readdir_dispatch_nanos: parse("readdir_dispatch_nanos")?,
     }))
@@ -6208,6 +6210,8 @@ fn fs_report(
                                     "getattr_dispatch_nanos": metrics.getattr_dispatch_nanos,
                                     "getxattr_dispatch_count": metrics.getxattr_dispatch_count,
                                     "getxattr_dispatch_nanos": metrics.getxattr_dispatch_nanos,
+                                    "lookup_dispatch_count": metrics.lookup_dispatch_count,
+                                    "lookup_dispatch_nanos": metrics.lookup_dispatch_nanos,
                                     "readdir_dispatch_count": metrics.readdir_dispatch_count,
                                     "readdir_dispatch_nanos": metrics.readdir_dispatch_nanos,
                                 })
@@ -7844,10 +7848,7 @@ mod tests {
         assert!(defaulted.btrfs_verify_data_on_read);
 
         let mut disabled = base;
-        disabled.extend([
-            "--btrfs-verify-data-on-read".to_owned(),
-            "false".to_owned(),
-        ]);
+        disabled.extend(["--btrfs-verify-data-on-read".to_owned(), "false".to_owned()]);
         let disabled = parse_config_args(&disabled)
             .expect("parse explicit opt-out")
             .expect("normal invocation");
@@ -9108,7 +9109,7 @@ mod tests {
         let log = temp.path().join("mount.log");
         fs::write(
             &log,
-            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
         )
         .expect("write mount log");
 
@@ -9117,11 +9118,32 @@ mod tests {
             .expect("metrics reported");
         assert_eq!(metrics.getattr_dispatch_count, 20);
         assert_eq!(metrics.getxattr_dispatch_nanos, 40);
+        assert_eq!(metrics.lookup_dispatch_count, 8);
+        assert_eq!(metrics.lookup_dispatch_nanos, 800);
         assert_eq!(metrics.readdir_dispatch_count, 2);
         assert!(parse_mount_dispatch_metrics(&log, FilesystemKind::Ext4).is_err());
 
-        fs::write(&log, "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20\n")
-            .expect("overwrite incomplete mount log");
+        fs::write(
+            &log,
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20\n",
+        )
+        .expect("overwrite incomplete mount log");
+        assert!(parse_mount_dispatch_metrics(&log, FilesystemKind::Btrfs).is_err());
+    }
+
+    /// An ELF that predates lookup timing must not be silently accepted with a
+    /// zero for name resolution: the btrfs readdir+stat attribution would then
+    /// read as "no inode-resolution cost" when the truth is "not measured"
+    /// (bd-zpc3q).
+    #[test]
+    fn mount_dispatch_metrics_reject_a_line_without_lookup_timing_bd_zpc3q() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("mount.log");
+        fs::write(
+            &log,
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
+        )
+        .expect("write pre-lookup mount log");
         assert!(parse_mount_dispatch_metrics(&log, FilesystemKind::Btrfs).is_err());
     }
 
