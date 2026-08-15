@@ -428,6 +428,8 @@ struct Config {
     /// value is injected into both FUSE A/A arms, so the null gate still
     /// exercises exactly the candidate configuration being compared to Linux.
     fuse_workers: Option<usize>,
+    /// Whether btrfs FUSE mounts verify data checksums on reads.
+    btrfs_verify_data_on_read: bool,
     /// Second candidate configuration mounted in the same window (bd-3tqgc).
     ///
     /// Omitted keeps the banked four-arm shape byte for byte. When present the
@@ -540,6 +542,7 @@ impl Default for Config {
             client_threads: DEFAULT_PARALLEL_THREADS,
             fuse_cpu_count: DEFAULT_FUSE_CPUS,
             fuse_workers: None,
+            btrfs_verify_data_on_read: true,
             candidate_comparison: None,
             placement_scope: PlacementScope::SameLlc,
             host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
@@ -1456,6 +1459,10 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
             }
             "--fuse-workers" => {
                 config.fuse_workers = Some(parse_value(args, &mut index, "--fuse-workers")?);
+            }
+            "--btrfs-verify-data-on-read" => {
+                config.btrfs_verify_data_on_read =
+                    parse_value(args, &mut index, "--btrfs-verify-data-on-read")?;
             }
             "--client-threads" => {
                 config.client_threads = parse_value(args, &mut index, "--client-threads")?;
@@ -2643,6 +2650,9 @@ fn mount_fuse(
     if config.workload.is_mutating() {
         command.arg("--rw");
     }
+    command
+        .arg("--btrfs-verify-data-on-read")
+        .arg(config.btrfs_verify_data_on_read.to_string());
     let mut child = command
         .arg("--no-background-scrub")
         .arg(image)
@@ -6398,6 +6408,7 @@ fn fs_report(
         "client_affinity_cpus": placement.driver_cpus,
         "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "placement_scope": config.placement_scope.label(),
+        "btrfs_verify_data_on_read": config.btrfs_verify_data_on_read,
         "placement_evidence_mode": placement_evidence_mode(config.placement_scope),
         // bd-pb85e: which construction built the fixture, and whether a row from
         // this run may be banked at all. Recorded unconditionally, including on
@@ -7725,6 +7736,35 @@ mod tests {
                 .all(|(key, _)| key.to_str() != Some("FFS_FUSE_WORKERS")),
             "omitting the option must preserve the serial banked dispatcher"
         );
+    }
+
+    #[test]
+    fn btrfs_read_checksum_verification_is_explicit_and_defaults_on() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let base = vec![
+            "--ffs-cli".to_owned(),
+            cli.display().to_string(),
+            "--harness-builder".to_owned(),
+            "hz1".to_owned(),
+            "--candidate-builder".to_owned(),
+            "hz2".to_owned(),
+        ];
+        let defaulted = parse_config_args(&base)
+            .expect("parse default")
+            .expect("normal invocation");
+        assert!(defaulted.btrfs_verify_data_on_read);
+
+        let mut disabled = base;
+        disabled.extend([
+            "--btrfs-verify-data-on-read".to_owned(),
+            "false".to_owned(),
+        ]);
+        let disabled = parse_config_args(&disabled)
+            .expect("parse explicit opt-out")
+            .expect("normal invocation");
+        assert!(!disabled.btrfs_verify_data_on_read);
     }
 
     #[test]
