@@ -1538,8 +1538,10 @@ fn seed_payload_coverage_from_items(
         if size == 0 {
             continue;
         }
-        let start = usize::try_from(item.data_offset)
-            .map_err(|_| ParseError::IntegerConversion { field: "item_offset" })?;
+        let start =
+            usize::try_from(item.data_offset).map_err(|_| ParseError::IntegerConversion {
+                field: "item_offset",
+            })?;
         let end = start.checked_add(size).ok_or(ParseError::InvalidField {
             field: "item_offset",
             reason: "overflow",
@@ -2298,7 +2300,7 @@ mod tests {
         };
 
         for err in [
-            map_logical_to_physical(&[chunk.clone()], u64::MAX - 3).unwrap_err(),
+            map_logical_to_physical(std::slice::from_ref(&chunk), u64::MAX - 3).unwrap_err(),
             map_logical_to_stripes(&[chunk], u64::MAX - 3).unwrap_err(),
         ] {
             assert_eq!(
@@ -2651,7 +2653,13 @@ mod tests {
         // rejected, so a corrupt header cannot drive a huge allocation.
         let err = checked_item_table_end(usize::MAX, BTRFS_ITEM_SIZE, "items").unwrap_err();
         assert!(
-            matches!(err, ParseError::InvalidField { reason: "overflow", .. }),
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    reason: "overflow",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -6363,11 +6371,9 @@ mod tests {
             super::validate_superblock_tree_level("root_level", super::BTRFS_MAX_LEVEL).is_ok()
         );
 
-        let err = super::validate_superblock_tree_level(
-            "chunk_root_level",
-            super::BTRFS_MAX_LEVEL + 1,
-        )
-        .expect_err("level above max must be rejected");
+        let err =
+            super::validate_superblock_tree_level("chunk_root_level", super::BTRFS_MAX_LEVEL + 1)
+                .expect_err("level above max must be rejected");
         assert!(
             matches!(err, ParseError::InvalidField { field, reason }
                 if field == "chunk_root_level" && reason.contains("exceeds btrfs max tree level")),

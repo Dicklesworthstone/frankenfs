@@ -9388,6 +9388,15 @@ mod tests {
     /// path that replaces the O(dir) rebuild. The read-half `htree_find_entry` is
     /// the oracle: after the split, every original name plus the new name must
     /// still resolve through the (now wider) single-level index.
+    // `too_many_lines` (130/100) is a maintainability heuristic for production
+    // functions; this is one indivisible on-disk SCENARIO — build a stamped htree,
+    // overfill a leaf, split it, then re-resolve every original name plus the new
+    // one through the widened index. Splitting it into helpers to reach 100 would
+    // scatter the sequence a reader has to follow in order, and hiding half the
+    // setup behind a helper is how a scenario test quietly stops testing the
+    // scenario. Narrow allow on this function only, not a blanket test exemption
+    // (bd-3ao0l); overrule it by restructuring the test, never by widening this.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn htree_leaf_split_keeps_dir_navigable_and_checksummed_bd_gauub() {
         let bs = 1024_usize; // small block => few entries per leaf, easy to overfill
@@ -9542,6 +9551,10 @@ mod tests {
         }
     }
 
+    // See the note on the single-level split test above: same reasoning, and this
+    // one drives a TWO-level index (8000 entries), so the sequence is longer still
+    // (141/100). Narrow allow, bd-3ao0l.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn htree_dx_node_leaf_split_keeps_two_level_dir_navigable_bd_bhh0i() {
         let bs = 1024_usize;
@@ -9613,7 +9626,7 @@ mod tests {
         blocks[node_logical as usize] = split.dx_node.clone();
         blocks[target_logical as usize] = split.old_leaf.clone();
         assert_eq!(blocks.len(), new_leaf_logical as usize);
-        blocks.push(split.new_leaf.clone());
+        blocks.push(split.new_leaf);
 
         let leaf_idx = if into_new {
             new_leaf_logical as usize
@@ -12452,7 +12465,11 @@ mod tests {
         fn leaf_block_bytes(exts: &[(u32, u16, u32)]) -> Vec<u8> {
             let mut b = vec![0_u8; 4096];
             b[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes());
-            b[2..4].copy_from_slice(&(exts.len() as u16).to_le_bytes());
+            b[2..4].copy_from_slice(
+                &u16::try_from(exts.len())
+                    .expect("fixture extent count fits u16")
+                    .to_le_bytes(),
+            );
             b[4..6].copy_from_slice(&340_u16.to_le_bytes()); // max_entries
             b[6..8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0 (leaf)
             for (i, (lb, len, phys)) in exts.iter().enumerate() {
@@ -13313,6 +13330,11 @@ mod tests {
         assert_eq!(entries[0].full_name(), "security.kernel");
     }
 
+    // Differential oracle: the by-name finder must agree with materialize-all for
+    // every entry across a table of namespace/index combinations. The length is
+    // the table plus one assertion per case, which is the point — trimming cases
+    // to reach 100 lines would delete coverage. Narrow allow, bd-3ao0l.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn get_xattr_by_name_finder_matches_materialize_all() {
         // Lay out xattr entries + values in one region. `value_base_start` is the
@@ -13514,8 +13536,8 @@ mod tests {
         let mut expected = Vec::new();
         let mut offset = 0_usize;
         for (i, name_index) in indexes.into_iter().enumerate() {
-            let name = [b'a' + i as u8, 0xFF];
-            data[offset] = name.len() as u8;
+            let name = [b'a' + u8::try_from(i).expect("fixture index fits u8"), 0xFF];
+            data[offset] = u8::try_from(name.len()).expect("2-byte fixture name");
             data[offset + 1] = name_index;
             data[offset + 16..offset + 16 + name.len()].copy_from_slice(&name);
             expected.push(
@@ -20770,7 +20792,7 @@ mod bitmap_csum_incremental_verify {
         let clusters = 32768u32; // 4096-byte bitmap, byte-aligned
         let seed = 0x1234_5678u32;
         let mut bitmap = vec![0u8; 4096];
-        for b in bitmap.iter_mut() {
+        for b in &mut bitmap {
             *b = (next() & 0xFF) as u8;
         }
         let mut checked = 0;
@@ -20816,7 +20838,7 @@ mod dir_csum_incremental_verify {
         let ino = 42u32;
         let generation = 7u32;
         let mut block = vec![0u8; bs];
-        for b in block.iter_mut() {
+        for b in &mut block {
             *b = (next() & 0xFF) as u8;
         }
         stamp_dir_block_checksum(&mut block, seed, ino, generation);
@@ -20826,7 +20848,7 @@ mod dir_csum_incremental_verify {
             let len = 1 + (next() as usize % 48);
             let start = (next() as usize) % (coverage_end - len);
             let mut new_bytes = vec![0u8; len];
-            for b in new_bytes.iter_mut() {
+            for b in &mut new_bytes {
                 *b = (next() & 0xFF) as u8;
             }
             let delta: Vec<u8> = new_bytes
