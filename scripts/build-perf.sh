@@ -33,7 +33,40 @@ TARGET_CPU="${FFS_TARGET_CPU:-x86-64-v3}"
 PGO_DIR="${PGO_DIR:-/tmp/ffs-pgo}"
 PROFILE="release-perf"
 BIN="ffs-cli"
-# Respect CARGO_TARGET_DIR (this repo commonly redirects it, e.g. /data/tmp/...).
+
+# OBSERVED DEFECT, 2026-08-15: this script was writing into the shared
+# cross-repo target dir on every run.
+#
+# This host exports CARGO_TARGET_DIR=/data/tmp/cargo-target GLOBALLY — one
+# directory shared by every project on the box, measured at 338 GB, and it has
+# filled the disk before (see bd-v0igv; / was at 8.86% free with the sbh ballast
+# pool fully released when this was found). The old line here was
+# `TARGET_DIR="${CARGO_TARGET_DIR:-target}"`, which deliberately honoured that
+# inherited value, so a perf build silently landed multiple GB of LTO artifacts
+# in the shared dir instead of in frankenfs.
+#
+# Building locally is correct and expected for this script — the mounted-kernel
+# comparator mounts a real FUSE filesystem and compares against the live kernel,
+# and rch cannot retrieve a compiled binary anyway. The defect was never
+# "builds locally"; it was "builds into a directory it does not own".
+#
+# So: honour an inherited CARGO_TARGET_DIR only when it is NOT the shared path.
+# Anything at or beneath the shared root is refused and replaced with the
+# repo-local default, loudly, so the next agent inherits the fix rather than
+# rediscovering it.
+SHARED_TARGET_DIR="${FFS_SHARED_TARGET_DIR:-/data/tmp/cargo-target}"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  # Compare with trailing slashes stripped, and reject subdirectories of the
+  # shared root too — /data/tmp/cargo-target/frankenfs is still the shared dir.
+  _ctd="${CARGO_TARGET_DIR%/}"
+  _shared="${SHARED_TARGET_DIR%/}"
+  if [ "$_ctd" = "$_shared" ] || case "$_ctd" in "$_shared"/*) true ;; *) false ;; esac; then
+    echo ">> CARGO_TARGET_DIR=$CARGO_TARGET_DIR is the SHARED cross-repo target dir; ignoring it." >&2
+    echo ">> Building into the repo-local target/ instead (set FFS_SHARED_TARGET_DIR to change)." >&2
+    unset CARGO_TARGET_DIR
+  fi
+  unset _ctd _shared
+fi
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 OUT="$TARGET_DIR/${PROFILE}/${BIN}"
 
@@ -59,8 +92,12 @@ if [ "${SKIP_TRAIN:-0}" != "1" ]; then
     exit 1
   fi
   mkdir -p "$PGO_DIR"
-  RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-generate=$PGO_DIR" \
-    cargo build --profile "$PROFILE" -p "$BIN"
+  # env -u plus an explicit --target-dir: the guard above already unset a shared
+  # CARGO_TARGET_DIR, and these make the destination independent of the
+  # environment even if this script is sourced or that guard is edited later.
+  env -u CARGO_TARGET_DIR \
+    RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-generate=$PGO_DIR" \
+    cargo build --profile "$PROFILE" -p "$BIN" --target-dir "$TARGET_DIR"
   INSTR="$OUT"
 
   if [ -z "$TRAIN_IMG" ]; then
@@ -121,9 +158,10 @@ MARKER
 fi
 
 echo ">> [4/4] optimized build (profile-use + fat LTO + target-cpu=$TARGET_CPU)"
-FFS_PGO_PROFILE_SHA256="$PROFILE_SHA256" \
+env -u CARGO_TARGET_DIR \
+  FFS_PGO_PROFILE_SHA256="$PROFILE_SHA256" \
   RUSTFLAGS="-C target-cpu=$TARGET_CPU -C profile-use=$PGO_DIR/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
-  cargo build --profile "$PROFILE" -p "$BIN"
+  cargo build --profile "$PROFILE" -p "$BIN" --target-dir "$TARGET_DIR"
 
 echo ">> done: $OUT  (fat LTO + target-cpu=$TARGET_CPU + PGO profile=$PROFILE_SHA256)"
 "$OUT" bench-evidence
