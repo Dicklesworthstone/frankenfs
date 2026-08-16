@@ -9949,21 +9949,9 @@ mod tests {
         ffs_fuse::MetricsSnapshot {
             requests_total,
             requests_ok: requests_total,
-            requests_err: 0,
             bytes_read: 4096,
             metadata_requests: requests_total,
-            getattr_dispatch_count: 0,
-            getattr_dispatch_nanos: 0,
-            getxattr_dispatch_count: 0,
-            getxattr_dispatch_nanos: 0,
-            mutation_dispatch_count: 0,
-            mutation_dispatch_nanos: 0,
-            lookup_dispatch_count: 0,
-            lookup_dispatch_nanos: 0,
-            readdir_dispatch_count: 0,
-            readdir_dispatch_nanos: 0,
-            requests_throttled: 0,
-            requests_shed: 0,
+            ..Default::default()
         }
     }
 
@@ -9983,6 +9971,7 @@ mod tests {
                     cache_misses: 0,
                     stolen_from: 0,
                     stolen_to: 0,
+                    ..Default::default()
                 })
                 .collect(),
         }
@@ -10112,14 +10101,13 @@ mod tests {
                     getattr_dispatch_nanos: 500,
                     getxattr_dispatch_count: 3,
                     getxattr_dispatch_nanos: 300,
-                    mutation_dispatch_count: 0,
-                    mutation_dispatch_nanos: 0,
                     lookup_dispatch_count: 9,
                     lookup_dispatch_nanos: 900,
                     readdir_dispatch_count: 7,
                     readdir_dispatch_nanos: 700,
                     requests_throttled: 4,
                     requests_shed: 1,
+                    ..Default::default()
                 },
                 worker_count: 2,
                 per_core: Some(super::MountAdaptiveRuntimePerCoreObservation {
@@ -10277,23 +10265,7 @@ mod tests {
     fn mount_adaptive_runtime_shutdown_summary_reports_default_off_explicitly() {
         let observation = super::MountAdaptiveRuntimeShutdownObservation {
             metrics: ffs_fuse::MetricsSnapshot {
-                requests_total: 0,
-                requests_ok: 0,
-                requests_err: 0,
-                bytes_read: 0,
-                metadata_requests: 0,
-                getattr_dispatch_count: 0,
-                getattr_dispatch_nanos: 0,
-                getxattr_dispatch_count: 0,
-                getxattr_dispatch_nanos: 0,
-                mutation_dispatch_count: 0,
-                mutation_dispatch_nanos: 0,
-                lookup_dispatch_count: 0,
-                lookup_dispatch_nanos: 0,
-                readdir_dispatch_count: 0,
-                readdir_dispatch_nanos: 0,
-                requests_throttled: 0,
-                requests_shed: 0,
+                ..Default::default()
             },
             worker_count: 0,
             per_core: None,
@@ -12071,6 +12043,7 @@ mod tests {
             cache_dirty_count: 40,
             writeback_queue_depth: 12,
             hit_rate: 0.9,
+            ..Default::default()
         };
         with_temp_image_path(
             serde_json::to_string_pretty(&snapshot)
@@ -12136,6 +12109,7 @@ mod tests {
             pruned_versions_total: 99,
             commit_latency_us: test_histogram(5, 200),
             conflict_resolution_latency_us: test_histogram(2, 50),
+            ..Default::default()
         };
         with_temp_image_path(
             serde_json::to_string_pretty(&snapshot)
@@ -12207,6 +12181,7 @@ mod tests {
             decode_successes: 6,
             symbol_refresh_count: 14,
             symbol_staleness_max_seconds: 120.0,
+            ..Default::default()
         };
         with_temp_image_path(
             serde_json::to_string_pretty(&snapshot)

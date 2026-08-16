@@ -1172,6 +1172,7 @@ impl AtomicMetrics {
             readdir_dispatch_nanos: self.readdir_dispatch_nanos.0.load(Ordering::Relaxed),
             requests_throttled: self.requests_throttled.0.load(Ordering::Relaxed),
             requests_shed: self.requests_shed.0.load(Ordering::Relaxed),
+            ..Default::default()
         }
     }
 }
@@ -1206,7 +1207,7 @@ impl std::fmt::Debug for AtomicMetrics {
 }
 
 /// Point-in-time snapshot of metrics (all plain `u64`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub requests_total: u64,
     pub requests_ok: u64,
@@ -15699,6 +15700,9 @@ mod tests {
             "metrics: MetricsSnapshot { requests_total: 0, requests_ok: 0, requests_err: 0, ",
             "bytes_read: 0, metadata_requests: 0, getattr_dispatch_count: 0, ",
             "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            // bd-i353e added the mutation counters in 3145d182 without updating this
+            // golden, which left `mount_handle_debug_format` red on HEAD. Restored.
+            "mutation_dispatch_count: 0, mutation_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
             "requests_throttled: 0, requests_shed: 0 }, ",
@@ -16788,14 +16792,11 @@ AllowOther"#;
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
             getxattr_dispatch_nanos: 200,
-            mutation_dispatch_count: 0,
-            mutation_dispatch_nanos: 0,
             lookup_dispatch_count: 5,
             lookup_dispatch_nanos: 500,
             readdir_dispatch_count: 3,
             readdir_dispatch_nanos: 300,
-            requests_throttled: 0,
-            requests_shed: 0,
+            ..Default::default()
         };
         let b = a;
         assert_eq!(a, b);
@@ -16810,14 +16811,11 @@ AllowOther"#;
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
             getxattr_dispatch_nanos: 200,
-            mutation_dispatch_count: 0,
-            mutation_dispatch_nanos: 0,
             lookup_dispatch_count: 5,
             lookup_dispatch_nanos: 500,
             readdir_dispatch_count: 3,
             readdir_dispatch_nanos: 300,
-            requests_throttled: 0,
-            requests_shed: 0,
+            ..Default::default()
         };
         assert_ne!(a, c);
     }
@@ -16831,6 +16829,58 @@ AllowOther"#;
         let snap = m.snapshot();
         assert_eq!(snap.requests_throttled, 2);
         assert_eq!(snap.requests_shed, 1);
+    }
+
+    /// bd-k3g3g: adding a counter to `MetricsSnapshot` must stay a one-line change.
+    ///
+    /// Before the `Default` derive, every construction site listed every field, so an
+    /// additive field broke ~31 sites across ffs-fuse and ffs-cli. That tax was paid
+    /// three times in this campaign (dispatch counts, dispatch nanos, mutation
+    /// counters) and was blocking bd-4zokj's whole-request timer.
+    ///
+    /// The property under test is exactly the one that makes the next counter cheap:
+    /// a site may name only the fields it cares about and take the rest from
+    /// `Default`, and the result is identical to writing every field out by hand.
+    #[test]
+    fn metrics_snapshot_struct_update_matches_an_exhaustive_literal_bd_k3g3g() {
+        let sparse = MetricsSnapshot {
+            requests_total: 7,
+            ..Default::default()
+        };
+        let exhaustive = MetricsSnapshot {
+            requests_total: 7,
+            requests_ok: 0,
+            requests_err: 0,
+            bytes_read: 0,
+            metadata_requests: 0,
+            getattr_dispatch_count: 0,
+            getattr_dispatch_nanos: 0,
+            getxattr_dispatch_count: 0,
+            getxattr_dispatch_nanos: 0,
+            mutation_dispatch_count: 0,
+            mutation_dispatch_nanos: 0,
+            lookup_dispatch_count: 0,
+            lookup_dispatch_nanos: 0,
+            readdir_dispatch_count: 0,
+            readdir_dispatch_nanos: 0,
+            requests_throttled: 0,
+            requests_shed: 0,
+        };
+        assert_eq!(
+            sparse, exhaustive,
+            "struct-update construction must equal the exhaustive literal; if this \
+             fails, `Default` for MetricsSnapshot no longer zeroes every counter and \
+             every site using `..Default::default()` is silently reporting something \
+             other than zero for the fields it does not name"
+        );
+        assert_eq!(
+            MetricsSnapshot::default(),
+            MetricsSnapshot {
+                requests_total: 0,
+                ..Default::default()
+            },
+            "Default must be the all-zero snapshot"
+        );
     }
 
     #[test]
