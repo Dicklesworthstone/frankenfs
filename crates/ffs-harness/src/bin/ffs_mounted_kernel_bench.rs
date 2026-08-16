@@ -5199,6 +5199,37 @@ fn select_cpu_placement(
     })
 }
 
+/// How many DISTINCT physical cores a CPU set occupies, and how many of its members are
+/// SMT siblings of another member (bd-client-core-distinctness).
+///
+/// Client placement fills `driver_cpus` in two passes: first CPUs whose siblings are all
+/// quiet, then — if that did not reach the requested thread count — a BACKFILL from
+/// `driver_guard_cpus`, which is precisely the sibling set of the CPUs already chosen.
+/// The backfill is deliberate and it is the right trade: refusing to run rather than
+/// degrade would mean never measuring on a busy host. What was wrong is that it was
+/// SILENT, so a row could not say whether its 8 threads had 8 cores or 4.
+///
+/// Audited 2026-08-16 over 13 clean-null runs of the worst row: ZERO achieved 8 threads
+/// on 8 distinct cores — ten got 7, two got 6, one got 4. The degradation varied run to
+/// run and was never recorded, which makes it an uncontrolled asymmetry rather than a
+/// known cost.
+///
+/// Reported, not gated: the SMT-shared pair slows the client, and the client is a larger
+/// fraction of the fast kernel arm than of the slow FUSE arm, so it depresses the ratio.
+/// Recording it lets that be tested; refusing on it would simply stop measurement.
+fn physical_core_occupancy(cpus: &BTreeSet<usize>) -> Result<(usize, usize)> {
+    let mut cores: BTreeSet<BTreeSet<usize>> = BTreeSet::new();
+    let mut shared = 0usize;
+    for &cpu in cpus {
+        let sibs = thread_siblings(cpu)?;
+        if sibs.iter().any(|s| *s != cpu && cpus.contains(s)) {
+            shared += 1;
+        }
+        cores.insert(sibs);
+    }
+    Ok((cores.len(), shared))
+}
+
 fn select_fuse_cpus(
     ranked: &[(usize, f64)],
     busy: &BTreeMap<usize, f64>,
@@ -6872,6 +6903,15 @@ fn fs_report(
     // bd-cpu-mhz: observed clocks, not just the policy. On a powersave host a quiet
     // window is a DOWNCLOCKED window, so loadavg alone cannot separate contention noise
     // from frequency error. Evidence, not a gate.
+    // bd-client-core-distinctness + bd-cpu-mhz: per-arm core identity and clock.
+    let client_cpu_set: BTreeSet<usize> = placement.driver_cpus.iter().copied().collect();
+    let client_core_occupancy = physical_core_occupancy(&client_cpu_set).ok();
+    let client_mhz_json = {
+        let mhz = cpu_mhz();
+        cpu_mhz_summary(&mhz, &client_cpu_set).map(|(min, max, mean, spread)| {
+            json!({"min": min, "max": max, "mean": mean, "spread": spread})
+        })
+    };
     let cpu_mhz_observed_json = {
         let mhz = cpu_mhz();
         // Summarise over ALL cores AND over the placement set separately.
@@ -6960,6 +7000,18 @@ fn fs_report(
         "client_affinity_list": client_affinity_list,
         "client_affinity_cpu_count": placement.driver_cpus.len(),
         "client_affinity_cpus": placement.driver_cpus,
+        // bd-client-core-distinctness: how many DISTINCT physical cores those threads
+        // actually got, and how many of them share a core with another client thread.
+        // Placement backfills from the sibling set when it cannot find enough quiet
+        // distinct cores; that trade is correct but was silent. Audited over 13
+        // clean-null runs, ZERO put 8 threads on 8 cores (ten got 7, two got 6, one
+        // got 4), and the degradation varied run to run without being recorded.
+        "client_physical_cores": client_core_occupancy.map(|(cores, _)| cores),
+        "client_smt_shared_cpus": client_core_occupancy.map(|(_, shared)| shared),
+        // MHz on the client cores specifically — the set whose clock can skew a ratio,
+        // as distinct from the all-core figure which mostly reports how much of the
+        // machine is asleep.
+        "client_cpu_mhz": client_mhz_json,
         "requested_client_threads_per_affinity_cpu": config.client_threads() as f64 / placement.driver_cpus.len() as f64,
         "placement_scope": config.placement_scope.label(),
         "btrfs_verify_data_on_read": config.btrfs_verify_data_on_read,
@@ -9741,6 +9793,39 @@ mod tests {
     /// So the all-core figure must not be read as ratio error. What can corrupt a ratio
     /// is the spread over the cores the ARMS occupy, which is why the summary takes a
     /// CPU set and why both figures are reported.
+    /// bd-client-core-distinctness: 8 threads on 8 cores must be distinguishable from
+    /// 8 threads on 4 cores, because both were measured and neither was recorded.
+    ///
+    /// Client placement backfills from the SIBLING set when it cannot find enough quiet
+    /// distinct cores. That trade is correct — refusing rather than degrading would mean
+    /// never measuring on a busy host — but it was silent. Audited over 13 clean-null
+    /// runs of the worst row: ZERO achieved 8-on-8; ten got 7 cores, two got 6, one got
+    /// 4. On this box cpu N and cpu N+32 are SMT siblings.
+    ///
+    /// The pair (cores, shared) is what a later analysis needs: `cores` says how much
+    /// parallelism the client really had, `shared` says how many threads were paying for
+    /// it, and a row carrying neither cannot be compared to one that had a different mix.
+    #[test]
+    fn physical_core_occupancy_separates_8_on_8_from_8_on_4_bd_client_core_distinctness() {
+        // Eight threads, eight distinct cores: nothing shared.
+        let ideal: BTreeSet<usize> = (0..8).collect();
+        let (cores, shared) = physical_core_occupancy(&ideal).expect("occupancy");
+        assert_eq!(cores, 8, "eight distinct cores");
+        assert_eq!(shared, 0, "no thread shares a core with another");
+
+        // The worst case actually observed: 8 threads on 4 cores, every one paired.
+        let worst: BTreeSet<usize> = [10, 11, 12, 14, 42, 43, 44, 46].into_iter().collect();
+        let (cores, shared) = physical_core_occupancy(&worst).expect("occupancy");
+        assert_eq!(cores, 4, "10/42, 11/43, 12/44, 14/46 are four sibling pairs");
+        assert_eq!(shared, 8, "all eight threads share a core with another thread");
+
+        // The common case: one sibling pair, so 7 cores and 2 shared threads.
+        let typical: BTreeSet<usize> = [24, 25, 26, 27, 29, 30, 58, 63].into_iter().collect();
+        let (cores, shared) = physical_core_occupancy(&typical).expect("occupancy");
+        assert_eq!(cores, 7, "26 and 58 are siblings, so eight cpus occupy seven cores");
+        assert_eq!(shared, 2, "exactly the two members of that pair are shared");
+    }
+
     #[test]
     fn placement_subset_spread_differs_from_all_core_spread_bd_cpu_mhz() {
         // Two busy arm cores clocked alike, plus parked idle cores.
