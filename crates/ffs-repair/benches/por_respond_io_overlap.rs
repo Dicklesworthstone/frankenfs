@@ -176,12 +176,11 @@ where
             let exp = expected.get(ch.table_offset as usize)?;
             (block_hash[0] == auth[0] && &auth == exp).then_some(())
         })();
-        match verdict {
-            Some(()) => passed += 1,
-            None => {
-                failed += 1;
-                failed_indices.push(ch.index);
-            }
+        if verdict.is_some() {
+            passed += 1;
+        } else {
+            failed += 1;
+            failed_indices.push(ch.index);
         }
     }
     (passed, failed, failed_indices)

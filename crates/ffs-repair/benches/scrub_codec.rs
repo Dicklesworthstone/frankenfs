@@ -98,7 +98,7 @@ struct CorruptEveryNthValidator {
 
 impl BlockValidator for CorruptEveryNthValidator {
     fn validate(&self, block: BlockNumber, _data: &BlockBuf) -> BlockVerdict {
-        if block.0 % self.every_n == 0 && block.0 > 0 {
+        if block.0.is_multiple_of(self.every_n) && block.0 > 0 {
             BlockVerdict::Corrupt(vec![(
                 ffs_repair::scrub::CorruptionKind::ChecksumMismatch,
                 ffs_repair::scrub::Severity::Error,

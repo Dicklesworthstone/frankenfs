@@ -15,9 +15,8 @@ use std::hint::black_box;
 
 /// Current production shape.
 fn zero_word(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(8);
-    chunks.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && chunks.remainder().iter().all(|&b| b == 0)
+    let (chunks, remainder) = data.as_chunks::<8>();
+    chunks.iter().all(|c| u64::from_ne_bytes(*c) == 0) && remainder.iter().all(|&b| b == 0)
 }
 
 /// Byte-wise (the old storage.rs erasure-symbol shape before routing through
@@ -28,8 +27,8 @@ fn zero_byte(data: &[u8]) -> bool {
 
 /// 4-wide OR-reduce: one branch per 256 bits.
 fn zero_unrolled4(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
+    let (chunks, rem) = data.as_chunks::<32>();
+    for block in chunks {
         let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
@@ -38,10 +37,8 @@ fn zero_unrolled4(data: &[u8]) -> bool {
             return false;
         }
     }
-    let rem = chunks.remainder();
-    let mut tail = rem.chunks_exact(8);
-    tail.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&b| b == 0)
+    let (tail, tail_rem) = rem.as_chunks::<8>();
+    tail.iter().all(|c| u64::from_ne_bytes(*c) == 0) && tail_rem.iter().all(|&b| b == 0)
 }
 
 fn bench(c: &mut Criterion) {
@@ -63,13 +60,13 @@ fn bench(c: &mut Criterion) {
         assert_eq!(zero_byte(block), zero_unrolled4(block));
         let mut g = c.benchmark_group(format!("scrub_is_all_zero_{name}"));
         g.bench_function("byte", |b| {
-            b.iter(|| black_box(zero_byte(black_box(block))))
+            b.iter(|| black_box(zero_byte(black_box(block))));
         });
         g.bench_function("word", |b| {
-            b.iter(|| black_box(zero_word(black_box(block))))
+            b.iter(|| black_box(zero_word(black_box(block))));
         });
         g.bench_function("unrolled4", |b| {
-            b.iter(|| black_box(zero_unrolled4(black_box(block))))
+            b.iter(|| black_box(zero_unrolled4(black_box(block))));
         });
         g.finish();
     }

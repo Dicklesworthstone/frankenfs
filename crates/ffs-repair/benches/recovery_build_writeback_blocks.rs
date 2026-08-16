@@ -194,9 +194,15 @@ fn map_absolute_blocks(corrupt_blocks: &[u64]) -> Result<Vec<u32>, &'static str>
     Ok(indices)
 }
 
+// The clone is NOT removable: this arm exists to measure the legacy path's
+// extra copy, so deleting it would delete the thing being benchmarked.
+#[expect(
+    clippy::redundant_clone,
+    reason = "the extra copy is the measured work"
+)]
 fn legacy_double_normalize(corrupt_blocks: &[u64]) -> Result<Vec<u32>, &'static str> {
     let indices = map_absolute_blocks(corrupt_blocks)?;
-    let mut normalized = indices.to_vec();
+    let mut normalized = indices.clone();
     normalize_indices(&mut normalized, ABSOLUTE_SOURCE_BLOCKS)?;
     Ok(normalized)
 }

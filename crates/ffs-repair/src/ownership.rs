@@ -759,7 +759,9 @@ mod tests {
 
     #[test]
     fn iso8601_round_trip() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_710_000_000); // ~2024-03
+        // 475_000 h == 1_710_000_000 s exactly (~2024-03); the larger unit is
+        // what clippy::duration_suboptimal_units asks for and is lossless here.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(475_000);
         let formatted = format_iso8601(now);
         let parsed = parse_iso8601(&formatted).expect("parse");
         let delta = parsed

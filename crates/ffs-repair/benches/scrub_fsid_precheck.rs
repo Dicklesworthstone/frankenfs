@@ -34,6 +34,9 @@ const N: usize = 256; // blocks per iter (one read batch worth)
 const FSID: [u8; 16] = [0x11; 16]; // this filesystem's fsid
 
 /// A data-heavy block: non-zero bytes, fsid region (0x20..0x30) NOT matching FSID.
+// Deliberate truncation: this synthesises a byte pattern, so only the low 8
+// bits are wanted.
+#[expect(clippy::cast_possible_truncation, reason = "synthetic byte pattern")]
 fn make_block(seed: usize) -> Vec<u8> {
     let mut b = vec![0u8; BLOCK];
     for (i, x) in b.iter_mut().enumerate() {
@@ -48,10 +51,8 @@ fn make_block(seed: usize) -> Vec<u8> {
 
 /// OLD: parse the full header, then reject on fsid mismatch.
 fn old_validate(slice: &[u8]) -> bool {
-    match BtrfsHeader::parse_from_block(slice) {
-        Ok(header) => header.fsid == FSID, // true == metadata candidate
-        Err(_) => false,
-    }
+    // true == metadata candidate
+    BtrfsHeader::parse_from_block(slice).is_ok_and(|header| header.fsid == FSID)
 }
 
 /// NEW: 16-byte fsid pre-check, only parse on match.

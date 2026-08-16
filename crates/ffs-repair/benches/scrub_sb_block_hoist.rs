@@ -31,11 +31,10 @@ const BLOCK_SIZE: u64 = 16_384; // btrfs nodesize
 const SUPER_INFO_OFFSET: u64 = 64 * 1024;
 
 /// OLD: recompute the two target-block divisions per block, then reject.
-
 fn old_path(block: u64, bs: u64) -> bool {
     // superblock validator: target_block_and_offset (division + modulo)
     let sb_target = SUPER_INFO_OFFSET / bs;
-    let _sb_off = SUPER_INFO_OFFSET % bs;
+    black_box(SUPER_INFO_OFFSET % bs);
     if block != sb_target {
         // tree-block validator: superblock_block (division)
         let tb_sb = SUPER_INFO_OFFSET / bs;
@@ -47,7 +46,6 @@ fn old_path(block: u64, bs: u64) -> bool {
 }
 
 /// NEW: compare against precomputed block numbers (no division).
-
 fn new_path(block: u64, sb_target: u64, tb_sb: u64) -> bool {
     if block != sb_target && block != tb_sb {
         return true;

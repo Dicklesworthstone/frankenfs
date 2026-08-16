@@ -47,10 +47,12 @@ fn xor_into_word(dst: &mut [u8], src: &[u8]) {
     let words = n / 8;
     let (dst_w, dst_rem) = dst.split_at_mut(words * 8);
     let (src_w, src_rem) = src.split_at(words * 8);
-    for (dc, sc) in dst_w.chunks_exact_mut(8).zip(src_w.chunks_exact(8)) {
-        let d = u64::from_ne_bytes(dc.try_into().unwrap());
-        let s = u64::from_ne_bytes(sc.try_into().unwrap());
-        dc.copy_from_slice(&(d ^ s).to_ne_bytes());
+    let (dst_words, _) = dst_w.as_chunks_mut::<8>();
+    let (src_words, _) = src_w.as_chunks::<8>();
+    for (dc, sc) in dst_words.iter_mut().zip(src_words) {
+        let d = u64::from_ne_bytes(*dc);
+        let s = u64::from_ne_bytes(*sc);
+        *dc = (d ^ s).to_ne_bytes();
     }
     let rem = dst_rem.len().min(src_rem.len());
     for (d, s) in dst_rem[..rem].iter_mut().zip(src_rem[..rem].iter()) {

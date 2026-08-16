@@ -122,8 +122,8 @@ fn symbol_slice(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 fn all_zero_unrolled4(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
+    let (chunks, rem) = data.as_chunks::<32>();
+    for block in chunks {
         let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
@@ -132,9 +132,9 @@ fn all_zero_unrolled4(data: &[u8]) -> bool {
             return false;
         }
     }
-    let mut tail = chunks.remainder().chunks_exact(8);
-    tail.all(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&byte| byte == 0)
+    let (tail, tail_rem) = rem.as_chunks::<8>();
+    tail.iter().all(|chunk| u64::from_ne_bytes(*chunk) == 0)
+        && tail_rem.iter().all(|&byte| byte == 0)
 }
 
 /// Representative raw-symbol parse: first `SYMBOL_SIZE` bytes, skip all-zero.
@@ -183,6 +183,12 @@ fn read_parallel(cx: &Cx, device: &dyn BlockDevice, blocks: &[BlockNumber]) -> R
     Ok(out)
 }
 
+// The criterion group's lifetime is deliberate: it spans every input size
+// before finish(). Tightening it would reshape the measured region.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "criterion group scope is intentional"
+)]
 fn bench_symbol_read(c: &mut Criterion) {
     let cx = Cx::for_testing();
     let mut group = c.benchmark_group("repair_symbol_read_io_overlap");

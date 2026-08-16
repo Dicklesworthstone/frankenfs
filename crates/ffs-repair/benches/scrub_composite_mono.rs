@@ -35,6 +35,10 @@ const CSUM_CRC32C: u16 = 0;
 /// is a validator target (the bench only touches data blocks 100.. anyway).
 const TOTAL_BYTES: u64 = 1 << 20;
 
+// The `as u8` below is a deliberate truncation: this synthesises a byte
+// pattern, so only the low 8 bits are wanted. Same form the gf256 tables in
+// lrc.rs use for the same reason.
+#[expect(clippy::cast_possible_truncation, reason = "synthetic byte pattern")]
 fn make_block(seed: usize) -> Vec<u8> {
     let mut b = vec![0u8; BLOCK];
     for (i, x) in b.iter_mut().enumerate() {
@@ -48,9 +52,8 @@ fn make_block(seed: usize) -> Vec<u8> {
 
 /// Word-wise all-zeros test (mirrors production `is_all_zero`).
 fn is_all_zero(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(8);
-    chunks.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && chunks.remainder().iter().all(|&b| b == 0)
+    let (chunks, remainder) = data.as_chunks::<8>();
+    chunks.iter().all(|c| u64::from_ne_bytes(*c) == 0) && remainder.iter().all(|&b| b == 0)
 }
 
 /// Monomorphic inline of the 3-validator btrfs composite for the common

@@ -687,6 +687,12 @@ fn bench_local(c: &mut Criterion) {
     group.finish();
 }
 
+// criterion_group! requires fn(&mut Criterion); without the
+// bench-instrumentation feature the body only discards `c`.
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "criterion_group! signature"
+)]
 fn bench_source_read_batch(c: &mut Criterion) {
     #[cfg(feature = "bench-instrumentation")]
     source_read_batch::bench(c);
