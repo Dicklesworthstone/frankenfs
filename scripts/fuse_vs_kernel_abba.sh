@@ -90,16 +90,6 @@ CONTENTION=${FFS_CONTENTION_CHECK:-0}
 # window and compares arms that never saw the same conditions. Everything this
 # harness has learned says put both arms in the same window.
 SIBLING_BIAS=${FFS_SIBLING_BIAS:-0}
-if [ "$SIBLING_BIAS" = "1" ]; then
-  SIB_CPU=$(python3 -c "
-import sys; sys.path.insert(0, '$HERE')
-import host_stability as h
-s = h.sibling_of($DAEMON_CPU)
-print(s if s is not None else '')
-")
-  [ -n "$SIB_CPU" ] || { echo "FATAL: cpu$DAEMON_CPU has no SMT sibling; nothing to measure"; exit 7; }
-  echo "sibling-bias mode: broken arm pins client to cpu$SIB_CPU (daemon cpu$DAEMON_CPU's sibling)"
-fi
 OUT=${FFS_OUT:-/tmp/ffs-abba}
 BLOCKS=${FFS_BLOCKS:-3}
 REPS=${FFS_REPS:-6}
@@ -111,6 +101,17 @@ DAEMON_CPU=${FFS_DAEMON_CPU:-8}
 # a sibling pairing rather than trusting the default.
 CLIENT_CPU=${FFS_CLIENT_CPU:-12}
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+if [ "$SIBLING_BIAS" = "1" ]; then
+  SIB_CPU=$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+import host_stability as h
+s = h.sibling_of($DAEMON_CPU)
+print(s if s is not None else '')
+")
+  [ -n "$SIB_CPU" ] || { echo "FATAL: cpu$DAEMON_CPU has no SMT sibling; nothing to measure"; exit 7; }
+  echo "sibling-bias mode: broken arm pins client to cpu$SIB_CPU (daemon cpu$DAEMON_CPU's sibling)"
+fi
 
 # A ratio whose arms sit on structurally different hardware is a hardware ratio in
 # disguise. Refuse before measuring rather than discovering it in the row.
