@@ -73,6 +73,25 @@ def main():
             per_visit[(arm, pos)].append(float(val))
     loads = [float(x) for x in open(f"{OUT}/loadavg")]
 
+    try:
+        freqs = collections.defaultdict(lambda: collections.defaultdict(list))
+        with open(f"{OUT}/cpufreq") as fh:
+            for line in fh:
+                arm, d_khz, c_khz = line.strip().split("\t")
+                freqs[arm]["daemon"].append(int(d_khz) / 1000)
+                freqs[arm]["client"].append(int(c_khz) / 1000)
+    except (OSError, ValueError):
+        freqs = {}
+    if freqs:
+        print("\nCPU MHz per arm (pinned cores). A frequency difference between "
+              "arms is a confound the ratio cannot cancel:")
+        for arm in sorted(freqs):
+            d = freqs[arm]["daemon"]
+            c = freqs[arm]["client"]
+            if d and c:
+                print(f"  {arm:8} daemon {st.median(d):6.0f} MHz   "
+                      f"client {st.median(c):6.0f} MHz")
+
     print(f"\nloadavg during run: median {st.median(loads):.2f} "
           f"min {min(loads):.2f} max {max(loads):.2f} (n={len(loads)})")
     print("record this in the banked row; a row is only as good as the "

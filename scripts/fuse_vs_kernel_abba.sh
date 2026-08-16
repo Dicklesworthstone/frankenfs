@@ -124,7 +124,7 @@ gcc -O2 -o "$BIN" "$SRC" || { echo "FATAL: client build failed"; exit 2; }
 
 FMNT=$OUT/ffs; KMNT=$OUT/kern; TMNT=/dev/shm/ffs-abba-cal
 mkdir -p "$FMNT" "$KMNT" "$TMNT"
-: > "$OUT/samples.tsv"; : > "$OUT/loadavg"
+: > "$OUT/samples.tsv"; : > "$OUT/loadavg"; : > "$OUT/cpufreq"
 
 # Name list and calibration dir are built from the KERNEL mount. Never enumerate
 # a directory inside the mount you are measuring: a partial `ls` in the measured
@@ -151,6 +151,18 @@ sweep() { # $1 dir  $2 tag  $3 position
     else taskset -c "$CLIENT_CPU" "$BIN" "$1" >/dev/null 2>&1; fi
     e=$EPOCHREALTIME
     awk '{print $1}' /proc/loadavg >> "$OUT/loadavg"
+    # Per-arm CPU frequency, on the two cores this harness pins. Recorded because
+    # frequency scaling is a real confound for any cross-arm comparison and
+    # because it is cheap. NOTE the trap: sampling an IDLE core reads the floor
+    # (1429 MHz observed on this box) while a working core boosts to ~4000 MHz, so
+    # a frequency read taken outside the work is meaningless. This samples right
+    # after a rep, which is the closest cheap proxy; the dedicated audit that
+    # sampled DURING the work found both arms at ~4 GHz and the daemon core within
+    # 0.01% of the client core, so this axis is clean on this box.
+    printf "%s\t%s\t%s\n" "$2" \
+      "$(cat /sys/devices/system/cpu/cpu$DAEMON_CPU/cpufreq/scaling_cur_freq 2>/dev/null || echo 0)" \
+      "$(cat /sys/devices/system/cpu/cpu$CLIENT_CPU/cpufreq/scaling_cur_freq 2>/dev/null || echo 0)" \
+      >> "$OUT/cpufreq"
     # Abort rather than finish a run the host has walked away from. A completed
     # run under conditions it was not admitted under costs more than the run did,
     # because the row has to be withdrawn afterwards.
