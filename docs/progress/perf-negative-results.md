@@ -11321,3 +11321,70 @@ Harness `scripts`-local `readdir_attr.sh`; candidate
 because a FUSE mount runs only on the executing machine. Counted mechanism: **32769
 probes vs 32769 probes** across the two slot counts, with the dispatch count moving
 `65539 -> 32770` underneath an unchanged round-trip count.
+
+## 2026-08-16 — DECOMPOSED: the memo's 2.08x is 1.36x per-op and 1.53x contention — a single thread sees only two thirds of it (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+The attribution above left an honest gap: the dispatch counters account for only ~12% of
+the comparator's `2.08x`, and a single unpinned sweep could not even reproduce the
+direction. Two hypotheses, predicting different next levers:
+
+- **per-op** — each probe's descent costs what the counters say plus overhead they miss,
+  and one thread should see ~`2x` too;
+- **contention** — 8 client threads descending the fs-tree simultaneously contend on
+  something, and one thread should see much less.
+
+**It is both, and roughly evenly split in log terms.**
+
+Alternating mounts with an A/A null on the same schedule, 5 rounds, single-threaded
+steady-state sweep (mount, warm twice so the memo is filled and dentries are hot, time
+the third), 32,768 entries:
+
+    4096 median   20187.1 ns/entry
+    65536 median  15520.4 ns/entry
+    A/B 4096 over 65536, same-invocation, median 1.359036x bootstrap median 95% confidence interval [1.162220, 1.405694]
+    A/A null 4096 over 4096, same-invocation, median 1.002902x bootstrap median 95% confidence interval [0.958159, 1.086918]
+    rounds=5 bootstrap_resamples=20000
+
+The A/B interval `[1.162, 1.406]` clears the null interval `[0.958, 1.087]` with no
+overlap, and the null sits on parity at `1.0029x`.
+
+| instrument | client threads | memo effect |
+| --- | --- | --- |
+| dispatch counters | — | ~`1.12x` (all the counter can see) |
+| this steady-state A/B | **1** | **`1.359036x`** |
+| mounted comparator | **8** | `2.078x`-`2.095x` |
+
+Dividing: `2.078 / 1.359 = ` **`1.529x`** of the comparator's effect is not present at one
+thread. So sizing the memo buys a genuine per-op saving of ~`1.36x`, and roughly the same
+again from whatever 8 concurrent descents contend on. **That second half is invisible to
+any per-op counter**, which is why the dispatch numbers under-explain the row — and they
+under-explain even the single-threaded part, predicting `~1.12x` against a measured
+`1.359x`, i.e. they capture about a third of the excess. Consistent with the counter
+timing only the innermost dispatch call and missing queueing and request handling.
+
+### What this changes about the next lever
+
+The contention half is a property of concurrent fs-tree descent, not of the capability
+probe. It should respond to anything that reduces simultaneous descents — which is what
+the memo does incidentally by making most probes not descend at all — and it will NOT
+respond to reducing the cost of one descent. Anyone attacking the remaining `3.36x`
+should know that at 8 threads roughly half the memo's benefit came from removing
+concurrency pressure rather than from removing work, and should measure at the thread
+count they intend to claim at.
+
+### A correction to my own earlier reading
+
+The attribution entry above reported a single unpinned sweep at `768 ms` (4096) against
+`892 ms` (65536) — the WRONG direction — and I declined to read it. That was the right
+call for the wrong reason: I attributed it to the instrument being unsuited, when the
+real problem was that it was one sample with no null and no repeats. The same instrument,
+given 5 interleaved rounds and an A/A control, resolves a `1.36x` effect cleanly. **The
+measurement was not unsuited, it was underpowered** — and those need different fixes.
+
+Harness `scripts`-local `memo_1t_steady.sh`; candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, run locally
+because a FUSE mount runs only on the executing machine. Mounts are torn down between
+arms so mount cost is paid identically by all four arms in a round, and the two null arms
+sit in the same schedule as the A/B pair. Host `CONTENDED` throughout, which is exactly
+what the A/A null is there to absorb.
