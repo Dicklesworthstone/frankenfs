@@ -12474,3 +12474,72 @@ regardless — it is the only thing that proves which binary actually ran.
 
 Counted mechanism: **47 of 47 contention samples over limit**, `max_external_busy_cpus=15`
 against a limit of `2`.
+
+## 2026-08-16 — CORRECTION to yesterday's own entry: "more contention, worse ratio" was an over-read of two points; a fourth run at DOUBLE the contention lands in the middle (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+A fourth ABBA run of btrfs readdir+stat, same invocation shape, same private candidate ELF.
+
+    RUN 4
+    fuse_over_kernel_median = 7.812565
+    bootstrap median 7.812565x with bootstrap median CI [7.791476, 8.218732], 20000 resamples
+    same-invocation A/A null control, kernel arm  0.999085  spread 1.043880  clear=FALSE
+    same-invocation A/A null control, fuse arm    0.989234  spread 1.012613  clear=true
+    twice_null_margin_ratio = 1.089684
+    directional_claim_clear = false   admitted = false   verdict = BLOCKED_NULL
+    external_load peak_off_placement_mean_busy = 0.521881, max_external_busy_cpus = 48
+
+### The correction
+
+The entry immediately above this one stated: "More socket contention, worse ratio. That is
+the expected direction and mechanism", and used it to argue the contention veto tracks a real
+effect. All four runs today:
+
+    peak_off_placement_mean_busy=0.255680  ->  7.453004   nulls clear
+    peak_off_placement_mean_busy=0.293381  ->  8.170852   nulls clear
+    peak_off_placement_mean_busy=0.521881  ->  7.812565   kernel null failed
+
+**Not monotonic.** Run 4 doubled the contention of run 3 and produced a LOWER ratio, landing
+between the other two. The claimed relationship rested on exactly two points, and two points
+always make a line. I should not have stated a direction and a mechanism from them, and the
+sentence "that is the expected direction and mechanism" made a two-point fit sound like a
+finding.
+
+### What survives the correction, and what does not
+
+DOES NOT SURVIVE: that contention severity predicts the ratio, or that the observed 9.6%
+spread between runs 2 and 3 is explained by their contention difference. Unexplained.
+
+SURVIVES, and is untouched by this: **two runs with clean A/A nulls disagreed by 9.6% with
+disjoint confidence intervals.** That observation needs no mechanism to stand — it is a
+direct comparison of two admitted runs, and it is the reason a single admitted row is
+insufficient evidence on this host.
+
+ALSO SURVIVES: withdrawing my earlier case for demoting the contention veto. That withdrawal
+was over-argued but its conclusion is unchanged and now rests on firmer ground: the ratio
+varies by ~10% across windows for reasons I cannot attribute, so a gate that refuses rows
+taken in visibly disturbed windows is doing useful work even if I cannot say exactly what it
+is filtering. "I do not know what moved" is a better reason to keep a conservative gate than
+a mechanism story that does not fit the data.
+
+### The pattern worth naming, because I have now done it twice in two turns
+
+Both errors were the same shape: taking a small number of measured points, fitting the
+smallest story that connects them, and stating that story with more confidence than the
+points support. `bd-q0xnl` already records the rule for constants — no per-round-trip figure
+may be used outside the workload that produced it. This is its sibling for TRENDS: **a
+direction claimed from two points is a fit, not a finding, and must be labelled as a
+hypothesis until a third point can contradict it.** Here the third point arrived within the
+hour and did contradict it.
+
+Nothing is claimed or superseded. Banked `7.753405x`/`7.649395x` stands, and today's four
+runs — `7.453004`, `7.812565`, `8.170852`, `8.449308` — bracket it.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+PRIVATE copy of the candidate so a concurrent peer build could not swap it. Bootstrap median
+CI, `bootstrap_resamples=20000`. LVM volume, same substrate as the banked rows.
+
+Counted mechanism: **48 of 48 contention samples over limit**, `max_external_busy_cpus=48`
+against a limit of `2`.
