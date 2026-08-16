@@ -4672,6 +4672,50 @@ fn host_provenance() -> Result<HostProvenance> {
     })
 }
 
+/// The kernel's 1/5/15-minute load averages, for the report (bd-loadavg-in-report).
+///
+/// Recorded because the fleet's 2026-08-16 finding is that host contention decides
+/// whether a row certifies, and mermaid's refinement is that VOLATILITY rather than
+/// absolute load is the blocker — a stable moderate window beats a brief quiet spike.
+/// Both of those are only checkable after the fact if the load state is stored WITH
+/// the row.
+///
+/// It was not. Every loadavg in this campaign's ledger was pasted in by hand from the
+/// invoking shell, which means a row banked by anyone who did not do that by hand
+/// cannot be re-examined against the finding at all. Capturing it here makes the
+/// practice automatic rather than a convention someone has to remember.
+///
+/// The 1-minute-to-5-minute RATIO is the volatility signal: values close together mean
+/// a settled host, a small ratio means load is collapsing and a large one means it is
+/// spiking. Both readings are stored so the ratio can be recomputed rather than
+/// trusted.
+fn load_average() -> Option<(f64, f64, f64)> {
+    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let mut parts = raw.split_whitespace();
+    let one = parts.next()?.parse().ok()?;
+    let five = parts.next()?.parse().ok()?;
+    let fifteen = parts.next()?.parse().ok()?;
+    Some((one, five, fifteen))
+}
+
+/// Whether a load sample looks like a settled window rather than a transient dip.
+///
+/// Encodes the fleet rule as a pure function so it is testable and so the report can
+/// carry the verdict rather than only the raw numbers: certify when the 1-minute and
+/// 5-minute averages are CLOSE and BOTH low. A brief quiet spike shows a small ratio
+/// (1-min far below 5-min) and is exactly what mermaid identified as the trap.
+///
+/// This is advisory only — it does not gate anything. The measurement's own
+/// pre-placement and post-hoc contention checks remain the gates; this records what
+/// the load looked like so a refusal can be attributed later.
+fn load_is_settled(one: f64, five: f64, low_threshold: f64, convergence: f64) -> bool {
+    if one > low_threshold || five > low_threshold {
+        return false;
+    }
+    let (lo, hi) = if one <= five { (one, five) } else { (five, one) };
+    hi <= 0.0 || lo / hi >= convergence
+}
+
 fn runtime_isa_label(host: &HostProvenance) -> String {
     host.runtime_features
         .iter()
@@ -6698,6 +6742,15 @@ fn fs_report(
         "chooser_statement": chooser_statement,
         "incumbent_isolation_proof": incumbent_isolation_proof_json,
         "host_identity": host.hostname,
+        "load_average": load_average().map(|(one, five, fifteen)| {
+            serde_json::json!({
+                "one_minute": one,
+                "five_minute": five,
+                "fifteen_minute": fifteen,
+                // Advisory, not a gate: see load_is_settled.
+                "settled": load_is_settled(one, five, 25.0, 0.7),
+            })
+        }),
         "physical_cores": host.physical_cores,
         "logical_threads": host.online_cpus.len(),
         "memory_bytes": host.memory_bytes,
@@ -7826,6 +7879,42 @@ mod tests {
     /// reject placements the old code would have accepted, never admit one it would
     /// have refused. That direction matters — a stability check that could admit
     /// more would be a gate weakening wearing a robustness costume.
+    /// bd-loadavg-in-report: the settled-window rule, as the fleet stated it.
+    ///
+    /// Certify when the 1-minute and 5-minute averages are CLOSE and BOTH low. The
+    /// case that matters is the one mermaid identified: a brief quiet spike, where
+    /// the 1-minute has collapsed but the 5-minute has not, looks inviting and is a
+    /// trap. Real examples from this session, all of which produced refusals or
+    /// mid-run contention:
+    ///
+    ///   1-min 11.15 / 5-min 30.25  ratio 0.37   falling, volatile
+    ///   1-min 11.07 / 5-min 20.50  ratio 0.54   still not converged
+    ///   1-min 10.28 / 5-min 25.26  ratio 0.41   certified, then refused post-hoc
+    ///
+    /// This is ADVISORY and gates nothing — the pre-placement and post-hoc contention
+    /// checks remain the gates. It exists so a refusal can be attributed to host
+    /// state after the fact, which is impossible when loadavg is pasted in by hand.
+    #[test]
+    fn load_is_settled_rejects_a_brief_quiet_spike_bd_loadavg_in_report() {
+        // Settled: close together and both low.
+        assert!(load_is_settled(8.0, 9.0, 25.0, 0.7));
+        assert!(load_is_settled(10.0, 10.0, 25.0, 0.7));
+
+        // The trap: 1-minute collapsed, 5-minute still high. Both real readings.
+        assert!(!load_is_settled(11.15, 30.25, 25.0, 0.7), "ratio 0.37 is a spike, not a window");
+        assert!(!load_is_settled(11.07, 20.50, 25.0, 0.7), "ratio 0.54 has not converged");
+        assert!(!load_is_settled(10.28, 25.26, 25.0, 0.7), "this one certified and was then refused");
+
+        // Converged but NOT low: a stable busy host is not a window either.
+        assert!(!load_is_settled(40.0, 41.0, 25.0, 0.7), "stable does not mean quiet");
+
+        // Rising spike: 1-minute far ABOVE the 5-minute is equally unsettled.
+        assert!(!load_is_settled(30.0, 12.0, 25.0, 0.7), "load climbing is not a window");
+
+        // Idle host.
+        assert!(load_is_settled(0.0, 0.0, 25.0, 0.7), "an idle host must not divide by zero");
+    }
+
     #[test]
     fn placement_requires_consecutive_stability_not_a_single_spike() {
         // A single qualifying sample is NOT enough when several are required.
