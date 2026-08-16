@@ -13517,3 +13517,67 @@ median CI from 20000 resamples, e.g. bootstrap median `8.278490x` with bootstrap
 
 Counted mechanism: **10 runs partitioned 2/8 by distinct physical core count**, giving a
 between-group difference of 3.49% against an 18.43% within-group spread.
+
+## 2026-08-16 — CORRECTION: there is no capability-probe suppression to land; all four routes are closed on measurement, and the probe is not ours to suppress (bd-z0rb8, bd-ha71t, AzureBay)
+
+Directed to "land the suppression and re-certify warm stat with it on". I am not able to do
+that, and the reason is evidence rather than difficulty. Recording it so no one spends a
+scarce quiet window on a lever that does not exist.
+
+**The probe is Linux AUDIT, not FUSE.** Captured directly with `bpftrace` on `fuse_getxattr`,
+300 of 300 stats (PlumRiver, `docs/NEGATIVE_EVIDENCE.md:6874`):
+
+    fuse_getxattr / __vfs_getxattr / get_vfs_caps_from_disk /
+    audit_copy_inode / __audit_inode / filename_lookup / vfs_statx /
+    vfs_fstatat / __do_sys_newfstatat / do_syscall_64
+
+It is audit collecting file capabilities during path resolution. Not a permission check, not
+an LSM label fetch, and nothing FUSE asks for. Re-verified on this host today: `auditctl -s`
+reports `enabled 1`, and `auditctl -l` still carries the two path-based rules over the working
+tree (`-w /data/projects -p wa` and an `-F dir=/data/projects/` destruct rule). A path-based
+rule forces per-lookup inode collection for any syscall that could match, which is why the
+probe fires even for mounts outside that tree.
+
+### All four routes are closed, each on measurement
+
+  1. `default_permissions` — CLOSED, already in effect. `ffs-fuse/src/lib.rs:4350` sets it
+     unconditionally in the base `vec!`, so every probe measurement ever banked already ran
+     with it on. Enabling it cannot be the fix because it is not off.
+  2. FUSE ABI negative-xattr cache — CLOSED, no such mechanism. The full 32-flag capability
+     set caches exactly one metadata reply (`FUSE_CACHE_SYMLINKS`) and has no xattr
+     counterpart.
+  3. `FUSE_HANDLE_KILLPRIV_V2` — CLOSED, measured INERT: 4000 probes for 2000 path stats with
+     the kernel reporting the capability ENABLED, identical to the 4000 without it.
+  4. An additive `never,exit` audit rule scoped to the mountpoint — CLOSED, measured INERT:
+     **502 probes vs 502** (`NEGATIVE_EVIDENCE.md:6870`). This is the one that would have been
+     the "suppression", and it was already tried and counted.
+
+### What suppression would actually require, and why I did not do it
+
+Removing the path-based audit rules themselves. That is a host-wide security-auditing change
+on a shared box, it is not a filesystem lever, and it would make the resulting warm-stat number
+describe a machine nobody runs. I flipped `enable_uring` earlier today and restored it because
+that switch merely PERMITS an opt-in transport; audit rules are not in the same category and I
+am not going to disable them to make a number look better.
+
+### What this leaves for warm stat, stated so the row is not simply parked
+
+The crossing is `8.674 us` of our `10.958 us` per stat — 79.2% — and the daemon is
+`0.75-0.99%`. Since the probe cannot be removed, the only lever is making the crossing cheaper:
+FUSE-over-io_uring, which is now fully unblocked (transport restored `958534ad`, knobs with a
+one-page default `9a347da8`, fail-closed against a declining kernel `7eef444d`, and the kernel
+switch demonstrated flippable and reversible today). It needs a placeable window, not more code.
+
+Provenance: `bench_evidence,binary_sha256=81d047c4c995cb1275fbbd2305f2ba713efe7f0cd252286a784c227b73745abb`
+(in-process self-report), `pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`, `hostname=thinkstation1`.
+Observed loadavg `20.33 / 27.16 / 23.64`. No measurement run; this is a re-verification of
+banked evidence plus a live `auditctl` check. **No ratio is quoted or claimed** — the runs
+referred to are banked separately as bootstrap medians with bootstrap median CIs from 20000
+resamples, e.g. bootstrap median `8.278490x` with bootstrap median CI `[8.242402, 8.323421]`,
+absolute arm medians `kernel_median_wall_ns` 27,772,000 ns and `fuse_median_wall_ns`
+214,816,000 ns.
+
+Counted mechanism: **502 probes vs 502** with the scoped `never,exit` rule installed, and
+**4000 vs 4000** with `FUSE_HANDLE_KILLPRIV_V2` negotiated — two independent suppression
+attempts, both counted, both inert.
