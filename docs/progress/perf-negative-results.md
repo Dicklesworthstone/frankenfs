@@ -13031,3 +13031,78 @@ loss, and banked `7.753405x`/`7.649395x` stands.
 
 Counted mechanism: **46 of 46 contention samples over the CPU-count limit**,
 `max_external_busy_cpus=11` against a limit of `2`, while the busy-fraction limit was met.
+
+## 2026-08-16 — the ratio/placement JOIN finally runs: placement REFUTED across 13 clean-null runs, and the preserved set turns out to MIX CONFIGURATIONS (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+No certification this turn. Loadavg was `11.15` on the 1-minute against `30.25` on the
+5-minute — a ratio of `0.37`, which is the falling-but-volatile shape mermaid identified as
+the real blocker rather than a window. Deferred to code work, per the stability rule.
+
+Every row analysed below is a same-invocation A/A null control pair that CLEARED: each
+carries `kernel_aa.clear=true` and `fuse_aa.clear=true`, which is the filter used to select
+them. Same-invocation A/A null control medians `0.986662` to `1.013928`, every one inside the
+`1.025` spread limit; same-invocation A/A null control `1.001300` on the tightest run.
+Every ratio quoted below is a bootstrap median with a bootstrap median CI from 20000
+resamples — e.g. bootstrap median `8.278490x` with bootstrap median CI
+`[8.242402, 8.323421]` — estimator `four_round_balanced_crossover_bootstrap_median_ci`.
+
+### Why the join was blocked, and it was my error
+
+I reported three times that ratio and placement could not be joined because the report JSON
+"carries `driver_cpus`/`placement_cpus` but not the ratio under `fuse_over_kernel_median`".
+The ratio is in the report — under `fuse_over_kernel`, not `fuse_over_kernel_median`. I was
+grepping the stdout metric name against the JSON schema and concluding the field was absent.
+The join was available the entire time. Placement is under `client_affinity_cpus`.
+
+### PLACEMENT IS REFUTED, now across 13 clean-null runs rather than 3
+
+    LOW  3.359246  cpus=[0,1,3,4,5,6,7,37]        HIGH 8.065190  cpus=[24,27,29,31,56,57,58,62]
+    LOW  3.438698  cpus=[10,11,12,14,42,43,44,46]  HIGH 8.110590  cpus=[24,29,31,56,57,58,60,62]
+    LOW  3.702690  cpus=[24,26,27,28,29,30,31,56]  HIGH 8.170852  cpus=[0,1,2,4,6,7,32,37]
+    LOW  6.990007  cpus=[0,2,3,4,5,6,7,38]         HIGH 8.278490  cpus=[0,5,7,32,34,35,36,38]
+    LOW  7.036174  cpus=[24,25,26,27,29,30,31,57]
+    LOW  7.316939  cpus=[24,25,26,27,29,30,58,63]
+    LOW  7.453004  cpus=[0,1,3,5,6,7,33,38]
+    LOW  7.531731  cpus=[24,25,29,30,31,57,58,59]
+    LOW  7.617279  cpus=[0,1,2,7,33,34,35,36]
+
+Both socket ranges appear in both groups, repeatedly. The `24-63` range produced `3.702690`
+and `8.110590`; the `0-38` range produced `3.359246` and `8.278490`. **CPU placement does not
+explain the spread**, confirmed on the full preserved set rather than the three points that
+first suggested it.
+
+### THE FINDING I DID NOT EXPECT: these 13 rows are not one experiment
+
+    3.359246  3.438698  3.702690   <- capability_memo_slots ~65536
+    6.990007  7.036174  7.316939  7.453004  7.531731
+    7.617279  8.065190  8.110590  8.170852  8.278490   <- capability_memo_slots ~4096
+
+The preserved readdir+stat rows span `3.36x-8.28x` because they MIX CONFIGURATIONS. The low
+outliers are the memo-sized arm (`bd-34hzz`, which took this row to `3.359246x` with the table
+sized to the directory); the rest are the shipping 4096-slot default.
+
+**Anyone joining across preserved reports without filtering on knobs will compute an average
+over two deliberately different filesystems and call it dispersion.** I came within one step
+of doing exactly that: the join above was run to test placement, and had placement happened to
+correlate with which runs were memo-sized, I would have "confirmed" a hardware effect that was
+really a configuration difference. The guard is to filter on `identities` before comparing,
+and it is now recorded here because nothing in the report layout enforces it.
+
+### What survives about the spread
+
+Restricted to the 4096-slot default — the only like-for-like set — the ten clean-null runs are
+`6.990007` through `8.278490`, spread `18.4%`. The two-cluster reading I carried across four
+entries is not supported once the set is filtered properly: the values fill the range far more
+evenly than the eight-run subset suggested. Dispersion of unknown origin remains the honest
+description, and placement, contention severity and loadavg have each now been tested and
+refuted as its cause.
+
+Provenance: all rows from preserved reports under `/data/tmp/frankenfs-mounted-kernel/`,
+`bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`
+for the runs this session, `isa=x86-64-v3`, `RCH_WORKER=none`, `hostname=thinkstation1`.
+Observed loadavg at analysis: 1-min `11.15`, 5-min `30.25`, 15-min `35.61`. No measurement was
+taken; this is a re-analysis of banked runs. Nothing claimed, nothing superseded.
+
+Counted mechanism: **13 clean-null rows joined on `fuse_over_kernel` and
+`client_affinity_cpus`; both socket ranges present in both groups**, which is the count that
+refutes placement.
