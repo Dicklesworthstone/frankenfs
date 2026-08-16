@@ -442,6 +442,72 @@ fn posix_acl_capability_from_value(value: Option<&str>) -> u64 {
     if enabled { POSIX_ACL_CAPABILITY } else { 0 }
 }
 
+/// Which xattr handler is asking [`xattr_switch_errno`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XattrHandler {
+    /// `getxattr` and `listxattr`: the kernel reads `ENOSYS` as "stop asking".
+    Read,
+    /// `setxattr` and `removexattr`: nothing makes the kernel stop sending
+    /// these, so they must be refused explicitly.
+    Write,
+}
+
+/// The errno every xattr handler must answer while `FFS_FUSE_XATTR_NO_SUPPORT`
+/// is active.
+///
+/// One function rather than four literals because the two answers are not
+/// independent: `ENOSYS` on the READ side is what makes the kernel stop sending
+/// probes, and it is one-way for the life of the connection. That is only sound
+/// if the WRITE side refuses too — otherwise a `setxattr` would succeed and
+/// store a value no reader could ever get back, since the kernel has already
+/// stopped issuing `getxattr`. Answering `ENOSYS` to a write would be actively
+/// wrong: the kernel would take it as "this server has no setxattr" and fall
+/// back, rather than as the operation being unsupported.
+fn xattr_switch_errno(handler: XattrHandler) -> i32 {
+    match handler {
+        XattrHandler::Read => libc::ENOSYS,
+        XattrHandler::Write => libc::ENOTSUP,
+    }
+}
+
+/// Whether to tell the kernel this mount has no extended attributes at all, via
+/// `FFS_FUSE_XATTR_NO_SUPPORT`.
+///
+/// DEFAULT OFF, and this one is a RESTRICTION rather than a claim about speed.
+/// It attacks the mechanism measured under bd-ha71t: the kernel sends
+/// `getxattr(security.capability)` on every path-based metadata op, and the
+/// existing memo makes that probe cheap to ANSWER without removing the round
+/// trip — which at ~7.29 us/crossing (bd-q0xnl) is the cost that actually shows
+/// up in warm stat's `>= 5.592099x`. A memo cannot delete a crossing; only the
+/// kernel deciding not to ask can.
+///
+/// Linux gives exactly one way to make it stop: `fs/fuse/xattr.c` answers
+/// `-ENOSYS` from the server by setting `fc->no_getxattr` and never sending
+/// another `getxattr` for the life of the connection (likewise `no_listxattr`).
+/// It is connection-wide and one-way — there is no per-inode form and no way to
+/// re-enable it — which is why this cannot be a default, and why while it is
+/// active `setxattr` and `removexattr` must be refused with `ENOTSUP`. A mount
+/// that accepted an xattr the kernel can no longer read back would be worse
+/// than a slow one.
+///
+/// So this is correct only for images that carry no extended attributes, and the
+/// operator asserts that by setting the knob. Unset, nothing changes.
+fn xattr_unsupported_from_env() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        xattr_unsupported_from_value(std::env::var("FFS_FUSE_XATTR_NO_SUPPORT").ok().as_deref())
+    })
+}
+
+/// Pure half of [`xattr_unsupported_from_env`], split out so the parsing is
+/// testable without mutating process-global environment state.
+fn xattr_unsupported_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    })
+}
+
 /// Resolve the readdirplus capability set from `FFS_FUSE_READDIRPLUS_AUTO`.
 ///
 /// `0`, `false` or `off` drops `FUSE_READDIRPLUS_AUTO`; anything else, including
@@ -4141,6 +4207,15 @@ impl Filesystem for FrankenFuse {
         reply: ReplyXattr,
     ) {
         let _handler_timer = HandlerTimer::new(&self.inner.metrics);
+        // Before the name is even parsed: `ENOSYS` is the kernel's signal to set
+        // `fc->no_getxattr` and stop sending these entirely, so the point is to
+        // pay as little as possible for the ONE probe that buys silence for the
+        // rest of the connection.
+        if xattr_unsupported_from_env() {
+            trace!(ino, "getxattr answered ENOSYS: kernel will stop probing (bd-ha71t)");
+            reply.error(xattr_switch_errno(XattrHandler::Read));
+            return;
+        }
         let Some(name) = name.to_str() else {
             reply.error(libc::EINVAL);
             return;
@@ -4190,6 +4265,13 @@ impl Filesystem for FrankenFuse {
     ) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
+            return;
+        }
+        // The kernel has been told this filesystem has no xattrs and has stopped
+        // asking; accepting one now would store data no reader could ever get
+        // back. Refusing is the only coherent answer while the switch is thrown.
+        if xattr_unsupported_from_env() {
+            reply.error(xattr_switch_errno(XattrHandler::Write));
             return;
         }
         let cx = Self::cx_for_request();
@@ -4250,6 +4332,13 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
+        // The kernel has been told this filesystem has no xattrs and has stopped
+        // asking; accepting one now would store data no reader could ever get
+        // back. Refusing is the only coherent answer while the switch is thrown.
+        if xattr_unsupported_from_env() {
+            reply.error(xattr_switch_errno(XattrHandler::Write));
+            return;
+        }
         let cx = Self::cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Removexattr) {
             warn!(ino, "backpressure: shedding removexattr");
@@ -4292,6 +4381,13 @@ impl Filesystem for FrankenFuse {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        // Same one-way switch as `getxattr`, via `fc->no_listxattr`. Both must be
+        // answered the same way: a mount that claims no xattrs on one call and
+        // enumerates them on the other is incoherent.
+        if xattr_unsupported_from_env() {
+            reply.error(xattr_switch_errno(XattrHandler::Read));
+            return;
+        }
         let ino = InodeNumber(ino);
         if self.inner.read_only
             && let Some(payload) = self.inner.readonly_xattr_cache.list_payload(ino)
@@ -6486,6 +6582,57 @@ mod tests {
     /// cache and ENFORCE POSIX ACLs itself. So the property pinned here is not that
     /// it is fast — it is that an unset or unrecognised value negotiates NOTHING,
     /// leaving the default mount byte-identical to before the knob existed.
+    /// bd-ha71t: the no-xattr switch must be opt-IN and inert when unset.
+    ///
+    /// The polarity matters more here than for a speed knob: this one makes the
+    /// kernel stop sending `getxattr` for the life of the connection and makes
+    /// the mount refuse `setxattr`. Arriving by default would silently turn a
+    /// working xattr-bearing mount into one that reports no xattr support.
+    #[test]
+    fn no_xattr_switch_is_opt_in_and_inert_when_unset_bd_ha71t() {
+        assert!(
+            !xattr_unsupported_from_value(None),
+            "unset must leave xattrs fully supported: this switch is one-way for \
+             the life of the connection"
+        );
+        for off in ["0", "false", "off", "", "  ", "yes", "2", "enabled", "ON!", "no"] {
+            assert!(
+                !xattr_unsupported_from_value(Some(off)),
+                "{off:?} must not throw a one-way switch"
+            );
+        }
+        for on in ["1", "true", "on", "TRUE", "On", " 1 "] {
+            assert!(xattr_unsupported_from_value(Some(on)), "{on:?} must enable");
+        }
+    }
+
+    /// The coherence invariant, which is the whole correctness argument for the
+    /// switch: the read side answers `ENOSYS` (the only value the kernel reads as
+    /// "stop asking"), and the write side must NOT — it answers `ENOTSUP`, so a
+    /// caller is told the operation is unsupported rather than the server lacking
+    /// the call. If the write side ever returned `ENOSYS`, a `setxattr` could be
+    /// accepted and stored while the kernel had already stopped issuing
+    /// `getxattr`, leaving data no reader can reach.
+    #[test]
+    fn no_xattr_switch_answers_reads_and_writes_differently_bd_ha71t() {
+        assert_eq!(
+            xattr_switch_errno(XattrHandler::Read),
+            libc::ENOSYS,
+            "only ENOSYS makes the kernel set no_getxattr/no_listxattr"
+        );
+        assert_eq!(
+            xattr_switch_errno(XattrHandler::Write),
+            libc::ENOTSUP,
+            "a write must be refused as unsupported, never as a missing call"
+        );
+        assert_ne!(
+            xattr_switch_errno(XattrHandler::Read),
+            xattr_switch_errno(XattrHandler::Write),
+            "the two sides must stay distinct: the read errno is a one-way switch \
+             and must never be answered to a write"
+        );
+    }
+
     #[test]
     fn posix_acl_knob_is_opt_in_and_inert_when_unset_bd_biwl4() {
         assert_eq!(
