@@ -87,8 +87,8 @@ fn count_free_unrolled_chunks32(bitmap: &[u8], count: u32) -> u32 {
     let remainder = count % 8;
     let mut free = 0_u32;
 
-    let mut blocks = bitmap[..full_bytes].chunks_exact(32);
-    for block in &mut blocks {
+    let (blocks, blocks_rest) = bitmap[..full_bytes].as_chunks::<32>();
+    for block in blocks {
         free += (!u64::from_le_bytes([
             block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7],
         ]))
@@ -107,14 +107,14 @@ fn count_free_unrolled_chunks32(bitmap: &[u8], count: u32) -> u32 {
         .count_ones();
     }
 
-    let mut chunks = blocks.remainder().chunks_exact(8);
-    for chunk in &mut chunks {
+    let (chunks, chunks_rest) = blocks_rest.as_chunks::<8>();
+    for chunk in chunks {
         let word = u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
         free += (!word).count_ones();
     }
-    for &byte in chunks.remainder() {
+    for &byte in chunks_rest {
         free += byte.count_zeros();
     }
 
@@ -370,7 +370,7 @@ fn largest_free_run_halfword_table_scan(bitmap: &[u8], count: u32) -> u32 {
     let available_full_bytes = full_bytes.min(bitmap.len());
     let word_bytes = available_full_bytes - (available_full_bytes % 8);
 
-    for chunk in bitmap[..word_bytes].chunks_exact(8) {
+    for chunk in bitmap[..word_bytes].as_chunks::<8>().0 {
         let word = u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
@@ -385,11 +385,11 @@ fn largest_free_run_halfword_table_scan(bitmap: &[u8], count: u32) -> u32 {
         run = 0;
     }
 
-    if remainder > 0 {
-        if let Some(&byte) = bitmap.get(full_bytes) {
-            let mask = u8::MAX >> (8 - remainder);
-            apply_old_byte_zero_run(byte | !mask, &mut run, &mut best);
-        }
+    if remainder > 0
+        && let Some(&byte) = bitmap.get(full_bytes)
+    {
+        let mask = u8::MAX >> (8 - remainder);
+        apply_old_byte_zero_run(byte | !mask, &mut run, &mut best);
     }
 
     best
@@ -793,7 +793,7 @@ fn bench_build(c: &mut Criterion) {
 /// one binary on one CPU (so the ratio is valid despite rch worker variance).
 fn find_free_byte_scan(bitmap: &[u8], count: u32, start: u32) -> Option<u32> {
     fn range(bitmap: &[u8], mut idx: u32, end: u32) -> Option<u32> {
-        while idx < end && idx % 8 != 0 {
+        while idx < end && !idx.is_multiple_of(8) {
             let &byte = bitmap.get((idx / 8) as usize)?;
             if (byte >> (idx % 8)) & 1 == 0 {
                 return Some(idx);
@@ -829,7 +829,7 @@ fn find_contiguous_byte_scan(bitmap: &[u8], count: u32, n: u32, start: u32) -> O
         let mut idx = start;
 
         while idx < count {
-            if idx % 8 == 0 && (idx + 8) <= count {
+            if idx.is_multiple_of(8) && (idx + 8) <= count {
                 let byte_idx = (idx / 8) as usize;
                 match bitmap.get(byte_idx).copied() {
                     None | Some(0xFF) => {

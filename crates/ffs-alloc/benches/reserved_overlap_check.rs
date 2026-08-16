@@ -9,6 +9,11 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
+// `manual_find` wants this written as `.find(..)`. Deliberately not done: this is
+// the OLD arm of an A/B against `new_check`, and its per-block binary search IS
+// the thing being measured. Rewriting it into an iterator chain changes the
+// candidate, so the benchmark would stop comparing what it claims to (bd-3ao0l).
+#[allow(clippy::manual_find)]
 fn old_check(reserved: &[u32], start: u32, count: u32) -> Option<u32> {
     for i in start..start + count {
         if reserved.binary_search(&i).is_ok() {
@@ -32,10 +37,10 @@ fn bench(c: &mut Criterion) {
         );
         let mut g = c.benchmark_group(format!("reserved_check_c{count}"));
         g.bench_function("per_block", |b| {
-            b.iter(|| black_box(old_check(black_box(&reserved), start, count)))
+            b.iter(|| black_box(old_check(black_box(&reserved), start, count)));
         });
         g.bench_function("range_overlap", |b| {
-            b.iter(|| black_box(new_check(black_box(&reserved), start, count)))
+            b.iter(|| black_box(new_check(black_box(&reserved), start, count)));
         });
         g.finish();
     }

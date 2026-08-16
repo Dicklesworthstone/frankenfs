@@ -48,7 +48,7 @@ fn bench(c: &mut Criterion) {
         assert_eq!(count_word(&bitmap), count_unrolled4(&bitmap));
         let mut g = c.benchmark_group(format!("bitmap_count_{bytes}bytes"));
         g.bench_function("word", |b| {
-            b.iter(|| black_box(count_word(black_box(&bitmap))))
+            b.iter(|| black_box(count_word(black_box(&bitmap))));
         });
         g.bench_function("unrolled4", |b| {
             b.iter(|| black_box(count_unrolled4(black_box(&bitmap))));

@@ -83,33 +83,36 @@ fn bench_bitmap_csum_incremental(c: &mut Criterion) {
 
     for desc_size in [32_u16, 64] {
         let old_desc = seeded_desc(&before, desc_size);
-        let mut full_group = c.benchmark_group(format!("bitmap_csum_desc{desc_size}_1bit"));
-        full_group.bench_function("full_recompute", |b| {
-            b.iter(|| {
-                let mut gd = black_box(old_desc.clone());
-                stamp_block_bitmap_checksum(
-                    black_box(&after_1b),
-                    black_box(CSUM_SEED),
-                    black_box(BLOCKS_PER_GROUP),
-                    &mut gd,
-                    black_box(desc_size),
-                );
-                black_box(gd.block_bitmap_csum)
+        // Scoped so the group's significant `Drop` runs at `finish()` (bd-3ao0l).
+        {
+            let mut full_group = c.benchmark_group(format!("bitmap_csum_desc{desc_size}_1bit"));
+            full_group.bench_function("full_recompute", |b| {
+                b.iter(|| {
+                    let mut gd = black_box(old_desc.clone());
+                    stamp_block_bitmap_checksum(
+                        black_box(&after_1b),
+                        black_box(CSUM_SEED),
+                        black_box(BLOCKS_PER_GROUP),
+                        &mut gd,
+                        black_box(desc_size),
+                    );
+                    black_box(gd.block_bitmap_csum)
+                });
             });
-        });
-        full_group.bench_function("incremental", |b| {
-            b.iter(|| {
-                black_box(incremental_checksum(
-                    black_box(old_desc.block_bitmap_csum),
-                    black_box(&before),
-                    black_box(&after_1b),
-                    black_box(513),
-                    black_box(1),
-                    black_box(desc_size),
-                ))
+            full_group.bench_function("incremental", |b| {
+                b.iter(|| {
+                    black_box(incremental_checksum(
+                        black_box(old_desc.block_bitmap_csum),
+                        black_box(&before),
+                        black_box(&after_1b),
+                        black_box(513),
+                        black_box(1),
+                        black_box(desc_size),
+                    ))
+                });
             });
-        });
-        full_group.finish();
+            full_group.finish();
+        }
 
         let mut eight_byte_group = c.benchmark_group(format!("bitmap_csum_desc{desc_size}_8byte"));
         eight_byte_group.bench_function("full_recompute", |b| {

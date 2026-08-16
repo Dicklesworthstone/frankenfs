@@ -65,7 +65,7 @@ fn incremental_mask_stack_update(
 }
 
 fn fill_flipped_bit_delta(delta: &mut [u8], local_start: u32, bit_count: u32) {
-    if local_start == 0 && bit_count % 8 == 0 {
+    if local_start == 0 && bit_count.is_multiple_of(8) {
         delta.fill(u8::MAX);
     } else {
         for bit in local_start..local_start + bit_count {

@@ -11,15 +11,16 @@ use std::hint::black_box;
 fn bench(c: &mut Criterion) {
     let nbits = 65536u32;
     let mut template = vec![0xFFu8; (nbits / 8) as usize];
-    for byte in 8180..8192 {
-        template[byte] = 0;
-    } // free bits near the end
+    // free bits near the end
+    for slot in &mut template[8180..8192] {
+        *slot = 0;
+    }
     c.bench_function("take_bits_mostly_alloc_n8", |b| {
         b.iter_batched(
             || template.clone(),
             |mut bm| black_box(bench_take_free_bits_cyclic(&mut bm, nbits, 8, 0)),
             BatchSize::SmallInput,
-        )
+        );
     });
 }
 criterion_group!(benches, bench);

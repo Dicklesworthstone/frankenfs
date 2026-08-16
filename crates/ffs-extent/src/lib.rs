@@ -359,8 +359,10 @@ impl BlockAllocator for GroupBlockAllocator<'_> {
     }
 }
 
-/// A [`BlockAllocator`] (used for extent-tree NODE alloc/free) that can ALSO free
-/// a range of DATA blocks. [`truncate_extents_with`] uses the `BlockAllocator`
+/// A [`BlockAllocator`] that can ALSO free a range of DATA blocks.
+///
+/// The allocator is used for extent-tree NODE alloc/free.
+/// [`truncate_extents_with`] uses the `BlockAllocator`
 /// supertrait for the tree surgery (`delete_range`) and `free_data_range` for the
 /// physical data blocks the removed extents mapped — the two free surfaces a
 /// directory-shrink / file-truncate touches.
@@ -420,9 +422,10 @@ pub fn allocate_extent(
     )
 }
 
-/// Like [`allocate_extent`], but COALESCES the new extent into a contiguous
-/// written predecessor (ext4 adjacent-extent merge) so a sequential write run
-/// stays O(1) extents instead of one per allocation — the latter makes per-write
+/// Like [`allocate_extent`], but COALESCES into a contiguous written predecessor.
+///
+/// This is the ext4 adjacent-extent merge, so a sequential write run stays O(1)
+/// extents instead of one per allocation — the latter makes per-write
 /// `collect_extents` re-walks O(N^2) for fine-grained writes
 /// (docs/NEGATIVE_EVIDENCE.md). The returned mapping still reports only the
 /// newly-allocated blocks (for i_blocks accounting); merging only changes how
@@ -618,9 +621,11 @@ pub fn truncate_extents(
     truncate_extents_with(cx, dev, root_bytes, new_logical_end, &mut backend)
 }
 
-/// Backend-agnostic core of [`truncate_extents`]: remove every extent at or past
-/// `new_logical_end` and free the data blocks they mapped, allocating/freeing
-/// extent-tree nodes AND data blocks through `backend`. `truncate_extents` passes
+/// Backend-agnostic core of [`truncate_extents`].
+///
+/// Removes every extent at or past `new_logical_end` and frees the data blocks
+/// they mapped, allocating/freeing extent-tree nodes AND data blocks through
+/// `backend`. `truncate_extents` passes
 /// a single-lock [`GroupBlockAllocator`]; the bd-bhh0i sharded directory-shrink
 /// passes a per-group-lock backend. Returns the number of physical blocks freed.
 pub fn truncate_extents_with<B: TruncateBackend>(
@@ -1388,13 +1393,13 @@ fn parse_and_validate_root_header(
             detail: format!("{op}: non-leaf extent root has zero entries"),
         });
     }
-    if let ExtentTree::Leaf(extents) = &tree {
-        if extents.iter().any(|ext| ext.actual_len() == 0) {
-            return Err(FfsError::Corruption {
-                block: 0,
-                detail: format!("{op}: leaf extent with zero length"),
-            });
-        }
+    if let ExtentTree::Leaf(extents) = &tree
+        && extents.iter().any(|ext| ext.actual_len() == 0)
+    {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("{op}: leaf extent with zero length"),
+        });
     }
     Ok((header, tree))
 }
@@ -1664,10 +1669,10 @@ impl ExtentCache {
             if entry_gen != current_gen {
                 drop(inner);
                 let mut inner = shard.write();
-                if let Some(entry) = inner.entries.get(&key) {
-                    if entry.generation != inner.generation {
-                        inner.remove_entry(key);
-                    }
+                if let Some(entry) = inner.entries.get(&key)
+                    && entry.generation != inner.generation
+                {
+                    inner.remove_entry(key);
                 }
             }
             None
@@ -1891,15 +1896,15 @@ pub fn cached_map_logical_to_physical(
     }
 
     // Fast path: single-block lookup that hits cache.
-    if count == 1 {
-        if let Some(hit) = cache.lookup(ns, logical_start) {
-            return Ok(vec![ExtentMapping {
-                logical_start,
-                physical_start: hit.physical_start,
-                count: 1,
-                unwritten: hit.unwritten,
-            }]);
-        }
+    if count == 1
+        && let Some(hit) = cache.lookup(ns, logical_start)
+    {
+        return Ok(vec![ExtentMapping {
+            logical_start,
+            physical_start: hit.physical_start,
+            count: 1,
+            unwritten: hit.unwritten,
+        }]);
     }
 
     if count == 1 {

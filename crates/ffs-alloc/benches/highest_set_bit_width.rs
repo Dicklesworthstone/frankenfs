@@ -58,14 +58,14 @@ fn word(bitmap: &[u8], count: u32) -> Option<u32> {
     while end >= 8 {
         let w = u64::from_le_bytes(bitmap[end - 8..end].try_into().unwrap());
         if w != 0 {
-            return Some(((end - 8) * 8) as u32 + (63 - w.leading_zeros()));
+            return Some(((end - 8) * 8) as u32 + w.ilog2());
         }
         end -= 8;
     }
     for byte_idx in (0..end).rev() {
         let byte = bitmap[byte_idx];
         if byte != 0 {
-            return Some((byte_idx * 8) as u32 + (7 - byte.leading_zeros()));
+            return Some((byte_idx * 8) as u32 + byte.ilog2());
         }
     }
     None

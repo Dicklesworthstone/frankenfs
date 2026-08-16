@@ -122,6 +122,11 @@ fn inode_alloc_inline_candidate(bitmap: &mut [u8], idx: u32) -> u32 {
 }
 
 fn bench(c: &mut Criterion) {
+    // Hoisted from mid-function (bd-3ao0l): an item declared after statements
+    // reads as if it came into existence there, when it is in scope from the
+    // start of the block.
+    const INODE_BIT: u32 = 12_345;
+    const ALLOC_BIT: u32 = 173;
     for count in [256u32, 4096] {
         let bytes = 8192usize;
         let start = 40u32;
@@ -139,19 +144,18 @@ fn bench(c: &mut Criterion) {
                 || template.clone(),
                 |mut bm| black_box(old_free(&mut bm, start, count)),
                 BatchSize::SmallInput,
-            )
+            );
         });
         g.bench_function("new_range", |b| {
             b.iter_batched(
                 || template.clone(),
                 |mut bm| black_box(new_free(&mut bm, start, count)),
                 BatchSize::SmallInput,
-            )
+            );
         });
         g.finish();
     }
 
-    const INODE_BIT: u32 = 12_345;
     let template = vec![0xFFu8; 4096];
     let mut control = template.clone();
     let mut candidate = template.clone();
@@ -164,26 +168,30 @@ fn bench(c: &mut Criterion) {
     assert_eq!(control, template, "Vec-control rollback diverged");
     assert_eq!(candidate, template, "known-bit rollback diverged");
 
-    let mut g = c.benchmark_group("inode_free_single_bit_undo");
-    for control_name in ["vec_control_a", "vec_control_b"] {
-        g.bench_function(control_name, |b| {
+    // Scoped so the group's significant `Drop` runs at `finish()` (bd-3ao0l).
+    {
+        let mut g = c.benchmark_group("inode_free_single_bit_undo");
+        for control_name in ["vec_control_a", "vec_control_b"] {
+            g.bench_function(control_name, |b| {
+                b.iter_batched(
+                    || template.clone(),
+                    |mut bitmap| {
+                        black_box(inode_free_vec_control(black_box(&mut bitmap), INODE_BIT))
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+        g.bench_function("known_bit_candidate", |b| {
             b.iter_batched(
                 || template.clone(),
-                |mut bitmap| black_box(inode_free_vec_control(black_box(&mut bitmap), INODE_BIT)),
+                |mut bitmap| black_box(inode_free_known_bit(black_box(&mut bitmap), INODE_BIT)),
                 BatchSize::SmallInput,
-            )
+            );
         });
+        g.finish();
     }
-    g.bench_function("known_bit_candidate", |b| {
-        b.iter_batched(
-            || template.clone(),
-            |mut bitmap| black_box(inode_free_known_bit(black_box(&mut bitmap), INODE_BIT)),
-            BatchSize::SmallInput,
-        )
-    });
-    g.finish();
 
-    const ALLOC_BIT: u32 = 173;
     let mut alloc_template = [0xFF_u8; 64];
     clear_bit(&mut alloc_template, ALLOC_BIT);
     let mut control = alloc_template;
@@ -204,7 +212,7 @@ fn bench(c: &mut Criterion) {
                 || alloc_template,
                 |mut bitmap| black_box(inode_alloc_vec_control(black_box(&mut bitmap), ALLOC_BIT)),
                 BatchSize::SmallInput,
-            )
+            );
         });
     }
     g.bench_function("inline_one_candidate", |b| {
@@ -217,7 +225,7 @@ fn bench(c: &mut Criterion) {
                 ))
             },
             BatchSize::SmallInput,
-        )
+        );
     });
     g.finish();
 }

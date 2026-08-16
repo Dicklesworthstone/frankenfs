@@ -76,14 +76,14 @@ fn bench(c: &mut Criterion) {
                 || vec![0u8; bytes],
                 |mut bm| black_box(old_alloc(&mut bm, &reserved, start, count)),
                 BatchSize::SmallInput,
-            )
+            );
         });
         g.bench_function("new", |b| {
             b.iter_batched(
                 || vec![0u8; bytes],
                 |mut bm| black_box(new_alloc(&mut bm, &reserved, start, count)),
                 BatchSize::SmallInput,
-            )
+            );
         });
         g.finish();
     }

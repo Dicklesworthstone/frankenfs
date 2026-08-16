@@ -46,12 +46,8 @@ fn apply_word(word: u64, run: &mut u32, best: &mut u32) {
 /// Current: per-word branchy step.
 fn run_word(bitmap: &[u8]) -> u32 {
     let (mut best, mut run) = (0u32, 0u32);
-    for chunk in bitmap.chunks_exact(8) {
-        apply_word(
-            u64::from_le_bytes(chunk.try_into().unwrap()),
-            &mut run,
-            &mut best,
-        );
+    for chunk in bitmap.as_chunks::<8>().0 {
+        apply_word(u64::from_le_bytes(*chunk), &mut run, &mut best);
     }
     best
 }
@@ -59,8 +55,8 @@ fn run_word(bitmap: &[u8]) -> u32 {
 /// 4-wide: skip fully-allocated 256-bit blocks with one AND+compare.
 fn run_unrolled4(bitmap: &[u8]) -> u32 {
     let (mut best, mut run) = (0u32, 0u32);
-    let mut chunks = bitmap.chunks_exact(32);
-    for block in &mut chunks {
+    let (blocks, blocks_rest) = bitmap.as_chunks::<32>();
+    for block in blocks {
         let w0 = u64::from_le_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_le_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_le_bytes(block[16..24].try_into().unwrap());
@@ -74,12 +70,8 @@ fn run_unrolled4(bitmap: &[u8]) -> u32 {
         apply_word(w2, &mut run, &mut best);
         apply_word(w3, &mut run, &mut best);
     }
-    for chunk in chunks.remainder().chunks_exact(8) {
-        apply_word(
-            u64::from_le_bytes(chunk.try_into().unwrap()),
-            &mut run,
-            &mut best,
-        );
+    for chunk in blocks_rest.as_chunks::<8>().0 {
+        apply_word(u64::from_le_bytes(*chunk), &mut run, &mut best);
     }
     best
 }
@@ -100,7 +92,7 @@ fn bench(c: &mut Criterion) {
         let mut g = c.benchmark_group(format!("bitmap_run_{name}"));
         g.bench_function("word", |b| b.iter(|| black_box(run_word(black_box(bm)))));
         g.bench_function("unrolled4", |b| {
-            b.iter(|| black_box(run_unrolled4(black_box(bm))))
+            b.iter(|| black_box(run_unrolled4(black_box(bm))));
         });
         g.finish();
     }
