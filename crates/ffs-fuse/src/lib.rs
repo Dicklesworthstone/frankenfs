@@ -36,7 +36,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
@@ -1490,95 +1492,87 @@ impl ReadonlyXattrCache {
     }
 }
 
-/// Lock-free cache of recently observed missing capability xattrs.
+/// Number of direct-mapped slots in the missing-capability memo.
+///
+/// Sized against the MEASURED working set, not guessed. The probe stream for
+/// path-based metadata ops is `root, file, root, file, ...` — one probe on the
+/// mount root and one on the target inode, per operation, regardless of path depth
+/// (intermediate directories are never probed). So the live set is "the root plus
+/// whatever files the workload is walking".
+///
+/// 64 slots is 512 bytes for the whole mount and covers a directory-sized sweep.
+/// The progression is counted, on a read-write mount, 1000 path stats:
+///
+///     1 slot   (`read_only`-gated, so also disabled here) :    0 / 2000 hits
+///     2 slots, shift-down victim                          :  501 / 2000 hits
+///     2 slots, 2-way pseudo-LRU                           : 1000 / 2000 hits
+///     64 slots, direct-mapped                             : see bd-2pq73
+///
+/// Two slots could hold the root and exactly one file, so a sweep of 50 files
+/// evicted each before it recurred and every file probe missed. Direct mapping by
+/// inode number removes the eviction policy entirely: an inode's slot is a pure
+/// function of its number, the root (`ino=1`) never contends with a file unless
+/// that file's inode is congruent mod 64, and there is no victim to choose or race
+/// over.
+///
+/// Slots are independent atomics rather than a mutex-guarded map: the probe is on
+/// the metadata hot path and must not serialize FUSE workers against each other. A
+/// racing pair of `remember` calls can only lose a memo entry or overwrite a
+/// colliding one, never invent one, because a slot is only ever consulted by exact
+/// inode match.
+const CAPABILITY_MEMO_SLOTS: usize = 64;
+
+/// Lock-free cache of inodes observed to have no capability xattr.
 ///
 /// The kernel still sends each FUSE `GETXATTR` request; this only makes the
 /// ANSWER free, avoiding a format-level lookup per probe.
-///
-/// TWO SLOTS, not one, and the reason is measured (bd-yu6jz). The kernel's probe
-/// stream for path-based metadata ops strictly ALTERNATES between the mount root
-/// and the target inode:
-///
-///     ino=1, ino=14, ino=1, ino=15, ino=1, ino=126, ...
-///
-/// Counted on a real mount: 4002 probes for 2000 path stats, of which 2002 are
-/// `ino=1`. A single slot is therefore the worst possible size for this workload —
-/// every root probe evicts the file and every file probe evicts the root, so the
-/// hit rate collapses to ~0% on exactly the pattern the memo exists to serve. Two
-/// slots hold "the root" and "the file currently being walked" simultaneously,
-/// which is the whole steady state. Depth does not change this: a file one
-/// directory down produces the same two probes, since intermediate directories are
-/// never probed.
-///
-/// Slots are independent atomics rather than a mutex-guarded map: the probe is on
-/// the metadata hot path and must not serialize FUSE workers against each other.
-/// A racing pair of `remember` calls can only lose a memo entry, never invent one,
-/// because a slot is only ever consulted by exact inode match.
-#[derive(Default)]
 struct LastMissingCapabilityXattr {
     /// Two independent slots. Neither is privileged; `victim` decides which one
-    /// the next insert overwrites.
-    slots: [AtomicU64; 2],
-    /// Index of the slot to overwrite next — a 2-way pseudo-LRU.
-    ///
-    /// MEASURED, not assumed. A plain "shift down" policy (new value into slot 0,
-    /// old slot 0 into slot 1) was implemented first and counted at 501 memo hits
-    /// per 2000 probes on a read-write mount — almost exactly 50%, because the
-    /// stream is `root, fileN, root, fileN+1, ...`: remembering each NEW file
-    /// displaced the previous file into slot 1 and evicted the ROOT, which is the
-    /// one inode present in every pair. Pointing the victim away from whichever
-    /// slot was last HIT keeps the constantly-hit root resident and rotates the
-    /// files through the other slot.
-    victim: AtomicUsize,
+    /// Direct-mapped by `ino % CAPABILITY_MEMO_SLOTS`. No victim bookkeeping: an
+    /// inode's slot is a pure function of its number, so there is nothing to
+    /// choose and nothing to race over.
+    slots: [AtomicU64; CAPABILITY_MEMO_SLOTS],
 }
 
 impl LastMissingCapabilityXattr {
+    fn slot(ino: u64) -> usize {
+        // Power-of-two size, so this is a mask.
+        (ino as usize) & (CAPABILITY_MEMO_SLOTS - 1)
+    }
+
     fn contains(&self, ino: InodeNumber) -> bool {
-        if ino.0 == 0 {
-            return false;
-        }
-        for (idx, slot) in self.slots.iter().enumerate() {
-            if slot.load(Ordering::Acquire) == ino.0 {
-                // Protect the slot that just hit: the next insert takes the other.
-                self.victim.store(idx ^ 1, Ordering::Release);
-                return true;
-            }
-        }
-        false
+        ino.0 != 0 && self.slots[Self::slot(ino.0)].load(Ordering::Acquire) == ino.0
     }
 
     fn remember(&self, ino: InodeNumber) {
-        if ino.0 == 0 {
-            return;
+        if ino.0 != 0 {
+            self.slots[Self::slot(ino.0)].store(ino.0, Ordering::Release);
         }
-        // Already resident: `contains` has just re-aimed the victim, so there is
-        // nothing to do and shuffling would only undo that.
-        if self.contains(ino) {
-            return;
-        }
-        let idx = self.victim.load(Ordering::Acquire) & 1;
-        self.slots[idx].store(ino.0, Ordering::Release);
-        self.victim.store(idx ^ 1, Ordering::Release);
     }
 
-    /// Drop `ino` from both slots.
+    /// Drop `ino` from the memo.
     ///
-    /// Required once this memo serves READ-WRITE mounts: a memoized "absent" is
+    /// Required because this memo serves READ-WRITE mounts: a memoized "absent" is
     /// only sound while the inode cannot gain the xattr, which on a writable mount
     /// is exactly until someone sets it. Clearing on mutation is what keeps a
-    /// later probe from being answered with a stale absence.
+    /// later probe from being answered with a stale absence. Only the inode's own
+    /// slot can hold it, so this cannot disturb any other entry.
     fn forget(&self, ino: InodeNumber) {
-        if ino.0 == 0 {
-            return;
+        if ino.0 != 0 {
+            let _ = self.slots[Self::slot(ino.0)].compare_exchange(
+                ino.0,
+                0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
         }
-        for (idx, slot) in self.slots.iter().enumerate() {
-            if slot
-                .compare_exchange(ino.0, 0, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                // A slot we just freed is the obvious next victim.
-                self.victim.store(idx, Ordering::Release);
-            }
+    }
+}
+
+impl Default for LastMissingCapabilityXattr {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -4372,6 +4366,60 @@ mod tests {
             memo.contains(InodeNumber(1)),
             "forgetting one inode must not evict the root"
         );
+    }
+
+    /// NEGATIVE CASE for a direct-mapped memo: two inodes congruent mod
+    /// `CAPABILITY_MEMO_SLOTS` share a slot, and the second must EVICT the first
+    /// rather than be reported as resident. An implementation that trusted the
+    /// slot index without comparing the stored inode would answer "absent" for an
+    /// inode it has never seen — reporting a capability that may well exist as
+    /// missing, which is a correctness bug and not a cache miss.
+    #[test]
+    fn capability_memo_collision_evicts_and_never_reports_the_wrong_inode() {
+        let memo = LastMissingCapabilityXattr::default();
+        let a = InodeNumber(14);
+        let b = InodeNumber(14 + CAPABILITY_MEMO_SLOTS as u64); // same slot
+        assert_eq!(
+            LastMissingCapabilityXattr::slot(a.0),
+            LastMissingCapabilityXattr::slot(b.0),
+            "test premise: these two inodes must collide"
+        );
+
+        memo.remember(a);
+        assert!(memo.contains(a));
+        assert!(
+            !memo.contains(b),
+            "a colliding inode must NOT be reported resident just because its \
+             slot is occupied"
+        );
+
+        memo.remember(b);
+        assert!(memo.contains(b));
+        assert!(
+            !memo.contains(a),
+            "the evicted inode must miss and take a real lookup, not inherit \
+             the newcomer's entry"
+        );
+    }
+
+    /// The root and a directory-sized sweep must coexist, which is the whole point
+    /// of sizing the memo at 64 rather than 2. Counted on a real mount: 1950 of
+    /// 2000 probes served, the residual 50 being one cold miss per distinct file.
+    #[test]
+    fn capability_memo_holds_the_root_and_a_directory_sized_sweep() {
+        let memo = LastMissingCapabilityXattr::default();
+        let root = InodeNumber(1);
+        memo.remember(root);
+        for file in 14_u64..64 {
+            memo.remember(InodeNumber(file));
+        }
+        assert!(memo.contains(root), "the root must survive a 50-file sweep");
+        for file in 14_u64..64 {
+            assert!(
+                memo.contains(InodeNumber(file)),
+                "file {file} must still be resident; two slots could not do this"
+            );
+        }
     }
 
     /// Inode 0 is not a real inode; it must never be memoized or match, or a
