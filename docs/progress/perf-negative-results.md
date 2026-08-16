@@ -10724,3 +10724,51 @@ only on the executing machine — no rch worker took part. Counts are exact and
 reproducible; the wall figures are from an unpinned managed mount on a contended host and
 are NOT comparable to the banked comparator absolutes, which is why every claim above is
 expressed as a COUNT or a RATIO of counts.
+
+## 2026-08-16 — REJECT: the kernel does not cache `security.capability` either way — probe rate is 1.0000/stat whether the xattr exists or not (bd-z0rb8 hypothesis 1, AzureBay)
+
+`bd-z0rb8` lists four untried routes to suppressing the per-stat capability probe that
+the warm-stat attribution showed to be ~99% of the 4.80x gap. This kills the cheapest
+one.
+
+**Hypothesis:** if the kernel caches a PRESENT `security.capability` value but re-asks
+for an ABSENT one, then the probe is addressable — the daemon could report presence
+differently, or an ABI route to cache the negative would be worth hunting for.
+
+**Result: identical.** One image, two files, one mount, 1,000 stats each, counted from
+the daemon's own trace:
+
+    positive_control_setcap=yes
+    === probes per stat, 1000 stats each, same mount ===
+    absent   getxattr_round_trips=1000   per_stat=1.0000
+    present  getxattr_round_trips=1000   per_stat=1.0000
+
+`1.0000` versus `1.0000`. Not close — exactly equal, on a counted mechanism with no
+timing involved: **1000 probes (absent) vs 1000 probes (present)**, over 1000 stats
+each.
+
+The positive control matters and is reported in the output: `setcap cap_net_raw+ep`
+returned success on the `present` file before the image was synced and unmounted, so the
+two files genuinely differ. Without that line this would be indistinguishable from a run
+that silently compared two identical files — the same failure mode the comparator's
+`configurations_differ` gate exists to prevent, reproduced here by hand because this
+harness has no such gate.
+
+**Conclusion: the kernel is not caching this xattr at all**, in either direction. There
+is no negative-caching behaviour to exploit and no presence-dependent path to take
+advantage of. Hypothesis 1 on `bd-z0rb8` is closed.
+
+What survives on that bead: `default_permissions` (one mount flag, still untried),
+kernel-version dependence (host is `6.17.0-41-generic`), and whether any FUSE ABI route
+exists to declare an inode free of `security.*` so the kernel can cache the negative —
+which `bd-ha71t`'s retry predicate already asked for and which this result makes more
+urgent, since it is now the only remaining shape that could work.
+
+Do NOT re-test presence-vs-absence. It is measured, exactly equal, with a positive
+control.
+
+Harness `scripts`-local `probe_present_vs_absent.sh`; candidate
+`d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`, `isa=x86-64-v3`;
+host `thinkstation1`, kernel `6.17.0-41-generic`, run locally because a FUSE mount runs
+only on the executing machine — no rch worker took part. Counted mechanism, so no quiet
+window is required and the host's contention cannot confound it.
