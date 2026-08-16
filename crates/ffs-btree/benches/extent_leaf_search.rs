@@ -66,8 +66,15 @@ fn encode_index_entries(indexes: &[Ext4ExtentIndex]) -> Vec<u8> {
 }
 
 fn decode_index_entries(encoded: &[u8]) -> Vec<Ext4ExtentIndex> {
-    encoded
-        .chunks_exact(INDEX_ENTRY_SIZE)
+    // `as_chunks::<N>()` rather than `chunks_exact(N)` (bd-3ao0l), matching the
+    // ffs-types fix in 01cf8477: with a const chunk size each item arrives as a
+    // fixed-size array, so the indexing below is bounds-checked once by the type
+    // rather than per access. Same split point — `as_chunks` yields the same
+    // `len/N*N` prefix `chunks_exact` did, and the trailing remainder is
+    // discarded here exactly as `chunks_exact` discarded it.
+    let (entries, _remainder) = encoded.as_chunks::<INDEX_ENTRY_SIZE>();
+    entries
+        .iter()
         .map(|entry| {
             let logical_block = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             let leaf_lo = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);

@@ -637,11 +637,12 @@ pub fn insert(
     insert_inner(cx, dev, root_bytes, extent, alloc, false)
 }
 
-/// Like [`insert`], but coalesces the new extent into a contiguous written
-/// predecessor when possible (ext4 adjacent-extent merge). Use ONLY for the
-/// data-block allocation path (`allocate_extent`); `collapse_range` /
-/// `insert_range` keep the plain non-coalescing [`insert`] so their exact
-/// extent boundaries are preserved.
+/// Like [`insert`], but coalesces into a contiguous written predecessor.
+///
+/// Merges the new extent into a contiguous written predecessor when possible
+/// (ext4 adjacent-extent merge). Use ONLY for the data-block allocation path
+/// (`allocate_extent`); `collapse_range` / `insert_range` keep the plain
+/// non-coalescing [`insert`] so their exact extent boundaries are preserved.
 pub fn insert_coalescing(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -1597,16 +1598,16 @@ fn parse_leaf_entries(data: &[u8], header: &Ext4ExtentHeader) -> Result<Vec<Ext4
             });
         }
 
-        if let Some(prev_end) = previous_end {
-            if u64::from(logical_block) < prev_end {
-                return Err(FfsError::Corruption {
-                    block: 0,
-                    detail: format!(
-                        "extent leaf entries not sorted or overlap at entry {i} \
-                         (logical_block {logical_block})"
-                    ),
-                });
-            }
+        if let Some(prev_end) = previous_end
+            && u64::from(logical_block) < prev_end
+        {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "extent leaf entries not sorted or overlap at entry {i} \
+                     (logical_block {logical_block})"
+                ),
+            });
         }
         previous_end = Some(u64::from(logical_block) + u64::from(actual_len(raw_len)));
 
@@ -1638,16 +1639,16 @@ fn parse_index_entries(data: &[u8], header: &Ext4ExtentHeader) -> Result<Vec<Ext
         let leaf_hi = u16::from_le_bytes([data[off + 8], data[off + 9]]);
         let leaf_block = u64::from(leaf_lo) | (u64::from(leaf_hi) << 32);
 
-        if let Some(prev) = previous_logical {
-            if logical_block <= prev {
-                return Err(FfsError::Corruption {
-                    block: 0,
-                    detail: format!(
-                        "extent index entries not strictly sorted at entry {i} \
-                         (logical_block {logical_block}, previous {prev})"
-                    ),
-                });
-            }
+        if let Some(prev) = previous_logical
+            && logical_block <= prev
+        {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "extent index entries not strictly sorted at entry {i} \
+                     (logical_block {logical_block}, previous {prev})"
+                ),
+            });
         }
         previous_logical = Some(logical_block);
 

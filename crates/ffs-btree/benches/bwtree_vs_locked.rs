@@ -315,10 +315,10 @@ fn scan_for_consolidation_snapshot_control(
     let mut candidates = Vec::new();
     for raw_id in 0..allocated {
         let page_id = PageId(raw_id);
-        if let Ok(snapshot) = table.get_page(page_id) {
-            if snapshot.chain_len > threshold {
-                candidates.push(page_id);
-            }
+        if let Ok(snapshot) = table.get_page(page_id)
+            && snapshot.chain_len > threshold
+        {
+            candidates.push(page_id);
         }
     }
     candidates
@@ -358,7 +358,7 @@ fn bench_consolidation_scan_ab(c: &mut Criterion) {
                     allocated,
                     1,
                 ))
-            })
+            });
         });
     }
 
@@ -367,7 +367,7 @@ fn bench_consolidation_scan_ab(c: &mut Criterion) {
             std::hint::black_box(
                 std::hint::black_box(&table).scan_for_consolidation(std::hint::black_box(1)),
             )
-        })
+        });
     });
 
     group.finish();
@@ -766,7 +766,7 @@ fn bench_split_materialize_tail_ab(c: &mut Criterion) {
                     std::hint::black_box(state.len())
                 },
                 BatchSize::PerIteration,
-            )
+            );
         });
     }
 
@@ -778,7 +778,7 @@ fn bench_split_materialize_tail_ab(c: &mut Criterion) {
                 std::hint::black_box(state.len())
             },
             BatchSize::PerIteration,
-        )
+        );
     });
 
     group.finish();
@@ -979,7 +979,7 @@ fn bench_range_delta_top_k_ab(c: &mut Criterion) {
                     BwKey(0),
                     16,
                 ))
-            })
+            });
         });
     }
 
@@ -991,7 +991,7 @@ fn bench_range_delta_top_k_ab(c: &mut Criterion) {
                 BwKey(0),
                 16,
             ))
-        })
+        });
     });
 
     group.finish();
@@ -1067,7 +1067,7 @@ fn bench_range_shadow_insert_fusion_ab(c: &mut Criterion) {
                     BwKey(0),
                     16,
                 ))
-            })
+            });
         });
     }
 
@@ -1079,7 +1079,7 @@ fn bench_range_shadow_insert_fusion_ab(c: &mut Criterion) {
                 BwKey(0),
                 16,
             ))
-        })
+        });
     });
 
     group.finish();
@@ -1154,12 +1154,12 @@ fn bench_range_chain_walk_ab(c: &mut Criterion) {
 
     for control in ["arc_clone_control_a", "arc_clone_control_b"] {
         group.bench_function(control, |b| {
-            b.iter(|| std::hint::black_box(range_chain_walk_cloned(std::hint::black_box(&head))))
+            b.iter(|| std::hint::black_box(range_chain_walk_cloned(std::hint::black_box(&head))));
         });
     }
 
     group.bench_function("borrowed_candidate", |b| {
-        b.iter(|| std::hint::black_box(range_chain_walk_borrowed(std::hint::black_box(&head))))
+        b.iter(|| std::hint::black_box(range_chain_walk_borrowed(std::hint::black_box(&head))));
     });
 
     group.finish();
@@ -1261,7 +1261,7 @@ fn bench_materialize_chain_collect_ab(c: &mut Criterion) {
         group.bench_function(control, |b| {
             b.iter(|| {
                 std::hint::black_box(collect_materialize_ops_cloned(std::hint::black_box(&head)))
-            })
+            });
         });
     }
 
@@ -1270,7 +1270,7 @@ fn bench_materialize_chain_collect_ab(c: &mut Criterion) {
             std::hint::black_box(collect_materialize_ops_borrowed(std::hint::black_box(
                 &head,
             )))
-        })
+        });
     });
 
     group.finish();

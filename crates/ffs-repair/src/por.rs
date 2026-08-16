@@ -895,12 +895,13 @@ mod tests {
         });
 
         let result = verify_responses(&key, &challenges, &responses, |idx| get_block(&blocks, idx));
-        let challenged: Vec<u64> = challenges.challenges.iter().map(|c| c.index).collect();
+        let expected_failed_indices: Vec<u64> =
+            challenges.challenges.iter().map(|c| c.index).collect();
 
         assert!(!result.audit_passed);
         assert_eq!(result.passed, 0);
         assert_eq!(result.failed, u32::try_from(challenges.len()).unwrap());
-        assert_eq!(result.failed_indices, challenged);
+        assert_eq!(result.failed_indices, expected_failed_indices);
     }
 
     #[test]
