@@ -4725,7 +4725,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_xattr_values_are_memoized_without_caching_zero_inode_or_rw_mounts() {
+    fn capability_absence_is_memoized_on_rw_mounts_too_but_never_for_inode_zero() {
         let calls = Arc::new(AtomicUsize::new(0));
         let fuse = FrankenFuse::with_options(
             Box::new(CountingMissingXattrFs {
@@ -4794,7 +4794,25 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(rw_calls.load(Ordering::Relaxed), 2);
+        // ONE call, not two: the second probe is memo-served. This assertion
+        // used to read `2`, encoding the read_only gating bd-yu6jz deliberately
+        // removed — that gating disabled the memo on exactly the mounts the
+        // worst ratios are measured on. The assertion could not be updated at
+        // the time because this test did not compile (1373408d dropped
+        // getxattr_value's `cx` parameter and left two call sites here passing
+        // it), so the stale expectation sat unnoticed behind a red build.
+        //
+        // What makes memoising an ABSENCE safe on a writable mount is not the
+        // mount flag but invalidation: setxattr and removexattr both
+        // `missing_capability_xattr.forget(ino)`, and forget/batch_forget drop
+        // it when the kernel releases the inode (bd-42b11). So a memoised
+        // absence cannot outlive the moment the inode gains the attribute.
+        assert_eq!(
+            rw_calls.load(Ordering::Relaxed),
+            1,
+            "a read-write mount must memoise capability absence too; the second \
+             probe should not reach the filesystem"
+        );
     }
 
     /// The bd-d9378 A/B opt-out defaults ON and only the exact opt-out spellings
