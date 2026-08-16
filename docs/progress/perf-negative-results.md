@@ -11676,3 +11676,66 @@ the observed-affinity field to the same line a positional parser index-slices, s
 every K=5 value by one and turning `getxattr` into `-819.0` ns/entry. The tell was a
 negative dominant term next to an implausibly large `lookup`. Diagnostic output belongs on
 a different stream from data.
+
+## 2026-08-16 — NULL on the dispatch counters as a complete account: 59-99% of the daemon's own CPU is OUTSIDE dispatch and invisible to every per-op counter it has (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Four hypotheses for the readdir+stat residual have been eliminated or retracted. One
+survived untested and is directly measurable: **the dispatch counters time only the
+innermost ops call**, so FUSE protocol decode, reply encode, request routing and the memo
+lookup itself are daemon work the counters never attribute.
+
+Daemon CPU is `utime+stime` from `/proc/<pid>/stat`, differenced across K=1 and K=5 sweeps
+exactly as the dispatch nanos were. Daemon pinned to one core, affinity reported OBSERVED
+(`observed daemon affinity: 8`), client pinned to a disjoint set.
+
+| slots | daemon CPU | of which dispatched | OUTSIDE dispatch |
+| --- | --- | --- | --- |
+| 4096 | `6790.2` ns/entry | `2768.5` (**40.8%**) | `4021.7` (**59.2%**) |
+| 65536 | `4425.0` ns/entry | `55.2` (**1.2%**) | `4369.8` (**98.8%**) |
+
+Tick resolution is `±76` ns/entry over the 4-sweep difference, i.e. `±1.1%` — coarse, but
+an order of magnitude below the effects above.
+
+### What this locates
+
+**Even with the memo perfectly sized, the daemon still burns `4425` ns/entry, and `98.8%`
+of it is invisible to every dispatch counter.** That is where the unexplained residual
+lives: not in a descent, not in contention, not in memo bookkeeping, but in the
+per-request work surrounding the dispatch call.
+
+It also reframes the memo lever. Sizing it cuts the daemon's own CPU **1.53x**
+(`6790.2 -> 4425.0` ns/entry) — a real reduction, but the floor it reveals is protocol
+handling, not filesystem work. The earlier conclusion that "once the memo fits there is no
+daemon-side work left to remove" was too strong: there is no *filesystem* work left, and
+a great deal of *daemon* work.
+
+### An instrument boundary I nearly crossed twice in one measurement
+
+The first run reported dispatch time as **170x** the daemon's on-CPU time — impossible,
+and the tell. Cause: `/proc/<pid>/schedstat` covers only the MAIN THREAD, and this daemon
+works on a pool, so it saw almost none of the work. `utime+stime` from `/proc/<pid>/stat`
+is process-wide and includes exited threads.
+
+Then, having fixed that, the obvious next step was to express daemon CPU as a percentage
+of the comparator's per-entry arm. **That would have been the same mixed-instrument error
+I corrected in myself one entry earlier** — my harness's daemon against the comparator's
+client. It produced `101.81%` and `136.92%`, values that are not impossible for a
+multi-threaded daemon but are meaningless here because the two halves come from different
+clients. **Every ratio above is therefore within a single run**: dispatch as a fraction of
+that same run's daemon CPU. No comparator number appears in this entry's arithmetic.
+
+### What this does NOT establish
+
+It does not say the `4425` ns/entry is irreducible, and it does not name what inside
+protocol handling costs it — decode, encode, routing and the memo lookup are lumped
+together because the daemon has no counter that separates them. It also cannot be
+converted into a share of the mounted row without a client that reproduces the
+comparator, which I do not have. What it does is move the residual from "unexplained" to
+"located but unmeasured at finer grain", and say which instrument would be needed next: a
+per-request timer around the whole handler, not around the ops call.
+
+Harness `scripts`-local `daemon_cpu.sh` + `daemon_share.py`; candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`. Counted mechanism
+unchanged and identical in both arms of both configurations: **131072 probes dispatched vs
+0 probes dispatched** across the four extra sweeps.
