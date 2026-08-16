@@ -4212,7 +4212,15 @@ impl Filesystem for FrankenFuse {
         // pay as little as possible for the ONE probe that buys silence for the
         // rest of the connection.
         if xattr_unsupported_from_env() {
-            trace!(ino, "getxattr answered ENOSYS: kernel will stop probing (bd-ha71t)");
+            // Same trace target as the probe line below, so ONE filter counts
+            // every getxattr that crossed the boundary in either arm -- an A/B
+            // whose two arms are counted by different filters is not a count.
+            trace!(
+                target: "ffs::fuse::xattr_probe",
+                ino,
+                size,
+                "getxattr answered ENOSYS: kernel will stop probing (bd-ha71t)"
+            );
             reply.error(xattr_switch_errno(XattrHandler::Read));
             return;
         }
