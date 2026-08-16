@@ -12392,3 +12392,85 @@ is the binary that is there.
 
 Counted mechanism: **54 of 54 contention samples over limit**, `max_external_busy_cpus=16`
 against a limit of `2`.
+
+## 2026-08-16 — TWO RUNS WITH CLEAN A/A NULLS DISAGREE BY 9.6%: btrfs readdir+stat measures `7.453004x` and `8.170852x`, both admitted, both CONTENDED — the contention veto is LOAD-BEARING and my earlier case for demoting it was wrong (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Three complete ABBA runs of the campaign's worst row today, one invocation each, live kernel
+btrfs incumbent. The headline is not any of the three ratios; it is that two of them passed
+every gate the ratio is judged by and still disagree by nearly ten percent.
+
+    RUN 3 (this turn, quoted)
+    fuse_over_kernel_median = 8.170852
+    ci_low = 8.113987   ci_high = 8.217506
+    same-invocation A/A null control, kernel arm  1.000341  spread 1.013161  clear=true
+    same-invocation A/A null control, fuse arm    0.995913  spread 1.020034  clear=true
+    twice_null_margin_ratio = 1.040470
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+    elf be270516... -> ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072
+
+    RUN 2 (previous turn)   7.453004x  ci [7.275531, 7.494622]  both nulls clear, admitted
+    RUN 1 (previous turn)   8.449308x  ci [7.987785, 8.535220]  kernel null FAILED at 2.42%
+
+### The disagreement, and what it costs the null gate
+
+Runs 2 and 3 both cleared BOTH same-invocation A/A nulls — kernel `0.998195`/`1.000341`,
+fuse `0.996389`/`0.995913`, every one inside the `1.025` spread limit and within 0.4% of
+one. Both were `admitted=true`, `directional_claim_clear=true`, `HONEST_LOSS`. Their
+confidence intervals are `[7.276, 7.495]` and `[8.114, 8.218]`: **disjoint, separated by
+8.3%, for a total spread of 9.6% between point estimates.**
+
+So a passing A/A null pair does NOT establish that a row reproduces. It controls
+within-invocation noise — the thing it is built for — and is blind to whatever moved between
+these two windows. This is the same lesson the fleet recorded for cross-WORKER comparison
+(one cell measured `1.2693x` and `0.0093x` on two workers with both nulls passing); it turns
+out to hold for cross-WINDOW comparison on a single worker too.
+
+### What moved, and the correction I owe
+
+All three runs were refused post-hoc as CONTENDED, and the contention differed:
+
+    run 2  47/54 -> peak_off_placement_mean_busy = 0.255680   ratio 7.453004
+    run 3  47/47 -> peak_off_placement_mean_busy = 0.293381   ratio 8.170852
+
+More socket contention, worse ratio. That is the expected direction and mechanism: the FUSE
+arm crosses the kernel boundary ~3 times per entry and is far more sensitive to shared
+memory bandwidth, LLC and boost budget than an in-kernel filesystem doing the same work
+inline. Contention inflates OUR arm preferentially, so it inflates the ratio.
+
+**I argued previously that the `external_load_during_run` veto could be demoted, on the
+grounds that every row it vetoes is an HONEST_LOSS and admitting them "cannot manufacture a
+win". That argument was wrong and I withdraw it.** It cannot manufacture a win, but it can
+manufacture a LOSS that is 9.6% larger than the quiet-window truth — and a campaign whose
+entire purpose is closing a gap must not publish an inflated gap any more than a deflated
+one. The veto is not conservatism; on this evidence it is tracking a real effect of the size
+we are trying to measure.
+
+### What is and is not claimed
+
+No ratio is claimed and nothing is superseded. The banked `7.753405x`/`7.649395x` stands, and
+notably it sits BETWEEN today's two clean-null runs, which is the most reassuring thing in
+this entry. What is banked here is the methodological result: on this host, two runs of this
+row with clean A/A nulls can differ by 9.6%, so a single admitted row is not sufficient
+evidence for a change of this magnitude. Rows near or below ~10% on this workload need a
+replicate in a genuinely uncontended window, not merely a passing null.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place.
+Bootstrap median CI, `bootstrap_resamples=20000`,
+estimator `four_round_balanced_crossover_bootstrap_median_ci`. LVM volume, same substrate as
+the banked rows.
+
+### Operational: the candidate was overwritten a SECOND time, within minutes
+
+Before this run, `target/release-perf/ffs-cli` had again been replaced by another pane's
+plain build — `be270516...` -> `0bd7166938be9b58b6b0a5b43918541d41d407416ec9dc0d4acfdc03b81222d8`,
+`compile_sse4_2=false`, `pgo_profile_sha256=none`. Twice in under an hour, so this is a
+recurring hazard rather than an accident. Mitigation now in use: rebuild, then COPY the
+candidate to a private path and point `--ffs-cli` at the copy, so a concurrent peer build
+cannot swap the binary mid-measurement. Verify `candidate_identity` in the run output
+regardless — it is the only thing that proves which binary actually ran.
+
+Counted mechanism: **47 of 47 contention samples over limit**, `max_external_busy_cpus=15`
+against a limit of `2`.
