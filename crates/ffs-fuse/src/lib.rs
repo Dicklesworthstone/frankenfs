@@ -96,6 +96,81 @@ pub fn capability_memo_slots() -> usize {
     LastMissingCapabilityXattr::slots_from_env()
 }
 
+/// Pin the calling thread to ONE CPU from its current affinity mask (bd-svhrq).
+///
+/// # The defect this fixes
+///
+/// Serial dispatch is a single thread running `Session::run`. When the daemon's cpuset
+/// is wider than one CPU the scheduler is free to migrate that thread between them, and
+/// it does so differently from run to run — so two IDENTICALLY configured serial mounts
+/// in the same window disagree.
+///
+/// Measured (SapphireBirch, 2026-08-05, five six-arm runs): at every `--fuse-cpus` above
+/// one the serial arm fails its own A/A null — spread `1.094147` at 4 CPUs, `1.065028`
+/// at 8, `1.034738` at 8 host-wide, and at 48 pairs / 4 CPUs the median deviation itself
+/// reached `2.35%`, past the 2% limit. More pairs made it WORSE, which is the signature
+/// of a bimodal placement rather than of noise. The WORKERS arm cleared its null in 3 of
+/// those 4 runs, so the instability is specific to serial dispatch, not to the workload
+/// or the window.
+///
+/// # Why it matters beyond tidiness
+///
+/// It blocks the largest unclaimed effect in the metadata class: workers measured
+/// `0.499511` / `0.502954` / `0.524839` / `0.590425` against serial — roughly `1.7-2.0x`
+/// faster, always the same direction — and none of it is admissible because the
+/// INCUMBENT arm of that comparison is unstable. A candidate cannot be judged against a
+/// baseline that disagrees with itself.
+///
+/// # Why pin rather than widen
+///
+/// Serial dispatch cannot use more than one CPU by construction: there is exactly one
+/// thread in the loop. A wider cpuset therefore buys it nothing and costs it placement
+/// determinism. Pinning takes the choice away from the scheduler without changing what
+/// the code does, so it cannot make serial dispatch faster or slower on average — it can
+/// only stop it varying, which is precisely the property the A/A null measures.
+///
+/// Best-effort: a failure to read or set affinity leaves the thread unpinned and is
+/// logged, never fatal. A mount must not fail because a determinism aid did.
+#[cfg(target_os = "linux")]
+fn pin_serial_dispatch_thread() {
+    // SAFETY: `sched_getaffinity` / `sched_setaffinity` on the calling thread (pid 0),
+    // with a correctly sized `cpu_set_t` allocated here and read or written only through
+    // libc's own accessors.
+    unsafe {
+        let mut current: libc::cpu_set_t = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        if libc::sched_getaffinity(0, size, std::ptr::addr_of_mut!(current)) != 0 {
+            debug!("could not read CPU affinity; serial dispatch left unpinned");
+            return;
+        }
+        let width = 8 * size;
+        let allowed: Vec<usize> = (0..width)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &current))
+            .collect();
+        // Already single-CPU, or nothing readable: leave it alone. Pinning a one-CPU set
+        // is a no-op, and pinning an empty one would be a bug.
+        if allowed.len() <= 1 {
+            return;
+        }
+        let chosen = allowed[0];
+        let mut only: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(std::ptr::addr_of_mut!(only));
+        libc::CPU_SET(chosen, std::ptr::addr_of_mut!(only));
+        if libc::sched_setaffinity(0, size, std::ptr::addr_of!(only)) == 0 {
+            info!(
+                cpu = chosen,
+                allowed = allowed.len(),
+                "serial FUSE dispatch pinned to one CPU (bd-svhrq)"
+            );
+        } else {
+            debug!("could not pin serial dispatch thread; left unpinned");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_serial_dispatch_thread() {}
+
 /// Bounded spin before the blocking `/dev/fuse` read (bd-receive-spin).
 ///
 /// Mirrors the vendored channel's own parser so the value reported on the mount
@@ -5157,6 +5232,10 @@ pub fn mount(
     } else if options.worker_threads > 0 {
         session.run_with_workers(options.resolved_thread_count())?;
     } else {
+        // bd-svhrq: serial dispatch is ONE thread. A wider cpuset cannot be used
+        // by it and only lets the scheduler place it differently each run, which
+        // is what makes the serial arm fail its own A/A null at every wider set.
+        pin_serial_dispatch_thread();
         session.run()?;
     }
     #[cfg(not(target_os = "linux"))]
