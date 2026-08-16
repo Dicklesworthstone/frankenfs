@@ -178,6 +178,35 @@ def main():
         print("  Note: these arms run SEQUENTIALLY, never concurrently, so this "
               "measures residue (page cache, device state), not CPU contention.")
 
+    if per_arm["ffs_sib"]:
+        # What did the SMT-sibling defect actually cost THIS harness? Measured in
+        # one invocation, position-matched, rather than assumed from other
+        # projects -- their audits disagreed, and only a local measurement settles
+        # it for a local instrument.
+        good, broken = per_arm["ffs"], per_arm["ffs_sib"]
+        eff = st.median(broken) / st.median(good)
+        lo, hi = ratio_ci(broken, good)
+        worst = max(
+            abs(st.median([x for k, vs in per_visit.items()
+                           if k[0] == a and k[1].endswith("1") for x in vs])
+                / st.median([x for k, vs in per_visit.items()
+                             if k[0] == a and k[1].endswith("2") for x in vs]) - 1.0)
+            for a in ("ffs", "ffs_sib"))
+        print("\nSMT-SIBLING BIAS (client on the daemon's sibling vs a separate core)")
+        print(f"  correct pinning {st.median(good) * 1000 / N:8.3f} us/op")
+        print(f"  sibling pinning {st.median(broken) * 1000 / N:8.3f} us/op")
+        print(f"  cost of the defect {eff:.6f}x   ci95 [{lo:.6f}, {hi:.6f}]")
+        decided = (lo > 1.0 or hi < 1.0) and abs(eff - 1.0) > worst
+        print(f"  worst arm null {worst * 100:.2f}%  -> "
+              f"{'DECIDED' if decided else 'INSIDE THE NULL, not decidable'}")
+        if decided and eff > 1.0:
+            print(f"  Every vs-kernel ratio measured under sibling pinning is "
+                  f"inflated by ~{(eff - 1) * 100:.1f}%; divide by {eff:.4f} to "
+                  f"estimate the corrected value.")
+        elif decided:
+            print("  The sibling pinning was FASTER, which contradicts the "
+                  "contention account and needs explaining before use.")
+
     knob = os.environ.get("FFS_KNOB", "")
     if per_arm["ffs_on"]:
         # The lever A/B, position-matched inside the same invocation. Reported

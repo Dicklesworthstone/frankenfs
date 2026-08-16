@@ -78,6 +78,28 @@ KNOB=${FFS_KNOB:-}
 # FrankenFS does to a filesystem, so whatever it moves by is time-order drift
 # between the phases, and only the excess beyond that is contention.
 CONTENTION=${FFS_CONTENTION_CHECK:-0}
+# FFS_SIBLING_BIAS=1 measures what the SMT-sibling defect actually COST, for THIS
+# harness, rather than assuming the fleet's findings transfer -- they did not:
+# networkx runs arms sequentially and cannot contend, torch measured no movement,
+# scipy a small effect, and only this project had a real defect.
+#
+# It adds a second FrankenFS arm whose CLIENT is pinned to the DAEMON'S SMT
+# SIBLING -- the broken configuration every row before 2026-08-16 used -- and
+# interleaves it with the corrected arm inside ONE invocation. That matters: the
+# alternative is two certifications compared across runs, which needs a ~10 minute
+# window and compares arms that never saw the same conditions. Everything this
+# harness has learned says put both arms in the same window.
+SIBLING_BIAS=${FFS_SIBLING_BIAS:-0}
+if [ "$SIBLING_BIAS" = "1" ]; then
+  SIB_CPU=$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+import host_stability as h
+s = h.sibling_of($DAEMON_CPU)
+print(s if s is not None else '')
+")
+  [ -n "$SIB_CPU" ] || { echo "FATAL: cpu$DAEMON_CPU has no SMT sibling; nothing to measure"; exit 7; }
+  echo "sibling-bias mode: broken arm pins client to cpu$SIB_CPU (daemon cpu$DAEMON_CPU's sibling)"
+fi
 OUT=${FFS_OUT:-/tmp/ffs-abba}
 BLOCKS=${FFS_BLOCKS:-3}
 REPS=${FFS_REPS:-6}
@@ -174,8 +196,9 @@ sweep() { # $1 dir  $2 tag  $3 position
   local i s e
   for i in $(seq 1 "$REPS"); do
     s=$EPOCHREALTIME
-    if [ "$CLIENT" = warm ]; then taskset -c "$CLIENT_CPU" "$BIN" "$1" "$OUT/list" >/dev/null 2>&1
-    else taskset -c "$CLIENT_CPU" "$BIN" "$1" >/dev/null 2>&1; fi
+    local ccpu=${4:-$CLIENT_CPU}
+    if [ "$CLIENT" = warm ]; then taskset -c "$ccpu" "$BIN" "$1" "$OUT/list" >/dev/null 2>&1
+    else taskset -c "$ccpu" "$BIN" "$1" >/dev/null 2>&1; fi
     e=$EPOCHREALTIME
     awk '{print $1}' /proc/loadavg >> "$OUT/loadavg"
     # Per-arm CPU frequency, on the two cores this harness pins. Recorded because
@@ -229,7 +252,7 @@ v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE for the daemon
     local kname=${3%%=*}
     grep -q "$kname" "$log" || true
   fi
-  sweep "$FMNT" "$2" "$1"
+  sweep "$FMNT" "$2" "$1" "${4:-$CLIENT_CPU}"
   kill -INT $mp 2>/dev/null; wait $mp 2>/dev/null; sleep 2
 }
 v_kern() { # $1 position  $2 optional arm tag override
@@ -246,6 +269,21 @@ if [ "$CONTENTION" = "1" ]; then
     v_cal "${b}p1" cal_iso; v_kern "${b}p1" kern_iso
     v_kern "${b}p2" kern_iso; v_cal "${b}p2" cal_iso
   done
+fi
+
+if [ "$SIBLING_BIAS" = "1" ]; then
+  for b in $(seq 1 "$BLOCKS"); do
+    v_cal "${b}s1"
+    v_ffs "${b}s1" ffs ""; v_ffs "${b}s1" ffs_sib "" "$SIB_CPU"
+    v_kern "${b}s1"; v_kern "${b}s2"
+    v_ffs "${b}s2" ffs_sib "" "$SIB_CPU"; v_ffs "${b}s2" ffs ""
+    v_cal "${b}s2"
+  done
+  fusermount3 -u "$FMNT" 2>/dev/null
+  echo "=== in-process ELF identity ==="
+  grep -ohE "binary_sha256=[0-9a-f]{64}" "$OUT"/ffs*-*.log | tail -1
+  FFS_OUT="$OUT" FFS_ENTRIES="$ENTRIES" FFS_KNOB="$KNOB" python3 "$HERE/fuse_vs_kernel_abba_report.py"
+  exit 0
 fi
 
 for b in $(seq 1 "$BLOCKS"); do

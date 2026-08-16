@@ -247,6 +247,12 @@ def siblings(cpu: int) -> set[int]:
     return out or {cpu}
 
 
+def sibling_of(cpu: int) -> int | None:
+    """The SMT sibling of `cpu`, or None if it has none (SMT off / single-thread)."""
+    others = sorted(siblings(cpu) - {cpu})
+    return others[0] if others else None
+
+
 def cores_comparable(daemon_cpu: int, client_cpu: int) -> tuple[bool, str]:
     """Refuse a pinning where the two arms cannot be compared.
 
@@ -427,11 +433,17 @@ def _selftest() -> int:
     ok, why = cores_comparable(8, 12)
     if 12 not in siblings(8):
         assert ok, why
+    # sibling_of must return the partner thread, or None when SMT is unavailable.
+    sib8 = sibling_of(8)
+    if 40 in siblings(8):
+        assert sib8 == 40, sib8
+    assert sibling_of(999999) is None      # missing sysfs -> no sibling, no raise
+
     # Sibling parsing must handle both list and range forms without raising.
     assert isinstance(siblings(0), set) and siblings(0)
     assert siblings(999999) == {999999}   # missing sysfs must not raise
 
-    print("host_stability selftest: 33 cases pass")
+    print("host_stability selftest: 35 cases pass")
     return 0
 
 
