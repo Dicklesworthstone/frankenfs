@@ -1576,6 +1576,9 @@ impl std::fmt::Debug for AtomicMetrics {
             .field("readdir_dispatch_nanos", &s.readdir_dispatch_nanos)
             .field("requests_throttled", &s.requests_throttled)
             .field("requests_shed", &s.requests_shed)
+            .field("readdirplus_memo_remembers", &s.readdirplus_memo_remembers)
+            .field("readdirplus_memo_hits", &s.readdirplus_memo_hits)
+            .field("forget_nodes", &s.forget_nodes)
             .finish()
     }
 }
@@ -17111,8 +17114,8 @@ mod tests {
             "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
-            "requests_throttled: 0, requests_shed: 0, "
-            "readdirplus_memo_remembers: 0, readdirplus_memo_hits: 0, "
+            "requests_throttled: 0, requests_shed: 0, ",
+            "readdirplus_memo_remembers: 0, readdirplus_memo_hits: 0, ",
             "forget_nodes: 0 }, ",
             "unmount_timeout: 30s }"
         );
@@ -18267,6 +18270,12 @@ AllowOther"#;
         m.record_throttled();
         m.record_shed();
         m.record_handler_duration(Duration::from_nanos(7));
+        // bd-i353e / bd-q0xnl: these three are boundary/mechanism counters that no
+        // dispatch op reaches, so exercising every RequestOp does not touch them.
+        // They must still be driven here, or this guard passes while they read zero.
+        m.record_forget_nodes(1);
+        m.record_readdirplus_memo_remember();
+        m.record_readdirplus_memo_hit();
         for op in RequestOp::ALL {
             m.record_dispatch_duration(op, Duration::from_nanos(7));
         }
@@ -18527,16 +18536,23 @@ AllowOther"#;
             "requests_err: 0, ",
             "bytes_read: 512, ",
             "metadata_requests: 0, ",
+            "handler_total_nanos: 0, ",
+            "handler_total_count: 0, ",
             "getattr_dispatch_count: 0, ",
             "getattr_dispatch_nanos: 0, ",
             "getxattr_dispatch_count: 0, ",
             "getxattr_dispatch_nanos: 0, ",
+            "mutation_dispatch_count: 0, ",
+            "mutation_dispatch_nanos: 0, ",
+            "other_dispatch_count: 0, ",
+            "other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, ",
             "lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, ",
             "readdir_dispatch_nanos: 0, ",
             "requests_throttled: 1, ",
-            "requests_shed: 0",
+            "requests_shed: 0, ",
+            "readdirplus_memo_remembers: 0, readdirplus_memo_hits: 0, forget_nodes: 0",
             " }"
         );
 
@@ -18719,8 +18735,8 @@ AllowOther"#;
             "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
-            "requests_throttled: 0, requests_shed: 0, "
-            "readdirplus_memo_remembers: 0, readdirplus_memo_hits: 0, "
+            "requests_throttled: 0, requests_shed: 0, ",
+            "readdirplus_memo_remembers: 0, readdirplus_memo_hits: 0, ",
             "forget_nodes: 0 }, ",
             "thread_count: 2, ",
             "worker_dispatch: true, ",
