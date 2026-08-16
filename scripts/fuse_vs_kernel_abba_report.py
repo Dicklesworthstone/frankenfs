@@ -82,6 +82,30 @@ def main():
                 freqs[arm]["client"].append(int(c_khz) / 1000)
     except (OSError, ValueError):
         freqs = {}
+    try:
+        cores = collections.defaultdict(collections.Counter)
+        with open(f"{OUT}/cores") as fh:
+            for line in fh:
+                arm, cpu = line.strip().split("\t")
+                cores[arm][int(cpu)] += 1
+    except (OSError, ValueError):
+        cores = {}
+    if cores:
+        print("\nOBSERVED core placement per arm (recorded, not asserted -- taskset "
+              "sets affinity, this is where the work actually ran):")
+        for arm in sorted(cores):
+            seen = cores[arm].most_common()
+            ids = []
+            for cpu, _ in seen:
+                try:
+                    with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/core_id") as fh:
+                        ids.append(f"cpu{cpu}(core {fh.read().strip()})")
+                except OSError:
+                    ids.append(f"cpu{cpu}")
+            print(f"  {arm:8} {', '.join(ids)}")
+        print("  A ratio whose arms sat on different physical cores, or shared one "
+              "via SMT, is a hardware ratio in disguise -- quote these in the row.")
+
     if freqs:
         print("\nCPU MHz per arm (pinned cores). A frequency difference between "
               "arms is a confound the ratio cannot cancel:")

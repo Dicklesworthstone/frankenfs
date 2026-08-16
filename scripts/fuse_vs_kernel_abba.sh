@@ -143,7 +143,7 @@ gcc -O2 -o "$BIN" "$SRC" || { echo "FATAL: client build failed"; exit 2; }
 
 FMNT=$OUT/ffs; KMNT=$OUT/kern; TMNT=/dev/shm/ffs-abba-cal
 mkdir -p "$FMNT" "$KMNT" "$TMNT"
-: > "$OUT/samples.tsv"; : > "$OUT/loadavg"; : > "$OUT/cpufreq"
+: > "$OUT/samples.tsv"; : > "$OUT/loadavg"; : > "$OUT/cpufreq"; : > "$OUT/cores"
 
 # Name list and calibration dir are built from the KERNEL mount. Never enumerate
 # a directory inside the mount you are measuring: a partial `ls` in the measured
@@ -178,6 +178,12 @@ sweep() { # $1 dir  $2 tag  $3 position
     # after a rep, which is the closest cheap proxy; the dedicated audit that
     # sampled DURING the work found both arms at ~4 GHz and the daemon core within
     # 0.01% of the client core, so this axis is clean on this box.
+    # OBSERVED core placement, not asserted. taskset sets affinity; this records
+    # where the work actually ran (field 39 of /proc/<tid>/stat is the last CPU).
+    # Verified 2026-08-16: client 92/92 samples on its pinned core, daemon 96/96
+    # across ALL its threads on its own core -- so worker threads do inherit the
+    # affinity, which had been an assumption until it was measured.
+    printf "%s\t%s\n" "$2" "$(awk '{print $39}' /proc/self/stat 2>/dev/null)" >> "$OUT/cores"
     printf "%s\t%s\t%s\n" "$2" \
       "$(cat /sys/devices/system/cpu/cpu$DAEMON_CPU/cpufreq/scaling_cur_freq 2>/dev/null || echo 0)" \
       "$(cat /sys/devices/system/cpu/cpu$CLIENT_CPU/cpufreq/scaling_cur_freq 2>/dev/null || echo 0)" \
