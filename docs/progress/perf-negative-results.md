@@ -11098,3 +11098,83 @@ self-reported via `bench-evidence`,
 `471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`; both built on
 `thinkstation1`; `hostname=thinkstation1`, `executed_on=thinkstation1`. Four-arm
 post-parity `verdict=pass` and `btrfs check` clean throughout.
+
+## 2026-08-16 — REFUTED, and it is my own claim being refuted: "8 bytes x slots" is right about address space and wrong about RESIDENT memory — 1,048,576 slots cost 8 MiB of address space and ~1 MB resident (bd-kzfh2, AzureBay)
+
+`bd-5vis3`'s acceptance bar says peak resident memory must be MEASURED, not argued. I
+had been arguing it: every row I wrote about the slot count said "65,536 slots is
+512 KiB per mount", straight from `8 bytes x slots`. **That arithmetic is right about
+address space and wrong about resident memory, and the difference decides the sizing
+policy.**
+
+Daemon peak RSS (`VmHWM`, the kernel's own high-water mark) read from
+`/proc/<pid>/status` while the daemon is still alive, before and after a **32,768-entry
+readdir sweep** that touches ~32,768 distinct inodes, one image, identical workload per
+arm:
+
+    slots=4096     capability_memo_slots=4096     VmHWM  9412 ->  39876 kB (+30464)  VmSize  190660 -> 1368516 kB
+    slots=65536    capability_memo_slots=65536    VmHWM  9544 ->  40848 kB (+31304)  VmSize  190660 -> 1371076 kB
+    slots=1048576  capability_memo_slots=1048576  VmHWM  9400 ->  40920 kB (+31520)  VmSize  200900 -> 1378756 kB
+
+| slots | table delta PREDICTED (8 B/slot) | table delta OBSERVED resident |
+| --- | --- | --- |
+| 65,536 vs 4,096 | `480 kB` | `840 kB` |
+| 1,048,576 vs 4,096 | `8,160 kB` | **`1,056 kB`** |
+
+The counted mechanism underneath the memory figures: the allocation count is the
+capacity while the touched count is the workload — **32768 slots touched vs 1048576 slots
+allocated** in the ceiling arm, so 3.1% of the table was ever written.
+
+At the ceiling the prediction is **8x too pessimistic**. The address space IS reserved
+exactly as arithmetic says — baseline `VmSize` goes `190,660 -> 200,900 kB`, a
+`10,240 kB` step for an 8 MiB table — but the pages never become resident until they are
+written.
+
+### Why: the table is lazily materialised
+
+`with_slots` builds the table by collecting `AtomicU64::new(0)` into a boxed slice. A
+zero-fill of freshly-mapped anonymous memory lowers to `alloc_zeroed`, so untouched
+slots stay on the shared zero page and cost nothing resident. A slot becomes real only
+when `remember()` writes an inode into it.
+
+A first pass missed this and nearly produced a wrong conclusion: measuring peak RSS
+after stat'ing ONE file gave `+12 / +28 / +64 kB` across the four slot counts against a
+predicted `+480 kB / +2 MiB / +8 MiB`, i.e. **100x off**. The tempting reading was "the
+env var is not taking effect" — but the same env var had already produced a measured
+`2.08x` on readdir+stat and both mount paths go through one production constructor, so
+the table was certainly being built. The right reading was that it was being built and
+not touched, and the way to tell the two apart was to touch it.
+
+### What this means for the sizing policy
+
+The unbounded-footprint objection is **materially weaker than I had been stating**. A
+larger table costs:
+
+- address space proportional to capacity (cheap on 64-bit, and bounded by
+  `CAPABILITY_MEMO_SLOTS_MAX` at 8 MiB), and
+- resident memory proportional to the inodes actually probed, which is bounded by the
+  workload rather than by the parameter.
+
+So option 1 on `bd-kzfh2` — a larger fixed default — is far more defensible than the
+`8 bytes x slots` arithmetic suggested, and a mount that never touches a large directory
+pays close to nothing for a large table.
+
+### The limit of that conclusion, which is NOT measured
+
+This fixture's inode numbers are **dense and sequential**, so `ino & (len - 1)` maps a
+32,768-inode sweep onto a contiguous ~`256 kB` region — best case for page residency.
+A filesystem with sparse or widely-spaced inode numbers would scatter the same number of
+touches across many more pages, and the resident cost could approach the capacity. **No
+claim is made about that case here.** Before a larger default ships, `bd-kzfh2` should
+measure a sparse-inode workload as well; the `100,000`-entry non-fitting workload from
+`bd-m1bpu` does not cover it, because its inodes are dense too.
+
+Harness `scripts`-local `memo_rss.sh` and `memo_rss_touched.sh`. The candidate reports
+its own identity through `bench-evidence` at run time:
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`;
+`hostname=thinkstation1`, `executed_on=thinkstation1`, run locally because a FUSE mount
+runs only on the executing machine — no rch worker took part. `VmHWM` is a counted
+kernel-maintained high-water mark, not a timing, so host contention cannot confound it
+and no quiet window was required.
