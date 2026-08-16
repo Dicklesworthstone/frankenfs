@@ -12238,3 +12238,83 @@ against a limit of `2`. Provenance as the parent entry: candidate
 `af6de55e7089f9b9091cc992fcb3a9c1c23a581f060b092789c40977e39a1c53`, `isa=x86-64-v3`,
 `RCH_WORKER=none`, `hostname=thinkstation1`, `bootstrap_resamples=20000`. Report at
 `/data/tmp/frankenfs-mounted-kernel/run_1786892764_29835723_483688/`.
+
+## 2026-08-16 — REJECT (too small to matter, not merely too small to measure): disabling FUSE splice moves warm stat by `0.27%` against a `9.2%` decision floor (bd-3nenf / bd-splice-metadata, AzureBay)
+
+First measurement of the splice A/B landed in `772a1e3c`. Six-arm within-window
+candidate-vs-candidate crossover on ext4 warm stat, 2,000 operations, 12 pairs, ONE ELF.
+
+    candidate_b_over_candidate_a_median = 0.997331
+    ci_low = 0.995369   ci_high = 1.000417
+    minimum_decidable_effect_ratio = 1.091665
+    achieved_resolution_ratio      = 1.004652
+    candidate_claim_clear = false   admitted = false   verdict = BLOCKED_NULL
+    same-invocation A/A null control, kernel arm            1.026376 spread
+    same-invocation A/A null control, fuse arm              1.044828 spread
+    same-invocation A/A null control, fuse_candidate_b arm  1.027015 spread   (limit 1.025)
+    All three nulls are same-invocation controls: the six arms run in ONE invocation
+    (same_window=true), so they share the window they are controlling for.
+
+**The hypothesis is refuted on size, and that conclusion does not depend on the row being
+admissible.** Splice-off is `0.27%` faster by point estimate, with a CI of
+`[0.995369, 1.000417]` that brackets 1.0 — the whole interval spans less than half a
+percent. The instrument's floor in this window was `9.2%`, so the effect is roughly THIRTY
+TIMES below what could be decided here; and buying pairs cannot rescue it, because 48 pairs
+in a quiet window has historically bought a claim gate of ~`1.07%`, still four times larger
+than the entire confidence interval. There is no window and no pair count on this harness
+that turns `0.27%` into a result.
+
+That is a stronger statement than "undecidable". An undecidable row leaves the effect
+unknown; here the CI is tight enough to say the effect is small, whatever its sign.
+
+### What the hypothesis was, and why it was worth one run
+
+`init()` has always negotiated `FUSE_SPLICE_READ|WRITE|MOVE` unconditionally, on the
+reasoning that avoiding a copy cannot hurt. Splice avoids copies on LARGE payloads by
+setting up pipe buffers and passing page references; warm stat's entire boundary traffic is
+one `getxattr(security.capability)` per operation with a reply of tens of bytes, far below
+where a copy costs anything, while the per-transfer setup is paid regardless. The sizing that
+licensed the experiment was that the warm-stat crossing is `8.674 us` of our `10.958 us` per
+stat — 79.2% of the row — so a per-reply transport overhead would have sat inside the
+dominant component, unlike the attr-reuse levers that sized out at 0.15% inside a 3.85%
+daemon share.
+
+**The sizing was right about WHERE to look and wrong about WHAT would be there.** Splice is
+not a measurable part of the crossing cost on a metadata workload. The 8.674 us is somewhere
+else — sleep/wake latency remains the standing hypothesis (bd-receive-spin), and it is now
+the better-supported one by elimination.
+
+### Admissibility, stated plainly
+
+The row is BLOCKED_NULL and CONTENDED and is NOT being claimed as a measurement. All three
+A/A nulls missed their spread gate — kernel `1.026376`, fuse `1.044828`, fuse_candidate_b
+`1.027015` against a `1.025` maximum, the first two only marginally — and
+`external_load_during_run` reported 37 of 37 samples over limit,
+`max_external_busy_cpus=26`, `peak_off_placement_mean_busy=0.336922`, `verdict=CONTENDED`.
+What is banked here is the REJECTION of the lever on magnitude, which the contention cannot
+manufacture: noise widens intervals, and this interval is narrow.
+
+### What the run DID establish beyond the lever
+
+The knob plumbing works end to end. `mounted_kernel_candidate_identity` reports
+`one_elf=true`, `elf_sha256=43a6e4503e955b30ff9cb654ae21a76ecae954149ac9ce5aa54770f16ec5d97e`,
+`candidate_a_runtime_knobs="...,splice=true,receive_spin=0"` against
+`candidate_b_runtime_knobs="...,splice=false,receive_spin=0"`, `configurations_differ=true`,
+`knob_divergence_proof=daemon_self_reported_effective_values`, `verdict=pass`. Every knob
+added during the freeze — capability_memo_bitmap, io_uring, io_uring_queue_depth,
+io_uring_payload_bytes, splice, receive_spin — is now visible on that line, so any of them
+can be A/B'd without further plumbing.
+
+Incidentally measured: `fuse_over_kernel_median=4.906970` for warm stat on this ELF, against
+the banked `4.769886x`/`4.802719x`. Not admitted and not superseding anything.
+
+Provenance: `bench_evidence,binary_sha256=43a6e4503e955b30ff9cb654ae21a76ecae954149ac9ce5aa54770f16ec5d97e`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`. `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place.
+Candidate-B bootstrap median `0.997331x` with bootstrap median CI `[0.995369, 1.000417]`,
+`bootstrap_resamples=20000`. Artifacts on the LVM volume (the emergency `/dev/sda1` bind
+mount was removed first), so this is the same substrate as the banked rows.
+
+Counted mechanism: **37 of 37 contention samples over limit** with `max_external_busy_cpus=26`
+against a limit of `2`.
