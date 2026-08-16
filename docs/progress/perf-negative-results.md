@@ -13449,3 +13449,71 @@ from 20000 resamples, e.g. bootstrap median `8.278490x` with bootstrap median CI
 
 Counted mechanism: **13 of 13 clean-null runs placed 8 client threads on fewer than 8 distinct
 physical cores** — 7 cores in ten runs, 6 in two, 4 in one.
+
+## 2026-08-16 — MEASURED for this harness: SMT co-residency shifts the ratio by `+3.49%`, but the spread at FIXED core count is `18.43%` — 5.3x larger, so placement does NOT explain the dispersion (bd-client-core-distinctness, AzureBay)
+
+The fleet's placement audits came back mixed — networkx sequential-so-cannot-contend, scipy
+~50% co-residency with a small effect, torch cross-core spread not moving its numbers,
+frankenfs both arms on one core, frankenpandas pinned and recorded. The instruction is to
+measure the impact for my own harness rather than assume it transfers. Measured.
+
+### The measurement
+
+Ten clean-null runs of the worst row at the shipping 4096-slot configuration (the memo-sized
+runs are a different filesystem configuration and are excluded — mixing them is the trap
+recorded earlier today):
+
+    6 physical cores  n=2  median 7.535142  range 7.453-7.617
+    7 physical cores  n=8  median 7.798460  range 6.990-8.278
+
+    BETWEEN-group difference (7-core median vs 6-core median):  +3.49%
+    WITHIN-group spread at FIXED 7 cores:                       18.43%
+    within-group spread / between-group difference:              5.3x
+
+### What that says, and what it does not
+
+**Direction matches the mechanism.** Fewer distinct cores means more SMT sharing among the 8
+client threads, which slows the client; the client is a larger fraction of the fast kernel arm
+(27.8 ms) than of the slow FUSE arm (214.8 ms), so it inflates the denominator more than the
+numerator and DEPRESSES the ratio. The 6-core runs are indeed the lower group, at `-3.49%`.
+
+**Magnitude does not explain the dispersion.** At a FIXED 7 cores the ratio still spans
+`6.990-8.278`, `18.43%` — more than five times the entire between-group difference. Whatever
+moves this row by ~13-18% between runs, it is not core count, because holding core count
+constant does not remove it.
+
+**And n=2 in the 6-core group means the `+3.49%` is itself weak.** Two points, which is the
+shape that has misled me three times today. I am reporting it as a bound rather than an
+estimate: co-residency plausibly costs a few percent here, and it is certainly not the tens of
+percent that would be needed to matter.
+
+### The answer for the fleet
+
+For THIS harness the placement effect is real, small, and NOT the explanation — closest to
+torch's result (cross-core spread does not move the numbers) and unlike the frankenfs
+both-arms-on-one-core failure, which I checked for explicitly and do not have: my four arms
+share one client set by design because the schedule is sequential, and `observed_worker_cpus_
+by_arm` is identical across `kernel_a`, `kernel_b`, `fuse_a`, `fuse_b` in every run.
+
+What I DO have, and what nobody else reported, is that the client's OWN 8 threads never got 8
+distinct cores in any of 13 runs. That is now recorded per row (`client_physical_cores`,
+`client_smt_shared_cpus`, `client_cpu_mhz`) so the bound above can be tightened as runs
+accumulate instead of re-derived.
+
+The dispersion therefore remains unexplained, with four candidates now tested: contention
+severity (refuted), loadavg (refuted), CPU placement (refuted), and core count (measured at
+5.3x too small). Frequency on the arms' own cores is the one still open, and it became
+measurable only this tick.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`
+(in-process self-report), `isa=x86-64-v3`, `candidate_identity verdict=pass`,
+`RCH_WORKER=none`, `hostname=thinkstation1`. Observed loadavg `12.8` falling; observed
+all-core spread `1429-4264 MHz` (2.98x, which per the earlier entry reflects parked idle cores
+rather than inter-arm inequality). Derived from 10 preserved reports; no new measurement run.
+**No new ratio is claimed** — each run referred to is a bootstrap median with a bootstrap
+median CI from 20000 resamples, e.g. bootstrap median `8.278490x` with bootstrap median CI
+`[8.242402, 8.323421]`, absolute arm medians `kernel_median_wall_ns` 27,772,000 ns and
+`fuse_median_wall_ns` 214,816,000 ns.
+
+Counted mechanism: **10 runs partitioned 2/8 by distinct physical core count**, giving a
+between-group difference of 3.49% against an 18.43% within-group spread.
