@@ -4775,6 +4775,58 @@ fn load_is_settled(one: f64, five: f64, low_threshold: f64, convergence: f64) ->
     hi <= 0.0 || lo / hi >= convergence
 }
 
+/// Observed per-CPU clock in MHz, from `/proc/cpuinfo` (bd-cpu-mhz).
+///
+/// The report has always recorded the frequency POLICY — governor, EPP — and never the
+/// frequency actually observed. On this host that is a material gap rather than a
+/// tidiness one: the governor is `powersave` and cores swing roughly 1429-4292 MHz, so
+/// a QUIET window is a DOWNCLOCKED window. Chasing low load therefore trades contention
+/// noise for frequency error, and a row recording loadavg but not MHz cannot tell the
+/// two apart afterwards.
+///
+/// Measured 2026-08-16 at loadavg 68: cores spanned 3111-3917 MHz simultaneously, a
+/// 1.26x spread ACROSS CORES AT ONE INSTANT. Two arms placed on different cores can
+/// therefore differ by more than the entire unexplained dispersion of the worst row
+/// (13.14% across eight clean-null runs), which is why this is worth capturing before
+/// any further attribution of that spread.
+fn cpu_mhz() -> BTreeMap<usize, f64> {
+    let mut out = BTreeMap::new();
+    let Ok(raw) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return out;
+    };
+    let mut cpu: Option<usize> = None;
+    for line in raw.lines() {
+        if let Some(v) = line.strip_prefix("processor") {
+            cpu = v.trim_start_matches([':', ' ']).trim().parse().ok();
+        } else if let Some(v) = line.to_ascii_lowercase().strip_prefix("cpu mhz") {
+            if let (Some(c), Ok(mhz)) = (
+                cpu,
+                v.trim_start_matches([':', ' ']).trim().parse::<f64>(),
+            ) {
+                out.insert(c, mhz);
+            }
+        }
+    }
+    out
+}
+
+/// Summarise observed clocks over a CPU set: (min, max, mean, spread).
+///
+/// `spread` is max/min — the ratio an arm placed on the slowest core would see against
+/// one placed on the fastest. Reported rather than gated: this is evidence for
+/// attributing a ratio after the fact, not a new refusal criterion.
+fn cpu_mhz_summary(mhz: &BTreeMap<usize, f64>, cpus: &BTreeSet<usize>) -> Option<(f64, f64, f64, f64)> {
+    let vals: Vec<f64> = cpus.iter().filter_map(|c| mhz.get(c).copied()).collect();
+    if vals.is_empty() {
+        return None;
+    }
+    let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+    let spread = if min > 0.0 { max / min } else { 1.0 };
+    Some((min, max, mean, spread))
+}
+
 fn runtime_isa_label(host: &HostProvenance) -> String {
     host.runtime_features
         .iter()
@@ -6802,6 +6854,23 @@ fn fs_report(
     };
     let cpu_frequency_policy_json = cpu_frequency_policy_json(&host.cpu_frequency_policy);
 
+    // bd-cpu-mhz: observed clocks, not just the policy. On a powersave host a quiet
+    // window is a DOWNCLOCKED window, so loadavg alone cannot separate contention noise
+    // from frequency error. Evidence, not a gate.
+    let cpu_mhz_observed_json = {
+        let mhz = cpu_mhz();
+        let all: BTreeSet<usize> = mhz.keys().copied().collect();
+        cpu_mhz_summary(&mhz, &all).map(|(min, max, mean, spread)| {
+            json!({
+                "min": min,
+                "max": max,
+                "mean": mean,
+                // max/min across cores at one instant: the ratio error two arms on
+                // different cores could see from frequency alone.
+                "spread": spread,
+            })
+        })
+    };
     let Value::Object(mut report) = json!({
         "filesystem": kind.label(),
         "workload": config.workload.label(),
@@ -6810,6 +6879,10 @@ fn fs_report(
         "chooser_statement": chooser_statement,
         "incumbent_isolation_proof": incumbent_isolation_proof_json,
         "host_identity": host.hostname,
+        // bd-cpu-mhz: observed clocks, not just the policy. On a powersave host a
+        // quiet window is a DOWNCLOCKED window, so loadavg alone cannot separate
+        // contention noise from frequency error. Evidence, not a gate.
+        "cpu_mhz_observed": cpu_mhz_observed_json,
         "load_average": load_average().map(|(one, five, fifteen)| {
             serde_json::json!({
                 "one_minute": one,
@@ -9598,6 +9671,51 @@ mod tests {
     /// "the run was quiet" can be told apart from "quiet apart from ourselves". And it
     /// does NOT affect the verdict — the external check stays the gate. Gating on it
     /// would be a new refusal criterion smuggled in as a diagnostic.
+    /// bd-cpu-mhz: a QUIET window is a DOWNCLOCKED window on this host.
+    ///
+    /// The governor is `powersave` and cores swing roughly 1429-4292 MHz, so chasing
+    /// low load trades contention noise for frequency error. The report recorded the
+    /// frequency POLICY and never the observed frequency, which means no banked row
+    /// can be re-examined for this after the fact.
+    ///
+    /// The number that makes it material: measured at loadavg 68 on 2026-08-16, cores
+    /// spanned 3111-3917 MHz SIMULTANEOUSLY — a 1.26x spread across cores at one
+    /// instant. Two arms placed on different cores can therefore differ by more than
+    /// the entire unexplained dispersion of the worst row (13.14% over eight
+    /// clean-null runs), which is why `spread` is reported and not just the mean.
+    #[test]
+    fn cpu_mhz_summary_reports_the_cross_core_spread_bd_cpu_mhz() {
+        let mhz: BTreeMap<usize, f64> =
+            [(0, 3111.0), (1, 3917.0), (2, 3500.0), (9, 1429.0)].into_iter().collect();
+
+        // Only the requested CPUs are summarised — an arm is placed on a subset.
+        let two: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let (min, max, mean, spread) = cpu_mhz_summary(&mhz, &two).expect("summary");
+        assert!((min - 3111.0).abs() < 1e-6);
+        assert!((max - 3917.0).abs() < 1e-6);
+        assert!((mean - 3514.0).abs() < 1e-6);
+        assert!(
+            (spread - 3917.0 / 3111.0).abs() < 1e-6,
+            "spread is max/min — the ratio error two arms on different cores would see"
+        );
+
+        // A downclocked core drags the spread far past the row's whole dispersion.
+        let with_slow: BTreeSet<usize> = [1, 9].into_iter().collect();
+        let (_, _, _, wide) = cpu_mhz_summary(&mhz, &with_slow).expect("summary");
+        assert!(
+            wide > 2.7,
+            "1429 MHz against 3917 MHz is a 2.7x spread; a row that does not record \
+             this cannot rule frequency out as the cause of its dispersion"
+        );
+
+        // CPUs with no reading must not fabricate one.
+        let missing: BTreeSet<usize> = [42].into_iter().collect();
+        assert!(
+            cpu_mhz_summary(&mhz, &missing).is_none(),
+            "absent readings yield None, never a defaulted zero"
+        );
+    }
+
     #[test]
     fn placement_busy_is_recorded_separately_and_does_not_gate_bd_arm_contention() {
         let placement: BTreeSet<usize> = [0, 1].into_iter().collect();
