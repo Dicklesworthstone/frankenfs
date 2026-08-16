@@ -13169,3 +13169,85 @@ changes. Nothing claimed, nothing superseded — a failure to certify under load
 
 Counted mechanism: **151 of 151 placement samples over 300000ms found no qualifying physical
 core**, against a limit of 1 qualifying core needed.
+
+## 2026-08-16 — CROSS-PROJECT CHECK ANSWERED: my arms CAN contend with each other, the contention witness is blind to it BY CONSTRUCTION, and the crossover balances order but not MAGNITUDE (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+No certification: loadavg 1-min `11.96`, 5-min `18.19`, ratio `0.66` — below my own `0.70`
+convergence threshold, and I overrode that rule once today and was wrong, so it stands.
+
+franken_numpy confirmed that its own arm slows the incumbent it is measured against, that the
+two arms are therefore not independent, and that an A/A null does not catch it. Checked
+against this harness rather than assumed. **The same exposure exists here.** No ratio is
+claimed or withdrawn on this basis; what follows is an audit of the instrument.
+
+### 1. The contention witness EXCLUDES our own arms, by construction
+
+`ffs_mounted_kernel_bench.rs:7169` builds the sampler's exclusion set as
+
+    driver_cpus + driver_guard_cpus + fuse_cpus + fuse_guard_cpus
+
+and `external_load_during_run` reports `peak_off_placement_mean_busy` — busy-ness OFF that
+set. Every CPU our own arms run on is removed from the measurement before it is taken. So if
+the FUSE daemon and the client threads were loading each other, or the daemon were loading the
+kernel arm, the witness that has refused literally every run today would report nothing. It is
+an EXTERNAL-load witness and does exactly what its name says; the gap is that nothing else
+watches the internal case.
+
+That is the same shape franken_numpy found, and it is invisible to the A/A nulls for the same
+reason: an A/A null compares an arm against ITSELF, so a bias that hits both halves equally
+cancels exactly. The nulls this row has produced — `1.001300`, `0.998394`, `1.005247` — are
+consistent with clean measurement AND with both halves being depressed identically.
+
+### 2. Arms are sequential, which limits but does not remove the exposure
+
+`balanced_schedule=four_arm_latin_square`, `measured_arms=[kernel_a, kernel_b, fuse_a,
+fuse_b]`, `between_arm_quiescence="read-only; settle only"`, `arm_settle_ms=100`. Only one arm
+is timed at a time, so there is no simultaneous CPU contention between arms. What survives is
+RESIDUAL state carried across a 100 ms settle:
+
+  - socket-wide boost and thermal budget, which does not recover in 100 ms
+  - the other three mounts remaining resident, including a FUSE daemon with live worker threads
+  - LLC occupancy from the previous arm
+
+Separate images and mounts mean page cache is not shared between arms, so that channel is
+closed. Boost budget is not.
+
+### 3. The crossover balances ORDER but not MAGNITUDE, and that is the sharp point
+
+A Latin square puts each arm in each position equally often, so a uniform "whatever ran
+previously depresses the next arm" effect cancels. That is a real defence and it is why this
+design was chosen.
+
+It does not cancel an ASYMMETRIC effect. The FUSE arm takes roughly **8x** the wall time of the
+kernel arm for identical work — that is the row's whole finding — so per visit it runs the
+socket hot for eight times as long. If sustained load depresses the following arm's boost
+headroom, the kernel arm measured after a FUSE arm is penalised more than the FUSE arm measured
+after a kernel arm. Balancing position does not equalise magnitudes that differ by 8x, and the
+bias direction is unfavourable to the incumbent, i.e. it would INFLATE our reported ratio.
+
+**This is unquantified.** I am not claiming the banked rows are inflated; I am recording that
+the design does not rule it out and that nothing currently measures it.
+
+### What would settle it, cheaply
+
+Extend the external-load sampler to ALSO record busy-ness ON the placement CPUs, reported
+separately rather than folded into the veto. That distinguishes "this run was quiet" from
+"this run was quiet apart from ourselves" at zero measurement cost, needs no quiet window, and
+would show directly whether a FUSE visit leaves the following kernel visit degraded. A stronger
+version raises `arm_settle_ms` and checks whether the ratio moves — if boost recovery is the
+mechanism, a longer settle should shrink the gap.
+
+Provenance: audit of `ffs_mounted_kernel_bench.rs` and of the preserved report at
+`/data/tmp/frankenfs-mounted-kernel/`, candidate
+`bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`isa=x86-64-v3`, `RCH_WORKER=none`, `hostname=thinkstation1`. Observed loadavg `11.96 / 18.19 /
+24.60`. No measurement taken. **No ratio is quoted or claimed here** — the runs referred to are
+banked separately, each a bootstrap median with a bootstrap median CI from 20000 resamples,
+e.g. bootstrap median `8.278490x` with bootstrap median CI `[8.242402, 8.323421]`,
+whose absolute arm medians are `kernel_median_wall_ns` 27,772,000 ns and
+`fuse_median_wall_ns` 214,816,000 ns for 32,768 entries — quoted so the asymmetry
+argued above (the FUSE arm running the socket hot ~8x longer per visit) rests on
+stated absolutes rather than on the ratio alone.
+
+Counted mechanism: **4 CPU sets excluded from the witness** — driver, driver-guard, fuse and
+fuse-guard — against 0 sets watched for internal contention.
