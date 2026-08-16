@@ -8919,14 +8919,28 @@ impl OpenFs {
                 .btrfs_floor_memo_disabled
                 .load(std::sync::atomic::Ordering::Relaxed);
         if memoizable {
-            let memo = self.btrfs_floor_leaf_memo.lock();
-            if let Some(memo) = memo.as_ref()
-                && memo.root_logical == root_logical
-                && ffs_btrfs::key_cmp(&memo.first_key, &target) != std::cmp::Ordering::Greater
-                && ffs_btrfs::key_cmp(&target, &memo.last_key) != std::cmp::Ordering::Greater
-            {
-                let leaf = Arc::clone(&memo.leaf);
-                drop(memo);
+            // Take the Arc under the lock and RELEASE IT before searching the
+            // leaf. The guard is scoped to this block for that reason: the
+            // previous shape bound the inner `Option` contents to a name that
+            // shadowed the guard, so its `drop(memo)` dropped a
+            // `&BtrfsFloorLeafMemo` — a no-op the compiler flags as
+            // `dropping_references` — and the mutex stayed held across
+            // `floor_in_leaf`. That serialised every concurrent reader through
+            // the memo lock on exactly the path this memo exists to make cheap,
+            // which is the opposite of the intent (bd-5vis3).
+            let hit = {
+                let memo = self.btrfs_floor_leaf_memo.lock();
+                memo.as_ref()
+                    .filter(|memo| {
+                        memo.root_logical == root_logical
+                            && ffs_btrfs::key_cmp(&memo.first_key, &target)
+                                != std::cmp::Ordering::Greater
+                            && ffs_btrfs::key_cmp(&target, &memo.last_key)
+                                != std::cmp::Ordering::Greater
+                    })
+                    .map(|memo| Arc::clone(&memo.leaf))
+            };
+            if let Some(leaf) = hit {
                 return ffs_btrfs::floor_in_leaf(leaf.as_ref(), &target)
                     .map_err(|e| parse_to_ffs_error(&e));
             }
