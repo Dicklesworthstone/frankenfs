@@ -72,6 +72,19 @@ pub fn count_memoized_requests_enabled() -> bool {
     count_memoized_requests_from_env()
 }
 
+/// Effective value of `FFS_FUSE_CAPABILITY_MEMO` for this process (bd-m1bpu).
+///
+/// Resolved through the SAME function the mount constructor calls, which is the
+/// whole point: the comparator refuses a candidate-vs-candidate run whose two
+/// configurations self-report identical knobs, so a knob reported from anywhere
+/// but the runtime's own resolver could let a run compare a configuration
+/// against itself. That failure has happened before (bd-d9378) and this line is
+/// how it fails closed instead.
+#[must_use]
+pub fn capability_memo_enabled() -> bool {
+    LastMissingCapabilityXattr::enabled_from_env()
+}
+
 /// Pure half of [`count_memoized_requests_from_env`], so the opt-out spelling
 /// is testable without mutating process-global environment from a test thread.
 fn count_memoized_requests_from_value(value: Option<&str>) -> bool {

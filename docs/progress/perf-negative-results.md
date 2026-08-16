@@ -10261,3 +10261,84 @@ only the timing is unusable.
 Retry predicate: a genuinely quiet window, and consider raising `--pairs` only AFTER
 the kernel null lands inside 2% twice in a row — more pairs against a sign-flipping
 null buys precision on a biased estimate.
+
+## 2026-08-16 — REJECT of the RATIO CLAIM (the code stays): the capability memo's 40x format-lookup cut does NOT show up end-to-end on mounted warm stat (bd-m1bpu / bd-2pq73, AzureBay)
+
+bd-2pq73 banked a **counted** win: cold format lookups on a warm-stat sweep fell
+2000 -> 50, a 40x reduction. That count is not in dispute and the code is not being
+reverted. What is refused here is the unstated inference that a 40x count cut buys a
+proportional — or any measurable — wall-clock win against a live kernel arm.
+
+This is the first time the question could be asked. It needed two things that landed
+today: a comparator that can start (the flat 120 GiB free-space floor, now derived) and
+a runtime kill switch so both arms come from ONE ELF
+(`FFS_FUSE_CAPABILITY_MEMO`, commit `d754bd3e`) rather than two binaries, which would
+reintroduce every ISA and PGO confound (bd-b9dug).
+
+### The instrument proved the arms actually differ before it measured them
+
+    mounted_kernel_candidate_identity,filesystem=btrfs,workload=warm_stat,workload_arms=6,candidate_a_arms=fuse_a:fuse_b,candidate_b_arms=fuse_candidate_b_a:fuse_candidate_b_b,one_elf=true,elf_sha256=28e74202275b2cb1ad094525a110472782026480f1f4f222a5fda6c98d4e6220,candidate_a_runtime_knobs="count_memoized_requests=true,fuse_dispatch_workers=0,capability_memo=true",candidate_b_runtime_knobs="count_memoized_requests=true,fuse_dispatch_workers=0,capability_memo=false",candidate_b_env="FFS_FUSE_CAPABILITY_MEMO=0",configurations_differ=true,knob_divergence_proof=daemon_self_reported_effective_values,verdict=pass
+
+`one_elf=true` and the two knob strings differ in exactly one field, each resolved
+through the same function the mount constructor calls. The first attempt at this run
+was REFUSED by the harness — "the two candidate configurations resolved IDENTICAL
+runtime knobs; the requested override never reached a knob this ELF reads, so the run
+would compare a configuration against itself" — because the new switch was not yet in
+the daemon's self-report. That refusal is why the numbers below can be trusted to be
+about the memo at all.
+
+### Result: memo ON vs memo OFF is UNDECIDABLE, and the bound is the point
+
+    run 1  candidate_b_over_candidate_a_median=0.994750, ci_low=0.961284, ci_high=1.007388, minimum_decidable_effect_ratio=1.226478, achieved_resolution_ratio=1.040275, admitted=false, verdict=BLOCKED_NULL, bootstrap_resamples=20000
+    run 2  candidate_b_over_candidate_a_median=0.986227, ci_low=0.959903, ci_high=0.992564, minimum_decidable_effect_ratio=1.106548, achieved_resolution_ratio=1.041772, admitted=false, verdict=BLOCKED_NULL, bootstrap_resamples=20000
+
+Each `ci_low`/`ci_high` pair is a bootstrap median 95% confidence interval, resampled
+20,000 times, from a `six_arm_williams_square` schedule with `same_window=true`. The
+ratio is memo-OFF over memo-ON, so **below 1.0 means turning the memo OFF was FASTER**.
+
+The two runs replicate: medians `0.9948` and `0.9862`, intervals overlapping on
+`[0.9599, 0.9926]`, and both on the same side of parity. The same-invocation A/A null
+for the candidate arm was measured too (`arm=fuse_candidate_b`, run 1 median `1.005818`;
+run 2 `candidate_aa_null_clear=true`).
+
+**But both runs are inside their own minimum decidable effect.** The instrument needed
+`22.6%` (run 1) and `10.7%` (run 2) to call anything; the observed effect is at most
+`1.4%`. So this is not "the memo is worth nothing" — it is **"the memo is worth less
+than 10.7% of mounted warm stat, and this instrument cannot say more."** That is still
+a hard bound, and it is the useful part: a 40x count reduction that cannot produce a
+10% wall-clock move has had its ceiling established.
+
+### Why that is exactly what the mechanism predicts
+
+The memo was never able to remove the expensive half. Its own doc comment says it: *the
+kernel still sends each FUSE `GETXATTR` request; this only makes the ANSWER free.* The
+earlier attribution put ~`6.38 us` of the ~`6.47 us` per-entry mounted cost in the
+per-path `security.capability` ROUND TRIP, not in the format lookup the memo
+eliminates. Removing 1950 of 2000 format lookups removes the cheap half of a cost whose
+expensive half is a kernel round trip that no daemon-side cache can touch.
+
+**Consequence for the campaign: stop aiming daemon-side caches at this path.** The
+lever that can move mounted warm stat is one that stops the kernel from SENDING the
+probe, and bd-ha71t already measured that `FUSE_HANDLE_KILLPRIV_V2` does not do it
+(4000 probes -> 4000 probes, a genuine null with a positive control). The memo stays
+because it is free and the count is real; it is not the answer to the 4.80x row.
+
+### Provenance and caveat
+
+`executing_elf_sha256 = 28e74202275b2cb1ad094525a110472782026480f1f4f222a5fda6c98d4e6220`,
+self-reported by the candidate via `bench-evidence`;
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`, candidate gate `verdict=pass`. Driver
+`471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`. Both built on
+`thinkstation1`; `executed_on=thinkstation1`, `hostname=thinkstation1` — no rch worker
+takes part, because a FUSE mount runs only on the executing machine. Reduced working
+set: `--pairs 12 --operations 2000 --image-size-mib 256`, btrfs only. Six-arm
+post-parity `verdict=pass` and `btrfs check` clean on every arm.
+
+Both runs `CONTENDED` (peak 55 and 43 busy CPUs, off-placement mean busy `41.7%` and
+`37.4%`), which is precisely why `minimum_decidable_effect_ratio` is as coarse as
+`22.6%` and `10.7%`. A quiet window would tighten the bound; it would not change the
+direction, and nothing here licenses a claim that the memo HELPS mounted warm stat.
+
+Retry predicate: re-run in a quiet window to push the decidable effect below ~2%, which
+would convert this bound into a number. Do NOT re-run it expecting a win.
