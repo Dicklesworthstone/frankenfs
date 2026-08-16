@@ -4784,20 +4784,26 @@ fn load_is_settled(one: f64, five: f64, low_threshold: f64, convergence: f64) ->
 /// afterwards.
 ///
 /// WHAT IS ESTABLISHED, from readings taken here rather than quoted:
-///   loadavg 68.0  ->  cores 3111.7-3917.5 MHz, spread 1.259x
-///   loadavg 17.1  ->  cores 3363.1-4242.4 MHz, spread 1.261x, mean 3790.5
-/// The CROSS-CORE spread is ~1.26x in both, and it is the spread that matters: two arms
-/// on different cores can differ by more than the entire unexplained dispersion of the
-/// worst row (13.14% over eight clean-null runs).
+///   loadavg 68.0  ->  3111.7-3917.5 MHz, cross-core spread 1.259x
+///   loadavg 17.1  ->  3363.1-4242.4 MHz, cross-core spread 1.261x
+///   loadavg 19.4  ->  1429.0-4114.3 MHz, cross-core spread 2.879x
+///   three consecutive samples at that load: min 1429.0 every time, spread 2.78-2.88x
 ///
-/// WHAT IS NOT ESTABLISHED: the direction or magnitude of any load-to-frequency
-/// relationship. A retracted third-party figure (1429-4292 MHz) previously appeared
-/// here and has been removed. The two readings above point the OPPOSITE way to
-/// "quiet windows are downclocked" — lower load showed HIGHER clocks, which is ordinary
-/// turbo behaviour — while another observer measured the reverse. Both are single
-/// instantaneous samples of a per-core value across 64 cores, which is too weak to
-/// settle it either way. That is precisely why this is recorded per run instead of
-/// argued from spot readings.
+/// THE CROSS-CORE SPREAD REACHES ~2.9x, and it is the spread — not any load-to-frequency
+/// direction — that threatens a ratio, because the two arms sit on DIFFERENT physical
+/// cores. It dwarfs the worst row's entire unexplained dispersion (13.14% over eight
+/// clean-null runs).
+///
+/// A CAUTION LEARNED THE HARD WAY HERE: the first two readings above showed minima of
+/// 3111 and 3363 MHz and I concluded the range was narrow. They had simply never
+/// sampled a parked core. A third reading found 1429 MHz, reproducibly, three samples
+/// running. A single `/proc/cpuinfo` sweep understates the spread whenever every core
+/// happens to be awake, so one sample is not evidence of a narrow range — only of a
+/// narrow sample. This is why the value is recorded per run rather than argued from
+/// spot checks.
+///
+/// STILL NOT ESTABLISHED: the direction or magnitude of any load-to-frequency
+/// relationship. Readings here have gone both ways and single sweeps cannot settle it.
 fn cpu_mhz() -> BTreeMap<usize, f64> {
     let mut out = BTreeMap::new();
     let Ok(raw) = std::fs::read_to_string("/proc/cpuinfo") else {

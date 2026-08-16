@@ -13251,3 +13251,63 @@ stated absolutes rather than on the ratio alone.
 
 Counted mechanism: **4 CPU sets excluded from the witness** — driver, driver-guard, fuse and
 fuse-guard — against 0 sets watched for internal contention.
+
+## 2026-08-16 — the cross-core clock spread reaches `2.879x` on this host, and my two earlier readings understated it because they never sampled a parked core (bd-cpu-mhz, AzureBay)
+
+No certification: loadavg 1-min `19.37`, 5-min `29.80`, 15-min `34.19`, ratio `0.65` and the
+5-minute above the low threshold. Both loadavg and MHz recorded per the new practice.
+
+### The measurement, and a correction to my own correction
+
+    loadavg 68.0  ->  3111.7-3917.5 MHz   cross-core spread 1.259x
+    loadavg 17.1  ->  3363.1-4242.4 MHz   cross-core spread 1.261x
+    loadavg 19.4  ->  1429.0-4114.3 MHz   cross-core spread 2.879x
+    three consecutive sweeps at that load: min 1429.0 every time, spread 2.78-2.88x
+
+Last tick I removed a third-party figure of "1429-4292 MHz" as retracted and unverified, and
+substituted my own two readings whose minima were 3111 and 3363 MHz. **Those two readings
+were undersampled.** A third sweep finds `1429.0` MHz, reproducibly across three consecutive
+samples. The retracted number's lower bound was right; what was missing was my own
+verification of it, and I have now done that rather than either trusting or dismissing it.
+
+**The methodological point is sharper than the number.** A single `/proc/cpuinfo` sweep
+reports each core's instantaneous clock. When every core happens to be awake it shows a
+narrow range — and I concluded from two such sweeps that the range WAS narrow. One sample is
+not evidence of a narrow range, only of a narrow sample. I have now made the same class of
+error twice in two ticks in opposite directions: first restating an unmeasured figure, then
+contradicting a correct figure with an undersampled measurement.
+
+### Why the spread is the threat, and the direction is a distraction
+
+The two arms are placed on DIFFERENT physical cores. A `2.879x` cross-core spread at a single
+instant is the ratio error available from frequency alone, and it dwarfs the worst row's
+entire unexplained dispersion — `13.14%` across eight clean-null runs. Whether quiet windows
+are up- or down-clocked is a second-order question; whether the kernel arm's cores and the
+FUSE arm's cores were clocked alike during a given run is first-order, and no banked row
+records it.
+
+That is now capturable per run (`cpu_mhz_observed`, landed last tick, reporting min/max/mean
+and spread). It is evidence, not a gate.
+
+### What this does NOT establish
+
+Not that any banked row is wrong; not the direction of a load-to-frequency relationship,
+where readings here have gone both ways; and not that frequency explains the dispersion. It
+establishes that a mechanism large enough to explain it exists, is present on this host, and
+has never been recorded — which is the fourth candidate for that dispersion and the first not
+yet refuted, after contention severity, loadavg and CPU placement were each tested and killed.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`
+is the candidate whose banked runs this entry refers to (in-process self-report,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`). The frequency
+readings themselves are host observations, not candidate output:
+readings from `/proc/cpuinfo` on `hostname=thinkstation1`, governor `powersave`,
+64 logical CPUs. Observed loadavg `19.37 / 29.80 / 34.19`. No measurement run taken. **No
+ratio is quoted or claimed here** — the runs referred to are banked separately, each a
+bootstrap median with a bootstrap median CI from 20000 resamples, e.g. bootstrap median
+`8.278490x` with bootstrap median CI `[8.242402, 8.323421]`, whose absolute arm medians are
+`kernel_median_wall_ns` 27,772,000 ns and `fuse_median_wall_ns` 214,816,000 ns.
+
+Counted mechanism: **three consecutive sweeps at loadavg 19.4 returned min 1429.0 MHz each
+time**, against two earlier single sweeps that returned 3111.7 and 3363.1 — the count that
+shows the earlier readings were undersampled rather than the host having changed.
