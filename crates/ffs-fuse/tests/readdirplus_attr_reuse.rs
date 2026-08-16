@@ -63,19 +63,34 @@ fn readdirplus_body() -> &'static str {
     }
 }
 
-/// The lever: no fresh `ops.getattr` inside the per-entry loop of readdirplus.
+/// RETIRED, and replaced by a pin for the design that actually landed.
+///
+/// This slot used to assert that readdirplus issues NO `ops.getattr` per entry.
+/// That criterion is wrong: it would have blocked the `ReaddirplusAttrMemo` that
+/// landed for this bead, which attacks the same waste from the other end — it
+/// keeps the per-entry `ops.getattr`, remembers the result, and serves the
+/// kernel's follow-up `getattr` from the memo instead of dispatching again.
+///
+/// Keeping a criterion that forbids a reasonable implementation is worse than
+/// having none, so it is replaced rather than left ignored where someone would
+/// later read it as a requirement.
+///
+/// # Sizing, so nobody expects this to move the row
+///
+/// `ops.getattr` is `33.185 ns/entry` measured with no FUSE (`stat-bench`), so the
+/// memo saves `0.66 ms` of a `325.1 ms` sweep = **0.20%**, and plausibly gives
+/// most of that back in its own `Mutex` traffic (~`0.80 ms` if `remember` and
+/// `take` each cost ~20 ns uncontended). It does **not** remove the crossing: the
+/// kernel still issues ~1.0 `getattr` per entry at ~`7.29 us`, which is ~146 ms of
+/// the sweep. The memo is a correct micro-optimisation on a cost that is ~0.2% of
+/// the problem.
 #[test]
-#[ignore = "bd-q0xnl acceptance: fails until the readdirplus attr-reuse lever lands"]
-fn readdirplus_does_not_call_ops_getattr_per_entry_bd_q0xnl() {
+fn readdirplus_remembers_attrs_for_the_follow_up_getattr_bd_q0xnl() {
     let body = readdirplus_body();
     assert!(
-        !body.contains("ops.getattr("),
-        "readdirplus still issues a fresh ops.getattr per entry. Measured cost of \
-         this call site: 20106 getattr for 20001 entries even when the client never \
-         stats (ls -U), and 60212 vs 20394 getattr across two ls -lU passes -- 2.95x \
-         the daemon work for identical output, on the row with the worst \
-         vs-incumbent ratio in the campaign. Serve the attributes from what the \
-         readdir walk already materialised instead."
+        body.contains("readdirplus_attr_memo"),
+        "readdirplus must feed the attr memo, or the kernel's follow-up getattr \
+         re-dispatches work readdirplus already did"
     );
 }
 
