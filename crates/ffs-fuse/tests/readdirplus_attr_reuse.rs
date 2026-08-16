@@ -63,6 +63,47 @@ fn readdirplus_does_not_call_ops_getattr_per_entry_bd_q0xnl() {
     );
 }
 
+/// bd-q0xnl candidate cause: readdirplus hardcodes `generation: 0` while every
+/// other entry-returning handler sends the real `attr.generation`.
+///
+/// `lookup`, `mknod`, `mkdir` and `create` all call
+/// `reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation)`. The
+/// readdirplus loop instead passes a literal `0` with the comment
+/// "generation - not tracked". The kernel keys an inode by (nodeid, generation),
+/// so an entry whose generation disagrees with the one `lookup` reported for the
+/// same inode is not the same inode as far as the kernel is concerned — which is
+/// a mechanism for it declining to install the attributes we supply.
+///
+/// That is consistent with what was measured, by subtracting two runs:
+///   forced, 1 pass  = 40107 getattr ; forced, 2 passes = 60212 ; so pass 2 alone
+///   costs 20105, against our handler's own 20106 per pass — i.e. the kernel asks
+///   for ~0 getattr on pass 2. It caches attributes fine once a *getattr* reply
+///   supplies them, and ignores the ones readdirplus supplies.
+///
+/// This is a HYPOTHESIS with code evidence, not a diagnosis: the kernel-side
+/// decision lives in `fuse_direntplus_link()`, and only headers are installed on
+/// this box, not `fs/fuse` source. If it is right the fix is small and also
+/// removes a real inconsistency — the same inode currently reports two different
+/// generations depending on which call the client made.
+#[test]
+#[ignore = "bd-q0xnl acceptance: fails until readdirplus reports the real generation"]
+fn readdirplus_reports_the_real_generation_bd_q0xnl() {
+    let body = readdirplus_body();
+    assert!(
+        !body.contains("0, // generation - not tracked"),
+        "readdirplus still hardcodes generation 0 while lookup/mknod/mkdir/create \
+         all send attr.generation. The kernel keys an inode by (nodeid, \
+         generation), so the same inode currently reports two different \
+         generations depending on which call the client made -- a correctness \
+         inconsistency independent of the performance question, and a candidate \
+         reason the kernel declines to install readdirplus attributes at all."
+    );
+    assert!(
+        body.contains("generation"),
+        "readdirplus must still pass a generation to reply.add"
+    );
+}
+
 /// Guard against the cheapest wrong way to satisfy the test above: dropping
 /// attributes from the reply entirely. That would turn readdirplus into readdir
 /// with extra steps, and the kernel would issue a lookup per entry again --
