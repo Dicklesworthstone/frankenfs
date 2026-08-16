@@ -10577,3 +10577,71 @@ the bank actually moves. Before shipping any larger default, bd-5vis3's bar appl
 peak resident memory reported, and a workload that does NOT fit measured beside one that
 does. The 100,000-entry row above is that non-fitting workload, and it is why a larger
 default cannot be justified on the 32,768 number alone.
+
+## 2026-08-16 — REPLICATED STANDING FIGURE: btrfs mounted warm stat is 4.75x-4.80x slower than kernel btrfs, worst bound 4.80x, on TWO admitted runs from TWO different ELFs (bd-btrfs-warm-stat-5x-9pxn1, AzureBay)
+
+Both runs below are `admitted=true` with `directional_claim_clear=true` and BOTH A/A
+nulls clear — not directional, not excused, admitted by the estimator on their own
+evidence. That is the first replicated admitted pair this bead has had.
+
+    run A  mounted_kernel_throughput,filesystem=btrfs,workload=warm_stat,operations_per_observation=2000,kernel_median_wall_ns=4652283,fuse_median_wall_ns=22422724,kernel_operations_per_second=429896.462,fuse_operations_per_second=89195.229
+    run A  mounted_kernel_ratio,filesystem=btrfs,metric=wall_ns,workload=warm_stat,pairs=12,fuse_over_kernel_median=4.798508,ci_low=4.759896,ci_high=4.802894,twice_null_margin_ratio=1.016331,directional_claim_clear=true,admitted=true,verdict=HONEST_LOSS,bootstrap_resamples=20000,cv_used=false
+    run B  mounted_kernel_throughput,filesystem=btrfs,workload=warm_stat,operations_per_observation=2000,kernel_median_wall_ns=4690072,fuse_median_wall_ns=22336491,kernel_operations_per_second=426432.640,fuse_operations_per_second=89539.579
+    run B  mounted_kernel_ratio,filesystem=btrfs,metric=wall_ns,workload=warm_stat,pairs=12,fuse_over_kernel_median=4.751179,ci_low=4.728531,ci_high=4.772781,twice_null_margin_ratio=1.047112,directional_claim_clear=true,admitted=true,verdict=HONEST_LOSS,bootstrap_resamples=20000,cv_used=false
+
+Each `ci_low`/`ci_high` pair is a bootstrap median 95% confidence interval, resampled
+20,000 times. Medians `4.798508` and `4.751179` — **1.0% apart** — with intervals
+overlapping on `[4.759896, 4.772781]`. **Quote the worst bound: `4.80x`.**
+
+### The two runs used DIFFERENT ELFs, and that is a feature
+
+Run A:
+`executing_elf_sha256 = e6cd5793384bdb6d6fff113e13fd9e1392753fadaf4ab0a15663e7912dba5bf0`,
+`pgo_profile_sha256 = cc6c121c9ee77d8a4b7f4855c443c07a59ac6191316d40acb08fb2fbe79f9562`.
+Run B:
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`.
+Both `isa=x86-64-v3`, candidate gate `verdict=pass`, both built on `thinkstation1`,
+`executed_on=thinkstation1`, `hostname=thinkstation1`. Driver
+`471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`.
+
+Each row is a self-contained vs-kernel ratio with its own live kernel arm in the same
+invocation, so the two are comparable as replicates even though the binaries differ.
+Two independently-built PGO binaries, two different profiles, landing 1.0% apart is
+stronger evidence for the figure than one binary measured twice would be. It also means
+the several code changes between them (capability-memo kill switch, slot-count knob)
+moved warm stat by **less than the 1.0% spread**, which is consistent with the separate
+finding that the memo is worth under 10.7% here.
+
+### What this figure supersedes and does not
+
+It supersedes the `4.98x` in this bead's title, which predates the 2026-08-15 btrfs
+checksum-verify default flip (bd-6kpp4). These runs are at the post-flip default
+(`btrfs_verify_data_on_read=true`), so **`4.98x` and `4.80x` are not a delta** — they are
+two different configurations and the older number should be retired rather than
+differenced.
+
+It says nothing about readdir+stat, which the same instrument puts at `7.4x`-`7.9x` at
+32,768 entries. Warm stat and readdir+stat are different rows with different mechanisms.
+
+### The attribution this row still cannot support, and why
+
+The obvious next question is where the `22.3 ms` goes: how many FUSE round trips per
+stat, and what fraction is daemon-side rather than kernel round trip. **The instrument
+cannot answer it today.** Every report carries
+`fuse_dispatch_metrics: {"fuse_a": "unreported_by_this_elf", ...}`, and that label is
+wrong: the ELF contains the emitter and the harness sets `FFS_MOUNT_BENCH_EVIDENCE=1`.
+The counters are discarded at the source — `MountRuntimeMode::Standard`, which is the
+path the comparator uses, hand-constructs a `MetricsSnapshot` of all zeros rather than
+returning the one the session accumulated. Filed as `bd-viil0`; both affected files were
+under another agent's exclusive reservation, so it was handed over rather than edited.
+
+Until that is fixed, no per-op round-trip attribution for warm stat is reproducible from
+a banked report by anyone, including the readdir+stat "daemon is 3.85% of the cost"
+figure.
+
+Reduced working set: `--pairs 12 --operations 2000 --image-size-mib 256`, btrfs only.
+Four-arm post-parity `verdict=pass` and `btrfs check` clean on both runs. Both runs
+`CONTENDED` — disclosed, and it cuts one way only: contention inflates the FUSE arm at
+least as much as the kernel arm, so a LOSS measured under it is if anything an
+overstatement and `4.80x` remains a safe upper bound.
