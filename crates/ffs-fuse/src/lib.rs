@@ -2585,6 +2585,12 @@ impl Filesystem for FrankenFuse {
         let inode = InodeNumber(ino);
         self.inner.readahead.invalidate_inode(inode);
         self.inner.access_predictor.invalidate_inode(inode);
+        // An inode number the kernel has dropped may be recycled by the format for
+        // a completely different file, so a memoized "no capability xattr" must not
+        // survive into its next life (bd-42b11). The two other per-inode caches
+        // here are already dropped for the same reason; the memo was added later
+        // and missed this seam.
+        self.inner.missing_capability_xattr.forget(inode);
     }
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuse_forget_one]) {
@@ -2592,6 +2598,7 @@ impl Filesystem for FrankenFuse {
             let inode = InodeNumber(node.nodeid);
             self.inner.readahead.invalidate_inode(inode);
             self.inner.access_predictor.invalidate_inode(inode);
+            self.inner.missing_capability_xattr.forget(inode);
         }
     }
 
@@ -4420,6 +4427,52 @@ mod tests {
                 "file {file} must still be resident; two slots could not do this"
             );
         }
+    }
+
+    /// Guards the seam that bd-42b11 was filed for: the capability memo is a
+    /// per-inode cache, and every per-inode cache must be dropped when the kernel
+    /// forgets the inode, because the format may recycle that number for a
+    /// different file. `readahead` and `access_predictor` were already dropped
+    /// there; the memo was added later and missed it.
+    ///
+    /// This mirrors the `forget` handler's body rather than invoking it (the
+    /// handler needs a full filesystem instance), so its value is as a checklist:
+    /// if you add another per-inode cache to `FuseInner`, add it here and to
+    /// `forget`/`batch_forget` together.
+    #[test]
+    fn every_per_inode_cache_is_dropped_when_the_kernel_forgets_an_inode() {
+        let inner = FuseInner {
+            ops: Arc::new(MinimalTestFs),
+            metrics: Arc::new(AtomicMetrics::new()),
+            thread_count: 1,
+            worker_dispatch: false,
+            parallel_dirops: false,
+            read_only: false,
+            count_memoized_requests: true,
+            mountpoint: None,
+            kernel_notifier: Mutex::new(None),
+            ioctl_trace: None,
+            backpressure: None,
+            access_predictor: AccessPredictor::default(),
+            readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+            readonly_xattr_cache: ReadonlyXattrCache::default(),
+            missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            inode_locks: Arc::new(FuseInodeLocks::default()),
+        };
+        let inode = InodeNumber(42);
+        inner.missing_capability_xattr.remember(inode);
+        assert!(inner.missing_capability_xattr.contains(inode));
+
+        // Exactly what `forget`/`batch_forget` do for one inode.
+        inner.readahead.invalidate_inode(inode);
+        inner.access_predictor.invalidate_inode(inode);
+        inner.missing_capability_xattr.forget(inode);
+
+        assert!(
+            !inner.missing_capability_xattr.contains(inode),
+            "a forgotten inode must not carry a memoized capability answer into \
+             the next file that reuses its number"
+        );
     }
 
     /// Inode 0 is not a real inode; it must never be memoized or match, or a
