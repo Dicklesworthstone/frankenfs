@@ -233,22 +233,25 @@ fn bench_cache(c: &mut Criterion) {
         "field-touch fold diverged from indexed-touch"
     );
 
-    let mut group = c.benchmark_group("extent_cache_hit_touch");
-    group.bench_function("indexed_touch", |b| {
-        b.iter_batched(
-            Indexed::seed,
-            |mut cache| black_box(run_indexed(black_box(&mut cache))),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-    group.bench_function("field_touch", |b| {
-        b.iter_batched(
-            Field::seed,
-            |mut cache| black_box(run_field(black_box(&mut cache))),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-    group.finish();
+    // Scoped so the group's significant `Drop` runs at `finish()` (bd-3ao0l).
+    {
+        let mut group = c.benchmark_group("extent_cache_hit_touch");
+        group.bench_function("indexed_touch", |b| {
+            b.iter_batched(
+                Indexed::seed,
+                |mut cache| black_box(run_indexed(black_box(&mut cache))),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+        group.bench_function("field_touch", |b| {
+            b.iter_batched(
+                Field::seed,
+                |mut cache| black_box(run_field(black_box(&mut cache))),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+        group.finish();
+    }
 
     assert_eq!(
         run_insert_workload(&mut seed_insert_map(), insert_control),
@@ -256,22 +259,27 @@ fn bench_cache(c: &mut Criterion) {
         "insert-once cache state diverged from the control"
     );
 
-    let mut group = c.benchmark_group("extent_cache_insert_full");
-    group.bench_function("contains_then_insert_control", |b| {
-        b.iter_batched(
-            seed_insert_map,
-            |mut entries| black_box(run_insert_workload(black_box(&mut entries), insert_control)),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-    group.bench_function("insert_once_candidate", |b| {
-        b.iter_batched(
-            seed_insert_map,
-            |mut entries| black_box(run_insert_workload(black_box(&mut entries), insert_once)),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-    group.finish();
+    // Scoped so the group's significant `Drop` runs at `finish()` (bd-3ao0l).
+    {
+        let mut group = c.benchmark_group("extent_cache_insert_full");
+        group.bench_function("contains_then_insert_control", |b| {
+            b.iter_batched(
+                seed_insert_map,
+                |mut entries| {
+                    black_box(run_insert_workload(black_box(&mut entries), insert_control))
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+        group.bench_function("insert_once_candidate", |b| {
+            b.iter_batched(
+                seed_insert_map,
+                |mut entries| black_box(run_insert_workload(black_box(&mut entries), insert_once)),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+        group.finish();
+    }
 
     let mut control = seed_invalidate_map();
     let mut candidate = control.clone();

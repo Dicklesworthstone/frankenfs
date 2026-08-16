@@ -116,8 +116,10 @@ pub fn write_inode(
     write_inode_at(cx, dev, loc, inode_size, ino, inode, csum_seed)
 }
 
-/// Write an inode to a KNOWN on-disk location (bd-bhh0i): the location-resolution
-/// half of `write_inode` factored out so the sharded per-group create path can
+/// Write an inode to a KNOWN on-disk location (bd-bhh0i).
+///
+/// The location-resolution half of `write_inode`, factored out so the sharded
+/// per-group create path can
 /// supply an `InodeLocation` it computed from the sharded allocator, instead of a
 /// `&[GroupStats]` slice.
 pub fn write_inode_at(
@@ -163,9 +165,10 @@ pub fn write_inode_at(
     Ok(())
 }
 
-/// Serialize `inode` into `buf` (`buf.len()` must be `inode_size`) AND stamp its
-/// CRC32C checksum — i.e. the exact bytes `write_inode` lands in the inode's slot,
-/// with NO device I/O. Exposed so the transactional ext4 create/write path in
+/// Serialize `inode` into `buf` AND stamp its CRC32C checksum, with NO device I/O.
+///
+/// `buf.len()` must be `inode_size`; the result is the exact bytes `write_inode`
+/// lands in the inode's slot. Exposed so the transactional ext4 create/write path in
 /// ffs-core can build the patched inode-table block itself and stage it with a
 /// slot-scoped MVCC merge proof: relaxed first-committer-wins so concurrent creates
 /// writing DISJOINT inode slots of the same 4 KiB table block MERGE instead of
@@ -184,8 +187,9 @@ pub fn serialize_inode_with_checksum(
     compute_and_set_checksum(buf, csum_seed, ino.0 as u32);
 }
 
-/// Serialize into a caller-provided `buf` (`buf.len()` must be `inode_size`) —
-/// lets the hot write path (`write_inode`) use a stack buffer instead of the
+/// Serialize into a caller-provided `buf`, whose length must be `inode_size`.
+///
+/// Lets the hot write path (`write_inode`) use a stack buffer instead of the
 /// per-call `vec![0; inode_size]` heap allocation (bd-cc-serialize-into).
 #[expect(clippy::cast_possible_truncation)]
 pub fn serialize_inode_into(inode: &Ext4Inode, inode_size: usize, buf: &mut [u8]) {
@@ -421,8 +425,9 @@ pub fn prepare_inode(
     Ok((alloc.ino, inode))
 }
 
-/// Build a fresh regular-file / directory [`Ext4Inode`] body — NO allocation,
-/// NO I/O. This is the pure construction half of [`prepare_inode`], extracted
+/// Build a fresh regular-file / directory [`Ext4Inode`] body — NO allocation, NO I/O.
+///
+/// This is the pure construction half of [`prepare_inode`], extracted
 /// verbatim so the sharded parallel-create path (bd-bhh0i) can reuse the EXACT
 /// same field initialization off a lock-free-allocated inode number without
 /// duplicating (and risking divergence from) it. `generation` is the
@@ -484,9 +489,10 @@ pub fn build_fresh_inode(
     }
 }
 
-/// Allocate and persist a fresh inode with its initial body. Equivalent to
-/// [`prepare_inode`] followed by [`write_inode`]; used by callers (e.g.
-/// `ext4_create`) whose returned inode needs no further mutation.
+/// Allocate and persist a fresh inode with its initial body.
+///
+/// Equivalent to [`prepare_inode`] followed by [`write_inode`]; used by callers
+/// (e.g. `ext4_create`) whose returned inode needs no further mutation.
 #[allow(clippy::too_many_arguments)]
 pub fn create_inode(
     cx: &Cx,
@@ -706,8 +712,12 @@ fn free_indirect_blocks(
 /// Result-identical. Same fix as ffs-core `is_block_all_zero` (bench
 /// `sparse_zero_scan`).
 fn indirect_block_all_zero(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
+    // `as_chunks::<N>()` splits identically to `chunks_exact(N)` + `.remainder()`
+    // — same prefix, same tail, same order — and `.all()` still short-circuits at
+    // the first non-zero lane, so the early exit this function was written for is
+    // preserved (bd-3ao0l).
+    let (blocks, blocks_rest) = data.as_chunks::<32>();
+    for block in blocks {
         let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
@@ -716,9 +726,8 @@ fn indirect_block_all_zero(data: &[u8]) -> bool {
             return false;
         }
     }
-    let mut tail = chunks.remainder().chunks_exact(8);
-    tail.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&b| b == 0)
+    let (lanes, rest) = blocks_rest.as_chunks::<8>();
+    lanes.iter().all(|c| u64::from_ne_bytes(*c) == 0) && rest.iter().all(|&b| b == 0)
 }
 
 /// Return the first indirect entry whose logical range is not wholly below
@@ -969,10 +978,11 @@ pub fn delete_inode(
     ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, is_dir, pctx)
 }
 
-/// Release everything an inode owns — data blocks, indirect metadata, any
-/// external xattr block — and write the zeroed inode back, WITHOUT freeing the
-/// inode number itself. Returns whether the inode was a directory, which the
-/// caller needs to pass to whichever inode-free primitive it uses.
+/// Release everything an inode owns, WITHOUT freeing the inode number itself.
+///
+/// That is data blocks, indirect metadata and any external xattr block; the
+/// zeroed inode is written back. Returns whether the inode was a directory, which
+/// the caller needs to pass to whichever inode-free primitive it uses.
 ///
 /// Split out of [`delete_inode`] for bd-y2t0r. When the bd-bhh0i sharded
 /// allocator is active, inode allocation goes through the per-group sharded
@@ -1156,6 +1166,11 @@ pub fn write_inode_at_slot_scoped(
     inode: &Ext4Inode,
     csum_seed: u32,
 ) -> Result<()> {
+    // Hoisted from mid-function (bd-3ao0l): an item declared after statements
+    // reads as though it came into existence there, when it is in scope from the
+    // start of the block. Its rationale stays with the retry loop below.
+    const MAX_ATTEMPTS: u32 = 8;
+
     cx_checkpoint(cx)?;
 
     let mut stack_buf = [0u8; 256];
@@ -1190,7 +1205,6 @@ pub fn write_inode_at_slot_scoped(
     // Bounded rather than unbounded: a conflict that survives this many attempts
     // is contention severe enough that the caller should see it, and an unbounded
     // loop would convert a livelock into a hang.
-    const MAX_ATTEMPTS: u32 = 8;
     let mut attempt = 0;
     loop {
         let outcome = dev.rmw_block(

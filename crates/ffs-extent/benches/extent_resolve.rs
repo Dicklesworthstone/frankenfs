@@ -651,15 +651,15 @@ impl ScanEvictionCache {
         let key = (ns, mapping.logical_start);
         // last_access mirrors hits+misses, which is 0 under pure-insert churn.
         let access = 0u64;
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
-            if let Some(victim) = self
+        if self.entries.len() >= self.capacity
+            && !self.entries.contains_key(&key)
+            && let Some(victim) = self
                 .entries
                 .iter()
                 .min_by_key(|(k, (_, last))| (*last, **k))
                 .map(|(k, _)| *k)
-            {
-                self.entries.remove(&victim);
-            }
+        {
+            self.entries.remove(&victim);
         }
         self.entries.insert(key, (mapping, access));
     }
