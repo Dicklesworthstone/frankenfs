@@ -10430,3 +10430,67 @@ and `btrfs check` clean throughout. Reduced working set: `--operations 2000
 Retry predicate: re-run in a quiet window at 12 pairs — not more — to bring
 `minimum_decidable_effect_ratio` under the observed `1.22` and convert this into an
 admitted row. Do not spend more pairs on a contended host.
+
+## 2026-08-16 — PREDICTION CONFIRMED: the memo's readdir win is a CAPACITY effect and vanishes at 32,768 entries (bd-m1bpu, AzureBay)
+
+The entry above measured the memo worth ~18% of mounted readdir+stat at 2,000 entries,
+attributed it to `CAPABILITY_MEMO_SLOTS = 4096` holding the whole directory, and wrote
+down the falsifiable consequence: *"this depends on the directory FITTING. A 32,768
+entry sweep does not fit in 4096 slots, so this 18% must NOT be extrapolated."*
+
+That prediction was made before the measurement. It holds.
+
+Same ELF, same switch, same instrument, only `--operations 2000` -> `32768` and
+`--image-size-mib 256` -> `512`:
+
+    run 1  candidate_b_over_candidate_a_median=0.994244, ci_low=0.941687, ci_high=1.000303, minimum_decidable_effect_ratio=1.160888, achieved_resolution_ratio=1.061924, verdict=BLOCKED_NULL, bootstrap_resamples=20000
+    run 2  candidate_b_over_candidate_a_median=1.003628, ci_low=1.003587, ci_high=1.013735, minimum_decidable_effect_ratio=1.033047, achieved_resolution_ratio=1.013735, verdict=BLOCKED_NULL, bootstrap_resamples=20000
+
+| directory entries | memo-OFF / memo-ON | reading |
+| --- | --- | --- |
+| 2,000 (fits in 4096 slots) | `1.2185` / `1.2568` / `1.2190`, every CI excluding parity | memo worth ~18% |
+| 32,768 (does not fit) | `0.994244` / `1.003628`, both within `0.6%` of parity | **no detectable effect** |
+
+Run 2 is the stronger of the two and is worth reading carefully: its
+`achieved_resolution_ratio` is `1.013735` against a `minimum_decidable_effect_ratio` of
+`1.033047` — **the interval is TIGHTER than the bar**, which is the case the earlier
+runs never reached. So this is not "we could not see it"; it is "we could have seen a
+`3.3%` effect and the memo produced `0.36%`." At the size that the banked readdir rows
+actually use, the memo does nothing.
+
+Every `ci_low`/`ci_high` pair above is a bootstrap median 95% confidence interval, resampled 20,000 times, from a `six_arm_williams_square` schedule with `same_window=true` and `one_elf=true`.
+
+`executing_elf_sha256 = 28e74202275b2cb1ad094525a110472782026480f1f4f222a5fda6c98d4e6220`
+self-reported via `bench-evidence`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`; driver
+`471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`; both built on
+`thinkstation1`, `executed_on=thinkstation1`, `hostname=thinkstation1`.
+
+### Independent corroboration of the "never difference these sizes" warning
+
+The same two runs report, diagnostically:
+
+    run 1  kernel_median_wall_ns=27203752, fuse_median_wall_ns=214406444   -> 7.88x
+    run 2  kernel_median_wall_ns=29372299, fuse_median_wall_ns=216984648   -> 7.39x
+
+At 32,768 entries the vs-kernel ratio lands at **7.39x-7.88x, bracketing the banked
+`7.73x`**. The same instrument on the same day at 2,000 entries measured `2.78x`. This
+is direct confirmation that the earlier entry was right to refuse the comparison
+between those numbers in capitals: the size is the difference, not the code. Anyone
+tempted to read `2.78x` as progress against `7.73x` now has the counter-measurement in
+the same ledger.
+
+### What this means for the lever
+
+The memo's benefit is bounded by its capacity, and real directories are not 2,000
+entries. Raising `CAPABILITY_MEMO_SLOTS` past 4096 is the obvious response and should be
+resisted without a bound: the memo is a per-mount array of `AtomicU64`, so 4096 slots is
+32 KiB and 32,768 would be 256 KiB — affordable in isolation, but the same reasoning
+scales it to any directory anyone names, which is the unbounded-footprint trap bd-5vis3
+was created to avoid. If it is raised, it needs the same acceptance bar bd-5vis3 carries:
+peak resident memory reported, and a workload that does NOT fit measured alongside one
+that does.
+
+Both runs `CONTENDED` (peak 33 and 17 busy CPUs). Neither is admitted; both are
+`BLOCKED_NULL`. The claim here is a bound and a direction, not a banked ratio.
