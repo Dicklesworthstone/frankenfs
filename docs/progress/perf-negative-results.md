@@ -12602,3 +12602,75 @@ volume, same substrate as the banked rows.
 
 Counted mechanism: **46 of 46 contention samples over limit**, `max_external_busy_cpus=23`
 against a limit of `2`.
+
+## 2026-08-16 — FOURTH clean-null run of the worst row: btrfs readdir+stat `7.531731x`; the four admitted runs fall in TWO clusters with a `5.72%` empty gap that contains the banked figure (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Another ABBA run, one invocation, live kernel btrfs, private candidate copy, at the quietest
+load observed today (`17.55`, down from `94` two hours earlier).
+
+    RUN 6 (quoted)
+    bootstrap median 7.531731x with bootstrap median CI [7.531255, 7.618960], 20000 resamples
+    same-invocation A/A null control, kernel arm  1.011521  spread 1.016019  clear=true
+    same-invocation A/A null control, fuse arm    0.999486  spread 1.023865  clear=true
+    twice_null_margin_ratio = 1.048300
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+
+Refused post-hoc as every run today has been: `external_load_during_run,samples=48,
+over_limit_samples=48,contended_fraction=1.0000,max_external_busy_cpus=24,
+peak_off_placement_mean_busy=0.344515,verdict=CONTENDED`.
+
+### Four clean-null runs now, and they are not scattered
+
+    run 2   7.453004   CI [7.275531, 7.494622]
+    run 6   7.531731   CI [7.531255, 7.618960]
+    ---------------------------------------------  5.72% of clear space, no run lands here
+    run 5   8.065190   CI [8.054564, 8.109706]
+    run 3   8.170852   CI [8.113987, 8.217506]
+
+Two runs sit at `7.45-7.53`, two at `8.07-8.17`, and **nothing lands in the 5.72% between
+them** — a gap wider than either cluster's internal spread. The banked `7.753405x` falls
+inside that empty gap.
+
+**I am labelling this an OBSERVATION, not a finding, and deliberately so.** Twice today I
+fitted the smallest story that connected a few points and had to withdraw it within the hour
+— "more contention, worse ratio" died when a third point arrived. Four points can look
+bimodal by chance, and I am not going to name a mechanism for this one. What I will say is
+what would test it: more clean-null runs. If the gap fills in, this is ordinary dispersion
+and the row's estimate is ~7.8x with ±5%; if the two clusters sharpen, something discrete is
+switching between windows — CPU placement landing on different physical cores, a cache or
+frequency state, or a fixture layout difference — and that would be worth chasing because
+discrete causes are findable in a way that "noise" is not.
+
+The one thing the clustering already changes: **quoting a single median for this row is
+misleading either way.** `7.531731x` and `8.170852x` are both clean-null admitted runs of the
+identical invocation. Any single number implies a precision the four runs do not support.
+
+### Disposition
+
+Nothing claimed, nothing superseded. All of today's runs were refused — four on the post-hoc
+contention veto despite clean nulls, three on the A/A null gate itself. Banked
+`7.753405x`/`7.649395x` stands and, notably, sits in the empty gap between the two clusters
+rather than near either.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+PRIVATE copy of the candidate — `target/release-perf/ffs-cli` was overwritten by other panes'
+plain builds twice today, so the copy is what makes this ELF sha trustworthy across a
+multi-run turn. Estimator `four_round_balanced_crossover_bootstrap_median_ci`. LVM volume,
+same substrate as the banked rows.
+
+### Gate check, prompted by a cross-project question
+
+Torch reported that its certification gate rejects SPORADIC contended samples — an
+infrastructure artefact rather than a performance signal. Checked mine against all 38
+preserved reports by walking the JSON: `contended_fraction == 1.0000` in **38 of 38** runs,
+zero below `0.50`, `max_external_busy_cpus` `7-60` against a limit of `2`, and
+`max_consecutive_over_limit` `14-306` against a limit of `3`. **The same does NOT apply
+here.** Every refusal is sustained total saturation, past threshold by 4.7x-102x on the
+consecutive-run limit; there is no window in that data where a more tolerant gate would have
+admitted a run. My refusals are the veto working, not an instrument defect.
+
+Counted mechanism: **48 of 48 contention samples over limit**, `max_external_busy_cpus=24`
+against a limit of `2`.
