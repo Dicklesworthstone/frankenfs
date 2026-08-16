@@ -1620,6 +1620,18 @@ pub struct OpenFs {
     /// implicated in a wrong-metadata report it can be taken out without a
     /// rebuild. Default off (memo enabled).
     btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool,
+    /// Consecutive floor descents that found the retained leaf unusable (bd-79li3).
+    ///
+    /// The memo's SIGN depends on the workload. A sweep over consecutive
+    /// objectids hits it almost every time and measured 2.884x in production
+    /// config; a random-access stat stream misses almost every time and measured
+    /// 0.116x — an 8.6x TAX — because every miss still pays the replacement (lock,
+    /// build, store, drop the previous `Arc`) and never amortises it.
+    ///
+    /// This counter is what makes the lever one-signed. It saturates, so it costs
+    /// one relaxed add on the miss path and one relaxed store on the hit path, and
+    /// it never needs to be reset by anything but a hit.
+    btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32,
     /// Read-only per-directory name→child_objectid map (the btrfs analog of the
     /// ext4 present-index). On a read-only mount the directory is immutable, so a
     /// map built once from readdir serves `btrfs_lookup_child` name resolution in
@@ -4780,6 +4792,7 @@ impl OpenFs {
             btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(
                 btrfs_floor_memo_disabled_from_env(),
             ),
+            btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32::new(0),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
@@ -8860,6 +8873,10 @@ impl OpenFs {
         // go with it — otherwise the next read-count test written against this
         // helper silently measures a warm path and reports too few reads.
         *self.btrfs_floor_leaf_memo.lock() = None;
+        // The miss streak is memo state too (bd-79li3): leaving it high across a
+        // reset would start the next measurement already suppressed.
+        self.btrfs_floor_memo_consecutive_misses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Targeted-descent counterpart to [`walk_btrfs_tree`](Self::walk_btrfs_tree):
@@ -8885,6 +8902,51 @@ impl OpenFs {
 
         walk_tree_range_parallel_with_nodes(&provider, root_logical, nodesize, lo, hi)
             .map_err(|e| parse_to_ffs_error(&e))
+    }
+
+    /// Should this descent REPLACE the retained floor leaf? (bd-79li3)
+    ///
+    /// The memo's hit path is close to free — a span compare under one uncontended
+    /// lock — but its miss path is not: it rebuilds and stores the memo, dropping
+    /// the previous `Arc`, on every descent that missed. A workload with key
+    /// locality pays that once per leaf and gets it back many times over
+    /// (2.884x measured in production config). A workload without locality pays it
+    /// on EVERY access and never gets it back (0.116x measured — an 8.6x tax), and
+    /// the memo is on by default, so that tax ships.
+    ///
+    /// So: keep replacing while the memo is being useful, and back off to a
+    /// PROBE cadence once it demonstrably is not. `MISS_STREAK_SUPPRESS`
+    /// consecutive misses is the "demonstrably not" signal — a sweep never reaches
+    /// it, since a sweep's misses come one per leaf crossing between long runs of
+    /// hits. Once suppressed, one descent in `SUPPRESSED_PROBE_PERIOD` still
+    /// refreshes, which is what lets a stream that turns sequential re-arm the
+    /// memo instead of staying cold for the life of the mount.
+    ///
+    /// Correctness is untouched: this only ever reduces how often a leaf is
+    /// retained. Every hit is still gated on the key-span check, and a stale
+    /// retained leaf can only produce FEWER hits, never a wrong floor.
+    fn btrfs_floor_memo_should_replace(&self) -> bool {
+        /// Consecutive misses before the memo stops replacing on every descent.
+        /// Sized above the miss-per-leaf-crossing rate a sweep produces, so the
+        /// sweep case never trips it.
+        const MISS_STREAK_SUPPRESS: u32 = 32;
+        /// While suppressed, refresh on one descent in this many, so a workload
+        /// that regains locality can re-arm.
+        const SUPPRESSED_PROBE_PERIOD: u32 = 64;
+
+        let misses = self
+            .btrfs_floor_memo_consecutive_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if misses < MISS_STREAK_SUPPRESS {
+            return true;
+        }
+        // Saturating rather than wrapping: a very long miss streak must not fall
+        // back to `0` and read as "the memo just started working".
+        if misses == u32::MAX {
+            return false;
+        }
+        (misses - MISS_STREAK_SUPPRESS).is_multiple_of(SUPPRESSED_PROBE_PERIOD)
     }
 
     /// Predecessor-or-equal descent over a btrfs B-tree: the on-disk dual of
@@ -8941,6 +9003,8 @@ impl OpenFs {
                     .map(|memo| Arc::clone(&memo.leaf))
             };
             if let Some(leaf) = hit {
+                self.btrfs_floor_memo_consecutive_misses
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 return ffs_btrfs::floor_in_leaf(leaf.as_ref(), &target)
                     .map_err(|e| parse_to_ffs_error(&e));
             }
@@ -8958,6 +9022,7 @@ impl OpenFs {
         let entry = walk_tree_floor_with_nodes(&mut provider, root_logical, nodesize, target)
             .map_err(|e| parse_to_ffs_error(&e))?;
         if memoizable
+            && self.btrfs_floor_memo_should_replace()
             && let Some(node) = reached
             && let BtrfsParsedNode::Leaf { items, .. } = node.as_ref()
             && let (Some(first), Some(last)) = (items.first(), items.last())
@@ -34412,6 +34477,12 @@ impl OpenFs {
     pub fn set_btrfs_floor_memo_disabled(&self, disabled: bool) {
         self.btrfs_floor_memo_disabled
             .store(disabled, std::sync::atomic::Ordering::Relaxed);
+        // Reset the miss streak on BOTH edges (bd-79li3). Re-enabling must not
+        // inherit a streak accumulated before the memo was switched off, or an A/B
+        // whose disabled arm runs first would start its enabled arm suppressed and
+        // measure the wrong thing.
+        self.btrfs_floor_memo_consecutive_misses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         if disabled {
             *self.btrfs_floor_leaf_memo.lock() = None;
         }
@@ -55503,7 +55574,7 @@ mod tests {
         assert_eq!(ok_off, ok_on, "both arms must stat the same inodes");
 
         println!(
-            "bd-5vis3 LARGE ({} inodes)\n  memo OFF: {t_off:?}  {lookups_off} lookups              ({:.2}/stat), {hits_off} hits\n  memo ON : {t_on:?}  {lookups_on} lookups              ({:.2}/stat), {hits_on} hits\n  lookups {:.2}x fewer, wall {:.3}x",
+            "bd-5vis3 SYNTHETIC SWEEP — NOT production-representative ({} inodes)\n  memo OFF: {t_off:?}  {lookups_off} lookups              ({:.2}/stat), {hits_off} hits\n  memo ON : {t_on:?}  {lookups_on} lookups              ({:.2}/stat), {hits_on} hits\n  lookups {:.2}x fewer, wall {:.3}x",
             ok_on,
             lookups_off as f64 / ok_off.max(1) as f64,
             lookups_on as f64 / ok_on.max(1) as f64,
@@ -55677,6 +55748,79 @@ mod tests {
         );
     }
 
+    /// bd-79li3: the miss-streak gate must be one-signed — invisible to a workload
+    /// with locality, and bounded for one without.
+    ///
+    /// This drives the policy directly rather than through a btrfs image, because
+    /// the property under test is the SCHEDULE of replacements, and a timed
+    /// end-to-end arm cannot distinguish "the gate suppressed replacements" from
+    /// "the machine was quiet". Timing lives in the ignored A/B arms; this asserts
+    /// the mechanism those arms depend on.
+    #[test]
+    fn btrfs_floor_memo_miss_streak_gate_is_one_signed_bd_79li3() {
+        let Some(fs) = open_empty_btrfs_for_floor_memo_policy_bd_79li3() else {
+            return; // btrfs-progs unavailable
+        };
+
+        // A sweep: every miss is followed by hits (a leaf crossing, then a run
+        // inside the new leaf). The streak never builds, so the gate must never
+        // suppress — the 2.884x production win depends on replacing every time.
+        for _ in 0..10_000 {
+            assert!(
+                fs.btrfs_floor_memo_should_replace(),
+                "the gate suppressed a replacement on a workload that keeps hitting \
+                 — this would silently cost the sweep case its win"
+            );
+            // Model the hit that follows: the real hit path resets the streak.
+            fs.btrfs_floor_memo_consecutive_misses
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // A random stream: nothing ever hits, so nothing ever resets the streak.
+        fs.btrfs_floor_memo_consecutive_misses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        const PROBE: usize = 6_400;
+        let replacements = (0..PROBE)
+            .filter(|_| fs.btrfs_floor_memo_should_replace())
+            .count();
+        // 31 while the streak builds, then one probe per 64.
+        let expected = 31 + (PROBE - 31).div_ceil(64);
+        assert_eq!(
+            replacements, expected,
+            "miss-only stream did {replacements} replacements in {PROBE} descents, \
+             expected {expected}"
+        );
+        // The point of the gate, stated as a bound rather than as an equality so a
+        // future retune of the constants still has to keep the property.
+        assert!(
+            replacements * 20 < PROBE,
+            "gate must cut the miss-path replacement cost by more than 20x; \
+             {replacements}/{PROBE} is only {:.1}x",
+            PROBE as f64 / replacements as f64
+        );
+
+        // And it must RE-ARM: a stream that regains locality gets the memo back.
+        // One probe replacement lands a leaf; the hit that follows resets the
+        // streak, and the very next descent replaces again.
+        fs.btrfs_floor_memo_consecutive_misses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(fs.btrfs_floor_memo_should_replace());
+    }
+
+    /// Smallest btrfs `OpenFs` that exercises the floor-memo policy (bd-79li3).
+    /// The policy is filesystem-independent, so an empty image is enough and the
+    /// test does not need to populate thousands of files to run in CI.
+    fn open_empty_btrfs_for_floor_memo_policy_bd_79li3() -> Option<OpenFs> {
+        let bytes = build_populated_btrfs_bytes_bd_5vis3(1)?;
+        let cx = Cx::for_testing();
+        OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions::default(),
+        )
+        .ok()
+    }
+
     /// bd-3zx2x + bd-5vis3: THREE arms on ONE fixture — read-plan index, bounded
     /// memo, and neither.
     ///
@@ -55825,11 +55969,11 @@ mod tests {
         assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
         let ratio = t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE);
         println!(
-            "bd-5vis3 RANDOM ACCESS ({ok_on} inodes, worst case for the memo)\n               memo OFF: {t_off:?}\n  memo ON : {t_on:?}\n  memo is {ratio:.3}x              (below 1.0 means the memo TAXES this workload)"
+            "bd-5vis3 SYNTHETIC RANDOM ACCESS — adversarial case ({ok_on} inodes)\n               memo OFF: {t_off:?}\n  memo ON : {t_on:?}\n  memo is {ratio:.3}x              (below 1.0 means the memo TAXES this workload)"
         );
     }
 
-    /// Build a populated btrfs image once and return its raw bytes, so several    /// Build a populated btrfs image once and return its raw bytes, so several
+    /// Build a populated btrfs image once and return its raw bytes, so several
     /// arms can each open a COLD `OpenFs` from the same image (bd-5vis3).
     ///
     /// Re-opening per arm is what removes the warm-cache confound that inflated
@@ -55922,13 +56066,132 @@ mod tests {
             (ok, elapsed, l1.saturating_sub(l0))
         };
 
-        let (ok_off, t_off, look_off) = arm(true);
-        let (ok_on, t_on, look_on) = arm(false);
-        assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
+        // One observation per arm cannot be banked: the ledger contract wants a
+        // bootstrap median CI, and a single pair cannot show whether the effect
+        // clears the instrument's own noise. Run INTERLEAVED pairs (off, on,
+        // off, on, ...) so drift over the series hits both arms equally, and
+        // carry an A/A null (off vs off) through the identical schedule. The
+        // null is the control that says whether the A/B is readable at all.
+        const ROUNDS: usize = 21;
+        let mut ab_log_ratios = Vec::with_capacity(ROUNDS);
+        let mut null_log_ratios = Vec::with_capacity(ROUNDS);
+        let (mut look_off_last, mut look_on_last, mut ok_last) = (0_u64, 0_u64, 0_u64);
+        for _ in 0..ROUNDS {
+            let (ok_off, t_off, look_off) = arm(true);
+            let (ok_on, t_on, look_on) = arm(false);
+            assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
+            ab_log_ratios
+                .push((t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE)).ln());
+            // A/A: the same disabled arm twice, same schedule position cost.
+            let (_, t_null_a, _) = arm(true);
+            let (_, t_null_b, _) = arm(true);
+            null_log_ratios.push(
+                (t_null_a.as_secs_f64() / t_null_b.as_secs_f64().max(f64::MIN_POSITIVE)).ln(),
+            );
+            look_off_last = look_off;
+            look_on_last = look_on;
+            ok_last = ok_on;
+        }
+        let ab = bd_5vis3_bootstrap_median_ci(&ab_log_ratios);
+        let null = bd_5vis3_bootstrap_median_ci(&null_log_ratios);
         println!(
-            "bd-5vis3 PRODUCTION CONFIG (attr cache ON, cold fs per arm, {ok_on} inodes)\n               memo OFF: {t_off:?}  {look_off} lookups\n  memo ON : {t_on:?}  {look_on} lookups\n               wall {:.3}x",
-            t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE)
+            "bd-5vis3 PRODUCTION CONFIG — the production-relevant row (attr cache ON, cold fs per arm, {ok_last} inodes, {ROUNDS} interleaved pairs)\n  \
+             executing_elf_sha256 {}\n  \
+             memo OFF lookups {look_off_last}, memo ON lookups {look_on_last}\n  \
+             wall ratio median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]\n  \
+             A/A null  median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]",
+            bd_5vis3_executing_elf_sha256(),
+            ab.median, ab.low, ab.high, null.median, null.low, null.high
         );
+        // The A/B must clear the null envelope, or the number is instrument noise.
+        assert!(
+            ab.low > null.high,
+            "bd-5vis3 production A/B [{:.6}, {:.6}] does not clear its own A/A null \
+             [{:.6}, {:.6}] — not a readable effect",
+            ab.low,
+            ab.high,
+            null.low,
+            null.high
+        );
+    }
+
+    /// Deterministic paired bootstrap over log ratios, mirroring the estimator the
+    /// CLI e2e suite already uses so a bd-5vis3 row is comparable to the rest of
+    /// the bank. Seeded, so a rerun reproduces the interval exactly.
+    struct Bd5vis3MedianCi {
+        median: f64,
+        low: f64,
+        high: f64,
+    }
+
+    /// SHA-256 of the test binary that is ACTUALLY executing, hashed from
+    /// `current_exe()` at measurement time.
+    ///
+    /// The ledger contract refuses a banked KEEP whose ratio cannot be tied to a
+    /// specific ELF, and a `sha256sum` run next to the row proves only what was on
+    /// disk when someone typed it — not what produced the numbers. Under the shared
+    /// cargo target dir a concurrent agent's rebuild can replace the binary between
+    /// the run and the hash, so the self-report is the only form of this evidence
+    /// that cannot drift.
+    fn bd_5vis3_executing_elf_sha256() -> String {
+        use sha2::{Digest, Sha256};
+        let Ok(exe) = std::env::current_exe() else {
+            return "unavailable(current_exe)".to_string();
+        };
+        let Ok(bytes) = std::fs::read(&exe) else {
+            return "unavailable(read)".to_string();
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn bd_5vis3_splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = *state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn bd_5vis3_median(mut values: Vec<f64>) -> f64 {
+        values.sort_by(f64::total_cmp);
+        let midpoint = values.len() / 2;
+        if values.len() % 2 == 0 {
+            values[midpoint - 1].midpoint(values[midpoint])
+        } else {
+            values[midpoint]
+        }
+    }
+
+    fn bd_5vis3_bootstrap_median_ci(log_ratios: &[f64]) -> Bd5vis3MedianCi {
+        const RESAMPLES: usize = 20_000;
+        assert!(
+            !log_ratios.is_empty(),
+            "bootstrap needs paired observations"
+        );
+        let len = u64::try_from(log_ratios.len()).expect("length fits u64");
+        let mut state = 0xB9D0_6202_6072_7001_u64 ^ len;
+        let mut bootstrapped = Vec::with_capacity(RESAMPLES);
+        for _ in 0..RESAMPLES {
+            let mut sample = Vec::with_capacity(log_ratios.len());
+            for _ in log_ratios {
+                let draw = bd_5vis3_splitmix64(&mut state) % len;
+                sample.push(log_ratios[usize::try_from(draw).expect("draw fits usize")]);
+            }
+            bootstrapped.push(bd_5vis3_median(sample));
+        }
+        bootstrapped.sort_by(f64::total_cmp);
+        let low_index = RESAMPLES.saturating_mul(25) / 1000;
+        let high_index = RESAMPLES
+            .saturating_mul(975)
+            .div_ceil(1000)
+            .saturating_sub(1);
+        Bd5vis3MedianCi {
+            median: bd_5vis3_median(log_ratios.to_vec()).exp(),
+            low: bootstrapped[low_index].exp(),
+            high: bootstrapped[high_index].exp(),
+        }
     }
 
     /// Build a small btrfs image with a populated root and open it READ-ONLY (the
