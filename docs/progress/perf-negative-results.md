@@ -10342,3 +10342,91 @@ direction, and nothing here licenses a claim that the memo HELPS mounted warm st
 
 Retry predicate: re-run in a quiet window to push the decidable effect below ~2%, which
 would convert this bound into a number. Do NOT re-run it expecting a win.
+
+## 2026-08-16 — DIRECTIONAL (harness refused on resolution, nulls CLEAN): the capability memo is worth ~18% of mounted readdir+stat, the opposite of its warm-stat result (bd-m1bpu, AzureBay)
+
+The companion entry above priced the memo on warm stat and found it worth **less than
+10.7%** — undecidable, effect at most `1.4%`. On readdir+stat the same switch, the same
+ELF and the same instrument give a completely different answer, and the contrast is the
+finding.
+
+Ratio is memo-OFF over memo-ON, so **above 1.0 means turning the memo OFF was SLOWER**,
+i.e. the memo is doing work:
+
+    12 pairs  candidate_b_over_candidate_a_median=1.218496, ci_low=1.080162, ci_high=1.247312, minimum_decidable_effect_ratio=1.478475, achieved_resolution_ratio=1.247312, candidate_aa_null_clear=true, verdict=BLOCKED_NULL
+    12 pairs  candidate_b_over_candidate_a_median=1.256750, ci_low=1.243660, ci_high=1.300158, minimum_decidable_effect_ratio=1.203189, achieved_resolution_ratio=1.300158, candidate_aa_null_clear=true, verdict=BLOCKED_NULL
+    36 pairs  candidate_b_over_candidate_a_median=1.219035, ci_low=1.203864, ci_high=1.288715, minimum_decidable_effect_ratio=1.225498, achieved_resolution_ratio=1.288715, candidate_aa_null_clear=true, verdict=BLOCKED_NULL
+
+Each `ci_low`/`ci_high` pair is a bootstrap median 95% confidence interval, resampled
+20,000 times, `schedule=six_arm_williams_square`, `same_window=true`, `one_elf=true`.
+The candidate self-reports its own identity through `bench-evidence` at run time:
+`executing_elf_sha256 = 28e74202275b2cb1ad094525a110472782026480f1f4f222a5fda6c98d4e6220`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`, gate `verdict=pass`; driver
+`471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`, both built on
+`thinkstation1`. The run carries
+`configurations_differ=true` and
+`knob_divergence_proof=daemon_self_reported_effective_values`. Host `thinkstation1`,
+`executed_on=thinkstation1`; no rch worker takes part, a FUSE mount runs only on the
+executing machine.
+
+Three runs, medians `1.2185`, `1.2568`, `1.2190` — a `3.1%` spread — and **every
+interval excludes parity**. The direction is not in question. Quoting the worst bound
+across all three (`ci_low = 1.080162`): **the memo is worth at least `7.4%` of mounted
+readdir+stat wall time**, with the central estimate near `18%` (`1 - 1/1.22`).
+
+### Why this is DIRECTIONAL and not banked
+
+All three are `verdict=BLOCKED_NULL`, and it matters *which* gate refused them. **The
+candidate A/A null is CLEAR in all three runs** (`candidate_aa_null_clear=true`) — this
+is not the sign-flipping-null failure that refused the vs-kernel readdir row earlier
+today. What fails is `achieved_resolution_ratio` against
+`minimum_decidable_effect_ratio`: the interval is wider than the bar the harness
+requires before it will call an effect.
+
+### Buying pairs did NOT fix it, and that is a methodological result
+
+I tripled the schedule from 12 pairs to 36 expecting a tighter interval. It got
+**wider**: `achieved_resolution_ratio` went `1.247312` -> `1.288715`.
+
+The reason is structural. `minimum_decidable_effect_ratio` is
+`twice_candidate_null_log_margin` — it is set by the spread of the candidate A/A NULL,
+not by the precision of the ratio. Under contention the null's spread does not shrink
+with pair count, because each additional pair samples the same noisy host. **More pairs
+buy precision on the ratio and nothing on the bar the ratio must clear.** The earlier
+retry predicate on the ext4 row said not to buy pairs against a sign-flipping null;
+this generalises it — do not buy pairs against a CONTENDED null either, for the same
+reason in a different disguise. What this needs is a quiet window, and only that.
+
+### Mechanism: why warm stat says <10.7% and readdir says ~18%
+
+`CAPABILITY_MEMO_SLOTS` is **4096**. Warm stat's fixture is **4 entries**; readdir+stat's
+is **2000**. So:
+
+- On warm stat the OFF arm re-resolves a handful of inodes whose format-level lookups
+  the layer beneath already caches. There is almost nothing for the memo to save, which
+  is why its effect there sits at `1.4%` against a `10.7%` bar.
+- On readdir+stat the sweep touches 2000 distinct inodes, **and 2000 fits inside 4096
+  slots**, so the whole directory is resident. The harness sweeps that same directory
+  once per observation across 12-36 pairs, so every sweep after the first is served
+  from the memo. That is the 18%.
+
+**This corrects the premise recorded on bd-t0xoq**, which reasoned that the memo is
+structurally useless on readdir+stat because "every entry is a distinct inode probed
+exactly once, so the memo is structurally useless on this path". That was written when
+`CAPABILITY_MEMO_SLOTS` was **64**, where a 2000-entry directory self-evicted many times
+over. At 4096 slots the working set fits and the conclusion inverts. The premise was
+correct for the memo it described and is now wrong for the memo that exists.
+
+Note the honest limit of that mechanism: it depends on the directory FITTING. A 32,768
+entry sweep — the size the banked `7.73x`/`8.32x` readdir rows use — does not fit in
+4096 slots, so this `18%` must NOT be extrapolated to those rows. Measuring it there is
+the obvious next step and needs its own run.
+
+Both runs `CONTENDED` (peak 41, 18 and 14 busy CPUs). Six-arm post-parity `verdict=pass`
+and `btrfs check` clean throughout. Reduced working set: `--operations 2000
+--image-size-mib 256`, btrfs only.
+
+Retry predicate: re-run in a quiet window at 12 pairs — not more — to bring
+`minimum_decidable_effect_ratio` under the observed `1.22` and convert this into an
+admitted row. Do not spend more pairs on a contended host.
