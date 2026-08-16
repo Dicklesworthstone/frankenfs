@@ -129,6 +129,39 @@ const PARALLEL_DIROPS_CAPABILITY: u64 = fuse_consts::FUSE_PARALLEL_DIROPS;
 /// lookup/getattr round-trip for entries whose attributes the caller needs.
 const READDIRPLUS_CAPABILITIES: u64 =
     fuse_consts::FUSE_DO_READDIRPLUS | fuse_consts::FUSE_READDIRPLUS_AUTO;
+
+/// Same, minus `FUSE_READDIRPLUS_AUTO` (bd-4ypbv).
+///
+/// AUTO leaves the CHOICE with the kernel: it uses readdirplus only when its own
+/// heuristic predicts the caller will stat what it lists, and falls back to plain
+/// readdir otherwise. Measured on a 20002-entry `ls -lU`, the kernel issued 0.99
+/// lookup and 1.01 getattr PER ENTRY against 41 readdir calls for the whole
+/// directory — the signature of plain readdir being chosen, with the per-entry
+/// lookup/getattr pair that readdirplus exists to fold away. That pair is 2.00 of
+/// the 7.00 FUSE requests per entry the mount actually paid.
+///
+/// Dropping AUTO asks the kernel to always use readdirplus. Whether that is a win
+/// is exactly the question, and it is not obvious: without AUTO the daemon builds
+/// attributes for entries a caller may never stat, which is wasted work on a
+/// plain `ls`. So this is a KNOB, defaulting to the current behaviour, existing
+/// so the A/B can be measured on one ELF rather than argued.
+const READDIRPLUS_CAPABILITIES_FORCED: u64 = fuse_consts::FUSE_DO_READDIRPLUS;
+
+/// Resolve the readdirplus capability set from `FFS_FUSE_READDIRPLUS_AUTO`.
+///
+/// `0`, `false` or `off` drops `FUSE_READDIRPLUS_AUTO`; anything else, including
+/// unset, keeps today's behaviour.
+fn readdirplus_capabilities_from_env() -> u64 {
+    let forced = std::env::var("FFS_FUSE_READDIRPLUS_AUTO").is_ok_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    });
+    if forced {
+        READDIRPLUS_CAPABILITIES_FORCED
+    } else {
+        READDIRPLUS_CAPABILITIES
+    }
+}
 const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
 const MAX_ACCESS_PREDICTOR_ENTRIES: usize = 4096;
 const MAX_READONLY_XATTR_CACHE_ENTRIES: usize = 32;
@@ -2734,7 +2767,7 @@ impl Filesystem for FrankenFuse {
             ),
         }
 
-        match config.add_capabilities(READDIRPLUS_CAPABILITIES) {
+        match config.add_capabilities(readdirplus_capabilities_from_env()) {
             Ok(()) => debug!("FUSE readdirplus capabilities enabled"),
             Err(missing) => debug!(
                 missing,
@@ -4844,6 +4877,29 @@ mod tests {
     }
 
     #[test]
+    /// The AUTO knob must change ONLY whether the kernel gets to choose, never
+    /// the rest of the negotiated set — and must default to today's behaviour so
+    /// an unset environment is byte-identical to before the knob existed
+    /// (bd-4ypbv).
+    #[test]
+    fn readdirplus_auto_knob_only_drops_the_auto_bit_bd_4ypbv() {
+        assert_eq!(
+            READDIRPLUS_CAPABILITIES_FORCED,
+            fuse_consts::FUSE_DO_READDIRPLUS,
+            "forcing readdirplus must still negotiate readdirplus itself"
+        );
+        assert_eq!(
+            READDIRPLUS_CAPABILITIES & !fuse_consts::FUSE_READDIRPLUS_AUTO,
+            READDIRPLUS_CAPABILITIES_FORCED,
+            "the forced set must differ from the default by exactly the AUTO bit"
+        );
+        assert_eq!(
+            READDIRPLUS_CAPABILITIES_FORCED & fuse_consts::FUSE_SPLICE_READ,
+            0,
+            "forcing readdirplus must not change the read-data transport"
+        );
+    }
+
     fn readdirplus_capabilities_enable_only_directory_metadata_coalescing() {
         assert_eq!(
             READDIRPLUS_CAPABILITIES,
