@@ -1876,7 +1876,7 @@ mod tests {
                     new_table.insert(new_page, key, value).expect("new insert");
                 }
                 _ => {
-                    if key.0 % 3 == 0 {
+                    if key.0.is_multiple_of(3) {
                         delete_without_preconsolidation_for_test(&old_table, old_page, key);
                         new_table.delete(new_page, key).expect("new delete");
                     } else {
@@ -2055,7 +2055,7 @@ mod tests {
                         .expect("new insert");
                 }
                 4 => {
-                    if key.0 % 4 == 0 {
+                    if key.0.is_multiple_of(4) {
                         delete_without_message_buffer_for_test(
                             &tables.old_table,
                             tables.old_page,

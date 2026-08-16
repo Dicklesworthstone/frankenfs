@@ -211,7 +211,7 @@ impl LrcConfig {
         assert!(data_blocks > 0, "data_blocks must be > 0");
         assert!(local_group_size > 0, "local_group_size must be > 0");
         assert!(
-            data_blocks % local_group_size == 0,
+            data_blocks.is_multiple_of(local_group_size),
             "data_blocks ({data_blocks}) must be divisible by local_group_size ({local_group_size})"
         );
         assert!(
@@ -287,7 +287,7 @@ pub fn encode_local(config: &LrcConfig, data: &[Vec<u8>]) -> Vec<Vec<u8>> {
     assert!(config.data_blocks > 0, "data_blocks must be > 0");
     assert!(config.local_group_size > 0, "local_group_size must be > 0");
     assert!(
-        config.data_blocks % config.local_group_size == 0,
+        config.data_blocks.is_multiple_of(config.local_group_size),
         "data_blocks ({}) must be divisible by local_group_size ({})",
         config.data_blocks,
         config.local_group_size
@@ -365,15 +365,18 @@ pub fn encode_global(config: &LrcConfig, data: &[Vec<u8>]) -> Vec<Vec<u8>> {
             let mut parity = vec![0_u8; block_size];
             let step = global_parity_row_step(j);
             let mut coeff = step;
-            let mut block_pairs = data.chunks_exact(2);
-            for pair in &mut block_pairs {
+            // as_chunks::<2>() yields the same pairs in the same order and the
+            // same trailing remainder chunks_exact(2)/.remainder() did, so the
+            // GF(256) coefficient chain below advances identically.
+            let (block_pairs, remainder) = data.as_chunks::<2>();
+            for pair in block_pairs {
                 let lhs_coeff = coeff;
                 coeff = gf256::mul(coeff, step);
                 let rhs_coeff = coeff;
                 gf256_mul_xor_pair_into(&mut parity, &pair[0], lhs_coeff, &pair[1], rhs_coeff);
                 coeff = gf256::mul(coeff, step);
             }
-            if let Some(block) = block_pairs.remainder().first() {
+            if let Some(block) = remainder.first() {
                 gf256_mul_xor_into(&mut parity, block, coeff);
             }
             parity
@@ -435,7 +438,7 @@ pub fn repair_local_single(
 ) -> Option<Vec<u8>> {
     if config.data_blocks == 0
         || config.local_group_size == 0
-        || config.data_blocks % config.local_group_size != 0
+        || !config.data_blocks.is_multiple_of(config.local_group_size)
     {
         return None;
     }
@@ -478,10 +481,10 @@ pub fn repair_local_single(
 
     // XOR all available blocks into the parity to isolate the missing block.
     for (i, block) in available_blocks.iter().enumerate() {
-        if let Some(b) = block {
-            if i != missing_idx {
-                xor_into(&mut recovered, b);
-            }
+        if let Some(b) = block
+            && i != missing_idx
+        {
+            xor_into(&mut recovered, b);
         }
     }
 
@@ -665,7 +668,7 @@ pub fn repair_global(
 fn config_supports_global_repair(config: &LrcConfig) -> bool {
     config.data_blocks > 0
         && config.local_group_size > 0
-        && config.data_blocks % config.local_group_size == 0
+        && config.data_blocks.is_multiple_of(config.local_group_size)
         && config.global_parity_count <= 255
         && (config.global_parity_count == 0 || config.data_blocks <= 255)
 }
