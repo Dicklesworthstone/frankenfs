@@ -581,9 +581,27 @@ fn xattr_switch_setting_from_value(value: Option<&str>) -> XattrSwitchSetting {
 /// tested as a truth table rather than inferred from four handlers:
 ///
 /// - `auto` requires BOTH a proof of absence AND a read-only mount. The proof
-///   covers the image as it is now; read-only is what keeps it true, since a
-///   writable mount could gain its first xattr a second after the scan and the
-///   kernel would already have stopped asking.
+///   covers the image as it is at mount; read-only is what keeps it true.
+///
+///   The read-only half is CONSERVATIVE, not fundamental, and it is worth
+///   recording why it has not been lifted. The argument for lifting it is
+///   strong: while suppression is active this mount refuses every write that
+///   could create an xattr -- `setxattr`/`removexattr` answer `ENOTSUP` -- and
+///   both formats funnel their xattr writes through the single
+///   `FsOps::setxattr` (ext4 reaches `ffs_xattr::set_xattr` only via
+///   `ext4_setxattr`; btrfs writes `XATTR_ITEM` keys only via
+///   `btrfs_setxattr`), so a suppressing mount cannot gain a first xattr
+///   through itself whether or not it is writable.
+///
+///   It is not lifted because that argument has never been OBSERVED end to
+///   end. The refusal is asserted at the errno level and reasoned about at the
+///   call graph, but no test drives a real `setxattr` through a live writable
+///   mount: the only image fixture available is root-owned, and a user-mounted
+///   FUSE filesystem denies root, so the write returns `EACCES` before it can
+///   reach the handler. A switch that cannot be un-thrown for the life of a
+///   connection should not be extended to writable mounts on reasoning alone.
+///   Lifting it needs a handler-level harness (a `ReplyEmpty` fixture, which
+///   this crate does not have) or an image with a directory the test user owns.
 /// - `Asserted` is honoured even without a proof -- that is what an assertion
 ///   IS -- but it is REFUSED when the filesystem actively proved the opposite.
 ///   An operator asserting "no xattrs" about an image that demonstrably has one
@@ -6684,19 +6702,28 @@ mod tests {
     /// This is the whole safety argument for the mode, as a truth table. The
     /// switch is one-way for the life of the FUSE connection -- there is no
     /// per-inode form and no way to re-enable it -- so every cell that is not a
-    /// proven-absent read-only mount must come out false.
+    /// proven-absent mount must come out false.
     #[test]
     fn auto_suppression_requires_a_proof_and_a_read_only_mount_bd_ha71t() {
         use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent, Unknown};
 
         assert!(
             xattr_suppression_allowed(XattrSwitchSetting::Auto, ProvenAbsent, true),
-            "a proof on a read-only mount is the ONE case auto exists for"
+            "a proof on a read-only mount is the case auto exists for"
         );
         assert!(
             !xattr_suppression_allowed(XattrSwitchSetting::Auto, ProvenAbsent, false),
-            "a WRITABLE mount can gain its first xattr a second after the scan, and \\
-             the kernel would already have stopped asking"
+            "a WRITABLE mount must NOT suppress yet. The call-graph argument that it \
+             could -- an active switch refuses every xattr write, and both formats \
+             funnel through one FsOps::setxattr -- has never been observed end to \
+             end, and a switch that cannot be un-thrown must not be extended on \
+             reasoning alone"
+        );
+        assert_eq!(
+            xattr_switch_errno(XattrHandler::Write),
+            libc::ENOTSUP,
+            "the refusal that WOULD make the writable case sound is real at the errno \
+             level; what is missing is a test that drives it through a live mount"
         );
         for presence in [Present, Unknown] {
             assert!(
