@@ -12892,3 +12892,74 @@ LVM volume, same substrate as the banked rows. Nothing claimed, nothing supersed
 
 Counted mechanism: **47 of 47 contention samples over limit**, `max_external_busy_cpus=23`
 against a limit of `2`.
+
+## 2026-08-16 — SEVENTH clean-null run at loadavg `9.81`: btrfs readdir+stat `7.617279x`, and its interval REACHES INTO the gap — my own clustering observation is weakened, not confirmed (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+    RUN 9 (quoted)
+    bootstrap median 7.617279x with bootstrap median CI [7.433814, 7.968284], 20000 resamples
+    same-invocation A/A null control, kernel arm  0.986662  spread 1.017961  clear=true
+    same-invocation A/A null control, fuse arm    1.013928  spread 1.019069  clear=true
+    twice_null_margin_ratio = 1.038501
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+    LOADAVG 9.81 at invocation, 11.49 at completion — the quietest start of the session
+    placement_cpus = 0:1:2:7:33:34:35:36, driver_thread_cpu = 0
+
+Still refused post-hoc: `external_load_during_run,samples=49,over_limit_samples=49,
+contended_fraction=1.0000,max_external_busy_cpus=50,peak_off_placement_mean_busy=0.488542,
+verdict=CONTENDED`.
+
+### The clustering observation is WEAKENED by this run, and I am recording that plainly
+
+The gap I have reported across four entries was `[7.618960, 8.054564]`, empty across six
+clean-null runs. This run's POINT ESTIMATE, `7.617279x`, sits `0.02%` below the gap's lower
+edge — technically still outside. But its confidence interval is `[7.433814, 7.968284]`, and
+`7.968284` lies **well inside the gap**. This is the first clean-null run whose interval
+occupies the space that had been empty.
+
+So the honest status changes: six point estimates still fall into two groups, but the gap is
+no longer empty in interval terms, and a run has now landed on its edge. That is evidence
+AGAINST a discrete split and FOR ordinary dispersion with a wider spread than the earlier
+runs' tight CIs suggested. Note this run's CI is also the widest of the seven (`7.2%` wide
+against `0.7%` for the tightest), which is itself the more mundane explanation: the earlier
+apparent structure may reflect which runs happened to get tight intervals, not two states.
+
+I flagged from the outset that four points could look bimodal by chance and that the test was
+whether the gap fills. It has begun to fill, at the first opportunity, and I am not going to
+defend the clustering because I have described it four times.
+
+### First evidence on the placement hypothesis — two points, and I will not build on it
+
+Placement has now been captured for exactly two clean-null runs:
+
+    8.110590  HIGH group   placement 24:29:31:56:57:58:60:62   upper socket range
+    7.617279  LOW  group   placement 0:1:2:7:33:34:35:36       lower socket range
+
+That is consistent with placement driving the split. It is also two points, and two points
+have already misled me twice today. Recorded as a hypothesis with the test unchanged: recover
+the ratio key from the report JSON, join it to `placement_cpus` across all preserved runs,
+and see whether the association holds over the full set. Until that join exists this is an
+anecdote with an appealing shape.
+
+### On load: a low loadavg at START does not mean a quiet measured region
+
+Both runs this turn began at loadavg `11.20` and `9.81` — the quietest of the session — and
+both were still refused CONTENDED, with `48` and `50` busy CPUs and peak off-placement mean
+busy of `0.666623` and `0.488542` DURING the measured region. Work started mid-run both
+times. This is the fourth distinct way today that an externally sampled loadavg has failed to
+predict what the run would encounter, and it argues the same conclusion as the others: only
+the sampling done by the measuring process, continuously through the measured region, is
+load-bearing.
+
+Also measured this turn and inadmissible: `7.555491x` CI `[7.275785, 7.594755]`, kernel null
+clear, fuse null `1.072800` FAILED, `BLOCKED_NULL`, at loadavg `11.20`.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+private copy of the candidate. Estimator `four_round_balanced_crossover_bootstrap_median_ci`.
+LVM volume. Nothing claimed, nothing superseded — a failure to certify under load is not a
+loss, and banked `7.753405x`/`7.649395x` stands.
+
+Counted mechanism: **49 of 49 contention samples over limit**, `max_external_busy_cpus=50`
+against a limit of `2`.
