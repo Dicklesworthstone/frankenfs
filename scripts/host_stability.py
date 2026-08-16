@@ -95,6 +95,33 @@ def verdict(samples: list[float], one: float, five: float, fifteen: float,
                   f"{s:.2f} — certify and record these with the row")
 
 
+def wait_for_stable(budget: float, poll: float = 15.0,
+                    sample_seconds: float = 12.0) -> tuple[bool, str, float]:
+    """Poll until the host is certifiable, or the budget runs out.
+
+    Deferring is correct but wasteful: on this box the load oscillates between
+    ~10 and ~90 over minutes, so a single check almost always lands mid-swing and
+    the window is lost even though one arrives shortly after. This waits for the
+    window instead of discarding it.
+
+    It is NOT a retry loop around a measurement -- nothing is measured here, and
+    the caller still decides. It only answers "is it time yet", and it always
+    terminates: the budget is a hard ceiling, checked before every poll.
+
+    Returns (ok, reason, seconds_waited).
+    """
+    started = time.monotonic()
+    while True:
+        samples, one, five, fifteen = sample(seconds=sample_seconds)
+        ok, why = verdict(samples, one, five, fifteen)
+        waited = time.monotonic() - started
+        if ok:
+            return True, f"{why} (waited {waited:.0f}s)", waited
+        if waited >= budget:
+            return False, f"{why} (gave up after {waited:.0f}s of {budget:.0f}s)", waited
+        time.sleep(poll)
+
+
 def sample(seconds: float = 12.0, interval: float = 2.0) -> tuple[list[float], float, float, float]:
     samples: list[float] = []
     one = five = fifteen = 0.0
@@ -149,13 +176,34 @@ def _selftest() -> int:
     assert drift(1.0, 0.0) == 0.0
     assert spread([]) == 0.0
 
-    print("host_stability selftest: 8 cases pass")
+    # A falling edge is exactly today's case: the 1-minute samples are rock-steady
+    # (spread ~1%) while the 5-minute is 3x higher. Sampling only the short average
+    # would call this quiet; the drift check is what catches it.
+    ok, why = verdict([11.05, 11.12, 10.95], one=10.95, five=28.68, fifteen=34.95)
+    assert not ok, why
+    assert "drift" in why and "spike" in why, why
+    assert spread([11.05, 11.12, 10.95]) < 0.02, "short-average spread alone looks quiet"
+
+    # wait_for_stable must terminate immediately when already stable, and must
+    # respect a zero budget rather than looping.
+    ok, why, waited = wait_for_stable(budget=0.0, sample_seconds=0.0)
+    assert isinstance(ok, bool) and waited >= 0.0, (ok, why, waited)
+
+    print("host_stability selftest: 10 cases pass")
     return 0
 
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
+    budget = 0.0
+    for i, a in enumerate(sys.argv):
+        if a == "--wait" and i + 1 < len(sys.argv):
+            budget = float(sys.argv[i + 1])
+    if budget > 0:
+        ok, why, _ = wait_for_stable(budget)
+        print(why)
+        raise SystemExit(0 if ok else 4)
     s, o, f, ft = sample()
     ok, why = verdict(s, o, f, ft)
     print(why)

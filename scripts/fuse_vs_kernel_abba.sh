@@ -85,8 +85,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # at a moderate level is the better place to certify. See scripts/host_stability.py
 # for the criteria and its self-test; set FFS_SKIP_STABILITY=1 to override
 # deliberately, which will be visible in the row because the reason is printed.
+# FFS_WAIT_STABLE=<seconds> waits for a window instead of discarding one. On this
+# box load swings ~10-90 over minutes, so a single check usually lands mid-swing
+# and the window is lost even though one arrives shortly after. The wait is
+# bounded and measures nothing; it only answers "is it time yet".
 if [ "${FFS_SKIP_STABILITY:-0}" != "1" ]; then
-  if ! STABILITY=$(python3 "$HERE/host_stability.py"); then
+  if ! STABILITY=$(python3 "$HERE/host_stability.py" ${FFS_WAIT_STABLE:+--wait "$FFS_WAIT_STABLE"}); then
     echo "$STABILITY"
     echo "A failure to certify under load is not a loss. Re-run when stable."
     exit 4
