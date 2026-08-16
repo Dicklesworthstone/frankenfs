@@ -56072,11 +56072,29 @@ mod tests {
         // off, on, ...) so drift over the series hits both arms equally, and
         // carry an A/A null (off vs off) through the identical schedule. The
         // null is the control that says whether the A/B is readable at all.
-        const ROUNDS: usize = 21;
-        let mut ab_log_ratios = Vec::with_capacity(ROUNDS);
-        let mut null_log_ratios = Vec::with_capacity(ROUNDS);
+        //
+        // ROUND COUNT IS TUNABLE, and it has to be, because this arm could not
+        // run at all as first written (bd-79li3). Each round pays FOUR full arms
+        // and each arm re-opens a cold `OpenFs` and re-walks the whole directory —
+        // deliberately, since a warm second arm inherits everything the first one
+        // warmed — so the UNTIMED setup dominates by roughly three orders of
+        // magnitude over the ~22 ms that is actually measured. At 21 rounds the
+        // run exceeded the 1800 s rch SSH ceiling twice on `vmi1264463` and
+        // produced nothing. An instrument that cannot finish reports no interval
+        // at all, which is strictly worse than a wider one.
+        //
+        // So: a default that completes, and an env override for a long window.
+        // More rounds tighten the interval; they do not change the estimator.
+        const DEFAULT_ROUNDS: usize = 7;
+        let rounds: usize = std::env::var("FFS_BD_5VIS3_ROUNDS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 3)
+            .unwrap_or(DEFAULT_ROUNDS);
+        let mut ab_log_ratios = Vec::with_capacity(rounds);
+        let mut null_log_ratios = Vec::with_capacity(rounds);
         let (mut look_off_last, mut look_on_last, mut ok_last) = (0_u64, 0_u64, 0_u64);
-        for _ in 0..ROUNDS {
+        for _ in 0..rounds {
             let (ok_off, t_off, look_off) = arm(true);
             let (ok_on, t_on, look_on) = arm(false);
             assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
@@ -56102,7 +56120,7 @@ mod tests {
             bd_5vis3_executing_elf_sha256()
         );
         println!(
-            "bd-5vis3 PRODUCTION CONFIG — the production-relevant row (attr cache ON, cold fs per arm, {ok_last} inodes, {ROUNDS} interleaved pairs)\n  \
+            "bd-5vis3 PRODUCTION CONFIG — the production-relevant row (attr cache ON, cold fs per arm, {ok_last} inodes, {rounds} interleaved pairs)\n  \
              executing_elf_sha256 {}\n  \
              memo OFF lookups {look_off_last}, memo ON lookups {look_on_last}\n  \
              wall ratio median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]\n  \
