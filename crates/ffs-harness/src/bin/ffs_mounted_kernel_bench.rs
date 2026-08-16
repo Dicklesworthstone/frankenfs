@@ -36,7 +36,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOOTSTRAP_RESAMPLES: usize = 20_000;
 const MAXIMUM_NULL_MEDIAN_DEVIATION: f64 = 0.02;
-const MIN_FREE_BYTES: u64 = 120 * 1024 * 1024 * 1024;
+/// Free bytes the host keeps no matter how small the run is (bd-btrfs-warm-stat-5x-9pxn1).
+///
+/// This replaces a flat `MIN_FREE_BYTES = 120 GiB`, which was wrong in BOTH
+/// directions because it was not derived from anything the run does. The guard's
+/// own neighbouring comment puts the arm images and fixture tree at 5-11 GiB, so
+/// at default settings the old constant demanded roughly fifteen times the space
+/// the run consumes — and refused every comparator row on this host for an entire
+/// session while 82 GiB sat free. In the other direction it was too permissive:
+/// `--image-size-mib 2048` with six arms on two filesystems stages ~28 GiB, and a
+/// flat 120 GiB floor would happily start that run with 121 GiB free.
+///
+/// The replacement is `reserve + safety x (what this configuration will actually
+/// write)`. It is STRICTER than the old constant for large configurations and
+/// looser only where the old number was arbitrary. It is a disk-safety guard, not
+/// a measurement-validity gate — nothing about which rows are admissible changes.
+const ABSOLUTE_FREE_RESERVE_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+/// Margin over the computed working set. Four times the space the run needs, on
+/// top of the reserve, so a mis-estimate here cannot fill the disk.
+const SCRATCH_SAFETY_FACTOR: u64 = 4;
+/// Every arm gets its own full clone of the base image, and the base is kept.
+const IMAGES_PER_FILESYSTEM: u64 = 1 + 6;
 const MAX_IMAGE_MIB: u64 = 2048;
 const PAYLOAD_BYTES: usize = 1024 * 1024;
 const MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2313,6 +2333,59 @@ fn validate_image(kind: FilesystemKind, image: &Path) -> Result<()> {
         )?,
     }
     Ok(())
+}
+
+/// How many filesystem images this run stages (bd-btrfs-warm-stat-5x-9pxn1).
+const fn requested_filesystem_count(requested: RequestedFilesystems) -> u64 {
+    match requested {
+        RequestedFilesystems::Ext4 | RequestedFilesystems::Btrfs => 1,
+        RequestedFilesystems::Both => 2,
+    }
+}
+
+/// Upper bound on the fixture tree staged on `/data` before it is baked into an
+/// image (bd-btrfs-warm-stat-5x-9pxn1).
+///
+/// `large-directory` creates `operations` EMPTY files, so its cost is one block
+/// of metadata each rather than file data; `parallel-read` creates `operations`
+/// files of `PARALLEL_READ_FILE_BYTES`. Both are bounded by `operations`, and a
+/// workload with no seeded fixture stages nothing. The per-entry figure is
+/// rounded up to a full block so the empty-entry case is never underestimated.
+fn fixture_tree_bytes(config: &Config) -> u64 {
+    const BLOCK_BYTES: u64 = 4096;
+    let Some(fixture) = SeededFixture::for_workload(config.workload) else {
+        return 0;
+    };
+    let per_entry = match fixture {
+        SeededFixture::LargeDirectory => BLOCK_BYTES,
+        SeededFixture::ParallelRead => {
+            u64::try_from(PARALLEL_READ_FILE_BYTES).unwrap_or(u64::MAX) + BLOCK_BYTES
+        }
+    };
+    u64::try_from(config.operations)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(per_entry)
+}
+
+/// Free bytes `/data` must have before this configuration may start
+/// (bd-btrfs-warm-stat-5x-9pxn1).
+///
+/// Derived rather than fixed, so the guard tracks the run: see
+/// [`ABSOLUTE_FREE_RESERVE_BYTES`] for why a flat constant was wrong in both
+/// directions. Saturating throughout — an overflow here must fail CLOSED (an
+/// unreachably large floor), never wrap to a small one.
+fn required_free_bytes(config: &Config) -> Result<u64> {
+    let image_bytes = config
+        .image_size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("image byte count overflow"))?;
+    let staged = requested_filesystem_count(config.filesystems)
+        .saturating_mul(IMAGES_PER_FILESYSTEM)
+        .saturating_mul(image_bytes)
+        .saturating_add(fixture_tree_bytes(config));
+    Ok(staged
+        .saturating_mul(SCRATCH_SAFETY_FACTOR)
+        .saturating_add(ABSOLUTE_FREE_RESERVE_BYTES))
 }
 
 fn clone_images(
@@ -6738,10 +6811,19 @@ fn run() -> Result<Option<PathBuf>> {
     );
 
     let free_before = free_bytes_on_data()?;
+    let free_floor = required_free_bytes(&config)?;
     ensure!(
-        free_before >= MIN_FREE_BYTES,
-        "/data has {:.1} GiB free, below the 120 GiB abort floor",
-        free_before as f64 / 1024.0_f64.powi(3)
+        free_before >= free_floor,
+        "/data has {:.1} GiB free, below the {:.1} GiB abort floor this configuration \
+         requires ({} filesystem(s) x {IMAGES_PER_FILESYSTEM} images of \
+         {} MiB, plus a {:.1} GiB fixture tree, x{SCRATCH_SAFETY_FACTOR} safety, \
+         plus a {:.0} GiB absolute reserve)",
+        free_before as f64 / 1024.0_f64.powi(3),
+        free_floor as f64 / 1024.0_f64.powi(3),
+        requested_filesystem_count(config.filesystems),
+        config.image_size_mib,
+        fixture_tree_bytes(&config) as f64 / 1024.0_f64.powi(3),
+        ABSOLUTE_FREE_RESERVE_BYTES as f64 / 1024.0_f64.powi(3),
     );
     let run_dir = create_run_dir(&config.artifact_root)?;
     let mount_run_dir = create_mount_run_dir(&run_dir)?;
@@ -8127,6 +8209,101 @@ mod tests {
             8,
             &SIX_ARM_SET
         ));
+    }
+
+    /// bd-btrfs-warm-stat-5x-9pxn1: the free-space floor must TRACK the run.
+    ///
+    /// The flat 120 GiB constant this replaces was not derived from anything, and
+    /// the test that matters is not "the default now fits" — it is that the floor
+    /// moves with the configuration in both directions, because a floor that only
+    /// ever got looser would be a weakened guard rather than a corrected one.
+    #[test]
+    fn free_space_floor_is_derived_from_what_the_run_stages() {
+        const OLD_FLAT_FLOOR: u64 = 120 * 1024 * 1024 * 1024;
+        let gib = |bytes: u64| bytes as f64 / 1024.0_f64.powi(3);
+
+        let default = Config {
+            workload: Workload::WarmStat,
+            filesystems: RequestedFilesystems::Both,
+            image_size_mib: 256,
+            operations: 2_000,
+            ..Config::default()
+        };
+        let default_floor = required_free_bytes(&default).expect("default floor");
+
+        // Warm stat seeds no fixture tree, so the whole working set is images:
+        // two filesystems x seven images x 256 MiB = 3.5 GiB.
+        let staged = 2 * IMAGES_PER_FILESYSTEM * 256 * 1024 * 1024;
+        assert_eq!(fixture_tree_bytes(&default), 0);
+        assert_eq!(
+            default_floor,
+            staged * SCRATCH_SAFETY_FACTOR + ABSOLUTE_FREE_RESERVE_BYTES
+        );
+        assert!(
+            default_floor < OLD_FLAT_FLOOR,
+            "the default configuration stages {:.1} GiB and the old floor demanded \
+             {:.1} GiB of headroom for it; the derived floor is {:.1} GiB",
+            gib(staged),
+            gib(OLD_FLAT_FLOOR),
+            gib(default_floor)
+        );
+
+        // STRICTER where the old constant was too permissive: the largest legal
+        // image stages ~28 GiB, which the flat floor would have started with
+        // 121 GiB free and only ~93 GiB of margin behind it.
+        let large = Config {
+            image_size_mib: MAX_IMAGE_MIB,
+            ..default.clone()
+        };
+        let large_floor = required_free_bytes(&large).expect("large floor");
+        assert!(
+            large_floor > OLD_FLAT_FLOOR,
+            "a {MAX_IMAGE_MIB} MiB image on both filesystems must demand MORE than the \
+             old flat {:.0} GiB, got {:.1} GiB",
+            gib(OLD_FLAT_FLOOR),
+            gib(large_floor)
+        );
+
+        // Monotone in every input that costs disk.
+        assert!(required_free_bytes(&large).unwrap() > default_floor);
+        let one_fs = Config {
+            filesystems: RequestedFilesystems::Ext4,
+            ..default.clone()
+        };
+        assert!(required_free_bytes(&one_fs).unwrap() < default_floor);
+
+        // A seeded fixture is charged for. readdir-stat stages `operations` empty
+        // entries; parallel-read stages `operations` x 256 KiB files, so the same
+        // entry count must cost strictly more there.
+        let readdir = Config {
+            workload: Workload::ReaddirStat8,
+            operations: 32_768,
+            ..default.clone()
+        };
+        let parallel = Config {
+            workload: Workload::ParallelRead8,
+            ..readdir.clone()
+        };
+        assert!(fixture_tree_bytes(&readdir) > 0);
+        assert!(fixture_tree_bytes(&parallel) > fixture_tree_bytes(&readdir));
+        assert!(required_free_bytes(&readdir).unwrap() > default_floor);
+
+        // Never below the absolute reserve, however small the run.
+        let tiny = Config {
+            filesystems: RequestedFilesystems::Ext4,
+            image_size_mib: 1,
+            operations: 1,
+            ..default.clone()
+        };
+        assert!(required_free_bytes(&tiny).unwrap() > ABSOLUTE_FREE_RESERVE_BYTES);
+
+        // Fails CLOSED on overflow rather than wrapping to a small floor.
+        let overflowing = Config {
+            workload: Workload::ParallelRead8,
+            operations: usize::MAX,
+            ..default.clone()
+        };
+        assert!(required_free_bytes(&overflowing).unwrap() >= OLD_FLAT_FLOOR);
     }
 
     #[test]
