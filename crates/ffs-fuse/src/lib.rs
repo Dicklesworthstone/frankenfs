@@ -96,6 +96,47 @@ pub fn capability_memo_slots() -> usize {
     LastMissingCapabilityXattr::slots_from_env()
 }
 
+/// Whether to negotiate the FUSE splice capabilities (bd-splice-metadata).
+///
+/// Splice exists to avoid a copy on LARGE payloads: it hands page references
+/// between the kernel and the daemon instead of memcpying bytes. Every mount has
+/// negotiated `FUSE_SPLICE_READ | FUSE_SPLICE_WRITE | FUSE_SPLICE_MOVE`
+/// unconditionally since the capability was added, on the reasoning that avoiding
+/// a copy cannot hurt.
+///
+/// That reasoning is untested on a METADATA workload, where it is not obviously
+/// true. Warm stat's entire boundary traffic is one `getxattr(security.capability)`
+/// per operation whose reply is tens of bytes — far below the point where a copy
+/// costs anything, and splice is not free: it sets up pipe buffers and page
+/// references per transfer. On a row where the crossing is 79% of our per-stat
+/// cost (8.674 us of 10.958 us), a per-reply transport overhead is exactly the
+/// kind of thing that would hide there.
+///
+/// DEFAULT IS ON, so the shipping path is unchanged and this is purely an A/B
+/// handle: `FFS_FUSE_SPLICE=0` disables negotiation so one ELF can supply both
+/// arms. Opt-OUT polarity rather than opt-in, deliberately — the default must
+/// remain the behaviour every banked measurement was taken with, or the knob
+/// silently invalidates the ledger.
+///
+/// This is a HYPOTHESIS, not a known win. It earns an experiment because it sits
+/// inside the transport, which is the dominant component of the two worst rows;
+/// contrast the attr-reuse levers, which sized out at 0.15% because they sat
+/// inside the 3.85% daemon share.
+#[must_use]
+pub fn splice_from_value(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let t = raw.trim();
+    !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+}
+
+/// Whether this process negotiates FUSE splice capabilities (bd-splice-metadata).
+#[must_use]
+pub fn splice_enabled() -> bool {
+    splice_from_value(std::env::var("FFS_FUSE_SPLICE").ok().as_deref())
+}
+
 /// FUSE-over-io_uring transport configuration (bd-vbqc6).
 ///
 /// # Why this exists before the transport does
@@ -3492,9 +3533,17 @@ impl Filesystem for FrankenFuse {
             }
         }
 
-        let splice_caps = fuse_consts::FUSE_SPLICE_READ
-            | fuse_consts::FUSE_SPLICE_WRITE
-            | fuse_consts::FUSE_SPLICE_MOVE;
+        // bd-splice-metadata: negotiated by default, so the shipping path is
+        // unchanged; `FFS_FUSE_SPLICE=0` supplies the other A/B arm from the same
+        // ELF. `add_capabilities(0)` is a no-op, so the disabled arm cannot alter
+        // negotiation in any other way.
+        let splice_caps = if splice_enabled() {
+            fuse_consts::FUSE_SPLICE_READ
+                | fuse_consts::FUSE_SPLICE_WRITE
+                | fuse_consts::FUSE_SPLICE_MOVE
+        } else {
+            0
+        };
         match config.add_capabilities(splice_caps) {
             Ok(()) => debug!("FUSE splice read/write/move capabilities enabled"),
             Err(missing) => debug!(
@@ -5577,6 +5626,64 @@ mod tests {
         assert!(
             !ReaddirplusAttrMemo::enabled_from_value(None),
             "unset means off"
+        );
+    }
+
+    /// THE NEGATIVE CASE: the splice knob must default to ON, or it silently
+    /// invalidates every banked measurement.
+    ///
+    /// Every mounted ratio in the ledger was taken with splice negotiated. If
+    /// this knob defaulted to OFF — or if a typo or an empty value fell through
+    /// to OFF — then the shipping binary would stop doing what the banked rows
+    /// measured, and the ledger would be describing a configuration that no
+    /// longer ships. That is a worse failure than the lever being wrong, because
+    /// nothing would announce it.
+    ///
+    /// So the polarity here is opt-OUT, the opposite of every other knob in this
+    /// file, and unrecognised input must fail OPEN to the shipping default rather
+    /// than closed. Only the three explicit spellings turn it off.
+    #[test]
+    fn splice_defaults_on_and_only_explicit_values_disable_it() {
+        assert!(
+            splice_from_value(None),
+            "unset MUST negotiate splice — that is what every banked mounted row \
+             was measured with"
+        );
+        for junk in ["", "  ", "yes", "no", "1", "true", "disable", "flase"] {
+            assert!(
+                splice_from_value(Some(junk)),
+                "{junk:?} is not a recognised disable spelling and must fail OPEN \
+                 to the shipping default; failing closed here would change what \
+                 ships without changing what the ledger says"
+            );
+        }
+        for off in ["0", "false", "FALSE", "off", " off "] {
+            assert!(
+                !splice_from_value(Some(off)),
+                "{off:?} must disable negotiation so one ELF can supply both A/B arms"
+            );
+        }
+    }
+
+    /// The two arms must be distinguishable from outside the process.
+    ///
+    /// The comparator REFUSES a candidate-vs-candidate run whose arms self-report
+    /// identical knobs, so a lever whose effect is invisible on the knob line is
+    /// unmeasurable no matter how large it is. This pins that the accessor the
+    /// mount path reports is the same function the negotiation consults, which is
+    /// the drift this codebase has already been bitten by.
+    #[test]
+    fn splice_accessor_is_the_function_negotiation_consults() {
+        // Both arms, resolved through the pure half that `splice_enabled` calls.
+        assert!(splice_from_value(None), "arm A: default, splice negotiated");
+        assert!(!splice_from_value(Some("0")), "arm B: splice declined");
+        // And the public accessor agrees with the pure half for the ambient
+        // environment, whatever it happens to be.
+        assert_eq!(
+            splice_enabled(),
+            splice_from_value(std::env::var("FFS_FUSE_SPLICE").ok().as_deref()),
+            "the reported knob must be resolved by the same function the mount \
+             path uses, or the knob line describes a configuration that did not run"
         );
     }
 
