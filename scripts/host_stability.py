@@ -225,6 +225,54 @@ def sample(seconds: float = 12.0, interval: float = 2.0) -> tuple[list[float], f
     return samples, one, five, fifteen
 
 
+def siblings(cpu: int) -> set[int]:
+    """Logical CPUs sharing a physical core with `cpu` (SMT siblings)."""
+    try:
+        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return {cpu}
+    out: set[int] = set()
+    for part in raw.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out.update(range(int(a), int(b) + 1))
+        elif part:
+            out.add(int(part))
+    return out or {cpu}
+
+
+def cores_comparable(daemon_cpu: int, client_cpu: int) -> tuple[bool, str]:
+    """Refuse a pinning where the two arms cannot be compared.
+
+    Found 2026-08-16, after a full day of measurements: this harness defaulted to
+    daemon `cpu8` and client `cpu40`, which on a 5975WX are SMT SIBLINGS of one
+    physical core (`core_id 8`). That made the FrankenFS arm run its daemon and its
+    client on two threads of a single core, contending for one core's execution
+    units, while the kernel arm ran its client alone on that core with the sibling
+    idle. Every vs-kernel ratio measured that way is biased AGAINST FrankenFS by an
+    unknown amount, and no A/A null could see it: both arms of a null share the
+    same pinning.
+
+    A ratio whose arms sit on structurally different hardware is a hardware ratio
+    in disguise, exactly as a ratio whose arms sit at different clocks is a
+    frequency ratio in disguise.
+    """
+    if daemon_cpu == client_cpu:
+        return False, (f"REFUSE: daemon and client are both pinned to cpu{daemon_cpu}; "
+                       f"they would timeshare one thread")
+    sib = siblings(daemon_cpu)
+    if client_cpu in sib:
+        return False, (f"REFUSE: cpu{daemon_cpu} and cpu{client_cpu} are SMT siblings "
+                       f"of one physical core (siblings {sorted(sib)}). The FrankenFS "
+                       f"arm would contend with itself on a single core while the "
+                       f"kernel arm gets that core to itself — the ratio would be a "
+                       f"hardware artefact, and no A/A null can detect it because "
+                       f"both arms of a null share the pinning")
+    return True, (f"cores comparable: cpu{daemon_cpu} and cpu{client_cpu} are on "
+                  f"different physical cores")
+
+
 def _selftest() -> int:
     # A brief quiet spike inside a busy host: the case the old gate admitted.
     ok, why = verdict([10.3, 9.8, 10.0], one=10.0, five=25.3, fifteen=25.9)
@@ -349,7 +397,24 @@ def _selftest() -> int:
     assert abort and "in-run ceiling" in why, why        # ceiling rule
     assert "38.0" not in why, "must not quote the factor threshold when the ceiling fired"
 
-    print("host_stability selftest: 26 cases pass")
+    # THE DEFECT FOUND 2026-08-16: the harness default was daemon cpu8 / client
+    # cpu40, which are SMT siblings on this box. It must be refused.
+    ok, why = cores_comparable(8, 40)
+    if 40 in siblings(8):          # only assert where the topology actually says so
+        assert not ok, why
+        assert "SMT siblings" in why, why
+    # Same CPU for both is always refused, on any topology.
+    ok, why = cores_comparable(8, 8)
+    assert not ok, why
+    # A pairing on genuinely different physical cores must be admitted.
+    ok, why = cores_comparable(8, 12)
+    if 12 not in siblings(8):
+        assert ok, why
+    # Sibling parsing must handle both list and range forms without raising.
+    assert isinstance(siblings(0), set) and siblings(0)
+    assert siblings(999999) == {999999}   # missing sysfs must not raise
+
+    print("host_stability selftest: 31 cases pass")
     return 0
 
 

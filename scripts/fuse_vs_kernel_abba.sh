@@ -82,8 +82,27 @@ OUT=${FFS_OUT:-/tmp/ffs-abba}
 BLOCKS=${FFS_BLOCKS:-3}
 REPS=${FFS_REPS:-6}
 DAEMON_CPU=${FFS_DAEMON_CPU:-8}
-CLIENT_CPU=${FFS_CLIENT_CPU:-40}
+# Client on a DIFFERENT PHYSICAL CORE from the daemon, not its SMT sibling. The
+# previous default of 40 was cpu8's sibling on this box, so the FrankenFS arm ran
+# daemon and client on two threads of one core while the kernel arm had that core
+# to itself. See cores_comparable() in host_stability.py; the harness now refuses
+# a sibling pairing rather than trusting the default.
+CLIENT_CPU=${FFS_CLIENT_CPU:-12}
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+# A ratio whose arms sit on structurally different hardware is a hardware ratio in
+# disguise. Refuse before measuring rather than discovering it in the row.
+if ! COMPARABLE=$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+import host_stability as h
+ok, why = h.cores_comparable($DAEMON_CPU, $CLIENT_CPU)
+print(why)
+sys.exit(0 if ok else 1)
+"); then
+  echo "$COMPARABLE"
+  exit 6
+fi
+echo "$COMPARABLE"
 
 [ -x "$CLI" ] || { echo "FATAL: no ffs-cli at $CLI"; exit 2; }
 [ -f "$IMG" ] || { echo "FATAL: no image at $IMG"; exit 2; }
