@@ -13106,3 +13106,66 @@ taken; this is a re-analysis of banked runs. Nothing claimed, nothing superseded
 Counted mechanism: **13 clean-null rows joined on `fuse_over_kernel` and
 `client_affinity_cpus`; both socket ranges present in both groups**, which is the count that
 refutes placement.
+
+## 2026-08-16 — I OVERRODE MY OWN STABILITY RULE ON A JUDGMENT CALL AND THE RULE WAS RIGHT; also, the placement retry is confirmed working over a full 5-minute window (bd-placement-retry, bd-loadavg-in-report, AzureBay)
+
+No row. What this entry records is a refuted heuristic of mine and a confirmed harness fix.
+**No ratio is quoted or claimed here.** The runs it refers to are banked separately, each
+as a bootstrap median with a bootstrap median CI from 20000 resamples — e.g. bootstrap
+median `8.278490x` with bootstrap median CI `[8.242402, 8.323421]`.
+
+### The override, and why I made it
+
+Observed loadavg was 1-min `9.11`, 5-min `16.30`, ratio `0.56`. My own `load_is_settled`
+rule, committed one turn earlier with a `0.7` convergence threshold, says that is NOT a
+window — the same shape as the `11.07`/`20.50` case my test explicitly asserts is a trap.
+
+I ran anyway, on this reasoning: all three averages were monotonically falling
+(15-min `26.24` > 5-min `15.43` > 1-min `8.91`) over about ten minutes, and both short
+averages were low in absolute terms. I argued a sustained DECLINE is a different shape from
+the brief SPIKE the rule targets, that my rule cannot distinguish the two because both show a
+low ratio, and that a monotone decline predicts the next minute is quieter still.
+
+### The rule was right and the reasoning was wrong
+
+    LOADAVG at invocation   9.59  15.06  25.73
+    LOADAVG at completion  56.77  27.82  27.24
+
+Load rose almost six-fold during the run. The decline reversed within minutes, and
+`no physical core has every SMT thread below the driver contention limit after 151 sample(s)
+over 300000ms` — the harness waited the entire five-minute budget, sampled 151 times, and
+never found a stable placement.
+
+**A monotone decline does not predict the next minute.** It is a description of the past three
+windows, and on a host whose load is driven by other tenants' job starts it carries no
+information about when the next job starts. The ratio rule was not producing a false negative
+here; it was correctly refusing a window that then evaporated.
+
+I am recording this because the override was reasonable-sounding and wrong, and because the
+convenient direction of my error is the tell: I reasoned my way past a rule I had written the
+previous turn, in the turn where I wanted to run. That is the shape of gate-weakening even
+when no gate is edited, and the fact that the rule survived contact is the only reason no bad
+row was banked.
+
+### The harness fix is confirmed working, which is the useful half
+
+`after 151 sample(s) over 300000ms` is the first observation of the full retry path from
+`cb8950f4` and `36c30047` doing its job on the default budget: one invocation now covers a
+five-minute window, re-sampling once per second and requiring consecutive stability, instead
+of aborting on the first bad sample. That converts what used to be 4-6 manual retries per turn
+into a single command that waits.
+
+It also means a refusal is now much stronger evidence than it was. Previously
+"no physical core..." meant one unlucky sample; now it means **151 consecutive samples over
+five minutes** could not find a physical core with both SMT threads quiet. That is a
+substantive statement about the host, and it is the counted mechanism for this entry.
+
+Observed loadavg recorded per the fleet practice: invocation `9.59 / 15.06 / 25.73`,
+completion `56.77 / 27.82 / 27.24`. Candidate
+`bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`. Driver rebuilt this turn to include the stability and loadavg
+changes. Nothing claimed, nothing superseded — a failure to certify under load is not a loss.
+
+Counted mechanism: **151 of 151 placement samples over 300000ms found no qualifying physical
+core**, against a limit of 1 qualifying core needed.
