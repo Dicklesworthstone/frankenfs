@@ -58,14 +58,63 @@ impl OpenFs {
     }
 }
 
+/// The largest btrfs filesystem this scan will walk before giving up.
+///
+/// btrfs cannot be scanned inode-by-inode the way ext4 can -- object ids are
+/// sparse, and an xattr is not a property of an inode record but a separate
+/// `XATTR_ITEM` key in the fs tree. The question "is there any xattr" is
+/// therefore "does the fs tree contain any key of type 24", and answering it
+/// costs one full fs-tree materialization. That is affordable on a small image
+/// and not on a large one, so the bound is on the filesystem's USED bytes,
+/// checked from the superblock before the walk rather than discovered during
+/// it.
+const XATTR_SCAN_BTRFS_USED_BYTES_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+
+impl OpenFs {
+    /// Decide whether ANY btrfs `XATTR_ITEM` exists in the fs tree.
+    ///
+    /// Same contract as the ext4 scan: every exit that is not a completed clean
+    /// walk returns [`XattrPresence::Unknown`] or [`XattrPresence::Present`],
+    /// because the answer gates a switch that cannot be un-thrown for the life
+    /// of a FUSE connection.
+    ///
+    /// Note what is NOT checked: subvolumes other than the mounted one. This
+    /// walks the fs tree this mount serves, which is exactly the scope the
+    /// suppression applies to -- the kernel's `no_getxattr` is per connection,
+    /// and a connection serves one subvolume.
+    fn btrfs_scan_for_any_xattr(&self, cx: &Cx) -> XattrPresence {
+        let Some(sb) = self.btrfs_superblock() else {
+            return XattrPresence::Unknown;
+        };
+        if sb.bytes_used > XATTR_SCAN_BTRFS_USED_BYTES_LIMIT {
+            return XattrPresence::Unknown;
+        }
+        match self.walk_btrfs_fs_tree(cx) {
+            Ok(items) => {
+                if items
+                    .iter()
+                    .any(|item| item.key.item_type == BTRFS_ITEM_XATTR_ITEM)
+                {
+                    XattrPresence::Present
+                } else {
+                    XattrPresence::ProvenAbsent
+                }
+            }
+            Err(e) => {
+                // Warn, not debug: the operator ASKED for `auto` and is not
+                // getting it, and this is the only useful thing to say about why.
+                tracing::warn!(error = %e, "xattr scan: btrfs fs-tree walk failed, no proof");
+                XattrPresence::Unknown
+            }
+        }
+    }
+}
+
 impl FsOps for OpenFs {
     fn xattr_presence(&self, cx: &Cx) -> XattrPresence {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_scan_for_any_xattr(cx),
-            // btrfs stores xattrs as DIR_ITEM keys in the fs tree; deciding
-            // absence there is a different walk and has not been written, so
-            // the honest answer is Unknown rather than a guess.
-            FsFlavor::Btrfs(_) => XattrPresence::Unknown,
+            FsFlavor::Btrfs(_) => self.btrfs_scan_for_any_xattr(cx),
         }
     }
 
@@ -4015,6 +4064,35 @@ impl FsOps for OpenFs {
 #[cfg(test)]
 mod xattr_scan_tests {
     use super::*;
+
+    /// bd-ha71t / bd-btrfs-warm-stat-5x-9pxn1: the btrfs half of the proof.
+    ///
+    /// btrfs pays the same per-path-op `security.capability` probe as ext4 --
+    /// its warm stat is `4.977803x` against kernel btrfs and its readdir+stat
+    /// `8.32x`, the worst row in the bank -- so the suppression is worth as much
+    /// here, and it needs the same proof. This asserts the scan reaches a real
+    /// btrfs image and returns a DECIDED answer rather than the `Unknown` a
+    /// missing implementation would return.
+    #[test]
+    fn the_btrfs_scan_decides_on_a_real_image_bd_ha71t() {
+        let image = std::path::Path::new("/data/tmp/probe_xfs/btrfs.img");
+        if !image.exists() {
+            eprintln!("skipping: no btrfs image at {}", image.display());
+            return;
+        }
+        let cx = Cx::for_testing();
+        let Ok(fs) = OpenFs::open(&cx, image) else {
+            eprintln!("skipping: image at {} did not open", image.display());
+            return;
+        };
+        let presence = FsOps::xattr_presence(&fs, &cx);
+        assert_ne!(
+            presence,
+            XattrPresence::Unknown,
+            "the btrfs arm must DECIDE on an image this size; Unknown here means the \
+             walk did not run, which is what an unimplemented arm returns"
+        );
+    }
 
     /// bd-ha71t: the scan must PROVE absence on a real image, not merely decline
     /// to find anything.
