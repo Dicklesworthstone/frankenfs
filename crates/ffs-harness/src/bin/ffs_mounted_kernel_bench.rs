@@ -4680,6 +4680,26 @@ fn runtime_isa_label(host: &HostProvenance) -> String {
         .join("+")
 }
 
+/// Whether a placement candidate has been stable long enough to trust (bd-placement-stability).
+///
+/// Mermaid's 2026-08-16 cross-project finding: the blocker is host VOLATILITY, not
+/// absolute load — a stable moderate window beats a brief quiet spike. This gate had
+/// exactly the defect that finding predicts. Placement retried until ONE sample
+/// qualified and then proceeded, so a momentary dip was enough to start a run whose
+/// measured region then got hit.
+///
+/// The evidence for that here is direct: runs starting at loadavg 9.81 and 10.28 were
+/// still refused post-hoc with 48-50 CPUs busy DURING the measured region. A single
+/// qualifying sample said nothing about the next thirty seconds.
+///
+/// So a candidate must qualify on `required` CONSECUTIVE samples before it is
+/// accepted. This is strictly more conservative than accepting the first — it can
+/// only reject placements the old code would have taken, never admit one it would
+/// have refused.
+const fn placement_is_stable(consecutive_qualifying: u32, required: u32) -> bool {
+    consecutive_qualifying >= required
+}
+
 /// Whether placement selection may re-sample after a failed attempt (bd-placement-retry).
 ///
 /// Encodes the two rules the retry loop must obey, as a pure function so they can
@@ -4789,6 +4809,11 @@ fn select_cpu_placement(
     // immediately measures, retried until it holds or the budget expires.
     let start = std::time::Instant::now();
     let mut placement_attempts: u32 = 0;
+    // Consecutive samples the SAME driver candidate must survive. Reuses the caller's
+    // existing quiet-sample count so there is no new knob to keep consistent.
+    let required_stable_samples = u32::try_from(host_quiet_samples).unwrap_or(1).max(1);
+    let mut consecutive_ok: u32 = 0;
+    let mut last_driver: Option<usize> = None;
     let (busy, ranked, driver_cpu, driver_busy, driver_guard_cpus) = loop {
         placement_attempts += 1;
         let busy = if let Some(window) = &initial_host_quiet_window {
@@ -4834,7 +4859,24 @@ fn select_cpu_placement(
             }
         }
         if let Some((driver_cpu, driver_busy, driver_guard_cpus)) = driver {
-            break (busy, ranked, driver_cpu, driver_busy, driver_guard_cpus);
+            // bd-placement-stability: one qualifying sample is a spike, not a window.
+            // Require the SAME candidate to qualify on consecutive samples before
+            // committing a run to it. A settled HostWide window is exempt: it already
+            // waited for consecutive quiet samples in wait_for_host_quiet.
+            consecutive_ok = if last_driver == Some(driver_cpu) {
+                consecutive_ok.saturating_add(1)
+            } else {
+                1
+            };
+            last_driver = Some(driver_cpu);
+            if initial_host_quiet_window.is_some()
+                || placement_is_stable(consecutive_ok, required_stable_samples)
+            {
+                break (busy, ranked, driver_cpu, driver_busy, driver_guard_cpus);
+            }
+        } else {
+            consecutive_ok = 0;
+            last_driver = None;
         }
         // A HostWide window is a single settled observation from
         // wait_for_host_quiet; re-sampling would not change it, so do not spin.
@@ -7772,6 +7814,36 @@ mod tests {
     /// change still cannot be placed by it. The only difference is that a
     /// transiently busy host is re-sampled instead of aborting the run on one
     /// unlucky sample.
+    /// bd-placement-stability: a placement must survive CONSECUTIVE samples.
+    ///
+    /// Mermaid's cross-project finding is that host VOLATILITY, not absolute load,
+    /// is the blocker — a stable moderate window beats a brief quiet spike. The
+    /// direct evidence here: runs that STARTED at loadavg 9.81 and 10.28 were still
+    /// refused with 48-50 CPUs busy during the measured region. One qualifying
+    /// sample said nothing about the next thirty seconds.
+    ///
+    /// This is strictly MORE conservative than the previous behaviour: it can only
+    /// reject placements the old code would have accepted, never admit one it would
+    /// have refused. That direction matters — a stability check that could admit
+    /// more would be a gate weakening wearing a robustness costume.
+    #[test]
+    fn placement_requires_consecutive_stability_not_a_single_spike() {
+        // A single qualifying sample is NOT enough when several are required.
+        assert!(!placement_is_stable(1, 5), "one sample is a spike, not a window");
+        assert!(!placement_is_stable(4, 5), "still short of the requirement");
+        assert!(placement_is_stable(5, 5), "the requirement is met exactly");
+        assert!(placement_is_stable(6, 5), "and exceeded");
+
+        // With a requirement of 1 the behaviour collapses to the previous
+        // accept-the-first-qualifying-sample rule, which is what makes this change
+        // provably non-weakening: the old behaviour is the required=1 case.
+        assert!(placement_is_stable(1, 1));
+
+        // Zero consecutive successes is never stable, whatever is required.
+        assert!(!placement_is_stable(0, 1));
+        assert!(!placement_is_stable(0, 5));
+    }
+
     #[test]
     fn placement_retry_is_bounded_and_never_spins_a_settled_window() {
         // Inside the budget on a same-LLC scope: retry.
