@@ -12189,3 +12189,52 @@ Report preserved at `/data/tmp/frankenfs-mounted-kernel/run_1786892581_115098753
 
 Counted mechanism: **107 of 107 contention samples over limit**, `max_external_busy_cpus=48`
 against a limit of `2` — the refusal is a count, not a judgement.
+
+### 2026-08-16 UPDATE — buying pairs did NOT fix it: at 48 pairs the resolution finally clears the floor, but the A/A nulls FLIP SIGN between runs, which is the disqualifying pattern
+
+Re-ran the same six-arm A/B at `--pairs 48` instead of 12, on the same ELF, to buy resolution
+the way this campaign has done before. Resolution improved as predicted — and the row is still
+inadmissible, for a different and more instructive reason.
+
+    pairs=48  candidate_b_over_candidate_a_median = 0.845204
+              bootstrap median CI [0.812518, 0.860704]
+              minimum_decidable_effect_ratio = 1.202585
+              achieved_resolution_ratio      = 1.230742   <-- now EXCEEDS the floor
+              candidate_claim_clear = false  admitted = false  verdict = BLOCKED_NULL
+
+The two runs AGREE on the point estimate: `0.858512x` at 12 pairs and `0.845204x` at 48, with
+CIs overlapping on `[0.843803, 0.860704]` — a consistent ~14-15% improvement. And at 48 pairs the
+achieved resolution (`1.230742`) is finally larger than the effect the run needed to decide
+(`1.202585`), so pair count is no longer the binding constraint.
+
+**The nulls are, and they disqualify it.** Compare the three A/A nulls across the two runs:
+
+| arm | 12 pairs | 48 pairs |
+| --- | --- | --- |
+| kernel | `1.018649` | `0.985121` |
+| fuse | `1.013971` | `0.995893` |
+| fuse_candidate_b | `1.013754` | `0.997499` |
+
+Every null is ABOVE one in the first run and BELOW one in the second. The campaign's stated
+condition for excusing a failing null is that two runs agree with overlapping intervals **AND
+both nulls are off in the same direction by a similar amount**. These are off in OPPOSITE
+directions, which is precisely the sign-flip pattern this project has previously refused a
+mounted row over. A null that changes sign between windows is not a small bias to correct for,
+it is evidence the instrument is measuring the host as much as the candidate.
+
+`external_load_during_run,samples=209,over_limit_samples=209,contended_fraction=1.0000,
+max_external_busy_cpus=48,peak_off_placement_mean_busy=1.000000,verdict=CONTENDED` — off-placement
+CPUs were at 100% busy for the entire measured region, all 209 samples.
+
+**Conclusion, and it redirects the work.** The blocker on this lever is not pair count and not
+estimator choice; both were tried and neither moved it. It is host quiescence, which no amount of
+sampling repairs — the effect and the noise scale together. `0.845204x`/`0.858512x` remains an
+unclaimed point estimate with a plausible mechanism (the range-leaf backend removes the
+direct-mapped table's conflict misses at 32,768 entries, which is 8x its slot count) and no
+admissible measurement behind it. It needs a genuinely quiet box, not more work on this one.
+
+Counted mechanism: **209 of 209 contention samples over limit**, `max_external_busy_cpus=48`
+against a limit of `2`. Provenance as the parent entry: candidate
+`af6de55e7089f9b9091cc992fcb3a9c1c23a581f060b092789c40977e39a1c53`, `isa=x86-64-v3`,
+`RCH_WORKER=none`, `hostname=thinkstation1`, `bootstrap_resamples=20000`. Report at
+`/data/tmp/frankenfs-mounted-kernel/run_1786892764_29835723_483688/`.
