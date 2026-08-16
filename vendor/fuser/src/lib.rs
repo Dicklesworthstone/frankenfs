@@ -19,6 +19,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::{convert::AsRef, io::ErrorKind};
 
+pub use crate::affinity::pin_current_thread_to_one_cpu;
 pub use crate::ll::fuse_abi::FUSE_ROOT_ID;
 use crate::ll::fuse_abi::consts::*;
 pub use crate::ll::{TimeOrNow, fuse_abi::consts};
@@ -46,6 +47,7 @@ pub use session::{BackgroundSession, Session, SessionACL, SessionUnmounter};
 use std::cmp::max;
 use std::cmp::min;
 
+pub mod affinity;
 pub mod channel;
 #[cfg(target_os = "linux")]
 mod io_uring;

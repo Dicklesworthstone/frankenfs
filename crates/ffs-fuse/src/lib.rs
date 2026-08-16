@@ -131,45 +131,15 @@ pub fn capability_memo_slots() -> usize {
 ///
 /// Best-effort: a failure to read or set affinity leaves the thread unpinned and is
 /// logged, never fatal. A mount must not fail because a determinism aid did.
-#[cfg(target_os = "linux")]
 fn pin_serial_dispatch_thread() {
-    // SAFETY: `sched_getaffinity` / `sched_setaffinity` on the calling thread (pid 0),
-    // with a correctly sized `cpu_set_t` allocated here and read or written only through
-    // libc's own accessors.
-    unsafe {
-        let mut current: libc::cpu_set_t = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::cpu_set_t>();
-        if libc::sched_getaffinity(0, size, std::ptr::addr_of_mut!(current)) != 0 {
-            debug!("could not read CPU affinity; serial dispatch left unpinned");
-            return;
-        }
-        let width = 8 * size;
-        let allowed: Vec<usize> = (0..width)
-            .filter(|cpu| libc::CPU_ISSET(*cpu, &current))
-            .collect();
-        // Already single-CPU, or nothing readable: leave it alone. Pinning a one-CPU set
-        // is a no-op, and pinning an empty one would be a bug.
-        if allowed.len() <= 1 {
-            return;
-        }
-        let chosen = allowed[0];
-        let mut only: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(std::ptr::addr_of_mut!(only));
-        libc::CPU_SET(chosen, std::ptr::addr_of_mut!(only));
-        if libc::sched_setaffinity(0, size, std::ptr::addr_of!(only)) == 0 {
-            info!(
-                cpu = chosen,
-                allowed = allowed.len(),
-                "serial FUSE dispatch pinned to one CPU (bd-svhrq)"
-            );
-        } else {
-            debug!("could not pin serial dispatch thread; left unpinned");
-        }
+    // The syscalls live in the vendored `fuser` crate: this one is
+    // `#![forbid(unsafe_code)]`, which cannot be locally overridden.
+    match fuser::pin_current_thread_to_one_cpu() {
+        Some(cpu) => info!(cpu, "serial FUSE dispatch pinned to one CPU (bd-svhrq)"),
+        None => debug!("serial dispatch left unpinned (already single-CPU, or affinity unavailable)"),
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn pin_serial_dispatch_thread() {}
 
 /// Bounded spin before the blocking `/dev/fuse` read (bd-receive-spin).
 ///
