@@ -11884,3 +11884,66 @@ Provenance: candidate
 40044 for getxattr and 40001 for lookup**, a 2:1:1 ratio holding across both FUSE arms.
 No build was started for this row; `df -h /data` was 63G at the time and the existing ELF
 already carried the fix.
+
+## 2026-08-16 — COUNTED, composition BLOCKED pending a rebuild: a create+delete operation costs 11.003 FUSE round trips against 1.000 for a warm stat — the mutating path crosses the boundary 11x more per op (bd-i353e, bd-btrfs-create-delete-storm, AzureBay)
+
+The mutation dispatch counters landed this turn but the candidate ELF predates them and
+both of the project's build slots were taken, so this measures the half of the
+create/delete attribution that needs no new counter: `requests_total`, which has always
+counted EVERY request at the FUSE boundary — including the creates and unlinks the old
+dispatch counters dropped on their `_ => {}` arm.
+
+Daemon pinned to one core, client to a disjoint set, K=1 vs K=5 sweep differencing so
+mount and teardown traffic cancels:
+
+    K1=[requests_total 22010, metadata_requests 6004]
+    K5=[requests_total 110034, metadata_requests 30012]
+
+    requests_total     11.003 round trips per create+delete op
+    metadata_requests   3.001 per op  (27.3% of them)
+
+Both divide cleanly — `88024 / 4 / 2000 = 11.003` and `24008 / 4 / 2000 = 3.001` — so
+these are exact per-op costs, not estimates.
+
+### The comparison that makes the number mean something
+
+| workload | FUSE round trips per operation |
+| --- | --- |
+| warm stat (banked) | **1.000** — one `security.capability` GETXATTR, nothing else |
+| readdir+stat (banked) | **1.000** per entry — same probe |
+| create+delete | **11.003** |
+
+The read rows cost exactly one boundary crossing per operation and are ~99% transport;
+this path costs eleven. Whatever the create/delete row's 2.36x is made of, it is a
+different shape of problem from the two rows already attributed, which is what justified
+giving it its own pass rather than assuming the probe finding transferred.
+
+`3.001` of the eleven are metadata requests — the getattr/statx family — which is
+consistent with the earlier dispatch census showing 2 getattr + 1 lookup + 1 getxattr of
+incidental read traffic per operation. The other ~8 are the mutating work and the opens,
+flushes and releases around it, and **their composition is exactly what the counters
+landed this turn will resolve**; that needs one rebuild and a free build slot.
+
+### What this is NOT, stated because the numbers are tempting
+
+**This is a strict LOWER BOUND on the comparator's workload, not a measurement of it.**
+The comparator's create/delete storm carries the durability contract
+`create_fsyncdir_delete_fsyncdir` (harness line 212) — a directory fsync *per operation*.
+My harness fsyncs the directory once per **sweep** of 2,000 operations, so it omits
+2 fsyncdirs per op. The comparator's per-op round-trip count is therefore higher than
+`11.003`, probably by about two, and the `2.358280x` row must not be decomposed with this
+figure.
+
+It is banked because the ratio between paths — 11 crossings versus 1 — does not depend on
+that difference, and because it is the first round-trip census any mutating row has had.
+
+No ratio is claimed and no comparator run was involved. Counted mechanism: **88024
+requests over four sweeps vs 24008 metadata requests over the same four**, both exact
+multiples of the operation count.
+
+Provenance: candidate
+`executing_elf_sha256 = 672ccf093608b1cb8734c68043f3a93fb62e64aeed450033b784309df6f8c8d1`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, daemon pinned to
+cpu 8 (observed), client to cpus 16-23. Read-write mount, managed runtime. **No build was
+started**: `df -h /data` was 61G and the project already had two builds in flight, which
+is the cap.
