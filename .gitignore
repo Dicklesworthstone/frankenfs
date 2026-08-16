@@ -90,6 +90,7 @@ crates/*/target/
 
 # Beads history snapshots
 .beads/.br_history/
+.beads/.br_recovery/
 # Local FrankenSQLite WAL certification sidecars (machine-local, regenerated)
 .beads/*wal-cert
 .beads/*wal-cert-head
