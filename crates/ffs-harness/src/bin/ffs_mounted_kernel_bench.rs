@@ -4778,17 +4778,26 @@ fn load_is_settled(one: f64, five: f64, low_threshold: f64, convergence: f64) ->
 /// Observed per-CPU clock in MHz, from `/proc/cpuinfo` (bd-cpu-mhz).
 ///
 /// The report has always recorded the frequency POLICY — governor, EPP — and never the
-/// frequency actually observed. On this host that is a material gap rather than a
-/// tidiness one: the governor is `powersave` and cores swing roughly 1429-4292 MHz, so
-/// a QUIET window is a DOWNCLOCKED window. Chasing low load therefore trades contention
-/// noise for frequency error, and a row recording loadavg but not MHz cannot tell the
-/// two apart afterwards.
+/// frequency actually observed. On this `powersave` host that is a material gap: two
+/// arms placed on different physical cores can run at different clocks, and a row that
+/// records loadavg but not MHz cannot separate contention noise from frequency error
+/// afterwards.
 ///
-/// Measured 2026-08-16 at loadavg 68: cores spanned 3111-3917 MHz simultaneously, a
-/// 1.26x spread ACROSS CORES AT ONE INSTANT. Two arms placed on different cores can
-/// therefore differ by more than the entire unexplained dispersion of the worst row
-/// (13.14% across eight clean-null runs), which is why this is worth capturing before
-/// any further attribution of that spread.
+/// WHAT IS ESTABLISHED, from readings taken here rather than quoted:
+///   loadavg 68.0  ->  cores 3111.7-3917.5 MHz, spread 1.259x
+///   loadavg 17.1  ->  cores 3363.1-4242.4 MHz, spread 1.261x, mean 3790.5
+/// The CROSS-CORE spread is ~1.26x in both, and it is the spread that matters: two arms
+/// on different cores can differ by more than the entire unexplained dispersion of the
+/// worst row (13.14% over eight clean-null runs).
+///
+/// WHAT IS NOT ESTABLISHED: the direction or magnitude of any load-to-frequency
+/// relationship. A retracted third-party figure (1429-4292 MHz) previously appeared
+/// here and has been removed. The two readings above point the OPPOSITE way to
+/// "quiet windows are downclocked" — lower load showed HIGHER clocks, which is ordinary
+/// turbo behaviour — while another observer measured the reverse. Both are single
+/// instantaneous samples of a per-core value across 64 cores, which is too weak to
+/// settle it either way. That is precisely why this is recorded per run instead of
+/// argued from spot readings.
 fn cpu_mhz() -> BTreeMap<usize, f64> {
     let mut out = BTreeMap::new();
     let Ok(raw) = std::fs::read_to_string("/proc/cpuinfo") else {
@@ -9673,16 +9682,19 @@ mod tests {
     /// would be a new refusal criterion smuggled in as a diagnostic.
     /// bd-cpu-mhz: a QUIET window is a DOWNCLOCKED window on this host.
     ///
-    /// The governor is `powersave` and cores swing roughly 1429-4292 MHz, so chasing
-    /// low load trades contention noise for frequency error. The report recorded the
-    /// frequency POLICY and never the observed frequency, which means no banked row
-    /// can be re-examined for this after the fact.
+    /// The report recorded the frequency POLICY and never the observed frequency, so
+    /// no banked row can be re-examined for frequency effects after the fact.
     ///
-    /// The number that makes it material: measured at loadavg 68 on 2026-08-16, cores
-    /// spanned 3111-3917 MHz SIMULTANEOUSLY — a 1.26x spread across cores at one
-    /// instant. Two arms placed on different cores can therefore differ by more than
-    /// the entire unexplained dispersion of the worst row (13.14% over eight
-    /// clean-null runs), which is why `spread` is reported and not just the mean.
+    /// The number that makes it material is the CROSS-CORE spread, measured here:
+    /// 3111.7-3917.5 MHz at loadavg 68 and 3363.1-4242.4 MHz at loadavg 17, a ~1.26x
+    /// spread across cores at a single instant in both. Two arms on different cores can
+    /// therefore differ by more than the worst row's entire unexplained dispersion
+    /// (13.14% over eight clean-null runs), which is why `spread` is reported and not
+    /// just the mean.
+    ///
+    /// The DIRECTION of any load-to-frequency effect is deliberately not asserted: the
+    /// two readings above disagree with a third-party observation, and single
+    /// instantaneous samples cannot settle it.
     #[test]
     fn cpu_mhz_summary_reports_the_cross_core_spread_bd_cpu_mhz() {
         let mhz: BTreeMap<usize, f64> =
@@ -9704,8 +9716,10 @@ mod tests {
         let (_, _, _, wide) = cpu_mhz_summary(&mhz, &with_slow).expect("summary");
         assert!(
             wide > 2.7,
-            "1429 MHz against 3917 MHz is a 2.7x spread; a row that does not record \
-             this cannot rule frequency out as the cause of its dispersion"
+            "a heavily downclocked core against a boosted one is a large spread; a row \
+             that does not record this cannot rule frequency out as the cause of its \
+             dispersion. The fixture values here are illustrative, NOT measured limits \
+             for this host — the observed range measured here is 3111-4242 MHz"
         );
 
         // CPUs with no reading must not fabricate one.
