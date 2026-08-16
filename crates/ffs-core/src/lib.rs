@@ -55979,18 +55979,22 @@ mod tests {
         let mut ab_log_ratios = Vec::with_capacity(rounds);
         let mut null_log_ratios = Vec::with_capacity(rounds);
         let mut ok_last = 0_u64;
+        // Balanced square per round: OFF, ON, ON, OFF — see the production arm
+        // for why the previous 1-2 / 3-4 split made the null measure a schedule
+        // position rather than instrument noise.
         for _ in 0..rounds {
-            let (ok_off, t_off) = arm(true);
-            let (ok_on, t_on) = arm(false);
-            assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
-            ab_log_ratios
-                .push((t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE)).ln());
-            let (_, t_null_a) = arm(true);
-            let (_, t_null_b) = arm(true);
-            null_log_ratios.push(
-                (t_null_a.as_secs_f64() / t_null_b.as_secs_f64().max(f64::MIN_POSITIVE)).ln(),
-            );
-            ok_last = ok_on;
+            let (ok_off1, t_off1) = arm(true);
+            let (ok_on1, t_on1) = arm(false);
+            let (ok_on2, t_on2) = arm(false);
+            let (ok_off2, t_off2) = arm(true);
+            assert_eq!(ok_off1, ok_on1, "arms must stat the same inodes");
+            assert_eq!(ok_on2, ok_off2, "arms must stat the same inodes");
+            let secs = |d: std::time::Duration| d.as_secs_f64().max(f64::MIN_POSITIVE);
+            ab_log_ratios.push((secs(t_off1) / secs(t_on1)).ln());
+            ab_log_ratios.push((secs(t_off2) / secs(t_on2)).ln());
+            null_log_ratios.push((secs(t_off1) / secs(t_off2)).ln());
+            null_log_ratios.push((secs(t_on1) / secs(t_on2)).ln());
+            ok_last = ok_on1;
         }
         let ab = bd_5vis3_bootstrap_median_ci(&ab_log_ratios);
         let null = bd_5vis3_bootstrap_median_ci(&null_log_ratios);
@@ -56153,21 +56157,38 @@ mod tests {
         let mut ab_log_ratios = Vec::with_capacity(rounds);
         let mut null_log_ratios = Vec::with_capacity(rounds);
         let (mut look_off_last, mut look_on_last, mut ok_last) = (0_u64, 0_u64, 0_u64);
+        // BALANCED SQUARE per round: OFF, ON, ON, OFF.
+        //
+        // The previous shape put the A/B at slots 1-2 and the A/A at slots 3-4,
+        // so the two estimators did not see the same schedule. Any drift across
+        // a round — page cache, allocator, frequency — landed on them
+        // differently, and the null measured a position effect rather than the
+        // instrument's own noise. Measured consequence: the null came out
+        // +14.1% on one run and -13.8% on another, same magnitude, OPPOSITE
+        // signs. A null that flips sign between runs cannot certify anything,
+        // and per the fleet rule a failing null is excusable only when repeats
+        // are off the SAME way.
+        //
+        // Here both estimators are formed from the SAME four slots:
+        //   A/B  = off1/on1 and off2/on2   (slots 1-2 and 4-3)
+        //   A/A  = off1/off2 and on1/on2   (slots 1-4 and 2-3)
+        // Each is a symmetric pairing about the round's midpoint, so a linear
+        // drift cancels in both rather than in neither.
         for _ in 0..rounds {
-            let (ok_off, t_off, look_off) = arm(true);
-            let (ok_on, t_on, look_on) = arm(false);
-            assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
-            ab_log_ratios
-                .push((t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE)).ln());
-            // A/A: the same disabled arm twice, same schedule position cost.
-            let (_, t_null_a, _) = arm(true);
-            let (_, t_null_b, _) = arm(true);
-            null_log_ratios.push(
-                (t_null_a.as_secs_f64() / t_null_b.as_secs_f64().max(f64::MIN_POSITIVE)).ln(),
-            );
+            let (ok_off1, t_off1, look_off) = arm(true);
+            let (ok_on1, t_on1, look_on) = arm(false);
+            let (ok_on2, t_on2, _) = arm(false);
+            let (ok_off2, t_off2, _) = arm(true);
+            assert_eq!(ok_off1, ok_on1, "arms must stat the same inodes");
+            assert_eq!(ok_on2, ok_off2, "arms must stat the same inodes");
+            let secs = |d: std::time::Duration| d.as_secs_f64().max(f64::MIN_POSITIVE);
+            ab_log_ratios.push((secs(t_off1) / secs(t_on1)).ln());
+            ab_log_ratios.push((secs(t_off2) / secs(t_on2)).ln());
+            null_log_ratios.push((secs(t_off1) / secs(t_off2)).ln());
+            null_log_ratios.push((secs(t_on1) / secs(t_on2)).ln());
             look_off_last = look_off;
             look_on_last = look_on;
-            ok_last = ok_on;
+            ok_last = ok_on1;
         }
         let ab = bd_5vis3_bootstrap_median_ci(&ab_log_ratios);
         let null = bd_5vis3_bootstrap_median_ci(&null_log_ratios);
