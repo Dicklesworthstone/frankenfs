@@ -15,9 +15,9 @@ use std::hint::black_box;
 /// One-u64-per-iteration popcount sum (mirrors production).
 fn count_word(bitmap: &[u8]) -> u32 {
     let mut free = 0u32;
-    for chunk in bitmap.chunks_exact(8) {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap());
-        free += (!word).count_ones();
+    let (chunks, _tail) = bitmap.as_chunks::<8>();
+    for chunk in chunks {
+        free += (!u64::from_le_bytes(*chunk)).count_ones();
     }
     free
 }
@@ -25,17 +25,17 @@ fn count_word(bitmap: &[u8]) -> u32 {
 /// Four independent popcounts per iteration (better ILP), summed.
 fn count_unrolled4(bitmap: &[u8]) -> u32 {
     let mut free = 0u32;
-    let mut chunks = bitmap.chunks_exact(32);
-    for block in &mut chunks {
+    let (blocks, blocks_rem) = bitmap.as_chunks::<32>();
+    for block in blocks {
         let w0 = u64::from_le_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_le_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_le_bytes(block[16..24].try_into().unwrap());
         let w3 = u64::from_le_bytes(block[24..32].try_into().unwrap());
         free += (!w0).count_ones() + (!w1).count_ones() + (!w2).count_ones() + (!w3).count_ones();
     }
-    for chunk in chunks.remainder().chunks_exact(8) {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap());
-        free += (!word).count_ones();
+    let (tail_words, _tail) = blocks_rem.as_chunks::<8>();
+    for chunk in tail_words {
+        free += (!u64::from_le_bytes(*chunk)).count_ones();
     }
     free
 }

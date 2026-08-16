@@ -58,7 +58,7 @@ fn new_free(bitmap: &mut [u8], start: u32, count: u32) -> u32 {
     }
     // range clear
     let mut idx = start;
-    while idx < end && idx % 8 != 0 {
+    while idx < end && !idx.is_multiple_of(8) {
         let b = (idx / 8) as usize;
         bitmap[b] &= !(1 << (idx % 8));
         idx += 1;
@@ -68,7 +68,7 @@ fn new_free(bitmap: &mut [u8], start: u32, count: u32) -> u32 {
     let be = ((fe / 8) as usize).min(bitmap.len());
     if be > bs {
         bitmap[bs..be].fill(0);
-        idx = (be as u32) * 8;
+        idx = u32::try_from(be).expect("be derives from a u32 bit index") * 8;
     }
     while idx < end {
         let b = (idx / 8) as usize;

@@ -18,7 +18,12 @@ const CSUM_SEED: u32 = 0x1357_2468;
 
 fn make_bitmap_pair(bit_start: u32, bit_count: u32) -> (Vec<u8>, Vec<u8>) {
     let before: Vec<u8> = (0..BITMAP_BYTES)
-        .map(|idx| (idx as u8).wrapping_mul(37).rotate_left(1))
+        .map(|idx| {
+            u8::try_from(idx % 256)
+                .unwrap_or(0)
+                .wrapping_mul(37)
+                .rotate_left(1)
+        })
         .collect();
     let mut after = before.clone();
     for bit in bit_start..bit_start + bit_count {

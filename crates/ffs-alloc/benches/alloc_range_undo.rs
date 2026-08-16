@@ -18,11 +18,11 @@ fn old_alloc(bitmap: &mut [u8], reserved: &[u32], start: u32, count: u32) -> u32
     let mut undo: Vec<u32> = Vec::with_capacity(count as usize);
     for i in start..start + count {
         let b = (i / 8) as usize;
-        if let Some(byte) = bitmap.get_mut(b) {
-            if (*byte >> (i % 8)) & 1 == 0 {
-                *byte |= 1 << (i % 8);
-                undo.push(i);
-            }
+        if let Some(byte) = bitmap.get_mut(b)
+            && (*byte >> (i % 8)) & 1 == 0
+        {
+            *byte |= 1 << (i % 8);
+            undo.push(i);
         }
     }
     black_box(&undo);
@@ -31,14 +31,14 @@ fn old_alloc(bitmap: &mut [u8], reserved: &[u32], start: u32, count: u32) -> u32
 fn new_alloc(bitmap: &mut [u8], reserved: &[u32], start: u32, count: u32) -> u32 {
     let end = start + count;
     let p = reserved.partition_point(|&r| r < start);
-    if let Some(&r) = reserved.get(p) {
-        if r < end {
-            return r;
-        }
+    if let Some(&r) = reserved.get(p)
+        && r < end
+    {
+        return r;
     }
     // range-set
     let mut idx = start;
-    while idx < end && idx % 8 != 0 {
+    while idx < end && !idx.is_multiple_of(8) {
         let b = (idx / 8) as usize;
         bitmap[b] |= 1 << (idx % 8);
         idx += 1;
@@ -48,7 +48,7 @@ fn new_alloc(bitmap: &mut [u8], reserved: &[u32], start: u32, count: u32) -> u32
     let be = ((fe / 8) as usize).min(bitmap.len());
     if be > bs {
         bitmap[bs..be].fill(0xFF);
-        idx = (be as u32) * 8;
+        idx = u32::try_from(be).expect("be derives from a u32 bit index") * 8;
     }
     while idx < end {
         let b = (idx / 8) as usize;
