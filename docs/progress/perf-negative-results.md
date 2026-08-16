@@ -12017,3 +12017,65 @@ requests over the same four**, both exact multiples of the operation count. Prov
 `isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, daemon pinned to
 cpu 8 (observed), client to cpus 16-23, read-write managed mount. **No build started**:
 `df -h /data` was `60G`, at the budget threshold.
+
+## 2026-08-16 — COUNTED at workload parity, composition still BLOCKED: a create+delete operation under the comparator's OWN durability contract costs 13.002 FUSE crossings, 69.2% of them uncounted (bd-i353e, bd-btrfs-create-delete-storm, AzureBay)
+
+The two previous entries measured `11.003` crossings per create+delete operation and
+flagged, prominently, that the harness fsynced the directory once per SWEEP while the
+comparator's contract is `create_fsyncdir_delete_fsyncdir` — a fsync PER OPERATION
+(`ffs_mounted_kernel_bench.rs:212`). Every figure from them was therefore a lower bound on
+a cheaper cousin of the banked row. **That mismatch is now fixed and the census re-run, so
+these figures apply to the workload the `2.358280x` row actually measures.**
+
+    K1=[26006 6003 4000 2002 2002 0]   K5=[130020 30014 20000 10009 10013 0]
+
+    requests_total       13.002 per op
+    metadata_requests     3.001 per op
+    getattr_disp          2.000 per op
+    getxattr_disp         1.001 per op
+    lookup_disp           1.001 per op
+    readdir_disp          0.000 per op
+    --
+    dispatched read-metadata      4.002 per op
+    UNACCOUNTED by any counter    8.999 per op   (69.2% of crossings)
+
+### Two predictions, written down before the run, both held
+
+The previous entry predicted the comparator's per-op count would be higher **"probably by
+about two"**. Measured: `13.002 - 11.003 = 1.999`. **Two directory fsyncs cost exactly two
+crossings** — one round trip each, no amortisation, which is what a durability barrier
+should look like and is worth having as a fact rather than an assumption.
+
+It also predicted the `63.6%` uncounted fraction was **"if anything an UNDERSTATEMENT"**,
+because the added fsyncs are themselves uncounted opcodes. Measured: `69.2%`.
+
+A third check nobody predicted but which had to hold: the dispatched read-metadata traffic
+is **unchanged** at `4.002` against `4.001`. Adding durability barriers moved only
+mutation-side crossings and left every read counter alone — so the `+2` is genuinely the
+fsyncs and not a disturbance of the rest of the workload.
+
+### Where the banked row now stands
+
+For the workload the comparator actually runs, a single create+delete operation costs
+**13 FUSE boundary crossings**, against **1.000** for a warm stat and **1.000** per entry
+for readdir+stat. Of those 13, **9 are invisible to every counter the shipping ELF has**.
+
+That is the honest state of this row's attribution: the traffic is now measured at
+workload parity, and the composition of 69.2% of it still requires the mutation counters
+landed in `3145d182` plus a rebuild. Per `bd-4zokj` the daemon-share figure that follows
+will STILL be a lower bound, because `59.2%`-`98.8%` of daemon CPU sits outside dispatch
+even for counted opcodes.
+
+### Not claimed
+
+No ratio, no comparator run, no daemon share. The banked `2.358280x` is untouched. What
+changed is that the crossing counts are no longer a lower bound on the wrong workload —
+they are exact counts on the right one.
+
+Counted mechanism: **104014 requests over four sweeps vs 32008 dispatched read-metadata
+requests over the same four**, every per-op figure landing on an integer. Provenance:
+`executing_elf_sha256 = 672ccf093608b1cb8734c68043f3a93fb62e64aeed450033b784309df6f8c8d1`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, daemon pinned to
+cpu 8 (observed), client to cpus 16-23, read-write managed mount. **No build started**:
+`df -h /data` was 61G, above the threshold, but both project build slots were occupied,
+which is the cap.
