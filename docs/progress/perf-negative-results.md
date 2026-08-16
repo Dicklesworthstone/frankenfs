@@ -10494,3 +10494,86 @@ that does.
 
 Both runs `CONTENDED` (peak 33 and 17 busy CPUs). Neither is admitted; both are
 `BLOCKED_NULL`. The claim here is a bound and a direction, not a banked ratio.
+
+## 2026-08-16 — THE CAPACITY CLIFF MOVES, IT DOES NOT DISAPPEAR: sizing the capability memo to the directory is worth 2.08x on mounted readdir+stat at 32,768 entries (bd-m1bpu, AzureBay)
+
+The previous entry established that the memo does nothing at 32,768 entries because
+`CAPABILITY_MEMO_SLOTS = 4096` cannot hold that directory. The obvious response is
+"make the table bigger", and the obvious objection is that this only relocates the
+problem. **Both are now measured, and both are true.**
+
+`FFS_FUSE_CAPABILITY_MEMO_SLOTS` (commit `96f78446`) makes the count a runtime knob, so
+every arm below is ONE ELF
+(`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+self-reported via `bench-evidence`;
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`) with the divergence proved by the daemon:
+
+    candidate_a_runtime_knobs="...,capability_memo=true,capability_memo_slots=4096"
+    candidate_b_runtime_knobs="...,capability_memo=true,capability_memo_slots=65536"
+    configurations_differ=true,knob_divergence_proof=daemon_self_reported_effective_values,verdict=pass
+
+Ratio is candidate_b over candidate_a, so **below 1.0 means the LARGER table was faster**.
+Every `ci_low`/`ci_high` is a bootstrap median 95% confidence interval, 20,000 resamples,
+`six_arm_williams_square`, `same_window=true`. Host `thinkstation1`,
+`executed_on=thinkstation1`; driver
+`471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`, both built on
+`thinkstation1`.
+
+| entries | table | fit | run 1 | run 2 | effect |
+| --- | --- | --- | --- | --- | --- |
+| 32,768 | memo ON vs OFF at 4096 | 8x oversubscribed | `0.994244` | `1.003628` | **nothing** |
+| 32,768 | 65536 vs 4096 | 2x headroom | `0.481225` `[0.479327, 0.485327]` | `0.481230` `[0.475523, 0.481959]` | **2.08x faster** |
+| 100,000 | 65536 vs 4096 | 1.5x oversubscribed | `0.774439` `[0.751522, 0.820958]` | `0.770822` `[0.757356, 0.774895]` | **1.30x faster** |
+
+The two 32,768 runs agree to **0.001%** (`0.481225` vs `0.481230`) — the tightest
+replication in this campaign — and their candidate A/A null was CLEAR
+(`candidate_aa_null_clear=true`, `minimum_decidable_effect_ratio=1.019983`, i.e. the
+instrument could resolve 2.0% and the effect was 108%). The 100,000-entry pair agrees to
+`0.47%`.
+
+### The answer to the question: it MOVES
+
+At 32,768 entries a 65,536-slot table has headroom and wins `2.08x`. At 100,000 entries
+the SAME table is now itself oversubscribed and the win degrades to `1.30x`. The benefit
+tracks how well the directory fits, monotonically, exactly as a direct-mapped table
+predicts. Nothing here removes the cliff; it relocates it to a larger directory, and any
+directory larger than the table walks off it again.
+
+So "size the memo to the workload" is not a fix, it is a **parameter with no correct
+value** — which is precisely the unbounded-footprint objection bd-5vis3 was created to
+enforce, arriving here on schedule. `CAPABILITY_MEMO_SLOTS_MAX` is capped at `1 << 20`
+(8 MiB per mount) for that reason, and the knob is documented in code as an experiment
+rather than a policy.
+
+Memory cost of the arm that won: 65,536 slots x 8 bytes = **512 KiB per mount**, resident
+for the mount's lifetime, against 32 KiB at the 4096 default. That is cheap in isolation
+and is exactly how every unbounded cache begins.
+
+### What this does and does not say about the vs-kernel row
+
+**It is a candidate-vs-candidate ratio. It is NOT a win against the kernel.** The same
+runs measured the incumbent at `kernel_median_wall_ns=30283575` / `27659631` against
+`fuse_median_wall_ns=215316988` / `217368101` for the 4096-slot arm — still a
+`7.1x`-`7.9x` LOSS, consistent with the banked `7.73x`. Applying the measured `0.4812`
+to the FUSE arm would put the 65,536-slot configuration near `103 ms`, i.e. roughly
+`3.5x` rather than `7.4x` — but that is an INFERENCE from two separately reported
+numbers, not a measured vs-kernel ratio, and it is written here as arithmetic to be
+checked rather than a result to be quoted. A vs-kernel row for the larger table has not
+been run.
+
+### Why none of this is admitted
+
+All six runs are `verdict=BLOCKED_NULL`. The candidate claim is gated on `admitted`,
+which requires the KERNEL arm's A/A nulls to be clear as well — and those have failed
+all session under contention (peak off-placement mean busy reached `99.8%` during the
+first 100,000-entry run). The candidate comparison does not use the kernel arm, so this
+is a stricter rule than the comparison needs; it is the harness's rule and it was not
+touched to make a number publishable. Recorded as directional with its bound.
+
+Retry predicate: a quiet window, then a vs-kernel row at 65,536 slots on the 32,768-entry
+fixture — that is the measurement that would tell the campaign whether the worst row in
+the bank actually moves. Before shipping any larger default, bd-5vis3's bar applies:
+peak resident memory reported, and a workload that does NOT fit measured beside one that
+does. The 100,000-entry row above is that non-fitting workload, and it is why a larger
+default cannot be justified on the 32,768 number alone.
