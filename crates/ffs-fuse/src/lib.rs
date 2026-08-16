@@ -234,6 +234,24 @@ pub mod io_uring_config {
     }
 }
 
+/// Whether the kernel will permit FUSE-over-io_uring (bd-vbqc6).
+///
+/// Pure over the file contents so it is testable without a kernel: `/sys/module/fuse/
+/// parameters/enable_uring` holds `Y` or `N`.
+#[must_use]
+pub fn io_uring_kernel_enabled_from_value(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("y"))
+}
+
+/// Read the kernel's io_uring switch. `None` when the knob does not exist, which is
+/// how a kernel with no FUSE-over-io_uring support at all presents.
+#[must_use]
+pub fn io_uring_kernel_enabled() -> Option<bool> {
+    std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring")
+        .ok()
+        .map(|raw| io_uring_kernel_enabled_from_value(Some(&raw)))
+}
+
 /// Whether the FUSE-over-io_uring transport is requested (bd-vbqc6).
 #[must_use]
 pub fn io_uring_enabled() -> bool {
@@ -5095,6 +5113,39 @@ pub fn mount(
     // unreachable by accident.
     #[cfg(target_os = "linux")]
     if io_uring_enabled() {
+        // FAIL CLOSED if the kernel will not honour the request.
+        //
+        // fuser falls back to the classic transport when the kernel declines
+        // ("kernel declined FUSE-over-io_uring; using classic transport"). For a
+        // FILESYSTEM that is the right behaviour; for a MEASUREMENT it is a trap.
+        // The knob line reports io_uring=true because the env var is set, so an A/B
+        // would show configurations differing while both arms actually ran the
+        // classic transport — a null by construction, reported as a valid
+        // comparison. The comparator cannot catch this: its knob-divergence proof
+        // reads self-reported knobs, and the knob was honestly set; what differed
+        // from reality was the outcome, not the request.
+        //
+        // So refuse rather than measure something other than what was asked for.
+        // This host has enable_uring=N today, which is exactly how the trap would
+        // have been sprung on the first quiet window.
+        match io_uring_kernel_enabled() {
+            Some(true) => {}
+            Some(false) => {
+                return Err(FuseError::Io(std::io::Error::other(
+                    "FFS_FUSE_IO_URING=1 but the kernel has \
+                     /sys/module/fuse/parameters/enable_uring=N; the transport would \
+                     silently fall back to classic and any A/B would compare classic \
+                     against classic",
+                )));
+            }
+            None => {
+                return Err(FuseError::Io(std::io::Error::other(
+                    "FFS_FUSE_IO_URING=1 but this kernel exposes no \
+                     /sys/module/fuse/parameters/enable_uring; FUSE-over-io_uring is \
+                     unsupported here",
+                )));
+            }
+        }
         let depth = io_uring_queue_depth();
         let payload = io_uring_payload_bytes();
         info!(
@@ -5766,6 +5817,39 @@ mod tests {
             splice_from_value(std::env::var("FFS_FUSE_SPLICE").ok().as_deref()),
             "the reported knob must be resolved by the same function the mount \
              path uses, or the knob line describes a configuration that did not run"
+        );
+    }
+
+    /// bd-vbqc6: requesting io_uring on a kernel that will decline must FAIL, not
+    /// silently measure the classic transport.
+    ///
+    /// fuser falls back to classic when the kernel declines, which is correct for a
+    /// filesystem and a trap for a measurement: the knob line would still report
+    /// `io_uring=true` because the env var was honestly set, so an A/B would show
+    /// two configurations differing while both arms actually ran the SAME transport.
+    /// The comparator cannot catch that — its divergence proof reads self-reported
+    /// knobs, and the knob was not lying about the request, only about the outcome.
+    ///
+    /// This host reads `N` today, so the trap would have been sprung on the first
+    /// quiet window, after several turns of waiting for one.
+    #[test]
+    fn io_uring_kernel_switch_is_read_strictly_bd_vbqc6() {
+        // The only accepted value is Y, in either case, with whitespace tolerated
+        // because the sysfs read carries a trailing newline.
+        assert!(io_uring_kernel_enabled_from_value(Some("Y")));
+        assert!(io_uring_kernel_enabled_from_value(Some("Y\n")));
+        assert!(io_uring_kernel_enabled_from_value(Some("y")));
+
+        // Everything else is "the kernel will decline", including this host's
+        // current value. Failing OPEN here would be the whole defect.
+        assert!(!io_uring_kernel_enabled_from_value(Some("N")));
+        assert!(!io_uring_kernel_enabled_from_value(Some("N\n")));
+        assert!(!io_uring_kernel_enabled_from_value(Some("0")));
+        assert!(!io_uring_kernel_enabled_from_value(Some("")));
+        assert!(!io_uring_kernel_enabled_from_value(Some("yes")));
+        assert!(
+            !io_uring_kernel_enabled_from_value(None),
+            "a kernel with no such knob does not support the transport at all"
         );
     }
 
