@@ -96,6 +96,22 @@ pub fn capability_memo_slots() -> usize {
     LastMissingCapabilityXattr::slots_from_env()
 }
 
+/// Bounded spin before the blocking `/dev/fuse` read (bd-receive-spin).
+///
+/// Mirrors the vendored channel's own parser so the value reported on the mount
+/// knob line is resolved the same way the transport resolves it. Reported because
+/// the comparator refuses a candidate-vs-candidate run whose arms self-report
+/// identical knobs — a lever invisible on that line is unmeasurable however large.
+#[must_use]
+pub fn receive_spin() -> u32 {
+    std::env::var("FFS_FUSE_RECEIVE_SPIN")
+        .ok()
+        .as_deref()
+        .and_then(|r| r.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(100_000)
+}
+
 /// Whether to negotiate the FUSE splice capabilities (bd-splice-metadata).
 ///
 /// Splice exists to avoid a copy on LARGE payloads: it hands page references

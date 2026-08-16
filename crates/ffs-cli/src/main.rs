@@ -7510,7 +7510,7 @@ fn log_mount_shutdown_metrics(
         Ok("1" | "true")
     ) {
         eprintln!(
-            "mount_dispatch_metrics,filesystem={filesystem},getattr_dispatch_count={},getattr_dispatch_nanos={},getxattr_dispatch_count={},getxattr_dispatch_nanos={},lookup_dispatch_count={},lookup_dispatch_nanos={},readdir_dispatch_count={},readdir_dispatch_nanos={},mutation_dispatch_count={},mutation_dispatch_nanos={},other_dispatch_count={},other_dispatch_nanos={},handler_total_count={},handler_total_nanos={}",
+            "mount_dispatch_metrics,filesystem={filesystem},getattr_dispatch_count={},getattr_dispatch_nanos={},getxattr_dispatch_count={},getxattr_dispatch_nanos={},lookup_dispatch_count={},lookup_dispatch_nanos={},readdir_dispatch_count={},readdir_dispatch_nanos={},mutation_dispatch_count={},mutation_dispatch_nanos={},other_dispatch_count={},other_dispatch_nanos={},handler_total_count={},handler_total_nanos={},forget_nodes={},readdirplus_memo_remembers={},readdirplus_memo_hits={}",
             metrics.getattr_dispatch_count,
             metrics.getattr_dispatch_nanos,
             metrics.getxattr_dispatch_count,
@@ -7525,6 +7525,14 @@ fn log_mount_shutdown_metrics(
             metrics.other_dispatch_nanos,
             metrics.handler_total_count,
             metrics.handler_total_nanos,
+            // bd-i353e / bd-q0xnl: boundary crossings and memo behaviour that the
+            // dispatch counters cannot express. FORGET opens no request scope, so
+            // it was invisible to every counter; the memo pair gives a HIT RATE,
+            // which is the number that decides whether the memo still earns its
+            // lock once the kernel stops re-asking for readdirplus attributes.
+            metrics.forget_nodes,
+            metrics.readdirplus_memo_remembers,
+            metrics.readdirplus_memo_hits,
         );
         // Which attribute names the client actually asks for (bd-4ypbv). The
         // dispatch line says how MANY probes and how cheap each was; this says
@@ -7927,7 +7935,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -7937,6 +7945,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             ffs_fuse::io_uring_queue_depth(),
             ffs_fuse::io_uring_payload_bytes(),
             ffs_fuse::splice_enabled(),
+            ffs_fuse::receive_spin(),
         );
     }
 
