@@ -142,7 +142,7 @@ fn bitmap_fill_range(bitmap: &mut [u8], start: u32, count: u32, set: bool) {
     let byte_end = ((full_end / 8) as usize).min(bitmap.len());
     if byte_end > byte_start {
         bitmap[byte_start..byte_end].fill(if set { 0xFF } else { 0x00 });
-        idx = (byte_end as u32) * 8;
+        idx = u32::try_from(byte_end).expect("byte_end derives from a u32 bit index") * 8;
     }
     // Trailing partial byte.
     while idx < end {
@@ -160,8 +160,9 @@ fn set_or_clear_bit(bitmap: &mut [u8], idx: u32, set: bool) {
     }
 }
 
-/// Set the inode-bitmap "padding" bits — every bit from `inodes_per_group` to
-/// the end of the bitmap block — to 1, as ext4 requires (e2fsck:
+/// Set the inode-bitmap "padding" bits to 1, as ext4 requires.
+///
+/// Every bit from `inodes_per_group` to the end of the bitmap block (e2fsck:
 /// "Padding at end of inode bitmap is not set"). These bits do not map to real
 /// inodes and must read as allocated/unavailable. frankenfs only hit this on
 /// groups whose inode bitmap it writes for the first time (e.g. mkdir's Orlov
@@ -232,17 +233,18 @@ fn fill_inode_bitmap_padding_with_clear_undo(
     }
     // Whole trailing bytes: skip fully-set bytes; flip only zero bits elsewhere.
     let byte_start = usize::try_from(bit / 8).unwrap_or(usize::MAX);
-    for byte_idx in byte_start..bitmap.len() {
-        let b = bitmap[byte_idx];
+    for (offset, slot) in bitmap[byte_start..].iter_mut().enumerate() {
+        let b = *slot;
         if b == 0xFF {
             continue;
         }
+        let byte_idx = byte_start + offset;
         for k in 0..8u32 {
             if b & (1u8 << k) == 0 {
                 undo_clear.extend([u32::try_from(byte_idx).unwrap_or(u32::MAX) * 8 + k]);
             }
         }
-        bitmap[byte_idx] = 0xFF;
+        *slot = 0xFF;
     }
 }
 
@@ -392,7 +394,8 @@ fn bitmap_find_free_range(bitmap: &[u8], mut idx: u32, end: u32) -> Option<u32> 
         if (w0 & w1 & w2 & w3) != u64::MAX {
             for (j, w) in [w0, w1, w2, w3].into_iter().enumerate() {
                 if w != u64::MAX {
-                    return Some(idx + (j as u32) * 64 + (!w).trailing_zeros());
+                    let j = u32::try_from(j).expect("index into a 4-element array");
+                    return Some(idx + j * 64 + (!w).trailing_zeros());
                 }
             }
         }
@@ -720,6 +723,12 @@ fn apply_byte_zero_run(stats: ByteZeroRun, run: &mut u32, best: &mut u32) {
 }
 
 /// Linear scan for `n` contiguous free bits in `[start, count)`.
+// 102/100. One linear scan whose run-tracking state is only correct read top to
+// bottom; splitting it would hide the invariant rather than clarify it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single scan, marginal over the limit"
+)]
 fn bitmap_find_contiguous_linear(bitmap: &[u8], count: u32, n: u32, start: u32) -> Option<u32> {
     let mut run_start = start;
     let mut run_len = 0u32;
@@ -932,6 +941,13 @@ pub struct GroupStats {
     pub reserved_confirmed: OnceLock<()>,
 }
 
+// The omitted fields are the runtime memoization caches, rendered as a stable
+// placeholder on purpose so the diagnostic golden snapshot is invariant under
+// cache population — see the comment in fmt below (bd-resv-cache / bd-resv-mark).
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "caches omitted for golden stability"
+)]
 impl std::fmt::Debug for GroupStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Render the runtime memoization caches (`reserved_cache`,
@@ -1232,21 +1248,22 @@ pub fn resolve_numa_allocation_goal(
     if let Some(goal_block) = hint.goal_block {
         return geo.absolute_to_group_block(goal_block).0;
     }
-    if let Some(preferred_node) = preferred_node {
-        if let Some(group_index) = plan
+    if let Some(preferred_node) = preferred_node
+        && let Some(group_index) = plan
             .group_nodes
             .iter()
             .position(|node| *node == Some(preferred_node))
-        {
-            return GroupNumber(u32::try_from(group_index).unwrap_or(u32::MAX));
-        }
+    {
+        return GroupNumber(u32::try_from(group_index).unwrap_or(u32::MAX));
     }
     GroupNumber(0)
 }
 
-/// The allocation group scan order for a `hint`: optional NUMA-preferred groups,
-/// then the goal group, its ±neighbors, and finally a full `0..group_count`
-/// fallback. Pure function of `geo` + `hint` (no state, no I/O). Exposed for the
+/// The allocation group scan order for a `hint`.
+///
+/// Optional NUMA-preferred groups, then the goal group, its ±neighbors, and
+/// finally a full `0..group_count` fallback. Pure function of `geo` + `hint`
+/// (no state, no I/O). Exposed for the
 /// bd-bhh0i per-group sharded allocator (ffs-core), which walks this same order
 /// but locks one group at a time via `PerGroupAlloc::alloc_in_scan_order`; the
 /// single-lock `alloc_blocks_persist` path uses it identically.
@@ -1925,11 +1942,12 @@ pub fn set_gdt_persistence_deferred_for_test(value: Option<bool>) {
 
 #[must_use]
 pub fn gdt_persistence_deferred() -> bool {
+    use std::sync::OnceLock;
+    static SKIP: OnceLock<bool> = OnceLock::new();
+
     if let Some(forced) = GDT_DEFER_OVERRIDE.with(std::cell::Cell::get) {
         return forced;
     }
-    use std::sync::OnceLock;
-    static SKIP: OnceLock<bool> = OnceLock::new();
     // Default ON (bd-cc-gdt-defer-default): GroupStats is the authoritative in-memory
     // count and the GD is flushed at every durability boundary
     // (flush_mvcc_to_device / sync_all_to_device / flush_on_destroy). Allocation reads
@@ -2132,9 +2150,10 @@ fn persist_group_desc_with_bitmap_overrides(
     )
 }
 
-/// Write group `group`'s descriptor to the GDT block from `stats`, unconditional
-/// of the deferral flag. Used by the flush-time GDT sync to persist all
-/// descriptors at once from the authoritative in-memory counts.
+/// Write group `group`'s descriptor to the GDT block from `stats`.
+///
+/// Unconditional of the deferral flag. Used by the flush-time GDT sync to
+/// persist all descriptors at once from the authoritative in-memory counts.
 pub fn persist_group_desc_force(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -2619,6 +2638,12 @@ fn eager_largest_run() -> bool {
 
 /// Per-group block allocation core (bd-bhh0i): allocate `count` blocks in a single locked group. `try_alloc_safe` (single-lock) and the sharded per-group path share it.
 #[expect(clippy::too_many_arguments)]
+// 102/100. A single allocation attempt with rollback; the failure paths must
+// stay beside the state they undo.
+#[expect(
+    clippy::too_many_lines,
+    reason = "allocation + rollback must stay together"
+)]
 pub fn try_alloc_blocks_in_group(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -2683,13 +2708,13 @@ pub fn try_alloc_blocks_in_group(
         // decides overlap for the whole run — O(log R) vs the old per-block
         // O(alloc_count · log R) scan.
         let p = reserved.partition_point(|&r| r < rel_start);
-        if let Some(&r) = reserved.get(p) {
-            if r < alloc_end {
-                return Err(FfsError::Corruption {
-                    block: geo.group_block_to_absolute(group, r).0,
-                    detail: "alloc would overlap reserved metadata block".into(),
-                });
-            }
+        if let Some(&r) = reserved.get(p)
+            && r < alloc_end
+        {
+            return Err(FfsError::Corruption {
+                block: geo.group_block_to_absolute(group, r).0,
+                detail: "alloc would overlap reserved metadata block".into(),
+            });
         }
 
         // Mark blocks as allocated word-at-a-time. The run was found free-
@@ -2884,13 +2909,13 @@ pub fn free_blocks_persist(
         // old per-block O(count · log R) scan.
         let seg_end = segment.rel_start + segment.count;
         let rp = reserved.partition_point(|&r| r < segment.rel_start);
-        if let Some(&r) = reserved.get(rp) {
-            if r < seg_end {
-                return Err(FfsError::Corruption {
-                    block: geo.group_block_to_absolute(segment.group, r).0,
-                    detail: "attempt to free reserved metadata block".into(),
-                });
-            }
+        if let Some(&r) = reserved.get(rp)
+            && r < seg_end
+        {
+            return Err(FfsError::Corruption {
+                block: geo.group_block_to_absolute(segment.group, r).0,
+                detail: "attempt to free reserved metadata block".into(),
+            });
         }
 
         let bitmap_buf = dev.read_block(cx, groups[gidx].block_bitmap_block)?;
@@ -3026,13 +3051,13 @@ pub fn free_blocks_in_group(
     // >= rel_start decides overlap for the whole run — identical to the
     // `free_blocks_persist` segment check.
     let rp = reserved.partition_point(|&r| r < rel_start);
-    if let Some(&r) = reserved.get(rp) {
-        if r < seg_end {
-            return Err(FfsError::Corruption {
-                block: geo.group_block_to_absolute(group, r).0,
-                detail: "attempt to free reserved metadata block".into(),
-            });
-        }
+    if let Some(&r) = reserved.get(rp)
+        && r < seg_end
+    {
+        return Err(FfsError::Corruption {
+            block: geo.group_block_to_absolute(group, r).0,
+            detail: "attempt to free reserved metadata block".into(),
+        });
     }
 
     let bitmap_buf = dev.read_block(cx, stats.block_bitmap_block)?;
@@ -3829,8 +3854,10 @@ pub fn free_inode_persist(
     Ok(())
 }
 
-/// Free inode `ino` — which MUST belong to `group` — operating on that one group's
-/// `&mut GroupStats` under the caller's lock. The per-group INODE-free counterpart
+/// Free inode `ino`, which MUST belong to `group`.
+///
+/// Operates on that one group's `&mut GroupStats` under the caller's lock. The
+/// per-group INODE-free counterpart
 /// to [`try_alloc_inode_in_group_persist_core`], mirroring the single-group
 /// [`free_inode_persist`] statement-for-statement (double-free + reserved checks,
 /// bitmap clear, `inode_search_start` rewind, `free_inodes`/`used_dirs` update,
@@ -4591,7 +4618,7 @@ mod tests {
                 if n == 0 {
                     return false;
                 }
-                while n % base == 0 {
+                while n.is_multiple_of(base) {
                     n /= base;
                 }
                 n == 1

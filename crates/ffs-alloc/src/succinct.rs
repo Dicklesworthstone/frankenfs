@@ -610,14 +610,11 @@ fn popcount_range(bitmap: &[u8], bit_start: u32, count: u32) -> u32 {
 
 fn popcount_full_bytes(bytes: &[u8]) -> u32 {
     let mut total = 0_u32;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-        total += word.count_ones();
+    let (chunks, chunks_rem) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        total += u64::from_le_bytes(*chunk).count_ones();
     }
-    for &byte in chunks.remainder() {
+    for &byte in chunks_rem {
         total += byte.count_ones();
     }
     total
@@ -657,14 +654,11 @@ fn popcount_partial_block(bitmap: &[u8], byte_start: usize, count: u32) -> u32 {
     let remainder = count % 8;
     let mut total = 0_u32;
 
-    let mut chunks = bitmap[byte_start..byte_start + full_bytes].chunks_exact(8);
-    for chunk in &mut chunks {
-        total += u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ])
-        .count_ones();
+    let (chunks, chunks_rem) = bitmap[byte_start..byte_start + full_bytes].as_chunks::<8>();
+    for chunk in chunks {
+        total += u64::from_le_bytes(*chunk).count_ones();
     }
-    for &byte in chunks.remainder() {
+    for &byte in chunks_rem {
         total += byte.count_ones();
     }
 

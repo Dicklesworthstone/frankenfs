@@ -13,12 +13,12 @@ fn bench(c: &mut Criterion) {
     let nbits = 65536u32;
     let mut bm = vec![0xFFu8; (nbits / 8) as usize];
     // free 16 bits at bit 65500..65516
-    for byte in 8187..8189 {
-        bm[byte] = 0;
+    for slot in &mut bm[8187..8189] {
+        *slot = 0;
     }
     let mut g = c.benchmark_group("contiguous_find");
     g.bench_function("mostly_alloc_n8", |b| {
-        b.iter(|| black_box(bitmap_find_contiguous(black_box(&bm), nbits, 8, 0)))
+        b.iter(|| black_box(bitmap_find_contiguous(black_box(&bm), nbits, 8, 0)));
     });
     g.finish();
 }

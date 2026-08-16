@@ -25,7 +25,7 @@ fn mark_range(bitmap: &mut [u8], start: u32, count: u32) {
     }
     let end = start + count;
     let mut idx = start;
-    while idx < end && idx % 8 != 0 {
+    while idx < end && !idx.is_multiple_of(8) {
         set_bit(bitmap, idx);
         idx += 1;
     }
@@ -34,7 +34,7 @@ fn mark_range(bitmap: &mut [u8], start: u32, count: u32) {
     let byte_end = ((full_end / 8) as usize).min(bitmap.len());
     if byte_end > byte_start {
         bitmap[byte_start..byte_end].fill(0xFF);
-        idx = (byte_end as u32) * 8;
+        idx = u32::try_from(byte_end).expect("byte_end derives from a u32 bit index") * 8;
     }
     while idx < end {
         set_bit(bitmap, idx);
@@ -54,16 +54,22 @@ fn bench(c: &mut Criterion) {
         g.bench_function("bitloop", |bch| {
             bch.iter_batched(
                 || vec![0u8; bytes],
-                |mut bm| black_box(mark_bitloop(&mut bm, start, count)),
+                |mut bm| {
+                    mark_bitloop(&mut bm, start, count);
+                    black_box(bm);
+                },
                 BatchSize::SmallInput,
-            )
+            );
         });
         g.bench_function("range", |bch| {
             bch.iter_batched(
                 || vec![0u8; bytes],
-                |mut bm| black_box(mark_range(&mut bm, start, count)),
+                |mut bm| {
+                    mark_range(&mut bm, start, count);
+                    black_box(bm);
+                },
                 BatchSize::SmallInput,
-            )
+            );
         });
         g.finish();
     }
