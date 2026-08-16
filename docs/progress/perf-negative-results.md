@@ -11243,3 +11243,81 @@ because a FUSE mount runs only on the executing machine. Counted mechanism: the 
 allocation count is 1048576 slots against a touched count of 32768 — **32768 probes
 touched vs 1048576 slots reserved** — and both figures are IDENTICAL in the two order
 arms, which is precisely why they cannot differ for the reason I intended.
+
+## 2026-08-16 — NULL on round trips (counted attribution): readdir+stat's steady state is the SAME mechanism as warm stat at 1.0000 capability probes per entry, and the memo sizing changes DISPATCHES while leaving round trips untouched (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+readdir+stat had a ratio and a lever but never the per-entry pass warm stat got. This is
+that pass, run at BOTH slot counts so it also explains what the `6.990007x -> 3.359246x`
+lever actually did.
+
+A 32,768-entry sweep, warmed once then measured, `--runtime-mode managed` so the dispatch
+counters are reachable (`bd-viil0`):
+
+    slots=4096   getxattr round trips in window: 32769  (1.0000 per entry)
+                 mount_dispatch_metrics,getattr_dispatch_count=393,getattr_dispatch_nanos=200448,getxattr_dispatch_count=65539,getxattr_dispatch_nanos=234536323,lookup_dispatch_count=32576,lookup_dispatch_nanos=25829008,readdir_dispatch_count=132,readdir_dispatch_nanos=21773605
+                 requests_total=98643
+    slots=65536  getxattr round trips in window: 32769  (1.0000 per entry)
+                 mount_dispatch_metrics,getattr_dispatch_count=393,getattr_dispatch_nanos=166452,getxattr_dispatch_count=32770,getxattr_dispatch_nanos=147431874,lookup_dispatch_count=32576,lookup_dispatch_nanos=26635751,readdir_dispatch_count=132,readdir_dispatch_nanos=16777527
+                 requests_total=98643
+
+### readdir+stat is warm stat at scale
+
+The opcode census over the measured window contains **exactly one thing**: `32769 fuse
+getxattr from kernel`, i.e. `1.0000` per entry. No GETATTR, no LOOKUP, no STATX crosses
+the boundary in the steady state. The cumulative counters say why: `lookup` dispatches
+`32,576` across BOTH sweeps — about one sweep's worth, so dentries are cached for the
+second — `getattr` is `393` in total, and `readdir` is `132` for 32,768 entries
+(`0.0040`/entry, amortised over multi-entry replies).
+
+**So the steady-state cost of a readdir+stat entry is one `security.capability` GETXATTR
+round trip, which is precisely the mechanism already banked for warm stat.** Two rows
+that looked like different problems are one problem at two scales. The counted work on
+the warm-stat side — depth-independent, filesystem-independent, present/absent-independent,
+privilege-independent, zero for `fstat` — therefore applies here without re-derivation.
+
+### The memo lever changes DISPATCHES, not ROUND TRIPS
+
+`requests_total = 98643` is **identical** at both slot counts, and so is the round-trip
+count `32769`. Sizing the memo did not remove a single kernel request. What it changed is
+whether each probe reaches the format layer:
+
+| | 4096 slots | 65536 slots |
+| --- | --- | --- |
+| getxattr round trips (steady sweep) | `32,769` | `32,769` |
+| getxattr DISPATCHES (cumulative, 2 sweeps) | `65,539` | `32,770` |
+| implied steady-sweep dispatches | ~`32,768` | ~`1` |
+| getxattr dispatch time (cumulative) | `234.5 ms` | `147.4 ms` |
+
+At 4096 slots a 32,768-entry directory self-evicts, so **every** probe misses on **every**
+sweep. At 65,536 it fits, so the first sweep fills the table and every later sweep is
+answered from memory. That is the whole of the `2.08x`: the same requests, answered
+without a descent.
+
+### What is left inside the 3.36x, and an honest gap
+
+With the table sized to fit, the steady-state sweep dispatches ~1 getxattr, ~0 lookups
+and ~0 getattrs. The daemon's filesystem work is essentially gone, and what remains is
+one FUSE round trip per entry — the same transport floor warm stat is up against.
+
+**The dispatch counters do not fully account for the 2.08x, and I am not going to pretend
+they do.** The measured getxattr dispatch saving is `87.1 ms` across two sweeps, ~`43.5 ms`
+per sweep, against sweeps of ~`768-892 ms` here — around `12%`, not `108%`. Either the
+dispatch counter times only the innermost call and misses queueing and request handling
+around it, or the end-to-end effect includes second-order costs (cache pressure from
+re-descending on every probe) that no per-op counter captures. Which of those it is has
+not been measured.
+
+**This script's wall times must NOT be read as a check on the comparator.** They came out
+`768 ms` at 4096 and `892 ms` at 65536 — the wrong direction — because this is a single
+unpinned single-threaded Python sweep on a managed-runtime mount on a contended host,
+where the comparator uses 8 client threads, pinned CPUs, min-of-3 repeats over 12 pairs
+and a within-window crossover. The counts here are exact and reproducible; the walls are
+not an instrument and are reported only so nobody quotes them.
+
+Harness `scripts`-local `readdir_attr.sh`; candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, run locally
+because a FUSE mount runs only on the executing machine. Counted mechanism: **32769
+probes vs 32769 probes** across the two slot counts, with the dispatch count moving
+`65539 -> 32770` underneath an unchanged round-trip count.
