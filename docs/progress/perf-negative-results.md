@@ -11947,3 +11947,73 @@ Provenance: candidate
 cpu 8 (observed), client to cpus 16-23. Read-write mount, managed runtime. **No build was
 started**: `df -h /data` was 61G and the project already had two builds in flight, which
 is the cap.
+
+## 2026-08-16 — COUNTED, attribution still BLOCKED: 63.6% of a create+delete operation's FUSE crossings are invisible to every counter the shipping ELF has (bd-i353e, bd-btrfs-create-delete-storm, AzureBay)
+
+The previous entry established that a create+delete operation costs `11.003` FUSE round
+trips against `1.000` for a warm stat. This decomposes those eleven as far as the current
+instrument allows — every counter the shipping ELF exposes, rather than a guess at the
+composition.
+
+Same harness, same pinning, K=1 vs K=5 differencing, 2,000 ops/sweep:
+
+    K1=[22010 6004 4001 2002 2001 0]   K5=[110034 30012 20001 10008 10001 0]
+
+    requests_total       11.003 per op
+    metadata_requests     3.001 per op
+    getattr_disp          2.000 per op
+    getxattr_disp         1.001 per op
+    lookup_disp           1.000 per op
+    readdir_disp          0.000 per op
+    --
+    dispatched read-metadata      4.001 per op
+    UNACCOUNTED by any counter    7.002 per op   (63.6% of crossings)
+
+Every figure lands on an integer per operation, so these are exact costs rather than
+estimates.
+
+### The gap, now with a number on it
+
+**`7.002` of the eleven crossings — 63.6% — are invisible to every counter this ELF
+has.** They are the creates, unlinks, opens, flushes, releases and fsyncs: precisely the
+opcodes that fell through `record_dispatch_duration`'s `_ => {}` arm until this turn.
+
+That is the quantified version of the refusal banked earlier today. When the create/delete
+attribution reported a daemon share of `0.90%`, the objection was that it was a lower
+bound because the mutating work was uncounted. **The bound is now measured: nearly
+two-thirds of the boundary traffic was outside the instrument entirely**, so `0.90%` was
+not merely conservative, it was answering a question about 36.4% of the workload.
+
+One incidental detail the numbers settle: `metadata_requests` is `3.001` while `getattr`
+DISPATCHES are `2.000`, so exactly one metadata request per operation is answered without
+reaching the format layer. That is the read-side caching working on the write path, and it
+is consistent with the `2 getattr + 1 lookup + 1 getxattr` incidental traffic measured
+from the comparator.
+
+### What resolves it, and what will still not
+
+The mutation dispatch counters landed this turn (`3145d182`) and will attribute the
+`7.002`. They need one rebuild and a free build slot; the project had both slots occupied
+this turn and `df -h /data` sat at exactly `60G`, so no build was started.
+
+Even then the result will be a **lower bound on daemon share**, because `bd-4zokj`
+separately measured `59.2%`-`98.8%` of daemon CPU sitting outside dispatch for opcodes
+that ARE counted. Two independent blind spots stack on this row: opcodes with no counter,
+and time outside the counted region. The first is fixed and unmeasured; the second is
+measured and unfixed.
+
+### Not claimed
+
+No ratio, no comparator run, and this remains a **strict lower bound on the comparator's
+workload**: its durability contract is `create_fsyncdir_delete_fsyncdir`, a directory
+fsync per operation, while this harness fsyncs once per sweep. The banked `2.358280x` must
+not be decomposed with these figures. The 63.6% uncounted fraction is if anything an
+UNDERSTATEMENT for the comparator's workload, since the fsyncs it adds are themselves
+uncounted opcodes.
+
+Counted mechanism: **88024 requests over four sweeps vs 32008 dispatched read-metadata
+requests over the same four**, both exact multiples of the operation count. Provenance:
+`executing_elf_sha256 = 672ccf093608b1cb8734c68043f3a93fb62e64aeed450033b784309df6f8c8d1`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, daemon pinned to
+cpu 8 (observed), client to cpus 16-23, read-write managed mount. **No build started**:
+`df -h /data` was `60G`, at the budget threshold.
