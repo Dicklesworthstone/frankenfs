@@ -13369,3 +13369,83 @@ and `fuse_median_wall_ns` 214,816,000 ns.
 Counted mechanism: **64 of 64 cores within 3.1 MHz of each other at loadavg 63.8**, against a
 1429-4287 MHz range at loadavg 26.9 — the count that shows the wide spread is idleness, not
 inter-core inequality under load.
+
+## 2026-08-16 — ARM PLACEMENT AUDIT: no run ever placed its 8 client threads on 8 distinct physical cores; every banked row has SMT-sibling contention inside the client set (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Two projects reported broken arm placement, so I audited my own rather than assuming. Topology
+confirmed from sysfs first: this is a 32-core/64-thread box where cpu `N` and cpu `N+32` are
+SMT siblings (`cpu24 -> 24,56`; `cpu26 -> 26,58`).
+
+### What the arms actually ran on
+
+**The four arms share one client CPU set, and that is correct.** `observed_worker_cpus_by_arm`
+is identical for `kernel_a`, `kernel_b`, `fuse_a`, `fuse_b` in every run. The schedule is a
+sequential Latin square, so only one arm is timed at a time; the same client threads run
+against the kernel mount and then the FUSE mount. Sharing is the design, not a defect, and the
+arms do NOT run concurrently on the same cores.
+
+**What IS a defect: the 8 client threads never occupied 8 distinct physical cores.**
+
+    ratio      threads  distinct physical cores
+    3.359246      8            7
+    3.438698      8            4     <- 8 threads on FOUR cores
+    3.702690      8            7
+    6.990007      8            7
+    7.036174      8            7
+    7.316939      8            7
+    7.453004      8            6
+    7.531731      8            7
+    7.617279      8            6
+    8.065190      8            7
+    8.110590      8            7
+    8.170852      8            7
+    8.278490      8            7
+
+Thirteen clean-null runs, and **zero** achieved 8-on-8. Every row therefore carries at least
+one pair of client threads sharing a physical core through its SMT siblings — two threads
+splitting one core's execution resources while six others each get their own. The worst case
+put eight threads on four cores.
+
+The mechanism is visible in the selection: placement ranks CPUs by how quiet they are and
+takes the best eight within one LLC domain. Nothing requires those eight to be on distinct
+cores, so whenever both siblings of a core are quiet, both get chosen — and a quiet host makes
+that MORE likely, not less.
+
+### Does it explain the dispersion? Not established, and I am not going to over-read it
+
+    4096-slot runs on 6 cores: n=2, ratios 7.453, 7.617   (both in the low group)
+    4096-slot runs on 7 cores: n=8, ratios 6.990 .. 8.278 (spans the entire range)
+
+Both 6-core runs land low, which is the direction the mechanism predicts: SMT sharing slows
+the client, the client is a larger FRACTION of the fast kernel arm (27.8 ms) than of the slow
+FUSE arm (214.8 ms), so it inflates the denominator more than the numerator and DEPRESSES the
+ratio. But n=2, and the 7-core runs span the whole `6.99-8.28` range by themselves, so core
+count cannot be the sole cause. I have killed three two-point trends today; this is not going
+to be a fourth.
+
+### What is established, and it is enough to act on
+
+Every banked row of this campaign's worst workload was measured with an uncontrolled
+client-placement asymmetry that varied run to run (4, 6 or 7 cores for the same 8 threads) and
+was never recorded. That is a real instrument defect, found by audit rather than by blaming
+the host, and it is the correct answer to the cross-project question: **my arms did not share
+a physical core with each other, but my client THREADS shared cores with themselves, in every
+run.**
+
+The fix is to require distinct physical cores when selecting client CPUs — the same discipline
+already applied to the FUSE daemon, which gets `fuse_cpu_isolation=private_physical_core`.
+The client never got that treatment.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`
+(in-process self-report), `isa=x86-64-v3`, `candidate_identity verdict=pass`,
+`RCH_WORKER=none`, `hostname=thinkstation1`. Observed loadavg `19.1`; observed core spread
+`1429-4018 MHz` (2.81x all-core, which per the previous entry reflects parked idle cores
+rather than inter-arm inequality). Placement read from `client_affinity_cpus` and
+`observed_worker_cpus_by_arm` in 13 preserved reports. **No ratio is quoted or claimed** — the
+runs referred to are banked separately, each a bootstrap median with a bootstrap median CI
+from 20000 resamples, e.g. bootstrap median `8.278490x` with bootstrap median CI
+`[8.242402, 8.323421]`, absolute arm medians `kernel_median_wall_ns` 27,772,000 ns and
+`fuse_median_wall_ns` 214,816,000 ns.
+
+Counted mechanism: **13 of 13 clean-null runs placed 8 client threads on fewer than 8 distinct
+physical cores** — 7 cores in ten runs, 6 in two, 4 in one.
