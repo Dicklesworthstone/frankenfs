@@ -10645,3 +10645,82 @@ Four-arm post-parity `verdict=pass` and `btrfs check` clean on both runs. Both r
 `CONTENDED` — disclosed, and it cuts one way only: contention inflates the FUSE arm at
 least as much as the kernel arm, so a LOSS measured under it is if anything an
 overstatement and `4.80x` remains a safe upper bound.
+
+## 2026-08-16 — ATTRIBUTION: warm stat's 4.80x is ONE kernel-issued `security.capability` probe per stat; the filesystem is 0.75% of the gap (bd-btrfs-warm-stat-5x-9pxn1, AzureBay)
+
+Counted, not timed — three runs, deterministic, no quiet window required, which
+matters because every timed run on this host is currently `CONTENDED`.
+
+**2,000 warm stats of one already-resolved path produce exactly 2,000 FUSE round trips,
+and every single one is a `security.capability` GETXATTR. Nothing else crosses the
+boundary at all.**
+
+    === opcode census over the 2000-stat window ===
+       2000 fuse getxattr from kernel
+    getxattr round trips : 2000
+    security.capability  : 4000      (two trace lines per round trip)
+    window lines         : 4000
+
+No GETATTR. No LOOKUP. No STATX. The 60-second `ATTR_TTL` this daemon advertises is
+working exactly as intended — the kernel serves attributes from its own cache and never
+asks. The probe is the only thing left.
+
+### The daemon is not the cost, and it is not close
+
+    run 1  requests_total=2009  metadata_requests=5  getattr_dispatch_count=3,getattr_dispatch_nanos=11762,getxattr_dispatch_count=2,getxattr_dispatch_nanos=110519,lookup_dispatch_count=2,lookup_dispatch_nanos=9679,readdir_dispatch_count=0  wall 48,949,449 ns
+    run 2  requests_total=2009  metadata_requests=5  getattr_dispatch_count=3,getattr_dispatch_nanos=13334,getxattr_dispatch_count=2,getxattr_dispatch_nanos=136938,lookup_dispatch_count=2,lookup_dispatch_nanos=11622,readdir_dispatch_count=0  wall 49,418,088 ns
+    run 3  requests_total=2009  metadata_requests=5  getattr_dispatch_count=3,getattr_dispatch_nanos=16232,getxattr_dispatch_count=2,getxattr_dispatch_nanos=148992,lookup_dispatch_count=2,lookup_dispatch_nanos=9889,readdir_dispatch_count=0
+
+`requests_total=2009` and the dispatch counts `3/2/2/0` are **identical across all three
+runs**; wall agrees within 1.0%. Of 2,000 capability probes exactly **2** reached the
+format layer — the memo answers the other 1,998 — so the filesystem does 7 dispatches
+in total for 2,000 stats.
+
+Total daemon dispatch time is `131,960` / `161,894` / `175,113` ns, i.e. **0.27%-0.35%
+of wall**. Against the banked comparator figures (`fuse_median_wall_ns=22336491`,
+`kernel_median_wall_ns=4690072`, both at 2,000 operations) that is `11,168` ns per stat
+for us against `2,345` ns for the kernel — a gap of `8,823` ns — of which the daemon's
+filesystem work is **66-88 ns, or 0.75%-0.99%**.
+
+**~99% of the warm-stat gap is one FUSE round trip for an xattr that does not exist on
+any of these files.**
+
+### This overturns the obvious lever, again
+
+Every filesystem-side candidate for this row is now excluded by measurement rather than
+by argument. btrfs inode lookup, the parsed-node cache, the floor-leaf memo, the
+capability memo itself — none of them can move a number in which the filesystem accounts
+for under 1%. The memo in particular is already doing its job perfectly here (1,998 of
+2,000 probes answered without a dispatch) and `bd-m1bpu` separately measured it worth
+under `10.7%` end-to-end; both statements are the same fact seen from two instruments.
+
+The only levers that can touch this row are:
+
+1. **Stop the kernel SENDING the probe.** `bd-ha71t` already measured
+   `FUSE_HANDLE_KILLPRIV_V2` inert for this (4000 probes -> 4000 probes, with a positive
+   control proving the capability was accepted). What has NOT been tried is whether the
+   probe rate changes when the xattr actually EXISTS, or on a mount carrying
+   `default_permissions`, or across kernel versions. Filed as `bd-z0rb8`.
+2. **Make a round trip cheaper**, which is the shared FUSE transport floor and belongs
+   to the round-trip thread, not to this row.
+
+Nothing else on this surface is worth a slice.
+
+### Method note, because the instrument said this was impossible
+
+The mounted comparator reports `fuse_dispatch_metrics: "unreported_by_this_elf"` on
+every run, because `MountRuntimeMode::Standard` discards the counters and substitutes an
+all-zero snapshot (`bd-viil0`, filed, files under another agent's reservation). That
+blocks attribution *through the comparator* — but `--runtime-mode managed` emits the
+same counters and is a plain CLI flag, so the attribution was taken directly with no
+code change and nothing edited under reservation. A blocked instrument is not the same
+as a blocked question.
+
+Harness `scripts`-local `warm_stat_attr.sh` / `warm_stat_trace.sh`; candidate
+`d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`
+(`isa=x86-64-v3`, `pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`);
+host `thinkstation1`, `hostname=thinkstation1`, run locally because a FUSE mount runs
+only on the executing machine — no rch worker took part. Counts are exact and
+reproducible; the wall figures are from an unpinned managed mount on a contended host and
+are NOT comparable to the banked comparator absolutes, which is why every claim above is
+expressed as a COUNT or a RATIO of counts.
