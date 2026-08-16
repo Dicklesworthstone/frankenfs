@@ -366,7 +366,7 @@ impl<'a> Scrubber<'a> {
 
         let mut next_block = sub_start;
         while next_block < sub_end {
-            if (next_block - range_start) % 256 == 0 {
+            if (next_block - range_start).is_multiple_of(256) {
                 cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             }
 
@@ -494,8 +494,8 @@ pub(crate) fn is_all_zero(data: &[u8]) -> bool {
     // is ~2.1x on the full-scan (all-zero / free block) case with NO regression
     // on the common non-zero data block that exits at word 0 — both are ~1.1 ns
     // (bench `zero_scan_width`). Identical result to the per-word scan.
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
+    let (chunks, chunks_remainder) = data.as_chunks::<32>();
+    for block in chunks {
         let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
@@ -504,9 +504,11 @@ pub(crate) fn is_all_zero(data: &[u8]) -> bool {
             return false;
         }
     }
-    let mut tail = chunks.remainder().chunks_exact(8);
-    tail.all(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&b| b == 0)
+    let (tail_words, tail_bytes) = chunks_remainder.as_chunks::<8>();
+    tail_words
+        .iter()
+        .all(|chunk| u64::from_ne_bytes(*chunk) == 0)
+        && tail_bytes.iter().all(|&b| b == 0)
 }
 
 /// Validator for the canonical ext4 primary superblock.

@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(zero_group.num_groups(), 0);
         assert_eq!(zero_group.local_parity_count(), 0);
         assert_eq!(zero_group.total_blocks(), 14);
-        assert_eq!(zero_group.overhead_fraction(), 2.0 / 12.0);
+        assert!((zero_group.overhead_fraction() - 2.0 / 12.0).abs() < f64::EPSILON);
 
         let zero_data = LrcConfig {
             data_blocks: 0,
@@ -806,7 +806,7 @@ mod tests {
         assert_eq!(zero_data.num_groups(), 0);
         assert_eq!(zero_data.local_parity_count(), 0);
         assert_eq!(zero_data.total_blocks(), 2);
-        assert_eq!(zero_data.overhead_fraction(), 0.0);
+        assert!(zero_data.overhead_fraction().abs() < f64::EPSILON);
 
         let saturated = LrcConfig {
             data_blocks: u32::MAX,
@@ -816,7 +816,7 @@ mod tests {
         assert_eq!(saturated.num_groups(), u32::MAX);
         assert_eq!(saturated.local_parity_count(), u32::MAX);
         assert_eq!(saturated.total_blocks(), u32::MAX);
-        assert_eq!(saturated.overhead_fraction(), 1.0);
+        assert!((saturated.overhead_fraction() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

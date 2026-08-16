@@ -97,8 +97,7 @@ impl RepairGroupLayout {
     pub fn group_end_exclusive(self) -> u64 {
         self.group_start
             .0
-            .checked_add(u64::from(self.blocks_per_group))
-            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(self.blocks_per_group))
     }
 
     #[must_use]
@@ -300,7 +299,7 @@ impl<'a> RepairGroupStorage<'a> {
     }
 
     /// The repair-symbol block numbers for `desc`, in ascending order.
-    fn repair_block_numbers(&self, desc: &RepairGroupDescExt) -> Vec<BlockNumber> {
+    fn repair_block_numbers(desc: &RepairGroupDescExt) -> Vec<BlockNumber> {
         (0..desc.repair_block_count)
             .map(|i| BlockNumber(desc.repair_start_block.0 + u64::from(i)))
             .collect()
@@ -350,7 +349,7 @@ impl<'a> RepairGroupStorage<'a> {
         // latencies overlap up to pool size), then parse SERIALLY in block order
         // so the esi threading, empty-tail ordering, and first-error-in-block-
         // order are byte-identical to the old loop (I/O-overlap, bd-g5v1s family).
-        let blocks = self.repair_block_numbers(desc);
+        let blocks = Self::repair_block_numbers(desc);
         let reads = Self::read_blocks_parallel(self.device, cx, &blocks);
 
         let mut out = Vec::new();
@@ -396,7 +395,7 @@ impl<'a> RepairGroupStorage<'a> {
 
         // Independent reads → parallel I/O overlap; serial parse in block order
         // preserves ESI assignment, zero-skip, and first-error order (bd-g5v1s).
-        let blocks = self.repair_block_numbers(desc);
+        let blocks = Self::repair_block_numbers(desc);
         let reads = Self::read_blocks_parallel(self.device, cx, &blocks);
 
         let mut out = Vec::new();
