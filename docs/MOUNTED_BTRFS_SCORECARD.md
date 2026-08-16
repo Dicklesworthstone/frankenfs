@@ -114,6 +114,20 @@ runs are recorded above precisely so this cannot recur for them.
   26.157 ms / 217.782 ms for `8.322812x`. Note which arm moved: ours improved `1.4%` while
   the incumbent slowed `6.2%`, so most of the `8.32x → 7.75x` change is the kernel's, not
   ours, and none of it is attributable to the fixture alone (`bd-pb85e`).
+  **⚡ 2026-08-16 — THIS ROW MOVES (AzureBay).** Sizing the capability memo to the
+  directory takes it from **`6.990007x`** `[6.988474, 7.026868]` to **`3.359246x`**
+  `[3.314229, 3.399607]`, **both `admitted=true` with both A/A nulls clear**, one ELF
+  (`d4278471…`), one fixture, one session, differing only in
+  `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (4096 → 65536). Our own arm goes
+  `217,470,654 ns` → `103,799,776 ns`; the FrankenFS absolutes replicate to `0.03%` and
+  `0.84%`, giving `2.078x`–`2.095x`, which independently reproduces the within-window
+  candidate crossover's `2.078x` (`bd-m1bpu`). Three estimators, three decimals.
+  ⛔ **NOT a shipping recommendation and NOT a new default.** The cliff MOVES rather than
+  disappears: at 100,000 entries the same 65,536-slot table is itself oversubscribed and
+  the win falls to `1.30x`. 65,536 slots is 512 KiB per mount against 32 KiB today, so a
+  larger default still owes bd-5vis3's bar — peak resident memory, plus a non-fitting
+  workload measured beside a fitting one. What is established is that the lever is real
+  and large at a realistic directory size (`bd-34hzz`).
 - **Warm stat: we lose.** About `4.8` times slower, re-measured 2026-08-08 as an admitted
   pair on a current ELF (`4.769886x` / `4.802719x`, spread `0.69%`); the banked
   `4.977803x` / `5.036433x` is superseded. The ext4 twin, measured in the SAME invocations,
