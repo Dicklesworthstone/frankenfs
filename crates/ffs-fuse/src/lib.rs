@@ -147,6 +147,57 @@ const READDIRPLUS_CAPABILITIES: u64 =
 /// so the A/B can be measured on one ELF rather than argued.
 const READDIRPLUS_CAPABILITIES_FORCED: u64 = fuse_consts::FUSE_DO_READDIRPLUS;
 
+/// Let the kernel CACHE POSIX ACLs instead of asking us per operation (bd-biwl4).
+///
+/// Aimed at the campaign's worst measured vs-incumbent ratio: btrfs readdir+stat
+/// at `7.728937x`. That row pays ~7.00 FUSE requests per entry, of which
+/// `getxattr` is `4.00` — the single largest component, and larger than the
+/// lookup+getattr pair readdirplus exists to fold away. The bounded xattr census
+/// names what is probed: `security.capability`, `security.selinux`,
+/// `system.posix_acl_access`, `system.posix_acl_default`.
+///
+/// `security.capability` is closed: it is kernel-originated, caller-independent,
+/// and no 6.17 INIT flag suppresses it (bd-z0rb8, closed negative). The two
+/// `system.posix_acl_*` probes are NOT closed, and they are the ones this flag
+/// addresses. Without `FUSE_POSIX_ACL` the kernel sets no `SB_POSIXACL`, holds no
+/// ACL cache for our inodes, and forwards every ACL query as a fresh round trip.
+/// With it, the kernel resolves ACLs itself and caches the answer — including the
+/// NEGATIVE answer, which is the common case here since our images carry no ACLs.
+/// That is the mechanism the capability memo could never reach: a daemon-side memo
+/// still costs a boundary crossing (bd-2pq73 cut format-level work 40x with
+/// `requests_total` unchanged), whereas this removes the crossing.
+///
+/// ⚠️ DEFAULT OFF, and for a correctness reason rather than caution. This flag is
+/// a CLAIM: it tells the kernel the filesystem supports POSIX ACLs, after which
+/// the kernel performs its own ACL-based permission checks from its cache instead
+/// of deferring to us. If our `getxattr` does not report ACLs faithfully, access
+/// decisions change — that is a semantic change, not a speed change, so it must
+/// not ride in as a default on the strength of a latency argument. It is a knob so
+/// the A/B runs on ONE ELF (ISA and PGO cancel, bd-b9dug class C), and so the
+/// permission-semantics question can be gated separately from the round-trip one.
+const POSIX_ACL_CAPABILITY: u64 = fuse_consts::FUSE_POSIX_ACL;
+
+/// Resolve the POSIX-ACL capability from `FFS_FUSE_POSIX_ACL`.
+///
+/// `1`, `true` or `on` negotiates `FUSE_POSIX_ACL`; anything else, including
+/// unset, keeps today's behaviour of not claiming ACL support. Opt-IN, the
+/// opposite polarity to the readdirplus knob, because enabling it changes
+/// permission semantics rather than only performance.
+fn posix_acl_capability_from_env() -> u64 {
+    posix_acl_capability_from_value(std::env::var("FFS_FUSE_POSIX_ACL").ok().as_deref())
+}
+
+/// Pure half of [`posix_acl_capability_from_env`], split out so the parsing is
+/// testable without mutating process-global environment state — which races
+/// under the parallel test harness and is `unsafe` from edition 2024 onward.
+fn posix_acl_capability_from_value(value: Option<&str>) -> u64 {
+    let enabled = value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    });
+    if enabled { POSIX_ACL_CAPABILITY } else { 0 }
+}
+
 /// Resolve the readdirplus capability set from `FFS_FUSE_READDIRPLUS_AUTO`.
 ///
 /// `0`, `false` or `off` drops `FUSE_READDIRPLUS_AUTO`; anything else, including
@@ -2823,6 +2874,22 @@ impl Filesystem for FrankenFuse {
             ),
         }
 
+        // bd-biwl4: opt-in only. `add_capabilities(0)` is a no-op, so when the knob
+        // is unset this call cannot change negotiation — the default path is
+        // byte-identical to before. Logged at info when it IS on, because it
+        // changes permission semantics and must be visible in a run's own evidence
+        // rather than inferred from the environment the run was launched with.
+        let posix_acl = posix_acl_capability_from_env();
+        if posix_acl != 0 {
+            match config.add_capabilities(posix_acl) {
+                Ok(()) => info!(
+                    "FUSE_POSIX_ACL negotiated (FFS_FUSE_POSIX_ACL): the kernel now \
+                     caches and enforces POSIX ACLs for this mount"
+                ),
+                Err(missing) => debug!(missing, "kernel declined FUSE_POSIX_ACL"),
+            }
+        }
+
         if self.inner.parallel_dirops {
             match config.add_capabilities(PARALLEL_DIROPS_CAPABILITY) {
                 Ok(()) => debug!("FUSE parallel directory operations enabled"),
@@ -4934,6 +5001,53 @@ mod tests {
     /// the rest of the negotiated set — and must default to today's behaviour so
     /// an unset environment is byte-identical to before the knob existed
     /// (bd-4ypbv).
+    #[test]
+    /// bd-biwl4: the POSIX-ACL knob must be opt-IN and must be inert when unset.
+    ///
+    /// This flag is aimed at the campaign's worst vs-incumbent ratio (btrfs
+    /// readdir+stat `7.728937x`, whose largest component is `4.00` getxattr per
+    /// entry), but it is also a semantic claim: negotiating it tells the kernel to
+    /// cache and ENFORCE POSIX ACLs itself. So the property pinned here is not that
+    /// it is fast — it is that an unset or unrecognised value negotiates NOTHING,
+    /// leaving the default mount byte-identical to before the knob existed.
+    #[test]
+    fn posix_acl_knob_is_opt_in_and_inert_when_unset_bd_biwl4() {
+        assert_eq!(
+            posix_acl_capability_from_value(None),
+            0,
+            "unset must negotiate no capability at all: this flag changes permission \
+             semantics, so it must never arrive by default"
+        );
+        for off in ["0", "false", "off", "", "  ", "yes", "2", "enabled", "ON!"] {
+            assert_eq!(
+                posix_acl_capability_from_value(Some(off)),
+                0,
+                "{off:?} must not enable FUSE_POSIX_ACL; only an explicit \
+                 1/true/on may, so a typo fails CLOSED rather than silently \
+                 changing access decisions"
+            );
+        }
+        for on in ["1", "true", "on", "TRUE", "On", " 1 ", "\ttrue\n"] {
+            assert_eq!(
+                posix_acl_capability_from_value(Some(on)),
+                fuse_consts::FUSE_POSIX_ACL,
+                "{on:?} must negotiate exactly FUSE_POSIX_ACL"
+            );
+        }
+        assert_eq!(
+            POSIX_ACL_CAPABILITY,
+            1 << 20,
+            "FUSE_POSIX_ACL is bit 20 in the 6.17 uapi (fuse.h:467); if this moves, \
+             the knob is negotiating some other capability entirely"
+        );
+        assert_eq!(
+            POSIX_ACL_CAPABILITY & READDIRPLUS_CAPABILITIES,
+            0,
+            "the ACL bit must not overlap the readdirplus bits, or one knob would \
+             silently toggle the other"
+        );
+    }
+
     #[test]
     fn readdirplus_auto_knob_only_drops_the_auto_bit_bd_4ypbv() {
         assert_eq!(
