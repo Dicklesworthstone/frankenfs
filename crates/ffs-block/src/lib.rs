@@ -884,7 +884,30 @@ impl ByteDevice for FileByteDevice {
             cx_checkpoint(cx)?;
             return Ok(());
         }
-        self.file.sync_all()?;
+        // `sync_data` (fdatasync), NOT `sync_all` (fsync): this device CANNOT
+        // extend the backing file, so there is no host-inode metadata the data
+        // depends on.
+        //
+        // `fsync` persists the file's data AND its inode metadata — size, mtime,
+        // ctime. `fdatasync` persists the data plus only the metadata required to
+        // READ that data back, which is the file size. The difference matters
+        // because on a journalling host filesystem the extra inode update is a
+        // separate journal transaction and a second cache flush, and this row is
+        // dominated by exactly that: fsync/journal commit measures 8 x 4 KiB
+        // write+fsync at 200.5 ms against the kernel's 101.5 ms — `1.976308x`,
+        // suspiciously close to paying two flushes where the incumbent pays one.
+        //
+        // WHY IT IS SOUND HERE, which is a property of this device and not a
+        // general claim about fdatasync. `write_at` bounds every write against
+        // `self.len` and returns `Format("write out of bounds")` past it, and
+        // `self.len` is assigned once at construction and never reassigned. So
+        // the file's SIZE cannot change through this device: the one piece of
+        // metadata `fdatasync` is obliged to persist is already stable, and the
+        // pieces it omits (mtime, ctime) are not required to retrieve the data.
+        // If a future change ever lets this device grow the file, this must go
+        // back to `sync_all` — the test below pins the invariant so that change
+        // fails loudly rather than silently losing a size update.
+        self.file.sync_data()?;
         // Publish at most the pre-sync observation; `fetch_max` keeps a
         // concurrent sync that observed a newer epoch from being regressed.
         self.sync_state
@@ -3877,6 +3900,65 @@ mod tests {
             "expected contiguous-write overflow Format error, got {err:?}"
         );
         assert!(dev.write_sequence().is_empty());
+    }
+
+    /// The invariant that makes `sync` safe to do with `fdatasync`.
+    ///
+    /// `FileByteDevice::sync` calls `sync_data` (fdatasync) rather than
+    /// `sync_all` (fsync) because this device cannot extend its backing file, so
+    /// the only inode metadata `fdatasync` is obliged to persist — the size — is
+    /// already stable. That reasoning is only as good as the bounds check, so
+    /// this pins it directly: a write past `len` must be REFUSED, and the file on
+    /// disk must be unchanged in both content and length afterwards.
+    ///
+    /// If someone later lets this device grow the file, this test fails and
+    /// `sync` must go back to `sync_all` — otherwise a size update could be lost
+    /// on power failure while the data it describes was persisted, which is a
+    /// silent short-read after recovery rather than a visible error.
+    #[test]
+    fn file_byte_device_cannot_extend_its_file_so_fdatasync_suffices() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no-extend.img");
+        std::fs::write(&path, [1_u8, 2, 3, 4]).expect("seed file");
+        let dev = FileByteDevice::open(&path).expect("device");
+
+        // Straddling the end, and wholly past the end.
+        let straddle = dev.write_all_at(&cx, ByteOffset(2), &[9_u8, 9, 9, 9]);
+        assert!(
+            straddle.is_err(),
+            "a write straddling EOF must be refused; if it were allowed the file \
+             would grow and fdatasync could lose the new size"
+        );
+        let past = dev.write_all_at(&cx, ByteOffset(8), &[9_u8]);
+        assert!(past.is_err(), "a write wholly past EOF must be refused");
+
+        // A refused write must not have partially applied, and must not have
+        // extended the file: both halves matter, because fdatasync's sufficiency
+        // rests on the LENGTH being immutable, not merely on the write failing.
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            4,
+            "the backing file must not have grown"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read file"),
+            [1_u8, 2, 3, 4],
+            "a refused out-of-bounds write must not partially apply"
+        );
+
+        // An in-bounds write plus sync still works, so the lever has not broken
+        // the ordinary durability path.
+        dev.write_all_at(&cx, ByteOffset(0), &[7_u8, 7])
+            .expect("in-bounds write");
+        dev.sync(&cx)
+            .expect("fdatasync must still make the data durable");
+        assert_eq!(std::fs::read(&path).expect("read file"), [7_u8, 7, 3, 4]);
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            4,
+            "length is still stable after a successful sync"
+        );
     }
 
     #[test]

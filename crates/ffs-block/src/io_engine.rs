@@ -49,7 +49,16 @@ pub enum IoOp {
         /// Data to write.
         data: Vec<u8>,
     },
-    /// Sync (fdatasync).
+    /// Sync.
+    ///
+    /// NOTE: this is implemented with `sync_all` (fsync), not fdatasync,
+    /// despite what this comment said until 2026-08-16. Corrected rather
+    /// than changed: `FileByteDevice::sync` was moved to `sync_data`
+    /// because that device provably cannot extend its file, and whether
+    /// the same holds for this engine's file has NOT been established.
+    /// Asserting fdatasync semantics in a doc comment while calling fsync
+    /// is how a reader concludes the flush is already cheap and stops
+    /// looking.
     Sync,
 }
 
