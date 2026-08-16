@@ -5311,12 +5311,33 @@ impl WorkerPinning {
     }
 }
 
-fn free_bytes_on_data() -> Result<u64> {
+/// Free bytes on the filesystem that will actually hold this run's artifacts.
+///
+/// Previously hardcoded to `/data`, which made the guard measure a filesystem
+/// the run might never write to: the images, fixture tree and scratch root all
+/// live under `--artifact-root`, and pointing that elsewhere left the abort
+/// floor policing an unrelated device. A free-space guard has to measure the
+/// filesystem it is guarding, or it is simultaneously too strict (refusing a run
+/// whose target has room) and too lax (admitting one whose target does not).
+///
+/// Reported against the artifact root's path so the failure message names the
+/// device the operator must actually free.
+fn free_bytes_for_artifacts(artifact_root: &Path) -> Result<u64> {
+    // The root may not exist yet on a first run; df needs an existing path, so
+    // walk up to the nearest ancestor that does.
+    let mut probe = artifact_root;
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => break,
+        }
+    }
     let output = Command::new("df")
-        .args(["--output=avail", "-B1", "/data"])
+        .args(["--output=avail", "-B1"])
+        .arg(probe)
         .output()
-        .context("run df for /data")?;
-    ensure!(output.status.success(), "df /data failed");
+        .with_context(|| format!("run df for {}", probe.display()))?;
+    ensure!(output.status.success(), "df {} failed", probe.display());
     let stdout = String::from_utf8(output.stdout).context("df output is not UTF-8")?;
     stdout
         .lines()
@@ -6843,14 +6864,15 @@ fn run() -> Result<Option<PathBuf>> {
             .unwrap_or("unavailable"),
     );
 
-    let free_before = free_bytes_on_data()?;
+    let free_before = free_bytes_for_artifacts(&config.artifact_root)?;
     let free_floor = required_free_bytes(&config)?;
     ensure!(
         free_before >= free_floor,
-        "/data has {:.1} GiB free, below the {:.1} GiB abort floor this configuration \
+        "{} has {:.1} GiB free, below the {:.1} GiB abort floor this configuration \
          requires ({} filesystem(s) x {IMAGES_PER_FILESYSTEM} images of \
          {} MiB, plus a {:.1} GiB fixture tree, x{SCRATCH_SAFETY_FACTOR} safety, \
          plus a {:.0} GiB absolute reserve)",
+        config.artifact_root.display(),
         free_before as f64 / 1024.0_f64.powi(3),
         free_floor as f64 / 1024.0_f64.powi(3),
         requested_filesystem_count(config.filesystems),
@@ -7027,7 +7049,7 @@ fn run() -> Result<Option<PathBuf>> {
         }
     );
 
-    let free_after = free_bytes_on_data()?;
+    let free_after = free_bytes_for_artifacts(&config.artifact_root)?;
     // Built as two objects and merged: one `json!` literal carrying every
     // top-level key exceeds the macro's recursion limit.
     let timed_thread_binding_json = json!({

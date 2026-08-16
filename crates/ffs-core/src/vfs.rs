@@ -388,6 +388,48 @@ impl RequestOp {
         | request_op_bit(Self::Write)
         | request_op_bit(Self::RepairWriteback);
 
+    /// Every variant, in declaration order.
+    ///
+    /// Exists so a consumer can iterate the opcode space instead of
+    /// hand-listing it. The length is tied to `COUNT`, so **adding a variant
+    /// without adding it here is a compile error** — which is the entire
+    /// point. bd-i353e was opened because `record_dispatch_duration` dropped
+    /// unlisted opcodes on a bare `_ => {}`; a hand-written test list would
+    /// have reproduced that same defect one level up, going stale the moment
+    /// someone adds an opcode and silently passing anyway.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Getattr,
+        Self::Statfs,
+        Self::Getxattr,
+        Self::Lookup,
+        Self::Listxattr,
+        Self::Flush,
+        Self::Fsync,
+        Self::Fsyncdir,
+        Self::Open,
+        Self::Release,
+        Self::Opendir,
+        Self::Read,
+        Self::Readdir,
+        Self::Readlink,
+        Self::Lseek,
+        Self::Create,
+        Self::Mkdir,
+        Self::Unlink,
+        Self::Rmdir,
+        Self::Rename,
+        Self::Link,
+        Self::Symlink,
+        Self::Fallocate,
+        Self::Setattr,
+        Self::Setxattr,
+        Self::Removexattr,
+        Self::Write,
+        Self::RepairWriteback,
+        Self::IoctlRead,
+        Self::IoctlWrite,
+    ];
+
     /// Dense operation index for hot-path policy tables.
     #[must_use]
     pub const fn as_index(self) -> usize {
@@ -3482,6 +3524,28 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RequestOp::ALL` must be the opcode space exactly once each, in order.
+    ///
+    /// The array's length is already tied to `COUNT`, so an ADDED variant is a
+    /// compile error. This covers the two mistakes the length cannot see: a
+    /// variant listed twice (which keeps the length right while dropping
+    /// another one) and a reordering. Both would make `ALL` claim complete
+    /// coverage while an opcode is missing — the same class of silent gap
+    /// bd-i353e exists to close.
+    #[test]
+    fn request_op_all_is_the_opcode_space_exactly_once_in_order() {
+        for (i, op) in RequestOp::ALL.iter().enumerate() {
+            assert_eq!(
+                op.as_index(),
+                i,
+                "RequestOp::ALL[{i}] is {op:?}, whose dense index is {}; ALL must \
+                 list every variant once in declaration order, or anything \
+                 iterating it silently skips an opcode",
+                op.as_index()
+            );
+        }
+    }
 
     struct DefaultXattrFsOpsFixture;
 

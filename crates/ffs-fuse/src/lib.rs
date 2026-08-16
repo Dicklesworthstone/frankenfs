@@ -96,6 +96,23 @@ pub fn capability_memo_slots() -> usize {
     LastMissingCapabilityXattr::slots_from_env()
 }
 
+/// Whether the range-leaf capability memo backend is selected
+/// (bd-btrfs-readdir-stat-8x-8y7vp).
+///
+/// Same contract as the two knobs above, and for the same reason: the comparator
+/// REFUSES a candidate-vs-candidate run whose two arms self-report identical
+/// knobs, so an A/B of the two backends is inadmissible until this appears on the
+/// mount knob line. Resolved through the function the mount constructor calls, so
+/// it cannot drift from what actually ran.
+#[must_use]
+pub fn capability_memo_bitmap() -> bool {
+    LastMissingCapabilityXattr::bitmap_from_value(
+        std::env::var("FFS_FUSE_CAPABILITY_MEMO_BITMAP")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Pure half of [`count_memoized_requests_from_env`], so the opt-out spelling
 /// is testable without mutating process-global environment from a test thread.
 fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
@@ -1039,12 +1056,38 @@ pub struct AtomicMetrics {
     /// Successful path-based metadata requests (getattr/statx) observed at
     /// the FUSE boundary, including memo-served replies (bd-0c4av).
     pub metadata_requests: CacheLinePadded<AtomicU64>,
+    /// Cumulative time inside the WHOLE FUSE handler, summed over the four
+    /// metadata opcodes, in ns (bd-4zokj).
+    ///
+    /// The `*_dispatch_nanos` counters bracket only `self.inner.ops.<op>(..)`.
+    /// Everything else a request costs — header decode, argument parse, the memo
+    /// and cache lookups that answer WITHOUT dispatching, reply encode — is
+    /// outside them. That blind spot was measured at 59.2% of the daemon's own
+    /// CPU at the shipping memo size and 98.8% once the memo fits, so the
+    /// counters were accounting for a shrinking minority of the work while
+    /// looking like a decomposition.
+    ///
+    /// One aggregate rather than per-opcode: the question this answers is
+    /// "handler minus dispatch", and the four opcodes already have separate
+    /// dispatch counters to subtract against.
+    pub handler_total_nanos: CacheLinePadded<AtomicU64>,
+    /// Number of whole-handler invocations timed into `handler_total_nanos`.
+    pub handler_total_count: CacheLinePadded<AtomicU64>,
     /// Number of MUTATING request-scope dispatches completed by the daemon,
     /// aggregated across create/mkdir/unlink/rmdir/rename/link/symlink/
     /// fallocate/setattr/setxattr/removexattr/write/fsync/fsyncdir (bd-i353e).
     pub mutation_dispatch_count: CacheLinePadded<AtomicU64>,
     /// Cumulative daemon dispatch time for those mutating request scopes, in ns.
     pub mutation_dispatch_nanos: CacheLinePadded<AtomicU64>,
+    /// bd-i353e: every dispatch NOT covered by a named category above.
+    ///
+    /// This exists so the decomposition is forced to reconcile: the named
+    /// categories plus this one must account for every dispatch. Before it,
+    /// Open/Flush/Release/Read and friends fell through a bare `_ => {}` and
+    /// were silently dropped, so `getattr+getxattr+lookup+readdir+mutation`
+    /// could be far below the real dispatch count with nothing to show it.
+    pub other_dispatch_count: CacheLinePadded<AtomicU64>,
+    pub other_dispatch_nanos: CacheLinePadded<AtomicU64>,
     /// Number of `Getattr` request-scope dispatches completed by the daemon.
     pub getattr_dispatch_count: CacheLinePadded<AtomicU64>,
     /// Cumulative daemon dispatch time for `Getattr` request scopes, in ns.
@@ -1096,7 +1139,11 @@ impl AtomicMetrics {
             getattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
+            handler_total_nanos: CacheLinePadded(AtomicU64::new(0)),
+            handler_total_count: CacheLinePadded(AtomicU64::new(0)),
             mutation_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            other_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            other_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             mutation_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             lookup_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
             lookup_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
@@ -1136,6 +1183,19 @@ impl AtomicMetrics {
 
     pub fn record_metadata_request(&self) {
         Self::saturating_add(&self.metadata_requests.0, 1);
+    }
+
+    /// Record one WHOLE-handler duration (bd-4zokj).
+    ///
+    /// Deliberately aggregate and deliberately cheap: two relaxed adds on a
+    /// cache-line-padded pair, on a path that already does several. The point is
+    /// to bound `handler - dispatch`, not to build a profiler.
+    fn record_handler_duration(&self, elapsed: Duration) {
+        Self::saturating_add(
+            &self.handler_total_nanos.0,
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        );
+        Self::saturating_add(&self.handler_total_count.0, 1);
     }
 
     fn record_dispatch_duration(&self, op: RequestOp, elapsed: Duration) {
@@ -1190,7 +1250,16 @@ impl AtomicMetrics {
                 Self::saturating_add(&self.mutation_dispatch_count.0, 1);
                 Self::saturating_add(&self.mutation_dispatch_nanos.0, nanos);
             }
-            _ => {}
+            // bd-i353e: count what the named categories miss instead of dropping
+            // it. A bare `_ => {}` here is what made the earlier attribution a
+            // lower bound presented as an answer: the create/delete census showed
+            // 13.002 crossings per op against at most ~7 counted, and the
+            // arithmetic never closed. Anything landing here is a candidate for
+            // promotion to its own category, but it is no longer invisible.
+            _ => {
+                Self::saturating_add(&self.other_dispatch_count.0, 1);
+                Self::saturating_add(&self.other_dispatch_nanos.0, nanos);
+            }
         }
     }
 
@@ -1211,12 +1280,16 @@ impl AtomicMetrics {
             requests_err: self.requests_err.0.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.0.load(Ordering::Relaxed),
             metadata_requests: self.metadata_requests.0.load(Ordering::Relaxed),
+            handler_total_nanos: self.handler_total_nanos.0.load(Ordering::Relaxed),
+            handler_total_count: self.handler_total_count.0.load(Ordering::Relaxed),
             getattr_dispatch_count: self.getattr_dispatch_count.0.load(Ordering::Relaxed),
             getattr_dispatch_nanos: self.getattr_dispatch_nanos.0.load(Ordering::Relaxed),
             getxattr_dispatch_count: self.getxattr_dispatch_count.0.load(Ordering::Relaxed),
             getxattr_dispatch_nanos: self.getxattr_dispatch_nanos.0.load(Ordering::Relaxed),
             mutation_dispatch_count: self.mutation_dispatch_count.0.load(Ordering::Relaxed),
             mutation_dispatch_nanos: self.mutation_dispatch_nanos.0.load(Ordering::Relaxed),
+            other_dispatch_count: self.other_dispatch_count.0.load(Ordering::Relaxed),
+            other_dispatch_nanos: self.other_dispatch_nanos.0.load(Ordering::Relaxed),
             lookup_dispatch_count: self.lookup_dispatch_count.0.load(Ordering::Relaxed),
             lookup_dispatch_nanos: self.lookup_dispatch_nanos.0.load(Ordering::Relaxed),
             readdir_dispatch_count: self.readdir_dispatch_count.0.load(Ordering::Relaxed),
@@ -1243,10 +1316,23 @@ impl std::fmt::Debug for AtomicMetrics {
             .field("requests_err", &s.requests_err)
             .field("bytes_read", &s.bytes_read)
             .field("metadata_requests", &s.metadata_requests)
+            // This impl is hand-written, so unlike the derived Debug on
+            // MetricsSnapshot it does NOT go red when a counter is added — it
+            // just stops mentioning it. The mutation counters (3145d182) were
+            // missing here for exactly that reason: nothing failed, the dump
+            // simply under-reported. A metrics dump that omits the counters an
+            // attribution rests on is the same defect as a counter that is never
+            // incremented, and harder to notice.
+            .field("handler_total_nanos", &s.handler_total_nanos)
+            .field("handler_total_count", &s.handler_total_count)
             .field("getattr_dispatch_count", &s.getattr_dispatch_count)
             .field("getattr_dispatch_nanos", &s.getattr_dispatch_nanos)
             .field("getxattr_dispatch_count", &s.getxattr_dispatch_count)
             .field("getxattr_dispatch_nanos", &s.getxattr_dispatch_nanos)
+            .field("mutation_dispatch_count", &s.mutation_dispatch_count)
+            .field("mutation_dispatch_nanos", &s.mutation_dispatch_nanos)
+            .field("other_dispatch_count", &s.other_dispatch_count)
+            .field("other_dispatch_nanos", &s.other_dispatch_nanos)
             .field("lookup_dispatch_count", &s.lookup_dispatch_count)
             .field("lookup_dispatch_nanos", &s.lookup_dispatch_nanos)
             .field("readdir_dispatch_count", &s.readdir_dispatch_count)
@@ -1265,6 +1351,12 @@ pub struct MetricsSnapshot {
     pub requests_err: u64,
     pub bytes_read: u64,
     pub metadata_requests: u64,
+    /// Cumulative whole-handler time over the four metadata opcodes, in ns
+    /// (bd-4zokj). Subtract the matching `*_dispatch_nanos` to get the cost
+    /// the dispatch counters cannot see.
+    pub handler_total_nanos: u64,
+    /// Whole-handler invocations timed into `handler_total_nanos`.
+    pub handler_total_count: u64,
     pub getattr_dispatch_count: u64,
     pub getattr_dispatch_nanos: u64,
     pub getxattr_dispatch_count: u64,
@@ -1273,6 +1365,10 @@ pub struct MetricsSnapshot {
     /// across every write-side `RequestOp`; see `record_dispatch_duration`.
     pub mutation_dispatch_count: u64,
     pub mutation_dispatch_nanos: u64,
+    /// Dispatches outside every named category (bd-i353e). Present so the
+    /// categories sum to the total rather than to an unknown fraction of it.
+    pub other_dispatch_count: u64,
+    pub other_dispatch_nanos: u64,
     pub lookup_dispatch_count: u64,
     pub lookup_dispatch_nanos: u64,
     pub readdir_dispatch_count: u64,
@@ -1777,6 +1873,17 @@ struct LastMissingCapabilityXattr {
     /// change during a mount, and the probe path is the hottest metadata path
     /// there is.
     enabled: bool,
+    /// Range-leaf backend, when `FFS_FUSE_CAPABILITY_MEMO_BITMAP` selects it.
+    ///
+    /// A per-store FIELD rather than a build flag, so both arms run from ONE ELF
+    /// and the comparator's `--candidate-b-env` gives a within-window
+    /// candidate-vs-candidate ratio. Two binaries would reintroduce every ISA and
+    /// PGO confound the campaign already paid for once (bd-b9dug).
+    ///
+    /// `Some` replaces the direct-mapped table entirely rather than layering over
+    /// it: running both would make the A/B measure a table PLUS a bitmap, which is
+    /// neither arm.
+    bitmap: Option<CapabilityBitmap>,
 }
 
 impl LastMissingCapabilityXattr {
@@ -1824,7 +1931,13 @@ impl LastMissingCapabilityXattr {
     }
 
     fn contains(&self, ino: InodeNumber) -> bool {
-        self.enabled && ino.0 != 0 && self.slots[self.slot(ino.0)].load(Ordering::Acquire) == ino.0
+        if !self.enabled || ino.0 == 0 {
+            return false;
+        }
+        if let Some(bitmap) = &self.bitmap {
+            return bitmap.contains(ino.0);
+        }
+        self.slots[self.slot(ino.0)].load(Ordering::Acquire) == ino.0
     }
 
     fn remember(&self, ino: InodeNumber) {
@@ -1833,7 +1946,11 @@ impl LastMissingCapabilityXattr {
         // so the OFF arm would measure the memo's cost without its benefit and
         // overstate the lever.
         if self.enabled && ino.0 != 0 {
-            self.slots[self.slot(ino.0)].store(ino.0, Ordering::Release);
+            if let Some(bitmap) = &self.bitmap {
+                bitmap.remember(ino.0);
+            } else {
+                self.slots[self.slot(ino.0)].store(ino.0, Ordering::Release);
+            }
         }
     }
 
@@ -1845,7 +1962,18 @@ impl LastMissingCapabilityXattr {
     /// later probe from being answered with a stale absence. Only the inode's own
     /// slot can hold it, so this cannot disturb any other entry.
     fn forget(&self, ino: InodeNumber) {
-        if ino.0 != 0 {
+        if ino.0 == 0 {
+            return;
+        }
+        // NOT gated on `enabled`: a disabled memo never fills, so there is nothing
+        // to clear, but gating here would make `forget` silently depend on a knob
+        // whose whole purpose is to be flipped between arms. Clearing an empty
+        // structure is free and cannot be wrong.
+        if let Some(bitmap) = &self.bitmap {
+            bitmap.forget(ino.0);
+            return;
+        }
+        {
             let _ = self.slots[self.slot(ino.0)].compare_exchange(
                 ino.0,
                 0,
@@ -1872,7 +2000,31 @@ impl LastMissingCapabilityXattr {
     /// Production constructor: honours `FFS_FUSE_CAPABILITY_MEMO` (bd-2pq73) and
     /// `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (bd-m1bpu).
     fn from_env() -> Self {
-        Self::with_slots(Self::slots_from_env(), Self::enabled_from_env())
+        let mut memo = Self::with_slots(Self::slots_from_env(), Self::enabled_from_env());
+        if Self::bitmap_from_value(
+            std::env::var("FFS_FUSE_CAPABILITY_MEMO_BITMAP")
+                .ok()
+                .as_deref(),
+        ) {
+            memo.bitmap = Some(CapabilityBitmap::new());
+        }
+        memo
+    }
+
+    /// Parse the range-leaf backend knob (bd-btrfs-readdir-stat-8x-8y7vp).
+    ///
+    /// Split into a PURE function over `Option<&str>` so the parsing is testable
+    /// without mutating process-global environment, which is racy under the
+    /// parallel test harness and `unsafe` from edition 2024.
+    ///
+    /// Opt-in polarity, so a typo fails CLOSED onto the shipping direct-mapped
+    /// table rather than silently enabling an unmeasured backend.
+    fn bitmap_from_value(raw: Option<&str>) -> bool {
+        let Some(raw) = raw else {
+            return false;
+        };
+        let trimmed = raw.trim();
+        trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("on")
     }
 
     /// Build a memo with an explicit table size, rounding UP to a power of two so
@@ -1889,7 +2041,143 @@ impl LastMissingCapabilityXattr {
         Self {
             slots: (0..len).map(|_| AtomicU64::new(0)).collect(),
             enabled,
+            bitmap: None,
         }
+    }
+
+    /// Test/bench constructor for the range-leaf arm.
+    #[cfg(test)]
+    fn with_bitmap() -> Self {
+        Self {
+            slots: (0..1).map(|_| AtomicU64::new(0)).collect(),
+            enabled: true,
+            bitmap: Some(CapabilityBitmap::new()),
+        }
+    }
+}
+
+// ── Capability memo, range-leaf backend (bd-btrfs-readdir-stat-8x-8y7vp) ────
+
+/// Inodes covered by one leaf: `2^15` = 32,768.
+const CAPABILITY_LEAF_BITS: u32 = 15;
+/// `u64` words in a leaf's bitmap: 32,768 bits = 512 words = 4 KiB.
+const CAPABILITY_LEAF_WORDS: usize = 1 << (CAPABILITY_LEAF_BITS - 6);
+/// Leaves retained per mount. Bounds the footprint at `64 * 4 KiB` = 256 KiB.
+const CAPABILITY_TOP_SLOTS: usize = 64;
+
+/// One contiguous 32,768-inode range, one bit per inode.
+///
+/// `base` makes the leaf EXACT: a leaf answers only for inodes whose range it
+/// actually covers, so an inode from a different range can never read another
+/// range's bit. That is not a nicety — a false "absent" here would return
+/// `ENODATA` for a file that really does carry `security.capability`, which is a
+/// wrong ANSWER about a privilege-bearing attribute, not a slow one.
+struct CapabilityLeaf {
+    base: u64,
+    bits: [AtomicU64; CAPABILITY_LEAF_WORDS],
+}
+
+/// Capability memo backed by lazily-allocated range leaves.
+///
+/// # Why this exists
+///
+/// The direct-mapped table stores a whole `AtomicU64` PER INODE, so its capacity
+/// is its slot count and any directory larger than that self-evicts. That is the
+/// measured cliff: at 4096 slots a 32,768-entry sweep misses on every probe of
+/// every sweep (65,539 dispatches over two sweeps); at 65,536 slots it fits and
+/// the second sweep dispatches ~1. Sizing the table won the `6.99x -> 3.36x`
+/// improvement but could not ship as a default, because "make it fit" just moves
+/// the cliff to the next directory anyone names.
+///
+/// One bit per inode instead of 64 changes the arithmetic rather than the
+/// constant. A 4 KiB leaf covers 32,768 inodes, so the same 32,768-entry
+/// directory that thrashes 4096 slots (32 KiB) fits in ONE leaf — **8x less
+/// memory for 8x the inodes, with no conflict misses at all**, because dense
+/// inode numbers within a range map to distinct bits rather than colliding on a
+/// shared slot.
+///
+/// # Why leaves are never replaced
+///
+/// A leaf is installed into an empty top slot and then lives until unmount. It is
+/// never swapped out, which is what lets readers hold a `&CapabilityLeaf` with no
+/// epoch scheme, hazard pointers, or reclamation of any kind: a pointer that was
+/// non-null once stays valid and stays the same. Once all `CAPABILITY_TOP_SLOTS`
+/// are occupied, further inode ranges simply are not memoized — they miss and
+/// dispatch, which is CORRECT and merely unaccelerated. Bounding the footprint by
+/// declining new work rather than by evicting live state is the same discipline
+/// `CAPABILITY_MEMO_SLOTS_MAX` was added for (bd-5vis3), without the cliff.
+struct CapabilityBitmap {
+    top: Box<[std::sync::OnceLock<Box<CapabilityLeaf>>]>,
+}
+
+impl CapabilityBitmap {
+    fn new() -> Self {
+        Self {
+            top: (0..CAPABILITY_TOP_SLOTS)
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+        }
+    }
+
+    /// Range key and top-slot index for an inode.
+    fn locate(ino: u64) -> (u64, usize) {
+        let base = ino >> CAPABILITY_LEAF_BITS;
+        // Direct-mapped on the RANGE, not the inode. Two ranges may contend for a
+        // top slot; `base` then makes the loser a miss rather than a wrong hit.
+        (base, (base as usize) & (CAPABILITY_TOP_SLOTS - 1))
+    }
+
+    /// Borrow the leaf covering `ino`, if one is installed AND covers it.
+    fn leaf(&self, ino: u64) -> Option<&CapabilityLeaf> {
+        let (base, idx) = Self::locate(ino);
+        let leaf = self.top[idx].get()?;
+        (leaf.base == base).then_some(&**leaf)
+    }
+
+    fn bit_position(ino: u64) -> (usize, u64) {
+        let within = (ino & ((1 << CAPABILITY_LEAF_BITS) - 1)) as usize;
+        (within / 64, 1u64 << (within % 64))
+    }
+
+    fn contains(&self, ino: u64) -> bool {
+        let Some(leaf) = self.leaf(ino) else {
+            return false;
+        };
+        let (word, mask) = Self::bit_position(ino);
+        leaf.bits[word].load(Ordering::Acquire) & mask != 0
+    }
+
+    fn remember(&self, ino: u64) {
+        let (base, idx) = Self::locate(ino);
+        // `get_or_init` gives exactly the semantics this design needs — installed
+        // once, never replaced, borrowable for as long as the map lives — with the
+        // race, the losing allocation and the reclamation all handled by the
+        // standard library. The earlier AtomicPtr form expressed the same
+        // invariants in `unsafe`, which this crate forbids outright; that lint is
+        // right, because the invariant "never replaced" is what made the raw
+        // pointer sound and nothing in the type system was enforcing it.
+        let leaf = self.top[idx].get_or_init(|| {
+            Box::new(CapabilityLeaf {
+                base,
+                bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            })
+        });
+        if leaf.base != base {
+            // Another range owns this top slot. Decline rather than evict: the
+            // footprint stays bounded and no live leaf is torn out from under a
+            // reader. This inode is simply not memoized.
+            return;
+        }
+        let (word, mask) = Self::bit_position(ino);
+        leaf.bits[word].fetch_or(mask, Ordering::AcqRel);
+    }
+
+    fn forget(&self, ino: u64) {
+        let Some(leaf) = self.leaf(ino) else {
+            return;
+        };
+        let (word, mask) = Self::bit_position(ino);
+        leaf.bits[word].fetch_and(!mask, Ordering::AcqRel);
     }
 }
 
@@ -2836,6 +3124,33 @@ impl FrankenFuse {
     }
 }
 
+/// Times a whole FUSE handler and records it on drop (bd-4zokj).
+///
+/// RAII rather than an explicit call at the end, because these handlers return
+/// early on several paths — an unparseable name, a memo hit, an error reply —
+/// and a guard cannot be forgotten on one of them. That matters here: the memo
+/// hit is exactly the path whose cost the dispatch counters miss, so a timer
+/// that skipped early returns would be blind to the thing it was built for.
+struct HandlerTimer<'a> {
+    metrics: &'a AtomicMetrics,
+    start: Instant,
+}
+
+impl<'a> HandlerTimer<'a> {
+    fn new(metrics: &'a AtomicMetrics) -> Self {
+        Self {
+            metrics,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for HandlerTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics.record_handler_duration(self.start.elapsed());
+    }
+}
+
 impl Filesystem for FrankenFuse {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
         if self.inner.worker_dispatch {
@@ -2950,6 +3265,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
@@ -3051,6 +3367,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
@@ -3153,6 +3470,7 @@ impl Filesystem for FrankenFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         let Ok(fs_offset) = u64::try_from(offset) else {
@@ -3341,6 +3659,7 @@ impl Filesystem for FrankenFuse {
         size: u32,
         reply: ReplyXattr,
     ) {
+        let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         let Some(name) = name.to_str() else {
             reply.error(libc::EINVAL);
             return;
@@ -4622,6 +4941,177 @@ mod tests {
     /// A one-slot memo is the worst possible size for that stream — each probe
     /// evicts the other half — so this is the test that pins WHY there are two.
     #[test]
+    /// THE CLIFF, stated as a test rather than as a paragraph.
+    ///
+    /// A 32,768-entry directory is exactly the banked readdir+stat fixture. On the
+    /// direct-mapped table at the shipping 4096 slots it self-evicts: 8 inodes
+    /// share every slot, so after one pass only the last 4096 survive and every
+    /// probe of the next sweep misses. That is the measured `65,539` dispatches
+    /// over two sweeps. The range-leaf backend holds all 32,768 in ONE 4 KiB leaf.
+    ///
+    /// Both halves are asserted deliberately. Showing the bitmap works proves the
+    /// lever; showing the table does NOT proves the lever is answering a real
+    /// defect rather than a hypothetical one — and if someone later raises the
+    /// default slot count, this test says so instead of quietly passing.
+    #[test]
+    fn range_leaf_backend_holds_a_32768_entry_directory_that_evicts_the_table() {
+        const ENTRIES: u64 = 32_768;
+        // Dense inode numbers starting away from 0, as a real directory's are.
+        const FIRST: u64 = 1_000_000;
+
+        let table = LastMissingCapabilityXattr::with_slots(CAPABILITY_MEMO_SLOTS, true);
+        let bitmap = LastMissingCapabilityXattr::with_bitmap();
+        for i in 0..ENTRIES {
+            table.remember(InodeNumber(FIRST + i));
+            bitmap.remember(InodeNumber(FIRST + i));
+        }
+
+        let table_survivors = (0..ENTRIES)
+            .filter(|i| table.contains(InodeNumber(FIRST + i)))
+            .count();
+        let bitmap_survivors = (0..ENTRIES)
+            .filter(|i| bitmap.contains(InodeNumber(FIRST + i)))
+            .count();
+
+        assert_eq!(
+            bitmap_survivors, ENTRIES as usize,
+            "the range-leaf backend must retain every entry of a 32,768-entry \
+             directory — this is the whole lever; got {bitmap_survivors}"
+        );
+        assert_eq!(
+            table_survivors, CAPABILITY_MEMO_SLOTS,
+            "the direct-mapped table at {CAPABILITY_MEMO_SLOTS} slots must retain \
+             only its slot count, which is the measured cliff. If this fails the \
+             default table size changed and the readdir+stat attribution needs \
+             re-deriving; got {table_survivors}"
+        );
+        // And the point of it all: strictly less memory for 8x the inodes.
+        assert!(
+            CAPABILITY_LEAF_WORDS * 8 < CAPABILITY_MEMO_SLOTS * 8,
+            "a leaf must be smaller than the table it replaces"
+        );
+    }
+
+    /// A memo that reports a capability xattr ABSENT when it is present is a wrong
+    /// answer about a privilege-bearing attribute, so exactness is the property
+    /// that matters most — more than any hit rate.
+    ///
+    /// Two ways the range-leaf design could get this wrong, both covered: an inode
+    /// in a range that was never remembered, and an inode whose range COLLIDES
+    /// with a remembered one on the same top slot (`base` differing by exactly
+    /// `CAPABILITY_TOP_SLOTS`), which is the case a plain bitmap would answer with
+    /// a stranger's bit.
+    #[test]
+    fn range_leaf_backend_never_reports_an_unremembered_inode_as_absent_xattr() {
+        let memo = LastMissingCapabilityXattr::with_bitmap();
+        let known = InodeNumber(4242);
+        memo.remember(known);
+        assert!(memo.contains(known));
+
+        assert!(
+            !memo.contains(InodeNumber(4243)),
+            "a neighbouring inode in the SAME leaf was never remembered"
+        );
+
+        // Same top slot, different range: base differs by exactly the top width.
+        let colliding =
+            InodeNumber(4242 + (CAPABILITY_TOP_SLOTS as u64) * (1 << CAPABILITY_LEAF_BITS));
+        assert_eq!(
+            CapabilityBitmap::locate(known.0).1,
+            CapabilityBitmap::locate(colliding.0).1,
+            "the fixture must actually collide on a top slot or it tests nothing"
+        );
+        assert_ne!(
+            CapabilityBitmap::locate(known.0).0,
+            CapabilityBitmap::locate(colliding.0).0,
+            "…while belonging to different ranges"
+        );
+        assert!(
+            !memo.contains(colliding),
+            "an inode from a DIFFERENT range that maps to the same top slot must \
+             miss, not read the resident leaf's bit — that would be a false \
+             'no capability xattr' for a file that may well have one"
+        );
+    }
+
+    /// `forget` must clear exactly one inode, since it runs on every mutation of a
+    /// read-write mount and a memo that over-forgets silently loses the lever
+    /// while a memo that under-forgets serves a stale absence.
+    #[test]
+    fn range_leaf_backend_forget_clears_only_its_own_inode() {
+        let memo = LastMissingCapabilityXattr::with_bitmap();
+        // Neighbours inside one word, and one in the next word, to catch a mask
+        // built with the wrong shift.
+        for ino in [700u64, 701, 702, 764, 765] {
+            memo.remember(InodeNumber(ino));
+        }
+        memo.forget(InodeNumber(701));
+        assert!(
+            !memo.contains(InodeNumber(701)),
+            "the forgotten inode is gone"
+        );
+        for ino in [700u64, 702, 764, 765] {
+            assert!(
+                memo.contains(InodeNumber(ino)),
+                "inode {ino} shares a word or a leaf with the forgotten one and \
+                 must survive"
+            );
+        }
+        // Forgetting an inode in a range with no leaf at all must not allocate or
+        // panic — mutations arrive for inodes that were never probed.
+        memo.forget(InodeNumber(9_999_999));
+    }
+
+    /// The backend knob is opt-in and fails CLOSED, so a typo cannot silently
+    /// enable an unmeasured backend on a production mount.
+    #[test]
+    fn capability_memo_bitmap_knob_is_opt_in_and_fails_closed() {
+        for on in ["1", "true", "TRUE", "on", " on ", "On"] {
+            assert!(
+                LastMissingCapabilityXattr::bitmap_from_value(Some(on)),
+                "{on:?} must select the range-leaf backend"
+            );
+        }
+        for off in ["", "0", "false", "off", "yes", "2", "bitmap", "ture"] {
+            assert!(
+                !LastMissingCapabilityXattr::bitmap_from_value(Some(off)),
+                "{off:?} must fall back to the shipping table, not enable a \
+                 backend nobody asked for"
+            );
+        }
+        assert!(
+            !LastMissingCapabilityXattr::bitmap_from_value(None),
+            "unset must mean the shipping direct-mapped table"
+        );
+    }
+
+    /// The footprint must stay bounded by declining new ranges, never by evicting
+    /// a live leaf — that is what lets readers borrow a leaf with no reclamation.
+    #[test]
+    fn range_leaf_backend_bounds_its_footprint_without_evicting() {
+        let memo = LastMissingCapabilityXattr::with_bitmap();
+        let stride = 1u64 << CAPABILITY_LEAF_BITS;
+        // Occupy every top slot, then ask for one more distinct range.
+        for r in 0..CAPABILITY_TOP_SLOTS as u64 {
+            memo.remember(InodeNumber(r * stride + 5));
+        }
+        let overflow = InodeNumber((CAPABILITY_TOP_SLOTS as u64) * stride + 5);
+        memo.remember(overflow);
+        assert!(
+            !memo.contains(overflow),
+            "a range beyond the retained set must be declined, so it misses and \
+             dispatches — unaccelerated but correct"
+        );
+        for r in 0..CAPABILITY_TOP_SLOTS as u64 {
+            assert!(
+                memo.contains(InodeNumber(r * stride + 5)),
+                "range {r} was resident first and must NOT be evicted by the \
+                 overflow; eviction would invalidate a pointer a reader may hold"
+            );
+        }
+    }
+
+    #[test]
     fn capability_memo_serves_the_alternating_root_and_file_probe_stream() {
         let memo = LastMissingCapabilityXattr::default();
         let root = InodeNumber(1);
@@ -4809,6 +5299,67 @@ mod tests {
                 "file {file} must still be resident; two slots could not do this"
             );
         }
+    }
+
+    /// bd-4zokj: whole-handler time must BOUND dispatch time, and must be
+    /// recorded on the paths dispatch never sees.
+    ///
+    /// The counter exists because `*_dispatch_nanos` bracket only the inner ops
+    /// call, which was measured accounting for as little as 1.2% of the daemon's
+    /// own CPU. A handler timer that missed the early-return paths — the memo
+    /// hit above all — would reproduce exactly that blind spot, so the property
+    /// under test is that a request which dispatches NOTHING still records
+    /// handler time.
+    #[test]
+    fn handler_timer_bounds_dispatch_and_covers_undispatched_requests_bd_4zokj() {
+        let metrics = AtomicMetrics::new();
+
+        // A request that dispatches: both counters move, and handler >= dispatch
+        // because the guard's scope encloses the dispatch scope.
+        {
+            let _h = HandlerTimer::new(&metrics);
+            metrics.record_dispatch_duration(RequestOp::Getxattr, Duration::from_nanos(50));
+        }
+        let s = metrics.snapshot();
+        assert_eq!(s.handler_total_count, 1, "the handler was timed once");
+        assert!(
+            s.handler_total_nanos >= s.getxattr_dispatch_nanos,
+            "handler {} must bound dispatch {} — a decomposition whose parts \
+             exceed the whole is not a decomposition",
+            s.handler_total_nanos,
+            s.getxattr_dispatch_nanos
+        );
+
+        // A request that dispatches NOTHING — the memo-hit shape. This is the
+        // case the dispatch counters are blind to, so it is the case that decides
+        // whether this counter was worth adding.
+        let before = metrics.snapshot();
+        {
+            let _h = HandlerTimer::new(&metrics);
+        }
+        let after = metrics.snapshot();
+        assert_eq!(
+            after.handler_total_count,
+            before.handler_total_count + 1,
+            "an undispatched request must still be counted"
+        );
+        assert_eq!(
+            after.getxattr_dispatch_count, before.getxattr_dispatch_count,
+            "an undispatched request must NOT move a dispatch counter"
+        );
+
+        // The subtraction the ledger performs must stay non-negative, which is
+        // the invariant the whole instrument rests on.
+        let dispatched = after.getattr_dispatch_nanos
+            + after.getxattr_dispatch_nanos
+            + after.lookup_dispatch_nanos
+            + after.readdir_dispatch_nanos;
+        assert!(
+            after.handler_total_nanos >= dispatched,
+            "handler_total_nanos {} must bound the sum of dispatch nanos {}",
+            after.handler_total_nanos,
+            dispatched
+        );
     }
 
     /// bd-m1bpu: the slot-count knob must round to a power of two, clamp, and
@@ -15812,11 +16363,20 @@ mod tests {
             "active: false, ",
             "shutdown: false, ",
             "metrics: MetricsSnapshot { requests_total: 0, requests_ok: 0, requests_err: 0, ",
-            "bytes_read: 0, metadata_requests: 0, getattr_dispatch_count: 0, ",
+            "bytes_read: 0, metadata_requests: 0, ",
+            // bd-4zokj: the whole-handler counters sit between metadata_requests
+            // and the dispatch counters in declaration order, which is the order
+            // derived Debug prints them in. This golden is a field-list assertion,
+            // so any new MetricsSnapshot field turns it red until it is added
+            // here, in position — which is the good case, and the reason the
+            // hand-written AtomicMetrics Debug needed a comment of its own.
+            "handler_total_nanos: 0, handler_total_count: 0, ",
+            "getattr_dispatch_count: 0, ",
             "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
             // bd-i353e added the mutation counters in 3145d182 without updating this
             // golden, which left `mount_handle_debug_format` red on HEAD. Restored.
             "mutation_dispatch_count: 0, mutation_dispatch_nanos: 0, ",
+            "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
             "requests_throttled: 0, requests_shed: 0 }, ",
@@ -16945,6 +17505,119 @@ AllowOther"#;
         assert_eq!(snap.requests_shed, 1);
     }
 
+    /// `snapshot()` must LOAD every counter, not fall through to `Default`.
+    ///
+    /// `AtomicMetrics::snapshot` ends with `..Default::default()`, which makes
+    /// adding a `MetricsSnapshot` field compile cleanly whether or not anyone
+    /// wired up the matching `.load()`. A field left unwired reports a constant
+    /// **zero** — the worst possible failure for an instrument, because zero is
+    /// a plausible reading. The whole create/delete attribution is a division by
+    /// these numbers; a silent zero there does not crash anything, it just
+    /// produces a confident wrong share.
+    ///
+    /// The check works off derived `Debug`, deliberately. A hand-listed
+    /// assertion would need updating with every new counter and would therefore
+    /// go stale exactly when it matters, which is the failure this whole bead
+    /// has now hit twice (the `_ => {}` arm, then the hand-picked opcode list).
+    /// Derived `Debug` enumerates the real field set, so a new field is covered
+    /// the moment it exists, with no list to maintain.
+    #[test]
+    fn snapshot_loads_every_counter_and_none_default_to_zero() {
+        let m = AtomicMetrics::new();
+
+        // Move every counter off zero through the public recording surface.
+        m.record_ok();
+        m.record_err();
+        m.record_bytes_read(4096);
+        m.record_metadata_request();
+        m.record_throttled();
+        m.record_shed();
+        m.record_handler_duration(Duration::from_nanos(7));
+        for op in RequestOp::ALL {
+            m.record_dispatch_duration(op, Duration::from_nanos(7));
+        }
+
+        let dump = format!("{:?}", m.snapshot());
+        assert!(
+            !dump.contains(": 0"),
+            "every counter was exercised, so no MetricsSnapshot field may still \
+             read zero. A field showing 0 here is one `snapshot()` never loads — \
+             it will silently report zero forever and any attribution dividing by \
+             it is wrong rather than merely imprecise. Dump: {dump}"
+        );
+    }
+
+    /// bd-i353e: the dispatch categories must RECONCILE, not merely exist.
+    ///
+    /// The defect this pins is not "an opcode is uncounted" but "the counters do
+    /// not add up and nothing says so". Before the catch-all, Open/Flush/Release
+    /// and friends fell through a bare `_ => {}`, so the named categories could sum
+    /// to any fraction of the real dispatch count while looking complete. That is
+    /// what let a create/delete attribution report 13.002 crossings per op against
+    /// at most ~7 counted, with the arithmetic never closing.
+    ///
+    /// This is the check the bead asked to add to its own acceptance: every
+    /// dispatch lands in exactly one category, so the categories sum to the total.
+    #[test]
+    fn every_dispatch_lands_in_exactly_one_category_bd_i353e() {
+        let m = AtomicMetrics::default();
+        // The WHOLE opcode space, not a hand-picked sample. A literal list here
+        // would go stale the moment someone adds a `RequestOp` — reproducing
+        // the exact defect this test exists to catch, one level up, while
+        // continuing to pass. `RequestOp::ALL` is length-tied to `COUNT`, so a
+        // new variant is a compile error instead.
+        let ops = RequestOp::ALL;
+        for op in ops {
+            m.record_dispatch_duration(op, Duration::from_nanos(1));
+        }
+        let s = m.snapshot();
+        let summed = s.getattr_dispatch_count
+            + s.getxattr_dispatch_count
+            + s.lookup_dispatch_count
+            + s.readdir_dispatch_count
+            + s.mutation_dispatch_count
+            + s.other_dispatch_count;
+        assert_eq!(
+            summed,
+            ops.len() as u64,
+            "dispatch categories must sum to the number of dispatches recorded; if \
+             this fails, some RequestOp is being dropped again and every attribution \
+             built on these counters is a lower bound presented as an answer"
+        );
+        // The five the create/delete workload issues and the census could not
+        // see. Named individually because these are the ones that made the
+        // 13.002-crossings decomposition fail to close, and a regression here
+        // should say which opcode went missing rather than just a total.
+        for op in [
+            RequestOp::Open,
+            RequestOp::Flush,
+            RequestOp::Release,
+            RequestOp::Opendir,
+            RequestOp::Statfs,
+        ] {
+            let solo = AtomicMetrics::default();
+            solo.record_dispatch_duration(op, Duration::from_nanos(1));
+            let s = solo.snapshot();
+            assert_eq!(
+                s.other_dispatch_count, 1,
+                "{op:?} is issued by the create+delete workload and must be \
+                 counted; if it lands nowhere, the attribution is a lower bound \
+                 presented as an answer"
+            );
+        }
+        let summed_nanos = s.getattr_dispatch_nanos
+            + s.getxattr_dispatch_nanos
+            + s.lookup_dispatch_nanos
+            + s.readdir_dispatch_nanos
+            + s.mutation_dispatch_nanos
+            + s.other_dispatch_nanos;
+        assert_eq!(
+            summed_nanos,
+            ops.len() as u64,
+            "the nanos decomposition must reconcile on the same terms as the counts"
+        );
+    }
+
     /// bd-k3g3g: adding a counter to `MetricsSnapshot` must stay a one-line change.
     ///
     /// Before the `Default` derive, every construction site listed every field, so an
@@ -16971,8 +17644,12 @@ AllowOther"#;
             getattr_dispatch_nanos: 0,
             getxattr_dispatch_count: 0,
             getxattr_dispatch_nanos: 0,
+            handler_total_nanos: 0,
+            handler_total_count: 0,
             mutation_dispatch_count: 0,
             mutation_dispatch_nanos: 0,
+            other_dispatch_count: 0,
+            other_dispatch_nanos: 0,
             lookup_dispatch_count: 0,
             lookup_dispatch_nanos: 0,
             readdir_dispatch_count: 0,
@@ -17190,8 +17867,12 @@ AllowOther"#;
         const FUSE_INNER_DEBUG_GOLDEN: &str = concat!(
             "FuseInner { ",
             "metrics: AtomicMetrics { requests_total: 0, requests_ok: 0, requests_err: 0, ",
-            "bytes_read: 0, metadata_requests: 0, getattr_dispatch_count: 0, ",
+            "bytes_read: 0, metadata_requests: 0, ",
+            "handler_total_nanos: 0, handler_total_count: 0, ",
+            "getattr_dispatch_count: 0, ",
             "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            "mutation_dispatch_count: 0, mutation_dispatch_nanos: 0, ",
+            "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
             "requests_throttled: 0, requests_shed: 0 }, ",
