@@ -27,7 +27,10 @@ impl FrankenFuse {
                 access_predictor: AccessPredictor::default(),
                 readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
                 readonly_xattr_cache: ReadonlyXattrCache::default(),
-                missing_capability_xattr: LastMissingCapabilityXattr::default(),
+                // `from_env`, not `default`: this is the one production mount, and
+                // the FFS_FUSE_CAPABILITY_MEMO switch has to reach it for the
+                // comparator to A/B the memo from a single ELF (bd-2pq73).
+                missing_capability_xattr: LastMissingCapabilityXattr::from_env(),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
             }),
         }

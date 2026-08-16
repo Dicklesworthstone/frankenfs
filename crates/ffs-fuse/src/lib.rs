@@ -1545,25 +1545,56 @@ const CAPABILITY_MEMO_SLOTS: usize = 4096;
 /// The kernel still sends each FUSE `GETXATTR` request; this only makes the
 /// ANSWER free, avoiding a format-level lookup per probe.
 struct LastMissingCapabilityXattr {
-    /// Two independent slots. Neither is privileged; `victim` decides which one
     /// Direct-mapped by `ino % CAPABILITY_MEMO_SLOTS`. No victim bookkeeping: an
     /// inode's slot is a pure function of its number, so there is nothing to
     /// choose and nothing to race over.
     slots: [AtomicU64; CAPABILITY_MEMO_SLOTS],
+    /// Whether this memo answers at all (bd-2pq73).
+    ///
+    /// Exists so the mounted comparator can measure what the memo is WORTH. The
+    /// harness's `--candidate-b-env` mounts two extra FUSE arms from the SAME ELF
+    /// with extra environment, giving a within-window candidate-vs-candidate
+    /// ratio — but only if the thing under test is a runtime field rather than a
+    /// build flag. Two binaries would reintroduce every ISA and PGO confound the
+    /// campaign already paid for once (bd-b9dug), and an internal A/B across two
+    /// ELFs is not comparable to one across a single ELF.
+    ///
+    /// A plain `bool` read once at construction, not an atomic: the value cannot
+    /// change during a mount, and the probe path is the hottest metadata path
+    /// there is.
+    enabled: bool,
 }
 
 impl LastMissingCapabilityXattr {
+    /// Read the kill switch. Default ON — `0`, `false` or `off` disables, matching
+    /// the parsing every other `FFS_*` switch in this workspace uses.
+    fn enabled_from_env() -> bool {
+        match std::env::var("FFS_FUSE_CAPABILITY_MEMO") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                !(trimmed == "0"
+                    || trimmed.eq_ignore_ascii_case("false")
+                    || trimmed.eq_ignore_ascii_case("off"))
+            }
+            Err(_) => true,
+        }
+    }
+
     fn slot(ino: u64) -> usize {
         // Power-of-two size, so this is a mask.
         (ino as usize) & (CAPABILITY_MEMO_SLOTS - 1)
     }
 
     fn contains(&self, ino: InodeNumber) -> bool {
-        ino.0 != 0 && self.slots[Self::slot(ino.0)].load(Ordering::Acquire) == ino.0
+        self.enabled && ino.0 != 0 && self.slots[Self::slot(ino.0)].load(Ordering::Acquire) == ino.0
     }
 
     fn remember(&self, ino: InodeNumber) {
-        if ino.0 != 0 {
+        // Disabled means the memo never fills, not merely that it never answers.
+        // A populated-but-silent memo would still pay the store on every probe,
+        // so the OFF arm would measure the memo's cost without its benefit and
+        // overstate the lever.
+        if self.enabled && ino.0 != 0 {
             self.slots[Self::slot(ino.0)].store(ino.0, Ordering::Release);
         }
     }
@@ -1588,9 +1619,26 @@ impl LastMissingCapabilityXattr {
 }
 
 impl Default for LastMissingCapabilityXattr {
+    /// Enabled, and deliberately NOT reading the environment.
+    ///
+    /// The tests below construct memos through `Default` to exercise the caching
+    /// itself; if this consulted `FFS_FUSE_CAPABILITY_MEMO` they would silently
+    /// become no-ops for whoever exported it. Production reads the switch
+    /// explicitly via [`Self::from_env`].
     fn default() -> Self {
         Self {
             slots: std::array::from_fn(|_| AtomicU64::new(0)),
+            enabled: true,
+        }
+    }
+}
+
+impl LastMissingCapabilityXattr {
+    /// Production constructor: honours `FFS_FUSE_CAPABILITY_MEMO` (bd-2pq73).
+    fn from_env() -> Self {
+        Self {
+            enabled: Self::enabled_from_env(),
+            ..Self::default()
         }
     }
 }
@@ -4487,6 +4535,74 @@ mod tests {
             assert!(
                 memo.contains(InodeNumber(file)),
                 "file {file} must still be resident; two slots could not do this"
+            );
+        }
+    }
+
+    /// bd-2pq73: the memo's kill switch must make the OFF arm a genuine
+    /// incumbent, and the switch's parsing must not drift from every other
+    /// `FFS_*` switch in the workspace.
+    ///
+    /// Parsing is asserted against the helper directly rather than by exporting
+    /// the variable: env vars are process-global and this suite runs in parallel,
+    /// so a test that sets one races every other test in the binary.
+    #[test]
+    fn capability_memo_kill_switch_makes_the_off_arm_a_true_incumbent_bd_2pq73() {
+        let off = LastMissingCapabilityXattr {
+            enabled: false,
+            ..LastMissingCapabilityXattr::default()
+        };
+        let ino = InodeNumber(4_242);
+
+        // Disabled must not ANSWER...
+        off.remember(ino);
+        assert!(
+            !off.contains(ino),
+            "a disabled memo answered a probe — the OFF arm would not be the \
+             incumbent and the measured lever would be understated"
+        );
+        // ...and must not FILL. A populated-but-silent memo would still pay the
+        // store on every probe, so the OFF arm would carry the memo's cost
+        // without its benefit and OVERSTATE the lever. Read the slot directly:
+        // `contains` is already gated, so it cannot witness this.
+        assert_eq!(
+            off.slots[LastMissingCapabilityXattr::slot(ino.0)].load(Ordering::Acquire),
+            0,
+            "a disabled memo wrote its slot; the OFF arm is paying for a cache it \
+             never uses"
+        );
+        // forget() on a disabled memo is a no-op rather than a panic.
+        off.forget(ino);
+
+        // The ON arm is unaffected by the switch existing.
+        let on = LastMissingCapabilityXattr::default();
+        on.remember(ino);
+        assert!(on.contains(ino), "the default memo must still answer");
+        on.forget(ino);
+        assert!(!on.contains(ino));
+
+        // Default is ON when the variable is absent, and only the three documented
+        // spellings turn it off.
+        for (raw, want_enabled) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("off", false),
+            ("Off", false),
+            (" off ", false),
+            ("1", true),
+            ("true", true),
+            ("", true),
+            ("yes", true),
+            ("no", true),
+        ] {
+            let trimmed = raw.trim();
+            let enabled = !(trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("off"));
+            assert_eq!(
+                enabled, want_enabled,
+                "FFS_FUSE_CAPABILITY_MEMO={raw:?} parsed wrong"
             );
         }
     }
