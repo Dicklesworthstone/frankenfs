@@ -13311,3 +13311,61 @@ bootstrap median with a bootstrap median CI from 20000 resamples, e.g. bootstrap
 Counted mechanism: **three consecutive sweeps at loadavg 19.4 returned min 1429.0 MHz each
 time**, against two earlier single sweeps that returned 3111.7 and 3363.1 — the count that
 shows the earlier readings were undersampled rather than the host having changed.
+
+## 2026-08-16 — the frequency threat INVERTS on measurement: under load every core converges to `1.001x` uniformity; the `3.001x` spread at low load is IDLE cores parked at the floor (bd-cpu-mhz, AzureBay)
+
+No certification — placement refused after `151 sample(s) over 300000ms` — but the run
+carried the frequency instrumentation and the readings settle a question I had been
+reasoning about wrongly for two ticks.
+
+    LOADAVG_PRE  26.90 25.63 31.22   MHZ  min 1429.0  max 4287.7  spread 3.001x
+    LOADAVG_POST 63.77 37.84 34.09   MHZ  min 3864.9  max 3868.0  spread 1.001x
+
+**At loadavg 63.8 all 64 cores sat between 3864.9 and 3868.0 MHz** — a spread of `1.001x`,
+i.e. uniform to two parts in ten thousand. At loadavg 26.9 the same host spanned
+`1429.0-4287.7`.
+
+### What that means, and it is the opposite of what I have been recording
+
+The `3x` spread at LOW load is not two working cores differing. It is IDLE cores parked at
+the `1429 MHz` floor while active ones boost. Under sustained load the whole machine
+converges to one clock, because every core is busy and the package settles at its
+all-core sustained frequency.
+
+So an ALL-CORE spread measures **how much of the machine is asleep**, not how unequally the
+two arms were clocked. I have spent two ticks describing that number as "the ratio error
+available from frequency alone" and calling it the threat that dwarfs the row's dispersion.
+That reading was wrong. A quiet host shows a large all-core spread precisely BECAUSE it is
+quiet, and the arms in that window may still be clocked identically.
+
+**And my instrument had the same defect**: `cpu_mhz_observed` summarised over every CPU on
+the box. Fixed this tick — the report now carries an all-core summary AND a `placement`
+summary over the driver and FUSE cores, the only set whose spread can corrupt a ratio. The
+pair distinguishes "the machine was idle" from "our arms were clocked unequally", which one
+figure alone cannot.
+
+### Where this leaves the dispersion question
+
+Frequency is NOT thereby cleared as the cause of the worst row's `13.14%` unexplained
+dispersion — the arms' own clocks have still never been recorded, which is exactly the gap
+now closed. What is cleared is my ARGUMENT for it: I was pointing at a `3x` number that
+does not describe the arms. The candidate remains open and is now testable properly, on the
+correct CPU set, from the next run onward.
+
+Also note the direction the fleet flagged is not clean here either: `4042 MHz` was observed
+at loadavg 18.4 and `3866 MHz` at loadavg 63.8 — higher clocks at LOWER load, the opposite
+of "quiet equals downclocked", and consistent with boost headroom rather than with thermal
+throttling. Measure it; do not infer it.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`
+(in-process self-report), `pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, governor `powersave`, 64 logical CPUs. **No ratio is quoted or
+claimed here** — the runs referred to are banked separately, each a bootstrap median with a
+bootstrap median CI from 20000 resamples, e.g. bootstrap median `8.278490x` with bootstrap
+median CI `[8.242402, 8.323421]`, absolute arm medians `kernel_median_wall_ns` 27,772,000 ns
+and `fuse_median_wall_ns` 214,816,000 ns.
+
+Counted mechanism: **64 of 64 cores within 3.1 MHz of each other at loadavg 63.8**, against a
+1429-4287 MHz range at loadavg 26.9 — the count that shows the wide spread is idleness, not
+inter-core inequality under load.

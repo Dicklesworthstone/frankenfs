@@ -6874,7 +6874,31 @@ fn fs_report(
     // from frequency error. Evidence, not a gate.
     let cpu_mhz_observed_json = {
         let mhz = cpu_mhz();
+        // Summarise over ALL cores AND over the placement set separately.
+        //
+        // The all-core figure is nearly useless on its own, and measuring it taught me
+        // why: at loadavg 63.8 every core sat at 3864.9-3868.0 MHz, a spread of
+        // 1.001x, while at loadavg 26.9 the same host showed 1429.0-4287.7 MHz, a
+        // spread of 3.001x. The 3x is not two working cores differing — it is IDLE
+        // cores parked at the 1429 MHz floor while active ones boost. An all-core
+        // spread therefore measures how much of the machine is asleep, not how
+        // unequally the two arms were clocked.
+        //
+        // What can corrupt a ratio is the spread across the cores the ARMS actually
+        // occupy while working, which is why cpu_mhz_summary takes a CPU set and why
+        // the placement figure is reported beside the all-core one rather than
+        // instead of it: the pair distinguishes "the machine was idle" from "our arms
+        // were clocked unequally".
         let all: BTreeSet<usize> = mhz.keys().copied().collect();
+        let placement: BTreeSet<usize> = placement
+            .driver_cpus
+            .iter()
+            .chain(placement.fuse_cpus.iter())
+            .copied()
+            .collect();
+        let placement_summary = cpu_mhz_summary(&mhz, &placement).map(|(min, max, mean, spread)| {
+            json!({"min": min, "max": max, "mean": mean, "spread": spread})
+        });
         cpu_mhz_summary(&mhz, &all).map(|(min, max, mean, spread)| {
             json!({
                 "min": min,
@@ -6883,6 +6907,8 @@ fn fs_report(
                 // max/min across cores at one instant: the ratio error two arms on
                 // different cores could see from frequency alone.
                 "spread": spread,
+                // The figure that can actually corrupt a ratio: the arms' own cores.
+                "placement": placement_summary,
             })
         })
     };
@@ -9701,6 +9727,47 @@ mod tests {
     /// The DIRECTION of any load-to-frequency effect is deliberately not asserted: the
     /// two readings above disagree with a third-party observation, and single
     /// instantaneous samples cannot settle it.
+    /// bd-cpu-mhz: an ALL-CORE spread measures how much of the machine is asleep, not
+    /// how unequally the two arms were clocked.
+    ///
+    /// Measured on this host, and it inverted my own framing:
+    ///   loadavg 63.8  ->  every core 3864.9-3868.0 MHz, spread 1.001x
+    ///   loadavg 26.9  ->  cores 1429.0-4287.7 MHz,       spread 3.001x
+    /// The 3x at LOW load is idle cores parked at the 1429 MHz floor while active ones
+    /// boost — not two working cores differing. Under sustained load the whole machine
+    /// converges to a uniform clock, which is the opposite of the intuition that a busy
+    /// host is a thermally messy one.
+    ///
+    /// So the all-core figure must not be read as ratio error. What can corrupt a ratio
+    /// is the spread over the cores the ARMS occupy, which is why the summary takes a
+    /// CPU set and why both figures are reported.
+    #[test]
+    fn placement_subset_spread_differs_from_all_core_spread_bd_cpu_mhz() {
+        // Two busy arm cores clocked alike, plus parked idle cores.
+        let mhz: BTreeMap<usize, f64> = [
+            (0, 3900.0), (1, 3905.0),          // arm cores, working
+            (2, 1429.0), (3, 1429.0), (4, 1429.0), // idle, parked at the floor
+        ]
+        .into_iter()
+        .collect();
+
+        let all: BTreeSet<usize> = mhz.keys().copied().collect();
+        let (_, _, _, all_spread) = cpu_mhz_summary(&mhz, &all).expect("all-core");
+        assert!(
+            all_spread > 2.7,
+            "the all-core spread is dominated by parked idle cores; it was {all_spread}"
+        );
+
+        let arms: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let (_, _, _, arm_spread) = cpu_mhz_summary(&mhz, &arms).expect("placement");
+        assert!(
+            arm_spread < 1.01,
+            "the ARMS were clocked within 0.2% of each other; reporting the all-core \
+             {all_spread}x as this run's frequency error would be wrong by a factor of \
+             nearly three"
+        );
+    }
+
     #[test]
     fn cpu_mhz_summary_reports_the_cross_core_spread_bd_cpu_mhz() {
         let mhz: BTreeMap<usize, f64> =
