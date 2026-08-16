@@ -10074,3 +10074,114 @@ Lock fix `1e334993` landed alongside: the memo hit path held its mutex across
 `drop(memo)` a no-op the compiler had been reporting as `dropping_references` in every
 `ffs-core` build. Gate for that fix: `cargo test -p ffs-core --lib btrfs_floor` on rch
 worker `vmi1152480`, 3 passed / 0 failed, including the concurrent-sweep test.
+
+## 2026-08-16 — HONEST_LOSS banked: btrfs mounted warm stat 4.80x (worst bound 5.00x) vs kernel btrfs, and readdir+stat REFUSED at 2.78x (bd-btrfs-warm-stat-5x-9pxn1, AzureBay)
+
+**The first mounted comparator rows produced on this host since the disk floor started
+refusing every run.** They exist because the floor was wrong, not because the machine
+got quieter — see the companion entry on the derived free-space floor.
+
+Provenance, identical for all four runs below. Both SHA-256s are self-reported by the
+executing ELFs at run time — the candidate prints its own via `bench-evidence` and the
+driver hashes `current_exe()` — not typed in from a later `sha256sum`:
+`driver_elf_sha256 = 471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`
+built on `thinkstation1`;
+`candidate_elf_sha256 = e6cd5793384bdb6d6fff113e13fd9e1392753fadaf4ab0a15663e7912dba5bf0`
+built on `thinkstation1`,
+`pgo_profile_sha256 = cc6c121c9ee77d8a4b7f4855c443c07a59ac6191316d40acb08fb2fbe79f9562`,
+`isa=x86-64-v3`, candidate gate `verdict=pass`;
+`executed_on=thinkstation1`, `retrieval=built_in_place_on_executing_host`. Host
+`thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, 32C/64T, `same-llc` placement.
+btrfs checksum verification at its post-flip default (`btrfs_verify_data_on_read=true`),
+which is the configuration bd-6kpp4 says every pre-2026-08-15 btrfs row lacks — so
+these do NOT compare to rows banked before that flip.
+
+Reduced working set: `--pairs 12 --operations 2000 --image-size-mib 256`, one
+filesystem. Both runs of each workload used the same ELF on the same host, so this is
+a replicated pair rather than a cross-worker one; no second machine can run a FUSE
+mount here.
+
+### BANKED — warm stat, `4.80x` slower than kernel btrfs, worst bound `5.00x`
+
+Absolute arm medians are given alongside the ratio, because a ratio alone cannot say
+which arm moved (bd-4sull item 3). Intervals are bootstrap median CI95 over 20,000
+resamples, `estimator=four_round_balanced_crossover_bootstrap_median_ci`.
+
+| run | kernel median wall | FrankenFS median wall | fuse/kernel median | bootstrap median CI95 | kernel null | fuse null | verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `4,652,283 ns` | `22,422,724 ns` | **4.798508x** | `[4.759896, 4.802894]` | `0.993753` clear | `1.003667` clear | `HONEST_LOSS`, `admitted=true` |
+| 2 | `4,665,133 ns` | `22,499,546 ns` | 4.866486x | `[4.756329, 4.999840]` | `1.010383` clear | `1.005541` spread `1.025399` | `BLOCKED_NULL` |
+
+Both arms moved together between runs — kernel `+0.28%`, FrankenFS `+0.34%` — which is
+what a replicate should look like and is why the ratio barely shifts.
+
+Verbatim from the harness, run 1 — the line the table above is derived from, kept
+unedited so the absolute arm medians and the estimator are not taken on trust:
+
+    mounted_kernel_throughput,filesystem=btrfs,workload=warm_stat,operations_per_observation=2000,kernel_median_wall_ns=4652283,fuse_median_wall_ns=22422724,kernel_operations_per_second=429896.462,fuse_operations_per_second=89195.229
+    mounted_kernel_ratio,filesystem=btrfs,metric=wall_ns,workload=warm_stat,pairs=12,crossover_blocks=3,observation_reducer=min,observation_repeats=3,fuse_over_kernel_median=4.798508,ci_low=4.759896,ci_high=4.802894,twice_null_margin_ratio=1.016331,directional_claim_clear=true,admitted=true,verdict=HONEST_LOSS,bootstrap_resamples=20000,cv_used=false
+    binary_provenance,driver_elf_sha256=471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc,driver_built_on=thinkstation1,candidate_elf_sha256=e6cd5793384bdb6d6fff113e13fd9e1392753fadaf4ab0a15663e7912dba5bf0,candidate_built_on=thinkstation1,executed_on=thinkstation1,retrieval=built_in_place_on_executing_host
+
+and run 2:
+
+    mounted_kernel_throughput,filesystem=btrfs,workload=warm_stat,operations_per_observation=2000,kernel_median_wall_ns=4665133,fuse_median_wall_ns=22499546,kernel_operations_per_second=428712.322,fuse_operations_per_second=88890.683
+    mounted_kernel_ratio,filesystem=btrfs,metric=wall_ns,workload=warm_stat,pairs=12,fuse_over_kernel_median=4.866486,ci_low=4.756329,ci_high=4.999840,twice_null_margin_ratio=1.051443,directional_claim_clear=false,admitted=false,verdict=BLOCKED_NULL,bootstrap_resamples=20000,cv_used=false
+
+Each `ci_low`/`ci_high` pair above is a bootstrap median 95% confidence interval, resampled 20,000 times
+(`estimator=four_round_balanced_crossover_bootstrap_median_ci`), and the
+`executing_elf_sha256 = 471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`
+above is self-reported by the driver at run time.
+
+Run 1 cleared BOTH A/A nulls on its own and the estimator admitted it. Run 2 replicates
+it: the medians are 1.4% apart, the intervals overlap, and its only failure is the fuse
+null's symmetric spread missing the `1.025` limit by `0.0004` — with both runs' fuse
+nulls off in the SAME direction (`+0.37%`, `+0.55%`) by a similar amount, which is the
+condition under which a failing null is excusable. **Quote the worst bound: `5.00x`.**
+
+Throughput, diagnostic only: kernel `429,896` / `428,712` stat/s against FrankenFS
+`89,195` / `88,891` stat/s. Four-arm post-parity `verdict=pass`, tree sha
+`ca98ba5dbb60fa...`, and `btrfs check` clean on every arm image.
+
+### REFUSED — readdir+stat, `2.78x`, and the reason is the null, not the ratio
+
+| run | kernel median wall | FrankenFS median wall | fuse/kernel median | bootstrap median CI95 | kernel null | fuse null |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `3,121,942 ns` | `8,447,506 ns` | 2.775065x | `[2.744423, 3.050166]` | `1.026632` | `1.034438` |
+| 2 | `3,192,140 ns` | `8,262,526 ns` | 2.777787x | `[2.685394, 2.828307]` | `0.985460` | `1.018249` |
+
+Verbatim, run 1 then run 2:
+
+    mounted_kernel_throughput,filesystem=btrfs,workload=large_directory_readdir_stat_8t,operations_per_observation=2000,kernel_median_wall_ns=3121942,fuse_median_wall_ns=8447506,kernel_operations_per_second=640626.994,fuse_operations_per_second=236756.283
+    mounted_kernel_throughput,filesystem=btrfs,workload=large_directory_readdir_stat_8t,operations_per_observation=2000,kernel_median_wall_ns=3192140,fuse_median_wall_ns=8262526,kernel_operations_per_second=626539.034,fuse_operations_per_second=242056.727
+
+The two medians agree to **0.098%** with heavily overlapping intervals, which is the
+tightest replication in this entry — and it is still not bankable. Both runs are
+`BLOCKED_NULL`, and the excusal condition fails on the kernel arm specifically: its
+null is `+2.66%` in run 1 and `-1.45%` in run 2, opposite directions rather than a
+consistent offset. A null that flips sign between runs is measuring the host, not the
+instrument's floor, so the agreement between the two medians cannot be credited to the
+estimator. Recorded, not banked; worth one retry in a genuinely quiet window.
+
+**`2.78x` IS NOT AN IMPROVEMENT ON THE BANKED `7.73x`/`8.32x` READDIR+STAT ROWS.** Those
+were taken at **32,768** directory entries and this is at **2,000**. The mounted
+per-entry cost is already known to grow ~60% between those two sizes, so the numbers
+measure different workloads and must never be differenced. Anyone quoting this row
+carries the entry count with it.
+
+### Every run was CONTENDED, and that is the honest caveat
+
+All four carry `external_load_during_run ... verdict=CONTENDED`: 14-15 of 15 samples
+over the limit, peak 16 busy CPUs, peak off-placement mean busy `18.3%`-`28.0%`,
+against limits of 2 CPUs / 10% of samples / 3 consecutive. Peer agents were building on
+the same socket throughout. The placement CPUs themselves were clean — the per-arm
+pinning and thread-observation checks all report `clear=true` — but memory bandwidth,
+LLC and boost budget are socket-wide.
+
+This is disclosed rather than dismissed. It cuts one way only: contention inflates the
+FUSE arm at least as much as the kernel arm, so a loss measured under contention is if
+anything an OVERSTATEMENT of the gap, and `5.00x` remains a safe upper bound on the
+warm-stat loss. It would not be safe if these were wins.
+
+Disk consumed: run 1 `84,890,284,032 -> 83,798,372,352` free = **1.02 GiB**. Run 2 spent
+**1.2 MiB**, because the image directory is reused. Against a floor that demanded
+120 GiB.
