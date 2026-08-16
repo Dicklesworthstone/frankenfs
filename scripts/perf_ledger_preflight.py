@@ -211,6 +211,30 @@ CANDIDATE_ABSOLUTE_MEDIAN = re.compile(
     re.I,
 )
 
+# --- daemon placement on a MOUNTED row (bd-plt79) -----------------------------
+# Observed defect class, measured twice on this host by two agents:
+#   * a 5-placement sweep found the UNPINNED arm swinging to a 1.4875x A/A null
+#     and disagreeing with itself 1.2613x across runs, while every PINNED arm in
+#     the same sweep stayed inside 1.0946x (ProudBarn, bd-plt79);
+#   * an unpinned managed-runtime harness measured a memo effect at 1.200033x
+#     where the pinned comparator measured 2.063608x at MATCHED thread count --
+#     a 1.72x instrument disagreement that invalidated a published decomposition
+#     (AzureBay, retraction 263e70c8).
+# In both cases requests_total was unchanged, so no work moved: the swing is pure
+# scheduler placement of the FUSE daemon relative to its client. A within-run CI
+# computed from reps that all shared one accidental placement looks tight while
+# the placement itself is the uncontrolled variable -- the same shape as the
+# worker-scope defect, one level down.
+MOUNTED_ROW = re.compile(
+    r"mounted[- ]kernel|mounted comparator|fuse_over_kernel|ffs-mounted-kernel-bench",
+    re.I,
+)
+DAEMON_PLACEMENT = re.compile(
+    r"placement_scope\s*[:=]|--fuse-cpus|fuse_cpu[s_]|daemon (?:is )?pinned|"
+    r"pinned (?:the )?daemon|same_llc|cross[- ]ccd|smt[- ]sibling|unpinned",
+    re.I,
+)
+
 FULL_SHA256 = r"[0-9a-f]{64}"
 EXECUTING_ELF_SHA256 = re.compile(
     rf"(?:bench_elf_sha256|executing_elf_sha256|current_exe_sha256)"
@@ -277,6 +301,12 @@ MULTI_WORKER = re.compile(
 # one way: a row gains the host it ran on. Raising it means an unnamed competitive
 # claim got committed past the forward gate, which is the defect itself.
 WORKER_SCOPE_BASELINE = 166
+
+# Forward-only ratchet for bd-plt79, seeded from the tree at the time it was
+# added. Like WORKER_SCOPE_BASELINE this is a floor that may only FALL: it does
+# not retract a banked row, it stops a NEW mounted ratio being banked without
+# saying where its daemon ran. Discovered by --placement-audit; do not raise it.
+PLACEMENT_SCOPE_BASELINE = 39
 
 BOOTSTRAP = re.compile(r"\bbootstrap(?:ped|ping)?\b|\bresampl(?:e|ed|es|ing)\b", re.I)
 MEDIAN = re.compile(r"\bmedian\b", re.I)
@@ -420,6 +450,23 @@ class Row:
             self.verdict == "KEEP"
             and not self.has_worker_identity()
             and bool(INCUMBENT_RATIO.search(decision_evidence(self.text)))
+        )
+
+    def is_placement_scoped_mounted_ratio(self) -> bool:
+        """A banked MOUNTED competitive claim that does not say where the daemon ran.
+
+        Narrower than "mounted": a mounted row quoting no incumbent ratio makes no
+        cross-configuration comparison, so an undeclared placement costs it
+        nothing. This is the bd-plt79 analogue of `is_worker_scoped_ratio` -- that
+        one asks which MACHINE, this one asks where on it.
+        """
+        if self.verdict != "KEEP":
+            return False
+        evidence = decision_evidence(self.text)
+        return (
+            bool(MOUNTED_ROW.search(evidence))
+            and bool(INCUMBENT_RATIO.search(evidence))
+            and not DAEMON_PLACEMENT.search(evidence)
         )
 
     def has_bootstrap_median_ci(self) -> bool:
@@ -879,6 +926,122 @@ def _display_path(path: Path) -> str:
 
 def worker_scoped_rows(rows: list[Row] | None = None) -> list[Row]:
     return [r for r in (all_rows() if rows is None else rows) if r.is_worker_scoped_ratio()]
+
+
+def placement_scoped_rows(rows: list[Row] | None = None) -> list[Row]:
+    return [
+        r
+        for r in (all_rows() if rows is None else rows)
+        if r.is_placement_scoped_mounted_ratio()
+    ]
+
+
+def cmd_placement_audit(list_rows: bool) -> int:
+    """Enumerate the banked MOUNTED ratios that never say where the daemon ran.
+
+    bd-plt79 item 3. The sibling of --worker-scope one level down: that asks
+    which machine a row ran on, this asks where on that machine the FUSE daemon
+    was placed. Both exist because a number that looks precise is not thereby
+    comparable to another number.
+
+    Reports rather than blocks on the first run, because the baseline has to be
+    discovered before it can be ratcheted, and because this finding explicitly
+    does NOT retract any banked row -- it says the uncertainty on those rows is
+    larger than recorded and gives its size.
+    """
+    rows = all_rows()
+    scoped = placement_scoped_rows(rows)
+    mounted = [
+        r
+        for r in rows
+        if r.verdict == "KEEP" and MOUNTED_ROW.search(decision_evidence(r.text))
+    ]
+    n = len(scoped)
+
+    from collections import Counter
+
+    per_file = Counter(_display_path(r.path) for r in scoped)
+    print(f"rows_parsed                 {len(rows)}")
+    print(f"mounted_keep_rows           {len(mounted)}")
+    print(f"placement_scoped_ratio_rows {n}")
+    for f, k in sorted(per_file.items()):
+        print(f"  {f:<40s} {k}")
+
+    if list_rows:
+        print("\nflagged (mounted KEEP quoting a ratio, no daemon placement declared):")
+        for r in scoped:
+            print(f"  {r.ref}\n    {r.title[:160]}")
+
+    if PLACEMENT_SCOPE_BASELINE is None:
+        print(
+            f"\nplacement-audit: baseline UNSEEDED — {n} row(s) found. Set "
+            f"PLACEMENT_SCOPE_BASELINE = {n} to arm the ratchet. Measured instrument "
+            "floor for an unpinned mounted row: A/A null to 1.4875x and cross-run "
+            "disagreement 1.2613x (bd-plt79), and a 1.72x disagreement against the "
+            "pinned comparator at matched threads (263e70c8). Neither retracts a "
+            "banked row; both say its recorded CI understates the uncertainty."
+        )
+        return 0
+
+    if n > PLACEMENT_SCOPE_BASELINE:
+        print(
+            f"\nplacement-audit: BLOCKED — {n} placement-scoped mounted ratios "
+            f"exceeds the {PLACEMENT_SCOPE_BASELINE}-row ratchet by "
+            f"{n - PLACEMENT_SCOPE_BASELINE}. A new mounted ratio was banked without "
+            "saying where its daemon ran. Record `--fuse-cpus N` or the report's "
+            "`placement_scope=`; do not raise the baseline."
+        )
+        return 2
+
+    print(f"\nplacement-audit: OK — {n} <= {PLACEMENT_SCOPE_BASELINE}")
+    return 0
+
+
+def _placement_scope_ratchet_checks() -> list[tuple[bool, str]]:
+    """bd-plt79: the mounted-placement ratchet, and the predicate under it.
+
+    Pinned to the same shape as the worker-scope checks so the two cannot drift:
+    a synthetic mounted ratio that declares no placement must be flagged, one
+    that declares any of the recognised forms must not, and a mounted row that
+    quotes no incumbent ratio must be out of scope entirely.
+    """
+    sha = "b" * 64
+    body = (
+        "mounted_kernel_ratio,filesystem=btrfs,fuse_over_kernel_median=3.36 "
+        "vs kernel btrfs 3.36x slower; median 95% CI [3.3, 3.4]; "
+        f"executing_elf_sha256 = {sha}. hostname=thinkstation1.\n"
+    )
+    undeclared = Row(Path("x.md"), 1, "## 2026-08-16 — KEEP: m (bd-x)\n" + body, "KEEP")
+    declared = Row(
+        Path("x.md"),
+        1,
+        "## 2026-08-16 — KEEP: m (bd-x)\n" + body + "placement_scope=same_llc, --fuse-cpus 1.\n",
+        "KEEP",
+    )
+    no_ratio = Row(
+        Path("x.md"),
+        1,
+        "## 2026-08-16 — KEEP: m (bd-x)\nmounted_kernel_ratio counted 4000 probes -> 4000 probes.\n",
+        "KEEP",
+    )
+    return [
+        (
+            undeclared.is_placement_scoped_mounted_ratio(),
+            "a mounted ratio declaring no daemon placement is placement-scoped",
+        ),
+        (
+            not declared.is_placement_scoped_mounted_ratio(),
+            "placement_scope=/--fuse-cpus clears the placement scope",
+        ),
+        (
+            not no_ratio.is_placement_scoped_mounted_ratio(),
+            "a mounted row quoting no incumbent ratio is out of placement scope",
+        ),
+        (
+            len(placement_scoped_rows()) == PLACEMENT_SCOPE_BASELINE,
+            f"placement ratchet holds at {PLACEMENT_SCOPE_BASELINE}",
+        ),
+    ]
 
 
 def cmd_worker_scope(list_rows: bool) -> int:
@@ -1510,6 +1673,7 @@ def cmd_self_test() -> int:
         ]
     )
     checks.extend(_worker_scope_ratchet_checks())
+    checks.extend(_placement_scope_ratchet_checks())
 
     # --- document structure is not a decision (bd-eqm8s) ---------------------
     # The bug: prose saying "record the exact keep/reject/pending status" was
@@ -1655,6 +1819,9 @@ def main() -> int:
     g.add_argument("--worker-scope", action="store_true",
                    help="ratchet the banked competitive rows that name no "
                         "execution host (retroactive half of the worker gate)")
+    g.add_argument("--placement-audit", action="store_true",
+                   help="enumerate banked MOUNTED ratios that never say where the "
+                        "FUSE daemon ran (bd-plt79; sibling of --worker-scope)")
     g.add_argument("--incumbent-audit", action="store_true",
                    help="how many KEEP claims carry a live same-invocation "
                         "incumbent ratio, and why the rest do not")
@@ -1677,6 +1844,8 @@ def main() -> int:
     a = ap.parse_args()
     if a.worker_scope:
         return cmd_worker_scope(a.list)
+    if a.placement_audit:
+        return cmd_placement_audit(a.list)
     if a.incumbent_audit:
         return cmd_incumbent_audit(a.show)
     if a.candidate:
