@@ -12079,3 +12079,57 @@ requests over the same four**, every per-op figure landing on an integer. Proven
 cpu 8 (observed), client to cpus 16-23, read-write managed mount. **No build started**:
 `df -h /data` was 61G, above the threshold, but both project build slots were occupied,
 which is the cap.
+
+## 2026-08-16 — REFUSED BY THE INSTRUMENT, recorded not claimed: ext4 readdir+stat measured `3.685341x` and `3.778850x` on a PGO+v3 candidate, both runs vetoed CONTENDED (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Two complete crossover runs of the campaign's worst-shaped row against kernel ext4, in one
+invocation each, on a host that would not stay quiet. **Neither is an admissible row and
+neither is being claimed.** They are recorded because the numbers exist and suppressing a
+measured figure because it was refused is how a ledger stops being a record.
+
+| run | `fuse_over_kernel_median` | CI | kernel A/A null | fuse A/A null | verdict |
+| --- | --- | --- | --- | --- | --- |
+| A | `3.685341x` | `[3.679825, 3.731010]` | `1.000152` clear | `1.002404` clear | `HONEST_LOSS`, `admitted=true` |
+| B | `3.778850x` | `[3.720437, 3.826641]` | `1.006952` clear | `1.010101` **clear=false** | `BLOCKED_NULL` |
+
+Run A satisfied every gate it was measured against — both nulls clear, `directional_claim_clear=true`,
+`twice_null_margin_ratio=1.013730` — and was then refused by the POST-HOC socket-contention
+check: `external_load_during_run,samples=67,over_limit_samples=67,contended_fraction=1.0000,
+max_consecutive_over_limit=67,peak_off_placement_mean_busy=0.342711,verdict=CONTENDED`. Run B
+was refused by its own fuse A/A null (`symmetric_spread=1.061850` against a `1.025` maximum) and
+was likewise CONTENDED.
+
+The two runs AGREE: the CIs overlap on `[3.720437, 3.731010]`, and run B's two nulls are off in
+the same direction by similar amounts (`+0.70%` kernel, `+1.01%` fuse), which is the campaign's
+stated condition for excusing a failing null. That agreement is why these are worth recording —
+but agreement between two contended runs is not admissibility, and the worst bound here
+(`3.826641x`) is quoted only to say what the pair spans, not to claim it.
+
+**Provenance.** `bench_evidence,binary_sha256=52c54c0167174b8c2bbf00ba44ea77e4d2639bd604ffa39a0fec504ce4c8d7ab` — the driver's own in-process self-report of the ELF that executed. `RCH_WORKER=none` (a mount is local by necessity; rch cannot return a linked binary), `hostname=thinkstation1`, `executed_on=thinkstation1`, worker: `thinkstation1-local`. Run A bootstrap median `3.685341x` with bootstrap median CI `[3.679825, 3.731010]`; run B bootstrap median `3.778850x` with bootstrap median CI `[3.720437, 3.826641]`. Both medians above are **bootstrap median CIs**, `bootstrap_resamples=20000` resamples, estimator `four_round_balanced_crossover_bootstrap_median_ci`.
+
+Candidate `binary_sha256=af6de55e7089f9b9091cc992fcb3a9c1c23a581f060b092789c40977e39a1c53`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`. Driver
+`binary_sha256=52c54c0167174b8c2bbf00ba44ea77e4d2639bd604ffa39a0fec504ce4c8d7ab`. Both built and
+executed on `thinkstation1` (`retrieval=built_in_place_on_executing_host`); rch worker NONE,
+because rch does not return a linked binary and a mount is local by necessity.
+`mounted_kernel_incumbent_isolation verdict=pass`, `same_invocation=true`,
+`independent_physical_arms=true`. Pre- and post-run fixture parity both `verdict=pass`, identical
+`tree_sha256=a03f45c5159da2e0b47b488a36ec52c0ceb078486105780de21c61b7e9ef8aac`, 32,773 entries.
+
+**NOT COMPARABLE TO THE BANKED ext4 ROW, and this is the most important caveat.** The banked
+ext4 readdir+stat figures (`4.052605x` / `4.163402x`) were measured with artifacts on the LVM
+volume. `/data` is at 98% and could not satisfy the harness's own free-space floor, so these two
+runs put the artifact root on `/dev/sda1` via a bind mount at the required `/data/tmp` path. That
+is a different storage substrate for BOTH arms. The pairing stays internally fair, but
+`3.69–3.78x` must not be read as an improvement on `4.05–4.16x` — different substrate, and the
+comparison is not licensed.
+
+**No lever is credited.** The candidate carries the range-leaf capability memo from `895b6884`,
+but that backend is opt-in and was OFF in both runs, so these measure the shipping direct-mapped
+path. Nothing here says anything about the lever.
+
+Counted mechanism: **67 of 67 contention samples over limit** in each run, with
+`max_external_busy_cpus=22` and `23` against a limit of `2` — the refusal is itself a count, not
+a judgement. Reports preserved at `/data/tmp/frankenfs-mounted-kernel/run_1786891969_262502156_372530/`
+and `run_1786892101_911482027_395758/`.
