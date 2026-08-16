@@ -4680,6 +4680,26 @@ fn runtime_isa_label(host: &HostProvenance) -> String {
         .join("+")
 }
 
+/// Whether placement selection may re-sample after a failed attempt (bd-placement-retry).
+///
+/// Encodes the two rules the retry loop must obey, as a pure function so they can
+/// be tested without a live host:
+///
+/// 1. A `HostWide` window came from `wait_for_host_quiet`, which has ALREADY waited
+///    for a settled observation. Re-sampling it would spin without changing the
+///    input, so that path never retries.
+/// 2. Otherwise retry only while inside the caller's quiet budget.
+///
+/// This changes WHEN placement gives up, never WHAT it accepts: every threshold and
+/// every `ensure!` in the selection is untouched.
+const fn placement_retry_permitted(
+    is_settled_host_wide_window: bool,
+    elapsed_ms: u64,
+    budget_ms: u64,
+) -> bool {
+    !is_settled_host_wide_window && elapsed_ms < budget_ms
+}
+
 fn thread_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
     let path = PathBuf::from(format!(
         "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
@@ -4748,51 +4768,91 @@ fn select_cpu_placement(
     } else {
         None
     };
-    let busy = if let Some(window) = &initial_host_quiet_window {
-        window.busy_fractions.clone()
-    } else {
-        sample_cpu_busy()?
-    };
-    let mut ranked: Vec<(usize, f64)> = busy
-        .iter()
-        .filter(|(cpu, _)| allowed_cpus.contains(cpu))
-        .map(|(&cpu, &load)| (cpu, load))
-        .collect();
-    ensure!(!ranked.is_empty(), "no allowed CPUs were sampled");
-    if scope == PlacementScope::HostWide {
-        ensure!(
-            ranked.len() == allowed_cpus.len(),
-            "host-wide placement sampled {} of {} allowed CPUs",
-            ranked.len(),
-            allowed_cpus.len()
-        );
-        ensure!(
-            busy_cpus_above_limit(&busy, allowed_cpus, MAX_DRIVER_PREFLIGHT_BUSY)?.is_empty(),
-            "host-wide quiet-window helper returned a busy final sample"
-        );
-    }
-    ranked.sort_by(|left, right| {
-        left.1
-            .total_cmp(&right.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    let mut driver = None;
-    for &(cpu, load) in &ranked {
-        let siblings = thread_siblings(cpu)?
-            .intersection(allowed_cpus)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if siblings.iter().all(|sibling| {
-            busy.get(sibling)
-                .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
-        }) {
-            driver = Some((cpu, load, siblings));
-            break;
+    // bd-placement-retry: RETRY the sample instead of failing on the first one.
+    //
+    // The thresholds below are UNCHANGED. MAX_DRIVER_PREFLIGHT_BUSY, the SMT-sibling
+    // requirement and every ensure! are identical; the only difference is that a
+    // transiently busy host now gets re-sampled within the quiet budget this
+    // function already accepts, instead of aborting the run on one unlucky sample.
+    //
+    // Why this is a defect rather than a preference: PlacementScope::HostWide
+    // already calls wait_for_host_quiet() with host_quiet_timeout_ms, so the
+    // waiting machinery exists and is wired. The SameLlc path — which is what the
+    // mounted comparator actually uses — took a SINGLE sample_cpu_busy() and gave
+    // up. The narrower, more commonly used path was the one with no patience.
+    //
+    // Measured cost of that asymmetry on 2026-08-16: 20+ invocations of the worst
+    // row refused before measuring, on a host whose load oscillated between 17 and
+    // 94 on a minute timescale. An externally observed "quiet window" is stale by
+    // the time a run starts — loadavg read 16.8 to an operator and 32.35 to the
+    // process seconds later — so the sample must be taken by the process that then
+    // immediately measures, retried until it holds or the budget expires.
+    let start = std::time::Instant::now();
+    let mut placement_attempts: u32 = 0;
+    let (busy, ranked, driver_cpu, driver_busy, driver_guard_cpus) = loop {
+        placement_attempts += 1;
+        let busy = if let Some(window) = &initial_host_quiet_window {
+            window.busy_fractions.clone()
+        } else {
+            sample_cpu_busy()?
+        };
+        let mut ranked: Vec<(usize, f64)> = busy
+            .iter()
+            .filter(|(cpu, _)| allowed_cpus.contains(cpu))
+            .map(|(&cpu, &load)| (cpu, load))
+            .collect();
+        ensure!(!ranked.is_empty(), "no allowed CPUs were sampled");
+        if scope == PlacementScope::HostWide {
+            ensure!(
+                ranked.len() == allowed_cpus.len(),
+                "host-wide placement sampled {} of {} allowed CPUs",
+                ranked.len(),
+                allowed_cpus.len()
+            );
+            ensure!(
+                busy_cpus_above_limit(&busy, allowed_cpus, MAX_DRIVER_PREFLIGHT_BUSY)?.is_empty(),
+                "host-wide quiet-window helper returned a busy final sample"
+            );
         }
-    }
-    let (driver_cpu, driver_busy, driver_guard_cpus) = driver.ok_or_else(|| {
-        anyhow!("no physical core has every SMT thread below the driver contention limit")
-    })?;
+        ranked.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut driver = None;
+        for &(cpu, load) in &ranked {
+            let siblings = thread_siblings(cpu)?
+                .intersection(allowed_cpus)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if siblings.iter().all(|sibling| {
+                busy.get(sibling)
+                    .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
+            }) {
+                driver = Some((cpu, load, siblings));
+                break;
+            }
+        }
+        if let Some((driver_cpu, driver_busy, driver_guard_cpus)) = driver {
+            break (busy, ranked, driver_cpu, driver_busy, driver_guard_cpus);
+        }
+        // A HostWide window is a single settled observation from
+        // wait_for_host_quiet; re-sampling would not change it, so do not spin.
+        let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if !placement_retry_permitted(
+            initial_host_quiet_window.is_some(),
+            elapsed_ms,
+            host_quiet_timeout_ms,
+        ) {
+            bail!(
+                "no physical core has every SMT thread below the driver contention \
+                 limit after {placement_attempts} sample(s) over {}ms",
+                host_quiet_timeout_ms
+            );
+        }
+        thread::sleep(CPU_SAMPLE_INTERVAL);
+    };
+    let _ = &ranked;
     ensure!(
         driver_busy <= MAX_DRIVER_PREFLIGHT_BUSY,
         "quietest driver CPU cpu{driver_cpu} was {:.1}% busy, above {:.1}% limit",
@@ -7701,6 +7761,38 @@ mod tests {
             scratch_image_dir(run).unwrap(),
             Path::new("/data/tmp/comparator/images")
         );
+    }
+
+    /// bd-placement-retry: the retry rule must be bounded and must not spin a
+    /// settled window.
+    ///
+    /// This pins WHEN placement gives up. It deliberately does not touch WHAT
+    /// placement accepts — MAX_DRIVER_PREFLIGHT_BUSY and the SMT-sibling
+    /// requirement are unchanged, and a run that could not be placed before this
+    /// change still cannot be placed by it. The only difference is that a
+    /// transiently busy host is re-sampled instead of aborting the run on one
+    /// unlucky sample.
+    #[test]
+    fn placement_retry_is_bounded_and_never_spins_a_settled_window() {
+        // Inside the budget on a same-LLC scope: retry.
+        assert!(placement_retry_permitted(false, 0, 300_000));
+        assert!(placement_retry_permitted(false, 299_999, 300_000));
+
+        // At or past the budget: stop. Without this the loop is unbounded, and an
+        // unbounded placement retry would hold a measurement slot forever on a
+        // permanently busy host.
+        assert!(!placement_retry_permitted(false, 300_000, 300_000));
+        assert!(!placement_retry_permitted(false, 300_001, 300_000));
+
+        // A settled HostWide window NEVER retries, however much budget remains:
+        // it came from wait_for_host_quiet, so re-sampling cannot change the input
+        // and would spin against an unchanging observation.
+        assert!(!placement_retry_permitted(true, 0, 300_000));
+        assert!(!placement_retry_permitted(true, 1, u64::MAX));
+
+        // A zero budget disables retry entirely, which is what restores the old
+        // fail-fast behaviour if anyone needs it back.
+        assert!(!placement_retry_permitted(false, 0, 0));
     }
 
     #[test]

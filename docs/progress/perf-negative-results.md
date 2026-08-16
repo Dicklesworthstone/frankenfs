@@ -12829,3 +12829,66 @@ refused by the contention veto, and none of those has been called a loss here.
 
 Current loadavg `43` — outside the runnable band — so no run was attempted this turn, which
 is the instruction applied rather than an obstacle reported.
+
+## 2026-08-16 — SIXTH clean-null run in the session's quietest window: btrfs readdir+stat `8.110590x` at loadavg `20.91`; six runs, the `5.72%` gap is STILL empty (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Run in the quietest window of the session, with loadavg recorded per the fleet finding.
+
+    RUN 8 (quoted)
+    bootstrap median 8.110590x with bootstrap median CI [8.011806, 8.150780], 20000 resamples
+    same-invocation A/A null control, kernel arm  1.001330  spread 1.014156  clear=true
+    same-invocation A/A null control, fuse arm    1.003987  spread 1.015420  clear=true
+    twice_null_margin_ratio = 1.031078
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+    LOADAVG 20.91 at invocation, 16.02 at completion (1/5/15: 20.91 28.99 29.85 -> 16.02 26.44 28.93)
+    placement_cpus = 24:29:31:56:57:58:60:62, driver_thread_cpu = 24
+
+Still refused post-hoc: `external_load_during_run,samples=47,over_limit_samples=47,
+contended_fraction=1.0000,max_external_busy_cpus=23,peak_off_placement_mean_busy=0.341993,
+verdict=CONTENDED`.
+
+**The operator-observed loadavg was `13`; the value this process read at invocation was
+`20.91`.** That is the third time today an externally observed quiet window was stale by the
+time the run started — earlier, `16.8` observed against `32.35` read. Loadavg moves faster
+than a run can start, which is exactly why the harness must sample it itself.
+
+### Six clean-null runs, gap unchanged
+
+    7.316939   [7.247609, 7.338024]   loadavg ~18
+    7.453004   [7.275531, 7.494622]   loadavg ~25
+    7.531731   [7.531255, 7.618960]   loadavg ~18
+    ---------- 5.72% of clear space, SIX runs, none inside ----------
+    8.065190   [8.054564, 8.109706]   loadavg ~24
+    8.110590   [8.011806, 8.150780]   loadavg 20.91   <- new
+    8.170852   [8.113987, 8.217506]   loadavg ~25
+
+Six points, three per group, and nothing has landed in the gap. **Loadavg does not separate
+the groups either** — both contain runs at ~18-25 — which matches the earlier finding that
+contention severity does not separate them. Two independent host-load measures now fail to
+explain the split.
+
+### The discrete-cause test is set up but not yet runnable
+
+Placement is the remaining candidate and this run is the first with it captured:
+`placement_cpus=24:29:31:56:57:58:60:62`, driver `24` — a HIGH-group run drawn entirely from
+the upper socket range. The correlation cannot be completed yet: the report JSON carries
+`driver_cpus`, `placement_cpus`, `driver_thread_cpu` and `admitted`, but NOT the ratio under
+`fuse_over_kernel_median`, so ratio and placement cannot be joined from the reports alone.
+**Next step, cheap and needing no measurement: find the key the report stores the ratio
+under, then join it to `placement_cpus` across all preserved runs.** If the low group is
+consistently one socket range and the high group another, the split is placement and the
+campaign has been quoting an average over two distinct hardware configurations.
+
+Until then the clustering remains an OBSERVATION with a stated test, as it has been since it
+appeared at four points. No mechanism is claimed.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+private copy of the candidate. Estimator `four_round_balanced_crossover_bootstrap_median_ci`.
+LVM volume, same substrate as the banked rows. Nothing claimed, nothing superseded; banked
+`7.753405x`/`7.649395x` stands and still sits inside the empty gap.
+
+Counted mechanism: **47 of 47 contention samples over limit**, `max_external_busy_cpus=23`
+against a limit of `2`.
