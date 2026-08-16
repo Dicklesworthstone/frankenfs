@@ -5568,7 +5568,7 @@ fn fs_report(
     };
 
     thread::sleep(Duration::from_millis(config.pre_measurement_settle_ms));
-    let post_mount_host_quiet_window = if config.placement_scope == PlacementScope::HostWide {
+    let post_mount_host_quiet_window = if requires_host_wide_quiet_window(config.placement_scope) {
         Some(wait_for_host_quiet(
             &placement.allowed_cpus,
             config.host_quiet_samples,
@@ -6614,6 +6614,18 @@ fn fs_report(
     Ok(Value::Object(report))
 }
 
+/// Whether a scope must WAIT for host-wide quiescence before measuring.
+///
+/// Only `host-wide` does. `balanced-square` deliberately does not (bd-owajb):
+/// its whole point is that the comparison survives a busy host by interleaving
+/// the arms, with contention caught after the fact by the per-arm A/A nulls
+/// instead of excluded up front. Extracted from an inline scope comparison so
+/// the rule can be asserted; a gate rule written as an inline `==` cannot be
+/// pinned, and an unpinned rule can be widened silently.
+const fn requires_host_wide_quiet_window(scope: PlacementScope) -> bool {
+    matches!(scope, PlacementScope::HostWide)
+}
+
 const fn placement_evidence_mode(scope: PlacementScope) -> &'static str {
     match scope {
         PlacementScope::BalancedSquare => "busy_host_balanced_square_with_posthoc_aa_nulls",
@@ -7645,6 +7657,56 @@ mod tests {
         assert!(absolute_arm_medians_are_valid(1.0, 1.0));
         assert!(!absolute_arm_medians_are_valid(0.0, 1.0));
         assert!(!absolute_arm_medians_are_valid(f64::NAN, 1.0));
+    }
+
+    /// bd-owajb: the busy-host scope must NOT wait for host-wide quiescence —
+    /// that precondition is the thing it exists to avoid. Pinned as a predicate
+    /// because it used to be an inline `==` at the call site, which nothing
+    /// could assert.
+    #[test]
+    fn only_host_wide_waits_for_quiescence_bd_owajb() {
+        assert!(requires_host_wide_quiet_window(PlacementScope::HostWide));
+        assert!(
+            !requires_host_wide_quiet_window(PlacementScope::BalancedSquare),
+            "balanced-square must not wait for host-wide quiescence; avoiding \
+             that precondition is the entire point of the design"
+        );
+        assert!(!requires_host_wide_quiet_window(PlacementScope::SameLlc));
+    }
+
+    /// bd-5mwos: a reader must be able to tell from the report ALONE that a
+    /// balanced-square row skipped host-wide quiescence on purpose and still
+    /// carried A/A gating. That is carried by one machine-readable string, so
+    /// pin its exact value — a row's self-description is evidence, and evidence
+    /// that can be reworded without a test failing is not evidence.
+    #[test]
+    fn balanced_square_declares_its_busy_host_evidence_mode_bd_5mwos() {
+        assert_eq!(
+            placement_evidence_mode(PlacementScope::BalancedSquare),
+            "busy_host_balanced_square_with_posthoc_aa_nulls"
+        );
+        assert_eq!(
+            placement_evidence_mode(PlacementScope::HostWide),
+            "host_wide_quiescence_preflight"
+        );
+        assert_eq!(
+            placement_evidence_mode(PlacementScope::SameLlc),
+            "same_llc_contention_preflight"
+        );
+        // The three modes must stay distinguishable, or the field cannot say
+        // which regime produced a row.
+        let modes = [
+            placement_evidence_mode(PlacementScope::BalancedSquare),
+            placement_evidence_mode(PlacementScope::HostWide),
+            placement_evidence_mode(PlacementScope::SameLlc),
+        ];
+        let unique: std::collections::BTreeSet<_> = modes.iter().collect();
+        assert_eq!(unique.len(), modes.len(), "evidence modes must be distinct");
+        // Only the busy-host mode advertises the post-hoc null regime.
+        assert!(
+            placement_evidence_mode(PlacementScope::BalancedSquare).contains("posthoc_aa_nulls")
+        );
+        assert!(!placement_evidence_mode(PlacementScope::HostWide).contains("posthoc_aa_nulls"));
     }
 
     #[test]
