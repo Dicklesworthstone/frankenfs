@@ -37,11 +37,17 @@
 # multiplicatively.
 #
 # ── Reading the nulls ───────────────────────────────────────────────────────
-# "The A/A null must contain 1.0" is NOT scale-free. In the quietest window
-# measured, the FrankenFS null failed at 1.0215x ci95 [1.0047, 1.0341] — not
-# because the run was worse but because it was precise enough to resolve a real
-# ~2% ordering effect that load had previously buried. Compare the null to the
-# EFFECT, not to 1.0. There, 2.15% against 462% is decisive.
+# "The A/A null must contain 1.0" is NOT scale-free. In one quiet window the
+# FrankenFS null failed at 1.0215x ci95 [1.0047, 1.0341] — a 2.15% deviation that
+# a narrow interval was able to reject. Compare the null to the EFFECT, not to
+# 1.0: 2.15% against 462% is decisive either way.
+#
+# Do NOT read that failure as a real ordering effect. I originally explained it as
+# the instrument resolving a genuine ~2% difference between an arm's first and
+# second visit; a later run at the same load put the same null at 1.0070x, so a
+# systematic effect would have reproduced and did not. It was noise landing
+# outside a narrow interval. The scale-free-criterion point survives; the
+# mechanism does not.
 #
 # ── Usage ───────────────────────────────────────────────────────────────────
 #   FFS_CLI=/path/to/ffs-cli FFS_IMG=/path/to.img \
@@ -66,12 +72,20 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 [ -x "$CLI" ] || { echo "FATAL: no ffs-cli at $CLI"; exit 2; }
 [ -f "$IMG" ] || { echo "FATAL: no image at $IMG"; exit 2; }
 
-# Refuse to certify under load rather than bank a row that will be refused later.
-LOAD1=$(awk '{print int($1)}' /proc/loadavg)
-if [ "$LOAD1" -gt "${FFS_MAX_LOAD:-30}" ]; then
-  echo "DEFERRED: loadavg $(awk '{print $1}' /proc/loadavg) exceeds ${FFS_MAX_LOAD:-30}."
-  echo "A failure to certify under load is not a loss. Re-run when quiet."
-  exit 4
+# Refuse to certify on an UNSTABLE host rather than bank a row that will be
+# refused later. The gate is stability, not absolute quiet: a 1-minute average
+# dipping to 10 while the 5-minute sits at 25 is the tail of a burst, and a run
+# launched into it finishes in a busier window than it started. A host pinned flat
+# at a moderate level is the better place to certify. See scripts/host_stability.py
+# for the criteria and its self-test; set FFS_SKIP_STABILITY=1 to override
+# deliberately, which will be visible in the row because the reason is printed.
+if [ "${FFS_SKIP_STABILITY:-0}" != "1" ]; then
+  if ! STABILITY=$(python3 "$HERE/host_stability.py"); then
+    echo "$STABILITY"
+    echo "A failure to certify under load is not a loss. Re-run when stable."
+    exit 4
+  fi
+  echo "$STABILITY"
 fi
 
 BIN=$OUT/client
