@@ -60,8 +60,8 @@ fn crc32c_combine(mut crc1: u32, crc2: u32, mut len2: u64) -> u32 {
     // `odd` = operator for a single zero BIT.
     odd[0] = CRC32C_REFLECTED_POLY;
     let mut row = 1u32;
-    for n in 1..GF2_DIM {
-        odd[n] = row;
+    for slot in odd.iter_mut().take(GF2_DIM).skip(1) {
+        *slot = row;
         row <<= 1;
     }
     gf2_matrix_square(&mut even, &odd); // even = 2 zero bits
@@ -120,6 +120,9 @@ fn crc32c_incremental(crc_old: u32, block_len: usize, pos: usize, delta: &[u8]) 
 }
 
 fn bench_crc_incremental(c: &mut Criterion) {
+    // Hoisted from mid-function (bd-3ao0l): items are in scope from the start
+    // of the block, so declaring one after statements misleads the reader.
+    const N: usize = 4096;
     // ---- Correctness proof #1: crc32c_combine == full crc of concatenation ----
     for s in 0..64u64 {
         let a = prng_bytes(s + 1, (s as usize) * 7 + 3);
@@ -135,7 +138,6 @@ fn bench_crc_incremental(c: &mut Criterion) {
     }
 
     // ---- Correctness proof #2: incremental dir-edit crc == full re-crc ----
-    const N: usize = 4096;
     for s in 0..32u64 {
         let mut block = prng_bytes(s + 7, N);
         let crc_old = crc32c::crc32c(&block);

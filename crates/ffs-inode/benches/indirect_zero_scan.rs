@@ -14,8 +14,11 @@ fn byte_all_zero(data: &[u8]) -> bool {
 }
 
 fn unrolled4_all_zero(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
+    // Mirrors the production `indirect_block_all_zero` conversion: same split,
+    // same order, `.all()` still short-circuits at the first non-zero lane, so the
+    // arm this bench measures stays the arm production runs (bd-3ao0l).
+    let (blocks, blocks_rest) = data.as_chunks::<32>();
+    for block in blocks {
         let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
@@ -24,9 +27,8 @@ fn unrolled4_all_zero(data: &[u8]) -> bool {
             return false;
         }
     }
-    let mut tail = chunks.remainder().chunks_exact(8);
-    tail.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&b| b == 0)
+    let (lanes, rest) = blocks_rest.as_chunks::<8>();
+    lanes.iter().all(|c| u64::from_ne_bytes(*c) == 0) && rest.iter().all(|&b| b == 0)
 }
 
 #[inline(never)]
@@ -39,7 +41,7 @@ fn linear_cutoff_scan(pointers: &[u32], base: u64, cutoff: u64, entry_span: u64)
         if child_base.saturating_add(entry_span) <= cutoff {
             continue;
         }
-        let pointer = pointers[i as usize];
+        let pointer = pointers[usize::try_from(i).expect("pointer index fits usize")];
         if pointer == 0 {
             continue;
         }
@@ -68,7 +70,7 @@ fn bounded_cutoff_scan(pointers: &[u32], base: u64, cutoff: u64, entry_span: u64
         if child_base.saturating_add(entry_span) <= cutoff {
             continue;
         }
-        let pointer = pointers[i as usize];
+        let pointer = pointers[usize::try_from(i).expect("pointer index fits usize")];
         if pointer == 0 {
             continue;
         }
@@ -91,7 +93,7 @@ fn bounded_leaf_scan(pointers: &[u32], base: u64, cutoff: u64) -> (u64, u64) {
     let mut visited = 0u64;
     let mut digest = 0u64;
     for i in first_entry..ppb {
-        let pointer = pointers[i as usize];
+        let pointer = pointers[usize::try_from(i).expect("pointer index fits usize")];
         if pointer == 0 {
             continue;
         }
@@ -103,7 +105,18 @@ fn bounded_leaf_scan(pointers: &[u32], base: u64, cutoff: u64) -> (u64, u64) {
     (visited, digest)
 }
 
-fn bench(c: &mut Criterion) {
+/// One indirect block's worth of pointers, every 11th a hole, shared by both
+/// truncate benches below so the two groups measure the same fixture.
+fn fixture_pointers() -> Vec<u32> {
+    (0..1024)
+        .map(|i| if i % 11 == 0 { 0 } else { i + 1 })
+        .collect()
+}
+
+const FIXTURE_BASE: u64 = 12;
+const FIXTURE_CUTOFF: u64 = FIXTURE_BASE + 900;
+
+fn bench_all_zero(c: &mut Criterion) {
     let zero = vec![0u8; 4096];
     let mut early = vec![0u8; 4096];
     early[0] = 1;
@@ -111,19 +124,19 @@ fn bench(c: &mut Criterion) {
         assert_eq!(byte_all_zero(block), unrolled4_all_zero(block));
         let mut g = c.benchmark_group(format!("indirect_all_zero_{name}"));
         g.bench_function("byte", |b| {
-            b.iter(|| black_box(byte_all_zero(black_box(block))))
+            b.iter(|| black_box(byte_all_zero(black_box(block))));
         });
         g.bench_function("unrolled4", |b| {
-            b.iter(|| black_box(unrolled4_all_zero(black_box(block))))
+            b.iter(|| black_box(unrolled4_all_zero(black_box(block))));
         });
         g.finish();
     }
+}
 
-    let pointers: Vec<u32> = (0..1024)
-        .map(|i| if i % 11 == 0 { 0 } else { i + 1 })
-        .collect();
-    let base = 12u64;
-    let cutoff = base + 900;
+fn bench_truncate_prefix(c: &mut Criterion) {
+    let pointers = fixture_pointers();
+    let base = FIXTURE_BASE;
+    let cutoff = FIXTURE_CUTOFF;
     let entry_span = 1u64;
     for &(case_base, case_cutoff, case_span) in &[
         (base, base - 1, 1),
@@ -151,7 +164,7 @@ fn bench(c: &mut Criterion) {
                 black_box(cutoff),
                 black_box(entry_span),
             ))
-        })
+        });
     });
     g.bench_function("linear_b", |b| {
         b.iter(|| {
@@ -161,7 +174,7 @@ fn bench(c: &mut Criterion) {
                 black_box(cutoff),
                 black_box(entry_span),
             ))
-        })
+        });
     });
     g.bench_function("bounded", |b| {
         b.iter(|| {
@@ -171,10 +184,15 @@ fn bench(c: &mut Criterion) {
                 black_box(cutoff),
                 black_box(entry_span),
             ))
-        })
+        });
     });
     g.finish();
+}
 
+fn bench_leaf_guard(c: &mut Criterion) {
+    let pointers = fixture_pointers();
+    let base = FIXTURE_BASE;
+    let cutoff = FIXTURE_CUTOFF;
     for &(case_base, case_cutoff) in &[
         (base, base - 1),
         (base, base),
@@ -202,7 +220,7 @@ fn bench(c: &mut Criterion) {
                 black_box(cutoff),
                 black_box(1),
             ))
-        })
+        });
     });
     g.bench_function("bounded_guard_b", |b| {
         b.iter(|| {
@@ -212,7 +230,7 @@ fn bench(c: &mut Criterion) {
                 black_box(cutoff),
                 black_box(1),
             ))
-        })
+        });
     });
     g.bench_function("leaf_guard_elided", |b| {
         b.iter(|| {
@@ -221,9 +239,15 @@ fn bench(c: &mut Criterion) {
                 black_box(base),
                 black_box(cutoff),
             ))
-        })
+        });
     });
     g.finish();
+}
+
+fn bench(c: &mut Criterion) {
+    bench_all_zero(c);
+    bench_truncate_prefix(c);
+    bench_leaf_guard(c);
 }
 
 criterion_group!(benches, bench);

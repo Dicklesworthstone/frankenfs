@@ -2,10 +2,11 @@
 #![allow(clippy::cast_possible_truncation)]
 
 //! Same-process A/B for `locate_inode`'s address arithmetic: the division/modulo
-//! form (`÷ inodes_per_group`, `÷ block_size`) vs a strength-reduced form (shift
-//! + mask for the power-of-two divisors that ext4 uses by invariant/default).
-//! `locate_inode` runs on EVERY inode read/write — every `getattr`/walk stat, and
-//! twice per create — so the per-call DIV cost is on the hot metadata path.
+//! form (`÷ inodes_per_group`, `÷ block_size`) vs a strength-reduced form
+//! (shift-and-mask for the power-of-two divisors that ext4 uses by
+//! invariant/default). `locate_inode` runs on EVERY inode read/write — every
+//! `getattr`/walk stat, and twice per create — so the per-call DIV cost is on the
+//! hot metadata path.
 //!
 //! REFUTED (do NOT re-implement): production `locate_inode` intentionally RETAINS
 //! the division form. The strength-reduced form measured 1.00x (`division`
@@ -116,7 +117,7 @@ fn bench_locate(c: &mut Criterion) {
                 }
             }
             black_box(acc)
-        })
+        });
     });
     g.bench_function("strength_reduced", |b| {
         b.iter(|| {
@@ -130,7 +131,7 @@ fn bench_locate(c: &mut Criterion) {
                 }
             }
             black_box(acc)
-        })
+        });
     });
     g.finish();
 }
