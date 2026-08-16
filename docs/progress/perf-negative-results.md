@@ -9913,3 +9913,4 @@ path-resolution ops, or a FUSE ABI flag that lets a daemon declare an inode has 
 `security.*` xattrs so the kernel can cache the negative. Do NOT re-test V2 on 6.17 —
 measured inert. Experimental wiring reverted; the ABI constant is kept in the vendored
 fuser so the next attempt does not rediscover that it was missing.
+
