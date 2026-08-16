@@ -56188,6 +56188,13 @@ mod tests {
         //   A/A  = off1/off2 and on1/on2   (slots 1-4 and 2-3)
         // Each is a symmetric pairing about the round's midpoint, so a linear
         // drift cancels in both rather than in neither.
+        // Absolute per-arm times, not just the ratio. A ratio cannot say WHICH
+        // arm moved (bd-4sull item 3), and it cannot say how far the surviving
+        // cost sits from an incumbent — the ns/stat figure below is what a
+        // vs-kernel comparison would have to close, so record it here where it
+        // is free rather than inferring it later from a ratio.
+        let mut off_ns: Vec<f64> = Vec::with_capacity(rounds * 2);
+        let mut on_ns: Vec<f64> = Vec::with_capacity(rounds * 2);
         for _ in 0..rounds {
             let (ok_off1, t_off1, look_off) = arm(true);
             let (ok_on1, t_on1, look_on) = arm(false);
@@ -56200,10 +56207,21 @@ mod tests {
             ab_log_ratios.push((secs(t_off2) / secs(t_on2)).ln());
             null_log_ratios.push((secs(t_off1) / secs(t_off2)).ln());
             null_log_ratios.push((secs(t_on1) / secs(t_on2)).ln());
+            for d in [t_off1, t_off2] {
+                off_ns.push(d.as_secs_f64() * 1e9);
+            }
+            for d in [t_on1, t_on2] {
+                on_ns.push(d.as_secs_f64() * 1e9);
+            }
             look_off_last = look_off;
             look_on_last = look_on;
             ok_last = ok_on1;
         }
+        let off_median_ns = bd_5vis3_median(off_ns);
+        let on_median_ns = bd_5vis3_median(on_ns);
+        let stats = f64::from(u32::try_from(ok_last.max(1)).unwrap_or(u32::MAX));
+        let per_stat_off_ns = off_median_ns / stats;
+        let per_stat_on_ns = on_median_ns / stats;
         let ab = bd_5vis3_bootstrap_median_ci(&ab_log_ratios);
         let null = bd_5vis3_bootstrap_median_ci(&null_log_ratios);
         // The ledger will not bank a ratio without the executing ELF naming
@@ -56218,14 +56236,19 @@ mod tests {
              executing_elf_sha256 {}\n  \
              memo OFF lookups {look_off_last}, memo ON lookups {look_on_last}\n  \
              wall ratio median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]\n  \
-             A/A null  median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]",
+             A/A null  median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]\n  \
+             absolute medians: memo_off {:.0} ns ({:.1} ns/stat), memo_on {:.0} ns ({:.1} ns/stat)",
             bd_5vis3_executing_elf_sha256(),
             ab.median,
             ab.low,
             ab.high,
             null.median,
             null.low,
-            null.high
+            null.high,
+            off_median_ns,
+            per_stat_off_ns,
+            on_median_ns,
+            per_stat_on_ns
         );
         // The A/B must clear the null envelope, or the number is instrument noise.
         assert!(
