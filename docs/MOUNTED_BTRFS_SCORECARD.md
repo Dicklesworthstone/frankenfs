@@ -128,6 +128,21 @@ runs are recorded above precisely so this cannot recur for them.
   larger default still owes bd-5vis3's bar — peak resident memory, plus a non-fitting
   workload measured beside a fitting one. What is established is that the lever is real
   and large at a realistic directory size (`bd-34hzz`).
+  **Where the cost sits, attributed 2026-08-16 (AzureBay).** At 8 threads the steady-state
+  boundary traffic is **exactly one `security.capability` GETXATTR per entry** — no
+  GETATTR, no LOOKUP, no STATX — the same mechanism as the warm-stat row. Splitting our
+  own arm by the daemon's internal dispatch counters (K=1 vs K=5 sweeps, differenced):
+  at 4096 slots the daemon is `3148.3` ns/entry = **47.21%** of the `6669.2` ns/entry FUSE
+  arm; at 65,536 it is **0% ± 2.5%** of the `3231.8` ns/entry arm. The counts settle it
+  before any timing: `getxattr_dispatch_count` goes `32,770 → 163,842` over four extra
+  sweeps at 4096 (every sweep re-descends every entry) and `32,770 → 32,770` at 65,536
+  (nothing descends again).
+  So **at the shipping default this row is about half our filesystem work and half
+  transport; sized to the directory it is essentially all transport** — the same wall
+  warm stat is against. Removing the measured daemon work predicts `1.894x` against the
+  measured `2.064x`, so the descent explains `88%` of the lever and `~12%` is residual and
+  unexplained. ⛔ Two hypotheses for that residual have already been retracted; do not
+  argue a lever from it.
 - **Warm stat: we lose.** About `4.8` times slower, re-measured 2026-08-08 as an admitted
   pair on a current ELF (`4.769886x` / `4.802719x`, spread `0.69%`); the banked
   `4.977803x` / `5.036433x` is superseded. The ext4 twin, measured in the SAME invocations,
