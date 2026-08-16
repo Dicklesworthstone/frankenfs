@@ -11178,3 +11178,68 @@ its own identity through `bench-evidence` at run time:
 runs only on the executing machine — no rch worker took part. `VmHWM` is a counted
 kernel-maintained high-water mark, not a timing, so host contention cannot confound it
 and no quiet window was required.
+
+## 2026-08-16 — INVALID EXPERIMENT, reported as such: my "sparse inode" arm reordered VISITS, not inode NUMBERS, so it cannot answer the question it was built for (bd-kzfh2, AzureBay)
+
+The previous entry established that the memo's resident cost tracks the touched working
+set, and flagged one limit as unmeasured: the fixture's inode numbers are dense and
+sequential, so a 32,768-inode sweep lands on a contiguous ~256 kB slot region — the best
+case for page residency. A sparse-inode filesystem might scatter the same touches across
+many more pages.
+
+I built an arm to test that. **It does not test it**, and the numbers are reported here
+only so nobody mistakes them for an answer:
+
+    slots=1048576  order=dense      VmHWM  9548 ->  38828 kB  (+29280)
+    slots=1048576  order=scattered  VmHWM  9388 ->  40200 kB  (+30812)
+    slots=4096     order=scattered  VmHWM  9424 ->  41272 kB  (+31848)
+
+**The flaw:** the "scattered" arm walks a large-stride permutation of the directory, which
+changes the ORDER in which inodes are visited. It does not change WHICH inodes are
+visited, and slot index is `ino & (len - 1)` — a pure function of the inode number. The
+same 32,768 dense objectids map to the same contiguous slot range regardless of the order
+they are probed in. So both arms touch an identical set of pages and the comparison is
+between two schedules of the same work.
+
+The `4096 scattered` row is the tell that should be read first: it is **higher**
+(`+31848`) than `1048576 scattered` (`+30812`), and a 4096-slot table cannot possibly
+cost more resident memory than a 1,048,576-slot one. That ordering is impossible if the
+table were what these numbers were measuring, so the spread is other caches and run
+noise — roughly `±1.5 MB` on a `~30 MB` sweep — and it sets the resolution floor for this
+instrument at about `5%`.
+
+### What it does legitimately establish
+
+Page residency depends on the SET of slots touched, not the order of touching. Obvious in
+hindsight, and now measured: `+1532 kB` between two orders of an identical touch set is
+within the `±1.5 MB` noise this instrument shows on the impossible-ordering row.
+
+### What would actually test it, and why it was not run
+
+Spacing inode numbers requires creating and deleting: make `N x K` files, delete `K-1` of
+every `K`, and the survivors' objectids are spread by `K`. To approach the pessimistic
+bound — one 4 KiB page per touch — needs `K >= 512`, because a page holds `512` slots at
+8 bytes each. For a 32,768-inode working set that is **16.7 million** file creations,
+which is not a cheap fixture and is not obviously worth it.
+
+**Reasoning, explicitly not measurement:** btrfs allocates objectids sequentially, so the
+dense case is the normal one and reaching `K >= 512` requires sustained deletion churn
+that leaves 511 of every 512 objectids unused. The pessimistic bound is real arithmetic —
+`32,768` touches x 4 KiB = `128 MB` if every touch hit a distinct page — but the workload
+that produces it is not one this filesystem's allocator naturally creates. A smaller `K`
+degrades gracefully: residency is bounded by `min(capacity, touched x 4 KiB)`, and at
+`K = 8` (a plausible churn level) the same sweep would touch roughly `8x` the pages, i.e.
+~2 MB rather than ~256 kB, still far below the 8 MiB capacity.
+
+That reasoning is offered as a reason not to block the sizing policy on this arm, NOT as
+a substitute for measuring it. `bd-kzfh2` keeps it open with the `K`-spacing recipe
+above, and any larger default should state that its resident bound is
+`min(capacity, touched x page)` rather than implying the dense figure generalises.
+
+Harness `scripts`-local `memo_rss_sparse.sh`; candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, run locally
+because a FUSE mount runs only on the executing machine. Counted mechanism: the memo's
+allocation count is 1048576 slots against a touched count of 32768 — **32768 probes
+touched vs 1048576 slots reserved** — and both figures are IDENTICAL in the two order
+arms, which is precisely why they cannot differ for the reason I intended.
