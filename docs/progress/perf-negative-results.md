@@ -11606,3 +11606,73 @@ banked runs from `bd-34hzz` and the thread-sweep cells, all 8-thread on this one
 the two disabled runs are new. Counted mechanism unchanged: **32769 probes vs 32769
 probes** per sweep in every configuration — the memo never changes what the kernel sends,
 only whether the daemon descends.
+
+## 2026-08-16 — REFUTED, my own published share: with the daemon PINNED the readdir+stat daemon share is 41.62%, not the 47.21% I banked, and the descent explains 74% of the lever, not 88% (bd-btrfs-readdir-stat-8x-8y7vp, bd-plt79, AzureBay)
+
+Building the `--placement-audit` ratchet for `bd-plt79` turned up a defect in my own
+published work. The daemon-share attribution in `6e562cae` divided dispatch nanos
+measured inside an **UNPINNED** managed-runtime mount by the **PINNED** comparator's
+per-entry wall — mixing exactly the two instruments that audit exists to separate.
+
+Re-measured with the daemon pinned to one core and the client to different cores,
+mirroring the comparator's `--fuse-cpus 1`. Affinity is reported OBSERVED, not
+requested: `observed daemon affinity: 8` on every arm.
+
+| | published (unpinned) | pinned | |
+| --- | --- | --- | --- |
+| daemon share, 4096 slots | `47.21%` | **`41.62%`** | published was `13.4%` relative too high |
+| daemon share, 65536 slots | `0% ± 2.5%` | `-1.66%`, floor `±1.7%` | unchanged conclusion, tighter floor |
+| getxattr dispatches, 4096 | `32,770 -> 163,842` | `32,770 -> 163,842` | **identical** |
+| getxattr dispatches, 65536 | `32,770 -> 32,770` | `32,770 -> 32,770` | **identical** |
+
+    slots=4096   K1=[93004082 83564241 22960090 124263 32770]  K5=[453590329 89415765 20375288 109626 163842]
+      getxattr 2751.1  lookup 44.6  readdir -19.7  getattr -0.1  ->  DAEMON 2775.9 ns/entry
+    slots=65536  K1=[93721672 84633571 22309090 98066 32770]   K5=[90938683 80667540 22016930 97799 32770]
+      getxattr  -21.2  lookup -30.3  readdir  -2.2  getattr -0.0  ->  DAEMON  -53.7 ns/entry
+
+### What moved, what did not, and which way the error ran
+
+**The counts did not move at all.** Both dispatch-count sequences are identical to the
+unpinned run, which is the direct confirmation that counts are placement-immune while
+nanos are not — the distinction the whole correction rests on.
+
+**The share moved 5.6 points.** Consequently the accounting moves too: removing the
+pinned daemon work from the slow arm predicts `6669.2 - 2775.9 = 3893.3` ns/entry against
+a measured `3231.8`, i.e. `1.713x` against `2.064x`. **The descent explains 74% of the
+lever, not the 88% published, and the unexplained residual grows from ~12% to ~26%.**
+
+That is the uncomfortable direction. The correction does not tidy the residual away; it
+makes it larger. Four hypotheses have now been eliminated or retracted for that residual
+(contention, counter-undercount-alone, memo bookkeeping, and now instrument placement),
+and it is bigger than when I started explaining it. It stays carried as unexplained.
+
+**The noise floor improved 1.50x**, from `±80.4` to `±53.7` ns/entry, which is `1.7%` of
+the fast arm rather than `2.5%`. So the 65,536 null is now stated as `0% ± 1.7%` — same
+conclusion, better instrument.
+
+### The general lesson, which is why this is a ledger row and not a quiet edit
+
+An instrument-quality gate is only worth building if it is turned on your own banked
+work first. I built `--placement-audit` to flag 39 other rows and it flagged a number I
+had published two entries earlier. The mixed-instrument error was invisible in the
+original entry precisely because both halves were individually defensible — daemon-internal
+counters on one side, the trustworthy comparator on the other — and nothing in the row
+said they came from different machines' worth of scheduling.
+
+`6e562cae` and the scorecard block from `365b9198` both carry the superseded `47.21%` /
+`88%` figures. They are corrected here rather than rewritten there, so the mistake stays
+visible.
+
+Harness `scripts`-local `pinned_share.sh` + `daemon_share.py`; candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, daemon pinned to
+cpu 8 (observed), client pinned to cpus 16-23. Counted mechanism, and it is the load-bearing
+half of this correction: **131072 probes dispatched vs 0 probes dispatched** across four
+extra sweeps at the two slot counts — identical to the unpinned run, which is what
+establishes that counts survive a placement change while nanos do not.
+
+One method note worth keeping: the first pinned run produced garbage because I appended
+the observed-affinity field to the same line a positional parser index-slices, shifting
+every K=5 value by one and turning `getxattr` into `-819.0` ns/entry. The tell was a
+negative dominant term next to an implausibly large `lookup`. Diagnostic output belongs on
+a different stream from data.
