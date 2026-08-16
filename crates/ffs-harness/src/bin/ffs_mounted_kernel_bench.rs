@@ -4347,6 +4347,23 @@ struct ExternalLoadWitness {
     current_consecutive: usize,
     /// Largest off-placement mean busy fraction seen in any single sample.
     peak_mean_busy: f64,
+    /// Largest ON-placement mean busy fraction — OUR OWN arms (bd-arm-contention).
+    ///
+    /// franken_numpy confirmed 2026-08-16 that its own arm slows the incumbent it is
+    /// measured against, and that an A/A null cannot catch it: an A/A compares an arm
+    /// against ITSELF, so a bias hitting both halves cancels exactly.
+    ///
+    /// This harness had the same blind spot. `peak_mean_busy` above measures busy-ness
+    /// OFF the placement set, and the placement set is precisely
+    /// driver + driver_guard + fuse + fuse_guard — every CPU our own arms run on. So
+    /// the witness that refuses runs for contention could not see contention we cause
+    /// ourselves.
+    ///
+    /// Recorded SEPARATELY and deliberately NOT fed to the verdict. The external check
+    /// stays the gate; this is evidence, so that "the run was quiet" can be
+    /// distinguished from "the run was quiet apart from ourselves" after the fact.
+    /// Gating on it would be a new refusal criterion smuggled in as a diagnostic.
+    peak_placement_mean_busy: f64,
 }
 
 impl ExternalLoadWitness {
@@ -4368,6 +4385,17 @@ impl ExternalLoadWitness {
             .filter(|(cpu, _)| !placement.contains(*cpu))
             .map(|(_, load)| *load)
             .collect();
+        let on: Vec<f64> = busy
+            .iter()
+            .filter(|(cpu, _)| placement.contains(*cpu))
+            .map(|(_, load)| *load)
+            .collect();
+        if !on.is_empty() {
+            let mean = on.iter().sum::<f64>() / on.len() as f64;
+            if mean > self.peak_placement_mean_busy {
+                self.peak_placement_mean_busy = mean;
+            }
+        }
         if !off.is_empty() {
             let mean = off.iter().sum::<f64>() / off.len() as f64;
             if mean > self.peak_mean_busy {
@@ -7223,7 +7251,7 @@ fn run() -> Result<Option<PathBuf>> {
     println!(
         "external_load_during_run,samples={},max_external_busy_cpus={},over_limit_samples={},\
          contended_fraction={:.4},max_consecutive_over_limit={},\
-         peak_off_placement_mean_busy={:.6},busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
+         peak_off_placement_mean_busy={:.6},peak_placement_mean_busy={:.6},busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
          max_contended_fraction_limit={:.2},max_consecutive_limit={},\
          placement_cpus_excluded={},verdict={}",
         external_load.samples,
@@ -7232,6 +7260,7 @@ fn run() -> Result<Option<PathBuf>> {
         external_load.contended_fraction(),
         external_load.max_consecutive_over_limit,
         external_load.peak_mean_busy,
+        external_load.peak_placement_mean_busy,
         EXTERNAL_BUSY_CPU_FRACTION,
         MAX_EXTERNAL_BUSY_CPUS,
         MAX_CONTENDED_SAMPLE_FRACTION,
@@ -7333,6 +7362,8 @@ fn run() -> Result<Option<PathBuf>> {
             "contended_fraction": external_load.contended_fraction(),
             "max_consecutive_over_limit": external_load.max_consecutive_over_limit,
             "peak_off_placement_mean_busy": external_load.peak_mean_busy,
+            // bd-arm-contention: OUR OWN arms. Evidence, not a gate input.
+            "peak_placement_mean_busy": external_load.peak_placement_mean_busy,
             "busy_cpu_fraction_limit": EXTERNAL_BUSY_CPU_FRACTION,
             "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
             "max_contended_fraction_limit": MAX_CONTENDED_SAMPLE_FRACTION,
@@ -9555,6 +9586,44 @@ mod tests {
     /// are the harness's own `pre_measurement_cpu_busy` from the reports of
     /// 2026-08-08: the contended window (a peer's build) and the quiet one whose
     /// re-run confirmed the btrfs parallel-read win.
+    /// bd-arm-contention: OUR OWN arms are measured too, separately, and do NOT gate.
+    ///
+    /// franken_numpy confirmed its own arm slows the incumbent it is measured against,
+    /// and that an A/A null cannot catch it — an A/A compares an arm against ITSELF,
+    /// so a bias hitting both halves cancels exactly. This harness had the same blind
+    /// spot: the witness measures busy-ness OFF the placement set, and the placement
+    /// set is every CPU our own arms run on.
+    ///
+    /// Two properties are pinned. The on-placement mean is RECORDED, so
+    /// "the run was quiet" can be told apart from "quiet apart from ourselves". And it
+    /// does NOT affect the verdict — the external check stays the gate. Gating on it
+    /// would be a new refusal criterion smuggled in as a diagnostic.
+    #[test]
+    fn placement_busy_is_recorded_separately_and_does_not_gate_bd_arm_contention() {
+        let placement: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let mut witness = ExternalLoadWitness::default();
+
+        // Our own arms saturated; everything else idle.
+        let busy: BTreeMap<usize, f64> =
+            [(0, 0.99), (1, 0.97), (2, 0.01), (3, 0.00)].into_iter().collect();
+        witness.observe(&busy, &placement, MAX_EXTERNAL_BUSY_CPUS);
+
+        assert!(
+            witness.peak_placement_mean_busy > 0.9,
+            "our own arms' load must be RECORDED; it was {}",
+            witness.peak_placement_mean_busy
+        );
+        assert!(
+            witness.peak_mean_busy < 0.1,
+            "off-placement stays low — the external witness is unaffected by our arms"
+        );
+        assert!(
+            witness.clean(),
+            "our own saturation must NOT flip the verdict; the external check is the \
+             gate and this is evidence. A diagnostic that refuses runs is a gate."
+        );
+    }
+
     #[test]
     fn external_load_policy_separates_the_two_real_windows_bd_bt2dy() {
         let placement: BTreeSet<usize> = [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39]
