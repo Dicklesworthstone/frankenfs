@@ -11388,3 +11388,89 @@ because a FUSE mount runs only on the executing machine. Mounts are torn down be
 arms so mount cost is paid identically by all four arms in a round, and the two null arms
 sit in the same schedule as the A/B pair. Host `CONTENDED` throughout, which is exactly
 what the A/A null is there to absorb.
+
+## 2026-08-16 — RETRACTION: my "1.53x is contention" decomposition is REFUTED — the gap was my instrument, not concurrency (bd-o83z3, bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Yesterday's entry decomposed the memo's `2.08x` into "`1.36x` per-op and `1.53x`
+contention" by comparing my single-threaded harness against the comparator's 8-thread
+run. **That comparison was invalid and the conclusion is withdrawn.**
+
+The check I should have run first: does my harness reproduce the comparator's ratio when
+BOTH run the same thread count?
+
+| instrument | threads | 4096 ns/entry | 65536 ns/entry | ratio |
+| --- | --- | --- | --- | --- |
+| my harness | 1 | `20723.9` | `15387.0` | `1.346845` |
+| my harness | **8** | `7980.7` | `6650.4` | **`1.200033`** |
+| comparator | **8** | `6669.2` | `3231.8` | **`2.063608`** |
+
+At matched concurrency my harness measures `1.20x` where the comparator measures
+`2.06x`. It does not reproduce the instrument it was being differenced against, so the
+`1`-vs-`8` comparison measured the difference between two clients, not the effect of
+threads. **`2.078 / 1.359 = 1.529x` was arithmetic on incomparable numbers.**
+
+The absolutes show the mechanism. My 65,536 arm costs `6650` ns/entry against the
+comparator's `3232` — my client adds ~`3400` ns/entry there — while my 4096 arm costs
+`7981` against `6669`, only ~`1310` ns more. A client overhead that is large relative to
+the fast arm and small relative to the slow one **compresses every ratio it measures**,
+and it compresses the fast-arm-heavy comparison most. My harness under-measures this
+effect at every thread count, and its ratio moves the WRONG way with threads
+(`1.347 -> 1.200`), which is the signature of dilution rather than of a real thread
+effect.
+
+### What survives and what does not
+
+**Withdrawn:** that roughly half the memo's benefit is concurrency pressure; that a
+per-op counter is blind to a contention component of this size; and the recommendation
+that anyone attacking the remaining `3.36x` should target concurrent-descent contention.
+`bd-o83z3` was filed on that premise and is closed as refuted.
+
+**Survives, because it never depended on my harness:** the counted attribution — one
+`security.capability` round trip per entry, `requests_total` identical at both slot
+counts, dispatch counts `65,539 -> 32,770`. Those are exact counts read at the kernel
+boundary. And the comparator's `2.06x`-`2.09x`, which is now corroborated by five further
+8-thread FUSE-arm samples banked below.
+
+**Still genuinely open:** the dispatch counters account for only ~`12%` of the
+comparator's `2.06x`. That gap is real and now has no explanation at all — the contention
+hypothesis was the explanation and it is gone. It should be treated as unexplained rather
+than as evidence for anything.
+
+### The thread sweep that produced this was ALSO invalid, for a second reason
+
+I ran the comparator at `--client-threads 1 2 4 8` intending a concurrency
+discriminator. **Every cell ran at 8 threads.** `Workload::client_threads`
+(ffs_mounted_kernel_bench.rs:183) returns `DEFAULT_PARALLEL_THREADS` unconditionally for
+`ReaddirStat8`, `ParallelRead8` and `ParallelRead8ColdCache`; only
+`ParallelMetadataWrite` honours the flag. The CLI accepts the value and discards it.
+
+The report is honest about it — every run prints `requested_client_threads=8,
+actual_observed_worker_threads=8` regardless of what was passed — so this is catchable,
+and it is why the effective value belongs in the report rather than only in the flag.
+**Read `requested_client_threads` in the output; do not trust `--client-threads` on these
+three workloads.**
+
+Five of those cells did complete, and since they were all 8-thread runs on one fixture
+they are useful as replication rather than as a sweep:
+
+    4096   fuse_median_wall_ns  215935808 / 224072610 / 218535580   (spread 3.8%)
+    65536  fuse_median_wall_ns  108894048 / 101942138 / 105899775   (spread 6.8%)
+    medians -> 2.063608x, per entry 6669.2 ns vs 3231.8 ns
+
+That is five more samples agreeing with the banked `2.078x`-`2.095x`, from runs taken for
+a different purpose.
+
+### The lesson, which is the reusable part
+
+A harness must be validated against the instrument it will be differenced against, at
+matched parameters, BEFORE its numbers are used to decompose that instrument's result. I
+had already caught this class of error twice this session — declining to read my own
+wall times against the comparator, and correctly noting a single sweep was underpowered —
+and then differenced against it anyway one entry later. Checking that the two agree
+somewhere is not optional politeness; it is what makes the subtraction mean anything.
+
+Harness `scripts`-local `memo_nt.sh` + `memo_nt.py`; candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, run locally
+because a FUSE mount runs only on the executing machine. Counted mechanism unchanged from
+the attribution entry: **32769 probes vs 32769 probes** at both slot counts.
