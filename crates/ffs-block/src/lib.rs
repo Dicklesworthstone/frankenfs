@@ -472,6 +472,28 @@ struct FileDeviceSyncState {
     /// The `write_epoch` observed immediately before the last successful
     /// `sync_all`.
     synced_epoch: AtomicU64,
+    /// Device flushes actually ISSUED — `sync_data` calls that reached the kernel
+    /// (bd-7nr8p).
+    ///
+    /// fsync/journal commit measures `1.976308x` against kernel btrfs: 25.06 ms per
+    /// write+fsync against 12.69 ms. A ratio that close to 2.0 on a workload that is
+    /// nothing but write-and-flush is consistent with issuing TWO device barriers where
+    /// the incumbent issues one — but nobody has COUNTED, and two attempts to size it by
+    /// arithmetic went wrong in opposite directions by borrowing a flush cost from the
+    /// wrong regime (the ~400 us figure in this file is a CLEAN flush, not a
+    /// data-carrying one).
+    ///
+    /// A count settles what a timing cannot: regime-independent, deterministic, and
+    /// needing no quiet window — which matters because this campaign has lost most of a
+    /// day to placement refusals. Same reasoning that made bd-ha71t's probe counts
+    /// stronger evidence than any wall-clock null.
+    flushes_issued: AtomicU64,
+    /// Flushes ELIDED by the clean-sync skip: calls where nothing was dirty.
+    ///
+    /// Reported beside `flushes_issued` so "we flush twice per op" is distinguishable
+    /// from "we were ASKED twice and skipped one". Without both, a low issued-count
+    /// reads as efficiency when it may be elision.
+    flushes_elided: AtomicU64,
 }
 
 /// Whether `FileByteDevice::sync` may skip the `fsync` syscall when no write
@@ -592,6 +614,8 @@ impl FileByteDevice {
             sync_state: Arc::new(FileDeviceSyncState {
                 write_epoch: AtomicU64::new(1),
                 synced_epoch: AtomicU64::new(0),
+                flushes_issued: AtomicU64::new(0),
+                flushes_elided: AtomicU64::new(0),
             }),
         })
     }
@@ -881,6 +905,7 @@ impl ByteDevice for FileByteDevice {
             // saves the storage cache-flush (~400us on this class of host)
             // that dominates no-op durability boundaries (unchanged-directory
             // fsyncdir storms).
+            self.sync_state.flushes_elided.fetch_add(1, Ordering::Relaxed);
             cx_checkpoint(cx)?;
             return Ok(());
         }
@@ -908,6 +933,7 @@ impl ByteDevice for FileByteDevice {
         // back to `sync_all` — the test below pins the invariant so that change
         // fails loudly rather than silently losing a size update.
         self.file.sync_data()?;
+        self.sync_state.flushes_issued.fetch_add(1, Ordering::Relaxed);
         // Publish at most the pre-sync observation; `fetch_max` keeps a
         // concurrent sync that observed a newer epoch from being regressed.
         self.sync_state
@@ -3915,6 +3941,59 @@ mod tests {
     /// `sync` must go back to `sync_all` — otherwise a size update could be lost
     /// on power failure while the data it describes was persisted, which is a
     /// silent short-read after recovery rather than a visible error.
+    /// bd-7nr8p: COUNT the device flushes, because a count settles what a timing cannot.
+    ///
+    /// fsync/journal commit measures 1.976308x against kernel btrfs — 25.06 ms per
+    /// write+fsync against 12.69 ms. A ratio that close to 2.0 on a workload that is
+    /// nothing but write-and-flush is consistent with issuing TWO device barriers where
+    /// the incumbent issues one. Two attempts to size that by arithmetic went wrong in
+    /// OPPOSITE directions, both by borrowing a flush cost from the wrong regime: the
+    /// ~400 us figure in this file describes a CLEAN flush, not a data-carrying one.
+    ///
+    /// A count is regime-independent, deterministic, and needs no quiet window — which
+    /// is decisive here, because this campaign has lost most of a day to placement
+    /// refusals and cannot rely on getting one.
+    ///
+    /// Both counters matter. `issued` alone cannot distinguish "we flush twice per op"
+    /// from "we were asked twice and elided one", and reading a low issued-count as
+    /// efficiency when it is really elision is exactly the mistake the pair prevents.
+    #[test]
+    fn device_flushes_are_counted_issued_and_elided_separately_bd_7nr8p() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("flush-count.img");
+        std::fs::write(&path, [0_u8; 64]).expect("seed file");
+        let dev = FileByteDevice::open(&path).expect("device");
+
+        // A dirty device must ISSUE a flush.
+        dev.write_all_at(&cx, ByteOffset(0), &[1_u8, 2, 3, 4]).expect("write");
+        dev.sync(&cx).expect("sync");
+        let issued_after_first = dev.sync_state.flushes_issued.load(Ordering::Relaxed);
+        assert_eq!(issued_after_first, 1, "one dirty sync issues exactly one flush");
+
+        // A second sync with nothing written since must ELIDE, not issue. That is the
+        // clean-sync-skip lever, and counting it separately is what keeps it from being
+        // credited as a cheaper flush rather than as an avoided one.
+        dev.sync(&cx).expect("clean sync");
+        assert_eq!(
+            dev.sync_state.flushes_issued.load(Ordering::Relaxed),
+            1,
+            "a clean sync must not issue a second flush"
+        );
+        assert_eq!(
+            dev.sync_state.flushes_elided.load(Ordering::Relaxed),
+            1,
+            "and the skip must be COUNTED, or a low issued-count reads as efficiency \
+             when it is really elision"
+        );
+
+        // Dirty again -> issues again, so the counter tracks work rather than calls.
+        dev.write_all_at(&cx, ByteOffset(8), &[9_u8]).expect("write");
+        dev.sync(&cx).expect("sync");
+        assert_eq!(dev.sync_state.flushes_issued.load(Ordering::Relaxed), 2);
+        assert_eq!(dev.sync_state.flushes_elided.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn file_byte_device_cannot_extend_its_file_so_fdatasync_suffices() {
         let cx = Cx::for_testing();
@@ -4010,6 +4089,8 @@ mod tests {
             sync_state: Arc::new(FileDeviceSyncState {
                 write_epoch: AtomicU64::new(1),
                 synced_epoch: AtomicU64::new(0),
+                flushes_issued: AtomicU64::new(0),
+                flushes_elided: AtomicU64::new(0),
             }),
         };
 
