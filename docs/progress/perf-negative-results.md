@@ -12674,3 +12674,73 @@ admitted a run. My refusals are the veto working, not an instrument defect.
 
 Counted mechanism: **48 of 48 contention samples over limit**, `max_external_busy_cpus=24`
 against a limit of `2`.
+
+## 2026-08-16 — FIFTH clean-null run: btrfs readdir+stat `7.316939x` with the tightest nulls yet; five admitted runs, still NOTHING in the 5.72% gap (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Another ABBA run, one invocation, live kernel btrfs, private candidate copy, at load `17.88`.
+
+    RUN 7 (quoted)
+    bootstrap median 7.316939x with bootstrap median CI [7.247609, 7.338024], 20000 resamples
+    same-invocation A/A null control, kernel arm  1.007960  spread 1.016690  clear=true
+    same-invocation A/A null control, fuse arm    0.998394  spread 1.005247  clear=true
+    twice_null_margin_ratio = 1.033659
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+
+The fuse-arm null at `1.005247` spread is the tightest this row has produced — the candidate
+arm reproduced itself to within half a percent. Refused post-hoc as always:
+`external_load_during_run,samples=47,over_limit_samples=47,contended_fraction=1.0000,
+max_external_busy_cpus=32,peak_off_placement_mean_busy=0.323978,verdict=CONTENDED`.
+
+### Five clean-null runs, and the gap has not filled
+
+    7.316939   CI [7.247609, 7.338024]   <- new, extends the low group DOWNWARD
+    7.453004   CI [7.275531, 7.494622]
+    7.531731   CI [7.531255, 7.618960]
+    ---------- 5.72% of clear space, five runs, none inside ----------
+    8.065190   CI [8.054564, 8.109706]
+    8.170852   CI [8.113987, 8.217506]
+
+    low group   n=3, spans 2.94%
+    high group  n=2, spans 1.31%
+    empty gap   5.72% — wider than both groups combined
+    banked 7.753405x sits inside the gap
+
+**This strengthens the clustering observation without settling it, and I am still not naming
+a mechanism.** Three points would be easy chance; five with an empty gap wider than both
+groups combined is harder to dismiss, and the new run extended the low group rather than
+landing in the middle. But I withdrew two fitted stories today already — "more contention,
+worse ratio" died when its third point arrived — so the discipline stands: this is an
+OBSERVATION with a stated test. If more clean-null runs fill the gap it is dispersion; if the
+groups sharpen, something DISCRETE differs between windows and is worth chasing, because
+discrete causes are findable in a way noise is not.
+
+Two candidate discrete causes worth ruling out first, both recorded here so the next person
+does not start from scratch: which physical cores the 8 client threads land on (the harness
+picks from whatever is quiet, so placement genuinely varies run to run), and whether the
+btrfs fixture is laid out identically each time. Neither is checked. Both are cheap to check
+from the preserved reports, which record `driver_cpus` and `fuse_cpus` per run.
+
+### Also measured this turn, both inadmissible
+
+    7.623243x  CI [7.479452, 7.671615]  nulls 1.028937 / 1.039952  BLOCKED_NULL
+    8.127588x  CI [7.995522, 8.555501]  nulls 1.016932 / 1.047695  BLOCKED_NULL
+
+Recorded rather than dropped: the first lands just inside the gap's lower edge and the second
+in the high group, so neither contradicts the clustering — but neither is clean-null and
+neither is counted in the five above.
+
+### Disposition
+
+Nothing claimed, nothing superseded. Banked `7.753405x`/`7.649395x` stands. Every run today
+was refused — five on the post-hoc contention veto despite clean nulls, five on the A/A null
+gate itself.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+PRIVATE copy of the candidate. Estimator `four_round_balanced_crossover_bootstrap_median_ci`.
+LVM volume, same substrate as the banked rows.
+
+Counted mechanism: **47 of 47 contention samples over limit**, `max_external_busy_cpus=32`
+against a limit of `2`.
