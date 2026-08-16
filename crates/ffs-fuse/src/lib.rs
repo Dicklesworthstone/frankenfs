@@ -36,9 +36,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
@@ -1518,30 +1516,49 @@ impl ReadonlyXattrCache {
 /// because a slot is only ever consulted by exact inode match.
 #[derive(Default)]
 struct LastMissingCapabilityXattr {
-    /// Most recent inode observed to have no capability xattr.
-    inode: AtomicU64,
-    /// The one before it — see the alternation note above.
-    previous: AtomicU64,
+    /// Two independent slots. Neither is privileged; `victim` decides which one
+    /// the next insert overwrites.
+    slots: [AtomicU64; 2],
+    /// Index of the slot to overwrite next — a 2-way pseudo-LRU.
+    ///
+    /// MEASURED, not assumed. A plain "shift down" policy (new value into slot 0,
+    /// old slot 0 into slot 1) was implemented first and counted at 501 memo hits
+    /// per 2000 probes on a read-write mount — almost exactly 50%, because the
+    /// stream is `root, fileN, root, fileN+1, ...`: remembering each NEW file
+    /// displaced the previous file into slot 1 and evicted the ROOT, which is the
+    /// one inode present in every pair. Pointing the victim away from whichever
+    /// slot was last HIT keeps the constantly-hit root resident and rotates the
+    /// files through the other slot.
+    victim: AtomicUsize,
 }
 
 impl LastMissingCapabilityXattr {
     fn contains(&self, ino: InodeNumber) -> bool {
-        ino.0 != 0
-            && (self.inode.load(Ordering::Acquire) == ino.0
-                || self.previous.load(Ordering::Acquire) == ino.0)
+        if ino.0 == 0 {
+            return false;
+        }
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if slot.load(Ordering::Acquire) == ino.0 {
+                // Protect the slot that just hit: the next insert takes the other.
+                self.victim.store(idx ^ 1, Ordering::Release);
+                return true;
+            }
+        }
+        false
     }
 
     fn remember(&self, ino: InodeNumber) {
         if ino.0 == 0 {
             return;
         }
-        // Already resident: do not shuffle, or an alternating stream would push
-        // its own other half out on every hit.
+        // Already resident: `contains` has just re-aimed the victim, so there is
+        // nothing to do and shuffling would only undo that.
         if self.contains(ino) {
             return;
         }
-        let displaced = self.inode.swap(ino.0, Ordering::AcqRel);
-        self.previous.store(displaced, Ordering::Release);
+        let idx = self.victim.load(Ordering::Acquire) & 1;
+        self.slots[idx].store(ino.0, Ordering::Release);
+        self.victim.store(idx ^ 1, Ordering::Release);
     }
 
     /// Drop `ino` from both slots.
@@ -1554,12 +1571,15 @@ impl LastMissingCapabilityXattr {
         if ino.0 == 0 {
             return;
         }
-        let _ = self
-            .inode
-            .compare_exchange(ino.0, 0, Ordering::AcqRel, Ordering::Relaxed);
-        let _ = self
-            .previous
-            .compare_exchange(ino.0, 0, Ordering::AcqRel, Ordering::Relaxed);
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if slot
+                .compare_exchange(ino.0, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                // A slot we just freed is the obvious next victim.
+                self.victim.store(idx, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -4262,6 +4282,46 @@ mod tests {
             );
             assert!(memo.contains(file), "the file just probed must be resident");
         }
+    }
+
+    /// Replays the REAL probe stream — `root, file, root, file, ...` with a fresh
+    /// file each time — and asserts the root never falls out.
+    ///
+    /// This is the test that caught the first implementation. A "shift down"
+    /// victim policy (new inode into slot 0, old slot 0 into slot 1) looks correct
+    /// and passes the simpler two-inode test above, but on this stream every NEW
+    /// file evicts the root, which is the one inode present in every pair. It was
+    /// counted at 501 memo hits per 2000 probes on a real read-write mount —
+    /// almost exactly the 50% this asserts against. Aiming the victim away from
+    /// the slot that just hit took it to 1000/2000.
+    #[test]
+    fn capability_memo_keeps_the_root_across_a_stream_of_distinct_files() {
+        let memo = LastMissingCapabilityXattr::default();
+        let root = InodeNumber(1);
+
+        // First probe of the root is a miss, as on a fresh mount.
+        assert!(!memo.contains(root));
+        memo.remember(root);
+
+        let mut root_hits = 0;
+        for file in 14_u64..64 {
+            // The kernel probes the root, then the file, for every path op.
+            if memo.contains(root) {
+                root_hits += 1;
+            } else {
+                memo.remember(root);
+            }
+            let file = InodeNumber(file);
+            if !memo.contains(file) {
+                memo.remember(file);
+            }
+        }
+
+        assert_eq!(
+            root_hits, 50,
+            "the root must hit on every path op after the first; a shift-down \
+             victim policy scores ~half this and costs a format lookup each time"
+        );
     }
 
     /// A hit must not reshuffle the slots. If `remember` promoted an
