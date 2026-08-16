@@ -127,6 +127,16 @@ def verdict(samples: list[float], one: float, five: float, fifteen: float,
 EXCURSION_FACTOR = 2.0
 
 
+# The ADMISSION ceiling and the IN-RUN ceiling answer different questions and must
+# not share a number. Admission asks "is this a good place to start"; in-run asks
+# "has it changed enough to invalidate what I already have". A run admitted at
+# loadavg 23.3 was killed by a 33.5 blip because both used 32 -- even though the
+# factor rule (46.6) was nowhere near tripping, and 33.5 on 64 cores is ~52%
+# utilisation, inside the band where this box has no evidence either way. Losing a
+# run that far inside its own admission conditions is a false positive.
+RUN_CEILING_MULTIPLE = 1.5
+
+
 def excursion(samples: list[float], launch_median: float,
               factor: float = EXCURSION_FACTOR,
               ceiling: float = None,
@@ -142,25 +152,32 @@ def excursion(samples: list[float], launch_median: float,
     than the run did.
     """
     if ceiling is None:
-        ceiling = ABSOLUTE_CEILING
+        ceiling = ABSOLUTE_CEILING * RUN_CEILING_MULTIPLE
     if launch_median <= 0 or not samples:
         return False, ""
     threshold = max(launch_median * factor, 0.0)
     run = 0
+    tripped_by = ""
     for v in samples:
-        if v > threshold or v > ceiling:
+        over_factor = v > threshold
+        over_ceiling = v > ceiling
+        if over_factor or over_ceiling:
             run += 1
+            # Name the rule that actually fired. Reporting the factor threshold
+            # when the ceiling tripped tells the reader the run exceeded a number
+            # it never reached, which is worse than saying nothing.
+            tripped_by = (f"drifted past {threshold:.1f} (launch median "
+                          f"{launch_median:.1f} x {factor:g})" if over_factor
+                          else f"exceeded the in-run ceiling {ceiling:.1f}")
             if run >= consecutive:
                 # Report the PEAK seen, not merely the sample that tripped the
                 # counter: the peak is what a reader needs to judge the row, and
                 # the tripping sample is an artefact of where the run happens to
                 # sit in the consecutive window.
-                return True, (f"ABORT: loadavg peaked at {max(samples):.1f} against "
-                              f"this run's admission threshold {threshold:.1f} "
-                              f"(launch median {launch_median:.1f} x {factor:g}); "
-                              f"{consecutive} consecutive samples over it, so the "
-                              f"host left the conditions this run was admitted "
-                              f"under")
+                return True, (f"ABORT: loadavg peaked at {max(samples):.1f} and "
+                              f"{tripped_by}, for {consecutive} consecutive "
+                              f"samples; the host left the conditions this run was "
+                              f"admitted under")
         else:
             run = 0
     return False, ""
@@ -314,7 +331,25 @@ def _selftest() -> int:
     assert excursion([], launch_median=19.0)[0] is False
     assert excursion([100.0], launch_median=0.0)[0] is False
 
-    print("host_stability selftest: 21 cases pass")
+    # THE FALSE POSITIVE observed 2026-08-16: a run admitted at 23.3 saw 33.5,
+    # which is far inside its own factor threshold (46.6). It must NOT abort now
+    # that the in-run ceiling is separated from the admission ceiling.
+    abort, why = excursion([23.0, 24.0, 33.5, 33.4, 24.0], launch_median=23.3)
+    assert not abort, why
+
+    # ...but the same trace against an ADMISSION-tight ceiling would abort, which
+    # is the conflation that caused it. Pinning both halves.
+    abort, why = excursion([23.0, 24.0, 33.5, 33.4], launch_median=23.3, ceiling=32.0)
+    assert abort, why
+
+    # The message must name the rule that actually fired, not the other one.
+    abort, why = excursion([80.0, 81.0], launch_median=19.0)
+    assert abort and "drifted past" in why, why          # factor rule
+    abort, why = excursion([50.0, 50.5], launch_median=40.0, ceiling=48.0)
+    assert abort and "in-run ceiling" in why, why        # ceiling rule
+    assert "38.0" not in why, "must not quote the factor threshold when the ceiling fired"
+
+    print("host_stability selftest: 26 cases pass")
     return 0
 
 
