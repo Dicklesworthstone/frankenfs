@@ -1520,7 +1520,25 @@ impl ReadonlyXattrCache {
 /// racing pair of `remember` calls can only lose a memo entry or overwrite a
 /// colliding one, never invent one, because a slot is only ever consulted by exact
 /// inode match.
-const CAPABILITY_MEMO_SLOTS: usize = 64;
+/// Sized to a DIRECTORY sweep, not to the 50-file working set bd-2pq73 measured
+/// (bd-t0xoq). 64 slots served that case at 1950/2000 hits, but a `ls -l` over a
+/// 2000-entry directory drives 2000 distinct inodes through them, overwriting the
+/// table ~31 times over, so every probe misses — measured as 2001 cold format
+/// lookups for 2000 entries, 1.000 per entry.
+///
+/// 4096 slots covers a 2000-entry sweep with headroom for the root and for
+/// collisions from non-contiguous inode numbers. The cost is the whole point of
+/// the direct-mapped design: 8 bytes per slot, allocated once per mount, no
+/// per-entry allocation and no eviction bookkeeping — 32 KiB, against the
+/// 65536-entry ext4 inode attr cache already resident. That is why the
+/// bounded-memory property the original one-slot design protected is not
+/// meaningfully reopened at this size.
+///
+/// This is NECESSARY BUT NOT SUFFICIENT for the readdir+stat row: on that path
+/// each inode is probed exactly once, so a larger table still misses every time.
+/// The win needs the memo POPULATED during readdirplus (bd-t0xoq); sizing only
+/// removes the reason a populated memo would immediately evict itself.
+const CAPABILITY_MEMO_SLOTS: usize = 4096;
 
 /// Lock-free cache of inodes observed to have no capability xattr.
 ///
@@ -4390,6 +4408,35 @@ mod tests {
         );
     }
 
+    /// The sizing this memo exists at is a claim about a WORKLOAD, so pin the
+    /// workload (bd-t0xoq). A `ls -l` over a 2000-entry directory drives 2000
+    /// distinct inodes through the table; at 64 slots that overwrote itself ~31
+    /// times over and every probe missed, measured as 1.000 cold format lookup
+    /// per entry. This asserts the table can actually HOLD a directory-sized
+    /// sweep, so a future shrink fails here instead of silently restoring the
+    /// thrash.
+    ///
+    /// It deliberately does NOT assert that readdir+stat gets faster: on that
+    /// path each inode is probed once, so capacity alone wins nothing until the
+    /// memo is populated during readdirplus. This is the prerequisite, pinned.
+    #[test]
+    fn capability_memo_holds_a_directory_sized_sweep_bd_t0xoq() {
+        const DIRECTORY_ENTRIES: u64 = 2000;
+        let memo = LastMissingCapabilityXattr::default();
+        for ino in 1..=DIRECTORY_ENTRIES {
+            memo.remember(InodeNumber(ino));
+        }
+        let resident = (1..=DIRECTORY_ENTRIES)
+            .filter(|ino| memo.contains(InodeNumber(*ino)))
+            .count();
+        assert_eq!(
+            resident,
+            usize::try_from(DIRECTORY_ENTRIES).expect("fits"),
+            "a {DIRECTORY_ENTRIES}-entry sweep must stay resident; {resident} of \
+             {DIRECTORY_ENTRIES} survived, so the table is evicting itself"
+        );
+    }
+
     /// NEGATIVE CASE for a direct-mapped memo: two inodes congruent mod
     /// `CAPABILITY_MEMO_SLOTS` share a slot, and the second must EVICT the first
     /// rather than be reported as resident. An implementation that trusted the
@@ -4737,13 +4784,13 @@ mod tests {
         );
         assert!(
             rw_fuse
-                .getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                .getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
         assert!(
             rw_fuse
-                .getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                .getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
