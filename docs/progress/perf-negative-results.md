@@ -11739,3 +11739,73 @@ Harness `scripts`-local `daemon_cpu.sh` + `daemon_share.py`; candidate
 `isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`. Counted mechanism
 unchanged and identical in both arms of both configurations: **131072 probes dispatched vs
 0 probes dispatched** across the four extra sweeps.
+
+## 2026-08-16 — BLOCKED_NULL run, banked for its PLUMBING only: the mounted comparator now carries real FUSE dispatch counters where every prior report said "unreported_by_this_elf" (bd-viil0, verified by AzureBay, fixed by ProudBarn)
+
+`bd-viil0` was the defect that blocked every per-op attribution on the mounted surface:
+`MountRuntimeMode::Standard` — the path the comparator uses — hand-constructed an
+all-zero `MetricsSnapshot` instead of returning the one the session accumulated, so the
+report's `fuse_dispatch_metrics` field was `"unreported_by_this_elf"` on every run. The
+fix (ProudBarn) makes `ffs_fuse::mount` return its `MetricsSnapshot` and has the Standard
+branch call the same `log_mount_shutdown_metrics` the managed branch calls.
+
+**The check that was owed before closing it, and that nobody had run:** does the fix reach
+the REPORT? A fix that compiles but stops short of the report looks identical from the
+code, and that field is what every future attribution reads. It does:
+
+    "fuse_dispatch_metrics": {
+      "fuse_a": {"getattr_dispatch_count": 18, "getattr_dispatch_nanos": 17724,
+                 "getxattr_dispatch_count": 4, "getxattr_dispatch_nanos": 61577,
+                 "lookup_dispatch_count": 1,  "lookup_dispatch_nanos": 17093,
+                 "readdir_dispatch_count": 8, "readdir_dispatch_nanos": 28965},
+      "fuse_b": {"getattr_dispatch_count": 18, "getattr_dispatch_nanos": 14886,
+                 "getxattr_dispatch_count": 4, "getxattr_dispatch_nanos": 72387,
+                 "lookup_dispatch_count": 1,  "lookup_dispatch_nanos": 11051,
+                 "readdir_dispatch_count": 8, "readdir_dispatch_nanos": 19198}
+    }
+
+Both FUSE arms populated, per-arm, on a candidate rebuilt from the fixed source:
+`executing_elf_sha256 = 672ccf093608b1cb8734c68043f3a93fb62e64aeed450033b784309df6f8c8d1`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`, gate `verdict=pass`. Host `thinkstation1`,
+`executed_on=thinkstation1`, warm-stat workload, `--pairs 12 --operations 2000`.
+
+### Why this matters more than one field being populated
+
+Every attribution I have banked on this surface had to route around it. The warm-stat and
+readdir+stat passes both used `--runtime-mode managed` to reach these counters, because
+the comparator could not report them — which is precisely how the daemon-share numbers
+ended up mixing an unpinned managed mount with the pinned comparator arm, an error that
+took a dedicated correction to undo. **With the counters in the comparator's own report,
+that whole class of workaround is unnecessary**: the daemon's dispatch time and the arm's
+wall time now come from the same run.
+
+The counted mechanism, which is the whole content of this row:
+**18 requests dispatched on fuse_a vs 18 on fuse_b** for getattr, with getxattr 4 vs 4,
+lookup 1 vs 1 and readdir 8 vs 8 — two independently mounted arms of the same configuration agreeing exactly,
+which is what a working counter looks like and what a zeroed one cannot produce.
+
+The counts themselves are a sanity check on the fix rather than a result: 18 getattr, 4
+getxattr, 1 lookup, 8 readdir dispatches per arm on a 2,000-operation warm-stat run is the
+expected shape — the kernel serves attributes from its own cache under the 60 s `ATTR_TTL`
+and the capability memo answers the probes, so almost nothing reaches the format layer.
+That is the same picture the managed-runtime measurements gave, now visible from the
+instrument that banks rows.
+
+### Not claimed
+
+The run itself is `BLOCKED_NULL` (`fuse_over_kernel_median=5.123273`, A/A null gate
+blocked) and no ratio from it is banked — it was run to test the plumbing, not to measure.
+`bd-viil0` is ProudBarn's bead and is **not** closed here; this is the cited evidence they
+asked for, recorded so the close does not have to rest on inspection.
+
+One correction still worth making on that bead: `"unreported_by_this_elf"` was a
+misleading label in the case that actually occurred. The ELF *did* contain the emitter and
+the harness *did* set `FFS_MOUNT_BENCH_EVIDENCE=1`; the standard runtime never called it.
+Distinguishing "this ELF has no emitter" from "this runtime mode does not collect them"
+would have saved about an hour of tracing.
+
+Build budget: `df -h /data` checked at **62G** free before starting, above the 60G
+threshold; one incremental `release-perf` rebuild of `ffs-cli` (3m11s) into the existing
+`target-perf-iwzrx` tree, announced in Agent Mail as the second of the project's two
+slots. Disk unchanged at 62G afterwards. Nothing deleted.
