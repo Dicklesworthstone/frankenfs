@@ -122,6 +122,21 @@ runs are recorded above precisely so this cannot recur for them.
   that this row measures the shared per-request FUSE floor rather than anything about btrfs
   inode lookup. The absolutes say the same thing: our arm is `21.91` ms on btrfs and
   `21.89` ms on ext4, a `0.1%` difference, while the two kernel arms differ by `1.2%`.
+  **Confirmed again 2026-08-16 across TWO DIFFERENT ELFs** (AzureBay): `4.798508x`
+  `[4.759896, 4.802894]` on `e6cd5793…` and `4.751179x` `[4.728531, 4.772781]` on
+  `d4278471…`, both `admitted=true` with both A/A nulls clear, medians `1.0%` apart.
+  The 2026-08-08 pair above was same-ELF; this one is not, so the figure now survives a
+  change of binary AND of PGO profile. Worst bound across all four admitted runs remains
+  **`4.80x`** — quote that. It also bounds everything that landed between the two
+  binaries (capability-memo kill switch, memo slot-count knob) at under the `1.0%`
+  spread, which is independently consistent with the memo measuring worth under `10.7%`
+  on this workload (`bd-m1bpu`).
+  ⚠ The per-op attribution this row invites — round trips per stat, daemon share versus
+  kernel round trip — **cannot be produced by this instrument today**. Every report
+  carries `fuse_dispatch_metrics: "unreported_by_this_elf"`, and that label is wrong:
+  the ELF has the emitter and the harness sets `FFS_MOUNT_BENCH_EVIDENCE=1`. The
+  standard mount runtime, which is the path the comparator uses, hand-constructs an
+  all-zero `MetricsSnapshot` instead of returning the accumulated one (`bd-viil0`).
 - **Create/delete storm: we lose.** About 2.36 times slower on a 2,000-file namespace
   transaction.
 - **Parallel metadata writes: we lose.** About 1.93 times slower with eight workers
