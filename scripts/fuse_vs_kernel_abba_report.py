@@ -102,6 +102,39 @@ def main():
         print(f"  A/A null {arm:5} {point:.4f}x ci95 [{lo:.4f}, {hi:.4f}] "
               f"(same-invocation, position-matched)")
 
+    if per_arm["kern_iso"]:
+        # Do the arms interfere? An A/A null cannot answer this: both arms of a
+        # null are the same arm, so a null is blind to one arm perturbing another.
+        # The tmpfs control is load-bearing -- it cannot be affected by anything
+        # FrankenFS does to a filesystem, so whatever IT moves by is time-order
+        # drift between the phases, and only the excess is contention.
+        k_eff = st.median(per_arm["kern"]) / st.median(per_arm["kern_iso"])
+        k_lo, k_hi = ratio_ci(per_arm["kern"], per_arm["kern_iso"])
+        print("\nCONTENTION CHECK (do the arms interfere?)")
+        print(f"  kernel  interleaved/isolated {k_eff:.6f}x ci95 [{k_lo:.6f}, {k_hi:.6f}]")
+        if per_arm["cal_iso"]:
+            c_eff = st.median(per_arm["cal"]) / st.median(per_arm["cal_iso"])
+            c_lo, c_hi = ratio_ci(per_arm["cal"], per_arm["cal_iso"])
+            print(f"  tmpfs   interleaved/isolated {c_eff:.6f}x ci95 [{c_lo:.6f}, "
+                  f"{c_hi:.6f}]   <- drift control")
+            corrected = k_eff / c_eff if c_eff else float("nan")
+            overlap = not (k_hi < c_lo or c_hi < k_lo)
+            print(f"  drift-corrected residual {corrected:.4f}x "
+                  f"({(corrected - 1) * 100:+.2f}% on the incumbent)")
+            if overlap:
+                print("  NOT ESTABLISHED: the kernel and control intervals overlap, so "
+                      "the residual is not resolvable at this sample size.")
+                print("  Report it anyway -- an effect this size hides inside "
+                      "overlapping intervals and later proves real.")
+            else:
+                print("  RESOLVED: intervals do not overlap. Every vs-kernel ratio "
+                      "from this harness is inflated by the residual; correct it.")
+        else:
+            print("  NO DRIFT CONTROL: without the tmpfs arm this comparison cannot "
+                  "separate contention from time-order drift. Do not read it.")
+        print("  Note: these arms run SEQUENTIALLY, never concurrently, so this "
+              "measures residue (page cache, device state), not CPU contention.")
+
     knob = os.environ.get("FFS_KNOB", "")
     if per_arm["ffs_on"]:
         # The lever A/B, position-matched inside the same invocation. Reported
@@ -193,7 +226,19 @@ def _selftest() -> int:
     lo, hi = ratio_ci([1.0], [1.0])
     assert lo == hi == 1.0
 
-    print("abba report selftest: 4 cases pass")
+    # Contention arithmetic: a kernel arm that moved exactly as much as the drift
+    # control has NO residual, however far both moved.
+    k_eff, c_eff = 0.90, 0.90
+    assert abs(k_eff / c_eff - 1.0) < 1e-9
+
+    # A kernel arm that moved LESS than the control is relatively slower, which is
+    # the contention direction -- this is the case measured on 2026-08-16
+    # (kernel 0.983020x against a control of 0.959330x).
+    resid = 0.983020 / 0.959330
+    assert resid > 1.0, resid
+    assert abs(resid - 1.0247) < 0.001, resid
+
+    print("abba report selftest: 6 cases pass")
     return 0
 
 

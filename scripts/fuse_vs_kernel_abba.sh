@@ -68,6 +68,16 @@ CLIENT=${FFS_CLIENT:-warm}
 # vs-kernel ratio are both position-matched inside one invocation, and every arm
 # still gets its own same-invocation A/A null from its two visits.
 KNOB=${FFS_KNOB:-}
+# FFS_CONTENTION_CHECK=1 asks a different question from a ratio: do the ARMS
+# interfere? franken_numpy confirmed that its own arm slows the incumbent it is
+# measured against, and an A/A null cannot catch that — both arms of a null are
+# the same arm, so a null is blind to one arm perturbing another. This mode runs
+# the kernel and tmpfs arms FIRST with no FrankenFS process in the run at all,
+# then again inside the normal interleave, and the report compares them. The
+# tmpfs arm is the load-bearing control: it cannot be affected by anything
+# FrankenFS does to a filesystem, so whatever it moves by is time-order drift
+# between the phases, and only the excess beyond that is contention.
+CONTENTION=${FFS_CONTENTION_CHECK:-0}
 OUT=${FFS_OUT:-/tmp/ffs-abba}
 BLOCKS=${FFS_BLOCKS:-3}
 REPS=${FFS_REPS:-6}
@@ -161,12 +171,21 @@ v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE for the daemon
   sweep "$FMNT" "$2" "$1"
   kill -INT $mp 2>/dev/null; wait $mp 2>/dev/null; sleep 2
 }
-v_kern() {
+v_kern() { # $1 position  $2 optional arm tag override
   sudo -n mount -o loop,ro "$IMG" "$KMNT" 2>/dev/null || { echo "FATAL: kernel mount"; exit 3; }
-  sweep "$KMNT" kern "$1"
+  sweep "$KMNT" "${2:-kern}" "$1"
   sudo -n umount "$KMNT" 2>/dev/null; sleep 1
 }
-v_cal() { sweep "$TMNT" cal "$1"; }
+v_cal() { sweep "$TMNT" "${2:-cal}" "$1"; }
+
+# Phase A of the contention check: the incumbent measured with no FrankenFS in the
+# process, so phase B's interleaved figure has something to be compared against.
+if [ "$CONTENTION" = "1" ]; then
+  for b in $(seq 1 "$BLOCKS"); do
+    v_cal "${b}p1" cal_iso; v_kern "${b}p1" kern_iso
+    v_kern "${b}p2" kern_iso; v_cal "${b}p2" cal_iso
+  done
+fi
 
 for b in $(seq 1 "$BLOCKS"); do
   if [ -n "$KNOB" ]; then
