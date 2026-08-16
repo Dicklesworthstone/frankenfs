@@ -45,6 +45,9 @@ target_rch*/
 # fat-LTO trees sitting inside the checkout where a stray `git add .` can reach
 # them.
 target-perf*/
+# Local debug trees built for mounted-FUSE measurement (rch cannot return a
+# binary, so these have to be built here). Multi-GB, inside the checkout.
+target-ha71t*/
 
 # Compiler crash reports
 rustc-ice-*.txt
