@@ -1492,26 +1492,74 @@ impl ReadonlyXattrCache {
     }
 }
 
-/// Lock-free cache of the most recently observed missing capability xattr.
+/// Lock-free cache of recently observed missing capability xattrs.
 ///
-/// The kernel still sends each FUSE `GETXATTR` request, but read-only images
-/// cannot gain a capability xattr while mounted. Caching one inode bounds the
-/// mount's memory while covering the repeated-stat case without adding a mutex
-/// to every kernel-issued probe.
+/// The kernel still sends each FUSE `GETXATTR` request; this only makes the
+/// ANSWER free, avoiding a format-level lookup per probe.
+///
+/// TWO SLOTS, not one, and the reason is measured (bd-yu6jz). The kernel's probe
+/// stream for path-based metadata ops strictly ALTERNATES between the mount root
+/// and the target inode:
+///
+///     ino=1, ino=14, ino=1, ino=15, ino=1, ino=126, ...
+///
+/// Counted on a real mount: 4002 probes for 2000 path stats, of which 2002 are
+/// `ino=1`. A single slot is therefore the worst possible size for this workload —
+/// every root probe evicts the file and every file probe evicts the root, so the
+/// hit rate collapses to ~0% on exactly the pattern the memo exists to serve. Two
+/// slots hold "the root" and "the file currently being walked" simultaneously,
+/// which is the whole steady state. Depth does not change this: a file one
+/// directory down produces the same two probes, since intermediate directories are
+/// never probed.
+///
+/// Slots are independent atomics rather than a mutex-guarded map: the probe is on
+/// the metadata hot path and must not serialize FUSE workers against each other.
+/// A racing pair of `remember` calls can only lose a memo entry, never invent one,
+/// because a slot is only ever consulted by exact inode match.
 #[derive(Default)]
 struct LastMissingCapabilityXattr {
+    /// Most recent inode observed to have no capability xattr.
     inode: AtomicU64,
+    /// The one before it — see the alternation note above.
+    previous: AtomicU64,
 }
 
 impl LastMissingCapabilityXattr {
     fn contains(&self, ino: InodeNumber) -> bool {
-        ino.0 != 0 && self.inode.load(Ordering::Acquire) == ino.0
+        ino.0 != 0
+            && (self.inode.load(Ordering::Acquire) == ino.0
+                || self.previous.load(Ordering::Acquire) == ino.0)
     }
 
     fn remember(&self, ino: InodeNumber) {
-        if ino.0 != 0 {
-            self.inode.store(ino.0, Ordering::Release);
+        if ino.0 == 0 {
+            return;
         }
+        // Already resident: do not shuffle, or an alternating stream would push
+        // its own other half out on every hit.
+        if self.contains(ino) {
+            return;
+        }
+        let displaced = self.inode.swap(ino.0, Ordering::AcqRel);
+        self.previous.store(displaced, Ordering::Release);
+    }
+
+    /// Drop `ino` from both slots.
+    ///
+    /// Required once this memo serves READ-WRITE mounts: a memoized "absent" is
+    /// only sound while the inode cannot gain the xattr, which on a writable mount
+    /// is exactly until someone sets it. Clearing on mutation is what keeps a
+    /// later probe from being answered with a stale absence.
+    fn forget(&self, ino: InodeNumber) {
+        if ino.0 == 0 {
+            return;
+        }
+        let _ = self
+            .inode
+            .compare_exchange(ino.0, 0, Ordering::AcqRel, Ordering::Relaxed);
+        let _ = self
+            .previous
+            .compare_exchange(ino.0, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
 }
 
@@ -2394,7 +2442,19 @@ impl FrankenFuse {
         ino: InodeNumber,
         name: &str,
     ) -> ffs_error::Result<Option<Vec<u8>>> {
-        let is_capability_probe = self.inner.read_only && name == SECURITY_CAPABILITY_XATTR;
+        // Deliberately NOT gated on `read_only` (bd-yu6jz). It used to be, which
+        // disabled the memo on exactly the mounts the worst ratios are measured on
+        // — the bead's own note reads "a read-write mount (memos disabled) counted
+        // 2005 requests for 2000 path stats". Every probe then paid a full
+        // format-level `ops.getxattr` lookup, twice per path-based metadata op.
+        //
+        // Soundness on a writable mount comes from invalidation instead of from
+        // immutability: `setxattr`/`removexattr` call `forget(ino)`, so a memoized
+        // absence cannot outlive the moment the inode gains the xattr. The memo
+        // only ever caches ABSENCE, so the failure it must not permit is
+        // "reported absent after it exists", which is precisely what `forget`
+        // closes.
+        let is_capability_probe = name == SECURITY_CAPABILITY_XATTR;
         if is_capability_probe && self.inner.missing_capability_xattr.contains(ino) {
             if self.inner.count_memoized_requests {
                 self.inner.metrics.record_memoized();
@@ -2973,6 +3033,13 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EINVAL);
             return;
         };
+        // Invalidate BEFORE dispatching, and unconditionally (bd-yu6jz). Before,
+        // so no concurrent probe can re-memoize an absence between the write
+        // landing and the memo being cleared; unconditionally, because a setxattr
+        // that fails partway is not a promise the xattr is still absent. Losing a
+        // memo entry costs one format lookup; keeping a stale one reports a
+        // capability that exists as missing.
+        self.inner.missing_capability_xattr.forget(InodeNumber(ino));
         match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
             Ok(_) => reply.ok(),
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
@@ -3024,6 +3091,11 @@ impl Filesystem for FrankenFuse {
             return;
         };
 
+        // Same rule as setxattr: clear first, unconditionally (bd-yu6jz). A remove
+        // makes the xattr absent, so a stale entry would be harmless here — but a
+        // FAILED remove leaves it present, and re-memoizing absence around that is
+        // the case worth being careful about.
+        self.inner.missing_capability_xattr.forget(InodeNumber(ino));
         match self.with_request_scope(&cx, RequestOp::Removexattr, |cx, scope| {
             let removed = self
                 .inner
@@ -4170,6 +4242,89 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime};
+
+    /// The measured probe stream (bd-yu6jz): the kernel alternates between the
+    /// mount root and the target inode, 2002 of 4002 probes landing on `ino=1`.
+    /// A one-slot memo is the worst possible size for that stream — each probe
+    /// evicts the other half — so this is the test that pins WHY there are two.
+    #[test]
+    fn capability_memo_serves_the_alternating_root_and_file_probe_stream() {
+        let memo = LastMissingCapabilityXattr::default();
+        let root = InodeNumber(1);
+        memo.remember(root);
+
+        for file in [InodeNumber(14), InodeNumber(15), InodeNumber(126)] {
+            memo.remember(file);
+            assert!(
+                memo.contains(root),
+                "the root must survive a file probe; a 1-slot memo loses it here \
+                 and collapses to a 0% hit rate on the real stream"
+            );
+            assert!(memo.contains(file), "the file just probed must be resident");
+        }
+    }
+
+    /// A hit must not reshuffle the slots. If `remember` promoted an
+    /// already-resident inode it would displace the other half, which reproduces
+    /// the single-slot thrash with two slots.
+    #[test]
+    fn capability_memo_hit_does_not_evict_the_other_slot() {
+        let memo = LastMissingCapabilityXattr::default();
+        memo.remember(InodeNumber(1));
+        memo.remember(InodeNumber(14));
+        for _ in 0..10 {
+            memo.remember(InodeNumber(1));
+            memo.remember(InodeNumber(14));
+        }
+        assert!(memo.contains(InodeNumber(1)));
+        assert!(memo.contains(InodeNumber(14)));
+    }
+
+    /// NEGATIVE CASE, and the one that makes enabling this on a WRITABLE mount
+    /// sound at all: a memoized absence must not outlive the xattr being set.
+    /// Without `forget`, a getxattr after a setxattr would report a capability
+    /// that exists as missing — a correctness bug, not a perf regression.
+    #[test]
+    fn capability_memo_forgets_an_inode_so_a_later_set_is_not_reported_absent() {
+        let memo = LastMissingCapabilityXattr::default();
+        let ino = InodeNumber(14);
+        memo.remember(ino);
+        assert!(memo.contains(ino));
+
+        memo.forget(ino);
+        assert!(
+            !memo.contains(ino),
+            "a mutated inode must fall out of the memo, or the next probe is \
+             answered with a stale absence"
+        );
+    }
+
+    /// `forget` must be surgical: clearing the inode that was written must not
+    /// drop the OTHER slot, or every setxattr would cost the root a lookup.
+    #[test]
+    fn capability_memo_forget_leaves_the_other_slot_intact() {
+        let memo = LastMissingCapabilityXattr::default();
+        memo.remember(InodeNumber(1));
+        memo.remember(InodeNumber(14));
+        memo.forget(InodeNumber(14));
+        assert!(!memo.contains(InodeNumber(14)));
+        assert!(
+            memo.contains(InodeNumber(1)),
+            "forgetting one inode must not evict the root"
+        );
+    }
+
+    /// Inode 0 is not a real inode; it must never be memoized or match, or a
+    /// zero-valued empty slot would answer every probe for it.
+    #[test]
+    fn capability_memo_never_matches_inode_zero() {
+        let memo = LastMissingCapabilityXattr::default();
+        assert!(!memo.contains(InodeNumber(0)));
+        memo.remember(InodeNumber(0));
+        assert!(!memo.contains(InodeNumber(0)));
+        memo.forget(InodeNumber(0));
+        assert!(!memo.contains(InodeNumber(0)));
+    }
 
     #[test]
     fn readdirplus_capabilities_enable_only_directory_metadata_coalescing() {
