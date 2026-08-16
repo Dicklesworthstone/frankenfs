@@ -12744,3 +12744,88 @@ LVM volume, same substrate as the banked rows.
 
 Counted mechanism: **47 of 47 contention samples over limit**, `max_external_busy_cpus=32`
 against a limit of `2`.
+
+## 2026-08-16 — FLEET FINDING CONFIRMED for this gate, with TWO refinements: loadavg predicts CERTIFICATION but not the RATIO, and scatter matters more than average load (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Torch's 21-lane board read zero-certified for four ticks and the cause was host contention;
+mermaid found its per-CPU exclusivity gate unachievable for the same reason. Checked against
+this comparator's gate.
+
+### CONFIRMED — the same cause, and it is not an instrument defect
+
+Across all 38 preserved reports, walked from the JSON rather than grepped:
+`contended_fraction == 1.0000` in **38 of 38**, none below `0.50`,
+`max_external_busy_cpus` `7-60` against a limit of `2`, `max_consecutive_over_limit`
+`14-306` against a limit of `3`. Every refusal is sustained total saturation, past threshold
+by `4.7x-102x`. There is no window in that data where a more tolerant gate would have
+admitted a run — so, exactly as the fleet reports, the board reads uncertified for an
+INFRASTRUCTURE reason and not a performance one.
+
+Corroborating from the run side: this row completed **only** at loadavg `17-25`. Every
+attempt above ~`30` failed placement outright. Today it produced five clean-null runs in that
+band and nothing at all outside it.
+
+### REFINEMENT 1 — loadavg predicts whether a row CERTIFIES; it does NOT predict the ratio
+
+The five clean-null admitted runs against the contention actually measured during each:
+
+    LOW  7.316939   peak_off_placement_mean_busy 0.323978
+    LOW  7.453004                                0.255680
+    LOW  7.531731                                0.344515
+    HIGH 8.065190                                0.317413
+    HIGH 8.170852                                0.293381
+
+    low-group  mean 0.3081, range 0.2557-0.3445
+    high-group mean 0.3054, range 0.2934-0.3174   -> ranges fully OVERLAP
+
+**Contention does not separate the two clusters.** The group means differ by 0.9% of each
+other and the ranges overlap completely. So the `5.72%` bimodal gap in this row is NOT a
+contention artefact, and quieting the host is not expected to collapse it — it will produce
+CERTIFIED runs, but the spread between them is driven by something else, still unidentified.
+This matters for the fleet's reading: "the full board certifies when the host is quiet" is
+consistent with everything here, but it must not be extended to "the numbers are stable once
+quiet". On this row they demonstrably are not.
+
+### REFINEMENT 2 — the binding condition is SCATTER, not average load
+
+Loadavg alone mispredicts. This turn: four consecutive attempts at loadavg `20.17` — inside
+the band that has worked — failed on `no physical core has every SMT thread below the driver
+contention limit`, while earlier a run at loadavg `22.98` cleared placement and completed.
+The gate needs a physical core with BOTH hyperthreads free; work spread thinly across many
+cores blocks that far more effectively than the same total work packed onto a few. So a
+scheduler that scatters is worse for this gate than one that concentrates, at identical
+loadavg. Anyone using loadavg as the quiet-window trigger will get false positives.
+
+### Provenance for the five runs this entry analyses
+
+All five are the same ELF and host: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`. `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+private copy of the candidate. Each ratio is a bootstrap median with a bootstrap median CI
+from 20000 resamples — e.g. the lowest, bootstrap median `7.316939x` with bootstrap median CI
+`[7.247609, 7.338024]`; estimator `four_round_balanced_crossover_bootstrap_median_ci`. LVM
+volume, same substrate as the banked rows.
+
+### ADOPTED
+
+Loadavg is now recorded alongside every row banked from this comparator. It is NOT in the
+report JSON — checked: no `loadavg`, `load_average`, `load_avg` or `uptime` key — so it must
+be captured from the invoking shell, and a row banked without it cannot be re-examined
+against this finding later. Retroactively, today's runs: the five clean-null runs were taken
+at loadavg `17-25`; the refused attempts at `26-94`.
+
+### On "before calling it a loss" — already the practice, with one clarification
+
+No refused row today was called a loss. All are banked as refused-and-unclaimed, the banked
+`7.753405x`/`7.649395x` was never superseded, and the row has been re-run 20+ times seeking a
+quiet window rather than being written off.
+
+One term needs distinguishing so the ledger is not misread: `verdict=HONEST_LOSS` in the
+harness output is its classification of an ADMITTED vs-incumbent comparison in which FUSE is
+slower — it is the opposite of a certification failure, since only a row that PASSED its
+nulls and margin can earn it. A row that fails to certify carries `BLOCKED_NULL` or is
+refused by the contention veto, and none of those has been called a loss here.
+
+Current loadavg `43` — outside the runnable band — so no run was attempted this turn, which
+is the instruction applied rather than an obstacle reported.
