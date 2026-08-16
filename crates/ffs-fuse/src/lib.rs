@@ -5081,6 +5081,34 @@ pub fn mount(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
     fs.install_kernel_notifier(session.notifier());
+    // bd-vbqc6: FUSE-over-io_uring, opt-in, wired to the KNOBS rather than to
+    // literals.
+    //
+    // The 2026-08-01 attempt called `run_with_io_uring(4, 128 * 1024)` with both
+    // values hardcoded at this call site. 128 KiB per queue entry for requests of a
+    // few hundred bytes is three orders of magnitude of buffer that never amortises;
+    // it was measured on 512 creates, came back 1.487x slower and NULL-BLOCKED — so
+    // it never supported "io_uring is slower" under our own ladder — and the
+    // transport was disabled anyway. Restoring those literals would re-run the
+    // experiment that already failed, which is why `io_uring_config` landed first
+    // (9a347da8) with a one-page default and a ceiling that makes 128 KiB
+    // unreachable by accident.
+    #[cfg(target_os = "linux")]
+    if io_uring_enabled() {
+        let depth = io_uring_queue_depth();
+        let payload = io_uring_payload_bytes();
+        info!(
+            queue_depth = depth,
+            payload_bytes = payload,
+            "FUSE-over-io_uring transport requested"
+        );
+        session.run_with_io_uring(depth, payload)?;
+    } else if options.worker_threads > 0 {
+        session.run_with_workers(options.resolved_thread_count())?;
+    } else {
+        session.run()?;
+    }
+    #[cfg(not(target_os = "linux"))]
     if options.worker_threads > 0 {
         session.run_with_workers(options.resolved_thread_count())?;
     } else {
