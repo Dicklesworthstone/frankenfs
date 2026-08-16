@@ -56094,6 +56094,13 @@ mod tests {
         }
         let ab = bd_5vis3_bootstrap_median_ci(&ab_log_ratios);
         let null = bd_5vis3_bootstrap_median_ci(&null_log_ratios);
+        // The ledger will not bank a ratio without the executing ELF naming
+        // itself: a neighbouring sha256sum does not prove which binary ran.
+        // Emitted in the same line format ffs-cli bench-evidence uses.
+        println!(
+            "bench_evidence,binary_sha256={}",
+            bd_5vis3_executing_elf_sha256()
+        );
         println!(
             "bd-5vis3 PRODUCTION CONFIG — the production-relevant row (attr cache ON, cold fs per arm, {ok_last} inodes, {ROUNDS} interleaved pairs)\n  \
              executing_elf_sha256 {}\n  \
@@ -56101,7 +56108,12 @@ mod tests {
              wall ratio median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]\n  \
              A/A null  median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]",
             bd_5vis3_executing_elf_sha256(),
-            ab.median, ab.low, ab.high, null.median, null.low, null.high
+            ab.median,
+            ab.low,
+            ab.high,
+            null.median,
+            null.low,
+            null.high
         );
         // The A/B must clear the null envelope, or the number is instrument noise.
         assert!(
@@ -56133,17 +56145,42 @@ mod tests {
     /// cargo target dir a concurrent agent's rebuild can replace the binary between
     /// the run and the hash, so the self-report is the only form of this evidence
     /// that cannot drift.
+    ///
+    /// Returns a marker string rather than panicking on failure: a measurement
+    /// that cannot identify its binary is a row that cannot be banked, which the
+    /// ledger preflight will catch — losing the whole run to a panic instead would
+    /// throw away the numbers as well as the provenance.
     fn bd_5vis3_executing_elf_sha256() -> String {
         use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        use std::io::Read as _;
+
         let Ok(exe) = std::env::current_exe() else {
             return "unavailable(current_exe)".to_string();
         };
-        let Ok(bytes) = std::fs::read(&exe) else {
-            return "unavailable(read)".to_string();
+        let Ok(mut file) = std::fs::File::open(&exe) else {
+            return "unavailable(open)".to_string();
         };
+        // Streamed rather than `fs::read`: a release test binary for this crate is
+        // hundreds of MiB, and this runs inside the measured process.
         let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        format!("{:x}", hasher.finalize())
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(_) => return "unavailable(read)".to_string(),
+            }
+        }
+        // sha2 0.11 returns a `hybrid_array::Array`, which implements neither
+        // `LowerHex` nor `Display` — `format!("{:x}", ..)` does not compile against
+        // it, so the hex is written out a byte at a time.
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
     }
 
     fn bd_5vis3_splitmix64(state: &mut u64) -> u64 {
