@@ -7829,6 +7829,112 @@ mod tests {
         );
     }
 
+    /// The busy-host balanced square is a FOUR-arm design. Its schedule period
+    /// must stay four-arm even when a candidate comparison is requested, or the
+    /// interleaving silently becomes a different experiment than the one the
+    /// design was ported from (bd-ep37o).
+    #[test]
+    fn balanced_square_schedule_period_stays_four_arm_bd_ep37o() {
+        assert_eq!(
+            balanced_scope_schedule_period(PlacementScope::BalancedSquare, true),
+            schedule_period(false),
+            "balanced-square must keep the four-arm period even with candidates requested"
+        );
+        assert_eq!(
+            balanced_scope_schedule_period(PlacementScope::BalancedSquare, false),
+            schedule_period(false)
+        );
+        // Other scopes still honour the six-arm period when comparing candidates.
+        assert_eq!(
+            balanced_scope_schedule_period(PlacementScope::SameLlc, true),
+            schedule_period(true)
+        );
+    }
+
+    /// Six-arm candidate comparison must be REFUSED under balanced-square rather
+    /// than silently reshaped into the four-arm schedule (bd-ykfpp).
+    #[test]
+    fn balanced_square_refuses_six_arm_candidate_comparison_bd_ykfpp() {
+        assert!(
+            !balanced_scope_allows_candidates(PlacementScope::BalancedSquare, true),
+            "balanced-square must reject a six-arm candidate comparison"
+        );
+        assert!(balanced_scope_allows_candidates(
+            PlacementScope::BalancedSquare,
+            false
+        ));
+        assert!(balanced_scope_allows_candidates(
+            PlacementScope::SameLlc,
+            true
+        ));
+    }
+
+    /// The ported busy-host design admits a 2% A/A null bound, not the 2.5%
+    /// the other scopes allow. This is a GATE, so pin both sides of it: an
+    /// unpinned bound can be widened without anything failing (bd-2fbs3).
+    #[test]
+    fn balanced_square_enforces_the_two_percent_null_bound_bd_2fbs3() {
+        assert!(balanced_square_margin_is_valid(
+            PlacementScope::BalancedSquare,
+            1.02
+        ));
+        assert!(
+            !balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.025),
+            "the 2.5% default must be refused under balanced-square"
+        );
+        assert!(
+            !balanced_square_margin_is_valid(PlacementScope::BalancedSquare, 1.021),
+            "anything above 2% must be refused, not rounded"
+        );
+        // Other scopes keep the wider default.
+        assert!(balanced_square_margin_is_valid(
+            PlacementScope::SameLlc,
+            1.025
+        ));
+    }
+
+    /// A row must be self-describing about the bound it was held to, so the
+    /// configured A/A null bound has to survive parsing into the Config the
+    /// report publishes as `maximum_null_ratio` (bd-loqti).
+    #[test]
+    fn balanced_square_null_bound_is_carried_into_the_report_config_bd_loqti() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let mut args = vec![
+            "--ffs-cli".to_owned(),
+            cli.display().to_string(),
+            "--harness-builder".to_owned(),
+            "hz1".to_owned(),
+            "--candidate-builder".to_owned(),
+            "hz2".to_owned(),
+            "--placement-scope".to_owned(),
+            "balanced-square".to_owned(),
+            // Explicit, so this test does not depend on the default --pairs
+            // happening to be a multiple of the balanced-square period.
+            "--pairs".to_owned(),
+            "24".to_owned(),
+            "--maximum-null-ratio".to_owned(),
+            "1.02".to_owned(),
+        ];
+        let config = parse_config_args(&args)
+            .expect("parse balanced-square config")
+            .expect("normal invocation");
+        assert_eq!(config.placement_scope, PlacementScope::BalancedSquare);
+        assert!(
+            (config.maximum_null_ratio - 1.02).abs() < f64::EPSILON,
+            "the exact bound the run was held to must reach the report"
+        );
+
+        // And the gate refuses the wider default under this scope.
+        let last = args.len() - 1;
+        args[last] = "1.025".to_owned();
+        assert!(
+            parse_config_args(&args).is_err(),
+            "balanced-square must refuse a 2.5% null bound at parse time"
+        );
+    }
+
     #[test]
     fn btrfs_read_checksum_verification_is_explicit_and_defaults_on() {
         let temp = tempfile::tempdir().expect("tempdir");
