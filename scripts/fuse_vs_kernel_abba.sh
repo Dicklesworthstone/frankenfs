@@ -92,7 +92,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 # A ratio whose arms sit on structurally different hardware is a hardware ratio in
 # disguise. Refuse before measuring rather than discovering it in the row.
-if ! COMPARABLE=$(python3 -c "
+# FFS_ALLOW_SIBLING_PINNING=1 exists for exactly ONE purpose: measuring the size
+# of the bias that sibling pinning introduces, by running the same certification
+# both ways. It must never be used to produce a competitive row. The override is
+# echoed loudly so a row produced under it cannot look like a normal one.
+if [ "${FFS_ALLOW_SIBLING_PINNING:-0}" = "1" ]; then
+  echo "WARNING: sibling-pinning guard OVERRIDDEN. This configuration is only"
+  echo "valid for measuring the bias itself; it must not produce a competitive row."
+elif ! COMPARABLE=$(python3 -c "
 import sys; sys.path.insert(0, '$HERE')
 import host_stability as h
 ok, why = h.cores_comparable($DAEMON_CPU, $CLIENT_CPU)
@@ -101,8 +108,9 @@ sys.exit(0 if ok else 1)
 "); then
   echo "$COMPARABLE"
   exit 6
+else
+  echo "$COMPARABLE"
 fi
-echo "$COMPARABLE"
 
 [ -x "$CLI" ] || { echo "FATAL: no ffs-cli at $CLI"; exit 2; }
 [ -f "$IMG" ] || { echo "FATAL: no image at $IMG"; exit 2; }
