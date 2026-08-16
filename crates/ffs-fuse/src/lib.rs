@@ -1113,6 +1113,18 @@ pub struct AtomicMetrics {
     pub requests_throttled: CacheLinePadded<AtomicU64>,
     /// Requests rejected (shed) by backpressure.
     pub requests_shed: CacheLinePadded<AtomicU64>,
+    /// FORGET / BATCH_FORGET nodes the kernel has dropped (bd-i353e).
+    ///
+    /// These are real boundary crossings that no dispatch counter saw: neither
+    /// handler goes through `with_request_scope`, so they never reached
+    /// `record_dispatch_duration` and never incremented `requests_total`. Any
+    /// reconciliation of dispatches against boundary crossings is therefore
+    /// unclosable on a workload that forgets inodes — and readdirplus is exactly
+    /// such a workload, since every entry it returns takes a reference the kernel
+    /// must later drop. Counted in NODES, not messages, so one BATCH_FORGET of
+    /// 200 inodes counts 200: the question these counters answer is how many
+    /// inodes the kernel dropped, not how many datagrams it used to say so.
+    pub forget_nodes: CacheLinePadded<AtomicU64>,
 }
 
 impl AtomicMetrics {
@@ -1151,6 +1163,7 @@ impl AtomicMetrics {
             readdir_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             requests_throttled: CacheLinePadded(AtomicU64::new(0)),
             requests_shed: CacheLinePadded(AtomicU64::new(0)),
+            forget_nodes: CacheLinePadded(AtomicU64::new(0)),
         }
     }
 
@@ -1183,6 +1196,11 @@ impl AtomicMetrics {
 
     pub fn record_metadata_request(&self) {
         Self::saturating_add(&self.metadata_requests.0, 1);
+    }
+
+    /// Record `nodes` forgotten inodes (bd-i353e). See `forget_nodes`.
+    pub fn record_forget_nodes(&self, nodes: u64) {
+        Self::saturating_add(&self.forget_nodes.0, nodes);
     }
 
     /// Record one WHOLE-handler duration (bd-4zokj).
@@ -1296,6 +1314,7 @@ impl AtomicMetrics {
             readdir_dispatch_nanos: self.readdir_dispatch_nanos.0.load(Ordering::Relaxed),
             requests_throttled: self.requests_throttled.0.load(Ordering::Relaxed),
             requests_shed: self.requests_shed.0.load(Ordering::Relaxed),
+            forget_nodes: self.forget_nodes.0.load(Ordering::Relaxed),
             ..Default::default()
         }
     }
@@ -1377,6 +1396,9 @@ pub struct MetricsSnapshot {
     pub requests_throttled: u64,
     /// Requests rejected (shed) by backpressure.
     pub requests_shed: u64,
+    /// Inodes dropped via FORGET / BATCH_FORGET (bd-i353e). Uncounted before this:
+    /// neither handler opens a request scope, so these crossings were invisible.
+    pub forget_nodes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3378,6 +3400,9 @@ impl Filesystem for FrankenFuse {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, _nlookup: u64) {
+        // bd-i353e: a FORGET is a boundary crossing. It opens no request scope, so
+        // before this it was invisible to every counter including requests_total.
+        self.inner.metrics.record_forget_nodes(1);
         let inode = InodeNumber(ino);
         self.inner.readahead.invalidate_inode(inode);
         self.inner.access_predictor.invalidate_inode(inode);
@@ -3391,6 +3416,12 @@ impl Filesystem for FrankenFuse {
     }
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuse_forget_one]) {
+        // Counted in NODES rather than messages: one BATCH_FORGET of 200 inodes is
+        // 200 dropped references, and the reconciliation question is how many
+        // inodes the kernel dropped, not how many datagrams it used to say so.
+        self.inner
+            .metrics
+            .record_forget_nodes(nodes.len().try_into().unwrap_or(u64::MAX));
         for node in nodes {
             let inode = InodeNumber(node.nodeid);
             self.inner.readahead.invalidate_inode(inode);
@@ -16663,7 +16694,7 @@ mod tests {
             "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
-            "requests_throttled: 0, requests_shed: 0 }, ",
+            "requests_throttled: 0, requests_shed: 0, forget_nodes: 0 }, ",
             "unmount_timeout: 30s }"
         );
 
@@ -17902,6 +17933,43 @@ AllowOther"#;
         );
     }
 
+    /// bd-i353e: FORGET is a boundary crossing and must be counted somewhere.
+    ///
+    /// `forget` and `batch_forget` open no request scope, so they never reached
+    /// `record_dispatch_duration` and never incremented `requests_total`. That made
+    /// them invisible to every counter: a readdirplus sweep and a plain readdir
+    /// sweep showed the same ~3 uncounted residual whatever the kernel actually did
+    /// with the references it took. Since readdirplus takes a reference per entry
+    /// that the kernel must later drop, a dispatch-vs-crossing reconciliation could
+    /// never close on that workload.
+    ///
+    /// Counted in NODES, not messages: one `BATCH_FORGET` carrying 200 inodes is 200
+    /// dropped references. The question these counters answer is how many inodes the
+    /// kernel dropped, not how many datagrams it used to say so.
+    #[test]
+    fn forget_nodes_are_counted_in_nodes_not_messages_bd_i353e() {
+        let m = AtomicMetrics::default();
+        assert_eq!(m.snapshot().forget_nodes, 0, "starts at zero");
+
+        m.record_forget_nodes(1); // one FORGET
+        m.record_forget_nodes(200); // one BATCH_FORGET of 200 inodes
+        let s = m.snapshot();
+        assert_eq!(
+            s.forget_nodes, 201,
+            "two messages carrying 201 inodes must count 201, not 2"
+        );
+
+        // FORGET carries no reply and completes no request, so it must NOT inflate
+        // requests_total -- that counter is already overloaded (it counts request
+        // SCOPES, and readdirplus opens one per entry). Keeping forget on its own
+        // axis is what lets a reconciliation say which quantity it is reconciling.
+        assert_eq!(
+            s.requests_total, 0,
+            "forget must not be folded into requests_total"
+        );
+        assert_eq!(s.requests_ok, 0, "forget completes no request");
+    }
+
     /// bd-k3g3g: adding a counter to `MetricsSnapshot` must stay a one-line change.
     ///
     /// Before the `Default` derive, every construction site listed every field, so an
@@ -17940,6 +18008,7 @@ AllowOther"#;
             readdir_dispatch_nanos: 0,
             requests_throttled: 0,
             requests_shed: 0,
+            forget_nodes: 0,
         };
         assert_eq!(
             sparse, exhaustive,
@@ -18159,7 +18228,7 @@ AllowOther"#;
             "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
-            "requests_throttled: 0, requests_shed: 0 }, ",
+            "requests_throttled: 0, requests_shed: 0, forget_nodes: 0 }, ",
             "thread_count: 2, ",
             "worker_dispatch: true, ",
             "parallel_dirops: true, ",
