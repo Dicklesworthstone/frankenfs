@@ -26,7 +26,7 @@ impl AsFd for Channel {
 
 /// Upper bound on `FFS_FUSE_RECEIVE_SPIN`, so a misconfigured knob cannot pin a
 /// core for the life of the mount.
-const MAX_RECEIVE_SPIN: u32 = 100_000;
+pub const MAX_RECEIVE_SPIN: u32 = 100_000;
 
 impl Channel {
     /// Create a new communication channel to the kernel driver by mounting the
@@ -59,7 +59,7 @@ impl Channel {
     /// would pin a core at 100% for the life of the mount, and on this shared
     /// measurement host that would corrupt every other pane's timings as well as
     /// our own.
-    fn spin_iterations_from_value(raw: Option<&str>) -> u32 {
+    pub fn spin_iterations_from_value(raw: Option<&str>) -> u32 {
         raw.and_then(|r| r.trim().parse::<u32>().ok())
             .unwrap_or(0)
             .min(MAX_RECEIVE_SPIN)

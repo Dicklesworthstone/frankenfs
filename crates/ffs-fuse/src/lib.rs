@@ -104,12 +104,17 @@ pub fn capability_memo_slots() -> usize {
 /// identical knobs — a lever invisible on that line is unmeasurable however large.
 #[must_use]
 pub fn receive_spin() -> u32 {
-    std::env::var("FFS_FUSE_RECEIVE_SPIN")
-        .ok()
-        .as_deref()
-        .and_then(|r| r.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-        .min(100_000)
+    // Delegates to the transport's OWN parser rather than reimplementing it.
+    // These were briefly two independent copies of one contract — the knob line
+    // would have reported whatever this function decided while the transport span
+    // whatever ITS parser decided, and the two could drift silently. A knob line
+    // that describes a configuration the daemon did not run is worse than no knob
+    // line, because it is trusted. This also makes the contract testable: `fuser`
+    // is a path dependency and NOT a workspace member, so `cargo test -p fuser`
+    // cannot run at all and the tests beside that parser can never execute here.
+    fuser::channel::Channel::spin_iterations_from_value(
+        std::env::var("FFS_FUSE_RECEIVE_SPIN").ok().as_deref(),
+    )
 }
 
 /// Whether to negotiate the FUSE splice capabilities (bd-splice-metadata).
@@ -5645,6 +5650,65 @@ mod tests {
         assert!(
             !ReaddirplusAttrMemo::enabled_from_value(None),
             "unset means off"
+        );
+    }
+
+    /// The receive-spin contract, tested HERE because it cannot be tested where
+    /// it is implemented.
+    ///
+    /// The parser lives in `fuser::channel`, and `fuser` is a path dependency
+    /// rather than a workspace member — `cargo test -p fuser` fails outright with
+    /// "requires dev-dependencies and is not a member of the workspace". The
+    /// tests written beside that parser can therefore never run in this
+    /// repository. Rather than leave the contract covered only by unrunnable
+    /// tests, `receive_spin()` delegates to that one parser and the contract is
+    /// asserted from this crate, where tests do run.
+    ///
+    /// THE NEGATIVE CASE is the default and the fail-closed behaviour: 0 means the
+    /// blocking read happens immediately, which is byte-for-byte what every banked
+    /// mounted measurement was taken with. A spin knob that engaged on
+    /// unrecognised input would burn a core per mount and silently invalidate the
+    /// ledger.
+    #[test]
+    fn receive_spin_defaults_to_zero_fails_closed_and_clamps_bd_receive_spin() {
+        use fuser::channel::{Channel, MAX_RECEIVE_SPIN};
+
+        assert_eq!(
+            Channel::spin_iterations_from_value(None),
+            0,
+            "unset MUST mean block immediately — the behaviour every banked row \
+             was measured with"
+        );
+        for junk in ["", "  ", "yes", "on", "true", "-1", "1.5", "1e6", "0x10"] {
+            assert_eq!(
+                Channel::spin_iterations_from_value(Some(junk)),
+                0,
+                "{junk:?} must fail CLOSED to 0; a spin knob engaging on \
+                 unrecognised input would pin a core per mount"
+            );
+        }
+
+        // The clamp is load-bearing, not defensive: each iteration is a
+        // non-blocking poll, so an unbounded value pins a core for the life of the
+        // mount and corrupts every other tenant's timings on this shared host.
+        assert_eq!(
+            Channel::spin_iterations_from_value(Some("4294967295")),
+            MAX_RECEIVE_SPIN,
+            "u32::MAX must clamp"
+        );
+        assert!(MAX_RECEIVE_SPIN < u32::MAX, "the ceiling must bound something");
+
+        // Sane values are honoured, or the knob is useless as an A/B handle.
+        assert_eq!(Channel::spin_iterations_from_value(Some("512")), 512);
+
+        // And the reported knob resolves through the SAME parser the transport
+        // uses — the drift this delegation exists to prevent.
+        assert_eq!(
+            receive_spin(),
+            Channel::spin_iterations_from_value(
+                std::env::var("FFS_FUSE_RECEIVE_SPIN").ok().as_deref()
+            ),
+            "the knob line must describe the configuration the transport actually ran"
         );
     }
 
