@@ -7510,7 +7510,7 @@ fn log_mount_shutdown_metrics(
         Ok("1" | "true")
     ) {
         eprintln!(
-            "mount_dispatch_metrics,filesystem={filesystem},getattr_dispatch_count={},getattr_dispatch_nanos={},getxattr_dispatch_count={},getxattr_dispatch_nanos={},lookup_dispatch_count={},lookup_dispatch_nanos={},readdir_dispatch_count={},readdir_dispatch_nanos={}",
+            "mount_dispatch_metrics,filesystem={filesystem},getattr_dispatch_count={},getattr_dispatch_nanos={},getxattr_dispatch_count={},getxattr_dispatch_nanos={},lookup_dispatch_count={},lookup_dispatch_nanos={},readdir_dispatch_count={},readdir_dispatch_nanos={},mutation_dispatch_count={},mutation_dispatch_nanos={}",
             metrics.getattr_dispatch_count,
             metrics.getattr_dispatch_nanos,
             metrics.getxattr_dispatch_count,
@@ -7519,6 +7519,8 @@ fn log_mount_shutdown_metrics(
             metrics.lookup_dispatch_nanos,
             metrics.readdir_dispatch_count,
             metrics.readdir_dispatch_nanos,
+            metrics.mutation_dispatch_count,
+            metrics.mutation_dispatch_nanos,
         );
         // Which attribute names the client actually asks for (bd-4ypbv). The
         // dispatch line says how MANY probes and how cheap each was; this says
@@ -9954,6 +9956,8 @@ mod tests {
             getattr_dispatch_nanos: 0,
             getxattr_dispatch_count: 0,
             getxattr_dispatch_nanos: 0,
+            mutation_dispatch_count: 0,
+            mutation_dispatch_nanos: 0,
             lookup_dispatch_count: 0,
             lookup_dispatch_nanos: 0,
             readdir_dispatch_count: 0,
@@ -10108,6 +10112,8 @@ mod tests {
                     getattr_dispatch_nanos: 500,
                     getxattr_dispatch_count: 3,
                     getxattr_dispatch_nanos: 300,
+                    mutation_dispatch_count: 0,
+                    mutation_dispatch_nanos: 0,
                     lookup_dispatch_count: 9,
                     lookup_dispatch_nanos: 900,
                     readdir_dispatch_count: 7,
@@ -10280,6 +10286,8 @@ mod tests {
                 getattr_dispatch_nanos: 0,
                 getxattr_dispatch_count: 0,
                 getxattr_dispatch_nanos: 0,
+                mutation_dispatch_count: 0,
+                mutation_dispatch_nanos: 0,
                 lookup_dispatch_count: 0,
                 lookup_dispatch_nanos: 0,
                 readdir_dispatch_count: 0,

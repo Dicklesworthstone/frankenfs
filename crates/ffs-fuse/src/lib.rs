@@ -988,6 +988,12 @@ pub struct AtomicMetrics {
     /// Successful path-based metadata requests (getattr/statx) observed at
     /// the FUSE boundary, including memo-served replies (bd-0c4av).
     pub metadata_requests: CacheLinePadded<AtomicU64>,
+    /// Number of MUTATING request-scope dispatches completed by the daemon,
+    /// aggregated across create/mkdir/unlink/rmdir/rename/link/symlink/
+    /// fallocate/setattr/setxattr/removexattr/write/fsync/fsyncdir (bd-i353e).
+    pub mutation_dispatch_count: CacheLinePadded<AtomicU64>,
+    /// Cumulative daemon dispatch time for those mutating request scopes, in ns.
+    pub mutation_dispatch_nanos: CacheLinePadded<AtomicU64>,
     /// Number of `Getattr` request-scope dispatches completed by the daemon.
     pub getattr_dispatch_count: CacheLinePadded<AtomicU64>,
     /// Cumulative daemon dispatch time for `Getattr` request scopes, in ns.
@@ -1039,6 +1045,8 @@ impl AtomicMetrics {
             getattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
+            mutation_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            mutation_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             lookup_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
             lookup_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             readdir_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
@@ -1098,6 +1106,39 @@ impl AtomicMetrics {
                 Self::saturating_add(&self.readdir_dispatch_count.0, 1);
                 Self::saturating_add(&self.readdir_dispatch_nanos.0, nanos);
             }
+            // bd-i353e: every MUTATING dispatch, aggregated.
+            //
+            // These all previously fell through the `_ => {}` below and were
+            // dropped, so the daemon counted only read-metadata opcodes. Three of
+            // the five remaining mounted LOSE rows perform none of those four:
+            // create/delete storm (2.36x) does create+fsyncdir+delete+fsyncdir,
+            // fsync/journal commit (1.98x) does write+fsync, parallel metadata
+            // writes (1.93x) does create+fsync. Attributing any of them reported
+            // a share of 0.90% that was a strict LOWER BOUND rather than an
+            // answer, because the work itself was uncounted.
+            //
+            // ONE aggregate rather than a pair per opcode: the question these
+            // rows ask is "how much of the arm is our mutation work", and a
+            // 14-variant breakdown is 28 fields to answer it. If the aggregate
+            // turns out to be large, splitting it is a follow-up with a reason.
+            RequestOp::Create
+            | RequestOp::Mkdir
+            | RequestOp::Unlink
+            | RequestOp::Rmdir
+            | RequestOp::Rename
+            | RequestOp::Link
+            | RequestOp::Symlink
+            | RequestOp::Fallocate
+            | RequestOp::Setattr
+            | RequestOp::Setxattr
+            | RequestOp::Removexattr
+            | RequestOp::Write
+            | RequestOp::Fsync
+            | RequestOp::Fsyncdir
+            | RequestOp::RepairWriteback => {
+                Self::saturating_add(&self.mutation_dispatch_count.0, 1);
+                Self::saturating_add(&self.mutation_dispatch_nanos.0, nanos);
+            }
             _ => {}
         }
     }
@@ -1123,6 +1164,8 @@ impl AtomicMetrics {
             getattr_dispatch_nanos: self.getattr_dispatch_nanos.0.load(Ordering::Relaxed),
             getxattr_dispatch_count: self.getxattr_dispatch_count.0.load(Ordering::Relaxed),
             getxattr_dispatch_nanos: self.getxattr_dispatch_nanos.0.load(Ordering::Relaxed),
+            mutation_dispatch_count: self.mutation_dispatch_count.0.load(Ordering::Relaxed),
+            mutation_dispatch_nanos: self.mutation_dispatch_nanos.0.load(Ordering::Relaxed),
             lookup_dispatch_count: self.lookup_dispatch_count.0.load(Ordering::Relaxed),
             lookup_dispatch_nanos: self.lookup_dispatch_nanos.0.load(Ordering::Relaxed),
             readdir_dispatch_count: self.readdir_dispatch_count.0.load(Ordering::Relaxed),
@@ -1174,6 +1217,10 @@ pub struct MetricsSnapshot {
     pub getattr_dispatch_nanos: u64,
     pub getxattr_dispatch_count: u64,
     pub getxattr_dispatch_nanos: u64,
+    /// Mutating dispatches and their cumulative time (bd-i353e). Aggregated
+    /// across every write-side `RequestOp`; see `record_dispatch_duration`.
+    pub mutation_dispatch_count: u64,
+    pub mutation_dispatch_nanos: u64,
     pub lookup_dispatch_count: u64,
     pub lookup_dispatch_nanos: u64,
     pub readdir_dispatch_count: u64,
@@ -16741,6 +16788,8 @@ AllowOther"#;
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
             getxattr_dispatch_nanos: 200,
+            mutation_dispatch_count: 0,
+            mutation_dispatch_nanos: 0,
             lookup_dispatch_count: 5,
             lookup_dispatch_nanos: 500,
             readdir_dispatch_count: 3,
@@ -16761,6 +16810,8 @@ AllowOther"#;
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
             getxattr_dispatch_nanos: 200,
+            mutation_dispatch_count: 0,
+            mutation_dispatch_nanos: 0,
             lookup_dispatch_count: 5,
             lookup_dispatch_nanos: 500,
             readdir_dispatch_count: 3,
