@@ -55921,10 +55921,20 @@ mod tests {
         };
         let cx = Cx::for_testing();
 
+        // ONE device, shared by every arm. TestDevice is an Arc over the image,
+        // so cloning it is a refcount bump; `bytes.clone()` was copying the whole
+        // image per arm — 4 arms a round, 28 full-image copies a run. That churn
+        // is the leading suspect for the monotonic within-round slowdown the A/A
+        // null reports (each successive arm slower than the last), which is what
+        // keeps the null failing on some workers. Safe because neither arm
+        // writes: both only readdir and getattr, and the fs is opened without
+        // enable_writes. Each arm still gets a FRESH OpenFs, so "cold fs per
+        // arm" is unchanged — that was always about the fs caches, not the bytes.
+        let shared_device = TestDevice::from_vec(bytes.clone());
         let mut arm = |memo_disabled: bool| -> (u64, std::time::Duration) {
             let fs = OpenFs::from_device(
                 &cx,
-                Box::new(TestDevice::from_vec(bytes.clone())),
+                Box::new(shared_device.clone()),
                 &OpenOptions::default(),
             )
             .expect("open btrfs");
@@ -56089,10 +56099,14 @@ mod tests {
         };
         let cx = Cx::for_testing();
 
+        // One shared Arc-backed device rather than a full image copy per arm —
+        // see the random arm for why this churn is the drift suspect. Each arm
+        // still constructs a fresh OpenFs, so the cold-fs property is unchanged.
+        let shared_device = TestDevice::from_vec(bytes.clone());
         let mut arm = |memo_disabled: bool| -> (u64, std::time::Duration, u64) {
             let fs = OpenFs::from_device(
                 &cx,
-                Box::new(TestDevice::from_vec(bytes.clone())),
+                Box::new(shared_device.clone()),
                 &OpenOptions::default(),
             )
             .expect("open btrfs");
