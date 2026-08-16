@@ -7297,8 +7297,20 @@ fn run() -> Result<Option<PathBuf>> {
     pin_current_process(&placement.driver_cpus)?;
     let driver_pinning = WorkerPinning::new(placement.driver_cpus.clone())?;
     let driver_thread_cpu = driver_pinning.bind_driver_thread()?;
+    // bd-client-core-distinctness: the DISTINCT-CORE count belongs on the line an
+    // operator actually reads, not only in the report JSON. Placement backfills from
+    // the SMT-sibling set when it cannot find enough quiet distinct cores, and audited
+    // over 13 clean-null runs of the worst row, ZERO got 8 threads onto 8 cores — ten
+    // got 7, two got 6, one got 4. Measured impact for this harness is +3.49% on the
+    // ratio against an 18.43% spread at fixed core count, so this is a small effect
+    // that must still be VISIBLE: a row whose degradation is invisible cannot be
+    // compared to one with a different mix.
+    let (client_cores, client_shared) = physical_core_occupancy(
+        &placement.driver_cpus.iter().copied().collect::<BTreeSet<_>>(),
+    )
+    .unwrap_or((0, 0));
     println!(
-        "mounted_kernel_driver_thread_binding,requested_client_threads={},placement_cpus={},driver_thread_cpu={driver_thread_cpu},binding=one_fixed_cpu,reason=the_timed_region_includes_driver_thread_directory_fsyncs,verdict=bound",
+        "mounted_kernel_driver_thread_binding,requested_client_threads={},placement_cpus={},driver_thread_cpu={driver_thread_cpu},client_physical_cores={client_cores},client_smt_shared_cpus={client_shared},binding=one_fixed_cpu,reason=the_timed_region_includes_driver_thread_directory_fsyncs,verdict=bound",
         config.client_threads(),
         format_cpu_list(placement.driver_cpus.iter().copied()),
     );
