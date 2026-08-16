@@ -296,6 +296,39 @@ const READDIRPLUS_CAPABILITIES_FORCED: u64 = fuse_consts::FUSE_DO_READDIRPLUS;
 /// permission-semantics question can be gated separately from the round-trip one.
 const POSIX_ACL_CAPABILITY: u64 = fuse_consts::FUSE_POSIX_ACL;
 
+/// Is the readdirplus attribute memo enabled? (bd-q0xnl)
+///
+/// Opt-OUT, defaulting ON, because the memo is already the shipping behaviour.
+/// This exists so the memo can be A/B'd on ONE ELF — ISA and PGO then cancel
+/// (bd-b9dug class C) — which matters because the memo's value is anti-correlated
+/// with the generation fix (`2e78f789`): it pays off only while the kernel re-asks
+/// for attributes readdirplus already supplied, and if the fix stops that, every
+/// `remember` is a mutex acquisition and a slot write that nothing reads.
+///
+/// Sized before writing this knob, so the expectation is calibrated: the memo can
+/// save at most one `ops.getattr` per entry, measured at `33.185 ns` with no FUSE,
+/// i.e. `0.66 ms` of a `325.1 ms` sweep = 0.20%. This knob is here to find out
+/// whether it COSTS more than that, not because a win is expected.
+fn readdirplus_attr_memo_enabled_from_env() -> bool {
+    readdirplus_attr_memo_enabled_from_value(
+        std::env::var("FFS_FUSE_READDIRPLUS_ATTR_MEMO")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure half of [`readdirplus_attr_memo_enabled_from_env`], so the parsing is
+/// testable without mutating process-global environment state.
+fn readdirplus_attr_memo_enabled_from_value(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+    }
+}
+
 /// Resolve the POSIX-ACL capability from `FFS_FUSE_POSIX_ACL`.
 ///
 /// `1`, `true` or `on` negotiates `FUSE_POSIX_ACL`; anything else, including
@@ -1215,6 +1248,18 @@ pub struct AtomicMetrics {
     pub requests_throttled: CacheLinePadded<AtomicU64>,
     /// Requests rejected (shed) by backpressure.
     pub requests_shed: CacheLinePadded<AtomicU64>,
+    /// Attributes stashed by readdirplus for a follow-up getattr (bd-q0xnl).
+    ///
+    /// Paired with `readdirplus_memo_hits` to give a HIT RATE, which is the only
+    /// number that can retire this memo. It pays off solely while the kernel
+    /// re-asks for attributes readdirplus already handed it; if the generation fix
+    /// stops that, every remember becomes a mutex acquisition and a slot write
+    /// that nothing ever reads. A hit rate near zero is the signature of dead
+    /// weight, and before this counter existed it was unobservable — `record_memoized`
+    /// only bumped `requests_total`, so a memo hit looked like any other request.
+    pub readdirplus_memo_remembers: CacheLinePadded<AtomicU64>,
+    /// Follow-up getattrs actually served from the memo (bd-q0xnl).
+    pub readdirplus_memo_hits: CacheLinePadded<AtomicU64>,
     /// FORGET / BATCH_FORGET nodes the kernel has dropped (bd-i353e).
     ///
     /// These are real boundary crossings that no dispatch counter saw: neither
@@ -1265,6 +1310,8 @@ impl AtomicMetrics {
             readdir_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             requests_throttled: CacheLinePadded(AtomicU64::new(0)),
             requests_shed: CacheLinePadded(AtomicU64::new(0)),
+            readdirplus_memo_remembers: CacheLinePadded(AtomicU64::new(0)),
+            readdirplus_memo_hits: CacheLinePadded(AtomicU64::new(0)),
             forget_nodes: CacheLinePadded(AtomicU64::new(0)),
         }
     }
@@ -1298,6 +1345,16 @@ impl AtomicMetrics {
 
     pub fn record_metadata_request(&self) {
         Self::saturating_add(&self.metadata_requests.0, 1);
+    }
+
+    /// Record one readdirplus attribute stashed for a later getattr (bd-q0xnl).
+    pub fn record_readdirplus_memo_remember(&self) {
+        Self::saturating_add(&self.readdirplus_memo_remembers.0, 1);
+    }
+
+    /// Record one follow-up getattr served from the memo (bd-q0xnl).
+    pub fn record_readdirplus_memo_hit(&self) {
+        Self::saturating_add(&self.readdirplus_memo_hits.0, 1);
     }
 
     /// Record `nodes` forgotten inodes (bd-i353e). See `forget_nodes`.
@@ -1416,6 +1473,8 @@ impl AtomicMetrics {
             readdir_dispatch_nanos: self.readdir_dispatch_nanos.0.load(Ordering::Relaxed),
             requests_throttled: self.requests_throttled.0.load(Ordering::Relaxed),
             requests_shed: self.requests_shed.0.load(Ordering::Relaxed),
+            readdirplus_memo_remembers: self.readdirplus_memo_remembers.0.load(Ordering::Relaxed),
+            readdirplus_memo_hits: self.readdirplus_memo_hits.0.load(Ordering::Relaxed),
             forget_nodes: self.forget_nodes.0.load(Ordering::Relaxed),
             ..Default::default()
         }
@@ -1498,6 +1557,10 @@ pub struct MetricsSnapshot {
     pub requests_throttled: u64,
     /// Requests rejected (shed) by backpressure.
     pub requests_shed: u64,
+    /// readdirplus attributes stashed, and follow-up getattrs served from them
+    /// (bd-q0xnl). Their ratio is the memo's hit rate.
+    pub readdirplus_memo_remembers: u64,
+    pub readdirplus_memo_hits: u64,
     /// Inodes dropped via FORGET / BATCH_FORGET (bd-i353e). Uncounted before this:
     /// neither handler opens a request scope, so these crossings were invisible.
     pub forget_nodes: u64,
@@ -2526,6 +2589,7 @@ struct FuseInner {
     readahead: ReadaheadManager,
     readonly_xattr_cache: ReadonlyXattrCache,
     readdirplus_attr_memo: ReaddirplusAttrMemo,
+    readdirplus_attr_memo_enabled: bool,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
 }
@@ -3543,8 +3607,14 @@ impl Filesystem for FrankenFuse {
         // than dispatched, because the kernel still paid for the round trip —
         // undercounting it is what made requests_total unusable as evidence
         // once before (bd-warm-stat-is-the-fuse-floor-4wxw9).
-        if let Some(attr) = self.inner.readdirplus_attr_memo.take(InodeNumber(ino)) {
+        if let Some(attr) = self
+            .inner
+            .readdirplus_attr_memo_enabled
+            .then(|| self.inner.readdirplus_attr_memo.take(InodeNumber(ino)))
+            .flatten()
+        {
             self.inner.metrics.record_memoized();
+            self.inner.metrics.record_readdirplus_memo_hit();
             reply.attr(&ATTR_TTL, &to_file_attr(&attr));
             return;
         }
@@ -3842,9 +3912,12 @@ impl Filesystem for FrankenFuse {
                     // bd-q0xnl: hand these attributes to the getattr the kernel
                     // issues for this same inode moments from now, so the daemon
                     // does not recompute what it just computed.
-                    self.inner
-                        .readdirplus_attr_memo
-                        .remember(entry.ino, &inode_attr);
+                    if self.inner.readdirplus_attr_memo_enabled {
+                        self.inner
+                            .readdirplus_attr_memo
+                            .remember(entry.ino, &inode_attr);
+                        self.inner.metrics.record_readdirplus_memo_remember();
+                    }
                     let attr = to_file_attr(&inode_attr);
 
                     let full = reply.add(
@@ -6046,6 +6119,7 @@ mod tests {
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             readonly_xattr_cache: ReadonlyXattrCache::default(),
             readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
+            readdirplus_attr_memo_enabled: readdirplus_attr_memo_enabled_from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
@@ -16778,6 +16852,7 @@ mod tests {
                 READDIRPLUS_ATTR_MEMO_SLOTS,
                 false,
             ),
+            readdirplus_attr_memo_enabled: true,
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
@@ -16913,7 +16988,9 @@ mod tests {
             "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
-            "requests_throttled: 0, requests_shed: 0, forget_nodes: 0 }, ",
+            "requests_throttled: 0, requests_shed: 0, "
+            "readdirplus_memo_remembers: 0, readdirplus_memo_hits: 0, "
+            "forget_nodes: 0 }, ",
             "unmount_timeout: 30s }"
         );
 
@@ -18152,6 +18229,76 @@ AllowOther"#;
         );
     }
 
+    /// bd-q0xnl: the memo knob must be opt-OUT and must parse conservatively.
+    ///
+    /// Opt-out because the memo is already shipping behaviour; the knob exists to
+    /// A/B it on ONE ELF, not to change a default. An unrecognised value keeps the
+    /// memo ON, so a typo cannot silently disable shipping behaviour mid-campaign
+    /// — the opposite polarity to `FFS_FUSE_POSIX_ACL`, which fails CLOSED because
+    /// enabling it changes permission semantics.
+    #[test]
+    fn readdirplus_memo_knob_is_opt_out_and_typo_safe_bd_q0xnl() {
+        assert!(
+            readdirplus_attr_memo_enabled_from_value(None),
+            "unset must keep the memo enabled: this knob must not change the default"
+        );
+        for off in ["0", "false", "off", "FALSE", "Off", " 0 "] {
+            assert!(
+                !readdirplus_attr_memo_enabled_from_value(Some(off)),
+                "{off:?} must disable the memo"
+            );
+        }
+        for on in ["1", "true", "on", "", "yes", "maybe", "  "] {
+            assert!(
+                readdirplus_attr_memo_enabled_from_value(Some(on)),
+                "{on:?} must leave the memo enabled; only an explicit 0/false/off \
+                 disables it, so a typo cannot silently turn off shipping behaviour"
+            );
+        }
+    }
+
+    /// bd-q0xnl: hit rate must be computable, and the NEGATIVE case must read zero.
+    ///
+    /// This is the number that can retire the memo. It pays off only while the
+    /// kernel re-asks for attributes readdirplus already handed it; if the
+    /// generation fix (`2e78f789`) stops that, every `remember` becomes a mutex
+    /// acquisition and a slot write nothing reads. Before these counters,
+    /// `record_memoized` only bumped `requests_total`, so a memo hit was
+    /// indistinguishable from any other request and the hit rate was unobservable.
+    #[test]
+    fn readdirplus_memo_hit_rate_is_observable_including_zero_bd_q0xnl() {
+        let m = AtomicMetrics::default();
+        let s = m.snapshot();
+        assert_eq!(
+            (s.readdirplus_memo_remembers, s.readdirplus_memo_hits),
+            (0, 0),
+            "both start at zero"
+        );
+
+        // THE NEGATIVE CASE, and the one that matters: readdirplus stashed an
+        // attribute for every entry and the kernel never came back for any of them.
+        // That is exactly what a working generation fix looks like from here, and
+        // it must be visible as a zero hit rate rather than as silence.
+        for _ in 0..20_001 {
+            m.record_readdirplus_memo_remember();
+        }
+        let s = m.snapshot();
+        assert_eq!(s.readdirplus_memo_remembers, 20_001);
+        assert_eq!(
+            s.readdirplus_memo_hits, 0,
+            "a memo that is never read must report 0 hits against 20001 remembers, \
+             which is the signature of dead weight -- not an absent counter"
+        );
+
+        m.record_readdirplus_memo_hit();
+        let s = m.snapshot();
+        assert_eq!(s.readdirplus_memo_hits, 1);
+        assert!(
+            s.readdirplus_memo_hits <= s.readdirplus_memo_remembers,
+            "a hit implies an earlier remember, so hits can never exceed remembers"
+        );
+    }
+
     /// bd-i353e: FORGET is a boundary crossing and must be counted somewhere.
     ///
     /// `forget` and `batch_forget` open no request scope, so they never reached
@@ -18227,6 +18374,8 @@ AllowOther"#;
             readdir_dispatch_nanos: 0,
             requests_throttled: 0,
             requests_shed: 0,
+            readdirplus_memo_remembers: 0,
+            readdirplus_memo_hits: 0,
             forget_nodes: 0,
         };
         assert_eq!(
@@ -18447,7 +18596,9 @@ AllowOther"#;
             "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
             "readdir_dispatch_count: 0, readdir_dispatch_nanos: 0, ",
-            "requests_throttled: 0, requests_shed: 0, forget_nodes: 0 }, ",
+            "requests_throttled: 0, requests_shed: 0, "
+            "readdirplus_memo_remembers: 0, readdirplus_memo_hits: 0, "
+            "forget_nodes: 0 }, ",
             "thread_count: 2, ",
             "worker_dispatch: true, ",
             "parallel_dirops: true, ",
@@ -18475,6 +18626,7 @@ AllowOther"#;
                 READDIRPLUS_ATTR_MEMO_SLOTS,
                 false,
             ),
+            readdirplus_attr_memo_enabled: true,
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
