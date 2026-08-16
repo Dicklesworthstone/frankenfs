@@ -11016,3 +11016,85 @@ Harness `scripts`-local `roundtrip_cost.sh` + `rt_cost.py`; candidate
 `hostname=thinkstation1`, `executed_on=thinkstation1`, kernel `6.17.0-41-generic`, run
 locally because a FUSE mount runs only on the executing machine — no rch worker took
 part. The `open()` that creates the fd sits outside every timed region.
+
+## 2026-08-16 — THE WORST ROW IN THE BANK MOVES: btrfs readdir+stat at 32,768 entries goes from 6.99x to 3.36x vs kernel with a directory-sized capability memo — BOTH ADMITTED (bd-34hzz, AzureBay)
+
+`bd-m1bpu` measured the memo's slot count worth `2.08x` candidate-vs-candidate and left
+one question: does that survive as a vs-kernel row, or does it vanish against a live
+incumbent? It survives.
+
+Four runs, one ELF, one fixture, one session, `--pairs 12 --operations 32768
+--image-size-mib 512`, btrfs. The only difference between arms is
+`FFS_FUSE_CAPABILITY_MEMO_SLOTS` exported to both FUSE arms:
+
+| slots | run | kernel median wall | FrankenFS median wall | fuse/kernel median | bootstrap median 95% confidence interval | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4096 (default) | 1 | `31,013,898 ns` | `217,470,654 ns` | **`6.990007x`** | `[6.988474, 7.026868]` | **`HONEST_LOSS`, `admitted=true`** |
+| 4096 (default) | 2 | `30,627,706 ns` | `217,537,728 ns` | `7.056140x` | `[6.981495, 7.127538]` | `BLOCKED_NULL` |
+| 65536 | 1 | `33,044,649 ns` | `104,677,062 ns` | `4.521091x` | `[3.674994, 5.221296]` | `BLOCKED_NULL` |
+| 65536 | 2 | `30,688,692 ns` | `103,799,776 ns` | **`3.359246x`** | `[3.314229, 3.399607]` | **`HONEST_LOSS`, `admitted=true`** |
+
+**One admitted row on each side, both with both A/A nulls clear: `6.990007x` at the
+default and `3.359246x` at 65,536 slots.**
+
+Verbatim from the harness for the two ADMITTED runs, kept unedited so the absolute arm
+medians and the estimator are not taken on trust:
+
+    4096   mounted_kernel_throughput,filesystem=btrfs,workload=large_directory_readdir_stat_8t,operations_per_observation=32768,kernel_median_wall_ns=31013898,fuse_median_wall_ns=217470654,kernel_operations_per_second=1056558.579,fuse_operations_per_second=150677.802
+    4096   mounted_kernel_ratio,filesystem=btrfs,metric=wall_ns,workload=large_directory_readdir_stat_8t,pairs=12,fuse_over_kernel_median=6.990007,ci_low=6.988474,ci_high=7.026868,twice_null_margin_ratio=1.031128,directional_claim_clear=true,admitted=true,verdict=HONEST_LOSS,bootstrap_resamples=20000,cv_used=false
+    65536  mounted_kernel_throughput,filesystem=btrfs,workload=large_directory_readdir_stat_8t,operations_per_observation=32768,kernel_median_wall_ns=30688692,fuse_median_wall_ns=103799776,kernel_operations_per_second=1067754.859,fuse_operations_per_second=315684.687
+    65536  mounted_kernel_ratio,filesystem=btrfs,metric=wall_ns,workload=large_directory_readdir_stat_8t,pairs=12,fuse_over_kernel_median=3.359246,ci_low=3.314229,ci_high=3.399607,twice_null_margin_ratio=1.047663,directional_claim_clear=true,admitted=true,verdict=HONEST_LOSS,bootstrap_resamples=20000,cv_used=false
+
+Each `ci_low`/`ci_high` pair is a bootstrap median 95% confidence interval, resampled
+20,000 times.
+
+### The FUSE arm is the robust evidence, and three estimators agree
+
+The two 65,536 ratios differ (`4.52` vs `3.36`) and the reason is visible in the table:
+run 1's KERNEL arm was slow (`33.0 ms` against `30.6-31.0 ms` everywhere else) because it
+ran at `99.9%` peak off-placement mean busy. Our own arm did not move.
+
+The FrankenFS absolutes are stable across every run:
+
+- 4096 slots: `217,470,654` and `217,537,728` ns — **agree to 0.03%**
+- 65536 slots: `104,677,062` and `103,799,776` ns — **agree to 0.84%**
+- reduction: **`2.095x`** on the median pair, **`2.078x`** on the worst pairing
+
+And that independently reproduces the candidate-vs-candidate A/B banked earlier today,
+which measured `0.481225` = **`2.078x`** within one window on one ELF with its own A/A
+null. Three estimators — two vs-kernel arms, and a within-window candidate crossover that
+cancels host drift by construction — land on the same number to three decimal places.
+
+### What to quote
+
+**`3.36x`, with `6.99x` as the incumbent it replaces**, both admitted. The conservative
+pairing of interval edges (`6.981495` against `5.221296`) still gives a `1.34x`
+improvement, and that pessimistic bound is dominated by run 1's contended kernel arm
+rather than by anything about our side.
+
+### This is NOT a shipping recommendation, and the reason is already measured
+
+`bd-m1bpu` established that the cliff MOVES rather than disappears: at 100,000 entries a
+65,536-slot table is itself oversubscribed and the win degrades to `1.30x`. 65,536 slots
+is **512 KiB per mount** against 32 KiB at the default, resident for the mount lifetime.
+A larger default therefore still needs bd-5vis3's acceptance bar — peak resident memory
+reported, and a workload that does NOT fit measured beside one that does — and the
+100,000-entry row already is that non-fitting workload. What this row establishes is that
+the lever is real and large at a realistic directory size, not that any particular
+default is correct.
+
+All four runs `CONTENDED`. For the vs-kernel ratios that is conservative in the usual
+direction (contention inflates our arm at least as much as the kernel's), but note this
+row's headline is a comparison between two of OUR OWN configurations, where contention
+could in principle cut either way — which is exactly why the stable FUSE absolutes and
+the contention-cancelling candidate crossover are cited above rather than the ratios
+alone.
+
+Provenance for all four: candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`
+self-reported via `bench-evidence`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`, candidate gate `verdict=pass`; driver
+`471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`; both built on
+`thinkstation1`; `hostname=thinkstation1`, `executed_on=thinkstation1`. Four-arm
+post-parity `verdict=pass` and `btrfs check` clean throughout.
