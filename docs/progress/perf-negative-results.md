@@ -10883,3 +10883,71 @@ only on the executing machine — no rch worker took part.
 
 Still UNMEASURED and worth someone's time: whether a privileged caller skips the probe.
 That arm did not run here and no claim is made about it.
+
+## 2026-08-16 — NULL on caller privilege (counted): root pays the capability probe at exactly the same rate as an unprivileged caller — and a CORRECTION to why the earlier arm did not run (bd-z0rb8, AzureBay)
+
+The kernel consults `security.capability` to decide whether a file confers capabilities.
+A root caller already has them, so if the check were short-circuited for privileged
+callers the probe would be a property of the CALLER rather than of the path — a
+different shape of problem, and an explanation for why some workloads never see this
+cost.
+
+It is not.
+
+    positive_control_root_can_stat=yes
+    === probes per path-based stat, 1000 stats each, one mount ===
+    uid=1000     probes=1000   per_stat=1.0000
+    uid=0(root)  probes=1000   per_stat=1.0000
+
+**1000 probes (uid 1000) vs 1000 probes (uid 0)** over 1,000 stats each, same mount,
+same file, same daemon. Identical.
+
+### CORRECTION: the earlier arm was misdiagnosed, and the misdiagnosis is instructive
+
+The cross-filesystem entry above records this arm as *"skipped: sudo python3
+unavailable"*. **That was wrong.** `sudo -n python3` works perfectly on this host — I
+checked. The real reason root could not stat the mount is that **a FUSE mount without
+`allow_other` denies every user except the mounting one, root included.** The arm needed
+`--allow-other`, not a different interpreter.
+
+Two things caused a wrong cause to be published. The arm was invoked with `2>/dev/null`,
+which threw away the actual error, and its failure branch printed a guess as if it were
+an observation. **A diagnosis inferred from a suppressed error message is not a
+measurement, and it should not have been written down as one.** The claim in that entry
+is corrected here rather than edited away, so the mistake stays visible.
+
+This run fixes both: `--allow-other` is passed, stderr is not suppressed, and a
+`positive_control_root_can_stat` line proves root could actually read the file before any
+count from the root arm is trusted. Without that control a `0` from an arm that cannot
+see the mount is indistinguishable from a genuine "root skips the probe" — which is
+exactly the false result the earlier run came within one line of publishing.
+
+### Where bd-z0rb8 now stands
+
+Closed by measurement, all with positive controls:
+
+| hypothesis | result |
+| --- | --- |
+| kernel caches a PRESENT capability differently from an ABSENT one | NULL — `1.0000` vs `1.0000` |
+| the probe amortises over path depth | NULL — mount root `1.0000` == nested file `1.0000` |
+| it is filesystem-dependent | NULL — ext4 `1.0000` == btrfs `1.0000` |
+| privileged callers skip it | NULL — uid 0 `1.0000` == uid 1000 `1.0000` |
+| `FUSE_HANDLE_KILLPRIV_V2` suppresses it (bd-ha71t) | NULL — 4000 probes -> 4000 probes |
+
+What remains is narrow and unchanged: a mount option the kernel honours
+(`default_permissions` — still untestable, `ffs-fuse` exposes no such option and the
+crate is under another agent's reservation), kernel-version dependence (host
+`6.17.0-41-generic`), and whether any FUSE ABI route exists to declare an inode free of
+`security.*` so the kernel can cache the negative.
+
+Five nulls in a row on one mechanism is itself worth stating plainly: **this probe looks
+like unconditional kernel behaviour on the path-resolution path, not a policy any
+parameter reachable from userspace turns off.** The remaining routes should be attempted
+in that light — the prior is now strongly against any of them working, and the honest
+next step may be to establish that the door is closed rather than to keep pushing it.
+
+Harness `scripts`-local `probe_privileged.sh`; candidate
+`d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`, `isa=x86-64-v3`;
+`hostname=thinkstation1`, `executed_on=thinkstation1`, kernel `6.17.0-41-generic`, run
+locally because a FUSE mount runs only on the executing machine — no rch worker took
+part, and there is no ratio here to be confounded by one.
