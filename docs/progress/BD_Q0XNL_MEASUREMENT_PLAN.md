@@ -27,8 +27,21 @@ the run can falsify it rather than be interpreted to fit.
   proof of which binary ran.
 - Fixture: `/data/tmp/ffs-pgo-train.img`, ext4, 20001 root entries. **This is a
   known gap**: the banked `7.728937x` row is btrfs and no btrfs fixture survives on
-  this box (`ffs-cli mkfs` is ext4-only). Every conclusion below is ext4-scoped and
-  must say so.
+  this box. `ffs-cli`'s own image creator is ext4-only.
+- **Correction to my own earlier claim.** I repeatedly wrote that a btrfs fixture
+  was blocked "because creating one needs a formatter the guard blocks". The
+  formatter IS installed (`/usr/sbin/mkfs.btrfs`), and `crates/ffs-harness/tests/
+  btrfs_kernel_reference.rs` already documents creating real btrfs images at test
+  time with it. So the blockers are narrower and more actionable than I said:
+  (a) the repo safety guard refuses any command containing that formatter's name,
+  so it needs explicit operator permission, and (b) disk headroom, which is the
+  binding constraint right now. Neither is "impossible", and this gap is closable
+  the moment someone with permission makes a fixture.
+- **Until then, every conclusion in this plan is ext4-scoped and must say so.** The
+  btrfs arm is the single largest outstanding validity question on the worst row:
+  the entire characterisation (`3.85%` daemon share, `33.185 ns` ops, `~7.29 us`
+  per crossing, `3.014` crossings/entry) was measured on ext4 and is *assumed* to
+  transfer. It has never been checked.
 - Workload: `ls -lU <mnt>` — the readdir+stat sweep the banked row runs.
 - Harness: `scripts/fuse_readdirplus_work_ab.sh` for the counted arms,
   `scripts/fuse_placement_workload_sweep.sh` shape for the timed arms.

@@ -82,3 +82,64 @@ fn standard_mount_runtime_emits_shutdown_metrics_bd_viil0() {
          actually uses (bd-viil0)"
     );
 }
+
+/// bd-i353e / bd-q0xnl: every counter on `MetricsSnapshot` must reach the emitted
+/// `mount_dispatch_metrics` line, or the measurement that needs it cannot read it.
+///
+/// This is the `bd-viil0` failure class one level out. There, the Standard runtime
+/// held real counters and never emitted them; here a counter can exist, be
+/// correctly incremented, be visible in `Debug`, and still be missing from the one
+/// line a harness actually parses — and nothing fails. A run then reports a
+/// perfectly well-formed metrics line with a counter silently absent, which is
+/// indistinguishable from that counter reading zero.
+///
+/// Deliberately checked against the STRUCT rather than a fixed list: a list would
+/// need updating in lockstep with the struct, which is the tax `bd-k3g3g` removed
+/// and which this test would silently reintroduce.
+#[test]
+fn every_metrics_snapshot_counter_reaches_the_emitted_line_bd_i353e() {
+    const FUSE_LIB: &str = include_str!("../../ffs-fuse/src/lib.rs");
+
+    let decl = FUSE_LIB
+        .split_once("pub struct MetricsSnapshot {")
+        .expect("MetricsSnapshot must exist")
+        .1;
+    let body = decl.split_once("\n}").expect("struct must close").0;
+
+    let fields: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pub "))
+        .filter_map(|l| l.split_once(": u64,"))
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        fields.len() >= 15,
+        "parsed only {} fields; the struct shape changed and this guard is no \
+         longer reading it correctly -- fix the parse rather than the assertion",
+        fields.len()
+    );
+
+    let emitted = production_source();
+    // requests_* are summary counters carried on other lines; the dispatch line is
+    // specifically the per-op/per-mechanism surface.
+    let exempt = [
+        "requests_total",
+        "requests_ok",
+        "requests_err",
+        "bytes_read",
+        "metadata_requests",
+        "requests_throttled",
+        "requests_shed",
+    ];
+    let missing: Vec<&str> = fields
+        .iter()
+        .filter(|f| !exempt.contains(*f))
+        .filter(|f| !emitted.contains(&format!("metrics.{f}")))
+        .copied()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these MetricsSnapshot counters are never emitted, so no harness can read \
+         them and a run reports a well-formed line with them silently absent: {missing:?}"
+    );
+}
