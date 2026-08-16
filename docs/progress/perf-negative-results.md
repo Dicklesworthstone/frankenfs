@@ -11544,3 +11544,65 @@ probes dispatched vs 0 probes dispatched** across four extra sweeps at the two s
 counts. The comparator per-entry figures are medians of the banked 8-thread runs and are
 the trustworthy timing instrument for this row; this client's own wall times are NOT used
 anywhere in this entry.
+
+## 2026-08-16 — NULL: at 32,768 entries the SHIPPING capability memo is indistinguishable from having no memo at all — the whole lever is the sizing (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+The readdir+stat attribution left one piece unaccounted: ~12% of the `2.06x` sizing
+effect that the daemon dispatch counters do not explain. Two hypotheses for it have
+already been retracted this session, so rather than propose a third this asks a question
+the accounting can actually settle — **is an UNDERSIZED memo better than no memo, worse
+than no memo, or the same?**
+
+Same fixture, same ELF, same 8-thread comparator, differing only in the memo
+configuration:
+
+| configuration | n | FUSE arm median | within-group spread |
+| --- | --- | --- | --- |
+| `FFS_FUSE_CAPABILITY_MEMO=0` (no memo) | 2 | `223,553,651 ns` | `5.3%` |
+| 4096 slots (shipping default, thrashing) | 5 | `217,537,728 ns` | `3.8%` |
+| 65536 slots (fits the directory) | 4 | `104,849,775 ns` | `6.8%` |
+
+    disabled vs 4096  : 1.0277x   (2.8% apart)
+    4096 vs 65536     : 2.0748x
+    disabled vs 65536 : 2.1321x
+
+**The disabled and 4096 arms are 2.8% apart, against within-group spreads of 5.3% and
+3.8%.** The difference between having the shipping memo and not having it is smaller than
+either arm's own run-to-run variation. At this directory size the memo is **inert**.
+
+### What that settles
+
+**An undersized memo is not a net harm.** It was worth asking: the memo pays a slot store
+on every miss, and a table that thrashes pays it 32,768 times per sweep for a hit rate
+near zero, so it could plausibly have cost more than it saved. It does not — the
+bookkeeping overhead is below measurement. That also closes the shape of question
+`bd-79li3` raised for random access, at this workload and size.
+
+**The entire lever is the sizing.** `2.0748x` from 4096 to 65,536 against `1.0277x` from
+nothing to 4096: essentially all of the benefit appears when the table starts fitting, and
+none of it before. Combined with the dispatch counts already banked — every sweep
+re-dispatches all 32,768 probes at 4096, zero at 65,536 — the mechanism is complete: the
+memo is a step function in directory size, not a gradient.
+
+### What it does NOT settle, stated because the temptation is to claim it does
+
+This does **not** explain the ~12% residual. It rules out one candidate — memo
+bookkeeping overhead being large enough to matter — by showing that overhead is below
+measurement. The residual is still unexplained, and three hypotheses have now been
+eliminated or retracted for it. It should continue to be carried as unexplained.
+
+It is also **not admitted**: both disabled runs are `BLOCKED_NULL`, the host refused the
+pre-run placement gate on several attempts (`no physical core has every SMT thread below
+the driver contention limit`, with 29 builds fleet-wide), and the comparison here is
+between medians of small samples rather than a within-window crossover. The claim it
+supports is a null bounded by the spreads, not a ratio.
+
+Provenance: candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`isa=x86-64-v3`; driver
+`471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`;
+`hostname=thinkstation1`, `executed_on=thinkstation1`. The 4096 and 65,536 samples are the
+banked runs from `bd-34hzz` and the thread-sweep cells, all 8-thread on this one fixture;
+the two disabled runs are new. Counted mechanism unchanged: **32769 probes vs 32769
+probes** per sweep in every configuration — the memo never changes what the kernel sends,
+only whether the daemon descends.
