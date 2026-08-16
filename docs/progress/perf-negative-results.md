@@ -10772,3 +10772,60 @@ Harness `scripts`-local `probe_present_vs_absent.sh`; candidate
 host `thinkstation1`, kernel `6.17.0-41-generic`, run locally because a FUSE mount runs
 only on the executing machine — no rch worker took part. Counted mechanism, so no quiet
 window is required and the host's contention cannot confound it.
+
+## 2026-08-16 — MECHANISM PINNED: the capability probe is ONE PER PATH-BASED SYSCALL, independent of path depth, and `fstat` pays ZERO (bd-z0rb8, AzureBay)
+
+The warm-stat attribution established that one `security.capability` GETXATTR per stat
+is ~99% of the 4.80x gap. This pins what the kernel binds that probe to, which is what
+decides whether any fix is possible and what an application can do today.
+
+Four arms, one mount, 1,000 operations each, counted from the daemon's own trace:
+
+    === probes per operation, 1000 ops each, one mount ===
+    path_file  probes=1000   per_op=1.0000
+    path_dir   probes=1000   per_op=1.0000
+    path_root  probes=1000   per_op=1.0000
+    fstat      probes=1      per_op=0.0010
+
+**1000 probes (path-based) vs 1 probe (fd-based)** over 1,000 operations each.
+
+### Two things this rules out, and one it rules in
+
+**Not per path component.** `stat("<mnt>")` — the mount root, the shortest possible walk,
+zero intermediate components — pays exactly the same `1.0000` as a two-component path.
+There is no depth to amortise, so nothing of the "resolve the parent once" family can
+help. This also corrects a loose reading of the earlier bd-ha71t note, which recorded
+"TWO probes per path-based stat (4000/2000)": that count came from a workload whose
+paths were being resolved cold. Warm, on an already-resolved path, it is exactly ONE.
+
+**Not the attribute fetch.** `fstat` on an already-open fd pays **zero** — the single
+probe in that arm is from the one `open()` that created the fd. A thousand attribute
+fetches through FUSE cost nothing, because `ATTR_TTL` lets the kernel serve them from
+its own cache and it never asks the daemon at all.
+
+**It is the path-based syscall itself.** One probe per `stat()`/`lstat()` on a path,
+whatever the path, however warm the dentry.
+
+### What follows
+
+For the campaign: there is no daemon-side or filesystem-side lever here, and now there
+is no path-shape lever either. The routes still open on this bead are unchanged and
+narrow — a mount option the kernel honours, a FUSE ABI route to cache a negative
+`security.*`, or a cheaper round trip (which belongs to the round-trip thread). It also
+bounds what that thread can deliver on THIS row: warm stat is one round trip per
+operation, so halving round-trip cost halves the warm-stat gap and no more.
+
+For anyone using FrankenFS today, this is directly actionable and worth stating plainly:
+**a workload that holds file descriptors pays none of this; one that stats by path pays
+all of it.** `ls -l`, `find`, and every `stat()`-per-entry tool are the worst case by
+construction. That is not a fix, but it is a real characterisation of when the 4.80x row
+applies.
+
+Do NOT re-test path depth or fd-vs-path. Both are measured, exact, and reproducible.
+
+Harness `scripts`-local `probe_binding.sh`; candidate
+`d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`, `isa=x86-64-v3`;
+host `thinkstation1`, kernel `6.17.0-41-generic`, run locally because a FUSE mount runs
+only on the executing machine — no rch worker took part. All four arms are in ONE mount,
+so the comparison is within-window; all four are COUNTS, so the host's contention cannot
+confound them and no quiet window was required.
