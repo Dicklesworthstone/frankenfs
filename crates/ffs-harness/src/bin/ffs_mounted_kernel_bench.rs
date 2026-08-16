@@ -944,6 +944,24 @@ struct FfsDispatchMetrics {
     lookup_dispatch_nanos: u64,
     readdir_dispatch_count: u64,
     readdir_dispatch_nanos: u64,
+    /// Counters a NEWER daemon emits; `None` when the ELF under test predates them.
+    ///
+    /// `Option`, never a defaulted `0`. A counter the binary does not export is not
+    /// a counter that measured zero, and rendering absence as zero is how a lower
+    /// bound gets published as an attribution — the exact defect bd-i353e was opened
+    /// for. `None` serialises as JSON `null`, so a reader can tell "this ELF did not
+    /// report it" from "it reported nothing happened".
+    mutation_dispatch_count: Option<u64>,
+    mutation_dispatch_nanos: Option<u64>,
+    other_dispatch_count: Option<u64>,
+    other_dispatch_nanos: Option<u64>,
+    /// Whole-handler timing (bd-4zokj). The `*_dispatch_nanos` above bracket only the
+    /// inner ops call; this brackets the entire FUSE callback, so `handler - dispatch`
+    /// bounds the work the dispatch counters cannot see — measured at 59.2%-98.8% of
+    /// daemon CPU. A report carrying dispatch WITHOUT this lets a reader compute a
+    /// daemon share that is a lower bound while looking complete.
+    handler_total_count: Option<u64>,
+    handler_total_nanos: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2758,6 +2776,13 @@ fn parse_mount_dispatch_metrics(
             .parse::<u64>()
             .with_context(|| format!("parse FUSE dispatch metric {name}"))
     };
+    // Absent -> None, NOT 0. An older daemon simply does not emit these, and a
+    // defaulted zero would be indistinguishable from a real measurement of zero.
+    let parse_optional = |name: &str| -> Option<u64> {
+        mount_dispatch_metric_value(payload, name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    };
     Ok(Some(FfsDispatchMetrics {
         getattr_dispatch_count: parse("getattr_dispatch_count")?,
         getattr_dispatch_nanos: parse("getattr_dispatch_nanos")?,
@@ -2767,6 +2792,12 @@ fn parse_mount_dispatch_metrics(
         lookup_dispatch_nanos: parse("lookup_dispatch_nanos")?,
         readdir_dispatch_count: parse("readdir_dispatch_count")?,
         readdir_dispatch_nanos: parse("readdir_dispatch_nanos")?,
+        mutation_dispatch_count: parse_optional("mutation_dispatch_count"),
+        mutation_dispatch_nanos: parse_optional("mutation_dispatch_nanos"),
+        other_dispatch_count: parse_optional("other_dispatch_count"),
+        other_dispatch_nanos: parse_optional("other_dispatch_nanos"),
+        handler_total_count: parse_optional("handler_total_count"),
+        handler_total_nanos: parse_optional("handler_total_nanos"),
     }))
 }
 
@@ -6487,6 +6518,15 @@ fn fs_report(
                                     "lookup_dispatch_nanos": metrics.lookup_dispatch_nanos,
                                     "readdir_dispatch_count": metrics.readdir_dispatch_count,
                                     "readdir_dispatch_nanos": metrics.readdir_dispatch_nanos,
+                                    // Newer-daemon counters. `null` when the ELF
+                                    // under test does not emit them — absence is
+                                    // NOT zero (bd-i353e).
+                                    "mutation_dispatch_count": metrics.mutation_dispatch_count,
+                                    "mutation_dispatch_nanos": metrics.mutation_dispatch_nanos,
+                                    "other_dispatch_count": metrics.other_dispatch_count,
+                                    "other_dispatch_nanos": metrics.other_dispatch_nanos,
+                                    "handler_total_count": metrics.handler_total_count,
+                                    "handler_total_nanos": metrics.handler_total_nanos,
                                 })
                             },
                         ),
@@ -9853,6 +9893,74 @@ mod tests {
         .expect("write ambiguous mount log");
         assert!(parse_mount_self_report(&ambiguous, false).is_err());
         assert!(parse_mount_self_report(&ambiguous, true).is_err());
+    }
+
+    /// bd-fhb53: a counter an older daemon does not emit must read NULL, not zero.
+    ///
+    /// The report is what a later analysis joins across runs, so what it omits is
+    /// invisible and what it defaults is worse than invisible. `handler_total`
+    /// bounds the work the `*_dispatch_nanos` counters CANNOT see — measured at
+    /// 59.2%-98.8% of daemon CPU — so a report carrying dispatch while silently
+    /// zeroing handler_total lets a reader compute a daemon share that is a lower
+    /// bound while looking complete. That is the bd-i353e defect one layer up.
+    ///
+    /// Both directions are pinned: an OLD daemon line yields None for every newer
+    /// counter, and a NEW line yields the real values. Backward compatibility must
+    /// not be bought by inventing measurements.
+    #[test]
+    fn older_daemon_counters_parse_as_none_not_zero_bd_fhb53() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // An ELF predating the mutation/other/handler counters.
+        let old_log = temp.path().join("old.log");
+        fs::write(
+            &old_log,
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
+        )
+        .expect("write old log");
+        let old = parse_mount_dispatch_metrics(&old_log, FilesystemKind::Btrfs)
+            .expect("parse old metrics")
+            .expect("old metrics reported");
+        assert_eq!(old.getattr_dispatch_count, 20, "the old fields still parse");
+        assert_eq!(
+            old.handler_total_nanos, None,
+            "a counter the ELF never emitted must be None; zero here would be a \
+             measurement this daemon never made"
+        );
+        assert_eq!(old.mutation_dispatch_count, None);
+        assert_eq!(old.other_dispatch_count, None);
+
+        // A current ELF emitting all of them.
+        let new_log = temp.path().join("new.log");
+        fs::write(
+            &new_log,
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20,mutation_dispatch_count=15,mutation_dispatch_nanos=105,other_dispatch_count=11,other_dispatch_nanos=77,handler_total_count=7,handler_total_nanos=4242\n",
+        )
+        .expect("write new log");
+        let new = parse_mount_dispatch_metrics(&new_log, FilesystemKind::Btrfs)
+            .expect("parse new metrics")
+            .expect("new metrics reported");
+        assert_eq!(new.handler_total_nanos, Some(4242));
+        assert_eq!(new.handler_total_count, Some(7));
+        assert_eq!(new.mutation_dispatch_count, Some(15));
+        assert_eq!(new.other_dispatch_count, Some(11));
+
+        // And a genuine zero is distinguishable from absence.
+        let zero_log = temp.path().join("zero.log");
+        fs::write(
+            &zero_log,
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20,handler_total_count=0,handler_total_nanos=0\n",
+        )
+        .expect("write zero log");
+        let zero = parse_mount_dispatch_metrics(&zero_log, FilesystemKind::Btrfs)
+            .expect("parse zero metrics")
+            .expect("zero metrics reported");
+        assert_eq!(
+            zero.handler_total_nanos,
+            Some(0),
+            "a REPORTED zero is Some(0) — distinguishable from the None above, which \
+             is the whole point of the Option"
+        );
     }
 
     #[test]
