@@ -13,6 +13,22 @@
 //! The lever is to serve those attributes from what the readdir walk already
 //! materialised instead of issuing a fresh `ops.getattr` per entry.
 //!
+//! # ⚠️ THE ATTR-REUSE LEVER IS MEASURED AT 0.15% AND SHOULD NOT BE PURSUED
+//!
+//! Sized after the fact, and the sizing kills it. `ffs-cli stat-bench` puts
+//! `ops.getattr` at **33.185 ns/entry** with no FUSE at all, so removing one per
+//! entry saves `0.66 ms` of a `437.5 ms` sweep — **0.15%**. The two tests below
+//! remain as a precise definition should anyone revisit, but they are not work
+//! worth buying, and the `#[ignore]`s should stay until that changes.
+//!
+//! This is recorded here rather than only in the ledger because a test file that
+//! encodes an acceptance criterion is exactly where someone will look for
+//! permission to do the work.
+//!
+//! What survives from the same investigation is the generation defect below,
+//! which is a correctness inconsistency rather than a performance lever, and the
+//! open wall question tracked as `bd-zsc7z`.
+//!
 //! # Why this test is `#[ignore]`d
 //!
 //! It asserts the POST-lever shape and therefore FAILS on today's code, which is
