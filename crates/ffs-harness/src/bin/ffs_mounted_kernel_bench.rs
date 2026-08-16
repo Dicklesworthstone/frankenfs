@@ -180,6 +180,18 @@ impl Workload {
         )
     }
 
+    /// Whether `--client-threads` reaches this workload at all (bd-zth9k).
+    ///
+    /// Only `parallel-metadata-write` is parameterised by client concurrency.
+    /// The `*8t` workloads are DEFINED at 8 threads — the count is in their name
+    /// and in every banked row's identity — and the single-threaded workloads at
+    /// 1, so honouring the flag would silently redefine the workload and make
+    /// rows non-comparable across runs. The flag is therefore refused rather
+    /// than obeyed; see `validate_config`.
+    const fn honours_client_threads(self) -> bool {
+        matches!(self, Self::ParallelMetadataWrite)
+    }
+
     const fn client_threads(self, configured: usize) -> usize {
         match self {
             Self::ParallelMetadataWrite => configured,
@@ -432,6 +444,13 @@ struct Config {
     arm_settle_ms: u64,
     pre_measurement_settle_ms: u64,
     client_threads: usize,
+    /// Did `--client-threads` appear on the command line? (bd-zth9k)
+    ///
+    /// The value alone cannot say: it defaults to `DEFAULT_PARALLEL_THREADS`, so
+    /// an explicit `--client-threads 8` is indistinguishable from the default by
+    /// value. Without this the refusal below could not tell a deliberate
+    /// invocation from an absent one.
+    client_threads_explicit: bool,
     /// Logical CPUs the FrankenFS daemon is pinned to.
     ///
     /// The default of one reproduces every banked row. It is also an asymmetry:
@@ -560,6 +579,7 @@ impl Default for Config {
             arm_settle_ms: 100,
             pre_measurement_settle_ms: 1_000,
             client_threads: DEFAULT_PARALLEL_THREADS,
+            client_threads_explicit: false,
             fuse_cpu_count: DEFAULT_FUSE_CPUS,
             fuse_workers: None,
             btrfs_verify_data_on_read: true,
@@ -1288,6 +1308,18 @@ fn validate_config(config: &Config) -> Result<()> {
             "{flag} is required: name the machine that built the ELF"
         );
     }
+    // bd-zth9k: refuse an invocation whose --client-threads cannot take effect.
+    // It used to be parsed, validated and silently discarded, so the run executed
+    // a different experiment than the one requested. That cost a 1/2/4/8 thread
+    // sweep in which every cell ran at 8 threads, and the wrong answer it implied
+    // was only caught because a second, independent error in the same analysis
+    // forced a re-check. Fail closed and name the one workload the flag reaches.
+    ensure!(
+        !config.client_threads_explicit || config.workload.honours_client_threads(),
+        "--client-threads does not apply to {}: that workload runs at a fixed {}          thread(s) and the value would be silently discarded. Only          parallel-metadata-write is parameterised by client concurrency. The          effective count is always reported as requested_client_threads in the          run output.",
+        config.workload.label(),
+        config.workload.client_threads(config.client_threads),
+    );
     let period =
         balanced_scope_schedule_period(config.placement_scope, config.compares_candidates());
     ensure!(
@@ -1501,6 +1533,7 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
             }
             "--client-threads" => {
                 config.client_threads = parse_value(args, &mut index, "--client-threads")?;
+                config.client_threads_explicit = true;
             }
             "--fixture-construction" => {
                 let value = parse_value::<String>(args, &mut index, "--fixture-construction")?;
@@ -8217,6 +8250,105 @@ mod tests {
     /// the test that matters is not "the default now fits" — it is that the floor
     /// moves with the configuration in both directions, because a floor that only
     /// ever got looser would be a weakened guard rather than a corrected one.
+    /// bd-zth9k: `--client-threads` must be REFUSED where it cannot take effect,
+    /// and accepted where it can. Both branches are pinned so they cannot drift
+    /// apart — a refusal that silently stops applying is the same defect again.
+    #[test]
+    fn client_threads_is_refused_on_workloads_that_discard_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let base = Config {
+            ffs_cli: cli,
+            harness_builder: "test-host".to_string(),
+            candidate_builder: "test-host".to_string(),
+            observation_repeats: 1,
+            ..Config::default()
+        };
+
+        // The one workload the flag reaches.
+        let honoured = Config {
+            workload: Workload::ParallelMetadataWrite,
+            client_threads: 4,
+            client_threads_explicit: true,
+            ..base.clone()
+        };
+        assert!(
+            Workload::ParallelMetadataWrite.honours_client_threads(),
+            "parallel-metadata-write is the workload --client-threads exists for"
+        );
+        assert_eq!(
+            Workload::ParallelMetadataWrite.client_threads(4),
+            4,
+            "an honoured flag must actually reach the workload"
+        );
+        validate_config(&honoured).expect("parallel-metadata-write must accept --client-threads");
+
+        // Every other workload discards it, so passing it must FAIL rather than
+        // run a different experiment than the one requested.
+        for workload in [
+            Workload::ReaddirStat8,
+            Workload::ParallelRead8,
+            Workload::ParallelRead8ColdCache,
+            Workload::WarmStat,
+            Workload::CreateDeleteStorm,
+            Workload::FsyncJournalCommit,
+            Workload::XattrGetListReport,
+        ] {
+            assert!(
+                !workload.honours_client_threads(),
+                "{} does not consume --client-threads",
+                workload.label()
+            );
+            let rejected = Config {
+                workload,
+                client_threads: 4,
+                client_threads_explicit: true,
+                ..base.clone()
+            };
+            let err = validate_config(&rejected)
+                .expect_err("a discarded --client-threads must fail closed")
+                .to_string();
+            assert!(
+                err.contains("--client-threads does not apply"),
+                "refusal must name the flag, got: {err}"
+            );
+            assert!(
+                err.contains(workload.label()),
+                "refusal must name the workload, got: {err}"
+            );
+            assert!(
+                err.contains("parallel-metadata-write"),
+                "refusal must name where the flag DOES apply, got: {err}"
+            );
+
+            // The same workload WITHOUT the flag must not hit THIS refusal. It may
+            // still fail validation for its own unrelated reasons — several
+            // workloads have capacity and durability requirements — so the
+            // assertion is specifically that the client-threads message is absent,
+            // not that the config validates. Asserting the latter is what made the
+            // first version of this test fail for a reason it was not about.
+            let untouched = Config {
+                workload,
+                ..base.clone()
+            };
+            if let Err(e) = validate_config(&untouched) {
+                assert!(
+                    !e.to_string().contains("--client-threads does not apply"),
+                    "{} without the flag must not trip the client-threads refusal, got: {e}",
+                    workload.label()
+                );
+            }
+            // This bead refuses a misleading invocation; it does NOT change any
+            // workload's effective thread count.
+            assert_eq!(
+                workload.client_threads(4),
+                workload.client_threads(DEFAULT_PARALLEL_THREADS),
+                "effective thread count must not depend on the discarded value"
+            );
+        }
+    }
+
     #[test]
     fn free_space_floor_is_derived_from_what_the_run_stages() {
         const OLD_FLAT_FLOOR: u64 = 120 * 1024 * 1024 * 1024;
