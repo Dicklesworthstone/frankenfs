@@ -10951,3 +10951,68 @@ Harness `scripts`-local `probe_privileged.sh`; candidate
 `hostname=thinkstation1`, `executed_on=thinkstation1`, kernel `6.17.0-41-generic`, run
 locally because a FUSE mount runs only on the executing machine — no rch worker took
 part, and there is no ratio here to be confounded by one.
+
+## 2026-08-16 — ONE FUSE ROUND TRIP IS 88.6%+ OF A PATH-BASED STAT: 13.9 us, against an A/A null of 1.055x — the ceiling on what the round-trip thread can deliver for warm stat (bd-z0rb8, AzureBay)
+
+Warm stat pays exactly 1 round trip per op; `fstat` on an open fd pays 0. Both return
+the same attributes for the same inode in the same mount, so the per-op difference IS
+one round trip, isolated, with the attribute work held constant. No comparator, no
+kernel arm, no cross-ELF question.
+
+Interleaved A/B and A/A on ONE schedule, 7 rounds x 20,000 ops, seeded bootstrap median
+95% confidence interval over log ratios (20,000 resamples) — the same estimator ffs-core
+uses, so this is comparable to the rest of the bank rather than a bespoke statistic:
+
+    stat  (1 round trip)  median   15236.8 ns/op   min   13216.7  max   16289.9
+    fstat (0 round trips) median    1362.8 ns/op   min    1254.2  max    1976.8
+    interleaved A/B stat over fstat, same-invocation, median 11.180674x bootstrap median 95% confidence interval [8.753012, 12.312406]
+    interleaved A/A null fstat over fstat, same-invocation, median 1.055089x bootstrap median 95% confidence interval [0.976038, 1.094971]
+    ONE ROUND TRIP = 13874.0 ns/op   (11.18x the fd path)
+
+**The A/B interval `[8.753, 12.312]` clears the A/A null interval `[0.976, 1.095]` with
+no overlap at all** — the effect's lower bound is 8x the null's upper bound. This is a
+timing on a contended host and it is still not close.
+
+An earlier pass of the same experiment, before the estimator carried a bootstrap CI,
+measured `13307.1` ns and `10.44x`. The two agree to `4.3%` on the round-trip figure, so
+the number replicates across runs as well as clearing its own null.
+
+### What it bounds — quote the worst bound
+
+Taking the conservative edge of the A/B interval (`8.753012x`), one round trip is
+**at least `88.6%`** of a path-based stat (`1 - 1/8.753`); at the median it is `91.1%`.
+Warm stat is one round trip per operation, so **a given fractional improvement in
+round-trip cost buys essentially the same fractional improvement in this row, and nothing
+more.** That is the ceiling the round-trip thread should plan against here — useful
+precisely because it is an upper bound rather than a target.
+
+### An inference, labelled, because it would be the campaign's biggest claim
+
+The comparator puts the kernel's own path-based stat at `2345` ns/op and our arm at
+`11168` ns/op. Our **fd** path costs `1362.8` ns/op. If the probe were eliminated
+entirely, a path-based stat would cost roughly what the fd path costs — **below the
+kernel's own path-based stat**. That would not narrow the 4.80x row; it would invert it.
+
+**This is arithmetic across two different configurations and is NOT a measured claim.**
+The absolutes here are inflated relative to the comparator — `15237` ns/op for a stat
+against the comparator's `11168` ns/op for the same workload — because this runs a Python
+loop on an unpinned managed-runtime mount on a contended host, where the comparator uses
+a pinned, tighter client. `13.9 us` is therefore an UPPER estimate of the round trip in
+the comparator's configuration, and the inversion above is a hypothesis needing its own
+measured row. It is written down because it changes how valuable `bd-z0rb8` is, not
+because it can be quoted.
+
+### Why the fd path is a legitimate control and not a smuggled baseline
+
+`fstat` resolves the same inode through the same mount and returns the same attributes.
+The counted work banked above showed it issues **zero** FUSE requests, because `ATTR_TTL`
+lets the kernel serve attributes from its own cache. So the subtraction removes the round
+trip and leaves everything else — syscall entry, the kernel's attribute cache, and the
+client loop — standing in both arms. The A/A null is that same fd path against itself,
+which is what makes its `1.055x` the right yardstick for reading the `11.18x`.
+
+Harness `scripts`-local `roundtrip_cost.sh` + `rt_cost.py`; candidate
+`d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`, `isa=x86-64-v3`;
+`hostname=thinkstation1`, `executed_on=thinkstation1`, kernel `6.17.0-41-generic`, run
+locally because a FUSE mount runs only on the executing machine — no rch worker took
+part. The `open()` that creates the fd sits outside every timed region.
