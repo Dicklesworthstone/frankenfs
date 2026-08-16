@@ -55964,12 +55964,71 @@ mod tests {
             (ok, start.elapsed())
         };
 
-        let (ok_off, t_off) = arm(true);
-        let (ok_on, t_on) = arm(false);
-        assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
-        let ratio = t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE);
+        // Interleaved pairs plus an A/A null on the identical schedule, same shape
+        // as the production arm (bd-79li3). A single pair was enough to SEE the
+        // 8.6x tax that motivated the fix, but not to bank the fix: the ledger
+        // contract wants an interval and a null, and this arm is cheap enough to
+        // afford both — two arms cost ~6 s at 8000 inodes, where the production
+        // arm's 20000-inode fixture cannot even finish inside the rch SSH ceiling.
+        const DEFAULT_ROUNDS: usize = 7;
+        let rounds: usize = std::env::var("FFS_BD_5VIS3_ROUNDS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 3)
+            .unwrap_or(DEFAULT_ROUNDS);
+        let mut ab_log_ratios = Vec::with_capacity(rounds);
+        let mut null_log_ratios = Vec::with_capacity(rounds);
+        let mut ok_last = 0_u64;
+        for _ in 0..rounds {
+            let (ok_off, t_off) = arm(true);
+            let (ok_on, t_on) = arm(false);
+            assert_eq!(ok_off, ok_on, "arms must stat the same inodes");
+            ab_log_ratios
+                .push((t_off.as_secs_f64() / t_on.as_secs_f64().max(f64::MIN_POSITIVE)).ln());
+            let (_, t_null_a) = arm(true);
+            let (_, t_null_b) = arm(true);
+            null_log_ratios.push(
+                (t_null_a.as_secs_f64() / t_null_b.as_secs_f64().max(f64::MIN_POSITIVE)).ln(),
+            );
+            ok_last = ok_on;
+        }
+        let ab = bd_5vis3_bootstrap_median_ci(&ab_log_ratios);
+        let null = bd_5vis3_bootstrap_median_ci(&null_log_ratios);
         println!(
-            "bd-5vis3 SYNTHETIC RANDOM ACCESS — adversarial case ({ok_on} inodes)\n               memo OFF: {t_off:?}\n  memo ON : {t_on:?}\n  memo is {ratio:.3}x              (below 1.0 means the memo TAXES this workload)"
+            "bd-5vis3 SYNTHETIC RANDOM ACCESS — the adversarial case bd-79li3 exists to fix \
+             ({ok_last} inodes, {rounds} interleaved pairs)\n  \
+             executing_elf_sha256 {}\n  \
+             wall ratio median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]\n  \
+             A/A null  median {:.6}x  bootstrap_median_ci95 [{:.6}, {:.6}]\n  \
+             (below 1.0 means the memo TAXES this workload; it measured 0.116x before \
+             the bd-79li3 miss-streak gate)",
+            bd_5vis3_executing_elf_sha256(),
+            ab.median,
+            ab.low,
+            ab.high,
+            null.median,
+            null.low,
+            null.high
+        );
+        // The whole point of bd-79li3 is that this arm must not be a REGRESSION any
+        // more. `bd_5vis3_bootstrap_median_ci` returns exponentiated ratios, so 1.0
+        // is parity and the pre-gate 0.116x sits far below it.
+        //
+        // Assert the DIRECTION, not the magnitude. The gate bounds the tax; it does
+        // not promise a win, and pinning a number here would turn an honest
+        // re-measurement on a slower worker into a spurious failure. The bound is
+        // the A/A null's own lower edge: the memo must not be slower than the
+        // instrument's demonstrated noise floor, which is the weakest claim that
+        // still rules out the 8.6x regression this bead was filed for.
+        assert!(
+            ab.high > null.low,
+            "random-access memo ratio [{:.6}, {:.6}] sits entirely below the A/A null \
+             [{:.6}, {:.6}] — it is still a tax, so the bd-79li3 miss-streak gate did \
+             not bound the adversarial case",
+            ab.low,
+            ab.high,
+            null.low,
+            null.high
         );
     }
 

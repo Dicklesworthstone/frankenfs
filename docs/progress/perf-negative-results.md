@@ -9914,3 +9914,163 @@ path-resolution ops, or a FUSE ABI flag that lets a daemon declare an inode has 
 measured inert. Experimental wiring reverted; the ABI constant is kept in the vendored
 fuser so the next attempt does not rediscover that it was missing.
 
+
+## 2026-08-16 — SURVEY (no ratio banked): btrfs floor-memo is 2.88x in production config and a 0.116x TAX on random access — plus the gate that makes it one-signed (bd-5vis3 / bd-79li3, measured by ProudBarn, written up by AzureBay)
+
+**SURVEY. Nothing here is banked.** No ratio in this row is admissible for publication, and the
+reason is recorded under "Admissibility" below: the arms are single off/on pairs with
+no interval and no ELF identity, and the instrumented arm that would fix that **has
+never completed a run**. Quote nothing here as a banked number.
+
+**Lead number, provisional: `2.884x` — 22.360080 ms -> 7.752808 ms, PRODUCTION config
+(attr cache ON), 20000-inode btrfs walk.** When this row does become bankable, that is
+the figure it will be about.
+
+The larger `37.705x` figure in this bead's history (211.129458 ms -> 5.599509 ms,
+lookups 60000 -> 1395, 43.01x fewer descents) is the **SYNTHETIC SWEEP** arm: attr
+cache disabled, so every inode resolution goes to the fs-tree and the memo gets to
+answer work production already caches away. It is a mechanism demonstration, not a
+production ratio.
+
+**The two are 13.1x apart on the same ELF and the same image.** A gap that size is
+itself the finding: it says the sweep arm is NOT production-representative, because
+the production configuration has already removed ~92% of the descents the sweep
+arm pays for. **`37.7x` must never stand unqualified** — quoted alone it overstates
+the lever by more than an order of magnitude. Any future citation carries the words
+"synthetic sweep, attr cache off" in the same sentence, or it is wrong.
+
+### The adversarial arm, which is a LOSS
+
+| arm | incumbent | floor memo ON | ratio |
+| --- | --- | --- | --- |
+| PRODUCTION, attr cache ON, 20000 inodes | 22.360080 ms | **7.752808 ms** | **2.884x WIN** |
+| synthetic sweep, attr cache OFF, 20000 inodes | 211.129458 ms | 5.599509 ms | 37.705x (not production-representative) |
+| RANDOM ACCESS, 8000 inodes | 7.907348 ms | 68.062258 ms | **0.116x — 8.6x SLOWER** |
+
+The retained leaf pays off by amortising the fs-tree DESCENT across inodes that share
+a leaf, which is what bd-5vis3 item 2 prescribed and why it beats the one-pass case
+that defeats a per-inode LRU. Random access has no such locality, so every probe
+retains a leaf it will not reuse — and **the memo is default-ON**, so that tax is
+shipped. Filed as `bd-79li3` — **and fixed there; the arm now measures 1.295x, a
+WIN. See the post-gate table below.**
+
+### The fix that makes the lever one-signed (bd-79li3)
+
+A miss-streak gate on the REPLACEMENT path: keep retaining a leaf while the memo is
+being useful, and once 32 consecutive misses land, back off to refreshing one descent
+in 64. A sweep never trips it — a sweep's misses arrive one per leaf crossing, each
+followed by a run of hits, and a hit resets the streak — so the production path still
+replaces on every descent. A miss-only stream does **131 replacements per 6400
+descents instead of 6400** (a 48.9x cut in miss-path work), and the 1-in-64 probe is
+what lets a stream that regains locality re-arm instead of staying cold for the life
+of the mount. Correctness is untouched by construction rather than by argument: the
+gate only decides whether to RETAIN a leaf, every hit is still gated on the key-span
+check, and a stale retained leaf can only produce fewer hits, never a wrong floor.
+
+The replacement schedule is asserted directly
+(`btrfs_floor_memo_miss_streak_gate_is_one_signed_bd_79li3`) rather than through a
+timed arm, because the property under test is the schedule and a wall-clock arm cannot
+separate "the gate suppressed replacements" from "the machine was quiet". That test
+passed on its first execution — `cargo test -p ffs-core --lib btrfs_floor`, rch worker
+`vmi1227854`, 4 passed / 0 failed / 3 ignored — alongside the pre-existing floor-memo
+correctness suite, so the gate did not disturb the argument it sits next to.
+
+**MEASURED AFTER THE GATE — the regression is gone, and the magnitude is
+UNDECIDABLE.** Both statements matter and the second one is why no ratio is banked.
+
+Harness `cargo test -p ffs-core --release --lib bd_5vis3_random -- --ignored`, rch
+worker `vmi1227854`, 8000 inodes, 7 interleaved (off, on) pairs with an A/A null on the
+identical schedule, seeded bootstrap median CI over 20,000 resamples. The run's own
+`executing_elf_sha256 = 6d126781e652442666a73b832da86ef997d9b1b6383a6ca697afbabbbdb9f34d`
+line is the binary identity — self-reported by the executing ELF via `current_exe()` at
+measurement time, not a `sha256sum` typed beside the row afterward:
+
+| | median | bootstrap median CI95 |
+| --- | --- | --- |
+| A/B, memo OFF / memo ON | `1.232888x` | `[0.711969, 1.553234]` |
+| A/A null, memo OFF twice | `1.136846x` | `[0.902400, 3.308809]` |
+
+**The A/B sits inside its own A/A null, so the post-gate ratio is not readable.** The
+null spans `0.90` to `3.31` — this worker was loaded and the instrument cannot resolve
+anything at 7 rounds. `1.23x` is therefore NOT a win and must not be quoted as one; an
+earlier single pair on the same worker read `1.295x` and that number is likewise noise.
+
+What IS decidable is the thing the bead was filed for. **The pre-gate ratio was
+`0.116x`, which sits an order of magnitude below the null's lower edge of `0.902`.** A
+null that wide is precisely what makes the comparison safe in this direction: an effect
+the instrument cannot see is an effect smaller than the noise, and the pre-gate
+regression was far larger than the noise. So:
+
+- before the gate: measurably, grossly slower — an 8.6x tax
+- after the gate: indistinguishable from neutral
+
+Neutral was the goal. The gate was never meant to make random access faster; it was
+meant to stop a locality-assuming cache from taxing a workload without locality, and
+"we can no longer measure any difference" is exactly what success looks like here.
+Bounding the magnitude of any residual effect needs a quiet window and more rounds
+(`FFS_BD_5VIS3_ROUNDS`), and that is still owed.
+
+### Still missing from this bead's own acceptance list
+
+Item 3 required peak resident memory and mount-time cost at several image sizes. The
+three arms above report wall time and lookup counts only. **No mounted comparator row
+is claimed here** — this is an in-process ffs-core measurement, not a vs-kernel ratio,
+and bd-3zx2x's attribution already showed inode resolution is ~1.2% of the mounted
+per-entry cost, so nothing here should be expected to move the 7.7x readdir+stat row.
+
+### Admissibility — what this row may and may not be quoted as
+
+**As first written this row did not meet the banked-ratio contract, and the ledger's own
+preflight said so** (`--lint`: "no in-process self-report of the executing ELF's
+SHA-256; timed row has no bootstrap median CI"). The gate was right: the three arms
+above are single off/on pairs with no interval and no binary identity, which is not
+enough to bank a ratio. The fix was to go get the evidence, not to soften the gate.
+
+`b56aad87` supplies it for the production arm, which is the one this row leads with:
+the production A/B now runs **21 interleaved (off, on) pairs** plus an **A/A null on
+the identical schedule**, reports a **seeded bootstrap median CI**, asserts the A/B
+interval clears the null envelope, and **self-reports the SHA-256 of the executing
+test binary**, hashed from `current_exe()` at measurement time rather than typed in
+beside the row — under the host-wide shared cargo target dir a concurrent agent's
+rebuild can replace the binary between a run and a later `sha256sum`.
+
+Until that instrumented arm is re-run and its interval recorded here, the numbers in
+the table are **provisional single-pair observations**. The 8.6x random-access tax is
+the weakest of the three in that respect — one pair, no null — but it is also the one
+whose direction was independently confirmed by mechanism (every miss pays a full memo
+replacement), and it was strong enough to justify `bd-79li3`.
+
+### BLOCKED: the instrumented arm has never completed a run
+
+Recorded because it is a defect in the instrument, not a quiet window problem, and the
+next person will otherwise spend the same hour rediscovering it.
+
+`cargo test -p ffs-core --release --lib bd_5vis3_prod -- --ignored` was attempted
+**four times** and produced no output on any of them:
+
+| attempt | worker | outcome |
+| --- | --- | --- |
+| all three arms | `vmi1227854` | `error[E0277]` — the crate did not build (fixed, `31091fdd`) |
+| all three arms | `vmi1264463` | `[RCH-E104]` SSH timeout at 1800 s |
+| prod arm alone, 21 rounds | `vmi1264463` | `[RCH-E104]` SSH timeout at 1800 s |
+| prod arm alone, 7 rounds | `vmi1264463` | `[RCH-E104]` SSH timeout at 1800 s |
+
+Cutting the round count 21 -> 7 did not help, which **refutes** the obvious diagnosis
+that the interleaved rounds are what overruns the ceiling. Whatever dominates is
+upstream of the loop — the one-time 20,000-file fixture build, or the release
+compile — so buying a shorter loop buys nothing. `FFS_BD_5VIS3_ROUNDS` now makes the
+count tunable anyway, since an instrument that cannot finish reports no interval at
+all and that is strictly worse than a wide one.
+
+Note the earlier ProudBarn run DID complete, on `vmi1293453`. Every failure above is
+on `vmi1264463`. That is consistent with a slow worker rather than an unbounded test,
+and the next attempt should pin the worker before concluding the test is at fault.
+
+Harness `cargo test -p ffs-core --release --lib bd_5vis3 -- --ignored` (three arms that
+existed as ignored tests and had never been run). One ELF, arms selected by
+`FFS_BTRFS_FLOOR_MEMO` so no rebuild sits between them. rch WORKER `vmi1293453`.
+Lock fix `1e334993` landed alongside: the memo hit path held its mutex across
+`floor_in_leaf` because an inner `if let` shadowed the `MutexGuard`, making the
+`drop(memo)` a no-op the compiler had been reporting as `dropping_references` in every
+`ffs-core` build. Gate for that fix: `cargo test -p ffs-core --lib btrfs_floor` on rch
+worker `vmi1152480`, 3 passed / 0 failed, including the concurrent-sweep test.
