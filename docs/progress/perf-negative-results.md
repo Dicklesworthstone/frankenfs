@@ -12963,3 +12963,71 @@ loss, and banked `7.753405x`/`7.649395x` stands.
 
 Counted mechanism: **49 of 49 contention samples over limit**, `max_external_busy_cpus=50`
 against a limit of `2`.
+
+## 2026-08-16 — EIGHTH clean-null run at loadavg `10.28`, the quietest measured region of the session: btrfs readdir+stat `8.278490x`, and the PLACEMENT hypothesis is REFUTED (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+    RUN 10 (quoted)
+    bootstrap median 8.278490x with bootstrap median CI [8.242402, 8.323421], 20000 resamples
+    same-invocation A/A null control, kernel arm  1.001300  spread 1.006264  clear=true
+    same-invocation A/A null control, fuse arm    1.009339  spread 1.013814  clear=true
+    twice_null_margin_ratio = 1.027820
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+    LOADAVG 10.28 at invocation, 9.82 at completion
+    placement_cpus = 0:5:7:32:34:35:36:38, driver_thread_cpu = 0
+
+### The placement hypothesis is refuted, at the third point
+
+Last entry recorded two runs consistent with CPU placement driving the spread — a HIGH run on
+the upper socket range, a LOW run on the lower — and said explicitly it would not be built on
+until a third point arrived. It has:
+
+    8.110590   upper range   24:29:31:56:57:58:60:62
+    7.617279   lower range   0:1:2:7:33:34:35:36
+    8.278490   lower range   0:5:7:32:34:35:36:38     <- new
+
+**The lower range produced both the LOWEST and the HIGHEST clean-null ratio of the session.**
+Placement does not explain the split. That is the third hypothesis for this spread to die
+today — after "more contention, worse ratio" and after loadavg — and all three died the same
+way, by a point that the two-point version could not have anticipated.
+
+Recording the pattern rather than only the result: every one of these was proposed with an
+explicit test and killed by running it. That is the process working, but three in one day on
+one row also says the spread is not going to yield to inspection of the variables I have been
+able to capture. What is left uncaptured is the fixture layout (whether mkfs produces an
+identical btrfs image each run) and anything internal to the kernel arm.
+
+### Eight clean-null runs, and the honest summary of the spread
+
+    7.316939  7.453004  7.531731  7.617279  8.065190  8.110590  8.170852  8.278490
+    total spread 13.14%; banked 7.753405x lies inside it
+
+The two-cluster reading is now clearly weaker than when first recorded: run 9's interval
+reached into the gap, and this run extends the upper end rather than reinforcing a tight
+group. Eight points spanning 13.14% with no surviving explanatory variable is better
+described as **dispersion of unknown origin** than as structure. I introduced the clustering
+observation, defended it across four entries with a stated test each time, and the test has
+now gone against it — so it should be read as an artefact of small numbers unless a future
+run restores the gap.
+
+### The veto fired on CPU COUNT, not busy fraction — the closest to clean yet
+
+`external_load_during_run,samples=46,over_limit_samples=46,max_external_busy_cpus=11,
+peak_off_placement_mean_busy=0.189142,busy_cpu_fraction_limit=0.25,verdict=CONTENDED`
+
+**`peak_off_placement_mean_busy` was `0.189142`, BELOW the `0.25` limit** — the first run all
+session where the mean off-placement busy fraction cleared its threshold. It was still
+refused because `11` individual CPUs sat above 25% busy against a `max_external_busy_cpus`
+limit of `2`. So this row failed on the count sub-limit alone while passing the intensity
+one, which is a materially quieter measured region than any previous run and worth
+distinguishing from the earlier refusals at 48-60 busy CPUs and means of 0.34-0.67.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+private copy of the candidate. Estimator `four_round_balanced_crossover_bootstrap_median_ci`.
+LVM volume. Nothing claimed, nothing superseded; a failure to certify under load is not a
+loss, and banked `7.753405x`/`7.649395x` stands.
+
+Counted mechanism: **46 of 46 contention samples over the CPU-count limit**,
+`max_external_busy_cpus=11` against a limit of `2`, while the busy-fraction limit was met.
