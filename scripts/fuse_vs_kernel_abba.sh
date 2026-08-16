@@ -106,7 +106,12 @@ if [ "${FFS_SKIP_STABILITY:-0}" != "1" ]; then
     exit 4
   fi
   echo "$STABILITY"
+  # Baseline for the in-run excursion check: the conditions this run was admitted
+  # under. Without it a run can be admitted at median 19 and finish at 57, which
+  # produced a row that had to be downgraded on 2026-08-16.
+  LAUNCH_MEDIAN=$(printf '%s' "$STABILITY" | sed -n 's/.*median \([0-9.]*\).*/\1/p')
 fi
+LAUNCH_MEDIAN=${LAUNCH_MEDIAN:-0}
 
 BIN=$OUT/client
 mkdir -p "$OUT"
@@ -146,6 +151,17 @@ sweep() { # $1 dir  $2 tag  $3 position
     else taskset -c "$CLIENT_CPU" "$BIN" "$1" >/dev/null 2>&1; fi
     e=$EPOCHREALTIME
     awk '{print $1}' /proc/loadavg >> "$OUT/loadavg"
+    # Abort rather than finish a run the host has walked away from. A completed
+    # run under conditions it was not admitted under costs more than the run did,
+    # because the row has to be withdrawn afterwards.
+    if [ "${FFS_SKIP_STABILITY:-0}" != "1" ] && [ "$LAUNCH_MEDIAN" != "0" ]; then
+      if ! EXC=$(python3 "$HERE/host_stability.py" --check-excursion "$LAUNCH_MEDIAN" "$OUT/loadavg"); then
+        echo "$EXC"
+        echo "Partial samples are in $OUT/samples.tsv and are NOT a row."
+        fusermount3 -u "$FMNT" 2>/dev/null
+        exit 5
+      fi
+    fi
     # rep 1 of every visit is COLD and runs 2-3x the warm reps; including it
     # produced a spurious 1.5630x result that sign-flipped on replicate.
     [ "$i" = 1 ] || printf "%s\t%s\t%s\n" "$2" "$3" \

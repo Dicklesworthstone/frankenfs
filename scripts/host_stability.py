@@ -118,6 +118,54 @@ def verdict(samples: list[float], one: float, five: float, fifteen: float,
                   f"{s:.2f} — certify and record these with the row")
 
 
+# A run may start stable and be ruined mid-flight. Observed 2026-08-16: a run
+# launched at median 19.0 with drift 0.07 -- the best conditions of the session --
+# saw loadavg reach 57.03 during its ~5 minutes, and produced A/A nulls so wide
+# (kernel 0.9329x ci95 [0.7130, 1.3627]) that an 8% lever could not be resolved.
+# The row had to be downgraded afterwards. A launch-time gate cannot prevent that;
+# only watching during the run can.
+EXCURSION_FACTOR = 2.0
+
+
+def excursion(samples: list[float], launch_median: float,
+              factor: float = EXCURSION_FACTOR,
+              ceiling: float = None,
+              consecutive: int = 2) -> tuple[bool, str]:
+    """Has the host left the conditions the run was admitted under?
+
+    (should_abort, reason). Requires `consecutive` samples over the threshold, so
+    a single lagging 1-minute average does not kill an otherwise good run — the
+    loadavg is itself an average and will overshoot briefly on any transient.
+
+    Aborting is the point: a run that finishes under conditions it was not
+    admitted under produces a row that has to be withdrawn later, which costs more
+    than the run did.
+    """
+    if ceiling is None:
+        ceiling = ABSOLUTE_CEILING
+    if launch_median <= 0 or not samples:
+        return False, ""
+    threshold = max(launch_median * factor, 0.0)
+    run = 0
+    for v in samples:
+        if v > threshold or v > ceiling:
+            run += 1
+            if run >= consecutive:
+                # Report the PEAK seen, not merely the sample that tripped the
+                # counter: the peak is what a reader needs to judge the row, and
+                # the tripping sample is an artefact of where the run happens to
+                # sit in the consecutive window.
+                return True, (f"ABORT: loadavg peaked at {max(samples):.1f} against "
+                              f"this run's admission threshold {threshold:.1f} "
+                              f"(launch median {launch_median:.1f} x {factor:g}); "
+                              f"{consecutive} consecutive samples over it, so the "
+                              f"host left the conditions this run was admitted "
+                              f"under")
+        else:
+            run = 0
+    return False, ""
+
+
 def wait_for_stable(budget: float, poll: float = 15.0,
                     sample_seconds: float = 12.0) -> tuple[bool, str, float]:
     """Poll until the host is certifiable, or the budget runs out.
@@ -242,13 +290,47 @@ def _selftest() -> int:
     ok, why, waited = wait_for_stable(budget=0.0, sample_seconds=0.0)
     assert isinstance(ok, bool) and waited >= 0.0, (ok, why, waited)
 
-    print("host_stability selftest: 15 cases pass")
+    # In-run excursion: the case that cost a row on 2026-08-16 (launch median 19.0,
+    # in-run max 57.03) must abort.
+    abort, why = excursion([18.0, 19.0, 57.0, 55.0, 20.0], launch_median=19.0)
+    assert abort, why
+    assert "ABORT" in why and "57.0" in why, why  # must report the PEAK, not the trip sample
+
+    # A single transient over the threshold must NOT abort: the 1-minute average
+    # overshoots on any brief burst and killing good runs is its own failure.
+    abort, why = excursion([18.0, 19.0, 57.0, 18.0, 19.0], launch_median=19.0)
+    assert not abort, why
+
+    # A run that stays inside its admission conditions must never abort.
+    abort, why = excursion([18.0, 19.0, 20.0, 21.0], launch_median=19.0)
+    assert not abort, why
+
+    # The absolute ceiling still applies even if the factor would allow it: a run
+    # launched at median 30 must not be allowed to ride up to 60 on this box.
+    abort, why = excursion([59.0, 59.5], launch_median=30.0, ceiling=32.0)
+    assert abort, why
+
+    # Degenerate inputs must not raise or abort.
+    assert excursion([], launch_median=19.0)[0] is False
+    assert excursion([100.0], launch_median=0.0)[0] is False
+
+    print("host_stability selftest: 21 cases pass")
     return 0
 
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
+    if "--check-excursion" in sys.argv:
+        i = sys.argv.index("--check-excursion")
+        launch = float(sys.argv[i + 1])
+        samples = [float(x) for x in open(sys.argv[i + 2]) if x.strip()]
+        abort, why = excursion(samples, launch)
+        if abort:
+            print(why)
+            raise SystemExit(5)
+        raise SystemExit(0)
+
     budget = 0.0
     for i, a in enumerate(sys.argv):
         if a == "--wait" and i + 1 < len(sys.argv):
