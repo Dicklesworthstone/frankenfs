@@ -2450,12 +2450,24 @@ fn check_access_permission(
 }
 
 impl FrankenFuse {
-    fn getxattr_value(
-        &self,
-        cx: &Cx,
-        ino: InodeNumber,
-        name: &str,
-    ) -> ffs_error::Result<Option<Vec<u8>>> {
+    /// Resolve one xattr, building a request `Cx` only if the caches miss.
+    ///
+    /// The `Cx` used to be constructed by the caller and passed in, so every
+    /// kernel probe paid for one whether or not it was needed.
+    /// `Cx::for_request()` mints an ephemeral `RegionId` and `TaskId`, and on the
+    /// memo path none of that is ever read: the answer returns before
+    /// `with_request_scope` is reached.
+    ///
+    /// That was tolerable while the memo only served read-only mounts. It is not
+    /// now: counted on a warm read-write mount, 4001 of 4001 `security.capability`
+    /// probes are answered from the memo (bd-2pq73), and the kernel sends TWO of
+    /// them per path-based metadata op — so this was the single most frequently
+    /// constructed-and-discarded object on the metadata hot path.
+    ///
+    /// Behaviour is unchanged by construction: `cx` was only ever read by the
+    /// `with_request_scope` call below, which is exactly the branch that still
+    /// builds one.
+    fn getxattr_value(&self, ino: InodeNumber, name: &str) -> ffs_error::Result<Option<Vec<u8>>> {
         // Deliberately NOT gated on `read_only` (bd-yu6jz). It used to be, which
         // disabled the memo on exactly the mounts the worst ratios are measured on
         // — the bead's own note reads "a read-write mount (memos disabled) counted
@@ -2490,7 +2502,9 @@ impl FrankenFuse {
             });
         }
 
-        let value = self.with_request_scope(cx, RequestOp::Getxattr, |cx, _scope| {
+        // Both caches missed: this is the only branch that needs a request scope.
+        let cx = Self::cx_for_request();
+        let value = self.with_request_scope(&cx, RequestOp::Getxattr, |cx, _scope| {
             self.inner.ops.getxattr(cx, ino, name)
         })?;
         if is_capability_probe && value.is_none() {
@@ -3012,8 +3026,9 @@ impl Filesystem for FrankenFuse {
             size,
             "fuse getxattr from kernel"
         );
-        let cx = Self::cx_for_request();
-        match self.getxattr_value(&cx, InodeNumber(ino), name) {
+        // No `Cx` here: `getxattr_value` builds one only if its caches miss, which
+        // on a warm mount is ~0% of probes (bd-yu6jz).
+        match self.getxattr_value(InodeNumber(ino), name) {
             Ok(Some(value)) => Self::reply_xattr_payload(size, &value, reply),
             Ok(None) => reply.error(Self::missing_xattr_errno()),
             Err(e) => {
@@ -4671,45 +4686,40 @@ mod tests {
             }),
             &MountOptions::default(),
         );
-        let cx = FrankenFuse::cx_for_request();
         let ino = InodeNumber(42);
 
         assert!(
-            fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+            fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+            fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
+        assert!(fuse.getxattr_value(ino, "user.mime").unwrap().is_none());
         assert!(
-            fuse.getxattr_value(&cx, ino, "user.mime")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            fuse.getxattr_value(&cx, InodeNumber(43), SECURITY_CAPABILITY_XATTR)
+            fuse.getxattr_value(InodeNumber(43), SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert!(
-            fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+            fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert!(
-            fuse.getxattr_value(&cx, InodeNumber(0), SECURITY_CAPABILITY_XATTR)
+            fuse.getxattr_value(InodeNumber(0), SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            fuse.getxattr_value(&cx, InodeNumber(0), SECURITY_CAPABILITY_XATTR)
+            fuse.getxattr_value(InodeNumber(0), SECURITY_CAPABILITY_XATTR)
                 .unwrap()
                 .is_none()
         );
@@ -4786,7 +4796,7 @@ mod tests {
             let ino = InodeNumber(7);
             for _ in 0..4 {
                 assert!(
-                    fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                    fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
                         .unwrap()
                         .is_none()
                 );
@@ -4826,12 +4836,11 @@ mod tests {
             }),
             &MountOptions::default(),
         );
-        let cx = FrankenFuse::cx_for_request();
         let ino = InodeNumber(42);
 
         for _ in 0..5 {
             assert!(
-                fuse.getxattr_value(&cx, ino, SECURITY_CAPABILITY_XATTR)
+                fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
                     .unwrap()
                     .is_none()
             );
@@ -4848,11 +4857,7 @@ mod tests {
 
         // The generic read-only value cache must account the same way.
         for _ in 0..3 {
-            assert!(
-                fuse.getxattr_value(&cx, ino, "user.mime")
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(fuse.getxattr_value(ino, "user.mime").unwrap().is_none());
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         let snapshot = fuse.inner.metrics.snapshot();
