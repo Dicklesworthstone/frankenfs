@@ -358,39 +358,6 @@ const READDIRPLUS_CAPABILITIES_FORCED: u64 = fuse_consts::FUSE_DO_READDIRPLUS;
 /// permission-semantics question can be gated separately from the round-trip one.
 const POSIX_ACL_CAPABILITY: u64 = fuse_consts::FUSE_POSIX_ACL;
 
-/// Is the readdirplus attribute memo enabled? (bd-q0xnl)
-///
-/// Opt-OUT, defaulting ON, because the memo is already the shipping behaviour.
-/// This exists so the memo can be A/B'd on ONE ELF — ISA and PGO then cancel
-/// (bd-b9dug class C) — which matters because the memo's value is anti-correlated
-/// with the generation fix (`2e78f789`): it pays off only while the kernel re-asks
-/// for attributes readdirplus already supplied, and if the fix stops that, every
-/// `remember` is a mutex acquisition and a slot write that nothing reads.
-///
-/// Sized before writing this knob, so the expectation is calibrated: the memo can
-/// save at most one `ops.getattr` per entry, measured at `33.185 ns` with no FUSE,
-/// i.e. `0.66 ms` of a `325.1 ms` sweep = 0.20%. This knob is here to find out
-/// whether it COSTS more than that, not because a win is expected.
-fn readdirplus_attr_memo_enabled_from_env() -> bool {
-    readdirplus_attr_memo_enabled_from_value(
-        std::env::var("FFS_FUSE_READDIRPLUS_ATTR_MEMO")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// Pure half of [`readdirplus_attr_memo_enabled_from_env`], so the parsing is
-/// testable without mutating process-global environment state.
-fn readdirplus_attr_memo_enabled_from_value(value: Option<&str>) -> bool {
-    match value {
-        None => true,
-        Some(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-    }
-}
-
 /// Resolve the POSIX-ACL capability from `FFS_FUSE_POSIX_ACL`.
 ///
 /// `1`, `true` or `on` negotiates `FUSE_POSIX_ACL`; anything else, including
@@ -2533,6 +2500,13 @@ impl ReaddirplusAttrMemo {
     }
 
     /// Claim the attributes for `ino`, removing them.
+    /// Whether this memo will actually store anything (bd-q0xnl). Exposed so the
+    /// remember COUNTER is only incremented when a remember really happened — a
+    /// counter that ticks on a disabled memo reports work that never occurred.
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     fn take(&self, ino: InodeNumber) -> Option<InodeAttr> {
         if !self.enabled || ino.0 == 0 {
             return None;
@@ -2654,7 +2628,6 @@ struct FuseInner {
     readahead: ReadaheadManager,
     readonly_xattr_cache: ReadonlyXattrCache,
     readdirplus_attr_memo: ReaddirplusAttrMemo,
-    readdirplus_attr_memo_enabled: bool,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
 }
@@ -3680,12 +3653,7 @@ impl Filesystem for FrankenFuse {
         // than dispatched, because the kernel still paid for the round trip —
         // undercounting it is what made requests_total unusable as evidence
         // once before (bd-warm-stat-is-the-fuse-floor-4wxw9).
-        if let Some(attr) = self
-            .inner
-            .readdirplus_attr_memo_enabled
-            .then(|| self.inner.readdirplus_attr_memo.take(InodeNumber(ino)))
-            .flatten()
-        {
+        if let Some(attr) = self.inner.readdirplus_attr_memo.take(InodeNumber(ino)) {
             self.inner.metrics.record_memoized();
             self.inner.metrics.record_readdirplus_memo_hit();
             reply.attr(&ATTR_TTL, &to_file_attr(&attr));
@@ -3985,10 +3953,10 @@ impl Filesystem for FrankenFuse {
                     // bd-q0xnl: hand these attributes to the getattr the kernel
                     // issues for this same inode moments from now, so the daemon
                     // does not recompute what it just computed.
-                    if self.inner.readdirplus_attr_memo_enabled {
-                        self.inner
-                            .readdirplus_attr_memo
-                            .remember(entry.ino, &inode_attr);
+                    self.inner
+                        .readdirplus_attr_memo
+                        .remember(entry.ino, &inode_attr);
+                    if self.inner.readdirplus_attr_memo.is_enabled() {
                         self.inner.metrics.record_readdirplus_memo_remember();
                     }
                     let attr = to_file_attr(&inode_attr);
@@ -5696,7 +5664,10 @@ mod tests {
             MAX_RECEIVE_SPIN,
             "u32::MAX must clamp"
         );
-        assert!(MAX_RECEIVE_SPIN < u32::MAX, "the ceiling must bound something");
+        assert!(
+            MAX_RECEIVE_SPIN < u32::MAX,
+            "the ceiling must bound something"
+        );
 
         // Sane values are honoured, or the knob is useless as an A/B handle.
         assert_eq!(Channel::spin_iterations_from_value(Some("512")), 512);
@@ -6309,7 +6280,6 @@ mod tests {
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             readonly_xattr_cache: ReadonlyXattrCache::default(),
             readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
-            readdirplus_attr_memo_enabled: readdirplus_attr_memo_enabled_from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
@@ -17042,7 +17012,6 @@ mod tests {
                 READDIRPLUS_ATTR_MEMO_SLOTS,
                 false,
             ),
-            readdirplus_attr_memo_enabled: true,
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
@@ -18425,32 +18394,47 @@ AllowOther"#;
         );
     }
 
-    /// bd-q0xnl: the memo knob must be opt-OUT and must parse conservatively.
+    /// bd-q0xnl: exactly ONE gate may own `FFS_FUSE_READDIRPLUS_ATTR_MEMO`.
     ///
-    /// Opt-out because the memo is already shipping behaviour; the knob exists to
-    /// A/B it on ONE ELF, not to change a default. An unrecognised value keeps the
-    /// memo ON, so a typo cannot silently disable shipping behaviour mid-campaign
-    /// — the opposite polarity to `FFS_FUSE_POSIX_ACL`, which fails CLOSED because
-    /// enabling it changes permission semantics.
+    /// This test exists because I added a SECOND gate on that variable with the
+    /// OPPOSITE default. `ReaddirplusAttrMemo::enabled_from_value` is opt-IN
+    /// (unset = off); mine was opt-OUT (unset = on). With both in place the memo
+    /// was off whether the variable was unset or `0`, so a four-arm A/B ran two
+    /// arms of the same configuration and reported them as a memo comparison. The
+    /// counters said so — `readdirplus_memo_remembers` was 0.000/entry in every
+    /// arm — but only because those counters existed; nothing else would have
+    /// caught it.
+    ///
+    /// The real contract is the memo's own: opt-IN, unset means OFF.
     #[test]
-    fn readdirplus_memo_knob_is_opt_out_and_typo_safe_bd_q0xnl() {
+    fn readdirplus_memo_knob_is_opt_in_and_singly_owned_bd_q0xnl() {
         assert!(
-            readdirplus_attr_memo_enabled_from_value(None),
-            "unset must keep the memo enabled: this knob must not change the default"
+            !ReaddirplusAttrMemo::enabled_from_value(None),
+            "unset must leave the memo OFF: it is opt-in, and a second gate that \
+             assumed opt-out silently voided a measurement"
         );
-        for off in ["0", "false", "off", "FALSE", "Off", " 0 "] {
+        for on in ["1", "true", "on", "TRUE", " 1 "] {
             assert!(
-                !readdirplus_attr_memo_enabled_from_value(Some(off)),
-                "{off:?} must disable the memo"
+                ReaddirplusAttrMemo::enabled_from_value(Some(on)),
+                "{on:?} enables"
             );
         }
-        for on in ["1", "true", "on", "", "yes", "maybe", "  "] {
+        for off in ["0", "false", "off", "", "yes", "maybe"] {
             assert!(
-                readdirplus_attr_memo_enabled_from_value(Some(on)),
-                "{on:?} must leave the memo enabled; only an explicit 0/false/off \
-                 disables it, so a typo cannot silently turn off shipping behaviour"
+                !ReaddirplusAttrMemo::enabled_from_value(Some(off)),
+                "{off:?} must leave the memo off"
             );
         }
+
+        // Exactly one reader of the variable, so a second gate cannot reappear.
+        let src = include_str!("lib.rs");
+        assert_eq!(
+            src.matches("\"FFS_FUSE_READDIRPLUS_ATTR_MEMO\"").count(),
+            1,
+            "FFS_FUSE_READDIRPLUS_ATTR_MEMO must have exactly ONE reader; a second \
+             gate on the same variable with a different default makes the knob's \
+             meaning depend on which gate runs first"
+        );
     }
 
     /// bd-q0xnl: hit rate must be computable, and the NEGATIVE case must read zero.
@@ -18829,7 +18813,6 @@ AllowOther"#;
                 READDIRPLUS_ATTR_MEMO_SLOTS,
                 false,
             ),
-            readdirplus_attr_memo_enabled: true,
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
