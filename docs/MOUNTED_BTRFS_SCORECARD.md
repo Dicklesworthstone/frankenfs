@@ -137,6 +137,22 @@ runs are recorded above precisely so this cannot recur for them.
   the ELF has the emitter and the harness sets `FFS_MOUNT_BENCH_EVIDENCE=1`. The
   standard mount runtime, which is the path the comparator uses, hand-constructs an
   all-zero `MetricsSnapshot` instead of returning the accumulated one (`bd-viil0`).
+  **✅ ATTRIBUTED ANYWAY 2026-08-16** (AzureBay) — `--runtime-mode managed` emits the same
+  counters and is a plain CLI flag, so the attribution was taken directly. 2,000 warm
+  stats of one already-resolved path produce **exactly 2,000 FUSE round trips, every one
+  a `security.capability` GETXATTR**. No GETATTR, no LOOKUP, no STATX: the 60 s
+  `ATTR_TTL` works and the kernel serves attributes from its own cache. Of 2,000 probes
+  exactly **2** reach the format layer (the memo answers 1,998), so daemon dispatch is
+  `0.27%–0.35%` of wall and **`0.75%–0.99%` of the gap vs kernel**.
+  The probe is **one per path-based syscall**, independent of path depth (mount root pays
+  the same as a nested file), independent of the filesystem (**ext4 `1.0000` == btrfs
+  `1.0000`**, which is what now supports the shared-floor claim above — a count, not the
+  `1.3%` wall agreement), independent of whether the xattr exists, and **zero for `fstat`
+  on an open fd**. So this row is a property of the kernel's FUSE path-resolution
+  behaviour, not of anything FrankenFS does: no filesystem-side, daemon-side or
+  path-shape lever can move it, and halving round-trip cost halves it and no more
+  (`bd-z0rb8`). Practically: **a workload holding fds pays none of this; one that stats
+  by path pays all of it.**
 - **Create/delete storm: we lose.** About 2.36 times slower on a 2,000-file namespace
   transaction.
 - **Parallel metadata writes: we lose.** About 1.93 times slower with eight workers
