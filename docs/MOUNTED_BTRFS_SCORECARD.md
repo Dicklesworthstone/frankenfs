@@ -140,9 +140,15 @@ runs are recorded above precisely so this cannot recur for them.
   So **at the shipping default this row is about half our filesystem work and half
   transport; sized to the directory it is essentially all transport** — the same wall
   warm stat is against. Removing the measured daemon work predicts `1.894x` against the
-  measured `2.064x`, so the descent explains `88%` of the lever and `~12%` is residual and
-  unexplained. ⛔ Two hypotheses for that residual have already been retracted; do not
-  argue a lever from it.
+  measured `2.064x`. ⚠ **CORRECTED 2026-08-16**: those daemon-share figures came from an
+  UNPINNED daemon divided by the PINNED comparator arm — a mixed instrument, caught by the
+  `--placement-audit` ratchet built for `bd-plt79`. Re-measured with the daemon pinned
+  (observed affinity, not requested): **`41.62%` at 4096 slots, not `47.21%`**, and
+  `0% ± 1.7%` at 65,536 on a floor 1.50x tighter. The dispatch COUNTS are byte-identical
+  pinned and unpinned, which is what shows counts survive a placement change and nanos do
+  not. Consequently the descent explains **`74%`** of the lever, not `88%`, and the
+  unexplained residual **grows** to `~26%`. ⛔ Four hypotheses for that residual have now
+  been eliminated or retracted; do not argue a lever from it.
 - **Warm stat: we lose.** About `4.8` times slower, re-measured 2026-08-08 as an admitted
   pair on a current ELF (`4.769886x` / `4.802719x`, spread `0.69%`); the banked
   `4.977803x` / `5.036433x` is superseded. The ext4 twin, measured in the SAME invocations,
