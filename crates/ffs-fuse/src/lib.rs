@@ -143,6 +143,52 @@ const XATTR_FLAG_REPLACE: i32 = 0x2;
 /// safely memoize that negative answer and avoid repeating the format lookup.
 const SECURITY_CAPABILITY_XATTR: &str = "security.capability";
 
+/// Attribute names counted individually by the xattr probe census (bd-4ypbv).
+///
+/// The mounted measurement found `ls -l` issuing 4.00 getxattr round trips per
+/// directory entry against 1.01 getattr, and the daemon answering all of them in
+/// under 4% of wall time. That makes the round-trip COUNT the lever and the
+/// per-op cost irrelevant — but only if we know WHICH names are being asked, and
+/// nobody had enumerated them. A probe for a name this filesystem can never carry
+/// is a round trip bought for nothing.
+///
+/// Deliberately a fixed table with an `other` bucket rather than a map keyed by
+/// the incoming name: the name comes from userspace on the hot path, so an
+/// unbounded per-name structure would be both an allocation and a memory-growth
+/// vector driven by whatever a caller chooses to ask for.
+const CENSUSED_XATTR_NAMES: [&str; 4] = [
+    SECURITY_CAPABILITY_XATTR,
+    "security.selinux",
+    "system.posix_acl_access",
+    "system.posix_acl_default",
+];
+
+/// One counter per censused name plus a final `other` bucket.
+static XATTR_PROBE_CENSUS: [AtomicU64; CENSUSED_XATTR_NAMES.len() + 1] =
+    [const { AtomicU64::new(0) }; CENSUSED_XATTR_NAMES.len() + 1];
+
+fn record_xattr_probe_name(name: &str) {
+    let slot = CENSUSED_XATTR_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(CENSUSED_XATTR_NAMES.len());
+    XATTR_PROBE_CENSUS[slot].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per-name xattr probe counts: one entry per [`CENSUSED_XATTR_NAMES`] name in
+/// order, then everything else. Process-global like the btrfs node-lookup
+/// counters, and read once at mount shutdown.
+#[must_use]
+pub fn xattr_probe_census() -> [u64; CENSUSED_XATTR_NAMES.len() + 1] {
+    std::array::from_fn(|i| XATTR_PROBE_CENSUS[i].load(Ordering::Relaxed))
+}
+
+/// The censused names, in the order [`xattr_probe_census`] returns them.
+#[must_use]
+pub fn xattr_probe_census_names() -> &'static [&'static str] {
+    &CENSUSED_XATTR_NAMES
+}
+
 const FS_IOC_FIEMAP: u32 = 0xC020_660B;
 const FIEMAP_HEADER_SIZE: usize = 32;
 const FIEMAP_EXTENT_SIZE: usize = 56;
@@ -2618,6 +2664,7 @@ impl FrankenFuse {
         // only ever caches ABSENCE, so the failure it must not permit is
         // "reported absent after it exists", which is precisely what `forget`
         // closes.
+        record_xattr_probe_name(name);
         let is_capability_probe = name == SECURITY_CAPABILITY_XATTR;
         if is_capability_probe && self.inner.missing_capability_xattr.contains(ino) {
             if self.inner.count_memoized_requests {

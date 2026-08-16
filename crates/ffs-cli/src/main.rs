@@ -7520,6 +7520,22 @@ fn log_mount_shutdown_metrics(
             metrics.readdir_dispatch_count,
             metrics.readdir_dispatch_nanos,
         );
+        // Which attribute names the client actually asks for (bd-4ypbv). The
+        // dispatch line says how MANY probes and how cheap each was; this says
+        // which ones, which is what decides whether a probe can be removed
+        // rather than merely made faster.
+        let census = ffs_fuse::xattr_probe_census();
+        let names = ffs_fuse::xattr_probe_census_names();
+        let mut line = String::from("mount_xattr_probe_census");
+        for (index, name) in names.iter().enumerate() {
+            use std::fmt::Write as _;
+            let _ = write!(line, ",{}={}", name.replace('.', "_"), census[index]);
+        }
+        {
+            use std::fmt::Write as _;
+            let _ = write!(line, ",other={}", census[names.len()]);
+        }
+        eprintln!("{line}");
     }
 }
 
