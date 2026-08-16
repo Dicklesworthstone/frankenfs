@@ -136,10 +136,11 @@ fn pin_serial_dispatch_thread() {
     // `#![forbid(unsafe_code)]`, which cannot be locally overridden.
     match fuser::pin_current_thread_to_one_cpu() {
         Some(cpu) => info!(cpu, "serial FUSE dispatch pinned to one CPU (bd-svhrq)"),
-        None => debug!("serial dispatch left unpinned (already single-CPU, or affinity unavailable)"),
+        None => {
+            debug!("serial dispatch left unpinned (already single-CPU, or affinity unavailable)")
+        }
     }
 }
-
 
 /// Bounded spin before the blocking `/dev/fuse` read (bd-receive-spin).
 ///
@@ -442,6 +443,45 @@ fn posix_acl_capability_from_value(value: Option<&str>) -> u64 {
     if enabled { POSIX_ACL_CAPABILITY } else { 0 }
 }
 
+/// Resolve the one-way xattr switch ONCE, before the first request can reach a
+/// handler.
+///
+/// A function rather than inline code because there are two mount entry points
+/// and they must not disagree: the kernel's `no_getxattr` is one bit per
+/// connection, so a mount whose handlers saw different answers could accept a
+/// `setxattr` the kernel has already stopped being able to read back.
+///
+/// `auto` pays for a bounded inode scan here rather than trusting an assertion
+/// (bd-ha71t). Mount time is the only place that scan can run: it must complete
+/// before any request is served, and its answer must not change afterwards.
+fn resolve_xattr_suppression(fs: &FrankenFuse) {
+    let setting =
+        xattr_switch_setting_from_value(std::env::var("FFS_FUSE_XATTR_NO_SUPPORT").ok().as_deref());
+    if setting == XattrSwitchSetting::Off {
+        return;
+    }
+    let cx = FrankenFuse::cx_for_request();
+    let presence = fs.inner.ops.xattr_presence(&cx);
+    let allowed = xattr_suppression_allowed(setting, presence, fs.inner.read_only);
+    XATTR_SWITCH.store(allowed, std::sync::atomic::Ordering::Relaxed);
+    if allowed {
+        info!(
+            ?setting,
+            ?presence,
+            "xattr suppression ACTIVE: the kernel will be told this mount has no extended \
+             attributes and will stop probing (bd-ha71t)"
+        );
+    } else {
+        warn!(
+            ?setting,
+            ?presence,
+            read_only = fs.inner.read_only,
+            "xattr suppression REFUSED: it is one-way for the life of the connection, so it \
+             is only taken on a proof, or on an assertion the filesystem did not contradict"
+        );
+    }
+}
+
 /// Which xattr handler is asking [`xattr_switch_errno`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum XattrHandler {
@@ -490,22 +530,75 @@ fn xattr_switch_errno(handler: XattrHandler) -> i32 {
 /// that accepted an xattr the kernel can no longer read back would be worse
 /// than a slow one.
 ///
-/// So this is correct only for images that carry no extended attributes, and the
-/// operator asserts that by setting the knob. Unset, nothing changes.
+/// So this is correct only for images that carry no extended attributes, which
+/// the operator either ASSERTS (`1`) or the filesystem PROVES (`auto`); see
+/// [`xattr_suppression_allowed`]. Unset, nothing changes.
+///
+/// Reads [`XATTR_SWITCH`] directly rather than memoising it. A `OnceLock` here
+/// would freeze whatever it happened to see on the FIRST call, so a single read
+/// before [`resolve_xattr_suppression`] ran would pin the switch to `false` for
+/// the life of the process — a caching bug that presents as the lever silently
+/// not working.
 fn xattr_unsupported_from_env() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        xattr_unsupported_from_value(std::env::var("FFS_FUSE_XATTR_NO_SUPPORT").ok().as_deref())
-    })
+    XATTR_SWITCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Pure half of [`xattr_unsupported_from_env`], split out so the parsing is
-/// testable without mutating process-global environment state.
-fn xattr_unsupported_from_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        let value = value.trim();
-        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
-    })
+/// Resolved at mount, read on every xattr request.
+///
+/// A process-global rather than a `FuseInner` field because the four xattr
+/// handlers must all see the SAME answer -- the kernel's `no_getxattr` is one
+/// bit per connection, so a mount whose handlers disagreed would accept a
+/// `setxattr` the kernel can no longer read back.
+static XATTR_SWITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How `FFS_FUSE_XATTR_NO_SUPPORT` was set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XattrSwitchSetting {
+    /// Unset or unrecognised: never suppress. Today's behaviour.
+    Off,
+    /// `1`/`true`/`on`: the operator ASSERTS the image has no xattrs.
+    Asserted,
+    /// `auto`: suppress only where the filesystem can PROVE it.
+    Auto,
+}
+
+/// Pure half of the knob, split out so the parsing is testable without mutating
+/// process-global environment state.
+fn xattr_switch_setting_from_value(value: Option<&str>) -> XattrSwitchSetting {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("auto") => XattrSwitchSetting::Auto,
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") => {
+            XattrSwitchSetting::Asserted
+        }
+        _ => XattrSwitchSetting::Off,
+    }
+}
+
+/// Whether the one-way suppression switch may be thrown, given how the operator
+/// set the knob and what the filesystem could prove.
+///
+/// This is the whole safety argument for `auto` in one place, so it can be
+/// tested as a truth table rather than inferred from four handlers:
+///
+/// - `auto` requires BOTH a proof of absence AND a read-only mount. The proof
+///   covers the image as it is now; read-only is what keeps it true, since a
+///   writable mount could gain its first xattr a second after the scan and the
+///   kernel would already have stopped asking.
+/// - `Asserted` is honoured even without a proof -- that is what an assertion
+///   IS -- but it is REFUSED when the filesystem actively proved the opposite.
+///   An operator asserting "no xattrs" about an image that demonstrably has one
+///   is making a mistake, and the cost of honouring it is silent data loss.
+fn xattr_suppression_allowed(
+    setting: XattrSwitchSetting,
+    presence: ffs_core::vfs::XattrPresence,
+    read_only: bool,
+) -> bool {
+    use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent};
+    match setting {
+        XattrSwitchSetting::Off => false,
+        XattrSwitchSetting::Asserted => presence != Present,
+        XattrSwitchSetting::Auto => presence == ProvenAbsent && read_only,
+    }
 }
 
 /// Resolve the readdirplus capability set from `FFS_FUSE_READDIRPLUS_AUTO`.
@@ -5246,6 +5339,7 @@ pub fn mount(
     validate_mountpoint(mountpoint)?;
     let fuse_opts = build_mount_options(options);
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
+    resolve_xattr_suppression(&fs);
     let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
     fs.install_kernel_notifier(session.notifier());
     // bd-vbqc6: FUSE-over-io_uring, opt-in, wired to the KNOBS rather than to
@@ -5339,6 +5433,7 @@ pub fn mount_background(
     validate_mountpoint(mountpoint)?;
     let fuse_opts = build_mount_options(options);
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
+    resolve_xattr_suppression(&fs);
     let notifier_owner = fs.shared_handle();
     let session = if options.worker_threads > 0 {
         fuser::spawn_mount2_with_workers(
@@ -6576,44 +6671,6 @@ mod tests {
         assert!(!memo.contains(InodeNumber(0)));
     }
 
-    #[test]
-    /// The AUTO knob must change ONLY whether the kernel gets to choose, never
-    /// the rest of the negotiated set — and must default to today's behaviour so
-    /// an unset environment is byte-identical to before the knob existed
-    /// (bd-4ypbv).
-    #[test]
-    /// bd-biwl4: the POSIX-ACL knob must be opt-IN and must be inert when unset.
-    ///
-    /// This flag is aimed at the campaign's worst vs-incumbent ratio (btrfs
-    /// readdir+stat `7.728937x`, whose largest component is `4.00` getxattr per
-    /// entry), but it is also a semantic claim: negotiating it tells the kernel to
-    /// cache and ENFORCE POSIX ACLs itself. So the property pinned here is not that
-    /// it is fast — it is that an unset or unrecognised value negotiates NOTHING,
-    /// leaving the default mount byte-identical to before the knob existed.
-    /// bd-ha71t: the no-xattr switch must be opt-IN and inert when unset.
-    ///
-    /// The polarity matters more here than for a speed knob: this one makes the
-    /// kernel stop sending `getxattr` for the life of the connection and makes
-    /// the mount refuse `setxattr`. Arriving by default would silently turn a
-    /// working xattr-bearing mount into one that reports no xattr support.
-    #[test]
-    fn no_xattr_switch_is_opt_in_and_inert_when_unset_bd_ha71t() {
-        assert!(
-            !xattr_unsupported_from_value(None),
-            "unset must leave xattrs fully supported: this switch is one-way for \
-             the life of the connection"
-        );
-        for off in ["0", "false", "off", "", "  ", "yes", "2", "enabled", "ON!", "no"] {
-            assert!(
-                !xattr_unsupported_from_value(Some(off)),
-                "{off:?} must not throw a one-way switch"
-            );
-        }
-        for on in ["1", "true", "on", "TRUE", "On", " 1 "] {
-            assert!(xattr_unsupported_from_value(Some(on)), "{on:?} must enable");
-        }
-    }
-
     /// The coherence invariant, which is the whole correctness argument for the
     /// switch: the read side answers `ENOSYS` (the only value the kernel reads as
     /// "stop asking"), and the write side must NOT — it answers `ENOTSUP`, so a
@@ -6621,6 +6678,119 @@ mod tests {
     /// the call. If the write side ever returned `ENOSYS`, a `setxattr` could be
     /// accepted and stored while the kernel had already stopped issuing
     /// `getxattr`, leaving data no reader can reach.
+    /// bd-ha71t: `auto` must suppress ONLY on a proof, and only where the proof
+    /// stays true.
+    ///
+    /// This is the whole safety argument for the mode, as a truth table. The
+    /// switch is one-way for the life of the FUSE connection -- there is no
+    /// per-inode form and no way to re-enable it -- so every cell that is not a
+    /// proven-absent read-only mount must come out false.
+    #[test]
+    fn auto_suppression_requires_a_proof_and_a_read_only_mount_bd_ha71t() {
+        use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent, Unknown};
+
+        assert!(
+            xattr_suppression_allowed(XattrSwitchSetting::Auto, ProvenAbsent, true),
+            "a proof on a read-only mount is the ONE case auto exists for"
+        );
+        assert!(
+            !xattr_suppression_allowed(XattrSwitchSetting::Auto, ProvenAbsent, false),
+            "a WRITABLE mount can gain its first xattr a second after the scan, and \\
+             the kernel would already have stopped asking"
+        );
+        for presence in [Present, Unknown] {
+            assert!(
+                !xattr_suppression_allowed(XattrSwitchSetting::Auto, presence, true),
+                "auto must not fire on {presence:?}: 'I did not find one' is not 'there \\
+                 is none', and Unknown must be treated exactly like Present"
+            );
+        }
+    }
+
+    /// An assertion is honoured without a proof -- that is what an assertion IS
+    /// -- but it must be REFUSED when the filesystem proved the opposite. An
+    /// operator asserting "no xattrs" about an image that demonstrably has one
+    /// is making a mistake whose cost is silent data loss.
+    #[test]
+    fn an_assertion_is_honoured_but_never_against_a_contradiction_bd_ha71t() {
+        use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent, Unknown};
+
+        assert!(xattr_suppression_allowed(
+            XattrSwitchSetting::Asserted,
+            Unknown,
+            false
+        ));
+        assert!(xattr_suppression_allowed(
+            XattrSwitchSetting::Asserted,
+            ProvenAbsent,
+            false
+        ));
+        assert!(
+            !xattr_suppression_allowed(XattrSwitchSetting::Asserted, Present, true),
+            "the filesystem found an xattr; honouring the assertion would make it \\
+             permanently unreadable through this mount"
+        );
+    }
+
+    /// Off must stay inert in every configuration -- including the one where a
+    /// proof exists. A proof is permission, never instruction: the switch also
+    /// changes `setxattr` semantics, so it must not arrive because a scan
+    /// happened to come back clean.
+    #[test]
+    fn off_never_suppresses_even_with_a_proof_bd_ha71t() {
+        use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent, Unknown};
+        for presence in [Present, ProvenAbsent, Unknown] {
+            for read_only in [true, false] {
+                assert!(
+                    !xattr_suppression_allowed(XattrSwitchSetting::Off, presence, read_only),
+                    "off must be inert for {presence:?} / read_only={read_only}"
+                );
+            }
+        }
+    }
+
+    /// The knob's spellings. `auto` is a distinct third state, not a truthy
+    /// value: reading it as an assertion would suppress without the scan, which
+    /// is the exact failure the mode exists to prevent.
+    #[test]
+    fn the_knob_parses_auto_as_its_own_state_bd_ha71t() {
+        assert_eq!(
+            xattr_switch_setting_from_value(None),
+            XattrSwitchSetting::Off
+        );
+        for off in [
+            "0",
+            "false",
+            "off",
+            "",
+            "  ",
+            "yes",
+            "2",
+            "automatic",
+            "AUTO!",
+        ] {
+            assert_eq!(
+                xattr_switch_setting_from_value(Some(off)),
+                XattrSwitchSetting::Off,
+                "{off:?} must not enable anything"
+            );
+        }
+        for asserted in ["1", "true", "on", "TRUE", " 1 "] {
+            assert_eq!(
+                xattr_switch_setting_from_value(Some(asserted)),
+                XattrSwitchSetting::Asserted,
+                "{asserted:?} must be an assertion"
+            );
+        }
+        for auto in ["auto", "AUTO", " Auto "] {
+            assert_eq!(
+                xattr_switch_setting_from_value(Some(auto)),
+                XattrSwitchSetting::Auto,
+                "{auto:?} must be the proving mode, not a truthy assertion"
+            );
+        }
+    }
+
     #[test]
     fn no_xattr_switch_answers_reads_and_writes_differently_bd_ha71t() {
         assert_eq!(

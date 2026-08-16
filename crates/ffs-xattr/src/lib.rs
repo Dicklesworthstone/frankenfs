@@ -575,6 +575,36 @@ pub fn remove_xattr(
     Ok(true)
 }
 
+/// Whether this inode carries ANY extended attribute, in either of the two
+/// places ext4 can put one.
+///
+/// Exists for `FFS_FUSE_XATTR_NO_SUPPORT=auto` (bd-ha71t). Suppressing the
+/// kernel's per-path-op `security.capability` probe is worth `>= 4.661799x` on
+/// warm stat -- it is the whole of that gap -- but the mechanism is
+/// connection-wide and one-way, so it is correct ONLY on an image that carries
+/// no extended attributes anywhere. Until now the operator asserted that. This
+/// is the per-inode half of PROVING it instead.
+///
+/// Both locations must be checked and the cheap one is not enough: `file_acl`
+/// points at an external xattr block, but ext4 also stores small xattrs INSIDE
+/// the inode's extra space, and an inode can carry those with `file_acl == 0`.
+/// Checking only `file_acl` would report an SELinux-labelled image as
+/// attribute-free, which is precisely the mistake that would make the switch
+/// silently wrong.
+///
+/// A parse error counts as PRESENT. This answer gates a one-way switch, so the
+/// unreadable case must fail towards "there might be one", never towards
+/// "there is none".
+#[must_use]
+pub fn inode_has_any_xattr(inode: &Ext4Inode) -> bool {
+    if inode.file_acl != 0 {
+        return true;
+    }
+    // `map_or`'s default is the ERROR arm: an inode whose inline area will not
+    // parse counts as carrying an attribute.
+    parse_inline_entries(inode).map_or(true, |entries| !entries.is_empty())
+}
+
 /// List all xattr names (`user.foo`, `security.selinux`, ...).
 pub fn list_xattrs(inode: &Ext4Inode, external_block: Option<&[u8]>) -> Result<Vec<String>> {
     list_xattrs_for_access(inode, external_block, XattrReadAccess::default())
@@ -3400,6 +3430,57 @@ mod tests {
                 "user.e3".to_owned(),
                 "user.e4".to_owned()
             ],
+        );
+    }
+
+    // The crate's own fixture, so these tests exercise the same inode shape the
+    // rest of the module is tested against.
+    fn bare_inode() -> Ext4Inode {
+        make_inode(128)
+    }
+
+    /// The whole point of the function: an inode with nothing on it must be
+    /// reported clean, because that is what lets `auto` prove absence.
+    #[test]
+    fn a_bare_inode_carries_nothing_bd_ha71t() {
+        assert!(!inode_has_any_xattr(&bare_inode()));
+    }
+
+    /// The cheap check. An external xattr block is a hard yes without parsing
+    /// anything.
+    #[test]
+    fn an_external_xattr_block_counts_bd_ha71t() {
+        let mut inode = bare_inode();
+        inode.file_acl = 42;
+        assert!(inode_has_any_xattr(&inode));
+    }
+
+    /// The check that `file_acl` alone would miss, and the reason this function
+    /// exists at all: a small xattr lives inside the inode with `file_acl == 0`.
+    /// An image labelled by SELinux looks exactly like this.
+    #[test]
+    fn an_in_inode_xattr_counts_even_with_no_external_block_bd_ha71t() {
+        let mut inode = bare_inode();
+        set_xattr(
+            &mut inode,
+            None,
+            "security.selinux",
+            b"system_u:object_r:t",
+            XattrWriteAccess {
+                is_owner: true,
+                has_cap_fowner: false,
+                has_cap_sys_admin: true,
+            },
+        )
+        .expect("in-inode set must fit");
+        assert_eq!(
+            inode.file_acl, 0,
+            "this fixture must exercise the INLINE path"
+        );
+        assert!(
+            inode_has_any_xattr(&inode),
+            "an in-inode xattr must count: reporting this image attribute-free \
+             would make the one-way suppression switch silently wrong"
         );
     }
 }

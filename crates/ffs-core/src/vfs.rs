@@ -769,7 +769,36 @@ pub struct QuotaInfo {
 /// - Write operations have default implementations returning `FfsError::ReadOnly`.
 /// - `begin_request_scope`/`end_request_scope` provide a policy hook for
 ///   per-request MVCC snapshot/transaction management.
+/// What a filesystem can say about whether it carries extended attributes.
+///
+/// Three-state on purpose (bd-ha71t). `FFS_FUSE_XATTR_NO_SUPPORT` suppresses the
+/// kernel's per-path-op `security.capability` probe, which is worth
+/// `>= 4.661799x` on warm stat -- it is the whole of that gap -- but the
+/// mechanism is connection-wide and ONE-WAY, so it is correct only where no
+/// extended attribute exists anywhere. "I did not find one" and "there is none"
+/// are different claims, and only the second may throw that switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrPresence {
+    /// Every inode was examined and none carries an extended attribute.
+    ProvenAbsent,
+    /// At least one extended attribute exists.
+    Present,
+    /// Not established -- too many inodes to check, a read failed, or the
+    /// format has no cheap answer. Callers must treat this exactly like
+    /// `Present`: it is the safe direction.
+    Unknown,
+}
+
 pub trait FsOps: Send + Sync {
+    /// Whether this filesystem can PROVE it carries no extended attributes.
+    ///
+    /// Defaults to [`XattrPresence::Unknown`] so a filesystem that has not done
+    /// the work cannot accidentally authorise the one-way suppression switch:
+    /// silence means "unknown", never "none". Called at most once per mount.
+    fn xattr_presence(&self, _cx: &Cx) -> XattrPresence {
+        XattrPresence::Unknown
+    }
+
     /// Get file attributes by inode number.
     ///
     /// Returns the attributes for the given inode. Returns
@@ -2675,6 +2704,15 @@ pub trait FsOps: Send + Sync {
 
 #[allow(clippy::too_many_arguments)]
 impl<T: FsOps + ?Sized> FsOps for Arc<T> {
+    // Forwarding this is load-bearing, not boilerplate: the production mount
+    // passes `Box<Arc<OpenFs>>`, so a method left unforwarded silently resolves
+    // to the TRAIT DEFAULT. That is how `xattr_presence` first shipped -- the
+    // scan was correct, the mount just never called it, and the only symptom
+    // was `auto` refusing on an image it had proved clean.
+    fn xattr_presence(&self, cx: &Cx) -> XattrPresence {
+        (**self).xattr_presence(cx)
+    }
+
     fn getattr(
         &self,
         cx: &Cx,

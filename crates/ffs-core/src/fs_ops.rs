@@ -1,8 +1,74 @@
 //! VFS operation dispatch for [`OpenFs`].
 
 use super::*;
+use crate::vfs::XattrPresence;
+
+/// The largest inode table this scan will walk before giving up.
+///
+/// A bound, not a tuning knob: the scan runs once at mount and its answer is
+/// only useful if it is cheap enough that nobody is tempted to skip it. At
+/// 256Ki inodes it is a few thousand cached block reads. Past that the honest
+/// answer is [`XattrPresence::Unknown`], which costs a caller only the
+/// suppression they never had.
+const XATTR_SCAN_INODE_LIMIT: u32 = 262_144;
+
+impl OpenFs {
+    /// Walk the inode table and decide whether ANY inode carries an xattr.
+    ///
+    /// Every exit that is not a completed clean walk returns
+    /// [`XattrPresence::Unknown`] or [`XattrPresence::Present`]. This answer
+    /// gates a switch that cannot be un-thrown for the life of a FUSE
+    /// connection, so an unreadable inode, a missing superblock, or an inode
+    /// table larger than the bound must all fail towards "there might be one".
+    fn ext4_scan_for_any_xattr(&self, cx: &Cx) -> XattrPresence {
+        let Some(sb) = self.ext4_superblock() else {
+            return XattrPresence::Unknown;
+        };
+        let count = sb.inodes_count;
+        if count == 0 || count > XATTR_SCAN_INODE_LIMIT {
+            return XattrPresence::Unknown;
+        }
+        for ino in 1..=count {
+            match self.read_inode(cx, InodeNumber(u64::from(ino))) {
+                Ok(inode) => {
+                    if ffs_xattr::inode_has_any_xattr(&inode) {
+                        tracing::debug!(ino, "xattr scan: found one, suppression unavailable");
+                        return XattrPresence::Present;
+                    }
+                }
+                // An inode that DOES NOT EXIST is skipped, not treated as a
+                // failure. Reserved and free inodes read as NotFound -- ext4
+                // inode 1 (bad blocks) is the very first one -- and an inode
+                // nothing can read cannot serve an xattr to anyone, because
+                // every xattr read goes through this same read. Bailing here
+                // was the first version of this scan and it made `auto` return
+                // Unknown on every image in existence.
+                Err(FfsError::NotFound(_)) => {}
+                // Anything else is a real failure and must fail towards
+                // "there might be one".
+                Err(e) => {
+                    // Warn, not debug: the operator ASKED for `auto` and is not getting it,
+                    // and the inode that refused the proof is the only useful thing to say.
+                    tracing::warn!(ino, error = %e, "xattr scan: unreadable inode, no proof");
+                    return XattrPresence::Unknown;
+                }
+            }
+        }
+        XattrPresence::ProvenAbsent
+    }
+}
 
 impl FsOps for OpenFs {
+    fn xattr_presence(&self, cx: &Cx) -> XattrPresence {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_scan_for_any_xattr(cx),
+            // btrfs stores xattrs as DIR_ITEM keys in the fs tree; deciding
+            // absence there is a different walk and has not been written, so
+            // the honest answer is Unknown rather than a guess.
+            FsFlavor::Btrfs(_) => XattrPresence::Unknown,
+        }
+    }
+
     fn getattr(
         &self,
         cx: &Cx,
@@ -3943,5 +4009,38 @@ impl FsOps for OpenFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod xattr_scan_tests {
+    use super::*;
+
+    /// bd-ha71t: the scan must PROVE absence on a real image, not merely decline
+    /// to find anything.
+    ///
+    /// This test exists because the first end-to-end run of
+    /// `FFS_FUSE_XATTR_NO_SUPPORT=auto` came back REFUSED with
+    /// `presence=Unknown` on an image that provably has no xattrs (`listxattr`
+    /// returns `[]`, `getxattr` returns `ENODATA`), and a log line could not say
+    /// whether the scan had run and failed or had never been reached at all.
+    /// A test can.
+    #[test]
+    fn the_scan_proves_absence_on_an_xattr_free_image_bd_ha71t() {
+        let image = std::path::Path::new("/data/tmp/ffs-pgo-train.img");
+        if !image.exists() {
+            // The fixture is a scratch artifact and scratch is reaped; skipping
+            // is honest, silently passing on a missing image would not be.
+            eprintln!("skipping: no image at {}", image.display());
+            return;
+        }
+        let cx = Cx::for_testing();
+        let fs = OpenFs::open(&cx, image).expect("image must open");
+        assert_eq!(
+            FsOps::xattr_presence(&fs, &cx),
+            XattrPresence::ProvenAbsent,
+            "this image carries no extended attributes, so the scan must say so; \
+             Unknown here means the scan did not run, not that it found something"
+        );
     }
 }
