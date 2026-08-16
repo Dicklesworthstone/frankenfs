@@ -85,6 +85,17 @@ pub fn capability_memo_enabled() -> bool {
     LastMissingCapabilityXattr::enabled_from_env()
 }
 
+/// Effective capability-memo table size for this process (bd-m1bpu).
+///
+/// Resolved through the same function the mount constructor calls, for the same
+/// reason as [`capability_memo_enabled`]: the comparator refuses a
+/// candidate-vs-candidate run whose two configurations self-report identical
+/// knobs, so this is what proves a slot-count override actually took effect.
+#[must_use]
+pub fn capability_memo_slots() -> usize {
+    LastMissingCapabilityXattr::slots_from_env()
+}
+
 /// Pure half of [`count_memoized_requests_from_env`], so the opt-out spelling
 /// is testable without mutating process-global environment from a test thread.
 fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
@@ -1553,6 +1564,16 @@ impl ReadonlyXattrCache {
 /// removes the reason a populated memo would immediately evict itself.
 const CAPABILITY_MEMO_SLOTS: usize = 4096;
 
+/// Hard ceiling on `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (bd-m1bpu).
+///
+/// The table is one `AtomicU64` per slot, per mount, resident for the mount's
+/// lifetime: 4096 slots is 32 KiB, this ceiling is 8 MiB. A ceiling exists at all
+/// because the measured benefit is a CAPACITY effect — the memo pays only while
+/// the working directory FITS — and "make it fit" generalises to any directory
+/// anyone names, which is exactly the unbounded-footprint trap bd-5vis3 was
+/// created to prevent. Sizing this knob is an experiment, not a policy.
+const CAPABILITY_MEMO_SLOTS_MAX: usize = 1 << 20;
+
 /// Lock-free cache of inodes observed to have no capability xattr.
 ///
 /// The kernel still sends each FUSE `GETXATTR` request; this only makes the
@@ -1561,7 +1582,9 @@ struct LastMissingCapabilityXattr {
     /// Direct-mapped by `ino % CAPABILITY_MEMO_SLOTS`. No victim bookkeeping: an
     /// inode's slot is a pure function of its number, so there is nothing to
     /// choose and nothing to race over.
-    slots: [AtomicU64; CAPABILITY_MEMO_SLOTS],
+    /// Heap-allocated so the count can be a runtime knob (bd-m1bpu). Always a
+    /// power of two, which is what lets `slot` be a mask rather than a modulo.
+    slots: Box<[AtomicU64]>,
     /// Whether this memo answers at all (bd-2pq73).
     ///
     /// Exists so the mounted comparator can measure what the memo is WORTH. The
@@ -1593,13 +1616,37 @@ impl LastMissingCapabilityXattr {
         }
     }
 
-    fn slot(ino: u64) -> usize {
-        // Power-of-two size, so this is a mask.
-        (ino as usize) & (CAPABILITY_MEMO_SLOTS - 1)
+    /// Now a method rather than an associated function: the mask depends on this
+    /// memo's own table size, which is no longer a compile-time constant.
+    fn slot(&self, ino: u64) -> usize {
+        // Power-of-two length, so this is a mask.
+        (ino as usize) & (self.slots.len() - 1)
+    }
+
+    /// Resolve the table size from `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (bd-m1bpu).
+    ///
+    /// Rounded UP to a power of two so `slot` stays a mask, clamped to
+    /// [`CAPABILITY_MEMO_SLOTS_MAX`], and falling back to the default on anything
+    /// unparseable or zero. Reported through `capability_memo_slots` on the mount
+    /// knob line so the comparator can prove the two arms actually differ.
+    fn slots_from_env() -> usize {
+        let Ok(raw) = std::env::var("FFS_FUSE_CAPABILITY_MEMO_SLOTS") else {
+            return CAPABILITY_MEMO_SLOTS;
+        };
+        let Ok(requested) = raw.trim().parse::<usize>() else {
+            return CAPABILITY_MEMO_SLOTS;
+        };
+        if requested == 0 {
+            return CAPABILITY_MEMO_SLOTS;
+        }
+        requested
+            .min(CAPABILITY_MEMO_SLOTS_MAX)
+            .next_power_of_two()
+            .min(CAPABILITY_MEMO_SLOTS_MAX)
     }
 
     fn contains(&self, ino: InodeNumber) -> bool {
-        self.enabled && ino.0 != 0 && self.slots[Self::slot(ino.0)].load(Ordering::Acquire) == ino.0
+        self.enabled && ino.0 != 0 && self.slots[self.slot(ino.0)].load(Ordering::Acquire) == ino.0
     }
 
     fn remember(&self, ino: InodeNumber) {
@@ -1608,7 +1655,7 @@ impl LastMissingCapabilityXattr {
         // so the OFF arm would measure the memo's cost without its benefit and
         // overstate the lever.
         if self.enabled && ino.0 != 0 {
-            self.slots[Self::slot(ino.0)].store(ino.0, Ordering::Release);
+            self.slots[self.slot(ino.0)].store(ino.0, Ordering::Release);
         }
     }
 
@@ -1621,7 +1668,7 @@ impl LastMissingCapabilityXattr {
     /// slot can hold it, so this cannot disturb any other entry.
     fn forget(&self, ino: InodeNumber) {
         if ino.0 != 0 {
-            let _ = self.slots[Self::slot(ino.0)].compare_exchange(
+            let _ = self.slots[self.slot(ino.0)].compare_exchange(
                 ino.0,
                 0,
                 Ordering::AcqRel,
@@ -1639,19 +1686,31 @@ impl Default for LastMissingCapabilityXattr {
     /// become no-ops for whoever exported it. Production reads the switch
     /// explicitly via [`Self::from_env`].
     fn default() -> Self {
-        Self {
-            slots: std::array::from_fn(|_| AtomicU64::new(0)),
-            enabled: true,
-        }
+        Self::with_slots(CAPABILITY_MEMO_SLOTS, true)
     }
 }
 
 impl LastMissingCapabilityXattr {
-    /// Production constructor: honours `FFS_FUSE_CAPABILITY_MEMO` (bd-2pq73).
+    /// Production constructor: honours `FFS_FUSE_CAPABILITY_MEMO` (bd-2pq73) and
+    /// `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (bd-m1bpu).
     fn from_env() -> Self {
+        Self::with_slots(Self::slots_from_env(), Self::enabled_from_env())
+    }
+
+    /// Build a memo with an explicit table size, rounding UP to a power of two so
+    /// `slot` remains a mask. Shared by `Default`, `from_env` and the tests, so
+    /// there is exactly one place the power-of-two invariant is established.
+    fn with_slots(slots: usize, enabled: bool) -> Self {
+        // Clamp BEFORE rounding: `usize::MAX.next_power_of_two()` overflows and
+        // panics, so a `.min()` applied afterwards is too late. The ceiling is
+        // itself a power of two, so clamping first cannot push the result over it.
+        let len = slots
+            .max(1)
+            .min(CAPABILITY_MEMO_SLOTS_MAX)
+            .next_power_of_two();
         Self {
-            enabled: Self::enabled_from_env(),
-            ..Self::default()
+            slots: (0..len).map(|_| AtomicU64::new(0)).collect(),
+            enabled,
         }
     }
 }
@@ -4510,8 +4569,8 @@ mod tests {
         let a = InodeNumber(14);
         let b = InodeNumber(14 + CAPABILITY_MEMO_SLOTS as u64); // same slot
         assert_eq!(
-            LastMissingCapabilityXattr::slot(a.0),
-            LastMissingCapabilityXattr::slot(b.0),
+            memo.slot(a.0),
+            memo.slot(b.0),
             "test premise: these two inodes must collide"
         );
 
@@ -4552,6 +4611,68 @@ mod tests {
         }
     }
 
+    /// bd-m1bpu: the slot-count knob must round to a power of two, clamp, and
+    /// refuse to silently produce a table `slot` cannot mask into.
+    ///
+    /// The power-of-two invariant is not cosmetic — `slot` is `ino & (len - 1)`,
+    /// so a non-power-of-two length would alias a subset of slots and leave the
+    /// rest permanently unreachable, quietly shrinking the memo while reporting
+    /// the requested size.
+    #[test]
+    fn capability_memo_slot_count_knob_keeps_the_mask_invariant_bd_m1bpu() {
+        for requested in [1_usize, 2, 3, 5, 1000, 4096, 4097, 65_536, 100_000] {
+            let memo = LastMissingCapabilityXattr::with_slots(requested, true);
+            let len = memo.slots.len();
+            assert!(
+                len.is_power_of_two(),
+                "{requested} produced a {len}-slot table"
+            );
+            assert!(len >= requested.min(CAPABILITY_MEMO_SLOTS_MAX));
+            assert!(len <= CAPABILITY_MEMO_SLOTS_MAX);
+            // Every slot must be reachable by some inode, which is what the mask
+            // invariant actually buys.
+            assert_eq!(memo.slot(0), 0);
+            assert_eq!(memo.slot((len - 1) as u64), len - 1);
+            assert_eq!(memo.slot(len as u64), 0, "wraparound must land on slot 0");
+        }
+
+        // The ceiling holds even for absurd requests, so a typo cannot allocate
+        // an unbounded per-mount table.
+        let capped = LastMissingCapabilityXattr::with_slots(usize::MAX, true);
+        assert_eq!(capped.slots.len(), CAPABILITY_MEMO_SLOTS_MAX);
+
+        // A bigger table must still behave like a memo, not merely allocate.
+        let big = LastMissingCapabilityXattr::with_slots(65_536, true);
+        for ino in 1..=40_000_u64 {
+            big.remember(InodeNumber(ino));
+        }
+        let resident = (1..=40_000_u64)
+            .filter(|ino| big.contains(InodeNumber(*ino)))
+            .count();
+        assert_eq!(
+            resident, 40_000,
+            "a 40,000-inode sweep must stay resident in a 65,536-slot table;              {resident} survived"
+        );
+        // And the DEFAULT table must NOT hold that sweep — this is the capacity
+        // cliff the mounted A/B measures, asserted here as a counted fact so the
+        // timed row has a mechanism to point at.
+        let small = LastMissingCapabilityXattr::with_slots(CAPABILITY_MEMO_SLOTS, true);
+        for ino in 1..=40_000_u64 {
+            small.remember(InodeNumber(ino));
+        }
+        let small_resident = (1..=40_000_u64)
+            .filter(|ino| small.contains(InodeNumber(*ino)))
+            .count();
+        assert!(
+            small_resident <= CAPABILITY_MEMO_SLOTS,
+            "a {CAPABILITY_MEMO_SLOTS}-slot table cannot hold more than its own              size; {small_resident} reported resident"
+        );
+        assert!(
+            small_resident < resident,
+            "the default table must lose entries a 65,536-slot table keeps — that              difference IS the capacity effect under test"
+        );
+    }
+
     /// bd-2pq73: the memo's kill switch must make the OFF arm a genuine
     /// incumbent, and the switch's parsing must not drift from every other
     /// `FFS_*` switch in the workspace.
@@ -4561,10 +4682,7 @@ mod tests {
     /// so a test that sets one races every other test in the binary.
     #[test]
     fn capability_memo_kill_switch_makes_the_off_arm_a_true_incumbent_bd_2pq73() {
-        let off = LastMissingCapabilityXattr {
-            enabled: false,
-            ..LastMissingCapabilityXattr::default()
-        };
+        let off = LastMissingCapabilityXattr::with_slots(CAPABILITY_MEMO_SLOTS, false);
         let ino = InodeNumber(4_242);
 
         // Disabled must not ANSWER...
@@ -4579,7 +4697,7 @@ mod tests {
         // without its benefit and OVERSTATE the lever. Read the slot directly:
         // `contains` is already gated, so it cannot witness this.
         assert_eq!(
-            off.slots[LastMissingCapabilityXattr::slot(ino.0)].load(Ordering::Acquire),
+            off.slots[off.slot(ino.0)].load(Ordering::Acquire),
             0,
             "a disabled memo wrote its slot; the OFF arm is paying for a cache it \
              never uses"
