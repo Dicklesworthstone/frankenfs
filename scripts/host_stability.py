@@ -155,7 +155,12 @@ def excursion(samples: list[float], launch_median: float,
         ceiling = ABSOLUTE_CEILING * RUN_CEILING_MULTIPLE
     if launch_median <= 0 or not samples:
         return False, ""
-    threshold = max(launch_median * factor, 0.0)
+    # Never abort at a load we would happily ADMIT a fresh run at. Without this
+    # floor the factor rule is hypersensitive exactly when conditions are best: a
+    # run launched at 13.7 got a threshold of 27.4 and died to a rise to 30.9,
+    # while one launched at 30 would have tolerated 60. Starting in a quiet window
+    # must not make a run more fragile than starting in a mediocre one.
+    threshold = max(launch_median * factor, ABSOLUTE_CEILING)
     run = 0
     tripped_by = ""
     for v in samples:
@@ -379,6 +384,18 @@ def _selftest() -> int:
     assert excursion([], launch_median=19.0)[0] is False
     assert excursion([100.0], launch_median=0.0)[0] is False
 
+    # THE THIRD FALSE POSITIVE of this family, observed 2026-08-16: a run launched
+    # in the BEST window of the day (median 13.7) was killed by a rise to 30.9,
+    # because 13.7 x 2 = 27.4. A load of 30.9 is one we admit new runs at, so it
+    # cannot be grounds for aborting a run already in flight.
+    abort, why = excursion([13.9, 15.0, 30.9, 30.5, 15.0], launch_median=13.7)
+    assert not abort, why
+
+    # The floor must not rescue a genuinely bad excursion: the run that cost a row
+    # (launch 19.0, peak 57.03) must still abort.
+    abort, why = excursion([19.0, 20.0, 57.0, 55.0], launch_median=19.0)
+    assert abort, why
+
     # THE FALSE POSITIVE observed 2026-08-16: a run admitted at 23.3 saw 33.5,
     # which is far inside its own factor threshold (46.6). It must NOT abort now
     # that the in-run ceiling is separated from the admission ceiling.
@@ -414,7 +431,7 @@ def _selftest() -> int:
     assert isinstance(siblings(0), set) and siblings(0)
     assert siblings(999999) == {999999}   # missing sysfs must not raise
 
-    print("host_stability selftest: 31 cases pass")
+    print("host_stability selftest: 33 cases pass")
     return 0
 
 
