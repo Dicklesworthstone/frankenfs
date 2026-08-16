@@ -63,7 +63,7 @@ inadmissible and the row's section explains why the gate could not see it.
 
 | Workload | FrankenFS ÷ kernel btrfs | Kernel A/A | FUSE A/A | Threads req → obs | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| **Large-directory readdir+stat**, 32,768 entries | **≈`7.7x` slower** — two admitted same-ELF runs, `7.753405x [7.733049, 7.764217]` and `7.649395x [7.617712, 7.728683]`, margins `1.011133x`/`1.011514x`. **Quote the `1.36%` spread, not either CI.** ⛔ SUPERSEDES `8.322812x`, measured on a fixture whose ext4 twin was unindexed (`bd-plkzd`) | run 1 `0.999027x`, spread `1.005551x` · run 2 clear | run 1 `0.999403x`, spread `1.003652x` · run 2 clear | 8 → **8** | **LOSE** |
+| **Large-directory readdir+stat**, 32,768 entries | **≈`7.7x` slower** — two admitted same-ELF runs, `7.753405x [7.733049, 7.764217]` and `7.649395x [7.617712, 7.728683]`, margins `1.011133x`/`1.011514x`. **Quote the `1.36%` spread, not either CI.** ⛔ SUPERSEDES `8.322812x`, measured on a fixture whose ext4 twin was unindexed (`bd-plkzd`). **ATTRIBUTED 2026-08-16**: the steady-state boundary traffic is **exactly 1.0000 `security.capability` GETXATTR per entry** — no GETATTR, LOOKUP or STATX — the same mechanism as warm stat; the daemon is **41.62%** of our arm at the shipping 4096-slot memo and **0% ± 1.7%** once the memo fits, and `59.2%`/`98.8%` of the daemon's own CPU is OUTSIDE dispatch entirely. **SIZING THE MEMO TAKES THIS ROW TO `3.359246x` `[3.314229, 3.399607]`, admitted, against `6.990007x` admitted at the default** (`bd-34hzz`) — ⛔ not a shipping default, the cliff moves rather than disappears | run 1 `0.999027x`, spread `1.005551x` · run 2 clear | run 1 `0.999403x`, spread `1.003652x` · run 2 clear | 8 → **8** | **LOSE** |
 | **Warm stat**, 2,000 calls | **≈`4.77–4.80x` slower.** Two admitted same-ELF runs on a current candidate, `4.769886x [4.736506, 4.801735]` and `4.802719x [4.775460, 4.816630]`, margins `1.040608x`/`1.021556x`, spread `0.69%`. ⛔ SUPERSEDES `4.977803x` / `5.036433x` — the new pair is ~4% lower on a current ELF | run 1 `0.994703x`, spread `1.020102x` · run 2 `0.999117x` | run 1 `0.993281x`, spread `1.017402x` · run 2 `0.998908x` | 1 → **1** | **LOSE** |
 | **Small-file create/delete storm**, 2,000 files | **`2.358280x` `[2.322435, 2.430125]` slower** (margin `1.045128x`) | `0.996139x`, spread `1.018112x` | `0.992157x`, spread `1.022315x` | 1 → **1** | **LOSE** |
 | **Parallel metadata writes**, 512 creates, 8 threads, **128 blocks** | **`1.930090x` `[1.916623, 1.940038]` slower** (margin `1.019214x`) | `1.002214x`, spread `1.009562x` | `0.997250x`, spread `1.009114x` | 8 → **8** | **LOSE** |
@@ -618,7 +618,7 @@ row shows no number, because a fixed defect is not a result.
 
 | Workload | vs kernel ext4 | vs kernel btrfs |
 | --- | --- | --- |
-| readdir+stat **(both re-measured 2026-08-08, corrected fixture)** | ≈`4.1x` slower (`4.052605x` / `4.163402x`) | **`7.753405x` slower** |
+| readdir+stat **(both re-measured 2026-08-08, corrected fixture)** | ≈`4.1x` slower (`4.052605x` / `4.163402x`) | **`7.753405x` slower** — attributed 2026-08-16 to 1.0000 capability probes/entry; **`3.359246x` admitted with the memo sized to the directory** (`bd-34hzz`) |
 | create/delete storm | `2.753659x` slower | `2.358280x` slower |
 | parallel read **(both re-measured 2026-08-08)** | ≈`0.98x` NEUTRAL (`0.986316x` / `0.978203x`) | **≈`0.89–0.93x` FASTER** (`0.893282x` / `0.927352x`, quiet window, 2/2 WIN) |
 | parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
