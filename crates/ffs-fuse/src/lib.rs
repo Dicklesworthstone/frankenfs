@@ -3548,16 +3548,17 @@ impl Filesystem for FrankenFuse {
                     let name = OsStr::new(&owned_name);
 
                     // Get attributes for each entry
-                    let attr =
+                    let inode_attr =
                         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
                             self.inner.ops.getattr(cx, scope, entry.ino)
                         }) {
-                            Ok(attr) => to_file_attr(&attr),
+                            Ok(attr) => attr,
                             Err(_) => {
                                 // If we can't get attrs, skip this entry
                                 continue;
                             }
                         };
+                    let attr = to_file_attr(&inode_attr);
 
                     let full = reply.add(
                         entry.ino.0,
@@ -3565,7 +3566,23 @@ impl Filesystem for FrankenFuse {
                         name,
                         &ATTR_TTL,
                         &attr,
-                        0, // generation - not tracked
+                        // bd-q0xnl: report the REAL generation, as `lookup`, `mknod`,
+                        // `mkdir` and `create` all already do. This was a literal `0`
+                        // commented "generation - not tracked", which made the same
+                        // inode report two different generations depending on which
+                        // call the client made.
+                        //
+                        // The kernel keys an inode by (nodeid, generation), so an
+                        // entry disagreeing with what `lookup` reported for that inode
+                        // is not the same inode from its point of view. That is a
+                        // candidate reason it declines to install the attributes this
+                        // reply supplies: measured, the kernel still issues ~1.0
+                        // getattr per entry on the first `ls -lU` pass despite this
+                        // reply carrying `attr_valid` = ATTR_TTL = 60s, while a second
+                        // pass costs it ~0 because the getattr REPLIES did populate
+                        // the cache. Fixing the inconsistency is correct regardless of
+                        // whether it also recovers those round trips.
+                        inode_attr.generation,
                     );
                     if full {
                         break;

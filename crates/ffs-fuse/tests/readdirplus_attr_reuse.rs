@@ -85,8 +85,9 @@ fn readdirplus_does_not_call_ops_getattr_per_entry_bd_q0xnl() {
 /// this box, not `fs/fuse` source. If it is right the fix is small and also
 /// removes a real inconsistency — the same inode currently reports two different
 /// generations depending on which call the client made.
+// NOT ignored: this half of the lever landed in the same commit that activated
+// this test. The other two remain ignored because attribute REUSE is still open.
 #[test]
-#[ignore = "bd-q0xnl acceptance: fails until readdirplus reports the real generation"]
 fn readdirplus_reports_the_real_generation_bd_q0xnl() {
     let body = readdirplus_body();
     assert!(
