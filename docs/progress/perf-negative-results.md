@@ -10769,8 +10769,9 @@ control.
 
 Harness `scripts`-local `probe_present_vs_absent.sh`; candidate
 `d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`, `isa=x86-64-v3`;
-host `thinkstation1`, kernel `6.17.0-41-generic`, run locally because a FUSE mount runs
-only on the executing machine — no rch worker took part. Counted mechanism, so no quiet
+`hostname=thinkstation1`, `executed_on=thinkstation1`, kernel `6.17.0-41-generic`, run
+locally because a FUSE mount runs only on the executing machine — no rch worker took
+part, and there is no ratio here to be confounded by one if it had. Counted mechanism, so no quiet
 window is required and the host's contention cannot confound it.
 
 ## 2026-08-16 — MECHANISM PINNED: the capability probe is ONE PER PATH-BASED SYSCALL, independent of path depth, and `fstat` pays ZERO (bd-z0rb8, AzureBay)
@@ -10829,3 +10830,56 @@ host `thinkstation1`, kernel `6.17.0-41-generic`, run locally because a FUSE mou
 only on the executing machine — no rch worker took part. All four arms are in ONE mount,
 so the comparison is within-window; all four are COUNTS, so the host's contention cannot
 confound them and no quiet window was required.
+
+## 2026-08-16 — NULL on filesystem dependence (counted, no ratio banked): the capability probe is identical on ext4 and btrfs — exactly 1.0000/stat on both (bd-btrfs-warm-stat-5x-9pxn1, AzureBay)
+
+The scorecard argues warm stat measures a shared per-request FUSE floor rather than
+anything about btrfs, on the strength of the two filesystems landing within `1.3%` of
+each other in wall time. That is a timing coincidence, and on this host timing
+coincidences are cheap. This replaces it with a count.
+
+    === probes per path-based stat, 1000 stats, per filesystem ===
+    ext4    as_root=no   probes=1000   per_stat=1.0000
+    btrfs   as_root=no   probes=1000   per_stat=1.0000
+
+**1000 probes (ext4) vs 1000 probes (btrfs)** over 1,000 stats each, separate images,
+separate mounts, same daemon binary.
+
+Not "within 1.3%" — identical, to four decimal places, on a quantity that cannot be
+perturbed by host contention because it is a count. The shared-floor claim is now
+supported by mechanism rather than by two noisy numbers agreeing.
+
+Combined with the depth-independence and fd-vs-path results banked above, the full
+mechanism for the warm-stat row is:
+
+- one `security.capability` GETXATTR per path-based stat syscall,
+- independent of path depth (mount root pays the same as a nested file),
+- independent of the filesystem (ext4 == btrfs, exactly),
+- independent of whether the xattr exists (present == absent, exactly),
+- zero for `fstat` on an open fd,
+- and the daemon answers it from the memo in `0.75%-0.99%` of the measured gap.
+
+Every one of those is a count with a positive control, none needs a quiet window, and
+together they say the 4.80x row is a property of the kernel's FUSE path-resolution
+behaviour and of nothing FrankenFS does.
+
+### Two method notes, both mine to own
+
+The first run of this script reported `probes=0` for a root arm that never executed:
+`sudo -n python3` is unavailable on this host, the arm printed a skip notice, and the
+count came back zero — which would have read as "root skips the probe", an exciting and
+completely false result. The arm is removed rather than left to report a fabricated
+null. **A skipped arm that still prints a number is worse than a missing arm.**
+
+The same run also tripped the `grep -c ... || echo 0` trap already recorded in this
+campaign: `grep -c` prints `0` AND exits non-zero, so the fallback appended a SECOND
+zero and the downstream arithmetic saw `0\n0`. Fixed to `|| true`, which keeps grep's own
+printed count.
+
+Harness `scripts`-local `probe_cross_fs.sh`; candidate
+`d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`, `isa=x86-64-v3`;
+host `thinkstation1`, kernel `6.17.0-41-generic`, run locally because a FUSE mount runs
+only on the executing machine — no rch worker took part.
+
+Still UNMEASURED and worth someone's time: whether a privileged caller skips the probe.
+That arm did not run here and no claim is made about it.
