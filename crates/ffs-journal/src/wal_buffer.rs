@@ -767,10 +767,10 @@ impl DurabilityNotifier {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             // Check for failure first.
-            if let Some((failed_epoch, ref msg)) = state.failed {
-                if epoch >= failed_epoch {
-                    return DurabilityOutcome::Failed(msg.clone());
-                }
+            if let Some((failed_epoch, ref msg)) = state.failed
+                && epoch >= failed_epoch
+            {
+                return DurabilityOutcome::Failed(msg.clone());
             }
             // Check for success.
             if epoch <= state.durable_epoch {
@@ -810,10 +810,10 @@ impl DurabilityNotifier {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Some((failed_epoch, ref msg)) = state.failed {
-                if epoch >= failed_epoch {
-                    return Some(DurabilityOutcome::Failed(msg.clone()));
-                }
+            if let Some((failed_epoch, ref msg)) = state.failed
+                && epoch >= failed_epoch
+            {
+                return Some(DurabilityOutcome::Failed(msg.clone()));
             }
             if epoch <= state.durable_epoch {
                 return Some(DurabilityOutcome::Durable);
@@ -830,10 +830,10 @@ impl DurabilityNotifier {
             state = new_state;
             if timeout_result.timed_out() {
                 // One more check before giving up.
-                if let Some((failed_epoch, ref msg)) = state.failed {
-                    if epoch >= failed_epoch {
-                        return Some(DurabilityOutcome::Failed(msg.clone()));
-                    }
+                if let Some((failed_epoch, ref msg)) = state.failed
+                    && epoch >= failed_epoch
+                {
+                    return Some(DurabilityOutcome::Failed(msg.clone()));
                 }
                 if epoch <= state.durable_epoch {
                     return Some(DurabilityOutcome::Durable);

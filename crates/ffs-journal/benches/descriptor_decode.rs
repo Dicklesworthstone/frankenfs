@@ -124,6 +124,12 @@ fn build_revoke(n: usize) -> Vec<u8> {
     b
 }
 
+// One flat scenario list: each parity assertion sits directly beside the
+// bench it guards, so splitting this would separate a claim from its proof.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario list, asserts beside their benches"
+)]
 fn bench(c: &mut Criterion) {
     let group_commit = group_commit_entries(false);
     let unsorted_group_commit = group_commit_entries(true);

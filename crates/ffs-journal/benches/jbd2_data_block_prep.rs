@@ -105,6 +105,12 @@ fn prep_chunk<F: Fn(&[u8]) -> Vec<u8>>(payload: &[u8], prep: F) -> u64 {
     acc
 }
 
+// The criterion group's scope deliberately spans its whole scenario set
+// before finish(); tightening it would reshape the measured region.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "criterion group scope is intentional"
+)]
 fn bench_jbd2_data_block_prep(c: &mut Criterion) {
     let full = vec![0xAB_u8; BS];
     let short = vec![0xCD_u8; 100];

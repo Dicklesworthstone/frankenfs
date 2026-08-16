@@ -119,7 +119,8 @@ fn make_region() -> Vec<u8> {
 }
 
 fn scalar_write(file: &File, region: &[u8]) {
-    for (block, bytes) in region.chunks_exact(BLOCK_SIZE).enumerate() {
+    let (blocks, _tail) = region.as_chunks::<BLOCK_SIZE>();
+    for (block, bytes) in blocks.iter().enumerate() {
         let offset = u64::try_from(block * BLOCK_SIZE).expect("offset fits u64");
         file.write_all_at(bytes, offset).expect("scalar pwrite");
     }

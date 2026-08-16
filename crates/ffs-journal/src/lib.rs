@@ -676,10 +676,11 @@ fn replay_jbd2_inner(
         }
 
         // Check sequence if following guided scan.
-        if let Some(expected) = expected_seq {
-            if header.sequence != expected && header.sequence != expected.wrapping_add(1) {
-                break;
-            }
+        if let Some(expected) = expected_seq
+            && header.sequence != expected
+            && header.sequence != expected.wrapping_add(1)
+        {
+            break;
         }
 
         let has_tail = journal_sb
@@ -749,10 +750,10 @@ fn replay_jbd2_inner(
             JBD2_BLOCKTYPE_COMMIT => {
                 stats.commit_blocks = stats.commit_blocks.saturating_add(1);
                 committed_sequences.insert(header.sequence);
-                if let Some(expected) = expected_seq {
-                    if header.sequence == expected {
-                        expected_seq = Some(expected.wrapping_add(1));
-                    }
+                if let Some(expected) = expected_seq
+                    && header.sequence == expected
+                {
+                    expected_seq = Some(expected.wrapping_add(1));
                 }
                 idx = idx.saturating_add(1);
             }
@@ -1161,15 +1162,15 @@ impl Jbd2Writer {
             let block = resolve_region_block(region, head)?;
             let raw = dev.read_block(cx, block)?;
 
-            if head == 0 {
-                if let Some(sb) = Jbd2Superblock::parse(raw.as_slice()) {
-                    is_64bit = sb.is_64bit();
-                    tag_format = sb.tag_format();
-                    has_checksum = sb.has_checksum();
-                    csum_seed = sb.csum_seed();
-                    head = head.saturating_add(1);
-                    continue;
-                }
+            if head == 0
+                && let Some(sb) = Jbd2Superblock::parse(raw.as_slice())
+            {
+                is_64bit = sb.is_64bit();
+                tag_format = sb.tag_format();
+                has_checksum = sb.has_checksum();
+                csum_seed = sb.csum_seed();
+                head = head.saturating_add(1);
+                continue;
             }
 
             let Some((next_head, next_seq)) =
@@ -2969,18 +2970,15 @@ fn scan_committed_tail_transaction(
     let mut idx = start_idx;
     let mut sequence = None;
     let mut saw_body = false;
-    let mut has_tail = false;
-    let mut tag_format = Jbd2TagFormat::Legacy;
-
     // Try to find if checksums are enabled to determine tail presence.
-    if let Ok(first_abs) = resolve_region_block(region, 0) {
-        if let Ok(first_raw) = dev.read_block(cx, first_abs) {
-            if let Some(sb) = Jbd2Superblock::parse(first_raw.as_slice()) {
-                has_tail = sb.has_checksum();
-                tag_format = sb.tag_format();
-            }
-        }
-    }
+    let (has_tail, tag_format) = if let Ok(first_abs) = resolve_region_block(region, 0)
+        && let Ok(first_raw) = dev.read_block(cx, first_abs)
+        && let Some(sb) = Jbd2Superblock::parse(first_raw.as_slice())
+    {
+        (sb.has_checksum(), sb.tag_format())
+    } else {
+        (false, Jbd2TagFormat::Legacy)
+    };
 
     while idx < region.blocks {
         let block = resolve_region_block(region, idx)?;
@@ -3057,7 +3055,7 @@ fn strict_revoke_entries(block: &[u8], is_64bit: bool, has_tail: bool) -> Option
     if r_count < JBD2_REVOKE_HEADER_SIZE || r_count > limit {
         return None;
     }
-    if (r_count - JBD2_REVOKE_HEADER_SIZE) % entry_size != 0 {
+    if !(r_count - JBD2_REVOKE_HEADER_SIZE).is_multiple_of(entry_size) {
         return None;
     }
 
@@ -3091,7 +3089,7 @@ fn strict_revoke_layout(block: &[u8], is_64bit: bool, has_tail: bool) -> Option<
     if r_count < JBD2_REVOKE_HEADER_SIZE || r_count > limit {
         return None;
     }
-    if (r_count - JBD2_REVOKE_HEADER_SIZE) % entry_size != 0 {
+    if !(r_count - JBD2_REVOKE_HEADER_SIZE).is_multiple_of(entry_size) {
         return None;
     }
 
@@ -3172,11 +3170,11 @@ fn parse_revoke_entries(block: &[u8], is_64bit: bool) -> Vec<BlockNumber> {
 
     while offset.saturating_add(entry_size) <= limit {
         if is_64bit {
-            if let Some(high) = read_be_u32(block, offset) {
-                if let Some(low) = read_be_u32(block, offset + 4) {
-                    let full = (u64::from(high) << 32) | u64::from(low);
-                    out.push(BlockNumber(full));
-                }
+            if let Some(high) = read_be_u32(block, offset)
+                && let Some(low) = read_be_u32(block, offset + 4)
+            {
+                let full = (u64::from(high) << 32) | u64::from(low);
+                out.push(BlockNumber(full));
             }
         } else if let Some(raw) = read_be_u32(block, offset) {
             out.push(BlockNumber(u64::from(raw)));
@@ -3462,7 +3460,7 @@ mod tests {
         fn write_contiguous_blocks(&self, _cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
             let block_size = usize::try_from(self.block_size)
                 .map_err(|_| FfsError::Format("block_size overflow".to_owned()))?;
-            if data.len() % block_size != 0 {
+            if !data.len().is_multiple_of(block_size) {
                 return Err(FfsError::Format(
                     "contiguous write size mismatch".to_owned(),
                 ));
@@ -3483,6 +3481,7 @@ mod tests {
                     .map_err(|_| FfsError::Format("block index overflow".to_owned()))?;
                 blocks.insert(BlockNumber(start.0 + index), bytes.to_vec());
             }
+            drop(blocks);
             Ok(())
         }
 
