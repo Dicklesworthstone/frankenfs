@@ -31,6 +31,7 @@ Live read: `python3 scripts/host_stability.py`
 """
 from __future__ import annotations
 
+import os
 import statistics as st
 import sys
 import time
@@ -39,8 +40,30 @@ import time
 MAX_DRIFT = 0.35
 # Oscillation within the sampling window, relative to its own median.
 MAX_SPREAD = 0.50
-# Backstop only. Stability cannot rescue a host with no spare CPU.
-ABSOLUTE_CEILING = 64.0
+# Backstop. Stability cannot rescue a host with no spare CPU — and this ceiling is
+# EMPIRICAL, not a round number. Across the vs-kernel runs banked on 2026-08-16:
+#
+#   loadavg median   outcome
+#    9.7, 10.1, 14.5  clean, tight, all A/A nulls passing
+#   43.7, 43.7        widest confidence intervals of the series
+#   52.6, 52.6        one kernel-arm null FAILED (1.1733x, CI excluding 1.0)
+#
+# Every run at or below ~20 produced clean nulls; every run at or above ~43
+# produced a wide or failing one. The ceiling therefore sits between them rather
+# than at nproc. Setting it AT nproc was a real defect, found by running this gate
+# against a host at loadavg 60.9 on 64 cores: drift 0.31 and spread 0.04 made it
+# report STABLE, and it was — stably saturated at ~95% utilisation, with no spare
+# CPU for the two cores the ABBA harness pins.
+#
+# Expressed as a fraction of nproc so it travels to other machines.
+def _default_ceiling() -> float:
+    try:
+        return max(8.0, (os.cpu_count() or 8) * 0.5)
+    except Exception:
+        return 8.0
+
+
+ABSOLUTE_CEILING = _default_ceiling()
 
 
 def drift(one: float, five: float) -> float:
@@ -143,9 +166,16 @@ def _selftest() -> int:
     assert not ok, why
     assert "spike" in why or "drift" in why, why
 
-    # A stable moderate window: the case the old gate refused. This is the whole
-    # point of the change.
-    ok, why = verdict([35.0, 35.2, 34.9], one=35.0, five=35.1, fifteen=35.0)
+    # A stable moderate window: the case the old gate refused, and the whole point
+    # of preferring stability over quiet.
+    #
+    # This case originally used 35.0, which was an ASSUMPTION dressed as a test: I
+    # had no measurement at that load, and when the ceiling became empirical (32)
+    # the two collided. The evidence covers <=14.5 (clean) and >=43.7 (wide or
+    # failing nulls) with nothing between, so the case now uses a value inside the
+    # evidenced-good range. Whether a stable host at 35 certifies well is UNTESTED
+    # and should be measured before any test asserts it.
+    ok, why = verdict([20.0, 20.2, 19.9], one=20.0, five=20.1, fifteen=20.0)
     assert ok, why
 
     # Ramping host, as observed at 71.89 / 61.15 / 41.21.
@@ -162,6 +192,29 @@ def _selftest() -> int:
     ok, why = verdict([80.0, 80.1, 79.9], one=80.0, five=80.0, fifteen=80.0)
     assert not ok, why
     assert "ceiling" in why, why
+
+    # The case that exposed the defect: STABLY saturated. drift and spread both
+    # look excellent, and on a 64-core box a ceiling of nproc admitted it.
+    ok, why = verdict([60.9, 61.0, 60.8], one=60.9, five=46.4, fifteen=35.1,
+                      ceiling=32.0)
+    assert not ok, why
+    assert "ceiling" in why, why
+    # ... and with the old permissive ceiling it wrongly passed, which is the
+    # regression this pins.
+    ok_old, _ = verdict([60.9, 61.0, 60.8], one=60.9, five=46.4, fifteen=35.1,
+                        ceiling=64.0, max_drift=0.35)
+    assert ok_old, "the old ceiling admitted a stably-saturated host"
+
+    # The empirical boundary: loads that produced clean nulls must still pass.
+    for good in (9.7, 10.1, 14.5):
+        ok, why = verdict([good, good, good], one=good, five=good, fifteen=good,
+                          ceiling=32.0)
+        assert ok, (good, why)
+    # ... and loads that produced wide or failing nulls must not.
+    for bad in (43.7, 52.6):
+        ok, why = verdict([bad, bad, bad], one=bad, five=bad, fifteen=bad,
+                          ceiling=32.0)
+        assert not ok, (bad, why)
 
     # A genuinely quiet AND stable host certifies.
     ok, why = verdict([9.7, 9.8, 9.6], one=9.7, five=9.7, fifteen=9.8)
@@ -189,7 +242,7 @@ def _selftest() -> int:
     ok, why, waited = wait_for_stable(budget=0.0, sample_seconds=0.0)
     assert isinstance(ok, bool) and waited >= 0.0, (ok, why, waited)
 
-    print("host_stability selftest: 10 cases pass")
+    print("host_stability selftest: 15 cases pass")
     return 0
 
 
