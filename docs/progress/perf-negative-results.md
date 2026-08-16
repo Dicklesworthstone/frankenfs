@@ -11474,3 +11474,73 @@ Harness `scripts`-local `memo_nt.sh` + `memo_nt.py`; candidate
 `isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, run locally
 because a FUSE mount runs only on the executing machine. Counted mechanism unchanged from
 the attribution entry: **32769 probes vs 32769 probes** at both slot counts.
+
+## 2026-08-16 — NULL on daemon work once the memo fits (counted attribution): the readdir+stat FUSE arm is 47.21% daemon at 4096 slots and 0% ± 2.5% at 65536, and the descent explains 88% of the 2.06x (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+The earlier pass established WHAT crosses the boundary — exactly one
+`security.capability` GETXATTR per entry, at both slot counts. It did not establish where
+the time inside our own arm goes, and the contention explanation offered for that has
+been RETRACTED, leaving it unexplained. This closes it.
+
+Dispatch counters are measured INSIDE the daemon, so unlike wall time they are not
+diluted by the client overhead that invalidated the previous attempt. They are cumulative
+and printed only at shutdown, so this runs K=1 and K=5 sweeps and differences them:
+`(K5 - K1) / 4` is the per-steady-sweep cost. 8 client threads, 32,768 entries.
+
+    slots=4096   K1=[gx 116986362  lk 109345290  rd 21392350  ga 151939  gx_count 32770]
+                 K5=[gx 533945503  lk 108716668  rd 17733151  ga 132065  gx_count 163842]
+      getxattr   3181.1 ns/entry   lookup -4.8   readdir -27.9   getattr -0.2
+      DAEMON     3148.3 ns/entry   -> 47.21% of the comparator's 6669.2 ns/entry FUSE arm
+
+    slots=65536  K1=[gx 124797002  lk 119237464  rd 16907515  ga 131231  gx_count 32770]
+                 K5=[gx 118472661  lk 113845353  rd 18047008  ga 174231  gx_count 32770]
+      getxattr    -48.3 ns/entry   lookup -41.1   readdir 8.7   getattr 0.3
+      DAEMON      -80.4 ns/entry   -> 0% of the comparator's 3231.8 ns/entry FUSE arm
+
+### The dispatch COUNTS settle it before any timing is read
+
+At 4096 slots `getxattr_dispatch_count` goes `32,770 -> 163,842` across four extra
+sweeps: `131,072 = 4 x 32,768`, i.e. **every sweep re-dispatches every entry, forever**.
+At 65,536 it goes `32,770 -> 32,770` — **zero further dispatches across four more
+sweeps**. The first sweep fills the table and nothing descends again. Those are exact
+counts, not timings, and they are the mechanism.
+
+### Detection floor, stated because three cells came out negative
+
+The negative per-entry figures (`-48.3`, `-41.1`, `-80.4`) are this differencing method's
+noise, not a saving: they bound its floor at about **±80 ns/entry**, which is `2.5%` of
+the 65,536 arm and `1.2%` of the 4096 arm. So the honest statement for the 65,536 case is
+**"daemon work is 0 ± 2.5% of the arm"** — the instrument could have seen 2.5% and saw
+nothing. That distinction is the whole difference between an underpowered measurement and
+a real null, and it is why the floor is quoted rather than the bare `-2.49%`.
+
+### The 2.06x is now 88% explained, and the residual is honest
+
+Removing the measured daemon work from the slow arm predicts what the fast arm should
+cost: `6669.2 - 3148.3 = 3520.9` ns/entry, against a measured `3231.8`. That is a
+predicted `1.894x` against a measured `2.064x`, so **the descent accounts for 88% of the
+effect in log terms** and ~12% remains.
+
+This inverts the earlier position. The previous pass had the counters explaining ~12% and
+88% dark, which is what motivated the contention hypothesis I have since withdrawn. The
+counters now explain 88% and 12% is residual. The residual is small enough to be
+second-order — the dispatch counter times the innermost call and misses request handling
+around it, and re-descending on every probe also costs cache pressure the counter cannot
+see — but **it is not measured, and no lever should be argued from it.**
+
+### What this settles for the row
+
+At the shipping default the readdir+stat FUSE arm is **roughly half our own filesystem
+work and half transport**. Sized to the directory, it is **essentially all transport** —
+the same wall the warm-stat row is against, and the same one round trip per entry. There
+is no remaining daemon-side lever on this row once the memo fits: the daemon's
+contribution is at the instrument's floor.
+
+Harness `scripts`-local `daemon_share.sh` + `daemon_share.py`; candidate
+`executing_elf_sha256 = d4278471dab01e7cfa496895c5a66f8a73894429bb2b4d80da5e050ba3ea32a0`,
+`isa=x86-64-v3`; `hostname=thinkstation1`, `executed_on=thinkstation1`, run locally
+because a FUSE mount runs only on the executing machine. Counted mechanism: **131072
+probes dispatched vs 0 probes dispatched** across four extra sweeps at the two slot
+counts. The comparator per-entry figures are medians of the banked 8-thread runs and are
+the trustworthy timing instrument for this row; this client's own wall times are NOT used
+anywhere in this entry.
