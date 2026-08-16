@@ -12318,3 +12318,77 @@ mount was removed first), so this is the same substrate as the banked rows.
 
 Counted mechanism: **37 of 37 contention samples over limit** with `max_external_busy_cpus=26`
 against a limit of `2`.
+
+## 2026-08-16 — REPLICATION of the campaign's worst row on a current ELF: btrfs readdir+stat `7.453004x`, BOTH A/A nulls clear and the ratio admitted, run refused post-hoc on socket contention (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+The worst measured vs-incumbent ratio, re-run ABBA in one invocation against live kernel
+btrfs on a freshly built PGO+v3 candidate. Two complete runs; the better one cleared every
+gate the ratio itself is judged by and was then refused by the post-hoc contention veto.
+
+    RUN 2 (quoted)
+    fuse_over_kernel_median = 7.453004
+    ci_low = 7.275531   ci_high = 7.494622
+    same-invocation A/A null control, kernel arm  0.998195  spread 1.012494  clear=true
+    same-invocation A/A null control, fuse arm    0.996389  spread 1.006569  clear=true
+    twice_null_margin_ratio = 1.025145
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+
+Both A/A nulls are inside the `1.025` spread limit and within 0.2% and 0.4% of one, the
+cleanest null pair this row has produced. The six arms run in ONE invocation
+(`same_invocation=true`, `independent_physical_arms=true`,
+`mounted_kernel_incumbent_isolation verdict=pass`), so the nulls control the window they
+were measured in.
+
+**It is still refused, and the refusal is post-hoc rather than a property of the ratio.**
+`external_load_during_run,samples=54,over_limit_samples=54,contended_fraction=1.0000,
+max_external_busy_cpus=16,peak_off_placement_mean_busy=0.255680,verdict=CONTENDED` — the
+placement CPUs were quiet (that is what the pre-run gate checks and it passed), but
+socket-wide memory bandwidth, LLC and boost budget are shared, and off-placement mean busy
+came to `25.6%` against a `25%` limit. Marginal, and over is over.
+
+### The replicate disagrees, and the disagreement is explained
+
+    RUN 1
+    fuse_over_kernel_median = 8.449308   ci [7.987785, 8.535220]
+    same-invocation A/A null control, kernel arm  0.975752  spread 1.028856  clear=FALSE
+    same-invocation A/A null control, fuse arm    0.996679  spread 1.007086  clear=true
+    verdict = BLOCKED_NULL
+
+The two CIs do NOT overlap — `[7.276, 7.495]` against `[7.988, 8.535]`, a 13% gap — so this
+is not a replication in the sense of two runs agreeing. But run 1 is inadmissible on its own
+terms: its kernel A/A null missed the 2% median-deviation limit at `2.42%`, meaning the
+kernel arm was not measuring itself consistently in that window. A run whose control arm
+disagrees with itself cannot be used to contradict one whose controls agree. Quoting run 2
+and recording run 1 as null-blocked is the disposition the ladder requires; averaging them,
+or quoting the worse number because it is worse, would both be wrong.
+
+### Relation to the banked figure
+
+Banked is `7.753405x` / `7.649395x` (spread `1.36%`). Run 2's `7.453004x` sits 3.9% below the
+banked pair on a NEWER ELF that carries every knob added during the freeze — all of them
+default-off, so the shipping path should be unchanged. Nothing is superseded: this run is
+refused, and a refused row cannot displace a banked one. It is recorded as evidence that the
+row reproduces in the same neighbourhood on a current binary.
+
+Provenance: `bench_evidence,binary_sha256=be270516fc27d50dd50ef5528474e01fd7587c11e8074f2d2c048685eda3d400`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`. `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place — rch
+cannot return a linked binary and a mount is local by necessity. Bootstrap median CI,
+`bootstrap_resamples=20000`, estimator `four_round_balanced_crossover_bootstrap_median_ci`.
+Artifacts on the LVM volume, same substrate as the banked rows.
+
+### One operational finding worth carrying, because the gate caught it
+
+The first attempt at this row was refused with `candidate is not the x86-64-v3 production
+ISA: missing compile_sse4_2=true`. `target/release-perf/ffs-cli` had been overwritten by
+another pane's plain `--release` build: sha `43a6e450...` -> `4ff317b1...`,
+`compile_sse4_2=false`, `pgo_profile_sha256=none`. The measurement candidate is a SHARED
+PATH, and a peer rebuilding it silently strips the ISA and PGO that every published ratio
+depends on. The ISA gate is what stood between that and a ratio measured on a baseline
+binary while claiming v3+PGO — exactly the confound bd-b9dug was opened for. Rebuild and
+re-check `candidate_identity` before every measurement; do not assume the binary you built
+is the binary that is there.
+
+Counted mechanism: **54 of 54 contention samples over limit**, `max_external_busy_cpus=16`
+against a limit of `2`.
