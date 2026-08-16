@@ -11809,3 +11809,78 @@ Build budget: `df -h /data` checked at **62G** free before starting, above the 6
 threshold; one incremental `release-perf` rebuild of `ffs-cli` (3m11s) into the existing
 `target-perf-iwzrx` tree, announced in Agent Mail as the second of the project's two
 slots. Disk unchanged at 62G afterwards. Nothing deleted.
+
+## 2026-08-16 — BLOCKED: create/delete storm cannot be attributed with the current instrument — every opcode it actually performs is uncounted (bd-btrfs-create-delete-storm, AzureBay)
+
+With readdir+stat and warm stat attributed, the worst remaining unattributed mounted row
+is the small-file create/delete storm at `2.358280x`. It is a MUTATING workload, so none
+of the capability-probe findings can carry over and it needed its own pass. It got one,
+and the pass produced a refusal rather than a share.
+
+Measured on the comparator itself — no managed-runtime workaround, because `bd-viil0` is
+fixed and the report now carries the counters:
+
+    mounted_kernel_ratio,...,workload=small_file_create_delete_storm,operations_per_observation=2000,pairs=12,observation_reducer=single,observation_repeats=1,fuse_over_kernel_median=2.304140,ci_low=2.184918,ci_high=2.344368,verdict=BLOCKED_NULL
+    mounted_kernel_throughput,...,kernel_median_wall_ns=152829492,fuse_median_wall_ns=340268822
+    fuse_a: getattr 80026/26122634ns  getxattr 40044/13505666ns  lookup 40001/21584855ns  readdir 12/30480ns
+    fuse_b: getattr 80026/28366664ns  getxattr 40044/13734376ns  lookup 40001/21924458ns  readdir 12/23814ns
+
+`2.304140x` is consistent with the banked `2.358280x`, so the row reproduces.
+
+### What the counters DO resolve, exactly
+
+The opcode ratio is instrument-independent and comes out clean:
+**getattr : getxattr : lookup = 2.00 : 1.00 : 1.00** per operation. The counts also
+cross-check the schedule — `80026 / 2 = 40013` operations served, against
+`(12 pairs + 8 warmup) x 2000 = 40000` expected, so the derivation is confirmed by a
+number nobody chose.
+
+Counted dispatch is `1530.6` ns/op against a `170134.4` ns/op arm, i.e. **0.90%**.
+
+### Why that 0.90% is NOT an attribution, and this is the whole point
+
+**The daemon has dispatch counters for getattr, getxattr, lookup and readdir. This
+workload performs create, fsyncdir, delete, fsyncdir. Not one of the opcodes it exists to
+measure is counted.**
+
+So `0.90%` is a strict LOWER BOUND on daemon filesystem work, and the 99.1% it leaves is
+not "transport" the way it was for warm stat — it is *unmeasured*, and it certainly
+contains the creates, the unlinks and two directory fsyncs per operation, which is where
+a mutating workload's cost must be. Reporting `0.90%` as this row's daemon share would be
+the same error as dividing an unpinned daemon by a pinned arm: an arithmetically valid
+number that answers a different question than the one asked.
+
+The `2:1:1` metadata traffic is real and worth having — it says every create/delete
+operation drags two getattrs, a lookup and a capability probe behind it, which is the
+same per-path-op probe already banked for the read rows showing up on the write path. But
+it is the *incidental* traffic, not the work.
+
+### The instrument gap, stated so the next attempt does not repeat this
+
+`RequestOp` covers exactly four read-metadata opcodes. Attributing any mutating row —
+create/delete storm at `2.36x`, parallel metadata writes at `1.93x`, fsync/journal commit
+at `1.98x`, bulk durable write — requires dispatch counters on the mutation path:
+`create`, `unlink`, `mkdir`, `rmdir`, `fsync`, `fsyncdir`, `setattr`, `write`. Three of
+the five remaining LOSE rows in the mounted scorecard are mutating, so this is not a
+one-row gap. Filed as `bd-i353e`.
+
+Note this compounds with the separate finding that `59.2%`-`98.8%` of the daemon's own
+CPU is outside dispatch even for opcodes that ARE counted (`bd-4zokj`): a mutating row
+needs both the missing opcodes AND the whole-request timer before its arm can be
+decomposed.
+
+### Not claimed
+
+The run is `BLOCKED_NULL` (host at load average 20.6; the pre-run placement gate refused
+two earlier attempts outright) and no ratio is banked from it — the banked `2.358280x`
+stands unchanged. Nothing here says the daemon is or is not the cost on this row; it says
+the instrument cannot answer, and names what it would take.
+
+Provenance: candidate
+`executing_elf_sha256 = 672ccf093608b1cb8734c68043f3a93fb62e64aeed450033b784309df6f8c8d1`,
+`pgo_profile_sha256 = 6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc`,
+`isa=x86-64-v3`, gate `verdict=pass`; `hostname=thinkstation1`,
+`executed_on=thinkstation1`. Counted mechanism: **80026 requests dispatched for getattr vs
+40044 for getxattr and 40001 for lookup**, a 2:1:1 ratio holding across both FUSE arms.
+No build was started for this row; `df -h /data` was 63G at the time and the existing ELF
+already carried the fix.
