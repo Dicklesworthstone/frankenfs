@@ -10185,3 +10185,79 @@ warm-stat loss. It would not be safe if these were wins.
 Disk consumed: run 1 `84,890,284,032 -> 83,798,372,352` free = **1.02 GiB**. Run 2 spent
 **1.2 MiB**, because the image directory is reused. Against a floor that demanded
 120 GiB.
+
+## 2026-08-16 — REJECT (refused, not measured-and-ignored): ext4 mounted parallel metadata write, 2.66x / 2.82x with non-overlapping intervals and a sign-flipping kernel null (bd-ext4-parallel-meta-1p51x-ex8qj, AzureBay)
+
+Same instrument, same ELFs and same session as the warm-stat entry above; the derived
+free-space floor is what let this workload run at all. Unlike warm stat, **it does not
+replicate, and the row is refused.** Recording it because a refusal with its evidence
+is worth more than an unrepeated number, and because the contrast with warm stat is
+the useful part.
+
+    run 1  mounted_kernel_throughput,filesystem=ext4,workload=parallel_metadata_write,operations_per_observation=2000,kernel_median_wall_ns=32113494,fuse_median_wall_ns=85342830,kernel_operations_per_second=62279.116,fuse_operations_per_second=23434.892
+    run 1  mounted_kernel_ratio,filesystem=ext4,metric=wall_ns,workload=parallel_metadata_write,requested_client_threads=8,pairs=12,observation_reducer=single,observation_repeats=1,fuse_over_kernel_median=2.663435,ci_low=2.658290,ci_high=2.746037,admitted=false,verdict=BLOCKED_NULL,bootstrap_resamples=20000,cv_used=false
+    run 2  mounted_kernel_throughput,filesystem=ext4,workload=parallel_metadata_write,operations_per_observation=2000,kernel_median_wall_ns=28956956,fuse_median_wall_ns=81203202,kernel_operations_per_second=69068.033,fuse_operations_per_second=24629.570
+    run 2  mounted_kernel_ratio,filesystem=ext4,metric=wall_ns,workload=parallel_metadata_write,requested_client_threads=8,pairs=12,observation_reducer=single,observation_repeats=1,fuse_over_kernel_median=2.819270,ci_low=2.815767,ci_high=2.852170,admitted=false,verdict=BLOCKED_NULL,bootstrap_resamples=20000,cv_used=false
+
+The two A/A null controls each arm carries, measured same-invocation inside the very
+runs above rather than from a separate calibration:
+
+    run 1  mounted_kernel_null,filesystem=ext4,workload=parallel_metadata_write,arm=kernel,median=1.134803,median_deviation_from_one=0.134803,maximum_median_deviation=0.020000,median_within_limit=false,ci_low=0.924119,ci_high=1.167663,symmetric_spread=1.167663,maximum=1.025000,clear=false
+    run 1  mounted_kernel_null,filesystem=ext4,workload=parallel_metadata_write,arm=fuse,median=1.038982,median_deviation_from_one=0.038982,ci_low=1.001054,ci_high=1.064244,symmetric_spread=1.064244,maximum=1.025000,clear=false
+    run 2  mounted_kernel_null,filesystem=ext4,workload=parallel_metadata_write,arm=kernel,median=0.915179,median_deviation_from_one=0.084821,ci_low=0.843346,ci_high=1.068810,symmetric_spread=1.185753,maximum=1.025000,clear=false
+    run 2  mounted_kernel_null,filesystem=ext4,workload=parallel_metadata_write,arm=fuse,median=1.005032,median_deviation_from_one=0.005032,ci_low=0.944428,ci_high=1.043008,symmetric_spread=1.058841,maximum=1.025000,clear=false
+
+These are same-invocation A/A null controls: each pairs two identical arms inside the
+same run that produced the ratio, so no cross-run or cross-host comparison is involved
+in the null itself. Each `ci_low`/`ci_high` pair, on the null lines and the ratio lines
+alike, is a bootstrap median 95% confidence interval, resampled 20,000 times.
+Provenance identical to the warm-stat entry:
+`executing_elf_sha256 = 471344289847c8f9eda3dd7c3db3d2a385a5bb4ef514451c2f6e3baa5aa539bc`
+(driver, self-reported at run time) and candidate
+`e6cd5793384bdb6d6fff113e13fd9e1392753fadaf4ab0a15663e7912dba5bf0`, both built on
+`thinkstation1`. Host identity, from the harness itself — no rch worker took part,
+because a FUSE mount can only run on the executing machine:
+
+    binary_provenance,driver_built_on=thinkstation1,candidate_built_on=thinkstation1,executed_on=thinkstation1,retrieval=built_in_place_on_executing_host
+    baseline_host,hostname=thinkstation1,cpu_model=AMD Ryzen Threadripper PRO 5975WX 32-Cores,physical_cores=32,logical_threads=64,numa_nodes=1,placement_scope=same_llc
+
+Both runs are `executed_on=thinkstation1` and `hostname=thinkstation1`, so this is a
+same-host pair; the non-replication below is NOT a cross-worker artifact.
+
+### Three independent reasons this is not bankable, any one of which suffices
+
+**The intervals do not overlap.** `[2.658290, 2.746037]` and `[2.815767, 2.852170]` are
+disjoint with a gap between them. Two runs of one configuration on one host that
+exclude each other are not a replication; they are evidence that something outside the
+configuration moved.
+
+**The kernel A/A null flips sign and is enormous.** `1.134803` in run 1 against
+`0.915179` in run 2 — `+13.5%` then `-8.5%`. The replication convention excuses a
+failing null only when both runs are off in the SAME direction by a similar amount, and
+this is the opposite of that. A null this large also dwarfs the thing being measured's
+run-to-run difference, so the ratio gap above is fully explained by instrument noise.
+
+**Run 2 was measured through a storm.** `external_load_during_run` reports peak **48
+busy CPUs** and peak off-placement mean busy **70.1%** across 21 of 21 samples, against
+limits of 2 CPUs and 10% of samples. Run 1 was already `CONTENDED` at 13 CPUs / 23.5%.
+This is the noisiest pair of runs in the session and the only one where the nulls got
+badly worse between runs.
+
+`observation_repeats=1` is forced here and is part of the story: mutating workloads
+require one durability boundary per timed row, so this workload cannot use the
+min-of-N reduction that damps the read-only workloads. It is structurally the noisiest
+row on the instrument, which is exactly why it needs a quiet window rather than more
+pairs.
+
+### Do not difference this against the bead's 1.51x
+
+That figure is a different configuration. This ran `--operations 2000` with 8 client
+threads on a 256 MiB image at `--pairs 12`. Nothing here licenses a claim that the ext4
+parallel-metadata gap grew from `1.51x` to `2.8x`, and the nulls say this instrument
+could not have detected such a change today even if it were real. Four-arm post-parity
+passed on both runs (`tree_sha256=5dce73d82e989d...`), so the arms did the same work;
+only the timing is unusable.
+
+Retry predicate: a genuinely quiet window, and consider raising `--pairs` only AFTER
+the kernel null lands inside 2% twice in a row — more pairs against a sign-flipping
+null buys precision on a biased estimate.
