@@ -12543,3 +12543,62 @@ CI, `bootstrap_resamples=20000`. LVM volume, same substrate as the banked rows.
 
 Counted mechanism: **48 of 48 contention samples over limit**, `max_external_busy_cpus=48`
 against a limit of `2`.
+
+## 2026-08-16 — THIRD clean-null run of the worst row: btrfs readdir+stat `8.065190x`; three admitted runs now span `9.63%` and the banked figure sits inside them (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+Fifth ABBA run today, one invocation, live kernel btrfs incumbent, private candidate copy.
+
+    RUN 5 (quoted)
+    bootstrap median 8.065190x with bootstrap median CI [8.054564, 8.109706], 20000 resamples
+    same-invocation A/A null control, kernel arm  1.005042  spread 1.017867  clear=true
+    same-invocation A/A null control, fuse arm    0.999057  spread 1.018997  clear=true
+    twice_null_margin_ratio = 1.038355
+    directional_claim_clear = true   admitted = true   verdict = HONEST_LOSS
+
+Refused post-hoc as before: `external_load_during_run,samples=46,over_limit_samples=46,
+contended_fraction=1.0000,max_external_busy_cpus=23,peak_off_placement_mean_busy=0.317413,
+verdict=CONTENDED`.
+
+### The three clean-null runs, which is now enough points to say something stable
+
+    run 2   7.453004   CI [7.275531, 7.494622]   contention 0.2557
+    run 5   8.065190   CI [8.054564, 8.109706]   contention 0.3174
+    run 3   8.170852   CI [8.113987, 8.217506]   contention 0.2934
+
+    median of the three = 8.065190      total spread = 9.63%
+    banked 7.753405x lies INSIDE the observed range
+
+Two things are worth stating precisely. **Runs 3 and 5 nearly agree**: their CIs are disjoint
+by `0.05%` — 8.109706 against 8.113987 — which is agreement in every practical sense and
+disagreement by the letter of the interval. Run 2 at `7.453004x` is the outlier, not the
+consensus. So the row's central estimate on this ELF is around `8.07x`, with the banked
+`7.753405x`/`7.649395x` sitting 4% below it.
+
+**And the contention ordering still does not explain it.** Sorted by contention the ratios go
+`7.453 -> 8.171 -> 8.065` for `0.2557 -> 0.2934 -> 0.3174`: the highest-contention run is not
+the worst ratio, confirming the correction banked earlier today that "more contention, worse
+ratio" was a two-point fit. Three clean-null points now, and the relationship still is not
+monotonic. Whatever moves this row between windows by ~10% remains unattributed, and I am
+recording that as an open question rather than fitting a third story to it.
+
+### Disposition
+
+Nothing is claimed and nothing is superseded. Every one of today's five runs was refused —
+three on the post-hoc contention veto despite clean nulls, two on the A/A null gate itself.
+The banked pair stands. What this entry adds is that the row now has THREE independent
+clean-null measurements on a current PGO+v3 ELF, they span 9.63%, two of the three agree to
+within 0.05% of interval separation, and the banked figure falls inside the range — which is
+the strongest statement available about reproducibility on this host without a genuinely
+quiet window.
+
+Provenance: `bench_evidence,binary_sha256=ffe9766047b1b137a2d58edc6a1ca2a5fffdcb4396101ce0f8820380d0d9b072`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`,
+`isa=x86-64-v3`, `candidate_identity verdict=pass`, `RCH_WORKER=none`,
+`hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place from a
+PRIVATE copy of the candidate — `target/release-perf/ffs-cli` has been overwritten by other
+panes' plain builds twice today, and the copy is what makes the ELF sha above trustworthy
+across a multi-run turn. Estimator `four_round_balanced_crossover_bootstrap_median_ci`. LVM
+volume, same substrate as the banked rows.
+
+Counted mechanism: **46 of 46 contention samples over limit**, `max_external_busy_cpus=23`
+against a limit of `2`.
