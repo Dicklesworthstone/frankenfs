@@ -96,6 +96,108 @@ pub fn capability_memo_slots() -> usize {
     LastMissingCapabilityXattr::slots_from_env()
 }
 
+/// FUSE-over-io_uring transport configuration (bd-vbqc6).
+///
+/// # Why this exists before the transport does
+///
+/// The 2026-08-01 io_uring attempt called `session.run_with_io_uring(4, 128 * 1024)`
+/// with BOTH values hardcoded at the call site. It was measured on 512 creates and
+/// came back `1.487x` slower and NULL-BLOCKED, and the transport was disabled.
+/// 128 KiB per queue entry for requests that are a few hundred bytes is three
+/// orders of magnitude of buffer that never amortises — a property of the
+/// CONFIGURATION, not of the transport. Restoring that call verbatim would
+/// re-run the experiment that already failed.
+///
+/// So the configuration surface lands first, with its own tests, and the restore
+/// wires the call site to these instead of to literals. These functions carry no
+/// dependency on the `io-uring` crate: they parse and clamp, nothing more, which
+/// is what lets them be written and gated while the transport itself is still
+/// out of the build.
+pub mod io_uring_config {
+    /// Default queue entries. Matches the depth the previous attempt used; the
+    /// depth was never the suspect, the payload was.
+    pub const DEFAULT_QUEUE_DEPTH: usize = 4;
+    /// Default bytes per queue entry: ONE PAGE, not 128 KiB.
+    ///
+    /// Sized for the workload the transport should first be tested on. Warm stat
+    /// issues exactly one `getxattr(security.capability)` per operation and its
+    /// reply is tens of bytes; a page is ample and is the smallest unit the
+    /// kernel will map anyway. A readdir-heavy workload needs more — that is what
+    /// the knob is for, and why the value is reported on the mount knob line
+    /// rather than assumed.
+    pub const DEFAULT_PAYLOAD_BYTES: u32 = 4096;
+    /// Refuse anything larger than this per entry. 128 KiB is deliberately NOT
+    /// reachable by accident: it is the value that produced the null-blocked
+    /// loss, so requesting it must be explicit and visible on the knob line.
+    pub const MAX_PAYLOAD_BYTES: u32 = 64 * 1024;
+    /// Refuse a depth that would pin an unbounded number of buffers.
+    pub const MAX_QUEUE_DEPTH: usize = 64;
+
+    /// Pure half of the enable knob, so the spelling is testable without
+    /// mutating process-global environment (racy under the parallel harness and
+    /// `unsafe` from edition 2024). Opt-in: a typo fails CLOSED to the classic
+    /// `/dev/fuse` transport.
+    #[must_use]
+    pub fn enabled_from_value(raw: Option<&str>) -> bool {
+        let Some(raw) = raw else {
+            return false;
+        };
+        let t = raw.trim();
+        t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+    }
+
+    /// Queue depth, clamped to `[1, MAX_QUEUE_DEPTH]`, defaulting on anything
+    /// unparseable. Clamping rather than erroring keeps a bad knob from taking
+    /// down a mount, and the effective value is reported so a clamped run cannot
+    /// be mistaken for the requested one.
+    #[must_use]
+    pub fn queue_depth_from_value(raw: Option<&str>) -> usize {
+        raw.and_then(|r| r.trim().parse::<usize>().ok())
+            .filter(|d| *d > 0)
+            .unwrap_or(DEFAULT_QUEUE_DEPTH)
+            .min(MAX_QUEUE_DEPTH)
+    }
+
+    /// Bytes per queue entry, clamped to `[64, MAX_PAYLOAD_BYTES]`.
+    ///
+    /// The floor exists because a payload smaller than a FUSE header cannot hold
+    /// any reply at all, and silently accepting one would fail at runtime rather
+    /// than at configuration time.
+    #[must_use]
+    pub fn payload_bytes_from_value(raw: Option<&str>) -> u32 {
+        raw.and_then(|r| r.trim().parse::<u32>().ok())
+            .filter(|b| *b >= 64)
+            .unwrap_or(DEFAULT_PAYLOAD_BYTES)
+            .min(MAX_PAYLOAD_BYTES)
+    }
+}
+
+/// Whether the FUSE-over-io_uring transport is requested (bd-vbqc6).
+#[must_use]
+pub fn io_uring_enabled() -> bool {
+    io_uring_config::enabled_from_value(std::env::var("FFS_FUSE_IO_URING").ok().as_deref())
+}
+
+/// Effective io_uring queue depth for this process (bd-vbqc6).
+#[must_use]
+pub fn io_uring_queue_depth() -> usize {
+    io_uring_config::queue_depth_from_value(
+        std::env::var("FFS_FUSE_IO_URING_QUEUE_DEPTH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Effective io_uring payload bytes per queue entry for this process (bd-vbqc6).
+#[must_use]
+pub fn io_uring_payload_bytes() -> u32 {
+    io_uring_config::payload_bytes_from_value(
+        std::env::var("FFS_FUSE_IO_URING_PAYLOAD_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Whether the range-leaf capability memo backend is selected
 /// (bd-btrfs-readdir-stat-8x-8y7vp).
 ///
@@ -5283,8 +5385,15 @@ mod tests {
         memo.remember(InodeNumber(77), &attr);
 
         let first = memo.take(InodeNumber(77));
-        assert!(first.is_some(), "the hand-off must answer the getattr it was stored for");
-        assert_eq!(first.expect("first").size, 4096, "and answer with the stored attributes");
+        assert!(
+            first.is_some(),
+            "the hand-off must answer the getattr it was stored for"
+        );
+        assert_eq!(
+            first.expect("first").size,
+            4096,
+            "and answer with the stored attributes"
+        );
         assert!(
             memo.take(InodeNumber(77)).is_none(),
             "a second getattr must NOT be answered from the memo — single-use is \
@@ -5314,8 +5423,13 @@ mod tests {
         reborn.generation = 8;
         memo.remember(InodeNumber(90), &reborn);
 
-        let got = memo.take(InodeNumber(90)).expect("the current generation answers");
-        assert_eq!(got.generation, 8, "the newer generation's attributes are the live ones");
+        let got = memo
+            .take(InodeNumber(90))
+            .expect("the current generation answers");
+        assert_eq!(
+            got.generation, 8,
+            "the newer generation's attributes are the live ones"
+        );
         assert_eq!(got.size, 512, "and its attributes, not the previous life's");
     }
 
@@ -5333,9 +5447,18 @@ mod tests {
             memo.remember(InodeNumber(ino), &attr);
         }
         memo.forget(InodeNumber(12));
-        assert!(memo.take(InodeNumber(12)).is_none(), "the mutated inode is dropped");
-        assert!(memo.take(InodeNumber(11)).is_some(), "its neighbours survive");
-        assert!(memo.take(InodeNumber(13)).is_some(), "its neighbours survive");
+        assert!(
+            memo.take(InodeNumber(12)).is_none(),
+            "the mutated inode is dropped"
+        );
+        assert!(
+            memo.take(InodeNumber(11)).is_some(),
+            "its neighbours survive"
+        );
+        assert!(
+            memo.take(InodeNumber(13)).is_some(),
+            "its neighbours survive"
+        );
         // Forgetting an inode that was never stored must not panic: mutations
         // arrive for inodes no readdirplus ever touched.
         memo.forget(InodeNumber(999_999));
@@ -5353,7 +5476,10 @@ mod tests {
         let mut attr = make_test_attr(FfsFileType::RegularFile, 4096);
         attr.ino = InodeNumber(5);
         off.remember(InodeNumber(5), &attr);
-        assert!(off.take(InodeNumber(5)).is_none(), "disabled must not answer");
+        assert!(
+            off.take(InodeNumber(5)).is_none(),
+            "disabled must not answer"
+        );
         {
             let state = off.state.lock().expect("memo lock");
             assert!(
@@ -5364,7 +5490,10 @@ mod tests {
         }
 
         for on in ["1", "true", "ON", " on "] {
-            assert!(ReaddirplusAttrMemo::enabled_from_value(Some(on)), "{on:?} enables");
+            assert!(
+                ReaddirplusAttrMemo::enabled_from_value(Some(on)),
+                "{on:?} enables"
+            );
         }
         for bad in ["", "0", "false", "off", "yes", "ture"] {
             assert!(
@@ -5372,7 +5501,94 @@ mod tests {
                 "{bad:?} must fail CLOSED to the shipping path"
             );
         }
-        assert!(!ReaddirplusAttrMemo::enabled_from_value(None), "unset means off");
+        assert!(
+            !ReaddirplusAttrMemo::enabled_from_value(None),
+            "unset means off"
+        );
+    }
+
+    /// THE NEGATIVE CASE, and the reason this module exists.
+    ///
+    /// The 2026-08-01 io_uring attempt ran at 128 KiB per queue entry because the
+    /// value was hardcoded at the call site, was measured on creates, and came
+    /// back 1.487x slower and NULL-BLOCKED. This pins that the defect cannot
+    /// recur by default: the default payload is ONE PAGE, and 128 KiB is not even
+    /// reachable — it exceeds MAX_PAYLOAD_BYTES and clamps down. Asking for the
+    /// configuration that produced the loss must be impossible by accident.
+    #[test]
+    fn io_uring_payload_defaults_to_a_page_and_cannot_reach_128k_bd_vbqc6() {
+        use io_uring_config::*;
+
+        assert_eq!(
+            payload_bytes_from_value(None),
+            4096,
+            "the DEFAULT must be a page, not the 128 KiB that produced the \
+             null-blocked loss"
+        );
+        assert_eq!(DEFAULT_PAYLOAD_BYTES, 4096);
+
+        // The exact configuration of the failed run, requested explicitly.
+        assert_eq!(
+            payload_bytes_from_value(Some("131072")),
+            MAX_PAYLOAD_BYTES,
+            "128 KiB must CLAMP rather than be honoured; the run that used it is \
+             the reason this ceiling exists"
+        );
+        assert!(
+            MAX_PAYLOAD_BYTES < 131_072,
+            "the ceiling must sit below the value that lost, or it is not a ceiling"
+        );
+
+        // A payload too small to hold a FUSE header is a configuration error, not
+        // a runtime one: reject it here rather than failing on the first reply.
+        assert_eq!(
+            payload_bytes_from_value(Some("8")),
+            4096,
+            "a sub-header payload falls back to the default instead of being honoured"
+        );
+        for junk in ["", "abc", "-1", "4096.5"] {
+            assert_eq!(
+                payload_bytes_from_value(Some(junk)),
+                4096,
+                "{junk:?} must fall back to the default"
+            );
+        }
+        // A sane explicit value is honoured, or the knob would be useless.
+        assert_eq!(payload_bytes_from_value(Some(" 8192 ")), 8192);
+    }
+
+    /// Depth clamps and defaults; the transport knob is opt-in and fails closed.
+    #[test]
+    fn io_uring_knobs_are_opt_in_and_clamped_bd_vbqc6() {
+        use io_uring_config::*;
+
+        for on in ["1", "true", "ON", " on "] {
+            assert!(enabled_from_value(Some(on)), "{on:?} must enable");
+        }
+        for off in ["", "0", "false", "off", "yes", "ture"] {
+            assert!(
+                !enabled_from_value(Some(off)),
+                "{off:?} must fail CLOSED to the classic /dev/fuse transport"
+            );
+        }
+        assert!(
+            !enabled_from_value(None),
+            "unset must mean the classic transport — the io_uring path has never \
+             produced an admissible measurement and must not be a default"
+        );
+
+        assert_eq!(queue_depth_from_value(None), DEFAULT_QUEUE_DEPTH);
+        assert_eq!(
+            queue_depth_from_value(Some("0")),
+            DEFAULT_QUEUE_DEPTH,
+            "0 is not a depth"
+        );
+        assert_eq!(
+            queue_depth_from_value(Some("9999")),
+            MAX_QUEUE_DEPTH,
+            "depth clamps"
+        );
+        assert_eq!(queue_depth_from_value(Some("8")), 8);
     }
 
     /// The backend knob is opt-in and fails CLOSED, so a typo cannot silently
@@ -16558,7 +16774,10 @@ mod tests {
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             readonly_xattr_cache: ReadonlyXattrCache::default(),
-            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, false),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(
+                READDIRPLUS_ATTR_MEMO_SLOTS,
+                false,
+            ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
@@ -18252,7 +18471,10 @@ AllowOther"#;
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(8),
             readonly_xattr_cache: ReadonlyXattrCache::default(),
-            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, false),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(
+                READDIRPLUS_ATTR_MEMO_SLOTS,
+                false,
+            ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
