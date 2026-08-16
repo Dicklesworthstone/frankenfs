@@ -12133,3 +12133,59 @@ Counted mechanism: **67 of 67 contention samples over limit** in each run, with
 `max_external_busy_cpus=22` and `23` against a limit of `2` — the refusal is itself a count, not
 a judgement. Reports preserved at `/data/tmp/frankenfs-mounted-kernel/run_1786891969_262502156_372530/`
 and `run_1786892101_911482027_395758/`.
+
+## 2026-08-16 — UNDECIDABLE, not a win: the range-leaf capability memo measures `0.858512x` candidate-B-over-candidate-A but the run's minimum decidable effect was `1.240365` (bd-btrfs-readdir-stat-8x-8y7vp, AzureBay)
+
+First measurement of the range-leaf memo backend landed in `895b6884`, as a six-arm
+within-window candidate-vs-candidate crossover on ext4 readdir+stat, 32,768 entries, 12 pairs.
+**The effect is directionally favourable and the run CANNOT DECIDE IT. No win is claimed.**
+
+    candidate_b_over_candidate_a_median = 0.858512
+    ci_low = 0.843803   ci_high = 0.865238
+    minimum_decidable_effect_ratio = 1.240365
+    achieved_resolution_ratio      = 1.185111
+    candidate_claim_clear = false   admitted = false   verdict = BLOCKED_NULL
+
+A `0.8585` median is a ~14.1% improvement. The instrument in this window could not resolve
+anything smaller than **24.0%**. An effect measured beneath its own detection floor is not a
+small win, it is an unmeasured quantity that happens to have a favourable point estimate, and
+this campaign has already retracted one flagship lever (`FFS_FUSE_WORKERS`, `1.923x`) that
+looked exactly this convincing. Quoting `0.8585x` as a result would repeat that mistake.
+
+**Why it could not resolve.** All three A/A nulls failed their spread gate against a `1.025`
+maximum: kernel `symmetric_spread=1.177668`, fuse `1.113717`, fuse_candidate_b `1.031694`. The
+socket was saturated throughout — `external_load_during_run,samples=107,over_limit_samples=107,
+contended_fraction=1.0000,max_external_busy_cpus=48,peak_off_placement_mean_busy=0.999583,
+verdict=CONTENDED`. Off-placement CPUs were essentially 100% busy for the whole measured region,
+which is a host condition, not a property of the lever.
+
+**What this run DID establish, and it is the part worth keeping.** The one-ELF A/B machinery
+works end to end:
+
+    mounted_kernel_candidate_identity,one_elf=true,
+      elf_sha256=af6de55e7089f9b9091cc992fcb3a9c1c23a581f060b092789c40977e39a1c53,
+      candidate_a_runtime_knobs="...capability_memo=true,capability_memo_slots=4096,capability_memo_bitmap=false",
+      candidate_b_runtime_knobs="...capability_memo=true,capability_memo_slots=4096,capability_memo_bitmap=true",
+      configurations_differ=true,knob_divergence_proof=daemon_self_reported_effective_values,verdict=pass
+
+Both arms ran from ONE ELF with the backend selected by a per-store field, and the daemon's own
+self-reported effective knobs prove the arms actually differed — the comparator refuses an A/B
+whose arms self-report identical knobs, so without that line on `mount_candidate_knobs` this
+measurement would have been inadmissible before it started. Worker threads and CPU pinning both
+`clear=true` on every arm.
+
+**What would decide it.** The effect, if real at ~14%, needs either a quiet window (the nulls
+must come inside `1.025`) or more pairs — `--pairs 48` rather than 12, which the campaign has
+already measured as taking the claim gate from 2.8-4.9% down to ~1.07% in a quiet window. Buying
+pairs is the known route; inventing an estimator is not.
+
+Provenance: `bench_evidence,binary_sha256=52c54c0167174b8c2bbf00ba44ea77e4d2639bd604ffa39a0fec504ce4c8d7ab`
+(driver in-process self-report). Candidate `af6de55e7089f9b9091cc992fcb3a9c1c23a581f060b092789c40977e39a1c53`,
+`pgo_profile_sha256=11f45ddee071327205c03d95d281b3394f6ff0cd00116ca221a422759cc202d2`, `isa=x86-64-v3`.
+`RCH_WORKER=none`, `hostname=thinkstation1`, worker: `thinkstation1-local`, built and executed in place.
+Candidate-B bootstrap median `0.858512x` with bootstrap median CI `[0.843803, 0.865238]`,
+`bootstrap_resamples=20000`, estimator `within_window_paired_candidate_crossover`.
+Report preserved at `/data/tmp/frankenfs-mounted-kernel/run_1786892581_115098753_459105/`.
+
+Counted mechanism: **107 of 107 contention samples over limit**, `max_external_busy_cpus=48`
+against a limit of `2` — the refusal is a count, not a judgement.
