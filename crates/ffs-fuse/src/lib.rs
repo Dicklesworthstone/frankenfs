@@ -4219,7 +4219,7 @@ pub fn mount(
     ops: Box<dyn FsOps>,
     mountpoint: impl AsRef<Path>,
     options: &MountOptions,
-) -> Result<(), FuseError> {
+) -> Result<MetricsSnapshot, FuseError> {
     validate_mount_options(options)?;
     let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
@@ -4232,7 +4232,12 @@ pub fn mount(
     } else {
         session.run()?;
     }
-    Ok(())
+    // bd-viil0: the session has run to completion, so these are the FINAL counters.
+    // Returning them rather than `()` is what lets the STANDARD mount runtime report
+    // real dispatch attribution instead of hand-constructed zeros — the managed
+    // runtime already had this via `MountHandle::wait`, and the asymmetry silently
+    // blocked every per-op attribution on the mounted comparator surface.
+    Ok(fs.inner.metrics.snapshot())
 }
 
 /// Mount a FrankenFS filesystem in the background, returning a session handle.

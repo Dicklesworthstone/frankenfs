@@ -6982,7 +6982,7 @@ fn mount_with_fuse(
     allow_other: bool,
     auto_unmount: bool,
     writeback_cache: WritebackCacheMode,
-) -> Result<()> {
+) -> Result<ffs_fuse::MetricsSnapshot> {
     let opts = MountOptions {
         read_only: !read_write,
         allow_other,
@@ -8057,7 +8057,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
 
     match runtime.mode {
         MountRuntimeMode::Standard => {
-            mount_with_fuse(
+            let metrics = mount_with_fuse(
                 Arc::clone(&open_fs),
                 mountpoint,
                 options.read_write,
@@ -8065,6 +8065,20 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                 auto_unmount,
                 WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
             )?;
+            // bd-viil0: emit the same shutdown metrics line the managed runtime emits.
+            // Without this the standard runtime — the one the mounted comparator
+            // actually uses — produced no `mount_dispatch_metrics` at all, so every
+            // banked mounted report carried "unreported_by_this_elf" and no per-op
+            // attribution could be reproduced from it by anyone else.
+            log_mount_shutdown_metrics(
+                &operation_id,
+                scenario_id,
+                match &open_fs.flavor {
+                    FsFlavor::Ext4(_) => "ext4",
+                    FsFlavor::Btrfs(_) => "btrfs",
+                },
+                &metrics,
+            );
             emit_mount_adaptive_runtime_shutdown_summary(
                 MountAdaptiveRuntimeShutdownContext {
                     image_path,
@@ -8077,23 +8091,10 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                     summary_config: &options.adaptive_runtime_summary,
                 },
                 &MountAdaptiveRuntimeShutdownObservation {
-                    metrics: ffs_fuse::MetricsSnapshot {
-                        requests_total: 0,
-                        requests_ok: 0,
-                        requests_err: 0,
-                        bytes_read: 0,
-                        metadata_requests: 0,
-                        getattr_dispatch_count: 0,
-                        getattr_dispatch_nanos: 0,
-                        getxattr_dispatch_count: 0,
-                        getxattr_dispatch_nanos: 0,
-                        lookup_dispatch_count: 0,
-                        lookup_dispatch_nanos: 0,
-                        readdir_dispatch_count: 0,
-                        readdir_dispatch_nanos: 0,
-                        requests_throttled: 0,
-                        requests_shed: 0,
-                    },
+                    // bd-viil0: was a hand-constructed all-zeros snapshot, which
+                    // discarded the counters at the source on the exact path the
+                    // instrument uses.
+                    metrics,
                     worker_count: 0,
                     per_core: None,
                 },
