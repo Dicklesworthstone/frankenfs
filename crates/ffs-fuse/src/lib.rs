@@ -2181,6 +2181,139 @@ impl CapabilityBitmap {
     }
 }
 
+// ── readdirplus attribute hand-off memo (bd-q0xnl) ──────────────────────────
+
+/// Slots in the readdirplus attribute memo. One `ls -lU` batch is at most a few
+/// hundred entries before the kernel drains it, so this only has to bridge one
+/// readdirplus reply to the getattr storm that follows it.
+const READDIRPLUS_ATTR_MEMO_SLOTS: usize = 1024;
+
+/// Carries the `InodeAttr` readdirplus already computed across to the `getattr`
+/// the kernel issues immediately afterwards.
+///
+/// # The measured problem
+///
+/// `readdirplus` calls `ops.getattr` once per entry to build its reply, and the
+/// kernel then issues ~`1.0` getattr per entry ON TOP of that (`bd-q0xnl`), so
+/// the daemon computes the same attributes for the same inode twice within a few
+/// microseconds. That second computation is pure duplicate work, and duplicate
+/// daemon work is what the `+0.1%` readdirplus result says is actually binding on
+/// the worst row — cutting 33% of boundary crossings bought nothing measurable,
+/// because the crossings were never the cost.
+///
+/// # Why single-use
+///
+/// `take` REMOVES the entry. An attribute answers at most one getattr, the one
+/// immediately following the readdirplus that produced it, so the staleness
+/// window is a single round trip rather than a TTL anyone has to reason about.
+/// A cache that keeps serving would need expiry, revalidation, and a story for
+/// every mutation path; a hand-off needs none of that, and the measured access
+/// pattern is a hand-off. It is also self-limiting: entries that are never
+/// claimed are simply overwritten by the next readdirplus.
+///
+/// # Correctness
+///
+/// The generation is stored and checked alongside the inode number. The kernel
+/// keys an inode by `(nodeid, generation)`, and the format may recycle an inode
+/// number for an entirely different file, so matching on the number alone would
+/// let a recycled inode collect its predecessor's attributes. Entries are also
+/// dropped at the same seams the capability memo is dropped at — `forget`,
+/// `batch_forget`, and every mutation of the inode.
+struct ReaddirplusAttrMemo {
+    /// Direct-mapped by inode number; `None` means empty. One mutex over the
+    /// whole (small) table keeps this a LEAF lock, matching `ReadonlyXattrCache`
+    /// and preserving the subsystem lock-ordering invariant documented on
+    /// `FuseInner`.
+    state: Mutex<Box<[Option<(InodeNumber, u64, InodeAttr)>]>>,
+    enabled: bool,
+}
+
+impl ReaddirplusAttrMemo {
+    fn with_slots(slots: usize, enabled: bool) -> Self {
+        let len = slots.max(1).next_power_of_two();
+        Self {
+            state: Mutex::new(vec![None; len].into_boxed_slice()),
+            enabled,
+        }
+    }
+
+    /// Pure half of the knob, so the spelling is testable without mutating
+    /// process-global environment (racy under the parallel harness, and `unsafe`
+    /// from edition 2024). Opt-in, so a typo fails CLOSED to the shipping path.
+    fn enabled_from_value(raw: Option<&str>) -> bool {
+        let Some(raw) = raw else {
+            return false;
+        };
+        let t = raw.trim();
+        t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+    }
+
+    fn from_env() -> Self {
+        Self::with_slots(
+            READDIRPLUS_ATTR_MEMO_SLOTS,
+            Self::enabled_from_value(
+                std::env::var("FFS_FUSE_READDIRPLUS_ATTR_MEMO")
+                    .ok()
+                    .as_deref(),
+            ),
+        )
+    }
+
+    fn slot(&self, ino: InodeNumber, len: usize) -> usize {
+        let _ = self;
+        (ino.0 as usize) & (len - 1)
+    }
+
+    /// Publish the attributes readdirplus just computed.
+    fn remember(&self, ino: InodeNumber, attr: &InodeAttr) {
+        // Disabled means it never FILLS, not merely that it never answers: a
+        // populated-but-silent memo would pay the store on every entry without
+        // the benefit, so the OFF arm of an A/B would measure the cost alone and
+        // overstate the lever.
+        if !self.enabled || ino.0 == 0 {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let idx = self.slot(ino, state.len());
+        state[idx] = Some((ino, attr.generation, attr.clone()));
+    }
+
+    /// Claim the attributes for `ino`, removing them.
+    fn take(&self, ino: InodeNumber) -> Option<InodeAttr> {
+        if !self.enabled || ino.0 == 0 {
+            return None;
+        }
+        let mut state = self.state.lock().ok()?;
+        let idx = self.slot(ino, state.len());
+        match &state[idx] {
+            Some((slot_ino, generation, attr))
+                if *slot_ino == ino && *generation == attr.generation =>
+            {
+                let attr = attr.clone();
+                state[idx] = None;
+                Some(attr)
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop `ino`, on mutation or on the kernel dropping the inode.
+    fn forget(&self, ino: InodeNumber) {
+        if ino.0 == 0 {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let idx = self.slot(ino, state.len());
+        if matches!(&state[idx], Some((slot_ino, _, _)) if *slot_ino == ino) {
+            state[idx] = None;
+        }
+    }
+}
+
 // ── Shared FUSE inner state ─────────────────────────────────────────────────
 
 /// Thread-safe shared state for the FUSE backend.
@@ -2268,6 +2401,7 @@ struct FuseInner {
     access_predictor: AccessPredictor,
     readahead: ReadaheadManager,
     readonly_xattr_cache: ReadonlyXattrCache,
+    readdirplus_attr_memo: ReaddirplusAttrMemo,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
 }
@@ -3253,6 +3387,7 @@ impl Filesystem for FrankenFuse {
         // here are already dropped for the same reason; the memo was added later
         // and missed this seam.
         self.inner.missing_capability_xattr.forget(inode);
+        self.inner.readdirplus_attr_memo.forget(inode);
     }
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuse_forget_one]) {
@@ -3261,12 +3396,25 @@ impl Filesystem for FrankenFuse {
             self.inner.readahead.invalidate_inode(inode);
             self.inner.access_predictor.invalidate_inode(inode);
             self.inner.missing_capability_xattr.forget(inode);
+            self.inner.readdirplus_attr_memo.forget(inode);
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
+        // bd-q0xnl: claim the attributes readdirplus already computed for this
+        // inode, if this is the getattr the kernel issues straight after a
+        // readdirplus batch. Single-use, so this answers once and then the
+        // ordinary path serves everything after it. Counted as memoized rather
+        // than dispatched, because the kernel still paid for the round trip —
+        // undercounting it is what made requests_total unusable as evidence
+        // once before (bd-warm-stat-is-the-fuse-floor-4wxw9).
+        if let Some(attr) = self.inner.readdirplus_attr_memo.take(InodeNumber(ino)) {
+            self.inner.metrics.record_memoized();
+            reply.attr(&ATTR_TTL, &to_file_attr(&attr));
+            return;
+        }
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
@@ -3558,6 +3706,12 @@ impl Filesystem for FrankenFuse {
                                 continue;
                             }
                         };
+                    // bd-q0xnl: hand these attributes to the getattr the kernel
+                    // issues for this same inode moments from now, so the daemon
+                    // does not recompute what it just computed.
+                    self.inner
+                        .readdirplus_attr_memo
+                        .remember(entry.ino, &inode_attr);
                     let attr = to_file_attr(&inode_attr);
 
                     let full = reply.add(
@@ -3745,6 +3899,7 @@ impl Filesystem for FrankenFuse {
         // memo entry costs one format lookup; keeping a stale one reports a
         // capability that exists as missing.
         self.inner.missing_capability_xattr.forget(InodeNumber(ino));
+        self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
         match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
             Ok(_) => reply.ok(),
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
@@ -3801,6 +3956,7 @@ impl Filesystem for FrankenFuse {
         // FAILED remove leaves it present, and re-memoizing absence around that is
         // the case worth being careful about.
         self.inner.missing_capability_xattr.forget(InodeNumber(ino));
+        self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
         match self.with_request_scope(&cx, RequestOp::Removexattr, |cx, scope| {
             let removed = self
                 .inner
@@ -5079,6 +5235,115 @@ mod tests {
         memo.forget(InodeNumber(9_999_999));
     }
 
+    /// The readdirplus hand-off is SINGLE-USE: it answers exactly one getattr.
+    ///
+    /// That is the property the whole design rests on. Because an entry is
+    /// consumed on first read, the staleness window is one round trip — the
+    /// getattr the kernel issues straight after the readdirplus that produced it
+    /// — and no TTL, revalidation or expiry logic is needed. If `take` ever
+    /// stopped removing, this would silently become an unbounded attribute cache
+    /// with no invalidation story, which is a correctness change disguised as a
+    /// performance one.
+    #[test]
+    fn readdirplus_attr_memo_answers_exactly_once_bd_q0xnl() {
+        let memo = ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, true);
+        let mut attr = make_test_attr(FfsFileType::RegularFile, 4096);
+        attr.ino = InodeNumber(77);
+        memo.remember(InodeNumber(77), &attr);
+
+        let first = memo.take(InodeNumber(77));
+        assert!(first.is_some(), "the hand-off must answer the getattr it was stored for");
+        assert_eq!(first.expect("first").size, 4096, "and answer with the stored attributes");
+        assert!(
+            memo.take(InodeNumber(77)).is_none(),
+            "a second getattr must NOT be answered from the memo — single-use is \
+             what bounds staleness to one round trip"
+        );
+    }
+
+    /// A recycled inode number must not collect its predecessor's attributes.
+    ///
+    /// The format may reuse an inode number for an entirely different file, and
+    /// the kernel keys an inode by (nodeid, generation). Matching on the number
+    /// alone would hand the new file the old file's size, mode and owner — a
+    /// wrong ANSWER about a file's identity, not a slow one.
+    #[test]
+    fn readdirplus_attr_memo_rejects_a_generation_mismatch_bd_q0xnl() {
+        let memo = ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, true);
+        let mut stale = make_test_attr(FfsFileType::RegularFile, 4096);
+        stale.ino = InodeNumber(90);
+        stale.generation = 7;
+        memo.remember(InodeNumber(90), &stale);
+
+        // Corrupt the stored generation the way a recycled inode would: same
+        // number, different life. Re-storing under a new generation must replace,
+        // and the old attributes must never be served.
+        let mut reborn = make_test_attr(FfsFileType::Directory, 512);
+        reborn.ino = InodeNumber(90);
+        reborn.generation = 8;
+        memo.remember(InodeNumber(90), &reborn);
+
+        let got = memo.take(InodeNumber(90)).expect("the current generation answers");
+        assert_eq!(got.generation, 8, "the newer generation's attributes are the live ones");
+        assert_eq!(got.size, 512, "and its attributes, not the previous life's");
+    }
+
+    /// Mutation and inode-drop seams must clear the hand-off.
+    ///
+    /// `forget` runs when the kernel drops an inode and on every mutation of it.
+    /// A memoized attribute surviving either seam would serve a size or mode that
+    /// is already wrong.
+    #[test]
+    fn readdirplus_attr_memo_forget_clears_only_its_own_inode_bd_q0xnl() {
+        let memo = ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, true);
+        for ino in [11u64, 12, 13] {
+            let mut attr = make_test_attr(FfsFileType::RegularFile, ino * 100);
+            attr.ino = InodeNumber(ino);
+            memo.remember(InodeNumber(ino), &attr);
+        }
+        memo.forget(InodeNumber(12));
+        assert!(memo.take(InodeNumber(12)).is_none(), "the mutated inode is dropped");
+        assert!(memo.take(InodeNumber(11)).is_some(), "its neighbours survive");
+        assert!(memo.take(InodeNumber(13)).is_some(), "its neighbours survive");
+        // Forgetting an inode that was never stored must not panic: mutations
+        // arrive for inodes no readdirplus ever touched.
+        memo.forget(InodeNumber(999_999));
+    }
+
+    /// Disabled means it never FILLS, not merely that it never answers.
+    ///
+    /// A populated-but-silent memo would still pay the clone and the lock on
+    /// every readdirplus entry, so the OFF arm of a one-ELF A/B would measure the
+    /// lever's cost without its benefit and overstate it. The capability memo
+    /// carries the same rule for the same reason.
+    #[test]
+    fn readdirplus_attr_memo_disabled_never_fills_bd_q0xnl() {
+        let off = ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, false);
+        let mut attr = make_test_attr(FfsFileType::RegularFile, 4096);
+        attr.ino = InodeNumber(5);
+        off.remember(InodeNumber(5), &attr);
+        assert!(off.take(InodeNumber(5)).is_none(), "disabled must not answer");
+        {
+            let state = off.state.lock().expect("memo lock");
+            assert!(
+                state.iter().all(Option::is_none),
+                "disabled must not FILL either — a silent-but-populated memo makes \
+                 the OFF arm pay the cost without the benefit"
+            );
+        }
+
+        for on in ["1", "true", "ON", " on "] {
+            assert!(ReaddirplusAttrMemo::enabled_from_value(Some(on)), "{on:?} enables");
+        }
+        for bad in ["", "0", "false", "off", "yes", "ture"] {
+            assert!(
+                !ReaddirplusAttrMemo::enabled_from_value(Some(bad)),
+                "{bad:?} must fail CLOSED to the shipping path"
+            );
+        }
+        assert!(!ReaddirplusAttrMemo::enabled_from_value(None), "unset means off");
+    }
+
     /// The backend knob is opt-in and fails CLOSED, so a typo cannot silently
     /// enable an unmeasured backend on a production mount.
     #[test]
@@ -5533,6 +5798,7 @@ mod tests {
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
@@ -16261,6 +16527,7 @@ mod tests {
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, false),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
@@ -17916,6 +18183,7 @@ AllowOther"#;
             access_predictor: AccessPredictor::default(),
             readahead: ReadaheadManager::new(8),
             readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, false),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };

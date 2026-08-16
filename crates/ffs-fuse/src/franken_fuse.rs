@@ -27,6 +27,7 @@ impl FrankenFuse {
                 access_predictor: AccessPredictor::default(),
                 readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
                 readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
                 // `from_env`, not `default`: this is the one production mount, and
                 // the FFS_FUSE_CAPABILITY_MEMO switch has to reach it for the
                 // comparator to A/B the memo from a single ELF (bd-2pq73).
