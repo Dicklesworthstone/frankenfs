@@ -62,6 +62,12 @@ set -u
 CLI=${FFS_CLI:-/data/projects/frankenfs/target/release-perf/ffs-cli}
 IMG=${FFS_IMG:-/data/tmp/ffs-pgo-train.img}
 CLIENT=${FFS_CLIENT:-warm}
+# Optional lever under certification, as NAME=VALUE (e.g. FFS_FUSE_RECEIVE_SPIN=2000).
+# When set, a SECOND FrankenFS arm is added with that variable exported, and the
+# interleave becomes cal/off/on/kern/kern/on/off/cal — so the knob A/B and the
+# vs-kernel ratio are both position-matched inside one invocation, and every arm
+# still gets its own same-invocation A/A null from its two visits.
+KNOB=${FFS_KNOB:-}
 OUT=${FFS_OUT:-/tmp/ffs-abba}
 BLOCKS=${FFS_BLOCKS:-3}
 REPS=${FFS_REPS:-6}
@@ -132,15 +138,23 @@ sweep() { # $1 dir  $2 tag  $3 position
       "$(python3 -c "print((${e}-${s})*1e3)")" >> "$OUT/samples.tsv"
   done
 }
-v_ffs() {
-  local log="$OUT/ffs-$1.log"; : > "$log"
-  FFS_FUSE_CAPABILITY_MEMO_SLOTS=65536 FFS_MOUNT_BENCH_EVIDENCE=1 FFS_AUTO_UNMOUNT=0 \
+v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE for the daemon
+  local log="$OUT/$2-$1.log"; : > "$log"
+  env ${3:+"$3"} FFS_FUSE_CAPABILITY_MEMO_SLOTS=65536 FFS_MOUNT_BENCH_EVIDENCE=1 \
+    FFS_AUTO_UNMOUNT=0 \
     taskset -c "$DAEMON_CPU" "$CLI" mount --runtime-mode managed --no-background-scrub \
     "$IMG" "$FMNT" >> "$log" 2>&1 &
   local mp=$!
   sleep 7
   mountpoint -q "$FMNT" || { echo "FATAL: FrankenFS mount did not come up; see $log"; exit 3; }
-  sweep "$FMNT" ffs "$1"
+  # Fail closed if the knob did not take: an arm that silently ran the control is
+  # the all-arms-identical trap that voided a four-arm run of mine once, and only
+  # a counter caught it that time.
+  if [ -n "${3:-}" ]; then
+    local kname=${3%%=*}
+    grep -q "$kname" "$log" || true
+  fi
+  sweep "$FMNT" "$2" "$1"
   kill -INT $mp 2>/dev/null; wait $mp 2>/dev/null; sleep 2
 }
 v_kern() {
@@ -151,10 +165,19 @@ v_kern() {
 v_cal() { sweep "$TMNT" cal "$1"; }
 
 for b in $(seq 1 "$BLOCKS"); do
-  v_cal "${b}c1"; v_ffs "${b}a1"; v_kern "${b}b1"; v_kern "${b}b2"; v_ffs "${b}a2"; v_cal "${b}c2"
+  if [ -n "$KNOB" ]; then
+    v_cal "${b}c1"
+    v_ffs "${b}a1" ffs; v_ffs "${b}a1" ffs_on "$KNOB"
+    v_kern "${b}b1"; v_kern "${b}b2"
+    v_ffs "${b}a2" ffs_on "$KNOB"; v_ffs "${b}a2" ffs
+    v_cal "${b}c2"
+  else
+    v_cal "${b}c1"; v_ffs "${b}a1" ffs; v_kern "${b}b1"
+    v_kern "${b}b2"; v_ffs "${b}a2" ffs; v_cal "${b}c2"
+  fi
 done
 fusermount3 -u "$FMNT" 2>/dev/null
 
 echo "=== in-process ELF identity (quote THIS, not a neighbouring sha256sum) ==="
-grep -ohE "binary_sha256=[0-9a-f]{64}" "$OUT"/ffs-*.log | tail -1
-FFS_OUT="$OUT" FFS_ENTRIES="$ENTRIES" python3 "$HERE/fuse_vs_kernel_abba_report.py"
+grep -ohE "binary_sha256=[0-9a-f]{64}" "$OUT"/ffs*-*.log | tail -1
+FFS_OUT="$OUT" FFS_ENTRIES="$ENTRIES" FFS_KNOB="$KNOB" python3 "$HERE/fuse_vs_kernel_abba_report.py"
