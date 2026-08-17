@@ -8902,3 +8902,59 @@ be aimed rather than exploratory: **record the `logical` of every cache MISS and
 `48300032` specifically.** If ~791 misses land on that one address in the suppressed arm, the root is
 never being served from the cache and the three properties above are the search space. NO wall-clock
 claim is made in this entry; every figure is a count re-derived from arms already on record.
+
+## ⛔ HARNESS DEFECT — 2026-08-17 — my instrument warmed every arm before tracing it, so all "cold sweep" figures in the rows above are WARM-START figures (CreamTrout)
+
+Self-review of `scripts/btrfs_readdir_node_reads.py`, prompted by having made two interpretation
+errors already this session. It found a defect in the instrument that produced every btrfs
+readdir+stat count I have banked today. **No runs — build and bench freeze in force** (/data 19G,
+100% used; consumer external). The fix is a source change to the harness only; nothing was
+re-measured, and that is the whole point of this entry.
+
+### The defect
+
+`probe()` counted the directory's entries with `os.listdir(mountpoint)` **before attaching the
+tracer**, purely to label the output row. That listdir is a full readdir the tracer never sees. It
+warms the daemon's readdir snapshot and populates the parsed-node cache, so the arm that followed
+measured a **second, warm traversal**. The entry count is now taken after the traced listing, when
+the tracer is stopped and a readdir is harmless.
+
+### Which banked claims this touches, and in which direction
+
+* ✅ **Every cross-arm A/B is unaffected and stands.** All arms carried the identical pre-warm, so
+  the ratios are fair: the floor-memo 2.78x, the probe suppression 14.98x/21.5x, the five inert
+  knobs, the 1-pass vs 3-pass retention test, and the memo-slot correction. None of these depended
+  on the absolute level.
+* ✅ **The root-concentration finding survives and gets STRONGER.** The fs-tree root was certainly
+  read during the untraced listdir and cached — and it is *still* read 11,772 times (791 with the
+  probe suppressed). A warm-start arm that still re-reads one cached node hundreds of times is worse
+  evidence for the defect, not weaker.
+* ✅ **Absolute read counts are LOWER BOUNDS.** A genuinely cold sweep costs at least what was
+  measured, so "the sweep costs 27,572 reads" understates. Findings of the form *this is worse than
+  it should be* are conservative.
+* ⚠️ **Distinct-node counts are lower bounds too.** A node read during the untraced listdir and
+  served from cache afterwards never appears in the trace, so 782 and 573 are floors on the nodes
+  actually touched.
+* ⛔ **One claim is NOT SUPPORTED as stated and I am re-scoping it.** "Readdir alone costs a FLAT 12
+  image reads at both 2,048 and 20,048 entries" was measured on a **warm** readdir — the untraced
+  listdir did the cold one. The correct statement is: *a warm readdir costs ~12 image reads and does
+  not grow with directory size.* A cold readdir is **unmeasured**.
+
+### What that does to the b398493d retirement
+
+I used the flat-12 figure to argue that `FFS_BTRFS_READDIR_RO_SNAPSHOT` should not consume a PGO
+build or a quiet window, because it aims at ~12 reads while the row costs 27,577. That argument now
+rests on the *warm* readdir cost. It is weakened but not overturned: the lever skips a per-readdir
+**call** validation descent, which happens on warm and cold readdirs alike, so "a warm readdir costs
+≤12 disk reads at any directory size" still bounds its disk-read target at trivial. What is now
+explicitly unmeasured is the cold-readdir case, and the recommendation should be read as *"do not
+spend a quiet window on it until a cold readdir is counted"* rather than as a closed rejection.
+
+### Rule this suggests, since it is the third instrumentation-shaped error in one session
+
+The other two were reading `walk`'s "0 hits" without asking whether the workload revisits nodes, and
+reading a 3-pass ratio without asking what else was sized to the directory. All three share a shape:
+**a number was interpreted before its instrument's contact with the workload was traced end to end.**
+For a counting harness specifically: *enumerate every operation the harness itself performs against
+the system under test, and prove each one is either inside the measured window or provably inert.*
+The pre-labelling listdir was neither, and it sat three lines above the tracer for the whole session.

@@ -33,6 +33,25 @@ conflating them is how a lever gets aimed at the flat half.
     scripts/btrfs_readdir_node_reads.py --images ~/btrfs-fixture-2k.img ~/btrfs-fixture-20k.img
     scripts/btrfs_readdir_node_reads.py --images ~/btrfs-bisect-*.img --stat-only
 
+⛔ DEFECT FIXED 2026-08-17, AND ROWS TAKEN BEFORE IT ARE WARM-START ROWS. This script
+used to count the directory's entries with `os.listdir(mountpoint)` BEFORE attaching
+the tracer, purely to label the output. That listdir is a full readdir the tracer never
+sees: it warms the daemon's readdir snapshot and populates the parsed-node cache, so
+the arm that followed measured a SECOND, warm traversal. The entry count is now taken
+AFTER the traced listing, when the tracer is already stopped and a readdir is harmless.
+
+Consequences, stated because banked rows depend on which way this cuts:
+  * CROSS-ARM A/Bs ARE UNAFFECTED. Every arm carried the identical pre-warm, so knob
+    comparisons (memo on/off, probe on/off, 1-pass vs 3-pass) are fair and their ratios
+    stand.
+  * ABSOLUTE READ COUNTS WERE UNDERSTATED, so any "the sweep costs N reads" figure is a
+    LOWER BOUND on a genuinely cold sweep. Findings of the form "this is worse than it
+    should be" therefore survive and are conservative.
+  * DISTINCT-NODE COUNTS ARE ALSO LOWER BOUNDS: a node read during the untraced listdir
+    and served from cache thereafter never appears in the trace at all.
+  * ANY CLAIM ABOUT A COLD FIRST TRAVERSAL taken before this fix is really a claim about
+    a WARM one and must be re-measured before it is relied on.
+
 Needs passwordless sudo for `strace` (yama blocks a same-user PTRACE_SEIZE here).
 `/data` is mounted `nosuid`, so `fusermount3` is refused there: `--mountpoint`
 must live under `$HOME`.
@@ -155,7 +174,13 @@ def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
         return None
     pid = pids[0]
 
-    entries = len(os.listdir(mountpoint))
+    # The entry count is taken AFTER the traced listing, never before it.
+    # Counting entries up front means calling `os.listdir` on the mount, which
+    # is a full readdir the tracer never sees: it warms the daemon's readdir
+    # snapshot AND populates the parsed-node cache, so the arm that follows
+    # measures a SECOND, warm traversal. Every "cold" claim taken with the count
+    # up front is really a warm-readdir claim. Ordering it after costs nothing
+    # -- the tracer is already stopped by then.
     trace = workdir / f"{label}.strace"
     tracer = subprocess.Popen(
         ["sudo", "timeout", "300", "strace", "-f", "-p", pid,
@@ -178,6 +203,8 @@ def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
     total = sum(offsets.values())
     distinct = len(offsets)
     worst = offsets.most_common(1)[0][1] if offsets else 0
+    # Safe now: the tracer is stopped, so this readdir cannot pollute the arm.
+    entries = len(os.listdir(mountpoint))
 
     unmount(mountpoint)
     try:
