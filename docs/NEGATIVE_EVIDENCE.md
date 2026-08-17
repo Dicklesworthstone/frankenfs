@@ -10859,3 +10859,58 @@ device is owned by the `MountedArm` and detached in both `unmount()` and `Drop` 
 early-return path when the mount is already gone, which is exactly the aborted-run case, because a
 leaked loop pins the image and silently breaks the NEXT run's fixture. Verified: loop count 15 before,
 15 after, on both runs; `mount_identity=pass`, `independent_arms=pass`.
+
+## ADMITTED (HONEST_LOSS, NOT REPLICATED) — 2026-08-17 — btrfs readdir+stat on the post-lever candidate: 6.132686x (bd-btrfs-readdir-stat-8x-8y7vp)
+
+The first admitted row of this session, obtained by applying the criterion derived from the banked
+corpus (`--pairs 12`) and probing repeatedly. Three attempts in this batch, admitted on the third.
+
+    executed_on: thinkstation1        kernel 6.17.0-41-generic
+    bench_evidence,binary_sha256=c3eac8bd3ad7d920a499d29bfa82cce32484358956068848ed0ce06073c13df0
+    executing_elf_sha256: c3eac8bd3ad7d920a499d29bfa82cce32484358956068848ed0ce06073c13df0
+    build_profile,pgo_profile_sha256=cc6c121c9ee77d8a4b7f4855c443c07a59ac6191316d40acb08fb2fbe79f9562
+    driver ELF 9d20206721ec9485…, both built thinkstation1, isa=x86-64-v3 verdict=pass
+    incumbent kernel engine 0acb7af512a7c454929981ca…
+
+    fuse_over_kernel  6.132686x   ci95 [6.028985, 6.164371]   (bootstrap median CI)
+    admitted = TRUE             verdict = honest_loss
+
+    A/A NULL CONTROLS, same invocation, bootstrap median CI on each:
+      fuse_aa    median 0.996621  deviation 0.003379  symmetric_spread 1.020584  CLEAR
+      kernel_aa  median 0.989800  deviation 0.010200  symmetric_spread 1.011221  CLEAR
+      ceilings: median deviation 0.02, symmetric spread 1.025
+
+    load_average 23.04 / 20.28 / 20.81, settled=TRUE
+    cpu_mhz observed: host mean 2307.7, spread 2.829, placement mean 1701.3, FUSE arm 1429.0
+    32,768 operations, 12 pairs, 8 client threads requested and 8 OBSERVED (unique TIDs)
+    parity PASS (tree sha identical, 32,773 entries both sides), incumbent_isolation_proof PASS
+    external_load_during_run: contended, 48 busy, contended_fraction 1.0000 — which the corpus
+      shows is NOT disqualifying (all 13 previously admitted rows of this workload carry it)
+
+**⚠️ NOT REPLICATED, and therefore not standing.** Six further attempts immediately afterwards
+produced no second admitted row (ratios 6.274146 to 8.224306, all blocked). Under the
+replicated-standing convention a single admitted row is a measurement, not a quotable figure, and the
+worst bound of a replicated pair is what may be published. **This row should be cited as
+"one admitted run, 6.132686x, unreplicated" and nothing stronger.**
+
+**⚠️ NO COMPARISON TO THE BANKED ROWS IS LICENSED.** The bank holds 7.753405x / 7.649395x for this
+workload (bd-plkzd, corrected fixture), measured on a PRE-lever ELF; this row is post-lever
+(`e99e91d9d`). The gap is ~20%, larger than bd-4sull's measured 9.15% cross-window spread — which
+makes it *interesting*, not *established*. One unreplicated row across a different ELF, a different
+PGO profile and a different session cannot attribute that gap to the memo lever, and this entry does
+not.
+
+**One observation that cuts in our disfavour, recorded because it makes the row conservative.** The
+FUSE daemon ran at **1429.0 MHz** against a host mean of 2307.7 and a spread of 2.829 — the slowest
+core on the box, and the same placement seen in five of the seven other attempts. That biases the
+FUSE arm SLOW, so if anything 6.132686x understates the candidate. It is not corrected for and no
+credit is taken for it.
+
+**Correction to my own criterion from the previous entry.** I proposed `max fuse CV <= ~2%` as the
+admission threshold. This row cleared at **6.11%**. CV remains strongly predictive — the 26-30% runs
+never came close — but it is not a hard gate, and the ~2% figure was drawn too tight from too few
+points. The usable form is "low single-digit CV is necessary-ish, and retry is cheap".
+
+**Reproduction:** `--pairs 12 --operations 32768 --image-size-mib 512`, ~90 s per attempt, roughly a
+third abort pre-measurement. Report at
+`/data/tmp/ffs-cert-creamtrout/run_1787004157_728445171_688867/`.
