@@ -799,6 +799,52 @@ fn readdirplus_inode_order_from_value(value: Option<&str>) -> bool {
 /// relative directory order, making the fetch order a deterministic function of
 /// the input -- an unstable sort would make the same directory produce different
 /// orders run to run and quietly cost reproducibility.
+/// How many entries the last readdirplus reply actually emitted before filling.
+///
+/// `0` means "not yet observed". A process-global rather than a per-mount field
+/// on purpose: it bounds a PREFETCH COUNT and nothing else, so a stale or
+/// cross-mount value can only make the bound a worse guess, never make a reply
+/// wrong. That is a deliberately weaker coupling than a `FuseInner` field, which
+/// would have to be threaded through every constructor including the test and
+/// bench helpers.
+static READDIRPLUS_OBSERVED_FILL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// First-call prefetch bound, used until a real fill count has been observed.
+///
+/// Small on purpose. The cost of guessing LOW is a few entries fetched inline
+/// instead of in inode order; the cost of guessing HIGH is exactly the defect
+/// that killed the unbounded version -- attributes fetched for entries the reply
+/// never reaches, then fetched again on the next call.
+const READDIRPLUS_PREFETCH_COLD_BOUND: usize = 32;
+
+/// How many of this batch's entries may be prefetched (bd-xfe7z).
+///
+/// THE UNBOUNDED VERSION OF THIS LEVER WAS MEASURED AND REJECTED: it prefetched
+/// every entry `ops.readdir` returned, and since the emit loop stops when the
+/// reply fills, `40407` getattr dispatch scopes became `104761` -- 2.59x, about
+/// 61% of the fetches thrown away and re-issued on the next call. The ordering
+/// win, whatever it is, never had a chance to show through that.
+///
+/// The bound here needs no estimate of the reply's byte capacity, which is not
+/// exposed to the handler. It uses what the PREVIOUS call actually emitted,
+/// which is the same quantity measured directly. It is capped at `entries_len`
+/// because a bound larger than the batch is meaningless, and it never returns
+/// more than the observed fill, so the steady state prefetches exactly what gets
+/// emitted and wastes nothing.
+///
+/// Returning a bound that is too SMALL is the safe direction: those entries are
+/// fetched inline exactly as they are today, so the lever degrades to current
+/// behaviour rather than to the rejected one.
+fn readdirplus_prefetch_bound(observed_fill: usize, entries_len: usize) -> usize {
+    let bound = if observed_fill == 0 {
+        READDIRPLUS_PREFETCH_COLD_BOUND
+    } else {
+        observed_fill
+    };
+    bound.min(entries_len)
+}
+
 fn readdirplus_inode_fetch_order(inos: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..inos.len()).collect();
     order.sort_by_key(|&i| inos[i]);
@@ -4392,12 +4438,26 @@ impl Filesystem for FrankenFuse {
                 // 433.9/370.0 -> 554.8/535.6. The ordering win, if any, is
                 // buried under ~61% wasted fetches.
                 //
-                // A future attempt must bound the prefetch to what the reply can
-                // actually hold BEFORE fetching. That is the hard part and it is
-                // why this is rejected rather than iterated.
+                // BOUNDED as of 2026-08-17: `readdirplus_prefetch_bound` caps the
+                // prefetch at what the PREVIOUS reply emitted, so the overshoot
+                // above is capped rather than paid per call. The measured
+                // rejection is kept verbatim because the knob is still OFF by
+                // default and the bounded form is itself UNMEASURED -- it must
+                // clear the same 40407-vs-104761 scope count before anyone
+                // enables it.
                 let prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> =
                     if readdirplus_inode_order_from_env() {
-                        let inos: Vec<u64> = entries.iter().map(|e| e.ino.0).collect();
+                        // bd-xfe7z: BOUNDED by what the previous reply actually
+                        // emitted. This is the fix the rejection above called
+                        // for. Entries past the bound are left `None` and fetched
+                        // inline in the emit loop, exactly as the off arm does,
+                        // so the 2.59x overshoot cannot reappear -- and the batch
+                        // arm below inherits the bound rather than the overshoot.
+                        let bound = readdirplus_prefetch_bound(
+                            READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed),
+                            entries.len(),
+                        );
+                        let inos: Vec<u64> = entries[..bound].iter().map(|e| e.ino.0).collect();
                         let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
                             (0..entries.len()).map(|_| None).collect();
                         // bd-xfe7z: ONE scope for the whole fill, not one per
@@ -4426,9 +4486,8 @@ impl Filesystem for FrankenFuse {
                                     // bd-xfe7z: time the OPS-layer call only, so
                                     // dispatch_ns - ops_ns is the FUSE layer's own
                                     // overhead and ops_ns is the format layer's work.
-                                    let _t = crossings::OpsTimer::start(
-                                        crossings::CrossingOp::Getattr,
-                                    );
+                                    let _t =
+                                        crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
                                     Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
                                 })
                             {
@@ -4460,6 +4519,7 @@ impl Filesystem for FrankenFuse {
                         None
                     };
 
+                let mut emitted: usize = 0;
                 for (index, entry) in entries.iter().enumerate() {
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
@@ -4470,11 +4530,22 @@ impl Filesystem for FrankenFuse {
 
                     // Get attributes for each entry
                     let inode_attr = match prefetched.as_ref() {
-                        // Already fetched above, in inode order. A `None` slot is
-                        // the same failure the inline path skips on.
+                        // A filled slot was prefetched in inode order. An empty
+                        // one means either past the prefetch bound or a failed
+                        // fetch, and both fall back to the inline path -- the
+                        // only place that can tell them apart. Skipping the entry
+                        // here instead would drop every entry beyond the bound
+                        // from the directory listing.
                         Some(slots) => match slots[index].clone() {
                             Some(attr) => attr,
-                            None => continue,
+                            None => match self.with_request_scope(
+                                &cx,
+                                RequestOp::Getattr,
+                                |cx, scope| self.inner.ops.getattr(cx, scope, entry.ino),
+                            ) {
+                                Ok(attr) => attr,
+                                Err(_) => continue,
+                            },
                         },
                         None => {
                             match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
@@ -4523,9 +4594,19 @@ impl Filesystem for FrankenFuse {
                         // whether it also recovers those round trips.
                         inode_attr.generation,
                     );
+                    emitted += 1;
                     if full {
                         break;
                     }
+                }
+                // bd-xfe7z: teach the next call how many entries this reply
+                // actually held. This is the whole bound: it is measured, not
+                // estimated from a byte budget the handler cannot see. Stored
+                // unconditionally so the OFF arm keeps it warm too, which means
+                // flipping the knob on mid-run does not start from the cold
+                // guess.
+                if emitted > 0 {
+                    READDIRPLUS_OBSERVED_FILL.store(emitted, std::sync::atomic::Ordering::Relaxed);
                 }
                 reply.ok();
             }
@@ -6212,10 +6293,16 @@ mod tests {
              byte-identical to before"
         );
         for off in ["0", "false", "off", "", "  ", "yes", "2", "enabled", "ON!"] {
-            assert!(!readdirplus_batch_attrs_from_value(Some(off)), "{off:?} must not enable");
+            assert!(
+                !readdirplus_batch_attrs_from_value(Some(off)),
+                "{off:?} must not enable"
+            );
         }
         for on in ["1", "true", "on", "TRUE", " 1 "] {
-            assert!(readdirplus_batch_attrs_from_value(Some(on)), "{on:?} must enable");
+            assert!(
+                readdirplus_batch_attrs_from_value(Some(on)),
+                "{on:?} must enable"
+            );
         }
     }
 
@@ -7580,6 +7667,67 @@ mod tests {
     /// Same polarity rule as every other lever knob here: an unset environment
     /// has to be byte-identical to before the knob existed, so that both arms of
     /// an A/B can come from one ELF and the OFF arm is genuinely today's code.
+
+    /// bd-xfe7z: the prefetch bound never exceeds the batch, which is the
+    /// property that stops the rejected overshoot returning.
+    ///
+    /// v1 of this lever prefetched every entry `ops.readdir` returned and was
+    /// measured at 40407 dispatch scopes -> 104761, ~61% of them discarded when
+    /// the reply filled and re-issued on the next call. The bound exists solely
+    /// to make that impossible, so "never more than the batch" and "never more
+    /// than the observed fill" are the two assertions that matter.
+    #[test]
+    fn readdirplus_prefetch_bound_never_exceeds_the_batch_bd_xfe7z() {
+        // Observed fill larger than this batch: clamp to the batch.
+        assert_eq!(readdirplus_prefetch_bound(500, 20), 20);
+        // Observed fill smaller than the batch: prefetch only that much, and
+        // leave the rest to the inline path.
+        assert_eq!(readdirplus_prefetch_bound(7, 20), 7);
+        // Exactly equal is the steady state: prefetch what will be emitted.
+        assert_eq!(readdirplus_prefetch_bound(20, 20), 20);
+        // An empty batch can never justify a fetch.
+        assert_eq!(readdirplus_prefetch_bound(500, 0), 0);
+        assert_eq!(readdirplus_prefetch_bound(0, 0), 0);
+    }
+
+    /// bd-xfe7z: with no observation yet, the bound is the small cold guess --
+    /// never the whole batch.
+    ///
+    /// This is the case that decides whether the FIRST readdirplus call of a
+    /// mount behaves like the rejected version. Guessing low costs a few entries
+    /// fetched inline instead of in inode order; guessing high is the defect.
+    #[test]
+    fn readdirplus_prefetch_bound_is_cold_conservative_bd_xfe7z() {
+        assert_eq!(
+            readdirplus_prefetch_bound(0, 10_000),
+            READDIRPLUS_PREFETCH_COLD_BOUND,
+            "an unobserved fill must not authorise prefetching a 10k-entry batch"
+        );
+        assert!(
+            READDIRPLUS_PREFETCH_COLD_BOUND < 10_000,
+            "the cold guess is only safe because it is small"
+        );
+        // ...but still clamped by a batch smaller than the cold guess.
+        assert_eq!(readdirplus_prefetch_bound(0, 5), 5);
+    }
+
+    /// bd-xfe7z: the bound tracks the observed fill DOWN as well as up.
+    ///
+    /// A bound that only ever grew would ratchet to the largest reply ever seen
+    /// and then overshoot on every smaller one -- the rejected behaviour, re-
+    /// introduced gradually instead of immediately, which is harder to notice.
+    #[test]
+    fn readdirplus_prefetch_bound_follows_a_shrinking_fill_bd_xfe7z() {
+        let batch = 1000;
+        assert_eq!(readdirplus_prefetch_bound(400, batch), 400);
+        assert_eq!(readdirplus_prefetch_bound(120, batch), 120);
+        assert_eq!(readdirplus_prefetch_bound(1, batch), 1);
+        // Monotone in the observation, so the steady state is a fixed point
+        // rather than an oscillation.
+        for fill in [1usize, 2, 50, 999, 1000] {
+            assert_eq!(readdirplus_prefetch_bound(fill, batch), fill.min(batch));
+        }
+    }
     #[test]
     fn readdirplus_inode_order_knob_is_opt_in_bd_xfe7z() {
         assert!(!readdirplus_inode_order_from_value(None));

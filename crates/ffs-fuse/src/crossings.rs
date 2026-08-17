@@ -257,9 +257,8 @@ impl Drop for OpsTimer {
 /// default mount pays nothing on the hot path.
 fn ops_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0"))
 }
 
 /// Render ops-layer nanoseconds with the same labels and ordering as the counts.
@@ -346,7 +345,10 @@ pub fn render_live_timed() -> String {
         "{} {}",
         render_fuser_counts(fuser::crossing_counts()),
         render_fuser_nanos(fuser::crossing_nanos())
-    ) + " " + &render_ops_nanos() + " " + &render_reply_nanos()
+    ) + " "
+        + &render_ops_nanos()
+        + " "
+        + &render_reply_nanos()
 }
 
 /// Live counts from the daemon, rendered for the metrics line.
@@ -366,7 +368,10 @@ mod tests {
     fn reply_nanos_share_the_label_vocabulary_bd_xfe7z() {
         let line = super::render_reply_nanos();
         for op in CrossingOp::ALL {
-            assert!(line.contains(&format!("reply_ns_{}=", op.label())), "{line}");
+            assert!(
+                line.contains(&format!("reply_ns_{}=", op.label())),
+                "{line}"
+            );
         }
         assert!(line.contains("reply_ns_total="), "{line}");
     }
