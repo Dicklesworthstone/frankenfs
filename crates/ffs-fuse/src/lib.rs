@@ -711,6 +711,16 @@ fn xattr_suppression_allowed(
 ///
 /// Opt-in and OFF unless set, like every other lever knob here, so an unset
 /// environment is byte-identical to before it existed and both arms of an A/B
+/// Effective readdirplus inode-order state, for the comparator's knob line.
+///
+/// Self-reported because the batch-fill path lives INSIDE it: an A/B of
+/// `FFS_FUSE_READDIRPLUS_BATCH_ATTRS` is only meaningful when inode order is on
+/// in BOTH arms, and a row cannot claim that unless the daemon says so.
+#[must_use]
+pub fn readdirplus_inode_order_enabled() -> bool {
+    readdirplus_inode_order_from_env()
+}
+
 /// Whether the readdirplus attribute fill uses ONE request scope for the whole
 /// batch instead of one per inode (bd-xfe7z).
 ///
