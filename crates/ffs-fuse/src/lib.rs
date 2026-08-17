@@ -4302,6 +4302,9 @@ impl Filesystem for FrankenFuse {
             return;
         };
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
+            // bd-xfe7z: the last decomposition left this call inside the
+            // "everything else" remainder, so 66.4% was not pure handler work.
+            let _t = crossings::OpsTimer::start(crossings::CrossingOp::Readdir);
             self.inner
                 .ops
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
@@ -4315,6 +4318,8 @@ impl Filesystem for FrankenFuse {
                     #[cfg(not(unix))]
                     let name = OsStr::new(&owned_name);
 
+                    let _reply_timer =
+                        crossings::ReplyTimer::start(crossings::CrossingOp::Readdirplus);
                     let full = reply.add(
                         entry.ino.0,
                         i64::try_from(entry.offset).unwrap_or(i64::MAX),

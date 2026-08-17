@@ -279,6 +279,66 @@ pub fn render_ops_nanos() -> String {
     out
 }
 
+/// Nanoseconds spent building the FUSE reply, per opcode (bd-xfe7z).
+///
+/// The third and last term of the readdirplus decomposition. With
+/// `dispatch_ns` (everything), `ops_ns` (the FsOps call) and this, the
+/// remainder is the handler's own bookkeeping:
+///
+///     dispatch_ns - ops_ns - reply_ns = per-entry handler work
+///
+/// It exists because the split so far only narrowed the target by half: the
+/// format layer is 33.6% of readdirplus dispatch and the handler is 66.4%, and
+/// "the handler" still spans reply construction, name conversion and iteration.
+/// A lever aimed at the wrong one of those is the third rejected lever in a row.
+static REPLY_NANOS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Accumulates reply-construction time on DROP.
+///
+/// RAII for the same reason as [`OpsTimer`]: `reply.add` sits inside a loop with
+/// a `break` on a full buffer, and a timer that accumulated after the loop would
+/// miss every entry of the batch that filled it.
+pub struct ReplyTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl ReplyTimer {
+    /// Start timing reply construction, or return `None` when evidence is off.
+    #[must_use]
+    pub fn start(op: CrossingOp) -> Option<Self> {
+        ops_timing_enabled().then(|| Self {
+            slot: op.index(),
+            started: std::time::Instant::now(),
+        })
+    }
+}
+
+impl Drop for ReplyTimer {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        REPLY_NANOS[self.slot].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Render reply-construction nanoseconds with the shared labels and ordering.
+#[must_use]
+pub fn render_reply_nanos() -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = REPLY_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
+        total += value;
+        out.push_str(&format!("reply_ns_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" reply_ns_total={total}"));
+    out
+}
+
 /// Live counts and dispatch times, rendered for the metrics line.
 #[must_use]
 pub fn render_live_timed() -> String {
@@ -286,7 +346,7 @@ pub fn render_live_timed() -> String {
         "{} {}",
         render_fuser_counts(fuser::crossing_counts()),
         render_fuser_nanos(fuser::crossing_nanos())
-    ) + " " + &render_ops_nanos()
+    ) + " " + &render_ops_nanos() + " " + &render_reply_nanos()
 }
 
 /// Live counts from the daemon, rendered for the metrics line.
@@ -297,6 +357,31 @@ pub fn render_live() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// All four families -- counts, dispatch, ops and reply -- must share labels
+    /// and ordering, because the decomposition is a SUBTRACTION across them:
+    /// dispatch_ns - ops_ns - reply_ns is the handler's own work, and a reader
+    /// doing that arithmetic must not have to map names between families.
+    #[test]
+    fn reply_nanos_share_the_label_vocabulary_bd_xfe7z() {
+        let line = super::render_reply_nanos();
+        for op in CrossingOp::ALL {
+            assert!(line.contains(&format!("reply_ns_{}=", op.label())), "{line}");
+        }
+        assert!(line.contains("reply_ns_total="), "{line}");
+    }
+
+    /// Inert without the evidence flag, like the ops timer: this one sits inside
+    /// the per-entry loop, so an unconditional Instant::now() pair would be paid
+    /// 20000 times per readdir pass on a default mount.
+    #[test]
+    fn the_reply_timer_is_inert_without_the_evidence_flag_bd_xfe7z() {
+        assert_eq!(
+            super::ReplyTimer::start(CrossingOp::Readdirplus).is_some(),
+            super::ops_timing_enabled(),
+            "the reply timer must be active exactly when mount evidence is on"
+        );
+    }
 
     /// Ops-layer nanoseconds must render with the same labels and ordering as
     /// the counts and the dispatch times, so `dispatch_ns_X - ops_ns_X` is a
