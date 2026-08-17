@@ -4704,14 +4704,30 @@ impl Filesystem for FrankenFuse {
                             None => match self.with_request_scope(
                                 &cx,
                                 RequestOp::Getattr,
-                                |cx, scope| self.inner.ops.getattr(cx, scope, entry.ino),
+                                |cx, scope| {
+                                    // bd-xfe7z: time the inline fetch too, or the
+                                    // split cannot be computed for any arm whose
+                                    // prefetch is bounded short.
+                                    let _t =
+                                        crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                                    self.inner.ops.getattr(cx, scope, entry.ino)
+                                },
                             ) {
                                 Ok(attr) => attr,
                                 Err(_) => continue,
                             },
                         },
                         None => {
+                            // bd-xfe7z: the DEFAULT path, with no prefetch at all.
+                            // It was the only getattr in readdirplus without an
+                            // OpsTimer, so `ops_ns_getattr` read 0 for the default
+                            // arm and the three-way split refused to compute --
+                            // which made the default impossible to compare against
+                            // any lever arm. Timing it is what makes the
+                            // scope-collapse A/B measurable against the real
+                            // baseline rather than against another lever.
                             match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
                                 self.inner.ops.getattr(cx, scope, entry.ino)
                             }) {
                                 Ok(attr) => attr,
