@@ -102,6 +102,25 @@ def summarize(count: int, seconds: float) -> str:
     return f"created {count} files in {seconds:.1f}s ({per:.0f} us/create)"
 
 
+def commit_batch_size(count: int, commits: int) -> int:
+    """Files to write between durability boundaries.
+
+    bd-yknl4. A lever whose behaviour is defined by what a PREVIOUS commit left
+    behind cannot be tested by a workload that commits ONCE, however many files it
+    writes. bd-42gtq shipped corrupt for exactly this reason: it reuses tree blocks
+    a previous commit wrote, this fixture mounts-creates-unmounts (one commit), so
+    the retained map was always empty and the defect could not appear — and it was
+    gated on three passes of this fixture at three sizes.
+
+    `commits <= 1` returns `count`, i.e. no intermediate boundary at all, which is
+    byte-for-byte the pre-bd-yknl4 behaviour every banked fixture row was built
+    with. Scale the number of BOUNDARIES, not the number of files.
+    """
+    if commits <= 1:
+        return max(1, count)
+    return max(1, -(-count // commits))  # ceil, so the last batch is the short one
+
+
 # --- everything below here touches a real mount -----------------------------
 
 
@@ -156,10 +175,21 @@ def build(args: argparse.Namespace) -> int:
     expected: dict[str, int] = {}
     started = time.monotonic()
     try:
-        for name in names:
+        batch = commit_batch_size(args.count, args.commits)
+        for index, name in enumerate(names):
             content = fixture_content(name)
             (mnt / name).write_bytes(content)
             expected[name] = len(content)
+            # A real durability boundary, not a flush: this is what makes a second
+            # commit happen inside ONE mount, which is the only way a reuse defect
+            # can appear (bd-yknl4). With --commits 1 no boundary is issued here
+            # and the run is identical to every banked fixture row.
+            if args.commits > 1 and (index + 1) % batch == 0:
+                handle = os.open(mnt / name, os.O_RDONLY)
+                try:
+                    os.fsync(handle)
+                finally:
+                    os.close(handle)
     except OSError as err:
         print(f"create failed at {len(expected)} of {args.count}: {err}")
         print("that is a result about the btrfs write path, not a script bug (bd-giw9n)")
@@ -233,6 +263,21 @@ def selftest() -> int:
     assert "created 0 files" in summarize(0, 3.0)
     cases += 1
 
+    # bd-yknl4. The DEFAULT must issue no intermediate boundary, or every banked
+    # fixture row silently changes meaning; and >1 must actually subdivide.
+    assert commit_batch_size(5000, 1) == 5000, "commits=1 must not subdivide"
+    cases += 1
+    assert commit_batch_size(5000, 0) == 5000, "a nonsensical commits count must not subdivide"
+    cases += 1
+    assert commit_batch_size(100, 10) == 10
+    cases += 1
+    # Ceil, so 10 boundaries over 101 files leaves a SHORT last batch rather than
+    # an 11th boundary that the caller did not ask for.
+    assert commit_batch_size(101, 10) == 11, commit_batch_size(101, 10)
+    cases += 1
+    assert commit_batch_size(1, 5) == 1, "more boundaries than files must not divide by zero"
+    cases += 1
+
     print(f"selftest: {cases} cases OK")
     return 0
 
@@ -247,6 +292,11 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=Path.home() / "btrfs-fixture.img")
     parser.add_argument("--work-dir", type=Path, default=Path.home() / "ffs-btrfs-fixture",
                         help="must NOT be on a nosuid filesystem; /data is one")
+    parser.add_argument("--commits", type=int, default=1,
+                        help="durability boundaries to spread across the creates. The "
+                             "default 1 reproduces every banked fixture row exactly. Use "
+                             ">1 to exercise the MULTI-COMMIT path, which is the only way "
+                             "a block-reuse defect can appear (bd-yknl4)")
     parser.add_argument("--count", type=int, default=5000,
                         help="files to create. bd-giw9n saw a btrfs image become "
                              "UNMOUNTABLE after ~32k creates, so stay well under it")

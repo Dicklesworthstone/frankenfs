@@ -9614,3 +9614,33 @@ corrupt candidate and the btrfs fsync ratio remains unmeasured.**
 where both A/A nulls land inside 2% and the arms' mean core clocks agree. The 12-pair attempt here
 was taken at loadavg ~18 rising to 45 with six concurrent builds — not a window that can decide
 anything.
+
+## GATE — 2026-08-17 — the fixture can now commit more than once, and it catches the defect the old gate could not see (bd-yknl4, PlumBeacon)
+
+`scripts/make_btrfs_fixture.py` gained `--commits N`, which spreads N durability boundaries across the
+creates. `--commits 1` is the default and issues no intermediate boundary, so every banked
+fixture-based row is unchanged.
+
+**The demonstration, and it is exact.** Same daemon ELF, same 2000 files, same source image — only the
+number of durability boundaries differs:
+
+| daemon | `--commits 1` (the gate bd-42gtq passed) | `--commits 20` |
+|---|---|---|
+| pre-fix `d103d36e…` | **0 missing backrefs, "no error found"** | **198 missing backrefs, `ERROR: errors found in extent allocation tree`, `errors found in fs roots`** |
+| post-fix | clean | clean |
+
+The pre-fix daemon is the one that shipped. It passed the old gate at three sizes, three times, and
+the very same binary fails the new one in seconds. **The verification axis was wrong, not the effort:
+scaling files found nothing, scaling durability boundaries found it immediately.**
+
+**Why the default stays 1.** A fixture row's meaning is fixed by how it was produced. Changing the
+default would silently redefine every banked row, so `--commits 1` is byte-for-byte the old path and
+the multi-commit mode is opt-in. The selftest pins that (`commit_batch_size(5000, 1) == 5000`), along
+with the ceil behaviour so N boundaries over a non-multiple count leave a short LAST batch rather than
+an extra boundary nobody asked for.
+
+**Rule for anyone gating a btrfs write-path lever from here on.** If the lever's behaviour depends on
+what a previous commit left behind — block reuse, retained maps, generation carry-over, anything
+keyed on "already written" — then a single-commit fixture cannot test it at any size. Run
+`--commits N` with N > 1, and run `scripts/fsync_flush_count.py`, which drives many commits and now
+fsck's the image before reporting any number.
