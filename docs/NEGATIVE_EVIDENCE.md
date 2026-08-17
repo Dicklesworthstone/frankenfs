@@ -10516,3 +10516,53 @@ MEDIAN. I had been reading that as a property of this host. On this row it demon
 kernel arm reproduces itself fine in the same invocations, under the same socket conditions, on the
 same hardware. **A/A null failures are attributable — check WHICH arm fails before blaming the
 window.**
+
+## MECHANISM — 2026-08-17 — the FUSE A/A null fails because observations are AUTOCORRELATED: doubling the pairs raised rho and REDUCED effective n from 8.5 to 6.1 (bd-btrfs-readdir-stat-8x-8y7vp, bd-4sull)
+
+Capstone of the null investigation, and the quantitative answer to a problem that has failed seven
+attempts. No run taken; analysis of `raw_wall_ns` from the two banked reports.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, mean CPU 2286.7 MHz over 64
+CPUs, loadavg 9.53/11.60/13.23, idle 89.2%, iowait 0.1%, df 201G.
+
+**Observations are not independent, and that is the whole problem.** Lag-1 autocorrelation, and the
+effective sample size it implies (`n_eff = n(1-rho)/(1+rho)`):
+
+| run | arm | n | rho | **n_eff** |
+|---|---|---|---|---|
+| 24-pair | fuse_a | 24 | 0.285 | 13.4 |
+| 24-pair | fuse_b | 24 | 0.476 | **8.5** |
+| 48-pair | fuse_a | 48 | 0.629 | 10.9 |
+| 48-pair | fuse_b | 48 | 0.773 | **6.1** |
+| 48-pair | kernel_a | 48 | 0.677 | 9.2 |
+| 48-pair | kernel_b | 48 | 0.665 | 9.7 |
+
+**Doubling the pairs from 24 to 48 REDUCED the effective sample size, 8.5 → 6.1.** Twice the
+observations, less independent information, because the longer window raised rho. That is the
+mechanism behind my failed 48-pair experiment and behind the banked result that 96 pairs did not fix
+this null either: **no pair count fixes an autocorrelated series.**
+
+**The pairing design is working — it is simply not enough.** External load is strongly common-mode:
+`corr(fuse_a, fuse_b) = +0.744` and `corr(fuse_a, kernel_a) = +0.905` at 48 pairs. Pairing therefore
+cancels roughly half the variance — arm CVs of 26.6% and 30.1% collapse to a per-pair ratio CV of
+**14.09%**. The design does what it is meant to do. But a residual 14% per-pair CV spread over
+`n_eff ≈ 6` leaves a median standard error of several percent against a **2%** ceiling, which is the
+order of the deviations actually observed (2.30%, 2.62%). The arithmetic is order-consistent rather
+than exact — a median's SE and the between-arm correlation both enter — so read it as "the same size
+as the failure", not as a derivation of it.
+
+**Two more candidates eliminated.** Warm-up is present but SYMMETRIC — first-3-vs-rest is +4.3%/+2.2%
+at 24 pairs and +6.9%/+6.8% at 48 — so it largely cancels in the A/B ratio and is not the cause. And
+the A/B quantile ratios sit at 0.98-1.02 from p10 to p75, diverging only at p90, confirming again
+that the tail moves the CI and not the median.
+
+**The concrete, cheap improvement this suggests.** The harness runs to completion and then blocks on
+a null it could have predicted would fail. Lag-1 rho and `n_eff` are computable from the first
+handful of observations, so the instrument could **report them and fail fast** when `n_eff` is too
+small to decide the configured ceiling — turning a multi-minute run plus 2.1G of artifacts into an
+early, honest refusal. That is a harness change, not a lever, and it would have saved both of this
+session's certification attempts.
+
+Standing: both banked attempts remain INADMISSIBLE and unquotable, and the memo lever's wall-clock
+effect remains UNMEASURED. What has changed is that the reason is now quantitative and the remedy is
+no longer "wait for a quiet window".
