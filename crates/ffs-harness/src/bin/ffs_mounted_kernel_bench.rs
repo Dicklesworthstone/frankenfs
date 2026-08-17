@@ -9921,6 +9921,43 @@ mod tests {
     ///
     /// The fixture below is the REAL layout, tabs included, taken from this
     /// host: `cpu MHz\t\t: 3423.725`.
+
+    /// bd-cpu-mhz: the parser must work on THIS host's real /proc/cpuinfo, not
+    /// only on a fixture.
+    ///
+    /// The fixture test proves the parser handles tabs. It does NOT prove the
+    /// reader is wired to a file whose format it can actually read, and that is
+    /// precisely the gap the original bug lived in: `cpu_mhz()` compiled, ran,
+    /// returned an empty map on every real invocation for the life of the
+    /// feature, and nothing failed. A fixture written by the same person who
+    /// wrote the parser tends to encode the same assumption; the kernel does not.
+    ///
+    /// So this reads the real file. It is skipped rather than failed where
+    /// /proc/cpuinfo does not exist or carries no `cpu MHz` line, because both
+    /// are legitimate elsewhere (containers, non-x86, some VMs) and a test that
+    /// failed there would be reporting the platform rather than the code.
+    #[test]
+    fn cpu_mhz_reads_this_host_bd_cpu_mhz() {
+        let Ok(raw) = std::fs::read_to_string("/proc/cpuinfo") else {
+            return; // no procfs here; nothing to assert about this host
+        };
+        if !raw.to_ascii_lowercase().contains("cpu mhz") {
+            return; // this CPU does not report a clock; not a parser failure
+        }
+
+        let mhz = cpu_mhz();
+        assert!(
+            !mhz.is_empty(),
+            "/proc/cpuinfo advertises `cpu MHz` but cpu_mhz() parsed nothing. That \
+             empty map is the exact signature of the tab-parsing bug: it makes \
+             cpu_mhz_summary return None and every per-arm clock field serialise \
+             as null, which reads as a missing feature rather than a defect."
+        );
+        assert!(
+            mhz.values().all(|v| *v > 0.0),
+            "a 0 MHz core would make the max/min spread infinite: {mhz:?}"
+        );
+    }
     #[test]
     fn parse_cpu_mhz_handles_tab_separated_cpuinfo_bd_cpu_mhz() {
         let raw = "processor\t: 0\n\

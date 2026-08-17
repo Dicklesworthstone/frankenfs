@@ -18595,6 +18595,76 @@ mod tests {
         );
     }
 
+    /// bd-k74ef. The commit-time self-description loop offers every block of the
+    /// extent and root trees on every pass and stops when a whole pass reports
+    /// no change, so "already correct" MUST report `false`. A naive
+    /// implementation that inserts unconditionally (or updates unconditionally
+    /// and says it changed something) never converges: the loop would run to its
+    /// pass cap and refuse the commit.
+    #[test]
+    fn ensure_self_metadata_item_is_idempotent_bd_k74ef() {
+        let mut alloc = BtrfsExtentAllocator::new(17).expect("allocator");
+        let bytenr = 0x10_0000;
+
+        assert!(
+            alloc
+                .ensure_self_metadata_item(bytenr, 1, BTRFS_EXTENT_TREE_OBJECTID, 17)
+                .expect("first ensure"),
+            "the first call has to file the item and say so"
+        );
+        assert!(
+            !alloc
+                .ensure_self_metadata_item(bytenr, 1, BTRFS_EXTENT_TREE_OBJECTID, 17)
+                .expect("second ensure"),
+            "an item that is already exactly right is not a change — this is the \
+             fixpoint's only termination signal"
+        );
+    }
+
+    /// bd-k74ef. A block's level lives in the METADATA_ITEM key's OFFSET, so a
+    /// block that changes level between passes (a leaf that becomes the root of
+    /// a taller tree) is a DIFFERENT key. Inserting the new one without removing
+    /// the old leaves two items for one block, which is exactly what `btrfs
+    /// check` reports as "metadata level mismatch" — the negative case
+    /// `insert_self_metadata_item` cannot handle and this exists for.
+    #[test]
+    fn ensure_self_metadata_item_repairs_a_stale_level_bd_k74ef() {
+        let mut alloc = BtrfsExtentAllocator::new(17).expect("allocator");
+        let bytenr = 0x20_0000;
+
+        alloc
+            .ensure_self_metadata_item(bytenr, 0, BTRFS_EXTENT_TREE_OBJECTID, 17)
+            .expect("file at level 0");
+        assert!(
+            alloc
+                .ensure_self_metadata_item(bytenr, 2, BTRFS_EXTENT_TREE_OBJECTID, 17)
+                .expect("re-file at level 2"),
+            "a level correction is a change"
+        );
+
+        let lo = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: u64::MAX,
+        };
+        let mut levels = Vec::new();
+        alloc
+            .extent_tree()
+            .range_with(&lo, &hi, |key, _| levels.push(key.offset))
+            .expect("scan");
+        assert_eq!(
+            levels,
+            vec![2],
+            "exactly one item, at the new level — a stale duplicate is what btrfs \
+             check calls a metadata level mismatch"
+        );
+    }
+
     #[test]
     fn largest_free_extent_excludes_loaded_skinny_metadata_items() {
         let mut alloc = BtrfsExtentAllocator::new(9).expect("alloc");
