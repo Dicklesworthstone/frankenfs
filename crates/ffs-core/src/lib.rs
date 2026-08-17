@@ -64045,6 +64045,108 @@ mod tests {
         );
     }
 
+    /// Counts `write_block` calls so a test can assert that a flush issued no
+    /// device write at all, not merely that it left the right bytes behind.
+    struct WriteCountingBlockDevice<'a> {
+        inner: &'a dyn BlockDevice,
+        writes: AtomicUsize,
+    }
+
+    impl<'a> WriteCountingBlockDevice<'a> {
+        fn new(inner: &'a dyn BlockDevice) -> Self {
+            Self {
+                inner,
+                writes: AtomicUsize::new(0),
+            }
+        }
+        fn writes(&self) -> usize {
+            self.writes.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl BlockDevice for WriteCountingBlockDevice<'_> {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
+            self.inner.read_block(cx, block)
+        }
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<(), FfsError> {
+            self.writes.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.write_block(cx, block, data)
+        }
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+        fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
+            self.inner.sync(cx)
+        }
+    }
+
+    /// bd-fv9tc. A durability boundary that changed no free count must not write
+    /// the superblock. `fsync-journal-commit` is entirely such boundaries — it
+    /// overwrites an existing 4 KiB at offset 0 and allocates nothing — yet block
+    /// 0 was pushed on every fsync.
+    ///
+    /// THE THIRD ASSERTION IS THE POINT. Skipping is only safe if a boundary that
+    /// DID change the totals still writes; a guard that is too eager silently
+    /// leaves `s_free_blocks_count` stale, which is an e2fsck "free count wrong"
+    /// and exactly the failure this path has regressed into before. So the test
+    /// mutates the free count and demands the write come back.
+    #[test]
+    fn sync_superblock_free_totals_skips_an_unchanged_boundary_bd_fv9tc() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let base = fs.direct_block_device_adapter();
+
+        // First call reconciles whatever mkfs left; it may or may not write.
+        fs.ext4_sync_superblock_free_totals(&cx)
+            .expect("initial superblock sync");
+
+        // Second call with nothing changed: the lever.
+        let quiet = WriteCountingBlockDevice::new(&base);
+        fs.ext4_sync_superblock_free_totals_to(&cx, &quiet)
+            .expect("unchanged superblock sync");
+        assert_eq!(
+            quiet.writes(),
+            0,
+            "a durability boundary that changed no free count must not write the \
+             superblock — this is the whole lever"
+        );
+
+        // Now change the totals the function folds from, and demand a write.
+        {
+            let lock = fs
+                .ext4_alloc_state
+                .as_ref()
+                .expect("writable ext4 has alloc state");
+            let mut alloc = lock.write();
+            alloc.groups[0].free_blocks -= 1;
+        }
+        let changed = WriteCountingBlockDevice::new(&base);
+        fs.ext4_sync_superblock_free_totals_to(&cx, &changed)
+            .expect("changed superblock sync");
+        assert_eq!(
+            changed.writes(),
+            1,
+            "a boundary that DID change the free totals must still write — an \
+             over-eager skip leaves s_free_blocks_count stale, which e2fsck reports \
+             as a wrong free count"
+        );
+
+        // And the skip must be stable: repeating after the write is quiet again.
+        let quiet_again = WriteCountingBlockDevice::new(&base);
+        fs.ext4_sync_superblock_free_totals_to(&cx, &quiet_again)
+            .expect("re-sync after change");
+        assert_eq!(
+            quiet_again.writes(),
+            0,
+            "once persisted, the same totals must not be written again"
+        );
+    }
+
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
     fn sync_superblock_free_totals_folds_from_sharded_when_active_bd_bhh0i() {
