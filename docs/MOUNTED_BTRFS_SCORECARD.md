@@ -1,5 +1,29 @@
 # Btrfs scorecard: FrankenFS FUSE against the incumbent, Linux kernel btrfs
 
+> ## ⛔⛔ THE fsync AND parallel-metadata WINS ARE SUBSTANTIALLY **TRANSPORT**, NOT FILESYSTEM
+>
+> **Measured 2026-08-17 (`bd-w2u82`).** Every row in this file puts the kernel arm on a LOOP
+> DEVICE — kernel btrfs cannot mount a plain file — while the FrankenFS arm `pwrite`s the
+> image directly. The incumbent therefore pays a block-layer and loop-worker hop per barrier
+> that we do not. With the comparator's new `--fuse-transport loop` putting BOTH arms on a
+> loop device, btrfs `fsync-journal-commit` goes:
+>
+> | FUSE arm transport | ratio |
+> | --- | --- |
+> | `file` — every row below | **`0.449–0.463x`** ("2.2x faster", admitted twice) |
+> | `loop` — symmetric | **`1.491904x`** [1.476471, 1.505554] — **1.49x SLOWER** |
+>
+> A **3.2x swing from transport alone**. So `fsync/journal commit`, `parallel metadata writes`
+> and any other durability-bound row here answers *"which is faster for a file-backed image on
+> this host"* — a real operator question for VM images and container layers — and **NOT** *"is
+> FrankenFS faster than btrfs"*. Do not quote them as filesystem wins.
+>
+> ⚠ Caveat that limits the clean-A/B reading: the kernel arm also slowed (~106 → 151 ms) when
+> a second loop device joined the run, so the symmetric figure is not simply the asymmetric one
+> with our transport corrected. The symmetric run is also `BLOCKED_NULL` (fuse null spread
+> `1.032060`) and `CONTENDED`. What survives without over-reading: **the configuration that
+> flattered us is the asymmetric one.**
+>
 > ## ⛔ FOUR ROWS DESCRIBE FRANKENFS AT `HEAD`. THE OTHER TWO DO NOT.
 >
 > **readdir+stat, parallel read and warm stat were re-measured 2026-08-08** on candidate
