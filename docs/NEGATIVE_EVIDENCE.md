@@ -8775,3 +8775,75 @@ sweeps. That is a stronger and cheaper demonstration than a mounted ratio, it is
 pair, and it needs no quiet window. It does NOT speed up a first sweep, and the row above is why.
 
 NO wall-clock claim is made anywhere in this entry.
+
+## SOURCE READ — 2026-08-17 — every btrfs descent path DOES consult the node cache, so the fs-tree root being read 11,777x contradicts the code (CreamTrout)
+
+No measurement this entry beyond re-confirming the standing number: **builds were held for an external
+non-frankenfs cargo loop** (df 67G→60G during the turn; `/data/tmp/frankensearch` alone is 191G and
+the live builds are `fsqlite_core`, `fr-conformance`, `mcp-agent-mail-conformance`). This is the
+source-reading half of bd-2s8zy, plus a harness change that costs nothing to run.
+
+Provenance for the re-confirmation: host `thinkstation1`, ELF `d103d36e54691124feb6842c…`,
+loadavg 10.90/13.90/19.72, df 60G. No build taken.
+
+### Every descent path routes through the cache — verified, not assumed
+
+| path | provider |
+|---|---|
+| `walk_btrfs_tree` (full walk) | `btrfs_read_parsed_node` |
+| `walk_btrfs_tree_range` (targeted range — the getxattr probe path) | `btrfs_read_parsed_node` |
+| `walk_btrfs_tree_floor` (floor descent — the floor-memo path) | `btrfs_read_parsed_node` |
+| `btrfs_fs_tree_root_bytenr` | memoized per subvolume with a lock-free `AtomicU64` fast path; does **not** read the fs-tree root node |
+
+and `enable_writes` — the only setter of `btrfs_alloc_state`, and therefore the only way `cacheable`
+becomes false — is guarded by `if options.read_write` at `crates/ffs-cli/src/main.rs:8056`, so a
+read-only mount leaves caching **on**.
+
+### So the observation contradicts the code
+
+The fs-tree ROOT is one node, it is the first node every descent touches, the cache has 512 slots
+with no eviction and `clear()` is `#[cfg(test)]` — and it is read from disk **11,777 times** for
+20,048 entries. Under the code as written it should be read once.
+
+Mechanisms refuted so far, each by measurement or by reading rather than by argument: the 512-entry
+capacity bound; a mount-time cache fill; the floor-leaf memo (it *helps*, 2.78x); `cacheable` being
+false; per-worker instance multiplicity (`FFS_FUSE_WORKERS=1` changes nothing); `enable_writes` on a
+read-only mount; and root-bytenr resolution. **Seven.**
+
+The remaining arithmetic constrains the answer usefully. Root reads track descents rather than
+sitting at a constant:
+
+| | root reads | descents (~2/entry) | ratio |
+|---|---|---|---|
+| floor memo ON (default) | 11777 | ~40096 | 29% |
+| floor memo OFF | 32955 | ~40096 | 82% |
+
+A working cache would put both at ~1. A rate proportional to descent count is the shape of *the root
+never being served from the cache at all* — either never inserted, or looked up under a key that is
+not the one it was inserted under.
+
+### The next experiment, which needs exactly one build
+
+Instrument `btrfs_read_parsed_node` to record the `logical` of every cache MISS, then run one
+`ls -l` on the 20048-entry fixture and check whether the misses carry `logical == 48300032` (the
+root's own self-reported bytenr, confirmed from its on-disk header). Two outcomes, both decisive:
+
+* misses are at `48300032` → the root is never inserted, or is evicted/refused; look at
+  `insert_within`'s admission under the real call pattern.
+* misses are at some *other* logical that resolves to the same physical → the cache is correct per
+  key and the defect is a key/identity mismatch in logical→physical resolution.
+
+That is a one-line counter behind a `#[cfg(debug_assertions)]` or an env knob, and the run costs no
+quiet window.
+
+### Harness change (no build, no window)
+
+`scripts/btrfs_readdir_node_reads.py --name-hot N` now identifies the N most re-read offsets by
+reading the btrfs 101-byte tree-block header **straight out of the image** — tree owner, level,
+nritems and the node's own logical address — so a hot physical offset arrives already named:
+
+    phys 56688640  11777 reads -> logical 48300032  FS_TREE  level=1 nritems=432
+    phys 56672256     31 reads -> logical 48283648  FS_TREE  level=0 nritems=91
+
+This is what made "the hot node is the fs-tree root" a fact rather than an inference, and it now
+happens automatically on every arm instead of by hand. NO wall-clock claim is made in this entry.

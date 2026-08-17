@@ -80,6 +80,44 @@ def parse_trace(path: Path) -> tuple[Counter, Counter]:
     return offsets, sizes
 
 
+# btrfs tree-block header, 101 bytes, little-endian:
+#   csum[32] fsid[16] bytenr:u64 flags:u64 chunk_tree_uuid[16]
+#   generation:u64 owner:u64 nritems:u32 level:u8
+# `owner` names the tree, `level` says root/internal (>=1) vs leaf (0), and
+# `bytenr` is the node's own LOGICAL address. Reading it straight out of the
+# image turns a physical offset from the trace into a named node with no mount,
+# no daemon and no build -- which is what makes a hot offset actionable instead
+# of merely large.
+BTRFS_TREES = {
+    1: "ROOT_TREE", 2: "EXTENT_TREE", 3: "CHUNK_TREE", 4: "DEV_TREE",
+    5: "FS_TREE", 6: "ROOT_TREE_DIR", 7: "CSUM_TREE", 8: "QUOTA_TREE",
+    9: "UUID_TREE", 10: "FREE_SPACE_TREE",
+}
+
+
+def name_node(image: Path, physical: int) -> dict | None:
+    """Identify the btrfs node at a physical offset from its own header."""
+    import struct
+    try:
+        with open(image, "rb") as fh:
+            fh.seek(physical)
+            head = fh.read(101)
+    except OSError:
+        return None
+    if len(head) < 101:
+        return None
+    bytenr, _flags = struct.unpack_from("<QQ", head, 48)
+    generation, owner = struct.unpack_from("<QQ", head, 80)
+    (nritems,) = struct.unpack_from("<I", head, 96)
+    level = head[100]
+    # A node whose self-reported bytenr is 0 is almost certainly not a node --
+    # say so rather than printing a confident wrong answer.
+    if bytenr == 0:
+        return None
+    return dict(logical=bytenr, owner=owner, tree=BTRFS_TREES.get(owner, f"?{owner}"),
+                level=level, nritems=nritems, generation=generation)
+
+
 def unmount(mountpoint: Path) -> None:
     _run(["fusermount3", "-u", str(mountpoint)])
     # A daemon started under sudo owns a root mount that fusermount3 will refuse.
@@ -151,7 +189,7 @@ def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
 
     return dict(label=label, entries=entries, total=total, distinct=distinct,
                 reread=(total / distinct if distinct else 0.0), worst=worst,
-                sizes=dict(sizes.most_common(3)))
+                sizes=dict(sizes.most_common(3)), offsets=offsets)
 
 
 def selftest() -> int:
@@ -213,6 +251,11 @@ def main() -> int:
                         "each. The mountpoint is appended as the last argument. "
                         "Split words with commas: "
                         "--client scripts/btrfs_stat_client.py,--mode,fstat")
+    p.add_argument("--name-hot", type=int, default=0, metavar="N",
+                   help="after each arm, identify the N most re-read nodes by reading "
+                        "their btrfs header out of the image (tree, level, nritems, "
+                        "logical). Needs no mount and no build -- it turns a hot "
+                        "physical offset into a named node.")
     p.add_argument("--daemon-env", action="append", default=[], metavar="K=V",
                    help="set an env var on the DAEMON, repeatable. Every arm then "
                         "runs from ONE ELF, so a knob A/B has no ISA/PGO confound "
@@ -282,6 +325,16 @@ def main() -> int:
                 print(f"{r['label']:>28} {r['entries']:>8} {r['distinct']:>9} "
                       f"{r['total']:>9} {r['reread']:>8.1f}x {per:>10.2f} "
                       f"{r['worst']:>8}")
+                if args.name_hot:
+                    for phys, n in r["offsets"].most_common(args.name_hot):
+                        info = name_node(image, phys)
+                        if info is None:
+                            print(f"      phys {phys:>10}  {n:>7} reads  "
+                                  f"(no btrfs header -- not a tree node?)")
+                        else:
+                            print(f"      phys {phys:>10}  {n:>7} reads  -> "
+                                  f"logical {info['logical']:<10} {info['tree']:<12} "
+                                  f"level={info['level']} nritems={info['nritems']}")
                 sys.stdout.flush()
     finally:
         unmount(args.mountpoint)
