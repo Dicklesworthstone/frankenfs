@@ -80,6 +80,27 @@ pub fn count_memoized_requests_enabled() -> bool {
 /// configurations self-report identical knobs, so a knob reported from anywhere
 /// but the runtime's own resolver could let a run compare a configuration
 /// against itself. That failure has happened before (bd-d9378) and this line is
+/// Effective readdirplus attribute-memo state for this process (bd-q0xnl).
+///
+/// Resolved through the same function the mount constructor calls, so the
+/// comparator's knob line reports what the runtime actually did rather than
+/// what the environment asked for.
+///
+/// This was MISSING from `mount_candidate_knobs` until 2026-08-17, which matters
+/// because that line exists so "an ELF that predates a knob fails the run closed
+/// instead of silently comparing a configuration against itself". The memo A/B
+/// -- the one that decides whether the memo is a lever against the per-entry
+/// attribute fill or genuinely dead weight -- could not have proved its own arms
+/// apart without it.
+#[must_use]
+pub fn readdirplus_attr_memo_enabled() -> bool {
+    ReaddirplusAttrMemo::enabled_from_value(
+        std::env::var("FFS_FUSE_READDIRPLUS_ATTR_MEMO")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// how it fails closed instead.
 #[must_use]
 pub fn capability_memo_enabled() -> bool {
@@ -5956,6 +5977,34 @@ mod tests {
     /// stopped removing, this would silently become an unbounded attribute cache
     /// with no invalidation story, which is a correctness change disguised as a
     /// performance one.
+    /// bd-q0xnl: the readdirplus attr memo must self-report, and must be opt-IN.
+    ///
+    /// The knob line exists so a candidate-vs-candidate A/B fails closed when an
+    /// ELF predates a knob, rather than silently comparing a configuration
+    /// against itself. This knob was missing from it until 2026-08-17, so the
+    /// memo A/B could not have proved its arms apart.
+    ///
+    /// Opt-in polarity is the second half: `readdirplus_memo_remembers=0` was
+    /// read as "the stashing path never executed" when it actually meant "the
+    /// feature was off", and that misreading nearly retired an unmeasured lever
+    /// aimed at 60.80% of daemon dispatch time.
+    #[test]
+    fn the_readdirplus_memo_knob_is_opt_in_and_self_reports_bd_q0xnl() {
+        assert!(
+            !ReaddirplusAttrMemo::enabled_from_value(None),
+            "unset must be OFF: a zero remembers count then means disabled, not dead"
+        );
+        for off in ["0", "false", "off", "", "  ", "yes", "2", "enabled", "ON!"] {
+            assert!(
+                !ReaddirplusAttrMemo::enabled_from_value(Some(off)),
+                "{off:?} must not enable the memo"
+            );
+        }
+        for on in ["1", "true", "on", "TRUE", " 1 "] {
+            assert!(ReaddirplusAttrMemo::enabled_from_value(Some(on)), "{on:?} must enable");
+        }
+    }
+
     #[test]
     fn readdirplus_attr_memo_answers_exactly_once_bd_q0xnl() {
         let memo = ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, true);
