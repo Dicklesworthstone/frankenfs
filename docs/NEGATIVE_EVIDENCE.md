@@ -10616,3 +10616,53 @@ conditions that produce ~1.5% CV are achievable on this host. Identifying what d
 runs — placement, time of day, tenancy — is a better question than "wait for idle to look high", and
 it is answerable from the same banked corpus. Both of my attempts remain INADMISSIBLE and unquotable,
 and the memo lever's wall-clock effect remains UNMEASURED.
+
+## ADMITTED WIN — 2026-08-17 — btrfs parallel metadata writes: `1.930090x` slower becomes `0.798200x`, a SIGN CHANGE (PlumBeacon)
+
+    fuse_over_kernel_median=0.798200, ci_low=0.791613, ci_high=0.814795
+    pairs=288, kernel null 0.993329 spread 1.014362 CLEAR
+               fuse   null 0.998869 spread 1.013106 CLEAR
+    directional_claim_clear=true, admitted=true, verdict=HONEST_WIN
+
+Third reading of this row. All three agree: `0.775502` / `0.780774` / `0.798200`, a 2.9% spread, against
+a banked `1.930090x` SLOWER. **Quote `0.798200x` — it is both the admitted run and the least
+favourable of the three.**
+
+### I was wrong about the mechanism, and the correct one gave a prediction that held
+
+Last entry I called the blocker a **fat tail** in our arm. The per-observation series say otherwise.
+From `raw_wall_ns` (96 observations per arm, the harness records them):
+
+| arm | CV | max/p50 | IQR/p50 | observations > 1.5x own median |
+| --- | --- | --- | --- | --- |
+| kernel_a / kernel_b | **5.62% / 6.11%** | 1.34 / 1.30 | 0.049 / 0.053 | 0 / 0 |
+| fuse_a / fuse_b | **8.98% / 9.19%** | 1.39 / 1.38 | 0.051 / 0.045 | 0 / 0 |
+
+**No arm has a single observation above 1.5x its own median, and max/p50 and IQR/p50 are
+indistinguishable between kernel and FUSE.** There is no tail. What differs is the CV — ~9.1% for our
+arms against ~5.9% for the kernel's, about **1.55x broader dispersion spread through the whole
+distribution**. IQR/p50 missed it precisely because the interquartile range is robust and this is not
+an outlier effect.
+
+I also checked whether the FUSE pair was less CORRELATED, which would widen a paired ratio: it is
+not — `r=+0.268` for fuse against `+0.039` for kernel. Pairing helps our arm slightly, if anything.
+
+**That model predicts the fix, and the prediction was recorded before the run.** A bootstrap null CI
+narrows as `cv/sqrt(pairs)`, so clearing a `1.0364` spread at 96 pairs needs ~2.1x the pairs. Stated
+in advance: *288 pairs -> excess `0.0364/1.73` = `0.021` -> ~`1.021`, CLEARS; 192 would be ~`1.026`,
+borderline.* **Measured: `1.013106`.** The model was directionally right and conservative.
+
+**So "our null keeps failing" was never a host property and never a defect — it is a sample-size
+requirement, and it is computable in advance from the arms' CVs.** That reconciles the contradiction
+between my earlier finding that more pairs rescued the fsync row and a peer's that more pairs made
+their readdir+stat null worse (`06f76c71a`): pairs buy precision only where the process is stationary,
+and the amount to buy is set by the noisier arm's CV.
+
+⚠️ **The window was the busiest I have measured** — load `40.67` and CPU idle **2%** at launch,
+`peak_off_placement_mean_busy=1.000000`, `verdict=CONTENDED`. Both nulls cleared anyway, because 288
+pairs bought enough precision to survive it. The row is admitted on its nulls and parity; the
+socket-contention veto applies to the run and argues for a replication in a quiet socket. Note also
+that this busiest run produced the LEAST favourable of the three readings, which is the opposite of the
+load-dependence I hypothesised and withdrew earlier today.
+
+**Remaining qualification, unchanged:** the kernel arm is loop-mounted and we are not (`bd-w2u82`).
