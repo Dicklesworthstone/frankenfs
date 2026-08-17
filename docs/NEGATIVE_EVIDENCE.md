@@ -10770,3 +10770,48 @@ carries the qualification.
 **Row status:** not banked. Nulls clear and the ratio line says `HONEST_WIN`, but the run was refused
 on socket contention with the socket at 98.5% off-placement busy — genuinely the busiest condition
 measured today, not a marginal call.
+
+## MECHANISM — 2026-08-17 — the admission criterion is `max fuse CV <= ~2%`, and `--pairs 12` is necessary but not sufficient (bd-btrfs-readdir-stat-8x-8y7vp, bd-4sull)
+
+Ten `--pairs 12` attempts across two load regimes now bound the criterion precisely. No row was
+admitted; what was obtained is the threshold itself, which is the thing that makes the next attempt
+cheap to judge.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, candidate ELF
+`c3eac8bd3ad7d920…` (`isa=x86-64-v3`), PGO `cc6c121c9ee77d8a…`, driver `9d20206721ec9485…`. Mean CPU
+3589.2 MHz over 64 CPUs, loadavg 41.72/25.06/20.88 at the retry batch, **idle 84.5% measured
+(reported 75%), iowait 1.0%**, four external builds running, df 196G→190G. Artifacts fell 2.1G→1.5M during the batch: the regenerable arm images were reclaimed while every cited `mounted-kernel-report.json` survived (verified, all three still present), which is the intended split and means the citations above still resolve.
+
+**max fuse CV tracks conditions, and the null clears only below ~2%:**
+
+| attempt | fuse_a CV | fuse_b CV | fuse_aa clear? |
+|---|---|---|---|
+| earlier, quieter | **1.33%** | **1.85%** | **YES** |
+| retry 4 | 1.61% | 2.76% | no |
+| retry 2 | 4.74% | 6.50% | no |
+| retry 3 | 4.79% | 8.55% | no |
+| retry 5 | 36.81% | 39.60% | no |
+
+Retry 4 at 1.61%/2.76% did **not** clear, so the bar sits below ~2.8% and the one clearing run was at
+1.85%. That is consistent with the admitted corpus for this workload — max fuse CV median **1.54%**.
+
+**So the criterion is: `--pairs 12` AND `max fuse CV <= ~2%`.** Pair count is necessary — it took CV
+from 26-30% to the low single digits — but it does not by itself deliver the arm quality the null
+needs. The remaining variable is the moment, and CV measures it directly where loadavg and idle% do
+not: this batch ran at **84.5% idle** and still produced CVs from 1.61% to 39.60%.
+
+**Two abort modes seen, both failing closed cheaply and correctly:** `driver guard cpuN became N%
+busy before measurement` and `same_llc domain supplied only 2 quiet client CPUs; 8 needed`. Four of
+ten attempts aborted this way in under a minute each, producing no artifacts and no contaminated row.
+
+⚠️ **Eight INADMISSIBLE ratios now exist from this session** — 6.349379, 6.514621, 6.704928,
+6.775101, 6.780288, 6.855263, 6.936515, 7.107260 — and **none may be quoted**, individually or as a
+range, including against the banked 7.753405 / 7.649395. Their consistency is not evidence: every one
+failed its A/A null, which is exactly the check that would tell us whether the instrument could see a
+difference at all. The memo lever's wall-clock effect remains UNMEASURED.
+
+**What this makes cheap for the next attempt.** CV is computable from the first few observations, so
+the fail-fast check is: run `--pairs 12`, read `max fuse CV` early, and abandon above ~2% rather than
+completing the run and blocking on the null. Combined with the two existing abort modes that already
+fire in under a minute, that turns certification from a multi-minute gamble into a short, repeatable
+probe — and 13 admitted rows prove the target is reachable.
