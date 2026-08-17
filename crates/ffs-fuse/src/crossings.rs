@@ -598,13 +598,23 @@ pub fn render_live() -> String {
 #[cfg(test)]
 mod tests {
 
-    /// The loop body CONTAINS the scope wrapper and the reply construction for
-    /// the entries it covers, so scope_ns + reply_ns <= loop_ns must hold on the
-    /// readdirplus path. Same predicate as the outer invariant, applied one
-    /// level in -- which is what makes the five families a nest rather than a
-    /// list.
+    /// ⚠️ CORRECTED 2026-08-17, BY MEASUREMENT. This test previously claimed the
+    /// loop body CONTAINS the scope wrapper, so `scope_ns + reply_ns <= loop_ns`
+    /// on the readdirplus path. It does not, and the numbers said so at once:
+    /// `scope_ns_getattr=20525044` against `loop_ns_readdirplus=4484755`, a
+    /// wrapper four times larger than the body it was supposed to sit inside.
+    ///
+    /// The reason is configuration, not a timer bug. With inode-order prefetch
+    /// enabled the attribute fetches happen in a PREFETCH PHASE BEFORE the emit
+    /// loop, and the loop only consumes slots -- so `scope_ns` and `loop_ns` are
+    /// SIBLINGS there, not parent and child. With prefetch off they nest. The
+    /// five families are a nest only in some configurations, which is exactly
+    /// the kind of assumption that should be measured rather than asserted.
+    ///
+    /// What is pinned here is therefore the PREDICATE, on values where
+    /// containment does hold, not a claim about the readdirplus path's shape.
     #[test]
-    fn the_loop_body_contains_the_scope_and_the_reply_bd_xfe7z() {
+    fn the_containment_predicate_rejects_a_child_larger_than_its_parent_bd_xfe7z() {
         assert!(super::decomposition_is_consistent(100, 60, 30));
         assert!(
             !super::decomposition_is_consistent(100, 60, 41),
