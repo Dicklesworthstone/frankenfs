@@ -8206,3 +8206,113 @@ prediction, and on ext4 the same class of counting moved bytes without moving th
 
 **Scope: only the FS_TREE is covered.** The csum, extent and root trees still write every block every
 commit — that is most of the residual 6 nodes, and the same map extends to them (bd-rsjvf).
+
+## MECHANISM — 2026-08-17 — the btrfs readdir+stat cost is a NODE RE-READ STORM with a cliff between 5k and 10k entries, and TWO candidate mechanisms for it are refuted (CreamTrout)
+
+Counted attribution for `bd-3zx2x` (the btrfs-specific readdir+stat excess) and a sizing that
+retires the premise of the lever shipped unmeasured in `b398493d`. No build was taken — every arm
+below runs the already-banked `release-perf` ELF, so this cost one binary and no quiet window.
+
+**Instrument.** One FRESH MOUNT PER ARM (so no arm inherits another's warm cache), `sudo strace -f -e
+trace=pread64` on the daemon, one `ls` or `ls -l`. The observables are *how many nodesize reads the
+daemon issues to the image fd*, *how many DISTINCT offsets those reads touch*, and their ratio.
+**Re-reading one offset N times is a cache miss, not work.** Driver:
+`scratchpad/cliff.py` + `scratchpad/rdprobe.py` (method is in the docstrings).
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, ELF `81c7b1a34d32f5c3f5c2478a…`
+(`release-perf`, built 05:02 EDT), mean CPU 2845.4 MHz over 64 CPUs. Loadavg **ranged 11.3 → 27.6
+across the series** and the integers did not move — which is the point of counting rather than
+timing, and is why this was runnable in a window that refused every timed row.
+
+### The cliff
+
+`ls -l`, one fresh mount each, seven fixture sizes:
+
+| entries | distinct nodes | preads | re-read | preads/entry | worst single offset |
+|---|---|---|---|---|---|
+| 2048 | 72 | 72 | **1.0x** | 0.04 | 1 |
+| 2548 | 91 | 91 | **1.0x** | 0.04 | 1 |
+| 3048 | 111 | 111 | **1.0x** | 0.04 | 1 |
+| 4048 | 150 | 150 | **1.0x** | 0.04 | 1 |
+| 5048 | 190 | 190 | **1.0x** | 0.04 | 1 |
+| 10048 | 387 | 1272 | **3.3x** | 0.13 | 46 |
+| 20048 | 782 | 27577 | **35.3x** | **1.38** | **11776** |
+
+Below ~5k entries the behaviour is *perfect*: every node read exactly once, 0.04 reads per entry.
+Above it the same work costs **34.5x more per entry**, and at 20048 entries **one single node is
+re-read 11,776 times** — on 59% of the 20,048 stats. The 20048 distribution is bimodal: 221 offsets
+read once, ~570 offsets read 23–31 times each, and that one read 11,776 times.
+
+**This is the shape the bank's btrfs readdir+stat rows sit on.** They are measured at 32,768 entries
+— far past the cliff — which is why btrfs readdir+stat is the worst row in the bank while the ext4
+twin, which has no equivalent descent, is ADMITTED at `1.0266x`.
+
+### Two mechanisms REFUTED, both by measurement
+
+1. ⛔ **"The working set outgrows `BTRFS_TREE_NODE_CACHE_LIMIT = 512`."** This was my prediction,
+   written before the run, and it is **wrong**. `btrfs_parsed_node_cache` really is fill-and-freeze
+   (`insert_within` refuses every insert once `len >= limit`, and nothing evicts, and `clear()` is
+   `#[cfg(test)]`) — but the cliff has already opened at 10048 entries where the distinct node count
+   is **387, comfortably UNDER 512**. A capacity bound that is not reached cannot be the cause.
+
+2. ⛔ **"The cache is filled and frozen during mount."** Also refuted. Straced from process launch,
+   a read-only mount reads **7 distinct nodes (5000-file fixture) and 8 (10000-file)** — the tree is
+   walked lazily, not eagerly, so the cache is nearly EMPTY when the first client op arrives.
+
+What is left, and what the next lane should test: the cache appears **not to hit at all**.
+`ffs-cli walk`'s own counter reports `0 hits (0.0%)` at every size measured — 274 lookups / 0 hits
+at 5000, 545 / 0 at 10000, 1085 / 0 at 20000 — and the strace corroborates it independently, since a
+cache that hit would have prevented those re-reads. ⚠️ Stated as the open question it is: a 0% hit
+rate is *also* what a broken hit COUNTER looks like (precedent: `requests_total` under-reported for
+weeks), so the first job is to distinguish "never hits" from "never counts a hit". If it genuinely
+never hits, the 512 limit is a red herring and the defect is bigger than a sizing constant.
+
+### Sizing that retires the `b398493d` premise
+
+`b398493d` shipped `FFS_BTRFS_READDIR_RO_SNAPSHOT` (default OFF, explicitly NOT MEASURED) against
+the claim that `btrfs_read_inode_attr` costs "roughly 209 descents for a 20000-entry directory, each
+a fresh chance to miss the block cache". On the **disk-read axis that claim does not hold**:
+
+| arm | 2048 entries | 20048 entries |
+|---|---|---|
+| `ls` (readdir only) | **12 preads** | **12 preads** |
+| `ls -l` (readdir+stat) | 89 | 27577 |
+
+Readdir alone costs a **flat 12 image reads and does not grow with directory size at all**. So the
+per-page validation descent has no block-cache exposure to remove, and the lever is aimed at ~12
+reads while the row it is aimed at costs 27,577. ⚠️ **Scope, and it is a real limit:** this counts
+DEVICE READS, not in-memory descent CPU. A per-page descent that stays in memory would be invisible
+here. What is refuted is specifically the "fresh chance to miss the block cache" mechanism and the
+"~209 descents" magnitude — not the existence of some residual CPU cost.
+
+**Recommendation: do not spend a PGO build or a quiet window A/B-ing that knob.** The arithmetic the
+campaign wrote down two days ago — divide the mechanism's measured unit cost into the row's measured
+gap — kills it for 12 against 27,577 before any window is consumed.
+
+### Scope
+
+One host, one ELF, one directory shape (flat, single directory, empty files), read-only mounts, and
+**no wall-clock claim of any kind**. Node counts are a mechanism, not a prediction. What these
+integers support is where to look: the excess is a re-read storm above ~5k entries, not readdir, and
+not the shipped knob.
+
+### Replication across two ELFs and a 50% clock difference
+
+The method above was packaged as `scripts/btrfs_readdir_node_reads.py` (with a `--selftest` that
+checks the trace parser against a buffer containing `)`, the fd filter, and both histograms) and
+re-run. A peer had rebuilt `release-perf` in the interval, so the replication landed on a
+**different binary at a different clock**:
+
+| | original | replication |
+|---|---|---|
+| ELF | `81c7b1a34d32f5c3f5c2478a…` | `d103d36e54691124feb6842c…` |
+| mean CPU | 2845.4 MHz | **4269.4 MHz** (+50%) |
+| loadavg | 11.3 → 27.6 | 14.37/20.74/21.39 |
+| 5048 entries | 190 distinct / 190 preads / 1.0x | **190 / 190 / 1.0x** |
+| 20048 entries | 782 / 27577 / 35.3x / worst 11776 | **782 / 27575 / 35.3x / worst 11777** |
+
+Two node reads out of 27,577 (0.007%) and one re-read out of 11,776 differ — daemon startup touching
+a node or two before the tracer attached. Everything that matters is identical across a different
+compilation and a 50% clock swing. That is what makes a count worth having on this host: the timed
+rows on this same row have never reproduced across windows at all (bd-4sull measured 9.15%
+cross-window spread), and this one reproduces to four significant figures across two binaries.
