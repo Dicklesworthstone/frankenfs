@@ -173,12 +173,42 @@ if [ "${SKIP_TRAIN:-0}" != "1" ]; then
     TRAIN_IMG="$PGO_DIR/train.img"; cp "$SRC" "$TRAIN_IMG"
     "$INSTR" create-bench "$TRAIN_IMG" / --count 40000 --threads 1 >/dev/null 2>&1 || true
   fi
+  # Each training command still tolerates its own failure -- one bad bench must
+  # not abort a 20-minute build -- but the failure is now RECORDED instead of
+  # discarded by `|| true`, and the gate below decides. Exit status alone is not
+  # enough: a command can exit 0 and write no profile at all, which is exactly
+  # what an offloaded build does (see the cargo note above), so each command also
+  # reports how many .profraw files appeared while it ran.
+  TRAIN_RESULTS="$PGO_DIR/training-results.tsv"
+  : > "$TRAIN_RESULTS"
+  train() { # $1 label, rest: command
+    local label="$1"; shift
+    local before after rc
+    before=$(find "$PGO_DIR" -name '*.profraw' | wc -l)
+    "$@" >/dev/null 2>&1; rc=$?
+    after=$(find "$PGO_DIR" -name '*.profraw' | wc -l)
+    printf '%s\t%s\t%s\n' "$label" "$rc" "$((after - before))" >> "$TRAIN_RESULTS"
+  }
+
   echo ">> [2/4] training on $TRAIN_IMG (exercise the hot paths)"
-  "$INSTR" create-bench "$TRAIN_IMG" / --count 20000 --threads 1 >/dev/null 2>&1 || true
-  "$INSTR" lookup-bench "$TRAIN_IMG" / --count 3000000            >/dev/null 2>&1 || true
-  "$INSTR" rename-bench "$TRAIN_IMG" / --count 20000              >/dev/null 2>&1 || true
-  "$INSTR" delbench     "$TRAIN_IMG" / --count 20000              >/dev/null 2>&1 || true
-  "$INSTR" walk         "$TRAIN_IMG" --no-stat                    >/dev/null 2>&1 || true
+  train create-bench "$INSTR" create-bench "$TRAIN_IMG" / --count 20000 --threads 1
+  train lookup-bench "$INSTR" lookup-bench "$TRAIN_IMG" / --count 3000000           
+  train rename-bench "$INSTR" rename-bench "$TRAIN_IMG" / --count 20000             
+  train delbench "$INSTR" delbench     "$TRAIN_IMG" / --count 20000             
+  train walk "$INSTR" walk         "$TRAIN_IMG" --no-stat                   
+
+  # Fail closed on a profile that trained only part of the hot paths. The
+  # pre-existing `[ -s merged.profdata ]` check below catches only the case where
+  # EVERY command failed; this catches the case where four of five did, which
+  # still produces a non-empty profile and a binary that every row would describe
+  # as "real PGO".
+  if ! python3 "$(dirname "$0")/pgo_training_gate.py" "$TRAIN_RESULTS" \
+       ${FFS_PGO_ALLOW_PARTIAL:+--allow-partial}; then
+    echo "!! refusing to build from a partially-trained profile" >&2
+    echo "!! set FFS_PGO_ALLOW_PARTIAL=1 to accept it deliberately; the artifact is" >&2
+    echo "!! then NOT the standard one and any row measured from it must say so" >&2
+    exit 1
+  fi
 
   echo ">> [3/4] merge profiles"
   find "$PGO_DIR" -name '*.profraw' > "$PGO_DIR/list.txt"
