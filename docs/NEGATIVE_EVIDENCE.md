@@ -9173,3 +9173,56 @@ bd-q0xnl's ~1.1x-for-a-33%-crossing-cut rather than against 14.98x. bd-2s8zy (th
 question) is bounded by the same 3.85%: even a perfect fix there cannot move this row more than ~4%,
 which is worth knowing **before** anyone spends a quiet window on it. Neither bead is worthless; both
 were being sized in the wrong units, by me.
+
+## ⛔ CORRECTION OF MY OWN CORRECTION — 2026-08-17 — bd-q0xnl's 3.85% bounds daemon CPU, not daemon ELAPSED contribution, so it does not cap the levers I just capped with it (CreamTrout)
+
+Grooming under the build freeze (/data 11G); no runs, no build, nothing deleted. Withdraws the
+sizing half of `16b226a6e`.
+
+### The tension, from two banked rows
+
+| row | says |
+|---|---|
+| bd-q0xnl | daemon CPU share of btrfs readdir+stat = **3.85%**; "a hard upper bound"; eliminating all daemon work takes 7.753405x → ~7.45x |
+| bd-kzfh2 / bd-34hzz | sizing the capability memo — **a daemon-side structure** — took the same row at 32,768 entries from **6.990007x → 3.359246x**, both arms `admitted=true`, A/A nulls clear, our arm 217,470,654 ns → 103,799,776 ns |
+
+A daemon-side lever produced a **52% wall-clock reduction** on a row whose daemon share is quoted as
+3.85%. **Both cannot be right as interpreted.**
+
+### The resolution, and it is a measurement-semantics one
+
+**Daemon CPU is `utime + stime`. Neither includes time the daemon spends BLOCKED** — in D-state on
+I/O, or runnable-but-not-scheduled. So 3.85% bounds *CPU-bound* daemon work and says nothing about
+daemon work that waits.
+
+That makes bd-q0xnl's own conclusion sound **for the question it was answering** — allocator pressure
+is pure CPU, so 3.85% genuinely caps it, and that row should not be re-scoped. It does **not** extend
+to daemon work that blocks, which is precisely what a tree descent that misses a cache does.
+
+bd-kzfh2's 2.08x is direct empirical evidence for that reading: it is the same row, measured
+end-to-end, moved by more than 3.85% by a daemon-side change.
+
+### So I withdraw the sizing I published one commit ago
+
+`16b226a6e` used the 3.85% to conclude "bd-2s8zy cannot move this row more than ~4%" and "bd-yu6jz
+is ~10% in the crossing currency, not 15x". **The ~4% cap is withdrawn** — the node cache is exactly
+the blocking-I/O class the bound does not cover, and had I let it stand I would have wrongly
+de-prioritised two P1 beads.
+
+**What survives from that commit:** the part that did not depend on the bound — 14.98x is a factor on
+*node reads*, not a wall-clock prediction, and quoting it as a "ceiling ~15x" was wrong. That
+withdrawal stands. What is now clear is that I replaced one bad estimate with another rather than
+stopping at "unmeasured".
+
+### Standing, stated as unmeasured rather than re-guessed
+
+* The wall-clock prize for removing the capability probe's per-entry descent: **UNMEASURED.**
+* The wall-clock prize for fixing the node cache: **UNMEASURED.**
+* The only direct evidence on this row for a daemon-side lever's worth is bd-kzfh2's **2.08x**, and
+  it says daemon-side levers on this row can be large.
+* bd-q0xnl's 3.85% stands **as a bound on CPU-bound daemon work**, which is what it was measured for.
+
+Three sizing attempts on this cluster in three turns — 15x, then ~4%, now neither. The lesson is not
+about which bound applies; it is that **I kept producing a number where the honest output was
+"unmeasured"**, and each one would have mis-steered the queue. NO wall-clock claim is made in this
+entry, and none should be made on this cluster until one is measured.
