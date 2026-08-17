@@ -639,6 +639,13 @@ def main() -> int:
     parser.add_argument("--operations", type=int, default=64,
                         help="client fsyncs per arm. The harness row uses 8; more "
                              "only sharpens a count that is already deterministic")
+    parser.add_argument("--fuse-transport", default="file", choices=["file", "loop"],
+                        help="how the FrankenFS arm reaches its image. `file` is the "
+                             "production shape (the daemon pwrites the image directly). "
+                             "`loop` puts it on a loop device so BOTH arms cross the same "
+                             "block layer — the kernel arm has no choice but to, and that "
+                             "asymmetry is a candidate explanation for the btrfs fsync "
+                             "result (bd-5hqj2). Needs the bd-5rxz0 block-device fix.")
     parser.add_argument("--fstype", default="ext4", choices=["ext4", "btrfs"],
                         help="filesystem the image holds. The KERNEL arm mounts with this "
                              "type; the FrankenFS arm detects it from the image either way")
@@ -712,9 +719,22 @@ def main() -> int:
     # ── FrankenFS arm ──────────────────────────────────────────────────────────
     fimage = work / "fuse.img"
     shutil.copyfile(args.image, fimage)
+    fuse_target = fimage
+    fuse_loop = None
+    if args.fuse_transport == "loop":
+        # Both arms then cross the block layer and the loop driver, so the ratio
+        # stops carrying a transport difference the filesystems are not
+        # responsible for (bd-5hqj2).
+        attached = sudo("losetup", "--find", "--show", str(fimage))
+        if attached.returncode != 0:
+            sys.exit(f"FATAL: losetup for the FUSE arm failed: {attached.stderr[-300:]}")
+        fuse_loop = attached.stdout.strip()
+        # The daemon runs unprivileged; the loop node is root:disk.
+        sudo("chown", str(os.getuid()), fuse_loop)
+        fuse_target = Path(fuse_loop)
     fmnt = work / "fmnt"
     daemon = subprocess.Popen(
-        [str(args.cli.resolve()), "mount", "--rw", str(fimage), str(fmnt)],
+        [str(args.cli.resolve()), "mount", "--rw", str(fuse_target), str(fmnt)],
         stdout=(work / "mount.log").open("w"), stderr=subprocess.STDOUT,
     )
     try:
@@ -727,13 +747,15 @@ def main() -> int:
         workload = fmnt / subdir / "fsync.bin"
         make_workload_file(workload, as_root=False)
         rows.append(measure_fuse_arm(daemon.pid, workload, client, args.operations,
-                                     work, fimage))
+                                     work, fuse_target))
     finally:
         run(["fusermount3", "-u", str(fmnt)])
         try:
             daemon.wait(timeout=20)
         except subprocess.TimeoutExpired:  # pragma: no cover
             daemon.kill()
+        if fuse_loop:
+            sudo("losetup", "-d", fuse_loop)
 
     # The image the FUSE arm just wrote, checked before any number is reported.
     fsck_summary = fsck_or_die(fimage, args.fstype)

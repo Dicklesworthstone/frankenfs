@@ -9774,3 +9774,41 @@ see how much of `0.461109x` survives.
 
 So bd-5rxz0 is no longer an ergonomics bead. It is the prerequisite for a transport-symmetric
 comparison, and until it closes, the fsync row keeps this qualification wherever it is quoted.
+
+## MEASURED — 2026-08-17 — the btrfs counts are TRANSPORT-INVARIANT, which sharpens bd-5hqj2 rather than answering it (PlumBeacon)
+
+bd-5rxz0 was closed by CreamTrout (fix `2241d060d`, tests `9e35833e9`) — and it turned out to be three
+sites, not the one I filed: `FileByteDevice::open` sizing via `metadata().len()`, plus TWO large-read
+guards that re-stat a length that is always 0 for a block special. That unblocked the transport
+question I raised on the admitted btrfs fsync row, so I ran the counted half of it immediately.
+
+**`scripts/fsync_flush_count.py` gained `--fuse-transport file|loop`.** With `loop`, the FrankenFS arm
+mounts a loop device over its image, so BOTH arms cross the block layer and the loop driver, instead
+of only the kernel arm doing so.
+
+| FUSE arm transport | barriers/fsync | bytes/fsync | vs kernel btrfs |
+|---|---|---|---|
+| `file` (production shape) | 3.0000 | 102400 | 1.389x |
+| `loop` (symmetric) | **3.0000** | **102400** | **1.389x** |
+
+**Identical, to the integer.** That is the expected result and it is worth having stated: the counts
+measure what the filesystem ASKS ITS BACKING STORE FOR, and routing those requests through a loop
+device does not change how many there are or how large. **So the transport hypothesis for the 2.17x
+is specifically about the COST of servicing each request, not about the number of them** — which
+means no count can settle it and only a timed, transport-symmetric run can.
+
+**A second result falls out for free:** a btrfs read-write mount over a block device works end to end
+and leaves a consistent image — `btrfs check` clean after 64 commits through the loop-mounted daemon.
+bd-5rxz0's own verification was ext4-only (a 4 MiB pread on ext4), so this extends it to the btrfs
+write path at no cost.
+
+**What is still needed to close bd-5hqj2's transport half.** The comparator must be able to put its
+FUSE arm on a loop device the way it already does for the kernel arm; `--ffs-cli` currently receives
+an image path that the harness manages. With that, re-run `fsync-journal-commit` at 96 pairs and see
+how much of `0.461109x` survives when both arms carry the same block layer. Until then the admitted
+row keeps its qualification, and the honest reading is unchanged: it is a file-backed-image result,
+not a filesystem-vs-filesystem result.
+
+Window, recorded per instruction: loadavg 32.14/29.22/27.27 (kernel arm) and 33.61/29.66/27.43 (FUSE
+arm), CPU idle 22-25% measured with `vmstat`, iowait 0. A count does not care, which is why it was
+the right thing to run on a host this busy.
