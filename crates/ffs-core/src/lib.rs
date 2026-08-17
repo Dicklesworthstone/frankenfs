@@ -17922,6 +17922,47 @@ const fn btrfs_commit_would_strand_free_space_tree(
     fst_root_item_patched && !fst_block_written
 }
 
+/// Byte range of `generation` inside a `btrfs_header`.
+///
+/// Layout: `csum[32] fsid[16] bytenr@48 flags@56 chunk_tree_uuid[16] generation@80`.
+const BTRFS_HEADER_GENERATION_RANGE: std::ops::Range<usize> = 0x50..0x58;
+
+/// Read the `generation` a metadata block claims in its own header.
+///
+/// `None` when the buffer is too short to contain one, so a truncated read can
+/// never be mistaken for generation 0 — which would silently pass the
+/// [`btrfs_free_space_tree_generation_matches`] check against a tree whose real
+/// generation happens to be 0.
+fn btrfs_header_generation(header: &[u8]) -> Option<u64> {
+    header
+        .get(BTRFS_HEADER_GENERATION_RANGE)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("range is exactly 8 bytes")))
+}
+
+/// Whether the free-space tree's ROOT_ITEM and its on-disk block agree on a
+/// generation — the exact pair the kernel compares (bd-73bi2).
+///
+/// This is the invariant whose violation made 20000-file images unopenable:
+/// `parent transid verify failed on logical N wanted 10 found 9`, then
+/// `open_ctree failed: -5`. It is checked against bytes READ BACK FROM DISK
+/// rather than against what the commit intended to write, because every proxy
+/// for it has now been wrong once. The predicate that used to guard this
+/// compared `fst_generation != new_gen`, which stopped meaning anything the
+/// moment the tree was correctly held at its own generation, and the call site
+/// was disabled with `&& false` rather than re-derived.
+///
+/// `None` from the reader is a FAILURE, not a pass: a block we cannot read is
+/// a block we cannot vouch for.
+const fn btrfs_free_space_tree_generation_matches(
+    root_item_generation: u64,
+    block_generation: Option<u64>,
+) -> bool {
+    match block_generation {
+        Some(on_disk) => on_disk == root_item_generation,
+        None => false,
+    }
+}
+
 const fn btrfs_compat_ro_after_commit(existing: u64, fst_committed: bool) -> u64 {
     if fst_committed {
         existing | BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID
@@ -29632,40 +29673,39 @@ impl OpenFs {
             item_type: BTRFS_ITEM_ROOT_ITEM,
             offset: 0,
         };
-        let fst_reuse: Option<(u64, u8)> =
-            if let Some(mut fst_root_data) = alloc.root_tree.get(&fst_root_key) {
-                let parsed = ffs_btrfs::parse_root_item(&fst_root_data).map_err(|e| {
-                    FfsError::Parse(format!("FREE_SPACE_TREE ROOT_ITEM parse failed: {e}"))
-                })?;
-                let (fst_addr, fst_level) = (parsed.bytenr, parsed.level);
-                // bd-73bi2: keep the ROOT_ITEM at the tree's OWN generation
-                // instead of advancing it to `new_gen`. The block below is
-                // written with the same value, so pointer and block always
-                // agree -- whether or not the rewrite happens. Advancing the
-                // pointer while the block might not be rewritten is what
-                // stranded the tree above ~4000 files and made the image
-                // unopenable by the kernel while FrankenFS read it fine. An
-                // unchanged tree keeping an older generation than the
-                // superblock is ordinary btrfs: that is how every tree a
-                // transaction does not touch behaves.
-                fst_generation = parsed.generation;
-                BtrfsRootItem::patch_root_commit(
-                    &mut fst_root_data,
-                    fst_addr,
-                    fst_level,
-                    fst_generation,
-                )
-                    .map_err(|e| {
-                        FfsError::Parse(format!("FREE_SPACE_TREE ROOT_ITEM patch failed: {e}"))
-                    })?;
-                alloc
-                    .root_tree
-                    .update(&fst_root_key, &fst_root_data)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                Some((fst_addr, fst_level))
-            } else {
-                None
-            };
+        let fst_reuse: Option<(u64, u8)> = if let Some(mut fst_root_data) =
+            alloc.root_tree.get(&fst_root_key)
+        {
+            let parsed = ffs_btrfs::parse_root_item(&fst_root_data).map_err(|e| {
+                FfsError::Parse(format!("FREE_SPACE_TREE ROOT_ITEM parse failed: {e}"))
+            })?;
+            let (fst_addr, fst_level) = (parsed.bytenr, parsed.level);
+            // bd-73bi2: keep the ROOT_ITEM at the tree's OWN generation
+            // instead of advancing it to `new_gen`. The block below is
+            // written with the same value, so pointer and block always
+            // agree -- whether or not the rewrite happens. Advancing the
+            // pointer while the block might not be rewritten is what
+            // stranded the tree above ~4000 files and made the image
+            // unopenable by the kernel while FrankenFS read it fine. An
+            // unchanged tree keeping an older generation than the
+            // superblock is ordinary btrfs: that is how every tree a
+            // transaction does not touch behaves.
+            fst_generation = parsed.generation;
+            BtrfsRootItem::patch_root_commit(
+                &mut fst_root_data,
+                fst_addr,
+                fst_level,
+                fst_generation,
+            )
+            .map_err(|e| FfsError::Parse(format!("FREE_SPACE_TREE ROOT_ITEM patch failed: {e}")))?;
+            alloc
+                .root_tree
+                .update(&fst_root_key, &fst_root_data)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            Some((fst_addr, fst_level))
+        } else {
+            None
+        };
         let mut fst_committed = false;
 
         // Build WriteDependencyDag for root_tree and commit it
@@ -29950,6 +29990,45 @@ impl OpenFs {
         }
 
         drop(alloc);
+
+        // bd-73bi2: before the superblock makes this transaction live, read the
+        // free-space tree block BACK OFF DISK and check it against the pointer
+        // we just published. This is the last moment refusing is still free —
+        // afterwards the image is what a kernel will try to mount.
+        //
+        // Checked against re-read bytes rather than against the values this
+        // function meant to write, because that is precisely the gap the P0
+        // lived in: every arm of the commit believed it had written a
+        // consistent pair, and the one that skipped its write left no trace any
+        // in-memory assertion could see. Our own reader does not verify parent
+        // transid, so nothing else in this process notices.
+        if let Some((fst_addr, _)) = fst_reuse {
+            let physical = resolve_physical(fst_addr).map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            let mut header = vec![0u8; ffs_btrfs::BTRFS_HEADER_SIZE];
+            self.dev
+                .read_exact_at(cx, ByteOffset(physical), &mut header)
+                .map_err(|e| {
+                    FfsError::Io(std::io::Error::other(format!(
+                        "bd-73bi2: free-space tree header read-back failed: {e}"
+                    )))
+                })?;
+            let on_disk = btrfs_header_generation(&header);
+            if !btrfs_free_space_tree_generation_matches(fst_generation, on_disk) {
+                // Latch read-only for the same reason the sibling refusal does:
+                // otherwise the caller takes one error and keeps writing into a
+                // transaction that can never land.
+                if let Some(state) = self.btrfs_alloc_state.as_ref() {
+                    state.write().commit_refused = true;
+                }
+                return Err(FfsError::Io(std::io::Error::other(format!(
+                    "bd-73bi2: refusing to advance the superblock — the FREE_SPACE_TREE \
+                     ROOT_ITEM publishes generation {fst_generation} but its block at \
+                     logical {fst_addr} reads {on_disk:?}. The kernel verifies exactly this \
+                     pair and would refuse the whole filesystem with open_ctree -5, while \
+                     our own reader would open it."
+                ))));
+            }
+        }
 
         // Read the existing on-disk superblock and patch it in place rather
         // than rebuilding from `BtrfsSuperblock::to_bytes`. The struct only
@@ -37891,6 +37970,64 @@ fn skipped_free_space_tree_rewrite_clears_the_feature_bits_bd_73bi2() {
 // imports (serde_json, tracing_subscriber, sha2). `cargo test` still passed,
 // which is why it survived: only a plain `cargo build` can see it.
 #[cfg(test)]
+
+/// bd-73bi2: the on-disk generation check, as a truth table.
+///
+/// The negative cases are the whole point. A proxy for this invariant has
+/// already been wrong once — the original guard compared the tree's
+/// generation against the transaction's, which stopped meaning anything as
+/// soon as the tree was correctly held back, and was disabled rather than
+/// re-derived. These assertions are about the pair the KERNEL compares.
+#[test]
+fn free_space_tree_generation_check_is_about_the_pair_the_kernel_compares_bd_73bi2() {
+    // The good case: pointer and block agree. Note this holds at a
+    // generation OLDER than the transaction's — an untouched tree keeping
+    // its own generation is ordinary btrfs, and a check that demanded
+    // `new_gen` here would refuse every correct commit.
+    assert!(btrfs_free_space_tree_generation_matches(9, Some(9)));
+
+    // The P0 itself: the pointer was advanced, the block was not rewritten.
+    assert!(
+        !btrfs_free_space_tree_generation_matches(10, Some(9)),
+        "wanted 10 found 9 is the exact kernel complaint this exists to prevent"
+    );
+
+    // The reverse skew is equally fatal and must not be waved through just
+    // because the block looks 'newer'.
+    assert!(!btrfs_free_space_tree_generation_matches(9, Some(10)));
+
+    // An unreadable block must FAIL, never pass. Treating `None` as a pass
+    // would make a truncated or failed read look like a verified tree.
+    assert!(
+        !btrfs_free_space_tree_generation_matches(9, None),
+        "a block we cannot read is a block we cannot vouch for"
+    );
+    assert!(
+        !btrfs_free_space_tree_generation_matches(0, None),
+        "generation 0 must not be confused with an absent read"
+    );
+}
+
+/// bd-73bi2: the header reader, including the short-buffer case that makes
+/// the `None`-is-failure rule reachable.
+#[test]
+fn btrfs_header_generation_reads_offset_0x50_and_rejects_short_buffers_bd_73bi2() {
+    let mut header = vec![0u8; ffs_btrfs::BTRFS_HEADER_SIZE];
+    header[0x50..0x58].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
+    assert_eq!(
+        btrfs_header_generation(&header),
+        Some(0x0123_4567_89ab_cdef)
+    );
+
+    // A zero generation is a real value, distinct from an absent one.
+    let zeroed = vec![0u8; ffs_btrfs::BTRFS_HEADER_SIZE];
+    assert_eq!(btrfs_header_generation(&zeroed), Some(0));
+
+    // One byte short of containing the field.
+    assert_eq!(btrfs_header_generation(&vec![0u8; 0x57]), None);
+    assert_eq!(btrfs_header_generation(&[]), None);
+}
+
 mod tests {
     // This (very large) test module relaxes pedantic/nursery style lints plus a
     // few default-level noise lints that accumulated while ffs-core's clippy was
