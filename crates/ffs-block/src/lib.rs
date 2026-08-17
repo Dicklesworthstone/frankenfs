@@ -3736,6 +3736,63 @@ mod tests {
         }
     }
 
+    /// `backing_len` must agree with `metadata().len()` for a REGULAR file, so
+    /// the block-special branch (bd-5rxz0) cannot change behaviour for the
+    /// overwhelmingly common case. The block-device branch itself needs a loop
+    /// device and root; see `backing_len_on_a_block_special_is_the_device_size`.
+    #[test]
+    fn backing_len_matches_metadata_for_a_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("regular.img");
+        std::fs::write(&path, vec![7_u8; 8192]).expect("seed");
+        let file = OpenOptions::new().read(true).open(&path).expect("open");
+        assert_eq!(
+            backing_len(&file).expect("backing_len"),
+            8192,
+            "a regular file's length must still come from metadata().len()"
+        );
+    }
+
+    /// The bd-5rxz0 regression, end to end. IGNORED because it needs a loop
+    /// device and passwordless sudo, neither of which a unit-test runner has.
+    ///
+    /// The defect had THREE sites and this exercises all of them: `open` sized
+    /// the image with `metadata().len()` (0 for a block special, so the image
+    /// looked empty and was refused), and the two large-read guards re-`stat`ed
+    /// the backing file and compared against that same 0, failing every read at
+    /// or above `file_device_direct_read_min()`. A fix to `open` alone passes an
+    /// open-only test and still fails the large read, which is why the read here
+    /// is deliberately far above the 64 KiB threshold.
+    ///
+    ///   img=/tmp/blk.img; cp <ext4 image> $img
+    ///   loop=$(sudo losetup --find --show $img)
+    ///   cargo test -p ffs-block -- --ignored backing_len_on_a_block_special \
+    ///       # with FFS_TEST_BLOCK_DEVICE=$loop
+    ///   sudo losetup -d $loop
+    #[test]
+    #[ignore = "needs a loop device and sudo; set FFS_TEST_BLOCK_DEVICE"]
+    fn backing_len_on_a_block_special_is_the_device_size() {
+        let Ok(dev) = std::env::var("FFS_TEST_BLOCK_DEVICE") else {
+            panic!("set FFS_TEST_BLOCK_DEVICE=/dev/loopN (see the doc comment)");
+        };
+        let file = OpenOptions::new().read(true).open(&dev).expect("open device");
+        let meta_len = file.metadata().expect("metadata").len();
+        let real_len = backing_len(&file).expect("backing_len");
+        assert_eq!(meta_len, 0, "st_size is 0 for a block special — the premise");
+        assert!(
+            real_len > 0,
+            "backing_len must report the DEVICE size, not st_size; got {real_len}"
+        );
+        let dev = FileByteDevice::open(&dev).expect("FileByteDevice::open");
+        assert_eq!(dev.len, real_len, "open must size the device the same way");
+        // The guard regression: a read at or above the large-read threshold must
+        // succeed rather than trip the live-length check against a stale 0.
+        let big = file_device_direct_read_min().max(64 * 1024) * 2;
+        let mut buf = vec![0_u8; big];
+        dev.read_exact_at(&Cx::for_testing(), ByteOffset(0), &mut buf)
+            .expect("a large read through a block device must succeed");
+    }
+
     #[test]
     fn byte_block_device_round_trips() {
         let cx = Cx::for_testing();
