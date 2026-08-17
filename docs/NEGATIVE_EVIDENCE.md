@@ -10721,3 +10721,52 @@ are all INADMISSIBLE and none may be quoted**, including for comparison against 
 attempt and expect roughly half to abort on the pre-measurement guard. Retry is the strategy; each
 attempt is cheap and the artifacts stay at 2.1G total because failed runs are discarded. Do not raise
 the pair count to chase the null — that is what this entry measured to be backwards.
+
+## MEASURED, VETOED, AND IT MAKES bd-w2u82 THE CAMPAIGN'S BIGGEST OPEN QUESTION — 2026-08-17 (PlumBeacon)
+
+ext4 `fsync-journal-commit`, candidate `c9fb745f…`, 192 pairs:
+
+    fuse_over_kernel_median=0.307345, ci_low=0.302910, ci_high=0.311926
+    kernel null 1.000855 spread 1.012982 CLEAR | fuse null 0.993063 spread 1.018737 CLEAR
+    directional_claim_clear=true, admitted=true, verdict=HONEST_WIN
+    kernel median 104.15 ms | fuse median 31.93 ms  (8 x 4 KiB write+fsync)
+    RUN REFUSED: external_load CONTENDED — 153/153 samples over limit, 60 peak busy CPUs,
+    peak off-placement mean busy 98.5%
+
+**My prediction was right in direction and badly wrong in size.** bd-jgq8e predicted this row "could
+tip to an admitted WIN" from `0.997098x` NEUTRAL. It measured `0.307345x` — **3.25x faster**. I
+predicted a small movement because the ext4 lever is only 1.67x fewer metadata blocks per boundary.
+
+**And that gap is the finding.** We write `3.00` blocks per client fsync against kernel ext4's `4.00`
+— `0.750x` the bytes, counted in exact integers with both arms in one invocation. **A 0.750x byte
+ratio cannot produce a 3.25x speedup.** Something other than the filesystems' own work dominates this
+row.
+
+### The pattern across three rows now points one way
+
+| row | our bytes vs kernel | wall-clock ratio |
+| --- | --- | --- |
+| btrfs fsync/journal commit | **1.389x MORE** | `0.449–0.463x` (admitted twice) |
+| btrfs parallel metadata writes | — | `0.798200x` (admitted) |
+| ext4 fsync/journal commit | `0.750x` | `0.307345x` (vetoed, nulls clear) |
+
+Every one is **durability-bound**, and in the btrfs case we are faster *while writing 39% more bytes
+and issuing 3 barriers to the kernel's 2*. The common factor is not our write path: **the incumbent
+mounts over a loop device on every one of these rows, and we do not** (`bd-w2u82`). Kernel ext4 and
+kernel btrfs cannot mount a plain file without one; our daemon `pwrite`/`fdatasync`s the image
+directly. Every barrier the incumbent issues crosses the block layer and a loop worker; ours does not.
+
+**So the honest reading of all three rows is that a large and unmeasured share of these wins is
+transport, not filesystem.** That is not a reason to withdraw them — they are real answers to "which
+is faster for a file-backed image on this host", which is a genuine operator question for VM images
+and container layers. It is a reason to stop describing them as filesystem wins until bd-w2u82 runs.
+
+**bd-w2u82 is now the highest-value open item in this campaign.** It is unblocked (bd-5rxz0 closed, so
+`ffs-cli` mounts a block device; I have verified a btrfs rw mount over `/dev/loopN` is `btrfs check`
+clean after 64 commits). It needs one harness flag to put the FUSE arm on a loop device as the kernel
+arm already is, and then one re-run per row. Until then every fsync-dominated ratio in both scorecards
+carries the qualification.
+
+**Row status:** not banked. Nulls clear and the ratio line says `HONEST_WIN`, but the run was refused
+on socket contention with the socket at 98.5% off-placement busy — genuinely the busiest condition
+measured today, not a marginal call.
