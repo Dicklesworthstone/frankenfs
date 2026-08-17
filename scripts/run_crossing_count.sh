@@ -49,8 +49,21 @@ LOG="$WORK/daemon.log"
 env FFS_FUSE_XATTR_NO_SUPPORT=auto FFS_MOUNT_BENCH_EVIDENCE=1 \
   "$CLI" mount "$IMG" "$WORK/mnt" >> "$LOG" 2>&1 &
 DAEMON=$!
-for _ in $(seq 1 150); do mountpoint -q "$WORK/mnt" && break; sleep 0.05; done
-mountpoint -q "$WORK/mnt" || { echo "FATAL: mount did not appear"; tail -3 "$LOG"; exit 3; }
+# 120s, not the 7.5s this used to allow. `auto` PROVES the image carries no
+# xattrs by walking the whole inode table at mount, before it serves a request,
+# and on a debug ELF that is slow: measured 13.5s to reach "suppression ACTIVE"
+# on a 512MB / 32768-inode image. The old bound gave up first and reported
+# "mount did not appear" while the daemon was still scanning -- and then left it
+# running, so the next attempt raced a live mount. This is a fail-closed wait,
+# not a latency budget, so it is sized far above the slowest arm rather than
+# near it.
+for _ in $(seq 1 1200); do mountpoint -q "$WORK/mnt" && break; sleep 0.1; done
+mountpoint -q "$WORK/mnt" || {
+  echo "FATAL: mount did not appear within 120s"
+  tail -3 "$LOG"
+  kill "$DAEMON" 2>/dev/null
+  exit 3
+}
 
 # Confirm the arm is what it claims BEFORE counting anything. An arm that
 # silently ran the control is how a btrfs certification reported a null on
