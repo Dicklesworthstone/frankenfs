@@ -162,8 +162,66 @@ impl Crossings {
     }
 }
 
+/// Ingest the raw per-slot counts the vendored `fuser` records at dispatch.
+///
+/// The counting lives in `fuser::Request::dispatch` because that is the single
+/// point every decoded request passes through before any handler; this side
+/// owns the vocabulary (labels, ordering, rendering) so the metrics line and the
+/// ledger speak one language.
+#[must_use]
+pub fn render_fuser_counts(counts: [u64; fuser::CROSSING_SLOTS]) -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = counts[op.index()];
+        total += value;
+        out.push_str(&format!("crossings_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" crossings_total={total}"));
+    out
+}
+
+/// Live counts from the daemon, rendered for the metrics line.
+#[must_use]
+pub fn render_live() -> String {
+    render_fuser_counts(fuser::crossing_counts())
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The two index tables live in different crates -- `fuser::crossing_slot`
+    /// assigns them, `CrossingOp::index` names them -- and a silent drift would
+    /// mislabel every count while still summing correctly, which is the worst
+    /// kind of instrument bug. This pins the shape they must share.
+    #[test]
+    fn the_slot_count_matches_the_vendored_counter_bd_xfe7z() {
+        assert_eq!(
+            CrossingOp::ALL.len(),
+            fuser::CROSSING_SLOTS,
+            "fuser records {} slots and this module names {}; adding an opcode on \
+             one side without the other mislabels every count after it",
+            fuser::CROSSING_SLOTS,
+            CrossingOp::ALL.len()
+        );
+    }
+
+    /// Ingest must preserve position: slot i is the opcode at index i, and the
+    /// total is the sum of what was handed in, not a recount.
+    #[test]
+    fn ingest_preserves_slot_position_and_total_bd_xfe7z() {
+        let mut counts = [0_u64; fuser::CROSSING_SLOTS];
+        counts[CrossingOp::Getxattr.index()] = 7;
+        counts[CrossingOp::Readdirplus.index()] = 11;
+        let line = super::render_fuser_counts(counts);
+        assert!(line.contains("crossings_getxattr=7"), "{line}");
+        assert!(line.contains("crossings_readdirplus=11"), "{line}");
+        assert!(line.contains("crossings_lookup=0"), "{line}");
+        assert!(line.contains("crossings_total=18"), "{line}");
+    }
     use super::{CrossingOp, Crossings};
 
     /// Indices must be unique and dense, or two opcodes share a counter and

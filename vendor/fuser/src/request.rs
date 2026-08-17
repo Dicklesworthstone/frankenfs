@@ -61,6 +61,56 @@ pub struct Request<'a> {
     request: ll::AnyRequest<'a>,
 }
 
+/// Per-opcode counts of requests that crossed the FUSE boundary (bd-xfe7z).
+///
+/// Incremented in [`Request::dispatch`], which is the single point every
+/// decoded request passes through BEFORE any filesystem handler, memo, cache or
+/// early return can answer it. That placement is the whole point: `ffs-fuse`'s
+/// `requests_total` counted request SCOPES and missed 5979 of 6001 warm stats
+/// because the capability-probe memo returned before the scope was opened
+/// (bdd0fd1b). One device read is one dispatch; anything skippable is not the
+/// boundary.
+///
+/// A process-global because `Request` has no handle to the filesystem's state
+/// and one daemon serves one mount. Relaxed ordering: these are read once at
+/// the end of a run and order nothing.
+///
+/// The index order is mirrored by `ffs_fuse::crossings::CrossingOp`, and the two
+/// are pinned against each other by a test there -- a silent drift would
+/// mislabel every count.
+pub static CROSSING_COUNTS: [std::sync::atomic::AtomicU64; CROSSING_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; CROSSING_SLOTS];
+
+/// Number of opcode slots, last one being "everything else".
+pub const CROSSING_SLOTS: usize = 10;
+
+/// Slot for one operation. Must agree with `CrossingOp::index` in `ffs-fuse`.
+fn crossing_slot(op: &ll::Operation<'_>) -> usize {
+    match op {
+        ll::Operation::Lookup(_) => 0,
+        ll::Operation::GetAttr(_) => 1,
+        ll::Operation::GetXAttr(_) => 2,
+        ll::Operation::ReadDir(_) => 3,
+        ll::Operation::ReadDirPlus(_) => 4,
+        ll::Operation::Open(_) => 5,
+        ll::Operation::OpenDir(_) => 6,
+        ll::Operation::Release(_) => 7,
+        ll::Operation::ReleaseDir(_) => 8,
+        _ => 9,
+    }
+}
+
+/// Read the counts. Returned by value so a caller cannot hold a reference into
+/// live counters while formatting them.
+#[must_use]
+pub fn crossing_counts() -> [u64; CROSSING_SLOTS] {
+    let mut out = [0_u64; CROSSING_SLOTS];
+    for (slot, counter) in CROSSING_COUNTS.iter().enumerate() {
+        out[slot] = counter.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 impl<'a> Request<'a> {
     /// Create a new request from the given data
     pub(crate) fn new(ch: ChannelSender, data: &'a [u8]) -> Option<Request<'a>> {
@@ -130,6 +180,16 @@ impl<'a> Request<'a> {
     /// request and sends back the returned reply to the kernel
     pub(crate) fn dispatch<FS: Filesystem>(&self, se: &mut Session<FS>) {
         debug!("{}", self.request);
+        // bd-xfe7z: count the crossing HERE -- before dispatch_req, before any
+        // handler, memo, cache or early return. A request that reached this
+        // line crossed the boundary regardless of how it is answered.
+        if let Ok(operation) = self.request.operation() {
+            CROSSING_COUNTS[crossing_slot(&operation)]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            CROSSING_COUNTS[CROSSING_SLOTS - 1]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let unique = self.request.unique();
 
         let res = match self.dispatch_req(se) {
