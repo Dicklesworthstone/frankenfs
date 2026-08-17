@@ -8152,3 +8152,57 @@ kind**. Bytes and node counts are a mechanism, not a prediction: the row this ha
 (`fsync/journal-commit`) is 1.98x, and on ext4 the same class of counting moved bytes 1.250x -> 0.750x
 while the timed row did not move. What these integers do support is a **sizing**: the fs tree is
 where ~96% of the metadata write lives, so a lever that does not touch the fs tree cannot matter here.
+
+## WIN — 2026-08-17 — bd-42gtq: btrfs metadata write amplification 21.389x -> 1.389x, 96 tree nodes per fsync -> 6 (PlumBeacon)
+
+**Lever.** Write a tree block only if this mount has not already written it. The `block -> (bytenr,
+generation)` map is retained per tree across commits in `BtrfsAllocState::written_tree_blocks`,
+supplying the on-disk identity the rebuilt in-memory tree otherwise lacks. Unchanged blocks keep
+their address and are skipped; they stay in the DAG, because their COWed ancestors point at them and
+the DAG is what orders children before parents (WB-I1).
+
+**Measured LIVE, incumbent in the SAME invocation** (`scripts/fsync_flush_count.py --fstype btrfs`),
+deterministic at N=8, 64 and 256, idle controls 0 in every run, per-arm provenance on every row:
+
+| | barriers/fsync | bytes/fsync | tree nodes/fsync | vs kernel btrfs |
+|---|---|---|---|---|
+| kernel btrfs | 2.0000 | 73728 | — | — |
+| FrankenFS BEFORE | 3.0000 | 1576960 | 96 | **21.389x** |
+| FrankenFS AFTER | 3.0000 | **102400** | **6** | **1.389x** |
+
+Write-size histogram after: 1 x 4096 (the data block) + **6 x 16384** per client fsync, down from 96.
+Sample window: loadavg 16.7-21.3, cross-core clock spread 2.84-3.00x, per-arm mean clocks 2270-2963
+MHz — recorded because a count is only comparable with its window attached.
+
+**The prediction was recorded before measuring and it held.** bd-42gtq's corrected direction predicted
+"the COW path, ~2 at this tree's depth 2, plus whatever extent/root/csum actually touched". Measured
+6. Had the count not dropped, the COW-propagation assumption was the thing to re-examine.
+
+**THE HAZARD THIS TURNS ON, and it is a P0 shape.** btrfs stores a generation in every parent key_ptr
+and a reader verifies it against the child block's own header. `serialize_node` stamped
+`self.generation` for every child unconditionally — correct only while every block is rewritten every
+commit. Reuse a child without fixing that and the parent claims a generation the child does not have:
+`parent transid verify failed ... wanted G found H`, then `open_ctree failed: -5`, and the kernel
+refuses the filesystem while our own reader opens it perfectly. That is exactly bd-73bi2. So
+`DiskWritebackContext` now carries a per-block generation map, and the same rule is applied to the
+FS_TREE ROOT_ITEM: a reused root means the transaction changed nothing, so the ROOT_ITEM keeps the
+generation its block actually carries instead of advancing to `new_gen`.
+
+**Correctness.** Kernel readback mandatory and passed at 2000 / 5000 / 20000 files (2001 / 5001 /
+20001 names and sizes verified through a FrankenFS mount then handed to the kernel), and `btrfs check`
+reports **no error found** at all three sizes with no transid complaint. ffs-btrfs 398 passed,
+ffs-core 1226 passed, 0 failed. ext4 re-counted and UNCHANGED at 0.750x, which matters because the
+`DiskWritebackContext` change is shared code.
+
+**Tests.** `generation_of_block_reports_the_childs_own_generation_bd_42gtq` pins the reuse case that
+is `open_ctree -5` if inverted; `an_empty_generation_map_matches_the_old_constructor_bd_42gtq` pins
+that the new constructor is ADDITIVE, since the ext4 commit path, the simulator and three other btrfs
+trees all still use the old one.
+
+⚠️ **Two things NOT claimed.** No timed A/B — the release-perf daemon is still stale (bd-9jat1). And
+the barrier count is UNCHANGED at 3.0000 against the kernel's 2.0000: still btrfs-specific, still
+unexplained, and untouched by this lever. The row this serves is 1.98x; bytes are a mechanism, not a
+prediction, and on ext4 the same class of counting moved bytes without moving the timed row at all.
+
+**Scope: only the FS_TREE is covered.** The csum, extent and root trees still write every block every
+commit — that is most of the residual 6 nodes, and the same map extends to them (bd-rsjvf).

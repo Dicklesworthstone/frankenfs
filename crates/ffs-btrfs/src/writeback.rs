@@ -722,6 +722,20 @@ pub struct DiskWritebackContext {
     /// When `None`, falls back to the simulator-only synthetic
     /// `block * nodesize` mapping.
     allocated_addrs: Option<BTreeMap<u64, u64>>,
+    /// bd-42gtq: per-block on-disk generation, for blocks this transaction is
+    /// NOT rewriting.
+    ///
+    /// btrfs stores a generation in every parent key_ptr and a reader verifies it
+    /// against the child block's own header — that check is what reports
+    /// `parent transid verify failed ... wanted G found H` and refuses the whole
+    /// filesystem with `open_ctree -5` (bd-73bi2, a P0). So a commit that reuses
+    /// an unchanged child block MUST stamp that child's real generation into the
+    /// COWed parent's pointer, not the transaction's.
+    ///
+    /// Absent (or missing an entry) means "this block is being written by this
+    /// transaction", so it carries `generation` — which is exactly the previous
+    /// behaviour for every caller that does not supply this map.
+    block_generations: Option<BTreeMap<u64, u64>>,
 }
 
 impl DiskWritebackContext {
@@ -742,6 +756,7 @@ impl DiskWritebackContext {
             nodesize,
             sector_size,
             allocated_addrs: None,
+            block_generations: None,
         }
     }
 
@@ -767,7 +782,50 @@ impl DiskWritebackContext {
             nodesize,
             sector_size,
             allocated_addrs: Some(allocated_addrs),
+            block_generations: None,
         }
+    }
+
+    /// Same as [`Self::with_allocated_addresses`], plus the on-disk generation of
+    /// each block this transaction is NOT rewriting (bd-42gtq).
+    ///
+    /// Only blocks being reused need an entry; anything absent is treated as
+    /// written-by-this-transaction and carries `generation`, so passing an empty
+    /// map is byte-identical to [`Self::with_allocated_addresses`].
+    #[must_use]
+    pub fn with_allocated_addresses_and_generations(
+        fsid: [u8; 16],
+        chunk_tree_uuid: [u8; 16],
+        generation: u64,
+        owner: u64,
+        nodesize: u32,
+        sector_size: u32,
+        allocated_addrs: BTreeMap<u64, u64>,
+        block_generations: BTreeMap<u64, u64>,
+    ) -> Self {
+        Self {
+            fsid,
+            chunk_tree_uuid,
+            generation,
+            owner,
+            nodesize,
+            sector_size,
+            allocated_addrs: Some(allocated_addrs),
+            block_generations: Some(block_generations),
+        }
+    }
+
+    /// The generation a parent key_ptr must record for `block`.
+    ///
+    /// The child's own on-disk generation when this transaction is reusing it
+    /// rather than rewriting it; otherwise this transaction's. Getting this wrong
+    /// in the reuse direction is `open_ctree -5` (bd-73bi2).
+    #[must_use]
+    pub fn generation_of_block(&self, block: u64) -> u64 {
+        self.block_generations
+            .as_ref()
+            .and_then(|gens| gens.get(&block).copied())
+            .unwrap_or(self.generation)
     }
 
     /// Convert an in-memory block number to a disk byte offset.
@@ -848,7 +906,16 @@ impl DiskWritebackContext {
         let (child_generations, child_bytenrs, child_min_keys) = match &node {
             BtrfsCowNode::Leaf { .. } => (Vec::new(), Vec::new(), Vec::new()),
             BtrfsCowNode::Internal { children, .. } => {
-                let gens = children.iter().map(|_| self.generation).collect();
+                // bd-42gtq: each child's OWN on-disk generation, which is this
+                // transaction's for a child it rewrites and the child's existing
+                // one for a child it reuses. Stamping `self.generation`
+                // unconditionally is only correct while every block is rewritten
+                // every commit; once blocks are reused it is `parent transid
+                // verify failed` and the kernel refuses the filesystem.
+                let gens = children
+                    .iter()
+                    .map(|c| self.generation_of_block(*c))
+                    .collect();
                 let bytenrs = children.iter().map(|c| self.block_to_bytenr(*c)).collect();
                 // Each key_ptr must carry the child's true subtree minimum key,
                 // not the CoW separator (bd-6uyto).
@@ -2233,5 +2300,87 @@ mod tests {
         }
 
         assert!(saw_transition, "should have seen the linearization point");
+    }
+
+    /// bd-42gtq. btrfs stores a generation in every parent key_ptr and a reader
+    /// verifies it against the child block's own header. Once a commit REUSES an
+    /// unchanged child instead of rewriting it, that child still carries its old
+    /// generation, so a COWed parent must record the CHILD's generation and not
+    /// the transaction's. Getting this backwards is `parent transid verify failed
+    /// ... wanted G found H` and the kernel refuses the whole filesystem with
+    /// `open_ctree failed: -5` — the P0 shape of bd-73bi2, on an image our own
+    /// reader opens perfectly well.
+    #[test]
+    fn generation_of_block_reports_the_childs_own_generation_bd_42gtq() {
+        let mut addrs = BTreeMap::new();
+        addrs.insert(7_u64, 0x10_0000_u64);
+        addrs.insert(9_u64, 0x20_0000_u64);
+        let mut gens = BTreeMap::new();
+        // Block 9 is being REUSED: it is on disk at generation 4, and this
+        // transaction is 10.
+        gens.insert(9_u64, 4_u64);
+
+        let ctx = DiskWritebackContext::with_allocated_addresses_and_generations(
+            [0x5A; 16], [0x5A; 16], 10, 5, 16384, 4096, addrs, gens,
+        );
+
+        assert_eq!(
+            ctx.generation_of_block(9),
+            4,
+            "a reused child must be recorded at the generation its BLOCK carries"
+        );
+        assert_eq!(
+            ctx.generation_of_block(7),
+            10,
+            "a child this transaction rewrites carries the transaction generation"
+        );
+        assert_eq!(
+            ctx.generation_of_block(12345),
+            10,
+            "an unknown block is being written, so it takes the transaction generation"
+        );
+    }
+
+    /// bd-42gtq. The generation map is ADDITIVE: with no reused blocks, the new
+    /// constructor must behave exactly like the old one, or landing it would have
+    /// silently changed every existing caller (the ext4 commit path, the
+    /// simulator, and three other btrfs trees).
+    #[test]
+    fn an_empty_generation_map_matches_the_old_constructor_bd_42gtq() {
+        let mut addrs = BTreeMap::new();
+        addrs.insert(3_u64, 0x30_0000_u64);
+
+        let legacy = DiskWritebackContext::with_allocated_addresses(
+            [0x11; 16],
+            [0x11; 16],
+            10,
+            5,
+            16384,
+            4096,
+            addrs.clone(),
+        );
+        let with_map = DiskWritebackContext::with_allocated_addresses_and_generations(
+            [0x11; 16],
+            [0x11; 16],
+            10,
+            5,
+            16384,
+            4096,
+            addrs,
+            BTreeMap::new(),
+        );
+
+        for block in [3_u64, 4, 99] {
+            assert_eq!(
+                legacy.generation_of_block(block),
+                with_map.generation_of_block(block),
+                "an empty generation map must not change block {block}"
+            );
+            assert_eq!(
+                legacy.block_to_bytenr(block),
+                with_map.block_to_bytenr(block),
+                "an empty generation map must not change addressing for block {block}"
+            );
+        }
     }
 }

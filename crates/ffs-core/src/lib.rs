@@ -1108,6 +1108,33 @@ struct BtrfsAllocState {
     nodesize: u32,
     /// Sector size in bytes (copied from superblock for convenience).
     sectorsize: u32,
+    /// bd-42gtq: in-memory block id -> on-disk bytenr, for every tree block this
+    /// mount has ALREADY written, keyed by tree objectid.
+    ///
+    /// This is the on-disk identity the in-memory tree otherwise lacks, and it is
+    /// what lets a commit write only the blocks it actually COWed. Measured
+    /// before it existed: 96 nodesize tree blocks written per 4 KiB client fsync,
+    /// against a filesystem holding 58 distinct metadata nodes in total, because
+    /// `WriteDependencyDag` is the whole tree and every commit rewrote all of it.
+    ///
+    /// THREE PROPERTIES MAKE READING IT SAFE, and none of them is incidental:
+    ///
+    /// 1. COW propagates to the root. Modifying a leaf COWs the leaf and every
+    ///    ancestor, so a node keeps its block id only if it AND its whole subtree
+    ///    are unchanged — which means the bytes written for it last commit, child
+    ///    pointers included, are still exactly right.
+    /// 2. In-memory block ids are NEVER REUSED. `InMemoryBtrfsAllocator::
+    ///    alloc_block` is a monotonic `next_block += 1` and `defer_free` only
+    ///    pushes onto a vec that is never popped, so an entry here cannot become
+    ///    a lie about a different node. If that allocator ever starts recycling,
+    ///    this map must be invalidated on free — see the test that pins it.
+    /// 3. A COWed parent's child pointers resolve through this map, so an
+    ///    unchanged child keeps its existing address and needs no write.
+    ///
+    /// Empty at mount, so the FIRST commit writes everything (the tree was
+    /// rebuilt from items and nothing on disk corresponds to its block ids).
+    written_tree_blocks:
+        std::collections::HashMap<u64, std::collections::BTreeMap<u64, (u64, u64)>>,
 }
 
 /// What to do with the data extent (if any) referenced by a purged
@@ -8486,6 +8513,9 @@ impl OpenFs {
             generation,
             nodesize,
             sectorsize,
+            // Empty on purpose: the tree was just rebuilt from items, so no block
+            // id in it corresponds to anything on disk yet (bd-42gtq).
+            written_tree_blocks: std::collections::HashMap::new(),
         })
     }
 
@@ -29319,13 +29349,38 @@ impl OpenFs {
         // Iterate block and level from the same immutable DAG entry. The DAG's
         // private BTreeMap preserves the ascending block order used for stable
         // logical-address allocation without a temporary block Vec or lookup.
+        //
+        // bd-42gtq: a block this mount has ALREADY written and which still has
+        // the same in-memory id is unchanged — COW propagates to the root, so an
+        // id survives only if the node and its whole subtree did — and its bytes
+        // on disk, child pointers included, are still exactly right. Reuse its
+        // address and do not write it. Measured before this: 96 nodesize blocks
+        // per 4 KiB client fsync on a filesystem holding 58 distinct nodes.
+        //
+        // A reused block keeps its OLD generation on disk, so its generation is
+        // carried into the context: any COWed parent must record that in its
+        // key_ptr, or a reader gets `parent transid verify failed` and refuses the
+        // filesystem (bd-73bi2, open_ctree -5).
+        let retained_fs = alloc
+            .written_tree_blocks
+            .get(&BTRFS_FS_TREE_OBJECTID)
+            .cloned()
+            .unwrap_or_default();
         let mut allocated_addrs = std::collections::BTreeMap::new();
+        let mut reused_generations = std::collections::BTreeMap::new();
+        let mut fs_blocks_to_write = std::collections::BTreeSet::new();
         for (block, level) in dag.blocks_with_levels() {
+            if let Some(&(bytenr, block_gen)) = retained_fs.get(&block) {
+                allocated_addrs.insert(block, bytenr);
+                reused_generations.insert(block, block_gen);
+                continue;
+            }
             let allocation = alloc
                 .extent_alloc
                 .alloc_metadata_for_tree(u64::from(nodesize), BTRFS_FS_TREE_OBJECTID, level)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
             allocated_addrs.insert(block, allocation.bytenr);
+            fs_blocks_to_write.insert(block);
             trace!(
                 target: "ffs::btrfs::writeback",
                 block,
@@ -29334,9 +29389,16 @@ impl OpenFs {
                 "node_address_allocated"
             );
         }
+        // Carried past the executor to update `written_tree_blocks` afterwards;
+        // the map itself is moved into the context below.
+        let fs_addr_snapshot = allocated_addrs.clone();
+        let fs_root_is_reused = retained_fs.contains_key(&alloc.fs_tree.root_block());
+        let reused_fs_root_generation = retained_fs
+            .get(&alloc.fs_tree.root_block())
+            .map(|&(_, block_gen)| block_gen);
 
         // Create disk writeback context with real allocated addresses
-        let disk_ctx = DiskWritebackContext::with_allocated_addresses(
+        let disk_ctx = DiskWritebackContext::with_allocated_addresses_and_generations(
             sb.fsid,
             sb.fsid, // chunk_tree_uuid = fsid for single-device
             new_gen,
@@ -29344,6 +29406,7 @@ impl OpenFs {
             nodesize,
             alloc.sectorsize,
             allocated_addrs,
+            reused_generations,
         );
 
         // Create the writeback executor
@@ -29378,6 +29441,13 @@ impl OpenFs {
         };
 
         let flush_result = executor.execute(|block, level| {
+            // bd-42gtq: an unchanged block is already on disk at this address with
+            // these bytes. It still has to stay in the DAG — its COWed ancestors
+            // point at it, and the DAG is what orders children before parents
+            // (WB-I1) — so it is skipped here rather than filtered out.
+            if !fs_blocks_to_write.contains(&block) {
+                return Ok(());
+            }
             // Serialize the node using DiskWritebackContext. For internal
             // nodes this resolves child block numbers to their allocated
             // logical addresses (see `DiskWritebackContext::serialize_node`).
@@ -29409,6 +29479,28 @@ impl OpenFs {
 
         flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
+        // bd-42gtq: record what is on disk for this tree now — blocks written by
+        // this transaction at `new_gen`, plus the reused ones at the generation
+        // they already had. Rebuilt from the CURRENT dag rather than merged into
+        // the old map, so blocks the tree no longer contains drop out and the map
+        // stays the size of the tree.
+        {
+            let recorded: std::collections::BTreeMap<u64, (u64, u64)> = fs_addr_snapshot
+                .iter()
+                .map(|(&block, &bytenr)| {
+                    let block_gen = if fs_blocks_to_write.contains(&block) {
+                        new_gen
+                    } else {
+                        retained_fs.get(&block).map_or(new_gen, |&(_, g)| g)
+                    };
+                    (block, (bytenr, block_gen))
+                })
+                .collect();
+            alloc
+                .written_tree_blocks
+                .insert(BTRFS_FS_TREE_OBJECTID, recorded);
+        }
+
         // Get fs_tree root location for ROOT_ITEM update
         let fs_tree_root = alloc.fs_tree.root_block();
         let fs_tree_bytenr = disk_ctx.block_to_bytenr(fs_tree_root);
@@ -29436,11 +29528,24 @@ impl OpenFs {
                     .into(),
             )
         })?;
+        // bd-42gtq: the generation the ROOT_ITEM publishes must be the one the
+        // root BLOCK actually carries. COW propagates to the root, so a reused
+        // root means this transaction changed nothing in the tree at all — and
+        // then the block on disk still has its old generation. Publishing
+        // `new_gen` over it is exactly the pair a kernel reader verifies and
+        // refuses (`parent transid verify failed` -> `open_ctree -5`), which is
+        // the P0 bd-73bi2 fixed for the free-space tree. An untouched tree
+        // keeping an older generation than the superblock is ordinary btrfs.
+        let fs_root_published_gen = if fs_root_is_reused {
+            reused_fs_root_generation.unwrap_or(new_gen)
+        } else {
+            new_gen
+        };
         BtrfsRootItem::patch_root_commit(
             &mut root_item_data,
             fs_tree_bytenr,
             fs_tree_level,
-            new_gen,
+            fs_root_published_gen,
         )
         .map_err(|e| FfsError::Parse(format!("ROOT_ITEM patch failed: {e}")))?;
         alloc
@@ -38136,6 +38241,7 @@ fn unvalidated_readdir_snapshot_matches_on_inode_only_bd_btrfs_ro_readdir() {
     assert!(readdir_snapshot_serve_unvalidated(&empty, 5, 0).is_none());
 }
 
+#[cfg(test)]
 /// bd-btrfs-ro-readdir: the knob is opt-in and inert unless set.
 ///
 /// Polarity matters more than usual here: enabled on a WRITABLE mount this
@@ -38153,6 +38259,7 @@ fn btrfs_ro_readdir_snapshot_knob_is_opt_in_bd_btrfs_ro_readdir() {
     );
 }
 
+#[cfg(test)]
 mod tests {
     // This (very large) test module relaxes pedantic/nursery style lints plus a
     // few default-level noise lints that accumulated while ffs-core's clippy was

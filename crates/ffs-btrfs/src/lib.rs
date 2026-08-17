@@ -25075,7 +25075,9 @@ mod parent_transid_tests {
     fn a_matching_generation_is_not_a_mismatch_bd_73bi2() {
         let block = block_with_generation(10);
         assert_eq!(
-            BtrfsHeader::parse_from_block(&block).expect("header").generation,
+            BtrfsHeader::parse_from_block(&block)
+                .expect("header")
+                .generation,
             10,
             "fixture must actually encode the generation, or this test proves nothing"
         );
@@ -25113,6 +25115,9 @@ mod parent_transid_tests {
     fn a_truncated_block_is_not_a_transid_mismatch_bd_73bi2() {
         assert_eq!(parent_transid_mismatch(10, &[]), None);
         assert_eq!(parent_transid_mismatch(10, &[0_u8; 8]), None);
-        assert_eq!(parent_transid_mismatch(10, &vec![0_u8; BTRFS_HEADER_SIZE - 1]), None);
+        assert_eq!(
+            parent_transid_mismatch(10, &vec![0_u8; BTRFS_HEADER_SIZE - 1]),
+            None
+        );
     }
 }
