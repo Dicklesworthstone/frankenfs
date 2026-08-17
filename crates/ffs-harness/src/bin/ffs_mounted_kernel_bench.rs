@@ -10468,15 +10468,21 @@ mod tests {
             format!(
                 "mount_bench_evidence,binary_sha256={sha}\n\
                  mount_build_profile,pgo_profile_sha256={pgo}\n\
-                 mount_candidate_knobs,count_memoized_requests=true,fuse_dispatch_workers=0\n"
+                 mount_candidate_knobs,count_memoized_requests=true,fuse_dispatch_workers=0\n\
+                 mount_candidate_xattr,xattr_suppression=refused,xattr_setting=off\n"
             ),
         )
         .expect("write mount log");
         let report = parse_mount_self_report(&complete, true).expect("parse self report");
         assert_eq!(report.identity.binary_sha256, sha);
+        // bd-ha71t: the RESOLVED xattr state is folded into the knob string, so a
+        // candidate-vs-candidate run can tell an ACTIVE suppression from a
+        // REFUSED one. This fixture gained that line when the fold landed; a
+        // complete log without it is now the "ELF too old" case, covered below.
         assert_eq!(
             report.runtime_knobs,
-            "count_memoized_requests=true,fuse_dispatch_workers=0"
+            "count_memoized_requests=true,fuse_dispatch_workers=0,\
+             xattr_suppression=refused,xattr_setting=off"
         );
 
         // An ELF too old to report its effective knobs cannot be an arm of a
