@@ -7701,3 +7701,61 @@ bytes-written-per-client-fsync in both arms before timing anything.
 **Retry predicate.** If `fsync-journal-commit` is ever re-measured near 2.0x, do NOT re-open the
 barrier-count hypothesis — it is closed by integers. Re-open only if the count itself changes,
 which `scripts/fsync_flush_count.py` re-checks in one command.
+
+## MECHANISM — 2026-08-17 — bd-2w2me: the fsync gap is not bytes either (1.250x), but the count found a redundant write and three unnecessary blocks (PlumBeacon)
+
+**Question.** bd-7nr8p refuted the barrier-count hypothesis (both arms 2.0000 per client fsync). With
+barrier counts equal, the cost had to be in what each barrier flushes. So: how many BYTES does each
+implementation put on its backing file per client fsync?
+
+**Measured.** `scripts/fsync_flush_count.py` (selftest 14 cases), same instrument and same boundary
+as bd-7nr8p — bytes to the BACKING FILE, from the loop device's `sectors written` for kernel ext4
+and from the daemon's own write syscalls for us. Deterministic at every N, idle controls 0:
+
+| arm | N | barriers/fsync | bytes/fsync | x 4 KiB client write |
+|---|---|---|---|---|
+| kernel ext4 | 8 / 64 / 256 | 2.0000 | 16384 | 4.00 |
+| FrankenFS | 8 / 64 / 256 | 2.0000 | 20480 | 5.00 |
+
+**Write amplification is 1.250x — so bytes do not explain the row either.** The ratio to close is
+`1.976308x` (25.06 ms vs 12.69 ms per operation). Barriers are 1.000x and bytes are 1.250x. Two
+mechanisms counted, two refuted as the dominant term.
+
+**But the count is not a dead end, because the trace says WHICH blocks.** Our five writes per client
+fsync land on four distinct blocks, identically every operation (4 KiB blocks; offsets from the
+same strace, counts for N=8):
+
+| block | offset | what it is | writes per client fsync |
+|---|---|---|---|
+| 0 | 0 | superblock (lives at byte 1024) | 1 |
+| 1 | 4096 | group descriptor table | **2** |
+| 163 | 667648 | inode table block for `fsync.bin` (table is 37-2084) | 1 |
+| 4446 | 18210816 | the file's data block | 1 |
+
+Two findings, both counted rather than argued:
+
+1. **Block 1 is written TWICE per client fsync.** The same 4 KiB at the same offset, twice, inside
+   one operation. That single redundancy is the whole 1.250x: 5 writes instead of 4.
+2. **The workload is a pure overwrite of an existing 4 KiB at offset 0 of an existing file — it
+   allocates nothing** — yet we rewrite the superblock AND the group descriptor table on every
+   single fsync. Neither is dirtied by an overwrite. Only the inode block (mtime) and the data block
+   have to move.
+
+**⚠️ What is NOT claimed.** Kernel ext4's 4 blocks were counted as a TOTAL (16384 bytes on the loop
+device), not resolved per block. Do not state which four they are without measuring; nothing here
+rests on it.
+
+**Lever this hands over (bd-fv9tc): 5 blocks -> 2.** Dropping the duplicate block-1 write and the
+superblock/GDT writes on an allocation-free overwrite would put us BELOW kernel ext4's 4 blocks, not
+merely level. Whether that moves the 1.976x is a separate question — bytes are 1.250x and the gap is
+1.976x, so it cannot close it alone, and anyone quoting this as a predicted speedup is overreading it.
+
+**Retry predicate.** Both counts are exact integers reproduced at N=8/64/256 in one command. If
+either changes, the write path changed; re-run before theorising.
+
+**Two instrument defects found and fixed while building this, recorded because both would have
+produced confident fiction:** (a) `strace -o FILE` writes a BARE pid prefix, not `[pid N]`, so a
+parser written for the bracketed form matched nothing and reported a daemon that never wrote;
+(b) a FUSE daemon's write traffic is dominated by `writev` to **/dev/fuse**, the reply channel —
+summing every write reports the FUSE PROTOCOL as backing-file write amplification. The counter now
+filters to the image fd, and the selftest pins both cases.

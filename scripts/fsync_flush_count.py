@@ -85,14 +85,18 @@ FLUSH_SYSCALLS = ("fsync", "fdatasync", "sync_file_range", "sync", "syncfs")
 # barrier has to flush, so the write syscalls are traced in the same window.
 WRITE_SYSCALLS = ("write", "pwrite64", "writev", "pwritev", "pwritev2")
 
-# A traced line, in any of the three shapes `strace -f` produces on a daemon with
-# 65 threads. The `<unfinished ...>` half carries no return value and is
-# deliberately unmatched here — its `resumed` counterpart carries it, and
-# counting both would double every interleaved call.
-TRACE_LINE = re.compile(
-    r"^(?:\[pid\s+\d+\]\s*)?"
-    r"(?:(?P<name>\w+)\(|<\.\.\.\s+(?P<resumed>\w+)\s+resumed>)"
-    r".*?=\s+(?P<ret>-?\d+)"
+# The shapes `strace -f -o FILE` produces on a 65-thread daemon. With `-o` the
+# pid prefix is BARE (`422667 writev(...)`), not the `[pid N]` form strace uses on
+# stderr — a regex written for the bracketed form silently matches nothing and
+# reports a daemon that never wrote anything.
+TRACE_COMPLETE = re.compile(
+    r"^(?:\[pid\s+(\d+)\]|(\d+))?\s*(\w+)\((-?\d+)?.*?=\s+(-?\d+)"
+)
+TRACE_UNFINISHED = re.compile(
+    r"^(?:\[pid\s+(\d+)\]|(\d+))?\s*(\w+)\((-?\d+)?.*<unfinished\s*\.\.\.>"
+)
+TRACE_RESUMED = re.compile(
+    r"^(?:\[pid\s+(\d+)\]|(\d+))?\s*<\.\.\.\s+(\w+)\s+resumed>.*?=\s+(-?\d+)"
 )
 
 
@@ -127,30 +131,82 @@ def parse_syscall_counts(text: str) -> dict[str, int]:
     return counts
 
 
-def parse_trace(text: str) -> tuple[dict[str, int], int]:
-    """(syscall -> completed calls, bytes written) from a NON-summary `strace -f`.
+def parse_trace(text: str, image_fd: int | None = None) -> tuple[dict[str, int], int]:
+    """(syscall -> completed calls, bytes written TO `image_fd`) from `strace -f`.
 
-    Bytes are summed from RETURN VALUES, never from the count argument and never
-    from the number of calls: a daemon writing 4 KiB in one call and one writing
-    512 bytes in four are not the same amount of I/O, and ranking them by call
-    count would invert them (bd-2w2me's stated negative case). A short write
-    returns less than it was asked for, and that shorter number is the truth.
+    THE FD FILTER IS THE WHOLE POINT, and leaving it out is the trap. A FUSE
+    daemon's write traffic is dominated by `writev` to /dev/fuse — the reply
+    channel — which is protocol, not storage. Summing every write would have
+    reported the FUSE protocol as backing-file write amplification and produced a
+    large, entirely fictional number. Only writes to the image fd count.
+    `image_fd=None` means count them all, which is for the selftest only.
+
+    Bytes come from RETURN VALUES, never from the count argument and never from
+    the number of calls: a daemon writing 4 KiB in one call and one writing 512
+    bytes in four are not the same I/O, and ranking by call count inverts them
+    (bd-2w2me's stated negative case). A short write returns less than it was
+    asked for, and the shorter number is the truth.
 
     A failed call (`= -1`) still counts as a call — it crossed — but contributes
     no bytes.
+
+    `strace -f` splits calls across an `<unfinished ...>` line and a `<... resumed>`
+    line, and only the first carries the fd while only the second carries the
+    return. They are matched up per-pid so a split write is neither dropped nor
+    counted against the wrong fd.
     """
     calls: dict[str, int] = {}
     written = 0
-    for line in text.splitlines():
-        match = TRACE_LINE.match(line)
-        if not match:
-            continue
-        name = match.group("name") or match.group("resumed")
-        ret = int(match.group("ret"))
+    pending: dict[str, tuple[str, int | None]] = {}
+
+    def record(name: str, fd: int | None, ret: int) -> None:
+        nonlocal written
         calls[name] = calls.get(name, 0) + 1
-        if name in WRITE_SYSCALLS and ret > 0:
+        if name in WRITE_SYSCALLS and ret > 0 and (image_fd is None or fd == image_fd):
             written += ret
+
+    for line in text.splitlines():
+        resumed = TRACE_RESUMED.match(line)
+        if resumed:
+            pid = resumed.group(1) or resumed.group(2) or ""
+            name = resumed.group(3)
+            _, fd = pending.pop(pid, (name, None))
+            record(name, fd, int(resumed.group(4)))
+            continue
+        unfinished = TRACE_UNFINISHED.match(line)
+        if unfinished:
+            pid = unfinished.group(1) or unfinished.group(2) or ""
+            fd = int(unfinished.group(4)) if unfinished.group(4) else None
+            pending[pid] = (unfinished.group(3), fd)
+            continue
+        complete = TRACE_COMPLETE.match(line)
+        if complete:
+            fd = int(complete.group(4)) if complete.group(4) else None
+            record(complete.group(3), fd, int(complete.group(5)))
     return calls, written
+
+
+def image_fd_of(pid: int, image: Path) -> int:
+    """The daemon's fd for the image file, from /proc/<pid>/fd.
+
+    Needed because the interesting writes and the uninteresting ones are the same
+    syscall on different descriptors; see `parse_trace`.
+    """
+    target = str(image.resolve())
+    proc = sudo("ls", "-l", f"/proc/{pid}/fd")
+    if proc.returncode != 0:
+        sys.exit(f"FATAL: cannot read /proc/{pid}/fd: {proc.stderr[-300:]}")
+    for line in proc.stdout.splitlines():
+        if " -> " not in line:
+            continue
+        name, _, dest = line.rpartition(" -> ")
+        if dest.strip() == target:
+            return int(name.split()[-1])
+    sys.exit(
+        f"FATAL: the daemon has no open fd for {target}. Without it every write "
+        "would be counted, including the FUSE reply channel, and the byte count "
+        "would be fiction."
+    )
 
 
 def per_fsync(flushes: int, operations: int) -> float:
@@ -191,24 +247,36 @@ def selftest() -> int:
     # calls across an `<unfinished ...>` line and a `<... resumed>` line. A parser
     # that only matched `name(` would drop every split call — on this daemon that
     # is most of them — and report a write path several times cheaper than it is.
+    # `strace -o FILE` writes a BARE pid prefix, not `[pid N]`. Both are accepted;
+    # a parser that only knew the bracketed form matched nothing at all and
+    # reported a daemon that never wrote.
     trace = (
-        '[pid 307762] pwrite64(3, "\\0\\0"..., 4096, 8192) = 4096\n'
-        "[pid 307762] fdatasync(3)                = 0\n"
-        '[pid 307763] pwrite64(3, "\\1"..., 1024, 0 <unfinished ...>\n'
-        "[pid 307764] fdatasync(3)                = 0\n"
-        "[pid 307763] <... pwrite64 resumed>)     = 1024\n"
-        '[pid 307765] write(3, "x"..., 512)       = -1 EIO (Input/output error)\n'
+        '307762 pwrite64(3, "\\0\\0"..., 4096, 8192) = 4096\n'
+        "307762 fdatasync(3)                = 0\n"
+        '307763 pwrite64(3, "\\1"..., 1024, 0 <unfinished ...>\n'
+        "307764 fdatasync(3)                = 0\n"
+        "307763 <... pwrite64 resumed>)     = 1024\n"
+        '307765 write(3, "x"..., 512)       = -1 EIO (Input/output error)\n'
+        '307766 writev(4, [{iov_base="\\20"..., iov_len=16}], 1) = 16\n'
     )
-    calls, written = parse_trace(trace)
+    calls, written = parse_trace(trace, image_fd=3)
     assert calls["pwrite64"] == 2, calls
     cases += 1
     assert calls["fdatasync"] == 2, calls
     cases += 1
-    assert written == 4096 + 1024, f"resumed write must be counted once: {written}"
+    # The split call must be counted once, with the fd from its unfinished half.
+    assert written == 4096 + 1024, f"resumed write miscounted: {written}"
     cases += 1
     assert calls["write"] == 1, "a failed write still crossed"
     cases += 1
-    assert written % 512 == 0, "a failed write contributes no bytes"
+    # THE LOAD-BEARING CASE: fd 4 is /dev/fuse, the reply channel. Counting it
+    # would report the FUSE protocol as backing-file write amplification.
+    assert calls["writev"] == 1, "the reply write is still a call"
+    cases += 1
+    _, unfiltered = parse_trace(trace, image_fd=None)
+    assert unfiltered == 4096 + 1024 + 16, unfiltered
+    cases += 1
+    assert written < unfiltered, "the fd filter must actually exclude /dev/fuse traffic"
     cases += 1
 
     assert per_fsync(16, 8) == 2.0
@@ -312,8 +380,9 @@ def measure_kernel_arm(device: str, workload: Path, client: Path, operations: in
     time.sleep(0.3)
     before_flushes, before_sectors = device_stats(device)
     result = run([sys.executable, str(client), str(workload), str(operations)])
-    subprocess.run(["sync"], check=False)
-    time.sleep(0.3)
+    # No `sync` inside the measured window: it is itself a barrier and inflated
+    # the count by exactly one (129 flushes for 64 fsyncs, 2.0156). The client's
+    # own fsync has already forced everything down to the loop device.
     after_flushes, after_sectors = device_stats(device)
     if result.returncode != 0:
         sys.exit(f"FATAL: kernel client failed: {result.stderr[-600:]}")
@@ -339,11 +408,12 @@ def measure_kernel_arm(device: str, workload: Path, client: Path, operations: in
 
 
 def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
-                     operations: int, out_dir: Path) -> dict:
-    """Barriers FrankenFS asked its image file for, via the daemon's own syscalls."""
+                     operations: int, out_dir: Path, image: Path) -> dict:
+    """Barriers and bytes FrankenFS asked its image file for, from the daemon."""
     if not shutil.which("strace"):
         sys.exit("FATAL: strace is required to count the daemon's flush syscalls")
 
+    image_fd = image_fd_of(daemon_pid, image)
     traced_syscalls = FLUSH_SYSCALLS + WRITE_SYSCALLS
 
     def traced(ops: int, tag: str) -> tuple[int, int]:
@@ -367,7 +437,7 @@ def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
         time.sleep(1.0)
         if not out.exists():
             return 0, 0
-        calls, written = parse_trace(out.read_text())
+        calls, written = parse_trace(out.read_text(), image_fd=image_fd)
         return sum(v for k, v in calls.items() if k in FLUSH_SYSCALLS), written
 
     control_flushes, control_bytes = traced(0, "control")
@@ -380,7 +450,8 @@ def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
     flushes, written = traced(operations, f"n{operations}")
     return {
         "arm": "frankenfs-fuse",
-        "counted_by": f"strace -f on daemon pid {daemon_pid}, return values summed",
+        "counted_by": (f"strace -f on daemon pid {daemon_pid}, return values summed, "
+                       f"writes filtered to the image fd {image_fd}"),
         "operations": operations,
         "control": control_flushes,
         "flushes": flushes,
@@ -440,8 +511,17 @@ def main() -> int:
         sys.exit(f"FATAL: no image at {args.image}")
 
     work = args.work_dir
-    (work / "kmnt").mkdir(parents=True, exist_ok=True)
-    (work / "fmnt").mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    # A run that aborts mid-measurement leaves its mountpoint as a dead transport
+    # endpoint, and every LATER run then dies on `stat` before it measures
+    # anything -- one abort poisons the instrument indefinitely. That is exactly
+    # the defect 1f0257e9 fixed for the comparator's seed mountpoint; do not
+    # reintroduce it here. Clear both mountpoints unconditionally at startup.
+    for name in ("kmnt", "fmnt"):
+        point = work / name
+        run(["fusermount3", "-u", str(point)])
+        sudo("umount", str(point))
+        point.mkdir(parents=True, exist_ok=True)
     client = work / "fsync_client.py"
     client.write_text(CLIENT_SOURCE)
 
@@ -486,7 +566,8 @@ def main() -> int:
             sys.exit(f"FATAL: FUSE mount never appeared\n{(work / 'mount.log').read_text()[-800:]}")
         workload = fmnt / args.subdir / "fsync.bin"
         make_workload_file(workload, as_root=False)
-        rows.append(measure_fuse_arm(daemon.pid, workload, client, args.operations, work))
+        rows.append(measure_fuse_arm(daemon.pid, workload, client, args.operations,
+                                     work, fimage))
     finally:
         run(["fusermount3", "-u", str(fmnt)])
         try:
