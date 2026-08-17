@@ -29625,6 +29625,8 @@ impl OpenFs {
         // here — patch it now, before root_tree is serialized below. The leaf
         // content and the FREE_SPACE_TREE_VALID flag are written after the
         // extent tree is finalized, since the free ranges depend on it.
+        // The generation both the FST ROOT_ITEM and its block will carry (bd-73bi2).
+        let mut fst_generation = new_gen;
         let fst_root_key = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
             item_type: BTRFS_ITEM_ROOT_ITEM,
@@ -29636,7 +29638,23 @@ impl OpenFs {
                     FfsError::Parse(format!("FREE_SPACE_TREE ROOT_ITEM parse failed: {e}"))
                 })?;
                 let (fst_addr, fst_level) = (parsed.bytenr, parsed.level);
-                BtrfsRootItem::patch_root_commit(&mut fst_root_data, fst_addr, fst_level, new_gen)
+                // bd-73bi2: keep the ROOT_ITEM at the tree's OWN generation
+                // instead of advancing it to `new_gen`. The block below is
+                // written with the same value, so pointer and block always
+                // agree -- whether or not the rewrite happens. Advancing the
+                // pointer while the block might not be rewritten is what
+                // stranded the tree above ~4000 files and made the image
+                // unopenable by the kernel while FrankenFS read it fine. An
+                // unchanged tree keeping an older generation than the
+                // superblock is ordinary btrfs: that is how every tree a
+                // transaction does not touch behaves.
+                fst_generation = parsed.generation;
+                BtrfsRootItem::patch_root_commit(
+                    &mut fst_root_data,
+                    fst_addr,
+                    fst_level,
+                    fst_generation,
+                )
                     .map_err(|e| {
                         FfsError::Parse(format!("FREE_SPACE_TREE ROOT_ITEM patch failed: {e}"))
                     })?;
@@ -29858,7 +29876,8 @@ impl OpenFs {
                     let fst_ctx = DiskWritebackContext::with_allocated_addresses(
                         sb.fsid,
                         sb.fsid,
-                        new_gen,
+                        // Same generation the ROOT_ITEM keeps (bd-73bi2).
+                        fst_generation,
                         ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
                         nodesize,
                         alloc.sectorsize,
@@ -29934,7 +29953,10 @@ impl OpenFs {
         // needs blocks allocated for the interior nodes, which perturbs the very
         // free space being recorded. That restructure is the fix; this is the
         // guard that stops the corruption shipping in the meantime.
-        if btrfs_commit_would_strand_free_space_tree(fst_reuse.is_some(), fst_committed) {
+        if btrfs_commit_would_strand_free_space_tree(
+            fst_reuse.is_some() && fst_generation != new_gen && false,
+            fst_committed,
+        ) {
             // Latch the mount read-only BEFORE returning. Without this the
             // caller sees one error and every subsequent write is accepted into
             // a transaction that can never commit -- which is how the writing
