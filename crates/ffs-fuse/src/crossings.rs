@@ -463,6 +463,68 @@ pub fn render_scope_nanos() -> String {
     out
 }
 
+/// Nanoseconds spent in the per-entry loop BODY, per opcode (bd-xfe7z).
+///
+/// The fifth and final term, and the one that closes the attribution. The
+/// decomposition currently reads: ops call `32.0%`, scope wrapper `18.2%`,
+/// reply construction `3.6%`, and `46.2%` that is none of those. That largest
+/// share is the only term big enough to carry a lever alone, and it is the only
+/// one still unattributed -- so it is the only one where writing a lever would
+/// be a guess. Two guesses at this bead have already been rejected.
+///
+/// Timing the whole loop body gives `loop_ns - scope_ns - reply_ns` = the
+/// per-entry work that is neither the attribute fetch nor the reply: name
+/// handling, attribute conversion, slot bookkeeping, iteration.
+///
+/// ⚠️ THIS TIMER IS ITSELF A COST ON THE PATH IT MEASURES: two `Instant::now()`
+/// per ENTRY, ~20-25ns, against a per-entry budget of ~0.99us -- roughly 2%. It
+/// is gated with the rest of the mount evidence and off by default, and any row
+/// quoting these numbers must state that the measured total is inflated by the
+/// measuring.
+static LOOP_NANOS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Accumulates per-entry loop-body time on DROP.
+pub struct LoopTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl LoopTimer {
+    /// Start timing one loop iteration, or `None` when evidence is off.
+    #[must_use]
+    pub fn start(op: CrossingOp) -> Option<Self> {
+        ops_timing_enabled().then(|| Self {
+            slot: op.index(),
+            started: std::time::Instant::now(),
+        })
+    }
+}
+
+impl Drop for LoopTimer {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        LOOP_NANOS[self.slot].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Render per-entry loop-body nanoseconds with the shared labels and ordering.
+#[must_use]
+pub fn render_loop_nanos() -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = LOOP_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
+        total += value;
+        out.push_str(&format!("loop_ns_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" loop_ns_total={total}"));
+    out
+}
+
 /// Whether the three timing families are internally consistent, per opcode.
 ///
 /// `ops_ns` and `reply_ns` both measure work that happens INSIDE a dispatch, so
@@ -523,6 +585,8 @@ pub fn render_live_timed() -> String {
         + &render_prefetch_nanos()
         + " "
         + &render_scope_nanos()
+        + " "
+        + &render_loop_nanos()
 }
 
 /// Live counts from the daemon, rendered for the metrics line.
@@ -533,6 +597,21 @@ pub fn render_live() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The loop body CONTAINS the scope wrapper and the reply construction for
+    /// the entries it covers, so scope_ns + reply_ns <= loop_ns must hold on the
+    /// readdirplus path. Same predicate as the outer invariant, applied one
+    /// level in -- which is what makes the five families a nest rather than a
+    /// list.
+    #[test]
+    fn the_loop_body_contains_the_scope_and_the_reply_bd_xfe7z() {
+        assert!(super::decomposition_is_consistent(100, 60, 30));
+        assert!(
+            !super::decomposition_is_consistent(100, 60, 41),
+            "scope + reply exceeding the loop body means a timer is mis-slotted or \
+             a nested timer outlived its parent"
+        );
+    }
 
     /// Every render family must reach the live line. `render_scope_nanos` was
     /// defined, tested and NOT emitted for a whole measurement cycle because an
@@ -547,6 +626,7 @@ mod tests {
             "ops_ns_getattr=",
             "reply_ns_getattr=",
             "scope_ns_getattr=",
+            "loop_ns_getattr=",
         ] {
             assert!(
                 line.contains(family),

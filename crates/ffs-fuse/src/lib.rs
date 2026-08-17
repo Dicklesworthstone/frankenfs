@@ -4546,6 +4546,13 @@ impl Filesystem for FrankenFuse {
 
                 let mut emitted: usize = 0;
                 for (index, entry) in entries.iter().enumerate() {
+                    // bd-xfe7z: time the whole loop body so loop_ns - scope_ns -
+                    // reply_ns attributes the 46.2% that is neither the attribute
+                    // fetch nor the reply. Declared first so it covers every path
+                    // out of the iteration, including the `continue` on a failed
+                    // fetch and the `break` on a full reply buffer.
+                    let _loop_timer =
+                        crossings::LoopTimer::start(crossings::CrossingOp::Readdirplus);
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
