@@ -8316,3 +8316,55 @@ a node or two before the tracer attached. Everything that matters is identical a
 compilation and a 50% clock swing. That is what makes a count worth having on this host: the timed
 rows on this same row have never reproduced across windows at all (bd-4sull measured 9.15%
 cross-window spread), and this one reproduces to four significant figures across two binaries.
+
+## PROVENANCE — 2026-08-17 — the certification blocker is CLEARED: all four counted rows re-verified on the SHIPPING release-perf+PGO binary (PlumBeacon)
+
+bd-9jat1 recorded that `target/release-perf/ffs-cli` was four hours older than the levers it would
+have been credited with. It stood for three ticks because only a build clears it, and a release-perf
+build closes the window it means to measure in. Taken here with one build slot free and 97G on /data.
+
+**Built** with the BANKED profile rather than a fresh one, so the candidate stays comparable with
+every earlier PGO row: `SKIP_TRAIN=1 PGO_DIR=$PWD/.pgo scripts/build-perf.sh`, 6m13s. It self-reports
+both gates the harness fails closed on:
+
+    bench_evidence,binary_sha256=d103d36e54691124feb6842caef82fe0c3249a36e567591321b14a46221a39a1
+    codegen_isa,...,compile_avx2=true,compile_fma=true,runtime_avx2=true,runtime_fma=true
+    build_profile,pgo_profile_sha256=6a22cfcf8f9555e81d742a129e7f3510fe5dc3578eec251c994421f09e60fbcc
+
+**Verified by content, not mtime** — the trap bd-9jat1 exists for: `flush GDT group` (old per-group
+path) absent, `flush GDT:` (bd-fv9tc) present, bd-k74ef's refusal string present.
+
+**All four counted rows reproduce EXACTLY on the shipping ISA/PGO binary**, which is what bd-b9dug
+requires of anything publishable — no ratio may be quoted from a binary that is not what ships:
+
+| workload | barriers/fsync | bytes/fsync | vs kernel |
+|---|---|---|---|
+| ext4, kernel | 2.0000 | 16384 | — |
+| ext4, FrankenFS | 2.0000 | 12288 | **0.750x** |
+| btrfs, kernel | 2.0000 | 73728 | — |
+| btrfs, FrankenFS | 3.0000 | 102400 | **1.389x** |
+
+Identical integers to the debug build, so the counts are ISA- and PGO-independent. That is expected of
+a count and is exactly why counting was the right instrument while the daemon was stale.
+
+**AND THE SAME RUNS SHOW WHY A TIMED ROW STILL CANNOT BE BANKED HERE — measured, not asserted.** The
+per-arm clock samples in these two runs:
+
+| run | kernel arm mean MHz | FUSE arm mean MHz | gap |
+|---|---|---|---|
+| btrfs | 4290 (spread 1.00x) | 3100 (spread 2.92x) | **38%** |
+| ext4 | 2581 (spread 2.84x) | 3044 (spread 2.78x) | **18%** |
+
+A timed A/B across arms sitting 38% apart in mean core clock is a frequency ratio wearing a costume,
+whichever way it comes out. Load was also swinging hard: `1m` went 14.33 -> 25.20 within 75 seconds,
+and 1/5/15 read 25.20/22.70/22.02 — the 1-minute average crossing the longer ones in both directions
+inside two minutes is the definition of an unstable window, not a quiet one.
+
+**CONCRETE GATE THIS SUGGESTS for whoever runs the timed row**, offered rather than imposed because
+the ABBA harness is another lane's (bd-cpu-mhz / bd-mhz-timing): require the two arms' MEAN core
+clocks to agree within ~5% before admitting the row, and record both. The harness already samples
+per-arm clocks before the timed region; this is a threshold on a number it already has. Note it would
+have refused both runs above.
+
+**What is left of bd-9jat1:** nothing about the binary. The remaining step is the
+`fsync-journal-commit` ABBA itself, in a window where the arms' clocks agree.
