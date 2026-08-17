@@ -9480,3 +9480,61 @@ timed row would be refused. Given the distribution above, the honest default for
 **timed vs-incumbent rows are not currently obtainable**, and counted mechanisms — which is what every
 row I have banked this session is — are not a second-best but the only instrument that works here.
 NO wall-clock claim is made in this entry; it is a measurement of the measuring conditions.
+
+## MECHANISM — 2026-08-17 — bd-yu6jz's "factor of two" is REFUTED (1.000 probes per inode), and the real lever is that the probe's descent has no memo while getattr's does (CreamTrout)
+
+bd-yu6jz names a cheapest-first-step: bd-ha71t measured "TWO probes per path-based stat (4000 for
+2000)" and "nobody has explained the factor of two"; if one of the pair were redundant, halving it
+would be a 2x cut. This runs that step, using the bead's own prescribed instrument — the
+`ffs::fuse::xattr_probe` trace, which sits unconditionally at the kernel boundary before any memo
+can hide a probe.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, ELF `dbc2dd65fe4e266fff0b45f1`,
+mean CPU 2271.4 MHz over 64 CPUs, loadavg 6.67→10.15, df 221G. No build taken; counted, so the
+window does not apply — and it was not quiet (6-8 CPUs above 25% against a limit of 2).
+
+### The count: there is no second probe to remove
+
+2,048-entry flat directory, `os.stat` on every entry, probe stream classified by inode and name:
+
+| mount | probes | distinct inodes | per inode | back-to-back repeats | names |
+|---|---|---|---|---|---|
+| read-only | 2049 | 2049 | **1.000** | **0** | `security.capability` only |
+| read-write | 2049 | 2049 | **1.000** | **0** | `security.capability` only |
+
+**Every probe is for a distinct inode, exactly once, in both mount modes.** No pair, no adjacency, no
+second name. ⛔ **The redundant-pair hypothesis is refuted and there is nothing to halve.** Whatever
+produced bd-ha71t's 2.0 was a different configuration; this configuration is 1.0 and it is the one
+the readdir+stat row runs on.
+
+That closes the bead's cheapest step with a negative and removes the 2x from the campaign's
+expectations — which matters, because "halve the probe count" has been sitting in this bead's text
+as an available win since it was filed.
+
+### The real lever, found in source and consistent with a measurement already banked
+
+The two metadata paths descend the btrfs tree by **different routes**, and only one is memoized:
+
+| path | function | descent | floor-leaf memo |
+|---|---|---|---|
+| `getattr` | `walk_btrfs_tree_floor` (`lib.rs:9034`) | one child per level | **YES** — `btrfs_floor_leaf_memo` at :9098 |
+| `getxattr` probe | `walk_btrfs_tree_range` (`lib.rs:8990`) via `btrfs_getxattr` → `walk_btrfs_fs_tree_range` | root-to-leaf, per probe | **NO** — provider only, no memo consulted |
+
+So the capability probe pays a **fresh, unmemoized root-to-leaf descent per entry**, while the
+attribute lookup for the same inode gets leaf-locality caching. That is consistent with the
+floor-memo A/B measured earlier today (`FFS_BTRFS_FLOOR_MEMO=0` moves the sweep 27,464 → 51,569
+reads, i.e. the memo is worth 1.88x) — the memo helps because it serves the *getattr* half; the probe
+half never touches it.
+
+**Proposed lever, with a counted acceptance and no quiet window:** give the probe's descent the same
+leaf-locality memo. Consecutive entries in readdir order have consecutive objectids and therefore
+share leaves, so a retained leaf should serve the run of entries within one leaf, exactly as it does
+for getattr.
+
+⚠️ **Not implemented here, deliberately.** The floor memo carries a validity contract and a
+replace-policy that bd-79li3 measured can *tax* random access 8.6x, and a memo that serves a stale
+xattr answer is a correctness bug rather than a slow one. Wiring the probe into it needs its own
+pass with the negative cases written first — not a tail-end edit after a long turn.
+
+NO wall-clock claim is made in this entry; the sizing of this lever is UNMEASURED, per this session's
+standing correction that node counts are not a wall-clock currency.
