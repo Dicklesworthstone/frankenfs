@@ -9118,3 +9118,58 @@ survived precisely because a ratio carries its denominator with it. **Where a qu
 compared against an expectation rather than against another arm, I got it wrong four times out of
 four.** The practical rule for this ledger: prefer an A/B to an absolute, and when an absolute is
 unavoidable, state its denominator in the same sentence or do not state it.
+
+## RECONCILIATION — 2026-08-17 — my "~15x ceiling" for the capability probe is 15x of a quantity that bd-q0xnl bounds at 3.85% of the row (CreamTrout)
+
+Grooming under the build freeze (/data 11G, 100% used); no runs, no build. This reconciles two
+findings on the same row that read as if they conflict, and the reconciliation deflates one of my
+own numbers.
+
+### The bound I did not account for
+
+bd-q0xnl **measured** the daemon's share of the btrfs readdir+stat row at **3.85%** (daemon CPU =
+utime+stime, so it already includes the kernel-side cost of what the daemon does — page faults,
+syscalls, copies). Its conclusion is explicit and is a hard bound, not an estimate:
+
+> "3.85% is a hard upper bound on the total contribution of [daemon-side work] to this row. If every
+> single nanosecond the daemon spent were inside malloc, the row would improve by at most 3.85%,
+> taking 7.753405x to about 7.45x. The remaining ~96% is kernel-side transport."
+
+**Every node read I counted this session is daemon-side work.** The `pread64`s are issued by the
+daemon and charged to its stime. So *eliminating every image read the daemon performs* moves this
+row by at most ~4%.
+
+### What that does to my number, and what it does not
+
+I recorded on bd-yu6jz that suppressing the capability probe removes **14.98x of node reads**, and
+called it a "ceiling ~15x". **That phrasing is misleading and I am withdrawing it.** 15x is a factor
+on a daemon-side count that lives inside a 3.85% slice; read as a wall-clock prize it is wrong by
+more than two orders of magnitude.
+
+What survives, and it is not nothing: suppressing the probe does not only remove daemon work, it
+removes **an entire FUSE round trip per entry** — and round trips are where bd-q0xnl says ~96% of
+the row lives. In that currency the probe is worth roughly *one crossing out of ~3.00 per entry*,
+the same order as the readdirplus lever bd-q0xnl measured at an undecidable-but-leaning **1.1087x**
+for a 33% crossing cut.
+
+So the honest prize for the probe work is **~10%, in the crossing currency** — not 15x, and not
+3.85% either, because the probe is not merely daemon work.
+
+### The correction in one line
+
+**Node reads were the right instrument for finding the mechanism and the wrong currency for pricing
+it.** Counting them located the probe, named the code path, and refuted five knobs — all of which
+stands. Converting that count into an expected win required a conversion factor I never had, and
+bd-q0xnl already measured the one that matters.
+
+That is this ledger's own standing rule, which I quoted at people twice today and then broke myself:
+*no per-round-trip figure may be used as a conversion factor outside the workload that produced it*,
+and its sibling — a count is a mechanism, not a prediction.
+
+### Practical consequence for the queue
+
+bd-yu6jz should be pursued for the **crossing** it removes, not for the node reads, and sized against
+bd-q0xnl's ~1.1x-for-a-33%-crossing-cut rather than against 14.98x. bd-2s8zy (the node-cache
+question) is bounded by the same 3.85%: even a perfect fix there cannot move this row more than ~4%,
+which is worth knowing **before** anyone spends a quiet window on it. Neither bead is worthless; both
+were being sized in the wrong units, by me.
