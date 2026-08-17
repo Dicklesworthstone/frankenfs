@@ -491,6 +491,17 @@ fn xattr_suppression_evidence(
 
 /// Print the resolved state where the comparator can read it.
 ///
+/// Print the per-opcode crossing counts where the comparator can read them.
+///
+/// Same gate and same shape as [`emit_xattr_suppression_evidence`], so one
+/// `FFS_MOUNT_BENCH_EVIDENCE=1` turns on all of the mount's evidence and a
+/// parser learns one prefix convention rather than two.
+fn emit_crossing_evidence(line: String) {
+    if std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0") {
+        eprintln!("mount_candidate_crossings,{line}");
+    }
+}
+
 /// Gated on the same `FFS_MOUNT_BENCH_EVIDENCE` as the rest of the mount
 /// evidence, and on stderr for the same reason: it is provenance for a
 /// measurement, not output a mount is expected to produce.
@@ -5523,6 +5534,16 @@ pub fn mount(
     } else {
         session.run()?;
     }
+    // bd-xfe7z: emit the per-opcode CROSSING counts, gated like the rest of the
+    // mount evidence. Emitted here because the session has ended, so these cover
+    // the whole mount and cannot be read mid-run and mistaken for a steady state.
+    //
+    // Deliberately alongside `requests_total` rather than replacing it: the two
+    // measure different things and the DIFFERENCE is diagnostic. requests_total
+    // counts request scopes and missed 5979 of 6001 warm stats (bdd0fd1b);
+    // crossings_total counts what reached `dispatch`. A future fast path that
+    // answers before the scope opens will show up as the gap between them.
+    emit_crossing_evidence(crossings::render_live());
     // bd-viil0: the session has run to completion, so these are the FINAL counters.
     // Returning them rather than `()` is what lets the STANDARD mount runtime report
     // real dispatch attribution instead of hand-constructed zeros — the managed

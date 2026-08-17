@@ -80,6 +80,20 @@ def verdict(per_entry: float, predicted_transport: float = 0.157) -> str:
     Deliberately not a hypothesis test: one count with a clear separation does
     not need one, and dressing it up as a test would overstate it.
     """
+    # Bounded ABOVE as well as below. The first version tested only
+    # `>= 0.5 * predicted`, an acceptance region open to infinity, so a count
+    # 12.7x the prediction came back as "within 2x ... consistent with
+    # BATCHING". A measurement that refutes the hypothesis must not be reported
+    # as confirming it, and an unbounded-above region guarantees exactly that.
+    if per_entry > predicted_transport * 2.0:
+        return (
+            f"{per_entry:.4f} crossings/entry is FAR ABOVE the transport "
+            f"prediction ({predicted_transport}) and refutes BOTH hypotheses: "
+            f"the residue arithmetic implies ~{predicted_transport} crossings "
+            f"per entry, and at ~7.29us each this many crossings would exceed "
+            f"the entire measured per-op cost. Suspect the COUNT, not the "
+            f"filesystem: reads not on /dev/fuse are the first thing to rule out"
+        )
     if per_entry >= predicted_transport * 0.5:
         return (
             f"{per_entry:.4f} crossings/entry is within 2x of the transport "
@@ -125,6 +139,11 @@ def selftest() -> int:
     assert crossings_per_entry(0, 100) == 0.0
     cases += 1
 
+    # A count far ABOVE the prediction refutes both hypotheses and must say so
+    # rather than reading as confirmation (the 1.9926 observed on 2026-08-17).
+    assert "refutes BOTH" in verdict(1.9926)
+    assert "refutes BOTH" in verdict(0.157 * 2.0 + 1e-9)
+    assert "BATCHING" in verdict(0.157 * 2.0)
     assert "BATCHING" in verdict(0.157)
     cases += 1
     assert "BATCHING" in verdict(0.10)

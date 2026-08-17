@@ -107,11 +107,24 @@ if [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" != "0" ];
   fi
 fi
 
-"${STRACE_PREFIX[@]}" strace -c -f -e trace=read -p "$DAEMON" \
+# `-y` annotates each fd with its path, and the count below keeps only reads on
+# /dev/fuse. WITHOUT this the count is every read() in all 66 daemon threads --
+# including reads of the BACKING IMAGE -- while being reported as "reads on the
+# fuse device". That inflated the first real run to 1.9926 crossings/entry,
+# which is arithmetically impossible as a crossing count: at ~7.29us each it
+# would be 14.5us/entry against a measured 4.048us/op for the whole operation.
+# `-c` is dropped because a summary table cannot carry fd paths.
+"${STRACE_PREFIX[@]}" strace -f -y -e trace=read -p "$DAEMON" \
   -o "$WORK/strace.out" 2> "$WORK/strace.err" &
 STRACE=$!
 sleep 1
-if grep -q "attach\|Operation not permitted" "$WORK/strace.err" 2>/dev/null; then
+# Match the FAILURE strings only. strace announces SUCCESS on stderr too --
+# "Process N attached with 66 threads" -- and a bare `attach` matched that, so
+# the first version of this guard aborted every successful run. A fail-closed
+# check that fires on success is just as broken as one that never fires; it
+# only fails in the direction that looks responsible.
+if grep -qE "attach: ptrace|Operation not permitted|could not attach" \
+    "$WORK/strace.err" 2>/dev/null; then
   echo "FATAL: strace did not attach to the daemon:"
   sed 's/^/       /' "$WORK/strace.err"
   "${STRACE_PREFIX[@]}" kill -INT "$STRACE" 2>/dev/null
@@ -133,7 +146,13 @@ sys.path.insert(0, "/data/projects/frankenfs/scripts")
 from fuse_crossing_count import parse_syscall_counts, crossings_per_entry, verdict
 text = open(sys.argv[1]).read()
 entries = int(sys.argv[2])
-reads = parse_syscall_counts(text).get("read", 0)
+# Only reads whose fd resolves to the fuse device are crossings. Everything
+# else the daemon reads (the backing image, above all) is not.
+reads = sum(
+    1
+    for line in text.splitlines()
+    if "/dev/fuse" in line and " read(" in line and "= -1 " not in line
+)
 # A daemon that served this walk MUST have read the fuse device. Zero is not a
 # count of zero crossings, it is the signature of an instrument that did not
 # run -- a failed ptrace attach produces exactly this, and the classifier will
