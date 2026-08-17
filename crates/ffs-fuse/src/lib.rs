@@ -853,6 +853,46 @@ fn take_prefetched<T>(slots: &mut [Option<T>], index: usize) -> Option<T> {
     slots.get_mut(index).and_then(Option::take)
 }
 
+/// Whether the readdirplus prefetch block runs at all, and in what order.
+///
+/// DECOUPLES TWO LEVERS THAT WERE WELDED TOGETHER (bd-xfe7z). The prefetch block
+/// was entered only under `FFS_FUSE_READDIRPLUS_INODE_ORDER`, and
+/// `FFS_FUSE_READDIRPLUS_BATCH_ATTRS` -- which collapses N request scopes into
+/// one -- lived inside it. So the scope-collapse win was reachable only by also
+/// enabling inode ordering, whose unbounded form was MEASURED AND REJECTED
+/// (40407 dispatch scopes -> 104761) and whose bounded form is unmeasured.
+///
+/// The within-window A/B/B/A crossover put scope collapse at `1.567x` on the
+/// readdirplus remainder, with the arms not overlapping. That is worth having on
+/// its own, without dragging a rejected lever along, so batching now runs in
+/// DIRECTORY order when ordering is not separately requested.
+///
+/// Returns `None` when neither knob is set, which is the default and must stay
+/// byte-identical to the inline path.
+fn readdirplus_prefetch_mode(inode_order: bool, batch_attrs: bool) -> Option<bool> {
+    if inode_order {
+        Some(true) // prefetch, sorted by inode
+    } else if batch_attrs {
+        Some(false) // prefetch, directory order -- scope collapse alone
+    } else {
+        None // no prefetch at all
+    }
+}
+
+/// Visit order for the prefetch, given whether inode ordering was requested.
+///
+/// Identity when it was not: the entries are already in directory order and
+/// re-deriving that with a sort would be the same list at the cost of an
+/// allocation and an O(n log n) pass, on the exact code path a lever is trying
+/// to make cheaper.
+fn readdirplus_fetch_order(inode_order: bool, inos: &[u64]) -> Vec<usize> {
+    if inode_order {
+        readdirplus_inode_fetch_order(inos)
+    } else {
+        (0..inos.len()).collect()
+    }
+}
+
 fn readdirplus_prefetch_bound(observed_fill: usize, entries_len: usize) -> usize {
     let bound = if observed_fill == 0 {
         READDIRPLUS_PREFETCH_COLD_BOUND
@@ -4482,87 +4522,90 @@ impl Filesystem for FrankenFuse {
                 // default and the bounded form is itself UNMEASURED -- it must
                 // clear the same 40407-vs-104761 scope count before anyone
                 // enables it.
-                let mut prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> =
-                    if readdirplus_inode_order_from_env() {
-                        // bd-xfe7z: times the whole prefetch block, scopes
-                        // included, so `prefetch_ns - ops_ns_getattr` isolates
-                        // the request-scope machinery from the format-layer work
-                        // already timed inside it.
-                        let _prefetch_timer =
-                            crossings::PrefetchTimer::start(crossings::CrossingOp::Readdirplus);
-                        // bd-xfe7z: BOUNDED by what the previous reply actually
-                        // emitted. This is the fix the rejection above called
-                        // for. Entries past the bound are left `None` and fetched
-                        // inline in the emit loop, exactly as the off arm does,
-                        // so the 2.59x overshoot cannot reappear -- and the batch
-                        // arm below inherits the bound rather than the overshoot.
-                        let bound = readdirplus_prefetch_bound(
-                            READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed),
-                            entries.len(),
-                        );
-                        let inos: Vec<u64> = entries[..bound].iter().map(|e| e.ino.0).collect();
-                        let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
-                            (0..entries.len()).map(|_| None).collect();
-                        // bd-xfe7z: ONE scope for the whole fill, not one per
-                        // inode. The fetch ORDER is unchanged -- still inode
-                        // order, which is what buys the inode-table locality --
-                        // but the N scope opens collapse to 1.
-                        //
-                        // That is the measured target: on this workload
-                        // `getattr` owns 60.80% of daemon dispatch time at 1.01
-                        // scopes per entry, while wire crossings are 0.0053 per
-                        // entry. The cost is not transport and not readdir; it
-                        // is the per-entry fill, and until now every entry of it
-                        // paid for its own request scope.
-                        //
-                        // `FsOps::getattr_batch` defaults to looping over
-                        // `getattr`, so the ops layer does exactly the same work
-                        // and this isolates the scope overhead. If an A/B shows
-                        // nothing, the 60.80% is the attribute fetch itself and
-                        // the next lever belongs in the format layer.
-                        let order: Vec<usize> = readdirplus_inode_fetch_order(&inos);
-                        if readdirplus_batch_attrs_from_env() {
-                            let ordered: Vec<InodeNumber> =
-                                order.iter().map(|index| entries[*index].ino).collect();
-                            if let Ok(results) =
-                                self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                                    // bd-xfe7z: time the OPS-layer call only, so
-                                    // dispatch_ns - ops_ns is the FUSE layer's own
-                                    // overhead and ops_ns is the format layer's work.
-                                    let _t =
-                                        crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                                    Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
-                                })
-                            {
-                                for (slot_index, result) in order.iter().zip(results) {
-                                    if let Ok(attr) = result {
-                                        slots[*slot_index] = Some(attr);
-                                    }
-                                }
-                            }
-                        } else {
-                            // The control: one request scope per inode, which is
-                            // what 1.01 scopes/entry measures.
-                            for index in order {
-                                let ino = entries[index].ino;
-                                let _scope_timer =
-                                    crossings::ScopeTimer::start(crossings::CrossingOp::Getattr);
-                                if let Ok(attr) =
-                                    self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                                        let _t = crossings::OpsTimer::start(
-                                            crossings::CrossingOp::Getattr,
-                                        );
-                                        self.inner.ops.getattr(cx, scope, ino)
-                                    })
-                                {
-                                    slots[index] = Some(attr);
+                let mut prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> = if let Some(
+                    sort_by_inode,
+                ) =
+                    readdirplus_prefetch_mode(
+                        readdirplus_inode_order_from_env(),
+                        readdirplus_batch_attrs_from_env(),
+                    ) {
+                    // bd-xfe7z: times the whole prefetch block, scopes
+                    // included, so `prefetch_ns - ops_ns_getattr` isolates
+                    // the request-scope machinery from the format-layer work
+                    // already timed inside it.
+                    let _prefetch_timer =
+                        crossings::PrefetchTimer::start(crossings::CrossingOp::Readdirplus);
+                    // bd-xfe7z: BOUNDED by what the previous reply actually
+                    // emitted. This is the fix the rejection above called
+                    // for. Entries past the bound are left `None` and fetched
+                    // inline in the emit loop, exactly as the off arm does,
+                    // so the 2.59x overshoot cannot reappear -- and the batch
+                    // arm below inherits the bound rather than the overshoot.
+                    let bound = readdirplus_prefetch_bound(
+                        READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed),
+                        entries.len(),
+                    );
+                    let inos: Vec<u64> = entries[..bound].iter().map(|e| e.ino.0).collect();
+                    let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
+                        (0..entries.len()).map(|_| None).collect();
+                    // bd-xfe7z: ONE scope for the whole fill, not one per
+                    // inode. The fetch ORDER is unchanged -- still inode
+                    // order, which is what buys the inode-table locality --
+                    // but the N scope opens collapse to 1.
+                    //
+                    // That is the measured target: on this workload
+                    // `getattr` owns 60.80% of daemon dispatch time at 1.01
+                    // scopes per entry, while wire crossings are 0.0053 per
+                    // entry. The cost is not transport and not readdir; it
+                    // is the per-entry fill, and until now every entry of it
+                    // paid for its own request scope.
+                    //
+                    // `FsOps::getattr_batch` defaults to looping over
+                    // `getattr`, so the ops layer does exactly the same work
+                    // and this isolates the scope overhead. If an A/B shows
+                    // nothing, the 60.80% is the attribute fetch itself and
+                    // the next lever belongs in the format layer.
+                    let order: Vec<usize> = readdirplus_fetch_order(sort_by_inode, &inos);
+                    if readdirplus_batch_attrs_from_env() {
+                        let ordered: Vec<InodeNumber> =
+                            order.iter().map(|index| entries[*index].ino).collect();
+                        if let Ok(results) =
+                            self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                // bd-xfe7z: time the OPS-layer call only, so
+                                // dispatch_ns - ops_ns is the FUSE layer's own
+                                // overhead and ops_ns is the format layer's work.
+                                let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                                Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
+                            })
+                        {
+                            for (slot_index, result) in order.iter().zip(results) {
+                                if let Ok(attr) = result {
+                                    slots[*slot_index] = Some(attr);
                                 }
                             }
                         }
-                        Some(slots)
                     } else {
-                        None
-                    };
+                        // The control: one request scope per inode, which is
+                        // what 1.01 scopes/entry measures.
+                        for index in order {
+                            let ino = entries[index].ino;
+                            let _scope_timer =
+                                crossings::ScopeTimer::start(crossings::CrossingOp::Getattr);
+                            if let Ok(attr) =
+                                self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                    let _t =
+                                        crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                                    self.inner.ops.getattr(cx, scope, ino)
+                                })
+                            {
+                                slots[index] = Some(attr);
+                            }
+                        }
+                    }
+                    Some(slots)
+                } else {
+                    None
+                };
 
                 let mut emitted: usize = 0;
                 for (index, entry) in entries.iter().enumerate() {
@@ -7762,6 +7805,67 @@ mod tests {
         // vector are built together, but the loop indexes from the entries side.
         assert_eq!(take_prefetched(&mut slots, 99), None);
         assert_eq!(take_prefetched::<u32>(&mut [], 0), None);
+    }
+
+    /// bd-xfe7z: the two prefetch knobs are INDEPENDENT, and neither on means no
+    /// prefetch at all.
+    ///
+    /// The default cell is the one that matters. Both knobs unset must return
+    /// `None` so the handler takes the inline path it has always taken -- if
+    /// decoupling accidentally made the prefetch reachable by default, it would
+    /// enable a lever whose unbounded form was measured at 2.59x MORE getattr
+    /// scopes, on every mount, silently.
+    #[test]
+    fn readdirplus_prefetch_mode_is_off_unless_a_knob_asks_bd_xfe7z() {
+        assert_eq!(
+            readdirplus_prefetch_mode(false, false),
+            None,
+            "default is inert"
+        );
+
+        // batch alone: prefetch, but in DIRECTORY order. This is the cell the
+        // decoupling exists to create -- scope collapse without dragging in the
+        // rejected reordering.
+        assert_eq!(readdirplus_prefetch_mode(false, true), Some(false));
+
+        // inode order alone, and inode order plus batch, both sort.
+        assert_eq!(readdirplus_prefetch_mode(true, false), Some(true));
+        assert_eq!(readdirplus_prefetch_mode(true, true), Some(true));
+    }
+
+    /// bd-xfe7z: without inode ordering the fetch order is the IDENTITY, not a
+    /// sort that happens to agree.
+    ///
+    /// Sorting here would return the same visit order for an already-ascending
+    /// directory and a different one otherwise, so the batch-only arm would
+    /// silently carry the reordering it is meant to exclude -- and the A/B
+    /// between them would compare two arms that both reorder.
+    #[test]
+    fn readdirplus_fetch_order_is_identity_without_inode_ordering_bd_xfe7z() {
+        // Deliberately NOT ascending: a sort would visibly permute this.
+        let inos = [900_u64, 12, 4001, 7, 55];
+
+        assert_eq!(
+            readdirplus_fetch_order(false, &inos),
+            vec![0, 1, 2, 3, 4],
+            "directory order must be preserved exactly when ordering is not asked for"
+        );
+        assert_ne!(
+            readdirplus_fetch_order(true, &inos),
+            vec![0, 1, 2, 3, 4],
+            "and the inode-ordered arm must actually differ, or the A/B is a null"
+        );
+        assert_eq!(
+            readdirplus_fetch_order(true, &inos),
+            readdirplus_inode_fetch_order(&inos),
+            "the ordered arm must be exactly the existing, tested order"
+        );
+
+        // Both arms agree on the empty and singleton cases, which is the only
+        // place they may.
+        assert!(readdirplus_fetch_order(false, &[]).is_empty());
+        assert_eq!(readdirplus_fetch_order(false, &[42]), vec![0]);
+        assert_eq!(readdirplus_fetch_order(true, &[42]), vec![0]);
     }
     #[test]
     fn readdirplus_prefetch_bound_never_exceeds_the_batch_bd_xfe7z() {
