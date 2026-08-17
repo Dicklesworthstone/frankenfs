@@ -9914,3 +9914,45 @@ will not hold still.
 **Retry predicate, unchanged but now with a purpose.** A run with both nulls clear on median AND
 spread and the arms' clocks within 5% would settle the magnitude. Given C, expect that number to land
 nearer 0.53 than 0.46.
+
+## REPRODUCTION — 2026-08-17 — the ADMITTED ext4 readdir+stat row reproduces, and the load-dependence does NOT generalise to it (PlumBeacon)
+
+bd-iyclx asks whether the load-dependence found on btrfs fsync (0.461 at loadavg 31, 0.533 at
+loadavg 15) infects other banked rows. Tested against the most-quoted row in the campaign: ext4
+readdir+stat, admitted at `1.026637x`.
+
+**Both configurations, 96 pairs each, candidate `c9fb745f`:**
+
+| configuration | ratio | CI | window |
+|---|---|---|---|
+| WITHOUT capability-probe suppression | **2.577928x** | [2.450524, 2.757820] | loadavg 30.71, idle 43%, iowait 0 |
+| WITH suppression (`FFS_FUSE_XATTR_NO_SUPPORT=1`) | **1.013686x** | [0.997243, 1.026737] | loadavg 17.90, idle 60%, iowait 0 |
+| banked ADMITTED row, earlier today | 1.026637x | — | window not recorded here |
+
+**The flagship row reproduces.** My suppressed CI `[0.997243, 1.026737]` CONTAINS the banked
+`1.026637x`, at a different time, on a rebuilt candidate, in a window I measured. That is the
+strongest thing that can be said for a banked row short of re-admitting it.
+
+**And the two runs together prove the knob was actually active**, which matters because an
+environment variable that silently fails to propagate would produce a "reproduction" that means
+nothing: the same harness, same pairs, same candidate, differing only in that variable, gives
+`2.577928x` and `1.013686x`. A no-op could not do that. It also prices the lever: capability-probe
+suppression is worth **~2.54x** on this row.
+
+**For bd-iyclx, this is a partial NULL and a useful one.** The btrfs fsync ratio moved 15% between
+loadavg 15 and 31 in our favour. The ext4 readdir+stat row does not show that: measured at loadavg
+17.9 it lands where the bank put it. So the load effect is NOT a blanket property of the mounted
+comparator, and the suspicion should be narrowed to the fsync/flush path — consistent with the
+mechanism hypothesis, since that row is the one whose incumbent runs unpinned kernel worker threads
+for its flushes.
+
+⚠️ **What this does NOT yet establish.** I have ONE suppressed measurement, at one load. Agreement
+with a banked figure whose own window I did not record is a reproduction, not a load-dependence test.
+The clean test is the same workload measured by one person at two separated loads, as was done for
+btrfs fsync. Until that runs, the honest claim is: *ext4 readdir+stat reproduces at loadavg ~18 and
+shows no sign of the fsync row's load sensitivity.*
+
+Both runs were BLOCKED_NULL on SPREAD, not median — kernel/fuse null medians were 0.9975/1.0053 and
+0.9962/1.0044, all within 0.6% of one, while the spreads sat just over the 1.025 limit (1.0256,
+1.0332, 1.0288). That is the same signature as every run today: **this host holds a median still and
+will not hold a spread still.**
