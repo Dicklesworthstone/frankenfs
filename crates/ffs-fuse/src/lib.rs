@@ -94,11 +94,7 @@ pub fn count_memoized_requests_enabled() -> bool {
 /// apart without it.
 #[must_use]
 pub fn readdirplus_attr_memo_enabled() -> bool {
-    ReaddirplusAttrMemo::enabled_from_value(
-        std::env::var("FFS_FUSE_READDIRPLUS_ATTR_MEMO")
-            .ok()
-            .as_deref(),
-    )
+    ReaddirplusAttrMemo::enabled_from_env()
 }
 
 /// how it fails closed instead.
@@ -2794,15 +2790,24 @@ impl ReaddirplusAttrMemo {
         t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
     }
 
-    fn from_env() -> Self {
-        Self::with_slots(
-            READDIRPLUS_ATTR_MEMO_SLOTS,
-            Self::enabled_from_value(
-                std::env::var("FFS_FUSE_READDIRPLUS_ATTR_MEMO")
-                    .ok()
-                    .as_deref(),
-            ),
+    /// The ONE reader of `FFS_FUSE_READDIRPLUS_ATTR_MEMO`.
+    ///
+    /// Single-owner by test (`readdirplus_memo_knob_is_opt_in_and_singly_owned`)
+    /// because two gates on one variable with different defaults make the knob's
+    /// meaning depend on which gate runs first -- that defect voided two arms of
+    /// a four-arm run once, and only a counter caught it. The public
+    /// `readdirplus_attr_memo_enabled` accessor routes here rather than reading
+    /// the environment a second time.
+    fn enabled_from_env() -> bool {
+        Self::enabled_from_value(
+            std::env::var("FFS_FUSE_READDIRPLUS_ATTR_MEMO")
+                .ok()
+                .as_deref(),
         )
+    }
+
+    fn from_env() -> Self {
+        Self::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, Self::enabled_from_env())
     }
 
     fn slot(&self, ino: InodeNumber, len: usize) -> usize {
