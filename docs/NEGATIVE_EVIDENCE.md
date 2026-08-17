@@ -9694,3 +9694,41 @@ bd-5hqj2.
 
 **Retry predicate.** Replicate at 96 pairs in a window with `external_load_during_run.verdict != contended`
 and `settled=true`. If it reproduces there, the row is unconditional.
+
+## REPLICATION — 2026-08-17 — the btrfs fsync win reproduces to 0.47% AT MATCHED CLOCKS, and one of my two caveats is now dead (PlumBeacon)
+
+Ran the retry predicate I wrote on the admitted row. The replication did NOT admit, and it is still
+the more useful of the two runs.
+
+| run | ratio | kernel null | fuse null | arms' mean MHz | verdict |
+|---|---|---|---|---|---|
+| A, 96 pairs | **0.461109** [0.452020, 0.470524] | 0.996063 clear | 0.995159 clear | driver 2524.74 / fuse **1429.01** (1.77x apart) | **HONEST_WIN, admitted** |
+| B, 96 pairs | **0.463280** [0.453808, 0.496900] | 1.000291 clear (dev 0.0003) | 1.009925, CI spread 1.0434 > 1.025 limit | driver 3212.46 / fuse **3214.10** (0.05% apart) | BLOCKED_NULL |
+
+**CAVEAT 2 IS DEAD.** Run A's arms sat 1.77x apart in clock and I flagged that even though it ran in
+our favour's disfavour. Run B's arms were **0.05% apart** — as close to matched as this host gets —
+and the ratio came out `0.463280`, within **0.47%** of run A. A frequency artifact cannot survive
+that: the effect is the same when the clocks are equal. The btrfs fsync advantage is not a clock
+story.
+
+**Run B did not admit for a different and narrower reason:** the FUSE arm's null MEDIAN was fine
+(1.009925, inside the 2% limit) but its CI SPREAD was 1.0434 against a 1.025 limit. The gate is
+median AND spread; the spread failed. Load climbed from 15.67 to **34.54 during the run** (idle 78% ->
+65%), which is the obvious candidate for the widened null.
+
+**MY OWN RETRY PREDICATE WAS UNREACHABLE AND I AM CORRECTING IT.** I wrote "replicate in a window with
+`external_load_during_run.verdict != contended`". Both runs report `contended` with
+`contended_fraction=1.0` and `max_external_busy_cpus=60` against a limit of **2** — and run B started
+at **81-83% idle with iowait 0**, verified with `vmstat` before launching. On a 64-CPU box shared by
+nine projects, "no more than 2 CPUs above 25% busy" is not a condition that occurs, so that predicate
+can never be satisfied and is not a useful gate to hold a row against.
+
+**Corrected predicate:** replicate at 96 pairs with (a) both A/A nulls clear on median AND spread, and
+(b) the arms' mean core clocks within ~5%. Run A satisfied (a) and failed (b); run B satisfied (b) and
+failed half of (a). **Neither run alone is unconditional; together they close both objections**, and a
+single run satisfying both simultaneously would make the row unconditional on its own.
+
+**Standing of the row.** The admitted `0.461109x` stands as banked — one run, HONEST_WIN, both nulls
+clear. The replication raises confidence in the MAGNITUDE (two independent 96-pair runs, 0.47% apart)
+and removes the frequency objection. bd-5hqj2 remains the open question that could still withdraw it:
+we are faster while issuing MORE barriers and MORE bytes, and that is not yet explained.
