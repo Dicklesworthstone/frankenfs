@@ -197,6 +197,21 @@ ops_readdir = fields.get("ops_ns_readdir", 0)
 reply = fields.get("reply_ns_readdirplus", 0)
 remainder = dispatch - ops_getattr - ops_readdir - reply
 
+# The getattr OpsTimer lives ONLY inside the prefetch path, which is gated on
+# FFS_FUSE_READDIRPLUS_INODE_ORDER. With the knob unset that timer never runs,
+# ops_ns_getattr reads 0, and the format-layer attribute work silently lands in
+# the remainder -- which then reads 95.58% instead of 55.90% and points the next
+# lever at bookkeeping that is mostly getattr. Measured both ways on the same
+# ELF, 2026-08-17. A zero here is a CONFIGURATION artifact, not a finding.
+if ops_getattr == 0:
+    print()
+    print("REFUSING to print a split: ops_ns_getattr=0.")
+    print("  The getattr timer is gated on FFS_FUSE_READDIRPLUS_INODE_ORDER, so")
+    print("  with that knob unset the attribute work is absorbed into the")
+    print("  remainder and every share below it is wrong. Re-run with")
+    print("  FFS_FUSE_READDIRPLUS_INODE_ORDER=1 to get a split that adds up.")
+    raise SystemExit(9)
+
 print()
 print("readdirplus three-way split (dispatch_ns_readdirplus = %d):" % dispatch)
 for label, value in (
