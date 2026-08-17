@@ -9011,3 +9011,58 @@ No banked figure changes. This entry re-attributes the *workload* behind them (u
 forward. Combined with the pre-tracer-listdir defect fixed in the previous entry, the instrument's
 contact surface is now fully enumerated: image copy, mount (7-8 nodes, untraced), tracer attach,
 **the measured client**, tracer stop, entry count, unmount. NO wall-clock claim is made anywhere.
+
+## ⛔ CORRECTION — 2026-08-17 — "the cache fails for exactly one node" is not established: I compared re-read counts without ever establishing how often a node is NEEDED (CreamTrout)
+
+Source reading only; **build and bench freeze in force** (/data 16G, 100% used), no runs. Withdraws
+the framing of `95df92510` ("the node-cache failure is CONCENTRATED ON ONE NODE").
+
+### What reading `floor_descend` changed
+
+Its own comment supplies the denominator I never had:
+
+> "a read-only btrfs lookup runs it ~3× per op (dir item + parent/child inode)"
+
+and the body calls `node_provider` exactly once per level, so on this depth-2 tree one descent is
+**2 provider calls, one of them the root**. Order of magnitude for 20,048 entries — and this is an
+estimate off a code comment, not a measurement:
+
+| arm | est. root provider calls | root READS | implied service rate |
+|---|---|---|---|
+| probe live | ~120,288 | 11,772 | ~90.2% |
+| probe suppressed | ~60,144 | 791 | ~98.7% |
+
+**The cache is plausibly serving 90-99% of root requests.** 11,772 reads is not a cache that fails;
+it is a cache that mostly works on the single most-requested key in the tree.
+
+### So the previous framing was wrong
+
+I wrote that the root "fails" while leaves at 1.83x are "close to a cache that works". That compared
+re-read *counts* against an implicit expectation of 1.0, which is only meaningful if each node is
+needed once. The root is on **every descent path**, so it is requested tens of thousands of times;
+being read 11,772 times makes it the most-*requested* node, not the most-*failing* one. The 43%
+share of reads is likewise a numerator statement.
+
+**What survives unchanged:** every cross-arm A/B (they are ratios, and both arms share the
+denominator), the probe attribution at 14.98x/21.5x, the absolute read counts as lower bounds, and
+the fact that the root is the most-read node — which is expected rather than anomalous.
+
+**What is withdrawn:** "the cache fails for exactly one node", the three-property hunt built on it,
+and the framing of bd-2s8zy's remaining question as a per-node defect. Whether there is a defect here
+at all is now open — a 90% service rate on a hot key may be entirely normal for a check-then-insert
+cache under a stampede, or may be nothing.
+
+### This is the fourth error of one kind, so the handoff changes
+
+The others: reading `walk`'s "0 hits" without asking whether the workload revisits nodes; reading a
+3-pass ratio without asking what else was sized to the directory; and a harness that warmed each arm
+before tracing it. All four are the same mistake — **a numerator read without its denominator.**
+
+The consequence for the instrumented run already queued on bd-2s8zy: **counting cache MISSES is not
+enough.** A miss count alone cannot separate a broken cache from a hot key, which is exactly the trap
+above. The instrumentation must record **hits and misses per logical address**, so the service rate
+is measured rather than inferred. That is the same one-line change in
+`btrfs_read_parsed_node` — increment on both branches, keyed by `logical` — and it answers the
+question in one run instead of producing another numerator.
+
+NO wall-clock claim; no figure here is new, and the service rates are explicitly estimates.
