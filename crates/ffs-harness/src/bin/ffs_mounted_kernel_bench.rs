@@ -5049,8 +5049,29 @@ fn select_cpu_placement(
                 .then_with(|| left.0.cmp(&right.0))
         });
         let mut driver = None;
-        for &(cpu, load) in &ranked {
-            let siblings = thread_siblings(cpu)?
+        // bd-placement-argmin: PREFER THE INCUMBENT while it still qualifies.
+        //
+        // The stability rule below wants the same candidate to qualify on
+        // consecutive samples. It was fed by an argmin over busy%, and on a
+        // quiet many-core host the argmin is the least stable thing available:
+        // measured on this box at loadavg ~10, 42-50 of 64 CPUs sat at or under
+        // MAX_DRIVER_PREFLIGHT_BUSY in EVERY sample, while the winner changed 9
+        // times in 15 samples and the longest run of one winner was 1. So the
+        // gate could never accumulate its consecutive count and refused after
+        // 151 samples with "no physical core has every SMT thread below the
+        // driver contention limit" -- a message that was false at the moment it
+        // was printed, because ~45 CPUs satisfied exactly that.
+        //
+        // This does NOT relax what is verified: the incumbent is re-checked
+        // against the same limit, on the same siblings, on every sample, and is
+        // dropped the moment it stops qualifying. It removes only the
+        // requirement that a qualifying core also be the global MINIMUM, which
+        // was never the property the gate meant to assert -- three projects
+        // reported this gate unachievable here, and this is why.
+        if let Some(incumbent) = last_driver
+            && allowed_cpus.contains(&incumbent)
+        {
+            let siblings = thread_siblings(incumbent)?
                 .intersection(allowed_cpus)
                 .copied()
                 .collect::<BTreeSet<_>>();
@@ -5058,8 +5079,23 @@ fn select_cpu_placement(
                 busy.get(sibling)
                     .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
             }) {
-                driver = Some((cpu, load, siblings));
-                break;
+                let load = busy.get(&incumbent).copied().unwrap_or(0.0);
+                driver = Some((incumbent, load, siblings));
+            }
+        }
+        if driver.is_none() {
+            for &(cpu, load) in &ranked {
+                let siblings = thread_siblings(cpu)?
+                    .intersection(allowed_cpus)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if siblings.iter().all(|sibling| {
+                    busy.get(sibling)
+                        .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
+                }) {
+                    driver = Some((cpu, load, siblings));
+                    break;
+                }
             }
         }
         if let Some((driver_cpu, driver_busy, driver_guard_cpus)) = driver {
