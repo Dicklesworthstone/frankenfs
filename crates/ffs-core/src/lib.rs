@@ -29373,6 +29373,29 @@ impl OpenFs {
             if let Some(&(bytenr, block_gen)) = retained_fs.get(&block) {
                 allocated_addrs.insert(block, bytenr);
                 reused_generations.insert(block, block_gen);
+                // A REUSED BLOCK STILL NEEDS ITS BACKREF RE-FILED, and forgetting
+                // this was a real regression, not a hypothetical: every commit
+                // opens by purging the FS/CSUM/EXTENT/ROOT trees' extent items
+                // (`remove_metadata_items_owned_by_roots`, bd-x36qn), and that was
+                // safe only because every block was then rewritten and re-filed by
+                // `alloc_metadata_for_tree`. A block we reuse takes neither path,
+                // so its item stayed purged and `btrfs check` reported "tree
+                // extent[...] root 5 has no backref item in extent tree" for every
+                // reused node — on the SECOND commit onward, which is why a
+                // single-commit fixture could not see it.
+                //
+                // Filed at the block's OWN generation, not `new_gen`: the block on
+                // disk still carries the old one, and an extent item claiming
+                // otherwise is a backref generation mismatch (bd-qxo5x).
+                alloc
+                    .extent_alloc
+                    .ensure_self_metadata_item(
+                        bytenr,
+                        level,
+                        BTRFS_FS_TREE_OBJECTID,
+                        block_gen,
+                    )
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                 continue;
             }
             let allocation = alloc
