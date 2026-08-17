@@ -84,12 +84,43 @@ COUNTED=$(find "$WORK/mnt" -maxdepth 1 -type f 2>/dev/null | wc -l)
 
 # strace the daemon while the client does one readdir+stat pass over the whole
 # directory -- the workload whose residue is in question.
-strace -c -f -e trace=read -p "$DAEMON" -o "$WORK/strace.out" &
+# `kernel.yama.ptrace_scope=1` (this host) lets a process trace only its own
+# DESCENDANTS. strace here is a SIBLING of the daemon -- both are children of
+# this script -- so a plain attach is refused with
+# `ptrace(PTRACE_SEIZE): Operation not permitted`. sudo lifts that.
+#
+# This is not a convenience. Observed: the attach failed, strace wrote an empty
+# syscall table, `reads` parsed as 0, and the classifier printed a CONFIDENT
+# verdict -- "far below the transport prediction, the residue is NOT crossings"
+# -- from an instrument that never ran. An absent measurement is not a
+# measurement of zero.
+STRACE_PREFIX=()
+if [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" != "0" ]; then
+  if sudo -n true 2>/dev/null; then
+    STRACE_PREFIX=(sudo -n)
+  else
+    echo "FATAL: ptrace_scope is restricted and passwordless sudo is unavailable,"
+    echo "       so strace cannot attach to the daemon. Refusing to emit a count"
+    echo "       that would be the absence of a measurement rather than a result."
+    fusermount3 -u "$WORK/mnt" 2>/dev/null
+    exit 5
+  fi
+fi
+
+"${STRACE_PREFIX[@]}" strace -c -f -e trace=read -p "$DAEMON" \
+  -o "$WORK/strace.out" 2> "$WORK/strace.err" &
 STRACE=$!
 sleep 1
+if grep -q "attach\|Operation not permitted" "$WORK/strace.err" 2>/dev/null; then
+  echo "FATAL: strace did not attach to the daemon:"
+  sed 's/^/       /' "$WORK/strace.err"
+  "${STRACE_PREFIX[@]}" kill -INT "$STRACE" 2>/dev/null
+  fusermount3 -u "$WORK/mnt" 2>/dev/null
+  exit 5
+fi
 find "$WORK/mnt" -maxdepth 1 -type f -exec stat -c %s {} + > /dev/null 2>&1
 sleep 1
-kill -INT $STRACE 2>/dev/null
+"${STRACE_PREFIX[@]}" kill -INT "$STRACE" 2>/dev/null
 wait $STRACE 2>/dev/null
 
 fusermount3 -u "$WORK/mnt" 2>/dev/null
@@ -103,6 +134,14 @@ from fuse_crossing_count import parse_syscall_counts, crossings_per_entry, verdi
 text = open(sys.argv[1]).read()
 entries = int(sys.argv[2])
 reads = parse_syscall_counts(text).get("read", 0)
+# A daemon that served this walk MUST have read the fuse device. Zero is not a
+# count of zero crossings, it is the signature of an instrument that did not
+# run -- a failed ptrace attach produces exactly this, and the classifier will
+# happily turn it into "the residue is NOT crossings" if allowed to.
+if reads == 0:
+    print("FATAL: strace recorded ZERO reads while the daemon served this walk.")
+    print("       That is an instrument failure, not a result. No verdict emitted.")
+    raise SystemExit(6)
 per_entry = crossings_per_entry(reads, entries)
 print(f"reads on the fuse device: {reads}")
 print(f"crossings per entry:      {per_entry:.4f}")
