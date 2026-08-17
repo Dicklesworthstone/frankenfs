@@ -1,3 +1,18 @@
+/// Whether `path` appears as a mount point in `/proc/self/mounts` content.
+///
+/// Pure so it can be tested without a mount: the field layout is
+/// `source mountpoint fstype options ...`, and only the SECOND field is a mount
+/// point. Matching anywhere in the line would treat a device or an option string
+/// that merely contains the path as a mount, which is the kind of false positive
+/// that would make the seeding path refuse to run at all.
+fn path_is_mounted(mounts: &str, path: &std::path::Path) -> bool {
+    let needle = path.to_string_lossy();
+    mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|mount_point| mount_point == needle)
+}
+
 #![forbid(unsafe_code)]
 
 //! Real mounted-kernel versus FrankenFS FUSE comparator.
@@ -2319,7 +2334,30 @@ fn seed_fixture_through_mount(
         .parent()
         .ok_or_else(|| anyhow!("base image {} has no parent", image.display()))?
         .join("seed-mnt");
-    fs::create_dir(&mount_dir)
+    // bd-seed-mnt: tolerate OUR OWN leftover directory, but never a leftover
+    // MOUNT. `fs::create_dir` failed with EEXIST whenever a previous run aborted
+    // between creating this directory and removing it, and since the abort paths
+    // include every gate refusal, one refused run poisoned every later run on the
+    // box. Observed twice in a row: the ext4 phase certified, the btrfs phase
+    // then died on `File exists (os error 17)` left by the ext4 phase's own
+    // earlier abort. Each occurrence costs a quiet window, which on this host is
+    // the scarcest thing there is.
+    //
+    // Reusing an empty directory is safe and deletes nothing. Reusing a directory
+    // that is STILL MOUNTED is not: the seeding writes would land in the old
+    // filesystem, and the fixture would be built somewhere other than the image
+    // under test. So that case fails loudly, and says what to do about it.
+    if mount_dir.exists() {
+        let mounts = fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        ensure!(
+            !path_is_mounted(&mounts, &mount_dir),
+            "seed mountpoint {} is STILL MOUNTED from an earlier run. Seeding into it \
+             would write to the old filesystem rather than the image under test. \
+             Unmount it and re-run.",
+            mount_dir.display()
+        );
+    }
+    fs::create_dir_all(&mount_dir)
         .with_context(|| format!("create seed mountpoint {}", mount_dir.display()))?;
 
     let options = match kind {
