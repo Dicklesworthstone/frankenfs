@@ -25,8 +25,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::IoSliceMut;
-use std::os::unix::fs::FileExt;
+use std::io::{IoSliceMut, Seek, SeekFrom};
+use std::os::unix::fs::{FileExt, FileTypeExt};
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "s3fifo")]
@@ -447,7 +447,39 @@ pub struct FileByteDevice {
     file: Arc<File>,
     len: u64,
     writable: bool,
+    /// True when the backing object is a block special (bd-5rxz0).
+    ///
+    /// Two things follow, and both matter. Its length cannot come from
+    /// `metadata().len()` — `st_size` is 0 for a block device, which is why
+    /// `ffs-cli` used to reject `/dev/loopN` as "not a recognized ext4 or btrfs
+    /// filesystem" on bytes the kernel mounts happily. And its length cannot
+    /// CHANGE under us the way a regular file can be truncated, so the
+    /// large-read guards must not re-`stat` it: re-deriving would either cost a
+    /// `seek` syscall per read on a path deliberately kept at one, or (as
+    /// before) compare against 0 and fail every large read.
+    block_device: bool,
     sync_state: Arc<FileDeviceSyncState>,
+}
+
+/// Length of the object behind `file`, correct for regular files AND block
+/// specials (bd-5rxz0).
+///
+/// `metadata().len()` reports `st_size`, which is 0 for a block device, so a
+/// block-backed image measured that way looks empty and is refused by the
+/// format probe. Seeking to the end reports the real size for both kinds, which
+/// is why this is preferred over a `BLKGETSIZE64` ioctl: one code path, no new
+/// dependency, and nothing to keep in sync between the two file kinds.
+///
+/// Safe against the positioned-read path — `pread`/`preadv` ignore the file
+/// cursor, so moving it here cannot perturb a concurrent or subsequent read.
+fn backing_len(file: &File) -> Result<u64> {
+    let meta = file.metadata()?;
+    if meta.file_type().is_block_device() {
+        // `impl Seek for &File`, so this needs no `mut` binding.
+        Ok((&*file).seek(SeekFrom::End(0))?)
+    } else {
+        Ok(meta.len())
+    }
 }
 
 /// Write/sync epoch pair backing `FileByteDevice`'s clean-sync skip.
@@ -599,7 +631,8 @@ impl FileByteDevice {
                     .open(path.as_ref())
                     .map(|file| (file, false))
             })?;
-        let len = file.metadata()?.len();
+        let block_device = file.metadata()?.file_type().is_block_device();
+        let len = backing_len(&file)?;
         // Declare the access pattern so the kernel sizes its read-ahead window
         // for our bulk reads (cold-read lever; inert when warm). Advisory: any
         // error is ignored — it never affects correctness.
@@ -611,6 +644,7 @@ impl FileByteDevice {
             file: Arc::new(file),
             len,
             writable,
+            block_device,
             sync_state: Arc::new(FileDeviceSyncState {
                 write_epoch: AtomicU64::new(1),
                 synced_epoch: AtomicU64::new(0),
@@ -694,7 +728,15 @@ impl ByteDevice for FileByteDevice {
         // extra syscall — keep it, which also preserves the destination for
         // free and leaves the hot metadata read path byte-identical.
         if buf.len() >= file_device_direct_read_min() {
-            let live_len = self.file.metadata()?.len();
+            // A block special cannot shrink under us, and its `st_size` is 0,
+            // so re-stat'ing would fail every large read (bd-5rxz0). Use the
+            // length established at open; regular files still re-stat, which is
+            // the point of this guard.
+            let live_len = if self.block_device {
+                self.len
+            } else {
+                self.file.metadata()?.len()
+            };
             if end > live_len {
                 return Err(FfsError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -797,7 +839,15 @@ impl ByteDevice for FileByteDevice {
         // first so a backing-file shrink fails before partially dirtying any
         // destination slices. Small reads keep the freelist-cheap scratch path.
         if total_len >= file_device_direct_read_min() && bufs.len() <= FILE_DEVICE_PREADV_IOV_MAX {
-            let live_len = self.file.metadata()?.len();
+            // A block special cannot shrink under us, and its `st_size` is 0,
+            // so re-stat'ing would fail every large read (bd-5rxz0). Use the
+            // length established at open; regular files still re-stat, which is
+            // the point of this guard.
+            let live_len = if self.block_device {
+                self.len
+            } else {
+                self.file.metadata()?.len()
+            };
             if end > live_len {
                 return Err(FfsError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -4086,6 +4136,7 @@ mod tests {
             file: Arc::new(file),
             len: std::fs::metadata(&path).expect("metadata").len(),
             writable: false,
+            block_device: false,
             sync_state: Arc::new(FileDeviceSyncState {
                 write_epoch: AtomicU64::new(1),
                 synced_epoch: AtomicU64::new(0),
