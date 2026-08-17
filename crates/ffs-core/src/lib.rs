@@ -33034,6 +33034,44 @@ impl OpenFs {
             item_type: BTRFS_ITEM_XATTR_ITEM,
             offset: u64::from(name_hash) + 1,
         };
+        // MEMO-AWARE FAST PATH (bd-yu6jz). `[lo, hi)` spans exactly ONE key —
+        // btrfs packs names that collide on `name_hash` into the single
+        // XATTR_ITEM at that key, which is why the fallback below searches item
+        // DATA rather than iterating keys. A one-key range is a point lookup, so
+        // a floor descent decides it: `walk_btrfs_fs_tree_floor` returns the
+        // greatest key `<= lo`, and that fully determines whether `lo` exists.
+        //
+        // The reason to prefer it is not the descent shape but the CACHE. The
+        // floor path consults `btrfs_floor_leaf_memo`; `walk_btrfs_fs_tree_range`
+        // does not. Linux issues one uncached `getxattr(security.capability)` per
+        // path-based metadata op, so on a readdir+stat sweep this path runs once
+        // per entry and previously paid a fresh root-to-leaf descent every time,
+        // while the `getattr` for the very same inode was served from the memo.
+        //
+        // ⚠️ GATED ON AN EMPTY TREE LOG, and that gate is the correctness of this
+        // fast path, not a heuristic. The range walker applies
+        // `btrfs_apply_tree_log_overlay_range`, which can REPLACE or ADD an item
+        // from an unreplayed tree log; the floor walker does not. That overlay
+        // early-returns when `btrfs_tree_log_items` is empty, so with an empty log
+        // the two paths are exactly equivalent and with a non-empty one they are
+        // not — hence the fallback rather than a blanket switch.
+        if self.btrfs_tree_log_items.is_empty() {
+            return match self.walk_btrfs_fs_tree_floor(cx, lo)? {
+                // ⚠️ THE KEY EQUALITY IS LOAD-BEARING. A floor descent returns the
+                // greatest key `<= lo`, so when this bucket is absent it hands
+                // back a SMALLER key — in a directory sweep, very likely another
+                // inode's XATTR_ITEM. Using that entry's data without this check
+                // would return ANOTHER FILE'S xattr value: silent and wrong.
+                Some(entry) if entry.key == lo => {
+                    find_xattr_item_value(&entry.data, name.as_bytes())
+                        .map_err(|e| parse_to_ffs_error(&e))
+                }
+                // A smaller key (or no key at all) proves the bucket is absent:
+                // the descent landed where `lo` would live and it is not there.
+                _ => Ok(None),
+            };
+        }
+
         let items = self.walk_btrfs_fs_tree_range(cx, lo, hi)?;
         for item in &items {
             if let Some(value) = find_xattr_item_value(&item.data, name.as_bytes())
@@ -73543,6 +73581,46 @@ mod tests {
             ok,
             "btrfs check must accept device nodes, a FIFO, and a 255-byte name:\n{output}"
         );
+    }
+
+    /// bd-yu6jz: the read-only getxattr fast path must not serve a NEIGHBOURING key.
+    ///
+    /// That path resolves a one-key XATTR_ITEM bucket with a floor descent, and
+    /// `walk_btrfs_fs_tree_floor` returns the greatest key `<= target`. When the
+    /// bucket is absent it therefore hands back a SMALLER key — on a populated tree,
+    /// very plausibly another inode's item. The implementation asserts
+    /// `entry.key == lo` before using the entry; WITHOUT that check this test reads a
+    /// neighbouring item's bytes instead of `None`, which is the silent-wrong-answer
+    /// failure this lever could have introduced.
+    ///
+    /// Read-only by construction (`from_device` with no `enable_writes`), because the
+    /// fast path is gated on `btrfs_alloc_state.is_none()`.
+    ///
+    /// ⚠️ SCOPE: this pins the ABSENT direction only. The PRESENT direction — an xattr
+    /// that exists must still be found — is verified end to end through a real FUSE
+    /// mount (set on a RW mount, read back correctly after a RO remount) and is
+    /// deliberately NOT pinned here: this crate's in-process btrfs fixture does not
+    /// survive `sync_all_to_device` + reopen (the file itself returns `NotFound`), so
+    /// such a test would assert on the fixture rather than on the code.
+    #[test]
+    fn btrfs_readonly_getxattr_absent_name_is_not_served_from_a_neighbour_bd_yu6jz() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let ro = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+            .expect("open read-only btrfs");
+        assert!(
+            !ro.is_writable(),
+            "the fast path is gated on a read-only mount; this fixture must be one"
+        );
+
+        for name in ["user.never.set", "security.capability", "user.zzz"] {
+            assert_eq!(
+                ro.getxattr(&cx, InodeNumber(1), name).expect("getxattr"),
+                None,
+                "absent name {name:?} must read as absent, not as a neighbouring key's value"
+            );
+        }
     }
 
     #[test]

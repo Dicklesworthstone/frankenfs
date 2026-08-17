@@ -9812,3 +9812,65 @@ not a filesystem-vs-filesystem result.
 Window, recorded per instruction: loadavg 32.14/29.22/27.27 (kernel arm) and 33.61/29.66/27.43 (FUSE
 arm), CPU idle 22-25% measured with `vmstat`, iowait 0. A count does not care, which is why it was
 the right thing to run on a host this busy.
+
+## MECHANISM — 2026-08-17 — routing the capability probe through the floor-leaf memo cuts btrfs readdir+stat node reads 12.6x, and removes the 10k cliff entirely (bd-yu6jz)
+
+Implements the lever this session attributed and designed. **Counted, not timed** — the window was
+checked and refused (58 CPUs above 25% busy against a limit of 2), which does not apply to a count.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, ELF
+`045d2e7edb934eda3bb0cb74` (`target/debug/ffs-cli`), mean CPU 3933.9 MHz over 64 CPUs, loadavg
+41.16/31.92/28.32, df 215G→212G. One build per pane, repo-local target, fixed parser, one fresh
+mount per arm.
+
+### The change
+
+`btrfs_getxattr`'s read-only branch resolved its one-key XATTR_ITEM bucket with
+`walk_btrfs_fs_tree_range`, which consults **no cache**. It now resolves it with
+`walk_btrfs_fs_tree_floor`, which consults `btrfs_floor_leaf_memo` — the same memo the `getattr` for
+that very same inode was already using. The probe runs once per path-based metadata op, so on a
+readdir+stat sweep it previously paid a fresh root-to-leaf descent per entry.
+
+### Counted effect
+
+| fixture | before | after | |
+|---|---|---|---|
+| 20,048 entries | 27464 reads, 25.3x re-read, 1.37/entry | **2184, 2.0x, 0.11/entry** | **12.6x fewer** |
+| 10,048 entries | 1417 reads, 2.6x re-read, 0.14/entry | **566, 1.0x, 0.06/entry** | **2.5x fewer** |
+| fs-tree root re-reads @20k | 11597 | **719** | 16x fewer |
+
+**The 10,048-entry cliff is gone** — re-read is back to 1.0x, every node read exactly once, which is
+what the sub-5k sizes always did. At 20k a 2.0x residual remains.
+
+### Correctness, and the case that could have made this silently wrong
+
+`walk_btrfs_fs_tree_floor` returns the greatest key `<= target`, so when the bucket is absent it
+returns a **smaller, different key** — on a populated tree, plausibly another inode's XATTR_ITEM. The
+implementation asserts `entry.key == lo` before using the entry. Without that check the probe returns
+**another file's xattr value**.
+
+* ✅ New test `btrfs_readonly_getxattr_absent_name_is_not_served_from_a_neighbour_bd_yu6jz` pins the
+  absent direction on a read-only fixture.
+* ✅ Present direction verified END TO END through a real FUSE mount: `user.ctrl=PRESENT-VALUE-42` set
+  on a RW mount, unmounted, **read back correctly after a RO remount**, with a never-set name still
+  reporting absent on the same mount.
+* ✅ `cargo test -p ffs-core --lib xattr`: **51 passed, 0 failed, 2 ignored.**
+
+⚠️ **Gated on an empty tree log, and that gate is load-bearing rather than cautious.** The range
+walker applies `btrfs_apply_tree_log_overlay_range`, which can REPLACE or ADD an item from an
+unreplayed tree log; the floor walker does not. That overlay early-returns when
+`btrfs_tree_log_items` is empty, so with an empty log the paths are exactly equivalent — and with a
+non-empty one they are not, which is why this falls back to the range walk instead of switching
+unconditionally.
+
+⚠️ **NOT pinned in-tree: the present direction.** This crate's in-process btrfs fixture does not
+survive `sync_all_to_device` + reopen — the file itself returns `NotFound` — so a unit test asserting
+it would be testing the fixture. I wrote that test, watched it fail for that reason, and replaced it
+rather than leave a test that proves nothing. The end-to-end mount check above is what covers it.
+
+### No wall-clock claim
+
+12.6x is a factor on **image reads**, which this session established repeatedly is not a wall-clock
+currency: the daemon-side share of this row is bounded and the row is transport-heavy (bd-q0xnl).
+What a timed row would show is UNMEASURED and will stay that way until a window exists — the gate has
+not been reachable once in thirty consecutive samples on this host.
