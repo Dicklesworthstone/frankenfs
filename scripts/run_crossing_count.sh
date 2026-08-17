@@ -76,11 +76,31 @@ if ! sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -q "xattr_suppression=active"; then
   exit 4
 fi
 
-# Warm the caches first: the count must describe the steady state, not the cold
-# walk that populated it.
-find "$WORK/mnt" -maxdepth 1 -type f -printf '' 2>/dev/null
+# THE CLIENT IS THE MEASUREMENT (bd-xfe7z, 2026-08-17). The first run of this
+# script used `find -maxdepth 1 -type f -exec stat` and counted 1.9927 crossings
+# per entry -- almost exactly 2.0, because that client issues a LOOKUP and a
+# GETATTR per file and never uses readdirplus. The certified readdir+stat row
+# whose 1.143 us/op residue this exists to explain uses
+# `scripts/abba_clients/readdir_stat_client.c`, which enumerates once and lets
+# the kernel batch attributes into the readdir reply. Counting a different
+# client answers a different question, and the answer looked like a refutation
+# of both hypotheses rather than what it was: the wrong workload.
+#
+# So the same client the certified row used is compiled and used here. gcc, not
+# cargo: this is a 30-line C file and needs no toolchain lane.
+CLIENT_BIN="$WORK/readdir_stat_client"
+gcc -O2 -o "$CLIENT_BIN" "$HERE/abba_clients/readdir_stat_client.c" || {
+  echo "FATAL: could not build the readdir+stat client; without it this script"
+  echo "       counts a per-file stat walk, which is the wrong workload."
+  fusermount3 -u "$WORK/mnt" 2>/dev/null
+  exit 6
+}
+
 COUNTED=$(find "$WORK/mnt" -maxdepth 1 -type f 2>/dev/null | wc -l)
 [ "$ENTRIES" = "0" ] && ENTRIES=$COUNTED
+# Warm first: the count must describe the steady state, not the cold walk that
+# populated the caches.
+"$CLIENT_BIN" "$WORK/mnt" >/dev/null 2>&1
 
 # strace the daemon while the client does one readdir+stat pass over the whole
 # directory -- the workload whose residue is in question.
@@ -131,7 +151,7 @@ if grep -qE "attach: ptrace|Operation not permitted|could not attach" \
   fusermount3 -u "$WORK/mnt" 2>/dev/null
   exit 5
 fi
-find "$WORK/mnt" -maxdepth 1 -type f -exec stat -c %s {} + > /dev/null 2>&1
+"$CLIENT_BIN" "$WORK/mnt" > /dev/null 2>&1
 sleep 1
 "${STRACE_PREFIX[@]}" kill -INT "$STRACE" 2>/dev/null
 wait $STRACE 2>/dev/null
