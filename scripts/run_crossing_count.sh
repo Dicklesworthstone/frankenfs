@@ -40,7 +40,14 @@ LOG="$WORK/daemon.log"
 
 # The suppressed arm, because that is the arm whose residue is unexplained. The
 # control arm's crossings are already counted and known (bd-ha71t).
-env FFS_FUSE_XATTR_NO_SUPPORT=auto "$CLI" mount "$IMG" "$WORK/mnt" >> "$LOG" 2>&1 &
+# FFS_MOUNT_BENCH_EVIDENCE=1 is REQUIRED, not decoration: the
+# `xattr_suppression=...` line the check below greps for is emitted only under
+# it (`emit_xattr_suppression_evidence`, ffs-fuse). Without it the daemon
+# suppresses correctly and says nothing, the check finds no match, and this
+# script exits 4 claiming the lever is inactive -- a false NEGATIVE in the one
+# guard that exists to prevent a false positive.
+env FFS_FUSE_XATTR_NO_SUPPORT=auto FFS_MOUNT_BENCH_EVIDENCE=1 \
+  "$CLI" mount "$IMG" "$WORK/mnt" >> "$LOG" 2>&1 &
 DAEMON=$!
 for _ in $(seq 1 150); do mountpoint -q "$WORK/mnt" && break; sleep 0.05; done
 mountpoint -q "$WORK/mnt" || { echo "FATAL: mount did not appear"; tail -3 "$LOG"; exit 3; }
