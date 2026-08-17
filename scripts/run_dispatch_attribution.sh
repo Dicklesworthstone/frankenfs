@@ -87,6 +87,14 @@ wait $DAEMON 2>/dev/null
 echo "entries walked: $ENTRIES x $PASSES passes"
 sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -o "mount_dispatch_metrics,[^ ]*" | tail -1 \
   > "$WORK/metrics.txt"
+# bd-xfe7z: the THREE-WAY split, from the daemon's own crossings line. This is
+# a DIFFERENT counter family from mount_dispatch_metrics above -- dispatch_ns is
+# the whole handler, ops_ns is the FsOps call inside it, reply_ns is reply
+# construction, and the remainder is per-entry handler bookkeeping. Captured to
+# its own file because the two families do NOT share a denominator; mixing them
+# already produced a 645.98% share once.
+sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -o "mount_candidate_crossings,.*" | tail -1 \
+  > "$WORK/crossings.txt"
 
 python3 - "$WORK/metrics.txt" "$ENTRIES" "$PASSES" <<'PY'
 import sys
@@ -153,3 +161,53 @@ print(f"ATTRIBUTION: {top_op} owns {100.0*top_n/total_nanos:.1f}% of daemon hand
 print("NOTE: shares are the result. Absolute ns on a debug ELF are inflated and")
 print("      must not be compared against any banked row.")
 PY
+
+# Three-way decomposition of readdirplus (bd-xfe7z): dispatch = ops + reply +
+# remainder. The remainder is the current target (60.0% on a debug ELF), and
+# repeating this split on release-perf is the stated prerequisite before writing
+# a lever against it -- so it is a command, not a paragraph.
+python3 - "$WORK/crossings.txt" <<'PYSPLIT'
+import sys
+
+text = open(sys.argv[1]).read().strip()
+if not text:
+    print()
+    print("three-way split: no mount_candidate_crossings line "
+          "(ELF predates it, or FFS_MOUNT_BENCH_EVIDENCE was unset)")
+    raise SystemExit(0)
+
+fields = {}
+for part in text.replace(",", " ").split():
+    if "=" in part:
+        k, v = part.split("=", 1)
+        try:
+            fields[k] = int(v)
+        except ValueError:
+            pass
+
+dispatch = fields.get("dispatch_ns_readdirplus", 0)
+if dispatch == 0:
+    print()
+    print("three-way split: dispatch_ns_readdirplus=0, so readdirplus never ran or")
+    print("was never timed. No split emitted -- a zero denominator is not a result.")
+    raise SystemExit(0)
+
+ops_getattr = fields.get("ops_ns_getattr", 0)
+ops_readdir = fields.get("ops_ns_readdir", 0)
+reply = fields.get("reply_ns_readdirplus", 0)
+remainder = dispatch - ops_getattr - ops_readdir - reply
+
+print()
+print("readdirplus three-way split (dispatch_ns_readdirplus = %d):" % dispatch)
+for label, value in (
+    ("ops_ns_getattr      ", ops_getattr),
+    ("ops_ns_readdir      ", ops_readdir),
+    ("reply_ns_readdirplus", reply),
+    ("remainder           ", remainder),
+):
+    print("  %s %14d  %6.2f%%" % (label, value, 100.0 * value / dispatch))
+if remainder < 0:
+    print("  WARNING: negative remainder -- the parts exceed the whole, so these")
+    print("           timers are not nested the way this split assumes. Do NOT")
+    print("           quote these shares; fix the nesting first.")
+PYSPLIT
