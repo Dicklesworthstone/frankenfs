@@ -9644,3 +9644,53 @@ what a previous commit left behind — block reuse, retained maps, generation ca
 keyed on "already written" — then a single-commit fixture cannot test it at any size. Run
 `--commits N` with N > 1, and run `scripts/fsync_flush_count.py`, which drives many commits and now
 fsck's the image before reporting any number.
+
+## ADMITTED WIN — 2026-08-17 — btrfs fsync/journal-commit is 0.461109x of kernel btrfs (2.17x FASTER), HONEST_WIN at 96 pairs (PlumBeacon)
+
+The first ADMITTED btrfs row of this campaign, and it reverses the banked direction: the row was
+recorded as `1.98x SLOWER` and measures `0.461109x` — i.e. **2.169x faster than kernel btrfs** — on a
+fixed candidate with both A/A nulls clear.
+
+    mounted_kernel_ratio,filesystem=btrfs,workload=fsync_journal_commit,pairs=96,crossover_blocks=24,
+      fuse_over_kernel_median=0.461109,ci_low=0.452020,ci_high=0.470524,
+      twice_null_margin_ratio=1.044109,directional_claim_clear=true,
+      admitted=true,verdict=HONEST_WIN
+    kernel median 106.29-106.75 ms   fuse median 48.70-48.71 ms   (8 x 4 KiB write+fsync)
+
+**Both nulls clear, which is what 48 pairs could not do.** kernel `0.996063` (dev 0.0039),
+fuse `0.995159` (dev 0.0048), limit `0.020000`, both `clear=true`. At 48 pairs the kernel null was
+`1.020623` — 2.06% against a 2.00% limit — and the row was `BLOCKED_NULL`. Doubling the pairs cleared
+it, which settles that it was sampling noise and NOT the equal-duration drift bd-fj2dg warns about;
+had it been drift, more pairs would not have moved the median.
+
+**Provenance, per arm, as required.** Host `thinkstation1`, kernel `6.17.0-41-generic`, kernel engine
+sha `0acb7af5…`, candidate ELF **`c9fb745f…`** (the FIXED daemon), PGO profile `6a22cfcf…`, ISA
+`avx+avx2+f16c+fma+sse2+sse4.2`, `same_invocation=true`, `independent_physical_arms=true`,
+`incumbent_isolation_proof=pass`, `parity=pass` (file sha and full tree sha before and after).
+
+| | loadavg 1/5/15 | placement mean MHz |
+|---|---|---|
+| run | 31.21 / 31.60 / 27.11, `settled=false` | driver **2524.74**, FUSE daemon **1429.008** |
+
+⚠️ **TWO CAVEATS THAT BELONG ON THIS ROW WHEREVER IT IS QUOTED.**
+
+1. **The window was contended.** `external_load_during_run.verdict=contended`,
+   `contended_fraction=1.0` against a `0.1` limit, `max_external_busy_cpus=60` against a limit of 2,
+   85 of 85 samples over limit. The harness admitted the row on its nulls and parity anyway, but this
+   is not a quiet-window row and should be replicated in one.
+2. **The arms' placement clocks differed 1.77x** — and in the direction that makes the result
+   CONSERVATIVE, not inflated: our daemon ran at 1429 MHz while the driver ran at 2525 MHz. A
+   frequency artifact here would have hurt us, so it cannot manufacture this win. That asymmetry
+   would still sink a row that went the other way.
+
+**THE OPEN QUESTION, and it is the one a fake win would hide.** We issue **3 barriers per client
+fsync where the kernel issues 2** and write **1.389x the bytes** (both counted, bd-7nr8p / bd-2w2me /
+bd-42gtq), yet we are 2.17x faster in wall clock. More I/O and more barriers should not be faster.
+Evidence against the obvious worry — that our fsync is simply less durable — is that the barrier
+count was measured from OUTSIDE the process with `strace`, and it is HIGHER, so we are not skipping
+flushes. But "more flush syscalls" is not the same claim as "equally durable", and until that gap is
+closed this row should be read as a wall-clock result, not a durability-equivalence claim. Filed as
+bd-5hqj2.
+
+**Retry predicate.** Replicate at 96 pairs in a window with `external_load_during_run.verdict != contended`
+and `settled=true`. If it reproduces there, the row is unconditional.
