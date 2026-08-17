@@ -4464,6 +4464,12 @@ impl Filesystem for FrankenFuse {
                 // enables it.
                 let mut prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> =
                     if readdirplus_inode_order_from_env() {
+                        // bd-xfe7z: times the whole prefetch block, scopes
+                        // included, so `prefetch_ns - ops_ns_getattr` isolates
+                        // the request-scope machinery from the format-layer work
+                        // already timed inside it.
+                        let _prefetch_timer =
+                            crossings::PrefetchTimer::start(crossings::CrossingOp::Readdirplus);
                         // bd-xfe7z: BOUNDED by what the previous reply actually
                         // emitted. This is the fix the rejection above called
                         // for. Entries past the bound are left `None` and fetched
@@ -4519,6 +4525,8 @@ impl Filesystem for FrankenFuse {
                             // what 1.01 scopes/entry measures.
                             for index in order {
                                 let ino = entries[index].ino;
+                                let _scope_timer =
+                                    crossings::ScopeTimer::start(crossings::CrossingOp::Getattr);
                                 if let Ok(attr) =
                                     self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
                                         let _t = crossings::OpsTimer::start(

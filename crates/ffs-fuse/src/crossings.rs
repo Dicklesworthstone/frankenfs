@@ -321,6 +321,75 @@ impl Drop for ReplyTimer {
     }
 }
 
+/// Nanoseconds spent in the readdirplus PREFETCH block (bd-xfe7z).
+///
+/// Splits the remainder, which is now the target and is not yet attributable.
+/// On release-perf the split reads `ops_getattr 38.92% / ops_readdir 0.95% /
+/// reply 4.23% / remainder 55.90%`, and every per-entry term NAMED in that
+/// remainder turns out to be cheap on inspection: `to_file_attr` is a
+/// field-by-field struct build with no allocation and no time arithmetic,
+/// `OsStr::from_bytes` is a zero-copy cast, and the attribute memo's
+/// `remember` returns immediately while disabled. Cheap terms do not add to
+/// 55.90%, so the remainder is somewhere else and guessing which is how the
+/// last lever got rejected.
+///
+/// This timer wraps the whole prefetch block, which contains the per-entry
+/// request scopes AND the `ops.getattr` calls already timed by [`OpsTimer`].
+/// That overlap is deliberate and is what makes it decompose:
+///
+///     prefetch_ns - ops_ns_getattr = request-scope machinery
+///     dispatch_ns - prefetch_ns - ops_ns_readdir - reply_ns = emit-loop work
+///
+/// Two halves of the remainder from one counter, and they point at different
+/// code: the first at `with_request_scope`, the second at the emit loop.
+static PREFETCH_NANOS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Accumulates prefetch-block time on DROP.
+///
+/// RAII for the same reason as its siblings: the prefetch loop can exit early
+/// on a failed fetch, and a timer that accumulated after it would miss exactly
+/// the batches that went wrong.
+pub struct PrefetchTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl PrefetchTimer {
+    /// Start timing the prefetch block, or return `None` when evidence is off.
+    #[must_use]
+    pub fn start(op: CrossingOp) -> Option<Self> {
+        ops_timing_enabled().then(|| Self {
+            slot: op.index(),
+            started: std::time::Instant::now(),
+        })
+    }
+}
+
+impl Drop for PrefetchTimer {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        PREFETCH_NANOS[self.slot].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Render prefetch-block nanoseconds with the shared labels and ordering.
+#[must_use]
+pub fn render_prefetch_nanos() -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = PREFETCH_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
+        total += value;
+        out.push_str(&format!("prefetch_ns_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" prefetch_ns_total={total}"));
+    out
+}
+
 /// Render reply-construction nanoseconds with the shared labels and ordering.
 #[must_use]
 pub fn render_reply_nanos() -> String {
@@ -335,6 +404,62 @@ pub fn render_reply_nanos() -> String {
         out.push_str(&format!("reply_ns_{}={}", op.label(), value));
     }
     out.push_str(&format!(" reply_ns_total={total}"));
+    out
+}
+
+/// Nanoseconds spent in `with_request_scope` around an ops call, per opcode.
+///
+/// The fourth term, and it exists to settle an apparent contradiction rather
+/// than to add detail. The decomposition puts `61.4%` of readdirplus dispatch in
+/// a remainder that is neither the ops calls nor reply construction, and the
+/// obvious candidate was the per-entry request scope -- yet collapsing those
+/// scopes into one measured `0.962933x`, INSIDE THE NULL. Both cannot be true
+/// unless scope overhead is a small part of the remainder.
+///
+/// Timing the wrapper directly says which. `scope_ns - ops_ns` for the same
+/// opcode is the scope's own cost; whatever is left in the remainder after that
+/// is per-entry loop work -- name handling, attribute conversion, iteration.
+static SCOPE_NANOS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Accumulates scope-wrapper time on DROP, like the other timers.
+pub struct ScopeTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl ScopeTimer {
+    /// Start timing a request-scope wrapper, or `None` when evidence is off.
+    #[must_use]
+    pub fn start(op: CrossingOp) -> Option<Self> {
+        ops_timing_enabled().then(|| Self {
+            slot: op.index(),
+            started: std::time::Instant::now(),
+        })
+    }
+}
+
+impl Drop for ScopeTimer {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        SCOPE_NANOS[self.slot].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Render scope-wrapper nanoseconds with the shared labels and ordering.
+#[must_use]
+pub fn render_scope_nanos() -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = SCOPE_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
+        total += value;
+        out.push_str(&format!("scope_ns_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" scope_ns_total={total}"));
     out
 }
 
@@ -394,6 +519,10 @@ pub fn render_live_timed() -> String {
         + &render_ops_nanos()
         + " "
         + &render_reply_nanos()
+        + " "
+        + &render_prefetch_nanos()
+        + " "
+        + &render_scope_nanos()
 }
 
 /// Live counts from the daemon, rendered for the metrics line.
@@ -405,12 +534,66 @@ pub fn render_live() -> String {
 #[cfg(test)]
 mod tests {
 
+    /// Every render family must reach the live line. `render_scope_nanos` was
+    /// defined, tested and NOT emitted for a whole measurement cycle because an
+    /// append did not match the formatting -- an instrument that exists, passes
+    /// its tests, and reports nothing. This pins emission, not existence.
+    #[test]
+    fn every_counter_family_reaches_the_live_line_bd_xfe7z() {
+        let line = super::render_live_timed();
+        for family in [
+            "crossings_getattr=",
+            "dispatch_ns_getattr=",
+            "ops_ns_getattr=",
+            "reply_ns_getattr=",
+            "scope_ns_getattr=",
+        ] {
+            assert!(
+                line.contains(family),
+                "{family} is missing from the live evidence line; a counter that is \
+                 not emitted is not an instrument"
+            );
+        }
+    }
+
+    /// The scope timer WRAPS the ops timer, so for any opcode
+    /// ops_ns <= scope_ns <= dispatch_ns. This pins the middle relation; the
+    /// existing invariant pins the outer one.
+    #[test]
+    fn a_scope_contains_its_ops_call_bd_xfe7z() {
+        // Same predicate, applied to the nested pair: ops inside scope.
+        assert!(
+            super::decomposition_is_consistent(100, 40, 0),
+            "ops fits in scope"
+        );
+        assert!(
+            !super::decomposition_is_consistent(40, 41, 0),
+            "an ops call longer than the scope that wraps it means one of the two \
+             timers is mis-slotted"
+        );
+    }
+
+    #[test]
+    fn scope_nanos_share_the_label_vocabulary_bd_xfe7z() {
+        let line = super::render_scope_nanos();
+        for op in CrossingOp::ALL {
+            assert!(
+                line.contains(&format!("scope_ns_{}=", op.label())),
+                "{line}"
+            );
+        }
+        assert!(line.contains("scope_ns_total="), "{line}");
+    }
+
     /// The invariant the decomposition rests on: ops and reply both happen
     /// inside a dispatch, so their sum cannot exceed it.
     #[test]
     fn ops_plus_reply_may_not_exceed_dispatch_bd_xfe7z() {
         assert!(super::decomposition_is_consistent(100, 30, 40));
-        assert!(super::decomposition_is_consistent(100, 60, 40), "equality is allowed");
+        assert!(
+            super::decomposition_is_consistent(100, 60, 40),
+            "equality is allowed"
+        );
         assert!(
             !super::decomposition_is_consistent(100, 61, 40),
             "a sum over dispatch means a timer is mis-slotted, double-counting, or \
@@ -444,6 +627,49 @@ mod tests {
             );
         }
         assert!(line.contains("reply_ns_total="), "{line}");
+    }
+
+    /// bd-xfe7z: the prefetch renderer emits every opcode and a total, with the
+    /// same labels as its siblings.
+    ///
+    /// Shared labels are the point, not decoration: the whole reason this
+    /// counter exists is to be SUBTRACTED from the others
+    /// (`prefetch_ns - ops_ns_getattr` is the request-scope machinery), and a
+    /// renderer that spelled an opcode differently would silently produce a
+    /// zero on one side of that subtraction. A zero on one side of a
+    /// subtraction is how the 95.58% remainder artifact happened.
+    #[test]
+    fn render_prefetch_nanos_emits_every_opcode_and_a_total_bd_xfe7z() {
+        let line = super::render_prefetch_nanos();
+        for op in CrossingOp::ALL {
+            assert!(
+                line.contains(&format!("prefetch_ns_{}=", op.label())),
+                "{line}"
+            );
+        }
+        assert!(line.contains("prefetch_ns_total="), "{line}");
+    }
+
+    /// bd-xfe7z: the prefetch timer is inert without the evidence flag.
+    ///
+    /// It wraps a block that runs once per readdir batch rather than once per
+    /// entry, so it is cheaper than its siblings -- but a default mount must
+    /// still pay nothing, and `start` returning `None` is what guarantees the
+    /// `Instant::now()` is never taken.
+    #[test]
+    fn prefetch_timer_is_inert_without_the_evidence_flag_bd_xfe7z() {
+        // The flag is read once into a OnceLock, so this asserts whichever way
+        // the harness is configured: enabled -> Some, disabled -> None. Either
+        // way the timer must AGREE with the other two, or one family would
+        // accumulate while another did not and the subtraction above would be
+        // taken across mismatched runs.
+        let ops = super::OpsTimer::start(CrossingOp::Getattr).is_some();
+        let prefetch = super::PrefetchTimer::start(CrossingOp::Readdirplus).is_some();
+        assert_eq!(
+            ops, prefetch,
+            "the ops and prefetch timers must be gated identically, or \
+             prefetch_ns - ops_ns_getattr subtracts across different gates"
+        );
     }
 
     /// Inert without the evidence flag, like the ops timer: this one sits inside
