@@ -6645,6 +6645,78 @@ impl BtrfsExtentAllocator {
         Ok(())
     }
 
+    /// Idempotent form of [`Self::insert_self_metadata_item`]: leave the extent
+    /// tree describing the block at `bytenr` with exactly one skinny
+    /// `METADATA_ITEM` at `level` owned by `owner_root`, and report whether the
+    /// tree actually changed.
+    ///
+    /// bd-k74ef. Self-description at commit time is a FIXPOINT, not a single
+    /// pass: describing a block writes an item into the extent tree, which can
+    /// give the extent tree another block, which needs describing in turn. A
+    /// caller iterating that loop offers the same `(bytenr, level, owner)`
+    /// repeatedly and needs a "nothing left to do" signal to stop, which
+    /// `insert_self_metadata_item` cannot give — it would also insert a SECOND
+    /// item at a different level rather than correct the first, and a stale
+    /// level is exactly what `btrfs check` reports as "metadata level mismatch".
+    ///
+    /// The `level` lives in the key's offset, so a level correction is a
+    /// delete + insert; the item count is unchanged by it, which is what keeps
+    /// the caller's fixpoint monotone.
+    ///
+    /// # Errors
+    /// Returns any error from the underlying extent-tree scan or mutation.
+    pub fn ensure_self_metadata_item(
+        &mut self,
+        bytenr: u64,
+        level: u8,
+        owner_root: u64,
+        generation: u64,
+    ) -> Result<bool, BtrfsMutationError> {
+        let extent_item = BtrfsExtentItem {
+            refs: 1,
+            generation,
+            flags: BtrfsExtentItem::FLAG_TREE_BLOCK,
+        };
+        let mut value = extent_item.to_bytes();
+        value.push(BTRFS_ITEM_TREE_BLOCK_REF);
+        value.extend_from_slice(&owner_root.to_le_bytes());
+        let key = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: u64::from(level),
+        };
+
+        // Every METADATA_ITEM recorded for this bytenr, at ANY level — the whole
+        // point is to notice one filed under the wrong one.
+        let lo = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: u64::MAX,
+        };
+        let mut existing: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
+        self.extent_tree.range_with(&lo, &hi, |k, v| {
+            existing.push((k, v.to_vec()));
+        })?;
+
+        if existing.len() == 1 && existing[0].0 == key && existing[0].1 == value {
+            return Ok(false);
+        }
+        let had_stale = !existing.is_empty();
+        for (stale, _) in &existing {
+            self.extent_tree.delete(stale)?;
+        }
+        self.extent_tree.insert(key, &value)?;
+        if had_stale {
+            self.invalidate_tail_cursors();
+        }
+        Ok(true)
+    }
+
     /// Attach the inline `EXTENT_DATA_REF` backref (and `FLAG_DATA`) to the
     /// extent-tree `EXTENT_ITEM` for a regular/prealloc DATA extent.
     ///
