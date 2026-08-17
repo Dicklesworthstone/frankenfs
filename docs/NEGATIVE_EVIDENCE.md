@@ -8440,3 +8440,46 @@ of supporting evidence is withdrawn. The in-process paths cannot be used to prob
 resolves 20048 entries at 37 ns/entry and never descends the tree at all, so the FUSE path re-descends
 where the in-process path does not, and *that* difference is the next thing to attribute. NO
 wall-clock claim is made anywhere in this entry.
+
+## MECHANISM — 2026-08-17 — the per-commit write set attributed BY TREE, and bd-rsjvf shrinks to at most 3 of 5 nodes (PlumBeacon)
+
+bd-rsjvf proposed extending bd-42gtq's written-block map to the csum, extent and root trees, and
+carried its own warning to measure before assuming a win. Measured, and the warning was right.
+
+**Instrument.** `dump-tree` cannot recover this: the newest on-disk generation does not correspond to
+one commit's write set (an image at superblock generation 20 showed a single FS_TREE node at 19 and
+none at 20). So the commit path now snapshots its own `nodes_written` around each tree's flush and
+emits `commit_write_set_by_tree` at debug. Eight fsyncs through a real FUSE mount, `RUST_LOG=
+ffs::btrfs::writeback=debug`:
+
+| commit | fs | csum | extent | root | total |
+|---|---|---|---|---|---|
+| first, empty map | **92** | 1 | 1 | 1 | 95 |
+| steady state (x8) | **2** | 1 | 1 | 1 | **5** |
+| one create commit | 0 | 1 | 1 | 1 | 3 |
+
+**bd-42gtq is confirmed end to end, per tree**: the FS_TREE goes 92 -> 2 from the second commit on,
+and 2 is exactly the COW path of a depth-2 tree. The first commit still writing everything is the
+predicted and correct behaviour — the map is empty because the tree was rebuilt from items at mount.
+
+**bd-rsjvf is now bounded, and the bound is small.** The csum, extent and root trees are ONE node each
+on this image, so the ceiling is 3 of 5 nodes — and none of the three is actually clean on this
+workload:
+
+* **csum** — the workload rewrites the same 4 KiB with different content each iteration, so the
+  `EXTENT_CSUM` item changes every commit. Genuinely dirty.
+* **extent** — bd-fv9tc/bd-k74ef make every commit insert `METADATA_ITEM`s describing the blocks that
+  commit allocates, and bd-4cxkd recomputes block-group accounting from it. Dirty by construction.
+* **root** — its `ROOT_ITEM`s are patched whenever any other tree moves, which is every commit here.
+
+So the map would skip nothing on this row. **bd-rsjvf is REJECTED for the fsync workload**, not
+because the mechanism is wrong but because there is nothing for it to skip.
+
+⚠️ **The scaling caveat is the part worth keeping.** These three trees are single-block ONLY because
+the fixture is a 256 MB image. On a filesystem large enough for them to be multi-node, writing all of
+each per commit is the same whole-tree defect bd-42gtq just fixed for the FS_TREE, and it will scale
+the same way. The measurement above cannot see that, because at this size there is nothing to see.
+
+**Retry predicate.** Re-open bd-rsjvf only on a filesystem where `btrfs inspect-internal dump-tree -t 3`
+(csum) or `-t 2` (extent) shows more than one node. Until then it is a lever with a ceiling of three
+single-block writes, two of which are provably dirty.

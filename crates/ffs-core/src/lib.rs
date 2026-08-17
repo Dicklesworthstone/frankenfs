@@ -29478,6 +29478,15 @@ impl OpenFs {
         });
 
         flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        // bd-rsjvf: attribute the per-commit write set BY TREE. Without this the
+        // only available number is the total, and `btrfs inspect-internal
+        // dump-tree` cannot recover the split (the newest on-disk generation does
+        // not correspond to one commit's write set). Deciding whether to extend
+        // the bd-42gtq written-block map to the other trees needs this number, and
+        // implementing that lever blind risks a change to a transid-critical path
+        // that saves nothing.
+        let fs_nodes_written = nodes_written;
+        let mut csum_nodes_written = 0_usize;
 
         // bd-42gtq: record what is on disk for this tree now — blocks written by
         // this transaction at `new_gen`, plus the reused ones at the generation
@@ -29581,6 +29590,7 @@ impl OpenFs {
                 alloc.sectorsize,
                 csum_allocated_addrs,
             );
+            let csum_nodes_before = nodes_written;
             let mut csum_executor = WritebackExecutor::new(csum_dag).without_crash_tracking();
             let csum_flush_result = csum_executor.execute(|block, level| {
                 let serialized = csum_disk_ctx.serialize_node(&alloc.csum_tree, block, level)?;
@@ -29595,6 +29605,7 @@ impl OpenFs {
                 Ok(())
             });
             csum_flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            csum_nodes_written = nodes_written.saturating_sub(csum_nodes_before);
 
             // Create (or update) the CSUM_TREE ROOT_ITEM in root_tree pointing
             // at the just-written csum tree. A fresh image has no csum tree, so
@@ -29997,6 +30008,7 @@ impl OpenFs {
         );
 
         // Write extent_tree nodes
+        let extent_nodes_before = nodes_written;
         let mut extent_executor = WritebackExecutor::new(extent_dag).without_crash_tracking();
         let extent_flush_result = extent_executor.execute(|block, level| {
             let serialized =
@@ -30012,6 +30024,7 @@ impl OpenFs {
             Ok(())
         });
         extent_flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let extent_nodes_written = nodes_written.saturating_sub(extent_nodes_before);
 
         // Update ROOT_ITEM for EXTENT_TREE in root_tree.
         //
@@ -30092,6 +30105,7 @@ impl OpenFs {
         // Write root_tree nodes — same logical→physical translation as
         // above, so that the next mount's resolver finds them via the
         // chunk tree.
+        let root_nodes_before = nodes_written;
         let mut root_executor = WritebackExecutor::new(root_dag).without_crash_tracking();
         let root_flush_result = root_executor.execute(|block, level| {
             let serialized = root_disk_ctx.serialize_node(&alloc.root_tree, block, level)?;
@@ -30106,6 +30120,16 @@ impl OpenFs {
             Ok(())
         });
         root_flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let root_nodes_written = nodes_written.saturating_sub(root_nodes_before);
+        debug!(
+            target: "ffs::btrfs::writeback",
+            fs_nodes_written,
+            csum_nodes_written,
+            extent_nodes_written,
+            root_nodes_written,
+            total_nodes_written = nodes_written,
+            "commit_write_set_by_tree"
+        );
 
         // Issue fsync barrier before superblock write
         root_executor.fsync_barrier();
