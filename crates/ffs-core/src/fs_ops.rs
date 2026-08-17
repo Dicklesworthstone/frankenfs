@@ -179,7 +179,9 @@ impl OpenFs {
                     // the layer that still has the bytes.
                     BtrfsParsedNode::Internal { .. } => self
                         .btrfs_tree_block_generation(cx, ptr.blockptr)
-                        .map(|actual| (actual != ptr.generation).then_some((ptr.generation, actual)))
+                        .map(|actual| {
+                            (actual != ptr.generation).then_some((ptr.generation, actual))
+                        })
                         .unwrap_or(None),
                 };
                 if let Some((wanted, actual)) = generation {
