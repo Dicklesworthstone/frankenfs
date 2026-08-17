@@ -553,6 +553,44 @@ def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
     }
 
 
+def fsck_or_die(image: Path, fstype: str) -> str:
+    """Refuse the run if the FUSE arm left the image inconsistent.
+
+    THIS EXISTS BECAUSE ITS ABSENCE COST A REAL REGRESSION. bd-42gtq made the
+    btrfs commit reuse unchanged tree blocks, and every commit opens by purging
+    the FS tree's extent items — so a reused block's backref stayed purged and
+    `btrfs check` reported "tree extent[...] root 5 has no backref item" for every
+    reused node. It appeared only from the SECOND commit onward, so the
+    single-commit fixture the lever was verified against could not see it, while
+    THIS script — which drives N commits through a real mount — reproduced it
+    immediately and said nothing, because it only counted.
+
+    A measurement tool that drives the write path and does not check what it left
+    behind is one line short of being a correctness gate. `btrfs check` and
+    `e2fsck -fn` are read-only and take seconds.
+    """
+    if fstype == "btrfs":
+        proc = run(["btrfs", "check", "--readonly", str(image)])
+        dirty = proc.returncode != 0
+    else:
+        proc = run(["e2fsck", "-fn", str(image)])
+        # e2fsck: 0 clean, 4 uncorrected errors; 1/2 mean it would have fixed it.
+        dirty = proc.returncode not in (0,)
+    tail = (proc.stdout + proc.stderr).strip().splitlines()
+    summary = tail[-1] if tail else "(no output)"
+    if dirty:
+        interesting = [
+            line for line in tail
+            if any(k in line.lower() for k in ("error", "backref", "not found", "mismatch"))
+        ]
+        sys.exit(
+            "FATAL: the FUSE arm left the image INCONSISTENT — refusing to report a "
+            f"count for a write path that corrupts.\n  fsck rc={proc.returncode}\n  "
+            + "\n  ".join(interesting[:8] or [summary])
+        )
+    return summary
+
+
 def report(rows: list[dict]) -> None:
     print()
     print("bd-7nr8p / bd-2w2me — barriers and bytes per client fsync, to the BACKING FILE")
@@ -697,7 +735,11 @@ def main() -> int:
         except subprocess.TimeoutExpired:  # pragma: no cover
             daemon.kill()
 
+    # The image the FUSE arm just wrote, checked before any number is reported.
+    fsck_summary = fsck_or_die(fimage, args.fstype)
+
     report(rows)
+    print(f"  fsck after the FUSE arm ({args.fstype}): {fsck_summary}")
     return 0
 
 
