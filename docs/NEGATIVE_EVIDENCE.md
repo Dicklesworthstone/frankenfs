@@ -8010,3 +8010,50 @@ not move at all. Bytes are a mechanism, not a prediction.
 **Why this was cheap.** The row is 13 days old and the count took one command in a loud window
 (loadavg 19-25, cross-core clock spread 2.8-2.9x, arms' mean clocks differing by up to 32% in a
 sibling run) and returned the same exact integers every time.
+
+## CORRECTION — 2026-08-17 — I refuted my own bd-42gtq fix direction 40 minutes after filing it, and the replacement is simpler (PlumBeacon)
+
+bd-42gtq said: the writeback DAG has no dirty filter, so filter `collect_nodes` on the generation it
+already stamps. **That fix is not implementable, and the reason matters more than the fix.**
+
+**Why it cannot work.** Two facts about the data model, both read from the code rather than inferred:
+
+1. `BtrfsCowNode` is `Leaf { items }` or `Internal { keys, children }` — **no generation field and no
+   on-disk bytenr**. The `generation` in `DagNode` is a parameter passed into `collect_nodes` and
+   stamped uniformly onto every node; there is nothing per-node to compare it against. So there is
+   nothing to filter ON.
+2. The in-memory tree is **rebuilt from scratch at mount**: `walk_btrfs_fs_tree` returns ITEMS, and
+   `enable_writes` inserts every one of them into a fresh `InMemoryCowBtrfsTree`. Block ids come from
+   `InMemoryBtrfsAllocator::with_start(2)`, a counter unrelated to disk addresses. So even given a
+   filter, an untouched node has no on-disk address for its COWed parent to point at — and
+   `block_to_bytenr` would fall back to `block * nodesize`, which is not where anything lives.
+
+So the 21.389x write amplification is not a missing `if`. It is a consequence of holding the tree as
+a rebuilt in-memory structure with no disk identity.
+
+**THE CORRECTED LEVER, and it is both simpler and provably sound.** Do not filter on generation —
+filter on *having already been written*:
+
+> **Write block B iff B is not in the previous commit's `block -> bytenr` map.**
+
+Three properties make that correct, and all three are checked:
+
+* **COW propagates to the root.** Modifying a leaf COWs the leaf and every ancestor, so a node
+  retains its block id only if it AND its whole subtree are unchanged — which means the bytes written
+  for it last commit, child pointers included, are still exactly right.
+* **In-memory block ids are never reused.** `InMemoryBtrfsAllocator::alloc_block` is a monotonic
+  `next_block += 1`, and `defer_free` only pushes onto a `deferred` vec that is never popped. So a
+  retained `block -> bytenr` map can never go stale by id recycling — the hazard that would otherwise
+  sink this whole approach.
+* **A COWed parent's pointers resolve through the retained map**, so unchanged children keep their
+  existing addresses and need no write.
+
+**Expected shape of the win, stated before measuring so it can be wrong:** the FIRST commit after a
+mount must still write everything (fresh tree, empty map), and commits 2..N drop from 96 nodes to the
+COW path — ~2 at this tree's depth 2, plus whatever the extent/root/csum trees actually touched. The
+fsync workload is 64 commits, so 63 of them should collapse.
+
+**Lesson.** I filed bd-42gtq from reading `collect_nodes` alone and had the mechanism right (the DAG
+is the whole tree) while the fix was wrong. Reading the walk without reading the DATA MODEL it walks
+is how a plausible one-line fix gets specified for a structural problem. The count that started this
+(96 nodes per 4 KiB fsync) is unaffected and still stands.
