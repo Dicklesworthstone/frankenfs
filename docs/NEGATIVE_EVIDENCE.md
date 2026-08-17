@@ -7852,3 +7852,51 @@ offered. What is claimed is exactly what was measured: write amplification at pa
 **Still open from the same count:** `ext4_sync_superblock_free_totals` writes block 0 on every
 durability boundary including a pure overwrite, which dirties no free count. That is a separate
 write and a separate lever, unaddressed here.
+
+## WIN — 2026-08-17 — bd-fv9tc second half: the superblock is no longer written on a boundary that changed no free count — 3 blocks/fsync vs kernel ext4's 4 (PlumBeacon)
+
+**Lever.** `ext4_sync_superblock_free_totals_to` folded the group free totals, patched the
+superblock, restamped its checksum and wrote block 0 — **unconditionally, at every durability
+boundary**. The `fsync-journal-commit` workload is entirely boundaries that change nothing: it
+overwrites an existing 4 KiB at offset 0 and allocates nothing. The write is now skipped when the
+fully patched block is byte-identical to the block as read.
+
+**Counted (`scripts/fsync_flush_count.py`, N=64, idle controls 0). NOT a certification — no timed
+A/B was run, and none is claimed.**
+
+| | blocks/fsync | bytes/fsync | vs kernel ext4 |
+|---|---|---|---|
+| kernel ext4 | 4.00 | 16384 | — |
+| FrankenFS, session start | 5.00 | 20480 | 1.250x |
+| after the GDT coalescing | 4.00 | 16384 | 1.000x |
+| after this lever | **3.00** | **12288** | **0.750x** |
+
+Per-fsync write set went `{0, 4096, 667648, 18210816}` -> `{4096, 667648, 18210816}`. Block 0 is
+gone; what remains is the GDT block, the inode-table block (mtime) and the data block.
+
+**Why the comparison is over the WHOLE block and not the three patched fields.** A field-wise guard
+is *almost* right and wrong in one case that matters: if the on-disk checksum is stale because some
+other path patched a superblock field without restamping it, the free counts can already match while
+the block still needs rewriting — and a field-wise guard would skip the repair. Comparing the fully
+patched buffer against the bytes as read preserves that repair, because a stale checksum makes the
+buffers differ. Skipping a write of bytes already on disk is a no-op by construction, and
+`block_dev` here is the DIRECT adapter, so there is no MVCC staging side effect to preserve.
+
+**Correctness.** `e2fsck -fn` exit 0 on the overwrite-only image AND on the allocate+free negative
+case (600 files of 8 KiB created past EOF, 200 removed) — the case that actually moves free counts,
+where an over-eager skip would leave `s_free_blocks_count` stale and e2fsck would report a wrong
+free count. ffs-core 1224 passed, ffs-alloc 219 passed, 0 failed; fmt clean.
+
+**The test was proven able to fail, both ways**, because a guard test that cannot fail is worthless:
+inverting its expectation made it fail with `left: 0` (so it really runs — the mkfs-dependent helper
+did not silently skip), and disabling the guard made it fail with `left: 1` (so it really pins the
+fix). It also asserts the third case explicitly: after mutating a group's `free_blocks`, the write
+must come back, and then quiesce again.
+
+⚠️ **Still not a claim about `1.976308x`.** Barriers 1.000x, bytes now 0.750x, and the wall-clock row
+is untouched and unmeasured this turn by instruction. We now write fewer bytes than kernel ext4 and
+are still slower; that gap is neither barriers nor bytes and remains open.
+
+**Next, to reach the 2-block floor (bd-ygznx):** the GDT block is still written on a pure overwrite
+even though a boundary that allocates nothing leaves its descriptor content unchanged. The same
+byte-identity argument applies inside the batched persist.
