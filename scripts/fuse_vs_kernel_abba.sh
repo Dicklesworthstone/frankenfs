@@ -249,9 +249,40 @@ v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE for the daemon
   # Fail closed if the knob did not take: an arm that silently ran the control is
   # the all-arms-identical trap that voided a four-arm run of mine once, and only
   # a counter caught it that time.
+  #
+  # This block used to end in `|| true`, so it could not fail -- it looked like a
+  # guard and was a no-op. On 2026-08-17 that cost a full btrfs certification:
+  # `mount_managed` never resolved FFS_FUSE_XATTR_NO_SUPPORT, the `ffs_on` arm ran
+  # the control, and the report said `0.976915x, inside the null`. Two identical
+  # arms produce exactly that, which is why an inert arm is the most expensive
+  # bug here -- it does not look like a bug, it looks like a result.
+  #
+  # It checks the daemon's own RESOLVED self-report, not the environment it was
+  # handed: `xattr_suppression=` is printed by the daemon after it decides, so a
+  # knob that was accepted and then refused (auto on an image with an xattr) is
+  # caught too. Any other knob falls back to the name appearing in the log.
   if [ -n "${3:-}" ]; then
     local kname=${3%%=*}
-    grep -q "$kname" "$log" || true
+    case "$kname" in
+      FFS_FUSE_XATTR_NO_SUPPORT)
+        if ! grep -q "xattr_suppression=active" "$log"; then
+          echo "FATAL: arm '$2' was given $3 but the daemon did not report"
+          echo "       xattr_suppression=active. It ran the CONTROL, so the lever"
+          echo "       A/B would compare two identical arms and report a null."
+          sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -o "xattr_suppression=[a-z]*" | head -1
+          kill -INT $mp 2>/dev/null; wait $mp 2>/dev/null
+          exit 8
+        fi
+        ;;
+      *)
+        if ! grep -q "$kname" "$log"; then
+          echo "FATAL: arm '$2' was given $3 but '$kname' never appears in $log;"
+          echo "       treat this arm as the control, not as the lever."
+          kill -INT $mp 2>/dev/null; wait $mp 2>/dev/null
+          exit 8
+        fi
+        ;;
+    esac
   fi
   sweep "$FMNT" "$2" "$1" "${4:-$CLIENT_CPU}"
   kill -INT $mp 2>/dev/null; wait $mp 2>/dev/null; sleep 2

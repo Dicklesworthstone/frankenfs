@@ -5755,6 +5755,12 @@ pub fn mount_managed(
 
     let fuse_opts = build_mount_options(&config.options);
     let fs = FrankenFuse::with_mount_config(ops, Some(mountpoint), config);
+    // The managed runtime is a THIRD entry point and it was missing this, so
+    // `FFS_FUSE_XATTR_NO_SUPPORT` was silently ignored on every managed mount
+    // from the moment `auto` introduced a resolution step. That is the mode
+    // `scripts/fuse_vs_kernel_abba.sh` uses, so the lever arm of a certification
+    // run was the control arm wearing its name.
+    resolve_xattr_suppression(&fs);
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
 
@@ -7052,6 +7058,42 @@ mod tests {
     /// A type-level check cannot catch it: naming the method resolves to the
     /// trait DEFAULT and compiles either way. So this reads the source and pins
     /// the span, which is the cheapest thing that actually fails.
+    /// bd-ha71t regression pin: EVERY public mount entry point must resolve the
+    /// xattr switch before it serves a request.
+    ///
+    /// `mount_managed` did not, so `FFS_FUSE_XATTR_NO_SUPPORT` was silently
+    /// ignored on the managed runtime -- which is the mode the ABBA comparator
+    /// uses. A certification run therefore measured its lever arm against an
+    /// identical control and reported `0.976915x`, "inside the null". A null is
+    /// exactly what two identical arms produce, which is why an inert arm is the
+    /// most expensive kind of bug here: it does not look like a bug, it looks
+    /// like a result.
+    ///
+    /// Source-level because the resolution happens at mount and no test in this
+    /// crate can mount.
+    #[test]
+    fn every_mount_entry_point_resolves_the_xattr_switch_bd_ha71t() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let mut checked = 0;
+        for entry in ["pub fn mount(", "pub fn mount_background(", "pub fn mount_managed("] {
+            let start = SOURCE.find(entry).unwrap_or_else(|| panic!("{entry} must exist"));
+            // The call must appear before the entry point's body ends. Bounding
+            // by the next `\npub fn ` keeps this from being satisfied by a call
+            // in some later function.
+            let end = SOURCE[start + entry.len()..]
+                .find("\npub fn ")
+                .map_or(SOURCE.len(), |offset| start + entry.len() + offset);
+            assert!(
+                SOURCE[start..end].contains("resolve_xattr_suppression(&fs)"),
+                "{entry} does not resolve the xattr switch. Every entry point must, \
+                 or the knob is silently ignored on that path and a lever arm \
+                 measures the control"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "all three entry points must be checked");
+    }
+
     #[test]
     fn every_fuse_handler_lives_inside_the_filesystem_trait_impl_bd_ha71t() {
         const SOURCE: &str = include_str!("lib.rs");
