@@ -19238,8 +19238,12 @@ impl OpenFs {
         // to ceil(G/64) blocks — measured as exactly 2 writes of block 1 per
         // client fsync on a 2-group image, and 64x on any realistic one. The
         // bytes written are identical: each descriptor patches only its own slot.
-        let mut entries: Vec<(GroupNumber, ffs_alloc::GroupStats, Option<Vec<u8>>, Option<Vec<u8>>)> =
-            Vec::with_capacity(alloc.groups.len());
+        let mut entries: Vec<(
+            GroupNumber,
+            ffs_alloc::GroupStats,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        )> = Vec::with_capacity(alloc.groups.len());
         for gidx in 0..alloc.groups.len() {
             let group = GroupNumber(
                 u32::try_from(gidx)

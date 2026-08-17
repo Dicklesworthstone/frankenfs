@@ -2339,8 +2339,11 @@ fn apply_group_desc_into(
 }
 
 /// The GDT block a group's descriptor lives in, and its offset within it.
-fn group_desc_location(pctx: &PersistCtx, block_size: usize, group: GroupNumber)
--> Result<(BlockNumber, usize, usize)> {
+fn group_desc_location(
+    pctx: &PersistCtx,
+    block_size: usize,
+    group: GroupNumber,
+) -> Result<(BlockNumber, usize, usize)> {
     let ds = usize::from(pctx.desc_size);
     if ds == 0 {
         return Err(FfsError::InvalidGeometry("desc_size is zero".into()));
@@ -5127,6 +5130,130 @@ mod tests {
             blocks_per_group: 32768,
             inodes_per_group: 2048,
         }
+    }
+
+    /// A `MemBlockDevice` that counts `write_block` calls, so a test can assert
+    /// how many device writes a flush issued and not merely what it left behind.
+    struct CountingBlockDevice {
+        inner: MemBlockDevice,
+        writes: AtomicUsize,
+    }
+
+    impl CountingBlockDevice {
+        fn new(block_size: u32) -> Self {
+            Self {
+                inner: MemBlockDevice::new(block_size),
+                writes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlockDevice for CountingBlockDevice {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_block(cx, block, data)
+        }
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+    }
+
+    /// bd-fv9tc. `persist_group_descs_batched` replaces a per-GROUP loop of
+    /// `persist_group_desc_force`, and 64 descriptors share a 4096-byte block, so
+    /// a durability-boundary flush was issuing one device write per group to
+    /// `ceil(G/64)` blocks.
+    ///
+    /// TWO ASSERTIONS, and the first is the one that matters: the batched form
+    /// must leave BYTE-IDENTICAL bytes. A batch that merely wrote fewer times but
+    /// dropped or reordered a descriptor would still "pass" a write count, and on
+    /// a real image that is a silently wrong free count — e2fsck-dirty, which is
+    /// the failure mode this path has regressed into before. 130 groups is chosen
+    /// to span three descriptor blocks with a partial last one, so a batch that
+    /// mishandled the block boundary shows up here.
+    #[test]
+    fn persist_group_descs_batched_matches_sequential_bd_fv9tc() {
+        const GROUPS: usize = 130;
+        let cx = test_cx();
+        let pctx = PersistCtx {
+            gdt_block: BlockNumber(50),
+            desc_size: 64,
+            has_metadata_csum: true,
+            csum_seed: 0x1357_2468,
+            uuid: [0x5A; 16],
+            group_desc_checksum_kind: ffs_ondisk::ext4::Ext4GroupDescChecksumKind::MetadataCsum,
+            blocks_per_group: 8192,
+            inodes_per_group: 2048,
+        };
+
+        // Distinct counters per group, so a descriptor written into the wrong
+        // slot cannot coincidentally match.
+        let groups: Vec<GroupStats> = (0..u32::try_from(GROUPS).expect("fits u32"))
+            .map(|g| {
+                let start = u64::from(g) * 8192;
+                GroupStats {
+                    group: GroupNumber(g),
+                    free_blocks: 8192 - g,
+                    block_largest_free_run: None,
+                    free_inodes: 2048 - g,
+                    inode_search_start: 0,
+                    used_dirs: g,
+                    block_bitmap_block: BlockNumber(start + 1),
+                    inode_bitmap_block: BlockNumber(start + 2),
+                    inode_table_block: BlockNumber(start + 3),
+                    flags: 0,
+                    block_bitmap_csum: 0,
+                    inode_bitmap_csum: 0,
+                    reserved_cache: OnceLock::new(),
+                    reserved_confirmed: OnceLock::new(),
+                }
+            })
+            .collect();
+
+        let sequential = CountingBlockDevice::new(4096);
+        for gs in &groups {
+            persist_group_desc_force(&cx, &sequential, &pctx, gs.group, gs, None, None)
+                .expect("sequential persist");
+        }
+
+        let batched = CountingBlockDevice::new(4096);
+        let entries: Vec<(GroupNumber, GroupStats, Option<Vec<u8>>, Option<Vec<u8>>)> = groups
+            .iter()
+            .map(|gs| (gs.group, gs.clone(), None, None))
+            .collect();
+        persist_group_descs_batched(&cx, &batched, &pctx, &entries).expect("batched persist");
+
+        // 130 descriptors at 64 bytes in a 4096-byte block => blocks 50, 51, 52.
+        for block in 50..=52_u64 {
+            let want = sequential.read_block(&cx, BlockNumber(block)).unwrap();
+            let got = batched.read_block(&cx, BlockNumber(block)).unwrap();
+            assert_eq!(
+                want.into_inner(),
+                got.into_inner(),
+                "batched GDT block {block} diverged from the per-group sequence it replaces"
+            );
+        }
+
+        let sequential_writes = sequential.writes.load(Ordering::Relaxed);
+        let batched_writes = batched.writes.load(Ordering::Relaxed);
+        assert_eq!(
+            sequential_writes, GROUPS,
+            "the old path is one device write per GROUP — if this changes, the \
+             premise of the fix changed"
+        );
+        assert_eq!(
+            batched_writes, 3,
+            "the batched path must be one device write per BLOCK (130 descriptors \
+             at 64 bytes span three 4096-byte blocks)"
+        );
     }
 
     fn seed_gdt_block(dev: &MemBlockDevice, pctx: &PersistCtx, groups: &[GroupStats]) {

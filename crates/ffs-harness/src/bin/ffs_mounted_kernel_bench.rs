@@ -32,6 +32,32 @@ const GUARD_RESAMPLE_ATTEMPTS: usize = 5;
 /// have DIFFERENT ceilings (0.20 and 0.35), and applying one arm's limit to the
 /// other would either refuse runs that should proceed or admit a busy driver
 /// core, which is the arm the timing is most sensitive to.
+/// Sort key for placement candidates: eligible first, then FASTEST, then index.
+///
+/// Returns `(ineligible, -mhz, cpu)`, so a plain ascending sort puts the eligible
+/// cores first and, among them, the fastest first.
+///
+/// The busy limit keeps its meaning exactly: a core above it sorts after every
+/// eligible core and is never chosen while any eligible core exists. What changes
+/// is the order WITHIN the eligible set. Sorting those by ascending busy picks
+/// the argmin, and on a `powersave` host the least-busy core is the one parked at
+/// minimum frequency -- so the old key volunteered for the slowest core available
+/// and the busy-based guard could not object, a parked core being maximally
+/// quiet.
+///
+/// A CPU with no clock reading sorts as if parked rather than as if fast: an
+/// unknown clock must not win a tie-break it might not deserve.
+fn rank_placement_candidate(
+    cpu: usize,
+    busy: f64,
+    clock: &BTreeMap<usize, f64>,
+    busy_limit: f64,
+) -> (bool, f64, usize) {
+    let ineligible = busy > busy_limit;
+    let mhz = clock.get(&cpu).copied().unwrap_or(0.0);
+    (ineligible, -mhz, cpu)
+}
+
 fn guard_offender(
     contention: &BTreeMap<usize, f64>,
     driver_guard_cpus: &BTreeSet<usize>,
@@ -5160,10 +5186,33 @@ fn select_cpu_placement(
                 "host-wide quiet-window helper returned a busy final sample"
             );
         }
+        // bd-parked-core: among cores that are QUIET ENOUGH, prefer the one
+        // running FASTEST.
+        //
+        // Sorting purely by busy fraction takes the argmin -- the least busy core
+        // -- and on this host's `powersave` governor the least busy core is the
+        // one parked at the 1429 MHz minimum. Measured: a run that placed the
+        // btrfs FUSE arm on a 1429.0 MHz core reported
+        // fuse_over_kernel_median=1.181157 against 1.095278-1.106491 in three
+        // runs whose arms were clocked normally -- 7.8% of pure frequency error,
+        // on a 2.40x clock ratio. The guard could not catch it because the guard
+        // checks BUSY, and a parked core is maximally quiet.
+        //
+        // So eligibility still comes first and is UNCHANGED: a core over
+        // MAX_DRIVER_PREFLIGHT_BUSY can never be chosen, whatever its clock. Only
+        // the order WITHIN the eligible set changes, from "least busy" to
+        // "fastest". That cannot admit a busy core; it can only stop us
+        // volunteering for the slowest one available.
+        let clock = cpu_mhz();
         ranked.sort_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| left.0.cmp(&right.0))
+            rank_placement_candidate(left.0, left.1, &clock, MAX_DRIVER_PREFLIGHT_BUSY)
+                .partial_cmp(&rank_placement_candidate(
+                    right.0,
+                    right.1,
+                    &clock,
+                    MAX_DRIVER_PREFLIGHT_BUSY,
+                ))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         let mut driver = None;
         // bd-placement-argmin: PREFER THE INCUMBENT while it still qualifies.
@@ -10153,6 +10202,59 @@ mod tests {
     /// failure: one direction refuses runs that should proceed, the other admits a
     /// busy DRIVER core, which is the arm the timing is most sensitive to because
     /// the timed region includes its directory fsyncs.
+
+    /// bd-parked-core: eligibility still wins, and among eligible cores the
+    /// FASTEST is preferred rather than the least busy.
+    ///
+    /// The fixture is the situation actually measured: a core parked at the
+    /// 1429 MHz floor is perfectly idle, and the old key -- ascending busy --
+    /// ranked it FIRST. A run that placed the btrfs FUSE arm there reported
+    /// fuse_over_kernel_median=1.181157 against 1.095278-1.106491 on normally
+    /// clocked arms, 7.8% of pure frequency error.
+    #[test]
+    fn rank_placement_candidate_prefers_clocked_over_parked_bd_parked_core() {
+        let clock: BTreeMap<usize, f64> = [
+            (4, 1429.0),  // parked, perfectly idle
+            (8, 4290.0),  // boosted, slightly busier but still eligible
+            (12, 4295.0), // boosted and busy: OVER the limit
+        ]
+        .into_iter()
+        .collect();
+        let limit = 0.20;
+
+        let parked = rank_placement_candidate(4, 0.00, &clock, limit);
+        let clocked = rank_placement_candidate(8, 0.10, &clock, limit);
+        let busy = rank_placement_candidate(12, 0.90, &clock, limit);
+
+        assert!(
+            clocked < parked,
+            "a 4290 MHz core at 10% busy must outrank a 1429 MHz core at 0% busy: \
+             {clocked:?} vs {parked:?}"
+        );
+
+        // ELIGIBILITY IS UNCHANGED AND STILL DOMINATES. The fastest core in the
+        // set is also the busiest, and it must still lose to both eligible ones —
+        // otherwise this change would have traded a slow arm for a contended one.
+        assert!(
+            parked < busy,
+            "an over-limit core loses to every eligible core"
+        );
+        assert!(clocked < busy);
+
+        // A missing clock reading sorts as if parked, never as if fast: an
+        // unknown must not win a tie-break it might not deserve.
+        let unknown = rank_placement_candidate(99, 0.00, &clock, limit);
+        assert!(
+            clocked < unknown,
+            "unknown clock must not outrank a known-fast core"
+        );
+
+        // Ties in clock fall back to CPU index, so the choice stays deterministic
+        // run to run — the property the incumbent-preference fix depends on.
+        let same_a = rank_placement_candidate(8, 0.05, &clock, limit);
+        let same_b = rank_placement_candidate(8, 0.05, &clock, limit);
+        assert_eq!(same_a, same_b);
+    }
     #[test]
     fn guard_offender_applies_each_arms_own_limit_bd_guard_resample() {
         let driver_guard: BTreeSet<usize> = [4, 36].into_iter().collect();
