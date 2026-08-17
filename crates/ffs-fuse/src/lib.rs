@@ -7,6 +7,7 @@
 //!
 //! See [`per_core::PerCoreDispatcher`] for thread-per-core dispatch routing.
 
+pub mod crossings;
 pub mod per_core;
 
 use asupersync::Cx;
