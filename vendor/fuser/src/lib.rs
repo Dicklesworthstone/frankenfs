@@ -44,7 +44,7 @@ pub use reply::{
 };
 pub use request::Request;
 // bd-xfe7z: the crossing counters are recorded in `Request::dispatch`.
-pub use request::{CROSSING_SLOTS, crossing_counts};
+pub use request::{CROSSING_SLOTS, crossing_counts, crossing_nanos};
 pub use session::{BackgroundSession, Session, SessionACL, SessionUnmounter};
 #[cfg(feature = "abi-7-28")]
 use std::cmp::max;

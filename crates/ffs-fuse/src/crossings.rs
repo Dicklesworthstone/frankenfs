@@ -184,6 +184,38 @@ pub fn render_fuser_counts(counts: [u64; fuser::CROSSING_SLOTS]) -> String {
     out
 }
 
+/// Render per-opcode dispatch nanoseconds alongside the counts.
+///
+/// Emitted as totals rather than averages so a reader can divide by whatever
+/// denominator the workload actually had. An average computed here would bake in
+/// an assumption about the client, and the last two counts in this bead were
+/// wrong precisely because the client was not what the reader assumed.
+#[must_use]
+pub fn render_fuser_nanos(nanos: [u64; fuser::CROSSING_SLOTS]) -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = nanos[op.index()];
+        total += value;
+        out.push_str(&format!("dispatch_ns_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" dispatch_ns_total={total}"));
+    out
+}
+
+/// Live counts and dispatch times, rendered for the metrics line.
+#[must_use]
+pub fn render_live_timed() -> String {
+    format!(
+        "{} {}",
+        render_fuser_counts(fuser::crossing_counts()),
+        render_fuser_nanos(fuser::crossing_nanos())
+    )
+}
+
 /// Live counts from the daemon, rendered for the metrics line.
 #[must_use]
 pub fn render_live() -> String {
@@ -192,6 +224,24 @@ pub fn render_live() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Nanoseconds must render per opcode with the same labels and ordering as
+    /// the counts, so the two lines can be divided by each other without a
+    /// mapping step -- that mapping is exactly where a reader would go wrong.
+    #[test]
+    fn nanos_render_with_the_same_labels_as_counts_bd_xfe7z() {
+        let mut nanos = [0_u64; fuser::CROSSING_SLOTS];
+        nanos[CrossingOp::Readdirplus.index()] = 22_000;
+        nanos[CrossingOp::Getxattr.index()] = 3;
+        let line = super::render_fuser_nanos(nanos);
+        assert!(line.contains("dispatch_ns_readdirplus=22000"), "{line}");
+        assert!(line.contains("dispatch_ns_getxattr=3"), "{line}");
+        assert!(line.contains("dispatch_ns_lookup=0"), "{line}");
+        assert!(line.contains("dispatch_ns_total=22003"), "{line}");
+        for op in CrossingOp::ALL {
+            assert!(line.contains(&format!("dispatch_ns_{}=", op.label())), "{line}");
+        }
+    }
 
     /// The two index tables live in different crates -- `fuser::crossing_slot`
     /// assigns them, `CrossingOp::index` names them -- and a silent drift would

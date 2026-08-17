@@ -5543,7 +5543,7 @@ pub fn mount(
     // counts request scopes and missed 5979 of 6001 warm stats (bdd0fd1b);
     // crossings_total counts what reached `dispatch`. A future fast path that
     // answers before the scope opens will show up as the gap between them.
-    emit_crossing_evidence(crossings::render_live());
+    emit_crossing_evidence(crossings::render_live_timed());
     // bd-viil0: the session has run to completion, so these are the FINAL counters.
     // Returning them rather than `()` is what lets the STANDARD mount runtime report
     // real dispatch attribution instead of hand-constructed zeros — the managed

@@ -100,6 +100,70 @@ fn crossing_slot(op: &ll::Operation<'_>) -> usize {
     }
 }
 
+/// Nanoseconds spent in dispatch, per opcode (bd-xfe7z).
+///
+/// Timed at the SAME boundary the counts are taken at, so "crossings" and
+/// "nanoseconds" describe the same events and can be divided by each other
+/// without an alignment argument. It measures the whole of what the daemon does
+/// for a request -- handler, format layer, reply construction -- because that is
+/// what the residue is made of.
+///
+/// The existing `HandlerTimer` cannot answer this: it is attached to six
+/// handlers and `readdirplus` is not one of them, so on a readdir+stat pass it
+/// timed 43 invocations out of 260 crossings and missed the handler carrying the
+/// cost.
+pub static CROSSING_NANOS: [std::sync::atomic::AtomicU64; CROSSING_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; CROSSING_SLOTS];
+
+/// Whether to time dispatch at all.
+///
+/// Read once. `Instant::now()` twice per request is cheap but not free, and this
+/// sits on the path whose cost is under investigation -- an instrument that
+/// changes the thing it measures by more than it resolves is worse than no
+/// instrument. Gated on the same `FFS_MOUNT_BENCH_EVIDENCE` that decides whether
+/// the numbers are ever printed, so the default mount pays nothing.
+fn dispatch_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0")
+    })
+}
+
+/// Accumulates dispatch time on DROP, so no return path can skip it.
+///
+/// The first version of this timer added the elapsed time after the reply was
+/// sent, and `dispatch` has an early `Ok(None) => return` for handlers that
+/// answer through their reply object rather than returning a response --
+/// `readdirplus` among them. The result: `crossings_readdirplus=209` and
+/// `dispatch_ns_readdirplus=0`, a timer that missed exactly the handler it was
+/// built to measure.
+///
+/// That is the bdd0fd1b defect verbatim -- a counter inside a branch that can be
+/// skipped -- committed by me two hours after writing the comment warning
+/// against it. A guard cannot be forgotten on a path, which is why the
+/// `HandlerTimer` in ffs-fuse is also RAII.
+struct DispatchTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl Drop for DispatchTimer {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        CROSSING_NANOS[self.slot].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the per-opcode dispatch nanoseconds.
+#[must_use]
+pub fn crossing_nanos() -> [u64; CROSSING_SLOTS] {
+    let mut out = [0_u64; CROSSING_SLOTS];
+    for (slot, counter) in CROSSING_NANOS.iter().enumerate() {
+        out[slot] = counter.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 /// Read the counts. Returned by value so a caller cannot hold a reference into
 /// live counters while formatting them.
 #[must_use]
@@ -183,13 +247,18 @@ impl<'a> Request<'a> {
         // bd-xfe7z: count the crossing HERE -- before dispatch_req, before any
         // handler, memo, cache or early return. A request that reached this
         // line crossed the boundary regardless of how it is answered.
-        if let Ok(operation) = self.request.operation() {
-            CROSSING_COUNTS[crossing_slot(&operation)]
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            CROSSING_COUNTS[CROSSING_SLOTS - 1]
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        let slot = match self.request.operation() {
+            Ok(operation) => crossing_slot(&operation),
+            Err(_) => CROSSING_SLOTS - 1,
+        };
+        CROSSING_COUNTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Timed around the whole of dispatch, not just the handler: the residue
+        // being chased is everything the daemon does per entry, and a timer that
+        // stopped at the handler boundary would exclude reply construction.
+        let _timer = dispatch_timing_enabled().then(|| DispatchTimer {
+            slot,
+            started: std::time::Instant::now(),
+        });
         let unique = self.request.unique();
 
         let res = match self.dispatch_req(se) {
