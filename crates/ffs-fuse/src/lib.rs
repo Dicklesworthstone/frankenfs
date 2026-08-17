@@ -836,6 +836,23 @@ const READDIRPLUS_PREFETCH_COLD_BOUND: usize = 32;
 /// Returning a bound that is too SMALL is the safe direction: those entries are
 /// fetched inline exactly as they are today, so the lever degrades to current
 /// behaviour rather than to the rejected one.
+/// Consume one prefetched attribute slot, leaving `None` behind.
+///
+/// `take` rather than `clone` (bd-xfe7z). The readdirplus decomposition put
+/// `60.0%` of dispatch time in per-entry handler bookkeeping -- neither the ops
+/// calls (`33.1% + 2.8%`) nor reply construction (`4.1%`) -- and an `InodeAttr`
+/// clone per entry is the first named term in it. The emit loop visits each
+/// index exactly once, so nothing is lost by moving the value out.
+///
+/// A named function rather than an inline `.take()` because that exactly-once
+/// property is the whole safety argument and is invisible at the call site: a
+/// second read of the same slot would silently see `None` and fall through to
+/// an inline refetch, which looks like a cache miss rather than a bug. The test
+/// pins it.
+fn take_prefetched<T>(slots: &mut [Option<T>], index: usize) -> Option<T> {
+    slots.get_mut(index).and_then(Option::take)
+}
+
 fn readdirplus_prefetch_bound(observed_fill: usize, entries_len: usize) -> usize {
     let bound = if observed_fill == 0 {
         READDIRPLUS_PREFETCH_COLD_BOUND
@@ -4445,7 +4462,7 @@ impl Filesystem for FrankenFuse {
                 // default and the bounded form is itself UNMEASURED -- it must
                 // clear the same 40407-vs-104761 scope count before anyone
                 // enables it.
-                let prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> =
+                let mut prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> =
                     if readdirplus_inode_order_from_env() {
                         // bd-xfe7z: BOUNDED by what the previous reply actually
                         // emitted. This is the fix the rejection above called
@@ -4529,14 +4546,14 @@ impl Filesystem for FrankenFuse {
                     let name = OsStr::new(&owned_name);
 
                     // Get attributes for each entry
-                    let inode_attr = match prefetched.as_ref() {
+                    let inode_attr = match prefetched.as_mut() {
                         // A filled slot was prefetched in inode order. An empty
                         // one means either past the prefetch bound or a failed
                         // fetch, and both fall back to the inline path -- the
                         // only place that can tell them apart. Skipping the entry
                         // here instead would drop every entry beyond the bound
                         // from the directory listing.
-                        Some(slots) => match slots[index].clone() {
+                        Some(slots) => match take_prefetched(slots, index) {
                             Some(attr) => attr,
                             None => match self.with_request_scope(
                                 &cx,
@@ -7676,6 +7693,41 @@ mod tests {
     /// the reply filled and re-issued on the next call. The bound exists solely
     /// to make that impossible, so "never more than the batch" and "never more
     /// than the observed fill" are the two assertions that matter.
+
+    /// bd-xfe7z: a prefetched slot is consumed EXACTLY ONCE.
+    ///
+    /// This is the contract that lets the emit loop `take` instead of `clone`,
+    /// and the reason it is worth a test is that violating it is silent. A
+    /// second read of the same slot returns `None`, and the handler treats
+    /// `None` as "past the prefetch bound or a failed fetch" and quietly issues
+    /// an inline getattr. So a double-read would not corrupt the listing -- it
+    /// would just pay for the entry twice and look like a low prefetch hit rate,
+    /// which is exactly the kind of regression that hides inside a percentage.
+    #[test]
+    fn take_prefetched_consumes_a_slot_exactly_once_bd_xfe7z() {
+        let mut slots = vec![Some(10_u32), None, Some(30)];
+
+        assert_eq!(take_prefetched(&mut slots, 0), Some(10));
+        assert_eq!(
+            take_prefetched(&mut slots, 0),
+            None,
+            "a second read must not hand out the value again"
+        );
+        assert_eq!(slots[0], None, "the slot is left empty, not restored");
+
+        // An already-empty slot is the "past the bound" case and must read as
+        // None rather than panic -- the emit loop walks every index, including
+        // the ones the bound deliberately skipped.
+        assert_eq!(take_prefetched(&mut slots, 1), None);
+
+        // Untouched slots are unaffected by taking their neighbours.
+        assert_eq!(take_prefetched(&mut slots, 2), Some(30));
+
+        // Out of range is None, never a panic: `entries.len()` and the slot
+        // vector are built together, but the loop indexes from the entries side.
+        assert_eq!(take_prefetched(&mut slots, 99), None);
+        assert_eq!(take_prefetched::<u32>(&mut [], 0), None);
+    }
     #[test]
     fn readdirplus_prefetch_bound_never_exceeds_the_batch_bd_xfe7z() {
         // Observed fill larger than this batch: clamp to the batch.
