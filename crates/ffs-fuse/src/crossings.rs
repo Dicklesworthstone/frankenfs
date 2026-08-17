@@ -525,6 +525,66 @@ pub fn render_loop_nanos() -> String {
     out
 }
 
+/// Nanoseconds spent in the readdirplus PREFETCH PHASE, per opcode (bd-xfe7z).
+///
+/// The sixth term, and it brackets everything between receiving the entry list
+/// and starting the emit loop: building the `inos` vector, computing the
+/// inode fetch order (a SORT of ~190 entries per call), allocating and
+/// initialising the slot vector, and the attribute fetches themselves.
+///
+/// It exists because `43.9%` of readdirplus dispatch is still unattributed after
+/// five timers, and the two guesses I made about unattributed terms in this bead
+/// were both wrong -- "the format layer" (it was the handler) and "per-entry
+/// loop work" (the loop is `10.1%`). `phase_ns - scope_ns` isolates the SETUP:
+/// vectors and the sort, with the fetches subtracted out.
+///
+/// Per CALL, not per entry, which matters for what a lever against it would look
+/// like: at ~190 entries per readdirplus call, per-call work is amortised 190
+/// ways and per-entry work is not.
+static PHASE_NANOS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Accumulates prefetch-phase time on DROP.
+pub struct PhaseTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl PhaseTimer {
+    /// Start timing the prefetch phase, or `None` when evidence is off.
+    #[must_use]
+    pub fn start(op: CrossingOp) -> Option<Self> {
+        ops_timing_enabled().then(|| Self {
+            slot: op.index(),
+            started: std::time::Instant::now(),
+        })
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        PHASE_NANOS[self.slot].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Render prefetch-phase nanoseconds with the shared labels and ordering.
+#[must_use]
+pub fn render_phase_nanos() -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = PHASE_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
+        total += value;
+        out.push_str(&format!("phase_ns_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" phase_ns_total={total}"));
+    out
+}
+
 /// Whether the three timing families are internally consistent, per opcode.
 ///
 /// `ops_ns` and `reply_ns` both measure work that happens INSIDE a dispatch, so
@@ -587,6 +647,8 @@ pub fn render_live_timed() -> String {
         + &render_scope_nanos()
         + " "
         + &render_loop_nanos()
+        + " "
+        + &render_phase_nanos()
 }
 
 /// Live counts from the daemon, rendered for the metrics line.
@@ -597,6 +659,21 @@ pub fn render_live() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The prefetch phase CONTAINS the attribute-fetch scopes it performs, so
+    /// scope_ns <= phase_ns for the same opcode. Unlike the loop/scope pair --
+    /// where containment turned out to be configuration-dependent and the claim
+    /// had to be corrected by measurement -- this one holds by construction:
+    /// the scopes are opened inside the phase the timer brackets.
+    #[test]
+    fn the_prefetch_phase_contains_its_fetch_scopes_bd_xfe7z() {
+        assert!(super::decomposition_is_consistent(100, 90, 0));
+        assert!(
+            !super::decomposition_is_consistent(90, 100, 0),
+            "a fetch scope longer than the phase containing it means a timer is \
+             mis-slotted or outlived its phase"
+        );
+    }
 
     /// ⚠️ CORRECTED 2026-08-17, BY MEASUREMENT. This test previously claimed the
     /// loop body CONTAINS the scope wrapper, so `scope_ns + reply_ns <= loop_ns`
@@ -637,6 +714,7 @@ mod tests {
             "reply_ns_getattr=",
             "scope_ns_getattr=",
             "loop_ns_getattr=",
+            "phase_ns_getattr=",
         ] {
             assert!(
                 line.contains(family),

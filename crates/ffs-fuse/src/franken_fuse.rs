@@ -2897,7 +2897,8 @@ impl FrankenFuse {
     where
         F: FnOnce(&Cx, &mut RequestScope) -> ffs_error::Result<T>,
     {
-        let started = Instant::now();
+        // Only read the clock when something will read the counter (bd-xfe7z).
+        let started = crate::dispatch_timing_enabled().then(Instant::now);
         let result = match self.inner.ops.begin_request_scope(cx, op) {
             Ok(mut scope) => {
                 let op_result = f(cx, &mut scope);
@@ -2930,7 +2931,7 @@ impl FrankenFuse {
         };
         self.inner
             .metrics
-            .record_dispatch_duration(op, started.elapsed());
+            .record_dispatch_duration(op, started.map(|started| started.elapsed()));
         result
     }
 

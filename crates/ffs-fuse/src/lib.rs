@@ -869,6 +869,53 @@ fn take_prefetched<T>(slots: &mut [Option<T>], index: usize) -> Option<T> {
 ///
 /// Returns `None` when neither knob is set, which is the default and must stay
 /// byte-identical to the inline path.
+/// Whether `with_request_scope` times each dispatch.
+///
+/// TWO CLOCK READS PER REQUEST, PAID BY EVERY MOUNT (bd-xfe7z). `with_request_scope`
+/// called `Instant::now()` on entry and `elapsed()` on exit unconditionally, and
+/// the only consumer of the resulting `*_dispatch_nanos` counters is the
+/// `mount_dispatch_metrics` line -- which `ffs-cli` emits ONLY under
+/// `FFS_MOUNT_BENCH_EVIDENCE`. So a production mount paid for a measurement it
+/// never printed.
+///
+/// The size is not a guess: `clock_gettime` through the vDSO is tens of ns, twice
+/// per request, and the readdirplus workload opens ~1.01 request scopes per
+/// directory entry. The crossings timers were already gated exactly this way; the
+/// dispatch timer was simply never brought in line with them.
+///
+/// Read once into a `OnceLock`, so the hot path is an atomic load, and the
+/// comparator is unaffected because it sets the flag for every run.
+fn dispatch_timing_enabled() -> bool {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let on = std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0");
+        DISPATCH_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
+    });
+    DISPATCH_TIMING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolved once from the environment, then readable as a plain atomic.
+///
+/// An `AtomicBool` behind a `Once` rather than a `OnceLock<bool>` so that tests
+/// can turn dispatch timing ON without mutating process-global environment
+/// state, which races under the parallel test harness and is `unsafe` from
+/// edition 2024. Two existing tests drive real requests through
+/// `with_request_scope` and assert that per-opcode nanoseconds are recorded and
+/// NOT folded across opcodes; gating the clock would have made them fail, and
+/// the honest fix is to make the gate reachable from a test rather than to
+/// delete the assertions that caught it.
+static DISPATCH_TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Force dispatch timing on for a test.
+///
+/// Runs the environment initialisation first so a later `dispatch_timing_enabled`
+/// cannot overwrite the value this sets.
+#[cfg(test)]
+fn enable_dispatch_timing_for_test() {
+    let _ = dispatch_timing_enabled();
+    DISPATCH_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn readdirplus_prefetch_mode(inode_order: bool, batch_attrs: bool) -> Option<bool> {
     if inode_order {
         Some(true) // prefetch, sorted by inode
@@ -1941,8 +1988,18 @@ impl AtomicMetrics {
         Self::saturating_add(&self.handler_total_count.0, 1);
     }
 
-    fn record_dispatch_duration(&self, op: RequestOp, elapsed: Duration) {
-        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    /// Record one dispatch: always the COUNT, and the nanoseconds only when the
+    /// caller actually timed it (bd-xfe7z).
+    ///
+    /// `None` means dispatch timing is off, not that the dispatch took no time.
+    /// The count is kept unconditional deliberately: it costs one relaxed add,
+    /// every attribution this campaign has published rests on it (the readdirplus
+    /// split is anchored on 40407 getattr scopes), and a count that disappeared
+    /// with a flag would make the cheap measurements depend on the expensive one.
+    fn record_dispatch_duration(&self, op: RequestOp, elapsed: Option<Duration>) {
+        let nanos = elapsed.map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
         match op {
             RequestOp::Getattr => {
                 Self::saturating_add(&self.getattr_dispatch_count.0, 1);
@@ -4522,6 +4579,10 @@ impl Filesystem for FrankenFuse {
                 // default and the bounded form is itself UNMEASURED -- it must
                 // clear the same 40407-vs-104761 scope count before anyone
                 // enables it.
+                // bd-xfe7z: bracket the whole pre-loop phase -- inos vector,
+                // fetch-order sort, slot allocation and the fetches -- so
+                // phase_ns - scope_ns isolates the setup from the fetching.
+                let _phase_timer = crossings::PhaseTimer::start(crossings::CrossingOp::Readdirplus);
                 let mut prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> = if let Some(
                     sort_by_inode,
                 ) =
@@ -4606,6 +4667,13 @@ impl Filesystem for FrankenFuse {
                 } else {
                     None
                 };
+                // End the phase HERE, explicitly. `_phase_timer` is bound in the
+                // same block as the emit loop, so RAII alone would keep it alive
+                // across that loop and the "phase" would silently include it:
+                // the timer would measure phase+loop, and `phase_ns - scope_ns`
+                // would attribute loop work to setup. An underscore-prefixed
+                // binding still drops at end of SCOPE, not at end of intent.
+                drop(_phase_timer);
 
                 let mut emitted: usize = 0;
                 for (index, entry) in entries.iter().enumerate() {
@@ -7044,7 +7112,7 @@ mod tests {
         // because the guard's scope encloses the dispatch scope.
         {
             let _h = HandlerTimer::new(&metrics);
-            metrics.record_dispatch_duration(RequestOp::Getxattr, Duration::from_nanos(50));
+            metrics.record_dispatch_duration(RequestOp::Getxattr, Some(Duration::from_nanos(50)));
         }
         let s = metrics.snapshot();
         assert_eq!(s.handler_total_count, 1, "the handler was timed once");
@@ -7815,6 +7883,50 @@ mod tests {
     /// decoupling accidentally made the prefetch reachable by default, it would
     /// enable a lever whose unbounded form was measured at 2.59x MORE getattr
     /// scopes, on every mount, silently.
+
+    /// bd-xfe7z: an untimed dispatch still COUNTS.
+    ///
+    /// This is the whole contract of gating the dispatch clock. The
+    /// `*_dispatch_nanos` counters are read only by the `mount_dispatch_metrics`
+    /// line, which is emitted only under `FFS_MOUNT_BENCH_EVIDENCE`, so a
+    /// production mount was paying two `Instant::now()` calls per request for a
+    /// number nothing printed. The COUNTS are different: they cost one relaxed
+    /// add and every attribution in this campaign rests on them -- the
+    /// readdirplus split is anchored on 40407 getattr scopes -- so they must
+    /// survive the gate exactly.
+    ///
+    /// `None` must therefore leave the count incremented and the nanos alone,
+    /// and it must be distinguishable from a timed dispatch that really took
+    /// zero: the second half of this test pins that a subsequent timed call adds
+    /// its nanos on top of the untimed one's count.
+    #[test]
+    fn an_untimed_dispatch_still_counts_bd_xfe7z() {
+        let metrics = AtomicMetrics::new();
+
+        metrics.record_dispatch_duration(RequestOp::Getattr, None);
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.getattr_dispatch_count, 1,
+            "the count must not be gated"
+        );
+        assert_eq!(
+            snap.getattr_dispatch_nanos, 0,
+            "an untimed dispatch must contribute no time rather than a fabricated one"
+        );
+
+        metrics.record_dispatch_duration(RequestOp::Getattr, Some(Duration::from_nanos(500)));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.getattr_dispatch_count, 2, "both dispatches counted");
+        assert_eq!(
+            snap.getattr_dispatch_nanos, 500,
+            "only the timed one contributed nanoseconds"
+        );
+
+        // A different opcode is unaffected by either, so the gate cannot smear
+        // time across the split this campaign reads.
+        assert_eq!(snap.readdir_dispatch_count, 0);
+        assert_eq!(snap.readdir_dispatch_nanos, 0);
+    }
     #[test]
     fn readdirplus_prefetch_mode_is_off_unless_a_knob_asks_bd_xfe7z() {
         assert_eq!(
@@ -19713,6 +19825,9 @@ mod tests {
 
     #[test]
     fn request_scope_records_metadata_and_readdir_dispatch_timing() {
+        // Dispatch timing is gated off by default (bd-xfe7z); this test is
+        // about the timing, so ask for it explicitly.
+        enable_dispatch_timing_for_test();
         let events = Arc::new(Mutex::new(Vec::new()));
         let fs = HookFs::new(Arc::clone(&events), false, false);
         let fuse = FrankenFuse::new(Box::new(fs));
@@ -19753,6 +19868,9 @@ mod tests {
     /// attribute-fetch time (bd-zpc3q).
     #[test]
     fn lookup_dispatch_timing_is_not_folded_into_getattr() {
+        // Dispatch timing is gated off by default (bd-xfe7z); this test is
+        // about the timing, so ask for it explicitly.
+        enable_dispatch_timing_for_test();
         let events = Arc::new(Mutex::new(Vec::new()));
         let fs = HookFs::new(Arc::clone(&events), false, false);
         let fuse = FrankenFuse::new(Box::new(fs));
@@ -19999,7 +20117,7 @@ AllowOther"#;
         m.record_readdirplus_memo_remember();
         m.record_readdirplus_memo_hit();
         for op in RequestOp::ALL {
-            m.record_dispatch_duration(op, Duration::from_nanos(7));
+            m.record_dispatch_duration(op, Some(Duration::from_nanos(7)));
         }
 
         let dump = format!("{:?}", m.snapshot());
@@ -20033,7 +20151,7 @@ AllowOther"#;
         // new variant is a compile error instead.
         let ops = RequestOp::ALL;
         for op in ops {
-            m.record_dispatch_duration(op, Duration::from_nanos(1));
+            m.record_dispatch_duration(op, Some(Duration::from_nanos(1)));
         }
         let s = m.snapshot();
         let summed = s.getattr_dispatch_count
@@ -20061,7 +20179,7 @@ AllowOther"#;
             RequestOp::Statfs,
         ] {
             let solo = AtomicMetrics::default();
-            solo.record_dispatch_duration(op, Duration::from_nanos(1));
+            solo.record_dispatch_duration(op, Some(Duration::from_nanos(1)));
             let s = solo.snapshot();
             assert_eq!(
                 s.other_dispatch_count, 1,
