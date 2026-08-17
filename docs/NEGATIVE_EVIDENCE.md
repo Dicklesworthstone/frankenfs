@@ -10386,3 +10386,40 @@ outlier tail (a 2.8x max/min inside one arm suggests occasional multi-hundred-mi
 rather than broad spread). Attacking those is a different and more tractable problem than waiting,
 and it is measurable from `raw_wall_ns` on runs already banked. NO wall-clock ratio is claimed here;
 both banked attempts remain INADMISSIBLE and unquotable.
+
+## MEASURED, NEITHER ADMITTED — 2026-08-17 — both remaining stale btrfs write-path rows moved, one by a sign change (PlumBeacon)
+
+bd-3tqec predicted that create/delete storm and parallel metadata writes had moved, because both are
+dominated by durability boundaries and bd-42gtq cut metadata written per commit from 96 nodes to 6.
+Both moved. **Neither is unconditionally admitted, and the blocking comes first.**
+
+| workload | banked (frozen `f44b3dc4…`) | re-measured (`c9fb745f…`) | nulls | status |
+| --- | --- | --- | --- | --- |
+| create/delete storm | `2.358280x` slower | **`1.901025x` slower** [1.871845, 1.929828] | **both clear** | ratio `admitted=true` / `HONEST_LOSS`, **run VETOED** |
+| parallel metadata writes | `1.930090x` slower | **`0.775502x` FASTER** [0.770582, 0.785457] | kernel clear; fuse `1.025973` vs a `1.025` limit | **BLOCKED_NULL** |
+
+**Create/delete storm** carried both A/A nulls clear (kernel `1.001903` spread `1.010921`; fuse
+`1.001637` spread `1.017462`) and `directional_claim_clear=true`, and its ratio line reads
+`admitted=true, verdict=HONEST_LOSS`. The RUN was then refused by the post-hoc external-load veto:
+140/140 samples over limit, 53 peak busy CPUs, peak OFF-placement mean busy 57.2%. The veto's message
+is the interesting part and it is right — *"the placement CPUs may well have been idle... but memory
+bandwidth, LLC and boost budget are socket-wide."* **The gap narrowed 19% and it is still a LOSS.**
+
+**Parallel metadata writes is a sign change**, from `1.930090x` slower to `1.29x faster`, at 8 observed
+worker threads. It is `BLOCKED_NULL` by **0.000973** — the fuse arm's null spread was `1.025973`
+against a `1.025` limit, with the kernel null clear at `1.024772`. That is the narrowest miss of this
+entire campaign and it must not be reported as a win until it clears.
+
+⚠️ **Do not quote either number as admitted.** One row's run was vetoed; the other's null missed. Both
+are recorded because a measured-and-refused row is evidence about where the write path now stands, and
+because the movement is large enough that leaving the scorecard's frozen figures unqualified would be
+the greater error.
+
+**The distinction this run teaches.** My own `vmstat` sampling read **83-88% idle** before and after,
+and the run was still vetoed — on OFF-placement busyness (57.2%), not placement busyness (54-62%).
+Host-idle and placement-idle are not the same gate as socket-idle. When recording a window from here
+on, record `peak_placement_mean_busy` AND `peak_off_placement_mean_busy`; the first is what the
+pre-run gate checks and the second is what the post-hoc veto refuses on.
+
+**Cheapest next step:** re-run parallel metadata writes. It needs 0.001 of null spread, so it is far
+closer to admissible than the storm row, and it is the one carrying a sign change.
