@@ -9732,3 +9732,45 @@ single run satisfying both simultaneously would make the row unconditional on it
 clear. The replication raises confidence in the MAGNITUDE (two independent 96-pair runs, 0.47% apart)
 and removes the frequency objection. bd-5hqj2 remains the open question that could still withdraw it:
 we are faster while issuing MORE barriers and MORE bytes, and that is not yet explained.
+
+## QUALIFICATION — 2026-08-17 — the btrfs fsync win contains a TRANSPORT asymmetry, and closing bd-5rxz0 is what would settle it (PlumBeacon)
+
+Investigating bd-5hqj2 — why we are 2.17x faster while issuing MORE barriers (3 vs 2) and writing
+MORE bytes (1.389x) — found a structural asymmetry in the comparison itself, not in either
+filesystem.
+
+**The two arms do not reach the host through the same path.** From the harness
+(`seed_fixture_through_mount`, and the same options at measurement time), the kernel arm mounts with
+`"loop,rw,noatime,nodev,nosuid"`:
+
+    kernel btrfs   client -> VFS -> btrfs -> block layer -> LOOP DRIVER -> vfs_write/vfs_fsync
+                     -> host ext4 -> page cache
+    FrankenFS      client -> VFS -> FUSE -> daemon -> pwrite/fdatasync DIRECTLY on the image file
+                     -> host ext4 -> page cache
+
+The incumbent pays a block-layer plus loop-worker hop on every I/O that our arm does not. On a
+workload that is nothing but small writes and flushes, that hop is a credible share of the 2.17x, and
+it explains the otherwise contradictory shape of the counted evidence: more barriers, more bytes,
+less time.
+
+**This is NOT a harness defect, and the harness already knows half of it.** Its header says the
+four-mount design gives each arm an A/A null "without confounding either null with a fixed image or
+loop-device effect" — both kernel arms are looped and both FUSE arms are not, so each NULL is
+internally consistent. The de-confounding applies to the nulls; the CROSS-ARM ratio still contains the
+transport difference. Nor is the loop avoidable: kernel btrfs cannot mount a plain file without one.
+
+**What the row therefore means, stated precisely.** It is a valid answer to "for a file-backed btrfs
+image on this host, is FrankenFS-over-FUSE faster than loop-mounted kernel btrfs at 8 x 4 KiB
+write+fsync" — which is a real operator question for VM images and container layers. It is NOT yet an
+answer to "is our filesystem faster than btrfs", because the incumbent is carrying a transport we do
+not.
+
+**THE DECISIVE EXPERIMENT, and it is blocked on a bead I already filed.** Put both arms on the SAME
+transport. That requires FrankenFS to mount a block device, which it currently refuses — `ffs-cli` on
+`/dev/loopN` returns "image is not a recognized ext4 or btrfs filesystem" because it sizes the image
+from `metadata().len()`, which is 0 for a block special (**bd-5rxz0**). Closing bd-5rxz0 turns this
+from an unfalsifiable qualification into a measurement: run the FUSE arm over a loop device too and
+see how much of `0.461109x` survives.
+
+So bd-5rxz0 is no longer an ergonomics bead. It is the prerequisite for a transport-symmetric
+comparison, and until it closes, the fsync row keeps this qualification wherever it is quoted.
