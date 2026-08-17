@@ -162,6 +162,16 @@ if [ "${FFS_SKIP_STABILITY:-0}" != "1" ]; then
   LAUNCH_MEDIAN=$(printf '%s' "$STABILITY" | sed -n 's/.*median \([0-9.]*\).*/\1/p')
 fi
 LAUNCH_MEDIAN=${LAUNCH_MEDIAN:-0}
+# A launch median that did not parse used to leave LAUNCH_MEDIAN=0, which the
+# in-run check below reads as "no baseline" and skips -- silently disabling the
+# guard for the whole run. Fail closed instead: an admitted run with no recorded
+# admission conditions cannot be checked against them, and a row from an
+# unchecked run is exactly what this guard exists to prevent.
+if [ "${FFS_SKIP_STABILITY:-0}" != "1" ] && [ "$LAUNCH_MEDIAN" = "0" ]; then
+  echo "FATAL: could not parse the launch loadavg median from the stability gate;"
+  echo "       the in-run excursion check would be silently disabled. Refusing."
+  exit 9
+fi
 
 BIN=$OUT/client
 mkdir -p "$OUT"
@@ -334,4 +344,20 @@ fusermount3 -u "$FMNT" 2>/dev/null
 
 echo "=== in-process ELF identity (quote THIS, not a neighbouring sha256sum) ==="
 grep -ohE "binary_sha256=[0-9a-f]{64}" "$OUT"/ffs*-*.log | tail -1
+# FINAL excursion check, over every sample the run recorded (bd-4sull).
+#
+# The per-rep check above can miss the moment: it runs inside the sweep loop, so
+# a spike that lands between the last check and the end of the run is never
+# tested. That happened on 2026-08-17 -- a 20k btrfs run was admitted at median
+# 17.3, drifted to 41.4, finished, and produced a row whose three A/A nulls all
+# failed in the same direction. The samples were in the file; nothing looked at
+# them again. This looks once more before any number is printed.
+if [ "${FFS_SKIP_STABILITY:-0}" != "1" ] && [ "$LAUNCH_MEDIAN" != "0" ]; then
+  if ! EXC=$(python3 "$HERE/host_stability.py" --check-excursion "$LAUNCH_MEDIAN" "$OUT/loadavg"); then
+    echo "$EXC"
+    echo "The run COMPLETED but left its admission envelope, so these samples are"
+    echo "NOT a row. They are in $OUT/samples.tsv if you want to look at them."
+    exit 5
+  fi
+fi
 FFS_OUT="$OUT" FFS_ENTRIES="$ENTRIES" FFS_KNOB="$KNOB" python3 "$HERE/fuse_vs_kernel_abba_report.py"
