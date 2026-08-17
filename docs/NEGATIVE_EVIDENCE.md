@@ -10225,3 +10225,100 @@ loop-mounted and we are not (bd-w2u82), and durability equivalence is unproven (
 both caused by treating a single run's window as representative. The discipline that would have
 prevented both: **do not attribute a difference between two runs to a mechanism until the covariate
 is measured per-run and there are at least two runs at each end.**
+
+## BLOCKED — INADMISSIBLE 2026-08-17 (bd-btrfs-readdir-stat-8x-8y7vp) — doubling pairs made the btrfs FUSE A/A null WORSE and flipped its sign; neither row may be quoted (CreamTrout)
+
+Second timed attempt on the post-lever candidate, run specifically to test whether the first
+attempt's near-miss was sampling noise. It was not, and the answer is worth more than the row.
+
+    executed_on: thinkstation1
+    bench_evidence,binary_sha256=c3eac8bd3ad7d920a499d29bfa82cce32484358956068848ed0ce06073c13df0
+    executing_elf_sha256: c3eac8bd3ad7d920a499d29bfa82cce32484358956068848ed0ce06073c13df0
+    build_profile,pgo_profile_sha256=cc6c121c9ee77d8a4b7f4855c443c07a59ac6191316d40acb08fb2fbe79f9562
+    driver ELF 9d20206721ec9485…, both built thinkstation1, kernel 6.17.0-41-generic
+    32,768 operations, 8 requested and 8 observed worker threads, min-of-3 repeats
+    harness load_average 26.16/19.67/17.79, settled=FALSE
+    idle at the time of writing 88.6%, iowait 0.1%, mean CPU 2640.2 MHz over 64 CPUs
+
+    A/A NULL CONTROLS, same invocation, bootstrap median CI on each:
+      24 pairs:  fuse_aa 1.0229916  deviation +0.0229916  ci95 [0.9826635, 1.0558851]  FAIL
+      48 pairs:  fuse_aa 0.9737502  deviation -0.0262498  ci95 [0.9189287, 1.0292779]  FAIL
+      48 pairs:  kernel_aa 0.9899270  deviation 0.0100730  ci95 [0.9650803, 1.0053100]  pass
+      ceiling on median deviation: 0.02
+
+    fuse_over_kernel  6.349379x  ci95 [5.832261, 6.956951]   admitted=FALSE  verdict=blocked_null
+    (24-pair attempt read 6.514621x [5.695101, 6.740817] — overlapping, and equally unusable)
+
+### Doubling the pairs did not tighten the null. It widened it and FLIPPED ITS SIGN
+
+24 pairs gave **+2.30%**; 48 pairs gave **−2.62%**. More samples made it worse in magnitude and
+reversed its direction. **A null that flips sign between runs is an unstable instrument**, and the
+campaign's own convention says such a null is never excusable — the failing-null exception requires
+both runs off in the SAME direction by a similar amount.
+
+This independently reproduces a finding already on bd-btrfs-readdir-stat-8x-8y7vp from a different
+lane: *"96 pairs does NOT fix the btrfs null — a null insensitive to sample size is not sampling
+variance."* I doubled the pairs expecting to close a 0.003 gap and instead confirmed the gap is not
+sampling noise. Buying pairs does not buy this row.
+
+### And the clock hazard was ABSENT this time, which isolates it further
+
+The first attempt had the FUSE daemon at **1429 MHz** against a 3964 max — a plausible confound.
+This run placed it at **3433.739 MHz** against a 4292 max, and `core_contention_preflight` returned
+`verdict=clear` with driver busy 0.0808 and fuse busy 0.0816 against limits of 0.200/0.350. **The
+null failed anyway.** So the failure is not the parked-core hazard.
+
+### A mechanical detail that explains why these runs start and then get vetoed
+
+The harness's PRE-run gate and its POST-hoc veto measure different things:
+
+* `core_contention_preflight` checks the **placement** CPUs — driver and fuse busy fractions against
+  0.200/0.350. Both were ~0.08. Verdict `clear`, `initial_host_quiet_wait_ms=0`, so it started
+  immediately.
+* `external_load_during_run` then checks **host-wide off-placement** load, and recorded
+  `max_external_busy_cpus=54`, `contended_fraction=1.0000`, `peak_off_placement_mean_busy=0.9967`.
+
+So a run can pass its own admission check and be vetoed by a metric the admission check never
+consults. That asymmetry is why twelve reported-clean windows produced two started-and-blocked runs
+rather than a refusal to start, and it belongs on bd-4sull beside the spread-not-magnitude finding.
+
+### What must NOT be concluded
+
+Both attempts (6.514621x, 6.349379x) sit below the banked 7.753405x / 7.649395x, and my memo lever
+landed between. **Neither number is usable and no comparison is licensed.** Both nulls failed, the
+null flipped sign, external load was 100% contended in both, and the second run's own
+`load_average.settled` is FALSE. The lever's wall-clock effect remains UNMEASURED. Artifacts: 2.1G
+under `/data/tmp/ffs-cert-creamtrout`; df 204G, unchanged across the run.
+
+## DEFERRED — 2026-08-17 — no certification: a NEIGHBOURING frankenfs mounted-kernel bench was in flight (PlumBeacon)
+
+Recorded because a deferral with a named cause is evidence and a silent gap is not.
+
+The window was clean by every measure I take — `uptime` 32.25/20.27/17.94 but CPU **idle 80-81%,
+iowait 0** (`vmstat`, which on this host disagrees with loadavg often enough that idle is the figure
+to trust). I did not certify anyway:
+
+    438018 ./target/release-perf/ffs-mounted-kernel-bench --ffs-cli target/release-perf/ffs-cli
+      --filesystem btrfs --workload readdir-stat-8t --operations 32768 --pairs 48
+      --image-size-mib 512 --artifact-root /data/tmp/ffs-cert-creamtrout
+
+A peer (CreamTrout) was mid-run with two live `fuse.ffs` mounts. **Two mounted-kernel comparators on
+one host is not ordinary contention — each becomes the other's external load, on the same placement
+CPUs, and both rows are poisoned symmetrically.** Neither would be recoverable afterwards, because
+neither report can tell how much of its own noise was the other.
+
+**No build either, for the same reason.** Even a `cargo check` is CPU that lands inside a neighbour's
+timed region. And a `release-perf` rebuild would have been worse than contention: their command line
+reads `--ffs-cli target/release-perf/ffs-cli`, so rebuilding that path swaps the binary under a
+running measurement — the exact hazard `fuse_vs_kernel_abba.sh` documents in its own header ("a peer
+rebuilding into target/ mid-run silently changes the binary under you, and a binary that can be
+swapped during a run is not a provenance claim").
+
+**Rule this leaves.** Before certifying OR building, check `pgrep -f ffs-mounted-kernel-bench`. The
+per-run `external_load_during_run` gate cannot see this: it counts busy CPUs, so a neighbouring
+comparator looks like generic load rather than a correlated competitor pinned to the same placement
+set. The check is cheap and the failure is silent.
+
+Zero-CPU work was done instead: the btrfs scorecard's fsync row was corrected from `1.976308x slower`
+to `~0.45–0.46x faster` with its five-run table and both qualifications, and its header warning went
+from "three rows describe HEAD" to four.

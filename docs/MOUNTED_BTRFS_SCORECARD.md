@@ -1,11 +1,20 @@
 # Btrfs scorecard: FrankenFS FUSE against the incumbent, Linux kernel btrfs
 
-> ## ⛔ THREE ROWS DESCRIBE FRANKENFS AT `HEAD`. THE OTHER THREE DO NOT.
+> ## ⛔ FOUR ROWS DESCRIBE FRANKENFS AT `HEAD`. THE OTHER TWO DO NOT.
 >
 > **readdir+stat, parallel read and warm stat were re-measured 2026-08-08** on candidate
-> `913c36a4…` (PGO `b30de364…`, x86-64-v3 attested) — each twice, all admitted. The other
-> three predate the current tree (2026-07-31, frozen `f44b3dc4…`) and none has been
-> re-measured.
+> `913c36a4…` (PGO `b30de364…`, x86-64-v3 attested) — each twice, all admitted.
+>
+> **fsync/journal commit was re-measured 2026-08-17** on candidate `c9fb745f…` (PGO
+> `6a22cfcf…`, x86-64-v3) — five runs, admitted twice, and **the sign changed**: a
+> `1.976308x` loss became `~0.45–0.46x`, about 2.2x faster. See the scored section below,
+> including the two qualifications that travel with it. That candidate is also the first to
+> contain the 2026-08-17 write-path work (`bd-fv9tc` GDT coalescing, `bd-42gtq` COW-only
+> block writes, `bd-k74ef` per-block backrefs), which is why the row moved.
+>
+> **create/delete storm and parallel metadata writes still predate the current tree**
+> (2026-07-31, frozen `f44b3dc4…`) and neither has been re-measured. Both are write-path
+> rows, so the fsync sign change is a direct reason to expect them to have moved too.
 >
 > This file needs the warning **more** than the ext4 one, because the commits landed since
 > are all in the btrfs write path: `839eb708` (the durable commit built leaves it could not
@@ -578,12 +587,53 @@ test tests::reconciled_block_group_accounting_makes_a_preexisting_extent_freeabl
 test result: ok. 1 passed; 0 failed; 375 filtered out
 ```
 
-`bd-ftev0` is closed on that evidence. **The row is still unscored**, and this is a
-capability fix rather than a measurement: producing the ratio needs a four-arm mounted
-comparator run with the kernel incumbent live in the same invocation, both A/A nulls, the
-observed thread count and a self-reported ELF hash — which needs root for the kernel arms
-and a quiet window. Tracked as `bd-score-btrfs-fsync-row-d98vj`. Until that run exists the
-row shows no number, because a fixed defect is not a result.
+`bd-ftev0` is closed on that evidence.
+
+### SCORED 2026-08-17, and the sign changed: `~0.45–0.46x`, about 2.2x FASTER
+
+The run `bd-score-btrfs-fsync-row-d98vj` asked for now exists — four-arm mounted comparator,
+kernel incumbent live in the same invocation, both A/A nulls, observed thread count, and a
+self-reported candidate ELF. **Five runs on candidate `c9fb745f…`** (x86-64-v3, PGO
+`6a22cfcf…`, the same banked profile as every earlier candidate, so it is comparable):
+
+| run | pairs | `peak_placement_mean_busy` | ratio | verdict |
+| --- | --- | --- | --- | --- |
+| E | 192 | 0.462 | `0.456284` [0.448364, 0.462696] | BLOCKED (fuse null spread 1.0307) |
+| A | 96 | 0.747 | `0.461109` [0.452020, 0.470524] | **ADMITTED, HONEST_WIN** |
+| D | 192 | 0.937 | `0.449048` [0.444672, 0.451959] | **ADMITTED, HONEST_WIN** |
+| B | 96 | — | `0.463280` | BLOCKED (fuse null spread) |
+| C | 96 | — | `0.533114` | BLOCKED (kernel null spread) — **outlier** |
+
+Four runs cluster inside 3.1%. Run C sits 15% away and is unexplained: recorded, not
+averaged in, not quoted. Run D's nulls were `0.995218` (spread 1.017305) and `0.991905`
+(spread 1.015658), both clear, with the ratio CI at ±0.8%.
+
+**This row needs 192 pairs, not 96** (`bd-ynqwx`). Six of seven attempts were `BLOCKED_NULL`
+on null CI SPREAD and never on median — every null median across all of them was within 1.4%
+of one. Spread narrows as `sqrt(pairs)`, and 96 → 192 took it from 1.022–1.033 to
+1.0157/1.0173, inside the 1.025 limit with margin.
+
+**No load dependence.** Ordered by `peak_placement_mean_busy` the ratio is flat — `0.456` at
+0.462 busy, `0.461` at 0.747, `0.449` at 0.937. An earlier claim that it moved with load was
+withdrawn: it rested on run C and on `loadavg`, a host-wide lagging covariate that ranked run
+D — which peaked at 93.7% busy on the placement CPUs — as the *quiet* run because it
+*launched* quiet. Use the run's own `peak_placement_mean_busy`; a pre-run `uptime` describes
+only the starting line.
+
+⚠️ **TWO QUALIFICATIONS TRAVEL WITH THIS ROW.**
+
+1. **Transport asymmetry (`bd-w2u82`).** The kernel arm mounts `loop,rw,noatime,…` because
+   kernel btrfs cannot mount a plain file; the FrankenFS arm `pwrite`s the image directly. The
+   incumbent pays a block-layer and loop-worker hop per I/O that we do not, which is a credible
+   share of the ratio. So this is a **file-backed-image** result, not a filesystem-vs-filesystem
+   one. Counted evidence says the *counts* are transport-invariant (3.0000 barriers and 102400
+   bytes per client fsync either way), so the question is the cost per request, and only a
+   timed transport-symmetric run settles it.
+2. **Durability equivalence unproven (`bd-5hqj2`).** We issue **more** barriers (3.0000 vs
+   2.0000) and write **more** bytes (1.389x) per client fsync, yet are faster. The barrier
+   count was taken from outside the process with `strace` and is higher, so we are not skipping
+   flushes — but that is not the same claim as equal durability. **Do not quote this row as a
+   durability claim until that closes.**
 
 ## Provenance
 
@@ -622,7 +672,7 @@ row shows no number, because a fixed defect is not a result.
 | create/delete storm | `2.753659x` slower | `2.358280x` slower |
 | parallel read **(both re-measured 2026-08-08)** | ≈`0.98x` NEUTRAL (`0.986316x` / `0.978203x`) | **≈`0.89–0.93x` FASTER** (`0.893282x` / `0.927352x`, quiet window, 2/2 WIN) |
 | parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
-| fsync/journal commit | `0.997098x` neutral | **`1.976308x` slower** |
+| fsync/journal commit | `0.997098x` neutral | **`~0.45–0.46x` FASTER (re-measured 2026-08-17)** — admitted twice, `0.449048x` at 192 pairs and `0.461109x` at 96, four runs inside 3.1%. Supersedes the `1.976308x` slower figure, which predates the write-path work. **Qualified**: the kernel arm is loop-mounted and we are not (`bd-w2u82`), and durability equivalence is unproven (`bd-5hqj2`) |
 | warm stat | `4.812194x` slower | `4.977803x` / `5.036433x` slower |
 
 The parallel-read row remains the only sign change anywhere in either scorecard, and it
