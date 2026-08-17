@@ -8057,3 +8057,98 @@ fsync workload is 64 commits, so 63 of them should collapse.
 is the whole tree) while the fix was wrong. Reading the walk without reading the DATA MODEL it walks
 is how a plausible one-line fix gets specified for a structural problem. The count that started this
 (96 nodes per 4 KiB fsync) is unaffected and still stands.
+
+## MECHANISM — 2026-08-17 — the btrfs per-fsync node count is LINEAR IN FILESYSTEM SIZE, no node is written twice, and a no-op fsync still writes the whole tree (CreamTrout)
+
+Independent counted follow-up to PlumBeacon's 96-node row and its correction, on a **different
+fixture**, so the two sets of integers complement rather than replicate each other. Three facts here
+are new, and one of them **refutes a sub-claim** of the original row.
+
+**Instrument.** No harness and no comparator: `target/release-perf/ffs-cli mount --rw` with
+`RUST_LOG=ffs::btrfs::writeback=debug`, one client `pwrite`+`fsync` via `os.pwrite`, and `sudo strace
+-f -e trace=pwrite64,fdatasync` on the daemon. The observable is `writeback_dag_built node_count`
+(the **fs tree DAG only**) plus the daemon's own write-size histogram (**all trees**). Every number
+below is an exact integer, reproduced at every generation.
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, daemon ELF `81c7b1a34d32f5c3f5c2478a…`
+(`release-perf`, built 05:02 EDT), loadavg 13.42/15.39/17.31 at the run, mean CPU 2821.9 MHz over 64
+CPUs. Load is recorded for the record only — **a count is load-independent**, which is the entire
+reason this was runnable in a window no timed row could have used.
+
+### 1. Full accounting for one 4 KiB write+fsync — and NOTHING is written twice
+
+Fixture `btrfs-fixture-2k.img` (2048 files, nodesize 16384, one directory):
+
+| what | count | bytes |
+|---|---|---|
+| data block | 1 x 4096 | 4096 |
+| metadata tree nodes | **120 x 16384** | 1966080 |
+| **total to the image fd** | | **1970176** = **481x** the client's 4 KiB |
+| `fdatasync` on the image fd | **4** | |
+
+The fs-tree DAG logged `node_count=115` for that same commit. So **115 of the 120 node writes are the
+fs tree** and the csum + subvol + extent + root trees contribute **5 between them** — the fs tree is
+**95.8%** of the metadata written.
+
+⛔ **This refutes "nodes are being written more than once per commit"**, the closing inference of the
+96-node row (which read `96 > 58 distinct on-disk nodes` as double-writing). Here 115 + 5 = 120
+exactly, so within this measurement **every node is written exactly once**. The excess over a
+`dump-tree` node count is not double-writing; it is that our in-memory tree is *rebuilt item by item
+at mount* and does not reproduce the kernel's fanout, so it simply **has more nodes than the on-disk
+tree it was built from**. Stated as the hypothesis it is: I did not `dump-tree` this fixture, so what
+is PROVEN is the no-double-write half, not the fanout explanation.
+
+This also **bounds the corrected lever's residual**. PlumBeacon's block→bytenr lever predicts commits
+2..N collapse to "the COW path plus whatever the extent/root/csum trees actually touched"; that
+second term is measured here and it is **at most 5 nodes**.
+
+### 2. A fsync that modifies NOTHING still writes the entire fs tree
+
+Four consecutive fsyncs on the same mount, same file:
+
+| fsync | what the client changed | fs-tree `node_count` |
+|---|---|---|
+| 1 | 4096 bytes at offset 0 | **115** |
+| 2 | **nothing at all** (open, fsync, close) | **115** |
+| 3 | 4096 bytes at offset 0 | **115** |
+| 4 | **16 bytes** at offset 0 | **115** |
+
+The DAG is not merely unfiltered by generation — it is **independent of whether anything was dirtied
+at all**, and independent of how much. The `if node_count == 0 { "no_dirty_nodes" }` early return in
+`btrfs_full_transaction_commit` is therefore **dead code on every non-empty filesystem**: it can only
+fire on an empty tree, never on a clean one.
+
+### 3. The amplification scales with the SIZE OF THE FILESYSTEM, not the size of the write
+
+Same daemon, same single 4 KiB write+fsync, two fixtures:
+
+| fixture | files | fs-tree `node_count` | metadata bytes per fsync |
+|---|---|---|---|
+| `btrfs-fixture-2k` | 2048 | 115 | ~1.9 MB |
+| `btrfs-fixture-20k` | 20050 | **1132** | **~18.5 MB** |
+
+Files x9.79, nodes x9.84 — **linear**. This is the part that makes the defect structural rather than
+merely wasteful: per-fsync metadata cost is **O(files in the filesystem)**, so the 21.389x on a small
+image is not a ceiling, it is a sample of a line through the origin.
+
+⚠️ **Corroborating but CONFOUNDED, so not claimed.** On the 20k fixture the fsync did not merely cost
+18.5 MB — it **failed**, `FUSE op failed op="fsync" errno=28 no space left on device`, immediately
+after building the 1132-node DAG, on a 512 MB image whose client write was 4 KiB. That is the shape
+the scaling law predicts. It is **not banked as a finding**, because the kernel independently refuses
+to mount `btrfs-fixture-20k.img` at all (`can't read superblock`), so that image's provenance is
+unknown and it may be damaged for unrelated reasons (cf. bd-giw9n, unmountable after ~32k creates).
+Reproducing ENOSPC on a fixture with a passing kernel readback is left open.
+
+### What was checked and did NOT fail
+
+The 2k fixture **kernel-mounts cleanly both before and after** four FrankenFS write+fsync generations
+(`mount -t btrfs`, 2050 entries listed both times). So nothing in this session's writing broke
+kernel interoperability at this size — the bd-73bi2 hazard did not fire here.
+
+### Scope
+
+One host, one daemon ELF, one filesystem size pair, no kernel arm and **no wall-clock claim of any
+kind**. Bytes and node counts are a mechanism, not a prediction: the row this hangs off
+(`fsync/journal-commit`) is 1.98x, and on ext4 the same class of counting moved bytes 1.250x -> 0.750x
+while the timed row did not move. What these integers do support is a **sizing**: the fs tree is
+where ~96% of the metadata write lives, so a lever that does not touch the fs tree cannot matter here.
