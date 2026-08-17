@@ -9576,3 +9576,41 @@ FUSE image before reporting any number, and REFUSES the run if the image is dirt
 both ways: it rejects the pre-fix image ("FATAL: the FUSE arm left the image INCONSISTENT") and
 accepts the post-fix one. A measurement tool that drives the write path and does not check what it
 left behind was one line short of being a correctness gate.
+
+## INADMISSIBLE — 2026-08-17 — the first timed btrfs fsync row read 0.405890 and MUST NOT BE QUOTED (PlumBeacon)
+
+The first timed `fsync-journal-commit` measurement ever taken with the write-path levers, run on the
+mounted comparator with the incumbent live in the same invocation. It is recorded here **so nobody
+quotes it**, for two independent reasons either of which alone would sink it.
+
+    mounted_kernel_ratio,filesystem=btrfs,workload=fsync_journal_commit,pairs=12,
+      fuse_over_kernel_median=0.405890,ci_low=0.368761,ci_high=0.549805,
+      admitted=false,verdict=BLOCKED_NULL
+    kernel median 109.85 ms  vs  fuse median 49.49 ms  (8 x 4 KiB write+fsync)
+
+**REASON 1 — both A/A nulls failed.** The estimator's own controls came out `kernel median 1.110006`
+and `fuse median 1.085426` against a `maximum_median_deviation` of `0.020000`. An arm that cannot
+reproduce itself to within 11% cannot resolve a ratio; 12 pairs in that window decided nothing. Per
+the standing contract a failed null invalidates the row, full stop.
+
+**REASON 2 — the daemon under test was the one that corrupts.** The pinned candidate
+`d103d36e…` predates the backref fix in this same session, so the run's own post-run `btrfs check`
+failed (`root 5 has no backref item`, `root 5 root dir 256 not found`). A timing number from a write
+path that leaves the filesystem inconsistent is not a performance result; it is a measurement of
+doing less work than correctness requires. **That is exactly the shape a fast-looking wrong answer
+takes, and it is why the comparator's fsck gate is load-bearing rather than ceremony.**
+
+Provenance, recorded because the row exists at all: host `thinkstation1`, kernel `6.17.0-41-generic`,
+kernel engine sha `0acb7af5…`, candidate ELF `d103d36e…`, ISA `avx+avx2+f16c+fma+sse2+sse4.2`,
+`same_invocation=true`, `independent_physical_arms=true`, arms pinned to cpu 29, 12 pairs, 3
+crossover blocks, `observation_repeats=1`.
+
+**What it does NOT license.** It does not license "FrankenFS is 2.46x faster than kernel btrfs on
+fsync", or any directional claim at all. The honest statement is: **the row is BLOCKED_NULL on a
+corrupt candidate and the btrfs fsync ratio remains unmeasured.**
+
+**Retry predicate.** Rebuild release-perf from a tree containing the backref fix, verify by content
+(`flush GDT:` present) and by the run's own post-run fsck, then re-run at >= 24 pairs in a window
+where both A/A nulls land inside 2% and the arms' mean core clocks agree. The 12-pair attempt here
+was taken at loadavg ~18 rising to 45 with six concurrent builds — not a window that can decide
+anything.
