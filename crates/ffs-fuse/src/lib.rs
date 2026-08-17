@@ -4418,6 +4418,12 @@ impl Filesystem for FrankenFuse {
                                 order.iter().map(|index| entries[*index].ino).collect();
                             if let Ok(results) =
                                 self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                    // bd-xfe7z: time the OPS-layer call only, so
+                                    // dispatch_ns - ops_ns is the FUSE layer's own
+                                    // overhead and ops_ns is the format layer's work.
+                                    let _t = crossings::OpsTimer::start(
+                                        crossings::CrossingOp::Getattr,
+                                    );
                                     Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
                                 })
                             {
@@ -4434,6 +4440,9 @@ impl Filesystem for FrankenFuse {
                                 let ino = entries[index].ino;
                                 if let Ok(attr) =
                                     self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                        let _t = crossings::OpsTimer::start(
+                                            crossings::CrossingOp::Getattr,
+                                        );
                                         self.inner.ops.getattr(cx, scope, ino)
                                     })
                                 {

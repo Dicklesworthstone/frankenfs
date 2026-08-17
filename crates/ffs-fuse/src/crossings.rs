@@ -206,6 +206,79 @@ pub fn render_fuser_nanos(nanos: [u64; fuser::CROSSING_SLOTS]) -> String {
     out
 }
 
+/// Nanoseconds spent INSIDE the ops layer, per opcode (bd-xfe7z).
+///
+/// `dispatch_ns` times everything the daemon does for a request. This times only
+/// the `FsOps` call within it, so `dispatch_ns - ops_ns` is the FUSE layer's own
+/// overhead and `ops_ns` is the format layer's work.
+///
+/// That split is the next question and nothing currently answers it. bd-xfe7z
+/// established that `getattr` owns 60.80% of dispatch time and that neither
+/// removing the per-entry request scope (REJECT, inside the null) nor memoizing
+/// the result (REJECT, 120630 stashes and 0 hits) moves it. What is left is the
+/// cost of producing one inode's attributes -- but "producing" spans an
+/// inode-table read, an attr-only parse and an `InodeAttr` construction on one
+/// side of the boundary, and handler plumbing on the other. A lever aimed at the
+/// wrong side of that line is the third rejected lever in a row.
+static OPS_NANOS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Accumulates ops-layer time on DROP, so no early return can skip it.
+///
+/// RAII because the first dispatch timer was not: it added elapsed time after
+/// the reply was sent, and `dispatch` returns early for handlers that answer
+/// through their reply object. It reported `crossings_readdirplus=209` with
+/// `dispatch_ns_readdirplus=0` -- a timer that missed the one handler it was
+/// built for.
+pub struct OpsTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl OpsTimer {
+    /// Start timing an ops-layer call, or return `None` when evidence is off.
+    #[must_use]
+    pub fn start(op: CrossingOp) -> Option<Self> {
+        ops_timing_enabled().then(|| Self {
+            slot: op.index(),
+            started: std::time::Instant::now(),
+        })
+    }
+}
+
+impl Drop for OpsTimer {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        OPS_NANOS[self.slot].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Gated on the same flag as the rest of the mount evidence, read once, so a
+/// default mount pays nothing on the hot path.
+fn ops_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0")
+    })
+}
+
+/// Render ops-layer nanoseconds with the same labels and ordering as the counts.
+#[must_use]
+pub fn render_ops_nanos() -> String {
+    let mut out = String::new();
+    let mut total = 0_u64;
+    for op in CrossingOp::ALL {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let value = OPS_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
+        total += value;
+        out.push_str(&format!("ops_ns_{}={}", op.label(), value));
+    }
+    out.push_str(&format!(" ops_ns_total={total}"));
+    out
+}
+
 /// Live counts and dispatch times, rendered for the metrics line.
 #[must_use]
 pub fn render_live_timed() -> String {
@@ -213,7 +286,7 @@ pub fn render_live_timed() -> String {
         "{} {}",
         render_fuser_counts(fuser::crossing_counts()),
         render_fuser_nanos(fuser::crossing_nanos())
-    )
+    ) + " " + &render_ops_nanos()
 }
 
 /// Live counts from the daemon, rendered for the metrics line.
@@ -224,6 +297,33 @@ pub fn render_live() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Ops-layer nanoseconds must render with the same labels and ordering as
+    /// the counts and the dispatch times, so `dispatch_ns_X - ops_ns_X` is a
+    /// subtraction a reader can do without a mapping step.
+    #[test]
+    fn ops_nanos_render_with_the_same_labels_bd_xfe7z() {
+        let line = super::render_ops_nanos();
+        for op in CrossingOp::ALL {
+            assert!(line.contains(&format!("ops_ns_{}=", op.label())), "{line}");
+        }
+        assert!(line.contains("ops_ns_total="), "{line}");
+    }
+
+    /// The timer must be inert when evidence is off, because it sits on the path
+    /// whose cost is under investigation. `start` returning None is what makes a
+    /// default mount pay nothing.
+    #[test]
+    fn the_ops_timer_is_inert_without_the_evidence_flag_bd_xfe7z() {
+        // Whatever the ambient flag is, `start` must agree with it rather than
+        // timing unconditionally.
+        let enabled = super::ops_timing_enabled();
+        assert_eq!(
+            super::OpsTimer::start(CrossingOp::Getattr).is_some(),
+            enabled,
+            "the timer must be active exactly when mount evidence is on"
+        );
+    }
 
     /// Nanoseconds must render per opcode with the same labels and ordering as
     /// the counts, so the two lines can be divided by each other without a
