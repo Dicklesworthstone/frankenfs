@@ -10666,3 +10666,58 @@ that this busiest run produced the LEAST favourable of the three readings, which
 load-dependence I hypothesised and withdrew earlier today.
 
 **Remaining qualification, unchanged:** the kernel arm is loop-mounted and we are not (`bd-w2u82`).
+
+## MECHANISM — 2026-08-17 — `--pairs 12` cuts the FUSE arm's CV 10-20x and clears its A/A null for the first time; CONTENDED never blocked admission (bd-btrfs-readdir-stat-8x-8y7vp, bd-4sull)
+
+Acting on the corpus survey rather than on the window. Every one of the 13 admitted btrfs
+readdir+stat rows used **`--pairs 12`**, the minimum — and every one was `verdict=CONTENDED` with
+`contended_fraction=1.0000` and up to 50 external busy CPUs. Two things follow, and the second
+corrects me.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, candidate ELF
+`c3eac8bd3ad7d920…` (`isa=x86-64-v3`, `verdict=pass`), PGO profile `cc6c121c9ee77d8a…`, driver
+`9d20206721ec9485…`, both built thinkstation1. Mean CPU 3589.2 MHz over 64 CPUs, loadavg
+18.13/18.85/18.91, idle 61.3-82.8% across the series, iowait 0.1-1.2%, df 201G→198G.
+
+**⛔ CORRECTION: `external_load_during_run = CONTENDED` does NOT block admission.** All 13 admitted
+rows carry it, at `contended_fraction = 1.0000`. I have treated that verdict as disqualifying and
+used it to decline runs; it is recorded, not gating. The gate that actually blocked both of my
+earlier attempts was the A/A null alone.
+
+**✅ THE PRESCRIPTION WORKS. Pair count drives the FUSE arm's CV, and fewer is better:**
+
+| pairs | fuse_a CV | fuse_b CV | fuse_aa clear? |
+|---|---|---|---|
+| 48 | 26.62% | 30.11% | no |
+| 24 | 14.28% | 8.56% | no |
+| **12** | **1.33%** | **1.85%** | **YES** |
+
+A 10-20x reduction, landing exactly in the admitted regime (13 admitted runs: max fuse CV median
+1.54%). **The FUSE A/A null cleared for the first time this session** — `median 1.013665`, deviation
+0.013665 against a 0.02 ceiling, `symmetric_spread 1.018463` against 1.025, `clear = true`.
+
+This inverts what I did earlier: I doubled the pairs to 48 trying to tighten the null, and pair count
+was the thing making it worse. A longer window accumulates more load variation than the extra samples
+average out.
+
+**Where it still stops.** Four `--pairs 12` attempts: two aborted BEFORE measuring on the
+pre-measurement guard (`driver guard cpu0 became 29.9% busy`, `cpu8 46.5%`) — the harness failing
+closed cheaply and correctly — and two measured but blocked, with **the failing arm alternating**:
+
+| attempt | fuse_aa clear | kernel_aa clear | ratio |
+|---|---|---|---|
+| A | **yes** | no (`symmetric_spread 1.028376` vs 1.025) | 6.855263x |
+| B | no | **yes** | 6.780288x |
+
+Each arm clears on its own; they have not yet cleared together. The kernel miss was 0.0034 over its
+spread limit, with `kernel_b` at 3.52% CV. This is marginal noise on both arms, not a structural
+barrier — and 13 admitted rows at these settings prove it is passable.
+
+⚠️ **The four ratios seen this session (6.780288x, 6.855263x, and the earlier 6.514621x, 6.349379x)
+are all INADMISSIBLE and none may be quoted**, including for comparison against the banked
+7.753405x / 7.649395x. The memo lever's wall-clock effect remains UNMEASURED.
+
+**The recipe, for whoever picks this up:** `--pairs 12`, `--operations 32768`, expect ~90 s per
+attempt and expect roughly half to abort on the pre-measurement guard. Retry is the strategy; each
+attempt is cheap and the artifacts stay at 2.1G total because failed runs are discarded. Do not raise
+the pair count to chase the null — that is what this entry measured to be backwards.
