@@ -10815,3 +10815,47 @@ the fail-fast check is: run `--pairs 12`, read `max fuse CV` early, and abandon 
 completing the run and blocking on the null. Combined with the two existing abort modes that already
 fire in under a minute, that turns certification from a multi-minute gamble into a short, repeatable
 probe — and 13 admitted rows prove the target is reachable.
+
+## ⛔ THE btrfs fsync WIN WAS SUBSTANTIALLY TRANSPORT — 2026-08-17 — symmetric transport turns `0.45x` into `1.49x` (PlumBeacon)
+
+bd-w2u82 is implemented and run. The outcome is the one I pre-committed to as the unfavourable branch,
+and it lands there.
+
+`ffs-mounted-kernel-bench` gained `--fuse-transport file|loop` (default `file` = every banked row's
+shape). With `loop`, the FUSE arm's image is put behind a loop device, as the kernel arm always is.
+btrfs `fsync-journal-commit`, candidate `c9fb745f…`, same harness, same invocation shape:
+
+| FUSE arm transport | kernel median | fuse median | ratio |
+| --- | --- | --- | --- |
+| **file** (all banked rows) | ~106 ms | ~48 ms | **`0.449–0.463x`** — "2.2x FASTER", admitted twice |
+| **loop** (symmetric) | 150.99 ms | 226.89 ms | **`1.491904x`** [1.476471, 1.505554] — **1.49x SLOWER** |
+
+**A 3.2x swing, from the transport alone.** The 12-pair smoke test read `1.411044x` and the 192-pair
+run `1.491904x`, so this is not a sampling artifact.
+
+**What this means for the banked rows.** The btrfs fsync row's "2.2x faster" was measured with the
+incumbent carrying a block-layer and loop-worker hop per barrier that we did not. Put both arms on the
+same transport and **we are slower**. The same qualification now has teeth for every fsync-dominated
+row measured this way: btrfs fsync (admitted twice), btrfs parallel metadata writes (admitted), and
+ext4 fsync (`0.307345x`, vetoed). **None of them may be described as a filesystem win.**
+
+⚠️ **Two honest caveats, and the first weakens the clean-A/B reading.** The kernel arm ALSO slowed,
+from ~106 ms to 150.99 ms, when a second loop device joined the run. So the symmetric configuration is
+not "the asymmetric measurement with our transport corrected" — adding a loop device perturbs shared
+loop infrastructure and moves both arms. What can be said without over-reading: *with both arms on
+loop devices we are 1.49x slower; with only the incumbent on one we are 0.45x. The configuration that
+flattered us is the asymmetric one.* Second, this run is `BLOCKED_NULL` — the fuse null spread was
+`1.032060` against `1.025` (the kernel null was clear at `1.017546`), which my CV model says needs
+~288 pairs — and `CONTENDED`.
+
+**Which configuration is the honest one depends on the question, and both should be published.**
+*"Which is faster for a file-backed image on this host"* is a real operator question (VM images,
+container layers) and the asymmetric row answers it — the incumbent genuinely must use a loop there.
+*"Is our filesystem faster than btrfs"* is the question the scorecards imply, and the symmetric row
+answers it: **no, about 1.5x slower on fsync.**
+
+**Implementation notes.** `--fuse-transport` defaults to `file`, so no banked row changes. The loop
+device is owned by the `MountedArm` and detached in both `unmount()` and `Drop` — including the
+early-return path when the mount is already gone, which is exactly the aborted-run case, because a
+leaked loop pins the image and silently breaks the NEXT run's fixture. Verified: loop count 15 before,
+15 after, on both runs; `mount_identity=pass`, `independent_arms=pass`.

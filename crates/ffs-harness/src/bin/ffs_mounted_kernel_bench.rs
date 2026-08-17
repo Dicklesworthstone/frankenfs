@@ -523,6 +523,14 @@ impl Workload {
 #[derive(Clone, Debug)]
 struct Config {
     ffs_cli: PathBuf,
+    /// bd-w2u82: put the FUSE arm's image behind a loop device, as the kernel arm
+    /// already is, so the two arms cross the SAME transport.
+    ///
+    /// Default `false` is the pre-bd-w2u82 shape and every banked row's shape. The
+    /// kernel arm has no choice — kernel ext4/btrfs cannot mount a plain file — so
+    /// it pays a block-layer and loop-worker hop per I/O that the FUSE arm does
+    /// not, and on durability-bound rows that is a credible share of the ratio.
+    fuse_transport_loop: bool,
     artifact_root: PathBuf,
     /// Reusable root for the bulk scratch (arm images + fixture tree).
     ///
@@ -663,6 +671,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             ffs_cli: PathBuf::new(),
+            fuse_transport_loop: false,
             artifact_root: PathBuf::from("/data/tmp/frankenfs-mounted-kernel"),
             scratch_root: None,
             filesystems: RequestedFilesystems::Both,
@@ -1107,6 +1116,14 @@ struct MountedArm {
     image: PathBuf,
     mount_info: MountInfo,
     kind: MountedArmKind,
+    /// bd-w2u82: loop device backing a FUSE arm, when `--fuse-transport loop` put
+    /// one there. `None` is the default and the pre-bd-w2u82 shape.
+    ///
+    /// Owned by the arm so teardown is symmetric with the kernel arm's, which the
+    /// mount option `loop` attaches and `umount` detaches implicitly. Ours is
+    /// explicit because `fusermount3 -u` knows nothing about it, and a leaked loop
+    /// device pins the image file and silently breaks the NEXT run's fixture.
+    loop_device: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1160,6 +1177,15 @@ impl MountedArm {
                     format!("wait for FUSE daemon at {}", self.mountpoint.display())
                 })?;
             }
+        }
+        // bd-w2u82: detach AFTER the filesystem is down, never before — the daemon
+        // holds the device open, and detaching a busy loop leaks it silently.
+        if let Some(device) = self.loop_device.take() {
+            let detach = Command::new("sudo")
+                .args(["-n", "losetup", "-d", &device])
+                .status()
+                .with_context(|| format!("losetup -d {device}"))?;
+            ensure!(detach.success(), "losetup -d failed for {device}: {detach}");
         }
         ensure!(
             find_mount(&self.mountpoint)?.is_none(),
@@ -1224,7 +1250,17 @@ impl MountedArm {
 
 impl Drop for MountedArm {
     fn drop(&mut self) {
+        // bd-w2u82: the loop device must be released even when the mount is
+        // already gone — that is precisely the aborted-run case this guard exists
+        // for, and the early return below would otherwise leak it. A leaked loop
+        // pins the image file and breaks the NEXT run's fixture, silently.
+        let mut release_loop = || {
+            if let Some(device) = self.loop_device.take() {
+                let _ = Command::new("sudo").args(["-n", "losetup", "-d", &device]).status();
+            }
+        };
         let Ok(Some(_)) = find_mount(&self.mountpoint) else {
+            release_loop();
             return;
         };
         match &mut self.kind {
@@ -1245,6 +1281,7 @@ impl Drop for MountedArm {
                 }
             }
         }
+        release_loop();
     }
 }
 
@@ -1263,7 +1300,11 @@ fn usage() {
            --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32;\n\
                                           with a candidate comparison the schedule period is\n\
                                           12, so pairs must be a multiple of 12, default 36)\n\
-           --candidate-b-env K=V          Mount two MORE FUSE arms from the same ELF with this\n\
+           --fuse-transport file|loop     How the FUSE arm reaches its image (default file).\n\
+`loop` puts it behind a loop device so BOTH arms cross\n\
+the same block layer; the kernel arm always does, which\n\
+is a transport it pays and we otherwise do not (bd-w2u82)\n\
+--candidate-b-env K=V          Mount two MORE FUSE arms from the same ELF with this\n\
                                           extra environment, and report a within-window paired\n\
                                           candidate-vs-candidate ratio (repeatable; keys must\n\
                                           start with FFS_)\n\
@@ -1594,6 +1635,16 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
             }
             "--ffs-cli" => {
                 config.ffs_cli = parse_value::<PathBuf>(args, &mut index, "--ffs-cli")?;
+            }
+            "--fuse-transport" => {
+                let value = parse_value::<String>(args, &mut index, "--fuse-transport")?;
+                config.fuse_transport_loop = match value.as_str() {
+                    "file" => false,
+                    "loop" => true,
+                    other => bail!(
+                        "unsupported --fuse-transport {other}; expected file|loop"
+                    ),
+                };
             }
             "--artifact-root" => {
                 config.artifact_root = parse_value::<PathBuf>(args, &mut index, "--artifact-root")?;
@@ -2776,6 +2827,8 @@ fn mount_kernel(
         image: expected_image,
         mount_info: info,
         kind: MountedArmKind::Kernel,
+        // `mount -o loop` attaches and `umount` detaches this one implicitly.
+        loop_device: None,
     };
     assert_common_mount_options(&mounted.mount_info, arm.label(), read_write)?;
     ensure!(
@@ -2948,6 +3001,20 @@ fn parse_mount_dispatch_metrics(
     }))
 }
 
+/// The invoking user's numeric uid, for chowning a loop node the daemon must open.
+///
+/// Read from `id -u` rather than a libc call: this binary is `#![forbid(unsafe_code)]`
+/// and `getuid()` would need an FFI hop for a value a subprocess reports exactly.
+fn whoami_uid() -> String {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_else(|| "1000".to_owned())
+}
+
 // Keep the lifecycle linear: every identity check must remain visibly between
 // daemon spawn and the cleanup guard that owns it.
 #[allow(clippy::too_many_lines)]
@@ -2966,6 +3033,38 @@ fn mount_fuse(
         .with_context(|| format!("canonicalize mountpoint {}", mountpoint.display()))?;
     let canonical_image = fs::canonicalize(image)
         .with_context(|| format!("canonicalize image {}", image.display()))?;
+
+    // bd-w2u82: optionally put this arm behind a loop device so it crosses the
+    // same block layer the kernel arm always does. Attached BEFORE the daemon
+    // starts and recorded on the MountedArm so teardown can detach it — a leaked
+    // loop device pins the image file and silently breaks the next run's fixture.
+    let fuse_loop_device: Option<String> = if config.fuse_transport_loop {
+        let attach = Command::new("sudo")
+            .args(["-n", "losetup", "--find", "--show"])
+            .arg(&canonical_image)
+            .output()
+            .with_context(|| format!("losetup {}", canonical_image.display()))?;
+        ensure!(
+            attach.status.success(),
+            "losetup failed for {}: {}",
+            canonical_image.display(),
+            String::from_utf8_lossy(&attach.stderr).trim()
+        );
+        let device = String::from_utf8_lossy(&attach.stdout).trim().to_owned();
+        ensure!(!device.is_empty(), "losetup returned no device path");
+        // The daemon runs unprivileged; the loop node is root:disk.
+        let chown = Command::new("sudo")
+            .args(["-n", "chown", &std::env::var("UID").unwrap_or_else(|_| whoami_uid()), &device])
+            .status()
+            .with_context(|| format!("chown {device}"))?;
+        ensure!(chown.success(), "chown failed for {device}: {chown}");
+        Some(device)
+    } else {
+        None
+    };
+    let daemon_image: &Path = fuse_loop_device
+        .as_deref()
+        .map_or(canonical_image.as_path(), Path::new);
     let stdout_log = mountpoint.with_extension("stdout.log");
     let stderr_log = mountpoint.with_extension("stderr.log");
     let stdout = OpenOptions::new()
@@ -3001,7 +3100,7 @@ fn mount_fuse(
         .arg(config.btrfs_verify_data_on_read.to_string());
     let mut child = command
         .arg("--no-background-scrub")
-        .arg(image)
+        .arg(daemon_image)
         .arg(mountpoint)
         .env("FFS_AUTO_UNMOUNT", "0")
         .env("FFS_MOUNT_BENCH_EVIDENCE", "1")
@@ -3029,6 +3128,7 @@ fn mount_fuse(
             runtime_knobs: String::new(),
             candidate_env,
         },
+        loop_device: fuse_loop_device,
     };
     assert_common_mount_options(
         &mounted.mount_info,
@@ -10003,6 +10103,7 @@ mod tests {
                 source: "frankenfs".to_owned(),
                 super_options: BTreeSet::new(),
             },
+            loop_device: None,
             kind: MountedArmKind::Fuse {
                 child,
                 stdout_log: PathBuf::from("/nonexistent/stdout.log"),
