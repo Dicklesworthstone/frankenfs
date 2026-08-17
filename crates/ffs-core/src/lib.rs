@@ -29681,12 +29681,10 @@ impl OpenFs {
 
             // extent_tree first, matching the pre-bd-k74ef allocation order so
             // an unchanged single-leaf filesystem lands on the same addresses.
-            let extent_order = WriteDependencyDag::from_cow_tree(
-                alloc.extent_alloc.extent_tree(),
-                new_gen,
-            )
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?
-            .reverse_topological_order_with_levels();
+            let extent_order =
+                WriteDependencyDag::from_cow_tree(alloc.extent_alloc.extent_tree(), new_gen)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                    .reverse_topological_order_with_levels();
             while extent_pool.len() < extent_order.len() {
                 let allocation = alloc
                     .extent_alloc
