@@ -46848,7 +46848,12 @@ mod tests {
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
         let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
-        assert!(fs.prewarm_btrfs_read_plan_index(&cx).unwrap());
+        // bd-vx9mt: no `prewarm_btrfs_read_plan_index` assertion here. This image
+        // is EXT4 (`build_ext4_image_with_dir`), and the prewarm returns
+        // `Ok(false)` for any non-btrfs flavor by construction, so asserting it
+        // is true could never pass — it left `cargo test -p ffs-core` red on
+        // main from 657c0179. The two live assertions (the readdir test and the
+        // memo bench) are on btrfs images and stay.
 
         let ops: &dyn FsOps = &fs;
         let attr = ops
