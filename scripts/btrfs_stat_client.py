@@ -40,7 +40,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("mountpoint")
-    p.add_argument("--mode", choices=("path", "fstat", "lstat"), default="path")
+    p.add_argument("--mode", choices=("readdir", "path", "fstat", "lstat"),
+                   default="path",
+                   help="readdir = enumerate only, NO per-entry metadata op at all "
+                        "(the control arm); the others stat every entry the way named")
     p.add_argument("--limit", type=int, default=0,
                    help="stat at most N entries (0 = all), so a huge directory "
                         "can be sampled without changing the traversal order")
@@ -58,6 +61,19 @@ def main() -> int:
 
     done = 0
     for _ in range(max(args.passes, 1)):
+        # The readdir control does the enumeration and NOTHING else. It exists so
+        # the per-entry metadata cost can be separated from the enumeration cost
+        # without trusting an external `ls` to refrain from stat'ing -- which is
+        # not a hypothetical: on this host the interactive shell's `ls` is an
+        # alias for `lsd --inode --long --all` while a bare execvp("ls") lands on
+        # /usr/bin/ls (uutils coreutils). Those are three different workloads
+        # behind one name, so the harness defines its own.
+        if args.mode == "readdir":
+            names = os.listdir(root)
+            if args.limit:
+                names = names[:args.limit]
+            done += len(names)
+            continue
         for name in names:
             full = os.path.join(root, name)
             try:

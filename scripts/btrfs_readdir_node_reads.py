@@ -52,6 +52,18 @@ Consequences, stated because banked rows depend on which way this cuts:
   * ANY CLAIM ABOUT A COLD FIRST TRAVERSAL taken before this fix is really a claim about
     a WARM one and must be re-measured before it is relied on.
 
+WHAT THIS COUNTS IS SYSCALLS, NOT PHYSICAL I/O. Each arm's image is a fresh
+`copyfile`, so it is warm in the page cache and the daemon's `pread64`s are
+served from memory. That is deliberate — the question is how many times the
+filesystem ASKS for a node, which is a property of its caching, not of the
+storage. It does mean no row here may be read as a disk-seek or latency claim.
+
+REMAINING UNTRACED CONTACT, enumerated so it can be checked rather than assumed:
+the daemon's own MOUNT happens before the tracer attaches, and it reads 7-8
+distinct nodes (measured separately by stracing from process launch). Everything
+else the harness does — the image copy, `pgrep`, the entry count, the unmount —
+either precedes the mount or follows the traced window.
+
 Needs passwordless sudo for `strace` (yama blocks a same-user PTRACE_SEIZE here).
 `/data` is mounted `nosuid`, so `fusermount3` is refused there: `--mountpoint`
 must live under `$HOME`.
@@ -329,9 +341,16 @@ def main() -> int:
             # as `fstat` in the table rather than as the interpreter path.
             arms.append((argv[-1], argv))
     else:
-        arms = [("stat", ["ls", "-l"])]
+        # Default arms run THIS repo's client, not `ls`. `ls` is not one program
+        # on this host: the interactive shell aliases it to `lsd --inode --long
+        # --all`, while a bare execvp("ls") from a subprocess lands on
+        # /usr/bin/ls (uutils coreutils 0.2.2). A reader reproducing a banked row
+        # by typing `ls` would run a different workload than the row measured.
+        # Rows banked 2026-08-17 and earlier used `ls`/`ls -l` = uutils 0.2.2.
+        client = str(Path(__file__).with_name("btrfs_stat_client.py"))
+        arms = [("stat", [sys.executable, client, "--mode", "path"])]
         if not args.stat_only:
-            arms.insert(0, ("readdir", ["ls"]))
+            arms.insert(0, ("readdir", [sys.executable, client, "--mode", "readdir"]))
 
     print(f"{'arm':>28} {'entries':>8} {'distinct':>9} {'preads':>9} "
           f"{'reread':>9} {'per_entry':>10} {'worst':>8}")

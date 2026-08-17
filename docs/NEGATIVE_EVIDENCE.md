@@ -8958,3 +8958,56 @@ reading a 3-pass ratio without asking what else was sized to the directory. All 
 For a counting harness specifically: *enumerate every operation the harness itself performs against
 the system under test, and prove each one is either inside the measured window or provably inert.*
 The pre-labelling listdir was neither, and it sat three lines above the tracer for the whole session.
+
+## HARNESS REVIEW — 2026-08-17 — `ls` is three different programs on this host, and the harness was silently picking a third one (CreamTrout)
+
+Second pass of the self-review, applying the rule the previous entry proposed: *enumerate every
+operation the harness performs against the system under test and prove each is inside the measured
+window or provably inert.* **No runs — build and bench freeze in force** (/data 16G, 100% used).
+
+### `ls` is not one program here
+
+| how it is invoked | what actually runs |
+|---|---|
+| typed in this shell | `lsd --inode --long --all` (alias) |
+| `subprocess.run(["ls"])` — what the harness did | `/usr/bin/ls`, **uutils coreutils 0.2.2** |
+| what a reader would assume | GNU coreutils |
+
+The harness called bare `"ls"` and `"ls", "-l"` through `execvp`, so every btrfs readdir+stat row
+banked today was produced by **uutils coreutils 0.2.2** — not GNU, and not the `lsd --long --all`
+that a human gets by typing `ls` on this box. A reader reproducing a row by typing the obvious
+command would run a *stat-every-entry, show-inode* workload against a row measured with a plain
+enumeration.
+
+That did not corrupt the banked numbers — the readdir arm's flat ~12 reads against the stat arm's
+27,572 shows uutils `ls` did not resolve inodes, which is the behaviour the arm needed. But it was
+true by luck rather than by construction, and it is not reproducible by the obvious command.
+
+### Fix: the harness now defines its own workload
+
+Default arms run `scripts/btrfs_stat_client.py` instead of `ls`:
+
+* `--mode readdir` — enumeration only, no per-entry metadata op at all. This is the control arm, and
+  it is now guaranteed to be one rather than assumed to be one.
+* `--mode path` — `os.stat` per entry, the readdir+stat arm.
+
+`--client` still accepts anything, and `ls` remains usable explicitly, but no row depends on an
+unpinned external binary whose identity differs between the shell and a subprocess.
+
+### Two properties of the instrument now written down rather than implied
+
+* **It counts syscalls, not physical I/O.** Each arm's image is a fresh `copyfile`, so it is warm in
+  the page cache and the daemon's `pread64`s are served from memory. That is the right choice for
+  the question — how many times does the filesystem *ask* for a node is a property of its caching,
+  not of the storage — but it means **no row here may be read as a disk-seek or latency claim**.
+* **One untraced contact remains, and it is bounded.** The daemon's own mount runs before the tracer
+  attaches and reads 7-8 distinct nodes (measured separately by stracing from process launch).
+  Everything else the harness does either precedes the mount or follows the traced window.
+
+### Standing
+
+No banked figure changes. This entry re-attributes the *workload* behind them (uutils coreutils
+0.2.2, recorded in the harness so future rows can be told apart) and removes the dependency going
+forward. Combined with the pre-tracer-listdir defect fixed in the previous entry, the instrument's
+contact surface is now fully enumerated: image copy, mount (7-8 nodes, untraced), tracer attach,
+**the measured client**, tracer stop, entry count, unmount. NO wall-clock claim is made anywhere.
