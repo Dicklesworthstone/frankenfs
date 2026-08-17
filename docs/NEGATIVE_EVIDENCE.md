@@ -7901,3 +7901,50 @@ are still slower; that gap is neither barriers nor bytes and remains open.
 **Next, to reach the 2-block floor (bd-ygznx):** the GDT block is still written on a pure overwrite
 even though a boundary that allocates nothing leaves its descriptor content unchanged. The same
 byte-identity argument applies inside the batched persist.
+
+## METHODOLOGY — 2026-08-17 — the quiet window was not quiet, and the daemon was four hours stale: two reasons a timed row was refused (PlumBeacon)
+
+Recorded because both traps were invisible from outside the run, and both would have produced a
+confident, wrong number rather than an error.
+
+**TRAP 1: the banked `release-perf` daemon predated the levers it would have been credited with
+(bd-9jat1).** `target/release-perf/ffs-mounted-kernel-bench` was current (08:34) while
+`target/release-perf/ffs-cli` was from **05:02** — and the harness binary is the CLIENT, which
+contains none of the write path. Checked by content, not mtime:
+
+    strings target/release-perf/ffs-cli | grep -c 'flush GDT group'  -> 1   (OLD per-group path)
+    strings target/release-perf/ffs-cli | grep -c 'flush GDT:'       -> 0   (NEW batched path)
+    strings target/debug/ffs-cli        | grep -c 'flush GDT:'       -> 1   (control: check works)
+
+A `fsync-journal-commit` row run in this window would have measured the 05:02 daemon — 5 blocks per
+client fsync — and been attributed to a tree that now writes 3. **A current harness beside a stale
+daemon is the specific shape to look for**, because the two are separate binaries with separate
+mtimes and only one of them contains the filesystem.
+
+**TRAP 2: the window was not quiet, and only the per-arm sample could see it.** `uptime` at 08:44
+read `15.14`, comfortably under the defer threshold. The per-arm figures sampled *inside* the run
+minutes later:
+
+| arm | loadavg (1/5/15) | cpu MHz min / max / mean | spread |
+|---|---|---|---|
+| kernel ext4 | **31.33** / 21.15 / 18.57 | 1429 / 4043 / 2614 | 2.83x |
+| FrankenFS | **27.81** / 20.73 / 18.46 | 1429 / 4217 / 2342 | 2.95x |
+
+The 1-minute average was **above 30 during the kernel arm**, twice what the pre-run `uptime` showed,
+and the two arms' MEAN core clocks differ by **11.6%** (2614 vs 2342). A timed ratio taken here would
+have carried a ~12% clock difference between its arms and been reported as a filesystem result. This
+is the "frequency ratio wearing a costume" hazard, measured rather than argued.
+
+**The counts were completely unaffected**, which is the entire argument for counting on this host:
+across a load swing from 15 to 31 the numbers were the same exact integers — barriers `2.0000` both
+arms, kernel ext4 `4.00` blocks/fsync, FrankenFS `3.00`, idle controls `0`.
+
+**What changed as a result.** `scripts/fsync_flush_count.py` now records, per RUN, the host, kernel
+and the daemon's **ELF SHA-256**, and per ARM the loadavg and the min/max/mean/spread core clock
+sampled at the moment that arm executed. Selftest 14 -> 20 cases, including that the ELF hash
+actually separates two different files (a hash that cannot detect the stale-daemon case is
+decoration) and that the clock helpers read THIS host rather than a constant.
+
+**Rule this leaves.** A pre-run `uptime` is a screening test, not provenance. Sample load and clocks
+INSIDE the run, per arm, or the row cannot be compared with any other row — and check the DAEMON's
+identity by content, never by the mtime of the binary next to it.
