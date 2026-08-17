@@ -285,9 +285,23 @@ v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE for the daemon
         fi
         ;;
       *)
-        if ! grep -q "$kname" "$log"; then
-          echo "FATAL: arm '$2' was given $3 but '$kname' never appears in $log;"
-          echo "       treat this arm as the control, not as the lever."
+        # Check the daemon's RESOLVED self-report, not the environment it was
+        # handed. `mount_candidate_knobs` prints each knob as
+        # `<name_without_prefix_lowercased>=<effective value>`, so
+        # FFS_FUSE_READDIRPLUS_ATTR_MEMO=1 appears as
+        # `readdirplus_attr_memo=true`. Grepping for the VARIABLE name finds
+        # nothing and fails a run whose lever was in fact active -- which is what
+        # happened to the memo A/B on 2026-08-17.
+        #
+        # Falls back to the variable name for knobs that do not yet self-report,
+        # so a knob missing from the evidence line still fails closed rather than
+        # running as the control.
+        local kfield
+        kfield=$(printf '%s' "$kname" | sed 's/^FFS_FUSE_//; s/^FFS_//' | tr 'A-Z' 'a-z')
+        if ! grep -qE "$kfield=(true|1|active|[0-9]+)" "$log" && ! grep -q "$kname" "$log"; then
+          echo "FATAL: arm '$2' was given $3 but neither '$kfield=' nor '$kname'"
+          echo "       appears in $log; treat this arm as the control, not the lever."
+          sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -o "mount_candidate_knobs,.*" | head -1
           kill -INT $mp 2>/dev/null; wait $mp 2>/dev/null
           exit 8
         fi

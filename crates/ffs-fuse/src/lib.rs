@@ -706,6 +706,56 @@ fn xattr_suppression_allowed(
 ///
 /// `0`, `false` or `off` drops `FUSE_READDIRPLUS_AUTO`; anything else, including
 /// unset, keeps today's behaviour.
+/// Whether readdirplus fetches its per-entry attributes in INODE order rather
+/// than directory order (bd-xfe7z).
+///
+/// Opt-in and OFF unless set, like every other lever knob here, so an unset
+/// environment is byte-identical to before it existed and both arms of an A/B
+/// come from one ELF.
+fn readdirplus_inode_order_from_env() -> bool {
+    readdirplus_inode_order_from_value(
+        std::env::var("FFS_FUSE_READDIRPLUS_INODE_ORDER")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure half of [`readdirplus_inode_order_from_env`], split out so the parsing
+/// is testable without mutating process-global environment state.
+fn readdirplus_inode_order_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    })
+}
+
+/// Visit order for readdirplus's per-entry attribute fetches: indices into
+/// `inos`, sorted by inode number, ties broken by original position.
+///
+/// WHY THIS EXISTS (bd-xfe7z). The readdirplus handler calls `ops.getattr` once
+/// per entry, and that is `60.80%` of daemon handler time at `1.01` calls per
+/// entry -- measured, and confirmed at the call site. An ext4 directory with
+/// `dir_index` returns entries in HASH order, which bears no relation to inode
+/// order, so those fetches walk the inode table in effectively random order and
+/// each one can miss a different block. ext4 packs many inodes per block, so
+/// visiting them in inode order gives repeated hits in the block just read.
+///
+/// It returns an ORDER, not a reordering of the reply. The entries are still
+/// emitted in directory order: readdir offsets are cookies the kernel resolves
+/// positionally, so permuting the reply would corrupt continuation. Only the
+/// order in which attributes are FETCHED changes, which is invisible to the
+/// client by construction.
+///
+/// Stable on ties so two entries sharing an inode (hard links) keep their
+/// relative directory order, making the fetch order a deterministic function of
+/// the input -- an unstable sort would make the same directory produce different
+/// orders run to run and quietly cost reproducibility.
+fn readdirplus_inode_fetch_order(inos: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..inos.len()).collect();
+    order.sort_by_key(|&i| inos[i]);
+    order
+}
+
 fn readdirplus_capabilities_from_env() -> u64 {
     let forced = std::env::var("FFS_FUSE_READDIRPLUS_AUTO").is_ok_and(|value| {
         let value = value.trim();
@@ -4263,7 +4313,38 @@ impl Filesystem for FrankenFuse {
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                for entry in &entries {
+                // bd-xfe7z: optionally fetch the per-entry attributes in INODE
+                // order before emitting. Same calls, same count, same results --
+                // only the order in which the inode table is touched changes,
+                // which is what a hash-ordered (`dir_index`) directory makes
+                // random. OFF unless the knob is set, so this is inert by
+                // default and both arms of an A/B come from one ELF.
+                //
+                // Prefetching pays for entries the reply never reaches, so it is
+                // bounded by the same `reply.add` fullness break as the inline
+                // path: entries beyond the first `full` are simply never asked
+                // for. Nothing here is cached across readdir calls.
+                let prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> =
+                    if readdirplus_inode_order_from_env() {
+                        let inos: Vec<u64> = entries.iter().map(|e| e.ino.0).collect();
+                        let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
+                            (0..entries.len()).map(|_| None).collect();
+                        for index in readdirplus_inode_fetch_order(&inos) {
+                            let ino = entries[index].ino;
+                            if let Ok(attr) =
+                                self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                    self.inner.ops.getattr(cx, scope, ino)
+                                })
+                            {
+                                slots[index] = Some(attr);
+                            }
+                        }
+                        Some(slots)
+                    } else {
+                        None
+                    };
+
+                for (index, entry) in entries.iter().enumerate() {
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -4272,16 +4353,25 @@ impl Filesystem for FrankenFuse {
                     let name = OsStr::new(&owned_name);
 
                     // Get attributes for each entry
-                    let inode_attr =
-                        match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                            self.inner.ops.getattr(cx, scope, entry.ino)
-                        }) {
-                            Ok(attr) => attr,
-                            Err(_) => {
-                                // If we can't get attrs, skip this entry
-                                continue;
+                    let inode_attr = match prefetched.as_ref() {
+                        // Already fetched above, in inode order. A `None` slot is
+                        // the same failure the inline path skips on.
+                        Some(slots) => match slots[index].clone() {
+                            Some(attr) => attr,
+                            None => continue,
+                        },
+                        None => {
+                            match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                self.inner.ops.getattr(cx, scope, entry.ino)
+                            }) {
+                                Ok(attr) => attr,
+                                Err(_) => {
+                                    // If we can't get attrs, skip this entry
+                                    continue;
+                                }
                             }
-                        };
+                        }
+                    };
                     // bd-q0xnl: hand these attributes to the getattr the kernel
                     // issues for this same inode moments from now, so the daemon
                     // does not recompute what it just computed.
@@ -5231,7 +5321,6 @@ impl Filesystem for FrankenFuse {
     }
 }
 
-
 /// Handler bodies split out of the `Filesystem` impl so tests can drive them.
 ///
 /// They MUST live here, in an inherent impl AFTER the trait impl closes.
@@ -6006,7 +6095,10 @@ mod tests {
             );
         }
         for on in ["1", "true", "on", "TRUE", " 1 "] {
-            assert!(ReaddirplusAttrMemo::enabled_from_value(Some(on)), "{on:?} must enable");
+            assert!(
+                ReaddirplusAttrMemo::enabled_from_value(Some(on)),
+                "{on:?} must enable"
+            );
         }
     }
 
@@ -7151,8 +7243,14 @@ mod tests {
     fn every_mount_entry_point_resolves_the_xattr_switch_bd_ha71t() {
         const SOURCE: &str = include_str!("lib.rs");
         let mut checked = 0;
-        for entry in ["pub fn mount(", "pub fn mount_background(", "pub fn mount_managed("] {
-            let start = SOURCE.find(entry).unwrap_or_else(|| panic!("{entry} must exist"));
+        for entry in [
+            "pub fn mount(",
+            "pub fn mount_background(",
+            "pub fn mount_managed(",
+        ] {
+            let start = SOURCE
+                .find(entry)
+                .unwrap_or_else(|| panic!("{entry} must exist"));
             // The call must appear before the entry point's body ends. Bounding
             // by the next `\npub fn ` keeps this from being satisfied by a call
             // in some later function.
@@ -7186,10 +7284,25 @@ mod tests {
         // ones that were silently lost; the rest are here so the next accidental
         // split is caught wherever it lands.
         for handler in [
-            "fn lookup(", "fn getattr(", "fn setattr(", "fn readdir(", "fn read(",
-            "fn write(", "fn create(", "fn mknod(", "fn mkdir(", "fn unlink(",
-            "fn rmdir(", "fn rename(", "fn flush(", "fn fsync(", "fn open(",
-            "fn getxattr(", "fn setxattr(", "fn listxattr(", "fn removexattr(",
+            "fn lookup(",
+            "fn getattr(",
+            "fn setattr(",
+            "fn readdir(",
+            "fn read(",
+            "fn write(",
+            "fn create(",
+            "fn mknod(",
+            "fn mkdir(",
+            "fn unlink(",
+            "fn rmdir(",
+            "fn rename(",
+            "fn flush(",
+            "fn fsync(",
+            "fn open(",
+            "fn getxattr(",
+            "fn setxattr(",
+            "fn listxattr(",
+            "fn removexattr(",
         ] {
             assert!(
                 span.contains(handler),
@@ -7325,6 +7438,113 @@ mod tests {
         );
     }
 
+    /// bd-xfe7z: the inode-order knob must be opt-IN and inert when unset.
+    ///
+    /// Same polarity rule as every other lever knob here: an unset environment
+    /// has to be byte-identical to before the knob existed, so that both arms of
+    /// an A/B can come from one ELF and the OFF arm is genuinely today's code.
+    #[test]
+    fn readdirplus_inode_order_knob_is_opt_in_bd_xfe7z() {
+        assert!(!readdirplus_inode_order_from_value(None));
+        for off in [
+            "0", "false", "off", "", "  ", "yes", "2", "auto", "ON!", "no",
+        ] {
+            assert!(
+                !readdirplus_inode_order_from_value(Some(off)),
+                "{off:?} must not enable the reordering"
+            );
+        }
+        for on in ["1", "true", "on", "TRUE", "On", " 1 "] {
+            assert!(
+                readdirplus_inode_order_from_value(Some(on)),
+                "{on:?} must enable"
+            );
+        }
+    }
+
+    /// bd-xfe7z: the fetch order visits every entry exactly once, in inode
+    /// order, and is a PERMUTATION -- never a filter.
+    ///
+    /// The load-bearing property is the permutation one. This order decides
+    /// which slot each fetched attribute lands in; if it ever dropped or
+    /// duplicated an index, entries would silently receive another entry's
+    /// attributes, which is a correctness bug that looks like a performance
+    /// change.
+    #[test]
+    fn readdirplus_inode_fetch_order_is_a_permutation_in_inode_order_bd_xfe7z() {
+        // Hash-ordered directory: inode numbers arrive in no useful order. This
+        // is the case the lever exists for.
+        let inos = [900_u64, 12, 4001, 7, 55, 12_000, 3];
+        let order = readdirplus_inode_fetch_order(&inos);
+
+        assert_eq!(order.len(), inos.len(), "never a filter");
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..inos.len()).collect::<Vec<_>>(),
+            "every index exactly once: a dropped or repeated index would give an \
+             entry another entry's attributes"
+        );
+
+        let visited: Vec<u64> = order.iter().map(|&i| inos[i]).collect();
+        let mut ascending = visited.clone();
+        ascending.sort_unstable();
+        assert_eq!(visited, ascending, "must walk the inode table upward");
+
+        // Already-ascending input must be left exactly as it is -- the lever
+        // must not shuffle a directory that is already laid out well.
+        let sorted = [1_u64, 2, 3, 4];
+        assert_eq!(readdirplus_inode_fetch_order(&sorted), vec![0, 1, 2, 3]);
+
+        assert!(readdirplus_inode_fetch_order(&[]).is_empty());
+        assert_eq!(readdirplus_inode_fetch_order(&[42]), vec![0]);
+    }
+
+    /// bd-xfe7z: hard links (repeated inode numbers) keep their relative
+    /// directory order.
+    ///
+    /// Stability is not cosmetic here. An unstable sort would make the same
+    /// directory produce different fetch orders run to run, so an A/B would be
+    /// comparing two arms that each vary, and a reproducer would stop
+    /// reproducing.
+    #[test]
+    fn readdirplus_inode_fetch_order_is_stable_on_duplicate_inodes_bd_xfe7z() {
+        // Three names on inode 5, one on inode 1: the 5s must stay in the order
+        // the directory listed them.
+        let inos = [5_u64, 1, 5, 5];
+        assert_eq!(readdirplus_inode_fetch_order(&inos), vec![1, 0, 2, 3]);
+    }
+
+    /// bd-xfe7z: the ORDER is not the REPLY. Reordering fetches must leave the
+    /// emitted sequence in directory order.
+    ///
+    /// This is the property that makes the lever safe at all. readdir offsets
+    /// are continuation cookies the kernel resolves positionally, so permuting
+    /// the reply would corrupt resumption -- a client would skip or repeat
+    /// entries across calls. The handler indexes prefetched slots by ORIGINAL
+    /// position for exactly this reason, and this pins the round trip.
+    #[test]
+    fn readdirplus_inode_order_never_permutes_the_reply_bd_xfe7z() {
+        let inos = [900_u64, 12, 4001, 7];
+        let names = ["d", "b", "z", "a"];
+
+        // Simulate the handler: fetch in inode order into slots indexed by
+        // original position, then emit by walking positions in order.
+        let mut slots: Vec<Option<u64>> = vec![None; inos.len()];
+        for index in readdirplus_inode_fetch_order(&inos) {
+            slots[index] = Some(inos[index]);
+        }
+        let emitted: Vec<(&str, u64)> = (0..inos.len())
+            .map(|i| (names[i], slots[i].expect("every slot filled")))
+            .collect();
+
+        assert_eq!(
+            emitted,
+            vec![("d", 900), ("b", 12), ("z", 4001), ("a", 7)],
+            "the reply must stay in DIRECTORY order even though the fetches did not"
+        );
+    }
     #[test]
     fn readdirplus_auto_knob_only_drops_the_auto_bit_bd_4ypbv() {
         assert_eq!(

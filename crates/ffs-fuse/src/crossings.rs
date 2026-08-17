@@ -239,7 +239,10 @@ mod tests {
         assert!(line.contains("dispatch_ns_lookup=0"), "{line}");
         assert!(line.contains("dispatch_ns_total=22003"), "{line}");
         for op in CrossingOp::ALL {
-            assert!(line.contains(&format!("dispatch_ns_{}=", op.label())), "{line}");
+            assert!(
+                line.contains(&format!("dispatch_ns_{}=", op.label())),
+                "{line}"
+            );
         }
     }
 
@@ -328,7 +331,10 @@ mod tests {
         assert!(line.contains("crossings_readdirplus=1"), "{line}");
         assert!(line.contains("crossings_total=1"), "{line}");
         for op in CrossingOp::ALL {
-            assert!(line.contains(&format!("crossings_{}=", op.label())), "{line}");
+            assert!(
+                line.contains(&format!("crossings_{}=", op.label())),
+                "{line}"
+            );
         }
     }
 
