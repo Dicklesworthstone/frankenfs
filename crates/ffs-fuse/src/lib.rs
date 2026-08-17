@@ -4442,143 +4442,6 @@ impl Filesystem for FrankenFuse {
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         self.removexattr_impl(ino, name, reply);
     }
-}
-
-impl FrankenFuse {
-    /// The `setxattr` handler body, minus the `Request` it never reads.
-    ///
-    /// Split out so a test can drive it (bd-ha71t). `fuser::Request::new` is
-    /// `pub(crate)`, so a handler taking one cannot be called from this crate's
-    /// tests at all -- which is why the refusal below had no test until now, and
-    /// why `auto` stayed restricted to read-only mounts on an argument nobody
-    /// could check.
-    fn setxattr_impl(
-        &mut self,
-        ino: u64,
-        name: &OsStr,
-        value: &[u8],
-        flags: i32,
-        position: u32,
-        reply: ReplyEmpty,
-    ) {
-        if self.inner.read_only {
-            reply.error(libc::EROFS);
-            return;
-        }
-        // The kernel has been told this filesystem has no xattrs and has stopped
-        // asking; accepting one now would store data no reader could ever get
-        // back. Refusing is the only coherent answer while the switch is thrown.
-        if xattr_unsupported_from_env() {
-            reply.error(xattr_switch_errno(XattrHandler::Write));
-            return;
-        }
-        let cx = Self::cx_for_request();
-        if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Setxattr) {
-            warn!(ino, "backpressure: shedding setxattr");
-            reply.error(errno);
-            return;
-        }
-        let Some(name) = name.to_str() else {
-            reply.error(libc::EINVAL);
-            return;
-        };
-        // Invalidate BEFORE dispatching, and unconditionally (bd-yu6jz). Before,
-        // so no concurrent probe can re-memoize an absence between the write
-        // landing and the memo being cleared; unconditionally, because a setxattr
-        // that fails partway is not a promise the xattr is still absent. Losing a
-        // memo entry costs one format lookup; keeping a stale one reports a
-        // capability that exists as missing.
-        self.inner.missing_capability_xattr.forget(InodeNumber(ino));
-        self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
-        match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
-            Ok(_) => reply.ok(),
-            Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
-            Err(MutationDispatchError::Operation { error: e, .. }) => {
-                let mode = match Self::parse_setxattr_mode(flags, position) {
-                    Ok(mode) => mode,
-                    Err(errno) => {
-                        reply.error(errno);
-                        return;
-                    }
-                };
-                if matches!(mode, XattrSetMode::Replace)
-                    && matches!(e, FfsError::NotFound(_))
-                    && self
-                        .inner
-                        .ops
-                        .getattr(&cx, &mut RequestScope::empty(), InodeNumber(ino))
-                        .is_ok()
-                {
-                    reply.error(Self::missing_xattr_errno());
-                    return;
-                }
-                Self::reply_error_empty(
-                    &FuseErrorContext {
-                        error: &e,
-                        operation: "setxattr",
-                        ino,
-                        offset: None,
-                    },
-                    reply,
-                );
-            }
-        }
-    }
-
-    /// The `removexattr` handler body, minus the `Request` it never reads.
-    /// Split for the same reason as [`Self::setxattr_impl`].
-    fn removexattr_impl(&mut self, ino: u64, name: &OsStr, reply: ReplyEmpty) {
-        if self.inner.read_only {
-            reply.error(libc::EROFS);
-            return;
-        }
-        // The kernel has been told this filesystem has no xattrs and has stopped
-        // asking; accepting one now would store data no reader could ever get
-        // back. Refusing is the only coherent answer while the switch is thrown.
-        if xattr_unsupported_from_env() {
-            reply.error(xattr_switch_errno(XattrHandler::Write));
-            return;
-        }
-        let cx = Self::cx_for_request();
-        if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Removexattr) {
-            warn!(ino, "backpressure: shedding removexattr");
-            reply.error(errno);
-            return;
-        }
-        let Some(name) = name.to_str() else {
-            reply.error(libc::EINVAL);
-            return;
-        };
-
-        // Same rule as setxattr: clear first, unconditionally (bd-yu6jz). A remove
-        // makes the xattr absent, so a stale entry would be harmless here — but a
-        // FAILED remove leaves it present, and re-memoizing absence around that is
-        // the case worth being careful about.
-        self.inner.missing_capability_xattr.forget(InodeNumber(ino));
-        self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
-        match self.with_request_scope(&cx, RequestOp::Removexattr, |cx, scope| {
-            let removed = self
-                .inner
-                .ops
-                .removexattr(cx, scope, InodeNumber(ino), name)?;
-            self.inner.ops.commit_request_scope(scope)?;
-            Ok(removed)
-        }) {
-            Ok(true) => reply.ok(),
-            Ok(false) => reply.error(Self::missing_xattr_errno()),
-            Err(e) => {
-                Self::reply_error_empty(
-                    &FuseErrorContext {
-                        error: &e,
-                        operation: "removexattr",
-                        ino,
-                        offset: None,
-                    },
-                    reply,
-                );
-            }
-        }
-    }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
         // Same one-way switch as `getxattr`, via `fc->no_listxattr`. Both must be
@@ -5321,6 +5184,154 @@ impl FrankenFuse {
                         error: &e,
                         operation: "create",
                         ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+}
+
+
+/// Handler bodies split out of the `Filesystem` impl so tests can drive them.
+///
+/// They MUST live here, in an inherent impl AFTER the trait impl closes.
+/// Splitting them INLINE is what broke `create`, `mknod`, `mkdir` and `flush`
+/// in 75ae6053: the extra brace ended `impl Filesystem for FrankenFuse` early,
+/// so every handler defined below it silently became an inherent method and
+/// fuser answered the kernel from its own default trait bodies -- `ENOSYS`,
+/// on both filesystems. It compiled and 616 tests passed, because an inherent
+/// method with the same name and signature is valid Rust. Only a live mount
+/// could see it.
+impl FrankenFuse {
+    /// The `setxattr` handler body, minus the `Request` it never reads.
+    ///
+    /// Split out so a test can drive it (bd-ha71t). `fuser::Request::new` is
+    /// `pub(crate)`, so a handler taking one cannot be called from this crate's
+    /// tests at all -- which is why the refusal below had no test until now, and
+    /// why `auto` stayed restricted to read-only mounts on an argument nobody
+    /// could check.
+    fn setxattr_impl(
+        &mut self,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        // The kernel has been told this filesystem has no xattrs and has stopped
+        // asking; accepting one now would store data no reader could ever get
+        // back. Refusing is the only coherent answer while the switch is thrown.
+        if xattr_unsupported_from_env() {
+            reply.error(xattr_switch_errno(XattrHandler::Write));
+            return;
+        }
+        let cx = Self::cx_for_request();
+        if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Setxattr) {
+            warn!(ino, "backpressure: shedding setxattr");
+            reply.error(errno);
+            return;
+        }
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        // Invalidate BEFORE dispatching, and unconditionally (bd-yu6jz). Before,
+        // so no concurrent probe can re-memoize an absence between the write
+        // landing and the memo being cleared; unconditionally, because a setxattr
+        // that fails partway is not a promise the xattr is still absent. Losing a
+        // memo entry costs one format lookup; keeping a stale one reports a
+        // capability that exists as missing.
+        self.inner.missing_capability_xattr.forget(InodeNumber(ino));
+        self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
+        match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
+            Ok(_) => reply.ok(),
+            Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
+            Err(MutationDispatchError::Operation { error: e, .. }) => {
+                let mode = match Self::parse_setxattr_mode(flags, position) {
+                    Ok(mode) => mode,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                };
+                if matches!(mode, XattrSetMode::Replace)
+                    && matches!(e, FfsError::NotFound(_))
+                    && self
+                        .inner
+                        .ops
+                        .getattr(&cx, &mut RequestScope::empty(), InodeNumber(ino))
+                        .is_ok()
+                {
+                    reply.error(Self::missing_xattr_errno());
+                    return;
+                }
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "setxattr",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    /// The `removexattr` handler body, minus the `Request` it never reads.
+    /// Split for the same reason as [`Self::setxattr_impl`].
+    fn removexattr_impl(&mut self, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        // The kernel has been told this filesystem has no xattrs and has stopped
+        // asking; accepting one now would store data no reader could ever get
+        // back. Refusing is the only coherent answer while the switch is thrown.
+        if xattr_unsupported_from_env() {
+            reply.error(xattr_switch_errno(XattrHandler::Write));
+            return;
+        }
+        let cx = Self::cx_for_request();
+        if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Removexattr) {
+            warn!(ino, "backpressure: shedding removexattr");
+            reply.error(errno);
+            return;
+        }
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        // Same rule as setxattr: clear first, unconditionally (bd-yu6jz). A remove
+        // makes the xattr absent, so a stale entry would be harmless here — but a
+        // FAILED remove leaves it present, and re-memoizing absence around that is
+        // the case worth being careful about.
+        self.inner.missing_capability_xattr.forget(InodeNumber(ino));
+        self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
+        match self.with_request_scope(&cx, RequestOp::Removexattr, |cx, scope| {
+            let removed = self
+                .inner
+                .ops
+                .removexattr(cx, scope, InodeNumber(ino), name)?;
+            self.inner.ops.commit_request_scope(scope)?;
+            Ok(removed)
+        }) {
+            Ok(true) => reply.ok(),
+            Ok(false) => reply.error(Self::missing_xattr_errno()),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "removexattr",
+                        ino,
                         offset: None,
                     },
                     reply,
@@ -7025,6 +7036,63 @@ mod tests {
     /// masks exactly the `ENOTSUP` the test exists to see.
     ///
     /// This drives the handler directly, so nothing can mask it.
+    /// bd-ha71t regression pin: EVERY FUSE handler must be inside the
+    /// `Filesystem` trait impl.
+    ///
+    /// This exists because I broke `create`, `mknod`, `mkdir` and `flush` on BOTH
+    /// filesystems in 75ae6053 by splitting two handler bodies into an inherent
+    /// impl INLINE. The extra brace closed `impl Filesystem for FrankenFuse`
+    /// early; every handler defined below it became an inherent method with the
+    /// same name and signature, which is valid Rust, so it compiled and 617 unit
+    /// tests passed. fuser then answered the kernel from its own default trait
+    /// bodies -- `ENOSYS` -- and the only symptom was a live mount refusing to
+    /// create a file. I misread that as a btrfs limitation and banked a ledger
+    /// row saying so.
+    ///
+    /// A type-level check cannot catch it: naming the method resolves to the
+    /// trait DEFAULT and compiles either way. So this reads the source and pins
+    /// the span, which is the cheapest thing that actually fails.
+    #[test]
+    fn every_fuse_handler_lives_inside_the_filesystem_trait_impl_bd_ha71t() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("\nimpl Filesystem for FrankenFuse {\n")
+            .expect("the trait impl must exist");
+        let end = start
+            + SOURCE[start..]
+                .find("\n}\n")
+                .expect("the trait impl must close");
+        let span = &SOURCE[start..end];
+
+        // Handlers a mount cannot work without. `create`/`mknod`/`mkdir` are the
+        // ones that were silently lost; the rest are here so the next accidental
+        // split is caught wherever it lands.
+        for handler in [
+            "fn lookup(", "fn getattr(", "fn setattr(", "fn readdir(", "fn read(",
+            "fn write(", "fn create(", "fn mknod(", "fn mkdir(", "fn unlink(",
+            "fn rmdir(", "fn rename(", "fn flush(", "fn fsync(", "fn open(",
+            "fn getxattr(", "fn setxattr(", "fn listxattr(", "fn removexattr(",
+        ] {
+            assert!(
+                span.contains(handler),
+                "`{handler}` is not inside `impl Filesystem for FrankenFuse`. If it \
+                 moved to an inherent impl, the kernel now gets fuser's default \
+                 answer (ENOSYS) for it and the mount is broken even though this \
+                 crate compiles and its tests pass"
+            );
+        }
+
+        // And the split bodies must NOT be in the trait impl: they are not trait
+        // methods, so their presence would mean the brace moved the other way.
+        for inherent in ["fn setxattr_impl(", "fn removexattr_impl("] {
+            assert!(
+                !span.contains(inherent),
+                "`{inherent}` is not a `Filesystem` method and cannot live in the \
+                 trait impl"
+            );
+        }
+    }
+
     #[test]
     fn an_active_switch_refuses_setxattr_on_a_writable_mount_bd_ha71t() {
         let sender = RecordingSender::default();
