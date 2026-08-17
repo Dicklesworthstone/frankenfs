@@ -9538,3 +9538,41 @@ pass with the negative cases written first — not a tail-end edit after a long 
 
 NO wall-clock claim is made in this entry; the sizing of this lever is UNMEASURED, per this session's
 standing correction that node counts are not a wall-clock currency.
+
+## REGRESSION I SHIPPED, AND THE HOLE IN MY OWN VERIFICATION — 2026-08-17 — bd-42gtq corrupted every image after the SECOND commit (PlumBeacon)
+
+**What I shipped.** bd-42gtq (a6ba0717) made the btrfs commit reuse unchanged tree blocks instead of
+rewriting them. It was verified against kernel readback and `btrfs check` at 2000 / 5000 / 20000 files
+and all three were clean. They were clean for a reason I did not notice: **`make_btrfs_fixture.py`
+performs ONE commit.** The map is empty on the first commit, so nothing is reused, so the defect
+cannot appear.
+
+**The defect.** Every commit opens by purging the FS/CSUM/EXTENT/ROOT trees' extent items
+(`remove_metadata_items_owned_by_roots`, bd-x36qn). That was safe only because every block was then
+rewritten and re-filed by `alloc_metadata_for_tree`. A block the new code REUSES takes neither path,
+so its backref stayed purged:
+
+    tree extent[30408704, 16384] root 5 has no backref item in extent tree   (x8, and more)
+    ERROR: errors found in extent allocation tree or chunk allocation
+    root 5 root dir 256 not found
+
+Found by the mounted comparator's own post-run `btrfs check`, on a `fsync-journal-commit` run — the
+first multi-commit btrfs workload the lever had ever seen.
+
+**The fix.** Re-file the backref for a reused block, at the block's OWN generation (not `new_gen` —
+the block on disk still carries the old one, and an item claiming otherwise is a backref generation
+mismatch, bd-qxo5x). Verified on the exact reproduction: 8 fsyncs / 10 commits through a real mount,
+`btrfs check` **no error found**, where the same workload produced 8+ missing backrefs before. The
+lever is unaffected: still 1.389x, still 102400 bytes/fsync.
+
+**THE LESSON IS ABOUT THE VERIFICATION, NOT THE BUG.** Every gate I ran was a SINGLE-COMMIT gate, and
+the lever's whole mechanism only engages on the second commit. A lever whose behaviour is defined by
+what a PREVIOUS commit left behind cannot be verified by a workload that commits once, and I ran that
+workload three times at three sizes and read three passes as coverage.
+
+**What changed so it cannot recur silently.** `scripts/fsync_flush_count.py` drives N commits through
+a real mount and previously only counted. It now runs `btrfs check --readonly` / `e2fsck -fn` on the
+FUSE image before reporting any number, and REFUSES the run if the image is dirty. Proven non-vacuous
+both ways: it rejects the pre-fix image ("FATAL: the FUSE arm left the image INCONSISTENT") and
+accepts the post-fix one. A measurement tool that drives the write path and does not check what it
+left behind was one line short of being a correctness gate.

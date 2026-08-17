@@ -29416,12 +29416,7 @@ impl OpenFs {
                 // otherwise is a backref generation mismatch (bd-qxo5x).
                 alloc
                     .extent_alloc
-                    .ensure_self_metadata_item(
-                        bytenr,
-                        level,
-                        BTRFS_FS_TREE_OBJECTID,
-                        block_gen,
-                    )
+                    .ensure_self_metadata_item(bytenr, level, BTRFS_FS_TREE_OBJECTID, block_gen)
                     .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                 continue;
             }
