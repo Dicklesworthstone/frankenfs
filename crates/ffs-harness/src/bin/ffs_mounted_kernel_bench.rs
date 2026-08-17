@@ -4875,18 +4875,42 @@ fn load_is_settled(one: f64, five: f64, low_threshold: f64, convergence: f64) ->
 /// STILL NOT ESTABLISHED: the direction or magnitude of any load-to-frequency
 /// relationship. Readings here have gone both ways and single sweeps cannot settle it.
 fn cpu_mhz() -> BTreeMap<usize, f64> {
-    let mut out = BTreeMap::new();
     let Ok(raw) = std::fs::read_to_string("/proc/cpuinfo") else {
-        return out;
+        return BTreeMap::new();
     };
+    parse_cpu_mhz(&raw)
+}
+
+/// Strip a `/proc/cpuinfo` value off its key: `\t\t: 3423.725` -> `3423.725`.
+///
+/// THIS IS THE BUG THAT MADE EVERY PER-ARM CLOCK FIGURE NULL (bd-cpu-mhz). The
+/// previous code did `trim_start_matches([':', ' '])` and then `trim()`. But
+/// `/proc/cpuinfo` separates key from value with TABS, and a tab is in neither
+/// the char set nor... it IS removed by `trim()` — except `trim()` ran second, so
+/// by then the leading tabs had blocked the colon from ever being stripped. The
+/// value stayed `": 3423.725"`, `parse::<f64>` failed, and the map came back
+/// EMPTY. Both the `processor` line and the `cpu MHz` line hit it, so nothing
+/// was ever collected.
+///
+/// Downstream that was silent: `cpu_mhz_summary` returns `None` for an empty
+/// set, the JSON fields serialise as `null`, and five banked rows recorded "this
+/// harness emits no MHz field" — a parse bug reported as a missing feature,
+/// because a null field looks exactly like an absent one.
+///
+/// Order matters: whitespace first, THEN the colon, then whitespace again.
+fn cpuinfo_value(raw: &str) -> &str {
+    raw.trim().trim_start_matches(':').trim()
+}
+
+/// Pure half of [`cpu_mhz`], so the tab handling is testable without a host.
+fn parse_cpu_mhz(raw: &str) -> BTreeMap<usize, f64> {
+    let mut out = BTreeMap::new();
     let mut cpu: Option<usize> = None;
     for line in raw.lines() {
         if let Some(v) = line.strip_prefix("processor") {
-            cpu = v.trim_start_matches([':', ' ']).trim().parse().ok();
+            cpu = cpuinfo_value(v).parse().ok();
         } else if let Some(v) = line.to_ascii_lowercase().strip_prefix("cpu mhz") {
-            if let (Some(c), Ok(mhz)) =
-                (cpu, v.trim_start_matches([':', ' ']).trim().parse::<f64>())
-            {
+            if let (Some(c), Ok(mhz)) = (cpu, cpuinfo_value(v).parse::<f64>()) {
                 out.insert(c, mhz);
             }
         }
@@ -9883,6 +9907,55 @@ mod tests {
     /// image under test. So this predicate decides whether a real run proceeds,
     /// and BOTH of its failure directions are expensive: a false negative seeds
     /// into the wrong filesystem, a false positive refuses every run forever.
+
+    /// bd-cpu-mhz: /proc/cpuinfo separates key from value with TABS, and the
+    /// parser must survive that.
+    ///
+    /// This is the regression test for a silent provenance failure. The old
+    /// parser stripped `[':', ' ']` before trimming whitespace, so the leading
+    /// tabs blocked the colon, every parse failed, the map came back EMPTY, and
+    /// the per-arm clock fields serialised as `null`. Five banked rows then
+    /// recorded "this harness emits no MHz field" — a parse bug reported as a
+    /// missing feature, because a null field is indistinguishable from an absent
+    /// one when you are reading the output rather than the code.
+    ///
+    /// The fixture below is the REAL layout, tabs included, taken from this
+    /// host: `cpu MHz\t\t: 3423.725`.
+    #[test]
+    fn parse_cpu_mhz_handles_tab_separated_cpuinfo_bd_cpu_mhz() {
+        let raw = "processor\t: 0\n\
+                   model name\t: AMD Ryzen Threadripper PRO 5975WX 32-Cores\n\
+                   cpu MHz\t\t: 3423.725\n\
+                   \n\
+                   processor\t: 1\n\
+                   cpu MHz\t\t: 1429.000\n";
+
+        let mhz = parse_cpu_mhz(raw);
+        assert_eq!(mhz.len(), 2, "both processors parsed: {mhz:?}");
+        assert!((mhz[&0] - 3423.725).abs() < 1e-6, "{mhz:?}");
+        assert!((mhz[&1] - 1429.0).abs() < 1e-6, "{mhz:?}");
+
+        // The failure mode itself: a non-empty cpuinfo that yields NOTHING is the
+        // signature of this bug, so pin that a well-formed input never does.
+        assert!(
+            !parse_cpu_mhz(raw).is_empty(),
+            "a populated cpuinfo must never parse to an empty map"
+        );
+
+        // Space-separated input must keep working too — the fix must not trade
+        // one separator for the other.
+        let spaced = "processor : 3\ncpu MHz : 4292.0\n";
+        let mhz = parse_cpu_mhz(spaced);
+        assert!((mhz[&3] - 4292.0).abs() < 1e-6, "{mhz:?}");
+
+        // A `cpu MHz` line before any `processor` line has no CPU to attach to
+        // and must be dropped rather than mis-attributed to CPU 0.
+        assert!(parse_cpu_mhz("cpu MHz\t\t: 3000.0\n").is_empty());
+
+        // Garbage values are skipped, not defaulted to zero: a 0 MHz core would
+        // make the max/min spread infinite and poison the summary.
+        assert!(parse_cpu_mhz("processor\t: 0\ncpu MHz\t\t: n/a\n").is_empty());
+    }
     #[test]
     fn path_is_mounted_matches_only_the_mount_point_field_bd_seed_mnt() {
         let mounts = concat!(

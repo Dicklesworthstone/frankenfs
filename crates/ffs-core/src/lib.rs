@@ -29955,162 +29955,20 @@ impl OpenFs {
         // Update alloc state generation
         alloc.generation = new_gen;
 
-        // bd-x36qn / bd-myrgc: make the extent_tree's and root_tree's OWN leaves
-        // self-describing. Both were just written (extent at `extent_tree_bytenr`,
-        // root at `root_tree_bytenr`) and are reachable from the superblock but
-        // carry no EXTENT_ITEM — which btrfs check rejects, and that single gap
-        // cascades into spurious "no backref" reports for every other (correct)
-        // extent. When the extent tree is a single leaf (the common small-fs
-        // case), insert their skinny METADATA_ITEMs + inline TREE_BLOCK_REFs and
-        // re-serialize that one leaf at its SAME address, so the root_tree's
-        // EXTENT_TREE ROOT_ITEM (already pointing there) stays valid. Larger
-        // multi-node extent trees fall back to the previous behaviour.
+        // bd-x36qn / bd-myrgc / bd-k74ef: the extent tree and the root tree are
+        // self-describing by the time we get here — every block of both, not
+        // just their roots — because the fixpoint before the extent-tree write
+        // reserved each block's address and filed its skinny METADATA_ITEM +
+        // inline TREE_BLOCK_REF, and both trees were then serialized ONCE onto
+        // those addresses. The old re-serialize-the-single-leaf-in-place step is
+        // gone with them: it existed only because the items were inserted after
+        // the tree had already been written, which is also why it could describe
+        // no more than one leaf.
         //
-        // bd-4cxkd: the superblock `bytes_used` recomputed from the final extent
-        // tree, set inside the single-leaf path below once every extent item is
-        // present. `None` => fall-back path; leave the on-disk value untouched.
-        let mut recomputed_bytes_used: Option<u64> = None;
-        // bd-xmh5g.193: when the FREE_SPACE_TREE is rewritten in place below,
-        // the accounting recompute and the free-space derivation scan the exact
-        // same per-block-group extent keys. Compute both in one fused pass and
-        // carry the free-space groups here so the second scan is eliminated.
-        let mut fused_free_groups: Option<Vec<ffs_btrfs::BlockGroupFreeSpace>> = None;
+        // What is left below is the free-space-tree rewrite. It is unchanged,
+        // including its single-leaf gate — that gate is about the FST, not about
+        // self-description, and widening it is a separate lever.
         if alloc.extent_alloc.extent_tree_root_is_leaf() {
-            alloc
-                .extent_alloc
-                .insert_self_metadata_item(
-                    extent_tree_bytenr,
-                    extent_tree_level,
-                    BTRFS_EXTENT_TREE_OBJECTID,
-                    new_gen,
-                )
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            alloc
-                .extent_alloc
-                .insert_self_metadata_item(
-                    root_tree_bytenr,
-                    root_tree_level,
-                    BTRFS_ROOT_TREE_OBJECTID,
-                    new_gen,
-                )
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-            // bd-qxo5x: the reused FREE_SPACE_TREE block is rewritten at new_gen
-            // below, so bump its loaded extent-item generation to match before
-            // the extent leaf is re-serialized (else btrfs check reports a
-            // backref generation mismatch for it).
-            if let Some((fst_addr, fst_level)) = fst_reuse {
-                alloc
-                    .extent_alloc
-                    .set_tree_block_generation(fst_addr, fst_level, new_gen)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            }
-
-            // bd-4cxkd: every extent item this transaction touches is now in the
-            // extent tree (self metadata items just above, data extent items from
-            // the writes, csum/free-space tree blocks). Recompute each block
-            // group's used_bytes as the sum of its extent items (what btrfs check
-            // does) and patch the on-disk BLOCK_GROUP_ITEMs + superblock
-            // bytes_used, so a net-new data extent no longer trips "block group
-            // used N but extent items used M" / "super bytes used ... mismatch".
-            if fst_reuse.is_some() {
-                // Fused single-scan accounting + free-space derivation: the
-                // FREE_SPACE_TREE rewrite below would otherwise re-scan the same
-                // extent keys a second time (bd-xmh5g.193).
-                let (bytes_used, free_groups) = alloc
-                    .extent_alloc
-                    .sync_accounting_and_free_space()
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                recomputed_bytes_used = Some(bytes_used);
-                fused_free_groups = Some(free_groups);
-            } else {
-                recomputed_bytes_used = Some(
-                    alloc
-                        .extent_alloc
-                        .sync_block_group_accounting()
-                        .map_err(|e| btrfs_mutation_to_ffs(&e))?,
-                );
-            }
-
-            // Only re-serialize when the two inserts kept the extent tree a
-            // single leaf; otherwise its root bytenr would have changed and the
-            // root_tree's pointer would be stale (fall back, leave as written).
-            //
-            // bd-k74ef, DIAGNOSED 2026-08-17 and it is NOT this branch. Measured
-            // missing-backref counts from `btrfs check`, one image per size:
-            //
-            //     2000 files ->  0        (root tree and extent tree are one block each)
-            //     5000 files ->  4        (1 for root 1, 3 for root 2)
-            //    20000 files -> 10        (1 for root 1, 9 for root 2)
-            //
-            // The errors are "tree extent[...] root N has no backref item in
-            // extent tree", and they scale with the NUMBER OF BLOCKS in the root
-            // and extent trees. That is bd-4nz82's deliberate tradeoff -- it
-            // skips EXTENT_ITEM insertion for these trees' own blocks, on the
-            // reasoning that "the blocks are small, missing refs don't affect
-            // mount or data access, and btrfs check stays clean". It stays clean
-            // only while each tree fits in ONE block, because exactly two
-            // EXTENT_ITEMs are inserted, one per tree. Past that, every
-            // additional block is a missing backref.
-            //
-            // So the fix is to insert a backref per block rather than per tree,
-            // which allocates into the extent tree while recording it -- the
-            // fixpoint bd-4nz82 declined to iterate to. Making THIS branch flush
-            // more nodes does not help: I tried it twice (the second attempt
-            // mapped the post-insert COW root explicitly onto extent_tree_bytenr)
-            // and `btrfs check` output was byte-identical, because the accounting
-            // was never the missing piece.
-            //
-            // The first attempt is still worth its warning: I tried to generalize this to multi-node trees by
-            // rewriting every node to the address THIS transaction allocated for
-            // it, and it REGRESSED the single-leaf case from a clean `btrfs
-            // check` to "tree extent[...] root 2 has no backref item". The
-            // reason is worth leaving here: the two accounting inserts COW the
-            // tree, so the root block ID afterwards is NOT the one that was
-            // pre-allocated. The old code sidesteps that by writing whatever the
-            // CURRENT root is to `extent_tree_bytenr`; a generalization keyed on
-            // the pre-allocation map fails its own precondition and silently
-            // skips the write the old path performed. Any fix has to handle the
-            // post-insert COW identity, not just the node count.
-            if alloc.extent_alloc.extent_tree_root_is_leaf() {
-                let leaf_block = alloc.extent_alloc.extent_tree().root_block();
-                let mut addrs = std::collections::BTreeMap::new();
-                addrs.insert(leaf_block, extent_tree_bytenr);
-                let self_ctx = DiskWritebackContext::with_allocated_addresses(
-                    sb.fsid,
-                    sb.fsid,
-                    new_gen,
-                    BTRFS_EXTENT_TREE_OBJECTID,
-                    nodesize,
-                    alloc.sectorsize,
-                    addrs,
-                );
-                let serialized = self_ctx
-                    .serialize_node(alloc.extent_alloc.extent_tree(), leaf_block, 0)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                let physical =
-                    resolve_physical(extent_tree_bytenr).map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                self.dev
-                    .write_all_at(cx, ByteOffset(physical), &serialized)
-                    .map_err(|e| {
-                        FfsError::Io(std::io::Error::other(format!(
-                            "self-describe extent leaf write failed: {e}"
-                        )))
-                    })?;
-                self.dev.sync(cx)?;
-            } else {
-                // Observability only, no behaviour change: this is the exact
-                // moment block-group accounting stops reaching disk, and until
-                // now it happened silently. `btrfs check` reports it much later
-                // as "errors found in extent allocation tree or chunk
-                // allocation" on an image that mounts and reads back perfectly.
-                warn!(
-                    "extent-tree accounting NOT flushed: the tree is no longer a single \
-                     leaf, so block-group accounting on disk is stale and btrfs check \
-                     will object (bd-k74ef)"
-                );
-            }
-
             // bd-qxo5x: rewrite the FREE_SPACE_TREE in place from the now-final
             // extent tree, so its free ranges reflect this transaction's
             // allocations. btrfs check [4/8] rejects a stale free-space tree
