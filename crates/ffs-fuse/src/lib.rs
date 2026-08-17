@@ -1705,8 +1705,20 @@ pub struct AtomicMetrics {
     /// Successful path-based metadata requests (getattr/statx) observed at
     /// the FUSE boundary, including memo-served replies (bd-0c4av).
     pub metadata_requests: CacheLinePadded<AtomicU64>,
-    /// Cumulative time inside the WHOLE FUSE handler, summed over the four
-    /// metadata opcodes, in ns (bd-4zokj).
+    /// Cumulative time inside the WHOLE FUSE handler, summed over the metadata
+    /// handlers that install a [`HandlerTimer`], in ns (bd-4zokj).
+    ///
+    /// Those are `getattr`, `lookup`, `readdir`, `readdirplus` and `getxattr`.
+    /// The list is stated rather than described because it was wrong once:
+    /// `readdirplus` was missing while `readdir` was present, so on a
+    /// readdir+stat workload -- where the kernel answers through readdirplus --
+    /// this counter saw 43 invocations against 40661 dispatch scopes, and
+    /// "handler minus dispatch" excluded the handler doing the work.
+    ///
+    /// It is NOT comparable to the sum of the `*_dispatch_*` counters: those
+    /// count request SCOPES, including the ones opened inside readdirplus per
+    /// entry, so the two families differ by construction and dividing one into
+    /// the other produced a 645.98% share once.
     ///
     /// The `*_dispatch_nanos` counters bracket only `self.inner.ops.<op>(..)`.
     /// Everything else a request costs — header decode, argument parse, the memo
@@ -4417,6 +4429,14 @@ impl Filesystem for FrankenFuse {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        // bd-4zokj: readdirplus was the ONE metadata handler without a whole-
+        // handler timer, while its sibling `readdir` had one. On a readdir+stat
+        // workload the kernel answers through readdirplus, so `handler_total_*`
+        // counted only the stray calls that fell outside it -- 43 invocations
+        // against 40661 dispatch scopes in the same run -- and any
+        // "handler minus dispatch" reasoning silently excluded the handler
+        // doing the work.
+        let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         let Ok(fs_offset) = u64::try_from(offset) else {
