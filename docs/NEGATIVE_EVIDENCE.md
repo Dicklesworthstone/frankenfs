@@ -10030,3 +10030,88 @@ recorded on bd-4sull, which already argues this gate is unreachable here.
 
 Disk: `disk_free_before_bytes=221640499200`, `after=219386523648`; the run left 2.1G under
 `/data/tmp/ffs-cert-creamtrout`.
+
+## ADMITTED, AND THE LOAD-DEPENDENCE SURVIVES IT — 2026-08-17 — btrfs fsync at 192 pairs is 0.449048x with both nulls clear (PlumBeacon)
+
+Fourth run of btrfs `fsync-journal-commit`, same candidate `c9fb745f`, doubled to **192 pairs** in the
+cleanest window of the session (pre-run loadavg 10.35, CPU idle 82%, iowait 0, verified with `vmstat`).
+
+    fuse_over_kernel_median=0.449048, ci_low=0.444672, ci_high=0.451959
+    pairs=192, crossover_blocks=48, twice_null_margin_ratio=1.034910
+    directional_claim_clear=true, admitted=true, verdict=HONEST_WIN
+    kernel null 0.995218 spread 1.017305 CLEAR | fuse null 0.991905 spread 1.015658 CLEAR
+
+**Doubling the pairs did exactly what the failure pattern predicted.** Five of my six earlier runs were
+`BLOCKED_NULL` on SPREAD and never on median; spread tightens as sqrt(pairs). Going 96 -> 192 took the
+null spreads from 1.022-1.033 to **1.0157 and 1.0173**, both comfortably inside the 1.025 limit, and
+the ratio CI to +/-0.8%. That is a harness-tuning result worth more than this one row: **on this host
+the fsync row needs 192 pairs, not 96, and the gate that was blocking was always the spread.**
+
+**But the load-dependence is not refuted — it is reinforced.** All four runs, ordered by how busy the
+placement CPUs actually got (`peak_placement_mean_busy`, a better covariate than loadavg because it
+measures the CPUs the arms ran on):
+
+| run | pairs | loadavg 1m | peak placement busy | ratio | verdict |
+|---|---|---|---|---|---|
+| C | 96 | 14.96 | — | **0.533114** | BLOCKED (kernel null spread) |
+| A | 96 | 31.21 | ~0.747 | 0.461109 | ADMITTED |
+| B | 96 | 34.54 | — | 0.463280 | BLOCKED (fuse null spread) |
+| D | 192 | 10.35 -> 23.56 | **0.937** | **0.449048** | **ADMITTED** |
+
+Run D started in the quietest window and ran for 2m52s, during which load went 10 -> 23.6 and the
+placement CPUs peaked at **93.7% busy** — the busiest of any run. It also produced the most favourable
+ratio. The ordering by busyness (0.533 quiet, 0.449-0.463 busy) holds across all four.
+
+**So the headline stays conservative.** The harness has now admitted this row twice, at `0.461109x`
+and `0.449048x`, and both admitted runs were the busy ones. The quietest measurement remains
+`0.533114x` and it was blocked only on null spread — a precision failure, not a validity one, and its
+null MEDIANS were 0.9868 and 0.9913. **Quote `~0.533x` (about 1.88x faster) as the defensible figure
+and treat 0.449-0.461 as what the row reads when the host is loaded.** The direction is now
+established by four independent runs; only the magnitude is window-sensitive.
+
+**The obvious next run, and it is cheap:** 192 pairs in a window that STAYS quiet for the full three
+minutes. That is the one measurement that would settle the magnitude, because it would have both the
+tight spreads of D and the quiet placement of C. Run D shows the window has to hold for the duration,
+not just at launch — checking `uptime` before the run is not sufficient provenance, and
+`peak_placement_mean_busy` from the run's own report is.
+
+## MECHANISM — 2026-08-17 — the memo's second consumer does NOT reintroduce the bd-79li3 random-access tax: 0.981442x, CI spanning 1.0 (bd-yu6jz, bd-79li3)
+
+Discharges the risk I flagged when landing `e99e91d9d`. That change routed the capability probe
+through `btrfs_floor_leaf_memo`, giving the memo a **second consumer** — and bd-79li3 measured that
+memo TAXING random-access metadata 8.6x, because a miss REPLACES it on every descent. More consumers
+means more replacement pressure on workloads without locality, so this had to be checked rather than
+assumed.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, harness
+`cargo test -p ffs-core --lib bd_5vis3_random -- --ignored`, mean CPU 2857.6 MHz over 64 CPUs,
+loadavg 16.49/15.53/18.50, **idle 84.3%, iowait 0.1%**, df 204G. One ELF, env-toggled A/B, so ISA and
+PGO cancel (bd-b9dug class C).
+
+    btrfs_floor_memo_does_not_tax_random_access_bd_5vis3_random
+      wall ratio median  0.981442x   bootstrap_median_ci95 [0.944286, 1.149033]   PASS
+
+Below 1.0 means the memo taxes this workload. The test's own note records that it measured
+**0.116x** — the 8.6x tax — before bd-79li3's miss-streak gate landed. With the gate in place AND the
+probe added as a second consumer, the random-access arm is **0.981442x with a CI spanning 1.0**:
+neutral, not improved, and emphatically not the 8.6x regression.
+
+**So the gate holds under a second consumer.** That is the specific thing that could have made
+`e99e91d9d` a net loss on a workload class it never measured, and it did not.
+
+⚠️ Read as neutral, not as a win: the CI [0.944286, 1.149033] contains 1.0, so this arm decides only
+that the tax is absent. It does not license any claim that the probe change helped random access.
+
+### Window, recorded because a run was declined on it
+
+Reported as "load 13, CPU idle 80 pct, no builds — clean window". Verified: **idle 82.3% then
+73-80% across five further samples, iowait 0.0%** — the idle figure was accurate. But 17-24 CPUs sat
+above 25% busy (best sample 17), and two `rustc` processes were running, so "no builds" was not.
+
+A timed row was NOT taken, and the reason is now calibrated rather than guessed: on the previous
+attempt my pre-run check measured **15 CPUs above 25%** and the harness then recorded
+**48 external busy CPUs** with `contended_fraction = 1.0000` during the arms. A 10-second snapshot
+understates what a multi-minute run sees by roughly 3x. At a best sample of 17 — worse than the 15
+that already produced a CONTENDED block — spending a run and 2.1G of artifacts to reproduce that
+verdict is not a good trade. **The candidate ELF is already built (`c3eac8bd3ad7d920…`), so the next
+genuine trough can be used immediately without the build that consumed the last one.**
