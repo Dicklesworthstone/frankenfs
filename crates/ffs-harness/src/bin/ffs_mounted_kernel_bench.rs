@@ -7062,15 +7062,25 @@ fn fs_report(
         // instead of it: the pair distinguishes "the machine was idle" from "our arms
         // were clocked unequally".
         let all: BTreeSet<usize> = mhz.keys().copied().collect();
-        let placement: BTreeSet<usize> = placement
-            .driver_cpus
-            .iter()
-            .chain(placement.fuse_cpus.iter())
-            .copied()
-            .collect();
-        let placement_summary = cpu_mhz_summary(&mhz, &placement).map(|(min, max, mean, spread)| {
-            json!({"min": min, "max": max, "mean": mean, "spread": spread})
-        });
+        let driver_cpus: BTreeSet<usize> = placement.driver_cpus.iter().copied().collect();
+        let fuse_cpus: BTreeSet<usize> = placement.fuse_cpus.iter().copied().collect();
+        let placement: BTreeSet<usize> = driver_cpus.union(&fuse_cpus).copied().collect();
+        let summarise = |cpus: &BTreeSet<usize>| {
+            cpu_mhz_summary(&mhz, cpus).map(|(min, max, mean, spread)| {
+                json!({"min": min, "max": max, "mean": mean, "spread": spread})
+            })
+        };
+        let placement_summary = summarise(&placement);
+        // bd-cpu-mhz: PER ARM, not merged. The union figure says the two arms
+        // together spanned some range; it cannot say WHICH arm was slow, and that
+        // is the question actually open. Measured on btrfs readdir+stat: union
+        // spread 3.0049 (1429.008-4294.087 MHz) with only the FUSE arm's A/A null
+        // failing while the kernel arm's was tight at 1.006896. One arm failing
+        // while its twin is clean is not ambient contention, so the hypothesis is
+        // that the fuse arm landed on a core parked at the 1429 MHz floor -- and
+        // the union summary is exactly the shape that cannot confirm or refute it.
+        let driver_summary = summarise(&driver_cpus);
+        let fuse_summary = summarise(&fuse_cpus);
         cpu_mhz_summary(&mhz, &all).map(|(min, max, mean, spread)| {
             json!({
                 "min": min,
@@ -7081,6 +7091,10 @@ fn fs_report(
                 "spread": spread,
                 // The figure that can actually corrupt a ratio: the arms' own cores.
                 "placement": placement_summary,
+                // ...and the same figure split by ARM, so a spread can be
+                // attributed instead of merely noted.
+                "driver": driver_summary,
+                "fuse": fuse_summary,
             })
         })
     };
@@ -9936,6 +9950,66 @@ mod tests {
     /// /proc/cpuinfo does not exist or carries no `cpu MHz` line, because both
     /// are legitimate elsewhere (containers, non-x86, some VMs) and a test that
     /// failed there would be reporting the platform rather than the code.
+
+    /// bd-cpu-mhz: a per-ARM clock summary attributes a spread that the merged
+    /// figure can only report.
+    ///
+    /// This is the shape of the real observation it exists to resolve. On btrfs
+    /// readdir+stat the placement spread was 3.0049x (1429.008-4294.087 MHz),
+    /// and only the FUSE arm's A/A null failed while the kernel arm's was tight
+    /// at 1.006896. The union summary is identical whether the parked core
+    /// belonged to the fuse arm or the driver arm, so it cannot distinguish the
+    /// hypothesis from its opposite. Splitting by arm can.
+    #[test]
+    fn cpu_mhz_summary_attributes_a_spread_to_one_arm_bd_cpu_mhz() {
+        // One arm on boosted cores, the other holding a core parked at the floor.
+        let mhz: BTreeMap<usize, f64> = [
+            (8, 4294.087),
+            (9, 4290.0),
+            (24, 1429.008), // the parked core
+            (25, 4294.087),
+        ]
+        .into_iter()
+        .collect();
+
+        let driver: BTreeSet<usize> = [8, 9].into_iter().collect();
+        let fuse: BTreeSet<usize> = [24, 25].into_iter().collect();
+        let union: BTreeSet<usize> = driver.union(&fuse).copied().collect();
+
+        let (_, _, _, driver_spread) = cpu_mhz_summary(&mhz, &driver).expect("driver summary");
+        let (_, _, _, fuse_spread) = cpu_mhz_summary(&mhz, &fuse).expect("fuse summary");
+        let (_, _, _, union_spread) = cpu_mhz_summary(&mhz, &union).expect("union summary");
+
+        assert!(
+            driver_spread < 1.01,
+            "driver arm is evenly clocked: {driver_spread}"
+        );
+        assert!(
+            fuse_spread > 2.9,
+            "fuse arm holds the parked core: {fuse_spread}"
+        );
+
+        // THE POINT: the union cannot tell these apart. It reports the same
+        // ~3x whichever arm owns the parked core, so a run that only records the
+        // union can note a spread but never attribute it.
+        assert!(
+            (union_spread - fuse_spread).abs() < 1e-6,
+            "the union is dominated by the worst arm and so is indistinguishable \
+             from it: union {union_spread}, fuse {fuse_spread}"
+        );
+        let swapped_driver: BTreeSet<usize> = [24, 25].into_iter().collect();
+        let (_, _, _, swapped_spread) =
+            cpu_mhz_summary(&mhz, &swapped_driver).expect("swapped summary");
+        assert!(
+            (swapped_spread - fuse_spread).abs() < 1e-6,
+            "swapping which ARM owns the parked core leaves the union unchanged, \
+             which is precisely why the union cannot answer the question"
+        );
+
+        // An empty arm set yields None rather than a degenerate 1.0 spread: a
+        // missing arm must not read as a perfectly-clocked one.
+        assert!(cpu_mhz_summary(&mhz, &BTreeSet::new()).is_none());
+    }
     #[test]
     fn cpu_mhz_reads_this_host_bd_cpu_mhz() {
         let Ok(raw) = std::fs::read_to_string("/proc/cpuinfo") else {
