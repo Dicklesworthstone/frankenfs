@@ -9419,3 +9419,64 @@ needs no quiet window.
 
 This also closes bd-3zx2x: its acceptance was the comparison, and the comparison now exists.
 NO wall-clock claim is made in this entry.
+
+## METHODOLOGY — 2026-08-17 — the certification gate was not reachable ONCE in five minutes of the quietest window of the day, so bd-4sull's completion path is impossible as written (CreamTrout)
+
+Eight times this session I was told the window was clean and eight times the gate disagreed. Rather
+than report a ninth refusal, I measured the question underneath it: **is the gate reachable on this
+host at all?**
+
+Method: the veto's own metric — CPUs above 25% busy — sampled every 10 seconds for 5 minutes,
+starting during what was described as "the cleanest certification window in hours" (loadavg 7.98).
+
+    samples             30, over 5 minutes
+    CPUs >25% busy      min = 9    median = 15    max = 64
+    veto limit          2
+    samples at/below    0 / 30
+    loadavg1 range      8.37 - 35.82
+
+**Not one sample in thirty met the condition**, and the best observation was 9 CPUs against a limit
+of 2 — more than four times the ceiling, at the quietest moment of the day.
+The maximum was 64 — every core on the box — inside the same five minutes that began at loadavg 7.98.
+That loadavg range, 8.37 to 35.82, is also the eighth and now quantified demonstration that loadavg
+does not track this gate.
+
+⚠️ **One caveat that bounds the claim, and it is real.** The veto counts *off-placement* CPUs — those
+not used by the run's own daemon and clients — whereas this sampled all 64. A run placing on 9 CPUs
+would exclude 9 from the count, so my figures are an UPPER BOUND on what the veto would see. The
+practical gap is small here because the busy CPUs belong to other projects' processes rather than to
+any placement I would choose, but the honest statement is: the gate was unreachable **as measured
+across all CPUs**, and a placement-aware count would be somewhat lower.
+
+**What this does to bd-4sull.**
+
+Provenance for this section, since it reasons about another bead's numbers:
+`executed_on: thinkstation1`, kernel `6.17.0-41-generic`, mean CPU 2477.8 MHz over 64 CPUs, loadavg 7.98→35.48
+across the sampling, df 239G→235G. No ELF is cited because **no binary was executed** — this samples
+`/proc/stat` only, and cites bd-4sull's figures as that bead recorded them rather than re-deriving
+them. No ratio here is a vs-incumbent measurement.
+
+bd-4sull is the bead holding the argument that the `external_load_during_run` veto should be demoted.
+Its own stated completion path is:
+
+> "the same five runs plus at least two taken in a genuinely quiet window (contended_fraction near 0),
+> so the contended cluster can be compared against a clean anchor"
+
+**That anchor is not obtainable on this host.** The bead has been waiting since 2026-08-16 for a
+condition that did not occur once in thirty consecutive samples of the best window of the day. A bead
+blocked on an unobtainable precondition is not blocked, it is stalled, and it should be re-scoped
+rather than left to wait.
+
+That does not decide the veto question — this measures *availability*, not *validity*, and bd-4sull's
+integrity check (every row the veto refuses on these workloads is an HONEST_LOSS, so admitting them
+cannot manufacture a win) remains the substantive argument. What it establishes is that the
+comparison bd-4sull specified cannot be run here, so the bead must either acquire a quieter host,
+lower its anchor definition to the best obtainable contention level, or make its case without one.
+
+**Practical consequence, already landed.**
+
+`scripts/quiet_window_check.sh` (committed in 408645bc1) prints this metric and exits non-zero when a
+timed row would be refused. Given the distribution above, the honest default for this host is that
+**timed vs-incumbent rows are not currently obtainable**, and counted mechanisms — which is what every
+row I have banked this session is — are not a second-best but the only instrument that works here.
+NO wall-clock claim is made in this entry; it is a measurement of the measuring conditions.
