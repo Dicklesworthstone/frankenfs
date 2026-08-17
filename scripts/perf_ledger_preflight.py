@@ -105,7 +105,7 @@ CONTRACT_COUNTED_MECHANISM = re.compile(
     # failing before, 232 after). It buys expressiveness for new rows only, so it
     # cannot launder existing debt.
     r"\b\d[\d,]*\s+(?:instructions?|cycles?|syscalls?|allocations?|faults?"
-    r"|requests?|probes?)"
+    r"|requests?|probes?|dispatch scopes?|crossings?)"
     r"[^|\n]{0,80}(?:vs|->|→|to)\s*\d[\d,]*",
     re.I,
 )

@@ -711,6 +711,45 @@ fn xattr_suppression_allowed(
 ///
 /// Opt-in and OFF unless set, like every other lever knob here, so an unset
 /// environment is byte-identical to before it existed and both arms of an A/B
+/// Whether the readdirplus attribute fill uses ONE request scope for the whole
+/// batch instead of one per inode (bd-xfe7z).
+///
+/// Opt-IN, so an unset environment is byte-identical to the per-inode path.
+///
+/// The target is measured, not assumed: on readdir+stat with the capability
+/// probe suppressed, `getattr` owns 60.80% of daemon dispatch time at 1.01
+/// scopes per entry, while wire crossings are 0.0053 per entry. The readdir
+/// scope has already closed by the time the fill runs, so every entry opens its
+/// own. This collapses N scope opens to 1 while leaving the fetch ORDER --
+/// inode order, which buys the inode-table locality -- untouched.
+///
+/// It is a separate knob from `FFS_FUSE_READDIRPLUS_INODE_ORDER` on purpose. The
+/// batch fill lives inside the inode-order path, so folding them into one flag
+/// would make an A/B measure ordering and scoping together and attribute the
+/// result to whichever the reader had in mind.
+fn readdirplus_batch_attrs_from_env() -> bool {
+    readdirplus_batch_attrs_from_value(
+        std::env::var("FFS_FUSE_READDIRPLUS_BATCH_ATTRS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure half of [`readdirplus_batch_attrs_from_env`], split out so the parsing
+/// is testable without mutating process-global environment state.
+fn readdirplus_batch_attrs_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    })
+}
+
+/// Effective batch-fill state for this process, for the comparator's knob line.
+#[must_use]
+pub fn readdirplus_batch_attrs_enabled() -> bool {
+    readdirplus_batch_attrs_from_env()
+}
+
 /// come from one ELF.
 fn readdirplus_inode_order_from_env() -> bool {
     readdirplus_inode_order_from_value(
@@ -4320,10 +4359,27 @@ impl Filesystem for FrankenFuse {
                 // random. OFF unless the knob is set, so this is inert by
                 // default and both arms of an A/B come from one ELF.
                 //
-                // Prefetching pays for entries the reply never reaches, so it is
-                // bounded by the same `reply.add` fullness break as the inline
-                // path: entries beyond the first `full` are simply never asked
-                // for. Nothing here is cached across readdir calls.
+                // ⛔ MEASURED HARMFUL 2026-08-17 — DO NOT ENABLE. Left in place,
+                // default OFF and inert, as the evidence for a rejected lever.
+                //
+                // The sentence that used to be here claimed prefetching is
+                // "bounded by the same `reply.add` fullness break as the inline
+                // path". That is FALSE, and writing it is what let the mistake
+                // through: the prefetch runs BEFORE any `reply.add`, so entries
+                // past the fill point are fetched, discarded when the loop
+                // breaks, and fetched AGAIN when the kernel re-issues readdir
+                // from that offset. Nothing is cached across readdir calls, so
+                // the overshoot is paid every time.
+                //
+                // Internal A/B, one ELF (v3+PGO), alternated off/on/off/on:
+                // getattr calls 40407 -> 104761 (2.59x, identical in both ON
+                // runs, so structural not noise), and getattr ns/entry
+                // 433.9/370.0 -> 554.8/535.6. The ordering win, if any, is
+                // buried under ~61% wasted fetches.
+                //
+                // A future attempt must bound the prefetch to what the reply can
+                // actually hold BEFORE fetching. That is the hard part and it is
+                // why this is rejected rather than iterated.
                 let prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> =
                     if readdirplus_inode_order_from_env() {
                         let inos: Vec<u64> = entries.iter().map(|e| e.ino.0).collect();
@@ -4347,16 +4403,31 @@ impl Filesystem for FrankenFuse {
                         // nothing, the 60.80% is the attribute fetch itself and
                         // the next lever belongs in the format layer.
                         let order: Vec<usize> = readdirplus_inode_fetch_order(&inos);
-                        let ordered: Vec<InodeNumber> =
-                            order.iter().map(|index| entries[*index].ino).collect();
-                        if let Ok(results) =
-                            self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                                Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
-                            })
-                        {
-                            for (slot_index, result) in order.iter().zip(results) {
-                                if let Ok(attr) = result {
-                                    slots[*slot_index] = Some(attr);
+                        if readdirplus_batch_attrs_from_env() {
+                            let ordered: Vec<InodeNumber> =
+                                order.iter().map(|index| entries[*index].ino).collect();
+                            if let Ok(results) =
+                                self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                    Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
+                                })
+                            {
+                                for (slot_index, result) in order.iter().zip(results) {
+                                    if let Ok(attr) = result {
+                                        slots[*slot_index] = Some(attr);
+                                    }
+                                }
+                            }
+                        } else {
+                            // The control: one request scope per inode, which is
+                            // what 1.01 scopes/entry measures.
+                            for index in order {
+                                let ino = entries[index].ino;
+                                if let Ok(attr) =
+                                    self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                        self.inner.ops.getattr(cx, scope, ino)
+                                    })
+                                {
+                                    slots[index] = Some(attr);
                                 }
                             }
                         }
@@ -6103,6 +6174,27 @@ mod tests {
     /// read as "the stashing path never executed" when it actually meant "the
     /// feature was off", and that misreading nearly retired an unmeasured lever
     /// aimed at 60.80% of daemon dispatch time.
+    /// bd-xfe7z: the batch-fill knob must be opt-IN and must be its own flag.
+    ///
+    /// Separate from FFS_FUSE_READDIRPLUS_INODE_ORDER because the batch fill
+    /// lives inside the inode-order path: one flag for both would make an A/B
+    /// measure ordering and scoping together and let the reader attribute the
+    /// result to whichever they had in mind.
+    #[test]
+    fn the_readdirplus_batch_attrs_knob_is_opt_in_bd_xfe7z() {
+        assert!(
+            !readdirplus_batch_attrs_from_value(None),
+            "unset must keep the per-inode scope path, so an unset environment is \
+             byte-identical to before"
+        );
+        for off in ["0", "false", "off", "", "  ", "yes", "2", "enabled", "ON!"] {
+            assert!(!readdirplus_batch_attrs_from_value(Some(off)), "{off:?} must not enable");
+        }
+        for on in ["1", "true", "on", "TRUE", " 1 "] {
+            assert!(readdirplus_batch_attrs_from_value(Some(on)), "{on:?} must enable");
+        }
+    }
+
     #[test]
     fn the_readdirplus_memo_knob_is_opt_in_and_self_reports_bd_q0xnl() {
         assert!(
