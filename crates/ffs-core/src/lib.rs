@@ -37970,64 +37970,6 @@ fn skipped_free_space_tree_rewrite_clears_the_feature_bits_bd_73bi2() {
 // imports (serde_json, tracing_subscriber, sha2). `cargo test` still passed,
 // which is why it survived: only a plain `cargo build` can see it.
 #[cfg(test)]
-
-/// bd-73bi2: the on-disk generation check, as a truth table.
-///
-/// The negative cases are the whole point. A proxy for this invariant has
-/// already been wrong once — the original guard compared the tree's
-/// generation against the transaction's, which stopped meaning anything as
-/// soon as the tree was correctly held back, and was disabled rather than
-/// re-derived. These assertions are about the pair the KERNEL compares.
-#[test]
-fn free_space_tree_generation_check_is_about_the_pair_the_kernel_compares_bd_73bi2() {
-    // The good case: pointer and block agree. Note this holds at a
-    // generation OLDER than the transaction's — an untouched tree keeping
-    // its own generation is ordinary btrfs, and a check that demanded
-    // `new_gen` here would refuse every correct commit.
-    assert!(btrfs_free_space_tree_generation_matches(9, Some(9)));
-
-    // The P0 itself: the pointer was advanced, the block was not rewritten.
-    assert!(
-        !btrfs_free_space_tree_generation_matches(10, Some(9)),
-        "wanted 10 found 9 is the exact kernel complaint this exists to prevent"
-    );
-
-    // The reverse skew is equally fatal and must not be waved through just
-    // because the block looks 'newer'.
-    assert!(!btrfs_free_space_tree_generation_matches(9, Some(10)));
-
-    // An unreadable block must FAIL, never pass. Treating `None` as a pass
-    // would make a truncated or failed read look like a verified tree.
-    assert!(
-        !btrfs_free_space_tree_generation_matches(9, None),
-        "a block we cannot read is a block we cannot vouch for"
-    );
-    assert!(
-        !btrfs_free_space_tree_generation_matches(0, None),
-        "generation 0 must not be confused with an absent read"
-    );
-}
-
-/// bd-73bi2: the header reader, including the short-buffer case that makes
-/// the `None`-is-failure rule reachable.
-#[test]
-fn btrfs_header_generation_reads_offset_0x50_and_rejects_short_buffers_bd_73bi2() {
-    let mut header = vec![0u8; ffs_btrfs::BTRFS_HEADER_SIZE];
-    header[0x50..0x58].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
-    assert_eq!(
-        btrfs_header_generation(&header),
-        Some(0x0123_4567_89ab_cdef)
-    );
-
-    // A zero generation is a real value, distinct from an absent one.
-    let zeroed = vec![0u8; ffs_btrfs::BTRFS_HEADER_SIZE];
-    assert_eq!(btrfs_header_generation(&zeroed), Some(0));
-
-    // One byte short of containing the field.
-    assert_eq!(btrfs_header_generation(&vec![0u8; 0x57]), None);
-    assert_eq!(btrfs_header_generation(&[]), None);
-}
-
 mod tests {
     // This (very large) test module relaxes pedantic/nursery style lints plus a
     // few default-level noise lints that accumulated while ffs-core's clippy was
@@ -38045,6 +37987,64 @@ mod tests {
         clippy::needless_pass_by_ref_mut,
         clippy::doc_lazy_continuation
     )]
+
+    /// bd-73bi2: the on-disk generation check, as a truth table.
+    ///
+    /// The negative cases are the whole point. A proxy for this invariant has
+    /// already been wrong once — the original guard compared the tree's
+    /// generation against the transaction's, which stopped meaning anything as
+    /// soon as the tree was correctly held back, and was disabled rather than
+    /// re-derived. These assertions are about the pair the KERNEL compares.
+    #[test]
+    fn free_space_tree_generation_check_is_about_the_pair_the_kernel_compares_bd_73bi2() {
+        // The good case: pointer and block agree. Note this holds at a
+        // generation OLDER than the transaction's — an untouched tree keeping
+        // its own generation is ordinary btrfs, and a check that demanded
+        // `new_gen` here would refuse every correct commit.
+        assert!(btrfs_free_space_tree_generation_matches(9, Some(9)));
+
+        // The P0 itself: the pointer was advanced, the block was not rewritten.
+        assert!(
+            !btrfs_free_space_tree_generation_matches(10, Some(9)),
+            "wanted 10 found 9 is the exact kernel complaint this exists to prevent"
+        );
+
+        // The reverse skew is equally fatal and must not be waved through just
+        // because the block looks 'newer'.
+        assert!(!btrfs_free_space_tree_generation_matches(9, Some(10)));
+
+        // An unreadable block must FAIL, never pass. Treating `None` as a pass
+        // would make a truncated or failed read look like a verified tree.
+        assert!(
+            !btrfs_free_space_tree_generation_matches(9, None),
+            "a block we cannot read is a block we cannot vouch for"
+        );
+        assert!(
+            !btrfs_free_space_tree_generation_matches(0, None),
+            "generation 0 must not be confused with an absent read"
+        );
+    }
+
+    /// bd-73bi2: the header reader, including the short-buffer case that makes
+    /// the `None`-is-failure rule reachable.
+    #[test]
+    fn btrfs_header_generation_reads_offset_0x50_and_rejects_short_buffers_bd_73bi2() {
+        let mut header = vec![0u8; ffs_btrfs::BTRFS_HEADER_SIZE];
+        header[0x50..0x58].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
+        assert_eq!(
+            btrfs_header_generation(&header),
+            Some(0x0123_4567_89ab_cdef)
+        );
+
+        // A zero generation is a real value, distinct from an absent one.
+        let zeroed = vec![0u8; ffs_btrfs::BTRFS_HEADER_SIZE];
+        assert_eq!(btrfs_header_generation(&zeroed), Some(0));
+
+        // One byte short of containing the field.
+        assert_eq!(btrfs_header_generation(&vec![0u8; 0x57]), None);
+        assert_eq!(btrfs_header_generation(&[]), None);
+    }
+
     use super::*;
     use asupersync::SystemPressure;
     use ffs_types::{
