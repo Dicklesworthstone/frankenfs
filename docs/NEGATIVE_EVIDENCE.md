@@ -7802,3 +7802,50 @@ writes carry the same final bytes.
 
 **Measured with** `scripts/fsync_flush_count.py` (load-independent, exact integers). The acceptance
 for the fix is the per-fsync block count, re-run with the same command, plus e2fsck rc 0.
+
+## WIN — 2026-08-17 — bd-fv9tc: GDT write amplification 1.250x -> 1.000x, at parity with kernel ext4 (PlumBeacon)
+
+**Lever.** Coalesce the group-descriptor flush by DESCRIPTOR BLOCK instead of by GROUP. The old path
+called `persist_group_desc_force` per group, each ending in `dev.rmw_block`, and 64 descriptors share
+a 4096-byte block — so a `G`-group filesystem issued `G` device writes to `ceil(G/64)` blocks at
+every durability boundary. New `ffs_alloc::persist_group_descs_batched` reads each descriptor block
+once, applies every descriptor living in it, and writes once.
+
+**Measured LIVE, incumbent in the SAME invocation, `scripts/fsync_flush_count.py`:**
+
+| | barriers/fsync | bytes/fsync | blocks/fsync | vs kernel ext4 |
+|---|---|---|---|---|
+| kernel ext4 | 2.0000 | 16384 | 4.00 | — |
+| FrankenFS BEFORE | 2.0000 | 20480 | 5.00 | **1.250x** |
+| FrankenFS AFTER | 2.0000 | 16384 | 4.00 | **1.000x** |
+
+Reproduced at N=8, 64 and 256, exact integers, both idle controls 0 in every run. The duplicate
+write of block 1 is gone: the per-fsync write set went from `{0, 4096, 4096, 667648, 18210816}` to
+`{0, 4096, 667648, 18210816}` — four distinct blocks, one write each.
+
+**On the 2-group test image this is 5 blocks -> 4. The change is `G -> ceil(G/64)`, so on an 8 GB
+filesystem it is 64 GDT writes -> 1, and on 256 GB it is 2048 -> 32.** The measured 1.250x is the
+smallest instance of the defect that exists, not its size; the test image is the reason it looks
+modest.
+
+**Correctness.** `e2fsck -fn` exit 0 on the image the fixed daemon wrote. The stated negative case
+was run too — a workload that ALLOCATES and FREES (600 files of 8 KiB created past EOF, 200 removed,
+touching block bitmaps, inode bitmaps, descriptors and superblock free counts): `e2fsck -fn` exit 0.
+An overwrite-only test could not have caught a broken batch, because an overwrite dirties no bitmap.
+Suites: ffs-alloc 219 passed, ffs-core 1223 passed, 0 failed. Clippy clean on ffs-alloc.
+
+**Regression test** `persist_group_descs_batched_matches_sequential_bd_fv9tc` asserts BYTE-IDENTITY
+against the per-group sequence over 130 groups (three descriptor blocks, last one partial), and
+pins the write counts at 130 sequential vs 3 batched. Byte-identity is the load-bearing assertion:
+a batch that merely wrote fewer times but dropped or misplaced a descriptor would pass a write count
+and silently persist a wrong free count.
+
+⚠️ **This does NOT close the `1.976308x` fsync/journal-commit row and must not be quoted as if it
+did.** Barriers were already 1.000x (bd-7nr8p) and bytes were 1.250x (bd-2w2me); bytes are now
+1.000x, and the wall-clock row is untouched by this measurement — no timed A/B was run, deliberately,
+because a count is the honest instrument here and the timed row needs a window this host has not
+offered. What is claimed is exactly what was measured: write amplification at parity.
+
+**Still open from the same count:** `ext4_sync_superblock_free_totals` writes block 0 on every
+durability boundary including a pure overwrite, which dirties no free count. That is a separate
+write and a separate lever, unaddressed here.
