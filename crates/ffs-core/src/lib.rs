@@ -19231,6 +19231,15 @@ impl OpenFs {
         alloc: &Ext4AllocState,
         device: &dyn BlockDevice,
     ) -> Result<(), FfsError> {
+        // bd-fv9tc: collect every group's descriptor and its bitmap overrides,
+        // then persist them with ONE read-modify-write per GDT BLOCK rather than
+        // one per GROUP. A 64-byte descriptor in a 4096-byte block means 64
+        // groups share a block, so the old per-group loop issued G device writes
+        // to ceil(G/64) blocks — measured as exactly 2 writes of block 1 per
+        // client fsync on a 2-group image, and 64x on any realistic one. The
+        // bytes written are identical: each descriptor patches only its own slot.
+        let mut entries: Vec<(GroupNumber, ffs_alloc::GroupStats, Option<Vec<u8>>, Option<Vec<u8>>)> =
+            Vec::with_capacity(alloc.groups.len());
         for gidx in 0..alloc.groups.len() {
             let group = GroupNumber(
                 u32::try_from(gidx)
@@ -19262,19 +19271,10 @@ impl OpenFs {
             } else {
                 None
             };
-            let inode_override = inode_bitmap.as_deref();
-            let block_override = block_bitmap.as_deref();
-            ffs_alloc::persist_group_desc_force(
-                cx,
-                device,
-                &alloc.persist_ctx,
-                group,
-                gs,
-                block_override,
-                inode_override,
-            )
-            .map_err(|e| FfsError::Format(format!("flush GDT group {}: {e}", group.0)))?;
+            entries.push((group, gs.clone(), block_bitmap, inode_bitmap));
         }
+        ffs_alloc::persist_group_descs_batched(cx, device, &alloc.persist_ctx, &entries)
+            .map_err(|e| FfsError::Format(format!("flush GDT: {e}")))?;
         Ok(())
     }
 

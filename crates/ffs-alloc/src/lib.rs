@@ -2216,6 +2216,38 @@ fn persist_group_desc_force_with_bitmap_overrides(
     // devices ignore the hint and do a plain read-modify-write (byte-identical).
     // The closure runs on the base block the device read at its own snapshot.
     dev.rmw_block(cx, block_num, &[(offset_in_block, ds)], &mut |buf| {
+        apply_group_desc_into(
+            buf,
+            offset_in_block,
+            ds,
+            pctx,
+            group,
+            stats,
+            block_bitmap_override,
+            inode_bitmap_override,
+        )
+    })
+}
+
+/// Patch ONE group descriptor's `ds`-byte slot at `offset_in_block` inside an
+/// already-read GDT block.
+///
+/// Split out of [`persist_group_desc_force_with_bitmap_overrides`] so that
+/// [`persist_group_descs_batched`] can apply SEVERAL descriptors to one block
+/// under a single read-modify-write. The body is unchanged and touches nothing
+/// outside its own slot, which is what makes batching byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn apply_group_desc_into(
+    buf: &mut [u8],
+    offset_in_block: usize,
+    ds: usize,
+    pctx: &PersistCtx,
+    group: GroupNumber,
+    stats: &GroupStats,
+    block_bitmap_override: Option<&BitmapOverride<'_>>,
+    inode_bitmap_override: Option<&BitmapOverride<'_>>,
+) -> Result<()> {
+    {
         // Build a temporary Ext4GroupDesc with updated counters and serialize.
         // Read existing descriptor to preserve fields we don't track.
         let existing = Ext4GroupDesc::parse_from_bytes(&buf[offset_in_block..], pctx.desc_size)
@@ -2303,7 +2335,92 @@ fn persist_group_desc_force_with_bitmap_overrides(
             );
         }
         Ok(())
-    })
+    }
+}
+
+/// The GDT block a group's descriptor lives in, and its offset within it.
+fn group_desc_location(pctx: &PersistCtx, block_size: usize, group: GroupNumber)
+-> Result<(BlockNumber, usize, usize)> {
+    let ds = usize::from(pctx.desc_size);
+    if ds == 0 {
+        return Err(FfsError::InvalidGeometry("desc_size is zero".into()));
+    }
+    let descs_per_block = block_size / ds;
+    if descs_per_block == 0 {
+        return Err(FfsError::InvalidGeometry(
+            "block_size smaller than desc_size".into(),
+        ));
+    }
+    let block = BlockNumber(
+        pctx.gdt_block
+            .0
+            .checked_add((group.0 as usize / descs_per_block) as u64)
+            .ok_or_else(|| FfsError::InvalidGeometry("GDT block number overflow".into()))?,
+    );
+    Ok((block, (group.0 as usize % descs_per_block) * ds, ds))
+}
+
+/// Persist many group descriptors with ONE read-modify-write per GDT BLOCK.
+///
+/// bd-fv9tc. [`persist_group_desc_force`] writes a whole block per GROUP, and a
+/// 64-byte descriptor in a 4096-byte block means 64 groups share one — so a
+/// durability-boundary flush of a `G`-group filesystem issued `G` device writes
+/// to `ceil(G/64)` blocks. Measured on a 2-group image as exactly 2 writes of
+/// block 1 per client fsync; on any realistic filesystem it is 64x. This issues
+/// `ceil(G/64)`.
+///
+/// Byte-identical to calling [`persist_group_desc_force`] per group in the same
+/// order: each descriptor patches only its own `ds`-byte slot, so applying all
+/// of a block's descriptors to one buffer produces exactly the bytes the
+/// per-group sequence would have left. The `rmw_block` range hint is the union
+/// of the touched slots, which keeps the per-descriptor MVCC merge proof that
+/// lets concurrent creates in different groups merge rather than conflict.
+///
+/// # Errors
+/// Returns any geometry, parse, or device error from the underlying writes.
+pub fn persist_group_descs_batched(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    pctx: &PersistCtx,
+    entries: &[(GroupNumber, GroupStats, Option<Vec<u8>>, Option<Vec<u8>>)],
+) -> Result<()> {
+    let block_size = dev.block_size() as usize;
+    // Preserve per-block ordering: within a block, later entries must overwrite
+    // earlier ones exactly as the sequential calls did.
+    let mut by_block: std::collections::BTreeMap<u64, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, (group, _, _, _)) in entries.iter().enumerate() {
+        let (block, _, _) = group_desc_location(pctx, block_size, *group)?;
+        by_block.entry(block.0).or_default().push(index);
+    }
+
+    for (block, indices) in by_block {
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(indices.len());
+        for &index in &indices {
+            let (_, offset, ds) = group_desc_location(pctx, block_size, entries[index].0)?;
+            ranges.push((offset, ds));
+        }
+        dev.rmw_block(cx, BlockNumber(block), &ranges, &mut |buf| {
+            for &index in &indices {
+                let (group, stats, block_bitmap, inode_bitmap) = &entries[index];
+                let (_, offset, ds) = group_desc_location(pctx, block_size, *group)?;
+                let block_override = block_bitmap.as_deref().map(BitmapOverride::full);
+                let inode_override = inode_bitmap.as_deref().map(BitmapOverride::full);
+                apply_group_desc_into(
+                    buf,
+                    offset,
+                    ds,
+                    pctx,
+                    *group,
+                    stats,
+                    block_override.as_ref(),
+                    inode_override.as_ref(),
+                )?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 fn stamp_bitmap_checksum_from_override(
