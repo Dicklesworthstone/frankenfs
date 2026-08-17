@@ -9956,3 +9956,77 @@ Both runs were BLOCKED_NULL on SPREAD, not median — kernel/fuse null medians w
 0.9962/1.0044, all within 0.6% of one, while the spreads sat just over the 1.025 limit (1.0256,
 1.0332, 1.0288). That is the same signature as every run today: **this host holds a median still and
 will not hold a spread still.**
+
+## ⛔ INADMISSIBLE — 2026-08-17 — the first post-lever timed btrfs readdir+stat row read 6.514621x and MUST NOT BE QUOTED (CreamTrout)
+
+The certification window was reported clean and I verified the reported figures myself: **idle
+85.5-87.3%, iowait 0.0%**, which was accurate and was the quietest sustained reading of the session.
+On that basis I built a fresh v3+PGO candidate and took the run. The row is **blocked** and this
+entry exists so the number is on record as unusable rather than discovered later out of context.
+
+### Provenance, complete
+
+`executed_on: thinkstation1`, kernel `6.17.0-41-generic`.
+Driver ELF `9d20206721ec9485…` (built thinkstation1), candidate ELF `c3eac8bd3ad7d920…` (built
+thinkstation1), PGO profile `cc6c121c9ee77d8a…`, `codegen_isa` self-reported avx2+fma true.
+Workload `large_directory_readdir_stat_8t`, 32,768 operations, 24 pairs, 8 requested client threads,
+**8 observed worker threads** (unique TIDs inside each timed batch), min-of-3 observation repeats.
+`load_average` recorded by the harness: **18.94 / 20.81 / 23.82, settled=true**.
+Parity PASS — tree sha `bea2b23e…` identical before and after, 32,773 entries both sides.
+`incumbent_isolation_proof: pass`. Report at
+`/data/tmp/ffs-cert-creamtrout/run_1786998421_55850913_3820863/`.
+
+### BLOCKED — INADMISSIBLE 2026-08-17 (bd-btrfs-readdir-stat-8x-8y7vp) — the number, and why it is not usable
+
+    fuse_over_kernel median  6.514621x   ci95 [5.695101, 6.740817]   (bootstrap median CI)
+    admitted = FALSE         verdict = blocked_null
+
+    executed_on: thinkstation1
+    bench_evidence,binary_sha256=c3eac8bd3ad7d920a499d29bfa82cce32484358956068848ed0ce06073c13df0
+    executing_elf_sha256: c3eac8bd3ad7d920a499d29bfa82cce32484358956068848ed0ce06073c13df0
+      (the candidate's OWN in-process self-report, emitted by `ffs-cli bench-evidence`
+       at build time and re-reported per identity slot by the harness during the run;
+       proc_exe_sha256 agrees. Not a neighbouring sha256sum.)
+    build_profile,pgo_profile_sha256=cc6c121c9ee77d8a4b7f4855c443c07a59ac6191316d40acb08fb2fbe79f9562
+
+    A/A NULL CONTROLS, same invocation, bootstrap median CI on each:
+      kernel_aa  median 0.9986801  deviation 0.0013199  ci95 [0.9716687, 1.0152137]  PASS
+      fuse_aa    median 1.0229916  deviation 0.0229916  ci95 [0.9826635, 1.0558851]  FAIL
+      ceiling on median deviation: 0.02
+
+**Three independent disqualifiers, any one sufficient:**
+
+1. ⛔ **The FUSE A/A null FAILED.** `fuse_aa.median = 1.0229916`, deviation from one **0.0229916**
+   against a ceiling of **0.02**. It missed by 0.003. The kernel A/A passed (0.998680, deviation
+   0.00132). An instrument whose own null is outside its ceiling cannot certify the arm that null
+   controls.
+2. ⛔ **External load CONTENDED, at 100% of samples.** 72 samples, **72 over limit**,
+   `contended_fraction = 1.0000`, `max_external_busy_cpus = 48` against a limit of 2,
+   `peak_off_placement_mean_busy = 0.7737`. The window I verified at 82-87% idle had collapsed by
+   the time the arms ran — a `frankentorch` job started during the 5m49s build.
+3. ⛔ **The FUSE arm ran on the slowest core on the box.** `cpu_mhz_observed.fuse.mean = 1429.008`
+   against an observed maximum of **3963.851** and a spread of **2.77x**. The daemon sat at 1429 MHz
+   while other cores ran at up to 3964. That is the bd-cpu-mhz hazard, and it biases the FUSE arm
+   directly.
+
+### ⚠️ What must NOT be concluded
+
+The banked btrfs readdir+stat figures are **7.753405x / 7.649395x** (bd-plkzd, corrected fixture).
+This row read **6.514621x**, and my capability-probe memo lever (`e99e91d9d`, 12.6x fewer node reads)
+landed between them. **It is tempting and wrong to read this as the lever working.** All three
+disqualifiers above push in unknown directions, the null failed on exactly the arm that would carry
+the effect, and the FUSE daemon was clocked at 36% of the fastest core. **No comparison to the banked
+rows is licensed and none is made.** The lever's wall-clock effect remains UNMEASURED, as it has been
+since it landed.
+
+### What would make it admissible
+
+The FUSE A/A null inside 2% and `external_load_during_run` not `contended` — in the same invocation.
+Both require a window this host has not produced: 0 of 30 samples reached the gate in five minutes of
+the quietest period of the day, and the one genuinely quiet window this session evaporated during the
+5m49s build needed to produce a certifiable candidate. **That is the structural finding worth keeping
+from this attempt: the build required to certify consumes the window required to certify.** It is
+recorded on bd-4sull, which already argues this gate is unreachable here.
+
+Disk: `disk_free_before_bytes=221640499200`, `after=219386523648`; the run left 2.1G under
+`/data/tmp/ffs-cert-creamtrout`.
