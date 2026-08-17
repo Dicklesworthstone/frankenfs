@@ -2732,6 +2732,34 @@ fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsM
             UNREPORTED_RUNTIME_KNOBS.to_owned()
         }
     };
+    // The xattr switch resolves INSIDE the mount, after the knob line above has
+    // already been printed, so the daemon reports it separately and it is folded
+    // in here (bd-ha71t). It has to be part of `runtime_knobs` rather than a
+    // field of its own because that is the string `candidate_knob_divergence`
+    // compares: left out, an `FFS_FUSE_XATTR_NO_SUPPORT` A/B resolves identical
+    // knob lines and fails closed as "the override never reached a knob this ELF
+    // reads" — which was true of the harness, not of the ELF.
+    let runtime_knobs = match optional_prefixed_line(
+        &content,
+        "mount_candidate_xattr,",
+        "FUSE mount resolved xattr suppression",
+    )? {
+        // Appended, not substituted: an arm still has to agree with its replica
+        // on every OTHER knob too.
+        Some(xattr) => format!("{runtime_knobs},{xattr}"),
+        // Absent means an ELF from before this line existed. That is only fatal
+        // for a candidate-vs-candidate run, and it is the same fail-closed rule
+        // the knob line itself uses.
+        None => {
+            ensure!(
+                !knobs_required,
+                "FUSE mount resolved xattr suppression was not reported: this ELF predates \
+                 xattr-suppression self-reporting, so a candidate-vs-candidate comparison \
+                 could not tell an ACTIVE suppression from a REFUSED one"
+            );
+            runtime_knobs
+        }
+    };
     Ok(FfsMountSelfReport {
         identity: FfsBinaryIdentity {
             binary_sha256,
@@ -4771,7 +4799,11 @@ fn load_is_settled(one: f64, five: f64, low_threshold: f64, convergence: f64) ->
     if one > low_threshold || five > low_threshold {
         return false;
     }
-    let (lo, hi) = if one <= five { (one, five) } else { (five, one) };
+    let (lo, hi) = if one <= five {
+        (one, five)
+    } else {
+        (five, one)
+    };
     hi <= 0.0 || lo / hi >= convergence
 }
 
@@ -4814,10 +4846,9 @@ fn cpu_mhz() -> BTreeMap<usize, f64> {
         if let Some(v) = line.strip_prefix("processor") {
             cpu = v.trim_start_matches([':', ' ']).trim().parse().ok();
         } else if let Some(v) = line.to_ascii_lowercase().strip_prefix("cpu mhz") {
-            if let (Some(c), Ok(mhz)) = (
-                cpu,
-                v.trim_start_matches([':', ' ']).trim().parse::<f64>(),
-            ) {
+            if let (Some(c), Ok(mhz)) =
+                (cpu, v.trim_start_matches([':', ' ']).trim().parse::<f64>())
+            {
                 out.insert(c, mhz);
             }
         }
@@ -4830,7 +4861,10 @@ fn cpu_mhz() -> BTreeMap<usize, f64> {
 /// `spread` is max/min — the ratio an arm placed on the slowest core would see against
 /// one placed on the fastest. Reported rather than gated: this is evidence for
 /// attributing a ratio after the fact, not a new refusal criterion.
-fn cpu_mhz_summary(mhz: &BTreeMap<usize, f64>, cpus: &BTreeSet<usize>) -> Option<(f64, f64, f64, f64)> {
+fn cpu_mhz_summary(
+    mhz: &BTreeMap<usize, f64>,
+    cpus: &BTreeSet<usize>,
+) -> Option<(f64, f64, f64, f64)> {
     let vals: Vec<f64> = cpus.iter().filter_map(|c| mhz.get(c).copied()).collect();
     if vals.is_empty() {
         return None;
@@ -7306,7 +7340,11 @@ fn run() -> Result<Option<PathBuf>> {
     // that must still be VISIBLE: a row whose degradation is invisible cannot be
     // compared to one with a different mix.
     let (client_cores, client_shared) = physical_core_occupancy(
-        &placement.driver_cpus.iter().copied().collect::<BTreeSet<_>>(),
+        &placement
+            .driver_cpus
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
     )
     .unwrap_or((0, 0));
     println!(
@@ -8150,24 +8188,45 @@ mod tests {
         assert!(load_is_settled(10.0, 10.0, 25.0, 0.7));
 
         // The trap: 1-minute collapsed, 5-minute still high. Both real readings.
-        assert!(!load_is_settled(11.15, 30.25, 25.0, 0.7), "ratio 0.37 is a spike, not a window");
-        assert!(!load_is_settled(11.07, 20.50, 25.0, 0.7), "ratio 0.54 has not converged");
-        assert!(!load_is_settled(10.28, 25.26, 25.0, 0.7), "this one certified and was then refused");
+        assert!(
+            !load_is_settled(11.15, 30.25, 25.0, 0.7),
+            "ratio 0.37 is a spike, not a window"
+        );
+        assert!(
+            !load_is_settled(11.07, 20.50, 25.0, 0.7),
+            "ratio 0.54 has not converged"
+        );
+        assert!(
+            !load_is_settled(10.28, 25.26, 25.0, 0.7),
+            "this one certified and was then refused"
+        );
 
         // Converged but NOT low: a stable busy host is not a window either.
-        assert!(!load_is_settled(40.0, 41.0, 25.0, 0.7), "stable does not mean quiet");
+        assert!(
+            !load_is_settled(40.0, 41.0, 25.0, 0.7),
+            "stable does not mean quiet"
+        );
 
         // Rising spike: 1-minute far ABOVE the 5-minute is equally unsettled.
-        assert!(!load_is_settled(30.0, 12.0, 25.0, 0.7), "load climbing is not a window");
+        assert!(
+            !load_is_settled(30.0, 12.0, 25.0, 0.7),
+            "load climbing is not a window"
+        );
 
         // Idle host.
-        assert!(load_is_settled(0.0, 0.0, 25.0, 0.7), "an idle host must not divide by zero");
+        assert!(
+            load_is_settled(0.0, 0.0, 25.0, 0.7),
+            "an idle host must not divide by zero"
+        );
     }
 
     #[test]
     fn placement_requires_consecutive_stability_not_a_single_spike() {
         // A single qualifying sample is NOT enough when several are required.
-        assert!(!placement_is_stable(1, 5), "one sample is a spike, not a window");
+        assert!(
+            !placement_is_stable(1, 5),
+            "one sample is a spike, not a window"
+        );
         assert!(!placement_is_stable(4, 5), "still short of the requirement");
         assert!(placement_is_stable(5, 5), "the requirement is met exactly");
         assert!(placement_is_stable(6, 5), "and exceeded");
@@ -9731,6 +9790,63 @@ mod tests {
         assert!(candidate_knob_divergence(&split_replicas, true).is_err());
     }
 
+    /// bd-ha71t: an `FFS_FUSE_XATTR_NO_SUPPORT` A/B diverges only because the
+    /// RESOLVED suppression state is part of the knob string.
+    ///
+    /// The negative case is the one that matters and it is specific to this
+    /// lever: `auto` is refused whenever the scan cannot prove the image has no
+    /// xattrs, so a B arm can carry the env var, mount cleanly, suppress
+    /// nothing, and be measured as a lever. Every other knob is identical
+    /// between those two arms, so nothing else in this harness can tell them
+    /// apart.
+    #[test]
+    fn xattr_suppression_divergence_needs_the_resolved_state_bd_ha71t() {
+        let base = "count_memoized_requests=true,fuse_dispatch_workers=0";
+        let off = format!("{base},xattr_suppression=refused,xattr_setting=off");
+        let active = format!("{base},xattr_suppression=active,xattr_setting=auto");
+        let refused = format!("{base},xattr_suppression=refused,xattr_setting=auto");
+
+        let fired = vec![
+            fuse_mount_for_test(Arm::FuseA, &off),
+            fuse_mount_for_test(Arm::FuseB, &off),
+            fuse_mount_for_test(Arm::CandidateBA, &active),
+            fuse_mount_for_test(Arm::CandidateBB, &active),
+        ];
+        assert_eq!(
+            candidate_knob_divergence(&fired, true).expect("an ACTIVE suppression diverges"),
+            (off.clone(), active.clone())
+        );
+
+        // The costume case: the knob was requested and REFUSED. It still
+        // diverges from the off arm -- the two really are different states, and
+        // the harness must not pretend otherwise -- so the protection is that
+        // the string says `refused` and lands in the banked row for a human and
+        // for `perf_ledger_preflight.py` to read.
+        let costume = vec![
+            fuse_mount_for_test(Arm::FuseA, &off),
+            fuse_mount_for_test(Arm::FuseB, &off),
+            fuse_mount_for_test(Arm::CandidateBA, &refused),
+            fuse_mount_for_test(Arm::CandidateBB, &refused),
+        ];
+        let (_, reported) =
+            candidate_knob_divergence(&costume, true).expect("refused still differs from off");
+        assert!(
+            reported.contains("xattr_suppression=refused"),
+            "a refused arm must be banked as refused, not as a lever: {reported}"
+        );
+
+        // Without the resolved state folded in, both arms are byte-identical and
+        // the run fails closed blaming the ELF. This is the regression the fold
+        // exists to prevent.
+        let unfolded = vec![
+            fuse_mount_for_test(Arm::FuseA, base),
+            fuse_mount_for_test(Arm::FuseB, base),
+            fuse_mount_for_test(Arm::CandidateBA, base),
+            fuse_mount_for_test(Arm::CandidateBB, base),
+        ];
+        assert!(candidate_knob_divergence(&unfolded, true).is_err());
+    }
+
     /// bd-plkzd: the htree control must accept a real indexed dump and reject
     /// the exact string `mke2fs -d` fixtures produce.
     ///
@@ -9828,13 +9944,22 @@ mod tests {
         // The worst case actually observed: 8 threads on 4 cores, every one paired.
         let worst: BTreeSet<usize> = [10, 11, 12, 14, 42, 43, 44, 46].into_iter().collect();
         let (cores, shared) = physical_core_occupancy(&worst).expect("occupancy");
-        assert_eq!(cores, 4, "10/42, 11/43, 12/44, 14/46 are four sibling pairs");
-        assert_eq!(shared, 8, "all eight threads share a core with another thread");
+        assert_eq!(
+            cores, 4,
+            "10/42, 11/43, 12/44, 14/46 are four sibling pairs"
+        );
+        assert_eq!(
+            shared, 8,
+            "all eight threads share a core with another thread"
+        );
 
         // The common case: one sibling pair, so 7 cores and 2 shared threads.
         let typical: BTreeSet<usize> = [24, 25, 26, 27, 29, 30, 58, 63].into_iter().collect();
         let (cores, shared) = physical_core_occupancy(&typical).expect("occupancy");
-        assert_eq!(cores, 7, "26 and 58 are siblings, so eight cpus occupy seven cores");
+        assert_eq!(
+            cores, 7,
+            "26 and 58 are siblings, so eight cpus occupy seven cores"
+        );
         assert_eq!(shared, 2, "exactly the two members of that pair are shared");
     }
 
@@ -9842,8 +9967,11 @@ mod tests {
     fn placement_subset_spread_differs_from_all_core_spread_bd_cpu_mhz() {
         // Two busy arm cores clocked alike, plus parked idle cores.
         let mhz: BTreeMap<usize, f64> = [
-            (0, 3900.0), (1, 3905.0),          // arm cores, working
-            (2, 1429.0), (3, 1429.0), (4, 1429.0), // idle, parked at the floor
+            (0, 3900.0),
+            (1, 3905.0), // arm cores, working
+            (2, 1429.0),
+            (3, 1429.0),
+            (4, 1429.0), // idle, parked at the floor
         ]
         .into_iter()
         .collect();
@@ -9867,8 +9995,9 @@ mod tests {
 
     #[test]
     fn cpu_mhz_summary_reports_the_cross_core_spread_bd_cpu_mhz() {
-        let mhz: BTreeMap<usize, f64> =
-            [(0, 3111.0), (1, 3917.0), (2, 3500.0), (9, 1429.0)].into_iter().collect();
+        let mhz: BTreeMap<usize, f64> = [(0, 3111.0), (1, 3917.0), (2, 3500.0), (9, 1429.0)]
+            .into_iter()
+            .collect();
 
         // Only the requested CPUs are summarised — an arm is placed on a subset.
         let two: BTreeSet<usize> = [0, 1].into_iter().collect();
@@ -9906,8 +10035,9 @@ mod tests {
         let mut witness = ExternalLoadWitness::default();
 
         // Our own arms saturated; everything else idle.
-        let busy: BTreeMap<usize, f64> =
-            [(0, 0.99), (1, 0.97), (2, 0.01), (3, 0.00)].into_iter().collect();
+        let busy: BTreeMap<usize, f64> = [(0, 0.99), (1, 0.97), (2, 0.01), (3, 0.00)]
+            .into_iter()
+            .collect();
         witness.observe(&busy, &placement, MAX_EXTERNAL_BUSY_CPUS);
 
         assert!(

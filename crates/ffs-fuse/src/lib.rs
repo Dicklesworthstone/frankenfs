@@ -454,16 +454,67 @@ fn posix_acl_capability_from_value(value: Option<&str>) -> u64 {
 /// `auto` pays for a bounded inode scan here rather than trusting an assertion
 /// (bd-ha71t). Mount time is the only place that scan can run: it must complete
 /// before any request is served, and its answer must not change afterwards.
+/// The daemon's self-reported, RESOLVED xattr-suppression state, in the form
+/// `mount_candidate_knobs`-style evidence uses.
+///
+/// Why the outcome and not the request (bd-ha71t). `ffs-mounted-kernel-bench`
+/// proves the two candidate arms of an A/B are actually different
+/// configurations by requiring their self-reported knob lines to disagree, and
+/// it fails the run closed when they match — the bd-d9378 defect, where a
+/// requested override reached nothing the ELF reads. Reporting the requested
+/// SETTING would clear that gate while proving nothing: `auto` is refused
+/// whenever the scan cannot prove absence, so an arm that suppressed nothing
+/// would still read `auto` and certify as a lever. Only `active` versus
+/// `refused` separates the lever from a null wearing its costume.
+///
+/// `presence` is `None` for the off arm, which never runs the scan.
+fn xattr_suppression_evidence(
+    setting: XattrSwitchSetting,
+    presence: Option<ffs_core::vfs::XattrPresence>,
+    allowed: bool,
+) -> String {
+    let setting = match setting {
+        XattrSwitchSetting::Off => "off",
+        XattrSwitchSetting::Asserted => "asserted",
+        XattrSwitchSetting::Auto => "auto",
+    };
+    let presence = match presence {
+        None => "not_scanned",
+        Some(ffs_core::vfs::XattrPresence::ProvenAbsent) => "proven_absent",
+        Some(ffs_core::vfs::XattrPresence::Present) => "present",
+        Some(ffs_core::vfs::XattrPresence::Unknown) => "unknown",
+    };
+    let outcome = if allowed { "active" } else { "refused" };
+    format!("xattr_suppression={outcome},xattr_setting={setting},xattr_presence={presence}")
+}
+
+/// Print the resolved state where the comparator can read it.
+///
+/// Gated on the same `FFS_MOUNT_BENCH_EVIDENCE` as the rest of the mount
+/// evidence, and on stderr for the same reason: it is provenance for a
+/// measurement, not output a mount is expected to produce.
+fn emit_xattr_suppression_evidence(line: String) {
+    if std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0") {
+        eprintln!("mount_candidate_xattr,{line}");
+    }
+}
+
 fn resolve_xattr_suppression(fs: &FrankenFuse) {
     let setting =
         xattr_switch_setting_from_value(std::env::var("FFS_FUSE_XATTR_NO_SUPPORT").ok().as_deref());
     if setting == XattrSwitchSetting::Off {
+        // Still reported, and that is the point: an ABSENT line is ambiguous
+        // between "this arm did not suppress" and "this ELF is too old to say".
+        // The comparator distinguishes a lever from a null by comparing the two
+        // arms' lines, so the off arm has to have one.
+        emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, None, false));
         return;
     }
     let cx = FrankenFuse::cx_for_request();
     let presence = fs.inner.ops.xattr_presence(&cx);
     let allowed = xattr_suppression_allowed(setting, presence, fs.inner.read_only);
     XATTR_SWITCH.store(allowed, std::sync::atomic::Ordering::Relaxed);
+    emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, Some(presence), allowed));
     if allowed {
         info!(
             ?setting,
@@ -6717,6 +6768,52 @@ mod tests {
         assert!(!memo.contains(InodeNumber(0)));
         memo.forget(InodeNumber(0));
         assert!(!memo.contains(InodeNumber(0)));
+    }
+
+    /// bd-ha71t: the evidence line must distinguish a lever that FIRED from one
+    /// that was refused.
+    ///
+    /// This is the property the comparator's knob-divergence proof rests on. An
+    /// implementation that reported the requested setting would pass every
+    /// other test in this file and still certify a refused arm as a lever, so
+    /// the load-bearing assertion is the inequality between `auto` active and
+    /// `auto` refused — not the exact spelling of either.
+    #[test]
+    fn suppression_evidence_separates_active_from_refused_bd_ha71t() {
+        use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent, Unknown};
+
+        let active = xattr_suppression_evidence(XattrSwitchSetting::Auto, Some(ProvenAbsent), true);
+        let refused = xattr_suppression_evidence(XattrSwitchSetting::Auto, Some(Unknown), false);
+        assert_ne!(
+            active, refused,
+            "a refused auto arm must not self-report as an active one: the comparator \
+             would certify a null as a lever"
+        );
+        assert!(active.contains("xattr_suppression=active"), "{active}");
+        assert!(refused.contains("xattr_suppression=refused"), "{refused}");
+
+        // The off arm must also differ from an active one, or the A/B has no
+        // divergence to prove and the run fails closed for the wrong reason.
+        let off = xattr_suppression_evidence(XattrSwitchSetting::Off, None, false);
+        assert_ne!(off, active);
+        assert!(off.contains("xattr_setting=off"), "{off}");
+        assert!(
+            off.contains("xattr_presence=not_scanned"),
+            "the off arm never runs the scan and must not imply it did: {off}"
+        );
+
+        // An assertion refused against a proof is the data-loss case; it must be
+        // visible in the evidence rather than looking like a plain refusal.
+        let contradicted =
+            xattr_suppression_evidence(XattrSwitchSetting::Asserted, Some(Present), false);
+        assert!(
+            contradicted.contains("xattr_presence=present"),
+            "{contradicted}"
+        );
+        assert!(
+            contradicted.contains("xattr_suppression=refused"),
+            "{contradicted}"
+        );
     }
 
     /// The coherence invariant, which is the whole correctness argument for the
