@@ -1130,6 +1130,32 @@ impl BtrfsDirItem {
     }
 }
 
+/// A parent key-pointer's claimed generation against the child block's own.
+///
+/// This is the kernel's `parent transid verify` check, implemented on our side
+/// (bd-73bi2). btrfs stores a generation in every internal node's key-pointer
+/// AND in the header of the block that pointer targets. If a parent is written
+/// with a bumped generation while its child is not persisted -- or the two are
+/// written out of order -- the pointer says 10 and the block says 9, and the
+/// kernel refuses to open the filesystem with:
+///
+///     parent transid verify failed on logical N wanted 10 found 9
+///
+/// We need our own copy because of the asymmetry that makes bd-73bi2 dangerous:
+/// FrankenFS reads such an image back perfectly and lists every file, so no test
+/// that round-trips through FrankenFS alone can see the corruption, and that is
+/// most of our btrfs coverage. A check that only asks our own code is a check on
+/// our own opinion.
+///
+/// Returns `Some((wanted, found))` on a mismatch, `None` when they agree or the
+/// block is too short to carry a header -- a truncated block is a different
+/// defect and the checksum verifier owns it.
+#[must_use]
+pub fn parent_transid_mismatch(wanted: u64, child_block: &[u8]) -> Option<(u64, u64)> {
+    let header = BtrfsHeader::parse_from_block(child_block).ok()?;
+    (header.generation != wanted).then_some((wanted, header.generation))
+}
+
 /// Parsed XATTR_ITEM payload.
 ///
 /// Uses the same on-disk layout as `BtrfsDirItem` but with `data_len > 0`:
@@ -24883,5 +24909,68 @@ mod tests {
         assert_eq!(path, b"prealloc.bin");
         assert_eq!(attr_u64(update, ATTR_FILE_OFFSET), FILE_OFFSET);
         assert_eq!(attr_u64(update, ATTR_SIZE), PREALLOC_LEN);
+    }
+}
+
+#[cfg(test)]
+mod parent_transid_tests {
+    use super::{BTRFS_HEADER_SIZE, BtrfsHeader, parent_transid_mismatch};
+
+    /// Build a block carrying only what this check reads: a header with a
+    /// generation. Everything else is zero, deliberately -- the check must not
+    /// depend on the rest of the node being well-formed, because the images it
+    /// runs against are by definition suspect.
+    fn block_with_generation(generation: u64) -> Vec<u8> {
+        let mut block = vec![0_u8; BTRFS_HEADER_SIZE + 64];
+        // `generation` sits after csum(32) + fsid(16) + bytenr(8) + flags(8)
+        // + chunk_tree_uuid(16).
+        let offset = 32 + 16 + 8 + 8 + 16;
+        block[offset..offset + 8].copy_from_slice(&generation.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn a_matching_generation_is_not_a_mismatch_bd_73bi2() {
+        let block = block_with_generation(10);
+        assert_eq!(
+            BtrfsHeader::parse_from_block(&block).expect("header").generation,
+            10,
+            "fixture must actually encode the generation, or this test proves nothing"
+        );
+        assert_eq!(parent_transid_mismatch(10, &block), None);
+    }
+
+    /// The exact shape bd-73bi2 produces: parent says 10, block says 9.
+    #[test]
+    fn a_stale_child_is_reported_with_both_generations_bd_73bi2() {
+        let block = block_with_generation(9);
+        assert_eq!(parent_transid_mismatch(10, &block), Some((10, 9)));
+    }
+
+    /// A child NEWER than its parent claims is also a mismatch. The kernel
+    /// rejects it too, and it is the signature of a different bug -- a child
+    /// rewritten without its parent being updated -- so it must not be silently
+    /// tolerated just because "newer" sounds harmless.
+    #[test]
+    fn a_child_newer_than_its_parent_is_also_a_mismatch_bd_73bi2() {
+        let block = block_with_generation(11);
+        assert_eq!(parent_transid_mismatch(10, &block), Some((10, 11)));
+    }
+
+    /// Generation 0 against 0 agrees; a fresh tree must not be reported as
+    /// corrupt.
+    #[test]
+    fn zero_generations_agree_bd_73bi2() {
+        assert_eq!(parent_transid_mismatch(0, &block_with_generation(0)), None);
+    }
+
+    /// A block too short to hold a header is NOT reported as a transid
+    /// mismatch. It is a different defect and the checksum verifier owns it;
+    /// reporting it here would attribute a truncation to the write ordering.
+    #[test]
+    fn a_truncated_block_is_not_a_transid_mismatch_bd_73bi2() {
+        assert_eq!(parent_transid_mismatch(10, &[]), None);
+        assert_eq!(parent_transid_mismatch(10, &[0_u8; 8]), None);
+        assert_eq!(parent_transid_mismatch(10, &vec![0_u8; BTRFS_HEADER_SIZE - 1]), None);
     }
 }

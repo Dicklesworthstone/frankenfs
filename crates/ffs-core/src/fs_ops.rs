@@ -125,6 +125,140 @@ impl OpenFs {
     }
 }
 
+/// One parent/child generation disagreement found by [`OpenFs::btrfs_transid_mismatches`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsTransidMismatch {
+    /// Logical address of the CHILD block whose header disagrees.
+    pub logical: u64,
+    /// Generation the parent's key-pointer claims.
+    pub wanted: u64,
+    /// Generation the child block actually carries.
+    pub found: u64,
+}
+
+impl OpenFs {
+    /// Every parent/child generation disagreement reachable from a tree root.
+    ///
+    /// This is the kernel's `parent transid verify`, run on our side (bd-73bi2).
+    /// Above ~4000 creates through a FrankenFS mount, an image acquires a free-
+    /// space-tree pointer claiming generation 10 over a block still carrying 9,
+    /// and the kernel refuses to open the filesystem -- while FrankenFS reads it
+    /// back perfectly and lists every file. That asymmetry is why this exists:
+    /// no test that round-trips through FrankenFS alone can see the corruption,
+    /// and that is most of our btrfs coverage.
+    ///
+    /// Reads one node at a time and returns the disagreements rather than the
+    /// first, so a caller can tell "one stale block" from "the whole tree is a
+    /// generation behind" -- those are different bugs.
+    pub fn btrfs_transid_mismatches(
+        &self,
+        cx: &Cx,
+        root_logical: u64,
+    ) -> Result<Vec<BtrfsTransidMismatch>, FfsError> {
+        let mut found = Vec::new();
+        for logical in self.btrfs_tree_node_addresses(cx, root_logical)? {
+            let node = self
+                .btrfs_read_parsed_node(cx, logical)
+                .map_err(|e| parse_to_ffs_error(&e))?;
+            let BtrfsParsedNode::Internal { ptrs } = node.as_ref() else {
+                continue;
+            };
+            for ptr in ptrs {
+                // Read the CHILD's own header and compare it against what this
+                // pointer claims. `btrfs_read_parsed_node` verifies the block's
+                // checksum on the way in, so a mismatch reported here is a
+                // generation disagreement and not a torn block.
+                let child = self
+                    .btrfs_read_parsed_node(cx, ptr.blockptr)
+                    .map_err(|e| parse_to_ffs_error(&e))?;
+                let generation = match child.as_ref() {
+                    BtrfsParsedNode::Leaf { block, .. } => {
+                        ffs_btrfs::parent_transid_mismatch(ptr.generation, block)
+                    }
+                    // An internal child's parsed form drops its header, so ask
+                    // the layer that still has the bytes.
+                    BtrfsParsedNode::Internal { .. } => self
+                        .btrfs_tree_block_generation(cx, ptr.blockptr)
+                        .map(|actual| (actual != ptr.generation).then_some((ptr.generation, actual)))
+                        .unwrap_or(None),
+                };
+                if let Some((wanted, actual)) = generation {
+                    found.push(BtrfsTransidMismatch {
+                        logical: ptr.blockptr,
+                        wanted,
+                        found: actual,
+                    });
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Every ROOT_ITEM whose generation disagrees with the block it points at.
+    ///
+    /// The internal-node walk above cannot see this class, and bd-73bi2 is
+    /// exactly this class: the root tree's ROOT_ITEM for the free space tree
+    /// (objectid 10) claims generation 10 over a block still carrying 9, and the
+    /// kernel says `parent transid verify failed on logical 30474240 wanted 10
+    /// found 9` before it has descended into any tree at all. A detector that
+    /// only compares key-pointers to children reports such an image CLEAN --
+    /// which is what the first version of this did.
+    pub fn btrfs_root_item_transid_mismatches(
+        &self,
+        cx: &Cx,
+    ) -> Result<Vec<BtrfsTransidMismatch>, FfsError> {
+        let Some(sb) = self.btrfs_superblock() else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        for logical in self.btrfs_tree_node_addresses(cx, sb.root)? {
+            let node = self
+                .btrfs_read_parsed_node(cx, logical)
+                .map_err(|e| parse_to_ffs_error(&e))?;
+            let BtrfsParsedNode::Leaf { block, items } = node.as_ref() else {
+                continue;
+            };
+            for item in items {
+                if item.key.item_type != BTRFS_ITEM_ROOT_ITEM {
+                    continue;
+                }
+                let start = item.data_offset as usize;
+                let end = start + item.data_size as usize;
+                let Some(payload) = block.get(start..end) else {
+                    continue;
+                };
+                let Ok(root_item) = ffs_btrfs::parse_root_item(payload) else {
+                    continue;
+                };
+                if let Some(actual) = self.btrfs_tree_block_generation(cx, root_item.bytenr)
+                    && actual != root_item.generation
+                {
+                    found.push(BtrfsTransidMismatch {
+                        logical: root_item.bytenr,
+                        wanted: root_item.generation,
+                        found: actual,
+                    });
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The generation in a tree block's header, read directly.
+    fn btrfs_tree_block_generation(&self, cx: &Cx, logical: u64) -> Option<u64> {
+        let ctx = self.btrfs_context()?;
+        let ns = usize::try_from(ctx.nodesize).ok()?;
+        let mapping = map_logical_to_physical(&ctx.chunks, logical).ok()??;
+        let mut buf = vec![0_u8; ns];
+        self.dev
+            .read_exact_at(cx, ByteOffset(mapping.physical), &mut buf)
+            .ok()?;
+        ffs_btrfs::BtrfsHeader::parse_from_block(&buf)
+            .ok()
+            .map(|header| header.generation)
+    }
+}
+
 impl FsOps for OpenFs {
     fn xattr_presence(&self, cx: &Cx) -> XattrPresence {
         match &self.flavor {
@@ -4079,6 +4213,60 @@ impl FsOps for OpenFs {
 #[cfg(test)]
 mod xattr_scan_tests {
     use super::*;
+
+    /// bd-73bi2: the detector must FIRE on an image the kernel rejects and stay
+    /// SILENT on one it accepts.
+    ///
+    /// Both fixtures are built the same way by
+    /// `scripts/make_btrfs_fixture.py`, differing only in file count -- 2000
+    /// (kernel mounts it) against 5000 (kernel refuses with `parent transid
+    /// verify failed ... failed to load root free space`). Without the negative
+    /// half, a detector that reported every image as corrupt would pass.
+    #[test]
+    fn the_transid_detector_fires_only_on_the_image_the_kernel_rejects_bd_73bi2() {
+        let good = std::path::Path::new("/home/ubuntu/btrfs-fixture-2k.img");
+        let bad = std::path::Path::new("/home/ubuntu/btrfs-bisect-r5000.img");
+        if !good.exists() || !bad.exists() {
+            eprintln!("skipping: fixtures absent; rebuild with scripts/make_btrfs_fixture.py");
+            return;
+        }
+        let cx = Cx::for_testing();
+        for (image, expect_mismatch) in [(good, false), (bad, true)] {
+            let fs = OpenFs::open(&cx, image).expect("image must open through OUR reader");
+            let sb = fs.btrfs_superblock().expect("btrfs superblock");
+            // Every tree, not just the root tree. The kernel's complaint on the
+            // bad image is `failed to load root free space`, so a detector aimed
+            // only at `sb.root` finds nothing and reports a corrupt image clean
+            // -- which is exactly what it did on the first run of this test.
+            let mut mismatches = fs
+                .btrfs_transid_mismatches(&cx, sb.root)
+                .expect("the walk itself must not fail");
+            for objectid in [
+                ffs_btrfs::BTRFS_FS_TREE_OBJECTID,
+                ffs_btrfs::BTRFS_CSUM_TREE_OBJECTID,
+                ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
+            ] {
+                if let Ok(root) = fs.btrfs_fs_tree_root_bytenr(&cx, objectid) {
+                    mismatches.extend(
+                        fs.btrfs_transid_mismatches(&cx, root)
+                            .expect("the walk itself must not fail"),
+                    );
+                }
+            }
+            // The class bd-73bi2 actually belongs to: a ROOT_ITEM disagreeing
+            // with the block it points at, before any tree is descended.
+            mismatches.extend(
+                fs.btrfs_root_item_transid_mismatches(&cx)
+                    .expect("the root-item walk must not fail"),
+            );
+            assert_eq!(
+                !mismatches.is_empty(),
+                expect_mismatch,
+                "{}: expected mismatch={expect_mismatch}, found {mismatches:?}",
+                image.display()
+            );
+        }
+    }
 
     /// bd-ha71t / bd-btrfs-warm-stat-5x-9pxn1: the btrfs half of the proof.
     ///
