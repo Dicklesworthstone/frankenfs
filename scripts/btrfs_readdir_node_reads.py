@@ -203,7 +203,8 @@ def unmount(mountpoint: Path) -> None:
 
 def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
           label: str, listing: list[str], settle: float,
-          daemon_env: dict[str, str] | None = None) -> dict | None:
+          daemon_env: dict[str, str] | None = None,
+          subdir: str = "") -> dict | None:
     """Mount `image` fresh, strace the daemon across one listing, count reads.
 
     `daemon_env` is applied to the DAEMON only, so an A/B of a knob runs both
@@ -245,7 +246,11 @@ def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(settle)
 
-    subprocess.run(listing + [str(mountpoint)],
+    # The comparator's own build_fixture_tree puts entries in `large-directory`,
+    # not at the image root, so an ext4 fixture measured at the root lists 5
+    # entries and compares nothing. --subdir targets the real directory.
+    target = str(mountpoint / subdir) if subdir else str(mountpoint)
+    subprocess.run(listing + [target],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
 
@@ -261,7 +266,7 @@ def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
     distinct = len(offsets)
     worst = offsets.most_common(1)[0][1] if offsets else 0
     # Safe now: the tracer is stopped, so this readdir cannot pollute the arm.
-    entries = len(os.listdir(mountpoint))
+    entries = len(os.listdir(target))
 
     unmount(mountpoint)
     try:
@@ -341,6 +346,11 @@ def main() -> int:
                         "so it is worth running once and not every time)")
     p.add_argument("--settle", type=float, default=4.0,
                    help="seconds to wait for the daemon and the tracer to attach")
+    p.add_argument("--subdir", default="",
+                   help="measure this directory INSIDE the image instead of its root. "
+                        "The mounted comparator's fixtures live in `large-directory`, "
+                        "so an ext4 arm measured at the root lists ~5 entries and "
+                        "compares nothing.")
     p.add_argument("--client", action="append", default=[], metavar="ARGV",
                    help="run this client instead of ls/ls -l, repeatable, one arm "
                         "each. The mountpoint is appended as the last argument. "
@@ -419,7 +429,7 @@ def main() -> int:
             for arm, listing in arms:
                 label = f"{image.stem}_{arm}"
                 r = probe(args.cli, image, args.mountpoint, args.work_dir,
-                          label, listing, args.settle, daemon_env)
+                          label, listing, args.settle, daemon_env, args.subdir)
                 if not r:
                     continue
                 rows.append(r)

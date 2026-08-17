@@ -9370,3 +9370,52 @@ What changed: distinct counts up ~40-50%, re-read factors down, the floor memo d
 the cold readdir newly measured. What did not change: the cliff's existence, its location, the
 per-entry growth, the mechanism, and the conclusion that the stat path is the problem and readdir
 is not. NO wall-clock claim is made anywhere in this entry.
+
+## MECHANISM — 2026-08-17 — bd-3zx2x's prescribed btrfs-vs-ext4 comparison, finally run: ext4's stat adds ZERO device reads, btrfs's does not (CreamTrout)
+
+bd-3zx2x has asked since 2026-08-06 for "btrfs-vs-ext4 on the SAME workload, because the shared
+audit component cancels in the former". I had measured btrfs in absolute terms and stated ext4's
+behaviour from architecture rather than measurement, and said so. Here is the arm.
+
+Certification window REFUSED for the seventh time, and the premise again did not hold: told "no
+external builds", `ps` showed three `rustc` at ~100% CPU each plus active cargo in smartedgar (9
+processes), frankenredis (8), mcp_agent_mail_rust (2). Samples: **15, 15, 14 of 64 CPUs above 25%
+busy against the veto limit of 2**, 4-6 above 50%. No timed row attempted; this is a count.
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, ELF `dbc2dd65fe4e266fff0b45f1`,
+mean CPU 2574.8 MHz over 64 CPUs, loadavg 10.16→11.51, df 248G→245G. One fresh mount per arm, fixed
+parser, entry count after the traced window.
+
+### The comparison
+
+Same harness, same client, comparable entry counts, one flat directory each:
+
+| filesystem | entries | readdir | readdir+stat | **stat adds** | per entry (stat) |
+|---|---|---|---|---|---|
+| **ext4** | 2000 | 143 reads | 143 reads | **0** | 0.07 |
+| **btrfs** | 2048 | 41 reads | 113 reads | **72** | 0.06 |
+
+**On ext4, statting every entry costs ZERO additional device reads.** Enumerating the directory
+already reads the inode-table blocks the stats need, and ext4 computes an inode's location
+arithmetically, so there is no second lookup to pay for. On btrfs the same stats add 72 reads at the
+same directory size — and that delta is the thing that explodes: at 20,048 entries btrfs goes
+303 → 27,464, adding **27,161**.
+
+That is the btrfs-SPECIFIC excess this bead was created to isolate, measured rather than inferred:
+**the entire excess is on the stat side, and ext4's stat side is free in device reads.**
+
+Note ext4's readdir is *more* expensive than btrfs's at comparable size (143 vs 41). The btrfs
+enumeration path is not the problem and never was; it is cheaper than the incumbent's. Everything
+btrfs loses on this row it loses after enumeration.
+
+### Scope, stated because it bounds the claim
+
+Measured at ~2,000 entries on both filesystems. I do not have a 20,000-entry ext4 fixture, so the
+ext4 arm is **below** the region where the btrfs cliff opens (5,048 → 10,048). What is established
+is that ext4's stat adds zero reads where btrfs's adds 72 at the same size; what is NOT established
+is ext4's behaviour at 20k. Building that fixture — `ffs-cli mkfs` plus population through our own
+mount with a kernel readback, the `make_btrfs_fixture.py` pattern — is the obvious next step and
+needs no quiet window.
+
+This also closes bd-3zx2x: its acceptance was the comparison, and the comparison now exists.
+NO wall-clock claim is made in this entry.
