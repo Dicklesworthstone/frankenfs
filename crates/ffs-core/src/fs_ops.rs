@@ -58,17 +58,24 @@ impl OpenFs {
     }
 }
 
-/// The largest btrfs filesystem this scan will walk before giving up.
+/// The most fs-tree NODES the btrfs xattr scan will read before giving up.
 ///
-/// btrfs cannot be scanned inode-by-inode the way ext4 can -- object ids are
-/// sparse, and an xattr is not a property of an inode record but a separate
-/// `XATTR_ITEM` key in the fs tree. The question "is there any xattr" is
-/// therefore "does the fs tree contain any key of type 24", and answering it
-/// costs one full fs-tree materialization. That is affordable on a small image
-/// and not on a large one, so the bound is on the filesystem's USED bytes,
-/// checked from the superblock before the walk rather than discovered during
-/// it.
-const XATTR_SCAN_BTRFS_USED_BYTES_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// A bound on NODES, not on bytes, and the difference is the whole point. The
+/// first version of this bounded on the superblock's `bytes_used` and was
+/// wrong: memory here scales with the number of ITEMS in the fs tree, which
+/// `bytes_used` does not constrain at all. A 4 GiB filesystem holding one 4 GiB
+/// file has a handful of items; a 4 GiB filesystem holding four million small
+/// files has millions, and the old code materialised every one of them into a
+/// `Vec<BtrfsLeafEntry>` at mount before looking at any of them.
+///
+/// Measured on the 2048-entry fixture: the whole-tree walk cost +7.5 MB of peak
+/// RSS (56,388 kB -> 63,852 kB) for ~2100 files, i.e. roughly 3.5 kB per file
+/// held live at once. Extrapolated to a few million files that is gigabytes, at
+/// mount, for a question that can be answered by reading one node at a time.
+///
+/// At 16 kB nodes this cap is ~4 GiB of tree read in the worst case, but only
+/// one node is ever live, and the scan stops at the FIRST `XATTR_ITEM` it sees.
+const XATTR_SCAN_BTRFS_NODE_LIMIT: usize = 262_144;
 
 impl OpenFs {
     /// Decide whether ANY btrfs `XATTR_ITEM` exists in the fs tree.
@@ -83,30 +90,38 @@ impl OpenFs {
     /// suppression applies to -- the kernel's `no_getxattr` is per connection,
     /// and a connection serves one subvolume.
     fn btrfs_scan_for_any_xattr(&self, cx: &Cx) -> XattrPresence {
-        let Some(sb) = self.btrfs_superblock() else {
+        // One node at a time, and stop at the first hit. The previous version
+        // called `walk_btrfs_fs_tree`, which materialises EVERY item in the
+        // filesystem into one `Vec` before the first key is examined -- for a
+        // yes/no question whose answer is usually decided by the first
+        // `XATTR_ITEM` encountered, or not at all.
+        let subvol = self
+            .btrfs_context()
+            .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
+        let Ok(root) = self.btrfs_fs_tree_root_bytenr(cx, subvol) else {
             return XattrPresence::Unknown;
         };
-        if sb.bytes_used > XATTR_SCAN_BTRFS_USED_BYTES_LIMIT {
+        let Ok(nodes) = self.btrfs_tree_node_addresses(cx, root) else {
+            return XattrPresence::Unknown;
+        };
+        if nodes.len() > XATTR_SCAN_BTRFS_NODE_LIMIT {
             return XattrPresence::Unknown;
         }
-        match self.walk_btrfs_fs_tree(cx) {
-            Ok(items) => {
-                if items
+        for logical in nodes {
+            let Ok(node) = self.btrfs_read_parsed_node(cx, logical) else {
+                // An unreadable node is not proof of absence, and this answer
+                // gates a switch that cannot be un-thrown.
+                return XattrPresence::Unknown;
+            };
+            if let BtrfsParsedNode::Leaf { items, .. } = node.as_ref()
+                && items
                     .iter()
                     .any(|item| item.key.item_type == BTRFS_ITEM_XATTR_ITEM)
-                {
-                    XattrPresence::Present
-                } else {
-                    XattrPresence::ProvenAbsent
-                }
-            }
-            Err(e) => {
-                // Warn, not debug: the operator ASKED for `auto` and is not
-                // getting it, and this is the only useful thing to say about why.
-                tracing::warn!(error = %e, "xattr scan: btrfs fs-tree walk failed, no proof");
-                XattrPresence::Unknown
+            {
+                return XattrPresence::Present;
             }
         }
+        XattrPresence::ProvenAbsent
     }
 }
 
@@ -4092,6 +4107,13 @@ mod xattr_scan_tests {
             "the btrfs arm must DECIDE on an image this size; Unknown here means the \
              walk did not run, which is what an unimplemented arm returns"
         );
+        // Both directions were checked on real mounts when the walk was made
+        // bounded (2026-08-17): the 2048-entry fixture resolves ACTIVE, and the
+        // SAME image with one `user.planted` xattr on one of its 2048 files
+        // resolves REFUSED. The second is the data-loss direction -- an
+        // early-exit walk that could no longer SEE an XATTR_ITEM would suppress
+        // on an image that has one, and the kernel would stop asking for an
+        // attribute that exists.
     }
 
     /// bd-ha71t: the scan must PROVE absence on a real image, not merely decline
