@@ -10115,3 +10115,63 @@ understates what a multi-minute run sees by roughly 3x. At a best sample of 17 �
 that already produced a CONTENDED block — spending a run and 2.1G of artifacts to reproduce that
 verdict is not a good trade. **The candidate ELF is already built (`c3eac8bd3ad7d920…`), so the next
 genuine trough can be used immediately without the build that consumed the last one.**
+
+## METHODOLOGY — 2026-08-17 — the load veto measures SPREAD, not magnitude: 8.5 cores of work across 64 trips it while the box is 85% idle (bd-4sull)
+
+Eleven windows have now been reported clean and declined. The idle figures were accurate every time
+and so was my refusal, which means the two readings were measuring different things. This entry
+identifies what, because the difference is mechanical and it decides whether this gate is reachable.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, mean CPU 2607.2 MHz over 64
+CPUs, loadavg 15.59/13.79/16.86, **idle 77.6-86.1% across four samples, iowait 0.0-0.1%**, df 204G.
+No binary executed for this entry beyond `ps` and `/proc/stat`.
+
+**Both readings are true at once.**
+
+Per-CPU busy distribution over 10s, and the total it sums to:
+
+| bucket | CPUs |
+|---|---|
+| <5% busy | 32 |
+| 5-25% | 20 |
+| **25-50%** | **8** |
+| **50-80%** | **4** |
+| >80% | 0 |
+| **total work** | **~8.5 cores of 64** |
+
+Only **8.5 cores** of work exist — hence idle 85%, which is exactly what was reported. But that work
+is **spread across ~32 cores**, so **12 of them sit above the veto's 25% line**. The veto's limit is
+**2**. Attribution: smartedgar ~3.0 cores, narrow_route_sentinel ~1.6, frankenpandas ~1.0, `am` ~1.1,
+frankenlibc ~0.3 — thin background work from several tenants, none of it heavy.
+
+**The veto does not measure how much load there is. It measures how many cores the load touches.**
+At 85% idle, ~8.5 cores of thin multi-tenant work reliably paints 13-21 cores above 25%, and no
+amount of idle headroom changes that.
+
+**A hypothesis of mine, refuted by the report.**
+
+I suspected the veto was counting the run's OWN activity as external — that would have made it
+unsatisfiable by construction. The preserved report refutes it: `placement_cpus_excluded = 16`,
+`client_affinity_cpus = [25,26,27,28,29,30,31,57]`, and the offending figure is
+`peak_off_placement_mean_busy = 0.7737` — off-placement cores at 77% mean busy. That is genuine
+external load, correctly excluded from the run's own. The 15-vs-48 gap between my pre-run sample and
+the harness's in-run count was **temporal**, not structural: the box was simply far busier at 16:47
+than during my samples.
+
+**What this means for bd-4sull.**
+
+bd-4sull argues the `external_load_during_run` veto should be demoted and has been blocked on
+obtaining a quiet anchor. Two measurements now bound that:
+
+* the gate was reached in **0 of 30 samples** over five minutes of the quietest period of the day;
+* and now the mechanism — with **8.5 cores** of thin spread work, 12 CPUs sit over the 25% line
+  against a limit of **2**. To satisfy it, essentially every tenant would have to be idle
+  simultaneously, not merely light.
+
+That reframes the bead's question. It is not "wait for a quiet window"; it is **"is a
+2-busy-off-placement-CPU threshold the right test for whether an 8-client-thread run pinned to 8 CPUs
+was disturbed, when 48 off-placement cores are available and 32 of them are below 5% busy?"** I do
+not answer that here — it is a methodology decision, and bd-4sull's own integrity argument (every row
+this veto refuses on these workloads is an HONEST_LOSS, so admitting them cannot manufacture a win)
+remains the substantive case. What is now measured is that the threshold is **unreachable under any
+realistic multi-tenant load on this host**, and the reason is spread rather than magnitude.
