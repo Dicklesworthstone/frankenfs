@@ -19,6 +19,61 @@
 /// point. Matching anywhere in the line would treat a device or an option string
 /// that merely contains the path as a mount, which is the kind of false positive
 /// that would make the seeding path refuse to run at all.
+/// How many times the pre-measurement guard check may resample before failing.
+///
+/// The guard runs after six mounts are already up, so failing on one sample
+/// throws away the whole setup. Bounded so a genuinely busy host still fails in
+/// finite time rather than spinning.
+const GUARD_RESAMPLE_ATTEMPTS: usize = 5;
+
+/// The first guard CPU over its limit, described, or `None` when all are clear.
+///
+/// Pure so the limit logic is testable without a host: the driver and FUSE arms
+/// have DIFFERENT ceilings (0.20 and 0.35), and applying one arm's limit to the
+/// other would either refuse runs that should proceed or admit a busy driver
+/// core, which is the arm the timing is most sensitive to.
+fn guard_offender(
+    contention: &BTreeMap<usize, f64>,
+    driver_guard_cpus: &BTreeSet<usize>,
+    fuse_guard_cpus: &BTreeSet<usize>,
+    driver_limit: f64,
+    fuse_limit: f64,
+) -> Option<String> {
+    for &cpu in driver_guard_cpus {
+        match contention.get(&cpu) {
+            None => {
+                return Some(format!(
+                    "driver guard cpu{cpu} disappeared before measurement"
+                ));
+            }
+            Some(&load) if load > driver_limit => {
+                return Some(format!(
+                    "driver guard cpu{cpu} became {:.1}% busy before measurement",
+                    load * 100.0
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for &cpu in fuse_guard_cpus {
+        match contention.get(&cpu) {
+            None => {
+                return Some(format!(
+                    "FUSE guard cpu{cpu} disappeared before measurement"
+                ));
+            }
+            Some(&load) if load > fuse_limit => {
+                return Some(format!(
+                    "FUSE cpu{cpu} became {:.1}% busy before measurement",
+                    load * 100.0
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    None
+}
+
 fn path_is_mounted(mounts: &str, path: &std::path::Path) -> bool {
     let needle = path.to_string_lossy();
     mounts
@@ -6157,28 +6212,49 @@ fn fs_report(
             MAX_DRIVER_PREFLIGHT_BUSY,
         );
     }
-    for &cpu in &placement.driver_guard_cpus {
-        let load = contention
-            .get(&cpu)
-            .copied()
-            .ok_or_else(|| anyhow!("driver guard cpu{cpu} disappeared before measurement"))?;
-        ensure!(
-            load <= MAX_DRIVER_PREFLIGHT_BUSY,
-            "driver guard cpu{cpu} became {:.1}% busy before measurement",
-            load * 100.0
-        );
+    // bd-guard-resample: RE-SAMPLE before failing, rather than treating the first
+    // sample as the only chance.
+    //
+    // This check runs AFTER all six arms are mounted, so a single transient blip
+    // discards the entire setup and the run exits with no data at all. Observed
+    // six times in one day -- cpu58, cpu60, cpu28, cpu61, cpu59, cpu26, a
+    // DIFFERENT cpu each time, at host loadavg 10-32. A different core every time
+    // is not a bad core; it is that any core can be scheduled onto during the
+    // window between placement and measurement.
+    //
+    // This does NOT relax the guarantee. Measurement still begins only when every
+    // guard CPU is under its limit ON A SINGLE SAMPLE -- the same condition as
+    // before, since a clean sample is required, not an average of dirty ones. All
+    // that changes is how many chances the host gets to present one.
+    let mut contention = contention;
+    let mut last_offender: Option<String> = None;
+    let mut cleared = false;
+    for attempt in 0..GUARD_RESAMPLE_ATTEMPTS {
+        match guard_offender(
+            &contention,
+            &placement.driver_guard_cpus,
+            &placement.fuse_guard_cpus,
+            MAX_DRIVER_PREFLIGHT_BUSY,
+            MAX_FUSE_PREFLIGHT_BUSY,
+        ) {
+            None => {
+                cleared = true;
+                break;
+            }
+            Some(offender) => {
+                last_offender = Some(offender);
+                if attempt + 1 < GUARD_RESAMPLE_ATTEMPTS {
+                    std::thread::sleep(CPU_SAMPLE_INTERVAL);
+                    contention = sample_cpu_busy()?;
+                }
+            }
+        }
     }
-    for &cpu in &placement.fuse_guard_cpus {
-        let load = contention
-            .get(&cpu)
-            .copied()
-            .ok_or_else(|| anyhow!("FUSE guard cpu{cpu} disappeared before measurement"))?;
-        ensure!(
-            load <= MAX_FUSE_PREFLIGHT_BUSY,
-            "FUSE cpu{cpu} became {:.1}% busy before measurement",
-            load * 100.0
-        );
-    }
+    ensure!(
+        cleared,
+        "{} after {GUARD_RESAMPLE_ATTEMPTS} samples",
+        last_offender.unwrap_or_else(|| "a guard cpu was busy".to_owned())
+    );
 
     let pinning = WorkerPinning::new(placement.driver_cpus.clone())?;
     let samples = collect_samples(&roots, config, &pinning, interrupted)?;
@@ -10066,6 +10142,62 @@ mod tests {
         // Garbage values are skipped, not defaulted to zero: a 0 MHz core would
         // make the max/min spread infinite and poison the summary.
         assert!(parse_cpu_mhz("processor\t: 0\ncpu MHz\t\t: n/a\n").is_empty());
+    }
+
+    /// bd-guard-resample: each arm keeps its OWN busy ceiling, and a clean sample
+    /// is still required.
+    ///
+    /// The resample loop only changes how many chances the host gets to present a
+    /// clean sample; it must not change what "clean" means. The driver ceiling is
+    /// 0.20 and the FUSE ceiling is 0.35, and collapsing them either way is a real
+    /// failure: one direction refuses runs that should proceed, the other admits a
+    /// busy DRIVER core, which is the arm the timing is most sensitive to because
+    /// the timed region includes its directory fsyncs.
+    #[test]
+    fn guard_offender_applies_each_arms_own_limit_bd_guard_resample() {
+        let driver_guard: BTreeSet<usize> = [4, 36].into_iter().collect();
+        let fuse_guard: BTreeSet<usize> = [8, 40].into_iter().collect();
+
+        let clear: BTreeMap<usize, f64> = [(4, 0.01), (36, 0.02), (8, 0.30), (40, 0.10)]
+            .into_iter()
+            .collect();
+        assert!(
+            guard_offender(&clear, &driver_guard, &fuse_guard, 0.20, 0.35).is_none(),
+            "cpu8 at 0.30 is under the FUSE ceiling of 0.35 and must pass"
+        );
+
+        // The same 0.30 on a DRIVER guard cpu must FAIL: it is over 0.20.
+        let busy_driver: BTreeMap<usize, f64> = [(4, 0.30), (36, 0.02), (8, 0.30), (40, 0.10)]
+            .into_iter()
+            .collect();
+        let offender = guard_offender(&busy_driver, &driver_guard, &fuse_guard, 0.20, 0.35)
+            .expect("a driver guard over its limit must be reported");
+        assert!(offender.contains("driver guard cpu4"), "{offender}");
+        assert!(offender.contains("30.0%"), "{offender}");
+
+        // A FUSE guard over its own, higher ceiling.
+        let busy_fuse: BTreeMap<usize, f64> = [(4, 0.01), (36, 0.02), (8, 0.40), (40, 0.10)]
+            .into_iter()
+            .collect();
+        let offender = guard_offender(&busy_fuse, &driver_guard, &fuse_guard, 0.20, 0.35)
+            .expect("a FUSE guard over its limit must be reported");
+        assert!(offender.contains("FUSE cpu8"), "{offender}");
+
+        // A guard CPU missing from the sample is a failure, not a pass: an absent
+        // reading must never be treated as a quiet one.
+        let missing: BTreeMap<usize, f64> =
+            [(4, 0.01), (8, 0.30), (40, 0.10)].into_iter().collect();
+        let offender = guard_offender(&missing, &driver_guard, &fuse_guard, 0.20, 0.35)
+            .expect("a missing guard cpu must be reported");
+        assert!(offender.contains("cpu36"), "{offender}");
+        assert!(offender.contains("disappeared"), "{offender}");
+
+        // Exactly at the limit passes: the check is `>`, and a core sitting
+        // precisely at the ceiling was always admitted before the resample loop.
+        let at_limit: BTreeMap<usize, f64> = [(4, 0.20), (36, 0.20), (8, 0.35), (40, 0.35)]
+            .into_iter()
+            .collect();
+        assert!(guard_offender(&at_limit, &driver_guard, &fuse_guard, 0.20, 0.35).is_none());
     }
     #[test]
     fn path_is_mounted_matches_only_the_mount_point_field_bd_seed_mnt() {
