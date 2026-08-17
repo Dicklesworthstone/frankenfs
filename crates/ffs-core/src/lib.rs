@@ -17836,6 +17836,72 @@ const BTRFS_FEATURE_COMPAT_RO_SUPP: u64 = BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TRE
 const BTRFS_FEATURE_COMPAT_RO_SAFE_SET: u64 = 0;
 const BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR: u64 = 0;
 
+/// The `compat_ro_flags` a commit must publish, given whether it actually
+/// rewrote the FREE_SPACE_TREE (bd-73bi2).
+///
+/// The commit patches the FREE_SPACE_TREE `ROOT_ITEM` generation to `new_gen`
+/// optimistically, before it can know whether the tree will still fit in one
+/// leaf. When it does not fit, the leaf is never rewritten and keeps its old
+/// generation — so the root pointer says `new_gen` and the block says
+/// `new_gen - 1`. The kernel checks exactly that pair:
+///
+/// ```text
+/// BTRFS error: parent transid verify failed on logical N wanted 10 found 9
+/// BTRFS error: failed to load root free space
+/// BTRFS error: open_ctree failed: -5
+/// ```
+///
+/// The whole filesystem is then unmountable, while OUR reader — which does not
+/// verify parent transid — opens it happily. That asymmetry is what makes this
+/// worth a named function instead of an inline `if`: no round-trip through
+/// FrankenFS alone can observe it.
+///
+/// `btrfs_read_roots` only loads the free-space root when the
+/// `FREE_SPACE_TREE` compat_ro bit is set, so CLEARING that bit is what stops
+/// the kernel from ever checking the stale pointer. `VALID` is cleared with it
+/// because a tree nobody loads is certainly not a tree anybody should trust;
+/// leaving `VALID` set on an unloaded tree is the state `btrfs check` reports
+/// as a stale free-space tree. The image then mounts and the kernel rebuilds
+/// free-space accounting from the extent tree.
+///
+/// Note this only ever CLEARS bits it did not set: a source image made without
+/// a free-space tree is unaffected, and no unrelated compat_ro bit is touched.
+/// Whether a commit is about to strand the free-space tree (bd-73bi2).
+///
+/// The FREE_SPACE_TREE's ROOT_ITEM generation is patched to `new_gen` EARLY,
+/// before the root tree is serialized, because the root tree must carry the new
+/// pointer. The block it points at is rewritten LATE, and only if the tree still
+/// fits in a single leaf. Above roughly 4000 files it does not, the write is
+/// skipped, and the image ships with a ROOT_ITEM claiming generation N over a
+/// block still carrying N-1. The kernel then refuses the whole filesystem:
+///
+///     parent transid verify failed on logical <fst> wanted N found N-1
+///     failed to load root free space
+///     open_ctree failed: -5
+///
+/// FrankenFS reads that image back perfectly, which is why it went unnoticed.
+///
+/// The same hazard was already reasoned about for `chunk_root_generation` a few
+/// lines below the commit point -- "we deliberately do NOT bump it, our
+/// transaction does not rewrite the chunk_tree" -- and the identical case for
+/// the free-space tree was missed.
+const fn btrfs_commit_would_strand_free_space_tree(
+    fst_root_item_patched: bool,
+    fst_block_written: bool,
+) -> bool {
+    fst_root_item_patched && !fst_block_written
+}
+
+const fn btrfs_compat_ro_after_commit(existing: u64, fst_committed: bool) -> u64 {
+    if fst_committed {
+        existing | BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID
+    } else {
+        existing
+            & !(BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE
+                | BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID)
+    }
+}
+
 const BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF: u64 = 1 << 0;
 const BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL: u64 = 1 << 1;
 const BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS: u64 = 1 << 2;
@@ -29810,6 +29876,27 @@ impl OpenFs {
         // on <chunk_root> wanted <new_gen> found <old_gen>". The
         // dev_item / sys_chunk_array / label / backup-root-ring regions are
         // preserved verbatim by virtue of patching in place.
+        // bd-73bi2: the superblock is the commit point, so this is the last
+        // place a stranded free-space tree can be stopped. Refusing to advance
+        // it leaves the image at its previous, consistent commit -- every other
+        // tree we wrote is unreachable from the old superblock, which is exactly
+        // what btrfs's commit model is for. Shipping the advance instead
+        // produces an image only FrankenFS can open.
+        //
+        // This is deliberately a refusal and not a repair: making the write
+        // succeed needs the free-space tree serialized at level > 0, and that
+        // needs blocks allocated for the interior nodes, which perturbs the very
+        // free space being recorded. That restructure is the fix; this is the
+        // guard that stops the corruption shipping in the meantime.
+        if btrfs_commit_would_strand_free_space_tree(fst_reuse.is_some(), fst_committed) {
+            return Err(FfsError::Io(std::io::Error::other(
+                "bd-73bi2: refusing to advance the superblock -- the FREE_SPACE_TREE \
+                 ROOT_ITEM was patched to the new generation but its block could not be \
+                 rewritten (it no longer fits in one leaf), so the kernel would reject \
+                 this image with 'parent transid verify failed'. The image is unchanged \
+                 at its previous commit.",
+            )));
+        }
         sb_bytes[0x48..0x50].copy_from_slice(&new_gen.to_le_bytes());
         sb_bytes[0x50..0x58].copy_from_slice(&root_tree_bytenr.to_le_bytes());
         sb_bytes[0xC6] = root_tree_level;
@@ -29827,10 +29914,25 @@ impl OpenFs {
         // bd-qxo5x: now that the FREE_SPACE_TREE has been rewritten to match the
         // new allocations, mark it valid so btrfs/`btrfs check` trust it rather
         // than rebuilding. compat_ro_flags lives at 0xB4 (u64 LE).
-        if fst_committed && sb_bytes.len() >= 0xBC {
-            let mut compat_ro =
-                u64::from_le_bytes(sb_bytes[0xB4..0xBC].try_into().expect("8 bytes"));
-            compat_ro |= BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID;
+        //
+        // bd-73bi2: and when it was NOT rewritten, the flags must be CLEARED,
+        // not merely left alone. The comment on the fallback above always said
+        // it leaves the tree "not-VALID in the superblock", but the code only
+        // ever OR-ed the bit in — so a source image that arrived from `mkfs`
+        // with the bit already set kept it, and the kernel then tried to load a
+        // tree whose ROOT_ITEM generation had been advanced past the block it
+        // points at. See [`btrfs_compat_ro_after_commit`].
+        if sb_bytes.len() >= 0xBC {
+            let existing = u64::from_le_bytes(sb_bytes[0xB4..0xBC].try_into().expect("8 bytes"));
+            let compat_ro = btrfs_compat_ro_after_commit(existing, fst_committed);
+            if compat_ro != existing {
+                tracing::debug!(
+                    existing,
+                    compat_ro,
+                    fst_committed,
+                    "btrfs commit: compat_ro_flags updated for free-space-tree state (bd-73bi2)"
+                );
+            }
             sb_bytes[0xB4..0xBC].copy_from_slice(&compat_ro.to_le_bytes());
         }
 
@@ -37601,6 +37703,69 @@ impl FrankenFsEngine {
     }
 }
 
+#[cfg(test)]
+
+/// bd-73bi2: a commit that did NOT rewrite the free-space tree must clear
+/// the feature bits, not leave whatever the source image already had.
+///
+/// This is the P0 in one assertion. The commit advances the FST ROOT_ITEM
+/// generation optimistically, so when the rewrite is skipped the pointer
+/// and the block disagree. A freshly formatted btrfs image arrives with
+/// both bits set, and the old code only ever OR-ed `VALID` in — so the bits
+/// survived, the kernel loaded the tree, checked the generation pair, and
+/// refused the whole filesystem with `open_ctree failed: -5` while our own
+/// mount read the same image fine.
+#[test]
+fn skipped_free_space_tree_rewrite_clears_the_feature_bits_bd_73bi2() {
+    let from_source =
+        BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE | BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID;
+
+    // The regression: a skipped rewrite on an image that already had the bits.
+    let skipped = btrfs_compat_ro_after_commit(from_source, false);
+    assert_eq!(
+        skipped & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE,
+        0,
+        "the kernel only loads the free-space root when this bit is set; leaving it \
+             set is what made the image unmountable"
+    );
+    assert_eq!(
+        skipped & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID,
+        0,
+        "a tree nobody loads must not also be advertised as trustworthy"
+    );
+
+    // The committed path still publishes VALID.
+    assert_eq!(
+        btrfs_compat_ro_after_commit(from_source, true)
+            & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID,
+        BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID
+    );
+    assert_eq!(
+        btrfs_compat_ro_after_commit(BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE, true),
+        from_source,
+        "a rewritten tree is marked valid"
+    );
+
+    // Unrelated compat_ro bits must survive both paths untouched: this
+    // function may clear only the two bits it owns.
+    let unrelated = BTRFS_FEATURE_COMPAT_RO_VERITY | BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE;
+    assert_eq!(
+        btrfs_compat_ro_after_commit(from_source | unrelated, false),
+        unrelated,
+        "clearing the free-space bits must not disturb verity/block-group-tree"
+    );
+    assert_eq!(
+        btrfs_compat_ro_after_commit(unrelated, false),
+        unrelated,
+        "an image that never had a free-space tree is left exactly as it was"
+    );
+}
+
+// Re-attached 2026-08-17: a `#[test] fn` was inserted between this module and
+// its `#[cfg(test)]`, so the attribute bound to that fn and left the module
+// unguarded -- ffs-core then failed EVERY non-test build on its test-only
+// imports (serde_json, tracing_subscriber, sha2). `cargo test` still passed,
+// which is why it survived: only a plain `cargo build` can see it.
 #[cfg(test)]
 mod tests {
     // This (very large) test module relaxes pedantic/nursery style lints plus a
@@ -89829,5 +89994,32 @@ mod tests {
             "no inodes should reference non-existent extent"
         );
         assert_eq!(elem_missed, 0);
+    }
+}
+
+#[cfg(test)]
+mod free_space_tree_strand_tests {
+    use super::btrfs_commit_would_strand_free_space_tree;
+
+    /// bd-73bi2, the exact shape: the ROOT_ITEM generation was advanced and the
+    /// block was not rewritten.
+    #[test]
+    fn a_patched_root_item_with_no_block_write_is_stranded_bd_73bi2() {
+        assert!(btrfs_commit_would_strand_free_space_tree(true, false));
+    }
+
+    /// The normal path: both happened, generations agree, nothing to stop.
+    #[test]
+    fn a_patched_root_item_with_a_block_write_is_fine_bd_73bi2() {
+        assert!(!btrfs_commit_would_strand_free_space_tree(true, true));
+    }
+
+    /// An image with NO free-space tree at all never patched a ROOT_ITEM, so
+    /// there is nothing stranded and the commit must proceed. Getting this cell
+    /// wrong would refuse every commit on such an image.
+    #[test]
+    fn an_image_without_a_free_space_tree_is_not_stranded_bd_73bi2() {
+        assert!(!btrfs_commit_would_strand_free_space_tree(false, false));
+        assert!(!btrfs_commit_would_strand_free_space_tree(false, true));
     }
 }
