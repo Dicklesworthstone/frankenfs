@@ -7651,3 +7651,52 @@ verified ceiling for this fixture is 20000; a larger source image is needed to p
 **Retry predicate for anyone revisiting.** If `btrfs check` ever reports a missing backref again,
 count them per size FIRST: a count that scales with block count is an insertion defect, and no
 amount of flushing fixes it.
+
+## MECHANISM — 2026-08-17 — bd-7nr8p REFUTED: we issue exactly as many barriers per client fsync as kernel ext4 does — 2.0000 each (PlumBeacon)
+
+**Lever/hypothesis.** `fsync-journal-commit` measures `1.976308x` [1.969150, 1.977948] — 200.5 ms
+against kernel ext4's 101.5 ms for 8 x 4 KiB write+fsync. A ratio that close to 2.0 on a workload
+that is nothing but write-and-flush suggested we issue TWO device barriers per client fsync where
+ext4 issues one. Nobody had counted.
+
+**Measured — a COUNT, not a timing, so it is load-independent and needed no quiet window.**
+Instrument: `scripts/fsync_flush_count.py` (selftest 7 cases). Client is byte-for-byte the
+harness's `fsync_journal_batch`. ELF: `target/debug/ffs-cli`, nightly-2026-07-20. Host
+`thinkstation1`, loadavg ~30 at the time — deliberately, to show the count does not care.
+
+| arm | counted by | N | idle control | flushes | per client fsync |
+|---|---|---|---|---|---|
+| kernel ext4 | `/proc/diskstats` flush requests on the loop device | 8 | 0 | 16 | **2.0000** |
+| kernel ext4 | " | 8 | 0 | 16 | **2.0000** |
+| kernel ext4 | " | 64 | 0 | 128 | **2.0000** |
+| kernel ext4 | " | 256 | 0 | 512 | **2.0000** |
+| FrankenFS | `strace -c` on the daemon (`fdatasync` et al.) | 8 | 0 | 16 | **2.0000** |
+| FrankenFS | " | 64 | 0 | 128 | **2.0000** |
+| FrankenFS | " | 256 | 0 | 512 | **2.0000** |
+
+**Why rejected.** The hypothesis is REFUTED, exactly and without a margin: both implementations ask
+their backing file for **two** barriers per client fsync, at every N, as integers. Kernel ext4 is
+not issuing one — it issues two (the ordinary `data=ordered` journal commit: the transaction's
+blocks, then the commit block). So `1.976308x` is NOT a barrier-count effect and no lever that
+removes "our redundant second barrier" exists, because there is no redundant second barrier.
+
+**What is counted, and why the two tools measure the same thing.** The comparable quantity is
+barriers asked of the BACKING FILE, and both arms back onto a regular file: the loop driver turns
+each `REQ_OP_FLUSH` into a `vfs_fsync` of the backing file, and our daemon calls `fdatasync` on the
+image directly. Both counts are exact integers at every N, not noisy averages, and both arms' idle
+controls were 0.
+
+⚠️ **The arms could not be put on one device, and the reason is a capability gap worth recording:**
+`ffs-cli` REFUSES a block device — `/dev/loop13` that the kernel mounts happily comes back as
+"image is not a recognized ext4 or btrfs filesystem", because the open path sizes the image from
+`metadata().len()`, which is 0 for a block special. Filed as bd-5rxz0.
+
+**Where the row goes next.** The per-operation gap is 25.06 ms vs 12.69 ms with the same number of
+barriers, so it is in what each barrier COSTS or what surrounds it, not how many there are. The
+next question is what the daemon writes per barrier: a barrier that flushes more dirty bytes costs
+more, and 8d0248d3 moved us from `sync_all` to `sync_data` without anyone counting the bytes. Count
+bytes-written-per-client-fsync in both arms before timing anything.
+
+**Retry predicate.** If `fsync-journal-commit` is ever re-measured near 2.0x, do NOT re-open the
+barrier-count hypothesis — it is closed by integers. Re-open only if the count itself changes,
+which `scripts/fsync_flush_count.py` re-checks in one command.
