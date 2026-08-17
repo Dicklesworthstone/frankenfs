@@ -12,9 +12,13 @@
 > contain the 2026-08-17 write-path work (`bd-fv9tc` GDT coalescing, `bd-42gtq` COW-only
 > block writes, `bd-k74ef` per-block backrefs), which is why the row moved.
 >
-> **create/delete storm and parallel metadata writes still predate the current tree**
-> (2026-07-31, frozen `f44b3dc4…`) and neither has been re-measured. Both are write-path
-> rows, so the fsync sign change is a direct reason to expect them to have moved too.
+> **create/delete storm and parallel metadata writes were re-measured 2026-08-17 on
+> `c9fb745f…` and BOTH MOVED — but NEITHER run was admitted**, so the table below still shows
+> their frozen figures with the new numbers alongside. Storm: `2.358280x` -> `1.901025x`
+> slower, both A/A nulls clear, run refused by the post-hoc external-load veto (peak
+> off-placement busy 57.2%). Parallel metadata writes: `1.930090x` slower -> **`0.775502x`
+> faster**, a sign change, `BLOCKED_NULL` by `0.000973` of null spread. Quote neither as
+> admitted; see `bd-3tqec`.
 >
 > This file needs the warning **more** than the ext4 one, because the commits landed since
 > are all in the btrfs write path: `839eb708` (the durable commit built leaves it could not
@@ -669,9 +673,9 @@ only the starting line.
 | Workload | vs kernel ext4 | vs kernel btrfs |
 | --- | --- | --- |
 | readdir+stat **(both re-measured 2026-08-08, corrected fixture)** | ≈`4.1x` slower (`4.052605x` / `4.163402x`) | **`7.753405x` slower** — attributed 2026-08-16 to 1.0000 capability probes/entry; **`3.359246x` admitted with the memo sized to the directory** (`bd-34hzz`) |
-| create/delete storm | `2.753659x` slower | `2.358280x` slower |
+| create/delete storm | `2.753659x` slower | `2.358280x` slower (frozen `f44b3dc4…`) — **re-measured 2026-08-17: `1.901025x` slower, gap narrowed 19%, both nulls clear but the run was VETOED for socket contention. Still a LOSS. `bd-3tqec`** |
 | parallel read **(both re-measured 2026-08-08)** | ≈`0.98x` NEUTRAL (`0.986316x` / `0.978203x`) | **≈`0.89–0.93x` FASTER** (`0.893282x` / `0.927352x`, quiet window, 2/2 WIN) |
-| parallel metadata writes | `1.510822x` slower | `1.930090x` slower |
+| parallel metadata writes | `1.510822x` slower | `1.930090x` slower (frozen `f44b3dc4…`) — **re-measured 2026-08-17: `0.775502x` FASTER, a sign change, but `BLOCKED_NULL` by 0.000973 of null spread. NOT admitted; do not quote as a win. `bd-3tqec`** |
 | fsync/journal commit | `0.997098x` neutral | **`~0.45–0.46x` FASTER (re-measured 2026-08-17)** — admitted twice, `0.449048x` at 192 pairs and `0.461109x` at 96, four runs inside 3.1%. Supersedes the `1.976308x` slower figure, which predates the write-path work. **Qualified**: the kernel arm is loop-mounted and we are not (`bd-w2u82`), and durability equivalence is unproven (`bd-5hqj2`) |
 | warm stat | `4.812194x` slower | `4.977803x` / `5.036433x` slower |
 
