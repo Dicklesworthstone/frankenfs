@@ -580,28 +580,28 @@ fn xattr_switch_setting_from_value(value: Option<&str>) -> XattrSwitchSetting {
 /// This is the whole safety argument for `auto` in one place, so it can be
 /// tested as a truth table rather than inferred from four handlers:
 ///
-/// - `auto` requires BOTH a proof of absence AND a read-only mount. The proof
-///   covers the image as it is at mount; read-only is what keeps it true.
+/// - `auto` requires a proof of absence. It does NOT require a read-only mount,
+///   and that is now an OBSERVED claim rather than an argument. The proof covers
+///   the image as it is at mount; what keeps it true afterwards is that while
+///   suppression is active this mount refuses every write that could create an
+///   xattr. Both formats funnel their xattr writes through the single
+///   `FsOps::setxattr` -- ext4 reaches `ffs_xattr::set_xattr` only via
+///   `ext4_setxattr`, btrfs writes `XATTR_ITEM` keys only via `btrfs_setxattr`
+///   -- so a suppressing mount cannot gain a first xattr through itself.
 ///
-///   The read-only half is CONSERVATIVE, not fundamental, and it is worth
-///   recording why it has not been lifted. The argument for lifting it is
-///   strong: while suppression is active this mount refuses every write that
-///   could create an xattr -- `setxattr`/`removexattr` answer `ENOTSUP` -- and
-///   both formats funnel their xattr writes through the single
-///   `FsOps::setxattr` (ext4 reaches `ffs_xattr::set_xattr` only via
-///   `ext4_setxattr`; btrfs writes `XATTR_ITEM` keys only via
-///   `btrfs_setxattr`), so a suppressing mount cannot gain a first xattr
-///   through itself whether or not it is writable.
+///   That was reasoned about at the call graph for one turn and deliberately
+///   NOT acted on, because no test could drive a real `setxattr` through a live
+///   writable mount: the image fixture is root-owned and a user-mounted FUSE
+///   filesystem denies root, so the write returned `EACCES` before reaching the
+///   handler and the permission denial masked the `ENOTSUP` under test. It is
+///   acted on now because
+///   `an_active_switch_refuses_setxattr_on_a_writable_mount_bd_ha71t` drives the
+///   handler directly and reads the errno back out of the reply, with a
+///   negative control that fails if the refusal were unconditional.
 ///
-///   It is not lifted because that argument has never been OBSERVED end to
-///   end. The refusal is asserted at the errno level and reasoned about at the
-///   call graph, but no test drives a real `setxattr` through a live writable
-///   mount: the only image fixture available is root-owned, and a user-mounted
-///   FUSE filesystem denies root, so the write returns `EACCES` before it can
-///   reach the handler. A switch that cannot be un-thrown for the life of a
-///   connection should not be extended to writable mounts on reasoning alone.
-///   Lifting it needs a handler-level harness (a `ReplyEmpty` fixture, which
-///   this crate does not have) or an image with a directory the test user owns.
+///   Not covered, so this is not oversold: another process writing the image
+///   file directly underneath a live mount. That corrupts a mounted image with
+///   or without this switch.
 /// - `Asserted` is honoured even without a proof -- that is what an assertion
 ///   IS -- but it is REFUSED when the filesystem actively proved the opposite.
 ///   An operator asserting "no xattrs" about an image that demonstrably has one
@@ -609,13 +609,16 @@ fn xattr_switch_setting_from_value(value: Option<&str>) -> XattrSwitchSetting {
 fn xattr_suppression_allowed(
     setting: XattrSwitchSetting,
     presence: ffs_core::vfs::XattrPresence,
-    read_only: bool,
+    // Still taken and no longer read: the caller logs it beside the outcome, and
+    // a reader who finds the parameter gone will assume the writable case was
+    // never considered rather than that it was settled.
+    _read_only: bool,
 ) -> bool {
     use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent};
     match setting {
         XattrSwitchSetting::Off => false,
         XattrSwitchSetting::Asserted => presence != Present,
-        XattrSwitchSetting::Auto => presence == ProvenAbsent && read_only,
+        XattrSwitchSetting::Auto => presence == ProvenAbsent,
     }
 }
 
@@ -4382,6 +4385,31 @@ impl Filesystem for FrankenFuse {
         position: u32,
         reply: ReplyEmpty,
     ) {
+        self.setxattr_impl(ino, name, value, flags, position, reply);
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.removexattr_impl(ino, name, reply);
+    }
+}
+
+impl FrankenFuse {
+    /// The `setxattr` handler body, minus the `Request` it never reads.
+    ///
+    /// Split out so a test can drive it (bd-ha71t). `fuser::Request::new` is
+    /// `pub(crate)`, so a handler taking one cannot be called from this crate's
+    /// tests at all -- which is why the refusal below had no test until now, and
+    /// why `auto` stayed restricted to read-only mounts on an argument nobody
+    /// could check.
+    fn setxattr_impl(
+        &mut self,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
             return;
@@ -4446,7 +4474,9 @@ impl Filesystem for FrankenFuse {
         }
     }
 
-    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    /// The `removexattr` handler body, minus the `Request` it never reads.
+    /// Split for the same reason as [`Self::setxattr_impl`].
+    fn removexattr_impl(&mut self, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
             return;
@@ -6704,7 +6734,7 @@ mod tests {
     /// per-inode form and no way to re-enable it -- so every cell that is not a
     /// proven-absent mount must come out false.
     #[test]
-    fn auto_suppression_requires_a_proof_and_a_read_only_mount_bd_ha71t() {
+    fn auto_suppression_requires_a_proof_and_an_observed_write_refusal_bd_ha71t() {
         use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent, Unknown};
 
         assert!(
@@ -6712,18 +6742,18 @@ mod tests {
             "a proof on a read-only mount is the case auto exists for"
         );
         assert!(
-            !xattr_suppression_allowed(XattrSwitchSetting::Auto, ProvenAbsent, false),
-            "a WRITABLE mount must NOT suppress yet. The call-graph argument that it \
-             could -- an active switch refuses every xattr write, and both formats \
-             funnel through one FsOps::setxattr -- has never been observed end to \
-             end, and a switch that cannot be un-thrown must not be extended on \
-             reasoning alone"
+            xattr_suppression_allowed(XattrSwitchSetting::Auto, ProvenAbsent, false),
+            "a WRITABLE mount is allowed, and only because an active switch is \
+             OBSERVED to refuse every xattr write -- see \
+             an_active_switch_refuses_setxattr_on_a_writable_mount_bd_ha71t, which \
+             drives the handler and reads the errno back out of the reply. If that \
+             test is ever deleted or weakened, this cell must go back to false"
         );
         assert_eq!(
             xattr_switch_errno(XattrHandler::Write),
             libc::ENOTSUP,
-            "the refusal that WOULD make the writable case sound is real at the errno \
-             level; what is missing is a test that drives it through a live mount"
+            "and the errno that refusal carries must stay distinct from the read \
+             side's ENOSYS, which is the one-way kernel switch"
         );
         for presence in [Present, Unknown] {
             assert!(
@@ -6816,6 +6846,142 @@ mod tests {
                 "{auto:?} must be the proving mode, not a truthy assertion"
             );
         }
+    }
+
+    /// A `ReplySender` that keeps what a handler replied instead of writing it
+    /// to /dev/fuse.
+    ///
+    /// This crate had no way to observe a handler's REPLY -- every test could
+    /// check what the ops layer was asked, and none could check what the kernel
+    /// would have been told. `fuser::Request::new` is `pub(crate)`, so the gap
+    /// is not laziness: a handler taking a `Request` simply cannot be called
+    /// from here. Pairing this with the `_impl` split makes handler replies
+    /// testable.
+    #[derive(Clone, Default)]
+    struct RecordingSender {
+        sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl RecordingSender {
+        /// The errno a FUSE reply carries, or `None` if it replied success.
+        ///
+        /// `fuse_out_header` is `{ len: u32, error: i32, unique: u64 }` and the
+        /// error is stored NEGATED, the kernel's convention.
+        fn errno(&self) -> Option<i32> {
+            let sent = self.sent.lock().expect("sender must not be poisoned");
+            assert!(sent.len() >= 8, "a reply must carry at least a header");
+            let error = i32::from_ne_bytes([sent[4], sent[5], sent[6], sent[7]]);
+            (error != 0).then_some(-error)
+        }
+    }
+
+    impl fuser::ReplySender for RecordingSender {
+        fn send(&self, data: &[std::io::IoSlice<'_>]) -> std::io::Result<()> {
+            let mut sent = self.sent.lock().expect("sender must not be poisoned");
+            for slice in data {
+                sent.extend_from_slice(slice);
+            }
+            Ok(())
+        }
+
+        fn open_backing(
+            &self,
+            _fd: std::os::fd::BorrowedFd<'_>,
+        ) -> std::io::Result<fuser::BackingId> {
+            unimplemented!("no test drives passthrough")
+        }
+    }
+
+    /// The switch is process-global (one connection, one `no_getxattr` bit), so
+    /// tests that move it must not run beside each other.
+    static XATTR_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_switch<T>(active: bool, body: impl FnOnce() -> T) -> T {
+        use std::sync::atomic::Ordering;
+        let _guard = XATTR_SWITCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = XATTR_SWITCH.load(Ordering::Relaxed);
+        XATTR_SWITCH.store(active, Ordering::Relaxed);
+        let out = body();
+        XATTR_SWITCH.store(previous, Ordering::Relaxed);
+        out
+    }
+
+    fn writable_fuse() -> FrankenFuse {
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        FrankenFuse::with_options(Box::new(MinimalTestFs), &options)
+    }
+
+    /// bd-ha71t: THE OBSERVATION THAT WAS MISSING.
+    ///
+    /// `auto` was held to read-only mounts because the argument for allowing a
+    /// writable one -- that an active switch refuses every write which could
+    /// create an xattr, so the mount-time proof keeps holding -- had only ever
+    /// been reasoned about at the call graph and asserted at the errno level.
+    /// The end-to-end check could not be run: the image fixture is root-owned
+    /// and a user-mounted FUSE filesystem denies root, so a real `setxattr`
+    /// returns `EACCES` before reaching the handler, and the permission denial
+    /// masks exactly the `ENOTSUP` the test exists to see.
+    ///
+    /// This drives the handler directly, so nothing can mask it.
+    #[test]
+    fn an_active_switch_refuses_setxattr_on_a_writable_mount_bd_ha71t() {
+        let sender = RecordingSender::default();
+        let reply = <ReplyEmpty as fuser::Reply>::new(1, sender.clone());
+        with_switch(true, || {
+            writable_fuse().setxattr_impl(
+                1,
+                OsStr::new("user.should_be_refused"),
+                b"1",
+                0,
+                0,
+                reply,
+            );
+        });
+        assert_eq!(
+            sender.errno(),
+            Some(libc::ENOTSUP),
+            "a WRITABLE mount with the switch active must refuse the write. If it \
+             ever stops refusing, the mount-time proof of absence stops holding for \
+             the life of the connection and `auto` must go back to read-only only"
+        );
+    }
+
+    /// The other half: `removexattr` must refuse too. A mount that refused
+    /// `setxattr` and accepted `removexattr` would still be coherent about
+    /// storage, but it would report success for an operation the kernel can no
+    /// longer verify, so both are refused the same way.
+    #[test]
+    fn an_active_switch_refuses_removexattr_on_a_writable_mount_bd_ha71t() {
+        let sender = RecordingSender::default();
+        let reply = <ReplyEmpty as fuser::Reply>::new(2, sender.clone());
+        with_switch(true, || {
+            writable_fuse().removexattr_impl(1, OsStr::new("user.anything"), reply);
+        });
+        assert_eq!(sender.errno(), Some(libc::ENOTSUP));
+    }
+
+    /// NEGATIVE CONTROL, and the one that makes the two above mean anything: with
+    /// the switch OFF the same call must NOT be refused with `ENOTSUP`. Without
+    /// this, a handler that refused everything unconditionally would pass.
+    #[test]
+    fn an_inactive_switch_does_not_refuse_setxattr_bd_ha71t() {
+        let sender = RecordingSender::default();
+        let reply = <ReplyEmpty as fuser::Reply>::new(3, sender.clone());
+        with_switch(false, || {
+            writable_fuse().setxattr_impl(1, OsStr::new("user.ok"), b"1", 0, 0, reply);
+        });
+        assert_ne!(
+            sender.errno(),
+            Some(libc::ENOTSUP),
+            "with the switch off this must reach the ops layer and answer on its own \
+             merits, whatever those are -- ENOTSUP here would mean the refusal is \
+             unconditional and the tests above prove nothing"
+        );
     }
 
     #[test]
