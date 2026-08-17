@@ -8718,3 +8718,60 @@ The lever is not in btrfs and not in the parsed-node cache's sizing. It is: **ma
 per-request path reuse across requests what the bulk path builds once.** That is a bridge change,
 it is measurable by this same count with no quiet window, and the ceiling is visible — the engine
 already answers this workload at 0.001 reads per entry. NO wall-clock claim is made in this entry.
+
+## ⛔ CORRECTION — 2026-08-17 — I was wrong that the parsed-node cache is inert: cross-request retention WORKS, and what I measured was the 64-slot capability memo thrashing (CreamTrout)
+
+Withdraws the central claim of `b07d68447` ("PROVEN — the read-only parsed-node cache retains
+nothing… it is INERT in the mounted daemon"). It is not inert. My evidence did not show what I said
+it showed, and a follow-up arm on the same instrument refutes it.
+
+Provenance: host `thinkstation1`, ELF `d103d36e54691124feb6842c…` (shipping release-perf+PGO), mean
+CPU 3213.7 MHz over 64 CPUs, loadavg 18.91/26.87/25.62, df 67G. **No build taken — builds were on
+hold this turn for an external non-frankenfs cargo loop eating the volume (88G→67G).**
+
+### The arm that refutes it
+
+Same 3-pass test, same fixture, one variable added — `FFS_FUSE_CAPABILITY_MEMO_SLOTS=65536`, a
+directory-sized capability memo instead of the 64-slot default:
+
+| capability memo | 1 pass | 3 passes | ratio |
+|---|---|---|---|
+| default (64 slots) | 27147 | 78203 | **2.88x** |
+| 65536 slots | 27150 | **27152** | **1.0001x** |
+
+**With a directory-sized memo, passes 2 and 3 are free — two extra device reads for two extra full
+sweeps of 20,048 entries.** Cross-request retention is not merely working, it is perfect.
+
+### What I got wrong, and how
+
+I ran the 3-pass test, saw 2.88x for 3x the work, and concluded the parsed-node cache retains
+nothing. The correct reading is that the **64-slot direct-mapped capability memo** cannot hold a
+20,048-entry directory, so on passes 2 and 3 every probe missed the memo and re-descended — and each
+re-descent re-read nodes. The node cache was never the variable. I had also already read bd-t0xoq's
+note that "the 64-slot memo is far too small for this" and did not connect it to my own result.
+
+This is the second time this session I have drawn a cache conclusion from a workload whose shape I had
+not accounted for (the first was `walk`'s single-pass "0 hits"). The pattern is the same both times:
+**a counter or a ratio was interpreted without first asking what the workload does to it.**
+
+### What SURVIVES from the withdrawn rows, and it is most of them
+
+* **The bridge comparison stands.** In-process `walk` 26 node reads vs FUSE `ls -l` 27,150 for one
+  sweep, 1,060x. A single sweep probes each inode exactly once, so **no capability memo of any size
+  can affect it** — the memo-sized arm measures 27,150, identical to the default. The per-entry
+  descent cost on a first sweep is real and is unrelated to this correction.
+* **The hot node stands, and is now sharper.** The fs-tree ROOT (logical 48300032, level 1, 432
+  children) is read **11,589 times in the memo-sized 1-pass arm** — one node, touched first by every
+  descent, in a 512-entry cache with no eviction. Capacity cannot explain it and neither can the
+  memo. **This is now the only unexplained observation, and it is the right one to chase.**
+* The cliff, the 15x probe attribution, the inert-knob results, and the `BTRFS_NODE_CACHE_HITS`
+  counter defect (bd-mdtqc) are all untouched — none depended on the retention claim.
+
+### What this ADDS
+
+A new, clean result for **bd-kzfh2** (capability-memo sizing policy), on an axis it did not have:
+**sizing the memo to the directory makes repeat metadata sweeps free** — 2.88x → 1.0001x for three
+sweeps. That is a stronger and cheaper demonstration than a mounted ratio, it is an exact integer
+pair, and it needs no quiet window. It does NOT speed up a first sweep, and the row above is why.
+
+NO wall-clock claim is made anywhere in this entry.
