@@ -302,7 +302,9 @@ impl PublicationMode {
         match value.map(str::trim) {
             None | Some("1" | "true" | "on" | "yes") => Self::WaitFree,
             Some("nospin" | "no-spin") => Self::WaitFreeNoSpin,
-            Some("0" | "false" | "off" | "no" | "mutex") => Self::Mutex,
+            // Every other value, recognised ("0"/"false"/"off"/"no"/"mutex") or
+            // not, means the mutex path: this knob must fail towards today's
+            // behaviour, never towards the wait-free ring.
             Some(_) => Self::Mutex,
         }
     }
@@ -859,16 +861,16 @@ impl ShardedMvccStore {
     }
 
     fn make_chain_head_full(versions: &mut [BlockVersion], keep_from: usize) {
-        if keep_from < versions.len() && versions[keep_from].data.is_identical() {
-            if let Some(full_data) =
+        if keep_from < versions.len()
+            && versions[keep_from].data.is_identical()
+            && let Some(full_data) =
                 compression::resolve_data_with(versions, keep_from, |v| &v.data)
-            {
-                // `resolve_data_with` returns `Cow::Owned` for any compressed
-                // version; move that decompressed Vec out instead of cloning it
-                // (matches the already-corrected twin in lib.rs make_chain_head_full).
-                let full_data = full_data.into_owned();
-                versions[keep_from].data = VersionData::full(full_data);
-            }
+        {
+            // `resolve_data_with` returns `Cow::Owned` for any compressed
+            // version; move that decompressed Vec out instead of cloning it
+            // (matches the already-corrected twin in lib.rs make_chain_head_full).
+            let full_data = full_data.into_owned();
+            versions[keep_from].data = VersionData::full(full_data);
         }
     }
 
@@ -1761,7 +1763,7 @@ impl ShardedMvccStore {
                 s.read()
                     .versions
                     .values()
-                    .map(|versions| versions.len())
+                    .map(smallvec::SmallVec::len)
                     .sum::<usize>()
             })
             .sum()
@@ -2320,10 +2322,16 @@ mod tests {
         let stored = {
             let shard = store.shards[store.shard_index(block)].read();
             let versions = shard.versions.get(&block).expect("version chain");
-            let compression::VersionData::Full(shared) = &versions[0].data else {
+            let compression::VersionData::Full(payload) = &versions[0].data else {
                 panic!("uncompressed staged write should remain full");
             };
-            ffs_block::BlockBuf::from_shared_aligned(Arc::clone(shared))
+            let payload = Arc::clone(payload);
+            // Released before building the buffer: holding a shard read lock
+            // across unrelated work is what `significant_drop_tightening` is
+            // pointing at, and this is a test that other shards' tests run
+            // beside.
+            drop(shard);
+            ffs_block::BlockBuf::from_shared_aligned(payload)
         };
 
         let snap = store.current_snapshot();

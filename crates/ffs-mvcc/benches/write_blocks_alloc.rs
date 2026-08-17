@@ -39,30 +39,36 @@ fn hammer(threads: usize, n: usize, collect: bool) {
 
 fn bench_write_blocks(c: &mut Criterion) {
     // Single-thread: the isolated per-commit alloc cost across write-set sizes.
-    let mut sz = c.benchmark_group("mvcc_write_blocks_collect_size");
-    sz.sample_size(20);
-    for n in [2_usize, 5, 20] {
-        sz.bench_with_input(BenchmarkId::new("collect", n), &n, |b, &n| {
-            b.iter(|| hammer(1, n, true));
-        });
-        sz.bench_with_input(BenchmarkId::new("skip", n), &n, |b, &n| {
-            b.iter(|| hammer(1, n, false));
-        });
+    // Scoped so each group is dropped before the next is created rather than
+    // both living to the end of the function.
+    {
+        let mut sz = c.benchmark_group("mvcc_write_blocks_collect_size");
+        sz.sample_size(20);
+        for n in [2_usize, 5, 20] {
+            sz.bench_with_input(BenchmarkId::new("collect", n), &n, |b, &n| {
+                b.iter(|| hammer(1, n, true));
+            });
+            sz.bench_with_input(BenchmarkId::new("skip", n), &n, |b, &n| {
+                b.iter(|| hammer(1, n, false));
+            });
+        }
+        sz.finish();
     }
-    sz.finish();
 
     // Parallel: allocator pressure at N=5 (a typical create write set).
-    let mut par = c.benchmark_group("mvcc_write_blocks_collect_parallel_n5");
-    par.sample_size(20);
-    for threads in [1_usize, 2, 4, 8] {
-        par.bench_with_input(BenchmarkId::new("collect", threads), &threads, |b, &t| {
-            b.iter(|| hammer(t, 5, true));
-        });
-        par.bench_with_input(BenchmarkId::new("skip", threads), &threads, |b, &t| {
-            b.iter(|| hammer(t, 5, false));
-        });
+    {
+        let mut par = c.benchmark_group("mvcc_write_blocks_collect_parallel_n5");
+        par.sample_size(20);
+        for threads in [1_usize, 2, 4, 8] {
+            par.bench_with_input(BenchmarkId::new("collect", threads), &threads, |b, &t| {
+                b.iter(|| hammer(t, 5, true));
+            });
+            par.bench_with_input(BenchmarkId::new("skip", threads), &threads, |b, &t| {
+                b.iter(|| hammer(t, 5, false));
+            });
+        }
+        par.finish();
     }
-    par.finish();
 }
 
 criterion_group!(write_blocks_alloc, bench_write_blocks);

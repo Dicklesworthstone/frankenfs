@@ -18,7 +18,9 @@ use std::hint::black_box;
 fn compressible(len: usize) -> Vec<u8> {
     // Realistic FS metadata-ish data: mostly-repeating with some structure, so
     // zstd actually compresses (a pure-random buffer would not).
-    (0..len).map(|i| ((i / 17) % 251) as u8).collect()
+    (0..len)
+        .map(|i| u8::try_from((i / 17) % 251).expect("modulo 251 always fits a u8"))
+        .collect()
 }
 
 fn bench(c: &mut Criterion) {

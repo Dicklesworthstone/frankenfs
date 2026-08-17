@@ -74,7 +74,7 @@ fn atomic_release(map: &AtomicMap, key: u64) {
     }
 }
 
-fn run<M, R, L>(threads: usize, map: Arc<M>, reg: R, rel: L, distinct: bool)
+fn run<M, R, L>(threads: usize, map: &Arc<M>, reg: R, rel: L, distinct: bool)
 where
     M: Send + Sync + 'static,
     R: Fn(&M, u64) + Send + Sync + Copy + 'static,
@@ -82,7 +82,7 @@ where
 {
     std::thread::scope(|scope| {
         for t in 0..threads {
-            let map = Arc::clone(&map);
+            let map = Arc::clone(map);
             let key = if distinct { t as u64 + 1 } else { 0 };
             scope.spawn(move || {
                 for _ in 0..PER_THREAD {
@@ -107,11 +107,11 @@ fn bench_refcount(c: &mut Criterion) {
                     b.iter(|| {
                         run(
                             t,
-                            Arc::new(CurrentMap::new(BTreeMap::new())),
+                            &Arc::new(CurrentMap::new(BTreeMap::new())),
                             current_register,
                             current_release,
                             distinct,
-                        )
+                        );
                     });
                 },
             );
@@ -122,11 +122,11 @@ fn bench_refcount(c: &mut Criterion) {
                     b.iter(|| {
                         run(
                             t,
-                            Arc::new(AtomicMap::new(BTreeMap::new())),
+                            &Arc::new(AtomicMap::new(BTreeMap::new())),
                             atomic_register,
                             atomic_release,
                             distinct,
-                        )
+                        );
                     });
                 },
             );

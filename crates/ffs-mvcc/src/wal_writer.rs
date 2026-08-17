@@ -443,14 +443,14 @@ impl WalWriter {
         })?;
 
         // ── Optional write verification ──────────────────────────────────
-        if self.config.verify_writes {
-            if let Err(e) = self.verify_written_record(write_offset, &encoded, op_id) {
-                // Revert the write position and truncate the file to avoid leaving a "successful" record in the WAL
-                // that the caller will roll back in memory.
-                self.write_pos = write_offset;
-                let _ = self.file.set_len(write_offset);
-                return Err(e);
-            }
+        if self.config.verify_writes
+            && let Err(e) = self.verify_written_record(write_offset, &encoded, op_id)
+        {
+            // Revert the write position and truncate the file to avoid leaving a "successful" record in the WAL
+            // that the caller will roll back in memory.
+            self.write_pos = write_offset;
+            let _ = self.file.set_len(write_offset);
+            return Err(e);
         }
 
         // ── Sync policy ──────────────────────────────────────────────────

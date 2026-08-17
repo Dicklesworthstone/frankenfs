@@ -1026,21 +1026,21 @@ impl MvccStore {
                     }
                 }
             }
-            if let Some(cap) = chain_cap {
-                if let Err(err) = self.enforce_chain_pressure(txn.id, block, cap) {
-                    // Chain backpressure abort — still record the commit attempt.
-                    if record_metrics {
-                        self.contention_metrics.record_commit(
-                            self.adaptive_config.ema_alpha,
-                            had_conflict,
-                            merge_succeeded,
-                            true,
-                        );
-                        self.contention_metrics.last_selected =
-                            Some(self.contention_metrics.select_policy(&self.adaptive_config));
-                    }
-                    return Err(err);
+            if let Some(cap) = chain_cap
+                && let Err(err) = self.enforce_chain_pressure(txn.id, block, cap)
+            {
+                // Chain backpressure abort — still record the commit attempt.
+                if record_metrics {
+                    self.contention_metrics.record_commit(
+                        self.adaptive_config.ema_alpha,
+                        had_conflict,
+                        merge_succeeded,
+                        true,
+                    );
+                    self.contention_metrics.last_selected =
+                        Some(self.contention_metrics.select_policy(&self.adaptive_config));
                 }
+                return Err(err);
             }
         }
 
@@ -1080,7 +1080,7 @@ impl MvccStore {
             self.maybe_emit_policy_switch(prev_effective);
 
             // Periodic contention sample (every 100 commits).
-            if self.contention_metrics.total_commits % 100 == 0
+            if self.contention_metrics.total_commits.is_multiple_of(100)
                 && self.contention_metrics.total_commits > 0
             {
                 self.emit_contention_sample();
@@ -1379,23 +1379,20 @@ impl MvccStore {
     /// Check if `new_bytes` are identical to the latest version for `block`.
     /// If so, return `VersionData::Identical` (dedup); otherwise `VersionData::Full` or compressed.
     pub(crate) fn maybe_dedup(&self, block: BlockNumber, new_bytes: &[u8]) -> VersionData {
-        if let Some(versions) = self.versions.get(&block) {
-            if !versions.is_empty() {
-                // Resolve the latest version's data (might itself be Identical).
-                if let Some(existing) =
-                    compression::resolve_data_with(versions, versions.len() - 1, |v| &v.data)
-                {
-                    if existing.as_ref() == new_bytes {
-                        trace!(
-                            block = block.0,
-                            chain_len = versions.len(),
-                            bytes_saved = new_bytes.len(),
-                            "version_dedup: identical to previous"
-                        );
-                        return VersionData::Identical;
-                    }
-                }
-            }
+        if let Some(versions) = self.versions.get(&block)
+            && !versions.is_empty()
+            // Resolve the latest version's data (might itself be Identical).
+            && let Some(existing) =
+                compression::resolve_data_with(versions, versions.len() - 1, |v| &v.data)
+            && existing.as_ref() == new_bytes
+        {
+            trace!(
+                block = block.0,
+                chain_len = versions.len(),
+                bytes_saved = new_bytes.len(),
+                "version_dedup: identical to previous"
+            );
+            return VersionData::Identical;
         }
         self.compress_data(new_bytes)
     }
@@ -1690,13 +1687,13 @@ impl MvccStore {
     }
 
     fn make_chain_head_full(versions: &mut [BlockVersion], keep_from: usize) {
-        if keep_from < versions.len() && versions[keep_from].data.is_identical() {
-            if let Some(full_data) =
+        if keep_from < versions.len()
+            && versions[keep_from].data.is_identical()
+            && let Some(full_data) =
                 compression::resolve_data_with(versions, keep_from, |v| &v.data)
-            {
-                let full_data = full_data.into_owned();
-                versions[keep_from].data = VersionData::full(full_data);
-            }
+        {
+            let full_data = full_data.into_owned();
+            versions[keep_from].data = VersionData::full(full_data);
         }
     }
 

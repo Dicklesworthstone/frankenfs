@@ -64,7 +64,11 @@ pub fn proof_downgrade_count() -> u64 {
 /// The lengths are the diagnostic — an empty or short `base` means ancestor
 /// resolution failed, while three full-length buffers under a range proof means
 /// the declared ranges overlapped in byte terms.
-static LAST_MERGE_REFUSAL: Mutex<Option<(&'static str, usize, usize, usize)>> = Mutex::new(None);
+/// The merge-proof variant that refused, then the `base`/`latest`/`staged`
+/// buffer lengths that describe the refusal.
+type MergeRefusalShape = (&'static str, usize, usize, usize);
+
+static LAST_MERGE_REFUSAL: Mutex<Option<MergeRefusalShape>> = Mutex::new(None);
 static MERGE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 /// Which validator branch refused the most recent merge, and the byte range it
@@ -77,7 +81,11 @@ static MERGE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// while `staged` having modified bytes outside its declared ranges means the
 /// proof under-declares and the fix is in the staging path. Recording the branch
 /// is the difference between fixing the right layer and fixing another one.
-static LAST_REFUSAL_REASON: Mutex<Option<(&'static str, usize, usize)>> = Mutex::new(None);
+/// The validator branch that refused, then the start and length of the byte
+/// range it blamed.
+type MergeRefusalReason = (&'static str, usize, usize);
+
+static LAST_REFUSAL_REASON: Mutex<Option<MergeRefusalReason>> = Mutex::new(None);
 
 fn note_refusal_reason(reason: &'static str, start: usize, len: usize) {
     *LAST_REFUSAL_REASON.lock() = Some((reason, start, len));
@@ -101,11 +109,7 @@ pub(crate) fn record_merge_refusal(
 /// Refusal count, the most recent refusal's shape, and which validator branch
 /// refused it.
 #[must_use]
-pub fn merge_refusal_report() -> (
-    u64,
-    Option<(&'static str, usize, usize, usize)>,
-    Option<(&'static str, usize, usize)>,
-) {
+pub fn merge_refusal_report() -> (u64, Option<MergeRefusalShape>, Option<MergeRefusalReason>) {
     (
         MERGE_REFUSALS.load(Ordering::Relaxed),
         *LAST_MERGE_REFUSAL.lock(),
@@ -115,7 +119,7 @@ pub fn merge_refusal_report() -> (
 
 fn saturating_increment_atomic(counter: &AtomicU64, ordering: Ordering) -> u64 {
     loop {
-        if let Ok(previous) = counter.fetch_update(ordering, Ordering::Relaxed, |current| {
+        if let Ok(previous) = counter.try_update(ordering, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         }) {
             return previous.saturating_add(1);
@@ -2375,7 +2379,7 @@ impl Drop for StoreBackedFlushPin {
 
         if self
             .active_flush_pins
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             })
             .is_err()
@@ -2712,7 +2716,7 @@ impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
         dst: &mut [u8],
     ) -> ffs_error::Result<()> {
         let bs = self.block_size() as usize;
-        if bs == 0 || dst.len() % bs != 0 {
+        if bs == 0 || !dst.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
                 "read_contiguous_into: dst length must be a multiple of block size".to_owned(),
             ));
@@ -2814,6 +2818,11 @@ impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
 
 #[cfg(test)]
 mod tests {
+    /// `(proof, base, latest, staged)` — one decision-branch case for the merge
+    /// validator. Named because the tuple is otherwise too complex to read at
+    /// the use site.
+    type MergeCase<'a> = (MergeProof, &'a [u8], &'a [u8], &'a [u8]);
+
     use super::*;
     use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::AtomicBool;
@@ -3193,7 +3202,7 @@ mod tests {
             dst: &mut [u8],
         ) -> ffs_error::Result<()> {
             let bs = self.block_size as usize;
-            if bs == 0 || dst.len() % bs != 0 {
+            if bs == 0 || !dst.len().is_multiple_of(bs) {
                 return Err(ffs_error::FfsError::Format(
                     "test read_contiguous_into requires whole blocks".to_owned(),
                 ));
@@ -3601,13 +3610,13 @@ mod tests {
         // (proof, base, latest, staged) cases spanning every decision branch.
         let ap = MergeProof::AppendOnly { base_len: 1 };
         let ind = MergeProof::independent_key_range(0, 4);
-        let cases: Vec<(MergeProof, &[u8], &[u8], &[u8])> = vec![
+        let cases: Vec<MergeCase<'_>> = vec![
             (MergeProof::Unsafe, &base, &latest, &staged),
             (MergeProof::DisjointBlocks, &base, &latest, &staged),
             (ind.clone(), &base, &latest, &staged), // clean merge
             (ind.clone(), &base, &latest, &staged_sneaky), // outside-range reject
             (ind.clone(), &base, &latest_conflict, &staged), // true-conflict reject
-            (ind.clone(), &base, &base[..4], &staged), // size mismatch reject
+            (ind, &base, &base[..4], &staged),      // size mismatch reject
             (
                 MergeProof::non_overlapping_extent_range(0, 5),
                 &base,
@@ -3615,7 +3624,7 @@ mod tests {
                 &staged,
             ), // overlaps latest range? no; still valid check
             (ap.clone(), b"abc", b"abcX", b"abcY"), // append clean
-            (ap.clone(), b"abc", b"Xbc!", b"abcY"), // append prefix reject
+            (ap, b"abc", b"Xbc!", b"abcY"),         // append prefix reject
             (
                 MergeProof::AppendOnly { base_len: 10 },
                 b"abc",
@@ -9148,7 +9157,7 @@ mod tests {
             // changed-bit sets are disjoint by construction. XOR flips in BOTH
             // directions: wherever base is 1 this clears (a free), wherever base
             // is 0 it sets (an allocation).
-            let a: Vec<u8> = a_mask.clone();
+            let a: Vec<u8> = a_mask;
             let b: Vec<u8> = b_mask.iter().zip(&a).map(|(&x, &y)| x & !y).collect();
             let latest: Vec<u8> = base.iter().zip(&a).map(|(&x, &m)| x ^ m).collect();
             let staged: Vec<u8> = base.iter().zip(&b).map(|(&x, &m)| x ^ m).collect();

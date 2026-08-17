@@ -140,46 +140,49 @@ fn scenario(bs: usize) -> (Vec<MergeByteRange>, Vec<u8>, Vec<u8>, Vec<u8>) {
     let base = vec![0_u8; bs];
     let mut staged = base.clone();
     for (i, b) in staged[0..range_len].iter_mut().enumerate() {
-        *b = (i as u8) | 1;
+        *b = u8::try_from(i % 256).expect("modulo 256 fits a u8") | 1;
     }
     let mut latest = base.clone();
-    for b in latest[bs - range_len..].iter_mut() {
+    for b in &mut latest[bs - range_len..] {
         *b = 0xAB;
     }
     (touched, base, latest, staged)
 }
 
 fn bench_merge(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mvcc_range_overlay_merge");
-    for bs in [4096_usize, 16384, 65536] {
-        let (touched, base, latest, staged) = scenario(bs);
-        // Sanity: both variants agree on this input.
-        assert_eq!(
-            merge_old(&touched, &base, &latest, &staged),
-            merge_new(&touched, &base, &latest, &staged),
-        );
-        group.bench_with_input(BenchmarkId::new("old_expected_copy", bs), &bs, |b, _| {
-            b.iter(|| {
-                black_box(merge_old(
-                    black_box(&touched),
-                    black_box(&base),
-                    black_box(&latest),
-                    black_box(&staged),
-                ))
+    // Scoped so the group is dropped at the end of the block rather than the fn.
+    {
+        let mut group = c.benchmark_group("mvcc_range_overlay_merge");
+        for bs in [4096_usize, 16384, 65536] {
+            let (touched, base, latest, staged) = scenario(bs);
+            // Sanity: both variants agree on this input.
+            assert_eq!(
+                merge_old(&touched, &base, &latest, &staged),
+                merge_new(&touched, &base, &latest, &staged),
+            );
+            group.bench_with_input(BenchmarkId::new("old_expected_copy", bs), &bs, |b, _| {
+                b.iter(|| {
+                    black_box(merge_old(
+                        black_box(&touched),
+                        black_box(&base),
+                        black_box(&latest),
+                        black_box(&staged),
+                    ))
+                });
             });
-        });
-        group.bench_with_input(BenchmarkId::new("new_complement", bs), &bs, |b, _| {
-            b.iter(|| {
-                black_box(merge_new(
-                    black_box(&touched),
-                    black_box(&base),
-                    black_box(&latest),
-                    black_box(&staged),
-                ))
+            group.bench_with_input(BenchmarkId::new("new_complement", bs), &bs, |b, _| {
+                b.iter(|| {
+                    black_box(merge_new(
+                        black_box(&touched),
+                        black_box(&base),
+                        black_box(&latest),
+                        black_box(&staged),
+                    ))
+                });
             });
-        });
+        }
+        group.finish();
     }
-    group.finish();
 
     // FCW-preflight A/B: the preflight used to run the FULL merge (build the
     // merged block, then discard it) just to decide "mergeable?"; it now runs

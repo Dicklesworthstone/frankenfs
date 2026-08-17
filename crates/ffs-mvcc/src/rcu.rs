@@ -227,6 +227,18 @@ impl<K: fmt::Debug + Ord, V: fmt::Debug> fmt::Debug for RcuMap<K, V> {
     }
 }
 
+/// Whether this update should emit the high-churn warning.
+///
+/// A named predicate rather than an inline condition because the zero case is a
+/// trap. The `threshold != 0` guard is NOT redundant with
+/// `count.is_multiple_of(threshold)`: `is_multiple_of(0)` is defined as
+/// `count == 0`, so dropping the guard -- which is literally what clippy's
+/// `manual_is_multiple_of` suggestion proposes -- would turn a DISABLED churn
+/// report into one that fires on the very first update. Zero means off.
+const fn churn_report_due(count: u64, threshold: u64) -> bool {
+    threshold != 0 && count.is_multiple_of(threshold)
+}
+
 impl<K: Clone + Ord + Hash + fmt::Debug, V: Clone + fmt::Debug> RcuMap<K, V> {
     /// Create a new empty RCU-protected map.
     #[must_use]
@@ -291,7 +303,7 @@ impl<K: Clone + Ord + Hash + fmt::Debug, V: Clone + fmt::Debug> RcuMap<K, V> {
             update_count = count,
             "rcu_map_update"
         );
-        if self.churn_threshold != 0 && count % self.churn_threshold == 0 {
+        if churn_report_due(count, self.churn_threshold) {
             warn!(
                 target: "ffs::mvcc::rcu",
                 update_count = count,
@@ -1017,6 +1029,28 @@ mod tests {
         map.insert(1, 10);
         assert_eq!(map.update_count(), 1);
         assert_eq!(map.get(&1).as_deref().copied(), Some(10));
+    }
+
+    /// The zero-threshold trap, pinned as a truth table.
+    ///
+    /// `is_multiple_of(0)` is `count == 0`, so the `threshold != 0` guard is the
+    /// only thing standing between "churn reporting disabled" and "churn
+    /// reported on the first update". Clippy's `manual_is_multiple_of`
+    /// suggestion drops that guard; this test is what catches it if anyone
+    /// applies it literally.
+    #[test]
+    fn zero_churn_threshold_means_disabled_not_always_bd_clippy_gate() {
+        assert!(
+            !churn_report_due(0, 0),
+            "threshold 0 must DISABLE the report; is_multiple_of(0) is true at count 0"
+        );
+        assert!(!churn_report_due(1, 0));
+        assert!(!churn_report_due(10_000, 0));
+
+        // ...and a real threshold still fires exactly on its multiples.
+        assert!(churn_report_due(5, 5));
+        assert!(churn_report_due(10, 5));
+        assert!(!churn_report_due(6, 5));
     }
 
     #[test]

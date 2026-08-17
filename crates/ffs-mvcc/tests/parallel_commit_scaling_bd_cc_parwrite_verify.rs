@@ -100,7 +100,7 @@ fn sharded_parallel_commit_is_correct_bd_cc_parwrite_verify() {
 
     // block b's payload: first 8 bytes = b.to_le_bytes(), rest a b-derived fill.
     fn payload(block: u64) -> Vec<u8> {
-        let mut v = vec![(block as u8) ^ 0x5A; BS];
+        let mut v = vec![u8::try_from(block & 0xFF).expect("masked to one byte") ^ 0x5A; BS];
         v[..8].copy_from_slice(&block.to_le_bytes());
         v
     }
@@ -184,7 +184,7 @@ fn sharded_concurrent_same_block_fcw_exactly_one_winner_bd_cc_parwrite_verify() 
         }
         let winners: usize = handles
             .into_iter()
-            .map(|h| h.join().unwrap() as usize)
+            .map(|h| usize::from(h.join().unwrap()))
             .sum();
         assert_eq!(
             winners, 1,
@@ -201,19 +201,18 @@ fn sharded_concurrent_same_block_fcw_exactly_one_winner_bd_cc_parwrite_verify() 
 fn parallel_commit_scaling_sharded_vs_single_locked() {
     let d = data();
     eprintln!(
-        "\n=== MVCC parallel commit scaling: ShardedMvccStore vs Mutex<MvccStore> ({} commits/thread) ===",
-        PER_THREAD
+        "\n=== MVCC parallel commit scaling: ShardedMvccStore vs Mutex<MvccStore> ({PER_THREAD} commits/thread) ==="
     );
     eprintln!("threads |   sharded c/s |    single c/s | sharded/single");
-    let mut sharded_1t = 0.0_f64;
-    let mut sharded_nt = 0.0_f64;
+    let mut sharded_one_thread = 0.0_f64;
+    let mut sharded_many_threads = 0.0_f64;
     for &t in &[1_usize, 4, 8] {
         let sharded = throughput(t, &d, run_sharded);
         let single = throughput(t, &d, run_single_locked);
         if t == 1 {
-            sharded_1t = sharded;
+            sharded_one_thread = sharded;
         }
-        sharded_nt = sharded;
+        sharded_many_threads = sharded;
         eprintln!(
             "{t:7} | {sharded:13.0} | {single:13.0} | {:.2}x",
             sharded / single
@@ -221,7 +220,7 @@ fn parallel_commit_scaling_sharded_vs_single_locked() {
     }
     eprintln!(
         "sharded self-scaling 8t/1t = {:.2}x (single store cannot scale: one exclusive commit lock)\n",
-        sharded_nt / sharded_1t
+        sharded_many_threads / sharded_one_thread
     );
 }
 
@@ -306,7 +305,7 @@ fn sharded_flush_to_device_checkpoints_committed_blocks_bd_cc_shardflush() {
     let blocks = [10_u64, 11, 12, 50];
     for &b in &blocks {
         let mut txn = store.begin();
-        txn.stage_write(BN(b), vec![b as u8; 4096]);
+        txn.stage_write(BN(b), vec![u8::try_from(b & 0xFF).expect("masked"); 4096]);
         store.commit(txn).map_err(|(e, _)| e).expect("commit");
     }
     let dev = MemDev {
@@ -321,7 +320,7 @@ fn sharded_flush_to_device_checkpoints_committed_blocks_bd_cc_shardflush() {
     for &b in &blocks {
         assert_eq!(
             dev_blocks.get(&BN(b)).expect("block must be on device"),
-            &vec![b as u8; 4096],
+            &vec![u8::try_from(b & 0xFF).expect("masked"); 4096],
             "block {b} bytes must be on device byte-exact"
         );
     }
