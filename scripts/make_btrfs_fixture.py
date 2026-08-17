@@ -69,7 +69,11 @@ def fixture_content(name: str) -> bytes:
     return b"x" * (len(name) + int(name.rsplit("_", 1)[1]) % 61)
 
 
-def compare_listings(expected: dict[str, int], actual: dict[str, int]) -> str | None:
+def compare_listings(
+    expected: dict[str, int],
+    actual: dict[str, int],
+    preexisting: frozenset[str] = frozenset(),
+) -> str | None:
     """First disagreement between what we wrote and what the kernel read back.
 
     Returns None when they agree. Reports a missing name, an unexpected name and
@@ -82,7 +86,12 @@ def compare_listings(expected: dict[str, int], actual: dict[str, int]) -> str | 
             return f"kernel cannot see {name!r}: {len(actual)} of {len(expected)} names read back"
         if actual[name] != size:
             return f"{name!r} size differs: wrote {size}, kernel read {actual[name]}"
-    extra = sorted(set(actual) - set(expected))
+    # Names the SOURCE image already carried are not ours and are not a defect.
+    # The first run of this script failed on exactly that -- it wrote 2000 files,
+    # the kernel read all 2000 back correctly, and the check reported the source
+    # image's own 48 files as "extra". A verifier that fails on a clean result is
+    # worse than no verifier, because the next person believes it.
+    extra = sorted(set(actual) - set(expected) - preexisting)
     if extra:
         return f"kernel sees {len(extra)} name(s) we did not write, first {extra[0]!r}"
     return None
@@ -138,6 +147,11 @@ def build(args: argparse.Namespace) -> int:
     mnt = args.work_dir / "build-mnt"
     proc = _mount(args.cli, args.out, mnt, args.work_dir / "build.log")
 
+    # Whatever the source image already contains, recorded before we add to it.
+    preexisting = frozenset(entry.name for entry in os.scandir(mnt))
+    if preexisting:
+        print(f"source image already holds {len(preexisting)} entries; they are not ours "
+              f"and are excluded from the check")
     names = fixture_names(args.count)
     expected: dict[str, int] = {}
     started = time.monotonic()
@@ -161,7 +175,7 @@ def build(args: argparse.Namespace) -> int:
         return 1
 
     actual = _kernel_listing(args.out, args.work_dir / "kernel-mnt")
-    difference = compare_listings(expected, actual)
+    difference = compare_listings(expected, actual, preexisting)
     if difference:
         print(f"FAIL: {difference}")
         return 1
@@ -196,6 +210,15 @@ def selftest() -> int:
     assert "size differs" in (compare_listings({"a": 1}, {"a": 2}) or "")
     cases += 1
     assert "we did not write" in (compare_listings({"a": 1}, {"a": 1, "z": 9}) or "")
+    cases += 1
+    # A name the SOURCE image already carried is not ours and must not fail the
+    # build -- the first real run failed on exactly this.
+    assert compare_listings({"a": 1}, {"a": 1, "z": 9}, frozenset({"z"})) is None
+    cases += 1
+    # But an unexpected name that was NOT pre-existing still fails.
+    assert "we did not write" in (
+        compare_listings({"a": 1}, {"a": 1, "z": 9, "q": 3}, frozenset({"z"})) or ""
+    )
     cases += 1
     # A lost create and a wrong size must not be reported as the same thing.
     assert "cannot see" in (compare_listings({"a": 1, "b": 2}, {"a": 1, "c": 2}) or "")
