@@ -68,6 +68,7 @@ from pathlib import Path
 # that never flushes.
 DISKSTATS = Path("/proc/diskstats")
 FLUSH_FIELD = 19
+SECTORS_WRITTEN_FIELD = 10  # stat 7 of 17, in 512-byte sectors (bd-2w2me)
 MIN_FIELDS = 20
 
 # `strace -c` summary rows:
@@ -79,6 +80,20 @@ SUMMARY_ROW = re.compile(r"^\s*[\d.]+\s+[\d.]+\s+\d+\s+(\d+)(?:\s+(\d+))?\s+(\w+
 # and read as "no flushes at all", which is the most dangerous possible wrong
 # answer here: it looks like a win.
 FLUSH_SYSCALLS = ("fsync", "fdatasync", "sync_file_range", "sync", "syncfs")
+
+# bd-2w2me. With barrier counts EQUAL, the remaining question is what each
+# barrier has to flush, so the write syscalls are traced in the same window.
+WRITE_SYSCALLS = ("write", "pwrite64", "writev", "pwritev", "pwritev2")
+
+# A traced line, in any of the three shapes `strace -f` produces on a daemon with
+# 65 threads. The `<unfinished ...>` half carries no return value and is
+# deliberately unmatched here — its `resumed` counterpart carries it, and
+# counting both would double every interleaved call.
+TRACE_LINE = re.compile(
+    r"^(?:\[pid\s+\d+\]\s*)?"
+    r"(?:(?P<name>\w+)\(|<\.\.\.\s+(?P<resumed>\w+)\s+resumed>)"
+    r".*?=\s+(?P<ret>-?\d+)"
+)
 
 
 def parse_flush_count(text: str, device: str) -> int | None:
@@ -110,6 +125,32 @@ def parse_syscall_counts(text: str) -> dict[str, int]:
         if match:
             counts[match.group(3)] = int(match.group(1))
     return counts
+
+
+def parse_trace(text: str) -> tuple[dict[str, int], int]:
+    """(syscall -> completed calls, bytes written) from a NON-summary `strace -f`.
+
+    Bytes are summed from RETURN VALUES, never from the count argument and never
+    from the number of calls: a daemon writing 4 KiB in one call and one writing
+    512 bytes in four are not the same amount of I/O, and ranking them by call
+    count would invert them (bd-2w2me's stated negative case). A short write
+    returns less than it was asked for, and that shorter number is the truth.
+
+    A failed call (`= -1`) still counts as a call — it crossed — but contributes
+    no bytes.
+    """
+    calls: dict[str, int] = {}
+    written = 0
+    for line in text.splitlines():
+        match = TRACE_LINE.match(line)
+        if not match:
+            continue
+        name = match.group("name") or match.group("resumed")
+        ret = int(match.group("ret"))
+        calls[name] = calls.get(name, 0) + 1
+        if name in WRITE_SYSCALLS and ret > 0:
+            written += ret
+    return calls, written
 
 
 def per_fsync(flushes: int, operations: int) -> float:
@@ -144,6 +185,30 @@ def selftest() -> int:
     assert counts["fdatasync"] == 2048, counts
     cases += 1
     assert counts["fsync"] == 32, "errored calls still crossed"
+    cases += 1
+
+    # bd-2w2me. The daemon runs 65 threads, so `strace -f` interleaves and splits
+    # calls across an `<unfinished ...>` line and a `<... resumed>` line. A parser
+    # that only matched `name(` would drop every split call — on this daemon that
+    # is most of them — and report a write path several times cheaper than it is.
+    trace = (
+        '[pid 307762] pwrite64(3, "\\0\\0"..., 4096, 8192) = 4096\n'
+        "[pid 307762] fdatasync(3)                = 0\n"
+        '[pid 307763] pwrite64(3, "\\1"..., 1024, 0 <unfinished ...>\n'
+        "[pid 307764] fdatasync(3)                = 0\n"
+        "[pid 307763] <... pwrite64 resumed>)     = 1024\n"
+        '[pid 307765] write(3, "x"..., 512)       = -1 EIO (Input/output error)\n'
+    )
+    calls, written = parse_trace(trace)
+    assert calls["pwrite64"] == 2, calls
+    cases += 1
+    assert calls["fdatasync"] == 2, calls
+    cases += 1
+    assert written == 4096 + 1024, f"resumed write must be counted once: {written}"
+    cases += 1
+    assert calls["write"] == 1, "a failed write still crossed"
+    cases += 1
+    assert written % 512 == 0, "a failed write contributes no bytes"
     cases += 1
 
     assert per_fsync(16, 8) == 2.0
@@ -220,30 +285,56 @@ def make_workload_file(path: Path, as_root: bool) -> None:
         sys.exit(f"FATAL: could not create {path}: {proc.stderr[-400:]}")
 
 
+def device_stats(device: str) -> tuple[int, int]:
+    """(flush requests completed, sectors written) for `device`."""
+    for line in DISKSTATS.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[2] == device:
+            if len(fields) < MIN_FIELDS:
+                sys.exit(
+                    f"FATAL: /proc/diskstats reports no flush counter for {device}. "
+                    "This needs a kernel that exports flush requests (>= 5.5); without "
+                    "it the count would read as zero for the wrong reason."
+                )
+            return int(fields[FLUSH_FIELD - 1]), int(fields[SECTORS_WRITTEN_FIELD - 1])
+    sys.exit(f"FATAL: {device} not present in /proc/diskstats")
+
+
 def measure_kernel_arm(device: str, workload: Path, client: Path, operations: int) -> dict:
-    """Barriers ext4 asked its backing file for, via the loop device's flush counter."""
-    control = idle_control(device, 2.0)
+    """Barriers AND bytes ext4 asked its backing file for, via the loop device."""
+    control_flushes, control_sectors = device_stats(device)
+    time.sleep(2.0)
+    idle_flushes, idle_sectors = device_stats(device)
+    control = idle_flushes - control_flushes
+    control_written = idle_sectors - control_sectors
+
     subprocess.run(["sync"], check=False)
     time.sleep(0.3)
-    before = flush_count(device)
+    before_flushes, before_sectors = device_stats(device)
     result = run([sys.executable, str(client), str(workload), str(operations)])
-    after = flush_count(device)
+    subprocess.run(["sync"], check=False)
+    time.sleep(0.3)
+    after_flushes, after_sectors = device_stats(device)
     if result.returncode != 0:
         sys.exit(f"FATAL: kernel client failed: {result.stderr[-600:]}")
-    flushes = after - before
-    if control != 0:
+    flushes = after_flushes - before_flushes
+    written = (after_sectors - before_sectors) * 512
+    if control != 0 or control_written != 0:
         sys.exit(
-            f"FATAL: the idle control on {device} counted {control} flushes. This "
-            "device is shared, so the arm counts would include someone else's "
-            "barriers and the comparison would be noise over noise. Refusing."
+            f"FATAL: the idle control on {device} counted {control} flushes and "
+            f"{control_written * 512} bytes. This device is shared, so the arm counts "
+            "would include someone else's I/O and the comparison would be noise over "
+            "noise. Refusing."
         )
     return {
         "arm": "kernel-ext4",
-        "counted_by": f"/proc/diskstats flush requests on {device}",
+        "counted_by": f"/proc/diskstats flush requests + sectors written on {device}",
         "operations": operations,
         "control": control,
         "flushes": flushes,
         "per_client_fsync": per_fsync(flushes, operations),
+        "bytes": written,
+        "bytes_per_client_fsync": written / operations,
     }
 
 
@@ -253,11 +344,14 @@ def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
     if not shutil.which("strace"):
         sys.exit("FATAL: strace is required to count the daemon's flush syscalls")
 
-    def traced(ops: int, tag: str) -> int:
+    traced_syscalls = FLUSH_SYSCALLS + WRITE_SYSCALLS
+
+    def traced(ops: int, tag: str) -> tuple[int, int]:
+        """(flush syscalls, bytes written) over one window."""
         out = out_dir / f"strace-{tag}.txt"
         proc = subprocess.Popen(
-            ["sudo", "-n", "strace", "-f", "-c", "-e",
-             f"trace={','.join(FLUSH_SYSCALLS)}", "-p", str(daemon_pid), "-o", str(out)],
+            ["sudo", "-n", "strace", "-f", "-e",
+             f"trace={','.join(traced_syscalls)}", "-p", str(daemon_pid), "-o", str(out)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         time.sleep(2.5)  # attach must complete before the client starts
@@ -268,40 +362,54 @@ def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
         else:
             time.sleep(3.0)
         time.sleep(0.5)
-        sudo("pkill", "-INT", "-f", "strace -f -c -e trace=fsync")
+        sudo("pkill", "-INT", "-f", "strace -f -e trace=")
         proc.wait(timeout=30)
         time.sleep(1.0)
         if not out.exists():
-            return 0
-        counts = parse_syscall_counts(out.read_text())
-        return sum(value for key, value in counts.items() if key in FLUSH_SYSCALLS)
+            return 0, 0
+        calls, written = parse_trace(out.read_text())
+        return sum(v for k, v in calls.items() if k in FLUSH_SYSCALLS), written
 
-    control = traced(0, "control")
-    if control != 0:
+    control_flushes, control_bytes = traced(0, "control")
+    if control_flushes != 0 or control_bytes != 0:
         sys.exit(
-            f"FATAL: the idle daemon issued {control} flush syscalls with no client "
-            "running. Refusing: the measured arm would include them."
+            f"FATAL: the idle daemon issued {control_flushes} flush syscalls and wrote "
+            f"{control_bytes} bytes with no client running. Refusing: the measured arm "
+            "would include them."
         )
-    flushes = traced(operations, f"n{operations}")
+    flushes, written = traced(operations, f"n{operations}")
     return {
         "arm": "frankenfs-fuse",
-        "counted_by": f"strace -c on daemon pid {daemon_pid} ({'/'.join(FLUSH_SYSCALLS)})",
+        "counted_by": f"strace -f on daemon pid {daemon_pid}, return values summed",
         "operations": operations,
-        "control": control,
+        "control": control_flushes,
         "flushes": flushes,
         "per_client_fsync": per_fsync(flushes, operations),
+        "bytes": written,
+        "bytes_per_client_fsync": written / operations,
     }
 
 
 def report(rows: list[dict]) -> None:
     print()
-    print("bd-7nr8p — barriers per client fsync (a COUNT; load-independent)")
-    print(f"{'arm':<16} {'N':>6} {'control':>8} {'flushes':>8} {'per fsync':>10}")
+    print("bd-7nr8p / bd-2w2me — barriers and bytes per client fsync, to the BACKING FILE")
+    print("(a COUNT; load-independent, needs no quiet window)")
+    print(f"{'arm':<16} {'N':>5} {'ctl':>5} {'flushes':>8} {'per fsync':>10} "
+          f"{'bytes':>12} {'B/fsync':>10} {'x4KiB':>7}")
     for row in rows:
-        print(f"{row['arm']:<16} {row['operations']:>6} {row['control']:>8} "
-              f"{row['flushes']:>8} {row['per_client_fsync']:>10.4f}")
+        amplification = row["bytes_per_client_fsync"] / 4096
+        print(f"{row['arm']:<16} {row['operations']:>5} {row['control']:>5} "
+              f"{row['flushes']:>8} {row['per_client_fsync']:>10.4f} "
+              f"{row['bytes']:>12} {row['bytes_per_client_fsync']:>10.1f} "
+              f"{amplification:>7.2f}")
     for row in rows:
         print(f"  {row['arm']}: {row['counted_by']}")
+    if len(rows) == 2:
+        ours = next(r for r in rows if r["arm"] == "frankenfs-fuse")
+        theirs = next(r for r in rows if r["arm"] == "kernel-ext4")
+        if theirs["bytes_per_client_fsync"] > 0:
+            ratio = ours["bytes_per_client_fsync"] / theirs["bytes_per_client_fsync"]
+            print(f"\n  write amplification, ours / kernel ext4: {ratio:.3f}x")
 
 
 def main() -> int:
