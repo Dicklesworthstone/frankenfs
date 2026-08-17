@@ -29807,7 +29807,32 @@ impl OpenFs {
             // single leaf; otherwise its root bytenr would have changed and the
             // root_tree's pointer would be stale (fall back, leave as written).
             //
-            // bd-k74ef: I tried to generalize this to multi-node trees by
+            // bd-k74ef, DIAGNOSED 2026-08-17 and it is NOT this branch. Measured
+            // missing-backref counts from `btrfs check`, one image per size:
+            //
+            //     2000 files ->  0        (root tree and extent tree are one block each)
+            //     5000 files ->  4        (1 for root 1, 3 for root 2)
+            //    20000 files -> 10        (1 for root 1, 9 for root 2)
+            //
+            // The errors are "tree extent[...] root N has no backref item in
+            // extent tree", and they scale with the NUMBER OF BLOCKS in the root
+            // and extent trees. That is bd-4nz82's deliberate tradeoff -- it
+            // skips EXTENT_ITEM insertion for these trees' own blocks, on the
+            // reasoning that "the blocks are small, missing refs don't affect
+            // mount or data access, and btrfs check stays clean". It stays clean
+            // only while each tree fits in ONE block, because exactly two
+            // EXTENT_ITEMs are inserted, one per tree. Past that, every
+            // additional block is a missing backref.
+            //
+            // So the fix is to insert a backref per block rather than per tree,
+            // which allocates into the extent tree while recording it -- the
+            // fixpoint bd-4nz82 declined to iterate to. Making THIS branch flush
+            // more nodes does not help: I tried it twice (the second attempt
+            // mapped the post-insert COW root explicitly onto extent_tree_bytenr)
+            // and `btrfs check` output was byte-identical, because the accounting
+            // was never the missing piece.
+            //
+            // The first attempt is still worth its warning: I tried to generalize this to multi-node trees by
             // rewriting every node to the address THIS transaction allocated for
             // it, and it REGRESSED the single-leaf case from a clean `btrfs
             // check` to "tree extent[...] root 2 has no backref item". The
