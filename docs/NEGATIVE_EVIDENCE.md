@@ -9302,3 +9302,71 @@ until they are, treat their absolute counts as provisional and their ratios as s
 total `pread64` count seen, and **prints a loud warning naming any line that matched no known
 shape**. The selftest pins the split-pair case explicitly. A harness that can undercount by 64x
 without saying so is worse than no harness; this one now has to admit it.
+
+## RE-MEASUREMENT — 2026-08-17 — the btrfs readdir+stat set re-run on the fixed parser: the cliff survives, two factors move, and a COLD readdir is finally measured (CreamTrout)
+
+Discharges the debt from `e9941e0ca`, which fixed a 64x parser undercount and left the dependent
+rows marked "ratios sound, absolute counts provisional". They are no longer provisional.
+
+Certification window REFUSED again, and the stated premise did not hold: I was told "no external
+builds", but `ps` showed three `rustc` at 233%/150%/136% CPU and active cargo test/build in
+**frankenscipy (13 processes), smartedgar (9), frankenredis (8), mcp_agent_mail_rust (3)**. Three
+10s samples gave **23, 22, 11 of 64 CPUs above 25% busy against the veto limit of 2**. Sixth time
+this session loadavg (13.3) and the gate disagreed. No timed row attempted. Every arm below is a
+count and does not care.
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, ELF `dbc2dd65fe4e266fff0b45f1`
+(`target/debug/ffs-cli`, carrying this session's MISS counter), mean CPU 2311.3 MHz over 64 CPUs,
+loadavg 13.34→10.85 across the series, df 253G→250G. Fixed parser, entry count taken AFTER the
+traced window, one fresh mount per arm.
+
+### The cliff — SURVIVES, same shape and same location
+
+| entries | distinct | preads | re-read | per entry | (was, broken parser) |
+|---|---|---|---|---|---|
+| 2048 | 113 | 113 | **1.0x** | 0.06 | 72 / 72 / 1.0x |
+| 5048 | 274 | 274 | **1.0x** | 0.05 | 190 / 190 / 1.0x |
+| 10048 | 545 | 1417 | **2.6x** | 0.14 | 387 / 1272 / 3.3x |
+| 20048 | 1085 | 27464 | **25.3x** | 1.37 | 782 / 27577 / 35.3x |
+
+Onset still between 5,048 and 10,048 entries; still 1.0x below it — and note that below the cliff
+reads equal distinct EXACTLY, every node read once. Per-entry cost grows **27x** from 5k to 20k
+(previously stated as 34.5x). **Distinct-node counts were understated 40-50%** across the board,
+which is where the re-read factors moved from.
+
+### Cold readdir — MEASURED, and it settles a claim I withdrew
+
+I withdrew "readdir alone costs a FLAT 12 reads at any size" as a warm-start artifact. Cold:
+
+| entries | preads | distinct | re-read | per entry |
+|---|---|---|---|---|
+| 2048 | 41 | 41 | **1.0x** | 0.02 |
+| 20048 | **303** | 303 | **1.0x** | 0.02 |
+
+So a cold readdir is **not flat** — it scales roughly linearly with entries — but its **per-entry
+cost is constant at 0.02 and it never re-reads a node**. Readdir is ~68x cheaper per entry than
+readdir+stat and is perfectly efficient; the stat side is where everything goes wrong.
+
+**The b398493d retirement therefore STANDS, now on a properly cold measurement**: 303 reads for the
+whole readdir at 20,048 entries against 27,464 for readdir+stat. A lever aimed at per-readdir-call
+validation is aimed at ~1% of the row.
+
+### Two factors move, both re-measured
+
+| result | banked | re-measured | direction |
+|---|---|---|---|
+| capability probe (`FFS_FUSE_XATTR_NO_SUPPORT=1`) @20k | 14.98x | **19.3x** | stronger |
+| floor-leaf memo (`FFS_BTRFS_FLOOR_MEMO=0`) @20k | 2.78x | **1.88x** | weaker |
+| floor-leaf memo @10k | 2.31x | **1.57x** | weaker |
+
+The floor memo is still a real win on the sweep, so **the bd-79li3 conflict stands** — that bead's
+8.6x random-access tax against a now-1.88x sweep benefit — but the magnitude is corrected and the
+trade is less lopsided than I told that bead. Its comment is updated.
+
+### Standing
+
+Every headline from this cluster has now been re-measured on a parser that agrees with `strace -c`.
+What changed: distinct counts up ~40-50%, re-read factors down, the floor memo down, the probe up,
+the cold readdir newly measured. What did not change: the cliff's existence, its location, the
+per-entry growth, the mechanism, and the conclusion that the stat path is the problem and readdir
+is not. NO wall-clock claim is made anywhere in this entry.
