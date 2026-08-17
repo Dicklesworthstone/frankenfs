@@ -10477,3 +10477,42 @@ rather than drift, and the displacement is in the median rather than the tail. T
 **per-observation state differing between the two FUSE arms** — mount/cache warmth, daemon scheduling
 — as the live candidate, and it is measurable from `raw_wall_ns` on banked runs without a window. NO
 wall-clock ratio is claimed; both banked attempts remain INADMISSIBLE and unquotable.
+
+## CORROBORATED BUT STILL BLOCKED — 2026-08-17 — the btrfs parallel-metadata sign change reproduces, and the blocker is OUR OWN ARM (PlumBeacon)
+
+Second reading of `parallel-metadata-write`, same candidate `c9fb745f…`, 96 pairs, 8 observed worker
+threads. The ratio reproduces; the null does not.
+
+| run | peak placement busy | peak off-placement busy | kernel null (spread) | FUSE null (spread) | ratio |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.544 | 0.572 | `1.024772` CLEAR | `1.025973` **FAIL** | `0.775502x` [0.770582, 0.785457] |
+| 2 | **0.328** | **0.318** | `1.020308` CLEAR | `1.036435` **FAIL** | `0.780774x` [0.771650, 0.795062] |
+
+**The sign change is corroborated.** Two independent runs agree to **0.68%**, against a banked
+`1.930090x` SLOWER. Whatever the gate says, the direction of this row has moved, and the mechanism is
+known: bd-42gtq cut metadata written per commit from 96 nodes to 6, and this workload fsyncs a private
+directory per worker.
+
+**The blocker is not the host — it is us.** The FUSE A/A null compares two byte-identical FrankenFS
+mounts inside one invocation. It fails its CI-spread gate in BOTH runs while the KERNEL A/A null
+passes in both. And run 2 had a markedly QUIETER socket — peak off-placement busy `0.318` against
+`0.572` — yet our null got **worse** (`1.036435` vs `1.025973`). Host busyness went down and our
+self-reproducibility went down with it, which rules out contention as the explanation.
+
+**The shape says tail, not bias.** Run 2's FUSE null median is `0.999971` — the two FrankenFS arms
+agree almost exactly on average and disagree in spread. Some observations are much slower than others;
+the arms are not systematically different from each other.
+
+**This is the only thing between a corroborated sign change and an admitted row**, and it is a
+user-visible property in its own right: a filesystem whose 8-thread metadata-write latency has a fat
+tail is worse than its median suggests, whatever the ratio says. Filed as **bd-r9fix**, with the first
+place to look — this workload drives the parallel create path (bd-bhh0i sharded allocator, bd-y2t0r
+delete routing) and the per-commit durability path together, and bd-42gtq made per-commit cost depend
+on how much a transaction dirtied, which is a plausible new source of per-observation variance that did
+not exist when every commit wrote the whole tree.
+
+**Method note.** Five of my last seven blocked runs failed on null SPREAD with a near-perfect null
+MEDIAN. I had been reading that as a property of this host. On this row it demonstrably is not: the
+kernel arm reproduces itself fine in the same invocations, under the same socket conditions, on the
+same hardware. **A/A null failures are attributable — check WHICH arm fails before blaming the
+window.**
