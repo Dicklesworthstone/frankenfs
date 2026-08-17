@@ -8847,3 +8847,58 @@ nritems and the node's own logical address — so a hot physical offset arrives 
 
 This is what made "the hot node is the fs-tree root" a fact rather than an inference, and it now
 happens automatically on every arm instead of by hand. NO wall-clock claim is made in this entry.
+
+## ANALYSIS — 2026-08-17 — the btrfs node-cache failure is CONCENTRATED ON ONE NODE: non-root nodes re-read 1.83x, the root 791x (CreamTrout)
+
+No runs. **Build and bench freeze in force** (/data at 19G, 99% full; the consumer is external —
+`/data/tmp/frankensearch` at 191G and a `fastmcp_*` cargo loop). This entry re-analyses figures
+already banked earlier today and adds two source refutations. Provenance of the underlying arms is
+unchanged: host `thinkstation1`, ELF `d103d36e54691124feb6842c…`, 20,048-entry fixture.
+
+### Splitting the root out of the totals
+
+| arm | total reads | distinct | root reads | non-root reads | non-root re-read | root re-read |
+|---|---|---|---|---|---|---|
+| probe live (default) | 27572 | 782 | 11772 | 15800 | **20.23x** | **11772x** |
+| probe suppressed | 1840 | 573 | 791 | 1049 | **1.83x** | **791x** |
+
+**With the capability probe suppressed, every node except the root is re-read 1.83x — close to a
+cache that works — while the root alone is re-read 791 times.** The root is 43.0% of all reads in
+the suppressed arm and 42.7% in the live one: nearly identical shares across a 15x difference in
+total volume.
+
+That stability matters. A race, a capacity effect or a load artifact would not hold its share to
+0.3 points across two arms whose totals differ by 15x. This is **structural**.
+
+### What it does to the question
+
+The open question on bd-2s8zy has been "why is the parsed-node cache not retaining". That framing is
+now too broad and I am narrowing it: **the cache retains acceptably for the ~572 leaves and fails
+for exactly one node — the fs-tree root.** Whatever is wrong is specific to that node, and the
+candidate properties are enumerable:
+
+* it is the **entry point of every descent** — the first `node_provider` call of every walk;
+* it is the **only non-leaf** in this depth-2 tree (level 1);
+* it is the **largest node** by occupancy (nritems 432 against leaves' 75-91).
+
+A per-node defect with three candidate properties is a much smaller hunt than "the cache is broken".
+
+### Two more mechanisms refuted, both by reading
+
+* **Not multiple `OpenFs` instances.** `mount_cmd` builds exactly one and shares it —
+  `let open_fs = Arc::new(open_fs);` then `Arc::clone` at each use site. One cache, one instance.
+* **Not inode canonicalisation.** `btrfs_canonical_inode` (`lib.rs:9175`) is a two-branch integer
+  map — `ino == 1` returns the subvolume root dirid, everything else returns `ino.0`. No descent, no
+  read.
+
+Refuted list is now **nine**: the 512-entry capacity bound; a mount-time fill; the floor-leaf memo
+(it helps, 2.78x); `cacheable` being false; per-worker instance multiplicity; `enable_writes` on a
+read-only mount; root-bytenr resolution; multiple `OpenFs` instances; inode canonicalisation.
+
+### Where this leaves the handoff
+
+The instrumented run described in the previous entry is still the decisive next step, but it can now
+be aimed rather than exploratory: **record the `logical` of every cache MISS and check the count for
+`48300032` specifically.** If ~791 misses land on that one address in the suppressed arm, the root is
+never being served from the cache and the three properties above are the search space. NO wall-clock
+claim is made in this entry; every figure is a count re-derived from arms already on record.
