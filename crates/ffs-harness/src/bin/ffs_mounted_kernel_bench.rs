@@ -6306,6 +6306,21 @@ fn fs_report(
     );
 
     let pinning = WorkerPinning::new(placement.driver_cpus.clone())?;
+    // bd-mhz-timing: sample the clocks HERE, immediately before the timed region.
+    //
+    // They used to be sampled only where the report is built, which is AFTER
+    // collect_samples returns -- so the figure described the host once the arms
+    // had stopped working and the `powersave` governor had parked their cores.
+    // On this host that reads `1429 MHz` for an arm that may have run the whole
+    // measurement boosted, and I built two ledger rows on that reading before
+    // checking when it was taken. A provenance field whose timestamp is wrong is
+    // worse than one that is absent, because it invites exactly that.
+    //
+    // Both samples are now kept. The BEFORE figure is what the run experienced;
+    // the AFTER figure is retained because their difference is itself evidence --
+    // an arm boosted at measurement and parked afterwards is the normal shape,
+    // and one parked at BOTH is a genuinely cold arm.
+    let mhz_before_measurement = cpu_mhz();
     let samples = collect_samples(&roots, config, &pinning, interrupted)?;
     let kernel_null = bootstrap_median_ci(
         &crossover_log_ratios(
@@ -7164,13 +7179,26 @@ fn fs_report(
     let client_cpu_set: BTreeSet<usize> = placement.driver_cpus.iter().copied().collect();
     let client_core_occupancy = physical_core_occupancy(&client_cpu_set).ok();
     let client_mhz_json = {
-        let mhz = cpu_mhz();
+        let mhz = mhz_before_measurement.clone();
         cpu_mhz_summary(&mhz, &client_cpu_set).map(|(min, max, mean, spread)| {
             json!({"min": min, "max": max, "mean": mean, "spread": spread})
         })
     };
     let cpu_mhz_observed_json = {
-        let mhz = cpu_mhz();
+        let mhz = mhz_before_measurement.clone();
+        // Sampled BEFORE the timed region (bd-mhz-timing). The post-run figure is
+        // reported separately as `cpu_mhz_after_measurement`, so a reader can see
+        // whether an arm parked afterwards rather than inferring it.
+        let after = cpu_mhz();
+        let after_placement: BTreeSet<usize> = placement
+            .driver_cpus
+            .iter()
+            .chain(placement.fuse_cpus.iter())
+            .copied()
+            .collect();
+        let after_summary = cpu_mhz_summary(&after, &after_placement).map(
+            |(min, max, mean, spread)| json!({"min": min, "max": max, "mean": mean, "spread": spread}),
+        );
         // Summarise over ALL cores AND over the placement set separately.
         //
         // The all-core figure is nearly useless on its own, and measuring it taught me
@@ -7220,6 +7248,10 @@ fn fs_report(
                 // attributed instead of merely noted.
                 "driver": driver_summary,
                 "fuse": fuse_summary,
+                // The same placement set sampled AFTER the run. Kept because the
+                // difference is evidence: parked-after is normal, parked-before
+                // is a cold arm.
+                "after_measurement": after_summary,
             })
         })
     };

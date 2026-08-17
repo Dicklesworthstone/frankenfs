@@ -19346,6 +19346,10 @@ impl OpenFs {
 
         let (sb_block, sb_off) = self.ext4_superblock_location();
         let mut block_data = block_dev.read_block(cx, sb_block)?.into_inner();
+        // bd-fv9tc: the bytes as they stand on disk, so the write below can be
+        // skipped when this function would not change them. See the guard at the
+        // end for why the comparison is over the WHOLE block.
+        let as_read = block_data.clone();
 
         #[allow(clippy::cast_possible_truncation)]
         let fb_lo = (total_free_blocks & 0xFFFF_FFFF) as u32;
@@ -19364,6 +19368,27 @@ impl OpenFs {
             );
             block_data[sb_off + EXT4_SB_CHECKSUM_OFFSET..sb_off + EXT4_SB_CHECKSUM_OFFSET + 4]
                 .copy_from_slice(&csum.to_le_bytes());
+        }
+        // bd-fv9tc: a durability boundary that changed no free count does not need
+        // to write the superblock, and the fsync-journal-commit workload is
+        // entirely such boundaries — it OVERWRITES an existing 4 KiB at offset 0,
+        // allocating and freeing nothing, yet this function pushed block 0 on
+        // every single fsync. Counted: 5 blocks per client fsync where 4 was
+        // kernel ext4's number and 2 is the necessary one (inode + data).
+        //
+        // THE COMPARISON IS OVER THE WHOLE BLOCK ON PURPOSE. Guarding on just the
+        // three patched fields would be *almost* right, and wrong in one case
+        // that matters: if the on-disk checksum is stale — some other path
+        // patched a superblock field without restamping it — the free counts can
+        // already match while the block still needs rewriting, and a field-wise
+        // guard would skip the write that repairs it. Comparing the fully patched
+        // buffer against the bytes we read keeps that repair, because a stale
+        // checksum makes the buffers differ. Skipping a write of bytes that are
+        // already on disk is a no-op by construction, so this cannot lose an
+        // update; `block_dev` here is the DIRECT adapter, so there is no MVCC
+        // staging side effect to preserve either.
+        if block_data == as_read {
+            return Ok(());
         }
         block_dev.write_block(cx, sb_block, &block_data)?;
         Ok(())
