@@ -1064,6 +1064,17 @@ impl ffs_extent::TruncateBackend for ShardedTreeBlockAllocator<'_> {
 /// tracks all FS-tree items, an extent allocator for data/metadata blocks,
 /// and a monotonically-increasing objectid counter for new inodes.
 struct BtrfsAllocState {
+    /// Set when a commit REFUSED to advance the superblock (bd-73bi2).
+    ///
+    /// Once a transaction cannot commit, every write after it is accumulating
+    /// into a transaction that will never land. ext4 remounts read-only on a
+    /// commit error for the same reason: continuing to accept writes converts a
+    /// bounded failure into unbounded silent data loss, and the application
+    /// keeps being told its writes succeeded.
+    ///
+    /// One-way for the life of the mount. Recovery is a fresh mount, because
+    /// whatever made the free-space tree unrewritable is still true.
+    commit_refused: bool,
     /// In-memory COW B-tree holding ROOT_TREE items (ROOT_ITEMs pointing to each tree).
     root_tree: InMemoryCowBtrfsTree,
     /// In-memory COW B-tree holding all FS-tree items (inodes, dirs, extents).
@@ -8429,6 +8440,7 @@ impl OpenFs {
         }
 
         Ok(BtrfsAllocState {
+            commit_refused: false,
             root_tree,
             fs_tree,
             csum_tree,
@@ -17866,6 +17878,24 @@ const BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR: u64 = 0;
 ///
 /// Note this only ever CLEARS bits it did not set: a source image made without
 /// a free-space tree is unaffected, and no unrelated compat_ro bit is touched.
+/// Whether a btrfs mutation may proceed (bd-73bi2).
+///
+/// Two independent reasons to refuse, kept in one place so a caller cannot
+/// honour one and forget the other:
+///
+/// - the mount is not writable at all, and
+/// - a previous FULL COMMIT refused to advance the superblock, after which every
+///   further write accumulates into a transaction that can never land.
+///
+/// The second is not reachable from an `fsync` in the common case: btrfs fsync
+/// takes the tree-log fast path (`commit_strategy = "tree_log_fast_fsync"`) and
+/// never runs the superblock commit. It is reachable from the full-commit path
+/// -- `sync`, unmount, or an fsync that cannot use the log -- which is exactly
+/// where a refusal originates.
+const fn btrfs_mutation_permitted(writable: bool, commit_refused: bool) -> bool {
+    writable && !commit_refused
+}
+
 /// Whether a commit is about to strand the free-space tree (bd-73bi2).
 ///
 /// The FREE_SPACE_TREE's ROOT_ITEM generation is patched to `new_gen` EARLY,
@@ -28588,8 +28618,24 @@ impl OpenFs {
     /// This function now always returns `Ok(())` — the EROFS interlock is retired.
     #[inline]
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    fn require_btrfs_rw_allowed(&self, _operation: &str) -> ffs_error::Result<()> {
-        // bd-jdo53: durable writeback is now implemented, mutations always allowed
+    fn require_btrfs_rw_allowed(&self, operation: &str) -> ffs_error::Result<()> {
+        // bd-jdo53: durable writeback is implemented, so mutations are allowed --
+        // UNLESS a commit has already refused to advance the superblock
+        // (bd-73bi2). After that point every write is accumulating into a
+        // transaction that will never land, and accepting it would keep telling
+        // the application its data is safe while none of it can ever commit.
+        let commit_refused = self
+            .btrfs_alloc_state
+            .as_ref()
+            .is_some_and(|alloc| alloc.read().commit_refused);
+        if !btrfs_mutation_permitted(self.is_writable(), commit_refused) && commit_refused {
+            warn!(
+                operation,
+                "refusing btrfs mutation: a previous commit was refused, so this mount \
+                 is read-only until it is remounted (bd-73bi2)"
+            );
+            return Err(FfsError::ReadOnly);
+        }
         Ok(())
     }
 
@@ -29889,6 +29935,14 @@ impl OpenFs {
         // free space being recorded. That restructure is the fix; this is the
         // guard that stops the corruption shipping in the meantime.
         if btrfs_commit_would_strand_free_space_tree(fst_reuse.is_some(), fst_committed) {
+            // Latch the mount read-only BEFORE returning. Without this the
+            // caller sees one error and every subsequent write is accepted into
+            // a transaction that can never commit -- which is how the writing
+            // application ended up believing 5000 creates had succeeded while
+            // the image on disk still held 48 files.
+            if let Some(state) = self.btrfs_alloc_state.as_ref() {
+                state.write().commit_refused = true;
+            }
             return Err(FfsError::Io(std::io::Error::other(
                 "bd-73bi2: refusing to advance the superblock -- the FREE_SPACE_TREE \
                  ROOT_ITEM was patched to the new generation but its block could not be \
@@ -90021,5 +90075,34 @@ mod free_space_tree_strand_tests {
     fn an_image_without_a_free_space_tree_is_not_stranded_bd_73bi2() {
         assert!(!btrfs_commit_would_strand_free_space_tree(false, false));
         assert!(!btrfs_commit_would_strand_free_space_tree(false, true));
+    }
+}
+
+#[cfg(test)]
+mod btrfs_mutation_permission_tests {
+    use super::btrfs_mutation_permitted;
+
+    /// The whole truth table, because the two refusal reasons are independent
+    /// and a caller that honours one and forgets the other is the bug this
+    /// function exists to prevent.
+    #[test]
+    fn a_writable_mount_with_no_refused_commit_may_mutate_bd_73bi2() {
+        assert!(btrfs_mutation_permitted(true, false));
+    }
+
+    #[test]
+    fn a_refused_commit_stops_writes_even_on_a_writable_mount_bd_73bi2() {
+        assert!(
+            !btrfs_mutation_permitted(true, true),
+            "after a refused commit every write accumulates into a transaction that \
+             can never land, and accepting it tells the application its data is safe \
+             when none of it can commit"
+        );
+    }
+
+    #[test]
+    fn a_read_only_mount_never_mutates_bd_73bi2() {
+        assert!(!btrfs_mutation_permitted(false, false));
+        assert!(!btrfs_mutation_permitted(false, true));
     }
 }
