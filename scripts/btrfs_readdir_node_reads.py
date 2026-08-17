@@ -208,6 +208,11 @@ def main() -> int:
                         "so it is worth running once and not every time)")
     p.add_argument("--settle", type=float, default=4.0,
                    help="seconds to wait for the daemon and the tracer to attach")
+    p.add_argument("--client", action="append", default=[], metavar="ARGV",
+                   help="run this client instead of ls/ls -l, repeatable, one arm "
+                        "each. The mountpoint is appended as the last argument. "
+                        "Split words with commas: "
+                        "--client scripts/btrfs_stat_client.py,--mode,fstat")
     p.add_argument("--daemon-env", action="append", default=[], metavar="K=V",
                    help="set an env var on the DAEMON, repeatable. Every arm then "
                         "runs from ONE ELF, so a knob A/B has no ISA/PGO confound "
@@ -242,9 +247,21 @@ def main() -> int:
     print()
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
-    arms = [("stat", ["ls", "-l"])]
-    if not args.stat_only:
-        arms.insert(0, ("readdir", ["ls"]))
+    if args.client:
+        arms = []
+        for spec in args.client:
+            argv = [w for w in spec.split(",") if w]
+            if not argv:
+                sys.exit(f"FATAL: empty --client spec {spec!r}")
+            if argv[0].endswith(".py"):
+                argv = [sys.executable] + argv
+            # Name the arm after the last flag value, so `--mode,fstat` reads
+            # as `fstat` in the table rather than as the interpreter path.
+            arms.append((argv[-1], argv))
+    else:
+        arms = [("stat", ["ls", "-l"])]
+        if not args.stat_only:
+            arms.insert(0, ("readdir", ["ls"]))
 
     print(f"{'arm':>28} {'entries':>8} {'distinct':>9} {'preads':>9} "
           f"{'reread':>9} {'per_entry':>10} {'worst':>8}")

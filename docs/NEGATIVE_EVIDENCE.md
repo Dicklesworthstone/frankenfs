@@ -8483,3 +8483,81 @@ the same way. The measurement above cannot see that, because at this size there 
 **Retry predicate.** Re-open bd-rsjvf only on a filesystem where `btrfs inspect-internal dump-tree -t 3`
 (csum) or `-t 2` (extent) shows more than one node. Until then it is a lever with a ceiling of three
 single-block writes, two of which are provably dirty.
+
+## MECHANISM — 2026-08-17 — the btrfs readdir+stat re-read storm IS the security.capability probe: 15-21x of all node reads, and the capability memo does nothing about it (CreamTrout)
+
+Attribution for the question left open by the two rows above — *why does the FUSE path re-descend
+where the in-process path does not*. Counted, one ELF, env-toggled arms, one fresh mount per arm.
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, ELF `d103d36e54691124feb6842c…` (the
+shipping release-perf+PGO daemon from `d0be37a48`), mean CPU 2939.3 MHz over 64 CPUs, loadavg
+14.56→29.78 across the series. Window measured at **19 of 64 CPUs above 25% busy against the veto's
+limit of 2** — worse than the previous turn's 12 even though loadavg had *fallen* from 22.31 to
+14.56, which is the third time this session loadavg has mis-signalled the gate. No timed row
+attempted, no build taken.
+
+### The arms
+
+`ls -l` over one flat directory, 20048 entries, image-fd `pread64` counted:
+
+| arm | distinct nodes | preads | re-read | per entry | worst offset |
+|---|---|---|---|---|---|
+| default | 782 | 27572 | 35.3x | 1.38 | 11772 |
+| `FFS_FUSE_CAPABILITY_MEMO=0` | 782 | 27577 | 35.3x | 1.38 | 11777 |
+| **`FFS_FUSE_XATTR_NO_SUPPORT=1`** | **573** | **1840** | **3.2x** | **0.09** | **791** |
+
+and at 10048 entries, default `387 distinct / 1266 preads` against xattr-off **`33 distinct / 59
+preads`**.
+
+**Suppressing the xattr layer removes 14.98x of the node reads at 20048 entries and 21.5x at
+10048.** The distinct node count collapses with it — 387 → 33 at 10048 — so the *majority of nodes
+the sweep touches at all are touched only by the probe path*. Replicated: the 20048 xattr-off arm
+came back 1841 then 1840, one read apart.
+
+**The capability MEMO changes nothing** — 27572 vs 27577, inside the 0.02% this instrument drifts by.
+That is exactly what bd-t0xoq predicted for a different reason ("a memo answers a crossing that
+already happened"): the memo caches the *answer*, and the cost measured here is the *descent taken to
+compute it*.
+
+### Mechanism, in the code rather than inferred
+
+`OpenFs::btrfs_getxattr` (`crates/ffs-core/src/lib.rs:32944`), read-only branch, resolves a probe by
+seeking the single XATTR_ITEM bucket:
+
+    let items = self.walk_btrfs_fs_tree_range(cx, lo, hi)?;
+
+That is a **fresh descent from the fs-tree root per probe**. Linux issues one uncached
+`getxattr(security.capability)` per path-based metadata op, so a readdir+stat sweep pays one full
+root-to-leaf btrfs descent *per entry*. The comment above that code is right that it fixed an
+O(object) → O(log N) problem; what it does not do is make the descent *shared* across the 20,048
+probes of one sweep.
+
+This is also why the three ways of asking are indistinguishable — `os.stat`, `os.lstat`, and
+`os.open`+`os.fstat` measured 27150 / 27154 / 27161 preads (0.04% apart). `open()` is itself a path
+walk, so none of them removes the probe; only the daemon-side knob does.
+
+### What this is NOT
+
+⛔ **`FFS_FUSE_XATTR_NO_SUPPORT=1` is an ATTRIBUTION ARM, not a lever, and must not be read as a
+proposed fix.** bd-yu6jz closed every suppression route by measurement, and the ENOSYS one by
+contract: it is per-CONNECTION, so it disables `getxattr` for the whole mount and takes
+`bd-ext4-xattr-row-unscored-a21dz` with it. Nothing here reopens that.
+
+What it does is **size the prize**, which is what bd-yu6jz has been missing: if the probe's descent
+were made free — shared across a sweep, or answered without a root descent — btrfs readdir+stat node
+reads fall by **~15x at 20k entries**. That is a number a lever can now be measured against.
+
+### Why this is btrfs-specific, and why the ext4 twin is admitted
+
+On btrfs the probe costs a tree descent per entry; ext4's equivalent is a single inode-table block
+read. That asymmetry is the most concrete explanation the campaign has for why ext4 readdir+stat is
+**ADMITTED at 1.0266x** while btrfs is not — the shared FUSE floor is genuinely shared, but btrfs
+*amplifies* it into a per-entry descent.
+
+### Still open
+
+Why the parsed-node cache does not absorb those descents. Every probe descends from the same root
+through the same upper nodes, and `walk_btrfs_fs_tree_range` does route through
+`btrfs_read_parsed_node`, yet one single offset is read 11,772 times. Three mechanisms are already
+refuted (the 512-entry cap, the mount-time fill, the floor-leaf memo) and one piece of evidence
+withdrawn. NO wall-clock claim is made in this entry; node counts are a mechanism, not a prediction.
