@@ -13581,3 +13581,37 @@ absolute arm medians `kernel_median_wall_ns` 27,772,000 ns and `fuse_median_wall
 Counted mechanism: **502 probes vs 502** with the scoped `never,exit` rule installed, and
 **4000 vs 4000** with `FUSE_HANDLE_KILLPRIV_V2` negotiated — two independent suppression
 attempts, both counted, both inert.
+
+### 2026-08-16, RETRACTION of this entry's headline (AzureBay)
+
+**The title above is wrong and I am withdrawing it.** "There is no capability-probe
+suppression to land" was over-general: it generalised from four *kernel-side* routes to the
+claim that no route exists, and a fifth was never in the list. Everything in the sections
+above stands as measured — the probe really is audit-driven, and all four of those routes
+really are closed. The error is the conclusion drawn from them.
+
+**The route that works is the FUSE one.** Answering `ENOSYS` to `getxattr` makes the kernel
+set `fc->no_getxattr` and stop asking for the life of the connection. It does not stop audit
+from *wanting* the capability; it stops the request from ever crossing into our daemon, which
+is the part we are billed for. This was already counted in this same ledger before I wrote the
+retracted entry — **400 crossings per 200 warm stats becomes 0** (`4e07063e`) — and it has
+since been measured end to end: **3.208967x on btrfs readdir+stat** (`c5cea19b`).
+
+What made it *look* unlandable was a real constraint I mistook for an absence: the switch is
+one-way and connection-wide, so it is only sound on an image carrying no xattrs. That is a
+safety gate, not a dead end. It is now `FFS_FUSE_XATTR_NO_SUPPORT=auto`, which PROVES absence
+by scanning the inode table and refuses unless the proof holds and the mount is read-only
+(`7c7439a5`, ext4; `9283cb91`, btrfs).
+
+**Why this correction is worth its own entry.** A ledger exists so nobody re-runs a dead
+lever. An entry that reports a *live* lever as dead costs more than no entry at all, and this
+one was load-bearing enough to be cited as a reason to stop. The reusable lesson is narrower
+than "I was wrong": *enumerating the routes by which a cost can be removed at one layer says
+nothing about whether it can be avoided at another.* The four closed routes were all attempts
+to stop the kernel GENERATING the probe. The one that worked stops it being DELIVERED.
+
+Not yet re-measured: warm stat specifically, on ext4, with the switch on. The `>= 4.661799x`
+figure in `f33db4de` predates the `auto` gate and should not be re-quoted until a run confirms
+the switch resolved ACTIVE rather than REFUSED — which the daemon now self-reports as
+`mount_candidate_xattr,xattr_suppression=...`, folded into the comparator's knob-divergence
+proof so a refused arm cannot be certified as a lever (`f4197ab0`).
