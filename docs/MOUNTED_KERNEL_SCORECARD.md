@@ -15,6 +15,22 @@
 > | fsync/journal, parallel metadata | `f44b3dc4…` | 2026-07-30/31 |
 > > | Xattr get/list report, bulk durable write | `bcf2bc80…` | 2026-08-05 |
 >
+> ⛔ **ALL FOUR WRITE ROWS ALSO PREDATE THE 2026-08-17 EXT4 WRITE-PATH WORK** — create/delete
+> storm, bulk durable write, parallel metadata writes and fsync/journal commit. `bd-fv9tc`
+> landed that day and is measured, in exact integers with both arms in one invocation, to take
+> ext4 from **5.00 to 3.00 blocks written per client fsync** against kernel ext4's 4.00 — i.e.
+> write amplification `1.250x` -> `0.750x`, so FrankenFS now writes FEWER bytes than kernel
+> ext4 per durability boundary. It coalesced the group-descriptor flush by descriptor block
+> (it had been issuing one device write per GROUP, with 64 groups sharing a block) and stopped
+> writing the superblock on a boundary that changed no free count.
+>
+> The same class of work moved the btrfs side hard: two btrfs rows changed SIGN on 2026-08-17
+> (fsync/journal commit and parallel metadata writes — see the
+> [btrfs scorecard](MOUNTED_BTRFS_SCORECARD.md)). The ext4 lever is much smaller (1.67x fewer
+> metadata blocks per boundary, against btrfs's ~16x), so expect smaller movement and no sign
+> change on the large losses — but **none of these four figures should be quoted as "FrankenFS
+> today" until re-measured**. Tracked as `bd-jgq8e`.
+>
 > ⚠ The re-measured readdir+stat row is **not** comparable with the other seven as if one
 > window produced them: it uses a freshly trained PGO profile (`b30de364…`, not the bank's
 > `5c6530a0…` — the banked profile was destroyed, see `bd-v0igv`), a different kernel, and a
