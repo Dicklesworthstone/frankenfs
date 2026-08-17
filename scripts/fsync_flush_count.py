@@ -53,7 +53,9 @@ and `--work-dir` must not point inside a `nosuid` filesystem.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -209,6 +211,64 @@ def image_fd_of(pid: int, image: Path) -> int:
     )
 
 
+def elf_sha256(path: Path) -> str:
+    """SHA-256 of the binary under test.
+
+    bd-9jat1. The banked `release-perf/ffs-cli` was found to be four hours older
+    than the levers it would have been credited with — it still carried the OLD
+    per-group GDT path — while the harness binary beside it was current. Anything
+    that measures a daemon and does not record WHICH daemon can be attributed to
+    the wrong tree, and a timestamp is not enough because the client and the
+    daemon are separate binaries with separate mtimes.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cpu_mhz() -> tuple[float, float, float]:
+    """(min, max, mean) core clock across every CPU, right now.
+
+    This host runs the POWERSAVE governor and cores clock INDEPENDENTLY — a 2.94x
+    spread between the slowest and fastest core at one instant has been observed
+    directly. A count does not care, but a row without its clocks cannot be
+    compared against one taken in another window, so every arm records them.
+    """
+    speeds = [
+        float(line.split(":", 1)[1])
+        for line in Path("/proc/cpuinfo").read_text().splitlines()
+        if line.startswith("cpu MHz")
+    ]
+    if not speeds:
+        return (0.0, 0.0, 0.0)
+    return (min(speeds), max(speeds), sum(speeds) / len(speeds))
+
+
+def loadavg() -> tuple[float, float, float]:
+    """The 1/5/15-minute load averages, read fresh.
+
+    Read here rather than accepted from a caller: a load figure quoted from
+    outside the run is stale by the time the arm executes.
+    """
+    parts = Path("/proc/loadavg").read_text().split()
+    return (float(parts[0]), float(parts[1]), float(parts[2]))
+
+
+def arm_provenance() -> dict:
+    """Per-ARM load and clocks, sampled at the moment the arm runs."""
+    one, five, fifteen = loadavg()
+    mhz_min, mhz_max, mhz_mean = cpu_mhz()
+    return {
+        "loadavg": [one, five, fifteen],
+        "cpu_mhz_min": round(mhz_min, 1),
+        "cpu_mhz_max": round(mhz_max, 1),
+        "cpu_mhz_mean": round(mhz_mean, 1),
+        "cpu_mhz_spread": round(mhz_max / mhz_min, 3) if mhz_min > 0 else 0.0,
+    }
+
+
 def per_fsync(flushes: int, operations: int) -> float:
     """Flushes per client fsync. `operations` of 0 is a caller bug, not a ratio."""
     if operations <= 0:
@@ -278,6 +338,31 @@ def selftest() -> int:
     cases += 1
     assert written < unfiltered, "the fd filter must actually exclude /dev/fuse traffic"
     cases += 1
+
+    # Provenance helpers must read THIS host, not a fixture — a per-arm clock that
+    # silently returns a constant is worse than none, because a row would carry a
+    # figure nobody could falsify.
+    mhz_min, mhz_max, mhz_mean = cpu_mhz()
+    assert mhz_max >= mhz_min > 0, (mhz_min, mhz_max)
+    cases += 1
+    assert mhz_min <= mhz_mean <= mhz_max, (mhz_min, mhz_mean, mhz_max)
+    cases += 1
+    one, five, fifteen = loadavg()
+    assert one >= 0 and five >= 0 and fifteen >= 0, (one, five, fifteen)
+    cases += 1
+    arm = arm_provenance()
+    assert set(arm) >= {"loadavg", "cpu_mhz_min", "cpu_mhz_max", "cpu_mhz_spread"}, arm
+    cases += 1
+    # The ELF hash must actually distinguish two different files, or it cannot
+    # detect the stale-daemon case it exists for.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b = Path(tmp) / "a", Path(tmp) / "b"
+        a.write_bytes(b"old per-group path")
+        b.write_bytes(b"new batched path")
+        assert elf_sha256(a) != elf_sha256(b), "the ELF hash must separate two binaries"
+        assert elf_sha256(a) == elf_sha256(a), "and be stable for one"
+    cases += 2
 
     assert per_fsync(16, 8) == 2.0
     cases += 1
@@ -379,6 +464,7 @@ def measure_kernel_arm(device: str, workload: Path, client: Path, operations: in
     subprocess.run(["sync"], check=False)
     time.sleep(0.3)
     before_flushes, before_sectors = device_stats(device)
+    provenance = arm_provenance()
     result = run([sys.executable, str(client), str(workload), str(operations)])
     # No `sync` inside the measured window: it is itself a barrier and inflated
     # the count by exactly one (129 flushes for 64 fsyncs, 2.0156). The client's
@@ -404,6 +490,7 @@ def measure_kernel_arm(device: str, workload: Path, client: Path, operations: in
         "per_client_fsync": per_fsync(flushes, operations),
         "bytes": written,
         "bytes_per_client_fsync": written / operations,
+        "provenance": provenance,
     }
 
 
@@ -447,6 +534,7 @@ def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
             f"{control_bytes} bytes with no client running. Refusing: the measured arm "
             "would include them."
         )
+    provenance = arm_provenance()
     flushes, written = traced(operations, f"n{operations}")
     return {
         "arm": "frankenfs-fuse",
@@ -458,6 +546,7 @@ def measure_fuse_arm(daemon_pid: int, workload: Path, client: Path,
         "per_client_fsync": per_fsync(flushes, operations),
         "bytes": written,
         "bytes_per_client_fsync": written / operations,
+        "provenance": provenance,
     }
 
 
@@ -475,6 +564,19 @@ def report(rows: list[dict]) -> None:
               f"{amplification:>7.2f}")
     for row in rows:
         print(f"  {row['arm']}: {row['counted_by']}")
+    # bd-9jat1 / provenance. A count is load-independent, but a row without its
+    # window cannot be compared against one taken in another, and a row without
+    # the daemon's ELF cannot be attributed to a tree at all — the banked
+    # release-perf ffs-cli was four hours stale and still carried the OLD GDT path
+    # while the harness binary beside it was current.
+    print()
+    print("  provenance (sampled per ARM, at the moment that arm ran):")
+    for row in rows:
+        p = row.get("provenance", {})
+        load = p.get("loadavg", [0, 0, 0])
+        print(f"    {row['arm']:<15} loadavg {load[0]:.2f}/{load[1]:.2f}/{load[2]:.2f}  "
+              f"cpu MHz min {p.get('cpu_mhz_min', 0):.0f} max {p.get('cpu_mhz_max', 0):.0f} "
+              f"mean {p.get('cpu_mhz_mean', 0):.0f} spread {p.get('cpu_mhz_spread', 0):.2f}x")
     if len(rows) == 2:
         ours = next(r for r in rows if r["arm"] == "frankenfs-fuse")
         theirs = next(r for r in rows if r["arm"] == "kernel-ext4")
@@ -526,6 +628,13 @@ def main() -> int:
     client.write_text(CLIENT_SOURCE)
 
     print("bd-7nr8p: this is a COUNT. It is load-independent and needs no quiet window.")
+    # bd-9jat1: name the daemon being measured, before measuring it. The banked
+    # release-perf ffs-cli was four hours older than the levers it would have been
+    # credited with, while the harness binary beside it was current — so neither
+    # an mtime nor "the tree is up to date" is evidence about the DAEMON.
+    print(f"  host {platform.node()}  kernel {platform.release()}")
+    print(f"  daemon {args.cli}")
+    print(f"  daemon ELF sha256 {elf_sha256(args.cli)}")
     rows: list[dict] = []
 
     # ── kernel ext4 arm ────────────────────────────────────────────────────────

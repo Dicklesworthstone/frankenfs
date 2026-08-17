@@ -462,6 +462,28 @@ impl FsOps for OpenFs {
                 // serialized by the FUSE dispatcher's inode locks, identical to
                 // the ext4 writable snapshot above.
                 let canonical = self.btrfs_canonical_inode(ino)?;
+                // bd-btrfs-ro-readdir: on a mount that cannot be written through,
+                // the snapshot cannot go stale, so skip the per-call attr lookup
+                // that exists only to build the validation key. On btrfs that
+                // lookup is a tree descent, paid once per readdir PAGE for a
+                // listing already in hand -- ~209 descents for a 20000-entry
+                // directory, each one a fresh chance to miss the block cache.
+                // That per-call variance is the leading remaining suspect for
+                // the btrfs readdir+stat A/A null, which has never cleared in 7
+                // attempts and whose best is only 0.5 points over the ceiling.
+                //
+                // `btrfs_alloc_state` is `None` exactly when the mount is
+                // read-only, which is the same condition the writable path below
+                // branches on, so this cannot diverge from it.
+                if btrfs_ro_readdir_snapshot_enabled() && self.btrfs_alloc_state.is_none() {
+                    if let Some(page) = readdir_snapshot_serve_unvalidated(
+                        &self.readdir_snapshot,
+                        canonical,
+                        offset,
+                    ) {
+                        return Ok(page);
+                    }
+                }
                 let attr = self.btrfs_read_inode_attr(cx, ino)?;
                 if attr.kind != FileType::Directory {
                     return Err(FfsError::NotDirectory);

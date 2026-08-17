@@ -1770,6 +1770,19 @@ fn slice_readdir_snapshot(entries: Arc<Vec<DirEntry>>, offset: u64) -> ReaddirPa
 
 /// Serve a readdir page from the snapshot slot iff it matches `ino` + `validation`.
 #[allow(clippy::significant_drop_tightening)]
+/// Whether a read-only btrfs mount may serve readdir pages without re-validating
+/// the snapshot (bd-btrfs-ro-readdir).
+///
+/// Opt-in and OFF unless set, so an unset environment is byte-identical to
+/// before it existed and both arms of an A/B come from one ELF.
+fn btrfs_ro_readdir_snapshot_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FFS_BTRFS_READDIR_RO_SNAPSHOT")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on" | "TRUE" | "On"))
+    })
+}
+
 fn readdir_snapshot_serve(
     slot: &Mutex<Option<ReaddirSnapshot>>,
     ino: u64,
@@ -1780,6 +1793,28 @@ fn readdir_snapshot_serve(
     let snap = guard.as_ref()?;
     (snap.ino == ino && snap.validation == validation)
         .then(|| slice_readdir_snapshot(Arc::clone(&snap.entries), offset))
+}
+
+/// Serve a readdir page from the snapshot WITHOUT re-validating it.
+///
+/// Only sound on a mount that cannot be written through (bd-btrfs-ro-readdir).
+/// The validated twin above exists because a writable mount can change a
+/// directory under a cached listing; a read-only mount cannot, so the validation
+/// key is pure cost there -- and on btrfs building that key costs a `DIR_ITEM`
+/// tree descent per readdir call, which is a B-tree walk repeated once per page
+/// for a listing already in hand.
+///
+/// Matching on inode alone is the whole difference. That is safe here precisely
+/// because a snapshot only ever exists for a directory this process listed, so
+/// an inode match means the entries were read from the same immutable image.
+fn readdir_snapshot_serve_unvalidated(
+    slot: &Mutex<Option<ReaddirSnapshot>>,
+    ino: u64,
+    offset: u64,
+) -> Option<ReaddirPage> {
+    let guard = slot.lock();
+    let snap = guard.as_ref()?;
+    (snap.ino == ino).then(|| slice_readdir_snapshot(Arc::clone(&snap.entries), offset))
 }
 
 /// Clear the readdir snapshot slot. Called on every directory mutation so a later
@@ -38044,6 +38079,80 @@ fn skipped_free_space_tree_rewrite_clears_the_feature_bits_bd_73bi2() {
 // imports (serde_json, tracing_subscriber, sha2). `cargo test` still passed,
 // which is why it survived: only a plain `cargo build` can see it.
 #[cfg(test)]
+
+/// bd-btrfs-ro-readdir: the unvalidated serve matches on INODE only, and the
+/// validated one still does not.
+///
+/// The whole safety argument is that these two are used in different
+/// conditions: the unvalidated path is reachable only on a mount that cannot
+/// be written through, where nothing can change a directory under a cached
+/// listing. If it ever ran on a writable mount it would serve a stale
+/// listing after a create or unlink, so the property worth pinning is that
+/// the two functions genuinely DIFFER — a test that passed for both would be
+/// testing nothing.
+#[test]
+fn unvalidated_readdir_snapshot_matches_on_inode_only_bd_btrfs_ro_readdir() {
+    let entries = std::sync::Arc::new(vec![DirEntry {
+        ino: InodeNumber(7),
+        offset: 1,
+        kind: FileType::RegularFile,
+        name: b"a".to_vec(),
+    }]);
+    let stored = ReaddirValidation {
+        ctime: 100,
+        mtime: 100,
+        size: 4096,
+    };
+    let slot = Mutex::new(Some(ReaddirSnapshot {
+        ino: 5,
+        validation: stored,
+        entries: std::sync::Arc::clone(&entries),
+    }));
+
+    // Same inode, DIFFERENT validation: the unvalidated serve answers, the
+    // validated one refuses. That difference is the lever.
+    let changed = ReaddirValidation {
+        ctime: 999,
+        mtime: 999,
+        size: 8192,
+    };
+    assert!(
+        readdir_snapshot_serve_unvalidated(&slot, 5, 0).is_some(),
+        "read-only serve must answer without consulting the validation key"
+    );
+    assert!(
+        readdir_snapshot_serve(&slot, 5, changed, 0).is_none(),
+        "the validated path must still refuse a changed directory — if this \
+             passed, the two paths would be identical and the knob pointless"
+    );
+
+    // A different inode is refused by BOTH: the unvalidated path drops the
+    // validation check, not the identity check.
+    assert!(readdir_snapshot_serve_unvalidated(&slot, 6, 0).is_none());
+    assert!(readdir_snapshot_serve(&slot, 6, stored, 0).is_none());
+
+    // An empty slot yields nothing rather than panicking.
+    let empty: Mutex<Option<ReaddirSnapshot>> = Mutex::new(None);
+    assert!(readdir_snapshot_serve_unvalidated(&empty, 5, 0).is_none());
+}
+
+/// bd-btrfs-ro-readdir: the knob is opt-in and inert unless set.
+///
+/// Polarity matters more than usual here: enabled on a WRITABLE mount this
+/// would serve listings that predate a mutation. The call site guards on
+/// `btrfs_alloc_state.is_none()` as well, so the knob alone cannot do that —
+/// but a knob that defaulted ON would put the entire weight of that
+/// correctness argument on one `&&`.
+#[test]
+fn btrfs_ro_readdir_snapshot_knob_is_opt_in_bd_btrfs_ro_readdir() {
+    // Reads the process environment once; under the test harness the var is
+    // unset, so the feature must be OFF.
+    assert!(
+        !btrfs_ro_readdir_snapshot_enabled(),
+        "an unset environment must leave readdir validation exactly as it was"
+    );
+}
+
 mod tests {
     // This (very large) test module relaxes pedantic/nursery style lints plus a
     // few default-level noise lints that accumulated while ffs-core's clippy was

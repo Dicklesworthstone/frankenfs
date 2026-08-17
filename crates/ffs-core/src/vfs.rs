@@ -3915,23 +3915,23 @@ mod getattr_batch_tests {
 
     fn attr_for(ino: InodeNumber) -> InodeAttr {
         InodeAttr {
-                ino,
-                size: ino.0,
-                blocks: 8,
-                atime: SystemTime::UNIX_EPOCH,
-                mtime: SystemTime::UNIX_EPOCH,
-                ctime: SystemTime::UNIX_EPOCH,
-                crtime: SystemTime::UNIX_EPOCH,
-                kind: FileType::Directory,
-                perm: 0o755,
-                nlink: 2,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                blksize: 4096,
-                generation: 1,
-            }
+            ino,
+            size: ino.0,
+            blocks: 8,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            crtime: SystemTime::UNIX_EPOCH,
+            kind: FileType::Directory,
+            perm: 0o755,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 4096,
+            generation: 1,
         }
+    }
 
     #[derive(Default)]
     struct CountingFs {
@@ -3957,8 +3957,11 @@ mod getattr_batch_tests {
             scope: &mut RequestScope,
             inos: &[InodeNumber],
         ) -> Vec<ffs_error::Result<InodeAttr>> {
-            self.batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            inos.iter().map(|ino| self.getattr(cx, scope, *ino)).collect()
+            self.batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            inos.iter()
+                .map(|ino| self.getattr(cx, scope, *ino))
+                .collect()
         }
 
         fn lookup(
@@ -4005,7 +4008,8 @@ mod getattr_batch_tests {
             Err(FfsError::UnsupportedFeature(
                 "readlink fixture path is not supported".to_owned(),
             ))
-        }    }
+        }
+    }
 
     struct DefaultOnlyFs;
 
@@ -4063,7 +4067,8 @@ mod getattr_batch_tests {
             Err(FfsError::UnsupportedFeature(
                 "readlink fixture path is not supported".to_owned(),
             ))
-        }    }
+        }
+    }
 
     /// bd-xfe7z: the DEFAULT batch must be indistinguishable from looping
     /// `getattr`, so a filesystem that does not override it behaves exactly as
