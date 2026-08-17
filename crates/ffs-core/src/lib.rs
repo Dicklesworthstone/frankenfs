@@ -29806,6 +29806,18 @@ impl OpenFs {
             // Only re-serialize when the two inserts kept the extent tree a
             // single leaf; otherwise its root bytenr would have changed and the
             // root_tree's pointer would be stale (fall back, leave as written).
+            //
+            // bd-k74ef: I tried to generalize this to multi-node trees by
+            // rewriting every node to the address THIS transaction allocated for
+            // it, and it REGRESSED the single-leaf case from a clean `btrfs
+            // check` to "tree extent[...] root 2 has no backref item". The
+            // reason is worth leaving here: the two accounting inserts COW the
+            // tree, so the root block ID afterwards is NOT the one that was
+            // pre-allocated. The old code sidesteps that by writing whatever the
+            // CURRENT root is to `extent_tree_bytenr`; a generalization keyed on
+            // the pre-allocation map fails its own precondition and silently
+            // skips the write the old path performed. Any fix has to handle the
+            // post-insert COW identity, not just the node count.
             if alloc.extent_alloc.extent_tree_root_is_leaf() {
                 let leaf_block = alloc.extent_alloc.extent_tree().root_block();
                 let mut addrs = std::collections::BTreeMap::new();
@@ -29832,6 +29844,17 @@ impl OpenFs {
                         )))
                     })?;
                 self.dev.sync(cx)?;
+            } else {
+                // Observability only, no behaviour change: this is the exact
+                // moment block-group accounting stops reaching disk, and until
+                // now it happened silently. `btrfs check` reports it much later
+                // as "errors found in extent allocation tree or chunk
+                // allocation" on an image that mounts and reads back perfectly.
+                warn!(
+                    "extent-tree accounting NOT flushed: the tree is no longer a single \
+                     leaf, so block-group accounting on disk is stale and btrfs check \
+                     will object (bd-k74ef)"
+                );
             }
 
             // bd-qxo5x: rewrite the FREE_SPACE_TREE in place from the now-final
