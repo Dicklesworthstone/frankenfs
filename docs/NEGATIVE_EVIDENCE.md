@@ -9874,3 +9874,43 @@ rather than leave a test that proves nothing. The end-to-end mount check above i
 currency: the daemon-side share of this row is bounded and the row is transport-heavy (bd-q0xnl).
 What a timed row would show is UNMEASURED and will stay that way until a window exists — the gate has
 not been reachable once in thirty consecutive samples on this host.
+
+## CORRECTION TO MY OWN HEADLINE — 2026-08-17 — the admitted btrfs fsync ratio is the MOST OPTIMISTIC of three, and it came from the MOST CONTENDED window (PlumBeacon)
+
+Third 96-pair run, same candidate `c9fb745f`, in the cleanest window this host has offered all day.
+It disagrees with the banked figure by 15%, and it is the better-provenanced measurement.
+
+| run | loadavg 1m | CPU idle | arms' clock gap | ratio | verdict |
+|---|---|---|---|---|---|
+| A | 31.21 | — | **1.77x apart** | **0.461109** | ADMITTED, HONEST_WIN |
+| B | 34.54 | 78% -> 65% | 0.05% | 0.463280 | BLOCKED (fuse null spread 1.043 > 1.025) |
+| C | **14.96** | **88% -> 78%** | **0.09%** | **0.533114** | BLOCKED (kernel null spread 1.027 > 1.025) |
+
+**The two favourable runs are the two loaded runs.** A and B agree to 0.47% at loadavg 31-35; C, at
+loadavg 15 with 88% idle and the arms' clocks 0.09% apart, comes out **15% less favourable to us**.
+That is a coherent direction rather than noise: under contention the incumbent — which crosses the
+block layer and a loop driver per I/O, and whose flush path runs kernel worker threads — has more to
+lose than a FUSE daemon pinned to its own CPU. The measurement was reading partly the host's
+busyness, and it was reading it in our favour.
+
+**So I am restating the row at the conservative figure.** The defensible number for btrfs
+`fsync-journal-commit` is **`0.533114x` [0.523640, 0.545181] — about 1.88x faster than kernel btrfs**,
+not the `0.461109x` (2.17x) that was admitted. `0.461109x` remains the only run that cleared the null
+gate, and that is exactly why it must not be the quoted figure: it is the best number, from the worst
+window, and quoting the best cell is the failure mode this ledger exists to prevent.
+
+**None of the three runs satisfies my corrected predicate in full**, and the pattern of failures is
+itself informative: A cleared both nulls but had 1.77x clock asymmetry; B and C each had matched
+clocks and failed one null on SPREAD, not median — B the fuse arm's, C the kernel arm's. Every null
+median across all three is within 1.4% of one. The medians are stable; the spreads are what this host
+will not hold still.
+
+**What is now true, stated so it survives quotation:**
+* the DIRECTION is robust — three independent 96-pair runs, all well below 1.0, medians 0.461 / 0.463 / 0.533;
+* the MAGNITUDE is load-dependent over at least 0.461-0.533, and the honest figure is the worst of them;
+* the row still carries the transport qualification (the kernel arm is loop-mounted, we are not — bd-w2u82);
+* and bd-5hqj2's durability half is still open.
+
+**Retry predicate, unchanged but now with a purpose.** A run with both nulls clear on median AND
+spread and the arms' clocks within 5% would settle the magnitude. Given C, expect that number to land
+nearer 0.53 than 0.46.
