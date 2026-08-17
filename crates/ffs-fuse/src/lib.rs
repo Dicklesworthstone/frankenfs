@@ -18079,24 +18079,55 @@ mod tests {
             config: MountConfig::default(),
         };
 
-        // Set the shutdown flag from another thread after one poll interval.
+        // Set the shutdown flag from another thread after one poll interval,
+        // reporting back the instant it was set.
+        //
+        // This test used to assert `elapsed < 6 * POLL_INTERVAL` (60ms). That is
+        // a LATENCY BUDGET standing in for the property actually wanted, and on
+        // a loaded host the scheduler blows through it for reasons that have
+        // nothing to do with this code: observed failing at `elapsed=153ms`
+        // under loadavg 69, passing at loadavg 22, same commit. A test that
+        // reports the host's load as a defect in `wait` costs more than it
+        // catches, because a red that everyone learns to re-run is a red nobody
+        // reads.
+        //
+        // What is asserted instead is the ORDERING, which is what "observes
+        // shutdown" actually means and which no amount of scheduler delay can
+        // perturb: `wait` must not return before the flag is set. That is
+        // strictly STRONGER than the old bound in the direction that matters --
+        // an implementation returning immediately, ignoring the flag entirely,
+        // passed the 60ms budget comfortably and fails this.
         let trigger_delay = MOUNT_HANDLE_WAIT_POLL_INTERVAL;
-        let max_wait = MOUNT_HANDLE_WAIT_POLL_INTERVAL.saturating_mul(6);
         let shutdown_thread = std::thread::spawn(move || {
             std::thread::sleep(trigger_delay);
+            let set_at = std::time::Instant::now();
             shutdown_trigger.store(true, Ordering::Relaxed);
+            set_at
         });
 
         let started = std::time::Instant::now();
         let snap = handle.wait();
+        let returned_at = std::time::Instant::now();
         let elapsed = started.elapsed();
-        shutdown_thread
+        let set_at = shutdown_thread
             .join()
             .expect("shutdown trigger thread should not panic");
+
         assert_eq!(snap.requests_ok, 1);
         assert!(
-            elapsed < max_wait,
-            "MountHandle::wait should observe shutdown within {max_wait:?}, elapsed={elapsed:?}"
+            returned_at >= set_at,
+            "MountHandle::wait returned BEFORE the shutdown flag was set, so it did not \
+             observe it: returned_at={returned_at:?}, set_at={set_at:?}"
+        );
+        // The remaining upper bound is a HANG DETECTOR, not a latency budget: it
+        // exists so an implementation that never notices the flag fails in
+        // finite time rather than wedging the suite. Sized far above any
+        // plausible scheduling delay so load can never reach it.
+        let hang_limit = Duration::from_secs(30);
+        assert!(
+            elapsed < hang_limit,
+            "MountHandle::wait never observed the shutdown flag within {hang_limit:?} \
+             (elapsed={elapsed:?}) -- this is a hang, not slowness"
         );
     }
 
