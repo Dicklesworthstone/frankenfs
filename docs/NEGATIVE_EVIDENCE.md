@@ -10175,3 +10175,53 @@ not answer that here — it is a methodology decision, and bd-4sull's own integr
 this veto refuses on these workloads is an HONEST_LOSS, so admitting them cannot manufacture a win)
 remains the substantive case. What is now measured is that the threshold is **unreachable under any
 realistic multi-tenant load on this host**, and the reason is spread rather than magnitude.
+
+## I OVER-CORRECTED — 2026-08-17 — the "load-dependence" was one outlier, and the proper covariate shows the ratio is FLAT (PlumBeacon)
+
+Last entry I restated the btrfs fsync headline from `0.449-0.461` up to `~0.533` on the grounds that
+the ratio moved with host load and the quiet window was less favourable. A fifth run, at 192 pairs in
+the quietest window measured so far, refutes that. **The correction was wrong and I am withdrawing
+it.**
+
+**Run E**: `fuse_over_kernel_median=0.456284` [0.448364, 0.462696], 192 pairs,
+`peak_placement_mean_busy=0.462` — half of run D's 0.937, i.e. genuinely the quiet end.
+`BLOCKED_NULL`, and only on the fuse arm's spread (1.030685 vs a 1.025 limit); the kernel null was
+clear (median 1.006997, spread 1.016966).
+
+**Ordered by the covariate that actually describes the window** — `peak_placement_mean_busy`, which
+measures the CPUs the arms ran on, not the host-wide loadavg:
+
+| run | pairs | peak placement busy | ratio |
+|---|---|---|---|
+| E | 192 | **0.462** | 0.456284 |
+| A | 96 | 0.747 | 0.461109 |
+| D | 192 | **0.937** | 0.449048 |
+
+**That is flat.** Across a doubling of placement busyness (0.46 -> 0.94) the ratio moves 1.6%, and not
+monotonically. There is no load effect to see once the window is measured properly.
+
+**What actually happened.** My load-dependence claim rested on run C (`0.533114`, loadavg 14.96) being
+the quiet-window truth and the others being inflated by contention. Run C is instead an OUTLIER: four
+runs now cluster at **0.449 / 0.456 / 0.461 / 0.463** — a 3.1% spread — and C sits 15% away from all of
+them. I had one quiet-ish run and one busy pair, saw a difference, and reached for a mechanism. The
+mechanism was plausible, which is exactly what made it worth distrusting until a second quiet run
+existed.
+
+**The error was using loadavg as the covariate.** Run D taught that a pre-run `uptime` describes only
+the starting line; this entry extends it. Loadavg is host-wide and lags by a minute, so it ranked run
+D (which peaked at 93.7% busy on the placement CPUs) as the *quiet* run because it *launched* quiet.
+`peak_placement_mean_busy` comes from the run's own samples over its own CPUs, and under it the
+apparent effect vanishes.
+
+**Corrected standing of the row.** btrfs `fsync-journal-commit` is **~0.45-0.46x of kernel btrfs
+(about 2.2x faster)**, admitted twice — `0.449048x` at 192 pairs and `0.461109x` at 96 — with two
+further runs agreeing at 0.456 and 0.463 and no dependence on window busyness. Run C's `0.533114x`
+stands as an unexplained outlier and should be recorded, not averaged in and not used as the headline.
+
+**Both qualifications from before still stand and are untouched by any of this:** the kernel arm is
+loop-mounted and we are not (bd-w2u82), and durability equivalence is unproven (bd-5hqj2).
+
+**Method note worth more than the row.** Two self-corrections in two turns, in opposite directions,
+both caused by treating a single run's window as representative. The discipline that would have
+prevented both: **do not attribute a difference between two runs to a mechanism until the covariate
+is measured per-run and there are at least two runs at each end.**
