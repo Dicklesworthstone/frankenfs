@@ -10566,3 +10566,53 @@ session's certification attempts.
 Standing: both banked attempts remain INADMISSIBLE and unquotable, and the memo lever's wall-clock
 effect remains UNMEASURED. What has changed is that the reason is now quantitative and the remedy is
 no longer "wait for a quiet window".
+
+## ⛔ MAJOR CORRECTION — 2026-08-17 — the certification gate IS reachable (13 admitted btrfs readdir+stat rows), and the discriminator is CV, not autocorrelation (bd-btrfs-readdir-stat-8x-8y7vp, bd-4sull)
+
+I built `scripts/aa_null_effective_n.py` to validate my autocorrelation explanation across the banked
+corpus. It refuted the explanation and refuted a larger claim I have been repeating for several
+turns. Both withdrawals are below. No run taken; survey of **78 banked reports** already on disk.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, mean CPU 2286.7 MHz over 64
+CPUs, loadavg 30.52/25.45/18.44, **idle 81.8% measured** (reported as 49%; my four-sample measurement
+disagrees and is recorded as such), iowait 0.7%, df 201G.
+
+**⛔ WITHDRAWN, and it is the important one: "the certification gate is unreachable on this host."**
+I said this repeatedly, and used it to frame twelve declined windows. It is false.
+btrfs `large_directory_readdir_stat_8t` — the exact row in question — has been **ADMITTED 13 times**
+in this bank, at 32,768 operations, `fuse_aa` between 0.99502 and 1.01889, every one
+`verdict=honest_loss` with ratios from **3.359246x to 8.278490x**. Across the whole corpus, 19 of 78
+filesystem rows are admitted.
+
+So "btrfs readdir+stat is not admitted" means **it has not reached PARITY** — every admitted row is
+an honest loss — and never meant the row cannot be certified. My "unreachable" framing conflated the
+two and overstated the case. The gate is reachable; my two attempts simply failed it.
+
+**⛔ WITHDRAWN: autocorrelation / n_eff as the explanation.** The previous entry made this the
+capstone. The survey inverts it:
+
+| statistic (per report, fuse arms) | admitted | blocked | separates? |
+|---|---|---|---|
+| **max fuse CV** | **1.63%** | **8.91%** | **YES** |
+| min fuse n_eff | 11.0 | 13.4 | **no — wrong direction** |
+
+Blocked runs carry the *higher* median n_eff. Autocorrelation is real inside individual runs — my
+48-pair run held rho=0.773 and roughly 6 independent observations — but it does not predict
+admissibility and is not why nulls fail.
+
+**✅ WHAT DOES HOLD: the FUSE arm's coefficient of variation.** Admitted runs sit at ~1.6% max fuse
+CV; blocked ones at ~8.9%. For this row specifically, the 13 admitted runs have a max fuse CV median
+of **1.54%**. My two attempts carried **14.28%** and **30.11%** — an order of magnitude outside the
+admissible regime. An arm at 9% CV cannot meet a 2% median-deviation ceiling however its samples are
+scheduled, and no pair count changes that.
+
+**What this makes actionable.** The fail-fast check is on **CV**, computable from the first handful
+of observations, not on n_eff. A run whose early FUSE CV is several percent is not going to pass and
+could be refused in seconds rather than after minutes and 2.1G of artifacts. That is the harness
+change worth making, and the previous entry named the wrong statistic for it.
+
+**And it reopens certification as a goal.** Thirteen admitted runs of this row exist, so the
+conditions that produce ~1.5% CV are achievable on this host. Identifying what distinguishes those
+runs — placement, time of day, tenancy — is a better question than "wait for idle to look high", and
+it is answerable from the same banked corpus. Both of my attempts remain INADMISSIBLE and unquotable,
+and the memo lever's wall-clock effect remains UNMEASURED.
