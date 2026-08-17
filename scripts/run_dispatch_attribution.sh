@@ -9,6 +9,19 @@
 #
 #   scripts/run_dispatch_attribution.sh <image> [entries]
 #
+# A/B/B/A CROSSOVER MODE (bd-xfe7z):
+#   FFS_AB_KNOB=FFS_FUSE_READDIRPLUS_BATCH_ATTRS=1 \
+#     scripts/run_dispatch_attribution.sh <image>
+#
+# Mounts four times -- A, B, B, A -- and compares the readdirplus
+# REMAINDER between arms. Required for any remainder lever, and not
+# optional: two release-perf splits taken in different windows disagreed
+# on the remainder by 31.1% while agreeing on the format layer to 2.4%.
+# The remainder is pure-CPU handler work, so it tracks host contention,
+# and a cross-window comparison of it is a load ratio wearing a lever's
+# costume. The two A visits straddle the two B visits so linear drift
+# cancels, and A1-vs-A2 is an A/A null taken inside the same invocation.
+#
 # HOW IT DIFFERS FROM run_crossing_count.sh. That script counts crossings and
 # must strace the daemon to do it. strace serialises the traced process, so its
 # durations are meaningless -- the script says so and discards them. This one
@@ -226,3 +239,51 @@ if remainder < 0:
     print("           timers are not nested the way this split assumes. Do NOT")
     print("           quote these shares; fix the nesting first.")
 PYSPLIT
+
+# ── A/B/B/A crossover over the remainder (bd-xfe7z) ─────────────────────────
+# Only when FFS_AB_KNOB is set, and only in the outer invocation: each arm
+# re-enters this script with FFS_AB_KNOB cleared, so there is no recursion.
+if [ -n "${FFS_AB_KNOB:-}" ]; then
+  AB_KEY=${FFS_AB_KNOB%%=*}
+  AB_VAL=${FFS_AB_KNOB#*=}
+  echo
+  echo "=== A/B/B/A crossover on the readdirplus remainder ==="
+  echo "    arm A: $AB_KEY unset"
+  echo "    arm B: $AB_KEY=$AB_VAL"
+
+  REMAINDERS=""
+  for phase in A B B A; do
+    if [ "$phase" = "B" ]; then
+      ARM_ENV="$AB_KEY=$AB_VAL"
+    else
+      ARM_ENV="FFS_AB_UNUSED=0"
+    fi
+    OUT=$(env "$ARM_ENV" FFS_AB_KNOB= FFS_WORK="$WORK/ab-$phase-$RANDOM" \
+      bash "$HERE/run_dispatch_attribution.sh" "$IMG" "$ENTRIES" 2>&1 |
+      grep -E "^  remainder" | awk '{print $2}')
+    if [ -z "$OUT" ]; then
+      echo "FATAL: arm $phase produced no remainder; refusing to compare arms"
+      echo "       when one of them did not measure. Re-run with the split"
+      echo "       preconditions satisfied (FFS_FUSE_READDIRPLUS_INODE_ORDER=1)."
+      exit 10
+    fi
+    echo "    phase $phase remainder_ns=$OUT"
+    REMAINDERS="$REMAINDERS $OUT"
+  done
+
+  python3 - $REMAINDERS <<'PYAB'
+import sys
+sys.path.insert(0, "/data/projects/frankenfs/scripts")
+from fuse_crossing_count import crossover_verdict
+
+vals = [float(x) for x in sys.argv[1:]]
+if len(vals) != 4:
+    print("FATAL: expected 4 phase remainders, got %d" % len(vals))
+    raise SystemExit(11)
+a1, b1, b2, a2 = vals
+print()
+print("A/A null (a1 vs a2): %.0f vs %.0f ns" % (a1, a2))
+print("B arm    (b1, b2):   %.0f, %.0f ns" % (b1, b2))
+print(crossover_verdict(a1, b1, b2, a2))
+PYAB
+fi

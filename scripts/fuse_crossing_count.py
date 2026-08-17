@@ -107,6 +107,54 @@ def verdict(per_entry: float, predicted_transport: float = 0.157) -> str:
     )
 
 
+def crossover_verdict(a1: float, b1: float, b2: float, a2: float) -> str:
+    """Decide an A/B/B/A crossover on the readdirplus remainder.
+
+    WHY A CROSSOVER AND NOT TWO RUNS (bd-xfe7z). Two release-perf splits taken
+    in different windows put the remainder at 18387723 ns and 24099500 ns -- a
+    31.1% disagreement -- while the format-layer term in the same pair agreed to
+    2.4%. The remainder is pure-CPU handler work with no I/O, so it tracks host
+    contention directly, and this host has spent a day between loadavg 9 and 525.
+    A remainder measured in one window and compared against another is a load
+    ratio wearing a lever's costume.
+
+    A/B/B/A because it is the shortest schedule that cancels a LINEAR drift: the
+    two A visits straddle the two B visits, so a host getting steadily busier
+    inflates both arms equally rather than whichever ran second.
+
+    THE DRIFT CHECK IS THE POINT, not decoration. `a1` versus `a2` is an A/A null
+    taken inside the same invocation: two measurements of the identical
+    configuration. If the arm disagrees with ITSELF by as much as the arms
+    disagree with each other, the window moved more than the lever did and the
+    comparison is void -- which is the same rule the mounted comparator applies
+    to ratios and which shares were quietly exempted from.
+    """
+    a_mean = (a1 + a2) / 2.0
+    b_mean = (b1 + b2) / 2.0
+    if a_mean <= 0 or b_mean <= 0:
+        return "VOID: a non-positive arm mean; the timers did not run"
+
+    effect = b_mean / a_mean
+    drift = abs(a2 - a1) / a_mean
+    margin = abs(effect - 1.0)
+
+    if drift >= margin:
+        return (
+            f"VOID: the A arm disagrees with ITSELF by {100*drift:.1f}% while the "
+            f"arms differ by {100*margin:.1f}%. The window moved more than the "
+            f"lever; re-run, do not report {effect:.4f}x"
+        )
+    if effect < 1.0:
+        return (
+            f"B IS FASTER: {effect:.4f}x of A ({1/effect:.3f}x speedup), "
+            f"A/A drift {100*drift:.1f}% against a {100*margin:.1f}% effect"
+        )
+    return (
+        f"B IS SLOWER: {effect:.4f}x of A, A/A drift {100*drift:.1f}% against a "
+        f"{100*margin:.1f}% effect"
+    )
+
+
 def selftest() -> int:
     cases = 0
     sample = """% time     seconds  usecs/call     calls    errors syscall
@@ -155,6 +203,30 @@ def selftest() -> int:
     cases += 1
     assert "BATCHING" in verdict(0.157 * 0.5)
     cases += 1
+
+
+    # bd-xfe7z: the crossover verdict on the remainder.
+    # A clean win: B consistently ~half of A, A stable across its two visits.
+    cases += 1
+    assert "B IS FASTER" in crossover_verdict(1000.0, 500.0, 510.0, 1010.0)
+    # A clean loss.
+    cases += 1
+    assert "B IS SLOWER" in crossover_verdict(1000.0, 1500.0, 1520.0, 1010.0)
+    # THE CASE THAT MATTERS: the A arm disagrees with itself by more than the
+    # arms differ. This is the 31% cross-window disagreement in miniature, and
+    # it must VOID rather than report a ratio.
+    cases += 1
+    v = crossover_verdict(1000.0, 1100.0, 1100.0, 1400.0)
+    assert "VOID" in v, v
+    assert "moved more than the lever" in v, v
+    # Exactly-equal drift and effect is still void: ties go to refusing.
+    cases += 1
+    assert "VOID" in crossover_verdict(1000.0, 1100.0, 1100.0, 1200.0)
+    # A dead timer must not be divided by.
+    cases += 1
+    assert "VOID" in crossover_verdict(0.0, 0.0, 0.0, 0.0)
+    cases += 1
+    assert "VOID" in crossover_verdict(1000.0, 0.0, 0.0, 1000.0)
 
     print(f"selftest: {cases} cases OK")
     return 0
