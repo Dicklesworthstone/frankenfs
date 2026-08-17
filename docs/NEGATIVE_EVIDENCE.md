@@ -7759,3 +7759,45 @@ parser written for the bracketed form matched nothing and reported a daemon that
 (b) a FUSE daemon's write traffic is dominated by `writev` to **/dev/fuse**, the reply channel —
 summing every write reports the FUSE PROTOCOL as backing-file write amplification. The counter now
 filters to the image fd, and the selftest pins both cases.
+
+## MECHANISM — 2026-08-17 — bd-fv9tc sharpened: the GDT flush issues one device write PER GROUP, and 64 groups share a block (PlumBeacon)
+
+bd-2w2me measured "block 1 is written twice per client fsync" on a 2-group image and called the
+duplicate a redundancy. It is worse and more general than that, and the 2-group image is why it
+looked small.
+
+**Mechanism, from the code and confirmed by the count.**
+`OpenFs::ext4_write_group_descriptors_to` loops `for gidx in 0..alloc.groups.len()` and calls
+`ffs_alloc::persist_group_desc_force` per group, which ends in `dev.rmw_block(cx, block_num, ...)`
+— **one read-modify-write of the descriptor block per GROUP**. A group descriptor is 64 bytes
+(`64bit` feature) in a 4096-byte block, so **64 groups share one block** and each of them writes it.
+
+**Scaling law: `G` device writes to `ceil(G/64)` distinct blocks, per durability boundary.**
+
+| filesystem | groups | GDT writes per fsync | distinct blocks | amplification |
+|---|---|---|---|---|
+| the 256 MB test image | 2 | 2 | 1 | 2x |
+| 8 GB | 64 | 64 | 1 | **64x** |
+| 256 GB | 2048 | 2048 | 32 | **64x** |
+
+**Confirmation.** The measured image has `Block count 65536`, `Blocks per group 32768` -> exactly
+2 groups, and the trace shows exactly 2 writes to block 1 per client fsync, at N=8/64/256. The
+count equals the group count, not the block count.
+
+**So the 1.250x write amplification bd-2w2me measured is the FLOOR of this defect, not its size.**
+It was measured on the smallest filesystem that can show it at all. On any realistically-sized
+image the GDT flush alone is 64 writes per durability boundary to a single block.
+
+**Fix direction (bd-fv9tc): coalesce the per-group RMWs by descriptor block** — read each descriptor
+block once, apply every group descriptor that lives in it, write once. `G` writes become
+`ceil(G/64)`, byte-identical on disk.
+
+⚠️ **The trap, and why the obvious guard is wrong.** A "skip the flush when free counts did not
+change" dirty-flag guard is NOT safe here: allocating one block and freeing another in the same
+window leaves the counts identical while the BITMAPS differ, and `persist_group_desc_force` stamps
+the descriptor's bitmap checksum over the bitmap bytes. Skipping on equal counts would persist a
+stale checksum -> e2fsck-dirty. Coalescing has no such hazard because it changes only how many
+writes carry the same final bytes.
+
+**Measured with** `scripts/fsync_flush_count.py` (load-independent, exact integers). The acceptance
+for the fix is the per-fsync block count, re-run with the same command, plus e2fsck rc 0.
