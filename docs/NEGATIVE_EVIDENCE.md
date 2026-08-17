@@ -10322,3 +10322,67 @@ set. The check is cheap and the failure is silent.
 Zero-CPU work was done instead: the btrfs scorecard's fsync row was corrected from `1.976308x slower`
 to `~0.45–0.46x faster` with its five-run table and both qualifications, and its header warning went
 from "three rows describe HEAD" to four.
+
+## MECHANISM — 2026-08-17 — why the btrfs FUSE A/A null cannot pass: the FUSE arm's own CV is 14-30% against a 2% ceiling, and it is variance, not drift (bd-btrfs-readdir-stat-8x-8y7vp, bd-4sull)
+
+Thirteen windows have been reported clean. Rather than take a third run that would block the same
+way, I analysed the **per-pair raw timings** from the two runs already paid for. The report carries
+`raw_wall_ns` for all four arms, which is enough to characterise the null directly. This is a
+7-attempt-failed problem and the data settles two things about it.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, candidate ELF
+`c3eac8bd3ad7d920…`, driver `9d20206721ec9485…`, both built thinkstation1. Mean CPU 3100.0 MHz over
+64 CPUs, loadavg 11.11/11.55/14.18, idle 82.0%, iowait 0.3%, df 203G at analysis time. **No run
+taken; this is analysis of banked reports.**
+
+**The arms are not equally noisy, and that alone forbids a 2% null.**
+
+|   | kernel_a CV | kernel_b CV | **fuse_a CV** | **fuse_b CV** |
+|---|---|---|---|---|
+| 24 pairs | 3.86% | 6.60% | **14.28%** | **8.56%** |
+| 48 pairs | 8.14% | 9.88% | **26.62%** | **30.11%** |
+
+The FUSE arms are **2-4x noisier than the kernel arms**, and at 48 pairs a single FUSE observation
+ranged 148.9 ms to 415.6 ms — a **2.8x spread inside one arm**. **A 2% median-deviation ceiling
+cannot be met by an arm carrying 14-30% CV**, regardless of how the pairs are scheduled. That is the
+whole of the null failure, and it is a property of the arm, not of the comparison.
+
+**It is variance, not drift — which independently confirms the banked reading.**
+
+Per-pair A/B ratio, with its trend against observation index:
+
+| | fuse A/B median | fuse A/B CV | trend r | kernel A/B CV | trend r |
+|---|---|---|---|---|---|
+| 24 pairs | 1.0367 | 10.17% | **+0.026** | 6.41% | +0.002 |
+| 48 pairs | 0.9877 | 14.09% | **−0.266** | 4.77% | +0.005 |
+
+Trend correlation is ~0 at 24 pairs and weakly negative at 48; first-half vs second-half medians move
+186.7→192.7 ms then 200.0→187.5 ms — in **opposite directions**. There is no monotonic drift to
+cancel. This reproduces, from fresh data on a current ELF, the banked conclusion that *"the fuse A/A
+null is pair-level variance, not an order effect"* — and it means ABBA scheduling cannot fix it,
+because ABBA cancels drift and there is no drift here.
+
+**Why doubling the pairs made the null WORSE — the mechanism, not just the observation.**
+
+More pairs means a longer measured window, and on a contended host longer means more exposure:
+
+| | measured window | peak off-placement busy | fuse_a CV |
+|---|---|---|---|
+| 24 pairs | 72 s | 0.7737 | 14.28% |
+| 48 pairs | 124 s | 0.9967 | 26.62% |
+
+Duration grew **1.7x**, peak external busy went 77% → **99.7%**, and FUSE CV grew **1.9x**. The added
+variance outpaces the `sqrt(n)` averaging that more pairs are supposed to buy. **On a contended host,
+buying pairs is counterproductive**: it purchases precision at a rate slower than it purchases noise.
+That explains my own failed experiment and independently explains the banked result that 96 pairs did
+not fix this null either.
+
+**What this changes about the row.**
+
+The blocker is no longer "wait for a quiet window". It is: **the FUSE arm's per-observation variance
+must come down before any pair count can decide a 2% null.** Candidate causes are enumerable and
+none of them is the window — daemon scheduling jitter, per-observation mount/cache state, and the
+outlier tail (a 2.8x max/min inside one arm suggests occasional multi-hundred-millisecond stalls
+rather than broad spread). Attacking those is a different and more tractable problem than waiting,
+and it is measurable from `raw_wall_ns` on runs already banked. NO wall-clock ratio is claimed here;
+both banked attempts remain INADMISSIBLE and unquotable.
