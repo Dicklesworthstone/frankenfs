@@ -8648,3 +8648,73 @@ The remaining candidates are structural rather than arithmetic — most obviousl
 daemon's request path reaches this `OpenFs` instance's cache at all, which is the shape of the
 `FsOps for Arc<T>` forwarding trap that has bitten this repo before. That is a code question, not a
 measurement one, and it is the next thing to settle. NO wall-clock claim is made in this entry.
+
+## MECHANISM — 2026-08-17 — the btrfs readdir+stat gap is in the FUSE BRIDGE, not the btrfs engine: 1,060x more node reads for the same work; plus the node-cache HIT COUNTER is broken (CreamTrout)
+
+The controlled comparison the previous row said was needed. Same image, same binary, same logical
+work — readdir plus a stat of all 20,048 entries — done two ways.
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, ELF `d103d36e54691124feb6842c…`
+(shipping release-perf+PGO), mean CPU 3213.7 MHz over 64 CPUs, loadavg 17.93→52.86 (a peer started
+something large mid-series; the integers did not move, which is the point of counting). df fell
+88G→74G in the same window — above the 42G floor but worth watching. No build taken, no timed row.
+
+### The comparison
+
+| path | node preads | distinct nodes | re-read | reads per entry |
+|---|---|---|---|---|
+| in-process `ffs-cli walk` | **26** | 25 | 1.0x | **0.001** |
+| FUSE `ls -l` on the same image | **27572** | 782 | 35.3x | **1.375** |
+
+**1,060x more device reads through the mount than in-process, for the same directory and the same
+20,048 stats.** In-process the engine touches 25 distinct nodes and reads each once; through FUSE it
+touches 782 and re-reads them 35 times over.
+
+⚠️ **Read this as bulk-vs-per-request, not as "the same work costing more".** `walk` materialises the
+directory once and answers every stat from that; the FUSE daemon necessarily receives one `getattr`
+(plus one `getxattr` probe) per entry from the kernel and cannot batch them. A per-request path can
+never be as cheap as a bulk one. What 1,060x says is that **the per-request path retains nothing
+between requests** — which is exactly what the 3-pass test in the previous row proved directly
+(3 identical sweeps in one mount cost 2.88x one sweep). The two results compose: the engine can do
+this work for ~free, the bridge rebuilds it per request, and the cache that exists to carry state
+across requests is not carrying it.
+
+**So the btrfs readdir+stat row is a FUSE-bridge defect, not a btrfs-format defect.** That relocates
+the whole row: bd-3zx2x asks to attribute a "btrfs-specific excess", and the btrfs-specific part is
+real (btrfs pays a tree descent where ext4 pays one inode-table block read) — but the thing making it
+cost 35x rather than 2x is the bridge discarding state, which is not a btrfs property at all.
+
+### A fifth mechanism refuted
+
+`FFS_FUSE_WORKERS=1` gives **27575** reads against the 27572 baseline — inside the 0.02% drift. So
+per-worker instance multiplicity does not explain the inert cache either. Refuted so far: the
+512-entry capacity bound, the mount-time fill, the floor-leaf memo, `cacheable` being false, and now
+worker multiplicity.
+
+### ⛔ The node-cache HIT COUNTER is broken, and this partly UN-RETRACTS my own retraction
+
+`ffs-cli walk` on the 20048-entry image self-reports `1085 lookups, 0 hits (0.0%)` while straced at
+**26 device reads**. Every cache MISS in `btrfs_read_parsed_node` causes exactly one read, so:
+
+    misses = 26,  hits = 1085 - 26 = 1059,  counter reports 0
+
+**~1059 hits occurred and the counter recorded none.** `BTRFS_NODE_CACHE_HITS` does not increment.
+
+Two turns ago I withdrew the "0 hits" evidence on the grounds that `walk` is a single-pass traversal
+in which a hit is impossible by construction. **That reasoning was wrong**: the lookup count proves
+`walk` revisits its 25 nodes ~43 times each, so hits not only can occur, they dominate. The
+withdrawal was itself an error and the anomaly is real — though it is a *counter* defect, not the
+cache defect I originally guessed, so the conclusion I drew from it was still not supported. Net: the
+counter cannot be used as evidence for anything until it is fixed, which is what the retraction got
+right.
+
+Consequence for anyone reading banked btrfs rows: **any figure quoting a btrfs node-cache hit RATE is
+wrong and reads as 0%.** The lookup count appears sound (1085 is consistent with 25 nodes revisited);
+it is the hit counter alone that is dead.
+
+### Where this leaves the row
+
+The lever is not in btrfs and not in the parsed-node cache's sizing. It is: **make the FUSE
+per-request path reuse across requests what the bulk path builds once.** That is a bridge change,
+it is measurable by this same count with no quiet window, and the ceiling is visible — the engine
+already answers this workload at 0.001 reads per entry. NO wall-clock claim is made in this entry.
