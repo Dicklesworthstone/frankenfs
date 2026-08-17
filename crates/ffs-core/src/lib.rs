@@ -1930,6 +1930,16 @@ const BTRFS_TREE_NODE_CACHE_LIMIT: usize = 512;
 /// a low hit rate would mean cache thrashing instead, which is a different fix.
 static BTRFS_NODE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 static BTRFS_NODE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+/// Cache MISSES, i.e. descents that reached the device read (bd-mdtqc).
+///
+/// Counted separately rather than derived as `lookups - hits`, because that
+/// subtraction is exactly what hid the defect this counter exists to expose: a
+/// workload reporting 1085 lookups and 0 hits while straced at 26 device reads
+/// cannot have missed 1085 times, and with only two counters there is no way to
+/// tell whether the HIT counter is dead or the reads are being served somewhere
+/// below this function. Three counters make `lookups == hits + misses` a
+/// checkable identity and `misses == device reads` a second one.
+static BTRFS_NODE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Read the [`BTRFS_NODE_LOOKUPS`] / [`BTRFS_NODE_CACHE_HITS`] pair.
 #[must_use]
@@ -1937,6 +1947,20 @@ pub fn btrfs_node_cache_counters() -> (u64, u64) {
     (
         BTRFS_NODE_LOOKUPS.load(std::sync::atomic::Ordering::Relaxed),
         BTRFS_NODE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Lookups, hits and MISSES for the read-only btrfs node cache (bd-mdtqc).
+///
+/// `lookups == hits + misses` must hold; a caller that also counts device reads
+/// can then check `misses == reads` and localise any discrepancy to the cache
+/// rather than to the layer beneath it.
+#[must_use]
+pub fn btrfs_node_cache_counters_full() -> (u64, u64, u64) {
+    (
+        BTRFS_NODE_LOOKUPS.load(std::sync::atomic::Ordering::Relaxed),
+        BTRFS_NODE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        BTRFS_NODE_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 const BTRFS_DIR_ENTRY_CACHE_LIMIT: usize = 4096;
@@ -8896,6 +8920,9 @@ impl OpenFs {
             // `get` clones the Arc out under the shard lock, which is then
             // released — no guard is held across the return.
             return Ok(node);
+        }
+        if cacheable {
+            BTRFS_NODE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let ctx = self.btrfs_context().ok_or(ParseError::InvalidField {
             field: "btrfs_context",

@@ -4831,13 +4831,28 @@ fn walk_cmd(path: &PathBuf, no_stat: bool, parallel: bool, read_data: bool) -> R
     // already-cached nodes, not device I/O" reading gets tested rather than
     // asserted. ~3 lookups/entry at a high hit rate confirms it; a low hit rate
     // would mean the 512-node cache is thrashing, which is a different fix.
-    let (node_lookups, node_hits) = ffs_core::btrfs_node_cache_counters();
+    let (node_lookups, node_hits, node_misses) =
+        ffs_core::btrfs_node_cache_counters_full();
     if node_lookups > 0 {
         let per_stat = node_lookups as f64 / stats.max(1) as f64;
         let hit_rate = node_hits as f64 / node_lookups as f64 * 100.0;
+        // Print MISSES too, and the identity that makes the triple checkable:
+        // lookups must equal hits + misses. Reporting only lookups and hits let a
+        // workload claim 1085 lookups / 0 hits while straced at 26 device reads,
+        // with no way to tell a dead hit counter from reads served below this
+        // layer (bd-mdtqc).
+        let accounted = node_hits + node_misses;
         eprintln!(
             "btrfs node cache: {node_lookups} lookups ({per_stat:.2}/stat), \
-             {node_hits} hits ({hit_rate:.1}%)"
+             {node_hits} hits ({hit_rate:.1}%), {node_misses} misses\
+             {}",
+            if accounted == node_lookups {
+                String::new()
+            } else {
+                format!(
+                    " [UNACCOUNTED: hits+misses={accounted} != lookups={node_lookups}]"
+                )
+            }
         );
     }
     Ok(())

@@ -82,11 +82,22 @@ import time
 from collections import Counter
 from pathlib import Path
 
-# strace renders a read as:
+# strace renders a completed read as:
 #   pread64(3, "<buffer>"..., 16384, 42680320) = 16384
 # The buffer is arbitrary bytes and may contain anything including `)`, so anchor
-# on the fixed tail (count, offset) = ret rather than trying to parse the string.
+# on the fixed tail (count, offset) = ret rather than parsing the string.
 PREAD = re.compile(r"pread64\((\d+), .*, (\d+), (\d+)\)\s+=\s+(-?\d+)$")
+
+# ⛔ BUT ON A MULTI-THREADED TRACEE strace SPLITS INTERLEAVED SYSCALLS, and the
+# above matches NEITHER half (bd-mdtqc trail, 2026-08-17):
+#   1428894 pread64(3 <unfinished ...>
+#   1428894 <... pread64 resumed>, "..."..., 16384, 56639488) = 16384
+# Matching only completed lines undercounted a `ffs-cli walk` by 64x — 17 parsed
+# against 1091 actual — and the FUSE daemon runs 80+ threads, so the effect there
+# is larger still. The fd appears only on the UNFINISHED half, so fd filtering
+# needs the pid map below.
+UNFINISHED = re.compile(r"^(\d+)\s+pread64\((\d+) <unfinished")
+RESUMED = re.compile(r"^(\d+)\s+<\.\.\. pread64 resumed>.*, (\d+), (\d+)\)\s+=\s+(-?\d+)$")
 
 # The daemon opens the image as fd 3; fd 4 is /dev/fuse. Counting fd 4 would
 # measure the FUSE transport, which is a different question (bd-q0xnl).
@@ -97,18 +108,52 @@ def _run(argv, **kw):
     return subprocess.run(argv, capture_output=True, text=True, **kw)
 
 
-def parse_trace(path: Path) -> tuple[Counter, Counter]:
-    """Return (offset -> read count, size -> read count) for the image fd."""
+def parse_trace(path: Path) -> tuple[Counter, Counter, int]:
+    """Return (offset -> count, size -> count, total pread64 lines seen).
+
+    Handles BOTH completed lines and unfinished/resumed pairs. The third value
+    is every `pread64` occurrence in the file regardless of shape, so the caller
+    can assert that parsing accounted for all of them instead of trusting it.
+    """
     offsets: Counter = Counter()
     sizes: Counter = Counter()
+    pending_fd: dict[str, str] = {}
+    unparsed: list[str] = []
+    seen = 0
     with open(path, errors="replace") as fh:
-        for line in fh:
-            m = PREAD.search(line.strip())
-            if not m or m.group(1) != IMAGE_FD:
+        for raw in fh:
+            line = raw.strip()
+            if "pread64" not in line:
                 continue
-            sizes[int(m.group(2))] += 1
-            offsets[int(m.group(3))] += 1
-    return offsets, sizes
+            # Count the syscall once: an unfinished/resumed PAIR is one call, so
+            # tally on the unfinished half and on standalone completed lines.
+            u = UNFINISHED.match(line)
+            if u:
+                seen += 1
+                pending_fd[u.group(1)] = u.group(2)
+                continue
+            r = RESUMED.match(line)
+            if r:
+                if pending_fd.pop(r.group(1), None) == IMAGE_FD:
+                    sizes[int(r.group(2))] += 1
+                    offsets[int(r.group(3))] += 1
+                continue
+            m = PREAD.search(line)
+            if m:
+                seen += 1
+                if m.group(1) == IMAGE_FD:
+                    sizes[int(m.group(2))] += 1
+                    offsets[int(m.group(3))] += 1
+                continue
+            # A pread64 line matching NONE of the three shapes is a silent
+            # undercount waiting to happen — which is exactly how this harness
+            # reported 17 reads for a workload that made 1091. Surface it.
+            unparsed.append(line[:120])
+    if unparsed:
+        print(f"\n⛔ {len(unparsed)} pread64 line(s) matched no known shape — the "
+              f"count below is an UNDERCOUNT. First:\n   {unparsed[0]}",
+              file=sys.stderr)
+    return offsets, sizes, seen
 
 
 # btrfs tree-block header, 101 bytes, little-endian:
@@ -211,7 +256,7 @@ def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
         tracer.kill()
     time.sleep(1)
 
-    offsets, sizes = parse_trace(trace)
+    offsets, sizes, seen = parse_trace(trace)
     total = sum(offsets.values())
     distinct = len(offsets)
     worst = offsets.most_common(1)[0][1] if offsets else 0
@@ -239,27 +284,38 @@ def selftest() -> int:
         '1789981 pread64(3, "xyz"..., 16384, 99999) = 16384',
         '1789981 pread64(4, "fuse"..., 4096, 0) = 4096',           # not the image
         '1789981 fdatasync(3) = 0',                                # not a read
+        # The split-pair shape strace emits for a MULTI-THREADED tracee. Dropping
+        # it silently undercounted a real run 64x (17 parsed against 1091 actual),
+        # so it is pinned here rather than trusted.
+        '1428894 pread64(3 <unfinished ...>',
+        '1428894 <... pread64 resumed], "z"..., 16384, 777216) = 16384'.replace("]", ">"),
     ]
     with tempfile.NamedTemporaryFile("w", suffix=".strace", delete=False) as fh:
         fh.write("\n".join(sample) + "\n")
         path = Path(fh.name)
-    offsets, sizes = parse_trace(path)
+    offsets, sizes, seen = parse_trace(path)
     path.unlink()
 
     failures = []
-    if sum(offsets.values()) != 3:
-        failures.append(f"expected 3 image reads, got {sum(offsets.values())}")
-    if len(offsets) != 2:
-        failures.append(f"expected 2 distinct offsets, got {len(offsets)}")
+    if sum(offsets.values()) != 4:
+        failures.append(f"expected 4 image reads, got {sum(offsets.values())}")
+    if len(offsets) != 3:
+        failures.append(f"expected 3 distinct offsets, got {len(offsets)}")
     if offsets.get(42680320) != 2:
         failures.append("a buffer containing ')' broke the tail anchor")
-    if sizes.get(16384) != 3:
-        failures.append(f"expected 3 nodesize reads, got {sizes.get(16384)}")
+    if offsets.get(777216) != 1:
+        failures.append("an unfinished/resumed PAIR was dropped — the 64x defect")
+    # `seen` counts every pread64 call regardless of fd: 4 completed (one on
+    # fd 4, deliberately excluded from the histograms) plus 1 split pair.
+    if seen != 5:
+        failures.append(f"expected 5 pread64 calls seen, got {seen}")
+    if sizes.get(16384) != 4:
+        failures.append(f"expected 4 nodesize reads, got {sizes.get(16384)}")
     for f in failures:
         print(f"SELFTEST FAIL: {f}", file=sys.stderr)
     if failures:
         return 1
-    print("selftest OK: fd filter, tail anchor, offset and size histograms")
+    print("selftest OK: fd filter, tail anchor, histograms, unfinished/resumed pairs")
     return 0
 
 

@@ -9226,3 +9226,79 @@ Three sizing attempts on this cluster in three turns — 15x, then ~4%, now neit
 about which bound applies; it is that **I kept producing a number where the honest output was
 "unmeasured"**, and each one would have mis-steered the queue. NO wall-clock claim is made in this
 entry, and none should be made on this cluster until one is measured.
+
+## ⛔ INSTRUMENT DEFECT — 2026-08-17 — my strace parser silently dropped every syscall strace SPLIT across threads: 64x undercount, and it refutes bd-mdtqc (CreamTrout)
+
+The certification window was checked first and REFUSED: three consecutive 10-second samples gave
+**15, 11 and 14 of 64 CPUs above 25% busy against the veto's limit of 2** while loadavg read 8-9,
+and `ps` named the cause — another project running `fp-bench-BASELINE` at 260% CPU. Fifth time this
+session loadavg has disagreed with the gate. No timed row was attempted. Provenance: host
+`thinkstation1`, kernel `6.17.0-41-generic`, mean CPU 3182.1 MHz over 64 CPUs, df 281G→256G, one
+build per pane, repo-local target.
+
+### The defect
+
+`strace -f` on a MULTI-THREADED tracee splits interleaved syscalls into two lines:
+
+    1428894 pread64(3 <unfinished ...>
+    1428894 <... pread64 resumed>, "..."..., 16384, 56639488) = 16384
+
+My parser anchored on `= N` at end of line, so it matched **neither half**. On `ffs-cli walk` it
+parsed **17 reads for a workload that made 1091** — a **64x undercount**, discovered by cross-checking
+against `strace -c`, which is immune to line splitting.
+
+### What it refutes: bd-mdtqc
+
+I filed bd-mdtqc claiming `BTRFS_NODE_CACHE_HITS` never increments, on the arithmetic
+`hits = 1085 lookups − 26 device reads = 1059`. That 26 was the broken parser. With a MISS counter
+added (`ffs-core`, this commit) the identity is exact.
+
+COUNTED MECHANISM, syscalls: `strace -f -e trace=pread64 -c` on `ffs-cli walk` over the
+20,048-entry fixture reports **1091 `pread64` syscalls**, against in-process counters reporting
+**1085 lookups, 0 hits, 1085 misses**. Two independent instruments, one a syscall count and one a
+process-internal counter, agreeing to 6 calls (the superblock and chunk-tree reads that precede any
+node lookup). No A/A null is applicable or claimed: these are exact integers from a deterministic
+single-threaded traversal, not a sampled ratio.
+
+**No counter is broken.** bd-mdtqc is closed as refuted. The 0% hit rate is real and has a mundane
+explanation the corrected numbers show directly: `walk` reads **1091 times over 1089 DISTINCT
+offsets** — it touches each node once, so there is nothing to hit. My original retraction of the
+"0 hits" evidence was right; the un-retraction that followed rested on the broken parser.
+
+### What it corrects: the "1,060x bridge"
+
+`6c6679a81` compared in-process `walk` at "26 node reads" against FUSE at 27,572 and called it
+1,060x. The walk figure was wrong by 42x. Corrected, with the fixed parser:
+
+| path | reads | distinct | re-read | per entry |
+|---|---|---|---|---|
+| in-process `walk` | **1091** | **1089** | **1.002x** | 0.054 |
+| FUSE `ls -l` | **27464** | **1085** | **25.3x** | 1.37 |
+
+**25.2x, not 1,060x.** But the corrected pair is a *cleaner* finding than the one it replaces: both
+paths touch **the same ~1,085-node set**. The difference is not what they need, it is that `walk`
+reads each node once and the FUSE path re-reads them 25 times. That also retires the bulk-vs-
+per-request caveat I attached to the original — the two are not doing different amounts of work.
+
+### What survives, re-measured rather than assumed
+
+The FUSE arms barely moved, because a mostly-blocked daemon's syscalls interleave far less than
+rayon's do. Re-run on the fixed parser with the same fixture:
+
+| arm | before (broken parser) | after |
+|---|---|---|
+| default | 27572 reads / 782 distinct | **27464 / 1085** |
+| `FFS_FUSE_XATTR_NO_SUPPORT=1` | 1840 / 573 | **1423 / 573** |
+| probe attribution | 14.98x | **19.3x** |
+
+So the probe attribution **holds and strengthens**; the distinct-node counts were the part most
+understated. The cliff, the floor-memo counterweight and the inert-knob results are all FUSE-arm
+A/Bs of the same shape and are expected to survive similarly — but they have NOT been re-run, and
+until they are, treat their absolute counts as provisional and their ratios as sound.
+
+### Guard, so this cannot recur silently
+
+`parse_trace` now handles both shapes, pairs the fd from the unfinished half by pid, returns the
+total `pread64` count seen, and **prints a loud warning naming any line that matched no known
+shape**. The selftest pins the split-pair case explicitly. A harness that can undercount by 64x
+without saying so is worse than no harness; this one now has to admit it.
