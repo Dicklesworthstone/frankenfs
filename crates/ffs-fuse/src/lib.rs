@@ -4329,14 +4329,35 @@ impl Filesystem for FrankenFuse {
                         let inos: Vec<u64> = entries.iter().map(|e| e.ino.0).collect();
                         let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
                             (0..entries.len()).map(|_| None).collect();
-                        for index in readdirplus_inode_fetch_order(&inos) {
-                            let ino = entries[index].ino;
-                            if let Ok(attr) =
-                                self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                                    self.inner.ops.getattr(cx, scope, ino)
-                                })
-                            {
-                                slots[index] = Some(attr);
+                        // bd-xfe7z: ONE scope for the whole fill, not one per
+                        // inode. The fetch ORDER is unchanged -- still inode
+                        // order, which is what buys the inode-table locality --
+                        // but the N scope opens collapse to 1.
+                        //
+                        // That is the measured target: on this workload
+                        // `getattr` owns 60.80% of daemon dispatch time at 1.01
+                        // scopes per entry, while wire crossings are 0.0053 per
+                        // entry. The cost is not transport and not readdir; it
+                        // is the per-entry fill, and until now every entry of it
+                        // paid for its own request scope.
+                        //
+                        // `FsOps::getattr_batch` defaults to looping over
+                        // `getattr`, so the ops layer does exactly the same work
+                        // and this isolates the scope overhead. If an A/B shows
+                        // nothing, the 60.80% is the attribute fetch itself and
+                        // the next lever belongs in the format layer.
+                        let order: Vec<usize> = readdirplus_inode_fetch_order(&inos);
+                        let ordered: Vec<InodeNumber> =
+                            order.iter().map(|index| entries[*index].ino).collect();
+                        if let Ok(results) =
+                            self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                                Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
+                            })
+                        {
+                            for (slot_index, result) in order.iter().zip(results) {
+                                if let Ok(attr) = result {
+                                    slots[*slot_index] = Some(attr);
+                                }
                             }
                         }
                         Some(slots)

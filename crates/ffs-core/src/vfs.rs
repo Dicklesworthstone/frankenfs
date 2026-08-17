@@ -810,6 +810,38 @@ pub trait FsOps: Send + Sync {
         ino: InodeNumber,
     ) -> ffs_error::Result<InodeAttr>;
 
+    /// Attributes for many inodes in ONE call.
+    ///
+    /// Exists because of what bd-xfe7z measured: on readdir+stat with the
+    /// capability probe suppressed, `getattr` owns **60.80% of daemon dispatch
+    /// time at 1.01 scopes per entry**, while wire crossings are 0.0053 per
+    /// entry. The cost is not transport and not the readdir itself -- it is the
+    /// per-entry attribute fill, and today that fill opens one request scope per
+    /// entry because the readdir scope has already closed by the time the loop
+    /// runs.
+    ///
+    /// The default implementation loops over [`FsOps::getattr`], so a filesystem
+    /// that does not override this behaves EXACTLY as before -- the win, if
+    /// any, comes from the caller opening one scope instead of N, and from an
+    /// override being able to read the inode table in inode order rather than
+    /// directory order.
+    ///
+    /// Returns one result per requested inode, in the order requested, so a
+    /// caller can zip it against its entries without a second lookup. Errors are
+    /// per-inode rather than for the batch: one unreadable inode must not
+    /// discard the attributes of the others, which is what a
+    /// `Result<Vec<_>>` would force.
+    fn getattr_batch(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        inos: &[InodeNumber],
+    ) -> Vec<ffs_error::Result<InodeAttr>> {
+        inos.iter()
+            .map(|ino| self.getattr(cx, scope, *ino))
+            .collect()
+    }
+
     /// Look up a directory entry by name.
     ///
     /// Returns the attributes of the child inode named `name` within the
@@ -2704,6 +2736,15 @@ pub trait FsOps: Send + Sync {
 
 #[allow(clippy::too_many_arguments)]
 impl<T: FsOps + ?Sized> FsOps for Arc<T> {
+    fn getattr_batch(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        inos: &[InodeNumber],
+    ) -> Vec<ffs_error::Result<InodeAttr>> {
+        (**self).getattr_batch(cx, scope, inos)
+    }
+
     // Forwarding this is load-bearing, not boilerplate: the production mount
     // passes `Box<Arc<OpenFs>>`, so a method left unforwarded silently resolves
     // to the TRAIT DEFAULT. That is how `xattr_presence` first shipped -- the
@@ -3865,5 +3906,223 @@ mod tests {
         let name = entry.name_str();
         assert!(name.contains(".txt"), "should preserve valid suffix");
         assert!(name.contains('\u{FFFD}'), "should contain replacement char");
+    }
+}
+
+#[cfg(test)]
+mod getattr_batch_tests {
+    use super::*;
+
+    fn attr_for(ino: InodeNumber) -> InodeAttr {
+        InodeAttr {
+                ino,
+                size: ino.0,
+                blocks: 8,
+                atime: SystemTime::UNIX_EPOCH,
+                mtime: SystemTime::UNIX_EPOCH,
+                ctime: SystemTime::UNIX_EPOCH,
+                crtime: SystemTime::UNIX_EPOCH,
+                kind: FileType::Directory,
+                perm: 0o755,
+                nlink: 2,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 4096,
+                generation: 1,
+            }
+        }
+
+    #[derive(Default)]
+    struct CountingFs {
+        batches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FsOps for CountingFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            if ino.0 == 13 {
+                return Err(FfsError::NotFound("13".into()));
+            }
+            Ok(attr_for(ino))
+        }
+
+        fn getattr_batch(
+            &self,
+            cx: &Cx,
+            scope: &mut RequestScope,
+            inos: &[InodeNumber],
+        ) -> Vec<ffs_error::Result<InodeAttr>> {
+            self.batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            inos.iter().map(|ino| self.getattr(cx, scope, *ino)).collect()
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound(name.to_string_lossy().into_owned()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Err(FfsError::UnsupportedFeature(
+                "readdir fixture path is not supported".to_owned(),
+            ))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Err(FfsError::UnsupportedFeature(
+                "read fixture path is not supported".to_owned(),
+            ))
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Err(FfsError::UnsupportedFeature(
+                "readlink fixture path is not supported".to_owned(),
+            ))
+        }    }
+
+    struct DefaultOnlyFs;
+
+    impl FsOps for DefaultOnlyFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Ok(attr_for(ino))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound(name.to_string_lossy().into_owned()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Err(FfsError::UnsupportedFeature(
+                "readdir fixture path is not supported".to_owned(),
+            ))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Err(FfsError::UnsupportedFeature(
+                "read fixture path is not supported".to_owned(),
+            ))
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Err(FfsError::UnsupportedFeature(
+                "readlink fixture path is not supported".to_owned(),
+            ))
+        }    }
+
+    /// bd-xfe7z: the DEFAULT batch must be indistinguishable from looping
+    /// `getattr`, so a filesystem that does not override it behaves exactly as
+    /// before. The safety argument for the readdirplus change rests on this --
+    /// it isolates SCOPE overhead precisely because the ops layer does the same
+    /// work either way.
+    #[test]
+    fn the_default_batch_matches_looping_getattr_bd_xfe7z() {
+        let cx = Cx::for_testing();
+        let fs = DefaultOnlyFs;
+        let mut scope = RequestScope::default();
+        let inos = [InodeNumber(7), InodeNumber(2), InodeNumber(99)];
+        let batched = fs.getattr_batch(&cx, &mut scope, &inos);
+        assert_eq!(batched.len(), inos.len(), "one result per requested inode");
+        for (result, ino) in batched.iter().zip(inos) {
+            assert_eq!(
+                result.as_ref().expect("ok").size,
+                ino.0,
+                "results must come back IN THE ORDER REQUESTED; readdirplus zips \
+                 them against its entries by index"
+            );
+        }
+    }
+
+    /// One unreadable inode must not discard the others. That is why this
+    /// returns `Vec<Result<_>>` and not `Result<Vec<_>>`: readdirplus skips the
+    /// bad entry and still replies with the rest, exactly as the per-entry path
+    /// did.
+    #[test]
+    fn one_failing_inode_does_not_discard_the_batch_bd_xfe7z() {
+        let cx = Cx::for_testing();
+        let fs = CountingFs::default();
+        let mut scope = RequestScope::default();
+        let batched = fs.getattr_batch(
+            &cx,
+            &mut scope,
+            &[InodeNumber(1), InodeNumber(13), InodeNumber(5)],
+        );
+        assert!(batched[0].is_ok());
+        assert!(batched[1].is_err(), "inode 13 must fail");
+        assert!(batched[2].is_ok(), "a later inode must still be filled");
+    }
+
+    /// THE TRAP THAT COST A DAY. The production mount passes `Box<Arc<OpenFs>>`,
+    /// so a method the blanket `impl FsOps for Arc<T>` does not forward silently
+    /// resolves to the trait DEFAULT -- correct-looking, and not what the
+    /// filesystem implements. `xattr_presence` shipped that way and the scan it
+    /// was written for never ran in production.
+    #[test]
+    fn arc_forwards_getattr_batch_rather_than_taking_the_default_bd_xfe7z() {
+        let cx = Cx::for_testing();
+        let fs = std::sync::Arc::new(CountingFs::default());
+        let mut scope = RequestScope::default();
+        let _ = FsOps::getattr_batch(&fs, &cx, &mut scope, &[InodeNumber(1), InodeNumber(2)]);
+        assert_eq!(
+            fs.batches.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Arc must forward to the implementor's getattr_batch; 0 means it fell \
+             through to the trait default and the override is dead in production"
+        );
     }
 }
