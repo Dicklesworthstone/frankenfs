@@ -427,7 +427,9 @@ def sudo(*cmd: str) -> subprocess.CompletedProcess:
 def make_workload_file(path: Path, as_root: bool) -> None:
     """Create the 4 KiB file the client rewrites. Never part of a measured window."""
     body = (
-        "import os,sys;p=sys.argv[1];"
+        "import os,sys;p=sys.argv[1];d=os.path.dirname(p);"
+        "os.makedirs(d,exist_ok=True);"
+        f"os.chown(d,{os.getuid()},{os.getgid()});"
         "fd=os.open(p,os.O_CREAT|os.O_RDWR,0o644);"
         "os.pwrite(fd,b'\\0'*4096,0);os.fsync(fd);os.close(fd);"
         f"os.chown(p,{os.getuid()},{os.getgid()})"
@@ -453,7 +455,8 @@ def device_stats(device: str) -> tuple[int, int]:
     sys.exit(f"FATAL: {device} not present in /proc/diskstats")
 
 
-def measure_kernel_arm(device: str, workload: Path, client: Path, operations: int) -> dict:
+def measure_kernel_arm(device: str, workload: Path, client: Path, operations: int,
+                       fstype: str = "ext4") -> dict:
     """Barriers AND bytes ext4 asked its backing file for, via the loop device."""
     control_flushes, control_sectors = device_stats(device)
     time.sleep(2.0)
@@ -482,7 +485,7 @@ def measure_kernel_arm(device: str, workload: Path, client: Path, operations: in
             "noise. Refusing."
         )
     return {
-        "arm": "kernel-ext4",
+        "arm": f"kernel-{fstype}",
         "counted_by": f"/proc/diskstats flush requests + sectors written on {device}",
         "operations": operations,
         "control": control,
@@ -579,10 +582,10 @@ def report(rows: list[dict]) -> None:
               f"mean {p.get('cpu_mhz_mean', 0):.0f} spread {p.get('cpu_mhz_spread', 0):.2f}x")
     if len(rows) == 2:
         ours = next(r for r in rows if r["arm"] == "frankenfs-fuse")
-        theirs = next(r for r in rows if r["arm"] == "kernel-ext4")
+        theirs = next(r for r in rows if r["arm"].startswith("kernel-"))
         if theirs["bytes_per_client_fsync"] > 0:
             ratio = ours["bytes_per_client_fsync"] / theirs["bytes_per_client_fsync"]
-            print(f"\n  write amplification, ours / kernel ext4: {ratio:.3f}x")
+            print(f"\n  write amplification, ours / {theirs['arm']}: {ratio:.3f}x")
 
 
 def main() -> int:
@@ -598,6 +601,9 @@ def main() -> int:
     parser.add_argument("--operations", type=int, default=64,
                         help="client fsyncs per arm. The harness row uses 8; more "
                              "only sharpens a count that is already deterministic")
+    parser.add_argument("--fstype", default="ext4", choices=["ext4", "btrfs"],
+                        help="filesystem the image holds. The KERNEL arm mounts with this "
+                             "type; the FrankenFS arm detects it from the image either way")
     parser.add_argument("--subdir", default="nested",
                         help="a directory on the image owned by this user; the image "
                              "root is often root-owned and the client must not need sudo")
@@ -611,6 +617,12 @@ def main() -> int:
         sys.exit(f"FATAL: no ffs-cli at {args.cli}")
     if not args.image.is_file():
         sys.exit(f"FATAL: no image at {args.image}")
+
+    # The ext4 fixture has a user-owned `nested/`; the btrfs fixture does not, so
+    # its workload file goes in a directory this run creates itself.
+    subdir = args.subdir
+    if args.fstype == "btrfs" and subdir == "nested":
+        subdir = "fsyncdir"
 
     work = args.work_dir
     work.mkdir(parents=True, exist_ok=True)
@@ -646,13 +658,14 @@ def main() -> int:
     loop = losetup.stdout.strip()
     device = os.path.basename(loop)
     try:
-        mounted = sudo("mount", "-t", "ext4", loop, str(work / "kmnt"))
+        mounted = sudo("mount", "-t", args.fstype, loop, str(work / "kmnt"))
         if mounted.returncode != 0:
             sys.exit(f"FATAL: kernel mount failed: {mounted.stderr[-400:]}")
         try:
-            workload = work / "kmnt" / args.subdir / "fsync.bin"
+            workload = work / "kmnt" / subdir / "fsync.bin"
             make_workload_file(workload, as_root=True)
-            rows.append(measure_kernel_arm(device, workload, client, args.operations))
+            rows.append(measure_kernel_arm(device, workload, client, args.operations,
+                                           args.fstype))
         finally:
             sudo("umount", str(work / "kmnt"))
     finally:
@@ -673,7 +686,7 @@ def main() -> int:
                 break
         else:
             sys.exit(f"FATAL: FUSE mount never appeared\n{(work / 'mount.log').read_text()[-800:]}")
-        workload = fmnt / args.subdir / "fsync.bin"
+        workload = fmnt / subdir / "fsync.bin"
         make_workload_file(workload, as_root=False)
         rows.append(measure_fuse_arm(daemon.pid, workload, client, args.operations,
                                      work, fimage))

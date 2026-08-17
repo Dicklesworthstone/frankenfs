@@ -7949,3 +7949,64 @@ decoration) and that the clock helpers read THIS host rather than a constant.
 **Rule this leaves.** A pre-run `uptime` is a screening test, not provenance. Sample load and clocks
 INSIDE the run, per arm, or the row cannot be compared with any other row — and check the DAEMON's
 identity by content, never by the mtime of the binary next to it.
+
+## MECHANISM — 2026-08-17 — btrfs writes 96 metadata nodes per 4 KiB client fsync, because the writeback DAG is the WHOLE TREE (PlumBeacon)
+
+The btrfs fsync/journal-commit row (`1.98x`) had never been counted — the bead sat in_progress with
+no notes for 13 days. Counting it took minutes and found an amplification an order of magnitude
+larger than anything the ext4 twin showed.
+
+**Measured**, `scripts/fsync_flush_count.py --fstype btrfs`, deterministic at N=8, 64 and 256, both
+idle controls 0, daemon ELF `6b557b4b…`, host `thinkstation1`, kernel `6.17.0-41-generic`:
+
+| arm | barriers/fsync | bytes/fsync | vs client's 4 KiB |
+|---|---|---|---|
+| kernel btrfs | **2.0000** | 73728 | 18x |
+| FrankenFS | **3.0000** | **1576960** | **385x** |
+
+**Write amplification 21.389x**, exact at every N. Per-arm provenance recorded on every row (kernel
+arm loadavg 25.40/24.90/20.88, mean 2181 MHz; FUSE arm 24.03/24.62/20.83, mean 2380 MHz).
+
+Note the barrier count too: **3 where the kernel issues 2**. On ext4 both arms were 2.0000 — the
+extra barrier is btrfs-specific.
+
+**What those bytes are.** Write-size histogram to the image fd over the N=256 run:
+
+    256 writes of  4096 bytes  =   1048576    1.0 per fsync   the data block
+  24576 writes of 16384 bytes  = 402653184   96.0 per fsync   nodesize tree nodes
+
+So **96 metadata tree nodes are rewritten for every 4 KiB overwrite.** For scale, from
+`btrfs inspect-internal dump-tree` on the same image:
+
+  * the whole filesystem holds **58 distinct metadata nodes** (50 of them in the fs tree);
+  * the fs tree root is **level 1**, i.e. depth 2, so one changed leaf's COW path is **2 nodes**.
+
+96 is larger than the entire filesystem's node count, so nodes are being written more than once per
+commit as well.
+
+**MECHANISM, confirmed in code and not inferred from the count.**
+`WriteDependencyDag::collect_nodes` (`crates/ffs-btrfs/src/writeback.rs`) recurses into EVERY child
+unconditionally:
+
+    let node = tree.node_snapshot(block)?;
+    nodes.insert(block, DagNode { block, level, generation, children, durable: false });
+    for child in children { Self::collect_nodes(tree, child, nodes, generation, child_level)?; }
+
+`generation` is *stamped* onto each `DagNode` and never *compared*. There is no dirty filter, so the
+write-dependency DAG is the whole tree, and `WritebackExecutor` writes all of it. The commit does
+this once each for the fs, csum, extent and root trees, which is how the per-fsync node count
+exceeds the filesystem's node count.
+
+A correct COW commit writes only the nodes this transaction COWed: the path from each dirtied leaf
+to its root, ~2 nodes at this depth, plus the handful the extent/root/csum trees actually touched.
+
+**Lever handed over: bd-42gtq.** Filter the DAG to nodes whose generation is the transaction's.
+
+⚠️ **What is NOT claimed.** No timed A/B was run — the release-perf daemon is still stale (bd-9jat1)
+and four builds were in flight. 21.389x of BYTES is not 21x of wall clock, and the row is 1.98x; on
+ext4 the same class of counting found bytes moving from 1.250x to 0.750x while the wall-clock row did
+not move at all. Bytes are a mechanism, not a prediction.
+
+**Why this was cheap.** The row is 13 days old and the count took one command in a loud window
+(loadavg 19-25, cross-core clock spread 2.8-2.9x, arms' mean clocks differing by up to 32% in a
+sibling run) and returned the same exact integers every time.
