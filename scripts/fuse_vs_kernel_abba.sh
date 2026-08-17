@@ -203,9 +203,25 @@ fi
 sudo -n umount "$KMNT" 2>/dev/null; sleep 1
 echo "entries=$ENTRIES client=$CLIENT"
 
-sweep() { # $1 dir  $2 tag  $3 position
+sweep() { # $1 dir  $2 tag  $3 position  [$4 client cpu]
   local i s e
-  for i in $(seq 1 "$REPS"); do
+  # bd-fj2dg: per-arm rep count, so two arms of very different speed can be made
+  # to occupy comparable WALL TIME per visit.
+  #
+  # ABBA cancels host drift only for arms of EQUAL DURATION. On readdir+stat the
+  # control arm takes ~3.5x the lever arm's wall time per visit, so a host warming
+  # during a run loads more absolute drift onto the control and would INFLATE the
+  # ratio. In both readdir+stat cells the run with a failing POSITIVE FrankenFS
+  # null produced the higher ratio, which is what that mechanism predicts.
+  #
+  # Setting FFS_REPS_ON to roughly (control us/op / lever us/op) x FFS_REPS makes
+  # the lever arm's visit last about as long as the control's. The per-op medians
+  # are unaffected -- more reps is more samples of the same quantity -- so the only
+  # thing that changes is how much drift each arm absorbs. If the ratio moves
+  # toward the passing-null value under matching, the mechanism is confirmed.
+  local reps=$REPS
+  [ "$2" = ffs_on ] && reps=${FFS_REPS_ON:-$REPS}
+  for i in $(seq 1 "$reps"); do
     s=$EPOCHREALTIME
     local ccpu=${4:-$CLIENT_CPU}
     if [ "$CLIENT" = warm ]; then taskset -c "$ccpu" "$BIN" "$1" "$OUT/list" >/dev/null 2>&1

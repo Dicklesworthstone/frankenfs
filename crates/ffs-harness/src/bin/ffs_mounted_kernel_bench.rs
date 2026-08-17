@@ -1,3 +1,17 @@
+#![forbid(unsafe_code)]
+
+//! Real mounted-kernel versus FrankenFS FUSE comparator.
+//!
+//! The harness owns four live mounts in one invocation:
+//! two byte-identical kernel filesystems and two byte-identical FrankenFS FUSE
+//! filesystems. A balanced physical-arm crossover interleaves all four mounts,
+//! so the two kernel mounts provide an incumbent A/A null and the two FUSE
+//! mounts provide a candidate A/A null without confounding either null with a
+//! fixed image or loop-device effect. Competitive latency is reported only
+//! when both crossover-block null confidence intervals are tight, mount
+//! identity is proven at runtime, the FUSE daemons self-report their executing
+//! ELF SHA-256, and untimed content and metadata parity pass.
+
 /// Whether `path` appears as a mount point in `/proc/self/mounts` content.
 ///
 /// Pure so it can be tested without a mount: the field layout is
@@ -12,20 +26,6 @@ fn path_is_mounted(mounts: &str, path: &std::path::Path) -> bool {
         .filter_map(|line| line.split_whitespace().nth(1))
         .any(|mount_point| mount_point == needle)
 }
-
-#![forbid(unsafe_code)]
-
-//! Real mounted-kernel versus FrankenFS FUSE comparator.
-//!
-//! The harness owns four live mounts in one invocation:
-//! two byte-identical kernel filesystems and two byte-identical FrankenFS FUSE
-//! filesystems. A balanced physical-arm crossover interleaves all four mounts,
-//! so the two kernel mounts provide an incumbent A/A null and the two FUSE
-//! mounts provide a candidate A/A null without confounding either null with a
-//! fixed image or loop-device effect. Competitive latency is reported only
-//! when both crossover-block null confidence intervals are tight, mount
-//! identity is proven at runtime, the FUSE daemons self-report their executing
-//! ELF SHA-256, and untimed content and metadata parity pass.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nix::sched::{CpuSet, sched_getcpu, sched_setaffinity};
@@ -9873,6 +9873,54 @@ mod tests {
     /// nothing, and be measured as a lever. Every other knob is identical
     /// between those two arms, so nothing else in this harness can tell them
     /// apart.
+
+    /// bd-seed-mnt: only the SECOND field of a /proc/self/mounts line is a mount
+    /// point.
+    ///
+    /// The seeding path now reuses its own leftover directory instead of dying on
+    /// EEXIST, but refuses when that directory is still MOUNTED -- seeding into a
+    /// stale mount would build the fixture in the old filesystem rather than the
+    /// image under test. So this predicate decides whether a real run proceeds,
+    /// and BOTH of its failure directions are expensive: a false negative seeds
+    /// into the wrong filesystem, a false positive refuses every run forever.
+    #[test]
+    fn path_is_mounted_matches_only_the_mount_point_field_bd_seed_mnt() {
+        let mounts = concat!(
+            "/dev/loop7 /data/tmp/frankenfs-mounted-kernel/scratch/images/seed-mnt ext4 rw 0 0\n",
+            "proc /proc proc rw,nosuid 0 0\n",
+        );
+        let mounted =
+            std::path::Path::new("/data/tmp/frankenfs-mounted-kernel/scratch/images/seed-mnt");
+        assert!(path_is_mounted(mounts, mounted));
+
+        // Not mounted: the same tree, a different directory.
+        assert!(!path_is_mounted(
+            mounts,
+            std::path::Path::new("/data/tmp/frankenfs-mounted-kernel/scratch/images"),
+        ));
+
+        // FALSE POSITIVES, the direction that would refuse every run. The path
+        // appears in the line, but never as the mount-point field.
+        let as_device = "/data/tmp/frankenfs-mounted-kernel/scratch/images/seed-mnt /mnt/elsewhere ext4 rw 0 0\n";
+        assert!(
+            !path_is_mounted(as_device, mounted),
+            "appearing as the SOURCE device is not being mounted"
+        );
+        let in_options = "/dev/loop7 /mnt/other ext4 rw,subvol=/data/tmp/frankenfs-mounted-kernel/scratch/images/seed-mnt 0 0\n";
+        assert!(
+            !path_is_mounted(in_options, mounted),
+            "appearing inside an option string is not being mounted"
+        );
+
+        // A prefix must not match: seed-mnt2 is a different directory.
+        let sibling =
+            "/dev/loop7 /data/tmp/frankenfs-mounted-kernel/scratch/images/seed-mnt2 ext4 rw 0 0\n";
+        assert!(!path_is_mounted(sibling, mounted));
+
+        // Empty input is not a mount, and must not panic: /proc/self/mounts is
+        // read with unwrap_or_default, so this is the read-failure path.
+        assert!(!path_is_mounted("", mounted));
+    }
     #[test]
     fn xattr_suppression_divergence_needs_the_resolved_state_bd_ha71t() {
         let base = "count_memoized_requests=true,fuse_dispatch_workers=0";
