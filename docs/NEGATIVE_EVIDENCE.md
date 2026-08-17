@@ -9066,3 +9066,55 @@ is measured rather than inferred. That is the same one-line change in
 question in one run instead of producing another numerator.
 
 NO wall-clock claim; no figure here is new, and the service rates are explicitly estimates.
+
+## STANDING — 2026-08-17 — what survives from one day of btrfs readdir+stat work, after four corrections (CreamTrout)
+
+Consolidation, not new evidence. Ten rows went into this ledger today and four of them withdrew or
+re-scoped an earlier one, so a reader working top-to-bottom can act on a claim that a later row
+retracted. This row is the single authority on current standing. **Build and bench freeze in force**
+(/data 15G, 100% used); no runs, no build, no target writes.
+
+### STANDS — measured, and unaffected by any correction
+
+| claim | figure | why it survived |
+|---|---|---|
+| btrfs readdir+stat node reads grow with directory size | 0.04/entry at 2,048 → 1.38/entry at 20,048 (**34.5x**) | absolute counts; corrections made them lower bounds, not wrong |
+| the cliff sits between 5,048 and 10,048 entries | 1.0x re-read below, 3.3x at 10,048, 35.3x at 20,048 | same |
+| the `security.capability` probe is the dominant mechanism | suppressing it: 27,572 → 1,840 reads (**14.98x**) at 20k, 1,266 → 59 (**21.5x**) at 10k | cross-arm A/B, both arms share every confound |
+| mechanism named in code | `btrfs_getxattr` (`lib.rs:32944`) read-only branch → `walk_btrfs_fs_tree_range`, a fresh root-to-leaf descent per probe | source, not inference |
+| the floor-leaf memo is a mitigation, not the cause | memo off costs **2.78x** more reads at 20k | cross-arm A/B |
+| sizing the capability memo makes REPEAT sweeps free | 3 passes: 2.88x (64 slots) → **1.0001x** (65,536 slots) | cross-arm A/B; new axis for bd-kzfh2 |
+| five shipped knobs are inert on this axis | capability memo, readdirplus attr memo, inode-order + batch-attrs, `FFS_FUSE_WORKERS=1`, all within 0.02% | cross-arm A/B |
+| the per-fsync write set is linear in filesystem size | 115 nodes @ 2,048 files → 1,132 @ 20,048 | absolute counts, independent instrument |
+| `BTRFS_NODE_CACHE_HITS` never increments | `walk`: 1,085 lookups, 26 device reads, counter reports 0 hits | has BOTH numerator and denominator; robust in either direction |
+
+### WITHDRAWN — do not act on these
+
+* ⛔ "The parsed-node cache is INERT / retains nothing." Refuted by the memo-slots arm: with a
+  directory-sized memo, 3 sweeps cost 1.0001x one sweep.
+* ⛔ "The cache fails for exactly one node", and the three-property hunt built on it. The root is the
+  most-**requested** node, not the most-failing one; implied service rate is ~90-99%.
+* ⛔ "Readdir alone costs a flat 12 reads at any size" as a COLD measurement. It was warm; the
+  harness warmed each arm before tracing. A cold readdir is unmeasured, which also softens the
+  `b398493d` retirement to "not until a cold readdir is counted".
+* ⛔ "`walk` reports 0 hits, so the cache may never hit." An artifact of a single-pass workload —
+  though see the STANDS row above: the counter is separately broken, for a different reason.
+
+### OPEN, and what would settle each
+
+1. **Is there a cache defect at all?** Unknown. Needs hits AND misses per `logical` in
+   `btrfs_read_parsed_node` — one line, both branches. A miss count alone repeats the error that
+   produced two withdrawals. → bd-2s8zy
+2. **What does a COLD readdir cost?** One arm on the fixed harness. → bd-3zx2x
+3. **Does the ENOSPC reproduce on a kernel-verified fixture?** → bd-uxh7t
+4. **Fix the hit counter**, so this class of question stops being answered by inference. → bd-mdtqc
+
+### Method note, earned the hard way
+
+Four of today's errors share one shape: **a numerator read without its denominator** — re-read counts
+without needs, a hit rate without revisit counts, a ratio without knowing what else was sized, a
+traced window that had already been warmed outside itself. Every cross-arm A/B in the STANDS table
+survived precisely because a ratio carries its denominator with it. **Where a quantity had to be
+compared against an expectation rather than against another arm, I got it wrong four times out of
+four.** The practical rule for this ledger: prefer an A/B to an absolute, and when an absolute is
+unavoidable, state its denominator in the same sentence or do not state it.
