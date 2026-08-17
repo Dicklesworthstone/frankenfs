@@ -8368,3 +8368,75 @@ have refused both runs above.
 
 **What is left of bd-9jat1:** nothing about the binary. The remaining step is the
 `fsync-journal-commit` ABBA itself, in a window where the arms' clocks agree.
+
+## MECHANISM + RETRACTION — 2026-08-17 — the floor-leaf memo is worth 2.78x ON the readdir+stat sweep, so it is the mitigation and not the cause; and my own "0 hits" evidence was an artifact (CreamTrout)
+
+Follow-up to the readdir+stat re-read storm row above, answering its first open question the way it
+asked to be answered — by a count, not by reading a counter. Also **withdraws one piece of evidence
+I banked in that row**, which is the more important half of this entry.
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, ELF `d103d36e54691124feb6842c…` — the
+**shipping release-perf+PGO daemon** a peer built in `d0be37a48`, so this runs on the binary that
+ships. Mean CPU 2869.4 MHz over 64 CPUs, loadavg 18.28→23.40 across the series. Window measured at
+**12 of 64 CPUs above 25% busy against the veto's limit of 2**, so no timed row was attempted; a
+count does not care. No build taken; df 92G→91G.
+
+### ⛔ RETRACTION: "the parsed-node cache reports 0 hits at every size"
+
+The row above offered `ffs-cli walk`'s `0 hits (0.0%)` at 5000/10000/20000 entries as support for
+"the cache may never hit at all". **That is an artifact and I withdraw it.** `walk` is a SINGLE-PASS
+traversal: it visits every node exactly once, so no node is ever revisited inside it and a hit is
+impossible by construction. Zero hits is the *correct* reading for that workload and says nothing
+about the cache. I read a counter without reading what the workload does to it — the same mistake the
+row was warning about two paragraphs earlier.
+
+Also checked and clean, so nobody re-runs it: `ShardedCache::insert_within` does **not** inflate its
+atomic `len` on re-insert (`insert(..).is_none()` guards the `fetch_add`), so the "cache freezes early
+with far fewer than 512 entries" variant is ruled out by reading.
+
+**What survives unchanged** is the strace evidence, which never depended on the counter: at 10048
+entries, 387 distinct nodes are read 1266 times with capacity for 512 — ~879 reads a cache with room
+did not absorb. The re-read storm is still real and still unexplained.
+
+### A/B: the floor-leaf memo, one ELF, env-toggled
+
+`FFS_BTRFS_FLOOR_MEMO=0` against the unset default, same binary, same fixtures, one fresh mount per
+arm (`scripts/btrfs_readdir_node_reads.py --daemon-env`). One ELF means ISA and PGO cancel exactly
+(bd-b9dug class C):
+
+| entries | memo ON (default) | memo OFF | memo is worth |
+|---|---|---|---|
+| 10048 | 1266 preads, 3.3x re-read | 2929, 7.6x | **2.31x** |
+| 20048 | 27572 preads, 35.3x re-read | 76784, 98.2x | **2.78x** |
+| 20048 worst single offset | 11772 | 32955 | 2.80x |
+
+⛔ **So the floor-leaf memo is REFUTED as the cause — it is the mitigation.** That was my third
+candidate mechanism for the storm (after the 512-entry cap and the mount-time fill, both already
+refuted above) and it is wrong in the *opposite* direction from the guess: turning it off nearly
+triples the re-reads.
+
+`n=1` per arm is adequate here and the reason is measurable rather than assumed: the baseline arm has
+now been run three times across two ELFs and a 50% clock swing and moved by 5 reads in 27,577
+(0.018%), while the effect being measured is 178%.
+
+### What this re-scopes
+
+**bd-79li3** reports the floor-leaf memo TAXING random-access metadata 8.6x and proposes a
+hit-rate-aware gate that stops replacing the memo once the recent hit rate collapses. That bead's
+finding stands, but this is its counterweight and the two must be decided together: on the
+**readdir+stat sweep — the worst row in the bank** — the memo is worth 2.78x, and a naive
+"disable when the hit rate looks bad" gate that fires here would cost that. The sweep and the
+random-access workload want opposite policies from the same one-slot structure.
+
+**The unmitigated cost is now sized.** With the memo off, 20048 stats cost 76784 node reads =
+**3.83 reads per stat** over only 782 distinct nodes. That is a full uncached descent per stat. The
+memo removes ~64% of it; nothing else removes any.
+
+### Still open, and stated honestly
+
+Why 387 distinct nodes are read 1266 times with a 512-entry cache that has room for all of them.
+Three mechanisms are now refuted (capacity bound, mount-time fill, floor-memo thrash) and one piece
+of supporting evidence is withdrawn. The in-process paths cannot be used to probe it — `stat-bench`
+resolves 20048 entries at 37 ns/entry and never descends the tree at all, so the FUSE path re-descends
+where the in-process path does not, and *that* difference is the next thing to attribute. NO
+wall-clock claim is made anywhere in this entry.

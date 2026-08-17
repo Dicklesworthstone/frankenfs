@@ -88,16 +88,25 @@ def unmount(mountpoint: Path) -> None:
 
 
 def probe(cli: Path, image: Path, mountpoint: Path, workdir: Path,
-          label: str, listing: list[str], settle: float) -> dict | None:
-    """Mount `image` fresh, strace the daemon across one listing, count reads."""
+          label: str, listing: list[str], settle: float,
+          daemon_env: dict[str, str] | None = None) -> dict | None:
+    """Mount `image` fresh, strace the daemon across one listing, count reads.
+
+    `daemon_env` is applied to the DAEMON only, so an A/B of a knob runs both
+    arms from ONE ELF and the ISA/PGO differences that sink cross-binary
+    comparisons cancel exactly (bd-b9dug class C).
+    """
     scratch = workdir / f"{label}.img"
     shutil.copyfile(image, scratch)
     unmount(mountpoint)
     mountpoint.mkdir(parents=True, exist_ok=True)
 
+    env = dict(os.environ)
+    if daemon_env:
+        env.update(daemon_env)
     log = open(workdir / "mount.log", "ab")
     daemon = subprocess.Popen([str(cli), "mount", str(scratch), str(mountpoint)],
-                              stdout=log, stderr=log)
+                              stdout=log, stderr=log, env=env)
     time.sleep(settle)
 
     # The launcher forks, so the pid that serves requests is not `daemon.pid`.
@@ -199,6 +208,10 @@ def main() -> int:
                         "so it is worth running once and not every time)")
     p.add_argument("--settle", type=float, default=4.0,
                    help="seconds to wait for the daemon and the tracer to attach")
+    p.add_argument("--daemon-env", action="append", default=[], metavar="K=V",
+                   help="set an env var on the DAEMON, repeatable. Every arm then "
+                        "runs from ONE ELF, so a knob A/B has no ISA/PGO confound "
+                        "(bd-b9dug class C). Example: --daemon-env FFS_BTRFS_FLOOR_MEMO=0")
     args = p.parse_args()
 
     if args.selftest:
@@ -214,9 +227,17 @@ def main() -> int:
     load = Path("/proc/loadavg").read_text().split()[:3]
     mhz = [float(l.split(":")[1]) for l in Path("/proc/cpuinfo").read_text().splitlines()
            if "cpu MHz" in l]
+    daemon_env = {}
+    for kv in args.daemon_env:
+        if "=" not in kv:
+            sys.exit(f"FATAL: --daemon-env wants K=V, got {kv!r}")
+        k, v = kv.split("=", 1)
+        daemon_env[k] = v
+
     print(f"# host={os.uname().nodename} kernel={os.uname().release}")
     print(f"# elf={elf[:24]}... loadavg={'/'.join(load)} "
           f"mean_cpu_mhz={sum(mhz)/len(mhz):.1f} over {len(mhz)} cpus")
+    print(f"# daemon_env={daemon_env or 'default (knobs unset)'}")
     print("# a COUNT is load-independent; the loadavg is recorded, not relied on")
     print()
 
@@ -236,7 +257,7 @@ def main() -> int:
             for arm, listing in arms:
                 label = f"{image.stem}_{arm}"
                 r = probe(args.cli, image, args.mountpoint, args.work_dir,
-                          label, listing, args.settle)
+                          label, listing, args.settle, daemon_env)
                 if not r:
                     continue
                 rows.append(r)
