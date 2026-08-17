@@ -338,6 +338,51 @@ pub fn render_reply_nanos() -> String {
     out
 }
 
+/// Whether the three timing families are internally consistent, per opcode.
+///
+/// `ops_ns` and `reply_ns` both measure work that happens INSIDE a dispatch, so
+/// for every opcode `ops_ns + reply_ns <= dispatch_ns` must hold. A violation
+/// means one of three things, all of which invalidate the decomposition:
+///
+/// - a timer attributes to the wrong slot, so time from opcode A lands on B;
+/// - a timer double-counts, e.g. nested starts on the same call;
+/// - a timer outlives its dispatch, which RAII is supposed to prevent.
+///
+/// This exists because the decomposition is a SUBTRACTION I have been doing by
+/// hand -- `dispatch - ops - reply` is quoted as "per-entry handler bookkeeping"
+/// -- and I have already published one wrong attribution from this bead by
+/// conflating scopes with nanoseconds. A subtraction whose terms are never
+/// checked against each other is a number nobody has validated.
+///
+/// Returns the offending `(label, dispatch, ops, reply)` for the first opcode
+/// that violates it, or `None` when every opcode is consistent.
+#[must_use]
+pub fn decomposition_violation(
+    dispatch: [u64; fuser::CROSSING_SLOTS],
+) -> Option<(&'static str, u64, u64, u64)> {
+    for op in CrossingOp::ALL {
+        let index = op.index();
+        let ops = OPS_NANOS[index].load(std::sync::atomic::Ordering::Relaxed);
+        let reply = REPLY_NANOS[index].load(std::sync::atomic::Ordering::Relaxed);
+        if !decomposition_is_consistent(dispatch[index], ops, reply) {
+            return Some((op.label(), dispatch[index], ops, reply));
+        }
+    }
+    None
+}
+
+/// Same check against explicit values, so the invariant is testable without
+/// touching the process-global counters.
+#[must_use]
+pub fn decomposition_is_consistent(dispatch: u64, ops: u64, reply: u64) -> bool {
+    // `checked_add`, not `saturating_add`. Saturating makes an OVERFLOWING sum
+    // compare equal to a maximal dispatch and report "consistent" -- the exact
+    // blind spot this check exists to close. An overflow is a violation: two
+    // timers that between them accumulated more than u64 nanoseconds are not
+    // measuring what they claim.
+    ops.checked_add(reply).is_some_and(|sum| sum <= dispatch)
+}
+
 /// Live counts and dispatch times, rendered for the metrics line.
 #[must_use]
 pub fn render_live_timed() -> String {
@@ -359,6 +404,31 @@ pub fn render_live() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The invariant the decomposition rests on: ops and reply both happen
+    /// inside a dispatch, so their sum cannot exceed it.
+    #[test]
+    fn ops_plus_reply_may_not_exceed_dispatch_bd_xfe7z() {
+        assert!(super::decomposition_is_consistent(100, 30, 40));
+        assert!(super::decomposition_is_consistent(100, 60, 40), "equality is allowed");
+        assert!(
+            !super::decomposition_is_consistent(100, 61, 40),
+            "a sum over dispatch means a timer is mis-slotted, double-counting, or \
+             outliving its dispatch -- all of which invalidate the subtraction"
+        );
+        // Zero dispatch with nonzero parts is the shape a wrong-slot bug makes:
+        // time landing on an opcode that never dispatched.
+        assert!(!super::decomposition_is_consistent(0, 1, 0));
+        assert!(super::decomposition_is_consistent(0, 0, 0));
+    }
+
+    /// Saturating arithmetic: two near-u64::MAX terms must report a violation
+    /// rather than wrapping into a value that looks consistent.
+    #[test]
+    fn the_consistency_check_does_not_wrap_bd_xfe7z() {
+        assert!(!super::decomposition_is_consistent(u64::MAX, u64::MAX, 1));
+        assert!(!super::decomposition_is_consistent(10, u64::MAX, u64::MAX));
+    }
 
     /// All four families -- counts, dispatch, ops and reply -- must share labels
     /// and ordering, because the decomposition is a SUBTRACTION across them:
