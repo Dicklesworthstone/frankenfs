@@ -8561,3 +8561,90 @@ through the same upper nodes, and `walk_btrfs_fs_tree_range` does route through
 `btrfs_read_parsed_node`, yet one single offset is read 11,772 times. Three mechanisms are already
 refuted (the 512-entry cap, the mount-time fill, the floor-leaf memo) and one piece of evidence
 withdrawn. NO wall-clock claim is made in this entry; node counts are a mechanism, not a prediction.
+
+## MECHANISM — 2026-08-17 — PROVEN: the btrfs read-only parsed-node cache retains essentially nothing, and the hot node is the FS_TREE ROOT (CreamTrout)
+
+Closes the question the three rows above left open — *why the parsed-node cache does not absorb the
+probe descents* — by the strongest test available for a cache: **repeat the identical workload in the
+same mount and see what was retained.** Nothing was.
+
+Provenance: host `thinkstation1`, kernel `6.17.0-41-generic`, ELF `d103d36e54691124feb6842c…`
+(shipping release-perf+PGO), mean CPU 2785.1 MHz over 64 CPUs, loadavg 16.62→17.93. Window measured
+at **33 of 64 CPUs above 25% busy against the veto's limit of 2**, fifteen above 50% — the worst of
+the session, while loadavg read 16.62. Fourth consecutive turn in which loadavg pointed the opposite
+way from the gate. No timed row, no build.
+
+### The proof: N passes cost N times one pass
+
+Same mount, same 20048-entry directory, `os.stat` over every entry, repeated in-process
+(`scripts/btrfs_stat_client.py --passes`):
+
+| passes | preads | re-read | per entry |
+|---|---|---|---|
+| 1 | 27147 | 34.7x | 1.35 |
+| 3 | 78203 | 100.0x | 3.90 |
+
+**78203 / 27147 = 2.88x for 3x the work.** A read-only mount's metadata is immutable and the whole fs
+tree is 433 nodes against a 512-entry cap, so a cache doing its job would make passes 2 and 3 nearly
+free. They cost ~96% of full price. The `btrfs_parsed_node_cache` is **inert in the mounted daemon**
+— not undersized, not thrashing: inert.
+
+This is what the earlier rows were circling and could not prove. It also retroactively explains every
+one of them: the cliff, the 35x re-read factor, and why three separate mechanisms (the 512-entry cap,
+the mount-time fill, the floor-leaf memo) each failed to account for it.
+
+### The hot node, named
+
+Reading the 101-byte btrfs header at the most-re-read physical offset:
+
+    physical 56688640 -> logical 48300032   owner=FS_TREE(5)   level=1   nritems=432   gen=10
+
+**It is the fs-tree ROOT** — level 1, the top of a depth-2 tree with 432 children — re-read **11,775
+times** for 20,048 stats. The next-hottest offsets are its level-0 leaves (nritems 75-91), each
+re-read 27-31 times. Every descent crosses the root; none of them find it cached.
+
+Probe ON vs probe suppressed, same mount shape, hot offset compared directly:
+
+| | reads of logical 48300032 | total reads | distinct offsets |
+|---|---|---|---|
+| default | 11775 | 27595 | 802 |
+| `FFS_FUSE_XATTR_NO_SUPPORT=1` | 791 | 1841 | 573 |
+
+**Same node in both arms** — the capability probe does not introduce a hot node, it **amplifies the
+existing one 14.9x**. Only 229 of 802 offsets are probe-exclusive and they contribute 229 reads
+(one each), i.e. ~0.8% of the total. So the probe's cost is not new nodes; it is a second uncached
+descent per entry across the same nodes.
+
+### Two more shipped levers measured inert on this axis
+
+Both default OFF, both opt-in, both counted at 20048 entries against the 27572 baseline:
+
+| knob | preads |
+|---|---|
+| `FFS_FUSE_READDIRPLUS_ATTR_MEMO=1` | 27577 |
+| `FFS_FUSE_READDIRPLUS_INODE_ORDER=1` + `FFS_FUSE_READDIRPLUS_BATCH_ATTRS=1` | 27576 |
+| `FFS_FUSE_CAPABILITY_MEMO=0` (from the row above) | 27577 |
+
+All three inside the 0.02% this instrument drifts by. **Every shipped attr/memo/batching lever is
+inert here**, and now the reason is clear rather than mysterious: they all cache or batch *answers*
+on the attribute path, while the cost is *uncached tree descents* underneath both paths. Relevant to
+bd-t0xoq, which proposed pre-populating the capability memo during readdirplus — the readdirplus
+batching machinery already exists, is reachable by knob, and moves nothing.
+
+### What is now the single question
+
+**Why is `btrfs_parsed_node_cache` inert in the daemon when the code says it should not be?**
+Checked and NOT the answer, each by reading rather than guessing:
+
+* `cacheable = self.btrfs_alloc_state.is_none()` — `btrfs_alloc_state` is set only in
+  `enable_writes` (`lib.rs:8109`), which a read-only mount does not call, so `cacheable` is true.
+* `ShardedCache::insert_within` does not inflate its atomic `len` on re-insert, so it does not
+  freeze early with few live entries.
+* `clear()` is `#[cfg(test)]` — nothing clears it in production.
+* Capacity: 802 distinct nodes touched against a 512 cap would leave 290 uncached, not 433 of 433 —
+  and cannot explain the ROOT, which every descent touches first, being re-read 11,775 times.
+
+The remaining candidates are structural rather than arithmetic — most obviously whether the mounted
+daemon's request path reaches this `OpenFs` instance's cache at all, which is the shape of the
+`FsOps for Arc<T>` forwarding trap that has bitten this repo before. That is a code question, not a
+measurement one, and it is the next thing to settle. NO wall-clock claim is made in this entry.

@@ -44,6 +44,11 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=0,
                    help="stat at most N entries (0 = all), so a huge directory "
                         "can be sampled without changing the traversal order")
+    p.add_argument("--passes", type=int, default=1,
+                   help="repeat the whole sweep N times in ONE mount. This is the "
+                        "cache test: a working read-only node cache makes pass 2 "
+                        "nearly free, so N passes costing N times one pass proves "
+                        "the cache is not serving (bd-2s8zy).")
     args = p.parse_args()
 
     root = args.mountpoint
@@ -52,25 +57,26 @@ def main() -> int:
         names = names[:args.limit]
 
     done = 0
-    for name in names:
-        full = os.path.join(root, name)
-        try:
-            if args.mode == "path":
-                os.stat(full)
-            elif args.mode == "lstat":
-                os.lstat(full)
-            else:
-                fd = os.open(full, os.O_RDONLY)
-                try:
-                    os.fstat(fd)
-                finally:
-                    os.close(fd)
-        except OSError as e:
-            print(f"{full}: {e}", file=sys.stderr)
-            continue
-        done += 1
+    for _ in range(max(args.passes, 1)):
+        for name in names:
+            full = os.path.join(root, name)
+            try:
+                if args.mode == "path":
+                    os.stat(full)
+                elif args.mode == "lstat":
+                    os.lstat(full)
+                else:
+                    fd = os.open(full, os.O_RDONLY)
+                    try:
+                        os.fstat(fd)
+                    finally:
+                        os.close(fd)
+            except OSError as e:
+                print(f"{full}: {e}", file=sys.stderr)
+                continue
+            done += 1
 
-    print(f"{args.mode}: {done} entries")
+    print(f"{args.mode}: {done} stats over {args.passes} pass(es)")
     return 0
 
 
