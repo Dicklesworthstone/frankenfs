@@ -10423,3 +10423,57 @@ pre-run gate checks and the second is what the post-hoc veto refuses on.
 
 **Cheapest next step:** re-run parallel metadata writes. It needs 0.001 of null spread, so it is far
 closer to admissible than the storm row, and it is the one carrying a sign change.
+
+## ⛔ TWO BLIND ALLEYS CLOSED — 2026-08-17 — the FUSE A/A null is NOT an outlier tail, and the harness is NOT using the wrong sample series (bd-btrfs-readdir-stat-8x-8y7vp, bd-4sull)
+
+Follow-up analysis of the two banked runs, taken instead of a fourteenth certification attempt. It
+**withdraws a hypothesis I published one entry ago** and eliminates a second before anyone spends a
+run on it. No run taken; analysis of `raw_wall_ns` and `raw_physical_wall_ns` from reports already on
+disk.
+
+Provenance: `executed_on: thinkstation1`, kernel `6.17.0-41-generic`, mean CPU 2435.2 MHz over 64
+CPUs, loadavg 20.07/16.74/15.39, idle 85.8%, iowait 0.0%, df 203G.
+
+**⛔ WITHDRAWN: "an outlier tail points at occasional multi-hundred-millisecond stalls".** I proposed
+that last entry as the most tractable candidate. It is wrong, and the test is one line: trimming the
+extreme per-pair ratios does not move the A/A median at all.
+
+| trimmed each side | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| 24-pair A/A median | 1.03675 | 1.03675 | 1.03675 | 1.03675 |
+| 48-pair A/A median | 0.98771 | 0.98771 | 0.98771 | 0.98771 |
+
+A median is robust to tail trimming by construction, so an outlier tail cannot be what displaces it.
+The tail is real — 4-12% of FUSE observations exceed 1.25x the median, worst 2.10x — but it inflates
+the **CI**, not the **median**. The null fails on the median. **Chasing the stalls would not have
+fixed the null**, and I would have sent the next attempt at the wrong target.
+
+**⛔ ELIMINATED, before it cost anything: "the harness computes the null from the wrong series".** The
+two series disagree materially:
+
+| | logical `raw_wall_ns` | physical `raw_physical_wall_ns` | harness reported |
+|---|---|---|---|
+| 24-pair fuse A/B | 1.05326 | 1.03320 | 1.02299 |
+| 48-pair fuse A/B | 0.97366 | **1.00165** | 0.97375 |
+
+The 48-pair **physical** grouping is near-perfect — 0.165% deviation, comfortably inside the 2%
+ceiling — while the logical grouping fails at 2.6%. That looked like a defect worth reporting. It is
+not: the harness source documents `values` as *"samples indexed by the counterbalanced logical A/B
+assignment"* and `physical_values` as *"the same samples indexed by the physical image/mount that
+executed"*, and the null is computed from the **logical** series. That is the correct choice by
+design — counterbalancing is what cancels position, so the logical assignment is the one an A/A null
+must be computed on. **Not a harness defect; recorded so nobody re-opens it.**
+
+**What the divergence does suggest, stated at the strength the data supports.** In the 48-pair run
+the two physical mounts performed within 0.17% of each other while the counterbalanced labels
+differed by 2.6% — which would point at a residual associated with **schedule position rather than
+mount identity**. But the 24-pair run fails on BOTH groupings (1.05326 logical, 1.03320 physical), so
+the pattern is not consistent and **n=2 supports no conclusion**. It is worth one targeted look, not
+a claim.
+
+**Where the next attempt should go.** Two candidates are now eliminated and one stands from the
+previous entry: the FUSE arm carries 14-30% per-observation CV against a 2% ceiling, it is variance
+rather than drift, and the displacement is in the median rather than the tail. That leaves
+**per-observation state differing between the two FUSE arms** — mount/cache warmth, daemon scheduling
+— as the live candidate, and it is measurable from `raw_wall_ns` on banked runs without a window. NO
+wall-clock ratio is claimed; both banked attempts remain INADMISSIBLE and unquotable.
