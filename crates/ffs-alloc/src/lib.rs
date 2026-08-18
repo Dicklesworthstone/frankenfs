@@ -5256,6 +5256,131 @@ mod tests {
         );
     }
 
+    /// bd-ygznx. The GDT block must be skipped ONLY when it is byte-identical, and the
+    /// case that decides it is a window that allocates one block and frees another.
+    ///
+    /// Such a window leaves `free_blocks` IDENTICAL while the bitmap content differs,
+    /// and `apply_group_desc_into` re-stamps the descriptor's bitmap checksum over the
+    /// new bitmap bytes. A guard keyed on the free COUNTS would skip that write and
+    /// leave a stale checksum on disk — e2fsck-dirty, the regression this path has hit
+    /// before. A byte-identity guard cannot, because the re-stamped checksum makes the
+    /// two blocks differ. This test pins that distinction on the real ext4 writer
+    /// rather than on the generic `rmw_block` default.
+    #[test]
+    fn gdt_write_is_skipped_only_when_the_descriptor_block_is_byte_identical_bd_ygznx() {
+        let cx = test_cx();
+        let pctx = PersistCtx {
+            gdt_block: BlockNumber(50),
+            desc_size: 64,
+            has_metadata_csum: true,
+            csum_seed: 0x1357_2468,
+            uuid: [0x5A; 16],
+            group_desc_checksum_kind: ffs_ondisk::ext4::Ext4GroupDescChecksumKind::MetadataCsum,
+            blocks_per_group: 8192,
+            inodes_per_group: 2048,
+        };
+        let stats = GroupStats {
+            group: GroupNumber(0),
+            free_blocks: 8000,
+            block_largest_free_run: None,
+            free_inodes: 2000,
+            inode_search_start: 0,
+            used_dirs: 1,
+            block_bitmap_block: BlockNumber(1),
+            inode_bitmap_block: BlockNumber(2),
+            inode_table_block: BlockNumber(3),
+            flags: 0,
+            block_bitmap_csum: 0,
+            inode_bitmap_csum: 0,
+            reserved_cache: OnceLock::new(),
+            reserved_confirmed: OnceLock::new(),
+        };
+
+        // 8192 blocks per group => a 1024-byte block bitmap.
+        let mut bitmap_a = vec![0_u8; 1024];
+        for byte in bitmap_a.iter_mut().take(25) {
+            *byte = 0xFF;
+        }
+        // ALLOCATE ONE, FREE ONE: same number of set bits, different bytes. This is
+        // the window whose free counts do not move.
+        let mut bitmap_b = bitmap_a.clone();
+        bitmap_b[0] &= !0x01;
+        bitmap_b[25] |= 0x01;
+        assert_eq!(
+            bitmap_a.iter().map(|b| b.count_ones()).sum::<u32>(),
+            bitmap_b.iter().map(|b| b.count_ones()).sum::<u32>(),
+            "the two bitmaps must have equal popcount or this is not the case under test"
+        );
+
+        let dev = CountingBlockDevice::new(4096);
+        let gdt = BlockNumber(50);
+        let slot = |dev: &CountingBlockDevice| -> Vec<u8> {
+            dev.read_block(&cx, gdt).expect("gdt read").into_inner()[0..64].to_vec()
+        };
+
+        // First persist: the block starts zeroed, so it must be written.
+        persist_group_desc_force(&cx, &dev, &pctx, stats.group, &stats, Some(&bitmap_a), None)
+            .expect("first persist");
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            1,
+            "the first descriptor write must reach the device"
+        );
+        let after_a = slot(&dev);
+
+        // Same counters, same bitmap: nothing changed, so nothing may be written. This
+        // is the pure-overwrite fsync that bd-ygznx is about.
+        persist_group_desc_force(&cx, &dev, &pctx, stats.group, &stats, Some(&bitmap_a), None)
+            .expect("idempotent persist");
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            1,
+            "re-persisting an unchanged descriptor must not reach the device"
+        );
+
+        // Ground truth, computed WITHOUT the guard: apply the new bitmap to the block
+        // exactly as the writer would and see whether the descriptor bytes actually
+        // move. Doing this independently is what keeps the two failure modes apart —
+        // "the checksums collided" and "the guard skipped a block that changed" would
+        // otherwise produce the identical symptom.
+        let mut reference = dev.read_block(&cx, gdt).expect("gdt read").into_inner();
+        let override_b = BitmapOverride::full(&bitmap_b[..]);
+        apply_group_desc_into(
+            &mut reference,
+            0,
+            64,
+            &pctx,
+            stats.group,
+            &stats,
+            Some(&override_b),
+            None,
+        )
+        .expect("reference apply");
+        assert_ne!(
+            reference[0..64].to_vec(),
+            after_a,
+            "the re-stamped bitmap checksum must change the descriptor slot. If this \
+             fails, the two bitmaps' checksums COLLIDED — pick different bitmaps. It \
+             is NOT evidence about the guard, which this assertion does not exercise"
+        );
+
+        // ⚠️ THE CASE THAT DECIDES THE GUARD. Identical free counts, different bitmap:
+        // the descriptor block genuinely differs (just proven above), so the write must
+        // happen. A count-based guard would skip it and persist a stale checksum.
+        persist_group_desc_force(&cx, &dev, &pctx, stats.group, &stats, Some(&bitmap_b), None)
+            .expect("alloc-one-free-one persist");
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            2,
+            "equal free counts with a different bitmap must STILL write the descriptor"
+        );
+        assert_eq!(
+            slot(&dev),
+            reference[0..64].to_vec(),
+            "and the bytes written must be the ones the writer computes"
+        );
+    }
+
     fn seed_gdt_block(dev: &MemBlockDevice, pctx: &PersistCtx, groups: &[GroupStats]) {
         // Write a GDT block with group descriptors packed at desc_size intervals.
         let block_size = dev.block_size() as usize;
