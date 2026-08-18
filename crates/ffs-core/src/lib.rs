@@ -11522,24 +11522,60 @@ impl OpenFs {
         offset: u64,
         read_end: u64,
     ) -> Result<Vec<(u64, BtrfsExtentData)>, FfsError> {
+        let mut exts: Vec<(u64, BtrfsExtentData)> = Vec::new();
+        for index in Self::btrfs_window_extent_indices(rows, offset, read_end)? {
+            let (logical_start, extent) = &rows[index];
+            exts.push((*logical_start, extent.clone()));
+        }
+        Ok(exts)
+    }
+
+    /// Indices of the extents in `rows` overlapping `[offset, read_end)`
+    /// (bd-vpypn).
+    ///
+    /// The window rule itself, separated from the copying so there is exactly ONE
+    /// definition of which extents a read touches. `btrfs_filter_window_extents`
+    /// is now a thin clone-and-collect over this, so the two cannot disagree.
+    ///
+    /// ⚠️ WHY THIS SHAPE MATTERS, and it is not tidiness. The clone in the filter
+    /// is NOT uniformly cheap: `BtrfsExtentData::Regular` is all scalars, but
+    /// `BtrfsExtentData::Inline` owns a `Vec<u8>` holding the file's bytes. btrfs
+    /// stores small files inline, so every read of a small file deep-copies its
+    /// payload here and then copies it AGAIN into the caller's buffer. Returning
+    /// indices lets a caller that borrows a long-lived extent list (the read-plan
+    /// index and the read-only per-inode cache both do) skip the first copy
+    /// entirely. That call-site change is deliberately NOT made here — it is a
+    /// lifetime refactor across three branches that must be compiled to be
+    /// trusted, and this lands under a build freeze.
+    ///
+    /// Selection is byte-identical to the previous inline implementation:
+    /// extents are sorted by `logical_start` and do not overlap, so the
+    /// overlapping ones form a contiguous run; the scan starts one slot before
+    /// the first extent past `offset` and re-applies the full predicate, so a
+    /// hole or gap entry landing on the lower bound is skipped exactly as before.
+    fn btrfs_window_extent_indices(
+        rows: &[(u64, BtrfsExtentData)],
+        offset: u64,
+        read_end: u64,
+    ) -> Result<Vec<usize>, FfsError> {
         // First extent whose `logical_start > offset`; the extent covering
         // `offset` (if any) is the immediately preceding entry, so start the
         // forward scan one slot earlier (saturating at 0).
         let start = rows
             .partition_point(|(ls, _)| *ls <= offset)
             .saturating_sub(1);
-        let mut exts: Vec<(u64, BtrfsExtentData)> = Vec::new();
-        for (logical_start, extent) in &rows[start..] {
+        let mut hits = Vec::new();
+        for (index, (logical_start, extent)) in rows.iter().enumerate().skip(start) {
             if *logical_start >= read_end {
                 break;
             }
             let extent_end =
                 (*logical_start).saturating_add(Self::btrfs_extent_logical_len(extent)?);
             if extent_end > offset {
-                exts.push((*logical_start, extent.clone()));
+                hits.push(index);
             }
         }
-        Ok(exts)
+        Ok(hits)
     }
 
     fn btrfs_read_file_into(
@@ -57822,6 +57858,95 @@ mod tests {
             btrfs_floor_memo_reuse_slot(&full, root, &key(12)),
             Some(2),
             "a full memo must still refresh a leaf it already holds"
+        );
+    }
+
+    /// bd-vpypn: the window rule and the copying filter must select the same
+    /// extents, and the inline case must be visible as the copy it is.
+    #[test]
+    fn btrfs_window_extent_selection_agrees_and_inline_is_a_deep_copy_bd_vpypn() {
+        let regular = |ram: u64| ffs_btrfs::BtrfsExtentData::Regular {
+            generation: 1,
+            ram_bytes: ram,
+            extent_type: 1,
+            compression: 0,
+            disk_bytenr: 4096,
+            disk_num_bytes: ram,
+            extent_offset: 0,
+            num_bytes: ram,
+        };
+        // Sorted, non-overlapping, with a gap between 8192 and 16384 so a read
+        // landing in the hole exercises the lower-bound skip.
+        let rows: Vec<(u64, ffs_btrfs::BtrfsExtentData)> = vec![
+            (0, regular(4096)),
+            (4096, regular(4096)),
+            (16384, regular(4096)),
+        ];
+
+        for (offset, end) in [
+            (0_u64, 4096_u64), // exactly the first extent
+            (0, 8192),         // both leading extents
+            (2048, 6144),      // straddles the boundary
+            (8192, 16384),     // entirely inside the hole
+            (8192, 20480),     // hole then the third extent
+            (16384, 20480),    // past the gap
+            (99999, 100_000),  // beyond every extent
+        ] {
+            let indices = OpenFs::btrfs_window_extent_indices(&rows, offset, end).unwrap();
+            let filtered = OpenFs::btrfs_filter_window_extents(&rows, offset, end).unwrap();
+            assert_eq!(
+                indices.len(),
+                filtered.len(),
+                "window [{offset}, {end}) selects a different count by index than by clone"
+            );
+            for (i, (logical_start, extent)) in indices.iter().zip(filtered.iter()) {
+                assert_eq!(rows[*i].0, *logical_start);
+                assert_eq!(
+                    &rows[*i].1, extent,
+                    "index and clone disagree on the extent"
+                );
+            }
+            // Selection must be a CONTIGUOUS run — that is what licenses stopping
+            // the scan at the first extent past the window.
+            for pair in indices.windows(2) {
+                assert_eq!(pair[1], pair[0] + 1, "selected extents must be contiguous");
+            }
+        }
+
+        // THE COST THIS SHAPE EXISTS TO EXPOSE. A Regular extent is all scalars,
+        // but an Inline extent owns the file's bytes, so the filter's clone is a
+        // deep copy of the payload on EVERY read of a small file.
+        let payload = vec![0xAB_u8; 2048];
+        let inline_rows: Vec<(u64, ffs_btrfs::BtrfsExtentData)> = vec![(
+            0,
+            ffs_btrfs::BtrfsExtentData::Inline {
+                generation: 1,
+                ram_bytes: payload.len() as u64,
+                compression: 0,
+                data: payload.clone(),
+            },
+        )];
+        let selected = OpenFs::btrfs_filter_window_extents(&inline_rows, 0, 2048).unwrap();
+        assert_eq!(selected.len(), 1);
+        match (&inline_rows[0].1, &selected[0].1) {
+            (
+                ffs_btrfs::BtrfsExtentData::Inline { data: original, .. },
+                ffs_btrfs::BtrfsExtentData::Inline { data: copied, .. },
+            ) => {
+                assert_eq!(original, copied, "the copy must be faithful");
+                assert_ne!(
+                    original.as_ptr(),
+                    copied.as_ptr(),
+                    "and it IS a separate allocation - this is the per-read payload copy \
+                     that returning indices would let a borrowing caller avoid"
+                );
+            }
+            _ => panic!("expected two inline extents"),
+        }
+        // The index form selects the same extent without copying anything.
+        assert_eq!(
+            OpenFs::btrfs_window_extent_indices(&inline_rows, 0, 2048).unwrap(),
+            vec![0]
         );
     }
 
