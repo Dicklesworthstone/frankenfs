@@ -2106,6 +2106,36 @@ fn btrfs_parsed_node_heap_bytes(node: &BtrfsParsedNode) -> usize {
     }
 }
 
+/// Which retained slot a freshly descended leaf should occupy, when one can be
+/// reused without evicting anything live (bd-yu6jz).
+///
+/// `Some(i)` means slot `i` is free to take: either it already holds THIS leaf
+/// (refresh in place) or it is empty. `None` means every slot holds a different
+/// live leaf and the caller must evict one — returned rather than decided here so
+/// the caller keeps its round-robin counter lazy and this stays pure.
+///
+/// THE ORDER IS THE CONTRACT, and getting it wrong is not a nuance — see the call
+/// site for how "empty first" collapses four slots to one on a probe for an
+/// absent key. Same-leaf refresh strictly precedes taking an empty slot.
+///
+/// A leaf is identified by `(root_logical, first_key)`: two distinct leaves of one
+/// tree cannot share a first key, and the root guards against two trees whose key
+/// spaces are unrelated.
+fn btrfs_floor_memo_reuse_slot(
+    identities: &[Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>],
+    fresh_root_logical: u64,
+    fresh_first_key: &ffs_ondisk::btrfs::BtrfsKey,
+) -> Option<usize> {
+    identities
+        .iter()
+        .position(|slot| {
+            slot.as_ref().is_some_and(|(root_logical, first_key)| {
+                *root_logical == fresh_root_logical && first_key == fresh_first_key
+            })
+        })
+        .or_else(|| identities.iter().position(Option::is_none))
+}
+
 const BTRFS_TREE_NODE_CACHE_LIMIT: usize = 512;
 
 /// Diagnostic counters for the read-only btrfs tree-node cache (bd-5vis3).
@@ -9331,27 +9361,39 @@ impl OpenFs {
                 leaf: Arc::clone(&node),
             };
             let mut slots = self.btrfs_floor_leaf_memo.lock();
-            // Prefer an EMPTY slot, and otherwise overwrite the slot that already
-            // spans this leaf, before evicting anything live. Without the second
-            // clause a sweep that re-descends the same leaf would consume a fresh
-            // slot each time and evict its own neighbours — turning four slots back
-            // into one on exactly the workload they exist for.
-            let victim = slots
-                .iter()
-                .position(Option::is_none)
-                .or_else(|| {
-                    slots.iter().position(|slot| {
-                        slot.as_ref().is_some_and(|slot| {
-                            slot.root_logical == fresh.root_logical
-                                && slot.first_key == fresh.first_key
-                        })
-                    })
-                })
-                .unwrap_or_else(|| {
-                    self.btrfs_floor_memo_next_slot
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        % BTRFS_FLOOR_MEMO_SLOTS
-                });
+            // ORDER MATTERS, AND IT IS NOT "EMPTY FIRST" (bd-yu6jz). A slot already
+            // holding this leaf is refreshed in place BEFORE any empty slot is
+            // taken, and only then is a live slot evicted.
+            //
+            // This runs only after a lookup MISS, so ordinarily no live slot can
+            // hold the reached leaf — one that did would have spanned the target and
+            // answered. The exception is the case this memo was widened to serve. A
+            // floor descent returns the greatest key `<= target`, so a target BEYOND
+            // the reached leaf's last key (an ABSENT xattr bucket sorting past the
+            // final key — the overwhelmingly common answer for the capability probe)
+            // resolves to that leaf and stores a span not containing the target.
+            // Every repeat of the lookup fails the span check, re-descends to the
+            // SAME leaf, and lands here again.
+            //
+            // With empty-first, those repeats deal that one leaf into every free slot
+            // and then start evicting live neighbours — collapsing four slots back to
+            // one precisely on the probe the widening exists for. Refreshing in place
+            // makes the repeat idempotent instead.
+            // Identities only — `BtrfsKey` is `Copy` and there are
+            // BTRFS_FLOOR_MEMO_SLOTS of them, so this is a small stack array and no
+            // allocation. Snapshotting them lets the ORDER live in a pure function
+            // that a test can pin, which is what this needed: the bug fixed here was
+            // an ordering bug, invisible to any test that only checked the memo
+            // answers correctly.
+            let identities: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] =
+                std::array::from_fn(|i| slots[i].as_ref().map(|s| (s.root_logical, s.first_key)));
+            let victim =
+                btrfs_floor_memo_reuse_slot(&identities, fresh.root_logical, &fresh.first_key)
+                    .unwrap_or_else(|| {
+                        self.btrfs_floor_memo_next_slot
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            % BTRFS_FLOOR_MEMO_SLOTS
+                    });
             slots[victim] = Some(fresh);
         }
         Ok(entry)
@@ -57152,6 +57194,77 @@ mod tests {
         assert!(
             !std::env::var("FFS_BTRFS_FLOOR_MEMO_DEFINITELY_UNSET_KEY").is_ok_and(|_| true),
             "sanity: an unset variable must not read as set"
+        );
+    }
+
+    /// bd-yu6jz: slot replacement must refresh a leaf IN PLACE before taking an
+    /// empty slot — this is a regression test for a bug, not a style preference.
+    ///
+    /// The original order was empty-first, and it was wrong in the one case the
+    /// four slots exist for. A floor descent returns the greatest key `<= target`,
+    /// so a probe for a key BEYOND the reached leaf's last key — an absent
+    /// XATTR_ITEM bucket, which is the usual answer for the capability probe —
+    /// resolves to that leaf and retains a span that does not contain the target.
+    /// Every repeat of the probe fails the span check, re-descends to the SAME
+    /// leaf, and asks for a slot again. Empty-first deals that one leaf into every
+    /// free slot and then evicts live neighbours: four slots collapse to one,
+    /// exactly on the workload the widening was for.
+    #[test]
+    fn btrfs_floor_memo_refreshes_in_place_before_taking_an_empty_slot_bd_yu6jz() {
+        let key = |objectid: u64| ffs_ondisk::btrfs::BtrfsKey {
+            objectid,
+            item_type: 1,
+            offset: 0,
+        };
+        let root = 4096_u64;
+
+        // THE REGRESSION. Slot 1 already holds this leaf while slots 0/2/3 are
+        // empty. Empty-first answered 0 and duplicated the leaf; the contract is 1.
+        let mut slots: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] =
+            [None; BTRFS_FLOOR_MEMO_SLOTS];
+        slots[1] = Some((root, key(100)));
+        assert_eq!(
+            btrfs_floor_memo_reuse_slot(&slots, root, &key(100)),
+            Some(1),
+            "a slot already holding this leaf must be refreshed in place, never duplicated \
+             into an empty slot"
+        );
+
+        // A leaf not present anywhere takes the FIRST empty slot.
+        assert_eq!(
+            btrfs_floor_memo_reuse_slot(&slots, root, &key(200)),
+            Some(0),
+            "an unseen leaf takes the lowest empty slot"
+        );
+
+        // Same first key but a different tree must NOT match — the two trees' key
+        // spaces are unrelated, so this has to fall through to an empty slot.
+        assert_eq!(
+            btrfs_floor_memo_reuse_slot(&slots, root + 16384, &key(100)),
+            Some(0),
+            "identity is (root_logical, first_key); a different root is a different leaf"
+        );
+
+        // Full and no match: the caller must evict, which is signalled by None
+        // rather than decided here.
+        // Written out rather than generated: if BTRFS_FLOOR_MEMO_SLOTS ever changes
+        // this stops compiling, which is the right way to find out.
+        let full: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] = [
+            Some((root, key(10))),
+            Some((root, key(11))),
+            Some((root, key(12))),
+            Some((root, key(13))),
+        ];
+        assert_eq!(
+            btrfs_floor_memo_reuse_slot(&full, root, &key(999)),
+            None,
+            "every slot live and none matching must ask the caller to evict"
+        );
+        // ...but a match in a FULL array still refreshes in place rather than evicting.
+        assert_eq!(
+            btrfs_floor_memo_reuse_slot(&full, root, &key(12)),
+            Some(2),
+            "a full memo must still refresh a leaf it already holds"
         );
     }
 
