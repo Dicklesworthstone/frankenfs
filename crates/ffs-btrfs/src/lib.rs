@@ -6899,6 +6899,58 @@ impl GrowthDevice {
     }
 }
 
+/// Reconstruct the chunk map from the in-memory chunk tree (bd-a136s).
+///
+/// The growth planner places a new chunk against the CURRENT map, so a commit
+/// that allocates two chunks needs the first to be visible when the second is
+/// placed. Reading the map back out of the tree gives that for free; the
+/// mount-time chunk list does not, and placing against a stale list puts the
+/// second chunk on top of the first.
+///
+/// # Errors
+/// Refuses if ANY CHUNK_ITEM fails to parse. ⚠️ Skipping it would be the
+/// dangerous choice: `DeviceOccupancy` derives what is occupied from this list,
+/// so a chunk that is dropped here reads as free space and the next allocation
+/// is placed on top of live data. An unparseable chunk means we do not know the
+/// layout, and not knowing must never present as room.
+pub fn chunk_entries_from_chunk_tree(
+    chunk_tree: &InMemoryCowBtrfsTree,
+) -> Result<Vec<BtrfsChunkEntry>, BtrfsMutationError> {
+    let mut out: Vec<BtrfsChunkEntry> = Vec::new();
+    let mut unparseable = false;
+    chunk_tree.range_with(
+        &BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        },
+        &BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        },
+        |key, value| {
+            if unparseable || key.item_type != BTRFS_ITEM_CHUNK_ITEM {
+                return;
+            }
+            match parse_chunk_item(value, key.offset) {
+                Ok(entry) => out.push(entry),
+                Err(_) => unparseable = true,
+            }
+        },
+    )?;
+    if unparseable {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "the chunk tree holds a CHUNK_ITEM that does not parse",
+        ));
+    }
+    // Ascending logical order, which is what `next_logical_chunk_start` and the
+    // occupancy derivation both read most naturally. The tree already yields
+    // this, so the sort is a cheap guarantee rather than a fix.
+    out.sort_unstable_by_key(|entry| entry.key.offset);
+    Ok(out)
+}
+
 /// Tree blocks a GROWING commit must budget for beyond its own trees.
 ///
 /// Serializing the chunk tree and the device tree ALLOCATES metadata, so a
@@ -19848,6 +19900,81 @@ mod tests {
         assert!(
             bigger_overhead > overhead,
             "a larger chunk tree must cost more to rewrite: {bigger_overhead} vs {overhead}"
+        );
+    }
+
+    /// bd-a136s. The growth planner places against the CURRENT chunk map, so the
+    /// map has to come back out of the tree — a commit that allocates two chunks
+    /// must see the first when placing the second, or it places on top of it.
+    #[test]
+    fn chunk_entries_round_trip_out_of_the_chunk_tree_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * MB);
+
+        // Inserted out of logical order, and with a DEV_ITEM in the tree that
+        // must not be mistaken for a chunk.
+        for logical in [64 * MB, 0, 32 * MB] {
+            let chunk = logical_chunk(
+                logical,
+                32 * MB,
+                BTRFS_BLOCK_GROUP_METADATA,
+                &[(1, logical + MB)],
+            );
+            chunk_tree
+                .insert(chunk.key, &chunk.to_item_bytes().expect("serialize"))
+                .expect("insert");
+        }
+
+        let entries = chunk_entries_from_chunk_tree(&chunk_tree).expect("read back");
+        assert_eq!(entries.len(), 3, "the DEV_ITEM must not be read as a chunk");
+        assert_eq!(
+            entries.iter().map(|e| e.key.offset).collect::<Vec<_>>(),
+            vec![0, 32 * MB, 64 * MB],
+            "ascending logical order regardless of insertion order"
+        );
+        assert_eq!(entries[1].length, 32 * MB);
+        assert_eq!(entries[1].stripes[0].offset, 32 * MB + MB);
+        assert_eq!(entries[1].stripes[0].devid, 1);
+
+        // An empty tree is not an error — it is a filesystem with no chunks,
+        // which the planner will refuse on its own terms.
+        let empty = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        assert!(chunk_entries_from_chunk_tree(&empty).expect("empty").is_empty());
+    }
+
+    /// bd-a136s. ⚠️ An unparseable CHUNK_ITEM must REFUSE, not be skipped.
+    /// `DeviceOccupancy` derives what is occupied from this list, so a dropped
+    /// chunk reads as free space and the next allocation lands on top of live
+    /// data. Not knowing the layout must never present as room.
+    #[test]
+    fn an_unparseable_chunk_item_refuses_the_whole_map_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        let good = logical_chunk(0, 32 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, MB)]);
+        chunk_tree
+            .insert(good.key, &good.to_item_bytes().expect("serialize"))
+            .expect("insert");
+        assert_eq!(
+            chunk_entries_from_chunk_tree(&chunk_tree).expect("good map").len(),
+            1
+        );
+
+        // A CHUNK_ITEM whose value is too short to be a chunk header.
+        chunk_tree
+            .insert(
+                BtrfsKey {
+                    objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+                    item_type: BTRFS_ITEM_CHUNK_ITEM,
+                    offset: 64 * MB,
+                },
+                &[0_u8; 8],
+            )
+            .expect("insert");
+        assert!(
+            chunk_entries_from_chunk_tree(&chunk_tree).is_err(),
+            "one unreadable chunk poisons the map — the alternative is placing a \
+             chunk on top of whatever it described"
         );
     }
 

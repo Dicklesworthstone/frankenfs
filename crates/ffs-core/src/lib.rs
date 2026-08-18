@@ -1741,6 +1741,13 @@ pub struct OpenFs {
     /// cancel by construction (bd-b9dug class C). Default off (fast path enabled),
     /// so an unset environment is byte-identical to the shipped behaviour.
     btrfs_xattr_memo_disabled: std::sync::atomic::AtomicBool,
+    /// Whether on-demand chunk allocation is enabled for this mount (bd-a136s).
+    ///
+    /// Read once at construction from `FFS_BTRFS_GROW_CHUNKS` rather than per
+    /// commit. Default OFF: growing writes on-disk structures `btrfs check` and
+    /// the kernel's mount path judge, and none of the path has ever run against
+    /// a real image.
+    btrfs_grow_chunks: std::sync::atomic::AtomicBool,
     /// Consecutive floor descents that found the retained leaf unusable (bd-79li3).
     ///
     /// The memo's SIGN depends on the workload. A sweep over consecutive
@@ -2011,6 +2018,37 @@ fn btrfs_floor_memo_disabled_from_env() -> bool {
     std::env::var("FFS_BTRFS_FLOOR_MEMO").is_ok_and(|value| {
         let value = value.trim();
         value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    })
+}
+
+/// Most chunks one commit may allocate before it stops trying (bd-a136s).
+///
+/// The loop plans, applies and re-asks; a shortfall that never shrinks would
+/// otherwise fill the device one chunk at a time. Eight covers any plausible
+/// demand — at the sizing policy's floor that is 64 MiB of new metadata for a
+/// single commit — while turning a runaway into a logged stop.
+const BTRFS_MAX_CHUNKS_PER_COMMIT: u32 = 8;
+
+/// Whether `FFS_BTRFS_GROW_CHUNKS` enables on-demand chunk allocation (bd-a136s).
+///
+/// ⚠️ OPT-IN, AND THE DEFAULT IS THE POINT. Growing a filesystem writes new
+/// CHUNK_ITEMs, DEV_EXTENTs, BLOCK_GROUP_ITEMs and a new `chunk_root` — on-disk
+/// structures `btrfs check` and the kernel's mount path judge, and which no
+/// amount of unit testing can validate. Every piece of the path is unit-tested
+/// and none of it has ever run against a real image, so it stays off until the
+/// acceptance gate on this bead passes: a kernel-verified fixture with a
+/// deliberately small metadata chunk, writes that today ENOSPC succeeding,
+/// `btrfs check` clean, and the KERNEL mounting the result and reading the files
+/// back.
+///
+/// Spelled the opposite way round from `FFS_BTRFS_FLOOR_MEMO` and
+/// `FFS_BTRFS_XATTR_MEMO` deliberately: those DISABLE a shipped fast path, so
+/// absent means on. This ENABLES an unproven one, so absent means off, and no
+/// value of it can turn a shipped behaviour off.
+fn btrfs_grow_chunks_from_env() -> bool {
+    std::env::var("FFS_BTRFS_GROW_CHUNKS").is_ok_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
     })
 }
 
@@ -5151,6 +5189,7 @@ impl OpenFs {
             btrfs_xattr_memo_disabled: std::sync::atomic::AtomicBool::new(
                 btrfs_xattr_memo_disabled_from_env(),
             ),
+            btrfs_grow_chunks: std::sync::atomic::AtomicBool::new(btrfs_grow_chunks_from_env()),
             btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32::new(0),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
@@ -29962,6 +30001,144 @@ impl OpenFs {
             "writeback_dag_built"
         );
 
+        // ── Grow the filesystem if this commit will not fit (bd-a136s) ──────
+        //
+        // ⚠️ HERE, AND NOWHERE LATER. This is after
+        // `remove_metadata_items_owned_by_roots` has PINNED the previous trees —
+        // so `allocatable_bytes` sees the space they still hold — and after the
+        // DAG node count is known, but before the first `alloc_metadata_for_tree`
+        // of the commit. Growing any later inserts a BLOCK_GROUP_ITEM into an
+        // extent tree the commit is already serializing and changes the very DAG
+        // whose count decided the demand. Kernel btrfs reserves up front for the
+        // same reason; a commit that discovers it is short half way through has
+        // no good move left.
+        //
+        // OPT-IN AND DEFAULT OFF (`FFS_BTRFS_GROW_CHUNKS`). Every piece below is
+        // unit-tested and none of it has ever run against a real image, so the
+        // shipped path is byte-identical to before until bd-a136s's acceptance
+        // gate passes.
+        //
+        // Every failure here SKIPS growth rather than failing the commit. A
+        // shortfall is a prediction; refusing the transaction on a prediction
+        // turns a maybe into a certainty. The allocator's own `NoSpace` stays the
+        // authority and `alloc_no_space_*` (c77d122d) reports why.
+        'grow: {
+            if !self.btrfs_grow_chunks_enabled() {
+                break 'grow;
+            }
+            // A partially loaded device tree makes every unread range look free,
+            // which would place a chunk on top of live data (bd-ftev0's shape).
+            if !alloc.chunk_trees_authoritative {
+                break 'grow;
+            }
+            let mut device =
+                match ffs_btrfs::GrowthDevice::from_chunk_tree(&alloc.chunk_tree, sb.fsid) {
+                Ok(device) => device,
+                Err(e) => {
+                    // No DEV_ITEM, or more than one device: a filesystem this
+                    // code cannot describe is one it must not grow.
+                    warn!(
+                        target: "ffs::btrfs::alloc",
+                        error = ?e,
+                        "growth_unavailable_for_this_filesystem"
+                    );
+                    break 'grow;
+                }
+            };
+            // The map the planner places against, read back from the tree so a
+            // chunk allocated earlier in THIS loop is visible when the next one
+            // is placed. The mount-time list would not show it, and placing
+            // against a stale list puts the second chunk on top of the first.
+            let mut chunks = match ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree) {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    warn!(
+                        target: "ffs::btrfs::alloc",
+                        error = ?e,
+                        "growth_skipped_unreadable_chunk_map"
+                    );
+                    break 'grow;
+                }
+            };
+            let overhead =
+                match ffs_btrfs::growth_overhead_nodes(&alloc.chunk_tree, &alloc.dev_tree, new_gen)
+                {
+                    Ok(overhead) => overhead,
+                    Err(e) => {
+                        warn!(target: "ffs::btrfs::alloc", error = ?e, "growth_overhead_unknown");
+                        break 'grow;
+                    }
+                };
+            // The commit's own trees PLUS the chunk and device trees a growing
+            // commit also rewrites — without the second term a chunk allocation
+            // can require a chunk allocation.
+            let demand = u64::try_from(node_count)
+                .unwrap_or(u64::MAX)
+                .saturating_add(overhead);
+            let policy = ffs_btrfs::ChunkSizePolicy::default();
+            let mut grown = 0_u32;
+            while grown < BTRFS_MAX_CHUNKS_PER_COMMIT {
+                let plan = match ffs_btrfs::plan_growth_for_commit(
+                    &alloc.extent_alloc,
+                    &chunks,
+                    demand,
+                    u64::from(nodesize),
+                    &device,
+                    &policy,
+                ) {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(
+                            target: "ffs::btrfs::alloc",
+                            error = ?e,
+                            demand,
+                            grown,
+                            "growth_could_not_satisfy_the_commit"
+                        );
+                        break;
+                    }
+                };
+                let bytes_used_after = plan.dev_bytes_used_after;
+                let new_chunk = plan.chunk.clone();
+                // Reborrow ONCE and split the fields off that: three separate
+                // `&mut alloc.field` expressions would each call `deref_mut` on
+                // the guard, which is three mutable borrows of the same value.
+                let state = &mut *alloc;
+                let applied = ffs_btrfs::apply_chunk_allocation(
+                    &plan,
+                    &mut state.chunk_tree,
+                    &mut state.dev_tree,
+                    &mut state.extent_alloc,
+                    None,
+                );
+                if let Err(e) = applied {
+                    warn!(target: "ffs::btrfs::alloc", error = ?e, "growth_apply_refused");
+                    break;
+                }
+                state.chunk_trees_dirty = true;
+                device.bytes_used = bytes_used_after;
+                chunks.push(new_chunk);
+                grown = grown.saturating_add(1);
+            }
+            if grown >= BTRFS_MAX_CHUNKS_PER_COMMIT {
+                warn!(
+                    target: "ffs::btrfs::alloc",
+                    grown,
+                    demand,
+                    "growth_hit_the_per_commit_chunk_cap"
+                );
+            }
+            if grown > 0 {
+                info!(
+                    target: "ffs::btrfs::alloc",
+                    grown,
+                    demand,
+                    "grew_the_filesystem_to_fit_the_commit"
+                );
+            }
+        }
+
         // Pre-allocate logical addresses for each node from the chunk-tree-covered
         // metadata block groups. This fixes the addressing gap where placeholder
         // addresses (block * nodesize) are not covered by any chunk.
@@ -35973,6 +36150,21 @@ impl OpenFs {
             }
         }
         out
+    }
+
+    /// Whether this mount may grow the filesystem by allocating chunks
+    /// (bd-a136s). Default off; see `btrfs_grow_chunks_from_env`.
+    #[must_use]
+    pub fn btrfs_grow_chunks_enabled(&self) -> bool {
+        self.btrfs_grow_chunks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only override for [`Self::btrfs_grow_chunks_enabled`], so the
+    /// acceptance gate can enable growth without an environment variable.
+    pub fn set_btrfs_grow_chunks(&self, enabled: bool) {
+        self.btrfs_grow_chunks
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_btrfs_floor_memo_disabled(&self, disabled: bool) {
