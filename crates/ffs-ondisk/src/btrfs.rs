@@ -1608,6 +1608,79 @@ impl BtrfsChunkEntry {
     }
 }
 
+impl BtrfsSuperblock {
+    /// Append a SYSTEM chunk to the `sys_chunk_array` (bd-a136s).
+    ///
+    /// The kernel bootstraps the chunk tree from this array alone: before any
+    /// tree is readable it must already be able to map the chunk tree's own
+    /// logical address to a physical one. So a newly allocated SYSTEM chunk that
+    /// never reaches this array leaves a filesystem that mounts today, from the
+    /// old array, and fails the moment the chunk tree grows into the new chunk.
+    ///
+    /// Only system chunks belong here, and that is enforced rather than assumed.
+    /// The array is 2048 bytes TOTAL for the life of the filesystem, so spending
+    /// any of it on a metadata or data chunk — which live in the chunk tree and
+    /// are found by walking it — is not merely redundant, it consumes a resource
+    /// that cannot be reclaimed without a rewrite.
+    ///
+    /// # Errors
+    /// Returns [`ParseError::InvalidField`] when the entry is not a system chunk,
+    /// when the array has no room, or when the entry itself will not serialize.
+    ///
+    /// ⚠️ THE FULL-ARRAY CASE MUST REFUSE, and this is why it is a hard error
+    /// rather than a best-effort append: [`Self::to_bytes`] clamps the array with
+    /// `.min(BTRFS_SYS_CHUNK_ARRAY_MAX)`, so an oversized array is silently
+    /// TRUNCATED on the way to disk — mid-entry, since entries are 97+ bytes and
+    /// nothing aligns them to the limit. That produces a superblock whose array
+    /// ends in a partial chunk, which is an unmountable filesystem rather than a
+    /// dropped chunk. Refusing here is what keeps that path unreachable.
+    pub fn append_sys_chunk_entry(&mut self, entry: &BtrfsChunkEntry) -> Result<(), ParseError> {
+        if entry.chunk_type & chunk_type_flags::BTRFS_BLOCK_GROUP_SYSTEM == 0 {
+            return Err(ParseError::InvalidField {
+                field: "sys_chunk_array",
+                reason: "only SYSTEM chunks belong in the superblock chunk array",
+            });
+        }
+        let bytes = entry.to_bytes()?;
+        let new_len = self
+            .sys_chunk_array
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(ParseError::InvalidField {
+                field: "sys_chunk_array",
+                reason: "array length overflow",
+            })?;
+        if new_len > BTRFS_SYS_CHUNK_ARRAY_MAX {
+            return Err(ParseError::InvalidField {
+                field: "sys_chunk_array",
+                reason: "no room for another system chunk",
+            });
+        }
+        self.sys_chunk_array.extend_from_slice(&bytes);
+        // `sys_chunk_array_size` is a SEPARATE field from the array itself, and
+        // leaving it stale would make the in-memory superblock disagree with its
+        // own array. `to_bytes` derives the on-disk size field from the array's
+        // length so the written superblock would still be right, which is
+        // exactly what makes a stale field here easy to miss: only a reader of
+        // the parsed struct sees it. `new_len` is already bounded by
+        // `BTRFS_SYS_CHUNK_ARRAY_MAX`, so the conversion cannot fail.
+        self.sys_chunk_array_size =
+            u32::try_from(new_len).map_err(|_| ParseError::IntegerConversion {
+                field: "sys_chunk_array_size",
+            })?;
+        Ok(())
+    }
+
+    /// Bytes still free in the `sys_chunk_array`.
+    ///
+    /// A caller sizing a system chunk needs this BEFORE it allocates: the chunk
+    /// is useless if it cannot be recorded, and by then the space is committed.
+    #[must_use]
+    pub fn sys_chunk_array_free(&self) -> usize {
+        BTRFS_SYS_CHUNK_ARRAY_MAX.saturating_sub(self.sys_chunk_array.len())
+    }
+}
+
 // ── Device space accounting for chunk allocation (bd-a136s) ────────────────
 
 /// The physical ranges of one device that existing chunks already occupy,
@@ -2828,6 +2901,126 @@ mod tests {
         // An empty device is one free run of everything above the reserved head.
         let empty = DeviceOccupancy::default();
         assert_eq!(empty.largest_free_run(MB, DEV), DEV - MB);
+    }
+
+    /// bd-a136s. Appending a system chunk to the superblock array must produce an
+    /// array the PARSER still reads, with the existing entry untouched.
+    ///
+    /// This is the highest-stakes write in chunk allocation: the kernel maps the
+    /// chunk tree's own logical address through this array before any tree is
+    /// readable, so a malformed array is not a lost chunk, it is a filesystem
+    /// that will not mount.
+    #[test]
+    fn appending_a_system_chunk_keeps_the_array_parseable_bd_a136s() {
+        use chunk_type_flags::{BTRFS_BLOCK_GROUP_METADATA, BTRFS_BLOCK_GROUP_SYSTEM};
+        const MB: u64 = 1024 * 1024;
+
+        let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+            .expect("sb parse");
+        let original = sb.sys_chunk_array.clone();
+        assert_eq!(original.len(), 97);
+
+        let entry = chunk_at(
+            32 * MB,
+            8 * MB,
+            BTRFS_BLOCK_GROUP_SYSTEM,
+            &[(1, 24 * MB)],
+        );
+        sb.append_sys_chunk_entry(&entry).expect("append");
+
+        // The existing entry is byte-for-byte untouched — an append that rewrote
+        // or shifted it would still parse, and would remap live data.
+        assert_eq!(&sb.sys_chunk_array[..97], &original[..]);
+        assert_eq!(sb.sys_chunk_array.len(), 97 + entry.encoded_len());
+        // The size FIELD must track the array, or a reader of the parsed struct
+        // sees a superblock that disagrees with itself. `to_bytes` derives the
+        // on-disk value from the array length, so only this in-memory field can
+        // go stale — which is what makes it easy to miss.
+        assert_eq!(
+            sb.sys_chunk_array_size as usize,
+            sb.sys_chunk_array.len(),
+            "sys_chunk_array_size must track the array it describes"
+        );
+
+        // And the whole array still parses, into both entries in order.
+        let entries = parse_sys_chunk_array(&sb.sys_chunk_array).expect("reparse");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key.offset, 0x100_0000);
+        assert_eq!(entries[1], entry, "the appended entry must round-trip exactly");
+
+        // Through the real superblock writer and back. If THIS assertion is the
+        // one that fails, look at `to_bytes`/`parse_superblock_region` rather
+        // than at the append — the array assertions above already passed.
+        let rebuilt = BtrfsSuperblock::parse_superblock_region(&sb.to_bytes())
+            .expect("superblock round-trip");
+        assert_eq!(rebuilt.sys_chunk_array, sb.sys_chunk_array);
+        assert_eq!(
+            parse_sys_chunk_array(&rebuilt.sys_chunk_array)
+                .expect("reparse after round-trip")
+                .len(),
+            2
+        );
+
+        // Non-system chunks are refused. They live in the chunk tree and are
+        // found by walking it; the array is 2048 bytes for the life of the
+        // filesystem and cannot be reclaimed without a rewrite.
+        let metadata = chunk_at(64 * MB, 8 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 40 * MB)]);
+        assert!(
+            sb.append_sys_chunk_entry(&metadata).is_err(),
+            "only SYSTEM chunks belong in the superblock array"
+        );
+    }
+
+    /// bd-a136s. A full array must REFUSE, not truncate.
+    ///
+    /// `BtrfsSuperblock::to_bytes` clamps the array with
+    /// `.min(BTRFS_SYS_CHUNK_ARRAY_MAX)`, so an oversized array is silently cut
+    /// on the way to disk — and cut MID-ENTRY, since entries are 97 bytes and
+    /// nothing aligns them to 2048. The result is a superblock whose array ends
+    /// in a partial chunk: an unmountable filesystem, not a dropped chunk. This
+    /// test is what keeps that path unreachable from the supported API.
+    #[test]
+    fn a_full_sys_chunk_array_refuses_rather_than_truncating_bd_a136s() {
+        use chunk_type_flags::BTRFS_BLOCK_GROUP_SYSTEM;
+        const MB: u64 = 1024 * 1024;
+
+        let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+            .expect("sb parse");
+        sb.sys_chunk_array.clear();
+        assert_eq!(sb.sys_chunk_array_free(), 2048);
+
+        // Fill it. Each entry is 97 bytes, so 21 fit (2037) and the 22nd does not.
+        let mut appended = 0_u64;
+        loop {
+            let entry = chunk_at(
+                (appended + 1) * 32 * MB,
+                8 * MB,
+                BTRFS_BLOCK_GROUP_SYSTEM,
+                &[(1, (appended + 1) * 8 * MB)],
+            );
+            if sb.append_sys_chunk_entry(&entry).is_err() {
+                break;
+            }
+            appended += 1;
+            assert!(appended < 64, "the array must fill and refuse, not grow forever");
+        }
+
+        assert_eq!(appended, 21_u64, "97-byte entries: 21 fit in 2048 bytes");
+        assert!(
+            sb.sys_chunk_array.len() <= 2048,
+            "the array must never exceed the on-disk limit, since to_bytes would \
+             truncate it mid-entry rather than reject it"
+        );
+        assert_eq!(sb.sys_chunk_array_free(), 2048 - 21 * 97);
+
+        // What is there still parses — a refusal must not have left a partial
+        // entry behind.
+        assert_eq!(
+            parse_sys_chunk_array(&sb.sys_chunk_array)
+                .expect("a refused append must leave the array intact")
+                .len(),
+            21
+        );
     }
 
     fn representative_sys_chunk_superblock() -> [u8; BTRFS_SUPER_INFO_SIZE] {
