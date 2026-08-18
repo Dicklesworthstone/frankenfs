@@ -5523,8 +5523,25 @@ mod tests {
             sb.sys_chunk_array_size = stale_size;
             sb.sys_chunk_array = sys_chunk_array;
 
+            // bd-q4qr8: an array LONGER than the on-disk limit is now REFUSED, not
+            // silently truncated. This branch is the half of the old assertion that
+            // encoded the corruption: entries are 97 bytes and nothing aligns them
+            // to 2048, so clamping cut mid-entry and produced a superblock whose
+            // array ends in a partial disk key — which the kernel, bootstrapping
+            // the chunk map from this array alone, reads as "not a btrfs
+            // filesystem". bd-6wubw's actual property (the size field describes the
+            // payload emitted, not a stale struct field) is unaffected and is still
+            // asserted below for every representable array.
+            if sb.sys_chunk_array.len() > BTRFS_SYS_CHUNK_ARRAY_MAX {
+                prop_assert!(
+                    sb.to_bytes().is_err(),
+                    "an oversized sys_chunk_array must refuse rather than truncate"
+                );
+                return Ok(());
+            }
+
             let serialized = sb.to_bytes().expect("superblock serializes");
-            let expected_len = sb.sys_chunk_array.len().min(BTRFS_SYS_CHUNK_ARRAY_MAX);
+            let expected_len = sb.sys_chunk_array.len();
             let expected_size =
                 u32::try_from(expected_len).expect("sys_chunk_array max fits in u32");
             let serialized_size = u32::from_le_bytes(
