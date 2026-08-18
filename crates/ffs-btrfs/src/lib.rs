@@ -11523,6 +11523,39 @@ pub struct TreeLogReplayResult {
     pub foreign_format: bool,
 }
 
+/// Build the ROOT_ITEM that a log ROOT TREE holds for one subvolume's log
+/// (bd-jhuob).
+///
+/// The kernel puts a log ROOT TREE at the superblock's `log_root`: a tree whose
+/// items are ROOT_ITEMs, one per subvolume that has a log, each pointing at that
+/// subvolume's own log tree. `replay_tree_log` already reads that shape; this is
+/// the other half, for a writer that must EMIT it.
+///
+/// ⚠️ THE GENERATION IS THE TRANSACTION'S, NOT THE SUPERBLOCK'S. The kernel reads
+/// the log tree root expecting `generation + 1` — "We always use generation + 1
+/// to read log tree root", `linux/btrfs_tree.h:682`, which is on this box and was
+/// checked rather than assumed. Our writer already bumps the generation before
+/// serializing the log leaf, so the value passed here is that bumped one, and the
+/// ROOT_ITEM must carry the SAME number as the block it points at or a reader
+/// sees a transid mismatch on the first thing it dereferences.
+///
+/// `refs` is 1 — a log root is referenced by exactly the log root tree — and
+/// `root_dirid` is 0, because a log has no directory of its own.
+#[must_use]
+pub fn tree_log_root_item(log_tree_bytenr: u64, level: u8, generation: u64) -> Vec<u8> {
+    BtrfsRootItem {
+        bytenr: log_tree_bytenr,
+        level,
+        generation,
+        root_dirid: 0,
+        flags: 0,
+        refs: 1,
+        uuid: [0; 16],
+        parent_uuid: [0; 16],
+    }
+    .to_bytes()
+}
+
 /// Replay the btrfs tree-log if present.
 ///
 /// Checks the superblock for a non-zero `log_root`. If present, walks the
@@ -20421,6 +20454,53 @@ mod tests {
             .expect("no shortfall")
             .is_none()
         );
+    }
+
+    /// bd-jhuob. The writer's log ROOT_ITEM must be readable by the reader that
+    /// will follow it — `replay_tree_log` extracts the log tree's address from
+    /// exactly this blob, so the two halves are tested against each other rather
+    /// than each against its own idea of the layout.
+    #[test]
+    fn a_log_root_item_points_where_replay_will_look_bd_jhuob() {
+        let log_tree = 0x4321_0000_u64;
+        let generation = 99_u64;
+        let item = tree_log_root_item(log_tree, 0, generation);
+        assert_eq!(item.len(), BTRFS_ROOT_ITEM_SIZE);
+
+        // The exact bytes `replay_tree_log` reads to find the log tree.
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(&item[176..184]);
+        assert_eq!(
+            u64::from_le_bytes(raw),
+            log_tree,
+            "replay reads the log tree address from offset 176"
+        );
+        assert_eq!(item[238], 0, "level, read from offset 238");
+
+        // ⚠️ The generation must match the block the item points at. The kernel
+        // reads the log tree root expecting generation + 1 (btrfs_tree.h:682) and
+        // our writer bumps the generation before serializing the leaf, so a
+        // ROOT_ITEM carrying anything else is a transid mismatch on the first
+        // dereference.
+        let mut gen_raw = [0_u8; 8];
+        gen_raw.copy_from_slice(&item[160..168]);
+        assert_eq!(u64::from_le_bytes(gen_raw), generation);
+        let mut gen_v2 = [0_u8; 8];
+        gen_v2.copy_from_slice(&item[239..247]);
+        assert_eq!(
+            u64::from_le_bytes(gen_v2),
+            generation,
+            "generation_v2 must agree, or the uuid fields read as invalid"
+        );
+
+        // A log root is referenced once, by the log root tree, and owns no
+        // directory.
+        let mut refs = [0_u8; 4];
+        refs.copy_from_slice(&item[216..220]);
+        assert_eq!(u32::from_le_bytes(refs), 1);
+        let mut dirid = [0_u8; 8];
+        dirid.copy_from_slice(&item[168..176]);
+        assert_eq!(u64::from_le_bytes(dirid), 0);
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
