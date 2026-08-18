@@ -13029,6 +13029,31 @@ impl OpenFs {
         objectids.sort_unstable();
         objectids.dedup();
 
+        // The capability probe descends to a DIFFERENT key than getattr does, and
+        // warming only getattr's key leaves the more expensive half cold. Linux
+        // issues one uncached getxattr(security.capability) per path-based
+        // metadata op, so on this workload that probe runs once per entry —
+        // against `(objectid, XATTR_ITEM, hash("security.capability"))`, while
+        // getattr reads `(objectid, INODE_ITEM, 0)`.
+        //
+        // Usually those two keys sit in the SAME leaf: they share an objectid and
+        // their types sort adjacently within one inode's items, so the second
+        // descent is answered by the leaf the first just retained and costs
+        // nothing. The case worth warming is the other one — an inode whose items
+        // straddle a leaf boundary between the two types — because there the probe
+        // pays a cold root-to-leaf descent that nothing else in this sweep would
+        // have fetched.
+        //
+        // Gated on exactly the condition `btrfs_getxattr` uses to take its floor
+        // path. With a pending tree log it uses the range walker instead, which
+        // does not consult the retained-leaf memo, so warming for it would be work
+        // that can never be collected.
+        let probe_hash = (!self
+            .btrfs_xattr_memo_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.btrfs_tree_log_items.is_empty())
+        .then(|| u64::from(ffs_btrfs::btrfs_name_hash(b"security.capability")));
+
         for canonical in objectids {
             if self.btrfs_read_ondisk_inode_item(cx, canonical).is_err() {
                 // A warm-up must never turn a readable directory into a failed
@@ -13037,6 +13062,18 @@ impl OpenFs {
                     inode = canonical,
                     "btrfs readdir inode-leaf prefetch skipped inode"
                 );
+                continue;
+            }
+            if let Some(offset) = probe_hash {
+                let probe_key = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_XATTR_ITEM,
+                    offset,
+                };
+                // Result discarded on purpose: this asks the tree a question only
+                // to leave the answer's leaf resident. Whether the attribute
+                // exists is decided by the real probe, from the same leaf.
+                let _ = self.walk_btrfs_fs_tree_floor(cx, probe_key);
             }
         }
     }
