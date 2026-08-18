@@ -1108,6 +1108,19 @@ struct BtrfsAllocState {
     nodesize: u32,
     /// Sector size in bytes (copied from superblock for convenience).
     sectorsize: u32,
+    /// bd-dm01m: every inode fsync'd through the tree-log path since the last full
+    /// commit.
+    ///
+    /// The tree log is ONE leaf whose `log_root` REPLACES the previous one, so
+    /// logging only the inode being fsync'd made every earlier fsync in the same
+    /// transaction unreachable: `fsync(A)` then `fsync(B)` left a log containing only
+    /// B, and a crash lost A's data even though its fsync had returned success.
+    /// Accumulating the set here and re-serializing all of them keeps every
+    /// acknowledged fsync reachable from the one log root.
+    ///
+    /// Cleared by a full transaction commit, which supersedes the log entirely (see
+    /// the `log_root` retirement in `btrfs_commit_writeback`, bd-mogn1).
+    btrfs_logged_inodes: std::collections::BTreeSet<u64>,
     /// bd-42gtq: in-memory block id -> on-disk bytenr, for every tree block this
     /// mount has ALREADY written, keyed by tree objectid.
     ///
@@ -8645,6 +8658,8 @@ impl OpenFs {
             // Empty on purpose: the tree was just rebuilt from items, so no block
             // id in it corresponds to anything on disk yet (bd-42gtq).
             written_tree_blocks: std::collections::HashMap::new(),
+            // No fsync has been logged in this mount yet (bd-dm01m).
+            btrfs_logged_inodes: std::collections::BTreeSet::new(),
         })
     }
 
@@ -29188,7 +29203,40 @@ impl OpenFs {
         alloc: &mut BtrfsAllocState,
         canonical: u64,
     ) -> Result<(Vec<u8>, Vec<u8>, BtrfsTreeLogWriteStats), FfsError> {
-        let items = Self::btrfs_collect_tree_log_items(alloc, canonical)?;
+        // bd-dm01m: log EVERY inode fsync'd since the last full commit, not just this
+        // one. `log_root` replaces the previous log rather than chaining to it, so a
+        // log holding only the current inode makes every earlier fsync in this
+        // transaction unreachable — `fsync(A)` then `fsync(B)` lost A on a crash even
+        // though its fsync returned success.
+        alloc.btrfs_logged_inodes.insert(canonical);
+        let logged: Vec<u64> = alloc.btrfs_logged_inodes.iter().copied().collect();
+        let mut items = Vec::new();
+        for inode in logged {
+            items.extend(Self::btrfs_collect_tree_log_items(alloc, inode)?);
+        }
+
+        // A tree log is ONE leaf here, so it has a hard capacity. Refusing at the
+        // boundary is the only safe direction: silently dropping items would be the
+        // acknowledged-then-lost failure this whole change exists to remove, and
+        // writing an oversized leaf fails at serialize and takes the fsync with it.
+        // The caller turns this into a FULL COMMIT, which is always correct — it
+        // supersedes the log and clears the accumulator — and is exactly what kernel
+        // btrfs does when its log cannot be used.
+        // Fully qualified: neither constant is imported bare into this crate — the
+        // only other use in this file is `ffs_btrfs::BTRFS_HEADER_SIZE`.
+        let leaf_budget =
+            (alloc.nodesize as usize).saturating_sub(ffs_btrfs::BTRFS_HEADER_SIZE);
+        let leaf_bytes: usize = items
+            .iter()
+            .map(|it| ffs_btrfs::BTRFS_ITEM_SIZE + it.data.len())
+            .sum();
+        if leaf_bytes > leaf_budget {
+            return Err(FfsError::UnsupportedFeature(
+                "btrfs tree log: accumulated fsync items exceed one leaf;                  the caller must fall back to a full transaction commit"
+                    .into(),
+            ));
+        }
+
         let (log_root, allocated_bytes, metadata_allocation) =
             Self::btrfs_allocate_tree_log_block(alloc)?;
         alloc.generation = alloc.generation.checked_add(1).ok_or_else(|| {
@@ -29391,7 +29439,29 @@ impl OpenFs {
                     "mvcc_flush_before_sync"
                 );
             }
-            let tree_log = self.btrfs_write_tree_log_for_sync(cx, ino)?;
+            // bd-dm01m: when the accumulated fsync set no longer fits one log leaf,
+            // fall back to a FULL COMMIT rather than failing the fsync or dropping
+            // items. A full commit supersedes the log and clears the accumulator, so
+            // the next fsync starts a fresh log — which is precisely what kernel
+            // btrfs does when its log cannot be used.
+            let tree_log = match self.btrfs_write_tree_log_for_sync(cx, ino) {
+                Ok(stats) => stats,
+                Err(FfsError::UnsupportedFeature(_)) => {
+                    info!(
+                        target: "ffs::btrfs::rw",
+                        operation_id = %operation_id,
+                        scenario_id,
+                        outcome = "applied",
+                        ino = ino.0,
+                        datasync,
+                        commit_strategy = "full_commit_log_overflow_fallback",
+                        "btrfs_sync_applied"
+                    );
+                    self.btrfs_full_transaction_commit(cx, &operation_id)?;
+                    return Ok(());
+                }
+                Err(other) => return Err(other),
+            };
 
             match self.dev.sync(cx) {
                 Ok(()) => {
@@ -30359,6 +30429,13 @@ impl OpenFs {
 
         // Update alloc state generation
         alloc.generation = new_gen;
+        // bd-dm01m: this commit supersedes the tree log, so the accumulated fsync set
+        // starts over. Cleared here rather than at the superblock patch because this
+        // is where the commit becomes authoritative in memory, and it must be cleared
+        // on every commit path — a stale accumulator would keep re-logging inodes
+        // whose items are already committed, growing the log for no reason and
+        // reintroducing the overflow this change bounds.
+        alloc.btrfs_logged_inodes.clear();
 
         // bd-x36qn / bd-myrgc / bd-k74ef: the extent tree and the root tree are
         // self-describing by the time we get here — every block of both, not
