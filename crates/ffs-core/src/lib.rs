@@ -2066,6 +2066,46 @@ fn btrfs_floor_memo_span_answers(
         && ffs_btrfs::key_cmp(target, last_key) != std::cmp::Ordering::Greater
 }
 
+/// What the floor-leaf memo actually costs in resident memory (bd-5vis3).
+///
+/// bd-5vis3 requires its lever to report added resident memory, on the stated
+/// grounds that "a design that quietly regrows is the failure mode this bead
+/// exists to catch". Nothing reported it, and widening the memo from one slot to
+/// [`BTRFS_FLOOR_MEMO_SLOTS`] multiplied the thing that was never being watched.
+///
+/// The split between the two byte figures is the whole point, and it is not a
+/// hedge. A `BtrfsParsedNode::Leaf` owns its block as an `Arc<Vec<u8>>`, and the
+/// memo retains a CLONE of the same `Arc` that `btrfs_parsed_node_cache` holds —
+/// so on a hot sweep the memo's marginal cost is a refcount, not a nodesize
+/// buffer, and charging it the full block would overstate it several-fold.
+/// `exclusive_bytes` counts only slots the memo is the sole owner of, which is
+/// the memory that would actually be returned if the memo were removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BtrfsFloorMemoFootprint {
+    /// Slots currently holding a leaf. Bounded by [`BTRFS_FLOOR_MEMO_SLOTS`] by
+    /// construction — the memo is a fixed-size array, not a growable map.
+    pub retained_leaves: usize,
+    /// Heap bytes held ONLY by the memo: slots whose `Arc` has no other owner.
+    /// This is the memo's true marginal footprint.
+    pub exclusive_bytes: usize,
+    /// Heap bytes reachable from the memo, counting shared blocks in full. An
+    /// upper bound, and the figure to quote when being conservative.
+    pub upper_bound_bytes: usize,
+}
+
+/// Heap bytes owned by one parsed node, excluding the enum itself.
+///
+/// Uses `size_of_val` on the slices rather than naming the item types, so this
+/// cannot silently go stale if either item struct changes shape.
+fn btrfs_parsed_node_heap_bytes(node: &BtrfsParsedNode) -> usize {
+    match node {
+        BtrfsParsedNode::Leaf { block, items } => {
+            block.len() + std::mem::size_of_val(items.as_slice())
+        }
+        BtrfsParsedNode::Internal { ptrs } => std::mem::size_of_val(ptrs.as_slice()),
+    }
+}
+
 const BTRFS_TREE_NODE_CACHE_LIMIT: usize = 512;
 
 /// Diagnostic counters for the read-only btrfs tree-node cache (bd-5vis3).
@@ -35522,6 +35562,37 @@ impl OpenFs {
             .store(disabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Report what the floor-leaf memo is holding (bd-5vis3).
+    ///
+    /// `pub` on purpose: bd-5vis3 will not accept the leaf-memo lever on a
+    /// speedup alone — it requires the added resident memory alongside it, and
+    /// the instrument that has to print that number (`ffs-cli walk`) lives in
+    /// another crate. A figure nobody outside this module can read is not a
+    /// reported figure.
+    ///
+    /// Cheap enough to call between phases of a measurement: one uncontended
+    /// mutex and at most [`BTRFS_FLOOR_MEMO_SLOTS`] slot inspections, no
+    /// allocation and no I/O.
+    #[must_use]
+    pub fn btrfs_floor_memo_footprint(&self) -> BtrfsFloorMemoFootprint {
+        let slots = self.btrfs_floor_leaf_memo.lock();
+        let mut out = BtrfsFloorMemoFootprint::default();
+        for slot in slots.iter().flatten() {
+            out.retained_leaves += 1;
+            let bytes = btrfs_parsed_node_heap_bytes(&slot.leaf);
+            out.upper_bound_bytes += bytes;
+            // Sole ownership means removing the memo would actually return these
+            // bytes. Counted under the lock while only borrowing `slot.leaf`, so
+            // this call contributes no reference of its own to the count — a
+            // clone here would make every slot look shared and silently report
+            // zero exclusive bytes forever.
+            if Arc::strong_count(&slot.leaf) == 1 {
+                out.exclusive_bytes += bytes;
+            }
+        }
+        out
+    }
+
     pub fn set_btrfs_floor_memo_disabled(&self, disabled: bool) {
         self.btrfs_floor_memo_disabled
             .store(disabled, std::sync::atomic::Ordering::Relaxed);
@@ -57081,6 +57152,102 @@ mod tests {
         assert!(
             !std::env::var("FFS_BTRFS_FLOOR_MEMO_DEFINITELY_UNSET_KEY").is_ok_and(|_| true),
             "sanity: an unset variable must not read as set"
+        );
+    }
+
+    /// bd-5vis3: the memo's marginal cost must be the refcount, not the block.
+    ///
+    /// The bead requires added resident memory to be reported and names "a design
+    /// that quietly regrows" as the failure it exists to catch. The claim that
+    /// makes the memo cheap is that its leaves are the SAME `Arc`s the parsed-node
+    /// cache already holds, so sharing must be measured rather than assumed — a
+    /// shared leaf costs nothing extra, an exclusively-held one costs a whole
+    /// block.
+    #[test]
+    fn btrfs_floor_memo_footprint_counts_sharing_bd_5vis3() {
+        const NODESIZE: usize = 16384;
+        let block = Arc::new(vec![0_u8; NODESIZE]);
+        let leaf = BtrfsParsedNode::Leaf {
+            block: Arc::clone(&block),
+            items: Vec::new(),
+        };
+        // An empty item vec contributes nothing, so the block dominates and the
+        // arithmetic is checkable exactly.
+        assert_eq!(btrfs_parsed_node_heap_bytes(&leaf), NODESIZE);
+
+        // An Internal node retains no block at all — it is pointers only, which is
+        // why the memo deliberately retains LEAVES.
+        let internal = BtrfsParsedNode::Internal { ptrs: Vec::new() };
+        assert_eq!(btrfs_parsed_node_heap_bytes(&internal), 0);
+
+        // Sole ownership vs shared, which is the distinction the accessor reports.
+        let only = Arc::new(BtrfsParsedNode::Leaf {
+            block: Arc::new(vec![0_u8; NODESIZE]),
+            items: Vec::new(),
+        });
+        assert_eq!(Arc::strong_count(&only), 1, "a fresh Arc must be unshared");
+        let shared = Arc::clone(&only);
+        assert_eq!(
+            Arc::strong_count(&only),
+            2,
+            "a second owner must make it shared, which is the case that costs the memo nothing"
+        );
+        drop(shared);
+        assert_eq!(Arc::strong_count(&only), 1);
+    }
+
+    /// bd-5vis3: the memo is bounded BY CONSTRUCTION, and this pins that in a test
+    /// rather than in a comment.
+    ///
+    /// The bead's whole objection to the read-plan index was memory proportional to
+    /// the filesystem. The defence is that the memo is a fixed-size array, so it
+    /// cannot grow with the image no matter how large the tree or how long the
+    /// sweep. A future widening should have to change this number deliberately.
+    #[test]
+    fn btrfs_floor_memo_retention_is_bounded_bd_5vis3() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"aaa.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"bbb.txt", 258, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"ccc.txt", 259, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+
+        // Nothing descended yet, so nothing is retained.
+        let cold = fs.btrfs_floor_memo_footprint();
+        assert_eq!(
+            cold.retained_leaves, 0,
+            "a mount that has not descended must retain no leaf"
+        );
+        assert_eq!(cold.upper_bound_bytes, 0);
+
+        // Drive real descents through the ordinary read path.
+        let ops: &dyn FsOps = &fs;
+        let listing = ops
+            .readdir(&cx, &mut RequestScope::empty(), InodeNumber(1), 0)
+            .unwrap();
+        for entry in &listing {
+            let _ = ops.getattr(&cx, &mut RequestScope::empty(), entry.ino);
+        }
+
+        let warm = fs.btrfs_floor_memo_footprint();
+        assert!(
+            warm.retained_leaves <= BTRFS_FLOOR_MEMO_SLOTS,
+            "the memo is a fixed {BTRFS_FLOOR_MEMO_SLOTS}-slot array and must never exceed it; \
+             retained {}",
+            warm.retained_leaves
+        );
+        assert!(
+            warm.exclusive_bytes <= warm.upper_bound_bytes,
+            "exclusive bytes are a subset of reachable bytes: {} > {}",
+            warm.exclusive_bytes,
+            warm.upper_bound_bytes
         );
     }
 
