@@ -11235,3 +11235,41 @@ machinery.
 mirror fence, the DEV_ITEM update and the stale-plan check are all unaffected by this and all still
 hold. What is withdrawn is any suggestion that the path is ready: it is not, the flag stays off, and
 this row is the evidence.
+
+## bd-jhuob — REFUTED FROM SOURCE: the tree-log replay ALREADY merges, so the planned merge is not needed
+
+**The hypothesis.** bd-jhuob proposed that tree-log replay is a READ-TIME OVERLAY rather than a
+merge, so a later full commit would serialize trees WITHOUT the logged items and clearing
+`log_root` would lose them — which would make the ephemeral flag mandatory and make "turn replay
+into a real merge" the work. It named the falsification test itself: write via the ephemeral path,
+force a full commit, remount, see whether the items survive.
+
+**The write path already answers it, in three hops.**
+
+    load_btrfs_alloc_state          lib.rs:8568   let items = self.walk_btrfs_fs_tree(cx)?;
+    walk_btrfs_fs_tree_by_objectid  lib.rs:9712   self.btrfs_apply_tree_log_overlay(subvol_id, &mut items);
+    load_btrfs_alloc_state          lib.rs:8592   fs_tree.insert(tree_item.key, &tree_item.data)
+
+`enable_writes` builds the in-memory `fs_tree` from a walk that has ALREADY had the log overlaid
+onto it, and `btrfs_apply_tree_log_overlay` is a real merge — same key replaces, new key is pushed,
+then the whole list is re-sorted into key order. So the logged items are in the tree the next FULL
+COMMIT serializes, and `log_root` can be cleared without losing them. The name "ephemeral" describes
+the flag's caution, not this mechanism.
+
+**What that changes.** The expensive half of this bead — converting replay from an overlay into a
+merge — is not work that needs doing. The remaining question is verification and policy, not
+implementation, which is a much cheaper bead than it was filed as.
+
+⚠️ **ONE REAL LIMITATION, and it is a guard rather than a bug.** The overlay applies only when
+`subvol_id == ctx.subvol_objectid` (lib.rs:9720). Logged items belonging to a subvolume OTHER than
+the mounted one are not overlaid, and would be dropped by a subsequent full commit. In practice the
+writer logs inodes of the mounted filesystem so the guard is satisfied, but anything that later
+logs across subvolumes must revisit this — the failure would be silent.
+
+⚠️ **THIS IS A SOURCE READING, NOT THE FALSIFICATION RUN.** The bead asked for an empirical test
+(write ephemeral, force a full commit, remount, check survival) and that still wants a build and a
+mount. What this establishes is that the test is now expected to PASS, and that if it fails the
+cause is somewhere other than the overlay-versus-merge distinction. It also does not touch the
+READ-path detail the bead cites — the floor-descent fast path really is gated on an empty tree log,
+because the floor walker does not apply the overlay — which is a correctness guard on reads and has
+no bearing on durability.
