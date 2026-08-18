@@ -11512,6 +11512,15 @@ pub struct TreeLogReplayResult {
     pub items_count: usize,
     /// Whether a valid tree-log was found and replayed.
     pub replayed: bool,
+    /// True when `log_root` addressed a log this implementation does not
+    /// understand, so `items` is EMPTY and nothing was replayed.
+    ///
+    /// ⚠️ A caller seeing this must NOT treat the filesystem as fully recovered.
+    /// A log exists precisely because some fsync was acknowledged and not yet
+    /// committed; leaving it unreplayed and then committing would clear
+    /// `log_root` (bd-mogn1) and discard those acknowledged writes silently.
+    /// Read-only is safe; enabling writes is not.
+    pub foreign_format: bool,
 }
 
 /// Replay the btrfs tree-log if present.
@@ -11546,6 +11555,37 @@ pub fn replay_tree_log(
         sb.csum_type,
     )?;
 
+    // ⚠️ IS THIS OUR LOG OR THE KERNEL'S? They are different SHAPES at the same
+    // address and only one of them is a flat list of fs-tree items.
+    //
+    // This implementation writes a single LEAF at `log_root` holding the logged
+    // items directly. Kernel btrfs writes a log ROOT TREE there: a tree of
+    // ROOT_ITEMs, one per subvolume that has a log, each pointing at that
+    // subvolume's own log tree. Walking the kernel's shape yields ROOT_ITEMs, and
+    // handing those to a caller that overlays them onto the fs tree injects
+    // entries keyed (subvol objectid, ROOT_ITEM, ..) into a keyspace where those
+    // objectids are INODE NUMBERS. Nothing downstream can tell the difference,
+    // which is why this is caught here rather than left to the consumer.
+    //
+    // Our log can never contain a ROOT_ITEM — it carries inode items, refs and
+    // extent data copied out of the fs tree — so one is a sufficient signal.
+    if items
+        .iter()
+        .any(|entry| entry.key.item_type == BTRFS_ITEM_ROOT_ITEM)
+    {
+        tracing::warn!(
+            log_root = sb.log_root,
+            items = items.len(),
+            "btrfs tree-log is a log ROOT TREE (kernel format), not the single leaf              this implementation writes; refusing to replay it"
+        );
+        return Ok(TreeLogReplayResult {
+            items: Vec::new(),
+            items_count: 0,
+            replayed: false,
+            foreign_format: true,
+        });
+    }
+
     tracing::info!(
         items_replayed = items.len(),
         "btrfs tree-log replay complete"
@@ -11555,6 +11595,7 @@ pub fn replay_tree_log(
         items_count: items.len(),
         items,
         replayed: true,
+        foreign_format: false,
     })
 }
 
