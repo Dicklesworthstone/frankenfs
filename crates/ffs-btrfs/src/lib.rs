@@ -7002,6 +7002,80 @@ impl NoSpaceReport {
 }
 
 impl BtrfsExtentAllocator {
+    /// Bytes a new allocation of `required_flags` could actually be given right
+    /// now: total minus used minus PINNED, across the matching block groups.
+    ///
+    /// Pinned bytes are subtracted because they are unavailable even though no
+    /// extent item claims them — they are the blocks of the trees the committed
+    /// superblock still points at, held until the new superblock lands. A caller
+    /// that reasons from `free_bytes()` alone will conclude there is room and
+    /// then fail placement, which is bd-uxh7t's second mechanism exactly.
+    ///
+    /// ⚠️ THIS CAN UNDER-COUNT, deliberately. `used_bytes` is a running tally
+    /// recomputed from the live extent items at commit
+    /// (`sync_block_group_accounting`), so mid-commit a block that has already
+    /// been pinned may still be counted in `used_bytes` too — subtracting both
+    /// charges it twice. Under-counting available space is the safe direction:
+    /// it costs a chunk allocated slightly earlier than strictly necessary,
+    /// while over-counting costs a commit that runs out of space part-way
+    /// through, which is the failure with no good recovery.
+    #[must_use]
+    pub fn allocatable_bytes(&self, required_flags: u64) -> u64 {
+        let mut total = 0_u64;
+        for bg in self.block_groups.values() {
+            if (bg.item.flags & required_flags) == 0 {
+                continue;
+            }
+            let bg_end = bg.start.saturating_add(bg.item.total_bytes);
+            let pinned: u64 = self
+                .pinned
+                .range(bg.start..bg_end)
+                .map(|(_, pin)| pin.num_bytes)
+                .sum();
+            let free = bg.item.free_bytes().saturating_sub(pinned);
+            total = total.saturating_add(free);
+        }
+        total
+    }
+
+    /// How far short of a commit's metadata demand this allocator is, or `None`
+    /// when it can satisfy it.
+    ///
+    /// `tree_nodes` is the number of tree blocks the commit will WRITE — the
+    /// writeback DAG's node count summed over every tree it serializes. Each one
+    /// is allocated at a FRESH address (COW), so the demand is `tree_nodes *
+    /// nodesize` of space that overlaps neither live extents nor the pinned
+    /// previous trees.
+    ///
+    /// ⚠️ THIS MUST BE CALLED BEFORE THE COMMIT STARTS SERIALIZING, and that is
+    /// the whole reason it exists as a separate query. Allocating a chunk in the
+    /// middle of a commit inserts a BLOCK_GROUP_ITEM into the extent tree that
+    /// the commit is already serializing, and changes the very DAG whose node
+    /// count decided the demand. Kernel btrfs has the same constraint and
+    /// answers it the same way, by reserving space up front rather than
+    /// allocating on demand mid-transaction. A commit that discovers it is short
+    /// halfway through has no good move left.
+    ///
+    /// The measured shape this exists for (bd-uxh7t, bd-42gtq): a 20,050-file
+    /// image had a 1,132-node fs-tree DAG, so one 4 KiB client write demanded
+    /// ~18.5 MB of fresh metadata — and the previous tree stays pinned for the
+    /// duration, so the group needs room for both at once.
+    #[must_use]
+    pub fn commit_metadata_shortfall(&self, tree_nodes: u64, nodesize: u64) -> Option<u64> {
+        // ⚠️ OVERFLOW MUST NOT READ AS "SATISFIED". Writing this as
+        // `checked_mul(nodesize)?` is the natural form and is a bug: `?` on None
+        // returns None, which this function's contract reads as "no shortfall".
+        // A demand too large to represent is the most short we can possibly be.
+        let Some(required) = tree_nodes.checked_mul(nodesize) else {
+            return Some(u64::MAX);
+        };
+        let available = self.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA);
+        if required <= available {
+            return None;
+        }
+        Some(required - available)
+    }
+
     /// Describe why a request for `num_bytes` with `required_flags` found no
     /// block group, in the terms that decide bd-uxh7t.
     ///
@@ -18805,6 +18879,119 @@ mod tests {
         .expect("plan");
         apply_chunk_allocation(&abutting, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
             .expect("an abutting chunk must be allowed");
+    }
+
+    /// bd-a136s / bd-uxh7t. A commit must learn it is short of metadata space
+    /// BEFORE it starts serializing, and the number that decides it has to
+    /// account for PINNED bytes — the previous trees, held until the new
+    /// superblock lands.
+    ///
+    /// The figures are bd-42gtq's counted ones: a 20,050-file image had a
+    /// 1,132-node DAG at a 16 KiB nodesize, so one 4 KiB client write demanded
+    /// ~18.5 MB of fresh metadata.
+    #[test]
+    fn commit_metadata_shortfall_counts_pinned_bytes_as_unavailable_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const NODESIZE: u64 = 16384;
+        const NODES: u64 = 1132;
+        let demand = NODES * NODESIZE;
+        // bd-42gtq's "~18.5 MB" is DECIMAL megabytes; in MiB it is 17.69, which
+        // is worth pinning exactly so the next reader does not "fix" a correct
+        // figure into a wrong one.
+        assert_eq!(demand, 18_546_688);
+
+        let start = 0x1_0000_u64;
+        // A 64 MiB metadata group holding 18.5 MB of live tree: plenty of room
+        // for one more copy, so no shortfall.
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("allocator");
+        alloc.add_block_group(
+            start,
+            BtrfsBlockGroupItem {
+                total_bytes: 64 * MB,
+                used_bytes: demand,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+        assert_eq!(alloc.commit_metadata_shortfall(NODES, NODESIZE), None);
+        assert_eq!(alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA), 64 * MB - demand);
+
+        // Now pin the live tree, which is what a commit does before deleting its
+        // extent items. The same group, the same demand — and now the commit
+        // needs the old and new trees resident at once. This is bd-uxh7t's
+        // mechanism B, and `free_bytes()` alone cannot see it.
+        alloc.pin_extent(start, 40 * MB, false);
+        assert_eq!(
+            alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA),
+            64 * MB - demand - 40 * MB,
+            "pinned bytes are unavailable even though no extent item claims them"
+        );
+        let short = alloc
+            .commit_metadata_shortfall(NODES, NODESIZE)
+            .expect("pinning the previous tree must produce a shortfall");
+        assert_eq!(short, demand - (64 * MB - demand - 40 * MB));
+
+        // A shortfall is what tells the caller how big a chunk to ask for, so it
+        // must be the amount MISSING, not the amount required.
+        assert!(short < demand, "the shortfall is the gap, not the whole demand");
+    }
+
+    /// bd-a136s. The boundaries, and one of them is a trap: an overflowing demand
+    /// must read as maximally short, never as satisfied.
+    #[test]
+    fn commit_metadata_shortfall_boundaries_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const NODESIZE: u64 = 16384;
+
+        // No metadata group at all: everything is a shortfall, and the whole
+        // demand is missing.
+        let empty = BtrfsExtentAllocator::new(1).expect("allocator");
+        assert_eq!(empty.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA), 0);
+        assert_eq!(empty.commit_metadata_shortfall(10, NODESIZE), Some(163_840));
+        // A commit that writes nothing is never short, even with no group.
+        assert_eq!(empty.commit_metadata_shortfall(0, NODESIZE), None);
+
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("allocator");
+        alloc.add_block_group(
+            0x1_0000,
+            BtrfsBlockGroupItem {
+                total_bytes: 16 * MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+        // Exactly enough is enough — refusing here would allocate a chunk the
+        // filesystem does not need on every commit that just fits.
+        let exact = 16 * MB / NODESIZE;
+        assert_eq!(alloc.commit_metadata_shortfall(exact, NODESIZE), None);
+        assert_eq!(
+            alloc.commit_metadata_shortfall(exact + 1, NODESIZE),
+            Some(NODESIZE)
+        );
+
+        // A DATA group does not satisfy a metadata demand, however large.
+        let mut data_only = BtrfsExtentAllocator::new(1).expect("allocator");
+        data_only.add_block_group(
+            0x1_0000,
+            BtrfsBlockGroupItem {
+                total_bytes: 1024 * MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_DATA,
+            },
+        );
+        assert_eq!(data_only.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA), 0);
+        assert!(data_only.commit_metadata_shortfall(1, NODESIZE).is_some());
+
+        // ⚠️ THE TRAP. A node count that overflows when multiplied by the
+        // nodesize must report the MOST short possible, not None. Writing the
+        // multiply as `checked_mul(nodesize)?` is the natural form and inverts
+        // this: `?` on None returns None, which this contract reads as "no
+        // shortfall" — a commit that cannot possibly be satisfied would sail
+        // straight into serialization.
+        assert_eq!(
+            alloc.commit_metadata_shortfall(u64::MAX, NODESIZE),
+            Some(u64::MAX),
+            "an unrepresentable demand must read as maximally short, never satisfied"
+        );
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
