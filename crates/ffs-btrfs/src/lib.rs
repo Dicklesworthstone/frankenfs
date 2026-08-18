@@ -6780,6 +6780,124 @@ pub fn plan_chunk_allocation(
     })
 }
 
+/// The device a chunk may be carved out of, and the fields a new chunk copies
+/// from it.
+#[derive(Debug, Clone, Copy)]
+pub struct GrowthDevice {
+    /// Device id, matching the stripes of every chunk on it.
+    pub devid: u64,
+    /// Size of the device.
+    pub total_bytes: u64,
+    /// The DEV_ITEM's current `bytes_used`.
+    pub bytes_used: u64,
+    /// Lowest physical offset a chunk may occupy — the reserved head carrying
+    /// the superblock copies and the bootstrap region.
+    pub min_offset: u64,
+    /// Sector size, copied into the new chunk's io fields.
+    pub sector_size: u32,
+    /// UUID of the chunk tree.
+    pub chunk_tree_uuid: [u8; 16],
+    /// UUID of this device.
+    pub dev_uuid: [u8; 16],
+}
+
+/// Decide whether the coming commit needs a new metadata chunk, and if so
+/// produce the plan for one.
+///
+/// This is the whole growth decision as a pure function: shortfall, then sizing,
+/// then placement, then the record set. It reads state and returns a plan; it
+/// mutates nothing, so it is safe to call from the point in a commit where
+/// nothing has been serialized yet — which is the ONLY point it may be called
+/// from. See [`BtrfsExtentAllocator::commit_metadata_shortfall`] for why growing
+/// mid-commit is not an option.
+///
+/// `tree_nodes` is the number of tree blocks the commit will write.
+///
+/// ⚠️ ONE CALL IS ONE CHUNK, AND ONE CHUNK MAY NOT BE ENOUGH. The size comes
+/// from [`ChunkSizePolicy`], which caps a chunk at a fraction of the device on
+/// purpose; a commit whose shortfall exceeds that cap needs more than one. The
+/// caller therefore LOOPS: plan, apply, re-ask, until the shortfall is `None` or
+/// this returns `Ok(None)`. Sizing a single chunk to cover an arbitrary
+/// shortfall would defeat the cap, and the cap is what stops one chunk
+/// swallowing a device that also needs room for data.
+///
+/// Returns `Ok(None)` when the commit already fits — the common case, on the hot
+/// path of every commit, which is why the shortfall test comes first and costs
+/// only a walk of the block groups.
+///
+/// # Errors
+/// Returns [`BtrfsMutationError::NoSpace`] when the commit is short and the
+/// device has no room to fix it — the honest ENOSPC, as opposed to today's,
+/// which fires while the device still has unallocated space. Propagates a
+/// refusal from [`DeviceOccupancy::from_chunks`] for a chunk layout that is not
+/// modelled, and from [`plan_chunk_allocation`] for a plan that would not
+/// survive `btrfs check`.
+pub fn plan_growth_for_commit(
+    alloc: &BtrfsExtentAllocator,
+    chunks: &[BtrfsChunkEntry],
+    tree_nodes: u64,
+    nodesize: u64,
+    device: &GrowthDevice,
+    policy: &ChunkSizePolicy,
+) -> Result<Option<ChunkAllocationPlan>, BtrfsMutationError> {
+    let Some(shortfall) = alloc.commit_metadata_shortfall(tree_nodes, nodesize) else {
+        return Ok(None);
+    };
+
+    let occupancy = DeviceOccupancy::from_chunks(device.devid, chunks)
+        .map_err(|_| BtrfsMutationError::InvalidConfig("chunk layout is not modelled"))?;
+    let free_run = occupancy.largest_free_run(device.min_offset, device.total_bytes);
+
+    let Some(length) = policy.decide(ChunkKind::Metadata, device.total_bytes, free_run) else {
+        // The device genuinely has nowhere to put a useful chunk. This is the
+        // ENOSPC that is honest: not "we cannot reach the space", but "there is
+        // none". `shortfall` is carried into the log by the caller, not swallowed.
+        debug!(
+            target: "ffs::btrfs::alloc",
+            shortfall,
+            free_run,
+            device_total = device.total_bytes,
+            "growth_refused_device_full"
+        );
+        return Err(BtrfsMutationError::NoSpace);
+    };
+
+    let Some(physical) = occupancy.find_free(length, device.min_offset, device.total_bytes) else {
+        // `largest_free_run` said a run of at least this size exists and
+        // `find_free` cannot place it. The two walk the same ranges, so this is
+        // not a space problem, it is a disagreement between two functions that
+        // must agree — refuse rather than place a chunk on a guess.
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "largest_free_run and find_free disagree about the device",
+        ));
+    };
+
+    let logical = next_logical_chunk_start(chunks)?;
+    let plan = plan_chunk_allocation(&ChunkAllocationRequest {
+        kind: ChunkKind::Metadata,
+        logical,
+        length,
+        devid: device.devid,
+        physical,
+        dev_total_bytes: device.total_bytes,
+        dev_bytes_used_before: device.bytes_used,
+        sector_size: device.sector_size,
+        chunk_tree_uuid: device.chunk_tree_uuid,
+        dev_uuid: device.dev_uuid,
+    })?;
+
+    debug!(
+        target: "ffs::btrfs::alloc",
+        shortfall,
+        length,
+        logical,
+        physical,
+        covers_shortfall = length >= shortfall,
+        "growth_planned"
+    );
+    Ok(Some(plan))
+}
+
 /// Apply a [`ChunkAllocationPlan`] to the in-memory trees and the allocator.
 ///
 /// Inserts the CHUNK_ITEM into `chunk_tree`, the DEV_EXTENT into `dev_tree`, the
@@ -18991,6 +19109,205 @@ mod tests {
             alloc.commit_metadata_shortfall(u64::MAX, NODESIZE),
             Some(u64::MAX),
             "an unrepresentable demand must read as maximally short, never satisfied"
+        );
+    }
+
+    fn growth_device(total: u64, bytes_used: u64) -> GrowthDevice {
+        GrowthDevice {
+            devid: 1,
+            total_bytes: total,
+            bytes_used,
+            min_offset: 1024 * 1024,
+            sector_size: 4096,
+            chunk_tree_uuid: [0x11; 16],
+            dev_uuid: [0x22; 16],
+        }
+    }
+
+    /// bd-a136s / bd-uxh7t, end to end at the pure level: a filesystem whose
+    /// metadata group cannot hold the coming commit GROWS until it can, and the
+    /// allocation that failed before now succeeds.
+    ///
+    /// The device is deliberately small (100 MiB) so the sizing policy's device
+    /// cap makes one chunk INSUFFICIENT — this exercises the loop, which is the
+    /// part a single-chunk test would silently skip. One call is one chunk by
+    /// design: sizing a single chunk to cover an arbitrary shortfall would defeat
+    /// the cap that stops one chunk swallowing the device.
+    #[test]
+    fn a_commit_that_would_enospc_grows_until_it_fits_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const NODESIZE: u64 = 16384;
+        const NODES: u64 = 1132; // bd-42gtq's counted DAG for 20,050 files
+        let demand = NODES * NODESIZE;
+
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(NODESIZE);
+
+        // One metadata chunk, FULL: logical [0, 16 MiB) on physical [1, 17) MiB.
+        let mut chunks = vec![logical_chunk(
+            0,
+            16 * MB,
+            BTRFS_BLOCK_GROUP_METADATA,
+            &[(1, MB)],
+        )];
+        alloc.add_block_group(
+            0,
+            BtrfsBlockGroupItem {
+                total_bytes: 16 * MB,
+                used_bytes: 16 * MB,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+
+        // The state bd-uxh7t observed: the commit cannot be satisfied, and an
+        // allocation fails, on a device with 87 MiB of unallocated space.
+        assert_eq!(alloc.commit_metadata_shortfall(NODES, NODESIZE), Some(demand));
+        assert!(
+            alloc
+                .alloc_metadata_for_tree(NODESIZE, BTRFS_FS_TREE_OBJECTID, 0)
+                .is_err(),
+            "the pre-growth allocation must fail, or this test proves nothing"
+        );
+
+        let policy = ChunkSizePolicy::default();
+        let mut device = growth_device(100 * MB, 17 * MB);
+        let mut grown = 0_usize;
+        while let Some(plan) = plan_growth_for_commit(
+            &alloc,
+            &chunks,
+            NODES,
+            NODESIZE,
+            &device,
+            &policy,
+        )
+        .expect("growth must not fail on a device with room")
+        {
+            apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+                .expect("apply");
+            device.bytes_used = plan.dev_bytes_used_after;
+            chunks.push(plan.chunk.clone());
+            grown += 1;
+            assert!(grown < 16, "growth must converge, not loop forever");
+        }
+
+        assert_eq!(
+            grown, 2,
+            "a 10 MiB device cap against a 17.7 MiB demand needs two chunks — if \
+             this becomes 1 the cap stopped binding and the loop is untested"
+        );
+        assert_eq!(alloc.commit_metadata_shortfall(NODES, NODESIZE), None);
+
+        // The allocation that failed above now succeeds. This is the capability.
+        let allocated = alloc
+            .alloc_metadata_for_tree(NODESIZE, BTRFS_FS_TREE_OBJECTID, 0)
+            .expect("the allocation must succeed once the filesystem has grown");
+        assert!(allocated.bytenr >= 16 * MB, "it must come from a NEW chunk");
+
+        // No two chunks may overlap, logically or physically — asserted over the
+        // whole final layout rather than per step, because an overlap introduced
+        // by the loop's bookkeeping would not show up in any single iteration.
+        for (i, a) in chunks.iter().enumerate() {
+            for b in chunks.iter().skip(i + 1) {
+                let (a_start, a_end) = (a.key.offset, a.key.offset + a.length);
+                let (b_start, b_end) = (b.key.offset, b.key.offset + b.length);
+                assert!(
+                    a_end <= b_start || b_end <= a_start,
+                    "logical overlap: [{a_start}, {a_end}) and [{b_start}, {b_end})"
+                );
+                let (ap, bp) = (a.stripes[0].offset, b.stripes[0].offset);
+                assert!(
+                    ap + a.length <= bp || bp + b.length <= ap,
+                    "physical overlap at {ap} and {bp}"
+                );
+            }
+        }
+        // And every chunk stays on the device.
+        for chunk in &chunks {
+            assert!(chunk.stripes[0].offset + chunk.length <= device.total_bytes);
+        }
+    }
+
+    /// bd-a136s. The two answers that are not "grow": a commit that already fits
+    /// must not allocate anything, and a device with genuinely no room must
+    /// return the HONEST ENOSPC rather than a chunk it cannot place.
+    #[test]
+    fn growth_is_refused_when_it_is_unnecessary_or_impossible_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const NODESIZE: u64 = 16384;
+        let policy = ChunkSizePolicy::default();
+
+        // A commit that fits: no plan, and this is the hot path of every commit.
+        let mut roomy = BtrfsExtentAllocator::new(7).expect("allocator");
+        roomy.add_block_group(
+            0,
+            BtrfsBlockGroupItem {
+                total_bytes: 64 * MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+        let chunks = vec![logical_chunk(
+            0,
+            64 * MB,
+            BTRFS_BLOCK_GROUP_METADATA,
+            &[(1, MB)],
+        )];
+        assert!(
+            plan_growth_for_commit(&roomy, &chunks, 100, NODESIZE, &growth_device(512 * MB, 65 * MB), &policy)
+                .expect("no growth needed")
+                .is_none(),
+            "a commit that already fits must not allocate a chunk"
+        );
+
+        // A device with no unallocated space: the chunk covers all of it, so the
+        // commit is short and nothing can be done. That is a REAL ENOSPC, unlike
+        // today's, which fires while the device still has room.
+        let mut full = BtrfsExtentAllocator::new(7).expect("allocator");
+        full.add_block_group(
+            0,
+            BtrfsBlockGroupItem {
+                total_bytes: 32 * MB,
+                used_bytes: 32 * MB,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+        let packed = vec![logical_chunk(0, 32 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 0)])];
+        assert!(
+            plan_growth_for_commit(
+                &full,
+                &packed,
+                1132,
+                NODESIZE,
+                &growth_device(32 * MB, 32 * MB),
+                &policy
+            )
+            .is_err(),
+            "a genuinely full device must report ENOSPC, not plan an unplaceable chunk"
+        );
+
+        // A chunk layout we do not model must refuse rather than be guessed at:
+        // a striped profile puts a fraction of the length on each device, so
+        // treating it as a mirror would understate what is occupied and place a
+        // chunk on top of live data.
+        let striped = vec![logical_chunk(
+            0,
+            32 * MB,
+            BTRFS_BLOCK_GROUP_METADATA | chunk_type_flags::BTRFS_BLOCK_GROUP_RAID0,
+            &[(1, MB), (2, MB)],
+        )];
+        assert!(
+            plan_growth_for_commit(
+                &full,
+                &striped,
+                1132,
+                NODESIZE,
+                &growth_device(512 * MB, 33 * MB),
+                &policy
+            )
+            .is_err(),
+            "an unmodelled chunk layout must refuse"
         );
     }
 
