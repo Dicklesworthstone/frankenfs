@@ -6899,6 +6899,42 @@ impl GrowthDevice {
     }
 }
 
+/// Tree blocks a GROWING commit must budget for beyond its own trees.
+///
+/// Serializing the chunk tree and the device tree ALLOCATES metadata, so a
+/// commit that grows the filesystem needs room for those two trees on top of
+/// everything else. If that is not included in the pre-check, a chunk allocation
+/// can require a chunk allocation — the circularity kernel btrfs keeps a
+/// system-chunk reserve for.
+///
+/// The count is the whole of both trees, not the part that changed:
+/// `WriteDependencyDag::from_cow_tree` collects from the root down, so every
+/// node is rewritten at a fresh address on commit (bd-42gtq established this for
+/// the fs tree; it is a property of the DAG, not of that tree).
+///
+/// A SPLIT ALLOWANCE of `root_level + 2` is added per tree. Inserting the new
+/// CHUNK_ITEM and DEV_EXTENT can split one node per level and create a new root,
+/// and the count is necessarily taken BEFORE those inserts — so without the
+/// allowance the budget is short by exactly the nodes the growth itself adds,
+/// which is the least convenient way to be wrong.
+///
+/// # Errors
+/// Propagates any error from building either tree's dependency DAG.
+pub fn growth_overhead_nodes(
+    chunk_tree: &InMemoryCowBtrfsTree,
+    dev_tree: &InMemoryCowBtrfsTree,
+    generation: u64,
+) -> Result<u64, BtrfsMutationError> {
+    let mut total = 0_u64;
+    for tree in [chunk_tree, dev_tree] {
+        let dag = crate::writeback::WriteDependencyDag::from_cow_tree(tree, generation)?;
+        let nodes = u64::try_from(dag.node_count()).unwrap_or(u64::MAX);
+        let split_allowance = u64::from(tree.root_level()).saturating_add(2);
+        total = total.saturating_add(nodes).saturating_add(split_allowance);
+    }
+    Ok(total)
+}
+
 /// Decide whether the coming commit needs a new metadata chunk, and if so
 /// produce the plan for one.
 ///
@@ -19759,6 +19795,60 @@ mod tests {
             .expect("insert");
 
         assert!(GrowthDevice::from_chunk_tree(&chunk_tree, [0; 16]).is_err());
+    }
+
+    /// bd-a136s. A growing commit rewrites the chunk and device trees too, and
+    /// those nodes must be in the budget. Leaving them out means a chunk
+    /// allocation can require a chunk allocation — the circularity kernel btrfs
+    /// keeps a system-chunk reserve for.
+    #[test]
+    fn growth_overhead_counts_both_trees_and_room_to_split_bd_a136s() {
+        use crate::writeback::WriteDependencyDag;
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * MB);
+        let dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+
+        let overhead = growth_overhead_nodes(&chunk_tree, &dev_tree, 7).expect("overhead");
+
+        // Both trees are counted, each with room to split. Two single-node trees
+        // at level 0 give (1 + 2) + (1 + 2) = 6.
+        let chunk_nodes =
+            u64::try_from(WriteDependencyDag::from_cow_tree(&chunk_tree, 7).expect("dag").node_count())
+                .expect("fits");
+        let dev_nodes =
+            u64::try_from(WriteDependencyDag::from_cow_tree(&dev_tree, 7).expect("dag").node_count())
+                .expect("fits");
+        assert_eq!(overhead, chunk_nodes + dev_nodes + 4);
+
+        // ⚠️ THE ALLOWANCE IS THE POINT. The count is taken BEFORE the growth's
+        // own inserts, so a budget of exactly `chunk_nodes + dev_nodes` is short
+        // by precisely the nodes the growth adds — the least convenient way to be
+        // wrong, because it only bites on the commit that is already short.
+        assert!(
+            overhead > chunk_nodes + dev_nodes,
+            "the budget must exceed the trees as they stand"
+        );
+
+        // It grows with the trees rather than being a constant.
+        let mut bigger = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut bigger, 1, 512 * MB);
+        for i in 0..64_u64 {
+            let chunk = logical_chunk(
+                i * 32 * MB,
+                32 * MB,
+                BTRFS_BLOCK_GROUP_METADATA,
+                &[(1, i * 32 * MB + MB)],
+            );
+            bigger
+                .insert(chunk.key, &chunk.to_item_bytes().expect("serialize"))
+                .expect("insert");
+        }
+        let bigger_overhead = growth_overhead_nodes(&bigger, &dev_tree, 7).expect("overhead");
+        assert!(
+            bigger_overhead > overhead,
+            "a larger chunk tree must cost more to rewrite: {bigger_overhead} vs {overhead}"
+        );
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
