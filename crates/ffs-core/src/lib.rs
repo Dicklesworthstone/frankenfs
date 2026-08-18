@@ -29190,16 +29190,62 @@ impl OpenFs {
                 detail: "tree-log logical bytenr not covered by any btrfs chunk".into(),
             })?;
         Self::btrfs_checked_physical_span(mapping.physical, node_bytes.len())?;
-        self.dev
-            .write_all_at(cx, ByteOffset(mapping.physical), &node_bytes)?;
-        self.dev.write_all_at(
+        let superblock_offset = ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
+            FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
+        })?);
+        Self::btrfs_publish_tree_log(
+            self.dev.as_ref(),
             cx,
-            ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
-                FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
-            })?),
+            ByteOffset(mapping.physical),
+            &node_bytes,
+            superblock_offset,
             &sb_bytes,
         )?;
         Ok(stats)
+    }
+
+    /// Publish a tree log: make the LOG NODE durable, then point the superblock at
+    /// it. The barrier between the two is the whole function.
+    ///
+    /// bd-sv7ql. This sequence previously wrote the node and the superblock
+    /// back-to-back and relied on the caller's single trailing `dev.sync()` to make
+    /// both durable. That is a torn commit point: the superblock publishes
+    /// `log_root`, so a crash landing the superblock but not the node leaves
+    /// `sb.log_root != 0` addressing a block that was never written. `replay_tree_log`
+    /// then fails its read and mount only `warn!`s — so an fsync that RETURNED
+    /// SUCCESS silently loses its data. Acknowledged-then-lost is the worst
+    /// available failure, and it is the same defect shape as bd-73bi2 (a pointer
+    /// published ahead of its target's durability), which cost a P0.
+    ///
+    /// `btrfs_commit_writeback` already gets this right for the full-commit path —
+    /// tree writes, `fsync_barrier()` + `sync()`, then the superblock, then `sync()`.
+    /// This gives the tree-log path the same protocol, which is the prerequisite for
+    /// ever promoting it to the durable default for fsync.
+    ///
+    /// Extracted as a named function taking `&dyn ByteDevice` specifically so the
+    /// ordering can be asserted by a test rather than left as an implicit property of
+    /// two adjacent statements; see
+    /// `btrfs_publish_tree_log_barriers_between_node_and_superblock_bd_sv7ql`.
+    ///
+    /// The caller still issues the FINAL sync that makes the superblock itself
+    /// durable, so the completed protocol is: node -> barrier -> superblock -> barrier.
+    ///
+    /// # Errors
+    /// Returns any device write or sync error, unchanged.
+    fn btrfs_publish_tree_log(
+        dev: &dyn ByteDevice,
+        cx: &Cx,
+        node_offset: ByteOffset,
+        node_bytes: &[u8],
+        superblock_offset: ByteOffset,
+        sb_bytes: &[u8],
+    ) -> Result<(), FfsError> {
+        dev.write_all_at(cx, node_offset, node_bytes)?;
+        // THE LOAD-BEARING LINE. Without it the superblock below can reach disk
+        // first and address a log node that does not exist.
+        dev.sync(cx)?;
+        dev.write_all_at(cx, superblock_offset, sb_bytes)?;
+        Ok(())
     }
 
     fn btrfs_sync_with_logging(
@@ -64568,6 +64614,90 @@ mod tests {
             quiet_again.writes(),
             0,
             "once persisted, the same totals must not be written again"
+        );
+    }
+
+    /// bd-sv7ql. The tree-log publish must put a BARRIER between the log node and
+    /// the superblock that points at it.
+    ///
+    /// Before the fix these were two adjacent `write_all_at` calls relying on the
+    /// caller's trailing sync, so a crash could land the superblock — which
+    /// publishes `log_root` — while the node it addresses was still only in the page
+    /// cache. `replay_tree_log` then fails its read and mount merely `warn!`s, so an
+    /// fsync that already RETURNED SUCCESS loses its data silently. That is the same
+    /// shape as bd-73bi2, which was a P0.
+    ///
+    /// The assertion is on ORDER, not on content: a test that only checked the final
+    /// bytes would pass against the broken version, because the broken version writes
+    /// exactly the same bytes. Order is the entire property.
+    #[test]
+    fn btrfs_publish_tree_log_barriers_between_node_and_superblock_bd_sv7ql() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum DevOp {
+            Write(u64),
+            Sync,
+        }
+
+        struct OrderRecordingDevice {
+            ops: Mutex<Vec<DevOp>>,
+        }
+
+        impl ByteDevice for OrderRecordingDevice {
+            fn len_bytes(&self) -> u64 {
+                1 << 30
+            }
+            fn read_exact_at(
+                &self,
+                _cx: &Cx,
+                _offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                buf.fill(0);
+                Ok(())
+            }
+            fn write_all_at(
+                &self,
+                _cx: &Cx,
+                offset: ByteOffset,
+                _buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.ops.lock().unwrap().push(DevOp::Write(offset.0));
+                Ok(())
+            }
+            fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+                self.ops.lock().unwrap().push(DevOp::Sync);
+                Ok(())
+            }
+        }
+
+        let dev = OrderRecordingDevice {
+            ops: Mutex::new(Vec::new()),
+        };
+        let cx = Cx::for_testing();
+        let node_offset = ByteOffset(0x40_0000);
+        let sb_offset = ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).expect("sb offset"));
+
+        OpenFs::btrfs_publish_tree_log(
+            &dev,
+            &cx,
+            node_offset,
+            &[0xAB; 64],
+            sb_offset,
+            &[0xCD; 64],
+        )
+        .expect("publish tree log");
+
+        let ops = dev.ops.lock().unwrap();
+        assert_eq!(
+            *ops,
+            vec![
+                DevOp::Write(node_offset.0),
+                DevOp::Sync,
+                DevOp::Write(sb_offset.0),
+            ],
+            "the log node must be made durable BEFORE the superblock publishes \
+             log_root; without the intervening sync an fsync that returned success \
+             can lose its data (bd-sv7ql, same shape as bd-73bi2)"
         );
     }
 
