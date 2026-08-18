@@ -10914,3 +10914,58 @@ points. The usable form is "low single-digit CV is necessary-ish, and retry is c
 **Reproduction:** `--pairs 12 --operations 32768 --image-size-mib 512`, ~90 s per attempt, roughly a
 third abort pre-measurement. Report at
 `/data/tmp/ffs-cert-creamtrout/run_1787004157_728445171_688867/`.
+
+## SOURCE-READ ANSWER — 2026-08-18 — our fsync is not less durable, it does MORE work: a full commit where kernel btrfs writes a tree log (PlumBeacon)
+
+Build freeze in force (`/data` 34G, 99%), so this is source reading and ledger only — no build, no
+comparator run. It closes bd-5hqj2's core question and hands over a larger lever than the one it asked
+about.
+
+**bd-5hqj2 asked whether we are faster because our fsync promises less.** The answer, from the code, is
+no — the opposite.
+
+`FsOps::fsync` -> `btrfs_sync_with_logging` (`crates/ffs-core/src/lib.rs:29163`). The default path is
+**`btrfs_full_transaction_commit`** — a FULL transaction commit on every client fsync. The commit's
+barrier protocol is the correct one:
+
+    tree writes -> root_executor.fsync_barrier() -> self.dev.sync()
+                -> superblock write_all_at(BTRFS_SUPER_INFO_OFFSET) -> self.dev.sync()
+
+Everything the superblock will point at is durable before the superblock is written, and the superblock
+is then made durable itself — prefix-closed, which is what the counted **3 barriers per client fsync**
+(against kernel btrfs's 2) is made of. The tree-log-only alternative exists but is gated behind
+`--btrfs-rw-ephemeral-ok`, default false, and the comparator never passes it (its mount args are
+`--rw`, `--btrfs-verify-data-on-read`, `--no-background-scrub`).
+
+**So the whole picture is now consistent.** We write more bytes and issue more barriers than kernel
+btrfs because we do strictly more durability work per fsync — a full transaction commit against the
+kernel's tree-log fast path. We looked 2.2x faster only because the incumbent was paying a loop
+transport we were not (`bd-w2u82`); on symmetric transport we are **1.49x slower**, which is exactly
+what doing more work should look like. No part of the earlier apparent win required us to be less
+durable, and bd-5hqj2 closes on that.
+
+**THE LEVER THIS EXPOSES — `bd-jhuob`: we already have both halves of the fast path.** (No new measurement in this section; the `1.49x` figure below is a cross-reference to the `bd-w2u82` row banked earlier in this file, which carries its own provenance, and every other claim here is read from source with a file:line citation.)
+
+Kernel btrfs makes fsync cheap by writing a **tree log** and replaying it after a crash, rather than
+committing the whole transaction. We have a log writer (`btrfs_write_tree_log_for_sync`) AND a replayer
+(`ffs_btrfs::replay_tree_log`, called at mount from `lib.rs:4725` whenever `sb.log_root != 0`). The fast
+path is built; it is just not the default.
+
+**Why it is not, as far as source shows — and this is a hypothesis, not a proven claim.** Mount replays
+the log into `btrfs_tree_log_items` and the log message says *"applying read overlay"*. The items are
+applied at READ time by `btrfs_apply_tree_log_overlay{,_range}`, not merged into the in-memory trees —
+which is confirmed from the other side by the floor-descent fast path being **gated on an empty tree
+log**, precisely because the range walker applies the overlay and the floor walker does not
+(`lib.rs:~33053`). Kernel btrfs's replay is a real recovery that rewrites the trees; ours is a read-time
+patch. If that reading is right, a subsequent full commit would serialize trees that do NOT contain the
+logged items, and clearing `log_root` would then lose them — which would fully justify the flag being
+opt-in and named "ephemeral".
+
+**The lever is therefore: make tree-log replay a MERGE rather than an overlay**, so the log path can be
+the durable default for fsync. That attacks the btrfs fsync cost at its root rather than shaving the
+commit, and it is the difference between "a full transaction per fsync" and what the incumbent does.
+
+⚠️ **Verify the hypothesis before building anything on it.** The claim that a full commit would drop
+logged items is read from control flow, not observed; the deciding test is to write via the ephemeral
+path, force a full commit, remount, and check whether the logged items survive. That test needs a build
+and a mount, so it waits for the freeze to lift.
