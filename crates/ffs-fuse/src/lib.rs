@@ -222,6 +222,49 @@ pub fn splice_enabled() -> bool {
     splice_from_value(std::env::var("FFS_FUSE_SPLICE").ok().as_deref())
 }
 
+/// Whether this process asks the kernel to handle `opendir` itself (bd-q0xnl).
+///
+/// ZERO-MESSAGE OPENDIR. The kernel's own contract (`FUSE_NO_OPENDIR_SUPPORT`,
+/// `linux/fuse.h` bit 24, "kernel supports zero-message opendir") is that when the
+/// kernel advertises the capability, a daemon may answer `OPENDIR` with `ENOSYS`
+/// to mean "you handle it" — after which the kernel stops sending `OPENDIR` and
+/// `RELEASEDIR` for the rest of the connection.
+///
+/// This is safe HERE for a reason that is a property of this adapter rather than
+/// an argument: `releasedir` is already a no-op that documents directory handles
+/// as stateless, and `readdir`/`readdirplus` resolve by inode and ignore the
+/// handle entirely. There is no per-directory state for the kernel to stop
+/// creating.
+///
+/// OPT-IN, opposite polarity to [`splice_enabled`], and deliberately so. Splice
+/// defaults ON because every banked row was measured with it on; this has never
+/// been measured at all, and a default-ON protocol change would silently make new
+/// rows non-comparable with the bank.
+///
+/// SIZE HONESTLY. This removes two crossings PER DIRECTORY, not per entry. On the
+/// 20,048-entry readdir+stat row that is 2 of ~40,000 crossings and will not be
+/// visible. Where it can matter is many-directory work — a tree walk, the
+/// create/delete storm, parallel metadata — at bd-q0xnl's measured ~7.29 us per
+/// crossing. It is offered as an arm to measure, not as a claimed win.
+#[must_use]
+pub fn zero_message_opendir_from_value(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let t = raw.trim();
+    t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+}
+
+/// Whether `FFS_FUSE_ZERO_MESSAGE_OPENDIR` opted this process in (bd-q0xnl).
+#[must_use]
+pub fn zero_message_opendir_enabled() -> bool {
+    zero_message_opendir_from_value(
+        std::env::var("FFS_FUSE_ZERO_MESSAGE_OPENDIR")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// FUSE-over-io_uring transport configuration (bd-vbqc6).
 ///
 /// # Why this exists before the transport does
@@ -3183,6 +3226,7 @@ impl ReaddirplusAttrMemo {
 /// | `ReadaheadManager::invalidate_inode` | readahead       | leaf-only                        |
 /// | `ReadonlyXattrCache` methods    | readonly_xattr_cache | leaf-only                      |
 /// | `LastMissingCapabilityXattr::{contains,remember}` | missing_capability_xattr | leaf-only |
+/// | `opendir` / `init` zero-message gate | zero_message_opendir | atomic, no lock |
 /// | `FuseInodeLocks::acquire`       | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeLocks::try_acquire`   | inode_locks        | rank 0 → drop → rank 1 (sorted)  |
 /// | `FuseInodeGuard::Drop`          | inode_locks        | rank 0 → rank 1 (nested)         |
@@ -3231,6 +3275,20 @@ struct FuseInner {
     readahead: ReadaheadManager,
     readonly_xattr_cache: ReadonlyXattrCache,
     readdirplus_attr_memo: ReaddirplusAttrMemo,
+    /// Set at INIT when the kernel ADVERTISED `FUSE_NO_OPENDIR_SUPPORT` and the
+    /// operator opted in (bd-q0xnl). Only then may `opendir` answer `ENOSYS`.
+    ///
+    /// ⚠️ BOTH CONDITIONS ARE LOAD-BEARING, and getting this wrong breaks mounts
+    /// rather than slowing them. `ENOSYS` means "you handle it" ONLY when the
+    /// kernel advertised the capability; without it the kernel treats the reply as
+    /// a plain error and the caller's `opendir` fails, so every `ls` on the mount
+    /// fails. Writing the flag only where `add_capabilities` returned `Ok` makes
+    /// that unrepresentable rather than merely avoided.
+    ///
+    /// Lives in `FuseInner` and not in `FrankenFuse` because `FrankenFuse` is
+    /// `Clone` — one clone per dispatch worker — and `init` runs on exactly one of
+    /// them. A flag on the outer struct would be invisible to every other worker.
+    zero_message_opendir: std::sync::atomic::AtomicBool,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
 }
@@ -4176,6 +4234,34 @@ impl Filesystem for FrankenFuse {
             }
         }
 
+        // bd-q0xnl: zero-message opendir, OPT-IN. `add_capabilities` fails unless
+        // the KERNEL advertised the bit, so its `Ok` is the capability probe — and
+        // the arming flag is written ONLY on that `Ok`. That ordering is the whole
+        // safety argument: `opendir` can never answer `ENOSYS` to a kernel that
+        // would read it as a hard error and fail every directory open on the mount.
+        //
+        // Not attempted at all when the knob is unset, so the default negotiation
+        // is byte-identical to before. Contrast splice above, which is opt-OUT
+        // because the bank was measured with it on; nothing was ever measured with
+        // this, so defaulting it on would make new rows non-comparable.
+        if zero_message_opendir_enabled() {
+            match config.add_capabilities(fuse_consts::FUSE_NO_OPENDIR_SUPPORT) {
+                Ok(()) => {
+                    self.inner
+                        .zero_message_opendir
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        "FUSE_NO_OPENDIR_SUPPORT negotiated (FFS_FUSE_ZERO_MESSAGE_OPENDIR): \
+                         opendir/releasedir will be handled by the kernel"
+                    );
+                }
+                Err(missing) => debug!(
+                    missing,
+                    "kernel declined FUSE_NO_OPENDIR_SUPPORT; opendir stays a round trip"
+                ),
+            }
+        }
+
         if self.inner.parallel_dirops {
             match config.add_capabilities(PARALLEL_DIROPS_CAPABILITY) {
                 Ok(()) => debug!("FUSE parallel directory operations enabled"),
@@ -4403,6 +4489,24 @@ impl Filesystem for FrankenFuse {
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        // bd-q0xnl: hand opendir back to the kernel. Reachable only when INIT saw
+        // the kernel advertise FUSE_NO_OPENDIR_SUPPORT *and* the operator opted in
+        // — see the flag's own comment for why both are required. The kernel stops
+        // sending OPENDIR and RELEASEDIR after this, so it is answered once per
+        // connection, not once per directory.
+        //
+        // Skipping the type check this would otherwise do is not a hole: the
+        // kernel already knows the inode's type from the attributes we returned
+        // and does not issue readdir against a non-directory. `releasedir` is
+        // already a no-op here and readdir resolves by inode, so no state is lost.
+        if self
+            .inner
+            .zero_message_opendir
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            reply.error(libc::ENOSYS);
+            return;
+        }
         self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.dispatch_opendir(&cx, InodeNumber(ino)) {
@@ -6710,6 +6814,53 @@ mod tests {
     /// So the polarity here is opt-OUT, the opposite of every other knob in this
     /// file, and unrecognised input must fail OPEN to the shipping default rather
     /// than closed. Only the three explicit spellings turn it off.
+    /// bd-q0xnl: zero-message opendir must default OFF, and only an explicit
+    /// affirmative may turn it on.
+    ///
+    /// Polarity is the point, and it is the OPPOSITE of the splice knob below.
+    /// Splice is opt-OUT because every banked row was taken with it on; this has
+    /// never been measured at all, so an accidental default-ON would silently make
+    /// new rows non-comparable with the bank. Anything that is not a deliberate
+    /// yes must therefore read as no — including the empty string and junk.
+    #[test]
+    fn zero_message_opendir_defaults_off_bd_q0xnl() {
+        assert!(
+            !zero_message_opendir_from_value(None),
+            "unset must be OFF — this is a protocol change, not a tuning knob"
+        );
+        for off in ["", "0", "false", "off", "no", "yes-ish", "  ", "2", "onn"] {
+            assert!(
+                !zero_message_opendir_from_value(Some(off)),
+                "{off:?} is not an explicit affirmative and must read as OFF"
+            );
+        }
+        for on in ["1", "true", "TRUE", "on", "On", " 1 ", " true "] {
+            assert!(
+                zero_message_opendir_from_value(Some(on)),
+                "{on:?} is an explicit affirmative and must read as ON"
+            );
+        }
+    }
+
+    /// bd-q0xnl: opting in must NOT by itself arm the `ENOSYS` reply.
+    ///
+    /// The dangerous ordering is the opt-in setting the flag directly. `ENOSYS`
+    /// means "you handle it" only to a kernel that advertised
+    /// `FUSE_NO_OPENDIR_SUPPORT`; to any other kernel it is a hard error that
+    /// fails every directory open on the mount. So the flag starts false and is
+    /// written only where INIT saw `add_capabilities` return `Ok`.
+    #[test]
+    fn zero_message_opendir_starts_disarmed_bd_q0xnl() {
+        let fs = writable_fuse();
+        assert!(
+            !fs.inner
+                .zero_message_opendir
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a freshly constructed mount must not answer opendir with ENOSYS before \
+             INIT has confirmed the kernel advertises the capability"
+        );
+    }
+
     #[test]
     fn splice_defaults_on_and_only_explicit_values_disable_it() {
         assert!(
@@ -7328,6 +7479,7 @@ mod tests {
             readonly_xattr_cache: ReadonlyXattrCache::default(),
             readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
         let inode = InodeNumber(42);
@@ -18799,6 +18951,7 @@ mod tests {
                 false,
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
@@ -20637,6 +20790,7 @@ AllowOther"#;
                 false,
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
         };
         let dbg = format!("{inner:?}");
