@@ -11273,3 +11273,39 @@ cause is somewhere other than the overlay-versus-merge distinction. It also does
 READ-path detail the bead cites — the floor-descent fast path really is gated on an empty tree log,
 because the floor walker does not apply the overlay — which is a correctness guard on reads and has
 no bearing on durability.
+
+## bd-jhuob — GATE ADDED: our tree-log format may not be one the KERNEL can replay, and a crash is what exposes it
+
+Found while fixing the opposite direction (refusing to replay a kernel-format log, above). The
+hazard runs both ways and the second way is worse, because it concerns images WE produce.
+
+**What we write.** `btrfs_write_tree_log_for_sync` serializes a single LEAF at `sb.log_root`
+(`BtrfsCowNode::Leaf { items }`, owner `BTRFS_TREE_LOG_OBJECTID`, `log_root_level = 0`) holding the
+logged fs-tree items directly.
+
+**What the kernel expects there.** A log ROOT TREE: a tree whose items are ROOT_ITEMs, one per
+subvolume with a log, each pointing at that subvolume's own log tree. ⚠️ PROVENANCE: this is from
+knowledge of `fs/btrfs/tree-log.c`, NOT verified on this box — the UAPI header carries the
+superblock fields and the objectid but not the log root's shape. What the header DOES confirm is
+that both of our other assumptions are right: `BTRFS_TREE_LOG_OBJECTID` is `-6ULL`
+(= `u64::MAX - 5`, our constant), and "We always use generation + 1 to read log tree root"
+(btrfs_tree.h:682) matches our writer bumping the generation before serializing.
+
+**Why it matters, and when it is reachable.** A full commit clears `log_root` (bd-mogn1), so an
+image we unmount cleanly carries no log. The exposure is exactly the window the log exists FOR: a
+crash between an ephemeral fsync and the next full commit leaves `log_root` set on disk. If the
+kernel then mounts that image and cannot parse our leaf as a log root tree, it refuses the
+filesystem — our reader opens it, the kernel does not, which is the silent-interoperability shape
+of bd-73bi2 that this bead's own scope warning names.
+
+**This gates promoting the tree log to the default fsync strategy.** The four correctness defects
+this session fixed (bd-sv7ql, bd-mogn1, bd-dm01m, bd-0ajub) are necessary and not sufficient: a
+format the kernel cannot replay makes the fast path unshippable no matter how correct our own
+replay is. Either the writer emits the kernel's shape, or the flag stays off.
+
+**The test is cheap and it is not the one already planned.** bd-jhuob's falsification (write
+ephemeral, force a full commit, remount, check survival) exercises OUR replay and would pass
+regardless, because a full commit clears the log before anyone else sees it. The interop test must
+NOT commit: write via the ephemeral path, `kill -9` the daemon so `log_root` survives on disk, then
+ask the KERNEL to mount. That distinction is why this is recorded separately rather than folded
+into the existing acceptance.
