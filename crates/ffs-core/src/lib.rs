@@ -1108,6 +1108,14 @@ struct BtrfsAllocState {
     nodesize: u32,
     /// Sector size in bytes (copied from superblock for convenience).
     sectorsize: u32,
+    /// bd-0ajub: the tree-log block currently published in the superblock, as
+    /// `(bytenr, num_bytes, is_metadata)`.
+    ///
+    /// Every ephemeral fsync allocated a FRESH nodesize extent and nothing ever freed
+    /// the one it superseded, so a long-lived mount leaked one block plus one extent
+    /// item per fsync — unbounded metadata growth on an fsync-heavy workload. Holding
+    /// the live block here lets the next write hand the superseded one back.
+    btrfs_live_log_block: Option<(u64, u64, bool)>,
     /// bd-dm01m: every inode fsync'd through the tree-log path since the last full
     /// commit.
     ///
@@ -1187,6 +1195,15 @@ struct BtrfsTreeLogWriteStats {
     items_count: usize,
     allocated_bytes: u64,
     metadata_allocation: bool,
+    /// bd-0ajub: the log block this write superseded — `(bytenr, num_bytes,
+    /// is_metadata)` — for the caller to free once the NEW `log_root` is durable.
+    ///
+    /// It cannot be freed inside the write: until the new `log_root` reaches disk the
+    /// on-disk superblock still points at the OLD block, so returning its space to
+    /// the allocator early lets the next allocation overwrite the log a crash would
+    /// still need. The caller frees it after its `dev.sync()`, which is the moment
+    /// the new pointer becomes durable.
+    retired_log_block: Option<(u64, u64, bool)>,
 }
 
 /// Statistics returned by full btrfs transaction commit (bd-jdo53).
@@ -8679,6 +8696,8 @@ impl OpenFs {
             written_tree_blocks: std::collections::HashMap::new(),
             // No fsync has been logged in this mount yet (bd-dm01m).
             btrfs_logged_inodes: std::collections::BTreeSet::new(),
+            // No tree log published yet (bd-0ajub).
+            btrfs_live_log_block: None,
         })
     }
 
@@ -29270,6 +29289,12 @@ impl OpenFs {
 
         let (log_root, allocated_bytes, metadata_allocation) =
             Self::btrfs_allocate_tree_log_block(alloc)?;
+        // bd-0ajub: rotate. The block we are superseding is handed to the caller to
+        // free AFTER the new log_root is durable, never here — until then the on-disk
+        // superblock still points at it.
+        let retired_log_block = alloc
+            .btrfs_live_log_block
+            .replace((log_root, allocated_bytes, metadata_allocation));
         alloc.generation = alloc.generation.checked_add(1).ok_or_else(|| {
             FfsError::InvalidGeometry("btrfs tree-log generation overflow".into())
         })?;
@@ -29309,6 +29334,7 @@ impl OpenFs {
             },
             allocated_bytes,
             metadata_allocation,
+            retired_log_block,
         };
         Ok((node_bytes, sb_bytes, stats))
     }
@@ -29496,6 +29522,31 @@ impl OpenFs {
 
             match self.dev.sync(cx) {
                 Ok(()) => {
+                    // bd-0ajub: the new log_root is durable as of this sync, so the
+                    // block it superseded is now unreachable and its space can go
+                    // back. Freeing it BEFORE this point would let the next
+                    // allocation overwrite the log that a crash would still have to
+                    // replay from. A failure to free is logged, not propagated: the
+                    // fsync itself has already succeeded durably, and turning a
+                    // space-accounting problem into a failed fsync would be the worse
+                    // trade.
+                    if let Some((bytenr, num_bytes, is_metadata)) = tree_log.retired_log_block {
+                        if let Ok(alloc_mutex) = self.require_btrfs_alloc_state() {
+                            if let Err(err) = alloc_mutex
+                                .write()
+                                .extent_alloc
+                                .free_extent(bytenr, num_bytes, is_metadata)
+                            {
+                                warn!(
+                                    target: "ffs::btrfs::rw",
+                                    operation_id = %operation_id,
+                                    retired_log_bytenr = bytenr,
+                                    error = ?err,
+                                    "btrfs tree-log: superseded block not freed; space leaked"
+                                );
+                            }
+                        }
+                    }
                     info!(
                         target: "ffs::btrfs::rw",
                         operation_id = %operation_id,
