@@ -30442,6 +30442,9 @@ impl OpenFs {
         } else {
             new_gen
         };
+        // bd-rsjvf: keep what the ROOT_ITEM said BEFORE the patch, so an update
+        // that would write identical bytes can be skipped below.
+        let root_item_before = root_item_data.clone();
         BtrfsRootItem::patch_root_commit(
             &mut root_item_data,
             fs_tree_bytenr,
@@ -30449,10 +30452,33 @@ impl OpenFs {
             fs_root_published_gen,
         )
         .map_err(|e| FfsError::Parse(format!("ROOT_ITEM patch failed: {e}")))?;
-        alloc
-            .root_tree
-            .update(&fs_root_key, &root_item_data)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        // ⚠️ SKIPPING AN IDENTICAL UPDATE IS NOT A MICRO-OPTIMISATION HERE. An
+        // `update` COWs the leaf it lands in and every node up to the root, so
+        // each one gives the root tree a fresh set of block ids — and
+        // `written_tree_blocks` reuses a block only while its id survives. A
+        // fully-reused fs tree (the bd-42gtq case: a pure overwrite changes no
+        // tree content) patches this ROOT_ITEM with the SAME bytenr, the SAME
+        // level and the SAME generation it already held, so the write is a no-op
+        // that nevertheless dirties the whole root-tree spine.
+        //
+        // On its own this saves nothing: the root tree still allocates a fresh
+        // address for every block, because the reuse map is applied to the FS
+        // tree only. It is the PREREQUISITE — with the update skipped the ids
+        // survive, so extending the map to the root tree can actually skip
+        // something. Landing the safe half first is deliberate; the map
+        // extension carries bd-rsjvf's generation hazard and wants a build.
+        if root_item_data == root_item_before {
+            trace!(
+                target: "ffs::btrfs::writeback",
+                objectid = BTRFS_FS_TREE_OBJECTID,
+                "root_item_unchanged_update_skipped"
+            );
+        } else {
+            alloc
+                .root_tree
+                .update(&fs_root_key, &root_item_data)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
 
         // ── CSUM_TREE commit (bd-x3fcu slice B3) ────────────────────────────────
         //
@@ -30522,6 +30548,7 @@ impl OpenFs {
                             .into(),
                     )
                 })?;
+            let csum_root_item_before = csum_root_item_data.clone();
             BtrfsRootItem::patch_root_commit(
                 &mut csum_root_item_data,
                 csum_tree_bytenr,
@@ -30529,16 +30556,39 @@ impl OpenFs {
                 new_gen,
             )
             .map_err(|e| FfsError::Parse(format!("CSUM_TREE ROOT_ITEM patch failed: {e}")))?;
-            alloc
-                .root_tree
-                .update(&csum_root_key, &csum_root_item_data)
-                .or_else(|err| match err {
-                    BtrfsMutationError::KeyNotFound => {
-                        alloc.root_tree.insert(csum_root_key, &csum_root_item_data)
-                    }
-                    other => Err(other),
-                })
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            // Same skip as the FS_TREE ROOT_ITEM above (bd-rsjvf): an update that
+            // writes identical bytes still COWs the root-tree spine. Note this one
+            // is reached far less often — the block above runs only when the csum
+            // tree has nodes, and the NODATASUM-default interim leaves it empty on
+            // current production images, so the csum tree contributes zero of the
+            // residual nodes per fsync. That is worth knowing before anyone counts
+            // on extending the reuse map here.
+            let csum_root_item_unchanged = csum_root_item_data == csum_root_item_before;
+            // The `or_else` insert is why the skip is conditional on the item
+            // having been PRESENT: a fresh image has no CSUM_TREE ROOT_ITEM, and
+            // the template it was cloned from is a different key's item, so
+            // "unchanged" there means "identical to the FS_TREE template", not
+            // "already on disk". Skipping then would leave the csum tree with no
+            // ROOT_ITEM at all.
+            let csum_root_item_present = alloc.root_tree.get(&csum_root_key).is_some();
+            if csum_root_item_unchanged && csum_root_item_present {
+                trace!(
+                    target: "ffs::btrfs::writeback",
+                    objectid = BTRFS_CSUM_TREE_OBJECTID,
+                    "root_item_unchanged_update_skipped"
+                );
+            } else {
+                alloc
+                    .root_tree
+                    .update(&csum_root_key, &csum_root_item_data)
+                    .or_else(|err| match err {
+                        BtrfsMutationError::KeyNotFound => {
+                            alloc.root_tree.insert(csum_root_key, &csum_root_item_data)
+                        }
+                        other => Err(other),
+                    })
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            }
         }
 
         // ── Newly-created subvolume fs-trees (bd-tm48j) ────────────────────────
