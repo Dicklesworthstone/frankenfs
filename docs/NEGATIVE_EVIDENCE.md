@@ -11085,3 +11085,50 @@ necessary, so this workload has no further block to remove — but that is a sta
 workload (a pure 4 KiB overwrite), not about the write path in general. An allocating write still
 moves descriptors and still writes them, which is correct and which the
 `gdt_write_is_skipped_only_when_the_descriptor_block_is_byte_identical_bd_ygznx` test pins.
+
+## bd-rsjvf / bd-jhuob — COUNTED: btrfs writes 25 blocks per client fsync to the incumbent's 18, and the residual is EXACTLY six tree nodes
+
+**Measured 2026-08-18, thinkstation1, kernel 6.17.0-41-generic.** `scripts/fsync_flush_count.py`,
+8 client fsyncs per arm, btrfs, both arms in ONE invocation. Daemon ELF sha256
+`bfceb72164b521150a761930183ccb7d58ca76425216d5d6c7218fd753b9c0b5`.
+
+    arm             N  ctl  flushes  per fsync    bytes   B/fsync  x4KiB
+    kernel-btrfs    8    0       16     2.0000   589824   73728.0  18.00
+    frankenfs-fuse  8    0       24     3.0000   819200  102400.0  25.00
+
+    write amplification, ours / kernel-btrfs: 1.389x
+
+Per-arm provenance: `kernel-btrfs` loadavg 46.87/28.81/23.90, cpu MHz mean 2970 spread 2.77x;
+`frankenfs-fuse` loadavg 44.00/28.78/23.95, cpu MHz mean 3384 spread 2.80x. Both idle controls 0.
+`btrfs check` after the FUSE arm ran all 8 phases and passed.
+
+**AN HONEST LOSS, and a precisely composed one.** 102400 bytes is not an approximate figure:
+
+    4096 (one data block) + 6 x 16384 (six tree nodes) = 102400   exactly
+
+which is bd-rsjvf's stated post-bd-42gtq cost, confirmed by counting rather than by reading the
+commit path. The residual per fsync is six nodesize blocks and nothing else.
+
+**THIS CONFIRMS THE PREDICTION THAT THE ROOT_ITEM SKIP SAVES NOTHING ON ITS OWN.** `9e462485`
+landed the byte-identity skip on the FS_TREE and CSUM_TREE ROOT_ITEM patches and said in its own
+message that it "SAVES NOTHING ON ITS OWN ... the root tree still allocates a fresh address for
+every block, because the reuse map is applied to the FS tree only." The count is unchanged at six
+nodes, which is exactly that claim measured. The skip remains a prerequisite, not a win, and the
+ledger should not carry it as one.
+
+**ALSO A REGRESSION CHECK, which is why it was run now.** The bd-a136s mount-time chunk-tree and
+device-tree load (`4ef5a7e3`) runs on EVERY read-write btrfs mount as of this session, growth flag
+or not. `btrfs check` clean after 8 write+fsync cycles says that loading did not disturb the commit
+path.
+
+⚠️ **A COUNT, NOT A RATIO.** `1.389x` is bytes to the backing file per client fsync, not time. It
+is load-independent, which matters here: the arms ran at loadavg 46.9 and 44.0, far above any
+certification ceiling, and a wall-clock row taken there would be worthless while this one is not.
+
+**WHERE THE SIX NODES GO, and what would move them.** bd-rsjvf's own analysis, now backed by this
+count: the csum tree contributes ZERO on current images (its commit block is guarded by
+`csum_dag.node_count() > 0` and the NODATASUM default leaves it empty), so the six are the extent
+tree and the root tree. The extent tree is dirty by construction (bd-fv9tc/bd-k74ef insert
+METADATA_ITEMs describing this very transaction's allocations; bd-4cxkd recomputes accounting from
+it). The root tree is the tractable half, and whether it is reusable depends on whether the
+ROOT_ITEM skip actually fires — untested here, because this script discards the daemon's log.
