@@ -6801,6 +6801,104 @@ pub struct GrowthDevice {
     pub dev_uuid: [u8; 16],
 }
 
+/// Bytes at the head of a device that no chunk may occupy.
+///
+/// ⚠️ PROVENANCE: 1 MiB is mkfs.btrfs's reservation, from knowledge — it is not
+/// in the UAPI headers on this box, so it is not verified here. Unlike the
+/// superblock mirrors, being wrong about it is not corruption: it is a
+/// convention, and the FORMAT-mandated exclusions (the superblock copies) are
+/// fenced separately by
+/// `DeviceOccupancy::reserve_superblock_mirrors`, which does not depend on this
+/// value. A device whose DEV_ITEM declares a larger `start_offset` wins over it.
+pub const BTRFS_DEVICE_RESERVED_HEAD: u64 = 1024 * 1024;
+
+impl GrowthDevice {
+    /// Read the single device's parameters out of the chunk tree.
+    ///
+    /// The DEV_ITEM lives in the CHUNK tree — "the device items go into the
+    /// chunk tree. The key is in the form [ 1 BTRFS_DEV_ITEM_KEY device_id ]"
+    /// (`linux/btrfs_tree.h:118`) — so growth reads its device parameters from
+    /// there rather than being told them.
+    ///
+    /// `chunk_tree_uuid` is stamped into the DEV_EXTENT this will produce. It
+    /// must come from the filesystem, not be invented: this repo's commit path
+    /// writes `sb.fsid` into every node header's chunk-tree uuid field, so that
+    /// is what a caller passes.
+    ///
+    /// # Errors
+    /// Refuses a filesystem with no DEV_ITEM, one whose DEV_ITEM does not parse,
+    /// and — deliberately — one with MORE THAN ONE DEVICE. Everything in this
+    /// bead models a single device: `DeviceOccupancy` maps one devid, the sizing
+    /// policy reasons about one device's size, and `plan_chunk_allocation` emits
+    /// exactly one stripe. On a two-device filesystem those assumptions do not
+    /// merely under-perform, they place a chunk using one device's free space
+    /// and record it against whichever devid happened to be found first. Refusing
+    /// costs a multi-device filesystem the ability to grow; guessing costs it its
+    /// data.
+    pub fn from_chunk_tree(
+        chunk_tree: &InMemoryCowBtrfsTree,
+        chunk_tree_uuid: [u8; 16],
+    ) -> Result<Self, BtrfsMutationError> {
+        let mut found: Option<(u64, Vec<u8>)> = None;
+        let mut extra_devices = false;
+        chunk_tree.range_with(
+            &BtrfsKey {
+                objectid: BTRFS_DEV_ITEMS_OBJECTID,
+                item_type: BTRFS_DEV_ITEM_KEY,
+                offset: 0,
+            },
+            &BtrfsKey {
+                objectid: BTRFS_DEV_ITEMS_OBJECTID,
+                item_type: BTRFS_DEV_ITEM_KEY,
+                offset: u64::MAX,
+            },
+            |key, value| {
+                if key.item_type != BTRFS_DEV_ITEM_KEY
+                    || key.objectid != BTRFS_DEV_ITEMS_OBJECTID
+                {
+                    return;
+                }
+                if found.is_some() {
+                    extra_devices = true;
+                    return;
+                }
+                found = Some((key.offset, value.to_vec()));
+            },
+        )?;
+
+        if extra_devices {
+            return Err(BtrfsMutationError::InvalidConfig(
+                "growth models a single device; this filesystem has more than one",
+            ));
+        }
+        let Some((devid, bytes)) = found else {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "the chunk tree has no DEV_ITEM",
+            ));
+        };
+        let item = parse_dev_item(&bytes)
+            .map_err(|_| BtrfsMutationError::BrokenInvariant("the DEV_ITEM does not parse"))?;
+        if item.devid != devid {
+            // The key's offset IS the device id, so a DEV_ITEM whose body
+            // disagrees with its own key is a filesystem we should not be
+            // allocating on.
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "the DEV_ITEM's devid disagrees with its key",
+            ));
+        }
+
+        Ok(Self {
+            devid,
+            total_bytes: item.total_bytes,
+            bytes_used: item.bytes_used,
+            min_offset: item.start_offset.max(BTRFS_DEVICE_RESERVED_HEAD),
+            sector_size: item.sector_size,
+            chunk_tree_uuid,
+            dev_uuid: item.uuid,
+        })
+    }
+}
+
 /// Decide whether the coming commit needs a new metadata chunk, and if so
 /// produce the plan for one.
 ///
@@ -19527,6 +19625,140 @@ mod tests {
         assert!(chunk_tree.get(&plan.chunk.key).is_none());
         assert!(dev_tree.get(&plan.dev_extent_key).is_none());
         assert!(alloc.block_group(128 * MB).is_none());
+    }
+
+    fn seed_dev_item_full(
+        chunk_tree: &mut InMemoryCowBtrfsTree,
+        devid: u64,
+        total_bytes: u64,
+        bytes_used: u64,
+        start_offset: u64,
+    ) {
+        let item = BtrfsDevItem {
+            devid,
+            total_bytes,
+            bytes_used,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            dev_type: 0,
+            generation: 1,
+            start_offset,
+            dev_group: 0,
+            seek_speed: 0,
+            bandwidth: 0,
+            uuid: [u8::try_from(devid).unwrap_or(0xAA); 16],
+            fsid: [0x42; 16],
+        };
+        let mut buf = vec![0_u8; BTRFS_DEV_ITEM_SIZE];
+        item.write_to_bytes(&mut buf).expect("dev item serializes");
+        chunk_tree
+            .insert(
+                BtrfsKey {
+                    objectid: BTRFS_DEV_ITEMS_OBJECTID,
+                    item_type: BTRFS_DEV_ITEM_KEY,
+                    offset: devid,
+                },
+                &buf,
+            )
+            .expect("seed dev item");
+    }
+
+    /// bd-a136s. Growth reads the device it is going to carve up out of the chunk
+    /// tree rather than being told about it, so the values cannot drift from what
+    /// is on disk.
+    #[test]
+    fn growth_device_is_read_from_the_dev_item_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item_full(&mut chunk_tree, 7, 512 * MB, 64 * MB, 0);
+
+        let device = GrowthDevice::from_chunk_tree(&chunk_tree, [0x42; 16]).expect("read");
+        assert_eq!(device.devid, 7);
+        assert_eq!(device.total_bytes, 512 * MB);
+        assert_eq!(device.bytes_used, 64 * MB);
+        assert_eq!(device.sector_size, 4096);
+        assert_eq!(device.dev_uuid, [7_u8; 16]);
+        assert_eq!(device.chunk_tree_uuid, [0x42; 16]);
+        // A zero start_offset falls back to the reserved head; it never yields 0,
+        // which would let a chunk sit on the front of the device.
+        assert_eq!(device.min_offset, BTRFS_DEVICE_RESERVED_HEAD);
+
+        // A device that declares a LARGER start_offset wins over the convention.
+        let mut offset_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item_full(&mut offset_tree, 1, 512 * MB, 0, 4 * MB);
+        let offset_device = GrowthDevice::from_chunk_tree(&offset_tree, [0; 16]).expect("read");
+        assert_eq!(offset_device.min_offset, 4 * MB);
+    }
+
+    /// bd-a136s. ⚠️ THE REFUSAL THAT MATTERS: a multi-device filesystem.
+    ///
+    /// Everything in this bead models ONE device — `DeviceOccupancy` maps one
+    /// devid, the sizing policy reasons about one device's size, and
+    /// `plan_chunk_allocation` emits exactly one stripe. On two devices those
+    /// assumptions do not merely under-perform: a chunk would be placed using one
+    /// device's free space and recorded against whichever devid was found first.
+    /// Refusing costs a multi-device filesystem the ability to grow. Guessing
+    /// costs it its data.
+    #[test]
+    fn growth_refuses_a_multi_device_filesystem_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item_full(&mut chunk_tree, 1, 512 * MB, 0, 0);
+        assert!(
+            GrowthDevice::from_chunk_tree(&chunk_tree, [0; 16]).is_ok(),
+            "one device is fine"
+        );
+
+        seed_dev_item_full(&mut chunk_tree, 2, 512 * MB, 0, 0);
+        assert!(
+            GrowthDevice::from_chunk_tree(&chunk_tree, [0; 16]).is_err(),
+            "a second device must refuse, not pick one"
+        );
+
+        // No DEV_ITEM at all is a different refusal, and also a refusal.
+        let empty = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        assert!(GrowthDevice::from_chunk_tree(&empty, [0; 16]).is_err());
+    }
+
+    /// bd-a136s. A DEV_ITEM whose body disagrees with its own key is a
+    /// filesystem we must not allocate on: the key's offset IS the device id, so
+    /// the two cannot legitimately differ, and picking either one silently would
+    /// record dev extents against a device that does not exist.
+    #[test]
+    fn growth_refuses_a_dev_item_that_contradicts_its_key_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        let item = BtrfsDevItem {
+            devid: 9, // body says 9 ...
+            total_bytes: 512 * MB,
+            bytes_used: 0,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            dev_type: 0,
+            generation: 1,
+            start_offset: 0,
+            dev_group: 0,
+            seek_speed: 0,
+            bandwidth: 0,
+            uuid: [0xAA; 16],
+            fsid: [0x42; 16],
+        };
+        let mut buf = vec![0_u8; BTRFS_DEV_ITEM_SIZE];
+        item.write_to_bytes(&mut buf).expect("serializes");
+        chunk_tree
+            .insert(
+                BtrfsKey {
+                    objectid: BTRFS_DEV_ITEMS_OBJECTID,
+                    item_type: BTRFS_DEV_ITEM_KEY,
+                    offset: 1, // ... key says 1
+                },
+                &buf,
+            )
+            .expect("insert");
+
+        assert!(GrowthDevice::from_chunk_tree(&chunk_tree, [0; 16]).is_err());
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
