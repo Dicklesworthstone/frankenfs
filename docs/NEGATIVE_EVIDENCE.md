@@ -11044,3 +11044,44 @@ something downstream trusts the running tally. Before filing "X is never freed",
 writer of the quantity — a periodic recompute-from-truth makes the missing decrement dead
 code rather than a defect, and the recompute lived in a different crate from both the alloc
 and the free.
+
+## bd-ygznx — COUNTED: 2.00 blocks per client fsync, and HALF the incumbent's write amplification
+
+**Measured 2026-08-18, thinkstation1, kernel 6.17.0-41-generic.** `scripts/fsync_flush_count.py`,
+8 client fsyncs per arm, ext4, both arms in ONE invocation. Daemon ELF sha256
+`bfceb72164b521150a761930183ccb7d58ca76425216d5d6c7218fd753b9c0b5` (`target/debug/ffs-cli`).
+
+    arm             N  ctl  flushes  per fsync    bytes   B/fsync  x4KiB
+    kernel-ext4     8    0       16     2.0000   131072   16384.0   4.00
+    frankenfs-fuse  8    0        8     1.0000    65536    8192.0   2.00
+
+    write amplification, ours / kernel-ext4: 0.500x
+
+Per-arm provenance, sampled at the moment each arm ran:
+`kernel-ext4` loadavg 21.82/25.92/22.32, cpu MHz min 1429 max 4070 mean 2600, spread 2.85x;
+`frankenfs-fuse` loadavg 20.79/25.64/22.25, cpu MHz min 1429 max 4168 mean 2387, spread 2.92x.
+Both idle controls read 0, which the script refuses on. e2fsck after the FUSE arm: clean (the
+script fails closed on a dirty image).
+
+**bd-ygznx's target was 3 blocks per client fsync down to 2. It reads 2.00.** The group-descriptor
+block is no longer written on a pure overwrite — an overwrite allocates nothing, so no descriptor
+changes, and the byte-identity guard in `rmw_block`'s default now skips a write of bytes already
+on disk.
+
+⚠️ **THIS IS A COUNT, NOT A RATIO, AND NO WALL-CLOCK CLAIM IS MADE.** The instrument counts
+barriers and bytes to the backing file per client fsync. It is load-independent and deterministic,
+which is why it is trustworthy at loadavg 22 where no timing row would be — and it is also why
+`0.500x` must not be read as "twice as fast". What it says is that on this workload we ask the
+backing file for HALF the bytes and HALF the barriers kernel ext4 does.
+
+⚠️ **THE BEFORE/AFTER IS CROSS-RUN, NOT A WITHIN-INVOCATION A/B.** The `3` is this bead's own
+earlier count on this same script; the `2.00` is measured now. The `rmw_block` skip is not
+env-gated, so one ELF cannot serve both arms and the honest statement is "this instrument counted
+3 before the change and counts 2 after", not a same-ELF A/B. The vs-incumbent half IS within one
+invocation, because the kernel arm ran in the same run.
+
+**What it does not settle.** Two blocks per fsync is the inode-table block and the data block, both
+necessary, so this workload has no further block to remove — but that is a statement about THIS
+workload (a pure 4 KiB overwrite), not about the write path in general. An allocating write still
+moves descriptors and still writes them, which is correct and which the
+`gdt_write_is_skipped_only_when_the_descriptor_block_is_byte_identical_bd_ygznx` test pins.
