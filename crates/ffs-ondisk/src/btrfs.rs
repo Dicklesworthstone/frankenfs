@@ -1261,7 +1261,10 @@ pub struct BtrfsDevItem {
 }
 
 /// Size of a btrfs_dev_item on disk (98 bytes).
-const BTRFS_DEV_ITEM_SIZE: usize = 98;
+///
+/// Public because a caller updating the DEV_ITEM's `bytes_used` (bd-a136s)
+/// needs to size the buffer it writes into.
+pub const BTRFS_DEV_ITEM_SIZE: usize = 98;
 
 /// Parse a DEV_ITEM from raw leaf data.
 pub fn parse_dev_item(data: &[u8]) -> Result<BtrfsDevItem, ParseError> {

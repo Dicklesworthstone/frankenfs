@@ -7005,10 +7005,37 @@ pub fn apply_chunk_allocation(
         return Err(BtrfsMutationError::BrokenInvariant(reason));
     }
 
+    // The DEV_ITEM's `bytes_used` must rise by this chunk's device footprint, or
+    // `btrfs check` reports a device whose usage disagrees with its dev extents.
+    // It lives in the CHUNK tree — "the device items go into the chunk tree. The
+    // key is in the form [ 1 BTRFS_DEV_ITEM_KEY device_id ]"
+    // (linux/btrfs_tree.h:118) — so it is read here, with everything else that
+    // can refuse, and written below with everything else that must happen.
+    let dev_item_key = BtrfsKey {
+        objectid: BTRFS_DEV_ITEMS_OBJECTID,
+        item_type: BTRFS_DEV_ITEM_KEY,
+        offset: devid,
+    };
+    let Some(dev_item_bytes) = chunk_tree.get(&dev_item_key) else {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "the chunk tree has no DEV_ITEM for this device",
+        ));
+    };
+    let mut dev_item = parse_dev_item(&dev_item_bytes)
+        .map_err(|_| BtrfsMutationError::BrokenInvariant("the DEV_ITEM does not parse"))?;
+    dev_item.bytes_used = plan.dev_bytes_used_after;
+
     let chunk_value = plan
         .chunk
         .to_item_bytes()
         .map_err(|_| BtrfsMutationError::InvalidConfig("chunk item does not serialize"))?;
+    // Serialized into the buffer it was READ from, so the item keeps its exact
+    // size: a same-size in-place update cannot overflow the leaf it sits in, and
+    // this runs during a commit that has already sized its trees.
+    let mut dev_item_value = dev_item_bytes.clone();
+    dev_item
+        .write_to_bytes(&mut dev_item_value)
+        .map_err(|_| BtrfsMutationError::InvalidConfig("DEV_ITEM does not serialize"))?;
     let dev_extent_value = plan
         .dev_extent
         .to_bytes()
@@ -7036,6 +7063,7 @@ pub fn apply_chunk_allocation(
         .extent_tree_mut()
         .insert(plan.block_group_key, &plan.block_group.to_bytes())?;
     alloc.add_block_group(plan.chunk.key.offset, plan.block_group);
+    chunk_tree.update(&dev_item_key, &dev_item_value)?;
 
     if plan.needs_sys_chunk_array {
         let sb = superblock
@@ -18743,6 +18771,7 @@ mod tests {
     fn applying_a_chunk_plan_makes_a_failing_allocation_succeed_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -18810,6 +18839,7 @@ mod tests {
     fn a_refused_chunk_plan_writes_nothing_at_all_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -18894,6 +18924,7 @@ mod tests {
     fn a_system_chunk_records_itself_in_the_superblock_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -18952,6 +18983,7 @@ mod tests {
     fn an_overlapping_physical_range_is_refused_even_with_a_new_key_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -19117,6 +19149,41 @@ mod tests {
         );
     }
 
+    /// Every real btrfs filesystem has a DEV_ITEM in its chunk tree — "the device
+    /// items go into the chunk tree" (linux/btrfs_tree.h:118) — and chunk
+    /// allocation updates its `bytes_used`. A test chunk tree without one models
+    /// a filesystem that cannot exist, so the tests seed it.
+    fn seed_dev_item(chunk_tree: &mut InMemoryCowBtrfsTree, devid: u64, total_bytes: u64) {
+        let item = BtrfsDevItem {
+            devid,
+            total_bytes,
+            bytes_used: 0,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            dev_type: 0,
+            generation: 1,
+            start_offset: 0,
+            dev_group: 0,
+            seek_speed: 0,
+            bandwidth: 0,
+            uuid: [0x22; 16],
+            fsid: [0x42; 16],
+        };
+        let mut buf = vec![0_u8; BTRFS_DEV_ITEM_SIZE];
+        item.write_to_bytes(&mut buf).expect("dev item serializes");
+        chunk_tree
+            .insert(
+                BtrfsKey {
+                    objectid: BTRFS_DEV_ITEMS_OBJECTID,
+                    item_type: BTRFS_DEV_ITEM_KEY,
+                    offset: devid,
+                },
+                &buf,
+            )
+            .expect("seed dev item");
+    }
+
     fn growth_device(total: u64, bytes_used: u64) -> GrowthDevice {
         GrowthDevice {
             devid: 1,
@@ -19146,6 +19213,7 @@ mod tests {
         let demand = NODES * NODESIZE;
 
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(NODESIZE);
@@ -19376,6 +19444,89 @@ mod tests {
             "expected placement past the mirror, got {physical}"
         );
         assert!(end <= DEV, "and it must still fit on the device");
+    }
+
+    /// bd-a136s. Allocating a chunk consumes device space, so the DEV_ITEM's
+    /// `bytes_used` must rise by exactly the chunk's footprint. Leaving it stale
+    /// is what `btrfs check` reports as a device whose usage disagrees with its
+    /// dev extents — an image that mounts and fails its own consistency check.
+    #[test]
+    fn applying_a_chunk_raises_the_dev_item_bytes_used_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, 512 * MB);
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+
+        let dev_item_key = BtrfsKey {
+            objectid: BTRFS_DEV_ITEMS_OBJECTID,
+            item_type: BTRFS_DEV_ITEM_KEY,
+            offset: 1,
+        };
+        let before = parse_dev_item(&chunk_tree.get(&dev_item_key).expect("seeded"))
+            .expect("parses");
+        assert_eq!(before.bytes_used, 0);
+
+        let plan = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            128 * MB,
+            96 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+            .expect("apply");
+
+        let after = parse_dev_item(&chunk_tree.get(&dev_item_key).expect("still present"))
+            .expect("parses");
+        assert_eq!(
+            after.bytes_used, plan.dev_bytes_used_after,
+            "bytes_used must be exactly what the plan computed"
+        );
+        assert_eq!(
+            after.bytes_used,
+            before.bytes_used + plan.chunk.length,
+            "and that is the previous value plus this chunk's footprint"
+        );
+        // Every other field is untouched: this is a one-field update, and a
+        // writer that rebuilt the item from defaults would pass a bytes_used
+        // check while silently resetting the device's identity.
+        assert_eq!(after.devid, before.devid);
+        assert_eq!(after.total_bytes, before.total_bytes);
+        assert_eq!(after.uuid, before.uuid);
+        assert_eq!(after.fsid, before.fsid);
+        assert_eq!(after.sector_size, before.sector_size);
+    }
+
+    /// bd-a136s. A chunk tree with no DEV_ITEM cannot record the allocation, so
+    /// the allocation must not happen. Refusing late — after the chunk item and
+    /// dev extent were inserted — would leave exactly the inconsistency the
+    /// all-or-nothing ordering exists to prevent.
+    #[test]
+    fn a_chunk_tree_without_a_dev_item_refuses_the_allocation_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        // Deliberately NOT seeded.
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+
+        let plan = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            128 * MB,
+            96 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        assert!(
+            apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+                .is_err(),
+            "no DEV_ITEM means the allocation cannot be recorded, so it must not happen"
+        );
+        assert!(chunk_tree.get(&plan.chunk.key).is_none());
+        assert!(dev_tree.get(&plan.dev_extent_key).is_none());
+        assert!(alloc.block_group(128 * MB).is_none());
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
