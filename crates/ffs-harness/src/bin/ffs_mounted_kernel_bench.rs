@@ -543,6 +543,10 @@ struct Config {
     pairs: usize,
     operations: usize,
     observation_repeats: usize,
+    /// UNTIMED batches appended to each kernel-arm visit (bd-fj2dg).
+    kernel_occupancy_padding: usize,
+    /// UNTIMED batches appended to each FrankenFS-arm visit (bd-fj2dg).
+    fuse_occupancy_padding: usize,
     image_size_mib: u64,
     maximum_null_ratio: f64,
     arm_settle_ms: u64,
@@ -679,6 +683,8 @@ impl Default for Config {
             pairs: 32,
             operations: 2_000,
             observation_repeats: 3,
+            kernel_occupancy_padding: 0,
+            fuse_occupancy_padding: 0,
             image_size_mib: 256,
             maximum_null_ratio: 1.025,
             arm_settle_ms: 100,
@@ -722,6 +728,15 @@ impl Arm {
             Self::CandidateBA => "fuse_candidate_b_a",
             Self::CandidateBB => "fuse_candidate_b_b",
         }
+    }
+
+    /// Whether this arm runs the kernel filesystem (bd-fj2dg).
+    ///
+    /// Occupancy padding is chosen per SIDE, not per replica: the A and B
+    /// replicas of one side must stay interchangeable or the crossover stops
+    /// being balanced.
+    const fn is_kernel(self) -> bool {
+        matches!(self, Self::KernelA | Self::KernelB)
     }
 
     const fn crossover_peer(self) -> Self {
@@ -1419,6 +1434,10 @@ is a transport it pays and we otherwise do not (bd-w2u82)\n\
                                           pre-bd-plkzd unindexed fixture for ATTRIBUTION ONLY and\n\
                                           FORCES the BLOCKED_UNFAIR_FIXTURE verdict (bd-pb85e)\n\
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
+           --kernel-occupancy-padding N   UNTIMED extra batches per kernel-arm visit (default 0)\n\
+           --fuse-occupancy-padding N     UNTIMED extra batches per FrankenFS-arm visit (default 0)\n\
+                                          bd-fj2dg: duration-match the arms so ABBA can cancel\n\
+                                          drift. Untimed on purpose - see occupancy_padding_for.\n\
            --image-size-mib N             Per-image size, <= 2048 (default 256)\n\
            --maximum-null-ratio R         Max symmetric A/A CI spread (default 1.025)\n\
            --arm-settle-ms N              Untimed delay after every arm (default 100)\n\
@@ -1600,6 +1619,15 @@ fn validate_config(config: &Config) -> Result<()> {
     ensure!(
         config.observation_repeats > 0,
         "--observation-repeats must be positive"
+    );
+    // bd-fj2dg: padding runs the workload for real, so a mutating workload would
+    // have its state advanced by batches nothing accounts for. Refuse rather than
+    // silently changing what a mutating row measures.
+    ensure!(
+        !config.workload.is_mutating()
+            || (config.kernel_occupancy_padding == 0 && config.fuse_occupancy_padding == 0),
+        "occupancy padding is read-only-workload only: a mutating workload's padding batches would \
+         advance filesystem state outside the timed contract"
     );
     ensure!(
         !config.workload.is_mutating() || config.observation_repeats == 1,
@@ -1808,6 +1836,14 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
             "--observation-repeats" => {
                 config.observation_repeats =
                     parse_value(args, &mut index, "--observation-repeats")?;
+            }
+            "--kernel-occupancy-padding" => {
+                config.kernel_occupancy_padding =
+                    parse_value(args, &mut index, "--kernel-occupancy-padding")?;
+            }
+            "--fuse-occupancy-padding" => {
+                config.fuse_occupancy_padding =
+                    parse_value(args, &mut index, "--fuse-occupancy-padding")?;
             }
             "--image-size-mib" => {
                 config.image_size_mib = parse_value(args, &mut index, "--image-size-mib")?;
@@ -4172,11 +4208,30 @@ fn workload_batch(
     })
 }
 
+/// Untimed batches to append to this arm's visit, for duration matching
+/// (bd-fj2dg).
+///
+/// ⚠️ THE PADDING MUST BE UNTIMED, and this is the whole reason it is a separate
+/// count rather than simply a larger `observation_repeats` for the fast arm.
+/// `observe` reduces by MIN over its timed repeats, and min-of-N is N-DEPENDENT:
+/// sampling more draws lowers the minimum. Padding the fast arm with extra TIMED
+/// repeats would therefore make it report an even faster time, biasing the ratio
+/// in the very act of trying to protect it. Timed repeats stay equal across arms
+/// so the estimator is untouched; only wall-clock OCCUPANCY is matched.
+fn occupancy_padding_for(config: &Config, arm: Arm) -> usize {
+    if arm.is_kernel() {
+        config.kernel_occupancy_padding
+    } else {
+        config.fuse_occupancy_padding
+    }
+}
+
 fn observe(
     root: &Path,
     config: &Config,
     sequence: usize,
     pinning: &WorkerPinning,
+    physical_arm: Arm,
 ) -> Result<Observation> {
     let mut best = u64::MAX;
     let mut expected_digest = None;
@@ -4203,6 +4258,25 @@ fn observe(
         }
         observed_worker_cpus.extend(batch.observed_worker_cpus);
         best = best.min(batch.elapsed_ns);
+    }
+    // bd-fj2dg: occupancy padding. ABBA cancels a linear host drift only for
+    // arms of EQUAL duration, and in this instrument the duration ratio is
+    // essentially the effect size — so every large-effect row is exposed by
+    // construction and cannot be rescued by scheduling. Giving the FASTER arm
+    // untimed extra batches equalises how long each visit occupies the host
+    // without touching what is reported.
+    //
+    // Deliberately AFTER the timed loop and outside `best`: these batches are
+    // work, not measurements. Their digests are not checked against
+    // `expected_digest` either, because a padding batch that legitimately mutates
+    // sequence state is not a parity violation — only timed batches carry the
+    // digest contract.
+    for pad in 0..occupancy_padding_for(config, physical_arm) {
+        let padding_sequence = sequence
+            .saturating_mul(config.observation_repeats)
+            .saturating_add(config.observation_repeats)
+            .saturating_add(pad);
+        let _ = workload_batch(root, config, padding_sequence, pinning)?;
     }
     Ok(Observation {
         elapsed_ns: best,
@@ -4318,7 +4392,7 @@ fn collect_samples(
                 .get(&physical_arm)
                 .ok_or_else(|| anyhow!("missing workload root for {}", physical_arm.label()))?;
             let sequence = next_sequences[&physical_arm];
-            let observation = observe(root, config, sequence, pinning)?;
+            let observation = observe(root, config, sequence, pinning, physical_arm)?;
             *next_sequences
                 .get_mut(&physical_arm)
                 .expect("all arms initialized") += 1;
@@ -7608,6 +7682,8 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
         },
         "cache_regime": config.workload.cache_regime_provenance(),
         "observation_repeats": config.observation_repeats,
+        "kernel_occupancy_padding": config.kernel_occupancy_padding,
+        "fuse_occupancy_padding": config.fuse_occupancy_padding,
         "observation_reducer": config.workload.observation_reducer(),
         "identities": identities,
     }) else {
@@ -8223,6 +8299,63 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    /// bd-fj2dg: occupancy padding is selected per SIDE and defaults to inert.
+    ///
+    /// Per side, not per replica: A and B are the same configuration visited in a
+    /// different order, and giving them different padding would unbalance the
+    /// crossover the whole design rests on.
+    #[test]
+    fn occupancy_padding_is_per_side_and_defaults_off_bd_fj2dg() {
+        assert!(super::Arm::KernelA.is_kernel());
+        assert!(super::Arm::KernelB.is_kernel());
+        for fuse_side in [
+            super::Arm::FuseA,
+            super::Arm::FuseB,
+            super::Arm::CandidateBA,
+            super::Arm::CandidateBB,
+        ] {
+            assert!(
+                !fuse_side.is_kernel(),
+                "{} is a FrankenFS-side arm",
+                fuse_side.label()
+            );
+        }
+
+        let mut config = super::Config::default();
+        // Inert unless asked for: an unconfigured run must be byte-identical to
+        // one built before this existed.
+        for arm in [
+            super::Arm::KernelA,
+            super::Arm::FuseA,
+            super::Arm::CandidateBA,
+        ] {
+            assert_eq!(super::occupancy_padding_for(&config, arm), 0);
+        }
+
+        config.kernel_occupancy_padding = 3;
+        config.fuse_occupancy_padding = 1;
+        assert_eq!(
+            super::occupancy_padding_for(&config, super::Arm::KernelA),
+            3
+        );
+        assert_eq!(
+            super::occupancy_padding_for(&config, super::Arm::KernelB),
+            3
+        );
+        assert_eq!(super::occupancy_padding_for(&config, super::Arm::FuseA), 1);
+        assert_eq!(super::occupancy_padding_for(&config, super::Arm::FuseB), 1);
+        // Replicas of one side must never diverge — that is what keeps the
+        // crossover balanced.
+        assert_eq!(
+            super::occupancy_padding_for(&config, super::Arm::FuseA),
+            super::occupancy_padding_for(&config, super::Arm::FuseB)
+        );
+        assert_eq!(
+            super::occupancy_padding_for(&config, super::Arm::KernelA),
+            super::occupancy_padding_for(&config, super::Arm::KernelB)
+        );
+    }
+
     /// bd-fj2dg: skepticism must follow the DURATION, not the side — otherwise the
     /// flag is structurally blind to every win in the bank.
     ///
@@ -9452,6 +9585,8 @@ mod tests {
             harness_builder: "test-host".to_string(),
             candidate_builder: "test-host".to_string(),
             observation_repeats: 1,
+            kernel_occupancy_padding: 0,
+            fuse_occupancy_padding: 0,
             ..Config::default()
         };
 
@@ -9638,6 +9773,8 @@ mod tests {
             workload: Workload::BulkDurableWrite,
             operations: 64,
             observation_repeats: 1,
+            kernel_occupancy_padding: 0,
+            fuse_occupancy_padding: 0,
             image_size_mib: 256,
             harness_builder: "hz1".to_owned(),
             candidate_builder: "hz2".to_owned(),
