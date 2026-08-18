@@ -117,6 +117,36 @@ def summarise(rows: list, label: str) -> None:
     )
 
 
+def admission_skew(groups: dict) -> list[tuple]:
+    """Compare ADMITTED against BLOCKED ratios inside each like-for-like group.
+
+    If admission were independent of the outcome, the two medians would track. Any
+    systematic gap means the banked (admitted) numbers are drawn from one side of
+    their own configuration's distribution.
+
+    ⚠️ MUST USE group_key. An earlier hand-rolled key that omitted the runtime
+    knobs reported a 2x skew that was entirely the capability-memo A/B: one group
+    mixed memo-sized runs (3.36x) with default ones (6.99x), which are bd-34hzz's
+    two published arms, and called the mixture irreproducibility. Sharing the key
+    with the spread analysis is what stops that recurring.
+    """
+    out = []
+    for key, runs in groups.items():
+        admitted = [r["ratio"] for r in runs if r["admitted"]]
+        blocked = [r["ratio"] for r in runs if not r["admitted"]]
+        if admitted and blocked:
+            out.append(
+                (
+                    key,
+                    st.median(admitted),
+                    st.median(blocked),
+                    len(admitted),
+                    len(blocked),
+                )
+            )
+    return sorted(out, key=lambda row: -(row[1] / row[2]))
+
+
 def selftest() -> int:
     failures = []
     doc_a = {"ffs_binary_sha256": "a" * 64}
@@ -161,6 +191,22 @@ def selftest() -> int:
     # A group with a single admitted run yields no spread at all.
     if spreads({("k",): [{"ratio": 1.0, "admitted": True}, {"ratio": 9.0, "admitted": False}]}, True):
         failures.append("one admitted run is not a cross-window pair")
+    # admission_skew must only report groups holding BOTH populations, and must
+    # take its medians from the right side.
+    skew_groups = {
+        ("both",): [
+            {"ratio": 2.0, "admitted": True},
+            {"ratio": 4.0, "admitted": False},
+        ],
+        ("admitted_only",): [{"ratio": 1.0, "admitted": True}],
+        ("blocked_only",): [{"ratio": 1.0, "admitted": False}],
+    }
+    skew = admission_skew(skew_groups)
+    if len(skew) != 1:
+        failures.append("only groups holding BOTH populations can be compared")
+    elif abs(skew[0][1] - 2.0) > 1e-9 or abs(skew[0][2] - 4.0) > 1e-9:
+        failures.append("admission_skew put the medians on the wrong side")
+
     for f in failures:
         print(f"SELFTEST FAIL: {f}", file=sys.stderr)
     if failures:
@@ -208,6 +254,30 @@ def main() -> int:
         "     spread characterised, and its published CI is a LOWER BOUND on its\n"
         "     true uncertainty (bd-4sull)."
     )
+
+    skew = admission_skew(groups)
+    if skew:
+        print()
+        print("ADMISSION SKEW (admitted vs blocked WITHIN one configuration):")
+        for key, med_adm, med_blk, n_adm, n_blk in skew:
+            print(
+                f"  {key[2]:<6}{key[3][:28]:<30}n_adm={n_adm:<3}n_blk={n_blk:<3}"
+                f"adm={med_adm:.4f} blk={med_blk:.4f} adm/blk={med_adm / med_blk:.4f}"
+            )
+        values = [row[1] / row[2] for row in skew]
+        favourable = sum(1 for v in values if v < 1.0)
+        print(
+            f"  median adm/blk {st.median(values):.4f} over {len(values)} group(s); "
+            f"admitted is the more favourable side in {favourable}/{len(values)}"
+        )
+        print(
+            "  -> TWO readings, and the bank cannot separate them: the gate may be\n"
+            "     correctly discarding load-contaminated windows (bd-fj2dg shows drift\n"
+            "     on the slower arm INFLATES a loss, and blocked runs are the loaded\n"
+            "     ones), or admission may be selecting on the outcome. Either way the\n"
+            "     direction is the same, so banked numbers sit on the favourable side\n"
+            "     of their own distribution and should be quoted knowing that."
+        )
     return 0
 
 
