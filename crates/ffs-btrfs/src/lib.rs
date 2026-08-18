@@ -7029,6 +7029,36 @@ pub fn plan_growth_for_commit(
     let Some(shortfall) = alloc.commit_metadata_shortfall(tree_nodes, nodesize) else {
         return Ok(None);
     };
+    plan_growth_for_shortfall(alloc, chunks, ChunkKind::Metadata, shortfall, device, policy)
+}
+
+/// [`plan_growth_for_commit`] for an arbitrary chunk kind and an already-computed
+/// shortfall in BYTES.
+///
+/// Split out for the SYSTEM case (bd-a136s). Serializing the chunk tree allocates
+/// from SYSTEM space — it must, or the chunk root is unmappable at bootstrap —
+/// so a commit that grows can exhaust the system chunk, and that shortfall is
+/// counted in bytes of tree blocks rather than in a DAG node count.
+///
+/// ⚠️ A SYSTEM chunk is the one kind that must ALSO reach the superblock's
+/// `sys_chunk_array`, because the kernel bootstraps from that array alone. The
+/// plan says so via `needs_sys_chunk_array`, and `apply_chunk_allocation` refuses
+/// to create one without a superblock to record it in. Growth must therefore hand
+/// it a superblock, not `None`, or the allocation is correctly rejected.
+///
+/// # Errors
+/// As [`plan_growth_for_commit`].
+pub fn plan_growth_for_shortfall(
+    alloc: &BtrfsExtentAllocator,
+    chunks: &[BtrfsChunkEntry],
+    kind: ChunkKind,
+    shortfall: u64,
+    device: &GrowthDevice,
+    policy: &ChunkSizePolicy,
+) -> Result<Option<ChunkAllocationPlan>, BtrfsMutationError> {
+    if shortfall == 0 {
+        return Ok(None);
+    }
 
     let mut occupancy = DeviceOccupancy::from_chunks(device.devid, chunks)
         .map_err(|_| BtrfsMutationError::InvalidConfig("chunk layout is not modelled"))?;
@@ -7039,7 +7069,7 @@ pub fn plan_growth_for_commit(
     occupancy.reserve_superblock_mirrors(device.total_bytes);
     let free_run = occupancy.largest_free_run(device.min_offset, device.total_bytes);
 
-    let Some(length) = policy.decide(ChunkKind::Metadata, device.total_bytes, free_run) else {
+    let Some(length) = policy.decide(kind, device.total_bytes, free_run) else {
         // The device genuinely has nowhere to put a useful chunk. This is the
         // ENOSPC that is honest: not "we cannot reach the space", but "there is
         // none". `shortfall` is carried into the log by the caller, not swallowed.
@@ -7065,7 +7095,7 @@ pub fn plan_growth_for_commit(
 
     let logical = next_logical_chunk_start(chunks)?;
     let plan = plan_chunk_allocation(&ChunkAllocationRequest {
-        kind: ChunkKind::Metadata,
+        kind,
         logical,
         length,
         devid: device.devid,

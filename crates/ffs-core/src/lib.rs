@@ -39,7 +39,8 @@ use ffs_block::{
     read_btrfs_superblock_region, read_ext4_superblock_region,
 };
 use ffs_btrfs::{
-    BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA, BTRFS_CHUNK_TREE_OBJECTID,
+    BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA, BTRFS_BLOCK_GROUP_SYSTEM,
+    BTRFS_CHUNK_TREE_OBJECTID,
     BTRFS_CSUM_TREE_OBJECTID, BTRFS_DEV_TREE_OBJECTID, BTRFS_EXTENT_TREE_OBJECTID,
     BTRFS_FILE_EXTENT_PREALLOC,
     BTRFS_FILE_EXTENT_REG, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV,
@@ -30119,6 +30120,11 @@ impl OpenFs {
         // shortfall is a prediction; refusing the transaction on a prediction
         // turns a maybe into a certainty. The allocator's own `NoSpace` stays the
         // authority and `alloc_no_space_*` (c77d122d) reports why.
+        // Carries a SYSTEM chunk's `sys_chunk_array` bytes from the growth block
+        // down to the superblock stamping. The commit patches a byte buffer read
+        // from disk rather than writing a `BtrfsSuperblock`, so the extended array
+        // has to travel as bytes (bd-a136s).
+        let mut grown_sys_chunk_array: Option<Vec<u8>> = None;
         'grow: {
             if !self.btrfs_grow_chunks_enabled() {
                 break 'grow;
@@ -30225,6 +30231,84 @@ impl OpenFs {
                     demand,
                     "growth_hit_the_per_commit_chunk_cap"
                 );
+            }
+
+            // ── SYSTEM space for the chunk tree itself (bd-a136s) ───────────
+            //
+            // Growing dirties the chunk tree, and the chunk tree is serialized
+            // out of SYSTEM space — it must be, or its root is unmappable at
+            // bootstrap and the filesystem will not open, which is exactly what
+            // the acceptance gate produced. So a commit that grows can exhaust
+            // the system chunk, and that is a different resource from the one
+            // the loop above just topped up.
+            //
+            // ⚠️ THE SUPERBLOCK IS NOT OPTIONAL HERE. A SYSTEM chunk must also
+            // reach the `sys_chunk_array`, because that array is the whole of
+            // what the kernel can map before it has read any tree.
+            // `apply_chunk_allocation` refuses a system chunk given `None`, so
+            // growth hands it a CLONE of the superblock and the extended array is
+            // carried down to the stamping below — the commit patches a byte
+            // buffer read from disk rather than writing this struct, so the array
+            // has to travel as bytes.
+            if alloc.chunk_trees_dirty {
+                let system_need = overhead.saturating_mul(u64::from(nodesize));
+                let system_have = alloc
+                    .extent_alloc
+                    .allocatable_bytes(BTRFS_BLOCK_GROUP_SYSTEM);
+                if system_need > system_have {
+                    let shortfall = system_need - system_have;
+                    match ffs_btrfs::plan_growth_for_shortfall(
+                        &alloc.extent_alloc,
+                        &chunks,
+                        ffs_btrfs::ChunkKind::System,
+                        shortfall,
+                        &device,
+                        &policy,
+                    ) {
+                        Ok(Some(plan)) => {
+                            let mut sb_with_array = sb.clone();
+                            let state = &mut *alloc;
+                            match ffs_btrfs::apply_chunk_allocation(
+                                &plan,
+                                &mut state.chunk_tree,
+                                &mut state.dev_tree,
+                                &mut state.extent_alloc,
+                                Some(&mut sb_with_array),
+                            ) {
+                                Ok(()) => {
+                                    grown_sys_chunk_array =
+                                        Some(sb_with_array.sys_chunk_array.clone());
+                                    info!(
+                                        target: "ffs::btrfs::alloc",
+                                        shortfall,
+                                        length = plan.chunk.length,
+                                        "grew_a_system_chunk_for_the_chunk_tree"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        target: "ffs::btrfs::alloc",
+                                        error = ?e,
+                                        "system_growth_apply_refused"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            // No room for a system chunk. The commit proceeds and
+                            // the chunk-tree allocation fails honestly, naming
+                            // SYSTEM in `alloc_no_space_*`, rather than being
+                            // silently served out of metadata space.
+                            warn!(
+                                target: "ffs::btrfs::alloc",
+                                error = ?e,
+                                shortfall,
+                                "system_growth_unavailable"
+                            );
+                        }
+                    }
+                }
             }
             if grown > 0 {
                 info!(
@@ -31491,6 +31575,37 @@ impl OpenFs {
             sb_bytes[0x58..0x60].copy_from_slice(&chunk_root_bytenr.to_le_bytes());
             sb_bytes[0xA4..0xAC].copy_from_slice(&new_gen.to_le_bytes());
             sb_bytes[0xC7] = chunk_root_level;
+        }
+
+        // bd-a136s: a SYSTEM chunk allocated this commit must also appear in the
+        // superblock's `sys_chunk_array`, which is the ONLY thing the kernel can
+        // map before it has read any tree. `append_sys_chunk_entry` already
+        // refused anything that would not fit (bd-q4qr8), so an array arriving
+        // here is within the 2048-byte limit — but it is re-checked rather than
+        // trusted, because writing past the array clobbers the fields after it and
+        // this is the one buffer where that is unrecoverable.
+        if let Some(array) = grown_sys_chunk_array {
+            const SYS_CHUNK_ARRAY_OFFSET: usize = 0x32B;
+            const SYS_CHUNK_ARRAY_MAX: usize = 2048;
+            if array.len() > SYS_CHUNK_ARRAY_MAX {
+                return Err(FfsError::Format(format!(
+                    "btrfs commit: sys_chunk_array grew to {} bytes, past the \
+                     {SYS_CHUNK_ARRAY_MAX}-byte on-disk limit; refusing to write a \
+                     superblock whose array would overrun the fields after it",
+                    array.len()
+                )));
+            }
+            let size = u32::try_from(array.len()).map_err(|_| {
+                FfsError::Format("btrfs commit: sys_chunk_array size does not fit u32".into())
+            })?;
+            sb_bytes[0xA0..0xA4].copy_from_slice(&size.to_le_bytes());
+            sb_bytes[SYS_CHUNK_ARRAY_OFFSET..SYS_CHUNK_ARRAY_OFFSET + array.len()]
+                .copy_from_slice(&array);
+            debug!(
+                target: "ffs::btrfs::alloc",
+                bytes = array.len(),
+                "sys_chunk_array_extended_for_a_new_system_chunk"
+            );
         }
 
         // bd-mogn1: RETIRE THE TREE LOG. A full transaction commit supersedes any
