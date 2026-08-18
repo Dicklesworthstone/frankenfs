@@ -11178,3 +11178,60 @@ transaction per fsync — the tree-log fast path, both halves of which this repo
 **What stays.** `9e462485` is correct and cheap and should stay: a commit where nothing moved no
 longer dirties the root-tree spine for nothing, which is what the unmount-flush row shows. It is
 simply not a fsync-row lever, and the ledger must not carry it as one.
+
+## bd-a136s — ACCEPTANCE GATE RUN, AND IT FAILED: chunk growth produces an unmountable filesystem
+
+**Run 2026-08-18, thinkstation1, ELF sha256
+`bfceb72164b521150a761930183ccb7d58ca76425216d5d6c7218fd753b9c0b5`.** Two arms, same workload,
+same 256 MB btrfs image copied fresh for each: 40,000 empty file creates followed by one 4 KiB
+`write+fsync`. Load 22-28 throughout; both arms are pass/fail, so load is irrelevant to the result.
+
+    arm                        creates  write+fsync  btrfs check          kernel mount + readback
+    FFS_BTRFS_GROW_CHUNKS off   40000        OK      no error found       OK, 40002 entries, data correct
+    FFS_BTRFS_GROW_CHUNKS=1     40000        OK      CANNOT OPEN          not attempted
+
+The growth arm's `btrfs check`:
+
+    No mapping for 60375040-60391424
+    Couldn't map the block 60375040
+    bad tree block 60375040, bytenr mismatch, want=60375040, have=0
+    ERROR: cannot read chunk root
+    ERROR: cannot open file system
+
+**THE MECHANISM, from the daemon's own diagnostics.** Growth fired at the unmount commit, whose
+demand was 1745 nodes:
+
+    growth_planned shortfall=28590080 length=26804224 logical=63963136 physical=105906176 covers_shortfall=false
+    growth_planned shortfall=1785856  length=26804224 logical=90767360 physical=132710400 covers_shortfall=true
+    grew_the_filesystem_to_fit_the_commit grown=2 demand=1745
+
+Two 25.6 MiB metadata chunks, the loop iterating exactly as designed — one chunk did not cover the
+shortfall, the second did. The plan/apply/sizing machinery worked. What broke is where the CHUNK
+TREE ITSELF was written.
+
+**THE DEFECT IS IN THE STEP (b) SERIALIZATION, AND IT IS A REAL DESIGN ERROR, NOT A SLIP.**
+`29133341` serializes the rewritten chunk tree with
+`alloc_metadata_for_tree(nodesize, BTRFS_CHUNK_TREE_OBJECTID, level)` — which allocates from a
+METADATA block group. The kernel bootstraps its chunk map from the superblock's `sys_chunk_array`
+ALONE, and that array carries SYSTEM chunks only. A chunk root living in metadata space is
+therefore unmappable before the chunk tree has been read, which is the definition of unbootable:
+`No mapping for 60375040` is the kernel saying it cannot find the address the superblock told it to
+read. That is exactly what SYSTEM chunks exist for, and it is why the original image's chunk root
+sat in one.
+
+**WHAT THIS VALIDATES.** The flag is default-off and the gate is the reason. Every unit test in
+this bead passes — 24 of them — and the on-disk result is still unmountable, because no unit test
+can model "the kernel must be able to map this address before it has read any tree". The bead said
+from the start that the third acceptance clause was the one that mattered; it was right.
+
+**THE FIX,** not yet written: the chunk tree's own blocks must be allocated from SYSTEM block
+groups (`BTRFS_BLOCK_GROUP_SYSTEM`), and when the system chunk cannot hold them a SYSTEM chunk must
+be grown and appended to the `sys_chunk_array` — the appender for which already exists
+(`append_sys_chunk_entry`, `4395815d`) and already refuses a full array. `alloc_extent` already
+takes a `required_flags` argument, so this is a new allocation entry point rather than new
+machinery.
+
+⚠️ **NOTHING IS WITHDRAWN FROM THE UNIT-TESTED LAYER.** Sizing, placement, the record set, the
+mirror fence, the DEV_ITEM update and the stale-plan check are all unaffected by this and all still
+hold. What is withdrawn is any suggestion that the path is ready: it is not, the flag stays off, and
+this row is the evidence.
