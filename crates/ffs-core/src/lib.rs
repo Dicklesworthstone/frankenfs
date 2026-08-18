@@ -1096,6 +1096,16 @@ struct BtrfsAllocState {
     /// onto the physical device ranges backing it (bd-a136s).
     #[allow(dead_code, reason = "read by chunk allocation, wired in a later commit (bd-a136s)")]
     dev_tree: InMemoryCowBtrfsTree,
+    /// Set when a chunk was ALLOCATED this transaction, so the chunk tree and
+    /// device tree must be re-serialized at commit (bd-a136s).
+    ///
+    /// ⚠️ Both trees are loaded in full at mount and are therefore never empty,
+    /// so "is it non-empty" cannot be the commit's guard the way it is for the
+    /// csum tree. Without this flag every commit would COW-rewrite the whole
+    /// chunk tree at fresh addresses for a tree that did not change — the exact
+    /// per-commit metadata amplification bd-42gtq and bd-uxh7t are about.
+    #[allow(dead_code, reason = "set by chunk allocation, wired in a later commit (bd-a136s)")]
+    chunk_trees_dirty: bool,
     /// False when the chunk tree or device tree could not be read in full.
     ///
     /// ⚠️ CHUNK ALLOCATION MUST REFUSE WHEN THIS IS FALSE. `apply_chunk_allocation`
@@ -8903,6 +8913,8 @@ impl OpenFs {
             extent_alloc,
             chunk_tree,
             dev_tree,
+            // No chunk has been allocated yet in this mount (bd-a136s).
+            chunk_trees_dirty: false,
             chunk_trees_authoritative,
             extra_subvol_trees: Vec::new(),
             dir_index_counters: std::collections::HashMap::new(),
@@ -30567,6 +30579,155 @@ impl OpenFs {
             }
         }
 
+        // ── CHUNK_TREE + DEV_TREE commit (bd-a136s) ─────────────────────────────
+        //
+        // Only when a chunk was ALLOCATED this transaction. Every other commit
+        // leaves both trees exactly as the previous commit wrote them and leaves
+        // `chunk_root` in the superblock pointing there.
+        //
+        // ⚠️ THE GUARD IS NOT AN OPTIMISATION. These trees are loaded in full at
+        // mount, so unlike the csum tree they are never empty, and
+        // `node_count() > 0` would be true on every commit. Re-serializing them
+        // unconditionally would COW-rewrite the whole chunk tree at fresh
+        // addresses on every fsync — precisely the per-commit metadata
+        // amplification bd-42gtq and bd-uxh7t are about — for a tree that did not
+        // change. btrfs COWs what changed; so do we.
+        //
+        // Ordered with the csum tree and before extent_tree for the same reason:
+        // the EXTENT_ITEMs these allocations add must be serialized into
+        // extent_tree below.
+        //
+        // ⚠️ THE SHORTFALL PRE-CHECK MUST COUNT THESE NODES. Serializing the
+        // chunk tree ALLOCATES metadata, so a commit that grows the filesystem
+        // needs room for the chunk and device trees on top of everything else. If
+        // that space is not reserved before serialization starts, a chunk
+        // allocation can need a chunk allocation — which is the circularity the
+        // kernel keeps a system-chunk reserve for. `commit_metadata_shortfall`
+        // takes the node count from the caller precisely so it can include them.
+        let mut new_chunk_root: Option<(u64, u8)> = None;
+        if alloc.chunk_trees_dirty {
+            // DEV_TREE first: its root is a ROOT_ITEM in root_tree, exactly like
+            // csum_tree, so it must be patched before root_tree is serialized.
+            let dev_dag = WriteDependencyDag::from_cow_tree(&alloc.dev_tree, new_gen)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            if dev_dag.node_count() > 0 {
+                let mut dev_addrs = std::collections::BTreeMap::new();
+                for (block, level) in dev_dag.blocks_with_levels() {
+                    let allocation = alloc
+                        .extent_alloc
+                        .alloc_metadata_for_tree(
+                            u64::from(nodesize),
+                            BTRFS_DEV_TREE_OBJECTID,
+                            level,
+                        )
+                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                    dev_addrs.insert(block, allocation.bytenr);
+                }
+                let dev_disk_ctx = DiskWritebackContext::with_allocated_addresses(
+                    sb.fsid,
+                    sb.fsid,
+                    new_gen,
+                    BTRFS_DEV_TREE_OBJECTID,
+                    nodesize,
+                    alloc.sectorsize,
+                    dev_addrs,
+                );
+                let mut dev_executor = WritebackExecutor::new(dev_dag).without_crash_tracking();
+                dev_executor
+                    .execute(|block, level| {
+                        let serialized = dev_disk_ctx.serialize_node(&alloc.dev_tree, block, level)?;
+                        let node_bytes = serialized.len() as u64;
+                        let logical = dev_disk_ctx.block_to_bytenr(block);
+                        let physical = resolve_physical(logical)?;
+                        self.dev
+                            .write_all_at(cx, ByteOffset(physical), &serialized)
+                            .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+                        bytes_written = bytes_written.saturating_add(node_bytes);
+                        nodes_written = nodes_written.saturating_add(1);
+                        Ok(())
+                    })
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+                let dev_root_key = BtrfsKey {
+                    objectid: BTRFS_DEV_TREE_OBJECTID,
+                    item_type: BTRFS_ITEM_ROOT_ITEM,
+                    offset: 0,
+                };
+                let mut dev_root_item_data = alloc
+                    .root_tree
+                    .get(&dev_root_key)
+                    .ok_or_else(|| {
+                        FfsError::Format(
+                            "btrfs commit: a chunk was allocated but the filesystem has no \
+                             DEV_TREE ROOT_ITEM to repoint"
+                                .into(),
+                        )
+                    })?;
+                BtrfsRootItem::patch_root_commit(
+                    &mut dev_root_item_data,
+                    dev_disk_ctx.block_to_bytenr(alloc.dev_tree.root_block()),
+                    alloc.dev_tree.root_level(),
+                    new_gen,
+                )
+                .map_err(|e| FfsError::Parse(format!("DEV_TREE ROOT_ITEM patch failed: {e}")))?;
+                alloc
+                    .root_tree
+                    .update(&dev_root_key, &dev_root_item_data)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            }
+
+            // CHUNK_TREE: its root is in the SUPERBLOCK, not in root_tree,
+            // because the kernel must map the chunk tree's own logical address
+            // before any tree is readable. So it is stamped alongside `root` far
+            // below rather than patched into a ROOT_ITEM here.
+            let chunk_dag = WriteDependencyDag::from_cow_tree(&alloc.chunk_tree, new_gen)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            if chunk_dag.node_count() > 0 {
+                let mut chunk_addrs = std::collections::BTreeMap::new();
+                for (block, level) in chunk_dag.blocks_with_levels() {
+                    let allocation = alloc
+                        .extent_alloc
+                        .alloc_metadata_for_tree(
+                            u64::from(nodesize),
+                            BTRFS_CHUNK_TREE_OBJECTID,
+                            level,
+                        )
+                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                    chunk_addrs.insert(block, allocation.bytenr);
+                }
+                let chunk_disk_ctx = DiskWritebackContext::with_allocated_addresses(
+                    sb.fsid,
+                    sb.fsid,
+                    new_gen,
+                    BTRFS_CHUNK_TREE_OBJECTID,
+                    nodesize,
+                    alloc.sectorsize,
+                    chunk_addrs,
+                );
+                let mut chunk_executor = WritebackExecutor::new(chunk_dag).without_crash_tracking();
+                chunk_executor
+                    .execute(|block, level| {
+                        let serialized =
+                            chunk_disk_ctx.serialize_node(&alloc.chunk_tree, block, level)?;
+                        let node_bytes = serialized.len() as u64;
+                        let logical = chunk_disk_ctx.block_to_bytenr(block);
+                        let physical = resolve_physical(logical)?;
+                        self.dev
+                            .write_all_at(cx, ByteOffset(physical), &serialized)
+                            .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+                        bytes_written = bytes_written.saturating_add(node_bytes);
+                        nodes_written = nodes_written.saturating_add(1);
+                        Ok(())
+                    })
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+                new_chunk_root = Some((
+                    chunk_disk_ctx.block_to_bytenr(alloc.chunk_tree.root_block()),
+                    alloc.chunk_tree.root_level(),
+                ));
+            }
+        }
+
         // bd-4cxkd: every extent item this transaction touches is now in the
         // extent tree (the self-description items just above, data extent items
         // from the writes, csum/free-space tree blocks). Recompute each block
@@ -30971,6 +31132,19 @@ impl OpenFs {
         sb_bytes[0x48..0x50].copy_from_slice(&new_gen.to_le_bytes());
         sb_bytes[0x50..0x58].copy_from_slice(&root_tree_bytenr.to_le_bytes());
         sb_bytes[0xC6] = root_tree_level;
+
+        // bd-a136s: a commit that grew the filesystem rewrote the chunk tree, and
+        // its root lives HERE rather than in a ROOT_ITEM — the kernel maps the
+        // chunk tree's own logical address from the superblock before any tree is
+        // readable. Left untouched on every other commit, which is every commit
+        // today. Offsets are the parser's own (`ffs-ondisk/src/btrfs.rs`):
+        // `chunk_root` u64 at 0x58, `chunk_root_generation` u64 at 0xA4,
+        // `chunk_root_level` u8 at 0xC7.
+        if let Some((chunk_root_bytenr, chunk_root_level)) = new_chunk_root {
+            sb_bytes[0x58..0x60].copy_from_slice(&chunk_root_bytenr.to_le_bytes());
+            sb_bytes[0xA4..0xAC].copy_from_slice(&new_gen.to_le_bytes());
+            sb_bytes[0xC7] = chunk_root_level;
+        }
 
         // bd-mogn1: RETIRE THE TREE LOG. A full transaction commit supersedes any
         // tree log — the trees this commit just wrote already contain everything the
