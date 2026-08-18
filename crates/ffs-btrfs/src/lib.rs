@@ -26195,7 +26195,7 @@ mod tests {
             sys_chunk_array: vec![],
         };
 
-        let original = sb.to_bytes();
+        let original = sb.to_bytes().expect("superblock serializes");
         verify_btrfs_superblock_checksum(&original).expect("original checksum valid");
         let parsed_orig = BtrfsSuperblock::parse_superblock_region(&original).expect("parse orig");
         assert_eq!(

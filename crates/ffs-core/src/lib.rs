@@ -29593,7 +29593,10 @@ impl OpenFs {
             .bytes_used
             .saturating_add(allocated_bytes)
             .min(logged_sb.total_bytes);
-        let sb_bytes = logged_sb.to_bytes();
+        // bd-q4qr8: refuses rather than truncating an oversized sys_chunk_array,
+        // which would have written a superblock whose array ends mid-entry — a
+        // filesystem the kernel cannot bootstrap.
+        let sb_bytes = logged_sb.to_bytes().map_err(|e| parse_to_ffs_error(&e))?;
         let stats = BtrfsTreeLogWriteStats {
             log_root,
             generation,

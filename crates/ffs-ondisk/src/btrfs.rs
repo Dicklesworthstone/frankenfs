@@ -249,8 +249,28 @@ impl BtrfsSuperblock {
     ///
     /// Writes all fields to their kernel-defined offsets and computes
     /// the CRC32C checksum over bytes [0x20..4096).
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    /// Refuses a `sys_chunk_array` longer than
+    /// `BTRFS_SYS_CHUNK_ARRAY_MAX` (2048) rather than truncating it (bd-q4qr8).
+    ///
+    /// ⚠️ THIS USED TO CLAMP WITH `.min(BTRFS_SYS_CHUNK_ARRAY_MAX)` AND THAT WAS
+    /// A CORRUPTION BUG. sys_chunk_array entries are a 17-byte key plus a
+    /// 48-byte chunk plus 32 bytes per stripe — 97 for the single-stripe case —
+    /// and nothing aligns 97 to 2048, so the clamp cut the array MID-ENTRY: 21
+    /// entries occupy 2037 bytes and a 22nd was cut 11 bytes in, leaving a
+    /// truncated disk key. That is not "one chunk missing". The kernel
+    /// bootstraps the chunk tree from this array ALONE, before any tree is
+    /// readable, so a trailing partial entry is a parse failure in the first
+    /// thing it reads — "not a btrfs filesystem" on a filesystem that was fine a
+    /// moment earlier. Our own `parse_sys_chunk_array` fails the same way, so we
+    /// would not mount our own image either.
+    ///
+    /// Failing closed is the only safe behaviour: a superblock that cannot be
+    /// represented must not be written. `append_sys_chunk_entry` refuses a full
+    /// array for the same reason, which is what keeps this error unreachable in
+    /// practice.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ParseError> {
         let mut buf = vec![0u8; BTRFS_SUPER_INFO_SIZE];
 
         // fsid at 0x20
@@ -285,8 +305,16 @@ impl BtrfsSuperblock {
         buf[0x98..0x9C].copy_from_slice(&self.nodesize.to_le_bytes());
         // stripesize at 0x9C
         buf[0x9C..0xA0].copy_from_slice(&self.stripesize.to_le_bytes());
-        let array_len = self.sys_chunk_array.len().min(BTRFS_SYS_CHUNK_ARRAY_MAX);
-        let array_size = u32::try_from(array_len).unwrap_or(BTRFS_SYS_CHUNK_ARRAY_MAX_U32);
+        let array_len = self.sys_chunk_array.len();
+        if array_len > BTRFS_SYS_CHUNK_ARRAY_MAX {
+            return Err(ParseError::InvalidField {
+                field: "sys_chunk_array",
+                reason: "exceeds 2048 byte limit; refusing rather than truncating mid-entry",
+            });
+        }
+        let array_size = u32::try_from(array_len).map_err(|_| ParseError::IntegerConversion {
+            field: "sys_chunk_array_size",
+        })?;
 
         // sys_chunk_array_size at 0xA0
         buf[0xA0..0xA4].copy_from_slice(&array_size.to_le_bytes());
@@ -320,7 +348,7 @@ impl BtrfsSuperblock {
         buf[0..4].copy_from_slice(&csum.to_le_bytes());
         // Rest of csum field is zeros (CRC32C produces 4 bytes, field is 32)
 
-        buf
+        Ok(buf)
     }
 
     /// Update an existing superblock blob in-place for a new commit.
@@ -2507,7 +2535,7 @@ mod tests {
             sys_chunk_array_size: 0,
             sys_chunk_array: vec![],
         };
-        let serialized = sb.to_bytes();
+        let serialized = sb.to_bytes().expect("superblock serializes");
         assert_eq!(serialized.len(), BTRFS_SUPER_INFO_SIZE);
 
         verify_superblock_checksum(&serialized).expect("checksum valid");
@@ -2558,7 +2586,7 @@ mod tests {
             sys_chunk_array_size: 0,
             sys_chunk_array: vec![],
         };
-        let mut data = sb.to_bytes();
+        let mut data = sb.to_bytes().expect("superblock serializes");
 
         BtrfsSuperblock::patch_commit(&mut data, 0x3000, 1, 100);
         verify_superblock_checksum(&data).expect("patched checksum valid");
@@ -3020,7 +3048,7 @@ mod tests {
         // Through the real superblock writer and back. If THIS assertion is the
         // one that fails, look at `to_bytes`/`parse_superblock_region` rather
         // than at the append — the array assertions above already passed.
-        let rebuilt = BtrfsSuperblock::parse_superblock_region(&sb.to_bytes())
+        let rebuilt = BtrfsSuperblock::parse_superblock_region(&sb.to_bytes().expect("superblock serializes"))
             .expect("superblock round-trip");
         assert_eq!(rebuilt.sys_chunk_array, sb.sys_chunk_array);
         assert_eq!(
@@ -3178,6 +3206,48 @@ mod tests {
         // `find_free` would have to skip.
         occ.reserve(40 * MB, 0);
         assert_eq!(occ.ranges().len(), 2);
+    }
+
+    /// bd-q4qr8. `to_bytes` must REFUSE an oversized `sys_chunk_array`, not
+    /// truncate it.
+    ///
+    /// The old code clamped with `.min(BTRFS_SYS_CHUNK_ARRAY_MAX)`. Entries are
+    /// 97 bytes for the single-stripe case and nothing aligns 97 to 2048, so the
+    /// clamp cut MID-ENTRY — 21 entries occupy 2037 bytes and a 22nd was cut 11
+    /// bytes in, leaving a truncated disk key. The kernel bootstraps the chunk
+    /// tree from this array ALONE, before any tree is readable, so that is not
+    /// "one chunk missing": it is a parse failure in the first thing the kernel
+    /// reads, on a filesystem that was fine a moment earlier.
+    #[test]
+    fn to_bytes_refuses_an_oversized_sys_chunk_array_bd_q4qr8() {
+        let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+            .expect("sb parse");
+
+        // Exactly at the limit is fine: refusing it would refuse a legal
+        // superblock.
+        sb.sys_chunk_array = vec![0_u8; 2048];
+        sb.sys_chunk_array_size = 2048;
+        let at_limit = sb.to_bytes().expect("a full array is legal");
+        assert_eq!(at_limit.len(), BTRFS_SUPER_INFO_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(at_limit[0xA0..0xA4].try_into().expect("4 bytes")),
+            2048
+        );
+
+        // One byte over must be an error, not a shorter array.
+        sb.sys_chunk_array = vec![0_u8; 2049];
+        assert!(
+            sb.to_bytes().is_err(),
+            "an oversized array must refuse; truncating it writes a superblock the \
+             kernel cannot parse"
+        );
+
+        // And a realistically oversized one — 22 whole 97-byte entries, which is
+        // how this is actually reached — is refused for the same reason rather
+        // than being cut back to 21.
+        sb.sys_chunk_array = vec![0_u8; 22 * 97];
+        assert!(22 * 97 > 2048, "22 entries really do overflow");
+        assert!(sb.to_bytes().is_err());
     }
 
     fn representative_sys_chunk_superblock() -> [u8; BTRFS_SUPER_INFO_SIZE] {
@@ -5424,7 +5494,7 @@ mod tests {
                 sys_chunk_array,
             };
 
-            let bytes = sb.to_bytes();
+            let bytes = sb.to_bytes().expect("superblock serializes");
             prop_assert_eq!(bytes.len(), BTRFS_SUPER_INFO_SIZE);
             let parsed = BtrfsSuperblock::parse_superblock_region(&bytes)
                 .expect("a serialized valid superblock must re-parse");
@@ -5453,7 +5523,7 @@ mod tests {
             sb.sys_chunk_array_size = stale_size;
             sb.sys_chunk_array = sys_chunk_array;
 
-            let serialized = sb.to_bytes();
+            let serialized = sb.to_bytes().expect("superblock serializes");
             let expected_len = sb.sys_chunk_array.len().min(BTRFS_SYS_CHUNK_ARRAY_MAX);
             let expected_size =
                 u32::try_from(expected_len).expect("sys_chunk_array max fits in u32");
