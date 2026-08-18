@@ -1140,14 +1140,21 @@ struct BtrfsAllocState {
     nodesize: u32,
     /// Sector size in bytes (copied from superblock for convenience).
     sectorsize: u32,
-    /// bd-0ajub: the tree-log block currently published in the superblock, as
+    /// bd-0ajub: the tree-log blocks currently reachable from the superblock, as
     /// `(bytenr, num_bytes, is_metadata)`.
     ///
     /// Every ephemeral fsync allocated a FRESH nodesize extent and nothing ever freed
     /// the one it superseded, so a long-lived mount leaked one block plus one extent
     /// item per fsync — unbounded metadata growth on an fsync-heavy workload. Holding
-    /// the live block here lets the next write hand the superseded one back.
-    btrfs_live_log_block: Option<(u64, u64, bool)>,
+    /// the live blocks here lets the next write hand the superseded ones back.
+    ///
+    /// A LIST, not one block, because the kernel's log shape is TWO blocks per
+    /// fsync — the subvolume's log tree and the log root tree that points at it
+    /// (bd-jhuob). Both are superseded by the same rotation, and retiring only one
+    /// of them would leak the other once per fsync: the same defect bd-0ajub fixed,
+    /// reintroduced at half the rate. Empty while no log is published, which is
+    /// every mount today, since the tree-log fsync path is opt-in.
+    btrfs_live_log_blocks: Vec<(u64, u64, bool)>,
     /// bd-dm01m: every inode fsync'd through the tree-log path since the last full
     /// commit.
     ///
@@ -1220,7 +1227,10 @@ enum BtrfsExtentRewriteSegment {
     Prealloc { logical_offset: u64, length: u64 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No longer `Copy`: `retired_log_blocks` is a Vec, because the kernel's log shape
+// retires TWO blocks per rotation (bd-jhuob). Every use reads fields or borrows the
+// list, so dropping `Copy` costs nothing here.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BtrfsTreeLogWriteStats {
     log_root: u64,
     generation: u64,
@@ -1235,7 +1245,13 @@ struct BtrfsTreeLogWriteStats {
     /// the allocator early lets the next allocation overwrite the log a crash would
     /// still need. The caller frees it after its `dev.sync()`, which is the moment
     /// the new pointer becomes durable.
-    retired_log_block: Option<(u64, u64, bool)>,
+    /// Blocks the rotation superseded, as `(bytenr, num_bytes, is_metadata)`.
+    ///
+    /// A LIST rather than one block because the kernel's log shape is two blocks
+    /// per fsync — the log tree and the log root tree pointing at it (bd-jhuob) —
+    /// and BOTH are superseded together. Retiring only one would leak the other
+    /// per fsync, which is exactly the defect bd-0ajub already fixed once.
+    retired_log_blocks: Vec<(u64, u64, bool)>,
 }
 
 /// Statistics returned by full btrfs transaction commit (bd-jdo53).
@@ -9024,7 +9040,7 @@ impl OpenFs {
             // No fsync has been logged in this mount yet (bd-dm01m).
             btrfs_logged_inodes: std::collections::BTreeSet::new(),
             // No tree log published yet (bd-0ajub).
-            btrfs_live_log_block: None,
+            btrfs_live_log_blocks: Vec::new(),
         })
     }
 
@@ -29872,9 +29888,14 @@ impl OpenFs {
         // bd-0ajub: rotate. The block we are superseding is handed to the caller to
         // free AFTER the new log_root is durable, never here — until then the on-disk
         // superblock still points at it.
-        let retired_log_block = alloc
-            .btrfs_live_log_block
-            .replace((log_root, allocated_bytes, metadata_allocation));
+        // Rotate the whole live set: the caller frees every entry once the new
+        // log_root is durable. `replace` on a single Option could only ever hand
+        // back one, which is why this is a list even while the writer publishes
+        // one block (bd-jhuob).
+        let retired_log_blocks = std::mem::replace(
+            &mut alloc.btrfs_live_log_blocks,
+            vec![(log_root, allocated_bytes, metadata_allocation)],
+        );
         alloc.generation = alloc.generation.checked_add(1).ok_or_else(|| {
             FfsError::InvalidGeometry("btrfs tree-log generation overflow".into())
         })?;
@@ -29917,7 +29938,7 @@ impl OpenFs {
             },
             allocated_bytes,
             metadata_allocation,
-            retired_log_block,
+            retired_log_blocks,
         };
         Ok((node_bytes, sb_bytes, stats))
     }
@@ -30125,7 +30146,7 @@ impl OpenFs {
                     // fsync itself has already succeeded durably, and turning a
                     // space-accounting problem into a failed fsync would be the worse
                     // trade.
-                    if let Some((bytenr, num_bytes, is_metadata)) = tree_log.retired_log_block {
+                    for &(bytenr, num_bytes, is_metadata) in &tree_log.retired_log_blocks {
                         if let Ok(alloc_mutex) = self.require_btrfs_alloc_state() {
                             if let Err(err) = alloc_mutex
                                 .write()
@@ -31572,7 +31593,7 @@ impl OpenFs {
         // top of this commit. Dropping the handle here keeps the two in step — a
         // later fsync must not hand this address back a second time, which would
         // free a block that by then belongs to something else.
-        alloc.btrfs_live_log_block = None;
+        alloc.btrfs_live_log_blocks.clear();
 
         // bd-x36qn / bd-myrgc / bd-k74ef: the extent tree and the root tree are
         // self-describing by the time we get here — every block of both, not
