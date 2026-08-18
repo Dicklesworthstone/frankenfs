@@ -11009,3 +11009,38 @@ invocation.
 changed*, that hint may be used to do LESS WORK, never to decide that a write can be
 SKIPPED — unless the hint is independently enforced. An optimization that reads a
 promise turns the caller's latent bug into this layer's silent corruption.
+
+## bd-uxh7t — REFUTED FROM SOURCE: the btrfs commit does NOT leak block-group accounting
+
+**The hypothesis, and it was mine.** bd-uxh7t asks whether repeated fsyncs eventually ENOSPC
+even at a small file count — whether the per-commit metadata demand is unbounded in TIME as
+well as in filesystem size. Reading the allocator makes that look certain.
+`remove_metadata_items_owned_by_roots` (ffs-btrfs:6565) deletes the previous trees' extent
+items with a bare `extent_tree.delete(&key)`, while the real free path, `free_extent`
+(ffs-btrfs:~7573), is the only place that decrements `block_group.used_bytes`. Since
+`alloc_extent` selects a block group on `free_bytes() = total - used`, a delete that skips
+the decrement should make `used_bytes` climb by the whole tree's footprint every commit and
+never fall — ENOSPC in a handful of commits at ANY file count.
+
+**It does not happen, and the reason is one call further up.** `btrfs_full_transaction_commit`
+recomputes every group's `used_bytes` from the live extent items on every commit —
+`sync_accounting_and_free_space` (ffs-core:30391) when the free-space tree is rewritten in
+place, `sync_block_group_accounting` (ffs-core:30399) otherwise, landed for bd-4cxkd so
+`btrfs check` would stop reporting "block group used N but extent items used M". That
+recompute is correct-by-construction and does not consult the running tally, so the running
+tally cannot drift across a commit. The deleted items simply stop counting. No leak, and
+nothing to fix.
+
+**Ratio: none — no measurement, and none was possible.** This is a source refutation written
+under the build freeze. It withdraws a predicted defect; it does not explain the observed
+ENOSPC, which remains open on bd-uxh7t with two candidate mechanisms (the block group is
+genuinely full and we cannot allocate a new chunk — now bd-a136s; or the previous tree is
+PINNED while the new one is written, so a commit needs twice the metadata footprint). The
+`alloc_no_space_*` report landed in c77d122d prints `used` against `pinned` and decides which,
+in one mounted run, once a build is possible.
+
+**Transferable rule, and the one I nearly broke.** A missing decrement is only a leak if
+something downstream trusts the running tally. Before filing "X is never freed", find every
+writer of the quantity — a periodic recompute-from-truth makes the missing decrement dead
+code rather than a defect, and the recompute lived in a different crate from both the alloc
+and the free.
