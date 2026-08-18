@@ -531,6 +531,13 @@ impl FsOps for OpenFs {
                         canonical,
                         offset,
                     ) {
+                        // bd-btrfs-readdir-stat-8x-8y7vp: warm THIS page, not just
+                        // the first. A full listing is paginated, and every page
+                        // after the first is served from the snapshot and returns
+                        // here — so hooking only the fresh walk below warmed one
+                        // page out of a directory's worth. ext4 hooks its snapshot
+                        // path for the same reason.
+                        self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
                         return Ok(page);
                     }
                 }
@@ -546,6 +553,7 @@ impl FsOps for OpenFs {
                 if let Some(page) =
                     readdir_snapshot_serve(&self.readdir_snapshot, canonical, validation, offset)
                 {
+                    self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
                     return Ok(page);
                 }
 
@@ -566,19 +574,7 @@ impl FsOps for OpenFs {
                 let full = Arc::new(full);
                 let page = slice_readdir_snapshot(Arc::clone(&full), offset);
                 readdir_snapshot_store(&self.readdir_snapshot, canonical, validation, full);
-                // bd-btrfs-readdir-stat-8x-8y7vp: warm this page's inode leaves so
-                // the stat pass that follows finds them resident. Gated by the same
-                // two switches as the ext4 prefetch, plus its own opt-in — see
-                // `prefetch_btrfs_readdir_inode_leaves` for why btrfs needs an
-                // ordered descent where ext4 needs only arithmetic.
-                if btrfs_readdir_prefetch_enabled()
-                    && !scope.skip_readdir_prefetch
-                    && !self
-                        .readdir_prefetch_disabled
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.prefetch_btrfs_readdir_inode_leaves(cx, page.as_slice());
-                }
+                self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
                 Ok(page)
             }
         }
