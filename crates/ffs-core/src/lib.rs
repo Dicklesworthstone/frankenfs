@@ -12982,6 +12982,29 @@ impl OpenFs {
     /// stat pass that follows — which arrives in readdir order, not inode order,
     /// and cannot be reordered — finds its leaves already resident.
     ///
+    /// ⚠️ TWO CACHES, AND THEY DO DIFFERENT JOBS HERE. The floor memo
+    /// ([`BTRFS_FLOOR_MEMO_SLOTS`] = 4) is what DEDUPES this sweep: sorted
+    /// objectids falling in the leaf just fetched are answered without a descent.
+    /// But four slots cannot hold a page's worth of leaves, so what actually
+    /// SURVIVES to the stat pass is the parsed-node cache
+    /// ([`BTRFS_TREE_NODE_CACHE_LIMIT`] = 512). Saying "the memo warms the stat
+    /// pass" would be wrong; the memo makes the prefetch cheap, the node cache
+    /// makes it pay.
+    ///
+    /// That gives the warm-up a capacity bound worth knowing: a readdir page holds
+    /// at most [`READDIR_SNAPSHOT_PAGE_MAX`] entries and therefore at most that
+    /// many DISTINCT leaves, so it can never ask the node cache to hold more than
+    /// it has room for — today, only because the two constants happen to be equal.
+    /// `btrfs_readdir_prefetch_cannot_thrash_the_node_cache_bd_8y7vp` pins that, so
+    /// raising the page cap alone stops compiling the test rather than silently
+    /// turning this warm-up into self-eviction, where late entries evict the early
+    /// ones and the whole page's work is wasted.
+    ///
+    /// It calls the SAME resolver the real getattr calls rather than a cheaper
+    /// bespoke descent, which discards a parsed inode item per objectid. That waste
+    /// is deliberate: warming through the identical path is what guarantees the
+    /// thing warmed is the thing later read, and a descent dominates a parse.
+    ///
     /// Errors are swallowed deliberately: this is a warm-up, and an objectid that
     /// cannot be resolved here will simply be resolved (and fail) again by the
     /// real getattr, which is where the error belongs.
@@ -53224,6 +53247,29 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, b".");
         assert_eq!(result[1].name, b"..");
+    }
+
+    /// bd-btrfs-readdir-stat-8x-8y7vp: a readdir page must never be able to warm
+    /// more leaves than the parsed-node cache can hold.
+    ///
+    /// The prefetch descends once per DISTINCT leaf across a page, and a page is
+    /// capped at READDIR_SNAPSHOT_PAGE_MAX entries, so in the worst case (one entry
+    /// per leaf) it touches that many nodes. If that exceeded
+    /// BTRFS_TREE_NODE_CACHE_LIMIT the warm-up would evict its own early work
+    /// before the stat pass ran — doing a page of descents guaranteed to be wasted,
+    /// and looking like a lever while being a cost.
+    ///
+    /// The two constants are equal today by coincidence, not by construction, and
+    /// they live far apart in this file. This makes raising one alone a test
+    /// failure instead of a silent regression.
+    #[test]
+    fn btrfs_readdir_prefetch_cannot_thrash_the_node_cache_bd_8y7vp() {
+        assert!(
+            READDIR_SNAPSHOT_PAGE_MAX <= BTRFS_TREE_NODE_CACHE_LIMIT,
+            "a readdir page can warm up to {READDIR_SNAPSHOT_PAGE_MAX} distinct leaves \
+             but the parsed-node cache holds only {BTRFS_TREE_NODE_CACHE_LIMIT}; the \
+             prefetch would evict its own early work before the stat pass reads it"
+        );
     }
 
     /// bd-btrfs-readdir-stat-8x-8y7vp: the btrfs readdir prefetch must be OFF
