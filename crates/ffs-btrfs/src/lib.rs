@@ -11536,6 +11536,7 @@ pub fn replay_tree_log(
     read_physical: &mut dyn FnMut(u64) -> Result<Vec<u8>, ParseError>,
     sb: &BtrfsSuperblock,
     chunks: &[BtrfsChunkEntry],
+    subvol_objectid: u64,
 ) -> Result<TreeLogReplayResult, ParseError> {
     if sb.log_root == 0 {
         return Ok(TreeLogReplayResult::default());
@@ -11573,16 +11574,61 @@ pub fn replay_tree_log(
         .iter()
         .any(|entry| entry.key.item_type == BTRFS_ITEM_ROOT_ITEM)
     {
-        tracing::warn!(
+        // The kernel's shape: `log_root` is a log ROOT TREE holding one ROOT_ITEM
+        // per subvolume that has a log, each pointing at that subvolume's own log
+        // tree. Follow the one for the subvolume being mounted, and ONLY that one
+        // — another subvolume's logged items belong to a different keyspace, and
+        // overlaying them onto this tree is the corruption this branch exists to
+        // avoid.
+        let Some(entry) = items.iter().find(|entry| {
+            entry.key.item_type == BTRFS_ITEM_ROOT_ITEM && entry.key.objectid == subvol_objectid
+        }) else {
+            // A log exists, but not for us. ⚠️ NOT "nothing to replay": some other
+            // subvolume has acknowledged fsyncs recorded there, and a commit that
+            // cleared `log_root` would destroy them. Report it unreplayable so the
+            // caller refuses writes.
+            tracing::warn!(
+                log_root = sb.log_root,
+                subvol_objectid,
+                logs = items.len(),
+                "btrfs log root tree holds no log for this subvolume"
+            );
+            return Ok(TreeLogReplayResult {
+                items: Vec::new(),
+                items_count: 0,
+                replayed: false,
+                foreign_format: true,
+            });
+        };
+        if entry.data.len() < BTRFS_ROOT_ITEM_SIZE {
+            return Err(ParseError::InsufficientData {
+                needed: BTRFS_ROOT_ITEM_SIZE,
+                offset: 0,
+                actual: entry.data.len(),
+            });
+        }
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(
+            &entry.data[BTRFS_ROOT_ITEM_BYTENR_OFFSET..BTRFS_ROOT_ITEM_BYTENR_OFFSET + 8],
+        );
+        let log_tree = u64::from_le_bytes(raw);
+        if log_tree == 0 {
+            // A ROOT_ITEM pointing nowhere is an empty log for this subvolume.
+            return Ok(TreeLogReplayResult::default());
+        }
+        let logged = walk_tree(read_physical, chunks, log_tree, sb.nodesize, sb.csum_type)?;
+        tracing::info!(
             log_root = sb.log_root,
-            items = items.len(),
-            "btrfs tree-log is a log ROOT TREE (kernel format), not the single leaf              this implementation writes; refusing to replay it"
+            log_tree,
+            subvol_objectid,
+            items_replayed = logged.len(),
+            "btrfs tree-log replay complete (log root tree)"
         );
         return Ok(TreeLogReplayResult {
-            items: Vec::new(),
-            items_count: 0,
-            replayed: false,
-            foreign_format: true,
+            items_count: logged.len(),
+            items: logged,
+            replayed: true,
+            foreign_format: false,
         });
     }
 

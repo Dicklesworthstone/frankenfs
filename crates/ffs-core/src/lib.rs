@@ -5046,7 +5046,15 @@ impl OpenFs {
                                     })?;
                                 Ok(buf)
                             };
-                        match ffs_btrfs::replay_tree_log(&mut read_phys, sb, chunks_ref) {
+                        match ffs_btrfs::replay_tree_log(
+                            &mut read_phys,
+                            sb,
+                            chunks_ref,
+                            // The subvolume being mounted: a log root tree may hold
+                            // logs for several, and only this one's items belong in
+                            // this tree's keyspace.
+                            subvol_objectid,
+                        ) {
                             Ok(result) if result.replayed => {
                                 info!(
                                     items = result.items_count,
@@ -83497,7 +83505,8 @@ mod tests {
             }
             Ok(image[start..end].to_vec())
         };
-        let replayed = ffs_btrfs::replay_tree_log(&mut read_physical, &sb, &chunks)
+        let replayed =
+            ffs_btrfs::replay_tree_log(&mut read_physical, &sb, &chunks, BTRFS_FS_TREE_OBJECTID)
             .expect("tree-log must replay from the fsynced image");
         assert!(replayed.replayed);
 

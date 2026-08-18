@@ -902,7 +902,8 @@ fn btrfs_tree_log_replay_multilevel_conforms() {
     };
 
     let sb = build_btrfs_tree_log_superblock(root_logical, 1);
-    let replay = replay_tree_log(&mut read, &sb, &chunks).expect("replay tree-log");
+    let replay = replay_tree_log(&mut read, &sb, &chunks, BTRFS_FS_TREE_OBJECTID)
+        .expect("replay tree-log");
     assert!(replay.replayed, "tree-log with log_root should replay");
     assert_eq!(reads, vec![root_physical, leaf_physical]);
     assert_eq!(replay.items_count, 2);
@@ -927,7 +928,8 @@ fn btrfs_tree_log_replay_skips_when_log_root_absent() {
         })
     };
 
-    let replay = replay_tree_log(&mut read, &sb, &[]).expect("tree-log absent fast path");
+    let replay = replay_tree_log(&mut read, &sb, &[], BTRFS_FS_TREE_OBJECTID)
+        .expect("tree-log absent fast path");
     assert_eq!(read_calls, 0, "no physical reads should occur");
     assert!(!replay.replayed);
     assert_eq!(replay.items_count, 0);
