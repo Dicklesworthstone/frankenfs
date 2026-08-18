@@ -1744,6 +1744,25 @@ struct BtrfsReadPlanIndex {
     extents: rustc_hash::FxHashMap<u64, Arc<[(u64, BtrfsExtentData)]>>,
     dir_items: BTreeMap<u64, Arc<[(BtrfsKey, Vec<u8>)]>>,
     parents: rustc_hash::FxHashMap<u64, u64>,
+    /// Objectids owning at least one `XATTR_ITEM` (bd-t0xoq).
+    ///
+    /// This is the ONLY table here used to answer NEGATIVELY: a miss in
+    /// `inodes` falls back to a tree descent, but a miss here is a final
+    /// `None`. That is sound for the same reason the other tables are trusted
+    /// positively and for one more — the set is built from
+    /// `walk_btrfs_fs_tree`, a COMPLETE walk of the mounted subvolume with the
+    /// tree-log overlay already merged, over an image no one may write while
+    /// the index exists (`btrfs_read_plan_index` refuses when
+    /// `btrfs_alloc_state` is `Some`). A complete walk that never saw an
+    /// `XATTR_ITEM` for an objectid is a proof of absence, not a cache miss.
+    ///
+    /// Stores objectids rather than the items: the caller that motivates it is
+    /// Linux's per-metadata-op `security.capability` probe, which almost always
+    /// wants the answer "this file has no xattrs at all". Presence falls
+    /// through to the ordinary descent, so this holds one u64 per file that
+    /// HAS an xattr — typically a small minority — instead of a copy of every
+    /// xattr value.
+    xattr_objectids: rustc_hash::FxHashSet<u64>,
 }
 
 /// Opaque per-directory validation token: the directory inode's change-time and
@@ -10922,6 +10941,7 @@ impl OpenFs {
             rustc_hash::FxHashMap::default();
         let mut dir_items: BTreeMap<u64, Vec<(BtrfsKey, Vec<u8>)>> = BTreeMap::new();
         let mut parents = rustc_hash::FxHashMap::default();
+        let mut xattr_objectids = rustc_hash::FxHashSet::default();
 
         for item in items {
             match item.key.item_type {
@@ -10945,6 +10965,16 @@ impl OpenFs {
                 }
                 BTRFS_ITEM_INODE_REF => {
                     parents.entry(item.key.objectid).or_insert(item.key.offset);
+                }
+                // bd-t0xoq: this walk already visits every XATTR_ITEM in the
+                // subvolume and, until now, dropped them all on the floor here.
+                // Recording the objectid costs one hash insert on a pass we are
+                // already paying for, and no extra I/O whatsoever — the bead's
+                // own framing, that the information is "already in a struct we
+                // are holding and then throwing away", was literally true of
+                // this arm.
+                BTRFS_ITEM_XATTR_ITEM => {
+                    xattr_objectids.insert(item.key.objectid);
                 }
                 _ => {}
             }
@@ -10972,6 +11002,7 @@ impl OpenFs {
             extents,
             dir_items,
             parents,
+            xattr_objectids,
         }))
     }
 
@@ -33287,6 +33318,33 @@ impl OpenFs {
                 .map_err(|e| parse_to_ffs_error(&e));
         }
 
+        // ZERO-DESCENT ABSENCE PROOF (bd-t0xoq). When a read-plan index exists it
+        // was built from a COMPLETE walk of this subvolume, so an objectid absent
+        // from `xattr_objectids` owns no XATTR_ITEM anywhere in the tree and the
+        // answer is `None` without touching the device at all.
+        //
+        // This is a NEGATIVE use of the index, which is a stronger claim than the
+        // positive lookups `inodes`/`extents` make, so the licence for it is
+        // spelled out on the field: completeness of the walk, the tree-log overlay
+        // already merged by `walk_btrfs_fs_tree_by_objectid`, and a mount that
+        // cannot be written through while the index lives. Presence still falls
+        // through to the descent below — the set says only "look", never "here".
+        //
+        // Uses the CACHED accessor deliberately: this must never be the thing that
+        // triggers a full-tree walk. On a mount that never prewarmed, this is one
+        // `OnceLock` load and the path below is unchanged.
+        //
+        // ⚠️ SCOPE, so nobody re-derives it from a mounted row: the mounted
+        // comparator NEVER prewarms — `prewarm_btrfs_read_plan_index` has exactly
+        // two call sites, `walk_cmd` and `readdirbench_cmd`, both in-process. So
+        // this cannot move the mounted readdir+stat row, and no such claim may be
+        // made for it. It pays on the in-process walk/readdirbench paths.
+        if let Some(index) = self.btrfs_cached_read_plan_index()
+            && !index.xattr_objectids.contains(&canonical)
+        {
+            return Ok(None);
+        }
+
         // Read-only path: the xattr's name hash IS its key offset, so only the
         // XATTR_ITEM bucket at (canonical, XATTR_ITEM, name_hash) can hold this
         // name — seek that single bucket instead of walking every item of the
@@ -52012,6 +52070,92 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, b".");
         assert_eq!(result[1].name, b"..");
+    }
+
+    /// bd-t0xoq: the read-plan index's xattr-presence set must answer exactly what
+    /// the fs-tree descent answers.
+    ///
+    /// The set is the one table in the index consulted NEGATIVELY — a miss ends the
+    /// call with `None` rather than falling back — so the property that matters is
+    /// not "the fast path is fast" but "the fast path and the slow path agree". Two
+    /// mounts over the SAME image, one prewarmed and one not, take different code
+    /// paths through `btrfs_getxattr` for identical inputs; any divergence is a
+    /// wrong answer, and a wrong answer here is silent.
+    #[test]
+    fn btrfs_read_plan_index_xattr_absence_agrees_with_descent_bd_t0xoq() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"aaa.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"bbb.txt", 258, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let cx = Cx::for_testing();
+
+        // Prewarmed arm: `btrfs_getxattr` takes the new zero-descent absence path.
+        let warm = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image.clone())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        assert!(warm.prewarm_btrfs_read_plan_index(&cx).unwrap());
+        let index = warm
+            .btrfs_cached_read_plan_index()
+            .expect("prewarm reported an index, so one must be cached");
+        // This fixture stores no xattrs, so the set must be empty...
+        assert!(
+            index.xattr_objectids.is_empty(),
+            "fixture has no XATTR_ITEMs, so the presence set must be empty; got {:?}",
+            index.xattr_objectids
+        );
+        // ...and this keeps that assertion from passing vacuously on an index that
+        // simply walked nothing. An empty walk would also produce an empty set.
+        assert!(
+            !index.inodes.is_empty(),
+            "the walk must have seen INODE_ITEMs, otherwise the emptiness above proves nothing"
+        );
+
+        // Un-prewarmed arm: the same call takes the ordinary floor descent.
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            cold.btrfs_cached_read_plan_index().is_none(),
+            "this arm must NOT have an index, or it is not testing the descent"
+        );
+
+        let ops: &dyn FsOps = &warm;
+        let listing = ops
+            .readdir(&cx, &mut RequestScope::empty(), InodeNumber(1), 0)
+            .unwrap();
+        // Take the inode numbers from readdir rather than hard-coding them, so the
+        // test cannot silently probe an inode the fixture does not have.
+        let mut probed = 0_usize;
+        for entry in &listing {
+            let ino = entry.ino;
+            let indexed = warm
+                .btrfs_getxattr(&cx, ino, "security.capability")
+                .unwrap();
+            let descended = cold
+                .btrfs_getxattr(&cx, ino, "security.capability")
+                .unwrap();
+            assert_eq!(
+                indexed, descended,
+                "indexed absence disagrees with the descent for inode {}",
+                entry.ino.0
+            );
+            assert!(
+                indexed.is_none(),
+                "no file in this fixture carries security.capability"
+            );
+            probed += 1;
+        }
+        assert!(
+            probed >= 3,
+            "expected at least '.', '..' and the two files to be probed; got {probed}"
+        );
     }
 
     #[test]
