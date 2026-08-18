@@ -1761,7 +1761,8 @@ struct BtrfsReadPlanIndex {
     extents: rustc_hash::FxHashMap<u64, Arc<[(u64, BtrfsExtentData)]>>,
     dir_items: BTreeMap<u64, Arc<[(BtrfsKey, Vec<u8>)]>>,
     parents: rustc_hash::FxHashMap<u64, u64>,
-    /// Objectids owning at least one `XATTR_ITEM` (bd-t0xoq).
+    /// Every `XATTR_ITEM` key in the subvolume, as `(objectid, name_hash)`
+    /// (bd-t0xoq).
     ///
     /// This is the ONLY table here used to answer NEGATIVELY: a miss in
     /// `inodes` falls back to a tree descent, but a miss here is a final
@@ -1770,16 +1771,22 @@ struct BtrfsReadPlanIndex {
     /// `walk_btrfs_fs_tree`, a COMPLETE walk of the mounted subvolume with the
     /// tree-log overlay already merged, over an image no one may write while
     /// the index exists (`btrfs_read_plan_index` refuses when
-    /// `btrfs_alloc_state` is `Some`). A complete walk that never saw an
-    /// `XATTR_ITEM` for an objectid is a proof of absence, not a cache miss.
+    /// `btrfs_alloc_state` is `Some`). A complete walk that never saw a given
+    /// `XATTR_ITEM` key is a proof of absence, not a cache miss.
     ///
-    /// Stores objectids rather than the items: the caller that motivates it is
-    /// Linux's per-metadata-op `security.capability` probe, which almost always
-    /// wants the answer "this file has no xattrs at all". Presence falls
-    /// through to the ordinary descent, so this holds one u64 per file that
-    /// HAS an xattr — typically a small minority — instead of a copy of every
-    /// xattr value.
-    xattr_objectids: rustc_hash::FxHashSet<u64>,
+    /// ⚠️ KEYED PER NAME, NOT PER INODE, and that is not a refinement — a
+    /// per-inode "has any xattr" set is USELESS on a large class of real
+    /// systems. Under SELinux every file carries `security.selinux`, so such a
+    /// set would contain every inode in the filesystem and the fast path would
+    /// never fire for the `security.capability` probe that motivates it. The
+    /// name hash IS the `XATTR_ITEM` key's offset, so keying on it costs the
+    /// same walk and the same order of memory while answering the question
+    /// actually being asked: "does THIS name exist on this inode".
+    ///
+    /// Bounded by the number of distinct xattr name-hash buckets in the image,
+    /// not by its inode count — colliding names share one key, and a file with
+    /// no xattrs contributes nothing.
+    xattr_item_keys: rustc_hash::FxHashSet<(u64, u64)>,
 }
 
 /// Opaque per-directory validation token: the directory inode's change-time and
@@ -11042,7 +11049,7 @@ impl OpenFs {
             rustc_hash::FxHashMap::default();
         let mut dir_items: BTreeMap<u64, Vec<(BtrfsKey, Vec<u8>)>> = BTreeMap::new();
         let mut parents = rustc_hash::FxHashMap::default();
-        let mut xattr_objectids = rustc_hash::FxHashSet::default();
+        let mut xattr_item_keys = rustc_hash::FxHashSet::default();
 
         for item in items {
             match item.key.item_type {
@@ -11075,7 +11082,10 @@ impl OpenFs {
                 // are holding and then throwing away", was literally true of
                 // this arm.
                 BTRFS_ITEM_XATTR_ITEM => {
-                    xattr_objectids.insert(item.key.objectid);
+                    // The key's offset IS the name hash, so the key alone answers
+                    // "does this name exist on this inode" without retaining any
+                    // item data.
+                    xattr_item_keys.insert((item.key.objectid, item.key.offset));
                 }
                 _ => {}
             }
@@ -11103,7 +11113,7 @@ impl OpenFs {
             extents,
             dir_items,
             parents,
-            xattr_objectids,
+            xattr_item_keys,
         }))
     }
 
@@ -33474,17 +33484,34 @@ impl OpenFs {
                 .map_err(|e| parse_to_ffs_error(&e));
         }
 
+        // Read-only path: the xattr's name hash IS its key offset, so only the
+        // XATTR_ITEM bucket at (canonical, XATTR_ITEM, name_hash) can hold this
+        // name — seek that single bucket instead of walking every item of the
+        // inode (O(object) -> O(log N); a getxattr no longer descends the file's
+        // extents). Mirrors the COW fast path above. A name in any other bucket
+        // would hash differently, so no other item can match.
+        let name_hash = ffs_btrfs::btrfs_name_hash(name.as_bytes());
+
         // ZERO-DESCENT ABSENCE PROOF (bd-t0xoq). When a read-plan index exists it
-        // was built from a COMPLETE walk of this subvolume, so an objectid absent
-        // from `xattr_objectids` owns no XATTR_ITEM anywhere in the tree and the
-        // answer is `None` without touching the device at all.
+        // was built from a COMPLETE walk of this subvolume, so a key absent from
+        // `xattr_item_keys` exists nowhere in the tree and the answer is `None`
+        // without touching the device at all.
+        //
+        // Keyed on (objectid, name_hash) — the XATTR_ITEM key itself — and NOT on
+        // "this inode has some xattr". Under SELinux every file carries
+        // `security.selinux`, so a per-inode presence set would contain every
+        // inode in the filesystem and this branch would never fire for the
+        // `security.capability` probe it exists to serve. Asking about the exact
+        // key costs the same walk and answers the question actually being asked.
         //
         // This is a NEGATIVE use of the index, which is a stronger claim than the
         // positive lookups `inodes`/`extents` make, so the licence for it is
         // spelled out on the field: completeness of the walk, the tree-log overlay
         // already merged by `walk_btrfs_fs_tree_by_objectid`, and a mount that
-        // cannot be written through while the index lives. Presence still falls
-        // through to the descent below — the set says only "look", never "here".
+        // cannot be written through while the index lives. A present key still
+        // falls through to the descent below — the set says only "look", never
+        // "here", because the bucket may hold a DIFFERENT name that collided on
+        // this hash and only `find_xattr_item_value` can tell them apart.
         //
         // Uses the CACHED accessor deliberately: this must never be the thing that
         // triggers a full-tree walk. On a mount that never prewarmed, this is one
@@ -33496,18 +33523,12 @@ impl OpenFs {
         // this cannot move the mounted readdir+stat row, and no such claim may be
         // made for it. It pays on the in-process walk/readdirbench paths.
         if let Some(index) = self.btrfs_cached_read_plan_index()
-            && !index.xattr_objectids.contains(&canonical)
+            && !index
+                .xattr_item_keys
+                .contains(&(canonical, u64::from(name_hash)))
         {
             return Ok(None);
         }
-
-        // Read-only path: the xattr's name hash IS its key offset, so only the
-        // XATTR_ITEM bucket at (canonical, XATTR_ITEM, name_hash) can hold this
-        // name — seek that single bucket instead of walking every item of the
-        // inode (O(object) -> O(log N); a getxattr no longer descends the file's
-        // extents). Mirrors the COW fast path above. A name in any other bucket
-        // would hash differently, so no other item can match.
-        let name_hash = ffs_btrfs::btrfs_name_hash(name.as_bytes());
         let lo = BtrfsKey {
             objectid: canonical,
             item_type: BTRFS_ITEM_XATTR_ITEM,
@@ -52290,9 +52311,34 @@ mod tests {
             .expect("prewarm reported an index, so one must be cached");
         // This fixture stores no xattrs, so the set must be empty...
         assert!(
-            index.xattr_objectids.is_empty(),
-            "fixture has no XATTR_ITEMs, so the presence set must be empty; got {:?}",
-            index.xattr_objectids
+            index.xattr_item_keys.is_empty(),
+            "fixture has no XATTR_ITEMs, so the key set must be empty; got {:?}",
+            index.xattr_item_keys
+        );
+
+        // ⚠️ THE KEY IS PER NAME, NOT PER INODE. A per-inode "has any xattr" set is
+        // useless under SELinux, where every file carries security.selinux: the set
+        // would hold every inode and the fast path would never fire for the
+        // security.capability probe it exists for. Simulate that here — give an
+        // inode ONE xattr and confirm a DIFFERENT name on the SAME inode is still
+        // answered absent.
+        let selinux = ffs_btrfs::btrfs_name_hash(b"security.selinux");
+        let capability = ffs_btrfs::btrfs_name_hash(b"security.capability");
+        assert_ne!(
+            selinux, capability,
+            "the two names must hash apart or this test proves nothing"
+        );
+        let mut labelled: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
+        labelled.insert((257, u64::from(selinux)));
+        assert!(
+            labelled.contains(&(257, u64::from(selinux))),
+            "the label this inode does carry must be found"
+        );
+        assert!(
+            !labelled.contains(&(257, u64::from(capability))),
+            "a per-NAME key answers security.capability absent on an SELinux-labelled \
+             inode; a per-INODE presence set could not, and would fall through to a \
+             descent for every file on the system"
         );
         // ...and this keeps that assertion from passing vacuously on an index that
         // simply walked nothing. An empty walk would also produce an empty set.
