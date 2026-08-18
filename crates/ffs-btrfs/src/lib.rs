@@ -8228,6 +8228,49 @@ impl BtrfsExtentAllocator {
         )
     }
 
+    /// Allocate a tree block from SYSTEM space (bd-a136s).
+    ///
+    /// ⚠️ THE CHUNK TREE MUST BE ALLOCATED HERE, NOT FROM METADATA, and getting
+    /// this wrong produces a filesystem that passes every in-memory check and is
+    /// unmountable. The kernel bootstraps its chunk map from the superblock's
+    /// `sys_chunk_array` ALONE, before it can read any tree, and that array
+    /// carries SYSTEM chunks only. A chunk root sitting in a metadata block group
+    /// is therefore unmappable at the moment the kernel needs to map it:
+    ///
+    ///     No mapping for 60375040-60391424
+    ///     ERROR: cannot read chunk root
+    ///
+    /// — which is exactly what the bd-a136s acceptance gate produced when the
+    /// chunk tree was serialized with `alloc_metadata_for_tree`. That is what
+    /// SYSTEM chunks are for, and why a freshly made image keeps its chunk root
+    /// in one.
+    ///
+    /// The extent item IS inserted (unlike `alloc_metadata_for_root_tree`),
+    /// because the chunk tree is serialized BEFORE the extent tree in the commit,
+    /// so an item added here still reaches disk.
+    ///
+    /// # Errors
+    /// [`BtrfsMutationError::NoSpace`] when no SYSTEM block group has room. Note
+    /// that growth does not yet cover this case: `plan_growth_for_commit` only
+    /// plans METADATA chunks, so an exhausted system chunk fails rather than
+    /// growing. The `alloc_no_space_*` diagnostic names the required flags, so
+    /// the failure says which resource ran out.
+    pub fn alloc_system_for_tree(
+        &mut self,
+        num_bytes: u64,
+        root: u64,
+        level: u8,
+    ) -> Result<ExtentAllocation, BtrfsMutationError> {
+        self.alloc_extent(
+            num_bytes,
+            BTRFS_BLOCK_GROUP_SYSTEM,
+            true,
+            root,
+            level,
+            false,
+        )
+    }
+
     /// Allocate metadata for root_tree nodes without EXTENT_ITEM insertion.
     ///
     /// Root_tree allocations happen after extent_tree is serialized during

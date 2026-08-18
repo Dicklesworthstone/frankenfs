@@ -31012,9 +31012,24 @@ impl OpenFs {
             if chunk_dag.node_count() > 0 {
                 let mut chunk_addrs = std::collections::BTreeMap::new();
                 for (block, level) in chunk_dag.blocks_with_levels() {
+                    // ⚠️ SYSTEM SPACE, NOT METADATA, AND THE GATE PROVED WHY. The
+                    // kernel bootstraps its chunk map from the superblock's
+                    // `sys_chunk_array` alone, before it can read any tree, and
+                    // that array carries SYSTEM chunks only. Allocating the chunk
+                    // tree from a METADATA block group — which this did — puts the
+                    // chunk root at an address the kernel cannot map at the moment
+                    // it must map it:
+                    //
+                    //     No mapping for 60375040-60391424
+                    //     ERROR: cannot read chunk root
+                    //
+                    // That is what bd-a136s's acceptance gate produced: every unit
+                    // test green, `btrfs check` unable to open the filesystem. No
+                    // in-memory test can catch it, because the property is about
+                    // what the kernel can resolve before it has read anything.
                     let allocation = alloc
                         .extent_alloc
-                        .alloc_metadata_for_tree(
+                        .alloc_system_for_tree(
                             u64::from(nodesize),
                             BTRFS_CHUNK_TREE_OBJECTID,
                             level,
