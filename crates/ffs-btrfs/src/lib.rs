@@ -7191,6 +7191,21 @@ pub fn apply_chunk_allocation(
         return Err(BtrfsMutationError::BrokenInvariant(reason));
     }
 
+    // A system chunk that cannot be recorded in the superblock array must not be
+    // created at all: it would be invisible to the kernel's bootstrap, which
+    // reads that array before any tree.
+    let mut superblock = superblock;
+    if plan.needs_sys_chunk_array {
+        let Some(sb) = superblock.as_deref_mut() else {
+            return Err(BtrfsMutationError::InvalidConfig(
+                "a system chunk needs a superblock to record it in",
+            ));
+        };
+        if sb.sys_chunk_array_free() < plan.chunk.encoded_len() {
+            return Err(BtrfsMutationError::NoSpace);
+        }
+    }
+
     // The DEV_ITEM's `bytes_used` must rise by this chunk's device footprint, or
     // `btrfs check` reports a device whose usage disagrees with its dev extents.
     // It lives in the CHUNK tree — "the device items go into the chunk tree. The
@@ -7209,6 +7224,25 @@ pub fn apply_chunk_allocation(
     };
     let mut dev_item = parse_dev_item(&dev_item_bytes)
         .map_err(|_| BtrfsMutationError::BrokenInvariant("the DEV_ITEM does not parse"))?;
+    // ⚠️ THE PLAN'S ARITHMETIC WAS DONE AGAINST A `bytes_used` THE PLANNER READ
+    // EARLIER, and nothing has forced the item to still hold it. Writing
+    // `dev_bytes_used_after` on top of an item that moved in between silently
+    // records a device usage that matches neither the plan nor the disk — and
+    // `btrfs check` reads that as a device whose usage disagrees with its dev
+    // extents, the exact complaint updating the item was supposed to prevent.
+    // Recompute what the planner must have seen and refuse if it is not what is
+    // there. Found by a unit test asserting the arithmetic rather than the field.
+    let expected_before = plan
+        .dev_bytes_used_after
+        .checked_sub(plan.chunk.length)
+        .ok_or(BtrfsMutationError::BrokenInvariant(
+            "the plan's dev_bytes_used_after is smaller than the chunk it adds",
+        ))?;
+    if dev_item.bytes_used != expected_before {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "the DEV_ITEM moved since the plan was made; the plan is stale",
+        ));
+    }
     dev_item.bytes_used = plan.dev_bytes_used_after;
 
     let chunk_value = plan
@@ -7226,21 +7260,6 @@ pub fn apply_chunk_allocation(
         .dev_extent
         .to_bytes()
         .map_err(|_| BtrfsMutationError::InvalidConfig("dev extent does not serialize"))?;
-
-    // A system chunk that cannot be recorded in the superblock array must not be
-    // created at all: it would be invisible to the kernel's bootstrap, which
-    // reads that array before any tree.
-    let mut superblock = superblock;
-    if plan.needs_sys_chunk_array {
-        let Some(sb) = superblock.as_deref_mut() else {
-            return Err(BtrfsMutationError::InvalidConfig(
-                "a system chunk needs a superblock to record it in",
-            ));
-        };
-        if sb.sys_chunk_array_free() < plan.chunk.encoded_len() {
-            return Err(BtrfsMutationError::NoSpace);
-        }
-    }
 
     // ── Writes. Nothing below here may fail for a reason checked above ─────
     chunk_tree.insert(plan.chunk.key, &chunk_value)?;
@@ -18735,7 +18754,17 @@ mod tests {
         }
     }
 
-    fn chunk_request(kind: ChunkKind, logical: u64, physical: u64, length: u64) -> ChunkAllocationRequest {
+    /// `dev_bytes_used_before` is explicit because `apply_chunk_allocation` now
+    /// checks it against the DEV_ITEM: a test applying two plans must advance it
+    /// between them, exactly as the commit loop advances `device.bytes_used`.
+    /// Defaulting it would let a test apply a stale plan and pass.
+    fn chunk_request_used(
+        kind: ChunkKind,
+        logical: u64,
+        physical: u64,
+        length: u64,
+        dev_bytes_used_before: u64,
+    ) -> ChunkAllocationRequest {
         ChunkAllocationRequest {
             kind,
             logical,
@@ -18743,11 +18772,22 @@ mod tests {
             devid: 1,
             physical,
             dev_total_bytes: 512 * 1024 * 1024,
-            dev_bytes_used_before: 64 * 1024 * 1024,
+            dev_bytes_used_before,
             sector_size: 4096,
             chunk_tree_uuid: [0x11; 16],
             dev_uuid: [0x22; 16],
         }
+    }
+
+    /// The common case: the device is still at the 64 MiB every `seed_dev_item`
+    /// call in these tests seeds.
+    fn chunk_request(
+        kind: ChunkKind,
+        logical: u64,
+        physical: u64,
+        length: u64,
+    ) -> ChunkAllocationRequest {
+        chunk_request_used(kind, logical, physical, length, 64 * 1024 * 1024)
     }
 
     /// bd-a136s. A chunk is five records that point at each other, and
@@ -18957,7 +18997,7 @@ mod tests {
     fn applying_a_chunk_plan_makes_a_failing_allocation_succeed_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024, 64 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -19025,7 +19065,7 @@ mod tests {
     fn a_refused_chunk_plan_writes_nothing_at_all_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024, 64 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -19110,7 +19150,7 @@ mod tests {
     fn a_system_chunk_records_itself_in_the_superblock_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024, 64 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -19137,11 +19177,13 @@ mod tests {
         assert_eq!(sb.sys_chunk_array_size as usize, sb.sys_chunk_array.len());
         // A metadata chunk must NOT touch the array, so the same apply with a
         // superblock present leaves it alone.
-        let metadata = plan_chunk_allocation(&chunk_request(
+        // 96 MiB: the system chunk above already moved the device from 64.
+        let metadata = plan_chunk_allocation(&chunk_request_used(
             ChunkKind::Metadata,
             512 * MB,
             256 * MB,
             32 * MB,
+            96 * MB,
         ))
         .expect("plan");
         let after_system = sb.sys_chunk_array.len();
@@ -19169,7 +19211,7 @@ mod tests {
     fn an_overlapping_physical_range_is_refused_even_with_a_new_key_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
+        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024, 64 * 1024 * 1024);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -19186,11 +19228,14 @@ mod tests {
 
         // Different logical address, different dev-extent key, physical range
         // straddling the live chunk's tail.
-        let overlapping = plan_chunk_allocation(&chunk_request(
+        // 96 MiB so this plan is CURRENT: if it were stale it would be refused
+        // for that instead, and the overlap assertion below would prove nothing.
+        let overlapping = plan_chunk_allocation(&chunk_request_used(
             ChunkKind::Metadata,
             256 * MB,
             100 * MB,
             32 * MB,
+            96 * MB,
         ))
         .expect("plan");
         assert_ne!(overlapping.dev_extent_key, first.dev_extent_key);
@@ -19211,11 +19256,12 @@ mod tests {
 
         // A range that ABUTS without overlapping is fine — refusing it would
         // waste the device and turn a correct allocation into an ENOSPC.
-        let abutting = plan_chunk_allocation(&chunk_request(
+        let abutting = plan_chunk_allocation(&chunk_request_used(
             ChunkKind::Metadata,
             256 * MB,
             128 * MB,
             32 * MB,
+            96 * MB,
         ))
         .expect("plan");
         apply_chunk_allocation(&abutting, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
@@ -19339,11 +19385,16 @@ mod tests {
     /// items go into the chunk tree" (linux/btrfs_tree.h:118) — and chunk
     /// allocation updates its `bytes_used`. A test chunk tree without one models
     /// a filesystem that cannot exist, so the tests seed it.
-    fn seed_dev_item(chunk_tree: &mut InMemoryCowBtrfsTree, devid: u64, total_bytes: u64) {
+    fn seed_dev_item(
+        chunk_tree: &mut InMemoryCowBtrfsTree,
+        devid: u64,
+        total_bytes: u64,
+        bytes_used: u64,
+    ) {
         let item = BtrfsDevItem {
             devid,
             total_bytes,
-            bytes_used: 0,
+            bytes_used,
             io_align: 4096,
             io_width: 4096,
             sector_size: 4096,
@@ -19399,7 +19450,10 @@ mod tests {
         let demand = NODES * NODESIZE;
 
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * 1024 * 1024);
+        // 17 MiB to match `growth_device(100 * MB, 17 * MB)` below: the plan's
+        // arithmetic is checked against the DEV_ITEM now, so a seed that
+        // disagreed with the device would make every plan stale by construction.
+        seed_dev_item(&mut chunk_tree, 1, 100 * MB, 17 * MB);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(NODESIZE);
@@ -19640,7 +19694,7 @@ mod tests {
     fn applying_a_chunk_raises_the_dev_item_bytes_used_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * MB);
+        seed_dev_item(&mut chunk_tree, 1, 512 * MB, 64 * MB);
         let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
         let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         alloc.set_nodesize(16384);
@@ -19652,7 +19706,7 @@ mod tests {
         };
         let before = parse_dev_item(&chunk_tree.get(&dev_item_key).expect("seeded"))
             .expect("parses");
-        assert_eq!(before.bytes_used, 0);
+        assert_eq!(before.bytes_used, 64 * MB, "the seeded device usage");
 
         let plan = plan_chunk_allocation(&chunk_request(
             ChunkKind::Metadata,
@@ -19683,6 +19737,32 @@ mod tests {
         assert_eq!(after.uuid, before.uuid);
         assert_eq!(after.fsid, before.fsid);
         assert_eq!(after.sector_size, before.sector_size);
+
+        // ⚠️ A STALE PLAN MUST REFUSE. This second plan was built from the SAME
+        // request as the first, so it still believes the device had 64 MiB used —
+        // but the apply above moved the DEV_ITEM to 96 MiB. Writing this plan's
+        // `dev_bytes_used_after` on top would record a usage matching neither the
+        // plan nor the disk, which `btrfs check` reads as a device whose usage
+        // disagrees with its dev extents: the exact complaint updating the item
+        // exists to prevent. A plain field-assignment would have accepted it.
+        let stale = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            256 * MB,
+            192 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        assert!(
+            apply_chunk_allocation(&stale, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+                .is_err(),
+            "a plan whose dev_bytes_used_before no longer matches the DEV_ITEM is stale              and must be refused"
+        );
+        let unchanged = parse_dev_item(&chunk_tree.get(&dev_item_key).expect("present"))
+            .expect("parses");
+        assert_eq!(
+            unchanged.bytes_used, after.bytes_used,
+            "and the refusal must leave the DEV_ITEM exactly as it was"
+        );
     }
 
     /// bd-a136s. A chunk tree with no DEV_ITEM cannot record the allocation, so
@@ -19858,7 +19938,7 @@ mod tests {
         use crate::writeback::WriteDependencyDag;
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * MB);
+        seed_dev_item(&mut chunk_tree, 1, 512 * MB, 64 * MB);
         let dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
 
         let overhead = growth_overhead_nodes(&chunk_tree, &dev_tree, 7).expect("overhead");
@@ -19884,7 +19964,7 @@ mod tests {
 
         // It grows with the trees rather than being a constant.
         let mut bigger = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut bigger, 1, 512 * MB);
+        seed_dev_item(&mut bigger, 1, 512 * MB, 64 * MB);
         for i in 0..64_u64 {
             let chunk = logical_chunk(
                 i * 32 * MB,
@@ -19910,7 +19990,7 @@ mod tests {
     fn chunk_entries_round_trip_out_of_the_chunk_tree_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        seed_dev_item(&mut chunk_tree, 1, 512 * MB);
+        seed_dev_item(&mut chunk_tree, 1, 512 * MB, 64 * MB);
 
         // Inserted out of logical order, and with a DEV_ITEM in the tree that
         // must not be mistaken for a chunk.
