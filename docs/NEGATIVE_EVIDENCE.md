@@ -11132,3 +11132,49 @@ tree and the root tree. The extent tree is dirty by construction (bd-fv9tc/bd-k7
 METADATA_ITEMs describing this very transaction's allocations; bd-4cxkd recomputes accounting from
 it). The root tree is the tractable half, and whether it is reusable depends on whether the
 ROOT_ITEM skip actually fires — untested here, because this script discards the daemon's log.
+
+## bd-rsjvf — REJECTED for the fsync workload: the residual six nodes are genuinely dirty, and the ROOT_ITEM skip fires only where nothing moved
+
+**Traced 2026-08-18, thinkstation1.** `ffs-cli mount --rw` on a 256 MB btrfs image with
+`RUST_LOG=ffs::btrfs::writeback=trace`, three 4 KiB pure-overwrite `write+fsync` cycles on an
+existing file, then unmount. Counted from the daemon's own trace, not inferred:
+
+    commit                     fs-tree node addresses allocated   ROOT_ITEM skip
+    fsync 1                    92                                 no
+    fsync 2                     3                                 no
+    fsync 3                     3                                 no
+    unmount flush               0                                 FIRED
+
+**WHAT THIS SETTLES.** bd-rsjvf proposed extending bd-42gtq's block-reuse map to the root tree, and
+`9e462485` landed the ROOT_ITEM byte-identity skip as its prerequisite. The trace says the
+prerequisite is correct and INERT on the workload that motivated it:
+
+* Reuse works. The fs-tree DAG is 92 nodes every commit, and after the first commit only **3**
+  addresses are allocated — the COW spine, leaf to root. 89 nodes are reused.
+* The skip fires exactly once, on the unmount flush, the only commit that allocated ZERO fs-tree
+  nodes. There the root did not move, so the patched ROOT_ITEM was byte-identical and the update
+  was correctly skipped.
+* On a write+fsync it does not fire, and **must not**: the write changes the inode, so the fs tree
+  genuinely changes, so its root genuinely moves, so the ROOT_ITEM genuinely differs. The root
+  tree is dirty on those commits because it really did change.
+
+**SO EXTENDING THE REUSE MAP TO THE ROOT TREE WOULD SAVE NOTHING PER FSYNC.** Not because the
+mechanism is wrong — it is the same mechanism that took 92 nodes to 3 — but because the root tree's
+content genuinely differs on every commit that writes anything. A reuse map skips unchanged blocks;
+these blocks changed.
+
+**WHERE THE SIX NODES ACTUALLY GO,** combining this trace with the counted row above (102400 B per
+fsync = 4096 + 6 x 16384): 3 of the 6 are the fs tree's COW spine, and the other 3 are the extent
+tree and the root tree, with the csum tree contributing 0 on a NODATASUM image. All three are
+dirtied by the transaction itself.
+
+**THE LEVER THIS POINTS AT IS bd-jhuob, NOT MORE REUSE.** Every one of the six is a consequence of
+doing a FULL TRANSACTION COMMIT per fsync: COW the spine, re-file the extent items, repoint the
+roots. Kernel btrfs writes a tree log instead and replays it after a crash, which is why its count
+is 18 blocks to our 25 on the same workload. Reducing the six means not committing the whole
+transaction per fsync — the tree-log fast path, both halves of which this repo already has
+(bd-jhuob) — rather than reusing more blocks inside a commit that is doing genuine work.
+
+**What stays.** `9e462485` is correct and cheap and should stay: a commit where nothing moved no
+longer dirties the root-tree spine for nothing, which is what the unmount-flush row shows. It is
+simply not a fsync-row lever, and the ledger must not carry it as one.
