@@ -1658,6 +1658,22 @@ pub struct OpenFs {
     /// implicated in a wrong-metadata report it can be taken out without a
     /// rebuild. Default off (memo enabled).
     btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool,
+    /// Whether the read-only getxattr memo-aware fast path is disabled (bd-yu6jz).
+    ///
+    /// The fast path resolves a one-key XATTR_ITEM bucket with a floor descent so
+    /// the probe reaches `btrfs_floor_leaf_memo`, which the range walker never
+    /// consults; it cut image reads 12.6x on a 20,048-entry readdir+stat sweep.
+    /// Its WALL-CLOCK worth has never been measured, and cross-window comparison
+    /// cannot settle that — bd-4sull measured 9.15% cross-window reproducibility
+    /// against an effect nobody has bounded.
+    ///
+    /// This exists to make the measurement possible AT ALL: the mounted
+    /// comparator's `--candidate-b-env` mounts two extra FUSE arms from the SAME
+    /// ELF with an added environment, so one knob turns an unanswerable
+    /// cross-window question into a within-window, same-ELF A/B where ISA and PGO
+    /// cancel by construction (bd-b9dug class C). Default off (fast path enabled),
+    /// so an unset environment is byte-identical to the shipped behaviour.
+    btrfs_xattr_memo_disabled: std::sync::atomic::AtomicBool,
     /// Consecutive floor descents that found the retained leaf unusable (bd-79li3).
     ///
     /// The memo's SIGN depends on the workload. A sweep over consecutive
@@ -1900,6 +1916,29 @@ const EXT4_BASE_BLOCK_CACHE_LIMIT: usize = 1024;
 /// see whether the symptom follows. Accepts `0`, `false`, `off` (bd-5vis3).
 fn btrfs_floor_memo_disabled_from_env() -> bool {
     std::env::var("FFS_BTRFS_FLOOR_MEMO").is_ok_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    })
+}
+
+/// Whether `FFS_BTRFS_XATTR_MEMO` disables the read-only getxattr fast path (bd-yu6jz).
+///
+/// Accepts `0`, `false`, `off`, matching `FFS_BTRFS_FLOOR_MEMO` so an operator does
+/// not have to remember two spellings. Absent or any other value leaves the fast
+/// path ON, which is the shipped behaviour — this knob may only ever subtract.
+fn btrfs_xattr_memo_disabled_from_env() -> bool {
+    btrfs_xattr_memo_disabled_from_value(std::env::var("FFS_BTRFS_XATTR_MEMO").ok().as_deref())
+}
+
+/// Pure half of [`btrfs_xattr_memo_disabled_from_env`], split out so the parsing is
+/// testable without mutating process-global environment state.
+///
+/// The sibling `FFS_BTRFS_FLOOR_MEMO` test has to restate its parsing rule inline for
+/// exactly that reason, which means the test can drift from the code it checks. This
+/// shape lets the test call the real thing instead, and the repo already uses it for
+/// `readdirplus_batch_attrs_from_value`.
+fn btrfs_xattr_memo_disabled_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
         let value = value.trim();
         value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
     })
@@ -4888,6 +4927,9 @@ impl OpenFs {
             btrfs_floor_leaf_memo: Mutex::new(None),
             btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(
                 btrfs_floor_memo_disabled_from_env(),
+            ),
+            btrfs_xattr_memo_disabled: std::sync::atomic::AtomicBool::new(
+                btrfs_xattr_memo_disabled_from_env(),
             ),
             btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32::new(0),
             btrfs_dir_entry_cache: ShardedCache::new(),
@@ -33055,7 +33097,16 @@ impl OpenFs {
         // early-returns when `btrfs_tree_log_items` is empty, so with an empty log
         // the two paths are exactly equivalent and with a non-empty one they are
         // not — hence the fallback rather than a blanket switch.
-        if self.btrfs_tree_log_items.is_empty() {
+        // The env gate is checked FIRST and separately from the tree-log condition,
+        // because the two refuse for different reasons: the tree log is a
+        // CORRECTNESS precondition (the range walker applies an overlay the floor
+        // walker does not), while the knob is an operator/measurement switch. Folding
+        // them into one boolean would let a future edit to either silently change the
+        // other's meaning.
+        let xattr_memo_enabled = !self
+            .btrfs_xattr_memo_disabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if xattr_memo_enabled && self.btrfs_tree_log_items.is_empty() {
             return match self.walk_btrfs_fs_tree_floor(cx, lo)? {
                 // ⚠️ THE KEY EQUALITY IS LOAD-BEARING. A floor descent returns the
                 // greatest key `<= lo`, so when this bucket is absent it hands
@@ -35100,6 +35151,17 @@ impl OpenFs {
     /// simply takes the uncached htree/inode-read path.
     /// Disable (or re-enable) the btrfs floor-leaf memo (bd-5vis3). See
     /// `btrfs_floor_memo_disabled`.
+    /// Disable (or re-enable) the read-only getxattr memo fast path (bd-yu6jz).
+    ///
+    /// The per-instance twin of `FFS_BTRFS_XATTR_MEMO`. Unlike the floor memo there
+    /// is no streak state to reset: the fast path holds nothing of its own, it only
+    /// chooses which descent reaches the shared floor-leaf memo, so flipping it is
+    /// stateless and an A/B may run the arms in either order.
+    pub fn set_btrfs_xattr_memo_disabled(&self, disabled: bool) {
+        self.btrfs_xattr_memo_disabled
+            .store(disabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn set_btrfs_floor_memo_disabled(&self, disabled: bool) {
         self.btrfs_floor_memo_disabled
             .store(disabled, std::sync::atomic::Ordering::Relaxed);
@@ -56573,6 +56635,45 @@ mod tests {
         assert!(
             !std::env::var("FFS_BTRFS_FLOOR_MEMO_DEFINITELY_UNSET_KEY").is_ok_and(|_| true),
             "sanity: an unset variable must not read as set"
+        );
+    }
+
+    /// bd-yu6jz: the getxattr fast-path kill switch must parse, and must default ON.
+    ///
+    /// This calls the REAL parser rather than restating its rule, so the test cannot
+    /// drift from the code the way an inline copy can.
+    #[test]
+    fn btrfs_xattr_memo_env_switch_parses_bd_yu6jz() {
+        for (raw, want_disabled) in [
+            (Some("0"), true),
+            (Some("false"), true),
+            (Some("FALSE"), true),
+            (Some("off"), true),
+            (Some("Off"), true),
+            (Some("  off  "), true),
+            (Some("1"), false),
+            (Some("true"), false),
+            (Some("on"), false),
+            (Some(""), false),
+            (Some("yes"), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                btrfs_xattr_memo_disabled_from_value(raw),
+                want_disabled,
+                "FFS_BTRFS_XATTR_MEMO={raw:?} should {} the getxattr fast path",
+                if want_disabled {
+                    "disable"
+                } else {
+                    "leave enabled"
+                }
+            );
+        }
+        // The load-bearing case: UNSET must leave the fast path on, so an environment
+        // that never heard of this knob is byte-identical to the shipped behaviour.
+        assert!(
+            !btrfs_xattr_memo_disabled_from_value(None),
+            "an unset FFS_BTRFS_XATTR_MEMO must leave the fast path ENABLED"
         );
     }
 
