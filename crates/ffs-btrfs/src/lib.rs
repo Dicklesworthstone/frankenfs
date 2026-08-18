@@ -6599,6 +6599,217 @@ impl ChunkSizePolicy {
     }
 }
 
+/// Everything one chunk allocation must write, as one value.
+///
+/// A chunk is not a single record. It is a CHUNK_ITEM in the chunk tree, a
+/// DEV_EXTENT in the device tree, a BLOCK_GROUP_ITEM in the extent tree, a
+/// raised `bytes_used` on the DEV_ITEM, and — for a system chunk only — an entry
+/// in the superblock's `sys_chunk_array`. Those records cross-reference each
+/// other and `btrfs check` verifies the cross-references: a CHUNK_ITEM with no
+/// matching DEV_EXTENT is reported as "chunk ... is not found in dev extent".
+///
+/// They are produced together, from one set of inputs, so that the consistency
+/// between them is established HERE — where it can be unit-tested — rather than
+/// at four separate call sites inside a transaction that can only be checked by
+/// mounting the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkAllocationPlan {
+    /// The CHUNK_ITEM, keyed `(FIRST_CHUNK_TREE_OBJECTID, CHUNK_ITEM, logical)`.
+    pub chunk: BtrfsChunkEntry,
+    /// Key of the DEV_EXTENT: `(devid, DEV_EXTENT, physical offset)`.
+    pub dev_extent_key: BtrfsKey,
+    /// The DEV_EXTENT itself, pointing back at the chunk.
+    pub dev_extent: BtrfsDevExtent,
+    /// Key of the BLOCK_GROUP_ITEM: `(logical, BLOCK_GROUP_ITEM, length)`.
+    pub block_group_key: BtrfsKey,
+    /// The block group, which starts empty.
+    pub block_group: BtrfsBlockGroupItem,
+    /// What the DEV_ITEM's `bytes_used` becomes once this chunk exists.
+    pub dev_bytes_used_after: u64,
+    /// Whether this entry must ALSO be appended to the superblock's
+    /// `sys_chunk_array`. True for system chunks and false otherwise, because
+    /// the kernel bootstraps the chunk tree from that array alone: omitting a
+    /// system chunk makes the filesystem unmountable, and adding a metadata or
+    /// data chunk wastes the array's small fixed space for nothing.
+    pub needs_sys_chunk_array: bool,
+}
+
+/// Inputs to [`plan_chunk_allocation`].
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkAllocationRequest {
+    /// What the chunk holds.
+    pub kind: ChunkKind,
+    /// Logical start of the new chunk.
+    pub logical: u64,
+    /// Length, already decided by [`ChunkSizePolicy::decide`] and therefore
+    /// already clamped to the device's free run and aligned.
+    pub length: u64,
+    /// Device this chunk lives on.
+    pub devid: u64,
+    /// Physical offset on that device, from
+    /// `DeviceOccupancy::find_free`.
+    pub physical: u64,
+    /// Size of the device.
+    pub dev_total_bytes: u64,
+    /// The DEV_ITEM's `bytes_used` before this allocation.
+    pub dev_bytes_used_before: u64,
+    /// Sector size, copied into the chunk's io fields.
+    pub sector_size: u32,
+    /// UUID of the chunk tree, stamped into the DEV_EXTENT.
+    pub chunk_tree_uuid: [u8; 16],
+    /// UUID of the device, stamped into the stripe.
+    pub dev_uuid: [u8; 16],
+}
+
+/// Key type of a CHUNK_ITEM. Verified against `/usr/include/linux/btrfs_tree.h`
+/// (`BTRFS_CHUNK_ITEM_KEY 228`), like every other key constant this plan uses:
+/// BLOCK_GROUP_ITEM 192, DEV_EXTENT 204, FIRST_CHUNK_TREE_OBJECTID 256.
+pub const BTRFS_ITEM_CHUNK_ITEM: u8 = 228;
+
+/// Build the complete, mutually consistent set of records for one SINGLE-profile
+/// chunk allocation.
+///
+/// Single profile only, deliberately: one stripe covering the whole chunk on one
+/// device. DUP and the mirror profiles need two or more stripes with their own
+/// placement, and the striped profiles need a per-stripe length this code does
+/// not model (see `DeviceOccupancy::from_chunks`, which refuses them for the same
+/// reason). Growing a single-device filesystem is what bd-a136s needs.
+///
+/// # Errors
+/// Refuses anything that would produce a filesystem `btrfs check` rejects or the
+/// kernel cannot mount: a zero or misaligned length, a chunk running past the end
+/// of the device, a `bytes_used` that would exceed the device, a zero devid, or a
+/// logical or physical address that overflows.
+pub fn plan_chunk_allocation(
+    request: &ChunkAllocationRequest,
+) -> Result<ChunkAllocationPlan, BtrfsMutationError> {
+    if request.length == 0 {
+        return Err(BtrfsMutationError::InvalidConfig("chunk length is zero"));
+    }
+    if request.length % BTRFS_STRIPE_LEN != 0 {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "chunk length is not a multiple of the stripe length",
+        ));
+    }
+    if request.devid == 0 {
+        return Err(BtrfsMutationError::InvalidConfig("devid must be non-zero"));
+    }
+    let physical_end = request
+        .physical
+        .checked_add(request.length)
+        .ok_or(BtrfsMutationError::AddressOverflow)?;
+    if physical_end > request.dev_total_bytes {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "chunk runs past the end of the device",
+        ));
+    }
+    request
+        .logical
+        .checked_add(request.length)
+        .ok_or(BtrfsMutationError::AddressOverflow)?;
+    // The device's own accounting must stay inside the device. This is a
+    // separate check from the one above: a chunk can fit at its offset while the
+    // running total is already wrong, and `parse_dev_item` refuses the result.
+    let dev_bytes_used_after = request
+        .dev_bytes_used_before
+        .checked_add(request.length)
+        .ok_or(BtrfsMutationError::AddressOverflow)?;
+    if dev_bytes_used_after > request.dev_total_bytes {
+        return Err(BtrfsMutationError::InvalidConfig(
+            "device bytes_used would exceed the device size",
+        ));
+    }
+
+    let flags = match request.kind {
+        ChunkKind::Metadata => BTRFS_BLOCK_GROUP_METADATA,
+        ChunkKind::Data => BTRFS_BLOCK_GROUP_DATA,
+        ChunkKind::System => BTRFS_BLOCK_GROUP_SYSTEM,
+    };
+
+    let chunk = BtrfsChunkEntry {
+        key: BtrfsKey {
+            objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+            item_type: BTRFS_ITEM_CHUNK_ITEM,
+            offset: request.logical,
+        },
+        length: request.length,
+        // "objectid of the root referencing this chunk" (btrfs_tree.h:634).
+        // That is the EXTENT tree, which is what the crate's own representative
+        // superblock fixture carries; the fs tree would be wrong.
+        owner: BTRFS_EXTENT_TREE_OBJECTID,
+        stripe_len: BTRFS_STRIPE_LEN,
+        chunk_type: flags,
+        io_align: request.sector_size,
+        io_width: request.sector_size,
+        sector_size: request.sector_size,
+        num_stripes: 1,
+        sub_stripes: 0,
+        stripes: vec![BtrfsStripe {
+            devid: request.devid,
+            offset: request.physical,
+            dev_uuid: request.dev_uuid,
+        }],
+    };
+
+    Ok(ChunkAllocationPlan {
+        dev_extent_key: BtrfsKey {
+            objectid: request.devid,
+            item_type: BTRFS_DEV_EXTENT_KEY,
+            offset: request.physical,
+        },
+        dev_extent: BtrfsDevExtent {
+            chunk_tree: BTRFS_CHUNK_TREE_OBJECTID,
+            chunk_objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+            chunk_offset: request.logical,
+            length: request.length,
+            chunk_tree_uuid: request.chunk_tree_uuid,
+        },
+        block_group_key: BtrfsKey {
+            objectid: request.logical,
+            item_type: BTRFS_ITEM_BLOCK_GROUP_ITEM,
+            offset: request.length,
+        },
+        block_group: BtrfsBlockGroupItem {
+            total_bytes: request.length,
+            used_bytes: 0,
+            flags,
+        },
+        dev_bytes_used_after,
+        needs_sys_chunk_array: matches!(request.kind, ChunkKind::System),
+        chunk,
+    })
+}
+
+/// The lowest logical address at which a new chunk may start, given the existing
+/// chunk map.
+///
+/// Append-only: the answer is past the end of the highest existing chunk, never
+/// in a logical hole a removed chunk left behind. Reusing holes is legal and
+/// saves logical address space, but logical space is 64 bits and effectively
+/// free, while a placement bug there aliases two chunks onto one address range.
+/// The conservative rule costs nothing real.
+///
+/// # Errors
+/// Returns [`BtrfsMutationError::AddressOverflow`] if the chunk map runs to the
+/// top of the logical address space.
+pub fn next_logical_chunk_start(chunks: &[BtrfsChunkEntry]) -> Result<u64, BtrfsMutationError> {
+    let mut end = 0_u64;
+    for chunk in chunks {
+        let chunk_end = chunk
+            .key
+            .offset
+            .checked_add(chunk.length)
+            .ok_or(BtrfsMutationError::AddressOverflow)?;
+        end = end.max(chunk_end);
+    }
+    let remainder = end % BTRFS_STRIPE_LEN;
+    if remainder == 0 {
+        return Ok(end);
+    }
+    end.checked_add(BTRFS_STRIPE_LEN - remainder)
+        .ok_or(BtrfsMutationError::AddressOverflow)
+}
+
 /// Why an allocation found no room, in the terms that separate bd-uxh7t's two
 /// candidate mechanisms. Produced by `BtrfsExtentAllocator::describe_no_space`
 /// at the moment `NoSpace` is returned; carries no policy.
@@ -17930,6 +18141,216 @@ mod tests {
             size <= device / 10,
             "one chunk must not swallow more than a tenth of the device"
         );
+    }
+
+    fn logical_chunk(
+        logical: u64,
+        length: u64,
+        chunk_type: u64,
+        stripes: &[(u64, u64)],
+    ) -> BtrfsChunkEntry {
+        BtrfsChunkEntry {
+            key: BtrfsKey {
+                objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+                item_type: BTRFS_ITEM_CHUNK_ITEM,
+                offset: logical,
+            },
+            length,
+            owner: BTRFS_EXTENT_TREE_OBJECTID,
+            stripe_len: BTRFS_STRIPE_LEN,
+            chunk_type,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            num_stripes: u16::try_from(stripes.len()).expect("stripe count fits"),
+            sub_stripes: 0,
+            stripes: stripes
+                .iter()
+                .map(|&(devid, offset)| BtrfsStripe {
+                    devid,
+                    offset,
+                    dev_uuid: [0; 16],
+                })
+                .collect(),
+        }
+    }
+
+    fn chunk_request(kind: ChunkKind, logical: u64, physical: u64, length: u64) -> ChunkAllocationRequest {
+        ChunkAllocationRequest {
+            kind,
+            logical,
+            length,
+            devid: 1,
+            physical,
+            dev_total_bytes: 512 * 1024 * 1024,
+            dev_bytes_used_before: 64 * 1024 * 1024,
+            sector_size: 4096,
+            chunk_tree_uuid: [0x11; 16],
+            dev_uuid: [0x22; 16],
+        }
+    }
+
+    /// bd-a136s. A chunk is five records that point at each other, and
+    /// `btrfs check` verifies the cross-references — a CHUNK_ITEM with no
+    /// matching DEV_EXTENT is reported as "chunk ... is not found in dev extent".
+    /// This asserts the cross-references themselves, not that each record is
+    /// individually well-formed, because it is the AGREEMENT between them that a
+    /// four-call-site transaction gets wrong.
+    #[test]
+    fn chunk_plan_records_agree_with_each_other_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let request = chunk_request(ChunkKind::Metadata, 128 * MB, 96 * MB, 32 * MB);
+        let plan = plan_chunk_allocation(&request).expect("plan");
+
+        // The chunk is keyed by LOGICAL address under the first chunk tree
+        // objectid; the block group is keyed by the same logical address with the
+        // length as its key offset.
+        assert_eq!(plan.chunk.key.objectid, BTRFS_FIRST_CHUNK_TREE_OBJECTID);
+        assert_eq!(plan.chunk.key.item_type, BTRFS_ITEM_CHUNK_ITEM);
+        assert_eq!(plan.chunk.key.offset, 128 * MB);
+        assert_eq!(plan.block_group_key.objectid, plan.chunk.key.offset);
+        assert_eq!(plan.block_group_key.item_type, BTRFS_ITEM_BLOCK_GROUP_ITEM);
+        assert_eq!(plan.block_group_key.offset, plan.chunk.length);
+
+        // The dev extent is keyed by PHYSICAL address under the device, and
+        // points back at the chunk's LOGICAL address. Confusing the two is the
+        // single easiest mistake here and produces a filesystem that parses.
+        assert_eq!(plan.dev_extent_key.objectid, request.devid);
+        assert_eq!(plan.dev_extent_key.item_type, BTRFS_DEV_EXTENT_KEY);
+        assert_eq!(plan.dev_extent_key.offset, 96 * MB);
+        assert_eq!(plan.dev_extent.chunk_offset, plan.chunk.key.offset);
+        assert_eq!(plan.dev_extent.chunk_objectid, BTRFS_FIRST_CHUNK_TREE_OBJECTID);
+        assert_eq!(plan.dev_extent.chunk_tree, BTRFS_CHUNK_TREE_OBJECTID);
+
+        // Lengths agree across all three records.
+        assert_eq!(plan.chunk.length, 32 * MB);
+        assert_eq!(plan.dev_extent.length, plan.chunk.length);
+        assert_eq!(plan.block_group.total_bytes, plan.chunk.length);
+
+        // The stripe places the chunk where the dev extent says it is.
+        assert_eq!(plan.chunk.stripes.len(), 1);
+        assert_eq!(plan.chunk.num_stripes, 1);
+        assert_eq!(plan.chunk.stripes[0].devid, plan.dev_extent_key.objectid);
+        assert_eq!(plan.chunk.stripes[0].offset, plan.dev_extent_key.offset);
+
+        // Flags agree between chunk and block group, a fresh chunk is empty, and
+        // the device's accounting rises by exactly the chunk length.
+        assert_eq!(plan.block_group.flags, plan.chunk.chunk_type);
+        assert_eq!(plan.chunk.chunk_type, BTRFS_BLOCK_GROUP_METADATA);
+        assert_eq!(plan.block_group.used_bytes, 0);
+        assert_eq!(
+            plan.dev_bytes_used_after,
+            request.dev_bytes_used_before + plan.chunk.length
+        );
+
+        // And the whole thing must serialize — the writers refuse what their
+        // parsers reject, so this is a real check that the plan is well-formed
+        // and not merely self-consistent.
+        plan.chunk.to_item_bytes().expect("chunk serializes");
+        plan.dev_extent.to_bytes().expect("dev extent serializes");
+    }
+
+    /// bd-a136s. Only a SYSTEM chunk goes into the superblock's
+    /// `sys_chunk_array`. The kernel bootstraps the chunk tree from that array
+    /// alone, so omitting a system chunk makes the filesystem unmountable, and
+    /// adding a metadata or data chunk burns the array's small fixed space for
+    /// nothing. Getting this backwards is the most expensive single mistake in
+    /// this path, so it is asserted for every kind rather than for one.
+    #[test]
+    fn only_a_system_chunk_needs_the_sys_chunk_array_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        for (kind, flags, wanted) in [
+            (ChunkKind::System, BTRFS_BLOCK_GROUP_SYSTEM, true),
+            (ChunkKind::Metadata, BTRFS_BLOCK_GROUP_METADATA, false),
+            (ChunkKind::Data, BTRFS_BLOCK_GROUP_DATA, false),
+        ] {
+            let plan = plan_chunk_allocation(&chunk_request(kind, 128 * MB, 96 * MB, 32 * MB))
+                .expect("plan");
+            assert_eq!(
+                plan.needs_sys_chunk_array, wanted,
+                "{kind:?} sys_chunk_array requirement"
+            );
+            assert_eq!(plan.chunk.chunk_type, flags, "{kind:?} flags");
+        }
+    }
+
+    /// bd-a136s. Every refusal here is a filesystem that would parse and then
+    /// fail somewhere expensive — at `btrfs check`, or at a kernel mount, or as a
+    /// silent overwrite of whatever already lives at the overlapping address.
+    #[test]
+    fn chunk_plan_refuses_what_would_not_survive_btrfs_check_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let ok = chunk_request(ChunkKind::Metadata, 128 * MB, 96 * MB, 32 * MB);
+        plan_chunk_allocation(&ok).expect("the baseline request must be accepted");
+
+        let mut zero_length = ok;
+        zero_length.length = 0;
+        assert!(plan_chunk_allocation(&zero_length).is_err());
+
+        // A length that is not a multiple of the stripe length. The sizing policy
+        // never produces one, but this function is reachable from anywhere.
+        let mut misaligned = ok;
+        misaligned.length = 32 * MB + 1;
+        assert!(plan_chunk_allocation(&misaligned).is_err());
+
+        let mut zero_devid = ok;
+        zero_devid.devid = 0;
+        assert!(plan_chunk_allocation(&zero_devid).is_err());
+
+        // Past the end of the device: the chunk would address bytes that do not
+        // exist.
+        let mut off_the_end = ok;
+        off_the_end.physical = ok.dev_total_bytes - 16 * MB;
+        assert!(
+            plan_chunk_allocation(&off_the_end).is_err(),
+            "a 32 MiB chunk 16 MiB from the end of the device must be refused"
+        );
+        // Ending exactly at the device end is legal — refusing it would refuse
+        // the last chunk a device can hold.
+        let mut exactly_at_end = ok;
+        exactly_at_end.physical = ok.dev_total_bytes - 32 * MB;
+        plan_chunk_allocation(&exactly_at_end).expect("a chunk ending at the device end is valid");
+
+        // The device's running total must stay inside the device even when the
+        // chunk itself fits — a separate failure, and one `parse_dev_item`
+        // rejects on the way back in.
+        let mut overcommitted = ok;
+        overcommitted.dev_bytes_used_before = ok.dev_total_bytes - 16 * MB;
+        assert!(
+            plan_chunk_allocation(&overcommitted).is_err(),
+            "bytes_used must not be able to exceed the device size"
+        );
+    }
+
+    /// bd-a136s. New chunks are placed past the highest existing one, never in a
+    /// logical hole. Logical space is 64 bits and effectively free; a placement
+    /// bug there aliases two chunks onto one address range, which is unbounded
+    /// data loss for a saving of nothing.
+    #[test]
+    fn next_logical_chunk_start_appends_past_every_chunk_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(next_logical_chunk_start(&[]).expect("empty"), 0);
+
+        // Deliberately out of order, and with a HOLE between the two chunks that
+        // must not be reused.
+        let chunks = vec![
+            logical_chunk(64 * MB, 16 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 0)]),
+            logical_chunk(0, 8 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 32 * MB)]),
+        ];
+        assert_eq!(
+            next_logical_chunk_start(&chunks).expect("start"),
+            80 * MB,
+            "the answer is past the HIGHEST chunk, not past the last one listed, \
+             and never inside the hole at 8-64 MiB"
+        );
+
+        // A ragged end is rounded UP to the stripe length: rounding down would
+        // overlap the chunk below it.
+        let ragged = vec![logical_chunk(0, 8 * MB + 1, BTRFS_BLOCK_GROUP_METADATA, &[(1, 0)])];
+        let start = next_logical_chunk_start(&ragged).expect("start");
+        assert!(start >= 8 * MB + 1, "must not overlap the chunk below");
+        assert_eq!(start % BTRFS_STRIPE_LEN, 0, "must be stripe aligned");
+        assert_eq!(start, 8 * MB + BTRFS_STRIPE_LEN);
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {

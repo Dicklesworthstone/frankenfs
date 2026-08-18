@@ -31,7 +31,10 @@ const BTRFS_STRIPE_SIZE: usize = 32;
 const BTRFS_SYS_CHUNK_MIN_ENTRY_SIZE: usize =
     BTRFS_DISK_KEY_SIZE + BTRFS_CHUNK_FIXED_SIZE + BTRFS_STRIPE_SIZE;
 /// Objectid for chunk tree items stored in sys_chunk_array.
-const BTRFS_FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
+/// Objectid every CHUNK_ITEM is keyed under, and the `chunk_objectid` every
+/// DEV_EXTENT points back at. Public because chunk ALLOCATION lives a crate up
+/// (bd-a136s) and must key its new items identically to the ones parsed here.
+pub const BTRFS_FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 /// Item type for chunk tree entries in sys_chunk_array.
 const BTRFS_CHUNK_ITEM_KEY: u8 = 228;
 
