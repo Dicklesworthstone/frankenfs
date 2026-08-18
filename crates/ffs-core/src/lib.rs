@@ -16117,6 +16117,47 @@ impl OpenFs {
             return Ok(Vec::new());
         }
 
+        // FITS-IN-I_BLOCK FAST PATH (bd-vpypn). When the whole file lives in the
+        // 60-byte i_block area, the continuation xattr contributes nothing to this
+        // read, so parsing the ibody and building the concatenation buffer is pure
+        // waste. ext4 puts a file inline precisely because it is tiny, so this is
+        // the COMMON case, not an edge case.
+        //
+        // Both things the general path below establishes still hold here, which is
+        // what makes the shortcut sound rather than merely faster:
+        //
+        //  * the corruption check cannot fire. It rejects `file_size >
+        //    inline_capacity`, and `inline_capacity` is `extent_bytes.len()` PLUS
+        //    the continuation value's length, so it is always at least
+        //    `extent_bytes.len()`. Guarding on `file_size <= extent_bytes.len()`
+        //    therefore implies `file_size <= inline_capacity` without needing to
+        //    know the continuation's length at all.
+        //  * the slice stays in range. `to_read` is clamped to `file_size -
+        //    offset`, so `end <= file_size <= extent_bytes.len()`.
+        //
+        // Byte-identical by construction: the general path's buffer begins with
+        // exactly these bytes, and this branch only runs when the read ends inside
+        // them.
+        let inline_head = &inode.extent_bytes;
+        if file_size <= inline_head.len() as u64 {
+            let start = usize::try_from(offset).map_err(|_| FfsError::Corruption {
+                block: 0,
+                detail: format!("ext4 inline data offset {offset} exceeds addressable range"),
+            })?;
+            let to_read = (file_size - offset).min(u64::from(size));
+            let to_read = usize::try_from(to_read).map_err(|_| FfsError::Corruption {
+                block: 0,
+                detail: format!("ext4 inline data read size {to_read} exceeds addressable range"),
+            })?;
+            let end = start
+                .checked_add(to_read)
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: "ext4 inline data read range overflow".to_owned(),
+                })?;
+            return Ok(inline_head[start..end].to_vec());
+        }
+
         // Assemble inline data: i_block (60 bytes) + xattr ibody payload.
         //
         // The ext4 inline data continuation is stored as the VALUE of a
@@ -41891,6 +41932,61 @@ mod tests {
         assert!(
             matches!(err, FfsError::Format(ref detail) if detail.contains("xattr_value")),
             "unexpected inline-data xattr error: {err:?}"
+        );
+    }
+
+    /// bd-vpypn: the fits-in-i_block fast path must agree with the assembling
+    /// path everywhere it applies, including the boundary.
+    ///
+    /// The shortcut skips the ibody xattr parse AND the capacity check, so the
+    /// thing worth testing is not that it is fast but that it is not observable:
+    /// every offset/size of a file that fits in i_block must return exactly what
+    /// the general path returns for the same inode with a continuation present.
+    #[test]
+    fn ext4_inline_data_i_block_fast_path_is_byte_identical_bd_vpypn() {
+        let head = b"0123456789abcdefghijklmnopqrstuv".to_vec();
+        let mut inode = make_test_inode(ffs_types::S_IFREG | 0o644, 0, 0);
+        inode.flags = ffs_types::EXT4_INLINE_DATA_FL;
+        inode.extent_bytes = head.clone().into();
+
+        // Every size that fits entirely in i_block, at every offset within it.
+        for file_size in [0_u64, 1, 5, head.len() as u64 - 1, head.len() as u64] {
+            inode.size = file_size;
+            for offset in 0..=file_size {
+                for size in [0_u32, 1, 4, 64] {
+                    let got = OpenFs::read_ext4_inline_data(&inode, offset, size)
+                        .expect("a file that fits in i_block must read");
+                    let want_len =
+                        usize::try_from((file_size - offset).min(u64::from(size))).unwrap();
+                    let start = usize::try_from(offset).unwrap();
+                    assert_eq!(
+                        got.as_slice(),
+                        &head[start..start + want_len],
+                        "size={file_size} offset={offset} read={size}"
+                    );
+                }
+            }
+        }
+
+        // Reading at or past EOF is empty, and must stay empty on the fast path.
+        inode.size = 4;
+        assert!(
+            OpenFs::read_ext4_inline_data(&inode, 4, 16).unwrap().is_empty(),
+            "a read starting at EOF returns nothing"
+        );
+        assert!(
+            OpenFs::read_ext4_inline_data(&inode, 99, 16).unwrap().is_empty(),
+            "a read starting past EOF returns nothing"
+        );
+
+        // ONE BYTE OVER and the fast path must NOT engage: the file no longer fits
+        // in i_block, so the continuation is required and its absence is the
+        // corruption the general path exists to catch.
+        inode.size = head.len() as u64 + 1;
+        let err = OpenFs::read_ext4_inline_data(&inode, 0, 8).unwrap_err();
+        assert!(
+            matches!(err, FfsError::Corruption { .. }),
+            "a file larger than i_block with no continuation must still be rejected, got {err:?}"
         );
     }
 
