@@ -20146,6 +20146,102 @@ mod tests {
         assert_ne!(regenerated, after_first, "a new generation must change the item");
     }
 
+    /// bd-a136s. ⚠️ THE TEST THAT WOULD HAVE CAUGHT THE ACCEPTANCE-GATE FAILURE.
+    ///
+    /// The chunk tree's own blocks MUST come from SYSTEM space. The kernel
+    /// bootstraps its chunk map from the superblock's `sys_chunk_array` alone,
+    /// before it can read any tree, and that array carries SYSTEM chunks only —
+    /// so a chunk root allocated out of a METADATA block group is unmappable at
+    /// exactly the moment the kernel must map it:
+    ///
+    ///     No mapping for 60375040-60391424
+    ///     ERROR: cannot read chunk root
+    ///
+    /// That is what a real run produced when the chunk tree was serialized with
+    /// `alloc_metadata_for_tree`. Twenty-four unit tests passed against that
+    /// version, because none of them asked WHICH BLOCK GROUP the address came
+    /// from. This one does.
+    #[test]
+    fn the_chunk_tree_is_allocated_from_system_space_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let system_start = 0x1_0000_u64;
+        let metadata_start = 0x100_0000_u64;
+
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+        alloc.add_block_group(
+            system_start,
+            BtrfsBlockGroupItem {
+                total_bytes: 8 * MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_SYSTEM,
+            },
+        );
+        alloc.add_block_group(
+            metadata_start,
+            BtrfsBlockGroupItem {
+                total_bytes: 32 * MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+
+        let system = alloc
+            .alloc_system_for_tree(16384, BTRFS_CHUNK_TREE_OBJECTID, 0)
+            .expect("system allocation");
+        assert!(
+            system.bytenr >= system_start && system.bytenr < system_start + 8 * MB,
+            "the chunk tree must land in the SYSTEM group, got {} (metadata starts at {metadata_start})",
+            system.bytenr
+        );
+        assert!(
+            system.bytenr < metadata_start,
+            "and emphatically NOT in the metadata group — that is the unmountable case"
+        );
+
+        // The metadata allocator must still prefer metadata space, or the fix
+        // would have merely swapped which tree is misplaced.
+        let metadata = alloc
+            .alloc_metadata_for_tree(16384, BTRFS_FS_TREE_OBJECTID, 0)
+            .expect("metadata allocation");
+        assert!(
+            metadata.bytenr >= metadata_start,
+            "ordinary tree blocks still come from METADATA space, got {}",
+            metadata.bytenr
+        );
+        assert_ne!(system.bytenr, metadata.bytenr);
+    }
+
+    /// bd-a136s. With no SYSTEM block group the chunk tree allocation must FAIL,
+    /// never fall back to metadata.
+    ///
+    /// A fallback is the tempting behaviour — it keeps the commit alive — and it
+    /// is precisely what produces a filesystem that passes every check we can run
+    /// and that the kernel cannot open. Refusing turns an unmountable image into
+    /// a failed commit, which is the trade this whole path is built on.
+    #[test]
+    fn the_chunk_tree_refuses_metadata_space_rather_than_falling_back_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+        // Metadata only: plenty of room, wrong KIND of room.
+        alloc.add_block_group(
+            0x100_0000,
+            BtrfsBlockGroupItem {
+                total_bytes: 512 * MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+        assert!(
+            alloc
+                .alloc_system_for_tree(16384, BTRFS_CHUNK_TREE_OBJECTID, 0)
+                .is_err(),
+            "512 MiB of METADATA space must not satisfy a SYSTEM allocation — a chunk \
+             root there is unmappable at bootstrap, so failing the commit is correct"
+        );
+    }
+
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
         BtrfsBlockGroupItem {
             total_bytes: size,
