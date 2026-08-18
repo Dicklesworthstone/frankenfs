@@ -1650,7 +1650,13 @@ pub struct OpenFs {
     ///
     /// Bounded by construction: ONE leaf, not a structure that grows with the
     /// filesystem — which is the property bd-5vis3 exists to preserve.
-    btrfs_floor_leaf_memo: Mutex<Option<BtrfsFloorLeafMemo>>,
+    btrfs_floor_leaf_memo: Mutex<[Option<BtrfsFloorLeafMemo>; BTRFS_FLOOR_MEMO_SLOTS]>,
+    /// Round-robin victim for [`BTRFS_FLOOR_MEMO_SLOTS`] (bd-yu6jz).
+    ///
+    /// Round-robin rather than LRU on purpose: LRU needs a timestamp write on every
+    /// HIT, which would put a store on the path this memo exists to keep cheap, and
+    /// with four slots covering a two-stream sweep the eviction order barely matters.
+    btrfs_floor_memo_next_slot: std::sync::atomic::AtomicUsize,
     /// Kill switch for the floor-leaf memo (bd-5vis3).
     ///
     /// A new cache on a metadata READ path deserves one: it makes the A/B
@@ -1953,6 +1959,62 @@ struct BtrfsFloorLeafMemo {
     first_key: ffs_ondisk::btrfs::BtrfsKey,
     last_key: ffs_ondisk::btrfs::BtrfsKey,
     leaf: Arc<BtrfsParsedNode>,
+}
+
+/// Retained floor leaves (bd-yu6jz). One slot was the original shape and it has a
+/// measured cost: a sweep re-descends at EVERY leaf boundary, and two interleaved key
+/// streams over the same inode — `getattr` reading INODE_ITEM and the capability probe
+/// reading XATTR_ITEM — evict each other whenever they straddle a boundary. A
+/// 20,048-entry readdir+stat sweep still cost 2.0x re-read after the probe was routed
+/// through this memo, and a full descent is root PLUS leaf, so each avoidable boundary
+/// miss is two device reads rather than one.
+///
+/// Four is chosen to cover the alternation, not to be a cache: the sweep's working set
+/// at any instant is the leaf under the cursor plus its neighbour, doubled by the two
+/// key streams. Larger would start to duplicate `btrfs_parsed_node_cache`, which already
+/// bounds parsed nodes at `BTRFS_TREE_NODE_CACHE_LIMIT`, and would widen the window in
+/// which a retained leaf is stale-but-unused memory on a mount that never sweeps.
+const BTRFS_FLOOR_MEMO_SLOTS: usize = 4;
+
+/// Does this retained leaf answer `target` on `root_logical`?
+///
+/// Split out as a free function so the span rule — the whole correctness argument for
+/// serving a descent from memory — is unit-testable without a mount, a device or an
+/// `OpenFs`. Serving a target inside `[first_key, last_key]` is equivalent to
+/// re-descending; outside it, it is NOT, because a floor descent returns the greatest
+/// key `<= target` and a leaf that does not span the target cannot prove what the
+/// neighbouring leaf holds.
+fn btrfs_floor_memo_slot_answers(
+    memo: &BtrfsFloorLeafMemo,
+    root_logical: u64,
+    target: &ffs_ondisk::btrfs::BtrfsKey,
+) -> bool {
+    btrfs_floor_memo_span_answers(
+        memo.root_logical,
+        &memo.first_key,
+        &memo.last_key,
+        root_logical,
+        target,
+    )
+}
+
+/// Scalar half of [`btrfs_floor_memo_slot_answers`], taking the span rather than the
+/// retained leaf.
+///
+/// Split this far because the leaf is an `Arc<BtrfsParsedNode>`, which a unit test
+/// cannot conjure without real node bytes — so a predicate taking the whole memo is
+/// effectively untestable, and this rule is the entire correctness argument for
+/// answering a descent from memory. Here it is checkable with three keys and no I/O.
+fn btrfs_floor_memo_span_answers(
+    memo_root_logical: u64,
+    first_key: &ffs_ondisk::btrfs::BtrfsKey,
+    last_key: &ffs_ondisk::btrfs::BtrfsKey,
+    root_logical: u64,
+    target: &ffs_ondisk::btrfs::BtrfsKey,
+) -> bool {
+    memo_root_logical == root_logical
+        && ffs_btrfs::key_cmp(first_key, target) != std::cmp::Ordering::Greater
+        && ffs_btrfs::key_cmp(target, last_key) != std::cmp::Ordering::Greater
 }
 
 const BTRFS_TREE_NODE_CACHE_LIMIT: usize = 512;
@@ -4924,7 +4986,8 @@ impl OpenFs {
             btrfs_fs_tree_root_fast: AtomicU64::new(0),
             btrfs_verified_dir_inode: AtomicU64::new(0),
             btrfs_parsed_node_cache: ShardedCache::new(),
-            btrfs_floor_leaf_memo: Mutex::new(None),
+            btrfs_floor_leaf_memo: Mutex::new([const { None }; BTRFS_FLOOR_MEMO_SLOTS]),
+            btrfs_floor_memo_next_slot: std::sync::atomic::AtomicUsize::new(0),
             btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(
                 btrfs_floor_memo_disabled_from_env(),
             ),
@@ -9018,7 +9081,7 @@ impl OpenFs {
         // measure per-op descent structure against cold reads, so the memo must
         // go with it — otherwise the next read-count test written against this
         // helper silently measures a warm path and reports too few reads.
-        *self.btrfs_floor_leaf_memo.lock() = None;
+        *self.btrfs_floor_leaf_memo.lock() = [const { None }; BTRFS_FLOOR_MEMO_SLOTS];
         // The miss streak is memo state too (bd-79li3): leaving it high across a
         // reset would start the next measurement already suppressed.
         self.btrfs_floor_memo_consecutive_misses
@@ -9138,15 +9201,10 @@ impl OpenFs {
             // which is the opposite of the intent (bd-5vis3).
             let hit = {
                 let memo = self.btrfs_floor_leaf_memo.lock();
-                memo.as_ref()
-                    .filter(|memo| {
-                        memo.root_logical == root_logical
-                            && ffs_btrfs::key_cmp(&memo.first_key, &target)
-                                != std::cmp::Ordering::Greater
-                            && ffs_btrfs::key_cmp(&target, &memo.last_key)
-                                != std::cmp::Ordering::Greater
-                    })
-                    .map(|memo| Arc::clone(&memo.leaf))
+                memo.iter()
+                    .flatten()
+                    .find(|slot| btrfs_floor_memo_slot_answers(slot, root_logical, &target))
+                    .map(|slot| Arc::clone(&slot.leaf))
             };
             if let Some(leaf) = hit {
                 self.btrfs_floor_memo_consecutive_misses
@@ -9173,12 +9231,35 @@ impl OpenFs {
             && let BtrfsParsedNode::Leaf { items, .. } = node.as_ref()
             && let (Some(first), Some(last)) = (items.first(), items.last())
         {
-            *self.btrfs_floor_leaf_memo.lock() = Some(BtrfsFloorLeafMemo {
+            let fresh = BtrfsFloorLeafMemo {
                 root_logical,
                 first_key: first.key,
                 last_key: last.key,
                 leaf: Arc::clone(&node),
-            });
+            };
+            let mut slots = self.btrfs_floor_leaf_memo.lock();
+            // Prefer an EMPTY slot, and otherwise overwrite the slot that already
+            // spans this leaf, before evicting anything live. Without the second
+            // clause a sweep that re-descends the same leaf would consume a fresh
+            // slot each time and evict its own neighbours — turning four slots back
+            // into one on exactly the workload they exist for.
+            let victim = slots
+                .iter()
+                .position(Option::is_none)
+                .or_else(|| {
+                    slots.iter().position(|slot| {
+                        slot.as_ref().is_some_and(|slot| {
+                            slot.root_logical == fresh.root_logical
+                                && slot.first_key == fresh.first_key
+                        })
+                    })
+                })
+                .unwrap_or_else(|| {
+                    self.btrfs_floor_memo_next_slot
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        % BTRFS_FLOOR_MEMO_SLOTS
+                });
+            slots[victim] = Some(fresh);
         }
         Ok(entry)
     }
@@ -30475,6 +30556,30 @@ impl OpenFs {
         sb_bytes[0x50..0x58].copy_from_slice(&root_tree_bytenr.to_le_bytes());
         sb_bytes[0xC6] = root_tree_level;
 
+        // bd-mogn1: RETIRE THE TREE LOG. A full transaction commit supersedes any
+        // tree log — the trees this commit just wrote already contain everything the
+        // log recorded, because `walk_btrfs_fs_tree` applies the replayed log overlay
+        // and `enable_writes` builds the in-memory trees from exactly that walk.
+        //
+        // Leaving `log_root` set is therefore not merely untidy, it is a silent DATA
+        // ROLLBACK: the next mount sees `sb.log_root != 0`, replays the now-STALE log
+        // (`lib.rs` ~4705), and the overlay applies those older items ON TOP of the
+        // newer committed ones, because it is keyed and unconditional. A value fsync'd
+        // early, superseded by a later write, and then committed would revert to the
+        // logged version on the next mount.
+        //
+        // This is what made the tree-log path "ephemeral" and is the second of the two
+        // defects standing between it and being the default fsync strategy (the first
+        // was the missing barrier, bd-sv7ql). Kernel btrfs retires its log on
+        // transaction commit for exactly this reason.
+        //
+        // Offsets are the parser's own (`ffs-ondisk/src/btrfs.rs`): `log_root` u64 at
+        // 0x60, `log_root_level` u8 at 0xC8. Cleared unconditionally — a commit
+        // supersedes the log whether or not this mount is the one that wrote it, and a
+        // log inherited from a previous mount is exactly the stale case that hurts.
+        sb_bytes[0x60..0x68].copy_from_slice(&0_u64.to_le_bytes());
+        sb_bytes[0xC8] = 0;
+
         // bd-4cxkd: superblock bytes_used = the total extent-item bytes
         // recomputed above. On the REAL on-disk btrfs_super_block this field is
         // at 0x78 (after total_bytes@0x70), NOT the 0x18 the in-struct model uses
@@ -35218,7 +35323,7 @@ impl OpenFs {
         self.btrfs_floor_memo_consecutive_misses
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if disabled {
-            *self.btrfs_floor_leaf_memo.lock() = None;
+            *self.btrfs_floor_leaf_memo.lock() = [const { None }; BTRFS_FLOOR_MEMO_SLOTS];
         }
     }
 
@@ -56681,6 +56786,48 @@ mod tests {
         assert!(
             !std::env::var("FFS_BTRFS_FLOOR_MEMO_DEFINITELY_UNSET_KEY").is_ok_and(|_| true),
             "sanity: an unset variable must not read as set"
+        );
+    }
+
+    /// bd-yu6jz: the floor-memo span rule is the correctness argument for answering a
+    /// descent from memory, so it is checked directly rather than through a mount.
+    ///
+    /// A floor descent returns the greatest key `<= target`. A retained leaf may
+    /// therefore answer ONLY for targets inside its own span: outside it, the leaf
+    /// cannot prove what the neighbouring leaf holds, and serving from it would return
+    /// a key that is not the true floor.
+    #[test]
+    fn btrfs_floor_memo_span_rule_bd_yu6jz() {
+        let key = |objectid: u64, item_type: u8, offset: u64| ffs_ondisk::btrfs::BtrfsKey {
+            objectid,
+            item_type,
+            offset,
+        };
+        let first = key(100, 1, 0);
+        let last = key(200, 1, 0);
+        let root = 4096_u64;
+
+        // Inside the span, including both inclusive endpoints.
+        for target in [key(100, 1, 0), key(150, 1, 0), key(200, 1, 0)] {
+            assert!(
+                btrfs_floor_memo_span_answers(root, &first, &last, root, &target),
+                "target {target:?} is inside [{first:?}, {last:?}] and must be answerable"
+            );
+        }
+
+        // Outside on either side: the leaf cannot prove the neighbour's contents.
+        for target in [key(99, 1, 0), key(201, 1, 0)] {
+            assert!(
+                !btrfs_floor_memo_span_answers(root, &first, &last, root, &target),
+                "target {target:?} is outside the span and MUST force a real descent"
+            );
+        }
+
+        // A different tree root must never be served from this leaf, however well the
+        // key happens to fall inside the span — the spans of two trees are unrelated.
+        assert!(
+            !btrfs_floor_memo_span_answers(root, &first, &last, root + 16384, &key(150, 1, 0)),
+            "a slot from another tree root must not answer"
         );
     }
 
