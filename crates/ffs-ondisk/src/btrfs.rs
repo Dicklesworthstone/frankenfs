@@ -3034,7 +3034,7 @@ mod tests {
         // on-disk value from the array length, so only this in-memory field can
         // go stale — which is what makes it easy to miss.
         assert_eq!(
-            sb.sys_chunk_array_size as usize,
+            usize::try_from(sb.sys_chunk_array_size).expect("array size fits usize"),
             sb.sys_chunk_array.len(),
             "sys_chunk_array_size must track the array it describes"
         );

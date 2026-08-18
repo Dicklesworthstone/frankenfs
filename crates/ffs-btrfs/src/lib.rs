@@ -7218,7 +7218,7 @@ pub fn apply_chunk_allocation(
     // Serialized into the buffer it was READ from, so the item keeps its exact
     // size: a same-size in-place update cannot overflow the leaf it sits in, and
     // this runs during a commit that has already sized its trees.
-    let mut dev_item_value = dev_item_bytes.clone();
+    let mut dev_item_value = dev_item_bytes;
     dev_item
         .write_to_bytes(&mut dev_item_value)
         .map_err(|_| BtrfsMutationError::InvalidConfig("DEV_ITEM does not serialize"))?;
