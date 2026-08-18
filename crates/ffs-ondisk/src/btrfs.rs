@@ -1605,6 +1605,162 @@ impl BtrfsChunkEntry {
     }
 }
 
+// ── Device space accounting for chunk allocation (bd-a136s) ────────────────
+
+/// The physical ranges of one device that existing chunks already occupy,
+/// sorted and coalesced.
+///
+/// Allocating a new chunk means choosing a physical offset on a device that no
+/// existing chunk covers. Getting that wrong does not fail loudly — it writes a
+/// new chunk on top of a live one — so the derivation refuses every layout it
+/// does not model exactly rather than approximating one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeviceOccupancy {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl DeviceOccupancy {
+    /// Derive the occupied physical ranges of device `devid` from the chunk map.
+    ///
+    /// # Errors
+    /// Returns [`ParseError::InvalidField`] for any chunk whose profile this does
+    /// not model — every STRIPED profile (RAID0/10/5/6), where a stripe covers a
+    /// FRACTION of the chunk length that depends on the profile and the stripe
+    /// count. Assuming the mirror rule for those would understate each stripe's
+    /// physical footprint and hand out space that is in use, so they are refused
+    /// until they are modelled. Mirror profiles (Single, DUP, RAID1, RAID1C3,
+    /// RAID1C4) all place a full `length` at every stripe, which is the case a
+    /// single-device filesystem needs.
+    pub fn from_chunks(devid: u64, chunks: &[BtrfsChunkEntry]) -> Result<Self, ParseError> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for chunk in chunks {
+            let profile = BtrfsRaidProfile::from_chunk_type(chunk.chunk_type);
+            match profile {
+                BtrfsRaidProfile::Single
+                | BtrfsRaidProfile::Dup
+                | BtrfsRaidProfile::Raid1
+                | BtrfsRaidProfile::Raid1C3
+                | BtrfsRaidProfile::Raid1C4 => {}
+                BtrfsRaidProfile::Raid0
+                | BtrfsRaidProfile::Raid10
+                | BtrfsRaidProfile::Raid5
+                | BtrfsRaidProfile::Raid6 => {
+                    return Err(ParseError::InvalidField {
+                        field: "chunk_type",
+                        reason: "striped profile: per-stripe physical length not modelled",
+                    });
+                }
+            }
+            for stripe in &chunk.stripes {
+                if stripe.devid != devid {
+                    continue;
+                }
+                // Validated, not stored: a stripe whose physical range overflows
+                // the address space cannot be reasoned about, and treating it as
+                // absent would make its bytes look free.
+                stripe
+                    .offset
+                    .checked_add(chunk.length)
+                    .ok_or(ParseError::InvalidField {
+                        field: "stripe_offset",
+                        reason: "physical range overflow",
+                    })?;
+                ranges.push((stripe.offset, chunk.length));
+            }
+        }
+        ranges.sort_unstable();
+        Ok(Self {
+            ranges: coalesce_device_ranges(ranges),
+        })
+    }
+
+    /// The occupied ranges, sorted by start and non-overlapping.
+    #[must_use]
+    pub fn ranges(&self) -> &[(u64, u64)] {
+        &self.ranges
+    }
+
+    /// Total occupied bytes on the device.
+    #[must_use]
+    pub fn occupied_bytes(&self) -> u64 {
+        self.ranges
+            .iter()
+            .fold(0_u64, |total, (_, len)| total.saturating_add(*len))
+    }
+
+    /// Lowest physical offset at or above `min_offset` where `length` contiguous
+    /// bytes fit below `dev_total_bytes`, or `None` when the device has no such
+    /// gap.
+    ///
+    /// `min_offset` fences off the device's reserved head — the superblock copies
+    /// and the bootstrap region — which no chunk may overlap. `None` is the
+    /// honest answer for "this device is full", and is what must turn into the
+    /// caller's decision to fail rather than into a smaller chunk: a chunk
+    /// shorter than asked for is a different allocation, not a fallback.
+    #[must_use]
+    pub fn find_free(&self, length: u64, min_offset: u64, dev_total_bytes: u64) -> Option<u64> {
+        if length == 0 {
+            return None;
+        }
+        let mut cursor = min_offset;
+        for &(start, len) in &self.ranges {
+            let end = start.checked_add(len)?;
+            if end <= cursor {
+                continue;
+            }
+            if start >= cursor {
+                let gap = start.checked_sub(cursor)?;
+                // The device bound is checked here too, not only on the tail: a
+                // chunk that already runs past `dev_total_bytes` (a corrupt or
+                // shrunk device) must not make the gap below it look usable.
+                if gap >= length && cursor.checked_add(length)? <= dev_total_bytes {
+                    return Some(cursor);
+                }
+            }
+            cursor = cursor.max(end);
+        }
+        // The tail past the last occupied range.
+        let tail_end = cursor.checked_add(length)?;
+        if tail_end <= dev_total_bytes {
+            Some(cursor)
+        } else {
+            None
+        }
+    }
+}
+
+/// Merge sorted, possibly overlapping physical ranges into disjoint ones.
+///
+/// Mirror profiles put two stripes of the SAME chunk on one device (DUP), and
+/// nothing forbids two chunks from abutting, so the input can touch or overlap.
+/// `find_free` walks the list assuming it is disjoint and ascending, which is
+/// why this runs first.
+fn coalesce_device_ranges(sorted: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, len) in sorted {
+        if len == 0 {
+            continue;
+        }
+        let Some(end) = start.checked_add(len) else {
+            // A range that overflows the address space cannot be represented;
+            // keeping it out of the map would make its bytes look free, so clamp
+            // it to the end of the space instead.
+            merged.push((start, u64::MAX - start));
+            continue;
+        };
+        match merged.last_mut() {
+            Some((prev_start, prev_len)) if start <= prev_start.saturating_add(*prev_len) => {
+                let prev_end = prev_start.saturating_add(*prev_len);
+                if end > prev_end {
+                    *prev_len = end - *prev_start;
+                }
+            }
+            _ => merged.push((start, len)),
+        }
+    }
+    merged
+}
+
 // ── Tree node types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2413,6 +2569,173 @@ mod tests {
         exactly_full
             .write_to_bytes(&mut buf)
             .expect("a fully allocated device is valid");
+    }
+
+    fn chunk_at(logical: u64, length: u64, chunk_type: u64, stripes: &[(u64, u64)]) -> BtrfsChunkEntry {
+        BtrfsChunkEntry {
+            key: BtrfsKey {
+                objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+                item_type: BTRFS_CHUNK_ITEM_KEY,
+                offset: logical,
+            },
+            length,
+            owner: 2,
+            stripe_len: 65536,
+            chunk_type,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            num_stripes: u16::try_from(stripes.len()).expect("stripe count fits"),
+            sub_stripes: 0,
+            stripes: stripes
+                .iter()
+                .map(|&(devid, offset)| BtrfsStripe {
+                    devid,
+                    offset,
+                    dev_uuid: [0; 16],
+                })
+                .collect(),
+        }
+    }
+
+    /// bd-a136s. A chunk allocation picks a physical offset on a device, and
+    /// picking one that an existing chunk already covers does not fail loudly —
+    /// it writes a new chunk on top of a live one. So the gap finder is asserted
+    /// against overlap directly, not just for plausible answers.
+    #[test]
+    fn device_occupancy_finds_a_gap_that_overlaps_nothing_bd_a136s() {
+        use chunk_type_flags::{BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA};
+        const MB: u64 = 1024 * 1024;
+
+        // Two chunks on device 1 with a 4 MiB hole between them, and one chunk on
+        // a different device that must be ignored entirely.
+        let chunks = vec![
+            chunk_at(0, 8 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, MB)]),
+            chunk_at(8 * MB, 8 * MB, BTRFS_BLOCK_GROUP_DATA, &[(1, 13 * MB)]),
+            chunk_at(16 * MB, 8 * MB, BTRFS_BLOCK_GROUP_DATA, &[(2, MB)]),
+        ];
+        let occ = DeviceOccupancy::from_chunks(1, &chunks).expect("derive");
+        assert_eq!(
+            occ.ranges(),
+            &[(MB, 8 * MB), (13 * MB, 8 * MB)][..],
+            "device 2's chunk must not appear in device 1's occupancy"
+        );
+        assert_eq!(occ.occupied_bytes(), 16 * MB);
+
+        // A 4 MiB request fits exactly in the hole at 9 MiB.
+        assert_eq!(occ.find_free(4 * MB, 0, 64 * MB), Some(9 * MB));
+        // A 5 MiB request does not fit the hole and must go past the tail.
+        assert_eq!(occ.find_free(5 * MB, 0, 64 * MB), Some(21 * MB));
+
+        // Whatever it returns must overlap nothing — asserted mechanically,
+        // because "looks right" is how an off-by-one gets committed here.
+        for length in [MB, 3 * MB, 4 * MB, 5 * MB, 16 * MB] {
+            let Some(offset) = occ.find_free(length, 0, 64 * MB) else {
+                continue;
+            };
+            let end = offset + length;
+            for &(start, len) in occ.ranges() {
+                assert!(
+                    end <= start || offset >= start + len,
+                    "allocation [{offset}, {end}) overlaps live chunk [{start}, {})",
+                    start + len
+                );
+            }
+            assert!(end <= 64 * MB, "allocation must stay on the device");
+        }
+    }
+
+    /// bd-a136s. `min_offset` fences off the device's reserved head — superblock
+    /// copies and the bootstrap region — and the device bound fences off the
+    /// tail. Both are the difference between a valid filesystem and one the
+    /// kernel refuses to mount.
+    #[test]
+    fn device_occupancy_respects_the_reserved_head_and_the_device_end_bd_a136s() {
+        use chunk_type_flags::BTRFS_BLOCK_GROUP_METADATA;
+        const MB: u64 = 1024 * 1024;
+
+        let empty = DeviceOccupancy::from_chunks(1, &[]).expect("derive");
+        assert!(empty.ranges().is_empty());
+        assert_eq!(empty.occupied_bytes(), 0);
+        // An empty device still may not allocate below the reserved head.
+        assert_eq!(empty.find_free(8 * MB, MB, 64 * MB), Some(MB));
+        // Exactly filling the device is legal; one byte more is not.
+        assert_eq!(empty.find_free(63 * MB, MB, 64 * MB), Some(MB));
+        assert_eq!(empty.find_free(63 * MB + 1, MB, 64 * MB), None);
+        // A zero-length chunk backs nothing and is never an answer.
+        assert_eq!(empty.find_free(0, MB, 64 * MB), None);
+
+        // A device with no room left reports None rather than a smaller offset:
+        // a chunk shorter than asked for is a different allocation, not a
+        // fallback, and silently shrinking it would corrupt the caller's sizing.
+        let full = DeviceOccupancy::from_chunks(
+            1,
+            &[chunk_at(0, 63 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, MB)])],
+        )
+        .expect("derive");
+        assert_eq!(full.find_free(MB, MB, 64 * MB), None);
+    }
+
+    /// bd-a136s. DUP puts two stripes of the SAME chunk on ONE device, so a
+    /// device's occupancy list can contain touching or overlapping ranges before
+    /// it is coalesced — and `find_free` walks it assuming disjoint ascending
+    /// ranges. This is the case that makes the coalescing load-bearing rather
+    /// than tidy.
+    #[test]
+    fn device_occupancy_coalesces_dup_and_abutting_chunks_bd_a136s() {
+        use chunk_type_flags::{BTRFS_BLOCK_GROUP_DUP, BTRFS_BLOCK_GROUP_METADATA};
+        const MB: u64 = 1024 * 1024;
+
+        // DUP: one chunk, two stripes on device 1, and they abut.
+        let dup = chunk_at(
+            0,
+            8 * MB,
+            BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_DUP,
+            &[(1, MB), (1, 9 * MB)],
+        );
+        // A second chunk starting exactly where the DUP copies end.
+        let abutting = chunk_at(8 * MB, 4 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 17 * MB)]);
+
+        let occ = DeviceOccupancy::from_chunks(1, &[dup, abutting]).expect("derive");
+        assert_eq!(
+            occ.ranges(),
+            &[(MB, 20 * MB)][..],
+            "two abutting DUP stripes plus an abutting chunk are one contiguous run"
+        );
+        assert_eq!(occ.find_free(4 * MB, 0, 64 * MB), Some(21 * MB));
+    }
+
+    /// bd-a136s. A striped profile puts a FRACTION of the chunk length on each
+    /// device, and the fraction depends on the profile and the stripe count.
+    /// Applying the mirror rule to one would understate its physical footprint
+    /// and hand out space that is in use — a silent overwrite of live data — so
+    /// the unmodelled profiles are refused, not approximated.
+    #[test]
+    fn device_occupancy_refuses_striped_profiles_it_does_not_model_bd_a136s() {
+        use chunk_type_flags::{
+            BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID10,
+            BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6,
+        };
+        const MB: u64 = 1024 * 1024;
+
+        for profile in [
+            BTRFS_BLOCK_GROUP_RAID0,
+            BTRFS_BLOCK_GROUP_RAID10,
+            BTRFS_BLOCK_GROUP_RAID5,
+            BTRFS_BLOCK_GROUP_RAID6,
+        ] {
+            let chunk = chunk_at(
+                0,
+                8 * MB,
+                BTRFS_BLOCK_GROUP_DATA | profile,
+                &[(1, MB), (2, MB)],
+            );
+            assert!(
+                DeviceOccupancy::from_chunks(1, &[chunk]).is_err(),
+                "striped profile {profile:#x} must be refused until its per-stripe \
+                 length is modelled — approximating it hands out live space"
+            );
+        }
     }
 
     fn representative_sys_chunk_superblock() -> [u8; BTRFS_SUPER_INFO_SIZE] {
