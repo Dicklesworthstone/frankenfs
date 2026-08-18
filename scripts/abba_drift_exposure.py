@@ -189,6 +189,47 @@ def main() -> int:
         print(f"  of those, NOT matched         : {len(adm_unequal)}")
         print(f"  of those, inflation suspected : {len(adm_suspected)}")
     print("  -> reported, never gating: no row is refused and no ratio corrected here.")
+
+    # THE PARTITION. arm_duration_ratio is built from the same two medians as
+    # fuse_over_kernel, so "unmatched arms" and "a large ratio" are very nearly the
+    # same statement. Printing the partition makes that explicit instead of letting
+    # the headline percentage be misread as sloppy scheduling: the instrument
+    # protects exactly the rows that have no effect to report.
+    usable = [
+        r
+        for r in rows
+        if isinstance(r["ratio"], (int, float))
+        and r["ratio"] > 0
+        and math.isfinite(r["arm_duration_ratio"])
+    ]
+    if usable:
+        effect = lambda r: abs(math.log(r["ratio"]))  # noqa: E731 - direction-free
+        matched = [r for r in usable if r["exact_cancellation"]]
+        unmatched = [r for r in usable if not r["exact_cancellation"]]
+        big = [r for r in usable if effect(r) > math.log(MAXIMUM_ABBA_DURATION_RATIO)]
+        print()
+        print("PARTITION (why the headline percentage is structural, not sloppiness):")
+        if matched:
+            print(
+                f"  matched arms   : {len(matched):>3} rows, largest effect "
+                f"{math.exp(max(effect(r) for r in matched)):.4f}x"
+            )
+        if unmatched:
+            print(
+                f"  unmatched arms : {len(unmatched):>3} rows, smallest effect "
+                f"{math.exp(min(effect(r) for r in unmatched)):.4f}x"
+            )
+        print(
+            f"  effects beyond {MAXIMUM_ABBA_DURATION_RATIO:.2f}x: {len(big)} rows, of which "
+            f"{sum(1 for r in big if r['exact_cancellation'])} are duration-matched"
+        )
+        print(
+            "  -> a row is duration-matched almost exactly when it has no effect to\n"
+            "     report. ABBA's precondition holds only where there is nothing to\n"
+            "     protect; every large-effect row is exposed BY CONSTRUCTION, and no\n"
+            "     amount of scheduling care changes that. Only decoupling arm duration\n"
+            "     from effect size does (per-arm rep counts)."
+        )
     return 0
 
 
