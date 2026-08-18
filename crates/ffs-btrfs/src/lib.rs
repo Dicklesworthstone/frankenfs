@@ -6452,6 +6452,153 @@ struct PinnedExtent {
 /// Default btrfs node size (16 KiB), used until the real superblock value is set.
 const BTRFS_DEFAULT_NODESIZE: u64 = 16384;
 
+// ── Chunk sizing policy (bd-a136s) ─────────────────────────────────────────
+
+/// Granularity every chunk length and physical offset is rounded to.
+///
+/// This is btrfs's `BTRFS_STRIPE_LEN`. ⚠️ PROVENANCE: 64 KiB is taken from
+/// knowledge of `fs/btrfs/volumes.h`, NOT verified against source on this box —
+/// the UAPI headers available here (`/usr/include/linux/btrfs_tree.h`) carry the
+/// key types and struct layouts but not the sizing constants. The key constants
+/// and on-disk layouts this code depends on WERE verified there; these size
+/// numbers were not. Check against `volumes.h` before quoting compatibility.
+///
+/// Being wrong here is not corruption on its own: any multiple of the sector
+/// size is a structurally valid chunk length. It affects how well our chunks sit
+/// beside the kernel's.
+pub const BTRFS_STRIPE_LEN: u64 = 64 * 1024;
+
+/// What a chunk is being allocated to hold. The kind sets the target size,
+/// because metadata and data grow at very different rates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkKind {
+    /// Filesystem metadata (trees).
+    Metadata,
+    /// File contents.
+    Data,
+    /// The system chunk carrying the chunk tree's own bootstrap. Distinct
+    /// because it is the ONLY kind whose entry must also be written into the
+    /// superblock's `sys_chunk_array` — the kernel bootstraps from that array
+    /// alone, before any tree is readable.
+    System,
+}
+
+/// Sizing inputs and limits for one chunk allocation.
+///
+/// Separated from the decision so the policy numbers are visible and testable
+/// rather than buried in an expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkSizePolicy {
+    /// Below this device size, metadata chunks use the smaller target: a 512 MB
+    /// image with a 1 GiB metadata chunk target would allocate nothing at all.
+    pub small_device_threshold: u64,
+    /// Metadata chunk target on a device at or below `small_device_threshold`.
+    pub metadata_small: u64,
+    /// Metadata chunk target on a larger device.
+    pub metadata_large: u64,
+    /// Data chunk target.
+    pub data: u64,
+    /// System chunk target.
+    pub system: u64,
+    /// No chunk may exceed this fraction of the device, expressed as a
+    /// percentage. A single chunk swallowing the device would leave nothing for
+    /// the other kinds, and a filesystem with metadata space and no data space
+    /// is as stuck as one with neither.
+    pub max_device_percent: u64,
+    /// Smallest chunk worth allocating. A chunk below this is refused rather
+    /// than created: allocating a sliver postpones the ENOSPC by one commit and
+    /// leaves a permanent fragment behind.
+    pub min_chunk: u64,
+}
+
+impl Default for ChunkSizePolicy {
+    /// ⚠️ PROVENANCE, and it matters more than the numbers: these mirror kernel
+    /// btrfs's `decide_stripe_size` as I know it — 256 MiB metadata below a
+    /// 50 GiB device and 1 GiB above, 1 GiB data, 32 MiB system, everything
+    /// capped at 10% of the device — but `fs/btrfs/volumes.c` is NOT available
+    /// on this box, so none of it is verified against source here. They are a
+    /// starting policy, not a compatibility claim.
+    ///
+    /// Nothing about interoperability depends on matching them: the kernel reads
+    /// whatever chunk sizes it finds. They decide how our filesystem AGES, so
+    /// they should be revisited with a measurement, not copied on faith.
+    fn default() -> Self {
+        Self {
+            small_device_threshold: 50 * 1024 * 1024 * 1024,
+            metadata_small: 256 * 1024 * 1024,
+            metadata_large: 1024 * 1024 * 1024,
+            data: 1024 * 1024 * 1024,
+            system: 32 * 1024 * 1024,
+            max_device_percent: 10,
+            min_chunk: 8 * 1024 * 1024,
+        }
+    }
+}
+
+impl ChunkSizePolicy {
+    /// The uncapped target size for `kind` on a device of `device_total_bytes`.
+    #[must_use]
+    pub fn target(&self, kind: ChunkKind, device_total_bytes: u64) -> u64 {
+        match kind {
+            ChunkKind::Metadata => {
+                if device_total_bytes > self.small_device_threshold {
+                    self.metadata_large
+                } else {
+                    self.metadata_small
+                }
+            }
+            ChunkKind::Data => self.data,
+            ChunkKind::System => self.system,
+        }
+    }
+
+    /// Decide the length of a chunk to allocate, or `None` when no chunk worth
+    /// allocating fits.
+    ///
+    /// `free_contiguous_bytes` comes from
+    /// `ffs_ondisk::btrfs::DeviceOccupancy::largest_free_run`. The answer is
+    /// CLAMPED to it rather than merely checked against it, which is what keeps
+    /// the result from overlapping a live chunk.
+    ///
+    /// The result is always rounded DOWN to [`BTRFS_STRIPE_LEN`]. Rounding up
+    /// would be the natural way to write this and would be a bug: it can push
+    /// the length past the free run the caller measured.
+    ///
+    /// `None` is returned rather than a sliver when the fit is below
+    /// `min_chunk`. A sliver postpones ENOSPC by one commit, leaves a permanent
+    /// fragment, and hides the fact that the device is full.
+    #[must_use]
+    pub fn decide(
+        &self,
+        kind: ChunkKind,
+        device_total_bytes: u64,
+        free_contiguous_bytes: u64,
+    ) -> Option<u64> {
+        let target = self.target(kind, device_total_bytes);
+        // Percentage of the device, computed so it cannot overflow on a large
+        // device: dividing before multiplying costs at most `max_device_percent`
+        // bytes of precision, which is nothing at chunk scale.
+        //
+        // ⚠️ THE CAP IS FLOORED AT `min_chunk`, and that is not a rounding
+        // convenience. Its purpose is to stop ONE chunk swallowing the device,
+        // never to forbid growth a device can afford: on anything under
+        // `min_chunk * 100 / max_device_percent` (800 MiB at the defaults) a raw
+        // 10% cap lands below `min_chunk` and refuses every allocation, which
+        // reinstates the exact ENOSPC this bead exists to remove — and does it
+        // on the small images the fixtures use, so it would look like the fix
+        // simply not working.
+        let device_cap = (device_total_bytes / 100)
+            .saturating_mul(self.max_device_percent)
+            .max(self.min_chunk);
+        let capped = target.min(device_cap).min(free_contiguous_bytes);
+        let aligned = capped - (capped % BTRFS_STRIPE_LEN);
+        if aligned < self.min_chunk || aligned == 0 {
+            return None;
+        }
+        Some(aligned)
+    }
+}
+
 /// Why an allocation found no room, in the terms that separate bd-uxh7t's two
 /// candidate mechanisms. Produced by `BtrfsExtentAllocator::describe_no_space`
 /// at the moment `NoSpace` is returned; carries no policy.
@@ -17655,6 +17802,134 @@ mod tests {
              which is a different failure from every matching group being full"
         );
         assert!(!report.is_pin_bound());
+    }
+
+    /// bd-a136s. The sizing decision is where a chunk allocation turns a policy
+    /// into a permanent on-disk layout, so its boundaries are pinned rather than
+    /// spot-checked.
+    #[test]
+    fn chunk_sizing_clamps_to_the_device_and_the_free_run_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * MB;
+        let policy = ChunkSizePolicy::default();
+
+        // Device size picks the metadata target, and the threshold is exclusive:
+        // a device exactly at it still gets the small target.
+        assert_eq!(policy.target(ChunkKind::Metadata, 8 * GB), 256 * MB);
+        assert_eq!(policy.target(ChunkKind::Metadata, 50 * GB), 256 * MB);
+        assert_eq!(policy.target(ChunkKind::Metadata, 50 * GB + 1), GB);
+        assert_eq!(policy.target(ChunkKind::Data, 8 * GB), GB);
+        assert_eq!(policy.target(ChunkKind::System, 8 * GB), 32 * MB);
+
+        // On a large device with room, the target survives both clamps.
+        assert_eq!(
+            policy.decide(ChunkKind::Metadata, 100 * GB, 50 * GB),
+            Some(GB)
+        );
+
+        // The 10% device cap binds before the target does: on a 512 MB image the
+        // 256 MB metadata target is cut to 51 MB and change, rounded down to the
+        // stripe length.
+        let decided = policy
+            .decide(ChunkKind::Metadata, 512 * MB, 512 * MB)
+            .expect("a 512 MB device must be growable");
+        assert_eq!(decided, (512 * MB / 100 * 10) / BTRFS_STRIPE_LEN * BTRFS_STRIPE_LEN);
+        assert!(decided < 256 * MB, "the device cap must bind here");
+
+        // The free run binds when it is the smallest of the three.
+        assert_eq!(
+            policy.decide(ChunkKind::Metadata, 100 * GB, 40 * MB),
+            Some(40 * MB)
+        );
+    }
+
+    /// bd-a136s. Rounding DOWN to the stripe length is the whole reason the
+    /// alignment step is written the way it is. Rounding up is the natural way to
+    /// write it and would push the length past the free run the caller measured
+    /// — an allocation that overlaps the next live chunk by less than 64 KiB,
+    /// which is the hardest kind of corruption to attribute later.
+    #[test]
+    fn chunk_sizing_never_exceeds_the_free_run_it_was_given_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * MB;
+        let policy = ChunkSizePolicy::default();
+
+        // Sweep free runs that are deliberately NOT multiples of the stripe
+        // length, including one just above and one just below a boundary.
+        for free in [
+            9 * MB + 1,
+            9 * MB + BTRFS_STRIPE_LEN - 1,
+            10 * MB - 1,
+            10 * MB + 7,
+            64 * MB + BTRFS_STRIPE_LEN + 3,
+            GB - 1,
+        ] {
+            let Some(size) = policy.decide(ChunkKind::Metadata, 100 * GB, free) else {
+                continue;
+            };
+            assert!(
+                size <= free,
+                "sizing returned {size} for a free run of {free} — it must never \
+                 exceed what the device can place"
+            );
+            assert_eq!(
+                size % BTRFS_STRIPE_LEN,
+                0,
+                "every chunk length must be a multiple of the stripe length"
+            );
+        }
+    }
+
+    /// bd-a136s. Two refusals, and both are deliberate.
+    ///
+    /// A fit below `min_chunk` returns None rather than a sliver: a sliver
+    /// postpones the ENOSPC by one commit, leaves a permanent fragment, and hides
+    /// that the device is full.
+    ///
+    /// But the 10% device cap must NEVER be the thing that refuses. It exists so
+    /// one chunk cannot swallow the device; if it were left unfloored, every
+    /// device under 800 MiB would compute a cap below `min_chunk` and refuse
+    /// every allocation — reinstating the exact ENOSPC this bead removes, on the
+    /// small images the fixtures use, where it would look like the fix simply not
+    /// working.
+    #[test]
+    fn chunk_sizing_refuses_a_sliver_but_the_device_cap_never_refuses_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * MB;
+        let policy = ChunkSizePolicy::default();
+
+        // Below min_chunk: refused.
+        assert_eq!(policy.decide(ChunkKind::Metadata, 100 * GB, 4 * MB), None);
+        assert_eq!(policy.decide(ChunkKind::Metadata, 100 * GB, 0), None);
+        // Exactly min_chunk: allocated. The boundary is inclusive, so a device
+        // with exactly enough is not refused.
+        assert_eq!(
+            policy.decide(ChunkKind::Metadata, 100 * GB, policy.min_chunk),
+            Some(policy.min_chunk)
+        );
+
+        // Small devices, where a raw 10% cap would land below min_chunk. Every
+        // one of these must still be growable when the free space is there.
+        for device in [40 * MB, 64 * MB, 100 * MB, 512 * MB, 800 * MB] {
+            let size = policy
+                .decide(ChunkKind::Metadata, device, device)
+                .unwrap_or_else(|| {
+                    panic!("a {device}-byte device with all of it free must be growable")
+                });
+            assert!(size >= policy.min_chunk);
+            assert!(size <= device);
+        }
+
+        // And the cap still does its job on a device large enough for it to
+        // exceed min_chunk: no chunk takes more than a tenth.
+        let device = 100 * GB;
+        let size = policy
+            .decide(ChunkKind::Data, device, device)
+            .expect("growable");
+        assert!(
+            size <= device / 10,
+            "one chunk must not swallow more than a tenth of the device"
+        );
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {

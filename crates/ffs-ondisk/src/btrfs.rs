@@ -1688,6 +1688,40 @@ impl DeviceOccupancy {
             .fold(0_u64, |total, (_, len)| total.saturating_add(*len))
     }
 
+    /// The largest contiguous free run at or above `min_offset` and below
+    /// `dev_total_bytes`.
+    ///
+    /// This is what a chunk SIZING decision needs: [`Self::find_free`] answers
+    /// "does this length fit and where", but a sizing policy has to clamp its
+    /// target to what the device can actually give before it has a length to ask
+    /// about.
+    ///
+    /// The two must agree, and their agreement is a test: `find_free(n)` returns
+    /// `Some` exactly when `largest_free_run() >= n`. They walk the same ranges
+    /// with the same bounds, so a divergence means one of them has a bound the
+    /// other does not — which is how a sizing policy ends up choosing a length
+    /// that then cannot be placed.
+    #[must_use]
+    pub fn largest_free_run(&self, min_offset: u64, dev_total_bytes: u64) -> u64 {
+        let mut cursor = min_offset;
+        let mut best = 0_u64;
+        for &(start, len) in &self.ranges {
+            let Some(end) = start.checked_add(len) else {
+                return best;
+            };
+            if end <= cursor {
+                continue;
+            }
+            if start > cursor {
+                // Clamped to the device end so a chunk recorded past it — a
+                // corrupt or shrunk device — cannot inflate the run below it.
+                best = best.max(start.min(dev_total_bytes).saturating_sub(cursor));
+            }
+            cursor = cursor.max(end);
+        }
+        best.max(dev_total_bytes.saturating_sub(cursor))
+    }
+
     /// Lowest physical offset at or above `min_offset` where `length` contiguous
     /// bytes fit below `dev_total_bytes`, or `None` when the device has no such
     /// gap.
@@ -2736,6 +2770,61 @@ mod tests {
                  length is modelled — approximating it hands out live space"
             );
         }
+    }
+
+    /// bd-a136s. `largest_free_run` and `find_free` must agree, because a sizing
+    /// policy clamps its target to the former and then asks the latter to place
+    /// that length. If the two disagree by even one byte, sizing chooses a chunk
+    /// that cannot be placed — an allocation that fails after the size decision
+    /// is already made.
+    ///
+    /// The agreement is asserted as an equivalence over a swept length rather
+    /// than at a few hand-picked points, because the failure is an off-by-one at
+    /// a boundary and hand-picked points are exactly what misses those.
+    #[test]
+    fn largest_free_run_agrees_with_find_free_bd_a136s() {
+        use chunk_type_flags::{BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA};
+        const MB: u64 = 1024 * 1024;
+        const DEV: u64 = 64 * MB;
+
+        let chunks = vec![
+            chunk_at(0, 8 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, MB)]),
+            chunk_at(8 * MB, 8 * MB, BTRFS_BLOCK_GROUP_DATA, &[(1, 13 * MB)]),
+        ];
+        let occ = DeviceOccupancy::from_chunks(1, &chunks).expect("derive");
+
+        // Occupied: [1 MiB, 9 MiB) and [13 MiB, 21 MiB). Free at or above 0:
+        // [0, 1 MiB) = 1 MiB, [9, 13) = 4 MiB, and the tail [21, 64) = 43 MiB.
+        assert_eq!(occ.largest_free_run(0, DEV), 43 * MB);
+
+        for length_mb in 0..48_u64 {
+            let length = length_mb * MB;
+            let fits = occ.find_free(length, 0, DEV).is_some();
+            let expected = length > 0 && length <= occ.largest_free_run(0, DEV);
+            assert_eq!(
+                fits, expected,
+                "find_free and largest_free_run disagree at {length_mb} MiB: \
+                 find_free says {fits}, largest run is {} MiB",
+                occ.largest_free_run(0, DEV) / MB
+            );
+        }
+
+        // The reserved head moves both answers together.
+        assert_eq!(occ.largest_free_run(MB, DEV), 43 * MB);
+        assert_eq!(occ.largest_free_run(22 * MB, DEV), 42 * MB);
+
+        // A device with nothing free reports zero, not the tail past its end.
+        let full = DeviceOccupancy::from_chunks(
+            1,
+            &[chunk_at(0, DEV, BTRFS_BLOCK_GROUP_METADATA, &[(1, 0)])],
+        )
+        .expect("derive");
+        assert_eq!(full.largest_free_run(0, DEV), 0);
+        assert_eq!(full.find_free(MB, 0, DEV), None);
+
+        // An empty device is one free run of everything above the reserved head.
+        let empty = DeviceOccupancy::default();
+        assert_eq!(empty.largest_free_run(MB, DEV), DEV - MB);
     }
 
     fn representative_sys_chunk_superblock() -> [u8; BTRFS_SUPER_INFO_SIZE] {
