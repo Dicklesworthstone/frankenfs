@@ -269,6 +269,56 @@ impl FsOps for OpenFs {
         }
     }
 
+    /// Resolve many inodes, visiting them in INODE ORDER regardless of the order
+    /// asked for (bd-xfe7z / bd-5vis3).
+    ///
+    /// The trait default loops in the caller's order, which for btrfs is readdir
+    /// order — and btrfs readdir returns entries in DIR_INDEX order, unrelated to
+    /// objectid. Each `getattr` is then an independent floor descent that lands in
+    /// a different leaf from the last, so the retained-leaf memo misses on
+    /// essentially every entry. Sorting first makes consecutive lookups fall in the
+    /// same leaf, which is the locality the memo exists to exploit: bd-5vis3's
+    /// finding is that what pays is amortising the descent ACROSS inodes that share
+    /// a leaf, not caching individual inodes.
+    ///
+    /// ⚠️ THE RETURNED ORDER IS THE REQUESTED ORDER. The trait contract is one
+    /// result per requested inode, positionally, so the caller can zip it against
+    /// its entries; only the VISIT order changes. Getting that wrong would attach
+    /// every entry's attributes to the wrong name — silent and severe — so the
+    /// permutation is inverted explicitly rather than by re-sorting the results.
+    ///
+    /// Independent of `FFS_FUSE_READDIRPLUS_INODE_ORDER`, which sorts at the FUSE
+    /// layer and is opt-in: this makes the locality available to every batch
+    /// caller. Sorting an already-sorted slice is near-free, so the two compose
+    /// rather than conflict.
+    fn getattr_batch(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        inos: &[InodeNumber],
+    ) -> Vec<ffs_error::Result<InodeAttr>> {
+        // Not worth permuting for a batch this small; the sort would cost more
+        // than the locality it buys.
+        if inos.len() < 2 {
+            return inos
+                .iter()
+                .map(|ino| self.getattr(cx, scope, *ino))
+                .collect();
+        }
+        let mut order: Vec<usize> = (0..inos.len()).collect();
+        order.sort_unstable_by_key(|&index| inos[index].0);
+
+        let mut slots: Vec<Option<ffs_error::Result<InodeAttr>>> =
+            (0..inos.len()).map(|_| None).collect();
+        for index in order {
+            slots[index] = Some(self.getattr(cx, scope, inos[index]));
+        }
+        slots
+            .into_iter()
+            .map(|slot| slot.expect("every slot is filled exactly once by the permutation"))
+            .collect()
+    }
+
     fn getattr(
         &self,
         cx: &Cx,

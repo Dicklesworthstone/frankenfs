@@ -53128,6 +53128,69 @@ mod tests {
         assert_eq!(result[1].name, b"..");
     }
 
+    /// bd-xfe7z: `getattr_batch` may reorder its VISITS but never its RESULTS.
+    ///
+    /// The batch resolves in inode order so consecutive lookups share fs-tree
+    /// leaves, but the trait contract is positional — one result per requested
+    /// inode, in the order requested — because the caller zips it against its
+    /// directory entries. If the permutation were not inverted, every entry would
+    /// receive another entry's attributes: silent, and wrong in the worst way.
+    ///
+    /// The request order here is deliberately REVERSED, so an implementation that
+    /// forgot to invert would return exactly the wrong answer rather than
+    /// accidentally the right one.
+    #[test]
+    fn btrfs_getattr_batch_returns_results_in_requested_order_bd_xfe7z() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"aaa.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"bbb.txt", 258, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"ccc.txt", 259, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let listing = ops
+            .readdir(&cx, &mut RequestScope::empty(), InodeNumber(1), 0)
+            .unwrap();
+        let mut inos: Vec<InodeNumber> = listing.iter().map(|e| e.ino).collect();
+        inos.reverse();
+        assert!(
+            inos.len() >= 3,
+            "need several entries to exercise a permutation"
+        );
+
+        let batched = ops.getattr_batch(&cx, &mut RequestScope::empty(), &inos);
+        assert_eq!(batched.len(), inos.len(), "one result per requested inode");
+        for (requested, result) in inos.iter().zip(batched.iter()) {
+            let attr = result
+                .as_ref()
+                .unwrap_or_else(|e| panic!("inode {} must resolve: {e:?}", requested.0));
+            assert_eq!(
+                attr.ino, requested.0,
+                "result position {} carries another inode's attributes",
+                requested.0
+            );
+        }
+
+        // And it must agree with resolving them one at a time.
+        for (requested, result) in inos.iter().zip(batched.iter()) {
+            let single = ops
+                .getattr(&cx, &mut RequestScope::empty(), *requested)
+                .expect("single getattr");
+            let batched_attr = result.as_ref().expect("batched getattr");
+            assert_eq!(single.ino, batched_attr.ino);
+            assert_eq!(single.size, batched_attr.size);
+            assert_eq!(single.mode, batched_attr.mode);
+        }
+    }
+
     /// bd-t0xoq: the read-plan index's xattr-presence set must answer exactly what
     /// the fs-tree descent answers.
     ///
