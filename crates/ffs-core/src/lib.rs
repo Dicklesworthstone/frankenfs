@@ -1928,6 +1928,23 @@ fn slice_readdir_snapshot(entries: Arc<Vec<DirEntry>>, offset: u64) -> ReaddirPa
 ///
 /// Opt-in and OFF unless set, so an unset environment is byte-identical to
 /// before it existed and both arms of an A/B come from one ELF.
+/// Whether a read-only btrfs mount warms its inode leaves at readdir
+/// (bd-btrfs-readdir-stat-8x-8y7vp).
+///
+/// OPT-IN and OFF unless set. ext4's equivalent prefetch is on by default, but it
+/// has been that way since before the banked rows; this one has never been
+/// measured, and defaulting it on would change what every future btrfs row means
+/// while the comparison to the existing ones silently stopped holding. Same
+/// reasoning bd-6kpp4 records for the checksum default: ship the knob, measure,
+/// then decide.
+fn btrfs_readdir_prefetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FFS_BTRFS_READDIR_PREFETCH")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on" | "TRUE" | "On"))
+    })
+}
+
 fn btrfs_ro_readdir_snapshot_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -12941,6 +12958,56 @@ impl OpenFs {
         let inode_offset_in_table = u64::from(loc.index) * u64::from(sb.inode_size);
         let abs_offset = inode_table_start_byte + inode_offset_in_table;
         Ok(BlockNumber(abs_offset / bs))
+    }
+
+    /// btrfs counterpart of [`Self::prefetch_ext4_readdir_inode_table_blocks`]
+    /// (bd-btrfs-readdir-stat-8x-8y7vp).
+    ///
+    /// THE ASYMMETRY THIS CLOSES. ext4's readdir warms the inode-table blocks for
+    /// the entries it just returned, so the stat pass that follows hits cache.
+    /// btrfs had no counterpart at all, on the workload that is the campaign's
+    /// worst measured loss — the admitted filesystem got the prefetch and the
+    /// unadmitted one did not.
+    ///
+    /// ⚠️ THE btrfs FIX IS DIFFERENT IN KIND, which is why this is not a copy of
+    /// the ext4 one. There, an inode's block is ARITHMETIC, so N entries can be
+    /// mapped and deduped into a handful of block reads before any I/O. Here, the
+    /// leaf holding an objectid cannot be known without descending to it — the
+    /// mapping IS the work. So the dedup has to come from ORDER instead: descend
+    /// in objectid order and the retained-leaf memo answers every subsequent
+    /// objectid that falls in the leaf just fetched, so a page of N entries costs
+    /// one descent per LEAF rather than per entry.
+    ///
+    /// The point is to pay that ordered cost ONCE, at readdir, so the per-entry
+    /// stat pass that follows — which arrives in readdir order, not inode order,
+    /// and cannot be reordered — finds its leaves already resident.
+    ///
+    /// Errors are swallowed deliberately: this is a warm-up, and an objectid that
+    /// cannot be resolved here will simply be resolved (and fail) again by the
+    /// real getattr, which is where the error belongs.
+    fn prefetch_btrfs_readdir_inode_leaves(&self, cx: &Cx, entries: &[DirEntry]) {
+        if entries.len() < EXT4_READDIR_INODE_PREFETCH_MIN_ENTRIES || self.is_writable() {
+            return;
+        }
+        // Sorted, deduped: the sort is what makes the memo skip whole runs, and
+        // duplicates would descend twice for one objectid.
+        let mut objectids: Vec<u64> = entries
+            .iter()
+            .filter_map(|entry| self.btrfs_canonical_inode(entry.ino).ok())
+            .collect();
+        objectids.sort_unstable();
+        objectids.dedup();
+
+        for canonical in objectids {
+            if self.btrfs_read_ondisk_inode_item(cx, canonical).is_err() {
+                // A warm-up must never turn a readable directory into a failed
+                // readdir; the real getattr reports it.
+                trace!(
+                    inode = canonical,
+                    "btrfs readdir inode-leaf prefetch skipped inode"
+                );
+            }
+        }
     }
 
     fn prefetch_ext4_readdir_inode_table_blocks(
@@ -53157,6 +53224,69 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, b".");
         assert_eq!(result[1].name, b"..");
+    }
+
+    /// bd-btrfs-readdir-stat-8x-8y7vp: the btrfs readdir prefetch must be OFF
+    /// unless asked for, and must never change what readdir returns.
+    ///
+    /// It is a warm-up, so the two things worth pinning are that it is inert by
+    /// default — turning it on by default would silently change what every future
+    /// btrfs row means relative to the banked ones — and that enabling it leaves
+    /// the listing byte-identical. A prefetch that altered results would be a
+    /// correctness bug wearing a performance change.
+    #[test]
+    fn btrfs_readdir_prefetch_is_opt_in_and_listing_neutral_bd_8y7vp() {
+        assert!(
+            !btrfs_readdir_prefetch_enabled(),
+            "FFS_BTRFS_READDIR_PREFETCH is unset in the test environment, so the \
+             prefetch must be inert; a default-on prefetch would change every \
+             future btrfs row without measurement"
+        );
+
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"aaa.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"bbb.txt", 258, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"ccc.txt", 259, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let before = ops
+            .readdir(&cx, &mut RequestScope::empty(), InodeNumber(1), 0)
+            .unwrap();
+
+        // Running the warm-up directly must not disturb anything the caller sees,
+        // and must not fail on a directory that reads fine.
+        fs.prefetch_btrfs_readdir_inode_leaves(&cx, &before);
+
+        let after = ops
+            .readdir(&cx, &mut RequestScope::empty(), InodeNumber(1), 0)
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the prefetch changed the entry count"
+        );
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert_eq!(a.ino, b.ino);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.offset, b.offset);
+        }
+
+        // Every entry must still resolve after the warm-up.
+        for entry in &after {
+            ops.getattr(&cx, &mut RequestScope::empty(), entry.ino)
+                .unwrap_or_else(|e| {
+                    panic!("inode {} must resolve after prefetch: {e:?}", entry.ino.0)
+                });
+        }
     }
 
     /// bd-xfe7z: `getattr_batch` may reorder its VISITS but never its RESULTS.
