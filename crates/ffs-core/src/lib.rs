@@ -1490,6 +1490,15 @@ pub struct OpenFs {
     /// Read-only remounts overlay these items onto the FS tree so the fsynced
     /// inode is visible without requiring a full transaction commit.
     btrfs_tree_log_items: Vec<BtrfsLeafEntry>,
+    /// True when `log_root` held a tree log this implementation cannot replay —
+    /// the kernel's log ROOT TREE shape rather than our single leaf (bd-jhuob).
+    ///
+    /// ⚠️ WRITES MUST BE REFUSED WHILE THIS IS SET. A log exists because some
+    /// fsync was acknowledged and not yet committed. We cannot replay it, and a
+    /// full commit would CLEAR `log_root` (bd-mogn1) and discard those writes
+    /// silently. Staying read-only preserves the log for a kernel mount, which
+    /// can replay it.
+    btrfs_foreign_tree_log: bool,
     /// LRU cache for extent tree lookups, avoiding repeated tree traversals
     /// for sequential reads. Invalidated on write/truncate/punch_hole.
     extent_cache: ffs_extent::ExtentCache,
@@ -4908,6 +4917,7 @@ impl OpenFs {
         };
 
         let mut btrfs_tree_log_items = Vec::new();
+        let mut btrfs_foreign_tree_log = false;
         let (ext4_geometry, btrfs_context) = match &flavor {
             FsFlavor::Ext4(sb) => {
                 // Detect standalone journal device: image IS a journal, not a data FS.
@@ -5028,6 +5038,15 @@ impl OpenFs {
                                 );
                                 btrfs_tree_log_items = result.items;
                             }
+                            Ok(result) if result.foreign_format => {
+                                // Not ours, and not ignorable: see the field's doc.
+                                warn!(
+                                    "btrfs tree-log is in the kernel's log-root-tree \
+                                     format; it cannot be replayed here, so this mount \
+                                     stays READ-ONLY to preserve it"
+                                );
+                                btrfs_foreign_tree_log = true;
+                            }
                             Ok(_) => {}
                             Err(err) => {
                                 warn!(error = %err, "btrfs tree-log replay failed");
@@ -5122,6 +5141,7 @@ impl OpenFs {
             ext4_geometry,
             btrfs_context,
             btrfs_tree_log_items,
+            btrfs_foreign_tree_log,
             ext4_journal_replay: None,
             ext4_fast_commit_replay: None,
             crash_recovery: None,
@@ -8431,6 +8451,17 @@ impl OpenFs {
                 self.ext4_forced_read_only.store(false, Ordering::SeqCst);
             }
             FsFlavor::Btrfs(_) => {
+                // bd-jhuob: a tree log we cannot replay means acknowledged fsyncs
+                // whose data lives only in that log. Enabling writes would let a
+                // commit clear `log_root` (bd-mogn1) and discard them with no
+                // error anywhere. Refusing keeps the mount read-only and leaves
+                // the log intact for a kernel mount, which can replay it.
+                if self.btrfs_foreign_tree_log {
+                    return Err(FfsError::Format(
+                        "btrfs: this image carries a tree log in the kernel's                          log-root-tree format, which this implementation cannot                          replay. Enabling writes would discard the fsyncs it                          records. Mount it read-only, or let a kernel mount replay                          and clear the log first."
+                            .into(),
+                    ));
+                }
                 let alloc_state = self.load_btrfs_alloc_state(cx)?;
                 self.btrfs_alloc_state = Some(RwLock::new(alloc_state));
             }
