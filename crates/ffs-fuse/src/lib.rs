@@ -4287,6 +4287,24 @@ impl Filesystem for FrankenFuse {
             }
         }
 
+        // ⛔ DO NOT ADD FUSE_NO_OPEN_SUPPORT HERE. The same trick for FILES looks
+        // symmetric and is not, and the asymmetry is in what the reply carries:
+        //
+        //   dispatch_opendir  returns (0, 0) — no open flags at all, so handing
+        //                     OPENDIR to the kernel gives up nothing.
+        //   kernel_open_flags returns FOPEN_KEEP_CACHE for an ordinary O_RDONLY
+        //                     open, which tells the kernel to KEEP its page cache
+        //                     for the file across opens.
+        //
+        // Zero-message open means the kernel synthesises the open itself with
+        // default flags, so FOPEN_KEEP_CACHE is never sent and the page cache is
+        // dropped on every open. That is a read-path regression, and a SILENT one:
+        // nothing errors, reads just start missing cache. It would also be measured
+        // as a transport win while costing more than it saved.
+        //
+        // `zero_message_open_would_lose_keep_cache_bd_q0xnl` pins the fact this
+        // rests on, so if `kernel_open_flags` ever stops setting FOPEN_KEEP_CACHE
+        // the reasoning is re-examined rather than silently outdated.
         // bd-q0xnl: zero-message opendir, OPT-IN. `add_capabilities` fails unless
         // the KERNEL advertised the bit, so its `Ok` is the capability probe — and
         // the arming flag is written ONLY on that `Ok`. That ordering is the whole
@@ -6979,6 +6997,28 @@ mod tests {
                 "{on:?} is an explicit affirmative and must read as ON"
             );
         }
+    }
+
+    /// bd-q0xnl: why zero-message OPEN is not the twin of zero-message opendir.
+    ///
+    /// The asymmetry is entirely in what each reply carries. `opendir` answers
+    /// with no open flags, so letting the kernel handle it gives up nothing;
+    /// `open` answers with FOPEN_KEEP_CACHE, and the kernel's synthesised open
+    /// uses default flags, so the page cache would be dropped on every open —
+    /// a silent read regression that would still look like a transport win.
+    #[test]
+    fn zero_message_open_would_lose_keep_cache_bd_q0xnl() {
+        assert_eq!(
+            FrankenFuse::kernel_open_flags(libc::O_RDONLY, 0),
+            fuse_consts::FOPEN_KEEP_CACHE,
+            "an ordinary read-only open asks the kernel to KEEP its page cache; \
+             zero-message open cannot send this, which is why it is refused"
+        );
+        assert_ne!(
+            FrankenFuse::kernel_open_flags(libc::O_RDONLY, 0),
+            0,
+            "if this ever becomes zero the refusal above needs re-deciding, not keeping"
+        );
     }
 
     /// bd-q0xnl: opting in must NOT by itself arm the `ENOSYS` reply.
