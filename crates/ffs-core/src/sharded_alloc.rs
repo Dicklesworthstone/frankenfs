@@ -871,6 +871,61 @@ mod tests {
         assert_eq!(sharded.lock_group(0).free_blocks, 97);
     }
 
+    /// bd-y2t0r. Reconciliation is `sharded + (live - seed)`, so it attributes a
+    /// delta EXACTLY ONCE — which is correct only while no operation debits both
+    /// structures. That precondition is stated in `reconciled_group_stats`'s doc
+    /// and is what every caller has to honour; this pins it as arithmetic rather
+    /// than prose.
+    ///
+    /// The three cases are the same filesystem event — one inode freed in group 0
+    /// — recorded three ways.
+    #[test]
+    fn reconciliation_counts_each_freed_inode_exactly_once_bd_y2t0r() {
+        let make = || -> (PerGroupAlloc, Vec<SeedCounts>) {
+            let seed: Vec<GroupStats> = (0..2).map(|g| sample_group(g, 100, 40)).collect();
+            let live = SeedCounts::snapshot(&seed);
+            (PerGroupAlloc::from_group_stats(seed), live)
+        };
+
+        // (a) Freed through the SHARDED records — an ordinary unlink with the
+        // sharded path active, routed through `PerGroupAlloc::free_inode`.
+        let (sharded_only, live) = make();
+        sharded_only.lock_group(0).free_inodes += 1;
+        assert_eq!(sharded_only.reconciled_group_stats(&live)[0].free_inodes, 41);
+
+        // (b) Freed through the SINGLE-LOCK array — orphan recovery and
+        // fast-commit replay still do this, and it must come out the same. This
+        // is the case bd-pbyu0 lost entirely before reconciliation existed.
+        let (single_only, mut live) = make();
+        live[0].free_inodes += 1;
+        assert_eq!(single_only.reconciled_group_stats(&live)[0].free_inodes, 41);
+
+        // (c) ⚠️ THE PRECONDITION. Credited to BOTH, the same free counts TWICE,
+        // and the error is in the DANGEROUS direction: the descriptors would
+        // advertise an inode that is still allocated in the bitmap, and the next
+        // allocation hands out a live inode. Nothing in the types prevents a
+        // future caller from doing this, so the contract is: an operation picks
+        // exactly ONE structure. The delete split in `ext4_unlink_impl` exists
+        // precisely to keep the block frees and the inode free on opposite sides
+        // of that line.
+        let (both, mut live) = make();
+        both.lock_group(0).free_inodes += 1;
+        live[0].free_inodes += 1;
+        assert_eq!(
+            both.reconciled_group_stats(&live)[0].free_inodes,
+            42,
+            "double-crediting double-counts — this is the failure the disjointness \
+             precondition exists to prevent, not an acceptable rounding"
+        );
+
+        // The same holds for blocks and for used_dirs, so the rule is about the
+        // reconciliation, not about inodes.
+        let (both_blocks, mut live) = make();
+        both_blocks.lock_group(1).free_blocks += 8;
+        live[1].free_blocks += 8;
+        assert_eq!(both_blocks.reconciled_group_stats(&live)[1].free_blocks, 116);
+    }
+
     /// The A/A control for the arithmetic above: with the single-lock array still
     /// at its seed, reconciliation must be the identity on every counter. A
     /// version that double-counted, or that copied the live array over the
