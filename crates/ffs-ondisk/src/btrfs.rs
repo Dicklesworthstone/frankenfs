@@ -1310,6 +1310,301 @@ pub fn parse_dev_item(data: &[u8]) -> Result<BtrfsDevItem, ParseError> {
     })
 }
 
+// ── CHUNK_ITEM / DEV_EXTENT / DEV_ITEM serialization (bd-a136s) ─────────────
+//
+// Writers for the three on-disk structures a chunk allocation must create. The
+// crate has carried parsers for all three since mount was read-only; growing a
+// filesystem needs the other direction.
+//
+// ⚠️ EVERY WRITER HERE VALIDATES WHAT ITS PARSER VALIDATES, and refuses rather
+// than emitting bytes its own parser would reject. That is not defensive
+// styling: these bytes are judged by `btrfs check` and by the kernel's mount
+// path, where a malformed chunk is not a parse error but an unmountable
+// filesystem. A serializer that can produce input its own parser rejects is a
+// silent corruption generator, so the round-trip is a type-level property here,
+// enforced by refusal.
+
+/// Byte length of a serialized `btrfs_dev_extent`.
+pub const BTRFS_DEV_EXTENT_SIZE: usize = 48;
+
+/// Key type of a `DEV_EXTENT` item — a device-tree record of which physical
+/// range of a device backs which chunk. Its key is
+/// `(objectid = devid, type = DEV_EXTENT, offset = physical start)`.
+pub const BTRFS_DEV_EXTENT_KEY: u8 = 204;
+
+/// Key type of a `DEV_ITEM`, which lives under objectid
+/// [`BTRFS_DEV_ITEMS_OBJECTID`] in the chunk tree.
+pub const BTRFS_DEV_ITEM_KEY: u8 = 216;
+
+/// Objectid the chunk tree files `DEV_ITEM`s under.
+pub const BTRFS_DEV_ITEMS_OBJECTID: u64 = 1;
+
+/// The reverse map of a chunk: the physical range on one device that backs it.
+///
+/// A chunk's stripes say "this logical range lives at this physical offset on
+/// device N"; the `DEV_EXTENT` says the same thing filed under the device, and
+/// `btrfs check` cross-checks the two. Allocating a chunk without writing the
+/// matching dev extents produces exactly the "chunk ... is not found in dev
+/// extent" complaint, so the two are written together or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrfsDevExtent {
+    /// Objectid of the tree owning the chunk (always the chunk tree, 3).
+    pub chunk_tree: u64,
+    /// Objectid of the chunk this extent backs (always
+    /// `BTRFS_FIRST_CHUNK_TREE_OBJECTID`).
+    pub chunk_objectid: u64,
+    /// Logical start of the chunk this extent backs.
+    pub chunk_offset: u64,
+    /// Length of the physical range.
+    pub length: u64,
+    /// UUID of the chunk tree.
+    pub chunk_tree_uuid: [u8; 16],
+}
+
+impl BtrfsDevExtent {
+    /// Serialize into the 48-byte on-disk form.
+    ///
+    /// # Errors
+    /// Returns [`ParseError::InvalidField`] for a zero `length`, which would
+    /// describe a device extent backing nothing, and
+    /// [`ParseError::InsufficientData`] if `buf` is too short.
+    pub fn write_to_bytes(&self, buf: &mut [u8]) -> Result<(), ParseError> {
+        if buf.len() < BTRFS_DEV_EXTENT_SIZE {
+            return Err(ParseError::InsufficientData {
+                needed: BTRFS_DEV_EXTENT_SIZE,
+                offset: 0,
+                actual: buf.len(),
+            });
+        }
+        if self.length == 0 {
+            return Err(ParseError::InvalidField {
+                field: "dev_extent_length",
+                reason: "must be non-zero",
+            });
+        }
+        buf[0..8].copy_from_slice(&self.chunk_tree.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.chunk_objectid.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.chunk_offset.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.length.to_le_bytes());
+        buf[32..48].copy_from_slice(&self.chunk_tree_uuid);
+        Ok(())
+    }
+
+    /// Serialize into a fresh 48-byte vector.
+    ///
+    /// # Errors
+    /// As [`Self::write_to_bytes`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ParseError> {
+        let mut buf = vec![0_u8; BTRFS_DEV_EXTENT_SIZE];
+        self.write_to_bytes(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// Parse a `DEV_EXTENT` item from raw leaf data.
+///
+/// # Errors
+/// Returns [`ParseError::InsufficientData`] if `data` is shorter than 48 bytes,
+/// or [`ParseError::InvalidField`] for a zero length.
+pub fn parse_dev_extent(data: &[u8]) -> Result<BtrfsDevExtent, ParseError> {
+    if data.len() < BTRFS_DEV_EXTENT_SIZE {
+        return Err(ParseError::InsufficientData {
+            needed: BTRFS_DEV_EXTENT_SIZE,
+            offset: 0,
+            actual: data.len(),
+        });
+    }
+    let length = read_le_u64(data, 24)?;
+    if length == 0 {
+        return Err(ParseError::InvalidField {
+            field: "dev_extent_length",
+            reason: "must be non-zero",
+        });
+    }
+    Ok(BtrfsDevExtent {
+        chunk_tree: read_le_u64(data, 0)?,
+        chunk_objectid: read_le_u64(data, 8)?,
+        chunk_offset: read_le_u64(data, 16)?,
+        length,
+        chunk_tree_uuid: read_fixed::<16>(data, 32)?,
+    })
+}
+
+impl BtrfsDevItem {
+    /// Serialize into the 98-byte on-disk form.
+    ///
+    /// # Errors
+    /// Mirrors [`parse_dev_item`]'s invariants exactly — zero `devid`, zero
+    /// `total_bytes`, or `bytes_used` exceeding `total_bytes` are refused, the
+    /// last being the one a chunk allocation can actually get wrong: growing the
+    /// filesystem must raise `bytes_used` by the chunk's device footprint, and
+    /// letting it pass `total_bytes` would claim more of the device than exists.
+    pub fn write_to_bytes(&self, buf: &mut [u8]) -> Result<(), ParseError> {
+        if buf.len() < BTRFS_DEV_ITEM_SIZE {
+            return Err(ParseError::InsufficientData {
+                needed: BTRFS_DEV_ITEM_SIZE,
+                offset: 0,
+                actual: buf.len(),
+            });
+        }
+        if self.devid == 0 {
+            return Err(ParseError::InvalidField {
+                field: "devid",
+                reason: "must be non-zero",
+            });
+        }
+        if self.total_bytes == 0 {
+            return Err(ParseError::InvalidField {
+                field: "total_bytes",
+                reason: "must be non-zero",
+            });
+        }
+        if self.bytes_used > self.total_bytes {
+            return Err(ParseError::InvalidField {
+                field: "bytes_used",
+                reason: "exceeds total_bytes",
+            });
+        }
+        buf[0..8].copy_from_slice(&self.devid.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.total_bytes.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.bytes_used.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.io_align.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.io_width.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.sector_size.to_le_bytes());
+        buf[36..44].copy_from_slice(&self.dev_type.to_le_bytes());
+        buf[44..52].copy_from_slice(&self.generation.to_le_bytes());
+        buf[52..60].copy_from_slice(&self.start_offset.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.dev_group.to_le_bytes());
+        buf[64] = self.seek_speed;
+        buf[65] = self.bandwidth;
+        buf[66..82].copy_from_slice(&self.uuid);
+        buf[82..98].copy_from_slice(&self.fsid);
+        Ok(())
+    }
+}
+
+impl BtrfsChunkEntry {
+    /// Bytes this entry occupies in a `sys_chunk_array`: disk key + chunk header
+    /// + one stripe per stripe.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        BTRFS_DISK_KEY_SIZE + BTRFS_CHUNK_FIXED_SIZE + self.stripes.len() * BTRFS_STRIPE_SIZE
+    }
+
+    /// Bytes this chunk occupies as a `CHUNK_ITEM` leaf VALUE — the same layout
+    /// without the leading disk key, because in the chunk tree the key is the
+    /// item's own key rather than embedded in its value. The `sys_chunk_array`
+    /// is the only place the key is inline, which is why there are two forms.
+    #[must_use]
+    pub fn item_len(&self) -> usize {
+        BTRFS_CHUNK_FIXED_SIZE + self.stripes.len() * BTRFS_STRIPE_SIZE
+    }
+
+    /// Validate exactly what [`parse_sys_chunk_array`] validates.
+    ///
+    /// # Errors
+    /// Returns [`ParseError::InvalidField`] on a stripe count that disagrees
+    /// with the stripe vector, a zero length / stripe_len / devid, more than one
+    /// RAID profile bit, or a key that is not a `CHUNK_ITEM` under the first
+    /// chunk-tree objectid.
+    fn validate(&self) -> Result<(), ParseError> {
+        // `num_stripes` and `stripes` can disagree, and silently writing
+        // `stripes.len()` over the field would hide the caller's bug in a
+        // structure nothing reads back until mount. Refuse instead.
+        if usize::from(self.num_stripes) != self.stripes.len() {
+            return Err(ParseError::InvalidField {
+                field: "num_stripes",
+                reason: "disagrees with the stripe list",
+            });
+        }
+        if self.num_stripes == 0 {
+            return Err(ParseError::InvalidField {
+                field: "num_stripes",
+                reason: "chunk must have at least one stripe",
+            });
+        }
+        if self.length == 0 {
+            return Err(ParseError::InvalidField {
+                field: "chunk_length",
+                reason: "chunk has zero length",
+            });
+        }
+        if self.stripe_len == 0 {
+            return Err(ParseError::InvalidField {
+                field: "stripe_len",
+                reason: "chunk has zero stripe length",
+            });
+        }
+        if (self.chunk_type & chunk_type_flags::RAID_MASK).count_ones() > 1 {
+            return Err(ParseError::InvalidField {
+                field: "chunk_type",
+                reason: "multiple RAID profiles set",
+            });
+        }
+        if self.stripes.iter().any(|stripe| stripe.devid == 0) {
+            return Err(ParseError::InvalidField {
+                field: "stripe_devid",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(())
+    }
+
+    /// Serialize the chunk body — header + stripes, no key — as a `CHUNK_ITEM`
+    /// leaf value.
+    ///
+    /// # Errors
+    /// As [`Self::validate`].
+    pub fn to_item_bytes(&self) -> Result<Vec<u8>, ParseError> {
+        self.validate()?;
+        let mut buf = Vec::with_capacity(self.item_len());
+        buf.extend_from_slice(&self.length.to_le_bytes());
+        buf.extend_from_slice(&self.owner.to_le_bytes());
+        buf.extend_from_slice(&self.stripe_len.to_le_bytes());
+        buf.extend_from_slice(&self.chunk_type.to_le_bytes());
+        buf.extend_from_slice(&self.io_align.to_le_bytes());
+        buf.extend_from_slice(&self.io_width.to_le_bytes());
+        buf.extend_from_slice(&self.sector_size.to_le_bytes());
+        buf.extend_from_slice(&self.num_stripes.to_le_bytes());
+        buf.extend_from_slice(&self.sub_stripes.to_le_bytes());
+        for stripe in &self.stripes {
+            buf.extend_from_slice(&stripe.devid.to_le_bytes());
+            buf.extend_from_slice(&stripe.offset.to_le_bytes());
+            buf.extend_from_slice(&stripe.dev_uuid);
+        }
+        Ok(buf)
+    }
+
+    /// Serialize as a `sys_chunk_array` entry: inline disk key followed by the
+    /// chunk body.
+    ///
+    /// # Errors
+    /// As [`Self::validate`], plus a key that `parse_sys_chunk_array` would
+    /// reject — the array is read by the KERNEL before any tree is available, so
+    /// a bad key here is an unmountable filesystem rather than a bad lookup.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ParseError> {
+        if self.key.item_type != BTRFS_CHUNK_ITEM_KEY {
+            return Err(ParseError::InvalidField {
+                field: "sys_chunk_key_type",
+                reason: "expected CHUNK_ITEM_KEY",
+            });
+        }
+        if self.key.objectid != BTRFS_FIRST_CHUNK_TREE_OBJECTID {
+            return Err(ParseError::InvalidField {
+                field: "sys_chunk_key_objectid",
+                reason: "expected first chunk tree objectid",
+            });
+        }
+        let body = self.to_item_bytes()?;
+        let mut buf = Vec::with_capacity(self.encoded_len());
+        buf.extend_from_slice(&self.key.objectid.to_le_bytes());
+        buf.push(self.key.item_type);
+        buf.extend_from_slice(&self.key.offset.to_le_bytes());
+        buf.extend_from_slice(&body);
+        Ok(buf)
+    }
+}
+
 // ── Tree node types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1938,6 +2233,186 @@ mod tests {
         assert_eq!(patched.generation, 100);
         assert_eq!(patched.chunk_root_generation, 100);
         assert_eq!(patched.fsid, sb.fsid);
+    }
+
+    /// bd-a136s. The chunk writer must reproduce, BYTE FOR BYTE, the on-disk
+    /// entry the parser read.
+    ///
+    /// This is the strongest check available without a mount, and it is stronger
+    /// than a struct round-trip (`to_bytes` then parse, compare fields): that
+    /// direction passes even if writer and parser share the same wrong offset,
+    /// because the error cancels. Starting from BYTES that the existing parser
+    /// already accepts, and requiring the writer to reproduce them exactly,
+    /// cannot cancel — a swapped field or a wrong offset moves a byte.
+    ///
+    /// The fixture is the crate's own representative superblock, so these are the
+    /// bytes a real `sys_chunk_array` carries.
+    #[test]
+    fn chunk_entry_writer_reproduces_the_bytes_it_parsed_bd_a136s() {
+        let sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+            .expect("sb parse");
+        let original = &sb.sys_chunk_array[..97];
+        let entries = parse_sys_chunk_array(original).expect("chunk parse");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+
+        assert_eq!(
+            entry.encoded_len(),
+            97,
+            "disk key (17) + chunk header (48) + one stripe (32)"
+        );
+        let written = entry.to_bytes().expect("serialize");
+        assert_eq!(
+            written,
+            original,
+            "the sys_chunk_array entry must serialize back to the bytes it was read from"
+        );
+
+        // The item form is the same bytes without the leading 17-byte disk key —
+        // that difference is the whole reason there are two forms, so it is
+        // asserted rather than assumed.
+        let item = entry.to_item_bytes().expect("serialize item");
+        assert_eq!(item.len(), entry.item_len());
+        assert_eq!(
+            item,
+            &original[BTRFS_DISK_KEY_SIZE..],
+            "the CHUNK_ITEM leaf value is the entry without its inline key"
+        );
+    }
+
+    /// bd-a136s. A writer that can emit bytes its own parser rejects is a silent
+    /// corruption generator: nothing reads a chunk back until the kernel mounts
+    /// the filesystem, at which point the failure is "not a btrfs filesystem".
+    /// So every invariant the parser enforces is enforced on the way out too.
+    #[test]
+    fn chunk_entry_writer_refuses_what_its_parser_would_reject_bd_a136s() {
+        let sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+            .expect("sb parse");
+        let good = parse_sys_chunk_array(&sb.sys_chunk_array[..97]).expect("chunk parse")[0].clone();
+        good.to_bytes().expect("the fixture must serialize");
+
+        // A stripe count that disagrees with the stripe list. Writing
+        // `stripes.len()` over the field would "work" and hide the caller's bug
+        // in a structure nothing reads back until mount.
+        let mut mismatched = good.clone();
+        mismatched.num_stripes = 2;
+        assert!(
+            mismatched.to_bytes().is_err(),
+            "num_stripes disagreeing with the stripe list must be refused, not silently corrected"
+        );
+
+        let mut zero_length = good.clone();
+        zero_length.length = 0;
+        assert!(zero_length.to_bytes().is_err(), "a zero-length chunk backs nothing");
+
+        let mut zero_stripe_len = good.clone();
+        zero_stripe_len.stripe_len = 0;
+        assert!(zero_stripe_len.to_bytes().is_err(), "a zero stripe_len divides by zero");
+
+        // Two RAID profile bits at once — the parser rejects it, so the writer
+        // must not be able to create it.
+        let mut two_profiles = good.clone();
+        two_profiles.chunk_type |= chunk_type_flags::RAID_MASK;
+        assert!(
+            two_profiles.to_bytes().is_err(),
+            "multiple RAID profile bits must be refused"
+        );
+
+        let mut zero_devid = good.clone();
+        zero_devid.stripes[0].devid = 0;
+        assert!(zero_devid.to_bytes().is_err(), "a stripe must name a device");
+
+        // The key is only inline in the sys_chunk_array, and the KERNEL reads
+        // that array before any tree is available — a bad key here is an
+        // unmountable filesystem, not a failed lookup. The item form carries no
+        // key, so it must still succeed for the same entry.
+        let mut wrong_key = good.clone();
+        wrong_key.key.item_type = BTRFS_CHUNK_ITEM_KEY.wrapping_add(1);
+        assert!(wrong_key.to_bytes().is_err(), "a non-CHUNK_ITEM key must be refused");
+        wrong_key
+            .to_item_bytes()
+            .expect("the item form carries no key and must still serialize");
+    }
+
+    /// bd-a136s. `DEV_EXTENT` is the reverse map of a chunk — the physical range
+    /// on a device, filed under the device. `btrfs check` cross-checks it against
+    /// the chunk's stripes, so a chunk allocation that writes one and not the
+    /// other produces "chunk ... is not found in dev extent".
+    #[test]
+    fn dev_extent_round_trips_through_its_own_parser_bd_a136s() {
+        let extent = BtrfsDevExtent {
+            chunk_tree: 3,
+            chunk_objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+            chunk_offset: 0x100_0000,
+            length: 8 * 1024 * 1024,
+            chunk_tree_uuid: [0x5A; 16],
+        };
+        let bytes = extent.to_bytes().expect("serialize");
+        assert_eq!(bytes.len(), BTRFS_DEV_EXTENT_SIZE);
+        assert_eq!(parse_dev_extent(&bytes).expect("parse"), extent);
+
+        // Byte-level pinning of the layout, so a field reordering is caught here
+        // rather than by a kernel that will not mount the result.
+        assert_eq!(&bytes[0..8], &3_u64.to_le_bytes()[..]);
+        assert_eq!(&bytes[16..24], &0x100_0000_u64.to_le_bytes()[..]);
+        assert_eq!(&bytes[24..32], &(8 * 1024 * 1024_u64).to_le_bytes()[..]);
+        assert_eq!(&bytes[32..48], &[0x5A_u8; 16][..]);
+
+        let mut zero_len = extent;
+        zero_len.length = 0;
+        assert!(zero_len.to_bytes().is_err(), "a zero-length dev extent backs nothing");
+
+        let mut short = [0_u8; BTRFS_DEV_EXTENT_SIZE - 1];
+        assert!(
+            extent.write_to_bytes(&mut short).is_err(),
+            "a short buffer must be refused, not partially written"
+        );
+    }
+
+    /// bd-a136s. The DEV_ITEM writer exists so a chunk allocation can raise
+    /// `bytes_used` by the chunk's device footprint. That is the one field it
+    /// mutates and the one that can be got wrong, so the `bytes_used <=
+    /// total_bytes` invariant is enforced on the way out, exactly as
+    /// `parse_dev_item` enforces it on the way in.
+    #[test]
+    fn dev_item_writer_round_trips_and_bounds_bytes_used_bd_a136s() {
+        let item = BtrfsDevItem {
+            devid: 1,
+            total_bytes: 512 * 1024 * 1024,
+            bytes_used: 64 * 1024 * 1024,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            dev_type: 0,
+            generation: 7,
+            start_offset: 0,
+            dev_group: 0,
+            seek_speed: 10,
+            bandwidth: 20,
+            uuid: [0xA5; 16],
+            fsid: [0x3C; 16],
+        };
+        let mut buf = [0_u8; BTRFS_DEV_ITEM_SIZE];
+        item.write_to_bytes(&mut buf).expect("serialize");
+        assert_eq!(parse_dev_item(&buf).expect("parse"), item);
+
+        // Growing the filesystem raises bytes_used; it must never pass
+        // total_bytes, which would claim more of the device than exists.
+        let mut overcommitted = item.clone();
+        overcommitted.bytes_used = item.total_bytes + 1;
+        assert!(
+            overcommitted.write_to_bytes(&mut buf).is_err(),
+            "bytes_used past total_bytes must be refused — this is the field a chunk \
+             allocation mutates"
+        );
+
+        // Exactly full is legal: a device with no unallocated space left is a
+        // valid device, and refusing it would refuse the last chunk.
+        let mut exactly_full = item.clone();
+        exactly_full.bytes_used = item.total_bytes;
+        exactly_full
+            .write_to_bytes(&mut buf)
+            .expect("a fully allocated device is valid");
     }
 
     fn representative_sys_chunk_superblock() -> [u8; BTRFS_SUPER_INFO_SIZE] {
