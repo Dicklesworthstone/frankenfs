@@ -20272,6 +20272,70 @@ mod tests {
         );
     }
 
+    /// bd-a136s. The SYSTEM growth path, which exists because serializing the
+    /// chunk tree draws on SYSTEM space — a different resource from the metadata
+    /// the growth loop tops up, and exhaustible on its own.
+    ///
+    /// The assertion that matters is `needs_sys_chunk_array`: a SYSTEM chunk the
+    /// superblock does not record is invisible to the kernel's bootstrap, which
+    /// reads that array before it can read any tree.
+    #[test]
+    fn growth_can_plan_a_system_chunk_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let policy = ChunkSizePolicy::default();
+        let alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        // One existing SYSTEM chunk, so the device is not empty and the new one
+        // must be placed after it.
+        let chunks = vec![logical_chunk(
+            0,
+            8 * MB,
+            chunk_type_flags::BTRFS_BLOCK_GROUP_SYSTEM,
+            &[(1, MB)],
+        )];
+
+        let plan = plan_growth_for_shortfall(
+            &alloc,
+            &chunks,
+            ChunkKind::System,
+            4 * MB,
+            &growth_device(512 * MB, 9 * MB),
+            &policy,
+        )
+        .expect("the device has room")
+        .expect("a shortfall must produce a plan");
+
+        assert!(
+            plan.needs_sys_chunk_array,
+            "a SYSTEM chunk the superblock does not record is invisible to the \
+             kernel's bootstrap"
+        );
+        assert_eq!(plan.chunk.chunk_type, BTRFS_BLOCK_GROUP_SYSTEM);
+        assert_eq!(plan.block_group.flags, BTRFS_BLOCK_GROUP_SYSTEM);
+        // Sized by the SYSTEM target, not the metadata one — 32 MiB against
+        // 256 MiB, so a plan sized from the wrong kind is visible here.
+        assert!(
+            plan.chunk.length <= policy.system,
+            "sized by the system target, got {}",
+            plan.chunk.length
+        );
+        // And placed clear of the existing chunk.
+        assert!(plan.chunk.stripes[0].offset >= 9 * MB);
+
+        // A zero shortfall is not a reason to allocate anything.
+        assert!(
+            plan_growth_for_shortfall(
+                &alloc,
+                &chunks,
+                ChunkKind::System,
+                0,
+                &growth_device(512 * MB, 9 * MB),
+                &policy
+            )
+            .expect("no shortfall")
+            .is_none()
+        );
+    }
+
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
         BtrfsBlockGroupItem {
             total_bytes: size,
