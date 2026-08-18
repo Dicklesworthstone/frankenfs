@@ -327,6 +327,47 @@ PLACEMENT_SCOPE_BASELINE = 39
 # Discovered by --incumbent-absolute-audit; do not raise it.
 INCUMBENT_ABSOLUTE_BASELINE: int | None = 98
 
+# Forward-only ratchet for bd-4sull item 2, seeded from the tree. Same contract as
+# the three above: a floor that may only FALL.
+#
+# THE RULE, in the bead's words: a row's quotable precision is max(its own CI, its
+# measured cross-window spread), and a row with no second run is quoted to the
+# campaign's worst observed spread until it has one.
+#
+# It exists because the published CI describes error INSIDE one invocation and
+# nothing else, while the numbers a reader compares rows with are cross-window.
+# Both quantities are now measured from the 87 surviving reports rather than
+# argued (scripts/cross_window_spread.py):
+#
+#   admitted rows re-measure to a median spread of 1.1022x, worst 1.1314x, over
+#   the only 3 like-for-like groups in the entire bank that HAVE a second admitted
+#   run -- against a published CI of typically 0.5-1%, an order of magnitude
+#   narrower;
+#   and 35 of 38 like-for-like groups have never had a second admitted run at all,
+#   so for almost every banked row the CI is the ONLY figure and it is a lower
+#   bound on the truth.
+#
+# A row satisfies this by saying so: naming its cross-window spread, citing a
+# second same-ELF run, or carrying an explicit within-invocation-only caveat.
+# Discovered by --precision-scope-audit; do not raise it.
+PRECISION_SCOPE_BASELINE: int | None = 33
+
+# A row that has ACKNOWLEDGED the scope of its own precision, in any of the forms
+# the ledger uses. Deliberately generous about wording and strict about intent: it
+# must reference the cross-window/re-measurement question, not merely contain the
+# word "window" (every quiet-window note would match that).
+PRECISION_SCOPE_ACKNOWLEDGED = re.compile(
+    r"cross[- ]window"
+    r"|between[- ]window"
+    r"|window[- ]to[- ]window"
+    r"|re[- ]measure(?:d|ment|s)?\s+(?:spread|delta|reproducib)"
+    r"|reproducib\w*\s+(?:across|between)\s+\w*\s*windows?"
+    r"|within[- ]invocation"
+    r"|same[- ]ELF\s+(?:re[- ]?run|second run)"
+    r"|second\s+(?:same[- ]ELF\s+)?(?:admitted\s+)?run",
+    re.I,
+)
+
 # An absolute incumbent cost, in any of the forms the ledger actually uses: the
 # harness's own machine-readable key, or prose naming the kernel/incumbent arm
 # next to a time unit. Deliberately does NOT accept a bare number near the word
@@ -484,6 +525,28 @@ class Row:
             and not self.has_worker_identity()
             and bool(INCUMBENT_RATIO.search(decision_evidence(self.text)))
         )
+
+    def lacks_precision_scope(self) -> bool:
+        """A banked competitive claim quoting a CI without saying what it bounds.
+
+        Fourth sibling of is_worker_scoped_ratio (which machine),
+        is_placement_scoped_mounted_ratio (where on it) and
+        lacks_incumbent_absolute (what the incumbent cost). This one asks whether
+        the row says its interval is a WITHIN-INVOCATION bound.
+
+        Narrower than "quotes a ratio", on purpose. A row carrying no interval is
+        making no precision claim to overstate, so only rows that quote BOTH a
+        vs-incumbent ratio and a confidence interval are in scope; those are the
+        rows a reader will compare against a later measurement.
+        """
+        if self.verdict != "KEEP":
+            return False
+        evidence = decision_evidence(self.text)
+        if not INCUMBENT_RATIO.search(evidence):
+            return False
+        if not CONFIDENCE_INTERVAL.search(evidence):
+            return False
+        return not PRECISION_SCOPE_ACKNOWLEDGED.search(evidence)
 
     def lacks_incumbent_absolute(self) -> bool:
         """A banked competitive claim that transcribes the QUOTIENT but not the
@@ -989,6 +1052,43 @@ def placement_scoped_rows(rows: list[Row] | None = None) -> list[Row]:
     ]
 
 
+def precision_scope_missing_rows(rows: list[Row] | None = None) -> list[Row]:
+    return [r for r in (all_rows() if rows is None else rows) if r.lacks_precision_scope()]
+
+
+def cmd_precision_scope_audit(list_rows: bool) -> int:
+    """Enumerate banked competitive rows that quote a CI without scoping it.
+
+    bd-4sull item 2. The interval these rows publish bounds error INSIDE one
+    invocation; the comparison a reader makes with it is across windows, where the
+    measured spread is roughly an order of magnitude wider.
+    """
+    scoped = precision_scope_missing_rows()
+    n = len(scoped)
+    print(f"precision-scope-audit: {n} banked KEEP ratio(s) quote a CI without scoping it")
+    if list_rows:
+        for r in scoped:
+            print(f"  {r.ref}\n    {r.title[:160]}")
+    if PRECISION_SCOPE_BASELINE is None:
+        print(
+            f"\nprecision-scope-audit: baseline UNSEEDED - {n} row(s) found. Set "
+            f"PRECISION_SCOPE_BASELINE = {n} to arm the ratchet. Measured stake: "
+            "admitted rows re-measure to a median 1.1022x (worst 1.1314x) across "
+            "windows, against a published CI of typically 0.5-1%; and 35 of 38 "
+            "like-for-like groups have never had a second admitted run, so for "
+            "almost every row the CI is the only figure and is a lower bound."
+        )
+        return 0
+    if n > PRECISION_SCOPE_BASELINE:
+        print(
+            f"precision-scope-audit: FAIL - {n} exceeds the {PRECISION_SCOPE_BASELINE} "
+            "floor; a new competitive ratio was banked quoting an interval without "
+            "saying it bounds one invocation only."
+        )
+        return 1
+    return 0
+
+
 def incumbent_absolute_missing_rows(rows: list[Row] | None = None) -> list[Row]:
     return [
         r for r in (all_rows() if rows is None else rows) if r.lacks_incumbent_absolute()
@@ -1186,6 +1286,58 @@ def _incumbent_absolute_selftests() -> list[tuple[str, bool]]:
         (
             f"incumbent-absolute ratchet holds at {INCUMBENT_ABSOLUTE_BASELINE}",
             len(incumbent_absolute_missing_rows()) == INCUMBENT_ABSOLUTE_BASELINE,
+        ),
+    ] + _precision_scope_selftests()
+
+
+def _precision_scope_selftests() -> list[tuple[str, bool]]:
+    """bd-4sull item 2.
+
+    The predicate must be narrow in two directions at once: a row carrying no
+    INTERVAL is making no precision claim to overstate, and a row that already
+    scopes its interval is compliant however it words it.
+    """
+
+    def keep(body: str) -> Row:
+        return Row(Path("x.md"), 1, "## 2026-08-16 - KEEP: m (bd-x)\n" + body, "KEEP")
+
+    ratio_ci = (
+        "mounted 5.753947x SLOWER than kernel ext4, median 95% CI [5.642761, 5.776242]. "
+    )
+    return [
+        (
+            "a competitive ratio quoting a CI with no scope is flagged",
+            keep(ratio_ci).lacks_precision_scope(),
+        ),
+        (
+            "naming the cross-window spread clears it",
+            not keep(ratio_ci + "cross-window spread 1.1022x.").lacks_precision_scope(),
+        ),
+        (
+            "an explicit within-invocation caveat clears it",
+            not keep(ratio_ci + "this CI is within-invocation only.").lacks_precision_scope(),
+        ),
+        (
+            "citing a second same-ELF run clears it",
+            not keep(ratio_ci + "a second same-ELF run agreed.").lacks_precision_scope(),
+        ),
+        (
+            "a bare mention of a quiet window does NOT clear it",
+            keep(ratio_ci + "taken in a quiet window on thinkstation1.").lacks_precision_scope(),
+        ),
+        (
+            "a ratio with no interval is making no precision claim",
+            not keep("mounted 5.75x SLOWER than kernel ext4.").lacks_precision_scope(),
+        ),
+        (
+            "a REJECT makes no competitive claim",
+            not Row(
+                Path("x.md"), 1, "## 2026-08-16 - REJECT: m (bd-x)\n" + ratio_ci, "REJECT"
+            ).lacks_precision_scope(),
+        ),
+        (
+            f"precision-scope ratchet holds at {PRECISION_SCOPE_BASELINE}",
+            len(precision_scope_missing_rows()) == PRECISION_SCOPE_BASELINE,
         ),
     ]
 
@@ -1971,6 +2123,9 @@ def main() -> int:
     g.add_argument("--incumbent-absolute-audit", action="store_true",
                    help="enumerate banked competitive ratios that record no "
                         "INCUMBENT absolute median (bd-4sull item 3)")
+    g.add_argument("--precision-scope-audit", action="store_true",
+                   help="enumerate banked competitive ratios quoting a CI without "
+                        "scoping it to one invocation (bd-4sull item 2)")
     g.add_argument("--incumbent-audit", action="store_true",
                    help="how many KEEP claims carry a live same-invocation "
                         "incumbent ratio, and why the rest do not")
@@ -1997,6 +2152,8 @@ def main() -> int:
         return cmd_placement_audit(a.list)
     if a.incumbent_absolute_audit:
         return cmd_incumbent_absolute_audit(a.list)
+    if a.precision_scope_audit:
+        return cmd_precision_scope_audit(a.list)
     if a.incumbent_audit:
         return cmd_incumbent_audit(a.show)
     if a.candidate:
