@@ -936,12 +936,20 @@ struct AbbaSymmetry {
     slower_arm: &'static str,
     /// Arms matched within [`MAXIMUM_ABBA_DURATION_RATIO`].
     exact_cancellation: bool,
-    /// Arms are NOT matched AND the FrankenFS null failed positive — the arm was
-    /// slower on its second visit, i.e. the host warmed during the run. This is
-    /// the exact conjunction under which both observed cells inflated, and it
-    /// mechanises the interim rule this bead already adopted by hand: a positive
-    /// null on unequal arms is a reason to suspect the ratio is INFLATED rather
-    /// than merely noisy.
+    /// Arms are NOT matched AND the SLOWER arm's own null failed positive — that
+    /// arm was slower on its second visit, i.e. the host warmed during the run.
+    ///
+    /// ⚠️ THE SLOWER ARM, NOT ALWAYS THE FrankenFS ARM. The first version of this
+    /// inspected the FUSE null unconditionally, which made it structurally blind
+    /// to every WIN in the bank: on all four admitted honest_win rows the KERNEL
+    /// arm is the slower one, so the drift lands there. Drift on the slower arm
+    /// inflates the MAGNITUDE of the effect whichever way the effect points — a
+    /// slower FUSE arm makes a loss look worse, a slower KERNEL arm makes our win
+    /// look better — so skepticism has to follow the duration, not the side.
+    ///
+    /// Mechanises the interim rule this bead adopted by hand, generalised to that
+    /// symmetry: a positive null on the longer arm of an unequal pair is a reason
+    /// to suspect the effect is INFLATED rather than merely noisy.
     inflation_suspected: bool,
 }
 
@@ -953,6 +961,7 @@ struct AbbaSymmetry {
 fn abba_symmetry(
     kernel_median_wall_ns: f64,
     fuse_median_wall_ns: f64,
+    kernel_null_median: f64,
     fuse_null_median: f64,
 ) -> AbbaSymmetry {
     // A non-finite or non-positive median means the arm did not produce a usable
@@ -974,20 +983,24 @@ fn abba_symmetry(
     let faster = kernel_median_wall_ns.min(fuse_median_wall_ns);
     let arm_duration_ratio = slower / faster;
     let exact_cancellation = arm_duration_ratio <= MAXIMUM_ABBA_DURATION_RATIO;
+    let kernel_is_slower = kernel_median_wall_ns >= fuse_median_wall_ns;
+    // The drift that ABBA fails to cancel lands on the arm that occupies more wall
+    // time, so that arm's own A/A null is the one that carries the signal.
+    let slower_arm_null = if kernel_is_slower {
+        kernel_null_median
+    } else {
+        fuse_null_median
+    };
     AbbaSymmetry {
         arm_duration_ratio,
-        slower_arm: if kernel_median_wall_ns >= fuse_median_wall_ns {
-            "kernel"
-        } else {
-            "fuse"
-        },
+        slower_arm: if kernel_is_slower { "kernel" } else { "fuse" },
         exact_cancellation,
         // Strictly greater than one: a null exactly at 1.0 shows no drift, and a
-        // null BELOW one is drift in the other direction, which would deflate the
-        // ratio rather than inflate it.
+        // null BELOW one is drift in the other direction, which would shrink the
+        // measured effect rather than inflate it.
         inflation_suspected: !exact_cancellation
-            && fuse_null_median.is_finite()
-            && fuse_null_median > 1.0,
+            && slower_arm_null.is_finite()
+            && slower_arm_null > 1.0,
     }
 }
 
@@ -6944,7 +6957,12 @@ fn fs_report(
     // it is not neutral, it is silently assuming the precondition holds. Reported,
     // never gating: the mechanism is inferred from four runs and its one
     // duration-matched test was inconclusive.
-    let abba = abba_symmetry(kernel_median_wall_ns, fuse_median_wall_ns, fuse_null.median);
+    let abba = abba_symmetry(
+        kernel_median_wall_ns,
+        fuse_median_wall_ns,
+        kernel_null.median,
+        fuse_null.median,
+    );
     println!(
         "mounted_kernel_abba_symmetry,filesystem={},workload={},arm_duration_ratio={:.6},\
 maximum_matched_ratio={MAXIMUM_ABBA_DURATION_RATIO:.6},slower_arm={},exact_drift_cancellation={},\
@@ -8205,6 +8223,46 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    /// bd-fj2dg: skepticism must follow the DURATION, not the side — otherwise the
+    /// flag is structurally blind to every win in the bank.
+    ///
+    /// Re-scoring the 87 banked reports showed all four admitted `honest_win` rows
+    /// have the KERNEL arm slower (fsync and parallel-metadata), so an
+    /// unconditional look at the FUSE null could never flag them. Drift on the
+    /// slower arm inflates the MAGNITUDE of the effect whichever way it points: a
+    /// slower FUSE arm makes a loss look worse, a slower KERNEL arm makes our win
+    /// look better. The second is the one worth being suspicious of.
+    #[test]
+    fn abba_symmetry_follows_the_slower_arm_not_the_fuse_arm_bd_fj2dg() {
+        // WIN shape: kernel arm ~2.2x longer (the banked btrfs fsync row), kernel
+        // null POSITIVE. Our own win is the thing being inflated.
+        let win = super::abba_symmetry(2.2, 1.0, 1.0041, 0.9952);
+        assert_eq!(win.slower_arm, "kernel");
+        assert!(!win.exact_cancellation);
+        assert!(
+            win.inflation_suspected,
+            "a positive null on the slower KERNEL arm inflates OUR win and must be flagged"
+        );
+
+        // Same shape, kernel null NEGATIVE: drift shrinks the win, which is the
+        // conservative direction and not grounds for suspicion.
+        let conservative = super::abba_symmetry(2.2, 1.0, 0.9961, 0.9952);
+        assert!(!conservative.inflation_suspected);
+
+        // The FUSE null must be IGNORED when the kernel arm is the slower one —
+        // this is the case the first version got wrong.
+        let fuse_null_irrelevant = super::abba_symmetry(2.2, 1.0, 0.9961, 1.9);
+        assert!(
+            !fuse_null_irrelevant.inflation_suspected,
+            "drift on the FASTER arm is what ABBA does cancel; it must not raise the flag"
+        );
+        let kernel_null_decides = super::abba_symmetry(2.2, 1.0, 1.0041, 0.5);
+        assert!(
+            kernel_null_decides.inflation_suspected,
+            "the slower arm's null decides, whatever the faster arm's null says"
+        );
+    }
+
     /// bd-fj2dg: the drift-cancellation precondition, stated as a computation.
     ///
     /// ABBA removes a linear host drift exactly only for EQUAL-duration arms. The
@@ -8217,7 +8275,7 @@ mod tests {
     fn abba_symmetry_flags_unequal_arms_with_a_positive_null_bd_fj2dg() {
         // Matched arms: cancellation is exact, and a positive null then means
         // noise rather than a directional inflation.
-        let matched = super::abba_symmetry(1_000.0, 1_050.0, 1.0553);
+        let matched = super::abba_symmetry(1_000.0, 1_050.0, 1.0, 1.0553);
         assert!(matched.arm_duration_ratio < super::MAXIMUM_ABBA_DURATION_RATIO);
         assert!(matched.exact_cancellation);
         assert!(
@@ -8225,19 +8283,23 @@ mod tests {
             "equal-duration arms cancel drift regardless of the null's sign"
         );
 
-        // The observed shape: control ~3.5x the lever arm, null positive.
-        let observed = super::abba_symmetry(13.8, 3.6, 1.0553);
+        // The observed shape. ORIENTATION IS NOT COSMETIC: on readdir+stat the
+        // FUSE arm is the slow one (13.8 us/op vs 3.6), which every banked row
+        // confirms by scoring slower_arm=fuse. An earlier version of this test had
+        // the two the other way round and still passed, because the code then
+        // consulted the fuse null unconditionally and orientation could not matter.
+        let observed = super::abba_symmetry(3.6, 13.8, 1.0, 1.0553);
         assert!((observed.arm_duration_ratio - 13.8 / 3.6).abs() < 1e-9);
-        assert_eq!(observed.slower_arm, "kernel");
+        assert_eq!(observed.slower_arm, "fuse");
         assert!(!observed.exact_cancellation);
         assert!(
             observed.inflation_suspected,
             "unequal arms plus a null that failed POSITIVE is the exact conjunction observed"
         );
 
-        // Same unequal arms, null NEGATIVE: drift in the other direction would
-        // DEFLATE the ratio, so suspecting inflation would be wrong.
-        let deflating = super::abba_symmetry(13.8, 3.6, 0.8762);
+        // Same unequal arms, the slower arm's null NEGATIVE: drift the other way
+        // would SHRINK the measured effect, so suspecting inflation would be wrong.
+        let deflating = super::abba_symmetry(3.6, 13.8, 1.0, 0.8762);
         assert!(!deflating.exact_cancellation);
         assert!(
             !deflating.inflation_suspected,
@@ -8245,9 +8307,9 @@ mod tests {
         );
 
         // Ratio is orientation-free: whichever arm is slower, the number is >= 1.
-        let fuse_slower = super::abba_symmetry(3.6, 13.8, 1.05);
-        assert_eq!(fuse_slower.slower_arm, "fuse");
-        assert!((fuse_slower.arm_duration_ratio - observed.arm_duration_ratio).abs() < 1e-9);
+        let kernel_slower = super::abba_symmetry(13.8, 3.6, 1.0, 1.05);
+        assert_eq!(kernel_slower.slower_arm, "kernel");
+        assert!((kernel_slower.arm_duration_ratio - observed.arm_duration_ratio).abs() < 1e-9);
 
         // Unusable inputs must not produce an infinity or a NaN that silently
         // compares false everywhere — they report "unknown" and claim nothing.
@@ -8257,7 +8319,7 @@ mod tests {
             (f64::NAN, 3.6),
             (13.8, f64::INFINITY),
         ] {
-            let bad = super::abba_symmetry(k, f, 1.05);
+            let bad = super::abba_symmetry(k, f, 1.05, 1.05);
             assert_eq!(bad.slower_arm, "unknown");
             assert!(!bad.exact_cancellation);
             assert!(!bad.inflation_suspected);
