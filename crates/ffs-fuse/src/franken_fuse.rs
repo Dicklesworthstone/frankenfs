@@ -33,6 +33,12 @@ impl FrankenFuse {
                 // comparator to A/B the memo from a single ELF (bd-2pq73).
                 missing_capability_xattr: LastMissingCapabilityXattr::from_env(),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
+                // bd-q0xnl: starts false and is armed at `init` from the env, the
+                // same as the crate's other two `FuseInner` constructors. This one
+                // was missed when the field landed, which broke every build of
+                // ffs-fuse and everything downstream of it (ffs-cli, and so the
+                // mounted instruments).
+                zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
