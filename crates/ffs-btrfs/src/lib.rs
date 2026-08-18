@@ -6780,6 +6780,155 @@ pub fn plan_chunk_allocation(
     })
 }
 
+/// Apply a [`ChunkAllocationPlan`] to the in-memory trees and the allocator.
+///
+/// Inserts the CHUNK_ITEM into `chunk_tree`, the DEV_EXTENT into `dev_tree`, the
+/// BLOCK_GROUP_ITEM into the allocator's extent tree, appends a SYSTEM chunk to
+/// the superblock's `sys_chunk_array`, and registers the new block group so the
+/// SAME transaction can allocate out of it.
+///
+/// ⚠️ EVERY REASON TO REFUSE IS CHECKED BEFORE THE FIRST INSERT. A chunk is only
+/// a chunk when all of its records exist: `btrfs check` reads a CHUNK_ITEM with
+/// no matching DEV_EXTENT as "chunk ... is not found in dev extent", and a
+/// SYSTEM chunk missing from the superblock array is a filesystem the kernel
+/// cannot bootstrap. Discovering the array is full AFTER inserting into two
+/// trees would leave exactly those states behind. The capacity check for the
+/// array therefore happens up front, with the duplicate-key checks, rather than
+/// at the point of use.
+///
+/// This is not a transaction and does not pretend to be one: the caller is
+/// responsible for committing the trees. What it guarantees is that it either
+/// makes all of its in-memory changes or none of them.
+///
+/// # Errors
+/// Refuses a plan whose CHUNK_ITEM, DEV_EXTENT or BLOCK_GROUP_ITEM key is
+/// already present — a second chunk at one address aliases live data — a SYSTEM
+/// chunk with no superblock to record it in or no room in the array, and any
+/// error from the underlying trees.
+pub fn apply_chunk_allocation(
+    plan: &ChunkAllocationPlan,
+    chunk_tree: &mut InMemoryCowBtrfsTree,
+    dev_tree: &mut InMemoryCowBtrfsTree,
+    alloc: &mut BtrfsExtentAllocator,
+    superblock: Option<&mut BtrfsSuperblock>,
+) -> Result<(), BtrfsMutationError> {
+    // ── Refusals, all of them, before anything is written ──────────────────
+    if chunk_tree.get(&plan.chunk.key).is_some() {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "a chunk already exists at this logical address",
+        ));
+    }
+    if dev_tree.get(&plan.dev_extent_key).is_some() {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "a device extent already exists at this physical address",
+        ));
+    }
+    if alloc.extent_tree().get(&plan.block_group_key).is_some() {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "a block group already exists at this logical address",
+        ));
+    }
+    if alloc.block_group(plan.chunk.key.offset).is_some() {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "the allocator already has a block group at this logical address",
+        ));
+    }
+
+    // ⚠️ KEY EQUALITY IS NOT ENOUGH. Two chunks can occupy overlapping physical
+    // ranges while starting at different offsets, so the duplicate-key check
+    // above would pass and the new chunk would be written on top of a live one.
+    // The caller is expected to have picked this offset with
+    // `DeviceOccupancy::find_free`, but "the caller should have" is not a
+    // property, and the cost of being wrong is silently overwritten data.
+    let physical = plan.dev_extent_key.offset;
+    let physical_end = physical
+        .checked_add(plan.dev_extent.length)
+        .ok_or(BtrfsMutationError::AddressOverflow)?;
+    let devid = plan.dev_extent_key.objectid;
+    let mut conflict = None;
+    dev_tree.range_with(
+        &BtrfsKey {
+            objectid: devid,
+            item_type: BTRFS_DEV_EXTENT_KEY,
+            offset: 0,
+        },
+        &BtrfsKey {
+            objectid: devid,
+            item_type: BTRFS_DEV_EXTENT_KEY,
+            offset: u64::MAX,
+        },
+        |key, value| {
+            if conflict.is_some() || key.item_type != BTRFS_DEV_EXTENT_KEY || key.objectid != devid
+            {
+                return;
+            }
+            // An unreadable dev extent is treated as a conflict, not skipped: we
+            // cannot show the range is free, and "unknown" must not read as
+            // "available" on a path that overwrites data.
+            let Ok(existing) = parse_dev_extent(value) else {
+                conflict = Some("device tree holds an unreadable dev extent");
+                return;
+            };
+            let Some(existing_end) = key.offset.checked_add(existing.length) else {
+                conflict = Some("device tree holds a dev extent that overflows");
+                return;
+            };
+            if key.offset < physical_end && existing_end > physical {
+                conflict = Some("the physical range overlaps a live device extent");
+            }
+        },
+    )?;
+    if let Some(reason) = conflict {
+        return Err(BtrfsMutationError::BrokenInvariant(reason));
+    }
+
+    let chunk_value = plan
+        .chunk
+        .to_item_bytes()
+        .map_err(|_| BtrfsMutationError::InvalidConfig("chunk item does not serialize"))?;
+    let dev_extent_value = plan
+        .dev_extent
+        .to_bytes()
+        .map_err(|_| BtrfsMutationError::InvalidConfig("dev extent does not serialize"))?;
+
+    // A system chunk that cannot be recorded in the superblock array must not be
+    // created at all: it would be invisible to the kernel's bootstrap, which
+    // reads that array before any tree.
+    let mut superblock = superblock;
+    if plan.needs_sys_chunk_array {
+        let Some(sb) = superblock.as_deref_mut() else {
+            return Err(BtrfsMutationError::InvalidConfig(
+                "a system chunk needs a superblock to record it in",
+            ));
+        };
+        if sb.sys_chunk_array_free() < plan.chunk.encoded_len() {
+            return Err(BtrfsMutationError::NoSpace);
+        }
+    }
+
+    // ── Writes. Nothing below here may fail for a reason checked above ─────
+    chunk_tree.insert(plan.chunk.key, &chunk_value)?;
+    dev_tree.insert(plan.dev_extent_key, &dev_extent_value)?;
+    alloc
+        .extent_tree_mut()
+        .insert(plan.block_group_key, &plan.block_group.to_bytes())?;
+    alloc.add_block_group(plan.chunk.key.offset, plan.block_group);
+
+    if plan.needs_sys_chunk_array {
+        let sb = superblock
+            .as_deref_mut()
+            .ok_or(BtrfsMutationError::BrokenInvariant(
+                "superblock vanished between the capacity check and the append",
+            ))?;
+        sb.append_sys_chunk_entry(&plan.chunk).map_err(|_| {
+            BtrfsMutationError::BrokenInvariant(
+                "sys_chunk_array append failed after its capacity was checked",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// The lowest logical address at which a new chunk may start, given the existing
 /// chunk map.
 ///
@@ -18351,6 +18500,311 @@ mod tests {
         assert!(start >= 8 * MB + 1, "must not overlap the chunk below");
         assert_eq!(start % BTRFS_STRIPE_LEN, 0, "must be stripe aligned");
         assert_eq!(start, 8 * MB + BTRFS_STRIPE_LEN);
+    }
+
+    fn test_superblock() -> BtrfsSuperblock {
+        BtrfsSuperblock {
+            csum: [0; 32],
+            fsid: [0x42; 16],
+            bytenr: ffs_types::BTRFS_SUPER_INFO_OFFSET as u64,
+            flags: 0,
+            magic: ffs_types::BTRFS_MAGIC,
+            generation: 7,
+            root: 0x10000,
+            chunk_root: 0x20000,
+            chunk_root_generation: 7,
+            log_root: 0,
+            total_bytes: 512 * 1024 * 1024,
+            bytes_used: 64 * 1024 * 1024,
+            root_dir_objectid: 6,
+            num_devices: 1,
+            sectorsize: 4096,
+            nodesize: 16384,
+            stripesize: 4096,
+            compat_flags: 0,
+            compat_ro_flags: 0,
+            incompat_flags: 0,
+            csum_type: ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+            root_level: 0,
+            chunk_root_level: 1,
+            log_root_level: 0,
+            label: "bd_a136s".to_string(),
+            sys_chunk_array_size: 0,
+            sys_chunk_array: vec![],
+        }
+    }
+
+    /// bd-a136s. THE POINT OF THE WHOLE BEAD, as an assertion: an allocation that
+    /// fails with `NoSpace` before the chunk exists succeeds after it.
+    ///
+    /// This is the capability gap against kernel btrfs stated as a test. It does
+    /// NOT prove the on-disk result mounts — only a kernel and `btrfs check` can
+    /// say that, and both need a build. It proves the in-memory half: that
+    /// applying a plan produces records the parsers read back, and a block group
+    /// the SAME transaction can allocate out of.
+    #[test]
+    fn applying_a_chunk_plan_makes_a_failing_allocation_succeed_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+
+        // No metadata block group: exactly bd-uxh7t's mechanism A, where the
+        // filesystem has device space and we cannot reach it.
+        assert!(
+            alloc
+                .alloc_metadata_for_tree(16384, BTRFS_FS_TREE_OBJECTID, 0)
+                .is_err(),
+            "with no metadata block group the allocation must fail — otherwise this \
+             test proves nothing about the fix"
+        );
+
+        let plan = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            128 * MB,
+            96 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+            .expect("apply");
+
+        // The same allocation now succeeds, and lands inside the new chunk.
+        let allocated = alloc
+            .alloc_metadata_for_tree(16384, BTRFS_FS_TREE_OBJECTID, 0)
+            .expect("allocation must succeed once the chunk exists");
+        assert!(
+            allocated.bytenr >= 128 * MB
+                && allocated.bytenr + 16384 <= 128 * MB + 32 * MB,
+            "the allocation must land inside the new chunk, got {}",
+            allocated.bytenr
+        );
+
+        // Every record is present AND parses back to what was planned — storing
+        // bytes the parser cannot read would still satisfy a presence check.
+        let chunk_bytes = chunk_tree.get(&plan.chunk.key).expect("chunk item present");
+        let dev_bytes = dev_tree
+            .get(&plan.dev_extent_key)
+            .expect("dev extent present");
+        assert_eq!(
+            parse_dev_extent(&dev_bytes).expect("dev extent parses"),
+            plan.dev_extent
+        );
+        assert_eq!(chunk_bytes.len(), plan.chunk.item_len());
+        assert!(
+            alloc.extent_tree().get(&plan.block_group_key).is_some(),
+            "the BLOCK_GROUP_ITEM must be in the extent tree, or btrfs check \
+             reports a block group with no item"
+        );
+        let registered = alloc
+            .block_group(128 * MB)
+            .expect("the allocator must know the new group");
+        assert_eq!(registered.total_bytes, 32 * MB);
+        assert_eq!(registered.flags, BTRFS_BLOCK_GROUP_METADATA);
+    }
+
+    /// bd-a136s. A chunk is only a chunk when ALL of its records exist. If a
+    /// refusal can happen after the first insert, the result is a CHUNK_ITEM with
+    /// no DEV_EXTENT — "chunk ... is not found in dev extent" — or a system chunk
+    /// the kernel cannot bootstrap. So every refusal is asserted to leave the
+    /// trees exactly as it found them, not merely to return an error.
+    #[test]
+    fn a_refused_chunk_plan_writes_nothing_at_all_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+
+        let plan = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            128 * MB,
+            96 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+            .expect("first apply");
+
+        // Applying the SAME plan again must refuse: a second chunk at one logical
+        // address aliases live data.
+        assert!(
+            apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+                .is_err(),
+            "a duplicate chunk must be refused"
+        );
+
+        // A SYSTEM chunk with nowhere to record it must refuse, and must not have
+        // touched either tree on the way to that refusal.
+        let system = plan_chunk_allocation(&chunk_request(
+            ChunkKind::System,
+            256 * MB,
+            192 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        assert!(
+            apply_chunk_allocation(&system, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+                .is_err(),
+            "a system chunk needs a superblock to record it in"
+        );
+        assert!(
+            chunk_tree.get(&system.chunk.key).is_none(),
+            "the refused system chunk must not be in the chunk tree"
+        );
+        assert!(
+            dev_tree.get(&system.dev_extent_key).is_none(),
+            "the refused system chunk must not have left a dev extent behind"
+        );
+        assert!(
+            alloc.block_group(256 * MB).is_none(),
+            "the refused system chunk must not have registered a block group"
+        );
+
+        // With a superblock whose array is FULL, the same refusal must arrive
+        // before any insert. This is the case the up-front capacity check exists
+        // for: checking at the point of use would leave two trees written.
+        let mut sb = test_superblock();
+        sb.sys_chunk_array = vec![0_u8; 2048];
+        sb.sys_chunk_array_size = 2048;
+        assert!(
+            apply_chunk_allocation(
+                &system,
+                &mut chunk_tree,
+                &mut dev_tree,
+                &mut alloc,
+                Some(&mut sb)
+            )
+            .is_err(),
+            "a full sys_chunk_array must refuse the whole allocation"
+        );
+        assert!(
+            chunk_tree.get(&system.chunk.key).is_none(),
+            "a full array must be discovered BEFORE the chunk item is inserted"
+        );
+        assert!(
+            dev_tree.get(&system.dev_extent_key).is_none(),
+            "a full array must be discovered BEFORE the dev extent is inserted"
+        );
+        assert!(alloc.block_group(256 * MB).is_none());
+    }
+
+    /// bd-a136s. A system chunk records itself in the superblock array as part of
+    /// the same apply, because the kernel bootstraps the chunk tree from that
+    /// array before any tree is readable.
+    #[test]
+    fn a_system_chunk_records_itself_in_the_superblock_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+        let mut sb = test_superblock();
+        let before = sb.sys_chunk_array.len();
+
+        let plan = plan_chunk_allocation(&chunk_request(
+            ChunkKind::System,
+            256 * MB,
+            192 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        apply_chunk_allocation(
+            &plan,
+            &mut chunk_tree,
+            &mut dev_tree,
+            &mut alloc,
+            Some(&mut sb),
+        )
+        .expect("apply");
+
+        assert_eq!(sb.sys_chunk_array.len(), before + plan.chunk.encoded_len());
+        assert_eq!(sb.sys_chunk_array_size as usize, sb.sys_chunk_array.len());
+        // A metadata chunk must NOT touch the array, so the same apply with a
+        // superblock present leaves it alone.
+        let metadata = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            512 * MB,
+            256 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        let after_system = sb.sys_chunk_array.len();
+        apply_chunk_allocation(
+            &metadata,
+            &mut chunk_tree,
+            &mut dev_tree,
+            &mut alloc,
+            Some(&mut sb),
+        )
+        .expect("apply");
+        assert_eq!(
+            sb.sys_chunk_array.len(),
+            after_system,
+            "a metadata chunk must not consume the superblock array"
+        );
+    }
+
+    /// bd-a136s. The duplicate-KEY checks would pass for a chunk that starts at a
+    /// different physical offset and still overlaps a live one, and the result of
+    /// letting that through is a new chunk written on top of live data. The
+    /// caller is meant to have picked the offset with `DeviceOccupancy::find_free`
+    /// — but "the caller should have" is not a property.
+    #[test]
+    fn an_overlapping_physical_range_is_refused_even_with_a_new_key_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+
+        let first = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            128 * MB,
+            96 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        apply_chunk_allocation(&first, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+            .expect("first apply");
+
+        // Different logical address, different dev-extent key, physical range
+        // straddling the live chunk's tail.
+        let overlapping = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            256 * MB,
+            100 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        assert_ne!(overlapping.dev_extent_key, first.dev_extent_key);
+        assert!(
+            apply_chunk_allocation(
+                &overlapping,
+                &mut chunk_tree,
+                &mut dev_tree,
+                &mut alloc,
+                None
+            )
+            .is_err(),
+            "a physical range overlapping a live device extent must be refused"
+        );
+        assert!(chunk_tree.get(&overlapping.chunk.key).is_none());
+        assert!(dev_tree.get(&overlapping.dev_extent_key).is_none());
+        assert!(alloc.block_group(256 * MB).is_none());
+
+        // A range that ABUTS without overlapping is fine — refusing it would
+        // waste the device and turn a correct allocation into an ENOSPC.
+        let abutting = plan_chunk_allocation(&chunk_request(
+            ChunkKind::Metadata,
+            256 * MB,
+            128 * MB,
+            32 * MB,
+        ))
+        .expect("plan");
+        apply_chunk_allocation(&abutting, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+            .expect("an abutting chunk must be allowed");
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
