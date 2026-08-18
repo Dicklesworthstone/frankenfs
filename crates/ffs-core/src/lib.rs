@@ -40,7 +40,8 @@ use ffs_block::{
 };
 use ffs_btrfs::{
     BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA, BTRFS_CHUNK_TREE_OBJECTID,
-    BTRFS_CSUM_TREE_OBJECTID, BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FILE_EXTENT_PREALLOC,
+    BTRFS_CSUM_TREE_OBJECTID, BTRFS_DEV_TREE_OBJECTID, BTRFS_EXTENT_TREE_OBJECTID,
+    BTRFS_FILE_EXTENT_PREALLOC,
     BTRFS_FILE_EXTENT_REG, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV,
     BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_REG_FILE, BTRFS_FT_SOCK,
     BTRFS_FT_SYMLINK, BTRFS_INODE_APPEND, BTRFS_INODE_IMMUTABLE, BTRFS_INODE_NODATASUM,
@@ -1086,6 +1087,26 @@ struct BtrfsAllocState {
     csum_tree: InMemoryCowBtrfsTree,
     /// Extent allocator for data and metadata block allocation.
     extent_alloc: BtrfsExtentAllocator,
+    /// In-memory COW B-tree holding CHUNK_ITEMs and the DEV_ITEM, seeded from
+    /// the on-disk chunk tree at mount (bd-a136s). Chunk ALLOCATION inserts
+    /// here; until that is wired, this is loaded and re-serialized unchanged.
+    #[allow(dead_code, reason = "read by chunk allocation, wired in a later commit (bd-a136s)")]
+    chunk_tree: InMemoryCowBtrfsTree,
+    /// In-memory COW B-tree holding DEV_EXTENTs — the reverse map of every chunk
+    /// onto the physical device ranges backing it (bd-a136s).
+    #[allow(dead_code, reason = "read by chunk allocation, wired in a later commit (bd-a136s)")]
+    dev_tree: InMemoryCowBtrfsTree,
+    /// False when the chunk tree or device tree could not be read in full.
+    ///
+    /// ⚠️ CHUNK ALLOCATION MUST REFUSE WHEN THIS IS FALSE. `apply_chunk_allocation`
+    /// decides a physical range is free by finding no DEV_EXTENT covering it, so
+    /// a partially loaded device tree does not mean "more space" — it means every
+    /// unread range looks free, and the next chunk lands on top of live data.
+    /// Unlike the extent tree, where a failed load costs accounting that the next
+    /// commit recomputes, a failed device-tree load costs the only record of
+    /// what is already on the disk.
+    #[allow(dead_code, reason = "read by chunk allocation, wired in a later commit (bd-a136s)")]
+    chunk_trees_authoritative: bool,
     /// Newly-created subvolume fs-trees awaiting their first commit, keyed by
     /// the subvolume's root objectid (>= `BTRFS_FIRST_FREE_OBJECTID`). Each is
     /// committed as its own tree by `btrfs_full_transaction_commit` (alongside
@@ -8633,6 +8654,124 @@ impl OpenFs {
             0
         };
 
+        // ── Load on-disk CHUNK_TREE and DEV_TREE items (bd-a136s) ───────────
+        //
+        // Growing a filesystem means INSERTING a CHUNK_ITEM and a DEV_EXTENT,
+        // and both trees have to be present in memory to be inserted into and
+        // re-serialized. The chunk tree's root is in the SUPERBLOCK (the kernel
+        // bootstraps it before any tree is readable); the device tree's root is a
+        // ROOT_ITEM in the root tree like every other tree.
+        //
+        // ⚠️ A FAILED WALK IS NOT AN EMPTY TREE, and the distinction is the whole
+        // reason `chunk_trees_authoritative` exists. `apply_chunk_allocation`
+        // decides a physical range is free by finding no DEV_EXTENT covering it.
+        // If a walk failed and left the tree empty, EVERY range reads as free and
+        // the next chunk allocation writes on top of live data. The extent-tree
+        // load above can warn and continue with an empty tree because an empty
+        // extent tree only loses accounting; an empty device tree loses the only
+        // record of what is already on the disk. So a failure here is recorded,
+        // and chunk allocation must refuse rather than proceed on a tree it
+        // cannot trust — the same shape as bd-ftev0's
+        // `extent_tree_items_loaded > 0` guard.
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(max_items)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            .with_node_byte_budget((nodesize as usize).saturating_sub(101));
+        let mut dev_tree = InMemoryCowBtrfsTree::new(max_items)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            .with_node_byte_budget((nodesize as usize).saturating_sub(101));
+        let mut chunk_trees_authoritative = true;
+
+        if sb.chunk_root == 0 {
+            // No chunk tree at all. Every mountable btrfs filesystem has one, so
+            // this is not a filesystem we may grow.
+            debug!(target: "ffs::write", "superblock has no chunk_root");
+            chunk_trees_authoritative = false;
+        } else {
+            match self.walk_btrfs_tree(cx, sb.chunk_root) {
+                Ok(items) => {
+                    let mut loaded = 0_usize;
+                    for item in items {
+                        let key = BtrfsKey {
+                            objectid: item.key.objectid,
+                            item_type: item.key.item_type,
+                            offset: item.key.offset,
+                        };
+                        if chunk_tree.insert(key, &item.data).is_ok() {
+                            loaded += 1;
+                        } else {
+                            chunk_trees_authoritative = false;
+                        }
+                    }
+                    debug!(
+                        target: "ffs::write",
+                        loaded,
+                        chunk_root = sb.chunk_root,
+                        "loaded on-disk chunk_tree entries"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        target: "ffs::write",
+                        error = %e,
+                        "failed to walk chunk_tree; chunk allocation is disabled for this mount"
+                    );
+                    chunk_trees_authoritative = false;
+                }
+            }
+        }
+
+        // The device tree may legitimately be absent on an image our own
+        // generators produced, which is why its absence disables growth rather
+        // than failing the mount: a filesystem that mounts read-write and cannot
+        // grow is strictly better than one that will not mount.
+        if let Some(dev_root_entry) = root_items.iter().find(|item| {
+            item.key.objectid == BTRFS_DEV_TREE_OBJECTID
+                && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+        }) {
+            match parse_root_item(&dev_root_entry.data) {
+                Ok(root_item) if root_item.bytenr != 0 => {
+                    match self.walk_btrfs_tree(cx, root_item.bytenr) {
+                        Ok(items) => {
+                            let mut loaded = 0_usize;
+                            for item in items {
+                                let key = BtrfsKey {
+                                    objectid: item.key.objectid,
+                                    item_type: item.key.item_type,
+                                    offset: item.key.offset,
+                                };
+                                if dev_tree.insert(key, &item.data).is_ok() {
+                                    loaded += 1;
+                                } else {
+                                    chunk_trees_authoritative = false;
+                                }
+                            }
+                            debug!(
+                                target: "ffs::write",
+                                loaded,
+                                dev_root_bytenr = root_item.bytenr,
+                                "loaded on-disk dev_tree entries"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "ffs::write",
+                                error = %e,
+                                "failed to walk dev_tree; chunk allocation is disabled for this mount"
+                            );
+                            chunk_trees_authoritative = false;
+                        }
+                    }
+                }
+                _ => {
+                    debug!(target: "ffs::write", "DEV_TREE ROOT_ITEM is unusable");
+                    chunk_trees_authoritative = false;
+                }
+            }
+        } else {
+            debug!(target: "ffs::write", "no DEV_TREE ROOT_ITEM found in root_tree");
+            chunk_trees_authoritative = false;
+        }
+
         // ── Pin the live ROOT_TREE and EXTENT_TREE blocks (bd-mqb9t) ────────
         //
         // Every other tree we rewrite wholesale (fs, csum) has EXTENT_ITEMs on
@@ -8762,6 +8901,9 @@ impl OpenFs {
             fs_tree,
             csum_tree,
             extent_alloc,
+            chunk_tree,
+            dev_tree,
+            chunk_trees_authoritative,
             extra_subvol_trees: Vec::new(),
             dir_index_counters: std::collections::HashMap::new(),
             next_objectid: max_objectid + 1,
