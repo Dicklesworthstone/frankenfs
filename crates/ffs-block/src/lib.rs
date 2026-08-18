@@ -1123,6 +1123,28 @@ pub trait BlockDevice: Send + Sync {
     /// pure concurrency optimization). Reading the base and staging the write in one
     /// call is what lets an MVCC device keep them snapshot-consistent, which a
     /// separate `read_block` then `write_block` cannot guarantee under concurrency.
+    ///
+    /// The default also SKIPS the write entirely when `patch` left the block
+    /// byte-identical to what was read (bd-ygznx). A durability boundary that changed
+    /// nothing should not cost a device write: measured on ext4, the group-descriptor
+    /// flush rewrote its block on every client fsync even for a pure overwrite that
+    /// allocates nothing and therefore changes no descriptor. Skipping a write of bytes
+    /// already on disk cannot lose an update — it is a no-op by construction — and it
+    /// leaves the write/sync epochs unbumped, which is correct because there is then
+    /// nothing to sync.
+    ///
+    /// ⚠️ THE COMPARISON IS OVER THE WHOLE BLOCK, DELIBERATELY, AND NOT OVER
+    /// `disjoint_ranges`. Comparing only the hinted ranges looks like a free
+    /// optimization and is a data-loss bug: the hint is the CALLER's promise about what
+    /// it touches, and this default previously ignored the hint entirely and wrote
+    /// unconditionally, so a caller whose patch strayed outside its declared ranges
+    /// still got a correct write here. Trusting the hint for the comparison would turn
+    /// every such contract violation into a silently dropped write. A full-block
+    /// compare costs one copy; a wrong skip costs data.
+    ///
+    /// ⚠️ Overrides must NOT inherit this skip blindly. An MVCC-backed device stages a
+    /// merge proof rather than a plain write, and suppressing that staging would change
+    /// concurrency semantics rather than just saving I/O.
     fn rmw_block(
         &self,
         cx: &Cx,
@@ -1132,7 +1154,11 @@ pub trait BlockDevice: Send + Sync {
     ) -> Result<()> {
         let _ = disjoint_ranges;
         let mut data = self.read_block(cx, block)?.into_inner();
+        let before = data.clone();
         patch(&mut data)?;
+        if data == before {
+            return Ok(());
+        }
         self.write_block(cx, block, &data)
     }
 
@@ -3185,6 +3211,110 @@ mod tests {
         fn sync(&self, _cx: &Cx) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// bd-ygznx. The default `rmw_block` must not issue a device write when the patch
+    /// left the block byte-identical to what was read.
+    ///
+    /// Motivation is measured, not stylistic: on ext4 the group-descriptor flush
+    /// rewrote its block on every client fsync, including for a pure overwrite that
+    /// allocates nothing and therefore changes no descriptor.
+    ///
+    /// The assertions are on the WRITE COUNT, never on content. A content assertion
+    /// passes against the old unconditional implementation, which wrote exactly the
+    /// same bytes — the number of writes reaching the device is the entire property.
+    #[test]
+    fn rmw_block_skips_a_write_the_patch_did_not_change_bd_ygznx() {
+        struct CountingDevice {
+            inner: MemBlockDevice,
+            writes: AtomicUsize,
+        }
+
+        impl BlockDevice for CountingDevice {
+            fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+                self.inner.read_block(cx, block)
+            }
+
+            fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                self.inner.write_block(cx, block, data)
+            }
+
+            fn block_size(&self) -> u32 {
+                self.inner.block_size()
+            }
+
+            fn block_count(&self) -> u64 {
+                self.inner.block_count()
+            }
+
+            fn sync(&self, cx: &Cx) -> Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let dev = CountingDevice {
+            inner: MemBlockDevice::new(4096, 16),
+            writes: AtomicUsize::new(0),
+        };
+        let block = BlockNumber(3);
+        let hint = [(64_usize, 8_usize)];
+        let writes = || dev.writes.load(Ordering::SeqCst);
+
+        // A patch that changes nothing must not reach the device.
+        dev.rmw_block(&cx, block, &hint, &mut |_buf| Ok(()))
+            .expect("no-op rmw");
+        assert_eq!(writes(), 0, "a patch that changed nothing must not be written");
+
+        // A real change must still be written.
+        dev.rmw_block(&cx, block, &hint, &mut |buf| {
+            buf[64] = 0xAB;
+            Ok(())
+        })
+        .expect("changing rmw");
+        assert_eq!(writes(), 1, "a real change must be written");
+
+        // Storing the value that is already there is not a change.
+        dev.rmw_block(&cx, block, &hint, &mut |buf| {
+            buf[64] = 0xAB;
+            Ok(())
+        })
+        .expect("idempotent rmw");
+        assert_eq!(
+            writes(),
+            1,
+            "re-storing an identical value must not reach the device"
+        );
+
+        // The skip does not depend on the hint being supplied.
+        dev.rmw_block(&cx, block, &[], &mut |_buf| Ok(()))
+            .expect("no-hint no-op");
+        assert_eq!(writes(), 1, "an unchanged patch with no hint is also skipped");
+
+        // ⚠️ THE LOAD-BEARING CASE. A patch that strays OUTSIDE its declared ranges
+        // must still be written. `disjoint_ranges` is the caller's promise about what
+        // it touches, and this default previously ignored the hint and wrote
+        // unconditionally — so a caller that broke the promise still got a correct
+        // write here. Comparing only the hinted ranges would look like a free
+        // optimization and would turn every such violation into a silently dropped
+        // write. This assertion is what forbids that comparison.
+        dev.rmw_block(&cx, block, &hint, &mut |buf| {
+            buf[2048] = 0xCD;
+            Ok(())
+        })
+        .expect("out-of-hint rmw");
+        assert_eq!(
+            writes(),
+            2,
+            "a change outside the declared ranges must still be written"
+        );
+
+        // And the bytes that did reach the device are the patched ones, so the skip
+        // never left the device holding a stale block.
+        let stored = dev.read_block(&cx, block).expect("readback");
+        assert_eq!(stored.as_slice()[64], 0xAB);
+        assert_eq!(stored.as_slice()[2048], 0xCD);
     }
 
     #[derive(Debug)]

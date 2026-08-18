@@ -10969,3 +10969,43 @@ commit, and it is the difference between "a full transaction per fsync" and what
 logged items is read from control flow, not observed; the deciding test is to write via the ephemeral
 path, force a full commit, remount, and check whether the logged items survive. That test needs a build
 and a mount, so it waits for the freeze to lift.
+
+## bd-ygznx — REJECTED VARIANT: comparing only `disjoint_ranges` in the `rmw_block` no-op skip
+
+**Lever (kept).** `BlockDevice::rmw_block`'s default read-modify-write always issued a
+`write_block`, even when the patch left the block byte-identical to what was read. The
+ext4 group-descriptor flush hits this on every client fsync: a pure overwrite allocates
+nothing, so no descriptor changes, and the block is rewritten anyway. The default now
+skips the write when nothing changed. Only devices that inherit the default are
+affected — `fs_mvcc_store.rs:600`, `TransactionBlockAdapter` (`ffs-core:3351`) and
+`Arc<D>` (`ffs-block:1335`) override `rmw_block`, and the MVCC overrides must NOT
+inherit the skip because they stage a merge proof rather than a plain write.
+
+**The variant that was written and then rejected: compare only the bytes inside
+`disjoint_ranges`.** The reasoning was that the hint already states the patch differs
+from the base only inside those ranges, so bytes outside cannot have changed and need
+not be compared — saving a 4 KiB copy per call. It is wrong, and the failure mode is
+silent data loss rather than a panic.
+
+`disjoint_ranges` is the CALLER's promise about what it touches, and this default
+previously **ignored the hint entirely**. So a caller whose patch strayed outside its
+declared ranges — a stale hint, an off-by-one, a patch that also fixes up a checksum
+elsewhere in the block — still got a correct unconditional write out of this default,
+and the bug stayed latent. Making the comparison trust the hint converts every one of
+those latent contract violations into a dropped write, on a durability path, with no
+error anywhere. The cost asymmetry decides it: a full-block compare costs one copy per
+rmw; a wrong skip costs data. The shipped code compares the whole block and ignores the
+hint, and `rmw_block_skips_a_write_the_patch_did_not_change_bd_ygznx` asserts the
+load-bearing direction — a patch that writes OUTSIDE its declared range must still
+reach the device.
+
+**Ratio: none — this is unmeasured.** No claim is made here about fsync cost. The write
+count is a counting property asserted in a unit test, not a wall-clock row, and that
+test has never been compiled: the entry is banked under the build freeze. It must not
+be cited as a win until it is built, run, and measured against the incumbent in one
+invocation.
+
+**Transferable rule.** When a hot path takes a caller-supplied hint about *what
+changed*, that hint may be used to do LESS WORK, never to decide that a write can be
+SKIPPED — unless the hint is independently enforced. An optimization that reads a
+promise turns the caller's latent bug into this layer's silent corruption.
