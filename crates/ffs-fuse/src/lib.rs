@@ -2704,6 +2704,59 @@ const CAPABILITY_MEMO_SLOTS: usize = 4096;
 /// created to prevent. Sizing this knob is an experiment, not a policy.
 const CAPABILITY_MEMO_SLOTS_MAX: usize = 1 << 20;
 
+/// Slot count for a memo that must span a working set of `working_set` inodes
+/// (bd-kzfh2).
+///
+/// Rounded UP to a power of two so `slot` stays a mask, floored at
+/// [`CAPABILITY_MEMO_SLOTS`] so a policy can never make the shipping default
+/// worse, and capped at [`CAPABILITY_MEMO_SLOTS_MAX`]. `0` means "no measured
+/// working set" and yields the default rather than a degenerate table.
+///
+/// ⚠️ THE WORKING SET IS A DIRECTORY, NOT A FILESYSTEM, and that distinction
+/// kills one of bd-kzfh2's three candidate policies. The measured benefit is a
+/// capacity effect whose reuse distance is one directory PASS — it pays while the
+/// swept directory fits and decays monotonically once it does not. Filesystem
+/// inode count is a different quantity and is uncorrelated with maximum directory
+/// size: a 64M-inode filesystem of ten-entry directories needs 16 slots, and a
+/// 2,000-inode image with one 2,000-entry directory needs 2,048.
+///
+/// Sizing from the inode count also DEGENERATES, which is the decisive part. At
+/// mke2fs's default of one inode per 16 KiB, a 16 GiB filesystem already carries
+/// 1<<20 inodes, so `min(inodes, cap)` returns the cap for essentially every real
+/// filesystem. That policy is a fixed 8 MiB-per-mount table wearing a costume,
+/// saving memory only on images small enough not to have needed it. Pass a
+/// directory size here, never an inode count.
+///
+/// NOT wired into [`LastMissingCapabilityXattr::slots_from_env`], and that is
+/// deliberate rather than an omission. The two have opposite contracts: this is a
+/// POLICY and must never be able to make the shipping default worse, so it has a
+/// floor; `FFS_FUSE_CAPABILITY_MEMO_SLOTS` is an EXPERIMENT and must be able to
+/// request a table SMALLER than the default, which is how bd-m1bpu measured the
+/// capacity cliff in the first place. Sharing one function would silently take
+/// that away. This has no caller until a policy is chosen, which needs the
+/// measurements bd-kzfh2's acceptance lists.
+#[must_use]
+pub fn capability_memo_slots_for_working_set(working_set: usize) -> usize {
+    if working_set == 0 {
+        return CAPABILITY_MEMO_SLOTS;
+    }
+    working_set
+        .checked_next_power_of_two()
+        .unwrap_or(CAPABILITY_MEMO_SLOTS_MAX)
+        .clamp(CAPABILITY_MEMO_SLOTS, CAPABILITY_MEMO_SLOTS_MAX)
+}
+
+/// Resident bytes a capability memo of `slots` costs, per mount, for the mount's
+/// lifetime (bd-kzfh2, reported because bd-5vis3's bar requires it).
+///
+/// One `AtomicU64` per slot and nothing else — the table is allocated whole at
+/// construction, so this is exact rather than an estimate, and it is paid whether
+/// or not any directory is ever large enough to need it.
+#[must_use]
+pub fn capability_memo_resident_bytes(slots: usize) -> usize {
+    slots * std::mem::size_of::<AtomicU64>()
+}
+
 /// Lock-free cache of inodes observed to have no capability xattr.
 ///
 /// The kernel still sends each FUSE `GETXATTR` request; this only makes the
@@ -6814,6 +6867,92 @@ mod tests {
     /// So the polarity here is opt-OUT, the opposite of every other knob in this
     /// file, and unrecognised input must fail OPEN to the shipping default rather
     /// than closed. Only the three explicit spellings turn it off.
+    /// bd-kzfh2: the sizing primitive's floor, rounding and cap.
+    ///
+    /// A policy that could size BELOW the shipping default would be able to make
+    /// the default worse, so the floor is part of the contract, not a detail.
+    #[test]
+    fn capability_memo_sizing_rounds_floors_and_caps_bd_kzfh2() {
+        // No measured working set must not produce a degenerate table.
+        assert_eq!(
+            capability_memo_slots_for_working_set(0),
+            CAPABILITY_MEMO_SLOTS
+        );
+        // Anything at or under the default stays at the default — never smaller.
+        for small in [1, 2, 100, 4095, 4096] {
+            assert_eq!(
+                capability_memo_slots_for_working_set(small),
+                CAPABILITY_MEMO_SLOTS,
+                "a {small}-entry working set must not shrink the table below the default"
+            );
+        }
+        // Above it, round UP to a power of two so `slot` stays a mask.
+        assert_eq!(capability_memo_slots_for_working_set(4097), 8192);
+        assert_eq!(capability_memo_slots_for_working_set(32_768), 32_768);
+        assert_eq!(capability_memo_slots_for_working_set(100_000), 131_072);
+        // Capped, and no panic on a value whose next power of two overflows.
+        assert_eq!(
+            capability_memo_slots_for_working_set(usize::MAX),
+            CAPABILITY_MEMO_SLOTS_MAX,
+            "an absurd working set must clamp, not overflow"
+        );
+        for slots in [CAPABILITY_MEMO_SLOTS, 32_768, CAPABILITY_MEMO_SLOTS_MAX] {
+            assert!(capability_memo_slots_for_working_set(slots).is_power_of_two());
+        }
+    }
+
+    /// bd-kzfh2 / bd-5vis3: the reported footprint must reproduce the two figures
+    /// the ceiling's own doc comment claims, or one of them is wrong.
+    #[test]
+    fn capability_memo_footprint_matches_the_documented_bounds_bd_kzfh2() {
+        assert_eq!(
+            capability_memo_resident_bytes(CAPABILITY_MEMO_SLOTS),
+            32 * 1024,
+            "the default table is documented as 32 KiB per mount"
+        );
+        assert_eq!(
+            capability_memo_resident_bytes(CAPABILITY_MEMO_SLOTS_MAX),
+            8 * 1024 * 1024,
+            "the ceiling is documented as 8 MiB per mount"
+        );
+    }
+
+    /// bd-kzfh2: sizing from the FILESYSTEM's inode count degenerates to the cap,
+    /// which is why that candidate policy is not implemented.
+    ///
+    /// mke2fs defaults to one inode per 16 KiB, so a 16 GiB filesystem already
+    /// carries 1<<20 inodes. `min(inodes, cap)` therefore returns the cap for
+    /// essentially every real filesystem — a fixed 8 MiB-per-mount table, saving
+    /// memory only on images too small to have needed it, while the quantity that
+    /// actually drives the benefit is the size of the directory being swept.
+    #[test]
+    fn capability_memo_sizing_from_inode_count_degenerates_bd_kzfh2() {
+        const BYTES_PER_INODE: usize = 16 * 1024;
+        let inodes_in = |bytes: usize| bytes / BYTES_PER_INODE;
+
+        let sixteen_gib = 16 * 1024 * 1024 * 1024_usize;
+        assert_eq!(
+            inodes_in(sixteen_gib),
+            CAPABILITY_MEMO_SLOTS_MAX,
+            "a 16 GiB filesystem at mke2fs defaults already holds exactly the cap in inodes"
+        );
+        // So every filesystem at least this large lands on the ceiling...
+        for bytes in [sixteen_gib, 64 * sixteen_gib, 1024 * sixteen_gib] {
+            assert_eq!(
+                capability_memo_slots_for_working_set(inodes_in(bytes)),
+                CAPABILITY_MEMO_SLOTS_MAX,
+                "inode-count sizing pins any real filesystem to the ceiling"
+            );
+        }
+        // ...while the directory that actually needs the table may be tiny, and a
+        // directory-driven policy would give it the default instead of 8 MiB.
+        assert_eq!(
+            capability_memo_slots_for_working_set(10),
+            CAPABILITY_MEMO_SLOTS,
+            "ten-entry directories on a huge filesystem need the default, not the ceiling"
+        );
+    }
+
     /// bd-q0xnl: zero-message opendir must default OFF, and only an explicit
     /// affirmative may turn it on.
     ///
