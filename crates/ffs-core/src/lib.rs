@@ -29248,6 +29248,34 @@ impl OpenFs {
         }
     }
 
+    /// Bytes a tree-log leaf would occupy for `items`, and the capacity of one leaf:
+    /// `(needed, capacity)`.
+    ///
+    /// bd-dm01m. Extracted from `btrfs_prepare_tree_log_write` because this arithmetic
+    /// is the safety property of the accumulating tree log, and it was inline and
+    /// untested. Getting it wrong is not a small error in either direction:
+    /// over-estimating capacity admits a leaf that fails at `serialize` and takes the
+    /// fsync down with it, while under-estimating forces needless full commits and
+    /// quietly discards the entire point of the fast path.
+    ///
+    /// A leaf is `BTRFS_HEADER_SIZE` of header followed by, per item, a
+    /// `BTRFS_ITEM_SIZE` slot plus its data — the same accounting
+    /// `InMemoryCowBtrfsTree`'s byte budget uses, so the two agree by construction
+    /// rather than by coincidence.
+    ///
+    /// `saturating_sub` is deliberate: a `nodesize` smaller than the header is
+    /// nonsensical, and reporting a capacity of 0 makes every non-empty log refuse and
+    /// fall back to a full commit, which is the safe direction. Panicking or wrapping
+    /// here would turn a malformed superblock into a crash or an enormous capacity.
+    fn tree_log_leaf_usage(nodesize: u32, items: &[BtrfsTreeItem]) -> (usize, usize) {
+        let capacity = (nodesize as usize).saturating_sub(ffs_btrfs::BTRFS_HEADER_SIZE);
+        let needed = items
+            .iter()
+            .map(|it| ffs_btrfs::BTRFS_ITEM_SIZE.saturating_add(it.data.len()))
+            .fold(0_usize, usize::saturating_add);
+        (needed, capacity)
+    }
+
     fn btrfs_prepare_tree_log_write(
         sb: &BtrfsSuperblock,
         alloc: &mut BtrfsAllocState,
@@ -29272,19 +29300,14 @@ impl OpenFs {
         // The caller turns this into a FULL COMMIT, which is always correct — it
         // supersedes the log and clears the accumulator — and is exactly what kernel
         // btrfs does when its log cannot be used.
-        // Fully qualified: neither constant is imported bare into this crate — the
-        // only other use in this file is `ffs_btrfs::BTRFS_HEADER_SIZE`.
-        let leaf_budget =
-            (alloc.nodesize as usize).saturating_sub(ffs_btrfs::BTRFS_HEADER_SIZE);
-        let leaf_bytes: usize = items
-            .iter()
-            .map(|it| ffs_btrfs::BTRFS_ITEM_SIZE + it.data.len())
-            .sum();
-        if leaf_bytes > leaf_budget {
-            return Err(FfsError::UnsupportedFeature(
-                "btrfs tree log: accumulated fsync items exceed one leaf;                  the caller must fall back to a full transaction commit"
-                    .into(),
-            ));
+        let (leaf_bytes, leaf_capacity) = Self::tree_log_leaf_usage(alloc.nodesize, &items);
+        if leaf_bytes > leaf_capacity {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "btrfs tree log: {} accumulated fsync items need {leaf_bytes} bytes \
+                 against a {leaf_capacity}-byte leaf capacity; the caller must fall \
+                 back to a full transaction commit",
+                items.len()
+            )));
         }
 
         let (log_root, allocated_bytes, metadata_allocation) =
@@ -65034,6 +65057,69 @@ mod tests {
             0,
             "once persisted, the same totals must not be written again"
         );
+    }
+
+    /// bd-dm01m. The accumulating tree log is only safe because it refuses at one
+    /// leaf's capacity, and that arithmetic decides whether an fsync succeeds via the
+    /// log or falls back to a full commit. Both directions of error are expensive:
+    /// over-estimating capacity admits a leaf that fails at `serialize` and takes the
+    /// fsync with it; under-estimating forces needless full commits and discards the
+    /// point of the fast path. So the boundary is pinned exactly, not approximately.
+    #[test]
+    fn tree_log_leaf_usage_pins_the_one_leaf_boundary_bd_dm01m() {
+        let nodesize: u32 = 16384;
+        let capacity = nodesize as usize - ffs_btrfs::BTRFS_HEADER_SIZE;
+
+        // Empty log: no items, full capacity, and it must not refuse.
+        let (needed, cap) = OpenFs::tree_log_leaf_usage(nodesize, &[]);
+        assert_eq!((needed, cap), (0, capacity));
+
+        let item = |len: usize| BtrfsTreeItem {
+            key: BtrfsKey {
+                objectid: 256,
+                item_type: 1,
+                offset: 0,
+            },
+            data: vec![0_u8; len].into(),
+        };
+
+        // One item costs its slot PLUS its data, not just its data — the slot is the
+        // half an accounting bug would drop.
+        let (needed, _) = OpenFs::tree_log_leaf_usage(nodesize, &[item(100)]);
+        assert_eq!(needed, ffs_btrfs::BTRFS_ITEM_SIZE + 100);
+
+        // EXACTLY full must FIT: the check is `needed` strictly greater than
+        // `capacity`, so a leaf filled to the byte is usable and must not trigger a
+        // full-commit fallback.
+        let exact = capacity - ffs_btrfs::BTRFS_ITEM_SIZE;
+        let (needed, cap) = OpenFs::tree_log_leaf_usage(nodesize, &[item(exact)]);
+        assert_eq!(
+            needed, cap,
+            "a leaf filled to the byte must report needed == capacity"
+        );
+        assert!(
+            needed <= cap,
+            "exactly-full must not be treated as overflow"
+        );
+
+        // One byte past a full leaf must NOT fit. This is the assertion that catches an
+        // off-by-one in either the header or the slot accounting.
+        let (needed, cap) = OpenFs::tree_log_leaf_usage(nodesize, &[item(exact + 1)]);
+        assert!(
+            cap < needed,
+            "one byte past a full leaf must overflow: needed={needed} capacity={cap}"
+        );
+
+        // Many items accumulate, which is the bd-dm01m behaviour being bounded.
+        let items: Vec<BtrfsTreeItem> = (0..10).map(|_| item(64)).collect();
+        let (needed, _) = OpenFs::tree_log_leaf_usage(nodesize, &items);
+        assert_eq!(needed, 10 * (ffs_btrfs::BTRFS_ITEM_SIZE + 64));
+
+        // A nodesize smaller than the header is nonsensical; capacity must saturate to
+        // 0 so every non-empty log refuses, rather than wrapping to a huge capacity.
+        let (needed, cap) = OpenFs::tree_log_leaf_usage(8, &[item(1)]);
+        assert_eq!(cap, 0, "a sub-header nodesize must report zero capacity");
+        assert!(cap < needed, "and must therefore refuse rather than wrap");
     }
 
     /// bd-sv7ql. The tree-log publish must put a BARRIER between the log node and
