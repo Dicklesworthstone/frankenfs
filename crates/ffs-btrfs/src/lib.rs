@@ -6452,7 +6452,99 @@ struct PinnedExtent {
 /// Default btrfs node size (16 KiB), used until the real superblock value is set.
 const BTRFS_DEFAULT_NODESIZE: u64 = 16384;
 
+/// Why an allocation found no room, in the terms that separate bd-uxh7t's two
+/// candidate mechanisms. Produced by `BtrfsExtentAllocator::describe_no_space`
+/// at the moment `NoSpace` is returned; carries no policy.
+///
+/// `used` counts bytes described by live extent items. `pinned` counts bytes held
+/// out of allocation because the committed superblock still points at them — the
+/// previous tree, during a commit that is writing the new one at fresh addresses.
+/// A group whose `used + pinned` approaches `total` while `used` alone does not is
+/// short of space only for the duration of the commit; a group whose `used` alone
+/// fills it needs another chunk, which this allocator cannot create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoSpaceReport {
+    /// Bytes the failing request asked for.
+    pub num_bytes: u64,
+    /// Block-group flag mask the request required (data / metadata / system).
+    pub required_flags: u64,
+    /// How many block groups carried at least one of `required_flags`. Zero means
+    /// the filesystem has no group of that kind at all, which is a different
+    /// failure from every matching group being full.
+    pub matching_groups: usize,
+    /// Sum of `total_bytes` over the matching groups.
+    pub total_bytes: u64,
+    /// Sum of `used_bytes` over the matching groups.
+    pub used_bytes: u64,
+    /// Sum of pinned extent bytes lying inside the matching groups.
+    pub pinned_bytes: u64,
+    /// The largest single-group `free_bytes()` among them — an allocation of at
+    /// most this size could still fail on fragmentation, and one larger than it
+    /// could not have been placed by accounting alone.
+    pub largest_free: u64,
+}
+
+impl NoSpaceReport {
+    /// True when pinned bytes are what the request is short of: accounting alone
+    /// leaves room for it, but the pinned previous tree does not. This is the
+    /// "needs twice the metadata footprint for one commit" shape.
+    #[must_use]
+    pub fn is_pin_bound(&self) -> bool {
+        self.largest_free >= self.num_bytes && self.pinned_bytes > 0
+    }
+}
+
 impl BtrfsExtentAllocator {
+    /// Describe why a request for `num_bytes` with `required_flags` found no
+    /// block group, in the terms that decide bd-uxh7t.
+    ///
+    /// A bare `NoSpace` reaching the client as `ENOSPC` says nothing about which
+    /// resource ran out, and the two candidate mechanisms need opposite fixes:
+    ///
+    /// * the matching block groups are genuinely FULL of live extent items — the
+    ///   filesystem needs another chunk, which this allocator cannot create
+    ///   (block groups come only from the chunk map read at mount,
+    ///   `load_btrfs_alloc_state`), so it is a capability gap against the kernel,
+    ///   which allocates a new chunk from unallocated device space; or
+    /// * the space is held by PINNED extents — the blocks of the trees the
+    ///   committed superblock still points at, which a full commit pins before
+    ///   deleting their extent items (`remove_metadata_items_owned_by_roots`).
+    ///   A commit that rewrites the whole tree at fresh addresses therefore needs
+    ///   the OLD tree and the NEW tree to fit in the group simultaneously, i.e.
+    ///   twice the metadata footprint, and that doubles with file count.
+    ///
+    /// `used` versus `pinned` is exactly what separates those, so both are
+    /// reported per group. This is a report, not a policy: it changes no
+    /// allocation decision and cannot fix either mechanism.
+    fn describe_no_space(&self, num_bytes: u64, required_flags: u64) -> NoSpaceReport {
+        let mut report = NoSpaceReport {
+            num_bytes,
+            required_flags,
+            matching_groups: 0,
+            total_bytes: 0,
+            used_bytes: 0,
+            pinned_bytes: 0,
+            largest_free: 0,
+        };
+        for bg in self.block_groups.values() {
+            if (bg.item.flags & required_flags) == 0 {
+                continue;
+            }
+            let bg_end = bg.start.saturating_add(bg.item.total_bytes);
+            let pinned: u64 = self
+                .pinned
+                .range(bg.start..bg_end)
+                .map(|(_, pin)| pin.num_bytes)
+                .sum();
+            report.matching_groups += 1;
+            report.total_bytes = report.total_bytes.saturating_add(bg.item.total_bytes);
+            report.used_bytes = report.used_bytes.saturating_add(bg.item.used_bytes);
+            report.pinned_bytes = report.pinned_bytes.saturating_add(pinned);
+            report.largest_free = report.largest_free.max(bg.item.free_bytes());
+        }
+        report
+    }
+
     /// Create a new extent allocator with an empty extent tree.
     pub fn new(generation: u64) -> Result<Self, BtrfsMutationError> {
         let extent_tree = InMemoryCowBtrfsTree::new(5)?;
@@ -7251,7 +7343,26 @@ impl BtrfsExtentAllocator {
             .find(|bg| (bg.item.flags & required_flags) != 0 && bg.item.free_bytes() >= num_bytes)
             .map(|bg| bg.start);
 
-        let bg_start = bg_start.ok_or(BtrfsMutationError::NoSpace)?;
+        let Some(bg_start) = bg_start else {
+            // bd-uxh7t: a bare ENOSPC at the client says nothing about which
+            // resource ran out. Report used-vs-pinned, which is what separates
+            // "these groups are full and the filesystem needs another chunk"
+            // from "the previous tree is pinned for the duration of this commit".
+            let report = self.describe_no_space(num_bytes, required_flags);
+            warn!(
+                target: "ffs::btrfs::alloc",
+                needed = num_bytes,
+                required_flags,
+                matching_groups = report.matching_groups,
+                total = report.total_bytes,
+                used = report.used_bytes,
+                pinned = report.pinned_bytes,
+                largest_free = report.largest_free,
+                pin_bound = report.is_pin_bound(),
+                "alloc_no_space_no_block_group"
+            );
+            return Err(BtrfsMutationError::NoSpace);
+        };
 
         debug!(
             target: "ffs::btrfs::alloc",
@@ -7356,9 +7467,26 @@ impl BtrfsExtentAllocator {
 
         // bytenr 0 is the btrfs hole/none sentinel and must never back a real
         // extent; refuse it defensively rather than corrupt data (bd-5aybu).
-        let bytenr = found
-            .filter(|&b| b != 0)
-            .ok_or(BtrfsMutationError::NoSpace)?;
+        let Some(bytenr) = found.filter(|&b| b != 0) else {
+            // Distinct from the case above and more informative: a group WAS
+            // selected on its accounting, so `free_bytes()` said there was room,
+            // and the gap search still could not place the extent. That is
+            // fragmentation or pinning, never a plain "disk full" (bd-uxh7t).
+            let report = self.describe_no_space(num_bytes, required_flags);
+            warn!(
+                target: "ffs::btrfs::alloc",
+                needed = num_bytes,
+                required_flags,
+                block_group = bg_start,
+                total = report.total_bytes,
+                used = report.used_bytes,
+                pinned = report.pinned_bytes,
+                largest_free = report.largest_free,
+                pin_bound = report.is_pin_bound(),
+                "alloc_no_space_no_gap_in_group"
+            );
+            return Err(BtrfsMutationError::NoSpace);
+        };
         let extent = ExtentKey { bytenr, num_bytes };
 
         debug!(
@@ -17443,6 +17571,91 @@ mod tests {
     }
 
     // ── Extent allocator tests ──────────────────────────────────────────
+
+    /// bd-uxh7t. The whole point of the report is to separate two failures that
+    /// arrive as the identical `ENOSPC`, so the test asserts the SEPARATION, not
+    /// that the fields are populated.
+    ///
+    /// Mechanism A — the matching groups are full of live extent items. The
+    /// filesystem needs another chunk, and this allocator cannot create one:
+    /// block groups come only from the chunk map read at mount. That is a
+    /// capability gap against kernel btrfs, which allocates a new chunk from
+    /// unallocated device space.
+    ///
+    /// Mechanism B — accounting leaves room, but the space is PINNED: the blocks
+    /// of the tree the committed superblock still points at, held until the new
+    /// superblock lands. A commit that rewrites the whole tree at fresh addresses
+    /// needs the old and new trees to fit at once, so it needs twice the metadata
+    /// footprint, and that doubles with file count rather than with the workload.
+    ///
+    /// `is_pin_bound` must be true for B and false for A, or the report cannot do
+    /// the job it exists for.
+    #[test]
+    fn no_space_report_separates_a_full_group_from_a_pinned_one_bd_uxh7t() {
+        let meta_start = 0x1_0000_u64;
+        let meta_size = 0x10_000_u64; // 64 KiB
+        let node = 0x4000_u64; // 16 KiB
+
+        // ── Mechanism A: used bytes fill the group. ──────────────────────────
+        let mut full = BtrfsExtentAllocator::new(1).expect("allocator");
+        full.add_block_group(
+            meta_start,
+            BtrfsBlockGroupItem {
+                total_bytes: meta_size,
+                used_bytes: meta_size,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+
+        let report = full.describe_no_space(node, BTRFS_BLOCK_GROUP_METADATA);
+        assert_eq!(report.matching_groups, 1);
+        assert_eq!(report.largest_free, 0, "a full group has no free bytes");
+        assert_eq!(report.pinned_bytes, 0, "nothing is pinned in this case");
+        assert!(
+            !report.is_pin_bound(),
+            "a genuinely full group must NOT be reported as pin-bound — that would \
+             point the fix at the commit protocol when it belongs at chunk allocation"
+        );
+
+        // ── Mechanism B: accounting has room, pins do not. ───────────────────
+        let mut pinned = BtrfsExtentAllocator::new(1).expect("allocator");
+        // Half the group is live tree, and that half is pinned because the
+        // committed superblock still points at it.
+        pinned.add_block_group(
+            meta_start,
+            BtrfsBlockGroupItem {
+                total_bytes: meta_size,
+                used_bytes: meta_size / 2,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+        pinned.pin_extent(meta_start, meta_size / 2, false);
+
+        let report = pinned.describe_no_space(node, BTRFS_BLOCK_GROUP_METADATA);
+        assert_eq!(report.matching_groups, 1);
+        assert_eq!(report.pinned_bytes, meta_size / 2);
+        assert!(
+            report.largest_free >= node,
+            "accounting must still show room for the request, or this is not \
+             mechanism B: free={} needed={node}",
+            report.largest_free
+        );
+        assert!(
+            report.is_pin_bound(),
+            "space held by the previous tree must be reported as pin-bound"
+        );
+
+        // ── The third case, which is neither: no metadata group at all. ──────
+        let mut data_only = BtrfsExtentAllocator::new(1).expect("allocator");
+        data_only.add_block_group(meta_start, make_data_bg(meta_start, meta_size));
+        let report = data_only.describe_no_space(node, BTRFS_BLOCK_GROUP_METADATA);
+        assert_eq!(
+            report.matching_groups, 0,
+            "a filesystem with no metadata group must report zero matching groups, \
+             which is a different failure from every matching group being full"
+        );
+        assert!(!report.is_pin_bound());
+    }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
         BtrfsBlockGroupItem {
