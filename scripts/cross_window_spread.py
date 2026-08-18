@@ -147,6 +147,120 @@ def admission_skew(groups: dict) -> list[tuple]:
     return sorted(out, key=lambda row: -(row[1] / row[2]))
 
 
+# Knob name as the daemon self-reports it -> the environment variable that sets it.
+# Every pair below was read out of the source, not inferred from the name: two of
+# them are not guessable (count_memoized_requests is FFS_D9378_COUNT_MEMOIZED, and
+# fuse_dispatch_workers is FFS_FUSE_WORKERS), and a rerun that sets the wrong
+# variable reproduces a DIFFERENT configuration while looking correct — which is
+# the precise failure this whole tool exists to prevent.
+KNOB_ENV = {
+    "count_memoized_requests": "FFS_D9378_COUNT_MEMOIZED",
+    "fuse_dispatch_workers": "FFS_FUSE_WORKERS",
+    "capability_memo": "FFS_FUSE_CAPABILITY_MEMO",
+    "capability_memo_slots": "FFS_FUSE_CAPABILITY_MEMO_SLOTS",
+    "capability_memo_bitmap": "FFS_FUSE_CAPABILITY_MEMO_BITMAP",
+    "io_uring": "FFS_FUSE_IO_URING",
+    "io_uring_queue_depth": "FFS_FUSE_IO_URING_QUEUE_DEPTH",
+    "io_uring_payload_bytes": "FFS_FUSE_IO_URING_PAYLOAD_BYTES",
+    "splice": "FFS_FUSE_SPLICE",
+    "receive_spin": "FFS_FUSE_RECEIVE_SPIN",
+    "readdirplus_attr_memo": "FFS_FUSE_READDIRPLUS_ATTR_MEMO",
+    "readdirplus_batch_attrs": "FFS_FUSE_READDIRPLUS_BATCH_ATTRS",
+    "readdirplus_inode_order": "FFS_FUSE_READDIRPLUS_INODE_ORDER",
+}
+
+
+def knob_env(knobs: str) -> list[str]:
+    """Translate a self-reported knob line into VAR=value assignments."""
+    out = []
+    for field in knobs.split(","):
+        name, _, value = field.partition("=")
+        var = KNOB_ENV.get(name.strip())
+        if var and value:
+            out.append(f"{var}={value.strip()}")
+    return out
+
+
+def rerun_command(fs: dict, knobs: str) -> list[str]:
+    """The comparator invocation that reproduces one banked row's configuration.
+
+    Only flags that exist are emitted (checked against the binary's own argument
+    list), and only fields the report actually recorded. A field the report does
+    not carry is left off rather than guessed — the run then uses the harness
+    default, which is what produced the row in the first place.
+    """
+    argv = ["ffs-mounted-kernel-bench"]
+    simple = [
+        ("--filesystem", fs.get("filesystem")),
+        ("--workload", fs.get("workload")),
+        ("--pairs", fs.get("pairs")),
+        ("--client-threads", fs.get("requested_client_threads")),
+        ("--operations", fs.get("operations_per_observation")),
+        ("--placement-scope", fs.get("placement_scope")),
+        ("--observation-repeats", fs.get("observation_repeats")),
+        ("--maximum-null-ratio", fs.get("maximum_null_ratio")),
+        ("--fixture-construction", fs.get("fixture_construction")),
+    ]
+    for flag, value in simple:
+        if value is not None:
+            argv += [flag, str(value)]
+    verify = fs.get("btrfs_verify_data_on_read")
+    if verify is not None:
+        argv += ["--btrfs-verify-data-on-read", "true" if verify else "false"]
+    return argv
+
+
+def emit_rerun_plan(paths: list[Path]) -> int:
+    """Print, for each row lacking a second ADMITTED run, the command to get one.
+
+    bd-4sull item 1 is the expensive half of that bead: 35 of 38 like-for-like
+    groups have never been re-run, and the reason is partly that nobody knows what
+    to type. Every field needed is already in the report, so this reconstructs it.
+
+    Ordered by how close a group is to being paired — a group with ONE admitted run
+    needs a single run to become a cross-window pair, so it is worth more than a
+    group with none, which needs two and may not admit at all.
+    """
+    groups: dict = defaultdict(list)
+    for path in paths:
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for fs in doc.get("filesystems", []):
+            ratio = (fs.get("fuse_over_kernel") or {}).get("median")
+            if not isinstance(ratio, (int, float)) or ratio <= 0:
+                continue
+            groups[group_key(doc, fs)].append(fs)
+
+    unpaired = []
+    for key, members in groups.items():
+        admitted = [m for m in members if m.get("admitted") is True]
+        if len(admitted) < 2:
+            # Prefer an admitted exemplar: its configuration is one that HAS
+            # cleared the gate, so re-running it is the likeliest to pair.
+            unpaired.append((key, admitted[0] if admitted else members[0], len(admitted)))
+
+    unpaired.sort(key=lambda row: (-row[2], str(row[0][2]), str(row[0][3])))
+    print(f"# bd-4sull item 1: {len(unpaired)} like-for-like group(s) lack a second ADMITTED run")
+    print("# Ordered by how close each is to being paired (1 admitted run first).")
+    print("# Set the env EXACTLY as shown: a rerun with different knobs is a different")
+    print("# experiment, and cross_window_spread.py will (correctly) refuse to group it")
+    print("# with the row you were trying to reproduce.")
+    for key, exemplar, n_admitted in unpaired:
+        knobs = fuse_runtime_knobs(exemplar)
+        print()
+        print(
+            f"# {exemplar.get('filesystem')} {exemplar.get('workload')} "
+            f"elf={key[0]} admitted_runs={n_admitted}"
+        )
+        env = knob_env(knobs)
+        prefix = " ".join(env)
+        argv = " ".join(rerun_command(exemplar, knobs))
+        print(f"{prefix + ' ' if prefix else ''}{argv}")
+    return 0
+
+
 def selftest() -> int:
     failures = []
     doc_a = {"ffs_binary_sha256": "a" * 64}
@@ -207,6 +321,33 @@ def selftest() -> int:
     elif abs(skew[0][1] - 2.0) > 1e-9 or abs(skew[0][2] - 4.0) > 1e-9:
         failures.append("admission_skew put the medians on the wrong side")
 
+    # The knob translation is the part that silently produces a WRONG rerun, so it
+    # is checked against the two names that are not guessable from the knob.
+    env = knob_env("count_memoized_requests=true,fuse_dispatch_workers=4,splice=false")
+    if "FFS_D9378_COUNT_MEMOIZED=true" not in env:
+        failures.append("count_memoized_requests maps to FFS_D9378_COUNT_MEMOIZED")
+    if "FFS_FUSE_WORKERS=4" not in env:
+        failures.append("fuse_dispatch_workers maps to FFS_FUSE_WORKERS")
+    if "FFS_FUSE_SPLICE=false" not in env:
+        failures.append("splice maps to FFS_FUSE_SPLICE")
+    if knob_env("not_a_knob=1"):
+        failures.append("an unknown knob must be dropped, not invented")
+    cmd = rerun_command(
+        {
+            "filesystem": "btrfs",
+            "workload": "warm_stat",
+            "pairs": 12,
+            "btrfs_verify_data_on_read": True,
+        },
+        "",
+    )
+    if "--pairs" not in cmd or "12" not in cmd:
+        failures.append("recorded fields must reach the command")
+    if "--client-threads" in cmd:
+        failures.append("a field the report does not carry must be OMITTED, not guessed")
+    if "--btrfs-verify-data-on-read" not in cmd or "true" not in cmd:
+        failures.append("the verify flag must be emitted from the recorded boolean")
+
     for f in failures:
         print(f"SELFTEST FAIL: {f}", file=sys.stderr)
     if failures:
@@ -224,6 +365,12 @@ def main() -> int:
     parser.add_argument("reports", nargs="*", type=Path)
     parser.add_argument("--survey", type=Path, help="walk this root for reports")
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument(
+        "--rerun-plan",
+        action="store_true",
+        help="emit the invocation that would give each unpaired row a second "
+        "ADMITTED run (bd-4sull item 1)",
+    )
     args = parser.parse_args()
 
     if args.selftest:
@@ -236,6 +383,10 @@ def main() -> int:
         sys.exit("give report paths or --survey ROOT")
 
     groups = collect(paths)
+
+    if args.rerun_plan:
+        return emit_rerun_plan(paths)
+
     all_rows = spreads(groups, admitted_only=False)
     adm_rows = spreads(groups, admitted_only=True)
 
