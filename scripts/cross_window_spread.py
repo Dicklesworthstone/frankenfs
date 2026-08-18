@@ -51,6 +51,20 @@ def fuse_runtime_knobs(fs: dict) -> str:
     return ""
 
 
+# Report fields that change WHAT WAS MEASURED rather than when, and so must split
+# a group (bd-6kpp4). Not runtime knobs -- those come from fuse_runtime_knobs --
+# but recorded configuration the harness sets per run.
+#
+# btrfs_verify_data_on_read is the concrete case and it is not hypothetical: the
+# product default was flipped false -> true on 2026-08-15 (1c85fc23, and the
+# harness default in e54146ee) while the bead meant to decide it sat blocked. Every
+# surviving btrfs report in the bank is verify=ON, so nothing mixes TODAY -- but
+# bd-6kpp4 item 3 is precisely a verify-on-vs-off 2x2, and the moment its runs land
+# a key without this would merge the two arms and report the checksum cost as
+# irreproducibility.
+CONFIG_FIELDS = ("btrfs_verify_data_on_read", "cache_regime", "fixture_construction")
+
+
 def group_key(doc: dict, fs: dict) -> tuple:
     return (
         str(doc.get("ffs_binary_sha256"))[:12],
@@ -61,7 +75,7 @@ def group_key(doc: dict, fs: dict) -> tuple:
         fs.get("placement_scope"),
         fs.get("requested_client_threads"),
         fs.get("operations_per_observation"),
-    )
+    ) + tuple(fs.get(field) for field in CONFIG_FIELDS)
 
 
 def collect(paths: list[Path]) -> dict:
@@ -123,6 +137,13 @@ def selftest() -> int:
     # Different ELF must not be grouped together.
     if group_key(doc_a, fs_common) == group_key({"ffs_binary_sha256": "b" * 64}, fs_common):
         failures.append("differing ELF must split the group")
+    # bd-6kpp4: a recorded configuration difference is a different EXPERIMENT, not a
+    # different window. Checked for every field, so adding one cannot be forgotten.
+    for field in CONFIG_FIELDS:
+        flipped = dict(fs_common)
+        flipped[field] = "OTHER"
+        if group_key(doc_a, fs_common) == group_key(doc_a, flipped):
+            failures.append(f"differing {field} must split the group")
     # admitted_only really filters.
     groups = {
         ("k",): [
@@ -144,7 +165,9 @@ def selftest() -> int:
         print(f"SELFTEST FAIL: {f}", file=sys.stderr)
     if failures:
         return 1
-    print("selftest OK: knob/ELF splitting, admitted filtering, single-run rejection")
+    print(
+        "selftest OK: knob/ELF/config splitting, admitted filtering, single-run rejection"
+    )
     return 0
 
 
