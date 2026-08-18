@@ -308,6 +308,39 @@ WORKER_SCOPE_BASELINE = 166
 # saying where its daemon ran. Discovered by --placement-audit; do not raise it.
 PLACEMENT_SCOPE_BASELINE = 39
 
+# Forward-only ratchet for bd-4sull item 3, seeded from the tree at the time it
+# was added. Same contract as the two above: a floor that may only FALL. It does
+# not retract a banked row; it stops a NEW competitive ratio being banked without
+# the incumbent's ABSOLUTE median beside it.
+#
+# WHY A RATIO ALONE IS NOT ENOUGH, and this is measured rather than argued. A row
+# is a quotient, so incumbent volatility lands in the published number even when
+# our own cost is stable: across four runs of one ELF, FrankenFS held
+# 232.11/225.22/225.31/222.39 ms while the kernel arm held 77.05/77.31/78.42 and
+# then 83.69 ms — our arm moved -1.30% and the incumbent moved +8.26%. With only
+# the ratio transcribed, that is undiagnosable after the fact.
+#
+# And "look it up in the report" does not survive contact with this host: the
+# 2026-07-31 bulk-durable row could not be diagnosed because its report had been
+# deleted (bd-v0igv), and 45 of 46 banked reports were reaped once already. The
+# ledger row is the only durable artefact, so the number has to be IN it.
+# Discovered by --incumbent-absolute-audit; do not raise it.
+INCUMBENT_ABSOLUTE_BASELINE: int | None = 98
+
+# An absolute incumbent cost, in any of the forms the ledger actually uses: the
+# harness's own machine-readable key, or prose naming the kernel/incumbent arm
+# next to a time unit. Deliberately does NOT accept a bare number near the word
+# "kernel" — "kernel 6.17.0-41" would match and the row would pass while carrying
+# no measurement at all.
+INCUMBENT_ABSOLUTE = re.compile(
+    r"kernel_median_wall_ns\s*[=:]"
+    r"|kernel_operations_per_second\s*[=:]"
+    r"|incumbent_median_wall_ns\s*[=:]"
+    r"|(?:kernel|incumbent)[^|\n]{0,60}?\b\d+(?:[.,]\d+)?\s*(?:ns|us|\u00b5s|ms|s)\b"
+    r"|\b\d+(?:[.,]\d+)?\s*(?:ns|us|\u00b5s|ms|s)\b[^|\n]{0,60}?(?:kernel|incumbent)",
+    re.I,
+)
+
 BOOTSTRAP = re.compile(r"\bbootstrap(?:ped|ping)?\b|\bresampl(?:e|ed|es|ing)\b", re.I)
 MEDIAN = re.compile(r"\bmedian\b", re.I)
 CONFIDENCE_INTERVAL = re.compile(r"\bCI\b|\bconfidence interval\b", re.I)
@@ -450,6 +483,26 @@ class Row:
             self.verdict == "KEEP"
             and not self.has_worker_identity()
             and bool(INCUMBENT_RATIO.search(decision_evidence(self.text)))
+        )
+
+    def lacks_incumbent_absolute(self) -> bool:
+        """A banked competitive claim that transcribes the QUOTIENT but not the
+        incumbent's absolute cost (bd-4sull item 3).
+
+        Third sibling of is_worker_scoped_ratio (which machine) and
+        is_placement_scoped_mounted_ratio (where on it). This one asks what the
+        INCUMBENT actually cost, because a ratio cannot be re-derived into its
+        parts, and incumbent volatility lands in the published number even when
+        our own cost is stable.
+
+        Same narrowing as its siblings: a KEEP quoting no vs-incumbent ratio makes
+        no competitive claim, so it is out of scope.
+        """
+        if self.verdict != "KEEP":
+            return False
+        evidence = decision_evidence(self.text)
+        return bool(INCUMBENT_RATIO.search(evidence)) and not INCUMBENT_ABSOLUTE.search(
+            evidence
         )
 
     def is_placement_scoped_mounted_ratio(self) -> bool:
@@ -936,6 +989,47 @@ def placement_scoped_rows(rows: list[Row] | None = None) -> list[Row]:
     ]
 
 
+def incumbent_absolute_missing_rows(rows: list[Row] | None = None) -> list[Row]:
+    return [
+        r for r in (all_rows() if rows is None else rows) if r.lacks_incumbent_absolute()
+    ]
+
+
+def cmd_incumbent_absolute_audit(list_rows: bool) -> int:
+    """Enumerate banked competitive ratios that never record the incumbent's cost.
+
+    bd-4sull item 3. The bead calls this the cheap one that stops the class of
+    question recurring, and the reason is durability: reports are reaped on this
+    host (45 of 46 once already, and the 2026-07-31 bulk-durable row was left
+    undiagnosable by exactly that), so the ledger row is the only artefact that
+    survives. A ratio alone cannot be decomposed after the fact.
+    """
+    scoped = incumbent_absolute_missing_rows()
+    n = len(scoped)
+    print(f"incumbent-absolute-audit: {n} banked KEEP ratio(s) carry no incumbent median")
+    if list_rows:
+        for r in scoped:
+            print(f"  {r.ref}\n    {r.title[:160]}")
+    if INCUMBENT_ABSOLUTE_BASELINE is None:
+        print(
+            f"\nincumbent-absolute-audit: baseline UNSEEDED - {n} row(s) found. Set "
+            f"INCUMBENT_ABSOLUTE_BASELINE = {n} to arm the ratchet. Measured stake: "
+            "admitted rows re-measure ~10% between windows (median 1.1022x over the "
+            "3 like-for-like groups that have a second admitted run), against a "
+            "published CI of 0.5-1%; with only the quotient banked, none of that "
+            "can be attributed to an arm after the report is reaped."
+        )
+        return 0
+    if n > INCUMBENT_ABSOLUTE_BASELINE:
+        print(
+            f"incumbent-absolute-audit: FAIL - {n} exceeds the "
+            f"{INCUMBENT_ABSOLUTE_BASELINE} floor; a new competitive ratio was banked "
+            "without the incumbent's absolute median. Record it in the row."
+        )
+        return 1
+    return 0
+
+
 def cmd_placement_audit(list_rows: bool) -> int:
     """Enumerate the banked MOUNTED ratios that never say where the daemon ran.
 
@@ -997,7 +1091,7 @@ def cmd_placement_audit(list_rows: bool) -> int:
     return 0
 
 
-def _placement_scope_ratchet_checks() -> list[tuple[bool, str]]:
+def _placement_scope_ratchet_checks() -> list[tuple[str, bool]]:
     """bd-plt79: the mounted-placement ratchet, and the predicate under it.
 
     Pinned to the same shape as the worker-scope checks so the two cannot drift:
@@ -1026,20 +1120,72 @@ def _placement_scope_ratchet_checks() -> list[tuple[bool, str]]:
     )
     return [
         (
-            undeclared.is_placement_scoped_mounted_ratio(),
             "a mounted ratio declaring no daemon placement is placement-scoped",
+            undeclared.is_placement_scoped_mounted_ratio(),
         ),
         (
-            not declared.is_placement_scoped_mounted_ratio(),
             "placement_scope=/--fuse-cpus clears the placement scope",
+            not declared.is_placement_scoped_mounted_ratio(),
         ),
         (
-            not no_ratio.is_placement_scoped_mounted_ratio(),
             "a mounted row quoting no incumbent ratio is out of placement scope",
+            not no_ratio.is_placement_scoped_mounted_ratio(),
         ),
         (
-            len(placement_scoped_rows()) == PLACEMENT_SCOPE_BASELINE,
             f"placement ratchet holds at {PLACEMENT_SCOPE_BASELINE}",
+            len(placement_scoped_rows()) == PLACEMENT_SCOPE_BASELINE,
+        ),
+    ] + _incumbent_absolute_selftests()
+
+
+def _incumbent_absolute_selftests() -> list[tuple[str, bool]]:
+    """bd-4sull item 3. Kept separate so the discriminations are readable.
+
+    The regex has to reject two things that LOOK like an incumbent measurement and
+    are not: a kernel VERSION string, and our own arm's absolute time. Both appear
+    verbatim in banked rows, so both are tested rather than assumed.
+    """
+    def keep(body: str) -> Row:
+        return Row(Path("x.md"), 1, "## 2026-08-16 - KEEP: m (bd-x)\n" + body, "KEEP")
+
+    ratio = "mounted 5.753947x SLOWER than kernel ext4, ci95 [5.642761, 5.776242]. "
+    return [
+        (
+            "a competitive ratio with no incumbent absolute is flagged",
+            keep(ratio).lacks_incumbent_absolute(),
+        ),
+        (
+            "the harness key clears it",
+            not keep(ratio + "kernel_median_wall_ns=47935843.").lacks_incumbent_absolute(),
+        ),
+        (
+            "prose naming the incumbent beside a time clears it",
+            not keep(ratio + "the kernel arm held 77.05 ms.").lacks_incumbent_absolute(),
+        ),
+        (
+            "a kernel VERSION is not a measurement and must not clear it",
+            keep(ratio + "kernel 6.17.0-41-generic.").lacks_incumbent_absolute(),
+        ),
+        (
+            "OUR arm's absolute time is not the incumbent's and must not clear it",
+            keep(ratio + "fuse_median_wall_ns=275860548 (13.792 us/op).").lacks_incumbent_absolute(),
+        ),
+        (
+            "a KEEP quoting no vs-incumbent ratio is out of scope",
+            not Row(
+                Path("x.md"),
+                1,
+                "## 2026-08-16 - KEEP: m (bd-x)\ncounted 4000 probes -> 4000 probes.\n",
+                "KEEP",
+            ).lacks_incumbent_absolute(),
+        ),
+        (
+            "a REJECT makes no competitive claim and is out of scope",
+            not Row(Path("x.md"), 1, "## 2026-08-16 - REJECT: m (bd-x)\n" + ratio, "REJECT").lacks_incumbent_absolute(),
+        ),
+        (
+            f"incumbent-absolute ratchet holds at {INCUMBENT_ABSOLUTE_BASELINE}",
+            len(incumbent_absolute_missing_rows()) == INCUMBENT_ABSOLUTE_BASELINE,
         ),
     ]
 
@@ -1822,6 +1968,9 @@ def main() -> int:
     g.add_argument("--placement-audit", action="store_true",
                    help="enumerate banked MOUNTED ratios that never say where the "
                         "FUSE daemon ran (bd-plt79; sibling of --worker-scope)")
+    g.add_argument("--incumbent-absolute-audit", action="store_true",
+                   help="enumerate banked competitive ratios that record no "
+                        "INCUMBENT absolute median (bd-4sull item 3)")
     g.add_argument("--incumbent-audit", action="store_true",
                    help="how many KEEP claims carry a live same-invocation "
                         "incumbent ratio, and why the rest do not")
@@ -1846,6 +1995,8 @@ def main() -> int:
         return cmd_worker_scope(a.list)
     if a.placement_audit:
         return cmd_placement_audit(a.list)
+    if a.incumbent_absolute_audit:
+        return cmd_incumbent_absolute_audit(a.list)
     if a.incumbent_audit:
         return cmd_incumbent_audit(a.show)
     if a.candidate:
