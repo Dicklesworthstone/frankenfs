@@ -30052,6 +30052,26 @@ impl OpenFs {
                 BTRFS_EXTENT_TREE_OBJECTID,
                 BTRFS_FS_TREE_OBJECTID,
                 BTRFS_CSUM_TREE_OBJECTID,
+                // bd-0ajub: the LAST live tree-log block. Every ephemeral fsync
+                // rotates its log block and hands the superseded one back to be
+                // freed, but the FINAL one never was — a full commit retires the
+                // log (bd-mogn1 clears `log_root`) while its block stayed
+                // allocated, extent item intact, for the life of the filesystem.
+                //
+                // Listed here rather than freed explicitly because this call does
+                // exactly the right two things in the right order: it PINS the
+                // extent before deleting its item. The pin is load-bearing — until
+                // the new superblock lands the on-disk one still names that block
+                // as `log_root`, so reusing it inside this same transaction would
+                // let a crash replay a log over bytes that had become something
+                // else. `release_pinned_after_superblock_commit` drops the pin
+                // exactly when the superblock stops pointing there, and
+                // `sync_block_group_accounting` recomputes used_bytes from the
+                // surviving items, so the space returns without a separate free.
+                //
+                // A no-op on every commit today: the tree-log fsync path is
+                // default-off, so there is usually no such block.
+                BTRFS_TREE_LOG_OBJECTID,
             ])
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
@@ -31243,6 +31263,11 @@ impl OpenFs {
         // whose items are already committed, growing the log for no reason and
         // reintroducing the overflow this change bounds.
         alloc.btrfs_logged_inodes.clear();
+        // bd-0ajub: the block itself was pinned and its extent item deleted at the
+        // top of this commit. Dropping the handle here keeps the two in step — a
+        // later fsync must not hand this address back a second time, which would
+        // free a block that by then belongs to something else.
+        alloc.btrfs_live_log_block = None;
 
         // bd-x36qn / bd-myrgc / bd-k74ef: the extent tree and the root tree are
         // self-describing by the time we get here — every block of both, not
