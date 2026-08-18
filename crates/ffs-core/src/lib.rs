@@ -12968,6 +12968,34 @@ impl OpenFs {
         Ok(BlockNumber(abs_offset / bs))
     }
 
+    /// Warm one readdir page's inode leaves if every gate allows it
+    /// (bd-btrfs-readdir-stat-8x-8y7vp).
+    ///
+    /// Exists so the THREE btrfs readdir return paths — snapshot-unvalidated,
+    /// snapshot-validated, and the fresh walk — share one gate. They did not:
+    /// the prefetch was first hooked only on the fresh walk, which is the path
+    /// taken exactly once per listing, so a paginated directory had its first
+    /// page warmed and every later page served cold. For a 32,768-entry directory
+    /// at a 512-entry page cap that is one page in sixty-four.
+    ///
+    /// A gate repeated at three call sites is a gate that will eventually differ
+    /// at one of them, which is how the coverage hole happened in the first place.
+    fn maybe_prefetch_btrfs_readdir_leaves(
+        &self,
+        cx: &Cx,
+        scope: &RequestScope,
+        entries: &[DirEntry],
+    ) {
+        if btrfs_readdir_prefetch_enabled()
+            && !scope.skip_readdir_prefetch
+            && !self
+                .readdir_prefetch_disabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.prefetch_btrfs_readdir_inode_leaves(cx, entries);
+        }
+    }
+
     /// btrfs counterpart of [`Self::prefetch_ext4_readdir_inode_table_blocks`]
     /// (bd-btrfs-readdir-stat-8x-8y7vp).
     ///
@@ -29937,8 +29965,7 @@ impl OpenFs {
         Self::btrfs_publish_tree_log(
             self.dev.as_ref(),
             cx,
-            ByteOffset(mapping.physical),
-            &node_bytes,
+            &[(ByteOffset(mapping.physical), node_bytes.as_slice())],
             superblock_offset,
             &sb_bytes,
         )?;
@@ -29976,14 +30003,27 @@ impl OpenFs {
     fn btrfs_publish_tree_log(
         dev: &dyn ByteDevice,
         cx: &Cx,
-        node_offset: ByteOffset,
-        node_bytes: &[u8],
+        nodes: &[(ByteOffset, &[u8])],
         superblock_offset: ByteOffset,
         sb_bytes: &[u8],
     ) -> Result<(), FfsError> {
-        dev.write_all_at(cx, node_offset, node_bytes)?;
+        for (offset, bytes) in nodes {
+            dev.write_all_at(cx, *offset, bytes)?;
+        }
         // THE LOAD-BEARING LINE. Without it the superblock below can reach disk
         // first and address a log node that does not exist.
+        //
+        // ONE barrier after ALL nodes, not one per node, and that is correct
+        // rather than a shortcut: the requirement is that every node is durable
+        // BEFORE the superblock names any of them. Nothing requires the nodes to
+        // be ordered among themselves — no node points at another until the
+        // superblock points at the first — so a barrier between them would buy
+        // nothing and cost a flush per node on the fsync path.
+        //
+        // Takes a slice because the kernel's log shape needs TWO blocks per fsync,
+        // the log tree and the log root tree that points at it (bd-jhuob). Passing
+        // one is the shape today and is byte-identical to the previous single-node
+        // form.
         dev.sync(cx)?;
         dev.write_all_at(cx, superblock_offset, sb_bytes)?;
         Ok(())
@@ -66700,6 +66740,73 @@ mod tests {
         assert!(cap < needed, "and must therefore refuse rather than wrap");
     }
 
+    /// bd-jhuob. Two log nodes must BOTH be durable before the superblock names
+    /// either of them.
+    ///
+    /// The kernel's log shape needs two blocks per fsync — the subvolume's log
+    /// tree and the log root tree pointing at it — and the superblock addresses
+    /// only the second. If the first can still be in the page cache when the
+    /// superblock lands, a crash leaves a log root tree pointing at a log tree
+    /// that does not exist, which is bd-sv7ql's failure one level deeper.
+    ///
+    /// The assertion is that the barrier comes after BOTH writes, and that there
+    /// is only ONE: a barrier between the nodes would be pure cost on the fsync
+    /// path, because no node points at another until the superblock points at the
+    /// root tree.
+    #[test]
+    fn btrfs_publish_tree_log_barriers_after_all_nodes_bd_jhuob() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum DevOp {
+            Write(u64),
+            Sync,
+        }
+        struct OrderRecordingDevice {
+            ops: Mutex<Vec<DevOp>>,
+        }
+        impl ByteDevice for OrderRecordingDevice {
+            fn read_exact_at(&self, _cx: &Cx, _off: ByteOffset, _buf: &mut [u8]) -> ffs_error::Result<()> {
+                Ok(())
+            }
+            fn write_all_at(&self, _cx: &Cx, off: ByteOffset, _buf: &[u8]) -> ffs_error::Result<()> {
+                self.ops.lock().unwrap().push(DevOp::Write(off.0));
+                Ok(())
+            }
+            fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+                self.ops.lock().unwrap().push(DevOp::Sync);
+                Ok(())
+            }
+        }
+
+        let dev = OrderRecordingDevice {
+            ops: Mutex::new(Vec::new()),
+        };
+        let cx = Cx::for_testing();
+        let log_tree = ByteOffset(0x40_0000);
+        let log_root_tree = ByteOffset(0x41_0000);
+        let sb_offset = ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).expect("sb offset"));
+
+        OpenFs::btrfs_publish_tree_log(
+            &dev,
+            &cx,
+            &[(log_tree, &[0xAB; 64]), (log_root_tree, &[0xBC; 64])],
+            sb_offset,
+            &[0xCD; 64],
+        )
+        .expect("publish two-node tree log");
+
+        let ops = dev.ops.lock().unwrap();
+        assert_eq!(
+            *ops,
+            vec![
+                DevOp::Write(log_tree.0),
+                DevOp::Write(log_root_tree.0),
+                DevOp::Sync,
+                DevOp::Write(sb_offset.0),
+            ],
+            "both nodes, then ONE barrier, then the superblock"
+        );
+    }
+
     /// bd-sv7ql. The tree-log publish must put a BARRIER between the log node and
     /// the superblock that points at it.
     ///
@@ -66763,8 +66870,7 @@ mod tests {
         OpenFs::btrfs_publish_tree_log(
             &dev,
             &cx,
-            node_offset,
-            &[0xAB; 64],
+            &[(node_offset, &[0xAB; 64])],
             sb_offset,
             &[0xCD; 64],
         )
