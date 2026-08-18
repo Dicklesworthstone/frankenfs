@@ -19978,6 +19978,51 @@ mod tests {
         );
     }
 
+    /// bd-rsjvf. The ROOT_ITEM skip landed in the commit path rests on one
+    /// premise: patching an item with the bytenr, level and generation it
+    /// ALREADY holds leaves the blob byte-identical, so the update can be
+    /// skipped and the root tree's block ids survive. If that were false the
+    /// skip would never fire and the follow-up reuse lever would be pointless.
+    ///
+    /// Verified here rather than by mounting, because it is a property of
+    /// `patch_root_commit` alone: it writes exactly four fields — bytenr,
+    /// generation, level, generation_v2 — and preserves everything else.
+    #[test]
+    fn patching_a_root_item_with_unchanged_values_is_byte_identical_bd_rsjvf() {
+        let mut item = vec![0_u8; BTRFS_ROOT_ITEM_SIZE];
+        // Fill the untouched region so a patch that clobbered more than its four
+        // fields shows up as a difference rather than as zeros matching zeros.
+        for (i, byte) in item.iter_mut().enumerate() {
+            *byte = u8::try_from(i % 251).expect("fits");
+        }
+        BtrfsRootItem::patch_root_commit(&mut item, 0x1_0000, 1, 7).expect("first patch");
+        let after_first = item.clone();
+
+        // THE PREMISE: the same three values again must change nothing.
+        BtrfsRootItem::patch_root_commit(&mut item, 0x1_0000, 1, 7).expect("repeat patch");
+        assert_eq!(
+            item, after_first,
+            "re-patching with unchanged values must be byte-identical — this is what \
+             lets the commit skip the root_tree update"
+        );
+
+        // And each field on its own MUST change the bytes, or the skip would
+        // swallow a real move. A reused root that advanced its generation is the
+        // dangerous case (bd-73bi2: parent transid verify failed), so generation
+        // is checked as carefully as bytenr.
+        let mut moved = after_first.clone();
+        BtrfsRootItem::patch_root_commit(&mut moved, 0x2_0000, 1, 7).expect("patch");
+        assert_ne!(moved, after_first, "a new bytenr must change the item");
+
+        let mut releveled = after_first.clone();
+        BtrfsRootItem::patch_root_commit(&mut releveled, 0x1_0000, 2, 7).expect("patch");
+        assert_ne!(releveled, after_first, "a new level must change the item");
+
+        let mut regenerated = after_first.clone();
+        BtrfsRootItem::patch_root_commit(&mut regenerated, 0x1_0000, 1, 8).expect("patch");
+        assert_ne!(regenerated, after_first, "a new generation must change the item");
+    }
+
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
         BtrfsBlockGroupItem {
             total_bytes: size,
