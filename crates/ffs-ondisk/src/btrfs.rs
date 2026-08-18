@@ -1839,6 +1839,72 @@ impl DeviceOccupancy {
     }
 }
 
+/// Physical offsets of the btrfs superblock copies, in device bytes.
+///
+/// btrfs writes a mirror only where the device actually covers the offset, so a
+/// small device has fewer than three.
+///
+/// ⚠️ PROVENANCE: these are not in the UAPI headers — they live in
+/// `fs/btrfs/ctree.h` (`BTRFS_SUPER_MIRROR_MAX`, `BTRFS_SUPER_MIRROR_SHIFT`) and
+/// are not verifiable on this box. They are corroborated by TWO independent
+/// copies already in this workspace that agree with each other and with these:
+/// `ffs-repair/src/scrub.rs` (`BTRFS_SUPER_MIRROR_OFFSETS`) and
+/// `ffs-cli/src/cmd_repair.rs` (`btrfs_super_mirror_offsets`). A third copy is a
+/// smell; deduplicating it means editing two crates that are not this change's
+/// subject, so it is filed rather than done here.
+pub const BTRFS_SUPER_MIRROR_OFFSETS: [u64; 3] = [
+    BTRFS_SUPER_INFO_OFFSET as u64, // 64 KiB — primary
+    0x0400_0000,                    // 64 MiB
+    0x40_0000_0000,                 // 256 GiB
+];
+
+impl DeviceOccupancy {
+    /// Mark `[start, start + len)` as occupied even though no chunk covers it.
+    ///
+    /// Re-sorts and re-coalesces, because [`Self::find_free`] walks the ranges
+    /// assuming they are disjoint and ascending and a reservation can land
+    /// anywhere.
+    pub fn reserve(&mut self, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        self.ranges.push((start, len));
+        self.ranges.sort_unstable();
+        let merged = std::mem::take(&mut self.ranges);
+        self.ranges = coalesce_device_ranges(merged);
+    }
+
+    /// Fence off every superblock copy this device is large enough to carry.
+    ///
+    /// ⚠️ A CHUNK PLACED OVER A SUPERBLOCK MIRROR IS AN UNMOUNTABLE FILESYSTEM,
+    /// and it fails in the worst possible way: the image mounts and works until
+    /// the kernel next writes that mirror, at which point 4 KiB in the middle of
+    /// a live chunk is overwritten with a superblock — or our chunk write
+    /// destroys the mirror and `btrfs check` reports a superblock that will not
+    /// validate. Nothing about the chunk map records that these bytes are
+    /// special, so an allocator that only consults the chunk map WILL hand them
+    /// out; kernel btrfs solves the same problem by excluding the super stripes
+    /// from every block group's free space.
+    ///
+    /// The primary at 64 KiB is normally below the reserved head a caller passes
+    /// as `min_offset`, but it is reserved anyway rather than assumed: the head
+    /// is a caller's parameter and this is a property of the format.
+    pub fn reserve_superblock_mirrors(&mut self, device_total_bytes: u64) {
+        let size = BTRFS_SUPER_INFO_SIZE as u64;
+        for offset in BTRFS_SUPER_MIRROR_OFFSETS {
+            let Some(end) = offset.checked_add(size) else {
+                continue;
+            };
+            // btrfs writes a mirror only where the device covers it in full, so
+            // a partially covered offset is not a mirror and must not be fenced
+            // — fencing it would lose real space on every small device.
+            if end <= device_total_bytes {
+                self.reserve(offset, size);
+            }
+        }
+    }
+}
+
 /// Merge sorted, possibly overlapping physical ranges into disjoint ones.
 ///
 /// Mirror profiles put two stripes of the SAME chunk on one device (DUP), and
@@ -3021,6 +3087,94 @@ mod tests {
                 .len(),
             21
         );
+    }
+
+    /// bd-a136s. A chunk placed over a superblock mirror is an unmountable
+    /// filesystem, and it fails late: the image works until the kernel next
+    /// writes that mirror, then 4 KiB in the middle of a live chunk becomes a
+    /// superblock. Nothing in the chunk map says those bytes are special, so an
+    /// allocator that consults only the chunk map WILL hand them out.
+    #[test]
+    fn superblock_mirrors_are_never_handed_out_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const DEV: u64 = 128 * MB;
+
+        let mut occ = DeviceOccupancy::default();
+        occ.reserve_superblock_mirrors(DEV);
+
+        // Two mirrors fit in 128 MiB: the primary at 64 KiB and the backup at
+        // 64 MiB. The 256 GiB one does not, and reserving it would lose real
+        // space on every small device.
+        assert_eq!(
+            occ.ranges(),
+            &[
+                (BTRFS_SUPER_INFO_OFFSET as u64, BTRFS_SUPER_INFO_SIZE as u64),
+                (0x0400_0000, BTRFS_SUPER_INFO_SIZE as u64),
+            ][..]
+        );
+
+        // Sweep placements and require that none overlaps any mirror. The
+        // interesting sizes are the ones whose natural placement STRADDLES a
+        // mirror rather than starting on one.
+        for length in [4096, 64 * 1024, MB, 8 * MB, 32 * MB, 60 * MB] {
+            let Some(offset) = occ.find_free(length, 0, DEV) else {
+                continue;
+            };
+            for mirror in BTRFS_SUPER_MIRROR_OFFSETS {
+                let mirror_end = mirror + BTRFS_SUPER_INFO_SIZE as u64;
+                assert!(
+                    offset + length <= mirror || offset >= mirror_end,
+                    "a {length}-byte chunk at {offset} straddles the superblock mirror \
+                     at {mirror}"
+                );
+            }
+        }
+
+        // A device too small for the 64 MiB backup reserves only the primary.
+        let mut small = DeviceOccupancy::default();
+        small.reserve_superblock_mirrors(32 * MB);
+        assert_eq!(small.ranges().len(), 1);
+
+        // A device that covers the backup only PARTIALLY does not reserve it:
+        // btrfs writes a mirror only where the device covers it in full.
+        let mut partial = DeviceOccupancy::default();
+        partial.reserve_superblock_mirrors(0x0400_0000 + 2048);
+        assert_eq!(partial.ranges().len(), 1);
+        let mut exact = DeviceOccupancy::default();
+        exact.reserve_superblock_mirrors(0x0400_0000 + BTRFS_SUPER_INFO_SIZE as u64);
+        assert_eq!(exact.ranges().len(), 2, "a device covering it exactly does");
+    }
+
+    /// bd-a136s. `reserve` has to re-sort and re-coalesce, because `find_free`
+    /// walks the ranges assuming they are disjoint and ascending while a
+    /// reservation can land anywhere — including inside or across a chunk that
+    /// is already recorded.
+    #[test]
+    fn reserving_merges_into_the_existing_ranges_bd_a136s() {
+        use chunk_type_flags::BTRFS_BLOCK_GROUP_METADATA;
+        const MB: u64 = 1024 * 1024;
+
+        let chunks = vec![chunk_at(0, 8 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 16 * MB)])];
+        let mut occ = DeviceOccupancy::from_chunks(1, &chunks).expect("derive");
+
+        // Below everything already there.
+        occ.reserve(MB, 4096);
+        // Abutting the chunk's start, which must merge rather than sit beside it.
+        occ.reserve(15 * MB, MB);
+        assert_eq!(
+            occ.ranges(),
+            &[(MB, 4096), (15 * MB, 9 * MB)][..],
+            "an abutting reservation merges; a distant one does not"
+        );
+
+        // Wholly inside an existing range: a no-op, not a duplicate.
+        occ.reserve(17 * MB, MB);
+        assert_eq!(occ.ranges(), &[(MB, 4096), (15 * MB, 9 * MB)][..]);
+
+        // Zero length is ignored rather than inserted as an empty range that
+        // `find_free` would have to skip.
+        occ.reserve(40 * MB, 0);
+        assert_eq!(occ.ranges().len(), 2);
     }
 
     fn representative_sys_chunk_superblock() -> [u8; BTRFS_SUPER_INFO_SIZE] {

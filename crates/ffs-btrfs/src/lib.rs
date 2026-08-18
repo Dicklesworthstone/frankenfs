@@ -6844,8 +6844,13 @@ pub fn plan_growth_for_commit(
         return Ok(None);
     };
 
-    let occupancy = DeviceOccupancy::from_chunks(device.devid, chunks)
+    let mut occupancy = DeviceOccupancy::from_chunks(device.devid, chunks)
         .map_err(|_| BtrfsMutationError::InvalidConfig("chunk layout is not modelled"))?;
+    // Nothing in the chunk map records that the superblock copies are special,
+    // so an allocator that consults only the chunk map hands them out. A chunk
+    // over a mirror is an unmountable filesystem, and it fails late — the image
+    // works until the kernel next writes that mirror.
+    occupancy.reserve_superblock_mirrors(device.total_bytes);
     let free_run = occupancy.largest_free_run(device.min_offset, device.total_bytes);
 
     let Some(length) = policy.decide(ChunkKind::Metadata, device.total_bytes, free_run) else {
@@ -19309,6 +19314,68 @@ mod tests {
             .is_err(),
             "an unmodelled chunk layout must refuse"
         );
+    }
+
+    /// bd-a136s. The growth planner must not place a chunk over a superblock
+    /// mirror, and this is the case that catches it: the device's free tail
+    /// STARTS below 64 MiB and is long enough that the natural first-fit
+    /// placement straddles the backup superblock.
+    ///
+    /// Without the fence the planner returns 63 MiB for a 12.75 MiB chunk, which
+    /// spans the mirror at 64 MiB — an image that mounts and works until the
+    /// kernel next writes that mirror, at which point 4 KiB in the middle of a
+    /// live metadata chunk becomes a superblock.
+    #[test]
+    fn growth_never_places_a_chunk_over_a_superblock_mirror_bd_a136s() {
+        const MB: u64 = 1024 * 1024;
+        const NODESIZE: u64 = 16384;
+        const DEV: u64 = 128 * MB;
+        const MIRROR: u64 = 0x0400_0000; // 64 MiB
+
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(NODESIZE);
+        // One full metadata chunk occupying physical [1 MiB, 63 MiB), so the
+        // first free byte is 1 MiB BELOW the mirror.
+        alloc.add_block_group(
+            0,
+            BtrfsBlockGroupItem {
+                total_bytes: 62 * MB,
+                used_bytes: 62 * MB,
+                flags: BTRFS_BLOCK_GROUP_METADATA,
+            },
+        );
+        let chunks = vec![logical_chunk(
+            0,
+            62 * MB,
+            BTRFS_BLOCK_GROUP_METADATA,
+            &[(1, MB)],
+        )];
+
+        let plan = plan_growth_for_commit(
+            &alloc,
+            &chunks,
+            1132,
+            NODESIZE,
+            &growth_device(DEV, 63 * MB),
+            &ChunkSizePolicy::default(),
+        )
+        .expect("the device has room")
+        .expect("the commit is short, so a chunk must be planned");
+
+        let physical = plan.chunk.stripes[0].offset;
+        let end = physical + plan.chunk.length;
+        assert!(
+            end <= MIRROR || physical >= MIRROR + 4096,
+            "chunk [{physical}, {end}) straddles the superblock mirror at {MIRROR}"
+        );
+        // It must land ABOVE the mirror, not be shrunk to fit below it: the gap
+        // below is only 1 MiB and the policy asked for more, so squeezing it in
+        // would mean the sizing decision was silently overridden.
+        assert!(
+            physical >= MIRROR + 4096,
+            "expected placement past the mirror, got {physical}"
+        );
+        assert!(end <= DEV, "and it must still fit on the device");
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
