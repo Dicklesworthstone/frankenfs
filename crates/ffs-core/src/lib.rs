@@ -29988,21 +29988,21 @@ impl OpenFs {
                 .serialize(&serialize_params(log_tree))
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        // The log ROOT TREE: exactly one ROOT_ITEM, keyed by the subvolume whose
-        // log it names. Its generation must equal the log tree's, which is the
-        // bumped one — the kernel reads the log tree root expecting generation + 1
-        // (linux/btrfs_tree.h:682), so a mismatch here is a transid failure on the
-        // first block it dereferences.
-        let root_item = BtrfsCowNode::Leaf {
-            items: vec![BtrfsTreeItem {
-                key: BtrfsKey {
-                    objectid: subvol_objectid,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                data: ffs_btrfs::tree_log_root_item(log_tree, 0, generation).into(),
-            }],
-        };
+            // The log ROOT TREE: exactly one ROOT_ITEM, keyed by the subvolume whose
+            // log it names. Its generation must equal the log tree's, which is the
+            // bumped one — the kernel reads the log tree root expecting generation + 1
+            // (linux/btrfs_tree.h:682), so a mismatch here is a transid failure on the
+            // first block it dereferences.
+            let root_item = BtrfsCowNode::Leaf {
+                items: vec![BtrfsTreeItem {
+                    key: BtrfsKey {
+                        objectid: subvol_objectid,
+                        item_type: BTRFS_ITEM_ROOT_ITEM,
+                        offset: 0,
+                    },
+                    data: ffs_btrfs::tree_log_root_item(log_tree, 0, generation).into(),
+                }],
+            };
             let log_root_bytes = root_item
                 .serialize(&serialize_params(log_root))
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
