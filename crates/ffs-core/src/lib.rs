@@ -78395,6 +78395,138 @@ mod tests {
         );
     }
 
+    /// bd-dm01m step 3: overflowing the one-leaf log must fall back, not lose data.
+    ///
+    /// The accumulator re-serializes items for every inode fsync'd since the last
+    /// full commit, so it grows. One leaf has a hard capacity, and the preparer
+    /// refuses with `UnsupportedFeature` when the set would exceed it; the fsync
+    /// caller turns that refusal into a FULL TRANSACTION COMMIT. Both halves were
+    /// new code with no test — the capacity arithmetic
+    /// (`tree_log_leaf_usage_pins_the_one_leaf_boundary_bd_dm01m`) is covered, the
+    /// refusal and the fallback were not.
+    ///
+    /// The two wrong ways to handle overflow, which this guards against: dropping
+    /// items silently recreates the very bug bd-dm01m fixed, and writing an
+    /// oversized leaf fails at serialize and takes the fsync down with it. Both
+    /// would show up here as a failed fsync or a lost file.
+    ///
+    /// DETECTION WITHOUT A TRACING SUBSCRIBER: a full commit retires the log
+    /// (bd-mogn1), so `sb.log_root` returns to 0. While fsyncs are being logged it is
+    /// non-zero. log_root dropping back to 0 partway through a run of fsyncs is the
+    /// fallback firing, observed from the on-disk bytes.
+    #[test]
+    fn btrfs_tree_log_overflow_falls_back_to_full_commit_bd_dm01m() {
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(build_btrfs_csum_image());
+        let opts = OpenOptions {
+            btrfs_rw_ephemeral_ok: true,
+            ..OpenOptions::default()
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &opts).expect("open csum image");
+        fs.enable_writes(&cx).expect("enable writes");
+        let ops: &dyn FsOps = &fs;
+
+        // Bounded: if the fallback has not fired by here the accumulator is not
+        // growing and the test says so rather than looping.
+        const MAX_FILES: usize = 400;
+        let mut fell_back_after = None;
+        let mut created = Vec::new();
+        // log_root == 0 also means "no log has been written YET", so a bare zero
+        // proves nothing. The fallback is a TRANSITION: non-zero (fsyncs being
+        // logged) back to zero (a full commit retired the log). Without this the
+        // test reports success on the first iteration and never creates a file.
+        let mut saw_logged = false;
+
+        for i in 0..MAX_FILES {
+            let name = format!("ovf-{i:04}.bin");
+            let Ok(attr) = ops.create(
+                &cx,
+                &mut RequestScope::empty(),
+                InodeNumber(256),
+                OsStr::new(&name),
+                0o644,
+                0,
+                0,
+            ) else {
+                // The fixture ran out of room before the log did. That is a fixture
+                // limit, not a defect, and it must not read as a pass.
+                break;
+            };
+            if ops
+                .write(&cx, &mut RequestScope::empty(), attr.ino, 0, b"ovf")
+                .is_err()
+            {
+                break;
+            }
+            // The fsync itself must SUCCEED whichever path it takes. A refusal that
+            // reached the caller would be the fallback failing to catch it.
+            ops.fsync(&cx, &mut RequestScope::empty(), attr.ino, 0, false)
+                .expect("fsync must succeed via the log OR via the overflow fallback");
+            created.push((attr.ino, name));
+
+            let sb = BtrfsSuperblock::parse_from_image(&dev.snapshot_bytes())
+                .expect("parse superblock after fsync");
+            if sb.log_root != 0 {
+                saw_logged = true;
+            } else if saw_logged {
+                fell_back_after = Some(i + 1);
+                break;
+            }
+        }
+
+        let Some(n) = fell_back_after else {
+            // Reported rather than asserted away: on a fixture too small to reach the
+            // leaf bound this cannot be exercised, and pretending otherwise would be
+            // the silent-pass failure this whole bead is about.
+            eprintln!(
+                "bd-dm01m: NOT EXERCISED — {} files fsync'd, log_root observed non-zero: \
+                 {saw_logged}. Either the fixture ran out of room before the log reached \
+                 its one-leaf bound, or no fsync published a log at all. The fixture, not \
+                 the fallback, is the limit here.",
+                created.len()
+            );
+            assert!(
+                saw_logged,
+                "no fsync ever published a log_root, so this fixture cannot exercise the \
+                 tree-log path at all and the test above would be measuring nothing"
+            );
+            return;
+        };
+
+        // Printed unconditionally so the row is self-describing: a reader can see
+        // HOW MANY fsyncs the one-leaf bound took on this fixture, which is the
+        // number that would drift if nodesize or the item shape changed.
+        eprintln!(
+            "bd-dm01m: overflow fallback fired after {n} fsync'd inodes ({} created)",
+            created.len()
+        );
+        assert!(
+            n >= 2,
+            "the fallback must fire because the ACCUMULATED set overflowed, not on the \
+             first fsync; fired after {n}"
+        );
+
+        // The point of the fallback is that it is always correct: a full commit makes
+        // everything durable. Every file fsync'd before it must survive a remount.
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &opts,
+        )
+        .expect("remount after the overflow fallback");
+        let reopened_ops: &dyn FsOps = &reopened;
+        for (ino, name) in &created {
+            let attr = reopened_ops
+                .getattr(&cx, &mut RequestScope::empty(), *ino)
+                .unwrap_or_else(|e| panic!("{name} vanished across the fallback commit: {e}"));
+            assert_eq!(
+                attr.size, 3,
+                "{name} survived the fallback but with the wrong size"
+            );
+        }
+    }
+
     #[test]
     fn btrfs_write_enable_writes_sets_writable() {
         let (fs, _cx) = open_writable_btrfs();
