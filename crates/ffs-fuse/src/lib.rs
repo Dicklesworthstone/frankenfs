@@ -4971,6 +4971,19 @@ impl Filesystem for FrankenFuse {
                         break;
                     }
                 }
+                // bd-xfe7z: the census must be emitted from BOTH directory
+                // handlers, and leaving it out of this one is what made the
+                // counters unreadable. It used to print only from `readdirplus`,
+                // so the LAST line was a snapshot taken at the last readdirplus
+                // call -- and every plain `readdir` after that point was
+                // invisible. A run whose single readdirplus came first therefore
+                // reported `readdir_handler_calls=0` no matter how many followed,
+                // which is exactly the impossible "20001 entries, 1 directory
+                // call" reading that forced a retraction. The counters were
+                // sound; the sampling point was not.
+                if readdirplus_census_enabled() {
+                    eprintln!("mount_candidate_{}", readdirplus_census_line());
+                }
                 reply.ok();
             }
             Err(e) => {
