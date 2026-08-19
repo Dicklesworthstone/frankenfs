@@ -29951,24 +29951,11 @@ impl OpenFs {
             };
         let allocated_bytes = log_tree_bytes_alloc.saturating_add(log_root_bytes_alloc);
         let metadata_allocation = log_tree_is_metadata && log_root_is_metadata;
-        // bd-0ajub: rotate. The block we are superseding is handed to the caller to
-        // free AFTER the new log_root is durable, never here — until then the on-disk
-        // superblock still points at it.
-        // Rotate the whole live set: the caller frees every entry once the new
-        // log_root is durable. `replace` on a single Option could only ever hand
-        // back one, which is why this is a list even while the writer publishes
-        // one block (bd-jhuob).
-        let retired_log_blocks = std::mem::replace(
-            &mut alloc.btrfs_live_log_blocks,
-            vec![
-                (log_tree, log_tree_bytes_alloc, log_tree_is_metadata),
-                (log_root, log_root_bytes_alloc, log_root_is_metadata),
-            ],
-        );
         alloc.generation = alloc.generation.checked_add(1).ok_or_else(|| {
             FfsError::InvalidGeometry("btrfs tree-log generation overflow".into())
         })?;
         let generation = alloc.generation;
+        let nodesize = alloc.nodesize;
         let items_count = items.len();
         let node = BtrfsCowNode::Leaf { items };
         let serialize_params = |bytenr: u64| BtrfsNodeSerializeParams {
@@ -29978,15 +29965,28 @@ impl OpenFs {
             flags: 0,
             generation,
             owner: BTRFS_TREE_LOG_OBJECTID,
-            nodesize: alloc.nodesize,
+            nodesize,
             level: 0, // both are leaves
             child_generations: Vec::new(),
             child_bytenrs: Vec::new(),
             child_min_keys: Vec::new(),
         };
-        let log_tree_bytes = node
-            .serialize(&serialize_params(log_tree))
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        // ⚠️ EVERY FALLIBLE STEP FROM HERE TO THE SUPERBLOCK BYTES IS A LEAK SITE,
+        // which is why they are gathered into one region with a single cleanup.
+        // Both blocks are allocated and neither is reachable yet: the live set
+        // still names the PREVIOUS log, and the caller only learns about these two
+        // if this function returns Ok. A `?` anywhere in here therefore orphans
+        // them, one nodesize block each, per failed fsync (bd-0ajub).
+        //
+        // The rotation deliberately happens AFTER this region rather than before
+        // it. Rotating first would make the opposite failure — a serialize error
+        // would drop the retired list and leak the PREVIOUS log's blocks instead.
+        // Doing all fallible work first, then swapping the set, leaves no window
+        // where a failure loses track of either generation of blocks.
+        let prepared = (|| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), FfsError> {
+            let log_tree_bytes = node
+                .serialize(&serialize_params(log_tree))
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
         // The log ROOT TREE: exactly one ROOT_ITEM, keyed by the subvolume whose
         // log it names. Its generation must equal the log tree's, which is the
@@ -30003,22 +30003,57 @@ impl OpenFs {
                 data: ffs_btrfs::tree_log_root_item(log_tree, 0, generation).into(),
             }],
         };
-        let log_root_bytes = root_item
-            .serialize(&serialize_params(log_root))
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            let log_root_bytes = root_item
+                .serialize(&serialize_params(log_root))
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        let mut logged_sb = sb.clone();
-        logged_sb.log_root = log_root;
-        logged_sb.log_root_level = 0;
-        logged_sb.generation = generation;
-        logged_sb.bytes_used = logged_sb
-            .bytes_used
-            .saturating_add(allocated_bytes)
-            .min(logged_sb.total_bytes);
-        // bd-q4qr8: refuses rather than truncating an oversized sys_chunk_array,
-        // which would have written a superblock whose array ends mid-entry — a
-        // filesystem the kernel cannot bootstrap.
-        let sb_bytes = logged_sb.to_bytes().map_err(|e| parse_to_ffs_error(&e))?;
+            let mut logged_sb = sb.clone();
+            logged_sb.log_root = log_root;
+            logged_sb.log_root_level = 0;
+            logged_sb.generation = generation;
+            logged_sb.bytes_used = logged_sb
+                .bytes_used
+                .saturating_add(allocated_bytes)
+                .min(logged_sb.total_bytes);
+            // bd-q4qr8: refuses rather than truncating an oversized sys_chunk_array,
+            // which would have written a superblock whose array ends mid-entry — a
+            // filesystem the kernel cannot bootstrap.
+            let sb_bytes = logged_sb.to_bytes().map_err(|e| parse_to_ffs_error(&e))?;
+            Ok((log_tree_bytes, log_root_bytes, sb_bytes))
+        })();
+        let (log_tree_bytes, log_root_bytes, sb_bytes) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                for (bytenr, bytes, is_metadata) in [
+                    (log_tree, log_tree_bytes_alloc, log_tree_is_metadata),
+                    (log_root, log_root_bytes_alloc, log_root_is_metadata),
+                ] {
+                    if let Err(free_err) =
+                        alloc.extent_alloc.free_extent(bytenr, bytes, is_metadata)
+                    {
+                        warn!(
+                            target: "ffs::btrfs::rw",
+                            bytenr,
+                            error = ?free_err,
+                            "btrfs tree-log: block not freed after a failed prepare; \
+                             space leaked"
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        // Nothing below here can fail, so the rotation is safe to perform now: the
+        // caller frees every retired entry once the new log_root is durable, and it
+        // is guaranteed to receive them (bd-0ajub).
+        let retired_log_blocks = std::mem::replace(
+            &mut alloc.btrfs_live_log_blocks,
+            vec![
+                (log_tree, log_tree_bytes_alloc, log_tree_is_metadata),
+                (log_root, log_root_bytes_alloc, log_root_is_metadata),
+            ],
+        );
         let stats = BtrfsTreeLogWriteStats {
             log_root,
             generation,
