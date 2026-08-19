@@ -1219,6 +1219,15 @@ struct WorkloadBatch {
 #[derive(Debug)]
 struct Observation {
     elapsed_ns: u64,
+    /// Wall time this visit OCCUPIED the host, timed batches plus untimed
+    /// occupancy padding (bd-fj2dg).
+    ///
+    /// Distinct from `elapsed_ns` on purpose. `elapsed_ns` is what the row
+    /// reports; this is what the arm cost the machine. Occupancy padding moves
+    /// only the latter — which is why `arm_duration_ratio`, computed from the
+    /// reported medians, cannot respond to the knob and is the wrong thing to
+    /// tune against.
+    occupancy_ns: u64,
     digest: u64,
     observed_worker_threads: BTreeSet<usize>,
     observed_worker_cpus: BTreeSet<usize>,
@@ -1235,6 +1244,15 @@ struct TimedSamples {
     observed_worker_threads: BTreeMap<Arm, BTreeSet<usize>>,
     /// Runtime-observed running CPUs for each logical arm's timed threads.
     observed_worker_cpus: BTreeMap<Arm, BTreeSet<usize>>,
+    /// Total wall time each PHYSICAL arm occupied the host, timed plus untimed
+    /// padding (bd-fj2dg).
+    ///
+    /// Keyed physically because occupancy is a property of the machine the arm
+    /// held, not of the logical A/B label it was counterbalanced into. This is
+    /// what `--kernel-occupancy-padding` actually moves, and reporting it is what
+    /// makes that knob tunable: without it the report carries only the REQUESTED
+    /// batch count and an operator cannot tell whether the arms ended up matched.
+    physical_occupancy_ns: BTreeMap<Arm, u64>,
     /// Last sequence actually executed by every physical arm.
     last_sequence: usize,
 }
@@ -4278,6 +4296,9 @@ fn observe(
     let mut expected_digest = None;
     let mut observed_worker_threads = BTreeSet::new();
     let mut observed_worker_cpus = BTreeSet::new();
+    // bd-fj2dg: starts BEFORE the timed loop and is read AFTER the padding loop,
+    // so it spans everything this visit does to the host.
+    let occupancy_start = Instant::now();
     for repeat in 0..config.observation_repeats {
         let current_sequence = sequence
             .saturating_mul(config.observation_repeats)
@@ -4321,6 +4342,7 @@ fn observe(
     }
     Ok(Observation {
         elapsed_ns: best,
+        occupancy_ns: u64::try_from(occupancy_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         digest: expected_digest.unwrap_or(0),
         observed_worker_threads,
         observed_worker_cpus,
@@ -4417,6 +4439,11 @@ fn collect_samples(
         .iter()
         .map(|&arm| (arm, Vec::with_capacity(config.pairs)))
         .collect();
+    // bd-fj2dg: pre-seeded for every arm so a physical arm that somehow took no
+    // visit reports 0 rather than being absent, which would make the achieved
+    // occupancy ratio silently undefined instead of visibly wrong.
+    let mut physical_occupancy_ns: BTreeMap<Arm, u64> =
+        arms.iter().map(|&arm| (arm, 0u64)).collect();
     let mut digests = BTreeMap::new();
     let mut observed_worker_threads: BTreeMap<Arm, BTreeSet<usize>> =
         arms.iter().map(|&arm| (arm, BTreeSet::new())).collect();
@@ -4445,6 +4472,12 @@ fn collect_samples(
                 .get_mut(&physical_arm)
                 .expect("all physical arms initialized")
                 .push(observation.elapsed_ns);
+            // bd-fj2dg: summed, not min-reduced. `elapsed_ns` takes a best-of to
+            // reject noise from the reported number; occupancy is the opposite
+            // question — how much of the host this arm consumed in total — so
+            // every visit counts, padding included.
+            let occupancy_slot = physical_occupancy_ns.entry(physical_arm).or_insert(0);
+            *occupancy_slot = occupancy_slot.saturating_add(observation.occupancy_ns);
             observed_worker_threads
                 .get_mut(&logical_arm)
                 .expect("all arms initialized")
@@ -4486,6 +4519,7 @@ fn collect_samples(
     Ok(TimedSamples {
         values,
         physical_values,
+        physical_occupancy_ns,
         digests,
         observed_worker_threads,
         observed_worker_cpus,
@@ -7224,6 +7258,42 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
         abba.exact_cancellation,
         fuse_null.median,
         abba.inflation_suspected,
+    );
+
+    // bd-fj2dg: the ACHIEVED occupancy ratio, which is the quantity
+    // `--kernel-occupancy-padding` actually moves.
+    //
+    // `arm_duration_ratio` above is computed from the REPORTED medians, and the
+    // padding batches are untimed by design, so that ratio cannot respond to the
+    // knob however it is set — measured: padding 4 left it at 4.850 against
+    // 4.638 unpadded. Reporting only the requested batch count left an operator
+    // with no way to tell whether the arms ended up matched, so tuning was
+    // guesswork. This is the feedback signal that was missing.
+    let kernel_occupancy_ns: u64 = samples
+        .physical_occupancy_ns
+        .iter()
+        .filter(|(arm, _)| arm.is_kernel())
+        .map(|(_, ns)| *ns)
+        .sum();
+    let fuse_occupancy_ns: u64 = samples
+        .physical_occupancy_ns
+        .iter()
+        .filter(|(arm, _)| !arm.is_kernel())
+        .map(|(_, ns)| *ns)
+        .sum();
+    let achieved_occupancy_ratio = if kernel_occupancy_ns == 0 || fuse_occupancy_ns == 0 {
+        f64::NAN
+    } else {
+        let hi = kernel_occupancy_ns.max(fuse_occupancy_ns) as f64;
+        let lo = kernel_occupancy_ns.min(fuse_occupancy_ns) as f64;
+        hi / lo
+    };
+    println!(
+        "mounted_kernel_occupancy,filesystem={},workload={},kernel_occupancy_ns={kernel_occupancy_ns},fuse_occupancy_ns={fuse_occupancy_ns},achieved_occupancy_ratio={achieved_occupancy_ratio:.6},kernel_occupancy_padding={},fuse_occupancy_padding={},gate_input=false",
+        kind.label(),
+        config.workload.label(),
+        config.kernel_occupancy_padding,
+        config.fuse_occupancy_padding,
     );
 
     let raw_samples = samples
@@ -10484,6 +10554,7 @@ mod tests {
                 (Arm::FuseB, vec![40, 40, 40, 40]),
             ]),
             physical_values: BTreeMap::new(),
+            physical_occupancy_ns: BTreeMap::new(),
             digests: BTreeMap::new(),
             observed_worker_threads: BTreeMap::new(),
             observed_worker_cpus: BTreeMap::new(),
@@ -10504,6 +10575,7 @@ mod tests {
                 (Arm::CandidateBB, candidate_b[1].to_vec()),
             ]),
             physical_values: BTreeMap::new(),
+            physical_occupancy_ns: BTreeMap::new(),
             digests: BTreeMap::new(),
             observed_worker_threads: BTreeMap::new(),
             observed_worker_cpus: BTreeMap::new(),
