@@ -5122,15 +5122,40 @@ impl OpenFs {
                 if sb.log_root != 0 {
                     let nodesize = sb.nodesize;
                     let chunks_ref = &chunks;
+                    // bd-whgpv: THE ARGUMENT IS ALREADY PHYSICAL. `walk_tree` builds a
+                    // `byte_node_provider(read_physical, chunks, ..)` which resolves
+                    // logical -> physical against the chunk table ITSELF and then calls
+                    // this closure with the result — hence the parameter's name in
+                    // `replay_tree_log`'s signature, `read_physical`.
+                    //
+                    // This closure used to map a SECOND time. The log root at logical
+                    // 30507008 was written to physical 38895616 (+8 MiB); the provider
+                    // resolved that correctly, then this closure mapped 38895616 again
+                    // to 47284224 and read UNWRITTEN space. A zeroed block has a stored
+                    // checksum of 0, which mismatches anything, so replay failed with
+                    // `tree_block_csum` and — because that failure is only a `warn!` —
+                    // the mount continued and every acknowledged fsync was silently lost.
+                    //
+                    // No in-process test caught it: the one at the bottom of this file
+                    // spells its closure `|physical: u64|` and indexes the image
+                    // directly, which is correct, so the tests exercised a closure the
+                    // production path did not use.
                     let mut read_phys =
-                        |logical: u64| -> std::result::Result<Vec<u8>, ParseError> {
-                            let mapping =
-                                ffs_ondisk::map_logical_to_physical(chunks_ref, logical)?
-                                    .ok_or(ParseError::InvalidField {
-                                        field: "tree_log",
-                                        reason: "logical address not mapped in chunk table",
-                                    })?;
-                            let byte_off = mapping.physical;
+                        |physical: u64| -> std::result::Result<Vec<u8>, ParseError> {
+                            let byte_off = physical;
+                            // bd-whgpv: the log blocks are on disk with VALID
+                            // checksums, yet replay fails one. That leaves WHICH
+                            // physical address we resolved to as the open question,
+                            // and it cannot be answered from outside the process —
+                            // a DUP metadata chunk has two copies at one logical
+                            // address, and an unmapped read lands on zeros whose
+                            // stored csum of 0 mismatches anything. Logged at mount
+                            // only, so it is cold-path provenance rather than noise.
+                            tracing::debug!(
+                                physical = byte_off,
+                                nodesize,
+                                "btrfs tree-log replay reading block (bd-whgpv)"
+                            );
                             let mut buf = vec![0u8; nodesize as usize];
                             dev.read_exact_at(cx, ByteOffset(byte_off), &mut buf)
                                 .map_err(|_| ParseError::InvalidField {
