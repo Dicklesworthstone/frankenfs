@@ -29887,6 +29887,7 @@ impl OpenFs {
         alloc: &mut BtrfsAllocState,
         canonical: u64,
         subvol_objectid: u64,
+        on_disk_sb: &[u8],
     ) -> Result<(Vec<(u64, Vec<u8>)>, Vec<u8>, BtrfsTreeLogWriteStats), FfsError> {
         // bd-dm01m: log EVERY inode fsync'd since the last full commit, not just this
         // one. `log_root` replaces the previous log rather than chaining to it, so a
@@ -30015,18 +30016,33 @@ impl OpenFs {
                 .serialize(&serialize_params(log_root))
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-            let mut logged_sb = sb.clone();
-            logged_sb.log_root = log_root;
-            logged_sb.log_root_level = 0;
-            logged_sb.generation = generation;
-            logged_sb.bytes_used = logged_sb
+            // ⚠️ PATCH THE ON-DISK BYTES; DO NOT REBUILD WITH `to_bytes`. This used
+            // `to_bytes`, which writes the fields BtrfsSuperblock models and zeroes
+            // everything else — including the `dev_item` at 0x65. A kernel handed
+            // the result refuses the filesystem outright:
+            //
+            //     BTRFS error: dev_item UUID does not match metadata fsid:
+            //                  7edb9d6b-... != 00000000-0000-0000-0000-000000000000
+            //     BTRFS error: open_ctree failed: -22
+            //
+            // Measured, not theorised: that is what a kernel mount said about an
+            // image carrying a tree log this code wrote. The FULL COMMIT path has
+            // always patched in place for exactly this reason and says so at its
+            // own superblock write; the tree-log path did not, and nothing caught
+            // it because our own reader repopulates dev_item from the chunk tree
+            // and never looks at that field.
+            let bytes_used = sb
                 .bytes_used
                 .saturating_add(allocated_bytes)
-                .min(logged_sb.total_bytes);
-            // bd-q4qr8: refuses rather than truncating an oversized sys_chunk_array,
-            // which would have written a superblock whose array ends mid-entry — a
-            // filesystem the kernel cannot bootstrap.
-            let sb_bytes = logged_sb.to_bytes().map_err(|e| parse_to_ffs_error(&e))?;
+                .min(sb.total_bytes);
+            let mut sb_bytes = on_disk_sb.to_vec();
+            BtrfsSuperblock::patch_tree_log_commit(
+                &mut sb_bytes,
+                log_root,
+                0,
+                generation,
+                bytes_used,
+            );
             Ok((log_tree_bytes, log_root_bytes, sb_bytes))
         })();
         let (log_tree_bytes, log_root_bytes, sb_bytes) = match prepared {
@@ -30093,9 +30109,26 @@ impl OpenFs {
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        // The superblock as it is ON DISK, so the tree-log publish patches it rather
+        // than rebuilding it — a rebuild zeroes dev_item and the kernel then refuses
+        // the filesystem (bd-jhuob).
+        let mut on_disk_sb = vec![0_u8; 4096];
+        self.dev.read_exact_at(
+            cx,
+            ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
+                FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
+            })?),
+            &mut on_disk_sb,
+        )?;
         let (nodes, sb_bytes, stats) = {
             let mut alloc = alloc_mutex.write();
-            Self::btrfs_prepare_tree_log_write(&sb, &mut alloc, canonical, ctx.subvol_objectid)?
+            Self::btrfs_prepare_tree_log_write(
+                &sb,
+                &mut alloc,
+                canonical,
+                ctx.subvol_objectid,
+                &on_disk_sb,
+            )?
         };
         // EVERY node gets the same checks the single node used to get. The log
         // root tree is as capable of straddling a chunk boundary as the log tree,
@@ -84056,6 +84089,7 @@ mod tests {
                     &mut alloc,
                     canonical,
                     BTRFS_FS_TREE_OBJECTID,
+                    &vec![0_u8; 4096],
                 )
                 .expect("prepare tree-log fast-fsync write");
             stats.items_count

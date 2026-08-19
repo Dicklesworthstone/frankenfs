@@ -367,6 +367,41 @@ impl BtrfsSuperblock {
         let csum = ffs_types::crc32c(&data[0x20..]);
         data[0..4].copy_from_slice(&csum.to_le_bytes());
     }
+
+    /// Patch an existing superblock blob to publish a TREE LOG (bd-jhuob).
+    ///
+    /// ⚠️ IN PLACE, ON THE BYTES READ FROM DISK — never rebuilt with
+    /// [`Self::to_bytes`], and this is measured rather than stylistic. `to_bytes`
+    /// writes the fields this struct models and ZEROES everything else, including
+    /// the `dev_item` embedded at 0x65. A superblock published that way is
+    /// rejected by the kernel outright:
+    ///
+    ///     BTRFS error: dev_item UUID does not match metadata fsid:
+    ///                  7edb9d6b-... != 00000000-0000-0000-0000-000000000000
+    ///     BTRFS error: superblock contains fatal errors
+    ///     BTRFS error: open_ctree failed: -22
+    ///
+    /// which is exactly what an image carrying a tree log this crate wrote
+    /// produced when handed to a kernel mount. The full-commit path has always
+    /// patched in place for this reason; the tree-log path did not, and the
+    /// difference was invisible until something other than us read the result.
+    ///
+    /// Patches `log_root` (0x60), `log_root_level` (0xC8), `generation` (0x48) and
+    /// `bytes_used` (0x78), then recomputes the CRC32C over [0x20..].
+    pub fn patch_tree_log_commit(
+        data: &mut [u8],
+        log_root: u64,
+        log_root_level: u8,
+        generation: u64,
+        bytes_used: u64,
+    ) {
+        data[0x48..0x50].copy_from_slice(&generation.to_le_bytes());
+        data[0x60..0x68].copy_from_slice(&log_root.to_le_bytes());
+        data[0x78..0x80].copy_from_slice(&bytes_used.to_le_bytes());
+        data[0xC8] = log_root_level;
+        let csum = ffs_types::crc32c(&data[0x20..]);
+        data[0..4].copy_from_slice(&csum.to_le_bytes());
+    }
 }
 
 fn validate_superblock_tree_level(field: &'static str, level: u8) -> Result<(), ParseError> {
