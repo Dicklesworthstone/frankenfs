@@ -1115,6 +1115,81 @@ fn readdirplus_prefetch_bound(observed_fill: usize, entries_len: usize) -> usize
     bound.min(entries_len)
 }
 
+/// Census of what the readdirplus prefetch ACTUALLY did, per reply (bd-xfe7z).
+///
+/// WHY THIS EXISTS. A counted A/B of `FFS_FUSE_READDIRPLUS_BATCH_ATTRS` removed
+/// only `0.0113` request scopes per entry where collapsing one scope per entry
+/// into one per reply should have removed close to `1.0`. A near-null there has
+/// two causes that the scope count alone CANNOT separate:
+///
+///   (i)  scopes are not where the cost is — the conclusion the comment beside
+///        the batch branch invites; or
+///   (ii) the prefetch never covered the reply, so the per-entry inline path ran
+///        anyway and there was no collapse to measure.
+///
+/// Drawing (i) while (ii) is true would retire a live lever on the strength of
+/// an experiment that never exercised it. These four counters decide it: if the
+/// bound tracks the fill and the served count tracks the emitted count, the
+/// prefetch is engaging and (i) survives. If `bound_sum / calls` sits at
+/// [`READDIRPLUS_PREFETCH_COLD_BOUND`], or `inline` dominates `served`, it is
+/// (ii) and the lever has not been measured yet.
+///
+/// Accumulated PER REPLY rather than per entry — the emit loop keeps local
+/// counters and folds them in once — so this is four atomic adds per
+/// readdirplus call, not four per directory entry.
+static READDIRPLUS_PREFETCH_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static READDIRPLUS_PREFETCH_BOUND_SUM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static READDIRPLUS_PREFETCH_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static READDIRPLUS_PREFETCH_INLINE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Pure half of `FFS_FUSE_READDIRPLUS_CENSUS`, testable without touching the
+/// process environment.
+fn readdirplus_census_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    })
+}
+
+/// Whether to print the prefetch census line after each readdirplus reply.
+///
+/// ⚠️ DELIBERATELY **NOT** GATED ON `FFS_MOUNT_BENCH_EVIDENCE`, unlike every
+/// other evidence line here. That gate is set by the mounted comparator on its
+/// TIMED runs, and a line printed once per reply is stderr I/O inside the
+/// measured region — it would perturb exactly the rows it was meant to explain.
+/// This census exists for COUNTED runs, so it gets its own opt-in knob and an
+/// unset environment prints nothing.
+fn readdirplus_census_enabled() -> bool {
+    readdirplus_census_from_value(std::env::var("FFS_FUSE_READDIRPLUS_CENSUS").ok().as_deref())
+}
+
+/// One line per readdirplus reply, in the same `key=value` shape the other
+/// evidence lines use so one parser handles all of them.
+fn readdirplus_census_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let calls = READDIRPLUS_PREFETCH_CALLS.load(Relaxed);
+    let bound_sum = READDIRPLUS_PREFETCH_BOUND_SUM.load(Relaxed);
+    let served = READDIRPLUS_PREFETCH_SERVED.load(Relaxed);
+    let inline = READDIRPLUS_PREFETCH_INLINE.load(Relaxed);
+    // Integer mean, to one decimal, without pulling in float formatting of a
+    // quantity that is conceptually a count.
+    let mean_bound_tenths = if calls == 0 {
+        0
+    } else {
+        (bound_sum * 10) / calls
+    };
+    format!(
+        "readdirplus_census,prefetch_calls={calls},bound_sum={bound_sum},\
+         mean_bound_tenths={mean_bound_tenths},served={served},inline={inline},\
+         observed_fill={}",
+        READDIRPLUS_OBSERVED_FILL.load(Relaxed)
+    )
+}
+
 fn readdirplus_inode_fetch_order(inos: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..inos.len()).collect();
     order.sort_by_key(|&i| inos[i]);
@@ -4957,6 +5032,13 @@ impl Filesystem for FrankenFuse {
                         READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed),
                         entries.len(),
                     );
+                    // bd-xfe7z census: record the bound ACTUALLY used, not the
+                    // one the knob asked for. A batch arm whose bound sits at the
+                    // cold guess never collapsed anything, and the scope count
+                    // alone cannot tell that apart from "scopes are not the cost".
+                    READDIRPLUS_PREFETCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    READDIRPLUS_PREFETCH_BOUND_SUM
+                        .fetch_add(bound as u64, std::sync::atomic::Ordering::Relaxed);
                     let inos: Vec<u64> = entries[..bound].iter().map(|e| e.ino.0).collect();
                     let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
                         (0..entries.len()).map(|_| None).collect();
@@ -5027,6 +5109,11 @@ impl Filesystem for FrankenFuse {
                 drop(_phase_timer);
 
                 let mut emitted: usize = 0;
+                // bd-xfe7z census, accumulated LOCALLY across this reply's emit
+                // loop and folded into the process counters once below, so the
+                // cost is per REPLY rather than per directory entry.
+                let mut census_served: u64 = 0;
+                let mut census_inline: u64 = 0;
                 for (index, entry) in entries.iter().enumerate() {
                     // bd-xfe7z: time the whole loop body so loop_ns - scope_ns -
                     // reply_ns attributes the 46.2% that is neither the attribute
@@ -5051,22 +5138,36 @@ impl Filesystem for FrankenFuse {
                         // here instead would drop every entry beyond the bound
                         // from the directory listing.
                         Some(slots) => match take_prefetched(slots, index) {
-                            Some(attr) => attr,
-                            None => match self.with_request_scope(
-                                &cx,
-                                RequestOp::Getattr,
-                                |cx, scope| {
-                                    // bd-xfe7z: time the inline fetch too, or the
-                                    // split cannot be computed for any arm whose
-                                    // prefetch is bounded short.
-                                    let _t =
-                                        crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                                    self.inner.ops.getattr(cx, scope, entry.ino)
-                                },
-                            ) {
-                                Ok(attr) => attr,
-                                Err(_) => continue,
-                            },
+                            Some(attr) => {
+                                // bd-xfe7z census: served from the prefetch, so
+                                // this entry cost no scope of its own.
+                                census_served += 1;
+                                attr
+                            }
+                            None => {
+                                // Census: past the bound OR a failed prefetch —
+                                // this entry pays its own scope after all, which
+                                // is exactly what a bounded-short arm looks like.
+                                // Incremented HERE rather than inside the closure
+                                // so nothing is captured mutably by it.
+                                census_inline += 1;
+                                match self.with_request_scope(
+                                    &cx,
+                                    RequestOp::Getattr,
+                                    |cx, scope| {
+                                        // bd-xfe7z: time the inline fetch too, or
+                                        // the split cannot be computed for any arm
+                                        // whose prefetch is bounded short.
+                                        let _t = crossings::OpsTimer::start(
+                                            crossings::CrossingOp::Getattr,
+                                        );
+                                        self.inner.ops.getattr(cx, scope, entry.ino)
+                                    },
+                                ) {
+                                    Ok(attr) => attr,
+                                    Err(_) => continue,
+                                }
+                            }
                         },
                         None => {
                             // bd-xfe7z: the DEFAULT path, with no prefetch at all.
@@ -5137,6 +5238,13 @@ impl Filesystem for FrankenFuse {
                 // guess.
                 if emitted > 0 {
                     READDIRPLUS_OBSERVED_FILL.store(emitted, std::sync::atomic::Ordering::Relaxed);
+                }
+                READDIRPLUS_PREFETCH_SERVED
+                    .fetch_add(census_served, std::sync::atomic::Ordering::Relaxed);
+                READDIRPLUS_PREFETCH_INLINE
+                    .fetch_add(census_inline, std::sync::atomic::Ordering::Relaxed);
+                if readdirplus_census_enabled() {
+                    eprintln!("mount_candidate_{}", readdirplus_census_line());
                 }
                 reply.ok();
             }
@@ -8640,6 +8748,69 @@ mod tests {
         );
         // ...but still clamped by a batch smaller than the cold guess.
         assert_eq!(readdirplus_prefetch_bound(0, 5), 5);
+    }
+
+    /// bd-xfe7z: the census knob is opt-in, and deliberately NOT the shared
+    /// `FFS_MOUNT_BENCH_EVIDENCE` gate.
+    ///
+    /// The census prints one line per readdirplus reply. Under the shared gate
+    /// that would be stderr I/O inside the region the mounted comparator times,
+    /// so it would perturb exactly the rows it exists to explain. Counted runs
+    /// opt in separately; an unset environment prints nothing.
+    #[test]
+    fn readdirplus_census_knob_is_opt_in_bd_xfe7z() {
+        assert!(!readdirplus_census_from_value(None));
+        for off in ["", "0", "false", "off", "no", "2", "yes"] {
+            assert!(
+                !readdirplus_census_from_value(Some(off)),
+                "{off:?} must not enable the census; anything unrecognised has to \
+                 fail towards printing nothing"
+            );
+        }
+        for on in ["1", "true", "TRUE", "on", " 1 "] {
+            assert!(readdirplus_census_from_value(Some(on)), "{on:?}");
+        }
+    }
+
+    /// bd-xfe7z: the census line must carry every field needed to separate
+    /// "scopes are not the cost" from "the prefetch never covered the reply".
+    ///
+    /// Those two produce the SAME near-null scope count, which is why the
+    /// batch_attrs A/B could not decide between them. The discriminators are the
+    /// mean bound and the served/inline split, so a line missing either is
+    /// useless for the question it was added for.
+    #[test]
+    fn readdirplus_census_line_carries_the_discriminators_bd_xfe7z() {
+        let line = readdirplus_census_line();
+        for field in [
+            "readdirplus_census,",
+            "prefetch_calls=",
+            "bound_sum=",
+            "mean_bound_tenths=",
+            "served=",
+            "inline=",
+            "observed_fill=",
+        ] {
+            assert!(
+                line.contains(field),
+                "census line is missing {field:?}: {line}"
+            );
+        }
+    }
+
+    /// bd-xfe7z: the census must not divide by zero before any reply.
+    ///
+    /// It is read from a live daemon, so it can be emitted on the very first
+    /// reply -- and on the control arm the prefetch block never runs at all, so
+    /// `prefetch_calls` stays 0 for the whole mount. A panic there would take
+    /// down the mount being measured.
+    #[test]
+    fn readdirplus_census_survives_zero_calls_bd_xfe7z() {
+        let line = readdirplus_census_line();
+        assert!(
+            line.contains("mean_bound_tenths="),
+            "must still report a mean with no calls recorded: {line}"
+        );
     }
 
     /// bd-xfe7z: the bound tracks the observed fill DOWN as well as up.
