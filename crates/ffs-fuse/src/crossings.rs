@@ -904,6 +904,57 @@ mod tests {
     /// assigns them, `CrossingOp::index` names them -- and a silent drift would
     /// mislabel every count while still summing correctly, which is the worst
     /// kind of instrument bug. This pins the shape they must share.
+    /// bd-xfe7z: pin the slot ASSIGNMENT, not just how many slots there are.
+    ///
+    /// The vendored counter's `crossing_slot` says "the index order is mirrored by
+    /// `ffs_fuse::crossings::CrossingOp`, and the two are pinned against each other
+    /// by a test there". Until now the only test compared the slot COUNT. Ten still
+    /// equals ten after two variants are swapped, so the stated failure — a silent
+    /// drift that mislabels every count while the total stays right — was exactly
+    /// the one nothing checked.
+    ///
+    /// This pins our half against the order both sides document: index, variant and
+    /// the LABEL that reaches the metrics line, which is what a reader actually
+    /// attributes a number to. Reordering `CrossingOp` now fails here instead of
+    /// quietly relabelling somebody's evidence.
+    ///
+    /// It cannot reach into `crossing_slot` — that function is private to the
+    /// vendored crate — so this is one half of the pin. The other half belongs in
+    /// fuser's own tests, asserting the same list; the two together are what the
+    /// comment claims.
+    #[test]
+    fn the_slot_assignment_matches_the_documented_order_bd_xfe7z() {
+        // Exactly the order `crossing_slot` matches on, written out so a diff to
+        // either side is visible here.
+        let documented: [(usize, CrossingOp, &str); 10] = [
+            (0, CrossingOp::Lookup, "lookup"),
+            (1, CrossingOp::Getattr, "getattr"),
+            (2, CrossingOp::Getxattr, "getxattr"),
+            (3, CrossingOp::Readdir, "readdir"),
+            (4, CrossingOp::Readdirplus, "readdirplus"),
+            (5, CrossingOp::Open, "open"),
+            (6, CrossingOp::Opendir, "opendir"),
+            (7, CrossingOp::Release, "release"),
+            (8, CrossingOp::Releasedir, "releasedir"),
+            (9, CrossingOp::Other, "other"),
+        ];
+        for (slot, op, label) in documented {
+            assert_eq!(
+                op.index(),
+                slot,
+                "{label} must occupy slot {slot}; a shifted assignment mislabels \
+                 every count from here on while the total still adds up"
+            );
+            assert_eq!(op.label(), label, "slot {slot} label drifted");
+            assert_eq!(
+                CrossingOp::ALL[slot].index(),
+                slot,
+                "ALL[{slot}] is not the opcode that indexes to {slot}; rendering \
+                 walks ALL, so this is what puts a count under the wrong name"
+            );
+        }
+    }
+
     #[test]
     fn the_slot_count_matches_the_vendored_counter_bd_xfe7z() {
         assert_eq!(
