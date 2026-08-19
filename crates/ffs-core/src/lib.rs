@@ -3308,10 +3308,10 @@ struct CachedByteDeviceBlockAdapter<'a> {
 
 impl CachedByteDeviceBlockAdapter<'_> {
     fn read_block_vec(&self, cx: &Cx, block: BlockNumber) -> Result<Vec<u8>, FfsError> {
-        if let Some(cache) = self.cache {
-            if let Some(cached) = cache.get(&block) {
-                return Ok(cached.as_slice().to_vec());
-            }
+        if let Some(cache) = self.cache
+            && let Some(cached) = cache.get(&block)
+        {
+            return Ok(cached.as_slice().to_vec());
         }
 
         let bytes = self.base.read_block_vec(cx, block)?;
@@ -3349,10 +3349,10 @@ impl CachedByteDeviceBlockAdapter<'_> {
 
 impl BlockDevice for CachedByteDeviceBlockAdapter<'_> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
-        if let Some(cache) = self.cache {
-            if let Some(cached) = cache.get(&block) {
-                return Ok(cached);
-            }
+        if let Some(cache) = self.cache
+            && let Some(cached) = cache.get(&block)
+        {
+            return Ok(cached);
         }
 
         let buf = self.base.read_block(cx, block)?;
@@ -9231,16 +9231,16 @@ impl OpenFs {
 
         // Notify repair lifecycle on successful commit (spec §12.1.3).
         if !write_blocks.is_empty() {
-            if let Some(ref lifecycle) = self.repair_flush_lifecycle {
-                if let Err(e) = lifecycle.on_flush_committed(cx, &write_blocks) {
-                    warn!(
-                        target: "ffs::repair",
-                        txn_id = txn_id.0,
-                        block_count = write_blocks.len(),
-                        error = %e,
-                        "repair_lifecycle_notify_failed"
-                    );
-                }
+            if let Some(ref lifecycle) = self.repair_flush_lifecycle
+                && let Err(e) = lifecycle.on_flush_committed(cx, &write_blocks)
+            {
+                warn!(
+                    target: "ffs::repair",
+                    txn_id = txn_id.0,
+                    block_count = write_blocks.len(),
+                    error = %e,
+                    "repair_lifecycle_notify_failed"
+                );
             }
         }
 
@@ -13234,10 +13234,10 @@ impl OpenFs {
         block: BlockNumber,
     ) -> Result<Arc<[u8]>, FfsError> {
         let cacheable = self.can_cache_ext4_read_only_block(scope, block);
-        if cacheable {
-            if let Some(cached) = self.ext4_file_data_block_cache.get(&block) {
-                return Ok(cached);
-            }
+        if cacheable
+            && let Some(cached) = self.ext4_file_data_block_cache.get(&block)
+        {
+            return Ok(cached);
         }
 
         let block_data = self.read_block_arc_with_scope(cx, scope, block)?;
@@ -13472,10 +13472,10 @@ impl OpenFs {
             && !self
                 .readonly_lookup_cache_disabled
                 .load(std::sync::atomic::Ordering::Relaxed);
-        if use_attr_cache {
-            if let Some(attr) = self.ext4_inode_attr_cache.get(&ino.0) {
-                return Ok(attr);
-            }
+        if use_attr_cache
+            && let Some(attr) = self.ext4_inode_attr_cache.get(&ino.0)
+        {
+            return Ok(attr);
         }
         let sb = self
             .ext4_superblock()
@@ -13831,10 +13831,10 @@ impl OpenFs {
         block: BlockNumber,
     ) -> Result<Vec<u8>, FfsError> {
         // 1. Check if the block is already staged in the transaction.
-        if let Some(tx) = &scope.tx {
-            if let Some(staged) = tx.staged_write(block) {
-                return Ok(staged.to_vec());
-            }
+        if let Some(tx) = &scope.tx
+            && let Some(staged) = tx.staged_write(block)
+        {
+            return Ok(staged.to_vec());
         }
 
         // 2. Transaction-backed scopes read at their fixed snapshot for
@@ -13848,10 +13848,10 @@ impl OpenFs {
         //    scopes therefore fall through to the current-snapshot device
         //    adapter below.
         if scope.tx.is_some() {
-            if let Some(snapshot) = scope.snapshot {
-                if let Some(visible) = self.mvcc_store.read_visible(block, snapshot) {
-                    return Ok(visible);
-                }
+            if let Some(snapshot) = scope.snapshot
+                && let Some(visible) = self.mvcc_store.read_visible(block, snapshot)
+            {
+                return Ok(visible);
             }
         }
 
@@ -13906,23 +13906,23 @@ impl OpenFs {
         block: BlockNumber,
     ) -> Result<Arc<[u8]>, FfsError> {
         // 1. Staged write in the active transaction.
-        if let Some(tx) = &scope.tx {
-            if let Some(staged) = tx.staged_write(block) {
-                return Ok(Arc::<[u8]>::from(staged));
-            }
+        if let Some(tx) = &scope.tx
+            && let Some(staged) = tx.staged_write(block)
+        {
+            return Ok(Arc::<[u8]>::from(staged));
         }
 
         // 2. Snapshot-visible MVCC version (transaction-backed scopes only —
         //    no-tx scopes must read at the current snapshot for read-your-writes;
         //    see read_block_with_scope and bd-bw90c).
-        if scope.tx.is_some() {
-            if let Some(snapshot) = scope.snapshot {
-                // Share the visible version (no clone), then one copy into the
-                // Arc — vs `read_visible`'s owned Vec clone THEN Arc copy (two
-                // full-block copies) for the same `Arc<[u8]>` bytes (bd-cc-shardread).
-                if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
-                    return Ok(Arc::<[u8]>::from(visible.as_slice()));
-                }
+        if scope.tx.is_some()
+            && let Some(snapshot) = scope.snapshot
+        {
+            // Share the visible version (no clone), then one copy into the
+            // Arc — vs `read_visible`'s owned Vec clone THEN Arc copy (two
+            // full-block copies) for the same `Arc<[u8]>` bytes (bd-cc-shardread).
+            if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
+                return Ok(Arc::<[u8]>::from(visible.as_slice()));
             }
         }
 
@@ -13947,20 +13947,20 @@ impl OpenFs {
         block: BlockNumber,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R, FfsError> {
-        if let Some(tx) = &scope.tx {
-            if let Some(staged) = tx.staged_write(block) {
-                return Ok(f(staged));
-            }
+        if let Some(tx) = &scope.tx
+            && let Some(staged) = tx.staged_write(block)
+        {
+            return Ok(f(staged));
         }
-        if scope.tx.is_some() {
-            if let Some(snapshot) = scope.snapshot {
-                // `f` only borrows the bytes read-only, so SHARE the visible
-                // version (Arc BlockBuf, no copy) rather than cloning the whole
-                // block via `read_visible` just to borrow it — this completes the
-                // fn's own no-copy contract on the MVCC-hit branch (bd-cc-shardread).
-                if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
-                    return Ok(f(visible.as_slice()));
-                }
+        if scope.tx.is_some()
+            && let Some(snapshot) = scope.snapshot
+        {
+            // `f` only borrows the bytes read-only, so SHARE the visible
+            // version (Arc BlockBuf, no copy) rather than cloning the whole
+            // block via `read_visible` just to borrow it — this completes the
+            // fn's own no-copy contract on the MVCC-hit branch (bd-cc-shardread).
+            if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
+                return Ok(f(visible.as_slice()));
             }
         }
         let dev = self.block_device_adapter();
@@ -14033,12 +14033,12 @@ impl OpenFs {
                     any_overlay = true;
                     continue;
                 }
-                if let Some(snapshot) = overlay_snapshot {
-                    if let Some(visible) = self.mvcc_store.read_visible(block, snapshot) {
-                        resolved.push(Some(visible));
-                        any_overlay = true;
-                        continue;
-                    }
+                if let Some(snapshot) = overlay_snapshot
+                    && let Some(visible) = self.mvcc_store.read_visible(block, snapshot)
+                {
+                    resolved.push(Some(visible));
+                    any_overlay = true;
+                    continue;
                 }
                 resolved.push(None);
             }
@@ -14149,12 +14149,12 @@ impl OpenFs {
                     any_overlay = true;
                     continue;
                 }
-                if let Some(snapshot) = overlay_snapshot {
-                    if let Some(visible) = self.mvcc_store.read_visible(block, snapshot) {
-                        resolved.push(Some(visible));
-                        any_overlay = true;
-                        continue;
-                    }
+                if let Some(snapshot) = overlay_snapshot
+                    && let Some(visible) = self.mvcc_store.read_visible(block, snapshot)
+                {
+                    resolved.push(Some(visible));
+                    any_overlay = true;
+                    continue;
                 }
                 resolved.push(None);
             }
@@ -14442,14 +14442,14 @@ impl OpenFs {
         if inode.flags & EXT4_EXTENTS_FL != 0 {
             let ns = extent_cache_namespace(inode);
             let hot = self.ext4_hot_extents.load();
-            if let Some(slot) = hot.as_ref() {
-                if slot.0 == ns {
-                    return Ok(Self::ext4_resolve_block_from_mappings_hinted(
-                        &slot.1,
-                        logical_block,
-                        hint,
-                    ));
-                }
+            if let Some(slot) = hot.as_ref()
+                && slot.0 == ns
+            {
+                return Ok(Self::ext4_resolve_block_from_mappings_hinted(
+                    &slot.1,
+                    logical_block,
+                    hint,
+                ));
             }
         }
         self.resolve_extent(cx, scope, inode, logical_block)
@@ -14489,13 +14489,13 @@ impl OpenFs {
         // and no `BTreeMap` query — skipping the `ExtentCache` shard `RwLock`
         // that otherwise serializes every reader on one hot file's namespace.
         let hot = self.ext4_hot_extents.load();
-        if let Some(slot) = hot.as_ref() {
-            if slot.0 == ns {
-                return Ok(Self::ext4_resolve_block_from_mappings(
-                    &slot.1,
-                    logical_block,
-                ));
-            }
+        if let Some(slot) = hot.as_ref()
+            && slot.0 == ns
+        {
+            return Ok(Self::ext4_resolve_block_from_mappings(
+                &slot.1,
+                logical_block,
+            ));
         }
         drop(hot);
 
@@ -14841,10 +14841,10 @@ impl OpenFs {
                 // kept, preserving the sorted suffix and the final extent.
                 let mut survivors: Vec<u64> = Vec::new();
                 for (i, idx) in indexes.iter().enumerate() {
-                    if let Some(next) = indexes.get(i + 1) {
-                        if next.logical_block <= from_block {
-                            continue;
-                        }
+                    if let Some(next) = indexes.get(i + 1)
+                        && next.logical_block <= from_block
+                    {
+                        continue;
                     }
                     survivors.push(idx.leaf_block);
                 }
@@ -15676,25 +15676,25 @@ impl OpenFs {
         let index_keyable = dir_inode.number != 0;
         if index_keyable {
             let guard = self.dir_name_index_shard(dir_inode.number).lock();
-            if let Some(idx) = guard.as_ref() {
-                if idx.inode == dir_inode.number && idx.validation == dir_validation {
-                    // A complete name->dirent snapshot (read-only mount, immutable
-                    // dir) answers a PRESENT lookup in O(1) too — return the entry
-                    // directly instead of descending the htree and linearly scanning
-                    // the hash-target leaf (~24% of an ext4 lookup on a large dir).
-                    // Absent names return `None` since the snapshot is complete.
-                    if let Some(present) = idx.present.as_ref() {
-                        return Ok(present.get(name).map(|&(inode, file_type)| Ext4DirEntry {
-                            inode,
-                            rec_len: 0,
-                            name_len: u8::try_from(name.len()).unwrap_or(u8::MAX),
-                            file_type,
-                            name: name.to_vec(),
-                        }));
-                    }
-                    if !idx.names.contains(name) {
-                        return Ok(None);
-                    }
+            if let Some(idx) = guard.as_ref()
+                && idx.inode == dir_inode.number && idx.validation == dir_validation
+            {
+                // A complete name->dirent snapshot (read-only mount, immutable
+                // dir) answers a PRESENT lookup in O(1) too — return the entry
+                // directly instead of descending the htree and linearly scanning
+                // the hash-target leaf (~24% of an ext4 lookup on a large dir).
+                // Absent names return `None` since the snapshot is complete.
+                if let Some(present) = idx.present.as_ref() {
+                    return Ok(present.get(name).map(|&(inode, file_type)| Ext4DirEntry {
+                        inode,
+                        rec_len: 0,
+                        name_len: u8::try_from(name.len()).unwrap_or(u8::MAX),
+                        file_type,
+                        name: name.to_vec(),
+                    }));
+                }
+                if !idx.names.contains(name) {
+                    return Ok(None);
                 }
             }
         }
@@ -15808,17 +15808,17 @@ impl OpenFs {
                 matches!(guard.as_ref(), Some(idx)
                     if idx.inode == dir_inode.number && idx.validation == dir_validation)
             };
-            if !have_current {
-                if let Ok(entries) = self.read_dir_with_scope(cx, scope, dir_inode) {
-                    let names: rustc_hash::FxHashSet<Vec<u8>> =
-                        entries.into_iter().map(|e| e.name).collect();
-                    *self.dir_name_index_shard(dir_inode.number).lock() = Some(DirNameIndex {
-                        inode: dir_inode.number,
-                        validation: dir_validation,
-                        names,
-                        present: None,
-                    });
-                }
+            if !have_current
+                && let Ok(entries) = self.read_dir_with_scope(cx, scope, dir_inode)
+            {
+                let names: rustc_hash::FxHashSet<Vec<u8>> =
+                    entries.into_iter().map(|e| e.name).collect();
+                *self.dir_name_index_shard(dir_inode.number).lock() = Some(DirNameIndex {
+                    inode: dir_inode.number,
+                    validation: dir_validation,
+                    names,
+                    present: None,
+                });
             }
         }
 
@@ -21656,10 +21656,10 @@ impl OpenFs {
     /// it back, keyed on the owning directory inode's number + generation, or
     /// e2fsck reports a directory-block checksum mismatch (bd-gauub).
     fn stamp_ext4_dir_block(&self, block: &mut [u8], dir_ino: u32, generation: u32) {
-        if let Some(sb) = self.ext4_superblock() {
-            if sb.has_metadata_csum() {
-                ffs_ondisk::stamp_dir_block_checksum(block, sb.csum_seed(), dir_ino, generation);
-            }
+        if let Some(sb) = self.ext4_superblock()
+            && sb.has_metadata_csum()
+        {
+            ffs_ondisk::stamp_dir_block_checksum(block, sb.csum_seed(), dir_ino, generation);
         }
     }
 
@@ -21697,21 +21697,21 @@ impl OpenFs {
         generation: u32,
         edit: &ffs_dir::DirBlockEdit,
     ) {
-        if let Some(sb) = self.ext4_superblock() {
-            if sb.has_metadata_csum() {
-                let delta = edit.delta(block);
-                if !ffs_ondisk::ext4::stamp_dir_block_checksum_incremental(
+        if let Some(sb) = self.ext4_superblock()
+            && sb.has_metadata_csum()
+        {
+            let delta = edit.delta(block);
+            if !ffs_ondisk::ext4::stamp_dir_block_checksum_incremental(
+                block,
+                edit.region_start,
+                &delta,
+            ) {
+                ffs_ondisk::stamp_dir_block_checksum(
                     block,
-                    edit.region_start,
-                    &delta,
-                ) {
-                    ffs_ondisk::stamp_dir_block_checksum(
-                        block,
-                        sb.csum_seed(),
-                        dir_ino,
-                        generation,
-                    );
-                }
+                    sb.csum_seed(),
+                    dir_ino,
+                    generation,
+                );
             }
         }
     }
@@ -21722,16 +21722,16 @@ impl OpenFs {
     /// [`stamp_ext4_dir_block`] writes — using the wrong one leaves the dir
     /// e2fsck-dirty.
     fn stamp_ext4_dx_root_block(&self, block: &mut [u8], dir_ino: u32, generation: u32) {
-        if let Some(sb) = self.ext4_superblock() {
-            if sb.has_metadata_csum() {
-                ffs_ondisk::stamp_dx_block_checksum(
-                    block,
-                    sb.csum_seed(),
-                    dir_ino,
-                    generation,
-                    ffs_ondisk::DX_ROOT_COUNT_OFFSET,
-                );
-            }
+        if let Some(sb) = self.ext4_superblock()
+            && sb.has_metadata_csum()
+        {
+            ffs_ondisk::stamp_dx_block_checksum(
+                block,
+                sb.csum_seed(),
+                dir_ino,
+                generation,
+                ffs_ondisk::DX_ROOT_COUNT_OFFSET,
+            );
         }
     }
 
@@ -23467,59 +23467,59 @@ impl OpenFs {
             // hash-correct-leaf routing). The linear scan stays as the
             // correctness fallback when the htree path can't locate the entry
             // (stale/odd index, non-ASCII casefold).
-            if parent_inode.has_htree_index() {
-                if let Some(sb) = self.ext4_superblock() {
-                    let resolve_logical = |logical: u32| -> Option<BlockNumber> {
-                        let pos = extents.partition_point(|e| e.logical_block <= logical);
-                        let ext = extents.get(pos.checked_sub(1)?)?;
-                        if ext.is_unwritten() {
-                            return None;
-                        }
-                        let start = ext.logical_block;
-                        let len = u32::from(ext.actual_len());
-                        (logical >= start && logical < start.saturating_add(len))
-                            .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
-                    };
-                    let read_leaf = |lb| {
-                        resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok())
-                    };
-                    let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-                    let target_logical = if casefold {
-                        ffs_ondisk::htree_target_leaf_block_casefold(
-                            &sb.hash_seed,
-                            sb.has_large_dir(),
-                            name,
-                            |v| sb.effective_dirhash_version(v),
-                            read_leaf,
-                        )
-                    } else {
-                        ffs_ondisk::htree_target_leaf_block(
-                            &sb.hash_seed,
-                            sb.has_large_dir(),
-                            name,
-                            |v| sb.effective_dirhash_version(v),
-                            read_leaf,
-                        )
-                    };
-                    if let Some(target_phys) = target_logical.and_then(|tl| resolve_logical(tl)) {
-                        if Some(target_phys) != dx_root_phys {
-                            let mut data = self.read_block_vec(cx, target_phys)?;
-                            if let Some((ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
-                                &mut data,
-                                name,
-                                reserved_tail,
-                            )? {
-                                self.stamp_ext4_dir_block_after_edit(
-                                    &mut data,
-                                    parent_ino_u32,
-                                    parent_inode.generation,
-                                    &edit,
-                                );
-                                // Defer the persist until the validations below pass.
-                                pending_dir_write = Some((target_phys, data));
-                                removed_ino = Some(ino);
-                            }
-                        }
+            if parent_inode.has_htree_index()
+                && let Some(sb) = self.ext4_superblock()
+            {
+                let resolve_logical = |logical: u32| -> Option<BlockNumber> {
+                    let pos = extents.partition_point(|e| e.logical_block <= logical);
+                    let ext = extents.get(pos.checked_sub(1)?)?;
+                    if ext.is_unwritten() {
+                        return None;
+                    }
+                    let start = ext.logical_block;
+                    let len = u32::from(ext.actual_len());
+                    (logical >= start && logical < start.saturating_add(len))
+                        .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
+                };
+                let read_leaf = |lb| {
+                    resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok())
+                };
+                let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+                let target_logical = if casefold {
+                    ffs_ondisk::htree_target_leaf_block_casefold(
+                        &sb.hash_seed,
+                        sb.has_large_dir(),
+                        name,
+                        |v| sb.effective_dirhash_version(v),
+                        read_leaf,
+                    )
+                } else {
+                    ffs_ondisk::htree_target_leaf_block(
+                        &sb.hash_seed,
+                        sb.has_large_dir(),
+                        name,
+                        |v| sb.effective_dirhash_version(v),
+                        read_leaf,
+                    )
+                };
+                if let Some(target_phys) = target_logical.and_then(|tl| resolve_logical(tl))
+                    && Some(target_phys) != dx_root_phys
+                {
+                    let mut data = self.read_block_vec(cx, target_phys)?;
+                    if let Some((ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
+                        &mut data,
+                        name,
+                        reserved_tail,
+                    )? {
+                        self.stamp_ext4_dir_block_after_edit(
+                            &mut data,
+                            parent_ino_u32,
+                            parent_inode.generation,
+                            &edit,
+                        );
+                        // Defer the persist until the validations below pass.
+                        pending_dir_write = Some((target_phys, data));
+                        removed_ino = Some(ino);
                     }
                 }
             }
@@ -26533,10 +26533,10 @@ impl OpenFs {
         //   `mv subdir newname` leaks a link on the parent (e2fsck "ref count is
         //   N, should be N-1").
         if child_inode.is_dir() {
-            if parent != new_parent {
-                if let Some((dot_dot_block, data)) = planned_child_dir_update.as_ref() {
-                    block_dev.write_block(cx, *dot_dot_block, data)?;
-                }
+            if parent != new_parent
+                && let Some((dot_dot_block, data)) = planned_child_dir_update.as_ref()
+            {
+                block_dev.write_block(cx, *dot_dot_block, data)?;
             }
             let mut adjust_parent = self.read_inode(cx, parent)?;
             // ext4_dec_count for the old parent losing the moved subdir's `..`
@@ -26769,20 +26769,20 @@ impl OpenFs {
                             partial_logical_block,
                             1,
                         )?;
-                        if let Some(mapping) = mappings.first() {
-                            if mapping.physical_start > 0 && mapping.count > 0 {
-                                let physical_block = BlockNumber(mapping.physical_start);
-                                let mut block_data = self.read_block_vec(cx, physical_block)?;
-                                block_data[partial_offset..].fill(0);
-                                if let Some(tx) = &mut scope.tx {
-                                    let tx_dev = TransactionBlockAdapter {
-                                        base: &block_dev,
-                                        tx: Mutex::new(tx),
-                                    };
-                                    tx_dev.write_block(cx, physical_block, &block_data)?;
-                                } else {
-                                    block_dev.write_block(cx, physical_block, &block_data)?;
-                                }
+                        if let Some(mapping) = mappings.first()
+                            && mapping.physical_start > 0 && mapping.count > 0
+                        {
+                            let physical_block = BlockNumber(mapping.physical_start);
+                            let mut block_data = self.read_block_vec(cx, physical_block)?;
+                            block_data[partial_offset..].fill(0);
+                            if let Some(tx) = &mut scope.tx {
+                                let tx_dev = TransactionBlockAdapter {
+                                    base: &block_dev,
+                                    tx: Mutex::new(tx),
+                                };
+                                tx_dev.write_block(cx, physical_block, &block_data)?;
+                            } else {
+                                block_dev.write_block(cx, physical_block, &block_data)?;
                             }
                         }
                     }
@@ -26929,10 +26929,10 @@ impl OpenFs {
     /// any in-place header mutation (e.g. `h_refcount`) — so the on-disk block
     /// is `e2fsck`-clean (bd-fwph3).
     fn stamp_ext4_xattr_block_csum(&self, block: &mut [u8], block_no: BlockNumber) {
-        if let Some(sb) = self.ext4_superblock() {
-            if sb.has_metadata_csum() {
-                ffs_ondisk::stamp_xattr_block_checksum(block, sb.csum_seed(), block_no.0);
-            }
+        if let Some(sb) = self.ext4_superblock()
+            && sb.has_metadata_csum()
+        {
+            ffs_ondisk::stamp_xattr_block_checksum(block, sb.csum_seed(), block_no.0);
         }
     }
 
@@ -31535,13 +31535,13 @@ impl OpenFs {
         // so a free-space tree we do NOT rewrite keeps the generation its block
         // still carries. In-place update of an existing item: no shape change,
         // so the fixpoint above stays converged.
-        if let Some((fst_addr, fst_level)) = fst_reuse {
-            if alloc.extent_alloc.extent_tree_root_is_leaf() {
-                alloc
-                    .extent_alloc
-                    .set_tree_block_generation(fst_addr, fst_level, new_gen)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            }
+        if let Some((fst_addr, fst_level)) = fst_reuse
+            && alloc.extent_alloc.extent_tree_root_is_leaf()
+        {
+            alloc
+                .extent_alloc
+                .set_tree_block_generation(fst_addr, fst_level, new_gen)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         }
 
         // ── CHUNK_TREE + DEV_TREE commit (bd-a136s) ─────────────────────────────
@@ -36487,10 +36487,10 @@ impl OpenFs {
     }
 
     fn ext4_dir_reserved_tail(&self) -> usize {
-        if let FsFlavor::Ext4(sb) = &self.flavor {
-            if sb.has_metadata_csum() {
-                return 12;
-            }
+        if let FsFlavor::Ext4(sb) = &self.flavor
+            && sb.has_metadata_csum()
+        {
+            return 12;
         }
         0
     }
@@ -71005,12 +71005,12 @@ mod tests {
                     let mut got: std::collections::BTreeMap<String, u64> =
                         std::collections::BTreeMap::new();
                     for e in fs.readdir(&cx, InodeNumber(pino), 0).expect("readdir") {
-                        if e.name != b"." && e.name != b".." {
-                            if let Ok(s) = std::str::from_utf8(&e.name) {
-                                // Only track the name pool (ignore pa/pb in root).
-                                if names.contains(&s) {
-                                    got.insert(s.to_owned(), e.ino.0);
-                                }
+                        if e.name != b"." && e.name != b".."
+                            && let Ok(s) = std::str::from_utf8(&e.name)
+                        {
+                            // Only track the name pool (ignore pa/pb in root).
+                            if names.contains(&s) {
+                                got.insert(s.to_owned(), e.ino.0);
                             }
                         }
                     }

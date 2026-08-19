@@ -4172,24 +4172,24 @@ impl FsOps for OpenFs {
         // there is nothing to release. Keyed on `op.is_write()` (symmetric with the
         // register condition) rather than `scope.tx`, because a committed write has
         // already consumed its `tx` yet its snapshot is still registered.
-        if op.is_write() {
-            if let Some(snapshot) = scope.snapshot {
-                let released = self.mvcc_store.release_snapshot(snapshot);
-                if released {
-                    trace!(
-                        target: "ffs::mvcc",
-                        op = ?op,
-                        snapshot_high = snapshot.high.0,
-                        "mvcc_request_scope_end_write"
-                    );
-                } else {
-                    warn!(
-                        target: "ffs::mvcc",
-                        op = ?op,
-                        snapshot_high = snapshot.high.0,
-                        "mvcc_request_scope_release_missed"
-                    );
-                }
+        if op.is_write()
+            && let Some(snapshot) = scope.snapshot
+        {
+            let released = self.mvcc_store.release_snapshot(snapshot);
+            if released {
+                trace!(
+                    target: "ffs::mvcc",
+                    op = ?op,
+                    snapshot_high = snapshot.high.0,
+                    "mvcc_request_scope_end_write"
+                );
+            } else {
+                warn!(
+                    target: "ffs::mvcc",
+                    op = ?op,
+                    snapshot_high = snapshot.high.0,
+                    "mvcc_request_scope_release_missed"
+                );
             }
         }
 
