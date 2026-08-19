@@ -571,6 +571,26 @@ fn emit_xattr_suppression_evidence(line: String) {
     }
 }
 
+/// The capability short-circuit's own prefix, and it must stay its own.
+///
+/// bd-t0xoq originally reported this through `emit_xattr_suppression_evidence`,
+/// which put TWO lines under `mount_candidate_xattr,`. The comparator requires
+/// that prefix to appear exactly once — deliberately, because two lines with the
+/// same prefix and different payloads cannot be disambiguated by a reader, and
+/// silently taking the first would be inventing an observation. So every mounted
+/// run against an ELF built after bd-t0xoq died on
+/// `FUSE mount resolved xattr suppression was reported more than once` before it
+/// measured anything.
+///
+/// These are two independent switches: the kernel-suppression switch tells the
+/// kernel to stop probing, while the short-circuit answers probes that still
+/// arrive without reading the inode. One prefix each.
+fn emit_capability_shortcircuit_evidence(line: String) {
+    if std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0") {
+        eprintln!("mount_candidate_shortcircuit,{line}");
+    }
+}
+
 fn resolve_xattr_suppression(fs: &FrankenFuse) {
     let setting =
         xattr_switch_setting_from_value(std::env::var("FFS_FUSE_XATTR_NO_SUPPORT").ok().as_deref());
@@ -586,7 +606,7 @@ fn resolve_xattr_suppression(fs: &FrankenFuse) {
         // The comparator distinguishes a lever from a null by comparing the two
         // arms' lines, so the off arm has to have one.
         emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, None, false));
-        emit_xattr_suppression_evidence(capability_shortcircuit_evidence(
+        emit_capability_shortcircuit_evidence(capability_shortcircuit_evidence(
             false,
             None,
             fs.inner.read_only,
@@ -602,7 +622,7 @@ fn resolve_xattr_suppression(fs: &FrankenFuse) {
         capability_shortcircuit_allowed(shortcircuit_requested, presence, fs.inner.read_only);
     XATTR_PROVEN_ABSENT.store(shortcircuit, std::sync::atomic::Ordering::Relaxed);
     emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, Some(presence), allowed));
-    emit_xattr_suppression_evidence(capability_shortcircuit_evidence(
+    emit_capability_shortcircuit_evidence(capability_shortcircuit_evidence(
         shortcircuit_requested,
         Some(presence),
         fs.inner.read_only,
@@ -1146,6 +1166,21 @@ static READDIRPLUS_PREFETCH_SERVED: std::sync::atomic::AtomicU64 =
 static READDIRPLUS_PREFETCH_INLINE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// How many times each DIRECTORY handler was entered (bd-xfe7z).
+///
+/// Both handlers open their request scope with `RequestOp::Readdir`, so every
+/// existing metric aggregates them and none can tell them apart. That is exactly
+/// the distinction the census now needs: the prefetch lives only in
+/// `readdirplus`, and the first census run showed it entered on 2 calls while
+/// ~102 directory requests were served over a 20001-entry sweep. Either ~100 of
+/// those were plain `readdir` — in which case the prefetch lever can never reach
+/// them and its ceiling is far lower than assumed — or they were readdirplus and
+/// something inside the handler skipped the block. These two counters separate
+/// those without changing any behaviour.
+static READDIR_HANDLER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READDIRPLUS_HANDLER_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Pure half of `FFS_FUSE_READDIRPLUS_CENSUS`, testable without touching the
 /// process environment.
 fn readdirplus_census_from_value(value: Option<&str>) -> bool {
@@ -1185,8 +1220,10 @@ fn readdirplus_census_line() -> String {
     format!(
         "readdirplus_census,prefetch_calls={calls},bound_sum={bound_sum},\
          mean_bound_tenths={mean_bound_tenths},served={served},inline={inline},\
-         observed_fill={}",
-        READDIRPLUS_OBSERVED_FILL.load(Relaxed)
+         observed_fill={},readdirplus_handler_calls={},readdir_handler_calls={}",
+        READDIRPLUS_OBSERVED_FILL.load(Relaxed),
+        READDIRPLUS_HANDLER_CALLS.load(Relaxed),
+        READDIR_HANDLER_CALLS.load(Relaxed)
     )
 }
 
@@ -4899,6 +4936,12 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EINVAL);
             return;
         };
+        // bd-xfe7z census: BOTH directory handlers open their scope with
+        // `RequestOp::Readdir`, so no existing metric can tell a plain readdir
+        // from a readdirplus. That distinction is the open question -- the
+        // prefetch lives only in readdirplus, and the census showed it running
+        // on 2 calls while ~102 requests were served.
+        READDIR_HANDLER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
             // bd-xfe7z: the last decomposition left this call inside the
             // "everything else" remainder, so 66.4% was not pure handler work.
@@ -4967,6 +5010,10 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EINVAL);
             return;
         };
+        // bd-xfe7z census: counted at handler entry, BEFORE the prefetch gate,
+        // so `prefetch_calls` can be read as a fraction of the readdirplus calls
+        // that actually happened rather than of a number nobody measured.
+        READDIRPLUS_HANDLER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
             self.inner
                 .ops
@@ -8790,6 +8837,12 @@ mod tests {
             "served=",
             "inline=",
             "observed_fill=",
+            // bd-xfe7z: without these two, `prefetch_calls` is a numerator with
+            // no denominator — 2 could mean "the block was skipped 100 times" or
+            // "there were only 2 readdirplus calls to begin with", which are
+            // completely different findings.
+            "readdirplus_handler_calls=",
+            "readdir_handler_calls=",
         ] {
             assert!(
                 line.contains(field),
