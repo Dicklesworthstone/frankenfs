@@ -46,6 +46,12 @@ fn raw_extents() -> Vec<(u64, u64)> {
 
 /// OLD: build the Vec, then a SEPARATE O(E) rescan for the max end.
 fn two_pass(raw: &[(u64, u64)]) -> (Vec<(u64, u64)>, u64) {
+    // Kept verbatim: this bench exists to measure the OLD construction against the
+    // fused one, so the expression under test is the point. `to_vec()` would be the
+    // same work under a different spelling, but rewriting the control arm of a
+    // comparison to satisfy a lint is how a benchmark quietly stops measuring what
+    // its name says.
+    #[expect(clippy::iter_cloned_collect, reason = "the control arm's exact shape is the subject")]
     let allocated_ranges: Vec<(u64, u64)> = raw.iter().copied().collect();
     let mut last_extent_end = MIN_USABLE;
     for &(ext_start, ext_size) in &allocated_ranges {

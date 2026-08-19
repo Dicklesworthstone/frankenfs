@@ -793,6 +793,13 @@ impl DiskWritebackContext {
     /// written-by-this-transaction and carries `generation`, so passing an empty
     /// map is byte-identical to [`Self::with_allocated_addresses`].
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a field-wise constructor: the eight arguments ARE the struct's eight \
+                  fields, in declaration order. Grouping them into a parameter struct \
+                  would add a type whose only purpose is to be destructured immediately, \
+                  and this has callers in two crates."
+    )]
     pub fn with_allocated_addresses_and_generations(
         fsid: [u8; 16],
         chunk_tree_uuid: [u8; 16],

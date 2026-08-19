@@ -35,7 +35,7 @@ fn build_payload(n: usize, value_len: usize) -> Vec<u8> {
         hdr[27..29].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(name_bytes);
-        buf.extend(std::iter::repeat((i as u8).wrapping_mul(31)).take(value_len));
+        buf.extend(std::iter::repeat_n((i as u8).wrapping_mul(31), value_len));
     }
     buf
 }

@@ -1,5 +1,16 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::cast_possible_truncation)]
+// Every measurement in this file is PAIRED: `whole_lhs_ns` and `whole_rhs_ns` are
+// the two arms of one A/B, `standard_lhs_ns`/`standard_rhs_ns` likewise. The names
+// differ by one syllable because the things they hold differ by one thing — which
+// arm. Renaming them to satisfy the lint would break the correspondence that makes
+// a paired run readable. `expect` rather than `allow` so it reports itself as
+// unnecessary if these ever go away.
+#![expect(clippy::similar_names, reason = "lhs/rhs are the two arms of a paired measurement")]
+// These are whole benchmark bodies: fixture, both arms, and the summary they print.
+// Splitting them moves the arms away from the setup they share, which is exactly
+// the coupling a paired measurement depends on.
+#![expect(clippy::too_many_lines, reason = "one benchmark body: fixture, both arms, summary")]
 
 //! Whole-stream benchmark for btrfs send path construction (bd-h3087).
 //!
@@ -51,7 +62,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     assert!(!values.is_empty(), "median requires at least one sample");
     values.sort_by(f64::total_cmp);
     let midpoint = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         values[midpoint - 1].midpoint(values[midpoint])
     } else {
         values[midpoint]
@@ -333,12 +344,12 @@ fn build_deep_send_items() -> Vec<BtrfsLeafEntry> {
 fn collect_inode_links(items: &[BtrfsLeafEntry]) -> BTreeMap<u64, Vec<(u64, Vec<u8>)>> {
     let mut inode_links: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
     for entry in items {
-        if entry.key.item_type == BTRFS_ITEM_INODE_REF {
-            if let Ok(refs) = parse_inode_refs(&entry.data) {
-                let links = inode_links.entry(entry.key.objectid).or_default();
-                for inode_ref in refs {
-                    links.push((entry.key.offset, inode_ref.name.clone()));
-                }
+        if entry.key.item_type == BTRFS_ITEM_INODE_REF
+            && let Ok(refs) = parse_inode_refs(&entry.data)
+        {
+            let links = inode_links.entry(entry.key.objectid).or_default();
+            for inode_ref in refs {
+                links.push((entry.key.offset, inode_ref.name.clone()));
             }
         }
     }
@@ -424,6 +435,16 @@ fn observe_ns_per_iteration(mut operation: impl FnMut(), iterations: u32) -> f64
     started.elapsed().as_secs_f64() * 1e9 / f64::from(iterations)
 }
 
+/// ⚠️ RETAINED, NOT DEAD. This and the two functions below are a measuring
+/// instrument for output-buffer growth — how many command frames, capacity
+/// changes and pointer relocations a generated send stream costs. No benchmark
+/// currently calls them, which is why clippy reports them, but deleting an
+/// instrument someone built to characterise a mechanism needs its author's say
+/// (AGENTS.md rule 1), not a lint's.
+///
+/// `expect` rather than `allow` deliberately: the moment a bench uses these
+/// again, the compiler reports this expectation as unfulfilled and it comes out.
+#[expect(dead_code, reason = "retained buffer-growth instrument; removal is the author's call")]
 #[derive(Debug, Clone, Copy, Default)]
 struct BufferGrowthMechanism {
     command_frames: usize,
@@ -433,6 +454,7 @@ struct BufferGrowthMechanism {
     final_capacity: usize,
 }
 
+#[expect(dead_code, reason = "retained buffer-growth instrument; see BufferGrowthMechanism")]
 fn record_buffer_growth(
     buffer: &Vec<u8>,
     prior_capacity: usize,
@@ -454,6 +476,7 @@ fn record_buffer_growth(
 /// generated stream. Command bytes are appended as one frame after the same
 /// `reserve(full_len)` call production makes; capacity evolution is therefore
 /// identical even though the individual frame fields are already serialized.
+#[expect(dead_code, reason = "retained buffer-growth instrument; see BufferGrowthMechanism")]
 fn count_output_buffer_growth(stream: &[u8]) -> BufferGrowthMechanism {
     let header_len = BTRFS_SEND_STREAM_MAGIC.len() + std::mem::size_of::<u32>();
     assert!(
@@ -2382,12 +2405,12 @@ fn legacy_generate_send_stream_for_fixture(
 
     let mut inode_links: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
     for entry in items {
-        if entry.key.item_type == BTRFS_ITEM_INODE_REF {
-            if let Ok(refs) = parse_inode_refs(&entry.data) {
-                let links = inode_links.entry(entry.key.objectid).or_default();
-                for inode_ref in refs {
-                    links.push((entry.key.offset, inode_ref.name));
-                }
+        if entry.key.item_type == BTRFS_ITEM_INODE_REF
+            && let Ok(refs) = parse_inode_refs(&entry.data)
+        {
+            let links = inode_links.entry(entry.key.objectid).or_default();
+            for inode_ref in refs {
+                links.push((entry.key.offset, inode_ref.name));
             }
         }
     }
@@ -2527,16 +2550,16 @@ fn legacy_generate_send_stream_for_fixture(
             _ => continue,
         }
 
-        if file_type != ffs_types::S_IFDIR {
-            if let Some(links) = inode_links.get(&ino) {
-                for (parent, name) in links.iter().skip(1) {
-                    let mut link_path = build_path(*parent);
-                    if !link_path.is_empty() {
-                        link_path.push(b'/');
-                    }
-                    link_path.extend_from_slice(name);
-                    legacy_add_command(&mut builder, build_link_command(&link_path, &path));
+        if file_type != ffs_types::S_IFDIR
+            && let Some(links) = inode_links.get(&ino)
+        {
+            for (parent, name) in links.iter().skip(1) {
+                let mut link_path = build_path(*parent);
+                if !link_path.is_empty() {
+                    link_path.push(b'/');
                 }
+                link_path.extend_from_slice(name);
+                legacy_add_command(&mut builder, build_link_command(&link_path, &path));
             }
         }
 
@@ -2546,6 +2569,7 @@ fn legacy_generate_send_stream_for_fixture(
             &mut builder,
             build_chown_command(&path, u64::from(inode.uid), u64::from(inode.gid)),
         );
+        #[expect(clippy::cast_possible_wrap, reason = "on-disk unsigned times into the signed send-stream fields")]
         legacy_add_command(
             &mut builder,
             build_utimes_command(

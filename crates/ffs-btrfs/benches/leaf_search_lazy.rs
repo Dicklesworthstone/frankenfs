@@ -48,7 +48,7 @@ fn eager_search(buf: &[u8], n: usize, target: u64) -> Option<usize> {
 fn lazy_search(buf: &[u8], n: usize, target: u64) -> Option<usize> {
     let (mut lo, mut hi) = (0usize, n);
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = lo.midpoint(hi);
         match read_objectid(buf, mid).cmp(&target) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,

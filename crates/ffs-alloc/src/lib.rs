@@ -2377,6 +2377,15 @@ fn group_desc_location(
 /// of a block's descriptors to one buffer produces exactly the bytes the
 /// per-group sequence would have left. The `rmw_block` range hint is the union
 /// of the touched slots, which keeps the per-descriptor MVCC merge proof that
+/// One group's contribution to a batched descriptor persist: the group, its
+/// stats, and optional whole-bitmap overrides for its block and inode bitmaps —
+/// the same four values [`persist_group_desc_force`] takes one call at a time.
+///
+/// Named because the bare 4-tuple appears in the batched API and in every caller
+/// that builds a batch, where `Option<Vec<u8>>` twice in a row says nothing about
+/// which bitmap is which.
+pub type GroupDescBatchEntry = (GroupNumber, GroupStats, Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// lets concurrent creates in different groups merge rather than conflict.
 ///
 /// # Errors
@@ -2385,7 +2394,7 @@ pub fn persist_group_descs_batched(
     cx: &Cx,
     dev: &dyn BlockDevice,
     pctx: &PersistCtx,
-    entries: &[(GroupNumber, GroupStats, Option<Vec<u8>>, Option<Vec<u8>>)],
+    entries: &[GroupDescBatchEntry],
 ) -> Result<()> {
     let block_size = dev.block_size() as usize;
     // Preserve per-block ordering: within a block, later entries must overwrite
@@ -5225,7 +5234,7 @@ mod tests {
         }
 
         let batched = CountingBlockDevice::new(4096);
-        let entries: Vec<(GroupNumber, GroupStats, Option<Vec<u8>>, Option<Vec<u8>>)> = groups
+        let entries: Vec<GroupDescBatchEntry> = groups
             .iter()
             .map(|gs| (gs.group, gs.clone(), None, None))
             .collect();

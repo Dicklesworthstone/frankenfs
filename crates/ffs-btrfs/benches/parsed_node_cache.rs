@@ -921,6 +921,12 @@ fn assert_snapshot_candidate_filter_isomorphic(entries: &[BtrfsLeafEntry]) {
 }
 
 fn bench_snapshot_candidate_filter(c: &mut Criterion) {
+    // Hoisted: a `const` after a statement is an item declared in the middle of a
+    // scope it is already visible throughout, which reads as sequencing it does
+    // not have.
+    const REGULAR_ROOTS: u64 = 16_384;
+    const SNAPSHOTS: u64 = 64;
+
     assert_snapshot_candidate_filter_isomorphic(&[]);
     assert_snapshot_candidate_filter_isomorphic(&[snapshot_root_item(
         BTRFS_FIRST_FREE_OBJECTID,
@@ -949,8 +955,6 @@ fn bench_snapshot_candidate_filter(c: &mut Criterion) {
         snapshot_root_item(800, snapshot_uuid(801), duplicate_uuid),
     ]);
 
-    const REGULAR_ROOTS: u64 = 16_384;
-    const SNAPSHOTS: u64 = 64;
     let entries = snapshot_candidate_filter_catalog(REGULAR_ROOTS, SNAPSHOTS);
     assert_snapshot_candidate_filter_isomorphic(&entries);
 
@@ -1120,6 +1124,11 @@ fn bench_snapshot_name_filter_group(c: &mut Criterion, label: &str, entries: &[B
 }
 
 fn bench_snapshot_name_filter(c: &mut Criterion) {
+    // Hoisted, as above.
+    const REGULAR_ROOTS: u64 = 4096;
+    const SNAPSHOTS: u64 = 64;
+    const DENSE_SNAPSHOTS: u64 = 1024;
+
     assert_snapshot_name_filter_isomorphic(&[]);
 
     let source_uuid = snapshot_uuid(300);
@@ -1139,12 +1148,9 @@ fn bench_snapshot_name_filter(c: &mut Criterion) {
         snapshot_root_item(401, snapshot_uuid(401), source_uuid),
     ]);
 
-    const REGULAR_ROOTS: u64 = 4096;
-    const SNAPSHOTS: u64 = 64;
     let sparse_entries = snapshot_name_filter_catalog(REGULAR_ROOTS, SNAPSHOTS);
     assert_snapshot_name_filter_isomorphic(&sparse_entries);
 
-    const DENSE_SNAPSHOTS: u64 = 1024;
     let dense_entries = named_snapshot_catalog(DENSE_SNAPSHOTS);
     assert_snapshot_name_filter_isomorphic(&dense_entries);
 

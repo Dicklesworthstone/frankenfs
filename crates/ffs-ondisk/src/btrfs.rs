@@ -3331,11 +3331,9 @@ mod tests {
     /// reads, on a filesystem that was fine a moment earlier.
     #[test]
     fn to_bytes_refuses_an_oversized_sys_chunk_array_bd_q4qr8() {
-        // Checked at COMPILE time: 22 whole entries really do overflow the 2048-byte
-        // array. It is a fact about two literals, so it belongs here and not in a
-        // runtime assert.
-        const _: () = assert!(22 * 97 > 2048, "22 entries really do overflow");
-
+        // 22 whole 97-byte entries is 2134 bytes against the format's 2048-byte
+        // sys_chunk_array — stated rather than asserted, because an assertion over
+        // two literals is one clippy rightly refuses in either form.
         let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
             .expect("sb parse");
 

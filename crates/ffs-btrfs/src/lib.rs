@@ -291,7 +291,7 @@ pub fn build_extent_csum_item(
             "sectorsize must be non-zero",
         ));
     }
-    if data.is_empty() || data.len() % sectorsize != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(sectorsize) {
         return Err(BtrfsMutationError::InvalidConfig(
             "data must be a positive whole multiple of sectorsize",
         ));
@@ -369,7 +369,7 @@ pub fn build_extent_csum_items(
             "sectorsize must be non-zero",
         ));
     }
-    if data.is_empty() || data.len() % sectorsize != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(sectorsize) {
         return Err(BtrfsMutationError::InvalidConfig(
             "data must be a positive whole multiple of sectorsize",
         ));
@@ -491,7 +491,7 @@ pub fn verify_extent_csum(
             "sectorsize must be non-zero",
         )));
     }
-    if data.is_empty() || data.len() % sectorsize != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(sectorsize) {
         return Err(Err(BtrfsMutationError::InvalidConfig(
             "data must be a positive whole multiple of sectorsize",
         )));
@@ -1330,8 +1330,9 @@ pub fn find_xattr_item_value(data: &[u8], target: &[u8]) -> Result<Option<Vec<u8
     Ok(matched.map(|(start, end)| data[start..end].to_vec()))
 }
 
-/// Parse only the NAMES of the xattr items in a DIR_ITEM/XATTR_ITEM payload,
-/// without materialising values. `listxattr` needs names only, but
+/// Parse only the NAMES of the xattr items in a DIR_ITEM/XATTR_ITEM payload.
+///
+/// Without materialising values. `listxattr` needs names only, but
 /// [`parse_xattr_items`] copies each attribute's value into a fresh `Vec`
 /// (`data[name_end..value_end].to_vec()`) that the caller immediately discards.
 /// This performs the identical walk + bounds validation (so it rejects the same
@@ -2653,7 +2654,7 @@ fn floor_descend(
             reason: "zero nodesize",
         });
     }
-    if logical % nodesize_u64 != 0 {
+    if !logical.is_multiple_of(nodesize_u64) {
         return Err(ParseError::InvalidField {
             field: "logical_address",
             reason: "not aligned to nodesize",
@@ -2704,7 +2705,7 @@ impl BtrfsTreeWalker<'_> {
                 reason: "zero nodesize",
             });
         }
-        if logical % nodesize_u64 != 0 {
+        if !logical.is_multiple_of(nodesize_u64) {
             return Err(ParseError::InvalidField {
                 field: "logical_address",
                 reason: "not aligned to nodesize",
@@ -2752,10 +2753,10 @@ impl BtrfsTreeWalker<'_> {
                         }
                         // Span ends at or before `lo` -> no overlap. The span end
                         // is the next sibling's key; the last child is unbounded.
-                        if let Some(next) = ptrs.get(idx + 1) {
-                            if key_cmp(&next.key, lo) != Ordering::Greater {
-                                continue;
-                            }
+                        if let Some(next) = ptrs.get(idx + 1)
+                            && key_cmp(&next.key, lo) != Ordering::Greater
+                        {
+                            continue;
                         }
                     }
                     self.walk_node(kp.blockptr)?;
@@ -2786,7 +2787,7 @@ impl BtrfsParallelTreeWalker<'_> {
                 reason: "zero nodesize",
             });
         }
-        if logical % nodesize_u64 != 0 {
+        if !logical.is_multiple_of(nodesize_u64) {
             return Err(ParseError::InvalidField {
                 field: "logical_address",
                 reason: "not aligned to nodesize",
@@ -2849,10 +2850,10 @@ impl BtrfsParallelTreeWalker<'_> {
                         if key_cmp(&kp.key, hi) != Ordering::Less {
                             break;
                         }
-                        if let Some(next) = ptrs.get(idx + 1) {
-                            if key_cmp(&next.key, lo) != Ordering::Greater {
-                                continue;
-                            }
+                        if let Some(next) = ptrs.get(idx + 1)
+                            && key_cmp(&next.key, lo) != Ordering::Greater
+                        {
+                            continue;
                         }
                     }
                     children.push(kp.blockptr);
@@ -2959,7 +2960,7 @@ impl BtrfsBorrowedTreeWalker<'_> {
                 reason: "zero nodesize",
             });
         }
-        if logical % nodesize_u64 != 0 {
+        if !logical.is_multiple_of(nodesize_u64) {
             return Err(ParseError::InvalidField {
                 field: "logical_address",
                 reason: "not aligned to nodesize",
@@ -2996,10 +2997,10 @@ impl BtrfsBorrowedTreeWalker<'_> {
                         if key_cmp(&kp.key, hi) != Ordering::Less {
                             break;
                         }
-                        if let Some(next) = ptrs.get(idx + 1) {
-                            if key_cmp(&next.key, lo) != Ordering::Greater {
-                                continue;
-                            }
+                        if let Some(next) = ptrs.get(idx + 1)
+                            && key_cmp(&next.key, lo) != Ordering::Greater
+                        {
+                            continue;
                         }
                     }
                     self.walk_node(kp.blockptr)?;
@@ -3059,6 +3060,7 @@ fn collect_leaf_item_batch(
 /// `BtrfsKey` deliberately does not derive `Ord`: the on-disk ordering is a
 /// format property, not a derived one, and deriving it would silently follow
 /// field declaration order.
+#[must_use]
 pub fn key_cmp(lhs: &BtrfsKey, rhs: &BtrfsKey) -> Ordering {
     lhs.objectid
         .cmp(&rhs.objectid)
@@ -5008,6 +5010,14 @@ impl InMemoryCowBtrfsTree {
     /// `true` iff a rotate/merge happened; `false` (the common no-underflow case)
     /// leaves `keys` untouched and lets the caller fix only `keys[child_idx - 1]`
     /// (the deleted child's minimum may have shifted).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one B-tree rebalance: borrow-left, borrow-right and merge are three \
+                  branches of a single decision over the same borrowed vectors, and this \
+                  is the mass-deletion hot path (bd-btrcow-sepkeep2). Splitting them into \
+                  helpers would re-borrow `keys` and `children` per branch for no gain in \
+                  clarity and a real risk to code that is measured."
+    )]
     fn rebalance_child(
         &mut self,
         keys: &mut Vec<BtrfsKey>,
@@ -6708,9 +6718,11 @@ pub struct ChunkAllocationRequest {
     pub dev_uuid: [u8; 16],
 }
 
-/// Key type of a CHUNK_ITEM. Verified against `/usr/include/linux/btrfs_tree.h`
-/// (`BTRFS_CHUNK_ITEM_KEY 228`), like every other key constant this plan uses:
-/// BLOCK_GROUP_ITEM 192, DEV_EXTENT 204, FIRST_CHUNK_TREE_OBJECTID 256.
+/// Key type of a CHUNK_ITEM.
+///
+/// Verified against `/usr/include/linux/btrfs_tree.h` (`BTRFS_CHUNK_ITEM_KEY
+/// 228`), like every other key constant this plan uses: BLOCK_GROUP_ITEM 192,
+/// DEV_EXTENT 204, FIRST_CHUNK_TREE_OBJECTID 256.
 pub const BTRFS_ITEM_CHUNK_ITEM: u8 = 228;
 
 /// Build the complete, mutually consistent set of records for one SINGLE-profile
@@ -6733,7 +6745,7 @@ pub fn plan_chunk_allocation(
     if request.length == 0 {
         return Err(BtrfsMutationError::InvalidConfig("chunk length is zero"));
     }
-    if request.length % BTRFS_STRIPE_LEN != 0 {
+    if !request.length.is_multiple_of(BTRFS_STRIPE_LEN) {
         return Err(BtrfsMutationError::InvalidConfig(
             "chunk length is not a multiple of the stripe length",
         ));
@@ -7076,7 +7088,7 @@ pub fn plan_growth_for_commit(
     let Some(shortfall) = alloc.commit_metadata_shortfall(tree_nodes, nodesize) else {
         return Ok(None);
     };
-    plan_growth_for_shortfall(alloc, chunks, ChunkKind::Metadata, shortfall, device, policy)
+    plan_growth_for_shortfall(chunks, ChunkKind::Metadata, shortfall, device, policy)
 }
 
 /// [`plan_growth_for_commit`] for an arbitrary chunk kind and an already-computed
@@ -7096,7 +7108,6 @@ pub fn plan_growth_for_commit(
 /// # Errors
 /// As [`plan_growth_for_commit`].
 pub fn plan_growth_for_shortfall(
-    alloc: &BtrfsExtentAllocator,
     chunks: &[BtrfsChunkEntry],
     kind: ChunkKind,
     shortfall: u64,
@@ -7191,6 +7202,14 @@ pub fn plan_growth_for_shortfall(
 /// already present — a second chunk at one address aliases live data — a SYSTEM
 /// chunk with no superblock to record it in or no room in the array, and any
 /// error from the underlying trees.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the length IS the structure: every refusal precedes every write, so a \
+              rejected plan leaves the trees untouched. Splitting the phases would have \
+              to thread the parsed DEV_ITEM, its key and its buffer across the seam, and \
+              the ordering this function exists to guarantee would become a convention \
+              between two functions instead of a property of one."
+)]
 pub fn apply_chunk_allocation(
     plan: &ChunkAllocationPlan,
     chunk_tree: &mut InMemoryCowBtrfsTree,
@@ -7348,9 +7367,7 @@ pub fn apply_chunk_allocation(
     chunk_tree.update(&dev_item_key, &dev_item_value)?;
 
     if plan.needs_sys_chunk_array {
-        let sb = superblock
-            .as_deref_mut()
-            .ok_or(BtrfsMutationError::BrokenInvariant(
+        let sb = superblock.ok_or(BtrfsMutationError::BrokenInvariant(
                 "superblock vanished between the capacity check and the append",
             ))?;
         sb.append_sys_chunk_entry(&plan.chunk).map_err(|_| {
@@ -7392,9 +7409,11 @@ pub fn next_logical_chunk_start(chunks: &[BtrfsChunkEntry]) -> Result<u64, Btrfs
         .ok_or(BtrfsMutationError::AddressOverflow)
 }
 
-/// Why an allocation found no room, in the terms that separate bd-uxh7t's two
-/// candidate mechanisms. Produced by `BtrfsExtentAllocator::describe_no_space`
-/// at the moment `NoSpace` is returned; carries no policy.
+/// Why an allocation found no room.
+///
+/// In the terms that separate bd-uxh7t's two candidate mechanisms. Produced by
+/// `BtrfsExtentAllocator::describe_no_space` at the moment `NoSpace` is
+/// returned; carries no policy.
 ///
 /// `used` counts bytes described by live extent items. `pinned` counts bytes held
 /// out of allocation because the committed superblock still points at them — the
@@ -9088,11 +9107,11 @@ impl BtrfsExtentAllocator {
                 item_type: BTRFS_ITEM_BLOCK_GROUP_ITEM,
                 offset: total_bytes,
             };
-            if let Some(mut value) = self.extent_tree.get(&bg_key) {
-                if value.len() >= 8 {
-                    value[0..8].copy_from_slice(&used.to_le_bytes());
-                    self.extent_tree.update(&bg_key, &value)?;
-                }
+            if let Some(mut value) = self.extent_tree.get(&bg_key)
+                && value.len() >= 8
+            {
+                value[0..8].copy_from_slice(&used.to_le_bytes());
+                self.extent_tree.update(&bg_key, &value)?;
             }
             grand_total = grand_total.saturating_add(used);
         }
@@ -9182,11 +9201,11 @@ impl BtrfsExtentAllocator {
             item_type: BTRFS_ITEM_BLOCK_GROUP_ITEM,
             offset: total_bytes,
         };
-        if let Some(mut value) = self.extent_tree.get(&bg_key) {
-            if value.len() >= 8 {
-                value[0..8].copy_from_slice(&used.to_le_bytes());
-                self.extent_tree.update(&bg_key, &value)?;
-            }
+        if let Some(mut value) = self.extent_tree.get(&bg_key)
+            && value.len() >= 8
+        {
+            value[0..8].copy_from_slice(&used.to_le_bytes());
+            self.extent_tree.update(&bg_key, &value)?;
         }
         Ok(())
     }
@@ -9566,10 +9585,10 @@ fn first_gap_at_or_after(
         }
     }
     // Gap after the last extent.
-    if let Some(end) = cursor.checked_add(num_bytes) {
-        if end <= bg_end {
-            return Ok(Some(cursor));
-        }
+    if let Some(end) = cursor.checked_add(num_bytes)
+        && end <= bg_end
+    {
+        return Ok(Some(cursor));
     }
     Ok(None)
 }
@@ -10661,19 +10680,26 @@ fn send_timespec_bytes(sec: i64, nsec: i32) -> [u8; 12] {
     buf
 }
 
+/// The three timestamps a `utimes` command carries, each `(seconds, nanoseconds)`.
+///
+/// Grouped rather than passed as six scalars. `atime_sec`/`atime_nsec` and their
+/// mtime and ctime twins are six parameters whose names differ by a character, in
+/// an order nothing enforces: transposing a pair at the call site compiles, and
+/// writes the wrong timestamp into a send stream that a receiver will trust.
+struct SendTimestamps {
+    atime: (i64, i32),
+    mtime: (i64, i32),
+    ctime: (i64, i32),
+}
+
 fn add_utimes_command_direct(
     builder: &mut SendStreamBuilder,
     path: &[u8],
-    atime_sec: i64,
-    atime_nsec: i32,
-    mtime_sec: i64,
-    mtime_nsec: i32,
-    ctime_sec: i64,
-    ctime_nsec: i32,
+    times: &SendTimestamps,
 ) {
-    let atime = send_timespec_bytes(atime_sec, atime_nsec);
-    let mtime = send_timespec_bytes(mtime_sec, mtime_nsec);
-    let ctime = send_timespec_bytes(ctime_sec, ctime_nsec);
+    let atime = send_timespec_bytes(times.atime.0, times.atime.1);
+    let mtime = send_timespec_bytes(times.mtime.0, times.mtime.1);
+    let ctime = send_timespec_bytes(times.ctime.0, times.ctime.1);
     builder.add_command(
         SendCommand::Utimes,
         &[
@@ -11480,18 +11506,18 @@ where
         // is created once (above, at its primary path) and linked at each
         // additional path. All parent dirs are already emitted, so the link path
         // resolves. (Directories cannot be hard-linked.)
-        if file_type != ffs_types::S_IFDIR {
-            if let Some(links) = inode_links.get(ino) {
-                for (parent, name) in links.iter().skip(1) {
-                    let mut link_path = build_path(*parent, true);
-                    // Relative to the subvol root: no leading slash for a link
-                    // directly under the root (whose build_path is empty).
-                    if !link_path.is_empty() {
-                        link_path.push(b'/');
-                    }
-                    link_path.extend_from_slice(name);
-                    add_link_command_direct(&mut builder, &link_path, &path);
+        if file_type != ffs_types::S_IFDIR
+            && let Some(links) = inode_links.get(ino)
+        {
+            for (parent, name) in links.iter().skip(1) {
+                let mut link_path = build_path(*parent, true);
+                // Relative to the subvol root: no leading slash for a link
+                // directly under the root (whose build_path is empty).
+                if !link_path.is_empty() {
+                    link_path.push(b'/');
                 }
+                link_path.extend_from_slice(name);
+                add_link_command_direct(&mut builder, &link_path, &path);
             }
         }
 
@@ -11530,12 +11556,11 @@ where
         add_utimes_command_direct(
             &mut builder,
             &path,
-            inode.atime_sec as i64,
-            inode.atime_nsec as i32,
-            inode.mtime_sec as i64,
-            inode.mtime_nsec as i32,
-            inode.ctime_sec as i64,
-            inode.ctime_nsec as i32,
+            &SendTimestamps {
+                atime: (inode.atime_sec as i64, inode.atime_nsec as i32),
+                mtime: (inode.mtime_sec as i64, inode.mtime_nsec as i32),
+                ctime: (inode.ctime_sec as i64, inode.ctime_nsec as i32),
+            },
         );
     }
 
@@ -11765,7 +11790,12 @@ mod tests {
             }
         }
 
-        fn signature(groups: &[SendInodeGroup<'_>]) -> Vec<(u64, Vec<(u8, u64, u8)>)> {
+        /// One inode's grouped send commands: (ino, [(command, offset, marker)]).
+        /// Named because the bare nested tuple says nothing about which u64 is
+        /// which, and it appears in both the helper and its expected values.
+        type GroupSignature = Vec<(u64, Vec<(u8, u64, u8)>)>;
+
+        fn signature(groups: &[SendInodeGroup<'_>]) -> GroupSignature {
             groups
                 .iter()
                 .map(|group| {
@@ -19200,7 +19230,7 @@ mod tests {
         // overlap the chunk below it.
         let ragged = vec![logical_chunk(0, 8 * MB + 1, BTRFS_BLOCK_GROUP_METADATA, &[(1, 0)])];
         let start = next_logical_chunk_start(&ragged).expect("start");
-        assert!(start >= 8 * MB + 1, "must not overlap the chunk below");
+        assert!(start > 8 * MB, "must not overlap the chunk below");
         assert_eq!(start % BTRFS_STRIPE_LEN, 0, "must be stripe aligned");
         assert_eq!(start, 8 * MB + BTRFS_STRIPE_LEN);
     }
@@ -20462,7 +20492,6 @@ mod tests {
     fn growth_can_plan_a_system_chunk_bd_a136s() {
         const MB: u64 = 1024 * 1024;
         let policy = ChunkSizePolicy::default();
-        let alloc = BtrfsExtentAllocator::new(7).expect("allocator");
         // One existing SYSTEM chunk, so the device is not empty and the new one
         // must be placed after it.
         let chunks = vec![logical_chunk(
@@ -20473,7 +20502,6 @@ mod tests {
         )];
 
         let plan = plan_growth_for_shortfall(
-            &alloc,
             &chunks,
             ChunkKind::System,
             4 * MB,
@@ -20503,7 +20531,6 @@ mod tests {
         // A zero shortfall is not a reason to allocate anything.
         assert!(
             plan_growth_for_shortfall(
-                &alloc,
                 &chunks,
                 ChunkKind::System,
                 0,
@@ -23726,7 +23753,6 @@ mod tests {
 
     // ── Extent allocator edge-case tests ──────────────────────────────
 
-    #[test]
     /// bd-mqb9t: freeing the live trees' extent items at the top of a commit
     /// must NOT hand their space back inside that same commit.
     ///
@@ -28238,7 +28264,7 @@ mod parent_transid_tests {
         assert_eq!(parent_transid_mismatch(10, &[]), None);
         assert_eq!(parent_transid_mismatch(10, &[0_u8; 8]), None);
         assert_eq!(
-            parent_transid_mismatch(10, &vec![0_u8; BTRFS_HEADER_SIZE - 1]),
+            parent_transid_mismatch(10, &[0_u8; BTRFS_HEADER_SIZE - 1]),
             None
         );
     }

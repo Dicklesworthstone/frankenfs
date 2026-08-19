@@ -695,6 +695,10 @@ fn bench_writeback_execute_durability(c: &mut Criterion) {
     // Pre-mark every node durable once; mark_durable is then idempotent, so the
     // flush loop can be re-run in place with zero per-iteration allocation.
     let mut dag_durable = dag.clone();
+    // ⚠️ THE COLLECT IS LOAD-BEARING, not needless as clippy reads it: it ends the
+    // immutable borrow of `dag_durable` so the body can take `&mut` to mark each
+    // block. Iterating lazily does not compile.
+    #[expect(clippy::needless_collect, reason = "ends the borrow so the body can mutate")]
     for block in dag_durable.blocks().collect::<Vec<_>>() {
         dag_durable.mark_durable(block).expect("pre-mark durable");
     }

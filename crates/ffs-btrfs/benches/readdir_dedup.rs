@@ -85,11 +85,11 @@ fn bench_readdir_parse_projection(c: &mut Criterion) {
     let mut group = c.benchmark_group("btrfs_readdir_parse_projection_1024");
     for control in ["owned_parser_control_a", "owned_parser_control_b"] {
         group.bench_function(control, |b| {
-            b.iter(|| black_box(project_owned_parser(black_box(&payloads))))
+            b.iter(|| black_box(project_owned_parser(black_box(&payloads))));
         });
     }
     group.bench_function("borrowed_visitor_candidate", |b| {
-        b.iter(|| black_box(project_borrowed_visitor(black_box(&payloads))))
+        b.iter(|| black_box(project_borrowed_visitor(black_box(&payloads))));
     });
     group.finish();
 }
