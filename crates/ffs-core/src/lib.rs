@@ -5058,59 +5058,6 @@ impl OpenFs {
                             }
                         }
                     };
-                    // Attempt tree-log replay if log_root is set.
-                    if sb.log_root != 0 {
-                        let nodesize = sb.nodesize;
-                        let chunks_ref = &chunks;
-                        let mut read_phys =
-                            |logical: u64| -> std::result::Result<Vec<u8>, ParseError> {
-                                let mapping =
-                                    ffs_ondisk::map_logical_to_physical(chunks_ref, logical)?
-                                        .ok_or(ParseError::InvalidField {
-                                            field: "tree_log",
-                                            reason: "logical address not mapped in chunk table",
-                                        })?;
-                                let byte_off = mapping.physical;
-                                let mut buf = vec![0u8; nodesize as usize];
-                                dev.read_exact_at(cx, ByteOffset(byte_off), &mut buf)
-                                    .map_err(|_| ParseError::InvalidField {
-                                        field: "tree_log",
-                                        reason: "failed to read tree-log block",
-                                    })?;
-                                Ok(buf)
-                            };
-                        match ffs_btrfs::replay_tree_log(
-                            &mut read_phys,
-                            sb,
-                            chunks_ref,
-                            // The subvolume being mounted: a log root tree may hold
-                            // logs for several, and only this one's items belong in
-                            // this tree's keyspace.
-                            subvol_objectid,
-                        ) {
-                            Ok(result) if result.replayed => {
-                                info!(
-                                    items = result.items_count,
-                                    "btrfs tree-log detected ({} items, applying read overlay)",
-                                    result.items_count
-                                );
-                                btrfs_tree_log_items = result.items;
-                            }
-                            Ok(result) if result.foreign_format => {
-                                // Not ours, and not ignorable: see the field's doc.
-                                warn!(
-                                    "btrfs tree-log is in the kernel's log-root-tree \
-                                     format; it cannot be replayed here, so this mount \
-                                     stays READ-ONLY to preserve it"
-                                );
-                                btrfs_foreign_tree_log = true;
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                warn!(error = %err, "btrfs tree-log replay failed");
-                            }
-                        }
-                    }
 
                     let root_tree_items = {
                         let nodesize = sb.nodesize;
@@ -5152,6 +5099,67 @@ impl OpenFs {
 
                     (chunks, subvol_objectid, subvol_root_dirid)
                 };
+
+                // bd-jhuob: replayed HERE, after the chunk map AND the mounted
+                // subvolume are both resolved. It used to run inside the very
+                // expression that computes them, where subvol_objectid does not
+                // exist yet — harmless while replay ignored the subvolume, and a
+                // compile error the moment it stopped. Following a log root tree
+                // means picking the entry for the subvolume being mounted, so the
+                // replay cannot happen before that is known.
+                // Attempt tree-log replay if log_root is set.
+                if sb.log_root != 0 {
+                    let nodesize = sb.nodesize;
+                    let chunks_ref = &chunks;
+                    let mut read_phys =
+                        |logical: u64| -> std::result::Result<Vec<u8>, ParseError> {
+                            let mapping =
+                                ffs_ondisk::map_logical_to_physical(chunks_ref, logical)?
+                                    .ok_or(ParseError::InvalidField {
+                                        field: "tree_log",
+                                        reason: "logical address not mapped in chunk table",
+                                    })?;
+                            let byte_off = mapping.physical;
+                            let mut buf = vec![0u8; nodesize as usize];
+                            dev.read_exact_at(cx, ByteOffset(byte_off), &mut buf)
+                                .map_err(|_| ParseError::InvalidField {
+                                    field: "tree_log",
+                                    reason: "failed to read tree-log block",
+                                })?;
+                            Ok(buf)
+                        };
+                    match ffs_btrfs::replay_tree_log(
+                        &mut read_phys,
+                        sb,
+                        chunks_ref,
+                        // The subvolume being mounted: a log root tree may hold
+                        // logs for several, and only this one's items belong in
+                        // this tree's keyspace.
+                        subvol_objectid,
+                    ) {
+                        Ok(result) if result.replayed => {
+                            info!(
+                                items = result.items_count,
+                                "btrfs tree-log detected ({} items, applying read overlay)",
+                                result.items_count
+                            );
+                            btrfs_tree_log_items = result.items;
+                        }
+                        Ok(result) if result.foreign_format => {
+                            // Not ours, and not ignorable: see the field's doc.
+                            warn!(
+                                "btrfs tree-log is in the kernel's log-root-tree \
+                                 format; it cannot be replayed here, so this mount \
+                                 stays READ-ONLY to preserve it"
+                            );
+                            btrfs_foreign_tree_log = true;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!(error = %err, "btrfs tree-log replay failed");
+                        }
+                    }
+                }
 
                 let ctx = BtrfsContext {
                     chunks,
