@@ -394,7 +394,7 @@ These files are mandatory and must stay current:
 
 Legacy bootstrap documents (retained only for history; do not treat as canonical):
 - `PLAN_TO_PORT_LEGACY_FS_TO_RUST.md`
-- `EXISTING_LEGACY_FS_STRUCTURE.md`
+- `docs/planning/EXISTING_LEGACY_FS_STRUCTURE.md`
 
 Reference artifact copied from FrankenSQLite:
 - `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`

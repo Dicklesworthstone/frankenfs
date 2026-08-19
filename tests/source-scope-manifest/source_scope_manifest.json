@@ -58,7 +58,7 @@
       "excluded_globs": [
         "COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md",
         "PLAN_TO_PORT_LEGACY_FS_TO_RUST.md",
-        "EXISTING_LEGACY_FS_STRUCTURE.md"
+        "docs/planning/EXISTING_LEGACY_FS_STRUCTURE.md"
       ],
       "risk_category": "docs_only",
       "owner": "release",

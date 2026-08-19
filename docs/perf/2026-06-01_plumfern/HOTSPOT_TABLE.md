@@ -27,7 +27,7 @@ Artifacts: `baseline_macro.json`, `baseline_fsck.json`.
 | 2 | Read-buffer movement `__memmove_avx_unaligned_erms` / `__memset_avx2_unaligned_erms` (per-block buffer alloc+zero+copy) | cumulative (file-read stack) | **13.5% (CLI) / 22.8% (FUSE)** stack; ~2.7% + ~1.8% self | CPU/alloc | `docs/reports/PROFILE_ANALYSIS.md` (same-CPU flamegraphs) |
 | 3 | `ffs_types::ensure_slice` + `read_le_*` + `Result<&[u8],ParseError>::branch` (parser primitive density) | self | ~1.9% + ~1.1% + ~1.4% | CPU | `docs/reports/PROFILE_ANALYSIS.md` |
 | 4 | `Cx::checkpoint` (asupersync request-scope checkpoint on the hot read loop) | self | ~1.8–2.0% | CPU | `docs/reports/PROFILE_ANALYSIS.md` |
-| 5 | Subsystem-level: ARC/S3-FIFO cache scan, RaptorQ scrub, WAL commit families (criterion) | per-op p50 | see `PROFILING-SUMMARY.md` / `benchmarks/baselines/latest.json` | mixed | established baselines (peer gauntlet refreshing) |
+| 5 | Subsystem-level: ARC/S3-FIFO cache scan, RaptorQ scrub, WAL commit families (criterion) | per-op p50 | see `docs/planning/PROFILING-SUMMARY.md` / `benchmarks/baselines/latest.json` | mixed | established baselines (peer gauntlet refreshing) |
 
 **Headline:** the read path's cost is dominated by **structure, not a hot
 function** — it reads and copies one 4 KiB block per syscall. Rank 1 (syscall
