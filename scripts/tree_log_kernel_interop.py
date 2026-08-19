@@ -77,6 +77,31 @@ def main() -> int:
     parser.add_argument("--cli", default="target/debug/ffs-cli")
     parser.add_argument("--work-dir", default=str(Path.home()))
     parser.add_argument("--fsyncs", type=int, default=4)
+    parser.add_argument(
+        "--files",
+        type=int,
+        default=1,
+        help=(
+            "how many files to create and fsync. ⚠️ MORE THAN ONE IS A DIFFERENT "
+            "TEST. The log accumulates every inode fsynced since the last full "
+            "commit (bd-dm01m), and each inode contributes its PARENT's dir items "
+            "as well as its own — so two inodes interleave two ascending key runs "
+            "in one leaf. A leaf whose items are out of key order is refused by "
+            "the kernel's tree-checker, and one file can never show it."
+        ),
+    )
+    parser.add_argument(
+        "--bytes",
+        type=int,
+        default=256,
+        help=(
+            "payload size. ⚠️ THE DEFAULT IS AN INLINE EXTENT. btrfs stores a small "
+            "file's data inside the EXTENT_DATA item, so a 256-byte probe never "
+            "exercises a real extent — the log names no disk_bytenr and the kernel's "
+            "replay takes no reference on anything. Pass a size above the inline "
+            "threshold (>4096 here) to test the case where it does."
+        ),
+    )
     args = parser.parse_args()
 
     cli = Path(args.cli).resolve()
@@ -92,6 +117,8 @@ def main() -> int:
 
     print(f"image      {image}")
     print(f"daemon     {cli}")
+    print(f"payload    {args.bytes} bytes ({'inline' if args.bytes <= 4096 else 'real extent'})")
+    print(f"files      {args.files}")
 
     # ── 2. mount read-write, ephemeral (tree-log) fsync strategy ────────────
     daemon = subprocess.Popen(
@@ -111,14 +138,19 @@ def main() -> int:
         sys.exit("FATAL: mount did not appear within 30s")
 
     # ── 3. write + fsync, so a tree log is published ────────────────────────
-    target = mnt / "interop-probe"
-    payload = b"tree-log-interop" * 16
+    unit = b"tree-log-interop"
+    payload = (unit * (args.bytes // len(unit) + 1))[: args.bytes]
+    names = [
+        "interop-probe" if index == 0 else f"interop-probe-{index}"
+        for index in range(args.files)
+    ]
     try:
-        fd = os.open(target, os.O_CREAT | os.O_RDWR, 0o644)
-        for _ in range(args.fsyncs):
-            os.pwrite(fd, payload, 0)
-            os.fsync(fd)
-        os.close(fd)
+        for name in names:
+            fd = os.open(mnt / name, os.O_CREAT | os.O_RDWR, 0o644)
+            for _ in range(args.fsyncs):
+                os.pwrite(fd, payload, 0)
+                os.fsync(fd)
+            os.close(fd)
     except OSError as err:
         daemon.kill()
         sys.exit(f"FATAL: write+fsync failed: {err}")
@@ -153,14 +185,17 @@ def main() -> int:
                 f"wrote.\n  {mount.stderr.strip()}"
             )
             return 1
-        try:
-            data = (kmnt / "interop-probe").read_bytes()
-        except OSError as err:
-            print(f"FINDING: kernel mounted the image but the file is unreadable: {err}")
-            return 1
-        if data[: len(payload)] != payload:
-            print("FINDING: kernel mounted and read, but the fsynced bytes differ")
-            return 1
+        for name in names:
+            try:
+                data = (kmnt / name).read_bytes()
+            except OSError as err:
+                print(
+                    f"FINDING: kernel mounted the image but {name} is unreadable: {err}"
+                )
+                return 1
+            if data[: len(payload)] != payload:
+                print(f"FINDING: kernel mounted and read, but {name}'s bytes differ")
+                return 1
         print(
             "PASS: the kernel mounted an image carrying our tree log and read the "
             "fsynced data back."

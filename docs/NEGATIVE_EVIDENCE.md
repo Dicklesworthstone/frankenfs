@@ -11397,3 +11397,55 @@ EXTENT_DATA whose extent is absent from the on-disk extent tree, log spanning mo
 or a log written by the kernel and replayed by us (the opposite direction, which `foreign_format`
 still refuses). Promoting the tree log to the default fsync strategy is not licensed by this row
 alone; it removes the objection this row's predecessor raised, and nothing more.
+
+## bd-jhuob — THE GATE'S OWN BLIND SPOT: a 256-byte probe is an INLINE extent, and two more defects hid behind it
+
+**Run 2026-08-18, thinkstation1, kernel 6.17.0-41-generic.** Same gate, three new arms. Pass/fail
+capability test; loadavg 36.22/26.00/22.43 at the passing run, which does not bear on the result.
+
+The row above closed with a named prediction: the most likely next refusal is "a non-inline
+EXTENT_DATA whose extent is absent from the on-disk extent tree". Testing the prediction took one
+argument (`--bytes 65536`) and it refused immediately — for a neighbouring reason, not the one
+predicted:
+
+    BTRFS warning (device loop13): csum failed root 5 ino 2305 off 20480
+                  csum 0xc9e5687d expected csum 0x00000000
+    FINDING: kernel mounted the image but the file is unreadable: [Errno 5] Input/output error
+
+**Why the passing gate could not see it.** btrfs stores a small file's data INSIDE the
+EXTENT_DATA item. The 256-byte probe produced `type 0 (inline)`, so the log carried the bytes
+themselves and owed no checksum. At 64 KiB the item becomes `type 1 (regular), disk byte 13631488
+nr 65536` — it NAMES data instead of carrying it, and the checksums for that data live in the csum
+tree, which a tree-log commit does not write. The kernel replays the extent, the file appears with
+the right size, and every read of it fails EIO. `btrfs inspect-internal dump-tree` on the log
+confirms it: five items, no EXTENT_CSUM among them.
+
+⚠️ **The default probe size was load-bearing and nobody chose it.** 256 bytes was picked to be a
+recognisable pattern, and it silently selected the one storage format that cannot exhibit the
+defect. The gate is now explicit about it — `--bytes` documents that its default is an inline
+extent, and prints which regime each run is in.
+
+**The second defect, found by asking for more than one file.** The log accumulates every inode
+fsynced since the last full commit (bd-dm01m), and each inode contributes its PARENT directory's
+DIR_ITEM/DIR_INDEX as well as its own items. Two inodes therefore interleave two ascending key
+runs into one leaf, and a leaf out of key order is not a valid btrfs leaf:
+
+    BTRFS error (device loop13 state A): Transaction aborted (error -5)
+    BTRFS: error in btrfs_recover_log_trees:7393: errno=-5 IO failure
+    BTRFS: error in btrfs_replay_log:2070: errno=-5 IO failure (Failed to recover log tree)
+
+**That one is a measured counterfactual, not an argument.** The fix (one `sort_by` over the
+accumulated set) was disabled again, rebuilt, and re-run: the 5-file arm fails exactly as above,
+and passes with it restored. A one-file gate can never show this, because one inode's items are
+already ordered.
+
+**Where the arms stand now.** 256 B × 1 file, 64 KiB × 1, 64 KiB × 5, and 1 MiB × 3 all PASS —
+the kernel mounts, replays, and reads every file's bytes back.
+
+**Still not covered, and still not licensing the default.** Multiple SUBVOLUMES with logs (the
+ROOT_ITEM loop this row's predecessor fixed emits exactly one); a log too large for a single leaf,
+which currently refuses to a full commit rather than growing a tree; a kernel-written log replayed
+by us (still refused as `foreign_format`); and rename/unlink/truncate in the logged set, which the
+gate only ever creates and writes. The duplicate-key case is refused rather than deduped — a
+silent dedup would drop a logged item, which is the acknowledged-then-lost failure the whole path
+exists to remove — but it has not been provoked.

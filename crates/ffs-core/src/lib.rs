@@ -29815,6 +29815,99 @@ impl OpenFs {
         Ok(items)
     }
 
+    /// The EXTENT_CSUM items covering the data extents named by `items` (bd-jhuob).
+    ///
+    /// ⚠️ A LOG WITHOUT THESE IS A FILE THE KERNEL REFUSES TO READ. Our csums live
+    /// in the csum tree, which a tree-log commit does not write — only a full
+    /// commit does. So a log carrying a regular EXTENT_DATA and nothing else names
+    /// data whose checksums are, on disk, absent. The kernel replays the extent,
+    /// the file appears, and every read of it fails:
+    ///
+    ///     BTRFS warning (device loop13): csum failed root 5 ino 2305 off 20480
+    ///                   csum 0xc9e5687d expected csum 0x00000000
+    ///     [Errno 5] Input/output error
+    ///
+    /// Measured on a 64 KiB probe. The default 256-byte probe never saw it because
+    /// btrfs stores small data INLINE, inside the EXTENT_DATA item, where the log
+    /// already carried the bytes themselves and no checksum was owed. Kernel btrfs
+    /// logs the csums alongside the extents for exactly this reason.
+    ///
+    /// The range query follows `btrfs_verify_data_csums`: an item covering
+    /// `disk_bytenr` starts no earlier than `disk_bytenr - max_span`, so the widened
+    /// low bound misses no covering item. Each candidate is then filtered to those
+    /// that genuinely intersect an extent we are logging — the leaf has a hard
+    /// capacity, and padding it with a neighbour's checksums buys nothing and can
+    /// force a full commit that was not needed.
+    fn btrfs_tree_log_csum_items(
+        alloc: &BtrfsAllocState,
+        items: &[BtrfsTreeItem],
+    ) -> Result<Vec<BtrfsTreeItem>, FfsError> {
+        let mut extents: Vec<(u64, u64)> = Vec::new();
+        for item in items {
+            if item.key.item_type != BTRFS_ITEM_EXTENT_DATA {
+                continue;
+            }
+            let extent = parse_extent_data(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
+            if let BtrfsExtentData::Regular {
+                extent_type,
+                disk_bytenr,
+                disk_num_bytes,
+                ..
+            } = extent
+                && extent_type == BTRFS_FILE_EXTENT_REG
+                && disk_bytenr != 0
+            {
+                extents.push((disk_bytenr, disk_bytenr.saturating_add(disk_num_bytes)));
+            }
+        }
+        if extents.is_empty() {
+            // Holes, inline extents and preallocated extents owe no checksums.
+            return Ok(Vec::new());
+        }
+
+        let min_disk = extents.iter().map(|(lo, _)| *lo).min().unwrap_or(0);
+        let max_disk_end = extents.iter().map(|(_, hi)| *hi).max().unwrap_or(0);
+        let sectorsize = u64::from(alloc.sectorsize);
+        let max_span = (ffs_btrfs::max_data_csums_per_item(alloc.nodesize) as u64)
+            .saturating_mul(sectorsize);
+        let lo = BtrfsKey {
+            objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
+            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
+            offset: min_disk.saturating_sub(max_span),
+        };
+        let hi = BtrfsKey {
+            objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
+            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
+            offset: max_disk_end,
+        };
+
+        let csum_size = ffs_btrfs::BTRFS_CRC32C_CSUM_SIZE as u64;
+        let mut logged = Vec::new();
+        for (key, data) in alloc
+            .csum_tree
+            .range(&lo, &hi)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+        {
+            if key.objectid != ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID
+                || key.item_type != ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM
+            {
+                continue;
+            }
+            let sectors = (data.len() as u64) / csum_size.max(1);
+            let covered_end = key.offset.saturating_add(sectors.saturating_mul(sectorsize));
+            if extents
+                .iter()
+                .any(|(lo, hi)| key.offset < *hi && covered_end > *lo)
+            {
+                logged.push(BtrfsTreeItem {
+                    key,
+                    data: data.into(),
+                });
+            }
+        }
+        Ok(logged)
+    }
+
     fn btrfs_allocate_tree_log_block(
         alloc: &mut BtrfsAllocState,
     ) -> Result<(u64, u64, bool), FfsError> {
@@ -29899,6 +29992,35 @@ impl OpenFs {
         let mut items = Vec::new();
         for inode in logged {
             items.extend(Self::btrfs_collect_tree_log_items(alloc, inode)?);
+        }
+
+        // The checksums for the data those extents name. Without them the kernel
+        // replays the file and then refuses to read it (bd-jhuob).
+        items.extend(Self::btrfs_tree_log_csum_items(alloc, &items)?);
+
+        // ⚠️ A LEAF'S ITEMS MUST BE IN KEY ORDER, and the per-inode collection
+        // above cannot produce that on its own: each inode contributes its parent
+        // directory's DIR_ITEM/DIR_INDEX as well as its own items, so two logged
+        // inodes interleave two ascending runs. Sorting once here is what makes the
+        // accumulating log of bd-dm01m emit a valid leaf; the csums appended above
+        // are keyed under EXTENT_CSUM_OBJECTID and would otherwise trail the sort
+        // order too. `btrfs_key_order` is the same comparator the single-inode
+        // collection already used.
+        items.sort_by(|lhs, rhs| Self::btrfs_key_order(&lhs.key, &rhs.key));
+
+        // Duplicate keys in one leaf are as invalid as unordered ones, and a
+        // silent dedup here would DROP a logged item — the acknowledged-then-lost
+        // failure this whole path exists to remove. Refusing hands the caller a
+        // full commit, which is always correct.
+        if let Some(dup) = items
+            .windows(2)
+            .find(|pair| Self::btrfs_key_order(&pair[0].key, &pair[1].key).is_eq())
+        {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "btrfs tree log: duplicate key (objectid {}, type {}, offset {}) in the \
+                 accumulated fsync set; the caller must fall back to a full commit",
+                dup[0].key.objectid, dup[0].key.item_type, dup[0].key.offset
+            )));
         }
 
         // A tree log is ONE leaf here, so it has a hard capacity. Refusing at the
