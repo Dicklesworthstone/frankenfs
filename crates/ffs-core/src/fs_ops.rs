@@ -302,7 +302,7 @@ impl FsOps for OpenFs {
         if inos.len() < 2 {
             return inos
                 .iter()
-                .map(|ino| self.getattr(cx, scope, *ino))
+                .map(|ino| <Self as FsOps>::getattr(self, cx, scope, *ino))
                 .collect();
         }
         let mut order: Vec<usize> = (0..inos.len()).collect();
@@ -311,7 +311,12 @@ impl FsOps for OpenFs {
         let mut slots: Vec<Option<ffs_error::Result<InodeAttr>>> =
             (0..inos.len()).map(|_| None).collect();
         for index in order {
-            slots[index] = Some(self.getattr(cx, scope, inos[index]));
+            // FULLY QUALIFIED, and it must be. `self.getattr(..)` resolves to the
+            // INHERENT `OpenFs::getattr`, which takes (cx, ino) and wraps itself in
+            // `with_latest_scope` — so it would not merely fail to compile, it would
+            // open a FRESH request scope per inode and throw away the one thing a
+            // batch is for. The compiler caught the arity; the scope is the reason.
+            slots[index] = Some(<Self as FsOps>::getattr(self, cx, scope, inos[index]));
         }
         slots
             .into_iter()

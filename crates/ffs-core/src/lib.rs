@@ -53657,7 +53657,7 @@ mod tests {
                 .as_ref()
                 .unwrap_or_else(|e| panic!("inode {} must resolve: {e:?}", requested.0));
             assert_eq!(
-                attr.ino, requested.0,
+                attr.ino, *requested,
                 "result position {} carries another inode's attributes",
                 requested.0
             );
@@ -53671,7 +53671,7 @@ mod tests {
             let batched_attr = result.as_ref().expect("batched getattr");
             assert_eq!(single.ino, batched_attr.ino);
             assert_eq!(single.size, batched_attr.size);
-            assert_eq!(single.mode, batched_attr.mode);
+            assert_eq!(single.kind, batched_attr.kind);
         }
     }
 
