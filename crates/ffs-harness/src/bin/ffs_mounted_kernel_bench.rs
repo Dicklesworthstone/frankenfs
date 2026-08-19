@@ -6435,6 +6435,11 @@ fn fs_report(
     fixture_root: &Path,
     placement: &CpuPlacement,
     interrupted: &AtomicBool,
+    // Load average sampled once, before ANY filesystem was measured, so the
+    // report can show drift across the measured region rather than only its far
+    // end (bd-loadavg-in-report). A `///` here is a hard error: doc comments
+    // cannot be applied to function parameters.
+    load_average_at_run_start: Option<(f64, f64, f64)>,
 ) -> Result<Value> {
     let fs_dir = scratch_dir.join(kind.label());
     fs::create_dir(&fs_dir).with_context(|| format!("create {}", fs_dir.display()))?;
@@ -7668,6 +7673,8 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
         // quiet window is a DOWNCLOCKED window, so loadavg alone cannot separate
         // contention noise from frequency error. Evidence, not a gate.
         "cpu_mhz_observed": cpu_mhz_observed_json,
+        // Sampled when THIS filesystem's report is built, i.e. after its arms
+        // ran. Kept under the original key so existing readers are unaffected.
         "load_average": load_average().map(|(one, five, fifteen)| {
             serde_json::json!({
                 "one_minute": one,
@@ -7677,6 +7684,29 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
                 "settled": load_is_settled(one, five, 25.0, 0.7),
             })
         }),
+        // The other end of the bracket, and the drift between them.
+        //
+        // A single sample cannot distinguish "quiet throughout" from "quiet by
+        // the time we looked": a run that begins under a build storm and ends
+        // after it drains reports the calm end and looks clean. The admitted ext4
+        // readdir+stat row is the standard here — it recorded 9.94/7.61/6.34 at
+        // launch and 8.91/7.86/6.54 after, and its claim to being "the quietest
+        // window of the campaign" rests on BOTH readings being close, not on
+        // either one alone.
+        //
+        // Evidence, not a gate. Nothing here refuses a run; the existing
+        // `external_load_during_run` verdict is unchanged.
+        "load_average_at_run_start": load_average_at_run_start.map(|(one, five, fifteen)| {
+            serde_json::json!({
+                "one_minute": one,
+                "five_minute": five,
+                "fifteen_minute": fifteen,
+                "settled": load_is_settled(one, five, 25.0, 0.7),
+            })
+        }),
+        "load_average_one_minute_drift": load_average_at_run_start
+            .zip(load_average())
+            .map(|((start_one, _, _), (end_one, _, _))| end_one - start_one),
         "physical_cores": host.physical_cores,
         "logical_threads": host.online_cpus.len(),
         "memory_bytes": host.memory_bytes,
@@ -7886,6 +7916,11 @@ fn run() -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let host = host_provenance()?;
+    // Sampled before any fixture is built or any arm runs. Paired with the
+    // per-filesystem sample taken when each report is built, this brackets the
+    // measured region — the two numbers every ledger row has been pasting in by
+    // hand as "loadavg X at launch and Y after".
+    let load_average_at_run_start = load_average();
     ensure!(
         config.client_threads() <= host.allowed_cpus_before_pin.len(),
         "{} requested client threads exceed the pre-pin process allowance of {} logical CPUs",
@@ -8121,6 +8156,7 @@ fn run() -> Result<Option<PathBuf>> {
             &fixture_root,
             &placement,
             &interrupted,
+            load_average_at_run_start,
         )?);
         let report = filesystem_reports
             .last()
