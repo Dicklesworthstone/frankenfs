@@ -11083,32 +11083,136 @@ mod tests {
     /// The pair (cores, shared) is what a later analysis needs: `cores` says how much
     /// parallelism the client really had, `shared` says how many threads were paying for
     /// it, and a row carrying neither cannot be compared to one that had a different mix.
+    /// The host's physical cores, as distinct thread-sibling sets, ascending.
+    ///
+    /// Reads the sysfs CPU list rather than counting from zero: CPU ids are not
+    /// required to be contiguous, and a host with offline CPUs has gaps.
+    fn host_physical_cores() -> Vec<BTreeSet<usize>> {
+        let mut cores: BTreeSet<BTreeSet<usize>> = BTreeSet::new();
+        let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(index) = name.strip_prefix("cpu") else {
+                continue;
+            };
+            if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(cpu) = index.parse::<usize>() else {
+                continue;
+            };
+            // Not every cpuN directory has topology (offline CPUs do not), and a
+            // host without it simply contributes no cores.
+            if let Ok(siblings) = thread_siblings(cpu) {
+                cores.insert(siblings);
+            }
+        }
+        cores.into_iter().collect()
+    }
+
+    /// bd-client-core-distinctness: 8-on-8 and 8-on-4 must be distinguishable.
+    ///
+    /// bd-rzbjk: the cases are DERIVED from this host's topology rather than
+    /// naming CPU indices. The previous form hard-coded
+    /// `[10, 11, 12, 14, 42, 43, 44, 46]` and resolved them through real sysfs, so
+    /// it could only pass on thinkstation1 and died with a bare
+    /// `No such file or directory` on every rch worker — which made `-p
+    /// ffs-harness` permanently red on the offload path and trained readers to
+    /// treat a FAILED line as normal.
+    ///
+    /// Two halves, and they are treated differently on purpose.
+    ///
+    /// The distinct-core half is PORTABLE and always asserted: any host with 8
+    /// cores can express it, so there is no excuse for skipping it anywhere.
+    ///
+    /// The 8-on-4 half needs SMT. A host without it — rch worker `vmi1152480`
+    /// reports 0 SMT cores — cannot express the case at all, so the test says so
+    /// on stderr and declines that half rather than failing. Failing would keep
+    /// `-p ffs-harness` red on the offload path forever, which teaches readers to
+    /// scroll past a FAILED line, and that is how a real regression gets waved
+    /// through. Declining a half whose precondition is absent, while still
+    /// asserting the half that is not, is not "passing by doing nothing".
+    ///
+    /// A host that HAS 4 SMT cores exercises everything; thinkstation1 does.
     #[test]
     fn physical_core_occupancy_separates_8_on_8_from_8_on_4_bd_client_core_distinctness() {
-        // Eight threads, eight distinct cores: nothing shared.
-        let ideal: BTreeSet<usize> = (0..8).collect();
-        let (cores, shared) = physical_core_occupancy(&ideal).expect("occupancy");
-        assert_eq!(cores, 8, "eight distinct cores");
+        let cores = host_physical_cores();
+        assert!(
+            cores.len() >= 8,
+            "host exposes {} physical cores; this case needs 8 — the HOST cannot \
+             express it, the code under test is not implicated",
+            cores.len()
+        );
+
+        // Eight threads on eight distinct cores: nothing shared.
+        let ideal: BTreeSet<usize> = cores
+            .iter()
+            .take(8)
+            .filter_map(|core| core.iter().next().copied())
+            .collect();
+        assert_eq!(ideal.len(), 8, "one CPU from each of eight distinct cores");
+        let (seen, shared) = physical_core_occupancy(&ideal).expect("occupancy");
+        assert_eq!(seen, 8, "eight distinct cores");
         assert_eq!(shared, 0, "no thread shares a core with another");
 
         // The worst case actually observed: 8 threads on 4 cores, every one paired.
-        let worst: BTreeSet<usize> = [10, 11, 12, 14, 42, 43, 44, 46].into_iter().collect();
-        let (cores, shared) = physical_core_occupancy(&worst).expect("occupancy");
-        assert_eq!(
-            cores, 4,
-            "10/42, 11/43, 12/44, 14/46 are four sibling pairs"
-        );
+        //
+        // This half needs SMT and a host without it cannot express the case at
+        // all — rch worker `vmi1152480` reports 0 SMT cores. Refusing to run it
+        // there is correct; FAILING there is not, because it would leave
+        // `-p ffs-harness` permanently red on the offload path, which is the
+        // condition bd-rzbjk exists to remove. The portable half above has
+        // already run and asserted by this point, so this is not a test that
+        // passes by doing nothing.
+        let smt: Vec<&BTreeSet<usize>> = cores.iter().filter(|core| core.len() >= 2).collect();
+        if smt.len() < 4 {
+            eprintln!(
+                "bd-rzbjk: NOT EXERCISED — host exposes {} SMT cores and the 8-on-4 \
+                 case needs 4. The distinct-core half above did run. A machine with \
+                 SMT disabled cannot express this by construction.",
+                smt.len()
+            );
+            return;
+        }
+        let worst: BTreeSet<usize> = smt
+            .iter()
+            .take(4)
+            .flat_map(|core| core.iter().take(2).copied())
+            .collect();
+        assert_eq!(worst.len(), 8, "four sibling pairs are eight CPUs");
+        let (seen, shared) = physical_core_occupancy(&worst).expect("occupancy");
+        assert_eq!(seen, 4, "four sibling pairs occupy four cores");
         assert_eq!(
             shared, 8,
             "all eight threads share a core with another thread"
         );
 
         // The common case: one sibling pair, so 7 cores and 2 shared threads.
-        let typical: BTreeSet<usize> = [24, 25, 26, 27, 29, 30, 58, 63].into_iter().collect();
-        let (cores, shared) = physical_core_occupancy(&typical).expect("occupancy");
+        let pair = smt[0];
+        let mut typical: BTreeSet<usize> = pair.iter().take(2).copied().collect();
+        for core in &cores {
+            if typical.len() == 8 {
+                break;
+            }
+            if core == pair {
+                continue;
+            }
+            if let Some(cpu) = core.iter().next() {
+                typical.insert(*cpu);
+            }
+        }
         assert_eq!(
-            cores, 7,
-            "26 and 58 are siblings, so eight cpus occupy seven cores"
+            typical.len(),
+            8,
+            "one pair plus six singletons is eight CPUs"
+        );
+        let (seen, shared) = physical_core_occupancy(&typical).expect("occupancy");
+        assert_eq!(
+            seen, 7,
+            "one sibling pair means eight cpus occupy seven cores"
         );
         assert_eq!(shared, 2, "exactly the two members of that pair are shared");
     }
