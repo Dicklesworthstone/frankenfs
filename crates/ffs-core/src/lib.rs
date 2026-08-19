@@ -1953,6 +1953,23 @@ fn slice_readdir_snapshot(entries: Arc<Vec<DirEntry>>, offset: u64) -> ReaddirPa
 /// while the comparison to the existing ones silently stopped holding. Same
 /// reasoning bd-6kpp4 records for the checksum default: ship the knob, measure,
 /// then decide.
+/// Smallest readdir page the btrfs inode-leaf prefetch bothers with
+/// (bd-btrfs-readdir-stat-8x-8y7vp).
+///
+/// Same VALUE as [`EXT4_READDIR_INODE_PREFETCH_MIN_ENTRIES`], deliberately a
+/// different CONSTANT, because ext4's rationale does not transfer and reusing its
+/// name would tell the next reader something false. ext4's threshold exists to
+/// avoid paying Rayon setup and inode-location work on tiny pages; the btrfs
+/// prefetch is a serial descent loop with no fan-out at all, so there is no setup
+/// cost to amortise.
+///
+/// What justifies a floor here is different: below a handful of entries the sweep
+/// has almost nothing to dedupe — the whole point is that many objectids share one
+/// leaf — so it degenerates into doing the stat pass's descents slightly early,
+/// while still adding latency to a readdir the caller may not follow with stats at
+/// all. Above it, one descent per LEAF replaces one per entry.
+const BTRFS_READDIR_LEAF_PREFETCH_MIN_ENTRIES: usize = 8;
+
 fn btrfs_readdir_prefetch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -13061,7 +13078,15 @@ impl OpenFs {
     /// cannot be resolved here will simply be resolved (and fail) again by the
     /// real getattr, which is where the error belongs.
     fn prefetch_btrfs_readdir_inode_leaves(&self, cx: &Cx, entries: &[DirEntry]) {
-        if entries.len() < EXT4_READDIR_INODE_PREFETCH_MIN_ENTRIES || self.is_writable() {
+        // WRITABLE MOUNTS ARE EXCLUDED FOR CORRECTNESS OF PURPOSE, not caution.
+        // With `btrfs_alloc_state` present the authoritative items live in the COW
+        // tree, and that is what the real getattr and getxattr read. This warm-up
+        // descends the ON-DISK fs tree, so on a writable mount it would fetch
+        // leaves nobody is going to consult — a pure cost that still looks like a
+        // prefetch. `is_writable()` reduces to exactly `btrfs_alloc_state.is_some()`
+        // for a btrfs mount (its ext4 clause cannot fire here), which is the same
+        // condition the readdir snapshot above uses, so the two cannot diverge.
+        if entries.len() < BTRFS_READDIR_LEAF_PREFETCH_MIN_ENTRIES || self.is_writable() {
             return;
         }
         // Sorted, deduped: the sort is what makes the memo skip whole runs, and
@@ -29853,7 +29878,8 @@ impl OpenFs {
         sb: &BtrfsSuperblock,
         alloc: &mut BtrfsAllocState,
         canonical: u64,
-    ) -> Result<(Vec<u8>, Vec<u8>, BtrfsTreeLogWriteStats), FfsError> {
+        subvol_objectid: u64,
+    ) -> Result<(Vec<(u64, Vec<u8>)>, Vec<u8>, BtrfsTreeLogWriteStats), FfsError> {
         // bd-dm01m: log EVERY inode fsync'd since the last full commit, not just this
         // one. `log_root` replaces the previous log rather than chaining to it, so a
         // log holding only the current inode makes every earlier fsync in this
@@ -29883,8 +29909,19 @@ impl OpenFs {
             )));
         }
 
-        let (log_root, allocated_bytes, metadata_allocation) =
+        // TWO blocks, in the kernel's shape (bd-jhuob): the subvolume's LOG TREE
+        // holding the items, and a LOG ROOT TREE holding one ROOT_ITEM that points
+        // at it. The superblock addresses the root tree, never the log tree
+        // directly. Writing only the leaf — which is what this did — produces a
+        // log the kernel cannot parse, and the exposure is exactly the window the
+        // log exists for: a crash before the next full commit leaves `log_root`
+        // set on disk for a kernel mount to read.
+        let (log_tree, log_tree_bytes_alloc, log_tree_is_metadata) =
             Self::btrfs_allocate_tree_log_block(alloc)?;
+        let (log_root, log_root_bytes_alloc, log_root_is_metadata) =
+            Self::btrfs_allocate_tree_log_block(alloc)?;
+        let allocated_bytes = log_tree_bytes_alloc.saturating_add(log_root_bytes_alloc);
+        let metadata_allocation = log_tree_is_metadata && log_root_is_metadata;
         // bd-0ajub: rotate. The block we are superseding is handed to the caller to
         // free AFTER the new log_root is durable, never here — until then the on-disk
         // superblock still points at it.
@@ -29894,27 +29931,51 @@ impl OpenFs {
         // one block (bd-jhuob).
         let retired_log_blocks = std::mem::replace(
             &mut alloc.btrfs_live_log_blocks,
-            vec![(log_root, allocated_bytes, metadata_allocation)],
+            vec![
+                (log_tree, log_tree_bytes_alloc, log_tree_is_metadata),
+                (log_root, log_root_bytes_alloc, log_root_is_metadata),
+            ],
         );
         alloc.generation = alloc.generation.checked_add(1).ok_or_else(|| {
             FfsError::InvalidGeometry("btrfs tree-log generation overflow".into())
         })?;
         let generation = alloc.generation;
+        let items_count = items.len();
         let node = BtrfsCowNode::Leaf { items };
-        let node_bytes = node
-            .serialize(&BtrfsNodeSerializeParams {
-                fsid: sb.fsid,
-                chunk_tree_uuid: sb.fsid,
-                bytenr: log_root,
-                flags: 0,
-                generation,
-                owner: BTRFS_TREE_LOG_OBJECTID,
-                nodesize: alloc.nodesize,
-                level: 0, // tree-log leaf
-                child_generations: Vec::new(),
-                child_bytenrs: Vec::new(),
-                child_min_keys: Vec::new(),
-            })
+        let serialize_params = |bytenr: u64| BtrfsNodeSerializeParams {
+            fsid: sb.fsid,
+            chunk_tree_uuid: sb.fsid,
+            bytenr,
+            flags: 0,
+            generation,
+            owner: BTRFS_TREE_LOG_OBJECTID,
+            nodesize: alloc.nodesize,
+            level: 0, // both are leaves
+            child_generations: Vec::new(),
+            child_bytenrs: Vec::new(),
+            child_min_keys: Vec::new(),
+        };
+        let log_tree_bytes = node
+            .serialize(&serialize_params(log_tree))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // The log ROOT TREE: exactly one ROOT_ITEM, keyed by the subvolume whose
+        // log it names. Its generation must equal the log tree's, which is the
+        // bumped one — the kernel reads the log tree root expecting generation + 1
+        // (linux/btrfs_tree.h:682), so a mismatch here is a transid failure on the
+        // first block it dereferences.
+        let root_item = BtrfsCowNode::Leaf {
+            items: vec![BtrfsTreeItem {
+                key: BtrfsKey {
+                    objectid: subvol_objectid,
+                    item_type: BTRFS_ITEM_ROOT_ITEM,
+                    offset: 0,
+                },
+                data: ffs_btrfs::tree_log_root_item(log_tree, 0, generation).into(),
+            }],
+        };
+        let log_root_bytes = root_item
+            .serialize(&serialize_params(log_root))
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
         let mut logged_sb = sb.clone();
@@ -29932,15 +29993,18 @@ impl OpenFs {
         let stats = BtrfsTreeLogWriteStats {
             log_root,
             generation,
-            items_count: match &node {
-                BtrfsCowNode::Leaf { items } => items.len(),
-                BtrfsCowNode::Internal { .. } => 0,
-            },
+            items_count,
             allocated_bytes,
             metadata_allocation,
             retired_log_blocks,
         };
-        Ok((node_bytes, sb_bytes, stats))
+        // Log tree FIRST: the publish barriers after all nodes, and a reader that
+        // ever sees a partial set must not find the root tree without its target.
+        Ok((
+            vec![(log_tree, log_tree_bytes), (log_root, log_root_bytes)],
+            sb_bytes,
+            stats,
+        ))
     }
 
     fn btrfs_write_tree_log_for_sync(
@@ -29954,39 +30018,46 @@ impl OpenFs {
             .clone();
         let canonical = self.btrfs_canonical_inode(ino)?;
         let alloc_mutex = self.require_btrfs_alloc_state()?;
-        let (node_bytes, sb_bytes, stats) = {
-            let mut alloc = alloc_mutex.write();
-            Self::btrfs_prepare_tree_log_write(&sb, &mut alloc, canonical)?
-        };
-
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
-        let chunk_end = self.btrfs_logical_chunk_end(stats.log_root)?;
-        let available_in_chunk = Self::btrfs_checked_chunk_available(chunk_end, stats.log_root)?;
-        if available_in_chunk
-            < u64::try_from(node_bytes.len())
-                .map_err(|_| FfsError::InvalidGeometry("tree-log node too large".into()))?
-        {
-            return Err(FfsError::Corruption {
-                block: stats.log_root,
-                detail: "btrfs tree-log node crosses chunk boundary".into(),
-            });
+        let (nodes, sb_bytes, stats) = {
+            let mut alloc = alloc_mutex.write();
+            Self::btrfs_prepare_tree_log_write(&sb, &mut alloc, canonical, ctx.subvol_objectid)?
+        };
+        // EVERY node gets the same checks the single node used to get. The log
+        // root tree is as capable of straddling a chunk boundary as the log tree,
+        // and a check that covered only one of them would be worse than none —
+        // it would read as validated (bd-jhuob).
+        let mut writes: Vec<(ByteOffset, &[u8])> = Vec::with_capacity(nodes.len());
+        for (logical, bytes) in &nodes {
+            let chunk_end = self.btrfs_logical_chunk_end(*logical)?;
+            let available_in_chunk = Self::btrfs_checked_chunk_available(chunk_end, *logical)?;
+            if available_in_chunk
+                < u64::try_from(bytes.len())
+                    .map_err(|_| FfsError::InvalidGeometry("tree-log node too large".into()))?
+            {
+                return Err(FfsError::Corruption {
+                    block: *logical,
+                    detail: "btrfs tree-log node crosses chunk boundary".into(),
+                });
+            }
+            let mapping = map_logical_to_physical(&ctx.chunks, *logical)
+                .map_err(|e| parse_to_ffs_error(&e))?
+                .ok_or_else(|| FfsError::Corruption {
+                    block: *logical,
+                    detail: "tree-log logical bytenr not covered by any btrfs chunk".into(),
+                })?;
+            Self::btrfs_checked_physical_span(mapping.physical, bytes.len())?;
+            writes.push((ByteOffset(mapping.physical), bytes.as_slice()));
         }
-        let mapping = map_logical_to_physical(&ctx.chunks, stats.log_root)
-            .map_err(|e| parse_to_ffs_error(&e))?
-            .ok_or_else(|| FfsError::Corruption {
-                block: stats.log_root,
-                detail: "tree-log logical bytenr not covered by any btrfs chunk".into(),
-            })?;
-        Self::btrfs_checked_physical_span(mapping.physical, node_bytes.len())?;
         let superblock_offset = ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
             FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
         })?);
         Self::btrfs_publish_tree_log(
             self.dev.as_ref(),
             cx,
-            &[(ByteOffset(mapping.physical), node_bytes.as_slice())],
+            &writes,
             superblock_offset,
             &sb_bytes,
         )?;
@@ -53353,6 +53424,42 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, b".");
         assert_eq!(result[1].name, b"..");
+    }
+
+    /// bd-btrfs-readdir-stat-8x-8y7vp: a read-only btrfs mount must report
+    /// `!is_writable()`, because the prefetch's whole gate rests on it.
+    ///
+    /// The prefetch descends the ON-DISK fs tree. On a writable mount the
+    /// authoritative items are in the COW tree, which is what the real getattr and
+    /// getxattr read — so warming there would fetch leaves nobody consults: a cost
+    /// wearing a prefetch's name. `is_writable()` is an OR across both flavors, so
+    /// the equivalence it relies on is not obvious from the call site and is worth
+    /// pinning rather than re-deriving.
+    #[test]
+    fn btrfs_readonly_mount_is_not_writable_bd_8y7vp() {
+        let entries: Vec<(&[u8], u64, u8, u32)> = vec![
+            (b"aaa.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+            (b"bbb.txt", 258, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644),
+        ];
+        let image = build_btrfs_readdir_image(&entries);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            fs.btrfs_alloc_state.is_none(),
+            "a default-opened btrfs image is read-only"
+        );
+        assert!(
+            !fs.is_writable(),
+            "is_writable() must agree with btrfs_alloc_state for a btrfs mount; the \
+             readdir leaf prefetch gates on it and would otherwise warm the on-disk \
+             tree while the COW tree is authoritative"
+        );
     }
 
     /// bd-btrfs-readdir-stat-8x-8y7vp: a readdir page must never be able to warm
@@ -83864,8 +83971,13 @@ mod tests {
         let tree_log_items = {
             let mut alloc = alloc_mutex.write();
             let (_node_bytes, _sb_bytes, stats) =
-                OpenFs::btrfs_prepare_tree_log_write(&sb, &mut alloc, canonical)
-                    .expect("prepare tree-log fast-fsync write");
+                OpenFs::btrfs_prepare_tree_log_write(
+                    &sb,
+                    &mut alloc,
+                    canonical,
+                    BTRFS_FS_TREE_OBJECTID,
+                )
+                .expect("prepare tree-log fast-fsync write");
             stats.items_count
         };
         let fast_elapsed_ns = fast_start.elapsed().as_nanos().max(1);
