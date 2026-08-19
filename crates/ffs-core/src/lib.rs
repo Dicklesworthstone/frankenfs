@@ -84118,6 +84118,102 @@ mod tests {
         assert_eq!(reopened_data, b"sync-me");
     }
 
+    /// bd-mogn1: a full transaction commit must RETIRE the tree log.
+    ///
+    /// The defect this pins is a silent data ROLLBACK, not a missing byte. The
+    /// fsync path publishes `sb.log_root`; the full commit used to patch only
+    /// generation/root/root_level and left `log_root` addressing a log whose
+    /// items are now OLDER than the ones the commit just wrote. The replay
+    /// overlay is keyed and unconditional, so on the next mount the stale
+    /// logged value WINS over the committed one — a write that was
+    /// acknowledged, superseded, committed and unmounted silently reverts.
+    ///
+    /// The assertion is therefore on the READ-BACK CONTENT after a remount,
+    /// with the retired `log_root` / `log_root_level` checked alongside it. A
+    /// field-only test would pass against a fix that zeroed the field while
+    /// leaving the overlay reachable by another route, and a content-only test
+    /// would not say which of the two mechanisms failed.
+    ///
+    /// Runs on the csum image rather than `open_writable_btrfs_with_device`'s:
+    /// the latter's metadata block group has no room for a full transaction
+    /// commit at all (it returns `NoSpace` with or without the fsync), so the
+    /// rollback cannot be staged there.
+    ///
+    /// The surviving value is checked as the inode's SIZE rather than its data
+    /// bytes, because a data read on this fixture trips a pre-existing
+    /// overwrite-vs-EXTENT_CSUM staleness that reproduces identically WITHOUT
+    /// any fsync (same expected/computed pair with the fsync removed), i.e. it
+    /// is a different defect and would mask this one. The size lives in the
+    /// INODE_ITEM the log replays, so it exercises the same overlay path.
+    #[test]
+    fn btrfs_full_commit_retires_the_tree_log_bd_mogn1() {
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(build_btrfs_csum_image());
+        let opts = OpenOptions {
+            btrfs_rw_ephemeral_ok: true,
+            ..OpenOptions::default()
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &opts).expect("open csum image");
+        fs.enable_writes(&cx).expect("enable writes");
+
+        // The seeded file, written at an offset well past its existing data so
+        // the two versions below are the only thing in play.
+        let ino = InodeNumber(257);
+        const OFF: u64 = 16384;
+        let ops: &dyn FsOps = &fs;
+
+        // A is ACKNOWLEDGED by fsync, so it lands in the tree log and the
+        // superblock publishes a log_root pointing at it.
+        ops.write(&cx, &mut RequestScope::empty(), ino, OFF, b"AAAA")
+            .expect("write A");
+        ops.fsync(&cx, &mut RequestScope::empty(), ino, 0, false)
+            .expect("fsync A into the tree log");
+        let logged = BtrfsSuperblock::parse_from_image(&dev.snapshot_bytes())
+            .expect("parse superblock after the fsync");
+        assert_ne!(
+            logged.log_root, 0,
+            "the fsync must publish a log_root, or the rollback this test \
+             reproduces cannot occur and the test is vacuous"
+        );
+
+        // B supersedes A and is made durable by the FULL COMMIT — which is
+        // exactly the moment the log describing A becomes stale.
+        ops.write(&cx, &mut RequestScope::empty(), ino, OFF, b"BBBBBBBB")
+            .expect("write B over A");
+        fs.btrfs_full_transaction_commit(&cx, "bd-mogn1-retire-tree-log")
+            .expect("full transaction commit");
+
+        let image = dev.snapshot_bytes();
+        let committed =
+            BtrfsSuperblock::parse_from_image(&image).expect("parse the committed superblock");
+        assert_eq!(
+            committed.log_root, 0,
+            "a full commit supersedes the log and must retire log_root (bd-mogn1)"
+        );
+        assert_eq!(
+            committed.log_root_level, 0,
+            "log_root_level must be retired with the root it describes"
+        );
+
+        // The mechanism, not merely the field: remount and read back. Before
+        // the fix the stale log replays and this returns A.
+        let reopened = OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(image)), &opts)
+            .expect("remount after the full commit");
+        let reopened_ops: &dyn FsOps = &reopened;
+        let attr = reopened_ops
+            .getattr(&cx, &mut RequestScope::empty(), ino)
+            .expect("stat the committed file after remount");
+        assert_eq!(
+            attr.size,
+            OFF + 8,
+            "the newer COMMITTED inode must survive the remount; seeing A's size \
+             ({}) is the bd-mogn1 rollback — a stale tree log replayed over newer \
+             items",
+            OFF + 4
+        );
+    }
+
     #[test]
     fn btrfs_tree_log_lab_crash_replay_makes_fsynced_file_visible() {
         let _guard = log_contract_guard();
