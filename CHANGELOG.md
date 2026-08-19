@@ -3,8 +3,8 @@
 All notable changes to FrankenFS are documented in this file, organized by capability area rather than chronological diff order. Development has been continuous since inception; **`v0.2.0` (2026-07-11) is the project's first tagged release**, cut to mark the completion of the solo performance-optimization campaign. Commit links point to the canonical GitHub repository.
 
 > **Repository:** <https://github.com/Dicklesworthstone/frankenfs>
-> **Period covered:** 2026-02-09 through 2026-07-11
-> **Total commits:** 3,448 (through the 2026-05-18 capability cutoff; the performance campaign below adds the 2026-05-18 → 2026-07-11 window)
+> **Period covered:** 2026-02-09 through 2026-08-19 (`main` HEAD [`f84e12d70`](https://github.com/Dicklesworthstone/frankenfs/commit/f84e12d702d36eae8adf8bd266f3b7f84b272003))
+> **Total commits:** 3,448 (through the 2026-05-18 capability cutoff; the `v0.2.0` performance campaign covers 2026-05-18 → 2026-07-11; **1,634 further commits** sit on `main` after `v0.2.0` and are summarized under [Unreleased](#unreleased--post-v020-2026-07-11--2026-08-19))
 > **Tracker:** [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankenfs/blob/main/.beads/issues.jsonl) (raw rows as of 2026-05-18: 2,859 closed, 45 open, 1 deferred; source-aware queue excludes 28 foreign-looking open rows)
 
 > **What's new since the 2026-04-07 cutoff (2,765 additional commits):** the
@@ -26,10 +26,36 @@ All notable changes to FrankenFS are documented in this file, organized by capab
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
-| **v0.2.0** | 2026-07-11 | First tagged release (GitHub Release) | Performance-campaign consolidation: measured, byte-identical wins across checksum, metadata/directory, extent/read, allocator, compression, MVCC, and btrfs-COW subsystems, plus an honest negative-evidence ledger of every rejected lever |
+| **[Unreleased](#unreleased--post-v020-2026-07-11--2026-08-19)** | 2026-07-11 → 2026-08-19 | commits on `main` after `v0.2.0` (no new tag / GitHub Release) | Mounted vs-kernel honesty campaign, btrfs tree-log kernel interop, FUSE directory-stat residue, occupancy-aware harness, and the 2026-08-19 janitor docs-reorg |
+| **[v0.2.0](https://github.com/Dicklesworthstone/frankenfs/releases/tag/v0.2.0)** | 2026-07-11 | First tagged release (GitHub Release) | Performance-campaign consolidation: measured, byte-identical wins across checksum, metadata/directory, extent/read, allocator, compression, MVCC, and btrfs-COW subsystems, plus an honest negative-evidence ledger of every rejected lever |
 | _(pre-tag)_ | 2026-02-09 → 2026-05-18 | Untagged continuous development | V1 parity matrix complete (97/97 tracked rows); release-gate policy, proof bundles, adaptive mount-runtime modes, hostile-image containment, metamorphic proptests, asupersync 0.2 → 0.3 (documented in the capability sections below) |
 
-> This is the first entry in the project's release history. Prior to `v0.2.0` FrankenFS had no formal releases or tags; the capability sections that follow this changelog reconstruct that untagged history by subsystem.
+> `v0.2.0` remains the only tagged GitHub Release. Prior to that tag FrankenFS had no formal releases; the capability sections that follow reconstruct that untagged history by subsystem. The post-tag window is Unreleased.
+
+---
+
+## [Unreleased] — post-`v0.2.0` (2026-07-11 → 2026-08-19)
+
+1,634 commits on [`main`](https://github.com/Dicklesworthstone/frankenfs/compare/v0.2.0...main) after the first tagged release. No new tag or GitHub Release exists in this window. The work is a measured vs-kernel campaign on mounted ext4/btrfs, a harness-honesty campaign that made those ratios admissible, and a btrfs tree-log interop slice the kernel can actually replay. Rejected levers stay in the negative-evidence ledger; several titled FUSE short-circuits were answered as near-nulls and left default-OFF.
+
+### Mounted vs-kernel honesty (late July 2026)
+
+The campaign's first defensible vs-incumbent number was that FrankenFS is **4.5× slower** than kernel ext4 on the mounted arm ([`e04111e1c`](https://github.com/Dicklesworthstone/frankenfs/commit/e04111e1c)). The harness grew the provenance that makes a ratio checkable: host-wide exclusivity, fixture quiescence, observed worker-thread attestation, CPU-governor recording, counterbalanced kernel A/A nulls, and a replaced null-CI straddle veto ([`2198a47de`](https://github.com/Dicklesworthstone/frankenfs/commit/2198a47de), [`6506e1fe6`](https://github.com/Dicklesworthstone/frankenfs/commit/6506e1fe6)). An admitted btrfs vs-incumbent ratio landed near **5.0× slower** and was replicated. Losing metadata-buffer and multi-reader FUSE candidates were reverted in the same week rather than survivorship-filtered.
+
+### FUSE transport and directory-stat residue (2026-07-31 → 2026-08-19)
+
+Opt-in Linux FUSE-over-io_uring (`FFS_FUSE_IO_URING`) ([`7473d535c`](https://github.com/Dicklesworthstone/frankenfs/commit/7473d535c)). A real `getattr_batch` resolves in inode order and returns in request order ([`8a806525c`](https://github.com/Dicklesworthstone/frankenfs/commit/8a806525c)). The readdir+stat residue was measured as a per-entry LOOKUP/GETATTR/GETXATTR trio (STATX with BTIME), not a getattr/`attr_valid` miss; several titled short-circuit levers were answered as <1% end-to-end or default-OFF. Occupancy padding is now an achieved-occupancy signal the harness can tune ([`f1bfe595d`](https://github.com/Dicklesworthstone/frankenfs/commit/f1bfe595d)).
+
+### btrfs tree-log kernel interop (August 2026)
+
+FrankenFS now emits the kernel's two-block tree-log shape, publishes N log nodes behind one barrier, and replays the kernel log-root-tree instead of refusing it ([`1ceca99e7`](https://github.com/Dicklesworthstone/frankenfs/commit/1ceca99e7)). A P0 checksum-map-twice bug was losing every ephemeral fsync on replay ([`6f477aec3`](https://github.com/Dicklesworthstone/frankenfs/commit/6f477aec3)). SYSTEM-chunk growth became kernel-mountable ([`aded6b9b3`](https://github.com/Dicklesworthstone/frankenfs/commit/aded6b9b3)).
+
+### Janitor docs-reorg wave (2026-08-19)
+
+Non-locked planning docs moved under [`docs/planning/`](https://github.com/Dicklesworthstone/frankenfs/tree/main/docs/planning). [`FEATURE_PARITY.md`](https://github.com/Dicklesworthstone/frankenfs/blob/main/FEATURE_PARITY.md) and the five root specs (`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`, `EXISTING_EXT4_BTRFS_STRUCTURE.md`, `PLAN_TO_PORT_FRANKENFS_TO_RUST.md`, `PLAN_TO_PORT_LEGACY_FS_TO_RUST.md`, `PROPOSED_ARCHITECTURE.md`) stay at the repository root because tests and the README table pin them.
+
+- [`d21f58e2c`](https://github.com/Dicklesworthstone/frankenfs/commit/d21f58e2c1058622524452c067efec54d11862c4) — untrack skill-loop scratch.
+- [`f84e12d70`](https://github.com/Dicklesworthstone/frankenfs/commit/f84e12d702d36eae8adf8bd266f3b7f84b272003) — relocate `EXISTING_LEGACY_FS_STRUCTURE.md`, `MODULARITY_RUNBOOK.md`, `PARITY-COVERAGE.md`, and `PROFILING-SUMMARY.md` into `docs/planning/`.
 
 ---
 
