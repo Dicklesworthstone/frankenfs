@@ -20836,8 +20836,12 @@ impl OpenFs {
 
         // Add directory entry to parent.
         // bd-bhh0i: single-lock caller wraps the alloc guard in a byte-identical
-        // SingleLock backend; dropped before the error branch re-borrows `alloc`.
-        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        // SingleLock backend. There used to be an explicit `drop(backend)` here to
+        // end the borrow before the error branch re-borrows `alloc`; NLL already
+        // ends it at the last use, and the compiler confirms removing it changes
+        // nothing. The comment is kept because the ORDER still matters — the
+        // re-borrow below is only legal after the backend's last use.
+        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
         let add_result = self.ext4_add_dir_entry(
             cx,
             &mut backend,
@@ -20850,7 +20854,6 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         if let Err(err) = add_result {
             let mut rollback_inode = new_inode;
             let Ext4AllocState {
@@ -20966,7 +20969,6 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         if let Err(err) = add_result {
             // Roll back the sharded inode alloc through the per-group lock. The
             // fresh inode has no data/xattr blocks, so freeing its bitmap bit +
@@ -21160,9 +21162,11 @@ impl OpenFs {
 
         let attr = inode_to_attr(sb, ino, &new_inode);
 
-        // bd-bhh0i: single-lock caller wraps the alloc guard (dropped before the
-        // error branch re-borrows `alloc`).
-        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
+        // before the error branch re-borrows `alloc` — NLL ends it at the backend's
+        // last use, so the explicit `drop` this comment used to name was a no-op and
+        // is gone. The ORDER is still the requirement.
+        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
         let add_result = self.ext4_add_dir_entry(
             cx,
             &mut backend,
@@ -21175,7 +21179,6 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         if let Err(err) = add_result {
             let mut rollback_inode = new_inode;
             let Ext4AllocState {
@@ -21405,9 +21408,11 @@ impl OpenFs {
 
         // Add directory entry to parent.
         // This will also update parent timestamps and size if needed.
-        // bd-bhh0i: single-lock caller wraps the alloc guard (dropped before the
-        // error branch re-borrows `alloc`).
-        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
+        // before the error branch re-borrows `alloc` — NLL ends it at the backend's
+        // last use, so the explicit `drop` this comment used to name was a no-op and
+        // is gone. The ORDER is still the requirement.
+        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
         let add_result = self.ext4_add_dir_entry(
             cx,
             &mut backend,
@@ -21420,7 +21425,6 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         if let Err(err) = add_result {
             let Ext4AllocState {
                 geo,
@@ -21636,7 +21640,6 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         if let Err(err) = add_result {
             let _ = self.ext4_sharded_free_blocks(cx, &dev, dir_alloc.start, 1);
             let _ = self.ext4_sharded_free_inode(cx, &dev, ino, true);
@@ -23852,9 +23855,11 @@ impl OpenFs {
             csum_seed,
         )?;
 
-        // bd-bhh0i: single-lock caller wraps the alloc guard (dropped before the
-        // error branch re-borrows `alloc`).
-        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
+        // before the error branch re-borrows `alloc` — NLL ends it at the backend's
+        // last use, so the explicit `drop` this comment used to name was a no-op and
+        // is gone. The ORDER is still the requirement.
+        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
         let add_result = self.ext4_add_dir_entry(
             cx,
             &mut backend,
@@ -23867,7 +23872,6 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         if let Err(err) = add_result {
             let block_dev = self.block_device_adapter();
             ffs_inode::write_inode(
@@ -23992,9 +23996,11 @@ impl OpenFs {
                 let Ext4AllocState { geo, groups, .. } = &mut *alloc;
                 ffs_inode::write_inode(cx, &block_dev, geo, groups, ino, &inode, csum_seed)?;
 
-                // bd-bhh0i: single-lock caller wraps the alloc guard (dropped
-                // before the error branch re-borrows `alloc`).
-                let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+                // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow
+                // must end before the error branch re-borrows `alloc`; NLL ends it
+                // at the last use, so the explicit `drop` is gone. Order still
+                // matters.
+                let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
                 let add_result = self.ext4_add_dir_entry(
                     cx,
                     &mut backend,
@@ -24007,7 +24013,6 @@ impl OpenFs {
                     tstamp_secs,
                     tstamp_nanos,
                 );
-                drop(backend);
                 if let Err(err) = add_result {
                     let Ext4AllocState {
                         geo,
@@ -24058,9 +24063,10 @@ impl OpenFs {
 
             symlink_inode = self.read_inode(cx, ino)?;
             let mut alloc = alloc_mutex.write();
-            // bd-bhh0i: single-lock caller wraps the alloc guard (dropped before
-            // the error branch re-borrows `alloc`).
-            let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+            // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must
+            // end before the error branch re-borrows `alloc`; NLL ends it at the
+            // last use, so the explicit `drop` is gone. Order still matters.
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
             let add_result = self.ext4_add_dir_entry(
                 cx,
                 &mut backend,
@@ -24073,7 +24079,6 @@ impl OpenFs {
                 tstamp_secs,
                 tstamp_nanos,
             );
-            drop(backend);
             if let Err(err) = add_result {
                 let block_dev = self.block_device_adapter();
                 let Ext4AllocState {
@@ -26450,9 +26455,10 @@ impl OpenFs {
         // and then failing, which would orphan the renamed inode (silent data
         // loss). On success the result is identical to remove-then-add.
         let new_parent_inode_fresh = self.read_inode(cx, new_parent)?;
-        // bd-bhh0i: single-lock caller wraps the alloc guard (dropped before the
-        // subsequent source-entry removal re-borrows `alloc`).
-        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
+        // before the subsequent source-entry removal re-borrows `alloc`; NLL ends it
+        // at the last use, so the explicit `drop` is gone. Order still matters.
+        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
         let add_result = self.ext4_add_dir_entry(
             cx,
             &mut backend,
@@ -26465,7 +26471,6 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         );
-        drop(backend);
         add_result?;
 
         // Re-acquire the block device adapter so subsequent reads/writes observe
@@ -58638,7 +58643,7 @@ mod tests {
         // from it and never reaches the memo at all — the two arms would differ by
         // cache warmth, not by the memo. Disable it so this measures what it says.
         fs.set_readonly_lookup_cache_disabled(true);
-        let mut arm = |disabled: bool| {
+        let arm = |disabled: bool| {
             fs.set_btrfs_floor_memo_disabled(disabled);
             let (l0, h0) = crate::btrfs_node_cache_counters();
             let start = std::time::Instant::now();
@@ -59264,7 +59269,7 @@ mod tests {
         };
         let cx = Cx::for_testing();
 
-        let mut arm = |prewarm: bool, memo: bool| -> (u64, std::time::Duration, u64) {
+        let arm = |prewarm: bool, memo: bool| -> (u64, std::time::Duration, u64) {
             let fs = OpenFs::from_device(
                 &cx,
                 Box::new(TestDevice::from_vec(bytes.clone())),
@@ -59353,7 +59358,7 @@ mod tests {
         // enable_writes. Each arm still gets a FRESH OpenFs, so "cold fs per
         // arm" is unchanged — that was always about the fs caches, not the bytes.
         let shared_device = TestDevice::from_vec(bytes.clone());
-        let mut arm = |memo_disabled: bool| -> (u64, std::time::Duration) {
+        let arm = |memo_disabled: bool| -> (u64, std::time::Duration) {
             let fs = OpenFs::from_device(
                 &cx,
                 Box::new(shared_device.clone()),
@@ -59525,7 +59530,7 @@ mod tests {
         // see the random arm for why this churn is the drift suspect. Each arm
         // still constructs a fresh OpenFs, so the cold-fs property is unchanged.
         let shared_device = TestDevice::from_vec(bytes.clone());
-        let mut arm = |memo_disabled: bool| -> (u64, std::time::Duration, u64) {
+        let arm = |memo_disabled: bool| -> (u64, std::time::Duration, u64) {
             let fs = OpenFs::from_device(
                 &cx,
                 Box::new(shared_device.clone()),
@@ -60557,7 +60562,7 @@ mod tests {
         // One scope per operation, opened and committed exactly as the FUSE
         // handlers do, so the only thing that differs from the direct-path test is
         // the scope lifecycle.
-        let mut scoped = |op: RequestOp,
+        let scoped = |op: RequestOp,
                           run: &mut dyn FnMut(&mut RequestScope) -> ffs_error::Result<()>|
          -> ffs_error::Result<()> {
             let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, op)?;
