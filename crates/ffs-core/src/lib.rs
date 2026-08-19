@@ -29918,8 +29918,37 @@ impl OpenFs {
         // set on disk for a kernel mount to read.
         let (log_tree, log_tree_bytes_alloc, log_tree_is_metadata) =
             Self::btrfs_allocate_tree_log_block(alloc)?;
+        // ⚠️ TWO FALLIBLE ALLOCATIONS MEANS THE FIRST CAN BE ORPHANED BY THE
+        // SECOND. Propagating with `?` here would leave the log tree allocated —
+        // extent item inserted, used_bytes charged — and unreachable, because
+        // nothing has recorded it in `btrfs_live_log_blocks` yet and the caller
+        // never sees it. That is one leaked nodesize block per failed fsync, the
+        // exact defect bd-0ajub fixed, reintroduced by making the writer emit two
+        // blocks instead of one. So the first is handed back before returning.
+        //
+        // A failure to free is swallowed rather than masking the real error: the
+        // allocation failure is what the caller needs to see, and turning a
+        // space-accounting problem into a different error would lose it.
         let (log_root, log_root_bytes_alloc, log_root_is_metadata) =
-            Self::btrfs_allocate_tree_log_block(alloc)?;
+            match Self::btrfs_allocate_tree_log_block(alloc) {
+                Ok(block) => block,
+                Err(err) => {
+                    if let Err(free_err) = alloc.extent_alloc.free_extent(
+                        log_tree,
+                        log_tree_bytes_alloc,
+                        log_tree_is_metadata,
+                    ) {
+                        warn!(
+                            target: "ffs::btrfs::rw",
+                            log_tree,
+                            error = ?free_err,
+                            "btrfs tree-log: log tree not freed after the log root \
+                             allocation failed; space leaked"
+                        );
+                    }
+                    return Err(err);
+                }
+            };
         let allocated_bytes = log_tree_bytes_alloc.saturating_add(log_root_bytes_alloc);
         let metadata_allocation = log_tree_is_metadata && log_root_is_metadata;
         // bd-0ajub: rotate. The block we are superseding is handed to the caller to
