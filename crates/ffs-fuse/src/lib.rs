@@ -574,19 +574,48 @@ fn emit_xattr_suppression_evidence(line: String) {
 fn resolve_xattr_suppression(fs: &FrankenFuse) {
     let setting =
         xattr_switch_setting_from_value(std::env::var("FFS_FUSE_XATTR_NO_SUPPORT").ok().as_deref());
-    if setting == XattrSwitchSetting::Off {
+    // The scan has TWO consumers now, so the early return has to ask both. Before
+    // bd-t0xoq the only reader was the kernel-suppression switch, and returning
+    // here whenever that was `Off` also skipped the scan — which would leave the
+    // short-circuit permanently refused with `not_scanned` no matter how its own
+    // knob was set, and it would look exactly like the lever not working.
+    let shortcircuit_requested = capability_shortcircuit_from_env();
+    if setting == XattrSwitchSetting::Off && !shortcircuit_requested {
         // Still reported, and that is the point: an ABSENT line is ambiguous
         // between "this arm did not suppress" and "this ELF is too old to say".
         // The comparator distinguishes a lever from a null by comparing the two
         // arms' lines, so the off arm has to have one.
         emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, None, false));
+        emit_xattr_suppression_evidence(capability_shortcircuit_evidence(
+            false,
+            None,
+            fs.inner.read_only,
+            false,
+        ));
         return;
     }
     let cx = FrankenFuse::cx_for_request();
     let presence = fs.inner.ops.xattr_presence(&cx);
     let allowed = xattr_suppression_allowed(setting, presence, fs.inner.read_only);
     XATTR_SWITCH.store(allowed, std::sync::atomic::Ordering::Relaxed);
+    let shortcircuit =
+        capability_shortcircuit_allowed(shortcircuit_requested, presence, fs.inner.read_only);
+    XATTR_PROVEN_ABSENT.store(shortcircuit, std::sync::atomic::Ordering::Relaxed);
     emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, Some(presence), allowed));
+    emit_xattr_suppression_evidence(capability_shortcircuit_evidence(
+        shortcircuit_requested,
+        Some(presence),
+        fs.inner.read_only,
+        shortcircuit,
+    ));
+    if shortcircuit {
+        info!(
+            ?presence,
+            "capability-probe short-circuit ACTIVE: security.capability probes answer ABSENT \
+             without reading the inode (bd-t0xoq). The probe still crosses; only the \
+             daemon-side inode read is removed."
+        );
+    }
     if allowed {
         info!(
             ?setting,
@@ -673,6 +702,100 @@ fn xattr_unsupported_from_env() -> bool {
 /// bit per connection, so a mount whose handlers disagreed would accept a
 /// `setxattr` the kernel can no longer read back.
 static XATTR_SWITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `security.capability` probe may be answered ABSENT without reading
+/// the inode, because this mount PROVED no inode carries any xattr (bd-t0xoq).
+///
+/// Resolved at mount beside [`XATTR_SWITCH`], and a process-global for the same
+/// reason: every xattr handler must see one answer.
+///
+/// ⚠️ THIS IS NOT THE `bd-ha71t` SUPPRESSION SWITCH, and the distinction is the
+/// whole point of it existing. [`XATTR_SWITCH`] asks the KERNEL to stop probing,
+/// which bd-ha71t closed by measurement — `ENOSYS` is per-connection so it
+/// disables `getxattr` for the whole mount, and both `HANDLE_KILLPRIV` bits
+/// negotiated and stayed inert (4000 probes -> 4000 probes). This flag changes
+/// nothing the kernel does: the probe still crosses, and the transport cost that
+/// bd-yu6jz owns is untouched. It only removes the DAEMON-side inode read behind
+/// the answer.
+static XATTR_PROVEN_ABSENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Pure half of `FFS_FUSE_XATTR_PROVEN_ABSENT_SHORTCIRCUIT`, split out so the
+/// parsing is testable without mutating process-global environment state.
+///
+/// Opt-in and OFF unless set, like every other lever knob here, so an unset
+/// environment is byte-identical to before it existed and both arms of an A/B
+/// can run from one ELF.
+fn capability_shortcircuit_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn capability_shortcircuit_from_env() -> bool {
+    capability_shortcircuit_from_value(
+        std::env::var("FFS_FUSE_XATTR_PROVEN_ABSENT_SHORTCIRCUIT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Whether the short-circuit is authorised for this mount.
+///
+/// THREE conditions, and the read-only one is load-bearing rather than
+/// conservative dressing. [`ffs_core::vfs::XattrPresence::ProvenAbsent`] is a
+/// statement about the image AT SCAN TIME. On a writable mount it can be
+/// falsified afterwards, and not only by `setxattr`: creating a file under a
+/// directory carrying a default POSIX ACL gives the new inode an xattr with no
+/// xattr call ever reaching this daemon. Invalidating correctly on a writable
+/// mount therefore means clearing this flag on every inode-creating path as
+/// well, which is a wider and more error-prone surface than the win justifies
+/// as a first cut. A read-only mount cannot mutate at all, so the proof holds
+/// for the life of the mount with no invalidation logic whatsoever.
+///
+/// `Unknown` is refused for the reason the enum's own docs give: it means the
+/// scan did not finish (too many inodes, or a read failed), and callers must
+/// treat it exactly like `Present`. Silence is never "none".
+fn capability_shortcircuit_allowed(
+    requested: bool,
+    presence: ffs_core::vfs::XattrPresence,
+    read_only: bool,
+) -> bool {
+    requested && read_only && presence == ffs_core::vfs::XattrPresence::ProvenAbsent
+}
+
+/// Evidence line for the short-circuit, emitted beside the suppression line
+/// under the same `FFS_MOUNT_BENCH_EVIDENCE` gate and the same
+/// `mount_candidate_xattr` prefix.
+///
+/// A SEPARATE line rather than extra fields on
+/// [`xattr_suppression_evidence`], because the two are different levers with
+/// different verdicts and a comparator that parsed one line would otherwise have
+/// to know which fields belonged to which. Emitted on both arms, including when
+/// refused, for the reason the suppression line already documents: an absent
+/// line is ambiguous between "this arm did not short-circuit" and "this ELF is
+/// too old to say".
+fn capability_shortcircuit_evidence(
+    requested: bool,
+    presence: Option<ffs_core::vfs::XattrPresence>,
+    read_only: bool,
+    active: bool,
+) -> String {
+    let presence = match presence {
+        None => "not_scanned",
+        Some(ffs_core::vfs::XattrPresence::ProvenAbsent) => "proven_absent",
+        Some(ffs_core::vfs::XattrPresence::Present) => "present",
+        Some(ffs_core::vfs::XattrPresence::Unknown) => "unknown",
+    };
+    let outcome = if active { "active" } else { "refused" };
+    let requested = if requested { "1" } else { "0" };
+    let mount = if read_only { "ro" } else { "rw" };
+    format!(
+        "capability_shortcircuit={outcome},capability_shortcircuit_requested={requested},\
+         capability_shortcircuit_presence={presence},capability_shortcircuit_mount={mount}"
+    )
+}
 
 /// How `FFS_FUSE_XATTR_NO_SUPPORT` was set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4194,6 +4317,25 @@ impl FrankenFuse {
         // closes.
         record_xattr_probe_name(name);
         let is_capability_probe = name == SECURITY_CAPABILITY_XATTR;
+        // bd-t0xoq: checked BEFORE the memo, because it subsumes it. The memo can
+        // only answer a probe it has already seen, and the regime this bead is
+        // about is the FIRST sweep of a directory on a fresh mount — a counted
+        // `ls -l` over 2000 entries produced 2003 probes, 2 memo hits and 2001
+        // cold format lookups, i.e. 1.000 inode reads per entry with the memo
+        // doing nothing. No slot count fixes that: every entry is a distinct
+        // inode probed exactly once, so a bigger table still misses every time.
+        // A whole-filesystem absence proof is the only thing that can answer a
+        // probe the mount has never seen.
+        if is_capability_probe && XATTR_PROVEN_ABSENT.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.inner.count_memoized_requests {
+                self.inner.metrics.record_memoized();
+            }
+            trace!(
+                ino = ino.0,
+                name, "getxattr answered from the proven-absent short-circuit"
+            );
+            return Ok(None);
+        }
         if is_capability_probe && self.inner.missing_capability_xattr.contains(ino) {
             if self.inner.count_memoized_requests {
                 self.inner.metrics.record_memoized();
@@ -7812,6 +7954,111 @@ mod tests {
                  is none', and Unknown must be treated exactly like Present"
             );
         }
+    }
+
+    /// bd-t0xoq: the short-circuit knob is opt-in and byte-identical to before
+    /// it existed when unset, so both arms of an A/B can run from one ELF.
+    #[test]
+    fn capability_shortcircuit_knob_is_opt_in_bd_t0xoq() {
+        assert!(
+            !capability_shortcircuit_from_value(None),
+            "unset must not enable a lever"
+        );
+        for off in ["", "0", "false", "off", "no", "maybe", "2"] {
+            assert!(
+                !capability_shortcircuit_from_value(Some(off)),
+                "{off:?} must not enable the short-circuit; anything unrecognised \
+                 has to fail towards today's behaviour"
+            );
+        }
+        for on in ["1", "true", "TRUE", "on", "On", " 1 "] {
+            assert!(
+                capability_shortcircuit_from_value(Some(on)),
+                "{on:?} is an accepted spelling of on, and the value is trimmed"
+            );
+        }
+    }
+
+    /// bd-t0xoq: the short-circuit answers a probe the mount has NEVER SEEN, so
+    /// it rests entirely on the whole-filesystem absence proof. Every cell that
+    /// is not `(requested, ProvenAbsent, read-only)` must come out false.
+    ///
+    /// The read-only cell is the one worth reading twice. `ProvenAbsent` is a
+    /// statement about the image at SCAN TIME, and on a writable mount it can be
+    /// falsified without any xattr call reaching this daemon at all -- creating a
+    /// file under a directory with a default POSIX ACL gives the new inode an
+    /// xattr. So unlike the per-inode memo, which `setxattr`/`removexattr`
+    /// invalidate with `forget`, this flag has no sound invalidation on a
+    /// writable mount short of clearing it on every inode-creating path.
+    #[test]
+    fn capability_shortcircuit_requires_a_proof_on_a_read_only_mount_bd_t0xoq() {
+        use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent, Unknown};
+
+        assert!(
+            capability_shortcircuit_allowed(true, ProvenAbsent, true),
+            "a proof on a read-only mount is the one case this lever exists for"
+        );
+        assert!(
+            !capability_shortcircuit_allowed(true, ProvenAbsent, false),
+            "a WRITABLE mount must be refused even WITH the proof: a create under a \
+             default-ACL directory adds an xattr with no xattr call reaching this \
+             daemon, so the proof can go stale behind our back. This cell may only \
+             become true alongside invalidation on every inode-creating path"
+        );
+        assert!(
+            !capability_shortcircuit_allowed(false, ProvenAbsent, true),
+            "the knob is opt-in: a proof alone must not enable it"
+        );
+        for presence in [Present, Unknown] {
+            assert!(
+                !capability_shortcircuit_allowed(true, presence, true),
+                "must not fire on {presence:?}: Unknown means the scan did not \
+                 finish, and the enum's own contract is that callers treat it \
+                 exactly like Present. Silence is never 'none'"
+            );
+        }
+    }
+
+    /// bd-t0xoq: both arms must emit a line, including the refused arm, for the
+    /// same reason the suppression line already does -- an absent line cannot be
+    /// told apart from an ELF too old to report one.
+    #[test]
+    fn capability_shortcircuit_evidence_reports_both_arms_bd_t0xoq() {
+        use ffs_core::vfs::XattrPresence::{Present, ProvenAbsent};
+
+        let active = capability_shortcircuit_evidence(true, Some(ProvenAbsent), true, true);
+        assert!(
+            active.contains("capability_shortcircuit=active"),
+            "{active}"
+        );
+        assert!(
+            active.contains("capability_shortcircuit_presence=proven_absent"),
+            "{active}"
+        );
+        assert!(
+            active.contains("capability_shortcircuit_mount=ro"),
+            "{active}"
+        );
+
+        let refused = capability_shortcircuit_evidence(true, Some(Present), false, false);
+        assert!(
+            refused.contains("capability_shortcircuit=refused"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("capability_shortcircuit_mount=rw"),
+            "{refused}"
+        );
+
+        let unscanned = capability_shortcircuit_evidence(false, None, true, false);
+        assert!(
+            unscanned.contains("capability_shortcircuit_presence=not_scanned"),
+            "{unscanned}"
+        );
+        assert!(
+            unscanned.contains("capability_shortcircuit_requested=0"),
+            "{unscanned}"
+        );
     }
 
     /// An assertion is honoured without a proof -- that is what an assertion IS
