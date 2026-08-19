@@ -2727,6 +2727,25 @@ const CAPABILITY_MEMO_SLOTS_MAX: usize = 1 << 20;
 /// saving memory only on images small enough not to have needed it. Pass a
 /// directory size here, never an inode count.
 ///
+/// ⚠️ WHICH REGIME THE 3.36x BELONGS TO, because two beads measured this memo and
+/// appear to contradict each other. bd-34hzz sized it to the directory and got
+/// 6.990007x -> 3.359246x. bd-t0xoq COUNTED a single sweep and found 2001 cold
+/// format lookups against 2 memo hits — a memo doing essentially nothing.
+///
+/// Both are right, and the variable is the harness's cache regime.
+/// `Workload::uses_cold_cache()` is true ONLY for the cold-cache parallel-read
+/// workload; readdir+stat is warm, so it runs WARMUP_ROUNDS before any timed
+/// observation and the mount — and therefore this memo — is already warm when the
+/// first timed batch starts. The reducer then takes the MINIMUM across repeats.
+/// So bd-34hzz's win is a warm-memo number by construction, and bd-t0xoq's count is
+/// the cold regime: the first sweep of a directory on a fresh mount.
+///
+/// That matters for the POLICY this bead is choosing, not for the validity of
+/// either measurement. A default sized from the warm number optimises repeated
+/// listings of one directory; a one-shot `ls -l` on a fresh mount is bd-t0xoq's
+/// regime and sees ~nothing from any slot count, because the answers are not there
+/// yet. Say which regime the default is for.
+///
 /// ⛔ AND THE WORKING SET IS NOT A READDIR PAGE EITHER, which is the other
 /// tempting answer because a page IS bounded and would make the whole sizing
 /// question go away. Two banked numbers rule it out without a new measurement.
