@@ -1970,7 +1970,18 @@ fn slice_readdir_snapshot(entries: Arc<Vec<DirEntry>>, offset: u64) -> ReaddirPa
 /// all. Above it, one descent per LEAF replaces one per entry.
 const BTRFS_READDIR_LEAF_PREFETCH_MIN_ENTRIES: usize = 8;
 
-fn btrfs_readdir_prefetch_enabled() -> bool {
+/// Whether this process warms btrfs readdir inode leaves
+/// (bd-btrfs-readdir-stat-8x-8y7vp).
+///
+/// `pub` because the mount MUST self-report it. The comparator proves two
+/// candidate arms differ by reading the daemon's own `mount_candidate_knobs`
+/// line, and refuses the run when both arms resolve identical knobs — so a knob
+/// the daemon does not report cannot be A/B'd at all. It refused this lever for
+/// exactly that reason before this was exported, which is the gate working: the
+/// alternative was a run comparing prefetch-on against prefetch-on and reporting
+/// a null.
+#[must_use]
+pub fn btrfs_readdir_prefetch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FFS_BTRFS_READDIR_PREFETCH")
@@ -30802,7 +30813,6 @@ impl OpenFs {
                 if system_need > system_have {
                     let shortfall = system_need - system_have;
                     match ffs_btrfs::plan_growth_for_shortfall(
-                        &alloc.extent_alloc,
                         &chunks,
                         ffs_btrfs::ChunkKind::System,
                         shortfall,
