@@ -2727,6 +2727,21 @@ const CAPABILITY_MEMO_SLOTS_MAX: usize = 1 << 20;
 /// saving memory only on images small enough not to have needed it. Pass a
 /// directory size here, never an inode count.
 ///
+/// ⛔ AND THE WORKING SET IS NOT A READDIR PAGE EITHER, which is the other
+/// tempting answer because a page IS bounded and would make the whole sizing
+/// question go away. Two banked numbers rule it out without a new measurement.
+/// bd-34hzz measured a 32,768-entry directory at 6.990007x with the 4,096-slot
+/// default and 3.359246x sized to 65,536. A readdir page caps at 512 entries, so
+/// the default table already spans EIGHT pages: if an inode's two probes were
+/// separated by less than 4,096 distinct inodes, the default would already have
+/// held the first answer and sizing up could not have produced that 2.08x. It did.
+///
+/// So the kernel's two `security.capability` probes for one inode are separated by
+/// MORE than 4,096 intervening inodes — a large fraction of a full pass, not a
+/// page. Any scheme that keeps only a page's worth of answers alive, including
+/// populating the memo from the readdir prefetch, cannot collect the second probe
+/// and buys nothing. Size to the DIRECTORY or accept the cliff.
+///
 /// NOT wired into [`LastMissingCapabilityXattr::slots_from_env`], and that is
 /// deliberate rather than an omission. The two have opposite contracts: this is a
 /// POLICY and must never be able to make the shipping default worse, so it has a
