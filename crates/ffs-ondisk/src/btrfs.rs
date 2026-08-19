@@ -386,18 +386,35 @@ impl BtrfsSuperblock {
     /// patched in place for this reason; the tree-log path did not, and the
     /// difference was invisible until something other than us read the result.
     ///
-    /// Patches `log_root` (0x60), `log_root_level` (0xC8), `generation` (0x48) and
-    /// `bytes_used` (0x78), then recomputes the CRC32C over [0x20..].
-    pub fn patch_tree_log_commit(
-        data: &mut [u8],
-        log_root: u64,
-        log_root_level: u8,
-        generation: u64,
-        bytes_used: u64,
-    ) {
-        data[0x48..0x50].copy_from_slice(&generation.to_le_bytes());
+    /// ⚠️ IT PATCHES EXACTLY TWO FIELDS, and the ones it does NOT touch are the
+    /// point. A log commit publishes a log; it does not complete a transaction.
+    ///
+    /// `generation` (0x48) describes the ROOT TREE at `root` (0x50), and a log
+    /// commit rewrites neither. Advancing it says the root tree was rewritten when
+    /// it was not, and the kernel checks:
+    ///
+    ///     BTRFS error: parent transid verify failed on logical 32440320
+    ///                  mirror 1 wanted 14 found 10
+    ///     BTRFS warning: couldn't read tree root
+    ///     BTRFS error: open_ctree failed: -5
+    ///
+    /// Also measured, on the image produced once the `dev_item` fault above was
+    /// fixed: 14 was the superblock's generation after four fsyncs each bumped it,
+    /// 10 was the generation of the root tree it still pointed at.
+    ///
+    /// `bytes_used` (0x78) is left alone for the same reason. The log's blocks are
+    /// not in the on-disk extent tree yet — they are recorded there by the next
+    /// full commit, which recomputes this field from the extent items (bd-4cxkd).
+    /// Counting them early makes the superblock disagree with the extent tree it
+    /// points at, for as long as the log exists.
+    ///
+    /// The log tree's own nodes carry `generation + 1`: they belong to the running
+    /// transaction, which is precisely the one this field says has not committed.
+    ///
+    /// Patches `log_root` (0x60) and `log_root_level` (0xC8), then recomputes the
+    /// CRC32C over [0x20..].
+    pub fn patch_tree_log_commit(data: &mut [u8], log_root: u64, log_root_level: u8) {
         data[0x60..0x68].copy_from_slice(&log_root.to_le_bytes());
-        data[0x78..0x80].copy_from_slice(&bytes_used.to_le_bytes());
         data[0xC8] = log_root_level;
         let csum = ffs_types::crc32c(&data[0x20..]);
         data[0..4].copy_from_slice(&csum.to_le_bytes());
@@ -2588,6 +2605,64 @@ mod tests {
         assert_eq!(parsed.sectorsize, sb.sectorsize);
         assert_eq!(parsed.nodesize, sb.nodesize);
         assert_eq!(parsed.label, sb.label);
+    }
+
+    /// A log commit must leave the ROOT TREE's description alone (bd-jhuob).
+    ///
+    /// Both halves of this were kernel-refusal findings, not review comments: a
+    /// rebuilt superblock zeroed `dev_item` (open_ctree -22), and once that was
+    /// fixed, an advanced `generation` made the kernel demand transid 14 from a
+    /// root tree still at 10 (open_ctree -5). So the assertion that matters here
+    /// is the NEGATIVE one — the bytes outside the two log fields are identical.
+    #[test]
+    fn superblock_tree_log_patch_touches_only_the_log_fields_bd_jhuob() {
+        let mut data = vec![0_u8; 4096];
+        // Fill with a recognisable pattern so any stray write shows up, then set
+        // the fields a log commit is (wrongly) tempted to move.
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = u8::try_from(index % 251).expect("modulo 251 fits u8");
+        }
+        data[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        data[0x48..0x50].copy_from_slice(&10_u64.to_le_bytes()); // generation
+        data[0x78..0x80].copy_from_slice(&100_000_u64.to_le_bytes()); // bytes_used
+        let before = data.clone();
+
+        BtrfsSuperblock::patch_tree_log_commit(&mut data, 0x1F00_0000, 0);
+
+        assert_eq!(
+            u64::from_le_bytes(data[0x60..0x68].try_into().expect("8 bytes")),
+            0x1F00_0000,
+            "log_root must be published"
+        );
+        assert_eq!(data[0xC8], 0, "log_root_level must be published");
+        assert_eq!(
+            u64::from_le_bytes(data[0x48..0x50].try_into().expect("8 bytes")),
+            10,
+            "generation describes the root tree, which a log commit does not rewrite"
+        );
+        assert_eq!(
+            u64::from_le_bytes(data[0x78..0x80].try_into().expect("8 bytes")),
+            100_000,
+            "bytes_used is recomputed by the next full commit, not advanced here"
+        );
+
+        // Everything except csum[0..4], log_root, log_root_level is byte-identical.
+        // dev_item at 0x65 is inside this range: that is the -22 refusal, fenced.
+        for (offset, (old, new)) in before.iter().zip(data.iter()).enumerate() {
+            let is_patched = (0x60..0x68).contains(&offset) || offset == 0xC8;
+            let is_csum = offset < 4;
+            assert!(
+                is_patched || is_csum || old == new,
+                "byte {offset:#x} changed: {old:#x} -> {new:#x}"
+            );
+        }
+
+        let csum = ffs_types::crc32c(&data[0x20..]);
+        assert_eq!(
+            data[0..4],
+            csum.to_le_bytes()[..],
+            "the checksum must cover the patched bytes"
+        );
     }
 
     #[test]

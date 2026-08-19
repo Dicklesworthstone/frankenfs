@@ -190,7 +190,7 @@ const FSCRYPT_POLICY_V2_VERSION: u8 = 2;
 const FSCRYPT_POLICY_V2_SIZE: usize = 24;
 const FSCRYPT_CONTEXT_V2_SIZE: usize = 40;
 const EXT4_ENCRYPTION_XATTR_NAME: &[u8] = b"c";
-const BTRFS_TREE_LOG_OBJECTID: u64 = u64::MAX - 5;
+const BTRFS_TREE_LOG_OBJECTID: u64 = ffs_btrfs::BTRFS_TREE_LOG_OBJECTID;
 
 /// First DIR_INDEX sequence number assigned in a fresh directory, matching the
 /// kernel's `BTRFS_DIR_START_INDEX`. Sequences 0 and 1 are reserved for the
@@ -29960,10 +29960,18 @@ impl OpenFs {
             };
         let allocated_bytes = log_tree_bytes_alloc.saturating_add(log_root_bytes_alloc);
         let metadata_allocation = log_tree_is_metadata && log_root_is_metadata;
-        alloc.generation = alloc.generation.checked_add(1).ok_or_else(|| {
+        // ⚠️ COMPUTED, NOT STORED BACK. `alloc.generation` is the LAST COMMITTED
+        // generation — the full commit derives `new_gen = current_gen + 1` and only
+        // assigns it once the commit has succeeded. An fsync does not complete a
+        // transaction, so it must not advance it, and every fsync before the next
+        // commit belongs to the SAME running transaction and therefore uses the
+        // SAME generation. This used to assign, which drifted the log's generation
+        // by one per fsync; the kernel reads the log tree root at exactly
+        // `super.generation + 1` (btrfs_tree.h:682), so the second fsync onward
+        // wrote a log no kernel could find (bd-jhuob).
+        let generation = alloc.generation.checked_add(1).ok_or_else(|| {
             FfsError::InvalidGeometry("btrfs tree-log generation overflow".into())
         })?;
-        let generation = alloc.generation;
         let nodesize = alloc.nodesize;
         let items_count = items.len();
         let node = BtrfsCowNode::Leaf { items };
@@ -29971,7 +29979,20 @@ impl OpenFs {
             fsid: sb.fsid,
             chunk_tree_uuid: sb.fsid,
             bytenr,
-            flags: 0,
+            // The same header flags every other tree block we write carries, and
+            // for the same reason: WRITTEN, MIXED backref revision. This was 0,
+            // and a kernel replaying the log said so —
+            //
+            //     corrupt leaf: root=18446744073709551610 block=32473088 slot=0,
+            //                   invalid flag for leaf, WRITTEN not set
+            //     BTRFS warning: failed to read log tree
+            //
+            // The kernel's tree-checker rejects any leaf READ FROM DISK without
+            // WRITTEN, log tree or not; the flag distinguishes a block that has
+            // been written from one merely allocated. Our own reader never checked
+            // it, so the log round-tripped through us perfectly while being
+            // unreadable to the incumbent — the bd-73bi2 shape this bead is about.
+            flags: ffs_btrfs::BTRFS_HEADER_FLAGS_COMMITTED,
             generation,
             owner: BTRFS_TREE_LOG_OBJECTID,
             nodesize,
@@ -30005,9 +30026,17 @@ impl OpenFs {
             let root_item = BtrfsCowNode::Leaf {
                 items: vec![BtrfsTreeItem {
                     key: BtrfsKey {
-                        objectid: subvol_objectid,
+                        // ⚠️ THE SUBVOLUME GOES IN THE OFFSET, NOT THE OBJECTID.
+                        // The kernel scans the log root tree for ROOT_ITEMs whose
+                        // objectid is TREE_LOG_OBJECTID and STOPS at the first key
+                        // that is not — so a ROOT_ITEM keyed by the subvolume (which
+                        // is what this wrote) ends the scan before it has replayed
+                        // anything. Observed exactly that way: the kernel logged
+                        // "start tree-log replay", mounted clean with no error, and
+                        // the fsynced file was simply not there.
+                        objectid: BTRFS_TREE_LOG_OBJECTID,
                         item_type: BTRFS_ITEM_ROOT_ITEM,
-                        offset: 0,
+                        offset: subvol_objectid,
                     },
                     data: ffs_btrfs::tree_log_root_item(log_tree, 0, generation).into(),
                 }],
@@ -30031,18 +30060,8 @@ impl OpenFs {
             // own superblock write; the tree-log path did not, and nothing caught
             // it because our own reader repopulates dev_item from the chunk tree
             // and never looks at that field.
-            let bytes_used = sb
-                .bytes_used
-                .saturating_add(allocated_bytes)
-                .min(sb.total_bytes);
             let mut sb_bytes = on_disk_sb.to_vec();
-            BtrfsSuperblock::patch_tree_log_commit(
-                &mut sb_bytes,
-                log_root,
-                0,
-                generation,
-                bytes_used,
-            );
+            BtrfsSuperblock::patch_tree_log_commit(&mut sb_bytes, log_root, 0);
             Ok((log_tree_bytes, log_root_bytes, sb_bytes))
         })();
         let (log_tree_bytes, log_root_bytes, sb_bytes) = match prepared {

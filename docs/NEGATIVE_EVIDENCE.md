@@ -11341,3 +11341,59 @@ metadata to the COW spine. The capability is proven; the motivating failure is n
 
 **The flag stays default-off** until that pair exists and the growth path has run on more than one
 fixture. One passing gate is the end of "unverified", not the end of "unproven".
+
+## bd-jhuob — GATE PASSES, AND IT FOUND FIVE DEFECTS: the kernel now replays a tree log we wrote
+
+**Run 2026-08-18, thinkstation1, kernel 6.17.0-41-generic.** `scripts/tree_log_kernel_interop.py`,
+loadavg 24.32/22.55/15.92 at the passing run. Pass/fail capability test, so load does not bear on
+the result. Each finding below is a KERNEL REFUSAL quoted from `dmesg`, not a review comment.
+
+The gate added in the entry above (write via the ephemeral path, `kill -9` the daemon so
+`log_root` survives, hand the image to the kernel) was run for the first time. It failed five
+times, each time further in, and the sequence is the finding:
+
+    #  kernel's verdict                                                  defect
+    1  dev_item UUID does not match metadata fsid: 7edb9d6b != 000...    superblock REBUILT, not patched
+       superblock contains fatal errors / open_ctree failed: -22
+    2  parent transid verify failed on logical 32440320 mirror 1         log commit ADVANCED generation
+       wanted 14 found 10 / couldn't read tree root / open_ctree -5
+    3  corrupt leaf: root=18446744073709551610 block=32473088 slot=0,    header flags were 0, no WRITTEN
+       invalid flag for leaf, WRITTEN not set / failed to read log tree
+    4  corrupt leaf: ... invalid root item size, have 279 expect         ROOT_ITEM emitted at 279 bytes
+       439 or 239 / failed to read log tree
+    5  (mounted clean, "start tree-log replay", NO error, file absent)   log root key had subvol in the
+                                                                        OBJECTID, kernel wants it in the OFFSET
+    6  PASS: kernel mounted, replayed, and read the fsynced bytes back
+
+**Every one of the five round-tripped through our own code perfectly.** That is the whole point of
+this row. Our reader repopulates `dev_item` from the chunk tree and never reads that field; it
+parses a ROOT_ITEM prefix and does not care what follows; it never checks the WRITTEN flag; and the
+writer and the reader agreed with each other on the wrong log-root key, so the round-trip test
+`btrfs_tree_log_replay_follows_a_log_root_tree_bd_jhuob` passed against a format nothing else can
+read. A self-consistent pair of writer and reader cannot detect any of this. Only the incumbent can.
+
+**#5 is the one worth remembering: it is silent.** The first four refuse the mount loudly. The
+fifth mounts clean, logs `start tree-log replay`, returns no error, and the fsynced file is simply
+not there — an fsync that RETURNED SUCCESS, silently discarded by the kernel. If the gate had only
+checked that the mount succeeded it would have reported PASS at step 5. It reads the file back and
+compares the bytes, which is why it did not.
+
+**#2 also corrects a model, not just a line.** `alloc.generation` is the LAST COMMITTED generation
+— the full commit derives `new_gen = current_gen + 1` and stores it back only on success. The log
+path was assigning it, so N fsyncs before a commit drifted it by N while the root tree on disk
+stayed put: the superblock claimed generation 14 while pointing at a root tree at 10. An fsync does
+not complete a transaction, and every fsync before the next commit belongs to the SAME one.
+
+**#4 is not confined to the tree log.** `BtrfsRootItem::to_bytes` emits every new ROOT_ITEM this
+crate writes, and it was emitting 279 bytes — a constant documented as "Full ROOT_ITEM size with V2
+extension fields" when `sizeof(struct btrfs_root_item)` is 439. Measured, not counted: compiled
+against `/usr/include/linux/btrfs_tree.h` on this box, `sizeof` = 439 and
+`offsetof(generation_v2)` = 239, which are exactly the two lengths the kernel's tree-checker
+accepts. 279 is the prefix our parser reads, and it had been mistaken for the struct.
+
+**What this does NOT establish.** The gate exercises one subvolume, one fsynced file, an inline
+extent, and a 512 MB image. It does not exercise multiple subvolumes with logs, a non-inline
+EXTENT_DATA whose extent is absent from the on-disk extent tree, log spanning more than one leaf,
+or a log written by the kernel and replayed by us (the opposite direction, which `foreign_format`
+still refuses). Promoting the tree log to the default fsync strategy is not licensed by this row
+alone; it removes the objection this row's predecessor raised, and nothing more.

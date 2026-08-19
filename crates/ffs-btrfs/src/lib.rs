@@ -146,6 +146,13 @@ pub const BTRFS_UUID_TREE_OBJECTID: u64 = 9;
 pub const BTRFS_FREE_SPACE_TREE_OBJECTID: u64 = 10;
 /// Block-group tree v2 (kernel: `BTRFS_BLOCK_GROUP_TREE_OBJECTID`).
 pub const BTRFS_BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
+/// The tree log's owner objectid — "does write ahead logging to speed up
+/// fsyncs", `#define BTRFS_TREE_LOG_OBJECTID -6ULL`, `linux/btrfs_tree.h:85`,
+/// read on this box.
+///
+/// It is also the OBJECTID of every ROOT_ITEM in the log root tree; the
+/// subvolume that log belongs to is the key's OFFSET. See [`replay_tree_log`].
+pub const BTRFS_TREE_LOG_OBJECTID: u64 = u64::MAX - 5;
 /// Objectid shared by all data-checksum items in the csum tree
 /// (kernel: `BTRFS_EXTENT_CSUM_OBJECTID`, defined as `-10`).
 pub const BTRFS_EXTENT_CSUM_OBJECTID: u64 = 0xFFFF_FFFF_FFFF_FFF6;
@@ -719,6 +726,12 @@ const BTRFS_TX_TREE_ROOT_BASE_BLOCK: u64 = 0x4_1000_0000;
 /// Internal MVCC metadata block base used for pending-free ledgers.
 const BTRFS_TX_PENDING_FREE_BASE_BLOCK: u64 = 0x4_2000_0000;
 
+/// The pre-UUID ROOT_ITEM length, ending where `generation_v2` begins.
+///
+/// The kernel accepts it alongside `BTRFS_ROOT_ITEM_FULL_SIZE` —
+/// `btrfs_legacy_root_item_size()` is `offsetof(struct btrfs_root_item,
+/// generation_v2)`, `linux/btrfs_tree.h:969`, and measures 239 when compiled on
+/// this box. A reader must tolerate this length; a writer emits the full size.
 const BTRFS_ROOT_ITEM_LEGACY_SIZE: usize = 239;
 const BTRFS_ROOT_ITEM_GENERATION_OFFSET: usize = 160;
 const BTRFS_ROOT_ITEM_ROOT_DIRID_OFFSET: usize = 168;
@@ -732,8 +745,31 @@ const BTRFS_ROOT_ITEM_PARENT_UUID_OFFSET: usize = 263;
 const BTRFS_ROOT_ITEM_UUID_END: usize = BTRFS_ROOT_ITEM_UUID_OFFSET + 16;
 const BTRFS_ROOT_ITEM_PARENT_UUID_END: usize = BTRFS_ROOT_ITEM_PARENT_UUID_OFFSET + 16;
 
-/// Full ROOT_ITEM size with V2 extension fields.
+/// The ROOT_ITEM PREFIX this crate reads and patches — through `parent_uuid`.
+///
+/// ⚠️ NOT the size of the struct, and it used to say it was. `sizeof(struct
+/// btrfs_root_item)` is [`BTRFS_ROOT_ITEM_FULL_SIZE`]; everything from
+/// `received_uuid` onward lies beyond this bound. Fine as a lower bound for the
+/// in-place patchers, which touch nothing past `parent_uuid`; NOT a length to
+/// emit. See [`BtrfsRootItem::to_bytes`].
 pub const BTRFS_ROOT_ITEM_SIZE: usize = 279;
+
+/// `sizeof(struct btrfs_root_item)` — what a WRITER must emit.
+///
+/// ⚠️ PROVENANCE: measured, not counted. Compiled against
+/// `/usr/include/linux/btrfs_tree.h` on this box:
+///
+///     sizeof(btrfs_root_item)  = 439
+///     legacy (offsetof gen_v2) = 239
+///     sizeof(btrfs_inode_item) = 160
+///
+/// The kernel's tree-checker accepts exactly these two lengths and rejects
+/// everything else, which is how the short form was found (bd-jhuob):
+///
+///     BTRFS critical: corrupt leaf: root=18446744073709551610 block=32473088
+///                     slot=0, invalid root item size, have 279 expect 439 or 239
+pub const BTRFS_ROOT_ITEM_FULL_SIZE: usize = 439;
+
 
 /// Parsed subset of `btrfs_root_item` needed for tree bootstrapping,
 /// subvolume enumeration, and snapshot navigation.
@@ -817,9 +853,20 @@ impl BtrfsRootItem {
     ///
     /// Sets essential fields (bytenr, level, generation, root_dirid, refs)
     /// and zeros the rest (inode_item, drop_progress, etc.).
+    ///
+    /// ⚠️ THE LENGTH IS PART OF THE FORMAT. This emitted
+    /// [`BTRFS_ROOT_ITEM_SIZE`] (279) — the prefix this crate patches — and the
+    /// kernel's tree-checker rejects any ROOT_ITEM that is neither 439 nor 239:
+    ///
+    ///     invalid root item size, have 279 expect 439 or 239
+    ///
+    /// It went unnoticed because our own parser reads a prefix and does not care
+    /// what follows, so a short item round-trips through us and is refused by
+    /// everything else. The trailing bytes are zero, which is what they mean:
+    /// no received_uuid, no send/receive transids, no timestamps.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; BTRFS_ROOT_ITEM_SIZE];
+        let mut buf = vec![0u8; BTRFS_ROOT_ITEM_FULL_SIZE];
         // generation at offset 160
         buf[BTRFS_ROOT_ITEM_GENERATION_OFFSET..BTRFS_ROOT_ITEM_GENERATION_OFFSET + 8]
             .copy_from_slice(&self.generation.to_le_bytes());
@@ -11613,8 +11660,14 @@ pub fn replay_tree_log(
         // — another subvolume's logged items belong to a different keyspace, and
         // overlaying them onto this tree is the corruption this branch exists to
         // avoid.
+        // The log root tree keys each ROOT_ITEM as (TREE_LOG_OBJECTID, ROOT_ITEM,
+        // subvolume objectid) — the subvolume is the OFFSET. This matched on the
+        // objectid instead, which agreed with what our writer emitted and therefore
+        // round-tripped perfectly while being invisible to the kernel (bd-jhuob).
         let Some(entry) = items.iter().find(|entry| {
-            entry.key.item_type == BTRFS_ITEM_ROOT_ITEM && entry.key.objectid == subvol_objectid
+            entry.key.item_type == BTRFS_ITEM_ROOT_ITEM
+                && entry.key.objectid == BTRFS_TREE_LOG_OBJECTID
+                && entry.key.offset == subvol_objectid
         }) else {
             // A log exists, but not for us. ⚠️ NOT "nothing to replay": some other
             // subvolume has acknowledged fsyncs recorded there, and a commit that
@@ -16069,7 +16122,10 @@ mod tests {
     /// constants).
     #[test]
     fn parse_root_item_kernel_offsets_match_btrfs_tree_h() {
-        // 279 bytes covers the full UUID-era root_item per kernel header.
+        // 279 bytes is the PREFIX this parser reads, through parent_uuid — not the
+        // struct's size, which is BTRFS_ROOT_ITEM_FULL_SIZE (439, measured by
+        // compiling against linux/btrfs_tree.h on this box). A parse test may feed a
+        // prefix; a WRITER may not emit one (bd-jhuob).
         let mut root = vec![0_u8; 279];
 
         // Each field gets a distinct non-zero magic so an offset
@@ -16260,7 +16316,10 @@ mod tests {
             parent_uuid: [0x22; 16],
         };
         let serialized = item.to_bytes();
-        assert_eq!(serialized.len(), BTRFS_ROOT_ITEM_SIZE);
+        // The kernel's tree-checker accepts 439 or 239 and nothing else; this
+        // asserted 279, the prefix our parser reads, and so pinned the very
+        // length that made a kernel refuse the leaf (bd-jhuob).
+        assert_eq!(serialized.len(), BTRFS_ROOT_ITEM_FULL_SIZE);
         let parsed = parse_root_item(&serialized).expect("roundtrip parse");
         assert_eq!(parsed.bytenr, item.bytenr);
         assert_eq!(parsed.level, item.level);
@@ -20465,7 +20524,11 @@ mod tests {
         let log_tree = 0x4321_0000_u64;
         let generation = 99_u64;
         let item = tree_log_root_item(log_tree, 0, generation);
-        assert_eq!(item.len(), BTRFS_ROOT_ITEM_SIZE);
+        assert_eq!(
+            item.len(),
+            BTRFS_ROOT_ITEM_FULL_SIZE,
+            "the kernel accepts 439 or 239 and rejects the 279-byte prefix"
+        );
 
         // The exact bytes `replay_tree_log` reads to find the log tree.
         let mut raw = [0_u8; 8];
