@@ -78278,6 +78278,123 @@ mod tests {
         (dev.snapshot_bytes(), canonical)
     }
 
+    /// bd-dm01m: EVERY fsync'd inode must survive a crash, not merely the last.
+    ///
+    /// The tree log is one leaf and `log_root` REPLACES the previous log rather than
+    /// chaining to it. So before the accumulator landed:
+    ///
+    ///     fsync(A) -> log holds A, log_root -> LogA
+    ///     fsync(B) -> log holds B, log_root -> LogB   (LogA unreachable)
+    ///     crash    -> replay sees LogB only           -> A is GONE
+    ///
+    /// A's fsync had already returned SUCCESS. Acknowledged-then-lost is the worst
+    /// available failure mode, and it is invisible to a single-inode test — which is
+    /// what the existing coverage was: `btrfs_tree_log_lab_crash_replay_makes_...`
+    /// fsyncs one file and passes against the broken code, and the only multi-file
+    /// interleaved-fsync test is ext4's.
+    ///
+    /// THE CRASH IS MODELLED BY SNAPSHOTTING THE DEVICE, not by unmounting. A clean
+    /// unmount performs a full transaction commit, which supersedes the log and
+    /// hides exactly this bug — the bead calls that out, and it is why this test
+    /// reads the raw bytes after the second fsync and never commits.
+    ///
+    /// Asserted on SIZE rather than data bytes, for the reason bd-mogn1's test
+    /// records: a data read on these fixtures trips a pre-existing
+    /// overwrite-vs-EXTENT_CSUM staleness that reproduces without any fsync, so a
+    /// content assertion would fail for an unrelated reason and mask this one. Size
+    /// lives in the INODE_ITEM the log replays, so it exercises the same overlay.
+    #[test]
+    fn btrfs_tree_log_keeps_every_fsynced_inode_not_just_the_last_bd_dm01m() {
+        let (fs, cx, dev) = open_writable_btrfs_with_device();
+        let ops: &dyn FsOps = &fs;
+
+        let a = ops
+            .create(
+                &cx,
+                &mut RequestScope::empty(),
+                InodeNumber(1),
+                OsStr::new("dm01m-a.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create A");
+        let b = ops
+            .create(
+                &cx,
+                &mut RequestScope::empty(),
+                InodeNumber(1),
+                OsStr::new("dm01m-b.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create B");
+
+        // Distinct sizes so a replayed inode can be identified by its size alone.
+        const A_LEN: usize = 4096;
+        const B_LEN: usize = 8192;
+
+        ops.write(
+            &cx,
+            &mut RequestScope::empty(),
+            a.ino,
+            0,
+            &vec![0xA1_u8; A_LEN],
+        )
+        .expect("write A");
+        ops.fsync(&cx, &mut RequestScope::empty(), a.ino, 0, false)
+            .expect("fsync A");
+
+        // B's fsync REPLACES the log root. Before the fix this is the step that
+        // orphaned A.
+        ops.write(
+            &cx,
+            &mut RequestScope::empty(),
+            b.ino,
+            0,
+            &vec![0xB2_u8; B_LEN],
+        )
+        .expect("write B");
+        ops.fsync(&cx, &mut RequestScope::empty(), b.ino, 0, false)
+            .expect("fsync B");
+
+        let image = dev.snapshot_bytes();
+        let logged = BtrfsSuperblock::parse_from_image(&image).expect("parse superblock");
+        assert_ne!(
+            logged.log_root, 0,
+            "both fsyncs must have published a tree log, or the crash this test \
+             models cannot lose anything and the test is vacuous"
+        );
+
+        let opts = OpenOptions {
+            btrfs_rw_ephemeral_ok: true,
+            ..OpenOptions::default()
+        };
+        let replayed = OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(image)), &opts)
+            .expect("remount after the modelled crash");
+        let replayed_ops: &dyn FsOps = &replayed;
+
+        let b_attr = replayed_ops
+            .getattr(&cx, &mut RequestScope::empty(), b.ino)
+            .expect("stat B after replay");
+        assert_eq!(
+            b_attr.size, B_LEN as u64,
+            "the LAST fsync'd inode surviving is the part that already worked; if \
+             this fails the defect is not bd-dm01m"
+        );
+
+        let a_attr = replayed_ops
+            .getattr(&cx, &mut RequestScope::empty(), a.ino)
+            .expect("stat A after replay");
+        assert_eq!(
+            a_attr.size, A_LEN as u64,
+            "bd-dm01m: A's fsync returned SUCCESS before B's replaced the log root. \
+             Seeing size 0 here is the acknowledged-then-lost bug — the accumulator \
+             must re-serialize items for EVERY inode fsync'd since the last full commit"
+        );
+    }
+
     #[test]
     fn btrfs_write_enable_writes_sets_writable() {
         let (fs, _cx) = open_writable_btrfs();
