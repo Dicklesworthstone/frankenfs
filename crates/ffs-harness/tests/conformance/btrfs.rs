@@ -916,6 +916,91 @@ fn btrfs_tree_log_replay_multilevel_conforms() {
     assert_eq!(replay.items[1].data, b"beta");
 }
 
+/// bd-jhuob. The KERNEL's log shape, end to end: `log_root` addresses a log ROOT
+/// TREE of ROOT_ITEMs, each naming one subvolume's log tree.
+///
+/// This is the round trip between the two halves landed for this bead — the
+/// ROOT_ITEM our writer emits (`tree_log_root_item`) and the reader that follows
+/// it. Testing them against each other is the point: each side can be
+/// self-consistent and still disagree about the layout, which is the failure that
+/// survives both being individually "correct".
+#[test]
+fn btrfs_tree_log_replay_follows_a_log_root_tree_bd_jhuob() {
+    const ROOT_ITEM_TYPE: u8 = 132;
+    let log_root_logical = 0x40_0000_u64;
+    let log_tree_logical = log_root_logical + u64::from(BTRFS_TEST_NODESIZE);
+    let physical_start = 0x10_0000_u64;
+    let log_root_physical = physical_start;
+    let log_tree_physical = physical_start + u64::from(BTRFS_TEST_NODESIZE);
+    let chunk_length = log_tree_logical + u64::from(BTRFS_TEST_NODESIZE) - log_root_logical;
+    let chunks = vec![build_single_stripe_chunk(
+        log_root_logical,
+        chunk_length,
+        physical_start,
+    )];
+
+    // The log ROOT TREE: one ROOT_ITEM for the fs tree, pointing at its log.
+    let mut log_root = vec![0_u8; BTRFS_TEST_NODESIZE as usize];
+    write_btrfs_header(&mut log_root, log_root_logical, 1, 0, 5, 77);
+    let root_item = tree_log_root_item(log_tree_logical, 0, 78);
+    let root_item_off = 3000_u32;
+    let root_item_len = u32::try_from(root_item.len()).expect("root item length fits u32");
+    write_btrfs_leaf_item(
+        &mut log_root,
+        0,
+        BTRFS_FS_TREE_OBJECTID,
+        ROOT_ITEM_TYPE,
+        0,
+        root_item_off,
+        root_item_len,
+    );
+    log_root[root_item_off as usize..(root_item_off + root_item_len) as usize]
+        .copy_from_slice(&root_item);
+
+    // The subvolume's log tree: the items an fsync actually recorded.
+    let mut log_tree = vec![0_u8; BTRFS_TEST_NODESIZE as usize];
+    write_btrfs_header(&mut log_tree, log_tree_logical, 1, 0, 5, 78);
+    let payload_off = 3600_u32;
+    write_btrfs_leaf_item(&mut log_tree, 0, 256, BTRFS_ITEM_INODE_ITEM, 0, payload_off, 6);
+    log_tree[payload_off as usize..(payload_off + 6) as usize].copy_from_slice(b"logged");
+
+    stamp_btrfs_tree_block_checksum(&mut log_root);
+    stamp_btrfs_tree_block_checksum(&mut log_tree);
+    let blocks: HashMap<u64, Vec<u8>> =
+        [(log_root_physical, log_root), (log_tree_physical, log_tree)]
+            .into_iter()
+            .collect();
+    let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+        blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+            field: "physical",
+            reason: "block not in test image",
+        })
+    };
+
+    let sb = build_btrfs_tree_log_superblock(log_root_logical, 0);
+    let replay = replay_tree_log(&mut read, &sb, &chunks, BTRFS_FS_TREE_OBJECTID)
+        .expect("replay a log root tree");
+    assert!(replay.replayed, "a log root tree naming our subvolume must replay");
+    assert!(!replay.foreign_format);
+    assert_eq!(replay.items.len(), 1, "the LOG TREE's items, not the root tree's");
+    assert_eq!(replay.items[0].key.objectid, 256);
+    assert_eq!(replay.items[0].data, b"logged");
+
+    // ⚠️ A log root tree naming a DIFFERENT subvolume must not be replayed into
+    // this one — those items belong to another keyspace — and must not be treated
+    // as "nothing to replay" either, because that subvolume's acknowledged fsyncs
+    // live there and a commit clearing log_root would destroy them.
+    let other = replay_tree_log(&mut read, &sb, &chunks, BTRFS_FS_TREE_OBJECTID + 1)
+        .expect("replay must not error for a foreign subvolume");
+    assert!(!other.replayed);
+    assert!(
+        other.foreign_format,
+        "a log for another subvolume is unreplayable HERE, and the caller must \
+         refuse writes rather than clear it"
+    );
+    assert!(other.items.is_empty());
+}
+
 #[test]
 fn btrfs_tree_log_replay_skips_when_log_root_absent() {
     let sb = build_btrfs_tree_log_superblock(0, 0);

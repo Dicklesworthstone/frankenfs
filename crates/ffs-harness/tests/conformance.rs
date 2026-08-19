@@ -10,7 +10,8 @@ use ffs_btrfs::{
     build_mkfile_command, build_mknod_command, build_mksock_command, build_removexattr_command,
     build_rename_command, build_rmdir_command, build_setxattr_command, build_subvol_command,
     build_symlink_command, build_truncate_command, build_unlink_command, build_utimes_command,
-    build_write_command, parse_send_stream, replay_tree_log, walk_chunk_tree, walk_device_tree,
+    build_write_command, parse_send_stream, replay_tree_log, tree_log_root_item,
+    walk_chunk_tree, walk_device_tree,
 };
 use ffs_core::{
     Ext4JournalReplayMode, FIEMAP_EXTENT_UNWRITTEN, FileType, FsOps, OpenFs, OpenOptions,
