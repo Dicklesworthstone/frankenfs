@@ -66956,6 +66956,14 @@ mod tests {
             ops: Mutex<Vec<DevOp>>,
         }
         impl ByteDevice for OrderRecordingDevice {
+            // Same value the sibling OrderRecordingDevice a few tests below
+            // reports; this impl was added without it and the trait has required
+            // it since 76475cb5a, so the crate did not build. Taken from the
+            // sibling rather than chosen, so the two fakes cannot disagree about
+            // how big they claim to be.
+            fn len_bytes(&self) -> u64 {
+                1 << 30
+            }
             fn read_exact_at(&self, _cx: &Cx, _off: ByteOffset, _buf: &mut [u8]) -> ffs_error::Result<()> {
                 Ok(())
             }
