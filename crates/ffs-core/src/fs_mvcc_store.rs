@@ -226,7 +226,7 @@ impl FsMvccStore {
     }
 
     pub(super) fn prune_after_commit_if_due(&self, commit_seq: CommitSeq) -> Option<CommitSeq> {
-        (commit_seq.0 != 0 && commit_seq.0 % MVCC_COMMIT_PRUNE_INTERVAL == 0)
+        (commit_seq.0 != 0 && commit_seq.0.is_multiple_of(MVCC_COMMIT_PRUNE_INTERVAL))
             .then(|| self.prune_safe())
     }
 
@@ -521,7 +521,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
 
     fn read_contiguous_into(&self, cx: &Cx, start: BlockNumber, dst: &mut [u8]) -> FfsResult<()> {
         let bs = self.block_size() as usize;
-        if bs == 0 || dst.len() % bs != 0 {
+        if bs == 0 || !dst.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
                 "read_contiguous_into: dst length must be a multiple of block size".to_owned(),
             ));

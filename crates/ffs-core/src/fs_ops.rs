@@ -3386,9 +3386,9 @@ impl FsOps for OpenFs {
                 // the on-disk image stays btrfs-check-clean (bd-70gyh).
                 let ss = u64::from(alloc.sectorsize);
                 let reaches_src_eof = src_offset.saturating_add(len) >= src_size;
-                if src_offset % ss != 0
-                    || dest_offset % ss != 0
-                    || (!reaches_src_eof && len % ss != 0)
+                if !src_offset.is_multiple_of(ss)
+                    || !dest_offset.is_multiple_of(ss)
+                    || (!reaches_src_eof && !len.is_multiple_of(ss))
                 {
                     return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                         libc::EINVAL,

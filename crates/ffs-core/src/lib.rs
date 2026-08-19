@@ -2760,7 +2760,7 @@ impl BlockDevice for MetadataLogCaptureDevice<'_> {
     ) -> Result<(), FfsError> {
         let block_size = usize::try_from(self.base.block_size)
             .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
-        if block_size == 0 || data.len() % block_size != 0 {
+        if block_size == 0 || !data.len().is_multiple_of(block_size) {
             return Err(FfsError::Format(
                 "metadata-log capture length is not block aligned".to_owned(),
             ));
@@ -3197,7 +3197,7 @@ impl BlockDevice for ByteDeviceBlockAdapter<'_> {
     ) -> Result<(), FfsError> {
         let block_size = usize::try_from(self.block_size)
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
-        if block_size == 0 || dst.len() % block_size != 0 {
+        if block_size == 0 || !dst.len().is_multiple_of(block_size) {
             return Err(FfsError::Format(
                 "read_contiguous_into: dst length must be a multiple of block size".to_owned(),
             ));
@@ -3256,7 +3256,7 @@ impl BlockDevice for ByteDeviceBlockAdapter<'_> {
     ) -> Result<(), FfsError> {
         let bs = usize::try_from(self.block_size)
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
-        if bs == 0 || data.len() % bs != 0 {
+        if bs == 0 || !data.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
                 "write_contiguous_blocks: data length must be a multiple of block size".to_owned(),
             ));
@@ -3397,7 +3397,7 @@ impl BlockDevice for CachedByteDeviceBlockAdapter<'_> {
     ) -> Result<(), FfsError> {
         let bs = usize::try_from(self.block_size())
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
-        if bs == 0 || data.len() % bs != 0 {
+        if bs == 0 || !data.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
                 "write_contiguous_blocks: data length must be a multiple of block size".to_owned(),
             ));
@@ -4071,7 +4071,7 @@ pub fn run_writeback_barrier_benchmark(
             barrier.stage_write(inode);
             write_idx += 1;
 
-            if write_idx % fsync_every == 0 && writeback_enabled {
+            if write_idx.is_multiple_of(fsync_every) && writeback_enabled {
                 let _ = barrier.fsync_barrier(inode);
                 barrier.advance_epoch();
                 epoch_transitions += 1;
@@ -11547,19 +11547,6 @@ impl OpenFs {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
-    /// Read btrfs file data directly into the caller-provided `dst` buffer,
-    /// returning the number of bytes written.
-    ///
-    /// This is the read-into-buffer form used by [`OpenFs::read_into`]'s btrfs
-    /// fast path: it writes straight into `dst[..to_read]` with no intermediate
-    /// owned `Vec` allocation + copy (bd-2emlm — the owned-`Vec` form doubled
-    /// the resident set on a streamed read and thrashed page-faults). Holes and
-    /// preallocated ranges are zero-filled during the extent assembly pass, so
-    /// fully covered data reads do not pay an extra whole-buffer write.
-    /// `dst.len()` must be `>= to_read` (the caller sizes it from the read
-    /// request; `to_read = min(file_size - offset, size)`).
-
     /// Resolve a btrfs inode's item + its FULL EXTENT_DATA list from the on-disk
     /// fs tree (bd-n5w92), for the per-inode read-only extent cache. Unlike the
     /// windowed walk in `btrfs_read_file_into`, this fetches every EXTENT_DATA of
@@ -11687,6 +11674,24 @@ impl OpenFs {
         Ok(hits)
     }
 
+    /// Read btrfs file data directly into the caller-provided `dst` buffer,
+    /// returning the number of bytes written.
+    ///
+    /// This is the read-into-buffer form used by [`OpenFs::read_into`]'s btrfs
+    /// fast path: it writes straight into `dst[..to_read]` with no intermediate
+    /// owned `Vec` allocation + copy (bd-2emlm — the owned-`Vec` form doubled
+    /// the resident set on a streamed read and thrashed page-faults). Holes and
+    /// preallocated ranges are zero-filled during the extent assembly pass, so
+    /// fully covered data reads do not pay an extra whole-buffer write.
+    /// `dst.len()` must be `>= to_read` (the caller sizes it from the read
+    /// request; `to_read = min(file_size - offset, size)`).
+    ///
+    /// ⚠️ THIS DOC AND ITS `#[allow]` HAD DRIFTED 140 LINES UP THE FILE, onto
+    /// `btrfs_load_inode_all_extents` — an insertion between a doc comment and
+    /// the item it describes (the bd-0onu4 class). That function has been
+    /// carrying another function's description, and this one lost the allowance
+    /// it was given, which is why clippy started reporting it.
+    #[allow(clippy::too_many_lines)]
     fn btrfs_read_file_into(
         &self,
         cx: &Cx,
@@ -14105,7 +14110,7 @@ impl OpenFs {
     ) -> Result<(), FfsError> {
         let bs = usize::try_from(self.block_size())
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
-        if bs == 0 || dst.len() % bs != 0 {
+        if bs == 0 || !dst.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
                 "read_contiguous_into_with_scope: dst length must be a multiple of block size"
                     .to_owned(),
@@ -24381,7 +24386,7 @@ impl OpenFs {
             // FALLOC_FL_COLLAPSE_RANGE: free [offset, offset+length) and
             // shift everything past it left by `length`. Both must be
             // block-aligned, and the range must not reach EOF.
-            if (offset % block_size) != 0 || (length % block_size) != 0 {
+            if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
                 return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                     EINVAL_ERRNO,
                 )));
@@ -24470,7 +24475,7 @@ impl OpenFs {
             // length, leaving an unallocated hole [offset, offset+length).
             // Both must be block-aligned; offset must lie inside the file
             // (insert at EOF would just be a truncate-up).
-            if (offset % block_size) != 0 || (length % block_size) != 0 {
+            if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
                 return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                     EINVAL_ERRNO,
                 )));
@@ -34425,7 +34430,7 @@ impl OpenFs {
         }
 
         let sectorsize = u64::from(alloc.sectorsize);
-        if (offset % sectorsize) != 0 || (length % sectorsize) != 0 {
+        if !offset.is_multiple_of(sectorsize) || !length.is_multiple_of(sectorsize) {
             if collapse_range || insert_range {
                 return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                     libc::EINVAL,
@@ -40131,7 +40136,6 @@ impl FrankenFsEngine {
 }
 
 #[cfg(test)]
-
 /// bd-73bi2: a commit that did NOT rewrite the free-space tree must clear
 /// the feature bits, not leave whatever the source image already had.
 ///
@@ -40194,7 +40198,6 @@ fn skipped_free_space_tree_rewrite_clears_the_feature_bits_bd_73bi2() {
 // imports (serde_json, tracing_subscriber, sha2). `cargo test` still passed,
 // which is why it survived: only a plain `cargo build` can see it.
 #[cfg(test)]
-
 /// bd-btrfs-ro-readdir: the unvalidated serve matches on INODE only, and the
 /// validated one still does not.
 ///
@@ -40341,7 +40344,7 @@ mod tests {
         assert_eq!(btrfs_header_generation(&zeroed), Some(0));
 
         // One byte short of containing the field.
-        assert_eq!(btrfs_header_generation(&vec![0u8; 0x57]), None);
+        assert_eq!(btrfs_header_generation(&[0u8; 0x57]), None);
         assert_eq!(btrfs_header_generation(&[]), None);
     }
 
@@ -59748,7 +59751,7 @@ mod tests {
     fn bd_5vis3_median(mut values: Vec<f64>) -> f64 {
         values.sort_by(f64::total_cmp);
         let midpoint = values.len() / 2;
-        if values.len() % 2 == 0 {
+        if values.len().is_multiple_of(2) {
             values[midpoint - 1].midpoint(values[midpoint])
         } else {
             values[midpoint]
