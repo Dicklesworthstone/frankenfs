@@ -2,6 +2,8 @@
 
 All notable changes to FrankenFS are documented in this file, organized by capability area rather than chronological diff order. Development has been continuous since inception; **`v0.2.0` (2026-07-11) is the project's first tagged release**, cut to mark the completion of the solo performance-optimization campaign. Commit links point to the canonical GitHub repository.
 
+Scope window: project inception on 2026-02-09 through HEAD on 2026-08-19.
+
 > **Repository:** <https://github.com/Dicklesworthstone/frankenfs>
 > **Period covered:** 2026-02-09 through 2026-08-19 (`main` HEAD [`f84e12d70`](https://github.com/Dicklesworthstone/frankenfs/commit/f84e12d702d36eae8adf8bd266f3b7f84b272003))
 > **Total commits:** 3,448 (through the 2026-05-18 capability cutoff; the `v0.2.0` performance campaign covers 2026-05-18 → 2026-07-11; **1,634 further commits** sit on `main` after `v0.2.0` and are summarized under [Unreleased](#unreleased--post-v020-2026-07-11--2026-08-19))
@@ -37,6 +39,23 @@ All notable changes to FrankenFS are documented in this file, organized by capab
 ## [Unreleased] — post-`v0.2.0` (2026-07-11 → 2026-08-19)
 
 1,634 commits on [`main`](https://github.com/Dicklesworthstone/frankenfs/compare/v0.2.0...main) after the first tagged release. No new tag or GitHub Release exists in this window. The work is a measured vs-kernel campaign on mounted ext4/btrfs, a harness-honesty campaign that made those ratios admissible, and a btrfs tree-log interop slice the kernel can actually replay. Rejected levers stay in the negative-evidence ledger; several titled FUSE short-circuits were answered as near-nulls and left default-OFF.
+
+### Delivered capability
+
+- Honest vs-kernel mounted ratios with A/A nulls and provenance, not survivorship-filtered headlines.
+- Opt-in FUSE-over-io_uring plus a real `getattr_batch`.
+- Kernel-shaped btrfs tree-log emit/replay.
+- Non-locked planning docs relocated under `docs/planning/` (test-pinned specs stay at root).
+
+### Closed workstreams
+
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankenfs/blob/main/.beads/issues.jsonl).
+
+### Representative commits
+
+- [`e04111e1c`](https://github.com/Dicklesworthstone/frankenfs/commit/e04111e1c) — first defensible vs-kernel mounted ratio.
+- [`1ceca99e7`](https://github.com/Dicklesworthstone/frankenfs/commit/1ceca99e7) — kernel two-block tree-log shape and replay.
+- [`f84e12d70`](https://github.com/Dicklesworthstone/frankenfs/commit/f84e12d702d36eae8adf8bd266f3b7f84b272003) — janitor relocate of non-locked planning docs.
 
 ### Mounted vs-kernel honesty (late July 2026)
 
