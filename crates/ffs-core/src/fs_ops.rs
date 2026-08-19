@@ -287,6 +287,17 @@ impl FsOps for OpenFs {
     /// every entry's attributes to the wrong name — silent and severe — so the
     /// permutation is inverted explicitly rather than by re-sorting the results.
     ///
+    /// ONE ENTRY PER PAGE IS EXEMPT, and the claim is stated exactly rather than
+    /// approximately. The sort key is the PRESENTED inode, while the descent uses
+    /// the canonical one. Both canonicalisers are the identity except for the VFS
+    /// root alias — `btrfs_canonical_inode` maps `1` to the subvolume's
+    /// `subvol_root_dirid`, `ext4_canonical_inode` maps `1` to `2` — so presented
+    /// order IS canonical order for every entry except `.`, which sorts as 1 and
+    /// resolves elsewhere. That costs at most one extra descent per page and
+    /// cannot affect correctness, since visit order only influences locality.
+    /// Canonicalising inside the sort key would add a fallible call per entry to
+    /// save that one descent, which is the wrong trade.
+    ///
     /// Independent of `FFS_FUSE_READDIRPLUS_INODE_ORDER`, which sorts at the FUSE
     /// layer and is opt-in: this makes the locality available to every batch
     /// caller. Sorting an already-sorted slice is near-free, so the two compose
