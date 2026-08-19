@@ -940,6 +940,13 @@ fn btrfs_tree_log_replay_follows_a_log_root_tree_bd_jhuob() {
     )];
 
     // The log ROOT TREE: one ROOT_ITEM for the fs tree, pointing at its log.
+    //
+    // ⚠️ THE KEY IS (TREE_LOG_OBJECTID, ROOT_ITEM, subvolume) — the subvolume is
+    // the OFFSET. This fixture used to key it by the subvolume, matching what our
+    // writer emitted and what our reader looked for, so this test passed against a
+    // shape the kernel skips over: it mounts, logs "start tree-log replay", reports
+    // no error, and the fsynced file is not there (bd-jhuob). Writer and reader
+    // agreeing with each other proves nothing about the format.
     let mut log_root = vec![0_u8; BTRFS_TEST_NODESIZE as usize];
     write_btrfs_header(&mut log_root, log_root_logical, 1, 0, 5, 77);
     let root_item = tree_log_root_item(log_tree_logical, 0, 78);
@@ -948,9 +955,9 @@ fn btrfs_tree_log_replay_follows_a_log_root_tree_bd_jhuob() {
     write_btrfs_leaf_item(
         &mut log_root,
         0,
-        BTRFS_FS_TREE_OBJECTID,
+        BTRFS_TREE_LOG_OBJECTID,
         ROOT_ITEM_TYPE,
-        0,
+        BTRFS_FS_TREE_OBJECTID,
         root_item_off,
         root_item_len,
     );

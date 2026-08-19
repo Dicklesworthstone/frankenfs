@@ -30,10 +30,11 @@ const BTRFS_STRIPE_SIZE: usize = 32;
 /// Smallest encoded sys-chunk entry: one key, one chunk header, one stripe.
 const BTRFS_SYS_CHUNK_MIN_ENTRY_SIZE: usize =
     BTRFS_DISK_KEY_SIZE + BTRFS_CHUNK_FIXED_SIZE + BTRFS_STRIPE_SIZE;
-/// Objectid for chunk tree items stored in sys_chunk_array.
-/// Objectid every CHUNK_ITEM is keyed under, and the `chunk_objectid` every
-/// DEV_EXTENT points back at. Public because chunk ALLOCATION lives a crate up
-/// (bd-a136s) and must key its new items identically to the ones parsed here.
+/// Objectid every CHUNK_ITEM is keyed under.
+///
+/// Also the `chunk_objectid` every DEV_EXTENT points back at. Public because
+/// chunk ALLOCATION lives a crate up (bd-a136s) and must key its new items
+/// identically to the ones parsed here.
 pub const BTRFS_FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 /// Item type for chunk tree entries in sys_chunk_array.
 const BTRFS_CHUNK_ITEM_KEY: u8 = 228;
@@ -2799,7 +2800,7 @@ mod tests {
         // that array before any tree is available — a bad key here is an
         // unmountable filesystem, not a failed lookup. The item form carries no
         // key, so it must still succeed for the same entry.
-        let mut wrong_key = good.clone();
+        let mut wrong_key = good;
         wrong_key.key.item_type = BTRFS_CHUNK_ITEM_KEY.wrapping_add(1);
         assert!(wrong_key.to_bytes().is_err(), "a non-CHUNK_ITEM key must be refused");
         wrong_key
@@ -3330,6 +3331,11 @@ mod tests {
     /// reads, on a filesystem that was fine a moment earlier.
     #[test]
     fn to_bytes_refuses_an_oversized_sys_chunk_array_bd_q4qr8() {
+        // Checked at COMPILE time: 22 whole entries really do overflow the 2048-byte
+        // array. It is a fact about two literals, so it belongs here and not in a
+        // runtime assert.
+        const _: () = assert!(22 * 97 > 2048, "22 entries really do overflow");
+
         let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
             .expect("sb parse");
 
@@ -3356,7 +3362,6 @@ mod tests {
         // how this is actually reached — is refused for the same reason rather
         // than being cut back to 21.
         sb.sys_chunk_array = vec![0_u8; 22 * 97];
-        assert!(22 * 97 > 2048, "22 entries really do overflow");
         assert!(sb.to_bytes().is_err());
     }
 

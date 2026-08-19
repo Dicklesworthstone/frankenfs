@@ -5,6 +5,7 @@ use ffs_btrfs::{
     BTRFS_CHUNK_TREE_OBJECTID, BTRFS_DEV_TREE_OBJECTID, BTRFS_FILE_EXTENT_REG,
     BTRFS_FS_TREE_OBJECTID, BTRFS_FT_REG_FILE, BTRFS_ITEM_CHUNK, BTRFS_ITEM_DEV_ITEM,
     BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_SEND_STREAM_MAGIC,
+    BTRFS_TREE_LOG_OBJECTID,
     BtrfsDeviceSet, SendAttr, SendCommand, SendStreamBuilder, build_chmod_command,
     build_chown_command, build_link_command, build_mkdir_command, build_mkfifo_command,
     build_mkfile_command, build_mknod_command, build_mksock_command, build_removexattr_command,
