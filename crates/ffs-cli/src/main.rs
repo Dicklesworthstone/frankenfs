@@ -1219,12 +1219,30 @@ enum Command {
         /// Mount a specific btrfs snapshot by name.
         #[arg(long)]
         snapshot: Option<String>,
-        /// Use ephemeral (tree-log only) commit strategy for btrfs.
+        /// Use the tree-log commit strategy for btrfs fsync (UNVERIFIED).
         ///
-        /// By default, btrfs RW is durable: full transaction commit on fsync/unmount
-        /// via btrfs_full_transaction_commit(). This flag switches to tree-log only
-        /// commits for faster fsync at the cost of durability - changes may be lost
-        /// if the process crashes before unmount completes the final commit.
+        /// By default every fsync does a FULL TRANSACTION COMMIT
+        /// (btrfs_full_transaction_commit). Counted against the incumbent on a
+        /// 4 KiB overwrite: 25 blocks per client fsync to kernel btrfs's 18, and
+        /// all six residual tree nodes are consequences of committing the whole
+        /// transaction. Kernel btrfs writes a tree log instead and replays it after
+        /// a crash. This flag selects that path.
+        ///
+        /// ⚠️ NOT "faster fsync at the cost of durability", which is what this said
+        /// before and is the wrong shape. A tree log is crash-RECOVERABLE by
+        /// design: the log records the fsync, and mount replays it. Describing it
+        /// as a write-back cache invites both mistakes at once — avoiding it for a
+        /// risk it does not have, or trusting it because the only stated risk seems
+        /// acceptable.
+        ///
+        /// ⚠️ THE REAL REASON IT IS OPT-IN: none of this path has been verified.
+        /// Four correctness defects were fixed in source and never run (a missing
+        /// barrier before publishing log_root; a stale log replayed over newer
+        /// items after a full commit; only the last fsync'd inode being logged; and
+        /// leaked log blocks). The on-disk format was changed to the kernel's
+        /// log-root-tree shape, also unrun — so whether a KERNEL can replay a log
+        /// this build leaves behind after a crash is an open question, and that is
+        /// exactly the situation the flag exists for. See bd-jhuob.
         #[arg(long = "btrfs-rw-ephemeral-ok")]
         btrfs_rw_ephemeral_ok: bool,
         /// Verify btrfs data checksums on every read.
