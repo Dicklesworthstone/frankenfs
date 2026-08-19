@@ -11309,3 +11309,35 @@ regardless, because a full commit clears the log before anyone else sees it. The
 NOT commit: write via the ephemeral path, `kill -9` the daemon so `log_root` survives on disk, then
 ask the KERNEL to mount. That distinction is why this is recorded separately rather than folded
 into the existing acceptance.
+
+## bd-a136s — ACCEPTANCE GATE PASSES: chunk growth now produces an image the KERNEL mounts
+
+**Run 2026-08-18, thinkstation1, kernel 6.17.0-41-generic.** ELF sha256
+`6a9576fdb184c30dc33c3f774d06c5082f0d1255658bb672dbd101bd49bdcb94`. loadavg 15.91/17.14/18.97,
+CPU 4293.9 MHz. Pass/fail capability test, so load does not bear on the result.
+
+Same workload as the failing run: 256 MB btrfs image copied fresh, `FFS_BTRFS_GROW_CHUNKS=1`,
+40,000 creates, one 4 KiB write+fsync, unmount.
+
+    step                                   previous run              this run
+    growth fired                           yes, 2 metadata chunks    yes, 3 plans
+    SYSTEM chunk grown for the chunk tree   n/a (path did not exist)  yes
+    btrfs check                            ERROR: cannot open        no error found
+    kernel mount + readback                not attempted             OK, 40002 entries, data correct
+
+The previous run died with `No mapping for 60375040` / `ERROR: cannot read chunk root`, because
+the chunk tree was serialized out of a METADATA block group and the kernel bootstraps its chunk
+map from the `sys_chunk_array` alone. Everything that fixed it was written during the disk
+throttle without a compiler: `alloc_system_for_tree`, SYSTEM-chunk growth, and the
+`sys_chunk_array` extension at the superblock stamping. All three fired in this run and the
+result is an image `btrfs check` calls clean and the kernel reads back byte-correct.
+
+**WHAT THIS DOES AND DOES NOT ESTABLISH.** It establishes that chunk allocation works end to end
+and interoperates: we grow a filesystem and the incumbent still accepts it. It does NOT establish
+the ENOSPC relief the bead was filed for — on this fixture the growth-OFF arm did not fail, so
+there is no "would have failed, now succeeds" pair. Constructing that needs a filesystem whose
+metadata group genuinely exhausts, which bd-42gtq's block reuse made harder by cutting per-fsync
+metadata to the COW spine. The capability is proven; the motivating failure is not reproduced.
+
+**The flag stays default-off** until that pair exists and the growth path has run on more than one
+fixture. One passing gate is the end of "unverified", not the end of "unproven".
