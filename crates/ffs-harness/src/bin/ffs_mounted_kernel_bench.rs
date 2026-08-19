@@ -4848,6 +4848,23 @@ struct ExternalLoadWitness {
     peak_mean_iowait: f64,
     /// Largest ON-placement mean iowait fraction — our own arms blocked on I/O.
     peak_placement_mean_iowait: f64,
+    /// Lowest clock seen on ANY placement CPU during the timed region, MHz.
+    ///
+    /// `cpu_mhz_observed` samples once before the run and once after. Those two
+    /// endpoints cannot answer the question the btrfs row actually turns on:
+    /// whether an arm's core sat at the 1429 MHz floor WHILE it was being
+    /// measured. A core that parks between the two snapshots is invisible to
+    /// both. This is the floor actually observed across the measured region.
+    ///
+    /// `None` until the first clock sample, so a run whose sampler never fired
+    /// reports absence rather than a fabricated 0.0.
+    min_placement_mhz: Option<f64>,
+    /// Highest clock seen on any placement CPU during the timed region, MHz.
+    /// With the floor above this gives the DURING-run spread, which is the figure
+    /// `cpu_mhz_observed.placement.spread` approximates from one instant.
+    max_placement_mhz: Option<f64>,
+    /// Clock samples taken. Zero means the two endpoint figures are all there is.
+    clock_samples: usize,
 }
 
 impl ExternalLoadWitness {
@@ -4913,6 +4930,43 @@ impl ExternalLoadWitness {
             if mean > self.peak_placement_mean_iowait {
                 self.peak_placement_mean_iowait = mean;
             }
+        }
+    }
+
+    /// Record the clocks of the CPUs our own arms occupy.
+    ///
+    /// Separate from `observe` on purpose: folding it in would mean touching
+    /// eight test call sites for a field none of them exercise, and the two are
+    /// genuinely independent readings that happen to share a sampler.
+    ///
+    /// Evidence, not a gate — nothing here refuses a run. A threshold would need
+    /// its own calibration window, and the campaign has none for clock.
+    fn observe_clock(&mut self, mhz: &BTreeMap<usize, f64>, placement: &BTreeSet<usize>) {
+        let mut saw = false;
+        for (_, clock) in mhz.iter().filter(|(cpu, _)| placement.contains(*cpu)) {
+            saw = true;
+            self.min_placement_mhz = Some(match self.min_placement_mhz {
+                Some(current) if current <= *clock => current,
+                _ => *clock,
+            });
+            self.max_placement_mhz = Some(match self.max_placement_mhz {
+                Some(current) if current >= *clock => current,
+                _ => *clock,
+            });
+        }
+        if saw {
+            self.clock_samples += 1;
+        }
+    }
+
+    /// During-run clock spread on the arms' own cores, `max / min`.
+    ///
+    /// `None` when no clock sample landed, or when the floor is zero — a divide
+    /// this must not perform silently.
+    fn placement_mhz_spread(&self) -> Option<f64> {
+        match (self.min_placement_mhz, self.max_placement_mhz) {
+            (Some(min), Some(max)) if min > 0.0 => Some(max / min),
+            _ => None,
         }
     }
 
@@ -8135,8 +8189,10 @@ fn run() -> Result<Option<PathBuf>> {
                 // Errors here must never fail a run: this is evidence, not a gate
                 // input, until the verdict below reads it.
                 if let Ok((busy, iowait)) = sample_cpu_load() {
+                    let clocks = cpu_mhz();
                     if let Ok(mut w) = witness.lock() {
                         w.observe(&busy, &iowait, &placement_cpus, MAX_EXTERNAL_BUSY_CPUS);
+                        w.observe_clock(&clocks, &placement_cpus);
                     }
                 }
             }
@@ -8298,6 +8354,17 @@ fn run() -> Result<Option<PathBuf>> {
             // storm. Evidence, not a gate input.
             "peak_off_placement_mean_iowait": external_load.peak_mean_iowait,
             "peak_placement_mean_iowait": external_load.peak_placement_mean_iowait,
+            // The arms' own clocks sampled ACROSS the timed region, beside the
+            // two endpoint figures in `cpu_mhz_observed`. A core that parks
+            // between those two snapshots is invisible to both, and "did the FUSE
+            // arm run at the 1429 MHz floor while being measured" is the open
+            // question on the worst row in the bank. Evidence, not a gate.
+            "placement_mhz_during_run": json!({
+                "min": external_load.min_placement_mhz,
+                "max": external_load.max_placement_mhz,
+                "spread": external_load.placement_mhz_spread(),
+                "samples": external_load.clock_samples,
+            }),
             "busy_cpu_fraction_limit": EXTERNAL_BUSY_CPU_FRACTION,
             "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
             "max_contended_fraction_limit": MAX_CONTENDED_SAMPLE_FRACTION,
