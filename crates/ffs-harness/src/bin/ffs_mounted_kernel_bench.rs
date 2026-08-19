@@ -3083,6 +3083,29 @@ fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsM
             runtime_knobs
         }
     };
+    // bd-t0xoq's capability short-circuit is a SECOND, independent switch: the
+    // suppression above tells the kernel to stop probing, while this answers the
+    // probes that still arrive without reading the inode. It carries its own
+    // prefix precisely because two lines under one prefix cannot be
+    // disambiguated -- reporting both through `mount_candidate_xattr,` is what
+    // made every mounted run die on "was reported more than once" before it
+    // measured anything.
+    //
+    // Folded into `runtime_knobs` for the same reason the xattr line is: that
+    // string is what `candidate_knob_divergence` compares, and a bd-t0xoq A/B
+    // that left it out would resolve identical knob lines and fail closed as
+    // "the override never reached a knob this ELF reads".
+    //
+    // Absent is tolerated rather than fatal: an ELF built before bd-t0xoq has no
+    // such line, and that is a fact about the binary, not a broken log.
+    let runtime_knobs = match optional_prefixed_line(
+        &content,
+        "mount_candidate_shortcircuit,",
+        "FUSE mount capability short-circuit",
+    )? {
+        Some(shortcircuit) => format!("{runtime_knobs},{shortcircuit}"),
+        None => runtime_knobs,
+    };
     Ok(FfsMountSelfReport {
         identity: FfsBinaryIdentity {
             binary_sha256,
