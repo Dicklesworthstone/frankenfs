@@ -1033,7 +1033,25 @@ struct MountInfo {
 #[derive(Clone, Copy, Debug, Default)]
 struct CpuTicks {
     total: u64,
+    /// Idle ticks INCLUDING iowait — `/proc/stat` fields 4 and 5 summed, exactly
+    /// as this has always been computed.
+    ///
+    /// Deliberately left alone. Every busy fraction this harness has ever
+    /// produced, and the `EXTERNAL_BUSY_CPU_FRACTION` threshold calibrated
+    /// against two real windows, are defined in terms of this sum. Narrowing it
+    /// to true idle would silently re-scale `peak_off_placement_mean_busy` and
+    /// move a refusal threshold under banked rows, which is the bd-6kpp4 failure
+    /// mode: a default changed underneath a scorecard. `iowait` below is
+    /// therefore ADDITIVE evidence, not a redefinition.
     idle: u64,
+    /// iowait ticks alone (`/proc/stat` field 5).
+    ///
+    /// Split out because a host can be pinned at 50%+ iowait while every CPU
+    /// reports as idle above, so neither the busy fractions nor the load guard
+    /// can see an I/O storm. That is not hypothetical here: parallel filesystem
+    /// image builds are the routine way this box goes to ~53% iowait, and image
+    /// builds are exactly what a filesystem comparator's fixtures need.
+    iowait: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -4666,31 +4684,61 @@ fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>> {
         ensure!(ticks.len() >= 5, "cpu{cpu} /proc/stat row is too short");
         let total = ticks.iter().copied().sum();
         let idle = ticks[3].saturating_add(ticks[4]);
-        cpus.insert(cpu, CpuTicks { total, idle });
+        // Field 5. The `ticks.len() >= 5` check above already guarantees it.
+        let iowait = ticks[4];
+        cpus.insert(
+            cpu,
+            CpuTicks {
+                total,
+                idle,
+                iowait,
+            },
+        );
     }
     ensure!(!cpus.is_empty(), "no per-CPU rows in /proc/stat");
     Ok(cpus)
 }
 
-fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>> {
+/// One sample of per-CPU busy AND iowait fractions over `CPU_SAMPLE_INTERVAL`.
+///
+/// Both come from the same tick pair, so they describe the same window and can
+/// be compared without assuming the two sleeps saw the same host.
+///
+/// The busy half is arithmetically identical to what `sample_cpu_busy` returned
+/// before iowait was recorded: `idle` still means idle+iowait, so a CPU blocked
+/// on I/O still counts as NOT busy. That is a real limitation and it is left in
+/// place rather than quietly fixed — see `CpuTicks::idle`. The iowait map is how
+/// a reader now detects the case the busy map cannot express.
+fn sample_cpu_load() -> Result<(BTreeMap<usize, f64>, BTreeMap<usize, f64>)> {
     let before = read_cpu_ticks()?;
     thread::sleep(CPU_SAMPLE_INTERVAL);
     let after = read_cpu_ticks()?;
     let mut busy = BTreeMap::new();
+    let mut iowait = BTreeMap::new();
     for (cpu, start) in before {
         let end = after
             .get(&cpu)
             .ok_or_else(|| anyhow!("cpu{cpu} disappeared during load sample"))?;
         let total = end.total.saturating_sub(start.total);
         let idle = end.idle.saturating_sub(start.idle);
-        let fraction = if total == 0 {
-            1.0
+        let waited = end.iowait.saturating_sub(start.iowait);
+        let (busy_fraction, iowait_fraction) = if total == 0 {
+            (1.0, 0.0)
         } else {
-            total.saturating_sub(idle) as f64 / total as f64
+            (
+                total.saturating_sub(idle) as f64 / total as f64,
+                waited as f64 / total as f64,
+            )
         };
-        busy.insert(cpu, fraction);
+        busy.insert(cpu, busy_fraction);
+        iowait.insert(cpu, iowait_fraction);
     }
-    Ok(busy)
+    Ok((busy, iowait))
+}
+
+/// Busy fractions only, for the callers that gate on them.
+fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>> {
+    Ok(sample_cpu_load()?.0)
 }
 
 /// A CPU outside the placement set counts as carrying EXTERNAL load above this
@@ -4782,10 +4830,34 @@ struct ExternalLoadWitness {
     /// distinguished from "the run was quiet apart from ourselves" after the fact.
     /// Gating on it would be a new refusal criterion smuggled in as a diagnostic.
     peak_placement_mean_busy: f64,
+    /// Largest off-placement mean IOWAIT fraction seen in any single sample.
+    ///
+    /// The busy fields above cannot see an I/O storm at all, because iowait
+    /// counts as idle in `CpuTicks`. A host at 53% iowait and 5% CPU therefore
+    /// passes the external-load gate cleanly while every arm on it contends for
+    /// the same disk queue.
+    ///
+    /// Recorded and deliberately NOT fed to the verdict, on the same reasoning
+    /// as `peak_placement_mean_busy`: gating on it would smuggle a new refusal
+    /// criterion in as a diagnostic, and would retroactively split banked rows
+    /// into admitted and refused without re-running any of them. Whether it
+    /// SHOULD gate is bd-xhl2g, which needs a calibration window of the kind
+    /// `EXTERNAL_BUSY_CPU_FRACTION` got before a threshold means anything — and
+    /// must also settle whether an iowait storm on a DIFFERENT device can hurt us
+    /// at all, since a CPU in iowait is idle rather than stealing our cycles.
+    peak_mean_iowait: f64,
+    /// Largest ON-placement mean iowait fraction — our own arms blocked on I/O.
+    peak_placement_mean_iowait: f64,
 }
 
 impl ExternalLoadWitness {
-    fn observe(&mut self, busy: &BTreeMap<usize, f64>, placement: &BTreeSet<usize>, limit: usize) {
+    fn observe(
+        &mut self,
+        busy: &BTreeMap<usize, f64>,
+        iowait: &BTreeMap<usize, f64>,
+        placement: &BTreeSet<usize>,
+        limit: usize,
+    ) {
         self.samples += 1;
         let count = external_busy_cpu_count(busy, placement, EXTERNAL_BUSY_CPU_FRACTION);
         self.max_busy_cpus = self.max_busy_cpus.max(count);
@@ -4818,6 +4890,28 @@ impl ExternalLoadWitness {
             let mean = off.iter().sum::<f64>() / off.len() as f64;
             if mean > self.peak_mean_busy {
                 self.peak_mean_busy = mean;
+            }
+        }
+        let off_iowait: Vec<f64> = iowait
+            .iter()
+            .filter(|(cpu, _)| !placement.contains(*cpu))
+            .map(|(_, waited)| *waited)
+            .collect();
+        let on_iowait: Vec<f64> = iowait
+            .iter()
+            .filter(|(cpu, _)| placement.contains(*cpu))
+            .map(|(_, waited)| *waited)
+            .collect();
+        if !off_iowait.is_empty() {
+            let mean = off_iowait.iter().sum::<f64>() / off_iowait.len() as f64;
+            if mean > self.peak_mean_iowait {
+                self.peak_mean_iowait = mean;
+            }
+        }
+        if !on_iowait.is_empty() {
+            let mean = on_iowait.iter().sum::<f64>() / on_iowait.len() as f64;
+            if mean > self.peak_placement_mean_iowait {
+                self.peak_placement_mean_iowait = mean;
             }
         }
     }
@@ -8005,9 +8099,9 @@ fn run() -> Result<Option<PathBuf>> {
             while !stop.load(Ordering::Relaxed) {
                 // Errors here must never fail a run: this is evidence, not a gate
                 // input, until the verdict below reads it.
-                if let Ok(busy) = sample_cpu_busy() {
-                    if let Some(mut w) = witness.lock().ok() {
-                        w.observe(&busy, &placement_cpus, MAX_EXTERNAL_BUSY_CPUS);
+                if let Ok((busy, iowait)) = sample_cpu_load() {
+                    if let Ok(mut w) = witness.lock() {
+                        w.observe(&busy, &iowait, &placement_cpus, MAX_EXTERNAL_BUSY_CPUS);
                     }
                 }
             }
@@ -8046,7 +8140,9 @@ fn run() -> Result<Option<PathBuf>> {
     println!(
         "external_load_during_run,samples={},max_external_busy_cpus={},over_limit_samples={},\
          contended_fraction={:.4},max_consecutive_over_limit={},\
-         peak_off_placement_mean_busy={:.6},peak_placement_mean_busy={:.6},busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
+         peak_off_placement_mean_busy={:.6},peak_placement_mean_busy={:.6},\
+         peak_off_placement_mean_iowait={:.6},peak_placement_mean_iowait={:.6},\
+         busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
          max_contended_fraction_limit={:.2},max_consecutive_limit={},\
          placement_cpus_excluded={},verdict={}",
         external_load.samples,
@@ -8056,6 +8152,8 @@ fn run() -> Result<Option<PathBuf>> {
         external_load.max_consecutive_over_limit,
         external_load.peak_mean_busy,
         external_load.peak_placement_mean_busy,
+        external_load.peak_mean_iowait,
+        external_load.peak_placement_mean_iowait,
         EXTERNAL_BUSY_CPU_FRACTION,
         MAX_EXTERNAL_BUSY_CPUS,
         MAX_CONTENDED_SAMPLE_FRACTION,
@@ -8159,6 +8257,11 @@ fn run() -> Result<Option<PathBuf>> {
             "peak_off_placement_mean_busy": external_load.peak_mean_busy,
             // bd-arm-contention: OUR OWN arms. Evidence, not a gate input.
             "peak_placement_mean_busy": external_load.peak_placement_mean_busy,
+            // iowait is invisible to every busy figure above (it counts as idle),
+            // so these are the only fields in the report that can show an I/O
+            // storm. Evidence, not a gate input.
+            "peak_off_placement_mean_iowait": external_load.peak_mean_iowait,
+            "peak_placement_mean_iowait": external_load.peak_placement_mean_iowait,
             "busy_cpu_fraction_limit": EXTERNAL_BUSY_CPU_FRACTION,
             "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
             "max_contended_fraction_limit": MAX_CONTENDED_SAMPLE_FRACTION,
@@ -11076,6 +11179,82 @@ mod tests {
         );
     }
 
+    /// Iowait is not what the busy-gate cases exercise. An empty map leaves both
+    /// iowait peaks at zero and every busy-derived assertion unchanged, which is
+    /// what makes the call-site update above a no-op for those tests.
+    fn no_iowait() -> BTreeMap<usize, f64> {
+        BTreeMap::new()
+    }
+
+    /// iowait is RECORDED on both sides of the placement split, and does NOT gate.
+    ///
+    /// Both halves matter and the second is the load-bearing one. `CpuTicks::idle`
+    /// counts iowait as idle, so a host pinned on its disk queue produces busy
+    /// fractions near zero and sails through the external-load gate. This test
+    /// pins that as the DELIBERATE current behaviour rather than an oversight: if
+    /// someone later makes iowait gate, `clean()` here flips and they are forced
+    /// to notice they changed admission semantics under every banked row.
+    #[test]
+    fn iowait_is_recorded_on_both_sides_and_does_not_gate() {
+        let placement: BTreeSet<usize> = [0, 1].into_iter().collect();
+
+        // A host doing nothing but waiting on I/O: CPUs are not busy, which is
+        // precisely why the busy map cannot see this.
+        let idle_busy: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+
+        // Our own arms blocked on I/O.
+        let mut on_placement_io: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.0)).collect();
+        on_placement_io.insert(0, 0.90);
+        on_placement_io.insert(1, 0.80);
+
+        let mut ours = ExternalLoadWitness::default();
+        ours.observe(
+            &idle_busy,
+            &on_placement_io,
+            &placement,
+            MAX_EXTERNAL_BUSY_CPUS,
+        );
+        assert!(
+            (ours.peak_placement_mean_iowait - 0.85).abs() < 1e-9,
+            "our arms' iowait must be recorded; got {}",
+            ours.peak_placement_mean_iowait
+        );
+        assert!(
+            ours.peak_mean_iowait < 1e-9,
+            "off-placement CPUs were not waiting; got {}",
+            ours.peak_mean_iowait
+        );
+
+        // An off-placement I/O storm — four CPUs deep in iowait, none of them busy.
+        let mut off_placement_io: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.0)).collect();
+        for cpu in [20, 21, 22, 23] {
+            off_placement_io.insert(cpu, 0.90);
+        }
+        let mut storm = ExternalLoadWitness::default();
+        for _ in 0..10 {
+            storm.observe(
+                &idle_busy,
+                &off_placement_io,
+                &placement,
+                MAX_EXTERNAL_BUSY_CPUS,
+            );
+        }
+        assert!(
+            storm.peak_mean_iowait > 0.0,
+            "an off-placement I/O storm must be recorded"
+        );
+        assert_eq!(
+            storm.max_busy_cpus, 0,
+            "the storm is invisible to the BUSY fractions — that is the gap these \
+             fields exist to close"
+        );
+        assert!(
+            storm.clean(),
+            "iowait must NOT gate: this run is refused only if someone changed \
+             admission semantics, which is exactly what this assertion is here to catch"
+        );
+    }
+
     #[test]
     fn placement_busy_is_recorded_separately_and_does_not_gate_bd_arm_contention() {
         let placement: BTreeSet<usize> = [0, 1].into_iter().collect();
@@ -11085,7 +11264,7 @@ mod tests {
         let busy: BTreeMap<usize, f64> = [(0, 0.99), (1, 0.97), (2, 0.01), (3, 0.00)]
             .into_iter()
             .collect();
-        witness.observe(&busy, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        witness.observe(&busy, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);
 
         assert!(
             witness.peak_placement_mean_busy > 0.9,
@@ -11170,7 +11349,12 @@ mod tests {
 
         let mut clean = ExternalLoadWitness::default();
         for _ in 0..10 {
-            clean.observe(&busy_quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+            clean.observe(
+                &busy_quiet,
+                &no_iowait(),
+                &placement,
+                MAX_EXTERNAL_BUSY_CPUS,
+            );
         }
         assert!(clean.clean());
         assert_eq!(clean.samples, 10);
@@ -11179,7 +11363,12 @@ mod tests {
         // Sustained contention refuses: the synthetic negative test's shape.
         let mut sustained = ExternalLoadWitness::default();
         for _ in 0..23 {
-            sustained.observe(&busy_loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
+            sustained.observe(
+                &busy_loaded,
+                &no_iowait(),
+                &placement,
+                MAX_EXTERNAL_BUSY_CPUS,
+            );
         }
         assert!(
             !sustained.clean(),
@@ -11196,7 +11385,7 @@ mod tests {
         at_limit.insert(30, 0.9);
         at_limit.insert(31, 0.9);
         let mut edge = ExternalLoadWitness::default();
-        edge.observe(&at_limit, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        edge.observe(&at_limit, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);
         assert!(edge.clean(), "2 busy CPUs is at the limit, not over it");
     }
 
@@ -11226,9 +11415,9 @@ mod tests {
             let stride = if over == 0 { total + 1 } else { total / over };
             for i in 0..total {
                 if over > 0 && i % stride == 0 && w.over_limit_samples < over {
-                    w.observe(&loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
+                    w.observe(&loaded, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);
                 } else {
-                    w.observe(&quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+                    w.observe(&quiet, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);
                 }
             }
             w
@@ -11262,9 +11451,9 @@ mod tests {
         let mut burst = ExternalLoadWitness::default();
         for i in 0..100 {
             if (40..43).contains(&i) {
-                burst.observe(&loaded, &placement, MAX_EXTERNAL_BUSY_CPUS);
+                burst.observe(&loaded, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);
             } else {
-                burst.observe(&quiet, &placement, MAX_EXTERNAL_BUSY_CPUS);
+                burst.observe(&quiet, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);
             }
         }
         assert_eq!(burst.max_consecutive_over_limit, 3);
