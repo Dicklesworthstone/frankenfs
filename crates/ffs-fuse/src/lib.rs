@@ -45,7 +45,7 @@ use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Whether memo-served requests increment `requests_total` (bd-d9378).
 ///
@@ -4655,7 +4655,30 @@ impl Filesystem for FrankenFuse {
     fn destroy(&mut self) {
         let cx = Self::cx_for_request();
         if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {
-            warn!("flush_on_destroy failed during FUSE destroy: {e}");
+            // ERROR, not WARN, and the only `error!` in this file — deliberately.
+            //
+            // This is the last chance to persist. If it fails, everything the
+            // application was told had succeeded is GONE, and nothing downstream
+            // will say so: FUSE `destroy` returns `()` so the failure cannot be
+            // propagated, `fusermount -u` reports success, and the daemon exits 0.
+            //
+            // Measured 2026-08-20 on a 512 MB image: 20000 creates all returned
+            // success, this call failed with ENOSPC, and the unmounted image was
+            // byte-for-byte identical to the one that was mounted — every create
+            // discarded, with a WARN as the only trace. Root cause is bd-a136s (no
+            // on-demand metadata chunk allocation, so we run out of space where the
+            // kernel would grow the filesystem); this line is not that fix, it is
+            // the part that stops the loss being quiet.
+            //
+            // The fields are the shape the rest of the codebase greps for, so an
+            // operator can find data loss without reading prose.
+            error!(
+                error = %e,
+                error_class = "flush_on_destroy_failed",
+                durability_boundary = "fuse_destroy",
+                consequence = "acknowledged writes not persisted",
+                "FUSE destroy could not flush: acknowledged writes are LOST"
+            );
         }
     }
 
