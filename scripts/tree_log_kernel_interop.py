@@ -31,6 +31,12 @@ perfectly ordinary image, and a naive script reports PASS having tested nothing.
 That is the failure mode this whole bead is about — a check that cannot fail is
 worse than no check, because it reads as evidence.
 
+A FIXTURE NEGATIVE CONTROL RUNS FIRST: `btrfs check --readonly` on the pristine
+image. If the fixture is already damaged (bd-f3fsg) the run is INCONCLUSIVE rather
+than a FINDING — log replay walks refs that an ordinary read-only mount never
+touches, so a pre-existing missing backref surfaces only once our log is present
+and reads exactly like our defect.
+
 EXIT CODES: 0 pass, 1 the kernel refused the image (the finding), 2 the test could
 not be set up (inconclusive, NOT a pass).
 
@@ -67,8 +73,43 @@ def read_log_root(image: Path) -> tuple[int, int]:
     return log_root, sb[LOG_ROOT_LEVEL_OFFSET]
 
 
+# Every wait here is bounded. `btrfs check` on a 20000-file image is the slowest
+# thing this script shells out to and it is still seconds, not minutes; an
+# unbounded wait on a hung losetup/mount would strand the loop device it just
+# claimed. A timeout surfaces as a non-zero verdict, which the callers already
+# treat as "could not establish this", not as a pass.
+DEFAULT_SUBPROCESS_TIMEOUT_S = 600
+
+
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False, **kw)
+    kw.setdefault("timeout", DEFAULT_SUBPROCESS_TIMEOUT_S)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, **kw)
+    except subprocess.TimeoutExpired as expired:
+        return subprocess.CompletedProcess(
+            cmd,
+            returncode=124,
+            stdout=expired.stdout.decode() if isinstance(expired.stdout, bytes) else (expired.stdout or ""),
+            stderr=f"timed out after {kw['timeout']}s: {' '.join(cmd)}",
+        )
+
+
+def fixture_is_sound(image: Path) -> tuple[bool, str]:
+    """Does `btrfs check` accept this image AS STORED? Returns (ok, diagnostic).
+
+    A read-only mount is NOT this question and cannot stand in for it: measured
+    2026-08-20, the kernel mounts `btrfs-acct-2000.img` ro without a murmur while
+    `btrfs check` reports a tree block with no extent-tree backref in it.
+    """
+    checked = run(["sudo", "btrfs", "check", "--readonly", str(image)])
+    if checked.returncode == 0:
+        return True, ""
+    lines = [
+        line
+        for line in (checked.stdout + checked.stderr).splitlines()
+        if "error" in line.lower() or "mismatch" in line.lower() or "backref" in line.lower()
+    ]
+    return False, "\n  ".join(lines[:6]) or f"btrfs check rc={checked.returncode}"
 
 
 def main() -> int:
@@ -120,6 +161,40 @@ def main() -> int:
     print(f"payload    {args.bytes} bytes ({'inline' if args.bytes <= 4096 else 'real extent'})")
     print(f"files      {args.files}")
 
+    # ── 1b. THE FIXTURE NEGATIVE CONTROL (observed 2026-08-20) ──────────────
+    # Step 6 below reads a kernel mount failure as "the kernel refused OUR tree
+    # log". That inference is only valid if the fixture was sound to begin with.
+    #
+    # WHAT WAS MEASURED. Three runs against btrfs-acct-2000.img reported FINDING,
+    # every one of them failing on tree block 32423936 at slot 121 — the same
+    # block whatever we wrote, and the block `btrfs check` already names as having
+    # no extent-tree backref in that fixture AS STORED (bd-f3fsg). The same runs
+    # against a fixture that passes `btrfs check` PASS.
+    #
+    # AND THE CONTROL HAS TO BE THE CHECK, NOT A MOUNT. A plain read-only kernel
+    # mount of that same damaged fixture SUCCEEDS — it never walks the refs. Only
+    # log replay does, and its delayed-ref drop is what hits the missing backref
+    # and takes open_ctree down with -ENOENT. So a mount-based control passes and
+    # tells you nothing; that mistake was made here first and is recorded so it is
+    # not made again.
+    #
+    # A fixture that fails `btrfs check` makes the run INCONCLUSIVE (2), never a
+    # FINDING (1). An instrument that reports somebody else's bug as yours is
+    # worse than no instrument, because a FINDING gets acted on.
+    sound, why = fixture_is_sound(Path(args.image))
+    if not sound:
+        print(
+            "INCONCLUSIVE: `btrfs check` already rejects this fixture BEFORE we "
+            "touch it, so a kernel refusal after our tree log cannot be attributed "
+            "to the log.\n"
+            f"  fixture {args.image}\n  {why}\n"
+            "  Note a read-only kernel mount of such a fixture still succeeds — "
+            "replay is what surfaces the damage. Pick a fixture that passes "
+            "`btrfs check --readonly` as stored (bd-f3fsg)."
+        )
+        return 2
+    print("control    `btrfs check` accepts the pristine fixture (so a later refusal is ours)")
+
     # ── 2. mount read-write, ephemeral (tree-log) fsync strategy ────────────
     daemon = subprocess.Popen(
         [str(cli), "mount", "--rw", "--btrfs-rw-ephemeral-ok", str(image), str(mnt)],
@@ -158,7 +233,7 @@ def main() -> int:
     # ── 4. SIGKILL: no commit may run, so log_root stays on disk ────────────
     daemon.send_signal(signal.SIGKILL)
     daemon.wait(timeout=30)
-    subprocess.run(["fusermount3", "-u", str(mnt)], capture_output=True, check=False)
+    run(["fusermount3", "-u", str(mnt)])
 
     # ── 5. the honesty gate ─────────────────────────────────────────────────
     log_root, log_root_level = read_log_root(image)
