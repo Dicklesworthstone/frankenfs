@@ -152,6 +152,12 @@ def main() -> int:
     image = work / "tree-log-interop.img"
     mnt = work / "tree-log-interop-mnt"
     kmnt = work / "tree-log-interop-kmnt"
+    # A previous run that ended between its SIGKILL and its unmount leaves a
+    # stale FUSE endpoint here, and every path call on it then raises ENOTCONN --
+    # including the mkdir below, which crashes before the run starts. Clearing it
+    # first is cheap and makes back-to-back invocations safe.
+    run(["fusermount3", "-u", str(mnt)])
+    run(["fusermount3", "-u", str(kmnt)])
     shutil.copyfile(args.image, image)
     mnt.mkdir(exist_ok=True)
     kmnt.mkdir(exist_ok=True)
