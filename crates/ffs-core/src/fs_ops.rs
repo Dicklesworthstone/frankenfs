@@ -5,32 +5,31 @@ use super::{
     BTRFS_INO_LOOKUP_USER_NAME_OFFSET, BTRFS_INO_LOOKUP_USER_NAME_SIZE,
     BTRFS_INO_LOOKUP_USER_PATH_OFFSET, BTRFS_INO_LOOKUP_USER_PATH_SIZE,
     BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
-    BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM,
-    BTRFS_MAX_ROOTREF_BUFFER_NUM, BTRFS_ROOTREF_ENTRY_SIZE, BTRFS_ROOT_SUBVOL_RDONLY,
-    BTRFS_SUBVOL_ROOTREF_ARGS_SIZE, BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET,
-    BTRFS_SUPER_INFO_OFFSET, BTRFS_TREE_SEARCH_KEY_SIZE, BTRFS_TREE_SEARCH_V2_HEADER_SIZE,
-    BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS, BtrfsBTree, BtrfsExtentData,
-    BtrfsKey, BtrfsParsedNode, BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey,
-    BlockNumber, ByteOffset, CommitSeq, Cx, DirEntry, DirNameIndex,
-    EXT4_COMPRBLK_FL, EXT4_ENCRYPTION_XATTR_NAME, EXT4_SB_CHECKSUM_OFFSET, Ext4FileType,
-    Ext4Inode, Ext4MoveExtRequest, Ext4Superblock, Ext4Xattr, FSCRYPT_CONTEXT_V1_SIZE,
-    FSCRYPT_CONTEXT_V2_SIZE,
-    FSCRYPT_POLICY_V1_SIZE, FSCRYPT_POLICY_V1_VERSION, FSCRYPT_POLICY_V2_SIZE,
-    FSCRYPT_POLICY_V2_VERSION, FfsError,
+    BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM, BTRFS_MAX_ROOTREF_BUFFER_NUM,
+    BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOTREF_ENTRY_SIZE, BTRFS_SUBVOL_ROOTREF_ARGS_SIZE,
+    BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET, BTRFS_SUPER_INFO_OFFSET, BTRFS_TREE_SEARCH_KEY_SIZE,
+    BTRFS_TREE_SEARCH_V2_HEADER_SIZE, BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS,
+    BlockDevice, BlockNumber, BtrfsBTree, BtrfsExtentData, BtrfsKey, BtrfsParsedNode,
+    BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey, ByteOffset, CommitSeq, Cx,
+    DirEntry, DirNameIndex, EXT4_COMPRBLK_FL, EXT4_ENCRYPTION_XATTR_NAME, EXT4_SB_CHECKSUM_OFFSET,
+    Ext4FileType, Ext4Inode, Ext4MoveExtRequest, Ext4Superblock, Ext4Xattr,
+    FSCRYPT_CONTEXT_V1_SIZE, FSCRYPT_CONTEXT_V2_SIZE, FSCRYPT_POLICY_V1_SIZE,
+    FSCRYPT_POLICY_V1_VERSION, FSCRYPT_POLICY_V2_SIZE, FSCRYPT_POLICY_V2_VERSION, FfsError,
     FiemapExtent, FileType, FsFlavor, FsGeometry, FsOps, FsStat, FsxattrInfo, InodeAttr,
     InodeNumber, LINUX_PATH_MAX, LINUX_SYMLINK_TARGET_MAX, Mutex, OpenFs, OsStr, Path, QuotaInfo,
     ReaddirPage, ReaddirValidation, RequestCommitMode, RequestOp, RequestScope, SeekWhence,
     SetAttrRequest, TransactionBlockAdapter, XattrSetMode, btrfs_inode_flags_to_fsflags,
-    btrfs_mutation_to_ffs, btrfs_ro_readdir_snapshot_enabled, clear_readdir_snapshot,
-    dir_entry_file_type, encode_btrfs_dev_info_args, encode_btrfs_fs_info_args,
-    encode_btrfs_ino_paths_container, encode_btrfs_supported_feature_flags,
-    encode_btrfs_tree_search_results, encode_btrfs_tree_search_results_with_limit,
-    ext4_flags_to_xflags, ext4_present_xattr_value, ext4_read_buffer_len, first_nul,
-    fsflags_to_btrfs_inode_flags, generate_send_stream, info, map_logical_to_physical,
-    parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item, parse_to_ffs_error,
-    read_btrfs_superblock_region, read_ext4_superblock_region, readdir_snapshot_serve,
-    readdir_snapshot_serve_unvalidated, readdir_snapshot_store, slice_readdir_snapshot,
-    systemtime_nanos, trace, warn, xflags_to_btrfs_inode_flags, xflags_to_ext4_flags,
+    btrfs_inode_flags_to_xflags, btrfs_mutation_to_ffs, btrfs_ro_readdir_snapshot_enabled,
+    clear_readdir_snapshot, dir_entry_file_type, encode_btrfs_dev_info_args,
+    encode_btrfs_fs_info_args, encode_btrfs_ino_paths_container,
+    encode_btrfs_supported_feature_flags, encode_btrfs_tree_search_results,
+    encode_btrfs_tree_search_results_with_limit, ext4_flags_to_xflags, ext4_present_xattr_value,
+    ext4_read_buffer_len, first_nul, fsflags_to_btrfs_inode_flags, generate_send_stream, info,
+    map_logical_to_physical, parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item,
+    parse_to_ffs_error, read_btrfs_superblock_region, read_ext4_superblock_region,
+    readdir_snapshot_serve, readdir_snapshot_serve_unvalidated, readdir_snapshot_store,
+    slice_readdir_snapshot, systemtime_nanos, trace, warn, xflags_to_btrfs_inode_flags,
+    xflags_to_ext4_flags,
 };
 use crate::vfs::XattrPresence;
 
@@ -210,7 +209,7 @@ impl OpenFs {
                     // the layer that still has the bytes.
                     BtrfsParsedNode::Internal { .. } => self
                         .btrfs_tree_block_generation(cx, ptr.blockptr)
-                        .map_or(None, |actual| {
+                        .and_then(|actual| {
                             (actual != ptr.generation).then_some((ptr.generation, actual))
                         }),
                 };
@@ -296,7 +295,7 @@ impl OpenFs {
     fn ext4_readdir(
         &self,
         cx: &Cx,
-        scope: &mut RequestScope,
+        scope: &RequestScope,
         ino: InodeNumber,
         offset: u64,
     ) -> ffs_error::Result<ReaddirPage> {
@@ -398,7 +397,7 @@ impl OpenFs {
     fn btrfs_readdir(
         &self,
         cx: &Cx,
-        scope: &mut RequestScope,
+        scope: &RequestScope,
         ino: InodeNumber,
         offset: u64,
     ) -> ffs_error::Result<ReaddirPage> {
@@ -432,11 +431,8 @@ impl OpenFs {
         // branches on, so this cannot diverge from it.
         if btrfs_ro_readdir_snapshot_enabled()
             && self.btrfs_alloc_state.is_none()
-            && let Some(page) = readdir_snapshot_serve_unvalidated(
-                &self.readdir_snapshot,
-                canonical,
-                offset,
-            )
+            && let Some(page) =
+                readdir_snapshot_serve_unvalidated(&self.readdir_snapshot, canonical, offset)
         {
             // bd-btrfs-readdir-stat-8x-8y7vp: warm THIS page, not just
             // the first. A full listing is paginated, and every page
@@ -899,9 +895,8 @@ impl FsOps for OpenFs {
                 // (`parse_xattr_name` errors — e.g. an unhandled prefix, which
                 // the kernel VFS rejects before ext4 anyway) fall back to the
                 // by-name finder so observable behavior is unchanged there.
-                let found = if let Ok((name_index, suffix)) =
-                    ffs_xattr::parse_xattr_name_borrowed(name)
-                {
+                let found =
+                    if let Ok((name_index, suffix)) = ffs_xattr::parse_xattr_name_borrowed(name) {
                         let found =
                             ffs_ondisk::find_ibody_xattr_by_index_name(&inode, name_index, suffix)
                                 .map_err(|e| parse_to_ffs_error(&e))?;
@@ -919,7 +914,7 @@ impl FsOps for OpenFs {
                             }
                             None => None,
                         }
-                } else {
+                    } else {
                         let found = ffs_ondisk::find_ibody_xattr_by_name(&inode, name)
                             .map_err(|e| parse_to_ffs_error(&e))?;
                         match found {
@@ -932,7 +927,7 @@ impl FsOps for OpenFs {
                             }
                             None => None,
                         }
-                };
+                    };
                 let Some((name_index, value, value_inum)) = found else {
                     return Ok(None);
                 };

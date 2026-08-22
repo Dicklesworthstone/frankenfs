@@ -97,6 +97,7 @@ fn collect_readdir_names(fs: &OpenFs, cx: &Cx, dir: InodeNumber) -> Vec<Vec<u8>>
 
 #[test]
 fn htree_leaf_split_inserts_renames_stay_consistent_bd_gauub() {
+    const N: usize = 6000;
     if !has_command("mkfs.ext4") {
         eprintln!("skipping htree_leaf_split gate: mkfs.ext4 unavailable");
         return;
@@ -120,7 +121,6 @@ fn htree_leaf_split_inserts_renames_stay_consistent_bd_gauub() {
     // Insert enough files to force htree conversion AND many single-level leaf
     // splits. At 4 KiB blocks a leaf holds ~120 short names; ~6000 names => ~50
     // leaves, each created by a split off a full leaf after conversion.
-    const N: usize = 6000;
     let mut expected: HashSet<Vec<u8>> = HashSet::new();
     for i in 0..N {
         let name = format!("file_{i:06}");

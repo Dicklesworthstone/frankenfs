@@ -18,7 +18,7 @@ use std::hint::black_box;
 fn recompute_seed() -> u32 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::thread::current().id().hash(&mut hasher);
-    hasher.finish() as u32
+    u32::try_from(hasher.finish() & 0xFFFF_FFFF).expect("masked to 32 bits")
 }
 
 fn cached_seed() -> u32 {
@@ -26,7 +26,7 @@ fn cached_seed() -> u32 {
         static SEED: u32 = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::thread::current().id().hash(&mut hasher);
-            hasher.finish() as u32
+            u32::try_from(hasher.finish() & 0xFFFF_FFFF).expect("masked to 32 bits")
         };
     }
     SEED.with(|seed| *seed)

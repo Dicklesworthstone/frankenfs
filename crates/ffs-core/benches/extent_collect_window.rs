@@ -75,10 +75,10 @@ fn collect_all(index: &[(u32, u32)], dev: &HashMap<u32, Vec<u8>>) -> Vec<u32> {
 fn collect_from(index: &[(u32, u32)], dev: &HashMap<u32, Vec<u8>>, from_block: u32) -> Vec<u32> {
     let mut out = Vec::new();
     for (i, &(_first, leaf)) in index.iter().enumerate() {
-        if let Some(&(next_first, _)) = index.get(i + 1) {
-            if next_first <= from_block {
-                continue;
-            }
+        if let Some(&(next_first, _)) = index.get(i + 1)
+            && next_first <= from_block
+        {
+            continue;
         }
         let (_h, tree) = parse_extent_tree(&dev[&leaf]).unwrap();
         if let ExtentTree::Leaf(exts) = tree {

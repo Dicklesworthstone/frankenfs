@@ -300,8 +300,10 @@ impl PublicationGate {
     }
 
     fn with_completed(completed: usize) -> Self {
-        let mut state = PublicationState::default();
-        state.completed_shadow = completed;
+        let state = PublicationState {
+            completed_shadow: completed,
+            ..PublicationState::default()
+        };
         Self {
             completed_prefix: AtomicUsize::new(completed),
             state: Mutex::new(state),
@@ -609,11 +611,8 @@ fn verify_execution(
         .contention_metrics
         .lock()
         .expect("inspect contention metrics");
-    for worker in 0..WRITER_COUNT {
-        assert_eq!(
-            metrics.committed_by_worker[worker],
-            results[worker].is_some()
-        );
+    for (worker, result) in results.iter().enumerate() {
+        assert_eq!(metrics.committed_by_worker[worker], result.is_some());
     }
     drop(metrics);
 
@@ -825,6 +824,7 @@ impl PruneModel {
                 .expect("active snapshot write lock");
             let high = self.publication.completed();
             assert!(active.high.replace(high).is_none());
+            drop(active);
             high
         };
         thread::yield_now();
@@ -905,6 +905,7 @@ fn installed_unpublished_versions_are_hidden_until_the_prefix_is_complete() {
             assert_eq!(shard.versions.len(), 2);
             assert!(shard.versions.iter().any(|version| version.sequence == 1));
             assert!(shard.versions.iter().any(|version| version.sequence == 2));
+            drop(shard);
         }
     });
 }

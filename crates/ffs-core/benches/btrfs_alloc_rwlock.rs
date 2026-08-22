@@ -55,8 +55,9 @@ impl Tree {
         if i < self.keys.len() && self.keys[i] == k {
             let v = &self.vals[i];
             let mut acc = 0_u64;
-            for chunk in v.chunks_exact(8) {
-                acc = acc.wrapping_add(u64::from_le_bytes(chunk.try_into().unwrap()));
+            let (chunks, _remainder) = v.as_chunks::<8>();
+            for chunk in chunks {
+                acc = acc.wrapping_add(u64::from_le_bytes(*chunk));
             }
             acc
         } else {

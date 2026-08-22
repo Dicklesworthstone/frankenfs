@@ -28,7 +28,10 @@ fn direct_to_vec(data: &[u8]) -> Vec<u8> {
 fn bench(c: &mut Criterion) {
     let mut data = vec![0u8; BS];
     for (i, x) in data.iter_mut().enumerate() {
-        *x = (i as u8).wrapping_mul(37).wrapping_add(3);
+        *x = u8::try_from(i & 0xFF)
+            .expect("index masked into u8 range")
+            .wrapping_mul(37)
+            .wrapping_add(3);
     }
     assert_eq!(memset_then_copy(&data), direct_to_vec(&data), "isomorphism");
 

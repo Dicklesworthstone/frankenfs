@@ -955,7 +955,9 @@ impl ByteDevice for FileByteDevice {
             // saves the storage cache-flush (~400us on this class of host)
             // that dominates no-op durability boundaries (unchanged-directory
             // fsyncdir storms).
-            self.sync_state.flushes_elided.fetch_add(1, Ordering::Relaxed);
+            self.sync_state
+                .flushes_elided
+                .fetch_add(1, Ordering::Relaxed);
             cx_checkpoint(cx)?;
             return Ok(());
         }
@@ -983,7 +985,9 @@ impl ByteDevice for FileByteDevice {
         // back to `sync_all` — the test below pins the invariant so that change
         // fails loudly rather than silently losing a size update.
         self.file.sync_data()?;
-        self.sync_state.flushes_issued.fetch_add(1, Ordering::Relaxed);
+        self.sync_state
+            .flushes_issued
+            .fetch_add(1, Ordering::Relaxed);
         // Publish at most the pre-sync observation; `fetch_max` keeps a
         // concurrent sync that observed a newer epoch from being regressed.
         self.sync_state
@@ -3265,7 +3269,11 @@ mod tests {
         // A patch that changes nothing must not reach the device.
         dev.rmw_block(&cx, block, &hint, &mut |_buf| Ok(()))
             .expect("no-op rmw");
-        assert_eq!(writes(), 0, "a patch that changed nothing must not be written");
+        assert_eq!(
+            writes(),
+            0,
+            "a patch that changed nothing must not be written"
+        );
 
         // A real change must still be written.
         dev.rmw_block(&cx, block, &hint, &mut |buf| {
@@ -3290,7 +3298,11 @@ mod tests {
         // The skip does not depend on the hint being supplied.
         dev.rmw_block(&cx, block, &[], &mut |_buf| Ok(()))
             .expect("no-hint no-op");
-        assert_eq!(writes(), 1, "an unchanged patch with no hint is also skipped");
+        assert_eq!(
+            writes(),
+            1,
+            "an unchanged patch with no hint is also skipped"
+        );
 
         // ⚠️ THE LOAD-BEARING CASE. A patch that strays OUTSIDE its declared ranges
         // must still be written. `disjoint_ranges` is the caller's promise about what
@@ -3905,10 +3917,16 @@ mod tests {
         let Ok(dev) = std::env::var("FFS_TEST_BLOCK_DEVICE") else {
             panic!("set FFS_TEST_BLOCK_DEVICE=/dev/loopN (see the doc comment)");
         };
-        let file = OpenOptions::new().read(true).open(&dev).expect("open device");
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&dev)
+            .expect("open device");
         let meta_len = file.metadata().expect("metadata").len();
         let real_len = backing_len(&file).expect("backing_len");
-        assert_eq!(meta_len, 0, "st_size is 0 for a block special — the premise");
+        assert_eq!(
+            meta_len, 0,
+            "st_size is 0 for a block special — the premise"
+        );
         assert!(
             real_len > 0,
             "backing_len must report the DEVICE size, not st_size; got {real_len}"
@@ -4203,10 +4221,14 @@ mod tests {
         let dev = FileByteDevice::open(&path).expect("device");
 
         // A dirty device must ISSUE a flush.
-        dev.write_all_at(&cx, ByteOffset(0), &[1_u8, 2, 3, 4]).expect("write");
+        dev.write_all_at(&cx, ByteOffset(0), &[1_u8, 2, 3, 4])
+            .expect("write");
         dev.sync(&cx).expect("sync");
         let issued_after_first = dev.sync_state.flushes_issued.load(Ordering::Relaxed);
-        assert_eq!(issued_after_first, 1, "one dirty sync issues exactly one flush");
+        assert_eq!(
+            issued_after_first, 1,
+            "one dirty sync issues exactly one flush"
+        );
 
         // A second sync with nothing written since must ELIDE, not issue. That is the
         // clean-sync-skip lever, and counting it separately is what keeps it from being
@@ -4225,7 +4247,8 @@ mod tests {
         );
 
         // Dirty again -> issues again, so the counter tracks work rather than calls.
-        dev.write_all_at(&cx, ByteOffset(8), &[9_u8]).expect("write");
+        dev.write_all_at(&cx, ByteOffset(8), &[9_u8])
+            .expect("write");
         dev.sync(&cx).expect("sync");
         assert_eq!(dev.sync_state.flushes_issued.load(Ordering::Relaxed), 2);
         assert_eq!(dev.sync_state.flushes_elided.load(Ordering::Relaxed), 1);

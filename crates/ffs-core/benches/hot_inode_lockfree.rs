@@ -83,79 +83,81 @@ fn run_threads(op: impl Fn(usize) + Sync) {
 }
 
 fn bench(c: &mut Criterion) {
-    let mut g = c.benchmark_group("hot_inode_lockfree");
+    {
+        let mut g = c.benchmark_group("hot_inode_lockfree");
 
-    // ── hot key (single-file random read): all threads read the SAME inode ──
-    g.bench_function("hot_key/sharded_mutex_get", |b| {
-        let map = Arc::new(ShardedMutexMap::new());
-        map.insert(HOT_KEY, 999);
-        b.iter(|| {
-            run_threads(|_| {
-                let mut acc = 0u64;
-                for _ in 0..OPS {
-                    acc = acc.wrapping_add(map.get(HOT_KEY).unwrap_or(0));
-                }
-                black_box(acc);
+        // ── hot key (single-file random read): all threads read the SAME inode ──
+        g.bench_function("hot_key/sharded_mutex_get", |b| {
+            let map = Arc::new(ShardedMutexMap::new());
+            map.insert(HOT_KEY, 999);
+            b.iter(|| {
+                run_threads(|_| {
+                    let mut acc = 0u64;
+                    for _ in 0..OPS {
+                        acc = acc.wrapping_add(map.get(HOT_KEY).unwrap_or(0));
+                    }
+                    black_box(acc);
+                });
             });
         });
-    });
-    g.bench_function("hot_key/arc_swap_load", |b| {
-        let slot: Arc<ArcSwapOption<(u64, u64)>> =
-            Arc::new(ArcSwapOption::from(Some(Arc::new((HOT_KEY, 999u64)))));
-        b.iter(|| {
-            run_threads(|_| {
-                let mut acc = 0u64;
-                for _ in 0..OPS {
-                    if let Some(kv) = &*slot.load() {
-                        if kv.0 == HOT_KEY {
+        g.bench_function("hot_key/arc_swap_load", |b| {
+            let slot: Arc<ArcSwapOption<(u64, u64)>> =
+                Arc::new(ArcSwapOption::from(Some(Arc::new((HOT_KEY, 999u64)))));
+            b.iter(|| {
+                run_threads(|_| {
+                    let mut acc = 0u64;
+                    for _ in 0..OPS {
+                        if let Some(kv) = &*slot.load()
+                            && kv.0 == HOT_KEY
+                        {
                             acc = acc.wrapping_add(kv.1);
                         }
                     }
-                }
-                black_box(acc);
+                    black_box(acc);
+                });
             });
         });
-    });
 
-    // ── distinct keys (multi-file): each thread reads its OWN inode ──
-    g.bench_function("distinct_keys/sharded_mutex_get", |b| {
-        let map = Arc::new(ShardedMutexMap::new());
-        for t in 0..THREADS {
-            map.insert(t as u64, t as u64 + 1);
-        }
-        b.iter(|| {
-            run_threads(|t| {
-                let key = t as u64;
-                let mut acc = 0u64;
-                for _ in 0..OPS {
-                    acc = acc.wrapping_add(map.get(key).unwrap_or(0));
-                }
-                black_box(acc);
-            });
-        });
-    });
-    g.bench_function("distinct_keys/arc_swap_thrash", |b| {
-        // Single slot + distinct per-thread keys ⇒ every read misses another
-        // thread's key and stores its own: the worst-case thrash the single-entry
-        // design pays under a multi-file workload.
-        let slot: Arc<ArcSwapOption<(u64, u64)>> =
-            Arc::new(ArcSwapOption::from(Some(Arc::new((0u64, 1u64)))));
-        b.iter(|| {
-            run_threads(|t| {
-                let key = t as u64;
-                let mut acc = 0u64;
-                for _ in 0..OPS {
-                    match &*slot.load() {
-                        Some(kv) if kv.0 == key => acc = acc.wrapping_add(kv.1),
-                        _ => slot.store(Some(Arc::new((key, key + 1)))),
+        // ── distinct keys (multi-file): each thread reads its OWN inode ──
+        g.bench_function("distinct_keys/sharded_mutex_get", |b| {
+            let map = Arc::new(ShardedMutexMap::new());
+            for t in 0..THREADS {
+                map.insert(t as u64, t as u64 + 1);
+            }
+            b.iter(|| {
+                run_threads(|t| {
+                    let key = t as u64;
+                    let mut acc = 0u64;
+                    for _ in 0..OPS {
+                        acc = acc.wrapping_add(map.get(key).unwrap_or(0));
                     }
-                }
-                black_box(acc);
+                    black_box(acc);
+                });
             });
         });
-    });
+        g.bench_function("distinct_keys/arc_swap_thrash", |b| {
+            // Single slot + distinct per-thread keys ⇒ every read misses another
+            // thread's key and stores its own: the worst-case thrash the single-entry
+            // design pays under a multi-file workload.
+            let slot: Arc<ArcSwapOption<(u64, u64)>> =
+                Arc::new(ArcSwapOption::from(Some(Arc::new((0u64, 1u64)))));
+            b.iter(|| {
+                run_threads(|t| {
+                    let key = t as u64;
+                    let mut acc = 0u64;
+                    for _ in 0..OPS {
+                        match &*slot.load() {
+                            Some(kv) if kv.0 == key => acc = acc.wrapping_add(kv.1),
+                            _ => slot.store(Some(Arc::new((key, key + 1)))),
+                        }
+                    }
+                    black_box(acc);
+                });
+            });
+        });
 
-    g.finish();
+        g.finish();
+    }
 
     // Complete one-shot multi-file reads cannot reuse the single hot slot.
     // Mirror the miss-path publication cost with duplicate controls, then the

@@ -40,20 +40,19 @@ use ffs_block::{
 };
 use ffs_btrfs::{
     BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA, BTRFS_BLOCK_GROUP_SYSTEM,
-    BTRFS_CHUNK_TREE_OBJECTID,
-    BTRFS_CSUM_TREE_OBJECTID, BTRFS_DEV_TREE_OBJECTID, BTRFS_EXTENT_TREE_OBJECTID,
-    BTRFS_FILE_EXTENT_PREALLOC,
-    BTRFS_FILE_EXTENT_REG, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV,
-    BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_REG_FILE, BTRFS_FT_SOCK,
-    BTRFS_FT_SYMLINK, BTRFS_INODE_APPEND, BTRFS_INODE_IMMUTABLE, BTRFS_INODE_NODATASUM,
-    BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
-    BTRFS_ITEM_INODE_REF, BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM,
-    BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_USER_SETTABLE_FSFLAGS,
-    BTRFS_USER_SETTABLE_XFLAGS, BtrfsBTree, BtrfsBlockGroupItem, BtrfsCowNode, BtrfsDirItem,
-    BtrfsExtentAllocator, BtrfsExtentData, BtrfsInodeItem, BtrfsKey, BtrfsLeafEntry,
-    BtrfsMutationError, BtrfsNodeSerializeParams, BtrfsParsedNode, BtrfsRootItem, BtrfsTreeItem,
-    InMemoryCowBtrfsTree, btrfs_inode_flags_to_fsflags, btrfs_inode_flags_to_xflags,
-    enumerate_snapshots, enumerate_subvolumes, find_xattr_item_value, fsflags_to_btrfs_inode_flags,
+    BTRFS_CHUNK_TREE_OBJECTID, BTRFS_CSUM_TREE_OBJECTID, BTRFS_DEV_TREE_OBJECTID,
+    BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG,
+    BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV, BTRFS_FT_CHRDEV,
+    BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_REG_FILE, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK,
+    BTRFS_INODE_APPEND, BTRFS_INODE_IMMUTABLE, BTRFS_INODE_NODATASUM, BTRFS_ITEM_DIR_INDEX,
+    BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_INODE_REF,
+    BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM, BTRFS_ROOT_SUBVOL_RDONLY,
+    BTRFS_ROOT_TREE_OBJECTID, BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS, BtrfsBTree,
+    BtrfsBlockGroupItem, BtrfsCowNode, BtrfsDirItem, BtrfsExtentAllocator, BtrfsExtentData,
+    BtrfsInodeItem, BtrfsKey, BtrfsLeafEntry, BtrfsMutationError, BtrfsNodeSerializeParams,
+    BtrfsParsedNode, BtrfsRootItem, BtrfsTreeItem, InMemoryCowBtrfsTree,
+    btrfs_inode_flags_to_fsflags, btrfs_inode_flags_to_xflags, enumerate_snapshots,
+    enumerate_subvolumes, find_xattr_item_value, fsflags_to_btrfs_inode_flags,
     generate_send_stream, lookup_data_block_csum, map_logical_to_physical,
     parse_btrfs_tree_node_owned, parse_dir_items, parse_extent_data, parse_inode_item,
     parse_root_item, parse_xattr_item_names, parse_xattr_items, visit_dir_items, walk_chunk_tree,
@@ -1091,11 +1090,17 @@ struct BtrfsAllocState {
     /// In-memory COW B-tree holding CHUNK_ITEMs and the DEV_ITEM, seeded from
     /// the on-disk chunk tree at mount (bd-a136s). Chunk ALLOCATION inserts
     /// here; until that is wired, this is loaded and re-serialized unchanged.
-    #[allow(dead_code, reason = "read by chunk allocation, wired in a later commit (bd-a136s)")]
+    #[allow(
+        dead_code,
+        reason = "read by chunk allocation, wired in a later commit (bd-a136s)"
+    )]
     chunk_tree: InMemoryCowBtrfsTree,
     /// In-memory COW B-tree holding DEV_EXTENTs — the reverse map of every chunk
     /// onto the physical device ranges backing it (bd-a136s).
-    #[allow(dead_code, reason = "read by chunk allocation, wired in a later commit (bd-a136s)")]
+    #[allow(
+        dead_code,
+        reason = "read by chunk allocation, wired in a later commit (bd-a136s)"
+    )]
     dev_tree: InMemoryCowBtrfsTree,
     /// Set when a chunk was ALLOCATED this transaction, so the chunk tree and
     /// device tree must be re-serialized at commit (bd-a136s).
@@ -1105,7 +1110,10 @@ struct BtrfsAllocState {
     /// csum tree. Without this flag every commit would COW-rewrite the whole
     /// chunk tree at fresh addresses for a tree that did not change — the exact
     /// per-commit metadata amplification bd-42gtq and bd-uxh7t are about.
-    #[allow(dead_code, reason = "set by chunk allocation, wired in a later commit (bd-a136s)")]
+    #[allow(
+        dead_code,
+        reason = "set by chunk allocation, wired in a later commit (bd-a136s)"
+    )]
     chunk_trees_dirty: bool,
     /// False when the chunk tree or device tree could not be read in full.
     ///
@@ -1116,7 +1124,10 @@ struct BtrfsAllocState {
     /// Unlike the extent tree, where a failed load costs accounting that the next
     /// commit recomputes, a failed device-tree load costs the only record of
     /// what is already on the disk.
-    #[allow(dead_code, reason = "read by chunk allocation, wired in a later commit (bd-a136s)")]
+    #[allow(
+        dead_code,
+        reason = "read by chunk allocation, wired in a later commit (bd-a136s)"
+    )]
     chunk_trees_authoritative: bool,
     /// Newly-created subvolume fs-trees awaiting their first commit, keyed by
     /// the subvolume's root objectid (>= `BTRFS_FIRST_FREE_OBJECTID`). Each is
@@ -1252,6 +1263,20 @@ struct BtrfsTreeLogWriteStats {
     /// and BOTH are superseded together. Retiring only one would leak the other
     /// per fsync, which is exactly the defect bd-0ajub already fixed once.
     retired_log_blocks: Vec<(u64, u64, bool)>,
+}
+
+/// Rename execution context shared by the batched and per-op rename paths:
+/// the resolved parent/name pairs plus the source entry. Grouped so the
+/// extracted path helpers stay under the argument-count lint.
+struct BtrfsRenameCtx<'a> {
+    parent_oid: u64,
+    new_parent_oid: u64,
+    child: &'a BtrfsDirItem,
+    child_dir_index: u64,
+    name: &'a [u8],
+    new_name: &'a [u8],
+    secs: u64,
+    nanos: u32,
 }
 
 /// Statistics returned by full btrfs transaction commit (bd-jdo53).
@@ -1453,6 +1478,7 @@ pub struct OpenFs {
     /// nothing ever clears it, so "which structure debited this block" is
     /// answerable from the toggle. A block-accounting fix depends on that, and an
     /// unenforced assumption of exactly this kind is what produced bd-pbyu0.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
     bhh0i_sharded_alloc_happened: std::sync::atomic::AtomicBool,
     /// Read-only ext4 group descriptor cache.
     ///
@@ -2009,12 +2035,9 @@ fn readdir_snapshot_serve(
     validation: ReaddirValidation,
     offset: u64,
 ) -> Option<ReaddirPage> {
-    let entries = {
-        let guard = slot.lock();
-        let snap = guard.as_ref()?;
-        (snap.ino == ino && snap.validation == validation)
-            .then(|| Arc::clone(&snap.entries))
-    };
+    let entries = slot.lock().as_ref().and_then(|snap| {
+        (snap.ino == ino && snap.validation == validation).then(|| Arc::clone(&snap.entries))
+    });
     entries.map(|entries| slice_readdir_snapshot(entries, offset))
 }
 
@@ -2035,11 +2058,10 @@ fn readdir_snapshot_serve_unvalidated(
     ino: u64,
     offset: u64,
 ) -> Option<ReaddirPage> {
-    let entries = {
-        let guard = slot.lock();
-        let snap = guard.as_ref()?;
-        (snap.ino == ino).then(|| Arc::clone(&snap.entries))
-    };
+    let entries = slot
+        .lock()
+        .as_ref()
+        .and_then(|snap| (snap.ino == ino).then(|| Arc::clone(&snap.entries)));
     entries.map(|entries| slice_readdir_snapshot(entries, offset))
 }
 
@@ -3635,12 +3657,12 @@ impl TransactionBlockAdapter<'_, '_> {
         //
         // Cost is one block-sized clone per RMW; it is only consumed on a
         // same-block conflict, and the alternative is aborting valid work.
+        let ancestor_bytes = ancestor.as_slice().to_vec();
         let mut tx = self.tx.lock();
         let already_staged = tx.staged_write(block).is_some();
-        let mut data = tx.staged_write(block).map_or_else(
-            || ancestor_bytes.clone(),
-            |staged| staged.to_vec(),
-        );
+        let mut data = tx
+            .staged_write(block)
+            .map_or_else(|| ancestor_bytes.clone(), <[u8]>::to_vec);
         patch(&mut data)?;
         // A transaction may RMW the SAME block more than once — an unlink writes
         // the deleted child's zeroed inode and its parent directory's inode, and a
@@ -3682,6 +3704,7 @@ impl TransactionBlockAdapter<'_, '_> {
             proof
         };
         tx.stage_write_with_proof_and_base(block, data, effective, Some(ancestor_bytes));
+        drop(tx);
         Ok(())
     }
 }
@@ -5276,6 +5299,7 @@ impl OpenFs {
             ext4_sharded_alloc: None,
             #[cfg(feature = "bhh0i_sharded_alloc")]
             bhh0i_sharded_ops: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "bhh0i_sharded_alloc")]
             bhh0i_sharded_alloc_happened: std::sync::atomic::AtomicBool::new(false),
             ext4_group_desc_cache: ShardedCache::new(),
             ext4_inode_table_locations: OnceLock::new(),
@@ -10299,7 +10323,7 @@ impl OpenFs {
                 return Err(FfsError::NotDirectory);
             }
             let alloc = alloc_mutex.read();
-            let dir_item = self.btrfs_lookup_dir_entry(&alloc, canonical_parent, name)?;
+            let dir_item = Self::btrfs_lookup_dir_entry(&alloc, canonical_parent, name)?;
             let child_ino = InodeNumber(dir_item.child_objectid);
             drop(alloc);
             return self.btrfs_read_inode_attr(cx, child_ino);
@@ -10429,10 +10453,7 @@ impl OpenFs {
         // readdir (measured ~3.4% self-time hashing names in a 30000-entry `walk`);
         // FxHash's word-at-a-time mix is the textbook Pareto swap for internal keys.
         let mut seen: rustc_hash::FxHashSet<&[u8]> =
-            rustc_hash::FxHashSet::with_capacity_and_hasher(
-                rows.len(),
-                rustc_hash::FxBuildHasher,
-            );
+            rustc_hash::FxHashSet::with_capacity_and_hasher(rows.len(), rustc_hash::FxBuildHasher);
         let mut keep: Vec<bool> = Vec::with_capacity(rows.len());
         for row in &rows {
             keep.push(seen.insert(row.1.name.as_slice()));
@@ -12952,11 +12973,8 @@ impl OpenFs {
                     self.ext4_sum_group_desc_block(
                         sb,
                         geo,
-                        desc_size,
-                        bs,
+                        first_group..last_group,
                         block_num,
-                        first_group,
-                        last_group,
                         cacheable,
                         block_data,
                     )
@@ -12983,17 +13001,16 @@ impl OpenFs {
         &self,
         sb: &Ext4Superblock,
         geo: &FsGeometry,
-        desc_size: usize,
-        bs: u64,
+        groups: std::ops::Range<u32>,
         block_num: BlockNumber,
-        first_group: u64,
-        last_group: u64,
         cacheable: bool,
         block_data: &[u8],
     ) -> Result<(u64, u64), FfsError> {
+        let desc_size = usize::from(geo.desc_size);
+        let bs = u64::from(sb.block_size);
         let mut blocks_free = 0_u64;
         let mut files_free = 0_u64;
-        for group_idx in first_group..last_group {
+        for group_idx in groups {
             let group = GroupNumber(group_idx);
             let offset = sb
                 .group_desc_offset(group)
@@ -13024,8 +13041,8 @@ impl OpenFs {
                 )
                 .map_err(|e| parse_to_ffs_error(&e))?;
             }
-            let gd =
-                Ext4GroupDesc::parse_from_bytes(buf, geo.desc_size).map_err(|e| parse_to_ffs_error(&e))?;
+            let gd = Ext4GroupDesc::parse_from_bytes(buf, geo.desc_size)
+                .map_err(|e| parse_to_ffs_error(&e))?;
             blocks_free = blocks_free.saturating_add(u64::from(gd.free_blocks_count));
             files_free = files_free.saturating_add(u64::from(gd.free_inodes_count));
             if cacheable {
@@ -13303,9 +13320,7 @@ impl OpenFs {
         block: BlockNumber,
     ) -> Result<Arc<[u8]>, FfsError> {
         let cacheable = self.can_cache_ext4_read_only_block(scope, block);
-        if cacheable
-            && let Some(cached) = self.ext4_file_data_block_cache.get(&block)
-        {
+        if cacheable && let Some(cached) = self.ext4_file_data_block_cache.get(&block) {
             return Ok(cached);
         }
 
@@ -13541,9 +13556,7 @@ impl OpenFs {
             && !self
                 .readonly_lookup_cache_disabled
                 .load(std::sync::atomic::Ordering::Relaxed);
-        if use_attr_cache
-            && let Some(attr) = self.ext4_inode_attr_cache.get(&ino.0)
-        {
+        if use_attr_cache && let Some(attr) = self.ext4_inode_attr_cache.get(&ino.0) {
             return Ok(attr);
         }
         let sb = self
@@ -14949,7 +14962,9 @@ impl OpenFs {
                     // Same blocks read, same ordered results.
                     ext4_read_pool().map_or_else(
                         || survivors.par_iter().map(|&b| fetch_block(b)).collect(),
-                        |pool| pool.install(|| survivors.par_iter().map(|&b| fetch_block(b)).collect()),
+                        |pool| {
+                            pool.install(|| survivors.par_iter().map(|&b| fetch_block(b)).collect())
+                        },
                     )
                 };
 
@@ -15744,7 +15759,8 @@ impl OpenFs {
         if index_keyable {
             let guard = self.dir_name_index_shard(dir_inode.number).lock();
             if let Some(idx) = guard.as_ref()
-                && idx.inode == dir_inode.number && idx.validation == dir_validation
+                && idx.inode == dir_inode.number
+                && idx.validation == dir_validation
             {
                 // A complete name->dirent snapshot (read-only mount, immutable
                 // dir) answers a PRESENT lookup in O(1) too — return the entry
@@ -15874,9 +15890,7 @@ impl OpenFs {
                 matches!(guard.as_ref(), Some(idx)
                     if idx.inode == dir_inode.number && idx.validation == dir_validation)
             };
-            if !have_current
-                && let Ok(entries) = self.read_dir_with_scope(cx, scope, dir_inode)
-            {
+            if !have_current && let Ok(entries) = self.read_dir_with_scope(cx, scope, dir_inode) {
                 let names: rustc_hash::FxHashSet<Vec<u8>> =
                     entries.into_iter().map(|e| e.name).collect();
                 *self.dir_name_index_shard(dir_inode.number).lock() = Some(DirNameIndex {
@@ -16121,8 +16135,7 @@ fn is_block_all_zero(data: &[u8]) -> bool {
         }
     }
     let (tail8, tail1) = remainder.as_chunks::<8>();
-    tail8.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && tail1.iter().all(|&b| b == 0)
+    tail8.iter().all(|c| u64::from_ne_bytes(*c) == 0) && tail1.iter().all(|&b| b == 0)
 }
 
 /// Three-way outcome of the authoritative htree name descent
@@ -16640,7 +16653,7 @@ impl OpenFs {
         // The value ranges are disjoint logical block windows. Overlap only the
         // read + short-block validation; consume the collected results in job
         // order so the lowest logical-block error remains the observable error.
-        Self::ext4_read_ea_inode_blocks_into_value(cx, jobs, value_inum, &mut value)?;
+        self.ext4_read_ea_inode_blocks_into_value(cx, jobs, value_inum, &mut value)?;
         if let Some(err) = terminal_error {
             return Err(err);
         }
@@ -19753,7 +19766,6 @@ enum DirInsertOutcome {
     NeedsGrowthLinear,
 }
 
-
 /// One group's persist unit for `ext4_write_group_descriptors_to`: the group
 /// number, its live stats, and optional inode/block bitmap override bytes read
 /// back from the device for checksum stamping (`None` = untouched group).
@@ -19763,6 +19775,14 @@ type GroupDescPersistEntry = (
     Option<Vec<u8>>,
     Option<Vec<u8>>,
 );
+
+/// Serialized tree-log write bundle from [`Self::btrfs_prepare_tree_log_write`]:
+/// per-block `(bytenr, bytes)` pairs, the patched superblock image, and stats.
+type BtrfsTreeLogWriteBundle = (Vec<(u64, Vec<u8>)>, Vec<u8>, BtrfsTreeLogWriteStats);
+
+/// Three serialized blobs of the tree-log prepare region: the log-tree root
+/// node, the log-tree leaf, and the superblock patch bytes.
+type BtrfsTreeLogPreparedBytes = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 impl OpenFs {
     /// Extract 60-byte extent tree root from inode's extent_bytes.
@@ -20100,6 +20120,11 @@ impl OpenFs {
     /// `from_device`, before `enable_writes` builds the sharded records at all —
     /// an ordering pinned by
     /// `sharded_records_do_not_exist_until_enable_writes_bd_y2t0r`.)
+    // significant_drop_tightening wants the write guard re-acquired per delta,
+    // but this loop applies ONE recovery's group deltas as a single compound
+    // mutation: the whole batch stays under one exclusive guard so a concurrent
+    // allocator can never observe half-applied recovery counts.
+    #[expect(clippy::significant_drop_tightening)]
     fn ext4_merge_recovery_alloc_into_live(
         &self,
         before: &[(u32, u32, u32)],
@@ -20268,6 +20293,23 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Fold the single-lock `groups` array's free block/inode totals in ONE
+    /// pass over the group array. Two separate `.sum()` passes reload every
+    /// group's (large) struct a second time; on a big filesystem the array
+    /// exceeds cache, so fusing halves the memory traffic. free_blocks +
+    /// free_inodes share a cache line.
+    fn ext4_fold_group_free_totals(alloc: &Ext4AllocState) -> (u64, u64) {
+        alloc
+            .groups
+            .iter()
+            .fold((0_u64, 0_u64), |(blocks, inodes), g| {
+                (
+                    blocks + u64::from(g.free_blocks),
+                    inodes + u64::from(g.free_inodes),
+                )
+            })
+    }
+
     fn ext4_sync_superblock_free_totals(&self, cx: &Cx) -> Result<(), FfsError> {
         let block_dev = self.direct_block_device_adapter();
         self.ext4_sync_superblock_free_totals_to(cx, &block_dev)
@@ -20299,7 +20341,7 @@ impl OpenFs {
         // carried the reconciled counts would make the superblock disagree with
         // its own group descriptors.
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        let sharded_totals: Option<(u64, u64)> = self.bhh0i_sharded_ops_active().then(|| {
+        let (total_free_blocks, total_free_inodes) = if self.bhh0i_sharded_ops_active() {
             let live = self.ext4_single_lock_group_counts();
             let t = self
                 .ext4_sharded_alloc
@@ -20307,26 +20349,15 @@ impl OpenFs {
                 .expect("sharded active implies present")
                 .reconciled_total_free(&live);
             (t.blocks, t.inodes)
-        });
+        } else {
+            let alloc = alloc_mutex.read();
+            Self::ext4_fold_group_free_totals(&alloc)
+        };
         #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-        let sharded_totals: Option<(u64, u64)> = None;
-
-        let (total_free_blocks, total_free_inodes) = sharded_totals.map_or_else(
-            || {
-                let alloc = alloc_mutex.read();
-                // Sum both free totals in ONE pass over the group array. Two separate
-                // `.sum()` passes reload every group's (large) struct a second time;
-                // on a big filesystem the array exceeds cache, so fusing halves the
-                // memory traffic. free_blocks + free_inodes share a cache line.
-                alloc.groups.iter().fold((0_u64, 0_u64), |(blocks, inodes), g| {
-                    (
-                        blocks + u64::from(g.free_blocks),
-                        inodes + u64::from(g.free_inodes),
-                    )
-                })
-            },
-            |totals| totals,
-        );
+        let (total_free_blocks, total_free_inodes) = {
+            let alloc = alloc_mutex.read();
+            Self::ext4_fold_group_free_totals(&alloc)
+        };
 
         let (sb_block, sb_off) = self.ext4_superblock_location();
         let mut block_data = block_dev.read_block(cx, sb_block)?.into_inner();
@@ -21792,12 +21823,7 @@ impl OpenFs {
                 edit.region_start,
                 &delta,
             ) {
-                ffs_ondisk::stamp_dir_block_checksum(
-                    block,
-                    sb.csum_seed(),
-                    dir_ino,
-                    generation,
-                );
+                ffs_ondisk::stamp_dir_block_checksum(block, sb.csum_seed(), dir_ino, generation);
             }
         }
     }
@@ -21943,16 +21969,6 @@ impl OpenFs {
         Ok(())
     }
 
-    /// Attempt to insert `name -> child_ino_u32` into the parent directory's
-    /// EXISTING blocks (the htree target leaf, or a linear block with free
-    /// space), staging the block write through `dev`. The parent-inode update
-    /// (mtime/ctime + dir link count) is HOISTED to the caller, so this insert
-    /// is ALLOCATOR-AGNOSTIC — it no longer reads `alloc` — and can be reused by
-    /// both the single-lock and the sharded (bd-bhh0i) create paths. Never
-    /// allocates — a full target returns a `NeedsGrowth*` outcome so the caller
-    /// runs the growth path. Read/write/stamp order is byte-for-byte identical
-    /// to the original; the caller writes the parent immediately after `Inserted`.
-
     /// Htree-indexed half of [`Self::ext4_try_insert_existing`]: every control
     /// path returns (inserted / needs-growth / error), so the split is exact.
     #[allow(clippy::too_many_arguments)]
@@ -22018,14 +22034,13 @@ impl OpenFs {
                 parent.0
             ),
         })?;
-        let target_phys = resolve_logical(target_logical)
-            .ok_or_else(|| FfsError::Corruption {
-                block: 0,
-                detail: format!(
-                    "htree directory inode {} dx index references unmapped leaf block {target_logical}",
-                    parent.0
-                ),
-            })?;
+        let target_phys = resolve_logical(target_logical).ok_or_else(|| FfsError::Corruption {
+            block: 0,
+            detail: format!(
+                "htree directory inode {} dx index references unmapped leaf block {target_logical}",
+                parent.0
+            ),
+        })?;
 
         let mut data = self.read_block_vec(cx, target_phys)?;
         match ffs_dir::add_entry_reject_existing_tracked(
@@ -22059,6 +22074,15 @@ impl OpenFs {
         }
     }
 
+    /// Attempt to insert `name -> child_ino_u32` into the parent directory's
+    /// EXISTING blocks (the htree target leaf, or a linear block with free
+    /// space), staging the block write through `dev`. The parent-inode update
+    /// (mtime/ctime + dir link count) is HOISTED to the caller, so this insert
+    /// is ALLOCATOR-AGNOSTIC — it no longer reads `alloc` — and can be reused by
+    /// both the single-lock and the sharded (bd-bhh0i) create paths. Never
+    /// allocates — a full target returns a `NeedsGrowth*` outcome so the caller
+    /// runs the growth path. Read/write/stamp order is byte-for-byte identical
+    /// to the original; the caller writes the parent immediately after `Inserted`.
     #[allow(clippy::too_many_arguments)]
     fn ext4_try_insert_existing(
         &self,
@@ -22076,8 +22100,17 @@ impl OpenFs {
     ) -> ffs_error::Result<DirInsertOutcome> {
         if parent_inode.has_htree_index() {
             return self.ext4_try_insert_existing_htree(
-                cx, dev, parent, parent_inode, extents, name, child_ino_u32,
-                parent_ino_u32, parent_generation, file_type, reserved_tail,
+                cx,
+                dev,
+                parent,
+                parent_inode,
+                extents,
+                name,
+                child_ino_u32,
+                parent_ino_u32,
+                parent_generation,
+                file_type,
+                reserved_tail,
             );
         }
 
@@ -23229,7 +23262,6 @@ impl OpenFs {
     /// add_entry ONLY on the hash-target leaf and fills `probe` from that leaf
     /// when byte-exact matching applies. `Ok(None)` = not an htree dir (caller
     /// runs the linear scan); `Ok(Some(checked))` = fast path ran.
-    #[expect(clippy::too_many_lines)]
     fn ext4_preflight_htree_fast_path(
         &self,
         cx: &Cx,
@@ -23237,7 +23269,6 @@ impl OpenFs {
         extents: &[Ext4Extent],
         name: &[u8],
         file_type: Ext4FileType,
-        reserved_tail: usize,
         probe: &mut RenameTargetProbe,
     ) -> ffs_error::Result<Option<bool>> {
         if !parent_inode.has_htree_index() {
@@ -23299,6 +23330,7 @@ impl OpenFs {
                 .map_err(|e| parse_to_ffs_error(&e))?
                 .map_or(RenameTargetProbe::Absent, RenameTargetProbe::Present);
         }
+        let reserved_tail = self.ext4_dir_reserved_tail();
         match ffs_dir::add_entry(&mut data, 1, name, file_type, reserved_tail) {
             Ok(_) | Err(FfsError::NoSpace) => {}
             Err(err) => return Err(err),
@@ -23365,7 +23397,6 @@ impl OpenFs {
                 &extents,
                 name,
                 file_type,
-                reserved_tail,
                 &mut probe,
             )?
             .unwrap_or(false);
@@ -23607,9 +23638,8 @@ impl OpenFs {
                     (logical >= start && logical < start.saturating_add(len))
                         .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
                 };
-                let read_leaf = |lb| {
-                    resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok())
-                };
+                let read_leaf =
+                    |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
                 let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
                 let target_logical = if casefold {
                     ffs_ondisk::htree_target_leaf_block_casefold(
@@ -23632,11 +23662,9 @@ impl OpenFs {
                     && Some(target_phys) != dx_root_phys
                 {
                     let mut data = self.read_block_vec(cx, target_phys)?;
-                    if let Some((ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
-                        &mut data,
-                        name,
-                        reserved_tail,
-                    )? {
+                    if let Some((ino, edit)) =
+                        ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
+                    {
                         self.stamp_ext4_dir_block_after_edit(
                             &mut data,
                             parent_ino_u32,
@@ -26896,7 +26924,8 @@ impl OpenFs {
                             1,
                         )?;
                         if let Some(mapping) = mappings.first()
-                            && mapping.physical_start > 0 && mapping.count > 0
+                            && mapping.physical_start > 0
+                            && mapping.count > 0
                         {
                             let physical_block = BlockNumber(mapping.physical_start);
                             let mut block_data = self.read_block_vec(cx, physical_block)?;
@@ -28253,9 +28282,8 @@ impl OpenFs {
             .btrfs_read_inode_from_tree(alloc, canonical)
             .is_ok_and(|inode| inode.flags & BTRFS_INODE_NODATASUM == 0);
         if is_datasum
-            && let Err(e) = self
-                .btrfs_capture_data_extent_csums(
-                    cx, alloc, allocation.bytenr, alloc_size, None)
+            && let Err(e) =
+                self.btrfs_capture_data_extent_csums(cx, alloc, allocation.bytenr, alloc_size, None)
         {
             let _ = alloc.fs_tree.delete(&extent_key);
             let _ = alloc
@@ -28404,22 +28432,21 @@ impl OpenFs {
             } = parse_extent_data(&data).map_err(|e| parse_to_ffs_error(&e))?
                 && disk_bytenr > 0
             {
-                    // btrfs data-backref offset = file_offset - extent_offset,
-                    // computed with u64 wraparound (a reflinked sub-range views
-                    // into the extent, so extent_offset can exceed file_offset —
-                    // btrfs check validates the wrapped value).
-                    let ref_offset = key.offset.wrapping_sub(extent_offset);
-                    alloc
-                        .extent_alloc
-                        .add_data_extent_ref(
-                            disk_bytenr,
-                            disk_num_bytes,
-                            BTRFS_FS_TREE_OBJECTID,
-                            dst_canonical,
-                            ref_offset,
-                        )
-                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                }
+                // btrfs data-backref offset = file_offset - extent_offset,
+                // computed with u64 wraparound (a reflinked sub-range views
+                // into the extent, so extent_offset can exceed file_offset —
+                // btrfs check validates the wrapped value).
+                let ref_offset = key.offset.wrapping_sub(extent_offset);
+                alloc
+                    .extent_alloc
+                    .add_data_extent_ref(
+                        disk_bytenr,
+                        disk_num_bytes,
+                        BTRFS_FS_TREE_OBJECTID,
+                        dst_canonical,
+                        ref_offset,
+                    )
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
             }
         }
 
@@ -29792,41 +29819,14 @@ impl OpenFs {
         }
 
         if self.metadata_log.is_some() {
-            let result = self.flush_ext4_metadata_log(cx);
-            let duration_us =
-                started.map_or(0, |s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX));
-            return match result {
-                Ok(logged_blocks) => {
-                    info!(
-                        target: "ffs::ext4::rw",
-                        operation_id = %operation_id,
-                        scenario_id,
-                        outcome = "applied",
-                        ino = ino.0,
-                        datasync,
-                        duration_us,
-                        flushed_blocks = logged_blocks,
-                        durability = "append_only_metadata_wal",
-                        "ext4_sync_applied"
-                    );
-                    Ok(())
-                }
-                Err(err) => {
-                    warn!(
-                        target: "ffs::ext4::rw",
-                        operation_id = %operation_id,
-                        scenario_id,
-                        outcome = "rejected",
-                        error_class = "metadata_wal_failed",
-                        ino = ino.0,
-                        datasync,
-                        duration_us,
-                        error = %err,
-                        "ext4_sync_rejected"
-                    );
-                    Err(err)
-                }
-            };
+            return self.ext4_sync_via_metadata_log(
+                cx,
+                &operation_id,
+                scenario_id,
+                ino,
+                datasync,
+                started,
+            );
         }
 
         // Keep the durable cursor private until the complete ext4 durability
@@ -29852,11 +29852,13 @@ impl OpenFs {
             );
         }
 
-        let duration_us =
-            started.map_or(0, |s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX));
+        let duration_us = started.map_or(0, |s| {
+            u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         match self.dev.sync(cx) {
             Ok(()) => {
                 *flushed_through = (*flushed_through).max(durable_through);
+                drop(flushed_through);
                 info!(
                     target: "ffs::ext4::rw",
                     operation_id = %operation_id,
@@ -29877,6 +29879,56 @@ impl OpenFs {
                     scenario_id,
                     outcome = "rejected",
                     error_class = "device_sync_failed",
+                    ino = ino.0,
+                    datasync,
+                    duration_us,
+                    error = %err,
+                    "ext4_sync_rejected"
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// Flush the fsync through the append-only metadata WAL and emit the sync
+    /// outcome records. Split out of [`Self::ext4_sync_with_logging`]; the
+    /// caller has already checked `metadata_log.is_some()`.
+    fn ext4_sync_via_metadata_log(
+        &self,
+        cx: &Cx,
+        operation_id: &str,
+        scenario_id: &'static str,
+        ino: InodeNumber,
+        datasync: bool,
+        started: Option<Instant>,
+    ) -> ffs_error::Result<()> {
+        let result = self.flush_ext4_metadata_log(cx);
+        let duration_us = started.map_or(0, |s| {
+            u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
+        match result {
+            Ok(logged_blocks) => {
+                info!(
+                    target: "ffs::ext4::rw",
+                    operation_id = %operation_id,
+                    scenario_id,
+                    outcome = "applied",
+                    ino = ino.0,
+                    datasync,
+                    duration_us,
+                    flushed_blocks = logged_blocks,
+                    durability = "append_only_metadata_wal",
+                    "ext4_sync_applied"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                warn!(
+                    target: "ffs::ext4::rw",
+                    operation_id = %operation_id,
+                    scenario_id,
+                    outcome = "rejected",
+                    error_class = "metadata_wal_failed",
                     ino = ino.0,
                     datasync,
                     duration_us,
@@ -29956,11 +30008,12 @@ impl OpenFs {
     /// in the csum tree, which a tree-log commit does not write — only a full
     /// commit does. So a log carrying a regular EXTENT_DATA and nothing else names
     /// data whose checksums are, on disk, absent. The kernel replays the extent,
-    /// the file appears, and every read of it fails:
     ///
-    ///     BTRFS warning (device loop13): csum failed root 5 ino 2305 off 20480
-    ///                   csum 0xc9e5687d expected csum 0x00000000
-    ///     [Errno 5] Input/output error
+    /// ```text
+    /// BTRFS warning (device loop13): csum failed root 5 ino 2305 off 20480
+    ///               csum 0xc9e5687d expected csum 0x00000000
+    /// [Errno 5] Input/output error
+    /// ```
     ///
     /// Measured on a 64 KiB probe. The default 256-byte probe never saw it because
     /// btrfs stores small data INLINE, inside the EXTENT_DATA item, where the log
@@ -30003,8 +30056,8 @@ impl OpenFs {
         let min_disk = extents.iter().map(|(lo, _)| *lo).min().unwrap_or(0);
         let max_disk_end = extents.iter().map(|(_, hi)| *hi).max().unwrap_or(0);
         let sectorsize = u64::from(alloc.sectorsize);
-        let max_span = (ffs_btrfs::max_data_csums_per_item(alloc.nodesize) as u64)
-            .saturating_mul(sectorsize);
+        let max_span =
+            (ffs_btrfs::max_data_csums_per_item(alloc.nodesize) as u64).saturating_mul(sectorsize);
         let lo = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
             item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
@@ -30029,7 +30082,9 @@ impl OpenFs {
                 continue;
             }
             let sectors = (data.len() as u64) / csum_size.max(1);
-            let covered_end = key.offset.saturating_add(sectors.saturating_mul(sectorsize));
+            let covered_end = key
+                .offset
+                .saturating_add(sectors.saturating_mul(sectorsize));
             if extents
                 .iter()
                 .any(|(lo, hi)| key.offset < *hi && covered_end > *lo)
@@ -30110,18 +30165,15 @@ impl OpenFs {
         (needed, capacity)
     }
 
-    fn btrfs_prepare_tree_log_write(
-        sb: &BtrfsSuperblock,
+    /// Collect the tree-log items for EVERY inode fsync'd since the last full
+    /// commit (plus the data csums they name), sort them into leaf key order,
+    /// and validate the accumulated set. Split out of
+    /// [`Self::btrfs_prepare_tree_log_write`]; error semantics are unchanged —
+    /// every refusal hands the caller a full commit, which is always correct.
+    fn btrfs_collect_accumulated_tree_log_items(
         alloc: &mut BtrfsAllocState,
         canonical: u64,
-    /// Serialized tree-log write bundle from [`Self::btrfs_prepare_tree_log_write`]:
-    /// per-block `(bytenr, bytes)` pairs, the patched superblock image, and stats.
-    type BtrfsTreeLogWriteBundle = (Vec<(u64, Vec<u8>)>, Vec<u8>, BtrfsTreeLogWriteStats);
-
-    fn btrfs_prepare_tree_log_write(
-        subvol_objectid: u64,
-        on_disk_sb: &[u8],
-    ) -> Result<BtrfsTreeLogWriteBundle, FfsError> {
+    ) -> Result<Vec<BtrfsTreeItem>, FfsError> {
         // bd-dm01m: log EVERY inode fsync'd since the last full commit, not just this
         // one. `log_root` replaces the previous log rather than chaining to it, so a
         // log holding only the current inode makes every earlier fsync in this
@@ -30179,6 +30231,110 @@ impl OpenFs {
                 items.len()
             )));
         }
+        Ok(items)
+    }
+
+    /// Serialize the two tree-log blocks (log-tree leaf and log-ROOT-tree
+    /// root item) and patch the on-disk superblock bytes for the commit.
+    /// Split out of [`Self::btrfs_prepare_tree_log_write`]; the CALLER owns the
+    /// leak-site cleanup — every fallible step in here can orphan the two
+    /// freshly allocated blocks, so its `Err` must trigger the caller's free
+    /// of both (bd-0ajub).
+    fn btrfs_serialize_tree_log_blocks(
+        sb: &BtrfsSuperblock,
+        node: &BtrfsCowNode,
+        log_blocks: (u64, u64),
+        subvol_objectid: u64,
+        generation: u64,
+        nodesize: u32,
+        on_disk_sb: &[u8],
+    ) -> Result<BtrfsTreeLogPreparedBytes, FfsError> {
+        let (log_tree, log_root) = log_blocks;
+        let serialize_params = |bytenr: u64| BtrfsNodeSerializeParams {
+            fsid: sb.fsid,
+            chunk_tree_uuid: sb.fsid,
+            bytenr,
+            // The same header flags every other tree block we write carries, and
+            // for the same reason: WRITTEN, MIXED backref revision. This was 0,
+            // and a kernel replaying the log said so —
+            //
+            //     corrupt leaf: root=18446744073709551610 block=32473088 slot=0,
+            //                   invalid flag for leaf, WRITTEN not set
+            //     BTRFS warning: failed to read log tree
+            //
+            // The kernel's tree-checker rejects any leaf READ FROM DISK without
+            // WRITTEN, log tree or not; the flag distinguishes a block that has
+            // been written from one merely allocated. Our own reader never checked
+            // it, so the log round-tripped through us perfectly while being
+            // unreadable to the incumbent — the bd-73bi2 shape this bead is about.
+            flags: ffs_btrfs::BTRFS_HEADER_FLAGS_COMMITTED,
+            generation,
+            owner: BTRFS_TREE_LOG_OBJECTID,
+            nodesize,
+            level: 0, // both are leaves
+            child_generations: Vec::new(),
+            child_bytenrs: Vec::new(),
+            child_min_keys: Vec::new(),
+        };
+        let log_tree_bytes = node
+            .serialize(&serialize_params(log_tree))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // The log ROOT TREE: exactly one ROOT_ITEM, keyed by the subvolume whose
+        // log it names. Its generation must equal the log tree's, which is the
+        // bumped one — the kernel reads the log tree root expecting generation + 1
+        // (linux/btrfs_tree.h:682), so a mismatch here is a transid failure on the
+        // first block it dereferences.
+        let root_item = BtrfsCowNode::Leaf {
+            items: vec![BtrfsTreeItem {
+                key: BtrfsKey {
+                    // ⚠️ THE SUBVOLUME GOES IN THE OFFSET, NOT THE OBJECTID.
+                    // The kernel scans the log root tree for ROOT_ITEMs whose
+                    // objectid is TREE_LOG_OBJECTID and STOPS at the first key
+                    // that is not — so a ROOT_ITEM keyed by the subvolume (which
+                    // is what this wrote) ends the scan before it has replayed
+                    // anything. Observed exactly that way: the kernel logged
+                    // "start tree-log replay", mounted clean with no error, and
+                    // the fsynced file was simply not there.
+                    objectid: BTRFS_TREE_LOG_OBJECTID,
+                    item_type: BTRFS_ITEM_ROOT_ITEM,
+                    offset: subvol_objectid,
+                },
+                data: ffs_btrfs::tree_log_root_item(log_tree, 0, generation).into(),
+            }],
+        };
+        let log_root_bytes = root_item
+            .serialize(&serialize_params(log_root))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // ⚠️ PATCH THE ON-DISK BYTES; DO NOT REBUILD WITH `to_bytes`. This used
+        // `to_bytes`, which writes the fields BtrfsSuperblock models and zeroes
+        // everything else — including the `dev_item` at 0x65. A kernel handed
+        // the result refuses the filesystem outright:
+        //
+        //     BTRFS error: dev_item UUID does not match metadata fsid:
+        //                  7edb9d6b-... != 00000000-0000-0000-0000-000000000000
+        //     BTRFS error: open_ctree failed: -22
+        //
+        // Measured, not theorised: that is what a kernel mount said about an
+        // image carrying a tree log this code wrote. The FULL COMMIT path has
+        // always patched in place for exactly this reason and says so at its
+        // own superblock write; the tree-log path did not, and nothing caught
+        // it because our own reader repopulates dev_item from the chunk tree
+        // and never looks at that field.
+        let mut sb_bytes = on_disk_sb.to_vec();
+        BtrfsSuperblock::patch_tree_log_commit(&mut sb_bytes, log_root, 0);
+        Ok((log_tree_bytes, log_root_bytes, sb_bytes))
+    }
+
+    fn btrfs_prepare_tree_log_write(
+        sb: &BtrfsSuperblock,
+        alloc: &mut BtrfsAllocState,
+        canonical: u64,
+        subvol_objectid: u64,
+        on_disk_sb: &[u8],
+    ) -> Result<BtrfsTreeLogWriteBundle, FfsError> {
+        let items = Self::btrfs_collect_accumulated_tree_log_items(alloc, canonical)?;
 
         // TWO blocks, in the kernel's shape (bd-jhuob): the subvolume's LOG TREE
         // holding the items, and a LOG ROOT TREE holding one ROOT_ITEM that points
@@ -30237,98 +30393,15 @@ impl OpenFs {
         let nodesize = alloc.nodesize;
         let items_count = items.len();
         let node = BtrfsCowNode::Leaf { items };
-        let serialize_params = |bytenr: u64| BtrfsNodeSerializeParams {
-            fsid: sb.fsid,
-            chunk_tree_uuid: sb.fsid,
-            bytenr,
-            // The same header flags every other tree block we write carries, and
-            // for the same reason: WRITTEN, MIXED backref revision. This was 0,
-            // and a kernel replaying the log said so —
-            //
-            //     corrupt leaf: root=18446744073709551610 block=32473088 slot=0,
-            //                   invalid flag for leaf, WRITTEN not set
-            //     BTRFS warning: failed to read log tree
-            //
-            // The kernel's tree-checker rejects any leaf READ FROM DISK without
-            // WRITTEN, log tree or not; the flag distinguishes a block that has
-            // been written from one merely allocated. Our own reader never checked
-            // it, so the log round-tripped through us perfectly while being
-            // unreadable to the incumbent — the bd-73bi2 shape this bead is about.
-            flags: ffs_btrfs::BTRFS_HEADER_FLAGS_COMMITTED,
+        let prepared = Self::btrfs_serialize_tree_log_blocks(
+            sb,
+            &node,
+            (log_tree, log_root),
+            subvol_objectid,
             generation,
-            owner: BTRFS_TREE_LOG_OBJECTID,
             nodesize,
-            level: 0, // both are leaves
-            child_generations: Vec::new(),
-            child_bytenrs: Vec::new(),
-            child_min_keys: Vec::new(),
-        };
-        // ⚠️ EVERY FALLIBLE STEP FROM HERE TO THE SUPERBLOCK BYTES IS A LEAK SITE,
-        // which is why they are gathered into one region with a single cleanup.
-        // Both blocks are allocated and neither is reachable yet: the live set
-        // still names the PREVIOUS log, and the caller only learns about these two
-        // if this function returns Ok. A `?` anywhere in here therefore orphans
-        // them, one nodesize block each, per failed fsync (bd-0ajub).
-        //
-        // The rotation deliberately happens AFTER this region rather than before
-        // it. Rotating first would make the opposite failure — a serialize error
-        // would drop the retired list and leak the PREVIOUS log's blocks instead.
-        // Doing all fallible work first, then swapping the set, leaves no window
-        // where a failure loses track of either generation of blocks.
-        /// Three serialized blobs of the tree-log prepare region: the log-tree
-        /// root node, the log-tree leaf, and the superblock patch bytes.
-        type BtrfsTreeLogPreparedBytes = (Vec<u8>, Vec<u8>, Vec<u8>);
-        let prepared = (|| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), FfsError> {
-            let log_tree_bytes = node
-                .serialize(&serialize_params(log_tree))
-        let prepared = (|| -> Result<BtrfsTreeLogPreparedBytes, FfsError> {
-
-            // The log ROOT TREE: exactly one ROOT_ITEM, keyed by the subvolume whose
-            // log it names. Its generation must equal the log tree's, which is the
-            // bumped one — the kernel reads the log tree root expecting generation + 1
-            // (linux/btrfs_tree.h:682), so a mismatch here is a transid failure on the
-            // first block it dereferences.
-            let root_item = BtrfsCowNode::Leaf {
-                items: vec![BtrfsTreeItem {
-                    key: BtrfsKey {
-                        // ⚠️ THE SUBVOLUME GOES IN THE OFFSET, NOT THE OBJECTID.
-                        // The kernel scans the log root tree for ROOT_ITEMs whose
-                        // objectid is TREE_LOG_OBJECTID and STOPS at the first key
-                        // that is not — so a ROOT_ITEM keyed by the subvolume (which
-                        // is what this wrote) ends the scan before it has replayed
-                        // anything. Observed exactly that way: the kernel logged
-                        // "start tree-log replay", mounted clean with no error, and
-                        // the fsynced file was simply not there.
-                        objectid: BTRFS_TREE_LOG_OBJECTID,
-                        item_type: BTRFS_ITEM_ROOT_ITEM,
-                        offset: subvol_objectid,
-                    },
-                    data: ffs_btrfs::tree_log_root_item(log_tree, 0, generation).into(),
-                }],
-            };
-            let log_root_bytes = root_item
-                .serialize(&serialize_params(log_root))
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-            // ⚠️ PATCH THE ON-DISK BYTES; DO NOT REBUILD WITH `to_bytes`. This used
-            // `to_bytes`, which writes the fields BtrfsSuperblock models and zeroes
-            // everything else — including the `dev_item` at 0x65. A kernel handed
-            // the result refuses the filesystem outright:
-            //
-            //     BTRFS error: dev_item UUID does not match metadata fsid:
-            //                  7edb9d6b-... != 00000000-0000-0000-0000-000000000000
-            //     BTRFS error: open_ctree failed: -22
-            //
-            // Measured, not theorised: that is what a kernel mount said about an
-            // image carrying a tree log this code wrote. The FULL COMMIT path has
-            // always patched in place for exactly this reason and says so at its
-            // own superblock write; the tree-log path did not, and nothing caught
-            // it because our own reader repopulates dev_item from the chunk tree
-            // and never looks at that field.
-            let mut sb_bytes = on_disk_sb.to_vec();
-            BtrfsSuperblock::patch_tree_log_commit(&mut sb_bytes, log_root, 0);
-            Ok((log_tree_bytes, log_root_bytes, sb_bytes))
-        })();
+            on_disk_sb,
+        );
         let (log_tree_bytes, log_root_bytes, sb_bytes) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -30440,16 +30513,11 @@ impl OpenFs {
             Self::btrfs_checked_physical_span(mapping.physical, bytes.len())?;
             writes.push((ByteOffset(mapping.physical), bytes.as_slice()));
         }
-        let superblock_offset = ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
-            FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
-        })?);
-        Self::btrfs_publish_tree_log(
-            self.dev.as_ref(),
-            cx,
-            &writes,
-            superblock_offset,
-            &sb_bytes,
-        )?;
+        let superblock_offset =
+            ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
+                FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
+            })?);
+        Self::btrfs_publish_tree_log(self.dev.as_ref(), cx, &writes, superblock_offset, &sb_bytes)?;
         Ok(stats)
     }
 
@@ -30553,111 +30621,13 @@ impl OpenFs {
         // Durable-by-default (bd-jdo53): full transaction commit unless ephemeral mode
         // is explicitly requested via --btrfs-rw-ephemeral-ok flag.
         if self.btrfs_rw_ephemeral_ok {
-            // Ephemeral mode: tree-log only (fast fsync, non-durable across unmount)
-            debug!(
-                target: "ffs::btrfs::rw",
-                operation_id = %operation_id,
-                "ephemeral_mode_tree_log_only"
+            return self.btrfs_sync_ephemeral_tree_log(
+                cx,
+                &operation_id,
+                scenario_id,
+                ino,
+                datasync,
             );
-
-            // Flush committed MVCC block versions to the underlying device.
-            let base_dev = self.direct_block_device_adapter();
-            let flushed = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
-            self.clear_ext4_writable_group_desc_cache();
-            if flushed > 0 {
-                trace!(
-                    target: "ffs::btrfs::rw",
-                    operation_id = %operation_id,
-                    flushed_blocks = flushed,
-                    "mvcc_flush_before_sync"
-                );
-            }
-            // bd-dm01m: when the accumulated fsync set no longer fits one log leaf,
-            // fall back to a FULL COMMIT rather than failing the fsync or dropping
-            // items. A full commit supersedes the log and clears the accumulator, so
-            // the next fsync starts a fresh log — which is precisely what kernel
-            // btrfs does when its log cannot be used.
-            let tree_log = match self.btrfs_write_tree_log_for_sync(cx, ino) {
-                Ok(stats) => stats,
-                Err(FfsError::UnsupportedFeature(_)) => {
-                    info!(
-                        target: "ffs::btrfs::rw",
-                        operation_id = %operation_id,
-                        scenario_id,
-                        outcome = "applied",
-                        ino = ino.0,
-                        datasync,
-                        commit_strategy = "full_commit_log_overflow_fallback",
-                        "btrfs_sync_applied"
-                    );
-                    self.btrfs_full_transaction_commit(cx, &operation_id)?;
-                    return Ok(());
-                }
-                Err(other) => return Err(other),
-            };
-
-            match self.dev.sync(cx) {
-                Ok(()) => {
-                    // bd-0ajub: the new log_root is durable as of this sync, so the
-                    // block it superseded is now unreachable and its space can go
-                    // back. Freeing it BEFORE this point would let the next
-                    // allocation overwrite the log that a crash would still have to
-                    // replay from. A failure to free is logged, not propagated: the
-                    // fsync itself has already succeeded durably, and turning a
-                    // space-accounting problem into a failed fsync would be the worse
-                    // trade.
-                    for &(bytenr, num_bytes, is_metadata) in &tree_log.retired_log_blocks {
-                        if let Ok(alloc_mutex) = self.require_btrfs_alloc_state() {
-                            if let Err(err) = alloc_mutex
-                                .write()
-                                .extent_alloc
-                                .free_extent(bytenr, num_bytes, is_metadata)
-                            {
-                                warn!(
-                                    target: "ffs::btrfs::rw",
-                                    operation_id = %operation_id,
-                                    retired_log_bytenr = bytenr,
-                                    error = ?err,
-                                    "btrfs tree-log: superseded block not freed; space leaked"
-                                );
-                            }
-                        }
-                    }
-                    info!(
-                        target: "ffs::btrfs::rw",
-                        operation_id = %operation_id,
-                        scenario_id,
-                        outcome = "applied",
-                        ino = ino.0,
-                        datasync,
-                        flushed_blocks = flushed,
-                        commit_strategy = "tree_log_fast_fsync",
-                        tree_log_root = tree_log.log_root,
-                        tree_log_generation = tree_log.generation,
-                        tree_log_items = tree_log.items_count,
-                        tree_log_allocated_bytes = tree_log.allocated_bytes,
-                        tree_log_metadata_allocation = tree_log.metadata_allocation,
-                        full_commit_required = false,
-                        ephemeral_mode = true,
-                        "btrfs_sync_applied"
-                    );
-                    return Ok(());
-                }
-                Err(err) => {
-                    warn!(
-                        target: "ffs::btrfs::rw",
-                        operation_id = %operation_id,
-                        scenario_id,
-                        outcome = "rejected",
-                        error_class = "device_sync_failed",
-                        ino = ino.0,
-                        datasync,
-                        error = %err,
-                        "btrfs_sync_rejected"
-                    );
-                    return Err(err);
-                }
-            }
         }
 
         // Durable mode (default): full transaction commit
@@ -30681,7 +30651,143 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Ephemeral-mode (`--btrfs-rw-ephemeral-ok`) fsync: MVCC flush plus the
+    /// tree-log fast path instead of a full transaction commit. Split out of
+    /// [`Self::btrfs_sync_with_logging`]; the caller has already emitted the
+    /// start record and checked writability.
+    fn btrfs_sync_ephemeral_tree_log(
+        &self,
+        cx: &Cx,
+        operation_id: &str,
+        scenario_id: &'static str,
+        ino: InodeNumber,
+        datasync: bool,
+    ) -> ffs_error::Result<()> {
+        // Ephemeral mode: tree-log only (fast fsync, non-durable across unmount)
+        debug!(
+            target: "ffs::btrfs::rw",
+            operation_id = %operation_id,
+            "ephemeral_mode_tree_log_only"
+        );
+
+        // Flush committed MVCC block versions to the underlying device.
+        let base_dev = self.direct_block_device_adapter();
+        let flushed = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
+        self.clear_ext4_writable_group_desc_cache();
+        if flushed > 0 {
+            trace!(
+                target: "ffs::btrfs::rw",
+                operation_id = %operation_id,
+                flushed_blocks = flushed,
+                "mvcc_flush_before_sync"
+            );
+        }
+        // bd-dm01m: when the accumulated fsync set no longer fits one log leaf,
+        // fall back to a FULL COMMIT rather than failing the fsync or dropping
+        // items. A full commit supersedes the log and clears the accumulator, so
+        // the next fsync starts a fresh log — which is precisely what kernel
+        // btrfs does when its log cannot be used.
+        let tree_log = match self.btrfs_write_tree_log_for_sync(cx, ino) {
+            Ok(stats) => stats,
+            Err(FfsError::UnsupportedFeature(_)) => {
+                info!(
+                    target: "ffs::btrfs::rw",
+                    operation_id = %operation_id,
+                    scenario_id,
+                    outcome = "applied",
+                    ino = ino.0,
+                    datasync,
+                    commit_strategy = "full_commit_log_overflow_fallback",
+                    "btrfs_sync_applied"
+                );
+                return self
+                    .btrfs_full_transaction_commit(cx, operation_id)
+                    .map(|_| ());
+            }
+            Err(other) => return Err(other),
+        };
+
+        match self.dev.sync(cx) {
+            Ok(()) => {
+                // bd-0ajub: the new log_root is durable as of this sync, so the
+                // block it superseded is now unreachable and its space can go
+                // back. Freeing it BEFORE this point would let the next
+                // allocation overwrite the log that a crash would still have to
+                // replay from.
+                self.btrfs_free_retired_log_blocks(&tree_log.retired_log_blocks, operation_id);
+                info!(
+                    target: "ffs::btrfs::rw",
+                    operation_id = %operation_id,
+                    scenario_id,
+                    outcome = "applied",
+                    ino = ino.0,
+                    datasync,
+                    flushed_blocks = flushed,
+                    commit_strategy = "tree_log_fast_fsync",
+                    tree_log_root = tree_log.log_root,
+                    tree_log_generation = tree_log.generation,
+                    tree_log_items = tree_log.items_count,
+                    tree_log_allocated_bytes = tree_log.allocated_bytes,
+                    tree_log_metadata_allocation = tree_log.metadata_allocation,
+                    full_commit_required = false,
+                    ephemeral_mode = true,
+                    "btrfs_sync_applied"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                warn!(
+                    target: "ffs::btrfs::rw",
+                    operation_id = %operation_id,
+                    scenario_id,
+                    outcome = "rejected",
+                    error_class = "device_sync_failed",
+                    ino = ino.0,
+                    datasync,
+                    error = %err,
+                    "btrfs_sync_rejected"
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// Free the superseded tree-log blocks once the new `log_root` is durable
+    /// (bd-0ajub). A failed free is logged, never propagated: the fsync itself
+    /// has already succeeded durably, and turning a space-accounting problem
+    /// into a failed fsync would be the worse trade.
+    fn btrfs_free_retired_log_blocks(
+        &self,
+        retired_log_blocks: &[(u64, u64, bool)],
+        operation_id: &str,
+    ) {
+        for &(bytenr, num_bytes, is_metadata) in retired_log_blocks {
+            if let Ok(alloc_mutex) = self.require_btrfs_alloc_state() {
+                let free_result =
+                    alloc_mutex
+                        .write()
+                        .extent_alloc
+                        .free_extent(bytenr, num_bytes, is_metadata);
+                if let Err(err) = free_result {
+                    warn!(
+                        target: "ffs::btrfs::rw",
+                        operation_id = %operation_id,
+                        retired_log_bytenr = bytenr,
+                        error = ?err,
+                        "btrfs tree-log: superseded block not freed; space leaked"
+                    );
+                }
+            }
+        }
+    }
+
     // ── Btrfs durable writeback (bd-jdo53) ───────────────────────────────
+
+    /// Fixpoint iteration cap for the extent tree's self-description pass in
+    /// [`Self::btrfs_full_transaction_commit`]: how many times the commit may
+    /// re-account newly-allocated extent-tree blocks before refusing to write
+    /// a tree that does not converge (bd-k74ef).
+    const SELF_DESCRIBE_MAX_PASSES: usize = 8;
 
     /// Drive the full btrfs writeback pipeline: serialize CoW nodes, allocate
     /// metadata blocks, write in dependency order, and atomically commit the
@@ -30823,18 +30929,18 @@ impl OpenFs {
             }
             let mut device =
                 match ffs_btrfs::GrowthDevice::from_chunk_tree(&alloc.chunk_tree, sb.fsid) {
-                Ok(device) => device,
-                Err(e) => {
-                    // No DEV_ITEM, or more than one device: a filesystem this
-                    // code cannot describe is one it must not grow.
-                    warn!(
-                        target: "ffs::btrfs::alloc",
-                        error = ?e,
-                        "growth_unavailable_for_this_filesystem"
-                    );
-                    break 'grow;
-                }
-            };
+                    Ok(device) => device,
+                    Err(e) => {
+                        // No DEV_ITEM, or more than one device: a filesystem this
+                        // code cannot describe is one it must not grow.
+                        warn!(
+                            target: "ffs::btrfs::alloc",
+                            error = ?e,
+                            "growth_unavailable_for_this_filesystem"
+                        );
+                        break 'grow;
+                    }
+                };
             // The map the planner places against, read back from the tree so a
             // chunk allocated earlier in THIS loop is visible when the next one
             // is placed. The mount-time list would not show it, and placing
@@ -31495,7 +31601,6 @@ impl OpenFs {
         // and running it first means the root tree's item set is final before
         // the self-description fixpoint starts pinning positions.
         //
-        const SELF_DESCRIBE_MAX_PASSES: usize = 8;
         // The generation both the FST ROOT_ITEM and its block will carry (bd-73bi2).
         let mut fst_generation = new_gen;
         let fst_root_key = BtrfsKey {
@@ -31588,7 +31693,7 @@ impl OpenFs {
         let mut extent_pool: Vec<u64> = Vec::new();
         let mut root_pool: Vec<u64> = Vec::new();
         let mut self_describe_converged = false;
-        for _pass in 0..SELF_DESCRIBE_MAX_PASSES {
+        for _pass in 0..Self::SELF_DESCRIBE_MAX_PASSES {
             let mut changed = false;
 
             // extent_tree first, matching the pre-bd-k74ef allocation order so
@@ -31655,9 +31760,9 @@ impl OpenFs {
         }
         if !self_describe_converged {
             return Err(FfsError::Io(std::io::Error::other(format!(
-                "bd-k74ef: extent-tree self-description did not converge in \
-                 {SELF_DESCRIBE_MAX_PASSES} passes; refusing to write an image whose \
-                 extent tree does not describe its own blocks"
+                "bd-k74ef: extent-tree self-description did not converge in {} passes; \
+                 refusing to write an image whose extent tree does not describe its own blocks",
+                Self::SELF_DESCRIBE_MAX_PASSES
             ))));
         }
 
@@ -31732,7 +31837,8 @@ impl OpenFs {
                 let mut dev_executor = WritebackExecutor::new(dev_dag).without_crash_tracking();
                 dev_executor
                     .execute(|block, level| {
-                        let serialized = dev_disk_ctx.serialize_node(&alloc.dev_tree, block, level)?;
+                        let serialized =
+                            dev_disk_ctx.serialize_node(&alloc.dev_tree, block, level)?;
                         let node_bytes = serialized.len() as u64;
                         let logical = dev_disk_ctx.block_to_bytenr(block);
                         let physical = resolve_physical(logical)?;
@@ -31750,10 +31856,8 @@ impl OpenFs {
                     item_type: BTRFS_ITEM_ROOT_ITEM,
                     offset: 0,
                 };
-                let mut dev_root_item_data = alloc
-                    .root_tree
-                    .get(&dev_root_key)
-                    .ok_or_else(|| {
+                let mut dev_root_item_data =
+                    alloc.root_tree.get(&dev_root_key).ok_or_else(|| {
                         FfsError::Format(
                             "btrfs commit: a chunk was allocated but the filesystem has no \
                              DEV_TREE ROOT_ITEM to repoint"
@@ -32779,33 +32883,10 @@ impl OpenFs {
         // EEXIST (an entry with this exact name already exists), and the
         // hash-collision flag (the DIR_ITEM key already holds entries, so the
         // insert below must read-merge instead of using the batch fast path).
-        // These were three separate htree descents to the SAME key —
-        // `btrfs_preflight_dir_entry_insert` + `btrfs_lookup_dir_entry` + the inline
-        // collision `range` — which showed up as ~10% of create self-time in
-        // `for_each_in_range` (bd-btrcreate-dedup). The DIR_INDEX half of the old
-        // preflight probed (parent, DIR_INDEX, next_objectid), a fresh never-used
-        // sequence slot that is always empty for a create, so it is dropped.
-        let name_hash = ffs_btrfs::btrfs_name_hash(name);
-        let dir_item_key = BtrfsKey {
-            objectid: parent_oid,
-            item_type: BTRFS_ITEM_DIR_ITEM,
-            offset: u64::from(name_hash),
-        };
-        let existing_dir_items = alloc
-            .fs_tree
-            .range(&dir_item_key, &dir_item_key)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        let dir_item_collision = !existing_dir_items.is_empty();
-        for (_, payload) in &existing_dir_items {
-            let entries = Self::btrfs_parse_dir_items(
-                payload,
-                "malformed btrfs DIR_ITEM payload during create",
-            )?;
-            if entries.iter().any(|e| e.name == name) {
-                // POSIX requires EEXIST for a duplicate name.
-                return Err(FfsError::Exists);
-            }
-        }
+        // Shared with mkdir/mknod/symlink via `btrfs_create_dir_entry_check`
+        // (bd-btrcreate-dedup).
+        let (dir_item_key, dir_item_collision) =
+            Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
         let new_oid = alloc.next_objectid;
         alloc.next_objectid = alloc.next_objectid.saturating_add(1);
@@ -32891,29 +32972,13 @@ impl OpenFs {
             // disjoint fields, applied in the SAME COW transaction as the four
             // inserts via insert_many_then_update. All parent-side ops (DIR_ITEM,
             // DIR_INDEX, the INODE_ITEM update) then COW the parent subtree once.
-            let mut parent_inode = validated_parent_inode;
-            let size_delta = Self::btrfs_dir_entry_size_delta(name.len());
-            parent_inode.size = i64::try_from(parent_inode.size)
-                .ok()
-                .and_then(|size| size.checked_add(size_delta))
-                .and_then(|size| u64::try_from(size).ok())
-                .ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: format!(
-                        "btrfs dir {parent_oid} size adjustment out of range (size={}, delta={size_delta})",
-                        parent_inode.size
-                    ),
-                })?;
-            parent_inode.mtime_sec = secs;
-            parent_inode.mtime_nsec = nanos;
-            parent_inode.ctime_sec = secs;
-            parent_inode.ctime_nsec = nanos;
-            let parent_key = BtrfsKey {
-                objectid: parent_oid,
-                item_type: BTRFS_ITEM_INODE_ITEM,
-                offset: 0,
-            };
-            let parent_bytes = parent_inode.to_bytes();
+            let (parent_key, parent_bytes) = Self::btrfs_batch_parent_dir_update(
+                parent_oid,
+                name.len(),
+                validated_parent_inode,
+                secs,
+                nanos,
+            )?;
             let inserts: [(BtrfsKey, &[u8]); 4] = [
                 (inode_key, inode_bytes.as_slice()),
                 (dir_item_key, dir_bytes.as_slice()),
@@ -32929,6 +32994,42 @@ impl OpenFs {
         drop(alloc);
 
         Ok(self.btrfs_inode_to_attr(new_oid, &inode))
+    }
+
+    /// Build the coalesced parent INODE_ITEM update for a batched fresh-entry
+    /// insert (bd-cowbatch): i_size += 2*name_len plus the mtime/ctime touch,
+    /// applied in the SAME COW transaction as the four inserts so all
+    /// parent-side ops COW the parent subtree once. The caller supplies the
+    /// already-read parent inode; returns the parent key and patched bytes.
+    fn btrfs_batch_parent_dir_update(
+        parent_oid: u64,
+        name_len: usize,
+        mut parent_inode: BtrfsInodeItem,
+        secs: u64,
+        nanos: u32,
+    ) -> ffs_error::Result<(BtrfsKey, Vec<u8>)> {
+        let size_delta = Self::btrfs_dir_entry_size_delta(name_len);
+        parent_inode.size = i64::try_from(parent_inode.size)
+            .ok()
+            .and_then(|size| size.checked_add(size_delta))
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "btrfs dir {parent_oid} size adjustment out of range (size={}, delta={size_delta})",
+                    parent_inode.size
+                ),
+            })?;
+        parent_inode.mtime_sec = secs;
+        parent_inode.mtime_nsec = nanos;
+        parent_inode.ctime_sec = secs;
+        parent_inode.ctime_nsec = nanos;
+        let parent_key = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        Ok((parent_key, parent_inode.to_bytes()))
     }
 
     /// Create a directory in a btrfs filesystem.
@@ -33026,29 +33127,13 @@ impl OpenFs {
                 item_type: BTRFS_ITEM_INODE_REF,
                 offset: parent_oid,
             };
-            let mut parent_inode = self.btrfs_read_inode_from_tree(&alloc, parent_oid)?;
-            let size_delta = Self::btrfs_dir_entry_size_delta(name.len());
-            parent_inode.size = i64::try_from(parent_inode.size)
-                .ok()
-                .and_then(|size| size.checked_add(size_delta))
-                .and_then(|size| u64::try_from(size).ok())
-                .ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: format!(
-                        "btrfs dir {parent_oid} size adjustment out of range (size={}, delta={size_delta})",
-                        parent_inode.size
-                    ),
-                })?;
-            parent_inode.mtime_sec = secs;
-            parent_inode.mtime_nsec = nanos;
-            parent_inode.ctime_sec = secs;
-            parent_inode.ctime_nsec = nanos;
-            let parent_key = BtrfsKey {
-                objectid: parent_oid,
-                item_type: BTRFS_ITEM_INODE_ITEM,
-                offset: 0,
-            };
-            let parent_bytes = parent_inode.to_bytes();
+            let (parent_key, parent_bytes) = Self::btrfs_batch_parent_dir_update(
+                parent_oid,
+                name.len(),
+                self.btrfs_read_inode_from_tree(&alloc, parent_oid)?,
+                secs,
+                nanos,
+            )?;
             let inserts: [(BtrfsKey, &[u8]); 4] = [
                 (inode_key, inode_bytes.as_slice()),
                 (dir_item_key, dir_bytes.as_slice()),
@@ -33238,10 +33323,7 @@ impl OpenFs {
 
         let mut alloc = alloc_mutex.write();
         self.btrfs_require_directory_inode(&alloc, parent_oid)?;
-        if self
-            .btrfs_lookup_dir_entry(&alloc, parent_oid, name)
-            .is_ok()
-        {
+        if Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name).is_ok() {
             return Err(FfsError::Exists);
         }
 
@@ -33341,11 +33423,7 @@ impl OpenFs {
         Self::validate_single_path_component(name)?;
 
         let mut alloc = alloc_mutex.write();
-        self.btrfs_require_directory_inode(&alloc, parent_oid)?;
-        if self
-            .btrfs_lookup_dir_entry(&alloc, parent_oid, name)
-            .is_ok()
-        {
+        if Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name).is_ok() {
             return Err(FfsError::Exists);
         }
 
@@ -33545,76 +33623,20 @@ impl OpenFs {
         Ok(self.btrfs_inode_to_attr(new_oid, &inode))
     }
 
-    /// Unlink a file or directory from a btrfs filesystem.
-    fn btrfs_unlink_impl(
-        &self,
-        _cx: &Cx,
-        _scope: &mut RequestScope,
-        parent: InodeNumber,
+    /// Probe whether an unlink reduces to exactly four clean key-removes plus
+    /// one coalesced parent INODE_ITEM update (bd-cowbatch): a linked-once
+    /// inode with NO other items whose name does not hash-collide. Returns the
+    /// keys to remove when batchable, else `None` — every doubtful case falls
+    /// back to the proven per-op path. No side effects.
+    fn btrfs_unlink_batchable_keys(
+        alloc: &BtrfsAllocState,
+        parent_oid: u64,
+        child_oid: u64,
+        child: &BtrfsDirItem,
         name: &[u8],
-        expect_dir: bool,
-    ) -> ffs_error::Result<()> {
-        self.require_btrfs_rw_allowed("unlink")?;
-        Self::validate_single_path_component(name)?;
-        let alloc_mutex = self.require_btrfs_alloc_state()?;
-        let parent_oid = self.btrfs_canonical_inode(parent)?;
-        let (secs, nanos) = Self::btrfs_now_timestamp();
-
-        let mut alloc = alloc_mutex.write();
-        self.btrfs_require_directory_inode(&alloc, parent_oid)?;
-
-        // Lookup the child entry in the parent directory.
-        let child = self.btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
-        let child_oid = child.child_objectid;
-
-        // Validate file type.
-        if expect_dir && child.file_type != BTRFS_FT_DIR {
-            return Err(FfsError::NotDirectory);
-        }
-        if !expect_dir && child.file_type == BTRFS_FT_DIR {
-            return Err(FfsError::IsDirectory);
-        }
-
-        // Immutable and append-only files/dirs cannot be deleted: the kernel's
-        // may_delete returns EPERM, before the dir-empty (ENOTEMPTY) check
-        // (matches ext4's delete path; bd-rmgwc). Checked before any mutation.
-        let victim_inode = self.btrfs_read_inode_from_tree(&alloc, child_oid)?;
-        if victim_inode.flags & (BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND) != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
-        }
-
-        // If removing a directory, verify it's empty.
-        if expect_dir && !self.btrfs_dir_is_empty(&alloc, child_oid)? {
-            return Err(FfsError::NotEmpty);
-        }
-
-        let dir_index = Self::btrfs_require_inode_ref_index(&alloc, child_oid, parent_oid, name)?;
-        // btrfs directories have nlink == 1 (not 2 + subdirs), so removing the
-        // sole link drops a dir as well as a file by -1; the parent's nlink does
-        // not change for a removed subdirectory (bd-egyf6).
-        self.btrfs_validate_nlink_adjustment(&alloc, child_oid, -1)?;
-
-        // `victim_inode` was read above before any mutation to enforce the
-        // immutable/append-only rule. The validated -1 adjustment below is the
-        // only link-count mutation here, so it also determines whether the
-        // final link is being removed.
-        let child_will_be_purged = victim_inode.nlink <= 1;
-        if child_will_be_purged {
-            Self::btrfs_validate_purgeable_items(&alloc, child_oid)?;
-        }
-
-        // bd-cowbatch: when the whole delete reduces to exactly 4 clean key-removes
-        // + one parent INODE_ITEM update — a linked-once inode (nlink<=1) with NO
-        // other items (no extents/xattrs/extra refs) whose name does NOT hash-
-        // collide — batch the removes via remove_many + one coalesced parent update
-        // (i_size -= 2*name_len AND mtime/ctime, disjoint fields) instead of ~5
-        // separate path-COWs. CONSERVATIVE so there is NO false positive (=> no
-        // data-loss risk): a hash collision makes the stored DIR_ITEM bytes LONGER
-        // than this single entry, any extent/xattr/extra ref makes the child item
-        // count != 2, and a multi-link makes child_will_be_purged false — every
-        // such case falls back to the proven per-op path below. Byte-identical to it
-        // (same 4 keys removed, same final parent value; remove_many is byte-
-        // identical to sequential delete).
+        dir_index: u64,
+        child_will_be_purged: bool,
+    ) -> ffs_error::Result<Option<[BtrfsKey; 4]>> {
         let dir_item_key = BtrfsKey {
             objectid: parent_oid,
             item_type: BTRFS_ITEM_DIR_ITEM,
@@ -33667,8 +33689,91 @@ impl OpenFs {
             && child_items
                 .iter()
                 .any(|(k, _)| k.item_type == BTRFS_ITEM_INODE_REF && k.offset == parent_oid);
+        Ok(batchable.then_some([dir_item_key, dir_index_key, ref_key, inode_key]))
+    }
 
-        if batchable {
+    /// Unlink a file or directory from a btrfs filesystem.
+    fn btrfs_unlink_impl(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &[u8],
+        expect_dir: bool,
+    ) -> ffs_error::Result<()> {
+        self.require_btrfs_rw_allowed("unlink")?;
+        Self::validate_single_path_component(name)?;
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let (secs, nanos) = Self::btrfs_now_timestamp();
+
+        let mut alloc = alloc_mutex.write();
+        self.btrfs_require_directory_inode(&alloc, parent_oid)?;
+
+        // Lookup the child entry in the parent directory.
+        let child = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+        let child_oid = child.child_objectid;
+
+        // Validate file type.
+        if expect_dir && child.file_type != BTRFS_FT_DIR {
+            return Err(FfsError::NotDirectory);
+        }
+        if !expect_dir && child.file_type == BTRFS_FT_DIR {
+            return Err(FfsError::IsDirectory);
+        }
+
+        // Immutable and append-only files/dirs cannot be deleted: the kernel's
+        // may_delete returns EPERM, before the dir-empty (ENOTEMPTY) check
+        // (matches ext4's delete path; bd-rmgwc). Checked before any mutation.
+        let victim_inode = self.btrfs_read_inode_from_tree(&alloc, child_oid)?;
+        if victim_inode.flags & (BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND) != 0 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+
+        // If removing a directory, verify it's empty.
+        if expect_dir && !self.btrfs_dir_is_empty(&alloc, child_oid)? {
+            return Err(FfsError::NotEmpty);
+        }
+
+        let dir_index = Self::btrfs_require_inode_ref_index(&alloc, child_oid, parent_oid, name)?;
+        // btrfs directories have nlink == 1 (not 2 + subdirs), so removing the
+        // sole link drops a dir as well as a file by -1; the parent's nlink does
+        // not change for a removed subdirectory (bd-egyf6).
+        self.btrfs_validate_nlink_adjustment(&alloc, child_oid, -1)?;
+
+        // `victim_inode` was read above before any mutation to enforce the
+        // immutable/append-only rule. The validated -1 adjustment below is the
+        // only link-count mutation here, so it also determines whether the
+        // final link is being removed.
+        let child_will_be_purged = victim_inode.nlink <= 1;
+        if child_will_be_purged {
+            Self::btrfs_validate_purgeable_items(&alloc, child_oid)?;
+        }
+
+        // bd-cowbatch: when the whole delete reduces to exactly 4 clean key-removes
+        // + one parent INODE_ITEM update — a linked-once inode (nlink<=1) with NO
+        // other items (no extents/xattrs/extra refs) whose name does NOT hash-
+        // collide — batch the removes via remove_many + one coalesced parent update
+        // (i_size -= 2*name_len AND mtime/ctime, disjoint fields) instead of ~5
+        // separate path-COWs. CONSERVATIVE so there is NO false positive (=> no
+        // data-loss risk): a hash collision makes the stored DIR_ITEM bytes LONGER
+        // than this single entry, any extent/xattr/extra ref makes the child item
+        // count != 2, and a multi-link makes child_will_be_purged false — every
+        // such case falls back to the proven per-op path below. Byte-identical to it
+        // (same 4 keys removed, same final parent value; remove_many is byte-
+        // identical to sequential delete).
+
+        if let Some([dir_item_key, dir_index_key, ref_key, inode_key]) =
+            Self::btrfs_unlink_batchable_keys(
+                &alloc,
+                parent_oid,
+                child_oid,
+                &child,
+                name,
+                dir_index,
+                child_will_be_purged,
+            )?
+        {
             let mut parent_inode = self.btrfs_read_inode_from_tree(&alloc, parent_oid)?;
             let size_delta = Self::btrfs_dir_entry_size_delta(name.len());
             parent_inode.size = i64::try_from(parent_inode.size)
@@ -33729,7 +33834,7 @@ impl OpenFs {
         new_name: &[u8],
         child_is_dir: bool,
     ) -> ffs_error::Result<bool> {
-        let target = match self.btrfs_lookup_dir_entry(alloc, new_parent_oid, new_name) {
+        let target = match Self::btrfs_lookup_dir_entry(alloc, new_parent_oid, new_name) {
             Ok(target) => target,
             Err(FfsError::NotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
@@ -33760,6 +33865,200 @@ impl OpenFs {
         }
     }
 
+    /// Probe whether a rename reduces to ONE batched COW transaction
+    /// (bd-cowbatch): only for a SAME-DIR rename with no target collision and
+    /// single old DIR_ITEM/INODE_REF entries. Returns the three keys driving
+    /// the batch — old/new DIR_ITEM and the INODE_REF — when batchable, else
+    /// `None`. Probing has no side effects; range errors are ignored exactly
+    /// as the inline probe did (`unwrap_or_default`).
+    fn btrfs_probe_same_dir_rename_batch(
+        alloc: &BtrfsAllocState,
+        parent_oid: u64,
+        old_name: &[u8],
+        new_name: &[u8],
+        old_entry: &BtrfsDirItem,
+        old_dir_index: u64,
+    ) -> Option<(BtrfsKey, BtrfsKey, BtrfsKey)> {
+        let old_dir_item_key = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_ITEM,
+            offset: u64::from(ffs_btrfs::btrfs_name_hash(old_name)),
+        };
+        let new_dir_item_key = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_ITEM,
+            offset: u64::from(ffs_btrfs::btrfs_name_hash(new_name)),
+        };
+        let ref_key = BtrfsKey {
+            objectid: old_entry.child_objectid,
+            item_type: BTRFS_ITEM_INODE_REF,
+            offset: parent_oid,
+        };
+        let old_dir_items = alloc
+            .fs_tree
+            .range(&old_dir_item_key, &old_dir_item_key)
+            .unwrap_or_default();
+        let new_dir_items = alloc
+            .fs_tree
+            .range(&new_dir_item_key, &new_dir_item_key)
+            .unwrap_or_default();
+        let old_refs = alloc.fs_tree.range(&ref_key, &ref_key).unwrap_or_default();
+        let single_item_len = old_entry.try_to_bytes().map(|b| b.len());
+        let single_ref_len =
+            Self::btrfs_serialize_inode_ref_payload(&[(old_dir_index, old_name.to_vec())])
+                .map(|b| b.len());
+        (new_dir_items.is_empty()
+            && old_dir_items.len() == 1
+            && matches!(single_item_len, Ok(len) if old_dir_items[0].1.len() == len)
+            && old_refs.len() == 1
+            && matches!(single_ref_len, Ok(len) if old_refs[0].1.len() == len))
+        .then_some((old_dir_item_key, new_dir_item_key, ref_key))
+    }
+
+    /// Apply a batched SAME-DIR rename in ONE COW transaction (bd-cowbatch):
+    /// remove the old DIR_ITEM/DIR_INDEX/INODE_REF, insert the new DIR_ITEM +
+    /// DIR_INDEX + INODE_REF, and apply the coalesced parent INODE_ITEM update
+    /// (i_size delta plus mtime/ctime). Byte-identical to sequential ops.
+    fn btrfs_apply_same_dir_rename_batch(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        ctx: &BtrfsRenameCtx<'_>,
+        old_dir_item_key: BtrfsKey,
+        new_dir_item_key: BtrfsKey,
+        ref_key: BtrfsKey,
+    ) -> ffs_error::Result<()> {
+        let new_seq = Self::btrfs_consume_dir_index_seq(alloc, ctx.parent_oid)?;
+        let new_dir_item = BtrfsDirItem {
+            child_objectid: ctx.child.child_objectid,
+            child_key_type: ctx.child.child_key_type,
+            child_key_offset: ctx.child.child_key_offset,
+            file_type: ctx.child.file_type,
+            name: ctx.new_name.to_vec(),
+        };
+        let new_dir_bytes = new_dir_item
+            .try_to_bytes()
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        let new_ref_payload =
+            Self::btrfs_serialize_inode_ref_payload(&[(new_seq, ctx.new_name.to_vec())])?;
+        let old_dir_index_key = BtrfsKey {
+            objectid: ctx.parent_oid,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: ctx.child_dir_index,
+        };
+        let new_dir_index_key = BtrfsKey {
+            objectid: ctx.parent_oid,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: new_seq,
+        };
+        let mut parent_inode = self.btrfs_read_inode_from_tree(alloc, ctx.parent_oid)?;
+        let delta = Self::btrfs_dir_entry_size_delta(ctx.new_name.len())
+            - Self::btrfs_dir_entry_size_delta(ctx.name.len());
+        parent_inode.size = i64::try_from(parent_inode.size)
+            .ok()
+            .and_then(|size| size.checked_add(delta))
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "btrfs dir {} rename size adjustment out of range (size={}, delta={delta})",
+                    ctx.parent_oid, parent_inode.size
+                ),
+            })?;
+        parent_inode.mtime_sec = ctx.secs;
+        parent_inode.mtime_nsec = ctx.nanos;
+        parent_inode.ctime_sec = ctx.secs;
+        parent_inode.ctime_nsec = ctx.nanos;
+        let parent_key = BtrfsKey {
+            objectid: ctx.parent_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        let parent_bytes = parent_inode.to_bytes();
+        let inserts: [(BtrfsKey, &[u8]); 3] = [
+            (new_dir_item_key, new_dir_bytes.as_slice()),
+            (new_dir_index_key, new_dir_bytes.as_slice()),
+            (ref_key, new_ref_payload.as_slice()),
+        ];
+        alloc
+            .fs_tree
+            .remove_many_then_insert_many_then_update(
+                &[old_dir_item_key, old_dir_index_key, ref_key],
+                &inserts,
+                &parent_key,
+                parent_bytes.as_slice(),
+            )
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        Ok(())
+    }
+
+    /// Per-op fallback for a rename that cannot be batched: remove old entry +
+    /// INODE_REF, clobber an existing target (nlink cleanup + purge), insert in
+    /// the new location, and touch the parents' timestamps.
+    fn btrfs_apply_rename_per_op(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        ctx: &BtrfsRenameCtx<'_>,
+        target_will_be_purged: bool,
+    ) -> ffs_error::Result<()> {
+        // Remove old entry and its INODE_REF.
+        self.btrfs_remove_dir_entry(alloc, ctx.parent_oid, ctx.name, ctx.child_dir_index)?;
+        Self::btrfs_remove_inode_ref(alloc, ctx.child.child_objectid, ctx.parent_oid, ctx.name)?;
+
+        // If target exists, remove it first and handle nlink cleanup.
+        let target = match Self::btrfs_lookup_dir_entry(alloc, ctx.new_parent_oid, ctx.new_name) {
+            Ok(target) => Some(target),
+            Err(FfsError::NotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
+        if let Some(target) = target {
+            let target_oid = target.child_objectid;
+            let target_is_dir = target.file_type == BTRFS_FT_DIR;
+            let target_dir_index = Self::btrfs_require_inode_ref_index(
+                alloc,
+                target_oid,
+                ctx.new_parent_oid,
+                ctx.new_name,
+            )?;
+            self.btrfs_remove_dir_entry(alloc, ctx.new_parent_oid, ctx.new_name, target_dir_index)?;
+            Self::btrfs_remove_inode_ref(alloc, target_oid, ctx.new_parent_oid, ctx.new_name)?;
+            // Removing the overwritten target drops its single link (-1 for both
+            // files and btrfs directories); the new parent's nlink is unchanged
+            // (bd-egyf6). `target_is_dir` no longer affects the link math.
+            let _ = target_is_dir;
+            self.btrfs_adjust_nlink(alloc, target_oid, -1, ctx.secs, ctx.nanos)?;
+            let target_inode = self.btrfs_read_inode_from_tree(alloc, target_oid)?;
+            if target_inode.nlink == 0 {
+                debug_assert!(target_will_be_purged);
+                self.btrfs_purge_inode(alloc, target_oid)?;
+            }
+        }
+
+        // Insert in new location.
+        let dir_item = BtrfsDirItem {
+            child_objectid: ctx.child.child_objectid,
+            child_key_type: ctx.child.child_key_type,
+            child_key_offset: ctx.child.child_key_offset,
+            file_type: ctx.child.file_type,
+            name: ctx.new_name.to_vec(),
+        };
+        let dir_index_seq = self.btrfs_insert_dir_entry(alloc, ctx.new_parent_oid, &dir_item)?;
+        Self::btrfs_insert_inode_ref(
+            alloc,
+            ctx.child.child_objectid,
+            ctx.new_parent_oid,
+            ctx.new_name,
+            dir_index_seq,
+        )?;
+
+        // Moving a directory across parents does not change either parent's
+        // nlink in btrfs (directories stay at nlink == 1) — bd-egyf6.
+        self.btrfs_touch_inode_times(alloc, ctx.parent_oid, ctx.secs, ctx.nanos)?;
+        if ctx.new_parent_oid != ctx.parent_oid {
+            self.btrfs_touch_inode_times(alloc, ctx.new_parent_oid, ctx.secs, ctx.nanos)?;
+        }
+        Ok(())
+    }
+
     /// Rename a btrfs directory entry.
     fn btrfs_rename(
         &self,
@@ -33782,7 +34081,7 @@ impl OpenFs {
         self.btrfs_require_directory_inode(&alloc, parent_oid)?;
         self.btrfs_require_directory_inode(&alloc, new_parent_oid)?;
 
-        let child = self.btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+        let child = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
         let child_is_dir = child.file_type == BTRFS_FT_DIR;
         let child_dir_index =
             Self::btrfs_require_inode_ref_index(&alloc, child.child_objectid, parent_oid, name)?;
@@ -33797,7 +34096,7 @@ impl OpenFs {
         // would remove the source name and decrement the shared inode's nlink,
         // silently destroying a hard link (bd-f7q6k). A directory cannot be
         // hard-linked, so this only fires for regular files.
-        if let Ok(existing_target) = self.btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name)
+        if let Ok(existing_target) = Self::btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name)
             && existing_target.child_objectid == child.child_objectid
         {
             return Ok(());
@@ -33830,7 +34129,7 @@ impl OpenFs {
         if src_inode.flags & (BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND) != 0 {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
         }
-        if let Ok(victim) = self.btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name) {
+        if let Ok(victim) = Self::btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name) {
             let victim_inode = self.btrfs_read_inode_from_tree(&alloc, victim.child_objectid)?;
             if victim_inode.flags & (BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND) != 0 {
                 return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
@@ -33848,166 +34147,40 @@ impl OpenFs {
         // proven per-op path. Byte-identical to it (same keys, same fresh DIR_INDEX
         // seq, same final parent value; remove_many/insert_many byte-identical to
         // sequential).
-        let old_dir_item_key = BtrfsKey {
-            objectid: parent_oid,
-            item_type: BTRFS_ITEM_DIR_ITEM,
-            offset: u64::from(ffs_btrfs::btrfs_name_hash(name)),
-        };
-        let new_dir_item_key = BtrfsKey {
-            objectid: new_parent_oid,
-            item_type: BTRFS_ITEM_DIR_ITEM,
-            offset: u64::from(ffs_btrfs::btrfs_name_hash(new_name)),
-        };
-        let ref_key = BtrfsKey {
-            objectid: child.child_objectid,
-            item_type: BTRFS_ITEM_INODE_REF,
-            offset: parent_oid,
-        };
-        let rename_batchable = parent_oid == new_parent_oid && {
-            let old_dir_items = alloc
-                .fs_tree
-                .range(&old_dir_item_key, &old_dir_item_key)
-                .unwrap_or_default();
-            let new_dir_items = alloc
-                .fs_tree
-                .range(&new_dir_item_key, &new_dir_item_key)
-                .unwrap_or_default();
-            let old_refs = alloc.fs_tree.range(&ref_key, &ref_key).unwrap_or_default();
-            let single_item_len = child.try_to_bytes().map(|b| b.len());
-            let single_ref_len =
-                Self::btrfs_serialize_inode_ref_payload(&[(child_dir_index, name.to_vec())])
-                    .map(|b| b.len());
-            new_dir_items.is_empty()
-                && old_dir_items.len() == 1
-                && matches!(single_item_len, Ok(len) if old_dir_items[0].1.len() == len)
-                && old_refs.len() == 1
-                && matches!(single_ref_len, Ok(len) if old_refs[0].1.len() == len)
-        };
-        if rename_batchable {
-            let new_seq = Self::btrfs_consume_dir_index_seq(&mut alloc, parent_oid)?;
-            let new_dir_item = BtrfsDirItem {
-                child_objectid: child.child_objectid,
-                child_key_type: child.child_key_type,
-                child_key_offset: child.child_key_offset,
-                file_type: child.file_type,
-                name: new_name.to_vec(),
-            };
-            let new_dir_bytes = new_dir_item
-                .try_to_bytes()
-                .map_err(|e| parse_to_ffs_error(&e))?;
-            let new_ref_payload =
-                Self::btrfs_serialize_inode_ref_payload(&[(new_seq, new_name.to_vec())])?;
-            let old_dir_index_key = BtrfsKey {
-                objectid: parent_oid,
-                item_type: BTRFS_ITEM_DIR_INDEX,
-                offset: child_dir_index,
-            };
-            let new_dir_index_key = BtrfsKey {
-                objectid: parent_oid,
-                item_type: BTRFS_ITEM_DIR_INDEX,
-                offset: new_seq,
-            };
-            let mut parent_inode = self.btrfs_read_inode_from_tree(&alloc, parent_oid)?;
-            let delta = Self::btrfs_dir_entry_size_delta(new_name.len())
-                - Self::btrfs_dir_entry_size_delta(name.len());
-            parent_inode.size = i64::try_from(parent_inode.size)
-                .ok()
-                .and_then(|size| size.checked_add(delta))
-                .and_then(|size| u64::try_from(size).ok())
-                .ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: format!(
-                        "btrfs dir {parent_oid} rename size adjustment out of range (size={}, delta={delta})",
-                        parent_inode.size
-                    ),
-                })?;
-            parent_inode.mtime_sec = secs;
-            parent_inode.mtime_nsec = nanos;
-            parent_inode.ctime_sec = secs;
-            parent_inode.ctime_nsec = nanos;
-            let parent_key = BtrfsKey {
-                objectid: parent_oid,
-                item_type: BTRFS_ITEM_INODE_ITEM,
-                offset: 0,
-            };
-            let parent_bytes = parent_inode.to_bytes();
-            let inserts: [(BtrfsKey, &[u8]); 3] = [
-                (new_dir_item_key, new_dir_bytes.as_slice()),
-                (new_dir_index_key, new_dir_bytes.as_slice()),
-                (ref_key, new_ref_payload.as_slice()),
-            ];
-            alloc
-                .fs_tree
-                .remove_many_then_insert_many_then_update(
-                    &[old_dir_item_key, old_dir_index_key, ref_key],
-                    &inserts,
-                    &parent_key,
-                    parent_bytes.as_slice(),
-                )
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        } else {
-            // Remove old entry and its INODE_REF.
-            self.btrfs_remove_dir_entry(&mut alloc, parent_oid, name, child_dir_index)?;
-            Self::btrfs_remove_inode_ref(&mut alloc, child.child_objectid, parent_oid, name)?;
-
-            // If target exists, remove it first and handle nlink cleanup.
-            let target = match self.btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name) {
-                Ok(target) => Some(target),
-                Err(FfsError::NotFound(_)) => None,
-                Err(err) => return Err(err),
-            };
-            if let Some(target) = target {
-                let target_oid = target.child_objectid;
-                let target_is_dir = target.file_type == BTRFS_FT_DIR;
-                let target_dir_index = Self::btrfs_require_inode_ref_index(
-                    &alloc,
-                    target_oid,
-                    new_parent_oid,
-                    new_name,
-                )?;
-                self.btrfs_remove_dir_entry(
-                    &mut alloc,
-                    new_parent_oid,
-                    new_name,
-                    target_dir_index,
-                )?;
-                Self::btrfs_remove_inode_ref(&mut alloc, target_oid, new_parent_oid, new_name)?;
-                // Removing the overwritten target drops its single link (-1 for both
-                // files and btrfs directories); the new parent's nlink is unchanged
-                // (bd-egyf6). `target_is_dir` no longer affects the link math.
-                let _ = target_is_dir;
-                self.btrfs_adjust_nlink(&mut alloc, target_oid, -1, secs, nanos)?;
-                let target_inode = self.btrfs_read_inode_from_tree(&alloc, target_oid)?;
-                if target_inode.nlink == 0 {
-                    debug_assert!(target_will_be_purged);
-                    self.btrfs_purge_inode(&mut alloc, target_oid)?;
-                }
-            }
-
-            // Insert in new location.
-            let dir_item = BtrfsDirItem {
-                child_objectid: child.child_objectid,
-                child_key_type: child.child_key_type,
-                child_key_offset: child.child_key_offset,
-                file_type: child.file_type,
-                name: new_name.to_vec(),
-            };
-            let dir_index_seq =
-                self.btrfs_insert_dir_entry(&mut alloc, new_parent_oid, &dir_item)?;
-            Self::btrfs_insert_inode_ref(
-                &mut alloc,
-                child.child_objectid,
-                new_parent_oid,
+        let rename_batch_keys = if parent_oid == new_parent_oid {
+            Self::btrfs_probe_same_dir_rename_batch(
+                &alloc,
+                parent_oid,
+                name,
                 new_name,
-                dir_index_seq,
-            )?;
-
-            // Moving a directory across parents does not change either parent's
-            // nlink in btrfs (directories stay at nlink == 1) — bd-egyf6.
-
-            self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
-            if new_parent_oid != parent_oid {
-                self.btrfs_touch_inode_times(&mut alloc, new_parent_oid, secs, nanos)?;
+                &child,
+                child_dir_index,
+            )
+        } else {
+            None
+        };
+        let ctx = BtrfsRenameCtx {
+            parent_oid,
+            new_parent_oid,
+            child: &child,
+            child_dir_index,
+            name,
+            new_name,
+            secs,
+            nanos,
+        };
+        match rename_batch_keys {
+            Some((old_dir_item_key, new_dir_item_key, ref_key)) => {
+                self.btrfs_apply_same_dir_rename_batch(
+                    &mut alloc,
+                    &ctx,
+                    old_dir_item_key,
+                    new_dir_item_key,
+                    ref_key,
+                )?;
+            }
+            None => {
+                self.btrfs_apply_rename_per_op(&mut alloc, &ctx, target_will_be_purged)?;
             }
         }
         drop(alloc);
@@ -34055,8 +34228,8 @@ impl OpenFs {
         // Both entries must exist (renameat2(2): ENOENT otherwise). Confirm the
         // matching INODE_REF too so the remove() calls below cannot fail
         // half-way through after the dir entries are already gone.
-        let src = self.btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
-        let dst = self.btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name)?;
+        let src = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+        let dst = Self::btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name)?;
         let src_dir_index =
             Self::btrfs_require_inode_ref_index(&alloc, src.child_objectid, parent_oid, name)?;
         let dst_dir_index = Self::btrfs_require_inode_ref_index(
@@ -34190,10 +34363,7 @@ impl OpenFs {
             )));
         }
 
-        if self
-            .btrfs_lookup_dir_entry(&alloc, parent_oid, new_name)
-            .is_ok()
-        {
+        if Self::btrfs_lookup_dir_entry(&alloc, parent_oid, new_name).is_ok() {
             return Err(FfsError::Exists);
         }
 
@@ -34736,22 +34906,22 @@ impl OpenFs {
                         let is_datasum = self
                             .btrfs_read_inode_from_tree(&alloc, canonical)
                             .is_ok_and(|inode| inode.flags & BTRFS_INODE_NODATASUM == 0);
-                        if is_datasum {
-                            if let Err(e) = self.btrfs_capture_data_extent_csums(
+                        if is_datasum
+                            && let Err(e) = self.btrfs_capture_data_extent_csums(
                                 cx,
                                 &mut alloc,
                                 prev_allocation.bytenr,
                                 prev_alloc_size,
                                 None,
-                            ) {
-                                let _ = alloc.fs_tree.delete(&inline_key);
-                                let _ = alloc.extent_alloc.free_extent(
-                                    prev_allocation.bytenr,
-                                    prev_alloc_size,
-                                    false,
-                                );
-                                return Err(e);
-                            }
+                            )
+                        {
+                            let _ = alloc.fs_tree.delete(&inline_key);
+                            let _ = alloc.extent_alloc.free_extent(
+                                prev_allocation.bytenr,
+                                prev_alloc_size,
+                                false,
+                            );
+                            return Err(e);
                         }
                     }
                 }
@@ -35698,7 +35868,6 @@ impl OpenFs {
     }
 
     fn btrfs_lookup_dir_entry(
-        &self,
         alloc: &BtrfsAllocState,
         parent_oid: u64,
         name: &[u8],
@@ -36749,8 +36918,7 @@ impl OpenFs {
     /// avoid the single-slot thrash under parallel writers, bd-par1).
     fn dir_name_index_shard(&self, inode: u64) -> &Mutex<Option<DirNameIndex>> {
         let shard = inode % DIR_NAME_INDEX_SHARDS as u64;
-        &self.dir_name_index
-            [usize::try_from(shard).expect("shard index < 64 always fits usize")]
+        &self.dir_name_index[usize::try_from(shard).expect("shard index < 64 always fits usize")]
     }
 
     /// `mknod(2)` for char/block devices, FIFOs, and sockets.
@@ -37234,24 +37402,22 @@ impl OpenFs {
                 let inode: &Ext4Inode = if let Some(arc) = hot_hit {
                     arc.as_ref()
                 } else {
-                        let parsed = self.read_inode_with_scope(cx, scope, canonical)?;
-                        // A complete one-shot read cannot reuse this inode on a
-                        // later chunk, so publishing it only displaces another
-                        // file from the single hot slot and pays two Arc
-                        // allocations plus ArcSwap debt. Partial reads retain
-                        // publication because subsequent chunks can hit it.
-                        let publish_hot =
-                            read_only && (offset != 0 || u64::from(size) < parsed.size);
-                        if publish_hot {
-                            let arc = Arc::new(parsed);
-                            self.ext4_hot_inode
-                                .store(Some(Arc::new((canonical.0, Arc::clone(&arc)))));
-                            parsed_arc = arc;
-                            parsed_arc.as_ref()
-                        } else {
-                            parsed_owned = parsed;
-                            &parsed_owned
-                        }
+                    let parsed = self.read_inode_with_scope(cx, scope, canonical)?;
+                    // A complete one-shot read cannot reuse this inode on a
+                    // later chunk, so publishing it only displaces another
+                    // file from the single hot slot and pays two Arc
+                    // allocations plus ArcSwap debt. Partial reads retain
+                    // publication because subsequent chunks can hit it.
+                    let publish_hot = read_only && (offset != 0 || u64::from(size) < parsed.size);
+                    if publish_hot {
+                        let arc = Arc::new(parsed);
+                        self.ext4_hot_inode
+                            .store(Some(Arc::new((canonical.0, Arc::clone(&arc)))));
+                        parsed_arc = arc;
+                        parsed_arc.as_ref()
+                    } else {
+                        parsed_owned = parsed;
+                        &parsed_owned
                     }
                 };
                 // Fast path: exactly the uncompressed-extent case `read` fills a
@@ -42831,11 +42997,15 @@ mod tests {
         // Reading at or past EOF is empty, and must stay empty on the fast path.
         inode.size = 4;
         assert!(
-            OpenFs::read_ext4_inline_data(&inode, 4, 16).unwrap().is_empty(),
+            OpenFs::read_ext4_inline_data(&inode, 4, 16)
+                .unwrap()
+                .is_empty(),
             "a read starting at EOF returns nothing"
         );
         assert!(
-            OpenFs::read_ext4_inline_data(&inode, 99, 16).unwrap().is_empty(),
+            OpenFs::read_ext4_inline_data(&inode, 99, 16)
+                .unwrap()
+                .is_empty(),
             "a read starting past EOF returns nothing"
         );
 
@@ -60668,7 +60838,7 @@ mod tests {
         // handlers do, so the only thing that differs from the direct-path test is
         // the scope lifecycle.
         let scoped = |op: RequestOp,
-                          run: &mut dyn FnMut(&mut RequestScope) -> ffs_error::Result<()>|
+                      run: &mut dyn FnMut(&mut RequestScope) -> ffs_error::Result<()>|
          -> ffs_error::Result<()> {
             let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, op)?;
             let result = run(&mut scope).and_then(|()| {
@@ -67269,10 +67439,20 @@ mod tests {
             fn len_bytes(&self) -> u64 {
                 1 << 30
             }
-            fn read_exact_at(&self, _cx: &Cx, _off: ByteOffset, _buf: &mut [u8]) -> ffs_error::Result<()> {
+            fn read_exact_at(
+                &self,
+                _cx: &Cx,
+                _off: ByteOffset,
+                _buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
                 Ok(())
             }
-            fn write_all_at(&self, _cx: &Cx, off: ByteOffset, _buf: &[u8]) -> ffs_error::Result<()> {
+            fn write_all_at(
+                &self,
+                _cx: &Cx,
+                off: ByteOffset,
+                _buf: &[u8],
+            ) -> ffs_error::Result<()> {
                 self.ops.lock().unwrap().push(DevOp::Write(off.0));
                 Ok(())
             }
@@ -84405,7 +84585,7 @@ mod tests {
         };
         let replayed =
             ffs_btrfs::replay_tree_log(&mut read_physical, &sb, &chunks, BTRFS_FS_TREE_OBJECTID)
-            .expect("tree-log must replay from the fsynced image");
+                .expect("tree-log must replay from the fsynced image");
         assert!(replayed.replayed);
 
         assert!(
@@ -84693,15 +84873,14 @@ mod tests {
         let fast_start = Instant::now();
         let tree_log_items = {
             let mut alloc = alloc_mutex.write();
-            let (_node_bytes, _sb_bytes, stats) =
-                OpenFs::btrfs_prepare_tree_log_write(
-                    &sb,
-                    &mut alloc,
-                    canonical,
-                    BTRFS_FS_TREE_OBJECTID,
-                    &vec![0_u8; 4096],
-                )
-                .expect("prepare tree-log fast-fsync write");
+            let (_node_bytes, _sb_bytes, stats) = OpenFs::btrfs_prepare_tree_log_write(
+                &sb,
+                &mut alloc,
+                canonical,
+                BTRFS_FS_TREE_OBJECTID,
+                &vec![0_u8; 4096],
+            )
+            .expect("prepare tree-log fast-fsync write");
             stats.items_count
         };
         let fast_elapsed_ns = fast_start.elapsed().as_nanos().max(1);
@@ -88397,8 +88576,7 @@ mod tests {
         let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable");
         let alloc = alloc_mutex.read();
         for name in &names {
-            let via_hash = fs
-                .btrfs_lookup_dir_entry(&alloc, parent, name.as_bytes())
+            let via_hash = OpenFs::btrfs_lookup_dir_entry(&alloc, parent, name.as_bytes())
                 .expect("present name must be found");
             let via_scan =
                 btrfs_lookup_dir_entry_full_scan_reference(&alloc, parent, name.as_bytes())
@@ -88411,8 +88589,7 @@ mod tests {
         }
         for absent in ["zzz_absent.dat", "nope", "entry_9999.dat"] {
             assert!(
-                fs.btrfs_lookup_dir_entry(&alloc, parent, absent.as_bytes())
-                    .is_err(),
+                OpenFs::btrfs_lookup_dir_entry(&alloc, parent, absent.as_bytes()).is_err(),
                 "absent name {absent} must be NotFound under the hash-keyed lookup"
             );
             assert!(
@@ -88448,7 +88625,7 @@ mod tests {
         for _ in 0..iters {
             for name in &names {
                 acc = acc.wrapping_add(
-                    fs.btrfs_lookup_dir_entry(&alloc, parent, name.as_bytes())
+                    OpenFs::btrfs_lookup_dir_entry(&alloc, parent, name.as_bytes())
                         .unwrap()
                         .child_objectid,
                 );

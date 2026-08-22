@@ -174,6 +174,7 @@ impl ByteDevice for BenchByteDevice {
             .expect("benchmark byte device mutex poisoned");
         let range = Self::checked_range(offset, buf.len(), data.len())?;
         buf.copy_from_slice(&data[range]);
+        drop(data);
         Ok(())
     }
 
@@ -184,6 +185,7 @@ impl ByteDevice for BenchByteDevice {
             .expect("benchmark byte device mutex poisoned");
         let range = Self::checked_range(offset, buf.len(), data.len())?;
         data[range].copy_from_slice(buf);
+        drop(data);
         Ok(())
     }
 

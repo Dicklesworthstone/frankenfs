@@ -345,17 +345,23 @@ impl PerGroupAlloc {
                 });
             }
         }
-        {
-            let mut stats = self.lock_group(gidx);
-            // Read this locked group's own pre-populated reserved set. The Arc
-            // clone releases the `reserved_cache` borrow before the `&mut stats`
-            // call below; empty only if unpopulated (never, under the feature) —
-            // same as `alloc_blocks`.
+        // Single-group free routed through the same closure seam as
+        // `alloc_blocks`: the guard lives inside `alloc_in_scan_order`, the
+        // shape the drop-tightening lint is calibrated for. `once` visits ONLY
+        // the owning group, so locking is identical to a direct lock (one
+        // acquire, released when the closure returns).
+        // Read the locked group's own pre-populated reserved set inside the
+        // closure: empty only if unpopulated (never, under the feature) — same
+        // as `alloc_blocks`.
+        // The `None` arm is unreachable: the single-group scan always yields
+        // `Some`, and `gidx < groups.len()` was checked above.
+        self.alloc_in_scan_order(std::iter::once(gidx), |_g, stats| {
             let reserved = stats.reserved_cache.get().cloned().unwrap_or_default();
-            ffs_alloc::free_blocks_in_group(
-                cx, dev, geo, &mut stats, group, rel_start, count, pctx, &reserved,
-            )
-        }
+            Some(ffs_alloc::free_blocks_in_group(
+                cx, dev, geo, stats, group, rel_start, count, pctx, &reserved,
+            ))
+        })
+        .unwrap_or(Ok(()))
     }
 
     /// Sharded per-group inode allocation (bd-bhh0i Part A): walk the
@@ -473,9 +479,8 @@ impl PerGroupAlloc {
         let index = ffs_types::inode_index_in_group(ino, geo.inodes_per_group);
         let byte_in_table = u64::from(index) * u64::from(geo.inode_size);
         let block_offset = byte_in_table / u64::from(geo.block_size);
-        let byte_offset =
-            usize::try_from(byte_in_table % u64::from(geo.block_size))
-                .expect("invariant: byte offset < block_size fits usize");
+        let byte_offset = usize::try_from(byte_in_table % u64::from(geo.block_size))
+            .expect("invariant: byte offset < block_size fits usize");
         let inode_table_block = self.groups[gidx].stats.lock().inode_table_block.0;
         let block = ffs_types::BlockNumber(inode_table_block.checked_add(block_offset)?);
         Some(ffs_inode::InodeLocation { block, byte_offset })
@@ -897,7 +902,10 @@ mod tests {
         // sharded path active, routed through `PerGroupAlloc::free_inode`.
         let (sharded_only, live) = make();
         sharded_only.lock_group(0).free_inodes += 1;
-        assert_eq!(sharded_only.reconciled_group_stats(&live)[0].free_inodes, 41);
+        assert_eq!(
+            sharded_only.reconciled_group_stats(&live)[0].free_inodes,
+            41
+        );
 
         // (b) Freed through the SINGLE-LOCK array — orphan recovery and
         // fast-commit replay still do this, and it must come out the same. This
@@ -929,7 +937,10 @@ mod tests {
         let (both_blocks, mut live) = make();
         both_blocks.lock_group(1).free_blocks += 8;
         live[1].free_blocks += 8;
-        assert_eq!(both_blocks.reconciled_group_stats(&live)[1].free_blocks, 116);
+        assert_eq!(
+            both_blocks.reconciled_group_stats(&live)[1].free_blocks,
+            116
+        );
     }
 
     /// The A/A control for the arithmetic above: with the single-lock array still

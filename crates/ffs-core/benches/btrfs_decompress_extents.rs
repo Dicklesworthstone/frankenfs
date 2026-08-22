@@ -63,8 +63,7 @@ fn read_job_digest(job: BenchReadJob) -> u64 {
 }
 
 fn single_read_job_heap_queue(job: BenchReadJob) -> u64 {
-    let mut jobs = Vec::new();
-    jobs.push(job);
+    let jobs = vec![job];
     black_box(jobs).into_iter().map(read_job_digest).sum()
 }
 
@@ -210,10 +209,8 @@ fn dedicated_pool() -> &'static ThreadPool {
     static POOL: std::sync::OnceLock<ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         let threads = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(DEDICATED_POOL_MAX_THREADS)
-            .min(DEDICATED_POOL_MAX_THREADS)
-            .max(1);
+            .map_or(DEDICATED_POOL_MAX_THREADS, usize::from)
+            .clamp(1, DEDICATED_POOL_MAX_THREADS);
         ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|idx| format!("bench-btrfs-decompress-{idx}"))
@@ -443,14 +440,16 @@ fn bench_decompress_pool(c: &mut Criterion) {
         "small-file gate changed decompressed byte count"
     );
 
-    let mut large = c.benchmark_group("btrfs_decompress_pool_large_272x128k");
-    large.bench_function("global_pool", |b| {
-        b.iter(|| black_box(decompress_parallel_sum(black_box(&large_blobs))));
-    });
-    large.bench_function("dedicated_pool_max16", |b| {
-        b.iter(|| black_box(decompress_parallel_pool_sum(black_box(&large_blobs), pool)));
-    });
-    large.finish();
+    {
+        let mut large = c.benchmark_group("btrfs_decompress_pool_large_272x128k");
+        large.bench_function("global_pool", |b| {
+            b.iter(|| black_box(decompress_parallel_sum(black_box(&large_blobs))));
+        });
+        large.bench_function("dedicated_pool_max16", |b| {
+            b.iter(|| black_box(decompress_parallel_pool_sum(black_box(&large_blobs), pool)));
+        });
+        large.finish();
+    }
 
     let mut small = c.benchmark_group("btrfs_decompress_pool_multifile_64x4x128k");
     small.bench_function("always_install_pool_max16", |b| {
@@ -576,6 +575,8 @@ fn zlib_reused(blobs: &[Vec<u8>], ulen: usize) -> usize {
 }
 
 fn bench_zlib_reuse(c: &mut Criterion) {
+    const CLUSTER: usize = 4096;
+    const CLUSTERS: usize = 128;
     if !should_build_group(&["zlib_decode_reuse", "zlib_decode_reuse_e2compr_4k"]) {
         return;
     }
@@ -587,22 +588,22 @@ fn bench_zlib_reuse(c: &mut Criterion) {
         zlib_reused(&zblobs, RAM),
         "zlib arms must agree"
     );
-    let mut group = c.benchmark_group("zlib_decode_reuse");
-    group.bench_function("fresh_a", |b| {
-        b.iter(|| black_box(zlib_fresh(black_box(&zblobs), RAM)))
-    });
-    group.bench_function("fresh_b", |b| {
-        b.iter(|| black_box(zlib_fresh(black_box(&zblobs), RAM)))
-    });
-    group.bench_function("reused", |b| {
-        b.iter(|| black_box(zlib_reused(black_box(&zblobs), RAM)))
-    });
-    group.finish();
+    {
+        let mut group = c.benchmark_group("zlib_decode_reuse");
+        group.bench_function("fresh_a", |b| {
+            b.iter(|| black_box(zlib_fresh(black_box(&zblobs), RAM)));
+        });
+        group.bench_function("fresh_b", |b| {
+            b.iter(|| black_box(zlib_fresh(black_box(&zblobs), RAM)));
+        });
+        group.bench_function("reused", |b| {
+            b.iter(|| black_box(zlib_reused(black_box(&zblobs), RAM)));
+        });
+        group.finish();
+    }
 
     // e2compr scale: 4 KiB ext4 clusters, many of them — the fresh-decoder init is a
     // LARGER fraction of each small decode, so the reuse win is bigger here.
-    const CLUSTER: usize = 4096;
-    const CLUSTERS: usize = 128;
     let cpay: Vec<u8> = (0..CLUSTER)
         .map(|i| b"the quick brown fox "[i % 20])
         .collect();
@@ -614,13 +615,13 @@ fn bench_zlib_reuse(c: &mut Criterion) {
     );
     let mut g2 = c.benchmark_group("zlib_decode_reuse_e2compr_4k");
     g2.bench_function("fresh_a", |b| {
-        b.iter(|| black_box(zlib_fresh(black_box(&cblobs), CLUSTER)))
+        b.iter(|| black_box(zlib_fresh(black_box(&cblobs), CLUSTER)));
     });
     g2.bench_function("fresh_b", |b| {
-        b.iter(|| black_box(zlib_fresh(black_box(&cblobs), CLUSTER)))
+        b.iter(|| black_box(zlib_fresh(black_box(&cblobs), CLUSTER)));
     });
     g2.bench_function("reused", |b| {
-        b.iter(|| black_box(zlib_reused(black_box(&cblobs), CLUSTER)))
+        b.iter(|| black_box(zlib_reused(black_box(&cblobs), CLUSTER)));
     });
     g2.finish();
 }
@@ -669,12 +670,12 @@ fn zlib_encode_reused(payloads: &[Vec<u8>], level: u32) -> Vec<Vec<u8>> {
 }
 
 fn bench_zlib_encode_reuse(c: &mut Criterion) {
-    if !should_build_group(&["zlib_encode_reuse_4k"]) {
-        return;
-    }
     const CLUSTER: usize = 4096;
     const CLUSTERS: usize = 128;
     const LEVEL: u32 = 6; // flate2 default; e2compr methods map to fixed levels
+    if !should_build_group(&["zlib_encode_reuse_4k"]) {
+        return;
+    }
     let payloads: Vec<Vec<u8>> = (0..CLUSTERS)
         .map(|k| {
             (0..CLUSTER)
@@ -690,13 +691,13 @@ fn bench_zlib_encode_reuse(c: &mut Criterion) {
     );
     let mut g = c.benchmark_group("zlib_encode_reuse_4k");
     g.bench_function("fresh_a", |b| {
-        b.iter(|| black_box(zlib_encode_fresh(black_box(&payloads), LEVEL)))
+        b.iter(|| black_box(zlib_encode_fresh(black_box(&payloads), LEVEL)));
     });
     g.bench_function("fresh_b", |b| {
-        b.iter(|| black_box(zlib_encode_fresh(black_box(&payloads), LEVEL)))
+        b.iter(|| black_box(zlib_encode_fresh(black_box(&payloads), LEVEL)));
     });
     g.bench_function("reused", |b| {
-        b.iter(|| black_box(zlib_encode_reused(black_box(&payloads), LEVEL)))
+        b.iter(|| black_box(zlib_encode_reused(black_box(&payloads), LEVEL)));
     });
     g.finish();
 }
@@ -728,11 +729,11 @@ fn lzo_decode_scratch(segs: &[Vec<u8>], page: usize) -> Vec<u8> {
 }
 
 fn bench_lzo_segment_decode(c: &mut Criterion) {
+    const SECTOR: usize = 4096;
+    const SEGS: usize = 32; // 128 KiB extent = 32 sector-sized LZO segments
     if !should_build_group(&["lzo_segment_decode"]) {
         return;
     }
-    const SECTOR: usize = 4096;
-    const SEGS: usize = 32; // 128 KiB extent = 32 sector-sized LZO segments
     let payloads: Vec<Vec<u8>> = (0..SEGS)
         .map(|k| {
             (0..SECTOR)
@@ -751,13 +752,13 @@ fn bench_lzo_segment_decode(c: &mut Criterion) {
     );
     let mut g = c.benchmark_group("lzo_segment_decode");
     g.bench_function("alloc_per_seg_a", |b| {
-        b.iter(|| black_box(lzo_decode_alloc(black_box(&segs), SECTOR)))
+        b.iter(|| black_box(lzo_decode_alloc(black_box(&segs), SECTOR)));
     });
     g.bench_function("alloc_per_seg_b", |b| {
-        b.iter(|| black_box(lzo_decode_alloc(black_box(&segs), SECTOR)))
+        b.iter(|| black_box(lzo_decode_alloc(black_box(&segs), SECTOR)));
     });
     g.bench_function("reused_scratch", |b| {
-        b.iter(|| black_box(lzo_decode_scratch(black_box(&segs), SECTOR)))
+        b.iter(|| black_box(lzo_decode_scratch(black_box(&segs), SECTOR)));
     });
     g.finish();
 }

@@ -39,7 +39,6 @@ fn commit_error_to_ffs(error: &CommitError) -> FfsError {
     }
 }
 
-
 /// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API./// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
 ///
 /// The enum is always owned behind `Arc`; boxing a variant would add another

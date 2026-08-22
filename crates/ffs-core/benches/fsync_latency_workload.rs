@@ -157,7 +157,7 @@ fn run_ffs() -> Option<FfsRun> {
         .ok()?;
     let mut samples = Vec::with_capacity(COUNT);
     for idx in 0..COUNT {
-        let payload = vec![idx as u8; PAYLOAD_SIZE];
+        let payload = vec![u8::try_from(idx).expect("sample count fits u8"); PAYLOAD_SIZE];
         let start = Instant::now();
         fs.write(&cx, attr.ino, 0, &payload).ok()?;
         fs.fsync(&cx, attr.ino, 0, false).ok()?;
@@ -184,7 +184,7 @@ fn run_kernel() -> Option<(Vec<u64>, String)> {
         .ok()?;
     let mut samples = Vec::with_capacity(COUNT);
     for idx in 0..COUNT {
-        let payload = vec![idx as u8; PAYLOAD_SIZE];
+        let payload = vec![u8::try_from(idx).expect("sample count fits u8"); PAYLOAD_SIZE];
         let start = Instant::now();
         file.write_at(&payload, 0).ok()?;
         file.sync_all().ok()?;
@@ -234,12 +234,12 @@ fn main() {
         &kernel_dir,
     );
     let ffs_med = {
-        let mut v = ffs_batch_medians.clone();
+        let mut v = ffs_batch_medians;
         v.sort_unstable();
         percentile(&v, 50)
     };
     let kernel_med = {
-        let mut v = kernel_batch_medians.clone();
+        let mut v = kernel_batch_medians;
         v.sort_unstable();
         percentile(&v, 50)
     };

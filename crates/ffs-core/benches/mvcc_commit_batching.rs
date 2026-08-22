@@ -84,6 +84,7 @@ impl ByteDevice for BenchByteDevice {
             .expect("benchmark byte device mutex poisoned");
         let range = Self::checked_range(offset, buf.len(), data.len())?;
         buf.copy_from_slice(&data[range]);
+        drop(data);
         Ok(())
     }
 
@@ -94,6 +95,7 @@ impl ByteDevice for BenchByteDevice {
             .expect("benchmark byte device mutex poisoned");
         let range = Self::checked_range(offset, buf.len(), data.len())?;
         data[range].copy_from_slice(buf);
+        drop(data);
         Ok(())
     }
 
@@ -128,18 +130,12 @@ fn ext4_seed_image() -> Vec<u8> {
 fn open_mvcc_bench_fs(image: Vec<u8>, single_store: bool) -> OpenFs {
     let cx = Cx::for_testing();
     let mut options = OpenOptions::default();
-    let _wal_dir;
-    if single_store {
-        _wal_dir = Some(tempfile::TempDir::new().expect("create missing WAL parent"));
-        options.mvcc_wal_path = Some(
-            _wal_dir
-                .as_ref()
-                .expect("WAL parent exists")
-                .path()
-                .join("missing.wal"),
-        );
-    } else {
-        _wal_dir = None;
+    // Holds the temporary WAL parent directory alive for as long as `options`
+    // (and the filesystem opened from it) below.
+    let wal_dir =
+        single_store.then(|| tempfile::TempDir::new().expect("create missing WAL parent"));
+    if let Some(dir) = &wal_dir {
+        options.mvcc_wal_path = Some(dir.path().join("missing.wal"));
     }
     OpenFs::from_device(&cx, Box::new(BenchByteDevice::from_vec(image)), &options)
         .expect("open benchmark filesystem")

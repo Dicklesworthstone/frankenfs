@@ -32,20 +32,22 @@ impl GroupHotStats {
     fn new(group: usize) -> Self {
         Self {
             free_blocks: 1_000_000,
-            free_inodes: 1_000_000 - group as u32,
-            used_dirs: group as u32,
+            free_inodes: 1_000_000 - u32::try_from(group).expect("group fits u32"),
+            used_dirs: u32::try_from(group).expect("group fits u32"),
             cursor: (group as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
         }
     }
 
     fn account_create(&mut self, op: usize) -> u64 {
         self.free_inodes = self.free_inodes.wrapping_sub(1);
-        self.free_blocks = self.free_blocks.wrapping_sub((op & 1) as u32);
-        self.used_dirs = self.used_dirs.wrapping_add((op & 3 == 0) as u32);
+        self.free_blocks = self.free_blocks.wrapping_sub(u32::from(op & 1 == 1));
+        self.used_dirs = self
+            .used_dirs
+            .wrapping_add(u32::from(op.trailing_zeros() >= 2));
         self.cursor = self
             .cursor
             .wrapping_add(u64::from(self.free_inodes))
-            .rotate_left((op as u32) & 31)
+            .rotate_left(u32::try_from(op).expect("op fits u32") & 31)
             ^ u64::from(self.free_blocks);
         self.cursor ^ u64::from(self.used_dirs)
     }
@@ -142,13 +144,13 @@ fn make_delta_buckets() -> Arc<Vec<DeltaBucket>> {
 fn counter_delta(thread_id: usize, group: usize, op: usize) -> CounterTotals {
     let mix = (op as u64)
         .wrapping_mul(0xD6E8_FEB8_6659_FD93)
-        .rotate_left(((thread_id + group) as u32) & 31)
+        .rotate_left(u32::try_from(thread_id + group).expect("mix shift fits u32") & 31)
         ^ ((group as u64) << 48)
         ^ thread_id as u64;
     CounterTotals {
-        free_blocks_delta: -i64::from((op & 1) as u8),
+        free_blocks_delta: -i64::from(op & 1 != 0),
         free_inodes_delta: -1,
-        used_dirs_delta: i64::from((op & 3 == 0) as u8),
+        used_dirs_delta: i64::from(op.trailing_zeros() >= 2),
         digest: mix,
     }
 }
@@ -262,14 +264,16 @@ fn bench_ext4_group_lock_layout(c: &mut Criterion) {
     let global_counters = Arc::new(Mutex::new(vec![CounterTotals::default(); GROUPS]));
     let delta_buckets = make_delta_buckets();
 
-    let mut group = c.benchmark_group("ext4_group_lock_layout_8t");
-    group.bench_function("plain_adjacent_group_locks", |b| {
-        b.iter(|| black_box(run_plain_groups(black_box(&plain_groups))));
-    });
-    group.bench_function("cacheline_padded_group_locks", |b| {
-        b.iter(|| black_box(run_padded_groups(black_box(&padded_groups))));
-    });
-    group.finish();
+    {
+        let mut group = c.benchmark_group("ext4_group_lock_layout_8t");
+        group.bench_function("plain_adjacent_group_locks", |b| {
+            b.iter(|| black_box(run_plain_groups(black_box(&plain_groups))));
+        });
+        group.bench_function("cacheline_padded_group_locks", |b| {
+            b.iter(|| black_box(run_padded_groups(black_box(&padded_groups))));
+        });
+        group.finish();
+    }
 
     let mut counter_group = c.benchmark_group("ext4_counter_delta_16t");
     counter_group.bench_function("global_counter_mutex", |b| {

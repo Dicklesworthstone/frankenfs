@@ -98,7 +98,7 @@ impl BlockDevice for LatencyBlockDevice {
     }
 
     fn read_contiguous_into(&self, _cx: &Cx, start: BlockNumber, dst: &mut [u8]) -> Result<()> {
-        if dst.len() % BS != 0 {
+        if !dst.len().is_multiple_of(BS) {
             return Err(FfsError::Format(
                 "bench read_contiguous_into requires block-aligned dst".into(),
             ));

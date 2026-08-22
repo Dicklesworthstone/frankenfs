@@ -45,7 +45,7 @@ impl GroupModel {
         let lane = op & (self.checksum_words.len() - 1);
         let mix = (op as u64)
             .wrapping_mul(0xA24B_AED4_963E_E407)
-            .rotate_left((lane as u32) & 31);
+            .rotate_left(u32::try_from(lane).expect("lane fits u32") & 31);
         self.checksum_words[lane] = self.checksum_words[lane]
             .wrapping_add(self.free_inodes)
             .rotate_left(7)
@@ -84,7 +84,7 @@ impl AtomicGroupModel {
             let lane = op & (checksum_words.len() - 1);
             let mix = (op as u64)
                 .wrapping_mul(0xA24B_AED4_963E_E407)
-                .rotate_left((lane as u32) & 31);
+                .rotate_left(u32::try_from(lane).expect("lane fits u32") & 31);
             let next = checksum_words[lane]
                 .wrapping_add(free_inodes)
                 .rotate_left(7)
@@ -159,9 +159,11 @@ fn run_global_rwlock_microbatch(state: &Arc<RwLock<Vec<GroupModel>>>) -> u64 {
                 let mut op = 0;
                 while op < OPS_PER_THREAD {
                     let end = (op + MICRO_BATCH).min(OPS_PER_THREAD);
-                    let mut groups = state.write();
-                    for batched_op in op..end {
-                        local = local.wrapping_add(groups[group].account_alloc(batched_op));
+                    {
+                        let mut groups = state.write();
+                        for batched_op in op..end {
+                            local = local.wrapping_add(groups[group].account_alloc(batched_op));
+                        }
                     }
                     op = end;
                 }

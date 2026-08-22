@@ -17,14 +17,13 @@ fn byte_all_zero(data: &[u8]) -> bool {
 }
 
 fn word_all_zero(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(8);
-    chunks.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && chunks.remainder().iter().all(|&b| b == 0)
+    let (chunks, remainder) = data.as_chunks::<8>();
+    chunks.iter().all(|c| u64::from_ne_bytes(*c) == 0) && remainder.iter().all(|&b| b == 0)
 }
 
 fn unrolled4_all_zero(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
+    let (blocks, tail) = data.as_chunks::<32>();
+    for block in blocks {
         let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
@@ -33,9 +32,8 @@ fn unrolled4_all_zero(data: &[u8]) -> bool {
             return false;
         }
     }
-    let mut tail = chunks.remainder().chunks_exact(8);
-    tail.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&b| b == 0)
+    let (tail8, tail_rem) = tail.as_chunks::<8>();
+    tail8.iter().all(|c| u64::from_ne_bytes(*c) == 0) && tail_rem.iter().all(|&b| b == 0)
 }
 
 fn bench(c: &mut Criterion) {
@@ -47,13 +45,13 @@ fn bench(c: &mut Criterion) {
         assert_eq!(word_all_zero(block), unrolled4_all_zero(block));
         let mut g = c.benchmark_group(format!("sparse_zero_{name}"));
         g.bench_function("byte", |b| {
-            b.iter(|| black_box(byte_all_zero(black_box(block))))
+            b.iter(|| black_box(byte_all_zero(black_box(block))));
         });
         g.bench_function("word", |b| {
-            b.iter(|| black_box(word_all_zero(black_box(block))))
+            b.iter(|| black_box(word_all_zero(black_box(block))));
         });
         g.bench_function("unrolled4", |b| {
-            b.iter(|| black_box(unrolled4_all_zero(black_box(block))))
+            b.iter(|| black_box(unrolled4_all_zero(black_box(block))));
         });
         g.finish();
     }

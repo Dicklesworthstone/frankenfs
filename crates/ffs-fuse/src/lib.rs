@@ -155,7 +155,7 @@ fn pin_serial_dispatch_thread() {
     match fuser::pin_current_thread_to_one_cpu() {
         Some(cpu) => info!(cpu, "serial FUSE dispatch pinned to one CPU (bd-svhrq)"),
         None => {
-            debug!("serial dispatch left unpinned (already single-CPU, or affinity unavailable)")
+            debug!("serial dispatch left unpinned (already single-CPU, or affinity unavailable)");
         }
     }
 }
@@ -295,17 +295,21 @@ pub mod io_uring_config {
     /// the knob is for, and why the value is reported on the mount knob line
     /// rather than assumed.
     pub const DEFAULT_PAYLOAD_BYTES: u32 = 4096;
-    /// Refuse anything larger than this per entry. 128 KiB is deliberately NOT
-    /// reachable by accident: it is the value that produced the null-blocked
-    /// loss, so requesting it must be explicit and visible on the knob line.
+    /// Refuse anything larger than this per entry.
+    ///
+    /// 128 KiB is deliberately NOT reachable by accident: it is the value that
+    /// produced the null-blocked loss, so requesting it must be explicit and
+    /// visible on the knob line.
     pub const MAX_PAYLOAD_BYTES: u32 = 64 * 1024;
     /// Refuse a depth that would pin an unbounded number of buffers.
     pub const MAX_QUEUE_DEPTH: usize = 64;
 
     /// Pure half of the enable knob, so the spelling is testable without
-    /// mutating process-global environment (racy under the parallel harness and
-    /// `unsafe` from edition 2024). Opt-in: a typo fails CLOSED to the classic
-    /// `/dev/fuse` transport.
+    /// mutating process-global environment.
+    ///
+    /// The environment is racy under the parallel harness and `unsafe` from
+    /// edition 2024. Opt-in: a typo fails CLOSED to the classic `/dev/fuse`
+    /// transport.
     #[must_use]
     pub fn enabled_from_value(raw: Option<&str>) -> bool {
         let Some(raw) = raw else {
@@ -316,9 +320,11 @@ pub mod io_uring_config {
     }
 
     /// Queue depth, clamped to `[1, MAX_QUEUE_DEPTH]`, defaulting on anything
-    /// unparseable. Clamping rather than erroring keeps a bad knob from taking
-    /// down a mount, and the effective value is reported so a clamped run cannot
-    /// be mistaken for the requested one.
+    /// unparseable.
+    ///
+    /// Clamping rather than erroring keeps a bad knob from taking down a mount,
+    /// and the effective value is reported so a clamped run cannot be mistaken
+    /// for the requested one.
     #[must_use]
     pub fn queue_depth_from_value(raw: Option<&str>) -> usize {
         raw.and_then(|r| r.trim().parse::<usize>().ok())
@@ -556,7 +562,7 @@ fn xattr_suppression_evidence(
 /// Same gate and same shape as [`emit_xattr_suppression_evidence`], so one
 /// `FFS_MOUNT_BENCH_EVIDENCE=1` turns on all of the mount's evidence and a
 /// parser learns one prefix convention rather than two.
-fn emit_crossing_evidence(line: String) {
+fn emit_crossing_evidence(line: &str) {
     if std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0") {
         eprintln!("mount_candidate_crossings,{line}");
     }
@@ -565,7 +571,7 @@ fn emit_crossing_evidence(line: String) {
 /// Gated on the same `FFS_MOUNT_BENCH_EVIDENCE` as the rest of the mount
 /// evidence, and on stderr for the same reason: it is provenance for a
 /// measurement, not output a mount is expected to produce.
-fn emit_xattr_suppression_evidence(line: String) {
+fn emit_xattr_suppression_evidence(line: &str) {
     if std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0") {
         eprintln!("mount_candidate_xattr,{line}");
     }
@@ -585,7 +591,7 @@ fn emit_xattr_suppression_evidence(line: String) {
 /// These are two independent switches: the kernel-suppression switch tells the
 /// kernel to stop probing, while the short-circuit answers probes that still
 /// arrive without reading the inode. One prefix each.
-fn emit_capability_shortcircuit_evidence(line: String) {
+fn emit_capability_shortcircuit_evidence(line: &str) {
     if std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0") {
         eprintln!("mount_candidate_shortcircuit,{line}");
     }
@@ -605,8 +611,8 @@ fn resolve_xattr_suppression(fs: &FrankenFuse) {
         // between "this arm did not suppress" and "this ELF is too old to say".
         // The comparator distinguishes a lever from a null by comparing the two
         // arms' lines, so the off arm has to have one.
-        emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, None, false));
-        emit_capability_shortcircuit_evidence(capability_shortcircuit_evidence(
+        emit_xattr_suppression_evidence(&xattr_suppression_evidence(setting, None, false));
+        emit_capability_shortcircuit_evidence(&capability_shortcircuit_evidence(
             false,
             None,
             fs.inner.read_only,
@@ -621,8 +627,8 @@ fn resolve_xattr_suppression(fs: &FrankenFuse) {
     let shortcircuit =
         capability_shortcircuit_allowed(shortcircuit_requested, presence, fs.inner.read_only);
     XATTR_PROVEN_ABSENT.store(shortcircuit, std::sync::atomic::Ordering::Relaxed);
-    emit_xattr_suppression_evidence(xattr_suppression_evidence(setting, Some(presence), allowed));
-    emit_capability_shortcircuit_evidence(capability_shortcircuit_evidence(
+    emit_xattr_suppression_evidence(&xattr_suppression_evidence(setting, Some(presence), allowed));
+    emit_capability_shortcircuit_evidence(&capability_shortcircuit_evidence(
         shortcircuit_requested,
         Some(presence),
         fs.inner.read_only,
@@ -1035,6 +1041,116 @@ const READDIRPLUS_PREFETCH_COLD_BOUND: usize = 32;
 /// second read of the same slot would silently see `None` and fall through to
 /// an inline refetch, which looks like a cache miss rather than a bug. The test
 /// pins it.
+/// Optionally fetch per-entry attributes in INODE order before emitting.
+/// Same calls, same count, same results -- only the order in which the
+/// inode table is touched changes, which is what a hash-ordered
+/// (`dir_index`) directory makes random. OFF unless the knob is set, so
+/// this is inert by default and both arms of an A/B come from one ELF.
+///
+/// ⛔ MEASURED HARMFUL 2026-08-17 — DO NOT ENABLE. Left in place, default
+/// OFF and inert, as the evidence for a rejected lever.
+///
+/// The sentence that used to be here claimed prefetching is "bounded by
+/// the same `reply.add` fullness break as the inline path". That is FALSE,
+/// and writing it is what let the mistake through: the prefetch runs
+/// BEFORE any `reply.add`, so entries past the fill point are fetched,
+/// discarded when the loop breaks, and fetched AGAIN when the kernel
+/// re-issues readdir from that offset. Nothing is cached across readdir
+/// calls, so the overshoot is paid every time.
+///
+/// Internal A/B, one ELF (v3+PGO), alternated off/on/off/on: getattr calls
+/// 40407 -> 104761 (2.59x, identical in both ON runs, so structural not
+/// noise), and getattr ns/entry 433.9/370.0 -> 554.8/535.6. The ordering
+/// win, if any, is buried under ~61% wasted fetches.
+///
+/// BOUNDED as of 2026-08-17: `readdirplus_prefetch_bound` caps the
+/// prefetch at what the PREVIOUS reply emitted, so the overshoot above is
+/// capped rather than paid per call. The measured rejection is kept
+/// verbatim because the knob is still OFF by default and the bounded form
+/// is itself UNMEASURED -- it must clear the same 40407-vs-104761 scope
+/// count before anyone enables it.
+fn readdirplus_prefetch_attrs(
+    fuse: &FrankenFuse,
+    cx: &Cx,
+    entries: &[ffs_core::vfs::DirEntry],
+) -> Option<Vec<Option<ffs_core::vfs::InodeAttr>>> {
+    // bd-xfe7z: times the whole prefetch block, scopes included, so
+    // `prefetch_ns - ops_ns_getattr` isolates the request-scope machinery
+    // from the format-layer work already timed inside it.
+    let Some(sort_by_inode) = readdirplus_prefetch_mode(
+        readdirplus_inode_order_from_env(),
+        readdirplus_batch_attrs_from_env(),
+    ) else {
+        return None;
+    };
+    let _prefetch_timer = crossings::PrefetchTimer::start(crossings::CrossingOp::Readdirplus);
+    // bd-xfe7z: BOUNDED by what the previous reply actually emitted. This
+    // is the fix the rejection above called for. Entries past the bound
+    // are left `None` and fetched inline in the emit loop, exactly as the
+    // off arm does, so the 2.59x overshoot cannot reappear -- and the
+    // batch arm below inherits the bound rather than the overshoot.
+    let bound =
+        readdirplus_prefetch_bound(READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed), entries.len());
+    // bd-xfe7z census: record the bound ACTUALLY used, not the one the knob
+    // asked for. A batch arm whose bound sits at the cold guess never
+    // collapsed anything, and the scope count alone cannot tell that apart
+    // from "scopes are not the cost".
+    READDIRPLUS_PREFETCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    READDIRPLUS_PREFETCH_BOUND_SUM.fetch_add(bound as u64, std::sync::atomic::Ordering::Relaxed);
+    let inos: Vec<u64> = entries[..bound].iter().map(|e| e.ino.0).collect();
+    let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
+        (0..entries.len()).map(|_| None).collect();
+    // bd-xfe7z: ONE scope for the whole fill, not one per inode. The fetch
+    // ORDER is unchanged -- still inode order, which is what buys the
+    // inode-table locality -- but the N scope opens collapse to 1.
+    //
+    // That is the measured target: on this workload `getattr` owns 60.80%
+    // of daemon dispatch time at 1.01 scopes per entry, while wire crossings
+    // are 0.0053 per entry. The cost is not transport and not readdir; it is
+    // the per-entry fill, and until now every entry of it paid for its own
+    // request scope.
+    //
+    // `FsOps::getattr_batch` defaults to looping over `getattr`, so the ops
+    // layer does exactly the same work and this isolates the scope overhead.
+    // If an A/B shows nothing, the 60.80% is the attribute fetch itself and
+    // the next lever belongs in the format layer.
+    let order: Vec<usize> = readdirplus_fetch_order(sort_by_inode, &inos);
+    if readdirplus_batch_attrs_from_env() {
+        let ordered: Vec<InodeNumber> = order.iter().map(|index| entries[*index].ino).collect();
+        if let Ok(results) =
+            fuse.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+                // bd-xfe7z: time the OPS-layer call only, so dispatch_ns -
+                // ops_ns is the FUSE layer's own overhead and ops_ns is the
+                // format layer's work.
+                let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                Ok(fuse.inner.ops.getattr_batch(cx, scope, &ordered))
+            })
+        {
+            for (slot_index, result) in order.iter().zip(results) {
+                if let Ok(attr) = result {
+                    slots[*slot_index] = Some(attr);
+                }
+            }
+        }
+    } else {
+        // The control: one request scope per inode, which is what 1.01
+        // scopes/entry measures.
+        for index in order {
+            let ino = entries[index].ino;
+            let _scope_timer = crossings::ScopeTimer::start(crossings::CrossingOp::Getattr);
+            if let Ok(attr) =
+                fuse.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+                    let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                    fuse.inner.ops.getattr(cx, scope, ino)
+                })
+            {
+                slots[index] = Some(attr);
+            }
+        }
+    }
+    Some(slots)
+}
+
 fn take_prefetched<T>(slots: &mut [Option<T>], index: usize) -> Option<T> {
     slots.get_mut(index).and_then(Option::take)
 }
@@ -1212,11 +1328,7 @@ fn readdirplus_census_line() -> String {
     let inline = READDIRPLUS_PREFETCH_INLINE.load(Relaxed);
     // Integer mean, to one decimal, without pulling in float formatting of a
     // quantity that is conceptually a count.
-    let mean_bound_tenths = if calls == 0 {
-        0
-    } else {
-        (bound_sum * 10) / calls
-    };
+    let mean_bound_tenths = (bound_sum * 10).checked_div(calls).unwrap_or(0);
     format!(
         "readdirplus_census,prefetch_calls={calls},bound_sum={bound_sum},\
          mean_bound_tenths={mean_bound_tenths},served={served},inline={inline},\
@@ -2377,7 +2489,6 @@ impl AtomicMetrics {
             readdirplus_memo_remembers: self.readdirplus_memo_remembers.0.load(Ordering::Relaxed),
             readdirplus_memo_hits: self.readdirplus_memo_hits.0.load(Ordering::Relaxed),
             forget_nodes: self.forget_nodes.0.load(Ordering::Relaxed),
-            ..Default::default()
         }
     }
 }
@@ -3068,22 +3179,18 @@ impl LastMissingCapabilityXattr {
     /// Read the kill switch. Default ON — `0`, `false` or `off` disables, matching
     /// the parsing every other `FFS_*` switch in this workspace uses.
     fn enabled_from_env() -> bool {
-        match std::env::var("FFS_FUSE_CAPABILITY_MEMO") {
-            Ok(raw) => {
-                let trimmed = raw.trim();
-                !(trimmed == "0"
-                    || trimmed.eq_ignore_ascii_case("false")
-                    || trimmed.eq_ignore_ascii_case("off"))
-            }
-            Err(_) => true,
-        }
+        std::env::var("FFS_FUSE_CAPABILITY_MEMO").map_or(true, |raw| {
+            let trimmed = raw.trim();
+            !(trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("off"))
+        })
     }
 
     /// Now a method rather than an associated function: the mask depends on this
     /// memo's own table size, which is no longer a compile-time constant.
     fn slot(&self, ino: u64) -> usize {
-        // Power-of-two length, so this is a mask.
-        (ino as usize) & (self.slots.len() - 1)
+        usize::try_from(ino).expect("inode fits host pointer width") & (self.slots.len() - 1)
     }
 
     /// Resolve the table size from `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (bd-m1bpu).
@@ -3213,8 +3320,7 @@ impl LastMissingCapabilityXattr {
         // panics, so a `.min()` applied afterwards is too late. The ceiling is
         // itself a power of two, so clamping first cannot push the result over it.
         let len = slots
-            .max(1)
-            .min(CAPABILITY_MEMO_SLOTS_MAX)
+            .clamp(1, CAPABILITY_MEMO_SLOTS_MAX)
             .next_power_of_two();
         Self {
             slots: (0..len).map(|_| AtomicU64::new(0)).collect(),
@@ -3366,6 +3472,9 @@ impl CapabilityBitmap {
 /// readdirplus reply to the getattr storm that follows it.
 const READDIRPLUS_ATTR_MEMO_SLOTS: usize = 1024;
 
+/// One readdirplus memo slot: inode number, publish-time generation, attributes.
+type ReaddirplusMemoEntry = Option<(InodeNumber, u64, InodeAttr)>;
+
 /// Carries the `InodeAttr` readdirplus already computed across to the `getattr`
 /// the kernel issues immediately afterwards.
 ///
@@ -3402,7 +3511,7 @@ struct ReaddirplusAttrMemo {
     /// whole (small) table keeps this a LEAF lock, matching `ReadonlyXattrCache`
     /// and preserving the subsystem lock-ordering invariant documented on
     /// `FuseInner`.
-    state: Mutex<Box<[Option<(InodeNumber, u64, InodeAttr)>]>>,
+    state: Mutex<Box<[ReaddirplusMemoEntry]>>,
     enabled: bool,
 }
 
@@ -3448,7 +3557,7 @@ impl ReaddirplusAttrMemo {
 
     fn slot(&self, ino: InodeNumber, len: usize) -> usize {
         let _ = self;
-        (ino.0 as usize) & (len - 1)
+        usize::try_from(ino.0).expect("inode fits host pointer width") & (len - 1)
     }
 
     /// Publish the attributes readdirplus just computed.
@@ -3481,7 +3590,7 @@ impl ReaddirplusAttrMemo {
         }
         let mut state = self.state.lock().ok()?;
         let idx = self.slot(ino, state.len());
-        match &state[idx] {
+        let hit = match &state[idx] {
             Some((slot_ino, generation, attr))
                 if *slot_ino == ino && *generation == attr.generation =>
             {
@@ -3490,7 +3599,9 @@ impl ReaddirplusAttrMemo {
                 Some(attr)
             }
             _ => None,
-        }
+        };
+        drop(state);
+        hit
     }
 
     /// Drop `ino`, on mutation or on the kernel dropping the inode.
@@ -5049,147 +5160,23 @@ impl Filesystem for FrankenFuse {
         // bd-xfe7z census: counted at handler entry, BEFORE the prefetch gate,
         // so `prefetch_calls` can be read as a fraction of the readdirplus calls
         // that actually happened rather than of a number nobody measured.
-        READDIRPLUS_HANDLER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let phase_timer = crossings::PhaseTimer::start(crossings::CrossingOp::Readdirplus);
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
             self.inner
                 .ops
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                // bd-xfe7z: optionally fetch the per-entry attributes in INODE
-                // order before emitting. Same calls, same count, same results --
-                // only the order in which the inode table is touched changes,
-                // which is what a hash-ordered (`dir_index`) directory makes
-                // random. OFF unless the knob is set, so this is inert by
-                // default and both arms of an A/B come from one ELF.
-                //
-                // ⛔ MEASURED HARMFUL 2026-08-17 — DO NOT ENABLE. Left in place,
-                // default OFF and inert, as the evidence for a rejected lever.
-                //
-                // The sentence that used to be here claimed prefetching is
-                // "bounded by the same `reply.add` fullness break as the inline
-                // path". That is FALSE, and writing it is what let the mistake
-                // through: the prefetch runs BEFORE any `reply.add`, so entries
-                // past the fill point are fetched, discarded when the loop
-                // breaks, and fetched AGAIN when the kernel re-issues readdir
-                // from that offset. Nothing is cached across readdir calls, so
-                // the overshoot is paid every time.
-                //
-                // Internal A/B, one ELF (v3+PGO), alternated off/on/off/on:
-                // getattr calls 40407 -> 104761 (2.59x, identical in both ON
-                // runs, so structural not noise), and getattr ns/entry
-                // 433.9/370.0 -> 554.8/535.6. The ordering win, if any, is
-                // buried under ~61% wasted fetches.
-                //
-                // BOUNDED as of 2026-08-17: `readdirplus_prefetch_bound` caps the
-                // prefetch at what the PREVIOUS reply emitted, so the overshoot
-                // above is capped rather than paid per call. The measured
-                // rejection is kept verbatim because the knob is still OFF by
-                // default and the bounded form is itself UNMEASURED -- it must
-                // clear the same 40407-vs-104761 scope count before anyone
-                // enables it.
-                // bd-xfe7z: bracket the whole pre-loop phase -- inos vector,
-                // fetch-order sort, slot allocation and the fetches -- so
-                // phase_ns - scope_ns isolates the setup from the fetching.
-                let _phase_timer = crossings::PhaseTimer::start(crossings::CrossingOp::Readdirplus);
-                let mut prefetched: Option<Vec<Option<ffs_core::vfs::InodeAttr>>> = if let Some(
-                    sort_by_inode,
-                ) =
-                    readdirplus_prefetch_mode(
-                        readdirplus_inode_order_from_env(),
-                        readdirplus_batch_attrs_from_env(),
-                    ) {
-                    // bd-xfe7z: times the whole prefetch block, scopes
-                    // included, so `prefetch_ns - ops_ns_getattr` isolates
-                    // the request-scope machinery from the format-layer work
-                    // already timed inside it.
-                    let _prefetch_timer =
-                        crossings::PrefetchTimer::start(crossings::CrossingOp::Readdirplus);
-                    // bd-xfe7z: BOUNDED by what the previous reply actually
-                    // emitted. This is the fix the rejection above called
-                    // for. Entries past the bound are left `None` and fetched
-                    // inline in the emit loop, exactly as the off arm does,
-                    // so the 2.59x overshoot cannot reappear -- and the batch
-                    // arm below inherits the bound rather than the overshoot.
-                    let bound = readdirplus_prefetch_bound(
-                        READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed),
-                        entries.len(),
-                    );
-                    // bd-xfe7z census: record the bound ACTUALLY used, not the
-                    // one the knob asked for. A batch arm whose bound sits at the
-                    // cold guess never collapsed anything, and the scope count
-                    // alone cannot tell that apart from "scopes are not the cost".
-                    READDIRPLUS_PREFETCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    READDIRPLUS_PREFETCH_BOUND_SUM
-                        .fetch_add(bound as u64, std::sync::atomic::Ordering::Relaxed);
-                    let inos: Vec<u64> = entries[..bound].iter().map(|e| e.ino.0).collect();
-                    let mut slots: Vec<Option<ffs_core::vfs::InodeAttr>> =
-                        (0..entries.len()).map(|_| None).collect();
-                    // bd-xfe7z: ONE scope for the whole fill, not one per
-                    // inode. The fetch ORDER is unchanged -- still inode
-                    // order, which is what buys the inode-table locality --
-                    // but the N scope opens collapse to 1.
-                    //
-                    // That is the measured target: on this workload
-                    // `getattr` owns 60.80% of daemon dispatch time at 1.01
-                    // scopes per entry, while wire crossings are 0.0053 per
-                    // entry. The cost is not transport and not readdir; it
-                    // is the per-entry fill, and until now every entry of it
-                    // paid for its own request scope.
-                    //
-                    // `FsOps::getattr_batch` defaults to looping over
-                    // `getattr`, so the ops layer does exactly the same work
-                    // and this isolates the scope overhead. If an A/B shows
-                    // nothing, the 60.80% is the attribute fetch itself and
-                    // the next lever belongs in the format layer.
-                    let order: Vec<usize> = readdirplus_fetch_order(sort_by_inode, &inos);
-                    if readdirplus_batch_attrs_from_env() {
-                        let ordered: Vec<InodeNumber> =
-                            order.iter().map(|index| entries[*index].ino).collect();
-                        if let Ok(results) =
-                            self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                                // bd-xfe7z: time the OPS-layer call only, so
-                                // dispatch_ns - ops_ns is the FUSE layer's own
-                                // overhead and ops_ns is the format layer's work.
-                                let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                                Ok(self.inner.ops.getattr_batch(cx, scope, &ordered))
-                            })
-                        {
-                            for (slot_index, result) in order.iter().zip(results) {
-                                if let Ok(attr) = result {
-                                    slots[*slot_index] = Some(attr);
-                                }
-                            }
-                        }
-                    } else {
-                        // The control: one request scope per inode, which is
-                        // what 1.01 scopes/entry measures.
-                        for index in order {
-                            let ino = entries[index].ino;
-                            let _scope_timer =
-                                crossings::ScopeTimer::start(crossings::CrossingOp::Getattr);
-                            if let Ok(attr) =
-                                self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                                    let _t =
-                                        crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                                    self.inner.ops.getattr(cx, scope, ino)
-                                })
-                            {
-                                slots[index] = Some(attr);
-                            }
-                        }
-                    }
-                    Some(slots)
-                } else {
-                    None
-                };
-                // End the phase HERE, explicitly. `_phase_timer` is bound in the
-                // same block as the emit loop, so RAII alone would keep it alive
-                // across that loop and the "phase" would silently include it:
-                // the timer would measure phase+loop, and `phase_ns - scope_ns`
-                // would attribute loop work to setup. An underscore-prefixed
-                // binding still drops at end of SCOPE, not at end of intent.
-                drop(_phase_timer);
+                // bd-xfe7z: optionally pre-fetch entry attributes in inode
+                // order before emitting; the lever's full measured history
+                // lives on [`readdirplus_prefetch_attrs`].
+                let mut prefetched = readdirplus_prefetch_attrs(self, &cx, &entries);
+                // End the phase HERE, explicitly. `phase_timer` is bound in
+                // the same block as the emit loop, so RAII alone would keep it
+                // alive across that loop and the "phase" would silently
+                // include it: the timer would measure phase+loop, and
+                // `phase_ns - scope_ns` would attribute loop work to setup.
+                drop(phase_timer);
 
                 let mut emitted: usize = 0;
                 // bd-xfe7z census, accumulated LOCALLY across this reply's emit
@@ -5220,14 +5207,13 @@ impl Filesystem for FrankenFuse {
                         // only place that can tell them apart. Skipping the entry
                         // here instead would drop every entry beyond the bound
                         // from the directory listing.
-                        Some(slots) => match take_prefetched(slots, index) {
-                            Some(attr) => {
+                        Some(slots) => {
+                            if let Some(attr) = take_prefetched(slots, index) {
                                 // bd-xfe7z census: served from the prefetch, so
                                 // this entry cost no scope of its own.
                                 census_served += 1;
                                 attr
-                            }
-                            None => {
+                            } else {
                                 // Census: past the bound OR a failed prefetch —
                                 // this entry pays its own scope after all, which
                                 // is exactly what a bounded-short arm looks like.
@@ -5251,7 +5237,7 @@ impl Filesystem for FrankenFuse {
                                     Err(_) => continue,
                                 }
                             }
-                        },
+                        }
                         None => {
                             // bd-xfe7z: the DEFAULT path, with no prefetch at all.
                             // It was the only getattr in readdirplus without an
@@ -6576,7 +6562,7 @@ pub fn mount(
     // counts request scopes and missed 5979 of 6001 warm stats (bdd0fd1b);
     // crossings_total counts what reached `dispatch`. A future fast path that
     // answers before the scope opens will show up as the gap between them.
-    emit_crossing_evidence(crossings::render_live_timed());
+    emit_crossing_evidence(&crossings::render_live_timed());
     // bd-viil0: the session has run to completion, so these are the FINAL counters.
     // Returning them rather than `()` is what lets the STANDARD mount runtime report
     // real dispatch attribution instead of hand-constructed zeros — the managed

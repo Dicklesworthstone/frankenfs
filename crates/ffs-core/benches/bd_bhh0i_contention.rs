@@ -21,16 +21,16 @@ const ALLOC_BYTES: usize = 4096;
 
 #[derive(Default)]
 struct Samples {
-    wait_ns: Mutex<Vec<u64>>,
-    hold_ns: Mutex<Vec<u64>>,
-    alloc_ns: Mutex<Vec<u64>>,
+    wait: Mutex<Vec<u64>>,
+    hold: Mutex<Vec<u64>>,
+    alloc: Mutex<Vec<u64>>,
 }
 
 impl Samples {
     fn record(&self, wait_ns: u64, hold_ns: u64, alloc_ns: u64) {
-        self.wait_ns.lock().push(wait_ns);
-        self.hold_ns.lock().push(hold_ns);
-        self.alloc_ns.lock().push(alloc_ns);
+        self.wait.lock().push(wait_ns);
+        self.hold.lock().push(hold_ns);
+        self.alloc.lock().push(alloc_ns);
     }
 }
 
@@ -53,7 +53,7 @@ impl GroupState {
         self.checksum = self
             .checksum
             .wrapping_add(self.free_inodes)
-            .rotate_left((op & 31) as u32)
+            .rotate_left(u32::try_from(op & 31).expect("op & 31 fits u32"))
             ^ seed;
         self.checksum
     }
@@ -92,12 +92,13 @@ fn run_current_global(threads: usize) -> (Samples, Samples, u64) {
                     let wait_ns = elapsed_ns(wait_start);
 
                     let hold_start = Instant::now();
-                    let (buf, alloc_ns) = timed_alloc(tid as u8);
-                    local = local.wrapping_add(groups[group].account(op, buf[0] as u64));
+                    let (buf, alloc_ns) = timed_alloc(u8::try_from(tid).expect("threads fit u8"));
+                    local = local.wrapping_add(groups[group].account(op, u64::from(buf[0])));
                     black_box(&buf);
                     drop(buf);
                     let hold_ns = elapsed_ns(hold_start);
                     alloc_samples.record(wait_ns, hold_ns, alloc_ns);
+                    drop(groups);
                 }
                 digest.fetch_add(local, Ordering::Relaxed);
             });
@@ -140,8 +141,8 @@ fn run_decomposed(threads: usize) -> (Samples, Samples, u64) {
                     let wait_ns = elapsed_ns(wait_start);
 
                     let hold_start = Instant::now();
-                    let (buf, alloc_ns) = timed_alloc(tid as u8);
-                    local = local.wrapping_add(group_state.account(op, buf[0] as u64));
+                    let (buf, alloc_ns) = timed_alloc(u8::try_from(tid).expect("threads fit u8"));
+                    local = local.wrapping_add(group_state.account(op, u64::from(buf[0])));
                     black_box(&buf);
                     drop(buf);
                     let hold_ns = elapsed_ns(hold_start);
@@ -152,9 +153,12 @@ fn run_decomposed(threads: usize) -> (Samples, Samples, u64) {
                     let mut published = publish_lock.lock();
                     let publish_wait_ns = elapsed_ns(wait_start);
                     let hold_start = Instant::now();
-                    *published = published.wrapping_add(local.rotate_left((op & 31) as u32));
+                    *published = published.wrapping_add(
+                        local.rotate_left(u32::try_from(op & 31).expect("op & 31 fits u32")),
+                    );
                     let publish_hold_ns = elapsed_ns(hold_start);
                     publish_samples.record(publish_wait_ns, publish_hold_ns, 0);
+                    drop(published);
                 }
                 digest.fetch_add(local, Ordering::Relaxed);
             });
@@ -193,15 +197,21 @@ fn stats(samples: &[u64]) -> (u64, u64, u64, f64) {
 }
 
 fn print_samples(label: &str, threads: usize, samples: &Samples) {
-    let wait = samples.wait_ns.lock();
-    let hold = samples.hold_ns.lock();
-    let alloc = samples.alloc_ns.lock();
-    let (wait_med, wait_p95, wait_p99, wait_mean) = stats(&wait);
-    let (hold_med, hold_p95, hold_p99, hold_mean) = stats(&hold);
-    let (alloc_med, alloc_p95, alloc_p99, alloc_mean) = stats(&alloc);
+    let (op_count, (wait_med, wait_p95, wait_p99, wait_mean)) = {
+        let wait = samples.wait.lock();
+        (wait.len(), stats(&wait))
+    };
+    let (hold_med, hold_p95, hold_p99, hold_mean) = {
+        let hold = samples.hold.lock();
+        stats(&hold)
+    };
+    let (alloc_med, alloc_p95, alloc_p99, alloc_mean) = {
+        let alloc = samples.alloc.lock();
+        stats(&alloc)
+    };
     println!(
         "{label},threads={threads},ops={},wait_us_med={:.3},wait_us_p95={:.3},wait_us_p99={:.3},wait_us_mean={:.3},hold_us_med={:.3},hold_us_p95={:.3},hold_us_p99={:.3},hold_us_mean={:.3},alloc_us_med={:.3},alloc_us_p95={:.3},alloc_us_p99={:.3},alloc_us_mean={:.3}",
-        wait.len(),
+        op_count,
         wait_med as f64 / 1000.0,
         wait_p95 as f64 / 1000.0,
         wait_p99 as f64 / 1000.0,
@@ -308,7 +318,7 @@ fn model_step(mut state: ModelState, thread: usize) -> Option<ModelState> {
     Some(state)
 }
 
-fn explore_model(state: ModelState, terminal: &mut u64, deadlocks: &mut u64) {
+fn explore_model(state: &ModelState, terminal: &mut u64, deadlocks: &mut u64) {
     let done = (0..2).all(|thread| state.pc[thread] == model_program(thread).len());
     if done {
         assert_eq!(state.global_delta, [1, 1]);
@@ -324,7 +334,7 @@ fn explore_model(state: ModelState, terminal: &mut u64, deadlocks: &mut u64) {
     for thread in 0..2 {
         if let Some(next) = model_step(state.clone(), thread) {
             enabled += 1;
-            explore_model(next, terminal, deadlocks);
+            explore_model(&next, terminal, deadlocks);
         }
     }
     if enabled == 0 {
@@ -343,7 +353,7 @@ fn run_model() {
         global_delta: [0, 0],
         published: Vec::new(),
     };
-    explore_model(state, &mut terminal, &mut deadlocks);
+    explore_model(&state, &mut terminal, &mut deadlocks);
     println!(
         "bounded_model,threads=2,terminal_interleavings={terminal},deadlocks={deadlocks},final_state_conserved=true,linearizable=unproven"
     );

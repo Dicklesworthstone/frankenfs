@@ -21,7 +21,7 @@ const GROUPS: usize = 128;
 const IN_USE_EVERY: usize = 16;
 
 fn in_use(g: usize) -> bool {
-    g % IN_USE_EVERY == 0
+    g.is_multiple_of(IN_USE_EVERY)
 }
 
 /// Mirrors `direct.read_block(cx, block)?.into_inner()`: a block-sized alloc +
@@ -133,8 +133,11 @@ fn one_pass_sum(groups: &[GroupLike]) -> (u64, u64) {
 fn bench_ext4_free_totals_sum(c: &mut Criterion) {
     let groups: Vec<GroupLike> = (0..SUM_GROUPS)
         .map(|k| GroupLike {
-            free_blocks: (k as u32) & 0xFFFF,
-            free_inodes: (k as u32).wrapping_mul(3) & 0xFFFF,
+            free_blocks: u32::try_from(k).expect("group count fits u32") & 0xFFFF,
+            free_inodes: u32::try_from(k)
+                .expect("group count fits u32")
+                .wrapping_mul(3)
+                & 0xFFFF,
             ..Default::default()
         })
         .collect();

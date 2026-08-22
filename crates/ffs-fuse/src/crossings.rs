@@ -28,6 +28,7 @@
 //! One device read is one crossing; anything that can be skipped is not the
 //! boundary.
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The opcodes worth attributing separately on the metadata path.
@@ -143,9 +144,9 @@ impl Crossings {
             if !out.is_empty() {
                 out.push(' ');
             }
-            out.push_str(&format!("crossings_{}={}", op.label(), self.get(op)));
+            let _ = write!(out, "crossings_{}={}", op.label(), self.get(op));
         }
-        out.push_str(&format!(" crossings_total={}", self.total()));
+        let _ = write!(out, " crossings_total={}", self.total());
         out
     }
 
@@ -178,9 +179,9 @@ pub fn render_fuser_counts(counts: [u64; fuser::CROSSING_SLOTS]) -> String {
         }
         let value = counts[op.index()];
         total += value;
-        out.push_str(&format!("crossings_{}={}", op.label(), value));
+        let _ = write!(out, "crossings_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" crossings_total={total}"));
+    let _ = write!(out, " crossings_total={total}");
     out
 }
 
@@ -200,9 +201,9 @@ pub fn render_fuser_nanos(nanos: [u64; fuser::CROSSING_SLOTS]) -> String {
         }
         let value = nanos[op.index()];
         total += value;
-        out.push_str(&format!("dispatch_ns_{}={}", op.label(), value));
+        let _ = write!(out, "dispatch_ns_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" dispatch_ns_total={total}"));
+    let _ = write!(out, " dispatch_ns_total={total}");
     out
 }
 
@@ -272,9 +273,9 @@ pub fn render_ops_nanos() -> String {
         }
         let value = OPS_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
         total += value;
-        out.push_str(&format!("ops_ns_{}={}", op.label(), value));
+        let _ = write!(out, "ops_ns_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" ops_ns_total={total}"));
+    let _ = write!(out, " ops_ns_total={total}");
     out
 }
 
@@ -384,9 +385,9 @@ pub fn render_prefetch_nanos() -> String {
         }
         let value = PREFETCH_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
         total += value;
-        out.push_str(&format!("prefetch_ns_{}={}", op.label(), value));
+        let _ = write!(out, "prefetch_ns_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" prefetch_ns_total={total}"));
+    let _ = write!(out, " prefetch_ns_total={total}");
     out
 }
 
@@ -401,9 +402,9 @@ pub fn render_reply_nanos() -> String {
         }
         let value = REPLY_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
         total += value;
-        out.push_str(&format!("reply_ns_{}={}", op.label(), value));
+        let _ = write!(out, "reply_ns_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" reply_ns_total={total}"));
+    let _ = write!(out, " reply_ns_total={total}");
     out
 }
 
@@ -457,9 +458,9 @@ pub fn render_scope_nanos() -> String {
         }
         let value = SCOPE_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
         total += value;
-        out.push_str(&format!("scope_ns_{}={}", op.label(), value));
+        let _ = write!(out, "scope_ns_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" scope_ns_total={total}"));
+    let _ = write!(out, " scope_ns_total={total}");
     out
 }
 
@@ -519,9 +520,9 @@ pub fn render_loop_nanos() -> String {
         }
         let value = LOOP_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
         total += value;
-        out.push_str(&format!("loop_ns_{}={}", op.label(), value));
+        let _ = write!(out, "loop_ns_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" loop_ns_total={total}"));
+    let _ = write!(out, " loop_ns_total={total}");
     out
 }
 
@@ -579,9 +580,9 @@ pub fn render_phase_nanos() -> String {
         }
         let value = PHASE_NANOS[op.index()].load(std::sync::atomic::Ordering::Relaxed);
         total += value;
-        out.push_str(&format!("phase_ns_{}={}", op.label(), value));
+        let _ = write!(out, "phase_ns_{}={}", op.label(), value);
     }
-    out.push_str(&format!(" phase_ns_total={total}"));
+    let _ = write!(out, " phase_ns_total={total}");
     out
 }
 
