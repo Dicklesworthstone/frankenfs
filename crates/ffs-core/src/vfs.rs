@@ -450,19 +450,14 @@ impl RequestOp {
 }
 
 /// Commit boundary policy carried by an MVCC request scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestCommitMode {
     /// The current FUSE behavior: commit before the request returns.
+    #[default]
     PerRequest,
     /// A caller is deliberately holding the scope across several writes and
     /// will commit it at a flush/fsync/release boundary.
     DeferredUntilFlush,
-}
-
-impl Default for RequestCommitMode {
-    fn default() -> Self {
-        Self::PerRequest
-    }
 }
 
 /// MVCC scope acquired for a single VFS request or an explicit writeback batch.
@@ -769,6 +764,7 @@ pub struct QuotaInfo {
 /// - Write operations have default implementations returning `FfsError::ReadOnly`.
 /// - `begin_request_scope`/`end_request_scope` provide a policy hook for
 ///   per-request MVCC snapshot/transaction management.
+///
 /// What a filesystem can say about whether it carries extended attributes.
 ///
 /// Three-state on purpose (bd-ha71t). `FFS_FUSE_XATTR_NO_SUPPORT` suppresses the

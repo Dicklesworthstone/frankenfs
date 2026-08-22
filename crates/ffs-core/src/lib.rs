@@ -1624,8 +1624,7 @@ pub struct OpenFs {
     /// the inode's extents are immutable, so resolve them once (the full extent
     /// list) and filter the read window in-memory thereafter. Keyed by inode
     /// objectid (as a `BlockNumber` to reuse the `CacheShard` impl).
-    btrfs_ro_inode_extents:
-        ShardedCache<BlockNumber, Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)>>,
+    btrfs_ro_inode_extents: ShardedCache<BlockNumber, BtrfsRoInodeExtents>,
     /// Lock-free single-slot "hot inode" cache in front of
     /// [`Self::btrfs_ro_inode_extents`]. A single-file random-read stream
     /// resolves the SAME inode every read; `btrfs_ro_inode_extents.get()` takes
@@ -1638,8 +1637,7 @@ pub struct OpenFs {
     /// back to the sharded cache, then publishes the new inode into the slot
     /// (last-writer-wins; a transient over-write is harmless — the value is the
     /// same immutable RO extent list the sharded cache holds).
-    btrfs_hot_inode_extents:
-        arc_swap::ArcSwapOption<(u64, Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)>)>,
+    btrfs_hot_inode_extents: arc_swap::ArcSwapOption<(u64, BtrfsRoInodeExtents)>,
     /// Lock-free single-slot "hot inode" cache for the ext4 read path — the
     /// ext4 analog of [`Self::btrfs_hot_inode_extents`]. Every `read_into`
     /// resolves the inode via `read_inode_with_scope`, which hits the
@@ -1811,6 +1809,14 @@ pub struct OpenFs {
     btrfs_decompressed_extent_cache: ShardedCache<u64, Arc<Vec<u8>>>,
 }
 
+/// Parsed read-only btrfs inode entry shared by the sharded extent cache and
+/// the lock-free hot-inode slot: the INODE_ITEM plus its full
+/// `(logical offset, EXTENT_DATA)` extent list.
+type BtrfsRoInodeExtents = Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)>;
+
+/// Immutable directory rows of [`BtrfsReadPlanIndex`], shared as a slice.
+type BtrfsDirItems = Arc<[(BtrfsKey, Vec<u8>)]>;
+
 struct Ext4WriteExtentSnapshot {
     namespace: u64,
     root_namespace: u64,
@@ -1823,7 +1829,7 @@ struct BtrfsReadPlanIndex {
     // getattr path while `dir_items` below remains ordered for directory order.
     inodes: rustc_hash::FxHashMap<u64, BtrfsInodeItem>,
     extents: rustc_hash::FxHashMap<u64, Arc<[(u64, BtrfsExtentData)]>>,
-    dir_items: BTreeMap<u64, Arc<[(BtrfsKey, Vec<u8>)]>>,
+    dir_items: BTreeMap<u64, BtrfsDirItems>,
     parents: rustc_hash::FxHashMap<u64, u64>,
     /// Every `XATTR_ITEM` key in the subvolume, as `(objectid, name_hash)`
     /// (bd-t0xoq).
@@ -2003,10 +2009,13 @@ fn readdir_snapshot_serve(
     validation: ReaddirValidation,
     offset: u64,
 ) -> Option<ReaddirPage> {
-    let guard = slot.lock();
-    let snap = guard.as_ref()?;
-    (snap.ino == ino && snap.validation == validation)
-        .then(|| slice_readdir_snapshot(Arc::clone(&snap.entries), offset))
+    let entries = {
+        let guard = slot.lock();
+        let snap = guard.as_ref()?;
+        (snap.ino == ino && snap.validation == validation)
+            .then(|| Arc::clone(&snap.entries))
+    };
+    entries.map(|entries| slice_readdir_snapshot(entries, offset))
 }
 
 /// Serve a readdir page from the snapshot WITHOUT re-validating it.
@@ -2026,9 +2035,12 @@ fn readdir_snapshot_serve_unvalidated(
     ino: u64,
     offset: u64,
 ) -> Option<ReaddirPage> {
-    let guard = slot.lock();
-    let snap = guard.as_ref()?;
-    (snap.ino == ino).then(|| slice_readdir_snapshot(Arc::clone(&snap.entries), offset))
+    let entries = {
+        let guard = slot.lock();
+        let snap = guard.as_ref()?;
+        (snap.ino == ino).then(|| Arc::clone(&snap.entries))
+    };
+    entries.map(|entries| slice_readdir_snapshot(entries, offset))
 }
 
 /// Clear the readdir snapshot slot. Called on every directory mutation so a later
@@ -2777,11 +2789,12 @@ impl BlockDevice for MetadataLogCaptureDevice<'_> {
                 start.0
             )));
         }
-        let mut writes = self.writes.write();
         for (delta, bytes) in data.chunks_exact(block_size).enumerate() {
             let delta = u64::try_from(delta)
                 .map_err(|_| FfsError::Format("block delta does not fit u64".to_owned()))?;
-            writes.insert(BlockNumber(start.0 + delta), bytes.to_vec());
+            self.writes
+                .write()
+                .insert(BlockNumber(start.0 + delta), bytes.to_vec());
         }
         Ok(())
     }
@@ -2889,15 +2902,12 @@ impl MetadataCompactor {
             loop {
                 match receiver.recv_timeout(Self::QUIESCENCE_WINDOW) {
                     Ok(MetadataCompactionCommand::Batch(batch)) => latest.extend(batch),
-                    Ok(MetadataCompactionCommand::Shutdown) => {
+                    Ok(MetadataCompactionCommand::Shutdown)
+                    | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         stop_after_batch = true;
                         break;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        stop_after_batch = true;
-                        break;
-                    }
                 }
             }
 
@@ -3599,8 +3609,10 @@ impl TransactionBlockAdapter<'_, '_> {
         proof: MergeProof,
         patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<(), FfsError>,
     ) -> Result<(), FfsError> {
-        let mut tx = self.tx.lock();
-        let snapshot = tx.snapshot();
+        let snapshot = {
+            let tx = self.tx.lock();
+            tx.snapshot()
+        };
         let (ancestor, _device_base) = self
             .base
             .read_merge_ancestor_at_snapshot(cx, block, snapshot)?;
@@ -3623,12 +3635,12 @@ impl TransactionBlockAdapter<'_, '_> {
         //
         // Cost is one block-sized clone per RMW; it is only consumed on a
         // same-block conflict, and the alternative is aborting valid work.
-        let ancestor_bytes = ancestor.as_slice().to_vec();
+        let mut tx = self.tx.lock();
         let already_staged = tx.staged_write(block).is_some();
-        let mut data = match tx.staged_write(block) {
-            Some(staged) => staged.to_vec(),
-            None => ancestor_bytes.clone(),
-        };
+        let mut data = tx.staged_write(block).map_or_else(
+            || ancestor_bytes.clone(),
+            |staged| staged.to_vec(),
+        );
         patch(&mut data)?;
         // A transaction may RMW the SAME block more than once — an unlink writes
         // the deleted child's zeroed inode and its parent directory's inode, and a
@@ -8385,6 +8397,7 @@ impl OpenFs {
             self.mvcc_store
                 .flush_to_device_after(cx, device, *flushed_through)?;
         *flushed_through = (*flushed_through).max(durable_through);
+        drop(flushed_through);
         Ok(flushed)
     }
 
@@ -8454,7 +8467,8 @@ impl OpenFs {
     }
 
     fn shutdown_metadata_compactor(&self) {
-        if let Some(mut compactor) = self.metadata_compactor.lock().take() {
+        let compactor = self.metadata_compactor.lock().take();
+        if let Some(mut compactor) = compactor {
             compactor.shutdown();
         }
     }
@@ -8862,17 +8876,16 @@ impl OpenFs {
         let mut dev_tree = InMemoryCowBtrfsTree::new(max_items)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
             .with_node_byte_budget((nodesize as usize).saturating_sub(101));
-        let mut chunk_trees_authoritative = true;
-
-        if sb.chunk_root == 0 {
+        let mut chunk_trees_authoritative = if sb.chunk_root == 0 {
             // No chunk tree at all. Every mountable btrfs filesystem has one, so
             // this is not a filesystem we may grow.
             debug!(target: "ffs::write", "superblock has no chunk_root");
-            chunk_trees_authoritative = false;
+            false
         } else {
             match self.walk_btrfs_tree(cx, sb.chunk_root) {
                 Ok(items) => {
                     let mut loaded = 0_usize;
+                    let mut chunk_tree_loaded = true;
                     for item in items {
                         let key = BtrfsKey {
                             objectid: item.key.objectid,
@@ -8882,7 +8895,7 @@ impl OpenFs {
                         if chunk_tree.insert(key, &item.data).is_ok() {
                             loaded += 1;
                         } else {
-                            chunk_trees_authoritative = false;
+                            chunk_tree_loaded = false;
                         }
                     }
                     debug!(
@@ -8891,6 +8904,7 @@ impl OpenFs {
                         chunk_root = sb.chunk_root,
                         "loaded on-disk chunk_tree entries"
                     );
+                    chunk_tree_loaded
                 }
                 Err(e) => {
                     warn!(
@@ -8898,10 +8912,10 @@ impl OpenFs {
                         error = %e,
                         "failed to walk chunk_tree; chunk allocation is disabled for this mount"
                     );
-                    chunk_trees_authoritative = false;
+                    false
                 }
             }
-        }
+        };
 
         // The device tree may legitimately be absent on an image our own
         // generators produced, which is why its absence disables growth rather
@@ -9255,18 +9269,17 @@ impl OpenFs {
         );
 
         // Notify repair lifecycle on successful commit (spec §12.1.3).
-        if !write_blocks.is_empty() {
-            if let Some(ref lifecycle) = self.repair_flush_lifecycle
-                && let Err(e) = lifecycle.on_flush_committed(cx, &write_blocks)
-            {
-                warn!(
-                    target: "ffs::repair",
-                    txn_id = txn_id.0,
-                    block_count = write_blocks.len(),
-                    error = %e,
-                    "repair_lifecycle_notify_failed"
-                );
-            }
+        if !write_blocks.is_empty()
+            && let Some(lifecycle) = &self.repair_flush_lifecycle
+            && let Err(e) = lifecycle.on_flush_committed(cx, &write_blocks)
+        {
+            warn!(
+                target: "ffs::repair",
+                txn_id = txn_id.0,
+                block_count = write_blocks.len(),
+                error = %e,
+                "repair_lifecycle_notify_failed"
+            );
         }
 
         Ok((commit_seq, jbd2_stats))
@@ -10209,7 +10222,7 @@ impl OpenFs {
         let attr = if let Some(index) = read_plan
             && let Some(inode) = index.inodes.get(&canonical)
         {
-            self.btrfs_inode_attr_from_item(ino, inode.clone())?
+            self.btrfs_inode_attr_from_item(ino, *inode)?
         } else {
             let inode = self.btrfs_read_ondisk_inode_item(cx, canonical)?;
             self.btrfs_inode_attr_from_item(ino, inode)?
@@ -10418,7 +10431,7 @@ impl OpenFs {
         let mut seen: rustc_hash::FxHashSet<&[u8]> =
             rustc_hash::FxHashSet::with_capacity_and_hasher(
                 rows.len(),
-                rustc_hash::FxBuildHasher::default(),
+                rustc_hash::FxBuildHasher,
             );
         let mut keep: Vec<bool> = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -11735,6 +11748,11 @@ impl OpenFs {
         // enabled (off by default), so the hot btrfs read path pays nothing for it
         // otherwise. The trace! records use the same default target/level, so the
         // guard is consistent with their own enablement.
+        // bd-4tw2n: the read-only decompressed-extent cache is consulted/filled
+        // only when writes are disabled (the on-disk compressed data is then
+        // immutable). The limit is read once from the environment so memory can
+        // be tuned per workload; 0 disables the cache.
+        static BTRFS_DECOMP_CACHE_ENTRIES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let read_started = tracing::enabled!(tracing::Level::TRACE).then(Instant::now);
         let canonical = self.btrfs_canonical_inode(ino)?;
         trace!(inode = canonical, offset, length = size, "btrfs read_start");
@@ -11809,7 +11827,7 @@ impl OpenFs {
                 }
                 (inode, exts)
             } else if let Some(index) = self.btrfs_cached_read_plan_index() {
-                let inode = index.inodes.get(&canonical).cloned().ok_or_else(|| {
+                let inode = index.inodes.get(&canonical).copied().ok_or_else(|| {
                     FfsError::NotFound(format!("btrfs INODE_ITEM for objectid {canonical}"))
                 })?;
                 let read_end = offset.saturating_add(u64::from(size));
@@ -11846,14 +11864,13 @@ impl OpenFs {
                 {
                     Some(slot) if slot.0 == canonical => &slot.1,
                     _ => {
-                        let e = match self.btrfs_ro_inode_extents.get(&key) {
-                            Some(e) => e,
-                            None => {
-                                let built = self.btrfs_load_inode_all_extents(cx, canonical)?;
-                                let arc = Arc::new(built);
-                                self.btrfs_ro_inode_extents.insert(key, Arc::clone(&arc));
-                                arc
-                            }
+                        let e = if let Some(e) = self.btrfs_ro_inode_extents.get(&key) {
+                            e
+                        } else {
+                            let built = self.btrfs_load_inode_all_extents(cx, canonical)?;
+                            let arc = Arc::new(built);
+                            self.btrfs_ro_inode_extents.insert(key, Arc::clone(&arc));
+                            arc
                         };
                         // Publish into the lock-free slot for the next read of
                         // this inode (last-writer-wins; the value is the same
@@ -12069,11 +12086,6 @@ impl OpenFs {
         // length is only known after decompression (overlap can't be
         // pre-checked), matching the assembly loop which also decompresses
         // inline extents before testing overlap.
-        // bd-4tw2n: the read-only decompressed-extent cache is consulted/filled
-        // only when writes are disabled (the on-disk compressed data is then
-        // immutable). The limit is read once from the environment so memory can
-        // be tuned per workload; 0 disables the cache.
-        static BTRFS_DECOMP_CACHE_ENTRIES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let decomp_cache_limit = *BTRFS_DECOMP_CACHE_ENTRIES.get_or_init(|| {
             std::env::var("FFS_BTRFS_DECOMP_CACHE_ENTRIES")
                 .ok()
@@ -12084,6 +12096,7 @@ impl OpenFs {
         let mut deferred_by_idx: Vec<Option<Result<BtrfsDeferredReadResult, FfsError>>> =
             (0..extents.len()).map(|_| None).collect();
         {
+            static BTRFS_CHUNK_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             use rayon::prelude::{IntoParallelIterator, ParallelIterator};
             // A deferred read job, consumed by one parallel map so that a read
             // spanning N extents overlaps its N device-read latencies across
@@ -12282,7 +12295,6 @@ impl OpenFs {
             // fills the Rayon pool; regular compressed extents stay one job per
             // compressed extent so each worker can decompress, copy, and drop.
             let bs_usize = self.block_size() as usize;
-            static BTRFS_CHUNK_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             let chunk_blocks = *BTRFS_CHUNK_BLOCKS.get_or_init(|| {
                 std::env::var("FFS_READ_CHUNK_BLOCKS")
                     .ok()
@@ -12856,20 +12868,19 @@ impl OpenFs {
             let buf = &block_data[offset_in_block..offset_in_block + desc_len];
 
             // Verify checksum if metadata_csum is enabled.
-            if let Some(geom) = &self.ext4_geometry {
-                if geom.group_desc_checksum_kind
+            if let Some(geom) = &self.ext4_geometry
+                && geom.group_desc_checksum_kind
                     != ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
-                {
-                    ffs_ondisk::ext4::verify_group_desc_checksum(
-                        buf,
-                        &geom.uuid,
-                        geom.csum_seed,
-                        group.0,
-                        desc_size,
-                        geom.group_desc_checksum_kind,
-                    )
-                    .map_err(|e| parse_to_ffs_error(&e))?;
-                }
+            {
+                ffs_ondisk::ext4::verify_group_desc_checksum(
+                    buf,
+                    &geom.uuid,
+                    geom.csum_seed,
+                    group.0,
+                    desc_size,
+                    geom.group_desc_checksum_kind,
+                )
+                .map_err(|e| parse_to_ffs_error(&e))?;
             }
 
             Ext4GroupDesc::parse_from_bytes(buf, desc_size).map_err(|e| parse_to_ffs_error(&e))
@@ -12938,50 +12949,17 @@ impl OpenFs {
                 }
 
                 self.with_block_bytes(cx, scope, block_num, |block_data| {
-                    let mut blocks_free = 0_u64;
-                    let mut files_free = 0_u64;
-                    for group_idx in first_group..last_group {
-                        let group = GroupNumber(group_idx);
-                        let offset = sb.group_desc_offset(group).ok_or_else(|| {
-                            FfsError::InvalidGeometry("group desc offset overflow".into())
-                        })?;
-                        let offset_in_block = usize::try_from(offset % bs).map_err(|_| {
-                            FfsError::InvalidGeometry(
-                                "group desc offset within block exceeds addressable range".into(),
-                            )
-                        })?;
-                        if offset_in_block + desc_size > block_data.len() {
-                            return Err(FfsError::Corruption {
-                                block: block_num.0,
-                                detail:
-                                    "group descriptor crosses block boundary or truncated block"
-                                        .into(),
-                            });
-                        }
-                        let buf = &block_data[offset_in_block..offset_in_block + desc_size];
-                        if let Some(geom) = &self.ext4_geometry
-                            && geom.group_desc_checksum_kind
-                                != ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
-                        {
-                            ffs_ondisk::ext4::verify_group_desc_checksum(
-                                buf,
-                                &geom.uuid,
-                                geom.csum_seed,
-                                group.0,
-                                geo.desc_size,
-                                geom.group_desc_checksum_kind,
-                            )
-                            .map_err(|e| parse_to_ffs_error(&e))?;
-                        }
-                        let gd = Ext4GroupDesc::parse_from_bytes(buf, geo.desc_size)
-                            .map_err(|e| parse_to_ffs_error(&e))?;
-                        blocks_free = blocks_free.saturating_add(u64::from(gd.free_blocks_count));
-                        files_free = files_free.saturating_add(u64::from(gd.free_inodes_count));
-                        if cacheable {
-                            self.ext4_group_desc_cache.insert(group, gd);
-                        }
-                    }
-                    Ok((blocks_free, files_free))
+                    self.ext4_sum_group_desc_block(
+                        sb,
+                        geo,
+                        desc_size,
+                        bs,
+                        block_num,
+                        first_group,
+                        last_group,
+                        cacheable,
+                        block_data,
+                    )
                 })?
             })
             .collect();
@@ -12992,6 +12970,67 @@ impl OpenFs {
             let (group_blocks, group_inodes) = result?;
             blocks_free = blocks_free.saturating_add(group_blocks);
             files_free = files_free.saturating_add(group_inodes);
+        }
+        Ok((blocks_free, files_free))
+    }
+
+    /// Sum the free-block / free-inode counts of every group descriptor packed
+    /// into one GD-table block, verifying each descriptor's checksum and
+    /// optionally populating the read-only group-descriptor cache. Split out of
+    /// [`Self::read_only_statfs_group_desc_totals`] to keep that function's
+    /// parallel map readable.
+    fn ext4_sum_group_desc_block(
+        &self,
+        sb: &Ext4Superblock,
+        geo: &FsGeometry,
+        desc_size: usize,
+        bs: u64,
+        block_num: BlockNumber,
+        first_group: u64,
+        last_group: u64,
+        cacheable: bool,
+        block_data: &[u8],
+    ) -> Result<(u64, u64), FfsError> {
+        let mut blocks_free = 0_u64;
+        let mut files_free = 0_u64;
+        for group_idx in first_group..last_group {
+            let group = GroupNumber(group_idx);
+            let offset = sb
+                .group_desc_offset(group)
+                .ok_or_else(|| FfsError::InvalidGeometry("group desc offset overflow".into()))?;
+            let offset_in_block = usize::try_from(offset % bs).map_err(|_| {
+                FfsError::InvalidGeometry(
+                    "group desc offset within block exceeds addressable range".into(),
+                )
+            })?;
+            if offset_in_block + desc_size > block_data.len() {
+                return Err(FfsError::Corruption {
+                    block: block_num.0,
+                    detail: "group descriptor crosses block boundary or truncated block".into(),
+                });
+            }
+            let buf = &block_data[offset_in_block..offset_in_block + desc_size];
+            if let Some(geom) = &self.ext4_geometry
+                && geom.group_desc_checksum_kind
+                    != ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
+            {
+                ffs_ondisk::ext4::verify_group_desc_checksum(
+                    buf,
+                    &geom.uuid,
+                    geom.csum_seed,
+                    group.0,
+                    geo.desc_size,
+                    geom.group_desc_checksum_kind,
+                )
+                .map_err(|e| parse_to_ffs_error(&e))?;
+            }
+            let gd =
+                Ext4GroupDesc::parse_from_bytes(buf, geo.desc_size).map_err(|e| parse_to_ffs_error(&e))?;
+            blocks_free = blocks_free.saturating_add(u64::from(gd.free_blocks_count));
+            files_free = files_free.saturating_add(u64::from(gd.free_inodes_count));
+            if cacheable {
+                self.ext4_group_desc_cache.insert(group, gd);
+            }
         }
         Ok((blocks_free, files_free))
     }
@@ -13877,12 +13916,11 @@ impl OpenFs {
         //    pointer slots and corrupted clusters on readback (bd-bw90c). No-tx
         //    scopes therefore fall through to the current-snapshot device
         //    adapter below.
-        if scope.tx.is_some() {
-            if let Some(snapshot) = scope.snapshot
-                && let Some(visible) = self.mvcc_store.read_visible(block, snapshot)
-            {
-                return Ok(visible);
-            }
+        if scope.tx.is_some()
+            && let Some(snapshot) = scope.snapshot
+            && let Some(visible) = self.mvcc_store.read_visible(block, snapshot)
+        {
+            return Ok(visible);
         }
 
         // 3. Fall back to the current-snapshot device view.
@@ -14080,7 +14118,7 @@ impl OpenFs {
         if !any_overlay {
             let mut bufs: Vec<BlockBuf> = (0..count).map(|_| BlockBuf::new(Vec::new())).collect();
             dev.read_contiguous_blocks(cx, start, &mut bufs)?;
-            return Ok(bufs.into_iter().map(|buf| buf.into_inner()).collect());
+            return Ok(bufs.into_iter().map(BlockBuf::into_inner).collect());
         }
 
         // Mixed: keep overlay bytes; coalesce maximal base-gap runs into ranged
@@ -14909,11 +14947,10 @@ impl OpenFs {
                     // on the global pool, bd-neteo). The guard above keeps this
                     // branch non-nested, so `install` runs from a non-worker thread.
                     // Same blocks read, same ordered results.
-                    if let Some(pool) = ext4_read_pool() {
-                        pool.install(|| survivors.par_iter().map(|&b| fetch_block(b)).collect())
-                    } else {
-                        survivors.par_iter().map(|&b| fetch_block(b)).collect()
-                    }
+                    ext4_read_pool().map_or_else(
+                        || survivors.par_iter().map(|&b| fetch_block(b)).collect(),
+                        |pool| pool.install(|| survivors.par_iter().map(|&b| fetch_block(b)).collect()),
+                    )
                 };
 
                 // CONSUME (serial): parse + validate + recurse in child order so
@@ -15740,9 +15777,9 @@ impl OpenFs {
         // genuinely unreadable index (`IndexInvalid`) or a casefold dir (whose
         // fold routing this descent does not replicate) falls through to the scan.
         match self.htree_lookup_name_authoritative(cx, scope, dir_inode, name) {
-            Some(Some(entry)) => return Ok(Some(entry)),
-            Some(None) => return Ok(None),
-            None => {}
+            HtreeNameProbe::Found(entry) => return Ok(Some(entry)),
+            HtreeNameProbe::AuthoritativelyAbsent => return Ok(None),
+            HtreeNameProbe::Untrusted => {}
         }
 
         let bs = u64::from(self.block_size());
@@ -15757,10 +15794,9 @@ impl OpenFs {
         for lb in 0..num_blocks {
             if let Some((phys, unwritten)) =
                 self.resolve_extent_seq(cx, scope, dir_inode, lb, &mut ehint)?
+                && !unwritten
             {
-                if !unwritten {
-                    planned.push(BlockNumber(phys));
-                }
+                planned.push(BlockNumber(phys));
             }
         }
 
@@ -15867,38 +15903,42 @@ impl OpenFs {
         // not) yields None here so the caller can decide. See
         // `htree_lookup_name_authoritative` for the negative-distinction variant.
         match self.htree_lookup_name_authoritative(cx, scope, dir_inode, name) {
-            Some(Some(entry)) => Some(entry),
+            HtreeNameProbe::Found(entry) => Some(entry),
             _ => None,
         }
     }
 
     /// htree descent that distinguishes a definitive negative from an unusable
     /// index:
-    /// - `Some(Some(entry))` — the name was found via the index.
-    /// - `Some(None)` — the index was navigated cleanly and the name is ABSENT
-    ///   (`NotFoundInIndex`). For a non-casefold htree dir this is authoritative
-    ///   (the index always covers every entry), so the caller may return "absent"
-    ///   WITHOUT a linear scan — the lever that makes a negative lookup O(log N).
-    /// - `None` — the fast path does not apply or cannot be trusted (not an htree
-    ///   dir; casefold, whose fold routing this does not replicate; or the index
-    ///   is absent/unparseable/unreadable, `IndexInvalid`). The caller MUST do the
-    ///   linear scan, which stays authoritative.
+    /// - [`HtreeNameProbe::Found`] — the name was found via the index.
+    /// - [`HtreeNameProbe::AuthoritativelyAbsent`] — the index was navigated
+    ///   cleanly and the name is ABSENT (`NotFoundInIndex`). For a non-casefold
+    ///   htree dir this is authoritative (the index always covers every entry),
+    ///   so the caller may return "absent" WITHOUT a linear scan — the lever
+    ///   that makes a negative lookup O(log N).
+    /// - [`HtreeNameProbe::Untrusted`] — the fast path does not apply or cannot
+    ///   be trusted (not an htree dir; casefold, whose fold routing this does
+    ///   not replicate; or the index is absent/unparseable/unreadable,
+    ///   `IndexInvalid`). The caller MUST do the linear scan, which stays
+    ///   authoritative.
     ///
-    /// Never returns `Err`: any resolve/read/parse failure becomes `None` so the
-    /// caller falls back to the safe scan.
+    /// Never fails: any resolve/read/parse failure becomes
+    /// [`HtreeNameProbe::Untrusted`] so the caller falls back to the safe scan.
     fn htree_lookup_name_authoritative(
         &self,
         cx: &Cx,
         scope: &RequestScope,
         dir_inode: &Ext4Inode,
         name: &[u8],
-    ) -> Option<Option<Ext4DirEntry>> {
+    ) -> HtreeNameProbe {
         if !dir_inode.has_htree_index() {
-            return None;
+            return HtreeNameProbe::Untrusted;
         }
         let casefold = dir_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
 
-        let sb = self.ext4_superblock()?;
+        let Some(sb) = self.ext4_superblock() else {
+            return HtreeNameProbe::Untrusted;
+        };
 
         let read_block = |logical_block| {
             self.resolve_extent(cx, scope, dir_inode, logical_block)
@@ -15938,13 +15978,15 @@ impl OpenFs {
         };
 
         match found {
-            HtreeFindResult::Found(entry) => Some(Some(entry)),
+            HtreeFindResult::Found(entry) => HtreeNameProbe::Found(entry),
             // A clean negative is authoritative ONLY for a non-casefold dir: a
             // casefold descent that misses an exotic-Unicode name must fall back
             // to the linear casefold scan (the index fold may diverge), so report
-            // "index unusable" (None) for casefold, not "absent".
-            HtreeFindResult::NotFoundInIndex if !casefold => Some(None),
-            HtreeFindResult::NotFoundInIndex | HtreeFindResult::IndexInvalid => None,
+            // "index unusable" (`Untrusted`) for casefold, not "absent".
+            HtreeFindResult::NotFoundInIndex if !casefold => HtreeNameProbe::AuthoritativelyAbsent,
+            HtreeFindResult::NotFoundInIndex | HtreeFindResult::IndexInvalid => {
+                HtreeNameProbe::Untrusted
+            }
         }
     }
 
@@ -16068,8 +16110,8 @@ fn btrfs_attr_cache_enabled(read_plan_present: bool, cache_disabled: bool) -> bo
 /// faster (99 ns) with no regression on non-zero data (early-exit at the first
 /// set byte) — bench `sparse_zero_scan`. Result-identical.
 fn is_block_all_zero(data: &[u8]) -> bool {
-    let mut chunks = data.chunks_exact(32);
-    for block in &mut chunks {
+    let (blocks, remainder) = data.as_chunks::<32>();
+    for block in blocks {
         let w0 = u64::from_ne_bytes(block[0..8].try_into().unwrap());
         let w1 = u64::from_ne_bytes(block[8..16].try_into().unwrap());
         let w2 = u64::from_ne_bytes(block[16..24].try_into().unwrap());
@@ -16078,9 +16120,36 @@ fn is_block_all_zero(data: &[u8]) -> bool {
             return false;
         }
     }
-    let mut tail = chunks.remainder().chunks_exact(8);
-    tail.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
-        && tail.remainder().iter().all(|&b| b == 0)
+    let (tail8, tail1) = remainder.as_chunks::<8>();
+    tail8.all(|c| u64::from_ne_bytes(c.try_into().unwrap()) == 0)
+        && tail1.iter().all(|&b| b == 0)
+}
+
+/// Three-way outcome of the authoritative htree name descent
+/// (`OpenFs::htree_lookup_name_authoritative`): the name was found via the
+/// index, the index cleanly proves it absent, or the fast path is unusable and
+/// the caller must fall back to its linear scan.
+enum HtreeNameProbe {
+    Found(Ext4DirEntry),
+    AuthoritativelyAbsent,
+    Untrusted,
+}
+
+/// One disjoint window of an EA-inode-backed xattr value to be read from one
+/// of the EA inode's data blocks.
+struct EaInodeReadJob {
+    phys: u64,
+    start: usize,
+    end: usize,
+    take: usize,
+}
+
+/// A completed EA-inode block read: the block bytes plus the value window
+/// (`start..end`) they fill.
+struct EaInodeBlockRead {
+    start: usize,
+    end: usize,
+    block: Vec<u8>,
 }
 
 /// Compute the number of logical blocks in a directory, as a u32.
@@ -16508,30 +16577,17 @@ impl OpenFs {
     /// value length. Read that many bytes from the EA inode's extent-mapped
     /// data blocks, leaving zeros for any (unexpected) holes.
     fn ext4_read_ea_inode_value(&self, cx: &Cx, value_inum: u32) -> ffs_error::Result<Vec<u8>> {
-        struct EaInodeReadJob {
-            phys: u64,
-            start: usize,
-            end: usize,
-            take: usize,
-        }
-
-        struct EaInodeBlockRead {
-            start: usize,
-            end: usize,
-            block: Vec<u8>,
-        }
-
+        // An xattr value cannot exceed XATTR_SIZE_MAX (64 KiB) — setxattr rejects
+        // larger values with E2BIG — so a larger EA-inode i_size is a corrupt
+        // image. Reject it rather than allocating an unbounded buffer (OOM on a
+        // malformed inode size).
+        const XATTR_SIZE_MAX: usize = 65_536;
         let ea_ino = InodeNumber(u64::from(value_inum));
         let ea_inode = self.read_inode(cx, ea_ino)?;
         let value_len = usize::try_from(ea_inode.size).map_err(|_| FfsError::Corruption {
             block: 0,
             detail: format!("EA inode {value_inum} value size exceeds addressable range"),
         })?;
-        // An xattr value cannot exceed XATTR_SIZE_MAX (64 KiB) — setxattr rejects
-        // larger values with E2BIG — so a larger EA-inode i_size is a corrupt
-        // image. Reject it rather than allocating an unbounded buffer (OOM on a
-        // malformed inode size).
-        const XATTR_SIZE_MAX: usize = 65_536;
         if value_len > XATTR_SIZE_MAX {
             return Err(FfsError::Corruption {
                 block: 0,
@@ -16584,49 +16640,63 @@ impl OpenFs {
         // The value ranges are disjoint logical block windows. Overlap only the
         // read + short-block validation; consume the collected results in job
         // order so the lowest logical-block error remains the observable error.
-        {
-            use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-
-            let read_job = |job: EaInodeReadJob| -> Result<EaInodeBlockRead, FfsError> {
-                let block = self.read_block_vec(cx, BlockNumber(job.phys))?;
-                if job.take > block.len() {
-                    return Err(FfsError::Corruption {
-                        block: job.phys,
-                        detail: format!("EA inode {value_inum} short block read"),
-                    });
-                }
-                Ok(EaInodeBlockRead {
-                    start: job.start,
-                    end: job.end,
-                    block,
-                })
-            };
-            // bd-ddryj/kdmu4: bound the EA-inode value read fan-out on the shared
-            // 16-wide read pool, not the nproc-wide global one, and serialize a
-            // small or nested fan-out — a large-xattr getxattr reached from a
-            // parallel reader would otherwise convoy the global pool's page-cache
-            // xa_lock, the same contention the sibling ext4 read paths already cap.
-            // Byte-identical: same reads, consumed in job order.
-            let reads: Vec<Result<EaInodeBlockRead, FfsError>> = if jobs.len()
-                < rayon::current_num_threads().max(2)
-                || rayon::current_thread_index().is_some()
-            {
-                jobs.into_iter().map(read_job).collect()
-            } else if let Some(pool) = ext4_read_pool() {
-                pool.install(|| jobs.into_par_iter().map(read_job).collect())
-            } else {
-                jobs.into_par_iter().map(read_job).collect()
-            };
-
-            for read in reads {
-                let read = read?;
-                value[read.start..read.end].copy_from_slice(&read.block[..read.end - read.start]);
-            }
-        }
+        Self::ext4_read_ea_inode_blocks_into_value(cx, jobs, value_inum, &mut value)?;
         if let Some(err) = terminal_error {
             return Err(err);
         }
         Ok(value)
+    }
+
+    /// Run the collected EA-inode block reads — serially for a small or nested
+    /// fan-out, else bounded on the shared 16-wide read pool rather than the
+    /// nproc-wide global one — and copy each result into its window of `value`,
+    /// consumed in job order so the lowest logical-block error remains the
+    /// observable error.
+    fn ext4_read_ea_inode_blocks_into_value(
+        &self,
+        cx: &Cx,
+        jobs: Vec<EaInodeReadJob>,
+        value_inum: u32,
+        value: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+
+        let read_job = |job: EaInodeReadJob| -> Result<EaInodeBlockRead, FfsError> {
+            let block = self.read_block_vec(cx, BlockNumber(job.phys))?;
+            if job.take > block.len() {
+                return Err(FfsError::Corruption {
+                    block: job.phys,
+                    detail: format!("EA inode {value_inum} short block read"),
+                });
+            }
+            Ok(EaInodeBlockRead {
+                start: job.start,
+                end: job.end,
+                block,
+            })
+        };
+        // bd-ddryj/kdmu4: bound the EA-inode value read fan-out on the shared
+        // 16-wide read pool, not the nproc-wide global one, and serialize a
+        // small or nested fan-out — a large-xattr getxattr reached from a
+        // parallel reader would otherwise convoy the global pool's page-cache
+        // xa_lock, the same contention the sibling ext4 read paths already cap.
+        // Byte-identical: same reads, consumed in job order.
+        let reads: Vec<Result<EaInodeBlockRead, FfsError>> = if jobs.len()
+            < rayon::current_num_threads().max(2)
+            || rayon::current_thread_index().is_some()
+        {
+            jobs.into_iter().map(read_job).collect()
+        } else if let Some(pool) = ext4_read_pool() {
+            pool.install(|| jobs.into_par_iter().map(read_job).collect())
+        } else {
+            jobs.into_par_iter().map(read_job).collect()
+        };
+
+        for read in reads {
+            let read = read?;
+            value[read.start..read.end].copy_from_slice(&read.block[..read.end - read.start]);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -16635,17 +16705,17 @@ impl OpenFs {
         cx: &Cx,
         value_inum: u32,
     ) -> ffs_error::Result<Vec<u8>> {
+        // An xattr value cannot exceed XATTR_SIZE_MAX (64 KiB) — setxattr rejects
+        // larger values with E2BIG — so a larger EA-inode i_size is a corrupt
+        // image. Reject it rather than allocating an unbounded buffer (OOM on a
+        // malformed inode size).
+        const XATTR_SIZE_MAX: usize = 65_536;
         let ea_ino = InodeNumber(u64::from(value_inum));
         let ea_inode = self.read_inode(cx, ea_ino)?;
         let value_len = usize::try_from(ea_inode.size).map_err(|_| FfsError::Corruption {
             block: 0,
             detail: format!("EA inode {value_inum} value size exceeds addressable range"),
         })?;
-        // An xattr value cannot exceed XATTR_SIZE_MAX (64 KiB) — setxattr rejects
-        // larger values with E2BIG — so a larger EA-inode i_size is a corrupt
-        // image. Reject it rather than allocating an unbounded buffer (OOM on a
-        // malformed inode size).
-        const XATTR_SIZE_MAX: usize = 65_536;
         if value_len > XATTR_SIZE_MAX {
             return Err(FfsError::Corruption {
                 block: 0,
@@ -17198,6 +17268,9 @@ impl OpenFs {
     }
 
     /// Read file data using indirect block pointers (non-extent inodes).
+    /// `(file_size - offset).min(size) as usize` is bounded by `size: u32`, so
+    /// the single cast below cannot truncate on any supported target.
+    #[expect(clippy::cast_possible_truncation)]
     fn read_ext4_indirect(
         &self,
         cx: &Cx,
@@ -17457,6 +17530,11 @@ impl OpenFs {
 
     /// `resolve_indirect_block` with a per-PLAN-pass memo (see
     /// `read_indirect_ptr_memo`). Identical result to `resolve_indirect_block`.
+    /// All `as usize` index casts below are bounded by the range guards that
+    /// precede them (`lb < 12`, indices `< ptrs_per_block^k` with
+    /// `ptrs_per_block <= 64 KiB / 4`), so no truncation is reachable on any
+    /// supported target; the lint cannot see the guards.
+    #[expect(clippy::cast_possible_truncation)]
     fn resolve_indirect_block_memo(
         &self,
         cx: &Cx,
@@ -18823,32 +18901,6 @@ const fn btrfs_mutation_permitted(writable: bool, commit_refused: bool) -> bool 
     writable && !commit_refused
 }
 
-/// Whether a commit is about to strand the free-space tree (bd-73bi2).
-///
-/// The FREE_SPACE_TREE's ROOT_ITEM generation is patched to `new_gen` EARLY,
-/// before the root tree is serialized, because the root tree must carry the new
-/// pointer. The block it points at is rewritten LATE, and only if the tree still
-/// fits in a single leaf. Above roughly 4000 files it does not, the write is
-/// skipped, and the image ships with a ROOT_ITEM claiming generation N over a
-/// block still carrying N-1. The kernel then refuses the whole filesystem:
-///
-///     parent transid verify failed on logical <fst> wanted N found N-1
-///     failed to load root free space
-///     open_ctree failed: -5
-///
-/// FrankenFS reads that image back perfectly, which is why it went unnoticed.
-///
-/// The same hazard was already reasoned about for `chunk_root_generation` a few
-/// lines below the commit point -- "we deliberately do NOT bump it, our
-/// transaction does not rewrite the chunk_tree" -- and the identical case for
-/// the free-space tree was missed.
-const fn btrfs_commit_would_strand_free_space_tree(
-    fst_root_item_patched: bool,
-    fst_block_written: bool,
-) -> bool {
-    fst_root_item_patched && !fst_block_written
-}
-
 /// Byte range of `generation` inside a `btrfs_header`.
 ///
 /// Layout: `csum[32] fsid[16] bytenr@48 flags@56 chunk_tree_uuid[16] generation@80`.
@@ -18873,10 +18925,10 @@ fn btrfs_header_generation(header: &[u8]) -> Option<u64> {
 /// `parent transid verify failed on logical N wanted 10 found 9`, then
 /// `open_ctree failed: -5`. It is checked against bytes READ BACK FROM DISK
 /// rather than against what the commit intended to write, because every proxy
-/// for it has now been wrong once. The predicate that used to guard this
-/// compared `fst_generation != new_gen`, which stopped meaning anything the
-/// moment the tree was correctly held at its own generation, and the call site
-/// was disabled with `&& false` rather than re-derived.
+/// for it has now been wrong once. The in-memory proxy that originally guarded
+/// this compared `fst_generation != new_gen`, which stopped meaning anything
+/// the moment the tree was correctly held at its own generation; that vestige
+/// (disabled with `&& false`) was removed when this read-back check superseded it.
 ///
 /// `None` from the reader is a FAILURE, not a pass: a block we cannot read is
 /// a block we cannot vouch for.
@@ -19701,6 +19753,17 @@ enum DirInsertOutcome {
     NeedsGrowthLinear,
 }
 
+
+/// One group's persist unit for `ext4_write_group_descriptors_to`: the group
+/// number, its live stats, and optional inode/block bitmap override bytes read
+/// back from the device for checksum stamping (`None` = untouched group).
+type GroupDescPersistEntry = (
+    GroupNumber,
+    ffs_alloc::GroupStats,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
 impl OpenFs {
     /// Extract 60-byte extent tree root from inode's extent_bytes.
     fn extent_root(inode: &Ext4Inode) -> [u8; 60] {
@@ -20045,19 +20108,22 @@ impl OpenFs {
         let Some(live_lock) = self.ext4_alloc_state.as_ref() else {
             return; // read-only / no writable state to keep in sync
         };
+        // Pass 1 (lock-free): compute the nonzero deltas from the immutable
+        // snapshot, so the write lock below is held only for the mutations.
+        let deltas: smallvec::SmallVec<[(usize, i64, i64, i64); 8]> = before
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &(pb, pi, pd))| {
+                let now = after.groups.get(idx)?;
+                let d_blocks = i64::from(now.free_blocks) - i64::from(pb);
+                let d_inodes = i64::from(now.free_inodes) - i64::from(pi);
+                let d_dirs = i64::from(now.used_dirs) - i64::from(pd);
+                (d_blocks != 0 || d_inodes != 0 || d_dirs != 0)
+                    .then_some((idx, d_blocks, d_inodes, d_dirs))
+            })
+            .collect();
         let mut live = live_lock.write();
-        for (idx, &(prev_free_blocks, prev_free_inodes, prev_used_dirs)) in
-            before.iter().enumerate()
-        {
-            let Some(now) = after.groups.get(idx) else {
-                continue;
-            };
-            let d_blocks = i64::from(now.free_blocks) - i64::from(prev_free_blocks);
-            let d_inodes = i64::from(now.free_inodes) - i64::from(prev_free_inodes);
-            let d_dirs = i64::from(now.used_dirs) - i64::from(prev_used_dirs);
-            if d_blocks == 0 && d_inodes == 0 && d_dirs == 0 {
-                continue;
-            }
+        for (idx, d_blocks, d_inodes, d_dirs) in deltas {
             let Some(live_group) = live.groups.get_mut(idx) else {
                 continue;
             };
@@ -20102,7 +20168,7 @@ impl OpenFs {
             dev: self.dev.as_ref(),
             block_size: self.block_size(),
         };
-        self.ext4_write_group_descriptors_to(cx, alloc, &direct)?;
+        Self::ext4_write_group_descriptors_to(cx, alloc, &direct)?;
         // The descriptors were written straight to the byte device above, bypassing
         // the MVCC overlay, the base-block cache, AND the parsed-descriptor cache. The
         // documented contract on `read_group_desc_with_scope` is that any code mutating
@@ -20146,14 +20212,12 @@ impl OpenFs {
                     FfsError::Format("sharded GDT capture: persist ctx unavailable".to_owned())
                 })?,
             };
-            return self.ext4_write_group_descriptors_to(cx, &synthetic, capture);
+            return Self::ext4_write_group_descriptors_to(cx, &synthetic, capture);
         }
         let alloc = alloc_mutex.read();
-        self.ext4_write_group_descriptors_to(cx, &alloc, capture)
+        Self::ext4_write_group_descriptors_to(cx, &alloc, capture)
     }
-
     fn ext4_write_group_descriptors_to(
-        &self,
         cx: &Cx,
         alloc: &Ext4AllocState,
         device: &dyn BlockDevice,
@@ -20165,12 +20229,7 @@ impl OpenFs {
         // to ceil(G/64) blocks — measured as exactly 2 writes of block 1 per
         // client fsync on a 2-group image, and 64x on any realistic one. The
         // bytes written are identical: each descriptor patches only its own slot.
-        let mut entries: Vec<(
-            GroupNumber,
-            ffs_alloc::GroupStats,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-        )> = Vec::with_capacity(alloc.groups.len());
+        let mut entries: Vec<GroupDescPersistEntry> = Vec::with_capacity(alloc.groups.len());
         for gidx in 0..alloc.groups.len() {
             let group = GroupNumber(
                 u32::try_from(gidx)
@@ -20252,24 +20311,22 @@ impl OpenFs {
         #[cfg(not(feature = "bhh0i_sharded_alloc"))]
         let sharded_totals: Option<(u64, u64)> = None;
 
-        let (total_free_blocks, total_free_inodes) = if let Some(totals) = sharded_totals {
-            totals
-        } else {
-            let alloc = alloc_mutex.read();
-            // Sum both free totals in ONE pass over the group array. Two separate
-            // `.sum()` passes reload every group's (large) struct a second time;
-            // on a big filesystem the array exceeds cache, so fusing halves the
-            // memory traffic. free_blocks + free_inodes share a cache line.
-            alloc
-                .groups
-                .iter()
-                .fold((0_u64, 0_u64), |(blocks, inodes), g| {
+        let (total_free_blocks, total_free_inodes) = sharded_totals.map_or_else(
+            || {
+                let alloc = alloc_mutex.read();
+                // Sum both free totals in ONE pass over the group array. Two separate
+                // `.sum()` passes reload every group's (large) struct a second time;
+                // on a big filesystem the array exceeds cache, so fusing halves the
+                // memory traffic. free_blocks + free_inodes share a cache line.
+                alloc.groups.iter().fold((0_u64, 0_u64), |(blocks, inodes), g| {
                     (
                         blocks + u64::from(g.free_blocks),
                         inodes + u64::from(g.free_inodes),
                     )
                 })
-        };
+            },
+            |totals| totals,
+        );
 
         let (sb_block, sb_off) = self.ext4_superblock_location();
         let mut block_data = block_dev.read_block(cx, sb_block)?.into_inner();
@@ -20740,30 +20797,38 @@ impl OpenFs {
         self.ext4_sharded_stage_inode_slot(cx, dev, loc, inode_size, ino, inode, csum_seed)
     }
 
-    /// Allocate one new directory block via the sharded (no-write-lock) path
-    /// (bd-bhh0i cutover slice 7b) — the growth primitive the sharded
-    /// `add_dir_entry` reconstruction uses when an htree leaf splits, a linear
-    /// dir spills, or a dir converts to htree. Thin wrapper over
-    /// [`Self::ext4_sharded_alloc_blocks`] returning the first (only) block;
-    /// `Ok(None)` = no free block.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
-    fn ext4_sharded_alloc_dir_block(
-        &self,
-        cx: &Cx,
-        dev: &dyn ffs_block::BlockDevice,
-        hint: &ffs_alloc::AllocHint,
-    ) -> Result<Option<BlockNumber>, FfsError> {
-        Ok(self
-            .ext4_sharded_alloc_blocks(cx, dev, hint, 1)?
-            .map(|alloc| alloc.start))
-    }
-
     /// Require the ext4 alloc state to be present (i.e., writes enabled).
     fn require_alloc_state(&self) -> Result<&RwLock<Ext4AllocState>, FfsError> {
         if self.ext4_forced_read_only.load(Ordering::SeqCst) {
             return Err(FfsError::ReadOnly);
         }
         self.ext4_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
+    }
+
+    /// POSIX EEXIST pre-check for create/mkdir-style operations.
+    ///
+    /// For a hash-indexed (htree) directory the insert path (`ext4_add_dir_entry`
+    /// → `ffs_dir::add_entry_reject_existing`) performs a byte-exact duplicate
+    /// check on the hash-correct target leaf, which is the ONLY block a duplicate
+    /// of `name` could occupy — so a separate positive lookup_name (a full second
+    /// htree descent) is redundant there and is skipped. Casefold htree
+    /// directories index by the folded name (a byte-different duplicate can
+    /// fold-collide), and linear directories may hold a duplicate in a block
+    /// other than the one with free space, so both keep the lookup_name
+    /// pre-check.
+    fn ext4_create_duplicate_precheck(
+        &self,
+        cx: &Cx,
+        parent_inode: &Ext4Inode,
+        name: &[u8],
+    ) -> ffs_error::Result<()> {
+        let htree_dedup_covers = parent_inode.has_htree_index()
+            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
+            && Self::htree_create_dedup_enabled();
+        if !htree_dedup_covers && self.lookup_name(cx, parent_inode, name)?.is_some() {
+            return Err(FfsError::Exists);
+        }
+        Ok(())
     }
 
     /// Create a regular file in an ext4 directory.
@@ -20813,22 +20878,7 @@ impl OpenFs {
             );
         }
 
-        // Check for duplicate name — POSIX requires EEXIST. For a hash-indexed
-        // (htree) directory the insert path (ext4_add_dir_entry ->
-        // ffs_dir::add_entry_reject_existing) performs a byte-exact duplicate
-        // check on the hash-correct target leaf, which is the ONLY block a
-        // duplicate of `name` could occupy — so this separate positive
-        // lookup_name (a full second htree descent) is redundant and is skipped.
-        // Casefold htree directories index by the folded name (a byte-different
-        // duplicate can fold-collide), and linear directories may hold a
-        // duplicate in a block other than the one with free space, so both keep
-        // the lookup_name pre-check.
-        let htree_dedup_covers = parent_inode.has_htree_index()
-            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-            && Self::htree_create_dedup_enabled();
-        if !htree_dedup_covers && self.lookup_name(cx, &parent_inode, name)?.is_some() {
-            return Err(FfsError::Exists);
-        }
+        self.ext4_create_duplicate_precheck(cx, &parent_inode, name)?;
 
         let mut alloc = alloc_mutex.write();
         let Ext4AllocState {
@@ -21022,6 +21072,9 @@ impl OpenFs {
     /// whole point of the decomposition). Deterministic within a thread; a
     /// single-thread run yields one seed (near-parent locality).
     #[cfg(feature = "bhh0i_sharded_alloc")]
+    /// The u64 -> u32 fold is the point: any 32 bits of a SipHash are uniform,
+    /// so the narrowing below is an intentional hash fold, not data loss.
+    #[expect(clippy::cast_possible_truncation)]
     fn bhh0i_spread_seed() -> u32 {
         // The Part-B spread seed is a pure function of the (stable) ThreadId, so it
         // is invariant for the life of a thread. Cache it per thread rather than
@@ -21899,6 +21952,113 @@ impl OpenFs {
     /// allocates — a full target returns a `NeedsGrowth*` outcome so the caller
     /// runs the growth path. Read/write/stamp order is byte-for-byte identical
     /// to the original; the caller writes the parent immediately after `Inserted`.
+
+    /// Htree-indexed half of [`Self::ext4_try_insert_existing`]: every control
+    /// path returns (inserted / needs-growth / error), so the split is exact.
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_try_insert_existing_htree(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        parent: InodeNumber,
+        parent_inode: &Ext4Inode,
+        extents: &[Ext4Extent],
+        name: &[u8],
+        child_ino_u32: u32,
+        parent_ino_u32: u32,
+        parent_generation: u32,
+        file_type: Ext4FileType,
+        reserved_tail: usize,
+    ) -> ffs_error::Result<DirInsertOutcome> {
+        let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+        if casefold && !name.is_ascii() {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "non-ASCII casefold htree directory inode {} insert is not yet supported (bd-owt2r: needs byte-exact UTF-8 normalization)",
+                parent.0
+            )));
+        }
+        let resolve_logical = |logical: u32| -> Option<BlockNumber> {
+            let pos = extents.partition_point(|e| e.logical_block <= logical);
+            let ext = extents.get(pos.checked_sub(1)?)?;
+            if ext.is_unwritten() {
+                return None;
+            }
+            let start = ext.logical_block;
+            let len = u32::from(ext.actual_len());
+            (logical >= start && logical < start.saturating_add(len))
+                .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
+        };
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("htree directory on non-ext4 fs".into()))?;
+        let read_leaf =
+            |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
+        let target_logical = if casefold {
+            ffs_ondisk::htree_target_leaf_block_casefold(
+                &sb.hash_seed,
+                sb.has_large_dir(),
+                name,
+                |v| sb.effective_dirhash_version(v),
+                read_leaf,
+            )
+        } else {
+            ffs_ondisk::htree_target_leaf_block(
+                &sb.hash_seed,
+                sb.has_large_dir(),
+                name,
+                |v| sb.effective_dirhash_version(v),
+                read_leaf,
+            )
+        }
+        .ok_or_else(|| FfsError::Corruption {
+            block: 0,
+            detail: format!(
+                "htree directory inode {} index is unreadable; refusing to insert (would corrupt dx_root, bd-wb4cd)",
+                parent.0
+            ),
+        })?;
+        let target_phys = resolve_logical(target_logical)
+            .ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "htree directory inode {} dx index references unmapped leaf block {target_logical}",
+                    parent.0
+                ),
+            })?;
+
+        let mut data = self.read_block_vec(cx, target_phys)?;
+        match ffs_dir::add_entry_reject_existing_tracked(
+            &mut data,
+            child_ino_u32,
+            name,
+            file_type,
+            reserved_tail,
+        ) {
+            Ok((_, edit)) => {
+                self.stamp_ext4_dir_block_maybe_incremental(
+                    &mut data,
+                    parent_ino_u32,
+                    parent_generation,
+                    edit.as_ref(),
+                );
+                dev.write_block(cx, target_phys, &data)?;
+                // Parent-inode update (mtime/ctime + dir link count) is HOISTED
+                // to the caller so this insert is allocator-agnostic (bd-bhh0i):
+                // the caller writes the parent via the single-lock or the sharded
+                // path after seeing `Inserted`. Order preserved (block write here,
+                // parent write immediately after in the caller) — byte-identical.
+                Ok(DirInsertOutcome::Inserted)
+            }
+            Err(FfsError::NoSpace) => Ok(DirInsertOutcome::NeedsGrowthHtree {
+                target_logical,
+                target_phys,
+                leaf: data,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn ext4_try_insert_existing(
         &self,
@@ -21915,97 +22075,10 @@ impl OpenFs {
         reserved_tail: usize,
     ) -> ffs_error::Result<DirInsertOutcome> {
         if parent_inode.has_htree_index() {
-            let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-            if casefold && !name.is_ascii() {
-                return Err(FfsError::UnsupportedFeature(format!(
-                    "non-ASCII casefold htree directory inode {} insert is not yet supported (bd-owt2r: needs byte-exact UTF-8 normalization)",
-                    parent.0
-                )));
-            }
-            let resolve_logical = |logical: u32| -> Option<BlockNumber> {
-                let pos = extents.partition_point(|e| e.logical_block <= logical);
-                let ext = extents.get(pos.checked_sub(1)?)?;
-                if ext.is_unwritten() {
-                    return None;
-                }
-                let start = ext.logical_block;
-                let len = u32::from(ext.actual_len());
-                (logical >= start && logical < start.saturating_add(len))
-                    .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
-            };
-
-            let sb = self
-                .ext4_superblock()
-                .ok_or_else(|| FfsError::Format("htree directory on non-ext4 fs".into()))?;
-            let read_leaf =
-                |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
-            let target_logical = if casefold {
-                ffs_ondisk::htree_target_leaf_block_casefold(
-                    &sb.hash_seed,
-                    sb.has_large_dir(),
-                    name,
-                    |v| sb.effective_dirhash_version(v),
-                    read_leaf,
-                )
-            } else {
-                ffs_ondisk::htree_target_leaf_block(
-                    &sb.hash_seed,
-                    sb.has_large_dir(),
-                    name,
-                    |v| sb.effective_dirhash_version(v),
-                    read_leaf,
-                )
-            }
-            .ok_or_else(|| FfsError::Corruption {
-                block: 0,
-                detail: format!(
-                    "htree directory inode {} index is unreadable; refusing to insert (would corrupt dx_root, bd-wb4cd)",
-                    parent.0
-                ),
-            })?;
-            let target_phys = resolve_logical(target_logical).ok_or_else(|| {
-                FfsError::Corruption {
-                    block: 0,
-                    detail: format!(
-                        "htree directory inode {} dx index references unmapped leaf block {target_logical}",
-                        parent.0
-                    ),
-                }
-            })?;
-
-            let mut data = self.read_block_vec(cx, target_phys)?;
-            match ffs_dir::add_entry_reject_existing_tracked(
-                &mut data,
-                child_ino_u32,
-                name,
-                file_type,
-                reserved_tail,
-            ) {
-                Ok((_, edit)) => {
-                    self.stamp_ext4_dir_block_maybe_incremental(
-                        &mut data,
-                        parent_ino_u32,
-                        parent_generation,
-                        edit.as_ref(),
-                    );
-                    dev.write_block(cx, target_phys, &data)?;
-                    // Parent-inode update (mtime/ctime + dir link count) is
-                    // HOISTED to the caller so this insert is allocator-agnostic
-                    // (bd-bhh0i): the caller writes the parent via the single-lock
-                    // or the sharded path after seeing `Inserted`. Order preserved
-                    // (block write here, parent write immediately after in the
-                    // caller) — byte-identical.
-                    return Ok(DirInsertOutcome::Inserted);
-                }
-                Err(FfsError::NoSpace) => {
-                    return Ok(DirInsertOutcome::NeedsGrowthHtree {
-                        target_logical,
-                        target_phys,
-                        leaf: data,
-                    });
-                }
-                Err(e) => return Err(e),
-            }
+            return self.ext4_try_insert_existing_htree(
+                cx, dev, parent, parent_inode, extents, name, child_ino_u32,
+                parent_ino_u32, parent_generation, file_type, reserved_tail,
+            );
         }
 
         for ext in extents {
@@ -22157,8 +22230,8 @@ impl OpenFs {
                     // helper hashes the verbatim name (the rebuild re-hashes by the
                     // fold), so a fold-indexed dir must keep using the rebuild.
                     let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-                    if !casefold {
-                        if let Some(()) = self.ext4_split_htree_leaf_and_add(
+                    if !casefold
+                        && self.ext4_split_htree_leaf_and_add(
                             cx,
                             dev,
                             &mut *backend,
@@ -22174,9 +22247,9 @@ impl OpenFs {
                             csum_seed,
                             tstamp_secs,
                             tstamp_nanos,
-                        )? {
-                            return Ok(());
-                        }
+                        )? == Some(())
+                    {
+                        return Ok(());
                     }
                     return self.ext4_rebuild_htree_dir(
                         cx,
@@ -22728,7 +22801,7 @@ impl OpenFs {
             .unwrap_or(0);
         let new_leaf_logical = logical_end;
 
-        let split = match ffs_ondisk::ext4::split_htree_leaf_in_dx_node(
+        let Ok(split) = ffs_ondisk::ext4::split_htree_leaf_in_dx_node(
             &dx_node_block,
             target_leaf,
             target_logical,
@@ -22740,9 +22813,8 @@ impl OpenFs {
             csum_seed,
             parent_ino_u32,
             generation,
-        ) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
+        ) else {
+            return Ok(None);
         };
 
         #[cfg(test)]
@@ -22976,7 +23048,7 @@ impl OpenFs {
                     ffs_ondisk::htree_leaf_logical_blocks(&b0_owned, has_large_dir, |lb| {
                     resolve(lb)
                         .and_then(|p| dev.read_block(cx, BlockNumber(p)).ok())
-                        .map(|b| b.into_inner())
+                        .map(ffs_block::BlockBuf::into_inner)
                 })
                 .ok_or_else(|| {
                     FfsError::UnsupportedFeature(format!(
@@ -23153,6 +23225,87 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Htree fast path of [`Self::ext4_preflight_dir_entry_insert`]: dry-runs
+    /// add_entry ONLY on the hash-target leaf and fills `probe` from that leaf
+    /// when byte-exact matching applies. `Ok(None)` = not an htree dir (caller
+    /// runs the linear scan); `Ok(Some(checked))` = fast path ran.
+    #[expect(clippy::too_many_lines)]
+    fn ext4_preflight_htree_fast_path(
+        &self,
+        cx: &Cx,
+        parent_inode: &Ext4Inode,
+        extents: &[Ext4Extent],
+        name: &[u8],
+        file_type: Ext4FileType,
+        reserved_tail: usize,
+        probe: &mut RenameTargetProbe,
+    ) -> ffs_error::Result<Option<bool>> {
+        if !parent_inode.has_htree_index() {
+            return Ok(None);
+        }
+        let Some(sb) = self.ext4_superblock() else {
+            return Ok(Some(false));
+        };
+        let resolve_logical = |logical: u32| -> Option<BlockNumber> {
+            let pos = extents.partition_point(|e| e.logical_block <= logical);
+            let ext = extents.get(pos.checked_sub(1)?)?;
+            if ext.is_unwritten() {
+                return None;
+            }
+            let start = ext.logical_block;
+            let len = u32::from(ext.actual_len());
+            (logical >= start && logical < start.saturating_add(len))
+                .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
+        };
+        let read_leaf =
+            |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
+        // Casefold htree dirs route by the folded name; the top-of-fn gate
+        // already rejected non-ASCII casefold names, so the ASCII fold is
+        // byte-exact here. Mirror the delete path's casefold descent
+        // (ext4_htree_remove_dir_entry's sibling at the unlink site).
+        let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+        let target_logical = if casefold {
+            ffs_ondisk::htree_target_leaf_block_casefold(
+                &sb.hash_seed,
+                sb.has_large_dir(),
+                name,
+                |v| sb.effective_dirhash_version(v),
+                read_leaf,
+            )
+        } else {
+            ffs_ondisk::htree_target_leaf_block(
+                &sb.hash_seed,
+                sb.has_large_dir(),
+                name,
+                |v| sb.effective_dirhash_version(v),
+                read_leaf,
+            )
+        };
+        let Some(target_phys) = target_logical.and_then(resolve_logical) else {
+            // Unreadable/stale index: fall through to the empty-block
+            // name-fits dry-run (the real insert will rebuild).
+            return Ok(Some(true));
+        };
+        let mut data = self.read_block_vec(cx, target_phys)?;
+        // Probe existence from this exact leaf BEFORE the dry-run add_entry
+        // mutates `data`. For a non-casefold htree dir an existing
+        // `new_name` MUST live in this hash-target leaf (same invariant the
+        // create/mkdir dedup guard uses), so a byte-exact scan here is
+        // equivalent to the caller's `lookup_name` — which it then skips.
+        // Casefold needs fold-aware matching (lookup_in_dir_block_casefold),
+        // so leave it NotChecked and let rename's lookup_name handle it.
+        if !casefold {
+            *probe = lookup_in_dir_block(&data, self.block_size(), name)
+                .map_err(|e| parse_to_ffs_error(&e))?
+                .map_or(RenameTargetProbe::Absent, RenameTargetProbe::Present);
+        }
+        match ffs_dir::add_entry(&mut data, 1, name, file_type, reserved_tail) {
+            Ok(_) | Err(FfsError::NoSpace) => {}
+            Err(err) => return Err(err),
+        }
+        Ok(Some(true))
+    }
+
     fn ext4_preflight_dir_entry_insert(
         &self,
         cx: &Cx,
@@ -23205,77 +23358,17 @@ impl OpenFs {
         // source entry — at O(1) instead of O(N). Both verbatim and casefold htree
         // dirs use this fast path (casefold descends by the folded name); only
         // linear dirs (the insert may touch any block) keep the full per-block scan.
-        let target_checked = if parent_inode.has_htree_index() {
-            if let Some(sb) = self.ext4_superblock() {
-                let resolve_logical = |logical: u32| -> Option<BlockNumber> {
-                    let pos = extents.partition_point(|e| e.logical_block <= logical);
-                    let ext = extents.get(pos.checked_sub(1)?)?;
-                    if ext.is_unwritten() {
-                        return None;
-                    }
-                    let start = ext.logical_block;
-                    let len = u32::from(ext.actual_len());
-                    (logical >= start && logical < start.saturating_add(len))
-                        .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
-                };
-                let read_leaf =
-                    |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
-                // Casefold htree dirs route by the folded name; the top-of-fn gate
-                // already rejected non-ASCII casefold names, so the ASCII fold is
-                // byte-exact here. Mirror the delete path's casefold descent
-                // (ext4_htree_remove_dir_entry's sibling at the unlink site).
-                let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-                let target_logical = if casefold {
-                    ffs_ondisk::htree_target_leaf_block_casefold(
-                        &sb.hash_seed,
-                        sb.has_large_dir(),
-                        name,
-                        |v| sb.effective_dirhash_version(v),
-                        read_leaf,
-                    )
-                } else {
-                    ffs_ondisk::htree_target_leaf_block(
-                        &sb.hash_seed,
-                        sb.has_large_dir(),
-                        name,
-                        |v| sb.effective_dirhash_version(v),
-                        read_leaf,
-                    )
-                };
-                let target = target_logical.and_then(|tl| resolve_logical(tl));
-                if let Some(target_phys) = target {
-                    let mut data = self.read_block_vec(cx, target_phys)?;
-                    // Probe existence from this exact leaf BEFORE the dry-run add_entry
-                    // mutates `data`. For a non-casefold htree dir an existing
-                    // `new_name` MUST live in this hash-target leaf (same invariant the
-                    // create/mkdir dedup guard uses), so a byte-exact scan here is
-                    // equivalent to the caller's `lookup_name` — which it then skips.
-                    // Casefold needs fold-aware matching (lookup_in_dir_block_casefold),
-                    // so leave it NotChecked and let rename's lookup_name handle it.
-                    if !casefold {
-                        probe = match lookup_in_dir_block(&data, self.block_size(), name)
-                            .map_err(|e| parse_to_ffs_error(&e))?
-                        {
-                            Some(entry) => RenameTargetProbe::Present(entry),
-                            None => RenameTargetProbe::Absent,
-                        };
-                    }
-                    match ffs_dir::add_entry(&mut data, 1, name, file_type, reserved_tail) {
-                        Ok(_) | Err(FfsError::NoSpace) => {}
-                        Err(err) => return Err(err),
-                    }
-                    true
-                } else {
-                    // Unreadable/stale index: fall through to the empty-block
-                    // name-fits dry-run (the real insert will rebuild).
-                    true
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let target_checked = self
+            .ext4_preflight_htree_fast_path(
+                cx,
+                parent_inode,
+                &extents,
+                name,
+                file_type,
+                reserved_tail,
+                &mut probe,
+            )?
+            .unwrap_or(false);
         if !target_checked {
             // Linear dir (or htree with no readable superblock): dry-run over every
             // block. For an htree dir, logical block 0 is the dx_root whose
@@ -23443,7 +23536,7 @@ impl OpenFs {
         // inode is freed, so an interrupted op leaves at worst an orphan inode
         // (e2fsck-reclaimable), never a dir entry pointing at a freed inode.
         let tx_dev: &dyn ffs_block::BlockDevice = &block_dev;
-        let result = (|| -> ffs_error::Result<()> {
+        (|| -> ffs_error::Result<()> {
             let alloc_mutex = self.require_alloc_state()?;
             let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
 
@@ -23535,7 +23628,7 @@ impl OpenFs {
                         read_leaf,
                     )
                 };
-                if let Some(target_phys) = target_logical.and_then(|tl| resolve_logical(tl))
+                if let Some(target_phys) = target_logical.and_then(resolve_logical)
                     && Some(target_phys) != dx_root_phys
                 {
                     let mut data = self.read_block_vec(cx, target_phys)?;
@@ -23801,9 +23894,7 @@ impl OpenFs {
             );
 
             Ok(())
-        })();
-
-        result
+        })()
     }
 
     /// Create a hard link in `new_parent/new_name` to existing inode `ino`.
@@ -28161,16 +28252,16 @@ impl OpenFs {
         let is_datasum = self
             .btrfs_read_inode_from_tree(alloc, canonical)
             .is_ok_and(|inode| inode.flags & BTRFS_INODE_NODATASUM == 0);
-        if is_datasum {
-            if let Err(e) =
-                self.btrfs_capture_data_extent_csums(cx, alloc, allocation.bytenr, alloc_size, None)
-            {
-                let _ = alloc.fs_tree.delete(&extent_key);
-                let _ = alloc
-                    .extent_alloc
-                    .free_extent(allocation.bytenr, alloc_size, false);
-                return Err(e);
-            }
+        if is_datasum
+            && let Err(e) = self
+                .btrfs_capture_data_extent_csums(
+                    cx, alloc, allocation.bytenr, alloc_size, None)
+        {
+            let _ = alloc.fs_tree.delete(&extent_key);
+            let _ = alloc
+                .extent_alloc
+                .free_extent(allocation.bytenr, alloc_size, false);
+            return Err(e);
         }
         Ok(data_len)
     }
@@ -28311,8 +28402,8 @@ impl OpenFs {
                 extent_offset,
                 ..
             } = parse_extent_data(&data).map_err(|e| parse_to_ffs_error(&e))?
+                && disk_bytenr > 0
             {
-                if disk_bytenr > 0 {
                     // btrfs data-backref offset = file_offset - extent_offset,
                     // computed with u64 wraparound (a reflinked sub-range views
                     // into the extent, so extent_offset can exceed file_offset —
@@ -29702,9 +29793,8 @@ impl OpenFs {
 
         if self.metadata_log.is_some() {
             let result = self.flush_ext4_metadata_log(cx);
-            let duration_us = started
-                .map(|s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX))
-                .unwrap_or(0);
+            let duration_us =
+                started.map_or(0, |s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX));
             return match result {
                 Ok(logged_blocks) => {
                     info!(
@@ -29762,9 +29852,8 @@ impl OpenFs {
             );
         }
 
-        let duration_us = started
-            .map(|s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+        let duration_us =
+            started.map_or(0, |s| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX));
         match self.dev.sync(cx) {
             Ok(()) => {
                 *flushed_through = (*flushed_through).max(durable_through);
@@ -30025,9 +30114,14 @@ impl OpenFs {
         sb: &BtrfsSuperblock,
         alloc: &mut BtrfsAllocState,
         canonical: u64,
+    /// Serialized tree-log write bundle from [`Self::btrfs_prepare_tree_log_write`]:
+    /// per-block `(bytenr, bytes)` pairs, the patched superblock image, and stats.
+    type BtrfsTreeLogWriteBundle = (Vec<(u64, Vec<u8>)>, Vec<u8>, BtrfsTreeLogWriteStats);
+
+    fn btrfs_prepare_tree_log_write(
         subvol_objectid: u64,
         on_disk_sb: &[u8],
-    ) -> Result<(Vec<(u64, Vec<u8>)>, Vec<u8>, BtrfsTreeLogWriteStats), FfsError> {
+    ) -> Result<BtrfsTreeLogWriteBundle, FfsError> {
         // bd-dm01m: log EVERY inode fsync'd since the last full commit, not just this
         // one. `log_root` replaces the previous log rather than chaining to it, so a
         // log holding only the current inode makes every earlier fsync in this
@@ -30181,10 +30275,13 @@ impl OpenFs {
         // would drop the retired list and leak the PREVIOUS log's blocks instead.
         // Doing all fallible work first, then swapping the set, leaves no window
         // where a failure loses track of either generation of blocks.
+        /// Three serialized blobs of the tree-log prepare region: the log-tree
+        /// root node, the log-tree leaf, and the superblock patch bytes.
+        type BtrfsTreeLogPreparedBytes = (Vec<u8>, Vec<u8>, Vec<u8>);
         let prepared = (|| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), FfsError> {
             let log_tree_bytes = node
                 .serialize(&serialize_params(log_tree))
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let prepared = (|| -> Result<BtrfsTreeLogPreparedBytes, FfsError> {
 
             // The log ROOT TREE: exactly one ROOT_ITEM, keyed by the subvolume whose
             // log it names. Its generation must equal the log tree's, which is the
@@ -31398,6 +31495,7 @@ impl OpenFs {
         // and running it first means the root tree's item set is final before
         // the self-description fixpoint starts pinning positions.
         //
+        const SELF_DESCRIBE_MAX_PASSES: usize = 8;
         // The generation both the FST ROOT_ITEM and its block will carry (bd-73bi2).
         let mut fst_generation = new_gen;
         let fst_root_key = BtrfsKey {
@@ -31487,7 +31585,6 @@ impl OpenFs {
         // reason: those are same-size `update`s of items that already exist, so
         // the root tree's shape — and therefore its positional order — is fixed
         // from here on.
-        const SELF_DESCRIBE_MAX_PASSES: usize = 8;
         let mut extent_pool: Vec<u64> = Vec::new();
         let mut root_pool: Vec<u64> = Vec::new();
         let mut self_describe_converged = false;
@@ -32117,38 +32214,6 @@ impl OpenFs {
         // on <chunk_root> wanted <new_gen> found <old_gen>". The
         // dev_item / sys_chunk_array / label / backup-root-ring regions are
         // preserved verbatim by virtue of patching in place.
-        // bd-73bi2: the superblock is the commit point, so this is the last
-        // place a stranded free-space tree can be stopped. Refusing to advance
-        // it leaves the image at its previous, consistent commit -- every other
-        // tree we wrote is unreachable from the old superblock, which is exactly
-        // what btrfs's commit model is for. Shipping the advance instead
-        // produces an image only FrankenFS can open.
-        //
-        // This is deliberately a refusal and not a repair: making the write
-        // succeed needs the free-space tree serialized at level > 0, and that
-        // needs blocks allocated for the interior nodes, which perturbs the very
-        // free space being recorded. That restructure is the fix; this is the
-        // guard that stops the corruption shipping in the meantime.
-        if btrfs_commit_would_strand_free_space_tree(
-            fst_reuse.is_some() && fst_generation != new_gen && false,
-            fst_committed,
-        ) {
-            // Latch the mount read-only BEFORE returning. Without this the
-            // caller sees one error and every subsequent write is accepted into
-            // a transaction that can never commit -- which is how the writing
-            // application ended up believing 5000 creates had succeeded while
-            // the image on disk still held 48 files.
-            if let Some(state) = self.btrfs_alloc_state.as_ref() {
-                state.write().commit_refused = true;
-            }
-            return Err(FfsError::Io(std::io::Error::other(
-                "bd-73bi2: refusing to advance the superblock -- the FREE_SPACE_TREE \
-                 ROOT_ITEM was patched to the new generation but its block could not be \
-                 rewritten (it no longer fits in one leaf), so the kernel would reject \
-                 this image with 'parent transid verify failed'. The image is unchanged \
-                 at its previous commit.",
-            )));
-        }
         sb_bytes[0x48..0x50].copy_from_slice(&new_gen.to_le_bytes());
         sb_bytes[0x50..0x58].copy_from_slice(&root_tree_bytenr.to_le_bytes());
         sb_bytes[0xC6] = root_tree_level;
@@ -32888,7 +32953,7 @@ impl OpenFs {
         // No parent nlink change for a btrfs subdirectory (bd-egyf6).
         // One DIR_ITEM descent serves preflight + EEXIST + collision (bd-btrcreate-dedup).
         let (dir_item_key, dir_item_collision) =
-            self.btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
+            Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
         let new_oid = alloc.next_objectid;
         alloc.next_objectid = alloc.next_objectid.saturating_add(1);
@@ -33429,7 +33494,7 @@ impl OpenFs {
         // One DIR_ITEM descent serves preflight + EEXIST + collision (bd-btrcreate-dedup).
         // One DIR_ITEM descent serves preflight + EEXIST (mknod always uses the
         // per-op insert path, so the collision flag is unused here) (bd-btrcreate-dedup).
-        self.btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
+        Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
         let new_oid = alloc.next_objectid;
         alloc.next_objectid = alloc.next_objectid.saturating_add(1);
@@ -34179,7 +34244,7 @@ impl OpenFs {
         self.btrfs_require_directory_inode(&alloc, parent_oid)?;
         // One DIR_ITEM descent serves preflight + EEXIST (symlink always uses the
         // per-op insert path, so the collision flag is unused here) (bd-btrcreate-dedup).
-        self.btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
+        Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
         let new_oid = alloc.next_objectid;
         alloc.next_objectid = alloc.next_objectid.saturating_add(1);
@@ -35605,7 +35670,6 @@ impl OpenFs {
     /// (bd-btrcreate-dedup). Returns the DIR_ITEM key (reused for the insert) and
     /// the collision flag.
     fn btrfs_create_dir_entry_check(
-        &self,
         alloc: &BtrfsAllocState,
         parent_oid: u64,
         name: &[u8],
@@ -36684,7 +36748,9 @@ impl OpenFs {
     /// The name-index shard for a directory inode (sharded by `inode % N` to
     /// avoid the single-slot thrash under parallel writers, bd-par1).
     fn dir_name_index_shard(&self, inode: u64) -> &Mutex<Option<DirNameIndex>> {
-        &self.dir_name_index[(inode % DIR_NAME_INDEX_SHARDS as u64) as usize]
+        let shard = inode % DIR_NAME_INDEX_SHARDS as u64;
+        &self.dir_name_index
+            [usize::try_from(shard).expect("shard index < 64 always fits usize")]
     }
 
     /// `mknod(2)` for char/block devices, FIFOs, and sockets.
@@ -37005,19 +37071,21 @@ impl OpenFs {
     /// allocation and no I/O.
     #[must_use]
     pub fn btrfs_floor_memo_footprint(&self) -> BtrfsFloorMemoFootprint {
-        let slots = self.btrfs_floor_leaf_memo.lock();
         let mut out = BtrfsFloorMemoFootprint::default();
-        for slot in slots.iter().flatten() {
-            out.retained_leaves += 1;
-            let bytes = btrfs_parsed_node_heap_bytes(&slot.leaf);
-            out.upper_bound_bytes += bytes;
-            // Sole ownership means removing the memo would actually return these
-            // bytes. Counted under the lock while only borrowing `slot.leaf`, so
-            // this call contributes no reference of its own to the count — a
-            // clone here would make every slot look shared and silently report
-            // zero exclusive bytes forever.
-            if Arc::strong_count(&slot.leaf) == 1 {
-                out.exclusive_bytes += bytes;
+        {
+            let slots = self.btrfs_floor_leaf_memo.lock();
+            for slot in slots.iter().flatten() {
+                out.retained_leaves += 1;
+                let bytes = btrfs_parsed_node_heap_bytes(&slot.leaf);
+                out.upper_bound_bytes += bytes;
+                // Sole ownership means removing the memo would actually return these
+                // bytes. Counted under the lock while only borrowing `slot.leaf`, so
+                // this call contributes no reference of its own to the count — a
+                // clone here would make every slot look shared and silently report
+                // zero exclusive bytes forever.
+                if Arc::strong_count(&slot.leaf) == 1 {
+                    out.exclusive_bytes += bytes;
+                }
             }
         }
         out
@@ -37163,9 +37231,9 @@ impl OpenFs {
                 // the borrowed inode is the same value either way.
                 let parsed_owned;
                 let parsed_arc;
-                let inode: &Ext4Inode = match hot_hit {
-                    Some(arc) => arc.as_ref(),
-                    None => {
+                let inode: &Ext4Inode = if let Some(arc) = hot_hit {
+                    arc.as_ref()
+                } else {
                         let parsed = self.read_inode_with_scope(cx, scope, canonical)?;
                         // A complete one-shot read cannot reuse this inode on a
                         // later chunk, so publishing it only displaces another
@@ -46514,8 +46582,10 @@ mod tests {
 
     #[test]
     fn btrfs_inode_attr_cache_has_a_fixed_mount_memory_bound_bd_5vis3() {
-        assert!(BTRFS_INODE_ATTR_CACHE_LIMIT > 0);
-        assert!(BTRFS_INODE_ATTR_CACHE_LIMIT < EXT4_INODE_ATTR_CACHE_LIMIT);
+        let limit = std::hint::black_box(BTRFS_INODE_ATTR_CACHE_LIMIT);
+        let ext_limit = std::hint::black_box(EXT4_INODE_ATTR_CACHE_LIMIT);
+        assert!(limit > 0);
+        assert!(limit < ext_limit);
         assert_eq!(BTRFS_INODE_ATTR_CACHE_LIMIT, 4096);
     }
 
@@ -52219,8 +52289,10 @@ mod tests {
             .expect("btrfs supported feature payload");
 
         let fields: Vec<u64> = payload
-            .chunks_exact(8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("u64 field")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
             .collect();
 
         assert_eq!(payload.len(), 72);
@@ -53766,8 +53838,10 @@ mod tests {
     /// failure instead of a silent regression.
     #[test]
     fn btrfs_readdir_prefetch_cannot_thrash_the_node_cache_bd_8y7vp() {
+        let page_max = std::hint::black_box(READDIR_SNAPSHOT_PAGE_MAX);
+        let node_limit = std::hint::black_box(BTRFS_TREE_NODE_CACHE_LIMIT);
         assert!(
-            READDIR_SNAPSHOT_PAGE_MAX <= BTRFS_TREE_NODE_CACHE_LIMIT,
+            page_max <= node_limit,
             "a readdir page can warm up to {READDIR_SNAPSHOT_PAGE_MAX} distinct leaves \
              but the parsed-node cache holds only {BTRFS_TREE_NODE_CACHE_LIMIT}; the \
              prefetch would evict its own early work before the stat pass reads it"
@@ -57307,8 +57381,10 @@ mod tests {
                         // Distinct starting group per thread, so the scans begin in
                         // different groups (they still fall through to
                         // neighbors → full-fallback if that family is exhausted).
-                        let mut hint = AllocHint::default();
-                        hint.goal_group = Some(GroupNumber(t as u32));
+                        let hint = AllocHint {
+                            goal_group: Some(GroupNumber(t as u32)),
+                            ..AllocHint::default()
+                        };
 
                         let mut got: Vec<BlockNumber> = Vec::with_capacity(K);
                         for call in 0..K {
@@ -58514,6 +58590,10 @@ mod tests {
         );
     }
 
+    /// Ground-truth row captured from the memo-disabled descent path: the inode
+    /// number plus its `(ino, size, blocks)` attr triple.
+    type BtrfsFloorAttrRow = (InodeNumber, Option<(InodeNumber, u64, u64)>);
+
     /// bd-5vis3: the floor-leaf memo must be correct under CONCURRENCY, because
     /// the mounted comparator row this bead owes is an 8-thread readdir+stat and
     /// the memo has only ever been exercised single-threaded.
@@ -58561,7 +58641,7 @@ mod tests {
         // metadata is corrupt. Verified by negative control — with the span check
         // removed, the circular version of this test still passed.
         fs.set_btrfs_floor_memo_disabled(true);
-        let expected: Vec<(InodeNumber, Option<(InodeNumber, u64, u64)>)> = inos
+        let expected: Vec<BtrfsFloorAttrRow> = inos
             .iter()
             .map(|ino| {
                 (
@@ -60102,7 +60182,7 @@ mod tests {
     ///   * `mkdir`  → sharded records debited (dir block + inode + `used_dirs`)
     ///   * `write`  → single-lock array debited (file data blocks)
     ///   * `rmdir`  → single-lock array credited (the dir's own block, via the
-    ///                extent walk) AND sharded records credited (the inode)
+    ///     extent walk) AND sharded records credited (the inode)
     ///   * `unlink` → single-lock array credited (file data blocks)
     ///
     /// — and leaves live objects of both kinds behind, so nothing cancels. Only
@@ -60315,7 +60395,7 @@ mod tests {
     #[test]
     #[ignore = "bd-y2t0r: measurement, not a gate — 8-thread storm per arm"]
     fn sharded_vs_single_lock_parallel_metadata_in_process_bd_y2t0r() {
-        let mut arm = |sharded: bool| -> Option<std::time::Duration> {
+        let arm = |sharded: bool| -> Option<std::time::Duration> {
             let (fs, _dev, _tmp) = open_writable_ext4_mkfs_with_device(256)?;
             let cx = Cx::for_testing();
             let root = InodeNumber(2);
@@ -67875,9 +67955,10 @@ mod tests {
 
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    fn ext4_sharded_alloc_dir_block_grows_bd_bhh0i() {
-        // The dir-growth primitive returns a distinct block per call and debits
-        // total_free().blocks by one.
+    fn ext4_sharded_alloc_blocks_single_block_grows_bd_bhh0i() {
+        // The sharded allocator's single-block growth returns a distinct block
+        // per call and debits total_free().blocks by one. Exercises the same
+        // primitive the DirAllocBackend seam routes dir growth through.
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
             return;
         };
@@ -67893,9 +67974,10 @@ mod tests {
         let mut blocks = Vec::new();
         for call in 0..3 {
             let blk = fs
-                .ext4_sharded_alloc_dir_block(&cx, &dev, &hint)
+                .ext4_sharded_alloc_blocks(&cx, &dev, &hint, 1)
                 .unwrap_or_else(|e| panic!("dir-block grow {call} errored: {e:?}"))
-                .unwrap_or_else(|| panic!("dir-block grow {call} found no free block"));
+                .unwrap_or_else(|| panic!("dir-block grow {call} found no free block"))
+                .start;
             blocks.push(blk.0);
         }
         let mut sorted = blocks.clone();
@@ -71087,10 +71169,9 @@ mod tests {
                         if fs
                             .rename(&cx, parents[p], OsStr::new(name), parents[dp], OsStr::new(dname))
                             .is_ok()
+                            && let Some(moved) = model.remove(&(pino, name))
                         {
-                            if let Some(moved) = model.remove(&(pino, name)) {
-                                model.insert((dpino, dname), moved);
-                            }
+                            model.insert((dpino, dname), moved);
                         }
                     }
                 }
@@ -93996,33 +94077,6 @@ mod tests {
             "no inodes should reference non-existent extent"
         );
         assert_eq!(elem_missed, 0);
-    }
-}
-
-#[cfg(test)]
-mod free_space_tree_strand_tests {
-    use super::btrfs_commit_would_strand_free_space_tree;
-
-    /// bd-73bi2, the exact shape: the ROOT_ITEM generation was advanced and the
-    /// block was not rewritten.
-    #[test]
-    fn a_patched_root_item_with_no_block_write_is_stranded_bd_73bi2() {
-        assert!(btrfs_commit_would_strand_free_space_tree(true, false));
-    }
-
-    /// The normal path: both happened, generations agree, nothing to stop.
-    #[test]
-    fn a_patched_root_item_with_a_block_write_is_fine_bd_73bi2() {
-        assert!(!btrfs_commit_would_strand_free_space_tree(true, true));
-    }
-
-    /// An image with NO free-space tree at all never patched a ROOT_ITEM, so
-    /// there is nothing stranded and the commit must proceed. Getting this cell
-    /// wrong would refuse every commit on such an image.
-    #[test]
-    fn an_image_without_a_free_space_tree_is_not_stranded_bd_73bi2() {
-        assert!(!btrfs_commit_would_strand_free_space_tree(false, false));
-        assert!(!btrfs_commit_would_strand_free_space_tree(false, true));
     }
 }
 

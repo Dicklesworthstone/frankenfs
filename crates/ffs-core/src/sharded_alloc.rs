@@ -36,7 +36,7 @@ struct GroupLock {
 /// the scan and never holds two group locks at once, matching the
 /// `groups(sorted)` acquisition order the Loom writer projection proves
 /// deadlock-free and linearizable.
-pub(crate) struct PerGroupAlloc {
+pub struct PerGroupAlloc {
     groups: Vec<GroupLock>,
     /// The per-group free counts these records were SEEDED with at
     /// `enable_writes`, i.e. the state the single-lock `Ext4AllocState.groups`
@@ -206,13 +206,15 @@ impl PerGroupAlloc {
         let mut blocks = 0_u64;
         let mut inodes = 0_u64;
         for (gidx, group) in self.groups.iter().enumerate() {
-            let stats = group.stats.lock();
-            let (free_blocks, free_inodes) = match (self.seed.get(gidx), live.get(gidx)) {
-                (Some(seed), Some(live)) => (
-                    apply_delta(stats.free_blocks, seed.free_blocks, live.free_blocks),
-                    apply_delta(stats.free_inodes, seed.free_inodes, live.free_inodes),
-                ),
-                _ => (stats.free_blocks, stats.free_inodes),
+            let (free_blocks, free_inodes) = {
+                let stats = group.stats.lock();
+                match (self.seed.get(gidx), live.get(gidx)) {
+                    (Some(seed), Some(live)) => (
+                        apply_delta(stats.free_blocks, seed.free_blocks, live.free_blocks),
+                        apply_delta(stats.free_inodes, seed.free_inodes, live.free_inodes),
+                    ),
+                    _ => (stats.free_blocks, stats.free_inodes),
+                }
             };
             blocks += u64::from(free_blocks);
             inodes += u64::from(free_inodes);
@@ -343,15 +345,17 @@ impl PerGroupAlloc {
                 });
             }
         }
-        let mut stats = self.lock_group(gidx);
-        // Read this locked group's own pre-populated reserved set. The Arc clone
-        // releases the `reserved_cache` borrow before the `&mut stats` call below;
-        // empty only if unpopulated (never, under the feature) — same as
-        // `alloc_blocks`.
-        let reserved = stats.reserved_cache.get().cloned().unwrap_or_default();
-        ffs_alloc::free_blocks_in_group(
-            cx, dev, geo, &mut stats, group, rel_start, count, pctx, &reserved,
-        )
+        {
+            let mut stats = self.lock_group(gidx);
+            // Read this locked group's own pre-populated reserved set. The Arc
+            // clone releases the `reserved_cache` borrow before the `&mut stats`
+            // call below; empty only if unpopulated (never, under the feature) —
+            // same as `alloc_blocks`.
+            let reserved = stats.reserved_cache.get().cloned().unwrap_or_default();
+            ffs_alloc::free_blocks_in_group(
+                cx, dev, geo, &mut stats, group, rel_start, count, pctx, &reserved,
+            )
+        }
     }
 
     /// Sharded per-group inode allocation (bd-bhh0i Part A): walk the
@@ -385,8 +389,8 @@ impl PerGroupAlloc {
         for delta in 1..=8u32 {
             for dir in [1_i64, -1_i64] {
                 let g = i64::from(target_idx) + dir * i64::from(delta);
-                if g >= 0 && (g as u32) < group_count {
-                    order.push(g as usize);
+                if g >= 0 && g < i64::from(group_count) {
+                    order.push(usize::try_from(g).expect("invariant: g >= 0 and < group_count"));
                 }
             }
         }
@@ -469,7 +473,9 @@ impl PerGroupAlloc {
         let index = ffs_types::inode_index_in_group(ino, geo.inodes_per_group);
         let byte_in_table = u64::from(index) * u64::from(geo.inode_size);
         let block_offset = byte_in_table / u64::from(geo.block_size);
-        let byte_offset = (byte_in_table % u64::from(geo.block_size)) as usize;
+        let byte_offset =
+            usize::try_from(byte_in_table % u64::from(geo.block_size))
+                .expect("invariant: byte offset < block_size fits usize");
         let inode_table_block = self.groups[gidx].stats.lock().inode_table_block.0;
         let block = ffs_types::BlockNumber(inode_table_block.checked_add(block_offset)?);
         Some(ffs_inode::InodeLocation { block, byte_offset })
@@ -483,7 +489,7 @@ impl PerGroupAlloc {
 /// immutable mkfs layout (the bitmap/table locators) or re-derived from the
 /// device at flush (the bitmap checksums and the UNINIT flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SeedCounts {
+pub struct SeedCounts {
     pub(crate) free_blocks: u32,
     pub(crate) free_inodes: u32,
     pub(crate) used_dirs: u32,
@@ -524,7 +530,7 @@ fn apply_delta(sharded: u32, seed: u32, live: u32) -> u32 {
 
 /// Aggregate free counts across all groups (see [`PerGroupAlloc::total_free`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FreeTotals {
+pub struct FreeTotals {
     pub(crate) blocks: u64,
     pub(crate) inodes: u64,
 }
@@ -532,7 +538,7 @@ pub(crate) struct FreeTotals {
 /// One group's free counts, as the sharded Orlov directory allocator reads them
 /// (see [`PerGroupAlloc::group_free_snapshot`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GroupFree {
+pub struct GroupFree {
     pub(crate) free_blocks: u32,
     pub(crate) free_inodes: u32,
     pub(crate) used_dirs: u32,
@@ -619,7 +625,7 @@ fn choose_dir_group_from_snapshot(snapshot: &[GroupFree]) -> Option<ffs_types::G
 /// offset. The seed source and whether to spread only under measured contention
 /// (vs. accept a small single-thread locality loss) are tuning decisions for the
 /// cutover A/B — this function is the mechanism, not the final policy.
-pub(crate) fn spread_start_group(
+pub fn spread_start_group(
     parent: ffs_types::GroupNumber,
     seed: u32,
     group_count: u32,
@@ -768,7 +774,7 @@ mod tests {
         let stats: Vec<GroupStats> = [0u32, 0, 5, 10]
             .into_iter()
             .enumerate()
-            .map(|(g, fb)| sample_group(g as u32, fb, 0))
+            .map(|(g, fb)| sample_group(u32::try_from(g).expect("small"), fb, 0))
             .collect();
         let sharded = PerGroupAlloc::from_group_stats(stats);
         // Order 0,1,2,3: groups 0,1 have 0 free (fail), group 2 has 5 >= 3 -> take.
@@ -793,7 +799,7 @@ mod tests {
         let stats: Vec<GroupStats> = [4u32, 4, 4, 4]
             .into_iter()
             .enumerate()
-            .map(|(g, fb)| sample_group(g as u32, fb, 0))
+            .map(|(g, fb)| sample_group(u32::try_from(g).expect("small"), fb, 0))
             .collect();
         let sharded = PerGroupAlloc::from_group_stats(stats);
         // Goal group 2 first: it satisfies, so it (not group 0) is debited.
@@ -812,7 +818,7 @@ mod tests {
         let stats: Vec<GroupStats> = [2u32, 1, 2]
             .into_iter()
             .enumerate()
-            .map(|(g, fb)| sample_group(g as u32, fb, 0))
+            .map(|(g, fb)| sample_group(u32::try_from(g).expect("small"), fb, 0))
             .collect();
         let sharded = PerGroupAlloc::from_group_stats(stats);
         let hit = sharded.alloc_in_scan_order(0..3, try_take(3));
@@ -835,7 +841,7 @@ mod tests {
     ///   * flush the sharded snapshot alone      → 97 (loses the single-lock -5)
     ///   * flush the single-lock array alone     → 95 (loses the sharded -3)
     ///   * add the two absolute counts           → 192 (double-counts the seed)
-    /// Only `seed + both deltas` = 92 is the state the bitmaps describe.
+    ///     Only `seed + both deltas` = 92 is the state the bitmaps describe.
     #[test]
     fn reconciled_group_stats_applies_the_single_lock_delta_bd_y2t0r() {
         let seed: Vec<GroupStats> = (0..2).map(|g| sample_group(g, 100, 40)).collect();
@@ -972,12 +978,14 @@ mod tests {
         let seed: Vec<GroupStats> = (0..4).map(|g| sample_group(g, 1_000, 200)).collect();
         let mut live = SeedCounts::snapshot(&seed);
         let sharded = PerGroupAlloc::from_group_stats(seed);
-        for g in 0..4usize {
-            let mut rec = sharded.lock_group(g);
-            rec.free_blocks -= u32::try_from(g).expect("small") * 3;
-            rec.free_inodes -= 1;
-            live[g].free_blocks -= 11;
-            live[g].free_inodes += 2;
+        for (g, live_counts) in live.iter_mut().enumerate() {
+            {
+                let mut rec = sharded.lock_group(g);
+                rec.free_blocks -= u32::try_from(g).expect("small") * 3;
+                rec.free_inodes -= 1;
+            }
+            live_counts.free_blocks -= 11;
+            live_counts.free_inodes += 2;
         }
         let per_group = sharded.reconciled_group_stats(&live);
         let expect_blocks: u64 = per_group.iter().map(|g| u64::from(g.free_blocks)).sum();
@@ -1034,7 +1042,7 @@ mod tests {
         let stats: Vec<GroupStats> = [0u32, 5]
             .into_iter()
             .enumerate()
-            .map(|(g, fb)| sample_group(g as u32, fb, 0))
+            .map(|(g, fb)| sample_group(u32::try_from(g).expect("small"), fb, 0))
             .collect();
         let sharded = PerGroupAlloc::from_group_stats(stats);
         // 99 is out of range (skipped), 0 fails, 1 satisfies.
@@ -1117,7 +1125,7 @@ mod tests {
         let stats: Vec<GroupStats> = [10u32, 10, 10]
             .into_iter()
             .enumerate()
-            .map(|(g, fb)| sample_group(g as u32, fb, 5))
+            .map(|(g, fb)| sample_group(u32::try_from(g).expect("small"), fb, 5))
             .collect();
         let sharded = PerGroupAlloc::from_group_stats(stats);
         // Debit 4 blocks from group 1 specifically (single-group scan order).

@@ -39,60 +39,6 @@ fn commit_error_to_ffs(error: &CommitError) -> FfsError {
     }
 }
 
-#[cfg(test)]
-mod commit_error_mapping_tests {
-    use super::commit_error_to_ffs;
-    use ffs_error::FfsError;
-    use ffs_mvcc::CommitError;
-    use ffs_types::{BlockNumber, CommitSeq};
-
-    /// bd-y2t0r: a first-committer-wins conflict must surface as `EAGAIN`, and
-    /// this pins that deliberately rather than leaving it incidental.
-    ///
-    /// It is also a BEHAVIOUR CHANGE worth stating plainly: before the retry work
-    /// these conflicts were flattened into `FfsError::Format`, which maps to
-    /// `EINVAL`. `EINVAL` says the caller passed something invalid, which is
-    /// false — nothing about the request was wrong, another writer simply
-    /// committed the same block first. `EAGAIN` says "try again", which is what
-    /// actually happened and what a caller can act on.
-    ///
-    /// Any caller that does NOT retry now surfaces `EAGAIN` where it previously
-    /// surfaced `EINVAL`. That is an improvement, but it is a change, and a
-    /// client keying on `EINVAL` for this case would need updating.
-    #[test]
-    fn a_first_committer_wins_conflict_maps_to_eagain_not_einval() {
-        let conflict = CommitError::Conflict {
-            block: BlockNumber(38),
-            snapshot: CommitSeq(1),
-            observed: CommitSeq(2),
-        };
-        let mapped = commit_error_to_ffs(&conflict);
-        assert!(
-            matches!(mapped, FfsError::MvccConflict { block: 38, .. }),
-            "a conflict must keep its type and its block: {mapped:?}"
-        );
-        assert_eq!(
-            mapped.to_errno(),
-            libc::EAGAIN,
-            "a transient conflict must be retryable, not reported as a bad argument"
-        );
-        assert_ne!(
-            mapped.to_errno(),
-            libc::EINVAL,
-            "EINVAL was the PREVIOUS mapping and is wrong: the request was valid"
-        );
-    }
-
-    /// Everything that is not a conflict keeps its previous shape, so the typed
-    /// mapping did not widen beyond the one case that needed it.
-    #[test]
-    fn non_conflict_commit_failures_stay_format_errors() {
-        let other = CommitError::DurabilityFailure {
-            detail: "wal write failed".to_owned(),
-        };
-        assert!(matches!(commit_error_to_ffs(&other), FfsError::Format(_)));
-    }
-}
 
 /// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API./// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
 ///
@@ -278,12 +224,11 @@ impl FsMvccStore {
         // inode-table block). Recording the base makes the merge independent of
         // pruning (bd-bhh0i BUG-4 inode-table pruning race). The extra block-sized
         // clone is only consumed on a same-block conflict.
-        let (mut data, base) = match self.read_visible(block, snapshot) {
-            Some(bytes) => (bytes.clone(), Some(bytes)),
-            None => {
-                let device_base = read_base()?;
-                (device_base.clone(), Some(device_base))
-            }
+        let (mut data, base) = if let Some(bytes) = self.read_visible(block, snapshot) {
+            (bytes.clone(), Some(bytes))
+        } else {
+            let device_base = read_base()?;
+            (device_base.clone(), Some(device_base))
         };
         patch(&mut data)?;
         txn.stage_write_with_proof_and_base(block, data, proof, base);
@@ -630,15 +575,13 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // pruning race); these three device-level RMW paths were left behind, and
         // the gap only shows under enough load for a snapshot to age past a prune
         // (bd-y2t0r, block 2085).
-        let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => {
-                let resident = buf.as_slice().to_vec();
-                (resident.clone(), Some(resident))
-            }
-            None => {
-                let device_base = self.base.read_block(cx, block)?.into_inner();
-                (device_base.clone(), Some(device_base))
-            }
+        let (mut data, base) = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot)
+        {
+            let resident = buf.as_slice().to_vec();
+            (resident.clone(), Some(resident))
+        } else {
+            let device_base = self.base.read_block(cx, block)?.into_inner();
+            (device_base.clone(), Some(device_base))
         };
         patch(&mut data)?;
         // Empty hint → identical to `write_block` (default `Unsafe` proof, no merge).
@@ -688,15 +631,13 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // pruning race); these three device-level RMW paths were left behind, and
         // the gap only shows under enough load for a snapshot to age past a prune
         // (bd-y2t0r, block 2085).
-        let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => {
-                let resident = buf.as_slice().to_vec();
-                (resident.clone(), Some(resident))
-            }
-            None => {
-                let device_base = self.base.read_block(cx, block)?.into_inner();
-                (device_base.clone(), Some(device_base))
-            }
+        let (mut data, base) = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot)
+        {
+            let resident = buf.as_slice().to_vec();
+            (resident.clone(), Some(resident))
+        } else {
+            let device_base = self.base.read_block(cx, block)?.into_inner();
+            (device_base.clone(), Some(device_base))
         };
         patch(&mut data)?;
         txn.stage_write_with_proof_and_base(block, data, MergeProof::BitmapOr, base);
@@ -737,15 +678,13 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // pruning race); these three device-level RMW paths were left behind, and
         // the gap only shows under enough load for a snapshot to age past a prune
         // (bd-y2t0r, block 2085).
-        let (mut data, base) = match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => {
-                let resident = buf.as_slice().to_vec();
-                (resident.clone(), Some(resident))
-            }
-            None => {
-                let device_base = self.base.read_block(cx, block)?.into_inner();
-                (device_base.clone(), Some(device_base))
-            }
+        let (mut data, base) = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot)
+        {
+            let resident = buf.as_slice().to_vec();
+            (resident.clone(), Some(resident))
+        } else {
+            let device_base = self.base.read_block(cx, block)?.into_inner();
+            (device_base.clone(), Some(device_base))
         };
         patch(&mut data)?;
         txn.stage_write_with_proof_and_base(block, data, MergeProof::BitmapDelta, base);
@@ -768,13 +707,12 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // re-derives the base from its chain (record no base); otherwise the block
         // is only on the raw base device → return its bytes AND record them as
         // `staged_base` (mirrors the auto-commit rmw path).
-        match self.store.read_visible_block_buf(block, snapshot) {
-            Some(buf) => Ok((buf, None)),
-            None => {
-                let device = self.base.read_block(cx, block)?;
-                let base = device.as_slice().to_vec();
-                Ok((device, Some(base)))
-            }
+        if let Some(buf) = self.store.read_visible_block_buf(block, snapshot) {
+            Ok((buf, None))
+        } else {
+            let device = self.base.read_block(cx, block)?;
+            let base = device.as_slice().to_vec();
+            Ok((device, Some(base)))
         }
     }
 
@@ -788,5 +726,59 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
 
     fn sync(&self, cx: &Cx) -> FfsResult<()> {
         self.base.sync(cx)
+    }
+}
+#[cfg(test)]
+mod commit_error_mapping_tests {
+    use super::commit_error_to_ffs;
+    use ffs_error::FfsError;
+    use ffs_mvcc::CommitError;
+    use ffs_types::{BlockNumber, CommitSeq};
+
+    /// bd-y2t0r: a first-committer-wins conflict must surface as `EAGAIN`, and
+    /// this pins that deliberately rather than leaving it incidental.
+    ///
+    /// It is also a BEHAVIOUR CHANGE worth stating plainly: before the retry work
+    /// these conflicts were flattened into `FfsError::Format`, which maps to
+    /// `EINVAL`. `EINVAL` says the caller passed something invalid, which is
+    /// false — nothing about the request was wrong, another writer simply
+    /// committed the same block first. `EAGAIN` says "try again", which is what
+    /// actually happened and what a caller can act on.
+    ///
+    /// Any caller that does NOT retry now surfaces `EAGAIN` where it previously
+    /// surfaced `EINVAL`. That is an improvement, but it is a change, and a
+    /// client keying on `EINVAL` for this case would need updating.
+    #[test]
+    fn a_first_committer_wins_conflict_maps_to_eagain_not_einval() {
+        let conflict = CommitError::Conflict {
+            block: BlockNumber(38),
+            snapshot: CommitSeq(1),
+            observed: CommitSeq(2),
+        };
+        let mapped = commit_error_to_ffs(&conflict);
+        assert!(
+            matches!(mapped, FfsError::MvccConflict { block: 38, .. }),
+            "a conflict must keep its type and its block: {mapped:?}"
+        );
+        assert_eq!(
+            mapped.to_errno(),
+            libc::EAGAIN,
+            "a transient conflict must be retryable, not reported as a bad argument"
+        );
+        assert_ne!(
+            mapped.to_errno(),
+            libc::EINVAL,
+            "EINVAL was the PREVIOUS mapping and is wrong: the request was valid"
+        );
+    }
+
+    /// Everything that is not a conflict keeps its previous shape, so the typed
+    /// mapping did not widen beyond the one case that needed it.
+    #[test]
+    fn non_conflict_commit_failures_stay_format_errors() {
+        let other = CommitError::DurabilityFailure {
+            detail: "wal write failed".to_owned(),
+        };
+        assert!(matches!(commit_error_to_ffs(&other), FfsError::Format(_)));
     }
 }

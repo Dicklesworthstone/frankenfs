@@ -1,6 +1,37 @@
 //! VFS operation dispatch for [`OpenFs`].
 
-use super::*;
+use super::{
+    Arc, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_INO_LOOKUP_USER_ARGS_SIZE,
+    BTRFS_INO_LOOKUP_USER_NAME_OFFSET, BTRFS_INO_LOOKUP_USER_NAME_SIZE,
+    BTRFS_INO_LOOKUP_USER_PATH_OFFSET, BTRFS_INO_LOOKUP_USER_PATH_SIZE,
+    BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
+    BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM,
+    BTRFS_MAX_ROOTREF_BUFFER_NUM, BTRFS_ROOTREF_ENTRY_SIZE, BTRFS_ROOT_SUBVOL_RDONLY,
+    BTRFS_SUBVOL_ROOTREF_ARGS_SIZE, BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET,
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_TREE_SEARCH_KEY_SIZE, BTRFS_TREE_SEARCH_V2_HEADER_SIZE,
+    BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS, BtrfsBTree, BtrfsExtentData,
+    BtrfsKey, BtrfsParsedNode, BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey,
+    BlockNumber, ByteOffset, CommitSeq, Cx, DirEntry, DirNameIndex,
+    EXT4_COMPRBLK_FL, EXT4_ENCRYPTION_XATTR_NAME, EXT4_SB_CHECKSUM_OFFSET, Ext4FileType,
+    Ext4Inode, Ext4MoveExtRequest, Ext4Superblock, Ext4Xattr, FSCRYPT_CONTEXT_V1_SIZE,
+    FSCRYPT_CONTEXT_V2_SIZE,
+    FSCRYPT_POLICY_V1_SIZE, FSCRYPT_POLICY_V1_VERSION, FSCRYPT_POLICY_V2_SIZE,
+    FSCRYPT_POLICY_V2_VERSION, FfsError,
+    FiemapExtent, FileType, FsFlavor, FsGeometry, FsOps, FsStat, FsxattrInfo, InodeAttr,
+    InodeNumber, LINUX_PATH_MAX, LINUX_SYMLINK_TARGET_MAX, Mutex, OpenFs, OsStr, Path, QuotaInfo,
+    ReaddirPage, ReaddirValidation, RequestCommitMode, RequestOp, RequestScope, SeekWhence,
+    SetAttrRequest, TransactionBlockAdapter, XattrSetMode, btrfs_inode_flags_to_fsflags,
+    btrfs_mutation_to_ffs, btrfs_ro_readdir_snapshot_enabled, clear_readdir_snapshot,
+    dir_entry_file_type, encode_btrfs_dev_info_args, encode_btrfs_fs_info_args,
+    encode_btrfs_ino_paths_container, encode_btrfs_supported_feature_flags,
+    encode_btrfs_tree_search_results, encode_btrfs_tree_search_results_with_limit,
+    ext4_flags_to_xflags, ext4_present_xattr_value, ext4_read_buffer_len, first_nul,
+    fsflags_to_btrfs_inode_flags, generate_send_stream, info, map_logical_to_physical,
+    parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item, parse_to_ffs_error,
+    read_btrfs_superblock_region, read_ext4_superblock_region, readdir_snapshot_serve,
+    readdir_snapshot_serve_unvalidated, readdir_snapshot_store, slice_readdir_snapshot,
+    systemtime_nanos, trace, warn, xflags_to_btrfs_inode_flags, xflags_to_ext4_flags,
+};
 use crate::vfs::XattrPresence;
 
 /// The largest inode table this scan will walk before giving up.
@@ -179,10 +210,9 @@ impl OpenFs {
                     // the layer that still has the bytes.
                     BtrfsParsedNode::Internal { .. } => self
                         .btrfs_tree_block_generation(cx, ptr.blockptr)
-                        .map(|actual| {
+                        .map_or(None, |actual| {
                             (actual != ptr.generation).then_some((ptr.generation, actual))
-                        })
-                        .unwrap_or(None),
+                        }),
                 };
                 if let Some((wanted, actual)) = generation {
                     found.push(BtrfsTransidMismatch {
@@ -258,6 +288,200 @@ impl OpenFs {
         ffs_btrfs::BtrfsHeader::parse_from_block(&buf)
             .ok()
             .map(|header| header.generation)
+    }
+}
+
+impl OpenFs {
+    /// ext4 arm of [`FsOps::readdir`] (split out to keep `readdir` readable).
+    fn ext4_readdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+    ) -> ffs_error::Result<ReaddirPage> {
+        let canonical = Self::ext4_canonical_inode(ino);
+        let inode = self.read_inode_metadata_with_scope(cx, scope, canonical)?;
+        if !inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        // Serve a later page from the snapshot if the directory is
+        // unchanged since it was taken (any mutation bumps ctime/mtime) —
+        // avoiding a full re-read+re-parse per paginated readdir call.
+        let validation = ReaddirValidation {
+            ctime: (u64::from(inode.ctime) << 32) | u64::from(inode.ctime_extra),
+            mtime: u64::from(inode.mtime),
+            size: inode.size,
+        };
+        if let Some(page) =
+            readdir_snapshot_serve(&self.readdir_snapshot, canonical.0, validation, offset)
+        {
+            if !scope.skip_readdir_prefetch
+                && !self
+                    .readdir_prefetch_disabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.prefetch_ext4_readdir_inode_table_blocks(cx, scope, page.as_slice());
+            }
+            return Ok(page);
+        }
+
+        #[cfg(test)]
+        self.readdir_full_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let raw_entries = self.read_dir_with_scope(cx, scope, &inode)?;
+        // On a read-only mount the directory is immutable, so cache this full
+        // readdir as a name->dirent snapshot: subsequent present-name lookups
+        // (ls -l, directory scans) answer O(1) from it instead of descending
+        // the htree + linearly scanning the hash-leaf per name. Non-casefold
+        // only (keys on exact name bytes); read-only only (never goes stale)
+        // (bd-cc-ext4-presentidx).
+        //
+        // Skip the build entirely for a ONE-PASS consumer (the
+        // `readonly_lookup_cache_disabled` contract): `ls -f`,
+        // getdents/name-enumeration, and any `walk` (--no-stat OR full stat,
+        // which getattrs by inode and never issues a name `lookup`) never
+        // query this index, so cloning every name into an FxHashMap per
+        // readdir is pure dead work (~7% of a 30000-entry read-only
+        // `walk --no-stat`; still ~2% under a full stat walk).
+        if canonical.0 != 0
+            && !self.is_writable()
+            && inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
+            && !self
+                .readonly_lookup_cache_disabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let present: rustc_hash::FxHashMap<Vec<u8>, (u32, Ext4FileType)> = raw_entries
+                .iter()
+                .map(|e| (e.name.clone(), (e.inode, e.file_type)))
+                .collect();
+            *self.dir_name_index_shard(canonical.0).lock() = Some(DirNameIndex {
+                inode: canonical.0,
+                validation,
+                // `present` is complete and lookup consults it first, so
+                // cloning every key into `names` would only duplicate
+                // ownership. Demotion moves these keys into the set.
+                names: rustc_hash::FxHashSet::default(),
+                present: Some(present),
+            });
+        }
+        // Build the FULL list (offset 0) once; cookies are 1-indexed
+        // positions (ascending), so the binary-search slice serves any
+        // page exactly.
+        let full: Vec<DirEntry> = raw_entries
+            .into_iter()
+            .enumerate()
+            .map(|(idx, e)| {
+                Self::ext4_present_dir_entry(DirEntry {
+                    ino: InodeNumber(u64::from(e.inode)),
+                    offset: (idx as u64) + 1,
+                    kind: dir_entry_file_type(e.file_type),
+                    name: e.name,
+                })
+            })
+            .collect();
+        let full = Arc::new(full);
+        let page = slice_readdir_snapshot(Arc::clone(&full), offset);
+        if !scope.skip_readdir_prefetch
+            && !self
+                .readdir_prefetch_disabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.prefetch_ext4_readdir_inode_table_blocks(cx, scope, page.as_slice());
+        }
+        readdir_snapshot_store(&self.readdir_snapshot, canonical.0, validation, full);
+        Ok(page)
+    }
+
+    /// btrfs arm of [`FsOps::readdir`] (split out to keep `readdir` readable).
+    fn btrfs_readdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+    ) -> ffs_error::Result<ReaddirPage> {
+        // Same snapshot lever as ext4: a paginated readdir otherwise
+        // re-walks the dir's DIR_INDEX items on every call (O(N^2)).
+        //
+        // Active on BOTH read-only and writable mounts. Correctness on
+        // the writable path rests on EXPLICIT invalidation, not on
+        // timestamp self-validation: every FsOps directory mutation
+        // (create/mknod/mkdir/unlink/rmdir/rename/rename2/link/symlink)
+        // calls clear_readdir_snapshot() before mutating, so a later
+        // readdir can never serve a listing that predates a change —
+        // including a rename's '..' update, which does not reliably bump
+        // the dir's change-time (the reason an earlier revision gated
+        // this to read-only). readdir vs. mutation on the same dir is
+        // serialized by the FUSE dispatcher's inode locks, identical to
+        // the ext4 writable snapshot above.
+        let canonical = self.btrfs_canonical_inode(ino)?;
+        // bd-btrfs-ro-readdir: on a mount that cannot be written through,
+        // the snapshot cannot go stale, so skip the per-call attr lookup
+        // that exists only to build the validation key. On btrfs that
+        // lookup is a tree descent, paid once per readdir PAGE for a
+        // listing already in hand -- ~209 descents for a 20000-entry
+        // directory, each one a fresh chance to miss the block cache.
+        // That per-call variance is the leading remaining suspect for
+        // the btrfs readdir+stat A/A null, which has never cleared in 7
+        // attempts and whose best is only 0.5 points over the ceiling.
+        //
+        // `btrfs_alloc_state` is `None` exactly when the mount is
+        // read-only, which is the same condition the writable path below
+        // branches on, so this cannot diverge from it.
+        if btrfs_ro_readdir_snapshot_enabled()
+            && self.btrfs_alloc_state.is_none()
+            && let Some(page) = readdir_snapshot_serve_unvalidated(
+                &self.readdir_snapshot,
+                canonical,
+                offset,
+            )
+        {
+            // bd-btrfs-readdir-stat-8x-8y7vp: warm THIS page, not just
+            // the first. A full listing is paginated, and every page
+            // after the first is served from the snapshot and returns
+            // here — so hooking only the fresh walk below warmed one
+            // page out of a directory's worth. ext4 hooks its snapshot
+            // path for the same reason.
+            self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
+            return Ok(page);
+        }
+        let attr = self.btrfs_read_inode_attr(cx, ino)?;
+        if attr.kind != FileType::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+        let validation = ReaddirValidation {
+            ctime: systemtime_nanos(attr.ctime),
+            mtime: systemtime_nanos(attr.mtime),
+            size: attr.size,
+        };
+        if let Some(page) =
+            readdir_snapshot_serve(&self.readdir_snapshot, canonical, validation, offset)
+        {
+            self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
+            return Ok(page);
+        }
+
+        #[cfg(test)]
+        self.readdir_full_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rows = self.btrfs_readdir_entries(cx, ino)?;
+        // Rows arrive sorted by DIR_INDEX key; the cookie is key+1, so the
+        // full list is cookie-ascending and the binary-search slice serves
+        // any page identically to the prior `key >= offset` filter.
+        let full: Vec<DirEntry> = rows
+            .into_iter()
+            .map(|(key, mut e)| {
+                e.offset = key.saturating_add(1);
+                e
+            })
+            .collect();
+        let full = Arc::new(full);
+        let page = slice_readdir_snapshot(Arc::clone(&full), offset);
+        readdir_snapshot_store(&self.readdir_snapshot, canonical, validation, full);
+        self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
+        Ok(page)
     }
 }
 
@@ -381,20 +605,19 @@ impl FsOps for OpenFs {
                         .map(|slot| &slot.1)
                 });
                 let parent_storage;
-                let parent_inode: &Ext4Inode = match hot_parent {
-                    Some(arc) => arc.as_ref(),
-                    None => {
-                        let parsed = self.read_inode_metadata_with_scope(cx, scope, parent_ino)?;
-                        if !parsed.is_dir() {
-                            return Err(FfsError::NotDirectory);
-                        }
-                        if read_only {
-                            self.ext4_hot_parent
-                                .store(Some(Arc::new((parent_ino.0, Arc::new(parsed.clone())))));
-                        }
-                        parent_storage = parsed;
-                        &parent_storage
+                let parent_inode: &Ext4Inode = if let Some(arc) = hot_parent {
+                    arc.as_ref()
+                } else {
+                    let parsed = self.read_inode_metadata_with_scope(cx, scope, parent_ino)?;
+                    if !parsed.is_dir() {
+                        return Err(FfsError::NotDirectory);
                     }
+                    if read_only {
+                        self.ext4_hot_parent
+                            .store(Some(Arc::new((parent_ino.0, Arc::new(parsed.clone())))));
+                    }
+                    parent_storage = parsed;
+                    &parent_storage
                 };
 
                 let name_bytes = name.as_encoded_bytes();
@@ -418,181 +641,8 @@ impl FsOps for OpenFs {
         offset: u64,
     ) -> ffs_error::Result<ReaddirPage> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => {
-                let canonical = Self::ext4_canonical_inode(ino);
-                let inode = self.read_inode_metadata_with_scope(cx, scope, canonical)?;
-                if !inode.is_dir() {
-                    return Err(FfsError::NotDirectory);
-                }
-
-                // Serve a later page from the snapshot if the directory is
-                // unchanged since it was taken (any mutation bumps ctime/mtime) —
-                // avoiding a full re-read+re-parse per paginated readdir call.
-                let validation = ReaddirValidation {
-                    ctime: (u64::from(inode.ctime) << 32) | u64::from(inode.ctime_extra),
-                    mtime: u64::from(inode.mtime),
-                    size: inode.size,
-                };
-                if let Some(page) =
-                    readdir_snapshot_serve(&self.readdir_snapshot, canonical.0, validation, offset)
-                {
-                    if !scope.skip_readdir_prefetch
-                        && !self
-                            .readdir_prefetch_disabled
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        self.prefetch_ext4_readdir_inode_table_blocks(cx, scope, page.as_slice());
-                    }
-                    return Ok(page);
-                }
-
-                #[cfg(test)]
-                self.readdir_full_reads
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let raw_entries = self.read_dir_with_scope(cx, scope, &inode)?;
-                // On a read-only mount the directory is immutable, so cache this full
-                // readdir as a name->dirent snapshot: subsequent present-name lookups
-                // (ls -l, directory scans) answer O(1) from it instead of descending
-                // the htree + linearly scanning the hash-leaf per name. Non-casefold
-                // only (keys on exact name bytes); read-only only (never goes stale)
-                // (bd-cc-ext4-presentidx).
-                //
-                // Skip the build entirely for a ONE-PASS consumer (the
-                // `readonly_lookup_cache_disabled` contract): `ls -f`,
-                // getdents/name-enumeration, and any `walk` (--no-stat OR full stat,
-                // which getattrs by inode and never issues a name `lookup`) never
-                // query this index, so cloning every name into an FxHashMap per
-                // readdir is pure dead work (~7% of a 30000-entry read-only
-                // `walk --no-stat`; still ~2% under a full stat walk).
-                if canonical.0 != 0
-                    && !self.is_writable()
-                    && inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-                    && !self
-                        .readonly_lookup_cache_disabled
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    let present: rustc_hash::FxHashMap<Vec<u8>, (u32, Ext4FileType)> = raw_entries
-                        .iter()
-                        .map(|e| (e.name.clone(), (e.inode, e.file_type)))
-                        .collect();
-                    *self.dir_name_index_shard(canonical.0).lock() = Some(DirNameIndex {
-                        inode: canonical.0,
-                        validation,
-                        // `present` is complete and lookup consults it first, so
-                        // cloning every key into `names` would only duplicate
-                        // ownership. Demotion moves these keys into the set.
-                        names: rustc_hash::FxHashSet::default(),
-                        present: Some(present),
-                    });
-                }
-                // Build the FULL list (offset 0) once; cookies are 1-indexed
-                // positions (ascending), so the binary-search slice serves any
-                // page exactly.
-                let full: Vec<DirEntry> = raw_entries
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, e)| {
-                        Self::ext4_present_dir_entry(DirEntry {
-                            ino: InodeNumber(u64::from(e.inode)),
-                            offset: (idx as u64) + 1,
-                            kind: dir_entry_file_type(e.file_type),
-                            name: e.name,
-                        })
-                    })
-                    .collect();
-                let full = Arc::new(full);
-                let page = slice_readdir_snapshot(Arc::clone(&full), offset);
-                if !scope.skip_readdir_prefetch
-                    && !self
-                        .readdir_prefetch_disabled
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.prefetch_ext4_readdir_inode_table_blocks(cx, scope, page.as_slice());
-                }
-                readdir_snapshot_store(&self.readdir_snapshot, canonical.0, validation, full);
-                Ok(page)
-            }
-            FsFlavor::Btrfs(_) => {
-                // Same snapshot lever as ext4: a paginated readdir otherwise
-                // re-walks the dir's DIR_INDEX items on every call (O(N^2)).
-                //
-                // Active on BOTH read-only and writable mounts. Correctness on
-                // the writable path rests on EXPLICIT invalidation, not on
-                // timestamp self-validation: every FsOps directory mutation
-                // (create/mknod/mkdir/unlink/rmdir/rename/rename2/link/symlink)
-                // calls clear_readdir_snapshot() before mutating, so a later
-                // readdir can never serve a listing that predates a change —
-                // including a rename's '..' update, which does not reliably bump
-                // the dir's change-time (the reason an earlier revision gated
-                // this to read-only). readdir vs. mutation on the same dir is
-                // serialized by the FUSE dispatcher's inode locks, identical to
-                // the ext4 writable snapshot above.
-                let canonical = self.btrfs_canonical_inode(ino)?;
-                // bd-btrfs-ro-readdir: on a mount that cannot be written through,
-                // the snapshot cannot go stale, so skip the per-call attr lookup
-                // that exists only to build the validation key. On btrfs that
-                // lookup is a tree descent, paid once per readdir PAGE for a
-                // listing already in hand -- ~209 descents for a 20000-entry
-                // directory, each one a fresh chance to miss the block cache.
-                // That per-call variance is the leading remaining suspect for
-                // the btrfs readdir+stat A/A null, which has never cleared in 7
-                // attempts and whose best is only 0.5 points over the ceiling.
-                //
-                // `btrfs_alloc_state` is `None` exactly when the mount is
-                // read-only, which is the same condition the writable path below
-                // branches on, so this cannot diverge from it.
-                if btrfs_ro_readdir_snapshot_enabled() && self.btrfs_alloc_state.is_none() {
-                    if let Some(page) = readdir_snapshot_serve_unvalidated(
-                        &self.readdir_snapshot,
-                        canonical,
-                        offset,
-                    ) {
-                        // bd-btrfs-readdir-stat-8x-8y7vp: warm THIS page, not just
-                        // the first. A full listing is paginated, and every page
-                        // after the first is served from the snapshot and returns
-                        // here — so hooking only the fresh walk below warmed one
-                        // page out of a directory's worth. ext4 hooks its snapshot
-                        // path for the same reason.
-                        self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
-                        return Ok(page);
-                    }
-                }
-                let attr = self.btrfs_read_inode_attr(cx, ino)?;
-                if attr.kind != FileType::Directory {
-                    return Err(FfsError::NotDirectory);
-                }
-                let validation = ReaddirValidation {
-                    ctime: systemtime_nanos(attr.ctime),
-                    mtime: systemtime_nanos(attr.mtime),
-                    size: attr.size,
-                };
-                if let Some(page) =
-                    readdir_snapshot_serve(&self.readdir_snapshot, canonical, validation, offset)
-                {
-                    self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
-                    return Ok(page);
-                }
-
-                #[cfg(test)]
-                self.readdir_full_reads
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let rows = self.btrfs_readdir_entries(cx, ino)?;
-                // Rows arrive sorted by DIR_INDEX key; the cookie is key+1, so the
-                // full list is cookie-ascending and the binary-search slice serves
-                // any page identically to the prior `key >= offset` filter.
-                let full: Vec<DirEntry> = rows
-                    .into_iter()
-                    .map(|(key, mut e)| {
-                        e.offset = key.saturating_add(1);
-                        e
-                    })
-                    .collect();
-                let full = Arc::new(full);
-                let page = slice_readdir_snapshot(Arc::clone(&full), offset);
-                readdir_snapshot_store(&self.readdir_snapshot, canonical, validation, full);
-                self.maybe_prefetch_btrfs_readdir_leaves(cx, scope, page.as_slice());
-                Ok(page)
-            }
+            FsFlavor::Ext4(_) => self.ext4_readdir(cx, scope, ino, offset),
+            FsFlavor::Btrfs(_) => self.btrfs_readdir(cx, scope, ino, offset),
         }
     }
 
@@ -849,8 +899,9 @@ impl FsOps for OpenFs {
                 // (`parse_xattr_name` errors — e.g. an unhandled prefix, which
                 // the kernel VFS rejects before ext4 anyway) fall back to the
                 // by-name finder so observable behavior is unchanged there.
-                let found = match ffs_xattr::parse_xattr_name_borrowed(name) {
-                    Ok((name_index, suffix)) => {
+                let found = if let Ok((name_index, suffix)) =
+                    ffs_xattr::parse_xattr_name_borrowed(name)
+                {
                         let found =
                             ffs_ondisk::find_ibody_xattr_by_index_name(&inode, name_index, suffix)
                                 .map_err(|e| parse_to_ffs_error(&e))?;
@@ -868,8 +919,7 @@ impl FsOps for OpenFs {
                             }
                             None => None,
                         }
-                    }
-                    Err(_) => {
+                } else {
                         let found = ffs_ondisk::find_ibody_xattr_by_name(&inode, name)
                             .map_err(|e| parse_to_ffs_error(&e))?;
                         match found {
@@ -882,7 +932,6 @@ impl FsOps for OpenFs {
                             }
                             None => None,
                         }
-                    }
                 };
                 let Some((name_index, value, value_inum)) = found else {
                     return Ok(None);

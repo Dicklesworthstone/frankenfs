@@ -230,6 +230,9 @@ impl Channel {
     }
 }
 
+/// Reply sender backed by a `/dev/fuse` character device file.
+///
+/// Cloning shares the underlying open device via [`std::sync::Arc`].
 #[derive(Clone, Debug)]
 pub struct ChannelSender(Arc<File>);
 

@@ -51,6 +51,7 @@ use std::cmp::max;
 use std::cmp::min;
 
 pub mod affinity;
+/// The `/dev/fuse` character-device request channel.
 pub mod channel;
 #[cfg(target_os = "linux")]
 mod io_uring;
