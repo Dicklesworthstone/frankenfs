@@ -5203,16 +5203,15 @@ impl Filesystem for FrankenFuse {
                     // prefetch slot, inline bounded scope past the bound, plain
                     // scope on the OFF arm. None means skip the entry because
                     // its fetch failed.
-                    let inode_attr = match self.readdirplus_entry_attr(
+                    let Some(inode_attr) = self.readdirplus_entry_attr(
                         &cx,
                         &mut prefetched,
                         entry,
                         index,
                         &mut census_served,
                         &mut census_inline,
-                    ) {
-                        Some(attr) => attr,
-                        None => continue,
+                    ) else {
+                        continue;
                     };
                     // bd-q0xnl: hand these attributes to the getattr the kernel
                     // issues for this same inode moments from now, so the daemon
@@ -5283,75 +5282,6 @@ impl Filesystem for FrankenFuse {
             }
         }
     }
-
-    /// Resolve ONE readdirplus entry's attributes, preserving bd-xfe7z's
-    /// three-way split: a filled prefetch slot is served without a new scope,
-    /// an empty slot pays an inline bounded getattr scope, and the
-    /// no-prefetch arm pays the plain scope it always paid.
-    ///
-    /// Returns `None` only when the entry must be SKIPPED -- its inline or
-    /// default getattr failed -- never merely for an unfilled slot beyond the
-    /// bound, which falls through to the inline path here exactly as the emit
-    /// loop did before this was extracted verbatim.
-    fn readdirplus_entry_attr(
-        &self,
-        cx: &Cx,
-        prefetched: &mut Option<Vec<Option<ffs_core::vfs::InodeAttr>>>,
-        entry: &ffs_core::vfs::DirEntry,
-        index: usize,
-        census_served: &mut u64,
-        census_inline: &mut u64,
-    ) -> Option<ffs_core::vfs::InodeAttr> {
-        match prefetched.as_mut() {
-            // A filled slot was prefetched in inode order. An empty
-            // one means either past the prefetch bound or a failed
-            // fetch, and both fall back to the inline path -- the
-            // only place that can tell them apart. Skipping the entry
-            // here instead would drop every entry beyond the bound
-            // from the directory listing.
-            Some(slots) => {
-                if let Some(attr) = take_prefetched(slots, index) {
-                    // bd-xfe7z census: served from the prefetch, so
-                    // this entry cost no scope of its own.
-                    *census_served += 1;
-                    Some(attr)
-                } else {
-                    // Census: past the bound OR a failed prefetch --
-                    // this entry pays its own scope after all, which
-                    // is exactly what a bounded-short arm looks like.
-                    *census_inline += 1;
-                    match self.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
-                        // bd-xfe7z: time the inline fetch too, or the
-                        // split cannot be computed for any arm whose
-                        // prefetch is bounded short.
-                        let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                        self.inner.ops.getattr(cx, scope, entry.ino)
-                    }) {
-                        Ok(attr) => Some(attr),
-                        Err(_) => None,
-                    }
-                }
-            }
-            None => {
-                // bd-xfe7z: the DEFAULT path, with no prefetch at all.
-                // It was the only getattr in readdirplus without an
-                // OpsTimer, so `ops_ns_getattr` read 0 for the default
-                // arm and the three-way split refused to compute --
-                // which made the default impossible to compare against
-                // any lever arm. Timing it is what makes the
-                // scope-collapse A/B measurable against the real
-                // baseline rather than against another lever.
-                match self.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
-                    let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                    self.inner.ops.getattr(cx, scope, entry.ino)
-                }) {
-                    Ok(attr) => Some(attr),
-                    Err(_) => None,
-                }
-            }
-        }
-    }
-
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Readlink, |cx, scope| {
@@ -6259,6 +6189,64 @@ impl Filesystem for FrankenFuse {
 /// method with the same name and signature is valid Rust. Only a live mount
 /// could see it.
 impl FrankenFuse {
+    /// Resolve ONE readdirplus entry's attributes, preserving bd-xfe7z's
+    /// three-way split: a filled prefetch slot is served without a new scope,
+    /// an empty slot pays an inline bounded getattr scope, and the
+    /// no-prefetch arm pays the plain scope it always paid.
+    ///
+    /// Returns `None` only when the entry must be SKIPPED -- its inline or
+    /// default getattr failed -- never merely for an unfilled slot beyond the
+    /// bound, which falls through to the inline path here exactly as the emit
+    /// loop did before this was extracted verbatim.
+    fn readdirplus_entry_attr(
+        &self,
+        cx: &Cx,
+        prefetched: &mut Option<Vec<Option<ffs_core::vfs::InodeAttr>>>,
+        entry: &ffs_core::vfs::DirEntry,
+        index: usize,
+        census_served: &mut u64,
+        census_inline: &mut u64,
+    ) -> Option<ffs_core::vfs::InodeAttr> {
+        let Some(slots) = prefetched.as_mut() else {
+            // bd-xfe7z: the DEFAULT path, with no prefetch at all.
+            // It was the only getattr in readdirplus without an
+            // OpsTimer, so `ops_ns_getattr` read 0 for the default
+            // arm and the three-way split refused to compute --
+            // which made the default impossible to compare against
+            // any lever arm. Timing it is what makes the
+            // scope-collapse A/B measurable against the real
+            // baseline rather than against another lever.
+            return self
+                .with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+                    let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                    self.inner.ops.getattr(cx, scope, entry.ino)
+                })
+                .ok();
+        };
+        // A filled slot was prefetched in inode order. An empty one means
+        // either past the prefetch bound or a failed fetch, and both fall
+        // back to the inline path -- the only place that can tell them
+        // apart. Skipping the entry instead would drop every entry beyond
+        // the bound from the directory listing.
+        if let Some(attr) = take_prefetched(slots, index) {
+            // bd-xfe7z census: served from the prefetch, so this entry
+            // cost no scope of its own.
+            *census_served += 1;
+            return Some(attr);
+        }
+        // Census: past the bound OR a failed prefetch -- this entry pays
+        // its own scope after all, which is exactly what a bounded-short
+        // arm looks like.
+        *census_inline += 1;
+        // bd-xfe7z: time the inline fetch too, or the split cannot be
+        // computed for any arm whose prefetch is bounded short.
+        self.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+            let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+            self.inner.ops.getattr(cx, scope, entry.ino)
+        })
+        .ok()
+    }
+
     /// The `setxattr` handler body, minus the `Request` it never reads.
     ///
     /// Split out so a test can drive it (bd-ha71t). `fuser::Request::new` is
@@ -8702,15 +8690,6 @@ mod tests {
         assert_eq!(take_prefetched::<u32>(&mut [], 0), None);
     }
 
-    /// bd-xfe7z: the two prefetch knobs are INDEPENDENT, and neither on means no
-    /// prefetch at all.
-    ///
-    /// The default cell is the one that matters. Both knobs unset must return
-    /// `None` so the handler takes the inline path it has always taken -- if
-    /// decoupling accidentally made the prefetch reachable by default, it would
-    /// enable a lever whose unbounded form was measured at 2.59x MORE getattr
-    /// scopes, on every mount, silently.
-
     /// bd-xfe7z: an untimed dispatch still COUNTS.
     ///
     /// This is the whole contract of gating the dispatch clock. The
@@ -8754,6 +8733,14 @@ mod tests {
         assert_eq!(snap.readdir_dispatch_count, 0);
         assert_eq!(snap.readdir_dispatch_nanos, 0);
     }
+    /// bd-xfe7z: the two prefetch knobs are INDEPENDENT, and neither on means no
+    /// prefetch at all.
+    ///
+    /// The default cell is the one that matters. Both knobs unset must return
+    /// `None` so the handler takes the inline path it has always taken -- if
+    /// decoupling accidentally made the prefetch reachable by default, it would
+    /// enable a lever whose unbounded form was measured at 2.59x MORE getattr
+    /// scopes, on every mount, silently.
     #[test]
     fn readdirplus_prefetch_mode_is_off_unless_a_knob_asks_bd_xfe7z() {
         assert_eq!(

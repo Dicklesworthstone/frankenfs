@@ -57,10 +57,7 @@ fn readdirplus_body() -> &'static str {
         .1;
     // Stop at the next top-level `fn ` at the same indentation, so we do not read
     // into neighbouring handlers.
-    match after.find("\n    fn ") {
-        Some(end) => &after[..end],
-        None => after,
-    }
+    after.find("\n    fn ").map_or(after, |end| &after[..end])
 }
 
 /// RETIRED, and replaced by a pin for the design that actually landed.
