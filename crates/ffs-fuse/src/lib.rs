@@ -627,7 +627,11 @@ fn resolve_xattr_suppression(fs: &FrankenFuse) {
     let shortcircuit =
         capability_shortcircuit_allowed(shortcircuit_requested, presence, fs.inner.read_only);
     XATTR_PROVEN_ABSENT.store(shortcircuit, std::sync::atomic::Ordering::Relaxed);
-    emit_xattr_suppression_evidence(&xattr_suppression_evidence(setting, Some(presence), allowed));
+    emit_xattr_suppression_evidence(&xattr_suppression_evidence(
+        setting,
+        Some(presence),
+        allowed,
+    ));
     emit_capability_shortcircuit_evidence(&capability_shortcircuit_evidence(
         shortcircuit_requested,
         Some(presence),
@@ -1077,20 +1081,20 @@ fn readdirplus_prefetch_attrs(
     // bd-xfe7z: times the whole prefetch block, scopes included, so
     // `prefetch_ns - ops_ns_getattr` isolates the request-scope machinery
     // from the format-layer work already timed inside it.
-    let Some(sort_by_inode) = readdirplus_prefetch_mode(
+    let sort_by_inode = readdirplus_prefetch_mode(
         readdirplus_inode_order_from_env(),
         readdirplus_batch_attrs_from_env(),
-    ) else {
-        return None;
-    };
+    )?;
     let _prefetch_timer = crossings::PrefetchTimer::start(crossings::CrossingOp::Readdirplus);
     // bd-xfe7z: BOUNDED by what the previous reply actually emitted. This
     // is the fix the rejection above called for. Entries past the bound
     // are left `None` and fetched inline in the emit loop, exactly as the
     // off arm does, so the 2.59x overshoot cannot reappear -- and the
     // batch arm below inherits the bound rather than the overshoot.
-    let bound =
-        readdirplus_prefetch_bound(READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed), entries.len());
+    let bound = readdirplus_prefetch_bound(
+        READDIRPLUS_OBSERVED_FILL.load(std::sync::atomic::Ordering::Relaxed),
+        entries.len(),
+    );
     // bd-xfe7z census: record the bound ACTUALLY used, not the one the knob
     // asked for. A batch arm whose bound sits at the cold guess never
     // collapsed anything, and the scope count alone cannot tell that apart
@@ -1117,15 +1121,13 @@ fn readdirplus_prefetch_attrs(
     let order: Vec<usize> = readdirplus_fetch_order(sort_by_inode, &inos);
     if readdirplus_batch_attrs_from_env() {
         let ordered: Vec<InodeNumber> = order.iter().map(|index| entries[*index].ino).collect();
-        if let Ok(results) =
-            fuse.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
-                // bd-xfe7z: time the OPS-layer call only, so dispatch_ns -
-                // ops_ns is the FUSE layer's own overhead and ops_ns is the
-                // format layer's work.
-                let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                Ok(fuse.inner.ops.getattr_batch(cx, scope, &ordered))
-            })
-        {
+        if let Ok(results) = fuse.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+            // bd-xfe7z: time the OPS-layer call only, so dispatch_ns -
+            // ops_ns is the FUSE layer's own overhead and ops_ns is the
+            // format layer's work.
+            let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+            Ok(fuse.inner.ops.getattr_batch(cx, scope, &ordered))
+        }) {
             for (slot_index, result) in order.iter().zip(results) {
                 if let Ok(attr) = result {
                     slots[*slot_index] = Some(attr);
@@ -1138,12 +1140,10 @@ fn readdirplus_prefetch_attrs(
         for index in order {
             let ino = entries[index].ino;
             let _scope_timer = crossings::ScopeTimer::start(crossings::CrossingOp::Getattr);
-            if let Ok(attr) =
-                fuse.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
-                    let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                    fuse.inner.ops.getattr(cx, scope, ino)
-                })
-            {
+            if let Ok(attr) = fuse.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+                let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                fuse.inner.ops.getattr(cx, scope, ino)
+            }) {
                 slots[index] = Some(attr);
             }
         }
@@ -5160,7 +5160,7 @@ impl Filesystem for FrankenFuse {
         // bd-xfe7z census: counted at handler entry, BEFORE the prefetch gate,
         // so `prefetch_calls` can be read as a fraction of the readdirplus calls
         // that actually happened rather than of a number nobody measured.
-                let phase_timer = crossings::PhaseTimer::start(crossings::CrossingOp::Readdirplus);
+        let phase_timer = crossings::PhaseTimer::start(crossings::CrossingOp::Readdirplus);
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
             self.inner
                 .ops
@@ -5199,65 +5199,20 @@ impl Filesystem for FrankenFuse {
                     #[cfg(not(unix))]
                     let name = OsStr::new(&owned_name);
 
-                    // Get attributes for each entry
-                    let inode_attr = match prefetched.as_mut() {
-                        // A filled slot was prefetched in inode order. An empty
-                        // one means either past the prefetch bound or a failed
-                        // fetch, and both fall back to the inline path -- the
-                        // only place that can tell them apart. Skipping the entry
-                        // here instead would drop every entry beyond the bound
-                        // from the directory listing.
-                        Some(slots) => {
-                            if let Some(attr) = take_prefetched(slots, index) {
-                                // bd-xfe7z census: served from the prefetch, so
-                                // this entry cost no scope of its own.
-                                census_served += 1;
-                                attr
-                            } else {
-                                // Census: past the bound OR a failed prefetch —
-                                // this entry pays its own scope after all, which
-                                // is exactly what a bounded-short arm looks like.
-                                // Incremented HERE rather than inside the closure
-                                // so nothing is captured mutably by it.
-                                census_inline += 1;
-                                match self.with_request_scope(
-                                    &cx,
-                                    RequestOp::Getattr,
-                                    |cx, scope| {
-                                        // bd-xfe7z: time the inline fetch too, or
-                                        // the split cannot be computed for any arm
-                                        // whose prefetch is bounded short.
-                                        let _t = crossings::OpsTimer::start(
-                                            crossings::CrossingOp::Getattr,
-                                        );
-                                        self.inner.ops.getattr(cx, scope, entry.ino)
-                                    },
-                                ) {
-                                    Ok(attr) => attr,
-                                    Err(_) => continue,
-                                }
-                            }
-                        }
-                        None => {
-                            // bd-xfe7z: the DEFAULT path, with no prefetch at all.
-                            // It was the only getattr in readdirplus without an
-                            // OpsTimer, so `ops_ns_getattr` read 0 for the default
-                            // arm and the three-way split refused to compute --
-                            // which made the default impossible to compare against
-                            // any lever arm. Timing it is what makes the
-                            // scope-collapse A/B measurable against the real
-                            // baseline rather than against another lever.
-                            match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
-                                let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
-                                self.inner.ops.getattr(cx, scope, entry.ino)
-                            }) {
-                                Ok(attr) => attr,
-                                Err(_) => {
-                                    // If we can't get attrs, skip this entry
-                                    continue;
-                                }
-                            }
-                        }
+                    // Get attributes for each entry: served free from a filled
+                    // prefetch slot, inline bounded scope past the bound, plain
+                    // scope on the OFF arm. None means skip the entry because
+                    // its fetch failed.
+                    let inode_attr = match self.readdirplus_entry_attr(
+                        &cx,
+                        &mut prefetched,
+                        entry,
+                        index,
+                        &mut census_served,
+                        &mut census_inline,
+                    ) {
+                        Some(attr) => attr,
+                        None => continue,
                     };
                     // bd-q0xnl: hand these attributes to the getattr the kernel
                     // issues for this same inode moments from now, so the daemon
@@ -5325,6 +5280,74 @@ impl Filesystem for FrankenFuse {
                     offset: Some(fs_offset),
                 };
                 reply.error(ctx.log_and_errno());
+            }
+        }
+    }
+
+    /// Resolve ONE readdirplus entry's attributes, preserving bd-xfe7z's
+    /// three-way split: a filled prefetch slot is served without a new scope,
+    /// an empty slot pays an inline bounded getattr scope, and the
+    /// no-prefetch arm pays the plain scope it always paid.
+    ///
+    /// Returns `None` only when the entry must be SKIPPED -- its inline or
+    /// default getattr failed -- never merely for an unfilled slot beyond the
+    /// bound, which falls through to the inline path here exactly as the emit
+    /// loop did before this was extracted verbatim.
+    fn readdirplus_entry_attr(
+        &self,
+        cx: &Cx,
+        prefetched: &mut Option<Vec<Option<ffs_core::vfs::InodeAttr>>>,
+        entry: &ffs_core::vfs::DirEntry,
+        index: usize,
+        census_served: &mut u64,
+        census_inline: &mut u64,
+    ) -> Option<ffs_core::vfs::InodeAttr> {
+        match prefetched.as_mut() {
+            // A filled slot was prefetched in inode order. An empty
+            // one means either past the prefetch bound or a failed
+            // fetch, and both fall back to the inline path -- the
+            // only place that can tell them apart. Skipping the entry
+            // here instead would drop every entry beyond the bound
+            // from the directory listing.
+            Some(slots) => {
+                if let Some(attr) = take_prefetched(slots, index) {
+                    // bd-xfe7z census: served from the prefetch, so
+                    // this entry cost no scope of its own.
+                    *census_served += 1;
+                    Some(attr)
+                } else {
+                    // Census: past the bound OR a failed prefetch --
+                    // this entry pays its own scope after all, which
+                    // is exactly what a bounded-short arm looks like.
+                    *census_inline += 1;
+                    match self.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+                        // bd-xfe7z: time the inline fetch too, or the
+                        // split cannot be computed for any arm whose
+                        // prefetch is bounded short.
+                        let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                        self.inner.ops.getattr(cx, scope, entry.ino)
+                    }) {
+                        Ok(attr) => Some(attr),
+                        Err(_) => None,
+                    }
+                }
+            }
+            None => {
+                // bd-xfe7z: the DEFAULT path, with no prefetch at all.
+                // It was the only getattr in readdirplus without an
+                // OpsTimer, so `ops_ns_getattr` read 0 for the default
+                // arm and the three-way split refused to compute --
+                // which made the default impossible to compare against
+                // any lever arm. Timing it is what makes the
+                // scope-collapse A/B measurable against the real
+                // baseline rather than against another lever.
+                match self.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+                    let _t = crossings::OpsTimer::start(crossings::CrossingOp::Getattr);
+                    self.inner.ops.getattr(cx, scope, entry.ino)
+                }) {
+                    Ok(attr) => Some(attr),
+                    Err(_) => None,
+                }
             }
         }
     }
@@ -6244,7 +6267,7 @@ impl FrankenFuse {
     /// why `auto` stayed restricted to read-only mounts on an argument nobody
     /// could check.
     fn setxattr_impl(
-        &mut self,
+        &self,
         ino: u64,
         name: &OsStr,
         value: &[u8],
@@ -6318,7 +6341,7 @@ impl FrankenFuse {
 
     /// The `removexattr` handler body, minus the `Request` it never reads.
     /// Split for the same reason as [`Self::setxattr_impl`].
-    fn removexattr_impl(&mut self, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr_impl(&self, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
             return;
@@ -6844,7 +6867,7 @@ mod tests {
     /// mount root and the target inode, 2002 of 4002 probes landing on `ino=1`.
     /// A one-slot memo is the worst possible size for that stream — each probe
     /// evicts the other half — so this is the test that pins WHY there are two.
-    #[test]
+    ///
     /// THE CLIFF, stated as a test rather than as a paragraph.
     ///
     /// A 32,768-entry directory is exactly the banked readdir+stat fixture. On the
@@ -6877,8 +6900,9 @@ mod tests {
             .filter(|i| bitmap.contains(InodeNumber(FIRST + i)))
             .count();
 
+        let entries_usize = usize::try_from(ENTRIES).expect("entry count fits usize");
         assert_eq!(
-            bitmap_survivors, ENTRIES as usize,
+            bitmap_survivors, entries_usize,
             "the range-leaf backend must retain every entry of a 32,768-entry \
              directory — this is the whole lever; got {bitmap_survivors}"
         );
@@ -6890,10 +6914,12 @@ mod tests {
              re-deriving; got {table_survivors}"
         );
         // And the point of it all: strictly less memory for 8x the inodes.
-        assert!(
-            CAPABILITY_LEAF_WORDS * 8 < CAPABILITY_MEMO_SLOTS * 8,
-            "a leaf must be smaller than the table it replaces"
-        );
+        const {
+            assert!(
+                CAPABILITY_LEAF_WORDS * 8 < CAPABILITY_MEMO_SLOTS * 8,
+                "a leaf must be smaller than the table it replaces"
+            );
+        }
     }
 
     /// A memo that reports a capability xattr ABSENT when it is present is a wrong
@@ -7136,14 +7162,13 @@ mod tests {
             off.take(InodeNumber(5)).is_none(),
             "disabled must not answer"
         );
-        {
-            let state = off.state.lock().expect("memo lock");
-            assert!(
-                state.iter().all(Option::is_none),
-                "disabled must not FILL either — a silent-but-populated memo makes \
-                 the OFF arm pay the cost without the benefit"
-            );
-        }
+        let state = off.state.lock().expect("memo lock");
+        assert!(
+            state.iter().all(Option::is_none),
+            "disabled must not FILL either — a silent-but-populated memo makes \
+             the OFF arm pay the cost without the benefit"
+        );
+        drop(state);
 
         for on in ["1", "true", "ON", " on "] {
             assert!(
@@ -7206,10 +7231,12 @@ mod tests {
             MAX_RECEIVE_SPIN,
             "u32::MAX must clamp"
         );
-        assert!(
-            MAX_RECEIVE_SPIN < u32::MAX,
-            "the ceiling must bound something"
-        );
+        const {
+            assert!(
+                MAX_RECEIVE_SPIN < u32::MAX,
+                "the ceiling must bound something"
+            );
+        }
 
         // Sane values are honoured, or the knob is useless as an A/B handle.
         assert_eq!(Channel::spin_iterations_from_value(Some("512")), 512);
@@ -7498,10 +7525,12 @@ mod tests {
             "128 KiB must CLAMP rather than be honoured; the run that used it is \
              the reason this ceiling exists"
         );
-        assert!(
-            MAX_PAYLOAD_BYTES < 131_072,
-            "the ceiling must sit below the value that lost, or it is not a ceiling"
-        );
+        const {
+            assert!(
+                MAX_PAYLOAD_BYTES < 131_072,
+                "the ceiling must sit below the value that lost, or it is not a ceiling"
+            );
+        }
 
         // A payload too small to hold a FUSE header is a configuration error, not
         // a runtime one: reject it here rather than failing on the first reply.
@@ -8345,16 +8374,24 @@ mod tests {
             let sent = self.sent.lock().expect("sender must not be poisoned");
             assert!(sent.len() >= 8, "a reply must carry at least a header");
             let error = i32::from_ne_bytes([sent[4], sent[5], sent[6], sent[7]]);
+            drop(sent);
             (error != 0).then_some(-error)
         }
     }
 
     impl fuser::ReplySender for RecordingSender {
         fn send(&self, data: &[std::io::IoSlice<'_>]) -> std::io::Result<()> {
-            let mut sent = self.sent.lock().expect("sender must not be poisoned");
+            let mut payload = Vec::new();
             for slice in data {
-                sent.extend_from_slice(slice);
+                payload.extend_from_slice(slice);
             }
+            // One locked append: a RecordingSender may be cloned across
+            // probes, so a reply must land as ONE contiguous write rather
+            // than as per-slice interleavings a reader could tear.
+            self.sent
+                .lock()
+                .expect("sender must not be poisoned")
+                .extend_from_slice(&payload);
             Ok(())
         }
 
@@ -8630,21 +8667,6 @@ mod tests {
         );
     }
 
-    /// bd-xfe7z: the inode-order knob must be opt-IN and inert when unset.
-    ///
-    /// Same polarity rule as every other lever knob here: an unset environment
-    /// has to be byte-identical to before the knob existed, so that both arms of
-    /// an A/B can come from one ELF and the OFF arm is genuinely today's code.
-
-    /// bd-xfe7z: the prefetch bound never exceeds the batch, which is the
-    /// property that stops the rejected overshoot returning.
-    ///
-    /// v1 of this lever prefetched every entry `ops.readdir` returned and was
-    /// measured at 40407 dispatch scopes -> 104761, ~61% of them discarded when
-    /// the reply filled and re-issued on the next call. The bound exists solely
-    /// to make that impossible, so "never more than the batch" and "never more
-    /// than the observed fill" are the two assertions that matter.
-
     /// bd-xfe7z: a prefetched slot is consumed EXACTLY ONCE.
     ///
     /// This is the contract that lets the emit loop `take` instead of `clone`,
@@ -8784,6 +8806,14 @@ mod tests {
         assert_eq!(readdirplus_fetch_order(false, &[42]), vec![0]);
         assert_eq!(readdirplus_fetch_order(true, &[42]), vec![0]);
     }
+    /// bd-xfe7z: the prefetch bound never exceeds the batch, which is the
+    /// property that stops the rejected overshoot returning.
+    ///
+    /// v1 of this lever prefetched every entry `ops.readdir` returned and was
+    /// measured at 40407 dispatch scopes -> 104761, ~61% of them discarded when
+    /// the reply filled and re-issued on the next call. The bound exists solely
+    /// to make that impossible, so "never more than the batch" and "never more
+    /// than the observed fill" are the two assertions that matter.
     #[test]
     fn readdirplus_prefetch_bound_never_exceeds_the_batch_bd_xfe7z() {
         // Observed fill larger than this batch: clamp to the batch.
@@ -8811,10 +8841,12 @@ mod tests {
             READDIRPLUS_PREFETCH_COLD_BOUND,
             "an unobserved fill must not authorise prefetching a 10k-entry batch"
         );
-        assert!(
-            READDIRPLUS_PREFETCH_COLD_BOUND < 10_000,
-            "the cold guess is only safe because it is small"
-        );
+        const {
+            assert!(
+                READDIRPLUS_PREFETCH_COLD_BOUND < 10_000,
+                "the cold guess is only safe because it is small"
+            );
+        }
         // ...but still clamped by a batch smaller than the cold guess.
         assert_eq!(readdirplus_prefetch_bound(0, 5), 5);
     }
@@ -8905,6 +8937,11 @@ mod tests {
             assert_eq!(readdirplus_prefetch_bound(fill, batch), fill.min(batch));
         }
     }
+    /// bd-xfe7z: the inode-order knob must be opt-IN and inert when unset.
+    ///
+    /// Same polarity rule as every other lever knob here: an unset environment
+    /// has to be byte-identical to before the knob existed, so that both arms of
+    /// an A/B can come from one ELF and the OFF arm is genuinely today's code.
     #[test]
     fn readdirplus_inode_order_knob_is_opt_in_bd_xfe7z() {
         assert!(!readdirplus_inode_order_from_value(None));
@@ -9026,6 +9063,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn readdirplus_capabilities_enable_only_directory_metadata_coalescing() {
         assert_eq!(
             READDIRPLUS_CAPABILITIES,
@@ -9333,7 +9371,7 @@ mod tests {
                 .expect("freshly constructed FuseInner Arc is unique")
                 .count_memoized_requests = count_memoized_requests;
 
-            let cx = FrankenFuse::cx_for_request();
+            let _cx = FrankenFuse::cx_for_request();
             let ino = InodeNumber(7);
             for _ in 0..4 {
                 assert!(
