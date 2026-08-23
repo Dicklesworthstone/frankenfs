@@ -492,7 +492,7 @@ fn validate_outcome_coverage(seen: &BTreeSet<String>, errors: &mut Vec<String>) 
 
 fn is_lower_hex(value: &str) -> bool {
     !value.is_empty()
-        && value.len() % 2 == 0
+        && value.len().is_multiple_of(2)
         && value
             .chars()
             .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))

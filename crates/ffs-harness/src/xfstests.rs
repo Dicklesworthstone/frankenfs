@@ -2062,10 +2062,10 @@ fn line_mentions_test_id(line: &str, test_id: &str) -> bool {
 
 fn parse_duration_secs(line: &str) -> Option<f64> {
     for token in line.split_whitespace() {
-        if let Some(raw) = token.strip_suffix('s') {
-            if let Ok(value) = raw.parse::<f64>() {
-                return Some(value);
-            }
+        if let Some(raw) = token.strip_suffix('s')
+            && let Ok(value) = raw.parse::<f64>()
+        {
+            return Some(value);
         }
     }
     None

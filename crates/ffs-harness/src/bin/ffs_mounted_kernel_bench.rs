@@ -889,7 +889,7 @@ const fn balanced_order_count(candidate_comparison: bool) -> usize {
 const fn schedule_period(candidate_comparison: bool) -> usize {
     let orders = balanced_order_count(candidate_comparison);
     let mut multiple = orders;
-    while multiple % ESTIMATOR_BLOCK_ROUNDS != 0 {
+    while !multiple.is_multiple_of(ESTIMATOR_BLOCK_ROUNDS) {
         multiple += orders;
     }
     multiple
@@ -1404,7 +1404,9 @@ impl Drop for MountedArm {
         // pins the image file and breaks the NEXT run's fixture, silently.
         let mut release_loop = || {
             if let Some(device) = self.loop_device.take() {
-                let _ = Command::new("sudo").args(["-n", "losetup", "-d", &device]).status();
+                let _ = Command::new("sudo")
+                    .args(["-n", "losetup", "-d", &device])
+                    .status();
             }
         };
         let Ok(Some(_)) = find_mount(&self.mountpoint) else {
@@ -1593,6 +1595,102 @@ fn bulk_durable_total_bytes(operations: usize) -> Result<usize> {
         .ok_or_else(|| anyhow!("bulk durable write byte count overflow for {operations} chunks"))
 }
 
+/// `rch exec` has no artifact-retrieval mechanism, so both ELFs are built on
+/// a remote worker and copied to this host. Record which worker produced
+/// each one: a binary of unknown origin is not evidence.
+fn validate_builder_provenance(config: &Config) -> Result<()> {
+    for (value, flag) in [
+        (&config.harness_builder, "--harness-builder"),
+        (&config.candidate_builder, "--candidate-builder"),
+    ] {
+        ensure!(
+            !value.trim().is_empty(),
+            "{flag} is required: name the machine that built the ELF"
+        );
+    }
+    Ok(())
+}
+
+/// Candidate-vs-candidate env keys must name runtime knobs (not ambient process
+/// environment) and each key may be given only once.
+fn validate_candidate_comparison(comparison: &CandidateComparison) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    for (key, _) in &comparison.env {
+        ensure!(
+            key.starts_with("FFS_"),
+            "--candidate-b-env key {key} must start with FFS_: the two candidate arms differ \
+             by a FrankenFS runtime knob on one ELF, not by their process environment at large"
+        );
+        ensure!(
+            keys.insert(key.clone()),
+            "--candidate-b-env {key} was given more than once"
+        );
+    }
+    Ok(())
+}
+
+/// bd-fj2dg: padding runs the workload for real, so a mutating workload would
+/// have its state advanced by batches nothing accounts for. Refuse rather than
+/// silently changing what a mutating row measures. Mutating rows also require a
+/// single repeat so every timed row has one durability boundary.
+fn validate_mutating_workload_rules(config: &Config) -> Result<()> {
+    ensure!(
+        !config.workload.is_mutating()
+            || (config.kernel_occupancy_padding == 0 && config.fuse_occupancy_padding == 0),
+        "occupancy padding is read-only-workload only: a mutating workload's padding batches would \
+         advance filesystem state outside the timed contract"
+    );
+    ensure!(
+        !config.workload.is_mutating() || config.observation_repeats == 1,
+        "mutating workloads require --observation-repeats 1 so every timed row has one durability boundary"
+    );
+    Ok(())
+}
+
+/// The host-quiet budget must cover its own sampling cadence.
+fn validate_host_quiet_budget(config: &Config) -> Result<()> {
+    ensure!(
+        (1..=MAX_HOST_QUIET_SAMPLES).contains(&config.host_quiet_samples),
+        "--host-quiet-samples must be in 1..={MAX_HOST_QUIET_SAMPLES}"
+    );
+    ensure!(
+        config.host_quiet_timeout_ms <= MAX_HOST_QUIET_TIMEOUT_MS,
+        "--host-quiet-timeout-ms must be at most {MAX_HOST_QUIET_TIMEOUT_MS}"
+    );
+    ensure!(
+        config.host_quiet_timeout_ms
+            >= CPU_SAMPLE_INTERVAL_MS.saturating_mul(config.host_quiet_samples as u64),
+        "--host-quiet-timeout-ms must cover at least --host-quiet-samples one-second samples"
+    );
+    Ok(())
+}
+
+/// Bulk-durable-write stages the payload plus fixed fixture/headroom bytes, so
+/// the image must actually hold them. Overflow fails CLOSED rather than wrapping.
+fn validate_bulk_durable_image_capacity(config: &Config) -> Result<()> {
+    if config.workload != Workload::BulkDurableWrite {
+        return Ok(());
+    }
+    let payload_bytes = u64::try_from(bulk_durable_total_bytes(config.operations)?)
+        .context("bulk durable byte count does not fit u64")?;
+    let required_bytes = payload_bytes
+        .checked_add(u64::try_from(PAYLOAD_BYTES).expect("payload size fits u64"))
+        .and_then(|bytes| bytes.checked_add(BULK_DURABLE_IMAGE_HEADROOM_BYTES))
+        .ok_or_else(|| anyhow!("bulk durable fixture size overflow"))?;
+    let image_bytes = config
+        .image_size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("image byte count overflow"))?;
+    ensure!(
+        required_bytes <= image_bytes,
+        "bulk-durable-write requires at least {} image bytes for {} payload bytes plus fixed fixture/headroom, but --image-size-mib={} provides {image_bytes}",
+        required_bytes,
+        payload_bytes,
+        config.image_size_mib
+    );
+    Ok(())
+}
+
 fn validate_config(config: &Config) -> Result<()> {
     ensure!(
         !config.ffs_cli.as_os_str().is_empty(),
@@ -1603,18 +1701,7 @@ fn validate_config(config: &Config) -> Result<()> {
         "ffs-cli does not exist: {}",
         config.ffs_cli.display()
     );
-    // `rch exec` has no artifact-retrieval mechanism, so both ELFs are built on
-    // a remote worker and copied to this host. Record which worker produced
-    // each one: a binary of unknown origin is not evidence.
-    for (value, flag) in [
-        (&config.harness_builder, "--harness-builder"),
-        (&config.candidate_builder, "--candidate-builder"),
-    ] {
-        ensure!(
-            !value.trim().is_empty(),
-            "{flag} is required: name the machine that built the ELF"
-        );
-    }
+    validate_builder_provenance(config)?;
     // bd-zth9k: refuse an invocation whose --client-threads cannot take effect.
     // It used to be parsed, validated and silently discarded, so the run executed
     // a different experiment than the one requested. That cost a 1/2/4/8 thread
@@ -1630,7 +1717,7 @@ fn validate_config(config: &Config) -> Result<()> {
     let period =
         balanced_scope_schedule_period(config.placement_scope, config.compares_candidates());
     ensure!(
-        config.pairs >= 12 && config.pairs % period == 0,
+        config.pairs >= 12 && config.pairs.is_multiple_of(period),
         "--pairs must be a multiple of {period} and at least 12"
     );
     ensure!(
@@ -1638,37 +1725,14 @@ fn validate_config(config: &Config) -> Result<()> {
         "balanced-square does not support six-arm candidate comparison"
     );
     if let Some(comparison) = &config.candidate_comparison {
-        let mut keys = BTreeSet::new();
-        for (key, _) in &comparison.env {
-            ensure!(
-                key.starts_with("FFS_"),
-                "--candidate-b-env key {key} must start with FFS_: the two candidate arms differ \
-                 by a FrankenFS runtime knob on one ELF, not by their process environment at large"
-            );
-            ensure!(
-                keys.insert(key.clone()),
-                "--candidate-b-env {key} was given more than once"
-            );
-        }
+        validate_candidate_comparison(comparison)?;
     }
     ensure!(config.operations > 0, "--operations must be positive");
     ensure!(
         config.observation_repeats > 0,
         "--observation-repeats must be positive"
     );
-    // bd-fj2dg: padding runs the workload for real, so a mutating workload would
-    // have its state advanced by batches nothing accounts for. Refuse rather than
-    // silently changing what a mutating row measures.
-    ensure!(
-        !config.workload.is_mutating()
-            || (config.kernel_occupancy_padding == 0 && config.fuse_occupancy_padding == 0),
-        "occupancy padding is read-only-workload only: a mutating workload's padding batches would \
-         advance filesystem state outside the timed contract"
-    );
-    ensure!(
-        !config.workload.is_mutating() || config.observation_repeats == 1,
-        "mutating workloads require --observation-repeats 1 so every timed row has one durability boundary"
-    );
+    validate_mutating_workload_rules(config)?;
     ensure!(
         (1..=MAX_CLIENT_THREADS).contains(&config.client_threads()),
         "--client-threads must be in 1..={MAX_CLIENT_THREADS}"
@@ -1708,43 +1772,13 @@ fn validate_config(config: &Config) -> Result<()> {
         config.pre_measurement_settle_ms <= MAX_PRE_MEASUREMENT_SETTLE_MS,
         "--pre-measurement-settle-ms must be at most {MAX_PRE_MEASUREMENT_SETTLE_MS}"
     );
-    ensure!(
-        (1..=MAX_HOST_QUIET_SAMPLES).contains(&config.host_quiet_samples),
-        "--host-quiet-samples must be in 1..={MAX_HOST_QUIET_SAMPLES}"
-    );
-    ensure!(
-        config.host_quiet_timeout_ms <= MAX_HOST_QUIET_TIMEOUT_MS,
-        "--host-quiet-timeout-ms must be at most {MAX_HOST_QUIET_TIMEOUT_MS}"
-    );
-    ensure!(
-        config.host_quiet_timeout_ms
-            >= CPU_SAMPLE_INTERVAL_MS.saturating_mul(config.host_quiet_samples as u64),
-        "--host-quiet-timeout-ms must cover at least --host-quiet-samples one-second samples"
-    );
+    validate_host_quiet_budget(config)?;
     ensure!(
         config.workload != Workload::XattrGetListReport
             || config.filesystems == RequestedFilesystems::Ext4,
         "xattr-get-list-report currently requires --filesystem ext4 because its inline/external storage-shape proof is ext4-specific"
     );
-    if config.workload == Workload::BulkDurableWrite {
-        let payload_bytes = u64::try_from(bulk_durable_total_bytes(config.operations)?)
-            .context("bulk durable byte count does not fit u64")?;
-        let required_bytes = payload_bytes
-            .checked_add(u64::try_from(PAYLOAD_BYTES).expect("payload size fits u64"))
-            .and_then(|bytes| bytes.checked_add(BULK_DURABLE_IMAGE_HEADROOM_BYTES))
-            .ok_or_else(|| anyhow!("bulk durable fixture size overflow"))?;
-        let image_bytes = config
-            .image_size_mib
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| anyhow!("image byte count overflow"))?;
-        ensure!(
-            required_bytes <= image_bytes,
-            "bulk-durable-write requires at least {} image bytes for {} payload bytes plus fixed fixture/headroom, but --image-size-mib={} provides {image_bytes}",
-            required_bytes,
-            payload_bytes,
-            config.image_size_mib
-        );
-    }
+    validate_bulk_durable_image_capacity(config)?;
     Ok(())
 }
 
@@ -1784,131 +1818,158 @@ fn parse_candidate_env_assignment(value: &str) -> Result<(String, String)> {
     Ok((key.to_owned(), assigned.to_owned()))
 }
 
+/// Apply one structural CLI flag to `config`, consuming its value from `args`
+/// at `index`. Returns `Ok(None)` when the flag was `-h/--help` and usage has
+/// been printed; scalar knobs are delegated to [`apply_config_knob`].
+fn apply_config_flag(
+    args: &[String],
+    index: &mut usize,
+    config: &mut Config,
+    pairs_explicit: &mut bool,
+    flag: &str,
+) -> Result<Option<()>> {
+    match flag {
+        "-h" | "--help" => {
+            usage();
+            return Ok(None);
+        }
+        "--ffs-cli" => {
+            config.ffs_cli = parse_value::<PathBuf>(args, index, "--ffs-cli")?;
+        }
+        "--fuse-transport" => {
+            let value = parse_value::<String>(args, index, "--fuse-transport")?;
+            config.fuse_transport_loop = match value.as_str() {
+                "file" => false,
+                "loop" => true,
+                other => bail!("unsupported --fuse-transport {other}; expected file|loop"),
+            };
+        }
+        "--artifact-root" => {
+            config.artifact_root = parse_value::<PathBuf>(args, index, "--artifact-root")?;
+        }
+        "--scratch-root" => {
+            config.scratch_root = Some(parse_value::<PathBuf>(args, index, "--scratch-root")?);
+        }
+        "--filesystem" => {
+            let value = parse_value::<String>(args, index, "--filesystem")?;
+            config.filesystems = match value.as_str() {
+                "ext4" => RequestedFilesystems::Ext4,
+                "btrfs" => RequestedFilesystems::Btrfs,
+                "both" => RequestedFilesystems::Both,
+                _ => bail!("unsupported --filesystem {value}; expected ext4|btrfs|both"),
+            };
+        }
+        "--workload" => {
+            let value = parse_value::<String>(args, index, "--workload")?;
+            config.workload = parse_workload(&value)?;
+        }
+        "--pairs" => {
+            config.pairs = parse_value(args, index, "--pairs")?;
+            *pairs_explicit = true;
+        }
+        "--candidate-b-env" => {
+            let value = parse_value::<String>(args, index, "--candidate-b-env")?;
+            config
+                .candidate_comparison
+                .get_or_insert_with(CandidateComparison::default)
+                .env
+                .push(parse_candidate_env_assignment(&value)?);
+        }
+        "--candidate-aa" => {
+            config
+                .candidate_comparison
+                .get_or_insert_with(CandidateComparison::default);
+        }
+        "--client-threads" => {
+            config.client_threads = parse_value(args, index, "--client-threads")?;
+            config.client_threads_explicit = true;
+        }
+        "--fixture-construction" => {
+            let value = parse_value::<String>(args, index, "--fixture-construction")?;
+            config.fixture_construction = parse_fixture_construction(&value)?;
+        }
+        "--placement-scope" => {
+            let value = parse_value::<String>(args, index, "--placement-scope")?;
+            config.placement_scope = parse_placement_scope(&value)?;
+        }
+        _ => return apply_config_knob(args, index, config, flag).map(Some),
+    }
+    Ok(Some(()))
+}
+
+/// Apply one scalar CLI knob — a `--name <value>` pair parsed straight into a
+/// single `Config` field.
+fn apply_config_knob(
+    args: &[String],
+    index: &mut usize,
+    config: &mut Config,
+    flag: &str,
+) -> Result<()> {
+    match flag {
+        "--operations" => {
+            config.operations = parse_value(args, index, "--operations")?;
+        }
+        "--fuse-cpus" => {
+            config.fuse_cpu_count = parse_value(args, index, "--fuse-cpus")?;
+        }
+        "--fuse-workers" => {
+            config.fuse_workers = Some(parse_value(args, index, "--fuse-workers")?);
+        }
+        "--btrfs-verify-data-on-read" => {
+            config.btrfs_verify_data_on_read =
+                parse_value(args, index, "--btrfs-verify-data-on-read")?;
+        }
+        "--observation-repeats" => {
+            config.observation_repeats = parse_value(args, index, "--observation-repeats")?;
+        }
+        "--kernel-occupancy-padding" => {
+            config.kernel_occupancy_padding =
+                parse_value(args, index, "--kernel-occupancy-padding")?;
+        }
+        "--fuse-occupancy-padding" => {
+            config.fuse_occupancy_padding = parse_value(args, index, "--fuse-occupancy-padding")?;
+        }
+        "--image-size-mib" => {
+            config.image_size_mib = parse_value(args, index, "--image-size-mib")?;
+        }
+        "--maximum-null-ratio" => {
+            config.maximum_null_ratio = parse_value(args, index, "--maximum-null-ratio")?;
+        }
+        "--arm-settle-ms" => {
+            config.arm_settle_ms = parse_value(args, index, "--arm-settle-ms")?;
+        }
+        "--pre-measurement-settle-ms" => {
+            config.pre_measurement_settle_ms =
+                parse_value(args, index, "--pre-measurement-settle-ms")?;
+        }
+        "--harness-builder" => {
+            config.harness_builder = parse_value(args, index, "--harness-builder")?;
+        }
+        "--candidate-builder" => {
+            config.candidate_builder = parse_value(args, index, "--candidate-builder")?;
+        }
+        "--host-quiet-samples" => {
+            config.host_quiet_samples = parse_value(args, index, "--host-quiet-samples")?;
+        }
+        "--host-quiet-timeout-ms" => {
+            config.host_quiet_timeout_ms = parse_value(args, index, "--host-quiet-timeout-ms")?;
+        }
+        "--out" => {
+            config.output = Some(parse_value(args, index, "--out")?);
+        }
+        other => bail!("unknown argument: {other}"),
+    }
+    Ok(())
+}
+
 fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
     let mut config = Config::default();
     let mut pairs_explicit = false;
     let mut index = 0;
     while index < args.len() {
-        match args[index].as_str() {
-            "-h" | "--help" => {
-                usage();
-                return Ok(None);
-            }
-            "--ffs-cli" => {
-                config.ffs_cli = parse_value::<PathBuf>(args, &mut index, "--ffs-cli")?;
-            }
-            "--fuse-transport" => {
-                let value = parse_value::<String>(args, &mut index, "--fuse-transport")?;
-                config.fuse_transport_loop = match value.as_str() {
-                    "file" => false,
-                    "loop" => true,
-                    other => bail!(
-                        "unsupported --fuse-transport {other}; expected file|loop"
-                    ),
-                };
-            }
-            "--artifact-root" => {
-                config.artifact_root = parse_value::<PathBuf>(args, &mut index, "--artifact-root")?;
-            }
-            "--scratch-root" => {
-                config.scratch_root =
-                    Some(parse_value::<PathBuf>(args, &mut index, "--scratch-root")?);
-            }
-            "--filesystem" => {
-                let value = parse_value::<String>(args, &mut index, "--filesystem")?;
-                config.filesystems = match value.as_str() {
-                    "ext4" => RequestedFilesystems::Ext4,
-                    "btrfs" => RequestedFilesystems::Btrfs,
-                    "both" => RequestedFilesystems::Both,
-                    _ => bail!("unsupported --filesystem {value}; expected ext4|btrfs|both"),
-                };
-            }
-            "--workload" => {
-                let value = parse_value::<String>(args, &mut index, "--workload")?;
-                config.workload = parse_workload(&value)?;
-            }
-            "--pairs" => {
-                config.pairs = parse_value(args, &mut index, "--pairs")?;
-                pairs_explicit = true;
-            }
-            "--candidate-b-env" => {
-                let value = parse_value::<String>(args, &mut index, "--candidate-b-env")?;
-                config
-                    .candidate_comparison
-                    .get_or_insert_with(CandidateComparison::default)
-                    .env
-                    .push(parse_candidate_env_assignment(&value)?);
-            }
-            "--candidate-aa" => {
-                config
-                    .candidate_comparison
-                    .get_or_insert_with(CandidateComparison::default);
-            }
-            "--operations" => {
-                config.operations = parse_value(args, &mut index, "--operations")?;
-            }
-            "--fuse-cpus" => {
-                config.fuse_cpu_count = parse_value(args, &mut index, "--fuse-cpus")?;
-            }
-            "--fuse-workers" => {
-                config.fuse_workers = Some(parse_value(args, &mut index, "--fuse-workers")?);
-            }
-            "--btrfs-verify-data-on-read" => {
-                config.btrfs_verify_data_on_read =
-                    parse_value(args, &mut index, "--btrfs-verify-data-on-read")?;
-            }
-            "--client-threads" => {
-                config.client_threads = parse_value(args, &mut index, "--client-threads")?;
-                config.client_threads_explicit = true;
-            }
-            "--fixture-construction" => {
-                let value = parse_value::<String>(args, &mut index, "--fixture-construction")?;
-                config.fixture_construction = parse_fixture_construction(&value)?;
-            }
-            "--placement-scope" => {
-                let value = parse_value::<String>(args, &mut index, "--placement-scope")?;
-                config.placement_scope = parse_placement_scope(&value)?;
-            }
-            "--observation-repeats" => {
-                config.observation_repeats =
-                    parse_value(args, &mut index, "--observation-repeats")?;
-            }
-            "--kernel-occupancy-padding" => {
-                config.kernel_occupancy_padding =
-                    parse_value(args, &mut index, "--kernel-occupancy-padding")?;
-            }
-            "--fuse-occupancy-padding" => {
-                config.fuse_occupancy_padding =
-                    parse_value(args, &mut index, "--fuse-occupancy-padding")?;
-            }
-            "--image-size-mib" => {
-                config.image_size_mib = parse_value(args, &mut index, "--image-size-mib")?;
-            }
-            "--maximum-null-ratio" => {
-                config.maximum_null_ratio = parse_value(args, &mut index, "--maximum-null-ratio")?;
-            }
-            "--arm-settle-ms" => {
-                config.arm_settle_ms = parse_value(args, &mut index, "--arm-settle-ms")?;
-            }
-            "--pre-measurement-settle-ms" => {
-                config.pre_measurement_settle_ms =
-                    parse_value(args, &mut index, "--pre-measurement-settle-ms")?;
-            }
-            "--harness-builder" => {
-                config.harness_builder = parse_value(args, &mut index, "--harness-builder")?;
-            }
-            "--candidate-builder" => {
-                config.candidate_builder = parse_value(args, &mut index, "--candidate-builder")?;
-            }
-            "--host-quiet-samples" => {
-                config.host_quiet_samples = parse_value(args, &mut index, "--host-quiet-samples")?;
-            }
-            "--host-quiet-timeout-ms" => {
-                config.host_quiet_timeout_ms =
-                    parse_value(args, &mut index, "--host-quiet-timeout-ms")?;
-            }
-            "--out" => config.output = Some(parse_value(args, &mut index, "--out")?),
-            other => bail!("unknown argument: {other}"),
+        let flag = args[index].as_str();
+        if apply_config_flag(args, &mut index, &mut config, &mut pairs_explicit, flag)?.is_none() {
+            return Ok(None);
         }
         index += 1;
     }
@@ -3058,20 +3119,19 @@ fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsM
     // single-configuration run has no divergence to prove, so it may mount such
     // an ELF — the only way a historical build can be re-measured at all — and
     // records the absence instead of a knob list.
-    let runtime_knobs = match optional_prefixed_line(
+    let runtime_knobs = if let Some(knobs) = optional_prefixed_line(
         &content,
         "mount_candidate_knobs,",
         "FUSE mount effective runtime knobs",
     )? {
-        Some(knobs) => knobs.to_owned(),
-        None => {
-            ensure!(
-                !knobs_required,
-                "FUSE mount effective runtime knobs was not reported: this ELF predates knob \
-                 self-reporting, so it cannot be an arm of a candidate-vs-candidate comparison"
-            );
-            UNREPORTED_RUNTIME_KNOBS.to_owned()
-        }
+        knobs.to_owned()
+    } else {
+        ensure!(
+            !knobs_required,
+            "FUSE mount effective runtime knobs was not reported: this ELF predates knob \
+             self-reporting, so it cannot be an arm of a candidate-vs-candidate comparison"
+        );
+        UNREPORTED_RUNTIME_KNOBS.to_owned()
     };
     // The xattr switch resolves INSIDE the mount, after the knob line above has
     // already been printed, so the daemon reports it separately and it is folded
@@ -3080,26 +3140,25 @@ fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsM
     // compares: left out, an `FFS_FUSE_XATTR_NO_SUPPORT` A/B resolves identical
     // knob lines and fails closed as "the override never reached a knob this ELF
     // reads" — which was true of the harness, not of the ELF.
-    let runtime_knobs = match optional_prefixed_line(
+    let runtime_knobs = if let Some(xattr) = optional_prefixed_line(
         &content,
         "mount_candidate_xattr,",
         "FUSE mount resolved xattr suppression",
     )? {
         // Appended, not substituted: an arm still has to agree with its replica
         // on every OTHER knob too.
-        Some(xattr) => format!("{runtime_knobs},{xattr}"),
+        format!("{runtime_knobs},{xattr}")
+    } else {
         // Absent means an ELF from before this line existed. That is only fatal
         // for a candidate-vs-candidate run, and it is the same fail-closed rule
         // the knob line itself uses.
-        None => {
-            ensure!(
-                !knobs_required,
-                "FUSE mount resolved xattr suppression was not reported: this ELF predates \
-                 xattr-suppression self-reporting, so a candidate-vs-candidate comparison \
-                 could not tell an ACTIVE suppression from a REFUSED one"
-            );
-            runtime_knobs
-        }
+        ensure!(
+            !knobs_required,
+            "FUSE mount resolved xattr suppression was not reported: this ELF predates \
+             xattr-suppression self-reporting, so a candidate-vs-candidate comparison \
+             could not tell an ACTIVE suppression from a REFUSED one"
+        );
+        runtime_knobs
     };
     // bd-t0xoq's capability short-circuit is a SECOND, independent switch: the
     // suppression above tells the kernel to stop probing, while this answers the
@@ -3203,8 +3262,10 @@ fn whoami_uid() -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|| "1000".to_owned())
+        .map_or_else(
+            || "1000".to_owned(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        )
 }
 
 // Keep the lifecycle linear: every identity check must remain visibly between
@@ -3246,7 +3307,12 @@ fn mount_fuse(
         ensure!(!device.is_empty(), "losetup returned no device path");
         // The daemon runs unprivileged; the loop node is root:disk.
         let chown = Command::new("sudo")
-            .args(["-n", "chown", &std::env::var("UID").unwrap_or_else(|_| whoami_uid()), &device])
+            .args([
+                "-n",
+                "chown",
+                &std::env::var("UID").unwrap_or_else(|_| whoami_uid()),
+                &device,
+            ])
             .status()
             .with_context(|| format!("chown {device}"))?;
         ensure!(chown.success(), "chown failed for {device}: {chown}");
@@ -4350,7 +4416,7 @@ fn observe(
 }
 
 const fn physical_arm_for(logical_arm: Arm, round: usize) -> Arm {
-    if round % PHYSICAL_ROLE_CROSSOVER_ROUNDS == 0 {
+    if round.is_multiple_of(PHYSICAL_ROLE_CROSSOVER_ROUNDS) {
         logical_arm
     } else {
         logical_arm.crossover_peer()
@@ -4533,7 +4599,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     assert!(!values.is_empty(), "median requires samples");
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         values[middle - 1].midpoint(values[middle])
     } else {
         values[middle]
@@ -4626,10 +4692,7 @@ fn candidate_cross_null_is_clear(
     if configurations_differ {
         return true;
     }
-    match ratio {
-        Some(ratio) => null_control_is_clear(ratio, maximum_null_ratio),
-        None => true,
-    }
+    ratio.is_none_or(|ratio| null_control_is_clear(ratio, maximum_null_ratio))
 }
 
 fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f64>> {
@@ -4638,7 +4701,7 @@ fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f6
         "paired ratio arms must be non-empty and equal length"
     );
     ensure!(
-        numerator.len() % ESTIMATOR_BLOCK_ROUNDS == 0,
+        numerator.len().is_multiple_of(ESTIMATOR_BLOCK_ROUNDS),
         "paired ratio arms must contain complete crossover blocks"
     );
     let per_round = numerator
@@ -4650,7 +4713,9 @@ fn crossover_log_ratios(numerator: &[u64], denominator: &[u64]) -> Result<Vec<f6
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(per_round
-        .chunks_exact(ESTIMATOR_BLOCK_ROUNDS)
+        .as_chunks::<ESTIMATOR_BLOCK_ROUNDS>()
+        .0
+        .iter()
         .map(|block| block.iter().sum::<f64>() / ESTIMATOR_BLOCK_DIVISOR)
         .collect())
 }
@@ -4710,7 +4775,9 @@ fn paired_group_log_ratios(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(per_round
-        .chunks_exact(ESTIMATOR_BLOCK_ROUNDS)
+        .as_chunks::<ESTIMATOR_BLOCK_ROUNDS>()
+        .0
+        .iter()
         .map(|block| block.iter().sum::<f64>() / ESTIMATOR_BLOCK_DIVISOR)
         .collect())
 }
@@ -5466,10 +5533,10 @@ fn parse_cpu_mhz(raw: &str) -> BTreeMap<usize, f64> {
     for line in raw.lines() {
         if let Some(v) = line.strip_prefix("processor") {
             cpu = cpuinfo_value(v).parse().ok();
-        } else if let Some(v) = line.to_ascii_lowercase().strip_prefix("cpu mhz") {
-            if let (Some(c), Ok(mhz)) = (cpu, cpuinfo_value(v).parse::<f64>()) {
-                out.insert(c, mhz);
-            }
+        } else if let Some(v) = line.to_ascii_lowercase().strip_prefix("cpu mhz")
+            && let (Some(c), Ok(mhz)) = (cpu, cpuinfo_value(v).parse::<f64>())
+        {
+            out.insert(c, mhz);
         }
     }
     out
@@ -5593,43 +5660,166 @@ fn last_level_cache_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
     Ok(siblings)
 }
 
-fn select_cpu_placement(
-    client_threads: usize,
-    fuse_cpu_count: usize,
+/// One preflight placement sample: the busy fractions over the allowed CPU set,
+/// restricted to allowed CPUs, host-wide-checked, then ranked by the
+/// bd-parked-core preference.
+fn sample_placement_candidates(
+    scope: PlacementScope,
+    allowed_cpus: &BTreeSet<usize>,
+    initial_host_quiet_window: Option<&HostQuietWindow>,
+) -> Result<PlacementSample> {
+    let busy = if let Some(window) = initial_host_quiet_window {
+        window.busy_fractions.clone()
+    } else {
+        sample_cpu_busy()?
+    };
+    let mut ranked: Vec<(usize, f64)> = busy
+        .iter()
+        .filter(|(cpu, _)| allowed_cpus.contains(cpu))
+        .map(|(&cpu, &load)| (cpu, load))
+        .collect();
+    ensure!(!ranked.is_empty(), "no allowed CPUs were sampled");
+    if scope == PlacementScope::HostWide {
+        ensure!(
+            ranked.len() == allowed_cpus.len(),
+            "host-wide placement sampled {} of {} allowed CPUs",
+            ranked.len(),
+            allowed_cpus.len()
+        );
+        ensure!(
+            busy_cpus_above_limit(&busy, allowed_cpus, MAX_DRIVER_PREFLIGHT_BUSY)?.is_empty(),
+            "host-wide quiet-window helper returned a busy final sample"
+        );
+    }
+    // bd-parked-core: among cores that are QUIET ENOUGH, prefer the one
+    // running FASTEST.
+    //
+    // Sorting purely by busy fraction takes the argmin -- the least busy core
+    // -- and on this host's `powersave` governor the least busy core is the
+    // one parked at the 1429 MHz minimum. Measured: a run that placed the
+    // btrfs FUSE arm on a 1429.0 MHz core reported
+    // fuse_over_kernel_median=1.181157 against 1.095278-1.106491 in three
+    // runs whose arms were clocked normally -- 7.8% of pure frequency error,
+    // on a 2.40x clock ratio. The guard could not catch it because the guard
+    // checks BUSY, and a parked core is maximally quiet.
+    //
+    // So eligibility still comes first and is UNCHANGED: a core over
+    // MAX_DRIVER_PREFLIGHT_BUSY can never be chosen, whatever its clock. Only
+    // the order WITHIN the eligible set changes, from "least busy" to
+    // "fastest". That cannot admit a busy core; it can only stop us
+    // volunteering for the slowest one available.
+    let clock = cpu_mhz();
+    ranked.sort_by(|left, right| {
+        rank_placement_candidate(left.0, left.1, &clock, MAX_DRIVER_PREFLIGHT_BUSY)
+            .partial_cmp(&rank_placement_candidate(
+                right.0,
+                right.1,
+                &clock,
+                MAX_DRIVER_PREFLIGHT_BUSY,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok((busy, ranked))
+}
+
+/// A CPU qualifies as the driver only when EVERY allowed SMT sibling of its
+/// physical core is at or under the preflight busy limit.
+fn qualifying_driver_cpu(
+    cpu: usize,
+    load: f64,
+    busy: &BTreeMap<usize, f64>,
+    allowed_cpus: &BTreeSet<usize>,
+) -> Result<Option<(usize, f64, BTreeSet<usize>)>> {
+    let siblings = thread_siblings(cpu)?
+        .intersection(allowed_cpus)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if siblings.iter().all(|sibling| {
+        busy.get(sibling)
+            .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
+    }) {
+        Ok(Some((cpu, load, siblings)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Choose this sample's driver candidate: the incumbent while it still
+/// qualifies, otherwise the first ranked CPU that does.
+///
+/// bd-placement-argmin: PREFER THE INCUMBENT while it still qualifies.
+///
+/// The stability rule wants the same candidate to qualify on consecutive
+/// samples. It was fed by an argmin over busy%, and on a quiet many-core host
+/// the argmin is the least stable thing available: measured on this box at
+/// loadavg ~10, 42-50 of 64 CPUs sat at or under MAX_DRIVER_PREFLIGHT_BUSY in
+/// EVERY sample, while the winner changed 9 times in 15 samples and the longest
+/// run of one winner was 1. So the gate could never accumulate its consecutive
+/// count and refused after 151 samples with "no physical core has every SMT
+/// thread below the driver contention limit" -- a message that was false at the
+/// moment it was printed, because ~45 CPUs satisfied exactly that.
+///
+/// This does NOT relax what is verified: the incumbent is re-checked against
+/// the same limit, on the same siblings, on every sample, and is dropped the
+/// moment it stops qualifying. It removes only the requirement that a
+/// qualifying core also be the global MINIMUM, which was never the property the
+/// gate meant to assert -- three projects reported this gate unachievable here,
+/// and this is why.
+fn pick_driver_candidate(
+    last_driver: Option<usize>,
+    busy: &BTreeMap<usize, f64>,
+    ranked: &[(usize, f64)],
+    allowed_cpus: &BTreeSet<usize>,
+) -> Result<Option<(usize, f64, BTreeSet<usize>)>> {
+    if let Some(incumbent) = last_driver
+        && allowed_cpus.contains(&incumbent)
+        && let Some(driver) = qualifying_driver_cpu(
+            incumbent,
+            busy.get(&incumbent).copied().unwrap_or(0.0),
+            busy,
+            allowed_cpus,
+        )?
+    {
+        return Ok(Some(driver));
+    }
+    for &(cpu, load) in ranked {
+        if let Some(driver) = qualifying_driver_cpu(cpu, load, busy, allowed_cpus)? {
+            return Ok(Some(driver));
+        }
+    }
+    Ok(None)
+}
+
+/// Sample candidates repeatedly until one driver candidate holds a settled
+/// placement, then return (busy fractions, ranked CPUs, driver CPU, its busy
+/// fraction, its guarded sibling set).
+///
+/// bd-placement-retry: RETRY the sample instead of failing on the first one.
+///
+/// The thresholds are UNCHANGED. MAX_DRIVER_PREFLIGHT_BUSY, the SMT-sibling
+/// requirement and every ensure! are identical; the only difference is that a
+/// transiently busy host now gets re-sampled within the quiet budget this
+/// function already accepts, instead of aborting the run on one unlucky sample.
+///
+/// Why this is a defect rather than a preference: PlacementScope::HostWide
+/// already calls wait_for_host_quiet() with host_quiet_timeout_ms, so the
+/// waiting machinery exists and is wired. The SameLlc path — which is what the
+/// mounted comparator actually uses — took a SINGLE sample_cpu_busy() and gave
+/// up. The narrower, more commonly used path was the one with no patience.
+///
+/// Measured cost of that asymmetry on 2026-08-16: 20+ invocations of the worst
+/// row refused before measuring, on a host whose load oscillated between 17 and
+/// 94 on a minute timescale. An externally observed "quiet window" is stale by
+/// the time a run starts — loadavg read 16.8 to an operator and 32.35 to the
+/// process seconds later — so the sample must be taken by the process that then
+/// immediately measures, retried until it holds or the budget expires.
+fn settle_driver_placement(
     scope: PlacementScope,
     allowed_cpus: &BTreeSet<usize>,
     host_quiet_samples: usize,
     host_quiet_timeout_ms: u64,
-) -> Result<CpuPlacement> {
-    let initial_host_quiet_window = if scope == PlacementScope::HostWide {
-        Some(wait_for_host_quiet(
-            allowed_cpus,
-            host_quiet_samples,
-            host_quiet_timeout_ms,
-            "initial placement",
-        )?)
-    } else {
-        None
-    };
-    // bd-placement-retry: RETRY the sample instead of failing on the first one.
-    //
-    // The thresholds below are UNCHANGED. MAX_DRIVER_PREFLIGHT_BUSY, the SMT-sibling
-    // requirement and every ensure! are identical; the only difference is that a
-    // transiently busy host now gets re-sampled within the quiet budget this
-    // function already accepts, instead of aborting the run on one unlucky sample.
-    //
-    // Why this is a defect rather than a preference: PlacementScope::HostWide
-    // already calls wait_for_host_quiet() with host_quiet_timeout_ms, so the
-    // waiting machinery exists and is wired. The SameLlc path — which is what the
-    // mounted comparator actually uses — took a SINGLE sample_cpu_busy() and gave
-    // up. The narrower, more commonly used path was the one with no patience.
-    //
-    // Measured cost of that asymmetry on 2026-08-16: 20+ invocations of the worst
-    // row refused before measuring, on a host whose load oscillated between 17 and
-    // 94 on a minute timescale. An externally observed "quiet window" is stale by
-    // the time a run starts — loadavg read 16.8 to an operator and 32.35 to the
-    // process seconds later — so the sample must be taken by the process that then
-    // immediately measures, retried until it holds or the budget expires.
+    initial_host_quiet_window: Option<&HostQuietWindow>,
+) -> Result<SettledDriverPlacement> {
     let start = std::time::Instant::now();
     let mut placement_attempts: u32 = 0;
     // Consecutive samples the SAME driver candidate must survive. Reuses the caller's
@@ -5639,108 +5829,11 @@ fn select_cpu_placement(
     let mut last_driver: Option<usize> = None;
     let (busy, ranked, driver_cpu, driver_busy, driver_guard_cpus) = loop {
         placement_attempts += 1;
-        let busy = if let Some(window) = &initial_host_quiet_window {
-            window.busy_fractions.clone()
-        } else {
-            sample_cpu_busy()?
-        };
-        let mut ranked: Vec<(usize, f64)> = busy
-            .iter()
-            .filter(|(cpu, _)| allowed_cpus.contains(cpu))
-            .map(|(&cpu, &load)| (cpu, load))
-            .collect();
-        ensure!(!ranked.is_empty(), "no allowed CPUs were sampled");
-        if scope == PlacementScope::HostWide {
-            ensure!(
-                ranked.len() == allowed_cpus.len(),
-                "host-wide placement sampled {} of {} allowed CPUs",
-                ranked.len(),
-                allowed_cpus.len()
-            );
-            ensure!(
-                busy_cpus_above_limit(&busy, allowed_cpus, MAX_DRIVER_PREFLIGHT_BUSY)?.is_empty(),
-                "host-wide quiet-window helper returned a busy final sample"
-            );
-        }
-        // bd-parked-core: among cores that are QUIET ENOUGH, prefer the one
-        // running FASTEST.
-        //
-        // Sorting purely by busy fraction takes the argmin -- the least busy core
-        // -- and on this host's `powersave` governor the least busy core is the
-        // one parked at the 1429 MHz minimum. Measured: a run that placed the
-        // btrfs FUSE arm on a 1429.0 MHz core reported
-        // fuse_over_kernel_median=1.181157 against 1.095278-1.106491 in three
-        // runs whose arms were clocked normally -- 7.8% of pure frequency error,
-        // on a 2.40x clock ratio. The guard could not catch it because the guard
-        // checks BUSY, and a parked core is maximally quiet.
-        //
-        // So eligibility still comes first and is UNCHANGED: a core over
-        // MAX_DRIVER_PREFLIGHT_BUSY can never be chosen, whatever its clock. Only
-        // the order WITHIN the eligible set changes, from "least busy" to
-        // "fastest". That cannot admit a busy core; it can only stop us
-        // volunteering for the slowest one available.
-        let clock = cpu_mhz();
-        ranked.sort_by(|left, right| {
-            rank_placement_candidate(left.0, left.1, &clock, MAX_DRIVER_PREFLIGHT_BUSY)
-                .partial_cmp(&rank_placement_candidate(
-                    right.0,
-                    right.1,
-                    &clock,
-                    MAX_DRIVER_PREFLIGHT_BUSY,
-                ))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut driver = None;
-        // bd-placement-argmin: PREFER THE INCUMBENT while it still qualifies.
-        //
-        // The stability rule below wants the same candidate to qualify on
-        // consecutive samples. It was fed by an argmin over busy%, and on a
-        // quiet many-core host the argmin is the least stable thing available:
-        // measured on this box at loadavg ~10, 42-50 of 64 CPUs sat at or under
-        // MAX_DRIVER_PREFLIGHT_BUSY in EVERY sample, while the winner changed 9
-        // times in 15 samples and the longest run of one winner was 1. So the
-        // gate could never accumulate its consecutive count and refused after
-        // 151 samples with "no physical core has every SMT thread below the
-        // driver contention limit" -- a message that was false at the moment it
-        // was printed, because ~45 CPUs satisfied exactly that.
-        //
-        // This does NOT relax what is verified: the incumbent is re-checked
-        // against the same limit, on the same siblings, on every sample, and is
-        // dropped the moment it stops qualifying. It removes only the
-        // requirement that a qualifying core also be the global MINIMUM, which
-        // was never the property the gate meant to assert -- three projects
-        // reported this gate unachievable here, and this is why.
-        if let Some(incumbent) = last_driver
-            && allowed_cpus.contains(&incumbent)
+        let (busy, ranked) =
+            sample_placement_candidates(scope, allowed_cpus, initial_host_quiet_window)?;
+        if let Some((driver_cpu, driver_busy, driver_guard_cpus)) =
+            pick_driver_candidate(last_driver, &busy, &ranked, allowed_cpus)?
         {
-            let siblings = thread_siblings(incumbent)?
-                .intersection(allowed_cpus)
-                .copied()
-                .collect::<BTreeSet<_>>();
-            if siblings.iter().all(|sibling| {
-                busy.get(sibling)
-                    .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
-            }) {
-                let load = busy.get(&incumbent).copied().unwrap_or(0.0);
-                driver = Some((incumbent, load, siblings));
-            }
-        }
-        if driver.is_none() {
-            for &(cpu, load) in &ranked {
-                let siblings = thread_siblings(cpu)?
-                    .intersection(allowed_cpus)
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                if siblings.iter().all(|sibling| {
-                    busy.get(sibling)
-                        .is_some_and(|value| *value <= MAX_DRIVER_PREFLIGHT_BUSY)
-                }) {
-                    driver = Some((cpu, load, siblings));
-                    break;
-                }
-            }
-        }
-        if let Some((driver_cpu, driver_busy, driver_guard_cpus)) = driver {
             // bd-placement-stability: one qualifying sample is a spike, not a window.
             // Require the SAME candidate to qualify on consecutive samples before
             // committing a run to it. A settled HostWide window is exempt: it already
@@ -5770,12 +5863,158 @@ fn select_cpu_placement(
         ) {
             bail!(
                 "no physical core has every SMT thread below the driver contention \
-                 limit after {placement_attempts} sample(s) over {}ms",
-                host_quiet_timeout_ms
+                 limit after {placement_attempts} sample(s) over {host_quiet_timeout_ms}ms"
             );
         }
         thread::sleep(CPU_SAMPLE_INTERVAL);
     };
+    Ok((busy, ranked, driver_cpu, driver_busy, driver_guard_cpus))
+}
+
+/// Place the FUSE daemon CPUs and the client CPUs inside one placement domain.
+///
+/// One daemon CPU keeps the historical order: the daemon claims a private
+/// physical core first, then the clients fill in around its guarded sibling
+/// set. That is the placement every banked row was taken at, so its selection
+/// must stay byte-identical.
+///
+/// More than one daemon CPU is tried the same way FIRST and only falls back
+/// when the domain genuinely cannot supply it. Inside one last-level-cache
+/// domain it usually cannot — C physical cores cannot host both a C-thread
+/// client set and a C-CPU daemon privately — and then the clients are placed
+/// first, exactly as they are today, with the daemon taking quiet CPUs they
+/// did not claim, which in that domain are their SMT siblings.
+///
+/// The fallback is NOT a neutral choice, which is why the private attempt now
+/// comes first: bd-svhrq measured the serial dispatcher failing its OWN A/A
+/// null in 4 of 4 runs taken under the sibling-sharing placement, at 4 and 8
+/// daemon CPUs, at both scopes, and worse at 48 pairs than at 24. Host-wide
+/// scope on a 32-core box can seat 8 clients and 8 daemon CPUs on distinct
+/// physical cores; refusing to even try meant no wide-cpuset run could be
+/// admitted. Either way the placement is reported, so a row can never be read
+/// as if the two placements were interchangeable.
+fn place_clients_and_daemon(
+    client_threads: usize,
+    fuse_cpu_count: usize,
+    driver_cpu: usize,
+    driver_guard_cpus: BTreeSet<usize>,
+    context: &PlacementContext<'_>,
+) -> Result<ClientDaemonPlacement> {
+    let PlacementContext {
+        scope,
+        ranked,
+        busy,
+        driver_domain,
+        last_level_cache_cpus,
+        allowed_cpus,
+    } = *context;
+    if fuse_cpu_count == 1 {
+        let (fuse_cpus, fuse_guard_cpus) = select_fuse_cpus(
+            ranked,
+            busy,
+            last_level_cache_cpus,
+            &driver_guard_cpus,
+            allowed_cpus,
+        )?;
+        let driver_context = DriverPlacementContext {
+            scope,
+            ranked,
+            busy,
+            driver_domain,
+            fuse_guard_cpus: &fuse_guard_cpus,
+        };
+        let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
+            client_threads,
+            driver_cpu,
+            driver_guard_cpus,
+            &driver_context,
+        )?;
+        Ok((
+            fuse_cpus,
+            fuse_guard_cpus,
+            driver_cpus,
+            driver_guard_cpus,
+            "private_physical_core_clients_placed_after",
+        ))
+    } else if let Some((fuse_cpus, fuse_guard_cpus, driver_cpus, guarded)) =
+        place_daemon_on_private_cores(
+            fuse_cpu_count,
+            client_threads,
+            driver_cpu,
+            &driver_guard_cpus,
+            &PrivateCorePlacementContext {
+                scope,
+                ranked,
+                busy,
+                driver_domain,
+                allowed_cpus,
+            },
+        )?
+    {
+        Ok((
+            fuse_cpus,
+            fuse_guard_cpus,
+            driver_cpus,
+            guarded,
+            "private_physical_core_clients_placed_after",
+        ))
+    } else {
+        let driver_context = DriverPlacementContext {
+            scope,
+            ranked,
+            busy,
+            driver_domain,
+            fuse_guard_cpus: &BTreeSet::new(),
+        };
+        let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
+            client_threads,
+            driver_cpu,
+            driver_guard_cpus,
+            &driver_context,
+        )?;
+        let claimed = driver_cpus.iter().copied().collect::<BTreeSet<_>>();
+        let (fuse_cpus, fuse_guard_cpus) = select_multi_fuse_cpus(
+            fuse_cpu_count,
+            ranked,
+            driver_domain,
+            &claimed,
+            allowed_cpus,
+        )?;
+        Ok((
+            fuse_cpus,
+            fuse_guard_cpus,
+            driver_cpus,
+            driver_guard_cpus,
+            "shares_physical_cores_with_clients_placed_after",
+        ))
+    }
+}
+
+fn select_cpu_placement(
+    client_threads: usize,
+    fuse_cpu_count: usize,
+    scope: PlacementScope,
+    allowed_cpus: &BTreeSet<usize>,
+    host_quiet_samples: usize,
+    host_quiet_timeout_ms: u64,
+) -> Result<CpuPlacement> {
+    let initial_host_quiet_window = if scope == PlacementScope::HostWide {
+        Some(wait_for_host_quiet(
+            allowed_cpus,
+            host_quiet_samples,
+            host_quiet_timeout_ms,
+            "initial placement",
+        )?)
+    } else {
+        None
+    };
+    let (busy, ranked, driver_cpu, driver_busy, driver_guard_cpus) = settle_driver_placement(
+        scope,
+        allowed_cpus,
+        host_quiet_samples,
+        host_quiet_timeout_ms,
+        initial_host_quiet_window.as_ref(),
+    )?;
     let _ = &ranked;
     ensure!(
         driver_busy <= MAX_DRIVER_PREFLIGHT_BUSY,
@@ -5796,107 +6035,21 @@ fn select_cpu_placement(
         PlacementScope::SameLlc | PlacementScope::BalancedSquare => &last_level_cache_cpus,
         PlacementScope::HostWide => allowed_cpus,
     };
-    // One daemon CPU keeps the historical order: the daemon claims a private
-    // physical core first, then the clients fill in around its guarded sibling
-    // set. That is the placement every banked row was taken at, so its selection
-    // must stay byte-identical.
-    //
-    // More than one daemon CPU is tried the same way FIRST and only falls back
-    // when the domain genuinely cannot supply it. Inside one last-level-cache
-    // domain it usually cannot — C physical cores cannot host both a C-thread
-    // client set and a C-CPU daemon privately — and then the clients are placed
-    // first, exactly as they are today, with the daemon taking quiet CPUs they
-    // did not claim, which in that domain are their SMT siblings.
-    //
-    // The fallback is NOT a neutral choice, which is why the private attempt now
-    // comes first: bd-svhrq measured the serial dispatcher failing its OWN A/A
-    // null in 4 of 4 runs taken under the sibling-sharing placement, at 4 and 8
-    // daemon CPUs, at both scopes, and worse at 48 pairs than at 24. Host-wide
-    // scope on a 32-core box can seat 8 clients and 8 daemon CPUs on distinct
-    // physical cores; refusing to even try meant no wide-cpuset run could be
-    // admitted. Either way the placement is reported, so a row can never be read
-    // as if the two placements were interchangeable.
     let (fuse_cpus, fuse_guard_cpus, driver_cpus, driver_guard_cpus, fuse_cpu_isolation) =
-        if fuse_cpu_count == 1 {
-            let (fuse_cpus, fuse_guard_cpus) = select_fuse_cpus(
-                &ranked,
-                &busy,
-                &last_level_cache_cpus,
-                &driver_guard_cpus,
-                allowed_cpus,
-            )?;
-            let driver_context = DriverPlacementContext {
+        place_clients_and_daemon(
+            client_threads,
+            fuse_cpu_count,
+            driver_cpu,
+            driver_guard_cpus,
+            &PlacementContext {
                 scope,
                 ranked: &ranked,
                 busy: &busy,
                 driver_domain,
-                fuse_guard_cpus: &fuse_guard_cpus,
-            };
-            let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
-                client_threads,
-                driver_cpu,
-                driver_guard_cpus,
-                &driver_context,
-            )?;
-            (
-                fuse_cpus,
-                fuse_guard_cpus,
-                driver_cpus,
-                driver_guard_cpus,
-                "private_physical_core_clients_placed_after",
-            )
-        } else if let Some((fuse_cpus, fuse_guard_cpus, driver_cpus, guarded)) =
-            place_daemon_on_private_cores(
-                fuse_cpu_count,
-                client_threads,
-                driver_cpu,
-                &driver_guard_cpus,
-                &PrivateCorePlacementContext {
-                    scope,
-                    ranked: &ranked,
-                    busy: &busy,
-                    driver_domain,
-                    allowed_cpus,
-                },
-            )?
-        {
-            (
-                fuse_cpus,
-                fuse_guard_cpus,
-                driver_cpus,
-                guarded,
-                "private_physical_core_clients_placed_after",
-            )
-        } else {
-            let driver_context = DriverPlacementContext {
-                scope,
-                ranked: &ranked,
-                busy: &busy,
-                driver_domain,
-                fuse_guard_cpus: &BTreeSet::new(),
-            };
-            let (driver_cpus, driver_guard_cpus) = select_driver_cpus(
-                client_threads,
-                driver_cpu,
-                driver_guard_cpus,
-                &driver_context,
-            )?;
-            let claimed = driver_cpus.iter().copied().collect::<BTreeSet<_>>();
-            let (fuse_cpus, fuse_guard_cpus) = select_multi_fuse_cpus(
-                fuse_cpu_count,
-                &ranked,
-                driver_domain,
-                &claimed,
+                last_level_cache_cpus: &last_level_cache_cpus,
                 allowed_cpus,
-            )?;
-            (
-                fuse_cpus,
-                fuse_guard_cpus,
-                driver_cpus,
-                driver_guard_cpus,
-                "shares_physical_cores_with_clients_placed_after",
-            )
-        };
+            },
+        )?;
     Ok(CpuPlacement {
         driver_cpu,
         driver_cpus,
@@ -6029,6 +6182,44 @@ fn select_multi_fuse_cpus(
     Ok((chosen, guards))
 }
 
+/// CPU sets produced by a daemon/client placement attempt: (fuse CPUs, fuse
+/// guard CPUs, driver CPUs, driver guard CPUs).
+type PlacementCpuSets = (Vec<usize>, BTreeSet<usize>, Vec<usize>, BTreeSet<usize>);
+
+/// One preflight sample: busy fractions over the allowed set, plus the
+/// allowed CPUs ranked by the bd-parked-core preference.
+type PlacementSample = (BTreeMap<usize, f64>, Vec<(usize, f64)>);
+
+/// A settled driver placement: final sample, ranking, chosen CPU, its busy
+/// fraction, and its guarded SMT-sibling set.
+type SettledDriverPlacement = (
+    BTreeMap<usize, f64>,
+    Vec<(usize, f64)>,
+    usize,
+    f64,
+    BTreeSet<usize>,
+);
+
+/// Client/daemon seating outcome: fuse CPUs, fuse guard CPUs, driver CPUs,
+/// driver guard CPUs, and the isolation label reported for the run.
+type ClientDaemonPlacement = (
+    Vec<usize>,
+    BTreeSet<usize>,
+    Vec<usize>,
+    BTreeSet<usize>,
+    &'static str,
+);
+
+/// Shared read-only inputs every client/daemon seating path needs.
+struct PlacementContext<'a> {
+    scope: PlacementScope,
+    ranked: &'a [(usize, f64)],
+    busy: &'a BTreeMap<usize, f64>,
+    driver_domain: &'a BTreeSet<usize>,
+    last_level_cache_cpus: &'a BTreeSet<usize>,
+    allowed_cpus: &'a BTreeSet<usize>,
+}
+
 /// Everything `place_daemon_on_private_cores` needs that it does not own.
 struct PrivateCorePlacementContext<'a> {
     scope: PlacementScope,
@@ -6052,7 +6243,7 @@ fn place_daemon_on_private_cores(
     driver_cpu: usize,
     driver_guard_cpus: &BTreeSet<usize>,
     context: &PrivateCorePlacementContext<'_>,
-) -> Result<Option<(Vec<usize>, BTreeSet<usize>, Vec<usize>, BTreeSet<usize>)>> {
+) -> Result<Option<PlacementCpuSets>> {
     let mut siblings = BTreeMap::new();
     for &(cpu, _) in context.ranked {
         if context.driver_domain.contains(&cpu) {
@@ -6577,14 +6768,13 @@ fn fs_report(
             // measured. Asserting it here would just fail the run and destroy the
             // comparison. The fail-closed verdict, not this assertion, is what
             // stops a baked run being banked.
-            validate_image(kind, &base)?;
         } else {
             seed_fixture_through_mount(kind, &base, fixture, config.operations, interrupted)?;
             if kind == FilesystemKind::Ext4 {
                 ensure_ext4_directory_is_htree_indexed(&base, fixture.dir_name())?;
             }
-            validate_image(kind, &base)?;
         }
+        validate_image(kind, &base)?;
     }
     let images = clone_images(kind, &base, &fs_dir, arms)?;
 
@@ -7731,17 +7921,14 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
     // bd-client-core-distinctness + bd-cpu-mhz: per-arm core identity and clock.
     let client_cpu_set: BTreeSet<usize> = placement.driver_cpus.iter().copied().collect();
     let client_core_occupancy = physical_core_occupancy(&client_cpu_set).ok();
-    let client_mhz_json = {
-        let mhz = mhz_before_measurement.clone();
-        cpu_mhz_summary(&mhz, &client_cpu_set).map(|(min, max, mean, spread)| {
-            json!({"min": min, "max": max, "mean": mean, "spread": spread})
-        })
-    };
+    let client_mhz_json = cpu_mhz_summary(&mhz_before_measurement, &client_cpu_set).map(
+        |(min, max, mean, spread)| json!({"min": min, "max": max, "mean": mean, "spread": spread}),
+    );
     let cpu_mhz_observed_json = {
-        let mhz = mhz_before_measurement.clone();
         // Sampled BEFORE the timed region (bd-mhz-timing). The post-run figure is
         // reported separately as `cpu_mhz_after_measurement`, so a reader can see
         // whether an arm parked afterwards rather than inferring it.
+        let mhz = mhz_before_measurement;
         let after = cpu_mhz();
         let after_placement: BTreeSet<usize> = placement
             .driver_cpus
@@ -10056,7 +10243,7 @@ mod tests {
         let overflowing = Config {
             workload: Workload::ParallelRead8,
             operations: usize::MAX,
-            ..default.clone()
+            ..default
         };
         assert!(required_free_bytes(&overflowing).unwrap() >= OLD_FLAT_FLOOR);
     }
@@ -10390,15 +10577,14 @@ mod tests {
     fn bootstrap_null_is_exact_for_identical_pairs() {
         let ratios = vec![0.0; 31];
         let ci = bootstrap_median_ci(&ratios, 7);
-        assert_eq!(ci.median, 1.0);
-        assert_eq!(ci.low, 1.0);
-        assert_eq!(ci.high, 1.0);
+        assert_eq!(ci.median.to_bits(), 1.0f64.to_bits());
+        assert_eq!(ci.low.to_bits(), 1.0f64.to_bits());
+        assert_eq!(ci.high.to_bits(), 1.0f64.to_bits());
         assert!(ci.median_within_null_bias_limit());
         assert!(ci.contains_null());
-        assert_eq!(ci.symmetric_spread(), 1.0);
+        assert_eq!(ci.symmetric_spread().to_bits(), 1.0f64.to_bits());
         assert!(null_control_is_clear(ci, 1.025));
     }
-
     #[test]
     fn ci_straddle_is_telemetry_not_a_null_veto() {
         let ci = BootstrapMedianCi {
@@ -10647,12 +10833,12 @@ mod tests {
 
         // A candidate claim is only decidable once it clears twice the worse of
         // the two CANDIDATE nulls: the kernel null is irrelevant here.
-        let candidate_a_null = BootstrapMedianCi {
+        let tight_null_ci = BootstrapMedianCi {
             median: 1.0,
             low: 0.995,
             high: 1.005,
         };
-        let candidate_b_null = BootstrapMedianCi {
+        let wide_null_ci = BootstrapMedianCi {
             median: 1.0,
             low: 0.99,
             high: 1.01,
@@ -10669,13 +10855,13 @@ mod tests {
         };
         assert!(!clears_twice_null_margin(
             inside_floor,
-            candidate_a_null,
-            candidate_b_null
+            tight_null_ci,
+            wide_null_ci
         ));
         assert!(clears_twice_null_margin(
             outside_floor,
-            candidate_a_null,
-            candidate_b_null
+            tight_null_ci,
+            wide_null_ci
         ));
     }
 
@@ -10844,7 +11030,7 @@ mod tests {
     /// nothing, and be measured as a lever. Every other knob is identical
     /// between those two arms, so nothing else in this harness can tell them
     /// apart.
-
+    ///
     /// bd-seed-mnt: only the SECOND field of a /proc/self/mounts line is a mount
     /// point.
     ///
@@ -10854,7 +11040,7 @@ mod tests {
     /// image under test. So this predicate decides whether a real run proceeds,
     /// and BOTH of its failure directions are expensive: a false negative seeds
     /// into the wrong filesystem, a false positive refuses every run forever.
-
+    ///
     /// bd-cpu-mhz: /proc/cpuinfo separates key from value with TABS, and the
     /// parser must survive that.
     ///
@@ -10868,7 +11054,7 @@ mod tests {
     ///
     /// The fixture below is the REAL layout, tabs included, taken from this
     /// host: `cpu MHz\t\t: 3423.725`.
-
+    ///
     /// bd-cpu-mhz: the parser must work on THIS host's real /proc/cpuinfo, not
     /// only on a fixture.
     ///
@@ -10883,7 +11069,7 @@ mod tests {
     /// /proc/cpuinfo does not exist or carries no `cpu MHz` line, because both
     /// are legitimate elsewhere (containers, non-x86, some VMs) and a test that
     /// failed there would be reporting the platform rather than the code.
-
+    ///
     /// bd-cpu-mhz: a per-ARM clock summary attributes a spread that the merged
     /// figure can only report.
     ///
@@ -11010,7 +11196,7 @@ mod tests {
     /// failure: one direction refuses runs that should proceed, the other admits a
     /// busy DRIVER core, which is the arm the timing is most sensitive to because
     /// the timed region includes its directory fsyncs.
-
+    ///
     /// bd-parked-core: eligibility still wins, and among eligible cores the
     /// FASTEST is preferred rather than the least busy.
     ///
@@ -11162,9 +11348,8 @@ mod tests {
         ];
         assert_eq!(
             candidate_knob_divergence(&fired, true).expect("an ACTIVE suppression diverges"),
-            (off.clone(), active.clone())
+            (off.clone(), active)
         );
-
         // The costume case: the knob was requested and REFUSED. It still
         // diverges from the off arm -- the two really are different states, and
         // the harness must not pretend otherwise -- so the protection is that
@@ -11474,7 +11659,7 @@ mod tests {
         );
 
         // CPUs with no reading must not fabricate one.
-        let missing: BTreeSet<usize> = [42].into_iter().collect();
+        let missing: BTreeSet<usize> = std::iter::once(42).collect();
         assert!(
             cpu_mhz_summary(&mhz, &missing).is_none(),
             "absent readings yield None, never a defaulted zero"
@@ -11714,7 +11899,7 @@ mod tests {
         // not a burst.
         let replay = |over: usize, total: usize| -> ExternalLoadWitness {
             let mut w = ExternalLoadWitness::default();
-            let stride = if over == 0 { total + 1 } else { total / over };
+            let stride = total.checked_div(over).unwrap_or(total + 1);
             for i in 0..total {
                 if over > 0 && i % stride == 0 && w.over_limit_samples < over {
                     w.observe(&loaded, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);

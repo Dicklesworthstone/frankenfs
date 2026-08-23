@@ -318,16 +318,16 @@ pub fn check_runbook_links(repo_root: &str) -> Vec<RunbookCheckResult> {
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
     for scenario in &scenarios {
-        if let Some(ref path) = scenario.runbook_ref {
-            if seen.insert(path.clone()) {
-                let full = format!("{repo_root}/{path}");
-                let exists = std::path::Path::new(&full).exists();
-                results.push(RunbookCheckResult {
-                    code: scenario.code.clone(),
-                    runbook_path: path.clone(),
-                    exists,
-                });
-            }
+        if let Some(path) = &scenario.runbook_ref
+            && seen.insert(path.clone())
+        {
+            let full = format!("{repo_root}/{path}");
+            let exists = std::path::Path::new(&full).exists();
+            results.push(RunbookCheckResult {
+                code: scenario.code.clone(),
+                runbook_path: path.clone(),
+                exists,
+            });
         }
     }
     results

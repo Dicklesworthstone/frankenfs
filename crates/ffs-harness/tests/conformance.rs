@@ -5,14 +5,13 @@ use ffs_btrfs::{
     BTRFS_CHUNK_TREE_OBJECTID, BTRFS_DEV_TREE_OBJECTID, BTRFS_FILE_EXTENT_REG,
     BTRFS_FS_TREE_OBJECTID, BTRFS_FT_REG_FILE, BTRFS_ITEM_CHUNK, BTRFS_ITEM_DEV_ITEM,
     BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_SEND_STREAM_MAGIC,
-    BTRFS_TREE_LOG_OBJECTID,
-    BtrfsDeviceSet, SendAttr, SendCommand, SendStreamBuilder, build_chmod_command,
-    build_chown_command, build_link_command, build_mkdir_command, build_mkfifo_command,
-    build_mkfile_command, build_mknod_command, build_mksock_command, build_removexattr_command,
-    build_rename_command, build_rmdir_command, build_setxattr_command, build_subvol_command,
-    build_symlink_command, build_truncate_command, build_unlink_command, build_utimes_command,
-    build_write_command, parse_send_stream, replay_tree_log, tree_log_root_item,
-    walk_chunk_tree, walk_device_tree,
+    BTRFS_TREE_LOG_OBJECTID, BtrfsDeviceSet, SendAttr, SendCommand, SendStreamBuilder,
+    build_chmod_command, build_chown_command, build_link_command, build_mkdir_command,
+    build_mkfifo_command, build_mkfile_command, build_mknod_command, build_mksock_command,
+    build_removexattr_command, build_rename_command, build_rmdir_command, build_setxattr_command,
+    build_subvol_command, build_symlink_command, build_truncate_command, build_unlink_command,
+    build_utimes_command, build_write_command, parse_send_stream, replay_tree_log,
+    tree_log_root_item, walk_chunk_tree, walk_device_tree,
 };
 use ffs_core::{
     Ext4JournalReplayMode, FIEMAP_EXTENT_UNWRITTEN, FileType, FsOps, OpenFs, OpenOptions,
@@ -2210,22 +2209,20 @@ fn mountinfo_unescape(field: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0;
     while let Some(byte) = bytes.get(idx) {
-        if *byte == b'\\' {
-            if let Some(octal) = idx
+        if *byte == b'\\'
+            && let Some(octal) = idx
                 .checked_add(1)
                 .zip(idx.checked_add(4))
                 .and_then(|(start, end)| bytes.get(start..end))
-            {
-                if octal.iter().all(|byte| matches!(*byte, b'0'..=b'7')) {
-                    let value = octal
-                        .iter()
-                        .fold(0_u16, |acc, byte| acc * 8 + u16::from(byte - b'0'));
-                    if let Ok(byte) = u8::try_from(value) {
-                        out.push(byte);
-                        idx += 4;
-                        continue;
-                    }
-                }
+            && octal.iter().all(|byte| matches!(*byte, b'0'..=b'7'))
+        {
+            let value = octal
+                .iter()
+                .fold(0_u16, |acc, byte| acc * 8 + u16::from(byte - b'0'));
+            if let Ok(byte) = u8::try_from(value) {
+                out.push(byte);
+                idx += 4;
+                continue;
             }
         }
         out.push(*byte);

@@ -134,22 +134,20 @@ fn mountinfo_unescape(field: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0;
     while let Some(byte) = bytes.get(idx) {
-        if *byte == b'\\' {
-            if let Some(octal) = idx
+        if *byte == b'\\'
+            && let Some(octal) = idx
                 .checked_add(1)
                 .zip(idx.checked_add(4))
                 .and_then(|(start, end)| bytes.get(start..end))
-            {
-                if octal.iter().all(|byte| matches!(*byte, b'0'..=b'7')) {
-                    let value = octal
-                        .iter()
-                        .fold(0_u16, |acc, byte| acc * 8 + u16::from(byte - b'0'));
-                    if let Ok(byte) = u8::try_from(value) {
-                        out.push(byte);
-                        idx += 4;
-                        continue;
-                    }
-                }
+            && octal.iter().all(|byte| matches!(*byte, b'0'..=b'7'))
+        {
+            let value = octal
+                .iter()
+                .fold(0_u16, |acc, byte| acc * 8 + u16::from(byte - b'0'));
+            if let Ok(byte) = u8::try_from(value) {
+                out.push(byte);
+                idx += 4;
+                continue;
             }
         }
         out.push(*byte);
@@ -3246,13 +3244,12 @@ fn run_readonly_splice_pipe_merge_probe(root: &Path) -> Value {
 }
 
 fn reference_conformance_tempdir() -> TempDir {
-    if Path::new("/dev/shm").is_dir() {
-        if let Ok(dir) = tempfile::Builder::new()
+    if Path::new("/dev/shm").is_dir()
+        && let Ok(dir) = tempfile::Builder::new()
             .prefix("ffs-reference-")
             .tempdir_in("/dev/shm")
-        {
-            return dir;
-        }
+    {
+        return dir;
     }
     TempDir::new().expect("reference tempdir")
 }
@@ -4480,17 +4477,16 @@ fn assert_seek_data_hole_contract(path: &Path, scenario_id: &str) {
     );
 
     let data0 = query_seek(path, 0, "SEEK_DATA");
-    if let Some(errno) = data0["errno"].as_i64() {
-        if errno == i64::from(libc::EINVAL)
+    if let Some(errno) = data0["errno"].as_i64()
+        && (errno == i64::from(libc::EINVAL)
             || errno == i64::from(libc::ENOSYS)
-            || errno == EOPNOTSUPP_ERRNO
-        {
-            eprintln!(
-                "SEEK_DATA/SEEK_HOLE skipped: current kernel/FUSE stack reports errno {errno} \
-                 before FrankenFS can prove mounted seek semantics"
-            );
-            return;
-        }
+            || errno == EOPNOTSUPP_ERRNO)
+    {
+        eprintln!(
+            "SEEK_DATA/SEEK_HOLE skipped: current kernel/FUSE stack reports errno {errno} \
+             before FrankenFS can prove mounted seek semantics"
+        );
+        return;
     }
 
     assert_eq!(
@@ -7605,22 +7601,21 @@ fn fuse_ioctl_ext4_setfslabel_updates_label_and_survives_remount() {
 
     let set_report = fs_label_ioctl(&path, "set", Some(requested));
     let set_trace = read_ioctl_trace(&ioctl_trace_path);
-    if let Some(errno) = set_report["errno"].as_i64() {
-        if errno == i64::from(libc::EPERM)
+    if let Some(errno) = set_report["errno"].as_i64()
+        && (errno == i64::from(libc::EPERM)
             || errno == i64::from(libc::ENOTTY)
-            || errno == EOPNOTSUPP_ERRNO
-        {
-            assert!(
-                !trace_contains_cmd(&set_trace, FS_IOC_SETFSLABEL_CMD),
-                "SETFSLABEL should not return {errno} after reaching ffs-fuse::ioctl: {set_trace}"
-            );
-            emit_scenario_result(
-                scenario_id,
-                "SKIP",
-                Some("kernel_or_vfs_rejected_setfslabel_before_userspace"),
-            );
-            return;
-        }
+            || errno == EOPNOTSUPP_ERRNO)
+    {
+        assert!(
+            !trace_contains_cmd(&set_trace, FS_IOC_SETFSLABEL_CMD),
+            "SETFSLABEL should not return {errno} after reaching ffs-fuse::ioctl: {set_trace}"
+        );
+        emit_scenario_result(
+            scenario_id,
+            "SKIP",
+            Some("kernel_or_vfs_rejected_setfslabel_before_userspace"),
+        );
+        return;
     }
     assert!(
         trace_contains_cmd(&set_trace, FS_IOC_SETFSLABEL_CMD),

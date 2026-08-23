@@ -129,12 +129,12 @@ fn unescape_mounts_field(field: &str) -> PathBuf {
     let bytes = field.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            if let Some(val) = octal3(&bytes[i + 1..]) {
-                out.push(val);
-                i += 4;
-                continue;
-            }
+        if bytes[i] == b'\\'
+            && let Some(val) = octal3(&bytes[i + 1..])
+        {
+            out.push(val);
+            i += 4;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -390,10 +390,10 @@ impl Drop for MountGuard {
             let _ = lazy_unmount(&self.mountpoint);
         }
         // 3. Deregister so the signal handler does not chase a freed mount.
-        if let Ok(mut live) = LIVE_MOUNTS.lock() {
-            if let Some(idx) = live.iter().position(|p| p == &self.mountpoint) {
-                live.swap_remove(idx);
-            }
+        if let Ok(mut live) = LIVE_MOUNTS.lock()
+            && let Some(idx) = live.iter().position(|p| p == &self.mountpoint)
+        {
+            live.swap_remove(idx);
         }
     }
 }

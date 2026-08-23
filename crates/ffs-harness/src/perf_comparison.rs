@@ -90,7 +90,7 @@ pub fn compute_stats(values: &[f64]) -> Option<SampleStats> {
 
     let min = *sorted.first()?;
     let max = *sorted.last()?;
-    let median = if n % 2 == 0 {
+    let median = if n.is_multiple_of(2) {
         let lower = *sorted.get(n / 2 - 1)?;
         let upper = *sorted.get(n / 2)?;
         f64::midpoint(lower, upper)

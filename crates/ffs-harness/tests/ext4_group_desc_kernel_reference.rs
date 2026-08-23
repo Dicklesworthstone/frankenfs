@@ -217,17 +217,17 @@ fn parse_group_header(rest: &str) -> KernelGroupDesc {
         g.csum = u16::try_from(parse_hex_u32(&after[..end]) & 0xFFFF).expect("masked to 16 bits");
     }
 
-    if let Some(start) = rest.find('[') {
-        if let Some(end) = rest.find(']') {
-            let body = &rest[start + 1..end];
-            for tok in body.split(',') {
-                match tok.trim() {
-                    "INODE_UNINIT" => g.flags |= BG_INODE_UNINIT,
-                    "BLOCK_UNINIT" => g.flags |= BG_BLOCK_UNINIT,
-                    "ITABLE_ZEROED" => g.flags |= BG_INODE_ZEROED,
-                    "" => {}
-                    other => panic!("unknown bg flag from dumpe2fs: {other}"),
-                }
+    if let Some(start) = rest.find('[')
+        && let Some(end) = rest.find(']')
+    {
+        let body = &rest[start + 1..end];
+        for tok in body.split(',') {
+            match tok.trim() {
+                "INODE_UNINIT" => g.flags |= BG_INODE_UNINIT,
+                "BLOCK_UNINIT" => g.flags |= BG_BLOCK_UNINIT,
+                "ITABLE_ZEROED" => g.flags |= BG_INODE_ZEROED,
+                "" => {}
+                other => panic!("unknown bg flag from dumpe2fs: {other}"),
             }
         }
     }

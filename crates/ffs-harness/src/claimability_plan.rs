@@ -1435,19 +1435,19 @@ fn plan_next_safe_actions(
             "preserve foreign rows as owner-handoff only; do not mutate them locally".to_owned(),
         );
     }
-    if let Some(summary) = rch_capacity_preflight {
-        if rows.iter().any(|row| {
+    if let Some(summary) = rch_capacity_preflight
+        && rows.iter().any(|row| {
             row.classification == ClaimabilityClassification::InfrastructureBlockedRchCapacity
-        }) {
-            actions.extend(summary.next_safe_actions.clone());
-            actions.push(format!(
-                "RCH capacity preflight {} blocks RCH-dependent rows: verdict={} admissible_workers={} probe={}",
-                summary.report_path,
-                summary.capacity_verdict,
-                summary.admissible_worker_count,
-                summary.probe_verdict
-            ));
-        }
+        })
+    {
+        actions.extend(summary.next_safe_actions.clone());
+        actions.push(format!(
+            "RCH capacity preflight {} blocks RCH-dependent rows: verdict={} admissible_workers={} probe={}",
+            summary.report_path,
+            summary.capacity_verdict,
+            summary.admissible_worker_count,
+            summary.probe_verdict
+        ));
     }
     if actions.is_empty() {
         actions.extend(

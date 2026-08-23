@@ -485,13 +485,13 @@ fn validate_registry_rows(
     for row in rows {
         validate_row_shape(row, &mut seen, errors);
         validate_active_follow_up_status(row, issue_status_by_id, errors);
-        if let Some(finding) = finding_by_id.get(row.source_bead_id.as_str()) {
-            if row.gap_class != finding.gap_class {
-                errors.push(format!(
-                    "row {} gap_class {} disagrees with detected {} for {}",
-                    row.row_id, row.gap_class, finding.gap_class, row.source_bead_id
-                ));
-            }
+        if let Some(finding) = finding_by_id.get(row.source_bead_id.as_str())
+            && row.gap_class != finding.gap_class
+        {
+            errors.push(format!(
+                "row {} gap_class {} disagrees with detected {} for {}",
+                row.row_id, row.gap_class, finding.gap_class, row.source_bead_id
+            ));
         }
     }
 

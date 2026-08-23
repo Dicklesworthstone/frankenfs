@@ -2298,29 +2298,28 @@ impl<'a> ReadinessLabRchLanePlanner<'a> {
                     );
                 }
             }
-            if let Some(worker_hint) = &lane.worker_hint {
-                if !worker_ids.contains(worker_hint.as_str()) {
-                    self.error(
-                        "missing_worker_hint",
-                        format!("lane references unknown worker_hint {worker_hint:?}"),
-                        FindingScope::lane(lane.lane_id.as_str()).field("worker_hint"),
-                    );
-                }
+            if let Some(worker_hint) = &lane.worker_hint
+                && !worker_ids.contains(worker_hint.as_str())
+            {
+                self.error(
+                    "missing_worker_hint",
+                    format!("lane references unknown worker_hint {worker_hint:?}"),
+                    FindingScope::lane(lane.lane_id.as_str()).field("worker_hint"),
+                );
             }
-            if lane.executes_cargo {
-                if let Some(owner) =
+            if lane.executes_cargo
+                && let Some(owner) =
                     target_dir_owner.insert(lane.target_dir.clone(), lane.lane_id.clone())
-                {
-                    self.target_dir_conflict_count += 1;
-                    self.error(
-                        "target_dir_conflict",
-                        format!(
-                            "cargo lanes {owner:?} and {:?} share target_dir {:?}",
-                            lane.lane_id, lane.target_dir
-                        ),
-                        FindingScope::lane(lane.lane_id.as_str()).field("target_dir"),
-                    );
-                }
+            {
+                self.target_dir_conflict_count += 1;
+                self.error(
+                    "target_dir_conflict",
+                    format!(
+                        "cargo lanes {owner:?} and {:?} share target_dir {:?}",
+                        lane.lane_id, lane.target_dir
+                    ),
+                    FindingScope::lane(lane.lane_id.as_str()).field("target_dir"),
+                );
             }
             canonical_dependencies.insert(lane.lane_id.clone(), deps);
         }

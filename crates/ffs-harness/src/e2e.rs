@@ -2347,7 +2347,9 @@ fn maybe_run_fsx_corruption_cycle(
     config: &FsxStressConfig,
 ) {
     if config.corruption_every_ops == 0
-        || state.operations_executed % config.corruption_every_ops != 0
+        || !state
+            .operations_executed
+            .is_multiple_of(config.corruption_every_ops)
     {
         return;
     }
@@ -2385,7 +2387,9 @@ fn maybe_run_fsx_periodic_verify(
     config: &FsxStressConfig,
 ) {
     if config.full_verify_every_ops == 0
-        || state.operations_executed % config.full_verify_every_ops != 0
+        || !state
+            .operations_executed
+            .is_multiple_of(config.full_verify_every_ops)
     {
         return;
     }

@@ -439,10 +439,8 @@ pub fn capability_rows_from_feature_parity(markdown: &str) -> Vec<CapabilityRow>
             break;
         }
 
-        if in_capability_matrix {
-            if let Some(row) = parse_capability_row(trimmed) {
-                rows.push(row);
-            }
+        if in_capability_matrix && let Some(row) = parse_capability_row(trimmed) {
+            rows.push(row);
         }
     }
 
@@ -483,11 +481,11 @@ pub fn extract_test_citations(notes: &str) -> Vec<String> {
                     }
                 }
                 // Also extract file::test pattern
-                if let Some((file_part, test_part)) = current_word.rsplit_once("::") {
-                    if let Some(file_name) = file_part.rsplit('/').next() {
-                        let file_name = file_name.trim_end_matches(".rs");
-                        citations.push(format!("{file_name}::{test_part}"));
-                    }
+                if let Some((file_part, test_part)) = current_word.rsplit_once("::")
+                    && let Some(raw_file) = file_part.rsplit('/').next()
+                {
+                    let file_name = raw_file.trim_end_matches(".rs");
+                    citations.push(format!("{file_name}::{test_part}"));
                 }
             }
             // Check for fuzz target patterns
@@ -502,12 +500,13 @@ pub fn extract_test_citations(notes: &str) -> Vec<String> {
     }
 
     // Handle trailing word
-    if !current_word.is_empty() && current_word.contains("::") {
-        if let Some(idx) = current_word.rfind("::") {
-            let test_name = &current_word[idx + 2..];
-            if !test_name.is_empty() && test_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                citations.push(test_name.to_string());
-            }
+    if !current_word.is_empty()
+        && current_word.contains("::")
+        && let Some(idx) = current_word.rfind("::")
+    {
+        let test_name = &current_word[idx + 2..];
+        if !test_name.is_empty() && test_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            citations.push(test_name.to_string());
         }
     }
 
