@@ -27,6 +27,21 @@ set -u
 
 IMG=${1:?usage: run_crossing_count.sh <image> [entries]}
 ENTRIES=${2:-0}
+# WHICH ARM (bd-2s8zy, 2026-08-24). This script was written to count the
+# SUPPRESSED arm, because in 2026-08 that was the arm whose residue was
+# unexplained. It has since been used to close the transport hypothesis, and the
+# open question moved: the ledger's own caveats say every crossing count so far
+# was taken on ext4, and the suppressed arm describes a configuration FrankenFS
+# does not ship. The banked 7.728937x readdir+stat row is btrfs, unsuppressed.
+#
+# So the arm is now a parameter rather than a constant. `control` is the SHIPPING
+# configuration: the capability probe crosses, because the kernel sends it and
+# suppressing it is not on the table.
+ARM=${FFS_ARM:-suppressed}
+case "$ARM" in
+  control|suppressed) ;;
+  *) echo "FATAL: FFS_ARM must be 'control' or 'suppressed', got '$ARM'"; exit 2 ;;
+esac
 CLI=${FFS_CLI:-/data/projects/frankenfs/target/debug/ffs-cli}
 WORK=${FFS_WORK:-$HOME/ffs-crossing-count}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -46,8 +61,16 @@ LOG="$WORK/daemon.log"
 # suppresses correctly and says nothing, the check finds no match, and this
 # script exits 4 claiming the lever is inactive -- a false NEGATIVE in the one
 # guard that exists to prevent a false positive.
-env FFS_FUSE_XATTR_NO_SUPPORT=auto FFS_MOUNT_BENCH_EVIDENCE=1 \
-  "$CLI" mount "$IMG" "$WORK/mnt" >> "$LOG" 2>&1 &
+if [ "$ARM" = "suppressed" ]; then
+  env FFS_FUSE_XATTR_NO_SUPPORT=auto FFS_MOUNT_BENCH_EVIDENCE=1 \
+    "$CLI" mount "$IMG" "$WORK/mnt" >> "$LOG" 2>&1 &
+else
+  # CONTROL: the knob is left entirely unset rather than set to an "off" value,
+  # so this arm is the mount an operator gets. The evidence flag stays on because
+  # the guard below reads the same self-report to prove the arm is what it says.
+  env FFS_MOUNT_BENCH_EVIDENCE=1 \
+    "$CLI" mount "$IMG" "$WORK/mnt" >> "$LOG" 2>&1 &
+fi
 DAEMON=$!
 # 120s, not the 7.5s this used to allow. `auto` PROVES the image carries no
 # xattrs by walking the whole inode table at mount, before it serves a request,
@@ -68,12 +91,25 @@ mountpoint -q "$WORK/mnt" || {
 # Confirm the arm is what it claims BEFORE counting anything. An arm that
 # silently ran the control is how a btrfs certification reported a null on
 # 2026-08-17; the harness now fails closed on exactly this and so does this.
-if ! sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -q "xattr_suppression=active"; then
-  echo "FATAL: suppression is not active on this mount, so the residue being"
-  echo "       counted is not the residue bd-xfe7z is about."
-  sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -o "xattr_suppression=[a-z]*" | head -1
-  fusermount3 -u "$WORK/mnt" 2>/dev/null
-  exit 4
+if [ "$ARM" = "suppressed" ]; then
+  if ! sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -q "xattr_suppression=active"; then
+    echo "FATAL: suppression is not active on this mount, so the residue being"
+    echo "       counted is not the residue bd-xfe7z is about."
+    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -o "xattr_suppression=[a-z]*" | head -1
+    fusermount3 -u "$WORK/mnt" 2>/dev/null
+    exit 4
+  fi
+else
+  # The control arm fails closed on the MIRROR IMAGE of the same mistake. An arm
+  # that silently suppressed would count ~0 probe crossings and report the
+  # shipping floor as far lower than it is — the most flattering possible error,
+  # which is exactly the kind that has to fail loudly.
+  if sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -q "xattr_suppression=active"; then
+    echo "FATAL: suppression is ACTIVE on a run that asked for the control arm,"
+    echo "       so this would count a configuration FrankenFS does not ship."
+    fusermount3 -u "$WORK/mnt" 2>/dev/null
+    exit 4
+  fi
 fi
 
 # THE CLIENT IS THE MEASUREMENT (bd-xfe7z, 2026-08-17). The first run of this
@@ -159,13 +195,15 @@ wait $STRACE 2>/dev/null
 fusermount3 -u "$WORK/mnt" 2>/dev/null
 wait $DAEMON 2>/dev/null
 
+echo "arm:            $ARM"
 echo "entries walked: $ENTRIES"
-python3 - "$WORK/strace.out" "$ENTRIES" <<'PY'
+python3 - "$WORK/strace.out" "$ENTRIES" "$ARM" <<'PY'
 import sys
 sys.path.insert(0, "/data/projects/frankenfs/scripts")
 from fuse_crossing_count import parse_syscall_counts, crossings_per_entry, verdict
 text = open(sys.argv[1]).read()
 entries = int(sys.argv[2])
+arm = sys.argv[3]
 # Only reads whose fd resolves to the fuse device are crossings. Everything
 # else the daemon reads (the backing image, above all) is not.
 reads = sum(
@@ -184,6 +222,25 @@ if reads == 0:
 per_entry = crossings_per_entry(reads, entries)
 print(f"reads on the fuse device: {reads}")
 print(f"crossings per entry:      {per_entry:.4f}")
-print(verdict(per_entry))
+if arm == "suppressed":
+    print(verdict(per_entry))
+else:
+    # The suppressed-arm verdict tests the TRANSPORT hypothesis against a 0.157
+    # prediction and would be nonsense here: this arm is expected to sit near or
+    # above 1.0 precisely because the capability probe crosses once per entry,
+    # and reusing that verdict would report the shipping configuration as
+    # "refuting both hypotheses" when it is doing exactly what it must.
+    #
+    # What the control count decides instead is the STRUCTURAL FLOOR: crossings
+    # the shipping mount cannot avoid, at ~7.29us each (bd-q0xnl in-stream).
+    floor_us = per_entry * 7.29
+    print(
+        f"control arm: {per_entry:.4f} crossings/entry x ~7.29us = "
+        f"{floor_us:.2f}us/entry of irreducible round trip"
+    )
+    print(
+        "This is a FLOOR, not a cost breakdown: it says what the mount pays for "
+        "crossings alone, before any daemon work."
+    )
 print("NOTE: durations under strace are meaningless. Only the count is a result.")
 PY

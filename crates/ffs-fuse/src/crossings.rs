@@ -285,7 +285,9 @@ pub fn render_ops_nanos() -> String {
 /// `dispatch_ns` (everything), `ops_ns` (the FsOps call) and this, the
 /// remainder is the handler's own bookkeeping:
 ///
-///     dispatch_ns - ops_ns - reply_ns = per-entry handler work
+/// ```text
+/// dispatch_ns - ops_ns - reply_ns = per-entry handler work
+/// ```
 ///
 /// It exists because the split so far only narrowed the target by half: the
 /// format layer is 33.6% of readdirplus dispatch and the handler is 66.4%, and
@@ -338,8 +340,10 @@ impl Drop for ReplyTimer {
 /// request scopes AND the `ops.getattr` calls already timed by [`OpsTimer`].
 /// That overlap is deliberate and is what makes it decompose:
 ///
-///     prefetch_ns - ops_ns_getattr = request-scope machinery
-///     dispatch_ns - prefetch_ns - ops_ns_readdir - reply_ns = emit-loop work
+/// ```text
+/// prefetch_ns - ops_ns_getattr = request-scope machinery
+/// dispatch_ns - prefetch_ns - ops_ns_readdir - reply_ns = emit-loop work
+/// ```
 ///
 /// Two halves of the remainder from one counter, and they point at different
 /// code: the first at `with_request_scope`, the second at the emit loop.
