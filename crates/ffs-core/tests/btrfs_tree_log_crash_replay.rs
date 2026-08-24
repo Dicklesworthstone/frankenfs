@@ -158,12 +158,6 @@ fn read_back(fs: &OpenFs, cx: &Cx, name: &str) -> Option<Vec<u8>> {
 /// mount 3 sees `log_root` cleared by the commit, so the only way the data can
 /// still be there is if the commit actually wrote it into the trees.
 #[test]
-#[ignore = "bd-jhuob: reproduces a LIVE data-loss defect. fsync(file) on a newly \
-created file logs only that inode's own items (tree_log_items=3) and not the parent's \
-DIR_ITEM/DIR_INDEX, so after a crash the inode recovers with NO NAME and lookup fails. \
-Ignored, not deleted, so main stays green while the defect is open — run with \
-`cargo test -p ffs-core --test btrfs_tree_log_crash_replay -- --ignored`. The locator \
-`fsyncing_the_parent_directory_recovers_the_name_bd_jhuob` is NOT ignored and passes."]
 fn tree_logged_fsync_survives_the_full_commit_after_recovery_bd_jhuob() {
     init_tracing();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
@@ -239,10 +233,6 @@ fn tree_logged_fsync_survives_the_full_commit_after_recovery_bd_jhuob() {
 /// every fsync in the transaction, not just the last one. A merge that handled
 /// only the most recent inode would pass the test above and fail this one.
 #[test]
-#[ignore = "bd-jhuob: the multi-inode form of the same live defect. bd-dm01m's \
-accumulation demonstrably works (the log grows 3 -> 6 -> 9 items across three fsyncs), \
-but every recovered inode is nameless for the same reason, so all three files are \
-unreachable after replay. Run with `-- --ignored`."]
 fn every_logged_inode_survives_the_recovery_commit_bd_jhuob() {
     init_tracing();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
@@ -258,6 +248,17 @@ fn every_logged_inode_survives_the_recovery_commit_bd_jhuob() {
         create_and_log(&fs, &cx, name);
     }
     drop(fs);
+
+    // Same vacuity guard as the single-file test: if the accumulated log had
+    // overflowed its leaf and taken the full-commit fallback, `log_root` would be
+    // retired and this test would be proving that a FULL COMMIT is durable —
+    // true, and not what it claims to test.
+    assert_ne!(
+        on_disk_log_root(&image),
+        0,
+        "the accumulated log was retired before the crash, so these files are durable via a \
+         full commit rather than via the tree log; this test would pass vacuously"
+    );
 
     let recovered = open_rw(&cx, &image, false).expect("recovery mount");
     let trigger = recovered
@@ -281,13 +282,20 @@ fn every_logged_inode_survives_the_recovery_commit_bd_jhuob() {
     );
 }
 
-/// LOCATES the defect the two tests above expose, rather than restating it.
+/// Belt and braces: fsyncing the parent directory TOO must also recover.
 ///
-/// Hypothesis: the log carries the fsync'd inode's OWN items and not the parent
-/// directory's namespace items, so after replay the inode exists and has no
-/// name — which is why `lookup` returns nothing while `log_root` was published
-/// and replay reported success. If additionally fsyncing the PARENT makes the
-/// file recoverable, the missing piece is exactly the namespace capture.
+/// This began as the locator for the defect the two tests above now cover. While
+/// the bug was live it was the discriminator — `fsync(file)` lost the name and
+/// `fsync(file) + fsync(dir)` kept it, which is what identified the missing
+/// namespace items as the cause rather than replay or the overlay.
+///
+/// It is kept, with its precondition corrected, because it exercises a path the
+/// others do not: the extra directory fsync pushes the ACCUMULATED log past its
+/// single-leaf budget, so this is the `full_commit_log_overflow_fallback` in
+/// action. Asserting `log_root != 0` here — as it did while it was a locator —
+/// is now simply wrong: a full commit RETIRES the log (bd-mogn1), so a zero
+/// `log_root` is the correct outcome of a correct fallback. What must hold is
+/// that the data is durable either way, which is what this asserts.
 #[test]
 fn fsyncing_the_parent_directory_recovers_the_name_bd_jhuob() {
     init_tracing();
@@ -305,14 +313,14 @@ fn fsyncing_the_parent_directory_recovers_the_name_bd_jhuob() {
         .expect("fsync the parent directory");
     drop(fs);
 
-    assert_ne!(on_disk_log_root(&image), 0, "no tree log was published");
-
     let recovered = open_rw(&cx, &image, false).expect("recovery mount");
     let visible = read_back(&recovered, &cx, "named.bin");
     drop(recovered);
     assert_eq!(
         visible.as_deref(),
         Some(LOGGED_CONTENT),
-        "even with the parent directory fsync'd, the name did not survive replay"
+        "fsync(file) followed by fsync(parent) did not survive the crash. Whether the \
+         accumulated log carried it or overflowed into the full-commit fallback, an fsync \
+         that returned success must not lose its file (bd-jhuob)."
     );
 }
