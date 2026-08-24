@@ -100,6 +100,34 @@ fn crossing_slot(op: &ll::Operation<'_>) -> usize {
     }
 }
 
+/// Opcode classification behind [`Request::is_concurrency_safe`], split out so it
+/// can be tested per opcode without a live `/dev/fuse` channel.
+fn operation_is_concurrency_safe(operation: &ll::Operation<'_>) -> bool {
+    match operation {
+        ll::Operation::Lookup(_)
+        | ll::Operation::GetAttr(_)
+        | ll::Operation::ReadLink(_)
+        | ll::Operation::Read(_)
+        | ll::Operation::StatFs(_)
+        | ll::Operation::GetXAttr(_)
+        | ll::Operation::ListXAttr(_)
+        | ll::Operation::ReadDir(_)
+        | ll::Operation::Access(_)
+        | ll::Operation::BMap(_)
+        | ll::Operation::Open(_)
+        | ll::Operation::OpenDir(_)
+        | ll::Operation::Release(_)
+        | ll::Operation::ReleaseDir(_) => true,
+        #[cfg(feature = "abi-7-21")]
+        ll::Operation::ReadDirPlus(_) => true,
+        #[cfg(feature = "abi-7-24")]
+        ll::Operation::Lseek(_) => true,
+        #[cfg(feature = "abi-7-40")]
+        ll::Operation::Statx(_) => true,
+        _ => false,
+    }
+}
+
 /// Nanoseconds spent in dispatch, per opcode (bd-xfe7z).
 ///
 /// Timed at the SAME boundary the counts are taken at, so "crossings" and
@@ -208,35 +236,58 @@ impl<'a> Request<'a> {
     /// Whether this request may be dispatched concurrently with other
     /// concurrency-safe requests.
     ///
-    /// The set is deliberately narrow: it holds only operations that read
-    /// filesystem state and publish nothing. Every mutation, every handle
-    /// lifecycle operation (`Open`/`Release`/`Flush`), `Forget` (which retires
-    /// inode references a concurrent `Lookup` may be taking) and the session
-    /// handshake stay outside it, so they keep the exact whole-session
-    /// exclusion the single-threaded loop always gave them.
+    /// The set holds operations that read filesystem state and publish nothing,
+    /// plus the handle-lifecycle operations this vendored copy's one consumer
+    /// (`ffs-fuse`'s `FrankenFuse`) implements *statelessly*. Every mutation,
+    /// `Flush`, and the session handshake stay outside it, so they keep the
+    /// exact whole-session exclusion the single-threaded loop always gave them.
+    ///
+    /// # bd-svhrq: why `Open`/`OpenDir`/`Release`/`ReleaseDir` moved in
+    ///
+    /// `docs/progress/perf-negative-results.md` measured the parallel-read row
+    /// losing `0.839x` under worker dispatch, and named the cause exactly: an
+    /// opcode census found **73% of that row's requests were `OPEN`/`FLUSH`/
+    /// `RELEASE`**, which took this gate EXCLUSIVELY, so eight workers
+    /// serialized on three quarters of the traffic and the loss was the same
+    /// size at 1 daemon CPU and at 8. Its stated retry predicate was to show
+    /// these handle-lifecycle ops safe to move into the shared set.
+    ///
+    /// They are, and not because of new locking — because there is no handle
+    /// table to make concurrent. In `ffs-core`'s `FsOps`:
+    ///
+    /// * `open` is the trait default `Ok((0, 0))` — the production `FsFlavor`
+    ///   never overrides it, so a FUSE `OPEN` allocates nothing and publishes
+    ///   nothing. It runs the same `with_request_scope` machinery as `GetAttr`,
+    ///   which has always been in the shared set.
+    /// * `release` is the trait default `Ok(())`, likewise never overridden.
+    /// * `OPENDIR` is `getattr` plus a file-type check; `RELEASEDIR` replies
+    ///   `ok` without reaching the backend at all.
+    ///
+    /// # What deliberately did NOT move, and why
+    ///
+    /// `Flush` stays exclusive: on ext4 it performs a real sync.
+    ///
+    /// `Forget`/`BatchForget` stay exclusive, and this is the load-bearing one.
+    /// They look safe — they only clear per-inode memo entries behind leaf
+    /// mutexes — but the exclusion is buying an ORDERING, not mutual exclusion of
+    /// data. `ffs-fuse`'s capability memo caches the ABSENCE of
+    /// `security.capability` for an inode number, and the kernel may recycle an
+    /// inode number the moment it forgets it (bd-42b11). Sharing the gate would
+    /// let a `LOOKUP` handler's `remember(X)` land AFTER a concurrent
+    /// `FORGET(X)`'s `forget(X)`, reviving a negative memo for a number that is
+    /// about to name a different file — a WRONG ANSWER, not a missed memo. The
+    /// window is real: the kernel does not count an in-flight lookup's reference
+    /// until it has the reply, so `FORGET(X)` and a `LOOKUP` returning `X` can be
+    /// concurrent. Moving these in requires a generation stamp on the memo first.
+    ///
+    /// This classification is a property of THIS consumer, which is why it lives
+    /// in the vendored copy. A different `Filesystem` with a real handle table
+    /// would have to narrow it again.
     pub(crate) fn is_concurrency_safe(&self) -> bool {
         let Ok(operation) = self.request.operation() else {
             return false;
         };
-        match operation {
-            ll::Operation::Lookup(_)
-            | ll::Operation::GetAttr(_)
-            | ll::Operation::ReadLink(_)
-            | ll::Operation::Read(_)
-            | ll::Operation::StatFs(_)
-            | ll::Operation::GetXAttr(_)
-            | ll::Operation::ListXAttr(_)
-            | ll::Operation::ReadDir(_)
-            | ll::Operation::Access(_)
-            | ll::Operation::BMap(_) => true,
-            #[cfg(feature = "abi-7-21")]
-            ll::Operation::ReadDirPlus(_) => true,
-            #[cfg(feature = "abi-7-24")]
-            ll::Operation::Lseek(_) => true,
-            #[cfg(feature = "abi-7-40")]
-            ll::Operation::Statx(_) => true,
-            _ => false,
-        }
+        operation_is_concurrency_safe(&operation)
     }
 
     /// Dispatch request to the given filesystem.
@@ -878,5 +929,143 @@ impl std::fmt::Debug for Request<'_> {
         f.debug_struct("Request")
             .field("request", &self.request)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod concurrency_classification_tests {
+    use super::operation_is_concurrency_safe;
+    use crate::ll::AnyRequest;
+    use crate::ll::fuse_abi as abi;
+    use crate::ll::test::AlignedData;
+
+    const HEADER_LEN: usize = std::mem::size_of::<abi::fuse_in_header>();
+
+    /// Build one minimal request: a `fuse_in_header` for `opcode` followed by
+    /// `payload_len` zero bytes, which is enough for every opcode tested here to
+    /// parse into its `Operation` variant.
+    fn request_bytes(opcode: u32, payload_len: usize) -> AlignedData<[u8; 256]> {
+        let mut buffer = AlignedData([0_u8; 256]);
+        let total = HEADER_LEN + payload_len;
+        assert!(total <= buffer.len(), "payload does not fit the test buffer");
+        let total_u32 = u32::try_from(total).expect("request length fits in u32");
+        buffer[0..4].copy_from_slice(&total_u32.to_ne_bytes());
+        buffer[4..8].copy_from_slice(&opcode.to_ne_bytes());
+        // unique
+        buffer[8..16].copy_from_slice(&1_u64.to_ne_bytes());
+        // nodeid: the root, which every one of these opcodes accepts
+        buffer[16..24].copy_from_slice(&1_u64.to_ne_bytes());
+        buffer
+    }
+
+    fn classify(opcode: u32, payload_len: usize) -> bool {
+        let buffer = request_bytes(opcode, payload_len);
+        let request =
+            AnyRequest::try_from(&buffer[..HEADER_LEN + payload_len]).expect("request parses");
+        let operation = request
+            .operation()
+            .unwrap_or_else(|error| panic!("opcode {opcode} did not decode: {error}"));
+        operation_is_concurrency_safe(&operation)
+    }
+
+    #[test]
+    fn handle_lifecycle_opcodes_are_shared_bd_svhrq() {
+        // Two thirds of the parallel-read row's 73% exclusive share (OPEN and
+        // RELEASE, plus the directory pair) is what this bead moved.
+        let open_in = std::mem::size_of::<abi::fuse_open_in>();
+        let release_in = std::mem::size_of::<abi::fuse_release_in>();
+
+        assert!(classify(abi::fuse_opcode::FUSE_OPEN as u32, open_in), "OPEN");
+        assert!(
+            classify(abi::fuse_opcode::FUSE_OPENDIR as u32, open_in),
+            "OPENDIR"
+        );
+        assert!(
+            classify(abi::fuse_opcode::FUSE_RELEASE as u32, release_in),
+            "RELEASE"
+        );
+        assert!(
+            classify(abi::fuse_opcode::FUSE_RELEASEDIR as u32, release_in),
+            "RELEASEDIR"
+        );
+    }
+
+    #[test]
+    fn forget_stays_exclusive_so_the_capability_memo_cannot_be_revived() {
+        // THE OTHER NEGATIVE CASE, and the one most likely to be "fixed" by a
+        // future widening. FORGET only clears leaf-locked memo entries, so it
+        // LOOKS shareable; what the exclusive gate buys is the ORDERING against a
+        // concurrent LOOKUP's `remember(ino)`. Losing it revives a negative
+        // `security.capability` memo for an inode number the kernel is free to
+        // recycle (bd-42b11) — a wrong answer, not a missed memo.
+        assert!(
+            !classify(
+                abi::fuse_opcode::FUSE_FORGET as u32,
+                std::mem::size_of::<abi::fuse_forget_in>()
+            ),
+            "FORGET must stay exclusive until the capability memo is generation-stamped"
+        );
+        assert!(
+            !classify(
+                abi::fuse_opcode::FUSE_BATCH_FORGET as u32,
+                std::mem::size_of::<abi::fuse_batch_forget_in>()
+            ),
+            "BATCH_FORGET must stay exclusive for the same reason as FORGET"
+        );
+    }
+
+    #[test]
+    fn mutations_and_flush_stay_exclusive() {
+        // THE NEGATIVE CASE. Widening the shared set is only sound while the
+        // mutating opcodes stay out of it; an implementation that returned `true`
+        // unconditionally — the easiest way to "fix" the contention — fails here.
+        // FLUSH is listed explicitly because it is the one member of the
+        // handle-lifecycle trio that did NOT move: on ext4 it performs a sync.
+        assert!(
+            !classify(
+                abi::fuse_opcode::FUSE_FLUSH as u32,
+                std::mem::size_of::<abi::fuse_flush_in>()
+            ),
+            "FLUSH must stay exclusive: ext4 flush syncs"
+        );
+        assert!(
+            !classify(
+                abi::fuse_opcode::FUSE_SETATTR as u32,
+                std::mem::size_of::<abi::fuse_setattr_in>()
+            ),
+            "SETATTR is a mutation"
+        );
+        assert!(
+            !classify(
+                abi::fuse_opcode::FUSE_FSYNC as u32,
+                std::mem::size_of::<abi::fuse_fsync_in>()
+            ),
+            "FSYNC is a durability boundary"
+        );
+        assert!(
+            !classify(
+                abi::fuse_opcode::FUSE_INIT as u32,
+                std::mem::size_of::<abi::fuse_init_in>()
+            ),
+            "INIT is the handshake"
+        );
+    }
+
+    #[test]
+    fn the_original_read_set_is_unchanged() {
+        assert!(classify(
+            abi::fuse_opcode::FUSE_GETATTR as u32,
+            std::mem::size_of::<abi::fuse_getattr_in>()
+        ));
+        assert!(classify(
+            abi::fuse_opcode::FUSE_READ as u32,
+            std::mem::size_of::<abi::fuse_read_in>()
+        ));
+        // GETXATTR carries a NUL-terminated name after its header struct; the
+        // extra zero bytes are that empty name.
+        assert!(classify(
+            abi::fuse_opcode::FUSE_GETXATTR as u32,
+            std::mem::size_of::<abi::fuse_getxattr_in>() + 8
+        ));
     }
 }
