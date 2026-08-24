@@ -481,3 +481,26 @@ fn interleaved_stat_order_costs_more_descents_than_sequential_bd_2s8zy() {
 fn fs_ref(fs: &OpenFs) -> &OpenFs {
     fs
 }
+
+/// The shipping floor-memo size must be the one the counted evidence was taken on
+/// (bd-2s8zy).
+///
+/// 692af94aa raised the memo 4 -> 16 on counted evidence and left it unmeasurable
+/// against the live kernel: the mounted comparator only A/Bs two configurations
+/// that come from ONE ELF and can be shown to differ on a knob the daemon
+/// self-reports. `FFS_BTRFS_FLOOR_MEMO_SLOTS` now makes that A/B expressible.
+///
+/// This asserts the half an integration test can honestly reach. The knob's
+/// PARSING is unit-tested inside ffs-core (`std::env::set_var` is `unsafe` in
+/// edition 2024 and this workspace forbids unsafe, so an integration test cannot
+/// toggle it without mutating process-global state the parallel harness shares).
+/// The knob's EFFECT is the 4-vs-16 table in 692af94aa, taken by rebuilding.
+#[test]
+fn the_shipping_floor_memo_size_matches_the_measured_one_bd_2s8zy() {
+    assert_eq!(
+        ffs_core::btrfs_floor_memo_slots_effective(),
+        16,
+        "the effective floor-memo slot count is not 16, so the knob line the comparator \
+         reads does not describe the configuration the counted 2.93x was measured on"
+    );
+}

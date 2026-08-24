@@ -1774,7 +1774,12 @@ pub struct OpenFs {
     ///
     /// Bounded by construction: ONE leaf, not a structure that grows with the
     /// filesystem — which is the property bd-5vis3 exists to preserve.
-    btrfs_floor_leaf_memo: Mutex<[Option<BtrfsFloorLeafMemo>; BTRFS_FLOOR_MEMO_SLOTS]>,
+    /// Boxed slice rather than a fixed array so the slot count is a RUNTIME value
+    /// (bd-2s8zy). It has to be: the mounted comparator can only A/B two
+    /// configurations that come from ONE ELF, so a compile-time constant cannot be
+    /// measured against the live kernel at all — which is exactly where the 4 -> 16
+    /// change was left.
+    btrfs_floor_leaf_memo: Mutex<Box<[Option<BtrfsFloorLeafMemo>]>>,
     /// Round-robin victim for [`BTRFS_FLOOR_MEMO_SLOTS`] (bd-yu6jz).
     ///
     /// Round-robin rather than LRU on purpose: LRU needs a timestamp write on every
@@ -2312,6 +2317,60 @@ struct BtrfsFloorLeafMemo {
 /// `BTRFS_TREE_NODE_CACHE_LIMIT`). Sixteen covers the 8-thread rows with headroom
 /// while staying two orders below that bound.
 const BTRFS_FLOOR_MEMO_SLOTS: usize = 16;
+
+/// Slot count for the floor-leaf memo, honouring `FFS_BTRFS_FLOOR_MEMO_SLOTS`.
+///
+/// THE KNOB EXISTS TO MAKE THE SIZING MEASURABLE, not to be tuned in production.
+/// The mounted comparator refuses a candidate A/B whose two arms do not come from
+/// ONE ELF and cannot be shown to differ on a knob the daemon self-reports, so a
+/// compile-time slot count can never be measured against the live kernel — which
+/// is precisely where 692af94aa left the 4 -> 16 change. Reading it from the
+/// environment lets one ELF supply both arms so the ISA and PGO provenance cancel
+/// between them (bd-b9dug).
+///
+/// Zero and unparseable values fall back to the default rather than disabling the
+/// memo: a zero-slot memo is a silent ~2.9x increase in descent work, not a
+/// configuration anyone means.
+fn btrfs_floor_memo_slot_count() -> usize {
+    btrfs_floor_memo_slots_from_value(
+        std::env::var("FFS_BTRFS_FLOOR_MEMO_SLOTS").ok().as_deref(),
+    )
+}
+
+/// Pure half of the knob, so the spelling is testable without mutating
+/// process-global environment — racy under the parallel harness, and `unsafe` from
+/// edition 2024, which this workspace forbids. Mirrors how the other `FFS_*`
+/// switches in this workspace are split.
+fn btrfs_floor_memo_slots_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|slots| *slots > 0)
+        .unwrap_or(BTRFS_FLOOR_MEMO_SLOTS)
+}
+
+/// The effective floor-leaf memo slot count, for the mount's self-reported knob
+/// line (bd-2s8zy).
+///
+/// The comparator proves two candidate arms differ by reading the knobs the DAEMON
+/// reports, so a knob that is not reported cannot be A/B'd — it refuses the run
+/// outright rather than compare a configuration against itself. That is not
+/// hypothetical: it is what happened to FFS_FUSE_WRITEBACK_BATCH earlier today.
+#[must_use]
+pub fn btrfs_floor_memo_slots_effective() -> usize {
+    btrfs_floor_memo_slot_count()
+}
+
+/// Allocate a fresh floor-leaf memo at the configured size.
+fn btrfs_floor_memo_new_slots() -> Box<[Option<BtrfsFloorLeafMemo>]> {
+    // `(0..n).map(|_| None)` rather than `vec![None; n]`: `BtrfsFloorLeafMemo` holds
+    // an `Arc<BtrfsParsedNode>` and is deliberately not `Clone`, so the repeat form
+    // does not compile — and making it `Clone` to satisfy a constructor would make
+    // it possible to duplicate a retained leaf by accident.
+    (0..btrfs_floor_memo_slot_count())
+        .map(|_| None)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 /// Does this retained leaf answer `target` on `root_logical`?
 ///
@@ -5468,7 +5527,7 @@ impl OpenFs {
             btrfs_fs_tree_root_fast: AtomicU64::new(0),
             btrfs_verified_dir_inode: AtomicU64::new(0),
             btrfs_parsed_node_cache: ShardedCache::new(),
-            btrfs_floor_leaf_memo: Mutex::new([const { None }; BTRFS_FLOOR_MEMO_SLOTS]),
+            btrfs_floor_leaf_memo: Mutex::new(btrfs_floor_memo_new_slots()),
             btrfs_floor_memo_next_slot: std::sync::atomic::AtomicUsize::new(0),
             btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(
                 btrfs_floor_memo_disabled_from_env(),
@@ -9705,7 +9764,9 @@ impl OpenFs {
         // measure per-op descent structure against cold reads, so the memo must
         // go with it — otherwise the next read-count test written against this
         // helper silently measures a warm path and reports too few reads.
-        *self.btrfs_floor_leaf_memo.lock() = [const { None }; BTRFS_FLOOR_MEMO_SLOTS];
+        for slot in self.btrfs_floor_leaf_memo.lock().iter_mut() {
+            *slot = None;
+        }
         // The miss streak is memo state too (bd-79li3): leaving it high across a
         // reset would start the next measurement already suppressed.
         self.btrfs_floor_memo_consecutive_misses
@@ -9886,14 +9947,17 @@ impl OpenFs {
             // that a test can pin, which is what this needed: the bug fixed here was
             // an ordering bug, invisible to any test that only checked the memo
             // answers correctly.
-            let identities: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] =
-                std::array::from_fn(|i| slots[i].as_ref().map(|s| (s.root_logical, s.first_key)));
+            let identities: Vec<Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>> = slots
+                .iter()
+                .map(|slot| slot.as_ref().map(|s| (s.root_logical, s.first_key)))
+                .collect();
+            let slot_count = slots.len().max(1);
             let victim =
                 btrfs_floor_memo_reuse_slot(&identities, fresh.root_logical, &fresh.first_key)
                     .unwrap_or_else(|| {
                         self.btrfs_floor_memo_next_slot
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            % BTRFS_FLOOR_MEMO_SLOTS
+                            % slot_count
                     });
             slots[victim] = Some(fresh);
         }
@@ -37556,7 +37620,9 @@ impl OpenFs {
         self.btrfs_floor_memo_consecutive_misses
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if disabled {
-            *self.btrfs_floor_leaf_memo.lock() = [const { None }; BTRFS_FLOOR_MEMO_SLOTS];
+            for slot in self.btrfs_floor_leaf_memo.lock().iter_mut() {
+            *slot = None;
+        }
         }
     }
 
@@ -58930,6 +58996,37 @@ mod tests {
     /// leaf, which is exactly the case an unguarded memo answers correctly by
     /// luck; stepping by a stride coprime to the entry count forces repeated
     /// crossings of leaf boundaries, where a wrong span check must diverge.
+    #[test]
+    fn btrfs_floor_memo_slots_from_value_parses_and_fails_safe_bd_2s8zy() {
+        // Default when unset: the shipping size the counted 2.93x was measured on.
+        assert_eq!(btrfs_floor_memo_slots_from_value(None), BTRFS_FLOOR_MEMO_SLOTS);
+        // An explicit value is honoured, which is what makes a mounted A/B of the
+        // sizing expressible from ONE ELF at all — a compile-time count cannot be
+        // measured against the live kernel.
+        assert_eq!(btrfs_floor_memo_slots_from_value(Some("4")), 4);
+        assert_eq!(btrfs_floor_memo_slots_from_value(Some(" 32 ")), 32);
+        // FAILS SAFE, and this is the half that matters. A zero-slot memo is not a
+        // configuration anyone means; it is a silent ~2.9x increase in descent work.
+        // Zero, empty, garbage and negatives all fall back to the default rather
+        // than disabling the memo.
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("0")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("sixteen")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("-1")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+    }
+
     #[test]
     fn btrfs_floor_memo_answers_match_the_descent_path_bd_5vis3() {
         let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(4000) else {
