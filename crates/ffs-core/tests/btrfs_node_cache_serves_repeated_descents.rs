@@ -209,3 +209,55 @@ fn a_repeated_capability_sweep_is_served_from_the_node_cache_bd_2s8zy() {
          and it is why the btrfs readdir+stat row re-reads its fs-tree root 11,775 times."
     );
 }
+
+/// THE CACHE IS OFF ENTIRELY ON A WRITABLE MOUNT, and this pins it.
+///
+/// `btrfs_read_parsed_node` gates every lookup, hit and insert on
+/// `let cacheable = self.btrfs_alloc_state.is_none();` — i.e. the parsed-node
+/// cache exists only for READ-ONLY mounts. On a writable one the counters do not
+/// even move, and every descent pays a full device read.
+///
+/// That is defensible by design (a writable tree changes under the cache and
+/// there is no invalidation), and it is NOT the mechanism behind bd-2s8zy's
+/// mounted readdir+stat storm — the comparator passes `--rw` only for MUTATING
+/// workloads (`ffs_mounted_kernel_bench.rs`: `if config.workload.is_mutating()`),
+/// and readdir+stat is not one. So this test does not explain that row.
+///
+/// It is worth pinning anyway because it sizes a DIFFERENT gap: every write
+/// workload — create/delete storm, parallel metadata write, fsync — runs with the
+/// node cache completely disabled, and the read-only numbers above show what that
+/// costs when the same nodes are crossed repeatedly (0 misses vs a full descent
+/// each time). Anyone proposing generation-stamped invalidation for writable
+/// mounts should start from this counter, and anyone who "fixes" the gate without
+/// adding invalidation will break correctness silently.
+#[test]
+fn the_node_cache_is_disabled_on_a_writable_mount_bd_2s8zy() {
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let entries = 600;
+    let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-rw.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-2s8zy writable-mount probe");
+        return;
+    };
+    let cx = Cx::for_testing();
+    let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
+
+    let device = ffs_block::FileByteDevice::open(&image).expect("open image");
+    let mut fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+        .expect("open btrfs");
+    fs.enable_writes(&cx).expect("enable writes");
+
+    let (l0, h0, m0) = ffs_core::btrfs_node_cache_counters_full();
+    probe_all(&fs, &cx, &names);
+    probe_all(&fs, &cx, &names);
+    let (l1, h1, m1) = ffs_core::btrfs_node_cache_counters_full();
+    let (lookups, hits, misses) = (l1 - l0, h1 - h0, m1 - m0);
+    eprintln!(
+        "bd-2s8zy WRITABLE entries={entries} two sweeps: lookups={lookups} hits={hits} misses={misses}"
+    );
+
+    assert_eq!(
+        (lookups, hits, misses),
+        (0, 0, 0),
+        "the writable-mount arm recorded node-cache activity, so the `cacheable` gate in          btrfs_read_parsed_node no longer means what this test documents — re-read it          before trusting any read-only cache number measured alongside a writable mount"
+    );
+}
