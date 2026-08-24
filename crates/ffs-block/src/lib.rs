@@ -1996,7 +1996,7 @@ impl CacheMetrics {
 }
 
 /// JSON-friendly cache metrics export used by runtime/e2e reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct CacheRuntimeMetricsSnapshot {
     pub cache_hits: u64,
     pub cache_misses: u64,

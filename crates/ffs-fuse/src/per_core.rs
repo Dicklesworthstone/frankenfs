@@ -156,7 +156,7 @@ impl Default for CoreMetrics {
 }
 
 /// Immutable snapshot of per-core metrics for reporting.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CoreMetricsSnapshot {
     pub requests: u64,
     pub pending_requests: i64,
