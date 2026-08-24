@@ -9419,7 +9419,11 @@ mod tests {
             name: &str,
         ) -> ffs_error::Result<Option<Vec<u8>>> {
             if name == SECURITY_CAPABILITY_XATTR {
-                return Ok(self.capability.lock().clone());
+                return Ok(self
+                    .capability
+                    .lock()
+                    .expect("capability lock poisoned")
+                    .clone());
             }
             Ok(None)
         }
@@ -9434,7 +9438,7 @@ mod tests {
             _mode: XattrSetMode,
         ) -> ffs_error::Result<()> {
             if name == SECURITY_CAPABILITY_XATTR {
-                *self.capability.lock() = Some(value.to_vec());
+                *self.capability.lock().expect("capability lock poisoned") = Some(value.to_vec());
             }
             Ok(())
         }
@@ -9447,7 +9451,12 @@ mod tests {
             name: &str,
         ) -> ffs_error::Result<bool> {
             if name == SECURITY_CAPABILITY_XATTR {
-                return Ok(self.capability.lock().take().is_some());
+                return Ok(self
+                    .capability
+                    .lock()
+                    .expect("capability lock poisoned")
+                    .take()
+                    .is_some());
             }
             Ok(false)
         }
