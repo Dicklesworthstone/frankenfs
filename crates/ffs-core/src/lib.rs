@@ -140,7 +140,7 @@ enum BtrfsDeferredReadResult {
 enum BtrfsReadJob<'o> {
     Inline {
         idx: usize,
-        data: Vec<u8>,
+        data: &'o [u8],
         comp: u8,
         ram: usize,
     },
@@ -1852,6 +1852,73 @@ pub struct OpenFs {
 /// the lock-free hot-inode slot: the INODE_ITEM plus its full
 /// `(logical offset, EXTENT_DATA)` extent list.
 type BtrfsRoInodeExtents = Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)>;
+
+/// Extents selected for one btrfs read. Mutable and tree-log-backed reads own
+/// parsed extent data, while immutable cache paths retain their cache backing
+/// and borrow just the window selected by [`OpenFs::btrfs_window_extent_indices`].
+/// This matters for inline extents: cloning the selected `BtrfsExtentData`
+/// otherwise cloned the file payload before the read path copied its requested
+/// bytes into the caller's buffer (bd-vpypn).
+enum BtrfsReadExtents {
+    Owned(Vec<(u64, BtrfsExtentData)>),
+    ReadPlan {
+        rows: Arc<[(u64, BtrfsExtentData)]>,
+        indices: Vec<usize>,
+    },
+    Cached {
+        entry: BtrfsRoInodeExtents,
+        indices: Vec<usize>,
+    },
+}
+
+enum BtrfsReadExtentIter<'a> {
+    Owned(std::slice::Iter<'a, (u64, BtrfsExtentData)>),
+    Indexed {
+        rows: &'a [(u64, BtrfsExtentData)],
+        indices: std::slice::Iter<'a, usize>,
+    },
+}
+
+impl<'a> Iterator for BtrfsReadExtentIter<'a> {
+    type Item = (&'a u64, &'a BtrfsExtentData);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(rows) => rows.next().map(|(logical_start, extent)| (logical_start, extent)),
+            Self::Indexed { rows, indices } => indices.next().map(|index| {
+                let (logical_start, extent) = &rows[*index];
+                (logical_start, extent)
+            }),
+        }
+    }
+}
+
+impl BtrfsReadExtents {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(rows) => rows.len(),
+            Self::ReadPlan { indices, .. } | Self::Cached { indices, .. } => indices.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn iter(&self) -> BtrfsReadExtentIter<'_> {
+        match self {
+            Self::Owned(rows) => BtrfsReadExtentIter::Owned(rows.iter()),
+            Self::ReadPlan { rows, indices } => BtrfsReadExtentIter::Indexed {
+                rows,
+                indices: indices.iter(),
+            },
+            Self::Cached { entry, indices } => BtrfsReadExtentIter::Indexed {
+                rows: &entry.1,
+                indices: indices.iter(),
+            },
+        }
+    }
+}
 
 /// Immutable directory rows of [`BtrfsReadPlanIndex`], shared as a slice.
 type BtrfsDirItems = Arc<[(BtrfsKey, Vec<u8>)]>;
@@ -11693,52 +11760,19 @@ impl OpenFs {
         Ok((inode, exts))
     }
 
-    /// Filter a `logical_start`-sorted, non-overlapping extent slice to those
-    /// overlapping the read window `[offset, read_end)` via a binary-searched
-    /// lower bound + forward scan that stops at the first extent past the
-    /// window — O(log N + overlapping) instead of the O(N) scan over every
-    /// extent of the inode. Profiling a single-thread compressed random read
-    /// put `btrfs_read_file_into` self-time at ~47%, dominated by this per-read
-    /// scan of the inode's FULL cached extent list (bd-n5w92 / read-plan
-    /// index): a 4 KiB random read of a many-extent file (e.g. a database on
-    /// btrfs = tens of thousands of extents) re-scanned every extent to find
-    /// the one or two it overlaps. Byte-identical selection: extents are sorted
-    /// by `logical_start` and do not overlap, so the overlapping extents form a
-    /// contiguous run and any extent before the lower bound has
-    /// `extent_end <= offset` (cannot overlap). The full predicate
-    /// (`logical_start < read_end && extent_end > offset`) is re-applied in the
-    /// forward scan, so a hole/gap entry landing on the lower bound is still
-    /// skipped exactly as the linear filter skipped it.
-    fn btrfs_filter_window_extents(
-        rows: &[(u64, BtrfsExtentData)],
-        offset: u64,
-        read_end: u64,
-    ) -> Result<Vec<(u64, BtrfsExtentData)>, FfsError> {
-        let mut exts: Vec<(u64, BtrfsExtentData)> = Vec::new();
-        for index in Self::btrfs_window_extent_indices(rows, offset, read_end)? {
-            let (logical_start, extent) = &rows[index];
-            exts.push((*logical_start, extent.clone()));
-        }
-        Ok(exts)
-    }
-
     /// Indices of the extents in `rows` overlapping `[offset, read_end)`
     /// (bd-vpypn).
     ///
-    /// The window rule itself, separated from the copying so there is exactly ONE
-    /// definition of which extents a read touches. `btrfs_filter_window_extents`
-    /// is now a thin clone-and-collect over this, so the two cannot disagree.
+    /// The window rule itself has exactly one definition of which extents a
+    /// read touches.
     ///
-    /// ⚠️ WHY THIS SHAPE MATTERS, and it is not tidiness. The clone in the filter
-    /// is NOT uniformly cheap: `BtrfsExtentData::Regular` is all scalars, but
+    /// ⚠️ WHY THIS SHAPE MATTERS, and it is not tidiness. An extent clone is NOT
+    /// uniformly cheap: `BtrfsExtentData::Regular` is all scalars, but
     /// `BtrfsExtentData::Inline` owns a `Vec<u8>` holding the file's bytes. btrfs
-    /// stores small files inline, so every read of a small file deep-copies its
-    /// payload here and then copies it AGAIN into the caller's buffer. Returning
-    /// indices lets a caller that borrows a long-lived extent list (the read-plan
-    /// index and the read-only per-inode cache both do) skip the first copy
-    /// entirely. That call-site change is deliberately NOT made here — it is a
-    /// lifetime refactor across three branches that must be compiled to be
-    /// trusted, and this lands under a build freeze.
+    /// stores small files inline, so every selected extent used to deep-copy its
+    /// payload before the caller's requested bytes were copied into its buffer.
+    /// The immutable read-plan and per-inode-cache callers retain their backing
+    /// allocation and use these indices to borrow the selected extents instead.
     ///
     /// Selection is byte-identical to the previous inline implementation:
     /// extents are sorted by `logical_start` and do not overlap, so the
@@ -11817,7 +11851,7 @@ impl OpenFs {
 
         // Fetch the inode and extent items from either the COW tree (when
         // writes are enabled) or the on-disk FS tree.
-        let (inode, extents): (BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>) =
+        let (inode, extents): (BtrfsInodeItem, BtrfsReadExtents) =
             if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
                 let alloc = alloc_mutex.read();
                 let inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
@@ -11883,15 +11917,18 @@ impl OpenFs {
                 if let Some(e) = cb_err {
                     return Err(e);
                 }
-                (inode, exts)
+                (inode, BtrfsReadExtents::Owned(exts))
             } else if let Some(index) = self.btrfs_cached_read_plan_index() {
                 let inode = index.inodes.get(&canonical).copied().ok_or_else(|| {
                     FfsError::NotFound(format!("btrfs INODE_ITEM for objectid {canonical}"))
                 })?;
                 let read_end = offset.saturating_add(u64::from(size));
                 let exts = match index.extents.get(&canonical) {
-                    Some(rows) => Self::btrfs_filter_window_extents(rows, offset, read_end)?,
-                    None => Vec::new(),
+                    Some(rows) => BtrfsReadExtents::ReadPlan {
+                        rows: Arc::clone(rows),
+                        indices: Self::btrfs_window_extent_indices(rows, offset, read_end)?,
+                    },
+                    None => BtrfsReadExtents::Owned(Vec::new()),
                 };
                 (inode, exts)
             } else if self.btrfs_tree_log_items.is_empty() {
@@ -11907,15 +11944,10 @@ impl OpenFs {
                 let key = BlockNumber(canonical);
                 // Lock-free hot-inode fast path: a single-file read stream hits
                 // the same `canonical` every read; serve it from the ArcSwap slot
-                // (no shard Mutex) when it matches. `load()` is a cheap arc-swap
-                // guard (no global refcount bump on the fast path); we clone only
-                // the inner entry Arc on a hit.
-                // Hold the arc_swap Guard and BORROW the entry Arc straight out
-                // on a hit, instead of `Arc::clone`-ing it per read — same
-                // lock-free-access tuning as the ext4 hot-inode/hot-parent slots
-                // (measured ~1.24x on lookup-bench, 31c57895). The Guard keeps
-                // the slot alive for the borrow; the entry is only borrowed
-                // (`&entry.1` for the window filter, `entry.0` copied out).
+                // (no shard Mutex) when it matches. The selected window retains
+                // the entry Arc across read assembly, then borrows extent data
+                // from it — one cheap refcount operation, never an inline-payload
+                // clone.
                 let hot = self.btrfs_hot_inode_extents.load();
                 let entry_storage;
                 let entry: &Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)> = match hot.as_ref()
@@ -11940,7 +11972,10 @@ impl OpenFs {
                     }
                 };
                 let read_end = offset.saturating_add(u64::from(size));
-                let exts = Self::btrfs_filter_window_extents(&entry.1, offset, read_end)?;
+                let exts = BtrfsReadExtents::Cached {
+                    entry: Arc::clone(entry),
+                    indices: Self::btrfs_window_extent_indices(&entry.1, offset, read_end)?,
+                };
                 (entry.0, exts)
             } else {
                 // Bound the on-disk walk to the read window on BOTH edges so a
@@ -12014,7 +12049,7 @@ impl OpenFs {
                             .map_err(|e| parse_to_ffs_error(&e))
                     })
                     .collect::<Result<_, _>>()?;
-                (inode, exts)
+                (inode, BtrfsReadExtents::Owned(exts))
             };
 
         match Self::btrfs_mode_to_file_type(inode.mode) {
@@ -12075,7 +12110,7 @@ impl OpenFs {
                 .filter(|s| *s != 0)
                 .ok_or_else(|| FfsError::Format("invalid btrfs sectorsize".into()))?;
             let csum_items = self.btrfs_read_csum_items(cx)?;
-            for (logical_start, extent) in &extents {
+            for (logical_start, extent) in extents.iter() {
                 let BtrfsExtentData::Regular {
                     extent_type,
                     disk_bytenr,
@@ -12199,7 +12234,7 @@ impl OpenFs {
                             })?;
                         jobs.push(BtrfsReadJob::Inline {
                             idx,
-                            data: data.clone(),
+                            data,
                             comp: *compression,
                             ram,
                         });
@@ -12431,7 +12466,7 @@ impl OpenFs {
                             ram,
                         } => (
                             idx,
-                            Self::btrfs_decompress(&data, comp, ram)
+                            Self::btrfs_decompress(data, comp, ram)
                                 .map(BtrfsDeferredReadResult::Bytes),
                         ),
                         BtrfsReadJob::ReadCompressed {
@@ -59395,10 +59430,10 @@ mod tests {
         );
     }
 
-    /// bd-vpypn: the window rule and the copying filter must select the same
-    /// extents, and the inline case must be visible as the copy it is.
+    /// bd-vpypn: windowed immutable-cache reads select a contiguous run and
+    /// borrow inline payload bytes from their backing cache.
     #[test]
-    fn btrfs_window_extent_selection_agrees_and_inline_is_a_deep_copy_bd_vpypn() {
+    fn btrfs_window_extent_selection_borrows_inline_payload_bd_vpypn() {
         let regular = |ram: u64| ffs_btrfs::BtrfsExtentData::Regular {
             generation: 1,
             ram_bytes: ram,
@@ -59411,11 +59446,12 @@ mod tests {
         };
         // Sorted, non-overlapping, with a gap between 8192 and 16384 so a read
         // landing in the hole exercises the lower-bound skip.
-        let rows: Vec<(u64, ffs_btrfs::BtrfsExtentData)> = vec![
+        let rows: Arc<[(u64, ffs_btrfs::BtrfsExtentData)]> = vec![
             (0, regular(4096)),
             (4096, regular(4096)),
             (16384, regular(4096)),
-        ];
+        ]
+        .into();
 
         for (offset, end) in [
             (0_u64, 4096_u64), // exactly the first extent
@@ -59427,17 +59463,20 @@ mod tests {
             (99999, 100_000),  // beyond every extent
         ] {
             let indices = OpenFs::btrfs_window_extent_indices(&rows, offset, end).unwrap();
-            let filtered = OpenFs::btrfs_filter_window_extents(&rows, offset, end).unwrap();
+            let selected = BtrfsReadExtents::ReadPlan {
+                rows: Arc::clone(&rows),
+                indices: indices.clone(),
+            };
             assert_eq!(
                 indices.len(),
-                filtered.len(),
-                "window [{offset}, {end}) selects a different count by index than by clone"
+                selected.len(),
+                "window [{offset}, {end}) selects a different count by index than by borrowed read"
             );
-            for (i, (logical_start, extent)) in indices.iter().zip(filtered.iter()) {
+            for (i, (logical_start, extent)) in indices.iter().zip(selected.iter()) {
                 assert_eq!(rows[*i].0, *logical_start);
                 assert_eq!(
                     &rows[*i].1, extent,
-                    "index and clone disagree on the extent"
+                    "index and borrowed read disagree on the extent"
                 );
             }
             // Selection must be a CONTIGUOUS run — that is what licenses stopping
@@ -59447,11 +59486,11 @@ mod tests {
             }
         }
 
-        // THE COST THIS SHAPE EXISTS TO EXPOSE. A Regular extent is all scalars,
-        // but an Inline extent owns the file's bytes, so the filter's clone is a
-        // deep copy of the payload on EVERY read of a small file.
+        // The performance contract: an Inline extent owns the file's bytes, so
+        // the selected read must borrow them from the immutable cache, not clone
+        // them before copying the requested bytes into the caller's output.
         let payload = vec![0xAB_u8; 2048];
-        let inline_rows: Vec<(u64, ffs_btrfs::BtrfsExtentData)> = vec![(
+        let inline_rows: Arc<[(u64, ffs_btrfs::BtrfsExtentData)]> = vec![(
             0,
             ffs_btrfs::BtrfsExtentData::Inline {
                 generation: 1,
@@ -59459,29 +59498,41 @@ mod tests {
                 compression: 0,
                 data: payload.clone(),
             },
-        )];
-        let selected = OpenFs::btrfs_filter_window_extents(&inline_rows, 0, 2048).unwrap();
+        )]
+        .into();
+        let selected = BtrfsReadExtents::ReadPlan {
+            rows: Arc::clone(&inline_rows),
+            indices: OpenFs::btrfs_window_extent_indices(&inline_rows, 0, 2048).unwrap(),
+        };
         assert_eq!(selected.len(), 1);
-        match (&inline_rows[0].1, &selected[0].1) {
+        match (&inline_rows[0].1, selected.iter().next().unwrap().1) {
             (
                 ffs_btrfs::BtrfsExtentData::Inline { data: original, .. },
-                ffs_btrfs::BtrfsExtentData::Inline { data: copied, .. },
+                ffs_btrfs::BtrfsExtentData::Inline { data: borrowed, .. },
             ) => {
-                assert_eq!(original, copied, "the copy must be faithful");
-                assert_ne!(
+                assert_eq!(original, borrowed, "the borrowed payload must be faithful");
+                assert_eq!(
                     original.as_ptr(),
-                    copied.as_ptr(),
-                    "and it IS a separate allocation - this is the per-read payload copy \
-                     that returning indices would let a borrowing caller avoid"
+                    borrowed.as_ptr(),
+                    "the read-window iterator must retain the cache allocation"
+                );
+                let job = BtrfsReadJob::Inline {
+                    idx: 0,
+                    data: borrowed,
+                    comp: 0,
+                    ram: borrowed.len(),
+                };
+                let BtrfsReadJob::Inline { data, .. } = job else {
+                    unreachable!("constructed inline job")
+                };
+                assert_eq!(
+                    original.as_ptr(),
+                    data.as_ptr(),
+                    "the deferred inline read job must keep borrowing the cached payload"
                 );
             }
             _ => panic!("expected two inline extents"),
         }
-        // The index form selects the same extent without copying anything.
-        assert_eq!(
-            OpenFs::btrfs_window_extent_indices(&inline_rows, 0, 2048).unwrap(),
-            vec![0]
-        );
     }
 
     /// bd-5vis3: the memo's marginal cost must be the refcount, not the block.
