@@ -141,3 +141,141 @@ fn btrfs_create_batch_threshold_probe_bd_giw9n() {
         .unwrap_or(1024);
     create_batch_and_remount(count, size_mb);
 }
+
+/// bd-a136s: a full initial metadata chunk is not the end of a btrfs device.
+///
+/// The control arm is deliberately non-vacuous: it fills a small, single-device
+/// image until the ordinary (growth-disabled) transaction commit returns ENOSPC.
+/// The candidate starts from a fresh image, performs exactly the same creates
+/// and data write, enables the production chunk-growth path, then must commit,
+/// pass `btrfs check`, and be readable through the kernel btrfs driver.
+///
+/// This is ignored because it intentionally writes enough metadata to exhaust a
+/// real chunk and requires passwordless sudo for the kernel mount. Run it on the
+/// live builder with `--ignored --exact`; do not reduce CREATE_COUNT merely to
+/// make a green test, since that would make the ENOSPC control vacuous.
+#[test]
+#[ignore = "bd-a136s: requires sudo + btrfs-progs and deliberately exhausts a metadata chunk"]
+fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
+    const IMAGE_MIB: u64 = 128;
+    const CREATE_COUNT: u32 = 60_000;
+    const SENTINEL: &[u8] = b"bd-a136s chunk growth kernel readback\n";
+
+    let sudo = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .output()
+        .expect("run sudo availability probe");
+    if !sudo.status.success() {
+        eprintln!("passwordless sudo unavailable; skipping bd-a136s kernel gate");
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().expect("tmpdir");
+    let Some(control_image) = mkfs_btrfs_image(tmp.path(), IMAGE_MIB) else {
+        eprintln!("btrfs-progs unavailable; skipping bd-a136s kernel gate");
+        return;
+    };
+    let candidate_image = tmp.path().join("a136s-growth.btrfs");
+    std::fs::copy(&control_image, &candidate_image).expect("copy fresh btrfs fixture");
+    let cx = Cx::for_testing();
+
+    let populate = |fs: &OpenFs| {
+        for i in 0..CREATE_COUNT {
+            fs.create(
+                &cx,
+                BTRFS_ROOT_DIR,
+                OsStr::new(&format!("fill{i:05}.dat")),
+                0o644,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("create fill{i:05}.dat failed: {error}"));
+        }
+        let sentinel = fs
+            .create(
+                &cx,
+                BTRFS_ROOT_DIR,
+                OsStr::new("growth-sentinel"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create kernel-readback sentinel");
+        fs.write(&cx, sentinel.ino, 0, SENTINEL)
+            .expect("write kernel-readback sentinel");
+    };
+
+    {
+        let control = open_rw(&cx, &control_image).expect("open growth-disabled control");
+        assert!(
+            !control.btrfs_grow_chunks_enabled(),
+            "the control must exercise the shipping-disabled growth policy"
+        );
+        populate(&control);
+        let error = FsOps::flush_on_destroy(&control, &cx)
+            .expect_err("fixture must exhaust the initial metadata chunk with growth disabled");
+        assert_eq!(
+            error.to_errno(),
+            libc::ENOSPC,
+            "the control must fail specifically with ENOSPC, got {error}"
+        );
+    }
+
+    {
+        let candidate = open_rw(&cx, &candidate_image).expect("open growth-enabled candidate");
+        candidate.set_btrfs_grow_chunks(true);
+        populate(&candidate);
+        FsOps::flush_on_destroy(&candidate, &cx)
+            .expect("chunk growth must make the identical workload commit");
+    }
+
+    let check = std::process::Command::new("btrfs")
+        .args(["check", candidate_image.to_str().unwrap()])
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        check.status.success(),
+        "btrfs check must accept the grown image:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let mountpoint = tmp.path().join("kernel-mnt");
+    std::fs::create_dir(&mountpoint).expect("create kernel mountpoint");
+    let mounted = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "mount",
+            "-t",
+            "btrfs",
+            "-o",
+            "ro,loop",
+            candidate_image.to_str().unwrap(),
+            mountpoint.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mount grown image with kernel btrfs");
+    assert!(
+        mounted.status.success(),
+        "kernel btrfs must mount the grown image:\n{}{}",
+        String::from_utf8_lossy(&mounted.stdout),
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+
+    let sentinel = std::fs::read(mountpoint.join("growth-sentinel"));
+    let unmounted = std::process::Command::new("sudo")
+        .args(["-n", "umount", mountpoint.to_str().unwrap()])
+        .output()
+        .expect("unmount kernel btrfs image");
+    assert!(
+        unmounted.status.success(),
+        "kernel btrfs mount must unmount cleanly:\n{}{}",
+        String::from_utf8_lossy(&unmounted.stdout),
+        String::from_utf8_lossy(&unmounted.stderr)
+    );
+    let sentinel = sentinel.expect("kernel must read the grown image's sentinel");
+    assert_eq!(
+        sentinel, SENTINEL,
+        "kernel readback must preserve written bytes"
+    );
+}
