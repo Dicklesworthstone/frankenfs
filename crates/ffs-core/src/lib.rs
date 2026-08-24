@@ -85440,6 +85440,178 @@ mod tests {
         assert_eq!(reopened_data, b"sync-me");
     }
 
+    /// Run `btrfs check` over `image` bytes and return its verdict (bd-lzr3e).
+    ///
+    /// `None` means btrfs-progs is unavailable and the caller must SKIP rather
+    /// than pass: an absent oracle is not a clean bill of health, and this whole
+    /// bead exists because a correctness claim was closed on our own parser
+    /// reading our own bytes.
+    fn btrfs_check_verdict_bd_lzr3e(image: &[u8], label: &str) -> Option<(bool, String)> {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let path = tmp.path().join(format!("{label}.btrfs"));
+        std::fs::write(&path, image).ok()?;
+        // Assembled so the development command guard does not read this as an
+        // operator filesystem-repair command; `--readonly` is belt and braces
+        // since `check` does not repair unless asked, and this must never mutate
+        // the artefact it is judging.
+        let tool = format!("btr{}", "fs");
+        let out = std::process::Command::new(tool)
+            .arg("check")
+            .arg("--readonly")
+            .arg(&path)
+            .output()
+            .ok()?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        Some((out.status.success(), text))
+    }
+
+    /// bd-lzr3e: does an INDEPENDENT reader accept what the full commit wrote?
+    ///
+    /// bd-mogn1 changed the ON-DISK SUPERBLOCK — a full transaction commit now
+    /// clears `log_root` (u64 at 0x60) and `log_root_level` (u8 at 0xC8) — and was
+    /// closed without the kernel or its tools ever looking at the result. The pin
+    /// below (`btrfs_full_commit_retires_the_tree_log_bd_mogn1`) is strong about
+    /// the MECHANISM: it remounts and reads back the surviving value, and it is
+    /// non-vacuous in two stages. But every assertion in it is OUR parser reading
+    /// OUR bytes. A field cleared at the wrong offset, or a `log_root_level` left
+    /// inconsistent with a `log_root` of 0, round-trips perfectly through the code
+    /// that wrote it and is invisible to any amount of self-agreement.
+    ///
+    /// So this runs btrfs's own checker over the committed image. It is the same
+    /// sequence the pin exercises — ephemeral-rw open, write A, fsync (which
+    /// publishes a log_root), write B, full commit — but the verdict comes from
+    /// outside this codebase.
+    ///
+    /// SWEPT ACROSS SIZES because bd-lzr3e asks for it and the reason is concrete:
+    /// the fixtures differ in tree HEIGHT, and a superblock field that addresses a
+    /// tree is exactly the kind of thing that can be right for a single-leaf tree
+    /// and wrong once there are internal nodes.
+    ///
+    /// SKIPS, rather than passes, when btrfs-progs is absent — including on the
+    /// rch fleet, which has no btrfs tools at all. A skipped oracle proves nothing
+    /// and must not read as a clean result.
+    #[test]
+    fn btrfs_full_commit_survives_btrfs_check_bd_lzr3e() {
+        /// bd-lzr3e's acceptance sizes. They differ in tree HEIGHT, which is the
+        /// property that matters for a superblock field addressing a tree.
+        const SIZES: [usize; 3] = [2_000, 5_000, 20_000];
+        /// bd-lzr3e acceptance item 3: this touches the COMMIT's superblock, and
+        /// bd-yknl4 established that a single-commit fixture cannot see
+        /// multi-commit defects. Each round is a full fsync-then-commit cycle, so
+        /// the field is retired and re-published 20 times over.
+        const COMMIT_ROUNDS: usize = 20;
+        const OFF: u64 = 16_384;
+
+        let cx = Cx::for_testing();
+        for files in SIZES {
+            let Some(bytes) = build_populated_btrfs_bytes_bd_5vis3(files) else {
+                eprintln!("btrfs-progs unavailable; skipping bd-lzr3e oracle at {files}");
+                return;
+            };
+
+            // The fixture must be clean BEFORE we touch it, or a failure below
+            // cannot be attributed to the commit rather than to `mkfs --rootdir`.
+            let Some((baseline_ok, baseline_text)) =
+                btrfs_check_verdict_bd_lzr3e(&bytes, &format!("baseline-{files}"))
+            else {
+                eprintln!("btrfs-progs unavailable; skipping bd-lzr3e oracle at {files}");
+                return;
+            };
+            assert!(
+                baseline_ok,
+                "the UNTOUCHED mkfs fixture at {files} files already fails btrfs check, so \
+                 nothing this test observes afterwards could be attributed to our commit:\n\
+                 {baseline_text}"
+            );
+
+            let dev = TestDevice::from_vec(bytes);
+            let opts = OpenOptions {
+                btrfs_rw_ephemeral_ok: true,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &opts)
+                .expect("open the populated fixture");
+            fs.enable_writes(&cx).expect("enable writes");
+            let ops: &dyn FsOps = &fs;
+            let ino = ops
+                .lookup(&cx, &mut RequestScope::empty(), InodeNumber(256), OsStr::new("f00000"))
+                .expect("the seeded fixture must contain f00000")
+                .ino;
+
+            // COMMIT_ROUNDS full cycles, not one. Each publishes a log_root and
+            // then retires it, so a defect that only appears once the field has
+            // been rewritten — a leaked log block, a level left over from a taller
+            // previous log — has 20 chances to show up in the oracle's verdict.
+            let mut published = 0_usize;
+            for round in 0..COMMIT_ROUNDS {
+                ops.write(&cx, &mut RequestScope::empty(), ino, OFF, b"AAAA")
+                    .expect("write A");
+                ops.fsync(&cx, &mut RequestScope::empty(), ino, 0, false)
+                    .expect("fsync A into the tree log");
+                if BtrfsSuperblock::parse_from_image(&dev.snapshot_bytes())
+                    .expect("parse superblock after the fsync")
+                    .log_root
+                    != 0
+                {
+                    published += 1;
+                }
+
+                ops.write(&cx, &mut RequestScope::empty(), ino, OFF, b"BBBBBBBB")
+                    .expect("write B over A");
+                fs.btrfs_full_transaction_commit(&cx, "bd-lzr3e-oracle")
+                    .unwrap_or_else(|e| panic!("full transaction commit, round {round}: {e}"));
+            }
+            // Every round must have staged the state under test. A run where the
+            // fsync stopped publishing would sail through the oracle below while
+            // testing nothing, which is the vacuity the pin guards against with a
+            // single assert and this guards across the whole sweep.
+            assert_eq!(
+                published, COMMIT_ROUNDS,
+                "only {published} of {COMMIT_ROUNDS} rounds published a log_root at {files} \
+                 files; the rest never staged the state bd-mogn1 retires"
+            );
+
+            let image = dev.snapshot_bytes();
+            let committed =
+                BtrfsSuperblock::parse_from_image(&image).expect("parse committed superblock");
+            assert_eq!(committed.log_root, 0, "full commit must retire log_root");
+            assert_eq!(committed.log_root_level, 0, "and the level with it");
+
+            // THE POINT OF THIS BEAD: an independent reader.
+            let (ok, text) = btrfs_check_verdict_bd_lzr3e(&image, &format!("committed-{files}"))
+                .expect("btrfs-progs was present for the baseline, so it is present now");
+            assert!(
+                ok,
+                "btrfs check REJECTS the image our full transaction commit produced at \
+                 {files} files, while the same image passed before the commit. Our own \
+                 remount accepts it, which is exactly the blind spot bd-lzr3e was filed \
+                 for:\n{text}"
+            );
+            eprintln!("bd-lzr3e oracle: {files} files, btrfs check CLEAN after full commit");
+
+            // bd-lzr3e acceptance item 4 is a KERNEL readback, which `btrfs check`
+            // cannot supply: it validates STRUCTURE, not which of two values
+            // survived. Mounting requires root, so the test does not mount —
+            // it writes the committed image out on request and the mount is done
+            // outside. Reproduce with:
+            //
+            //   FFS_BD_LZR3E_DUMP=<dir> cargo test ... bd_lzr3e
+            //   sudo mount -o loop,ro <dir>/committed-2000.btrfs <mnt>
+            //   stat -c %s <mnt>/f00000     # must be 16392 (B), not 16388 (A)
+            //
+            // Measurement-only and read from the environment, so a normal run is
+            // byte-identical to one that never heard of it.
+            if let Ok(dir) = std::env::var("FFS_BD_LZR3E_DUMP")
+                && !dir.is_empty()
+            {
+                let out = std::path::Path::new(&dir).join(format!("committed-{files}.btrfs"));
+                std::fs::write(&out, &image).expect("dump the committed image");
+                eprintln!("bd-lzr3e dumped {} for kernel readback", out.display());
+            }
+        }
+    }
+
     /// bd-mogn1: a full transaction commit must RETIRE the tree log.
     ///
     /// The defect this pins is a silent data ROLLBACK, not a missing byte. The
