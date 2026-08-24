@@ -6960,7 +6960,36 @@ pub struct MountHandle {
     mountpoint: PathBuf,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     metrics: Arc<AtomicMetrics>,
+    per_core_metrics: Option<Arc<fuser::PerCoreMetrics>>,
     config: MountConfig,
+}
+
+/// Snapshot of the queues that actually routed a per-core FUSE mount.
+///
+/// These counters are deliberately separate from [`per_core::PerCoreDispatcher`]:
+/// the latter is an advisory in-process dispatcher, whereas these are owned by
+/// fuser's CPU-keyed transport queues.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerCoreTransportMetrics {
+    /// CPUs selected for the transport lanes.
+    pub cpus: Vec<usize>,
+    /// Requests executed by each lane.
+    pub requests: Vec<u64>,
+    /// Requests stolen away from each source lane.
+    pub stolen_from: Vec<u64>,
+    /// Requests stolen by each destination lane.
+    pub stolen_to: Vec<u64>,
+}
+
+impl From<fuser::PerCoreMetricsSnapshot> for PerCoreTransportMetrics {
+    fn from(snapshot: fuser::PerCoreMetricsSnapshot) -> Self {
+        Self {
+            cpus: snapshot.cpus,
+            requests: snapshot.requests,
+            stolen_from: snapshot.stolen_from,
+            stolen_to: snapshot.stolen_to,
+        }
+    }
 }
 
 impl MountHandle {
@@ -6990,6 +7019,26 @@ impl MountHandle {
     /// Returns the final metrics snapshot.
     #[must_use]
     pub fn wait(mut self) -> MetricsSnapshot {
+        self.wait_for_shutdown();
+        self.do_unmount()
+    }
+
+    /// Wait for shutdown and return metrics from the real per-core transport,
+    /// when this handle was mounted through [`mount_managed_per_core`].
+    #[must_use]
+    pub fn wait_with_per_core_metrics(
+        mut self,
+    ) -> (MetricsSnapshot, Option<PerCoreTransportMetrics>) {
+        self.wait_for_shutdown();
+        let metrics = self.do_unmount();
+        let per_core_metrics = self
+            .per_core_metrics
+            .as_ref()
+            .map(|metrics| PerCoreTransportMetrics::from(metrics.snapshot()));
+        (metrics, per_core_metrics)
+    }
+
+    fn wait_for_shutdown(&self) {
         info!(mountpoint = %self.mountpoint.display(), "waiting for shutdown signal");
         loop {
             if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -7010,7 +7059,6 @@ impl MountHandle {
             }
             std::thread::sleep(MOUNT_HANDLE_WAIT_POLL_INTERVAL);
         }
-        self.do_unmount()
     }
 
     /// Trigger a graceful unmount.
@@ -7141,6 +7189,52 @@ pub fn mount_managed(
         mountpoint: mountpoint.to_owned(),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics: metrics_ref,
+        per_core_metrics: None,
+        config: config.clone(),
+    })
+}
+
+/// Mount a FrankenFS filesystem with lifecycle control and CPU-keyed request
+/// queues. Idle lanes steal only requests that are independent of an active
+/// file handle, so same-handle order is preserved by fuser's transport layer.
+pub fn mount_managed_per_core(
+    ops: Box<dyn FsOps>,
+    mountpoint: impl AsRef<Path>,
+    config: &MountConfig,
+) -> Result<MountHandle, FuseError> {
+    validate_mount_options(&config.options)?;
+    let mountpoint = mountpoint.as_ref();
+    validate_mountpoint(mountpoint)?;
+
+    let thread_count = config.options.resolved_thread_count();
+    if thread_count < 2 {
+        return Err(FuseError::Io(std::io::Error::other(
+            "per-core FUSE routing requires at least two worker threads",
+        )));
+    }
+
+    let fuse_opts = build_mount_options(&config.options);
+    let fs = FrankenFuse::with_mount_config(ops, Some(mountpoint), config);
+    resolve_xattr_suppression(&fs);
+    let metrics_ref = Arc::clone(&fs.inner.metrics);
+    let notifier_owner = fs.shared_handle();
+    let session =
+        fuser::spawn_mount2_with_per_core_workers(fs, mountpoint, &fuse_opts, thread_count)?;
+    let per_core_metrics = session.per_core_metrics();
+    notifier_owner.install_kernel_notifier(session.notifier());
+
+    info!(
+        mountpoint = %mountpoint.display(),
+        thread_count,
+        "per-core FUSE mount active"
+    );
+
+    Ok(MountHandle {
+        session: Some(session),
+        mountpoint: mountpoint.to_owned(),
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        metrics: metrics_ref,
+        per_core_metrics,
         config: config.clone(),
     })
 }
@@ -20581,6 +20675,41 @@ mod tests {
     }
 
     #[test]
+    fn mount_managed_per_core_rejects_one_worker_before_session_spawn() {
+        let config = MountConfig {
+            options: MountOptions {
+                worker_threads: 1,
+                ..MountOptions::default()
+            },
+            ..MountConfig::default()
+        };
+        let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
+        let err = mount_managed_per_core(ops, "/tmp", &config)
+            .expect_err("one worker cannot provide a CPU-keyed work-stealing transport");
+
+        assert!(
+            err.to_string()
+                .contains("requires at least two worker threads"),
+            "the per-core path must reject before allocating a FUSE session: {err}"
+        );
+    }
+
+    #[test]
+    fn per_core_transport_metrics_preserve_each_scheduler_lane() {
+        let metrics = PerCoreTransportMetrics::from(fuser::PerCoreMetricsSnapshot {
+            cpus: vec![3, 11],
+            requests: vec![7, 4],
+            stolen_from: vec![2, 0],
+            stolen_to: vec![0, 2],
+        });
+
+        assert_eq!(metrics.cpus, vec![3, 11]);
+        assert_eq!(metrics.requests, vec![7, 4]);
+        assert_eq!(metrics.stolen_from, vec![2, 0]);
+        assert_eq!(metrics.stolen_to, vec![0, 2]);
+    }
+
+    #[test]
     fn mount_handle_shutdown_flag_lifecycle() {
         // Build a MountHandle manually (without a real FUSE session) to
         // exercise the shutdown flag + metrics plumbing.
@@ -20594,6 +20723,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/test"),
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::clone(&metrics),
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
 
@@ -20645,6 +20775,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/dbg"),
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(AtomicMetrics::new()),
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
         let dbg = format!("{handle:?}");
@@ -20659,6 +20790,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/drop"),
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(AtomicMetrics::new()),
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
         drop(handle);
@@ -20677,6 +20809,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/wait"),
             shutdown: Arc::clone(&shutdown),
             metrics,
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
 
@@ -20747,6 +20880,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/timeout"),
             shutdown: Arc::clone(&shutdown),
             metrics: Arc::new(AtomicMetrics::new()),
+            per_core_metrics: None,
             config: config.clone(),
         };
 

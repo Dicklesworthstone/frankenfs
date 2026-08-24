@@ -102,9 +102,13 @@ struct PerCoreLane {
 /// Immutable counters exported from the real per-core transport scheduler.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PerCoreMetricsSnapshot {
+    /// CPU identifier for each scheduler lane.
     pub cpus: Vec<usize>,
+    /// Requests executed by each scheduler lane.
     pub requests: Vec<u64>,
+    /// Requests stolen away from each source lane.
     pub stolen_from: Vec<u64>,
+    /// Requests stolen by each destination lane.
     pub stolen_to: Vec<u64>,
 }
 
