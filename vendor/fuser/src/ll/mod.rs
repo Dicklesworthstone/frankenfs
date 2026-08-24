@@ -271,7 +271,7 @@ impl From<Generation> for u64 {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use std::io::IoSlice;
     use std::ops::{Deref, DerefMut};
     /// If we want to be able to cast bytes to our fuse C struct types we need it

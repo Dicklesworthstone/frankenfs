@@ -32,6 +32,90 @@ pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 /// up to MAX_WRITE_SIZE bytes in a write request, we use that value plus some extra space.
 const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 
+/// One dispatch-gate slot, padded to its own cache line.
+///
+/// The padding is the whole point: an unpadded `RwLock<()>` array would put
+/// several workers' lock words in one line and reintroduce exactly the
+/// coherence traffic this type exists to remove.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub(crate) struct DispatchSlot(RwLock<()>);
+
+/// Per-worker dispatch gate — a "big reader" lock (bd-svhrq).
+///
+/// # Why not one `RwLock`
+///
+/// The previous gate was a single `RwLock<()>`: every concurrency-safe request
+/// on every worker took `read()` on ONE lock word, so N dispatch workers
+/// ping-ponged one cache line on the hot path of a metadata workload whose
+/// requests are ~100% shared-set. The exclusion the gate provides was never the
+/// problem; the shared word was.
+///
+/// # The replacement, and why it is semantically identical
+///
+/// One slot per worker. A shared acquisition takes only *its own* worker's
+/// slot, so two readers never contend and a reader's lock word is private to
+/// its thread. An exclusive acquisition takes *every* slot, so it still
+/// excludes every concurrent request exactly as the single lock did:
+///
+/// * reader ∥ reader — different slots, no interaction (was: same word).
+/// * reader ∥ writer — the writer holds that reader's slot, so they exclude.
+/// * writer ∥ writer — both take all slots, so they exclude.
+///
+/// The exclusion SET is unchanged. Only the cost of the common case moved.
+///
+/// # Deadlock argument
+///
+/// Writers acquire slots in ascending index order, so two writers cannot form
+/// an AB-BA cycle. A reader holds at most one slot and never blocks on a
+/// second, so no reader can be part of a cycle either. A writer blocked at
+/// slot `i` therefore waits only on readers, which always make progress.
+#[derive(Debug)]
+pub(crate) struct DispatchGate {
+    slots: Box<[DispatchSlot]>,
+}
+
+impl DispatchGate {
+    /// Build a gate with one slot per dispatch worker (at least one).
+    pub(crate) fn new(worker_count: usize) -> Self {
+        let slots = (0..worker_count.max(1))
+            .map(|_| DispatchSlot::default())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { slots }
+    }
+
+    /// Take this worker's slot shared. Concurrency-safe requests only.
+    ///
+    /// `worker` is reduced modulo the slot count rather than asserted, because
+    /// an out-of-range index must degrade to "shares a slot with someone" — a
+    /// performance loss — and never to a missing exclusion.
+    fn shared(&self, worker: usize) -> std::sync::RwLockReadGuard<'_, ()> {
+        let slot = &self.slots[worker % self.slots.len()];
+        slot.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Take every slot exclusively, in ascending index order.
+    fn exclusive(&self) -> Vec<std::sync::RwLockWriteGuard<'_, ()>> {
+        self.slots
+            .iter()
+            .map(|slot| {
+                slot.0
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect()
+    }
+
+    /// Number of slots, i.e. the worker count this gate was built for.
+    #[cfg(test)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 /// How requests should be filtered based on the calling UID.
 pub enum SessionACL {
@@ -75,7 +159,13 @@ pub struct Session<FS: Filesystem> {
     /// Reader/writer gate used by [`Session::run_with_workers`]: concurrency-safe
     /// requests take it shared, everything else takes it exclusively. `None`
     /// (the default) means single-threaded dispatch and costs nothing.
-    pub(crate) dispatch_gate: Option<Arc<RwLock<()>>>,
+    pub(crate) dispatch_gate: Option<Arc<DispatchGate>>,
+    /// Index of this session clone among the dispatch workers (bd-svhrq).
+    ///
+    /// Selects which [`DispatchGate`] slot the shared path takes, so two workers
+    /// never touch the same lock word on the hot path. The mount-owning session
+    /// is worker 0; `run_with_workers` hands out 1..N.
+    pub(crate) dispatch_worker: usize,
     /// Request FUSE-over-io_uring during the INIT handshake.
     pub(crate) io_uring_requested: bool,
     /// The kernel accepted FUSE-over-io_uring for this connection.
@@ -139,6 +229,7 @@ impl<FS: Filesystem> Session<FS> {
             destroy_on_drop: true,
             dispatch_lock: None,
             dispatch_gate: None,
+            dispatch_worker: 0,
             io_uring_requested: false,
             io_uring_negotiated: false,
             io_uring_payload_size: 0,
@@ -163,6 +254,7 @@ impl<FS: Filesystem> Session<FS> {
             destroy_on_drop: true,
             dispatch_lock: None,
             dispatch_gate: None,
+            dispatch_worker: 0,
             io_uring_requested: false,
             io_uring_negotiated: false,
             io_uring_payload_size: 0,
@@ -180,12 +272,10 @@ impl<FS: Filesystem> Session<FS> {
             return req.dispatch(self);
         };
         if req.is_concurrency_safe() {
-            let _shared = gate.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _shared = gate.shared(self.dispatch_worker);
             req.dispatch(self);
         } else {
-            let _exclusive = gate
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _exclusive = gate.exclusive();
             req.dispatch(self);
         }
     }
@@ -234,7 +324,9 @@ impl<FS: Filesystem> Session<FS> {
     /// can be in flight at once instead of one. Requests are still ordered
     /// against each other by [`Session::dispatch_request`]'s reader/writer
     /// gate: concurrency-safe reads run in parallel, and everything else keeps
-    /// the whole-session exclusion of the single-threaded loop.
+    /// the whole-session exclusion of the single-threaded loop. The gate is
+    /// per-worker ([`DispatchGate`]), so the shared path costs each worker one
+    /// uncontended lock on a private cache line rather than a shared word.
     ///
     /// INIT is always handled on this thread before any worker starts, so the
     /// worker clones inherit a fully negotiated session.
@@ -256,12 +348,13 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
 
-        self.dispatch_gate = Some(Arc::new(RwLock::new(())));
+        self.dispatch_gate = Some(Arc::new(DispatchGate::new(worker_count)));
+        self.dispatch_worker = 0;
         info!("FUSE dispatch workers: {worker_count}");
         thread::scope(|scope| {
             let mut workers = Vec::with_capacity(worker_count - 1);
             for index in 1..worker_count {
-                let mut worker = self.worker_clone();
+                let mut worker = self.worker_clone(index);
                 workers.push(
                     thread::Builder::new()
                         .name(format!("fuse-dispatch-{index}"))
@@ -291,7 +384,7 @@ impl<FS: Filesystem> Session<FS> {
     ///
     /// The clone must never run `Filesystem::destroy` from `Drop` and must never
     /// own the mount: both belong to the session that created the connection.
-    fn worker_clone(&self) -> Self
+    fn worker_clone(&self, dispatch_worker: usize) -> Self
     where
         FS: Clone,
     {
@@ -309,6 +402,7 @@ impl<FS: Filesystem> Session<FS> {
             destroy_on_drop: false,
             dispatch_lock: self.dispatch_lock.clone(),
             dispatch_gate: self.dispatch_gate.clone(),
+            dispatch_worker,
             io_uring_requested: self.io_uring_requested,
             io_uring_negotiated: self.io_uring_negotiated,
             io_uring_payload_size: self.io_uring_payload_size,
@@ -368,6 +462,7 @@ impl<FS: Filesystem> Session<FS> {
             destroy_on_drop: false,
             dispatch_lock: self.dispatch_lock.clone(),
             dispatch_gate: self.dispatch_gate.clone(),
+            dispatch_worker: self.dispatch_worker,
             io_uring_requested: self.io_uring_requested,
             io_uring_negotiated: self.io_uring_negotiated,
             io_uring_payload_size: self.io_uring_payload_size,
@@ -511,5 +606,126 @@ impl BackgroundSession {
 impl fmt::Debug for BackgroundSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "BackgroundSession {{ guard: JoinGuard<()> }}",)
+    }
+}
+
+#[cfg(test)]
+mod dispatch_gate_tests {
+    use super::DispatchGate;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn gate_has_one_slot_per_worker_and_never_zero() {
+        assert_eq!(DispatchGate::new(8).slot_count(), 8);
+        assert_eq!(DispatchGate::new(1).slot_count(), 1);
+        // A zero worker count must still produce a usable gate: `shared` indexes
+        // modulo the slot count and would panic on an empty slice.
+        assert_eq!(DispatchGate::new(0).slot_count(), 1);
+    }
+
+    #[test]
+    fn two_workers_take_the_shared_path_at_the_same_time() {
+        // The whole point of the per-worker gate: readers on distinct workers
+        // must not exclude each other. A single `RwLock` also passes this (read
+        // locks are shared), so this is the baseline, not the discriminator.
+        let gate = DispatchGate::new(2);
+        let first = gate.shared(0);
+        let second = gate.shared(1);
+        drop((first, second));
+    }
+
+    #[test]
+    fn exclusive_still_excludes_every_worker_slot() {
+        // THE NEGATIVE CASE. A naive per-worker gate that made `exclusive` take
+        // only the caller's own slot would leave every other worker running
+        // concurrently with a mutation — the exact bug this shape invites. Hold
+        // the exclusive guard, then prove from another thread that a shared
+        // acquisition on a DIFFERENT worker index cannot complete.
+        let gate = Arc::new(DispatchGate::new(4));
+        let entered = Arc::new(AtomicBool::new(false));
+        let guards = gate.exclusive();
+
+        let handle = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            std::thread::spawn(move || {
+                let held = gate.shared(3);
+                entered.store(true, Ordering::SeqCst);
+                drop(held);
+            })
+        };
+
+        // Give the spawned thread a real chance to acquire if the gate is broken.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            assert!(
+                !entered.load(Ordering::SeqCst),
+                "a shared acquisition on worker 3 completed while an exclusive \
+                 guard was held: exclusive() is not covering every slot"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(guards);
+        handle.join().expect("shared waiter panicked");
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the shared waiter never made progress after the exclusive guard was released"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_deadlock_against_concurrent_readers() {
+        // Writers take all slots in ascending order and readers take exactly one,
+        // so no cycle is possible. Exercised under contention with a watchdog:
+        // an ordering mistake here hangs a mount rather than slowing it.
+        let gate = Arc::new(DispatchGate::new(4));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for worker in 0..4 {
+            let gate = Arc::clone(&gate);
+            let reads = Arc::clone(&reads);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    let held = gate.shared(worker);
+                    reads.fetch_add(1, Ordering::Relaxed);
+                    drop(held);
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let gate = Arc::clone(&gate);
+            let writes = Arc::clone(&writes);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let held = gate.exclusive();
+                    writes.fetch_add(1, Ordering::Relaxed);
+                    drop(held);
+                }
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for handle in handles {
+            assert!(
+                Instant::now() < deadline,
+                "dispatch gate contention exceeded its watchdog: suspect a lock cycle"
+            );
+            handle.join().expect("gate contender panicked");
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 8_000);
+        assert_eq!(writes.load(Ordering::Relaxed), 1_000);
+    }
+
+    #[test]
+    fn an_out_of_range_worker_index_shares_a_slot_rather_than_panicking() {
+        // Degrades to contention, never to a missing exclusion.
+        let gate = DispatchGate::new(2);
+        let held = gate.shared(9);
+        drop(held);
     }
 }
