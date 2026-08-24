@@ -577,6 +577,9 @@ struct Config {
     fuse_workers: Option<usize>,
     /// Whether btrfs FUSE mounts verify data checksums on reads.
     btrfs_verify_data_on_read: bool,
+    /// Explicitly permit a non-PGO candidate for a remeasurement that records
+    /// non-production provenance. The default remains the production PGO gate.
+    allow_non_pgo_candidate: bool,
     /// Second candidate configuration mounted in the same window (bd-3tqgc).
     ///
     /// Omitted keeps the banked four-arm shape byte for byte. When present the
@@ -694,6 +697,7 @@ impl Default for Config {
             fuse_cpu_count: DEFAULT_FUSE_CPUS,
             fuse_workers: None,
             btrfs_verify_data_on_read: true,
+            allow_non_pgo_candidate: false,
             candidate_comparison: None,
             placement_scope: PlacementScope::SameLlc,
             host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
@@ -1156,6 +1160,8 @@ struct FfsBinaryIdentity {
     pgo_profile_sha256: String,
 }
 
+const NON_PGO_PROFILE_SENTINEL: &str = "none";
+
 /// Everything a mounted FUSE daemon reports about itself at startup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FfsMountSelfReport {
@@ -1460,6 +1466,8 @@ is a transport it pays and we otherwise do not (bd-w2u82)\n\
                                           start with FFS_)\n\
            --candidate-aa                 Same six-arm shape with IDENTICAL candidate\n\
                                           configurations: the estimator's own A/A null control\n\
+           --allow-non-pgo-candidate      Explicitly allow a non-PGO candidate and record it as
+                                          non-production; the default PGO gate is unchanged\n\
            --operations N                 Workload operations per observation (default 2000)\n\
            --client-threads N             Actual parallel-metadata worker threads (default 8)\n\
            --fuse-cpus N                  CPUs pinned to the FrankenFS daemon (default 1;\n\
@@ -1880,6 +1888,9 @@ fn apply_config_flag(
                 .candidate_comparison
                 .get_or_insert_with(CandidateComparison::default);
         }
+        "--allow-non-pgo-candidate" => {
+            config.allow_non_pgo_candidate = true;
+        }
         "--client-threads" => {
             config.client_threads = parse_value(args, index, "--client-threads")?;
             config.client_threads_explicit = true;
@@ -2120,7 +2131,7 @@ fn optional_prefixed_line<'a>(
     Ok(Some(value))
 }
 
-fn inspect_ffs_binary(path: &Path) -> Result<FfsBinaryIdentity> {
+fn inspect_ffs_binary(path: &Path, allow_non_pgo: bool) -> Result<FfsBinaryIdentity> {
     let output = Command::new(path)
         .arg("bench-evidence")
         .env("RUST_LOG", "off")
@@ -2169,7 +2180,8 @@ fn inspect_ffs_binary(path: &Path) -> Result<FfsBinaryIdentity> {
     )?
     .to_owned();
     ensure!(
-        is_sha256(&pgo_profile_sha256),
+        is_sha256(&pgo_profile_sha256)
+            || (allow_non_pgo && pgo_profile_sha256 == NON_PGO_PROFILE_SENTINEL),
         "candidate is not a PGO production build: {pgo_profile_sha256}"
     );
     Ok(FfsBinaryIdentity {
@@ -3089,7 +3101,11 @@ fn mount_kernel(
 /// knobs", because the second would be a fabricated observation.
 const UNREPORTED_RUNTIME_KNOBS: &str = "unreported_by_this_elf";
 
-fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsMountSelfReport> {
+fn parse_mount_self_report(
+    log_path: &Path,
+    knobs_required: bool,
+    allow_non_pgo: bool,
+) -> Result<FfsMountSelfReport> {
     let content = fs::read_to_string(log_path)
         .with_context(|| format!("read FUSE mount log {}", log_path.display()))?;
     let binary_sha256 = unique_prefixed_line(
@@ -3109,7 +3125,8 @@ fn parse_mount_self_report(log_path: &Path, knobs_required: bool) -> Result<FfsM
     )?
     .to_owned();
     ensure!(
-        is_sha256(&pgo_profile_sha256),
+        is_sha256(&pgo_profile_sha256)
+            || (allow_non_pgo && pgo_profile_sha256 == NON_PGO_PROFILE_SENTINEL),
         "FUSE mount is not running a PGO production build: {pgo_profile_sha256}"
     );
     // A daemon that cannot report which knob values it actually resolved must
@@ -3420,7 +3437,11 @@ fn mount_fuse(
         } => (child.id(), stderr_log.clone()),
         MountedArmKind::Kernel => unreachable!("constructed FUSE mount"),
     };
-    let self_report = parse_mount_self_report(&stderr_log, config.compares_candidates())?;
+    let self_report = parse_mount_self_report(
+        &stderr_log,
+        config.compares_candidates(),
+        config.allow_non_pgo_candidate,
+    )?;
     let proc_exe_sha256 = file_sha256(&PathBuf::from(format!("/proc/{child_id}/exe")))
         .with_context(|| format!("hash mapped FUSE executable for pid {child_id}"))?;
     ensure!(
@@ -8261,12 +8282,18 @@ fn run() -> Result<Option<PathBuf>> {
         config.client_threads(),
         host.allowed_cpus_before_pin.len()
     );
-    let ffs_binary_identity = inspect_ffs_binary(&config.ffs_cli)?;
+    let ffs_binary_identity = inspect_ffs_binary(&config.ffs_cli, config.allow_non_pgo_candidate)?;
     let harness_sha = current_elf_sha256()?;
     println!("bench_evidence,binary_sha256={harness_sha}");
     println!(
-        "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,verdict=pass",
-        ffs_binary_identity.binary_sha256, ffs_binary_identity.pgo_profile_sha256
+        "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,build_mode={},verdict=pass",
+        ffs_binary_identity.binary_sha256,
+        ffs_binary_identity.pgo_profile_sha256,
+        if config.allow_non_pgo_candidate {
+            "authorized_non_pgo"
+        } else {
+            "production_pgo"
+        },
     );
     // Where each ELF was built is recorded, and whether it had to be copied
     // here is derived from that rather than assumed: see `RetrievalProvenance`.
@@ -12074,7 +12101,7 @@ mod tests {
             ),
         )
         .expect("write mount log");
-        let report = parse_mount_self_report(&complete, true).expect("parse self report");
+        let report = parse_mount_self_report(&complete, true, false).expect("parse self report");
         assert_eq!(report.identity.binary_sha256, sha);
         // bd-ha71t: the RESOLVED xattr state is folded into the knob string, so a
         // candidate-vs-candidate run can tell an ACTIVE suppression from a
@@ -12098,15 +12125,32 @@ mod tests {
             ),
         )
         .expect("write legacy mount log");
-        assert!(parse_mount_self_report(&legacy, true).is_err());
+        assert!(parse_mount_self_report(&legacy, true, false).is_err());
 
         // A single-configuration run has no knob divergence to prove, so it may
         // re-measure a historical ELF — and records the absence verbatim rather
         // than a knob list it never observed.
-        let tolerated = parse_mount_self_report(&legacy, false).expect("parse legacy self report");
+        let tolerated =
+            parse_mount_self_report(&legacy, false, false).expect("parse legacy self report");
         assert_eq!(tolerated.runtime_knobs, UNREPORTED_RUNTIME_KNOBS);
         assert!(!UNREPORTED_RUNTIME_KNOBS.is_empty());
         assert!(!UNREPORTED_RUNTIME_KNOBS.contains('='));
+
+        let non_pgo = temp.path().join("non-pgo.log");
+        fs::write(
+            &non_pgo,
+            format!(
+                "mount_bench_evidence,binary_sha256={sha}\nmount_build_profile,pgo_profile_sha256={NON_PGO_PROFILE_SENTINEL}\nmount_candidate_knobs,count_memoized_requests=true\n"
+            ),
+        )
+        .expect("write non-PGO mount log");
+        assert!(parse_mount_self_report(&non_pgo, false, false).is_err());
+        let non_pgo_report =
+            parse_mount_self_report(&non_pgo, false, true).expect("allow explicit non-PGO mode");
+        assert_eq!(
+            non_pgo_report.identity.pgo_profile_sha256,
+            NON_PGO_PROFILE_SENTINEL
+        );
 
         // Tolerating absence must not tolerate ambiguity: two disagreeing knob
         // lines is a broken log under either requirement.
@@ -12121,8 +12165,8 @@ mod tests {
             ),
         )
         .expect("write ambiguous mount log");
-        assert!(parse_mount_self_report(&ambiguous, false).is_err());
-        assert!(parse_mount_self_report(&ambiguous, true).is_err());
+        assert!(parse_mount_self_report(&ambiguous, false, false).is_err());
+        assert!(parse_mount_self_report(&ambiguous, true, false).is_err());
     }
 
     /// bd-fhb53: a counter an older daemon does not emit must read NULL, not zero.
