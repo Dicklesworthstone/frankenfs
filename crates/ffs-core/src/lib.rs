@@ -1520,6 +1520,11 @@ pub struct OpenFs {
     /// dominant cost of an ext4 lookup once name resolution is O(1)
     /// (bd-cc-ext4-attrcache). Never populated on writable mounts.
     ext4_inode_attr_cache: ShardedCache<u64, InodeAttr>,
+    /// Parsed external xattr blocks, keyed by inode number. `listxattr` and
+    /// `getxattr` otherwise read and parse the same `i_file_acl` block on every
+    /// request. Entries carry the inode's xattr-relevant generation so a reader
+    /// that raced a mutation cannot serve its pre-mutation block.
+    ext4_inode_xattr_block_cache: ShardedCache<u64, CachedExt4XattrBlock>,
     /// Bounded ext4 base-device block cache for repeated metadata reads.
     ///
     /// This sits below the MVCC overlay and is ext4-only: htree/name-index
@@ -2107,6 +2112,7 @@ type BtrfsCsumItems = Vec<(BtrfsKey, Vec<u8>)>;
 
 const EXT4_FILE_DATA_BLOCK_CACHE_LIMIT: usize = 256;
 const EXT4_INODE_ATTR_CACHE_LIMIT: usize = 65536;
+const EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT: usize = 4096;
 /// Maximum number of immutable btrfs inode attributes retained by the
 /// read-only resolver.  This is deliberately smaller than the ext4 limit:
 /// btrfs inode resolution is an on-disk tree descent, so a bounded cache can
@@ -2535,6 +2541,26 @@ type CacheShards<K, V> = Box<[Mutex<rustc_hash::FxHashMap<K, V>>]>;
 struct ShardedCache<K, V> {
     shards: CacheShards<K, V>,
     len: std::sync::atomic::AtomicUsize,
+}
+
+/// A parsed external-xattr block plus the inode fields that identify the
+/// version from which it came. `i_file_acl` alone is insufficient: an ext4
+/// xattr update may rewrite the same block in place, while `ctime` advances on
+/// every successful set/remove operation.
+#[derive(Clone)]
+struct CachedExt4XattrBlock {
+    file_acl: u64,
+    ctime: u32,
+    ctime_extra: u32,
+    entries: Arc<Vec<(Ext4Xattr, u32)>>,
+}
+
+impl CachedExt4XattrBlock {
+    fn matches_inode(&self, inode: &Ext4Inode) -> bool {
+        self.file_acl == inode.file_acl
+            && self.ctime == inode.ctime
+            && self.ctime_extra == inode.ctime_extra
+    }
 }
 
 impl<K: std::hash::Hash + Eq + CacheShard, V: Clone> ShardedCache<K, V> {
@@ -5314,6 +5340,7 @@ impl OpenFs {
             ext4_inode_table_block_cache: ShardedCache::new(),
             ext4_file_data_block_cache: ShardedCache::new(),
             ext4_inode_attr_cache: ShardedCache::new(),
+            ext4_inode_xattr_block_cache: ShardedCache::new(),
             ext4_base_block_cache: ShardedCache::new(),
             btrfs_alloc_state: None,
             extent_cache: ffs_extent::ExtentCache::new(),
@@ -27107,6 +27134,47 @@ impl OpenFs {
         }
     }
 
+    /// Return the parsed external xattrs for `inode`, reusing the per-inode
+    /// cache only when they describe this exact inode version.
+    fn ext4_cached_xattr_block_entries(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        inode: &Ext4Inode,
+    ) -> ffs_error::Result<Arc<Vec<(Ext4Xattr, u32)>>> {
+        debug_assert_ne!(inode.file_acl, 0);
+        if let Some(cached) = self.ext4_inode_xattr_block_cache.get(&ino.0)
+            && cached.matches_inode(inode)
+        {
+            return Ok(cached.entries);
+        }
+
+        // Remove an old generation before admission so an updated inode can
+        // replace its own entry even when the bounded cache is otherwise full.
+        self.ext4_inode_xattr_block_cache.remove(&ino.0);
+        let block = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
+        let entries = Arc::new(
+            ffs_ondisk::parse_xattr_block_with_inum(&block)
+                .map_err(|error| parse_to_ffs_error(&error))?,
+        );
+        self.ext4_inode_xattr_block_cache.insert_within(
+            ino.0,
+            CachedExt4XattrBlock {
+                file_acl: inode.file_acl,
+                ctime: inode.ctime,
+                ctime_extra: inode.ctime_extra,
+                entries: Arc::clone(&entries),
+            },
+            EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT,
+        );
+        Ok(entries)
+    }
+
+    /// Drop the cached external xattr block after a successful xattr mutation.
+    fn invalidate_ext4_xattr_block_cache(&self, ino: InodeNumber) {
+        self.ext4_inode_xattr_block_cache.remove(&ino.0);
+    }
+
     /// Set or replace one ext4 xattr.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn ext4_setxattr(
@@ -27368,6 +27436,7 @@ impl OpenFs {
         }
 
         self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
+        self.invalidate_ext4_xattr_block_cache(ino);
 
         trace!(
             target: "ffs::write",
@@ -27582,6 +27651,7 @@ impl OpenFs {
         }
 
         self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
+        self.invalidate_ext4_xattr_block_cache(ino);
 
         trace!(
             target: "ffs::write",
@@ -64002,6 +64072,71 @@ mod tests {
                 "listxattr must include {name}; got {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn ext4_external_xattr_cache_invalidates_after_set_and_remove() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let attr = fs
+            .create(
+                &cx,
+                InodeNumber(2),
+                OsStr::new("xattr-cache-invalidate.txt"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create");
+        let ino = attr.ino;
+        let initial = vec![0xA1_u8; 512];
+        fs.setxattr(&cx, ino, "user.cached", &initial, XattrSetMode::Set)
+            .expect("create external xattr");
+        assert_ne!(
+            fs.read_inode(&cx, ino).expect("read inode").file_acl,
+            0,
+            "test requires an external xattr block"
+        );
+
+        // listxattr fills the parsed external-block cache without reading a
+        // value. A later mutation must evict it rather than leave a stale
+        // answer for getxattr/listxattr.
+        assert!(
+            fs.listxattr(&cx, ino)
+                .expect("listxattr")
+                .iter()
+                .any(|name| name == "user.cached")
+        );
+        assert!(fs.ext4_inode_xattr_block_cache.contains_key(&ino.0));
+
+        let replaced = vec![0xB2_u8; 512];
+        fs.setxattr(&cx, ino, "user.cached", &replaced, XattrSetMode::Replace)
+            .expect("replace external xattr");
+        assert!(
+            !fs.ext4_inode_xattr_block_cache.contains_key(&ino.0),
+            "setxattr must evict the old parsed external xattr block"
+        );
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.cached").expect("get replaced"),
+            Some(replaced)
+        );
+        assert!(fs.ext4_inode_xattr_block_cache.contains_key(&ino.0));
+
+        assert!(
+            fs.removexattr(&cx, ino, "user.cached")
+                .expect("remove external xattr")
+        );
+        assert!(
+            !fs.ext4_inode_xattr_block_cache.contains_key(&ino.0),
+            "removexattr must evict the parsed external xattr block"
+        );
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.cached")
+                .expect("get removed attribute"),
+            None
+        );
     }
 
     #[test]
