@@ -726,6 +726,106 @@ fn the_measurement_resize_actually_changes_the_memo_bd_2s8zy() {
     );
 }
 
+/// IS THE PER-REQUEST SCOPE MACHINERY MATERIAL TO THE readdir+stat GAP? (bd-2s8zy)
+///
+/// 4f23cf23f routed that gap OUT of the fs-tree descent: in-process the capability
+/// probe costs 334 node lookups against 14,817 for LOOKUP, about 2%, while through
+/// a mount suppressing it took preads 27,572 -> 1,840. So the cost is added by the
+/// mount. The mount adds exactly two things per probe — a kernel/userspace round
+/// trip, which no in-process change can remove, and the userspace per-request
+/// machinery every FUSE op pays on top of the filesystem call itself.
+///
+/// Only the second is measurable without a mount, and it is worth knowing before
+/// anyone spends a quiet window: the banked mounted row is 21.30ms for 2,000 stats
+/// against the kernel's 4.42ms, i.e. ~10.65us per stat for us. At two probes per
+/// stat, a per-request cost of a few microseconds would be a large share of that
+/// and worth attacking; a cost in the tens of nanoseconds is noise and routes the
+/// gap entirely to the round trip.
+///
+/// Measured as the DELTA between the identical getxattr sweep with and without
+/// `begin_request_scope`/`end_request_scope` around each call, on the same
+/// balanced 3-arm rotation with the null inside the window.
+#[test]
+fn the_per_request_scope_cost_is_priced_against_the_mounted_gap_bd_2s8zy() {
+    const ROUNDS: usize = 15;
+
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let entries = 6_000;
+    let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-scope.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-2s8zy per-request scope pricing");
+        return;
+    };
+    let cx = Cx::for_testing();
+    let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
+    let order = interleaved_order(entries, 8);
+
+    // `scoped` false = the raw filesystem calls; true = the same calls wrapped the
+    // way every FUSE request wraps them. Nothing else differs between the arms.
+    let sweep = |scoped: bool| -> std::time::Duration {
+        let device = ffs_block::FileByteDevice::open(&image).expect("open image");
+        let fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+            .expect("open btrfs read-only");
+        let started = std::time::Instant::now();
+        for &index in &order {
+            if scoped {
+                let mut scope = fs
+                    .begin_request_scope(&cx, ffs_core::RequestOp::Lookup)
+                    .expect("begin lookup scope");
+                let attr = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(&names[index]));
+                fs.end_request_scope(&cx, ffs_core::RequestOp::Lookup, scope)
+                    .expect("end lookup scope");
+                if let Ok(attr) = attr {
+                    scope = fs
+                        .begin_request_scope(&cx, ffs_core::RequestOp::Getxattr)
+                        .expect("begin getxattr scope");
+                    let _ = FsOps::getxattr(fs_ref(&fs), &cx, attr.ino, SECURITY_CAPABILITY);
+                    fs.end_request_scope(&cx, ffs_core::RequestOp::Getxattr, scope)
+                        .expect("end getxattr scope");
+                }
+            } else if let Ok(attr) = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(&names[index])) {
+                let _ = FsOps::getxattr(fs_ref(&fs), &cx, attr.ino, SECURITY_CAPABILITY);
+            }
+        }
+        started.elapsed()
+    };
+
+    const ARMS: [bool; 3] = [false, true, false];
+    let mut times: [Vec<std::time::Duration>; 3] = std::array::from_fn(|_| Vec::with_capacity(ROUNDS));
+    for round in 0..ROUNDS {
+        for position in 0..ARMS.len() {
+            let arm = (round + position) % ARMS.len();
+            times[arm].push(sweep(ARMS[arm]));
+        }
+    }
+    let [null_left, scoped, null_right] = times.map(median);
+    let null_ratio = null_right.as_secs_f64() / null_left.as_secs_f64();
+    let baseline = (null_left + null_right) / 2;
+    // Two scopes per entry: one for the LOOKUP, one for the capability probe.
+    let per_scope_ns = (scoped.as_secs_f64() - baseline.as_secs_f64()) * 1e9
+        / (entries as f64 * 2.0);
+    // The banked mounted row: 21.30ms for 2,000 stats.
+    let mounted_per_stat_ns = 21.30e6 / 2_000.0;
+    let share = (per_scope_ns * 2.0) / mounted_per_stat_ns * 100.0;
+
+    eprintln!(
+        "bd-2s8zy scope entries={entries} rounds={ROUNDS}\n  \
+         unscoped {:.3}ms / {:.3}ms (A/A null ratio={null_ratio:.4})  scoped {:.3}ms\n  \
+         per scope pair {:.1}ns => {per_scope_ns:.1}ns per request\n  \
+         mounted row is {mounted_per_stat_ns:.0}ns per stat; two scopes are {share:.2}% of it",
+        null_left.as_secs_f64() * 1e3,
+        null_right.as_secs_f64() * 1e3,
+        scoped.as_secs_f64() * 1e3,
+        per_scope_ns * 2.0,
+    );
+
+    // No direction pinned: a negative delta just means the cost is below this
+    // instrument's floor, which is itself the answer worth reporting.
+    assert!(
+        baseline > std::time::Duration::ZERO,
+        "the unscoped arms took no measurable time, so the delta above is meaningless"
+    );
+}
+
 /// The shipping floor-memo size must be the one the counted evidence was taken on
 /// (bd-2s8zy).
 ///
