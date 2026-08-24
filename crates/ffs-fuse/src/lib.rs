@@ -3348,7 +3348,7 @@ impl LastMissingCapabilityXattr {
             // The direct table is never indexed while `bitmap` is present, but a
             // one-slot allocation preserves the representation invariant without
             // reserving the old table's 32 KiB on every mount.
-            slots: vec![AtomicU64::new(0)],
+            slots: vec![AtomicU64::new(0)].into_boxed_slice(),
             enabled,
             bitmap: Some(CapabilityBitmap::new()),
         }
