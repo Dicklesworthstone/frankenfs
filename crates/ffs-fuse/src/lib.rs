@@ -103,12 +103,14 @@ pub fn capability_memo_enabled() -> bool {
     LastMissingCapabilityXattr::enabled_from_env()
 }
 
-/// Effective capability-memo table size for this process (bd-m1bpu).
+/// Effective direct-mapped comparison-table size for this process (bd-m1bpu).
 ///
 /// Resolved through the same function the mount constructor calls, for the same
 /// reason as [`capability_memo_enabled`]: the comparator refuses a
 /// candidate-vs-candidate run whose two configurations self-report identical
-/// knobs, so this is what proves a slot-count override actually took effect.
+/// knobs, so this is what proves the direct-table comparison arm's override
+/// actually took effect. The shipping range-leaf policy does not reserve this
+/// table.
 #[must_use]
 pub fn capability_memo_slots() -> usize {
     LastMissingCapabilityXattr::slots_from_env()
@@ -391,8 +393,8 @@ pub fn io_uring_payload_bytes() -> u32 {
     )
 }
 
-/// Whether the range-leaf capability memo backend is selected
-/// (bd-btrfs-readdir-stat-8x-8y7vp).
+/// Whether the bounded range-leaf capability memo policy is selected
+/// (bd-kzfh2).
 ///
 /// Same contract as the two knobs above, and for the same reason: the comparator
 /// REFUSES a candidate-vs-candidate run whose two arms self-report identical
@@ -401,7 +403,7 @@ pub fn io_uring_payload_bytes() -> u32 {
 /// it cannot drift from what actually ran.
 #[must_use]
 pub fn capability_memo_bitmap() -> bool {
-    LastMissingCapabilityXattr::bitmap_from_value(
+    LastMissingCapabilityXattr::range_leaf_enabled_from_value(
         std::env::var("FFS_FUSE_CAPABILITY_MEMO_BITMAP")
             .ok()
             .as_deref(),
@@ -1983,6 +1985,29 @@ impl MountOptions {
     }
 }
 
+/// Number of kernel requests allowed to queue behind each active dispatch worker.
+///
+/// A path lookup produces separate FUSE requests (including the mandatory
+/// `security.capability` GETXATTR); the protocol cannot collapse them into one
+/// reply.  It can, however, keep the next requests queued while another worker
+/// returns the first one.  One outstanding request per worker defeats that
+/// overlap as soon as a worker is briefly occupied by a sibling lookup.
+const FUSE_QUEUED_REQUESTS_PER_WORKER: u16 = 16;
+
+/// Derive the kernel FUSE queue limits for a concurrent dispatcher.
+///
+/// This is deliberately independent of xattr values and request kinds: queue
+/// admission changes scheduling only, never whether a GETXATTR is sent or how
+/// it is answered.  Saturation is safe because the kernel ABI stores both
+/// values as `u16`.
+#[must_use]
+fn fuse_worker_queue_limits(worker_threads: usize) -> (u16, u16) {
+    let workers = u16::try_from(worker_threads).unwrap_or(u16::MAX).max(1);
+    let max_background = workers.saturating_mul(FUSE_QUEUED_REQUESTS_PER_WORKER);
+    let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+    (max_background, congestion_threshold)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum MountOptionParseError {
@@ -3126,8 +3151,9 @@ pub fn capability_memo_slots_for_working_set(working_set: usize) -> usize {
         .clamp(CAPABILITY_MEMO_SLOTS, CAPABILITY_MEMO_SLOTS_MAX)
 }
 
-/// Resident bytes a capability memo of `slots` costs, per mount, for the mount's
-/// lifetime (bd-kzfh2, reported because bd-5vis3's bar requires it).
+/// Resident bytes the direct-table comparison memo of `slots` costs, per mount,
+/// for the mount's lifetime (bd-kzfh2, reported because bd-5vis3's bar requires
+/// it).
 ///
 /// One `AtomicU64` per slot and nothing else — the table is allocated whole at
 /// construction, so this is exact rather than an estimate, and it is paid whether
@@ -3162,7 +3188,8 @@ struct LastMissingCapabilityXattr {
     /// change during a mount, and the probe path is the hottest metadata path
     /// there is.
     enabled: bool,
-    /// Range-leaf backend, when `FFS_FUSE_CAPABILITY_MEMO_BITMAP` selects it.
+    /// Shipping range-leaf backend, unless `FFS_FUSE_CAPABILITY_MEMO_BITMAP`
+    /// explicitly opts into the direct-table comparison arm.
     ///
     /// A per-store FIELD rather than a build flag, so both arms run from ONE ELF
     /// and the comparator's `--candidate-b-env` gives a within-window
@@ -3277,39 +3304,45 @@ impl Default for LastMissingCapabilityXattr {
     /// become no-ops for whoever exported it. Production reads the switch
     /// explicitly via [`Self::from_env`].
     fn default() -> Self {
-        Self::with_slots(CAPABILITY_MEMO_SLOTS, true)
+        Self::with_range_leaves(true)
     }
 }
 
 impl LastMissingCapabilityXattr {
     /// Production constructor: honours `FFS_FUSE_CAPABILITY_MEMO` (bd-2pq73) and
-    /// `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (bd-m1bpu).
+    /// the bounded range-leaf policy. `FFS_FUSE_CAPABILITY_MEMO_BITMAP=0` keeps
+    /// the direct-mapped table available as the candidate-A benchmark arm.
     fn from_env() -> Self {
-        let mut memo = Self::with_slots(Self::slots_from_env(), Self::enabled_from_env());
-        if Self::bitmap_from_value(
+        let enabled = Self::enabled_from_env();
+        if Self::range_leaf_enabled_from_value(
             std::env::var("FFS_FUSE_CAPABILITY_MEMO_BITMAP")
                 .ok()
                 .as_deref(),
         ) {
-            memo.bitmap = Some(CapabilityBitmap::new());
+            Self::with_range_leaves(enabled)
+        } else {
+            Self::with_slots(Self::slots_from_env(), enabled)
         }
-        memo
     }
 
-    /// Parse the range-leaf backend knob (bd-btrfs-readdir-stat-8x-8y7vp).
+    /// Parse the range-leaf policy knob (bd-kzfh2).
     ///
     /// Split into a PURE function over `Option<&str>` so the parsing is testable
     /// without mutating process-global environment, which is racy under the
     /// parallel test harness and `unsafe` from edition 2024.
     ///
-    /// Opt-in polarity, so a typo fails CLOSED onto the shipping direct-mapped
-    /// table rather than silently enabling an unmeasured backend.
-    fn bitmap_from_value(raw: Option<&str>) -> bool {
-        let Some(raw) = raw else {
-            return false;
-        };
-        let trimmed = raw.trim();
-        trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("on")
+    /// The range-leaf memo is the shipping policy. It allocates a 4 KiB leaf only
+    /// when a workload probes an inode range and caps leaf storage at 64 leaves
+    /// (256 KiB), avoiding the direct table's directory-size cliff without sizing
+    /// from a filesystem-wide inode count. Only the three explicit opt-outs select
+    /// the legacy direct-mapped table for A/B comparison.
+    fn range_leaf_enabled_from_value(raw: Option<&str>) -> bool {
+        !raw.is_some_and(|raw| {
+            let trimmed = raw.trim();
+            trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("off")
+        })
     }
 
     /// Build a memo with an explicit table size, rounding UP to a power of two so
@@ -3329,14 +3362,25 @@ impl LastMissingCapabilityXattr {
         }
     }
 
+    /// Production-sized memo: leaves are allocated only for inode ranges the
+    /// workload actually probes. The fixed top table bounds leaf storage at
+    /// 64 × 4 KiB and deliberately declines a 65th range rather than evicting a
+    /// leaf another reader may be borrowing.
+    fn with_range_leaves(enabled: bool) -> Self {
+        Self {
+            // The direct table is never indexed while `bitmap` is present, but a
+            // one-slot allocation preserves the representation invariant without
+            // reserving the old table's 32 KiB on every mount.
+            slots: vec![AtomicU64::new(0)].into_boxed_slice(),
+            enabled,
+            bitmap: Some(CapabilityBitmap::new()),
+        }
+    }
+
     /// Test/bench constructor for the range-leaf arm.
     #[cfg(test)]
     fn with_bitmap() -> Self {
-        Self {
-            slots: (0..1).map(|_| AtomicU64::new(0)).collect(),
-            enabled: true,
-            bitmap: Some(CapabilityBitmap::new()),
-        }
+        Self::with_range_leaves(true)
     }
 }
 
@@ -3724,6 +3768,8 @@ struct FuseInner {
     zero_message_opendir: std::sync::atomic::AtomicBool,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
+    /// bd-2i2ez: stage a run of WRITEs into one MVCC transaction. Default OFF.
+    writeback: WritebackBatch,
 }
 
 impl std::fmt::Debug for FuseInner {
@@ -3736,6 +3782,130 @@ impl std::fmt::Debug for FuseInner {
             .field("read_only", &self.read_only)
             .field("mountpoint", &self.mountpoint)
             .finish_non_exhaustive()
+    }
+}
+
+/// One outstanding writeback batch: several FUSE WRITEs staged into a single
+/// MVCC transaction, committed once at the next flush boundary (bd-2i2ez).
+///
+/// # Why one scope and not a table
+///
+/// bd-w3hol specified a per-file-handle table. A SINGLE outstanding scope is
+/// strictly simpler and loses nothing on the workload this exists for — the
+/// bulk-durable-write job is 64 sequential 1 MiB writes to ONE file followed by
+/// one fsync — while making the correctness argument small enough to check by
+/// reading it. A write to a different inode commits the outstanding batch first,
+/// so the batch is always exactly one inode's staged run.
+///
+/// # The visibility invariant, which is the whole safety argument
+///
+/// Staged writes live in an uncommitted MVCC transaction, so they are invisible
+/// to any observer reading through a fresh scope — a stale `read`, a stale
+/// `getattr` size, a stale `readdir`. Rather than route every observing path
+/// through the live scope (many call sites, each one a chance to miss one and
+/// serve stale data), this takes the conservative rule:
+///
+///   ANY request that is not a WRITE commits the outstanding batch BEFORE it
+///   runs, centrally in `with_request_scope`.
+///
+/// So no observer can ever see less than a caller would have seen without
+/// batching. What is amortized is exactly a RUN OF CONSECUTIVE WRITES, which is
+/// the only thing this lever claims.
+///
+/// POSIX durability is unchanged in the direction that matters: `write()` was
+/// never durable before `fsync`, and `fsync`/`flush`/`release` are non-write
+/// requests, so they commit the batch before doing their own work.
+///
+/// # What this does NOT preserve, stated rather than discovered later
+///
+/// The commit performed by `flush` does not re-acquire the inode guard the
+/// staging write held. Taking it there would deadlock against a mutation that
+/// already holds guards for its own inodes and then triggers the flush from
+/// inside `with_request_scope`. The commit is an MVCC store operation with its
+/// own synchronization, and the `Mutex` plus `Option::take` below means exactly
+/// one thread ever commits a given batch. This is a real narrowing of the
+/// existing locking discipline and is one of the reasons the mode is OFF by
+/// default.
+#[derive(Debug)]
+struct PendingWriteback {
+    /// The inode whose writes are staged. A write to any other inode flushes.
+    ino: u64,
+    /// Number of FUSE writes staged so far, for the bounded-dirty threshold.
+    staged: usize,
+}
+
+/// Writeback batching state (bd-2i2ez). Default OFF.
+struct WritebackBatch {
+    /// Off unless `FFS_FUSE_WRITEBACK_BATCH` opts in.
+    ///
+    /// A per-store field rather than a build flag, so ONE ELF supplies both A/B
+    /// arms for the mounted comparator's `--candidate-b-env` and the ISA/PGO
+    /// provenance cancels between them (bd-b9dug).
+    enabled: bool,
+    /// Commit and start over once this many writes are staged, so a writer that
+    /// never fsyncs cannot pin unbounded dirty state.
+    max_staged_writes: usize,
+    /// Non-zero when a batch is outstanding. Read on EVERY non-write request, so
+    /// it is a relaxed atomic and not the mutex: with batching off, or on with
+    /// nothing staged, the flush hook costs one load.
+    outstanding: std::sync::atomic::AtomicUsize,
+    state: Mutex<Option<(PendingWriteback, RequestScope)>>,
+}
+
+impl std::fmt::Debug for WritebackBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WritebackBatch")
+            .field("enabled", &self.enabled)
+            .field("max_staged_writes", &self.max_staged_writes)
+            .field(
+                "outstanding",
+                &self.outstanding.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Default bound on staged writes before an involuntary commit.
+///
+/// 64 is the bulk-durable-write job's exact write count, so that job commits
+/// once at its fsync rather than once mid-run: the threshold is a memory bound,
+/// and picking it below the target run would silently halve the amortization
+/// this lever exists to measure.
+const DEFAULT_MAX_STAGED_WRITES: usize = 64;
+
+impl WritebackBatch {
+    fn from_env() -> Self {
+        let enabled = std::env::var("FFS_FUSE_WRITEBACK_BATCH")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"));
+        let max_staged_writes = std::env::var("FFS_FUSE_WRITEBACK_MAX_WRITES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_STAGED_WRITES);
+        Self {
+            enabled,
+            max_staged_writes,
+            outstanding: std::sync::atomic::AtomicUsize::new(0),
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Cheap "is anything staged" check for the hot non-write path.
+    fn has_outstanding(&self) -> bool {
+        self.enabled && self.outstanding.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(PendingWriteback, RequestScope)>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_outstanding(&self, outstanding: bool) {
+        self.outstanding.store(
+            usize::from(outstanding),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -4627,8 +4797,8 @@ impl Drop for HandlerTimer<'_> {
 impl Filesystem for FrankenFuse {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
         if self.inner.worker_dispatch {
-            let max_background = u16::try_from(self.inner.thread_count).unwrap_or(u16::MAX);
-            let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+            let (max_background, congestion_threshold) =
+                fuse_worker_queue_limits(self.inner.thread_count);
             if let Err(nearest) = config.set_max_background(max_background) {
                 debug!(
                     max_background,
@@ -7572,27 +7742,35 @@ mod tests {
         assert_eq!(queue_depth_from_value(Some("8")), 8);
     }
 
-    /// The backend knob is opt-in and fails CLOSED, so a typo cannot silently
-    /// enable an unmeasured backend on a production mount.
+    /// The bounded range-leaf policy is the shipping default. Only an explicit
+    /// opt-out selects the legacy direct-mapped table for an A/B comparison.
     #[test]
-    fn capability_memo_bitmap_knob_is_opt_in_and_fails_closed() {
+    fn capability_memo_range_leaf_policy_defaults_on_and_has_explicit_opt_out() {
         for on in ["1", "true", "TRUE", "on", " on ", "On"] {
             assert!(
-                LastMissingCapabilityXattr::bitmap_from_value(Some(on)),
-                "{on:?} must select the range-leaf backend"
+                LastMissingCapabilityXattr::range_leaf_enabled_from_value(Some(on)),
+                "{on:?} must keep the shipping range-leaf policy"
             );
         }
-        for off in ["", "0", "false", "off", "yes", "2", "bitmap", "ture"] {
+        for shipping_default in [
+            None,
+            Some(""),
+            Some("yes"),
+            Some("2"),
+            Some("bitmap"),
+            Some("ture"),
+        ] {
             assert!(
-                !LastMissingCapabilityXattr::bitmap_from_value(Some(off)),
-                "{off:?} must fall back to the shipping table, not enable a \
-                 backend nobody asked for"
+                LastMissingCapabilityXattr::range_leaf_enabled_from_value(shipping_default),
+                "{shipping_default:?} must not silently opt out of the shipping policy"
             );
         }
-        assert!(
-            !LastMissingCapabilityXattr::bitmap_from_value(None),
-            "unset must mean the shipping direct-mapped table"
-        );
+        for opt_out in ["0", "false", "off", " OFF ", "False"] {
+            assert!(
+                !LastMissingCapabilityXattr::range_leaf_enabled_from_value(Some(opt_out)),
+                "{opt_out:?} must select the explicit direct-table comparison arm"
+            );
+        }
     }
 
     /// The footprint must stay bounded by declining new ranges, never by evicting
@@ -7619,6 +7797,40 @@ mod tests {
                  overflow; eviction would invalidate a pointer a reader may hold"
             );
         }
+    }
+
+    /// The production memo adapts to the inode ranges actually touched. A dense
+    /// 32,768-inode directory occupies one 4 KiB leaf instead of requiring a
+    /// hand-sized 65,536-slot table, and a mutation removes only its own absence.
+    #[test]
+    fn capability_memo_shipping_policy_keeps_a_dense_directory_and_invalidates_one_inode_bd_kzfh2()
+    {
+        const FIRST: u64 = 1_000_000;
+        const DIRECTORY_ENTRIES: u64 = 32_768;
+        let memo = LastMissingCapabilityXattr::default();
+        assert!(
+            memo.bitmap.is_some(),
+            "Default must exercise the shipping range-leaf policy"
+        );
+
+        for ino in FIRST..FIRST + DIRECTORY_ENTRIES {
+            memo.remember(InodeNumber(ino));
+        }
+        assert!(
+            (FIRST..FIRST + DIRECTORY_ENTRIES).all(|ino| memo.contains(InodeNumber(ino))),
+            "a directory that fits one live range must remain memoized"
+        );
+
+        let changed = InodeNumber(FIRST + 17);
+        memo.forget(changed);
+        assert!(
+            !memo.contains(changed),
+            "a setxattr/removexattr invalidation must remove the changed inode's absence"
+        );
+        assert!(
+            memo.contains(InodeNumber(FIRST + 18)),
+            "invalidating one inode must not drop a neighboring capability absence"
+        );
     }
 
     #[test]
@@ -7713,6 +7925,47 @@ mod tests {
         );
     }
 
+    /// The shipping range-leaf memo must retain the writable-mount contract:
+    /// both xattr mutations clear a cached absence before they reach the
+    /// format.  In particular, this holds even when the format rejects the
+    /// mutation, because retaining the entry would answer a later probe from
+    /// stale state.
+    #[test]
+    fn capability_memo_range_leaf_is_invalidated_by_both_xattr_mutations_bd_kzfh2() {
+        let fuse = writable_fuse();
+        let ino = InodeNumber(1_000_017);
+        assert!(fuse.inner.missing_capability_xattr.bitmap.is_some());
+
+        with_switch(false, || {
+            fuse.inner.missing_capability_xattr.remember(ino);
+            let sender = RecordingSender::default();
+            fuse.setxattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                b"capability",
+                0,
+                0,
+                <ReplyEmpty as fuser::Reply>::new(1, sender),
+            );
+            assert!(
+                !fuse.inner.missing_capability_xattr.contains(ino),
+                "setxattr must invalidate before dispatching to the format"
+            );
+
+            fuse.inner.missing_capability_xattr.remember(ino);
+            let sender = RecordingSender::default();
+            fuse.removexattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                <ReplyEmpty as fuser::Reply>::new(2, sender),
+            );
+            assert!(
+                !fuse.inner.missing_capability_xattr.contains(ino),
+                "removexattr must invalidate before dispatching to the format"
+            );
+        });
+    }
+
     /// `forget` must be surgical: clearing the inode that was written must not
     /// drop the OTHER slot, or every setxattr would cost the root a lookup.
     #[test]
@@ -7765,7 +8018,9 @@ mod tests {
     /// missing, which is a correctness bug and not a cache miss.
     #[test]
     fn capability_memo_collision_evicts_and_never_reports_the_wrong_inode() {
-        let memo = LastMissingCapabilityXattr::default();
+        // This is the explicit legacy direct-table comparison arm. The shipping
+        // range-leaf policy has no per-inode slot collision inside a live range.
+        let memo = LastMissingCapabilityXattr::with_slots(CAPABILITY_MEMO_SLOTS, true);
         let a = InodeNumber(14);
         let b = InodeNumber(14 + CAPABILITY_MEMO_SLOTS as u64); // same slot
         assert_eq!(
@@ -8030,6 +8285,7 @@ mod tests {
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         };
         let inode = InodeNumber(42);
         inner.missing_capability_xattr.remember(inode);
@@ -9225,6 +9481,105 @@ mod tests {
         }
     }
 
+    /// Writable xattr backend for the transport regression: the queue policy
+    /// may change request scheduling, but it must not let a cached absence
+    /// survive either xattr mutation.
+    #[derive(Default)]
+    struct CapabilityMutationFs {
+        capability: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl FsOps for CapabilityMutationFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Ok(test_inode_attr(ino.0, FfsFileType::RegularFile, 0o644))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Ok(test_inode_attr(1, FfsFileType::RegularFile, 0o644))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn getxattr(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            name: &str,
+        ) -> ffs_error::Result<Option<Vec<u8>>> {
+            if name == SECURITY_CAPABILITY_XATTR {
+                return Ok(self.capability.lock().clone());
+            }
+            Ok(None)
+        }
+
+        fn setxattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            name: &str,
+            value: &[u8],
+            _mode: XattrSetMode,
+        ) -> ffs_error::Result<()> {
+            if name == SECURITY_CAPABILITY_XATTR {
+                *self.capability.lock() = Some(value.to_vec());
+            }
+            Ok(())
+        }
+
+        fn removexattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            name: &str,
+        ) -> ffs_error::Result<bool> {
+            if name == SECURITY_CAPABILITY_XATTR {
+                return Ok(self.capability.lock().take().is_some());
+            }
+            Ok(false)
+        }
+    }
+
     #[test]
     fn capability_absence_is_memoized_on_rw_mounts_too_but_never_for_inode_zero() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9314,6 +9669,67 @@ mod tests {
             "a read-write mount must memoise capability absence too; the second \
              probe should not reach the filesystem"
         );
+    }
+
+    #[test]
+    fn capability_xattr_set_and_remove_invalidate_a_queued_mount_bd_yu6jz() {
+        let fuse = FrankenFuse::with_options(
+            Box::new(CapabilityMutationFs::default()),
+            &MountOptions {
+                read_only: false,
+                worker_threads: 4,
+                ..MountOptions::default()
+            },
+        );
+        let ino = InodeNumber(42);
+
+        with_switch(false, || {
+            assert_eq!(
+                fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
+                    .expect("initial capability probe"),
+                None,
+                "the first probe must establish a cacheable absence"
+            );
+            assert!(
+                fuse.inner.missing_capability_xattr.contains(ino),
+                "the absence must be cached before the mutation exercises invalidation"
+            );
+
+            let set_sender = RecordingSender::default();
+            fuse.setxattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                b"capability-bytes",
+                0,
+                0,
+                <ReplyEmpty as fuser::Reply>::new(1, set_sender.clone()),
+            );
+            assert_eq!(set_sender.errno(), None, "setxattr must still succeed");
+            assert_eq!(
+                fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
+                    .expect("probe after setxattr"),
+                Some(b"capability-bytes".to_vec()),
+                "setxattr must invalidate the cached absence before the next probe"
+            );
+
+            let remove_sender = RecordingSender::default();
+            fuse.removexattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                <ReplyEmpty as fuser::Reply>::new(2, remove_sender.clone()),
+            );
+            assert_eq!(
+                remove_sender.errno(),
+                None,
+                "removexattr must still succeed"
+            );
+            assert_eq!(
+                fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
+                    .expect("probe after removexattr"),
+                None,
+                "removexattr must invalidate the prior present answer and restore absence"
+            );
+        });
     }
 
     /// The bd-d9378 A/B opt-out defaults ON and only the exact opt-out spellings
@@ -10529,6 +10945,25 @@ mod tests {
             ..MountOptions::default()
         };
         assert_eq!(opts.resolved_thread_count(), 1);
+    }
+
+    #[test]
+    fn worker_queue_keeps_path_lookup_requests_pipelined_without_suppression_bd_yu6jz() {
+        assert_eq!(
+            fuse_worker_queue_limits(1),
+            (16, 12),
+            "one worker must still admit a bounded queue of independent FUSE requests"
+        );
+        assert_eq!(
+            fuse_worker_queue_limits(4),
+            (64, 48),
+            "queue depth must scale with the dispatcher that drains it"
+        );
+        assert_eq!(
+            fuse_worker_queue_limits(usize::MAX),
+            (u16::MAX, 49_151),
+            "an excessive worker request must saturate in the kernel's u16 ABI"
+        );
     }
 
     #[test]
@@ -19684,6 +20119,7 @@ mod tests {
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
 
@@ -21523,6 +21959,7 @@ AllowOther"#;
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         };
         let dbg = format!("{inner:?}");
         assert_eq!(dbg, FUSE_INNER_DEBUG_GOLDEN);

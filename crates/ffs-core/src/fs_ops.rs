@@ -4251,6 +4251,41 @@ impl FsOps for OpenFs {
 
         Ok(())
     }
+    /// Expose the writeback-batch primitives through the trait (bd-2i2ez).
+    ///
+    /// These bodies are one line each because the work has existed since
+    /// bd-xhm5g.401 — as INHERENT methods on `OpenFs`. The production mount holds
+    /// `Arc<dyn FsOps>` and could not name them, so the amortization they enable
+    /// was unreachable from the code that ships. These impls plus the `Arc<T>`
+    /// forwards in `vfs.rs` are the entire difference between a primitive and a
+    /// feature.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying scope error unchanged.
+    fn begin_writeback_batch_scope(&self, cx: &Cx) -> ffs_error::Result<RequestScope> {
+        Self::begin_writeback_batch_scope(self, cx)
+    }
+
+    /// # Errors
+    ///
+    /// Propagates the commit error, or the release error when commit succeeded
+    /// and release did not.
+    fn commit_writeback_batch_scope(
+        &self,
+        cx: &Cx,
+        scope: RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
+        Self::commit_writeback_batch_scope(self, cx, scope)
+    }
+
+    /// # Errors
+    ///
+    /// Propagates the scope-release error.
+    fn abort_writeback_batch_scope(&self, cx: &Cx, scope: RequestScope) -> ffs_error::Result<()> {
+        Self::abort_writeback_batch_scope(self, cx, scope)
+    }
+
     /// Commit any transaction in the request scope.
     ///
     /// # Errors
@@ -4350,6 +4385,63 @@ impl FsOps for OpenFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dispatch_concurrency_pins {
+    /// bd-svhrq regression pin: `OPEN` and `RELEASE` are shared-set FUSE
+    /// requests, and that is only sound while `OpenFs` leaves them STATELESS.
+    ///
+    /// The vendored `fuser`'s `Request::is_concurrency_safe` puts `OPEN`,
+    /// `OPENDIR`, `RELEASE` and `RELEASEDIR` in the set that dispatches
+    /// CONCURRENTLY under `FFS_FUSE_WORKERS`. The whole argument for that is
+    /// stated there and rests on one fact owned by THIS file: `impl FsOps for
+    /// OpenFs` does not override `open` or `release`, so both take the trait
+    /// defaults — `Ok((0, 0))` and `Ok(())` — and a FUSE open allocates no
+    /// handle state that two workers could race over.
+    ///
+    /// Giving `OpenFs` a real handle table is a perfectly reasonable future
+    /// change. What must not happen is that change landing SILENTLY while a
+    /// concurrent dispatcher keeps treating the operations as stateless: the
+    /// symptom would be a rare handle-table corruption under load, not a
+    /// compile error. So this fails loudly and names the file to fix.
+    ///
+    /// A type-level check cannot express it — naming `open` on `OpenFs`
+    /// resolves to the trait default and compiles whether or not an override
+    /// exists — so this reads the source, the same technique `ffs-fuse` uses to
+    /// pin that its handlers are inside the `Filesystem` trait impl.
+    #[test]
+    fn openfs_leaves_open_and_release_stateless_for_the_shared_dispatch_set() {
+        let source = include_str!("fs_ops.rs");
+        let start = source
+            .find("\nimpl FsOps for OpenFs {\n")
+            .expect("the FsOps impl block must be findable by its header line");
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("the FsOps impl block must end at a closing brace in column 0");
+        let body = &body[..end];
+
+        // Positive control: a span that failed to locate the block would be
+        // empty and would pass both assertions below vacuously.
+        assert!(
+            body.contains("\n    fn flush("),
+            "the located span is not the FsOps impl block: it does not contain `fn flush(`"
+        );
+
+        assert!(
+            !body.contains("\n    fn open("),
+            "`OpenFs` now overrides `FsOps::open`. FUSE `OPEN` currently dispatches \
+             CONCURRENTLY (bd-svhrq); if the override introduces handle state, either \
+             make it concurrency-safe or move `Operation::Open` back out of the shared \
+             set in vendor/fuser/src/request.rs::operation_is_concurrency_safe."
+        );
+        assert!(
+            !body.contains("\n    fn release("),
+            "`OpenFs` now overrides `FsOps::release`. FUSE `RELEASE` currently dispatches \
+             CONCURRENTLY (bd-svhrq); see the note on `fn open(` above."
+        );
     }
 }
 
