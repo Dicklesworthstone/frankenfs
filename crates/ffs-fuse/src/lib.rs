@@ -1985,6 +1985,29 @@ impl MountOptions {
     }
 }
 
+/// Number of kernel requests allowed to queue behind each active dispatch worker.
+///
+/// A path lookup produces separate FUSE requests (including the mandatory
+/// `security.capability` GETXATTR); the protocol cannot collapse them into one
+/// reply.  It can, however, keep the next requests queued while another worker
+/// returns the first one.  One outstanding request per worker defeats that
+/// overlap as soon as a worker is briefly occupied by a sibling lookup.
+const FUSE_QUEUED_REQUESTS_PER_WORKER: u16 = 16;
+
+/// Derive the kernel FUSE queue limits for a concurrent dispatcher.
+///
+/// This is deliberately independent of xattr values and request kinds: queue
+/// admission changes scheduling only, never whether a GETXATTR is sent or how
+/// it is answered.  Saturation is safe because the kernel ABI stores both
+/// values as `u16`.
+#[must_use]
+fn fuse_worker_queue_limits(worker_threads: usize) -> (u16, u16) {
+    let workers = u16::try_from(worker_threads).unwrap_or(u16::MAX).max(1);
+    let max_background = workers.saturating_mul(FUSE_QUEUED_REQUESTS_PER_WORKER);
+    let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+    (max_background, congestion_threshold)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum MountOptionParseError {
@@ -4648,8 +4671,8 @@ impl Drop for HandlerTimer<'_> {
 impl Filesystem for FrankenFuse {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
         if self.inner.worker_dispatch {
-            let max_background = u16::try_from(self.inner.thread_count).unwrap_or(u16::MAX);
-            let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+            let (max_background, congestion_threshold) =
+                fuse_worker_queue_limits(self.inner.thread_count);
             if let Err(nearest) = config.set_max_background(max_background) {
                 debug!(
                     max_background,
@@ -9331,6 +9354,105 @@ mod tests {
         }
     }
 
+    /// Writable xattr backend for the transport regression: the queue policy
+    /// may change request scheduling, but it must not let a cached absence
+    /// survive either xattr mutation.
+    #[derive(Default)]
+    struct CapabilityMutationFs {
+        capability: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl FsOps for CapabilityMutationFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Ok(test_inode_attr(ino.0, FfsFileType::RegularFile, 0o644))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Ok(test_inode_attr(1, FfsFileType::RegularFile, 0o644))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn getxattr(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            name: &str,
+        ) -> ffs_error::Result<Option<Vec<u8>>> {
+            if name == SECURITY_CAPABILITY_XATTR {
+                return Ok(self.capability.lock().clone());
+            }
+            Ok(None)
+        }
+
+        fn setxattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            name: &str,
+            value: &[u8],
+            _mode: XattrSetMode,
+        ) -> ffs_error::Result<()> {
+            if name == SECURITY_CAPABILITY_XATTR {
+                *self.capability.lock() = Some(value.to_vec());
+            }
+            Ok(())
+        }
+
+        fn removexattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            name: &str,
+        ) -> ffs_error::Result<bool> {
+            if name == SECURITY_CAPABILITY_XATTR {
+                return Ok(self.capability.lock().take().is_some());
+            }
+            Ok(false)
+        }
+    }
+
     #[test]
     fn capability_absence_is_memoized_on_rw_mounts_too_but_never_for_inode_zero() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9420,6 +9542,67 @@ mod tests {
             "a read-write mount must memoise capability absence too; the second \
              probe should not reach the filesystem"
         );
+    }
+
+    #[test]
+    fn capability_xattr_set_and_remove_invalidate_a_queued_mount_bd_yu6jz() {
+        let fuse = FrankenFuse::with_options(
+            Box::new(CapabilityMutationFs::default()),
+            &MountOptions {
+                read_only: false,
+                worker_threads: 4,
+                ..MountOptions::default()
+            },
+        );
+        let ino = InodeNumber(42);
+
+        with_switch(false, || {
+            assert_eq!(
+                fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
+                    .expect("initial capability probe"),
+                None,
+                "the first probe must establish a cacheable absence"
+            );
+            assert!(
+                fuse.inner.missing_capability_xattr.contains(ino),
+                "the absence must be cached before the mutation exercises invalidation"
+            );
+
+            let set_sender = RecordingSender::default();
+            fuse.setxattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                b"capability-bytes",
+                0,
+                0,
+                <ReplyEmpty as fuser::Reply>::new(1, set_sender.clone()),
+            );
+            assert_eq!(set_sender.errno(), None, "setxattr must still succeed");
+            assert_eq!(
+                fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
+                    .expect("probe after setxattr"),
+                Some(b"capability-bytes".to_vec()),
+                "setxattr must invalidate the cached absence before the next probe"
+            );
+
+            let remove_sender = RecordingSender::default();
+            fuse.removexattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                <ReplyEmpty as fuser::Reply>::new(2, remove_sender.clone()),
+            );
+            assert_eq!(
+                remove_sender.errno(),
+                None,
+                "removexattr must still succeed"
+            );
+            assert_eq!(
+                fuse.getxattr_value(ino, SECURITY_CAPABILITY_XATTR)
+                    .expect("probe after removexattr"),
+                None,
+                "removexattr must invalidate the prior present answer and restore absence"
+            );
+        });
     }
 
     /// The bd-d9378 A/B opt-out defaults ON and only the exact opt-out spellings
@@ -10635,6 +10818,25 @@ mod tests {
             ..MountOptions::default()
         };
         assert_eq!(opts.resolved_thread_count(), 1);
+    }
+
+    #[test]
+    fn worker_queue_keeps_path_lookup_requests_pipelined_without_suppression_bd_yu6jz() {
+        assert_eq!(
+            fuse_worker_queue_limits(1),
+            (16, 12),
+            "one worker must still admit a bounded queue of independent FUSE requests"
+        );
+        assert_eq!(
+            fuse_worker_queue_limits(4),
+            (64, 48),
+            "queue depth must scale with the dispatcher that drains it"
+        );
+        assert_eq!(
+            fuse_worker_queue_limits(usize::MAX),
+            (u16::MAX, 49_151),
+            "an excessive worker request must saturate in the kernel's u16 ABI"
+        );
     }
 
     #[test]
