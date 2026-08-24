@@ -224,6 +224,31 @@ pub fn splice_enabled() -> bool {
     splice_from_value(std::env::var("FFS_FUSE_SPLICE").ok().as_deref())
 }
 
+/// Whether this process batches a run of FUSE WRITEs into one MVCC transaction
+/// (bd-2i2ez). Default off.
+///
+/// Exists so `mount_candidate_knobs` can REPORT it. The mounted comparator
+/// requires the two candidate arms to disagree on a knob the ELF actually reads,
+/// and refuses the run otherwise —
+///
+///   "the two candidate configurations resolved IDENTICAL runtime knobs (...);
+///    the requested override never reached a knob this ELF reads, so the run
+///    would compare a configuration against itself"
+///
+/// — which is exactly what it said when `--candidate-b-env
+/// FFS_FUSE_WRITEBACK_BATCH=1` was passed to an ELF whose knob line did not
+/// mention writeback. The gate was right: without this accessor the A/B arm was
+/// unprovable, and an unprovable arm measured against itself is the inert-arm
+/// failure the knob line exists to prevent.
+///
+/// This reads the same variable `WritebackBatch::from_env` reads, so the knob
+/// line reports what the mount actually did rather than what was requested.
+#[must_use]
+pub fn writeback_batch_enabled() -> bool {
+    std::env::var("FFS_FUSE_WRITEBACK_BATCH")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+}
+
 /// Whether this process asks the kernel to handle `opendir` itself (bd-q0xnl).
 ///
 /// ZERO-MESSAGE OPENDIR. The kernel's own contract (`FUSE_NO_OPENDIR_SUPPORT`,

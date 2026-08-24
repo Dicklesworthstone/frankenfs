@@ -7943,7 +7943,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -7958,6 +7958,10 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             ffs_fuse::readdirplus_batch_attrs_enabled(),
             ffs_fuse::readdirplus_inode_order_enabled(),
             ffs_core::btrfs_readdir_prefetch_enabled(),
+            // bd-2i2ez: without this field the comparator refuses a
+            // --candidate-b-env FFS_FUSE_WRITEBACK_BATCH run outright, because it
+            // cannot prove the two arms differ.
+            ffs_fuse::writeback_batch_enabled(),
         );
     }
 
