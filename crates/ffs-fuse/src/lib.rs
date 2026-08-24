@@ -2004,7 +2004,11 @@ const FUSE_QUEUED_REQUESTS_PER_WORKER: u16 = 16;
 fn fuse_worker_queue_limits(worker_threads: usize) -> (u16, u16) {
     let workers = u16::try_from(worker_threads).unwrap_or(u16::MAX).max(1);
     let max_background = workers.saturating_mul(FUSE_QUEUED_REQUESTS_PER_WORKER);
-    let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+    let congestion_threshold = max_background
+        .saturating_div(4)
+        .saturating_mul(3)
+        .saturating_add((max_background % 4).saturating_mul(3).saturating_div(4))
+        .max(1);
     (max_background, congestion_threshold)
 }
 
