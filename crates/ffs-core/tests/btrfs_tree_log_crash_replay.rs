@@ -324,3 +324,143 @@ fn fsyncing_the_parent_directory_recovers_the_name_bd_jhuob() {
          that returned success must not lose its file (bd-jhuob)."
     );
 }
+
+// ── Second fixture family: transactions that DELETE a name (bd-jhuob) ───────
+//
+// The tests above all ADD names. A tree log leaf can express "this key now has
+// this value"; it has no tombstone, so it cannot express "this key is gone".
+// `btrfs_tree_log_has_deletions` is what stops the log being used for such a
+// transaction — the fsync takes `full_commit_log_overflow_fallback` instead —
+// and these tests are the gate on that guard staying honest.
+//
+// They are deliberately written to be STRATEGY-AGNOSTIC. What must hold is the
+// POSIX outcome after a crash, not which mechanism delivered it, so they pass
+// today (full-commit fallback) and must keep passing once a deletion record
+// lands and the log carries these transactions itself. A test that asserted
+// `log_root == 0` would pin today's implementation and fail the moment the
+// feature it is guarding arrives.
+//
+// The resurrection assertion is the one that matters. A log replayed over a
+// tree that has since dropped a name puts the name BACK — a deleted file
+// returning from the dead after a crash — which is the precise failure the
+// no-deletions guard exists to prevent and the precise failure a tombstone
+// implementation has to get right.
+
+/// Alternate content, so a stale item cannot pass by returning the right bytes
+/// from the wrong file.
+const OTHER_CONTENT: &[u8] = b"bd-jhuob second file, distinct from LOGGED_CONTENT";
+
+fn create_with(fs: &OpenFs, cx: &Cx, name: &str, content: &[u8]) -> InodeNumber {
+    let ino = fs
+        .create(cx, BTRFS_ROOT_DIR, OsStr::new(name), 0o644, 0, 0)
+        .unwrap_or_else(|error| panic!("create {name}: {error}"))
+        .ino;
+    let written = fs
+        .write(cx, ino, 0, content)
+        .unwrap_or_else(|error| panic!("write {name}: {error}"));
+    assert_eq!(written as usize, content.len(), "short write for {name}");
+    ino
+}
+
+fn content_of(fs: &OpenFs, cx: &Cx, name: &str, len: usize) -> Option<Vec<u8>> {
+    let attr = fs.lookup(cx, BTRFS_ROOT_DIR, OsStr::new(name)).ok()?;
+    Some(
+        fs.read(cx, attr.ino, 0, len as u32)
+            .unwrap_or_else(|error| panic!("read {name}: {error}")),
+    )
+}
+
+/// UNLINK then fsync a sibling, then crash. The unlinked file must stay gone and
+/// the sibling must keep its data.
+#[test]
+fn unlink_does_not_resurrect_across_a_crash_bd_jhuob() {
+    init_tracing();
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let Some(image) = mkfs_btrfs_image(tmp.path(), "jhuob-unlink.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-jhuob unlink crash replay");
+        return;
+    };
+    let cx = Cx::for_testing();
+
+    let fs = open_rw(&cx, &image, true).expect("open ephemeral btrfs mount");
+    let doomed = create_with(&fs, &cx, "doomed.bin", LOGGED_CONTENT);
+    let survivor = create_with(&fs, &cx, "survivor.bin", OTHER_CONTENT);
+    // Both names are in a tree log at this point — that is what makes the unlink
+    // interesting: the log that would replay still NAMES `doomed.bin`.
+    fs.fsync(&cx, doomed, 0, false).expect("fsync doomed");
+    fs.fsync(&cx, survivor, 0, false).expect("fsync survivor");
+
+    fs.unlink(&cx, BTRFS_ROOT_DIR, OsStr::new("doomed.bin"))
+        .expect("unlink doomed.bin");
+    // The fsync AFTER the unlink is the commit point under test.
+    fs.fsync(&cx, survivor, 0, false)
+        .expect("fsync survivor after the unlink");
+    drop(fs);
+
+    let recovered = open_rw(&cx, &image, false).expect("recovery mount");
+    let resurrected = recovered.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new("doomed.bin"));
+    let survivor_bytes = content_of(&recovered, &cx, "survivor.bin", OTHER_CONTENT.len());
+    drop(recovered);
+
+    assert!(
+        resurrected.is_err(),
+        "THE UNLINKED FILE CAME BACK. A tree log written before the unlink was replayed over \
+         a tree that had already dropped the name, so a deleted file returned after a crash. \
+         This is what `btrfs_tree_log_has_deletions` exists to prevent; if a deletion record \
+         has just been added to the log, it is not encoding the removal (bd-jhuob)."
+    );
+    assert_eq!(
+        survivor_bytes.as_deref(),
+        Some(OTHER_CONTENT),
+        "the surviving file lost the data its fsync acknowledged"
+    );
+}
+
+/// RENAME OVER an existing file, then crash. The destination must hold the
+/// SOURCE's bytes and the source name must be gone — a rename-over is a deletion
+/// of the destination's old inode reference plus a namespace move.
+#[test]
+fn rename_over_survives_a_crash_bd_jhuob() {
+    init_tracing();
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let Some(image) = mkfs_btrfs_image(tmp.path(), "jhuob-rename-over.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-jhuob rename-over crash replay");
+        return;
+    };
+    let cx = Cx::for_testing();
+
+    let fs = open_rw(&cx, &image, true).expect("open ephemeral btrfs mount");
+    let src = create_with(&fs, &cx, "src.bin", LOGGED_CONTENT);
+    let dst = create_with(&fs, &cx, "dst.bin", OTHER_CONTENT);
+    fs.fsync(&cx, src, 0, false).expect("fsync src");
+    fs.fsync(&cx, dst, 0, false).expect("fsync dst");
+
+    fs.rename(
+        &cx,
+        BTRFS_ROOT_DIR,
+        OsStr::new("src.bin"),
+        BTRFS_ROOT_DIR,
+        OsStr::new("dst.bin"),
+    )
+    .expect("rename src.bin over dst.bin");
+    fs.fsync(&cx, src, 0, false)
+        .expect("fsync the renamed inode");
+    drop(fs);
+
+    let recovered = open_rw(&cx, &image, false).expect("recovery mount");
+    let dst_bytes = content_of(&recovered, &cx, "dst.bin", LOGGED_CONTENT.len());
+    let src_still_there = recovered.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new("src.bin"));
+    drop(recovered);
+
+    assert_eq!(
+        dst_bytes.as_deref(),
+        Some(LOGGED_CONTENT),
+        "after a crash, dst.bin does not hold src.bin's bytes: the rename-over was \
+         acknowledged by fsync and then lost or half-applied (bd-jhuob)"
+    );
+    assert!(
+        src_still_there.is_err(),
+        "src.bin is still present after a rename-over, so the crash left BOTH names \
+         pointing at the inode — a replayed log re-added the source name (bd-jhuob)"
+    );
+}
