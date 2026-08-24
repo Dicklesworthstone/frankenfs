@@ -44,6 +44,7 @@ impl FrankenFuse {
                 // mounted instruments).
                 zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             }),
+            final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         }
     }
 
@@ -101,7 +102,28 @@ impl FrankenFuse {
     fn shared_handle(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            final_flush_errno: Arc::clone(&self.final_flush_errno),
         }
+    }
+
+    /// Record the failure that `fuser` cannot return from `Filesystem::destroy`.
+    ///
+    /// The blocking mount owner checks this once `Session::run` returns. Keeping
+    /// the native errno makes a final ENOSPC distinguishable from generic I/O
+    /// failure to the CLI and its caller.
+    fn record_final_flush_failure(&self, error: &FfsError) {
+        self.final_flush_errno
+            .store(error.to_errno(), std::sync::atomic::Ordering::Release);
+    }
+
+    fn final_flush_result(&self) -> Result<(), FuseError> {
+        let errno = self
+            .final_flush_errno
+            .load(std::sync::atomic::Ordering::Acquire);
+        if errno == 0 {
+            return Ok(());
+        }
+        Err(FuseError::Io(std::io::Error::from_raw_os_error(errno)))
     }
 
     fn install_kernel_notifier(&self, notifier: fuser::Notifier) {

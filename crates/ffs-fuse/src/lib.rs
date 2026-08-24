@@ -4626,6 +4626,10 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
 #[derive(Clone)]
 pub struct FrankenFuse {
     inner: Arc<FuseInner>,
+    // `Filesystem::destroy` cannot return an error. Retain a final-flush errno
+    // per mount so the blocking `mount` caller can still fail after its session
+    // ends rather than reporting a successful unmount after lost writes.
+    final_flush_errno: Arc<std::sync::atomic::AtomicI32>,
 }
 
 // Compile-time assertions: FrankenFuse must be Send + Sync.
@@ -5014,6 +5018,7 @@ impl Filesystem for FrankenFuse {
     fn destroy(&mut self) {
         let cx = Self::cx_for_request();
         if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {
+            self.record_final_flush_failure(&e);
             // ERROR, not WARN, and the only `error!` in this file — deliberately.
             //
             // This is the last chance to persist. If it fails, everything the
@@ -6880,6 +6885,7 @@ pub fn mount(
     // crossings_total counts what reached `dispatch`. A future fast path that
     // answers before the scope opens will show up as the gap between them.
     emit_crossing_evidence(&crossings::render_live_timed());
+    fs.final_flush_result()?;
     // bd-viil0: the session has run to completion, so these are the FINAL counters.
     // Returning them rather than `()` is what lets the STANDARD mount runtime report
     // real dispatch attribution instead of hand-constructed zeros — the managed
@@ -7606,6 +7612,7 @@ mod tests {
         };
         let fuse = FrankenFuse {
             inner: Arc::new(inner),
+            final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         };
         for ino in [InodeNumber(12), InodeNumber(13)] {
             let mut attr = make_test_attr(FfsFileType::RegularFile, ino.0 * 100);
@@ -9880,6 +9887,86 @@ mod tests {
         ) -> ffs_error::Result<Vec<u8>> {
             Ok(vec![])
         }
+    }
+
+    /// A backend whose only failure is the durability boundary FUSE invokes
+    /// after the kernel has already accepted ordinary operations.
+    struct FinalFlushFailsTestFs;
+
+    impl FsOps for FinalFlushFailsTestFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn flush_on_destroy(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            Err(FfsError::NoSpace)
+        }
+    }
+
+    #[test]
+    fn final_destroy_flush_failure_reaches_the_mount_caller_bd_f3fsg() {
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let mut failing = FrankenFuse::with_options(Box::new(FinalFlushFailsTestFs), &options);
+        failing.destroy();
+        let error = failing
+            .final_flush_result()
+            .expect_err("a failed final flush must fail the outer mount caller");
+        assert!(matches!(
+            error,
+            FuseError::Io(ref io_error) if io_error.raw_os_error() == Some(libc::ENOSPC)
+        ));
+
+        let mut clean = FrankenFuse::with_options(Box::new(MinimalTestFs), &options);
+        clean.destroy();
+        assert!(clean.final_flush_result().is_ok());
     }
 
     struct CountingMissingXattrFs {
