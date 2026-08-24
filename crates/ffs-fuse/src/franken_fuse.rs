@@ -126,6 +126,11 @@ impl FrankenFuse {
     }
 
     fn notify_entry_invalidation(&self, parent: u64, name: &OsStr) {
+        // An entry invalidation names a parent/name, not the inode displaced by
+        // a rename-over or removed by unlink. Drop every pending READDIRPLUS
+        // hand-off before the notifier early-return so this boundary is also
+        // correct in unit tests and before a live mount installs its notifier.
+        self.inner.invalidate_readdirplus_entries();
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };

@@ -3673,6 +3673,20 @@ impl ReaddirplusAttrMemo {
             state[idx] = None;
         }
     }
+
+    /// Drop every pending hand-off after a namespace mutation.
+    ///
+    /// `rename` and `unlink` identify the changed directory entry, not every
+    /// inode whose identity may have changed. In particular, rename-over can
+    /// retire the destination inode without naming it at this invalidation
+    /// seam. Clearing this bounded, single-use table is therefore the only
+    /// sound answer until the next readdirplus rebuilds its hand-offs.
+    fn clear(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.fill(None);
+    }
 }
 
 // ── Shared FUSE inner state ─────────────────────────────────────────────────
@@ -3790,6 +3804,13 @@ impl FuseInner {
     /// before the kernel has a chance to consume the hand-off.
     fn invalidate_readdirplus_attrs(&self, ino: InodeNumber) {
         self.readdirplus_attr_memo.forget(ino);
+    }
+
+    /// A namespace mutation can replace or unlink an inode that its parent
+    /// entry invalidation does not identify, so it invalidates every pending
+    /// readdirplus-to-getattr hand-off.
+    fn invalidate_readdirplus_entries(&self) {
+        self.readdirplus_attr_memo.clear();
     }
 }
 
@@ -7436,6 +7457,111 @@ mod tests {
             inner.readdirplus_attr_memo.take(ino).is_none(),
             "a metadata mutation must never let GETATTR consume READDIRPLUS's stale attributes"
         );
+    }
+
+    /// A rename-over only identifies the destination directory entry; it does
+    /// not provide the inode number of the file it replaces. Every pending
+    /// READDIRPLUS hand-off must therefore be dropped at that namespace seam.
+    #[test]
+    fn rename_over_entry_invalidation_drops_all_pending_readdirplus_attrs() {
+        let inner = FuseInner {
+            ops: Arc::new(MinimalTestFs),
+            metrics: Arc::new(AtomicMetrics::new()),
+            thread_count: 1,
+            worker_dispatch: false,
+            parallel_dirops: false,
+            read_only: false,
+            count_memoized_requests: true,
+            mountpoint: None,
+            kernel_notifier: Mutex::new(None),
+            ioctl_trace: None,
+            backpressure: None,
+            access_predictor: AccessPredictor::default(),
+            readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+            readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(4, true),
+            missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
+            zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+        };
+        let fuse = FrankenFuse {
+            inner: Arc::new(inner),
+        };
+        for ino in [InodeNumber(12), InodeNumber(13)] {
+            let mut attr = make_test_attr(FfsFileType::RegularFile, ino.0 * 100);
+            attr.ino = ino;
+            fuse.inner.readdirplus_attr_memo.remember(ino, &attr);
+        }
+
+        fuse.notify_entry_invalidation(1, OsStr::new("destination"));
+
+        for ino in [InodeNumber(12), InodeNumber(13)] {
+            assert!(
+                fuse.inner.readdirplus_attr_memo.take(ino).is_none(),
+                "rename-over must not let the next getattr consume {ino:?}'s stale attributes"
+            );
+        }
+    }
+
+    /// An entry can disappear after readdir has supplied its name but before
+    /// readdirplus fetches attributes. It must be skipped rather than emitted
+    /// with a stale or fabricated attribute reply.
+    #[test]
+    fn readdirplus_skips_an_entry_unlinked_during_listing() {
+        let fuse = FrankenFuse::with_options(Box::new(MinimalTestFs), &MountOptions::default());
+        let entry = FfsDirEntry {
+            ino: InodeNumber(71),
+            offset: 1,
+            kind: FfsFileType::RegularFile,
+            name: b"unlinked-before-attr".to_vec(),
+        };
+        let mut prefetched = None;
+        let mut census_served = 0;
+        let mut census_inline = 0;
+
+        assert!(
+            fuse.readdirplus_entry_attr(
+                &Cx::for_testing(),
+                &mut prefetched,
+                &entry,
+                0,
+                &mut census_served,
+                &mut census_inline,
+            )
+            .is_none(),
+            "an unlink racing readdirplus must skip the vanished entry"
+        );
+    }
+
+    /// A large directory needs many FUSE replies. Direct-map collisions between
+    /// an early page and a later page must cause a miss, never return the older
+    /// page's attributes for the later inode.
+    #[test]
+    fn readdirplus_large_directory_pages_never_cross_serve_attrs() {
+        let memo = ReaddirplusAttrMemo::with_slots(4, true);
+        for page_start in (1_u64..=128).step_by(4) {
+            for ino in page_start..page_start + 4 {
+                let inode = InodeNumber(ino);
+                let mut attr = make_test_attr(FfsFileType::RegularFile, ino * 10);
+                attr.ino = inode;
+                memo.remember(inode, &attr);
+            }
+        }
+
+        for ino in 125_u64..=128 {
+            let attr = memo
+                .take(InodeNumber(ino))
+                .expect("the final reply page keeps its own hand-off");
+            assert_eq!(attr.ino, InodeNumber(ino));
+            assert_eq!(attr.size, ino * 10);
+        }
+        for ino in 1_u64..=4 {
+            assert!(
+                memo.take(InodeNumber(ino)).is_none(),
+                "an earlier reply page must miss after a colliding later page, not cross-serve"
+            );
+        }
     }
 
     /// Disabled means it never FILLS, not merely that it never answers.
