@@ -11661,6 +11661,34 @@ fn split_tree_log_deletion_records(
     Ok((items, deleted_keys))
 }
 
+fn tree_log_replay_result(entries: Vec<BtrfsLeafEntry>) -> Result<TreeLogReplayResult, ParseError> {
+    let items_count = entries.len();
+    let has_deletions = entries.iter().any(|entry| {
+        entry.key.objectid == BTRFS_TREE_LOG_DELETE_OBJECTID
+            && entry.key.item_type == BTRFS_ITEM_TREE_LOG_DELETE
+    });
+    // The encoder is intentionally landable before ffs-core understands the
+    // deletion sidecar. Default-off means an old core refuses writes after a
+    // crash rather than pretending an unlink or rename did not happen.
+    if has_deletions && !cfg!(feature = "tree-log-deletion-replay") {
+        return Ok(TreeLogReplayResult {
+            items: Vec::new(),
+            deleted_keys: Vec::new(),
+            items_count: 0,
+            replayed: false,
+            foreign_format: true,
+        });
+    }
+    let (items, deleted_keys) = split_tree_log_deletion_records(entries)?;
+    Ok(TreeLogReplayResult {
+        items,
+        deleted_keys,
+        items_count,
+        replayed: true,
+        foreign_format: false,
+    })
+}
+
 /// Result of scanning the btrfs tree-log.
 ///
 /// The tree-log is a per-subvolume journal used for efficient fsync. When
@@ -11822,22 +11850,15 @@ pub fn replay_tree_log(
             return Ok(TreeLogReplayResult::default());
         }
         let logged = walk_tree(read_physical, chunks, log_tree, sb.nodesize, sb.csum_type)?;
-        let items_count = logged.len();
-        let (items, deleted_keys) = split_tree_log_deletion_records(logged)?;
+        let result = tree_log_replay_result(logged)?;
         tracing::info!(
             log_root = sb.log_root,
             log_tree,
             subvol_objectid,
-            items_replayed = items_count,
+            items_replayed = result.items_count,
             "btrfs tree-log replay complete (log root tree)"
         );
-        return Ok(TreeLogReplayResult {
-            items_count,
-            items,
-            deleted_keys,
-            replayed: true,
-            foreign_format: false,
-        });
+        return Ok(result);
     }
 
     tracing::info!(
@@ -11845,15 +11866,7 @@ pub fn replay_tree_log(
         "btrfs tree-log replay complete"
     );
 
-    let items_count = items.len();
-    let (items, deleted_keys) = split_tree_log_deletion_records(items)?;
-    Ok(TreeLogReplayResult {
-        items_count,
-        items,
-        deleted_keys,
-        replayed: true,
-        foreign_format: false,
-    })
+    tree_log_replay_result(items)
 }
 
 #[cfg(test)]
@@ -20726,6 +20739,25 @@ mod tests {
             deleted_keys,
             vec![dir_item, dir_index],
             "replay must receive the exact DIR_ITEM and DIR_INDEX keys"
+        );
+    }
+
+    #[cfg(not(feature = "tree-log-deletion-replay"))]
+    #[test]
+    fn tree_log_delete_records_fail_closed_until_core_overlay_lands_bd_uxh7t() {
+        let result = tree_log_replay_result(vec![tree_log_delete_record(
+            0,
+            BtrfsKey {
+                objectid: 256,
+                item_type: BTRFS_ITEM_DIR_ITEM,
+                offset: 1,
+            },
+        )])
+        .expect("a supported but disabled feature is not malformed");
+        assert!(result.foreign_format, "default-off deletion replay must fail closed");
+        assert!(
+            !result.replayed,
+            "an old core cannot safely apply a deletion-only log"
         );
     }
 
