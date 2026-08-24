@@ -20291,13 +20291,12 @@ impl OpenFs {
             // first fsync correctly clears INODE_UNINIT and stamps its checksum;
             // the second must re-stamp that checksum over the cleared bits rather
             // than treating the group as untouched just because its count is full.
-            let inode_bitmap = if !gs.inode_bitmap_uninit()
-                || gs.free_inodes < alloc.geo.inodes_in_group(group)
-            {
-                Some(device.read_block(cx, gs.inode_bitmap_block)?.into_inner())
-            } else {
-                None
-            };
+            let inode_bitmap =
+                if !gs.inode_bitmap_uninit() || gs.free_inodes < alloc.geo.inodes_in_group(group) {
+                    Some(device.read_block(cx, gs.inode_bitmap_block)?.into_inner())
+                } else {
+                    None
+                };
             let block_bitmap = if gs.free_blocks < alloc.geo.blocks_in_group(group) {
                 Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
             } else {
