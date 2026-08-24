@@ -770,15 +770,19 @@ pub const BTRFS_ROOT_ITEM_SIZE: usize = 279;
 /// ⚠️ PROVENANCE: measured, not counted. Compiled against
 /// `/usr/include/linux/btrfs_tree.h` on this box:
 ///
-///     sizeof(btrfs_root_item)  = 439
-///     legacy (offsetof gen_v2) = 239
-///     sizeof(btrfs_inode_item) = 160
+/// ```text
+/// sizeof(btrfs_root_item)  = 439
+/// legacy (offsetof gen_v2) = 239
+/// sizeof(btrfs_inode_item) = 160
+/// ```
 ///
 /// The kernel's tree-checker accepts exactly these two lengths and rejects
 /// everything else, which is how the short form was found (bd-jhuob):
 ///
-///     BTRFS critical: corrupt leaf: root=18446744073709551610 block=32473088
-///                     slot=0, invalid root item size, have 279 expect 439 or 239
+/// ```text
+/// BTRFS critical: corrupt leaf: root=18446744073709551610 block=32473088
+///                 slot=0, invalid root item size, have 279 expect 439 or 239
+/// ```
 pub const BTRFS_ROOT_ITEM_FULL_SIZE: usize = 439;
 
 
@@ -869,7 +873,9 @@ impl BtrfsRootItem {
     /// [`BTRFS_ROOT_ITEM_SIZE`] (279) — the prefix this crate patches — and the
     /// kernel's tree-checker rejects any ROOT_ITEM that is neither 439 nor 239:
     ///
-    ///     invalid root item size, have 279 expect 439 or 239
+    /// ```text
+    /// invalid root item size, have 279 expect 439 or 239
+    /// ```
     ///
     /// It went unnoticed because our own parser reads a prefix and does not care
     /// what follows, so a short item round-trips through us and is refused by
@@ -1197,7 +1203,9 @@ impl BtrfsDirItem {
 /// written out of order -- the pointer says 10 and the block says 9, and the
 /// kernel refuses to open the filesystem with:
 ///
-///     parent transid verify failed on logical N wanted 10 found 9
+/// ```text
+/// parent transid verify failed on logical N wanted 10 found 9
+/// ```
 ///
 /// We need our own copy because of the asymmetry that makes bd-73bi2 dangerous:
 /// FrankenFS reads such an image back perfectly and lists every file, so no test
@@ -8362,8 +8370,10 @@ impl BtrfsExtentAllocator {
     /// carries SYSTEM chunks only. A chunk root sitting in a metadata block group
     /// is therefore unmappable at the moment the kernel needs to map it:
     ///
-    ///     No mapping for 60375040-60391424
-    ///     ERROR: cannot read chunk root
+    /// ```text
+    /// No mapping for 60375040-60391424
+    /// ERROR: cannot read chunk root
+    /// ```
     ///
     /// — which is exactly what the bd-a136s acceptance gate produced when the
     /// chunk tree was serialized with `alloc_metadata_for_tree`. That is what
@@ -20506,8 +20516,10 @@ mod tests {
     /// so a chunk root allocated out of a METADATA block group is unmappable at
     /// exactly the moment the kernel must map it:
     ///
-    ///     No mapping for 60375040-60391424
-    ///     ERROR: cannot read chunk root
+    /// ```text
+    /// No mapping for 60375040-60391424
+    /// ERROR: cannot read chunk root
+    /// ```
     ///
     /// That is what a real run produced when the chunk tree was serialized with
     /// `alloc_metadata_for_tree`. Twenty-four unit tests passed against that

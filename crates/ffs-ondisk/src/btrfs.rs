@@ -377,10 +377,12 @@ impl BtrfsSuperblock {
     /// the `dev_item` embedded at 0x65. A superblock published that way is
     /// rejected by the kernel outright:
     ///
-    ///     BTRFS error: dev_item UUID does not match metadata fsid:
-    ///                  7edb9d6b-... != 00000000-0000-0000-0000-000000000000
-    ///     BTRFS error: superblock contains fatal errors
-    ///     BTRFS error: open_ctree failed: -22
+    /// ```text
+    /// BTRFS error: dev_item UUID does not match metadata fsid:
+    ///              7edb9d6b-... != 00000000-0000-0000-0000-000000000000
+    /// BTRFS error: superblock contains fatal errors
+    /// BTRFS error: open_ctree failed: -22
+    /// ```
     ///
     /// which is exactly what an image carrying a tree log this crate wrote
     /// produced when handed to a kernel mount. The full-commit path has always
@@ -394,10 +396,12 @@ impl BtrfsSuperblock {
     /// commit rewrites neither. Advancing it says the root tree was rewritten when
     /// it was not, and the kernel checks:
     ///
-    ///     BTRFS error: parent transid verify failed on logical 32440320
-    ///                  mirror 1 wanted 14 found 10
-    ///     BTRFS warning: couldn't read tree root
-    ///     BTRFS error: open_ctree failed: -5
+    /// ```text
+    /// BTRFS error: parent transid verify failed on logical 32440320
+    ///              mirror 1 wanted 14 found 10
+    /// BTRFS warning: couldn't read tree root
+    /// BTRFS error: open_ctree failed: -5
+    /// ```
     ///
     /// Also measured, on the image produced once the `dev_item` fault above was
     /// fixed: 14 was the superblock's generation after four fsyncs each bumped it,

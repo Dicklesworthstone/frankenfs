@@ -140,7 +140,7 @@ enum BtrfsDeferredReadResult {
 enum BtrfsReadJob<'o> {
     Inline {
         idx: usize,
-        data: Vec<u8>,
+        data: &'o [u8],
         comp: u8,
         ram: usize,
     },
@@ -1520,6 +1520,11 @@ pub struct OpenFs {
     /// dominant cost of an ext4 lookup once name resolution is O(1)
     /// (bd-cc-ext4-attrcache). Never populated on writable mounts.
     ext4_inode_attr_cache: ShardedCache<u64, InodeAttr>,
+    /// Parsed external xattr blocks, keyed by inode number. `listxattr` and
+    /// `getxattr` otherwise read and parse the same `i_file_acl` block on every
+    /// request. Entries carry the inode's xattr-relevant generation so a reader
+    /// that raced a mutation cannot serve its pre-mutation block.
+    ext4_inode_xattr_block_cache: ShardedCache<u64, CachedExt4XattrBlock>,
     /// Bounded ext4 base-device block cache for repeated metadata reads.
     ///
     /// This sits below the MVCC overlay and is ext4-only: htree/name-index
@@ -1769,7 +1774,12 @@ pub struct OpenFs {
     ///
     /// Bounded by construction: ONE leaf, not a structure that grows with the
     /// filesystem — which is the property bd-5vis3 exists to preserve.
-    btrfs_floor_leaf_memo: Mutex<[Option<BtrfsFloorLeafMemo>; BTRFS_FLOOR_MEMO_SLOTS]>,
+    /// Boxed slice rather than a fixed array so the slot count is a RUNTIME value
+    /// (bd-2s8zy). It has to be: the mounted comparator can only A/B two
+    /// configurations that come from ONE ELF, so a compile-time constant cannot be
+    /// measured against the live kernel at all — which is exactly where the 4 -> 16
+    /// change was left.
+    btrfs_floor_leaf_memo: Mutex<Box<[Option<BtrfsFloorLeafMemo>]>>,
     /// Round-robin victim for [`BTRFS_FLOOR_MEMO_SLOTS`] (bd-yu6jz).
     ///
     /// Round-robin rather than LRU on purpose: LRU needs a timestamp write on every
@@ -1818,6 +1828,24 @@ pub struct OpenFs {
     /// one relaxed add on the miss path and one relaxed store on the hit path, and
     /// it never needs to be reset by anything but a hit.
     btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32,
+    /// How many times the miss-streak gate has actually SUPPRESSED a replacement
+    /// (bd-79li3).
+    ///
+    /// The gate's own doc asserts it is "sized above the miss-per-leaf-crossing
+    /// rate a sweep produces, so the sweep case never trips it", and that claim was
+    /// only ever checked SYNTHETICALLY — by calling `should_replace` in a loop
+    /// with a hand-built hit/miss pattern. It matters because bd-79li3 carries an
+    /// explicit warning that a gate firing on a sweep would cost 1.88x on the worst
+    /// row in the bank, and the capability probe makes the sweep miss-heavy by
+    /// construction: an absent xattr bucket sorts past the reached leaf's last key,
+    /// so the span check fails on nearly every probe even though the descent lands
+    /// on the same leaf.
+    ///
+    /// Cumulative and never reset by a hit — a hit resets the STREAK, which is the
+    /// thing the gate reads, but zeroing this too would hide every firing that a
+    /// later hit recovered from, which is precisely the pattern in question.
+    /// Incremented only on the suppression branch, so the hot path pays nothing.
+    btrfs_floor_memo_suppressions: std::sync::atomic::AtomicU64,
     /// Read-only per-directory name→child_objectid map (the btrfs analog of the
     /// ext4 present-index). On a read-only mount the directory is immutable, so a
     /// map built once from readdir serves `btrfs_lookup_child` name resolution in
@@ -1847,6 +1875,73 @@ pub struct OpenFs {
 /// the lock-free hot-inode slot: the INODE_ITEM plus its full
 /// `(logical offset, EXTENT_DATA)` extent list.
 type BtrfsRoInodeExtents = Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)>;
+
+/// Extents selected for one btrfs read. Mutable and tree-log-backed reads own
+/// parsed extent data, while immutable cache paths retain their cache backing
+/// and borrow just the window selected by [`OpenFs::btrfs_window_extent_indices`].
+/// This matters for inline extents: cloning the selected `BtrfsExtentData`
+/// otherwise cloned the file payload before the read path copied its requested
+/// bytes into the caller's buffer (bd-vpypn).
+enum BtrfsReadExtents {
+    Owned(Vec<(u64, BtrfsExtentData)>),
+    ReadPlan {
+        rows: Arc<[(u64, BtrfsExtentData)]>,
+        indices: Vec<usize>,
+    },
+    Cached {
+        entry: BtrfsRoInodeExtents,
+        indices: Vec<usize>,
+    },
+}
+
+enum BtrfsReadExtentIter<'a> {
+    Owned(std::slice::Iter<'a, (u64, BtrfsExtentData)>),
+    Indexed {
+        rows: &'a [(u64, BtrfsExtentData)],
+        indices: std::slice::Iter<'a, usize>,
+    },
+}
+
+impl<'a> Iterator for BtrfsReadExtentIter<'a> {
+    type Item = (&'a u64, &'a BtrfsExtentData);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(rows) => rows.next().map(|(logical_start, extent)| (logical_start, extent)),
+            Self::Indexed { rows, indices } => indices.next().map(|index| {
+                let (logical_start, extent) = &rows[*index];
+                (logical_start, extent)
+            }),
+        }
+    }
+}
+
+impl BtrfsReadExtents {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(rows) => rows.len(),
+            Self::ReadPlan { indices, .. } | Self::Cached { indices, .. } => indices.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn iter(&self) -> BtrfsReadExtentIter<'_> {
+        match self {
+            Self::Owned(rows) => BtrfsReadExtentIter::Owned(rows.iter()),
+            Self::ReadPlan { rows, indices } => BtrfsReadExtentIter::Indexed {
+                rows,
+                indices: indices.iter(),
+            },
+            Self::Cached { entry, indices } => BtrfsReadExtentIter::Indexed {
+                rows: &entry.1,
+                indices: indices.iter(),
+            },
+        }
+    }
+}
 
 /// Immutable directory rows of [`BtrfsReadPlanIndex`], shared as a slice.
 type BtrfsDirItems = Arc<[(BtrfsKey, Vec<u8>)]>;
@@ -2107,6 +2202,7 @@ type BtrfsCsumItems = Vec<(BtrfsKey, Vec<u8>)>;
 
 const EXT4_FILE_DATA_BLOCK_CACHE_LIMIT: usize = 256;
 const EXT4_INODE_ATTR_CACHE_LIMIT: usize = 65536;
+const EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT: usize = 4096;
 /// Maximum number of immutable btrfs inode attributes retained by the
 /// read-only resolver.  This is deliberately smaller than the ext4 limit:
 /// btrfs inode resolution is an on-disk tree descent, so a bounded cache can
@@ -2207,12 +2303,111 @@ struct BtrfsFloorLeafMemo {
 /// through this memo, and a full descent is root PLUS leaf, so each avoidable boundary
 /// miss is two device reads rather than one.
 ///
-/// Four is chosen to cover the alternation, not to be a cache: the sweep's working set
-/// at any instant is the leaf under the cursor plus its neighbour, doubled by the two
-/// key streams. Larger would start to duplicate `btrfs_parsed_node_cache`, which already
-/// bounds parsed nodes at `BTRFS_TREE_NODE_CACHE_LIMIT`, and would widen the window in
-/// which a retained leaf is stale-but-unused memory on a mount that never sweeps.
+/// FOUR, RESTORED FROM SIXTEEN ON A WALL-CLOCK MEASUREMENT THAT REFUTED THE
+/// COUNTED ONE (bd-2s8zy). This doc is deliberately a record of that, because the
+/// counted argument for sixteen is genuinely persuasive and would otherwise be made
+/// again.
+///
+/// 692af94aa raised this 4 -> 16 on counts alone, having established that four was
+/// below the working set: the memo must hold at least one leaf per CONCURRENT
+/// DESCENT STREAM, doubled for the two key streams each sweep alternates between
+/// (`getattr` reading INODE_ITEM, the capability probe reading XATTR_ITEM), and the
+/// banked worst row `readdir-stat-8t` presents eight streams. That reasoning is
+/// still correct, and sixteen still takes far fewer node lookups — the counts are
+/// reproducible from one ELF via
+/// [`OpenFs::btrfs_resize_floor_memo_for_measurement`]:
+///
+/// ```text
+///                   4 slots     16 slots
+/// sequential          15151         5167    2.93x fewer
+/// 8-way interleaved   23875        15377    1.55x fewer
+/// ```
+///
+/// THE LOOKUPS IT SAVES ARE CHEAPER THAN THE SLOTS IT ADDS, which is what the
+/// counted table could not see and what pricing it found. Priced in wall clock on
+/// the interleaved order, balanced 3-arm rotation with the A/A null riding inside
+/// the same window, 30 rounds, 6,000 entries: sixteen slots is **6-12% SLOWER**
+/// than four, decidable in 4 of 4 runs against a noise floor near 1.9%, direction
+/// unanimous across all eight null-arm estimates. Both mechanisms are O(slots) and
+/// both run on the hot path:
+///
+///   * the memo LOOKUP linearly scans every slot under a mutex on every
+///     memoizable floor descent, so four times the slots is four times the scan
+///     on all ~15-24k of them;
+///   * the install path snapshots slot identities on every MISS — and a miss is
+///     the COMMON case for the capability probe, whose absent xattr bucket sorts
+///     past the reached leaf's last key and so never satisfies the span check.
+///
+/// The saved lookups, by contrast, are overwhelmingly `btrfs_parsed_node_cache`
+/// HITS. 692af94aa said in its own commit message that "a 2.93x cut in lookups is
+/// NOT a 2.93x cut in time and must not be quoted as one"; measured, it is not even
+/// a cut in time in the right direction.
+///
+/// SO THE POLICY IS NOT "one slot per concurrent stream" after all. It is: keep the
+/// memo small enough that scanning it costs less than the descent it saves, and
+/// treat a counted improvement in descents as a HYPOTHESIS about time rather than
+/// evidence of it. Raising this number again requires the priced A/B, not a
+/// working-set argument.
+///
+/// The upper bound the original four was protecting still holds independently: a
+/// retained leaf is memory a mount that never sweeps does not use, and enough of
+/// them would duplicate `btrfs_parsed_node_cache` (bounded by
+/// `BTRFS_TREE_NODE_CACHE_LIMIT`).
 const BTRFS_FLOOR_MEMO_SLOTS: usize = 4;
+
+/// Slot count for the floor-leaf memo, honouring `FFS_BTRFS_FLOOR_MEMO_SLOTS`.
+///
+/// THE KNOB EXISTS TO MAKE THE SIZING MEASURABLE, not to be tuned in production.
+/// The mounted comparator refuses a candidate A/B whose two arms do not come from
+/// ONE ELF and cannot be shown to differ on a knob the daemon self-reports, so a
+/// compile-time slot count can never be measured against the live kernel — which
+/// is precisely where 692af94aa left the 4 -> 16 change. Reading it from the
+/// environment lets one ELF supply both arms so the ISA and PGO provenance cancel
+/// between them (bd-b9dug).
+///
+/// Zero and unparseable values fall back to the default rather than disabling the
+/// memo: a zero-slot memo is a silent ~2.9x increase in descent work, not a
+/// configuration anyone means.
+fn btrfs_floor_memo_slot_count() -> usize {
+    btrfs_floor_memo_slots_from_value(
+        std::env::var("FFS_BTRFS_FLOOR_MEMO_SLOTS").ok().as_deref(),
+    )
+}
+
+/// Pure half of the knob, so the spelling is testable without mutating
+/// process-global environment — racy under the parallel harness, and `unsafe` from
+/// edition 2024, which this workspace forbids. Mirrors how the other `FFS_*`
+/// switches in this workspace are split.
+fn btrfs_floor_memo_slots_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|slots| *slots > 0)
+        .unwrap_or(BTRFS_FLOOR_MEMO_SLOTS)
+}
+
+/// The effective floor-leaf memo slot count, for the mount's self-reported knob
+/// line (bd-2s8zy).
+///
+/// The comparator proves two candidate arms differ by reading the knobs the DAEMON
+/// reports, so a knob that is not reported cannot be A/B'd — it refuses the run
+/// outright rather than compare a configuration against itself. That is not
+/// hypothetical: it is what happened to FFS_FUSE_WRITEBACK_BATCH earlier today.
+#[must_use]
+pub fn btrfs_floor_memo_slots_effective() -> usize {
+    btrfs_floor_memo_slot_count()
+}
+
+/// Allocate a fresh floor-leaf memo at the configured size.
+fn btrfs_floor_memo_new_slots() -> Box<[Option<BtrfsFloorLeafMemo>]> {
+    // `(0..n).map(|_| None)` rather than `vec![None; n]`: `BtrfsFloorLeafMemo` holds
+    // an `Arc<BtrfsParsedNode>` and is deliberately not `Clone`, so the repeat form
+    // does not compile — and making it `Clone` to satisfy a constructor would make
+    // it possible to duplicate a retained leaf by accident.
+    (0..btrfs_floor_memo_slot_count())
+        .map(|_| None)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 /// Does this retained leaf answer `target` on `root_logical`?
 ///
@@ -2535,6 +2730,26 @@ type CacheShards<K, V> = Box<[Mutex<rustc_hash::FxHashMap<K, V>>]>;
 struct ShardedCache<K, V> {
     shards: CacheShards<K, V>,
     len: std::sync::atomic::AtomicUsize,
+}
+
+/// A parsed external-xattr block plus the inode fields that identify the
+/// version from which it came. `i_file_acl` alone is insufficient: an ext4
+/// xattr update may rewrite the same block in place, while `ctime` advances on
+/// every successful set/remove operation.
+#[derive(Clone)]
+struct CachedExt4XattrBlock {
+    file_acl: u64,
+    ctime: u32,
+    ctime_extra: u32,
+    entries: Arc<Vec<(Ext4Xattr, u32)>>,
+}
+
+impl CachedExt4XattrBlock {
+    fn matches_inode(&self, inode: &Ext4Inode) -> bool {
+        self.file_acl == inode.file_acl
+            && self.ctime == inode.ctime
+            && self.ctime_extra == inode.ctime_extra
+    }
 }
 
 impl<K: std::hash::Hash + Eq + CacheShard, V: Clone> ShardedCache<K, V> {
@@ -5314,6 +5529,7 @@ impl OpenFs {
             ext4_inode_table_block_cache: ShardedCache::new(),
             ext4_file_data_block_cache: ShardedCache::new(),
             ext4_inode_attr_cache: ShardedCache::new(),
+            ext4_inode_xattr_block_cache: ShardedCache::new(),
             ext4_base_block_cache: ShardedCache::new(),
             btrfs_alloc_state: None,
             extent_cache: ffs_extent::ExtentCache::new(),
@@ -5348,7 +5564,7 @@ impl OpenFs {
             btrfs_fs_tree_root_fast: AtomicU64::new(0),
             btrfs_verified_dir_inode: AtomicU64::new(0),
             btrfs_parsed_node_cache: ShardedCache::new(),
-            btrfs_floor_leaf_memo: Mutex::new([const { None }; BTRFS_FLOOR_MEMO_SLOTS]),
+            btrfs_floor_leaf_memo: Mutex::new(btrfs_floor_memo_new_slots()),
             btrfs_floor_memo_next_slot: std::sync::atomic::AtomicUsize::new(0),
             btrfs_floor_memo_disabled: std::sync::atomic::AtomicBool::new(
                 btrfs_floor_memo_disabled_from_env(),
@@ -5358,6 +5574,7 @@ impl OpenFs {
             ),
             btrfs_grow_chunks: std::sync::atomic::AtomicBool::new(btrfs_grow_chunks_from_env()),
             btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32::new(0),
+            btrfs_floor_memo_suppressions: std::sync::atomic::AtomicU64::new(0),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
@@ -9585,9 +9802,48 @@ impl OpenFs {
         // measure per-op descent structure against cold reads, so the memo must
         // go with it — otherwise the next read-count test written against this
         // helper silently measures a warm path and reports too few reads.
-        *self.btrfs_floor_leaf_memo.lock() = [const { None }; BTRFS_FLOOR_MEMO_SLOTS];
+        for slot in self.btrfs_floor_leaf_memo.lock().iter_mut() {
+            *slot = None;
+        }
         // The miss streak is memo state too (bd-79li3): leaving it high across a
         // reset would start the next measurement already suppressed.
+        self.btrfs_floor_memo_consecutive_misses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Measurement-only: resize the floor-leaf memo to `slots` and clear it.
+    ///
+    /// `FFS_BTRFS_FLOOR_MEMO_SLOTS` is read ONCE, at construction. That is right for
+    /// a mount and wrong for an experiment: a single process cannot then hold both
+    /// arms of the 4-vs-16 A/B, so pricing the sizing needed two ELFs, which is
+    /// exactly the provenance confound bd-b9dug exists to prevent. Setting the
+    /// variable instead is not available — `std::env::set_var` is `unsafe` from
+    /// edition 2024, this workspace forbids unsafe, and the parallel harness shares
+    /// the environment.
+    ///
+    /// SOUND AT ANY POINT, not merely straight after open, and that is a property of
+    /// what the memo IS rather than of when this is called: it is a pure cache of
+    /// retained leaves, so discarding its contents can cost a descent and can never
+    /// change an answer. Every read that would have hit re-walks the tree instead.
+    ///
+    /// It deliberately leaves `btrfs_parsed_node_cache` alone, so an A/B driven
+    /// through this prices the MEMO against the cache underneath it rather than
+    /// pricing both together — which is the distinction the counted 4-vs-16 table
+    /// could not make.
+    ///
+    /// `slots` of 0 is clamped to 1 rather than honoured, for the same reason the
+    /// env parser falls back on it: a zero-slot memo is not a configuration anyone
+    /// means, it is a silent restoration of every descent the memo removes.
+    pub fn btrfs_resize_floor_memo_for_measurement(&self, slots: usize) {
+        *self.btrfs_floor_leaf_memo.lock() = (0..slots.max(1))
+            .map(|_| None)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        // Both counters are memo state, and a stale value in either would bias the
+        // arm that follows: a mid-slice next-slot skews which slot is evicted first,
+        // and a high miss streak starts the arm already suppressed (bd-79li3).
+        self.btrfs_floor_memo_next_slot
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.btrfs_floor_memo_consecutive_misses
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -9657,9 +9913,26 @@ impl OpenFs {
         // Saturating rather than wrapping: a very long miss streak must not fall
         // back to `0` and read as "the memo just started working".
         if misses == u32::MAX {
+            self.btrfs_floor_memo_suppressions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
-        (misses - MISS_STREAK_SUPPRESS).is_multiple_of(SUPPRESSED_PROBE_PERIOD)
+        let replace = (misses - MISS_STREAK_SUPPRESS).is_multiple_of(SUPPRESSED_PROBE_PERIOD);
+        if !replace {
+            self.btrfs_floor_memo_suppressions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        replace
+    }
+
+    /// How many replacements the miss-streak gate has suppressed (bd-79li3).
+    ///
+    /// Exists so the gate's central claim — that a SWEEP never trips it — can be
+    /// checked against a real sweep instead of a synthetic hit/miss pattern.
+    #[must_use]
+    pub fn btrfs_floor_memo_suppressions(&self) -> u64 {
+        self.btrfs_floor_memo_suppressions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Predecessor-or-equal descent over a btrfs B-tree: the on-disk dual of
@@ -9760,20 +10033,36 @@ impl OpenFs {
             // and then start evicting live neighbours — collapsing four slots back to
             // one precisely on the probe the widening exists for. Refreshing in place
             // makes the repeat idempotent instead.
-            // Identities only — `BtrfsKey` is `Copy` and there are
-            // BTRFS_FLOOR_MEMO_SLOTS of them, so this is a small stack array and no
-            // allocation. Snapshotting them lets the ORDER live in a pure function
-            // that a test can pin, which is what this needed: the bug fixed here was
-            // an ordering bug, invisible to any test that only checked the memo
-            // answers correctly.
-            let identities: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] =
-                std::array::from_fn(|i| slots[i].as_ref().map(|s| (s.root_logical, s.first_key)));
+            // Identities only — `BtrfsKey` is `Copy`. Snapshotting them lets the
+            // ORDER live in a pure function that a test can pin, which is what this
+            // needed: the bug fixed here was an ordering bug, invisible to any test
+            // that only checked the memo answers correctly.
+            //
+            // `SmallVec`, NOT `Vec`, and that is measured rather than tidy. This
+            // block runs on every memo MISS — which for the capability probe is the
+            // COMMON case, since an absent xattr bucket sorts past the reached
+            // leaf's last key and so never satisfies the span check. c400f8d0d made
+            // the memo a runtime-sized `Box<[_]>` and turned what had been a fixed
+            // `[_; 4]` snapshot into a heap allocation per miss, while leaving the
+            // comment that claimed "no allocation" in place. That is half of why
+            // pricing the sizing found SIXTEEN slots ~13% SLOWER than four despite
+            // taking 55% fewer node lookups (bd-2s8zy). Inline capacity of
+            // `BTRFS_FLOOR_MEMO_SLOTS` keeps the default size allocation-free; a
+            // larger override spills, which is a measurement configuration's
+            // problem and not the mount's.
+            let identities: SmallVec<
+                [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS],
+            > = slots
+                .iter()
+                .map(|slot| slot.as_ref().map(|s| (s.root_logical, s.first_key)))
+                .collect();
+            let slot_count = slots.len().max(1);
             let victim =
                 btrfs_floor_memo_reuse_slot(&identities, fresh.root_logical, &fresh.first_key)
                     .unwrap_or_else(|| {
                         self.btrfs_floor_memo_next_slot
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            % BTRFS_FLOOR_MEMO_SLOTS
+                            % slot_count
                     });
             slots[victim] = Some(fresh);
         }
@@ -11666,52 +11955,19 @@ impl OpenFs {
         Ok((inode, exts))
     }
 
-    /// Filter a `logical_start`-sorted, non-overlapping extent slice to those
-    /// overlapping the read window `[offset, read_end)` via a binary-searched
-    /// lower bound + forward scan that stops at the first extent past the
-    /// window — O(log N + overlapping) instead of the O(N) scan over every
-    /// extent of the inode. Profiling a single-thread compressed random read
-    /// put `btrfs_read_file_into` self-time at ~47%, dominated by this per-read
-    /// scan of the inode's FULL cached extent list (bd-n5w92 / read-plan
-    /// index): a 4 KiB random read of a many-extent file (e.g. a database on
-    /// btrfs = tens of thousands of extents) re-scanned every extent to find
-    /// the one or two it overlaps. Byte-identical selection: extents are sorted
-    /// by `logical_start` and do not overlap, so the overlapping extents form a
-    /// contiguous run and any extent before the lower bound has
-    /// `extent_end <= offset` (cannot overlap). The full predicate
-    /// (`logical_start < read_end && extent_end > offset`) is re-applied in the
-    /// forward scan, so a hole/gap entry landing on the lower bound is still
-    /// skipped exactly as the linear filter skipped it.
-    fn btrfs_filter_window_extents(
-        rows: &[(u64, BtrfsExtentData)],
-        offset: u64,
-        read_end: u64,
-    ) -> Result<Vec<(u64, BtrfsExtentData)>, FfsError> {
-        let mut exts: Vec<(u64, BtrfsExtentData)> = Vec::new();
-        for index in Self::btrfs_window_extent_indices(rows, offset, read_end)? {
-            let (logical_start, extent) = &rows[index];
-            exts.push((*logical_start, extent.clone()));
-        }
-        Ok(exts)
-    }
-
     /// Indices of the extents in `rows` overlapping `[offset, read_end)`
     /// (bd-vpypn).
     ///
-    /// The window rule itself, separated from the copying so there is exactly ONE
-    /// definition of which extents a read touches. `btrfs_filter_window_extents`
-    /// is now a thin clone-and-collect over this, so the two cannot disagree.
+    /// The window rule itself has exactly one definition of which extents a
+    /// read touches.
     ///
-    /// ⚠️ WHY THIS SHAPE MATTERS, and it is not tidiness. The clone in the filter
-    /// is NOT uniformly cheap: `BtrfsExtentData::Regular` is all scalars, but
+    /// ⚠️ WHY THIS SHAPE MATTERS, and it is not tidiness. An extent clone is NOT
+    /// uniformly cheap: `BtrfsExtentData::Regular` is all scalars, but
     /// `BtrfsExtentData::Inline` owns a `Vec<u8>` holding the file's bytes. btrfs
-    /// stores small files inline, so every read of a small file deep-copies its
-    /// payload here and then copies it AGAIN into the caller's buffer. Returning
-    /// indices lets a caller that borrows a long-lived extent list (the read-plan
-    /// index and the read-only per-inode cache both do) skip the first copy
-    /// entirely. That call-site change is deliberately NOT made here — it is a
-    /// lifetime refactor across three branches that must be compiled to be
-    /// trusted, and this lands under a build freeze.
+    /// stores small files inline, so every selected extent used to deep-copy its
+    /// payload before the caller's requested bytes were copied into its buffer.
+    /// The immutable read-plan and per-inode-cache callers retain their backing
+    /// allocation and use these indices to borrow the selected extents instead.
     ///
     /// Selection is byte-identical to the previous inline implementation:
     /// extents are sorted by `logical_start` and do not overlap, so the
@@ -11790,7 +12046,7 @@ impl OpenFs {
 
         // Fetch the inode and extent items from either the COW tree (when
         // writes are enabled) or the on-disk FS tree.
-        let (inode, extents): (BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>) =
+        let (inode, extents): (BtrfsInodeItem, BtrfsReadExtents) =
             if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
                 let alloc = alloc_mutex.read();
                 let inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
@@ -11856,15 +12112,18 @@ impl OpenFs {
                 if let Some(e) = cb_err {
                     return Err(e);
                 }
-                (inode, exts)
+                (inode, BtrfsReadExtents::Owned(exts))
             } else if let Some(index) = self.btrfs_cached_read_plan_index() {
                 let inode = index.inodes.get(&canonical).copied().ok_or_else(|| {
                     FfsError::NotFound(format!("btrfs INODE_ITEM for objectid {canonical}"))
                 })?;
                 let read_end = offset.saturating_add(u64::from(size));
                 let exts = match index.extents.get(&canonical) {
-                    Some(rows) => Self::btrfs_filter_window_extents(rows, offset, read_end)?,
-                    None => Vec::new(),
+                    Some(rows) => BtrfsReadExtents::ReadPlan {
+                        rows: Arc::clone(rows),
+                        indices: Self::btrfs_window_extent_indices(rows, offset, read_end)?,
+                    },
+                    None => BtrfsReadExtents::Owned(Vec::new()),
                 };
                 (inode, exts)
             } else if self.btrfs_tree_log_items.is_empty() {
@@ -11880,15 +12139,10 @@ impl OpenFs {
                 let key = BlockNumber(canonical);
                 // Lock-free hot-inode fast path: a single-file read stream hits
                 // the same `canonical` every read; serve it from the ArcSwap slot
-                // (no shard Mutex) when it matches. `load()` is a cheap arc-swap
-                // guard (no global refcount bump on the fast path); we clone only
-                // the inner entry Arc on a hit.
-                // Hold the arc_swap Guard and BORROW the entry Arc straight out
-                // on a hit, instead of `Arc::clone`-ing it per read — same
-                // lock-free-access tuning as the ext4 hot-inode/hot-parent slots
-                // (measured ~1.24x on lookup-bench, 31c57895). The Guard keeps
-                // the slot alive for the borrow; the entry is only borrowed
-                // (`&entry.1` for the window filter, `entry.0` copied out).
+                // (no shard Mutex) when it matches. The selected window retains
+                // the entry Arc across read assembly, then borrows extent data
+                // from it — one cheap refcount operation, never an inline-payload
+                // clone.
                 let hot = self.btrfs_hot_inode_extents.load();
                 let entry_storage;
                 let entry: &Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)> = match hot.as_ref()
@@ -11913,7 +12167,10 @@ impl OpenFs {
                     }
                 };
                 let read_end = offset.saturating_add(u64::from(size));
-                let exts = Self::btrfs_filter_window_extents(&entry.1, offset, read_end)?;
+                let exts = BtrfsReadExtents::Cached {
+                    entry: Arc::clone(entry),
+                    indices: Self::btrfs_window_extent_indices(&entry.1, offset, read_end)?,
+                };
                 (entry.0, exts)
             } else {
                 // Bound the on-disk walk to the read window on BOTH edges so a
@@ -11987,7 +12244,7 @@ impl OpenFs {
                             .map_err(|e| parse_to_ffs_error(&e))
                     })
                     .collect::<Result<_, _>>()?;
-                (inode, exts)
+                (inode, BtrfsReadExtents::Owned(exts))
             };
 
         match Self::btrfs_mode_to_file_type(inode.mode) {
@@ -12048,7 +12305,7 @@ impl OpenFs {
                 .filter(|s| *s != 0)
                 .ok_or_else(|| FfsError::Format("invalid btrfs sectorsize".into()))?;
             let csum_items = self.btrfs_read_csum_items(cx)?;
-            for (logical_start, extent) in &extents {
+            for (logical_start, extent) in extents.iter() {
                 let BtrfsExtentData::Regular {
                     extent_type,
                     disk_bytenr,
@@ -12172,7 +12429,7 @@ impl OpenFs {
                             })?;
                         jobs.push(BtrfsReadJob::Inline {
                             idx,
-                            data: data.clone(),
+                            data,
                             comp: *compression,
                             ram,
                         });
@@ -12404,7 +12661,7 @@ impl OpenFs {
                             ram,
                         } => (
                             idx,
-                            Self::btrfs_decompress(&data, comp, ram)
+                            Self::btrfs_decompress(data, comp, ram)
                                 .map(BtrfsDeferredReadResult::Bytes),
                         ),
                         BtrfsReadJob::ReadCompressed {
@@ -25113,7 +25370,31 @@ impl OpenFs {
         let block_size = sb.block_size;
         let bs = u64::from(block_size);
 
-        let mut inode = self.read_inode(cx, ino)?;
+        // ⚠️ READ THE INODE THROUGH THE CALLER'S SCOPE, NOT A FRESH ONE (bd-2i2ez).
+        //
+        // This was `self.read_inode(cx, ino)`, which is
+        // `with_latest_scope(|scope| read_inode_with_scope(..))` — a brand-new
+        // scope with NO transaction. So a write running inside a caller's
+        // transaction read the inode from COMMITTED state and could not see an
+        // earlier write staged in its own transaction.
+        //
+        // With one write per transaction — every path in production today — that
+        // is invisible. With TWO, it silently loses the first:
+        //
+        //   write(A) stages the inode carrying A's extent
+        //   write(B) reads the COMMITTED inode (no A), adds B's extent, stages it
+        //   commit    -> B's inode version wins; A's extent never existed
+        //   read(A)   -> the logical block has no mapping and returns ZEROS
+        //
+        // Measured exactly that way before this line changed: staging 1 write and
+        // committing round-trips; staging 2 or 8 loses all but the LAST, and the
+        // lost blocks read back as ZEROS rather than as another chunk's data —
+        // the mapping is gone, not aliased. See
+        // `probe_how_many_staged_writes_survive_one_commit_bd_2i2ez`.
+        //
+        // The inode is the shared mutable state of the whole batch, so it is
+        // exactly the thing that must be read-your-writes within a transaction.
+        let mut inode = self.read_inode_with_scope(cx, scope, ino)?;
         if inode.is_dir() {
             return Err(FfsError::IsDirectory);
         }
@@ -27107,6 +27388,47 @@ impl OpenFs {
         }
     }
 
+    /// Return the parsed external xattrs for `inode`, reusing the per-inode
+    /// cache only when they describe this exact inode version.
+    fn ext4_cached_xattr_block_entries(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        inode: &Ext4Inode,
+    ) -> ffs_error::Result<Arc<Vec<(Ext4Xattr, u32)>>> {
+        debug_assert_ne!(inode.file_acl, 0);
+        if let Some(cached) = self.ext4_inode_xattr_block_cache.get(&ino.0)
+            && cached.matches_inode(inode)
+        {
+            return Ok(cached.entries);
+        }
+
+        // Remove an old generation before admission so an updated inode can
+        // replace its own entry even when the bounded cache is otherwise full.
+        self.ext4_inode_xattr_block_cache.remove(&ino.0);
+        let block = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
+        let entries = Arc::new(
+            ffs_ondisk::parse_xattr_block_with_inum(&block)
+                .map_err(|error| parse_to_ffs_error(&error))?,
+        );
+        self.ext4_inode_xattr_block_cache.insert_within(
+            ino.0,
+            CachedExt4XattrBlock {
+                file_acl: inode.file_acl,
+                ctime: inode.ctime,
+                ctime_extra: inode.ctime_extra,
+                entries: Arc::clone(&entries),
+            },
+            EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT,
+        );
+        Ok(entries)
+    }
+
+    /// Drop the cached external xattr block after a successful xattr mutation.
+    fn invalidate_ext4_xattr_block_cache(&self, ino: InodeNumber) {
+        self.ext4_inode_xattr_block_cache.remove(&ino.0);
+    }
+
     /// Set or replace one ext4 xattr.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn ext4_setxattr(
@@ -27368,6 +27690,7 @@ impl OpenFs {
         }
 
         self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
+        self.invalidate_ext4_xattr_block_cache(ino);
 
         trace!(
             target: "ffs::write",
@@ -27582,6 +27905,7 @@ impl OpenFs {
         }
 
         self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
+        self.invalidate_ext4_xattr_block_cache(ino);
 
         trace!(
             target: "ffs::write",
@@ -37401,7 +37725,9 @@ impl OpenFs {
         self.btrfs_floor_memo_consecutive_misses
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if disabled {
-            *self.btrfs_floor_leaf_memo.lock() = [const { None }; BTRFS_FLOOR_MEMO_SLOTS];
+            for slot in self.btrfs_floor_leaf_memo.lock().iter_mut() {
+            *slot = None;
+        }
         }
     }
 
@@ -58776,6 +59102,37 @@ mod tests {
     /// luck; stepping by a stride coprime to the entry count forces repeated
     /// crossings of leaf boundaries, where a wrong span check must diverge.
     #[test]
+    fn btrfs_floor_memo_slots_from_value_parses_and_fails_safe_bd_2s8zy() {
+        // Default when unset: the shipping size the counted 2.93x was measured on.
+        assert_eq!(btrfs_floor_memo_slots_from_value(None), BTRFS_FLOOR_MEMO_SLOTS);
+        // An explicit value is honoured, which is what makes a mounted A/B of the
+        // sizing expressible from ONE ELF at all — a compile-time count cannot be
+        // measured against the live kernel.
+        assert_eq!(btrfs_floor_memo_slots_from_value(Some("4")), 4);
+        assert_eq!(btrfs_floor_memo_slots_from_value(Some(" 32 ")), 32);
+        // FAILS SAFE, and this is the half that matters. A zero-slot memo is not a
+        // configuration anyone means; it is a silent ~2.9x increase in descent work.
+        // Zero, empty, garbage and negatives all fall back to the default rather
+        // than disabling the memo.
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("0")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("sixteen")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(Some("-1")),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
+    }
+
+    #[test]
     fn btrfs_floor_memo_answers_match_the_descent_path_bd_5vis3() {
         let Some((fs, _files)) = open_populated_btrfs_readonly_bd_5vis3(4000) else {
             return; // btrfs-progs unavailable
@@ -59280,14 +59637,22 @@ mod tests {
 
         // Full and no match: the caller must evict, which is signalled by None
         // rather than decided here.
-        // Written out rather than generated: if BTRFS_FLOOR_MEMO_SLOTS ever changes
-        // this stops compiling, which is the right way to find out.
-        let full: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] = [
-            Some((root, key(10))),
-            Some((root, key(11))),
-            Some((root, key(12))),
-            Some((root, key(13))),
-        ];
+        //
+        // GENERATED from BTRFS_FLOOR_MEMO_SLOTS rather than written out. It used to
+        // be four literals, with a note that changing the constant "stops
+        // compiling, which is the right way to find out" — but what it actually
+        // found out was a type error in an unrelated resize (bd-2s8zy took the
+        // memo from 4 slots to 16), telling the reader nothing about the property
+        // under test. The property is "full, and no slot matches", which holds at
+        // any size; keying the fixture to the constant tests it at whatever the
+        // constant is.
+        let full: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] =
+            std::array::from_fn(|slot| {
+                Some((
+                    root,
+                    key(10_u64.saturating_add(u64::try_from(slot).unwrap_or(0))),
+                ))
+            });
         assert_eq!(
             btrfs_floor_memo_reuse_slot(&full, root, &key(999)),
             None,
@@ -59301,10 +59666,10 @@ mod tests {
         );
     }
 
-    /// bd-vpypn: the window rule and the copying filter must select the same
-    /// extents, and the inline case must be visible as the copy it is.
+    /// bd-vpypn: windowed immutable-cache reads select a contiguous run and
+    /// borrow inline payload bytes from their backing cache.
     #[test]
-    fn btrfs_window_extent_selection_agrees_and_inline_is_a_deep_copy_bd_vpypn() {
+    fn btrfs_window_extent_selection_borrows_inline_payload_bd_vpypn() {
         let regular = |ram: u64| ffs_btrfs::BtrfsExtentData::Regular {
             generation: 1,
             ram_bytes: ram,
@@ -59317,11 +59682,12 @@ mod tests {
         };
         // Sorted, non-overlapping, with a gap between 8192 and 16384 so a read
         // landing in the hole exercises the lower-bound skip.
-        let rows: Vec<(u64, ffs_btrfs::BtrfsExtentData)> = vec![
+        let rows: Arc<[(u64, ffs_btrfs::BtrfsExtentData)]> = vec![
             (0, regular(4096)),
             (4096, regular(4096)),
             (16384, regular(4096)),
-        ];
+        ]
+        .into();
 
         for (offset, end) in [
             (0_u64, 4096_u64), // exactly the first extent
@@ -59333,17 +59699,20 @@ mod tests {
             (99999, 100_000),  // beyond every extent
         ] {
             let indices = OpenFs::btrfs_window_extent_indices(&rows, offset, end).unwrap();
-            let filtered = OpenFs::btrfs_filter_window_extents(&rows, offset, end).unwrap();
+            let selected = BtrfsReadExtents::ReadPlan {
+                rows: Arc::clone(&rows),
+                indices: indices.clone(),
+            };
             assert_eq!(
                 indices.len(),
-                filtered.len(),
-                "window [{offset}, {end}) selects a different count by index than by clone"
+                selected.len(),
+                "window [{offset}, {end}) selects a different count by index than by borrowed read"
             );
-            for (i, (logical_start, extent)) in indices.iter().zip(filtered.iter()) {
+            for (i, (logical_start, extent)) in indices.iter().zip(selected.iter()) {
                 assert_eq!(rows[*i].0, *logical_start);
                 assert_eq!(
                     &rows[*i].1, extent,
-                    "index and clone disagree on the extent"
+                    "index and borrowed read disagree on the extent"
                 );
             }
             // Selection must be a CONTIGUOUS run — that is what licenses stopping
@@ -59353,11 +59722,11 @@ mod tests {
             }
         }
 
-        // THE COST THIS SHAPE EXISTS TO EXPOSE. A Regular extent is all scalars,
-        // but an Inline extent owns the file's bytes, so the filter's clone is a
-        // deep copy of the payload on EVERY read of a small file.
+        // The performance contract: an Inline extent owns the file's bytes, so
+        // the selected read must borrow them from the immutable cache, not clone
+        // them before copying the requested bytes into the caller's output.
         let payload = vec![0xAB_u8; 2048];
-        let inline_rows: Vec<(u64, ffs_btrfs::BtrfsExtentData)> = vec![(
+        let inline_rows: Arc<[(u64, ffs_btrfs::BtrfsExtentData)]> = vec![(
             0,
             ffs_btrfs::BtrfsExtentData::Inline {
                 generation: 1,
@@ -59365,29 +59734,41 @@ mod tests {
                 compression: 0,
                 data: payload.clone(),
             },
-        )];
-        let selected = OpenFs::btrfs_filter_window_extents(&inline_rows, 0, 2048).unwrap();
+        )]
+        .into();
+        let selected = BtrfsReadExtents::ReadPlan {
+            rows: Arc::clone(&inline_rows),
+            indices: OpenFs::btrfs_window_extent_indices(&inline_rows, 0, 2048).unwrap(),
+        };
         assert_eq!(selected.len(), 1);
-        match (&inline_rows[0].1, &selected[0].1) {
+        match (&inline_rows[0].1, selected.iter().next().unwrap().1) {
             (
                 ffs_btrfs::BtrfsExtentData::Inline { data: original, .. },
-                ffs_btrfs::BtrfsExtentData::Inline { data: copied, .. },
+                ffs_btrfs::BtrfsExtentData::Inline { data: borrowed, .. },
             ) => {
-                assert_eq!(original, copied, "the copy must be faithful");
-                assert_ne!(
+                assert_eq!(original, borrowed, "the borrowed payload must be faithful");
+                assert_eq!(
                     original.as_ptr(),
-                    copied.as_ptr(),
-                    "and it IS a separate allocation - this is the per-read payload copy \
-                     that returning indices would let a borrowing caller avoid"
+                    borrowed.as_ptr(),
+                    "the read-window iterator must retain the cache allocation"
+                );
+                let job = BtrfsReadJob::Inline {
+                    idx: 0,
+                    data: borrowed,
+                    comp: 0,
+                    ram: borrowed.len(),
+                };
+                let BtrfsReadJob::Inline { data, .. } = job else {
+                    unreachable!("constructed inline job")
+                };
+                assert_eq!(
+                    original.as_ptr(),
+                    data.as_ptr(),
+                    "the deferred inline read job must keep borrowing the cached payload"
                 );
             }
             _ => panic!("expected two inline extents"),
         }
-        // The index form selects the same extent without copying anything.
-        assert_eq!(
-            OpenFs::btrfs_window_extent_indices(&inline_rows, 0, 2048).unwrap(),
-            vec![0]
-        );
     }
 
     /// bd-5vis3: the memo's marginal cost must be the refcount, not the block.
@@ -59624,6 +60005,28 @@ mod tests {
         fs.btrfs_floor_memo_consecutive_misses
             .store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(fs.btrfs_floor_memo_should_replace());
+
+        // THE SUPPRESSION COUNTER MUST DISCRIMINATE (bd-79li3, 2026-08-24). The
+        // integration arm `the_miss_streak_gate_does_not_fire_on_a_real_sweep_bd_79li3`
+        // reports ZERO suppressions on a real readdir+stat sweep, which is the
+        // gate's central claim finally checked against the workload it names. That
+        // zero is only evidence if a non-zero is reachable, and this is the cheapest
+        // place to prove it: the miss-only stream above is a true no-locality
+        // stream, unlike a random ACCESS order over a small fixture, which still
+        // retains enough leaf locality to reset the streak (measured: 6,000 entries
+        // in stride order produced zero suppressions, so it cannot serve as the
+        // control).
+        //
+        // Exact, not a bound: every descent in that stream either replaced or was
+        // suppressed, so the two must sum to the stream length.
+        let suppressions = fs.btrfs_floor_memo_suppressions();
+        assert_eq!(
+            suppressions,
+            (PROBE - replacements) as u64,
+            "the gate suppressed {replacements} of {PROBE} replacements but the counter \
+             recorded {suppressions}; a counter that does not track the gate turns the \
+             sweep arm's zero into an absence of measurement rather than a result"
+        );
     }
 
     /// Smallest btrfs `OpenFs` that exercises the floor-memo policy (bd-79li3).
@@ -64002,6 +64405,71 @@ mod tests {
                 "listxattr must include {name}; got {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn ext4_external_xattr_cache_invalidates_after_set_and_remove() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let attr = fs
+            .create(
+                &cx,
+                InodeNumber(2),
+                OsStr::new("xattr-cache-invalidate.txt"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create");
+        let ino = attr.ino;
+        let initial = vec![0xA1_u8; 512];
+        fs.setxattr(&cx, ino, "user.cached", &initial, XattrSetMode::Set)
+            .expect("create external xattr");
+        assert_ne!(
+            fs.read_inode(&cx, ino).expect("read inode").file_acl,
+            0,
+            "test requires an external xattr block"
+        );
+
+        // listxattr fills the parsed external-block cache without reading a
+        // value. A later mutation must evict it rather than leave a stale
+        // answer for getxattr/listxattr.
+        assert!(
+            fs.listxattr(&cx, ino)
+                .expect("listxattr")
+                .iter()
+                .any(|name| name == "user.cached")
+        );
+        assert!(fs.ext4_inode_xattr_block_cache.contains_key(&ino.0));
+
+        let replaced = vec![0xB2_u8; 512];
+        fs.setxattr(&cx, ino, "user.cached", &replaced, XattrSetMode::Replace)
+            .expect("replace external xattr");
+        assert!(
+            !fs.ext4_inode_xattr_block_cache.contains_key(&ino.0),
+            "setxattr must evict the old parsed external xattr block"
+        );
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.cached").expect("get replaced"),
+            Some(replaced)
+        );
+        assert!(fs.ext4_inode_xattr_block_cache.contains_key(&ino.0));
+
+        assert!(
+            fs.removexattr(&cx, ino, "user.cached")
+                .expect("remove external xattr")
+        );
+        assert!(
+            !fs.ext4_inode_xattr_block_cache.contains_key(&ino.0),
+            "removexattr must evict the parsed external xattr block"
+        );
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.cached")
+                .expect("get removed attribute"),
+            None
+        );
     }
 
     #[test]
