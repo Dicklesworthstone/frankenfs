@@ -5442,6 +5442,23 @@ impl Ext4ImageReader {
         // the loop. `to_read > 0` here, so the old per-block path would have
         // parsed on the first iteration regardless — identical behaviour,
         // including error propagation.
+        //
+        // ERROR PRECEDENCE, restored (found 2026-08-24 verifying bd-q4qr8). The
+        // "identical error propagation" above is NOT identical, and
+        // `adversarial_corpus` was red on exactly this: the old per-block loop
+        // computed `logical_block` FIRST and parsed only after, so a read starting
+        // beyond the u32 logical-block range reported `IntegerConversion { field:
+        // "logical_block" }`. With the parse hoisted in front of it, such a read
+        // reports whatever the extent header says instead — for a zeroed inode a
+        // header error, which is both a DIFFERENT error and a less accurate one:
+        // the read is unsatisfiable because of the OFFSET, not because of the tree.
+        //
+        // Converting the first block here restores the old precedence without
+        // giving back the per-block parse. The loop keeps its own conversion,
+        // because a later block can cross the boundary this first one does not.
+        u32::try_from(offset / bs).map_err(|_| ParseError::IntegerConversion {
+            field: "logical_block",
+        })?;
         let (header, tree) = parse_inode_extent_tree(inode)?;
         // Reuse child index/leaf blocks across the read's blocks (depth ≥ 1).
         let mut extent_cache = ExtentResolveCache::default();

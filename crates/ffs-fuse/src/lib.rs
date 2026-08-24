@@ -3065,10 +3065,12 @@ impl ReadonlyXattrCache {
 /// 64 slots is 512 bytes for the whole mount and covers a directory-sized sweep.
 /// The progression is counted, on a read-write mount, 1000 path stats:
 ///
-///     1 slot   (`read_only`-gated, so also disabled here) :    0 / 2000 hits
-///     2 slots, shift-down victim                          :  501 / 2000 hits
-///     2 slots, 2-way pseudo-LRU                           : 1000 / 2000 hits
-///     64 slots, direct-mapped                             : see bd-2pq73
+/// ```text
+/// 1 slot   (`read_only`-gated, so also disabled here) :    0 / 2000 hits
+/// 2 slots, shift-down victim                          :  501 / 2000 hits
+/// 2 slots, 2-way pseudo-LRU                           : 1000 / 2000 hits
+/// 64 slots, direct-mapped                             : see bd-2pq73
+/// ```
 ///
 /// Two slots could hold the root and exactly one file, so a sweep of 50 files
 /// evicted each before it recurred and every file probe missed. Direct mapping by

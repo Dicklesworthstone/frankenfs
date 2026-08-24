@@ -2299,9 +2299,11 @@ struct BtrfsFloorLeafMemo {
 /// reproducible from one ELF via
 /// [`OpenFs::btrfs_resize_floor_memo_for_measurement`]:
 ///
-///                     4 slots     16 slots
-///   sequential          15151         5167    2.93x fewer
-///   8-way interleaved   23875        15377    1.55x fewer
+/// ```text
+///                   4 slots     16 slots
+/// sequential          15151         5167    2.93x fewer
+/// 8-way interleaved   23875        15377    1.55x fewer
+/// ```
 ///
 /// THE LOOKUPS IT SAVES ARE CHEAPER THAN THE SLOTS IT ADDS, which is what the
 /// counted table could not see and what pricing it found. Priced in wall clock on
