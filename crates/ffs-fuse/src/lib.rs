@@ -103,12 +103,14 @@ pub fn capability_memo_enabled() -> bool {
     LastMissingCapabilityXattr::enabled_from_env()
 }
 
-/// Effective capability-memo table size for this process (bd-m1bpu).
+/// Effective direct-mapped comparison-table size for this process (bd-m1bpu).
 ///
 /// Resolved through the same function the mount constructor calls, for the same
 /// reason as [`capability_memo_enabled`]: the comparator refuses a
 /// candidate-vs-candidate run whose two configurations self-report identical
-/// knobs, so this is what proves a slot-count override actually took effect.
+/// knobs, so this is what proves the direct-table comparison arm's override
+/// actually took effect. The shipping range-leaf policy does not reserve this
+/// table.
 #[must_use]
 pub fn capability_memo_slots() -> usize {
     LastMissingCapabilityXattr::slots_from_env()
@@ -391,8 +393,8 @@ pub fn io_uring_payload_bytes() -> u32 {
     )
 }
 
-/// Whether the range-leaf capability memo backend is selected
-/// (bd-btrfs-readdir-stat-8x-8y7vp).
+/// Whether the bounded range-leaf capability memo policy is selected
+/// (bd-kzfh2).
 ///
 /// Same contract as the two knobs above, and for the same reason: the comparator
 /// REFUSES a candidate-vs-candidate run whose two arms self-report identical
@@ -401,7 +403,7 @@ pub fn io_uring_payload_bytes() -> u32 {
 /// it cannot drift from what actually ran.
 #[must_use]
 pub fn capability_memo_bitmap() -> bool {
-    LastMissingCapabilityXattr::bitmap_from_value(
+    LastMissingCapabilityXattr::range_leaf_enabled_from_value(
         std::env::var("FFS_FUSE_CAPABILITY_MEMO_BITMAP")
             .ok()
             .as_deref(),
@@ -3126,8 +3128,9 @@ pub fn capability_memo_slots_for_working_set(working_set: usize) -> usize {
         .clamp(CAPABILITY_MEMO_SLOTS, CAPABILITY_MEMO_SLOTS_MAX)
 }
 
-/// Resident bytes a capability memo of `slots` costs, per mount, for the mount's
-/// lifetime (bd-kzfh2, reported because bd-5vis3's bar requires it).
+/// Resident bytes the direct-table comparison memo of `slots` costs, per mount,
+/// for the mount's lifetime (bd-kzfh2, reported because bd-5vis3's bar requires
+/// it).
 ///
 /// One `AtomicU64` per slot and nothing else — the table is allocated whole at
 /// construction, so this is exact rather than an estimate, and it is paid whether
@@ -3162,7 +3165,8 @@ struct LastMissingCapabilityXattr {
     /// change during a mount, and the probe path is the hottest metadata path
     /// there is.
     enabled: bool,
-    /// Range-leaf backend, when `FFS_FUSE_CAPABILITY_MEMO_BITMAP` selects it.
+    /// Shipping range-leaf backend, unless `FFS_FUSE_CAPABILITY_MEMO_BITMAP`
+    /// explicitly opts into the direct-table comparison arm.
     ///
     /// A per-store FIELD rather than a build flag, so both arms run from ONE ELF
     /// and the comparator's `--candidate-b-env` gives a within-window
@@ -3277,39 +3281,45 @@ impl Default for LastMissingCapabilityXattr {
     /// become no-ops for whoever exported it. Production reads the switch
     /// explicitly via [`Self::from_env`].
     fn default() -> Self {
-        Self::with_slots(CAPABILITY_MEMO_SLOTS, true)
+        Self::with_range_leaves(true)
     }
 }
 
 impl LastMissingCapabilityXattr {
     /// Production constructor: honours `FFS_FUSE_CAPABILITY_MEMO` (bd-2pq73) and
-    /// `FFS_FUSE_CAPABILITY_MEMO_SLOTS` (bd-m1bpu).
+    /// the bounded range-leaf policy. `FFS_FUSE_CAPABILITY_MEMO_BITMAP=0` keeps
+    /// the direct-mapped table available as the candidate-A benchmark arm.
     fn from_env() -> Self {
-        let mut memo = Self::with_slots(Self::slots_from_env(), Self::enabled_from_env());
-        if Self::bitmap_from_value(
+        let enabled = Self::enabled_from_env();
+        if Self::range_leaf_enabled_from_value(
             std::env::var("FFS_FUSE_CAPABILITY_MEMO_BITMAP")
                 .ok()
                 .as_deref(),
         ) {
-            memo.bitmap = Some(CapabilityBitmap::new());
+            Self::with_range_leaves(enabled)
+        } else {
+            Self::with_slots(Self::slots_from_env(), enabled)
         }
-        memo
     }
 
-    /// Parse the range-leaf backend knob (bd-btrfs-readdir-stat-8x-8y7vp).
+    /// Parse the range-leaf policy knob (bd-kzfh2).
     ///
     /// Split into a PURE function over `Option<&str>` so the parsing is testable
     /// without mutating process-global environment, which is racy under the
     /// parallel test harness and `unsafe` from edition 2024.
     ///
-    /// Opt-in polarity, so a typo fails CLOSED onto the shipping direct-mapped
-    /// table rather than silently enabling an unmeasured backend.
-    fn bitmap_from_value(raw: Option<&str>) -> bool {
-        let Some(raw) = raw else {
-            return false;
-        };
-        let trimmed = raw.trim();
-        trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("on")
+    /// The range-leaf memo is the shipping policy. It allocates a 4 KiB leaf only
+    /// when a workload probes an inode range and caps leaf storage at 64 leaves
+    /// (256 KiB), avoiding the direct table's directory-size cliff without sizing
+    /// from a filesystem-wide inode count. Only the three explicit opt-outs select
+    /// the legacy direct-mapped table for A/B comparison.
+    fn range_leaf_enabled_from_value(raw: Option<&str>) -> bool {
+        !raw.is_some_and(|raw| {
+            let trimmed = raw.trim();
+            trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("off")
+        })
     }
 
     /// Build a memo with an explicit table size, rounding UP to a power of two so
@@ -3329,14 +3339,25 @@ impl LastMissingCapabilityXattr {
         }
     }
 
+    /// Production-sized memo: leaves are allocated only for inode ranges the
+    /// workload actually probes. The fixed top table bounds leaf storage at
+    /// 64 × 4 KiB and deliberately declines a 65th range rather than evicting a
+    /// leaf another reader may be borrowing.
+    fn with_range_leaves(enabled: bool) -> Self {
+        Self {
+            // The direct table is never indexed while `bitmap` is present, but a
+            // one-slot allocation preserves the representation invariant without
+            // reserving the old table's 32 KiB on every mount.
+            slots: vec![AtomicU64::new(0)],
+            enabled,
+            bitmap: Some(CapabilityBitmap::new()),
+        }
+    }
+
     /// Test/bench constructor for the range-leaf arm.
     #[cfg(test)]
     fn with_bitmap() -> Self {
-        Self {
-            slots: (0..1).map(|_| AtomicU64::new(0)).collect(),
-            enabled: true,
-            bitmap: Some(CapabilityBitmap::new()),
-        }
+        Self::with_range_leaves(true)
     }
 }
 
@@ -7572,27 +7593,35 @@ mod tests {
         assert_eq!(queue_depth_from_value(Some("8")), 8);
     }
 
-    /// The backend knob is opt-in and fails CLOSED, so a typo cannot silently
-    /// enable an unmeasured backend on a production mount.
+    /// The bounded range-leaf policy is the shipping default. Only an explicit
+    /// opt-out selects the legacy direct-mapped table for an A/B comparison.
     #[test]
-    fn capability_memo_bitmap_knob_is_opt_in_and_fails_closed() {
+    fn capability_memo_range_leaf_policy_defaults_on_and_has_explicit_opt_out() {
         for on in ["1", "true", "TRUE", "on", " on ", "On"] {
             assert!(
-                LastMissingCapabilityXattr::bitmap_from_value(Some(on)),
-                "{on:?} must select the range-leaf backend"
+                LastMissingCapabilityXattr::range_leaf_enabled_from_value(Some(on)),
+                "{on:?} must keep the shipping range-leaf policy"
             );
         }
-        for off in ["", "0", "false", "off", "yes", "2", "bitmap", "ture"] {
+        for shipping_default in [
+            None,
+            Some(""),
+            Some("yes"),
+            Some("2"),
+            Some("bitmap"),
+            Some("ture"),
+        ] {
             assert!(
-                !LastMissingCapabilityXattr::bitmap_from_value(Some(off)),
-                "{off:?} must fall back to the shipping table, not enable a \
-                 backend nobody asked for"
+                LastMissingCapabilityXattr::range_leaf_enabled_from_value(shipping_default),
+                "{shipping_default:?} must not silently opt out of the shipping policy"
             );
         }
-        assert!(
-            !LastMissingCapabilityXattr::bitmap_from_value(None),
-            "unset must mean the shipping direct-mapped table"
-        );
+        for opt_out in ["0", "false", "off", " OFF ", "False"] {
+            assert!(
+                !LastMissingCapabilityXattr::range_leaf_enabled_from_value(Some(opt_out)),
+                "{opt_out:?} must select the explicit direct-table comparison arm"
+            );
+        }
     }
 
     /// The footprint must stay bounded by declining new ranges, never by evicting
@@ -7619,6 +7648,40 @@ mod tests {
                  overflow; eviction would invalidate a pointer a reader may hold"
             );
         }
+    }
+
+    /// The production memo adapts to the inode ranges actually touched. A dense
+    /// 32,768-inode directory occupies one 4 KiB leaf instead of requiring a
+    /// hand-sized 65,536-slot table, and a mutation removes only its own absence.
+    #[test]
+    fn capability_memo_shipping_policy_keeps_a_dense_directory_and_invalidates_one_inode_bd_kzfh2()
+    {
+        const FIRST: u64 = 1_000_000;
+        const DIRECTORY_ENTRIES: u64 = 32_768;
+        let memo = LastMissingCapabilityXattr::default();
+        assert!(
+            memo.bitmap.is_some(),
+            "Default must exercise the shipping range-leaf policy"
+        );
+
+        for ino in FIRST..FIRST + DIRECTORY_ENTRIES {
+            memo.remember(InodeNumber(ino));
+        }
+        assert!(
+            (FIRST..FIRST + DIRECTORY_ENTRIES).all(|ino| memo.contains(InodeNumber(ino))),
+            "a directory that fits one live range must remain memoized"
+        );
+
+        let changed = InodeNumber(FIRST + 17);
+        memo.forget(changed);
+        assert!(
+            !memo.contains(changed),
+            "a setxattr/removexattr invalidation must remove the changed inode's absence"
+        );
+        assert!(
+            memo.contains(InodeNumber(FIRST + 18)),
+            "invalidating one inode must not drop a neighboring capability absence"
+        );
     }
 
     #[test]
@@ -7713,6 +7776,47 @@ mod tests {
         );
     }
 
+    /// The shipping range-leaf memo must retain the writable-mount contract:
+    /// both xattr mutations clear a cached absence before they reach the
+    /// format.  In particular, this holds even when the format rejects the
+    /// mutation, because retaining the entry would answer a later probe from
+    /// stale state.
+    #[test]
+    fn capability_memo_range_leaf_is_invalidated_by_both_xattr_mutations_bd_kzfh2() {
+        let fuse = writable_fuse();
+        let ino = InodeNumber(1_000_017);
+        assert!(fuse.inner.missing_capability_xattr.bitmap.is_some());
+
+        with_switch(false, || {
+            fuse.inner.missing_capability_xattr.remember(ino);
+            let sender = RecordingSender::default();
+            fuse.setxattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                b"capability",
+                0,
+                0,
+                <ReplyEmpty as fuser::Reply>::new(1, sender),
+            );
+            assert!(
+                !fuse.inner.missing_capability_xattr.contains(ino),
+                "setxattr must invalidate before dispatching to the format"
+            );
+
+            fuse.inner.missing_capability_xattr.remember(ino);
+            let sender = RecordingSender::default();
+            fuse.removexattr_impl(
+                ino.0,
+                OsStr::new(SECURITY_CAPABILITY_XATTR),
+                <ReplyEmpty as fuser::Reply>::new(2, sender),
+            );
+            assert!(
+                !fuse.inner.missing_capability_xattr.contains(ino),
+                "removexattr must invalidate before dispatching to the format"
+            );
+        });
+    }
+
     /// `forget` must be surgical: clearing the inode that was written must not
     /// drop the OTHER slot, or every setxattr would cost the root a lookup.
     #[test]
@@ -7765,7 +7869,9 @@ mod tests {
     /// missing, which is a correctness bug and not a cache miss.
     #[test]
     fn capability_memo_collision_evicts_and_never_reports_the_wrong_inode() {
-        let memo = LastMissingCapabilityXattr::default();
+        // This is the explicit legacy direct-table comparison arm. The shipping
+        // range-leaf policy has no per-inode slot collision inside a live range.
+        let memo = LastMissingCapabilityXattr::with_slots(CAPABILITY_MEMO_SLOTS, true);
         let a = InodeNumber(14);
         let b = InodeNumber(14 + CAPABILITY_MEMO_SLOTS as u64); // same slot
         assert_eq!(
