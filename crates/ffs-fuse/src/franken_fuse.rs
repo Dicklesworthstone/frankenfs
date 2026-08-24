@@ -3116,7 +3116,6 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_entry_invalidation(parent, name);
         Ok(())
     }
 
@@ -3137,7 +3136,6 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_entry_invalidation(parent, name);
         Ok(())
     }
 

@@ -429,8 +429,9 @@ const ATTR_TTL: Duration = Duration::from_secs(60);
 ///
 /// A positive entry is valid for [`ATTR_TTL`]; a negative entry needs a much
 /// shorter horizon because a create can make its name live. Every successful
-/// namespace mutation sends `FUSE_NOTIFY_INVAL_ENTRY` for the affected name,
-/// so this is an optimization only while that name is known unchanged.
+/// namespace mutation sends `FUSE_NOTIFY_INVAL_ENTRY` for the affected name
+/// after replying to the kernel. The ordering is required: invalidating while
+/// a mutating request holds the parent lock can deadlock the FUSE request.
 const NEGATIVE_ENTRY_TTL: Duration = Duration::from_secs(1);
 const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
 const COALESCED_FETCH_MULTIPLIER: u32 = 4;
@@ -5538,9 +5539,9 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
             }
             Err(e) => {
                 Self::reply_error_entry(
@@ -5729,8 +5730,8 @@ impl Filesystem for FrankenFuse {
         };
         match self.dispatch_setattr(&cx, ino, &attrs, req.uid()) {
             Ok(attr) => {
-                self.notify_inode_invalidation(ino);
                 reply.attr(&ATTR_TTL, &to_file_attr(&attr));
+                self.notify_inode_invalidation(ino);
             }
             Err(e) => {
                 Self::reply_error_attr(
@@ -5759,9 +5760,9 @@ impl Filesystem for FrankenFuse {
     ) {
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
             Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -5790,9 +5791,9 @@ impl Filesystem for FrankenFuse {
     ) {
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
             Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -5828,8 +5829,9 @@ impl Filesystem for FrankenFuse {
             Ok(())
         }) {
             Ok(()) => {
-                self.notify_inode_invalidation(parent);
                 reply.ok();
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
             }
             Err(e) => {
                 Self::reply_error_empty(
@@ -5848,8 +5850,9 @@ impl Filesystem for FrankenFuse {
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.dispatch_rmdir(parent, name) {
             Ok(()) => {
-                self.notify_inode_invalidation(parent);
                 reply.ok();
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -5881,13 +5884,13 @@ impl Filesystem for FrankenFuse {
         // FsOps::rename2; we no longer pre-reject every non-zero flag.
         match self.dispatch_rename(parent, name, newparent, newname, flags) {
             Ok(()) => {
+                reply.ok();
                 self.notify_entry_invalidation(parent, name);
                 self.notify_entry_invalidation(newparent, newname);
                 self.notify_inode_invalidation(parent);
                 if newparent != parent {
                     self.notify_inode_invalidation(newparent);
                 }
-                reply.ok();
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -5934,10 +5937,10 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_entry_invalidation(newparent, newname);
                 self.notify_inode_invalidation(newparent);
                 self.notify_inode_invalidation(ino);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
             }
             Err(e) => {
                 Self::reply_error_entry(
@@ -5980,8 +5983,8 @@ impl Filesystem for FrankenFuse {
             WriteIntent::from_fuse(fh, write_flags, flags),
         ) {
             Ok(written) => {
-                self.notify_inode_invalidation(ino);
                 reply.written(written);
+                self.notify_inode_invalidation(ino);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -6017,8 +6020,8 @@ impl Filesystem for FrankenFuse {
         );
         match self.dispatch_copy_file_range(ino_in, offset_in, ino_out, offset_out, len, flags) {
             Ok(written) => {
-                self.notify_inode_invalidation(ino_out);
                 reply.written(written);
+                self.notify_inode_invalidation(ino_out);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -6077,8 +6080,8 @@ impl Filesystem for FrankenFuse {
             Ok(())
         }) {
             Ok(()) => {
-                self.notify_inode_invalidation(ino);
                 reply.ok();
+                self.notify_inode_invalidation(ino);
             }
             Err(e) => {
                 Self::reply_error_empty(
@@ -6404,9 +6407,9 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
                 self.notify_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
-                reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
             }
             Err(e) => {
                 Self::reply_error_create(
@@ -6564,8 +6567,8 @@ impl FrankenFuse {
         self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
         match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
             Ok(_) => {
-                self.notify_inode_invalidation(ino);
                 reply.ok();
+                self.notify_inode_invalidation(ino);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error: e, .. }) => {
@@ -6640,8 +6643,8 @@ impl FrankenFuse {
             Ok(removed)
         }) {
             Ok(true) => {
-                self.notify_inode_invalidation(ino);
                 reply.ok();
+                self.notify_inode_invalidation(ino);
             }
             Ok(false) => reply.error(Self::missing_xattr_errno()),
             Err(e) => {
@@ -8859,7 +8862,8 @@ mod tests {
         // cache validity, while a nonzero node id would turn a miss into a
         // positive dentry. Linux interprets nodeid=0 plus entry_valid as the
         // short-lived negative dentry that create/mkdir/symlink/link evict
-        // before their successful reply installs the now-live entry.
+        // after their success reply, when the kernel has released the parent
+        // lock the reverse invalidation needs.
         assert_eq!(
             read_u64(NODE_ID_OFFSET),
             0,
