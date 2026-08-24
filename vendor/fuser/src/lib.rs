@@ -1053,3 +1053,21 @@ pub fn spawn_mount2_with_workers<
     let session = Session::new(filesystem, mountpoint.as_ref(), options)?;
     BackgroundSession::new_with_workers(session, worker_count)
 }
+
+/// Like [`spawn_mount2_with_workers`], but queues every received request by
+/// the CPU that read it before dispatch. Idle workers steal a ready request
+/// from a loaded CPU queue; requests sharing a file handle retain order.
+pub fn spawn_mount2_with_per_core_workers<
+    'a,
+    FS: Filesystem + Clone + Send + 'static + 'a,
+    P: AsRef<Path>,
+>(
+    filesystem: FS,
+    mountpoint: P,
+    options: &[MountOption],
+    worker_count: usize,
+) -> io::Result<BackgroundSession> {
+    check_option_conflicts(options)?;
+    let session = Session::new(filesystem, mountpoint.as_ref(), options)?;
+    BackgroundSession::new_with_per_core_workers(session, worker_count)
+}

@@ -290,6 +290,37 @@ impl<'a> Request<'a> {
         operation_is_concurrency_safe(&operation)
     }
 
+    /// File handle whose requests must retain submission order.
+    ///
+    /// Per-core transport workers may steal independent metadata requests, but
+    /// they must never run two operations for one kernel file handle out of
+    /// order.  Operations without a file handle remain eligible for stealing.
+    pub(crate) fn ordering_file_handle(&self) -> Option<u64> {
+        let operation = self.request.operation().ok()?;
+        let handle = match operation {
+            ll::Operation::Read(operation) => operation.file_handle(),
+            ll::Operation::Write(operation) => operation.file_handle(),
+            ll::Operation::Release(operation) => operation.file_handle(),
+            ll::Operation::FSync(operation) => operation.file_handle(),
+            ll::Operation::Flush(operation) => operation.file_handle(),
+            ll::Operation::ReadDir(operation) => operation.file_handle(),
+            ll::Operation::ReleaseDir(operation) => operation.file_handle(),
+            ll::Operation::FSyncDir(operation) => operation.file_handle(),
+            ll::Operation::GetLk(operation) => operation.file_handle(),
+            ll::Operation::SetLk(operation) => operation.file_handle(),
+            ll::Operation::SetLkW(operation) => operation.file_handle(),
+            ll::Operation::Poll(operation) => operation.file_handle(),
+            #[cfg(feature = "abi-7-19")]
+            ll::Operation::FAllocate(operation) => operation.file_handle(),
+            #[cfg(feature = "abi-7-21")]
+            ll::Operation::ReadDirPlus(operation) => operation.file_handle(),
+            #[cfg(feature = "abi-7-24")]
+            ll::Operation::Lseek(operation) => operation.file_handle(),
+            _ => return None,
+        };
+        Some(u64::from(handle))
+    }
+
     /// Dispatch request to the given filesystem.
     /// This calls the appropriate filesystem operation method for the
     /// request and sends back the returned reply to the kernel
