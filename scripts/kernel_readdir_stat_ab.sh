@@ -74,9 +74,18 @@ visit() {
 fuse_visit() {
   local img=$1
   local tag=$2
+  # Optional third argument: extra environment for the daemon. Used for the
+  # SUPPRESSED arm, which is a MEASUREMENT PROBE and not a shipping
+  # configuration -- it answers `getxattr` with ENOSYS, which is a semantic
+  # change, and exists here only because it removes almost exactly one boundary
+  # crossing per entry (counted: 1.0052 -> 0.0052 crossings/entry, 9ffd33dec).
+  # Timing both arms therefore PRICES the round trip directly instead of
+  # inferring it from a per-crossing constant.
+  local extra=${3:-}
   local log="$WORK/$tag-fuse.log"
   : >> "$log"
-  "$CLI" mount "$img" "$WORK/mnt" >> "$log" 2>&1 &
+  # shellcheck disable=SC2086
+  env $extra "$CLI" mount "$img" "$WORK/mnt" >> "$log" 2>&1 &
   local daemon=$!
   local i
   for i in $(seq 1 600); do mountpoint -q "$WORK/mnt" && break; sleep 0.2; done
@@ -101,6 +110,10 @@ for r in $(seq 1 "$ROUNDS"); do
   visit "$EXT4_IMG"  kern-ext4
   fuse_visit "$BTRFS_IMG" fuse-btrfs
   fuse_visit "$EXT4_IMG"  fuse-ext4
+  fuse_visit "$BTRFS_IMG" supp-btrfs FFS_FUSE_XATTR_NO_SUPPORT=auto
+  fuse_visit "$EXT4_IMG"  supp-ext4  FFS_FUSE_XATTR_NO_SUPPORT=auto
+  fuse_visit "$EXT4_IMG"  supp-ext4  FFS_FUSE_XATTR_NO_SUPPORT=auto
+  fuse_visit "$BTRFS_IMG" supp-btrfs FFS_FUSE_XATTR_NO_SUPPORT=auto
   fuse_visit "$EXT4_IMG"  fuse-ext4
   fuse_visit "$BTRFS_IMG" fuse-btrfs
   visit "$EXT4_IMG"  kern-ext4
@@ -131,7 +144,7 @@ if len(sizes) == 2 and len({tuple(v) for v in sizes.values()}) != 1:
     print("       tree height would differ and this would measure the fixture.")
     raise SystemExit(2)
 
-need = ("kern-btrfs", "kern-ext4", "fuse-btrfs", "fuse-ext4")
+need = ("kern-btrfs", "kern-ext4", "fuse-btrfs", "fuse-ext4", "supp-btrfs", "supp-ext4")
 missing = [a for a in need if len(per.get(a, [])) < 2]
 if missing:
     print("arms with fewer than 2 visits, nothing decidable: %s" % ", ".join(missing))
@@ -158,4 +171,30 @@ verdict = "DECIDABLE" if sep > null else "UNDECIDABLE (inside the A/A null)"
 print("A/A null (worst arm spread) %.3fx  ->  %s" % (null, verdict))
 print("NOTE: matched fixtures, one window. The per-filesystem RATIOS are the")
 print("      comparable quantity; the absolute ns/entry are not a scorecard row.")
+
+# IS THE GAP THE ROUND TRIP, OR THE DAEMON? The suppressed arm removes almost
+# exactly one boundary crossing per entry (1.0052 -> 0.0052, counted in 9ffd33dec)
+# and changes nothing else about the daemon, so the control-minus-suppressed
+# difference PRICES that crossing instead of inferring it from a per-crossing
+# constant. What is left above the kernel after removing it is daemon work.
+#
+# This decides a question that has been answered by assertion in both directions:
+# "structural / round-trip-bound" versus "daemon-work-bound".
+for fs in ("btrfs", "ext4"):
+    ctl, sup, ker = "fuse-" + fs, "supp-" + fs, "kern-" + fs
+    if any(len(per.get(a, [])) < 2 for a in (ctl, sup, ker)):
+        continue
+    c, s, k = med[ctl], med[sup], med[ker]
+    gap = c - k
+    if gap <= 0:
+        continue
+    trip = c - s
+    daemon = s - k
+    print("")
+    print("%s decomposition of the %.0f ns/entry gap over the kernel:" % (fs, gap))
+    print("    round trip (control - suppressed) %8.0f ns/entry  %5.1f%%"
+          % (trip, 100.0 * trip / gap))
+    print("    daemon     (suppressed - kernel)  %8.0f ns/entry  %5.1f%%"
+          % (daemon, 100.0 * daemon / gap))
+    print("    suppressed arm is a MEASUREMENT PROBE, not a shipping configuration.")
 '
