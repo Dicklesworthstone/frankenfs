@@ -425,6 +425,13 @@ fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
 ///
 /// Read-only images are immutable, so a generous TTL is safe.
 const ATTR_TTL: Duration = Duration::from_secs(60);
+/// Keep an unsuccessful lookup briefly so repeated misses do not cross FUSE.
+///
+/// A positive entry is valid for [`ATTR_TTL`]; a negative entry needs a much
+/// shorter horizon because a create can make its name live. Every successful
+/// namespace mutation sends `FUSE_NOTIFY_INVAL_ENTRY` for the affected name,
+/// so this is an optimization only while that name is known unchanged.
+const NEGATIVE_ENTRY_TTL: Duration = Duration::from_secs(1);
 const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
 const COALESCED_FETCH_MULTIPLIER: u32 = 4;
 const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
@@ -5147,23 +5154,7 @@ impl Filesystem for FrankenFuse {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
-        match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
-            self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
-        }) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
-            Err(e) => {
-                Self::reply_error_entry(
-                    &FuseErrorContext {
-                        error: &e,
-                        operation: "lookup",
-                        ino: parent,
-                        offset: None,
-                    },
-                    reply,
-                );
-            }
-        }
+        self.lookup_impl(parent, name, reply);
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -5537,7 +5528,11 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(attr)
         }) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+            }
             Err(e) => {
                 Self::reply_error_entry(
                     &FuseErrorContext {
@@ -5724,7 +5719,10 @@ impl Filesystem for FrankenFuse {
             mtime: mtime.map(resolve_time),
         };
         match self.dispatch_setattr(&cx, ino, &attrs, req.uid()) {
-            Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(&attr)),
+            Ok(attr) => {
+                self.notify_inode_invalidation(ino);
+                reply.attr(&ATTR_TTL, &to_file_attr(&attr));
+            }
             Err(e) => {
                 Self::reply_error_attr(
                     &FuseErrorContext {
@@ -5751,7 +5749,11 @@ impl Filesystem for FrankenFuse {
         reply: ReplyEntry,
     ) {
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_entry(
@@ -5778,7 +5780,11 @@ impl Filesystem for FrankenFuse {
         reply: ReplyEntry,
     ) {
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_entry(
@@ -5812,7 +5818,10 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(())
         }) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.notify_inode_invalidation(parent);
+                reply.ok();
+            }
             Err(e) => {
                 Self::reply_error_empty(
                     &FuseErrorContext {
@@ -5829,7 +5838,10 @@ impl Filesystem for FrankenFuse {
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.dispatch_rmdir(parent, name) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.notify_inode_invalidation(parent);
+                reply.ok();
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_empty(
@@ -5860,9 +5872,13 @@ impl Filesystem for FrankenFuse {
         // FsOps::rename2; we no longer pre-reject every non-zero flag.
         match self.dispatch_rename(parent, name, newparent, newname, flags) {
             Ok(()) => {
-                reply.ok();
                 self.notify_entry_invalidation(parent, name);
                 self.notify_entry_invalidation(newparent, newname);
+                self.notify_inode_invalidation(parent);
+                if newparent != parent {
+                    self.notify_inode_invalidation(newparent);
+                }
+                reply.ok();
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -5908,7 +5924,12 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(attr)
         }) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                self.notify_entry_invalidation(newparent, newname);
+                self.notify_inode_invalidation(newparent);
+                self.notify_inode_invalidation(ino);
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+            }
             Err(e) => {
                 Self::reply_error_entry(
                     &FuseErrorContext {
@@ -5949,7 +5970,10 @@ impl Filesystem for FrankenFuse {
             data,
             WriteIntent::from_fuse(fh, write_flags, flags),
         ) {
-            Ok(written) => reply.written(written),
+            Ok(written) => {
+                self.notify_inode_invalidation(ino);
+                reply.written(written);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_write(
@@ -5983,7 +6007,10 @@ impl Filesystem for FrankenFuse {
             offset_in, ino_out, offset_out, len, flags, "FUSE copy_file_range"
         );
         match self.dispatch_copy_file_range(ino_in, offset_in, ino_out, offset_out, len, flags) {
-            Ok(written) => reply.written(written),
+            Ok(written) => {
+                self.notify_inode_invalidation(ino_out);
+                reply.written(written);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_write(
@@ -6040,7 +6067,10 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(())
         }) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.notify_inode_invalidation(ino);
+                reply.ok();
+            }
             Err(e) => {
                 Self::reply_error_empty(
                     &FuseErrorContext {
@@ -6365,6 +6395,8 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
                 reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
             }
             Err(e) => {
@@ -6393,6 +6425,31 @@ impl Filesystem for FrankenFuse {
 /// method with the same name and signature is valid Rust. Only a live mount
 /// could see it.
 impl FrankenFuse {
+    /// The `lookup` handler body, minus the `Request` it never reads.
+    ///
+    /// Kept separately so the FUSE protocol reply for a negative dentry can be
+    /// tested without a live kernel request.
+    fn lookup_impl(&self, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
+            self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
+        }) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Err(FfsError::NotFound(_)) => Self::reply_negative_entry(reply),
+            Err(e) => {
+                Self::reply_error_entry(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "lookup",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
     /// Resolve ONE readdirplus entry's attributes, preserving bd-xfe7z's
     /// three-way split: a filled prefetch slot is served without a new scope,
     /// an empty slot pays an inline bounded getattr scope, and the
@@ -6497,7 +6554,10 @@ impl FrankenFuse {
         self.inner.missing_capability_xattr.forget(InodeNumber(ino));
         self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
         match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                self.notify_inode_invalidation(ino);
+                reply.ok();
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error: e, .. }) => {
                 let mode = match Self::parse_setxattr_mode(flags, position) {
@@ -6570,7 +6630,10 @@ impl FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(removed)
         }) {
-            Ok(true) => reply.ok(),
+            Ok(true) => {
+                self.notify_inode_invalidation(ino);
+                reply.ok();
+            }
             Ok(false) => reply.error(Self::missing_xattr_errno()),
             Err(e) => {
                 Self::reply_error_empty(
@@ -8644,6 +8707,13 @@ mod tests {
     }
 
     impl RecordingSender {
+        fn bytes(&self) -> Vec<u8> {
+            self.sent
+                .lock()
+                .expect("sender must not be poisoned")
+                .clone()
+        }
+
         /// The errno a FUSE reply carries, or `None` if it replied success.
         ///
         /// `fuse_out_header` is `{ len: u32, error: i32, unique: u64 }` and the
@@ -8703,6 +8773,85 @@ mod tests {
             ..MountOptions::default()
         };
         FrankenFuse::with_options(Box::new(MinimalTestFs), &options)
+    }
+
+    #[test]
+    fn lookup_miss_installs_a_short_negative_dentry_not_a_stale_attr_bd_yu6jz() {
+        let sender = RecordingSender::default();
+        writable_fuse().lookup_impl(
+            1,
+            OsStr::new("new-after-miss"),
+            <ReplyEntry as fuser::Reply>::new(0x33, sender.clone()),
+        );
+
+        assert_eq!(
+            sender.errno(),
+            None,
+            "a cacheable miss is a successful FUSE reply"
+        );
+        let response = sender.bytes();
+        const FUSE_OUT_HEADER_SIZE: usize = 16;
+        const NODE_ID_OFFSET: usize = FUSE_OUT_HEADER_SIZE;
+        const ENTRY_VALID_OFFSET: usize = NODE_ID_OFFSET + 16;
+        const ATTR_VALID_OFFSET: usize = ENTRY_VALID_OFFSET + 8;
+        let read_u64 = |offset| {
+            u64::from_ne_bytes(
+                response[offset..offset + 8]
+                    .try_into()
+                    .expect("entry reply must include the requested u64"),
+            )
+        };
+
+        // This is the planted stale-attribute negative: ENOENT alone has no
+        // cache validity, while a nonzero node id would turn a miss into a
+        // positive dentry. Linux interprets nodeid=0 plus entry_valid as the
+        // short-lived negative dentry that create/mkdir/symlink/link evict
+        // before their successful reply installs the now-live entry.
+        assert_eq!(
+            read_u64(NODE_ID_OFFSET),
+            0,
+            "misses must never manufacture an inode"
+        );
+        assert_eq!(
+            read_u64(ENTRY_VALID_OFFSET),
+            NEGATIVE_ENTRY_TTL.as_secs(),
+            "the negative dentry must be cached briefly, not for the 60s positive TTL"
+        );
+        assert_eq!(
+            read_u64(ATTR_VALID_OFFSET),
+            NEGATIVE_ENTRY_TTL.as_secs(),
+            "fuser must carry the same short TTL in the paired attr field"
+        );
+    }
+
+    #[test]
+    fn lookup_of_stable_metadata_advertises_entry_and_attr_ttls_bd_yu6jz() {
+        let sender = RecordingSender::default();
+        FrankenFuse::with_options(
+            Box::new(CapabilityMutationFs::default()),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        )
+        .lookup_impl(
+            1,
+            OsStr::new("already-live"),
+            <ReplyEntry as fuser::Reply>::new(0x34, sender.clone()),
+        );
+
+        let response = sender.bytes();
+        let read_u64 = |offset| {
+            u64::from_ne_bytes(
+                response[offset..offset + 8]
+                    .try_into()
+                    .expect("entry reply must include the requested u64"),
+            )
+        };
+        const FUSE_OUT_HEADER_SIZE: usize = 16;
+        assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE), 1);
+        assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE + 16), ATTR_TTL.as_secs());
+        assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE + 24), ATTR_TTL.as_secs());
     }
 
     /// bd-ha71t: THE OBSERVATION THAT WAS MISSING.
