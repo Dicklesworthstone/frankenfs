@@ -132,8 +132,26 @@ fi
 echo ">> using cargo: $CARGO"
 echo ">> using rustc: ${RUSTC:-<PATH>} ($("${RUSTC:-rustc}" --version 2>/dev/null))"
 
-# Locate llvm-profdata (rustup component OR system).
-PROFDATA="$(find "${RUSTUP_HOME:-$HOME/.rustup}" -name llvm-profdata 2>/dev/null | head -1)"
+# Locate llvm-profdata, PREFERRING THE TOOLCHAIN WE ARE BUILDING WITH.
+#
+# OBSERVED DEFECT, 2026-08-23 (bd-svhrq): this was
+# `find "$RUSTUP_HOME" -name llvm-profdata | head -1`, which is the very trap the
+# cargo-resolution comment above documents and guards against -- the guard was
+# applied to cargo and rustc and not to this. `find` returns the FLOATING
+# `nightly` toolchain's copy first, and stage [3/4] then dies with
+#
+#   error: raw profile version mismatch: Profile uses raw profile format
+#          version = 10; expected version = 11
+#
+# because the pinned nightly-2026-07-20 emits v10 raw profiles and today's
+# floating nightly ships a v11 reader. A twenty-minute training run is already
+# spent by the time that fires.
+#
+# The profile reader must match the compiler that WROTE the profile, so take it
+# from $CARGO's own toolchain root first and only then fall back to a search.
+TOOLCHAIN_ROOT="$(dirname "$(dirname "$CARGO")")"
+PROFDATA="$(find "$TOOLCHAIN_ROOT" -name llvm-profdata 2>/dev/null | head -1)"
+[ -z "$PROFDATA" ] && PROFDATA="$(find "${RUSTUP_HOME:-$HOME/.rustup}" -name llvm-profdata 2>/dev/null | head -1)"
 [ -z "$PROFDATA" ] && PROFDATA="$(command -v llvm-profdata llvm-profdata-18 2>/dev/null | head -1)"
 if [ -z "$PROFDATA" ]; then
   echo "!! llvm-profdata not found. Run: rustup component add llvm-tools-preview" >&2
@@ -181,11 +199,45 @@ if [ "${SKIP_TRAIN:-0}" != "1" ]; then
   # reports how many .profraw files appeared while it ran.
   TRAIN_RESULTS="$PGO_DIR/training-results.tsv"
   : > "$TRAIN_RESULTS"
+  #
+  # EACH COMMAND WRITES ITS OWN PROFILE FILE, and that is load-bearing rather
+  # than tidy. OBSERVED DEFECT, 2026-08-23 (bd-svhrq): without the explicit
+  # LLVM_PROFILE_FILE below, rustc's default `-Cprofile-generate=<dir>` pattern
+  # is `default_%m_0.profraw`, and `%m` names a MERGE POOL keyed by the binary's
+  # signature. All five commands run the SAME instrumented binary, so all five
+  # merge IN PLACE into ONE file: the file count rises exactly once, on the
+  # first command, and this gate reported
+  #
+  #   PGO training gate FAILED: 4 of 5 training commands did not train
+  #     (lookup-bench, rename-bench, delbench, walk)
+  #
+  # for a run in which every command exited 0 and did real work
+  # (`lookupbench_done count=100000 dir_entries=40004 found=100000`), and whose
+  # merged profile demonstrably contained `lookupbench_cmd`, `renamebench_cmd`
+  # and `walk_cmd`. The gate was right to fail closed on the evidence it had;
+  # the evidence was being collected wrongly.
+  #
+  # `%p` gives every RUN its own file, so "a new profile appeared" is once again
+  # the thing this is counting. The gate's threshold is untouched: this repairs
+  # its input rather than relaxing what it demands.
   train() { # $1 label, rest: command
     local label="$1"; shift
     local before after rc
     before=$(find "$PGO_DIR" -name '*.profraw' | wc -l)
-    "$@" >/dev/null 2>&1; rc=$?
+    # `if`, not `cmd; rc=$?`: this script runs under `set -e`, which aborts on a
+    # failing simple command BEFORE the next one can read `$?`. The comment above
+    # promises that "one bad bench must not abort a 20-minute build" and that the
+    # gate decides -- but as written a single failing bench killed the script
+    # outright, with an empty results file and nothing for the gate to adjudicate
+    # (observed 2026-08-23: a second run against an already-trained image failed
+    # `create-bench ... file exists` and took the whole build down at stage 2).
+    # A command inside an `if` condition is exempt from `set -e`, so the failure
+    # is recorded and the gate gets to rule on it, as intended.
+    if LLVM_PROFILE_FILE="$PGO_DIR/${label}_%m_%p.profraw" "$@" >/dev/null 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
     after=$(find "$PGO_DIR" -name '*.profraw' | wc -l)
     printf '%s\t%s\t%s\n' "$label" "$rc" "$((after - before))" >> "$TRAIN_RESULTS"
   }
