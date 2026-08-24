@@ -2329,15 +2329,14 @@ fn cli_mount_nonexistent_image_reports_error() {
     emit_scenario_result("cli_mount_missing_image_error", "PASS", None);
 }
 
-/// The per-core mode used to construct an unconnected dispatcher, then start a
-/// regular managed mount. Reject it at the command boundary before opening the
-/// image: otherwise the CLI advertises a routing model that serves no request.
+/// Per-core mode must reach the real CPU-keyed FUSE transport rather than
+/// retaining the former command-boundary rejection. A missing image therefore
+/// fails during image open, just like the other mount modes.
 ///
-/// This is intentionally a binary-level regression rather than a direct call
-/// to `MountRuntimeConfig::validate`, so Clap parsing and the public `ffs mount`
-/// surface cannot bypass the fail-closed guard (bd-fuse-per-core-mount-dispatch-inert-qai4n).
+/// This is intentionally a binary-level regression: it proves Clap parsing and
+/// the public `ffs mount` surface admit the real routing path (bd-28mw2).
 #[test]
-fn cli_mount_per_core_rejects_inert_dispatcher_before_image_open() {
+fn cli_mount_per_core_reaches_image_open_before_mounting() {
     let tmpdir = tempfile::tempdir().expect("create temp dir");
     let missing_image = tmpdir.path().join("no_such.img");
     let mountpoint = tmpdir.path().join("mnt");
@@ -2353,18 +2352,18 @@ fn cli_mount_per_core_rejects_inert_dispatcher_before_image_open() {
 
     assert!(
         !output.status.success(),
-        "an inert per-core dispatcher must be refused"
+        "a missing image must prevent a per-core mount from succeeding"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("per-core runtime is unavailable"),
-        "the CLI must name the unavailable dispatcher, got: {stderr}"
+        stderr.contains("failed to open filesystem image"),
+        "per-core mode must reach image open, got: {stderr}"
     );
     assert!(
-        !stderr.contains("failed to open filesystem image"),
-        "validation must run before image I/O, got: {stderr}"
+        !stderr.contains("per-core runtime is unavailable"),
+        "the stale inert-dispatcher rejection must stay gone, got: {stderr}"
     );
-    emit_scenario_result("cli_mount_per_core_inert_dispatcher_rejected", "PASS", None);
+    emit_scenario_result("cli_mount_per_core_reaches_image_open", "PASS", None);
 }
 
 #[test]

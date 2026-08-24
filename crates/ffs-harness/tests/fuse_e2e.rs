@@ -15583,6 +15583,40 @@ fn fuse_empty_file_operations() {
 }
 
 #[test]
+fn fuse_negative_dentry_does_not_hide_created_or_renamed_file_bd_yu6jz() {
+    with_rw_mount(|mnt| {
+        let created = mnt.join("appears_after_negative_create.txt");
+        let initial_miss = fs::metadata(&created).expect_err("plant a negative dentry first");
+        assert_eq!(
+            initial_miss.raw_os_error(),
+            Some(libc::ENOENT),
+            "the planted lookup must be a real kernel-visible miss"
+        );
+
+        fs::write(&created, b"created after miss\n").expect("create after planted miss");
+        assert_eq!(
+            fs::read(&created).expect("created file must be visible immediately"),
+            b"created after miss\n",
+            "a cached ENOENT must not survive the successful create"
+        );
+
+        let source = mnt.join("rename_source.txt");
+        let destination = mnt.join("appears_after_negative_rename.txt");
+        fs::write(&source, b"renamed after miss\n").expect("create rename source");
+        let destination_miss =
+            fs::metadata(&destination).expect_err("plant destination negative dentry");
+        assert_eq!(destination_miss.raw_os_error(), Some(libc::ENOENT));
+
+        fs::rename(&source, &destination).expect("rename onto planted negative dentry");
+        assert_eq!(
+            fs::read(&destination).expect("renamed file must be visible immediately"),
+            b"renamed after miss\n",
+            "a cached destination ENOENT must not survive rename"
+        );
+    });
+}
+
+#[test]
 fn fuse_empty_filesystem_root_readdir_stat_and_create_readback() {
     const SCENARIO_ID: &str = "fuse_prod_empty_ext4_root_readdir_stat_create_readback";
 

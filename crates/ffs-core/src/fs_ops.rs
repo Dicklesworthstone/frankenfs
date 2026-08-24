@@ -851,11 +851,8 @@ impl FsOps for OpenFs {
                 let mut names = ffs_ondisk::parse_ibody_xattr_names(&inode)
                     .map_err(|e| parse_to_ffs_error(&e))?;
                 if inode.file_acl != 0 {
-                    let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
-                    names.extend(
-                        ffs_ondisk::parse_xattr_block_names(&block_data)
-                            .map_err(|e| parse_to_ffs_error(&e))?,
-                    );
+                    let entries = self.ext4_cached_xattr_block_entries(cx, ino, &inode)?;
+                    names.extend(entries.iter().map(|(xattr, _)| xattr.full_name()));
                 }
                 Ok(names)
             }
@@ -895,39 +892,38 @@ impl FsOps for OpenFs {
                 // (`parse_xattr_name` errors — e.g. an unhandled prefix, which
                 // the kernel VFS rejects before ext4 anyway) fall back to the
                 // by-name finder so observable behavior is unchanged there.
-                let found =
-                    if let Ok((name_index, suffix)) = ffs_xattr::parse_xattr_name_borrowed(name) {
-                        let found =
-                            ffs_ondisk::find_ibody_xattr_by_index_name(&inode, name_index, suffix)
-                                .map_err(|e| parse_to_ffs_error(&e))?;
-                        match found {
-                            Some(v) => Some(v),
-                            None if inode.file_acl != 0 => {
-                                let block_data =
-                                    self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
-                                ffs_ondisk::find_xattr_block_value_by_index_name(
-                                    &block_data,
-                                    name_index,
-                                    suffix,
-                                )
-                                .map_err(|e| parse_to_ffs_error(&e))?
-                            }
-                            None => None,
-                        }
-                    } else {
-                        let found = ffs_ondisk::find_ibody_xattr_by_name(&inode, name)
+                let found = if let Ok((name_index, suffix)) =
+                    ffs_xattr::parse_xattr_name_borrowed(name)
+                {
+                    let found =
+                        ffs_ondisk::find_ibody_xattr_by_index_name(&inode, name_index, suffix)
                             .map_err(|e| parse_to_ffs_error(&e))?;
-                        match found {
-                            Some(v) => Some(v),
-                            None if inode.file_acl != 0 => {
-                                let block_data =
-                                    self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
-                                ffs_ondisk::find_xattr_block_value_by_name(&block_data, name)
-                                    .map_err(|e| parse_to_ffs_error(&e))?
-                            }
-                            None => None,
+                    match found {
+                        Some(v) => Some(v),
+                        None if inode.file_acl != 0 => {
+                            let entries = self.ext4_cached_xattr_block_entries(cx, ino, &inode)?;
+                            entries.iter().find_map(|(xattr, value_inum)| {
+                                (xattr.name_index == name_index && xattr.name == suffix)
+                                    .then(|| (xattr.name_index, xattr.value.clone(), *value_inum))
+                            })
                         }
-                    };
+                        None => None,
+                    }
+                } else {
+                    let found = ffs_ondisk::find_ibody_xattr_by_name(&inode, name)
+                        .map_err(|e| parse_to_ffs_error(&e))?;
+                    match found {
+                        Some(v) => Some(v),
+                        None if inode.file_acl != 0 => {
+                            let entries = self.ext4_cached_xattr_block_entries(cx, ino, &inode)?;
+                            entries.iter().find_map(|(xattr, value_inum)| {
+                                (xattr.full_name() == name)
+                                    .then(|| (xattr.name_index, xattr.value.clone(), *value_inum))
+                            })
+                        }
+                        None => None,
+                    }
+                };
                 let Some((name_index, value, value_inum)) = found else {
                     return Ok(None);
                 };
@@ -4251,6 +4247,41 @@ impl FsOps for OpenFs {
 
         Ok(())
     }
+    /// Expose the writeback-batch primitives through the trait (bd-2i2ez).
+    ///
+    /// These bodies are one line each because the work has existed since
+    /// bd-xhm5g.401 — as INHERENT methods on `OpenFs`. The production mount holds
+    /// `Arc<dyn FsOps>` and could not name them, so the amortization they enable
+    /// was unreachable from the code that ships. These impls plus the `Arc<T>`
+    /// forwards in `vfs.rs` are the entire difference between a primitive and a
+    /// feature.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying scope error unchanged.
+    fn begin_writeback_batch_scope(&self, cx: &Cx) -> ffs_error::Result<RequestScope> {
+        Self::begin_writeback_batch_scope(self, cx)
+    }
+
+    /// # Errors
+    ///
+    /// Propagates the commit error, or the release error when commit succeeded
+    /// and release did not.
+    fn commit_writeback_batch_scope(
+        &self,
+        cx: &Cx,
+        scope: RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
+        Self::commit_writeback_batch_scope(self, cx, scope)
+    }
+
+    /// # Errors
+    ///
+    /// Propagates the scope-release error.
+    fn abort_writeback_batch_scope(&self, cx: &Cx, scope: RequestScope) -> ffs_error::Result<()> {
+        Self::abort_writeback_batch_scope(self, cx, scope)
+    }
+
     /// Commit any transaction in the request scope.
     ///
     /// # Errors

@@ -224,6 +224,31 @@ pub fn splice_enabled() -> bool {
     splice_from_value(std::env::var("FFS_FUSE_SPLICE").ok().as_deref())
 }
 
+/// Whether this process batches a run of FUSE WRITEs into one MVCC transaction
+/// (bd-2i2ez). Default off.
+///
+/// Exists so `mount_candidate_knobs` can REPORT it. The mounted comparator
+/// requires the two candidate arms to disagree on a knob the ELF actually reads,
+/// and refuses the run otherwise —
+///
+///   "the two candidate configurations resolved IDENTICAL runtime knobs (...);
+///    the requested override never reached a knob this ELF reads, so the run
+///    would compare a configuration against itself"
+///
+/// — which is exactly what it said when `--candidate-b-env
+/// FFS_FUSE_WRITEBACK_BATCH=1` was passed to an ELF whose knob line did not
+/// mention writeback. The gate was right: without this accessor the A/B arm was
+/// unprovable, and an unprovable arm measured against itself is the inert-arm
+/// failure the knob line exists to prevent.
+///
+/// This reads the same variable `WritebackBatch::from_env` reads, so the knob
+/// line reports what the mount actually did rather than what was requested.
+#[must_use]
+pub fn writeback_batch_enabled() -> bool {
+    std::env::var("FFS_FUSE_WRITEBACK_BATCH")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+}
+
 /// Whether this process asks the kernel to handle `opendir` itself (bd-q0xnl).
 ///
 /// ZERO-MESSAGE OPENDIR. The kernel's own contract (`FUSE_NO_OPENDIR_SUPPORT`,
@@ -425,6 +450,14 @@ fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
 ///
 /// Read-only images are immutable, so a generous TTL is safe.
 const ATTR_TTL: Duration = Duration::from_secs(60);
+/// Keep an unsuccessful lookup briefly so repeated misses do not cross FUSE.
+///
+/// A positive entry is valid for [`ATTR_TTL`]; a negative entry needs a much
+/// shorter horizon because a create can make its name live. Every successful
+/// namespace mutation sends `FUSE_NOTIFY_INVAL_ENTRY` for the affected name
+/// after replying to the kernel. The ordering is required: invalidating while
+/// a mutating request holds the parent lock can deadlock the FUSE request.
+const NEGATIVE_ENTRY_TTL: Duration = Duration::from_secs(1);
 const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
 const COALESCED_FETCH_MULTIPLIER: u32 = 4;
 const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
@@ -2004,7 +2037,11 @@ const FUSE_QUEUED_REQUESTS_PER_WORKER: u16 = 16;
 fn fuse_worker_queue_limits(worker_threads: usize) -> (u16, u16) {
     let workers = u16::try_from(worker_threads).unwrap_or(u16::MAX).max(1);
     let max_background = workers.saturating_mul(FUSE_QUEUED_REQUESTS_PER_WORKER);
-    let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+    let congestion_threshold = max_background
+        .saturating_div(4)
+        .saturating_mul(3)
+        .saturating_add((max_background % 4).saturating_mul(3).saturating_div(4))
+        .max(1);
     (max_background, congestion_threshold)
 }
 
@@ -3028,10 +3065,12 @@ impl ReadonlyXattrCache {
 /// 64 slots is 512 bytes for the whole mount and covers a directory-sized sweep.
 /// The progression is counted, on a read-write mount, 1000 path stats:
 ///
-///     1 slot   (`read_only`-gated, so also disabled here) :    0 / 2000 hits
-///     2 slots, shift-down victim                          :  501 / 2000 hits
-///     2 slots, 2-way pseudo-LRU                           : 1000 / 2000 hits
-///     64 slots, direct-mapped                             : see bd-2pq73
+/// ```text
+/// 1 slot   (`read_only`-gated, so also disabled here) :    0 / 2000 hits
+/// 2 slots, shift-down victim                          :  501 / 2000 hits
+/// 2 slots, 2-way pseudo-LRU                           : 1000 / 2000 hits
+/// 64 slots, direct-mapped                             : see bd-2pq73
+/// ```
 ///
 /// Two slots could hold the root and exactly one file, so a sweep of 50 files
 /// evicted each before it recurred and every file probe missed. Direct mapping by
@@ -3661,6 +3700,20 @@ impl ReaddirplusAttrMemo {
             state[idx] = None;
         }
     }
+
+    /// Drop every pending hand-off after a namespace mutation.
+    ///
+    /// `rename` and `unlink` identify the changed directory entry, not every
+    /// inode whose identity may have changed. In particular, rename-over can
+    /// retire the destination inode without naming it at this invalidation
+    /// seam. Clearing this bounded, single-use table is therefore the only
+    /// sound answer until the next readdirplus rebuilds its hand-offs.
+    fn clear(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.fill(None);
+    }
 }
 
 // ── Shared FUSE inner state ─────────────────────────────────────────────────
@@ -3768,6 +3821,24 @@ struct FuseInner {
     zero_message_opendir: std::sync::atomic::AtomicBool,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
+    /// bd-2i2ez: stage a run of WRITEs into one MVCC transaction. Default OFF.
+    writeback: WritebackBatch,
+}
+
+impl FuseInner {
+    /// Drop the single-use attributes handed from `READDIRPLUS` to a following
+    /// `GETATTR`. A successful metadata mutation makes those attributes stale
+    /// before the kernel has a chance to consume the hand-off.
+    fn invalidate_readdirplus_attrs(&self, ino: InodeNumber) {
+        self.readdirplus_attr_memo.forget(ino);
+    }
+
+    /// A namespace mutation can replace or unlink an inode that its parent
+    /// entry invalidation does not identify, so it invalidates every pending
+    /// readdirplus-to-getattr hand-off.
+    fn invalidate_readdirplus_entries(&self) {
+        self.readdirplus_attr_memo.clear();
+    }
 }
 
 impl std::fmt::Debug for FuseInner {
@@ -3780,6 +3851,141 @@ impl std::fmt::Debug for FuseInner {
             .field("read_only", &self.read_only)
             .field("mountpoint", &self.mountpoint)
             .finish_non_exhaustive()
+    }
+}
+
+/// One outstanding writeback batch: several FUSE WRITEs staged into a single
+/// MVCC transaction, committed once at the next flush boundary (bd-2i2ez).
+///
+/// # Why one scope and not a table
+///
+/// bd-w3hol specified a per-file-handle table. A SINGLE outstanding scope is
+/// strictly simpler and loses nothing on the workload this exists for — the
+/// bulk-durable-write job is 64 sequential 1 MiB writes to ONE file followed by
+/// one fsync — while making the correctness argument small enough to check by
+/// reading it. A write to a different inode commits the outstanding batch first,
+/// so the batch is always exactly one inode's staged run.
+///
+/// # The visibility invariant, which is the whole safety argument
+///
+/// Staged writes live in an uncommitted MVCC transaction, so they are invisible
+/// to any observer reading through a fresh scope — a stale `read`, a stale
+/// `getattr` size, a stale `readdir`. Rather than route every observing path
+/// through the live scope (many call sites, each one a chance to miss one and
+/// serve stale data), this takes the conservative rule:
+///
+///   ANY request that is not a WRITE commits the outstanding batch BEFORE it
+///   runs, centrally in `with_request_scope`.
+///
+/// So no observer can ever see less than a caller would have seen without
+/// batching. What is amortized is exactly a RUN OF CONSECUTIVE WRITES, which is
+/// the only thing this lever claims.
+///
+/// POSIX durability is unchanged in the direction that matters: `write()` was
+/// never durable before `fsync`, and `fsync`/`flush`/`release` are non-write
+/// requests, so they commit the batch before doing their own work.
+///
+/// # What this does NOT preserve, stated rather than discovered later
+///
+/// The commit performed by `flush` does not re-acquire the inode guard the
+/// staging write held. Taking it there would deadlock against a mutation that
+/// already holds guards for its own inodes and then triggers the flush from
+/// inside `with_request_scope`. The commit is an MVCC store operation with its
+/// own synchronization, and the `Mutex` plus `Option::take` below means exactly
+/// one thread ever commits a given batch. This is a real narrowing of the
+/// existing locking discipline and is one of the reasons the mode is OFF by
+/// default.
+#[derive(Debug)]
+struct PendingWriteback {
+    /// The inode whose writes are staged. A write to any other inode flushes.
+    ino: u64,
+    /// Number of FUSE writes staged so far, for the bounded-dirty threshold.
+    staged: usize,
+}
+
+/// Writeback batching state (bd-2i2ez). Default OFF.
+struct WritebackBatch {
+    /// Off unless `FFS_FUSE_WRITEBACK_BATCH` opts in.
+    ///
+    /// A per-store field rather than a build flag, so ONE ELF supplies both A/B
+    /// arms for the mounted comparator's `--candidate-b-env` and the ISA/PGO
+    /// provenance cancels between them (bd-b9dug).
+    enabled: bool,
+    /// Commit and start over once this many writes are staged, so a writer that
+    /// never fsyncs cannot pin unbounded dirty state.
+    max_staged_writes: usize,
+    /// Non-zero when a batch is outstanding. Read on EVERY non-write request, so
+    /// it is a relaxed atomic and not the mutex: with batching off, or on with
+    /// nothing staged, the flush hook costs one load.
+    outstanding: std::sync::atomic::AtomicUsize,
+    state: Mutex<Option<(PendingWriteback, RequestScope)>>,
+}
+
+impl std::fmt::Debug for WritebackBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WritebackBatch")
+            .field("enabled", &self.enabled)
+            .field("max_staged_writes", &self.max_staged_writes)
+            .field(
+                "outstanding",
+                &self.outstanding.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Default bound on staged writes before an involuntary commit.
+///
+/// 64 is the bulk-durable-write job's exact write count, so that job commits
+/// once at its fsync rather than once mid-run: the threshold is a memory bound,
+/// and picking it below the target run would silently halve the amortization
+/// this lever exists to measure.
+const DEFAULT_MAX_STAGED_WRITES: usize = 64;
+
+impl WritebackBatch {
+    /// Reads `FFS_FUSE_WRITEBACK_BATCH`. Default OFF.
+    ///
+    /// This was hard-refused while the underlying scope primitive was known to
+    /// lose data. That defect is fixed (bd-2i2ez: `ext4_write` read the inode
+    /// through a FRESH scope, so a second write in one transaction could not see
+    /// the first's staged extent and only the last survived), and
+    /// `fuse_writeback_batch_crash_matrix.rs` now passes all five cases
+    /// including crash-replay, so the knob is honoured again.
+    ///
+    /// Still default OFF: it changes when writes become durable, and nothing has
+    /// measured it yet against the live kernel.
+    fn from_env() -> Self {
+        let enabled = std::env::var("FFS_FUSE_WRITEBACK_BATCH")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"));
+        let max_staged_writes = std::env::var("FFS_FUSE_WRITEBACK_MAX_WRITES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_STAGED_WRITES);
+        Self {
+            enabled,
+            max_staged_writes,
+            outstanding: std::sync::atomic::AtomicUsize::new(0),
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Cheap "is anything staged" check for the hot non-write path.
+    fn has_outstanding(&self) -> bool {
+        self.enabled && self.outstanding.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(PendingWriteback, RequestScope)>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_outstanding(&self, outstanding: bool) {
+        self.outstanding.store(
+            usize::from(outstanding),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -4422,6 +4628,10 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
 #[derive(Clone)]
 pub struct FrankenFuse {
     inner: Arc<FuseInner>,
+    // `Filesystem::destroy` cannot return an error. Retain a final-flush errno
+    // per mount so the blocking `mount` caller can still fail after its session
+    // ends rather than reporting a successful unmount after lost writes.
+    final_flush_errno: Arc<std::sync::atomic::AtomicI32>,
 }
 
 // Compile-time assertions: FrankenFuse must be Send + Sync.
@@ -4810,6 +5020,7 @@ impl Filesystem for FrankenFuse {
     fn destroy(&mut self) {
         let cx = Self::cx_for_request();
         if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {
+            self.record_final_flush_failure(&e);
             // ERROR, not WARN, and the only `error!` in this file — deliberately.
             //
             // This is the last chance to persist. If it fails, everything the
@@ -4987,23 +5198,7 @@ impl Filesystem for FrankenFuse {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
-        match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
-            self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
-        }) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
-            Err(e) => {
-                Self::reply_error_entry(
-                    &FuseErrorContext {
-                        error: &e,
-                        operation: "lookup",
-                        ino: parent,
-                        offset: None,
-                    },
-                    reply,
-                );
-            }
-        }
+        self.lookup_impl(parent, name, reply);
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -5377,7 +5572,11 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(attr)
         }) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+            }
             Err(e) => {
                 Self::reply_error_entry(
                     &FuseErrorContext {
@@ -5564,7 +5763,10 @@ impl Filesystem for FrankenFuse {
             mtime: mtime.map(resolve_time),
         };
         match self.dispatch_setattr(&cx, ino, &attrs, req.uid()) {
-            Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(&attr)),
+            Ok(attr) => {
+                reply.attr(&ATTR_TTL, &to_file_attr(&attr));
+                self.notify_inode_invalidation(ino);
+            }
             Err(e) => {
                 Self::reply_error_attr(
                     &FuseErrorContext {
@@ -5591,7 +5793,11 @@ impl Filesystem for FrankenFuse {
         reply: ReplyEntry,
     ) {
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_entry(
@@ -5618,7 +5824,11 @@ impl Filesystem for FrankenFuse {
         reply: ReplyEntry,
     ) {
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_entry(
@@ -5652,7 +5862,11 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(())
         }) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                reply.ok();
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+            }
             Err(e) => {
                 Self::reply_error_empty(
                     &FuseErrorContext {
@@ -5669,7 +5883,11 @@ impl Filesystem for FrankenFuse {
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.dispatch_rmdir(parent, name) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                reply.ok();
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_empty(
@@ -5703,6 +5921,10 @@ impl Filesystem for FrankenFuse {
                 reply.ok();
                 self.notify_entry_invalidation(parent, name);
                 self.notify_entry_invalidation(newparent, newname);
+                self.notify_inode_invalidation(parent);
+                if newparent != parent {
+                    self.notify_inode_invalidation(newparent);
+                }
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -5748,7 +5970,12 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(attr)
         }) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                self.notify_entry_invalidation(newparent, newname);
+                self.notify_inode_invalidation(newparent);
+                self.notify_inode_invalidation(ino);
+            }
             Err(e) => {
                 Self::reply_error_entry(
                     &FuseErrorContext {
@@ -5789,7 +6016,10 @@ impl Filesystem for FrankenFuse {
             data,
             WriteIntent::from_fuse(fh, write_flags, flags),
         ) {
-            Ok(written) => reply.written(written),
+            Ok(written) => {
+                reply.written(written);
+                self.notify_inode_invalidation(ino);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_write(
@@ -5823,7 +6053,10 @@ impl Filesystem for FrankenFuse {
             offset_in, ino_out, offset_out, len, flags, "FUSE copy_file_range"
         );
         match self.dispatch_copy_file_range(ino_in, offset_in, ino_out, offset_out, len, flags) {
-            Ok(written) => reply.written(written),
+            Ok(written) => {
+                reply.written(written);
+                self.notify_inode_invalidation(ino_out);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_write(
@@ -5880,7 +6113,10 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(())
         }) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                reply.ok();
+                self.notify_inode_invalidation(ino);
+            }
             Err(e) => {
                 Self::reply_error_empty(
                     &FuseErrorContext {
@@ -6206,6 +6442,8 @@ impl Filesystem for FrankenFuse {
         }) {
             Ok(attr) => {
                 reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
+                self.notify_entry_invalidation(parent, name);
+                self.notify_inode_invalidation(parent);
             }
             Err(e) => {
                 Self::reply_error_create(
@@ -6233,6 +6471,31 @@ impl Filesystem for FrankenFuse {
 /// method with the same name and signature is valid Rust. Only a live mount
 /// could see it.
 impl FrankenFuse {
+    /// The `lookup` handler body, minus the `Request` it never reads.
+    ///
+    /// Kept separately so the FUSE protocol reply for a negative dentry can be
+    /// tested without a live kernel request.
+    fn lookup_impl(&self, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
+            self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
+        }) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Err(FfsError::NotFound(_)) => Self::reply_negative_entry(reply),
+            Err(e) => {
+                Self::reply_error_entry(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "lookup",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
     /// Resolve ONE readdirplus entry's attributes, preserving bd-xfe7z's
     /// three-way split: a filled prefetch slot is served without a new scope,
     /// an empty slot pays an inline bounded getattr scope, and the
@@ -6337,7 +6600,10 @@ impl FrankenFuse {
         self.inner.missing_capability_xattr.forget(InodeNumber(ino));
         self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
         match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                reply.ok();
+                self.notify_inode_invalidation(ino);
+            }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error: e, .. }) => {
                 let mode = match Self::parse_setxattr_mode(flags, position) {
@@ -6410,7 +6676,10 @@ impl FrankenFuse {
             self.inner.ops.commit_request_scope(scope)?;
             Ok(removed)
         }) {
-            Ok(true) => reply.ok(),
+            Ok(true) => {
+                reply.ok();
+                self.notify_inode_invalidation(ino);
+            }
             Ok(false) => reply.error(Self::missing_xattr_errno()),
             Err(e) => {
                 Self::reply_error_empty(
@@ -6618,6 +6887,7 @@ pub fn mount(
     // crossings_total counts what reached `dispatch`. A future fast path that
     // answers before the scope opens will show up as the gap between them.
     emit_crossing_evidence(&crossings::render_live_timed());
+    fs.final_flush_result()?;
     // bd-viil0: the session has run to completion, so these are the FINAL counters.
     // Returning them rather than `()` is what lets the STANDARD mount runtime report
     // real dispatch attribution instead of hand-constructed zeros — the managed
@@ -6698,7 +6968,36 @@ pub struct MountHandle {
     mountpoint: PathBuf,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     metrics: Arc<AtomicMetrics>,
+    per_core_metrics: Option<Arc<fuser::PerCoreMetrics>>,
     config: MountConfig,
+}
+
+/// Snapshot of the queues that actually routed a per-core FUSE mount.
+///
+/// These counters are deliberately separate from [`per_core::PerCoreDispatcher`]:
+/// the latter is an advisory in-process dispatcher, whereas these are owned by
+/// fuser's CPU-keyed transport queues.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerCoreTransportMetrics {
+    /// CPUs selected for the transport lanes.
+    pub cpus: Vec<usize>,
+    /// Requests executed by each lane.
+    pub requests: Vec<u64>,
+    /// Requests stolen away from each source lane.
+    pub stolen_from: Vec<u64>,
+    /// Requests stolen by each destination lane.
+    pub stolen_to: Vec<u64>,
+}
+
+impl From<fuser::PerCoreMetricsSnapshot> for PerCoreTransportMetrics {
+    fn from(snapshot: fuser::PerCoreMetricsSnapshot) -> Self {
+        Self {
+            cpus: snapshot.cpus,
+            requests: snapshot.requests,
+            stolen_from: snapshot.stolen_from,
+            stolen_to: snapshot.stolen_to,
+        }
+    }
 }
 
 impl MountHandle {
@@ -6728,6 +7027,26 @@ impl MountHandle {
     /// Returns the final metrics snapshot.
     #[must_use]
     pub fn wait(mut self) -> MetricsSnapshot {
+        self.wait_for_shutdown();
+        self.do_unmount()
+    }
+
+    /// Wait for shutdown and return metrics from the real per-core transport,
+    /// when this handle was mounted through [`mount_managed_per_core`].
+    #[must_use]
+    pub fn wait_with_per_core_metrics(
+        mut self,
+    ) -> (MetricsSnapshot, Option<PerCoreTransportMetrics>) {
+        self.wait_for_shutdown();
+        let metrics = self.do_unmount();
+        let per_core_metrics = self
+            .per_core_metrics
+            .as_ref()
+            .map(|metrics| PerCoreTransportMetrics::from(metrics.snapshot()));
+        (metrics, per_core_metrics)
+    }
+
+    fn wait_for_shutdown(&self) {
         info!(mountpoint = %self.mountpoint.display(), "waiting for shutdown signal");
         loop {
             if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -6748,7 +7067,6 @@ impl MountHandle {
             }
             std::thread::sleep(MOUNT_HANDLE_WAIT_POLL_INTERVAL);
         }
-        self.do_unmount()
     }
 
     /// Trigger a graceful unmount.
@@ -6879,6 +7197,52 @@ pub fn mount_managed(
         mountpoint: mountpoint.to_owned(),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics: metrics_ref,
+        per_core_metrics: None,
+        config: config.clone(),
+    })
+}
+
+/// Mount a FrankenFS filesystem with lifecycle control and CPU-keyed request
+/// queues. Idle lanes steal only requests that are independent of an active
+/// file handle, so same-handle order is preserved by fuser's transport layer.
+pub fn mount_managed_per_core(
+    ops: Box<dyn FsOps>,
+    mountpoint: impl AsRef<Path>,
+    config: &MountConfig,
+) -> Result<MountHandle, FuseError> {
+    validate_mount_options(&config.options)?;
+    let mountpoint = mountpoint.as_ref();
+    validate_mountpoint(mountpoint)?;
+
+    let thread_count = config.options.resolved_thread_count();
+    if thread_count < 2 {
+        return Err(FuseError::Io(std::io::Error::other(
+            "per-core FUSE routing requires at least two worker threads",
+        )));
+    }
+
+    let fuse_opts = build_mount_options(&config.options);
+    let fs = FrankenFuse::with_mount_config(ops, Some(mountpoint), config);
+    resolve_xattr_suppression(&fs);
+    let metrics_ref = Arc::clone(&fs.inner.metrics);
+    let notifier_owner = fs.shared_handle();
+    let session =
+        fuser::spawn_mount2_with_per_core_workers(fs, mountpoint, &fuse_opts, thread_count)?;
+    let per_core_metrics = session.per_core_metrics();
+    notifier_owner.install_kernel_notifier(session.notifier());
+
+    info!(
+        mountpoint = %mountpoint.display(),
+        thread_count,
+        "per-core FUSE mount active"
+    );
+
+    Ok(MountHandle {
+        session: Some(session),
+        mountpoint: mountpoint.to_owned(),
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        metrics: metrics_ref,
+        per_core_metrics,
         config: config.clone(),
     })
 }
@@ -7176,6 +7540,248 @@ mod tests {
         // Forgetting an inode that was never stored must not panic: mutations
         // arrive for inodes no readdirplus ever touched.
         memo.forget(InodeNumber(999_999));
+    }
+
+    /// A mutation may land after `READDIRPLUS` has prepared an attribute reply
+    /// but before the kernel's follow-up `GETATTR`. The mutation invalidation
+    /// seam must discard that planted stale answer even without a live notifier
+    /// (which keeps this regression deterministic and exercises the cache path
+    /// rather than a kernel mount fixture).
+    #[test]
+    fn mutation_invalidation_drops_a_planted_readdirplus_stale_attr() {
+        let inner = FuseInner {
+            ops: Arc::new(MinimalTestFs),
+            metrics: Arc::new(AtomicMetrics::new()),
+            thread_count: 1,
+            worker_dispatch: false,
+            parallel_dirops: false,
+            read_only: false,
+            count_memoized_requests: true,
+            mountpoint: None,
+            kernel_notifier: Mutex::new(None),
+            ioctl_trace: None,
+            backpressure: None,
+            access_predictor: AccessPredictor::default(),
+            readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+            readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(
+                READDIRPLUS_ATTR_MEMO_SLOTS,
+                true,
+            ),
+            missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
+            zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+        };
+        let ino = InodeNumber(404);
+        let mut stale = make_test_attr(FfsFileType::RegularFile, 4096);
+        stale.ino = ino;
+        inner.readdirplus_attr_memo.remember(ino, &stale);
+
+        inner.invalidate_readdirplus_attrs(ino);
+
+        assert!(
+            inner.readdirplus_attr_memo.take(ino).is_none(),
+            "a metadata mutation must never let GETATTR consume READDIRPLUS's stale attributes"
+        );
+    }
+
+    /// A rename-over only identifies the destination directory entry; it does
+    /// not provide the inode number of the file it replaces. Every pending
+    /// READDIRPLUS hand-off must therefore be dropped at that namespace seam.
+    #[test]
+    fn rename_over_entry_invalidation_drops_all_pending_readdirplus_attrs() {
+        let inner = FuseInner {
+            ops: Arc::new(MinimalTestFs),
+            metrics: Arc::new(AtomicMetrics::new()),
+            thread_count: 1,
+            worker_dispatch: false,
+            parallel_dirops: false,
+            read_only: false,
+            count_memoized_requests: true,
+            mountpoint: None,
+            kernel_notifier: Mutex::new(None),
+            ioctl_trace: None,
+            backpressure: None,
+            access_predictor: AccessPredictor::default(),
+            readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+            readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(4, true),
+            missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
+            zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+        };
+        let fuse = FrankenFuse {
+            inner: Arc::new(inner),
+            final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        };
+        for ino in [InodeNumber(12), InodeNumber(13)] {
+            let mut attr = make_test_attr(FfsFileType::RegularFile, ino.0 * 100);
+            attr.ino = ino;
+            fuse.inner.readdirplus_attr_memo.remember(ino, &attr);
+        }
+
+        fuse.notify_entry_invalidation(1, OsStr::new("destination"));
+
+        for ino in [InodeNumber(12), InodeNumber(13)] {
+            assert!(
+                fuse.inner.readdirplus_attr_memo.take(ino).is_none(),
+                "rename-over must not let the next getattr consume {ino:?}'s stale attributes"
+            );
+        }
+    }
+
+    /// An entry can disappear after readdir has supplied its name but before
+    /// readdirplus fetches attributes. It must be skipped rather than emitted
+    /// with a stale or fabricated attribute reply.
+    #[test]
+    fn readdirplus_skips_an_entry_unlinked_during_listing() {
+        let fuse = FrankenFuse::with_options(Box::new(MinimalTestFs), &MountOptions::default());
+        let entry = FfsDirEntry {
+            ino: InodeNumber(71),
+            offset: 1,
+            kind: FfsFileType::RegularFile,
+            name: b"unlinked-before-attr".to_vec(),
+        };
+        let mut prefetched = None;
+        let mut census_served = 0;
+        let mut census_inline = 0;
+
+        assert!(
+            fuse.readdirplus_entry_attr(
+                &Cx::for_testing(),
+                &mut prefetched,
+                &entry,
+                0,
+                &mut census_served,
+                &mut census_inline,
+            )
+            .is_none(),
+            "an unlink racing readdirplus must skip the vanished entry"
+        );
+    }
+
+    /// THE BATCHING HALF OF THE readdir+stat STRUCTURAL BOUND (bd-2s8zy).
+    ///
+    /// Counted on a real mount, a readdir+stat sweep over 20,000 btrfs entries
+    /// costs `1.0052` crossings per entry with the shipping configuration and
+    /// `0.0052` with the capability probe suppressed — a delta of exactly
+    /// `1.0000`, the probe. The `0.0052` is the batched remainder: readdirplus
+    /// already carries ~192 entries per crossing, so readdir, lookup and getattr
+    /// are effectively free per entry and only the probe still crosses.
+    ///
+    /// That measurement is what makes the bound quotable, and it depends on the
+    /// prefetch actually serving entries. If the prefetch regressed, every entry
+    /// would pay its own `getattr` scope, crossings per entry would climb from
+    /// `1.0052` toward `2.0`, and the banked bound would silently describe a
+    /// configuration that no longer exists. A count taken on a mount cannot guard
+    /// itself; this does.
+    ///
+    /// Both ends are asserted, because only the pair proves the census
+    /// DISCRIMINATES. A test that checked the served arm alone would pass just as
+    /// happily against a census that always reported "served".
+    #[test]
+    fn readdirplus_prefetch_serves_every_entry_without_its_own_scope_bd_2s8zy() {
+        const ENTRIES: usize = 64;
+        let fuse = FrankenFuse::with_options(Box::new(MinimalTestFs), &MountOptions::default());
+        let cx = Cx::for_testing();
+        let entries: Vec<FfsDirEntry> = (0..ENTRIES)
+            .map(|index| FfsDirEntry {
+                ino: InodeNumber(index as u64 + 1),
+                offset: index as u64 + 1,
+                kind: FfsFileType::RegularFile,
+                name: format!("f{index:06}").into_bytes(),
+            })
+            .collect();
+
+        // SERVED: a full prefetch. Every entry comes out of the batch, so none
+        // opens a request scope of its own.
+        let mut prefetched = Some(
+            entries
+                .iter()
+                .map(|entry| {
+                    let mut attr = make_test_attr(FfsFileType::RegularFile, entry.ino.0 * 10);
+                    attr.ino = entry.ino;
+                    Some(attr)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let (mut served, mut inline) = (0_u64, 0_u64);
+        for (index, entry) in entries.iter().enumerate() {
+            assert!(
+                fuse.readdirplus_entry_attr(
+                    &cx,
+                    &mut prefetched,
+                    entry,
+                    index,
+                    &mut served,
+                    &mut inline,
+                )
+                .is_some(),
+                "a fully prefetched batch must answer entry {index} from the batch"
+            );
+        }
+        assert_eq!(
+            (served, inline),
+            (ENTRIES as u64, 0),
+            "a full prefetch must serve every entry from the batch and open no \
+             per-entry scope; anything else raises the measured 1.0052 crossings \
+             per entry and invalidates the readdir+stat structural bound"
+        );
+
+        // INLINE: slots present but empty — past the prefetch bound, or a failed
+        // fetch. Each entry pays its own scope, which is the regression shape the
+        // assertion above exists to catch.
+        let mut exhausted = Some((0..ENTRIES).map(|_| None).collect::<Vec<_>>());
+        let (mut served_none, mut inline_none) = (0_u64, 0_u64);
+        for (index, entry) in entries.iter().enumerate() {
+            let _ = fuse.readdirplus_entry_attr(
+                &cx,
+                &mut exhausted,
+                entry,
+                index,
+                &mut served_none,
+                &mut inline_none,
+            );
+        }
+        assert_eq!(
+            (served_none, inline_none),
+            (0, ENTRIES as u64),
+            "an exhausted prefetch must charge every entry an inline scope; if this \
+             reports entries as SERVED the census cannot tell the two apart and the \
+             assertion above proves nothing"
+        );
+    }
+
+    /// A large directory needs many FUSE replies. Direct-map collisions between
+    /// an early page and a later page must cause a miss, never return the older
+    /// page's attributes for the later inode.
+    #[test]
+    fn readdirplus_large_directory_pages_never_cross_serve_attrs() {
+        let memo = ReaddirplusAttrMemo::with_slots(4, true);
+        for page_start in (1_u64..=128).step_by(4) {
+            for ino in page_start..page_start + 4 {
+                let inode = InodeNumber(ino);
+                let mut attr = make_test_attr(FfsFileType::RegularFile, ino * 10);
+                attr.ino = inode;
+                memo.remember(inode, &attr);
+            }
+        }
+
+        for ino in 125_u64..=128 {
+            let attr = memo
+                .take(InodeNumber(ino))
+                .expect("the final reply page keeps its own hand-off");
+            assert_eq!(attr.ino, InodeNumber(ino));
+            assert_eq!(attr.size, ino * 10);
+        }
+        for ino in 1_u64..=4 {
+            assert!(
+                memo.take(InodeNumber(ino)).is_none(),
+                "an earlier reply page must miss after a colliding later page, not cross-serve"
+            );
+        }
     }
 
     /// Disabled means it never FILLS, not merely that it never answers.
@@ -8159,6 +8765,7 @@ mod tests {
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         };
         let inode = InodeNumber(42);
         inner.missing_capability_xattr.remember(inode);
@@ -8483,6 +9090,13 @@ mod tests {
     }
 
     impl RecordingSender {
+        fn bytes(&self) -> Vec<u8> {
+            self.sent
+                .lock()
+                .expect("sender must not be poisoned")
+                .clone()
+        }
+
         /// The errno a FUSE reply carries, or `None` if it replied success.
         ///
         /// `fuse_out_header` is `{ len: u32, error: i32, unique: u64 }` and the
@@ -8542,6 +9156,86 @@ mod tests {
             ..MountOptions::default()
         };
         FrankenFuse::with_options(Box::new(MinimalTestFs), &options)
+    }
+
+    #[test]
+    fn lookup_miss_installs_a_short_negative_dentry_not_a_stale_attr_bd_yu6jz() {
+        let sender = RecordingSender::default();
+        writable_fuse().lookup_impl(
+            1,
+            OsStr::new("new-after-miss"),
+            <ReplyEntry as fuser::Reply>::new(0x33, sender.clone()),
+        );
+
+        assert_eq!(
+            sender.errno(),
+            None,
+            "a cacheable miss is a successful FUSE reply"
+        );
+        let response = sender.bytes();
+        const FUSE_OUT_HEADER_SIZE: usize = 16;
+        const NODE_ID_OFFSET: usize = FUSE_OUT_HEADER_SIZE;
+        const ENTRY_VALID_OFFSET: usize = NODE_ID_OFFSET + 16;
+        const ATTR_VALID_OFFSET: usize = ENTRY_VALID_OFFSET + 8;
+        let read_u64 = |offset| {
+            u64::from_ne_bytes(
+                response[offset..offset + 8]
+                    .try_into()
+                    .expect("entry reply must include the requested u64"),
+            )
+        };
+
+        // This is the planted stale-attribute negative: ENOENT alone has no
+        // cache validity, while a nonzero node id would turn a miss into a
+        // positive dentry. Linux interprets nodeid=0 plus entry_valid as the
+        // short-lived negative dentry that create/mkdir/symlink/link evict
+        // after their success reply, when the kernel has released the parent
+        // lock the reverse invalidation needs.
+        assert_eq!(
+            read_u64(NODE_ID_OFFSET),
+            0,
+            "misses must never manufacture an inode"
+        );
+        assert_eq!(
+            read_u64(ENTRY_VALID_OFFSET),
+            NEGATIVE_ENTRY_TTL.as_secs(),
+            "the negative dentry must be cached briefly, not for the 60s positive TTL"
+        );
+        assert_eq!(
+            read_u64(ATTR_VALID_OFFSET),
+            NEGATIVE_ENTRY_TTL.as_secs(),
+            "fuser must carry the same short TTL in the paired attr field"
+        );
+    }
+
+    #[test]
+    fn lookup_of_stable_metadata_advertises_entry_and_attr_ttls_bd_yu6jz() {
+        let sender = RecordingSender::default();
+        FrankenFuse::with_options(
+            Box::new(CapabilityMutationFs::default()),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        )
+        .lookup_impl(
+            1,
+            OsStr::new("already-live"),
+            <ReplyEntry as fuser::Reply>::new(0x34, sender.clone()),
+        );
+
+        let response = sender.bytes();
+        let read_u64 = |offset| {
+            u64::from_ne_bytes(
+                response[offset..offset + 8]
+                    .try_into()
+                    .expect("entry reply must include the requested u64"),
+            )
+        };
+        const FUSE_OUT_HEADER_SIZE: usize = 16;
+        assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE), 1);
+        assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE + 16), ATTR_TTL.as_secs());
+        assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE + 24), ATTR_TTL.as_secs());
     }
 
     /// bd-ha71t: THE OBSERVATION THAT WAS MISSING.
@@ -9289,6 +9983,86 @@ mod tests {
         }
     }
 
+    /// A backend whose only failure is the durability boundary FUSE invokes
+    /// after the kernel has already accepted ordinary operations.
+    struct FinalFlushFailsTestFs;
+
+    impl FsOps for FinalFlushFailsTestFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn flush_on_destroy(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            Err(FfsError::NoSpace)
+        }
+    }
+
+    #[test]
+    fn final_destroy_flush_failure_reaches_the_mount_caller_bd_f3fsg() {
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let mut failing = FrankenFuse::with_options(Box::new(FinalFlushFailsTestFs), &options);
+        failing.destroy();
+        let error = failing
+            .final_flush_result()
+            .expect_err("a failed final flush must fail the outer mount caller");
+        assert!(matches!(
+            error,
+            FuseError::Io(ref io_error) if io_error.raw_os_error() == Some(libc::ENOSPC)
+        ));
+
+        let mut clean = FrankenFuse::with_options(Box::new(MinimalTestFs), &options);
+        clean.destroy();
+        assert!(clean.final_flush_result().is_ok());
+    }
+
     struct CountingMissingXattrFs {
         calls: Arc<AtomicUsize>,
     }
@@ -9419,7 +10193,11 @@ mod tests {
             name: &str,
         ) -> ffs_error::Result<Option<Vec<u8>>> {
             if name == SECURITY_CAPABILITY_XATTR {
-                return Ok(self.capability.lock().clone());
+                return Ok(self
+                    .capability
+                    .lock()
+                    .expect("capability lock poisoned")
+                    .clone());
             }
             Ok(None)
         }
@@ -9434,7 +10212,7 @@ mod tests {
             _mode: XattrSetMode,
         ) -> ffs_error::Result<()> {
             if name == SECURITY_CAPABILITY_XATTR {
-                *self.capability.lock() = Some(value.to_vec());
+                *self.capability.lock().expect("capability lock poisoned") = Some(value.to_vec());
             }
             Ok(())
         }
@@ -9447,7 +10225,12 @@ mod tests {
             name: &str,
         ) -> ffs_error::Result<bool> {
             if name == SECURITY_CAPABILITY_XATTR {
-                return Ok(self.capability.lock().take().is_some());
+                return Ok(self
+                    .capability
+                    .lock()
+                    .expect("capability lock poisoned")
+                    .take()
+                    .is_some());
             }
             Ok(false)
         }
@@ -19992,6 +20775,7 @@ mod tests {
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
 
@@ -20072,6 +20856,41 @@ mod tests {
     }
 
     #[test]
+    fn mount_managed_per_core_rejects_one_worker_before_session_spawn() {
+        let config = MountConfig {
+            options: MountOptions {
+                worker_threads: 1,
+                ..MountOptions::default()
+            },
+            ..MountConfig::default()
+        };
+        let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
+        let err = mount_managed_per_core(ops, "/tmp", &config)
+            .expect_err("one worker cannot provide a CPU-keyed work-stealing transport");
+
+        assert!(
+            err.to_string()
+                .contains("requires at least two worker threads"),
+            "the per-core path must reject before allocating a FUSE session: {err}"
+        );
+    }
+
+    #[test]
+    fn per_core_transport_metrics_preserve_each_scheduler_lane() {
+        let metrics = PerCoreTransportMetrics::from(fuser::PerCoreMetricsSnapshot {
+            cpus: vec![3, 11],
+            requests: vec![7, 4],
+            stolen_from: vec![2, 0],
+            stolen_to: vec![0, 2],
+        });
+
+        assert_eq!(metrics.cpus, vec![3, 11]);
+        assert_eq!(metrics.requests, vec![7, 4]);
+        assert_eq!(metrics.stolen_from, vec![2, 0]);
+        assert_eq!(metrics.stolen_to, vec![0, 2]);
+    }
+
+    #[test]
     fn mount_handle_shutdown_flag_lifecycle() {
         // Build a MountHandle manually (without a real FUSE session) to
         // exercise the shutdown flag + metrics plumbing.
@@ -20085,6 +20904,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/test"),
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::clone(&metrics),
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
 
@@ -20136,6 +20956,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/dbg"),
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(AtomicMetrics::new()),
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
         let dbg = format!("{handle:?}");
@@ -20150,6 +20971,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/drop"),
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(AtomicMetrics::new()),
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
         drop(handle);
@@ -20168,6 +20990,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/wait"),
             shutdown: Arc::clone(&shutdown),
             metrics,
+            per_core_metrics: None,
             config: MountConfig::default(),
         };
 
@@ -20238,6 +21061,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/timeout"),
             shutdown: Arc::clone(&shutdown),
             metrics: Arc::new(AtomicMetrics::new()),
+            per_core_metrics: None,
             config: config.clone(),
         };
 
@@ -21831,6 +22655,7 @@ AllowOther"#;
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         };
         let dbg = format!("{inner:?}");
         assert_eq!(dbg, FUSE_INNER_DEBUG_GOLDEN);

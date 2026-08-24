@@ -47,7 +47,10 @@ use ffs_core::{
     Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions, RepairWritebackBlock,
     detect_filesystem_at_path,
 };
-use ffs_fuse::{MountConfig, MountOptions, WritebackCacheMode, mount_managed};
+use ffs_fuse::{
+    MountConfig, MountOptions, PerCoreTransportMetrics, WritebackCacheMode, mount_managed,
+    mount_managed_per_core,
+};
 use ffs_harness::{
     ParityReport,
     adaptive_runtime_manifest::{
@@ -190,11 +193,6 @@ struct MountRuntimeConfig {
 
 impl MountRuntimeConfig {
     fn validate(self) -> Result<Self> {
-        if self.mode == MountRuntimeMode::PerCore {
-            bail!(
-                "--runtime-mode per-core runtime is unavailable: its dispatcher does not route FUSE requests"
-            );
-        }
         if self.mode == MountRuntimeMode::Standard && self.managed_unmount_timeout_secs.is_some() {
             bail!("--managed-unmount-timeout-secs requires --runtime-mode managed");
         }
@@ -1097,9 +1095,9 @@ enum Command {
         ///   on unmount or signal.
         /// - `managed`: background mount with lifecycle control, graceful Ctrl+C
         ///   shutdown, and final metrics logging.
-        /// - `per-core`: unavailable until its dispatcher routes FUSE requests;
-        ///   selecting it fails closed rather than reporting ordinary worker-pool
-        ///   behavior as per-core dispatch.
+        /// - `per-core`: CPU-keyed request queues with independent-handle work
+        ///   stealing. The shutdown report publishes the transport lanes that
+        ///   actually served requests.
         /// - Kernel FUSE `writeback_cache` mode is default-off in V1.x and only
         ///   enabled by `--writeback-cache` after the audit gate, ordering
         ///   oracle, crash/replay oracle, runtime guard, and host/lane evidence
@@ -7111,22 +7109,10 @@ fn worker_count_from_usize(worker_count: usize) -> u32 {
 
 /// Build the shutdown observation for the per-core runtime.
 ///
-/// The per-core block is emitted ONLY when the dispatcher actually routed
-/// requests (`bd-fuse-per-core-mount-dispatch-inert-qai4n`).
-///
-/// `mount_with_per_core_fuse` constructs a `PerCoreDispatcher` but hands
-/// `mount_managed` a plain `FsOps`, so no request is ever routed through it. The
-/// dispatcher's counters are therefore permanently zero, and reporting them as an
-/// observation is not merely useless, it is FALSE in the most misleading
-/// direction available: `AggregateMetrics::imbalance_ratio()` returns `1.0` when
-/// max and min are both zero, so an inert dispatcher reports PERFECT per-core load
-/// balance. A reader of this summary would conclude thread-per-core routing ran
-/// and distributed work evenly across every core.
-///
-/// A measurement that cannot have happened must not be published, so when the
-/// dispatcher observed no requests the block is `None`. That is honest about the
-/// only thing this runtime currently does, which is size the FUSE worker pool to
-/// the core count — a real effect, reported as `worker_count`.
+/// The per-core block is emitted ONLY when fuser's CPU-keyed transport queues
+/// actually routed requests (`bd-28mw2`). A zeroed aggregate therefore means
+/// that the mounted session served no requests, not that an advisory dispatcher
+/// fabricated perfect balance.
 ///
 /// This is deliberately a runtime check on the counters rather than a hardcoded
 /// `None`: the day routing is actually wired up, this function starts publishing
@@ -7172,6 +7158,40 @@ fn build_mount_per_core_shutdown_observation(
 /// a total without a distribution.
 fn per_core_routing_observed(aggregate: &ffs_fuse::per_core::AggregateMetrics) -> bool {
     aggregate.total_requests > 0 || aggregate.per_core.iter().any(|core| core.requests > 0)
+}
+
+/// Translate fuser's CPU-keyed transport counters into the existing reporting
+/// shape. These rows are emitted only by the scheduler that owned the request;
+/// the advisory `PerCoreDispatcher` is not consulted here.
+fn per_core_transport_aggregate(
+    metrics: &PerCoreTransportMetrics,
+) -> ffs_fuse::per_core::AggregateMetrics {
+    let per_core = metrics
+        .requests
+        .iter()
+        .enumerate()
+        .map(
+            |(index, &requests)| ffs_fuse::per_core::CoreMetricsSnapshot {
+                requests,
+                pending_requests: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                stolen_from: metrics.stolen_from.get(index).copied().unwrap_or(0),
+                stolen_to: metrics.stolen_to.get(index).copied().unwrap_or(0),
+            },
+        )
+        .collect::<Vec<_>>();
+    let total_requests = per_core
+        .iter()
+        .fold(0_u64, |total, core| total.saturating_add(core.requests));
+    ffs_fuse::per_core::AggregateMetrics {
+        total_requests,
+        total_pending_requests: 0,
+        total_cache_hits: 0,
+        total_cache_misses: 0,
+        aggregate_hit_rate: 0.0,
+        per_core,
+    }
 }
 
 fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>) -> Result<()> {
@@ -7327,11 +7347,10 @@ fn emit_per_core_mount_console(
     started_at: std::time::SystemTime,
     shutdown_at: std::time::SystemTime,
 ) -> Result<()> {
-    // Same rule as the shutdown observation: publish a per-core row only when the
-    // dispatcher actually routed something. An inert dispatcher would otherwise
+    // Same rule as the shutdown observation: publish a per-core row only when
+    // the actual transport routed something. An idle transport would otherwise
     // print one zeroed row per core, which reads as "routing ran, evenly, and did
-    // nothing" rather than "routing never happened"
-    // (bd-fuse-per-core-mount-dispatch-inert-qai4n).
+    // nothing" rather than "this session received no requests".
     let per_core: Vec<MountConsoleCore> = if per_core_routing_observed(aggregate) {
         aggregate
             .per_core
@@ -7361,18 +7380,18 @@ fn emit_per_core_mount_console(
 }
 
 fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>) -> Result<()> {
-    use ffs_fuse::per_core::{PerCoreConfig, PerCoreDispatcher};
+    use ffs_fuse::per_core::PerCoreConfig;
 
     let mount_started = std::time::SystemTime::now();
     let per_core_config = PerCoreConfig::default();
-    let dispatcher = PerCoreDispatcher::new(per_core_config.clone());
+    let worker_count = per_core_config.resolved_cores();
 
     info!(
         target: "ffs::cli::mount",
         operation_id = params.operation_id,
         scenario_id = params.scenario_id,
         outcome = "per_core_mount_starting",
-        num_cores = dispatcher.num_cores(),
+        num_cores = worker_count,
         cache_blocks_per_core = per_core_config.cache_blocks_per_core,
         total_cache_blocks = per_core_config.total_cache_blocks(),
         steal_threshold = per_core_config.steal_threshold,
@@ -7387,14 +7406,14 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
             auto_unmount: params.auto_unmount,
             writeback_cache: params.writeback_cache,
             ioctl_trace_path: None,
-            worker_threads: dispatcher.num_cores() as usize,
+            worker_threads: worker_count as usize,
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
     };
 
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
-    let handle = mount_managed(fs_ops, params.mountpoint, &config).with_context(|| {
+    let handle = mount_managed_per_core(fs_ops, params.mountpoint, &config).with_context(|| {
         format!(
             "FUSE per-core mount failed at {}",
             params.mountpoint.display()
@@ -7411,10 +7430,13 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
         "per_core_mount_waiting_for_shutdown"
     );
 
-    let metrics = handle.wait();
+    let (metrics, transport_metrics) = handle.wait_with_per_core_metrics();
     let mount_ended = std::time::SystemTime::now();
 
-    let aggregate = dispatcher.aggregate_metrics();
+    let transport_metrics = transport_metrics.ok_or_else(|| {
+        anyhow::anyhow!("per-core mount ended without transport scheduler metrics")
+    })?;
+    let aggregate = per_core_transport_aggregate(&transport_metrics);
     let routing_observed = per_core_routing_observed(&aggregate);
     if routing_observed {
         debug!(
@@ -7428,15 +7450,14 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
             "per_core_aggregate_metrics"
         );
     } else {
-        // Do not log an imbalance ratio computed from an inert dispatcher: it is
-        // 1.0 by construction and reads as perfect balance
-        // (bd-fuse-per-core-mount-dispatch-inert-qai4n).
+        // Do not log the 1.0 imbalance ratio that an all-zero transport snapshot
+        // computes by construction: the mounted session served no requests.
         debug!(
             target: "ffs::cli::mount",
             operation_id = params.operation_id,
             scenario_id = params.scenario_id,
             total_requests = 0,
-            "per_core_dispatcher_routed_nothing"
+            "per_core_transport_routed_nothing"
         );
     }
 
@@ -7449,17 +7470,16 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
         requests_ok = metrics.requests_ok,
         requests_err = metrics.requests_err,
         bytes_read = metrics.bytes_read,
-        num_cores = dispatcher.num_cores(),
-        // `imbalance_ratio` is reported only when routing was observed; see
-        // bd-fuse-per-core-mount-dispatch-inert-qai4n.
+        num_cores = worker_count,
+        // `imbalance_ratio` is reported only when the actual transport served a
+        // request, never from an all-zero snapshot.
         per_core_routing_observed = routing_observed,
         "per_core_mount_shutdown_complete"
     );
 
     emit_per_core_mount_console(params, &metrics, &aggregate, mount_started, mount_ended)?;
 
-    let observation =
-        build_mount_per_core_shutdown_observation(metrics, dispatcher.num_cores(), &aggregate);
+    let observation = build_mount_per_core_shutdown_observation(metrics, worker_count, &aggregate);
     emit_mount_adaptive_runtime_shutdown_summary(
         MountAdaptiveRuntimeShutdownContext {
             image_path: params.image_path,
@@ -7943,7 +7963,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -7958,6 +7978,14 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             ffs_fuse::readdirplus_batch_attrs_enabled(),
             ffs_fuse::readdirplus_inode_order_enabled(),
             ffs_core::btrfs_readdir_prefetch_enabled(),
+            // bd-2i2ez: without this field the comparator refuses a
+            // --candidate-b-env FFS_FUSE_WRITEBACK_BATCH run outright, because it
+            // cannot prove the two arms differ.
+            ffs_fuse::writeback_batch_enabled(),
+            // bd-2s8zy: reported so the comparator can A/B the floor-leaf memo
+            // sizing from ONE ELF. A compile-time slot count is unmeasurable
+            // against the live kernel.
+            ffs_core::btrfs_floor_memo_slots_effective(),
         );
     }
 
@@ -9453,9 +9481,9 @@ mod tests {
         MountAdaptiveRuntimeSummaryConfig, MountBackgroundRepairMode, MountBackgroundScrubConfig,
         MountBackgroundScrubMode, MountBackgroundScrubRequest, MountCmdOptions, MountConsoleConfig,
         MountMode, MountRuntimeConfig, MountRuntimeMode, MountWritebackCacheConfig,
-        RepairCommandOptions, RepairFlags, WRITEBACK_CACHE_KILL_SWITCH_ENV,
-        btrfs_checksum_type_name, btrfs_chunk_type_flag_names, build_ext4_group_info,
-        build_fsck_output, build_info_output, build_mount_open_options,
+        PerCoreTransportMetrics, RepairCommandOptions, RepairFlags,
+        WRITEBACK_CACHE_KILL_SWITCH_ENV, btrfs_checksum_type_name, btrfs_chunk_type_flag_names,
+        build_ext4_group_info, build_fsck_output, build_info_output, build_mount_open_options,
         choose_btrfs_scrub_block_size, count_blocks_at_severity_or_higher,
         ext4_appears_clean_state, ext4_group_flag_names, ext4_group_scrub_scope,
         ext4_mount_replay_mode, ext4_recovery_detail, ext4_state_flag_names, filesystem_name,
@@ -9996,25 +10024,46 @@ mod tests {
         }
     }
 
-    /// PARENT-RED (bd-fuse-per-core-mount-dispatch-inert-qai4n).
-    ///
-    /// `mount_with_per_core_fuse` builds a `PerCoreDispatcher` and then hands
-    /// `mount_managed` a plain `FsOps`, so nothing is ever routed through it. This
-    /// is that exact shape: the mount served 2,000 requests, the dispatcher saw
-    /// none. Before the fix this published a per-core block anyway.
+    #[test]
+    fn per_core_transport_metrics_publish_the_real_queue_split_bd_28mw2() {
+        let aggregate = super::per_core_transport_aggregate(&PerCoreTransportMetrics {
+            cpus: vec![2, 8],
+            requests: vec![8, 5],
+            stolen_from: vec![1, 0],
+            stolen_to: vec![0, 1],
+        });
+
+        assert_eq!(aggregate.total_requests, 13);
+        assert_eq!(
+            aggregate
+                .per_core
+                .iter()
+                .map(|core| core.requests)
+                .collect::<Vec<_>>(),
+            vec![8, 5],
+            "transport counters, not the advisory dispatcher, must publish the 8:5 split"
+        );
+        assert!(super::per_core_routing_observed(&aggregate));
+        assert!((aggregate.imbalance_ratio() - 1.6).abs() < f64::EPSILON);
+    }
+
+    /// A served mount with no transport counters must not report a fictitious
+    /// per-core distribution. This is the parent-red shape fixed by bd-28mw2:
+    /// the transport scheduler now owns those counters, so a zero snapshot only
+    /// means that this session did not receive a request.
     ///
     /// It is the `imbalance_ratio` that makes this a correctness bug rather than a
     /// cosmetic one: `AggregateMetrics::imbalance_ratio()` returns 1.0 when max and
-    /// min are both zero, so the inert dispatcher reported PERFECT load balance
+    /// min are both zero, so an idle transport could report PERFECT load balance
     /// across every core.
     #[test]
-    fn per_core_observation_is_omitted_when_the_dispatcher_routed_nothing() {
+    fn per_core_observation_is_omitted_when_the_transport_routed_nothing() {
         let aggregate = per_core_aggregate(&[0, 0, 0, 0]);
 
         // The misleading value this test exists to keep out of the summary.
         assert!(
             (aggregate.imbalance_ratio() - 1.0).abs() < f64::EPSILON,
-            "precondition: an inert dispatcher reports perfect balance, which is \
+            "precondition: an idle transport reports perfect balance, which is \
              why publishing it is a falsehood and not merely noise"
         );
 
@@ -10026,7 +10075,7 @@ mod tests {
 
         assert!(
             observation.per_core.is_none(),
-            "a mount that served 2000 requests while the dispatcher routed 0 must \
+            "a mount that served 2000 requests while the transport routed 0 must \
              publish NO per-core routing observation; publishing one claims a \
              thread-per-core distribution that never happened"
         );
@@ -10043,7 +10092,7 @@ mod tests {
     /// The negative case a naive fix fails: hardcoding `per_core: None` would pass
     /// the test above and silently discard real data once routing is wired up.
     #[test]
-    fn per_core_observation_is_published_when_the_dispatcher_did_route() {
+    fn per_core_observation_is_published_when_the_transport_did_route() {
         let aggregate = per_core_aggregate(&[5, 8]);
         let observation = super::build_mount_per_core_shutdown_observation(
             served_mount_metrics(13),
@@ -13374,7 +13423,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_cmd_per_core_mode_rejects_inert_dispatcher_before_opening_image() {
+    fn mount_cmd_per_core_mode_reaches_image_open_before_mounting() {
         let _guard = log_contract_guard();
         let err = mount_cmd(
             &PathBuf::from("/definitely/missing.img"),
@@ -13399,11 +13448,11 @@ mod tests {
                 console: MountConsoleConfig::default(),
             },
         )
-        .expect_err("per-core mode without a request-routing dispatcher must reject");
+        .expect_err("missing image must fail before a per-core mount is attempted");
         let message = format!("{err:#}");
         assert!(
-            message.contains("per-core runtime is unavailable"),
-            "expected inert-dispatch rejection, got: {message}"
+            message.contains("failed to open filesystem image"),
+            "per-core mode must be reachable; got: {message}"
         );
     }
 
@@ -14370,14 +14419,14 @@ mod tests {
     }
 
     #[test]
-    fn mount_per_core_config_rejects_inert_dispatcher() {
-        let err = MountRuntimeConfig {
+    fn mount_per_core_config_accepts_routed_transport() {
+        let config = MountRuntimeConfig {
             mode: MountRuntimeMode::PerCore,
             managed_unmount_timeout_secs: Some(60),
         }
         .validate()
-        .expect_err("per-core must stay unavailable without request routing");
-        assert!(format!("{err:#}").contains("per-core runtime is unavailable"));
+        .expect("per-core routing is implemented by the fuser transport scheduler");
+        assert_eq!(config.mode, MountRuntimeMode::PerCore);
     }
 
     #[test]
