@@ -126,6 +126,11 @@ impl FrankenFuse {
     }
 
     fn notify_entry_invalidation(&self, parent: u64, name: &OsStr) {
+        // An entry invalidation names a parent/name, not the inode displaced by
+        // a rename-over or removed by unlink. Drop every pending READDIRPLUS
+        // hand-off before the notifier early-return so this boundary is also
+        // correct in unit tests and before a live mount installs its notifier.
+        self.inner.invalidate_readdirplus_entries();
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
@@ -136,6 +141,27 @@ impl FrankenFuse {
                 error = %error,
                 "FUSE kernel entry invalidation failed"
             );
+        }
+    }
+
+    /// Drop a cached inode's attributes after a successful mutation.
+    ///
+    /// Positive entry and attribute TTLs are valid only while the metadata is
+    /// unchanged. The kernel can keep a prior reply for up to `ATTR_TTL`, so a
+    /// committed mutation must actively evict it rather than waiting for that
+    /// timeout to elapse.
+    fn notify_inode_invalidation(&self, ino: u64) {
+        // READDIRPLUS may have prepared attributes for the next GETATTR before
+        // this mutation committed. Clear that userspace hand-off regardless of
+        // whether a live kernel notifier has been installed; the kernel cache
+        // and our own hand-off must have the same mutation boundary.
+        self.inner
+            .invalidate_readdirplus_attrs(InodeNumber(ino));
+        let Some(notifier) = self.kernel_notifier() else {
+            return;
+        };
+        if let Err(error) = notifier.inval_inode(ino, 0, 0) {
+            debug!(ino, error = %error, "FUSE kernel inode invalidation failed");
         }
     }
 
@@ -740,6 +766,33 @@ impl FrankenFuse {
 
     fn reply_error_entry(ctx: &FuseErrorContext<'_>, reply: ReplyEntry) {
         reply.error(ctx.log_and_errno());
+    }
+
+    /// Reply to `LOOKUP` with a protocol negative entry, not merely `ENOENT`.
+    ///
+    /// Linux caches a `fuse_entry_out` whose node id is zero for `entry_valid`.
+    /// `ReplyEntry::error(ENOENT)` deliberately carries no such validity, so it
+    /// makes every repeated miss cross FUSE again. The remaining attribute
+    /// fields are ignored for a zero node id.
+    fn reply_negative_entry(reply: ReplyEntry) {
+        let negative = FileAttr {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            crtime: SystemTime::UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 0,
+            flags: 0,
+        };
+        reply.entry(&NEGATIVE_ENTRY_TTL, &negative, 0);
     }
 
     fn reply_error_data(ctx: &FuseErrorContext<'_>, reply: ReplyData) {
@@ -3068,7 +3121,6 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_entry_invalidation(parent, name);
         Ok(())
     }
 
@@ -3089,7 +3141,6 @@ impl FrankenFuse {
             error,
             offset: None,
         })?;
-        self.notify_entry_invalidation(parent, name);
         Ok(())
     }
 
