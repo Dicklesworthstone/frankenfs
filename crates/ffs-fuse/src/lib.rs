@@ -21922,6 +21922,69 @@ mod tests {
         assert_eq!(snap.readdir_dispatch_count, 0);
     }
 
+    /// EVERY DISPATCH LANDS IN EXACTLY ONE BUCKET, and `handler_total` is NOT one
+    /// of them (bd-zpc3q).
+    ///
+    /// The btrfs-vs-ext4 attribution this diagnostic exists for divides bucket
+    /// nanoseconds by the entries walked, so it is only meaningful if the buckets
+    /// partition the dispatches — a scope counted twice, or bleeding from `Lookup`
+    /// into `Getattr`, would move the split without moving the work.
+    ///
+    /// ⚠️ AND `handler_total` IS A DIFFERENT GRANULARITY, which is recorded here
+    /// because it misled me first. `handler_total_*` times WHOLE HANDLER
+    /// invocations (`HandlerTimer`, at handler entry); `*_dispatch_*` counts
+    /// request SCOPES, which NEST inside a handler — readdirplus opens one per
+    /// entry. So `handler_total` neither contains nor is contained by the buckets,
+    /// and `handler_total_nanos / handler_total_count` is "nanoseconds per handler
+    /// call", not "per operation". On a readdirplus workload the two counts happen
+    /// to come out nearly equal (40207 vs 40201 on a 20,000-entry btrfs mount),
+    /// which is exactly what makes the confusion easy and the resulting aggregate
+    /// wrong for a reason no magnitude would reveal. An aggregate over the daemon
+    /// must therefore be built from the BUCKETS and a known entry count.
+    #[test]
+    fn handler_total_accounts_for_every_dispatch_bucket_bd_zpc3q() {
+        enable_dispatch_timing_for_test();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, false);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+
+        // One of each bucket the attribution reads, plus a repeat so a bucket that
+        // silently overwrote instead of accumulating would show up.
+        for op in [
+            RequestOp::Getattr,
+            RequestOp::Getxattr,
+            RequestOp::Lookup,
+            RequestOp::Readdir,
+            RequestOp::Getattr,
+        ] {
+            let _ = fuse.with_request_scope(&cx, op, |_cx, _scope| Ok::<(), FfsError>(()));
+        }
+
+        let snap = fuse.metrics().snapshot();
+        let bucketed = snap.getattr_dispatch_count
+            + snap.getxattr_dispatch_count
+            + snap.lookup_dispatch_count
+            + snap.readdir_dispatch_count;
+        assert_eq!(
+            bucketed, 5,
+            "the five dispatches did not partition into the buckets; an attribution \
+             that divides bucket nanoseconds by entries would move without the work moving"
+        );
+        assert_eq!(snap.getattr_dispatch_count, 2, "two Getattr scopes were opened");
+        assert_eq!(snap.lookup_dispatch_count, 1, "Lookup must not fold into Getattr");
+        // The granularity distinction, pinned so the doc above cannot go stale:
+        // opening request scopes does NOT time a whole handler, because no handler
+        // was entered. If this ever starts counting, the two quantities have been
+        // merged and `handler_total` may no longer be read as per-handler.
+        assert_eq!(
+            snap.handler_total_count, 0,
+            "request scopes must not increment the WHOLE-HANDLER counter; if they do, \
+             handler_total and the dispatch buckets are no longer different granularities \
+             and every reading of either has to be revisited"
+        );
+    }
+
     // ── MountOptions thread count resolution ─────────────────────────────
 
     #[test]
