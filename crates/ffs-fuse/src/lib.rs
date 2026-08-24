@@ -7660,6 +7660,98 @@ mod tests {
         );
     }
 
+    /// THE BATCHING HALF OF THE readdir+stat STRUCTURAL BOUND (bd-2s8zy).
+    ///
+    /// Counted on a real mount, a readdir+stat sweep over 20,000 btrfs entries
+    /// costs `1.0052` crossings per entry with the shipping configuration and
+    /// `0.0052` with the capability probe suppressed — a delta of exactly
+    /// `1.0000`, the probe. The `0.0052` is the batched remainder: readdirplus
+    /// already carries ~192 entries per crossing, so readdir, lookup and getattr
+    /// are effectively free per entry and only the probe still crosses.
+    ///
+    /// That measurement is what makes the bound quotable, and it depends on the
+    /// prefetch actually serving entries. If the prefetch regressed, every entry
+    /// would pay its own `getattr` scope, crossings per entry would climb from
+    /// `1.0052` toward `2.0`, and the banked bound would silently describe a
+    /// configuration that no longer exists. A count taken on a mount cannot guard
+    /// itself; this does.
+    ///
+    /// Both ends are asserted, because only the pair proves the census
+    /// DISCRIMINATES. A test that checked the served arm alone would pass just as
+    /// happily against a census that always reported "served".
+    #[test]
+    fn readdirplus_prefetch_serves_every_entry_without_its_own_scope_bd_2s8zy() {
+        const ENTRIES: usize = 64;
+        let fuse = FrankenFuse::with_options(Box::new(MinimalTestFs), &MountOptions::default());
+        let cx = Cx::for_testing();
+        let entries: Vec<FfsDirEntry> = (0..ENTRIES)
+            .map(|index| FfsDirEntry {
+                ino: InodeNumber(index as u64 + 1),
+                offset: index as u64 + 1,
+                kind: FfsFileType::RegularFile,
+                name: format!("f{index:06}").into_bytes(),
+            })
+            .collect();
+
+        // SERVED: a full prefetch. Every entry comes out of the batch, so none
+        // opens a request scope of its own.
+        let mut prefetched = Some(
+            entries
+                .iter()
+                .map(|entry| {
+                    let mut attr = make_test_attr(FfsFileType::RegularFile, entry.ino.0 * 10);
+                    attr.ino = entry.ino;
+                    Some(attr)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let (mut served, mut inline) = (0_u64, 0_u64);
+        for (index, entry) in entries.iter().enumerate() {
+            assert!(
+                fuse.readdirplus_entry_attr(
+                    &cx,
+                    &mut prefetched,
+                    entry,
+                    index,
+                    &mut served,
+                    &mut inline,
+                )
+                .is_some(),
+                "a fully prefetched batch must answer entry {index} from the batch"
+            );
+        }
+        assert_eq!(
+            (served, inline),
+            (ENTRIES as u64, 0),
+            "a full prefetch must serve every entry from the batch and open no \
+             per-entry scope; anything else raises the measured 1.0052 crossings \
+             per entry and invalidates the readdir+stat structural bound"
+        );
+
+        // INLINE: slots present but empty — past the prefetch bound, or a failed
+        // fetch. Each entry pays its own scope, which is the regression shape the
+        // assertion above exists to catch.
+        let mut exhausted = Some((0..ENTRIES).map(|_| None).collect::<Vec<_>>());
+        let (mut served_none, mut inline_none) = (0_u64, 0_u64);
+        for (index, entry) in entries.iter().enumerate() {
+            let _ = fuse.readdirplus_entry_attr(
+                &cx,
+                &mut exhausted,
+                entry,
+                index,
+                &mut served_none,
+                &mut inline_none,
+            );
+        }
+        assert_eq!(
+            (served_none, inline_none),
+            (0, ENTRIES as u64),
+            "an exhausted prefetch must charge every entry an inline scope; if this \
+             reports entries as SERVED the census cannot tell the two apart and the \
+             assertion above proves nothing"
+        );
+    }
+
     /// A large directory needs many FUSE replies. Direct-map collisions between
     /// an early page and a later page must cause a miss, never return the older
     /// page's attributes for the later inode.
