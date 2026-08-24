@@ -113,13 +113,6 @@ fn lookup(fs: &OpenFs, cx: &Cx, name: &str) -> Option<InodeNumber> {
 /// 64 sequential writes and one fsync — so if a single commit could not carry a
 /// whole run durably the wiring would be pointless.
 #[test]
-#[ignore = "bd-2i2ez: REPRODUCES A LIVE DEFECT in the writeback-batch scope \
-primitive — writes staged into begin_writeback_batch_scope and committed with \
-commit_writeback_batch_scope do NOT persist; they read back as zeros after a \
-remount, even after fsync + sync_all_to_device. The control in this file \
-(control_ordinary_writes_survive_the_same_harness_bd_2i2ez, NOT ignored) uses the \
-same harness with ordinary writes and PASSES, so it is the batch route that loses \
-data. Ignored so main stays green; run with `-- --ignored`."]
 fn one_commit_carries_a_whole_staged_run_across_a_crash_bd_2i2ez() {
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let Some(image) = mkfs_ext4_image(tmp.path(), "run.ext4") else {
@@ -157,13 +150,6 @@ fn one_commit_carries_a_whole_staged_run_across_a_crash_bd_2i2ez() {
 /// never fsync'd, and whose batch was explicitly abandoned, would appear after a
 /// crash.
 #[test]
-#[ignore = "bd-2i2ez: REPRODUCES A LIVE DEFECT in the writeback-batch scope \
-primitive — writes staged into begin_writeback_batch_scope and committed with \
-commit_writeback_batch_scope do NOT persist; they read back as zeros after a \
-remount, even after fsync + sync_all_to_device. The control in this file \
-(control_ordinary_writes_survive_the_same_harness_bd_2i2ez, NOT ignored) uses the \
-same harness with ordinary writes and PASSES, so it is the batch route that loses \
-data. Ignored so main stays green; run with `-- --ignored`."]
 fn an_abandoned_batch_publishes_nothing_bd_2i2ez() {
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let Some(image) = mkfs_ext4_image(tmp.path(), "abandon.ext4") else {
@@ -200,13 +186,6 @@ fn an_abandoned_batch_publishes_nothing_bd_2i2ez() {
 /// The bounded-dirty threshold turns one long run into several batches, so
 /// batch N+1 committing must leave batch N's bytes exactly where they were.
 #[test]
-#[ignore = "bd-2i2ez: REPRODUCES A LIVE DEFECT in the writeback-batch scope \
-primitive — writes staged into begin_writeback_batch_scope and committed with \
-commit_writeback_batch_scope do NOT persist; they read back as zeros after a \
-remount, even after fsync + sync_all_to_device. The control in this file \
-(control_ordinary_writes_survive_the_same_harness_bd_2i2ez, NOT ignored) uses the \
-same harness with ordinary writes and PASSES, so it is the batch route that loses \
-data. Ignored so main stays green; run with `-- --ignored`."]
 fn a_later_batch_does_not_disturb_an_earlier_committed_one_bd_2i2ez() {
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let Some(image) = mkfs_ext4_image(tmp.path(), "sequence.ext4") else {
@@ -269,4 +248,59 @@ fn control_ordinary_writes_survive_the_same_harness_bd_2i2ez() {
     let after = open_rw(&cx, &image).expect("remount after crash");
     let ino = lookup(&after, &cx, "control.bin").expect("control.bin survived");
     assert_run(&after, &cx, ino, 8, 0x10);
+}
+
+/// PROBE: how many staged writes does one transaction survive?
+///
+/// The production FUSE write path already uses a transaction — `with_request_scope
+/// (RequestOp::Write)` begins one, writes ONCE, and commits — and it works. The
+/// batch scope is the same thing with `defer_commit_until_flush` set, and that
+/// flag is read nowhere in production (`commit_mode` has no non-test reader). So
+/// the only real difference between the working path and the failing one is the
+/// number of writes staged before the commit. This measures exactly that, and
+/// prints the count rather than asserting a guess.
+#[test]
+fn probe_how_many_staged_writes_survive_one_commit_bd_2i2ez() {
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let Some(image) = mkfs_ext4_image(tmp.path(), "probe.ext4") else {
+        eprintln!("e2fsprogs unavailable; skipping bd-2i2ez staging probe");
+        return;
+    };
+    let cx = Cx::for_testing();
+
+    for chunks in [1_usize, 2, 8] {
+        let fs = open_rw(&cx, &image).expect("open ext4 mount");
+        let name = format!("probe-{chunks}.bin");
+        let ino = create(&fs, &cx, &name);
+        let scope = stage_run(&fs, &cx, ino, chunks, 0x40);
+        fs.commit_writeback_batch_scope(&cx, scope)
+            .expect("commit the staged run");
+        let first = fs
+            .read(&cx, ino, 0, CHUNK as u32)
+            .expect("read chunk 0 after commit");
+        let last_offset = ((chunks - 1) * CHUNK) as u64;
+        let last = fs
+            .read(&cx, ino, last_offset, CHUNK as u32)
+            .expect("read the last chunk after commit");
+        let want_first = payload(0x40);
+        let want_last = payload(0x40_u8.wrapping_add(u8::try_from((chunks - 1) % 251).unwrap()));
+        let classify = |got: &[u8]| -> String {
+            if got == want_first.as_slice() {
+                "first-payload".to_owned()
+            } else if got == want_last.as_slice() {
+                "LAST-payload(aliased)".to_owned()
+            } else if got.iter().all(|b| *b == 0) {
+                "ZEROS(lost)".to_owned()
+            } else {
+                format!("other(byte0={})", got[0])
+            }
+        };
+        eprintln!(
+            "PROBE chunks={chunks} first_ok={} last_ok={} chunk0_is={}",
+            first == want_first,
+            last == want_last,
+            classify(&first)
+        );
+        drop(fs);
+    }
 }

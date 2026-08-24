@@ -25140,7 +25140,31 @@ impl OpenFs {
         let block_size = sb.block_size;
         let bs = u64::from(block_size);
 
-        let mut inode = self.read_inode(cx, ino)?;
+        // ⚠️ READ THE INODE THROUGH THE CALLER'S SCOPE, NOT A FRESH ONE (bd-2i2ez).
+        //
+        // This was `self.read_inode(cx, ino)`, which is
+        // `with_latest_scope(|scope| read_inode_with_scope(..))` — a brand-new
+        // scope with NO transaction. So a write running inside a caller's
+        // transaction read the inode from COMMITTED state and could not see an
+        // earlier write staged in its own transaction.
+        //
+        // With one write per transaction — every path in production today — that
+        // is invisible. With TWO, it silently loses the first:
+        //
+        //   write(A) stages the inode carrying A's extent
+        //   write(B) reads the COMMITTED inode (no A), adds B's extent, stages it
+        //   commit    -> B's inode version wins; A's extent never existed
+        //   read(A)   -> the logical block has no mapping and returns ZEROS
+        //
+        // Measured exactly that way before this line changed: staging 1 write and
+        // committing round-trips; staging 2 or 8 loses all but the LAST, and the
+        // lost blocks read back as ZEROS rather than as another chunk's data —
+        // the mapping is gone, not aliased. See
+        // `probe_how_many_staged_writes_survive_one_commit_bd_2i2ez`.
+        //
+        // The inode is the shared mutable state of the whole batch, so it is
+        // exactly the thing that must be read-your-writes within a transaction.
+        let mut inode = self.read_inode_with_scope(cx, scope, ino)?;
         if inode.is_dir() {
             return Err(FfsError::IsDirectory);
         }

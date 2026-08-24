@@ -3895,39 +3895,20 @@ impl std::fmt::Debug for WritebackBatch {
 const DEFAULT_MAX_STAGED_WRITES: usize = 64;
 
 impl WritebackBatch {
-    /// ⛔ THE KNOB IS CURRENTLY REFUSED, and that is a measured decision.
+    /// Reads `FFS_FUSE_WRITEBACK_BATCH`. Default OFF.
     ///
-    /// `crates/ffs-core/tests/fuse_writeback_batch_crash_matrix.rs` shows the
-    /// scope primitive this batching stands on DOES NOT PERSIST: eight writes
-    /// staged into one `begin_writeback_batch_scope`, committed with
-    /// `commit_writeback_batch_scope`, then `fsync` + `sync_all_to_device`, come
-    /// back as ZEROS after a remount. The control in that file — the identical
-    /// harness with ordinary `OpenFs::write` calls — PASSES, so it is the batch
-    /// route that loses data, not the test.
+    /// This was hard-refused while the underlying scope primitive was known to
+    /// lose data. That defect is fixed (bd-2i2ez: `ext4_write` read the inode
+    /// through a FRESH scope, so a second write in one transaction could not see
+    /// the first's staged extent and only the last survived), and
+    /// `fuse_writeback_batch_crash_matrix.rs` now passes all five cases
+    /// including crash-replay, so the knob is honoured again.
     ///
-    /// The wiring below is kept because it is correct against a primitive that
-    /// works and is the expensive part to re-derive, but honouring the
-    /// environment variable today would hand an operator a switch that silently
-    /// discards acknowledged writes. So the variable is parsed, refused, and the
-    /// refusal is logged rather than being a silent no-op.
-    ///
-    /// TO RE-ENABLE: make the batched route durable (the staged transaction's
-    /// committed versions never reach the image the way the ordinary write path's
-    /// do), un-ignore the three batched tests in that file, and delete this
-    /// override. The tests are the gate; do not flip this on their absence.
+    /// Still default OFF: it changes when writes become durable, and nothing has
+    /// measured it yet against the live kernel.
     fn from_env() -> Self {
-        let requested = std::env::var("FFS_FUSE_WRITEBACK_BATCH")
+        let enabled = std::env::var("FFS_FUSE_WRITEBACK_BATCH")
             .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"));
-        if requested {
-            tracing::error!(
-                target: "ffs::fuse::writeback",
-                "FFS_FUSE_WRITEBACK_BATCH was requested and is REFUSED: the writeback \
-                 batch scope does not persist its writes (bd-2i2ez; see \
-                 fuse_writeback_batch_crash_matrix.rs). Continuing with per-request \
-                 commits."
-            );
-        }
-        let enabled = false;
         let max_staged_writes = std::env::var("FFS_FUSE_WRITEBACK_MAX_WRITES")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
