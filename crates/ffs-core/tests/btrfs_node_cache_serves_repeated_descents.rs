@@ -261,3 +261,119 @@ fn the_node_cache_is_disabled_on_a_writable_mount_bd_2s8zy() {
         "the writable-mount arm recorded node-cache activity, so the `cacheable` gate in          btrfs_read_parsed_node no longer means what this test documents — re-read it          before trusting any read-only cache number measured alongside a writable mount"
     );
 }
+
+/// PER-OPERATION DESCENT DECOMPOSITION for the readdir+stat row
+/// (bd-btrfs-readdir-stat-8x-8y7vp, bd-2s8zy, bd-3zx2x).
+///
+/// The mounted instrument reports device reads PER ARM. It has never reported
+/// them PER FUSE OPERATION, so "the probe costs a second uncached descent per
+/// entry" — bd-2s8zy's attribution, and the basis for the whole lever class — has
+/// been inferred from arm totals rather than measured directly.
+///
+/// One `ls -l` entry costs the daemon three kinds of work: resolve the NAME
+/// (LOOKUP), read the ATTRIBUTES (GETATTR), and answer the kernel's mandatory
+/// `security.capability` probe (GETXATTR). This counts node lookups for each in
+/// isolation, over the same directory, from a cold cache each time.
+///
+/// It needs no mount and no quiet window, which matters because every mounted
+/// attempt at this row this session has been refused for host contention.
+#[test]
+fn readdir_stat_descent_cost_decomposes_by_operation_bd_2s8zy() {
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let entries = 6_000;
+    let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-decomp.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-2s8zy per-op decomposition");
+        return;
+    };
+    let cx = Cx::for_testing();
+    let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
+
+    // Each arm gets a FRESH OpenFs so it starts from a cold parsed-node cache;
+    // otherwise arm 2 measures arm 1's cache and the decomposition is meaningless.
+    let fresh = || {
+        let device = ffs_block::FileByteDevice::open(&image).expect("open image");
+        OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+            .expect("open btrfs read-only")
+    };
+    let measure = |label: &str, body: &dyn Fn(&OpenFs)| -> (u64, u64) {
+        let fs = fresh();
+        let (l0, _, m0) = ffs_core::btrfs_node_cache_counters_full();
+        body(&fs);
+        let (l1, _, m1) = ffs_core::btrfs_node_cache_counters_full();
+        let (lookups, misses) = (l1 - l0, m1 - m0);
+        eprintln!(
+            "bd-2s8zy decomp {label}: node_lookups={lookups} misses={misses} \
+             per_entry={:.3}",
+            lookups as f64 / entries as f64
+        );
+        (lookups, misses)
+    };
+
+    let (lookup_only, _) = measure("LOOKUP        ", &|fs| {
+        for name in &names {
+            let _ = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(name));
+        }
+    });
+    let (lookup_getattr, _) = measure("LOOKUP+GETATTR", &|fs| {
+        for name in &names {
+            if let Ok(attr) = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(name)) {
+                let _ = fs.getattr(&cx, attr.ino);
+            }
+        }
+    });
+    let (full_stat, _) = measure("LOOKUP+GETATTR+GETXATTR", &|fs| {
+        for name in &names {
+            if let Ok(attr) = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(name)) {
+                let _ = fs.getattr(&cx, attr.ino);
+                let _ = FsOps::getxattr(fs, &cx, attr.ino, SECURITY_CAPABILITY);
+            }
+        }
+    });
+
+    let getattr_cost = lookup_getattr.saturating_sub(lookup_only);
+    let getxattr_cost = full_stat.saturating_sub(lookup_getattr);
+    eprintln!(
+        "bd-2s8zy decomp DELTAS: lookup={lookup_only} getattr=+{getattr_cost} \
+         getxattr=+{getxattr_cost} (total {full_stat})"
+    );
+
+    assert!(
+        lookup_only > 0,
+        "the LOOKUP arm performed no node lookups, so this decomposition is measuring nothing"
+    );
+    // ⚠️ MEASURED RESULT THAT REFUTES THE PREMISE I WROTE THIS TEST TO CONFIRM.
+    //
+    // I first asserted `getxattr_cost * 4 >= lookup_only` — the bead's attribution
+    // that the capability probe is a SECOND FULL DESCENT per entry. It FAILS:
+    // the probe costs 334 node lookups against 14817 for LOOKUP over the same
+    // 6,000 entries, about 2%. GETATTR costs ZERO. In-process, the probe is very
+    // nearly free.
+    //
+    // That does not contradict bd-2s8zy's mounted measurement (suppressing the
+    // probe took preads 27572 -> 1840, ~15x). It LOCATES it: the probe's expense
+    // is not the tree descent, because in-process the descent is already absorbed
+    // by the parsed-node cache and the floor-leaf memo. Whatever makes it
+    // expensive through a mount is added by the mount — the extra FUSE round trip
+    // per probe, or per-request state that stops those two caches from carrying
+    // across operations the way they do here.
+    //
+    // The direction of this assertion is therefore INVERTED on purpose: it pins
+    // that the probe is cheap on the in-process path, so that anyone proposing a
+    // "share the descent across the sweep" lever sees first that there is almost
+    // no descent left to share at this layer, and goes looking in the FUSE layer
+    // instead.
+    assert!(
+        getxattr_cost * 4 < lookup_only,
+        "the security.capability probe now costs {getxattr_cost} node lookups against \
+         {lookup_only} for LOOKUP over {entries} entries. It used to be ~2%. If the probe \
+         has become a full descent again at this layer, the parsed-node cache or the \
+         floor-leaf memo stopped absorbing it, and bd-2s8zy's mounted attribution would \
+         now apply in-process too."
+    );
+    assert_eq!(
+        getattr_cost, 0,
+        "GETATTR now costs {getattr_cost} node lookups on top of LOOKUP; it used to be \
+         free because the lookup already resolved the inode. A regression here would \
+         double the descent cost of every stat."
+    );
+}
