@@ -740,7 +740,7 @@ pub struct RepairMetricsSnapshot {
 }
 
 /// JSON-friendly runtime metrics export for repair pipeline health.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RepairRuntimeMetricsSnapshot {
     pub groups_scrubbed: u64,
     pub corruption_detected: u64,

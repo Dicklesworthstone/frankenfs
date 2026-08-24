@@ -199,7 +199,7 @@ pub struct EvidenceHistogramBucket {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceHistogramSnapshot {
     pub buckets: Vec<EvidenceHistogramBucket>,
     pub inf_count: u64,
@@ -208,7 +208,7 @@ pub struct EvidenceHistogramSnapshot {
 }
 
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceMvccRuntimeMetricsSnapshot {
     pub active_snapshots: usize,
     pub commit_rate: f64,
