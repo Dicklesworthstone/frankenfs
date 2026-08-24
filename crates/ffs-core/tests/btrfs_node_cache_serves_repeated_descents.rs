@@ -370,17 +370,35 @@ fn readdir_stat_descent_cost_decomposes_by_operation_bd_2s8zy() {
          floor-leaf memo stopped absorbing it, and bd-2s8zy's mounted attribution would \
          now apply in-process too."
     );
-    // REGRESSION GUARD on the floor-memo sizing (bd-2s8zy). With
-    // BTRFS_FLOOR_MEMO_SLOTS = 4 this sweep cost 2.525 node lookups per entry; at
-    // 16 it costs 0.861. The threshold sits between the two, so shrinking the memo
-    // back below the working set fails here instead of quietly restoring ~3x the
-    // descent work.
+    // REGRESSION GUARD on descent cost (bd-2s8zy) — RE-POINTED, and the reason is
+    // the whole point of the entry below it.
+    //
+    // This threshold was 1.5, chosen to sit between 0.861 node lookups per entry at
+    // BTRFS_FLOOR_MEMO_SLOTS = 16 and 2.525 at 4, so that "shrinking the memo back
+    // below the working set" would fail loudly. Then the sizing was PRICED in wall
+    // clock (`the_floor_memo_sizing_prices_out_against_an_aa_null_bd_2s8zy`) and
+    // sixteen slots came out 6-12% SLOWER than four, decidable 4 of 4 against a
+    // ~1.9% null. The lookups sixteen saves are parsed-node-cache hits; the slots it
+    // adds are scanned linearly on every descent. So the old threshold did not guard
+    // a regression — it MANDATED one, and a guard that pins a counted proxy after
+    // the proxy has been measured not to track time is enforcing the wrong thing.
+    //
+    // WHAT THIS GIVES UP, stated rather than glossed: a shrink of the memo no longer
+    // fails here. That is deliberate, because the shrink is what measured faster.
+    // Sizing is now gated by the priced A/B, which is the measurement that can
+    // actually decide it.
+    //
+    // WHAT IT STILL CATCHES: a genuine blowup in descent cost from any cause — the
+    // parsed-node cache regressing, the memo being bypassed, a descent that stopped
+    // being absorbed. 2.525 per entry is the shipping cost at four slots, and 3.5
+    // leaves ~40% of headroom for fixture drift while still catching the extra full
+    // descent per entry (~2.0) that any of those failures would add.
     let per_entry = full_stat as f64 / entries as f64;
     assert!(
-        per_entry < 1.5,
+        per_entry < 3.5,
         "a full stat now costs {per_entry:.3} node lookups per entry ({full_stat} for \
-         {entries}); it was 0.861 at BTRFS_FLOOR_MEMO_SLOTS = 16 and 2.525 at 4. The \
-         floor-leaf memo has dropped back below the sweep's working set."
+         {entries}); it is 2.525 at the shipping BTRFS_FLOOR_MEMO_SLOTS = 4 and was \
+         0.861 at 16. Descent cost has blown up beyond what the memo size explains."
     );
     assert_eq!(
         getattr_cost, 0,
@@ -424,19 +442,7 @@ fn interleaved_stat_order_costs_more_descents_than_sequential_bd_2s8zy() {
     let cx = Cx::for_testing();
     let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
 
-    // Eight contiguous slices, round-robined: exactly the sequence eight threads
-    // each scanning their own slice present to one shared memo.
-    let mut interleaved: Vec<usize> = Vec::with_capacity(entries);
-    let slice = entries.div_ceil(streams);
-    for offset in 0..slice {
-        for stream in 0..streams {
-            let index = stream * slice + offset;
-            if index < entries {
-                interleaved.push(index);
-            }
-        }
-    }
-    assert_eq!(interleaved.len(), entries, "the interleaving must cover every entry");
+    let interleaved = interleaved_order(entries, streams);
 
     let sweep = |order: &[usize]| -> u64 {
         let device = ffs_block::FileByteDevice::open(&image).expect("open image");
@@ -482,6 +488,244 @@ fn fs_ref(fs: &OpenFs) -> &OpenFs {
     fs
 }
 
+/// `streams` contiguous slices, round-robined: exactly the sequence that many
+/// client threads each scanning their own slice present to one shared memo.
+///
+/// Shared by the order test and the pricing test below so both arms of the A/B are
+/// priced on the ACCESS ORDER the banked worst row (`readdir-stat-8t`) actually
+/// produces, rather than on two orders that happen to be spelled separately.
+fn interleaved_order(entries: usize, streams: usize) -> Vec<usize> {
+    let mut interleaved: Vec<usize> = Vec::with_capacity(entries);
+    let slice = entries.div_ceil(streams);
+    for offset in 0..slice {
+        for stream in 0..streams {
+            let index = stream * slice + offset;
+            if index < entries {
+                interleaved.push(index);
+            }
+        }
+    }
+    assert_eq!(interleaved.len(), entries, "the interleaving must cover every entry");
+    interleaved
+}
+
+/// Median of a set of sweep timings, for a statistic that a single contended
+/// sample cannot dominate.
+fn median(mut samples: Vec<std::time::Duration>) -> std::time::Duration {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+/// PRICE the 4 -> 16 floor-memo sizing IN WALL CLOCK, with an A/A null (bd-2s8zy).
+///
+/// 692af94aa cut node LOOKUPS 2.93x and said in its own commit message that "a
+/// 2.93x cut in lookups is NOT a 2.93x cut in time and must not be quoted as one".
+/// This is the measurement that settles which it is. Most of those lookups hit
+/// `btrfs_parsed_node_cache` and are cheap, so the honest prior is that the
+/// wall-clock effect is far smaller than 2.93x and possibly nil.
+///
+/// THE A/A NULL IS THE RESULT, not a formality attached to one. The host has been
+/// at 12-60 of 64 CPUs above 25% busy against the mounted comparator's limit of 2,
+/// which is why this runs in-process at all; a wall-clock ratio taken there means
+/// nothing on its own. The same instrument run 16-vs-16 measures what that
+/// contention is worth, and an A/B effect inside that floor is UNDECIDABLE and
+/// says so, rather than being reported as a win.
+///
+/// NOT A vs-KERNEL CLAIM IN EITHER DIRECTION: both arms are ours, so at best this
+/// is maintenance (`/data/projects/AGENTS.md` — "a self-speedup is MAINTENANCE,
+/// not a win"). What it can honestly decide is whether the shipping default earns
+/// its place, and the counted table already established the mechanism.
+///
+/// THREE ARMS, ROTATED, AND THE NULL RIDES INSIDE THE SAME WINDOW — both of which
+/// this instrument earned by getting them wrong first:
+///
+///   * A two-arm A,B / B,A alternation over an ODD round count gives one arm the
+///     first position one extra time. That is not academic here: the null arms
+///     showed the SECOND position is systematically 3-8% faster, so an odd count
+///     silently hands the spare fast slot to one arm and prices position as
+///     effect. Rotating three arms over a round count divisible by three puts
+///     every arm in every position equally often.
+///   * A null measured in its own separate run priced 16 slots at 5.48ms in one
+///     window and 7.50ms in the next — 37% apart on an IDENTICAL configuration,
+///     which is far more than any effect worth claiming and is invisible to a
+///     null that does not share the window. So the two null arms are interleaved
+///     with the B arm and the noise floor is quoted from the same rounds as the
+///     effect.
+///
+/// No direction is asserted. This test publishes a priced ratio next to the noise
+/// floor that qualifies it; pinning a direction measured through this much
+/// contention would freeze a number the instrument cannot support.
+#[test]
+fn the_floor_memo_sizing_prices_out_against_an_aa_null_bd_2s8zy() {
+    /// The shipping size, restored to four when this test priced sixteen slower.
+    const SHIPPING_SLOTS: usize = 4;
+    /// What 692af94aa shipped on counted evidence. Kept as the candidate arm so
+    /// this test remains the standing answer to "why not more slots?" rather than a
+    /// one-off that has to be rewritten to ask again.
+    const CANDIDATE_SLOTS: usize = 16;
+    /// Enough rounds for a median to mean something without turning a unit-test
+    /// suite into a benchmark run. MUST stay divisible by the arm count, or the
+    /// rotation stops balancing position and prices position as effect.
+    const ROUNDS: usize = 30;
+    /// `[null-left, candidate, null-right]`: two shipping-configuration arms
+    /// bracket the candidate, so the noise floor comes from the same rounds as the
+    /// effect rather than from a separate window that can drift 37% away from it.
+    const ARMS: [usize; 3] = [SHIPPING_SLOTS, CANDIDATE_SLOTS, SHIPPING_SLOTS];
+
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let entries = 6_000;
+    let streams = 8;
+    let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-price.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-2s8zy floor-memo pricing");
+        return;
+    };
+    let cx = Cx::for_testing();
+    let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
+    let order = interleaved_order(entries, streams);
+
+    // One sweep: a FRESH mount so the parsed-node cache starts cold exactly as it
+    // did for the counted table, the memo forced to `slots`, then the full
+    // lookup+getattr+getxattr pass that the mounted readdir+stat row performs.
+    let sweep = |slots: usize| -> (std::time::Duration, u64) {
+        let device = ffs_block::FileByteDevice::open(&image).expect("open image");
+        let fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+            .expect("open btrfs read-only");
+        fs.btrfs_resize_floor_memo_for_measurement(slots);
+        let (l0, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        let started = std::time::Instant::now();
+        for &index in &order {
+            if let Ok(attr) = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(&names[index])) {
+                let _ = fs.getattr(&cx, attr.ino);
+                let _ = FsOps::getxattr(fs_ref(&fs), &cx, attr.ino, SECURITY_CAPABILITY);
+            }
+        }
+        let elapsed = started.elapsed();
+        let (l1, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        (elapsed, l1 - l0)
+    };
+
+    let mut times: [Vec<std::time::Duration>; ARMS.len()] =
+        std::array::from_fn(|_| Vec::with_capacity(ROUNDS));
+    let mut lookups = [0_u64; ARMS.len()];
+    for round in 0..ROUNDS {
+        // Rotate the starting arm so each arm occupies each position equally.
+        for position in 0..ARMS.len() {
+            let arm = (round + position) % ARMS.len();
+            let (elapsed, counted) = sweep(ARMS[arm]);
+            times[arm].push(elapsed);
+            lookups[arm] = counted;
+        }
+    }
+
+    // Checked before the medians consume `times`, and asserted after the report so
+    // a failure still prints the numbers that produced it.
+    let every_sweep_timed = times
+        .iter()
+        .flatten()
+        .all(|elapsed| *elapsed > std::time::Duration::ZERO);
+    let [null_left, candidate, null_right] = times.map(median);
+    let null_ratio = null_right.as_secs_f64() / null_left.as_secs_f64();
+    // Priced against BOTH null arms. One estimate could be an artifact of which
+    // null arm happened to sit next to the candidate; two that disagree in
+    // direction mean the instrument cannot see the effect at all.
+    let against_left = candidate.as_secs_f64() / null_left.as_secs_f64();
+    let against_right = candidate.as_secs_f64() / null_right.as_secs_f64();
+    let noise = (null_ratio - 1.0).abs();
+    let effect = (against_left - 1.0).abs().min((against_right - 1.0).abs());
+    let agree = (against_left - 1.0).signum() == (against_right - 1.0).signum();
+    let decidable = agree && effect > noise;
+
+    eprintln!(
+        "bd-2s8zy price entries={entries} streams={streams} rounds={ROUNDS} arms={ARMS:?}\n  \
+         A/A  {SHIPPING_SLOTS} vs {SHIPPING_SLOTS}: {:.3}ms vs {:.3}ms  ratio={null_ratio:.4} \
+         (noise floor {:.2}%)\n  \
+         A/B  {CANDIDATE_SLOTS} slots {:.3}ms  vs left null={against_left:.4} \
+         vs right null={against_right:.4} (effect {:.2}%, arms {})\n  \
+         node lookups: {SHIPPING_SLOTS} slots={}  {CANDIDATE_SLOTS} slots={}\n  \
+         verdict={}",
+        null_left.as_secs_f64() * 1e3,
+        null_right.as_secs_f64() * 1e3,
+        noise * 100.0,
+        candidate.as_secs_f64() * 1e3,
+        effect * 100.0,
+        if agree { "AGREE" } else { "DISAGREE" },
+        lookups[0],
+        lookups[1],
+        if decidable {
+            "DECIDABLE"
+        } else if agree {
+            "UNDECIDABLE (effect inside the A/A noise floor)"
+        } else {
+            "UNDECIDABLE (the two null arms disagree on the direction)"
+        }
+    );
+
+    // Sanity only — see the doc comment on why no direction is pinned. What IS
+    // pinned is that the instrument did the work it claims to have timed: a sweep
+    // that silently resolved nothing would report a beautifully stable ratio of
+    // two numbers that measure nothing.
+    assert!(
+        every_sweep_timed,
+        "a priced sweep took no measurable time, so the ratios above are meaningless"
+    );
+    assert!(
+        lookups.iter().all(|counted| *counted > 0),
+        "a priced arm performed no node lookups, so it never descended the tree"
+    );
+    assert_eq!(
+        ROUNDS % ARMS.len(),
+        0,
+        "the round count no longer balances the rotation, so position is being priced as effect"
+    );
+}
+
+/// The measurement resize must actually change the memo's capacity, or the A/B
+/// above compares a configuration against itself (bd-2s8zy).
+///
+/// This is the in-process analogue of the knob-divergence gate the mounted
+/// comparator applies, and it exists because that exact failure — two arms that
+/// resolve to one configuration — is what blocked the writeback A/B earlier. The
+/// property is visible in the counters: at four slots the interleaved sweep must
+/// take strictly more node lookups than at sixteen, because a memo below the
+/// working set re-descends what it evicted.
+#[test]
+fn the_measurement_resize_actually_changes_the_memo_bd_2s8zy() {
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let entries = 6_000;
+    let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-resize.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-2s8zy resize divergence check");
+        return;
+    };
+    let cx = Cx::for_testing();
+    let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
+    let order = interleaved_order(entries, 8);
+
+    let sweep = |slots: usize| -> u64 {
+        let device = ffs_block::FileByteDevice::open(&image).expect("open image");
+        let fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+            .expect("open btrfs read-only");
+        fs.btrfs_resize_floor_memo_for_measurement(slots);
+        let (l0, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        for &index in &order {
+            if let Ok(attr) = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(&names[index])) {
+                let _ = fs.getattr(&cx, attr.ino);
+                let _ = FsOps::getxattr(fs_ref(&fs), &cx, attr.ino, SECURITY_CAPABILITY);
+            }
+        }
+        let (l1, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        l1 - l0
+    };
+
+    let sixteen = sweep(16);
+    let four = sweep(4);
+    eprintln!("bd-2s8zy resize divergence: 16 slots={sixteen} 4 slots={four}");
+    assert!(
+        four > sixteen,
+        "four slots took {four} node lookups against {sixteen} at sixteen — the resize \
+         did not reach the memo, so the priced A/B compares one configuration with itself"
+    );
+}
+
 /// The shipping floor-memo size must be the one the counted evidence was taken on
 /// (bd-2s8zy).
 ///
@@ -494,13 +738,16 @@ fn fs_ref(fs: &OpenFs) -> &OpenFs {
 /// PARSING is unit-tested inside ffs-core (`std::env::set_var` is `unsafe` in
 /// edition 2024 and this workspace forbids unsafe, so an integration test cannot
 /// toggle it without mutating process-global state the parallel harness shares).
-/// The knob's EFFECT is the 4-vs-16 table in 692af94aa, taken by rebuilding.
+/// The knob's EFFECT is priced by the A/B above.
+///
+/// The expected value is FOUR, not the sixteen 692af94aa shipped: pricing the
+/// sizing found sixteen 6-12% slower, so the default was restored.
 #[test]
 fn the_shipping_floor_memo_size_matches_the_measured_one_bd_2s8zy() {
     assert_eq!(
         ffs_core::btrfs_floor_memo_slots_effective(),
-        16,
-        "the effective floor-memo slot count is not 16, so the knob line the comparator \
-         reads does not describe the configuration the counted 2.93x was measured on"
+        4,
+        "the effective floor-memo slot count is not 4, so the knob line the comparator \
+         reads does not describe the configuration that priced fastest"
     );
 }

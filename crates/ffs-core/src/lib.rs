@@ -2285,38 +2285,55 @@ struct BtrfsFloorLeafMemo {
 /// through this memo, and a full descent is root PLUS leaf, so each avoidable boundary
 /// miss is two device reads rather than one.
 ///
-/// THE POLICY, and it is a policy rather than a number (bd-2s8zy asked for exactly
-/// that, so the same bead is not refiled at the next directory size): the memo must
-/// hold at least one leaf PER CONCURRENT DESCENT STREAM, doubled for the two key
-/// streams each sweep alternates between. The banked worst row is `readdir-stat-8t`
-/// — EIGHT client threads each walking its own slice of one directory — so eight
-/// streams x two key streams is the working set the shipping configuration
-/// actually presents. Four was sized for ONE stream's alternation and is provably
-/// below that.
+/// FOUR, RESTORED FROM SIXTEEN ON A WALL-CLOCK MEASUREMENT THAT REFUTED THE
+/// COUNTED ONE (bd-2s8zy). This doc is deliberately a record of that, because the
+/// counted argument for sixteen is genuinely persuasive and would otherwise be made
+/// again.
 ///
-/// MEASURED, counted, in-process, no mount
-/// (`btrfs_node_cache_serves_repeated_descents.rs`, 6,000 entries, node lookups):
+/// 692af94aa raised this 4 -> 16 on counts alone, having established that four was
+/// below the working set: the memo must hold at least one leaf per CONCURRENT
+/// DESCENT STREAM, doubled for the two key streams each sweep alternates between
+/// (`getattr` reading INODE_ITEM, the capability probe reading XATTR_ITEM), and the
+/// banked worst row `readdir-stat-8t` presents eight streams. That reasoning is
+/// still correct, and sixteen still takes far fewer node lookups — the counts are
+/// reproducible from one ELF via
+/// [`OpenFs::btrfs_resize_floor_memo_for_measurement`]:
 ///
 ///                     4 slots     16 slots
 ///   sequential          15151         5167    2.93x fewer
 ///   8-way interleaved   23875        15377    1.55x fewer
 ///
-/// The sequential arm is the honest headline because it is the arm with no
-/// contention at all: even ONE stream was thrashing four slots. The interleaved
-/// arm is the order eight client threads present to a shared memo, and it improves
-/// too, which is the point — the old size was below the working set in BOTH orders.
+/// THE LOOKUPS IT SAVES ARE CHEAPER THAN THE SLOTS IT ADDS, which is what the
+/// counted table could not see and what pricing it found. Priced in wall clock on
+/// the interleaved order, balanced 3-arm rotation with the A/A null riding inside
+/// the same window, 30 rounds, 6,000 entries: sixteen slots is **6-12% SLOWER**
+/// than four, decidable in 4 of 4 runs against a noise floor near 1.9%, direction
+/// unanimous across all eight null-arm estimates. Both mechanisms are O(slots) and
+/// both run on the hot path:
 ///
-/// NOT A WALL-CLOCK CLAIM. These are node LOOKUPS, most of which hit
-/// `btrfs_parsed_node_cache` and are cheap; a 2.93x cut in lookups is not a 2.93x
-/// cut in time and must not be quoted as one. What it does establish is that the
-/// descent work is real and was being redone.
+///   * the memo LOOKUP linearly scans every slot under a mutex on every
+///     memoizable floor descent, so four times the slots is four times the scan
+///     on all ~15-24k of them;
+///   * the install path snapshots slot identities on every MISS — and a miss is
+///     the COMMON case for the capability probe, whose absent xattr bucket sorts
+///     past the reached leaf's last key and so never satisfies the span check.
 ///
-/// The upper bound is still the concern the original four was protecting: a
+/// The saved lookups, by contrast, are overwhelmingly `btrfs_parsed_node_cache`
+/// HITS. 692af94aa said in its own commit message that "a 2.93x cut in lookups is
+/// NOT a 2.93x cut in time and must not be quoted as one"; measured, it is not even
+/// a cut in time in the right direction.
+///
+/// SO THE POLICY IS NOT "one slot per concurrent stream" after all. It is: keep the
+/// memo small enough that scanning it costs less than the descent it saves, and
+/// treat a counted improvement in descents as a HYPOTHESIS about time rather than
+/// evidence of it. Raising this number again requires the priced A/B, not a
+/// working-set argument.
+///
+/// The upper bound the original four was protecting still holds independently: a
 /// retained leaf is memory a mount that never sweeps does not use, and enough of
 /// them would duplicate `btrfs_parsed_node_cache` (bounded by
-/// `BTRFS_TREE_NODE_CACHE_LIMIT`). Sixteen covers the 8-thread rows with headroom
-/// while staying two orders below that bound.
-const BTRFS_FLOOR_MEMO_SLOTS: usize = 16;
+/// `BTRFS_TREE_NODE_CACHE_LIMIT`).
+const BTRFS_FLOOR_MEMO_SLOTS: usize = 4;
 
 /// Slot count for the floor-leaf memo, honouring `FFS_BTRFS_FLOOR_MEMO_SLOTS`.
 ///
@@ -9773,6 +9790,43 @@ impl OpenFs {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Measurement-only: resize the floor-leaf memo to `slots` and clear it.
+    ///
+    /// `FFS_BTRFS_FLOOR_MEMO_SLOTS` is read ONCE, at construction. That is right for
+    /// a mount and wrong for an experiment: a single process cannot then hold both
+    /// arms of the 4-vs-16 A/B, so pricing the sizing needed two ELFs, which is
+    /// exactly the provenance confound bd-b9dug exists to prevent. Setting the
+    /// variable instead is not available — `std::env::set_var` is `unsafe` from
+    /// edition 2024, this workspace forbids unsafe, and the parallel harness shares
+    /// the environment.
+    ///
+    /// SOUND AT ANY POINT, not merely straight after open, and that is a property of
+    /// what the memo IS rather than of when this is called: it is a pure cache of
+    /// retained leaves, so discarding its contents can cost a descent and can never
+    /// change an answer. Every read that would have hit re-walks the tree instead.
+    ///
+    /// It deliberately leaves `btrfs_parsed_node_cache` alone, so an A/B driven
+    /// through this prices the MEMO against the cache underneath it rather than
+    /// pricing both together — which is the distinction the counted 4-vs-16 table
+    /// could not make.
+    ///
+    /// `slots` of 0 is clamped to 1 rather than honoured, for the same reason the
+    /// env parser falls back on it: a zero-slot memo is not a configuration anyone
+    /// means, it is a silent restoration of every descent the memo removes.
+    pub fn btrfs_resize_floor_memo_for_measurement(&self, slots: usize) {
+        *self.btrfs_floor_leaf_memo.lock() = (0..slots.max(1))
+            .map(|_| None)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        // Both counters are memo state, and a stale value in either would bias the
+        // arm that follows: a mid-slice next-slot skews which slot is evicted first,
+        // and a high miss streak starts the arm already suppressed (bd-79li3).
+        self.btrfs_floor_memo_next_slot
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.btrfs_floor_memo_consecutive_misses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Targeted-descent counterpart to [`walk_btrfs_tree`](Self::walk_btrfs_tree):
     /// walk a btrfs b-tree but read only the O(log N) nodes whose key span can
     /// overlap the half-open range `[lo, hi)`, returning exactly the leaf
@@ -9941,13 +9995,26 @@ impl OpenFs {
             // and then start evicting live neighbours — collapsing four slots back to
             // one precisely on the probe the widening exists for. Refreshing in place
             // makes the repeat idempotent instead.
-            // Identities only — `BtrfsKey` is `Copy` and there are
-            // BTRFS_FLOOR_MEMO_SLOTS of them, so this is a small stack array and no
-            // allocation. Snapshotting them lets the ORDER live in a pure function
-            // that a test can pin, which is what this needed: the bug fixed here was
-            // an ordering bug, invisible to any test that only checked the memo
-            // answers correctly.
-            let identities: Vec<Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>> = slots
+            // Identities only — `BtrfsKey` is `Copy`. Snapshotting them lets the
+            // ORDER live in a pure function that a test can pin, which is what this
+            // needed: the bug fixed here was an ordering bug, invisible to any test
+            // that only checked the memo answers correctly.
+            //
+            // `SmallVec`, NOT `Vec`, and that is measured rather than tidy. This
+            // block runs on every memo MISS — which for the capability probe is the
+            // COMMON case, since an absent xattr bucket sorts past the reached
+            // leaf's last key and so never satisfies the span check. c400f8d0d made
+            // the memo a runtime-sized `Box<[_]>` and turned what had been a fixed
+            // `[_; 4]` snapshot into a heap allocation per miss, while leaving the
+            // comment that claimed "no allocation" in place. That is half of why
+            // pricing the sizing found SIXTEEN slots ~13% SLOWER than four despite
+            // taking 55% fewer node lookups (bd-2s8zy). Inline capacity of
+            // `BTRFS_FLOOR_MEMO_SLOTS` keeps the default size allocation-free; a
+            // larger override spills, which is a measurement configuration's
+            // problem and not the mount's.
+            let identities: SmallVec<
+                [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS],
+            > = slots
                 .iter()
                 .map(|slot| slot.as_ref().map(|s| (s.root_logical, s.first_key)))
                 .collect();
