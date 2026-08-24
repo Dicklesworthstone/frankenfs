@@ -4247,6 +4247,41 @@ impl FsOps for OpenFs {
 
         Ok(())
     }
+    /// Expose the writeback-batch primitives through the trait (bd-2i2ez).
+    ///
+    /// These bodies are one line each because the work has existed since
+    /// bd-xhm5g.401 — as INHERENT methods on `OpenFs`. The production mount holds
+    /// `Arc<dyn FsOps>` and could not name them, so the amortization they enable
+    /// was unreachable from the code that ships. These impls plus the `Arc<T>`
+    /// forwards in `vfs.rs` are the entire difference between a primitive and a
+    /// feature.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying scope error unchanged.
+    fn begin_writeback_batch_scope(&self, cx: &Cx) -> ffs_error::Result<RequestScope> {
+        Self::begin_writeback_batch_scope(self, cx)
+    }
+
+    /// # Errors
+    ///
+    /// Propagates the commit error, or the release error when commit succeeded
+    /// and release did not.
+    fn commit_writeback_batch_scope(
+        &self,
+        cx: &Cx,
+        scope: RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
+        Self::commit_writeback_batch_scope(self, cx, scope)
+    }
+
+    /// # Errors
+    ///
+    /// Propagates the scope-release error.
+    fn abort_writeback_batch_scope(&self, cx: &Cx, scope: RequestScope) -> ffs_error::Result<()> {
+        Self::abort_writeback_batch_scope(self, cx, scope)
+    }
+
     /// Commit any transaction in the request scope.
     ///
     /// # Errors

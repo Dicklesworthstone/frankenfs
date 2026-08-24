@@ -3772,6 +3772,8 @@ struct FuseInner {
     zero_message_opendir: std::sync::atomic::AtomicBool,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
+    /// bd-2i2ez: stage a run of WRITEs into one MVCC transaction. Default OFF.
+    writeback: WritebackBatch,
 }
 
 impl std::fmt::Debug for FuseInner {
@@ -3784,6 +3786,160 @@ impl std::fmt::Debug for FuseInner {
             .field("read_only", &self.read_only)
             .field("mountpoint", &self.mountpoint)
             .finish_non_exhaustive()
+    }
+}
+
+/// One outstanding writeback batch: several FUSE WRITEs staged into a single
+/// MVCC transaction, committed once at the next flush boundary (bd-2i2ez).
+///
+/// # Why one scope and not a table
+///
+/// bd-w3hol specified a per-file-handle table. A SINGLE outstanding scope is
+/// strictly simpler and loses nothing on the workload this exists for — the
+/// bulk-durable-write job is 64 sequential 1 MiB writes to ONE file followed by
+/// one fsync — while making the correctness argument small enough to check by
+/// reading it. A write to a different inode commits the outstanding batch first,
+/// so the batch is always exactly one inode's staged run.
+///
+/// # The visibility invariant, which is the whole safety argument
+///
+/// Staged writes live in an uncommitted MVCC transaction, so they are invisible
+/// to any observer reading through a fresh scope — a stale `read`, a stale
+/// `getattr` size, a stale `readdir`. Rather than route every observing path
+/// through the live scope (many call sites, each one a chance to miss one and
+/// serve stale data), this takes the conservative rule:
+///
+///   ANY request that is not a WRITE commits the outstanding batch BEFORE it
+///   runs, centrally in `with_request_scope`.
+///
+/// So no observer can ever see less than a caller would have seen without
+/// batching. What is amortized is exactly a RUN OF CONSECUTIVE WRITES, which is
+/// the only thing this lever claims.
+///
+/// POSIX durability is unchanged in the direction that matters: `write()` was
+/// never durable before `fsync`, and `fsync`/`flush`/`release` are non-write
+/// requests, so they commit the batch before doing their own work.
+///
+/// # What this does NOT preserve, stated rather than discovered later
+///
+/// The commit performed by `flush` does not re-acquire the inode guard the
+/// staging write held. Taking it there would deadlock against a mutation that
+/// already holds guards for its own inodes and then triggers the flush from
+/// inside `with_request_scope`. The commit is an MVCC store operation with its
+/// own synchronization, and the `Mutex` plus `Option::take` below means exactly
+/// one thread ever commits a given batch. This is a real narrowing of the
+/// existing locking discipline and is one of the reasons the mode is OFF by
+/// default.
+#[derive(Debug)]
+struct PendingWriteback {
+    /// The inode whose writes are staged. A write to any other inode flushes.
+    ino: u64,
+    /// Number of FUSE writes staged so far, for the bounded-dirty threshold.
+    staged: usize,
+}
+
+/// Writeback batching state (bd-2i2ez). Default OFF.
+struct WritebackBatch {
+    /// Off unless `FFS_FUSE_WRITEBACK_BATCH` opts in.
+    ///
+    /// A per-store field rather than a build flag, so ONE ELF supplies both A/B
+    /// arms for the mounted comparator's `--candidate-b-env` and the ISA/PGO
+    /// provenance cancels between them (bd-b9dug).
+    enabled: bool,
+    /// Commit and start over once this many writes are staged, so a writer that
+    /// never fsyncs cannot pin unbounded dirty state.
+    max_staged_writes: usize,
+    /// Non-zero when a batch is outstanding. Read on EVERY non-write request, so
+    /// it is a relaxed atomic and not the mutex: with batching off, or on with
+    /// nothing staged, the flush hook costs one load.
+    outstanding: std::sync::atomic::AtomicUsize,
+    state: Mutex<Option<(PendingWriteback, RequestScope)>>,
+}
+
+impl std::fmt::Debug for WritebackBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WritebackBatch")
+            .field("enabled", &self.enabled)
+            .field("max_staged_writes", &self.max_staged_writes)
+            .field(
+                "outstanding",
+                &self.outstanding.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Default bound on staged writes before an involuntary commit.
+///
+/// 64 is the bulk-durable-write job's exact write count, so that job commits
+/// once at its fsync rather than once mid-run: the threshold is a memory bound,
+/// and picking it below the target run would silently halve the amortization
+/// this lever exists to measure.
+const DEFAULT_MAX_STAGED_WRITES: usize = 64;
+
+impl WritebackBatch {
+    /// ⛔ THE KNOB IS CURRENTLY REFUSED, and that is a measured decision.
+    ///
+    /// `crates/ffs-core/tests/fuse_writeback_batch_crash_matrix.rs` shows the
+    /// scope primitive this batching stands on DOES NOT PERSIST: eight writes
+    /// staged into one `begin_writeback_batch_scope`, committed with
+    /// `commit_writeback_batch_scope`, then `fsync` + `sync_all_to_device`, come
+    /// back as ZEROS after a remount. The control in that file — the identical
+    /// harness with ordinary `OpenFs::write` calls — PASSES, so it is the batch
+    /// route that loses data, not the test.
+    ///
+    /// The wiring below is kept because it is correct against a primitive that
+    /// works and is the expensive part to re-derive, but honouring the
+    /// environment variable today would hand an operator a switch that silently
+    /// discards acknowledged writes. So the variable is parsed, refused, and the
+    /// refusal is logged rather than being a silent no-op.
+    ///
+    /// TO RE-ENABLE: make the batched route durable (the staged transaction's
+    /// committed versions never reach the image the way the ordinary write path's
+    /// do), un-ignore the three batched tests in that file, and delete this
+    /// override. The tests are the gate; do not flip this on their absence.
+    fn from_env() -> Self {
+        let requested = std::env::var("FFS_FUSE_WRITEBACK_BATCH")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"));
+        if requested {
+            tracing::error!(
+                target: "ffs::fuse::writeback",
+                "FFS_FUSE_WRITEBACK_BATCH was requested and is REFUSED: the writeback \
+                 batch scope does not persist its writes (bd-2i2ez; see \
+                 fuse_writeback_batch_crash_matrix.rs). Continuing with per-request \
+                 commits."
+            );
+        }
+        let enabled = false;
+        let max_staged_writes = std::env::var("FFS_FUSE_WRITEBACK_MAX_WRITES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_STAGED_WRITES);
+        Self {
+            enabled,
+            max_staged_writes,
+            outstanding: std::sync::atomic::AtomicUsize::new(0),
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Cheap "is anything staged" check for the hot non-write path.
+    fn has_outstanding(&self) -> bool {
+        self.enabled && self.outstanding.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(PendingWriteback, RequestScope)>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_outstanding(&self, outstanding: bool) {
+        self.outstanding.store(
+            usize::from(outstanding),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -8163,6 +8319,7 @@ mod tests {
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         };
         let inode = InodeNumber(42);
         inner.missing_capability_xattr.remember(inode);
@@ -20005,6 +20162,7 @@ mod tests {
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
 
@@ -21844,6 +22002,7 @@ AllowOther"#;
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
         };
         let dbg = format!("{inner:?}");
         assert_eq!(dbg, FUSE_INNER_DEBUG_GOLDEN);

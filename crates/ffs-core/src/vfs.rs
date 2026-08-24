@@ -2720,6 +2720,60 @@ pub trait FsOps: Send + Sync {
         Ok(CommitSeq(0))
     }
 
+    /// Begin a caller-held write scope for writeback batching (bd-2i2ez).
+    ///
+    /// The FUSE layer holds the returned scope across several WRITE requests and
+    /// commits it once at a flush boundary, so a run of writes pays one MVCC
+    /// commit — SSI validate, WAL append, snapshot bump, version insert — instead
+    /// of one per request.
+    ///
+    /// `OpenFs` has had the concrete primitives since bd-xmh5g.401, but only as
+    /// INHERENT methods, and the FUSE layer holds an `Arc<dyn FsOps>`. There was
+    /// therefore no way to reach them from the code that ships, which is why
+    /// bd-w3hol's wiring never landed despite the bead closing. Putting them on
+    /// the trait is what makes the amortization reachable at all.
+    ///
+    /// # Errors
+    ///
+    /// The default refuses with `UnsupportedFeature`, so a backend that has not
+    /// opted in keeps per-request commits and the caller falls back rather than
+    /// silently batching against a store that cannot support it.
+    fn begin_writeback_batch_scope(&self, _cx: &Cx) -> ffs_error::Result<RequestScope> {
+        Err(FfsError::UnsupportedFeature(
+            "writeback batch scopes are not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Commit and release a scope obtained from
+    /// [`Self::begin_writeback_batch_scope`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the commit error, or the release error when commit succeeded and
+    /// release did not.
+    fn commit_writeback_batch_scope(
+        &self,
+        _cx: &Cx,
+        _scope: RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
+        Err(FfsError::UnsupportedFeature(
+            "writeback batch scopes are not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Discard a writeback batch scope without committing it.
+    ///
+    /// Used when a staged write fails partway through a batch: the transaction
+    /// may hold a partial mutation, so it is abandoned rather than published by
+    /// a later flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns the scope-release error.
+    fn abort_writeback_batch_scope(&self, _cx: &Cx, _scope: RequestScope) -> ffs_error::Result<()> {
+        Ok(())
+    }
+
     /// Flush all pending writes to durable storage before unmount.
     ///
     /// Called by the FUSE `destroy` callback to ensure in-memory MVCC
@@ -3589,6 +3643,26 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
 
     fn commit_request_scope(&self, scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {
         self.as_ref().commit_request_scope(scope)
+    }
+
+    // ⚠️ These two forwards are the load-bearing half of bd-2i2ez. A method added
+    // to `FsOps` and NOT forwarded here is dead code in the production mount,
+    // which serves `Arc<OpenFs>` — the same trap that left the writeback
+    // primitives unreachable for two months.
+    fn begin_writeback_batch_scope(&self, cx: &Cx) -> ffs_error::Result<RequestScope> {
+        self.as_ref().begin_writeback_batch_scope(cx)
+    }
+
+    fn commit_writeback_batch_scope(
+        &self,
+        cx: &Cx,
+        scope: RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
+        self.as_ref().commit_writeback_batch_scope(cx, scope)
+    }
+
+    fn abort_writeback_batch_scope(&self, cx: &Cx, scope: RequestScope) -> ffs_error::Result<()> {
+        self.as_ref().abort_writeback_batch_scope(cx, scope)
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {

@@ -33,6 +33,10 @@ impl FrankenFuse {
                 // comparator to A/B the memo from a single ELF (bd-2pq73).
                 missing_capability_xattr: LastMissingCapabilityXattr::from_env(),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
+                // bd-2i2ez: `from_env`, not `default` — this is the one
+                // production mount, and `FFS_FUSE_WRITEBACK_BATCH` has to reach
+                // it for the comparator to A/B the batch from a single ELF.
+                writeback: WritebackBatch::from_env(),
                 // bd-q0xnl: starts false and is armed at `init` from the env, the
                 // same as the crate's other two `FuseInner` constructors. This one
                 // was missed when the field landed, which broke every build of
@@ -132,6 +136,21 @@ impl FrankenFuse {
                 error = %error,
                 "FUSE kernel entry invalidation failed"
             );
+        }
+    }
+
+    /// Drop a cached inode's attributes after a successful mutation.
+    ///
+    /// Positive entry and attribute TTLs are valid only while the metadata is
+    /// unchanged. The kernel can keep a prior reply for up to `ATTR_TTL`, so a
+    /// committed mutation must actively evict it rather than waiting for that
+    /// timeout to elapse.
+    fn notify_inode_invalidation(&self, ino: u64) {
+        let Some(notifier) = self.kernel_notifier() else {
+            return;
+        };
+        if let Err(error) = notifier.inval_inode(ino, 0, 0) {
+            debug!(ino, error = %error, "FUSE kernel inode invalidation failed");
         }
     }
 
@@ -736,6 +755,33 @@ impl FrankenFuse {
 
     fn reply_error_entry(ctx: &FuseErrorContext<'_>, reply: ReplyEntry) {
         reply.error(ctx.log_and_errno());
+    }
+
+    /// Reply to `LOOKUP` with a protocol negative entry, not merely `ENOENT`.
+    ///
+    /// Linux caches a `fuse_entry_out` whose node id is zero for `entry_valid`.
+    /// `ReplyEntry::error(ENOENT)` deliberately carries no such validity, so it
+    /// makes every repeated miss cross FUSE again. The remaining attribute
+    /// fields are ignored for a zero node id.
+    fn reply_negative_entry(reply: ReplyEntry) {
+        let negative = FileAttr {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            crtime: SystemTime::UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 0,
+            flags: 0,
+        };
+        reply.entry(&NEGATIVE_ENTRY_TTL, &negative, 0);
     }
 
     fn reply_error_data(ctx: &FuseErrorContext<'_>, reply: ReplyData) {
@@ -2899,10 +2945,55 @@ impl FrankenFuse {
         trace.record(ino, cmd, in_len, out_size);
     }
 
+    /// Commit any outstanding writeback batch (bd-2i2ez).
+    ///
+    /// THE VISIBILITY INVARIANT LIVES HERE. Staged writes are in an uncommitted
+    /// MVCC transaction and are invisible through a fresh scope, so every
+    /// non-WRITE request commits the batch before it runs. A missed call site
+    /// here does not fail loudly — it serves a stale read — which is why the
+    /// call is in the single funnel every handler already goes through rather
+    /// than sprinkled across the handlers that happen to observe.
+    ///
+    /// Failure to commit is propagated: the batch holds writes whose `write()`
+    /// already returned success, and swallowing the error would lose them
+    /// silently. The batch is taken out of the slot before the commit is
+    /// attempted, so a failed commit does not leave a poisoned scope behind for
+    /// the next request to retry forever.
+    fn flush_writeback_batch(&self, cx: &Cx) -> ffs_error::Result<()> {
+        if !self.inner.writeback.has_outstanding() {
+            return Ok(());
+        }
+        let taken = {
+            let mut slot = self.inner.writeback.lock();
+            let taken = slot.take();
+            self.inner.writeback.set_outstanding(false);
+            taken
+        };
+        let Some((pending, scope)) = taken else {
+            return Ok(());
+        };
+        let staged = pending.staged;
+        let seq = self.inner.ops.commit_writeback_batch_scope(cx, scope)?;
+        trace!(
+            target: "ffs::fuse::writeback",
+            ino = pending.ino,
+            staged,
+            commit_seq = seq.0,
+            "writeback_batch_committed"
+        );
+        Ok(())
+    }
+
     fn with_request_scope<T, F>(&self, cx: &Cx, op: RequestOp, f: F) -> ffs_error::Result<T>
     where
         F: FnOnce(&Cx, &mut RequestScope) -> ffs_error::Result<T>,
     {
+        // bd-2i2ez: everything that is not a WRITE observes, so it commits the
+        // outstanding batch first. `has_outstanding` makes this one relaxed load
+        // when batching is off or nothing is staged.
+        if op != RequestOp::Write {
+            self.flush_writeback_batch(cx)?;
+        }
         // Only read the clock when something will read the counter (bd-xfe7z).
         let started = crate::dispatch_timing_enabled().then(Instant::now);
         let result = match self.inner.ops.begin_request_scope(cx, op) {
@@ -3181,6 +3272,13 @@ impl FrankenFuse {
         let byte_offset =
             u64::try_from(offset).map_err(|_| MutationDispatchError::Errno(libc::EINVAL))?;
         let mut operation_offset = byte_offset;
+        // bd-2i2ez: a plain WRITE stages into the outstanding batch instead of
+        // committing. Excluded deliberately: O_SYNC/O_DSYNC writes, whose whole
+        // contract is to be durable on return, and which therefore keep the
+        // per-request commit.
+        if self.inner.writeback.enabled && intent.sync_mode().is_none() {
+            return self.dispatch_batched_write(&cx, ino, byte_offset, data, intent);
+        }
         let (written, _commit_seq) = {
             let _inode_guards = if intent.nowait() {
                 self.try_acquire_mutation_inode_guards(&[InodeNumber(ino)])
@@ -3219,6 +3317,123 @@ impl FrankenFuse {
         })?;
         // Update writeback barrier if enabled.
         Ok(written)
+    }
+
+    /// Stage one WRITE into the outstanding writeback batch (bd-2i2ez).
+    ///
+    /// The amortization this bead is about: 64 sequential writes to one file
+    /// currently pay 64 full MVCC commits — SSI validate, WAL append, snapshot
+    /// bump, version insert — where kernel ext4 accumulates the same bytes into
+    /// one journal transaction and pays once at the fsync.
+    ///
+    /// The `getattr` for an append lands in the SAME scope as the staged writes,
+    /// so an appending writer sees its own staged size. That is read-your-writes
+    /// for the one observation this path makes; every OTHER observer is handled
+    /// by `flush_writeback_batch` committing before non-write requests.
+    fn dispatch_batched_write(
+        &self,
+        cx: &Cx,
+        ino: u64,
+        byte_offset: u64,
+        data: &[u8],
+        intent: WriteIntent,
+    ) -> Result<u32, MutationDispatchError> {
+        let mut operation_offset = byte_offset;
+        let outcome = {
+            let _inode_guards = if intent.nowait() {
+                self.try_acquire_mutation_inode_guards(&[InodeNumber(ino)])
+                    .ok_or(MutationDispatchError::Errno(libc::EAGAIN))?
+            } else {
+                self.acquire_mutation_inode_guards(&[InodeNumber(ino)])
+            };
+            // A batch belongs to exactly one inode. Writing to a different one
+            // commits the old batch rather than mixing two files' staged writes
+            // into a transaction that a single fsync would then publish together.
+            let flush_other = {
+                let slot = self.inner.writeback.lock();
+                slot.as_ref().is_some_and(|(pending, _)| pending.ino != ino)
+            };
+            if flush_other {
+                self.flush_writeback_batch(cx)
+                    .map_err(|error| MutationDispatchError::Operation {
+                        error,
+                        offset: Some(byte_offset),
+                    })?;
+            }
+
+            let mut slot = self.inner.writeback.lock();
+            if slot.is_none() {
+                let scope = self.inner.ops.begin_writeback_batch_scope(cx).map_err(
+                    |error| MutationDispatchError::Operation {
+                        error,
+                        offset: Some(byte_offset),
+                    },
+                )?;
+                *slot = Some((PendingWriteback { ino, staged: 0 }, scope));
+                self.inner.writeback.set_outstanding(true);
+            }
+            let (pending, scope) = slot
+                .as_mut()
+                .expect("the batch slot was just populated for this inode");
+
+            let staged = (|| -> ffs_error::Result<u32> {
+                let write_offset = if intent.append_to_eof() {
+                    self.inner.ops.getattr(cx, scope, InodeNumber(ino))?.size
+                } else {
+                    byte_offset
+                };
+                operation_offset = write_offset;
+                self.inner
+                    .ops
+                    .write(cx, scope, InodeNumber(ino), write_offset, data)
+            })();
+
+            match staged {
+                Ok(bytes) => {
+                    pending.staged += 1;
+                    let full = pending.staged >= self.inner.writeback.max_staged_writes;
+                    drop(slot);
+                    self.inner.readahead.invalidate_inode(InodeNumber(ino));
+                    // Bounded dirty state: a writer that never fsyncs must not
+                    // pin an unbounded transaction.
+                    if full {
+                        self.flush_writeback_batch(cx).map_err(|error| {
+                            MutationDispatchError::Operation {
+                                error,
+                                offset: Some(operation_offset),
+                            }
+                        })?;
+                    }
+                    Ok(bytes)
+                }
+                Err(error) => {
+                    // The staged write failed, so the transaction may hold a
+                    // partial mutation. Drop the whole batch rather than let a
+                    // later fsync publish it: the writes it carries have already
+                    // been reported as successful, so this is the one place the
+                    // batch can legitimately be abandoned, and it is reported.
+                    let abandoned = slot.take();
+                    self.inner.writeback.set_outstanding(false);
+                    drop(slot);
+                    if let Some((pending, scope)) = abandoned {
+                        warn!(
+                            target: "ffs::fuse::writeback",
+                            ino = pending.ino,
+                            staged = pending.staged,
+                            error = %error,
+                            "writeback batch abandoned after a staged write failed; \
+                             its earlier writes are lost and were never fsync'd"
+                        );
+                        let _ = self.inner.ops.abort_writeback_batch_scope(cx, scope);
+                    }
+                    Err(MutationDispatchError::Operation {
+                        error,
+                        offset: Some(operation_offset),
+                    })
+                }
+            }
+        };
+        outcome
     }
 
     fn kernel_open_flags(request_flags: i32, backend_open_flags: u32) -> u32 {
