@@ -826,6 +826,116 @@ fn the_per_request_scope_cost_is_priced_against_the_mounted_gap_bd_2s8zy() {
     );
 }
 
+/// DOES THE MISS-STREAK GATE FIRE ON A REAL SWEEP? (bd-79li3)
+///
+/// The gate exists because the floor-leaf memo taxed random-access metadata 8.6x:
+/// a stream with no locality misses every time and still pays the replacement, so
+/// after 32 consecutive misses the memo backs off to refreshing one descent in 64.
+/// Its doc asserts it is "sized above the miss-per-leaf-crossing rate a sweep
+/// produces, so the sweep case never trips it".
+///
+/// THAT CLAIM HAS ONLY EVER BEEN CHECKED SYNTHETICALLY — by calling
+/// `should_replace` in a loop against a hand-built hit/miss pattern
+/// (`btrfs_floor_memo_miss_streak_gate_is_one_signed_bd_79li3`). That test pins the
+/// SCHEDULE the gate implements; it cannot tell you which pattern a real sweep
+/// presents, because it supplies the pattern itself.
+///
+/// It is worth checking rather than assuming, for a reason recorded on bd-79li3:
+/// a gate that fired on a sweep would cost 1.88x on the worst row in the bank. And
+/// the capability probe makes a readdir+stat sweep miss-heavy BY CONSTRUCTION —
+/// an absent xattr bucket sorts past the reached leaf's last key, so the span check
+/// fails on nearly every probe even though the descent lands on the same leaf. A
+/// long run of those is exactly the shape the gate is looking for.
+///
+/// So this runs the real workload — the interleaved 8-stream lookup+getattr+
+/// getxattr sweep, the order `readdir-stat-8t` presents — and reports what the
+/// gate actually did.
+#[test]
+fn the_miss_streak_gate_does_not_fire_on_a_real_sweep_bd_79li3() {
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let entries = 6_000;
+    let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-gate.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-79li3 sweep-gate probe");
+        return;
+    };
+    let cx = Cx::for_testing();
+    let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
+
+    let sweep = |order: &[usize]| -> (u64, u64) {
+        let device = ffs_block::FileByteDevice::open(&image).expect("open image");
+        let fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+            .expect("open btrfs read-only");
+        let (l0, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        for &index in order {
+            if let Ok(attr) = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(&names[index])) {
+                let _ = fs.getattr(&cx, attr.ino);
+                let _ = FsOps::getxattr(fs_ref(&fs), &cx, attr.ino, SECURITY_CAPABILITY);
+            }
+        }
+        let (l1, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        // Suppressions are per-mount, so this is the count for THIS sweep alone.
+        (fs.btrfs_floor_memo_suppressions(), l1 - l0)
+    };
+
+    let sequential: Vec<usize> = (0..entries).collect();
+    let (seq_suppressions, seq_lookups) = sweep(&sequential);
+    let (int_suppressions, int_lookups) = sweep(&interleaved_order(entries, 8));
+
+    // A RANDOM-ACCESS ARM, reported rather than asserted, and the reason is a
+    // measurement: it was written as this test's control — the workload the gate
+    // was BUILT for, which ought to fire it — and it produced ZERO suppressions
+    // too. Six thousand entries in stride order still retain enough leaf locality
+    // that a hit resets the streak before it reaches 32, so at this size random
+    // ACCESS is not a no-locality STREAM and cannot serve as a control.
+    //
+    // Rather than grow the fixture until it fires, the discrimination check moved
+    // to `btrfs_floor_memo_miss_streak_gate_is_one_signed_bd_79li3`, which already
+    // constructs a true miss-only stream and now asserts the counter matches the
+    // gate exactly. This arm stays because the number is worth knowing: it says the
+    // 8.6x random-access tax bd-79li3 measured needs a bigger working set than this
+    // to reproduce, which is a fact about that bead's fixture, not about the gate.
+    //
+    // The permutation is a fixed multiplicative step over a size coprime to it
+    // rather than a shuffle, so the order is random-ACCESS without being random —
+    // an unseeded shuffle would make any failure here unreproducible.
+    let stride = 2_797_i64 as usize;
+    let random: Vec<usize> = (0..entries).map(|i| (i * stride) % entries).collect();
+    let mut seen = random.clone();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), entries, "the stride permutation must cover every entry exactly once");
+    let (rnd_suppressions, rnd_lookups) = sweep(&random);
+
+    eprintln!(
+        "bd-79li3 sweep gate entries={entries}\n  \
+         sequential  suppressions={seq_suppressions} node_lookups={seq_lookups}\n  \
+         interleaved suppressions={int_suppressions} node_lookups={int_lookups}\n  \
+         random      suppressions={rnd_suppressions} node_lookups={rnd_lookups}"
+    );
+
+    // Not asserted — see the note above. The counter's ability to report a non-zero
+    // is pinned in the unit test that can build a real miss-only stream.
+    assert!(
+        rnd_lookups > 0,
+        "the random-access arm performed no node lookups, so it never descended"
+    );
+
+    // The gate's claim, checked against the workload it names rather than against
+    // a pattern the test supplies. If this ever fires, the memo has quietly backed
+    // off on the row it exists to serve and the 1.88x sweep benefit is at risk —
+    // which is the failure bd-79li3 asked to be guarded against before the gate
+    // landed, and which until now nothing measured.
+    assert_eq!(
+        (seq_suppressions, int_suppressions),
+        (0, 0),
+        "the miss-streak gate suppressed replacements during a SWEEP (sequential \
+         {seq_suppressions}, interleaved {int_suppressions}). Its doc claims a sweep \
+         never trips it. Either the gate's streak threshold is now below what the \
+         capability probe produces, or the probe's miss rate has risen — both put the \
+         sweep's floor-memo benefit at risk on the worst row in the bank."
+    );
+}
+
 /// The shipping floor-memo size must be the one the counted evidence was taken on
 /// (bd-2s8zy).
 ///

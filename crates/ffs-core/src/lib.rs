@@ -1828,6 +1828,24 @@ pub struct OpenFs {
     /// one relaxed add on the miss path and one relaxed store on the hit path, and
     /// it never needs to be reset by anything but a hit.
     btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32,
+    /// How many times the miss-streak gate has actually SUPPRESSED a replacement
+    /// (bd-79li3).
+    ///
+    /// The gate's own doc asserts it is "sized above the miss-per-leaf-crossing
+    /// rate a sweep produces, so the sweep case never trips it", and that claim was
+    /// only ever checked SYNTHETICALLY — by calling `should_replace` in a loop
+    /// with a hand-built hit/miss pattern. It matters because bd-79li3 carries an
+    /// explicit warning that a gate firing on a sweep would cost 1.88x on the worst
+    /// row in the bank, and the capability probe makes the sweep miss-heavy by
+    /// construction: an absent xattr bucket sorts past the reached leaf's last key,
+    /// so the span check fails on nearly every probe even though the descent lands
+    /// on the same leaf.
+    ///
+    /// Cumulative and never reset by a hit — a hit resets the STREAK, which is the
+    /// thing the gate reads, but zeroing this too would hide every firing that a
+    /// later hit recovered from, which is precisely the pattern in question.
+    /// Incremented only on the suppression branch, so the hot path pays nothing.
+    btrfs_floor_memo_suppressions: std::sync::atomic::AtomicU64,
     /// Read-only per-directory name→child_objectid map (the btrfs analog of the
     /// ext4 present-index). On a read-only mount the directory is immutable, so a
     /// map built once from readdir serves `btrfs_lookup_child` name resolution in
@@ -5556,6 +5574,7 @@ impl OpenFs {
             ),
             btrfs_grow_chunks: std::sync::atomic::AtomicBool::new(btrfs_grow_chunks_from_env()),
             btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32::new(0),
+            btrfs_floor_memo_suppressions: std::sync::atomic::AtomicU64::new(0),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
@@ -9894,9 +9913,26 @@ impl OpenFs {
         // Saturating rather than wrapping: a very long miss streak must not fall
         // back to `0` and read as "the memo just started working".
         if misses == u32::MAX {
+            self.btrfs_floor_memo_suppressions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
-        (misses - MISS_STREAK_SUPPRESS).is_multiple_of(SUPPRESSED_PROBE_PERIOD)
+        let replace = (misses - MISS_STREAK_SUPPRESS).is_multiple_of(SUPPRESSED_PROBE_PERIOD);
+        if !replace {
+            self.btrfs_floor_memo_suppressions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        replace
+    }
+
+    /// How many replacements the miss-streak gate has suppressed (bd-79li3).
+    ///
+    /// Exists so the gate's central claim — that a SWEEP never trips it — can be
+    /// checked against a real sweep instead of a synthetic hit/miss pattern.
+    #[must_use]
+    pub fn btrfs_floor_memo_suppressions(&self) -> u64 {
+        self.btrfs_floor_memo_suppressions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Predecessor-or-equal descent over a btrfs B-tree: the on-disk dual of
@@ -59969,6 +60005,28 @@ mod tests {
         fs.btrfs_floor_memo_consecutive_misses
             .store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(fs.btrfs_floor_memo_should_replace());
+
+        // THE SUPPRESSION COUNTER MUST DISCRIMINATE (bd-79li3, 2026-08-24). The
+        // integration arm `the_miss_streak_gate_does_not_fire_on_a_real_sweep_bd_79li3`
+        // reports ZERO suppressions on a real readdir+stat sweep, which is the
+        // gate's central claim finally checked against the workload it names. That
+        // zero is only evidence if a non-zero is reachable, and this is the cheapest
+        // place to prove it: the miss-only stream above is a true no-locality
+        // stream, unlike a random ACCESS order over a small fixture, which still
+        // retains enough leaf locality to reset the streak (measured: 6,000 entries
+        // in stride order produced zero suppressions, so it cannot serve as the
+        // control).
+        //
+        // Exact, not a bound: every descent in that stream either replaced or was
+        // suppressed, so the two must sum to the stream length.
+        let suppressions = fs.btrfs_floor_memo_suppressions();
+        assert_eq!(
+            suppressions,
+            (PROBE - replacements) as u64,
+            "the gate suppressed {replacements} of {PROBE} replacements but the counter \
+             recorded {suppressions}; a counter that does not track the gate turns the \
+             sweep arm's zero into an absence of measurement rather than a result"
+        );
     }
 
     /// Smallest btrfs `OpenFs` that exercises the floor-memo policy (bd-79li3).
