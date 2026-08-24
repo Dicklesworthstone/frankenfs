@@ -3783,6 +3783,15 @@ struct FuseInner {
     writeback: WritebackBatch,
 }
 
+impl FuseInner {
+    /// Drop the single-use attributes handed from `READDIRPLUS` to a following
+    /// `GETATTR`. A successful metadata mutation makes those attributes stale
+    /// before the kernel has a chance to consume the hand-off.
+    fn invalidate_readdirplus_attrs(&self, ino: InodeNumber) {
+        self.readdirplus_attr_memo.forget(ino);
+    }
+}
+
 impl std::fmt::Debug for FuseInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FuseInner")
@@ -7399,6 +7408,50 @@ mod tests {
         // Forgetting an inode that was never stored must not panic: mutations
         // arrive for inodes no readdirplus ever touched.
         memo.forget(InodeNumber(999_999));
+    }
+
+    /// A mutation may land after `READDIRPLUS` has prepared an attribute reply
+    /// but before the kernel's follow-up `GETATTR`. The mutation invalidation
+    /// seam must discard that planted stale answer even without a live notifier
+    /// (which keeps this regression deterministic and exercises the cache path
+    /// rather than a kernel mount fixture).
+    #[test]
+    fn mutation_invalidation_drops_a_planted_readdirplus_stale_attr() {
+        let inner = FuseInner {
+            ops: Arc::new(MinimalTestFs),
+            metrics: Arc::new(AtomicMetrics::new()),
+            thread_count: 1,
+            worker_dispatch: false,
+            parallel_dirops: false,
+            read_only: false,
+            count_memoized_requests: true,
+            mountpoint: None,
+            kernel_notifier: Mutex::new(None),
+            ioctl_trace: None,
+            backpressure: None,
+            access_predictor: AccessPredictor::default(),
+            readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
+            readonly_xattr_cache: ReadonlyXattrCache::default(),
+            readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(
+                READDIRPLUS_ATTR_MEMO_SLOTS,
+                true,
+            ),
+            missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            inode_locks: Arc::new(FuseInodeLocks::default()),
+            writeback: WritebackBatch::from_env(),
+            zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+        };
+        let ino = InodeNumber(404);
+        let mut stale = make_test_attr(FfsFileType::RegularFile, 4096);
+        stale.ino = ino;
+        inner.readdirplus_attr_memo.remember(ino, &stale);
+
+        inner.invalidate_readdirplus_attrs(ino);
+
+        assert!(
+            inner.readdirplus_attr_memo.take(ino).is_none(),
+            "a metadata mutation must never let GETATTR consume READDIRPLUS's stale attributes"
+        );
     }
 
     /// Disabled means it never FILLS, not merely that it never answers.

@@ -146,6 +146,12 @@ impl FrankenFuse {
     /// committed mutation must actively evict it rather than waiting for that
     /// timeout to elapse.
     fn notify_inode_invalidation(&self, ino: u64) {
+        // READDIRPLUS may have prepared attributes for the next GETATTR before
+        // this mutation committed. Clear that userspace hand-off regardless of
+        // whether a live kernel notifier has been installed; the kernel cache
+        // and our own hand-off must have the same mutation boundary.
+        self.inner
+            .invalidate_readdirplus_attrs(InodeNumber(ino));
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
