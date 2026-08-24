@@ -2,6 +2,8 @@
 
 /// Degradation, backpressure, and compute-budget management for graceful overload handling.
 pub mod degradation;
+/// Read-only btrfs extent-tree allocation diagnostics.
+pub mod btrfs_debug;
 /// NFS-style file handles for `name_to_handle_at(2)` / `open_by_handle_at(2)`.
 pub mod file_handle;
 /// MVCC-store lock-model abstraction for the parallel-write wiring.
@@ -1179,6 +1181,12 @@ struct BtrfsAllocState {
     /// Cleared by a full transaction commit, which supersedes the log entirely (see
     /// the `log_root` retirement in `btrfs_commit_writeback`, bd-mogn1).
     btrfs_logged_inodes: std::collections::BTreeSet<u64>,
+    /// Exact FS-tree keys changed by non-deleting directory mutations since the
+    /// last full commit. Tree-log collection reads only these point keys.
+    btrfs_logged_dir_keys: std::collections::BTreeSet<(u64, u8, u64)>,
+    /// A tree-log leaf cannot express a deleted key. Reject before allocating a
+    /// log so `btrfs_sync` takes its established full-commit fallback.
+    btrfs_tree_log_has_deletions: bool,
     /// bd-42gtq: in-memory block id -> on-disk bytenr, for every tree block this
     /// mount has ALREADY written, keyed by tree objectid.
     ///
@@ -9138,6 +9146,8 @@ impl OpenFs {
             written_tree_blocks: std::collections::HashMap::new(),
             // No fsync has been logged in this mount yet (bd-dm01m).
             btrfs_logged_inodes: std::collections::BTreeSet::new(),
+            btrfs_logged_dir_keys: std::collections::BTreeSet::new(),
+            btrfs_tree_log_has_deletions: false,
             // No tree log published yet (bd-0ajub).
             btrfs_live_log_blocks: Vec::new(),
         })
@@ -20276,11 +20286,17 @@ impl OpenFs {
             // two per-group device reads were pure waste; on a large fs with few
             // touched groups that is the bulk of the flush. Byte-identical: the
             // override handed to persist_group_desc_force is unchanged.
-            let inode_bitmap = if gs.free_inodes < alloc.geo.inodes_in_group(group) {
-                Some(device.read_block(cx, gs.inode_bitmap_block)?.into_inner())
-            } else {
-                None
-            };
+            // A group can return to its full free-inode count after a
+            // create/delete storm while its bitmap remains materialised.  The
+            // first fsync correctly clears INODE_UNINIT and stamps its checksum;
+            // the second must re-stamp that checksum over the cleared bits rather
+            // than treating the group as untouched just because its count is full.
+            let inode_bitmap =
+                if !gs.inode_bitmap_uninit() || gs.free_inodes < alloc.geo.inodes_in_group(group) {
+                    Some(device.read_block(cx, gs.inode_bitmap_block)?.into_inner())
+                } else {
+                    None
+                };
             let block_bitmap = if gs.free_blocks < alloc.geo.blocks_in_group(group) {
                 Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
             } else {
@@ -29969,12 +29985,12 @@ impl OpenFs {
         canonical: u64,
     ) -> Result<Vec<BtrfsTreeItem>, FfsError> {
         let start = BtrfsKey {
-            objectid: 0,
+            objectid: canonical,
             item_type: 0,
             offset: 0,
         };
         let end = BtrfsKey {
-            objectid: u64::MAX,
+            objectid: canonical,
             item_type: u8::MAX,
             offset: u64::MAX,
         };
@@ -30177,6 +30193,11 @@ impl OpenFs {
         // bd-dm01m: log EVERY inode fsync'd since the last full commit, not just this
         // one. `log_root` replaces the previous log rather than chaining to it, so a
         // log holding only the current inode makes every earlier fsync in this
+        if alloc.btrfs_tree_log_has_deletions {
+            return Err(FfsError::UnsupportedFeature(
+                "btrfs tree log cannot encode deleted directory entries; use full commit".into(),
+            ));
+        }
         // transaction unreachable — `fsync(A)` then `fsync(B)` lost A on a crash even
         // though its fsync returned success.
         alloc.btrfs_logged_inodes.insert(canonical);
@@ -30184,6 +30205,22 @@ impl OpenFs {
         let mut items = Vec::new();
         for inode in logged {
             items.extend(Self::btrfs_collect_tree_log_items(alloc, inode)?);
+        }
+        for &(objectid, item_type, offset) in &alloc.btrfs_logged_dir_keys {
+            let key = BtrfsKey {
+                objectid,
+                item_type,
+                offset,
+            };
+            if let Some((_, data)) = alloc
+                .fs_tree
+                .range(&key, &key)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                .into_iter()
+                .next()
+            {
+                items.push(BtrfsTreeItem { key, data: data.into() });
+            }
         }
 
         // The checksums for the data those extents name. Without them the kernel
@@ -32152,6 +32189,8 @@ impl OpenFs {
         // whose items are already committed, growing the log for no reason and
         // reintroducing the overflow this change bounds.
         alloc.btrfs_logged_inodes.clear();
+        alloc.btrfs_logged_dir_keys.clear();
+        alloc.btrfs_tree_log_has_deletions = false;
         // bd-0ajub: the block itself was pinned and its extent item deleted at the
         // top of this commit. Dropping the handle here keeps the two in step — a
         // later fsync must not hand this address back a second time, which would
@@ -32989,11 +33028,61 @@ impl OpenFs {
                 .fs_tree
                 .insert_many_then_update(&inserts, &parent_key, parent_bytes.as_slice())
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            // bd-jhuob: the collision path above reaches these via
+            // `btrfs_insert_dir_entry`; this batched path builds the keys inline,
+            // so it has to record them itself or a tree-logged fsync of the new
+            // file recovers it without a name.
+            Self::btrfs_log_new_dir_entry_keys(
+                &mut alloc,
+                dir_item_key,
+                dir_index_key,
+                parent_key,
+            );
         }
 
         drop(alloc);
 
         Ok(self.btrfs_inode_to_attr(new_oid, &inode))
+    }
+
+    /// Record the parent-side namespace keys a fresh directory entry creates, so
+    /// a tree-logged fsync of the CHILD can carry the name that reaches it
+    /// (bd-jhuob).
+    ///
+    /// # Why this exists as a separate call rather than living in `btrfs_insert_dir_entry`
+    ///
+    /// It does live there — and that was the whole defect. `btrfs_insert_dir_entry`
+    /// records these keys, but `btrfs_create` and `btrfs_mkdir` only call it on the
+    /// RARE name-hash-collision path; the common case takes the bd-cowbatch
+    /// `insert_many_then_update` branch, which builds the same keys inline and
+    /// never reaches the helper. So the capture existed and the common path
+    /// bypassed it, leaving `btrfs_logged_dir_keys` empty for exactly the
+    /// operation that needs it most.
+    ///
+    /// # What that cost, measured
+    ///
+    /// A tree-logged `fsync` of a newly created file logged three items — the
+    /// child's own INODE_ITEM, INODE_REF and EXTENT_DATA — and none of the
+    /// parent's. After a crash the inode was recovered with NO NAME, so `lookup`
+    /// could not find it: an fsync that returned success lost its file. See
+    /// `crates/ffs-core/tests/btrfs_tree_log_crash_replay.rs`, which reproduces
+    /// it and whose `fsyncing_the_parent_directory_recovers_the_name_bd_jhuob`
+    /// isolates the cause to precisely these three keys.
+    ///
+    /// This is also what kernel btrfs does: it logs the new dentry's parent
+    /// directory entries so that `fsync(file)` alone is sufficient for a freshly
+    /// created file, rather than requiring the caller to fsync the directory too.
+    fn btrfs_log_new_dir_entry_keys(
+        alloc: &mut BtrfsAllocState,
+        dir_item_key: BtrfsKey,
+        dir_index_key: BtrfsKey,
+        parent_key: BtrfsKey,
+    ) {
+        for key in [dir_item_key, dir_index_key, parent_key] {
+            alloc
+                .btrfs_logged_dir_keys
+                .insert((key.objectid, key.item_type, key.offset));
+        }
     }
 
     /// Build the coalesced parent INODE_ITEM update for a batched fresh-entry
@@ -33144,6 +33233,14 @@ impl OpenFs {
                 .fs_tree
                 .insert_many_then_update(&inserts, &parent_key, parent_bytes.as_slice())
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            // bd-jhuob: same bypass as `btrfs_create`'s batched branch — see the
+            // note there and on `btrfs_log_new_dir_entry_keys`.
+            Self::btrfs_log_new_dir_entry_keys(
+                &mut alloc,
+                dir_item_key,
+                dir_index_key,
+                parent_key,
+            );
         }
         drop(alloc);
 
@@ -33746,6 +33843,10 @@ impl OpenFs {
         // only link-count mutation here, so it also determines whether the
         // final link is being removed.
         let child_will_be_purged = victim_inode.nlink <= 1;
+        // Both the batched and per-op unlink paths remove namespace keys. The
+        // current single-leaf log has no tombstone encoding, so make fsync take
+        // the pre-existing full-commit fallback before it allocates a log.
+        alloc.btrfs_tree_log_has_deletions = true;
         if child_will_be_purged {
             Self::btrfs_validate_purgeable_items(&alloc, child_oid)?;
         }
@@ -33927,6 +34028,9 @@ impl OpenFs {
         new_dir_item_key: BtrfsKey,
         ref_key: BtrfsKey,
     ) -> ffs_error::Result<()> {
+        // This batch removes the old name and its reverse reference. Until the
+        // tree log has deletion records, use the established full-commit path.
+        alloc.btrfs_tree_log_has_deletions = true;
         let new_seq = Self::btrfs_consume_dir_index_seq(alloc, ctx.parent_oid)?;
         let new_dir_item = BtrfsDirItem {
             child_objectid: ctx.child.child_objectid,
@@ -35792,6 +35896,9 @@ impl OpenFs {
                 other => Err(other),
             })
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        alloc
+            .btrfs_logged_dir_keys
+            .insert((dir_item_key.objectid, dir_item_key.item_type, dir_item_key.offset));
 
         // Insert a DIR_INDEX entry keyed by a monotonic per-directory sequence
         // number (not the child objectid). Each link — including multiple hard
@@ -35808,6 +35915,12 @@ impl OpenFs {
             .fs_tree
             .insert(dir_index_key, &new_bytes)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        alloc
+            .btrfs_logged_dir_keys
+            .insert((dir_index_key.objectid, dir_index_key.item_type, dir_index_key.offset));
+        alloc
+            .btrfs_logged_dir_keys
+            .insert((parent_oid, BTRFS_ITEM_INODE_ITEM, 0));
 
         // Account the new entry against the directory's i_size (DIR_ITEM +
         // DIR_INDEX => 2 * name_len), matching the kernel and `btrfs check`.
@@ -35914,6 +36027,7 @@ impl OpenFs {
         name: &[u8],
         dir_index: u64,
     ) -> ffs_error::Result<()> {
+        alloc.btrfs_tree_log_has_deletions = true;
         // INODE_REF.index is assigned with the DIR_INDEX offset at link time, so
         // it can address the exact DIR_INDEX item without a directory-wide scan.
         let (dir_index_key, dir_index_entries) =
@@ -36524,6 +36638,9 @@ impl OpenFs {
         parent_oid: u64,
         name: &[u8],
     ) -> ffs_error::Result<()> {
+        // Removing either the last entry (and key) or one name from this
+        // payload needs a tree-log tombstone, which the current leaf lacks.
+        alloc.btrfs_tree_log_has_deletions = true;
         let ref_key = BtrfsKey {
             objectid: child_oid,
             item_type: BTRFS_ITEM_INODE_REF,
@@ -71453,6 +71570,57 @@ mod tests {
         }
     }
 
+    /// A directory fsync after the create half of a storm stamps the live inode
+    /// bitmap checksum.  The second fsync, after all of those inodes are freed,
+    /// must stamp it again even though the group's free-inode count has returned
+    /// to capacity.  The mounted comparator exercises this exact
+    /// create/fsyncdir/delete/fsyncdir sequence.
+    #[test]
+    fn ext4_create_delete_storm_fsyncdir_keeps_inode_bitmap_checksum_clean() {
+        let Some((fs, dev, _tmp, image)) = open_ext4_mke2fs(256, true) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let parent = fs
+            .mkdir(
+                &cx,
+                InodeNumber(2),
+                OsStr::new("create-delete-storm"),
+                0o755,
+                0,
+                0,
+            )
+            .expect("create storm parent");
+
+        const FILES: usize = 2_000;
+        for index in 0..FILES {
+            let name = format!("storm-{index:08}");
+            fs.create(&cx, parent.ino, OsStr::new(&name), 0o644, 0, 0)
+                .unwrap_or_else(|error| panic!("create {name}: {error}"));
+        }
+        fs.fsync(&cx, parent.ino, 0, false)
+            .expect("fsyncdir after creates");
+
+        for index in 0..FILES {
+            let name = format!("storm-{index:08}");
+            fs.unlink(&cx, parent.ino, OsStr::new(&name))
+                .unwrap_or_else(|error| panic!("unlink {name}: {error}"));
+        }
+        fs.fsync(&cx, parent.ino, 0, false)
+            .expect("fsyncdir after deletes");
+
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write ext4 image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(
+            clean,
+            "e2fsck -n must accept the image after the mounted create/delete storm \\
+             durability sequence; a stale inode bitmap checksum means the second \\
+             fsyncdir classified a materialised-but-empty group as untouched:\n{output}"
+        );
+    }
+
     #[test]
     fn append_only_metadata_log_replays_then_checkpoints_clean() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -78678,6 +78846,157 @@ mod tests {
             "bd-dm01m: A's fsync returned SUCCESS before B's replaced the log root. \
              Seeing size 0 here is the acknowledged-then-lost bug — the accumulator \
              must re-serialize items for EVERY inode fsync'd since the last full commit"
+        );
+    }
+
+    /// bd-uxh7t: a fast fsync must collect only its mutation-time keys.  This
+    /// plants 10,000 otherwise clean inode records in the FS tree; an old
+    /// whole-tree collector visited every one of them on each fsync.
+    #[test]
+    fn btrfs_tree_log_collects_dirty_keys_without_visiting_clean_files_bd_uxh7t() {
+        let (fs, cx) = open_writable_btrfs();
+        let dirty = fs
+            .create(
+                &cx,
+                InodeNumber(1),
+                OsStr::new("uxh7t-dirty.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create the only dirty file")
+            .ino;
+        let dirty_oid = fs
+            .btrfs_canonical_inode(dirty)
+            .expect("canonical dirty inode");
+        let alloc_mutex = fs.require_btrfs_alloc_state().expect("writable btrfs");
+        let mut alloc = alloc_mutex.write();
+        let dirty_key = BtrfsKey {
+            objectid: dirty_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        let dirty_inode_bytes = alloc
+            .fs_tree
+            .range(&dirty_key, &dirty_key)
+            .expect("read dirty inode item")
+            .into_iter()
+            .next()
+            .expect("created file has an inode item")
+            .1;
+        const CLEAN_START: u64 = 1_000_000;
+        const CLEAN_FILES: u64 = 10_000;
+        for objectid in CLEAN_START..CLEAN_START + CLEAN_FILES {
+            alloc
+                .fs_tree
+                .insert(
+                    BtrfsKey {
+                        objectid,
+                        item_type: BTRFS_ITEM_INODE_ITEM,
+                        offset: 0,
+                    },
+                    &dirty_inode_bytes,
+                )
+                .expect("plant clean inode item");
+        }
+        let clean_start = BtrfsKey {
+            objectid: CLEAN_START,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        let clean_end = BtrfsKey {
+            objectid: CLEAN_START + CLEAN_FILES - 1,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        assert_eq!(
+            alloc
+                .fs_tree
+                .range(&clean_start, &clean_end)
+                .expect("count planted clean inode items")
+                .len(),
+            CLEAN_FILES as usize,
+            "the regression must really contain 10k clean files"
+        );
+
+        let items = OpenFs::btrfs_collect_accumulated_tree_log_items(&mut alloc, dirty_oid)
+            .expect("non-deleting mutation must use the fast tree-log collector");
+        assert!(
+            items.iter().any(|item| item.key == dirty_key),
+            "the dirty inode must be included"
+        );
+        assert!(
+            items.iter().all(|item| {
+                !(CLEAN_START..CLEAN_START + CLEAN_FILES).contains(&item.key.objectid)
+            }),
+            "a clean file must never be visited by the tree-log collector"
+        );
+    }
+
+    /// bd-uxh7t: the current tree-log format has no deletion record.  A delete
+    /// must therefore take the existing full-commit fallback, never allocate a
+    /// partial log that would replay the removed name after a crash.
+    #[test]
+    fn btrfs_tree_log_delete_uses_full_commit_fallback_bd_uxh7t() {
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(build_btrfs_csum_image());
+        let opts = OpenOptions {
+            btrfs_rw_ephemeral_ok: true,
+            ..OpenOptions::default()
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &opts).expect("open csum image");
+        fs.enable_writes(&cx).expect("enable writes");
+        let ops: &dyn FsOps = &fs;
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let removed = ops
+            .create(
+                &cx,
+                &mut RequestScope::empty(),
+                root,
+                OsStr::new("uxh7t-delete.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create file to delete");
+        ops.fsync(&cx, &mut RequestScope::empty(), removed.ino, 0, false)
+            .expect("non-deleting fsync writes a tree log");
+        assert_ne!(
+            BtrfsSuperblock::parse_from_image(&dev.snapshot_bytes())
+                .expect("parse logged superblock")
+                .log_root,
+            0,
+            "the pre-delete fsync must prove the tree-log path was active"
+        );
+
+        ops.unlink(
+            &cx,
+            &mut RequestScope::empty(),
+            root,
+            OsStr::new("uxh7t-delete.bin"),
+        )
+        .expect("unlink records a deletion");
+        {
+            let alloc = fs.require_btrfs_alloc_state().expect("writable btrfs").read();
+            assert!(
+                alloc.btrfs_tree_log_has_deletions,
+                "unlink must make tree-log collection refuse before allocation"
+            );
+        }
+
+        ops.fsync(&cx, &mut RequestScope::empty(), root, 0, false)
+            .expect("fsync after a deletion must succeed through full commit");
+        let committed = BtrfsSuperblock::parse_from_image(&dev.snapshot_bytes())
+            .expect("parse post-fallback superblock");
+        assert_eq!(
+            committed.log_root, 0,
+            "the deletion fallback is a full commit, which retires the previous log"
+        );
+        let alloc = fs.require_btrfs_alloc_state().expect("writable btrfs").read();
+        assert!(
+            !alloc.btrfs_tree_log_has_deletions,
+            "the authoritative full commit clears the deletion marker"
         );
     }
 

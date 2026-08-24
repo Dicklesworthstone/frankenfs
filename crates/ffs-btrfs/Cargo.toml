@@ -8,6 +8,10 @@ rust-version.workspace = true
 
 [features]
 bench-instrumentation = []
+# Default-off until ffs-core applies `TreeLogReplayResult::deleted_keys` to its
+# read overlay. With this feature disabled, a log carrying deletion records
+# fails closed as foreign rather than silently replaying an incomplete tree.
+tree-log-deletion-replay = []
 
 [dependencies]
 asupersync = { workspace = true }

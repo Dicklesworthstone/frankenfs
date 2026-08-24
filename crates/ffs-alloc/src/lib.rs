@@ -1049,6 +1049,16 @@ impl GroupStats {
     pub fn inode_bitmap_uninit(&self) -> bool {
         self.flags & GD_FLAG_INODE_UNINIT != 0
     }
+
+    /// Record that this group's inode bitmap has been materialised.
+    ///
+    /// The bitmap stays initialized after its last non-reserved inode is freed:
+    /// its padding and checksum remain on disk, so a later durability boundary
+    /// must continue to re-stamp the descriptor even when `free_inodes` returns
+    /// to the group's full capacity.
+    pub fn mark_inode_bitmap_initialized(&mut self) {
+        self.flags &= !GD_FLAG_INODE_UNINIT;
+    }
 }
 
 // ── Allocation hint ─────────────────────────────────────────────────────────
@@ -3571,6 +3581,7 @@ fn try_alloc_inode_in_group(
 
         groups[gidx].advance_inode_search_start(idx, inodes_in_group);
         groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_sub(1);
+        groups[gidx].mark_inode_bitmap_initialized();
 
         Ok(Some(InodeAlloc {
             ino: InodeNumber(ino),
@@ -3660,6 +3671,7 @@ pub fn try_alloc_inode_in_group_persist_core(
     let bitmap_buf = dev.read_block(cx, bitmap_block)?;
     let mut bitmap = bitmap_buf.as_slice().to_vec();
     let previous_free_inodes = stats.free_inodes;
+    let previous_flags = stats.flags;
 
     let inodes_in_group = geo.inodes_in_group(group);
     let reserved_count = reserved_inode_count_in_group(geo, group);
@@ -3731,6 +3743,7 @@ pub fn try_alloc_inode_in_group_persist_core(
     let previous_used_dirs = stats.used_dirs;
     stats.advance_inode_search_start(idx, inodes_in_group);
     stats.free_inodes = stats.free_inodes.saturating_sub(1);
+    stats.mark_inode_bitmap_initialized();
     // ext4 tracks the number of directory inodes per group in
     // `bg_used_dirs_count`; the Orlov allocator reads it for dir spreading and
     // e2fsck verifies it against the actual directory count. Maintain it here so
@@ -3749,6 +3762,7 @@ pub fn try_alloc_inode_in_group_persist_core(
         Some(&inode_bitmap_override),
     ) {
         stats.free_inodes = previous_free_inodes;
+        stats.flags = previous_flags;
         stats.used_dirs = previous_used_dirs;
         stats.inode_search_start = previous_inode_search_start;
         rollback_set_mutations(&mut bitmap, &rollback_clear_bits);
@@ -3867,6 +3881,7 @@ pub fn free_inode(
     dev.write_block(cx, gs.inode_bitmap_block, &bitmap)?;
     groups[gidx].rewind_inode_search_start_on_free(bit_idx);
     groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_add(1);
+    groups[gidx].mark_inode_bitmap_initialized();
     Ok(())
 }
 
@@ -3911,6 +3926,7 @@ pub fn free_inode_persist(
     let bitmap_buf = dev.read_block(cx, bitmap_block)?;
     let mut bitmap = bitmap_buf.as_slice().to_vec();
     let previous_free_inodes = groups[gidx].free_inodes;
+    let previous_flags = groups[gidx].flags;
     let previous_inode_search_start = groups[gidx].inode_search_start;
     let group = GroupNumber(group_idx);
     let bit_idx = u32::try_from(ino_zero % u64::from(geo.inodes_per_group)).map_err(|_| {
@@ -3952,6 +3968,7 @@ pub fn free_inode_persist(
     let previous_used_dirs = groups[gidx].used_dirs;
     groups[gidx].rewind_inode_search_start_on_free(bit_idx);
     groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_add(1);
+    groups[gidx].mark_inode_bitmap_initialized();
     // Mirror the directory-count maintenance done on allocation: freeing a
     // directory inode decrements `bg_used_dirs_count` for its group (bd-0y7jp).
     if is_dir {
@@ -3968,6 +3985,7 @@ pub fn free_inode_persist(
         Some(&inode_bitmap_override),
     ) {
         groups[gidx].free_inodes = previous_free_inodes;
+        groups[gidx].flags = previous_flags;
         groups[gidx].used_dirs = previous_used_dirs;
         groups[gidx].inode_search_start = previous_inode_search_start;
         bitmap_set(&mut bitmap, bit_idx);
@@ -4031,6 +4049,7 @@ pub fn free_inode_in_group(
     let bitmap_buf = dev.read_block(cx, bitmap_block)?;
     let mut bitmap = bitmap_buf.as_slice().to_vec();
     let previous_free_inodes = stats.free_inodes;
+    let previous_flags = stats.flags;
     let previous_inode_search_start = stats.inode_search_start;
     let bit_idx = u32::try_from(ino_zero % u64::from(geo.inodes_per_group)).map_err(|_| {
         FfsError::Corruption {
@@ -4090,6 +4109,7 @@ pub fn free_inode_in_group(
     let previous_used_dirs = stats.used_dirs;
     stats.rewind_inode_search_start_on_free(bit_idx);
     stats.free_inodes = stats.free_inodes.saturating_add(1);
+    stats.mark_inode_bitmap_initialized();
     if is_dir {
         stats.used_dirs = stats.used_dirs.saturating_sub(1);
     }
@@ -4104,6 +4124,7 @@ pub fn free_inode_in_group(
         Some(&inode_bitmap_override),
     ) {
         stats.free_inodes = previous_free_inodes;
+        stats.flags = previous_flags;
         stats.used_dirs = previous_used_dirs;
         stats.inode_search_start = previous_inode_search_start;
         bitmap_set(&mut bitmap, bit_idx);
@@ -7098,6 +7119,11 @@ mod tests {
         gs.flags = 0x0001; // GD_FLAG_INODE_UNINIT
         assert!(!gs.block_bitmap_uninit());
         assert!(gs.inode_bitmap_uninit());
+        gs.mark_inode_bitmap_initialized();
+        assert!(
+            !gs.inode_bitmap_uninit(),
+            "materialising an inode bitmap must remain visible after it becomes empty"
+        );
 
         gs.flags = 0x0002; // GD_FLAG_BLOCK_UNINIT
         assert!(gs.block_bitmap_uninit());
