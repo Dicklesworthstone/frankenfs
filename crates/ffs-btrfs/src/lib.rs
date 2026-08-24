@@ -7454,6 +7454,24 @@ impl NoSpaceReport {
 }
 
 impl BtrfsExtentAllocator {
+    /// Count the currently materialized on-disk extent-tree items.
+    ///
+    /// This is read-only diagnostic state used by mounted integration tests to
+    /// distinguish a live allocation from an unreachable leaked extent.
+    pub fn allocated_extent_item_count(&self) -> Result<usize, BtrfsMutationError> {
+        let first = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let last = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        Ok(self.extent_tree.range(&first, &last)?.len())
+    }
+
     /// Bytes a new allocation of `required_flags` could actually be given right
     /// now: total minus used minus PINNED, across the matching block groups.
     ///

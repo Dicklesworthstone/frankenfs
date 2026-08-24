@@ -2,6 +2,8 @@
 
 /// Degradation, backpressure, and compute-budget management for graceful overload handling.
 pub mod degradation;
+/// Read-only btrfs extent-tree allocation diagnostics.
+pub mod btrfs_debug;
 /// NFS-style file handles for `name_to_handle_at(2)` / `open_by_handle_at(2)`.
 pub mod file_handle;
 /// MVCC-store lock-model abstraction for the parallel-write wiring.
