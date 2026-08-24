@@ -7,14 +7,20 @@
 
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{info, warn};
-use nix::unistd::geteuid;
+#[cfg(target_os = "linux")]
+use nix::sched::{CpuSet, sched_getaffinity, sched_getcpu, sched_setaffinity};
+use nix::unistd::{Pid, geteuid};
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::{io, ops::DerefMut};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    ops::DerefMut,
+};
 
 use crate::Filesystem;
 use crate::MountOption;
@@ -73,6 +79,264 @@ pub(crate) struct DispatchSlot(RwLock<()>);
 #[derive(Debug)]
 pub(crate) struct DispatchGate {
     slots: Box<[DispatchSlot]>,
+}
+
+/// One owned kernel request waiting in a CPU-local queue.
+///
+/// The original receive buffer cannot outlive a reader iteration.  The
+/// per-core scheduler therefore owns exactly the received bytes until one
+/// worker reconstructs and dispatches the request.  A request is moved, never
+/// cloned: that is the exactly-once invariant for a FUSE reply.
+#[derive(Debug)]
+struct QueuedRequest {
+    bytes: Vec<u8>,
+    file_handle: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct PerCoreLane {
+    pending: Mutex<VecDeque<QueuedRequest>>,
+    active_handles: Mutex<HashSet<u64>>,
+}
+
+/// Immutable counters exported from the real per-core transport scheduler.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerCoreMetricsSnapshot {
+    pub cpus: Vec<usize>,
+    pub requests: Vec<u64>,
+    pub stolen_from: Vec<u64>,
+    pub stolen_to: Vec<u64>,
+}
+
+/// Metrics attached to the queues that actually own FUSE requests.
+#[derive(Debug)]
+pub struct PerCoreMetrics {
+    cpus: Box<[usize]>,
+    requests: Box<[std::sync::atomic::AtomicU64]>,
+    stolen_from: Box<[std::sync::atomic::AtomicU64]>,
+    stolen_to: Box<[std::sync::atomic::AtomicU64]>,
+}
+
+impl PerCoreMetrics {
+    fn new(cpus: Vec<usize>) -> Self {
+        let lanes = cpus.len();
+        let counters = || {
+            (0..lanes)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        };
+        Self {
+            cpus: cpus.into_boxed_slice(),
+            requests: counters(),
+            stolen_from: counters(),
+            stolen_to: counters(),
+        }
+    }
+
+    fn increment(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot request execution and theft counts by processing lane.
+    #[must_use]
+    pub fn snapshot(&self) -> PerCoreMetricsSnapshot {
+        let load = |counters: &[std::sync::atomic::AtomicU64]| {
+            counters
+                .iter()
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .collect()
+        };
+        PerCoreMetricsSnapshot {
+            cpus: self.cpus.to_vec(),
+            requests: load(&self.requests),
+            stolen_from: load(&self.stolen_from),
+            stolen_to: load(&self.stolen_to),
+        }
+    }
+}
+
+/// CPU-keyed request queues for the per-core transport mode.
+///
+/// Each request is placed in the lane selected by the CPU that read it from
+/// `/dev/fuse`.  Idle workers first drain their current CPU lane, then steal a
+/// ready request from the busiest donor.  One active request per file handle
+/// preserves enqueue order for that handle even while work moves between CPUs.
+#[derive(Debug)]
+struct PerCoreScheduler {
+    cpus: Box<[usize]>,
+    lanes: Box<[PerCoreLane]>,
+    metrics: Arc<PerCoreMetrics>,
+}
+
+impl PerCoreScheduler {
+    #[cfg(test)]
+    fn new(lanes: usize) -> Self {
+        let lanes = lanes.max(1);
+        let cpus = (0..lanes).collect::<Vec<_>>();
+        Self::with_metrics(cpus.clone(), Arc::new(PerCoreMetrics::new(cpus)))
+    }
+
+    fn with_metrics(cpus: Vec<usize>, metrics: Arc<PerCoreMetrics>) -> Self {
+        let lanes = cpus.len().max(1);
+        Self {
+            cpus: cpus.into_boxed_slice(),
+            lanes: (0..lanes)
+                .map(|_| PerCoreLane::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            metrics,
+        }
+    }
+
+    fn lane_for_cpu(&self, cpu: usize) -> usize {
+        self.cpus
+            .iter()
+            .position(|&candidate| candidate == cpu)
+            .unwrap_or_else(|| cpu % self.lanes.len())
+    }
+
+    fn enqueue(&self, cpu: usize, bytes: Vec<u8>, file_handle: Option<u64>) {
+        let lane = self.lane_for_cpu(cpu);
+        let mut pending = self.lanes[lane]
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.push_back(QueuedRequest { bytes, file_handle });
+    }
+
+    fn pop_local(&self, lane: usize) -> Option<QueuedRequest> {
+        let lane = self.lane_for_cpu(lane);
+        let queue = &self.lanes[lane];
+        let mut pending = queue
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = queue
+            .active_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let position = pending.iter().position(|request| {
+            request
+                .file_handle
+                .is_none_or(|file_handle| !active.contains(&file_handle))
+        })?;
+        let request = pending.remove(position)?;
+        if let Some(file_handle) = request.file_handle {
+            active.insert(file_handle);
+        }
+        Some(request)
+    }
+
+    fn steal_ready(&self, receiver: usize) -> Option<(usize, QueuedRequest)> {
+        let receiver = self.lane_for_cpu(receiver);
+        let mut donor = None;
+        let mut donor_depth = 0;
+        for (lane, queue) in self.lanes.iter().enumerate() {
+            if lane == receiver {
+                continue;
+            }
+            let pending = queue
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active = queue
+                .active_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let eligible = pending
+                .iter()
+                .filter(|request| {
+                    request
+                        .file_handle
+                        .is_none_or(|file_handle| !active.contains(&file_handle))
+                })
+                .count();
+            if eligible > donor_depth {
+                donor = Some(lane);
+                donor_depth = eligible;
+            }
+        }
+        let donor = donor?;
+        let mut pending = self.lanes[donor]
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = self.lanes[donor]
+            .active_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let position = pending.iter().position(|request| {
+            request
+                .file_handle
+                .is_none_or(|file_handle| !active.contains(&file_handle))
+        })?;
+        let request = pending.remove(position)?;
+        if let Some(file_handle) = request.file_handle {
+            active.insert(file_handle);
+        }
+        PerCoreMetrics::increment(&self.metrics.stolen_from[donor]);
+        PerCoreMetrics::increment(&self.metrics.stolen_to[receiver]);
+        Some((donor, request))
+    }
+
+    fn complete(&self, source_lane: usize, processing_lane: usize, file_handle: Option<u64>) {
+        let source_lane = self.lane_for_cpu(source_lane);
+        let processing_lane = self.lane_for_cpu(processing_lane);
+        if let Some(file_handle) = file_handle {
+            self.lanes[source_lane]
+                .active_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&file_handle);
+        }
+        PerCoreMetrics::increment(&self.metrics.requests[processing_lane]);
+    }
+
+    #[cfg(test)]
+    fn metrics(&self) -> Arc<PerCoreMetrics> {
+        Arc::clone(&self.metrics)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn per_core_cpus(worker_count: usize) -> io::Result<Vec<usize>> {
+    let allowed = sched_getaffinity(Pid::from_raw(0)).map_err(io::Error::other)?;
+    let cpus = (0..CpuSet::count())
+        .filter_map(|cpu| allowed.is_set(cpu).ok().filter(|set| *set).map(|_| cpu))
+        .take(worker_count)
+        .collect::<Vec<_>>();
+    if cpus.len() < worker_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "per-core FUSE routing requires one allowed CPU per worker",
+        ));
+    }
+    Ok(cpus)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_worker(cpu: usize) -> io::Result<()> {
+    let mut only = CpuSet::new();
+    only.set(cpu).map_err(io::Error::other)?;
+    sched_setaffinity(Pid::from_raw(0), &only).map_err(io::Error::other)?;
+    if sched_getcpu().map_err(io::Error::other)? != cpu {
+        return Err(io::Error::other("FUSE worker migrated after CPU pinning"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn per_core_cpus(worker_count: usize) -> io::Result<Vec<usize>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("per-core FUSE routing is unsupported for {worker_count} workers on this platform"),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_worker(_cpu: usize) -> io::Result<()> {
+    unreachable!("non-Linux per-core routing is rejected before worker launch")
 }
 
 impl DispatchGate {
@@ -166,6 +430,8 @@ pub struct Session<FS: Filesystem> {
     /// never touch the same lock word on the hot path. The mount-owning session
     /// is worker 0; `run_with_workers` hands out 1..N.
     pub(crate) dispatch_worker: usize,
+    /// CPU-keyed queues used only by the explicit per-core transport mode.
+    per_core_scheduler: Option<Arc<PerCoreScheduler>>,
     /// Request FUSE-over-io_uring during the INIT handshake.
     pub(crate) io_uring_requested: bool,
     /// The kernel accepted FUSE-over-io_uring for this connection.
@@ -230,6 +496,7 @@ impl<FS: Filesystem> Session<FS> {
             dispatch_lock: None,
             dispatch_gate: None,
             dispatch_worker: 0,
+            per_core_scheduler: None,
             io_uring_requested: false,
             io_uring_negotiated: false,
             io_uring_payload_size: 0,
@@ -255,6 +522,7 @@ impl<FS: Filesystem> Session<FS> {
             dispatch_lock: None,
             dispatch_gate: None,
             dispatch_worker: 0,
+            per_core_scheduler: None,
             io_uring_requested: false,
             io_uring_negotiated: false,
             io_uring_payload_size: 0,
@@ -297,8 +565,72 @@ impl<FS: Filesystem> Session<FS> {
         }
     }
 
+    fn current_cpu(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            return sched_getcpu().unwrap_or(self.dispatch_worker);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.dispatch_worker
+        }
+    }
+
+    fn dispatch_per_core_queued(
+        &mut self,
+        scheduler: &PerCoreScheduler,
+        source_lane: usize,
+        processing_lane: usize,
+        request: QueuedRequest,
+    ) {
+        let file_handle = request.file_handle;
+        if let Some(request) = Request::new(self.ch.sender(), &request.bytes) {
+            self.dispatch_request(&request);
+        }
+        scheduler.complete(source_lane, processing_lane, file_handle);
+    }
+
+    /// Receive into the CPU-keyed queues, then dispatch a ready local request
+    /// or steal one from the busiest donor.  Queued bytes have one owner at all
+    /// times, so the same kernel request cannot be processed twice.
+    fn dispatch_next_per_core(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+        let Some(scheduler) = self.per_core_scheduler.clone() else {
+            return self.dispatch_next(buf);
+        };
+        let processing_lane = scheduler.lane_for_cpu(self.current_cpu());
+        if let Some(request) = scheduler.pop_local(processing_lane) {
+            self.dispatch_per_core_queued(&scheduler, processing_lane, processing_lane, request);
+            return Ok(true);
+        }
+        if let Some((source_lane, request)) = scheduler.steal_ready(processing_lane) {
+            self.dispatch_per_core_queued(&scheduler, source_lane, processing_lane, request);
+            return Ok(true);
+        }
+
+        match self.ch.receive(buf) {
+            Ok(size) => {
+                let bytes = buf[..size].to_vec();
+                let file_handle = Request::new(self.ch.sender(), &bytes)
+                    .and_then(|request| request.ordering_file_handle());
+                let requesting_lane = scheduler.lane_for_cpu(self.current_cpu());
+                scheduler.enqueue(requesting_lane, bytes, file_handle);
+                Ok(true)
+            }
+            Err(err) => match err.raw_os_error() {
+                Some(ENOENT | EINTR | EAGAIN) => Ok(true),
+                Some(ENODEV) => Ok(false),
+                _ => Err(err),
+            },
+        }
+    }
+
     pub(crate) fn run_classic_loop(&mut self, buf: &mut [u8]) -> io::Result<()> {
         while self.dispatch_next(buf)? {}
+        Ok(())
+    }
+
+    fn run_per_core_loop(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        while self.dispatch_next_per_core(buf)? {}
         Ok(())
     }
 
@@ -380,6 +712,76 @@ impl<FS: Filesystem> Session<FS> {
         })
     }
 
+    /// Run an explicit CPU-keyed FUSE dispatch scheduler.
+    ///
+    /// Unlike [`Self::run_with_workers`], a reader never invokes a filesystem
+    /// callback straight from `/dev/fuse`. It first transfers the owned request
+    /// bytes into the queue for the CPU that received it. Workers drain their
+    /// local lane and steal ready donor work only when local work is absent.
+    /// File-handle requests retain FIFO order through the queue's active-handle
+    /// guard; every queued byte buffer is removed exactly once before dispatch.
+    pub fn run_with_per_core_workers(
+        &mut self,
+        worker_count: usize,
+        metrics: Arc<PerCoreMetrics>,
+    ) -> io::Result<()>
+    where
+        FS: Clone + Send,
+    {
+        let mut buffer = vec![0; BUFFER_SIZE];
+        let buf = aligned_sub_buf(
+            buffer.deref_mut(),
+            std::mem::align_of::<abi::fuse_in_header>(),
+        );
+        if worker_count <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "per-core FUSE routing requires at least two workers",
+            ));
+        }
+        let cpus = per_core_cpus(worker_count)?;
+        while !self.initialized {
+            if !self.dispatch_next(buf)? {
+                return Ok(());
+            }
+        }
+
+        let scheduler = Arc::new(PerCoreScheduler::with_metrics(cpus.clone(), metrics));
+        self.per_core_scheduler = Some(scheduler);
+        self.dispatch_gate = Some(Arc::new(DispatchGate::new(worker_count)));
+        self.dispatch_worker = 0;
+        info!("FUSE CPU-keyed dispatch workers: {worker_count}");
+        thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count - 1);
+            for (index, &cpu) in cpus.iter().enumerate().skip(1) {
+                let mut worker = self.worker_clone(index);
+                workers.push(
+                    thread::Builder::new()
+                        .name(format!("fuse-per-core-{index}"))
+                        .spawn_scoped(scope, move || {
+                            pin_current_worker(cpu)?;
+                            let mut worker_buffer = vec![0; BUFFER_SIZE];
+                            let worker_buf = aligned_sub_buf(
+                                worker_buffer.deref_mut(),
+                                std::mem::align_of::<abi::fuse_in_header>(),
+                            );
+                            worker.run_per_core_loop(worker_buf)
+                        })?,
+                );
+            }
+            pin_current_worker(cpus[0])?;
+            let primary = self.run_per_core_loop(buf);
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!("FUSE per-core worker failed: {error}"),
+                    Err(_) => warn!("FUSE per-core worker panicked"),
+                }
+            }
+            primary
+        })
+    }
+
     /// A handle onto the same connection and filesystem for a dispatch worker.
     ///
     /// The clone must never run `Filesystem::destroy` from `Drop` and must never
@@ -403,6 +805,7 @@ impl<FS: Filesystem> Session<FS> {
             dispatch_lock: self.dispatch_lock.clone(),
             dispatch_gate: self.dispatch_gate.clone(),
             dispatch_worker,
+            per_core_scheduler: self.per_core_scheduler.clone(),
             io_uring_requested: self.io_uring_requested,
             io_uring_negotiated: self.io_uring_negotiated,
             io_uring_payload_size: self.io_uring_payload_size,
@@ -463,6 +866,7 @@ impl<FS: Filesystem> Session<FS> {
             dispatch_lock: self.dispatch_lock.clone(),
             dispatch_gate: self.dispatch_gate.clone(),
             dispatch_worker: self.dispatch_worker,
+            per_core_scheduler: self.per_core_scheduler.clone(),
             io_uring_requested: self.io_uring_requested,
             io_uring_negotiated: self.io_uring_negotiated,
             io_uring_payload_size: self.io_uring_payload_size,
@@ -543,6 +947,8 @@ pub struct BackgroundSession {
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
     _mount: Option<Mount>,
+    /// Real request-queue metrics when this session uses per-core routing.
+    per_core_metrics: Option<Arc<PerCoreMetrics>>,
 }
 
 impl BackgroundSession {
@@ -561,6 +967,7 @@ impl BackgroundSession {
             guard,
             sender,
             _mount: mount,
+            per_core_metrics: None,
         })
     }
 
@@ -582,7 +989,36 @@ impl BackgroundSession {
             guard,
             sender,
             _mount: mount,
+            per_core_metrics: None,
         })
+    }
+
+    /// Start a background session with CPU-keyed queues and work stealing.
+    pub fn new_with_per_core_workers<FS: Filesystem + Clone + Send + 'static>(
+        se: Session<FS>,
+        worker_count: usize,
+    ) -> io::Result<BackgroundSession> {
+        let sender = se.ch.sender();
+        let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
+        let cpus = per_core_cpus(worker_count.max(1))?;
+        let metrics = Arc::new(PerCoreMetrics::new(cpus));
+        let worker_metrics = Arc::clone(&metrics);
+        let guard = thread::spawn(move || {
+            let mut se = se;
+            se.run_with_per_core_workers(worker_count, worker_metrics)
+        });
+        Ok(BackgroundSession {
+            guard,
+            sender,
+            _mount: mount,
+            per_core_metrics: Some(metrics),
+        })
+    }
+
+    /// Metrics from the queues that served this session's requests.
+    #[must_use]
+    pub fn per_core_metrics(&self) -> Option<Arc<PerCoreMetrics>> {
+        self.per_core_metrics.as_ref().map(Arc::clone)
     }
     /// Unmount the filesystem and join the background thread.
     pub fn join(self) {
@@ -590,6 +1026,7 @@ impl BackgroundSession {
             guard,
             sender: _,
             _mount,
+            ..
         } = self;
         drop(_mount);
         guard.join().unwrap().unwrap();
@@ -611,10 +1048,66 @@ impl fmt::Debug for BackgroundSession {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
-    use super::DispatchGate;
+    use super::{DispatchGate, PerCoreScheduler};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn per_core_queue_is_keyed_by_the_requesting_cpu() {
+        let scheduler = PerCoreScheduler::new(4);
+        // CPU 5 maps to lane 1. The worker CPU is intentionally not an inode
+        // or PID: the lane is selected at receive time by sched_getcpu.
+        scheduler.enqueue(5, vec![1], None);
+        assert!(scheduler.pop_local(0).is_none());
+        let request = scheduler.pop_local(5).expect("request queued for CPU 5");
+        assert_eq!(request.bytes, vec![1]);
+        scheduler.complete(5, 5, request.file_handle);
+    }
+
+    #[test]
+    fn per_file_handle_requests_keep_enqueue_order_when_work_is_stolen() {
+        let scheduler = PerCoreScheduler::new(2);
+        scheduler.enqueue(0, vec![1], Some(77));
+        scheduler.enqueue(0, vec![2], Some(77));
+
+        let first = scheduler.pop_local(0).expect("first handle request");
+        assert_eq!(first.bytes, vec![1]);
+        // THE NEGATIVE CASE: a naive queue thief could run request 2 while
+        // request 1 is active, reversing handle-visible effects.
+        assert!(
+            scheduler.steal_ready(1).is_none(),
+            "a second request for an active file handle must not be stolen"
+        );
+        scheduler.complete(0, 0, first.file_handle);
+
+        let (source, second) = scheduler
+            .steal_ready(1)
+            .expect("second handle request becomes ready after completion");
+        assert_eq!(source, 0);
+        assert_eq!(second.bytes, vec![2]);
+        scheduler.complete(source, 1, second.file_handle);
+    }
+
+    #[test]
+    fn moved_request_cannot_be_processed_twice() {
+        let scheduler = PerCoreScheduler::new(2);
+        scheduler.enqueue(0, vec![9], None);
+
+        let (source, request) = scheduler.steal_ready(1).expect("steal queued request");
+        assert_eq!(request.bytes, vec![9]);
+        // Removing the one owned buffer is the planted exactly-once negative:
+        // a clone-before-remove implementation would expose the same request
+        // to CPU 0 as well as the thief.
+        assert!(scheduler.pop_local(0).is_none());
+        scheduler.complete(source, 1, request.file_handle);
+        assert!(scheduler.steal_ready(1).is_none());
+        let metrics = scheduler.metrics().snapshot();
+        assert_eq!(metrics.cpus, vec![0, 1]);
+        assert_eq!(metrics.requests, vec![0, 1]);
+        assert_eq!(metrics.stolen_from, vec![1, 0]);
+        assert_eq!(metrics.stolen_to, vec![0, 1]);
+    }
 
     #[test]
     fn gate_has_one_slot_per_worker_and_never_zero() {
