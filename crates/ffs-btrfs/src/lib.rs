@@ -130,6 +130,17 @@ pub const BTRFS_ITEM_FREE_SPACE_INFO: u8 = 198;
 pub const BTRFS_ITEM_FREE_SPACE_EXTENT: u8 = 199;
 pub const BTRFS_ITEM_FREE_SPACE_BITMAP: u8 = 200;
 
+/// Private tree-log item type carrying one exact FS-tree key deletion.
+///
+/// This is deliberately confined to FrankenFS's log tree rather than the FS
+/// tree: it is consumed during replay and never overlaid as a normal btrfs
+/// item. Keeping the deleted key in the payload lets one log leaf describe an
+/// unlink or rename without scanning the directory at fsync time.
+pub const BTRFS_ITEM_TREE_LOG_DELETE: u8 = u8::MAX;
+/// Objectid reserved for [`BTRFS_ITEM_TREE_LOG_DELETE`] records.
+pub const BTRFS_TREE_LOG_DELETE_OBJECTID: u64 = u64::MAX;
+const BTRFS_TREE_LOG_DELETE_KEY_BYTES: usize = 17;
+
 /// Well-known tree objectids (kernel: fs/btrfs/btrfs_tree.h).
 pub const BTRFS_EXTENT_TREE_OBJECTID: u64 = 2;
 pub const BTRFS_CHUNK_TREE_OBJECTID: u64 = 3;
@@ -11588,6 +11599,68 @@ where
 
 // ── btrfs tree-log replay ─────────────────────────────────────────────────
 
+/// Encode an exact FS-tree key removal for a FrankenFS tree log.
+///
+/// `sequence` is local to one log leaf and makes multiple tombstones distinct
+/// even when their target keys share objectid and offset. The target key is
+/// encoded explicitly rather than inferred from the record key, so replay can
+/// remove a DIR_ITEM, DIR_INDEX, or INODE_REF without rescanning a directory.
+#[must_use]
+pub fn tree_log_delete_record(sequence: u64, deleted_key: BtrfsKey) -> BtrfsLeafEntry {
+    let mut data = Vec::with_capacity(BTRFS_TREE_LOG_DELETE_KEY_BYTES);
+    data.extend_from_slice(&deleted_key.objectid.to_le_bytes());
+    data.push(deleted_key.item_type);
+    data.extend_from_slice(&deleted_key.offset.to_le_bytes());
+    BtrfsLeafEntry {
+        key: BtrfsKey {
+            objectid: BTRFS_TREE_LOG_DELETE_OBJECTID,
+            item_type: BTRFS_ITEM_TREE_LOG_DELETE,
+            offset: sequence,
+        },
+        data,
+    }
+}
+
+fn tree_log_delete_target(entry: &BtrfsLeafEntry) -> Result<Option<BtrfsKey>, ParseError> {
+    if entry.key.objectid != BTRFS_TREE_LOG_DELETE_OBJECTID
+        || entry.key.item_type != BTRFS_ITEM_TREE_LOG_DELETE
+    {
+        return Ok(None);
+    }
+    if entry.data.len() != BTRFS_TREE_LOG_DELETE_KEY_BYTES {
+        return Err(ParseError::InsufficientData {
+            needed: BTRFS_TREE_LOG_DELETE_KEY_BYTES,
+            offset: 0,
+            actual: entry.data.len(),
+        });
+    }
+    let mut objectid = [0_u8; 8];
+    objectid.copy_from_slice(&entry.data[..8]);
+    let item_type = entry.data[8];
+    let mut offset = [0_u8; 8];
+    offset.copy_from_slice(&entry.data[9..]);
+    Ok(Some(BtrfsKey {
+        objectid: u64::from_le_bytes(objectid),
+        item_type,
+        offset: u64::from_le_bytes(offset),
+    }))
+}
+
+fn split_tree_log_deletion_records(
+    entries: Vec<BtrfsLeafEntry>,
+) -> Result<(Vec<BtrfsLeafEntry>, Vec<BtrfsKey>), ParseError> {
+    let mut items = Vec::with_capacity(entries.len());
+    let mut deleted_keys = Vec::new();
+    for entry in entries {
+        if let Some(deleted_key) = tree_log_delete_target(&entry)? {
+            deleted_keys.push(deleted_key);
+        } else {
+            items.push(entry);
+        }
+    }
+    Ok((items, deleted_keys))
+}
+
 /// Result of scanning the btrfs tree-log.
 ///
 /// The tree-log is a per-subvolume journal used for efficient fsync. When
@@ -11598,6 +11671,8 @@ where
 pub struct TreeLogReplayResult {
     /// Items extracted from the tree-log, in key order.
     pub items: Vec<BtrfsLeafEntry>,
+    /// Exact FS-tree keys that replay must remove before overlaying `items`.
+    pub deleted_keys: Vec<BtrfsKey>,
     /// Number of items replayed.
     pub items_count: usize,
     /// Whether a valid tree-log was found and replayed.
@@ -11724,6 +11799,7 @@ pub fn replay_tree_log(
             );
             return Ok(TreeLogReplayResult {
                 items: Vec::new(),
+                deleted_keys: Vec::new(),
                 items_count: 0,
                 replayed: false,
                 foreign_format: true,
@@ -11746,16 +11822,19 @@ pub fn replay_tree_log(
             return Ok(TreeLogReplayResult::default());
         }
         let logged = walk_tree(read_physical, chunks, log_tree, sb.nodesize, sb.csum_type)?;
+        let items_count = logged.len();
+        let (items, deleted_keys) = split_tree_log_deletion_records(logged)?;
         tracing::info!(
             log_root = sb.log_root,
             log_tree,
             subvol_objectid,
-            items_replayed = logged.len(),
+            items_replayed = items_count,
             "btrfs tree-log replay complete (log root tree)"
         );
         return Ok(TreeLogReplayResult {
-            items_count: logged.len(),
-            items: logged,
+            items_count,
+            items,
+            deleted_keys,
             replayed: true,
             foreign_format: false,
         });
@@ -11766,9 +11845,12 @@ pub fn replay_tree_log(
         "btrfs tree-log replay complete"
     );
 
+    let items_count = items.len();
+    let (items, deleted_keys) = split_tree_log_deletion_records(items)?;
     Ok(TreeLogReplayResult {
-        items_count: items.len(),
+        items_count,
         items,
+        deleted_keys,
         replayed: true,
         foreign_format: false,
     })
@@ -20609,6 +20691,42 @@ mod tests {
         let mut dirid = [0_u8; 8];
         dirid.copy_from_slice(&item[168..176]);
         assert_eq!(u64::from_le_bytes(dirid), 0);
+    }
+
+    #[test]
+    fn tree_log_delete_records_round_trip_exact_keys_bd_uxh7t() {
+        let dir_item = BtrfsKey {
+            objectid: 256,
+            item_type: BTRFS_ITEM_DIR_ITEM,
+            offset: 0x1234,
+        };
+        let dir_index = BtrfsKey {
+            objectid: 256,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: 42,
+        };
+        let live = BtrfsLeafEntry {
+            key: BtrfsKey {
+                objectid: 257,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            },
+            data: vec![7; 160],
+        };
+
+        let (items, deleted_keys) = split_tree_log_deletion_records(vec![
+            live.clone(),
+            tree_log_delete_record(0, dir_item),
+            tree_log_delete_record(1, dir_index),
+        ])
+        .expect("well-formed deletion records");
+
+        assert_eq!(items, vec![live], "tombstones must not enter the FS overlay");
+        assert_eq!(
+            deleted_keys,
+            vec![dir_item, dir_index],
+            "replay must receive the exact DIR_ITEM and DIR_INDEX keys"
+        );
     }
 
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
