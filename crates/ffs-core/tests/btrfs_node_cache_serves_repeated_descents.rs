@@ -370,10 +370,114 @@ fn readdir_stat_descent_cost_decomposes_by_operation_bd_2s8zy() {
          floor-leaf memo stopped absorbing it, and bd-2s8zy's mounted attribution would \
          now apply in-process too."
     );
+    // REGRESSION GUARD on the floor-memo sizing (bd-2s8zy). With
+    // BTRFS_FLOOR_MEMO_SLOTS = 4 this sweep cost 2.525 node lookups per entry; at
+    // 16 it costs 0.861. The threshold sits between the two, so shrinking the memo
+    // back below the working set fails here instead of quietly restoring ~3x the
+    // descent work.
+    let per_entry = full_stat as f64 / entries as f64;
+    assert!(
+        per_entry < 1.5,
+        "a full stat now costs {per_entry:.3} node lookups per entry ({full_stat} for \
+         {entries}); it was 0.861 at BTRFS_FLOOR_MEMO_SLOTS = 16 and 2.525 at 4. The \
+         floor-leaf memo has dropped back below the sweep's working set."
+    );
     assert_eq!(
         getattr_cost, 0,
         "GETATTR now costs {getattr_cost} node lookups on top of LOOKUP; it used to be \
          free because the lookup already resolved the inode. A regression here would \
          double the descent cost of every stat."
     );
+}
+
+/// DOES ACCESS ORDER REPRODUCE THE MOUNTED STORM? (bd-2s8zy, bd-79li3,
+/// bd-btrfs-readdir-stat-8x-8y7vp)
+///
+/// The decomposition above says the capability probe is ~2% of LOOKUP in-process,
+/// while the mount measures it at ~15x. The obvious difference in my harness is
+/// ACCESS ORDER: in-process I probe each inode immediately after looking it up,
+/// which is perfect locality for a 4-slot floor-leaf memo
+/// (`BTRFS_FLOOR_MEMO_SLOTS = 4`, round-robin victim). The banked row is
+/// `readdir-stat-8t` — EIGHT client threads, each walking its own slice of one
+/// directory, so eight independent descent streams compete for four slots and
+/// bd-79li3 already measured that a miss REPLACES the memo on every descent.
+///
+/// This drives the same total work in two orders on the same image:
+///   SEQUENTIAL  — one stream, entry 0,1,2,...  (what the earlier arms measured)
+///   INTERLEAVED — eight streams round-robined, which is the ORDER eight
+///                 concurrent client threads present to a shared memo, without
+///                 needing threads to reproduce it.
+///
+/// Single-threaded on purpose: the question is whether ORDER alone accounts for
+/// the gap. If it does, the mechanism is memo capacity against stream count and
+/// the fix is a policy on slots, not a new constant. If it does not, order is
+/// exonerated and the cost is elsewhere in the FUSE layer.
+#[test]
+fn interleaved_stat_order_costs_more_descents_than_sequential_bd_2s8zy() {
+    let tmp = tempfile::TempDir::new().expect("temporary directory");
+    let entries = 6_000;
+    let streams = 8;
+    let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-order.btrfs") else {
+        eprintln!("btrfs-progs unavailable; skipping bd-2s8zy access-order probe");
+        return;
+    };
+    let cx = Cx::for_testing();
+    let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
+
+    // Eight contiguous slices, round-robined: exactly the sequence eight threads
+    // each scanning their own slice present to one shared memo.
+    let mut interleaved: Vec<usize> = Vec::with_capacity(entries);
+    let slice = entries.div_ceil(streams);
+    for offset in 0..slice {
+        for stream in 0..streams {
+            let index = stream * slice + offset;
+            if index < entries {
+                interleaved.push(index);
+            }
+        }
+    }
+    assert_eq!(interleaved.len(), entries, "the interleaving must cover every entry");
+
+    let sweep = |order: &[usize]| -> u64 {
+        let device = ffs_block::FileByteDevice::open(&image).expect("open image");
+        let fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+            .expect("open btrfs read-only");
+        let (l0, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        for &index in order {
+            if let Ok(attr) = fs.lookup(&cx, BTRFS_ROOT_DIR, OsStr::new(&names[index])) {
+                let _ = fs.getattr(&cx, attr.ino);
+                let _ = FsOps::getxattr(fs_ref(&fs), &cx, attr.ino, SECURITY_CAPABILITY);
+            }
+        }
+        let (l1, _, _) = ffs_core::btrfs_node_cache_counters_full();
+        l1 - l0
+    };
+
+    let sequential_order: Vec<usize> = (0..entries).collect();
+    let sequential = sweep(&sequential_order);
+    let interleaved_cost = sweep(&interleaved);
+
+    eprintln!(
+        "bd-2s8zy order entries={entries} streams={streams}: sequential={sequential} \
+         interleaved={interleaved_cost} ratio={:.3}",
+        interleaved_cost as f64 / sequential as f64
+    );
+
+    assert!(sequential > 0, "the sequential sweep performed no node lookups");
+    // No assertion on the DIRECTION beyond a sanity bound: this test exists to
+    // publish the ratio, and pinning a direction I have not yet explained is how
+    // a premise gets frozen before it is understood (the mistake the arm above
+    // corrects). The bound catches only a pathological blowup, which would be a
+    // regression in anyone's reading.
+    assert!(
+        interleaved_cost < sequential * 50,
+        "interleaved access cost {interleaved_cost} node lookups against {sequential} \
+         sequential — a >50x blowup from ORDER alone on one thread is a defect, not a \
+         locality effect"
+    );
+}
+
+/// `FsOps::getxattr` takes `&self`; this keeps the call site readable above.
+fn fs_ref(fs: &OpenFs) -> &OpenFs {
+    fs
 }

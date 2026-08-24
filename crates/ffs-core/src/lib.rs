@@ -2280,12 +2280,38 @@ struct BtrfsFloorLeafMemo {
 /// through this memo, and a full descent is root PLUS leaf, so each avoidable boundary
 /// miss is two device reads rather than one.
 ///
-/// Four is chosen to cover the alternation, not to be a cache: the sweep's working set
-/// at any instant is the leaf under the cursor plus its neighbour, doubled by the two
-/// key streams. Larger would start to duplicate `btrfs_parsed_node_cache`, which already
-/// bounds parsed nodes at `BTRFS_TREE_NODE_CACHE_LIMIT`, and would widen the window in
-/// which a retained leaf is stale-but-unused memory on a mount that never sweeps.
-const BTRFS_FLOOR_MEMO_SLOTS: usize = 4;
+/// THE POLICY, and it is a policy rather than a number (bd-2s8zy asked for exactly
+/// that, so the same bead is not refiled at the next directory size): the memo must
+/// hold at least one leaf PER CONCURRENT DESCENT STREAM, doubled for the two key
+/// streams each sweep alternates between. The banked worst row is `readdir-stat-8t`
+/// — EIGHT client threads each walking its own slice of one directory — so eight
+/// streams x two key streams is the working set the shipping configuration
+/// actually presents. Four was sized for ONE stream's alternation and is provably
+/// below that.
+///
+/// MEASURED, counted, in-process, no mount
+/// (`btrfs_node_cache_serves_repeated_descents.rs`, 6,000 entries, node lookups):
+///
+///                     4 slots     16 slots
+///   sequential          15151         5167    2.93x fewer
+///   8-way interleaved   23875        15377    1.55x fewer
+///
+/// The sequential arm is the honest headline because it is the arm with no
+/// contention at all: even ONE stream was thrashing four slots. The interleaved
+/// arm is the order eight client threads present to a shared memo, and it improves
+/// too, which is the point — the old size was below the working set in BOTH orders.
+///
+/// NOT A WALL-CLOCK CLAIM. These are node LOOKUPS, most of which hit
+/// `btrfs_parsed_node_cache` and are cheap; a 2.93x cut in lookups is not a 2.93x
+/// cut in time and must not be quoted as one. What it does establish is that the
+/// descent work is real and was being redone.
+///
+/// The upper bound is still the concern the original four was protecting: a
+/// retained leaf is memory a mount that never sweeps does not use, and enough of
+/// them would duplicate `btrfs_parsed_node_cache` (bounded by
+/// `BTRFS_TREE_NODE_CACHE_LIMIT`). Sixteen covers the 8-thread rows with headroom
+/// while staying two orders below that bound.
+const BTRFS_FLOOR_MEMO_SLOTS: usize = 16;
 
 /// Does this retained leaf answer `target` on `root_logical`?
 ///
@@ -59409,14 +59435,22 @@ mod tests {
 
         // Full and no match: the caller must evict, which is signalled by None
         // rather than decided here.
-        // Written out rather than generated: if BTRFS_FLOOR_MEMO_SLOTS ever changes
-        // this stops compiling, which is the right way to find out.
-        let full: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] = [
-            Some((root, key(10))),
-            Some((root, key(11))),
-            Some((root, key(12))),
-            Some((root, key(13))),
-        ];
+        //
+        // GENERATED from BTRFS_FLOOR_MEMO_SLOTS rather than written out. It used to
+        // be four literals, with a note that changing the constant "stops
+        // compiling, which is the right way to find out" — but what it actually
+        // found out was a type error in an unrelated resize (bd-2s8zy took the
+        // memo from 4 slots to 16), telling the reader nothing about the property
+        // under test. The property is "full, and no slot matches", which holds at
+        // any size; keying the fixture to the constant tests it at whatever the
+        // constant is.
+        let full: [Option<(u64, ffs_ondisk::btrfs::BtrfsKey)>; BTRFS_FLOOR_MEMO_SLOTS] =
+            std::array::from_fn(|slot| {
+                Some((
+                    root,
+                    key(10_u64.saturating_add(u64::try_from(slot).unwrap_or(0))),
+                ))
+            });
         assert_eq!(
             btrfs_floor_memo_reuse_slot(&full, root, &key(999)),
             None,
