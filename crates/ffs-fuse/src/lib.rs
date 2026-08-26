@@ -4360,6 +4360,34 @@ impl WriteSyncMode {
 /// Bounded queue capacity for the ioctl trace writer.  Sized so a busy
 /// dispatcher can buffer ~4k callbacks before backpressure forces drops; in
 /// practice the trace is only enabled by harness tests with low ioctl volume.
+/// Whether entry invalidations are issued at all (`FFS_FUSE_ENTRY_INVAL`).
+///
+/// DEFAULT ON — this is the shipping behaviour and the knob exists to MEASURE
+/// what it costs, not to make it optional.
+///
+/// `c6a7a9697` (bd-yu6jz) added a `FUSE_NOTIFY_INVAL_ENTRY` to every namespace
+/// mutation so a create after a failed lookup is visible without waiting out
+/// `ATTR_TTL`. A 2,000-create + 2,000-delete storm therefore issues ~4,000
+/// notifications that the 2026-08-08 banked storm row never paid, and that row's
+/// re-measurement now sits above its banked figure (bd-avg6f). Whether those two
+/// facts are connected is a MEASUREMENT, and it cannot be taken without a way to
+/// turn the notifications off in one ELF.
+///
+/// Reported on the mount knob line for the reason bd-087wt exists: a lever that
+/// the daemon does not self-report is unattestable, and the comparator's
+/// knob-divergence proof reads exactly that line. `FFS_FUSE_RECEIVE_SPIN_ADAPTIVE`
+/// is currently in that unattestable state; this knob is not repeating it.
+#[must_use]
+pub fn entry_invalidation_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FFS_FUSE_ENTRY_INVAL").map_or(true, |raw| {
+            let raw = raw.trim();
+            !(raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off"))
+        })
+    })
+}
+
 /// One FUSE reverse notification, queued for the thread that owns the notifier.
 #[derive(Debug)]
 enum KernelNotification {
