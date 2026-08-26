@@ -171,6 +171,19 @@ impl FrankenFuse {
         notifier.entry(parent, name);
     }
 
+    /// A successful create-like operation only needs to evict a negative dentry
+    /// when this mount previously installed that exact negative lookup reply.
+    fn notify_created_entry_invalidation(&self, parent: u64, name: &OsStr) {
+        self.inner.invalidate_readdirplus_entries();
+        let Some(notifier) = self.kernel_notifier() else {
+            return;
+        };
+        if !crate::entry_invalidation_enabled() || !notifier.take_negative_entry(parent, name) {
+            return;
+        }
+        notifier.entry(parent, name);
+    }
+
     /// Drop a cached inode's attributes after a successful mutation.
     ///
     /// Positive entry and attribute TTLs are valid only while the metadata is
