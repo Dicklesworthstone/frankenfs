@@ -159,9 +159,28 @@ impl FrankenFuse {
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
+        // bd-avg6f: default ON. Off only to MEASURE what bd-yu6jz's per-mutation
+        // notification costs; the readdirplus hand-off above is dropped either
+        // way, so the knob isolates the KERNEL notification and nothing else.
+        if !crate::entry_invalidation_enabled() {
+            return;
+        }
         // Queued, never issued here: this runs inside the request handler, and
         // the caller's syscall still holds the parent directory's inode lock
         // that `fuse_reverse_inval_entry` needs (bd-7s0p7).
+        notifier.entry(parent, name);
+    }
+
+    /// A successful create-like operation only needs to evict a negative dentry
+    /// when this mount previously installed that exact negative lookup reply.
+    fn notify_created_entry_invalidation(&self, parent: u64, name: &OsStr) {
+        self.inner.invalidate_readdirplus_entries();
+        let Some(notifier) = self.kernel_notifier() else {
+            return;
+        };
+        if !crate::entry_invalidation_enabled() || !notifier.take_negative_entry(parent, name) {
+            return;
+        }
         notifier.entry(parent, name);
     }
 

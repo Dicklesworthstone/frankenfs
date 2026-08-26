@@ -28,7 +28,7 @@ use fuser::{
     TimeOrNow, consts as fuse_consts, fuse_forget_one,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::raw::c_int;
@@ -4360,11 +4360,44 @@ impl WriteSyncMode {
 /// Bounded queue capacity for the ioctl trace writer.  Sized so a busy
 /// dispatcher can buffer ~4k callbacks before backpressure forces drops; in
 /// practice the trace is only enabled by harness tests with low ioctl volume.
+/// Whether entry invalidations are issued at all (`FFS_FUSE_ENTRY_INVAL`).
+///
+/// DEFAULT ON — this is the shipping behaviour and the knob exists to MEASURE
+/// what it costs, not to make it optional.
+///
+/// `c6a7a9697` (bd-yu6jz) added a `FUSE_NOTIFY_INVAL_ENTRY` to every namespace
+/// mutation so a create after a failed lookup is visible without waiting out
+/// `ATTR_TTL`. A 2,000-create + 2,000-delete storm therefore issues ~4,000
+/// notifications that the 2026-08-08 banked storm row never paid, and that row's
+/// re-measurement now sits above its banked figure (bd-avg6f). Whether those two
+/// facts are connected is a MEASUREMENT, and it cannot be taken without a way to
+/// turn the notifications off in one ELF.
+///
+/// Reported on the mount knob line for the reason bd-087wt exists: a lever that
+/// the daemon does not self-report is unattestable, and the comparator's
+/// knob-divergence proof reads exactly that line. `FFS_FUSE_RECEIVE_SPIN_ADAPTIVE`
+/// is currently in that unattestable state; this knob is not repeating it.
+#[must_use]
+pub fn entry_invalidation_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FFS_FUSE_ENTRY_INVAL").map_or(true, |raw| {
+            let raw = raw.trim();
+            !(raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off"))
+        })
+    })
+}
+
 /// One FUSE reverse notification, queued for the thread that owns the notifier.
 #[derive(Debug)]
 enum KernelNotification {
-    Entry { parent: u64, name: std::ffi::OsString },
-    Inode { ino: u64 },
+    Entry {
+        parent: u64,
+        name: std::ffi::OsString,
+    },
+    Inode {
+        ino: u64,
+    },
 }
 
 /// Handle to the thread that issues FUSE reverse notifications (bd-7s0p7).
@@ -4396,9 +4429,74 @@ enum KernelNotification {
 /// one. Messages are a `u64` plus a short `OsString` and the notifier thread
 /// does one syscall per message, so the queue only grows while that thread is
 /// briefly behind. Liveness and correctness both point the same way here.
+const MAX_NEGATIVE_DENTRY_HINTS_PER_PARENT: usize = 32;
+const MAX_NEGATIVE_DENTRY_HINT_PARENTS: usize = 1024;
+
+/// Bounded record of cacheable negative lookup replies. Once accounting fills,
+/// callers retain the existing always-invalidate behaviour.
+#[derive(Debug, Default)]
+struct NegativeDentryHints {
+    parents: BTreeMap<u64, NegativeDentryParentHints>,
+    all_parents_overflowed: bool,
+}
+
+#[derive(Debug, Default)]
+struct NegativeDentryParentHints {
+    names: BTreeSet<OsString>,
+    overflowed: bool,
+}
+
+impl NegativeDentryHints {
+    fn remember(&mut self, parent: u64, name: &OsStr) {
+        if self.all_parents_overflowed {
+            return;
+        }
+        if !self.parents.contains_key(&parent) {
+            if self.parents.len() == MAX_NEGATIVE_DENTRY_HINT_PARENTS {
+                self.all_parents_overflowed = true;
+                return;
+            }
+            self.parents
+                .insert(parent, NegativeDentryParentHints::default());
+        }
+        let hints = self
+            .parents
+            .get_mut(&parent)
+            .expect("parent hint was inserted above");
+        if hints.overflowed {
+            return;
+        }
+        if hints.names.len() == MAX_NEGATIVE_DENTRY_HINTS_PER_PARENT {
+            hints.names.clear();
+            hints.overflowed = true;
+            return;
+        }
+        hints.names.insert(name.to_owned());
+    }
+
+    fn take(&mut self, parent: u64, name: &OsStr) -> bool {
+        if self.all_parents_overflowed {
+            return true;
+        }
+        let (invalidate, remove_parent) = match self.parents.get_mut(&parent) {
+            Some(hints) if hints.overflowed => (true, false),
+            Some(hints) => {
+                let invalidate = hints.names.remove(name);
+                (invalidate, hints.names.is_empty())
+            }
+            None => return false,
+        };
+        if remove_parent {
+            self.parents.remove(&parent);
+        }
+        invalidate
+    }
+}
+
 #[derive(Debug, Clone)]
 struct KernelNotifyQueue {
     sender: std::sync::mpsc::Sender<KernelNotification>,
+    negative_entries: Arc<Mutex<NegativeDentryHints>>,
 }
 
 impl KernelNotifyQueue {
@@ -4433,7 +4531,34 @@ impl KernelNotifyQueue {
         {
             warn!(error = %error, "FUSE notification thread failed to spawn;                 kernel cache entries will expire by TTL instead");
         }
-        Self { sender }
+        Self {
+            sender,
+            negative_entries: Arc::new(Mutex::new(NegativeDentryHints::default())),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> (Self, std::sync::mpsc::Receiver<KernelNotification>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (
+            Self {
+                sender,
+                negative_entries: Arc::new(Mutex::new(NegativeDentryHints::default())),
+            },
+            receiver,
+        )
+    }
+
+    fn remember_negative_entry(&self, parent: u64, name: &OsStr) {
+        if let Ok(mut hints) = self.negative_entries.lock() {
+            hints.remember(parent, name);
+        }
+    }
+
+    fn take_negative_entry(&self, parent: u64, name: &OsStr) -> bool {
+        self.negative_entries
+            .lock()
+            .map_or(true, |mut hints| hints.take(parent, name))
     }
 
     fn entry(&self, parent: u64, name: &std::ffi::OsStr) {
@@ -5662,7 +5787,7 @@ impl Filesystem for FrankenFuse {
         }) {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
-                self.notify_entry_invalidation(parent, name);
+                self.notify_created_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
             }
             Err(e) => {
@@ -5883,7 +6008,7 @@ impl Filesystem for FrankenFuse {
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
-                self.notify_entry_invalidation(parent, name);
+                self.notify_created_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
@@ -5914,7 +6039,7 @@ impl Filesystem for FrankenFuse {
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
-                self.notify_entry_invalidation(parent, name);
+                self.notify_created_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
@@ -6060,7 +6185,7 @@ impl Filesystem for FrankenFuse {
         }) {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
-                self.notify_entry_invalidation(newparent, newname);
+                self.notify_created_entry_invalidation(newparent, newname);
                 self.notify_inode_invalidation(newparent);
                 self.notify_inode_invalidation(ino);
             }
@@ -6530,7 +6655,7 @@ impl Filesystem for FrankenFuse {
         }) {
             Ok(attr) => {
                 reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
-                self.notify_entry_invalidation(parent, name);
+                self.notify_created_entry_invalidation(parent, name);
                 self.notify_inode_invalidation(parent);
             }
             Err(e) => {
@@ -6569,7 +6694,14 @@ impl FrankenFuse {
             self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
         }) {
             Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
-            Err(FfsError::NotFound(_)) => Self::reply_negative_entry(reply),
+            Err(FfsError::NotFound(_)) => {
+                if crate::entry_invalidation_enabled()
+                    && let Some(notifier) = self.kernel_notifier()
+                {
+                    notifier.remember_negative_entry(parent, name);
+                }
+                Self::reply_negative_entry(reply);
+            }
             Err(e) => {
                 Self::reply_error_entry(
                     &FuseErrorContext {
@@ -9294,6 +9426,56 @@ mod tests {
             NEGATIVE_ENTRY_TTL.as_secs(),
             "fuser must carry the same short TTL in the paired attr field"
         );
+    }
+
+    #[test]
+    fn create_invalidates_only_the_exact_cached_negative_dentry_bd_6xwql() {
+        let fuse = writable_fuse();
+        let (notifier, receiver) = KernelNotifyQueue::for_test();
+        *fuse
+            .inner
+            .kernel_notifier
+            .lock()
+            .expect("test notifier lock must not be poisoned") = Some(notifier);
+
+        let parent = 17;
+        let missed = OsStr::new("created-after-miss");
+        fuse.lookup_impl(
+            parent,
+            missed,
+            <ReplyEntry as fuser::Reply>::new(0x61, RecordingSender::default()),
+        );
+
+        // A naive per-parent cache would evict this name too, paying the old
+        // notification tax for a create the kernel never looked up.
+        fuse.notify_created_entry_invalidation(parent, OsStr::new("unseen-name"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        fuse.notify_created_entry_invalidation(parent, missed);
+        match receiver
+            .try_recv()
+            .expect("cached negative must be invalidated")
+        {
+            KernelNotification::Entry {
+                parent: notified_parent,
+                name,
+            } => {
+                assert_eq!(notified_parent, parent);
+                assert_eq!(name, missed);
+            }
+            KernelNotification::Inode { .. } => panic!("expected an entry invalidation"),
+        }
+
+        // The hint is consumed: a second create of the same name cannot retain
+        // an obsolete negative entry after the first invalidation.
+        fuse.notify_created_entry_invalidation(parent, missed);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
