@@ -3358,6 +3358,27 @@ fn mount_fuse(
         .collect::<Vec<_>>()
         .join(",");
     let candidate_env = config.arm_env(arm).to_vec();
+    // bd-jlkk8: FUSE-over-io_uring refuses to mount with EINVAL unless auto_unmount
+    // is enabled. Measured as a clean 2x2 on one ELF with every other flag matched
+    // to what this function spawns:
+    //   uring=0 auto_unmount=1 READY   uring=0 auto_unmount=0 READY
+    //   uring=1 auto_unmount=1 READY   uring=1 auto_unmount=0 EINVAL
+    // and it is auto_unmount specifically, not the allow_other it pulls in
+    // (uring=1, auto_unmount=0, allow_other=1 still fails).
+    //
+    // This function otherwise pins FFS_AUTO_UNMOUNT=0 because the harness unmounts
+    // its own arms, and that `.env` call sits AFTER the candidate_env loop below,
+    // so it silently overrode any --candidate-b-env attempt to turn it back on.
+    // The result was 16/16 runs failing at "wait for fuse_candidate_b_a FUSE mount"
+    // with the daemon cheerfully reporting io_uring=true: the request reached it,
+    // the mount could never succeed.
+    //
+    // Only io_uring arms are affected; every classic arm keeps auto_unmount=0 and
+    // is byte-identical to before, so no banked row changes meaning.
+    let wants_io_uring = candidate_env.iter().any(|(key, value)| {
+        key == "FFS_FUSE_IO_URING" && ffs_fuse::io_uring_config::enabled_from_value(Some(value))
+    });
+    let auto_unmount = if wants_io_uring { "1" } else { "0" };
     let mut command = Command::new("taskset");
     command
         .args(["-c", &cpu_list])
@@ -3377,7 +3398,7 @@ fn mount_fuse(
         .arg("--no-background-scrub")
         .arg(daemon_image)
         .arg(mountpoint)
-        .env("FFS_AUTO_UNMOUNT", "0")
+        .env("FFS_AUTO_UNMOUNT", auto_unmount)
         .env("FFS_MOUNT_BENCH_EVIDENCE", "1")
         .env("RUST_LOG", "off")
         .stdout(Stdio::from(stdout))
