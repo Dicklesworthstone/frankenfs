@@ -49,6 +49,9 @@ impl AsFd for Channel {
 /// core for the life of the mount.
 pub const MAX_RECEIVE_SPIN: u32 = 100_000;
 
+/// Ceiling on `FFS_FUSE_SPIN_PAUSE`. See [`Channel::spin_pause`].
+pub const MAX_SPIN_PAUSE: u32 = 4_096;
+
 impl Channel {
     /// Create a new communication channel to the kernel driver by mounting the
     /// given path. The kernel driver will delegate filesystem operations of
@@ -87,6 +90,30 @@ impl Channel {
                 std::env::var("FFS_FUSE_RECEIVE_SPIN_ADAPTIVE").ok().as_deref(),
             )
         })
+    }
+
+    /// Pause iterations between polls in the receive spin (`FFS_FUSE_SPIN_PAUSE`).
+    ///
+    /// DEFAULT 0 — byte-identical to the loop before this existed, so an unset
+    /// environment cannot change a banked number and one ELF supplies both arms
+    /// of the A/B.
+    ///
+    /// Clamped to `MAX_SPIN_PAUSE` for the same reason `MAX_RECEIVE_SPIN` is
+    /// clamped: an unbounded value turns a latency optimisation into a core the
+    /// daemon never gives back.
+    fn spin_pause() -> u32 {
+        static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            Self::spin_pause_from_value(std::env::var("FFS_FUSE_SPIN_PAUSE").ok().as_deref())
+        })
+    }
+
+    /// Pure half of [`Self::spin_pause`], testable without touching the environment.
+    #[must_use]
+    pub fn spin_pause_from_value(raw: Option<&str>) -> u32 {
+        raw.and_then(|r| r.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(MAX_SPIN_PAUSE)
     }
 
     /// Pure half, so the parsing is testable without mutating process-global
@@ -197,6 +224,24 @@ impl Channel {
                     // report the real condition. Spinning is an optimisation and
                     // must never be the thing that surfaces an error.
                     break;
+                }
+                // Pause BETWEEN polls rather than polling every iteration.
+                //
+                // Counted on the live daemon (bpftrace on raw_syscalls:sys_enter,
+                // 120,000 stats): this loop issued 7.074 polls per crossing, which
+                // was 77.5% of every syscall the daemon made — against 1.025 reads
+                // and 1.025 writevs. And a syscall is exactly what the whole-op
+                // profile blamed for the worst row: 21.84% of daemon CPU in
+                // entry/exit plus 13.98% in AUDIT on the daemon's own syscalls,
+                // 35.8% before any FUSE work happens.
+                //
+                // So the spin was paying a full audited syscall to ask a question
+                // whose answer changes on a sub-microsecond timescale. Pausing
+                // between polls covers the same wall time with far fewer of them.
+                // Default 0 keeps today's behaviour byte-for-byte so one ELF can
+                // supply both A/B arms.
+                for _ in 0..Self::spin_pause() {
+                    std::hint::spin_loop();
                 }
                 std::hint::spin_loop();
             }
