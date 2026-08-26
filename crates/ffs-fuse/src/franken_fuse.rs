@@ -127,6 +127,9 @@ impl FrankenFuse {
     }
 
     fn install_kernel_notifier(&self, notifier: fuser::Notifier) {
+        // bd-7s0p7: the notifier is handed to a dedicated thread rather than
+        // stored for the dispatch thread to use. See `KernelNotifyQueue`.
+        let queue = KernelNotifyQueue::spawn(notifier);
         let mut guard = match self.inner.kernel_notifier.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -134,10 +137,10 @@ impl FrankenFuse {
                 poisoned.into_inner()
             }
         };
-        *guard = Some(notifier);
+        *guard = Some(queue);
     }
 
-    fn kernel_notifier(&self) -> Option<fuser::Notifier> {
+    fn kernel_notifier(&self) -> Option<KernelNotifyQueue> {
         match self.inner.kernel_notifier.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => {
@@ -156,14 +159,10 @@ impl FrankenFuse {
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
-        if let Err(error) = notifier.inval_entry(parent, name) {
-            debug!(
-                parent,
-                name = ?name,
-                error = %error,
-                "FUSE kernel entry invalidation failed"
-            );
-        }
+        // Queued, never issued here: this runs inside the request handler, and
+        // the caller's syscall still holds the parent directory's inode lock
+        // that `fuse_reverse_inval_entry` needs (bd-7s0p7).
+        notifier.entry(parent, name);
     }
 
     /// Drop a cached inode's attributes after a successful mutation.
@@ -182,9 +181,10 @@ impl FrankenFuse {
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
-        if let Err(error) = notifier.inval_inode(ino, 0, 0) {
-            debug!(ino, error = %error, "FUSE kernel inode invalidation failed");
-        }
+        // Queued for the same reason as the entry case (bd-7s0p7): this is a
+        // request-handler context, and `fuse_reverse_inval_inode` takes a lock
+        // the caller has not released yet.
+        notifier.inode(ino);
     }
 
     /// Execute the internal ioctl dispatcher without a live kernel mount.

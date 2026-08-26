@@ -3798,7 +3798,7 @@ struct FuseInner {
     /// costs on the per-path-op capability probe, not to make it optional.
     count_memoized_requests: bool,
     mountpoint: Option<PathBuf>,
-    kernel_notifier: Mutex<Option<fuser::Notifier>>,
+    kernel_notifier: Mutex<Option<KernelNotifyQueue>>,
     ioctl_trace: Option<IoctlTraceProbe>,
     backpressure: Option<Arc<BackpressureGate>>,
     access_predictor: AccessPredictor,
@@ -4360,6 +4360,94 @@ impl WriteSyncMode {
 /// Bounded queue capacity for the ioctl trace writer.  Sized so a busy
 /// dispatcher can buffer ~4k callbacks before backpressure forces drops; in
 /// practice the trace is only enabled by harness tests with low ioctl volume.
+/// One FUSE reverse notification, queued for the thread that owns the notifier.
+#[derive(Debug)]
+enum KernelNotification {
+    Entry { parent: u64, name: std::ffi::OsString },
+    Inode { ino: u64 },
+}
+
+/// Handle to the thread that issues FUSE reverse notifications (bd-7s0p7).
+///
+/// # Why these cannot be issued from the dispatch thread
+///
+/// `fuse_reverse_inval_entry` takes the PARENT directory's inode lock, and the
+/// caller's syscall still holds it: replying to the FUSE request unblocks the
+/// REQUEST, not the `mkdir`/`create`/`unlink` that issued it. A notification
+/// sent from the dispatch thread therefore blocks in `D` state until a lock
+/// that only the caller can release, and the caller is not going to release it
+/// until the daemon serves its next request. With the shipping serial
+/// dispatcher there is exactly one thread that could do that, so the mount
+/// deadlocks on its FIRST mutating operation — measured 4/4 on `mkdir`, on a
+/// root-level `create`, and on two comparator runs, with the daemon parked at
+/// `fuse_reverse_inval_entry+0x45/0x230`.
+///
+/// `26d122a6c` closed this for `unlink`/`rmdir` by deleting the call; `c6a7a9697`
+/// reintroduced it across all seven namespace handlers on the theory that issuing
+/// it AFTER the reply is safe. It is not, for the reason above. Moving the send
+/// off the dispatch thread fixes the CLASS rather than the seven instances, and
+/// keeps the invalidation that `bd-yu6jz` added.
+///
+/// # Why the queue is unbounded
+///
+/// A bounded queue would have to either block the dispatch thread when full —
+/// reintroducing a stall on this exact path — or drop notifications, which
+/// leaves the kernel holding a stale dentry, a WRONG ANSWER rather than a slow
+/// one. Messages are a `u64` plus a short `OsString` and the notifier thread
+/// does one syscall per message, so the queue only grows while that thread is
+/// briefly behind. Liveness and correctness both point the same way here.
+#[derive(Debug, Clone)]
+struct KernelNotifyQueue {
+    sender: std::sync::mpsc::Sender<KernelNotification>,
+}
+
+impl KernelNotifyQueue {
+    /// Take ownership of `notifier` on a dedicated thread and return a handle.
+    ///
+    /// A failure to spawn is logged and degrades to "no kernel notifications"
+    /// rather than failing the mount: the receiver drops, every later `send`
+    /// fails, and the filesystem stays correct because entry/attr TTLs still
+    /// expire. A mount must not fail because a cache-eviction helper did.
+    fn spawn(notifier: fuser::Notifier) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<KernelNotification>();
+        if let Err(error) = std::thread::Builder::new()
+            .name("ffs-fuse-notify".to_owned())
+            .spawn(move || {
+                for message in receiver {
+                    match message {
+                        KernelNotification::Entry { parent, name } => {
+                            if let Err(error) = notifier.inval_entry(parent, &name) {
+                                debug!(parent, name = ?name, error = %error,
+                                    "FUSE kernel entry invalidation failed");
+                            }
+                        }
+                        KernelNotification::Inode { ino } => {
+                            if let Err(error) = notifier.inval_inode(ino, 0, 0) {
+                                debug!(ino, error = %error,
+                                    "FUSE kernel inode invalidation failed");
+                            }
+                        }
+                    }
+                }
+            })
+        {
+            warn!(error = %error, "FUSE notification thread failed to spawn;                 kernel cache entries will expire by TTL instead");
+        }
+        Self { sender }
+    }
+
+    fn entry(&self, parent: u64, name: &std::ffi::OsStr) {
+        let _ = self.sender.send(KernelNotification::Entry {
+            parent,
+            name: name.to_owned(),
+        });
+    }
+
+    fn inode(&self, ino: u64) {
+        let _ = self.sender.send(KernelNotification::Inode { ino });
+    }
+}
+
 const IOCTL_TRACE_CHANNEL_CAPACITY: usize = 4096;
 
 #[derive(Debug)]
