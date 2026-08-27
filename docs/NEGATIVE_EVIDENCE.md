@@ -13167,3 +13167,130 @@ Reproduce:
       FA_CPUS=18 FB_CPUS=19 bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
     python3 scripts/perf/create_delete_storm_ab/sanalyze.py $WORK/stormdio-io1.csv
     # the per-phase device columns are cr_/f1_/de_/f2_ {ios,sec,fl} in the CSV
+
+## 2026-08-27 — REJECTED, my own lever from one commit ago: the 8-vs-3 write fragmentation is NOT a coalescer failure, it is the second cost of having no journal, and the coalescable part is worth <1% of the row
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/create_delete_storm_ab/storm_trace.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18, loop device `--direct-io=on` (`dio=1`).
+
+One commit ago the per-phase device census counted **8 write I/Os per directory fsync
+against kernel ext4's 3**, for the same ~1160 sectors and the same 2 FLUSH barriers, and I
+named two candidate attacks: "issue the run writes as ONE vectored write per flush" and
+"order the runs so adjacent metadata coalesces". **Both are now refuted by reading where
+the writes actually go.**
+
+### 2026-08-27 — where our seven writes go, traced
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.999481` bootstrap median CI `[0.981414, 1.009510]` (candidate, fsync phase),
+both from 20000 resamples over 32 paired per-round ratios on this same rig and ELF.
+`RCH_WORKER=none`, `hostname=thinkstation1`.
+
+Counted mechanism: 7 `pwrite64` calls and 2 `fdatasync` calls per directory fsync, traced
+on the live daemon, totalling 593,920 bytes = 1160 sectors — agreeing exactly with the
+independently counted 1160 sectors and 2 FLUSH requests from `/sys/block/<dev>/stat`.
+
+`strace -f -e trace=pwrite64,fdatasync` on the LIVE daemon across a full 2,000-file storm
+batch. `RCH_WORKER=none`, `hostname=thinkstation1`. The same-invocation A/A null controls
+for this rig and ELF are the previous entry's: kernel `0.999663` bootstrap median CI
+`[0.986268, 1.011319]`, candidate on the fsync phases `0.999481` and `1.008302`, 20000
+resamples. Per directory fsync, every batch, byte-identical between rounds:
+
+    block      0   len   4096   =   1 block    superblock
+    block      1   len   4096   =   1 block    group descriptors
+    block     70   len   4096   =   1 block    block bitmap
+    block     73   len   4096   =   1 block    inode bitmap
+    block   2121   len 512000   = 125 blocks   inode table, 2121..2245, ONE request
+    block   8304   len  16384   =   4 blocks   directory, 8304..8307
+    block   8310   len  49152   =  12 blocks   directory, 8310..8321
+    -----------------------------------------------------------------
+    total 593,920 bytes = 1160 sectors   <- EXACTLY the census figure
+
+and the ordering is **5 writes → `fdatasync` → 2 writes (group descriptors, superblock) →
+`fdatasync`**: two correctly-ordered barrier rounds, which is why our FLUSH count is `2`
+and matches the kernel's `2` exactly.
+
+⚠ Seven `pwrite64`s are observed where the block layer counted **8** device write I/Os; the
+one-request discrepancy is not attributed (most likely the 512,000-byte request being split
+against a queue limit) and is recorded rather than explained away.
+
+### 2026-08-27 — why both of my candidate attacks are dead
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.999481` bootstrap median CI `[0.981414, 1.009510]` (candidate, fsync phase),
+both from 20000 resamples over 32 paired per-round ratios on this same rig and ELF.
+`RCH_WORKER=none`, `hostname=thinkstation1`.
+
+Counted mechanism: 7 `pwrite64` calls and 2 `fdatasync` calls per directory fsync, traced
+on the live daemon, totalling 593,920 bytes = 1160 sectors — agreeing exactly with the
+independently counted 1160 sectors and 2 FLUSH requests from `/sys/block/<dev>/stat`.
+
+**"One vectored write per flush" — impossible.** The seven regions are at seven different
+offsets. `pwritev` scatters *buffers* into one contiguous file range; there is no POSIX
+call that scatters to multiple offsets. The idea was wrong on its face.
+
+**"The coalescer is producing too many runs" — REFUTED by counting.** The coalescer is
+already emitting maximal runs: one of the seven writes is **125 contiguous blocks in a
+single 512,000-byte request**, and the two directory writes are 4 and 12 contiguous blocks.
+The seven regions are genuinely disjoint. There is no coalescing failure to fix.
+
+⭐ **The real reason the kernel needs only 3: it writes metadata into the contiguous
+JOURNAL.** jbd2 emits descriptor + metadata + commit as a couple of large sequential
+writes; **we write metadata IN PLACE, and in-place ext4 metadata is scattered by
+construction** — superblock at block 0, group descriptors at 1, bitmaps at 70 and 73, inode
+table at 2121, directory at 8304. ⇒ **the `8`-vs-`3` request count is a SECOND, distinct
+cost of having no journal.** bd-4zjkz identified the durability-class consequence (half the
+barriers, half the bytes); this is the write-PATTERN consequence that falls out of the same
+fact, and it is the first time it has been counted.
+
+### 2026-08-27 — what is actually coalescable, and why it is not worth taking
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.999481` bootstrap median CI `[0.981414, 1.009510]` (candidate, fsync phase),
+both from 20000 resamples over 32 paired per-round ratios on this same rig and ELF.
+`RCH_WORKER=none`, `hostname=thinkstation1`.
+
+Counted mechanism: 7 `pwrite64` calls and 2 `fdatasync` calls per directory fsync, traced
+on the live daemon, totalling 593,920 bytes = 1160 sectors — agreeing exactly with the
+independently counted 1160 sectors and 2 FLUSH requests from `/sys/block/<dev>/stat`.
+
+Exactly two gaps in the whole set, both **2 blocks**: 71-72 between the two bitmaps, and
+8308-8309 between the two directory extents. A gap-tolerant coalescer with a ≥2-block
+threshold would take the first round from 5 writes to 3, i.e. **7 → 5 per fsync, −29%
+requests**.
+
+Sized honestly. Seven writes cost about `9.1 ms` of the `27.2 ms` fsync phase (the phase is
+`27.2 ms`, of which two device FLUSHes are ~`18.1 ms` at the `9.07 ms`/flush the ext4
+barrier census measured), so ~`1.3 ms` per request regardless of size. Two fewer requests ≈
+`2.6 ms` of a `27.2 ms` phase = **`9.6%` of that phase**, and the two fsync phases are
+`9.5%` of the batch ⇒ **≈`0.9%` of the storm.**
+
+⛔ **REJECTED.** It costs a read-modify-write correctness surface — writing the intervening
+CLEAN blocks requires their current contents, so the flush path would have to source blocks
+it did not modify, and a stale source there silently corrupts a block another writer owns —
+for under `1%` of the row. **The fragmentation is structural, not sloppy, and the only
+sloppy part is not worth its risk.**
+
+### What this leaves
+
+The storm's directory-fsync loss (`1.3698x`/`1.4494x`) is now fully attributed: equal
+barriers, marginally fewer sectors, and **4 extra device requests that exist because our
+metadata is scattered and the kernel's is journalled**. The only lever class that closes it
+is a journal — which is exactly the change bd-4zjkz says must never be made silently, and
+which would move us into the incumbent's durability class rather than beating it.
+`flush_to_device_after` remains implicated once, not twice: the missing `reserve()`
+(`1.137104x`, landed) stands; the fragmentation charge is **withdrawn**.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates. This entry adds no new ratio — it is a counted trace explaining a ratio banked one
+commit ago, and it RETRACTS the attack that entry proposed. What it banks is the exact
+seven-region write map, its byte total agreeing with the independently counted 1160
+sectors, the two-round barrier structure, and the sizing that rejects the lever.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> OPS=2000 TAG=t1 \
+      bash scripts/perf/create_delete_storm_ab/storm_trace.sh
