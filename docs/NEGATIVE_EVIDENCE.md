@@ -11738,3 +11738,169 @@ Reproduce:
       bash scripts/perf/bulk_durable_write_ab/run_bulk.sh
     python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulk-resmir.csv
     WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/bvalidate.sh fa fb k1 k2
+
+## 2026-08-27 — parallel metadata writes: FOUR levers rejected, and the serializer is `DispatchGate::exclusive()` in the vendored fuser, priced at 1.50-1.58x
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/parallel_metadata_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`
+(measurements 1-6) and
+`bench_evidence,binary_sha256=3b6e5446ef8a7094aaaf64acb63d5c0ab01a5691f7b9ea9b5e8ce1217a1d1da8`
+(the ceiling run, same tree plus the measurement knob),
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU.
+
+Fourth row dug in this sequence, and the fourth different verdict.
+
+### 2026-08-27 — the instrument, and where the row actually loses
+
+`parallel_metadata_write_batch` (`ffs_mounted_kernel_bench.rs:3935`) reproduced in C: 8
+pinned workers each `open(O_CREAT|O_EXCL)` 64 files into its OWN
+`parallel-metadata/worker-N`, then the driver fsyncs all 8 worker directories. The
+unlink that resets the tree is OUTSIDE the timed region, as in the harness. Four arms
+live SIMULTANEOUSLY in ONE rig invocation — two kernel ext4 RW loop mounts and two
+FrankenFS `--rw` mounts from one ELF — arm order rotated per round. Same-invocation
+kernel A/A null control `0.991488` bootstrap median CI `[0.952630, 1.000465]`, candidate
+A/A null control `0.984092` `[0.953930, 1.013191]`, both from 20000 resamples over the
+24 paired per-round ratios. `RCH_WORKER=none`, `hostname=thinkstation1`, single host by
+construction.
+
+| phase | kernel k1 | kernel k2 | FrankenFS | ratio |
+| --- | --- | --- | --- | --- |
+| whole batch | kernel_median_wall_ns=20199000 | kernel_median_wall_ns=20730000 | fuse_median_wall_ns=32140000 | **`1.5797x` LOSS** |
+| create | 1.689 ms | 1.766 ms | 27.637 ms | **`16.4x` LOSS** |
+| directory fsync | 18.478 ms | 18.901 ms | 4.228 ms | **`4.4449x` WIN** (`k1/ffs` `4.444850` `[4.139651, 4.670259]`) |
+
+Executing ELF, self-reported in-process by the daemon at mount:
+`mount_bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`.
+
+**The banked `1.510822x` is a NET of two large opposite effects**, and nobody had split
+it: we lose 16x on the creates and win 4.4x on the directory fsyncs. Every lever below
+was aimed at the create half, and the fsync half doubles as a per-run negative control
+because none of them touches `fsyncdir`.
+
+### 2026-08-27 — the daemon is NOT saturated, counted per thread
+
+`perf record -F 4999 -g --call-graph dwarf`: 73.70% kernel, 19.63% our ELF, 5.23% libc.
+Children-mode, `Channel::receive` **24.69%** and `ReplySender::send` **19.91%** — 44.6%
+is the `/dev/fuse` read and write — against `FrankenFuse::lookup` 1.79%,
+`ShardedMvccStore::commit` 1.04%, `read_visible` 1.00%.
+
+Per-DAEMON-THREAD CPU over a 4096-create load, which is what decides the lever class:
+
+    serial (shipping)   wall 3.433s   daemon CPU 2.970s = 0.87 cores
+                          ffs-cli          2.500s   72.8% of one core
+                          ffs-fuse-notify  0.470s   13.7% of one core
+
+    FFS_FUSE_WORKERS=4  wall 3.310s   daemon CPU 4.330s = 1.31 cores
+                          fuse-dispatch-3  1.040s / fuse-dispatch-2 1.030s
+                          fuse-dispatch-1  0.990s / ffs-cli 0.840s / notify 0.430s
+
+**The work really is spread across four dispatch threads and buys nothing**: 46% more
+daemon CPU (2.970 → 4.330 s) for 3.6% less wall. A single serial dispatcher is already
+13% idle, so this row was never dispatch-THROUGHPUT-bound.
+
+### 2026-08-27 — four levers, four rejects, each with the fsync phase as its own control
+
+| lever | whole batch | create phase | fsync phase | verdict |
+| --- | --- | --- | --- | --- |
+| `FFS_FUSE_WORKERS=2` | `0.906325` `[0.862912, 0.966634]` | 28.218 → 23.982 ms | 3.855 → 6.788 ms | **10.3% SLOWER** |
+| `FFS_FUSE_WORKERS=4` | `0.900828` `[0.814340, 0.926163]` | 23.981 → 23.703 ms | 3.791 → 6.792 ms | **11.0% SLOWER** |
+| `FFS_FUSE_WORKERS=8` | `0.832611` `[0.768377, 0.911670]` | 30.858 → 32.876 ms | 3.886 → 7.466 ms | **20.1% SLOWER** |
+| `FFS_FUSE_RECEIVE_SPIN=500` | `0.905551` `[0.873244, 0.931762]` | 27.549 → 31.694 ms | unmoved `1.021131` | **10.4% SLOWER** |
+| `FFS_FUSE_RECEIVE_SPIN=2000` | `0.904080` `[0.877637, 0.912648]` | 27.469 → 30.798 ms | unmoved `1.006535` | **10.6% SLOWER** |
+| `FFS_FUSE_RECEIVE_SPIN=20000` | `0.931376` `[0.877142, 0.987914]` | 28.231 → 31.331 ms | unmoved `1.041900` | **7.4% SLOWER** |
+| `FFS_FUSE_ENTRY_INVAL=0` | `0.977732` `[0.966127, 1.007648]` | 26.576 → 27.129 ms | unmoved `1.032960` | **NULL** |
+| `FFS_FUSE_PARENT_INVAL=0` | `1.041333` `[1.029638, 1.085746]` | 27.138 → 26.062 ms | unmoved `1.001340` | 4.1%, marginal |
+
+Every row above is a same-invocation A/A/B: the two kernel arms are live alongside both
+FrankenFS arms in each run, and their A/A null control lands at `1.001788`, `1.012506`,
+`1.001869`, `1.015836`, `0.994024`, `1.012091` and `1.006681` across the seven runs, each
+a bootstrap median with a bootstrap median CI from 20000 resamples over the 24 paired
+per-round ratios. `RCH_WORKER=none`, `hostname=thinkstation1`, one host by construction.
+Counted mechanism for the two invalidation rows: `crossings_getattr` 37,523 → 31,406 and
+37,434 → 25,800, read off the daemon's unconditional crossing counter at the kernel
+boundary, with `getxattr` request scopes 25,609 → 12,809.
+
+⭐ **The two invalidation rows are the useful pair.** `FFS_FUSE_ENTRY_INVAL=0` is a
+COUNTED WIN and a WALL NULL: `crossings_getattr` 37,523 → 31,406 (**6,117 fewer**, 0.478
+per create) and `getxattr` request scopes 25,609 → **12,809** (halved), and the batch does
+not get faster. `FFS_FUSE_PARENT_INVAL=0` removes nearly twice as many crossings —
+`crossings_getattr` 37,434 → 25,800, **11,634 fewer**, 0.909 per create — and buys 4.1%,
+which is barely outside the `1.013` candidate A/A margin. Together they price a removed
+crossing on this row at roughly **2.4 us of wall**, and say that crossing COUNT is not
+the binding constraint. The spin rows say the same from the other side: the lever that
+buys wake latency by burning CPU loses here, because the daemon is not the queue.
+
+### 2026-08-27 — the serializer, located in code and priced
+
+`vendor/fuser/src/session.rs`: `DispatchGate::exclusive()` takes a **write lock on EVERY
+worker slot**, and `operation_is_concurrency_safe` (`vendor/fuser/src/request.rs:105`)
+admits only read-shaped opcodes — `Create`, `Unlink`, `Flush`, `FSync`, `FSyncDir`,
+`Write` and `SetAttr` all fall to `_ => false`. So on a create-heavy row every mutating
+crossing is a full N-way barrier that drains every other worker. In the `WORKERS=4`
+profile, per dispatch thread, `RwLock::write_contended` is **2.55%** children and the
+`exclusive()` guard-vector collect another **2.29%**.
+
+**That is the mechanism behind the campaign's banked "shared-vs-exclusive opcode mix"
+scope rule, and it is not MVCC contention.** It also explains this session's other rows
+exactly: readdir+stat, whose every crossing is a read-only memo hit, took `FFS_FUSE_WORKERS`
+to `1.995801x`; this row, whose crossings are creates and flushes, loses 10-20%.
+
+Priced from ONE ELF behind a default-OFF **measurement-only** knob
+(`FFS_FUSE_CONCURRENT_MUTATIONS=1`, which admits Create/Unlink/Flush/FSyncDir to the
+shared path), both arms `FFS_FUSE_WORKERS=4` on CPUs 8-15, 48 rounds, forward and
+mirrored:
+
+    gated / wide   1.499448x [1.426943, 1.574908]   and   1.583175x [1.518687, 1.652584]
+    create phase   22.544 -> 11.894 ms  and  22.243 -> 11.533 ms   (1.90x, 1.93x)
+    fsync phase    0.991333             and  0.969889              (unmoved)
+
+Same-invocation A/A null controls for the two ceiling runs, each a bootstrap median
+with a bootstrap median CI from 20000 resamples: kernel `1.028046` and `1.041260`.
+`RCH_WORKER=none`, `hostname=thinkstation1`, single host by construction — every arm is a
+mount inside ONE rig invocation on this box. And
+the counted mechanism is the per-dispatch-thread profile above — `RwLock::write_contended`
+2.55% and the `exclusive()` guard-vector collect 2.29% of each worker's CPU, against a
+serial dispatcher that is already 13% idle.
+
+⚠ **The vs-kernel consequence is NOT claimable.** Those two runs measured
+`k1/w4_wide` = `1.039263` and `1.162646` — i.e. the row crossing from a loss to nominal
+parity-or-better — but their kernel A/A null controls were LOOSE (`1.028046`
+`[0.826325, 1.118619]` and `1.041260` `[0.984747, 1.163355]`; peer builds had the host at
+loadavg 22.8), so a `1.04-1.16x` result sits inside the null band. The interior A/B at
+`1.50-1.58x` is far outside it and is what this row banks.
+
+**Correctness on the ceiling run, and its limits.** e2fsck clean and exact name/size
+parity through a kernel mount (4096 files, `missing=0 extra=0 nonzero_size=0`), **10 of
+10** repetitions at `FFS_FUSE_WORKERS=8` with the gate widened. ⛔ That is SUPPORT, NOT A
+PROOF, and the knob stays default OFF: the check exercises concurrent Create/Flush/FSyncDir
+into PRIVATE directories, which is exactly the case bd-bhh0i proved safe for ext4 with the
+sharded allocator; **concurrent `Unlink` is in the widened set and is NOT exercised** (the
+rig's reset is single-threaded), and btrfs is not exercised at all. Narrowing the gate for
+real is a correctness project, not a knob flip. What this row does is tell whoever takes it
+that the prize is **1.50-1.58x on the whole batch and ~1.9x on the create phase**, measured
+rather than hoped.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELFs fail that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. The `1.5797x` whole-batch loss agrees with
+the banked `1.510822x` to 4.6%. What this banks is the phase decomposition, the counted
+crossing deltas, the per-thread CPU split, and the one-ELF interior A/Bs — all
+ISA-invariant.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_metadata_ab/mkpmeta.sh
+    gcc -O2 -o $WORK/pmeta_ab scripts/perf/parallel_metadata_ab/pmeta_ab.c -lpthread
+    gcc -O2 -o $WORK/pmeta_create_only scripts/perf/parallel_metadata_ab/pmeta_create_only.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=48 TAG=g48 FA_LABEL=w4_gated FB_LABEL=w4_wide \
+      FA_CPUS=8-15 FB_CPUS=8-15 FA_ENV="FFS_FUSE_WORKERS=4" \
+      FB_ENV="FFS_FUSE_WORKERS=4 FFS_FUSE_CONCURRENT_MUTATIONS=1" \
+      bash scripts/perf/parallel_metadata_ab/run_pmeta.sh
+    python3 scripts/perf/parallel_metadata_ab/panalyze.py $WORK/pmeta-g48.csv
+    WORK=<scratch> ELF=<ffs-cli> FENV="FFS_FUSE_WORKERS=4" bash scripts/perf/parallel_metadata_ab/pthreads.sh
+    WORK=<scratch> ELF=<ffs-cli> FENV="FFS_FUSE_WORKERS=8 FFS_FUSE_CONCURRENT_MUTATIONS=1" \
+      OPS=4096 bash scripts/perf/parallel_metadata_ab/pvalidate.sh

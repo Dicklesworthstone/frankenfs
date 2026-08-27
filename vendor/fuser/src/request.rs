@@ -100,9 +100,44 @@ fn crossing_slot(op: &ll::Operation<'_>) -> usize {
     }
 }
 
+/// MEASUREMENT-ONLY widening of the concurrency-safe opcode set
+/// (`FFS_FUSE_CONCURRENT_MUTATIONS`, default OFF).
+///
+/// `DispatchGate::exclusive()` takes a write lock on EVERY worker slot, so each
+/// non-concurrency-safe opcode is a full N-way barrier. Measured 2026-08-27 on
+/// parallel-metadata-write: `FFS_FUSE_WORKERS=4` spread the daemon's CPU evenly
+/// across four dispatch threads (24%/24%/23%/19%) and burned **46% more CPU**
+/// (2.970s -> 4.330s) for **3.6% less wall**, because create/flush/fsyncdir are
+/// all exclusive and drain every other worker.
+///
+/// This knob exists to PRICE the ceiling of narrowing that gate, from one ELF,
+/// before anyone does the correctness work to narrow it for real. It is NOT a
+/// shipping option: the gate protects every `FsOps` implementation, and the only
+/// concurrent-mutation proof this repo has (bd-bhh0i) covers ext4 create with the
+/// sharded allocator, not unlink/flush, not btrfs. Any run using it must carry an
+/// e2fsck and a content-parity gate, and its number is a CEILING, not a claim.
+fn concurrent_mutations_measurement_override() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_FUSE_CONCURRENT_MUTATIONS")
+            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+    })
+}
+
 /// Opcode classification behind [`Request::is_concurrency_safe`], split out so it
 /// can be tested per opcode without a live `/dev/fuse` channel.
 fn operation_is_concurrency_safe(operation: &ll::Operation<'_>) -> bool {
+    if concurrent_mutations_measurement_override()
+        && matches!(
+            operation,
+            ll::Operation::Create(_)
+                | ll::Operation::Unlink(_)
+                | ll::Operation::Flush(_)
+                | ll::Operation::FSyncDir(_)
+        )
+    {
+        return true;
+    }
     match operation {
         ll::Operation::Lookup(_)
         | ll::Operation::GetAttr(_)
