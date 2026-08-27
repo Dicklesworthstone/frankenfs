@@ -14418,3 +14418,114 @@ mirrored halves agree to `0.52%`.
   * ⭐ A hard `assert!` is the right pin for a durability invariant whose violating path is
     the one your trace does not reach. One bool per commit buys the branch coverage the
     rig cannot.
+
+## 2026-08-27 — ext4 readdir+stat is `5.649257x` and **95.98% of it is the Linux audit probe**: suppression is `6.405191x` and lands us `1.102674x` FASTER than kernel ext4; `FFS_FUSE_WORKERS=4` REJECTED at `1.033114x` slower
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/readdir_stat_ab/run_multi.sh` + `rdstat_ab.c`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=98fa982b00f996d55a8a0b183793493c50ca5c5732b251b40aee39541230c280`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15.
+
+Four arms live simultaneously in ONE invocation — two live kernel ext4 read-only mounts
+(the A/A null) and two FrankenFS mounts from ONE ELF — arm order rotated per round, 24
+rounds × 8 client threads, run forward and mirrored with arms **and** daemon CPUs swapped.
+
+### REJECT — `FFS_FUSE_WORKERS=4`, balanced `1.033114x` SLOWER
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `w4/serial`, whole batch | `1.038839` | `1.027420` `[1.013292, 1.050077]` | **`1.033114x` slower** |
+| `w4/serial`, stat phase | `1.046004` | `1.029180` `[1.013689, 1.059390]` | `1.037558x` slower |
+| A/A null `k1/k2` | `1.014294` `[1.000484, 1.029232]` | `1.015026` `[1.006007, 1.052987]` | `1.014660` |
+
+Counted mechanism for the reject: the two arms' crossing censuses are **identical** —
+`crossings_lookup=32576`, `crossings_getxattr=819226`, `crossings_total=853504` in both.
+The knob changes dispatch shape and **zero** crossings, and this row's cost is per-crossing.
+
+⚠ Honest margin: the A/A null is a systematic `1.5%` (same sign both runs), so the `3.3%`
+effect is only ~2.2x the null. What is decidable is the SIGN — both halves agree the knob
+is slower — and that the banked `1.923x` / `1.995801x` **does not reproduce on this row
+with this ELF**. This is the second independent failure to reproduce that figure; treat the
+readdir+stat `FFS_FUSE_WORKERS` win as withdrawn for the ext4 read-only shape.
+
+### The row's real content: 95.98% of every crossing is `security.capability`
+
+| arm | `crossings_lookup` | `crossings_getxattr` | `crossings_total` |
+| --- | --- | --- | --- |
+| base | 32,576 | **819,226** | 853,504 |
+| `FFS_FUSE_XATTR_NO_SUPPORT=1` | 32,576 | **1** | **34,279** |
+
+`819,225 / 853,504 = ` **`95.98%`** of all kernel↔daemon crossings on this row are the
+audit subsystem probing `security.capability`. Lookups are byte-identical between arms.
+
+⭐ **And the capability memo was already working — it does not matter.** `op_counts` shows
+`getxattr=32770` reaching a handler against `819,226` counted crossings: the memo absorbs
+**96%** of the *work* and the round trip is paid anyway. This is the sharpest quantification
+yet of "a memo answers a crossing that already happened."
+
+### Suppression measured vs the LIVE kernel incumbent, same invocation
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/noxattr`, whole batch | `6.382283` `[5.915820, 6.608756]` | `6.428181` `[6.315237, 6.522060]` | **`6.405191x`** |
+| `base/noxattr`, stat phase | `10.634172` `[9.744347, 10.930369]` | `10.657345` `[10.269382, 10.770435]` | **`10.645752x`** |
+| **row vs kernel, before** | `5.625436` | `5.673179` | **`5.649257x` slower** |
+| **row vs kernel, after** | `1.078909` `[1.058787, 1.160355]` | `1.126962` `[1.105651, 1.155489]` | **`1.102674x` FASTER** |
+| stat phase vs kernel, after | `1.049546` | `1.033055` | `1.041268x` slower — parity |
+| A/A null `k1/k2` | `1.037881` `[0.983892, 1.090846]` | `1.013785` `[0.999301, 1.023559]` | `1.025762` |
+
+Both A/A halves span 1. Absolutes, forward / mirrored: kernel `k1` total
+`24.306` / `23.605 ms`, base `138.840` / `133.664 ms`, suppressed `22.229` / `20.873 ms`;
+stat phase `12.368` / `11.585`, `129.990` / `124.942`, `12.553` / `11.719 ms`.
+
+⭐⭐ **This is the FIFTH read-only row the audit probe explains, and the first that goes PAST
+parity.** The four banked rows landed at `0.956`–`1.034x`; this one lands at `1.102674x`
+**faster than kernel ext4**. Once the probe is gone our readdir+stat beats the incumbent —
+so the entire `5.649257x` is an external cost, not filesystem work.
+
+⛔ **Not a shippable win.** `FFS_FUSE_XATTR_NO_SUPPORT` is a RESTRICTED mount with no xattr
+support at all. It is a diagnosis, not a default, and it is inapplicable to any row that
+uses xattrs. What it banks is the size and the location of the loss.
+
+### A rig defect found and fixed: the digest was never a parity oracle
+
+`rdstat_ab.c` folded `digest_path(absolute_path)` into its per-entry digest. Every arm has
+its own mountpoint, so **two identical kernel ext4 mounts of the same image reported
+different digests** — the field looked like a cross-arm content check and could never have
+caught an arm returning wrong metadata. Fixed to hash from the last `/`, i.e. the entry
+name. All four arms now report the identical `10247677003263444632`, which additionally
+proves the suppressed arm's `6.405191x` is **not** bought with different metadata: size,
+mode and nlink are byte-identical for all 32,576 entries.
+
+⚠ Any digest banked by this rig before this commit is meaningless as a cross-arm check.
+No published ratio depended on one.
+
+### Transferable
+
+  * ⭐⭐ **A "different" digest across arms is not automatically a correctness alarm — check
+    whether the digest can even be equal.** This one could not be, by construction. The
+    check that mattered was running it against two identical KERNEL arms.
+  * ⭐ **A memo that removes 96% of the work can be worth 0% of the wall.** Count crossings
+    and handler entries separately; their ratio is the memo's hit rate, and only the
+    crossing count predicts the time on a round-trip-bound row.
+  * ⛔ A knob that leaves the crossing census **byte-identical** cannot help a
+    per-crossing-bound row. Census first, then decide whether the row can express the lever
+    at all.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates. Every ratio is same-invocation against live kernel ext4 with its A/A null reported,
+forward and mirrored, 20000-resample bootstrap median CIs over 24 paired per-round ratios.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/readdir_stat_ab/mkfixture.sh
+    gcc -O2 -o $WORK/rdstat_ab scripts/perf/readdir_stat_ab/rdstat_ab.c -lpthread
+    ELF=<ffs-cli> ROUNDS=24 THREADS=8 CPUBASE=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_ENV="" FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" FA_LABEL=base FB_LABEL=noxattr \
+      TAG=xf1 bash scripts/perf/readdir_stat_ab/run_multi.sh
+    python3 scripts/perf/readdir_stat_ab/analyze.py <body.csv>

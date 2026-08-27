@@ -33,9 +33,18 @@ static uint64_t now_ns(void) {
 }
 
 static uint64_t digest_path(const char *p) {
-    // FNV-1a over the path bytes; stands in for the harness's digest_path.
+    // FNV-1a over the ENTRY NAME, not the absolute path.
+    //
+    // Hashing the absolute path made the digest differ between every arm by
+    // construction — each arm has its own mountpoint — so two identical kernel
+    // ext4 mounts of the same image reported different digests and the field
+    // could never have caught an arm returning wrong metadata. It looked like a
+    // cross-arm parity oracle and was not one. Hashing from the last '/' makes
+    // it one: same directory contents => same digest, whatever the mountpoint.
+    const char *leaf = strrchr(p, '/');
+    leaf = leaf ? leaf + 1 : p;
     uint64_t h = 1469598103934665603ull;
-    for (const unsigned char *c = (const unsigned char *)p; *c; c++) {
+    for (const unsigned char *c = (const unsigned char *)leaf; *c; c++) {
         h ^= *c;
         h *= 1099511628211ull;
     }
