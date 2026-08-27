@@ -15402,3 +15402,98 @@ Reproduce:
     WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
       FA_LABEL=base FB_LABEL=noParInval FB_ENV="FFS_FUSE_PARENT_INVAL=0" TAG=pi1 \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+
+## 2026-08-27 — the spin scope rule makes a PREDICTION and survives it: `FFS_FUSE_RECEIVE_SPIN=2000` is a balanced `1.181102x` LOSS on btrfs readdir+stat; and that row is `96.0%` audit crossings / `85.0%` audit dispatch, i.e. NOT btrfs-specific
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, NEW rig
+`scripts/perf/readdir_stat_btrfs_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15.
+
+One commit ago the receive-spin scope rule was stated from four rows: **client concurrency,
+not opcode mix** — one client thread wins because the daemon idles between requests, eight
+lose because every spun cycle is stolen from a ready request. btrfs readdir+stat is an
+**8-client-thread** row that had never been measured, so the rule predicts a LOSS. This is
+that test.
+
+The rig is the ext4 rig's twin — same client (`rdstat_ab.c`), same 32,768-entry directory,
+same 8 threads, fixture built THROUGH A KERNEL MOUNT so btrfs lays out its own
+`DIR_INDEX`/`DIR_ITEM` keys. Only the filesystem differs, so the two rows' censuses compare
+directly.
+
+### The prediction, and the result
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `spin/base` | `1.180448` `[1.143342, 1.194752]` | `1.181757` `[1.172742, 1.189263]` | **`1.181102x` SLOWER** |
+| A/A null `k1/k2` | `1.020836` `[1.007751, 1.056127]` ⚠ | `1.008698` `[0.987929, 1.035010]` | `1.014749` |
+| **row vs kernel btrfs** | `6.219099` | `6.591306` | **`6.402498x`** |
+
+⭐⭐ **The two mirrored halves agree to `0.11%`** — the tightest pair measured this session —
+and the `18.1%` effect is `12×` the balanced null. ⛔ Disclosed: the forward A/A half fails
+at `1.020836`; the mirrored half passes.
+
+Absolutes: kernel_median_wall_ns=22197000 and kernel_median_wall_ns=20462000 against
+fuse_median_wall_ns=136378000 / fuse_median_wall_ns=158892000 (forward) and
+fuse_median_wall_ns=133308000 / fuse_median_wall_ns=157576000 (mirrored). All CIs are
+20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+**Five rows now, and the rule has predicted the sign on the one it had not seen:**
+
+| row | client threads | spin |
+| --- | ---: | --- |
+| ext4 xattr-get-list-report | 1 | `1.414346x` WIN |
+| ext4 warm stat (banked) | 1 | `~1.241x` WIN |
+| create/delete storm | 1 | `1.146594x` WIN |
+| parallel-metadata-write (banked) | 8 | `7.4–10.6%` LOSS |
+| **btrfs readdir+stat** | **8** | **`1.181102x` LOSS — predicted** |
+
+### And the row itself is not btrfs-specific
+
+Per-opcode, in-process, one arm:
+
+| | crossings | share | dispatch | share |
+| --- | ---: | ---: | ---: | ---: |
+| `getxattr` (all of it the audit probe) | 819,226 | **96.0%** | 1,737.2 ms | **85.0%** |
+| `readdir` | 1,625 | 0.2% | 70.3 ms | 3.4% |
+| `readdirplus` | 25 | 0.0% | 23.0 ms | 1.1% |
+| `lookup` | 32,576 | 3.8% | 212.7 ms | 10.4% |
+| total | 853,504 | 100% | 2,043.7 ms | 100% |
+
+`crossings_getxattr=819226` and `crossings_total=853504` are **identical to the ext4
+readdir+stat row's** — same workload, same probes. And `op_counts` reports `getxattr=32770`
+reaching a handler against 819,226 crossings: the memo absorbs 96% of the work and the round
+trip is paid regardless, exactly as on ext4.
+
+⭐⭐ **So the btrfs excess over ext4 on this row is `13%`, not a category difference**:
+ext4 `5.649257x` against btrfs `6.402498x`, both ~96% audit crossings. A long-standing
+suspicion that readdir+stat was the "genuinely btrfs-specific" row does not survive the
+census — the row is an audit-probe row on both formats, and there is no filesystem-side
+lever on either.
+
+### Transferable
+
+  * ⭐⭐⭐ **A scope rule earns its keep by predicting a sign before the run.** This one did,
+    on a row it had never seen, with the tightest mirrored agreement of the session. A rule
+    fitted to N rows and never risked on the N+1st is a summary, not a rule.
+  * ⭐ **Build the twin rig when you want to attribute a difference to the FILESYSTEM.**
+    Same client, same directory, same thread count, one variable — that is what makes
+    "ext4 `5.649257x` vs btrfs `6.402498x`" a statement about btrfs rather than about two
+    unrelated benchmarks.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel btrfs with its A/A null reported, forward
+and mirrored.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/readdir_stat_btrfs_ab/mkfixture_btrfs.sh
+    gcc -O2 -o $WORK/rdstat_ab scripts/perf/readdir_stat_btrfs_ab/rdstat_ab.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 THREADS=8 CPUBASE=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=spin FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000" TAG=bf1 \
+      bash scripts/perf/readdir_stat_btrfs_ab/run_multi_btrfs.sh
+    python3 scripts/perf/readdir_stat_btrfs_ab/analyze.py <body.csv>
