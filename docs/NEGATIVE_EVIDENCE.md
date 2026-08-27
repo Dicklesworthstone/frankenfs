@@ -16521,3 +16521,90 @@ no-op unless the forwarder lists it.**
 
 Code verification, no measurement. The `~10.5 pp` figure it references is the counted profile
 delta banked one commit ago; nothing here revises it.
+
+## 2026-08-27 — the vectored flush, DE-RISKED before the refactor: `pwritev` beats coalesce+`pwrite` by `~1.28x` at the syscall layer, but `IOV_MAX=1024` makes a 64 MiB run 16 syscalls — and the change spans TWO traits, not one
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, new probe
+`scripts/perf/bulk_durable_write_ab/iovprobe.c`, run directly against the same O_DIRECT loop
+device the daemon uses.** `RCH_WORKER=none`, `hostname=thinkstation1`, governor/EPP
+`performance`. No FrankenFS ELF is involved — this measures the syscall layer the lever would
+sit on, deliberately, before anything is refactored.
+
+Two commits ago the coalescing copy was priced at `~10.5 pp` of daemon CPU and the
+`pwritev`-per-run replacement was named. One commit ago its lock-lifetime blocker was
+withdrawn. **This asks the question that should come before the refactor: does `pwritev`
+actually win, and what will it accept?**
+
+The probe alternates, inside each round, against one fd:
+**A** = `memcpy` 16,384 blocks into a coalesced buffer, then one `pwrite` (today's flush).
+**B** = `pwritev` over the per-block pointers, no copy (the proposal). Buffers are 4 KiB-
+aligned, exactly as `Arc<AlignedVec>` is.
+
+### ⚠ `IOV_MAX = 1024` — a 64 MiB run is 16 syscalls, not one
+
+    IOV_MAX=1024  blocks=16384 (64.0 MiB)  iovecs needed=16384
+
+The flush's largest run is 16,384 blocks. **`pwritev` cannot express it in one call**; the
+implementation must batch at `IOV_MAX` and issue 16 positioned writes. This does not kill the
+lever — see below — but "one vectored write per run" is not achievable either, and any design
+that assumes it is wrong.
+
+### It still wins: `B/A ≈ 0.78`
+
+| run | A: coalesce + `pwrite` | B: `pwritev`, no copy, 16 syscalls | B/A |
+| --- | ---: | ---: | ---: |
+| 1 | 41.646 ms | 30.806 ms | **0.7397** |
+| 2 | 41.084 ms | 31.919 ms | **0.7769** |
+| 3 | 40.662 ms | 31.704 ms | **0.7797** |
+| 4 | 39.687 ms | 32.411 ms | **0.8167** |
+| ⛔ outlier | **96.055 ms** | **129.529 ms** | 1.3485 |
+
+Four clean observations give **`B/A ≈ 0.78`, i.e. the vectored path is `~1.28x` faster** on
+the flush's copy-plus-device work, and the 15 extra syscalls cost far less than the 64 MiB
+`memcpy` saves.
+
+⛔ **The outlier is reported, not dropped.** In that round BOTH arms tripled (`40 → 96 ms` and
+`32 → 129 ms`) — a device stall landed inside the B arm. Alternating A and B *within* a round
+protects against drift but not against a stall that fits inside one arm; only the repeat count
+distinguishes them.
+
+⚠ A size sweep (1, 8, 64, 512, 1024, 4096, 16,384 blocks) gave `B/A` between `0.85` and `1.59`
+with no monotone trend — too noisy on this device to place a crossover. Direction is
+consistently `B < A` at `≥1024` blocks. **No crossover is claimed.**
+
+### ⛔ Scope correction: TWO traits, not one
+
+One commit ago I wrote the remaining work was to "add one trait method, override it on the
+real device, list it in the `Arc<D>` forwarder". Reading the layers:
+
+| layer | what a vectored write needs | impls to consider |
+| --- | --- | --- |
+| `BlockDevice` (`ffs-block/src/lib.rs:1002`) | `write_contiguous_blocks_vectored` | 3 in `ffs-block`, 3 in `ffs-core`, **+ the `Arc<D>` forwarder at :1305** |
+| `ByteDevice` (`:321`) | `write_all_vectored_at` — the block layer delegates to `write_all_at` | the real file device at `:909`, plus test doubles at `:3199`, `:3355`, `:3399` |
+
+Defaulted methods keep the impl count down, but every default is a silent no-op behind the
+`Arc<D>` forwarder, which is the trap already identified. ⭐ The real device already uses
+`nix::sys::uio::preadv` for vectored READS, so the write side is symmetric with code that
+exists — the plumbing is mechanical, but it is two traits deep and it is not a small edit.
+
+### Transferable
+
+  * ⭐⭐⭐ **Measure the syscall the refactor is FOR, before the refactor.** Twenty lines of C
+    on the real device answered "is it faster" (`1.28x`) and "what will it accept"
+    (`IOV_MAX=1024`, so 16 calls) in one run. Both answers change the design.
+  * ⭐⭐ **Alternating arms inside a round does not defend against a stall that fits inside one
+    arm.** One of five rounds inverted the result by `1.7x`; only repetition caught it.
+  * ⭐ **Estimate implementation scope by reading the layers, not the call site.** "One trait
+    method" was wrong by a whole trait.
+
+### Admissibility
+
+Syscall-layer probe, no FrankenFS ELF and no vs-incumbent ratio; it prices a lower bound on
+what the lever can return and a hard constraint on how it must be written. The `~10.5 pp`
+daemon-CPU figure it de-risks is the counted profile delta banked two commits ago.
+
+Reproduce:
+
+    gcc -O2 -o $WORK/iovprobe scripts/perf/bulk_durable_write_ab/iovprobe.c
+    DEV=$(sudo losetup --find --show --direct-io=on <image>)
+    $WORK/iovprobe $DEV 16384 16
