@@ -55,6 +55,7 @@ default = ["bhh0i_sharded_alloc"]
 bhh0i_sharded_alloc = ["ffs-core/bhh0i_sharded_alloc", "ffs-fuse/bhh0i_sharded_alloc"]
 
 [dev-dependencies]
+ffs-journal = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 

@@ -957,6 +957,7 @@ dependencies = [
  "ffs-error",
  "ffs-fuse",
  "ffs-harness",
+ "ffs-journal",
  "ffs-mvcc",
  "ffs-ondisk",
  "ffs-repair",

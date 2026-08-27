@@ -8356,22 +8356,25 @@ fn build_mount_open_options(options: &MountCmdOptions) -> OpenOptions {
     }
 }
 
-/// Refuse a writable ext4 mount that advertises JBD2 until the mounted flush
-/// path actually routes through its writer.
+/// Refuse a writable ext4 mount that advertises JBD2 until its complete
+/// durability boundary routes through JBD2.
 ///
 /// `OpenFs` has a `Jbd2Writer` attachment point, but attaching it alone is not
 /// a durability implementation: the production `fsync` path currently flushes
 /// MVCC versions directly to their home blocks and never calls
-/// `commit_transaction_journaled`. Allowing this mount to proceed would make a
-/// journalled ext4 image look durable while silently skipping descriptor and
-/// commit blocks. A no-journal ext4 image remains a valid writable mount.
+/// `commit_transaction_journaled`. In particular, an attached writer is not a
+/// signal that the mounted checkpoint's inode, allocation, group-descriptor,
+/// and superblock writes are represented in one ordered JBD2 transaction.
+/// Allowing this mount to proceed would make a journalled ext4 image look
+/// durable while silently skipping descriptor and commit blocks. A no-journal
+/// ext4 image remains a valid writable mount.
 fn require_jbd2_durability_for_mount(open_fs: &OpenFs, read_write: bool) -> Result<()> {
     let journalled_ext4 = open_fs.ext4_superblock().is_some_and(|superblock| {
         superblock.has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL)
     });
-    if read_write && journalled_ext4 && !open_fs.has_jbd2_writer() {
+    if read_write && journalled_ext4 {
         bail!(
-            "refusing writable journalled ext4 mount: the mounted fsync path has no active JBD2 durability writer"
+            "refusing writable journalled ext4 mount: the mounted fsync path does not route its complete durability checkpoint through JBD2"
         );
     }
     Ok(())
@@ -13686,7 +13689,7 @@ mod tests {
         let image = build_test_ext4_image_with_internal_journal_feature();
         with_temp_image_path(&image, |path| {
             let cx = Cx::for_testing();
-            let fs = OpenFs::open_with_options(
+            let mut fs = OpenFs::open_with_options(
                 &cx,
                 path,
                 &OpenOptions {
@@ -13699,12 +13702,33 @@ mod tests {
             assert!(fs.is_ext4());
             assert!(!fs.has_jbd2_writer());
             let error = require_jbd2_durability_for_mount(&fs, true)
-                .expect_err("rw journalled ext4 must not bypass the JBD2 durability path");
+                .expect_err("rw journalled ext4 must not bypass the unwired JBD2 durability path");
             assert!(
                 error
                     .to_string()
-                    .contains("no active JBD2 durability writer"),
+                    .contains("complete durability checkpoint through JBD2"),
                 "unexpected rejection: {error:#}"
+            );
+
+            // A naive implementation would treat an attached writer as proof that
+            // FUSE fsync journals its entire checkpoint. The mounted path still
+            // bypasses `commit_transaction_journaled`, so that must remain
+            // fail-closed until the full routing is implemented.
+            fs.attach_jbd2_writer(ffs_journal::Jbd2Writer::new(
+                ffs_journal::JournalRegion {
+                    start: ffs_types::BlockNumber(20),
+                    blocks: 4,
+                },
+                1,
+            ));
+            assert!(fs.has_jbd2_writer());
+            let attached_error = require_jbd2_durability_for_mount(&fs, true)
+                .expect_err("an attached writer alone must not permit an unwired fsync path");
+            assert!(
+                attached_error
+                    .to_string()
+                    .contains("complete durability checkpoint through JBD2"),
+                "unexpected attached-writer rejection: {attached_error:#}"
             );
             require_jbd2_durability_for_mount(&fs, false)
                 .expect("read-only journalled ext4 never writes and remains valid");
