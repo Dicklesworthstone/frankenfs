@@ -15719,3 +15719,94 @@ Reproduce:
       FB_ENV="FFS_FUSE_CREATE_INVAL=0" TAG=pd1 \
       bash scripts/perf/parallel_metadata_ab/run_pmeta_dio.sh
     python3 scripts/perf/parallel_metadata_ab/panalyze.py <body.csv>
+
+## 2026-08-27 — the audit probe priced on a MUTATING row for the first time: `2.016` probes per mutation, `29.9%` of crossings, worth a balanced `1.134295x` on parallel-metadata-write (`1.853064x` → `1.636426x`)
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/parallel_metadata_ab/run_pmeta_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15, every
+arm on its own loop device with `--direct-io=on`.
+
+Five rows have been explained by the Linux audit `security.capability` probe and its call
+site is proven, but **every one of them was read-only**. The ext4 xattr row's suppression was
+correctly REFUSED because that image has xattrs. parallel-metadata-write's image has none, so
+the gate can allow it on a `--rw` mount — and this is the first time the probe has been
+priced where the workload mutates.
+
+### The gate allowed it, and the census proves the lever ran
+
+| arm | gate verdict | `crossings_getxattr` | `crossings_total` |
+| --- | --- | ---: | ---: |
+| base | `presence=not_scanned` | 76,369 | 255,341 |
+| `FFS_FUSE_XATTR_NO_SUPPORT=1` | **`presence=proven_absent`** | **1** | **176,588 (−30.8%)** |
+
+`76,369` probes against `18,944` creates + `18,944` removals = **`2.016` probes per
+mutation**, the same `2.000`-per-op constant the storm counts. The workload issues no
+`getxattr` of its own, so every one of them is the probe.
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+36 rounds × 512 ops × 8 threads, four arms simultaneously (two live kernel ext4 RW mounts =
+the A/A null, two FrankenFS from ONE ELF), order rotated per round, forward and mirrored with
+arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/noxattr` | `1.141106` `[1.100740, 1.181066]` | `1.127524` `[1.090449, 1.152102]` | **`1.134295x`** |
+| **row vs kernel, before** | `1.824062` | `1.882527` | **`1.853064x`** |
+| **row vs kernel, after** | `1.633325` | `1.639532` | **`1.636426x`** |
+| A/A null `k1/k2` | `1.006502` `[1.000122, 1.016635]` ⚠ | `0.997063` `[0.990830, 1.007406]` **PASS** | `1.001771` |
+
+⭐ The balanced null residual is **`0.18%`** against a **`13.4%`** effect — a `76×` margin,
+the cleanest of this session. Create phase: `26.775 → 23.307 ms` forward,
+`27.079 → 22.809 ms` mirrored. Absolutes: kernel_median_wall_ns=20416000 and
+kernel_median_wall_ns=19947000 against fuse_median_wall_ns=37852000 /
+fuse_median_wall_ns=33379000 (forward) and fuse_median_wall_ns=37365000 /
+fuse_median_wall_ns=33230000 (mirrored). All CIs are 20000-resample bootstrap medians over
+the 36 paired per-round ratios.
+
+### The probe's price across six rows, now including a mutating one
+
+| row | probes | share of crossings | suppression | row before → after |
+| --- | ---: | ---: | --- | --- |
+| ext4 readdir+stat | 819,225 | 96.0% | `6.405191x` | `5.649257x` → `1.102674x` **faster than kernel** |
+| btrfs readdir+stat | 819,225 | 96.0% | not run | `6.402498x` |
+| ext4 xattr-get-list-report | 240,100 | 50.0% | **REFUSED** (image has xattrs) | `8.428754x` |
+| create/delete storm | 200,051 | 27.1% | not run | `5.279772x` |
+| **parallel-metadata-write** | **76,369** | **29.9%** | **`1.134295x`** | **`1.853064x` → `1.636426x`** |
+
+⭐⭐ **The probe is not a read-path phenomenon.** It fires on every path resolution, so a
+mutating workload pays it exactly as a stat-heavy one does — `2.016` per mutation here
+against `2.000` per op on the storm. What differs between rows is not the probe rate but how
+much *other* work each crossing competes with: at `96%` of crossings it is the row, at `30%`
+it is a `1.13x`.
+
+⛔ **Not a default, and on a `--rw` mount the caveat is sharper than on the read-only rows.**
+`proven_absent` is a fact about the image AT MOUNT; what keeps it true is that a suppressing
+mount refuses every write that could create an xattr. That is a real restriction, not a free
+win, and it is why the ext4 xattr row's identical request was refused.
+
+### Transferable
+
+  * ⭐⭐ **A knob refused on one row may be ALLOWED on another, for a reason the gate states.**
+    `presence=present` refused the xattr row; `presence=proven_absent` allowed this one. Read
+    the gate's verdict per row instead of generalising the first refusal.
+  * ⭐ **Price an external cost on both sides of the read/write split before calling it a
+    read-path problem.** Two probes per mutation is the same constant as two per stat.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=36 OPS=512 THREADS=8 CPUBASE=8 \
+      FA_CPUS=18 FB_CPUS=19 FA_LABEL=base FB_LABEL=noxattr \
+      FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=px1 \
+      bash scripts/perf/parallel_metadata_ab/run_pmeta_dio.sh
+    python3 scripts/perf/parallel_metadata_ab/panalyze.py <body.csv>
