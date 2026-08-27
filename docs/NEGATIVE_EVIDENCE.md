@@ -15810,3 +15810,101 @@ Reproduce:
       FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=px1 \
       bash scripts/perf/parallel_metadata_ab/run_pmeta_dio.sh
     python3 scripts/perf/parallel_metadata_ab/panalyze.py <body.csv>
+
+## 2026-08-27 — btrfs readdir+stat reaches KERNEL PARITY under audit suppression (`6.464769x` → `1.023564x`, lever `6.227045x`, BOTH A/A halves passing) — and that bounds the genuinely btrfs-specific residual at `7.7` points
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/readdir_stat_btrfs_ab/run_multi_btrfs.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15.
+
+The audit probe has been suppressed on five ext4 rows and priced on a mutating one, but
+never on btrfs. btrfs readdir+stat was measured at `6.402498x` with `96.0%` of its crossings
+being the probe; the question that leaves open is whether the *remainder* is btrfs-specific.
+
+### The gate allowed it, and the census is identical to the ext4 twin's
+
+| arm | gate verdict | `crossings_getxattr` | `crossings_total` |
+| --- | --- | ---: | ---: |
+| base | `presence=not_scanned` | 819,226 | 853,504 |
+| `FFS_FUSE_XATTR_NO_SUPPORT=1` | **`presence=proven_absent`** | **1** | **34,279 (−96.0%)** |
+
+Byte-identical to the ext4 readdir+stat row's census — same client, same 32,768 entries, same
+8 threads, only the filesystem differs.
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+24 rounds × 8 client threads, four arms simultaneously (two live kernel btrfs read-only
+mounts = the A/A null, two FrankenFS from ONE ELF), order rotated per round, forward and
+mirrored with arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/noxattr` | `6.260710` `[5.933917, 6.564695]` | `6.193561` `[5.472731, 6.479228]` | **`6.227045x`** |
+| **row vs kernel btrfs, before** | `6.592132` | `6.339868` | **`6.464769x`** |
+| **row vs kernel btrfs, after** | `1.028150` | `1.018999` | **`1.023564x` — PARITY** |
+| A/A null `k1/k2` | `1.009588` `[0.991044, 1.020634]` **PASS** | `1.004194` `[0.981453, 1.024549]` **PASS** | `1.006887` |
+
+⭐ **Both A/A halves pass** — the first fully clean null pair of the session. Absolutes:
+kernel_median_wall_ns=20453000 and kernel_median_wall_ns=21439000 against
+fuse_median_wall_ns=133356000 / fuse_median_wall_ns=22073000 (forward) and
+fuse_median_wall_ns=135010000 / fuse_median_wall_ns=23007000 (mirrored). All CIs are
+20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+### 2026-08-27 — what this bounds: the btrfs-specific residual is `7.7` points, not a category
+
+After the shared external cost is removed, the two formats' rows can finally be compared for
+what WE do:
+
+| row | before suppression | after suppression |
+| --- | --- | --- |
+| ext4 readdir+stat | `5.649257x` slower | **`1.102674x` FASTER than kernel ext4** |
+| btrfs readdir+stat | `6.464769x` slower | **`1.023564x` slower than kernel btrfs** |
+
+Our ext4 readdir+stat **beats** its incumbent; our btrfs one is `2.4%` behind its own. The
+difference between the two positions is **`7.7` points of ratio** — that, and not the `13%`
+the unsuppressed rows showed, is the genuinely btrfs-specific part of this row. A row that
+has carried "btrfs is the bad one" for a long time turns out to be a shared audit cost plus a
+small single-digit residual.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by the
+daemon at mount:
+`mount_bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`.
+Same-invocation A/A null control `1.009588` bootstrap median CI `[0.991044, 1.020634]` and
+same-invocation A/A null control `1.004194` bootstrap median CI `[0.981453, 1.024549]`, both
+from 20000 resamples over the 24 paired per-round ratios. Absolutes:
+kernel_median_wall_ns=20453000 and kernel_median_wall_ns=21439000 against
+fuse_median_wall_ns=133356000 and fuse_median_wall_ns=22073000. Counted mechanism:
+`crossings_getxattr` **819,226 → 1** and `crossings_total` **853,504 → 34,279**, read off the
+daemon's own counters.
+
+⛔ **Not a default.** `proven_absent` is a fact about the image at mount, and a suppressing
+mount is a RESTRICTED mount with no xattr support at all. Sixth row to reach parity this way,
+first on btrfs; it is a diagnosis, not a shipping option.
+
+### Transferable
+
+  * ⭐⭐ **Subtract the shared external cost before attributing a difference to a
+    filesystem.** Unsuppressed, ext4 and btrfs readdir+stat looked `13%` apart and the
+    conclusion "btrfs is worse" was available. Suppressed, one row beats its incumbent and
+    the other trails its own by `2.4%` — a completely different statement, from the same two
+    runs plus one knob.
+  * ⭐ **A twin rig plus a shared-cost knob is a subtraction instrument.** Neither alone
+    could isolate the residual.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel btrfs with its A/A null reported, forward
+and mirrored, both halves passing.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/readdir_stat_btrfs_ab/mkfixture_btrfs.sh
+    gcc -O2 -o $WORK/rdstat_ab scripts/perf/readdir_stat_btrfs_ab/rdstat_ab.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 THREADS=8 CPUBASE=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=noxattr FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=bx1 \
+      bash scripts/perf/readdir_stat_btrfs_ab/run_multi_btrfs.sh
+    python3 scripts/perf/readdir_stat_btrfs_ab/analyze.py <body.csv>
