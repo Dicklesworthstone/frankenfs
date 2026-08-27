@@ -17671,3 +17671,63 @@ estimator, at a FIXED round count — `min` is an extreme order statistic, so fi
 only at equal N, and `mean of 4 lowest` is the safer form where a bootstrap CI is wanted. The tail
 burden is now its own target and is the larger remaining question on this row. Nothing shipped,
 nothing reverted: no candidate change in these runs.
+
+## 2026-08-27 — bd-4iqg6: REJECT "give the daemon more cores" on parallel-read — 4 physical cores vs 1 is a balanced NULL (`0.999385x` floor, `1.016863x` tail burden) with the worker count PROVEN to scale, which also clears the 8:1 CPU handicap objection against every parallel-read row I have published
+
+The previous entry left the tail burden as the larger remaining loss on this row (FrankenFS `1.2404`
+vs kernel `1.0735`, a `1.1555x` excess that is ours). The obvious mechanism for a heavy tail under 8
+concurrent readers is queueing, and the obvious cause of queueing is that my rig pins the FrankenFS
+daemon to ONE core with `taskset -c 18` while the kernel arm's filesystem work runs in the clients'
+own context across all 8 client cores. That is an 8:1 CPU handicap against us, so it had to be
+tested before any other tail hypothesis — and before the row's published numbers could be trusted.
+
+**Instrument.** `scripts/perf/parallel_read_ab/run_pread.sh`, ext4, ONE invocation per run: two
+kernel ext4 ro loop mounts (`k1`, `k2` — the A/A null and the live incumbent) plus two FrankenFS ro
+mounts from the SAME ELF, **both now on loop+`--direct-io=on`** per the previous entry's rule, so
+transport is symmetric across all four arms and the only difference between the FrankenFS arms is
+the daemon cpuset. 24 rounds x 8 client threads on cpus 8..15. Host is a 32-core Threadripper PRO
+5975WX, 2 threads/core; clients hold 8..15 (siblings 40..47 idle), so the daemon cpusets below use
+distinct physical cores with no SMT overlap with the clients or with each other.
+`binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
+`hostname=thinkstation1`, rch worker NONE, `bootstrap_resamples=20000`.
+
+| run | `cpu1` arm | `cpu4` arm |
+|---|---|---|
+| `w1` forward | cpu 18 | cpus 20,21,22,23 |
+| `w2` mirrored | cpu 20 | cpus 18,19,22,23 |
+
+**THE KNOB REACHED THE CODE — proven, not assumed.** `MountOptions::resolved_thread_count()` maps
+`worker_threads == 0` (the default, and what both arms self-report as
+`fuse_dispatch_workers=0`) to `min(available_parallelism(), 8)`, and `available_parallelism()`
+honours the affinity mask. Measured directly on a fresh mount of the same ELF:
+`taskset -c 18` -> **4 daemon threads**, `taskset -c 20,21,22,23` -> **7 daemon threads**. The
+cpuset really did scale the dispatch pool; this is a null with the lever demonstrably running, not a
+null from a knob that was silently ignored.
+
+| run | `cpu1` floor | `cpu4` floor | `cpu1` tail | `cpu4` tail | kernel tail (mean) | A/A null `k1/k2` |
+|---|---|---|---|---|---|---|
+| `w1` | 5.660 ms | 5.525 ms | `1.5044` | `1.4022` | `1.1371` | `1.022090 [0.969563, 1.064907]` PASS |
+| `w2` | 5.195 ms | 5.328 ms | `1.2038` | `1.2491` | `1.0966` | `1.008581 [0.987367, 1.045345]` PASS |
+
+**REJECT.** Each direction on its own looks like a small effect and they point OPPOSITE WAYS:
+forward `cpu1/cpu4 = 1.024428` (4 cores 2.4% faster), mirrored `0.974955` (4 cores 2.6% SLOWER).
+Balanced: **`0.999385x` on the floor** (`1.026553x` on the mean-of-4-lowest form, inside that
+estimator's own spread) and **`1.016863x` on the tail burden**. Four times the cores and nearly
+twice the dispatch threads buy nothing on this row. The 2–3% seen in either direction is core
+placement and cancels on the geomean — the same trap as the write-row A/B, and a single-direction
+run here would have published a 2.4% "win" that does not exist.
+
+**What this clears, which is the more valuable half.** Because widening the cpuset is a null, the
+one-core daemon pinning used in every parallel-read row I have published was NOT handicapping
+FrankenFS. The `1.303819x` loss and the `1.2404` tail burden from the previous entry **stand as
+measured**, and the standing objection "your daemon only had one core against the kernel's eight" is
+answered with a balanced null rather than an argument.
+
+**Where the tail actually points.** Our excess tail over the kernel in the same window, across four
+arm-instances: `1.3230`, `1.2332` (`w1`), `1.0978`, `1.1390` (`w2`), against `1.1555` in the five
+baseline runs. It is largest in the busiest window — `w1`'s kernel arms themselves ran a `1.1371`
+tail burden against `1.0735` at baseline — so the tail is **window-sensitive and amplifies more for
+us than for the kernel**, while being flatly insensitive to daemon CPU. That rules out daemon
+compute starvation and points at contention for something shared (memory bandwidth, the loop device,
+or the kernel FUSE transport itself). That is the next question on this row; it is not answered
+here. Nothing shipped, nothing reverted: no candidate change in these runs, only a placement.
