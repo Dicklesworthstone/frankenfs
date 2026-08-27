@@ -17362,3 +17362,81 @@ Hand rig, not `ffs-mounted-kernel-bench`. The `0.944517` A/A is a same-invocatio
 null and is the only ratio claimed here. `k1/ffsA = 7.106774` is reported **as an artifact to
 be rejected**, not as a result, and no vs-incumbent figure from the no-journal fixture is
 banked.
+
+## 2026-08-27 — bd-3tqec: the btrfs storm re-measured against today's write-path flip (`1.075948x`, row `3.723449x → 3.505012x`) — and I REJECT my own parallel-metadata half, which compared ext4 against btrfs and would have published a `1.4161x` that is not the flip
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/create_delete_storm_ab/run_storm_btrfs_dio.sh` and
+`scripts/perf/parallel_metadata_ab/run_pmeta_btrfs_dio.sh`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), every arm on its own loop
+device with `--direct-io=on`.
+
+bd-3tqec asks for the btrfs create/delete storm and parallel metadata writes to be
+re-measured because both predate the write-path work that flipped the fsync row. That work is
+`FFS_BTRFS_COMMIT_FST_EARLY` (default ON, shipped today), which deferred the pre-superblock
+barrier and took the btrfs fsync row from `1.513698x` to parity. Both arms come from ONE ELF
+with the knob toggled, so the comparison prices exactly the shipped change.
+
+### The storm: the flip generalises off the fsync row
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `preflip/shipped` | `1.063054` `[1.004509, 1.083026]` | `1.088999` `[1.038377, 1.141466]` | **`1.075948x`** |
+| **row vs kernel btrfs, pre-flip** | `3.580174` | `3.872457` | **`3.723449x`** |
+| **row vs kernel btrfs, shipped** | `3.422360` | `3.589659` | **`3.505012x`** |
+| A/A null `k1/k2` | `1.034240` `[0.959965, 1.100396]` **PASS** | `0.964213` `[0.916929, 0.992748]` ⛔ **FAIL** | `0.998613` |
+
+Both arms self-report the knob (`btrfs_commit_fst_early=true` / `false`, and swapped in the
+mirror). The phase split shows the mechanism: fsync1 `28.031` vs `35.135 ms` and fsync2
+`23.793` vs `35.109 ms` forward — the deferred barrier, doing on the storm's fsyncs what it
+did on the fsync row. ⚠ Disclosed: the mirrored A/A half fails by `3.6%`; the balanced
+residual is `0.14%` against a `7.6%` effect, and the two halves agree in sign.
+
+⇒ **A change measured and shipped on the fsync row is worth `1.075948x` on the storm too.**
+That is what bd-3tqec was asking: the banked storm figure predates it and is superseded.
+
+### ⛔ REJECTED — my own parallel-metadata run, for comparing the wrong two things
+
+I ran `run_pmeta_btrfs_dio.sh` with `FA_ENV=""` / `FB_ENV="FFS_BTRFS_COMMIT_FST_EARLY=0"` and
+got `ffsA/ffsB = 0.706186` `[0.699934, 0.715251]` on total and `0.668437` on the fsync phase —
+a clean, tight, `1.4161x` "flip win" with a passing btrfs A/A null. **It is not the flip.**
+
+Two defects, both mine:
+
+  * **That rig's env hook is `FE_ENV`/`FB_ENV`, not `FA_ENV`.** My `FA_ENV` was silently
+    ignored, so the "shipped" arm inherited nothing.
+  * **Its two FUSE arms are different FILESYSTEMS.** `pimg-fa.ext4` and `pimgb-fb.btrfs` —
+    it is the six-arm both-formats rig. `ffsA` is FrankenFS-on-ext4 and `ffsB` is
+    FrankenFS-on-btrfs. The `1.4161x` is an **ext4-vs-btrfs** difference wearing a flip's
+    label.
+
+The tell was there and I nearly missed it: **`grep 'btrfs_commit_fst_early=' ` on that run
+printed NOTHING** — not two differing values, nothing at all, because the rig's logs are named
+differently. An absent knob line is not a passing knob line. The mirror then returned
+`ffsA/ffsB = 0.999421`, which is ext4 and btrfs coincidentally tying, and would have read as
+"the flip does not reproduce".
+
+⇒ **No parallel-metadata figure is claimed.** The rig cannot express this A/B at all: pricing
+a btrfs-only knob needs two btrfs FUSE arms, and that rig has one.
+
+### Transferable
+
+  * ⭐⭐⭐ **An ABSENT knob line is a louder failure than a mismatched one, and it is easier to
+    miss.** I have checked "do the two arms differ?" all session; this time the answer was "the
+    question did not even parse" and the run still produced a beautiful CI.
+  * ⭐⭐ **Check what a rig's arms ARE, not just what you named them.** `FA_LABEL=shipped` was
+    accepted and ignored; the arm stayed `ffsA`, which was a different filesystem. A label the
+    rig does not use is a lie you wrote yourself.
+  * ⭐ **A tight CI is not evidence of a valid comparison.** `[0.699934, 0.715251]` on n=36 is
+    as clean as anything banked today, and it measures the wrong thing.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`. The storm ratios are same-invocation against live
+kernel btrfs with both A/A halves reported (one fails, disclosed), forward and mirrored, both
+arms self-reporting the knob. The parallel-metadata run is reported only as a rejected
+measurement; nothing from it is banked.
