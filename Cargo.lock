@@ -969,6 +969,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
