@@ -17510,3 +17510,79 @@ Reproduce:
       FA_CPUS=18 FB_CPUS=19 FA_LABEL=shipped FB_LABEL=preflip \
       FB_ENV="FFS_BTRFS_COMMIT_FST_EARLY=0" TAG=q4 \
       bash scripts/perf/parallel_metadata_ab/run_pmeta_btrfs2_dio.sh
+
+## 2026-08-27 — bd-4iqg6: the parallel-read row's "loop-transport asymmetry" prime suspect is REFUTED — geomean `1.004731x` over three runs, and the real cause is a `1.625x` run-to-run instability in the FUSE arms that the kernel arms do not have
+
+`bd-4iqg6` says the banked PARALLEL-READ figures do not reproduce on either ELF and names
+**loop-transport asymmetry** as the prime suspect: that the banked run put the FUSE arm on a
+transport the kernel arm did not get. That is a testable claim, so I tested it directly rather than
+re-litigating the banked report (which no longer survives on disk anyway).
+
+**Instrument.** `scripts/perf/parallel_read_ab/run_pread.sh`, ext4, ONE invocation per run carrying
+four LIVE mounts: two kernel ext4 ro loop mounts (`k1`, `k2` — the A/A null, the real incumbent in
+the same window) and two FrankenFS ro mounts from the SAME ELF, arm order rotated per round,
+24 rounds x 8 client threads pinned to cpus 8..15. The two FrankenFS arms differ in **exactly one
+thing, the transport**: `loopdio` = `FA_LOOP=1`, image behind a loop device with
+`losetup --direct-io=on`; `rawfile` = `FB_LOOP=0`, daemon opens the image file directly (buffered).
+No env knobs on either arm (`FA_ENV=""`, `FB_ENV=""`), so this is a pure transport A/B. The rig
+prints `(loop transport: <img> -> /dev/loopN)` for exactly the arms that got one — checked to be 1
+line in every run, so the arms really did differ.
+
+**Conditions.** In-process self-report via `FFS_MOUNT_BENCH_EVIDENCE=1`,
+`binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`, one ELF driving
+both FrankenFS arms in every run. `hostname=thinkstation1`, rch worker NONE (all four mounts are
+local; nothing crossed a worker boundary). Bootstrap median CI, `bootstrap_resamples=20000`, over
+paired per-round ratios. Daemon cores 18/19 — never cpu16, which is a known-defective daemon core.
+Host loadavg `9.37 / 10.27 / 14.87` at the start of the series.
+
+`tr2` was intended as the mirror, but I moved `FA_LOOP` together with `FA_CPUS`, which kept each
+transport on its own core — so `tr2` is a **REPEAT of `tr1`, not a mirror**. `tr3` is the true
+mirror, transports swapped across cores. The accident turned out to be the most informative part of
+the series.
+
+| run | placement | `loopdio/rawfile` | 95% CI | kernel A/A `k1/k2` | A/A CI |
+|---|---|---|---|---|---|
+| `tr1` | loop@cpu18 raw@cpu19 | `1.144135` | `[1.003576, 1.211235]` | `0.998261` PASS | `[0.971317, 1.013296]` |
+| `tr2` | loop@cpu18 raw@cpu19 (repeat) | `0.738577` | inverse of `[1.247300, 1.423552]` | `0.998353` PASS | `[0.973909, 1.020924]` |
+| `tr3` | loop@cpu19 raw@cpu18 (mirror) | `1.200262` | `[0.972472, 1.292817]` | `0.995675` PASS | `[0.986268, 1.045895]` |
+
+Absolute medians, ms (total, 8 threads x 256 files x 256 KiB):
+
+| run | k1 | k2 | loopdio | rawfile | kernel `iqr_total` | FUSE `iqr_total` |
+|---|---|---|---|---|---|---|
+| `tr1` | 4.228 | 4.279 | 6.513 | 6.179 | 0.360 / 0.504 | 2.352 / 1.231 |
+| `tr2` | 4.248 | 4.309 | 5.788 | 7.801 | 0.371 / 0.286 | 1.175 / 1.359 |
+| `tr3` | 4.376 | 4.397 | 7.360 | 5.835 | 0.326 / 0.308 | 2.274 / 2.127 |
+
+**FINDING 1 — the suspect is a NULL, not an explanation.** Geomean of the three transport ratios is
+**`1.004731x`** with a **`1.625x` spread**. `tr1` and `tr3` agree (`1.144`, `1.200`) *across a core
+swap*, so the effect is not core placement; `tr2` inverts it. Across three runs the loop-vs-raw
+transport buys **nothing measurable on this row**. Even granting the most favourable single run, it
+cannot do the job the bead needs it to do: the row measures **`1.336x` / `1.367x` / `1.792x` SLOWER**
+than live kernel ext4 on the *faster* transport (`k1/rawfile` = `0.748536` / `0.731484` /
+`0.557940`) — a LOSS in all three; the banked figure is `0.894290x`, i.e. `1.118x` FASTER; bridging
+`1.367x` slower to `0.894290x` needs **`1.529x`**; transport pays at most **`1.200x`**, and on
+geomean **`1.005x`**. REFUTED — not because the effect is small with an uncertain sign, but because
+even its largest observed value falls short of what the discrepancy requires by a factor this
+instrument resolves clearly.
+
+**FINDING 2 — what the row actually has is an unstable FUSE arm.** The three runs put the two FUSE
+arms through a `1.625x` spread while the kernel A/A null spread `1.0027x` in the same three windows
+— **600x tighter**. Within-run dispersion agrees: kernel `iqr_total` is `0.29–0.50 ms` on a
+`~4.3 ms` median (7–12%), FUSE is `1.17–2.35 ms` on a `5.8–7.8 ms` median (20–30%). The instability
+is on our side of the mount, not in the window. The per-arm shifts between `tr1` and `tr2` — same
+configuration, same cores, same ELF, back to back — are `rawfile 6.179 -> 7.801 ms (+26.3%)` and
+`loopdio 6.513 -> 5.788 ms (-11.1%)`: both arms moved, in opposite directions, while both kernel
+arms held to under 2%. **This, not the transport, is why the banked figures do not reproduce**, and
+it disqualifies any single-run parallel-read figure on this instrument, the banked `0.894290x`
+included. A row whose FUSE arms swing `1.625x` between repeats can emit a `1.118x` "win" and a
+`1.792x` "loss" from one binary without either being a property of the code.
+
+**Status.** Prime suspect REFUTED; documented, not erased. The banked `0.894290x` is superseded by
+three measured LOSSES (`1.336x`, `1.367x`, `1.792x`) and must not be quoted as a win. Corroborates
+my own btrfs measurement under `bd-6kpp4` (`1.750162x` / `1.726329x` SLOWER on a fresh
+kernel-built fixture, both checksum configurations) — two formats, same direction, no overlap with
+this instrument. **The row is not measurable to better than ~1.6x until the FUSE-arm instability is
+found**, which is upstream of every parallel-read lever: no lever smaller than `1.6x` can be
+adjudicated on this row today. Nothing shipped and nothing reverted — this run carried no candidate
+change, only a suspect.
