@@ -20,6 +20,9 @@ ELF=${ELF:?set ELF to the ffs-cli under test}
 MB=${MB:-64}
 BS=${BS:-65536}
 SYNC_EVERY=${SYNC_EVERY:-16}
+# Extra daemon env, e.g. FFS_BTRFS_GROW_CHUNKS=1 (bd-a136s): the btrfs write side
+# hits ENOSPC once the first data chunk fills unless chunk growth is enabled.
+FENV=${FENV:-}
 KMNT=/home/ubuntu/instr-k
 FMNT=/home/ubuntu/instr-f
 LOOPS=""
@@ -53,7 +56,8 @@ fdev=$(sudo -n losetup --find --show "$W/bimgb-f.btrfs")
 sudo -n losetup --direct-io=on "$fdev" 2>/dev/null || true
 sudo -n chown "$(id -u)" "$fdev"
 LOOPS="$LOOPS $fdev"
-env FFS_MOUNT_BENCH_EVIDENCE=1 FFS_OP_COUNTS=1 RUST_LOG=warn \
+# shellcheck disable=SC2086
+env FFS_MOUNT_BENCH_EVIDENCE=1 FFS_OP_COUNTS=1 RUST_LOG=warn $FENV \
   taskset -c 18 "$ELF" mount --rw "$fdev" "$FMNT" >> "$W/instr-fuse.log" 2>&1 &
 fpid=$!
 for _ in $(seq 1 300); do mountpoint -q "$FMNT" && break; kill -0 "$fpid" 2>/dev/null || break; sleep 0.1; done

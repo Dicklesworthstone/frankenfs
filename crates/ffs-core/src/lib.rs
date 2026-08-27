@@ -2371,6 +2371,17 @@ const BTRFS_MAX_CHUNKS_PER_COMMIT: u32 = 8;
 /// `FFS_BTRFS_XATTR_MEMO` deliberately: those DISABLE a shipped fast path, so
 /// absent means on. This ENABLES an unproven one, so absent means off, and no
 /// value of it can turn a shipped behaviour off.
+/// Public read of `FFS_BTRFS_GROW_CHUNKS` for the daemon's knob self-report.
+///
+/// bd-cjqhh: without this the mount could not attest whether chunk growth was
+/// enabled, so a run that still hit ENOSPC was ambiguous between "the knob never
+/// reached the code" and "growth ran and declined to grow" — the exact ambiguity
+/// this campaign's knob-attestation rule exists to remove.
+#[must_use]
+pub fn btrfs_grow_chunks_from_env_public() -> bool {
+    btrfs_grow_chunks_from_env()
+}
+
 fn btrfs_grow_chunks_from_env() -> bool {
     std::env::var("FFS_BTRFS_GROW_CHUNKS").is_ok_and(|value| {
         let value = value.trim();

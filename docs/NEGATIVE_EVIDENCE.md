@@ -18532,3 +18532,56 @@ figure is at most `2.48x` and probably less. It is quotable as a bound, not as t
 
 ELF `cf456c70ebeb49b41fb1d38dc05c4f19c2313b39c3dea57eff61b28c6a5aa9ff` (HEAD + this fix, release).
 `hostname=thinkstation1`.
+
+## 2026-08-27 — bd-cjqhh / bd-a136s: chunk growth is ATTESTED ON and still does NOT relieve the btrfs data-write ENOSPC — the data block groups stay at 16 MiB in a 1024 MiB image, and the knob was UNATTESTABLE until this commit
+
+The previous entry fixed the node-overflow half of bd-cjqhh and named the remaining blocker: `write
+255: No space left on device` at offset 16,711,680, i.e. ENOSPC at ~16 MiB in a 1024 MiB image. This
+turn chased that.
+
+**The capability already exists.** `FFS_BTRFS_GROW_CHUNKS` (bd-a136s) adds chunks at commit time,
+default OFF, and is carefully guarded — it declines on a non-authoritative chunk tree or a filesystem
+it cannot describe, and every failure SKIPS growth rather than failing the commit.
+
+**First run with the knob on: still ENOSPC at block 255 — and I could not tell why.** The daemon's
+`mount_candidate_knobs` line does not carry `btrfs_grow_chunks`, so the run was AMBIGUOUS between
+"the knob never reached the code" and "growth ran and declined". That is precisely the ambiguity this
+campaign's knob-attestation rule exists to remove, and I have spent this session applying that rule to
+other people's knobs; it applied to this one too.
+
+**Fix: make it attestable.** `ffs_core::btrfs_grow_chunks_from_env_public()` and a new
+`btrfs_grow_chunks={}` field on the mount's knob self-report, alongside every other knob that is there
+for the same reason.
+
+**Re-run, now attested.** `mount_candidate_knobs,...,btrfs_grow_chunks=true` — the knob DID reach the
+code — and the workload still fails identically:
+
+| | value |
+|---|---|
+| attested knob | `btrfs_grow_chunks=true` |
+| result | `write 255: No space left on device`, offset 16,711,680 |
+| allocator report | `alloc_no_space_no_block_group needed=65536 required_flags=1 matching_groups=2 total=16777216` |
+| growth refusals logged | **none** (`growth_unavailable_for_this_filesystem` absent) |
+| kernel arm, same fixture | 1024 blocks, 67,108,864 bytes, 65 fsyncs — **completes** |
+
+`required_flags=1` is `BTRFS_BLOCK_GROUP_DATA`: **two DATA block groups totalling exactly 16 MiB, in a
+1024 MiB image, and they never grow.** Growth logged no refusal, so it is not being blocked by its own
+guards — it simply does not add DATA capacity in response to data exhaustion. The live kernel arm
+completes the same 64 MiB workload on the same fixture, so this is ours and not the fixture's.
+
+**MEASURED NEGATIVE, honestly: bd-a136s's chunk growth does NOT unblock bd-cjqhh.** I expected it to
+and it does not. The remaining gap is specifically DATA-chunk growth on data exhaustion — the write
+path fails at allocation time, while growth is a commit-time prediction, so a workload that exhausts
+data extents between commits is never rescued. I am NOT attempting that fix here: chunk placement is
+the area bd-ftev0 records as capable of putting a chunk on top of live data, and a speculative change
+there is worse than a documented blocker.
+
+**Regression.** `ffs-cli` **358 passed / 1 failed**. The failure is
+`load_metrics_report_metrics_preset_reads_bundle` — "missing field `metadata_requests`" in a metrics
+snapshot JSON — and is unrelated to this change: my diff adds a knob to an `eprintln` and a `pub`
+wrapper, and the string `metadata_requests` appears nowhere in the working-tree diff. I did NOT verify
+by reverting and rebuilding, so I record it as pre-existing-and-unrelated on that evidence rather than
+claiming it proven.
+
+ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (HEAD + this change, release).
+`hostname=thinkstation1`. Nothing else shipped, nothing reverted.
