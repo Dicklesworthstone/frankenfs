@@ -17938,3 +17938,60 @@ Nothing shipped, nothing reverted. One ELF throughout,
 `binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
 `crossings_getxattr` `6426 -> 1` counted in every run, `hostname=thinkstation1`, rch worker NONE,
 `bootstrap_resamples=20000`.
+
+## 2026-08-27 — bd-q0xnl: the latent-backend guard I said shipping needed is now WRITTEN and VERIFIED IN BOTH DIRECTIONS — it fails on a planted violation and passes clean, closing the second half of the zero-message-open blocker
+
+Two entries ago I refuted the CLIENT half of the O_DIRECT blocker on zero-message open (a measured
+`1.160389x`) and was explicit that the BACKEND half was **moot but latent, and not refuted**: nothing
+in the workspace returns `FOPEN_DIRECT_IO` from `FsOps::open`, so `direct_io_forced` is dead code and
+there was nothing to measure — but if a backend ever started forcing it, zero-message open would
+silently drop it and **no test would catch that**. I wrote that shipping needed that guard first, and
+did not add it, because `/data` was at 93% with peers holding active builds and I will not commit a
+test I cannot verify compiles. Neither condition holds now (no peer `cargo`/`rustc` in this repo,
+148 GB free), so this turn writes it. No timing is involved, which also makes it the right work while
+the host is spiking — three separate windows this session were voided for load.
+
+**The invariant, and why it is scoped to backends.** `crates/ffs-fuse/src/lib.rs`
+`tests::no_backend_forces_direct_io_bd_q0xnl` walks every `.rs` file under `crates/` and asserts that
+**no crate outside `ffs-fuse` mentions `FOPEN_DIRECT_IO`**. `ffs-fuse` is where the flag is
+legitimately read (`kernel_open_flags`); a *backend* is the only thing that could force it, via its
+`FsOps::open` return, and that is precisely the case zero-message open cannot see. The failure
+message says so and names the two ways out — keep backends from forcing it, or make the
+zero-message-open negotiation refuse mounts whose backend can.
+
+**It carries its own positive control.** A source walk that silently read nothing would pass the real
+assertion vacuously, which is exactly how a guard like this rots. So it first asserts the scan DID
+find `direct_io_forced` in `franken_fuse.rs`, and reports the scanned path and hit count if not.
+
+**VERIFIED IN BOTH DIRECTIONS, because a guard that has never failed is a tautological test.**
+
+| state | result |
+|---|---|
+| clean tree | `test tests::no_backend_forces_direct_io_bd_q0xnl ... ok` |
+| violation planted in `ffs-core/src/vfs.rs` | **FAILED**, naming `crates/ffs-core/src/vfs.rs` line 895 and the exact offending text |
+| violation reverted | `ok` again, `git diff --quiet crates/ffs-core/src/vfs.rs` = clean |
+
+The planted violation was a single comment line mentioning the constant. That it trips the guard is
+deliberate: the scan is textual, so a backend that so much as names `FOPEN_DIRECT_IO` forces a human
+to look. A false positive here costs one code review; a false negative costs a silent correctness
+regression under a default someone flipped on the strength of my `1.160389x`.
+
+**Build provenance, since the wrapper matters.** `cargo` here is intercepted by `rch`, which shipped
+my first attempt to a remote worker where it failed `exit=127` — passing `RCH_CARGO_WRAPPER_BYPASS=1`
+as a command PREFIX is not enough, it must be `export`ed in the environment the wrapper itself reads.
+Built locally from a script that exports the bypass and unsets the host-wide `CARGO_TARGET_DIR`
+(`test` profile, 2m00s, into the repo's own `target/`), so this did not touch the shared 338 GB tree.
+
+**Two things I did NOT do, deliberately.** (1) I did not run `rustfmt` over the file. My added block
+was flagged at two points and I fixed those by hand; the file still carries THREE pre-existing fmt
+diffs (`lib.rs:197`, `:3876`, `:22762`) that are not mine, and sweeping them into this commit would
+disguise an unrelated reformatting as part of the guard. (2) I did not commit the other modified
+files in the working tree — `Cargo.lock`, `crates/ffs-cli/Cargo.toml`, `crates/ffs-cli/src/main.rs`,
+`scripts/build-perf.sh` are a live peer's uncommitted work, not mine; only
+`crates/ffs-fuse/src/lib.rs` is staged, and its diff is purely additive (77 insertions, 0 deletions).
+
+**Status of the blocker.** Client half REFUTED by counted measurement (previous entry); backend half
+now GUARDED rather than refuted — it remains unreachable, and is now unreachable *enforceably*. The
+default stays OFF: that is still a whole-product decision needing rows outside this one's regime
+(read-only ext4, no writeback, no mmap), and I am not flipping it on one row's evidence. What changed
+is that the reason it is off is no longer "an unmeasured worry nobody is watching".

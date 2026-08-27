@@ -19893,6 +19893,88 @@ mod tests {
         );
     }
 
+    /// bd-q0xnl: no filesystem backend may force `FOPEN_DIRECT_IO`.
+    ///
+    /// The O_DIRECT worry that kept zero-message open (`FUSE_NO_OPEN_SUPPORT`,
+    /// a measured `1.160389x`) default OFF has two halves. The CLIENT half —
+    /// a client passing `O_DIRECT` — was measured on 2026-08-27 and refuted:
+    /// all 64 reads of one block still reached the daemon with zero-message
+    /// open negotiated, against 1 for the buffered control, so the kernel does
+    /// not need our `open` reply to honour direct I/O.
+    ///
+    /// The BACKEND half cannot be refuted the same way, because it is
+    /// unreachable rather than safe: `direct_io_forced` in `kernel_open_flags`
+    /// is dead code today, so there is nothing to measure. It is dead only
+    /// because no `FsOps` implementation returns `FOPEN_DIRECT_IO`, and NOTHING
+    /// enforced that. If a backend ever starts forcing direct I/O, zero-message
+    /// open would silently drop it — the daemon never sees the open at all —
+    /// and every existing test would still pass.
+    ///
+    /// So this guard makes the unenforced premise enforced. It is deliberately
+    /// scoped to backends: `ffs-fuse` is where the flag is legitimately read.
+    #[test]
+    fn no_backend_forces_direct_io_bd_q0xnl() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, usize, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `target/` under a crate would be build output, not source.
+                    if path.file_name().and_then(|n| n.to_str()) != Some("target") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    for (i, line) in text.lines().enumerate() {
+                        if line.contains("FOPEN_DIRECT_IO") {
+                            out.push((
+                                path.to_string_lossy().into_owned(),
+                                i + 1,
+                                line.trim().to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("ffs-fuse must sit under the workspace crates directory");
+        let mut hits = Vec::new();
+        walk(crates_dir, &mut hits);
+
+        // Positive control: a walk that found nothing would pass the real
+        // assertion vacuously, which is exactly how this guard would rot.
+        assert!(
+            hits.iter()
+                .any(|(path, _, line)| path.contains("franken_fuse.rs")
+                    && line.contains("direct_io_forced")),
+            "the scan did not find `direct_io_forced` in franken_fuse.rs, so it is not \
+             reading the workspace source and its verdict is meaningless \
+             (scanned {}, {} hits)",
+            crates_dir.display(),
+            hits.len()
+        );
+
+        let offenders: Vec<_> = hits
+            .iter()
+            .filter(|(path, _, _)| !path.contains("ffs-fuse"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a crate outside ffs-fuse now mentions FOPEN_DIRECT_IO: {offenders:?}\n\
+             If this is an `FsOps` implementation forcing direct I/O, it is INVISIBLE \
+             under FFS_FUSE_ZERO_MESSAGE_OPEN (FUSE_NO_OPEN_SUPPORT): the daemon never \
+             sees the open, so `kernel_open_flags` never runs and the forced flag is \
+             silently dropped. Either keep the backend from forcing it, or make the \
+             zero-message-open negotiation refuse mounts whose backend can."
+        );
+    }
+
     #[test]
     fn conformance_fuse_read_file_lifecycle_round_trip() {
         let calls = Arc::new(Mutex::new(Vec::new()));
