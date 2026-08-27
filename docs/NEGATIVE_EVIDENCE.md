@@ -16444,3 +16444,80 @@ Reproduce:
     WORK=<scratch> ELF=<ffs-cli> bash scripts/perf/bulk_durable_write_ab/bperf2.sh borrowON ""
     WORK=<scratch> ELF=<ffs-cli> bash scripts/perf/bulk_durable_write_ab/bperf2.sh \
       borrowOFF FFS_MVCC_FLUSH_BORROW=0
+
+## 2026-08-27 — ⛔ WITHDRAWN again, my own blocker from one commit ago: the flush does NOT have to hold shard locks across the device write. `VersionData::Full` is already `Arc<AlignedVec>`, so the `~10.5 pp` copy is reachable — and the `Arc<D>` forwarder is a pre-identified trap on the way
+
+**Code verification, 2026-08-27, thinkstation1.** No new ratio; this entry retires a blocker
+by reading the types the previous entry reasoned about without checking. Ratios cited are the
+counted profile deltas banked one commit ago from
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`.
+
+One commit ago I reopened the `pwritev`-per-run lever (worth a counted `~10.5 pp` of daemon
+CPU) and named its blocker: *"the per-block slices must stay valid for the duration of the
+device write, so the flush would have to hold the shard read locks across
+`write_contiguous_blocks` — precisely what the borrowed two-pass walk was designed to
+avoid."* **That blocker does not exist for the common case.**
+
+### The version data is already shared
+
+`crates/ffs-mvcc/src/compression.rs:36`:
+
+    pub enum VersionData {
+        Full(Arc<AlignedVec>),   // <- the uncompressed case, which is the bulk path
+        Identical,
+        Zstd(Vec<u8>),
+        Brotli(Vec<u8>),
+    }
+
+and `resolve_data_with` (`compression.rs:191`) returns, for that variant,
+`Some(Cow::Borrowed(bytes.as_slice()))` — a borrow **of an `Arc`**. So pass 2 of the borrowed
+flush can `Arc::clone` at the resolve site, drop the shard read lock immediately as it does
+today, and still own a buffer that outlives the device write. The cost is one refcount bump
+per block — `16,384` per 64 MiB batch — against the `~10.5 pp` of daemon CPU the coalescing
+copy costs.
+
+⇒ **The lever is not a lock-hold redesign.** It is: accumulate `Arc<AlignedVec>` handles for
+the current run instead of `extend_from_slice`ing their bytes, and issue one positioned
+vectored write when the run closes. `Zstd`/`Brotli`/`Identical` resolve to `Cow::Owned` and
+keep an owned fallback; they are not the bulk path.
+
+### ⚠ The trap on the way, identified BEFORE it produces a null
+
+`crates/ffs-block/src/lib.rs:1305` has
+
+    impl<D: BlockDevice + ?Sized> BlockDevice for Arc<D> { ... }
+
+which explicitly forwards **14** methods — `read_block`, `supports_contiguous_reads`,
+`read_contiguous_blocks`, `read_contiguous_into`, `write_block`, `rmw_block`,
+`rmw_block_bitmap_or`, `rmw_block_bitmap_delta`, `read_merge_ancestor_at_snapshot`,
+`supports_contiguous_writes`, `write_contiguous_blocks`, `block_size`, `block_count`, `sync`.
+
+A new **defaulted** `write_contiguous_blocks_vectored` that is not added to that list would be
+inherited by `Arc<D>` as the DEFAULT — which must concatenate to preserve semantics — so the
+production mount would keep making exactly the copy the change exists to remove, and the
+lever would measure as a perfect null. This is `frankenfs-fsops-arc-forwarding-trap` in a
+second crate: **a defaulted trait method plus a blanket forwarding impl is a silent
+no-op unless the forwarder lists it.**
+
+### What this changes about the plan
+
+| | before this reading | after |
+| --- | --- | --- |
+| blocker | hold shard locks across the device write | **none for `Full`; clone the `Arc`** |
+| shape | redesign lock hold times under concurrent commit | add one trait method, override it on the real device, list it in the `Arc<D>` forwarder, accumulate handles instead of bytes |
+| risk | lock convoy under concurrent committers | O_DIRECT iovec alignment; short-write handling; the forwarder trap above |
+| sized at | `~10.5 pp` of daemon CPU | unchanged |
+
+### Transferable
+
+  * ⭐⭐⭐ **Read the type before naming the blocker.** Two commits in a row I sized and then
+    blocked this lever from reasoning; both times the code said otherwise. `Arc<AlignedVec>`
+    was there the whole time and one `grep` settled it.
+  * ⭐⭐ **A blanket `impl Trait for Arc<T>` turns every DEFAULTED method into a silent
+    no-op.** Enumerate the forwarder's list before adding a method, not after the A/B returns
+    a null.
+
+### Admissibility
+
+Code verification, no measurement. The `~10.5 pp` figure it references is the counted profile
+delta banked one commit ago; nothing here revises it.
