@@ -96,7 +96,8 @@ static unsigned char *payload;
 
 static int run_batch(const char *root, unsigned long chunks, unsigned long sequence,
                      uint64_t *write_ns, uint64_t *fsync_ns,
-                     const char *statfile, struct phase_io io[2]) {
+                     const char *statfile, struct phase_io io[2],
+                     int fusepid, unsigned long long dticks[2]) {
     char path[4096];
     snprintf(path, sizeof(path), "%s/bulk-durable.bin", root);
     int fd = open(path, O_RDWR);
@@ -112,6 +113,8 @@ static int run_batch(const char *root, unsigned long chunks, unsigned long seque
 
     struct phase_io mark;
     block_stat(statfile, &mark.ios, &mark.sectors, &mark.flushes);
+    unsigned long long dm = 0, dnow = 0;
+    read_daemon_ticks(fusepid, &dm);
 
     uint64_t t0 = now_ns();
     for (unsigned long i = 0; i < chunks; i++) {
@@ -125,9 +128,11 @@ static int run_batch(const char *root, unsigned long chunks, unsigned long seque
     }
     uint64_t t1 = now_ns();
     io_delta(statfile, &mark, &io[0]);
+    read_daemon_ticks(fusepid, &dnow); dticks[0] = dnow - dm; dm = dnow;
     if (fsync(fd) != 0) { fprintf(stderr, "fsync: %s\n", strerror(errno)); return -1; }
     uint64_t t2 = now_ns();
     io_delta(statfile, &mark, &io[1]);
+    read_daemon_ticks(fusepid, &dnow); dticks[1] = dnow - dm;
     close(fd);
     *write_ns = t1 - t0;
     *fsync_ns = t2 - t1;
@@ -170,27 +175,28 @@ int main(int argc, char **argv) {
 
     unsigned long sequence = 0;
     struct phase_io io[2];
+    unsigned long long dticks[2] = {0, 0};
     for (int i = 0; i < narms; i++) {
         uint64_t w, f;
-        if (run_batch(dirs[i], chunks, sequence++, &w, &f, stats[i], io) != 0) return 1;
+        if (run_batch(dirs[i], chunks, sequence++, &w, &f, stats[i], io, 0, dticks) != 0) return 1;
         fprintf(stderr, "warmup %s write=%.3fms fsync=%.3fms\n", labels[i], w / 1e6, f / 1e6);
     }
 
-    printf("round,pos,arm,write_ns,fsync_ns,total_ns,bytes,daemon_ticks,w_ios,w_sec,w_fl,f_ios,f_sec,f_fl\n");
+    printf("round,pos,arm,write_ns,fsync_ns,total_ns,bytes,daemon_ticks,w_ios,w_sec,w_fl,f_ios,f_sec,f_fl,w_dticks,f_dticks\n");
     for (int r = 0; r < rounds; r++) {
         for (int pos = 0; pos < narms; pos++) {
             int i = (pos + r) % narms;
             unsigned long long tb = 0, ta = 0;
             read_daemon_ticks(fusepid, &tb);
             uint64_t w, f;
-            if (run_batch(dirs[i], chunks, sequence++, &w, &f, stats[i], io) != 0) return 1;
+            if (run_batch(dirs[i], chunks, sequence++, &w, &f, stats[i], io, fusepid, dticks) != 0) return 1;
             read_daemon_ticks(fusepid, &ta);
             printf("%d,%d,%s,%llu,%llu,%llu,%lu,%llu", r, pos, labels[i],
                    (unsigned long long)w, (unsigned long long)f,
                    (unsigned long long)(w + f), chunks * CHUNK, ta - tb);
             for (int q = 0; q < 2; q++)
                 printf(",%llu,%llu,%llu", io[q].ios, io[q].sectors, io[q].flushes);
-            printf("\n");
+            printf(",%llu,%llu\n", dticks[0], dticks[1]);
             fflush(stdout);
         }
     }

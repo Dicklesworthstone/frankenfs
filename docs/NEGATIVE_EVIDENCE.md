@@ -13681,3 +13681,99 @@ Reproduce:
     # then the mirror with FA/FB swapped; take the geometric mean of the two
     python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulkdio-boF.csv
     WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/bvalidate.sh fa fb
+
+## 2026-08-27 — the bulk row's write phase is 63.7% daemon CPU, so it IS attackable — and jemalloc decay tuning is a NULL on every phase
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/bulk_durable_write_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on cpu18/cpu19, every arm on its own loop device
+`--direct-io=on`.
+
+The device census left this row's **write phase at `14.352x` with ZERO device I/O** as the
+largest un-attacked multiple on any row. Two questions had to be answered before spending
+code on it: is the daemon even BUSY during that phase, and is the cost the allocator churn
+the first profile suggested?
+
+### 2026-08-27 — per-phase daemon CPU: the write phase is 63.7% busy
+
+`bulkwrite_ab.c` now samples `/proc/<daemon>/stat` at the write/fsync boundary as well as
+the block counters. Same-invocation A/A null control `0.977675` bootstrap median CI
+`[0.973309, 1.007113]` (kernel, total) and `0.989794` `[0.976453, 1.002392]` (kernel, fsync
+phase), 20000 resamples over 32 paired per-round ratios. `RCH_WORKER=none`,
+`hostname=thinkstation1`.
+
+| arm | phase | wall | daemon CPU | CPU / wall |
+| --- | --- | --- | --- | --- |
+| kernel k1 | write | 6.187 ms | — | — |
+| kernel k1 | fsync | 53.151 ms | — | — |
+| FrankenFS | write | 78.448 ms | **50.0 ms** | **63.7%** |
+| FrankenFS | fsync | 162.735 ms | **105.0 ms** | **64.5%** |
+
+⇒ **the write phase is NOT round-trip-idle.** `0.781 ms` of daemon CPU per 1 MiB write
+crossing. Apportioned against the loop-dio profile (`Channel::receive` 12.00% of 155 ms
+total daemon CPU ≈ `18.6 ms`, which is the kernel copying 64 MiB into our request buffer),
+the residual is **≈`31.4 ms` per batch in our own write handler and MVCC staging — over
+16,384 blocks that is `1.92 µs` per 4 KiB block**, one allocation and one copy each. That
+is the same shape as the flush clone taken in `65d3a4eeb`, on the other side of the batch.
+
+### 2026-08-27 — REJECT: jemalloc decay tuning is a NULL, so allocator page-churn is not the cost
+
+Same-invocation A/A null control `0.977675` bootstrap median CI `[0.973309, 1.007113]` and same-invocation A/A null control `0.989794` bootstrap median CI `[0.976453, 1.002392]` (fsync phase),
+both from 20000 resamples over the 32 paired per-round ratios. `RCH_WORKER=none`,
+`hostname=thinkstation1`.
+
+The first profile of this row showed `clear_page_erms` `4.51%`, `do_anonymous_page`
+`1.43%`, `__handle_mm_fault` `1.17%`, `mod_memcg_lruvec_state` `2.22%` — ~`11.4%` of daemon
+CPU faulting in and zeroing FRESH anonymous pages, the classic signature of an allocator
+returning memory to the OS between allocations. `MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`
+turns that off with **no code change at all**, one ELF, both arms otherwise identical:
+
+    whole batch   forward default/nodecay 0.970875 [0.933846, 1.023265]
+                  mirrored                1.015043 (from nodecay/default 0.985183)
+                  balanced                0.992712        <- NULL
+    write phase   balanced                1.004358        <- NULL
+    fsync phase   balanced                1.002388        <- NULL
+
+**All three straddle 1.0.** Kernel A/A on the fsync phase clean (`0.989794`, `0.991299`);
+on the whole batch marginal (`0.977675`, `0.971207`); on the write phase it FAILS again
+(`0.916006`, `0.889800`) — the known non-decidable phase under `--direct-io=on`, so the
+write-phase figure is quoted only as corroboration of the other two.
+
+⇒ **Allocator page-return churn costs no measurable wall time on this row.** The `11.4%`
+of daemon CPU in the fault-and-zero path is real but it is not on the critical path — the
+daemon has CPU headroom precisely because it is 36% idle waiting on round trips. The
+attackable `31.4 ms` is the **copy and the staging work itself**, not the allocator behind
+it, and a `MALLOC_CONF` tune is not the lever. Recorded so nobody spends a build on it.
+
+### What this leaves
+
+The write phase's `1.92 µs` per 4 KiB block is one `to_vec` allocation plus one 4 KiB copy
+in `OpenFs::ext4_write`, then `stage_write_with_proof` taking ownership of that `Vec`. The
+borrow trick that worked for the flush does not transfer directly: the flush could borrow
+because it only needed to READ each version, while staging must OWN a buffer that outlives
+the request. Removing it means changing what the MVCC transaction accepts — a shared
+`Arc<[u8]>` slice of the request buffer, or a per-scope buffer pool — which is an API
+change to the staging path, not a knob. **Named, sized at `31.4` of `241 ms` (13%) of this
+row's batch, and NOT taken here.**
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. The `MALLOC_CONF` A/B is one ELF with both
+arms on the same transport; its divergence is an ALLOCATOR environment variable, not a
+FrankenFS knob, so it does not appear on the `mount_candidate_knobs` line — the arms are
+distinguished by the env passed and by the counted absence of any effect. What this banks
+is the per-phase daemon-CPU split that proves the write phase is attackable, the
+apportionment of its `50 ms`, and the NULL that removes the allocator hypothesis.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=mcF FA_LABEL=default FB_LABEL=nodecay \
+      FA_CPUS=18 FB_CPUS=19 FA_ENV="" \
+      FB_ENV="MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1" \
+      bash scripts/perf/bulk_durable_write_ab/run_bulk_dio.sh
+    # then the mirror with FA/FB swapped; take the geometric mean of the two
+    python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulkdio-mcF.csv
