@@ -8024,7 +8024,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={},btrfs_verify_data_on_read={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},ext4_file_data_extent_cache_bytes={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={},btrfs_verify_data_on_read={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -8047,6 +8047,10 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             // sizing from ONE ELF. A compile-time slot count is unmeasurable
             // against the live kernel.
             ffs_core::btrfs_floor_memo_slots_effective(),
+            // bd-mf9z9: the cache is useful only if its byte budget is attested
+            // by the daemon that owns it; report the resolved value, not merely
+            // the environment the comparator requested.
+            ffs_core::ext4_file_data_extent_cache_bytes(),
             // bd-avg6f: reported so the storm's per-mutation invalidation can be
             // A/B'd from ONE ELF, and so the lever is ATTESTABLE in-process
             // rather than only in the env the harness set (bd-087wt).
