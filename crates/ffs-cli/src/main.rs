@@ -8181,6 +8181,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     };
     emit_mount_banner(&open_fs, mountpoint, options.read_write, runtime.mode);
     emit_optional_recovery_banner(&open_fs);
+    require_jbd2_durability_for_mount(&open_fs, options.read_write)?;
 
     if options.read_write {
         let cx = cli_cx();
@@ -8336,6 +8337,27 @@ fn build_mount_open_options(options: &MountCmdOptions) -> OpenOptions {
         btrfs_verify_data_on_read: options.btrfs_verify_data_on_read,
         ..OpenOptions::default()
     }
+}
+
+/// Refuse a writable ext4 mount that advertises JBD2 until the mounted flush
+/// path actually routes through its writer.
+///
+/// `OpenFs` has a `Jbd2Writer` attachment point, but attaching it alone is not
+/// a durability implementation: the production `fsync` path currently flushes
+/// MVCC versions directly to their home blocks and never calls
+/// `commit_transaction_journaled`. Allowing this mount to proceed would make a
+/// journalled ext4 image look durable while silently skipping descriptor and
+/// commit blocks. A no-journal ext4 image remains a valid writable mount.
+fn require_jbd2_durability_for_mount(open_fs: &OpenFs, read_write: bool) -> Result<()> {
+    let journalled_ext4 = open_fs.ext4_superblock().is_some_and(|superblock| {
+        superblock.has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL)
+    });
+    if read_write && journalled_ext4 && !open_fs.has_jbd2_writer() {
+        bail!(
+            "refusing writable journalled ext4 mount: the mounted fsync path has no active JBD2 durability writer"
+        );
+    }
+    Ok(())
 }
 
 fn parse_btrfs_mount_selection(
@@ -9582,6 +9604,7 @@ mod tests {
         log_mount_runtime_rejected, log_mount_runtime_selected, mount_cmd, mount_operation_id,
         open_filesystem_for_mount, parse_btrfs_mount_selection, parse_fuse_dispatch_workers,
         read_ext4_group_desc_from_path, read_ext4_inode_from_path, read_file_region,
+        require_jbd2_durability_for_mount,
         start_mount_background_scrub, summarize_repair_staleness, unavailable_repair_info,
         validate_mount_adaptive_runtime_request_with_config,
         validate_mount_writeback_cache_request,
@@ -9599,7 +9622,9 @@ mod tests {
         select_ext4_repair_groups,
     };
     use clap::Parser;
+    use asupersync::Cx;
     use ffs_block::CacheRuntimeMetricsSnapshot;
+    use ffs_core::{OpenFs, OpenOptions};
     use ffs_harness::adaptive_runtime_manifest::{
         AdaptiveRuntimeCleanupStatus, AdaptiveRuntimeDegradationThresholds,
         AdaptiveRuntimeEvidenceManifest, AdaptiveRuntimeEvidenceValidationConfig,
