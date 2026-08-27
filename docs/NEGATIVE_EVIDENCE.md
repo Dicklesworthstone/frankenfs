@@ -16003,3 +16003,102 @@ Reproduce:
       FA_LABEL=base FB_LABEL=noxattr FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=sx1 \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
     python3 scripts/perf/create_delete_storm_ab/sanalyze.py <body.csv>
+
+## 2026-08-27 — ⛔ WITHDRAWN, my own analysis from one commit ago: `getattr` does NOT convert at `0.28`. Remove the audit confound and the SAME knob goes `1.017298x` UNDECIDABLE → `1.065465x` DECIDABLE, converting at `0.72` like everything else
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8, every arm on
+its own loop device with `--direct-io=on`.
+
+One commit ago I priced the storm's audit half and concluded that **`dispatch_ns` ranks
+crossings wrong**, on the strength of `getattr` converting at `0.28` wall-points per
+crossing-point against `getxattr`'s `0.79` — and offered a mechanism: the probe blocks the
+client's syscall while a parent-invalidation `getattr` is a kernel-initiated revalidation off
+that critical path. **The `0.28` was an artifact of the confound I had just removed, and the
+mechanism was invented to explain it.**
+
+### Profile first: with the probes gone, the notifier is the second-largest item
+
+`perf record -F 4999 -g` on the daemon under `FFS_FUSE_XATTR_NO_SUPPORT=1`:
+
+| frame (inclusive) | probes present | probes suppressed |
+| --- | ---: | ---: |
+| `fuser::channel::Channel::receive` | 30.41% | 25.54% |
+| **`fuser::notify::Notifier::send`** | 11.13% | **14.49%** |
+| `fuser::request::RequestSender::send` | 14.45% | 12.35% |
+| `Notifier::inval_entry` (the entry half) | — | 2.04% |
+
+⇒ with the external cost removed, **~12.4% of daemon CPU is `inval_inode`** — the
+parent-directory attribute invalidation. That is what motivated re-running a knob I had
+already rejected.
+
+### The same knob, the same rig, the confound removed
+
+Both arms carry `FFS_FUSE_XATTR_NO_SUPPORT=1`; arm B adds `FFS_FUSE_PARENT_INVAL=0`.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `supp/suppNoPar` | `1.051946` `[1.020931, 1.076941]` | `1.079158` `[1.052373, 1.115172]` | **`1.065465x`** |
+| A/A null `k1/k2` | `1.017054` `[0.948866, 1.044303]` **PASS** | `1.002163` `[0.994623, 1.008095]` **PASS** | `1.009581` |
+| row, suppressed | `4.227007` | `4.332605` | `4.279481x` |
+| row, suppressed + no parent inval | `3.980353` | `4.027759` | **`4.003986x`** |
+
+Both A/A halves pass, both effect CIs exclude 1, and the `6.5%` effect is `6.8×` the `1.0%`
+null. Counted: `crossings_getattr` **146,825 → 100,131**, `crossings_total`
+**546,978 → 500,284 (−8.5%)**. Absolutes: kernel_median_wall_ns=89699000 and
+kernel_median_wall_ns=86355000 against fuse_median_wall_ns=375189000 /
+fuse_median_wall_ns=358464000 (forward) and fuse_median_wall_ns=379304000 /
+fuse_median_wall_ns=356666000 (mirrored).
+
+### ⛔ What is withdrawn
+
+| measurement of `FFS_FUSE_PARENT_INVAL=0` on the storm | crossings removed | wall | wall-pts per crossing-pt |
+| --- | ---: | --- | ---: |
+| with 200,051 audit probes present (banked one commit ago) | 6.0% | `1.017298x` **undecidable** | **0.28** |
+| with the probes suppressed (this run) | 8.5% | `1.065465x` **decidable** | **0.72** |
+
+  * ⛔ **WITHDRAWN: "`dispatch_ns` ranks crossings wrong / the ordering inverts."** With the
+    confound gone, `getxattr` converts at `0.79` and `getattr` at `0.72` — the same class,
+    and in the order `dispatch_ns` would predict. The inversion was the artifact talking.
+  * ⛔ **WITHDRAWN: the mechanism I offered** — "a parent-invalidation `getattr` is off the
+    client's critical path." Nothing measured supported it; it was constructed to fit `0.28`.
+  * ✅ **STANDS:** the probe itself converts at `0.79` while being only `11.2%` of
+    `dispatch_ns` — `dispatch_ns` does understate a crossing's wall cost. It just does not
+    reorder it.
+
+⭐⭐⭐ **The real finding is bigger than the one it replaces: a dominant external cost does
+not merely ADD time, it MASKS other levers AND deflates their measured per-crossing value.**
+The same knob, same rig, same day: undecidable at `1.017298x` behind the probes, decidable at
+`1.065465x` in front of them. Any lever rejected as "too small" on a row with a known
+dominant confound must be re-run with that confound removed before the rejection is trusted.
+
+⛔ **Still not shipping.** `FFS_FUSE_PARENT_INVAL=0` costs a directory `stat` an mtime/ctime
+up to `ATTR_TTL` stale, and the `1.065465x` is only realised inside a suppressed mount, which
+is itself restricted. This converts an *undecidable* reject into a *decidably priced* one —
+the semantic cost is unchanged and still not bought.
+
+### Transferable
+
+  * ⭐⭐⭐ **Re-run every lever a dominant confound was masking, before trusting its
+    rejection.** Removing the confound is not only how you measure it — it is how you
+    re-measure everything behind it.
+  * ⭐⭐ **A mechanism invented to explain one anomalous number is a hypothesis, not a
+    finding.** Mine survived one commit. Label such things as unmeasured, or measure them.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored, both halves passing.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=supp FB_LABEL=suppNoPar \
+      FA_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" \
+      FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1 FFS_FUSE_PARENT_INVAL=0" TAG=sp1 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
