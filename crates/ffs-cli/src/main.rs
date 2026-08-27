@@ -10950,6 +10950,22 @@ mod tests {
             &(compat | ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL.0).to_le_bytes(),
         );
         image[sb_off + 0xE0..sb_off + 0xE4].copy_from_slice(&8_u32.to_le_bytes());
+
+        // Inode 8 is the internal journal. It only needs to be readable here:
+        // replay is deliberately skipped so the mount gate, rather than a
+        // malformed synthetic journal, is the behavior under test.
+        let inode_offset = 5 * 4096 + 7 * 256;
+        image[inode_offset..inode_offset + 2].copy_from_slice(&0o100_600_u16.to_le_bytes());
+        image[inode_offset + 4..inode_offset + 8].copy_from_slice(&4096_u32.to_le_bytes());
+        image[inode_offset + 0x1A..inode_offset + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+        image[inode_offset + 0x20..inode_offset + 0x24]
+            .copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+        let extent = inode_offset + 0x28;
+        image[extent..extent + 2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+        image[extent + 2..extent + 4].copy_from_slice(&1_u16.to_le_bytes());
+        image[extent + 4..extent + 6].copy_from_slice(&4_u16.to_le_bytes());
+        image[extent + 16..extent + 18].copy_from_slice(&1_u16.to_le_bytes());
+        image[extent + 20..extent + 24].copy_from_slice(&20_u32.to_le_bytes());
         image
     }
 
