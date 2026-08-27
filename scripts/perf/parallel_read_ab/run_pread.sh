@@ -79,17 +79,17 @@ wait_mount() {
   echo "mount $1 never came up"; tail -20 "$3"; return 1
 }
 wait_mount "$FA" "$APID" "$W/rfuse-$TAG-a.log"
-ARMS=("k1=$K1" "k2=$K2" "$FA_LABEL=$FA")
+ARMS=("k1=$K1=0" "k2=$K2=0" "$FA_LABEL=$FA=$APID")
 if [ -n "$FB_LABEL" ]; then
   wait_mount "$FB" "$BPID" "$W/rfuse-$TAG-b.log"
-  ARMS+=("$FB_LABEL=$FB")
+  ARMS+=("$FB_LABEL=$FB=$BPID")
 fi
 
 echo "== $FA_LABEL pid $APID cpus $FA_CPUS loop=$FA_LOOP env '$FA_ENV'"
 echo "== $FB_LABEL pid $BPID cpus $FB_CPUS loop=$FB_LOOP env '$FB_ENV'"
 echo "== clients cpus $CPUBASE..$((CPUBASE+THREADS-1))"
 
-"$W/pread_ab" "$ROUNDS" "$THREADS" "$CPUBASE" "$APID" "${ARMS[@]}" | tee "$W/pread-$TAG.csv"
+"$W/pread_ab" "$ROUNDS" "$THREADS" "$CPUBASE" "${ARMS[@]}" | tee "$W/pread-$TAG.csv"
 
 echo "== unmount + census"
 fusermount3 -u "$FA"; wait "$APID" 2>/dev/null || true

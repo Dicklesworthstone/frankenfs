@@ -5,13 +5,14 @@
 // batch = readdir <root>/parallel-read, BYTE-SORT the paths, then THREADS workers
 // each open + pread one whole 256 KiB file per stride step, folding a content digest.
 //
-// usage: pread_ab ROUNDS THREADS CPUBASE FUSEPID label=dir [label=dir ...]
+// usage: pread_ab ROUNDS THREADS CPUBASE label=dir=FUSEPID [label=dir=FUSEPID ...]
 // prints CSV: round,pos,arm,list_ns,read_ns,total_ns,digest,daemon_ticks
 
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -51,6 +52,56 @@ struct worker {
     uint64_t digest;
     int err;
 };
+
+struct arm {
+    char *label;
+    char *dir;
+    int fusepid;
+};
+
+static int parse_arm(char *spec, struct arm *arm) {
+    char *label_end = strchr(spec, '=');
+    if (!label_end || label_end == spec) {
+        fprintf(stderr, "bad arm spec %s (expected label=dir=FUSEPID)\n", spec);
+        return -1;
+    }
+    *label_end = 0;
+    char *dir = label_end + 1;
+    char *pid_start = strrchr(dir, '=');
+    if (!pid_start || pid_start == dir || pid_start[1] == 0) {
+        fprintf(stderr, "bad arm spec %s (expected label=dir=FUSEPID)\n", spec);
+        return -1;
+    }
+    *pid_start = 0;
+    errno = 0;
+    char *end = NULL;
+    long pid = strtol(pid_start + 1, &end, 10);
+    if (errno != 0 || end == pid_start + 1 || *end != 0 || pid < 0 || pid > INT_MAX) {
+        fprintf(stderr, "bad daemon pid in arm spec\n");
+        return -1;
+    }
+    arm->label = spec;
+    arm->dir = dir;
+    arm->fusepid = (int)pid;
+    return 0;
+}
+
+static int parser_self_test(void) {
+    struct arm arm;
+    char fuse[] = "ffsA=/mnt/a=101";
+    char kernel[] = "k1=/mnt/k1=0";
+    char missing_pid[] = "bad=/mnt";
+    char nonnumeric_pid[] = "bad=/mnt=no";
+    char negative_pid[] = "bad=/mnt=-1";
+    if (parse_arm(fuse, &arm) != 0 || strcmp(arm.label, "ffsA") != 0
+        || strcmp(arm.dir, "/mnt/a") != 0 || arm.fusepid != 101) return 1;
+    if (parse_arm(kernel, &arm) != 0 || strcmp(arm.label, "k1") != 0
+        || strcmp(arm.dir, "/mnt/k1") != 0 || arm.fusepid != 0) return 1;
+    if (parse_arm(missing_pid, &arm) == 0) return 1;
+    if (parse_arm(nonnumeric_pid, &arm) == 0) return 1;
+    if (parse_arm(negative_pid, &arm) == 0) return 1;
+    return 0;
+}
 
 static void *worker_main(void *arg) {
     struct worker *w = arg;
@@ -167,32 +218,26 @@ static int run_batch(const char *root, int threads, int cpubase, uint64_t *list_
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6) {
-        fprintf(stderr, "usage: %s ROUNDS THREADS CPUBASE FUSEPID label=dir [...]\n", argv[0]);
+    if (argc == 2 && strcmp(argv[1], "--self-test") == 0) return parser_self_test();
+    if (argc < 5) {
+        fprintf(stderr, "usage: %s ROUNDS THREADS CPUBASE label=dir=FUSEPID [...]\n", argv[0]);
         return 2;
     }
     int rounds = atoi(argv[1]);
     int threads = atoi(argv[2]);
     int cpubase = atoi(argv[3]);
-    int fusepid = atoi(argv[4]);
-    int narms = argc - 5;
+    int narms = argc - 4;
     if (narms > MAX_ARMS) { fprintf(stderr, "too many arms\n"); return 2; }
-    char *labels[MAX_ARMS];
-    char *dirs[MAX_ARMS];
+    struct arm arms[MAX_ARMS];
     for (int i = 0; i < narms; i++) {
-        char *s = argv[5 + i];
-        char *eq = strchr(s, '=');
-        if (!eq) { fprintf(stderr, "bad arm spec %s\n", s); return 2; }
-        *eq = 0;
-        labels[i] = s;
-        dirs[i] = eq + 1;
+        if (parse_arm(argv[4 + i], &arms[i]) != 0) return 2;
     }
 
     for (int i = 0; i < narms; i++) {
         uint64_t l, rd, dg;
-        if (run_batch(dirs[i], threads, cpubase, &l, &rd, &dg) != 0) return 1;
+        if (run_batch(arms[i].dir, threads, cpubase, &l, &rd, &dg) != 0) return 1;
         fprintf(stderr, "warmup %s list=%.3fms read=%.3fms digest=%llu\n",
-                labels[i], l / 1e6, rd / 1e6, (unsigned long long)dg);
+                arms[i].label, l / 1e6, rd / 1e6, (unsigned long long)dg);
     }
 
     printf("round,pos,arm,list_ns,read_ns,total_ns,digest,daemon_ticks\n");
@@ -200,11 +245,11 @@ int main(int argc, char **argv) {
         for (int pos = 0; pos < narms; pos++) {
             int i = (pos + r) % narms;
             unsigned long long tb = 0, ta = 0;
-            read_daemon_ticks(fusepid, &tb);
+            read_daemon_ticks(arms[i].fusepid, &tb);
             uint64_t l, rd, dg;
-            if (run_batch(dirs[i], threads, cpubase, &l, &rd, &dg) != 0) return 1;
-            read_daemon_ticks(fusepid, &ta);
-            printf("%d,%d,%s,%llu,%llu,%llu,%llu,%llu\n", r, pos, labels[i],
+            if (run_batch(arms[i].dir, threads, cpubase, &l, &rd, &dg) != 0) return 1;
+            read_daemon_ticks(arms[i].fusepid, &ta);
+            printf("%d,%d,%s,%llu,%llu,%llu,%llu,%llu\n", r, pos, arms[i].label,
                    (unsigned long long)l, (unsigned long long)rd,
                    (unsigned long long)(l + rd), (unsigned long long)dg, ta - tb);
             fflush(stdout);
