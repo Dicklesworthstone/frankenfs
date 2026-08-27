@@ -15605,3 +15605,117 @@ Reproduce:
       FB_ENV="FFS_FUSE_ZERO_MESSAGE_OPEN=1" TAG=pr1 \
       bash scripts/perf/parallel_read_ab/run_pread.sh
     python3 scripts/perf/parallel_read_ab/ranalyze.py <body.csv>
+
+## 2026-08-27 — parallel-metadata-write gets a symmetric-transport rig (kernel-arm IQR `257 ms → 0.284 ms`), measures a balanced `1.882357x`, and ⛔ REJECTS the storm's create-invalidation lever: `crossings_lookup` does not move here
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, NEW rig
+`scripts/perf/parallel_metadata_ab/run_pmeta_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15.
+
+### 2026-08-27 — the existing rig was not measurable, and the fix is symmetric transport
+
+`run_pmeta.sh` let the daemon open the image file **buffered** while the kernel arms went
+through loop. Measured today on that rig: kernel arms `iqr_total=257.118 ms` and
+`219.371 ms` on medians of `128.206` / `109.917 ms`, with CIs like
+`k1/base: 1.254593 [0.694054, 2.412262]` — a 3.5× span. Nothing is decidable there.
+
+`run_pmeta_dio.sh` puts **every** arm on its own loop device with `--direct-io=on` and
+preallocates the copies so the host extent layout matches. Same workload, same window class:
+
+| rig | kernel `k1` median | kernel `k1` IQR |
+| --- | ---: | ---: |
+| `run_pmeta.sh` (buffered FUSE arm) | 128.206 ms | **257.118 ms** |
+| `run_pmeta_dio.sh` (symmetric) | **19.429 ms** | **0.284 ms** |
+
+⭐ A **~900× variance reduction**, and the kernel median drops 6.6× because the arms are no
+longer fighting the page cache. bd-4zjkz found the same artifact worth `2.20x` on the ext4
+fsync twin; this row had it too and nobody had checked.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by the
+daemon at mount:
+`mount_bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`.
+Same-invocation A/A null control `0.989375` bootstrap median CI `[0.982531, 0.997341]` and
+same-invocation A/A null control `0.997422` bootstrap median CI `[0.991813, 1.000509]`, both
+from 20000 resamples over the 36 paired per-round ratios. Absolutes:
+kernel_median_wall_ns=19429000 and kernel_median_wall_ns=19641000 against
+fuse_median_wall_ns=36839000 and fuse_median_wall_ns=36836000. Counted mechanism: the
+per-opcode `crossings_*` / `dispatch_ns_*` census below, read off the daemon's own counters.
+
+### The row, on the rig that can see it
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| **row vs kernel ext4** | `1.889880` | `1.874864` | **`1.882357x`** |
+| A/A null `k1/k2` | `0.989375` `[0.982531, 0.997341]` ⚠ | `0.997422` `[0.991813, 1.000509]` | `0.993390` |
+
+Absolutes: kernel_median_wall_ns=19429000 and kernel_median_wall_ns=19641000 against
+fuse_median_wall_ns=36839000 and fuse_median_wall_ns=36836000. All CIs are 20000-resample
+bootstrap medians over the 36 paired per-round ratios.
+
+**The row is a NET of two opposite phases, and the dio rig sharpens both:**
+
+| phase | kernel | FrankenFS | ratio |
+| --- | ---: | ---: | --- |
+| create | 1.551 / 1.549 ms | 27.002 / 27.107 ms | **17.41x / 17.50x LOSS** |
+| directory fsync | 17.867 / 18.071 ms | 9.641 / 9.672 ms | **1.852x / 1.867x WIN** |
+
+Per-opcode census: `crossings_total=255,964`, of which `other` (create+unlink+flush+fsyncdir)
+is 85,093 crossings and **59.4% of dispatch**, `getxattr` 76,369 (all audit probes, `29.8%`
+of crossings but only `14.6%` of dispatch), `getattr` 54,829 (`11.8%`), `lookup` (`9.3%`).
+Like the storm, **not audit-dominated**.
+
+### ⛔ REJECT — the storm's create-invalidation lever does not transfer
+
+`FFS_FUSE_CREATE_INVAL=0` is worth a balanced `1.105635x` on the create/delete storm. Here:
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `noCreInval/base` | `1.009381` | `1.016006` `[0.996809, 1.040163]` | **`1.012688x` SLOWER** |
+
+A `1.3%` effect against a `0.7%` null — **undecidable, and pointing the wrong way. REJECTED.**
+
+⭐⭐ **The counted reason is exact.** On the storm the knob removed **exactly 50,000
+lookups** (`crossings_lookup` `100,001 → 50,001`). Here:
+
+| counter | base | `CREATE_INVAL=0` | Δ |
+| --- | ---: | ---: | ---: |
+| `crossings_lookup` | 18,953 | **18,953** | **0** |
+| `crossings_total` | 257,833 | 247,658 | −10,175 (notifier sends only) |
+
+**The extra LOOKUP the storm pays does not exist on this row**, so there is nothing for the
+knob to save beyond the notify send itself — and that alone does not pay for itself.
+
+⭐ **The rule: an entry invalidation costs an extra LOOKUP only if the workload touches that
+name again.** The storm creates and then deletes the same name in the same batch, so the
+invalidated entry is immediately re-resolved. parallel-metadata-write creates from 8 threads
+and then fsyncs — nothing revisits the name — so the invalidation costs only the send. Same
+knob, same mechanism, `1.105635x` on one row and a null on the other, and the census says
+which before the clock does.
+
+### Transferable
+
+  * ⭐⭐⭐ **Check transport symmetry before believing a row is noisy.** A `257 ms` IQR on a
+    `128 ms` median looks like a busy host; it was one arm buffered and three on loop-dio.
+    The fix made the row measurable, not merely quieter.
+  * ⭐⭐ **A lever's mechanism has a precondition, and the census tests it directly.**
+    `crossings_lookup` not moving said "this lever cannot work here" before any wall-clock
+    arm was run.
+  * ⭐ **Report the phase split on a net row.** `1.882357x` hides a `17.4x` create loss and
+    an `1.85x` fsync win; a lever aimed at the net would be aimed at nothing.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=36 OPS=512 THREADS=8 CPUBASE=8 \
+      FA_CPUS=18 FB_CPUS=19 FA_LABEL=base FB_LABEL=noCreInval \
+      FB_ENV="FFS_FUSE_CREATE_INVAL=0" TAG=pd1 \
+      bash scripts/perf/parallel_metadata_ab/run_pmeta_dio.sh
+    python3 scripts/perf/parallel_metadata_ab/panalyze.py <body.csv>
