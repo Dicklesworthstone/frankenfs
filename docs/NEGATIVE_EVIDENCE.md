@@ -18841,3 +18841,49 @@ aimed at the right allocation with a measured target to beat.
 
 ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
 `hostname=thinkstation1`. Nothing shipped, nothing reverted; no timing claimed.
+
+## 2026-08-27 — bd-cjqhh: TWO corrections to my own last two entries — `AlignedVec` IS on the write path (via `from_vec`, not `new`), the staging site I cited was TEST code, and the attempt to count the realignment copy FAILED AS AN INSTRUMENT
+
+Chasing the per-write staging allocation into the code produced two errors of mine that are already in
+this ledger. Both are corrected here rather than left standing.
+
+**CORRECTION 1 — "AlignedVec is read-path only" is WRONG.** My survey found `AlignedVec::new` has
+exactly one production caller (`BlockBuf::zeroed`, read path), and I generalised that to the type. The
+write path reaches `AlignedVec` through a DIFFERENT constructor: `BlockBuf::new(bytes: Vec<u8>)` calls
+**`AlignedVec::from_vec(bytes, DEFAULT_BLOCK_ALIGNMENT)`**, and MVCC's `VersionData::Full` holds
+`Arc<AlignedVec>` (`compression.rs:242` hands it straight to `BlockBuf::from_shared_aligned`). The
+survey's finding about `AlignedVec::new` stands; the generalisation to `AlignedVec` does not.
+
+**CORRECTION 2 — the staging site I cited is TEST code.** The previous two entries named
+`sharded.rs:2127` (`data.to_vec()`) and `2123` (`BlockBuf::new(data)`) as the write-staging
+allocation. Those lines are inside `CheckpointDevice`, a test helper in the `mod tests` block, not a
+production path. The measured RESULT they were offered to explain — a fresh ~16-page buffer allocated
+per WRITE OP, proven by the rewrite-mode experiment (2,437 faults for one distinct block against 3,533
+for 192) — is unaffected, because that came from measurement rather than from those lines. Only the
+code citation was wrong.
+
+**The sharpened candidate, from code that IS production.** `AlignedVec::from_vec` takes ownership with
+NO copy when the incoming `Vec`'s pointer is already `alignment`-aligned, and otherwise allocates
+`Self::new(len, alignment)` — which is `vec![0_u8; …]`, fresh zeroed pages — and `copy_from_slice`s
+into it, emitting a `copy_detected` trace. That is exactly the shape the fault profile showed:
+`86.44%` of daemon page faults caused by `__memmove_avx_unaligned_erms` into a fresh destination. If
+FUSE write payloads are not 4096-aligned, every write takes that branch.
+
+**⚠ THE COUNT FAILED AS AN INSTRUMENT — recording that rather than the tempting conclusion.** I tried
+to confirm it by counting `copy_detected` with `RUST_LOG=ffs::block::io=trace`, on the release build
+and then on the debug build (legitimate here: whether a branch is taken is logic, not codegen). Both
+runs produced **zero `copy_detected`, zero `buffer_alloc`, and zero `ffs::block::io` lines of ANY
+kind**. `buffer_alloc` is emitted by `AlignedVec::new`, which the read path demonstrably calls, so its
+absence proves the TARGET IS NOT REACHING THE LOG rather than that no copies happen. **A zero from a
+silent instrument is not a measurement**, and reading it as "the copy branch never fires" would be the
+same error as the `MALLOC_CONF` reject this campaign already had to withdraw. The candidate is
+therefore UNCONFIRMED, not refuted.
+
+**What the next attempt needs:** a counter that does not depend on the tracing subscriber — a plain
+atomic incremented in the `copy_detected` branch and reported on the knob/census line, in the same
+style as `crossings_*`. That is the attestation pattern this campaign already uses everywhere else,
+and this row now has a concrete reason to extend it into `ffs-block`.
+
+`hostname=thinkstation1`. Nothing shipped, nothing reverted; no timing claimed. The measured facts on
+this row are unchanged: `12.69`–`18.40` first-touch faults per 64 KiB write op, per WRITE OP rather
+than per distinct block.
