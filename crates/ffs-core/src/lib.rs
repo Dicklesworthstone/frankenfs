@@ -2165,6 +2165,41 @@ fn btrfs_ro_readdir_snapshot_enabled() -> bool {
     })
 }
 
+/// Whether a btrfs full commit defers its pre-superblock barrier until after the
+/// free-space-tree leaf is written, so ONE flush covers both instead of two.
+///
+/// The fsync row counts `3.000` device FLUSH requests per client fsync against
+/// kernel btrfs's `2.000`; this collapses ours to `2.000`. See the reordering
+/// argument at the deferral site — the reachable crash states are the barrier
+/// prefixes, and the reordered set is a strict subset of the original.
+///
+/// `pub` because the mount MUST self-report it: the comparator refuses a run
+/// whose two candidate arms resolve identical knobs, so a knob the daemon does
+/// not report cannot be A/B'd at all.
+///
+/// Default ON. The reorder does not delete a barrier — deleting one would
+/// re-open bd-73bi2, whose read-back is only meaningful against flushed bytes —
+/// it defers one so a single flush covers the tree nodes and the free-space-tree
+/// leaf together, and fires it unconditionally on the paths that skip that leaf.
+/// Evidence, 2026-08-27: traced device sequence `3.000 → 2.000` FLUSHes per
+/// commit with a byte-identical write set; `barrier_prefix_check.py` confirms the
+/// reordered barrier-prefix set is a strict SUBSET of the original's (16 states
+/// removed, 0 added), so no crash state becomes newly reachable; the bd-jhuob
+/// crash-replay suite passes 5/5 both ways; `btrfs check --readonly` clean 3/3
+/// under 8-thread mutation; and the row moves from `1.513698x` slower than kernel
+/// btrfs to `1.014658x` — parity — at a balanced interior `1.490946x`.
+///
+/// Set `FFS_BTRFS_COMMIT_FST_EARLY=0` to restore the three-barrier order.
+#[must_use]
+pub fn btrfs_commit_fst_early() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FFS_BTRFS_COMMIT_FST_EARLY") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "off" | "no"),
+        Err(std::env::VarError::NotUnicode(_)) => false,
+        Err(std::env::VarError::NotPresent) => true,
+    })
+}
+
 fn readdir_snapshot_serve(
     slot: &Mutex<Option<ReaddirSnapshot>>,
     ino: u64,
@@ -32671,7 +32706,31 @@ impl OpenFs {
 
         // Issue fsync barrier before superblock write
         root_executor.fsync_barrier();
-        self.dev.sync(cx)?;
+        // The free-space-tree leaf below is written AFTER this point and then
+        // flushed by a barrier of its own, which is why a full commit costs
+        // 3.000 device FLUSHes against kernel btrfs's 2.000. Nothing requires
+        // the tree nodes to be durable before the FST leaf is written — the
+        // constraint set is only (a) every block the superblock names is
+        // durable before the superblock, and (b) the bd-73bi2 read-back reads
+        // bytes a barrier put on disk. Deferring this barrier until after the
+        // FST write satisfies both with ONE flush instead of two, and is the
+        // rule `btrfs_publish_tree_log` already states for the tree-log path
+        // ("ONE barrier after ALL nodes, not one per node"). The full-commit
+        // path did not follow it only because the FST write was appended after
+        // the barrier rather than before it.
+        //
+        // Crash-safety of the reorder is a prefix argument, not a claim about
+        // timing: the states a crash can expose are the barrier prefixes.
+        // Before: {}, {nodes}, {nodes+fst}, {nodes+fst+sb}. After: {},
+        // {nodes+fst}, {nodes+fst+sb}. The new set is a strict SUBSET of the
+        // old one, so the reorder cannot expose a state the old order could
+        // not. It only removes the intermediate {nodes} state.
+        let mut commit_barrier_pending = if btrfs_commit_fst_early() {
+            true
+        } else {
+            self.dev.sync(cx)?;
+            false
+        };
 
         // Get root_tree root location for superblock
         let root_tree_root = alloc.root_tree.root_block();
@@ -32773,11 +32832,34 @@ impl OpenFs {
                                 "free-space tree write failed: {e}"
                             )))
                         })?;
+                    // Under `btrfs_commit_fst_early` this is the deferred
+                    // barrier from above, now covering the tree nodes AND this
+                    // leaf in one flush; otherwise it is the second of three.
                     self.dev.sync(cx)?;
+                    commit_barrier_pending = false;
                     fst_committed = true;
                 }
             }
         }
+
+        // Every path out of the FST block must leave the write set durable
+        // before the bd-73bi2 read-back and the superblock. When the FST leaf
+        // was written the barrier above already did it; when it was not (no
+        // `fst_reuse`, a multi-level extent tree, or a leaf that would split)
+        // the deferred barrier fires here, still ahead of both.
+        if commit_barrier_pending {
+            self.dev.sync(cx)?;
+            commit_barrier_pending = false;
+        }
+        // A hard assert, not a `debug_assert`: reaching the superblock write with
+        // this still set would mean publishing a pointer to blocks no barrier made
+        // durable, which is the bd-73bi2 / bd-sv7ql P0 shape. One bool test per
+        // commit is not a cost worth trading for the guarantee, and it is what
+        // pins the deferral for the paths that skip the free-space-tree write.
+        assert!(
+            !commit_barrier_pending,
+            "btrfs commit reached the superblock with its write set unflushed"
+        );
 
         drop(alloc);
 

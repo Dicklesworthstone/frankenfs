@@ -9,6 +9,8 @@ ELF=${ELF:?set ELF to the ffs-cli under test}
 OPS=${OPS:-8}
 FM=/home/ubuntu/fs-fa
 TAG=${TAG:-strace}
+# Extra env for the daemon, so a commit-path knob can be traced from ONE ELF.
+FENV=${FENV:-}
 LOOPS=""
 cleanup() {
   fusermount3 -u "$FM" 2>/dev/null || true
@@ -23,7 +25,8 @@ LOOPS="$DEV"
 sudo -n chown "$(id -u)" "$DEV"
 echo "loop=$DEV dio=$(cat /sys/block/$(basename "$DEV")/loop/dio)"
 
-env FFS_MOUNT_BENCH_EVIDENCE=1 RUST_LOG=warn taskset -c 18 \
+# shellcheck disable=SC2086
+env FFS_MOUNT_BENCH_EVIDENCE=1 RUST_LOG=warn $FENV taskset -c 18 \
   "$ELF" mount --rw "$DEV" "$FM" >> "$W/fsfuse-$TAG.log" 2>&1 &
 FPID=$!
 for _ in $(seq 1 300); do mountpoint -q "$FM" && break; sleep 0.1; done

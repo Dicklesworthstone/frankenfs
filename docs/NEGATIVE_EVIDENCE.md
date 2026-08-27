@@ -14291,3 +14291,130 @@ finding.
   * ⚠ A per-phase A/A null can fail while the whole-batch null passes. The write phase here
     is 12% asymmetric between two identical kernel arms; without per-phase nulls the
     forward run's `1.377530` write-phase ratio would have been published.
+
+## 2026-08-27 — the btrfs fsync row reaches KERNEL PARITY: the third barrier is not deleted but DEFERRED, `3.000 → 2.000` FLUSHes, `1.513698x` slower → `1.014658x`, balanced interior `1.490946x`
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/fsync_journal_ab/run_fsync_btrfs.sh`, `fsync_strace.sh`,
+`barrier_prefix_check.py` (new), `scripts/perf/parallel_metadata_ab/rm_gate_btrfs.sh`.**
+Provenance: in-process self-report
+`bench_evidence,binary_sha256=095be5bc12655399b8002f9d67caa83da0f0bf6399ed3b28c4189d87d37f2b0b`
+(measurement ELF, knob default OFF) and
+`98fa982b00f996d55a8a0b183793493c50ca5c5732b251b40aee39541230c280` (shipped ELF, default
+ON), `codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19, client on CPU 8, every arm on its own
+loop device with `losetup --direct-io=on`.
+
+One commit ago this row was located but **NOT TAKEN**: three device FLUSHes per client
+fsync against kernel btrfs's two, the middle one a bd-73bi2 verification flush whose naive
+deletion would re-open a P0, and the stated blocker was "needs the crash/replay gate". This
+takes it, and the barrier is **deferred, never deleted**.
+
+### The change
+
+`crates/ffs-core/src/lib.rs`, behind `FFS_BTRFS_COMMIT_FST_EARLY` (**default ON**). The
+pre-superblock barrier no longer fires immediately after the tree nodes; it is deferred so
+the barrier that already follows the free-space-tree leaf covers **both**. Every path that
+skips the FST write fires the deferred barrier unconditionally afterwards, guarded by a
+hard `assert!` — not a `debug_assert!` — because reaching the superblock with an unflushed
+write set is exactly the bd-73bi2 / bd-sv7ql shape.
+
+    before                                   after
+    ------------------------------------     ------------------------------------
+    4 tree nodes                             4 tree nodes
+    BARRIER 1                                free-space-tree leaf
+    free-space-tree leaf                     BARRIER 1'   (covers both)
+    BARRIER 2                                bd-73bi2 read-back
+    bd-73bi2 read-back                       superblock
+    superblock                               BARRIER 2'
+    BARRIER 3
+
+### Counted mechanism, traced on the live daemon
+
+`fsync_strace.sh` (now with an `FENV` passthrough so a commit-path knob is traceable from
+ONE ELF), `-e trace=pwrite64,fdatasync`, 16 commits:
+
+| config | pwrites | fdatasyncs | per-commit sequence |
+| --- | --- | --- | --- |
+| `=0` | 96 | 48 | `N N N N B FST B SB B` — **3.000 barriers** |
+| `=1` | 96 | 32 | `N N N N FST B SB B` — **2.000 barriers** |
+
+**The write set is identical** — 96 pwrites, same offsets, same sizes, same order of
+blocks. Only the barrier positions move. The device counter agrees:
+`/sys/block/<dev>/stat` FLUSH requests `600 → 400` per 32 rounds, and `k1/fstEarly` on
+`flush_ios` is **exactly `1.000000`** — we now issue precisely the kernel's barrier count.
+
+### ⭐ The crash-consistency gate: a prefix-SUBSET proof, mechanically checked
+
+A crash exposes some prefix of the write stream, and the states a filesystem must survive
+are the ones a barrier made durable — so the reachable crash states of a commit are its
+**barrier prefixes**. `barrier_prefix_check.py` reconstructs those sets from the two
+straces and compares them:
+
+    old: 16 commits, 3 barriers each, 48 distinct barrier prefixes
+    new: 16 commits, 2 barriers each, 32 distinct barrier prefixes
+    PASS: every post-reorder barrier prefix was already reachable before;
+          the reorder removes 16 intermediate state(s) and adds none
+
+This is the right gate for a REORDER, where the previous commit's write-sequence-IDENTITY
+oracle cannot apply by construction: a reorder changes the sequence on purpose. Subset, not
+identity, is the property that matters, and it is decidable from the same trace.
+
+Corroborating gates, both configurations:
+
+| gate | `=0` | `=1` |
+| --- | --- | --- |
+| bd-jhuob crash-replay suite (drops `OpenFs` uncommitted = power loss) | 5/5 | **5/5** |
+| `btrfs check --readonly`, 8 threads × 4096 ops, shared parent | 3/3 clean | **3/3 clean** |
+| files left on disk after sweep | 0 | **0** |
+| `cargo test -p ffs-core` (1249 lib + integration) | clean | clean |
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+`run_fsync_btrfs.sh`, 32 rounds × 200 ops, four arms up simultaneously (two live kernel
+btrfs RW mounts = the A/A null, two FrankenFS mounts from ONE ELF), arm order rotated per
+round, run forward and mirrored with arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced `sqrt(f·m)`** |
+| --- | --- | --- | --- |
+| interior A/B (`base3b/fstEarly`) | `1.487071` `[1.471332, 1.499054]` | `1.494831` `[1.488728, 1.501504]` | **`1.490946x`** |
+| **row vs kernel, before** | `1.506467` | `1.520963` | **`1.513698x` slower** |
+| **row vs kernel, after** | `1.015513` | `1.013803` | **`1.014658x` — PARITY** |
+| A/A null (`k1/k2`) | `0.995358` `[0.987134, 1.004287]` | `0.997372` `[0.985513, 1.005960]` | `0.996364` **PASS** |
+
+Absolutes, forward run: kernel `k1` `3658.808 ms` / `18294.04 us/op`, `base3b`
+`5565.398 ms` / `27826.99 us/op`, `fstEarly` `3755.118 ms` / `18775.59 us/op`. Sectors
+written are identical between our two arms (`33600` both), and `write_ios` drops
+`1200 → 1000` because the FST write now joins the node run ahead of the barrier instead of
+standing alone behind it.
+
+⭐ **The counted prediction and the wall clock agree to 0.6%.** The barrier ratio
+`3.000/2.000 = 1.500` predicted the gain; the balanced measurement is `1.490946x`. The two
+mirrored halves agree to `0.52%`.
+
+### Admissibility and limits
+
+  * Hand rig, not `ffs-mounted-kernel-bench` — the ELF fails that instrument's ISA and PGO
+    gates. Ratios here are same-invocation against live kernel btrfs with a passing A/A
+    null, forward and mirrored.
+  * ⛔ The prefix-subset argument is checked **on the traces this workload produced**. It
+    covers every commit shape the fsync row exercises; a commit that skips the FST write
+    (no `fst_reuse`, a multi-level extent tree, or a leaf that would split) is covered by
+    the unconditional deferred fire and its hard `assert!`, not by a traced prefix set.
+  * ⛔ Not measured: whether the same deferral helps any non-fsync btrfs row. The write set
+    is unchanged, so no other row should regress, but "should" is not a measurement.
+
+### Transferable
+
+  * ⭐⭐ **For a REORDER, the gate is barrier-prefix SUBSET, not sequence identity.** The
+    identity oracle from one commit ago is unusable here by construction. Subset is
+    strictly weaker, exactly as strong as it needs to be, and decidable from the same
+    strace — `scripts/perf/fsync_journal_ab/barrier_prefix_check.py`.
+  * ⭐ **"We issue one barrier too many" is almost never an argument for deleting one.**
+    Deleting barrier 2 here would have silently defeated the bd-73bi2 read-back and
+    re-opened a P0. Deferring barrier 1 gets the whole `1.500x` and strengthens nothing
+    away.
+  * ⭐ A hard `assert!` is the right pin for a durability invariant whose violating path is
+    the one your trace does not reach. One bool per commit buys the branch coverage the
+    rig cannot.
