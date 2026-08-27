@@ -8023,7 +8023,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},jemalloc_dirty_decay_ms={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},jemalloc_dirty_decay_ms={},fuse_no_flush={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -8065,6 +8065,9 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             // 2026-08-27: read back from jemalloc, not echoed from the env, so the
             // line attests what the allocator actually holds.
             DIRTY_DECAY_MS_IN_FORCE.load(std::sync::atomic::Ordering::Relaxed),
+            // 2026-08-27: ENOSYS on FLUSH removes one crossing per close(2);
+            // reported so the arm can be A/B'd from ONE ELF.
+            ffs_fuse::no_flush_measurement_enabled(),
         );
     }
 

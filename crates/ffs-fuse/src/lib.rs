@@ -320,6 +320,38 @@ pub fn zero_message_open_measurement_enabled() -> bool {
     })
 }
 
+/// Answer FUSE `FLUSH` with `ENOSYS` so the kernel stops sending it
+/// (`FFS_FUSE_NO_FLUSH`, default OFF — an arm to measure).
+///
+/// The kernel emits one `FLUSH` per `close(2)`, and on the create/delete storm
+/// that is **50,000 crossings per batch, 6.8% of all crossings**, landing in the
+/// mutating bucket that costs **13,946 ns/crossing** against 3,076–4,905 ns for
+/// every read opcode. `fuse_flush()` treats `-ENOSYS` as "not implemented" — it
+/// sets `fc->no_flush` and returns success — so one reply removes the opcode for
+/// the life of the mount.
+///
+/// What FLUSH is for, and why this filesystem owes it nothing today:
+///
+/// - **Deferred write errors at `close(2)`.** `FsOps::flush` returns `Ok(())`
+///   unconditionally for both formats; its whole body is two `info!` records
+///   tagged `durability_boundary = "none"`. There is no error to report.
+/// - **Releasing POSIX locks held by the closing fd.** `getlk` always answers
+///   `F_UNLCK` and `setlk` always answers ok — no lock state is held anywhere, so
+///   there is nothing for FLUSH to release.
+///
+/// ⚠ Default OFF regardless, because both of those are properties of the code as
+/// it stands rather than invariants anyone has promised: the day `FsOps::flush`
+/// gains a durability or error-reporting duty, or locking stops being a stub,
+/// this knob silently drops it. Anything shipping it must re-check both.
+#[must_use]
+pub fn no_flush_measurement_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_FUSE_NO_FLUSH")
+            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+    })
+}
+
 /// FUSE-over-io_uring transport configuration (bd-vbqc6).
 ///
 /// # Why this exists before the transport does
@@ -6686,6 +6718,14 @@ impl Filesystem for FrankenFuse {
     }
 
     fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        // MEASUREMENT ONLY, default OFF — see `no_flush_measurement_enabled`.
+        // One `ENOSYS` makes the kernel set `fc->no_flush` and stop sending FLUSH
+        // for the life of the mount, which is the only way to remove a crossing
+        // the kernel emits on every `close(2)`.
+        if no_flush_measurement_enabled() {
+            reply.error(libc::ENOSYS);
+            return;
+        }
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Flush, |cx, scope| {
             self.inner

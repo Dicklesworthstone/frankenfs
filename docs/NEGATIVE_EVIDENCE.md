@@ -14993,3 +14993,114 @@ a win does.* Here the code answered explicitly, which is what an evidence line i
     `auditctl -s`/`-l` alongside the governor and the CPU placement.
   * ⭐ **A refusal is not a null.** Report the gate's verdict, not the ratio its refused arm
     produced.
+
+## 2026-08-27 — the create/delete storm is the biggest GENUINELY-OURS row (audit is 11.2% of its dispatch, not 96%); and ⛔ REJECT: `ENOSYS` on FLUSH removes 50,000 crossings and the kernel replaces them with 45,233 GETATTRs, for a balanced `1.026199x` LOSS
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh` and `sperf.sh`.** Provenance:
+in-process self-report
+`bench_evidence,binary_sha256=31652ce23e7d88b6b4b7133adc9fdc5e6f433090dc6cd86c3203333546f13d38`
+(census/profile) and
+`81a4e5ab3ba280b204ae1e5c31ec8345cf5869115b83f208ef755dc279bd420d` (the ELF carrying the
+new `FFS_FUSE_NO_FLUSH` arm),
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19, client on CPU 8, loop devices
+`--direct-io=on`.
+
+Yesterday's call-site proof made every read-side row an audit-probe row. **This asks which
+row is still ours**, and the answer is the storm.
+
+### 2026-08-27 — the storm is NOT audit-dominated, and it is `5.522404x` vs live kernel ext4
+
+`FFS_MOUNT_BENCH_EVIDENCE=1` `dispatch_ns_*` against `crossings_*`, one arm, 24 rounds ×
+2,000 create+delete pairs:
+
+| opcode | crossings | share of count | dispatch | share of time | ns/crossing |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **`other`** (create, unlink, flush, fsyncdir) | 250,051 | 33.8% | **3,487.3 ms** | **63.7%** | **13,946** |
+| `getxattr` (all of it the audit probe) | 200,051 | 27.1% | 615.3 ms | **11.2%** | 3,076 |
+| `lookup` | 100,001 | 13.5% | 602.2 ms | 11.0% | 6,022 |
+| `getattr` | 138,934 | 18.8% | 526.9 ms | 9.6% | 3,792 |
+| `release` | 50,000 | 6.8% | 245.3 ms | 4.5% | 4,905 |
+| **total** | **739,137** | 100% | **5,477.5 ms** | 100% | 7,411 |
+
+The storm issues no explicit `getxattr`, so **all 200,051 are audit probes** — and they are
+`27.1%` of the crossing COUNT but only **`11.2%` of dispatch TIME**, because a probe is the
+cheapest crossing on the row at `3,076 ns` while a mutating one costs **`13,946 ns`, 4.5×
+more**. ⭐ On readdir+stat the audit probe was 96% of the row; here it is a ninth of it.
+
+`perf` agrees the work is ours: by DSO the storm daemon is **`76.61%` kernel / `17.72%`
+`ffs-cli` / `4.37%` libc**, against `91.04%` / `5.61%` on the xattr row. The userspace is
+flat — `ShardedMvccStore::commit` `0.77%`, `ext4::lookup_in_dir_block` `0.61%`,
+`fuser::Request::dispatch` `0.52%`, jemalloc `0.95%` — so it is the whole mutating path, not
+one symbol.
+
+**Row vs live kernel ext4, balanced over the mirrored pair: `5.522404x` slower**
+(`k1/base` `0.179290` forward, `0.182889` mirrored). Absolutes:
+kernel_median_wall_ns=84872000 and kernel_median_wall_ns=87691000 against
+fuse_median_wall_ns=473365000 and fuse_median_wall_ns=481905000.
+Same-invocation A/A null control `0.999189` bootstrap median CI `[0.988199, 1.008896]` and
+same-invocation A/A null control `0.983672` bootstrap median CI `[0.964946, 1.017711]`, both
+from 20000 resamples over the 24 paired per-round ratios. `RCH_WORKER=none`,
+`hostname=thinkstation1`. Executing ELF, self-reported in-process by the daemon at mount:
+`mount_bench_evidence,binary_sha256=81a4e5ab3ba280b204ae1e5c31ec8345cf5869115b83f208ef755dc279bd420d`.
+Counted mechanism: the per-opcode `dispatch_ns_*` / `crossings_*` table above, read off the
+daemon's own counters.
+
+### ⛔ REJECT — `FFS_FUSE_NO_FLUSH=1`, balanced `1.026199x` SLOWER
+
+`FsOps::flush` is a no-op: its whole body is two `info!` records tagged
+`durability_boundary = "none"`, it returns `Ok(())` unconditionally for both formats, and
+FLUSH's other duty — releasing POSIX locks — is vacuous here because `getlk` always answers
+`F_UNLCK` and `setlk` always answers ok. So FLUSH looked free to delete: `fuse_flush()`
+treats `-ENOSYS` as "not implemented", sets `fc->no_flush`, and stops sending the opcode for
+the life of the mount. That is **50,000 crossings per batch, in the `13,946 ns` bucket**.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `noflush/base` | `1.031364` `[1.007295, 1.059154]` | `1.021060` `[0.999594, 1.051224]` | **`1.026199x` SLOWER** |
+| A/A null `k1/k2` | `0.999189` `[0.988199, 1.008896]` | `0.983672` `[0.964946, 1.017711]` | `0.991400` **PASS** |
+
+**The lever ran** — `fuse_no_flush=true` in the self-report, and `flush=50000` disappears
+from `op_counts` entirely.
+
+⭐⭐ **The counted mechanism is a SUBSTITUTION, and it is why this fails:**
+
+| counter | base | `NO_FLUSH=1` | Δ |
+| --- | ---: | ---: | ---: |
+| `op_counts flush` | 50,000 | **0** | −50,000 |
+| `op_counts getattr` | 148,566 / 146,452 | **193,799 / 185,878** | **+45,233 / +39,426** |
+| `crossings_other` | 250,051 | 200,048 | −50,003 |
+| **`crossings_total`** | **748,769** | **743,999** | **−4,770 (0.6%)** |
+
+Removing FLUSH does not remove a round trip; the kernel loses the point at which it
+refreshes the inode and revalidates with a **GETATTR** instead, recovering `~90%` of the
+crossings and costing more wall than it saved. **REJECTED**, knob kept default OFF and
+documented so nobody re-derives it.
+
+### Transferable
+
+  * ⭐⭐⭐ **Removing a crossing can make the kernel issue a different one.** Read the
+    census on BOTH arms and compare `crossings_total`, not just the opcode you targeted.
+    Here the targeted opcode fell by 50,003 and the total fell by 4,770.
+  * ⭐⭐ **Crossing COUNT and crossing TIME rank rows differently.** The audit probe is
+    `27.1%` of this row's crossings and `11.2%` of its time; the mutating bucket is `33.8%`
+    of crossings and `63.7%` of time. Always divide `dispatch_ns_*` by `crossings_*` before
+    choosing a target.
+  * ⭐ **A no-op handler is not a free deletion.** `FsOps::flush` genuinely does nothing, and
+    the opcode still cannot be removed, because its value to the kernel is not what the
+    handler computes.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored, 20000-resample bootstrap median CIs over 24 paired per-round ratios.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=noflush FB_ENV="FFS_FUSE_NO_FLUSH=1" TAG=nf1 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+    python3 scripts/perf/create_delete_storm_ab/sanalyze.py <body.csv>
