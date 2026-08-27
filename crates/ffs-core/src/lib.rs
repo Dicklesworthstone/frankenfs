@@ -2266,7 +2266,29 @@ fn systemtime_nanos(t: std::time::SystemTime) -> u64 {
 /// Csum-tree items `(key, packed crc32c values)` used by the read-verify path.
 type BtrfsCsumItems = Vec<(BtrfsKey, Vec<u8>)>;
 
-const EXT4_FILE_DATA_BLOCK_CACHE_LIMIT: usize = 256;
+/// Read-only file-data block cache capacity, in BLOCKS (bd-coldcache).
+///
+/// 256 blocks is 1 MiB. The cold-cache parallel-read row has a 64 MiB working set
+/// (256 files x 256 KiB), so the cache holds 1.6% of it and every read misses to the
+/// device AND pays a FUSE round trip -- measured 1.387074x against kernel ext4 on the
+/// one row where a userspace cache could structurally BEAT the kernel, because after
+/// `drop_caches` the kernel must re-read from the device while our heap need not.
+///
+/// `FFS_EXT4_FILE_DATA_CACHE_BLOCKS` overrides it so the hypothesis can be A/B'd from one
+/// ELF. Default UNCHANGED at 256: raising a cache limit is the shape of lever this
+/// campaign has already seen reverse under wall clock (the floor-memo 4->16 change counted
+/// 2.93x fewer descents and measured a 6-14% wall LOSS), and the resident cost is real --
+/// 16384 blocks is 64 MiB of RSS per mount.
+fn ext4_file_data_block_cache_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("FFS_EXT4_FILE_DATA_CACHE_BLOCKS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(256)
+    })
+}
 const EXT4_INODE_ATTR_CACHE_LIMIT: usize = 65536;
 const EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT: usize = 4096;
 /// Maximum number of immutable btrfs inode attributes retained by the
@@ -13733,7 +13755,7 @@ impl OpenFs {
             self.ext4_file_data_block_cache.insert_within(
                 block,
                 Arc::clone(&block_data),
-                EXT4_FILE_DATA_BLOCK_CACHE_LIMIT,
+                ext4_file_data_block_cache_limit(),
             );
         }
         Ok(block_data)
@@ -16063,7 +16085,7 @@ impl OpenFs {
                             self.ext4_file_data_block_cache.insert_within(
                                 blk,
                                 Arc::from(data.as_slice()),
-                                EXT4_FILE_DATA_BLOCK_CACHE_LIMIT,
+                                ext4_file_data_block_cache_limit(),
                             );
                         }
                         let (entries, _tail) = parse_dir_block(data, block_size)
