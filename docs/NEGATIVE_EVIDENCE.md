@@ -16682,3 +16682,109 @@ Reproduce:
     WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/vec_eq.sh off1 ""
     WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/vec_eq.sh on1 \
       FFS_MVCC_FLUSH_VECTORED=1
+
+## 2026-08-27 — bd-warm-stat-is-the-fuse-floor-4wxw9: the BTRFS twin, measured. `99.997%` of the row is the audit probe — `7.724334x` slower becomes `1.024594x` FASTER than kernel btrfs, both A/A halves passing
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, NEW rig
+`scripts/perf/warm_stat_btrfs_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=7f08ce8064cf53658e2ba79f30dc8d5fbb80001551b61ecd3724fd3d2176bec8`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8.
+
+The bead's note records the ext4 half as answered and names what is left: *"the btrfs twin
+(`4.977803x`) is unmeasured under the switch, and the suppression is only correct for an
+xattr-free image, so the shippable version of this result is still missing."* **This measures
+the btrfs twin.**
+
+The rig is the harness's `stat_batch` (`ffs_mounted_kernel_bench.rs:3812`) against four live
+mounts in one invocation — two kernel btrfs read-only mounts (the A/A null) and two FrankenFS
+mounts from ONE ELF — arm order rotated per round, 24 rounds × 4,000 stats, single client
+thread, forward and mirrored with arms **and** daemon CPUs swapped. The fixture's
+`payload.bin` is created through a kernel mount. The digest folds size/mode/nlink/index and
+never a path, so all four arms must agree: **they do, `7246260210447973673` in both runs.**
+
+### The census: the row is the probe, and almost nothing else
+
+| arm | gate verdict | `crossings_lookup` | `crossings_getattr` | `crossings_getxattr` | `crossings_total` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| base | `presence=not_scanned` | 1 | **1** | **96,201** | **96,204** |
+| `FFS_FUSE_XATTR_NO_SUPPORT=1` | `presence=proven_absent` | 1 | 1 | **1** | **4** |
+
+**`96,201 / 96,204 = 99.997%` of every crossing on this row is the audit
+`security.capability` probe**, at exactly **`1.000` per stat** over 96,200 stats. Suppressed,
+the entire 96,000-stat row costs **four crossings**.
+
+⭐ `crossings_getattr = 1` confirms the bead's own diagnosis from the ext4 half: `ATTR_TTL=60s`
+already suppresses `getattr` entirely, which is why no attr-cache lever ever showed on this
+row.
+
+⭐⭐ **The probe RATE differs by format.** ext4 warm stat counts `2.000` probes per stat; btrfs
+counts `1.000`. Same kernel, same client, same call site — the difference is how many path
+components each format's lookup resolves through FUSE. The *rate* is format-dependent even
+though the *cause* is not.
+
+### bd-warm-stat-is-the-fuse-floor-4wxw9 — measured vs the LIVE kernel incumbent, same invocation
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/noxattr` | `7.726535` `[7.555777, 7.923265]` | `7.904201` `[7.577199, 8.267296]` | **`7.814863x`** |
+| **row vs kernel btrfs, before** | `7.702736` | `7.745993` | **`7.724334x` slower** |
+| **row vs kernel btrfs, after** | `1.019610` `[1.013490, 1.047011]` | `1.029602` `[1.015481, 1.045546]` | **`1.024594x` FASTER** |
+| A/A null `k1/k2` | `0.999011` `[0.990390, 1.007053]` **PASS** | `1.001292` `[0.984331, 1.014333]` **PASS** | `1.000151` |
+
+⭐⭐ **A balanced A/A residual of `0.015%`** — both halves passing, the cleanest null of the
+campaign — against a `7.8x` effect. Absolutes: kernel_median_wall_ns=8613000 and
+kernel_median_wall_ns=8566000 against fuse_median_wall_ns=65808000 /
+fuse_median_wall_ns=8332000 (forward) and fuse_median_wall_ns=67550000 /
+fuse_median_wall_ns=8366000 (mirrored). All CIs are 20000-resample bootstrap medians over the
+24 paired per-round ratios.
+
+⇒ **With the probe gone, FrankenFS warm stat on btrfs BEATS kernel btrfs by `2.5%`.** The
+`7.724334x` is not filesystem work; it is one external round trip per stat.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by the
+daemon at mount:
+`mount_bench_evidence,binary_sha256=7f08ce8064cf53658e2ba79f30dc8d5fbb80001551b61ecd3724fd3d2176bec8`.
+Same-invocation A/A null control `0.999011` bootstrap median CI `[0.990390, 1.007053]` and
+same-invocation A/A null control `1.001292` bootstrap median CI `[0.984331, 1.014333]`, both
+from 20000 resamples over the 24 paired per-round ratios. Counted mechanism:
+`crossings_getxattr` **96,201 → 1** and `crossings_total` **96,204 → 4**, read off the
+daemon's own counters.
+
+### What this closes on the bead, and what it does not
+
+  * ✅ **Closed: the btrfs twin is measured under the switch**, and it behaves as the ext4 half
+    did — the entire gap is the probe, and removing it lands past parity.
+  * ✅ **Closed: the bead's framing is confirmed.** "Two filesystems with completely different
+    inode representations losing by the same factor says the cost is in the shared path" — the
+    shared path is now named, counted per format, and shown to be all of it on both.
+  * ⛔ **Still open, unchanged: the shippable version.** `presence=proven_absent` is a fact
+    about the image at mount, and a suppressing mount is a RESTRICTED mount with no xattr
+    support at all. Nothing here makes that shippable; it makes the size of the prize exact.
+
+### Transferable
+
+  * ⭐⭐ **A row can be `99.997%` external.** Warm stat is the campaign's cleanest instrument
+    precisely because it has almost no filesystem work in it — which is what makes it the best
+    place to measure something that is not filesystem work either.
+  * ⭐ **Confirm a cross-format law by measuring the rate, not just the cause.** `2.000` on
+    ext4 against `1.000` on btrfs would look like a contradiction if only the cause were
+    checked.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates,
+so `7.724334x` is not a scorecard row and is additionally ISA-overstated. Every ratio is
+same-invocation against live kernel btrfs with its A/A null reported, forward and mirrored,
+both halves passing. The banked `4.977803x` was measured at the harness's own operation count;
+this rig's `7.724334x` is a different batch shape and does not supersede it.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/warm_stat_btrfs_ab/mkwarm_btrfs.sh
+    gcc -O2 -o $WORK/warmstat_ab scripts/perf/warm_stat_btrfs_ab/warmstat_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=4000 CPUBASE=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=noxattr FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=wf1 \
+      bash scripts/perf/warm_stat_btrfs_ab/run_warm_btrfs.sh
+    python3 scripts/perf/warm_stat_btrfs_ab/wanalyze.py <body.csv>
