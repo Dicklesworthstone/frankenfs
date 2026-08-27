@@ -17088,3 +17088,101 @@ Ratios are same-invocation against live kernel ext4 with both A/A nulls reported
 mirrored. This entry does not revise the banked harness warm-stat figures, which were measured
 at the harness's own batch shape; it withdraws a cross-format claim I made about the pure
 stat loop.
+
+## 2026-08-27 — bd-3d2c0: the spin lever's CPU price is `+36.4%`/`+39.0%` for a balanced `1.444255x`, and the ADAPTIVE mode is a NULL that saves no CPU either — measured for the first time, because it was UNATTESTABLE until this commit
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/xattr_ab/run_xattr.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=75b1e3f0b871ce7e0168d8f7ec16bbfbf97c5ca4096b6003e838e61a7602fc6f`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8. The row is
+ext4 `xattr-get-list-report` — the campaign's worst vs-incumbent ratio.
+
+### Two instrument fixes this bead required first
+
+⚠ **`FFS_FUSE_RECEIVE_SPIN_ADAPTIVE` and `FFS_FUSE_SPIN_PAUSE` were UNATTESTABLE.** Both are
+implemented in `vendor/fuser/src/channel.rs` and read from the environment, and **neither was
+on `mount_candidate_knobs`** — so the comparator could not prove two arms differed and *no
+A/B of the adaptive mode was admissible*. Added as `receive_spin_adaptive` and `spin_pause`,
+delegating to the transport's own parser rather than reimplementing it (the rule
+`receive_spin()` already states: two copies of one contract drift, and a knob line that
+describes a configuration the daemon did not run is worse than none). Every run below carries
+`receive_spin_adaptive=false|true`.
+
+⚠ **The rig could only price ONE arm.** `xattr_ab`'s `daemon_ticks` column follows a single
+pid, so a CPU cost quoted from it is the cost of whichever arm happened to be A — which is how
+the `+33%` figure quoted earlier today was produced ("arm-A-only counter, one run each,
+indicative"). `run_xattr.sh` now snapshots `utime+stime` for **both** daemons around the whole
+run and emits `daemon_cpu_ticks,<arm>,<ticks>`.
+
+### The spin lever, and its price
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/spin` | `1.446869` `[1.368870, 1.482018]` | `1.441645` `[1.399870, 1.484102]` | **`1.444255x`** |
+| A/A null `k1/k2` | `1.000988` `[0.980550, 1.008404]` **PASS** | `1.003632` `[0.998716, 1.044834]` **PASS** | `1.002309` |
+
+| daemon CPU (ticks, `utime+stime`, whole run) | base | spin | Δ |
+| --- | ---: | ---: | ---: |
+| forward | 412 | 562 | **+36.4%** |
+| mirrored | 405 | 563 | **+39.0%** |
+
+⭐ The two mirrored halves agree to `0.36%` on the wall and the CPU price reproduces in both
+directions. ⇒ **The lever buys `1.444255x` of wall for `~37%` more daemon CPU** — a real
+trade, now priced on both sides instead of one, and consistent with the scope rule that spin
+wins only where the daemon is not saturated.
+
+### ⛔ REJECT: the ADAPTIVE mode is a NULL, and it does not save CPU
+
+Adaptive spinning exists to shrink the budget when requests are sparse — *"it changes when the
+daemon burns CPU"* — so its promise is CPU, not wall.
+
+| ratio | forward | mirrored |
+| --- | --- | --- |
+| adaptive vs fixed | `fixed/adaptive = 0.975351` `[0.953010, 1.004471]` | `adaptive/fixed = 0.976785` `[0.916068, 1.027123]` |
+| direction | adaptive `2.5%` SLOWER | adaptive `2.3%` FASTER |
+| A/A null `k1/k2` | `1.009062` `[0.998372, 1.098716]` **PASS** | `1.013558` `[0.999834, 1.112861]` **PASS** |
+
+**Both CIs span 1 and the two halves disagree in SIGN — an undecidable NULL on wall.** And on
+the quantity it exists for:
+
+| daemon CPU (ticks) | fixed | adaptive |
+| --- | ---: | ---: |
+| forward | 545 | **555** |
+| mirrored | 571 | **546** |
+
+`+1.8%` in one direction, `−4.4%` in the other — **inconsistent in sign, `~±3%` in magnitude,
+against a lever that costs `+37%`**. ⇒ **REJECTED**: adaptive delivers neither wall nor the
+CPU saving that is its entire premise, on the row where the fixed mode's cost is largest and
+therefore where adaptation had the most to give back.
+
+Digest parity PASS across all four arms in every run above.
+
+### Transferable
+
+  * ⭐⭐⭐ **A mode that cannot be attested has never been measured, whatever the tree
+    suggests.** The adaptive path has been implemented and reachable for weeks; because it was
+    absent from the knobs line, every A/B of it would have been inadmissible, so its first
+    real measurement is this one — and it is a reject.
+  * ⭐⭐ **Price both sides of a lever with a counter that sees both arms.** A single-pid tick
+    column silently prices whichever arm is A; the `+33%` it produced earlier today is
+    superseded by `+36.4%`/`+39.0%` from a counter that reads both daemons.
+  * ⭐ **Test a lever on the quantity it promises.** Adaptive spin's claim is CPU, so a
+    wall-only null would have been an incomplete rejection; the CPU column is what makes it a
+    finished one.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+All ratios are same-invocation against live kernel ext4 with both A/A nulls reported, forward
+and mirrored, every half passing. Daemon CPU is `utime+stime` deltas across the whole run,
+per arm.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=fixed FB_LABEL=adaptive \
+      FA_ENV="FFS_FUSE_RECEIVE_SPIN=2000" \
+      FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000 FFS_FUSE_RECEIVE_SPIN_ADAPTIVE=1" TAG=ad1 \
+      bash scripts/perf/xattr_ab/run_xattr.sh

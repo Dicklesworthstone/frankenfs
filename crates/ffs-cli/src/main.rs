@@ -8024,7 +8024,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},ext4_file_data_extent_cache_bytes={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={},btrfs_verify_data_on_read={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},receive_spin_adaptive={},spin_pause={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},ext4_file_data_extent_cache_bytes={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={},btrfs_verify_data_on_read={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -8035,6 +8035,12 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             ffs_fuse::io_uring_payload_bytes(),
             ffs_fuse::splice_enabled(),
             ffs_fuse::receive_spin(),
+            // bd-3d2c0: both were implemented in the transport and readable from
+            // the environment while ABSENT from this line, so neither could be
+            // A/B'd admissibly. A knob the daemon does not self-report is
+            // unattestable (bd-087wt).
+            ffs_fuse::receive_spin_adaptive(),
+            ffs_fuse::spin_pause(),
             ffs_fuse::readdirplus_attr_memo_enabled(),
             ffs_fuse::readdirplus_batch_attrs_enabled(),
             ffs_fuse::readdirplus_inode_order_enabled(),

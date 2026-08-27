@@ -183,6 +183,36 @@ pub fn receive_spin() -> u32 {
     )
 }
 
+/// Whether the receive spin's budget ADAPTS to the observed request rate
+/// (`FFS_FUSE_RECEIVE_SPIN_ADAPTIVE`, default OFF).
+///
+/// Delegates to the transport's own parser for the reason spelled out on
+/// [`receive_spin`]: two copies of one contract drift, and a knob line that
+/// describes a configuration the daemon did not run is worse than no knob line.
+///
+/// ⚠ bd-3d2c0: this mode was previously UNATTESTABLE — implemented in the
+/// transport, readable from the environment, and absent from
+/// `mount_candidate_knobs`, so the comparator could not prove two arms differed
+/// and no A/B of it was admissible. Reported now, like every other knob there.
+#[must_use]
+pub fn receive_spin_adaptive() -> bool {
+    fuser::channel::Channel::adaptive_from_value(
+        std::env::var("FFS_FUSE_RECEIVE_SPIN_ADAPTIVE").ok().as_deref(),
+    )
+}
+
+/// Pause iterations between polls inside the receive spin (`FFS_FUSE_SPIN_PAUSE`,
+/// default 0 = byte-identical to the loop before it existed).
+///
+/// Same delegation rule and same attestability reason as
+/// [`receive_spin_adaptive`].
+#[must_use]
+pub fn spin_pause() -> u32 {
+    fuser::channel::Channel::spin_pause_from_value(
+        std::env::var("FFS_FUSE_SPIN_PAUSE").ok().as_deref(),
+    )
+}
+
 /// Whether to negotiate the FUSE splice capabilities (bd-splice-metadata).
 ///
 /// Splice exists to avoid a copy on LARGE payloads: it hands page references

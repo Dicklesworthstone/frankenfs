@@ -69,7 +69,20 @@ grep -h mount_candidate_knobs "$W/xfuse-$TAG-a.log" | tail -1 || true
   grep -h mount_candidate_knobs "$W/xfuse-$TAG-b.log" | tail -1 || true; }
 echo "== client cpu $CPU, $OPS reports/batch"
 
+# bd-3d2c0: the client's daemon_ticks column follows ONE pid, so it can only
+# price the arm that happens to be A. Snapshot BOTH daemons around the whole run
+# and report utime+stime per arm, which is what a CPU price needs.
+ticks_of() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+A_TK0=$(ticks_of "$APID"); B_TK0=0
+[ -n "$FB_LABEL" ] && B_TK0=$(ticks_of "$BPID")
+
 "$W/xattr_ab" "$ROUNDS" "$OPS" "$CPU" "$APID" "${ARMS[@]}"
+
+A_TK1=$(ticks_of "$APID"); B_TK1=0
+[ -n "$FB_LABEL" ] && B_TK1=$(ticks_of "$BPID")
+echo "== daemon CPU over the whole run (ticks, utime+stime)"
+echo "daemon_cpu_ticks,$FA_LABEL,$((A_TK1-A_TK0))"
+[ -n "$FB_LABEL" ] && echo "daemon_cpu_ticks,$FB_LABEL,$((B_TK1-B_TK0))"
 
 echo "== unmount + census"
 fusermount3 -u "$FA"; [ -n "$FB_LABEL" ] && fusermount3 -u "$FB"
