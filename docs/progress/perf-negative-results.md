@@ -13615,3 +13615,51 @@ figure in `f33db4de` predates the `auto` gate and should not be re-quoted until 
 the switch resolved ACTIVE rather than REFUSED — which the daemon now self-reports as
 `mount_candidate_xattr,xattr_suppression=...`, folded into the comparator's knob-divergence
 proof so a refused arm cannot be certified as a lever (`f4197ab0`).
+
+## 2026-08-27 — NO VERDICT BEFORE TIMING: current production ext4 create/delete cannot compare honestly while writable JBD2 is refused (bd-avg6f)
+
+The ready bead's next experiment was the longer `create-delete-storm` observation: 20,000
+operations and 12 paired rounds, with the live kernel incumbent, the current in-place PGO
+candidate, and the harness's same-ELF candidate A/A control in one invocation. The exact
+command was:
+
+```
+target/bd-avg6f-20260827/release-perf/ffs-mounted-kernel-bench \
+  --ffs-cli target/bd-avg6f-20260827/release-perf/ffs-cli \
+  --filesystem ext4 --workload create-delete-storm --operations 20000 --pairs 12 \
+  --observation-repeats 1 --fuse-transport loop --placement-scope same-llc \
+  --candidate-aa --artifact-root /data/tmp/ffs-bd-avg6f-20260827T2220Z \
+  --harness-builder thinkstation1 --candidate-builder thinkstation1
+```
+
+It exited `2` before its first timed arm. The harness did identify a current production PGO
+candidate. Its in-process witnesses were
+`bench_evidence,binary_sha256=2ac8dd3221e2758b23400d09dff965f6ea93e90daef43ed45e75c54b36d54855`
+and `mount_bench_evidence,binary_sha256=b91e399c08d6d8107fa11e6266087b64a3de88527c39c97ef60ff5fc89f8f244`
+on `hostname=thinkstation1`. The candidate PGO profile SHA-256 was
+`5021c02f7dfb0a11e56d5e78ca554e0d04288ec68ee71ad325936461de0c25de`; the executing
+harness ELF SHA-256 was
+`2ac8dd3221e2758b23400d09dff965f6ea93e90daef43ed45e75c54b36d54855`.
+
+The preflight itself was clear (`driver_busy_fraction=0.138614`,
+`fuse_busy_fractions=0.090000`, limits `0.200` and `0.350`), but the candidate FUSE process
+then emitted:
+
+```
+refusing writable journalled ext4 mount: the mounted fsync path does not route its complete durability checkpoint through JBD2
+```
+
+That is the live production guard in `ffs-cli` (current source `0c23ce53`), not a harness
+self-comparison or an incumbent restriction. It means **0 timed kernel observations, 0 timed
+FrankenFS observations, and 0 A/A observations**: no ratio, null ratio, or instructions/op
+figure exists. I did not retry with a no-journal image, because that would remove the real
+incumbent durability contract and manufacture a non-comparable result. The correct result for
+this bead attempt is an honest comparability stop, not a performance claim.
+
+As a non-timing mechanism witness for the stop, the same command was also run under
+`strace -f -e trace=execve`. `strace counted 1 candidate execve → 0 timed observation phases`
+(`candidate_ffs_cli_execve_count=1`, exit `2`). That trace retry encountered a separate kernel
+mount infrastructure failure—`sudo must be owned by uid 0 and have the setuid bit set`—before
+it could reach the candidate mount, so it contributes no ratio and does not supersede the
+first invocation's JBD2 refusal. It only establishes that this stop was a single live candidate
+launch, not a harness self-comparison.
