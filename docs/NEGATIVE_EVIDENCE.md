@@ -14151,3 +14151,143 @@ Reproduce:
       FENV="FFS_MVCC_FLUSH_BORROW=1" \
       bash scripts/perf/parallel_metadata_ab/flush_race_gate.sh
     # control: FENV="FFS_MVCC_FLUSH_BORROW=0"
+
+## 2026-08-27 — crash consistency proved by DEVICE WRITE-SEQUENCE IDENTITY, not crash injection: the flush-borrow knob ships default ON at a balanced `1.108260x`; and the same oracle is REFUTED for the dispatch gate by its own null
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rigs
+`scripts/perf/create_delete_storm_ab/write_seq.sh` + `img_eq.sh`,
+`scripts/perf/bulk_durable_write_ab/bulk_seq.sh` + `run_bulk_dio.sh`,
+`scripts/perf/parallel_metadata_ab/write_seq_pmeta.sh`.** Provenance: in-process
+self-report `bench_evidence,binary_sha256=`
+`6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d` (pre-flip ELF) and
+`c659afcc4c603c170e949e5bc855b5b59085663deb1fb5f96d9ea6ab5824bf33` (post-flip ELF),
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16 — known defective daemon core),
+clients on CPU 8, every arm on its own loop device with `losetup --direct-io=on`.
+
+Two levers were measured and left default OFF, blocked on the same single named gap:
+`FFS_MVCC_FLUSH_BORROW` (`1.238905x` on the bulk fsync phase) and
+`FFS_FUSE_CONCURRENT_MUTATIONS` (`1.50-1.58x` on parallel-metadata-write). The gap was
+**crash consistency**, and the named instrument was a crash-replay gate that does not exist
+yet.
+
+### The instrument: diff the sequence, don't inject the crash
+
+Crash behaviour is a function of **what** is written, in **what order**, with barriers
+**where**. Two configurations that emit an identical device write/barrier sequence cannot
+differ in crash behaviour on that workload — no crash need be injected to know it.
+`write_seq.sh` straces the daemon (`-e trace=pwrite64,pwritev,fdatasync,fsync`) across a
+fixed workload and normalises the trace to `W <len> <offset>` and `BARRIER` lines, dropping
+pids and payload bytes, so two runs are diffable byte-for-byte.
+
+⭐ **The control is the whole method.** A cross-configuration diff means nothing unless the
+same-configuration diff is empty first. Both are reported below, and on one of the two
+levers the control is exactly what kills the oracle.
+
+### Result 1 — flush-borrow: sequence identical, with a passing determinism control
+
+| workload | config | runs | events | barriers | same-config diff | cross-config diff |
+| --- | --- | --- | --- | --- | --- | --- |
+| bulk-durable-write | `FFS_MVCC_FLUSH_BORROW=0` | 2 | 12 | 4 | **IDENTICAL** | — |
+| bulk-durable-write | `FFS_MVCC_FLUSH_BORROW=1` | 2 | 12 | 4 | **IDENTICAL** | **IDENTICAL, 4/4 pairs** |
+| create/delete storm | `FFS_MVCC_FLUSH_BORROW=0` | 3 | 33 | 8 | **IDENTICAL** | — |
+| create/delete storm | `FFS_MVCC_FLUSH_BORROW=1` | 4 | 33 | 8 | **IDENTICAL** | **IDENTICAL, 6/6 pairs** |
+
+The bulk sequence is one round repeated four times and reads:
+`W 4096 299008` / `W 67108864 8843264` / `BARRIER` — one 4 KiB inode-table write plus the
+coalescer's **single 64 MiB contiguous `pwrite`**, then the barrier. Byte-identical between
+clone and borrow.
+
+**Resulting image, same oracle discipline.** `img_eq.sh` sha256s the unmounted image. Raw
+sha256 differs — *and it differs between two runs of the SAME configuration too*, which is
+the control that makes the number readable. Comparing three images (two OFF runs and one ON
+run) block by block, the set of blocks that vary is **`[73]`** on bulk and
+**`[73, 2121..2133]`** on the storm — block 73 is the inode-table block at offset 299008,
+i.e. the timestamps. Excluding exactly that nondeterministic set, all three images hash
+**identically** (`8bdb63d05c3a9a309d3b14c788bfa259` on bulk,
+`8352c267a3398dcc8a4d1ada4e17a739` on the storm). `e2fsck -fn` clean on all six.
+
+**Self-time proof the lever actually ran**, `perf record -F 4999 -g` on the daemon over the
+bulk workload: `__memmove_avx_unaligned_erms` self-time **14.09% → 10.07%** when the knob
+flips — the removed clone, and nothing else moves. `ShardedMvccStore::commit` appears in
+both profiles (1.60% / 2.13%), which is the check that matters: production `init_mvcc_store`
+takes `FsMvccStore::sharded()`, so the branch in `sharded.rs` is live and **not** the
+`FsOps`-forwarding-style dead code it could have been.
+
+### The default is now ON — measured vs the LIVE kernel incumbent, same invocation
+
+`run_bulk_dio.sh`, 24 rounds, 64 × 1 MiB + `fsync`, four arms up simultaneously (two live
+kernel ext4 RW mounts = the A/A null, two FrankenFS mounts from ONE ELF), arm order rotated
+per round; run forward and mirrored with arms **and** daemon CPUs swapped.
+
+| metric | forward (clone/borrow) | mirrored | **balanced `sqrt(f·m)`** |
+| --- | --- | --- | --- |
+| whole batch `total_ns` | `1.059367` (CI spans 1) | `1.159410` `[1.072976, 1.285094]` | **`1.108260x`** |
+| `fsync` phase | `1.211104` `[1.208…]` | `1.409481` `[1.201586, 1.451525]` | **`1.306533x`** |
+| **A/A null, total** | `0.983066` `[0.964847, 1.014824]` | `1.006783` `[0.988824, 1.043459]` | `0.994854` **PASS** |
+| **A/A null, fsync** | `0.987230` `[0.970140, 1.018363]` | `1.021649` `[1.005634, 1.046152]` | `1.004292` **PASS** |
+| **A/A null, write phase** | `0.877642` `[0.857094, 0.893016]` | `0.882332` `[0.863054, 0.903434]` | `0.879984` ⛔ **FAILS** |
+
+Absolutes, mirrored run: kernel `k1` total `73.862 ms`, `cloneOFF` `255.445 ms`,
+`borrowON` `209.373 ms`; fsync phase `68.071` / `165.155` / `111.652 ms`. Forward run:
+kernel `k1` `217.781 ms`, `borrowON` `340.102 ms`, `cloneOFF` `336.245 ms`.
+
+⛔ **Disclosed limits on this measurement.** (a) The **write-phase A/A null FAILS**, at
+`0.877642` and `0.882332` — two identical kernel arms on identically preallocated images
+differ 12% on the buffered write phase, consistently and in both runs, so it is systematic
+transport asymmetry and **every write-phase ratio here is inadmissible**, including the
+forward run's eye-catching `1.377530`. (b) The two windows are not comparable: kernel `k1`
+total was `217.781 ms` forward and `73.862 ms` mirrored, a 2.9x window shift, so the
+balanced figure corrects placement but not window. What survives both objections is the
+**sign**: forward and mirrored agree that the borrowed flush is faster on `total` and on
+`fsync`, and three of the four interior comparisons are individually decidable.
+
+Gates before the flip: `cargo fmt --check`, `cargo check --all-targets`,
+`cargo clippy --all-targets -- -D warnings` all clean on `ffs-mvcc` (the flip also exposed
+and fixed two pre-existing `collapsible_if` lints in the borrowed walk), and
+`cargo test -p ffs-mvcc` **553 passed / 0 failed** — a suite that now exercises the borrowed
+flush as its default path. Post-flip ELF re-verified: no env ⇒
+`mvcc_flush_borrow=true`, `FFS_MVCC_FLUSH_BORROW=0` ⇒ `false`, sequences identical in both
+directions and identical to the pre-flip ELF's.
+
+### Result 2 — the same oracle is REFUTED for the dispatch gate, by its own null
+
+Same instrument, `pmeta_ab` at 8 client threads, `FFS_FUSE_WORKERS=4`:
+
+| comparison | events | barriers | diff |
+| --- | --- | --- | --- |
+| gated run 1 vs **gated run 2** (the control) | 17 | 4 | ⛔ **DIFFERS, 4 lines** |
+| gated vs `FFS_FUSE_CONCURRENT_MUTATIONS=1` | 17 | 4 | DIFFERS, 10 lines |
+
+**The control fails, so the cross-configuration diff is uninterpretable and this oracle
+cannot decide the dispatch gate.** Reporting the 10-line diff as evidence against the knob
+would have been a fabricated finding.
+
+What the diff's *shape* does say, and it is worth recording: every differing line is a
+**run LENGTH** at an **unchanged offset** (`W 57344 282624` vs `W 61440 282624`;
+`W 45056 8687616` vs `W 36864 8687616`). Write offsets, barrier count and barrier positions
+are invariant across all three traces. Eight client threads dirty a race-dependent number of
+adjacent inode-table blocks between barriers — with the gate fully intact. The widened gate
+varies on the same axis, only more.
+
+⛔ **`FFS_FUSE_CONCURRENT_MUTATIONS` therefore stays default OFF and its crash-consistency
+gap stays open.** It needs real crash injection; the cheap route is closed, and that is the
+finding.
+
+### Transferable
+
+  * ⭐⭐ **Crash consistency can be settled by write-sequence identity instead of crash
+    injection** — but only where the sequence is deterministic, and *only if you run the
+    same-configuration control first*. One lever here passed that control and shipped; the
+    other failed it and kept its blocker.
+  * ⭐ **A nondeterministic artifact is still usable if you first measure which part is
+    nondeterministic.** Raw image sha256 differs run-to-run; the *set of blocks* that differ
+    is stable, and equality outside that set is the real oracle.
+  * ⭐ **Prove the lever ran before believing an identity result.** An A/B where the code
+    path is dead returns "IDENTICAL" trivially. The `sharded.rs` branch is only reachable
+    because production picks `FsMvccStore::sharded()`; the memcpy self-time drop is what
+    confirms it.
+  * ⚠ A per-phase A/A null can fail while the whole-batch null passes. The write phase here
+    is 12% asymmetric between two identical kernel arms; without per-phase nulls the
+    forward run's `1.377530` write-phase ratio would have been published.

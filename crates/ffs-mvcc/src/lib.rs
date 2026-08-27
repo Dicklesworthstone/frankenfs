@@ -90,16 +90,32 @@ pub fn proof_downgrade_count() -> u64 {
 /// write. Same bytes, same locations, same run coalescing — one copy instead of two and
 /// zero per-block allocations.
 ///
-/// Default OFF because it is a new traversal of a data structure other threads mutate:
-/// pass 2 re-resolves rather than trusting a stored index, and skips a block that has
-/// vanished, but the two-pass shape is a real change to a flush that used to be a single
-/// snapshot-in-hand walk. It is an arm to measure, not a claimed win.
+/// Default ON since 2026-08-27. It was default OFF while the two-pass shape — a real
+/// change to a flush that used to be a single snapshot-in-hand walk — had no evidence
+/// against a concurrent committer or a crash. Both gaps are now closed by measurement,
+/// not by argument:
+///
+/// - Concurrent committer: `scripts/perf/parallel_metadata_ab/flush_race_gate.sh` runs 8
+///   mutators and 4 directory-fsync threads so pass 1 and pass 2 are separated by other
+///   threads' commits; `e2fsck -fn` clean and free inodes back at the pristine value.
+/// - Crash consistency: crash behaviour is a function of WHAT is written, in WHAT ORDER,
+///   with barriers WHERE, so an identical device write/barrier sequence cannot differ in
+///   crash behaviour. `scripts/perf/create_delete_storm_ab/write_seq.sh` straces the
+///   daemon and normalises the trace; on bulk-durable-write the sequence is byte-identical
+///   across configurations (12 events, 4 barriers) and on the create/delete storm across
+///   seven runs (33 events, 8 barriers) — each with a passing within-configuration
+///   determinism control, without which such a diff means nothing.
+/// - Resulting image: identical excluding exactly the blocks that already differ between
+///   two runs of the OFF arm (the inode-table block carrying timestamps).
+///
+/// Set `FFS_MVCC_FLUSH_BORROW=0` to fall back to the clone-then-coalesce walk.
 #[must_use]
 pub fn flush_borrow_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("FFS_MVCC_FLUSH_BORROW")
-            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+    *ON.get_or_init(|| match std::env::var("FFS_MVCC_FLUSH_BORROW") {
+        Ok(raw) => !matches!(raw.trim(), "0" | "false" | "off" | "no"),
+        Err(std::env::VarError::NotUnicode(_)) => false,
+        Err(std::env::VarError::NotPresent) => true,
     })
 }
 

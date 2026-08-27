@@ -1484,32 +1484,26 @@ impl ShardedMvccStore {
         let mut run_start: Option<BlockNumber> = None;
         let mut run_next: u64 = 0;
         let mut run_buf: Vec<u8> = Vec::new();
-        if crate::flush_run_reserve_enabled() {
-            if let Some(first) = keys.first() {
-                let shard = self.shards[self.shard_index(*first)].read();
-                let block_len = shard
-                    .versions
-                    .get(first)
-                    .and_then(|versions| {
-                        crate::newest_visible_index(versions, snapshot.high)
-                            .and_then(|idx| {
-                                compression::resolve_data_with(versions, idx, |v| &v.data)
-                            })
-                            .map(|bytes| bytes.len())
-                    })
-                    .unwrap_or(0);
-                drop(shard);
-                run_buf.reserve(keys.len().saturating_mul(block_len));
-            }
+        if let Some(first) = keys.first().filter(|_| crate::flush_run_reserve_enabled()) {
+            let shard = self.shards[self.shard_index(*first)].read();
+            let block_len = shard
+                .versions
+                .get(first)
+                .and_then(|versions| {
+                    crate::newest_visible_index(versions, snapshot.high)
+                        .and_then(|idx| compression::resolve_data_with(versions, idx, |v| &v.data))
+                        .map(|bytes| bytes.len())
+                })
+                .unwrap_or(0);
+            drop(shard);
+            run_buf.reserve(keys.len().saturating_mul(block_len));
         }
 
         for block in &keys {
             let continues = run_start.is_some() && block.0 == run_next;
-            if !continues {
-                if let Some(start) = run_start.take() {
-                    device.write_contiguous_blocks(cx, start, &run_buf)?;
-                    run_buf.clear();
-                }
+            if !continues && let Some(start) = run_start.take() {
+                device.write_contiguous_blocks(cx, start, &run_buf)?;
+                run_buf.clear();
             }
             let appended = {
                 let shard = self.shards[self.shard_index(*block)].read();
