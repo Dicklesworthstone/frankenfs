@@ -16788,3 +16788,88 @@ Reproduce:
       FA_LABEL=base FB_LABEL=noxattr FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=wf1 \
       bash scripts/perf/warm_stat_btrfs_ab/run_warm_btrfs.sh
     python3 scripts/perf/warm_stat_btrfs_ab/wanalyze.py <body.csv>
+
+## 2026-08-27 — bd-vbqc6: BLOCKED on a host precondition, not on code. The mount REFUSED to run rather than compare classic against classic — and the bead's "STATE OF THE CODE" section is stale on four points
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/readdir_stat_btrfs_ab/run_multi_btrfs.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=7f08ce8064cf53658e2ba79f30dc8d5fbb80001551b61ecd3724fd3d2176bec8`,
+`RCH_WORKER=none`, `hostname=thinkstation1`. **No ratio is produced and none is claimed.**
+
+bd-vbqc6 asks for FUSE-over-io_uring to be re-tested on readdir+stat — the row it argues is
+`~96%` crossings — with a metadata-sized payload and a deeper queue, instead of the
+`payload=131072, depth=4` configuration that lost on creates. It is the highest-ceiling
+lever named for a transport-bound row: every daemon-side lever there is bounded by the
+`3.85%` daemon share, and a per-crossing lever is bounded by the rest.
+
+### The attempt, and the refusal
+
+    FA_ENV=""  FB_ENV="FFS_FUSE_IO_URING=1 FFS_FUSE_IO_URING_QUEUE_DEPTH=64"
+    → arm-a  io_uring=false io_uring_queue_depth=4  io_uring_payload_bytes=4096
+    → arm-b  io_uring=true  io_uring_queue_depth=64 io_uring_payload_bytes=4096
+    error: FUSE mount failed: FFS_FUSE_IO_URING=1 but the kernel has
+      /sys/module/fuse/parameters/enable_uring=N; the transport would silently fall
+      back to classic and any A/B would compare classic against classic
+
+⭐⭐ **The guard is the result.** The B arm negotiated its knobs, found the kernel would not
+honour them, and **refused the mount** rather than produce a classic-vs-classic A/B that
+would have looked like a clean null. That is exactly the failure mode this campaign has been
+burned by twice this session — an env var the process never read, and a knob a gate refused —
+and here the code caught it before a single round ran.
+
+`/sys/module/fuse/parameters/enable_uring` is `N`, root-owned, mode `0644`, and
+`modinfo fuse` reports it as a runtime-settable bool. ⛔ **Not flipped.** It is a host-wide
+kernel module parameter: enabling it changes the FUSE transport substrate for **every** mount
+on a shared box where other agents are running mounted benchmarks. That is an operator
+decision, not a measurement one. The command is
+`echo Y | sudo tee /sys/module/fuse/parameters/enable_uring`, and this bead cannot proceed
+without it.
+
+### ⛔ The bead's "STATE OF THE CODE, so nobody re-derives it" is stale on four points
+
+That section exists precisely to save the next reader an investigation, so its drift is worth
+correcting explicitly:
+
+| bead says | actually, 2026-08-27 |
+| --- | --- |
+| `mod io_uring;` in `fuser/src/lib.rs` **ABSENT** | **PRESENT**, `vendor/fuser/src/lib.rs:60` |
+| `io-uring` dependency **ABSENT** | **PRESENT**, `vendor/fuser/Cargo.toml:148` |
+| the file is orphaned, "never compiled into any binary that ships today" | **compiled today** — the knobs line reports `io_uring=false, io_uring_queue_depth=4, io_uring_payload_bytes=4096` |
+| "DO NOT START THIS UNDER THE BUILD FREEZE. `/data` is at the 42G floor" | **189G free**; the freeze is over |
+
+`958534ad5` ("perf(fuse): restore the FUSE-over-io_uring transport, wired to the knobs instead
+of the literals that lost (bd-vbqc6)") did the restore. ⭐ **And the bead's main configuration
+objection is already fixed and pinned by a test**: `payload_bytes_from_value(None) == 4096`
+with `io_uring_payload_defaults_to_a_page_and_cannot_reach_128k_bd_vbqc6` asserting the
+default is a page and that the losing `131072` is clamped. The implementation work the bead
+scopes is **done**; only the host precondition remains.
+
+### ✅ The bead's central sizing argument is confirmed — by a measurement banked today
+
+bd-vbqc6 argues the row is `~96%` crossings, so a per-crossing lever is bounded by `~96%`
+while any daemon-side lever is bounded by `3.85%`. Measured today on that exact row
+(btrfs readdir+stat, same rig): suppressing the audit probe removes `96.0%` of crossings
+(`crossings_getxattr` `819,226 → 1`, `crossings_total` `853,504 → 34,279`) and is worth a
+balanced **`6.227045x`**, taking the row from `6.464769x` slower to `1.023564x` — parity.
+
+⇒ **A per-crossing lever on this row really is worth `~6x`**, and the bead's sizing comparison
+holds empirically, not just by argument. That does not predict io_uring will win — the bead's
+own counter-argument (the classic transport may already pipeline well) is untouched — but it
+does establish that the ceiling it claims is real.
+
+### Transferable
+
+  * ⭐⭐⭐ **A transport knob must refuse to run when the kernel will not honour it.** Silent
+    fallback plus an A/B is a manufactured null, and it is indistinguishable from a genuine
+    one in the output. This mount's refusal is the pattern every capability knob should copy.
+  * ⭐⭐ **A "so nobody re-derives it" section decays like any other citation.** Four of its
+    four claims had flipped in eleven days. Re-check state sections before trusting them, and
+    correct them in place when they are wrong.
+  * ⭐ **Blocked on a host precondition is a result.** The name of the file, its value, its
+    mode, and the reason not to change it are more useful than a ratio would have been.
+
+### Admissibility
+
+No ratio measured or claimed; the run terminated at mount. The `6.227045x` cited as
+confirmation is the same-invocation forward+mirrored measurement banked earlier today with
+both A/A halves passing.
