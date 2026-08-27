@@ -18391,3 +18391,64 @@ stack trace and the 1:1 coupling — direct evidence for the CALLER, inference f
 Nothing shipped, nothing reverted. ELF
 `7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug — counts only, no wall
 time claimed). `hostname=thinkstation1`.
+
+## 2026-08-27 — bd-4iqg6: the audit counterfactual RUN WITHOUT touching host security config — `fstat` resolves no path, takes the probe from `20,004` to `4`, and FrankenFS warm `fstat` reaches EXACT PARITY with the live kernel at `0.0000` blocking crossings per op
+
+The previous entry corrected the cause of the capability probe to `__audit_inode` and named the
+decisive experiment — drop the two audit rules, re-run, watch the probes vanish — as needing operator
+approval, because `auditctl -D` is a host-wide security control on a shared machine. That approval has
+not been given and I have not taken it. But the causal chain makes a second prediction that needs no
+configuration change at all: **a syscall that resolves no path cannot reach `__audit_inode`.**
+
+`stat(path)` -> `filename_lookup` -> `__audit_inode` -> `get_vfs_caps_from_disk`, versus `fstat(fd)`,
+which resolves nothing. Same file, same mount, same process, the fd opened OUTSIDE the counted region
+in both modes so the open's own probe cannot be mistaken for per-op cost. Run against BOTH arms,
+because the prediction is about the kernel's path-resolution behaviour and must hold on the incumbent
+too. `scripts/perf/warm_stat_btrfs_ab/{fstatprobe.c,fstat_counterfactual.sh}`, 20,000 ops per cell.
+
+| arm | mode | `nvcsw`/op | `__audit_inode` | `get_vfs_caps_from_disk` |
+|---|---|---|---|---|
+| kernel btrfs (live incumbent) | `stat` | `0.0000` | 20,004 | 20,004 |
+| kernel btrfs (live incumbent) | `fstat` | `0.0000` | **4** | **4** |
+| FrankenFS (FUSE) | `stat` | **`1.0000`** | 20,004 | 20,004 |
+| FrankenFS (FUSE) | `fstat` | **`0.0000`** | **4** | **4** |
+
+Two runs; the only cell that moved was FUSE/`stat` at `20000` then `19998` (`1.0000` -> `0.9999`).
+Digests identical across all eight cells, so every arm and mode served the same metadata. The residual
+`4` is setup — the `open()` and one warm `stat()`, both outside the counted region — and is the same
+on both arms, which is what makes it readable as a floor rather than a leak.
+
+**PREDICTION CONFIRMED, by intervention rather than by stack reading.** Removing path resolution
+removes the probe: `20,004` -> `4`, on the kernel arm and the FUSE arm alike. The probe is bound to
+path resolution, exactly as `__audit_inode`'s position in the stack requires.
+
+**AND THE RESULT IS STRONGER THAN THE PREDICTION: FrankenFS warm `fstat` is at EXACT PARITY with the
+live kernel incumbent — `0.0000` blocking crossings per op on both arms.** The daemon census shows
+why: `crossings_getattr=1` for the whole run of 40,000 stat+fstat operations. The attribute cache
+absorbs every one. **On warm metadata FrankenFS does essentially no FUSE work at all; the boundary is
+crossed only for the audit-forced probe.** This is the first measured PARITY row of this session and
+it is a count, not a timing, so no quiet window was needed for it.
+
+**What this does and does not establish.** It establishes that the probe is bound to path resolution
+and that without it FrankenFS matches the kernel on warm metadata. It does NOT by itself prove that
+removing the audit RULES would remove the probe from `stat()` — that remains the operator-approval
+experiment. The chain is: rules exist -> tasks carry an audit context (measured: `audit_alloc` 0
+during the loop, so contexts predate it) -> `__audit_inode` does its work on every path resolution ->
+one capability read each, coupled 1:1. Every link is measured except the counterfactual on the first,
+and I am not going to quietly present the inference as the experiment.
+
+**An actionable finding that is independent of audit entirely.** A program doing repeated metadata
+operations against a FUSE mount should hold a descriptor and use `fstat`, not re-resolve the path:
+here that is the difference between `1.0000` and `0.0000` blocking round trips per operation. That is
+a property of FUSE plus path-resolution auditing, not of FrankenFS, and it applies to any FUSE
+filesystem on a host configured like this one.
+
+**Consequence for the banked warm-stat row.** `btrfs warm stat` is banked at `4.977803x`. Its entire
+round-trip excess is the path-resolution probe, and the same file accessed by descriptor costs us
+nothing the kernel does not also pay. I am deliberately NOT converting that into a predicted ratio —
+crossing count is not a time model on this codebase — but the row's mechanism is now fully accounted
+for, with a measured parity configuration sitting beside it.
+
+Nothing shipped, nothing reverted. ELF
+`7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug — counts only, no wall
+time claimed). `hostname=thinkstation1`.
