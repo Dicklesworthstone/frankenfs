@@ -16608,3 +16608,77 @@ Reproduce:
     gcc -O2 -o $WORK/iovprobe scripts/perf/bulk_durable_write_ab/iovprobe.c
     DEV=$(sudo losetup --find --show --direct-io=on <image>)
     $WORK/iovprobe $DEV 16384 16
+
+## 2026-08-27 — the vectored flush is LANDED behind `FFS_MVCC_FLUSH_VECTORED`: byte-identical output, `877` tests green, `~4%` less daemon CPU — wall arm still owed a quiet window; and I corrupted a fixture with my own probe
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/bulk_durable_write_ab/vec_eq.sh` (new).** Provenance: in-process self-report
+`bench_evidence,binary_sha256=7f08ce8064cf53658e2ba79f30dc8d5fbb80001551b61ecd3724fd3d2176bec8`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18, loop device `--direct-io=on`.
+
+Four commits of scoping — priced at `~10.5 pp` of daemon CPU, blocker withdrawn, syscall
+de-risked at `~1.28x` — and now implemented.
+
+### What landed
+
+| layer | change |
+| --- | --- |
+| `ByteDevice` (`ffs-block`) | `write_vectored_all_at`, default concatenates → `write_all_at`; **override on the file device** using `nix::sys::uio::pwritev`, batched at `IOV_MAX`, one epoch bump covering a partial gather exactly as the scalar path does |
+| `BlockDevice` | `write_contiguous_blocks_vectored`, default concatenates → `write_contiguous_blocks`; override on the byte-device-backed impl with the scalar path's validation applied to the summed length |
+| **`impl BlockDevice for Arc<D>`** | **listed explicitly** — the pre-identified trap; a defaulted method inherited here would silently keep the copy |
+| `ShardedMvccStore` | `flush_to_device_after_vectored`: `Arc::clone` the `VersionData::Full` handle under the shard lock, drop the lock, accumulate one owner per block, hand the device a gather list at run close. Compressed/`Identical` keep an owned chunk. |
+| `ffs-cli` | `mvcc_flush_vectored` on the knobs line |
+
+### Correctness: byte-identical output
+
+Four runs of the 64 × 1 MiB + `fsync` batch, two with the knob off and two on:
+
+| check | result |
+| --- | --- |
+| `e2fsck -fn` | **clean 4/4** |
+| blocks differing across all four images | **`[73]`** — the inode-table timestamp block |
+| blocks differing between the two OFF runs alone | **1** (the same block) |
+| **vectored introduces a new differing block?** | **No** |
+| sha256 excluding block 73 | `c0007ae662dafdd5c046aa60191309aa` — **identical in all four** |
+
+⭐ The oracle is the one this campaign has settled on: an artifact that is nondeterministic
+run-to-run is still usable once you measure WHICH part is nondeterministic. The vectored
+flush lands inside the OFF arm's own equivalence class.
+
+Gates: `cargo check` and `cargo clippy -D warnings` clean on `ffs-block` and `ffs-mvcc`;
+`cargo test -p ffs-block -p ffs-mvcc` **877 passed / 0 failed**; the knob self-reports
+`mvcc_flush_vectored=false|true`.
+
+### ⛔ Wall arm: not yet
+
+Daemon CPU over six rounds: **`56`/`55` ticks off against `54`/`53` on — `~4%` less**,
+directionally right and consistent. But the batch totals in the same runs were
+`124.871` / `135.505 ms` (off) against `218.813` / `317.921 ms` (on) — a device-bound window
+where the fsync phase swamps the write phase and swings `2.5x` between adjacent runs. **No
+ratio is claimed**; the knob stays default OFF until it is measured in a quiet window against
+a live kernel arm.
+
+### ⛔ I corrupted a fixture with my own probe
+
+`iovprobe.c` writes `64 MiB` at offset `1 MiB` to whatever device it is given, and I pointed
+it at `bimg-base.ext4` — the live bulk fixture. The next run failed with
+`open .../bulk-durable.bin: Invalid argument`. Rebuilt with `mkbulk.sh`; no published
+measurement used the corrupted image (the probe's own numbers are device-layer timings that
+do not read the filesystem). **Fixed at the source**: the probe now refuses to run unless
+`IOVPROBE_I_WILL_DESTROY_THIS_DEVICE=1` is set, and says what it will overwrite.
+
+⭐ A benchmark that writes to a device is a destructive tool wearing a measurement's clothes.
+It needs the same guard rail as `rm`.
+
+### Admissibility
+
+Correctness and counted-CPU evidence only; no vs-incumbent ratio is claimed and the default
+is unchanged.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/vec_eq.sh off1 ""
+    WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/vec_eq.sh on1 \
+      FFS_MVCC_FLUSH_VECTORED=1

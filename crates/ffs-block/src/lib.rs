@@ -434,6 +434,42 @@ pub trait ByteDevice: Send + Sync {
     /// Write all bytes in `buf` to `offset`.
     fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()>;
 
+    /// Write a contiguous byte range GATHERED from multiple buffers.
+    ///
+    /// The mirror of [`Self::read_vectored_exact_at`], and it exists for the same
+    /// reason: the caller already holds the bytes in separate allocations, and
+    /// concatenating them to satisfy a scalar API is a copy that buys nothing.
+    /// The MVCC flush holds one `Arc<AlignedVec>` per block and coalesces runs of
+    /// them; measured 2026-08-27, that copy is **~10.5 percentage points of daemon
+    /// CPU** on the bulk-durable-write row, and a `pwritev` of the same run beat
+    /// `memcpy`+`pwrite` by **~1.28x** at the syscall layer
+    /// (`scripts/perf/bulk_durable_write_ab/iovprobe.c`).
+    ///
+    /// The default CONCATENATES and calls [`Self::write_all_at`], so every existing
+    /// implementation keeps byte-identical behaviour and only loses the saving.
+    /// ⚠ That also means a blanket forwarding impl which does not list this method
+    /// silently keeps the copy — see the `Arc<D>` forwarder note on `BlockDevice`.
+    fn write_vectored_all_at(&self, cx: &Cx, offset: ByteOffset, bufs: &[&[u8]]) -> Result<()> {
+        cx_checkpoint(cx)?;
+        let total_len = bufs.iter().try_fold(0_usize, |total, buf| {
+            total
+                .checked_add(buf.len())
+                .ok_or_else(|| FfsError::Format("write length overflows usize".to_owned()))
+        })?;
+        if total_len == 0 {
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+        if let [single] = bufs {
+            return self.write_all_at(cx, offset, single);
+        }
+        let mut flat = Vec::with_capacity(total_len);
+        for buf in bufs {
+            flat.extend_from_slice(buf);
+        }
+        self.write_all_at(cx, offset, &flat)
+    }
+
     /// Flush pending writes to stable storage.
     fn sync(&self, cx: &Cx) -> Result<()>;
 }
@@ -941,6 +977,84 @@ impl ByteDevice for FileByteDevice {
         Ok(())
     }
 
+    fn write_vectored_all_at(&self, cx: &Cx, offset: ByteOffset, bufs: &[&[u8]]) -> Result<()> {
+        cx_checkpoint(cx)?;
+        let total_len = bufs.iter().try_fold(0_usize, |total, buf| {
+            total
+                .checked_add(buf.len())
+                .ok_or_else(|| FfsError::Format("write length overflows usize".to_owned()))
+        })?;
+        if total_len == 0 {
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+        if !self.writable {
+            return Err(FfsError::PermissionDenied);
+        }
+        let end = offset
+            .0
+            .checked_add(
+                u64::try_from(total_len)
+                    .map_err(|_| FfsError::Format("write length overflows u64".to_owned()))?,
+            )
+            .ok_or_else(|| FfsError::Format("write range overflows u64".to_owned()))?;
+        if end > self.len {
+            return Err(FfsError::Format(format!(
+                "write out of bounds: offset={offset} len={total_len} file_len={}",
+                self.len
+            )));
+        }
+
+        // Gather straight from the caller's buffers with positioned `pwritev`,
+        // batched at IOV_MAX because a 64 MiB flush run is 16,384 blocks and the
+        // kernel accepts 1024 iovecs per call (measured; `iovprobe.c`). Sixteen
+        // syscalls still beat one `memcpy` of 64 MiB by ~1.28x.
+        //
+        // The epoch is advanced ONCE, before any error is surfaced, exactly as the
+        // scalar path does and for the same reason: a partial gather has dirtied
+        // the device and `sync` must never treat it as clean.
+        let mut written = 0_usize;
+        let mut index = 0_usize;
+        let mut result = Ok(());
+        while index < bufs.len() {
+            let batch_end = (index + FILE_DEVICE_PREADV_IOV_MAX).min(bufs.len());
+            let slices: Vec<std::io::IoSlice<'_>> = bufs[index..batch_end]
+                .iter()
+                .map(|buf| std::io::IoSlice::new(buf))
+                .collect();
+            let batch_len: usize = bufs[index..batch_end].iter().map(|buf| buf.len()).sum();
+            let Ok(off) = i64::try_from(offset.0 + written as u64) else {
+                result = Err(FfsError::Format("write offset overflows i64".to_owned()));
+                break;
+            };
+            match nix::sys::uio::pwritev(self.file.as_ref(), &slices, off)
+                .map_err(std::io::Error::from)
+            {
+                Ok(n) if n == batch_len => {
+                    written += n;
+                    index = batch_end;
+                }
+                Ok(n) => {
+                    // A short gather has still dirtied the device; the epoch bump
+                    // below covers it, and `written` is not needed past this point.
+                    result = Err(FfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!("short vectored write: got {n} of {batch_len} bytes"),
+                    )));
+                    break;
+                }
+                Err(e) => {
+                    result = Err(FfsError::Io(e));
+                    break;
+                }
+            }
+        }
+        self.sync_state.write_epoch.fetch_add(1, Ordering::Release);
+        result?;
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+
     fn sync(&self, cx: &Cx) -> Result<()> {
         cx_checkpoint(cx)?;
         let observed = self.sync_state.write_epoch.load(Ordering::Acquire);
@@ -1259,6 +1373,40 @@ pub trait BlockDevice: Send + Sync {
     /// the run into a single ranged write (one `pwrite`/`write_all_at` instead
     /// of one per block). The default preserves scalar `write_block` semantics,
     /// so the final on-disk state is identical either way.
+    /// Write a contiguous run of blocks GATHERED from per-block buffers.
+    ///
+    /// Same on-disk result as [`Self::write_contiguous_blocks`] over the
+    /// concatenation of `chunks`, without the concatenation. The MVCC flush holds
+    /// one `Arc<AlignedVec>` per block, so building the flat buffer is a pure copy
+    /// — measured 2026-08-27 at **~10.5 percentage points of daemon CPU** on the
+    /// bulk-durable-write row.
+    ///
+    /// The default concatenates and delegates, so an implementation that does not
+    /// override this is byte-identical and merely keeps the copy.
+    ///
+    /// ⚠⚠ **A blanket forwarding impl MUST list this method.**
+    /// `impl<D: BlockDevice + ?Sized> BlockDevice for Arc<D>` below forwards
+    /// fourteen methods by hand; anything it omits resolves to the DEFAULT above,
+    /// so a production mount holding an `Arc<D>` would silently keep concatenating
+    /// and the lever would measure as a perfect null.
+    fn write_contiguous_blocks_vectored(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        chunks: &[&[u8]],
+    ) -> Result<()> {
+        cx_checkpoint(cx)?;
+        if let [single] = chunks {
+            return self.write_contiguous_blocks(cx, start, single);
+        }
+        let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        let mut flat = Vec::with_capacity(total);
+        for chunk in chunks {
+            flat.extend_from_slice(chunk);
+        }
+        self.write_contiguous_blocks(cx, start, &flat)
+    }
+
     fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
         cx_checkpoint(cx)?;
         let bs = self.block_size() as usize;
@@ -1379,6 +1527,18 @@ impl<D: BlockDevice + ?Sized> BlockDevice for Arc<D> {
 
     fn write_contiguous_blocks(&self, cx: &Cx, start: BlockNumber, data: &[u8]) -> Result<()> {
         (**self).write_contiguous_blocks(cx, start, data)
+    }
+
+    // Listed explicitly: a DEFAULTED trait method inherited here would concatenate,
+    // which is exactly the copy the override exists to remove, and the production
+    // mount holds an `Arc<D>`.
+    fn write_contiguous_blocks_vectored(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        chunks: &[&[u8]],
+    ) -> Result<()> {
+        (**self).write_contiguous_blocks_vectored(cx, start, chunks)
     }
 
     fn block_size(&self) -> u32 {
@@ -1808,6 +1968,49 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
         // N syscalls; without it the byte device silently fell back to scalar.
         // Mirrors `read_contiguous_into`.
         self.inner.write_all_at(cx, ByteOffset(offset), data)?;
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+
+    /// Gather the run straight to the byte device, skipping the concatenation the
+    /// default would do. Validation is the scalar path's, applied to the summed
+    /// length, so an invalid run is rejected identically.
+    fn write_contiguous_blocks_vectored(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        chunks: &[&[u8]],
+    ) -> Result<()> {
+        cx_checkpoint(cx)?;
+        let block_size = usize::try_from(self.block_size)
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+        let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        if block_size == 0 || !total.is_multiple_of(block_size) {
+            return Err(FfsError::Format(
+                "write_contiguous_blocks: data length must be a multiple of block size".to_owned(),
+            ));
+        }
+        if total == 0 {
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+        let count = (total / block_size) as u64;
+        let end = start
+            .0
+            .checked_add(count)
+            .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
+        if end > self.block_count {
+            return Err(FfsError::Format(format!(
+                "block range out of range: start={} count={} block_count={}",
+                start.0, count, self.block_count
+            )));
+        }
+        let offset = start
+            .0
+            .checked_mul(u64::from(self.block_size))
+            .ok_or_else(|| FfsError::Format("block offset overflow".to_owned()))?;
+        self.inner
+            .write_vectored_all_at(cx, ByteOffset(offset), chunks)?;
         cx_checkpoint(cx)?;
         Ok(())
     }

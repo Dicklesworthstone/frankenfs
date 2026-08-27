@@ -133,6 +133,22 @@ pub fn flush_borrow_enabled() -> bool {
 ///
 /// Only capacity crosses a flush boundary, never bytes — see
 /// `ShardedMvccStore::put_run_buf`.
+/// Whether the flush hands the device a GATHER LIST instead of a coalesced buffer
+/// (`FFS_MVCC_FLUSH_VECTORED`, default OFF — an arm to measure).
+///
+/// Removes the last copy on the flush path. See
+/// `ShardedMvccStore::flush_to_device_after_vectored`; sized at `~10.5 pp` of
+/// daemon CPU on the bulk-durable-write row, with `pwritev` measured `~1.28x`
+/// faster than `memcpy`+`pwrite` at the syscall layer.
+#[must_use]
+pub fn flush_vectored_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_MVCC_FLUSH_VECTORED")
+            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+    })
+}
+
 #[must_use]
 pub fn flush_buf_reuse_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

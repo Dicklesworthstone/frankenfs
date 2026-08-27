@@ -30,6 +30,19 @@ int main(int argc, char **argv) {
     printf("IOV_MAX=%ld  blocks=%ld (%.1f MiB)  iovecs needed=%ld\n",
            (long)IOV_MAX, blocks, blocks * (double)BLK / (1024*1024), blocks);
 
+    // ⚠ THIS PROBE DESTROYS THE FIRST ~64 MiB PAST 1 MiB OF WHATEVER IT OPENS.
+    // On 2026-08-27 it was pointed at a live ext4 fixture and corrupted it; the
+    // next bulk run failed with EINVAL opening its own data file. Require an
+    // explicit opt-in so a fixture path cannot be passed by reflex.
+    if (getenv("IOVPROBE_I_WILL_DESTROY_THIS_DEVICE") == NULL) {
+        fprintf(stderr,
+                "refusing to write to %s: this probe overwrites %.1f MiB at offset 1 MiB.\n"
+                "Point it at a scratch image you can lose, then set\n"
+                "  IOVPROBE_I_WILL_DESTROY_THIS_DEVICE=1\n",
+                dev, blocks * (double)BLK / (1024 * 1024));
+        return 2;
+    }
+
     int fd = open(dev, O_RDWR | O_DIRECT);
     if (fd < 0) { fprintf(stderr, "open %s: %s\n", dev, strerror(errno)); return 1; }
 

@@ -1436,6 +1436,9 @@ impl ShardedMvccStore {
         // variant collects block numbers first (no copy), then re-resolves each block
         // under its own shard's read lock and appends the BORROWED bytes straight into
         // the run buffer, dropping the lock before every device write.
+        if crate::flush_vectored_enabled() {
+            return self.flush_to_device_after_vectored(cx, device, flushed_through, snapshot);
+        }
         if crate::flush_borrow_enabled() {
             return self.flush_to_device_after_borrowed(cx, device, flushed_through, snapshot);
         }
@@ -1490,6 +1493,107 @@ impl ShardedMvccStore {
             device.write_contiguous_blocks(cx, start, &run_buf)?;
         }
         self.put_run_buf(run_buf);
+        if flushed > 0 {
+            device.sync(cx)?;
+        }
+        Ok((flushed, snapshot.high))
+    }
+
+    /// One owner per block, no coalescing copy at all (`FFS_MVCC_FLUSH_VECTORED`).
+    ///
+    /// The borrowed walk still builds `run_buf` — it appends every block's bytes
+    /// into one contiguous buffer so the device can take a single ranged write.
+    /// Measured 2026-08-27 that copy is **~10.5 percentage points of daemon CPU**
+    /// on the bulk-durable-write row, and it is pure: `VersionData::Full` is
+    /// already an `Arc<AlignedVec>`, so the flush can clone the handle, drop the
+    /// shard lock exactly as it does today, and hand the device a gather list.
+    /// `pwritev` over that list beat `memcpy`+`pwrite` by `~1.28x` at the syscall
+    /// layer (`scripts/perf/bulk_durable_write_ab/iovprobe.c`).
+    ///
+    /// Compressed and `Identical` versions resolve to owned bytes and keep an
+    /// owned chunk; they are not the bulk path.
+    fn flush_to_device_after_vectored<D: BlockDevice>(
+        &self,
+        cx: &Cx,
+        device: &D,
+        flushed_through: CommitSeq,
+        snapshot: Snapshot,
+    ) -> FfsResult<(usize, CommitSeq)> {
+        enum FlushChunk {
+            Shared(std::sync::Arc<ffs_block::AlignedVec>),
+            Owned(Vec<u8>),
+        }
+        impl FlushChunk {
+            fn as_slice(&self) -> &[u8] {
+                match self {
+                    Self::Shared(buf) => buf.as_slice(),
+                    Self::Owned(buf) => buf.as_slice(),
+                }
+            }
+        }
+
+        let mut keys: Vec<BlockNumber> = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.read();
+            keys.extend(shard.versions.keys().copied());
+        }
+        keys.sort_unstable_by_key(|block| block.0);
+
+        let mut flushed = 0_usize;
+        let mut run_start: Option<BlockNumber> = None;
+        let mut run_next: u64 = 0;
+        let mut run: Vec<FlushChunk> = Vec::new();
+
+        let write_run = |device: &D,
+                         start: Option<BlockNumber>,
+                         run: &mut Vec<FlushChunk>|
+         -> FfsResult<()> {
+            if let Some(start) = start
+                && !run.is_empty()
+            {
+                let slices: Vec<&[u8]> = run.iter().map(FlushChunk::as_slice).collect();
+                device.write_contiguous_blocks_vectored(cx, start, &slices)?;
+            }
+            run.clear();
+            Ok(())
+        };
+
+        for block in &keys {
+            let continues = run_start.is_some() && block.0 == run_next;
+            if !continues {
+                write_run(device, run_start.take(), &mut run)?;
+            }
+            let chunk = {
+                let shard = self.shards[self.shard_index(*block)].read();
+                shard.versions.get(block).and_then(|versions| {
+                    let idx = crate::newest_visible_index(versions, snapshot.high)?;
+                    if versions[idx].commit_seq <= flushed_through {
+                        return None;
+                    }
+                    // The Full case hands back an Arc CLONE, so the shard lock is
+                    // released here exactly as in the borrowed walk and the bytes
+                    // still outlive the device write below.
+                    match &versions[idx].data {
+                        compression::VersionData::Full(buf) => {
+                            Some(FlushChunk::Shared(std::sync::Arc::clone(buf)))
+                        }
+                        _ => compression::resolve_data_with(versions, idx, |v| &v.data)
+                            .map(|bytes| FlushChunk::Owned(bytes.into_owned())),
+                    }
+                })
+            };
+            if let Some(chunk) = chunk {
+                if !continues {
+                    run_start = Some(*block);
+                }
+                run.push(chunk);
+                run_next = block.0.saturating_add(1);
+                flushed += 1;
+            } else if !continues {
+                run_start = None;
+            }
+        }
+        write_run(device, run_start.take(), &mut run)?;
         if flushed > 0 {
             device.sync(cx)?;
         }
