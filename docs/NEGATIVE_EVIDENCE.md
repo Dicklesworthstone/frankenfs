@@ -12686,3 +12686,123 @@ Reproduce:
     WORK=<scratch> ELF=<ffs-cli> ROUNDS=36 TAG=pxd1 FE_CPUS=18 FB_CPUS=19 \
       bash scripts/perf/parallel_metadata_ab/run_pmeta_xdio.sh
     python3 scripts/perf/parallel_metadata_ab/panalyze.py $WORK/pxmeta-pxd1.csv
+
+## 2026-08-27 — SELF-AUDIT: my own bulk-durable-write dig used the wrong transport, the row is 1.545x worse than I reported, and the flush-reserve lever survives and grows
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/bulk_durable_write_ab/run_bulk_dio.sh`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU, daemons on cpu18/cpu19.
+
+Tenth row dug in this sequence, and the target is **my own earlier commit**. The btrfs
+fsync row and the btrfs parallel-metadata row established that a durability-dominated row
+measured with our daemon on a buffered image file against a loop-mounted kernel is
+measuring the I/O stack — worth `1.74x` on one row and a SIGN FLIP on another. **The ext4
+bulk-durable-write dig I committed earlier today used exactly that shape**, and that row is
+~64% fsync by wall. It had to be re-run before anything else.
+
+### 2026-08-27 — the corrected headline
+
+Same rig, same workload (overwrite a preallocated 64 MiB file with 64 sequential 1 MiB
+positioned writes, then one file `fsync`), but **every arm — both kernel and both FUSE —
+on its own loop device with `--direct-io=on`**. Four runs, 32-48 rounds each, arms and
+daemon CPUs mirrored. `RCH_WORKER=none`, `hostname=thinkstation1`.
+
+    shipping configuration vs the live kernel arm, six readings across four runs
+      3.746  3.693  3.431  3.575  4.408  4.263      geometric mean  3.8367x
+
+against **my own earlier asymmetric figure of `2.4826x`** and the banked `2.898298x`.
+
+⛔ **The wrong transport flattered us by `1.545x`.** The correction is against my own
+committed row, not someone else's: `docs/NEGATIVE_EVIDENCE.md`'s bulk-durable-write entry
+quotes `2.4826x`/`2.5017x` and `2.7846x`/`2.5034x` from a rig whose kernel arms were
+`mount -o loop` while the daemon opened the image FILE. Those numbers describe two
+different I/O stacks and should be read as superseded by the `3.8367x` here.
+
+⚠ **And the phase split is NOT usable under loop-dio, which the A/A null says outright.**
+The same-invocation kernel A/A null control PASSES on the fsync phase in every run
+(`1.001578` bootstrap median CI `[0.985843, 1.012874]`, `1.009640` `[0.986974, 1.023544]`,
+`0.995062` `[0.978867, 1.007666]`, `1.003638` `[0.988069, 1.015708]`, 20000 resamples) and
+**FAILS on the write phase in every run** (`0.619812`, `1.539767`, `0.893379`, `0.884411`
+— up to `1.6x` in OPPOSITE directions between runs). Two identical kernel arms disagree by
+`1.6x` on how much of the batch lands in the write phase versus the fsync phase, because
+with `--direct-io=on` writeback timing decides that split per arm. **Only the TOTAL and the
+fsync phase are decidable on this row; the write-phase ratio is not.** On the total the
+per-run kernel A/A also fails in alternating directions (`0.938513`, `1.074055`) and only
+the balanced pair is usable — geometric mean `1.004`.
+
+A second thing that had to be fixed to get there: a plain `cp` of the image gives each arm
+whatever host extents are free, and under `--direct-io=on` that layout is on the critical
+path. Copies are now made through `mkcopy.py`, which `posix_fallocate`s the whole file
+before writing a byte. (It did not fix the write-phase A/A, which is the writeback-timing
+effect above, but it removes one confound.)
+
+### 2026-08-27 — the lever survives the correction and gets BIGGER
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+
+`FFS_MVCC_FLUSH_RESERVE` — the missing `run_buf.reserve()` on the MVCC flush path, landed
+earlier today at a banked `1.098925x` — re-measured from ONE ELF under symmetric transport,
+48 rounds, forward and mirrored with arms and daemon CPUs swapped:
+
+    whole batch   forward  1.143150  [1.109771, 1.209375]
+                  mirrored 1.131087  (from reserve/noreserve 0.884103 [0.860151, 0.911015])
+                  balanced 1.137104        <- banked conservative figure was 1.098925
+
+    fsync phase   forward  1.247745  [1.168195, 1.281492]
+                  mirrored 1.236459  (from 0.808766 [0.797194, 0.841562])
+                  balanced 1.242085
+
+    write phase   forward  1.000277  [0.950885, 1.094184]
+                  mirrored 0.989827
+                  balanced 0.995040        <- the negative control, still a NULL
+
+Same-invocation kernel A/A null control `0.982423` bootstrap median CI
+`[0.961700, 0.996372]` and `0.984539` `[0.974552, 1.004600]` on the total; on the fsync
+phase, where the effect lives, `0.995062` and `1.003638`, both clean.
+
+⭐ **This is the outcome that matters for the ledger's credibility: the HEADLINE was wrong
+by `1.545x` and the LEVER was right.** The lever was always a one-ELF interior A/B with
+both arms on the same transport, so the artifact cancelled in it exactly as the
+admissibility note claimed — and under the corrected, slower transport the reservation is
+worth slightly MORE (`1.137104` against `1.098925`), because the realloc chain it removes
+is unchanged while the batch it sits in got longer only in its device-bound part. The
+write-phase negative control is a NULL in both directions under the new transport too.
+
+### What this changes, and what it does not
+
+  * ⛔ Superseded: the bulk-durable-write vs-kernel figures in this ledger's earlier
+    2026-08-27 entry (`2.4826x`, `2.5017x`, `2.7846x`, `2.5034x`). Read `3.8367x`.
+  * ✅ Unchanged: the counted mechanism from that entry — `RawVecInner::finish_grow`
+    `15.81% → 0.04%`, `_rjem_je_large_ralloc` `15.19% →` below threshold — which is a
+    profile of the daemon and does not depend on the transport at all.
+  * ✅ Strengthened: the lever, now `1.137104x` balanced under symmetric transport.
+  * ⚠ New constraint: on this row the WRITE-phase ratio is not decidable, so the earlier
+    entry's per-phase write figures should not be quoted either.
+
+**The general rule this session has now paid for three times: split the phases first, and
+if any meaningful fraction of the batch is fsync, put every arm on its own loop device
+with `--direct-io=on` before believing a single number.**
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row and `3.8367x` is additionally ISA-overstated.
+What this banks is the corrected headline with its `1.545x` self-correction, the A/A-null
+evidence that the write/fsync split is not decidable under loop-dio, the fallocated-copy
+fix, and the re-confirmed lever with its negative control intact.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/mkbulk.sh
+    gcc -O2 -o $WORK/bulkwrite_ab scripts/perf/bulk_durable_write_ab/bulkwrite_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=48 TAG=rsF FA_LABEL=noreserve FB_LABEL=reserve \
+      FA_CPUS=18 FB_CPUS=19 FA_ENV="FFS_MVCC_FLUSH_RESERVE=0" \
+      FB_ENV="FFS_MVCC_FLUSH_RESERVE=1" \
+      bash scripts/perf/bulk_durable_write_ab/run_bulk_dio.sh
+    # then the mirror with FA/FB swapped; take the geometric mean of the two
+    python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulkdio-rsF.csv
