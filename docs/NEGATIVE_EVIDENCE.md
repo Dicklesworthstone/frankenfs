@@ -17288,3 +17288,77 @@ Hand rig, not `ffs-mounted-kernel-bench`. No vs-incumbent ratio is claimed: the 
 span 1 and one A/A half fails. What is banked is the counted mechanism (`memmove` `16.07% →
 5.77%`), the inertness of the previous build, and the fact that the row's clock cannot resolve
 the effect.
+
+## 2026-08-27 — bd-avg6f: the ext4 storm's FUSE arm DOES hold an A/A null (`0.944517`, 17th attempt) — but the row is now unmeasurable anyway, because the only fixture the JBD2 guard permits makes the KERNEL arm `134x` slower and manufactures a `7.1x` fake win
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8, every arm on
+its own loop device with `--direct-io=on`.
+
+bd-avg6f: *"ext4 create/delete storm RUNS post-deadlock-fix but its FUSE arm cannot hold an
+A/A null — 16 attempts, none admitted."*
+
+### ✅ The FUSE arm holds an A/A null
+
+Two identical FrankenFS arms, same ELF, same env, 24 rounds:
+
+    ffsA/ffsB (total):  0.944517  [0.893906, 1.018498]  n=24   PASS
+
+**The CI spans 1 — the 17th attempt holds.** It is wide (`±6%`), so it can only decide effects
+above roughly `10%`, but it is admissible where 16 previous attempts were not. What differs
+from the banked attempts: every arm on its own loop device with `--direct-io=on` (symmetric
+transport), daemons on CPUs **18/19 and never cpu16** (a measured-defective core on this host),
+and `performance` governor on the daemon cores.
+
+### ⛔ And it does not matter, because the row has no admissible FIXTURE
+
+`94fdba50b` refuses a writable **journalled** ext4 mount, and `mkstorm.sh` builds one — so the
+row now fails at mount. The obvious fix is `-O ^has_journal`, which the guard explicitly
+permits. **Measured, and it is worse than the block.** Same rig, same rounds, kernel `k1`:
+
+| fixture | kernel `k1` create | kernel `k1` total |
+| --- | ---: | ---: |
+| journalled (this morning, `TAG=sx1`) | **29.4 ms** | **89.0 ms** |
+| no-journal (this run, `TAG=aa1`) | **3942.3 ms** | **3986.8 ms** |
+| | **134x slower** | **44.8x slower** |
+
+A no-journal ext4 cannot batch metadata into a transaction, so on a `--direct-io` loop device
+every create's inode-table and bitmap update goes to the device individually. The FUSE arms
+are unmoved (`554.862` / `588.805 ms`, in line with the journalled runs) — **only the incumbent
+collapses.**
+
+⚠⚠ **The ratio that configuration produces is `k1/ffsA = 7.106774`: FrankenFS "beating" kernel
+ext4 sevenfold on the create/delete storm.** It is a fixture artifact and must never be
+published. This is the exact shape the campaign is told to reject — a number that only exists
+because of how the bench input was built.
+
+⇒ **Every ext4 MUTATING row is currently unmeasurable**: journalled ⇒ refused at mount,
+no-journal ⇒ a silent `7x` fake win. The fixtures are therefore left **journalled on purpose**,
+with the blocker documented at the `mke2fs` line in `mkstorm.sh` and `mkpmeta.sh`, so the
+failure is the loud one. The real fix is the one `94fdba50b`'s own doc names: route the mounted
+fsync path through the JBD2 writer. **btrfs mutating rows are unaffected** and are where write
+work can still be measured today.
+
+### Transferable
+
+  * ⭐⭐⭐ **When a guard blocks a fixture, measure the permitted alternative before adopting
+    it.** `-O ^has_journal` satisfies the guard and bd-4zjkz's durability-class argument, and
+    it still produces a `7.1x` lie. Reasoning said it was the correct fixture; one run said
+    otherwise.
+  * ⭐⭐ **Prefer a loud failure to a quiet artifact.** Journalled fails at mount with a clear
+    message; no-journal succeeds and hands you a headline. The fixture stays in the state that
+    fails loudly.
+  * ⭐ **An A/A null that finally holds can be worth less than it looks.** bd-avg6f's blocker
+    is resolved and the row is still unmeasurable — for an unrelated reason that landed the
+    same day.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`. The `0.944517` A/A is a same-invocation candidate
+null and is the only ratio claimed here. `k1/ffsA = 7.106774` is reported **as an artifact to
+be rejected**, not as a result, and no vs-incumbent figure from the no-journal fixture is
+banked.
