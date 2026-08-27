@@ -1922,8 +1922,7 @@ pub fn reserved_inode_count_in_group(geo: &FsGeometry, group: GroupNumber) -> u3
     u32::try_from(limit).unwrap_or(u32::MAX)
 }
 
-// Returns true when GDT-block persistence is deferred to flush (env
-// FFS_SKIP_GDT, bd-cc-gdt-defer; OPT-IN). In deferral mode the per-op GDT write
+// Returns true when GDT-block persistence is deferred to flush. In deferral mode the per-op GDT write
 // is skipped — the in-memory `GroupStats` is the authoritative count — and
 // `ext4_flush_group_descriptors` (ffs-core) writes every descriptor once at
 // flush, collapsing the ~80k per-op MVCC versions on the one shared GDT block
@@ -1935,16 +1934,16 @@ pub fn reserved_inode_count_in_group(geo: &FsGeometry, group: GroupNumber) -> u3
 // under deferral — those paths persist via a boundary the GDT flush pass is not
 // yet wired into; default-on needs that wiring first (bd-cc-gdt-defer-default).
 thread_local! {
-    // Per-thread override of `gdt_persistence_deferred`, `None` = use the global
-    // env default. Test code can pin eager mode regardless of process-global
-    // `OnceLock` init order; production leaves this as `None`.
+    // Per-thread override of `gdt_persistence_deferred`. Test code can pin eager
+    // mode to exercise the per-operation persistence path; production leaves
+    // this as `None` and always uses deferred persistence.
     static GDT_DEFER_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Test-only: pin `gdt_persistence_deferred()` on the current thread. Pass
 /// `Some(false)` to force eager per-op GD persistence (what the eager-path alloc
-/// tests validate), `Some(true)` for deferral, or `None` to fall back to the env
-/// default. `#[doc(hidden)]` — not part of the stable API.
+/// tests validate), `Some(true)` for deferral, or `None` for production's safe
+/// deferred mode. `#[doc(hidden)]` — not part of the stable API.
 #[doc(hidden)]
 pub fn set_gdt_persistence_deferred_for_test(value: Option<bool>) {
     GDT_DEFER_OVERRIDE.with(|c| c.set(value));
@@ -1952,19 +1951,15 @@ pub fn set_gdt_persistence_deferred_for_test(value: Option<bool>) {
 
 #[must_use]
 pub fn gdt_persistence_deferred() -> bool {
-    use std::sync::OnceLock;
-    static SKIP: OnceLock<bool> = OnceLock::new();
-
     if let Some(forced) = GDT_DEFER_OVERRIDE.with(std::cell::Cell::get) {
         return forced;
     }
-    // Default ON (bd-cc-gdt-defer-default): GroupStats is the authoritative in-memory
-    // count and the GD is flushed at every durability boundary
-    // (flush_mvcc_to_device / sync_all_to_device / flush_on_destroy). Allocation reads
-    // the authoritative bitmap, so a stale on-disk GD after an unclean stop is a
-    // cosmetic free-count hint that e2fsck recomputes — no corruption. Opt back into
-    // eager per-op GD persistence with FFS_SKIP_GDT=0 (for A/B).
-    *SKIP.get_or_init(|| std::env::var("FFS_SKIP_GDT").as_deref() != Ok("0"))
+    // GroupStats is authoritative in memory and the descriptor is flushed at every
+    // durability boundary. `FFS_SKIP_GDT=0` used to switch production into eager
+    // mode, but some allocating paths do not perform a matching per-operation
+    // descriptor write; that leaves stale free counts on disk (bd-hyysq). Keep the
+    // eager branch test-only until every allocation path can prove that contract.
+    true
 }
 
 const INCREMENTAL_BITMAP_CSUM_MAX_DELTA_BYTES: usize = 128;
@@ -4158,6 +4153,21 @@ mod tests {
         Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn production_gdt_persistence_stays_deferred_after_eager_test_override_bd_hyysq() {
+        set_gdt_persistence_deferred_for_test(Some(false));
+        assert!(
+            !gdt_persistence_deferred(),
+            "the test-only override must keep the eager persistence path covered"
+        );
+
+        set_gdt_persistence_deferred_for_test(None);
+        assert!(
+            gdt_persistence_deferred(),
+            "production must not revive unsafe eager persistence through FFS_SKIP_GDT=0"
+        );
+    }
 
     struct MemBlockDevice {
         block_size: u32,
