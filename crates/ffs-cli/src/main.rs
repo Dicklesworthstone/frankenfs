@@ -1301,8 +1301,10 @@ enum Command {
         ///
         /// Kernel btrfs always verifies a datasum extent's crc32c before
         /// returning its bytes and reports EIO on a mismatch. FrankenFS has the
-        /// same check (`bd-tkv2n`) is enabled by default. Pass an explicit
-        /// `false` only when measuring the cost of the kernel-parity check.
+        /// same check (`bd-tkv2n`), and it is enabled by default. Pass an
+        /// explicit `false` only when measuring the cost of that kernel-parity
+        /// check — a read row measured with it off is NOT
+        /// configuration-comparable to one measured with it on (bd-6kpp4).
         #[arg(
             long = "btrfs-verify-data-on-read",
             default_value_t = true,
@@ -8022,7 +8024,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={},btrfs_verify_data_on_read={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -8078,6 +8080,11 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             // census after the fact and the comparator could not prove the two
             // arms differ at all. Reported now, like every other knob here.
             ffs_fuse::parent_invalidation_enabled(),
+            // bd-6kpp4: the 2026-08-15 default flip made every banked btrfs READ
+            // row describe a configuration that no longer ships, and the flag was
+            // not on this line, so a verify-on-vs-off A/B could not be attested
+            // in-process at all. Reported now, like every other knob here.
+            options.btrfs_verify_data_on_read,
         );
     }
 
