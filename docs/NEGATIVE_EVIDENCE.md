@@ -14758,3 +14758,137 @@ change stashed — pre-existing, not caused here.
   * ⭐ **Read the setting back from the allocator for the self-report.** Echoing the request
     would have attested nothing; reading `arenas.dirty_decay_ms` is what makes
     `jemalloc_dirty_decay_ms=-1` evidence.
+
+## 2026-08-27 — the campaign's WORST row gets a same-invocation instrument: ext4 xattr-get-list-report is `8.428754x`, its crossing census decomposes to ONE crossing, `50.0%` of it is the audit probe that here CANNOT be suppressed, and `FFS_FUSE_RECEIVE_SPIN=2000` is a balanced `1.414346x`
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, NEW rig
+`scripts/perf/xattr_ab/` (`mkxattr.sh`, `xattr_ab.c`, `run_xattr.sh`, `xanalyze.py`).**
+Provenance: in-process self-report
+`bench_evidence,binary_sha256=31652ce23e7d88b6b4b7133adc9fdc5e6f433090dc6cd86c3203333546f13d38`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8.
+
+`xattr-get-list-report` has been the banked WORST row (`5.749816x`) with no rig of its own.
+This builds one: four arms live simultaneously in ONE invocation — two kernel ext4 read-only
+mounts (the A/A null) and two FrankenFS mounts from ONE ELF — arm order rotated per round,
+24 rounds × 2,000 reports, forward and mirrored with arms **and** daemon CPUs swapped.
+
+The fixture is `seed_ext4_xattr_fixture`'s exactly, and its storage shape is **asserted, not
+assumed**: `xattr-inline.bin` File ACL `0` (stays in the inode body), `xattr-external.bin`
+`2159` and `xattr-many.bin` `2160` (both allocate an external xattr block). The batch is the
+harness's: per report `getxattr(inline, user.inline)`, `getxattr(external, user.external)`,
+`getxattr(inline, user.absent)` which must return `ENODATA`, `listxattr(inline)`,
+`listxattr(many)`.
+
+⭐ The rig's digest folds **value bytes and name bytes only, never a path**, so it is a real
+cross-arm parity oracle — a lesson taken directly from the readdir+stat rig, whose digest
+hashed the absolute path and therefore could never be equal across arms. **All four arms
+report `13764262966921926213` in both runs**, so every ratio below is over byte-identical
+xattr results, including the `ENODATA` miss on the absent name.
+
+### The row
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| **row vs kernel ext4** | `8.429571` | `8.427937` | **`8.428754x` slower** |
+| A/A null `k1/k2` | `1.002111` `[0.992982, 1.008930]` | `1.000381` `[0.995871, 1.003523]` | `1.001246` **PASS** |
+
+Absolutes: kernel `k1` `33.767` / `33.703 ms`, FrankenFS `292.691` / `286.427 ms`. ⭐ The two
+kernel arms reproduce **to `0.02%` across two independent runs** — this row's incumbent is
+about as stable a reference as this host produces.
+
+### The crossing census decomposes to ONE crossing
+
+`crossings_total=480206`, `crossings_getxattr=384161`, byte-identical in **all four
+FrankenFS arms across both runs**. For 48,020 reports (24 × 2,000 plus the 20-report warm):
+
+| term | predicted | |
+| --- | --- | --- |
+| real `getxattr`, 3 per report | 144,060 | |
+| audit `security.capability` probe, 1 per path-based syscall × 5 | 240,100 | |
+| ⇒ `crossings_getxattr` | **384,160** | measured **384,161** |
+| real `listxattr`, 2 per report | 96,040 | |
+| `lookup` + `getattr` | 4 | |
+| ⇒ `crossings_total` | **480,204** | measured **480,206** |
+
+**Exact to two crossings, and `240,100 / 480,206 = 50.0%` of every crossing on this row is
+the Linux audit probe.**
+
+⛔ **And here it cannot be suppressed.** `FFS_FUSE_XATTR_NO_SUPPORT=1` took five read-only
+rows to parity by answering `ENOSYS` to *all* `getxattr` — but this row's own work IS
+`getxattr`, so the knob would delete the workload rather than the overhead. The audit half of
+this row is structural in a way it was not for readdir+stat, warm stat, or the other three.
+
+⭐⭐ **The memo absorbs essentially 100% of the work and buys nothing.** `op_counts` reports
+`getxattr=7 listxattr=2` reaching a handler against `384,161` + `96,040` counted crossings —
+**0.0018%**. Every other crossing was answered by the capability/xattr memos before the
+handler, and the round trip was paid anyway. This is the most extreme case yet of "a memo
+answers a crossing that already happened"; the readdir+stat row's 96% was mild by comparison.
+
+### Profile: there is no filesystem-side lever here
+
+`perf record -F 4999 -g` on the daemon, by DSO: **`91.04%` `[kernel.kallsyms]`**, `5.61%`
+`ffs-cli`, `2.03%` libc, `1.31%` vdso. Our own `FrankenFuse::getxattr` is **`0.47%`**. The
+top symbols are all transport and scheduler — `fuse_dev_do_read` `4.52%`, `fuse_copy_fill`
+`3.24%`, `entry_SYSRETQ_unsafe_stack` `4.82%`, `dequeue_entity` `4.11%`, `update_curr`
+`3.17%` — plus **`5.71%` in the audit family on the DAEMON's own syscalls**
+(`__audit_syscall_exit` `1.21`, `audit_reset_context` `1.21`, `auditd_test_task` `1.15`,
+`audit_filter_inodes` `0.81`, `__audit_syscall_entry` `0.66`, `__audit_filter_op` `0.43`,
+`audit_filter_rules` `0.24`). ⇒ **the row is round-trip bound; the lever class is transport,
+not filesystem.**
+
+### `FFS_FUSE_RECEIVE_SPIN=2000`, measured on this row
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/spin` | `1.451892` `[1.397843, 1.497197]` | `1.377771` `[1.359292, 1.431075]` | **`1.414346x`** |
+| **row vs kernel with spin** | `5.951460` | `6.021158` | **`5.986208x`** |
+| A/A null `k1/k2` | `1.002111` | `1.000381` | `1.001246` **PASS** |
+
+⭐ **Same census, cheaper crossing.** `crossings_total=480206` is byte-identical between the
+spin and non-spin arms in both runs, so the `1.414346x` is bought entirely by making each
+round trip cheaper, not by removing any. It corroborates the banked
+`5.786301x → 4.281783x` (`1.351x`) on a different rig and a newer ELF.
+
+⛔ **Still not a default, and the cost is now priced.** Arm-A daemon ticks: `15` without
+spin, `20` with — **~+33% daemon CPU for `1.414346x` less wall** (one run each, arm-A-only
+counter, so indicative rather than a measured ratio). Spinning is a global transport setting
+and the same knob measured **`10.4%` / `10.6%` / `7.4%` SLOWER** on parallel-metadata-write.
+A row-dependent knob with a real CPU price is exactly what should stay a knob.
+
+### What this leaves
+
+`8.428754x` splits into **`50.0%` audit probe that cannot be removed while the row does xattr
+work**, and a remainder that is round trips whose handler cost is `0.47%`. Transport is the
+only live lever class, spin is the only one measured on it, and it trades CPU for wall.
+`0.0018%` of crossings reach a handler — there is nothing left to memoize.
+
+### Transferable
+
+  * ⭐⭐ **Predict the crossing census arithmetically before reading it.** `3 getxattr +
+    2 listxattr + 5 capability probes` per report predicted `480,204`; the counter said
+    `480,206`. An exact decomposition tells you what fraction of a row is even addressable
+    before any lever is tried.
+  * ⭐⭐ **The same external cost can be structural on one row and removable on another.**
+    The audit probe was 96% of readdir+stat and removable; it is 50% of this row and not,
+    because here the workload and the overhead use the same syscall.
+  * ⭐ **Build the digest so it CAN be equal across arms.** Value bytes and names, never
+    paths. All four arms matching is what makes a `1.414346x` a performance result rather
+    than an unexamined behaviour change.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates,
+so `8.428754x` is not a scorecard row and is additionally ISA-overstated. Every ratio is
+same-invocation against live kernel ext4 with its A/A null reported, forward and mirrored,
+20000-resample bootstrap median CIs over 24 paired per-round ratios.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/xattr_ab/mkxattr.sh
+    gcc -O2 -o $WORK/xattr_ab scripts/perf/xattr_ab/xattr_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=spin FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000" TAG=xf \
+      bash scripts/perf/xattr_ab/run_xattr.sh
+    python3 scripts/perf/xattr_ab/xanalyze.py <body.csv>
