@@ -18452,3 +18452,83 @@ for, with a measured parity configuration sitting beside it.
 Nothing shipped, nothing reverted. ELF
 `7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug — counts only, no wall
 time claimed). `hostname=thinkstation1`.
+
+## 2026-08-27 — bd-6uyto residual FIXED at the extent-tree site its own fix missed (btrfs bulk write no longer fails `fsync` with node overflow), and the write row's first instr/op figure: `2.48x` the kernel's instructions for byte-identical durable work, `83.3%` of it in our daemon
+
+Every read row this campaign has decomposed was ~99% FUSE round trip with the daemon nearly idle. The
+write side is the opposite regime — the one place measured where WE are the cost — so I went to
+measure it with the metric that suits it: **instructions retired**, which does not move when a peer
+spikes the host. The measurement did not survive first contact, and what it hit is the more valuable
+half of this entry.
+
+**A correctness bug, reproduced from a clean fixture.** Bulk durable write (64 KiB writes, `fsync`
+every 16) on a FrankenFS btrfs `--rw` mount fails at ~13 MiB:
+
+```
+FUSE op failed op="fsync" ino=257 errno=22
+  error=invalid on-disk format: btrfs mutation: node overflow:
+        tree owner 2 level 0 has 224 items needing 17226 bytes in a 16384-byte node
+ERROR FUSE destroy could not flush: acknowledged writes are LOST
+  consequence="acknowledged writes not persisted"
+```
+
+This is `bd-cjqhh` ("the whole workload is UNRUNNABLE on btrfs"), and `bd-6uyto` — **CLOSED** — names
+the root cause exactly: *"COW tree splits leaves by item COUNT not serialized byte size"*.
+
+**Why a closed bead still reproduced: its fix missed a creation site.** bd-6uyto's plan was "set the
+budget at each real-tree creation site from the actual nodesize". Eight sites in `ffs-core` got it;
+`ExtentAllocator::set_nodesize` in `ffs-btrfs` did not. That function REPLACES the extent tree with
+`InMemoryCowBtrfsTree::new(max_items)` where `max_items = (nodesize - 101) / 64` — a count cap derived
+from an ASSUMED ~64 bytes per item — and never calls `.with_node_byte_budget`, so `leaf_byte_budget`
+stays `usize::MAX` and the leaf splits by COUNT alone. The measured leaf held **224 items needing
+17,226 bytes = 76.9 B/item**, so it overflowed a 16,384-byte node while still far under the count cap
+of 254. bd-6uyto's own regression test creates 1000 files, exercising the FS tree, so a missed
+EXTENT-tree site passes it. Tree owner 2 is the extent tree, which is why this surfaced only on a
+data-write workload.
+
+**Fix**: set the byte budget at that site, as at every other. `crates/ffs-btrfs/src/lib.rs`.
+
+**Verified in both directions.** Post-fix the failure class is GONE — 0 `node overflow` lines in the
+post-fix run against 4 pre-fix (the log is append-mode; the runs are separated by timestamp).
+Regression: `ffs-btrfs` **429 passed / 0 failed**, `ffs-core` btrfs-filtered **402 passed / 0 failed**
+(including `btrfs_full_commit_survives_btrfs_check_bd_lzr3e`).
+
+**bd-cjqhh is NOT closed — one of its two blockers is.** The workload now runs further and hits a
+DIFFERENT bug: `write 255: No space left on device` at offset 16,711,680 — **ENOSPC at ~16 MiB in a
+1024 MiB image**, i.e. the data chunk is not grown when the first one fills. That is the next blocker
+on the btrfs write side and it is not the one I fixed.
+
+**THE MEASUREMENT, run inside the working range so both arms do byte-identical work** (192 blocks,
+12,582,912 bytes, 13 `fsync`s — verified equal on both arms, not assumed):
+
+| quantity | kernel btrfs (live incumbent) | FrankenFS |
+|---|---|---|
+| total instructions | **50,174,974** | **124,547,223** |
+| — client | 50,174,974 | 20,772,654 |
+| — daemon | n/a (in-syscall) | **103,774,569** (`83.3%` of ours) |
+| instructions / byte | `3.99` | `9.90` |
+| blocking crossings / write | `1.0208` | `2.0677` |
+
+**`2.48x` the kernel's instructions for identical durable work**, and `2.03x` its blocking crossings.
+The comparison is fair by construction: the kernel's filesystem work happens in the client's syscall
+context and is counted there, while ours is split across the boundary and BOTH halves are counted —
+counting only our client would have flattered us by 6x.
+
+Reproducibility, two runs: daemon `103,774,569` / `103,764,490` — **0.01%**; overall ratio `2.483x` /
+`2.494x` — **0.4%**; FUSE blocking crossings identical at `2.0677` both runs. Instructions are the
+right instrument for this row.
+
+**⚠ A METHODOLOGICAL WARNING I nearly published through.** I first ran this with a DEBUG build and
+measured **`8.10x`**. The optimized build measures `2.48x` — **debug inflated our daemon by 3.7x**
+(384.7M -> 103.8M instructions for the same work). Debug is legitimate for counting crossings and
+context switches (protocol properties) and is what I used for every counted row before this one; it is
+NOT legitimate for a cross-arm instruction ratio against an optimized kernel. Had I reported `8.10x`
+it would have been wrong by a factor of three in the direction that flatters the campaign's sense of
+where the work is.
+
+**⚠ And this figure is still an UPPER BOUND.** `codegen_isa` reports `compile_avx2=false` — a baseline
+build, no `x86-64-v3`, no PGO. Per bd-b9dug that OVERSTATES losses-vs-kernel, so the shipping-ISA
+figure is at most `2.48x` and probably less. It is quotable as a bound, not as the row's number.
+
+ELF `cf456c70ebeb49b41fb1d38dc05c4f19c2313b39c3dea57eff61b28c6a5aa9ff` (HEAD + this fix, release).
+`hostname=thinkstation1`.

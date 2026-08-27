@@ -8257,7 +8257,18 @@ impl BtrfsExtentAllocator {
                 .unwrap_or(5)
                 .max(5);
             if let Ok(tree) = InMemoryCowBtrfsTree::new(max_items) {
-                self.extent_tree = tree;
+                // bd-6uyto, at a site its fix missed: `max_items` is a COUNT cap
+                // derived from an ASSUMED ~64 bytes per item, and real extent
+                // items are larger. Measured on a bulk durable write, an extent
+                // leaf reached 224 items needing 17226 bytes — 76.9 B/item — and
+                // overflowed a 16384-byte node while still far under the count cap
+                // of 254, failing `fsync` with EINVAL and then losing acknowledged
+                // writes at unmount (bd-cjqhh). The count cap cannot bound bytes;
+                // the byte budget must be set here as it is at every ffs-core
+                // tree-creation site.
+                self.extent_tree = tree.with_node_byte_budget(
+                    usize::try_from(nodesize.saturating_sub(101)).unwrap_or(usize::MAX),
+                );
             }
         }
     }
