@@ -18635,3 +18635,63 @@ this baseline does not need a quiet window.
 
 ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
 `hostname=thinkstation1`. Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-cjqhh write row: THREE attested rejects on the memory-churn lever, and my own "pool the per-block buffers" framing is REFUTED — the fault rate is a fixed `~1.15` per data page, insensitive to buffer reuse, jemalloc retention, AND flush frequency
+
+The previous entry located the write daemon's cost as memory churn (`1.158` page faults per 4 KiB page
+of data written) and named "pool the per-block version buffers" as the lever, declining to attempt it
+without a crash-consistency oracle. Before touching MVCC version-storage lifetime — shared with the
+read path and with snapshot semantics — I tested whether that framing is even right. It is not.
+
+**1. The churn is real and has ZERO amortisation.** Daemon page faults against bytes written, fixture
+rebuilt between runs:
+
+| workload | pages of data | daemon page faults | faults / page |
+|---|---|---|---|
+| 3 MiB | 768 | 890 | `1.159` |
+| 6 MiB | 1,536 | 1,758 | `1.145` |
+| 12 MiB | 3,072 | 3,548 | `1.155` |
+
+Ratios `1.976` and `2.018` against a doubling of the workload — **perfectly linear**. Every page of
+data costs a fresh fault at every size, so this is not a cold-start cost that amortises.
+
+**2. REJECT — `FFS_MVCC_FLUSH_BUF_REUSE`** (previous entry, restated for the set): faults
+`3,557 -> 3,551` (0.2%, noise), daemon instructions `+1.8%` the wrong way, knob attested
+`mvcc_flush_buf_reuse=false`/`=true` in the daemon's own self-report.
+
+**3. REJECT — jemalloc retention.** `_RJEM_MALLOC_CONF=retain:true,dirty_decay_ms:-1,muzzy_decay_ms:-1`
+moved faults `3,551 -> 3,547` and instructions `106.24M -> 106.58M`. **With the lever-ran proof, which
+this class of test has burned me on before**: plain `MALLOC_CONF` is SILENTLY IGNORED under
+`tikv-jemallocator`, so a null from it would be worthless. Proven by setting an invalid option with
+`abort_conf:true` — under `_RJEM_MALLOC_CONF` jemalloc printed `Invalid conf pair:
+definitely_not_an_option:1` and `Abort (abort_conf:true)`, while under `MALLOC_CONF` the binary ran
+normally and printed its evidence. **The env var reaches jemalloc; the null is real.** That abort-on-
+invalid-option trick is the cheapest available proof that an allocator config was actually parsed, and
+is worth reusing.
+
+**4. REFUTED — my own live-footprint framing.** If the faults came from version data accumulating
+until a flush, then flushing more often would bound the live set and cut them. It does not:
+
+| `SYNC_EVERY` | fsyncs | daemon page faults |
+|---|---|---|
+| 4 | 49 | 3,496 |
+| 16 | 13 | 3,547 |
+| 64 | 4 | 3,592 |
+
+A **16x** change in flush frequency moves faults **2.7%** — and in the wrong direction for the
+hypothesis (more flushes, slightly FEWER faults, but nowhere near proportionally). **Pooling buffers
+across flushes therefore cannot be the lever**, because flush boundaries are not what governs the
+fault rate. I am withdrawing that framing from the previous entry rather than leaving a plausible but
+unsupported target on the record for someone to chase.
+
+**What survives, stated as the bounded mystery it now is.** The write daemon takes a fixed `~1.15`
+page faults per 4 KiB of data written. That rate is INSENSITIVE to: the flush staging-buffer reuse
+knob, jemalloc extent retention and both decay settings, and a 16x change in flush frequency. It
+scales exactly linearly with bytes. Whatever allocates those pages does so per unit of data and is
+reached by none of the three levers tried — which is a much narrower target than "memory churn", and
+narrowing it cost three measured rejects rather than a speculative change to shared version storage.
+
+All counts on this row reproduce to `0.01%` on the daemon instruction component, so the next candidate
+can be adjudicated against these baselines without a quiet window. ELF
+`b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
+`hostname=thinkstation1`. Nothing shipped, nothing reverted.
