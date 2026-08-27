@@ -43,6 +43,14 @@ rust-version = "1.95"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
+# Debug impls deliberately omit large payload fields.
+missing_fields_in_debug = "allow"
+# Readable incremental string building in cold paths.
+format_push_string = "allow"
+# usize->u32 casts on values bounded by the on-disk format.
+cast_possible_truncation = "allow"
+# Doc prose shape only.
+too_long_first_doc_paragraph = "allow"
 # Helper items declared next to the code that uses them.
 items_after_statements = "allow"
 # Guards deliberately span the critical section.
