@@ -15908,3 +15908,98 @@ Reproduce:
       FA_LABEL=base FB_LABEL=noxattr FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=bx1 \
       bash scripts/perf/readdir_stat_btrfs_ab/run_multi_btrfs.sh
     python3 scripts/perf/readdir_stat_btrfs_ab/analyze.py <body.csv>
+
+## 2026-08-27 — the storm's audit half, priced: `1.281533x` (`5.695311x` → `4.389209x`), BOTH A/A halves passing — and it shows `dispatch_ns` RANKS CROSSINGS WRONG
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8, every arm on
+its own loop device with `--direct-io=on`.
+
+The create/delete storm is the worst genuinely-ours row and the last one where the audit
+probe had been counted but never suppressed.
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+24 rounds × 2,000 create+delete pairs, four arms simultaneously, order rotated per round,
+forward and mirrored with arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/noxattr` | `1.274520` `[1.200880, 1.351527]` | `1.288585` `[1.271285, 1.322930]` | **`1.281533x`** |
+| **row vs kernel, before** | `5.775039` | `5.616684` | **`5.695311x`** |
+| **row vs kernel, after** | `4.463429` | `4.316224` | **`4.389209x`** |
+| A/A null `k1/k2` | `1.000581` `[0.992385, 1.005491]` **PASS** | `0.977264` `[0.947615, 1.012855]` **PASS** | `0.988854` |
+
+Both A/A halves pass. Gate verdict `presence=proven_absent`; counted:
+`crossings_getxattr` **200,051 → 1**, `crossings_total` **747,860 → 539,755 (−27.8%)**.
+Absolutes: kernel_median_wall_ns=86169000 and kernel_median_wall_ns=89998000 against
+fuse_median_wall_ns=502824000 / fuse_median_wall_ns=404073000 (forward) and
+fuse_median_wall_ns=503414000 / fuse_median_wall_ns=392208000 (mirrored). All CIs are
+20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+### ⭐⭐⭐ `dispatch_ns` ranks crossings wrong, and this row proves it three ways
+
+The probe is **`27.8%` of this row's crossings but only `11.2%` of its `dispatch_ns`** — and
+removing it is worth **`22.0%` of the WALL**. Three levers have now been measured on this one
+row, all with the same rig and the same counter:
+
+| lever | opcode removed | crossings removed | `dispatch_ns`/crossing | wall | wall-points per crossing-point |
+| --- | --- | ---: | ---: | --- | ---: |
+| audit suppression | `getxattr` | 27.8% | **3,076 ns (cheapest)** | `1.281533x` | **0.79** |
+| create-side entry inval | `lookup` + notify | 13.8% | 6,022 ns | `1.105635x` | 0.70 |
+| parent inval | `getattr` | 6.0% | 3,792 ns | `1.017298x` **undecidable** | **0.28** |
+
+⛔ **The ordering inverts.** By `dispatch_ns` a `getxattr` crossing (`3,076 ns`) is CHEAPER
+than a `getattr` one (`3,792 ns`); by wall it is worth **2.8× more per crossing**. So
+`dispatch_ns` measures what the DAEMON spends, and that is not what the client waits for.
+
+⭐ **The mechanism is where the crossing sits.** The audit probe happens *inside* the client's
+own syscall — `filename_lookup → __audit_inode → get_vfs_caps_from_disk` — so the client
+blocks on it, every time. The parent-invalidation `getattr` is a kernel-initiated
+revalidation that need not sit on the critical path of the syscall that caused it. Same
+counter, same row, and the placement decides the price.
+
+⚠ This retro-explains the parent-inval REJECT: `6.0%` of crossings for an undecidable
+`1.7%` looked anomalous against the other two levers' `~0.75` conversion. It is not an
+anomaly, it is a different KIND of crossing.
+
+### The probe across all six rows
+
+| row | probes | share of crossings | suppression | row before → after |
+| --- | ---: | ---: | --- | --- |
+| ext4 readdir+stat | 819,225 | 96.0% | `6.405191x` | `5.649257x` → `1.102674x` **faster than kernel** |
+| btrfs readdir+stat | 819,225 | 96.0% | `6.227045x` | `6.464769x` → `1.023564x` **parity** |
+| ext4 xattr-get-list-report | 240,100 | 50.0% | **REFUSED** (image has xattrs) | `8.428754x` |
+| **create/delete storm** | **200,051** | **27.8%** | **`1.281533x`** | **`5.695311x` → `4.389209x`** |
+| parallel-metadata-write | 76,369 | 29.9% | `1.134295x` | `1.853064x` → `1.636426x` |
+
+⇒ **The storm keeps a `4.389209x` loss after the external cost is removed — by far the
+largest residual on the board, and all of it ours.** Every other row either reaches parity or
+is refused; this one is where the remaining filesystem work is.
+
+⛔ Not a default: a suppressing mount is a RESTRICTED mount with no xattr support.
+
+### Transferable
+
+  * ⭐⭐⭐ **Rank candidate levers by MEASURED wall-per-crossing, not by `dispatch_ns`.** The
+    two disagree in ORDER, not just in scale, because a crossing on the client's syscall path
+    costs the client its whole round trip while the daemon only clocks its handler.
+  * ⭐ **Finish the table before choosing the next target.** Suppression on the last
+    unsuppressed row is what showed the storm holds the biggest genuinely-ours residual.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored, both halves passing.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=noxattr FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" TAG=sx1 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+    python3 scripts/perf/create_delete_storm_ab/sanalyze.py <body.csv>
