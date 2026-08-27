@@ -17812,3 +17812,63 @@ so the CROSSING remains, and the crossing is the cost — the memo already absor
 (`op_counts getxattr=257` against `crossings_getxattr=6425`) while the row still pays 17.24 ms of
 `dispatch_ns_getxattr`. Its target regime is the COLD first sweep, where the memo is useless; this
 row is the opposite. That prediction is unmeasured and stated so it can be falsified.
+
+## 2026-08-27 — bd-q0xnl: the O_DIRECT blocker on zero-message open is REFUTED by a counted oracle (`64/64` reads still reach the daemon, controls at `1/64`) — the last named obstacle to a measured `1.160389x` does not survive, though its backend half is moot-but-latent
+
+Zero-message open (`FFS_FUSE_ZERO_MESSAGE_OPEN`, `FUSE_NO_OPEN_SUPPORT`) was measured earlier today
+at a balanced **`1.160389x`** on this row — `crossings_open` `6400 -> 4`, `crossings_release`
+`6400 -> 0`, `crossings_total` `26329 -> 13532` (−48.60%), taking the row `1.321623x -> 1.135508x`
+against live kernel ext4 — and its original "costs more than it saved" REJECT was refuted there. It
+stayed default OFF on a NEW and explicitly unmeasured worry, quoted from the knob's own docstring:
+`kernel_open_flags` withholds `FOPEN_KEEP_CACHE` exactly when the client passed `O_DIRECT`, and with
+zero-message open the daemon never sees the open flags, so **an `O_DIRECT` open might silently get
+page-cached behaviour**. That is the single named obstacle between a measured win and a shipped
+default, which is what makes it worth a turn.
+
+**This is a correctness question, so the instrument is a COUNTED oracle, not a timing run.**
+`scripts/perf/parallel_read_ab/dioprobe.c` opens ONE file and reads THE SAME aligned 4 KiB block 64
+times; `run_dioprobe.sh` counts how many of those reads actually reached the daemon
+(`op_counts read`). A true `O_DIRECT` open must send every read down; a page-cached open serves the
+repeats from the client. Each pass gets its OWN mount lifetime because `op_counts` is cumulative and
+only emitted at unmount — one pass per mount is what makes each number attributable. One ELF,
+`binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
+`hostname=thinkstation1`, rch worker NONE, daemon on cpu 18, image on a loop device with
+`--direct-io=on`.
+
+| config | mode | client reads | daemon `op_counts read` | `FUSE_NO_OPEN_SUPPORT` negotiated |
+|---|---|---|---|---|
+| base | buffered | 64 | **1** | 0 |
+| base | `O_DIRECT` | 64 | **64** | 0 |
+| zero-message | buffered | 64 | **1** | 1 |
+| zero-message | `O_DIRECT` | 64 | **64** | **1** |
+
+**REFUTED.** `O_DIRECT` is still honoured with `FUSE_NO_OPEN_SUPPORT` negotiated: all 64 reads reach
+the daemon, exactly as in the base arm. The kernel does not need our `open` reply to know the client
+asked for direct I/O. This is the same shape of error as the `FOPEN_KEEP_CACHE` premise this knob
+already refuted — both assumed the kernel's caching decision depends on the daemon's reply to
+`open`, and it does not.
+
+**The negative control is what makes that mean anything.** Both buffered passes report `1`, so the
+oracle demonstrably CAN see caching on this stack; without them, `64` in the zero-message
+`O_DIRECT` row would be equally consistent with the lever working and with the counter being broken.
+The `zmo_negotiated` flag is read out of each daemon's own log per pass, so the configuration is
+attested rather than assumed, and the digests are identical across all four passes, so every arm
+read the same bytes.
+
+**The backend half is MOOT TODAY BUT LATENT, and I am not calling it refuted.** The docstring's
+worry has two clauses and the oracle only answers one — a client passing `O_DIRECT`. The other is a
+backend returning `FOPEN_DIRECT_IO`, which zero-message open could not honour because it never gets
+to reply. Nothing in the workspace does that today: `FsOps::open`'s trait default is `Ok((0, 0))`,
+the `Arc` forwarding impl delegates, and the only occurrences of the constant are the
+`direct_io_forced` check itself and a unit test — so the branch is dead in production and the table
+above covers every open this mount can actually serve. But if a backend ever starts forcing it,
+zero-message open would silently drop it and **no test would catch that**.
+
+**What I am NOT doing, and why.** I am not flipping the default in this turn. The blocker as stated
+does not survive, but a default is a whole-product decision and this is one row's regime (read-only
+ext4, no writeback, no mmap); AGENTS.md's rule against broad changes on narrow evidence applies to
+me as much as to the gate. The honest position is that the named obstacle is gone and what shipping
+now needs is the latent-backend guard plus rows outside this one. I also did not add that guard as a
+test this turn: `/data` is at 93% with peers holding active builds, and I will not commit a test I
+cannot cheaply verify compiles. The measurement is recorded in the knob's own docstring beside the
+claim it refutes, which is where the next person will look.

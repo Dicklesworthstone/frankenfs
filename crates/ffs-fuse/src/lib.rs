@@ -350,14 +350,43 @@ pub fn zero_message_opendir_enabled() -> bool {
 /// **`1.160389x`** and taking the row from `1.321623x` to `1.135508x` against
 /// live kernel ext4.
 ///
-/// ⛔ **The default still stays OFF, for a DIFFERENT and previously unstated
-/// reason:** `kernel_open_flags` honours `O_DIRECT` per open — a client that opens
+/// ⛔ ~~The default still stays OFF, for a DIFFERENT and previously unstated
+/// reason:~~ `kernel_open_flags` honours `O_DIRECT` per open — a client that opens
 /// with `O_DIRECT`, or a backend that returns `FOPEN_DIRECT_IO`, gets direct I/O
 /// instead of `FOPEN_KEEP_CACHE`. With zero-message open the daemon never sees the
-/// open flags, so **an `O_DIRECT` open would silently get page-cached behaviour**.
-/// The parallel-read row does not open with `O_DIRECT` and therefore cannot see
-/// this. Shipping needs that case measured, or the capability scoped to mounts
-/// that cannot serve one.
+/// open flags, so an `O_DIRECT` open *might* silently get page-cached behaviour.
+///
+/// ✅ **MEASURED 2026-08-27 and REFUTED for the client half.**
+/// `scripts/perf/parallel_read_ab/{dioprobe.c,run_dioprobe.sh}` is a COUNTED oracle,
+/// not a timing run: read the SAME aligned block 64 times from one open file and
+/// count how many of those reads reach the daemon. A true `O_DIRECT` open must send
+/// every one; a page-cached open serves the repeats locally. Four passes, each in
+/// its own mount lifetime so `op_counts` is attributable, one ELF:
+///
+/// | config | mode | client reads | daemon `op_counts read` |
+/// |---|---|---|---|
+/// | base | buffered | 64 | **1** |
+/// | base | `O_DIRECT` | 64 | **64** |
+/// | zero-message | buffered | 64 | **1** |
+/// | zero-message | `O_DIRECT` | 64 | **64** |
+///
+/// The buffered passes are the negative control and are what make the result mean
+/// anything: they show the oracle CAN see caching, so `64` in the zero-message
+/// `O_DIRECT` row is a real bypass rather than a broken counter. Digests are
+/// identical across all four passes. **`O_DIRECT` is still honoured with
+/// `FUSE_NO_OPEN_SUPPORT` negotiated** — the kernel does not need our reply to know
+/// the client asked for direct I/O. This is the same shape of error as the
+/// `FOPEN_KEEP_CACHE` premise above: both assumed the kernel's caching decision
+/// depends on the daemon's `open` reply, and it does not.
+///
+/// ⚠ **The backend half is MOOT TODAY BUT LATENT, and is NOT refuted.** Nothing in
+/// the workspace ever returns `FOPEN_DIRECT_IO` from `FsOps::open` — the trait
+/// default is `Ok((0, 0))` and the only occurrences of the constant are the
+/// `direct_io_forced` check itself and a unit test — so `direct_io_forced` is dead
+/// in production and the measurement above covers every open this mount can serve.
+/// But if a backend ever starts forcing it, zero-message open would silently drop
+/// it and **no test would catch that**. Anything shipping this default should add
+/// that guard first.
 ///
 /// ⭐ What is retired: "measured as a transport win while costing more than it
 /// saved" is no longer an open question — it is a `1.160389x` win that costs
