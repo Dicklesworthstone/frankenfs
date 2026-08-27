@@ -12081,3 +12081,170 @@ Reproduce:
       FA_CPUS=16 FB_CPUS=17 FA_ENV="FFS_FUSE_ENTRY_INVAL=0" FB_ENV="" \
       bash scripts/perf/create_delete_storm_ab/run_storm.sh
     python3 scripts/perf/create_delete_storm_ab/sanalyze.py $WORK/storm-entryinv.csv
+
+## 2026-08-27 — multi-file parallel read: the row's own prime suspect REFUTED, cpu16 identified as a defective daemon core, and zero-message open removes 49.14% of the row's crossings for 1.279004x
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/parallel_read_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`
+(replicate, loop transport) and
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`
+(the zero-message-open arms, same tree plus the measurement knob),
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU.
+
+Sixth row dug in this sequence. Its cell owes two things — a replicate ("ONE admitted run
+— NO PAIR YET") and a test of its own named prime suspect — and this takes both.
+
+### 2026-08-27 — cpu16 is a defective daemon core, and that is the correction to yesterday's rule
+
+`parallel_read_batch` (`ffs_mounted_kernel_bench.rs:4063`) reproduced in C: readdir
+`parallel-read`, BYTE-SORT the paths, then 8 pinned workers each open + `pread` one whole
+256 KiB file per stride step, folding a content digest. Four arms live SIMULTANEOUSLY in
+ONE rig invocation — two kernel ext4 ro loop mounts and two FrankenFS ro mounts from one
+ELF — arm order rotated per round. `RCH_WORKER=none`, `hostname=thinkstation1`.
+
+    candidate A/A null control, two identical FrankenFS mounts, ONE ELF
+      daemons on cpu16 / cpu17:  1.239997  [1.134146, 1.295083]
+      daemons on cpu17 / cpu16:  0.764822  [0.656715, 0.790236]
+      daemons on cpu18 / cpu19:  1.019552  [0.997715, 1.033564]   <- PASSES
+
+Executing ELF, self-reported in-process by the daemon at mount:
+`mount_bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`.
+Every figure in this subsection is a bootstrap median with a bootstrap median CI from
+20000 resamples over the 48 paired per-round ratios.
+
+Same-invocation kernel A/A null control passes throughout (`0.999567`
+`[0.990041, 1.010417]`, `1.003655`, `1.009003`). **The cpu16 arm is 1.24-1.31x slower in
+both directions, and moving the pair to cpu18/cpu19 makes the null pass.** The
+create/delete storm row banked this yesterday as "a write row's A/B must be balanced
+across daemon CPUs"; that is now **too weak and slightly wrong** — this is a READ-only row
+and it reproduces, so the defect is **cpu16 specifically**, not the write path. The rule is
+`do not place a FUSE daemon on cpu16 on this host`, and the balanced geometric mean is the
+fallback when a pair must be used. Every ratio below is nonetheless reported as the
+geometric mean of a forward and a mirrored run.
+
+### 2026-08-27 — the replicate, and where the row spends itself
+
+On the clean cpu18/cpu19 placement, kernel_median_wall_ns=4185000 and
+kernel_median_wall_ns=4147000 against fuse_median_wall_ns=5721000 and
+fuse_median_wall_ns=5785000 — **`1.367x` / `1.395x`**, against the banked `1.209857x`.
+This ELF is baseline-ISA and un-PGO'd, so per bd-b9dug the loss is OVERSTATED; the
+direction and rough magnitude of the banked supersession are confirmed, and the row's
+"1 admitted + 19 blocked readings, all in `1.13`-`1.30`" now has a same-invocation
+companion outside its CI on the high side.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process:
+`mount_bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`. Same-invocation kernel A/A null control
+`1.009003` with bootstrap median CI `[1.001376, 1.020533]`, and same-invocation candidate
+A/A null control `1.019552` with bootstrap median CI `[0.997715, 1.033564]`, both from
+20000 resamples over the 48 paired per-round ratios.
+
+Counted mechanism, 49 batches × 256 files = 12,544 file reads: `crossings_total` **51,049
+= 4.07 crossings per file** — `crossings_open` 12,544 (1.000/file), `crossings_release`
+12,544 (1.000/file), reads inside `crossings_other` 13,057 (1.000/file), `crossings_getxattr`
+12,594 (1.000/file, the `security.capability` audit probe), `crossings_lookup` only 64
+(the dentry cache holds). Per-opcode dispatch: **open `2.79 us`, release `2.54 us`, read
+`5.05 us` for a whole 256 KiB, getxattr `2.29 us`** = `12.67 us` per file = `3.24 ms` of a
+`5.72 ms` batch, i.e. **57% of the batch is daemon dispatch on one serial thread**. And
+`ops_ns_total` is `2.09 ms` against `dispatch_ns_total` `169.5 ms` — **1.2%**. ⇒ **three of
+the four crossings per file (open, release, getxattr) carry NO filesystem work at all**
+(`ops_ns_open` = `ops_ns_release` = `ops_ns_getxattr` = 0).
+
+### 2026-08-27 — REFUTED: the loop-transport asymmetry is not this row's problem
+
+The cell names its prime suspect: "the kernel arm is loop-mounted and buffered while ours
+reads the image directly, so a READ-heavy row gives the incumbent double page-cache
+residency" (bd-w2u82). Tested directly by attaching our arm's image to a loop device with
+`losetup --find --show` and handing the daemon the device node instead of the file — the
+same thing `--fuse-transport loop` does — one ELF, both directions:
+
+    ffs_file / ffs_loop   forward  1.040352  [0.992745, 1.172267]
+                          mirrored 1.023648  [0.993049, 1.097033]  (as loop/file)
+                          balanced 1.008126
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process:
+`mount_bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`. Counted mechanism: `crossings_total`
+51,049 in both arms, so the two arms did identical work.
+
+Same-invocation A/A null control `0.999730` bootstrap median CI `[0.987421, 1.024430]` forward, from 20000 resamples. **Both
+directions straddle 1.0 and the balanced figure is `1.008126` — a NULL.** Crossing this
+arm through the same block layer the incumbent always crosses changes nothing measurable.
+The suspect is refuted and should stop being cited for this row.
+
+### 2026-08-27 — the reject that was never measured, now measured: zero-message open
+
+`crates/ffs-fuse/src/lib.rs` carries a `⛔ DO NOT ADD FUSE_NO_OPEN_SUPPORT` note rejecting
+zero-message open for ordinary files on reasoning: the kernel would synthesise the open
+with default flags, `FOPEN_KEEP_CACHE` would never be sent, "reads just start missing
+cache", and it "would also be measured as a transport win while costing more than it
+saved". A REJECT with no number is exactly what this ledger exists to convert, so the
+capability is now reachable from ONE ELF behind a default-OFF measurement knob
+(`FFS_FUSE_ZERO_MESSAGE_OPEN`).
+
+⛔ **First attempt INERT, and the inertness is itself the finding.** Negotiating
+`FUSE_NO_OPEN_SUPPORT` at INIT alone — the capability line logged as negotiated — left
+`crossings_open` at **12,544 of 12,544**, byte-identical to the control, and the wall
+ratio at `1.009247`/`1.015226`, inside the null. The INIT bit is the kernel advertising
+that it *supports* zero-message opens; **the kernel only stops sending OPEN once the daemon
+answers one with `ENOSYS`**, exactly as `opendir` already does. That is now pinned in the
+code comment so the next reader does not repeat the half-measure.
+
+**With the `ENOSYS` reply in place, counted:**
+
+    crossings_open      12,544  ->  2   (1 in the mirrored run)
+    crossings_release   12,544  ->  0
+    crossings_total     51,049  ->  25,963      = 49.14% of the row's crossings removed
+    crossings_other     13,057  ->  13,057      = the reads, IDENTICAL
+
+    zm_off / zm_on   forward  1.139228  [1.107028, 1.168202]
+                     mirrored 1.435928  [1.299712, 1.512560]  (from zm_on/zm_off 0.696413)
+                     balanced 1.279004
+
+Same-invocation A/A null control `1.010452` bootstrap median CI `[0.992797, 1.027590]`, and same-invocation A/A null control `1.006785` bootstrap median CI `[0.994945, 1.019130]`,
+both from 20000 resamples. Against the live kernel arm the row goes from
+`k1/zm_off` `0.756935`/`0.578928` to `k1/zm_on` `0.852266`/`0.844534` — i.e. from a
+`1.32x`-`1.73x` loss to a **`1.17x`-`1.18x`** loss. Content digest is identical across all
+four arms (`7210026533243859909`), so nothing was skipped.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process:
+`mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`. Both ratios are bootstrap medians with
+bootstrap median CIs from 20000 resamples over the 48 paired per-round ratios.
+
+⭐⭐ **AND THE REJECT'S STATED COST DID NOT APPEAR.** `crossings_other` — which is where
+this row's reads land — is **13,057 in BOTH arms**, exactly one read crossing per file per
+batch either way. The control arm IS sending `FOPEN_KEEP_CACHE` (`kernel_open_flags`
+returns it for `O_RDONLY`, pinned by
+`zero_message_open_would_lose_keep_cache_bd_q0xnl`) and the kernel is re-reading every file
+every batch anyway. **On this row `FOPEN_KEEP_CACHE` is buying nothing, which is why
+removing it costs nothing.**
+
+⚠ **The reject is NOT overturned, and the knob stays default OFF.** This row opens each
+file once and reads it once, so it never exercises the case the note is about — a re-read
+after a re-open, where a retained page cache would answer without crossing. What is
+established is narrower and still useful: the transport win is real and large, the cost
+the note predicts is absent HERE, and the note's premise — that `FOPEN_KEEP_CACHE` is what
+keeps those pages resident — is **not operative on this row**. Why a KEEP_CACHE open is
+nonetheless followed by a full re-read every batch is the open question this row now
+leaves, and it must be answered before anyone proposes defaulting the capability on.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; both ELFs fail that instrument's ISA and PGO
+gates, so no figure here is a scorecard row, and the `1.367x`/`1.395x` replicate is
+additionally ISA-overstated. What this banks is the cpu16 placement defect, the crossing
+census and per-opcode dispatch decomposition, the REFUTED loop-transport suspect, the
+counted inertness of the INIT-only capability, and the one-ELF interior A/B for
+zero-message open — all ISA-invariant.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_read_ab/mkpread.sh
+    gcc -O2 -o $WORK/pread_ab scripts/perf/parallel_read_ab/pread_ab.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=48 TAG=zxF FA_LABEL=zm_off FB_LABEL=zm_on \
+      FA_CPUS=18 FB_CPUS=19 FA_ENV="" FB_ENV="FFS_FUSE_ZERO_MESSAGE_OPEN=1" \
+      bash scripts/perf/parallel_read_ab/run_pread.sh
+    # then the mirror with FA/FB swapped; take the geometric mean of the two
+    python3 scripts/perf/parallel_read_ab/ranalyze.py $WORK/pread-zxF.csv
+    # loop-transport arm: FA_LOOP=1 / FB_LOOP=1 on the arm that should cross a loop device

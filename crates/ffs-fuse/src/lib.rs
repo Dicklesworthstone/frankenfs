@@ -292,6 +292,34 @@ pub fn zero_message_opendir_enabled() -> bool {
     )
 }
 
+/// MEASUREMENT-ONLY zero-message open for ORDINARY FILES
+/// (`FFS_FUSE_ZERO_MESSAGE_OPEN`, default OFF).
+///
+/// The `⛔ DO NOT ADD FUSE_NO_OPEN_SUPPORT` note at the negotiation site rejects
+/// this on reasoning: zero-message open means the kernel synthesises the open with
+/// default flags, so `FOPEN_KEEP_CACHE` is never sent and the page cache is dropped
+/// on every open — "measured as a transport win while costing more than it saved".
+/// That reasoning was never given a number, and a REJECT with no measurement is
+/// exactly what this campaign's ledger exists to convert.
+///
+/// So the capability is reachable from ONE ELF behind a default-OFF knob, purely so
+/// the trade can be COUNTED on the multi-file parallel-read row, where each of 256
+/// files is opened, read once and released per batch: `open` and `release` are
+/// 2 of that row's ~4 crossings per file and carry no filesystem work
+/// (`ops_ns_open` = `ops_ns_release` = 0), while `FOPEN_KEEP_CACHE` is exactly what
+/// keeps those files' pages resident between batches.
+///
+/// ⛔ It is NOT a shipping option and the note above still stands: whatever this
+/// measures, the default stays off unless a row shows the cache is not lost.
+#[must_use]
+pub fn zero_message_open_measurement_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN")
+            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+    })
+}
+
 /// FUSE-over-io_uring transport configuration (bd-vbqc6).
 ///
 /// # Why this exists before the transport does
@@ -5350,6 +5378,23 @@ impl Filesystem for FrankenFuse {
         // is byte-identical to before. Contrast splice above, which is opt-OUT
         // because the bank was measured with it on; nothing was ever measured with
         // this, so defaulting it on would make new rows non-comparable.
+        // MEASUREMENT ONLY, default OFF — see `zero_message_open_measurement_enabled`.
+        // The rejection above is retained verbatim; this exists so the trade it
+        // describes can be counted from one ELF instead of argued.
+        if zero_message_open_measurement_enabled() {
+            match config.add_capabilities(fuse_consts::FUSE_NO_OPEN_SUPPORT) {
+                Ok(()) => warn!(
+                    "FUSE_NO_OPEN_SUPPORT negotiated (FFS_FUSE_ZERO_MESSAGE_OPEN): \
+                     MEASUREMENT ONLY — open/release become zero-message and \
+                     FOPEN_KEEP_CACHE is no longer sent"
+                ),
+                Err(missing) => debug!(
+                    missing,
+                    "kernel declined FUSE_NO_OPEN_SUPPORT; open stays a round trip"
+                ),
+            }
+        }
+
         if zero_message_opendir_enabled() {
             match config.add_capabilities(fuse_consts::FUSE_NO_OPENDIR_SUPPORT) {
                 Ok(()) => {
@@ -5612,6 +5657,16 @@ impl Filesystem for FrankenFuse {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        // MEASUREMENT ONLY, default OFF. Setting FUSE_NO_OPEN_SUPPORT at INIT is
+        // NECESSARY BUT NOT SUFFICIENT — measured 2026-08-27: with the capability
+        // negotiated and this branch absent, `crossings_open` stayed at 12,544 of
+        // 12,544, byte-identical to the control. The kernel only stops sending OPEN
+        // once the daemon answers one with ENOSYS, exactly as `opendir` does below.
+        // See `zero_message_open_measurement_enabled` for why this is not shippable.
+        if zero_message_open_measurement_enabled() {
+            reply.error(libc::ENOSYS);
+            return;
+        }
         self.inner.metrics.record_metadata_request();
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Open, |cx, scope| {
