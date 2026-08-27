@@ -18324,3 +18324,70 @@ stat has exactly ONE to remove and it is the capability probe — unconditional 
 previous entry, so removable only by `ENOSYS`, i.e. only on an image with no xattrs.
 
 Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-4iqg6: CORRECTION to the previous entry — the capability probe IS audit. The stack is `get_vfs_caps_from_disk ← __audit_inode ← filename_lookup`, coupled 1:1 (`5003`/`5003`), so it is CONFIGURATION-DEPENDENT, not the permanent kernel floor I called it one commit ago
+
+The previous entry established that the live kernel incumbent performs the identical capability
+lookups we do, and concluded from that: *"The audit-rules attribution is RETIRED as the explanation.
+The cause is the VFS capability path, which runs for every filesystem on every path resolution."*
+**That conclusion is WRONG and I am withdrawing it.** A plain `stat()` reading a capability xattr is
+unusual enough to be worth a stack, and the stack names the caller outright.
+
+**Measured, on the LIVE KERNEL btrfs arm** (`bpftrace kstack`, 3000 warm stats):
+
+```
+get_vfs_caps_from_disk+1
+__audit_inode+722
+filename_lookup+421
+vfs_statx+121
+vfs_fstatat+142
+__do_sys_newfstatat+68
+```
+`3001` hits for 3000 stats. And the coupling is exact — a separate run over 5000 stats counted
+`__audit_inode` **5003** and `get_vfs_caps_from_disk` **5003**, i.e. **every audited path resolution
+costs exactly one capability read**, 1:1, with `audit_alloc` at 0 (contexts are per-task, not
+per-syscall). Host audit state: `auditctl -s` reports `enabled 1`, auditd live at pid 2890, **2 rules**,
+both scoped to `/data/projects`.
+
+**What I got wrong, precisely.** I inferred "not audit" from two true observations — the mount sits
+OUTSIDE the audited `/data/projects` tree, and the kernel arm pays the probes too. Both are true and
+both are perfectly consistent with audit being the cause: a `-w` watch cannot be evaluated by path
+alone, so the kernel must inspect the resolved INODE on **every** path resolution, on every
+filesystem, wherever it lives. Being outside the watched tree buys no exemption, which is exactly why
+a `/home/ubuntu` mount pays it. My reasoning, not my measurements, was the error.
+
+**What stands from the previous entry, unchanged:** both arms perform identical lookups (20,003 each
+on warm stat, 10,004 each on the worst row); `crossings_getxattr` = `__vfs_getxattr` exactly; and THE
+ENTIRE GAP IS THE ROUND TRIP — the kernel serves these in-process with 0 and 1 voluntary context
+switches against our 20,000 and 20,001. None of that depended on the cause.
+
+**What is WITHDRAWN:** "unconditional kernel behaviour", "a PERMANENT FUSE FLOOR on this kernel", and
+"the worst row's 50.0% is not an inflation of the headline by this host's configuration". **The
+opposite is the case.** The probe is conditional on this host's audit configuration, and on a host
+whose audit rules do not force per-inode inspection the probes would not fire at all.
+
+**Scope of the correction, stated as counts and deliberately NOT as predicted ratios** (crossing count
+is not a time model on this codebase — established two entries ago, where the same correction over-
+and under-shot two measured levers):
+
+| row | blocking crossings / syscall | of which audit probe | remainder if audit did not force it |
+|---|---|---|---|
+| btrfs warm stat | `1.000` | **`1.000` — all of it** | `0` (the attribute cache already absorbs `getattr`: 1 crossing per 20,000 stats) |
+| ext4 `xattr-get-list-report` | `2.001` | **`1.000` — half** | `1.001` |
+
+So **warm stat's entire round-trip excess, and half the worst row's, are an artifact of the
+measurement host's audit configuration.** That is a material scoping result for the campaign: rows
+that were read as structural FrankenFS losses are partly a property of where they were measured, and
+the four "parity by suppression" rows were suppressing a cost that a differently-configured host would
+not impose in the first place.
+
+**The confirming experiment, and why I did NOT run it.** The counterfactual is direct — drop the two
+audit rules, re-run, and the probes should vanish. `auditctl -D` is a host-wide security control
+affecting every user on this shared machine and is not mine to change unilaterally, so it needs
+operator approval. It is the single highest-value measurement left on this row, and I am naming it
+rather than quietly substituting the inference for it. Until it is run, the causal chain rests on the
+stack trace and the 1:1 coupling — direct evidence for the CALLER, inference for the counterfactual.
+
+Nothing shipped, nothing reverted. ELF
+`7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug — counts only, no wall
+time claimed). `hostname=thinkstation1`.
