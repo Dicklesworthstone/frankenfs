@@ -12545,3 +12545,144 @@ Reproduce:
     # the transport arm: FB_RAW=1 gives arm B the buffered image file
     # the syscall attribution:
     WORK=<scratch> ELF=<ffs-cli> OPS=200 TAG=st1 bash scripts/perf/fsync_journal_ab/fsync_strace.sh
+
+## 2026-08-27 — btrfs parallel metadata writes: a durability row in disguise, and the transport artifact FLIPS ITS SIGN by 1.5903x
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/parallel_metadata_ab/` (`run_pmeta_x.sh`, `run_pmeta_xdio.sh`).**
+Provenance: in-process self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU, daemons on cpu18/cpu19.
+
+Ninth row dug in this sequence: btrfs parallel metadata writes, banked `1.930090x`.
+Six arms live SIMULTANEOUSLY in ONE rig invocation — two kernel ext4 loop mounts, two
+kernel btrfs loop mounts, and two FrankenFS `--rw` mounts FROM THE SAME ELF, one per
+image format — arm order rotated per round, 36 rounds, forward and mirrored with the two
+FrankenFS daemons' CPUs swapped. All four same-invocation kernel A/A null controls pass
+(`0.996130`, `0.998846`, `1.003276`, `0.999186` forward; `0.997097`, `1.001881` mirrored),
+each a bootstrap median with a bootstrap median CI from 20000 resamples over the 36 paired
+per-round ratios.
+
+### 2026-08-27 — I measured this row wrong first, and the wrong answer was a WIN
+
+The first six-arm run mounted the kernel arms `-o loop` and let each daemon open its
+image FILE — the shape every earlier rig in this session used, and the shape that is fine
+for a read row. It measured **`kbtr_1/ffs_btr` = `1.033194` `[1.021345, 1.037111]`, i.e.
+FrankenFS `1.033x` FASTER than live kernel btrfs**, against a banked `1.930090x` SLOWER.
+Absolute arm medians of that wrong run, so it is visible which arm moved:
+kernel_median_wall_ns=159943000 against fuse_median_wall_ns=155081000 on btrfs, and
+kernel_median_wall_ns=20018000 against fuse_median_wall_ns=32314000 on ext4.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `1.003276` bootstrap median CI `[0.993546, 1.011545]` (kernel ext4) and same-invocation A/A null control `0.999186` bootstrap median CI `[0.993778, 1.006644]` (kernel btrfs),
+both from 20000 resamples over the 36 paired per-round ratios.
+
+That is wrong, and the btrfs fsync row committed an hour earlier says why: this workload's
+timed region is **`88.97%` directory fsync**, so it is a DURABILITY row in disguise, and
+the bd-4zjkz transport artifact applies to it in full. Re-run with every arm — kernel and
+FUSE — on its own loop device with `--direct-io=on`:
+
+| | asymmetric (first run) | **symmetric loop-dio** |
+| --- | --- | --- |
+| btrfs, whole batch | `1.033x` **FASTER** | **`1.5456x` / `1.5328x` SLOWER** |
+| btrfs, fsync phase | `1.220x` FASTER | **`1.4111x` / `1.4037x` SLOWER** |
+| ext4, whole batch | `1.607x` slower | `1.9100x` / `2.0121x` slower |
+| ext4, fsync phase | `4.473x` FASTER | `1.8217x` / `1.8088x` FASTER |
+
+⛔ **The transport asymmetry is worth `1.5903x` on this row and CHANGES THE SIGN of the
+verdict.** A row whose timed region is mostly fsync cannot be measured with our daemon on
+a buffered image file against a loop-mounted kernel, and "it is a metadata row, not a
+durability row" is not a defence — the phase split decides that, not the row's name.
+
+### 2026-08-27 — the row, measured properly
+
+Balanced across both daemon CPU assignments, symmetric transport:
+
+    btrfs whole batch   1.5392x        (forward 1.5456, mirrored 1.5328 — 0.8% apart)
+    btrfs fsync phase   1.4074x        (forward 1.4111, mirrored 1.4037 — 0.5% apart)
+    ext4  whole batch   1.9604x
+    ext4  fsync phase   1.8152x  in OUR favour
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Absolute arm medians, forward run:
+kernel_median_wall_ns=161504000 (btrfs k1) and kernel_median_wall_ns=20144000 (ext4 k1)
+against fuse_median_wall_ns=249147000 (ours on btrfs) and fuse_median_wall_ns=38267000
+(ours on ext4).
+
+Executing ELF, self-reported in-process by the daemon at mount:
+`mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`. Same-invocation A/A null control `1.003276`
+bootstrap median CI `[0.993546, 1.011545]` and same-invocation A/A null control `0.999186` bootstrap median CI `[0.993778, 1.006644]`, from 20000 resamples.
+
+| phase | kernel ext4 | kernel btrfs | ours (ext4) | ours (btrfs) |
+| --- | --- | --- | --- | --- |
+| whole batch | 20.144 ms | 161.504 ms | 38.267 ms | 249.147 ms |
+| 512 creates | 1.607 ms | 4.157 ms | 28.201 ms | 27.117 ms |
+| 8 directory fsyncs | 18.517 ms | 157.159 ms | **10.082 ms** | 221.663 ms |
+
+**The two rows are opposites.** On ext4 the batch is `73.7%` CREATE and we still WIN the
+fsync phase by `1.8152x`. On btrfs the batch is `88.97%` FSYNC and we LOSE that phase by
+`1.4074x`. So the banked ext4 (`1.510822x`) and btrfs (`1.930090x`) cells are not two
+samples of one phenomenon — they are two different workloads wearing one name.
+
+⭐ **Third confirmation that our create path carries no btrfs-specific excess**: our ext4
+create `28.201 ms` against our btrfs create `27.117 ms` — **4.0% apart** (6.8% in the
+mirrored run), same ELF, same invocation, while the two KERNEL create phases differ by
+`2.59x` (1.607 vs 4.157 ms). Counted after readdir+stat (`0.10%`) and the create/delete
+storm (`1.6%`).
+
+### 2026-08-27 — the fsync row's counted mechanism PREDICTS this row's loss to 6.6%
+
+The btrfs fsync row (committed today) counted, straight off `/sys/block/<dev>/stat`,
+**`3.000` device FLUSH barriers per client durability boundary against kernel btrfs's
+`2.000`**, with a 1:1 match to our own `fdatasync` calls. This row issues 8 directory
+fsyncs per batch and nothing else durable, so that mechanism predicts a fsync-phase ratio
+of **`1.500`** with no fitting whatsoever.
+
+    predicted from the fsync row's barrier count   1.5000
+    measured here, balanced, fsync phase           1.4074      gap 6.6%
+
+**A mechanism counted on one row predicting a different row's ratio to 6.6% is the
+strongest form of confirmation this campaign has produced**, and it means this row does
+not need its own attack: it is the same defect, sized at `88.97%` of a batch instead of
+`100%`.
+
+### 2026-08-27 — the ext4 lever does NOT transfer here, and the arithmetic says so
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `1.003276` bootstrap median CI `[0.993546, 1.011545]` (kernel ext4) and same-invocation A/A null control `0.999186` bootstrap median CI `[0.993778, 1.006644]` (kernel btrfs),
+both from 20000 resamples over the 36 paired per-round ratios.
+
+The ext4 twin's attack was the `DispatchGate::exclusive()` barrier, whose measured ceiling
+was `1.90x` on the CREATE phase. On btrfs the create phase is `27.117` of `249.147 ms` =
+**`10.88%` of the batch**, so even a perfect create phase — zero cost — bounds the gain at
+`1.1221x`, and the measured `1.90x` ceiling bounds it at **`1.0543x`**. ⇒ **the dispatch
+gate is worth at most `5.4%` on the btrfs row against `1.50x` on the ext4 one.** Stated as
+a DERIVED BOUND from the measured phase split, not as a new measurement.
+
+What is left is the barrier count, which the fsync row already named, sized and gated: it
+is a durability-ordering change, the class bd-4zjkz says must never be traded silently, and
+it needs its own crash/ordering gate before any number from it is admissible.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row and the ratios are ISA-overstated. What this
+banks is the phase split that reclassifies this row as a durability row, the measured
+`1.5903x` transport artifact WITH ITS SIGN FLIP, the third counted confirmation that our
+create path is filesystem-independent, the cross-row prediction agreeing to 6.6%, and the
+derived bound retiring the ext4 lever for this row.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_metadata_ab/mkpmeta.sh
+    WORK=<scratch> bash scripts/perf/parallel_metadata_ab/mkpmeta_btrfs.sh
+    gcc -O2 -o $WORK/pmeta_ab scripts/perf/parallel_metadata_ab/pmeta_ab.c -lpthread
+    # the WRONG shape, kept so the artifact is reproducible:
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=36 TAG=px1 bash scripts/perf/parallel_metadata_ab/run_pmeta_x.sh
+    # the right one, every arm on its own loop device with --direct-io=on:
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=36 TAG=pxd1 FE_CPUS=18 FB_CPUS=19 \
+      bash scripts/perf/parallel_metadata_ab/run_pmeta_xdio.sh
+    python3 scripts/perf/parallel_metadata_ab/panalyze.py $WORK/pxmeta-pxd1.csv
