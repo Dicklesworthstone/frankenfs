@@ -13198,6 +13198,7 @@ impl OpenFs {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         groups.len().hash(&mut hasher);
         for gs in groups {
+
             gs.free_blocks.hash(&mut hasher);
             gs.free_inodes.hash(&mut hasher);
             gs.used_dirs.hash(&mut hasher);
@@ -30357,6 +30358,7 @@ impl OpenFs {
                         self.ext4_gdt_persisted_fingerprint
                             .store(0, std::sync::atomic::Ordering::Release);
                     }
+
                 }
             }
             trace!(
