@@ -17586,3 +17586,88 @@ this instrument. **The row is not measurable to better than ~1.6x until the FUSE
 found**, which is upstream of every parallel-read lever: no lever smaller than `1.6x` can be
 adjudicated on this row today. Nothing shipped and nothing reverted — this run carried no candidate
 change, only a suspect.
+
+## 2026-08-27 — bd-4iqg6 follow-on: the parallel-read instability is FOUND and the row is measurable again — floor-on-DIO reproduces to `1.0440x` across five runs (vs `1.3773x` for the shipping estimator), and the honest number is `1.303819x` SLOWER than live kernel ext4
+
+My previous entry on this bead closed with "the row is not measurable to better than ~1.6x until the
+FUSE-arm instability is found." **That statement is now superseded and was too pessimistic**: it was
+a property of the estimator, not of the instrument. Two more runs and a re-slice of the first three
+locate the instability and remove it.
+
+**Instrument, unchanged.** `scripts/perf/parallel_read_ab/run_pread.sh`, ext4, ONE invocation per
+run: two kernel ext4 ro loop mounts (`k1`, `k2` — the A/A null and the live incumbent) plus two
+FrankenFS ro mounts from the SAME ELF differing only in transport (`loopdio` =
+`losetup --direct-io=on`; `rawfile` = daemon opens the image file directly, buffered). 24 rounds x 8
+client threads on cpus 8..15, daemons on cpus 18/19, arm order rotated per round.
+`binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc` self-reported in all
+FIVE runs (checked per run, not assumed). `hostname=thinkstation1`, rch worker NONE.
+`bootstrap_resamples=20000`.
+
+**The FUSE arms are bimodal: a stable fast mode plus a variable tail.** Per-arm floor (min of the 24
+rounds) and median, ms:
+
+| arm | tr1 | tr2 | tr3 | tr4 | tr5 | spread |
+|---|---|---|---|---|---|---|
+| `k1` floor | 3.985 | 4.057 | 4.078 | 4.090 | 4.197 | `1.053x` |
+| `k2` floor | 4.020 | 4.032 | 4.088 | 4.054 | 4.333 | `1.078x` |
+| `loopdio` floor | 5.269 | 5.260 | 5.179 | 5.423 | 5.479 | **`1.058x`** |
+| `rawfile` floor | 5.256 | 6.157 | 5.255 | 5.427 | 5.460 | **`1.172x`** |
+| `k1` median | 4.228 | 4.248 | 4.376 | 4.329 | 4.744 | `1.122x` |
+| `loopdio` median | 6.513 | 5.788 | 7.360 | 6.800 | 6.639 | `1.272x` |
+| `rawfile` median | 6.179 | 7.801 | 5.835 | 6.972 | 6.942 | `1.337x` |
+
+Two separable causes, and the table separates them. **(1) Transport moves the FLOOR**: the O_DIRECT
+arm's fast mode is stable to `1.058x` — as stable as the kernel arms (`1.053x`, `1.078x`) — while the
+buffered arm's fast mode swings `1.172x`, because its cost depends on page-cache residency of an
+image copy that the rig re-creates every run. **(2) The median is exposed to a tail whose weight
+varies run to run**, for both FUSE arms. This is why the transport A/B looked like a null with a
+`1.625x` spread in the previous entry: transport does not shift the mean, it inflates the variance,
+and the median then mixes that in with a moving tail.
+
+**Estimator comparison, all five runs**, same data, same arms, estimator applied IDENTICALLY to the
+incumbent and to the null:
+
+| estimator | A/A null `k1/k2` | spread | row vs kernel, DIO arm | spread |
+|---|---|---|---|---|
+| median | `0.9848` | `1.0261x` | `0.6638` | `1.2345x` |
+| p25 | `0.9984` | `1.0208x` | `0.7449` | `1.1475x` |
+| p10 | `0.9930` | `1.0420x` | `0.7663` | `1.1032x` |
+| mean of 4 lowest | `0.9952` | `1.0281x` | `0.7673` | `1.0790x` |
+| **floor (min of 24)** | **`0.9945`** | **`1.0415x`** | **`0.7670`** | **`1.0440x`** |
+
+The buffered arm under the same estimators stays loose (`1.1777x` floor, `1.3773x` median), which is
+the transport effect showing up as variance exactly where predicted.
+
+**Validity, four ways.** (a) The estimator's spread on the ROW (`1.0440x`) matches its spread on the
+A/A NULL (`1.0415x`) — the row is now measured as tightly as this instrument measures anything, so
+the residual 4.4% is instrument, not row. (b) All five per-run A/A nulls PASS with the CI covering
+1.0: `0.9913 [0.9748, 1.0209]`, `1.0062 [0.9849, 1.0280]`, `0.9976 [0.9828, 1.0323]`,
+`1.0089 [0.9661, 1.0292]`, `0.9688 [0.9275, 1.0247]`. (c) Two independent floor estimators agree to
+**0.04%** (min `0.7670`, mean-of-4-lowest `0.7673`). (d) The estimator was fixed on tr1–tr3 and then
+validated OUT OF SAMPLE on two fresh runs against a prediction registered before they were launched
+— `k1_floor/loopdio_floor` in `[0.75, 0.80]`; measured `tr4=0.7543`, `tr5=0.7661`. Per-run row CIs:
+`[0.7401, 0.7788]`, `[0.7635, 0.7880]`, `[0.7762, 0.8147]`, `[0.7103, 0.7694]`, `[0.7312, 0.8103]`.
+
+**THE NUMBER: parallel-read ext4, 8 threads, is `1.303819x` SLOWER than live kernel ext4**
+(`k1/loopdio` floor geomean `0.766978` over five runs, spread `1.0440x`). Still a LOSS, and the
+banked `0.894290x` win remains refuted — no estimator here comes within reach of `1.118x` faster.
+
+**Caveat I am not going to bury: the floor estimator FLATTERS us.** It reads `1.303819x` where the
+median reads `1.5065x`, so it cannot be justified by its value, only by its reproducibility. What it
+excludes is a real cost, so I am reporting that cost separately rather than dropping it. Tail burden
+per arm (median / floor, geomean over five runs): kernel `k1` `1.0735`, `k2` `1.0841`; FrankenFS
+`loopdio` `1.2404`, `rawfile` `1.2199`. **Our tail is `1.1555x` heavier than the kernel's, and that
+is a second, genuinely-ours loss on this row.** The median loss factors as
+`1.3038x (fast path) x 1.1555x (extra tail) = 1.5065x` — the factorisation is an algebraic identity,
+not independent evidence, and I claim nothing from the arithmetic itself. What is empirical is that
+**one factor reproduces to 4.4% and the other only to `1.29x`**, which is the whole reason the
+median never reproduced.
+
+**Consequences.** The row is adjudicable again, to ~4–5%, so parallel-read levers are back on the
+table — my previous "no lever smaller than `1.6x` can be decided here" is WITHDRAWN. Any future
+parallel-read row must (i) run the FUSE arm on loop+`--direct-io=on`, symmetric with the kernel
+arms' own loop mounts, and (ii) report the floor estimator with the A/A null under the SAME
+estimator, at a FIXED round count — `min` is an extreme order statistic, so figures are comparable
+only at equal N, and `mean of 4 lowest` is the safer form where a bootstrap CI is wanted. The tail
+burden is now its own target and is the larger remaining question on this row. Nothing shipped,
+nothing reverted: no candidate change in these runs.
