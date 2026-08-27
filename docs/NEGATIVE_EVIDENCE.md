@@ -13558,3 +13558,126 @@ Reproduce:
     # per-phase device columns are w_/f_ {ios,sec,fl} in the CSV
     WORK=<scratch> ELF=<ffs-cli> CHUNKS=64 TAG=b1 \
       bash scripts/perf/bulk_durable_write_ab/bulk_trace.sh
+
+## 2026-08-27 — the flush's second copy, taken: `FFS_MVCC_FLUSH_BORROW` is worth 1.238905x on the bulk-durable-write fsync phase
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/bulk_durable_write_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on cpu18/cpu19, every arm on its own loop device
+`--direct-io=on`. Knob self-reported as
+`mount_candidate_knobs,...,mvcc_flush_borrow={false,true}`.
+
+The device census closed every competing explanation for this row and re-pointed it at the
+copy chain. This takes the copy that was explicitly left untaken.
+
+### 2026-08-27 — the profile under symmetric transport says something the old one did not
+
+`perf record -F 4999 -g --call-graph dwarf` on the daemon, loop-dio: **65.41% kernel,
+17.84% libc, 16.72% our ELF**. Children-mode:
+
+    FsMvccStore::flush_to_device_after        36.94%   <- the single largest cost
+      run_buf.extend_from_slice               18.47%
+      Cow::into_owned -> to_vec               10.77%
+    __memmove_avx_unaligned_erms (self)       16.94%
+    Channel::receive                          12.00%
+
+⇒ **the flush copies the payload TWICE in userspace before its single 64 MiB `pwrite`** —
+once into a per-block `Vec` (one allocation per block: **16,384** of them for a 64 MiB
+flush) and once into the coalescing run buffer. `resolve_data_with` returns
+`Cow::Borrowed` for every uncompressed version, so the first copy exists ONLY because the
+shard read lock is released before the coalescing loop runs. Under the ASYMMETRIC transport
+this row was first profiled with, `flush_to_device_after` measured 28.87% and the reading
+was dominated by the realloc chain; with the transport fixed the clone is the headline.
+
+### 2026-08-27 — the change
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`.
+Same-invocation A/A null control `1.000896` bootstrap median CI `[0.995760, 1.018864]` and same-invocation A/A null control `0.989023` bootstrap median CI `[0.972751, 1.008423]` on the fsync phase,
+both from 20000 resamples over the 32 paired per-round ratios.
+
+`FFS_MVCC_FLUSH_BORROW`, default OFF, one ELF. A two-pass flush that keeps the lock
+discipline and removes the clone: pass 1 walks every shard under its read lock and records
+only BLOCK NUMBERS, copying nothing; pass 2 walks the sorted list, re-resolves each block
+under its own shard's read lock and appends the BORROWED bytes straight into the run
+buffer, dropping the lock before every `write_contiguous_blocks`. Same runs, same bytes,
+same locations — **one copy instead of two and zero per-block allocations**. Defensive
+against a block vanishing between passes (it re-resolves rather than trusting a stored
+index, and a skipped block never becomes a run start).
+
+### 2026-08-27 — measured, one ELF, forward and mirrored
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`.
+Same-invocation A/A null control `1.000896` bootstrap median CI `[0.995760, 1.018864]` and same-invocation A/A null control `0.989023` bootstrap median CI `[0.972751, 1.008423]` on the fsync phase,
+both from 20000 resamples over the 32 paired per-round ratios.
+
+32 rounds each, arms and daemon CPUs swapped between runs:
+
+    fsync phase   forward  clone/borrow 1.297623  [1.249510, 1.395867]
+                  mirrored              1.182843  (from borrow/clone 0.845420 [0.819058, 0.875931])
+                  balanced              1.238905
+    whole batch   forward               1.175205  [1.064967, 1.235721]
+                  mirrored              1.054945  (from 0.947917 [0.909151, 0.994505])
+                  balanced              1.113452
+
+Absolute arm medians, forward run: kernel_median_wall_ns=70043000 and
+kernel_median_wall_ns=70583000 against fuse_median_wall_ns=223503000 (clone) and
+fuse_median_wall_ns=203442000 (borrow).
+
+Same-invocation A/A null control on the FSYNC PHASE, where the effect lives: `1.000896`
+bootstrap median CI `[0.995760, 1.018864]` and `0.989023` `[0.972751, 1.008423]`, both from
+20000 resamples over the 32 paired per-round ratios — clean in both runs.
+
+⚠ **The write phase is NOT a usable control on this row and this run confirms it.** Its
+KERNEL A/A null fails in both directions (`0.829618` `[0.811700, 0.843018]` and `0.860563`
+`[0.842534, 0.873236]`) — the same defect the transport self-audit banked: under
+`--direct-io=on`, writeback timing decides per arm how much of the batch lands in the write
+phase versus the fsync phase. The whole-batch kernel A/A is also marginal (`0.984636`,
+`0.980952`). **Only the fsync-phase figure is decidable, and it is the phase the change
+touches.**
+
+### 2026-08-27 — correctness
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`.
+Same-invocation A/A null control `1.000896` bootstrap median CI `[0.995760, 1.018864]` and same-invocation A/A null control `0.989023` bootstrap median CI `[0.972751, 1.008423]` on the fsync phase,
+both from 20000 resamples over the 32 paired per-round ratios.
+
+Counted mechanism: `Cow::into_owned` 10.77% and `run_buf.extend_from_slice` 18.47% of
+daemon CPU in the cloning path, with one allocation per block (16,384 per 64 MiB flush);
+the borrow path removes the first copy and all of those allocations.
+
+`e2fsck` clean and `bulk-durable.bin` read back as 67,108,864 bytes of ONE uniform byte
+through a kernel mount, on BOTH borrow arms, **5 of 5 repetitions**.
+`cargo test -p ffs-mvcc --lib` = **507 passed, 0 failed** (the watchdog test that flaked
+under peer load in an earlier session passed here).
+
+⚠ **Default OFF, and it should stay off until a concurrency gate runs.** This is a new
+two-pass traversal of a structure other threads mutate. Flush is caller-serialized and
+resolves at a FIXED `snapshot.high`, so pass 2 recomputes exactly what pass 1 computed —
+but "recomputes the same thing" is an argument, and the argument has not been tested
+against a concurrent committer. The bd-bhh0i parallel-create harness is the instrument that
+would test it. Until then this is a measured arm, not a landed default.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. The interior A/B is one ELF with both arms on
+the same transport, so it is ISA-invariant and immune to the transport artifact. What this
+banks is the corrected-transport profile that names the clone, the two-pass change, the
+`1.238905x` balanced fsync-phase result with its clean per-phase nulls, and the explicit
+note that the whole-batch and write-phase figures are not decidable on this row.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=boF FA_LABEL=clone FB_LABEL=borrow \
+      FA_CPUS=18 FB_CPUS=19 FA_ENV="FFS_MVCC_FLUSH_BORROW=0" \
+      FB_ENV="FFS_MVCC_FLUSH_BORROW=1" \
+      bash scripts/perf/bulk_durable_write_ab/run_bulk_dio.sh
+    # then the mirror with FA/FB swapped; take the geometric mean of the two
+    python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulkdio-boF.csv
+    WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/bvalidate.sh fa fb

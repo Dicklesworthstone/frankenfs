@@ -71,6 +71,38 @@ pub fn proof_downgrade_count() -> u64 {
 /// worst case is unchanged peak memory with no reallocation.
 ///
 /// `0`/`false`/`off`/`no` restore the un-reserved growth path.
+/// Whether the sharded flush BORROWS each block's bytes instead of cloning them
+/// (`FFS_MVCC_FLUSH_BORROW`, default OFF).
+///
+/// MEASURED, NOT GUESSED (2026-08-27). Under symmetric loop-`--direct-io` transport a
+/// perf profile of the bulk-durable-write row puts `flush_to_device_after` at **36.94%
+/// of daemon CPU**, and inside it the payload is copied TWICE in userspace before the
+/// single 64 MiB `pwrite`: `Cow::into_owned` into a per-block `Vec` (**10.77%**, plus
+/// one allocation per block — 16,384 of them for a 64 MiB flush) and then
+/// `run_buf.extend_from_slice` (**18.47%**). `resolve_data_with` returns
+/// `Cow::Borrowed` for every uncompressed version, so the first copy exists ONLY
+/// because the shard read lock is released before the coalescing loop runs.
+///
+/// This path keeps the lock discipline and removes the clone by splitting the walk in
+/// two: pass 1 collects block numbers under each shard's read lock and copies nothing;
+/// pass 2 re-resolves each block under its own shard's read lock and appends the
+/// BORROWED bytes straight into the run buffer, dropping the lock before any device
+/// write. Same bytes, same locations, same run coalescing — one copy instead of two and
+/// zero per-block allocations.
+///
+/// Default OFF because it is a new traversal of a data structure other threads mutate:
+/// pass 2 re-resolves rather than trusting a stored index, and skips a block that has
+/// vanished, but the two-pass shape is a real change to a flush that used to be a single
+/// snapshot-in-hand walk. It is an arm to measure, not a claimed win.
+#[must_use]
+pub fn flush_borrow_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_MVCC_FLUSH_BORROW")
+            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+    })
+}
+
 #[must_use]
 pub fn flush_run_reserve_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
