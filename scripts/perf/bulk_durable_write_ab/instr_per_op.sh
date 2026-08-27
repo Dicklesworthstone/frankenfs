@@ -65,7 +65,7 @@ mountpoint -q "$FMNT" || { echo "fuse mount never came up"; tail -8 "$W/instr-fu
 
 echo "--- FrankenFS (FUSE, --rw)"
 # Attach to the daemon FIRST so no daemon work escapes the count.
-perf stat -e instructions -x, -o "$W/instr-fd.txt" -p "$fpid" &
+perf stat -e instructions,page-faults,minor-faults -x, -o "$W/instr-fd.txt" -p "$fpid" &
 dperf=$!
 sleep 1
 perf stat -e instructions,task-clock -x, -o "$W/instr-fc.txt" -- \
@@ -73,6 +73,6 @@ perf stat -e instructions,task-clock -x, -o "$W/instr-fc.txt" -- \
 kill -INT "$dperf" 2>/dev/null || true
 wait "$dperf" 2>/dev/null || true
 echo "    client:"; grep -E "instructions|task-clock" "$W/instr-fc.txt" | sed 's/^/      /'
-echo "    daemon:"; grep -E "instructions" "$W/instr-fd.txt" | sed 's/^/      /'
+echo "    daemon:"; grep -E "instructions|faults" "$W/instr-fd.txt" | sed 's/^/      /'
 fusermount3 -u "$FMNT"; wait "$fpid" 2>/dev/null || true
 grep -o "crossings_total=[0-9]*\|crossings_write=[0-9]*" "$W/instr-fuse.log" | tail -2 | sed 's/^/    /'

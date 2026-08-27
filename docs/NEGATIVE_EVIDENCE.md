@@ -18585,3 +18585,53 @@ claiming it proven.
 
 ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (HEAD + this change, release).
 `hostname=thinkstation1`. Nothing else shipped, nothing reverted.
+
+## 2026-08-27 — bd-cjqhh write row: the daemon's cost is MEMORY CHURN — `1.158` page faults per 4 KiB page of data written — and `FFS_MVCC_FLUSH_BUF_REUSE` is an attested REJECT here (`+1.8%` instructions, faults `3557 -> 3551`) because it parks the staging buffer, not the per-block version data
+
+The write row is the only row this campaign has measured where WE are the cost (`2.48x` the kernel's
+instructions, `83.3%` of ours inside the daemon), so it is the only row where a profile can point at a
+lever instead of at the FUSE boundary. Run inside the working range (bd-cjqhh bounds the row at ~16 MiB
+until data-chunk growth exists) so the profile is of a SUCCESSFUL run and not an error path.
+
+**Profile, daemon only, self time** (`perf record -g -p <daemon>`, 12 MiB in 64 KiB writes,
+`fsync` every 16): `__pi_memcpy` 5.38%, `clear_page_erms` 3.54%, `__memmove_avx_unaligned_erms` 2.51%,
+`mas_walk` 2.28%, `do_anonymous_page` 1.56%, `fuse_copy_fill` 1.46%, `__handle_mm_fault` 1.19%,
+`rmqueue` 1.18%, `rmqueue_pcplist` 1.16%. **Not filesystem logic — page faults, page zeroing, and
+copying.** The daemon is faulting in fresh anonymous memory, having the kernel zero it, and copying
+into it, per operation.
+
+**Quantified with a counter rather than a profile percentage.** `perf stat` on the daemon over the
+same workload: **3,557 page faults (all minor) for 192 writes = `18.53` per write**. The workload
+writes `12,582,912` bytes = **3,072 pages**, so the daemon takes **`1.158` faults per page of data
+written** — essentially every page of data is a FRESH allocation, touched once. That is the mechanism
+behind every kernel symbol in the profile above, stated as a count.
+
+**REJECT: `FFS_MVCC_FLUSH_BUF_REUSE` does not address it.** One ELF, same fixture rebuilt between
+arms, knob ATTESTED in the daemon's own self-report (`mvcc_flush_buf_reuse=false` / `=true`):
+
+| arm | daemon instructions | page faults | blocking crossings/write |
+|---|---|---|---|
+| `buf_reuse=false` | **104,778,053** | **3,557** | `2.0677` |
+| `buf_reuse=true` | **106,635,221** | **3,551** | `2.0677` |
+
+Faults move `0.2%` (noise) and instructions go **`+1.8%` the WRONG WAY**. Rejected.
+
+**And the reject is explicable, which is what makes it useful.** `take_run_buf`/`put_run_buf` park ONE
+flush *staging* buffer across flushes, carrying capacity and not bytes. This workload performs 13
+flushes, so at best that saves ~13 allocations — against 3,072 pages of churn. The churn is not in the
+staging buffer at all: it is in the per-block version data, one `Arc<AlignedVec>` per written block
+(192 blocks x 64 KiB = 3,072 pages), which matches the measured 3,557 faults almost exactly. **The
+knob is aimed at the wrong allocation on this row.** It is not broken and this is not evidence against
+it on the row it was built for; it simply cannot reach the dominant cost here.
+
+**The real lever class, named and NOT attempted:** pooling or reusing the per-block version buffers so
+a page of write data is faulted once per buffer rather than once per block. That is a change to MVCC
+version storage lifetime, which is shared with the read path and with snapshot semantics; the counted
+target (`1.158` -> ideally well under `0.1` faults per data page) is now on record, and a speculative
+change there without a crash-consistency oracle would be worse than a documented target.
+
+Instruction counts on this row reproduce to `0.01%` on the daemon component, so a future A/B against
+this baseline does not need a quiet window.
+
+ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
+`hostname=thinkstation1`. Nothing shipped, nothing reverted.
