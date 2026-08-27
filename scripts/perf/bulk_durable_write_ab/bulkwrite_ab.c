@@ -5,7 +5,7 @@
 // batch = open <root>/bulk-durable.bin O_RDWR, `chunks` sequential pwrite()s of
 // 1 MiB each, then one fsync of the file. Single client thread, as the banked row.
 //
-// usage: bulkwrite_ab ROUNDS CHUNKS CPU FUSEPID label=dir [label=dir ...]
+// usage: bulkwrite_ab ROUNDS CHUNKS CPU label=dir=block-stat=FUSEPID [...]
 // prints CSV: round,pos,arm,write_ns,fsync_ns,total_ns,bytes,daemon_ticks
 
 #define _GNU_SOURCE
@@ -94,6 +94,59 @@ static unsigned char seq_byte(unsigned long sequence) {
 
 static unsigned char *payload;
 
+struct arm {
+    char *label;
+    char *dir;
+    char *statfile;
+    int fusepid;
+};
+
+static int parse_arm(char *spec, struct arm *out) {
+    char *eq = strchr(spec, '=');
+    if (!eq) return -1;
+    *eq = 0;
+    out->label = spec;
+    out->dir = eq + 1;
+
+    eq = strchr(out->dir, '=');
+    if (!eq) return -1;
+    *eq = 0;
+    out->statfile = eq + 1;
+
+    eq = strchr(out->statfile, '=');
+    if (!eq) return -1;
+    *eq = 0;
+    char *pid_text = eq + 1;
+    char *end = NULL;
+    long pid = strtol(pid_text, &end, 10);
+    if (out->label[0] == 0 || out->dir[0] == 0 || out->statfile[0] == 0
+        || *pid_text == 0 || *end != 0 || pid < 0 || pid > INT32_MAX) {
+        return -1;
+    }
+    out->fusepid = (int)pid;
+    return 0;
+}
+
+static int self_test(void) {
+    char first[] = "baseA=/mnt/a=/sys/block/loop1/stat=101";
+    char second[] = "baseB=/mnt/b=/sys/block/loop2/stat=202";
+    char missing_pid[] = "baseA=/mnt/a=/sys/block/loop1/stat";
+    char invalid_pid[] = "baseA=/mnt/a=/sys/block/loop1/stat=not-a-pid";
+    struct arm a;
+    struct arm b;
+    struct arm ignored;
+
+    if (parse_arm(first, &a) != 0 || parse_arm(second, &b) != 0
+        || strcmp(a.label, "baseA") != 0 || strcmp(b.label, "baseB") != 0
+        || a.fusepid != 101 || b.fusepid != 202 || a.fusepid == b.fusepid
+        || parse_arm(missing_pid, &ignored) == 0 || parse_arm(invalid_pid, &ignored) == 0) {
+        fprintf(stderr, "per-arm PID parser self-test failed\n");
+        return 1;
+    }
+    puts("per-arm PID parser self-test passed");
+    return 0;
+}
+
 static int run_batch(const char *root, unsigned long chunks, unsigned long sequence,
                      uint64_t *write_ns, uint64_t *fsync_ns,
                      const char *statfile, struct phase_io io[2],
@@ -140,28 +193,22 @@ static int run_batch(const char *root, unsigned long chunks, unsigned long seque
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6) {
-        fprintf(stderr, "usage: %s ROUNDS CHUNKS CPU FUSEPID label=dir [...]\n", argv[0]);
+    if (argc == 2 && strcmp(argv[1], "--self-test") == 0) return self_test();
+    if (argc < 5) {
+        fprintf(stderr, "usage: %s ROUNDS CHUNKS CPU label=dir=block-stat=FUSEPID [...]\n", argv[0]);
         return 2;
     }
     int rounds = atoi(argv[1]);
     unsigned long chunks = strtoul(argv[2], NULL, 10);
     int cpu = atoi(argv[3]);
-    int fusepid = atoi(argv[4]);
-    int narms = argc - 5;
+    int narms = argc - 4;
     if (narms > MAX_ARMS) { fprintf(stderr, "too many arms\n"); return 2; }
-    char *labels[MAX_ARMS];
-    char *dirs[MAX_ARMS];
-    char *stats[MAX_ARMS];
+    struct arm arms[MAX_ARMS];
     for (int i = 0; i < narms; i++) {
-        char *s = argv[5 + i];
-        char *eq = strchr(s, '=');
-        if (!eq) { fprintf(stderr, "bad arm spec %s\n", s); return 2; }
-        *eq = 0;
-        labels[i] = s;
-        dirs[i] = eq + 1;
-        char *eq2 = strchr(dirs[i], '=');
-        if (eq2) { *eq2 = 0; stats[i] = eq2 + 1; } else { stats[i] = NULL; }
+        if (parse_arm(argv[4 + i], &arms[i]) != 0) {
+            fprintf(stderr, "bad arm spec %s\n", argv[4 + i]);
+            return 2;
+        }
     }
 
     cpu_set_t set;
@@ -178,8 +225,9 @@ int main(int argc, char **argv) {
     unsigned long long dticks[2] = {0, 0};
     for (int i = 0; i < narms; i++) {
         uint64_t w, f;
-        if (run_batch(dirs[i], chunks, sequence++, &w, &f, stats[i], io, 0, dticks) != 0) return 1;
-        fprintf(stderr, "warmup %s write=%.3fms fsync=%.3fms\n", labels[i], w / 1e6, f / 1e6);
+        if (run_batch(arms[i].dir, chunks, sequence++, &w, &f, arms[i].statfile,
+                      io, arms[i].fusepid, dticks) != 0) return 1;
+        fprintf(stderr, "warmup %s write=%.3fms fsync=%.3fms\n", arms[i].label, w / 1e6, f / 1e6);
     }
 
     printf("round,pos,arm,write_ns,fsync_ns,total_ns,bytes,daemon_ticks,w_ios,w_sec,w_fl,f_ios,f_sec,f_fl,w_dticks,f_dticks\n");
@@ -187,11 +235,12 @@ int main(int argc, char **argv) {
         for (int pos = 0; pos < narms; pos++) {
             int i = (pos + r) % narms;
             unsigned long long tb = 0, ta = 0;
-            read_daemon_ticks(fusepid, &tb);
+            read_daemon_ticks(arms[i].fusepid, &tb);
             uint64_t w, f;
-            if (run_batch(dirs[i], chunks, sequence++, &w, &f, stats[i], io, fusepid, dticks) != 0) return 1;
-            read_daemon_ticks(fusepid, &ta);
-            printf("%d,%d,%s,%llu,%llu,%llu,%lu,%llu", r, pos, labels[i],
+            if (run_batch(arms[i].dir, chunks, sequence++, &w, &f, arms[i].statfile,
+                          io, arms[i].fusepid, dticks) != 0) return 1;
+            read_daemon_ticks(arms[i].fusepid, &ta);
+            printf("%d,%d,%s,%llu,%llu,%llu,%lu,%llu", r, pos, arms[i].label,
                    (unsigned long long)w, (unsigned long long)f,
                    (unsigned long long)(w + f), chunks * CHUNK, ta - tb);
             for (int q = 0; q < 2; q++)
