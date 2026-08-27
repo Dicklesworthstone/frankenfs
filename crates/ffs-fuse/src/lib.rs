@@ -4614,6 +4614,25 @@ pub fn write_inode_invalidation_enabled() -> bool {
     })
 }
 
+/// getattr census, split finer than `OP_COUNTS` can (bd-ltx9e).
+///
+/// TWO reasons this exists separately. First, the readdirplus memo answers some getattrs
+/// and returns BEFORE `with_request_scope`, so `OP_COUNTS[Getattr]` UNDERCOUNTS by exactly
+/// the memo hits -- the same shape as the getxattr memo bug that made `requests_total`
+/// read 22 for 6,001 stats. `GETATTR_ENTERED` is incremented at the top of the handler, so
+/// it counts every getattr the kernel actually issued.
+///
+/// Second, the storm's biggest opcode is getattr (3.147/pair, and ~1.948 of that in the
+/// unlink phase alone) and the open question is WHICH inode it names: the victim file or
+/// its parent directory. Splitting by the returned file type answers that by counting.
+pub static GETATTR_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// getattrs answered from the readdirplus memo (never reach `with_request_scope`).
+pub static GETATTR_MEMO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// getattrs whose subject is a DIRECTORY.
+pub static GETATTR_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// getattrs whose subject is not a directory.
+pub static GETATTR_NONDIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Per-opcode request counts, indexed by `RequestOp::as_index()`.
 ///
 /// The scalar `requests_total` cannot say WHICH operations a workload issued, so a row
@@ -4623,6 +4642,16 @@ pub fn write_inode_invalidation_enabled() -> bool {
 /// Reported at destroy under FFS_OP_COUNTS=1.
 pub static OP_COUNTS: [std::sync::atomic::AtomicU64; ffs_core::vfs::RequestOp::COUNT] =
     [const { std::sync::atomic::AtomicU64::new(0) }; ffs_core::vfs::RequestOp::COUNT];
+
+/// Tally one getattr against the file type of its subject (bd-ltx9e).
+fn record_getattr_subject(attr: &ffs_core::InodeAttr) {
+    let counter = if to_file_attr(attr).kind == fuser::FileType::Directory {
+        &GETATTR_DIR
+    } else {
+        &GETATTR_NONDIR
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Render the per-opcode counts as `name=count` pairs, omitting operations that never
 /// ran so a storm's profile is not buried in thirty zeroes.
@@ -5343,6 +5372,13 @@ impl Filesystem for FrankenFuse {
         // asked for, so no normal mount pays a line for it.
         if std::env::var("FFS_OP_COUNTS").is_ok_and(|v| v.trim() == "1") {
             warn!(counts = %op_counts_report(), "op_counts");
+            warn!(
+                entered = GETATTR_ENTERED.load(std::sync::atomic::Ordering::Relaxed),
+                memo = GETATTR_MEMO.load(std::sync::atomic::Ordering::Relaxed),
+                dir = GETATTR_DIR.load(std::sync::atomic::Ordering::Relaxed),
+                nondir = GETATTR_NONDIR.load(std::sync::atomic::Ordering::Relaxed),
+                "getattr_split"
+            );
         }
         if std::env::var("FFS_NOTIFY_SEND_COUNT").is_ok_and(|v| v.trim() == "1") {
             warn!(
@@ -5416,6 +5452,9 @@ impl Filesystem for FrankenFuse {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
+        // BEFORE the memo fast path on purpose: that path returns without reaching
+        // `with_request_scope`, so OP_COUNTS[Getattr] cannot see it (bd-ltx9e).
+        GETATTR_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // bd-q0xnl: claim the attributes readdirplus already computed for this
         // inode, if this is the getattr the kernel issues straight after a
         // readdirplus batch. Single-use, so this answers once and then the
@@ -5426,6 +5465,8 @@ impl Filesystem for FrankenFuse {
         if let Some(attr) = self.inner.readdirplus_attr_memo.take(InodeNumber(ino)) {
             self.inner.metrics.record_memoized();
             self.inner.metrics.record_readdirplus_memo_hit();
+            GETATTR_MEMO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            record_getattr_subject(&attr);
             reply.attr(&ATTR_TTL, &to_file_attr(&attr));
             return;
         }
@@ -5433,7 +5474,10 @@ impl Filesystem for FrankenFuse {
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
         }) {
-            Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(&attr)),
+            Ok(attr) => {
+                record_getattr_subject(&attr);
+                reply.attr(&ATTR_TTL, &to_file_attr(&attr));
+            }
             Err(e) => {
                 Self::reply_error_attr(
                     &FuseErrorContext {
