@@ -1544,6 +1544,13 @@ pub struct OpenFs {
     /// The writable path bypasses this cache because file data changes are
     /// published through MVCC and eventually persisted to these blocks.
     ext4_file_data_block_cache: ShardedCache<BlockNumber, Arc<[u8]>>,
+    /// Byte-bounded read-only cache of contiguous ext4 file-data extents.
+    ///
+    /// Large file reads take the zero-copy contiguous-device path and therefore
+    /// intentionally bypass the scalar block cache above. Keeping whole runs
+    /// here lets a later offset read reuse a previous cold extent without
+    /// making resident memory a function of the image size.
+    ext4_file_data_extent_cache: Ext4ReadExtentCache,
     /// Read-only parsed inode ATTR cache (inode number → InodeAttr). On a read-only
     /// mount inodes are immutable, so a resolved attr can be reused across repeated
     /// lookups/getattrs (a directory scan re-resolves the same children) instead of
@@ -2289,6 +2296,28 @@ fn ext4_file_data_block_cache_limit() -> usize {
             .unwrap_or(256)
     })
 }
+
+/// Memory budget for cached immutable ext4 data extents (bd-mf9z9).
+///
+/// The cache is read-only-mount-only, so it never serves data that a local
+/// mutation could have changed. The 64 MiB ceiling covers the cold parallel
+/// read working set while remaining a fixed per-mount budget. Setting
+/// `FFS_EXT4_FILE_DATA_EXTENT_CACHE_BYTES=0` disables admission for a
+/// same-ELF A/B comparison.
+const EXT4_FILE_DATA_EXTENT_CACHE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+
+/// Effective per-mount extent-cache budget, exposed for in-process benchmark
+/// attestation rather than reconstructed from the launcher environment.
+#[must_use]
+pub fn ext4_file_data_extent_cache_bytes() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("FFS_EXT4_FILE_DATA_EXTENT_CACHE_BYTES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(EXT4_FILE_DATA_EXTENT_CACHE_BYTES_DEFAULT)
+    })
+}
 const EXT4_INODE_ATTR_CACHE_LIMIT: usize = 65536;
 const EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT: usize = 4096;
 /// Maximum number of immutable btrfs inode attributes retained by the
@@ -2900,6 +2929,94 @@ impl<K: std::hash::Hash + Eq + CacheShard, V: Clone> ShardedCache<K, V> {
             shard.lock().clear();
         }
         self.len.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A byte-bounded immutable extent cache keyed by physical start block.
+///
+/// Unlike [`ShardedCache`], this cache answers contained-range queries: a
+/// previously cached 128 KiB extent can satisfy a later 8 KiB read starting in
+/// its middle. Entries are admitted only while their aggregate payload stays
+/// within the configured byte budget; there is no eviction policy that could
+/// make the resident footprint exceed that budget.
+struct Ext4ReadExtentCache {
+    inner: Mutex<Ext4ReadExtentCacheInner>,
+    capacity_bytes: usize,
+}
+
+struct Ext4ReadExtentCacheInner {
+    entries: BTreeMap<BlockNumber, Arc<[u8]>>,
+    resident_bytes: usize,
+}
+
+impl Ext4ReadExtentCache {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(Ext4ReadExtentCacheInner {
+                entries: BTreeMap::new(),
+                resident_bytes: 0,
+            }),
+            capacity_bytes,
+        }
+    }
+
+    /// Copy `dst` from an extent that fully contains `[start, start + dst)`.
+    ///
+    /// The payload `Arc` is cloned while locked and the potentially large copy
+    /// happens after releasing the cache mutex, so one reader never blocks
+    /// another reader for the duration of a data copy.
+    fn copy_into(&self, start: BlockNumber, block_size: usize, dst: &mut [u8]) -> bool {
+        if dst.is_empty() || block_size == 0 {
+            return false;
+        }
+        let Some((extent_start, extent)) = self
+            .inner
+            .lock()
+            .entries
+            .range(..=start)
+            .next_back()
+            .map(|(key, value)| (*key, Arc::clone(value)))
+        else {
+            return false;
+        };
+        let Some(block_delta) = start.0.checked_sub(extent_start.0) else {
+            return false;
+        };
+        let Ok(block_delta) = usize::try_from(block_delta) else {
+            return false;
+        };
+        let Some(offset) = block_delta.checked_mul(block_size) else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(dst.len()) else {
+            return false;
+        };
+        let Some(source) = extent.get(offset..end) else {
+            return false;
+        };
+        dst.copy_from_slice(source);
+        true
+    }
+
+    /// Admit one physical extent if its immutable payload fits the fixed budget.
+    fn insert(&self, start: BlockNumber, bytes: Arc<[u8]>) {
+        if bytes.is_empty() || bytes.len() > self.capacity_bytes {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        if inner.entries.contains_key(&start)
+            || inner.resident_bytes.saturating_add(bytes.len()) > self.capacity_bytes
+        {
+            return;
+        }
+        inner.resident_bytes += bytes.len();
+        inner.entries.insert(start, bytes);
+    }
+
+    fn clear(&self) {
+        let mut inner = self.inner.lock();
+        inner.entries.clear();
+        inner.resident_bytes = 0;
     }
 }
 
@@ -5617,6 +5734,9 @@ impl OpenFs {
             ext4_inode_table_locations: OnceLock::new(),
             ext4_inode_table_block_cache: ShardedCache::new(),
             ext4_file_data_block_cache: ShardedCache::new(),
+            ext4_file_data_extent_cache: Ext4ReadExtentCache::new(
+                ext4_file_data_extent_cache_bytes(),
+            ),
             ext4_inode_attr_cache: ShardedCache::new(),
             ext4_inode_xattr_block_cache: ShardedCache::new(),
             ext4_base_block_cache: ShardedCache::new(),
@@ -6466,6 +6586,7 @@ impl OpenFs {
         self.ext4_inode_table_block_cache.clear();
         self.ext4_group_desc_cache.clear();
         self.ext4_file_data_block_cache.clear();
+        self.ext4_file_data_extent_cache.clear();
         self.ext4_base_block_cache.clear();
 
         info!(
@@ -7168,6 +7289,7 @@ impl OpenFs {
         self.ext4_inode_table_block_cache.clear();
         self.ext4_group_desc_cache.clear();
         self.ext4_file_data_block_cache.clear();
+        self.ext4_file_data_extent_cache.clear();
         self.ext4_base_block_cache.clear();
         debug!(
             ino,
@@ -7724,6 +7846,7 @@ impl OpenFs {
             self.ext4_inode_table_block_cache.clear();
             self.ext4_group_desc_cache.clear();
             self.ext4_file_data_block_cache.clear();
+            self.ext4_file_data_extent_cache.clear();
             self.ext4_base_block_cache.clear();
         }
         Ok(())
@@ -14639,6 +14762,27 @@ impl OpenFs {
         // Vec). The device adapter already resolves read-your-writes at the
         // current snapshot, so this is byte-identical to the loop's fast path.
         let dev = self.block_device_adapter();
+        // Large read runs normally bypass the scalar block cache and go straight
+        // to the device. On a read-only latest scope their bytes are immutable,
+        // so retain a bounded whole extent after the first cold read. The range
+        // lookup deliberately accepts offset subreads of that extent; an
+        // exact-start cache would only pay on a benchmark replaying identical
+        // requests.
+        let extent_cacheable = scope.tx.is_none()
+            && scope.snapshot.is_none()
+            && self.can_cache_ext4_read_only_block(scope, start);
+        if extent_cacheable {
+            if self
+                .ext4_file_data_extent_cache
+                .copy_into(start, bs, dst)
+            {
+                return Ok(());
+            }
+            dev.read_contiguous_into(cx, start, dst)?;
+            self.ext4_file_data_extent_cache
+                .insert(start, Arc::from(dst.to_vec()));
+            return Ok(());
+        }
         if scope.tx.is_none() {
             return dev.read_contiguous_into(cx, start, dst);
         }
@@ -49988,6 +50132,57 @@ mod tests {
             dev.read_count(),
             1,
             "the read-only scalar file-data cache should suppress the second data-block read"
+        );
+    }
+
+    #[test]
+    fn extent_cache_serves_offset_subrange_without_device_io_bd_mf9z9() {
+        // Inode #11 is a four-block contiguous extent at physical blocks 15..19.
+        // Cache the entire run, then ask for its middle two blocks. An exact-key
+        // cache would issue a second device read at block 16; the extent cache
+        // must serve this different request shape from the cached range.
+        let image = build_ext4_image_with_multiblock_index_extent();
+        let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(15 * 4096));
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        dev.reset_count();
+
+        let mut full = vec![0_u8; 4 * 4096];
+        let full_count = fs
+            .read_file_data(&cx, &RequestScope::empty(), &inode, 0, &mut full)
+            .unwrap();
+        assert_eq!(full_count, full.len(), "the full extent must be read");
+        assert_eq!(full, vec![0_u8; 4 * 4096]);
+        assert_eq!(dev.read_count(), 1, "the initial cold extent needs one device read");
+
+        dev.reset_count();
+        let mut middle = vec![0_u8; 2 * 4096];
+        let count = fs
+            .read_file_data(&cx, &RequestScope::empty(), &inode, 4096, &mut middle)
+            .unwrap();
+        assert_eq!(count, middle.len());
+        assert_eq!(middle, vec![0_u8; 2 * 4096]);
+        assert_eq!(
+            dev.read_count(),
+            0,
+            "an offset subrange of a cached extent must not revisit the device"
+        );
+    }
+
+    #[test]
+    fn extent_cache_refuses_entries_that_exceed_its_byte_budget_bd_mf9z9() {
+        let cache = Ext4ReadExtentCache::new(8);
+        cache.insert(BlockNumber(100), Arc::from([1_u8; 8]));
+        cache.insert(BlockNumber(101), Arc::from([2_u8; 1]));
+
+        let mut admitted = [0_u8; 8];
+        assert!(cache.copy_into(BlockNumber(100), 1, &mut admitted));
+        assert_eq!(admitted, [1_u8; 8]);
+        let mut rejected = [0_u8; 1];
+        assert!(
+            !cache.copy_into(BlockNumber(101), 1, &mut rejected),
+            "a second entry must not push resident bytes over the fixed budget"
         );
     }
 
