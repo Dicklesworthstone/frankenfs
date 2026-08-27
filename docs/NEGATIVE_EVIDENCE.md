@@ -13985,3 +13985,97 @@ Reproduce:
     # the oracle control:
     WORK=<scratch> THREADS=16 OPS=8192 MODE=shared \
       bash scripts/perf/parallel_metadata_ab/rm_gate_kernel.sh
+
+## 2026-08-27 — the dispatch gate on BTRFS: correctness gap closed (22/22, 50 across both filesystems), and the perf ceiling is a measured NULL that confirms the derived bound
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rigs
+`scripts/perf/parallel_metadata_ab/rm_gate_btrfs.sh`, `run_pmeta_btrfs_dio.sh`,
+`scripts/perf/create_delete_storm_ab/run_storm_btrfs_dio.sh`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, every arm on its own loop device `--direct-io=on` for the timed
+rows.
+
+The concurrent-unlink gate closed the ext4 half and left two named gaps: "**btrfs and
+crash-consistency**". This closes btrfs, on both axes.
+
+**Correctness: `btrfs check` as the oracle, 22 runs, 0 failures.** Same
+`pmeta_rm` stress (N workers create strided files, fsync every directory, then remove them
+all CONCURRENTLY, fsync again), against a FrankenFS `--rw` **btrfs** mount with
+`FFS_FUSE_WORKERS=4 FFS_FUSE_CONCURRENT_MUTATIONS=1`. Oracle per run: no syscall error,
+then `btrfs check --readonly` on the unmounted image (it walks every tree and reports
+extent, ref-count and free-space-cache inconsistencies — the btrfs analogue of the ext4
+half's `e2fsck -fn`), then the tree must be EMPTY through a live kernel btrfs mount.
+
+    control, gate INTACT   shared  8t x 4,096     1 run    PASS
+    widened                shared  8t x 4,096     6 runs   6 PASS
+    widened                private 8t x 4,096     6 runs   6 PASS
+    widened                shared 16t x 8,192     6 runs   6 PASS
+    widened                private 8t x 16,384    4 runs   4 PASS
+    ------------------------------------------------------------
+    btrfs total                                  22 runs   22 PASS, 0 FAIL
+
+`btrfs check` clean and 0 surviving files on every run. ⇒ **combined with the ext4 half's
+28/28, the widened gate now has 50 concurrent-mutation runs across BOTH filesystems with
+zero failures**, including the shared-parent shape that races two unlinks on one directory.
+
+**Perf: the gate is a NULL on btrfs, and that confirms the derived bound.** The ext4
+parallel-metadata row measured the gate's ceiling at `1.499448x`/`1.583175x`. The btrfs
+twin entry did not measure it — it DERIVED a bound of `<=1.0543x` from the phase split
+(create is only `10.88%` of that batch). Measured now, one ELF, both FUSE arms on btrfs
+images, forward and mirrored with arms and daemon CPUs swapped, 24 rounds each:
+
+    btrfs parallel-metadata-write, gated / wide
+      forward  1.002236  [0.993444, 1.010935]
+      mirrored 1.007378  (from wide/gated 0.992671 [0.981817, 1.006754])
+      balanced 1.004806        <- NULL, against a derived bound of <=1.0543x
+
+Same-invocation A/A null control `1.001792` bootstrap median CI `[0.998292, 1.013005]` and
+same-invocation A/A null control `0.993688` bootstrap median CI `[0.984854, 0.997204]`
+(kernel btrfs), 20000 resamples over the 24 paired per-round ratios. `RCH_WORKER=none`,
+`hostname=thinkstation1`. Absolute arm medians: kernel_median_wall_ns=164133000 against
+fuse_median_wall_ns=250019000, with the fsync phase `224.132` of `250.019 ms` = **`89.6%`
+of the batch**. ⇒ **the derivation was right: a lever on a phase worth 10% of a batch
+cannot show, and it does not.**
+
+**A scope catch worth recording: the gate cannot show on a SINGLE-CLIENT-THREAD row.** The
+same A/B run on the btrfs create/delete storm measured `gated/wide` forward `0.940493`
+`[0.908718, 0.989237]` and mirrored `1.051125` — **balanced `0.994200`, a NULL with the two
+directions disagreeing in SIGN.** That is not noise about a small effect; the storm drives
+its mutations from ONE client thread, so there is no client-side concurrency for a dispatch
+gate to unblock, and the measurement is structurally incapable of showing the lever. Same
+class as the zero-message-open inertness: **a lever measured on a row that cannot express
+it produces a NULL that means nothing about the lever.** Rows must be chosen for the lever's
+mechanism, and disagreeing signs across a mirrored pair are the tell that the row is wrong.
+
+### What the gate now is
+
+  * **An ext4 parallel-metadata lever worth `1.50`-`1.58x`**, and nothing on btrfs
+    (`1.004806`) or on any single-client-thread row.
+  * Correctness-exercised on **50 concurrent-mutation runs across both filesystems, 0
+    failures**, with `e2fsck -fn` / `btrfs check` and exact inode accounting.
+  * ⛔ Still default OFF. The remaining named gap is now **crash-consistency alone** — no
+    crash injection has been run — plus `rename`/`link`, which are in the
+    non-concurrency-safe set and were never widened by the measurement knob.
+
+### Admissibility
+
+Hand rigs, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. What this banks is the btrfs correctness
+result with its `btrfs check` oracle, the measured btrfs NULL confirming a previously
+derived bound, and the single-client-thread scope catch with its sign-disagreement tell.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_metadata_ab/mkpmeta_btrfs.sh
+    gcc -O2 -o $WORK/pmeta_rm scripts/perf/parallel_metadata_ab/pmeta_rm.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> THREADS=16 OPS=8192 MODE=shared \
+      FENV="FFS_FUSE_WORKERS=4 FFS_FUSE_CONCURRENT_MUTATIONS=1" \
+      bash scripts/perf/parallel_metadata_ab/rm_gate_btrfs.sh
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 TAG=pbF FE_CPUS=18 FB_CPUS=19 \
+      FE_ENV="FFS_FUSE_WORKERS=4" \
+      FB_ENV="FFS_FUSE_WORKERS=4 FFS_FUSE_CONCURRENT_MUTATIONS=1" \
+      bash scripts/perf/parallel_metadata_ab/run_pmeta_btrfs_dio.sh
+    python3 scripts/perf/parallel_metadata_ab/panalyze.py $WORK/pbmeta-pbF.csv
