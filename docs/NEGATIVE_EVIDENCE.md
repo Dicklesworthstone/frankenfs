@@ -13445,3 +13445,116 @@ Reproduce:
     # then the mirror with FA/FB swapped; take the geometric mean of the two
     WORK=<scratch> ELF=<ffs-cli> TAG=sp2 ROUNDS=40 OPS=2000 \
       bash scripts/perf/create_delete_storm_ab/sperf.sh
+
+## 2026-08-27 — bulk durable write, device census: write amplification is 1.000x, we issue HALF the barriers, our flush is ONE 64 MiB pwrite — and the row's real loss is a 14.504x WRITE phase that never touches the device
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/bulk_durable_write_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on cpu18/cpu19, every arm on its own loop device
+`--direct-io=on`.
+
+Worst standing row without a full accounting. Its headline was corrected to `3.8367x` in
+the transport self-audit and its flush-reserve lever re-confirmed at `1.137104x`, but the
+device work behind it was never counted. `bulkwrite_ab.c` now samples
+`/sys/block/<dev>/stat` at the write/fsync boundary.
+
+### 2026-08-27 — the census, 32 rounds, all nulls clean
+
+Same-invocation A/A null control `1.002762` bootstrap median CI `[0.984552, 1.052922]`
+(kernel) and same-invocation A/A null control `1.001868` bootstrap median CI
+`[0.970806, 1.044514]` (candidate), both from 20000 resamples over the 32 paired per-round
+ratios. `RCH_WORKER=none`, `hostname=thinkstation1`.
+
+| arm | phase | ms | write I/Os | sectors | MiB | FLUSH |
+| --- | --- | --- | --- | --- | --- | --- |
+| kernel k1 | 64 × 1 MiB pwrite | 5.400 | **0** | **0** | 0.00 | **0** |
+| kernel k1 | fsync | 150.384 | **54** | 131,096 | 64.01 | **2** |
+| FrankenFS | 64 × 1 MiB pwrite | 78.324 | **0** | **0** | 0.00 | **0** |
+| FrankenFS | fsync | 243.671 | **130** | 131,080 | 64.00 | **1** |
+
+(k2 and the second FrankenFS arm are identical on every counter.)
+
+Paired ratios: total `k1/ffsA` = `0.465934` ⇒ **`2.1463x`**; write phase `0.069679`
+`[0.065357, 0.074385]` ⇒ **`14.352x`**; fsync phase `0.566639` ⇒ **`1.7648x`**.
+
+### 2026-08-27 — three things the census kills outright
+
+**1. Write amplification is `1.000x` on BOTH arms.** We write 131,080 sectors = **64.00
+MiB** for a 64 MiB overwrite; the kernel writes 131,096 = 64.01 MiB. The MVCC overlay does
+not write the payload twice. Any amplification hypothesis for this row is dead by counting.
+
+**2. We issue HALF the barriers — `1` against the kernel's `2`.** Same shape as the ext4
+fsync census: their second barrier is the jbd2 commit we never write. ⇒ **this row's
+comparison carries the same durability-class caveat bd-4zjkz attached to the ext4 fsync
+row**, and the `1.7648x` fsync-phase loss is measured against an incumbent doing MORE
+durable work, not less. That makes the loss real and, if anything, understated.
+
+**3. Our flush is already ONE syscall.** `strace -f -e trace=pwrite64,fdatasync` on the
+live daemon, per batch:
+
+    1 x pwrite64(fd, ..., 67108864, ...)      <- the whole 64 MiB in a single call
+    1 x pwrite64(fd, ..., 4096, ...)          <- the inode
+    1 x fdatasync(fd)
+
+There is nothing to coalesce. **The `130`-vs-`54` device request count is the BLOCK LAYER
+splitting our single 64 MiB call**, at `516,254` bytes per request against the kernel's
+`1,242,984`. The loop device's `max_sectors_kb` is **1280** (1.25 MiB), so neither arm is
+size-capped: we are hitting the **128-segment** limit (128 × 4 KiB = 512 KiB) because our
+buffer is ordinary anonymous userspace memory, while ext4's writeback submits page-cache
+folios and reaches 1.19 MiB per request. ⇒ **not a bug in our flush path; a property of
+where the bytes live.** The one userspace lever that could move it is transparent huge
+pages on the flush buffer (`MADV_HUGEPAGE`), which would cut segments 512-fold. **Named,
+unmeasured, and NOT taken here.**
+
+### 2026-08-27 — where the row actually loses: a 14.504x phase with ZERO device I/O
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `1.002762` bootstrap median CI `[0.984552, 1.052922]` and same-invocation A/A null control `1.001868` bootstrap median CI `[0.970806, 1.044514]`, 20000 resamples.
+Absolute arm medians: kernel_median_wall_ns=5400000 (write phase) and
+kernel_median_wall_ns=150384000 (fsync) against fuse_median_wall_ns=78324000 and
+fuse_median_wall_ns=243671000.
+
+The write phase does **no device work at all on either arm** — kernel ext4 absorbs into
+page cache, we stage into the MVCC overlay — and it is where the biggest multiple lives:
+
+    kernel 5.400 ms   ours 78.324 ms   = 14.504x
+    64 FUSE write crossings of 1 MiB   = 1.224 ms per crossing  =  817 MB/s
+
+**1.224 ms to move 1 MiB through one FUSE write crossing.** That is the row's dominant
+loss and it is entirely ours: no device, no barriers, no journal difference, no transport
+artifact. The earlier profile of this row (`4d093101f`) already located the shape —
+`__memmove_avx_unaligned_erms` at **18.09%** of daemon CPU, the payload copied roughly five
+times end to end where the kernel copies it twice, of which the sharded flush's
+`Cow::into_owned` is **9.27%** and was explicitly left untaken because removing it needs a
+two-pass collect that re-resolves under the shard lock.
+
+⇒ **The census re-points this row at that copy chain and removes every competing
+explanation**: it is not amplification (1.000x), not barriers (we issue fewer), not
+request coalescing (one syscall), and not transport (symmetric loop-dio). The remaining
+`9.27%`-of-daemon-CPU `into_owned` and the rest of the five-copy chain are the whole
+attack surface, on a phase that is `78.3` of `322.0 ms` and loses `14.5x`.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row and the ratios are ISA-overstated. The total's
+CI is wide in this window (`[0.300712, 0.548075]`) because peer load moved the kernel arm's
+fsync from ~54 ms in earlier runs to 150 ms here; the WRITE-phase ratio is tight
+(`[0.065357, 0.074385]`) and the device counters are exact integers, so those carry the
+result. What this banks is the exact device census, the `1.000x` amplification, the
+half-barrier durability-class caveat, the single-syscall flush with its segment-limit
+explanation for `130`-vs-`54`, and the re-pointing of the row at the copy chain.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/mkbulk.sh
+    gcc -O2 -o $WORK/bulkwrite_ab scripts/perf/bulk_durable_write_ab/bulkwrite_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=bio1 FA_LABEL=ffsA FB_LABEL=ffsA2 \
+      FA_CPUS=18 FB_CPUS=19 bash scripts/perf/bulk_durable_write_ab/run_bulk_dio.sh
+    # per-phase device columns are w_/f_ {ios,sec,fl} in the CSV
+    WORK=<scratch> ELF=<ffs-cli> CHUNKS=64 TAG=b1 \
+      bash scripts/perf/bulk_durable_write_ab/bulk_trace.sh
