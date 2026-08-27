@@ -688,9 +688,56 @@ pub struct ShardedMvccStore {
     /// leaves this `false` — fixed policies never read the metrics, so recording
     /// them would just serialize otherwise-disjoint parallel commits.
     force_metrics_record: AtomicBool,
+    /// Reusable staging buffer for `flush_to_device_after`'s coalesced runs.
+    ///
+    /// A flush builds one contiguous buffer per run and drops it at the end, so a
+    /// 64 MiB flush hands 16,384 pages back to the allocator and faults every one
+    /// of them in again on the next flush. Counted 2026-08-27 on the bulk row:
+    /// ~25,000 minor faults per 64 MiB batch, and turning the reserve off raised
+    /// that to ~42,000 — the run buffer is the largest single source. Parking it
+    /// here and `clear()`ing means the pages are faulted once for the life of the
+    /// mount instead of once per flush.
+    ///
+    /// **Not a cache and not shared state** — it holds no data between flushes,
+    /// only capacity. Taken out under the lock and put back after the last device
+    /// write, so two concurrent flushes simply do not share it: the second finds
+    /// an empty slot and allocates, exactly as before.
+    flush_run_buf: Mutex<Vec<u8>>,
 }
 
+/// Largest run buffer parked for reuse in [`ShardedMvccStore::flush_run_buf`].
+///
+/// A buffer above this is dropped rather than kept, so one unusually large flush
+/// cannot pin memory for the process lifetime. 64 MiB is the largest single run
+/// the bulk-durable-write row produces, so the row that motivated the reuse is
+/// covered exactly.
+const FLUSH_RUN_BUF_KEEP_BYTES: usize = 64 * 1024 * 1024;
+
 impl ShardedMvccStore {
+    /// Take the parked run buffer, or a fresh empty one.
+    ///
+    /// Returns an EMPTY buffer either way — only capacity is carried across
+    /// flushes, never bytes — so a caller cannot observe a difference beyond the
+    /// allocation it did not have to make.
+    fn take_run_buf(&self) -> Vec<u8> {
+        if !crate::flush_buf_reuse_enabled() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *self.flush_run_buf.lock())
+    }
+
+    /// Park a run buffer for the next flush, dropping it if it is oversized.
+    ///
+    /// Clears before parking so no flush's bytes are visible to the next one;
+    /// `clear()` keeps the capacity, which is the entire point.
+    fn put_run_buf(&self, mut buf: Vec<u8>) {
+        if !crate::flush_buf_reuse_enabled() || buf.capacity() > FLUSH_RUN_BUF_KEEP_BYTES {
+            return;
+        }
+        buf.clear();
+        *self.flush_run_buf.lock() = buf;
+    }
+
     /// Create a new sharded store with the given shard count.
     ///
     /// A reasonable default is `min(num_cpus, 64)`.
@@ -753,6 +800,7 @@ impl ShardedMvccStore {
             adaptive_config: AdaptivePolicyConfig::default(),
             contention_metrics: RwLock::new(ContentionMetrics::default()),
             force_metrics_record: AtomicBool::new(false),
+            flush_run_buf: Mutex::new(Vec::new()),
         }
     }
 
@@ -1416,7 +1464,7 @@ impl ShardedMvccStore {
         let mut flushed = 0_usize;
         let mut run_start: Option<BlockNumber> = None;
         let mut run_next: u64 = 0;
-        let mut run_buf: Vec<u8> = Vec::new();
+        let mut run_buf: Vec<u8> = self.take_run_buf();
         // 2026-08-27: one `reserve` instead of a realloc chain. The longest possible run
         // is every block in `items`, and that total is already materialized, so
         // this cannot reserve more than the call is about to touch. Measured at
@@ -1441,6 +1489,7 @@ impl ShardedMvccStore {
         if let Some(start) = run_start.take() {
             device.write_contiguous_blocks(cx, start, &run_buf)?;
         }
+        self.put_run_buf(run_buf);
         if flushed > 0 {
             device.sync(cx)?;
         }
@@ -1483,7 +1532,7 @@ impl ShardedMvccStore {
         let mut flushed = 0_usize;
         let mut run_start: Option<BlockNumber> = None;
         let mut run_next: u64 = 0;
-        let mut run_buf: Vec<u8> = Vec::new();
+        let mut run_buf: Vec<u8> = self.take_run_buf();
         if let Some(first) = keys.first().filter(|_| crate::flush_run_reserve_enabled()) {
             let shard = self.shards[self.shard_index(*first)].read();
             let block_len = shard
@@ -1534,6 +1583,7 @@ impl ShardedMvccStore {
         if let Some(start) = run_start.take() {
             device.write_contiguous_blocks(cx, start, &run_buf)?;
         }
+        self.put_run_buf(run_buf);
         if flushed > 0 {
             device.sync(cx)?;
         }

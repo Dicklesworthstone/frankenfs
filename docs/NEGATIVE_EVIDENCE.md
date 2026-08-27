@@ -14529,3 +14529,120 @@ Reproduce:
       FA_ENV="" FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" FA_LABEL=base FB_LABEL=noxattr \
       TAG=xf1 bash scripts/perf/readdir_stat_ab/run_multi.sh
     python3 scripts/perf/readdir_stat_ab/analyze.py <body.csv>
+
+## 2026-08-27 — the bulk write phase's memory churn, LOCATED to exactly one page fault per staged block: allocator tuning REJECTED at ≤0.4%, and my own flush-buffer-reuse lever REJECTED as a counted NULL at ≤0.7%
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/bulk_durable_write_ab/bulk_seq.sh` (perf mode), `fltcount.sh` and
+`chunkfault.sh` (new).** Provenance: in-process self-report
+`bench_evidence,binary_sha256=98fa982b00f996d55a8a0b183793493c50ca5c5732b251b40aee39541230c280`
+(profile) and
+`c2d83d25e6746bfc0ae3b4c1fbbe7d37ac5449ee47c1628e41fa25ac15c59e89` (the ELF carrying the
+new `FFS_MVCC_FLUSH_BUF_REUSE` arm),
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18.
+
+The bulk-durable-write row's loss is its **write phase**, banked at `14.504x` and previously
+established as `63.7%` daemon CPU — the one big row where WE are the cost. This profiles it
+and prices two candidate fixes.
+
+### Profile: a third of the write path is memory churn
+
+`perf record -F 4999 -g` on the daemon over the bulk workload, flat self-time:
+
+| family | self-time |
+| --- | --- |
+| page-fault + anonymous-page allocation (`clear_page_erms` 5.61, `do_anonymous_page` 2.15, `mod_memcg_lruvec_state` 1.86, `__lruvec_stat_mod_folio` 1.53, `handle_mm_fault` 1.35, `__handle_mm_fault` 1.26, `lock_vma_under_rcu` 0.97, `get_mem_cgroup_from_mm` 0.91, `asm_exc_page_fault` 0.84, `__alloc_frozen_pages_noprof` 0.84, `do_user_addr_fault` 0.82) | **~18.1%** |
+| `__memmove_avx_unaligned_erms` | 11.64% |
+| FUSE payload in (`copy_folio_from_iter_atomic` 5.52, `fuse_copy_fill` 0.95) | 6.47% |
+| jemalloc (`_rjem_je_edata_avail_remove` 1.00, `_rjem_je_edata_heap_remove` 0.84) | 1.84% |
+
+`perf record -e page-faults -g` then puts **`96.41%` of all daemon page faults inside
+`__memmove_avx_unaligned_erms`** — i.e. on the *destination* of a copy, first touch of
+freshly allocated staging memory.
+
+### Counted: exactly ONE fault per staged block, and the receive path is exonerated
+
+`chunkfault.sh` writes the same 64 MiB through the mount twice, once as 64 × 1 MiB and once
+as 16,384 × 4 KiB — same blocks staged, **256× different FUSE request count**:
+
+| client write size | FUSE write requests | minor faults | faults per 4 KiB block | faults per request |
+| --- | --- | --- | --- | --- |
+| 1 MiB | 64 | 34,437 (first) / **16,482** (repeat) | 2.102 / **1.006** | 538.08 / 257.53 |
+| 4 KiB | 16,384 | **17,073** | **1.042** | 1.04 |
+
+⭐ **Both shapes land at ~`1.0` faults per staged 4 KiB block while the request count differs
+by 256×.** The cost is per BLOCK STAGED, not per request — **fuser's receive buffer is
+exonerated** (it is allocated once per worker loop, not per request). Scaling confirms
+linearity: 3 / 6 / 12 rounds → 84,718 / 152,944 / 316,504 faults.
+
+**Located:** `crates/ffs-core/src/lib.rs:25823`, `data[data_start..data_start + chunk_len]
+.to_vec()` — one fresh `Vec<u8>` per 4 KiB block, **16,384 allocations per 64 MiB batch**,
+each landing on an unfaulted page that the kernel zeroes and we immediately overwrite.
+
+### ⛔ REJECT 1 — allocator tuning is not the lever (counted, ≤0.4%)
+
+| `MALLOC_CONF` | minor faults / 6 rounds |
+| --- | --- |
+| (default) | 151,587 |
+| `retain:true` | 151,096 |
+| `dirty_decay_ms:-1,muzzy_decay_ms:-1` | 151,582 |
+| both | 151,663 |
+
+Spread **`0.37%`**. This reproduces the banked "jemalloc decay tuning is a NULL on every
+phase" and upgrades it from a wall-clock null to a **counted** one: the pages are not being
+returned to the kernel and re-acquired, so no decay or retain policy can matter.
+
+### ⛔ REJECT 2 — `FFS_MVCC_FLUSH_BUF_REUSE`, my own lever, is a counted NULL (≤0.7%)
+
+Reasoning that a 64 MiB flush frees 16,384 pages and re-faults them next flush, I added
+`ShardedMvccStore::flush_run_buf` — the coalescing run buffer parked and `clear()`ed instead
+of dropped (capacity only, never bytes; capped at `FLUSH_RUN_BUF_KEEP_BYTES` = 64 MiB), used
+by both flush paths, behind `FFS_MVCC_FLUSH_BUF_REUSE`, default OFF.
+
+| arm | minor faults / 6 rounds |
+| --- | --- |
+| `=0` | 151,825 / 152,655 |
+| `=1` | 152,921 / 152,384 |
+
+Spread **`0.72%`**, no separation, signs disagree between the repeats. **REJECTED.** The run
+buffer is not a fault source: it is a same-size alloc/free cycle the allocator already
+recycles, which is also why REJECT 1 came out flat. The lever was aimed at the wrong 65%.
+
+The code stays, default OFF and documented as a measured null, so the next person prices it
+from one ELF instead of re-deriving the same wrong hypothesis. `cargo test -p ffs-mvcc`
+**549 passed / 0 failed** with the knob both ways; `fmt`/`check`/`clippy` clean on
+`ffs-mvcc`.
+
+### ⛔ NOT MEASURED this turn: no wall-clock arm, and why
+
+`loadavg 97.91` at the time of the run (`uptime`), with the bulk rig's own totals swinging
+`149 ms → 454 ms` across identical configurations. **No wall-clock ratio is admissible in
+that window and none is claimed.** Both rejects above rest on counted mechanism, which is
+the form the ledger's REJECT standard accepts precisely for this case. The fault counters
+are per-process and load-insensitive; the timings printed alongside them are NOT, and must
+not be read as ratios.
+
+### What this leaves
+
+The write phase's memory churn is **one page fault + one 4 KiB allocation per staged
+block**, and neither the allocator nor the flush buffer can touch it. The only lever that
+can is the one already named and still not taken: **make the staged block share the write's
+payload allocation** — a `Arc<[u8]>` (or equivalent) plus a range, so a 1 MiB write stages
+256 blocks from ONE allocation instead of 256. That is an MVCC data-type change across
+`stage_write_with_proof`, the version store and both flush paths, and it is the honest next
+step for this row rather than another peripheral knob.
+
+### Transferable
+
+  * ⭐⭐ **Vary the request size while holding the work constant to separate per-request from
+    per-unit costs.** 64 requests and 16,384 requests staging the same 64 MiB produced the
+    same fault count; that one comparison exonerated the entire receive path and pinned the
+    cost to the staging allocation.
+  * ⭐ **`perf record -e page-faults` attributes faults to the faulting instruction, and a
+    memcpy destination is the classic answer.** `96.41%` in one symbol turned "memory is
+    expensive here" into a specific allocation site.
+  * ⭐ **Price your own lever with the same counter you used to justify it.** The
+    fault-count hypothesis that motivated the buffer reuse also killed it, before any wall
+    clock was involved and in a window where the wall clock was worthless.

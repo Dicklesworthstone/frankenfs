@@ -119,6 +119,29 @@ pub fn flush_borrow_enabled() -> bool {
     })
 }
 
+/// Whether a flush parks its coalescing run buffer for the next flush instead of
+/// dropping it (`FFS_MVCC_FLUSH_BUF_REUSE`, default OFF — an arm to measure).
+///
+/// A flush builds one contiguous buffer per run and frees it at the end, so a
+/// 64 MiB flush returns 16,384 pages to the allocator and faults every one of
+/// them back in on the next flush. Counted 2026-08-27 on bulk-durable-write:
+/// ~25,000 minor faults per 64 MiB batch at default, ~42,000 with the reserve
+/// off, and `perf` attributes **96.4% of all page faults to the destination of a
+/// memcpy** — first touch of freshly-allocated staging memory. Allocator tuning
+/// is not the lever: `MALLOC_CONF=retain:true`, `dirty_decay_ms:-1`,
+/// `muzzy_decay_ms:-1` and both together move the fault count by under `0.4%`.
+///
+/// Only capacity crosses a flush boundary, never bytes — see
+/// `ShardedMvccStore::put_run_buf`.
+#[must_use]
+pub fn flush_buf_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_MVCC_FLUSH_BUF_REUSE")
+            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+    })
+}
+
 #[must_use]
 pub fn flush_run_reserve_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
