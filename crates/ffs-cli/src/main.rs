@@ -2989,7 +2989,7 @@ fn bench_evidence_cmd() -> Result<()> {
     print_codegen_isa();
     println!(
         "build_profile,pgo_profile_sha256={}",
-        option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+        env!("FFS_PGO_PROFILE_SHA256")
     );
     Ok(())
 }
@@ -3618,7 +3618,7 @@ fn read_pool_cutover_gate_cmd(fixture: &Path, blocks: usize, rounds: usize) -> R
     print_codegen_isa();
     println!(
         "build_profile,pgo_profile_sha256={}",
-        option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+        env!("FFS_PGO_PROFILE_SHA256")
     );
 
     if rounds < 5 {
@@ -8015,7 +8015,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         eprintln!("mount_bench_evidence,binary_sha256={sha}");
         eprintln!(
             "mount_build_profile,pgo_profile_sha256={}",
-            option_env!("FFS_PGO_PROFILE_SHA256").unwrap_or("none")
+            env!("FFS_PGO_PROFILE_SHA256")
         );
         // Effective values of the runtime knobs a same-window
         // candidate-vs-candidate A/B may vary (bd-3tqgc), each resolved through
