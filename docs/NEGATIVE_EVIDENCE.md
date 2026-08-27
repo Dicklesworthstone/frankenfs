@@ -16196,3 +16196,82 @@ passing; this entry adds no new ratio and explicitly refuses one.
 Reproduce (device-read census):
 
     WORK=<scratch> ELF=<ffs-cli> bash scripts/perf/create_delete_storm_ab/readcount.sh base
+
+## 2026-08-27 — ⛔ REJECT: zero-message open is INERT on the create/delete storm (balanced `1.008142x`, `crossings_release` unchanged at 50,000) — `FUSE_NO_OPEN_SUPPORT` cannot suppress a RELEASE for a file opened by CREATE
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=81a4e5ab3ba280b204ae1e5c31ec8345cf5869115b83f208ef755dc279bd420d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8, every arm on
+its own loop device with `--direct-io=on`.
+
+The storm's residual is the round trip over `~500,000` crossings, of which `release` (50,000)
+plus `flush` (50,000) are `20%`. `FFS_FUSE_ZERO_MESSAGE_OPEN` removed **both** `open` and
+`release` on the parallel-read row — `crossings_open` `6,400 → 4`, `crossings_release`
+`6,400 → 0`, worth a balanced `1.160389x` — so it is the obvious candidate for the `release`
+half here. Both arms carry `FFS_FUSE_XATTR_NO_SUPPORT=1` so the audit confound cannot mask
+the result, per the re-test rule.
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+24 rounds × 2,000 create+delete pairs, four arms simultaneously, order rotated per round,
+forward and mirrored with arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `supp/suppZmo` (inverted to >1 = knob faster) | `1.011243` `[0.983041, 1.036705]` | `1.005051` `[0.986259, 1.024989]` | **`1.008142x`** |
+| A/A null `k1/k2` | `1.015341` `[0.991040, 1.043915]` **PASS** | `1.016332` `[0.999342, 1.028388]` **PASS** | `1.015836` |
+
+**The effect (`0.8%`) is SMALLER than the null (`1.6%`). NULL.** Absolutes:
+kernel_median_wall_ns=93933000 and kernel_median_wall_ns=89521000 against
+fuse_median_wall_ns=372736000 / fuse_median_wall_ns=385305000 (forward) and
+fuse_median_wall_ns=405744000 / fuse_median_wall_ns=405785000 (mirrored). All CIs are
+20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+### The counted mechanism says why, exactly
+
+| counter | base (suppressed) | `+ ZERO_MESSAGE_OPEN=1` |
+| --- | ---: | ---: |
+| `crossings_open` | **0** | **0** |
+| `crossings_release` | **50,000** | **50,000** |
+| `op_counts create` / `release` / `flush` | 50,000 / 50,000 / 50,000 | 50,000 / 50,000 / 50,000 |
+| `crossings_total` | 545,551 | 544,102 (`0.27%`, noise) |
+
+⭐⭐ **The storm never sends OPEN.** `crossings_open` is `0` in both arms: every file is opened
+by the **atomic `CREATE`**, which returns its own `fh`. `FUSE_NO_OPEN_SUPPORT` is a capability
+for the OPEN opcode, so on this row it has nothing to suppress — and the kernel still sends
+`RELEASE` for a handle that CREATE produced.
+
+⇒ **Scope rule: `FUSE_NO_OPEN_SUPPORT` removes the open/release PAIR only for files opened via
+OPEN. A file opened by CREATE keeps its RELEASE.** The parallel-read row's `1.160389x` does
+not generalise to create-heavy rows, and the `50,000` releases on the storm are not reachable
+this way.
+
+### Transferable
+
+  * ⭐⭐ **A capability negotiated for one opcode cannot remove a different opcode's traffic,
+    even when the two normally arrive as a pair.** `open`/`release` look inseparable until a
+    row opens files some other way; then the census shows one of them alone.
+  * ⭐ **Check that the targeted opcode is even PRESENT before running the lever.**
+    `crossings_open = 0` in the control arm settled this before any wall clock did — one
+    census line would have predicted the null.
+  * This is the third lever re-tested under suppression per the confound rule: parent
+    invalidation became **decidable** (`1.017298x` → `1.065465x`), the FLUSH re-test was
+    **window-refused**, and this one is a **clean NULL**. The rule finds real changes and
+    also confirms rejections; it is not a way to resurrect levers.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored, both halves passing.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=supp FB_LABEL=suppZmo \
+      FA_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" \
+      FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1 FFS_FUSE_ZERO_MESSAGE_OPEN=1" TAG=sz1 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
