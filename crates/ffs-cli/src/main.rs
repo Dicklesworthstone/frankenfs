@@ -10930,6 +10930,22 @@ mod tests {
         image
     }
 
+    fn build_test_ext4_image_with_internal_journal_feature() -> Vec<u8> {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let mut image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        let sb_off = ffs_types::EXT4_SUPERBLOCK_OFFSET;
+        let compat = u32::from_le_bytes(
+            image[sb_off + 0x5C..sb_off + 0x60]
+                .try_into()
+                .expect("feature field has four bytes"),
+        );
+        image[sb_off + 0x5C..sb_off + 0x60].copy_from_slice(
+            &(compat | ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL.0).to_le_bytes(),
+        );
+        image[sb_off + 0xE0..sb_off + 0xE4].copy_from_slice(&8_u32.to_le_bytes());
+        image
+    }
+
     fn build_test_btrfs_superblock(bytenr: u64, generation: u64) -> Vec<u8> {
         let mut sb = vec![0_u8; super::BTRFS_SUPER_INFO_SIZE];
         sb[0x40..0x48].copy_from_slice(&ffs_types::BTRFS_MAGIC.to_le_bytes());
@@ -13630,6 +13646,36 @@ mod tests {
             open_options.btrfs_mount_selection,
             BtrfsMountSelection::DefaultRoot
         );
+    }
+
+    #[test]
+    fn journalled_ext4_rw_mount_refuses_the_unwired_jbd2_path() {
+        let image = build_test_ext4_image_with_internal_journal_feature();
+        with_temp_image_path(&image, |path| {
+            let cx = Cx::for_testing();
+            let fs = OpenFs::open_with_options(
+                &cx,
+                path,
+                &OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("journalled ext4 image should open for mount validation");
+
+            assert!(fs.is_ext4());
+            assert!(!fs.has_jbd2_writer());
+            let error = require_jbd2_durability_for_mount(&fs, true)
+                .expect_err("rw journalled ext4 must not bypass the JBD2 durability path");
+            assert!(
+                error
+                    .to_string()
+                    .contains("no active JBD2 durability writer"),
+                "unexpected rejection: {error:#}"
+            );
+            require_jbd2_durability_for_mount(&fs, false)
+                .expect("read-only journalled ext4 never writes and remains valid");
+        });
     }
 
     /// bd-btrfs-no-read-side-csum-verify-xu3m6: `ffs-core` has verified btrfs
