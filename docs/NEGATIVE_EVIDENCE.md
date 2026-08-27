@@ -14892,3 +14892,104 @@ Reproduce:
       FA_LABEL=base FB_LABEL=spin FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000" TAG=xf \
       bash scripts/perf/xattr_ab/run_xattr.sh
     python3 scripts/perf/xattr_ab/xanalyze.py <body.csv>
+
+## 2026-08-27 — the capability probe's call site, PROVEN by kernel stack: `__audit_inode → audit_copy_inode → get_vfs_caps_from_disk`, caused by THIS HOST's audit rules — and `FFS_FUSE_XATTR_NO_SUPPORT` is correctly REFUSED on the xattr row by its own gate
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/xattr_ab/bpfprobe.sh` (new) and `run_xattr.sh`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=31652ce23e7d88b6b4b7133adc9fdc5e6f433090dc6cd86c3203333546f13d38`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18, client on cpu8.
+
+Five rows have now been explained by "the Linux audit `security.capability` probe" without
+anyone naming the call site. `bpftrace -e 'kprobe:fuse_getxattr { @[kstack(12), str(arg1)] =
+count(); }'` names it.
+
+### The stack, and the counts that match the census exactly
+
+    fuse_getxattr
+    __vfs_getxattr
+    get_vfs_caps_from_disk        <-- reads security.capability off the filesystem
+    audit_copy_inode              <-- AUDIT copies inode identity into the audit context
+    __audit_inode
+    filename_lookup               <-- on EVERY path resolution
+    path_getxattrat / path_listxattrat
+    __x64_sys_getxattr / __x64_sys_listxattr
+
+| xattr name | stack | count (3,020 reports) | per report |
+| --- | --- | --- | --- |
+| `security.capability` | via `path_getxattrat` | 9,060 | 3 |
+| `security.capability` | via `path_listxattrat` | 6,040 | 2 |
+| `user.inline` | direct `vfs_getxattr` | 3,020 | 1 |
+| `user.external` | direct `vfs_getxattr` | 3,020 | 1 |
+
+**`15,100` capability probes = exactly `5.000` per report, one per path-based syscall**, and
+the real xattr reads arrive by a stack with no `audit_` frame in it at all. This is the
+counted mechanism the five banked rows were missing.
+
+### ⭐⭐ The cause is this host's AUDIT RULES, and it is not FrankenFS-related
+
+Read-only inspection, `auditctl -s` and `auditctl -l`:
+
+    enabled 1        pid 2890 (auditd)
+    -w /data/projects -p wa -k data_projects_writes
+    -a always,exit -F arch=b64 -S rename,rmdir,unlink,unlinkat,renameat,renameat2 \
+       -F dir=/data/projects/ -F success=1 -F key=data_projects_destruct
+
+Those are the workspace's own guard rails. **Any enabled rule gives every task an audit
+context, so `__audit_inode` fires on every path resolution regardless of whether the path is
+under the watched directory** — the rig's mountpoints are in `$HOME` and are watched by
+nothing, and they are probed all the same.
+
+⚠ **This is an admissibility caveat on every banked read-side ratio, not a retraction.** The
+numbers are real on this host. But `get_vfs_caps_from_disk` costs kernel ext4 a read of an
+already-cached in-memory inode xattr and costs FrankenFS a **FUSE round trip**, so an audited
+host amplifies the FUSE side specifically. Every read-side ratio in this ledger is therefore
+a function of the host's audit configuration as well as of the filesystem, and a deployment
+without audit rules would measure a materially smaller gap. No row is withdrawn; the caveat
+is now stated with the call site that justifies it.
+
+### ⛔ REFUSED, not a null: `FFS_FUSE_XATTR_NO_SUPPORT=1` on the xattr row
+
+The obvious move — apply the knob that took five read-only rows to parity — was run as a
+fourth arm and produced `k1/noget = 0.110546` against `k1/base = 0.114610`, which looks like
+a tiny effect. **It is not an effect at all.** Checked before reporting:
+
+| check | base arm | `=1` arm |
+| --- | --- | --- |
+| `crossings_total` | 480,206 | **480,206** |
+| `crossings_getxattr` | 384,161 | **384,161** |
+| cross-arm digest parity | PASS | PASS (all four arms identical) |
+| gate verdict | `capability_shortcircuit=refused, presence=not_scanned` | `capability_shortcircuit=refused, **presence=present**` |
+
+The knob was read, the image was scanned, xattrs were found, and **suppression was correctly
+refused** — a mount cannot answer "no xattr support" for an image full of `user.*` xattrs.
+The arm was the control, so no ratio from it is admissible and none is claimed.
+
+⭐ **This is the gate working, and it settles the row's status.** "The audit half is
+inapplicable here" was previously an argument; it is now an OBSERVED refusal with the gate's
+own reason. There is no configuration in which this row's `50.0%` audit half can be removed,
+because the only mechanism that removes it requires proving the image has no xattrs and this
+image demonstrably has them.
+
+### Method note
+
+Two commits ago an env var the process never read produced a perfect meaningless null. This
+turn the same shape appeared again — a knob whose arm resolved to the control — and was
+caught **before** publication by reading the crossing census and the gate's evidence line
+first. The rule is holding: *a null needs the "did the knob reach the code" proof as much as
+a win does.* Here the code answered explicitly, which is what an evidence line is for.
+
+### Transferable
+
+  * ⭐⭐⭐ **`bpftrace -e 'kprobe:<fn> { @[kstack(12), str(argN)] = count(); }'` turns "some
+    external thing is doing this" into a call site and an exact count in one command.** Five
+    rows carried "the audit probe" as a name for a year of guesses; one kprobe produced the
+    stack, the caller, and `5.000` per report.
+  * ⭐⭐ **A benchmark host's security configuration is part of the measurement.** Audit rules
+    added for workspace safety silently multiply every FUSE metadata row. Record
+    `auditctl -s`/`-l` alongside the governor and the CPU placement.
+  * ⭐ **A refusal is not a null.** Report the gate's verdict, not the ratio its refused arm
+    produced.
