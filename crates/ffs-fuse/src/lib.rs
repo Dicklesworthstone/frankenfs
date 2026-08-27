@@ -4596,6 +4596,65 @@ pub fn write_inode_invalidation_enabled() -> bool {
     })
 }
 
+/// Per-opcode request counts, indexed by `RequestOp::as_index()`.
+///
+/// The scalar `requests_total` cannot say WHICH operations a workload issued, so a row
+/// like the create/delete storm (~15 FUSE round trips per create+unlink pair) can only be
+/// profiled by guessing or by attaching bpftrace. Counted here instead: one relaxed
+/// fetch_add on a path that is already crossing a FUSE boundary and taking an MVCC scope.
+/// Reported at destroy under FFS_OP_COUNTS=1.
+pub static OP_COUNTS: [std::sync::atomic::AtomicU64; ffs_core::vfs::RequestOp::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ffs_core::vfs::RequestOp::COUNT];
+
+/// Render the per-opcode counts as `name=count` pairs, omitting operations that never
+/// ran so a storm's profile is not buried in thirty zeroes.
+pub fn op_counts_report() -> String {
+    use ffs_core::vfs::RequestOp as R;
+    const NAMES: [(R, &str); R::COUNT] = [
+        (R::Getattr, "getattr"),
+        (R::Statfs, "statfs"),
+        (R::Getxattr, "getxattr"),
+        (R::Lookup, "lookup"),
+        (R::Listxattr, "listxattr"),
+        (R::Flush, "flush"),
+        (R::Fsync, "fsync"),
+        (R::Fsyncdir, "fsyncdir"),
+        (R::Open, "open"),
+        (R::Release, "release"),
+        (R::Opendir, "opendir"),
+        (R::Read, "read"),
+        (R::Readdir, "readdir"),
+        (R::Readlink, "readlink"),
+        (R::Lseek, "lseek"),
+        (R::Create, "create"),
+        (R::Mkdir, "mkdir"),
+        (R::Unlink, "unlink"),
+        (R::Rmdir, "rmdir"),
+        (R::Rename, "rename"),
+        (R::Link, "link"),
+        (R::Symlink, "symlink"),
+        (R::Fallocate, "fallocate"),
+        (R::Setattr, "setattr"),
+        (R::Setxattr, "setxattr"),
+        (R::Removexattr, "removexattr"),
+        (R::Write, "write"),
+        (R::RepairWriteback, "repair_writeback"),
+        (R::IoctlRead, "ioctl_read"),
+        (R::IoctlWrite, "ioctl_write"),
+    ];
+    let mut out = String::new();
+    for (op, name) in NAMES {
+        let n = OP_COUNTS[op.as_index()].load(std::sync::atomic::Ordering::Relaxed);
+        if n != 0 {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&format!("{name}={n}"));
+        }
+    }
+    out
+}
+
 /// bd-pmjvd: how many notifications were actually ENQUEUED, so a futex wake on the
 /// notify thread can be tied to a real send or shown to have no send behind it.
 /// Reported by `ffs-cli` at unmount when FFS_NOTIFY_SEND_COUNT=1.
@@ -5264,6 +5323,9 @@ impl Filesystem for FrankenFuse {
         // bd-pmjvd: report the ENQUEUE counts so a notify-thread futex wake can be
         // tied to a real send. WARN so it survives RUST_LOG=off runs, and only when
         // asked for, so no normal mount pays a line for it.
+        if std::env::var("FFS_OP_COUNTS").is_ok_and(|v| v.trim() == "1") {
+            warn!(counts = %op_counts_report(), "op_counts");
+        }
         if std::env::var("FFS_NOTIFY_SEND_COUNT").is_ok_and(|v| v.trim() == "1") {
             warn!(
                 entry_sends = NOTIFY_ENTRY_SENDS.load(std::sync::atomic::Ordering::Relaxed),

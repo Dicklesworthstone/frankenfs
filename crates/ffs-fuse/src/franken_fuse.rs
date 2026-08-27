@@ -3040,6 +3040,10 @@ impl FrankenFuse {
     where
         F: FnOnce(&Cx, &mut RequestScope) -> ffs_error::Result<T>,
     {
+        // Per-opcode census (see crate::OP_COUNTS). This is the one choke point every
+        // request passes through -- the getxattr memo used to return BEFORE it, which is
+        // why requests_total once read 22 for 6,001 stats, fixed in bdd0fd1b.
+        crate::OP_COUNTS[op.as_index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // bd-2i2ez: everything that is not a WRITE observes, so it commits the
         // outstanding batch first. `has_outstanding` makes this one relaxed load
         // when batching is off or nothing is staged.
