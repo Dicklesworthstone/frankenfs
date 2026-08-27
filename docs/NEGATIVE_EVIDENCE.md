@@ -18062,3 +18062,67 @@ picking the story that flatters the ladder. **A crossing count is an exact mecha
 floor; it is NOT a time predictor on this row.**
 
 Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-4iqg6: the contradiction I refused to resolve last entry is now MEASURED — FUSE `RELEASE` is asynchronous, so `dispatch_ns` over-weights it by `13.0%` of the daemon's total; correcting for it cuts the lever-vs-lever disagreement from `1.63x` to `0.81x` but OVERSHOOTS, so blocking-crossing count is a better predictor and still not a time model
+
+The previous entry published a contradiction rather than a story: removing a getxattr crossing bought
+~1.6x more wall time than removing an open/release one, while the daemon's own `dispatch_ns` ranked
+getxattr as the CHEAPER crossing. I wrote that either `dispatch_ns` misses where a probe's cost lands,
+or crossings are not uniform-cost, and declined to pick. This entry measures it, with a COUNT.
+
+**Instrument.** `scripts/perf/parallel_read_ab/blockprobe.c` counts
+`getrusage(RUSAGE_SELF).ru_nvcsw` — VOLUNTARY context switches — across a fixed open/read/close loop
+over 256 files. A crossing the client must WAIT on costs one voluntary switch (the client sleeps until
+the daemon replies); a background crossing the kernel does not wait for costs none. Single-threaded on
+purpose so the count is attributable rather than smeared across a thread pool, and warm-up is outside
+the counted region. Driven through `crossing_ladder.sh` (`BLOCKPROBE=1`), one config per mount
+lifetime. ELF `7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug — a
+context-switch count, like a crossing count, is a property of the protocol path and not of codegen; no
+wall time is claimed from it). `hostname=thinkstation1`.
+
+| config | crossings/file | `nvcsw`/file | blocking removed |
+|---|---|---|---|
+| base | `7.031` | **`5.988`** | — |
+| `ZERO_MESSAGE_OPEN` (−open, −release) | `5.027` | **`4.988`** | **`1.000`** |
+| `XATTR_NO_SUPPORT` (−getxattr) | `6.027` | **`4.988`** | `1.000` |
+| `NO_FLUSH` (−flush) | `6.031` | **`4.988`** | `1.000` |
+| all three | `3.023` | **`2.984`** | `3.004` |
+
+**FINDING: `RELEASE` is asynchronous, measured rather than asserted.** Zero-message open removes TWO
+crossings per file (`open` and `release`) but only ONE voluntary context switch. The other three knobs
+each remove one crossing and one switch. So of the four scaffolding crossings a file read pays, three
+block the client and `release` does not.
+
+**The instrument validates against the census internally.** `(crossings − release)/file` =
+`7.031 − 1.004` = `6.027`, against a measured `nvcsw/file` of `5.988` — **agreeing to 0.6%**, with no
+fitted parameter. Determinism, two independent full-ladder runs: `1533`, `1277`, `1277`, `1277`,
+`765`/`764` — four bit-exact, the fifth off by one.
+
+**CONSEQUENCE, and it is general: `dispatch_ns` systematically over-weights asynchronous opcodes.**
+It attributes **19.02 ms of 146.36 ms — 13.0% of the daemon's whole measured dispatch cost — to
+`RELEASE`, which no client ever waits for.** That is real daemon work and it is invisible to the
+client, so a row that ranks targets by `dispatch_ns` will over-value async opcodes. This is not
+specific to this row; any ledger entry that picked a target by per-opcode `dispatch_ns` inherits the
+bias, and the fix is to rank by BLOCKING crossings.
+
+**The reconciliation is PARTIAL and it OVERSHOOTS — stating that rather than banking the clean half.**
+Of the 8-thread run's 26,329 crossings, 6,400 are `RELEASE`, leaving 19,929 blocking (75.7%).
+Re-normalised, the two measured levers remove almost exactly the same share of BLOCKING crossings —
+zero-message open `32.1%`, xattr suppression `32.2%` — yet bought `13.82%` and `11.30%` of wall time.
+
+| normalisation | zero-message open | xattr suppression | disagreement |
+|---|---|---|---|
+| per 1% of RAW crossings | `0.284` | `0.463` | **`1.63x`** |
+| per 1% of BLOCKING crossings | `0.431` | `0.350` | **`0.81x`** |
+
+The disagreement shrinks from 63% to 19% **but flips sign**: the correction does not merely close the
+gap, it crosses it. Blocking-crossing count is therefore a materially BETTER predictor than raw
+crossing count and still **not** a time model — ~20% of the effect remains unexplained by either. A
+likely contributor I have not measured: these wall-time figures come from 8-thread runs where blocked
+client threads overlap, so the wall-time price of a blocking crossing is lower than the
+single-threaded probe implies, and need not be equal across opcodes.
+
+**Status.** The contradiction is explained in mechanism (async `RELEASE`, and a measurement bias in
+`dispatch_ns`) and only partly closed in magnitude. Nothing shipped, nothing reverted. What changed is
+that "rank opcodes by `dispatch_ns`" is now a known-biased method with a measured size for the bias,
+and there is a deterministic instrument for the unbiased quantity.

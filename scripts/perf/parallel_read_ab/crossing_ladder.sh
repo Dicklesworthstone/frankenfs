@@ -64,7 +64,13 @@ run_cfg() {  # $1=label $2=env
   done
   if [ "$up" != "1" ]; then echo "$1: mount never came up"; tail -5 "$log"; return 1; fi
 
-  "$W/pread_ab" "$ROUNDS" "$THREADS" "$CPUBASE" "$pid" "solo=$MNT" > "$W/ladder-$1.csv" 2>/dev/null || true
+  if [ "${BLOCKPROBE:-0}" = "1" ]; then
+    # bd-4iqg6: count VOLUNTARY context switches per file instead of timing, to
+    # separate crossings the client waits on from background ones.
+    taskset -c "$CPUBASE" "$W/blockprobe" "$MNT" "${NFILES:-256}"
+  else
+    "$W/pread_ab" "$ROUNDS" "$THREADS" "$CPUBASE" "$pid" "solo=$MNT" > "$W/ladder-$1.csv" 2>/dev/null || true
+  fi
 
   fusermount3 -u "$MNT" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
