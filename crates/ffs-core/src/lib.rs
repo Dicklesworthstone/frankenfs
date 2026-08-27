@@ -13171,20 +13171,33 @@ impl OpenFs {
             trace!(target: "ffs::ext4::rw", guard = "not_ext4", "gdt_fp_none");
             return None;
         }
+        // bd-rmug7: the sharded path is the PRODUCTION path on a plain `--rw` mount,
+        // so declining here made this whole lever inert. Fingerprint the same source
+        // the persist itself uses on that path -- the RECONCILED per-group stats --
+        // rather than `alloc.groups`, which is stale while sharded is active because
+        // sharded creates debit the per-group records and the on-disk GDs, not that
+        // array (bd-bhh0i / bd-y2t0r).
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        if self.bhh0i_sharded_ops_active() {
-            trace!(target: "ffs::ext4::rw", guard = "sharded_active", "gdt_fp_none");
-            return None;
-        }
+        let sharded_groups = if self.bhh0i_sharded_ops_active() {
+            let sharded = self.ext4_sharded_alloc.as_ref()?;
+            let live = self.ext4_single_lock_group_counts();
+            Some(sharded.reconciled_group_stats(&live))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let sharded_groups: Option<Vec<GroupStats>> = None;
+
         let Ok(alloc_mutex) = self.require_alloc_state() else {
             trace!(target: "ffs::ext4::rw", guard = "no_alloc_state", "gdt_fp_none");
             return None;
         };
         let alloc = alloc_mutex.read();
+        let groups: &[GroupStats] = sharded_groups.as_deref().unwrap_or(&alloc.groups);
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        alloc.groups.len().hash(&mut hasher);
-        for gs in &alloc.groups {
+        groups.len().hash(&mut hasher);
+        for gs in groups {
             gs.free_blocks.hash(&mut hasher);
             gs.free_inodes.hash(&mut hasher);
             gs.used_dirs.hash(&mut hasher);
