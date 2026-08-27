@@ -3595,6 +3595,16 @@ struct ReaddirplusAttrMemo {
     /// and preserving the subsystem lock-ordering invariant documented on
     /// `FuseInner`.
     state: Mutex<Box<[ReaddirplusMemoEntry]>>,
+    /// How many slots currently hold an entry.
+    ///
+    /// Exists so `clear()` can answer "there is nothing to clear" without taking
+    /// the lock or touching the table. `clear()` runs on EVERY mutation, while a
+    /// mutating workload may never issue a readdirplus at all — the create/delete
+    /// storm issues 0.080 readdir per create+unlink pair — so the common case is
+    /// wiping a table that has been empty since mount. Profiled as the single
+    /// largest FrankenFS symbol on that row at 1.02% of daemon CPU, and the cost
+    /// is O(slots) plus a lock acquire, both paid for nothing.
+    occupied: std::sync::atomic::AtomicUsize,
     enabled: bool,
 }
 
@@ -3603,6 +3613,7 @@ impl ReaddirplusAttrMemo {
         let len = slots.max(1).next_power_of_two();
         Self {
             state: Mutex::new(vec![None; len].into_boxed_slice()),
+            occupied: std::sync::atomic::AtomicUsize::new(0),
             enabled,
         }
     }
@@ -3656,6 +3667,10 @@ impl ReaddirplusAttrMemo {
             return;
         };
         let idx = self.slot(ino, state.len());
+        if state[idx].is_none() {
+            self.occupied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         state[idx] = Some((ino, attr.generation, attr.clone()));
     }
 
@@ -3679,6 +3694,8 @@ impl ReaddirplusAttrMemo {
             {
                 let attr = attr.clone();
                 state[idx] = None;
+                self.occupied
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 Some(attr)
             }
             _ => None,
@@ -3698,6 +3715,8 @@ impl ReaddirplusAttrMemo {
         let idx = self.slot(ino, state.len());
         if matches!(&state[idx], Some((slot_ino, _, _)) if *slot_ino == ino) {
             state[idx] = None;
+            self.occupied
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -3709,10 +3728,24 @@ impl ReaddirplusAttrMemo {
     /// seam. Clearing this bounded, single-use table is therefore the only
     /// sound answer until the next readdirplus rebuilds its hand-offs.
     fn clear(&self) {
+        // Two early exits, both for work that provably cannot be needed:
+        //   - a DISABLED memo holds nothing, yet the old code still locked and
+        //     wiped the table on every mutation;
+        //   - an EMPTY memo has nothing to wipe, which is the steady state on any
+        //     workload that does not issue readdirplus.
+        // Relaxed is sufficient: a concurrent insert that this load misses is one
+        // whose own `clear()` ordering the caller was already racing, and the memo
+        // is a single-use hand-off whose miss costs a re-read, never a wrong answer.
+        if !self.enabled
+            || self.occupied.load(std::sync::atomic::Ordering::Relaxed) == 0
+        {
+            return;
+        }
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         state.fill(None);
+        self.occupied.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
