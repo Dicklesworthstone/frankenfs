@@ -13294,3 +13294,154 @@ Reproduce:
 
     WORK=<scratch> ELF=<ffs-cli> OPS=2000 TAG=t1 \
       bash scripts/perf/create_delete_storm_ab/storm_trace.sh
+
+## 2026-08-27 — the storm's 90.7% has no filesystem-side lever: the mutating handlers are 0.46% of daemon CPU, and zero-message open is STRUCTURALLY INERT here (counted, byte-identical census)
+
+**Run 2026-08-27, thinkstation1, hand rig `scripts/perf/create_delete_storm_ab/`.**
+Provenance: in-process self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on cpu18/cpu19, every arm on its own loop device
+`--direct-io=on`, kernel 6.17.0-41-generic.
+
+The ext4 create/delete storm is the worst standing number (`5.58`-`6.24x`). Its two fsync
+phases are now fully attributed and closed (no journal ⇒ scattered in-place metadata; the
+coalescing lever was rejected last commit). This digs the other **90.7%** — the create and
+delete phases, which the per-phase census proved touch the device **zero** times on both
+arms.
+
+### 2026-08-27 — the crossing budget, per create+delete pair
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.999481` bootstrap median CI `[0.981414, 1.009510]` (candidate),
+both from 20000 resamples over 32 paired per-round ratios on this same rig and ELF.
+
+Per-opcode dispatch census over 33 batches = 66,000 create+delete pairs. `RCH_WORKER=none`,
+`hostname=thinkstation1`. Same-invocation A/A null controls for this rig and ELF:
+kernel `0.999663` bootstrap median CI `[0.986268, 1.011319]`, candidate on the fsync phases
+`0.999481` and `1.008302`, 20000 resamples.
+
+| opcode | crossings / pair | dispatch µs / crossing |
+| --- | --- | --- |
+| `getxattr` (audit `security.capability`) | **4.001** | 2.541 |
+| `getattr` | 2.935 | 3.150 |
+| `lookup` | 2.000 | 4.915 |
+| `create` + `unlink` + `flush` + `fsyncdir` | 5.001 | 10.989 |
+| `release` | 1.000 | 3.957 |
+| **total** | **14.939** | **5.901** |
+
+Counted mechanism: 985,977 crossings over 66,000 create+delete pairs = 14.939 per pair,
+read off the daemon's unconditional crossing counter at the kernel boundary, with
+`getxattr` at 264,068 (4.001/pair) and `create`/`unlink`/`flush`/`release` at 66,000 each.
+
+`ops_ns_total` is **0** for every one of these opcodes — the OPS-layer timer is only wired
+for the read-path opcodes, so this census cannot split FUSE overhead from filesystem work
+by timer. The profile does it instead.
+
+### 2026-08-27 — the filesystem handlers are 0.46% of daemon CPU
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.999481` bootstrap median CI `[0.981414, 1.009510]` (candidate, fsync phase),
+both from 20000 resamples over 32 paired per-round ratios on this same rig and ELF.
+`RCH_WORKER=none`, `hostname=thinkstation1`.
+Counted mechanism: 985,977 crossings over 66,000 create+delete pairs = 14.939 per pair,
+read off the daemon's unconditional crossing counter at the kernel boundary, with
+`getxattr` at 264,068 (4.001/pair) and `create`/`unlink`/`flush`/`release` at 66,000 each.
+
+`perf record -F 4999 -g --call-graph dwarf` on the daemon under loop-dio: **77.16% kernel,
+16.80% our ELF, 4.86% libc**. Children-mode inside our ELF:
+
+    Channel::receive                     30.60%   \  44.70% is the /dev/fuse
+    ReplySender::send                    14.10%   /  read and write
+    notify (reverse invalidation)         4.56%
+    FrankenFuse::lookup                   2.87%
+    Request::dispatch                     1.62%
+    ShardedMvccStore::read_visible        0.96%
+    ---- the four MUTATING handlers ----
+    FrankenFuse::create                   0.13%
+    FrankenFuse::release                  0.12%
+    FrankenFuse::unlink                   0.11%
+    FrankenFuse::flush                    0.10%
+                                          -----
+                                          0.46%
+
+⇒ **Creating and deleting 2,000 files costs the filesystem 0.46% of the daemon's CPU.**
+Everything else is the round trip. There is no filesystem-side lever in the storm's
+dominant phases, and this is the third row in this sequence where that is true — but the
+first where it is true of a MUTATING path, which the row's own scorecard cell had claimed
+was "daemon-bound in a way no read-only row is".
+
+### 2026-08-27 — REJECT, counted: zero-message open is structurally inert on this row
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.999481` bootstrap median CI `[0.981414, 1.009510]` (candidate),
+both from 20000 resamples over 32 paired per-round ratios on this same rig and ELF.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Counted mechanism: `op_counts` byte-identical between the two arms — `create` 66000,
+`flush` 66000, `release` 66000, `lookup` 132001, `getxattr` 132002, and no `open` at all.
+
+`FFS_FUSE_ZERO_MESSAGE_OPEN` removed **49.14%** of the parallel-read row's crossings for
+`1.279004x` — `crossings_open` 12,544 → 2 and `crossings_release` 12,544 → 0. The storm
+spends `2.000` of its `14.939` crossings per pair on `flush` + `release`, so the obvious
+question is whether the same knob removes them here. One ELF, forward and mirrored with
+arms and daemon CPUs swapped, 32 rounds each:
+
+    op_counts, BOTH arms, BOTH directions, byte-identical:
+      create 66000   flush 66000   release 66000   lookup 132001   getxattr 132002
+      (no `open` at all)
+
+    def / zm    forward  0.978893  [0.953851, 0.998404]
+                mirrored 1.024473  (from zm/def 0.976115 [0.940003, 0.997439])
+                balanced 1.001422        <- NULL, exactly as the census predicts
+
+**The knob cannot fire because this workload never issues a bare `OPEN`.** Every file is
+opened by `CREATE`, which returns its own file handle, and `FUSE_NO_OPEN_SUPPORT` governs
+`OPEN` only — the kernel keeps sending `FLUSH` and `RELEASE` for a CREATE-opened file. So
+this is not "the lever did not help", it is "the opcode the lever removes is never issued
+here", and the identical census proves it rather than inferring it. ⇒ **scope rule: the
+zero-message-open lever applies to OPEN-then-read workloads and is structurally unavailable
+to create-heavy ones.**
+
+### 2026-08-27 — what the 14.939 crossings are actually made of
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.999481` bootstrap median CI `[0.981414, 1.009510]` (candidate, fsync phase),
+both from 20000 resamples over 32 paired per-round ratios on this same rig and ELF.
+`RCH_WORKER=none`, `hostname=thinkstation1`.
+Counted mechanism: 985,977 crossings over 66,000 create+delete pairs = 14.939 per pair,
+read off the daemon's unconditional crossing counter at the kernel boundary, with
+`getxattr` at 264,068 (4.001/pair) and `create`/`unlink`/`flush`/`release` at 66,000 each.
+
+  * **4.001 `getxattr` — the Linux AUDIT `security.capability` probe, 26.8% of all
+    crossings and the single largest class.** `FFS_FUSE_XATTR_NO_SUPPORT` took all four
+    read-only rows to parity, but it is gated `auto` on a PROVEN-ABSENT xattr scan **and a
+    read-only mount**; a rw storm cannot use it. Blocked by a documented safety gate, not
+    by ignorance.
+  * **2.6 of the `getattr` + `lookup` crossings are coherence**, already priced: entry
+    invalidation costs exactly `1.000` extra LOOKUP per pair and parent invalidation
+    `0.812` getattr per pair, together worth `1.192619x` — and both exist so a create is
+    visible after a failed lookup without waiting out `ATTR_TTL`.
+  * **4.000 are protocol-mandatory** — `create`, `unlink`, `flush`, `release`, one each,
+    and zero-message open cannot touch `flush`/`release` here (above).
+  * The remainder is `fsyncdir` and the residual `getattr`/`lookup` traffic.
+
+⇒ **Of 14.939 crossings per pair: `4.001` blocked by a read-only safety gate, `4.000`
+protocol-mandatory, `~2.6` removable only by giving up cache coherence at a measured
+`1.192619x`, and the filesystem work behind all of them is `0.46%` of daemon CPU.** The
+storm is round-trip-COUNT bound, and every remaining count is spoken for.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. The zero-message-open A/B's kernel A/A null
+was marginal in the forward direction (`0.979289`) and clean in the mirror (`0.992431`),
+which is why only the balanced figure is quoted — and the byte-identical census makes the
+NULL robust to the window regardless. What this banks is the per-opcode crossing budget,
+the `0.46%` handler share, the counted structural-inertness of zero-message open on a
+create-heavy row, and the accounting that leaves the storm with no unspoken-for crossings.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=zsF FA_LABEL=def FB_LABEL=zm \
+      FA_CPUS=18 FB_CPUS=19 FA_ENV="" FB_ENV="FFS_FUSE_ZERO_MESSAGE_OPEN=1" \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+    # then the mirror with FA/FB swapped; take the geometric mean of the two
+    WORK=<scratch> ELF=<ffs-cli> TAG=sp2 ROUNDS=40 OPS=2000 \
+      bash scripts/perf/create_delete_storm_ab/sperf.sh
