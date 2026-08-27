@@ -51,7 +51,7 @@ mod tests {
     fn dir_block_parser_reexport_handles_zero_initialized_block() {
         let block = vec![0_u8; 4096];
         let (entries, tail) = parse_dir_block(&block, 4096).expect("zero block parses");
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [ffs_ondisk::Ext4DirEntry; 0]);
         assert!(tail.is_none());
     }
 
@@ -670,7 +670,7 @@ unknown ro_compat: 0xAB"
         };
         let result = parse_ibody_xattrs(&inode);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert_eq!(result.unwrap(), [] as [ffs_ondisk::Ext4Xattr; 0]);
     }
 
     #[test]
@@ -803,14 +803,14 @@ unknown ro_compat: 0xAB"
                 | Ext4IncompatFeatures::CASEFOLD.0,
         );
         let rejected = features.describe_rejected_v1();
-        assert!(rejected.is_empty());
+        assert_eq!(rejected, [] as [&str; 0]);
     }
 
     #[test]
     fn incompat_features_describe_rejected_v1_none_present() {
         let features = Ext4IncompatFeatures(0x0002 | 0x0040); // FILETYPE + EXTENTS only
         let rejected = features.describe_rejected_v1();
-        assert!(rejected.is_empty());
+        assert_eq!(rejected, [] as [&str; 0]);
     }
 
     #[test]
@@ -1684,7 +1684,7 @@ unknown ro_compat: 0xAB"
         let root = parse_dx_root(&block).expect("valid dx root");
         assert_eq!(root.hash_version, 1);
         assert_eq!(root.indirect_levels, 0);
-        assert!(root.entries.is_empty());
+        assert_eq!(root.entries, [] as [ffs_ondisk::Ext4DxEntry; 0]);
     }
 
     #[test]
@@ -2568,8 +2568,8 @@ missing required: FILETYPE, EXTENTS; rejected: ENCRYPT; unknown incompat: \
         let sb = make_superblock();
         let diag = sb.feature_diagnostics_v1();
         assert!(diag.is_ok());
-        assert!(diag.missing_required.is_empty());
-        assert!(diag.rejected_present.is_empty());
+        assert_eq!(diag.missing_required, [] as [&str; 0]);
+        assert_eq!(diag.rejected_present, [] as [&str; 0]);
         assert_eq!(diag.unknown_incompat_bits, 0);
     }
 
@@ -2589,7 +2589,7 @@ missing required: FILETYPE, EXTENTS; rejected: ENCRYPT; unknown incompat: \
         let mut sb = make_superblock();
         sb.feature_incompat.0 |= Ext4IncompatFeatures::ENCRYPT.0;
         let diag = sb.feature_diagnostics_v1();
-        assert!(diag.rejected_present.is_empty());
+        assert_eq!(diag.rejected_present, [] as [&str; 0]);
     }
 
     #[test]

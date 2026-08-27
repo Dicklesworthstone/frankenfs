@@ -701,7 +701,7 @@ mod tests {
         );
         assert_eq!(report.commits_replayed, 0);
         assert_eq!(report.records_discarded, 1);
-        assert!(applied.is_empty());
+        assert_eq!(applied, [] as [u64; 0]);
     }
 
     #[test]
@@ -880,7 +880,7 @@ mod tests {
             .expect("replay");
 
         // All commits have seq <= 3, so none should be applied.
-        assert!(applied_seqs.is_empty());
+        assert_eq!(applied_seqs, [] as [u64; 0]);
     }
 
     // ── Large commit count ───────────────────────────────────────────────

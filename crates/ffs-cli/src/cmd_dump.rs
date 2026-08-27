@@ -31,7 +31,7 @@ use crate::{
     read_file_region, superblock_info_for,
 };
 
-pub(super) fn dump_cmd(command: &DumpCommand) -> Result<()> {
+pub fn dump_cmd(command: &DumpCommand) -> Result<()> {
     match command {
         DumpCommand::Superblock { image, json, hex } => dump_superblock_cmd(image, *json, *hex),
         DumpCommand::Group {
@@ -214,7 +214,7 @@ fn dump_group_cmd(group: u32, path: &PathBuf, json: bool, hex: bool) -> Result<(
     Ok(())
 }
 
-pub(super) fn build_dump_group_output(
+pub fn build_dump_group_output(
     path: &PathBuf,
     group: u32,
     hex: bool,
@@ -357,7 +357,7 @@ fn dump_inode_cmd(inode: u64, path: &PathBuf, json: bool, hex: bool) -> Result<(
     Ok(())
 }
 
-pub(super) fn build_dump_inode_output(
+pub fn build_dump_inode_output(
     path: &PathBuf,
     inode: u64,
     hex: bool,
@@ -646,7 +646,7 @@ fn dump_dir_cmd(inode: u64, path: &PathBuf, json: bool, hex: bool) -> Result<()>
     Ok(())
 }
 
-pub(super) fn build_dump_dir_output(
+pub fn build_dump_dir_output(
     path: &PathBuf,
     inode: u64,
     hex: bool,
@@ -809,7 +809,7 @@ fn load_ext4_reader(path: &PathBuf, action: &str) -> Result<(Vec<u8>, Ext4ImageR
     Ok((image, reader))
 }
 
-pub(super) fn bytes_to_hex_dump(bytes: &[u8]) -> String {
+pub fn bytes_to_hex_dump(bytes: &[u8]) -> String {
     let mut out = String::new();
     for (line, chunk) in bytes.chunks(16).enumerate() {
         let offset = line.saturating_mul(16);

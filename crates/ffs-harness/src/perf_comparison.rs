@@ -126,7 +126,7 @@ pub fn cohens_d(baseline: &SampleStats, current: &SampleStats) -> f64 {
     let pooled_var = if baseline.n + current.n > 2 {
         let df_b = (baseline.n - 1) as f64;
         let df_c = (current.n - 1) as f64;
-        (df_b * baseline.std_dev.powi(2) + df_c * current.std_dev.powi(2)) / (df_b + df_c)
+        df_c.mul_add(current.std_dev.powi(2), df_b * baseline.std_dev.powi(2)) / (df_b + df_c)
     } else {
         0.0
     };

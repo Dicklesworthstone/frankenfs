@@ -1003,16 +1003,16 @@ mod tests {
 
         let (idx_acl, name_acl) = parse_xattr_name("system.posix_acl_access").unwrap();
         assert_eq!(idx_acl, EXT4_XATTR_INDEX_POSIX_ACL_ACCESS);
-        assert!(name_acl.is_empty());
+        assert_eq!(name_acl, [] as [u8; 0]);
 
         let (idx_acl_default, name_acl_default) =
             parse_xattr_name("system.posix_acl_default").unwrap();
         assert_eq!(idx_acl_default, EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT);
-        assert!(name_acl_default.is_empty());
+        assert_eq!(name_acl_default, [] as [u8; 0]);
 
         let (idx_richacl, name_richacl) = parse_xattr_name("system.richacl").unwrap();
         assert_eq!(idx_richacl, EXT4_XATTR_INDEX_RICHACL);
-        assert!(name_richacl.is_empty());
+        assert_eq!(name_richacl, [] as [u8; 0]);
     }
 
     #[test]
@@ -1372,7 +1372,7 @@ mod tests {
     fn list_xattrs_empty_returns_empty() {
         let inode = make_inode(128);
         let names = list_xattrs(&inode, None).unwrap();
-        assert!(names.is_empty());
+        assert_eq!(names, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn build_inline_ibody_zero_len_empty_entries_returns_empty() {
         let data = build_inline_ibody(0, &[]).unwrap();
-        assert!(data.is_empty());
+        assert_eq!(data, [] as [u8; 0]);
     }
 
     #[test]
@@ -1645,7 +1645,7 @@ mod tests {
     fn parse_external_entries_all_zeros_allowed() {
         let block = vec![0_u8; 1024];
         let entries = parse_external_entries(&block, true).unwrap();
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [ffs_ondisk::Ext4Xattr; 0]);
     }
 
     #[test]
@@ -2377,12 +2377,12 @@ mod tests {
         let (idx, name) = parse_xattr_name("system.posix_acl_default").unwrap();
         assert_eq!(idx, EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT);
         assert_eq!(idx, 3, "kernel fs/ext4/xattr.h: POSIX_ACL_DEFAULT == 3");
-        assert!(name.is_empty());
+        assert_eq!(name, [] as [u8; 0]);
 
         let (idx, name) = parse_xattr_name("system.richacl").unwrap();
         assert_eq!(idx, EXT4_XATTR_INDEX_RICHACL);
         assert_eq!(idx, 8, "kernel fs/ext4/xattr.h: RICHACL == 8");
-        assert!(name.is_empty());
+        assert_eq!(name, [] as [u8; 0]);
 
         // Sibling kernel constants the dispatcher names elsewhere; pinned
         // here so a stray renumbering in ffs-types is caught by this crate's
@@ -2473,7 +2473,7 @@ mod tests {
     #[test]
     fn build_inline_ibody_zero_length_empty_entries() {
         let out = build_inline_ibody(0, &[]).unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
     }
 
     #[test]
@@ -2542,7 +2542,7 @@ mod tests {
     fn parse_external_entries_accepts_zero_initialized() {
         let block = vec![0_u8; 1024];
         let entries = parse_external_entries(&block, true).unwrap();
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [ffs_ondisk::Ext4Xattr; 0]);
     }
 
     #[test]
@@ -3053,7 +3053,7 @@ mod tests {
     fn parse_xattr_name_system_posix_acl_default() {
         let (idx, name) = parse_xattr_name("system.posix_acl_default").unwrap();
         assert_eq!(idx, EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT);
-        assert!(name.is_empty());
+        assert_eq!(name, [] as [u8; 0]);
     }
 
     #[test]
@@ -3186,7 +3186,7 @@ mod tests {
         let inode = make_inode(128);
         let ext_block = vec![0u8; 4096];
         let names = list_xattrs(&inode, Some(&ext_block)).unwrap();
-        assert!(names.is_empty());
+        assert_eq!(names, [] as [std::string::String; 0]);
     }
 
     // ── All namespace types simultaneously ──────────────────────────────
@@ -3239,7 +3239,7 @@ mod tests {
             remove_xattr(&mut inode, None, &name, access).unwrap();
         }
         let names = list_xattrs(&inode, None).unwrap();
-        assert!(names.is_empty());
+        assert_eq!(names, [] as [std::string::String; 0]);
     }
 
     // ── Permission denial edge cases ────────────────────────────────────

@@ -544,7 +544,7 @@ impl RefreshLossModel {
         let data_loss_rate =
             self.crash_rate_per_sec() * avg_stale_fraction * self.corruption_probability();
         let refresh_amortized = self.refresh_io_cost() / max_staleness_secs;
-        finite_loss(data_loss_rate * self.data_loss_cost() + refresh_amortized)
+        finite_loss(data_loss_rate.mul_add(self.data_loss_cost(), refresh_amortized))
     }
 
     /// Expected loss rate (per second) for block-count refresh with the given threshold.
@@ -573,7 +573,7 @@ impl RefreshLossModel {
         let data_loss_rate =
             self.crash_rate_per_sec() * avg_stale_fraction * self.corruption_probability();
         let refresh_amortized = self.refresh_io_cost() * clamped_rate / threshold_f;
-        finite_loss(data_loss_rate * self.data_loss_cost() + refresh_amortized)
+        finite_loss(data_loss_rate.mul_add(self.data_loss_cost(), refresh_amortized))
     }
 
     /// Expected loss rate (per second) for hybrid refresh (min of age and block-count).
@@ -624,7 +624,7 @@ impl RefreshLossModel {
         } else {
             0.0
         };
-        finite_loss(data_loss_rate * self.data_loss_cost() + refresh_amortized)
+        finite_loss(data_loss_rate.mul_add(self.data_loss_cost(), refresh_amortized))
     }
 
     /// Compare all three policies for a given workload and return the best.

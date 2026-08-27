@@ -3421,7 +3421,8 @@ impl FrankenFuse {
         intent: WriteIntent,
     ) -> Result<u32, MutationDispatchError> {
         let mut operation_offset = byte_offset;
-        let outcome = {
+        
+        {
             let _inode_guards = if intent.nowait() {
                 self.try_acquire_mutation_inode_guards(&[InodeNumber(ino)])
                     .ok_or(MutationDispatchError::Errno(libc::EAGAIN))?
@@ -3514,8 +3515,7 @@ impl FrankenFuse {
                     })
                 }
             }
-        };
-        outcome
+        }
     }
 
     fn kernel_open_flags(request_flags: i32, backend_open_flags: u32) -> u32 {

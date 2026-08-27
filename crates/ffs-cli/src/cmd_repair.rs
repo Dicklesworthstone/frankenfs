@@ -2920,11 +2920,11 @@ mod coordination_tests {
             vec![1, 2]
         );
         // All fresh (no stale) -> nothing to repair.
-        assert!(
-            select_ext4_repair_groups(flags, false, &all, &[(0, Fresh), (1, Fresh)]).is_empty()
+        assert_eq!(
+            select_ext4_repair_groups(flags, false, &all, &[(0, Fresh), (1, Fresh)]), [] as [u32; 0]
         );
         // A clean filesystem short-circuits to empty.
-        assert!(select_ext4_repair_groups(flags, true, &all, &[(0, Untracked)]).is_empty());
+        assert_eq!(select_ext4_repair_groups(flags, true, &all, &[(0, Untracked)]), [] as [u32; 0]);
         // No stale, no fresh, not clean (untracked) -> conservative full set.
         assert_eq!(
             select_ext4_repair_groups(flags, false, &all, &[(0, Untracked), (1, Untracked)]),
@@ -3007,8 +3007,8 @@ mod coordination_tests {
     #[test]
     fn partition_scrub_range_covers_exactly_without_overlap() {
         // No work when count or workers is zero.
-        assert!(partition_scrub_range(BlockNumber(0), 0, 4).is_empty());
-        assert!(partition_scrub_range(BlockNumber(0), 100, 0).is_empty());
+        assert_eq!(partition_scrub_range(BlockNumber(0), 0, 4), [] as [(ffs_types::BlockNumber, u64); 0]);
+        assert_eq!(partition_scrub_range(BlockNumber(0), 100, 0), [] as [(ffs_types::BlockNumber, u64); 0]);
 
         // 100 blocks across 3 workers: 33 each, remainder 1 to the first worker.
         let parts = partition_scrub_range(BlockNumber(10), 100, 3);

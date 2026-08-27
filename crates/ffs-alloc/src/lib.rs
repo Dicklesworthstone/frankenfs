@@ -4887,7 +4887,7 @@ mod tests {
         geo.first_inode = 32;
 
         let reserved = reserved_inodes_in_group(&geo, GroupNumber(65_536));
-        assert!(reserved.is_empty());
+        assert_eq!(reserved, [] as [u32; 0]);
     }
 
     // ── Block allocation tests ──────────────────────────────────────────
@@ -9213,7 +9213,7 @@ InodeAlloc { ino: InodeNumber(17), group: GroupNumber(1) }
 
         let result =
             alloc_blocks_batch_persist(&cx, &dev, &geo, &mut groups, 0, &hint, &pctx).unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [BlockAlloc; 0]);
     }
 
     #[test]

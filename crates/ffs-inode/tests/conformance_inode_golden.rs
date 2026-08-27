@@ -118,7 +118,7 @@ fn golden_ext4_inode_128_regfile_fields_match() {
     assert_eq!(decoded.atime_extra, 0);
     assert_eq!(decoded.crtime, 0);
     assert_eq!(decoded.checksum, 0);
-    assert!(decoded.xattr_ibody.is_empty());
+    assert_eq!(decoded.xattr_ibody, [] as [u8; 0]);
 }
 
 // 256-byte inode, directory, extended area with nsec timestamps

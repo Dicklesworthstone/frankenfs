@@ -323,12 +323,11 @@ fn is_safe_artifact_path(value: &str) -> bool {
 }
 
 fn write_console_artifact(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create {label} directory {}", parent.display()))?;
         }
-    }
     fs::write(path, bytes).with_context(|| format!("write {label} {}", path.display()))
 }
 
@@ -382,8 +381,8 @@ mod tests {
             scenario_id: "cli_mount_runtime_managed_ro".to_owned(),
             runtime_mode: mode,
             read_write: false,
-            started_at: UNIX_EPOCH + Duration::from_secs(1_779_000_000),
-            shutdown_at: UNIX_EPOCH + Duration::from_secs(1_779_000_600),
+            started_at: UNIX_EPOCH + Duration::from_mins(29650000),
+            shutdown_at: UNIX_EPOCH + Duration::from_mins(29650010),
             requests_total: 300,
             requests_err: 2,
             bytes_read: 65_536,

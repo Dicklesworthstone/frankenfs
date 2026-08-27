@@ -10241,7 +10241,7 @@ mod tests {
 
         // Both arms agree on the empty and singleton cases, which is the only
         // place they may.
-        assert!(readdirplus_fetch_order(false, &[]).is_empty());
+        assert_eq!(readdirplus_fetch_order(false, &[]), [] as [usize; 0]);
         assert_eq!(readdirplus_fetch_order(false, &[42]), vec![0]);
         assert_eq!(readdirplus_fetch_order(true, &[42]), vec![0]);
     }
@@ -10435,7 +10435,7 @@ mod tests {
         let sorted = [1_u64, 2, 3, 4];
         assert_eq!(readdirplus_inode_fetch_order(&sorted), vec![0, 1, 2, 3]);
 
-        assert!(readdirplus_inode_fetch_order(&[]).is_empty());
+        assert_eq!(readdirplus_inode_fetch_order(&[]), [] as [usize; 0]);
         assert_eq!(readdirplus_inode_fetch_order(&[42]), vec![0]);
     }
 
@@ -11761,7 +11761,7 @@ mod tests {
     fn parse_fs_label_request_empty_label() {
         let data = b"\0rest".to_vec();
         let label = FrankenFuse::parse_fs_label_request(&data).unwrap();
-        assert!(label.is_empty());
+        assert_eq!(label, [] as [u8; 0]);
     }
 
     #[test]
@@ -12749,7 +12749,7 @@ mod tests {
     #[test]
     fn encode_xattr_names_empty_is_empty_payload() {
         let encoded = FrankenFuse::encode_xattr_names(&[]);
-        assert!(encoded.is_empty());
+        assert_eq!(encoded, [] as [u8; 0]);
     }
 
     #[test]
@@ -17678,7 +17678,7 @@ mod tests {
         assert_eq!(record.ino, 9);
         assert_eq!(record.donor_fd, donor_fd);
         assert_eq!(record.moved_len, Some(21));
-        assert!(!record.operation_id.is_empty());
+        assert_ne!(record.operation_id, "");
     }
 
     #[test]
@@ -17729,7 +17729,7 @@ mod tests {
         assert_eq!(record.ino, 9);
         assert_eq!(record.donor_fd, 7);
         assert_eq!(record.errno, Some(libc::EOPNOTSUPP));
-        assert!(!record.operation_id.is_empty());
+        assert_ne!(record.operation_id, "");
     }
 
     #[test]

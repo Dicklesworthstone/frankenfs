@@ -2914,7 +2914,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     assert!(!values.is_empty(), "median requires at least one sample");
     values.sort_by(f64::total_cmp);
     let midpoint = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         values[midpoint - 1].midpoint(values[midpoint])
     } else {
         values[midpoint]
@@ -3326,7 +3326,7 @@ fn createbench_cutover_gate_cmd(
     if threads < 2 {
         bail!("cutover A/B requires at least 2 writer threads");
     }
-    if count == 0 || count % threads != 0 {
+    if count == 0 || !count.is_multiple_of(threads) {
         bail!("count must be nonzero and divisible by threads");
     }
     let (image_size, image_sha256) = validate_cutover_images([
@@ -4272,7 +4272,7 @@ fn lookupbench_cmd(path: &PathBuf, dir_path: &str, count: usize, seed: u64) -> R
         let page = open_fs
             .readdir(&cx, ino, off)
             .with_context(|| format!("failed to readdir {dir_path} at offset {off}"))?;
-        let entries = page.to_vec();
+        let entries = page.clone();
         if entries.is_empty() {
             break;
         }
@@ -4503,8 +4503,7 @@ fn randread_cmd(
                 let mut buf = vec![0_u8; size];
                 open_fs
                     .read_into(&read_cx, ino, off, &mut buf)
-                    .map(|n| n as u64)
-                    .unwrap_or(0)
+                    .map_or(0, |n| n as u64)
             })
             .sum()
     } else {
@@ -8396,7 +8395,7 @@ pub fn choose_btrfs_scrub_block_size(
 
     let mut candidate = nodesize;
     while candidate >= min_block_size {
-        if image_len % u64::from(candidate) == 0 {
+        if image_len.is_multiple_of(u64::from(candidate)) {
             return Ok(candidate);
         }
         candidate /= 2;
@@ -8645,11 +8644,10 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
             source.offset, source.generation
         )
     });
-    if flags.repair() && repair_coordination.writes_allowed {
-        if let FsFlavor::Ext4(_) = &flavor {
+    if flags.repair() && repair_coordination.writes_allowed
+        && let FsFlavor::Ext4(_) = &flavor {
             ext4_recovery = Some(run_ext4_mount_recovery(path)?);
         }
-    }
 
     phases.push(FsckPhaseOutput {
         phase: "superblock_validation".to_owned(),
@@ -10417,9 +10415,7 @@ mod tests {
     #[test]
     fn mount_adaptive_runtime_shutdown_summary_reports_default_off_explicitly() {
         let observation = super::MountAdaptiveRuntimeShutdownObservation {
-            metrics: ffs_fuse::MetricsSnapshot {
-                ..Default::default()
-            },
+            metrics: Default::default(),
             worker_count: 0,
             per_core: None,
         };
@@ -15978,7 +15974,7 @@ mod tests {
             assert!(
                 raw_hex.starts_with("00000000: 00 01 00 00 00 00 00 00 e4 00 00 00 00 00 00 00\n")
             );
-            assert!(output.limitations.is_empty());
+            assert_eq!(output.limitations, [] as [std::string::String; 0]);
 
             let chunk = output
                 .btrfs_chunk
@@ -16371,7 +16367,7 @@ mod tests {
             (1, Ext4RepairStaleness::Untracked),
         ];
         let selected = select_ext4_repair_groups(RepairFlags::empty(), true, &all, &staleness);
-        assert!(selected.is_empty());
+        assert_eq!(selected, [] as [u32; 0]);
     }
 
     #[test]
@@ -17445,7 +17441,7 @@ mod tests {
     #[test]
     fn format_ratio_thousandths_large_values() {
         let result = format_ratio_thousandths(usize::MAX, 1);
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
         assert!(result.contains('.'));
     }
 
@@ -17488,7 +17484,7 @@ mod tests {
             project: None,
         };
         let result = format_ext4_quota_inodes(&quota);
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     // ── bytes_to_hex_dump: raw data display helper ───────────────────────
@@ -17497,7 +17493,7 @@ mod tests {
     fn bytes_to_hex_dump_empty_input() {
         use super::bytes_to_hex_dump;
         let result = bytes_to_hex_dump(&[]);
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     #[test]
@@ -17764,7 +17760,7 @@ mod tests {
             (2, Ext4RepairStaleness::Fresh),
         ];
         let selected = select_ext4_repair_groups(RepairFlags::empty(), false, &all, &staleness);
-        assert!(selected.is_empty());
+        assert_eq!(selected, [] as [u32; 0]);
     }
 
     #[test]
@@ -17797,7 +17793,7 @@ mod tests {
         let all = vec![0, 1, 2];
         let staleness: Vec<(u32, Ext4RepairStaleness)> = vec![];
         let selected = select_ext4_repair_groups(RepairFlags::empty(), true, &all, &staleness);
-        assert!(selected.is_empty());
+        assert_eq!(selected, [] as [u32; 0]);
     }
 
     // ── WAL replay telemetry tests ──────────────────────────────────────

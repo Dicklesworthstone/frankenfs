@@ -145,7 +145,7 @@ fn run_throughput_test(
 
     let elapsed = start.elapsed();
     // Verify we got entries.
-    assert!(!all_entries.is_empty());
+    assert_ne!(all_entries, [] as [ffs_journal::wal_buffer::WalEntry; 0]);
     elapsed
 }
 
@@ -386,7 +386,7 @@ fn group_commit_all_threads_share_one_fsync() {
     // Single group commit for epoch 1.
     let (result, remaining) = coord.flush_epoch(all_entries, 1).expect("flush");
     assert_eq!(result.fsyncs_issued, 1); // Only 1 fsync for all 8 transactions.
-    assert!(remaining.is_empty());
+    assert_eq!(remaining, [] as [ffs_journal::wal_buffer::WalEntry; 0]);
     assert_eq!(sync_counter.load(Ordering::Acquire), 1);
 }
 
@@ -576,7 +576,7 @@ fn cross_epoch_transactions_correctly_ordered() {
     }
 
     // Verify final state.
-    assert!(remaining.is_empty());
+    assert_eq!(remaining, [] as [ffs_journal::wal_buffer::WalEntry; 0]);
     assert!(epoch_mgr.is_durable(max_epoch));
 
     // Verify the writer received entries in epoch order.

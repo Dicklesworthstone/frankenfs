@@ -40230,9 +40230,7 @@ fn erfc_approx(x: f64) -> f64 {
     // Abramowitz & Stegun approximation (7.1.26), max error < 1.5e-7
     let t = 1.0 / 0.327_591_1_f64.mul_add(x.abs(), 1.0);
     let poly = t
-        * (0.254_829_592
-            + t * (-0.284_496_736
-                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+        * t.mul_add(t.mul_add(t.mul_add(t.mul_add(1.061_405_429, -1.453_152_027), 1.421_413_741), -0.284_496_736), 0.254_829_592);
     let result = poly * (-x * x).exp();
     if x >= 0.0 { result } else { 2.0 - result }
 }

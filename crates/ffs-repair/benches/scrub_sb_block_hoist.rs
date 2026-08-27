@@ -47,10 +47,7 @@ fn old_path(block: u64, bs: u64) -> bool {
 
 /// NEW: compare against precomputed block numbers (no division).
 fn new_path(block: u64, sb_target: u64, tb_sb: u64) -> bool {
-    if block != sb_target && block != tb_sb {
-        return true;
-    }
-    false
+    block != sb_target && block != tb_sb
 }
 
 fn bench(c: &mut Criterion) {

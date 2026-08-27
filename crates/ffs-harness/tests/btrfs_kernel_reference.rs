@@ -914,8 +914,8 @@ fn btrfs_golden_json_parses_and_is_consistent() {
         assert!(golden.sectorsize > 0);
         assert!(golden.nodesize > 0);
         assert!(golden.total_bytes >= SMALL_IMAGE_BYTES);
-        assert!(!golden.directories.is_empty());
-        assert!(!golden.files.is_empty());
+        assert_ne!(golden.directories, [] as [BtrfsDirectorySummary; 0]);
+        assert_ne!(golden.files, [] as [BtrfsFileSummary; 0]);
         for file in &golden.files {
             if let Some(content_hex) = &file.content_hex {
                 assert_eq!(

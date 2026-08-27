@@ -280,8 +280,8 @@ fn assert_manifest_case(
         "seed id should keep the owning bead visible: {}",
         case.seed_id
     );
-    assert!(!case.stdout_path.is_empty());
-    assert!(!case.stderr_path.is_empty());
+    assert_ne!(case.stdout_path, "");
+    assert_ne!(case.stderr_path, "");
 
     let fixture_bytes =
         fixture_bytes_for_case(case, clean_ledger, torn_ledger, missing_ledger_path);

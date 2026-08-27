@@ -904,7 +904,7 @@ mod extent_mapping {
 
         let mappings =
             ffs_extent::map_logical_to_physical(&cx, &dev, &root, 0, 0).expect("empty range");
-        assert!(mappings.is_empty());
+        assert_eq!(mappings, [] as [ffs_extent::ExtentMapping; 0]);
     }
 
     #[test]

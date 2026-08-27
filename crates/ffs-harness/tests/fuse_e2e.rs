@@ -15575,7 +15575,7 @@ fn fuse_empty_file_operations() {
         fs::write(&path, b"").expect("create empty file");
 
         let content = fs::read(&path).expect("read empty file");
-        assert!(content.is_empty());
+        assert_eq!(content, [] as [u8; 0]);
 
         let meta = fs::metadata(&path).expect("stat empty file");
         assert_eq!(meta.len(), 0);

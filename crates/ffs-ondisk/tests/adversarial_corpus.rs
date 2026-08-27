@@ -2017,10 +2017,9 @@ fn ext4_inline_data_adversarial_samples_exercise_ibody_boundaries() {
     let magic_only =
         Ext4Inode::parse_from_bytes(&samples["synthetic_ext4_inline_data_ibody_magic_only.bin"])
             .expect("magic-only ibody inode parses");
-    assert!(
+    assert_eq!(
         parse_ibody_xattrs(&magic_only)
-            .expect("magic-only ibody xattr area is empty")
-            .is_empty()
+            .expect("magic-only ibody xattr area is empty"), [] as [ffs_ondisk::Ext4Xattr; 0]
     );
 
     let valid_ibody =
@@ -2165,7 +2164,7 @@ fn ext4_xattr_block_adversarial_samples_exercise_boundaries() {
 
     let header_only = parse_xattr_block(&samples["synthetic_ext4_xattr_block_header_only.bin"])
         .expect("header-only xattr block parses as empty");
-    assert!(header_only.is_empty());
+    assert_eq!(header_only, [] as [ffs_ondisk::Ext4Xattr; 0]);
 
     let name_err = parse_xattr_block(&samples["synthetic_ext4_xattr_block_name_overflow.bin"])
         .expect_err("xattr block name overflow must be rejected");
@@ -2445,7 +2444,7 @@ fn assert_valid_ext4_dx_root_samples(samples: &BTreeMap<String, Vec<u8>>) {
 
     let zero_count = parse_dx_root(&samples["synthetic_ext4_dx_root_zero_count.bin"])
         .expect("zero-count dx root parses as an empty entry set");
-    assert!(zero_count.entries.is_empty());
+    assert_eq!(zero_count.entries, [] as [ffs_ondisk::Ext4DxEntry; 0]);
 }
 
 fn assert_invalid_ext4_dx_root_samples(samples: &BTreeMap<String, Vec<u8>>) {

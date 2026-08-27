@@ -2038,8 +2038,8 @@ fn golden_json_parses_and_is_consistent() {
     );
     assert!(golden.superblock.blocks_count > 0);
     assert!(golden.superblock.inodes_count > 0);
-    assert!(!golden.directories.is_empty());
-    assert!(!golden.files.is_empty());
+    assert_ne!(golden.directories, [] as [ffs_harness::GoldenDirectory; 0]);
+    assert_ne!(golden.files, [] as [ffs_harness::GoldenFile; 0]);
 
     // Root directory should have standard entries
     let root = golden

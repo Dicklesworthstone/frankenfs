@@ -271,7 +271,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     assert!(!values.is_empty(), "median requires a non-empty sample");
     values.sort_by(f64::total_cmp);
     let midpoint = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         values[midpoint - 1].midpoint(values[midpoint])
     } else {
         values[midpoint]

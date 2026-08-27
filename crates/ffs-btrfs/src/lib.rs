@@ -3806,8 +3806,8 @@ impl InMemoryCowBtrfsTree {
         entry: BtrfsTreeItem,
         allow_replace: bool,
     ) -> Result<u64, BtrfsMutationError> {
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
         let old_root = self.root;
         trace!(
             root = old_root,
@@ -3875,8 +3875,8 @@ impl InMemoryCowBtrfsTree {
         entries: Vec<BtrfsTreeItem>,
         allow_replace: bool,
     ) -> Result<u64, BtrfsMutationError> {
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
         for entry in entries {
             let inserted_inplace = match self.try_insert_inplace(self.root, &entry, allow_replace) {
                 Ok(inserted_inplace) => inserted_inplace,
@@ -4019,8 +4019,8 @@ impl InMemoryCowBtrfsTree {
     /// Returns the same COW-tree errors as the equivalent `delete` sequence (incl.
     /// `KeyNotFound` for an absent key); on any error the whole batch is rolled back.
     pub fn remove_many(&mut self, keys: &[BtrfsKey]) -> Result<u64, BtrfsMutationError> {
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
         for key in keys {
             let removed_inplace = match self.try_remove_inplace(self.root, key) {
                 Ok(removed_inplace) => removed_inplace,
@@ -4181,8 +4181,8 @@ impl InMemoryCowBtrfsTree {
             return Err(BtrfsMutationError::KeyNotFound);
         }
 
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
         let old_root = self.root;
         let insert_result = match self.insert_into(
             self.root,
@@ -4270,8 +4270,8 @@ impl InMemoryCowBtrfsTree {
             return Err(BtrfsMutationError::KeyNotFound);
         }
 
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
         let old_root = self.root;
         let mut current_root = old_root;
         for &(key, item) in inserts {
@@ -4366,8 +4366,8 @@ impl InMemoryCowBtrfsTree {
             return <Self as BtrfsBTree>::update(self, update_key, update_item);
         }
 
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
         let old_root = self.root;
         let mut current_root = old_root;
 
@@ -5551,8 +5551,8 @@ impl BtrfsBTree for InMemoryCowBtrfsTree {
     }
 
     fn delete(&mut self, key: &BtrfsKey) -> Result<u64, BtrfsMutationError> {
-        debug_assert!(self.staged_allocations.is_empty());
-        debug_assert!(self.staged_deferred_frees.is_empty());
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
         let old_root = self.root;
         trace!(
             root = old_root,
@@ -13672,7 +13672,7 @@ mod tests {
         };
 
         let entries = walk_tree(&mut read, &chunks, logical, NODESIZE, 0).expect("walk");
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [BtrfsLeafEntry; 0]);
     }
 
     #[test]
@@ -14795,7 +14795,7 @@ mod tests {
         let empty = tree
             .range(&test_key(100), &test_key(200))
             .expect("range above tree");
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]);
 
         // Exact-single-key range returns just that key.
         let one = tree.range(&test_key(17), &test_key(17)).expect("point");
@@ -16929,10 +16929,9 @@ mod tests {
 
         let parsed = parse_dir_items(&payload).expect("parse multi-entry dir payload");
         assert_eq!(parsed, [first, second.clone()]);
-        assert!(
+        assert_eq!(
             parse_dir_items(&[])
-                .expect("parse empty dir payload")
-                .is_empty()
+                .expect("parse empty dir payload"), [] as [BtrfsDirItem; 0]
         );
 
         assert_insufficient_data(parse_dir_items(&[0_u8; 29]), 30, 0, 29);
@@ -16967,7 +16966,7 @@ mod tests {
         assert_eq!(parsed[0].name, b"user.a");
         assert_eq!(parsed[0].value, b"alpha");
         assert_eq!(parsed[1].name, b"user.b");
-        assert!(parsed[1].value.is_empty());
+        assert_eq!(parsed[1].value, [] as [u8; 0]);
         assert_eq!(
             find_xattr_item_value(&payload, b"user.a").expect("find first xattr"),
             Some(b"alpha".to_vec())
@@ -16980,10 +16979,9 @@ mod tests {
             find_xattr_item_value(&payload, b"user.missing").expect("miss xattr"),
             None
         );
-        assert!(
+        assert_eq!(
             parse_xattr_items(&[])
-                .expect("parse empty xattr payload")
-                .is_empty()
+                .expect("parse empty xattr payload"), [] as [BtrfsXattrItem; 0]
         );
         assert_eq!(
             find_xattr_item_value(&[], b"user.a").expect("find in empty payload"),
@@ -18779,7 +18777,7 @@ mod tests {
         let parsed = parse_xattr_items(&payload).expect("parse xattr empty value");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, name);
-        assert!(parsed[0].value.is_empty());
+        assert_eq!(parsed[0].value, [] as [u8; 0]);
     }
 
     #[test]
@@ -20425,7 +20423,7 @@ mod tests {
         // An empty tree is not an error — it is a filesystem with no chunks,
         // which the planner will refuse on its own terms.
         let empty = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        assert!(chunk_entries_from_chunk_tree(&empty).expect("empty").is_empty());
+        assert_eq!(chunk_entries_from_chunk_tree(&empty).expect("empty"), [] as [ffs_ondisk::BtrfsChunkEntry; 0]);
     }
 
     /// bd-a136s. ⚠️ An unparseable CHUNK_ITEM must REFUSE, not be skipped.
@@ -21262,7 +21260,7 @@ mod tests {
             alloc.extent_item_refs(a.bytenr, a.num_bytes).unwrap(),
             Some(0)
         );
-        assert!(alloc.get_extent_data_refs(a.bytenr).unwrap().is_empty());
+        assert_eq!(alloc.get_extent_data_refs(a.bytenr).unwrap(), [] as [BtrfsExtentDataRef; 0]);
 
         // Dropping a ref that isn't present is an atomic error (no change).
         alloc
@@ -21371,19 +21369,17 @@ mod tests {
             item_type: BTRFS_ITEM_TREE_BLOCK_REF,
             offset: BTRFS_FS_TREE_OBJECTID,
         };
-        assert!(
+        assert_eq!(
             alloc
                 .extent_tree
                 .range(&metadata_key, &metadata_key)
-                .expect("metadata item lookup")
-                .is_empty()
+                .expect("metadata item lookup"), [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
         );
-        assert!(
+        assert_eq!(
             alloc
                 .extent_tree
                 .range(&ref_key, &ref_key)
-                .expect("tree block ref lookup")
-                .is_empty()
+                .expect("tree block ref lookup"), [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
         );
         assert_eq!(alloc.block_group(0x20_0000).expect("meta bg").used_bytes, 0);
     }
@@ -24390,12 +24386,11 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
+        assert_eq!(
             alloc
                 .extent_tree
                 .range(&orphan_key, &orphan_key)
-                .expect("orphan extent lookup")
-                .is_empty()
+                .expect("orphan extent lookup"), [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
         );
         assert_eq!(
             alloc.block_group(bg_start).expect("bg").used_bytes,
@@ -24877,8 +24872,8 @@ mod tests {
         assert_eq!(drained[2].extent, key_high);
         assert_eq!(drained[2].action, RefAction::Delete);
         assert_eq!(queue.pending_count(), 0);
-        assert!(queue.pending_for(&key_low).is_empty());
-        assert!(queue.pending_for(&key_high).is_empty());
+        assert_eq!(queue.pending_for(&key_low), []);
+        assert_eq!(queue.pending_for(&key_high), []);
     }
 
     // ── Subvolume enumeration tests ────────────────────────────────
@@ -24961,7 +24956,7 @@ mod tests {
             },
         ];
         let subvols = enumerate_subvolumes(&entries);
-        assert!(subvols.is_empty());
+        assert_eq!(subvols, [] as [BtrfsSubvolume; 0]);
     }
 
     #[test]
@@ -25477,7 +25472,7 @@ mod tests {
         let older = vec![make_inode_entry(256, 10), make_inode_entry(257, 10)];
         let newer = vec![make_inode_entry(256, 10), make_inode_entry(257, 10)];
         let diffs = snapshot_diff_by_generation(&older, &newer);
-        assert!(diffs.is_empty());
+        assert_eq!(diffs, [] as [SnapshotDiffEntry; 0]);
     }
 
     #[test]

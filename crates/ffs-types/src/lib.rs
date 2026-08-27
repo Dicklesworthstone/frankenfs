@@ -1463,9 +1463,9 @@ mod tests {
     fn batch_checksum_empty_blocks() {
         let blocks: [&[u8]; 0] = [];
         let result = batch_checksum(&blocks, ChecksumAlgo::Crc32c { seed: 0 });
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u32; 0]);
         let result = batch_checksum(&blocks, ChecksumAlgo::Blake3Truncated32);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u32; 0]);
     }
 
     #[test]

@@ -152,6 +152,6 @@ fn fast_commit_missing_tail_fixture_forces_fallback() {
         fixture.expected.incomplete_transactions
     );
     assert_eq!(replay.fallback_required, fixture.expected.fallback_required);
-    assert!(replay.operations.is_empty());
+    assert_eq!(replay.operations, [] as [ffs_journal::FcOperation; 0]);
     assert!(fixture.expected.operations.is_empty());
 }

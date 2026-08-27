@@ -228,7 +228,7 @@ fn ext4_journal_recovery_ignores_uncommitted_transaction() {
         replay.stats.incomplete_transactions
     );
 
-    assert!(replay.committed_sequences.is_empty());
+    assert_eq!(replay.committed_sequences, [] as [u32; 0]);
     assert_eq!(replay.stats.replayed_blocks, 0);
     assert_eq!(replay.stats.commit_blocks, 0);
     assert_eq!(replay.stats.incomplete_transactions, 1);
@@ -738,7 +738,7 @@ fn ext4_journal_recovery_skip_mode_no_replay() {
     let replay = fs
         .ext4_journal_replay()
         .expect("skip mode still populates a default replay outcome");
-    assert!(replay.committed_sequences.is_empty());
+    assert_eq!(replay.committed_sequences, [] as [u32; 0]);
     assert_eq!(replay.stats.replayed_blocks, 0);
 
     // Target block is untouched — no replay occurred.

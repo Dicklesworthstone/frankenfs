@@ -625,7 +625,7 @@ mod tests {
         assert!((snap.cpu_pressure - 0.0).abs() < f64::EPSILON);
         assert!((snap.memory_pressure - 0.0).abs() < f64::EPSILON);
         assert_eq!(snap.io_queue_depth, 0);
-        assert!(snap.degradation_events.is_empty());
+        assert_eq!(snap.degradation_events, [] as [DegradationEvent; 0]);
         assert_eq!(snap.scrub_blocks_scanned, 0);
         assert_eq!(snap.scrub_findings_count, 0);
     }

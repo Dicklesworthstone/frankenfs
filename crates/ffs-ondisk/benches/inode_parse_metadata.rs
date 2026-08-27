@@ -45,8 +45,8 @@ fn bench(c: &mut Criterion) {
     // metadata skips the ibody copy; attr ALSO skips the extent copy (non-device).
     assert_eq!(full.size, meta.size);
     assert_eq!(full.mode, attr.mode);
-    assert!(meta.xattr_ibody.is_empty());
-    assert!(!full.xattr_ibody.is_empty());
+    assert_eq!(meta.xattr_ibody, [] as [u8; 0]);
+    assert_ne!(full.xattr_ibody, [] as [u8; 0]);
     assert!(
         attr.extent_bytes.is_empty(),
         "attr skips extents for a regular file"

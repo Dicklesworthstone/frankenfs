@@ -907,7 +907,7 @@ impl<'a> WriteSet<'a> {
         staged_write_pos(self.staged_writes, *block).is_ok()
     }
 
-    #[must_use]
+    
     pub fn keys(self) -> impl DoubleEndedIterator<Item = &'a BlockNumber> + ExactSizeIterator + 'a {
         self.staged_writes.iter().map(|(block, _)| block)
     }
@@ -1687,7 +1687,7 @@ impl ContentionMetrics {
     pub fn expected_loss_safe_merge(&self, config: &AdaptivePolicyConfig) -> f64 {
         let corruption_loss = config.base_corruption_probability * config.corruption_severity;
         let residual_abort_rate = self.conflict_rate * (1.0 - self.merge_success_rate);
-        corruption_loss + residual_abort_rate * config.abort_cost
+        residual_abort_rate.mul_add(config.abort_cost, corruption_loss)
     }
 
     /// Select the conflict resolution strategy with the lowest expected loss,
@@ -4444,7 +4444,7 @@ mod tests {
             &[0xAB; 8]
         );
         assert_eq!(store.latest_physical_block(logical), Some(new_physical));
-        assert!(allocator.freed_blocks().is_empty());
+        assert_eq!(allocator.freed_blocks(), [] as [ffs_types::BlockNumber; 0]);
     }
 
     #[test]
@@ -4478,7 +4478,7 @@ mod tests {
             Some(logical)
         );
         assert_eq!(store.latest_physical_block(logical), Some(new_physical));
-        assert!(allocator.freed_blocks().is_empty());
+        assert_eq!(allocator.freed_blocks(), [] as [ffs_types::BlockNumber; 0]);
 
         assert!(store.release_snapshot(old_snapshot));
         let freed_now = store.gc_cow_blocks(&allocator, &cx);
@@ -4537,7 +4537,7 @@ mod tests {
                 .expect("cow commit");
         }
 
-        assert!(allocator.freed_blocks().is_empty());
+        assert_eq!(allocator.freed_blocks(), [] as [ffs_types::BlockNumber; 0]);
 
         assert!(store.release_snapshot(held_snapshot));
         let freed_now = store.gc_cow_blocks(&allocator, &cx);

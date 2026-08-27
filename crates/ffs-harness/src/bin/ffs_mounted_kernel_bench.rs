@@ -10949,8 +10949,8 @@ mod tests {
             [("FFS_D9378_COUNT_MEMOIZED".to_owned(), "0".to_owned())]
         );
         // The first candidate configuration must stay the untouched baseline.
-        assert!(config.arm_env(Arm::FuseA).is_empty());
-        assert!(config.arm_env(Arm::KernelA).is_empty());
+        assert_eq!(config.arm_env(Arm::FuseA), []);
+        assert_eq!(config.arm_env(Arm::KernelA), []);
         // The banked default of 32 does not complete the six-arm square.
         assert_eq!(config.pairs, 36);
 
@@ -10961,7 +10961,7 @@ mod tests {
             .expect("normal invocation");
         assert!(control.compares_candidates());
         assert!(!control.candidate_configurations_differ());
-        assert!(control.arm_env(Arm::CandidateBA).is_empty());
+        assert_eq!(control.arm_env(Arm::CandidateBA), []);
 
         // An explicit round count that does not complete the square is refused
         // rather than silently truncated.
@@ -12154,7 +12154,7 @@ mod tests {
         let tolerated =
             parse_mount_self_report(&legacy, false, false).expect("parse legacy self report");
         assert_eq!(tolerated.runtime_knobs, UNREPORTED_RUNTIME_KNOBS);
-        assert!(!UNREPORTED_RUNTIME_KNOBS.is_empty());
+        assert_ne!(UNREPORTED_RUNTIME_KNOBS, "");
         assert!(!UNREPORTED_RUNTIME_KNOBS.contains('='));
 
         let non_pgo = temp.path().join("non-pgo.log");
