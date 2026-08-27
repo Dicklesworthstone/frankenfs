@@ -11452,3 +11452,148 @@ by us (still refused as `foreign_format`); and rename/unlink/truncate in the log
 gate only ever creates and writes. The duplicate-key case is refused rather than deduped — a
 silent dedup would drop a logged item, which is the acknowledged-then-lost failure the whole path
 exists to remove — but it has not been provoked.
+
+## bd — readdir+stat: the warm-stat REJECT does NOT transfer. The daemon is 79% of a core busy, and SERIAL DISPATCH is worth 1.995801x at ZERO extra CPU
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/readdir_stat_ab/` (NOT the gated comparator — see admissibility below).**
+Provenance: in-process self-report
+`bench_evidence,binary_sha256=333521a5497dc737a2a01fde3558a491ede77100403e9a8799bb930ba0ce92c6`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false,compile_fma=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU (8-23, 40-55).
+
+The row before this one closed warm stat as unattackable because the daemon received
+**3 requests per 22,001 stats**. Asked for the next-worst loss, I took readdir+stat and
+ran the same instrumentation before assuming the same answer. **It is the opposite row.**
+
+### 2026-08-27 — the whole op, counted
+
+Rig shape is `readdir_stat_batch` (`crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs:4171`)
+reproduced in C: readdir `large-directory` (32,768 zero-byte entries seeded THROUGH a kernel
+mount so ext4 builds its own htree, the bd-plkzd bankable construction), then 8 pinned workers
+`lstat` every entry exactly once. Four arms are live SIMULTANEOUSLY inside ONE rig invocation —
+two kernel ext4 loop mounts (the A/A null) and two FrankenFS mounts from ONE ELF — and arm order
+is rotated per round so position cannot be priced as effect.
+
+48 rounds, clients pinned to CPUs 8-15, both daemons pinned to CPUs **8-15 as well**, so the
+FrankenFS arms and the kernel arms are confined to the SAME 8 logical CPUs. No extra cores.
+
+| arm | median batch | vs kernel k1 | vs kernel k2 |
+| --- | --- | --- | --- |
+| kernel ext4 `k1` | **23.080 ms** (IQR 0.601 ms) | — | — |
+| kernel ext4 `k2` | **22.985 ms** (IQR 0.499 ms) | — | — |
+| FrankenFS default | **138.486 ms** | **`5.998540x`** | **`6.042065x`** |
+| FrankenFS `FFS_FUSE_WORKERS=4` | **69.516 ms** | **`3.018357x`** | **`3.020709x`** |
+
+Same-invocation kernel A/A null control `1.005771`, bootstrap median CI `[0.999193, 1.012563]`
+(20000 resamples over the 48 paired per-round ratios) — both kernel arms are LIVE in the same
+rig invocation as both FrankenFS arms, which is what makes this an interleaved A/A. Candidate
+A/A null control, two identical FrankenFS mounts of identical images from this same ELF, also
+same-invocation: `1.011956` `[0.999045, 1.054262]`.
+
+Counted mechanism: **1,605,682 getxattr requests for 1,605,632 client stats**, read off the
+daemon's unconditional crossing counter at the kernel boundary, identical in both FrankenFS
+arms; and **32,770 request scopes** against those 1,605,682 crossings.
+
+**The crossing census is identical in both FrankenFS arms**, so the two arms did the same work:
+`crossings_getxattr=1605682` for 1,605,632 client stats — **1.000031 `getxattr` crossings per
+stat, on every round, forever** — `crossings_lookup=32576` (ONE round's worth; the dentry cache
+holds), `crossings_getattr=1`. `op_counts getxattr=32770`, i.e. only 32,770 of the 1,605,682
+crossings open a request scope; the capability memo answers the other **97.96%**.
+
+### Where the loss is, measured three ways
+
+1. **`ops_ns_getxattr=0` for 1,605,682 crossings.** The filesystem does ZERO work on the hot
+   path. `dispatch_ns_total=4476432925` against `ops_ns_total=41716922` — the ops layer is
+   **0.93%** of dispatch, and getxattr's share of it is exactly zero.
+2. **`dispatch_ns_getxattr / crossings_getxattr` = 4,162,670,571 / 1,605,682 = `2,592 ns`** to
+   serve one bitmap-memo hit and reply. That is the unit cost of the crossing, not of a lookup.
+3. **`perf record -F 4999 -g` on the daemon, 25,506 samples, 20.4 G cycles:**
+
+       87.62%  [kernel.kallsyms]      fuse_copy_fill, __pi_memcpy, fuse_dev_do_read/write,
+                                      entry_SYSRETQ_unsafe_stack, vfs_writev, ksys_read
+        6.72%  ffs-cli                (our whole ELF, fuser included)
+        3.00%  [vdso]
+        2.66%  libc.so.6
+
+   Inside our 6.72%: `Request::dispatch` 0.94%, `Session::dispatch_next` 0.84%,
+   `FrankenFuse::getxattr` **0.59%**, `ffs_core::*` ~0.5%. Linux AUDIT and AppArmor on the
+   daemon's OWN `read`/`write` syscalls (`audit_reset_context`, `__audit_syscall_exit/entry`,
+   `auditd_test_task`, `audit_filter_inodes`, `apparmor_file_permission`) total **8.54%** —
+   more than everything FrankenFS executes.
+
+**⛔ REJECTED, with a bound: no codegen, ISA, PGO or algorithmic lever can matter on this row.**
+The daemon burns ~110 ms of CPU per 138.5 ms batch and 6.72% of it is our ELF. Making our
+userspace INFINITELY fast removes at most ~7.4 ms of 138.5 ms and lands the row at ~5.7x. That
+also disposes of the bd-b9dug ISA caveat quantitatively rather than by re-building: this ELF is
+baseline-ISA and un-PGO'd, so the `5.998540x` LOSS is OVERSTATED, and it is overstated by at
+most a few percent because ISA cannot touch the 87.62% that is kernel.
+
+### The lever that IS there, and it is not a filesystem lever
+
+The daemon dispatches SERIALLY and is the bottleneck: 11 ticks (~110 ms) of CPU per 138.5 ms
+batch on one core, feeding 8 clients. `FFS_FUSE_WORKERS=4`, one ELF, within-window, arms rotated:
+
+    def / w4 = 1.995801x  [1.980669, 2.005521]   n=48, both daemons on CPUs 8-15
+
+Reproduced with the arms MIRRORED (`w4` mounted first) at `1.950130x` `[1.884, 1.999]` n=24, and
+at `2.083103x` `[2.059231, 2.151680]` n=12 in a third window. Worker sweep on the shared cpuset,
+each against the default in its own window: **w2 `1.557306x`, w4 `2.083103x`, w6 `1.760x`,
+w8 `1.614163x`-`1.643822x`, w16 `1.241075x`** — 4 is the optimum when 8 clients and the daemon
+share 8 CPUs, and the curve turns over exactly where 8 clients + N workers oversubscribe.
+
+Per-crossing dispatch goes UP under workers (`6688368555 / 1605682 = 4,165 ns` vs `2,592 ns`)
+while wall time halves: 7.106 s of aggregate worker time per 49 batches inside 69.5 ms of wall is
+**2.09x realised concurrency**. Metadata parity is byte-identical — all 32,768 entries'
+name/size/mode/nlink/uid/gid through the FrankenFS mount hash to
+`7c8b88c2302c032f479890fb17abf5bb98fb9c8827d267971c4a380d5f32cba8`, the same as through the
+kernel mount.
+
+**Two controls say what the win is NOT.**
+
+- **It is not "more CPU".** `FFS_FUSE_WORKERS=8` confined to ONE CPU measures **158.426 ms**
+  against the serial default's 137.656 ms in the same window — a **15% LOSS**. Threads without
+  CPU to run on make it worse. The win appears only when the workers can occupy the CPU the
+  clients release while blocked on the round trip, which is why the resource-parity placement
+  (daemon and clients sharing CPUs 8-15, total footprint equal to the kernel arm's) wins at all.
+- **It does not compose with the banked spin lever.** `FFS_FUSE_RECEIVE_SPIN=2000` on top of
+  `FFS_FUSE_WORKERS=4`: `w4 / w4spin = 0.953115x` `[0.934481, 0.984303]` n=24 — spin is **4.9%
+  SLOWER** here, just outside the candidate A/A margin. Spinning workers burn the CPU the other
+  workers need. The two admitted spin rows were both single-dispatch-thread mounts.
+
+### One instrument finding worth more than the row
+
+**The candidate A/A null FAILED at `1.256363x` `[1.125963, 1.346718]` until the governor was
+fixed.** Two identical mounts, identical images, one ELF, differing 25.6%. Swapping which daemon
+sat on which CPU moved the asymmetry WITH THE CPU (`1.256363` with A on cpu16, `0.933320` with A
+on cpu17), so it was placement, not arm identity. The cause was `powersave` /
+`balance_performance` on the daemon cores — a mostly-idle daemon core never ramps. With
+`performance` set on CPUs 8-23 and 40-55 the same A/A null measures `1.011956`
+`[0.999045, 1.054262]`. **A daemon core is idle between requests by construction, so a FUSE A/B
+is far more governor-sensitive than a client-side one**, and this rig would have manufactured a
+25% "lever" out of nothing.
+
+### Admissibility
+
+This is a hand rig, not `ffs-mounted-kernel-bench`, and the ELF fails both of that instrument's
+gates (baseline ISA, no PGO). **The `5.998540x` and `3.018357x` figures are therefore NOT
+scorecard rows** and must not be quoted against the banked `3.671116x`, which was measured on a
+v3+PGO candidate through the gated comparator with a different fixture lifetime. What this row
+banks is (a) the counted mechanism — 1.000 `getxattr` crossings per stat, `ops_ns=0`, 87.62%
+kernel — which is ISA-invariant, and (b) the one-ELF interior A/B `1.995801x`, which is
+ISA-invariant by construction because both arms are the same binary.
+
+`FFS_FUSE_WORKERS` is NOT proposed as a default. It is banked as LOSING `0.839x` on
+parallel-read, and the scope rule from that row (shared-vs-exclusive opcode mix) is what this
+result confirms from the other side: a workload whose every crossing is a read-only memo hit is
+the best case for concurrent dispatch, and a workload holding exclusive state is the worst.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/readdir_stat_ab/mkfixture.sh
+    gcc -O2 -o $WORK/rdstat_ab scripts/perf/readdir_stat_ab/rdstat_ab.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=48 TAG=final \
+      FA_LABEL=def FB_LABEL=w4 FA_CPUS=8-15 FB_CPUS=8-15 FB_ENV="FFS_FUSE_WORKERS=4" \
+      bash scripts/perf/readdir_stat_ab/run_multi.sh
+    python3 scripts/perf/readdir_stat_ab/analyze.py $WORK/rdstat-final.csv
