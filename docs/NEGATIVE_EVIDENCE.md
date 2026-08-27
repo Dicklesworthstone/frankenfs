@@ -17731,3 +17731,84 @@ us than for the kernel**, while being flatly insensitive to daemon CPU. That rul
 compute starvation and points at contention for something shared (memory bandwidth, the loop device,
 or the kernel FUSE transport itself). That is the next question on this row; it is not answered
 here. Nothing shipped, nothing reverted: no candidate change in these runs, only a placement.
+
+## 2026-08-27 — bd-4iqg6: the audit capability probe is worth only `1.092441x` on parallel-read (balanced, five runs) — NOT the parity-reaching lever it was on the metadata rows — and removing 24.4% of the round trips lightens the tail by 4%, which RULES OUT crossing-count queueing as the tail mechanism
+
+The previous entry left the tail pointing at "contention for something shared" and ruled out daemon
+CPU. The census answers where to look first, and it is free — the rig already runs with
+`FFS_OP_COUNTS=1`.
+
+**Census, from the `w2` run, 6400 file opens over 25 rounds.** `crossings_getxattr=6425` — **exactly
+1.000 audit `security.capability` probes per open**, the same rate this campaign measured on the
+metadata rows. But `op_counts getxattr=257`: the memo already answers 96% of them, so what remains
+is not lookup work, it is the ROUND TRIP. And the round trip is the whole row:
+`dispatch_ns_total=146358215` (146.36 ms) against `ops_ns_total=960051` (0.96 ms) — **our actual
+filesystem work is 0.66% of the time this row spends**. Per-opcode dispatch: `other` 83.94 ms (the
+6400 flushes and 512 reads), `open` 21.01 ms, `release` 19.02 ms, `getxattr` 17.24 ms.
+
+That predicts the lever's size before it is run: `FFS_FUSE_XATTR_NO_SUPPORT=1` answers ENOSYS, which
+makes the kernel stop SENDING the probe (one-way for the life of the connection), removing 6425 of
+26328 crossings = 24.4% of them and 17.24/146.36 = 11.8% of dispatch time. Predictions registered
+before the runs: floor improves ~11.8%, row moves `1.3038x` -> `~1.16x`, and IF the tail is
+round-trip queueing the tail burden falls with the crossing count.
+
+**Instrument.** As the previous two entries: four live mounts in ONE invocation, two kernel ext4 ro
+loop mounts (`k1`, `k2`) and two FrankenFS ro mounts from the SAME ELF, all four on
+loop+`--direct-io=on`, 24 rounds x 8 client threads on cpus 8..15, daemons on cpus 18/19, arm order
+rotated per round. The FrankenFS arms differ ONLY in `FFS_FUSE_XATTR_NO_SUPPORT`.
+`binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
+`hostname=thinkstation1`, rch worker NONE, `bootstrap_resamples=20000`.
+
+**THE LEVER RAN — counted, per run, both directions.** `crossings_getxattr` **6426 -> 1** and
+`crossings_total` **26329 -> 19904** in every run. Not a knob taken on trust.
+
+| run | dir | kernel tail `k1`/`k2` | window gate | lever `min` | lever `lo4` | estimators differ | A/A null (floor) |
+|---|---|---|---|---|---|---|---|
+| `x1` | fwd | `1.0471` / `1.0631` | **ADMIT** | `1.086881` | `1.056562` | 2.9% | `0.997545` |
+| `x5` | fwd | `1.1573` / `1.1615` | **ADMIT** | `1.104630` | `1.171244` | 5.7% | `0.984086` |
+| `x2` | mir | `1.2716` / `1.3117` | refuse | `1.180292` | `0.935645` | **26.1%** | `1.008398` |
+| `x3` | mir | `1.2596` / `1.2556` | refuse | `1.063167` | `1.080751` | 1.6% | `0.985732` |
+| `x4` | mir | `1.2725` / `1.1266` | refuse | `1.193557` | `1.221066` | 2.3% | `0.991009` |
+
+**On the window gate, stated plainly.** I set "kernel tail burden <= 1.20" BEFORE these runs, because
+the floor estimator was only ever validated in windows sitting at 1.05-1.14. All three MIRRORS fail
+it — the host carried a peer job at loadavg 68-85 with 80% system time for part of this session, and
+two bounded waits (237 s, 188 s) bought a quieter window for the forward runs but never for a mirror.
+I am reporting the balanced figure using the refused mirrors anyway, transparently, because the only
+alternative is a forward-only number and a one-directional A/B is the exact error the previous entry
+caught (it would have published a 2.4% win that did not exist). `x2` is the least trustworthy of the
+five on an INTERNAL check rather than a window proxy: its two floor estimators disagree by 26.1%,
+where every other run agrees to within 5.7%.
+
+**RESULT — balanced across 2 forward and 3 mirrored runs**: `min` estimator **`1.119666x`**, `lo4`
+estimator **`1.092441x`**. Publishing the conservative **`1.092441x`**. Spread across the five runs
+is `1.123x` (`1.0632`..`1.1936`), and all five A/A nulls sit in `0.984`..`1.008`.
+
+**Finding 1 — the capability probe is NOT the story on this row.** On the four read-only metadata
+rows, suppressing this probe moved `3.9-4.9x` to kernel PARITY; here it is worth `1.09x`. The
+difference is structural and the census names it: those rows are almost entirely path resolution, so
+the probe is most of their crossings, while parallel-read's getxattr is 24.4% of crossings against
+76% open/release/flush/read. **A lever that reached parity elsewhere buys 9% here, and the row stays
+a LOSS at `1.164471x`.** This scopes the campaign's biggest read-side result rather than extending
+it.
+
+**Finding 2 — this RULES OUT crossing-count queueing as the tail mechanism.** Removing 24.4% of the
+round trips bought 10.7% of the time but lightened the tail burden by only **4.0%** (geomean
+`1.0413` over five runs, individually `1.0174`, `1.0180`, `1.0682`, `0.9968`, `1.1100` — one of them
+below 1). If the tail were the 8 client threads queueing behind round trips, deleting a quarter of
+the round trips would have moved it much more than that. Combined with the previous entry's balanced
+null on daemon cores, the tail is now shown to be insensitive to BOTH daemon CPU and crossing count.
+
+**Not shippable, and not a win — this is a decomposition.** `FFS_FUSE_XATTR_NO_SUPPORT=1` makes the
+mount refuse xattrs entirely; it is sound here only because the fixture has none, and on an image
+that has them it breaks correctness rather than merely failing to pay. It can never be a default.
+Nothing shipped, nothing reverted.
+
+**Named next step with a falsifiable prediction.** `FFS_FUSE_XATTR_PROVEN_ABSENT_SHORTCIRCUIT`
+(bd-t0xoq) is the shippable-shaped sibling — gated on `XattrPresence::ProvenAbsent` plus a read-only
+mount, which is exactly this row's regime. **I predict it is worth approximately NOTHING here**, and
+the reason is in the code, not the timing: `getxattr_value` answers it with `Ok(None)` in userspace,
+so the CROSSING remains, and the crossing is the cost — the memo already absorbs 96% of these probes
+(`op_counts getxattr=257` against `crossings_getxattr=6425`) while the row still pays 17.24 ms of
+`dispatch_ns_getxattr`. Its target regime is the COLD first sweep, where the memo is useless; this
+row is the opposite. That prediction is unmeasured and stated so it can be falsified.
