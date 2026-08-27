@@ -4562,6 +4562,10 @@ impl KernelNotifyQueue {
     }
 
     fn entry(&self, parent: u64, name: &std::ffi::OsStr) {
+        // bd-pmjvd: counted, so the fsync path's 1.000 notify-wake/op can be
+        // attributed to a real send or ruled out. A relaxed counter on a path
+        // that already allocates an OsString and crosses a channel.
+        NOTIFY_ENTRY_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self.sender.send(KernelNotification::Entry {
             parent,
             name: name.to_owned(),
@@ -4569,9 +4573,35 @@ impl KernelNotifyQueue {
     }
 
     fn inode(&self, ino: u64) {
+        NOTIFY_INODE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self.sender.send(KernelNotification::Inode { ino });
     }
 }
+
+/// bd-pmjvd: should a successful FUSE `write` invalidate the kernel's page cache for
+/// the inode it just wrote?
+///
+/// Default ON (the shipping behaviour). `FFS_FUSE_WRITE_INVAL=0` turns it off for an
+/// A/B from a single ELF. Counted cost: exactly 1.000 enqueue per write, each a futex
+/// wake plus a reverse-invalidation round trip.
+pub fn write_inode_invalidation_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_FUSE_WRITE_INVAL")
+            .ok()
+            .map_or(true, |raw| {
+                let v = raw.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
+            })
+    })
+}
+
+/// bd-pmjvd: how many notifications were actually ENQUEUED, so a futex wake on the
+/// notify thread can be tied to a real send or shown to have no send behind it.
+/// Reported by `ffs-cli` at unmount when FFS_NOTIFY_SEND_COUNT=1.
+pub static NOTIFY_ENTRY_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Twin of [`NOTIFY_ENTRY_SENDS`] for inode invalidations.
+pub static NOTIFY_INODE_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 const IOCTL_TRACE_CHANNEL_CAPACITY: usize = 4096;
 
@@ -5231,6 +5261,16 @@ impl Filesystem for FrankenFuse {
     }
 
     fn destroy(&mut self) {
+        // bd-pmjvd: report the ENQUEUE counts so a notify-thread futex wake can be
+        // tied to a real send. WARN so it survives RUST_LOG=off runs, and only when
+        // asked for, so no normal mount pays a line for it.
+        if std::env::var("FFS_NOTIFY_SEND_COUNT").is_ok_and(|v| v.trim() == "1") {
+            warn!(
+                entry_sends = NOTIFY_ENTRY_SENDS.load(std::sync::atomic::Ordering::Relaxed),
+                inode_sends = NOTIFY_INODE_SENDS.load(std::sync::atomic::Ordering::Relaxed),
+                "notify_send_counts"
+            );
+        }
         let cx = Self::cx_for_request();
         if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {
             self.record_final_flush_failure(&e);
@@ -6231,7 +6271,19 @@ impl Filesystem for FrankenFuse {
         ) {
             Ok(written) => {
                 reply.written(written);
-                self.notify_inode_invalidation(ino);
+                // bd-pmjvd: counted at exactly 1.000 enqueue per write, and it is the
+                // ONLY notification this workload produces (entry_sends=1,
+                // inode_sends=502 over 501 ops). Each one costs a futex wake plus a
+                // reverse-invalidation round trip, to tell the kernel to drop cached
+                // pages for data the kernel itself just handed us.
+                //
+                // Knob, default ON, so the A/B runs from one ELF. Default is NOT
+                // flipped here: whether the kernel's copy can ever diverge from ours
+                // after a write is a data-integrity question, not a perf one, and it
+                // needs a read-after-write correctness argument before it ships.
+                if crate::write_inode_invalidation_enabled() {
+                    self.notify_inode_invalidation(ino);
+                }
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
