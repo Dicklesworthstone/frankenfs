@@ -50174,14 +50174,14 @@ mod tests {
     fn extent_cache_refuses_entries_that_exceed_its_byte_budget_bd_mf9z9() {
         let cache = Ext4ReadExtentCache::new(8);
         cache.insert(BlockNumber(100), Arc::from([1_u8; 8]));
-        cache.insert(BlockNumber(101), Arc::from([2_u8; 1]));
+        cache.insert(BlockNumber(108), Arc::from([2_u8; 1]));
 
         let mut admitted = [0_u8; 8];
         assert!(cache.copy_into(BlockNumber(100), 1, &mut admitted));
         assert_eq!(admitted, [1_u8; 8]);
         let mut rejected = [0_u8; 1];
         assert!(
-            !cache.copy_into(BlockNumber(101), 1, &mut rejected),
+            !cache.copy_into(BlockNumber(108), 1, &mut rejected),
             "a second entry must not push resident bytes over the fixed budget"
         );
     }
