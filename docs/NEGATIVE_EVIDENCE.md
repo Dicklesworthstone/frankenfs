@@ -17872,3 +17872,69 @@ now needs is the latent-backend guard plus rows outside this one. I also did not
 test this turn: `/data` is at 93% with peers holding active builds, and I will not commit a test I
 cannot cheaply verify compiles. The measurement is recorded in the knob's own docstring beside the
 claim it refutes, which is where the next person will look.
+
+## 2026-08-27 — bd-4iqg6: I VOID four of my own eight capability-probe runs under the load-spike rule and re-derive the figure from the four admissible ones — the lever is `1.127366x`, my published `1.092441x` was VOID-derived and UNDERSTATED it, and my "rules out crossing-count queueing" claim is REVISED as overstated
+
+A standing instruction now voids any measurement taken while host load spikes. That lands on my own
+most recent published figure. In the previous entry I balanced the capability-probe lever using
+three MIRRORS that failed the window gate I had stated before those runs, and I said so at the time
+— a peer job held the host at loadavg 68-85 with 80% system time and I could not buy a clean mirror.
+Under the rule those runs are void, so this turn re-earns the number instead of defending it.
+
+**Gate, unchanged and applied uniformly to all eight runs**: kernel tail burden <= 1.20 on BOTH
+kernel arms, measured INSIDE the window on the incumbent arm — a better spike detector than an
+external load sample, which is what I had been reaching for. (My attempt to sample `/proc/loadavg`
+during a run produced exactly one sample: foreground `sleep` is blocked in this harness, so the
+sampler loop died after one iteration. The in-window proxy is the right instrument anyway.)
+
+| run | dir | kernel tail `k1`/`k2` | A/A null | verdict | lever `min` | lever `lo4` |
+|---|---|---|---|---|---|---|
+| `x1` | fwd | `1.0471` / `1.0631` | `0.997545` | **ADMIT** | `1.086881` | `1.056562` |
+| `x5` | fwd | `1.1573` / `1.1615` | `0.984086` | **ADMIT** | `1.104630` | `1.171244` |
+| `m1` | mir | `1.0783` / `1.0900` | `1.000814` | **ADMIT** | `1.153223` | `1.167519` |
+| `m3` | mir | `1.1756` / `1.1174` | `0.991958` | **ADMIT** | `1.166670` | `1.138168` |
+| `x2` | mir | `1.2716` / `1.3117` | `1.008398` | VOID | `1.180292` | `0.935645` |
+| `x3` | mir | `1.2596` / `1.2556` | `0.985732` | VOID | `1.063167` | `1.080751` |
+| `x4` | mir | `1.2725` / `1.1266` | `0.991009` | VOID | `1.193557` | `1.221066` |
+| `m2` | mir | `1.3263` / `1.2774` | `1.070928` | VOID | `1.217382` | `1.107644` |
+
+**The gate is selecting on noise, not on outcome, and the data say so.** The four admissible runs
+agree to **1.6% within forward** (`1.086881`, `1.104630`) and **1.2% within mirrored** (`1.153223`,
+`1.166670`); the four voided runs scatter **11%** in the same direction (`1.063167` vs `1.180292`).
+`m2` additionally fails on its own A/A null (`1.070928`, against `0.984`-`1.001` for every admitted
+run) — an internal check, not a window proxy.
+
+**RESULT, four admissible runs, two per direction**: `min` **`1.127366x`**, `lo4` **`1.132409x`**,
+the two estimators agreeing to **0.45%** (they disagreed by 2.5% on the contaminated set).
+Publishing the conservative **`1.127366x`**. Row after the lever: **`1.156518x`** slower than live
+kernel ext4, still a LOSS. The direction effect is **5.9%** and systematic — mirrored runs read
+higher than forward ones in every case — which is exactly why a one-directional figure on this row
+is not admissible.
+
+**My published number was wrong, and in the safe direction.** `bbe45c6c1` reported `1.092441x`
+(conservative estimator) from the contaminated set; the clean value is `1.127366x`, so the void
+figure **UNDERSTATED the lever by 3.7%**. Nothing downstream of it was overstated, and no conclusion
+that rested on it is reversed.
+
+**Finding 1 SURVIVES and is slightly strengthened.** The capability probe took four read-only
+metadata rows from `3.9-4.9x` to kernel PARITY; on parallel-read it is worth `1.127366x`. The row
+stays a LOSS. The scoping conclusion — that this lever's parity result does not generalise to a row
+whose crossings are only 24.4% getxattr — is unchanged.
+
+**Finding 2 is REVISED, and it was overstated.** I wrote that removing 24.4% of the round trips
+"RULES OUT crossing-count queueing as the tail mechanism" because the tail lightened only 4.0%
+against 10.7% of time bought. On the admissible runs alone the tail lightens **6.7%** against
+**11.3%** of time bought — proportionally 59% as much, not 37%. More importantly the per-run tail
+ratios are `1.0174`, `1.1100`, `1.1693`, `0.9983`: a **`1.17x` spread around a `1.0715` geomean**,
+one of them below 1. **A 6.7% effect is not resolvable against that scatter, so "ruled out" was a
+claim the data could not carry** — it rested partly on voided runs and partly on a spread I never
+quantified. What survives is the weaker and still useful statement: **the tail does not move
+proportionally with the crossing count** (24.4% of crossings removed moves it at most ~7%). Whether
+it moves at all is UNDECIDED on this instrument. The previous entry's other tail result is
+unaffected: our tail excess over the kernel on the admissible runs is `1.1537x`, against `1.1555x`
+from the five baseline runs — agreeing to 0.16%.
+
+Nothing shipped, nothing reverted. One ELF throughout,
+`binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
+`crossings_getxattr` `6426 -> 1` counted in every run, `hostname=thinkstation1`, rch worker NONE,
+`bootstrap_resamples=20000`.
