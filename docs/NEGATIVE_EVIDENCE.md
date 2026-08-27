@@ -17995,3 +17995,70 @@ now GUARDED rather than refuted — it remains unreachable, and is now unreachab
 default stays OFF: that is still a whole-product decision needing rows outside this one's regime
 (read-only ext4, no writeback, no mmap), and I am not flipping it on one row's evidence. What changed
 is that the reason it is off is no longer "an unmeasured worry nobody is watching".
+
+## 2026-08-27 — bd-4iqg6: the parallel-read row's round-trip budget, COUNTED — `4.476` crossings per file of which `91.1%` carry no file data; the three knobs are EXACTLY ADDITIVE (to 1 crossing in 5729) and the counts reproduce to `±1`, but only `44.7%` of the ladder is shippable
+
+Every wall-time ratio I have taken on this host today has been fragile — three windows voided for load
+spikes, four of eight runs voided in one entry — while every COUNTED result has held exactly. On this
+row a count is not a proxy for the mechanism, it IS the mechanism: the census measured
+`dispatch_ns_total` 146.36 ms against `ops_ns_total` 0.96 ms, so ~99% of the row is the FUSE round
+trip and ~0.7% is our filesystem work. Crossings therefore set the floor, and they can be measured
+without a quiet window.
+
+**Instrument.** `scripts/perf/parallel_read_ab/crossing_ladder.sh`: one config per mount lifetime
+(because `crossings_*` is cumulative and only emitted at unmount), identical workload each time —
+4 rounds + warmup x 8 threads over 256 files x 256 KiB = **1280 file opens**. Each config attests its
+own knob (`zmo_negotiated` read from the daemon's own log). No timing is claimed from this run.
+
+**ELF provenance, and an incident worth recording.** The binary all of today's earlier rows used
+(`05087d76…d832fcc`, `target/zmvec2`) **was reaped mid-session** — it existed for the `m3` run and was
+gone ~20 minutes later, `bench-evidence` silent and `taskset` reporting no such file. The two freshest
+binaries on disk (17:32, 17:38) are peers' in-flight builds and are not mine to use, so I built my own:
+`binary_sha256=7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec`, HEAD, **debug
+profile**. Debug is legitimate HERE and only here: a crossing count is a property of the protocol path,
+not of codegen. **No wall-time ratio may be quoted from this binary**, and none is.
+
+**THE LADDER**, 1280 file opens:
+
+| config | crossings | per file | removed |
+|---|---|---|---|
+| base | 5729 | `4.476` | — |
+| `FFS_FUSE_XATTR_NO_SUPPORT` | 4444 | `3.472` | 22.4% |
+| `FFS_FUSE_NO_FLUSH` | 4451 | `3.477` | 22.3% |
+| `FFS_FUSE_ZERO_MESSAGE_OPEN` | 3171 | `2.477` | 44.7% |
+| all three | 609 | `0.476` | **89.4%** |
+
+**The three knobs are EXACTLY ADDITIVE.** getxattr `1285` + open/release `2558` + flush `1278` =
+`5121`; `5729 − 5121 = 608` against a measured `609`. **Additive to one crossing in 5729 (0.02%)** —
+they touch disjoint parts of the protocol and nothing double-counts.
+
+**The counts are deterministic, which is the whole point of taking this route.** Two independent runs
+of the full ladder: base `5729`/`5729`, noxattr `4444`/`4444`, noflush `4451`/`4451` — **bit-exact**;
+zmo `3171`/`3170` and all3 `609`/`610` differ by exactly **one** `crossings_open`, a race on the
+mount-time root open. **±1 in 5729 is 0.017%**, against a `1.123x` spread on the wall-time lever for
+this same row. That is a ~7000x difference in reproducibility for the same underlying question.
+
+**What the residual says.** Of 5729 base crossings, about **512 carry file data** (the reads) — so
+**91.1% of this row's round trips move no file bytes at all**. Per file read: `4.476` crossings, of
+which `~0.4` are reads and `~4.08` are protocol scaffolding, against a kernel arm that pays **zero**
+round trips per file. That is the row's structural loss stated without a stopwatch.
+
+**⚠ ONLY 44.7% OF THIS LADDER IS SHIPPABLE, and the 89.4% must not be read as an available speedup.**
+`FFS_FUSE_XATTR_NO_SUPPORT` (22.4%) is RESTRICTED — the mount refuses xattrs entirely, sound only on
+an image that has none, never a default. `FFS_FUSE_NO_FLUSH` (22.3%) is MEASUREMENT ONLY, valid while
+`FsOps::flush` is a stub and not one day longer. Only zero-message open (44.7%) is a candidate, and it
+is still default OFF pending rows outside this regime, now with its latent-backend guard in place.
+
+**⚠ AND COUNTS ARE NOT A LINEAR TIME PROXY — the two measured points disagree by 1.63x.** Zero-message
+open removed 48.60% of crossings for a measured `1.160389x` (13.8% of time) = 0.284% time per 1% of
+crossings; xattr suppression removed 24.40% for `1.127366x` (11.3%) = 0.463%. **Removing a getxattr
+crossing buys ~1.6x more time than removing an open/release one.** This CUTS AGAINST the naive reading
+of the ladder, and it is unexplained: the census's own `dispatch_ns` points the other way
+(`getxattr` 2.68 µs/crossing vs `open` 3.28 µs and `release` 2.97 µs), i.e. the crossings that buy the
+most time are the ones the daemon reports as cheapest. Either `dispatch_ns` (receive-to-reply inside
+the daemon) misses where a probe's cost actually lands — it fires synchronously during the client's
+path resolution — or the cost is not per-crossing at all. I am recording the contradiction rather than
+picking the story that flatters the ladder. **A crossing count is an exact mechanism and an exact
+floor; it is NOT a time predictor on this row.**
+
+Nothing shipped, nothing reverted.
