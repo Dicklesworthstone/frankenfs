@@ -18200,3 +18200,67 @@ predicted speedup: the previous entry established that crossing count is not a t
 codebase (the same correction over- and under-shot two measured levers by 63% and 19%).
 
 Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-4iqg6 / worst row: the capability probe is UNCONDITIONAL KERNEL BEHAVIOUR, not something FrankenFS provokes — the live kernel ext4 incumbent performs the IDENTICAL `10,004` capability lookups and `16,005` VFS xattr reads, and serves all 10,000 user syscalls with **one** voluntary context switch against our `20,001`
+
+The previous entry decomposed the campaign's worst row and ended by naming the one question that
+decides how to read it: the probe RATE was measured and exact, but its CAUSE was open. If the probe is
+unconditional kernel behaviour it is a permanent FUSE floor; if it is configuration-dependent then the
+worst row's headline is partly a property of this measurement host. I also flagged that I could NOT
+support the campaign's existing attribution to this host's audit rules, because the mount sits outside
+the audited tree and the probes fire anyway. This entry answers it.
+
+**Instrument.** `scripts/perf/xattr_ab/capsource.sh` runs the SAME client binary (`xblockprobe`, 2000
+reports x 5 path-based xattr syscalls) over the SAME fixture on the SAME host against two arms — a
+LIVE kernel ext4 ro loop mount (the incumbent) and a FrankenFS FUSE mount — while one `bpftrace`
+session per arm counts `get_vfs_caps_from_disk` (the function that actually reads
+`security.capability` off an inode) and `__vfs_getxattr`, filtered to the client's `comm`. Counting the
+kernel function directly is the point: it settles the question on the KERNEL side of the boundary
+instead of arguing from FUSE traffic. The script waits for bpftrace's "Attaching" line before starting
+the client, because a probe that attaches late undercounts and would look exactly like the finding
+being tested. ELF `7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug —
+these are counts; **no wall time is claimed or quoted**). `hostname=thinkstation1`.
+
+| quantity | kernel ext4 (live incumbent) | FrankenFS (FUSE) |
+|---|---|---|
+| `get_vfs_caps_from_disk` | **10,004** | **10,004** |
+| `__vfs_getxattr` | **16,005** | **16,005** |
+| client voluntary ctx switches | **1** | **20,001** |
+| daemon `crossings_getxattr` | — | **16,005** |
+
+Both runs reproduced **bit-exact on every one of those five numbers**.
+
+**ANSWER: unconditional.** The incumbent performs exactly the same number of capability lookups as we
+do — `10,004` for 10,000 user syscalls, `1.000` per path resolution. **FrankenFS does not provoke a
+single extra capability lookup.** The worst row's `50.0%` is therefore a PERMANENT FUSE FLOOR on this
+kernel and not an inflation of the headline by this host's configuration. The caution I recorded last
+entry was right to withhold the claim; the answer is that it is not a host artifact.
+
+**The audit-rules attribution is RETIRED as the explanation.** The cause is the VFS capability path,
+which runs for every filesystem on every path resolution — which is precisely why the kernel arm,
+sitting outside any FUSE involvement, pays the identical count. Earlier notes attributing the probe to
+this host's `-w /data/projects` watch should not be repeated: the mount is outside that tree and the
+kernel arm pays it too.
+
+**The decomposition closes exactly, with no fitted term.** `__vfs_getxattr` `16,005` = capability
+lookups `10,004` + the batch's own three `getxattr` per report (`6,000`) + warm-up. And on the FUSE
+side, **`crossings_getxattr` = `__vfs_getxattr` = `16,005` exactly**: every single VFS xattr read on a
+FUSE mount becomes a FUSE crossing, 1:1, with nothing absorbed below the boundary. The daemon census
+and the kernel-side kprobe are measuring the same events and agree to the unit.
+
+**THE ENTIRE GAP IS THE ROUND TRIP, stated as a count.** Identical VFS work on both arms — and the
+kernel client blocks **once** across 10,000 user xattr syscalls while ours blocks **20,001** times.
+That is what "in-process" means numerically, and it is the incumbent's structural advantage on this
+row expressed without a stopwatch. There is no filesystem work to win back: the previous entry already
+counted the daemon at 9 handler entries for 10,000 user ops (`0.090%`, memo hit `99.956%`).
+
+**What this means for the campaign's four "parity by suppression" rows — a scoping note, not a
+retraction.** Suppressing the probe with `ENOSYS` removes a round trip that the KERNEL ALSO INCURS but
+serves in-process for nearly free, so those comparisons were not unfair to the incumbent. But it is
+now measured that suppression does not remove *shared* work — it declines to answer a query the kernel
+arm still answers correctly. That is a SEMANTIC trade, not a pure win, and it is exactly why the knob
+is RESTRICTED and refused on any image whose xattrs are present. The parity figures stand as measured;
+what is now precise is what was traded for them.
+
+Nothing shipped, nothing reverted. This is the fifth consecutive counted result to reproduce to ±1 or
+better while wall-time rows on this host were being voided for load.
