@@ -8,6 +8,60 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Configured dirty-page decay, in ms; `-1` disables purging. Default `-1`.
+///
+/// The bulk-durable-write path stages one 4 KiB `Vec` per block — 16,384 per
+/// 64 MiB batch — and frees them all at the flush. jemalloc's decay reacts to
+/// that free burst by returning the pages to the kernel, so the next batch
+/// faults every one of them back in. Counted 2026-08-27 on the bulk row:
+/// **152,996 minor faults per 6 rounds at the default decay against 36,858 with
+/// it disabled — 4.15x — and daemon CPU 69 → 48 ticks.** Measured vs live kernel
+/// ext4 in the same invocation, forward and mirrored: balanced **`1.308717x`**
+/// on the whole batch and **`1.669753x`** on the fsync phase, A/A nulls
+/// `0.997425` / `1.002381`.
+///
+/// Only `-1` works: `muzzy_decay_ms:-1` alone is a null (153,462 faults) and a
+/// bounded `dirty_decay_ms:30000` is also a null (152,551), because jemalloc's
+/// decay is driven by the dirty-to-active ratio of a free burst, not only by
+/// elapsed time. The cost is retention of freed memory, bounded by peak usage:
+/// measured RSS `348 → 423 MiB` (+21.6%) on the bulk row.
+///
+/// Set at runtime through `mallctl` rather than via a `_rjem_malloc_conf`
+/// static, because exporting that symbol needs `#[unsafe(no_mangle)]` and this
+/// crate is `#![forbid(unsafe_code)]`. ⚠ Note for anyone reaching for the env
+/// var instead: `tikv-jemallocator` prefixes its symbols, so plain `MALLOC_CONF`
+/// is SILENTLY IGNORED — it must be `_RJEM_MALLOC_CONF`.
+const DIRTY_DECAY_MS_DEFAULT: libc::ssize_t = -1;
+
+/// Dirty-decay value jemalloc reports after [`configure_dirty_decay`], for the
+/// mount's `mount_candidate_knobs` self-report.
+static DIRTY_DECAY_MS_IN_FORCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Apply [`DIRTY_DECAY_MS_DEFAULT`], overridable with `FFS_JEMALLOC_DIRTY_DECAY_MS`.
+///
+/// Writes both `arena.4096.dirty_decay_ms` (`MALLCTL_ARENAS_ALL`, the arenas that
+/// already exist) and `arenas.dirty_decay_ms` (the template every later arena is
+/// created from). Setting only the second leaves arena 0 — the one a
+/// single-threaded mount actually allocates from — at the stock decay.
+///
+/// Returns the value that is in force, read back from jemalloc rather than
+/// echoed, so the mount's self-report attests what the allocator actually holds.
+fn configure_dirty_decay() -> libc::ssize_t {
+    use tikv_jemalloc_ctl::{Access, AsName};
+
+    let requested = std::env::var("FFS_JEMALLOC_DIRTY_DECAY_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<libc::ssize_t>().ok())
+        .unwrap_or(DIRTY_DECAY_MS_DEFAULT);
+    // Best-effort: a jemalloc built without these knobs must not stop the mount.
+    let _ = b"arena.4096.dirty_decay_ms\0".name().write(requested);
+    let _ = b"arenas.dirty_decay_ms\0".name().write(requested);
+    b"arenas.dirty_decay_ms\0"
+        .name()
+        .read()
+        .unwrap_or(requested)
+}
+
 mod cmd_dump;
 mod cmd_evidence;
 mod cmd_inspect;
@@ -2150,6 +2204,12 @@ pub struct RepairScrubOutput {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // Before any substantial allocation, so arena 0's decay is set for the whole
+    // run rather than after the first burst has already been purged.
+    DIRTY_DECAY_MS_IN_FORCE.store(
+        i64::try_from(configure_dirty_decay()).unwrap_or(i64::MIN),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if let Err(error) = run() {
         eprintln!("error: {error:#}");
         std::process::exit(1);
@@ -7963,7 +8023,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},jemalloc_dirty_decay_ms={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -8002,6 +8062,9 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             // 2026-08-27: parks the flush run buffer instead of re-faulting 16,384
             // pages per flush; reported so it can be A/B'd from ONE ELF.
             ffs_mvcc::flush_buf_reuse_enabled(),
+            // 2026-08-27: read back from jemalloc, not echoed from the env, so the
+            // line attests what the allocator actually holds.
+            DIRTY_DECAY_MS_IN_FORCE.load(std::sync::atomic::Ordering::Relaxed),
         );
     }
 

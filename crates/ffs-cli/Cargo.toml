@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 tikv-jemallocator = "0.7"
+tikv-jemalloc-ctl = "0.7"
 anyhow = { workspace = true }
 asupersync = { workspace = true }
 clap = { workspace = true }

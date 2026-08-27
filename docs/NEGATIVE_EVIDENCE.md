@@ -14646,3 +14646,115 @@ step for this row rather than another peripheral knob.
   * ⭐ **Price your own lever with the same counter you used to justify it.** The
     fault-count hypothesis that motivated the buffer reuse also killed it, before any wall
     clock was involved and in a window where the wall clock was worthless.
+
+## 2026-08-27 — ⛔ WITHDRAWN: my REJECT of allocator tuning from one commit ago tested NOTHING (`MALLOC_CONF` is silently ignored under `tikv-jemallocator`). With the right prefix it is a `4.15x` fault reduction and a balanced `1.186689x` on the bulk row, now the shipped default
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/bulk_durable_write_ab/fltcount.sh` and `run_bulk_dio.sh`.** Provenance:
+in-process self-report
+`bench_evidence,binary_sha256=c2d83d25e6746bfc0ae3b4c1fbbe7d37ac5449ee47c1628e41fa25ac15c59e89`
+(env-only A/B) and
+`31652ce23e7d88b6b4b7133adc9fdc5e6f433090dc6cd86c3203333546f13d38` (shipped default),
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19, client on CPU 8, loop devices
+`--direct-io=on`.
+
+### ⛔ The withdrawal
+
+One commit ago I published **"REJECT 1 — allocator tuning is not the lever (counted,
+≤0.4%)"** on the strength of `MALLOC_CONF=retain:true` / `dirty_decay_ms:-1` /
+`muzzy_decay_ms:-1` moving the fault count by nothing. **`tikv-jemallocator` prefixes its
+symbols — the profile even shows `_rjem_je_*` — so the unprefixed `MALLOC_CONF` is read by
+nobody.** The arm was the control. The reject is WITHDRAWN in full.
+
+| env var | minor faults / 6 rounds |
+| --- | --- |
+| (none) | 152,198 |
+| `MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1` | 152,386 |
+| **`_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`** | **36,881** |
+
+⭐⭐ **I wrote "prove the lever ran before believing an identity result" into this ledger two
+commits ago and then failed to apply it to a NULL.** A null needs the same proof a win does:
+the knob must be shown to have reached the code. An env var the process never reads produces
+a perfect, meaningless null.
+
+### Attribution: only `dirty_decay_ms:-1` does it, and time-bounded decay does not
+
+| `_RJEM_MALLOC_CONF` | minor faults | daemon ticks | RSS |
+| --- | --- | --- | --- |
+| (none) | 152,996 | 69 | 348 MiB |
+| **`dirty_decay_ms:-1`** | **36,858** | **48** | 423 MiB |
+| `muzzy_decay_ms:-1` | 153,462 | 74 | 367 MiB |
+| `dirty_decay_ms:-1,muzzy_decay_ms:-1` | 38,226 | 51 | 429 MiB |
+| `dirty_decay_ms:30000,muzzy_decay_ms:30000` | 152,551 | 77 | 363 MiB |
+
+**`4.15x` fewer faults and `30%` fewer daemon ticks**, for `+75 MiB` RSS (`+21.6%`). ⭐ A
+*bounded* 30-second decay is a NULL: jemalloc's decay is driven by the dirty-to-active ratio
+of a free burst, not only by elapsed time, so the 16,384-block free at each flush triggers
+purging immediately whatever the timer says. Only disabling it works.
+
+### Shipped as a default, not an env var
+
+`crates/ffs-cli/src/main.rs`: `configure_dirty_decay()` writes
+`arena.4096.dirty_decay_ms` (`MALLCTL_ARENAS_ALL` — the arenas that already exist) **and**
+`arenas.dirty_decay_ms` (the template for later ones) through `tikv-jemalloc-ctl`, before
+`run()`. Setting only the second leaves arena 0 — the one a single-threaded mount actually
+allocates from — at the stock decay. Runtime `mallctl` rather than a `_rjem_malloc_conf`
+static because exporting that symbol needs `#[unsafe(no_mangle)]` and the crate is
+`#![forbid(unsafe_code)]`. Overridable with `FFS_JEMALLOC_DIRTY_DECAY_MS`.
+
+The value is **read back from jemalloc** and reported as `jemalloc_dirty_decay_ms` in
+`mount_candidate_knobs`, so the line attests what the allocator holds rather than echoing
+what was asked for. Verified in-process on the shipped ELF:
+
+| configuration | self-reported | minor faults | ticks | RSS |
+| --- | --- | --- | --- | --- |
+| default | `jemalloc_dirty_decay_ms=-1` | **37,425** | 48 | 425 MiB |
+| `FFS_JEMALLOC_DIRTY_DECAY_MS=10000` | `=10000` | 152,374 | 69 | 357 MiB |
+| `FFS_JEMALLOC_DIRTY_DECAY_MS=0` | `=0` | 151,573 | 70 | 357 MiB |
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+`run_bulk_dio.sh`, 24 rounds, 64 × 1 MiB + `fsync`, four arms simultaneously (two live
+kernel ext4 RW mounts = the A/A null, two FrankenFS from ONE ELF), order rotated per round,
+forward and mirrored with arms **and** daemon CPUs swapped.
+
+**Shipped ELF `31652ce2…`, default vs `FFS_JEMALLOC_DIRTY_DECAY_MS=10000`:**
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| whole batch | `1.129621` `[1.091704, 1.181781]` | `1.246640` `[1.204070, 1.303963]` | **`1.186689x`** |
+| `fsync` phase | `1.169982` | `1.484838` `[1.443936, 1.544771]` | **`1.318042x`** |
+| **A/A null, total** | `1.002479` `[0.979947, 1.022876]` | `0.995826` `[0.977508, 1.026618]` | `0.999147` **PASS** |
+| **A/A null, fsync** | `1.006870` `[0.982106, 1.028147]` | `0.994959` `[0.977120, 1.025680]` | `1.000897` **PASS** |
+
+**Env-only A/B on ELF `c2d83d25…` in a quieter window** (kernel `k1` `56.813 ms` vs the
+shipped run's `247.933 ms` forward): balanced **`1.308717x`** whole batch and
+**`1.669753x`** fsync, A/A nulls `0.997425` / `1.002381`. `1.186689x` is therefore the
+**conservative** claim — the forward half of the shipped pair ran in a window where the
+device dominated the fsync phase and diluted a CPU-side saving.
+
+Row against kernel ext4, from the mirrored halves' own windows:
+`k1/oldDecay = 0.369668` ⇒ `2.705x` slower, `k1/shipped = 0.450946` ⇒ **`2.218x`**; the
+quiet-window pair agrees at `2.966x → 2.206x`.
+
+Gates: `cargo check`/`clippy -D warnings` clean on `ffs-cli` (the 8 remaining clippy errors
+are pre-existing in `ffs-core` and untouched here), `cargo fmt --check` clean on the new
+code, `cargo test -p ffs-cli` **357 passed / 1 failed** where that one failure
+(`load_metrics_report_metrics_preset_reads_bundle`) reproduces identically at HEAD with the
+change stashed — pre-existing, not caused here.
+
+### Transferable
+
+  * ⭐⭐⭐ **A null needs the "did the knob reach the code" proof exactly as much as a win
+    does.** This one did not, and it buried a `4.15x` counted mechanism for a commit.
+  * ⭐⭐ **A prefixed allocator has a prefixed env var.** `tikv-jemallocator` ⇒
+    `_RJEM_MALLOC_CONF`. The `_rjem_je_*` symbols were already visible in the profile that
+    motivated the experiment, which is where the mistake was catchable.
+  * ⭐ **Setting `arenas.<knob>` alone does not touch existing arenas.** Write
+    `arena.4096.<knob>` (`MALLCTL_ARENAS_ALL`) as well, or arena 0 — the one a
+    single-threaded daemon uses — keeps the stock value and the change looks inert.
+  * ⭐ **Read the setting back from the allocator for the self-report.** Echoing the request
+    would have attested nothing; reading `arenas.dirty_decay_ms` is what makes
+    `jemalloc_dirty_decay_ms=-1` evidence.
