@@ -12806,3 +12806,136 @@ Reproduce:
       bash scripts/perf/bulk_durable_write_ab/run_bulk_dio.sh
     # then the mirror with FA/FB swapped; take the geometric mean of the two
     python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulkdio-rsF.csv
+
+## 2026-08-27 — SELF-AUDIT 2: the ext4 storm's HEADLINE survives the transport fix but its directory-fsync WIN does not, and the artifact now has a law
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU, daemons on cpu18/cpu19.
+
+Eleventh row dug, and the second self-audit. The ext4 create/delete storm is the worst
+standing number on the board (`5.0`-`5.5x` as I measured it earlier today) and it was
+measured with the SAME wrong transport that cost the bulk-durable-write row `1.545x`.
+
+### 2026-08-27 — the headline survives, and that is a PREDICTION CONFIRMED
+
+Every arm — both kernel and both FUSE — on its own loop device with `--direct-io=on`,
+copies made through `mkcopy.py` (`posix_fallocate` before a byte is written), 32 rounds,
+arm order rotated. `RCH_WORKER=none`, `hostname=thinkstation1`.
+
+    same-invocation A/A null control, kernel     1.001563  [0.994024, 1.008885]
+    same-invocation A/A null control, candidate  0.986313  [0.959809, 1.002653]
+    both bootstrap medians with bootstrap median CIs from 20000 resamples, n=32
+
+kernel_median_wall_ns=87338000 and kernel_median_wall_ns=87825000 against
+fuse_median_wall_ns=488573000 and fuse_median_wall_ns=496664000 — **`5.5820x`
+bootstrap median CI `[5.367, 5.675]` and `5.6672x` bootstrap median CI `[5.579, 5.755]`**
+(inverted from the paired `k1/ffsA` `0.179148` `[0.176201, 0.186315]` and `k1/ffsA2`
+`0.176455` `[0.173767, 0.179243]`, 20000 resamples), against my earlier ASYMMETRIC
+`5.23`-`5.70x`. **Overlapping: the transport
+artifact is not detectable on this row.**
+
+Executing ELF, self-reported in-process by the daemon at mount:
+`mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+
+That is what the phase split predicted. This batch is only **`11.30%` fsync by wall**,
+where bulk-durable-write is `66.9%` and btrfs parallel-metadata is `88.97%`. The artifact
+scales with the fsync share, and four rows now measure it:
+
+| row | fsync share of batch | measured transport artifact |
+| --- | --- | --- |
+| ext4 create/delete storm | `11.30%` | **not detectable** |
+| ext4 bulk durable write | `66.9%` | `1.5450x` |
+| btrfs parallel metadata writes | `88.97%` | `1.5903x` (**sign flip**) |
+| btrfs fsync/journal commit | `100%` | `1.7408x` |
+
+⇒ **the rule now has a cheap precondition instead of being universal**: split the phases,
+and if fsync is a small minority of the batch the asymmetric shape is survivable. It is
+not a licence to keep using it — it is a way to know which banked rows need re-running.
+
+### 2026-08-27 — but the directory-fsync WIN was the artifact, and I retract it
+
+My storm entry earlier today reported, from the asymmetric rig, that we **WIN** both
+directory fsyncs — `1.85x` and `1.89x` — and that framing ("we lose the mutation stream
+and win the fsyncs") was carried into the btrfs storm entry too. Under symmetric transport:
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `1.001563` bootstrap median CI `[0.994024, 1.008885]` (kernel) and same-invocation A/A null control `0.986313` bootstrap median CI `[0.959809, 1.002653]` (candidate),
+both from 20000 resamples over the 32 paired per-round ratios.
+
+| phase | kernel k1 | ours | |
+| --- | --- | --- | --- |
+| create 2,000 | 29.132 ms | 229.499 ms | `7.779x` LOSS |
+| fsync parent | 18.892 ms | 27.660 ms | **`1.4757x` LOSS** (was reported as a `1.85x` WIN) |
+| delete 2,000 | 19.516 ms | 203.114 ms | `10.368x` LOSS |
+| fsync parent | 18.510 ms | 27.572 ms | **`1.4856x` LOSS** (was reported as a `1.89x` WIN) |
+
+Every phase's kernel A/A null passes (`1.004515`, `1.000193`, `1.016409`, `1.000494`).
+**⛔ RETRACTED: FrankenFS does not beat kernel ext4 on directory fsync. It loses by
+~`1.48x`.** The apparent win was our daemon's `fdatasync` landing in the host page cache
+while the kernel arm's went through a loop device.
+
+⭐ **And `1.4757x` / `1.4856x` is within `1.6%`-`2.9%` of `1.500`** — the ratio the btrfs
+fsync row counted directly as **`3.000` device FLUSH barriers per durability boundary
+against kernel `2.000`**. That row measured btrfs; this is ext4. The barrier law appears
+to be filesystem-independent, which is consistent with it living in our commit path rather
+than in either format. ⚠ Stated as AGREEMENT, not as a count: this rig does not read
+`/sys/block/<dev>/stat`, and an ext4 barrier census is the obvious next measurement.
+
+### 2026-08-27 — the entry-invalidation lever survives the correction
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process:
+`mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+
+`FFS_FUSE_ENTRY_INVAL=0`, one ELF, 32 rounds, forward and mirrored with arms and daemon
+CPUs swapped, under symmetric transport:
+
+    whole batch   forward 1.124402 [1.107639, 1.150185]   mirrored 1.264970
+                  balanced 1.192619        <- banked (asymmetric) was 1.231079, 3.1% apart
+    delete phase  forward 1.380163 [1.338109, 1.451362]   mirrored 1.517983
+                  balanced 1.447432        <- banked was 1.431277, 1.1% apart
+    fsync phases  1.010485 / 0.995927 forward, 0.998734 / 1.004963 mirrored — all NULL
+
+Same-invocation kernel A/A null control `0.990172` bootstrap median CI
+`[0.968678, 1.030319]` and `1.006940` `[0.995727, 1.023049]`. **The lever is robust to the
+transport to `3.1%`**, which is what a crossing-count mechanism should be — its counted
+basis is `crossings_lookup` `132,001 → 66,001`, exactly 1.000 fewer LOOKUP per
+create+delete pair, and a lookup does not touch the device. The fsync phases remain the
+built-in negative control and remain NULL under the new transport.
+
+### The score of the two self-audits
+
+  * **Headlines**: one wrong by `1.545x` (bulk durable write), one unchanged (this row).
+    Which one it is, is predicted by the fsync share.
+  * **A reported WIN**: retracted (`1.85x`/`1.89x` directory-fsync wins → `1.48x` losses).
+  * **Levers**: both survived — flush-reserve `1.098925 → 1.137104`, entry-invalidation
+    `1.231079 → 1.192619`. Every lever in this campaign is a one-ELF interior A/B with
+    both arms on the same transport, and the artifact cancels in exactly that construction.
+
+⇒ **the interior-A/B discipline held under an audit that broke two headlines.** That is the
+part of the method worth keeping.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row and `5.5820x` is additionally ISA-overstated.
+What this banks is the confirmed headline, the RETRACTED directory-fsync win, the
+fsync-share law that says which banked rows need re-running, the ext4 agreement with the
+btrfs barrier count, and the re-confirmed lever.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/create_delete_storm_ab/mkstorm.sh
+    gcc -O2 -o $WORK/storm_ab scripts/perf/create_delete_storm_ab/storm_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=sd1 FA_LABEL=ffsA FB_LABEL=ffsA2 \
+      FA_CPUS=18 FB_CPUS=19 bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+    python3 scripts/perf/create_delete_storm_ab/sanalyze.py $WORK/stormdio-sd1.csv
+    # the lever, forward then mirrored; take the geometric mean:
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=eiF FA_LABEL=def FB_LABEL=off \
+      FA_CPUS=18 FB_CPUS=19 FA_ENV="" FB_ENV="FFS_FUSE_ENTRY_INVAL=0" \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
