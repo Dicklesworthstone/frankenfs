@@ -309,8 +309,29 @@ pub fn zero_message_opendir_enabled() -> bool {
 /// (`ops_ns_open` = `ops_ns_release` = 0), while `FOPEN_KEEP_CACHE` is exactly what
 /// keeps those files' pages resident between batches.
 ///
-/// ⛔ It is NOT a shipping option and the note above still stands: whatever this
-/// measures, the default stays off unless a row shows the cache is not lost.
+/// ✅ **MEASURED 2026-08-27, and the stated reason is REFUTED.** `op_counts read`
+/// is **512 in all four arms** — base and zero-message, forward and mirrored — so
+/// the page cache is NOT dropped. The premise was wrong: with
+/// `FUSE_NO_OPEN_SUPPORT` the kernel does not synthesise an open with default
+/// flags, it does not call `fuse_open` at all, so the invalidate-on-open path
+/// never runs and there is nothing for `FOPEN_KEEP_CACHE` to prevent. Counted:
+/// `crossings_open` **6,400 → 4**, `crossings_release` **6,400 → 0**,
+/// `crossings_total` **26,329 → 13,532 (−48.60%)**, worth a balanced
+/// **`1.160389x`** and taking the row from `1.321623x` to `1.135508x` against
+/// live kernel ext4.
+///
+/// ⛔ **The default still stays OFF, for a DIFFERENT and previously unstated
+/// reason:** `kernel_open_flags` honours `O_DIRECT` per open — a client that opens
+/// with `O_DIRECT`, or a backend that returns `FOPEN_DIRECT_IO`, gets direct I/O
+/// instead of `FOPEN_KEEP_CACHE`. With zero-message open the daemon never sees the
+/// open flags, so **an `O_DIRECT` open would silently get page-cached behaviour**.
+/// The parallel-read row does not open with `O_DIRECT` and therefore cannot see
+/// this. Shipping needs that case measured, or the capability scoped to mounts
+/// that cannot serve one.
+///
+/// ⭐ What is retired: "measured as a transport win while costing more than it
+/// saved" is no longer an open question — it is a `1.160389x` win that costs
+/// nothing on this row's cache. The blocker moved; it did not survive.
 #[must_use]
 pub fn zero_message_open_measurement_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

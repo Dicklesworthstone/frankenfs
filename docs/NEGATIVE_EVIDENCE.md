@@ -15497,3 +15497,111 @@ Reproduce:
       FA_LABEL=base FB_LABEL=spin FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000" TAG=bf1 \
       bash scripts/perf/readdir_stat_btrfs_ab/run_multi_btrfs.sh
     python3 scripts/perf/readdir_stat_btrfs_ab/analyze.py <body.csv>
+
+## 2026-08-27 — zero-message open on parallel-read: the banked REJECT's stated reason is REFUTED by a counter (`read=512` in all four arms), the lever is a balanced `1.160389x`, and the default still stays OFF for a DIFFERENT reason nobody had named
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/parallel_read_ab/run_pread.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15, both
+FUSE arms behind their own loop device (symmetric transport, bd-w2u82).
+
+parallel-read is one of the two rows the audit probe does NOT dominate — its reads are
+fd-based, so no path resolution, no probe on the read itself. It is therefore genuinely ours.
+
+### The row is an OPEN/CLOSE row, not a read row
+
+Per-opcode, in-process, one arm, 24 rounds × 256 files × 8 threads:
+
+| opcode | crossings | share | dispatch | share |
+| --- | ---: | ---: | ---: | ---: |
+| `other` (flush + read + …) | 6,913 | 26.3% | 63.5 ms | **55.6%** |
+| `open` | 6,400 | 24.3% | 17.2 ms | 15.0% |
+| `release` | 6,400 | 24.3% | 15.4 ms | 13.5% |
+| `getxattr` (audit probe on the 6,400 path opens) | 6,426 | 24.4% | 14.1 ms | 12.3% |
+| `readdirplus` | 25 | 0.1% | 3.1 ms | 2.7% |
+| total | 26,329 | 100% | 114.2 ms | 100% |
+
+⭐ **`op_counts` reports `read=512` against 6,400 opens.** The page cache is already serving
+essentially every read — `FOPEN_KEEP_CACHE` works — so the row's cost is open/release/flush
+churn, `~84%` of dispatch, not re-reading. That answers the banked open question ("why is a
+`FOPEN_KEEP_CACHE` open followed by a full re-read every batch?"): **it is not.**
+
+### The REJECT's stated reason, and its refutation
+
+`zero_message_open_measurement_enabled` records the REJECT it was built to test: *"zero-message
+open means the kernel synthesises the open with default flags, so `FOPEN_KEEP_CACHE` is never
+sent and the page cache is dropped on every open"*, and names the condition for shipping —
+*"the default stays off unless a row shows the cache is not lost."*
+
+| counter | base | `ZERO_MESSAGE_OPEN=1` |
+| --- | ---: | ---: |
+| `op_counts read` forward | **512** | **512** |
+| `op_counts read` mirrored | **512** | **512** |
+| `crossings_open` | 6,400 | **4** |
+| `crossings_release` | 6,400 | **0** |
+| `crossings_total` | 26,329 | **13,532 (−48.60%)** |
+
+⭐⭐ **`read=512` in all four arms — the cache is not lost, and the premise was wrong.** With
+`FUSE_NO_OPEN_SUPPORT` the kernel does not synthesise an open with default flags; it does not
+call `fuse_open` at all, so the invalidate-on-open path never runs and there is nothing for
+`FOPEN_KEEP_CACHE` to prevent. The REJECT was reasoning about a code path the capability
+skips.
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/zmopen` | `1.175910` `[1.144802, 1.227724]` | `1.145073` `[1.132962, 1.163401]` | **`1.160389x`** |
+| **row vs kernel, before** | `1.332912` | `1.310429` | **`1.321623x`** |
+| **row vs kernel, after** | `1.131049` | `1.139984` | **`1.135508x`** |
+| A/A null `k1/k2` | `0.995479` `[0.983687, 1.022565]` **PASS** | `0.981373` `[0.969523, 0.997006]` ⚠ | `0.988401` |
+
+A separate candidate A/A (two FrankenFS arms, identical env) ran `1.019865`
+`[0.999631, 1.113773]` — **passes**. Absolutes: kernel_median_wall_ns=4189000 and
+kernel_median_wall_ns=4058000 against fuse_median_wall_ns=5482000 / fuse_median_wall_ns=4766000
+(forward) and fuse_median_wall_ns=5310000 / fuse_median_wall_ns=4622000 (mirrored). All CIs
+are 20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+### ⛔ Still not shipped — for a reason nobody had named
+
+`kernel_open_flags` honours `O_DIRECT` **per open**: a client opening with `O_DIRECT`, or a
+backend returning `FOPEN_DIRECT_IO`, gets direct I/O instead of `FOPEN_KEEP_CACHE`. With
+zero-message open the daemon never sees the open flags, so **an `O_DIRECT` open would
+silently get page-cached behaviour**. The parallel-read row does not open with `O_DIRECT` and
+therefore cannot see this.
+
+⭐ **The blocker moved; it did not survive.** "Costs more than it saved" is retired — it is a
+`1.160389x` win that costs nothing on this row's cache. What replaces it is specific and
+testable: measure an `O_DIRECT` open under the capability, or scope the capability to mounts
+that cannot serve one.
+
+### Transferable
+
+  * ⭐⭐⭐ **A REJECT written from reasoning names a mechanism, and a counter can check the
+    mechanism directly.** One `op_counts read` field decided a question that had stood as an
+    argument: the cache is not dropped, because the code that would drop it never runs.
+  * ⭐⭐ **Retiring a blocker is not the same as clearing a lever.** The stated reason was
+    wrong AND the default should still not move — those are independent findings, and
+    collapsing them would have shipped an `O_DIRECT` regression.
+  * ⭐ **Read the per-opcode table before naming a row.** "parallel-read" spends `55.6%` of
+    dispatch in `other` and `28.5%` in open+release, with `read=512` handler entries for
+    6,400 opens. It is an open/close row wearing a read row's name.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with both A/A nulls reported, forward
+and mirrored.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_read_ab/mkpread.sh
+    gcc -O2 -o $WORK/pread_ab scripts/perf/parallel_read_ab/pread_ab.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 THREADS=8 CPUBASE=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LOOP=1 FB_LOOP=1 FA_LABEL=base FB_LABEL=zmopen \
+      FB_ENV="FFS_FUSE_ZERO_MESSAGE_OPEN=1" TAG=pr1 \
+      bash scripts/perf/parallel_read_ab/run_pread.sh
+    python3 scripts/perf/parallel_read_ab/ranalyze.py <body.csv>

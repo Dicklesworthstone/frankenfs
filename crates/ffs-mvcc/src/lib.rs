@@ -907,7 +907,7 @@ impl<'a> WriteSet<'a> {
         staged_write_pos(self.staged_writes, *block).is_ok()
     }
 
-    
+    #[must_use]
     pub fn keys(self) -> impl DoubleEndedIterator<Item = &'a BlockNumber> + ExactSizeIterator + 'a {
         self.staged_writes.iter().map(|(block, _)| block)
     }
