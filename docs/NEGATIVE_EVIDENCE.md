@@ -18695,3 +18695,62 @@ All counts on this row reproduce to `0.01%` on the daemon instruction component,
 can be adjudicated against these baselines without a quiet window. ELF
 `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
 `hostname=thinkstation1`. Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-cjqhh write row: the fault mechanism is LOCATED — `86.44%` of daemon page faults are caused by `__memmove_avx_unaligned_erms` writing into a buffer `AlignedVec::new` just obtained via `vec![0u8; n]`, and a fourth lever (allocation size class) is also a negative
+
+The previous entry left a bounded mystery: a fixed `~1.15` page faults per 4 KiB of data written,
+linear in bytes, insensitive to staging-buffer reuse, jemalloc extent retention, and a 16x change in
+flush frequency. This closes it by profiling the FAULTS rather than the cycles.
+
+**`perf record -e page-faults -g` on the daemon, 12 MiB workload, attributing each fault to the stack
+that caused it:**
+
+| share of daemon page faults | symbol |
+|---|---|
+| **86.44%** | `__memmove_avx_unaligned_erms` |
+| 4.52% / 3.39% / 2.26% | unresolved `ffs-cli` frames (release build, no frame pointers) |
+| 1.69% | `__memset_avx2_unaligned_erms` |
+
+**The faults are first-touch of a memcpy DESTINATION.** That single fact explains all three earlier
+negatives at once: allocator retention and staging-buffer reuse cannot warm pages that are freshly
+mapped per write, and flush frequency does not govern when those mappings are made.
+
+**The allocation is `AlignedVec::new`, which does `let storage = vec![0_u8; storage_len];`** —
+`alloc_zeroed`. For a zeroed request an allocator prefers pages that are ALREADY zero, i.e. fresh
+anonymous pages from the OS, because the alternative is a `memset` over a recycled dirty extent. That
+trade is exactly backwards for this workload: the buffer is immediately and completely overwritten by
+the memmove, so the zeroing is discarded and the only thing purchased with it is a page fault per page.
+The 1.69% `memset` share is the other half of the same trade showing up where the allocator did recycle.
+
+**FOURTH NEGATIVE — allocation size class does not rescue it.** Same 12 MiB total, varying block size
+so the per-write allocation moves across jemalloc's size classes:
+
+| block size | writes | allocations | daemon page faults |
+|---|---|---|---|
+| 4 KiB | 3,072 | 3,072 small | **4,686** |
+| 16 KiB | 768 | 768 | **3,688** |
+| 64 KiB | 192 | 192 large | **3,497** |
+
+Faults track the DATA volume (3,072 pages), not the allocation count or class — and small-class
+allocations, which should come back warm from a bin, still fault. Fewer, larger allocations are
+mildly BETTER, which is the opposite of an allocation-count problem.
+
+**The lever, and the constraint that bounds it.** The fix is to stop paying for zeroing on a buffer
+that is fully overwritten. The obvious form — allocate uninitialised — is **not available**: this
+workspace sets `#![forbid(unsafe_code)]` and AGENTS.md forbids unsafe outright, so `MaybeUninit`-style
+allocation is off the table by policy, not by oversight. That leaves SAFE POOLING: hand `AlignedVec`
+a reusable buffer whose pages are already warm and which the caller overwrites in full. Note this is
+NOT the pooling I withdrew last entry — that one was pooling across FLUSH boundaries, refuted because
+flush frequency does not move the fault count. This is pooling across ALLOCATIONS, which the
+size-class table above shows is where the cost actually lives.
+
+**Why I am not implementing it in this turn.** `AlignedVec` is shared with the read path, and its
+current contract hands every caller zeroed storage; a pool that skips zeroing changes that contract
+for every consumer, and any caller that relies on the zero fill would be silently corrupted rather
+than failing loudly. That needs a survey of consumers and a test that a pooled buffer is fully
+overwritten before use — not a speculative edit at the end of a session. The counted target is on
+record: `~1.15` faults per data page today, with the memmove destination named as the source of
+`86.44%` of them.
+
+ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
+`hostname=thinkstation1`. Nothing shipped, nothing reverted.

@@ -41,7 +41,10 @@ mountpoint -q "$FMNT" || { echo "fuse mount never came up"; tail -8 "$W/prof-fus
 
 # Sample the daemon only. -g gives callers so a hot leaf (memcpy, malloc) can be
 # attributed to the path that called it rather than reported as an anonymous total.
-perf record -q -F 3999 -g -p "$fpid" -o "$W/prof.data" &
+# EVENT=page-faults attributes each FAULT to the stack that caused it, which is
+# what names the allocating path; the default cycles profile only shows where
+# the kernel spends the fault, not who asked for the page (bd-cjqhh).
+perf record -q -e "${EVENT:-cycles}" -c "${PERIOD:-1}" -g -p "$fpid" -o "$W/prof.data" &
 prec=$!
 sleep 1
 taskset -c 8 "$W/writeprobe" "$FMNT/out.bin" "$MB" "$BS" "$SYNC_EVERY"
@@ -49,6 +52,6 @@ sudo -n kill -INT "$prec" 2>/dev/null || kill -INT "$prec" 2>/dev/null || true
 wait "$prec" 2>/dev/null || true
 fusermount3 -u "$FMNT"; wait "$fpid" 2>/dev/null || true
 
-echo "== daemon profile, self time (top 25)"
+echo "== daemon profile: ${EVENT:-cycles} (top 25)"
 perf report -i "$W/prof.data" --no-children --percent-limit 0.4 --stdio 2>/dev/null \
   | grep -E "^ +[0-9]" | head -25
