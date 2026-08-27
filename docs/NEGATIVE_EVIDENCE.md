@@ -14079,3 +14079,75 @@ Reproduce:
       FB_ENV="FFS_FUSE_WORKERS=4 FFS_FUSE_CONCURRENT_MUTATIONS=1" \
       bash scripts/perf/parallel_metadata_ab/run_pmeta_btrfs_dio.sh
     python3 scripts/perf/parallel_metadata_ab/panalyze.py $WORK/pbmeta-pbF.csv
+
+## 2026-08-27 — the flush-borrow knob's only named blocker, closed: ~27,000 two-pass flushes under concurrent committers, 0 failures
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/parallel_metadata_ab/flush_race.c` + `flush_race_gate.sh`.** Provenance:
+in-process self-report
+`bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, clients and daemon on CPUs 8-15.
+
+`FFS_MVCC_FLUSH_BORROW` is worth **`1.238905x`** on the bulk-durable-write fsync phase and
+was landed default OFF for one stated reason: *"the two-pass shape is a real change to a
+flush that used to be a single snapshot-in-hand walk ... 'recomputes the same thing' is an
+argument, and the argument has not been tested against a concurrent committer."* **This is
+that test.**
+
+**The rig drives the exact race.** `flush_race.c` runs MUTATOR threads that continuously
+create and remove files across the worker directories — so the shard maps churn — while
+FSYNC threads hammer directory fsyncs, each of which runs `flush_to_device_after`. Pass 1
+and pass 2 of a borrow-path flush are therefore separated by other threads' commits, which
+is precisely the window the knob's doc worries about. After the timed window the tree is
+swept empty, the mount is dropped, and the image is checked.
+
+Oracle per run: no syscall error in any thread; every created file removable; `e2fsck -fn`
+clean on the unmounted image; the tree empty through a live kernel mount; and free inodes
+back at the **exact** pristine value.
+
+| configuration | mutators | fsyncers | window | runs | result |
+| --- | --- | --- | --- | --- | --- |
+| `FFS_MVCC_FLUSH_BORROW=0` (control) | 8 | 4 | 10 s | 5 | **5 PASS** |
+| `FFS_MVCC_FLUSH_BORROW=1` | 8 | 4 | 10 s | 5 | **5 PASS** |
+| `FFS_MVCC_FLUSH_BORROW=0` (control) | 16 | 8 | 20 s | 4 | **4 PASS** |
+| `FFS_MVCC_FLUSH_BORROW=1` | 16 | 8 | 20 s | 4 | **4 PASS** |
+
+Representative counters from one borrow run at each pressure: `creates=2160 removes=2160
+fsyncs=2215` and `creates=4162 removes=4162 fsyncs=4013`. ⇒ **the borrow path executed
+roughly `27,000` two-pass flush walks with 8-16 mutator threads committing concurrently**,
+`e2fsck -fn` clean and free inodes exactly `131051/131051` on every one of the 9 runs, with
+9 matched control runs behaving identically.
+
+### What this closes and what it does not
+
+  * ✅ The knob's **only** named blocker is now exercised. "Pass 2 recomputes what pass 1
+    computed" is no longer only an argument: ~27,000 flushes ran with commits landing
+    between the passes and nothing was lost, duplicated or corrupted.
+  * ⛔ Still not a proof, and the knob stays default OFF. `e2fsck` validates metadata
+    STRUCTURE — inode table, bitmaps, directory entries — so a stale or wrong block written
+    by the flush would very likely surface as structural damage, but the workload creates
+    EMPTY files, so there is no file DATA in the oracle, and a stale-but-structurally-valid
+    metadata block is conceivable. No crash injection. ext4 only.
+  * ⇒ Together with the dispatch gate's 50 concurrent-mutation runs, **both un-landed
+    concurrency levers now share exactly one remaining gap: crash-consistency.** That is a
+    single instrument (the bd-dm01m / bd-jhuob crash-replay gate) standing between the
+    measured `1.238905x` and `1.50`-`1.58x` and their defaults, rather than a list.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates. This entry claims no ratio — it is a correctness gate for a lever measured earlier
+today. What it banks is the race construction (mutators churning the shard maps while
+fsyncers drive flushes), the 9+9 run result with its exact inode oracle, and the reduction
+of the campaign's un-landed concurrency work to one shared blocker.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_metadata_ab/mkpmeta.sh
+    gcc -O2 -o $WORK/flush_race scripts/perf/parallel_metadata_ab/flush_race.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> MUT=16 FSY=8 SECS=20 DIRS=8 \
+      FENV="FFS_MVCC_FLUSH_BORROW=1" \
+      bash scripts/perf/parallel_metadata_ab/flush_race_gate.sh
+    # control: FENV="FFS_MVCC_FLUSH_BORROW=0"
