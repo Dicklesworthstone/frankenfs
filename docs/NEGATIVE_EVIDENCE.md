@@ -18264,3 +18264,63 @@ what is now precise is what was traded for them.
 
 Nothing shipped, nothing reverted. This is the fifth consecutive counted result to reproduce to ±1 or
 better while wall-time rows on this host were being voided for load.
+
+## 2026-08-27 — bd-4iqg6: blocking crossings per syscall RANKS the three read rows in the same order as the banked wall-time ratios — but the two metadata rows agree at `~4.2-5.0x` of ratio per crossing while parallel read is `1.52x`, because the ratio measures how CHEAP the incumbent is as much as how much overhead we add
+
+The campaign selects targets by wall-time ratio on a host where four of eight runs in one session had
+to be voided for load. Blocking crossings per user syscall is deterministic — five consecutive counted
+results have reproduced to ±1 or better — so this asks whether the ranking survives the switch to it.
+
+**Instrument.** `scripts/perf/warm_stat_btrfs_ab/statcapsource.sh`, the same shape as the worst row's
+`capsource.sh`: ONE client binary over ONE fixture on ONE host, against a LIVE kernel btrfs ro loop
+mount and a FrankenFS FUSE mount, with `bpftrace` counting `get_vfs_caps_from_disk` on the kernel side
+of the boundary. 20,000 warm `stat()`s of one file. ELF
+`7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug — counts only, **no
+wall time claimed**). `hostname=thinkstation1`.
+
+| quantity | kernel btrfs (live incumbent) | FrankenFS (FUSE) |
+|---|---|---|
+| `get_vfs_caps_from_disk` | **20,003** | **20,003** |
+| `__vfs_getxattr` | **20,003** | **20,003** |
+| client voluntary ctx switches | **0** | **20,000** |
+| daemon `crossings_getattr` | — | **1** |
+| daemon `crossings_getxattr` | — | **20,003** |
+
+Two runs, **bit-exact on every number**. Digests equal across arms, so both served the same metadata.
+
+**MY PREDICTION WAS WRONG, and the way it was wrong is the finding.** I registered "a warm `stat()`
+resolves a path, so ~2 blocking crossings per op — one capability probe plus one `getattr`". Measured:
+**`1.000`**. The kernel's attribute cache absorbs the stats completely — **one `getattr` crossing for
+20,000 stats** — so the `getattr` half never happens. **Every blocking round trip on the warm-stat row
+is the capability probe and nothing else**, which pins the earlier campaign claim with a cleaner
+instrument and corrects its rate: `1.000` per stat, not the `2.000` some older notes carry.
+
+**The incumbent never sleeps.** Kernel-side voluntary context switches for these workloads: warm stat
+**0**, the worst row **1**. Against our `20,000` and `20,001`. The kernel performs the identical
+capability lookups (20,003 both arms here, 10,004 both arms on the xattr row) and pays them in-process.
+
+**THE RANKING SURVIVES — the deterministic metric orders the rows exactly as the ratios do:**
+
+| row | blocking crossings / syscall | banked ratio | ratio per blocking crossing |
+|---|---|---|---|
+| ext4 `xattr-get-list-report` | **`2.000`** | `8.428754x` | `4.21x` |
+| btrfs warm stat | **`1.000`** | `4.977803x` | `4.98x` |
+| ext4 parallel read (1 thread) | **`0.855`** | `1.303819x` | `1.52x` |
+
+**But it is NOT proportional, and the residual is informative.** The two METADATA rows agree closely —
+`4.21x` and `4.98x` of ratio per blocking crossing, 18% apart — while parallel read sits at `1.52x`,
+about 3x lower. The reason is visible in the arms: parallel read's kernel arm does REAL WORK (256 KiB
+of data movement per file) so a round trip is amortised against genuine I/O, whereas the metadata rows'
+kernel arms do almost nothing at all. **A vs-incumbent ratio therefore measures how CHEAP the incumbent
+is at that operation at least as much as it measures our overhead.**
+
+**Consequence for target selection, which is why this was worth a turn.** Chasing the worst RATIO
+steers the campaign toward the rows where the kernel is fastest, not the rows where our overhead is
+largest — those are different orderings whenever the incumbent's own per-op cost varies. On the two
+metadata rows the ratio is now almost entirely explained by round-trip count (`~4.2-5.0x` per blocking
+crossing, agreeing to 18% across two different filesystems and two different workloads), which also
+means their excess is bounded by the same lever: remove a blocking crossing, remove that share. Warm
+stat has exactly ONE to remove and it is the capability probe — unconditional kernel behaviour per the
+previous entry, so removable only by `ENOSYS`, i.e. only on an image with no xattrs.
+
+Nothing shipped, nothing reverted.
