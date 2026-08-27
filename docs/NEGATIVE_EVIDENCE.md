@@ -16275,3 +16275,88 @@ Reproduce:
       FA_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" \
       FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1 FFS_FUSE_ZERO_MESSAGE_OPEN=1" TAG=sz1 \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+
+## 2026-08-27 — bulk-durable-write after this session's shipped defaults: the page-fault family is gone from the top and `__memmove_avx_unaligned_erms` is now the single largest item at `14.10%` — the next lever is the 2.0x IN-MEMORY write amplification. Wall arm REFUSED (device-bound window)
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/bulk_durable_write_ab/bulk_seq.sh` (perf mode) and `run_bulk_dio.sh`.**
+Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`
+(shipped defaults: `mvcc_flush_borrow=true`, `jemalloc_dirty_decay_ms=-1`). The "before"
+column is the same rig on the pre-allocator-default ELF, which self-reports
+`mvcc_flush_borrow=true` with the stock allocator decay. `codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18, loop device `--direct-io=on`.
+
+Three defaults shipped this session touch this row: the borrowed flush, the jemalloc
+dirty-decay disable, and (on btrfs) the barrier deferral. This re-profiles the row to see
+what the next lever is.
+
+### The profile moved, and it names the next lever
+
+Same rig, same 64 × 1 MiB + `fsync` workload, `perf record -F 4999 -g` on the daemon:
+
+| | before the allocator default | **after (shipped)** |
+| --- | ---: | ---: |
+| `[kernel.kallsyms]` | 77.09% | **65.44%** |
+| `ffs-cli` | 11.80% | **19.61%** |
+| `libc.so.6` | 11.04% | **14.87%** |
+| **`__memmove_avx_unaligned_erms`** | 10.18% | **14.10%** |
+| `clear_page_erms` | 5.26% | **3.30%** |
+| `do_anonymous_page` | 1.70% | 1.29% |
+| `__handle_mm_fault` | 1.50% | *(below 1%)* |
+| `ShardedMvccStore::commit` | 1.76% | 3.50% |
+| `_rjem_je_edata_heap_remove` | *(below 1%)* | 1.82% |
+
+⭐ **The page-fault family has left the top of the profile** — `clear_page_erms` down `37%`,
+`__handle_mm_fault` gone — which is the shipped `jemalloc_dirty_decay_ms=-1` doing exactly
+what its `4.15x` fault reduction predicted. What is left is a **copy** profile:
+`__memmove_avx_unaligned_erms` is now the single largest item at `14.10%`, and userspace has
+grown from `22.8%` to `34.5%` of daemon CPU because the kernel's share of it went away.
+
+### Sized: 2.0x in-memory write amplification, and where it comes from
+
+A 64 MiB batch stages 16,384 blocks, and each 4 KiB of payload is copied **twice**:
+
+| copy | site | bytes per 64 MiB batch |
+| --- | --- | ---: |
+| payload → per-block staging `Vec` | `crates/ffs-core/src/lib.rs`, `data[..].to_vec()` | 64 MiB |
+| staged block → coalesced run buffer | `sharded.rs`, `run_buf.extend_from_slice` | 64 MiB |
+| *(removed 2026-08-27)* clone before coalescing | `FFS_MVCC_FLUSH_BORROW` | *0* |
+
+⇒ **`128 MiB` of memcpy per `64 MiB` written — `2.0x` amplification in memory**, against a
+device write amplification already measured at `1.000x`. The borrowed flush removed the third
+copy; the `Arc<[u8]>`-plus-range staging change removes the first, taking this to `1.0x` and
+halving a `14.10%` line item. That remains the named, unimplemented lever for this row.
+
+### ⛔ REFUSED: the wall measurement
+
+`run_bulk_dio.sh`, 24 rounds, four arms, both FrankenFS arms identical. The A/A nulls pass —
+kernel `k1/k2` `0.996403` `[0.969608, 1.036705]`, candidate `ffsA/ffsB` `0.961134`
+`[0.881160, 1.020114]` — but the window is **device-bound**: kernel `k1` totalled
+`201.694 ms` against `56.813 ms` in this morning's quiet window, with the fsync phase at
+`195.236 ms` of it, and the vs-kernel CIs spanning `[0.523218, 0.680464]`. A row whose
+interesting phase is the `115.337 ms` WRITE cannot be read when a `195 ms` device fsync sits
+on top of it. **No ratio is quoted; the row's position stands at the `~2.2x` banked earlier
+today.**
+
+⭐ The profile above is unaffected by this: `perf` percentages are shares of the daemon's own
+CPU, and the daemon does no device I/O in the write phase.
+
+### Transferable
+
+  * ⭐⭐ **Re-profile after every shipped default — the ranking changes.** Removing the
+    page-fault cost did not just make the row faster, it promoted memcpy from `10.18%` to the
+    top and made the next lever obvious. A profile taken before the fix would still be
+    pointing at page faults.
+  * ⭐ **Count the copies from the code and check them against the profile.** `2.0x` in-memory
+    amplification derived from two call sites, and a `14.10%` memcpy line that agrees with
+    it, is a stronger case for the refactor than either alone.
+  * ⭐ **A phase-specific question needs a window where that phase is visible.** The write
+    phase is `36%` of this batch in a quiet window and `36%` of a batch three times longer
+    here — the same fraction of a much noisier whole.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`. This entry banks a profile comparison and a code-
+derived byte count; it adds no vs-incumbent ratio and explicitly refuses one.
