@@ -12939,3 +12939,110 @@ Reproduce:
     WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=eiF FA_LABEL=def FB_LABEL=off \
       FA_CPUS=18 FB_CPUS=19 FA_ENV="" FB_ENV="FFS_FUSE_ENTRY_INVAL=0" \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+
+## 2026-08-27 — the ext4 barrier census: the 3-vs-2 law is BTRFS-SPECIFIC, bd-4zjkz is confirmed with the counter it lacked, and my own cross-row inference from one commit ago is REFUTED
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/fsync_journal_ab/run_fsync_ext4.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU, daemons on cpu18/cpu19.
+
+The btrfs fsync row counted **`3.000` device FLUSH barriers per client fsync against kernel
+btrfs's `2.000`**. The ext4 storm's directory-fsync phase then measured `1.4757x`/`1.4856x`
+— within `2.9%` of `1.500` — and I wrote that the barrier law "appears to be
+filesystem-independent", explicitly flagging it as AGREEMENT needing its own ext4 census.
+**This is that census, and it refutes the inference.**
+
+### 2026-08-27 — a FIVE-arm instrument that puts both durability classes in one invocation
+
+`fsync_journal_batch` at the banked 8-op shape (pwrite 4096 at offset 0, then `fsync`, one
+client thread). **Five arms live SIMULTANEOUSLY in ONE rig invocation, each on its own loop
+device with `--direct-io=on`**, order rotated per round, 48 rounds: two JOURNALLED kernel
+ext4 mounts (the kernel A/A null), **one UNJOURNALLED kernel ext4 mount**
+(`tune2fs -O ^has_journal`, bd-4zjkz's middle arm), and two FrankenFS `--rw` mounts from
+one ELF (the candidate A/A null). Each arm carries its device's `/sys/block/<dev>/stat`.
+`RCH_WORKER=none`, `hostname=thinkstation1`. Both kernel mounts report `rw,relatime`.
+
+Same-invocation A/A null control `0.994573` bootstrap median CI `[0.981302, 1.001391]` (kernel) and same-invocation A/A null control `1.008096` bootstrap median CI `[0.992431, 1.027760]` (candidate),
+both from 20000 resamples over the 48 paired per-round ratios.
+
+| arm | sectors | write I/Os | **FLUSH** | µs per client fsync |
+| --- | --- | --- | --- | --- |
+| kernel ext4, journalled (k1) | 256 | 24 | **16 = `2.000`/fsync** | 18,354.71 |
+| kernel ext4, journalled (k2) | 256 | 24 | **16 = `2.000`/fsync** | 18,417.79 |
+| kernel ext4, **NO journal** | 128 | 24 | **8 = `1.000`/fsync** | 9,074.30 |
+| **FrankenFS (both arms)** | **128** | **24** | **8 = `1.000`/fsync** | 9,523.53 / 9,486.73 |
+
+### 2026-08-27 — three results, all exact integers
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `0.994573` bootstrap median CI `[0.981302, 1.001391]` and same-invocation A/A null control `1.008096` bootstrap median CI `[0.992431, 1.027760]`, from 20000 resamples.
+
+**1. The 3-vs-2 barrier law is BTRFS-SPECIFIC, and my cross-row inference is REFUTED.** On
+btrfs we issue `3.000` barriers where the kernel issues `2.000`. On ext4 we issue
+**`1.000`** where the journalled kernel issues `2.000` — the ratio is `0.5`, not `1.5`. A
+"we always issue 1.5x the barriers" law does not exist. ⛔ **The ext4 storm's
+directory-fsync `1.4757x`/`1.4856x` agreeing with `1.500` to `2.9%` was a COINCIDENCE**,
+and the sentence in the previous commit that called the barrier law "filesystem-independent"
+is withdrawn. That storm phase now has NO counted explanation, which is the honest state and
+the next thing that row needs.
+
+**2. bd-4zjkz is CONFIRMED, with the counter it never had.** That row closed the ext4
+fsync cell `NOT COMPARABLE` because "kernel ext4 writes 4.00 blocks/fsync against our 2.00
+— exactly 2.00x, the extra two being the jbd2 descriptor and commit blocks", and concluded
+"FrankenFS ext4 fsync is indistinguishable from kernel ext4 with the journal stripped,
+doing the same work per boundary". Counted here on a live five-arm instrument:
+**FrankenFS matches the unjournalled kernel EXACTLY on all three counters** — 128 sectors,
+24 write I/Os, 8 flushes against 128, 24, 8 — and the journal costs exactly `2.000x` the
+sectors, `2.000x` the barriers, and `k1/knj` = **`2.010174x`** `[1.999292, 2.020929]` of
+the wall. Three independent exact 2.000s and a wall ratio agreeing to `0.5%`.
+
+**3. Against its OWN durability class, our ext4 fsync is a small honest LOSS.**
+Absolute arm medians, so it is visible which arm moved: kernel_median_wall_ns=72594000
+(unjournalled kernel ext4) and kernel_median_wall_ns=146838000 (journalled) against
+fuse_median_wall_ns=76188000 and fuse_median_wall_ns=75894000.
+`knj/ffsA` = `0.958754` `[0.938457, 0.968535]` and `knj/ffsA2` = `0.967070` ⇒
+**`1.0430x` `[1.0325, 1.0656]` and `1.0341x` SLOWER** than kernel ext4 with the journal
+stripped, doing byte-identical device work. bd-4zjkz could only bound this at "a `±15%`
+floor, so no claim in either direction"; the five-arm same-invocation shape resolves it to
+**`4.3% ± 1%`**. ⚠ Against the JOURNALLED incumbent we measure `1.9224x` FASTER — that
+figure is REJECTED for the same reason bd-4zjkz rejected `5.47x`: it is bought with half
+the barriers and half the bytes, not with engineering.
+
+### 2026-08-27 — what this changes
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `0.994573` bootstrap median CI `[0.981302, 1.001391]` and same-invocation A/A null control `1.008096` bootstrap median CI `[0.992431, 1.027760]`, from 20000 resamples.
+Counted mechanism: FLUSH requests 16 / 16 / 8 / 8 / 8 per 8-op batch across the five arms,
+read off `/sys/block/<dev>/stat`. Absolute arm medians: kernel_median_wall_ns=72594000
+(unjournalled) and kernel_median_wall_ns=146838000 (journalled) against
+fuse_median_wall_ns=76188000 and fuse_median_wall_ns=75894000.
+
+  * ⛔ WITHDRAWN: "the barrier law appears to be filesystem-independent" (previous commit).
+    It is btrfs-specific. The ext4 storm's directory-fsync loss is unexplained again.
+  * ✅ CONFIRMED and sharpened: bd-4zjkz's `NOT COMPARABLE` verdict and its journal
+    decomposition, now with a FLUSH count and a `±1%` residual instead of `±15%`.
+  * ✅ NEW: our ext4 file-fsync path issues exactly `1.000` barrier per boundary and is
+    `1.0430x` slower than the same-class incumbent — a real but small loss, and the first
+    time this row has a decidable number in its own durability class.
+  * ⇒ The btrfs `3.000` barriers are the outlier worth attacking, not a universal.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row and `1.0430x` is additionally ISA-overstated.
+What this banks is the exact ext4 barrier census, the refutation of my own cross-row
+inference, the confirmation of bd-4zjkz with a new counter, and the first same-durability-
+class ratio for the ext4 fsync row.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/fsync_journal_ab/mkfsync_ext4.sh
+    gcc -O2 -o $WORK/fsync_ab scripts/perf/fsync_journal_ab/fsync_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=48 OPS=8 TAG=e41 FA_CPUS=18 FB_CPUS=19 \
+      bash scripts/perf/fsync_journal_ab/run_fsync_ext4.sh
+    python3 scripts/perf/fsync_journal_ab/fanalyze.py $WORK/fsync4-e41.csv
