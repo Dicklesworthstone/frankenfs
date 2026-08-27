@@ -12406,3 +12406,142 @@ Reproduce:
       FA_CPUS=18 FB_CPUS=19 FA_ENV="" FB_ENV="FFS_FUSE_ENTRY_INVAL=0" \
       bash scripts/perf/create_delete_storm_ab/run_storm_btrfs.sh
     # then the mirror with FA/FB swapped; take the geometric mean of the two
+
+## 2026-08-27 — btrfs fsync/journal commit: the loss is 3.000 cache-flush barriers per fsync against the kernel's 2.000, and unlike the ext4 twin this row IS comparable
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/fsync_journal_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU, daemons on cpu18/cpu19.
+
+Eighth row dug in this sequence and the worst remaining un-dug cell: the btrfs
+fsync/journal-commit row, banked `1.976308x`, whose scorecard cell is **bare — a ratio
+and nothing else**. Its ext4 twin was closed `NOT COMPARABLE` by bd-4zjkz because the
+arms were in different durability classes; the first job here was to find out whether
+that carries over. **It does not, and the opposite is true.**
+
+### 2026-08-27 — symmetric transport first, because bd-4zjkz says that artifact is worth more than the row
+
+`fsync_journal_batch` (`ffs_mounted_kernel_bench.rs:4252`) reproduced in C: `ops`
+iterations of `pwrite` 4096 bytes at offset 0 of `fsync.bin` then `fsync`, one client
+thread, at the banked `8`-op shape. **Four arms live SIMULTANEOUSLY in ONE rig invocation,
+each on its OWN loop device with `--direct-io=on`** (`dio=1` verified per device and
+printed by the rig) — two kernel btrfs mounts and two FrankenFS `--rw` mounts from one
+ELF, arm order rotated per round, 48 rounds. `RCH_WORKER=none`, `hostname=thinkstation1`.
+Each arm also carries its device's `/sys/block/<dev>/stat` so write I/Os, sectors and
+FLUSH requests are counted per arm per batch.
+
+    same-invocation A/A null control, kernel     0.998436  [0.983451, 1.018431]
+    same-invocation A/A null control, candidate  0.997565  [0.983482, 1.021369]
+    both bootstrap medians with bootstrap median CIs from 20000 resamples, n=48
+
+kernel_median_wall_ns=149097000 and kernel_median_wall_ns=150033000 against
+fuse_median_wall_ns=228399000 and fuse_median_wall_ns=229212000 — **`1.5297x` and
+`1.5409x` slower**, against the banked `1.976308x`. `18.64`/`18.75 us` per client fsync
+for the kernel against `28.55`/`28.65 us` for us.
+
+⛔ **And the transport artifact bd-4zjkz found on ext4 reproduces on btrfs, larger than
+the row itself.** The SAME daemon given the buffered image file instead of its loop
+device, in the same invocation as the loop-dio arms:
+
+    ffs_dio / ffs_file   1.746363  [1.723551, 1.761328]   (ffs_dio on cpu18)
+                         1.735224  [1.715665, 1.744708]   (ffs_dio on cpu19)
+    k1 / ffs_file        1.150451  and  1.140665
+
+Same-invocation A/A null control `1.002523` bootstrap median CI `[0.995411, 1.011289]` and same-invocation A/A null control `1.005653` bootstrap median CI `[1.003580, 1.008111]`, from 20000 resamples.
+
+**A FrankenFS-on-a-buffered-file arm measures `1.15x` FASTER than live kernel btrfs — a
+sign flip — purely from transport**, and it writes **0 sectors and 0 flushes through the
+counted device** because its I/O goes to the host filesystem instead. Any future run of
+this row that does not put both arms on the same kind of device is measuring the stack,
+not the filesystem.
+
+### 2026-08-27 — the durability-class check, and why this row is NOT its ext4 twin
+
+Counted per 8-op batch, straight off `/sys/block/<dev>/stat`, both FrankenFS arms
+byte-identical to each other (`ffsA/ffsA2` = `1.000000` on all three counters):
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `0.998436` bootstrap median CI `[0.983451, 1.018431]` (kernel) and same-invocation A/A null control `0.997565` bootstrap median CI `[0.983482, 1.021369]` (candidate),
+both from 20000 resamples over the 48 paired per-round ratios.
+
+| arm | write I/Os | sectors | **FLUSH requests** |
+| --- | --- | --- | --- |
+| kernel btrfs (both arms) | 56 | 1152 | **16 = `2.000` per client fsync** |
+| FrankenFS (both arms) | 48 | 1344 | **24 = `3.000` per client fsync** |
+
+**We issue FEWER I/Os (`0.857x`) and write MORE sectors (`1.167x`).** bd-4zjkz closed the
+ext4 twin as NOT COMPARABLE because there we wrote **half** the blocks per fsync — the
+jbd2 descriptor and commit we never write — so the ext4 win was "bought with a weaker
+crash guarantee". **On btrfs the sign is reversed: we do MORE durable work per boundary,
+not less. This row is therefore comparable, and its loss is real.**
+
+### 2026-08-27 — the mechanism is an exact integer, and it is ours
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `0.998436` bootstrap median CI `[0.983451, 1.018431]` (kernel) and same-invocation A/A null control `0.997565` bootstrap median CI `[0.983482, 1.021369]` (candidate),
+both from 20000 resamples over the 48 paired per-round ratios.
+
+`24 / 16 = **1.500**` flush barriers, against a measured wall of **`1.5297x`** and
+**`1.5409x`**. **The extra barrier accounts for ~98% of the loss** — it is not bytes
+(we write `1.167x` the sectors) and not I/O count (we issue `0.857x` the I/Os).
+
+And the barriers are ours, not the block layer's. `strace -c` on the LIVE daemon over 200
+client fsyncs, the same technique bd-4zjkz used on the ext4 twin:
+
+    daemon syscalls   fdatasync 1200      pwrite64 2400
+    device deltas     flush_ios 1200      write_ios 2400     sectors 67200
+
+**A 1:1 match on both counters — every device FLUSH is one of our own `fdatasync` calls.**
+⚠ The per-op flush count is SHAPE-DEPENDENT and the two numbers are not the same
+measurement: `3.000` per client fsync at the banked 8-op batch (which is the figure
+comparable to the kernel arm, measured in the same invocation), `6.000` in a 200-op single
+batch. The 1:1 attribution is not shape-dependent.
+
+### 2026-08-27 — this row is not daemon-CPU-bound and has no crossing waste
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+Same-invocation A/A null control `0.998436` bootstrap median CI `[0.983451, 1.018431]` (kernel) and same-invocation A/A null control `0.997565` bootstrap median CI `[0.983482, 1.021369]` (candidate),
+both from 20000 resamples over the 48 paired per-round ratios.
+
+Daemon `ticks` = **0** per batch on every FrankenFS arm; `ops_ns_total` = **0**; and
+`dispatch_ns_total` `10.888 s` over 49 batches = `222 ms/batch` against a `222.0 ms` batch
+wall — **the daemon's dispatch time IS the whole batch, spent blocked in the fsync
+handler.** The crossing census is minimal and waste-free: over 392 client write+fsync
+pairs, `write` **392** and `fsync` **392** — exactly `2.000` crossings per durability
+boundary, with `crossings_total` 1424 including the per-batch open/release/getattr. There
+is nothing to remove on the transport side of this row; the cost is the barrier count.
+
+### What is left, named and NOT taken
+
+Get from `3` barriers per fsync to `2`. That is a **durability-ordering change**, which is
+precisely the class bd-4zjkz says must never be traded silently — the ext4 twin's `5.47x`
+"win" was exactly such a trade made without noticing. Any attempt needs its own crash and
+ordering gate before a number from it is admissible, and the three `fdatasync` call sites
+on the btrfs commit path need to be identified first (`OpenFs::fsync`,
+`crates/ffs-core/src/lib.rs:37763`, is the entry). Sized: `1.500x` of this row.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row, and the `1.5297x`/`1.5409x` is additionally
+ISA-overstated. What this banks is the symmetric-transport requirement with its measured
+`1.74x` price and sign flip, the counted durability-class check that makes this row
+comparable where its ext4 twin is not, the exact `3.000`-vs-`2.000` barrier mechanism, and
+the 1:1 `fdatasync`-to-FLUSH attribution — all ISA-invariant.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/fsync_journal_ab/mkfsync_btrfs.sh
+    gcc -O2 -o $WORK/fsync_ab scripts/perf/fsync_journal_ab/fsync_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=48 OPS=8 TAG=fl1 FA_LABEL=ffsA FB_LABEL=ffsA2 \
+      FA_CPUS=18 FB_CPUS=19 bash scripts/perf/fsync_journal_ab/run_fsync_btrfs.sh
+    python3 scripts/perf/fsync_journal_ab/fanalyze.py $WORK/fsync-fl1.csv
+    # the transport arm: FB_RAW=1 gives arm B the buffered image file
+    # the syscall attribution:
+    WORK=<scratch> ELF=<ffs-cli> OPS=200 TAG=st1 bash scripts/perf/fsync_journal_ab/fsync_strace.sh
