@@ -17440,3 +17440,73 @@ Hand rig, not `ffs-mounted-kernel-bench`. The storm ratios are same-invocation a
 kernel btrfs with both A/A halves reported (one fails, disclosed), forward and mirrored, both
 arms self-reporting the knob. The parallel-metadata run is reported only as a rejected
 measurement; nothing from it is banked.
+
+## 2026-08-27 — bd-3tqec, second half: btrfs parallel-metadata-write re-measured on a rig that can actually express the knob — the shipped flip is a balanced `1.432206x` and takes the row `1.543180x → 1.085649x`
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, NEW rig
+`scripts/perf/parallel_metadata_ab/run_pmeta_btrfs2_dio.sh`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15, every arm
+on its own loop device with `--direct-io=on`.
+
+One commit ago I rejected my own parallel-metadata measurement: `run_pmeta_btrfs_dio.sh` has
+**two FUSE arms of different filesystems** (`pimg-fa.ext4` and `pimgb-fb.btrfs`), so an A/B
+across them prices ext4-against-btrfs, and its env hook is `FE_ENV`/`FB_ENV`, so the arm I
+thought I was configuring inherited nothing. **A btrfs-only knob needs two btrfs arms.** This
+rig has them: two live kernel btrfs mounts (the A/A null) and two FrankenFS btrfs mounts from
+ONE ELF, order rotated per round, 36 rounds × 512 ops × 8 client threads.
+
+⭐ **The knob check ran BEFORE the analysis this time**, and it is the check that failed
+silently last commit: `grep -o 'btrfs_commit_fst_early=[a-z]*'` on each arm's log returns
+`true` / `false`, and `false` / `true` in the mirror. An absent line would have stopped the run
+being reported at all.
+
+### The result
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `preflip/shipped`, whole batch | `1.441930` `[1.399253, 1.482596]` | `1.422547` `[1.408645, 1.437421]` | **`1.432206x`** |
+| `preflip/shipped`, fsync phase | `1.513448` | — | — |
+| **row vs kernel btrfs, pre-flip** | `1.537272` | `1.549111` | **`1.543180x` slower** |
+| **row vs kernel btrfs, shipped** | `1.064739` | `1.106969` | **`1.085649x` slower** |
+| A/A null `k1/k2` | `0.964571` `[0.901437, 1.003766]` **PASS** | `1.008365` `[0.998261, 1.021715]` **PASS** | `0.986225` |
+
+Both A/A halves pass and the two mirrored halves agree to `1.4%`. The phase split names the
+mechanism exactly: `create` is unmoved (`26.904` vs `26.989 ms` forward, `26.176` vs
+`26.267 ms` mirrored) while **`fsync` carries all of it** (`153.532` vs `230.048 ms`) — which
+is what a barrier deferral should do and nothing else.
+
+⇒ **`FFS_BTRFS_COMMIT_FST_EARLY`, measured and shipped this morning on the btrfs fsync row,
+is worth `1.432206x` here and takes btrfs parallel-metadata-write from `1.543180x` slower to
+`1.085649x`.** With the storm's `1.075948x` from one commit ago, bd-3tqec is answered for both
+rows it names: the banked figures predate the flip and both are superseded.
+
+⭐ Three rows now carry the same shipped change: fsync `1.513698x → 1.014658x`, parallel
+metadata `1.543180x → 1.085649x`, storm `3.723449x → 3.505012x`. The two fsync-heavy rows move
+by `~1.43–1.50x`; the storm, where fsync is a smaller share, moves `1.08x`. **The lever's size
+tracks the fsync share of the row**, which is the falsifiable form of "it is a barrier change".
+
+### Transferable
+
+  * ⭐⭐ **When a rig cannot express a knob, build the rig — do not reinterpret the run.** The
+    six-arm rig produced a tight `1.4161x` that was ext4-vs-btrfs; the four-arm rig produces
+    `1.432206x` that is the knob. The two numbers are close enough that the wrong one would
+    never have been questioned on its value alone.
+  * ⭐ **Put the knob check before the analysis in the command itself.** It cost one line and
+    it is the difference between this commit and the retraction in the last one.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+All ratios are same-invocation against live kernel btrfs with both A/A nulls reported and
+passing, forward and mirrored, both arms self-reporting the knob under test.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=36 OPS=512 THREADS=8 CPUBASE=8 \
+      FA_CPUS=18 FB_CPUS=19 FA_LABEL=shipped FB_LABEL=preflip \
+      FB_ENV="FFS_BTRFS_COMMIT_FST_EARLY=0" TAG=q4 \
+      bash scripts/perf/parallel_metadata_ab/run_pmeta_btrfs2_dio.sh
