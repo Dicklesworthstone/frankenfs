@@ -13875,3 +13875,113 @@ Reproduce:
     gcc -O2 -o $WORK/fsync_ab scripts/perf/fsync_journal_ab/fsync_ab.c
     WORK=<scratch> ELF=<ffs-cli> OPS=8 TAG=bs1 \
       bash scripts/perf/fsync_journal_ab/fsync_strace.sh
+
+## 2026-08-27 — concurrent UNLINK under the widened dispatch gate: the named missing case, exercised 28 times, 0 failures — and the free-block oracle validated against a kernel arm before it was trusted
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/parallel_metadata_ab/rm_gate.sh` + `pmeta_rm.c`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, clients and daemon on CPUs 8-15.
+
+The ext4 parallel-metadata row measured a `1.50`-`1.58x` ceiling for narrowing
+`DispatchGate::exclusive()` behind `FFS_FUSE_CONCURRENT_MUTATIONS`, and closed with an
+explicit gap: "**concurrent `Unlink` is in the widened set and is NOT exercised** (the rig's
+reset is single-threaded)". This exercises it.
+
+**The stress, and the shape that actually races.**
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`.
+This is a PASS/FAIL correctness gate, not a timed row: it quotes no ratio and needs no
+A/A null. Counted mechanism: 28 runs, free inodes exactly 131051/131051 on every one,
+`e2fsck -fn` clean on every one, 0 surviving files on every one.
+
+`pmeta_rm.c`: THREADS workers create `OPS` files strided across threads, fsync every
+directory, then **remove them all CONCURRENTLY**, fsync again. Two shapes:
+
+  * `private` — each worker owns its own `worker-<n>` directory (the row's shape: unlinks
+    on DISJOINT parents).
+  * `shared` — **every worker creates and removes in ONE directory**, striding so adjacent
+    indices land on different threads. This is the case the gate was protecting: two
+    unlinks racing on the same directory blocks.
+
+Oracle per run: the stress itself returns non-zero on any syscall error; then `e2fsck -fn`
+on the unmounted image; then the tree must be EMPTY through a live kernel mount; then the
+free-inode count must be EXACTLY the pristine value.
+
+| configuration | runs | result |
+| --- | --- | --- |
+| `FFS_FUSE_WORKERS=4` + widened, `private`, 8t × 4,096 | 8 | **8 PASS** |
+| `FFS_FUSE_WORKERS=4` + widened, `shared`, 8t × 4,096 | 8 | **8 PASS** |
+| `FFS_FUSE_WORKERS=4` + widened, `private`, 8t × 16,384 | 6 | **6 PASS** |
+| `FFS_FUSE_WORKERS=4` + widened, `shared`, 16t × 8,192 | 6 | **6 PASS** |
+| **total** | **28** | **28 PASS, 0 FAIL** |
+
+`free_inodes` came back exactly pristine (`131051/131051`) on every one of the 28 runs, and
+`e2fsck -fn` was clean on every one. ⇒ **the specific gap that entry flagged is now
+exercised, including the shared-parent race, and it does not fail.**
+
+**The free-BLOCK oracle was wrong, and a kernel arm caught it.**
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`.
+This is a PASS/FAIL correctness gate, not a timed row: it quotes no ratio and needs no
+A/A null. Counted mechanism: 28 runs, free inodes exactly 131051/131051 on every one,
+`e2fsck -fn` clean on every one, 0 surviving files on every one.
+
+The first sharpened oracle also required free BLOCKS to return to pristine. Under the
+SHIPPING configuration (gate intact) that immediately "failed": `free_blocks=118468`
+against a pristine `118534`. Before treating a 66-block shortfall as a defect, the same
+stress was run through a **live kernel ext4 mount**:
+
+    KERNEL  mode=shared threads=16 ops=8192  e2fsck=clean
+            free_inodes=131051/131051   free_blocks=118470/118534
+
+**Kernel ext4 leaves 64 blocks unreturned; we leave 66.** ext4 does not shrink a directory
+on unlink, so a directory grown to hold 8,192 entries keeps its blocks — on BOTH arms. The
+oracle was measuring that, not a leak. Corrected: free INODES is the sharp check (a leaked
+or double-freed inode moves it, and it was exact 28/28); free BLOCKS is RECORDED against
+the kernel reference rather than gated. The residual `118468` vs `118470` is a two-block
+directory-growth policy difference, not an accounting error.
+
+⚠ **A rig bug worth recording because its SHAPE is the tell.** `private` mode at 16 threads
+"failed" 6 times out of 6 with byte-identical numbers every run (`left=4096`,
+`free_inodes=126955`). Identical failures are not a race — the fixture only has 8
+`worker-<n>` directories, so workers 8-15 addressed paths that do not exist. **A concurrency
+defect varies; a deterministic one is the harness.** `private` requires
+`THREADS <= fixture worker directories`.
+
+### What this does and does not license
+
+  * ✅ The `1.50`-`1.58x` dispatch-gate ceiling's named blocker — unvalidated concurrent
+    `Unlink` — is now exercised 28 times at up to 16 threads and 16,384 operations,
+    including the shared-parent shape, with an exact inode-accounting oracle.
+  * ⛔ It is still **not a proof and the knob stays default OFF**. No crash injection; ext4
+    only (the gate protects every `FsOps` impl, and btrfs is untested); create-then-delete
+    rather than interleaved mutation; no `rename` or `link`, which are also in the
+    non-concurrency-safe set and were NOT widened by the measurement knob.
+  * ⇒ The remaining gaps are now **btrfs and crash-consistency**, not "we have never run a
+    concurrent unlink". That is a narrower and more actionable statement than the one this
+    entry replaces.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates. This entry claims no ratio — it is a correctness gate for a ceiling measured
+earlier, plus the validation of its own oracle against a live kernel arm. What it banks is
+the 28-run result with its exact inode oracle, the kernel-arm control that invalidated the
+free-block oracle, and the deterministic-failure tell that separated a rig bug from a race.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_metadata_ab/mkpmeta.sh
+    gcc -O2 -o $WORK/pmeta_rm scripts/perf/parallel_metadata_ab/pmeta_rm.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> THREADS=16 OPS=8192 MODE=shared \
+      FENV="FFS_FUSE_WORKERS=4 FFS_FUSE_CONCURRENT_MUTATIONS=1" \
+      bash scripts/perf/parallel_metadata_ab/rm_gate.sh
+    # the oracle control:
+    WORK=<scratch> THREADS=16 OPS=8192 MODE=shared \
+      bash scripts/perf/parallel_metadata_ab/rm_gate_kernel.sh
