@@ -18754,3 +18754,45 @@ record: `~1.15` faults per data page today, with the memmove destination named a
 
 ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
 `hostname=thinkstation1`. Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-cjqhh: CORRECTION — the write row's faulting buffer is NOT `AlignedVec`. The consumer survey shows `AlignedVec` is read-path only, the flush run buffer IS correctly reused, and the remaining candidate is the per-block version `Vec<u8>` staged at WRITE time
+
+The previous entry attributed the write row's page faults to `AlignedVec::new`'s
+`vec![0_u8; storage_len]` and named a consumer survey as the gate before implementing a pool. I ran
+the survey. **It refutes my own attribution**, and the correction is worth more than the pool would
+have been, because the pool would have been built against the wrong buffer.
+
+**Survey — `AlignedVec` is read-path only.** `AlignedVec::new` has 14 call sites and exactly **ONE**
+outside tests: `BlockBuf::zeroed` (`ffs-block/src/lib.rs:296`). `BlockBuf::zeroed` in turn has exactly
+**ONE** production caller in `src` — the block READ path at `ffs-block/src/lib.rs:1785`, which
+immediately overwrites the buffer via `read_exact_at_volatile` and whose own comment already says the
+buffer "is freshly allocated here and dropped if the read fails, so it needs no
+destination-preservation". Every other `BlockBuf::zeroed` reference is in benches, examples or tests.
+**So the zero fill I identified is real dead weight — but it is on the READ path, and the row I was
+measuring is a WRITE row.** The attribution in the previous entry does not survive.
+
+**The flush run buffer IS correctly reused, which retro-explains the reuse null.** Both flush
+implementations pair the parked buffer properly: `flush_to_device_after` takes at `sharded.rs:1470`
+and parks at `1495`; `flush_to_device_after_borrowed` — the SHIPPING path, since
+`FFS_MVCC_FLUSH_BORROW` is default ON — takes at `1639` and parks at `1690`. `put_run_buf` calls
+`clear()`, which keeps capacity. So across 13 flushes the run buffer's pages stay warm and its
+`extend_from_slice` should not fault. `FFS_MVCC_FLUSH_BUF_REUSE` measured null on faults **because
+the run buffer was never the problem**, not because the knob failed — a materially different reading
+of that reject than the one I recorded, and the knob is exonerated.
+
+**The remaining candidate, and why it fits every measurement.** The write path stages each written
+block into its own `Vec<u8>` (`sharded.rs:2127` `data.to_vec()`, `2123` `BlockBuf::new(data)`) at
+WRITE time, not at flush time. One allocation per written block, memmove'd into immediately. That
+single candidate is consistent with all four negatives already on record: linear in bytes written
+(one buffer per block); insensitive to flush frequency (allocated per write, not per flush);
+insensitive to run-buffer reuse (a different buffer entirely); and insensitive to allocator retention
+and size class (each is a fresh destination touched once).
+
+**Status.** The pool target from the previous entry is WITHDRAWN as aimed — pooling `AlignedVec`
+would have changed the read path's contract for no effect on the write row, which is exactly the
+outcome the survey existed to prevent. The sharpened target is the per-block write-staging `Vec<u8>`.
+I am not implementing that either: it is MVCC version storage with snapshot-lifetime semantics, and
+the previous entry's reasoning about needing a consumer survey first applies to it with more force,
+not less. What this turn buys is that the next person aims at the right buffer.
+
+`hostname=thinkstation1`. Nothing shipped, nothing reverted; no new timing claimed.
