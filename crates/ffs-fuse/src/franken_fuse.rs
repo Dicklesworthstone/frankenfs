@@ -190,6 +190,25 @@ impl FrankenFuse {
     /// unchanged. The kernel can keep a prior reply for up to `ATTR_TTL`, so a
     /// committed mutation must actively evict it rather than waiting for that
     /// timeout to elapse.
+    /// Invalidate a PARENT DIRECTORY's cached attributes after a mutation inside it
+    /// (bd-ltx9e).
+    ///
+    /// Split from [`Self::notify_inode_invalidation`] because the two have different
+    /// cost and different semantics. This one fires on every create, unlink, mkdir,
+    /// rmdir, rename, link and symlink, and the storm census puts the resulting
+    /// revalidation at the top of the profile: `getattr` 3.147 per create+unlink pair,
+    /// 28% of all requests, on a workload that never asks for attributes itself.
+    ///
+    /// Suppressing it means a `stat` of the directory can report an mtime/ctime up to
+    /// ATTR_TTL stale. That is a real semantic change, so the default is ON (shipping
+    /// behaviour) and `FFS_FUSE_PARENT_INVAL=0` is the A/B switch.
+    fn notify_parent_invalidation(&self, parent: u64) {
+        if !crate::parent_invalidation_enabled() {
+            return;
+        }
+        self.notify_inode_invalidation(parent);
+    }
+
     fn notify_inode_invalidation(&self, ino: u64) {
         // READDIRPLUS may have prepared attributes for the next GETATTR before
         // this mutation committed. Clear that userspace hand-off regardless of

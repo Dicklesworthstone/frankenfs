@@ -4578,6 +4578,24 @@ impl KernelNotifyQueue {
     }
 }
 
+/// bd-ltx9e: should a mutation inside a directory invalidate that DIRECTORY's cached
+/// attributes?
+///
+/// Default ON (shipping behaviour). `FFS_FUSE_PARENT_INVAL=0` turns it off for an A/B from
+/// a single ELF. Measured cost of leaving it on: `getattr` 3.147 per create+unlink pair on
+/// the storm, 28% of every request that workload issues.
+pub fn parent_invalidation_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_FUSE_PARENT_INVAL")
+            .ok()
+            .map_or(true, |raw| {
+                let v = raw.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
+            })
+    })
+}
+
 /// bd-pmjvd: should a successful FUSE `write` invalidate the kernel's page cache for
 /// the inode it just wrote?
 ///
@@ -5890,7 +5908,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
-                self.notify_inode_invalidation(parent);
+                self.notify_parent_invalidation(parent);
             }
             Err(e) => {
                 Self::reply_error_entry(
@@ -6111,7 +6129,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
-                self.notify_inode_invalidation(parent);
+                self.notify_parent_invalidation(parent);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -6142,7 +6160,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
-                self.notify_inode_invalidation(parent);
+                self.notify_parent_invalidation(parent);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -6180,7 +6198,7 @@ impl Filesystem for FrankenFuse {
             Ok(()) => {
                 reply.ok();
                 self.notify_entry_invalidation(parent, name);
-                self.notify_inode_invalidation(parent);
+                self.notify_parent_invalidation(parent);
             }
             Err(e) => {
                 Self::reply_error_empty(
@@ -6201,7 +6219,7 @@ impl Filesystem for FrankenFuse {
             Ok(()) => {
                 reply.ok();
                 self.notify_entry_invalidation(parent, name);
-                self.notify_inode_invalidation(parent);
+                self.notify_parent_invalidation(parent);
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
             Err(MutationDispatchError::Operation { error, offset }) => {
@@ -6236,9 +6254,9 @@ impl Filesystem for FrankenFuse {
                 reply.ok();
                 self.notify_entry_invalidation(parent, name);
                 self.notify_entry_invalidation(newparent, newname);
-                self.notify_inode_invalidation(parent);
+                self.notify_parent_invalidation(parent);
                 if newparent != parent {
-                    self.notify_inode_invalidation(newparent);
+                    self.notify_parent_invalidation(newparent);
                 }
             }
             Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
@@ -6288,7 +6306,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(newparent, newname);
-                self.notify_inode_invalidation(newparent);
+                self.notify_parent_invalidation(newparent);
                 self.notify_inode_invalidation(ino);
             }
             Err(e) => {
@@ -6770,7 +6788,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr) => {
                 reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
                 self.notify_created_entry_invalidation(parent, name);
-                self.notify_inode_invalidation(parent);
+                self.notify_parent_invalidation(parent);
             }
             Err(e) => {
                 Self::reply_error_create(
