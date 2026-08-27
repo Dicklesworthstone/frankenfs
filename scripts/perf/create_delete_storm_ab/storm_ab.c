@@ -39,6 +39,28 @@ static uint64_t digest_path(const char *p) {
     return h;
 }
 
+// /sys/block/<dev>/stat, 1-based: 5 = writes completed, 7 = sectors written,
+// 16 = FLUSH requests completed. Per-PHASE deltas are what this row needs: the
+// create/delete phases stage into the MVCC overlay while the two fsyncs are the
+// only durability boundaries, so where the device work actually lands is the
+// question the wall clock cannot answer.
+static void block_stat(const char *statfile, unsigned long long *ios,
+                       unsigned long long *sectors, unsigned long long *flushes) {
+    *ios = 0; *sectors = 0; *flushes = 0;
+    if (!statfile || !*statfile) return;
+    FILE *f = fopen(statfile, "r");
+    if (!f) return;
+    unsigned long long v[17] = {0};
+    int n = 0;
+    for (int i = 0; i < 17; i++) {
+        if (fscanf(f, "%llu", &v[i]) != 1) break;
+        n = i + 1;
+    }
+    fclose(f);
+    if (n >= 7) { *ios = v[4]; *sectors = v[6]; }
+    if (n >= 16) { *flushes = v[15]; }
+}
+
 static int read_daemon_ticks(int pid, unsigned long long *out) {
     if (pid <= 0) { *out = 0; return 0; }
     char path[64];
@@ -74,13 +96,28 @@ static int fsync_dir(const char *dir) {
     return 0;
 }
 
+struct phase_io { unsigned long long ios, sectors, flushes; };
+
+static void io_delta(const char *sf, struct phase_io *before, struct phase_io *out) {
+    struct phase_io now;
+    block_stat(sf, &now.ios, &now.sectors, &now.flushes);
+    out->ios = now.ios - before->ios;
+    out->sectors = now.sectors - before->sectors;
+    out->flushes = now.flushes - before->flushes;
+    *before = now;
+}
+
 static int run_batch(const char *root, unsigned long ops, uint64_t *create_ns,
                      uint64_t *fsync1_ns, uint64_t *delete_ns, uint64_t *fsync2_ns,
-                     uint64_t *digest_out) {
+                     uint64_t *digest_out, const char *statfile,
+                     struct phase_io io[4]) {
     char parent[3584];
     snprintf(parent, sizeof(parent), "%s/create-delete-storm", root);
     char path[4096];
     uint64_t digest = 0;
+
+    struct phase_io mark;
+    block_stat(statfile, &mark.ios, &mark.sectors, &mark.flushes);
 
     uint64_t t0 = now_ns();
     for (unsigned long i = 0; i < ops; i++) {
@@ -91,15 +128,19 @@ static int run_batch(const char *root, unsigned long ops, uint64_t *create_ns,
         digest ^= digest_path(path);
     }
     uint64_t t1 = now_ns();
+    io_delta(statfile, &mark, &io[0]);
     if (fsync_dir(parent) != 0) return -1;
     uint64_t t2 = now_ns();
+    io_delta(statfile, &mark, &io[1]);
     for (unsigned long i = 0; i < ops; i++) {
         snprintf(path, sizeof(path), "%s/storm-%08lu", parent, i);
         if (remove(path) != 0) { fprintf(stderr, "remove %s: %s\n", path, strerror(errno)); return -1; }
     }
     uint64_t t3 = now_ns();
+    io_delta(statfile, &mark, &io[2]);
     if (fsync_dir(parent) != 0) return -1;
     uint64_t t4 = now_ns();
+    io_delta(statfile, &mark, &io[3]);
 
     *create_ns = t1 - t0;
     *fsync1_ns = t2 - t1;
@@ -122,6 +163,7 @@ int main(int argc, char **argv) {
     if (narms > MAX_ARMS) { fprintf(stderr, "too many arms\n"); return 2; }
     char *labels[MAX_ARMS];
     char *dirs[MAX_ARMS];
+    char *stats[MAX_ARMS];
     for (int i = 0; i < narms; i++) {
         char *s = argv[5 + i];
         char *eq = strchr(s, '=');
@@ -129,6 +171,8 @@ int main(int argc, char **argv) {
         *eq = 0;
         labels[i] = s;
         dirs[i] = eq + 1;
+        char *eq2 = strchr(dirs[i], '=');
+        if (eq2) { *eq2 = 0; stats[i] = eq2 + 1; } else { stats[i] = NULL; }
     }
 
     cpu_set_t set;
@@ -139,27 +183,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    struct phase_io io[4];
     for (int i = 0; i < narms; i++) {
         uint64_t c, f1, d, f2, dg;
-        if (run_batch(dirs[i], ops, &c, &f1, &d, &f2, &dg) != 0) return 1;
+        if (run_batch(dirs[i], ops, &c, &f1, &d, &f2, &dg, stats[i], io) != 0) return 1;
         fprintf(stderr, "warmup %s create=%.3fms fsync1=%.3fms delete=%.3fms fsync2=%.3fms\n",
                 labels[i], c / 1e6, f1 / 1e6, d / 1e6, f2 / 1e6);
     }
 
-    printf("round,pos,arm,create_ns,fsync1_ns,delete_ns,fsync2_ns,total_ns,digest,daemon_ticks\n");
+    printf("round,pos,arm,create_ns,fsync1_ns,delete_ns,fsync2_ns,total_ns,digest,daemon_ticks,cr_ios,cr_sec,cr_fl,f1_ios,f1_sec,f1_fl,de_ios,de_sec,de_fl,f2_ios,f2_sec,f2_fl\n");
     for (int r = 0; r < rounds; r++) {
         for (int pos = 0; pos < narms; pos++) {
             int i = (pos + r) % narms;
             unsigned long long tb = 0, ta = 0;
             read_daemon_ticks(fusepid, &tb);
             uint64_t c, f1, d, f2, dg;
-            if (run_batch(dirs[i], ops, &c, &f1, &d, &f2, &dg) != 0) return 1;
+            if (run_batch(dirs[i], ops, &c, &f1, &d, &f2, &dg, stats[i], io) != 0) return 1;
             read_daemon_ticks(fusepid, &ta);
-            printf("%d,%d,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", r, pos, labels[i],
+            printf("%d,%d,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu", r, pos, labels[i],
                    (unsigned long long)c, (unsigned long long)f1,
                    (unsigned long long)d, (unsigned long long)f2,
                    (unsigned long long)(c + f1 + d + f2),
                    (unsigned long long)dg, ta - tb);
+            for (int q = 0; q < 4; q++)
+                printf(",%llu,%llu,%llu", io[q].ios, io[q].sectors, io[q].flushes);
+            printf("\n");
             fflush(stdout);
         }
     }

@@ -13046,3 +13046,124 @@ Reproduce:
     WORK=<scratch> ELF=<ffs-cli> ROUNDS=48 OPS=8 TAG=e41 FA_CPUS=18 FB_CPUS=19 \
       bash scripts/perf/fsync_journal_ab/run_fsync_ext4.sh
     python3 scripts/perf/fsync_journal_ab/fanalyze.py $WORK/fsync4-e41.csv
+
+## 2026-08-27 — the storm's per-phase device census: create+delete write ZERO sectors on BOTH arms, and the unexplained directory-fsync loss is WRITE-I/O FRAGMENTATION, 8 requests against the kernel's 3
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU, daemons on cpu18/cpu19.
+
+The ext4 create/delete storm is the worst standing number on the board, and one commit
+ago its directory-fsync loss lost its explanation: I had attributed `1.4757x`/`1.4856x` to
+the btrfs `3.000`-vs-`2.000` FLUSH-barrier law, and the ext4 barrier census then showed
+that law is btrfs-specific. **This applies the same census per PHASE to the storm itself.**
+
+### 2026-08-27 — the instrument now counts the device per phase
+
+`storm_ab.c` gained the `/sys/block/<dev>/stat` reader the fsync rig uses, sampled at every
+phase boundary, so write I/Os, sectors and FLUSH requests are attributed to create /
+fsync #1 / delete / fsync #2 separately. Four arms live in ONE invocation, each on its own
+loop device with `--direct-io=on`, order rotated per round, 32 rounds.
+`RCH_WORKER=none`, `hostname=thinkstation1`.
+
+Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]` (kernel) and same-invocation A/A null control `0.944989` bootstrap median CI `[0.917613, 0.975865]` (candidate),
+both from 20000 resamples over the 32 paired per-round ratios.
+
+⚠ **The candidate A/A FAILS on the total (`5.5%`) and PASSES on the phases this row's new
+finding rests on**: per-phase candidate A/A is `0.937150` (create) and `0.943366` (delete)
+but **`0.999481` (fsync #1) and `1.008302` (fsync #2)**. The cpu18/cpu19 asymmetry shows up
+only in the CPU-bound phases. So the fsync-phase conclusions below are decidable; the
+create/delete wall ratios carry a `~5.5%` candidate floor and are quoted with that caveat.
+
+| arm | phase | ms | write I/Os | sectors | **FLUSH** |
+| --- | --- | --- | --- | --- | --- |
+| kernel k1 | create 2,000 | 30.001 | **0** | **0** | **0** |
+| kernel k1 | fsync parent | 18.866 | **3** | 1168 | **2** |
+| kernel k1 | delete 2,000 | 21.436 | **0** | **0** | **0** |
+| kernel k1 | fsync parent | 19.086 | **3** | 1176 | **2** |
+| FrankenFS | create 2,000 | 285.215 | **0** | **0** | **0** |
+| FrankenFS | fsync parent | 27.243 | **8** | 1160 | **2** |
+| FrankenFS | delete 2,000 | 236.535 | **0** | **0** | **0** |
+| FrankenFS | fsync parent | 27.142 | **8** | 1160 | **2** |
+
+(kernel k2 and the second FrankenFS arm are identical on every counter.)
+
+### 2026-08-27 — result 1: 88.5% of this row touches the device ZERO times, on BOTH arms
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Same-invocation A/A null control `0.999663` bootstrap median CI `[0.986268, 1.011319]`, from 20000 resamples. Counted mechanism: write I/Os 0, sectors 0 and FLUSH requests 0 in the
+create and delete phases on every arm, read off `/sys/block/<dev>/stat` at each phase
+boundary; against 3 I/Os / 1168 sectors / 2 flushes per kernel fsync and 8 / 1160 / 2 per
+ours.
+
+The create and delete phases write **0 sectors, 0 I/Os and 0 barriers** on both the kernel
+arm and ours. Kernel ext4 defers everything to the fsync; we stage into the MVCC overlay.
+Those two phases are `285.215 + 236.535 = 521.75 ms` of a `575.168 ms` batch — **90.7%** —
+and they are **pure FUSE crossing and daemon CPU with no device work whatsoever**.
+
+⇒ **Any "we do more I/O" hypothesis for the storm's dominant phases is dead by counting.**
+What is left there is what earlier entries already counted: `12.88` crossings per
+create+delete pair, of which `2.000` are the `security.capability` audit probe and
+`1.000` is the extra LOOKUP entry invalidation costs (`1.192619x`, banked). Daemon CPU is
+34 ticks per 575 ms round = **59% of one core**, with `ops_ns` a low single-digit
+percentage of dispatch. Loss ratios on those phases, with the `5.5%` candidate floor
+attached: create `9.1624x`, delete `10.7649x`.
+
+### 2026-08-27 — result 2: the fsync loss is WRITE-I/O FRAGMENTATION, counted
+
+    FLUSH barriers   ours 2  vs kernel 2      IDENTICAL — not barriers
+    sectors          ours 1160 vs 1168/1176   we write 0.7-1.4% FEWER — not volume
+    write I/Os       ours 8  vs kernel 3      2.667x MORE REQUESTS
+
+    kernel: 1168 sectors / 3 I/Os = 389.3 sectors (195 KiB) per request
+    ours:   1160 sectors / 8 I/Os = 145.0 sectors ( 72 KiB) per request
+
+Wall on those phases: `k1/ffsA` = `0.730044` `[0.680403, 0.777292]` and `0.689943`
+`[0.674471, 0.875201]` ⇒ **`1.3698x` and `1.4494x` slower**, with the candidate A/A on
+those same phases at `0.999481` and `1.008302`.
+
+⭐ **So the previously-unexplained directory-fsync loss is now named and counted: our flush
+path emits the same bytes behind the same number of barriers in `2.667x` as many separate
+device writes.** It is not a durability difference — the barrier count is equal, and we
+write marginally fewer sectors. It is the run-coalescer in
+`ShardedMvccStore::flush_to_device_after` producing ~8 discontiguous runs where ext4's
+writeback produces 3.
+
+### What to attack, and why it is the same function as before
+
+`flush_to_device_after` already coalesces maximal runs of contiguous blocks into one
+`write_contiguous_blocks`. Eight requests for 1160 sectors means the dirty set lands in
+about eight discontiguous ranges — the directory block, the inode table block, the block
+and inode bitmaps, the group descriptor and the superblock all sit far apart in an ext4
+image, and each becomes its own request. ext4's own writeback reaches 3 by letting the
+block layer merge across a plugged region. Candidate approaches, none measured:
+issue the run writes under a single `blk_start_plug`-equivalent (i.e. one `pwritev` per
+flush rather than one `pwrite` per run), or order the runs so adjacent metadata coalesces.
+This is the same function whose missing `reserve()` was worth `1.137104x` on bulk durable
+write, so the flush path is now twice-implicated and is the single best-supported target
+left on the mutating rows. **Sized here at `1.37`-`1.45x` of two phases that are `9.5%` of
+this batch — i.e. `~4%` of the storm — but the same fragmentation applies to every
+durability boundary we emit, including the ones that ARE the whole batch on the fsync
+rows.**
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. The candidate A/A null fails on the total and
+on the create/delete phases (`5.5%`) and passes on the fsync phases, so only the fsync-phase
+ratios are decidable and the create/delete ratios carry that floor. What this banks is the
+per-phase device census — zero device work in create/delete on both arms, equal barriers
+and fewer sectors but `2.667x` the write requests at the durability boundary — all counted,
+all ISA-invariant.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/create_delete_storm_ab/mkstorm.sh
+    gcc -O2 -o $WORK/storm_ab scripts/perf/create_delete_storm_ab/storm_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=io1 FA_LABEL=ffsA FB_LABEL=ffsA2 \
+      FA_CPUS=18 FB_CPUS=19 bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+    python3 scripts/perf/create_delete_storm_ab/sanalyze.py $WORK/stormdio-io1.csv
+    # the per-phase device columns are cr_/f1_/de_/f2_ {ios,sec,fl} in the CSV

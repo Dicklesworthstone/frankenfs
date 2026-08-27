@@ -88,6 +88,9 @@ if [ -n "$FB_LABEL" ]; then
 fi
 echo "== client cpu $CPU, $OPS create+delete pairs per batch"
 
+S() { echo "/sys/block/$(basename "$1")/stat"; }
+ARMS=("k1=$K1=$(S "$DK1")" "k2=$K2=$(S "$DK2")" "$FA_LABEL=$FA=$(S "$DFA")")
+[ -n "$FB_LABEL" ] && ARMS+=("$FB_LABEL=$FB=$(S "$DFB")")
 "$W/storm_ab" "$ROUNDS" "$OPS" "$CPU" "$APID" "${ARMS[@]}" | tee "$W/stormdio-$TAG.csv"
 
 echo "== unmount + census"
