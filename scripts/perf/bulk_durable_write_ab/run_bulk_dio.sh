@@ -94,7 +94,20 @@ echo "== client cpu $CPU, $CHUNKS x 1 MiB + fsync"
 S() { echo "/sys/block/$(basename "$1")/stat"; }
 ARMS=("k1=$K1=$(S "$DK1")" "k2=$K2=$(S "$DK2")" "$FA_LABEL=$FA=$(S "$DFA")")
 [ -n "$FB_LABEL" ] && ARMS+=("$FB_LABEL=$FB=$(S "$DFB")")
+# bd-3giz2: the copy this row's lever removes is DAEMON CPU, and on a loaded box
+# CPU ticks measure work done while wall measures waiting. Snapshot utime+stime for
+# BOTH daemons around the whole run, per arm, exactly as the xattr rig does.
+ticks_of() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+A_TK0=$(ticks_of "$APID"); B_TK0=0
+[ -n "$FB_LABEL" ] && B_TK0=$(ticks_of "$BPID")
+
 "$W/bulkwrite_ab" "$ROUNDS" "$CHUNKS" "$CPU" "$APID" "${ARMS[@]}" | tee "$W/bulkdio-$TAG.csv"
+
+A_TK1=$(ticks_of "$APID"); B_TK1=0
+[ -n "$FB_LABEL" ] && B_TK1=$(ticks_of "$BPID")
+echo "== daemon CPU over the whole run (ticks, utime+stime)"
+echo "daemon_cpu_ticks,$FA_LABEL,$((A_TK1-A_TK0))"
+[ -n "$FB_LABEL" ] && echo "daemon_cpu_ticks,$FB_LABEL,$((B_TK1-B_TK0))"
 
 echo "== unmount + census"
 fusermount3 -u "$FA"; wait "$APID" 2>/dev/null || true

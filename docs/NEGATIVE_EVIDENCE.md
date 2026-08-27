@@ -17186,3 +17186,105 @@ Reproduce:
       FA_ENV="FFS_FUSE_RECEIVE_SPIN=2000" \
       FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000 FFS_FUSE_RECEIVE_SPIN_ADAPTIVE=1" TAG=ad1 \
       bash scripts/perf/xattr_ab/run_xattr.sh
+
+## 2026-08-27 — bd-3giz2: my own landed vectored flush was INERT in production for two commits (the forwarder trap, in an adapter I did not enumerate). Fixed — memmove `16.07% → 5.77%` — and the row still cannot express it: wall NULL, CPU not reproducible
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/bulk_durable_write_ab/{run_bulk_dio.sh,bperf2.sh,mkbulk.sh}`.** Provenance:
+in-process self-report
+`bench_evidence,binary_sha256=75b1e3f0b871ce7e0168d8f7ec16bbfbf97c5ca4096b6003e838e61a7602fc6f`
+(inert build) and
+`05087d768d82cc22ae131dfab8f014f0138b9ac746cd2288315264997d832fcc` (after the fix),
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19, client on CPU 8, loop devices
+`--direct-io=on`.
+
+bd-3giz2 names the mutating path as the only surface FrankenFS owns and asks for allocation
+churn and **block copies**. The block-copy half was landed two commits ago as
+`FFS_MVCC_FLUSH_VECTORED`, byte-identical and gated, with its wall arm owed. This measures it.
+
+### ⛔ First: the row could not be mounted at all
+
+`94fdba50b` (a peer, today) added `require_jbd2_durability_for_mount`: a writable **journalled**
+ext4 mount is now REFUSED, because the mounted fsync path never calls
+`commit_transaction_journaled` and a journalled image would look durable while skipping
+descriptor and commit blocks. `mke2fs -t ext4` produces a journalled image, so **every ext4
+`--rw` fixture in this campaign is now unmountable** and the mutating-path rows are blocked
+until rebuilt.
+
+Rebuilt `mkbulk.sh` with `-O ^has_journal`. ⭐ That is not a workaround, it is the only
+comparable form: bd-4zjkz already established our write path matches **unjournalled** kernel
+ext4 exactly (128 sectors / 24 write I/Os / 8 flushes against the journalled kernel's
+256/24/16), so a journalled arm was never the same durability class anyway.
+
+### ⛔ Then: the lever I landed was doing nothing
+
+`perf` self-time, one ELF, knob toggled — the same load-insensitive check that priced the copy
+at `10.52 pp` by adding one back:
+
+| `__memmove_avx_unaligned_erms` | vectored OFF | vectored ON | Δ |
+| --- | ---: | ---: | ---: |
+| **before the fix** (`75b1e3f0…`) | 17.01% | 15.77% | **−1.24 pp** |
+| **after the fix** (`05087d76…`) | 16.07% | **5.77%** | **−10.30 pp** |
+
+A copy worth `~10.5 pp` was moving `1.24 pp`. **The vectored path was inert in the mounted
+daemon.** Cause: `impl BlockDevice for CachedByteDeviceBlockAdapter` — the device the mounted
+path actually holds, visible in every profile as
+`FsMvccStore::flush_to_device_after::<CachedByteDeviceBlockAdapter>` — **overrides
+`write_contiguous_blocks` and inherited the concatenating DEFAULT** for the vectored sibling.
+`ffs-core` had **zero** vectored overrides.
+
+⭐⭐⭐ **This is the trap I documented two commits ago and then walked into.** I wrote *"a
+defaulted trait method plus a blanket forwarding impl is a silent no-op unless the forwarder
+lists it"*, enumerated `impl BlockDevice for Arc<D>` in `ffs-block`, added the method there —
+and never enumerated the four `ffs-core` adapters. **Listing one forwarder is not enumerating
+the impls.** Fixed in `CachedByteDeviceBlockAdapter` and `ByteDeviceBlockAdapter`, and the
+`10.30 pp` drop is the proof it now runs.
+
+### The measurement, on the fixed ELF
+
+24 rounds × 64 × 1 MiB + `fsync`, four arms in ONE invocation, forward and mirrored with arms
+**and** daemon CPUs swapped:
+
+| | forward | mirrored |
+| --- | --- | --- |
+| `coalesce/vectored`, whole batch | — | `1.014319` `[0.988331, 1.079169]` |
+| `coalesce/vectored`, write phase | `1.019166` `[0.958735, 1.119698]` | `0.941459` `[0.868000, 1.042479]` |
+| A/A null `k1/k2`, total | — | `0.982010` `[0.965294, 1.016414]` **PASS** |
+| A/A null `k1/k2`, write phase | `1.001144` `[0.922889, 1.108399]` **PASS** | `0.908290` `[0.856717, 0.960603]` ⛔ **FAIL** |
+| **daemon CPU (ticks)** | coalesce 297 → vectored **269** (**−9.4%**) | coalesce 267 → vectored **265** (**−0.7%**) |
+
+⛔ **Every wall CI spans 1, the two write-phase halves disagree in sign, the write-phase A/A
+null fails in the mirror, and the CPU saving does not reproduce (`−9.4%` against `−0.7%`).**
+
+⇒ **The mechanism works and the row cannot express it.** The copy is provably gone — `10.30 pp`
+of daemon CPU, reproducible and load-insensitive — but the bulk row's wall is dominated by the
+device fsync (`156.755` and `74.752 ms` against write phases of `105.249` and `93.198 ms`), and
+a `10 pp` slice of a daemon that is mostly waiting does not surface. **The knob stays default
+OFF.** It is not a rejected mechanism; it is a mechanism this row's clock cannot see.
+
+Gates: `cargo test -p ffs-block -p ffs-mvcc -p ffs-core --lib` **2072 passed / 0 failed**;
+`clippy -D warnings` clean on `ffs-core` and `ffs-block` (the errors it reports are all in
+`ffs-cli` at lines untouched here, from the workspace lint config landed in `4ee4606de`).
+
+### Transferable
+
+  * ⭐⭐⭐ **Enumerate the IMPLS, not the forwarder.** I identified the `Arc<D>` trap, wrote a
+    warning about it, listed that one impl — and the production device was a different adapter
+    that overrides the scalar method and silently inherited the default. The check is
+    `grep -c '<new_method>' <crate>` over every crate with a `BlockDevice` impl, not a reading
+    of the blanket impl.
+  * ⭐⭐ **A knob that self-reports `true` is not a knob that ran.** `mvcc_flush_vectored=true`
+    was on the line for two commits while the code path did nothing; only a counter tied to
+    the MECHANISM (memmove self-time) could tell the difference.
+  * ⭐ **A correctness guard can invalidate a whole fixture class overnight.** Every ext4 `--rw`
+    row is blocked on a no-journal rebuild as of today, and that is worth knowing before the
+    next agent debugs a mount failure.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`. No vs-incumbent ratio is claimed: the wall CIs all
+span 1 and one A/A half fails. What is banked is the counted mechanism (`memmove` `16.07% →
+5.77%`), the inertness of the previous build, and the fact that the row's clock cannot resolve
+the effect.

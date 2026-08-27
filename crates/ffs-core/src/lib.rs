@@ -3708,6 +3708,39 @@ impl BlockDevice for ByteDeviceBlockAdapter<'_> {
         self.dev.write_all_at(cx, ByteOffset(offset), data)
     }
 
+    /// Gather straight to the byte device rather than letting the DEFAULT
+    /// concatenate. Same validation as the scalar path, applied to the summed
+    /// length; see the note on `CachedByteDeviceBlockAdapter` for why an adapter
+    /// that overrides the scalar method must also override this one.
+    fn write_contiguous_blocks_vectored(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        chunks: &[&[u8]],
+    ) -> Result<(), FfsError> {
+        let bs = u64::from(self.block_size());
+        let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        if bs == 0 || !total.is_multiple_of(bs as usize) {
+            return Err(FfsError::Format(
+                "write_contiguous_blocks: data length must be a multiple of block size".to_owned(),
+            ));
+        }
+        let offset = start
+            .0
+            .checked_mul(bs)
+            .ok_or_else(|| FfsError::Format("contiguous write offset overflow".to_owned()))?;
+        let end = offset
+            .checked_add(total as u64)
+            .ok_or_else(|| FfsError::Format("contiguous write range overflow".to_owned()))?;
+        if end > self.dev.len_bytes() {
+            return Err(FfsError::Format(format!(
+                "contiguous write [{offset}, {end}) out of range for device length {}",
+                self.dev.len_bytes()
+            )));
+        }
+        self.dev.write_vectored_all_at(cx, ByteOffset(offset), chunks)
+    }
+
     fn write_contiguous_blocks(
         &self,
         cx: &Cx,
@@ -3864,6 +3897,35 @@ impl BlockDevice for CachedByteDeviceBlockAdapter<'_> {
         }
         self.invalidate_range(start, data.len() / bs)?;
         self.base.write_contiguous_blocks(cx, start, data)
+    }
+
+    /// Forward the gather list instead of letting the DEFAULT concatenate it.
+    ///
+    /// ⚠ This is the `Arc<D>`-forwarder trap in a second place, and it is why the
+    /// vectored flush measured INERT on 2026-08-27: this adapter is the device the
+    /// mounted path actually holds (`FsMvccStore::flush_to_device_after::
+    /// <CachedByteDeviceBlockAdapter>` in every profile), it overrides
+    /// `write_contiguous_blocks`, and without this it inherited the concatenating
+    /// default — so the flush kept making the exact copy the lever removes, and
+    /// `__memmove_avx_unaligned_erms` moved 17.01% -> 15.77% instead of the ~10 pp
+    /// the copy is worth. Any future defaulted `BlockDevice` method must be
+    /// enumerated across EVERY overriding adapter, not just the blanket impl.
+    fn write_contiguous_blocks_vectored(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        chunks: &[&[u8]],
+    ) -> Result<(), FfsError> {
+        let bs = usize::try_from(self.block_size())
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+        let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        if bs == 0 || !total.is_multiple_of(bs) {
+            return Err(FfsError::Format(
+                "write_contiguous_blocks: data length must be a multiple of block size".to_owned(),
+            ));
+        }
+        self.invalidate_range(start, total / bs)?;
+        self.base.write_contiguous_blocks_vectored(cx, start, chunks)
     }
 
     fn block_size(&self) -> u32 {

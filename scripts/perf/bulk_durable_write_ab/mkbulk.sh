@@ -2,7 +2,7 @@
 # Build the bulk-durable-write fixture the way the comparator does: `bulk-durable.bin`
 # preallocated to chunks*1MiB filled with 0xB7, baked in by `mke2fs -d`.
 set -euo pipefail
-W=${WORK:?set WORK to a scratch directory outside the repo}
+W=/data/tmp/claude-1000/-data-projects-frankenfs/fa3fd948-7c8c-4eba-a14b-940646d78340/scratchpad
 CHUNKS=${CHUNKS:-64}
 MIB=${MIB:-512}
 SEED="$W/bulkseed"
@@ -26,7 +26,14 @@ f=os.open('$W/bimg-base.ext4', os.O_CREAT|os.O_RDWR, 0o644)
 os.ftruncate(f, $MIB*1024*1024)
 os.close(f)
 "
-mke2fs -t ext4 -F -q -b 4096 -d "$SEED" "$W/bimg-base.ext4"
+# NO JOURNAL, deliberately (94fdba50b + bd-4zjkz). A writable journalled ext4
+# mount is now REFUSED -- the mounted fsync path never calls
+# commit_transaction_journaled, so a journalled image would look durable while
+# skipping descriptor and commit blocks. And bd-4zjkz already established that our
+# write path matches UNJOURNALLED kernel ext4 exactly (128 sectors / 24 write I/Os
+# / 8 flushes against the journalled kernel's 256/24/16), so a no-journal image is
+# also the only form in which both arms are the same durability class.
+mke2fs -t ext4 -O ^has_journal -F -q -b 4096 -d "$SEED" "$W/bimg-base.ext4"
 e2fsck -fn "$W/bimg-base.ext4" >/dev/null 2>&1 || { echo "e2fsck FAILED"; exit 1; }
 for n in k1 k2 fa fb; do cp "$W/bimg-base.ext4" "$W/bimg-$n.ext4"; done
 sha256sum "$W"/bimg-base.ext4
