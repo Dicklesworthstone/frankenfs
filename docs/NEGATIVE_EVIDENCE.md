@@ -15308,3 +15308,97 @@ Reproduce:
       FA_LABEL=base FB_LABEL=spin FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000" TAG=ss1 \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
     python3 scripts/perf/create_delete_storm_ab/sanalyze.py <body.csv>
+
+## 2026-08-27 — ⛔ REJECT: `FFS_FUSE_PARENT_INVAL=0` removes `0.938` GETATTR crossings per create+delete pair — `6.0%` of every crossing on the storm — for an UNDECIDABLE `1.017298x`; and the knob was not on the self-report line at all
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=5553e4eb5702b249f04a51cd62cc48d4bb909803052298451e02fc598e5fc45d`
+(measurement) and
+`588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9` (the ELF that now reports
+the knob), `codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19, client on CPU 8, loop devices
+`--direct-io=on`.
+
+`notify_parent_invalidation` fires on every create, unlink, mkdir, rmdir, rename, link and
+symlink, and its own doc names the cost: "`getattr` 3.147 per create+unlink pair on the
+storm, 28% of every request that workload issues", on a workload that never asks for
+attributes itself. `getattr` is `18.8%` of this row's crossings and `9.6%` of its dispatch
+time. It had never been measured here.
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+24 rounds × 2,000 create+delete pairs, four arms simultaneously, order rotated per round,
+forward and mirrored with arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/noParInval` | `1.008712` `[0.981033, 1.049046]` | `1.025958` `[0.996288, 1.049989]` | **`1.017298x`** |
+| A/A null `k1/k2` | `1.003263` `[0.985817, 1.014834]` | `1.014725` `[1.002677, 1.080035]` ⚠ | `1.008978` |
+
+**Both halves' CIs span 1.** The balanced `1.7%` sits against a balanced null of `0.9%` — a
+`1.9×` margin, which this rig cannot resolve. ⛔ **UNDECIDABLE, therefore REJECTED**: a
+measured semantic degradation cannot be bought with an effect the instrument cannot see.
+
+Absolutes: kernel_median_wall_ns=87052000 and kernel_median_wall_ns=88545000 against
+fuse_median_wall_ns=498618000 / fuse_median_wall_ns=491592000 (forward) and
+fuse_median_wall_ns=511536000 / fuse_median_wall_ns=490294000 (mirrored). All CIs are
+20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+### Counted mechanism — exact, reproducible, and nothing substituted
+
+| counter | base | `PARENT_INVAL=0` | Δ |
+| --- | ---: | ---: | ---: |
+| `crossings_getattr` forward | 146,430 | 101,416 | **−45,014** |
+| `crossings_getattr` mirrored | 147,191 | 101,812 | **−45,379** |
+| `crossings_total` forward | 746,633 | 701,619 | **−45,014** |
+| `crossings_total` mirrored | 747,382 | 701,992 | **−45,390** |
+
+**`0.938` GETATTR crossings removed per create+delete pair, `6.0%` of every crossing on the
+row**, and the total falls by exactly the same amount — unlike the FLUSH reject, the kernel
+substitutes nothing back.
+
+⭐⭐ **This prices a removed crossing, and the price depends on which opcode it is.** Two
+levers on the same row, same rig, same day:
+
+| lever | crossings removed | share | wall | decidable? |
+| --- | ---: | ---: | --- | --- |
+| create-side entry invalidation | 103,150 (50,000 `lookup` + notifier sends) | 13.8% | `1.105635x` | **yes** |
+| parent invalidation | 45,014 (`getattr` only) | 6.0% | `1.017298x` | **no** |
+
+`0.77` wall-points per crossing-point for the lookups against `0.28` for the getattrs. The
+per-opcode table explains the direction — `lookup` costs `6,022 ns/crossing` against
+`getattr`'s `3,792` — and the create-side lever additionally removed 50,000 notifier sends.
+**"Crossings removed" is not a currency; the opcode is.**
+
+### ⚠ The knob was unattestable, and is not any more
+
+`FFS_FUSE_PARENT_INVAL` was **absent from `mount_candidate_knobs`**, so the comparator could
+not prove two arms differ and this A/B could only be attested after the fact from the
+crossing census. That is exactly the state bd-087wt exists to prevent. Added to the line;
+verified on the new ELF: no env ⇒ `parent_inval=true`, `FFS_FUSE_PARENT_INVAL=0` ⇒
+`parent_inval=false`.
+
+### Transferable
+
+  * ⭐⭐ **Rank levers by opcode-weighted crossings, not crossing count.** Divide
+    `dispatch_ns_<op>` by `crossings_<op>` first; a lever that removes cheap crossings can be
+    undecidable while one removing half as many expensive ones is a clear win.
+  * ⭐ **"Undecidable" is a verdict, not a missing result.** The semantic cost here (a
+    directory `stat` may report an mtime up to `ATTR_TTL` stale) is certain; the gain is not.
+    That asymmetry decides it without needing a bigger rig.
+  * ⭐ **A knob missing from the self-report line is a measurement bug, not a cosmetic one** —
+    it makes every A/B on it unattestable in-process.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=noParInval FB_ENV="FFS_FUSE_PARENT_INVAL=0" TAG=pi1 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
