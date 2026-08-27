@@ -16102,3 +16102,97 @@ Reproduce:
       FA_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1" \
       FB_ENV="FFS_FUSE_XATTR_NO_SUPPORT=1 FFS_FUSE_PARENT_INVAL=0" TAG=sp1 \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+
+## 2026-08-27 — the storm's `4.003986x` residual is the ROUND TRIP, proven three ways; and `dispatch_ns` is NOT a cost metric — `Request::dispatch` is `1.66%` of daemon CPU while `dispatch_ns_other` is `71.3%` of dispatch
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh` and `sperf.sh`, plus a device-read
+census.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18, loop device `--direct-io=on`.
+
+With the audit probe suppressed and parent invalidation off, the storm still measures
+`4.003986x` — the largest genuinely-ours residual on the board. Its per-opcode table blames
+one bucket:
+
+| opcode | crossings | share | dispatch | share | ns/crossing |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **`other`** (create, unlink, flush, fsyncdir, lookup) | 250,051 | 50.0% | **2,857.8 ms** | **72.4%** | **11,429** |
+| `getattr` | 100,131 | 20.0% | 341.9 ms | 8.7% | 3,415 |
+| `release` | 50,000 | 10.0% | 213.3 ms | 5.4% | 4,265 |
+| total | 500,284 | 100% | 3,949.8 ms | 100% | 7,895 |
+
+Netting out `lookup` (497.7 ms / 100,001), a create or unlink costs **~24 µs** of
+`dispatch_ns` against a round trip of ~3 µs. That looked like 21 µs of handler work.
+
+### It is not handler work, and it is not the device
+
+| evidence | measurement |
+| --- | --- |
+| device READ I/Os over 16,000 mutations | **0** (read sectors 0) |
+| device WRITE I/Os / sectors over the same | **80** / 11,600 |
+| `Request::dispatch` inclusive, `perf` on the daemon | **1.66%** of CPU |
+| `ShardedMvccStore::commit` inclusive | 1.01% |
+| daemon CPU, probes on → suppressed | **159 → 122 ticks (−23.3%)** |
+| wall gain from the same suppression | **22.0%** |
+
+The mutating path **never touches the device** — zero reads, and 80 writes for 16,000
+mutations. And if the handlers were burning 21 µs of CPU each, `Request::dispatch` would
+dominate the profile; it is `1.66%`. Meanwhile daemon CPU tracks wall almost exactly
+(`−23.3%` CPU for a `22.0%` wall gain), so the CPU that IS spent is real — and it is
+transport: `Channel::receive` `25.54%` + `RequestSender::send` `12.35%` + `Notifier::send`
+`14.49%` = **`52.4%` of daemon CPU in three frames that move bytes**.
+
+⇒ **The residual is the FUSE round trip.** 250,051 mutating crossings that the workload
+requires, each costing a kernel↔daemon crossing that the kernel filesystem does not pay at
+all.
+
+### ⛔ `dispatch_ns` is not a cost metric — instrument correction
+
+`dispatch_ns` is measured receive-to-reply. On a row where the daemon waits between requests
+it therefore includes **time the daemon is not working**, which is why `other` can be `72.4%`
+of "dispatch" while the code that serves it is `1.66%` of CPU. The two are not in
+contradiction; they measure different things, and only one of them is cost.
+
+⚠ Every ranking in this ledger that used `dispatch_ns` as a proxy for cost should be read as
+a ranking of **what the client waits on**, not of what the daemon spends. That is often the
+more useful quantity — but it must be named correctly, and it cannot be compared against
+`perf` percentages as if they were the same units. This is the second correction in two
+commits arising from the same over-reading of that counter.
+
+### ⛔ REFUSED, not measured: the FLUSH reject re-test
+
+The rule from one commit ago says a lever rejected behind a dominant confound must be re-run
+with the confound removed. `FFS_FUSE_NO_FLUSH=1` was rejected at `1.026199x` SLOWER with the
+probes present; the re-test under suppression was **run and its wall arm refused**:
+`loadavg 69.45` mid-run, kernel `k1` at `112.523 ms` against `86–90 ms` in the quiet windows
+earlier today, and the A/A null `1.006255` `[0.908295, 1.057266]` — a **15%-wide** CI on a
+question worth `2–5%`. No ratio from it is admissible and none is quoted.
+
+⭐ What DID survive the bad window, because counters do not care about load: **the
+substitution reproduces**. `op_counts flush` `50,000 → 0` while `getattr` `139,891 →
+154,434` (**+14,543**), and `crossings_total` `540,044 → 504,566` — the kernel still replaces
+most of the removed FLUSHes with GETATTRs when the probes are gone. The mechanism that
+justified the original reject is intact; only its wall re-confirmation is outstanding.
+
+### Transferable
+
+  * ⭐⭐⭐ **Three counters that disagree are how you find out what a number means.** Zero
+    device reads, `1.66%` CPU in dispatch, and `72.4%` of `dispatch_ns` in the same bucket
+    cannot all describe cost — and resolving that is what turned "21 µs of handler work" into
+    "the round trip".
+  * ⭐⭐ **Name what a timer spans before ranking with it.** Receive-to-reply is not
+    handler cost on a row with an idle daemon.
+  * ⭐ **A refused window is a result.** Counters still bank; ratios do not.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`. The `4.003986x` and `4.279481x` figures are the
+same-invocation forward+mirrored measurements banked one commit ago with both A/A halves
+passing; this entry adds no new ratio and explicitly refuses one.
+
+Reproduce (device-read census):
+
+    WORK=<scratch> ELF=<ffs-cli> bash scripts/perf/create_delete_storm_ab/readcount.sh base
