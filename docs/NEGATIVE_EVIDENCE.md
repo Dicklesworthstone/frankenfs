@@ -11597,3 +11597,144 @@ Reproduce:
       FA_LABEL=def FB_LABEL=w4 FA_CPUS=8-15 FB_CPUS=8-15 FB_ENV="FFS_FUSE_WORKERS=4" \
       bash scripts/perf/readdir_stat_ab/run_multi.sh
     python3 scripts/perf/readdir_stat_ab/analyze.py $WORK/rdstat-final.csv
+
+## 2026-08-27 — bulk durable write: 36.7% of the daemon is OUR memcpy and allocator, and one missing `reserve` on the flush path was 15.81% of daemon CPU
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/bulk_durable_write_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU. Both FrankenFS arms are the SAME ELF,
+differing only in `FFS_MVCC_FLUSH_RESERVE`, which the daemon self-reports in
+`mount_candidate_knobs,...,mvcc_flush_reserve={false,true}` so an override that never
+reached the knob is a hard error rather than a silent self-comparison.
+
+Third row dug in this sequence. Warm stat rejected because the daemon was idle;
+readdir+stat found the daemon busy but executing almost no FrankenFS code (6.72% of
+daemon CPU). **This row is the first where the loss is ours.**
+
+### 2026-08-27 — the instrument, and its own null controls
+
+`bulk_durable_write_batch` (`ffs_mounted_kernel_bench.rs:4279`) reproduced in C: open
+the preallocated 64 MiB `bulk-durable.bin`, 64 sequential 1 MiB `pwrite`s, one `fsync`.
+One client thread, as the banked row. Four arms live SIMULTANEOUSLY in ONE rig
+invocation — two kernel ext4 RW loop mounts and two FrankenFS `--rw` mounts — arm order
+rotated per round. Same-invocation kernel A/A null control, both 60-round runs:
+`1.002721` `[0.986768, 1.020893]` and `1.009355` `[0.986050, 1.034637]`. Candidate A/A
+null control, two identical FrankenFS mounts of identical images from one ELF, also
+same-invocation: `1.049630` `[0.965108, 1.098533]` — **this row's candidate floor is
+~10%, twice readdir+stat's**, because the fsync phase rides the host's NVMe state.
+
+Both A/A null controls are bootstrap medians, each with a bootstrap median CI from 20000
+resamples over the paired per-round ratios. `RCH_WORKER=none`, `hostname=thinkstation1`,
+single worker by construction — the rig never leaves this host, and both arms of every
+comparison are mounts inside ONE process invocation on it.
+
+⚠ The vs-kernel ratio on this row is WINDOW-DOMINATED and must not be quoted to a CI.
+Absolute arm medians, stated so it is visible which arm moved. Mirrored 60-round run:
+kernel_median_wall_ns=103335000 (k1) and kernel_median_wall_ns=102544000 (k2) against
+fuse_median_wall_ns=256517000 (reserve) and fuse_median_wall_ns=281434000 (noreserve),
+giving `2.4826x`/`2.5017x` for the shipping configuration. Forward 60-round run:
+kernel_median_wall_ns=82156000 and kernel_median_wall_ns=101836000 against
+fuse_median_wall_ns=246980000, giving `2.7846x`/`2.5034x` for the same configuration. The kernel arm's own
+fsync median moved `78 ms → 279 ms` across the session as peer builds loaded the device,
+so the movement is the incumbent's absolute, not ours. The banked `2.898298x` sits inside
+that spread, and the banked row already carries the same warning. What is decidable here
+is the WITHIN-INVOCATION interior A/B, not the headline.
+
+### Where the loss is — the profile is nothing like the read rows
+
+`perf record -F 4999 -g --call-graph dwarf` on the daemon, 39,788 samples, 28.0 G cycles:
+
+    65.83%  [kernel.kallsyms]     fuse/dev copy, page-fault + folio-zero path
+    19.10%  libc.so.6             __memmove_avx_unaligned_erms alone is 18.09%
+    14.87%  ffs-cli
+     0.12%  [nvme]
+
+On the four read-only rows our whole ELF is ~6.7% of daemon CPU. Here **our userspace
+plus the libc memcpy it calls is 36.7%**, and the daemon is ~70% of the batch's wall
+(17-21 ticks per 250-295 ms round). Counted, children-mode:
+
+    28.87%  FsMvccStore::flush_to_device_after
+    27.60%  asm_exc_page_fault
+    15.81%  RawVecInner::finish_grow  ->  do_rallocx 15.35%  ->  _rjem_je_large_ralloc 15.19%
+     9.27%  Cow::into_owned  (sharded flush)
+     1.17%  OpenFs::ext4_write -> to_vec  (one owned 4 KiB block per staged write)
+
+**The defect, read straight off the stack.** `flush_to_device_after` coalesces contiguous
+dirty blocks into one `run_buf` with `extend_from_slice` and **never reserves**. A 64 MiB
+sequential overwrite is ONE run of 16,384 contiguous 4 KiB blocks, so the buffer is grown
+16,384 times and jemalloc's `large_ralloc` moves the whole multi-MiB allocation on every
+growth step. The flush already materializes every dirty block before the loop starts, so
+the total is known and one `reserve` removes the entire chain. Both stores had it
+(`ShardedMvccStore` and `MvccStore`).
+
+### The fix, measured, one ELF, arms rotated
+
+`FFS_MVCC_FLUSH_RESERVE`, default ON, 60 rounds each, forward and mirrored:
+
+| | forward (`noreserve` on cpu16) | mirrored (arms and CPUs swapped) |
+| --- | --- | --- |
+| whole batch | **`1.157904x`** `[1.138461, 1.235676]` | **`1.098925x`** `[1.060830, 1.117844]` |
+| fsync phase | **`1.216721x`** `[1.158106, 1.287506]` | **`1.149860x`** `[1.096920, 1.187409]` |
+| write phase (negative control) | `1.053513x` `[1.034462, 1.119871]` | `0.988431x` `[0.952323, 1.014998]` |
+
+Absolute medians, mirrored run: kernel `103.335`/`102.544 ms`, `reserve` `256.517 ms`,
+`noreserve` `281.434 ms`. Quote the conservative pair — **`1.098925x` whole batch,
+`1.149860x` on fsync**.
+
+⭐ **The write phase is a free negative control INSIDE the same invocation.** The
+reservation is on the flush path and provably cannot touch the pwrite phase; that phase
+measures `1.053513x` and `0.988431x`, straddling the candidate A/A null `1.049630`. A
+lever that moved both phases equally would have been the instrument moving, not the code.
+
+**Counted mechanism, the same profile re-run on both arms of the one ELF:**
+
+    RawVecInner::finish_grow    15.81%  ->  0.04%   (395x)
+    do_rallocx                  15.35%  ->  0.19%
+    _rjem_je_large_ralloc       15.19%  ->  below threshold
+    asm_exc_page_fault          27.60%  -> 19.26%
+
+**Correctness.** e2fsck clean on all four images after the 60-round mirrored run, and
+`bulk-durable.bin` reads back through a kernel mount as 67,108,864 bytes of ONE uniform
+byte on every arm — and that byte is EXACTLY the one the rig's last batch for that arm
+wrote (`reserve` 68, `noreserve` 208, `k1` 245, `k2` 31, all matching
+`((seq % 251) * 37 + 113) % 251` for the sequence numbers the rotation assigned). Unit
+tests: `cargo test -p ffs-mvcc --lib` = **506 passed, 1 failed** —
+`persist::tests::lock_ordering_under_concurrent_commit_and_truncate`, a watchdog-deadline
+test that does not call `flush_to_device_after` at all and passes **3 of 3** in isolation;
+it tripped on a shared remote worker running a peer swarm. Recorded rather than hidden.
+
+### What is left, sized, and NOT taken
+
+`__memmove_avx_unaligned_erms` is still **17.00%** of daemon CPU with the reserve on. The
+payload is copied roughly five times end to end — kernel into the FUSE request buffer,
+`ext4_write`'s per-block `to_vec`, the MVCC staged version, the sharded flush's
+`Cow::into_owned`, and `run_buf.extend_from_slice` — where the kernel arm copies it twice
+(page cache, then writeback). Two of those five are removable in principle:
+`resolve_data_with` returns `Cow::Borrowed` for every uncompressed version, so the
+sharded path's `into_owned` is a pure allocation-plus-copy that exists only because the
+shard read lock is released before the write. Removing it needs a two-pass collect that
+re-resolves under the lock, which is a real correctness surface (pruning, concurrent
+commit) and is NOT attempted here. **Sized at 9.27% of daemon CPU; unmeasured.**
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row and the vs-kernel numbers are additionally
+window-dominated (above). What this banks is the counted mechanism — the realloc chain at
+15.81% and its collapse to 0.04% — and the one-ELF interior A/B, both ISA-invariant. The
+knob defaults ON because the reservation is an upper bound on a buffer the same call was
+already about to allocate, so the worst case is unchanged peak memory with no realloc.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/mkbulk.sh
+    gcc -O2 -o $WORK/bulkwrite_ab scripts/perf/bulk_durable_write_ab/bulkwrite_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=60 TAG=resmir \
+      FA_LABEL=reserve FB_LABEL=noreserve FA_CPUS=16 FB_CPUS=17 \
+      FA_ENV="FFS_MVCC_FLUSH_RESERVE=1" FB_ENV="FFS_MVCC_FLUSH_RESERVE=0" \
+      bash scripts/perf/bulk_durable_write_ab/run_bulk.sh
+    python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulk-resmir.csv
+    WORK=<scratch> bash scripts/perf/bulk_durable_write_ab/bvalidate.sh fa fb k1 k2

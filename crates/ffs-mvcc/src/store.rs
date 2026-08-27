@@ -1875,6 +1875,12 @@ impl MvccStore {
         let mut sorted_versions: Vec<(&BlockNumber, &Vec<BlockVersion>)> =
             self.versions.iter().collect();
         sorted_versions.sort_unstable_by_key(|(block, _)| **block);
+        // 2026-08-27: same realloc chain as the sharded path (`flush_run_reserve_enabled`).
+        // The block length is not known until the first version resolves, so the
+        // reservation is taken once, then, on the first block, sized to the whole
+        // candidate set — the longest run this call can possibly build.
+        let candidate_blocks = sorted_versions.len();
+        let mut run_buf_reserved = !crate::flush_run_reserve_enabled();
         for (block, versions) in sorted_versions {
             // Binary-search the newest visible version instead of an O(n) reverse
             // linear scan; identical index for an ascending-ordered chain.
@@ -1887,6 +1893,11 @@ impl MvccStore {
             let Some(data) = compression::resolve_data_with(versions, idx, |v| &v.data) else {
                 continue;
             };
+
+            if !run_buf_reserved {
+                run_buf.reserve(candidate_blocks.saturating_mul(data.len()));
+                run_buf_reserved = true;
+            }
 
             let continues_run = run_start.is_some() && block.0 == run_next;
             if !continues_run {

@@ -55,6 +55,32 @@ pub fn proof_downgrade_count() -> u64 {
     PROOF_DOWNGRADES.load(Ordering::Relaxed)
 }
 
+/// Whether `flush_to_device_after` pre-sizes its run-coalescing buffer.
+///
+/// MEASURED, NOT GUESSED (2026-08-27). A perf profile of the bulk-durable-write
+/// row put `RawVecInner::finish_grow` — `run_buf` growing one block at a time
+/// under `extend_from_slice` — at **17.58% of all daemon CPU**, because a 64 MiB
+/// sequential overwrite coalesces into ONE run of 16,384 contiguous blocks and
+/// jemalloc's `large_ralloc` moves the whole buffer on every growth step. The
+/// flush already knows every dirty block before the loop starts, so one `reserve`
+/// removes the entire realloc chain.
+///
+/// Behind a knob so both arms of an A/B run from ONE ELF, which is the only
+/// interior comparison this campaign admits. Default ON: the reservation is an
+/// upper bound on a buffer the same call is about to allocate anyway, so the
+/// worst case is unchanged peak memory with no reallocation.
+///
+/// `0`/`false`/`off`/`no` restore the un-reserved growth path.
+#[must_use]
+pub fn flush_run_reserve_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FFS_MVCC_FLUSH_RESERVE") {
+        Ok(value) => !matches!(value.trim(), "0" | "false" | "off" | "no"),
+        Err(std::env::VarError::NotUnicode(_)) => false,
+        Err(std::env::VarError::NotPresent) => true,
+    })
+}
+
 /// Most recent merge refusal: `(proof variant, base_len, latest_len,
 /// staged_len)` (bd-y2t0r).
 ///
