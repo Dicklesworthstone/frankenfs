@@ -106,6 +106,14 @@ case "$CARGO" in
     exit 1
     ;;
 esac
+# `rustup which cargo` selects the pinned toolchain but does not itself bypass
+# this host's rch shim: the shim can also wrap that toolchain cargo.  A mounted
+# comparator needs the executable on this machine, so letting that wrapper
+# offload even one of the two PGO builds can silently train or attest an older
+# local artifact.  Keep the bypass in the script instead of requiring every
+# caller to remember it; it is inherited by both profile-generate and
+# profile-use cargo invocations below.
+export RCH_CARGO_WRAPPER_BYPASS=1
 # Every other tool the build shells out to (rustc, rustdoc) is otherwise
 # resolved from PATH, where it is a RUSTUP PROXY, not a binary. That proxy
 # re-resolves the toolchain on every invocation, so a concurrent `rustup` run
