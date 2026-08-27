@@ -15220,3 +15220,91 @@ Reproduce:
     WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
       FA_LABEL=base FB_LABEL=noCreInval FB_ENV="FFS_FUSE_CREATE_INVAL=0" TAG=ci1 \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+
+## 2026-08-27 — `FFS_FUSE_RECEIVE_SPIN=2000` on the create/delete storm: balanced `1.146594x`, `5.279772x` → `4.626997x`, at `+22.6%` daemon CPU — and the scope rule now has four rows and a mechanism
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=5553e4eb5702b249f04a51cd62cc48d4bb909803052298451e02fc598e5fc45d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19, client on CPU 8, loop devices
+`--direct-io=on`.
+
+The storm's inclusive profile puts **`fuser::channel::Channel::receive` at `29.89%` of daemon
+CPU** — the largest single item on the row, ahead of `ReplySender::send` (`14.45%`) and
+`Notifier::send` (`11.13%`). `FFS_FUSE_RECEIVE_SPIN` targets exactly that path and had never
+been measured here.
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+24 rounds × 2,000 create+delete pairs, four arms simultaneously (two live kernel ext4 RW
+mounts = the A/A null, two FrankenFS from ONE ELF), order rotated per round, forward and
+mirrored with arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/spin` | `1.133167` `[1.102145, 1.160520]` | `1.160180` `[1.117375, 1.222490]` | **`1.146594x`** |
+| **row vs kernel, before** | `5.351801` | `5.208713` | **`5.279772x`** |
+| **row vs kernel, after** | `4.808571` | `4.452280` | **`4.626997x`** |
+| A/A null `k1/k2` | `0.965424` `[0.951479, 0.979715]` ⚠ | `0.990904` `[0.962958, 1.012561]` | `0.978081` |
+
+Absolutes: kernel_median_wall_ns=87019000 and kernel_median_wall_ns=95100000 against
+fuse_median_wall_ns=481561000 / fuse_median_wall_ns=422245000 (forward) and
+fuse_median_wall_ns=504742000 / fuse_median_wall_ns=429945000 (mirrored). All CIs are
+20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+⚠ **Disclosed: the forward A/A null fails at `0.965424`** — `k2`'s first fsync phase ran
+`22.491 ms` against `k1`'s `18.334 ms` in that window. The mirrored half passes; balanced
+residual `0.978081`, a `2.2%` null against a `14.7%` effect, halves agreeing in sign.
+
+### ⚠ Not "same census, cheaper crossing" here — unlike the xattr row
+
+| arm | `crossings_total` forward | mirrored |
+| --- | ---: | ---: |
+| base | 747,668 | 744,378 |
+| `RECEIVE_SPIN=2000` | **729,922** | **729,957** |
+
+The spin arm runs **~15,700 fewer crossings (2.1%), reproducibly in both directions**. On the
+xattr row the census was byte-identical between spin and non-spin, so the win there was
+purely a cheaper round trip. Here part of it is *fewer* round trips: faster replies shift the
+`ATTR_TTL` windows and the parent-invalidation revalidation fires less often. ⭐ **Two rows,
+same knob, different mechanism — the census is what distinguishes them, and it must be read
+per row rather than assumed from a previous one.**
+
+### The price, and the scope rule with a mechanism
+
+Daemon CPU over the run: **31 ticks base, 38 ticks spin — `+22.6%`** (arm-A counter, one run
+each). The xattr row measured `+33%` for `1.414346x`. The knob buys wall with CPU, every time.
+
+Four rows now:
+
+| row | client threads | spin | daemon busy |
+| --- | ---: | --- | --- |
+| ext4 xattr-get-list-report | 1 | **`1.414346x` WIN** | idle between requests |
+| create/delete storm | 1 | **`1.146594x` WIN** | ~64% busy |
+| ext4 warm stat (banked) | 1 | **`1.241x` WIN** (`4.901194x`→`3.949942x`) | idle |
+| parallel-metadata-write (banked) | 8 | **`7.4–10.6%` LOSS** | saturated |
+
+⭐⭐ **The scope rule is CLIENT CONCURRENCY, not opcode mix.** A single client thread means
+the daemon has nothing to do between requests, so spinning converts idle wait into a faster
+turnaround. Eight client threads keep the daemon saturated, so every spun cycle is stolen
+from a request that was ready to run. The storm sits at `~64%` busy with one client thread
+and still wins, which places the boundary at saturation rather than at "idle".
+
+⛔ **Still a knob, not a default.** Client concurrency is not knowable at mount time, and the
+same setting is a measured loss on the 8-thread row. What this banks is the price on a third
+and fourth row and the rule that predicts the sign.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with its A/A null reported, forward
+and mirrored.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=spin FB_ENV="FFS_FUSE_RECEIVE_SPIN=2000" TAG=ss1 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
+    python3 scripts/perf/create_delete_storm_ab/sanalyze.py <body.csv>
