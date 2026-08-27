@@ -16873,3 +16873,128 @@ does establish that the ceiling it claims is real.
 No ratio measured or claimed; the run terminated at mount. The `6.227045x` cited as
 confirmation is the same-invocation forward+mirrored measurement banked earlier today with
 both A/A halves passing.
+
+## 2026-08-27 — bd-6kpp4 item 3, MEASURED after three blocked attempts: the btrfs checksum-verify default costs a balanced `1.023691x` WARM (a NULL) and is UNDECIDABLE COLD — and the row it invalidated is a `1.750162x` LOSS on a fresh fixture, not the banked WIN
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, NEW rig
+`scripts/perf/parallel_read_btrfs_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=d574a1a8a55db92398d119c44bf4ab4769ad1ec4aed16d79515669f105c5802c`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), clients on CPUs 8-15, every
+FUSE arm behind its own loop device with `--direct-io=on`.
+
+bd-6kpp4 items 1 and 2 are done; **item 3 — "measure the cost: cold-cache and warm, verify on
+vs off, one ELF, same window" — has been outstanding since 2026-08-15**, blocked twice by
+`external_load_during_run` (100% of samples on both attempts) and once by a build freeze. The
+bead also records that **no parallel-read report survives**, so the row cannot be compared
+against its own bank.
+
+### First: the knob could not be attested in-process at all
+
+`--btrfs-verify-data-on-read` is a **clap flag, not an env var**, and it was **absent from
+`mount_candidate_knobs`**. A verify-on-vs-off A/B therefore had no in-process proof the two
+arms differed — the bd-087wt failure mode. Added to the line and verified:
+`btrfs_verify_data_on_read=true` / `=false` on the two arms of every run below. Also fixed the
+garbled `--help` sentence the bead left for the `ffs-cli` holder ("FrankenFS has the same
+check (`bd-tkv2n`) is enabled by default").
+
+The rig is the ext4 parallel-read twin, rebuilt for btrfs: 256 × 256 KiB files written
+**through a kernel mount**, so the kernel writes real crc32c entries into the csum tree — a
+fixture built any other way would not exercise the path under test. Per-arm CLI args were
+added to the runner because an env-only hook cannot A/B a clap flag.
+
+### WARM: the checksum default is a NULL
+
+Four arms in ONE invocation (two live kernel btrfs mounts = the A/A null, two FrankenFS from
+ONE ELF), order rotated per round, 24 rounds × 8 client threads, forward and mirrored with
+arms **and** daemon CPUs swapped.
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `verifyON/verifyOFF` | `1.053621` `[0.983439, 1.170365]` | `0.994611` `[0.923000, 1.060818]` | **`1.023691x`** |
+| A/A null `k1/k2` | `0.973838` `[0.945817, 1.009985]` **PASS** | `1.011108` `[0.988591, 1.052330]` **PASS** | `0.992298` |
+
+**Both effect CIs span 1 and both A/A halves pass.** The read phase is `6.940` vs `6.978 ms`
+forward and `7.777` vs `7.895 ms` mirrored — indistinguishable. ⇒ **On a warm cache the
+kernel-parity checksum check costs nothing measurable**, which is the answer item 3 wanted and
+is a good outcome for a correctness default.
+
+### COLD: attempted, and UNDECIDABLE — reported, not hidden
+
+Cold here means a freshly mounted daemon with an empty FrankenFS cache, produced by
+remounting between batches. `drop_caches` is host-wide on a shared box and was **not** used.
+Eight alternating ON/OFF cycles:
+
+| metric | ON/OFF median | CI | min | max |
+| --- | ---: | --- | ---: | ---: |
+| total | `1.117067` | `[0.818079, 1.582229]` | 0.434 | 1.929 |
+| read phase | `1.112837` | `[0.811676, 1.572825]` | 0.420 | 2.045 |
+
+⛔ **UNDECIDABLE at n=8**: the CI spans 1 and individual cycles range from `0.43` to `1.93`.
+⚠ And a warning against the obvious shortcut: the rig's own **warmup** line showed
+`read=144.927 ms` ON against `73.104 ms` OFF — a `1.98x` that looks like a headline and is a
+**single unpaired observation**. The paired cycles do not support it. Anyone quoting a first-
+touch number here should quote the spread with it.
+
+### bd-6kpp4 — the invalidated row, re-measured: a LOSS, not the banked WIN
+
+bd-6kpp4 correctly narrowed the flip's blast radius to exactly one row — multi-file parallel
+read, *"the campaign's ONLY honest_win"*, banked `0.894290x` FASTER than live kernel btrfs.
+On a freshly built fixture, same invocation, both A/A halves passing:
+
+| configuration | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| verify ON (the shipping default) | `1.804992` | `1.696998` | **`1.750162x` SLOWER** |
+| verify OFF (what the bank measured) | `1.718402` | `1.734293` | **`1.726329x` SLOWER** |
+
+⛔ **I am NOT retracting the banked `0.894290x`.** My fixture is not that fixture — bd-4sull's
+own cross-window grouper keys on `fixture_construction` precisely because that varies — and
+the banked report no longer exists to diff against. What this establishes is narrower and
+still worth having: **on an independently built btrfs parallel-read fixture the row is a
+`~1.73x` LOSS in BOTH checksum configurations**, so the WIN does not reproduce here, and the
+`0.894290x` now rests on a scorecard sentence with no surviving report behind it and no
+independent reproduction.
+
+⭐ It also answers the configuration question the bead raised: the difference between the two
+configurations is `2.4%` and undecidable, so the flip cannot be what turned a `0.894290x` win
+into a `1.73x` loss. Whatever separates the two measurements, it is not the checksum default.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by the
+daemon at mount:
+`mount_bench_evidence,binary_sha256=d574a1a8a55db92398d119c44bf4ab4769ad1ec4aed16d79515669f105c5802c`,
+with `mount_candidate_knobs,...,btrfs_verify_data_on_read=true` and `=false` on the two arms.
+Same-invocation A/A null control `0.973838` bootstrap median CI `[0.945817, 1.009985]` and
+same-invocation A/A null control `1.011108` bootstrap median CI `[0.988591, 1.052330]`, both
+from 20000 resamples over the 24 paired per-round ratios. Absolutes:
+kernel_median_wall_ns=4459000 and kernel_median_wall_ns=4977000 against
+fuse_median_wall_ns=7994000 and fuse_median_wall_ns=8401000.
+
+### Transferable
+
+  * ⭐⭐ **A knob that is a CLI flag rather than an env var can still be unattestable.**
+    bd-087wt is usually applied to env knobs; the same rule binds any per-mount option, and
+    this one gated the exact A/B it was invisible to.
+  * ⭐⭐ **A warmup line is not a measurement.** `1.98x` from one unpaired first touch against
+    `1.117067 [0.818, 1.582]` from eight paired cycles is the difference between a headline
+    and a result.
+  * ⭐ **"Cold" has to be defined by what you are willing to do to a shared host.** Remounting
+    the daemon isolates the cache under test without dropping everyone else's page cache, and
+    that constraint belongs in the method, not in a footnote.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+The warm ratios are same-invocation against live kernel btrfs with both A/A nulls reported,
+forward and mirrored. The cold comparison has no kernel arm and no A/A null — it is an
+interior A/B only, and it is reported as undecidable rather than as a number.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/parallel_read_btrfs_ab/mkpread_btrfs.sh
+    gcc -O2 -o $WORK/pread_ab scripts/perf/parallel_read_btrfs_ab/pread_ab.c -lpthread
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 THREADS=8 CPUBASE=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LOOP=1 FB_LOOP=1 FA_LABEL=verifyON FB_LABEL=verifyOFF \
+      FA_ARGS="--btrfs-verify-data-on-read true" \
+      FB_ARGS="--btrfs-verify-data-on-read false" TAG=cs2 \
+      bash scripts/perf/parallel_read_btrfs_ab/run_pread_btrfs.sh
