@@ -202,6 +202,24 @@ const BTRFS_DIR_START_INDEX: u64 = 2;
 ///
 /// The seed is split into `s1 = seed & 0xFFFF` and `s2 = seed >> 16`,
 /// then updated byte-by-byte over `data`.
+/// Skip the group-descriptor + superblock persist at a durability boundary that
+/// changed no descriptor state (bd-1bh8i).
+///
+/// Default OFF until measured. `FFS_EXT4_GDT_SKIP_UNCHANGED=1` enables it, so an
+/// A/B runs both arms from ONE ELF and the flag is the only difference between
+/// them.
+fn ext4_gdt_skip_unchanged() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED")
+            .ok()
+            .is_some_and(|raw| {
+                let v = raw.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+            })
+    })
+}
+
 fn adler32_seeded(seed: u32, data: &[u8]) -> u32 {
     const MOD_ADLER: u32 = 65521;
     let mut s1 = seed & 0xFFFF;
@@ -1493,6 +1511,21 @@ pub struct OpenFs {
     /// The writable path bypasses this cache because group descriptor counters
     /// can change during allocation/free operations.
     ext4_group_desc_cache: ShardedCache<GroupNumber, Ext4GroupDesc>,
+    /// Fingerprint of the mutable group-descriptor state as of the last
+    /// SUCCESSFUL durability-boundary persist, or 0 if none has happened yet
+    /// (bd-1bh8i).
+    ///
+    /// A durability boundary that allocated and freed nothing leaves every
+    /// group descriptor and the superblock free totals exactly as the previous
+    /// boundary already wrote them, yet the persist path re-reads block 0 (the
+    /// superblock), block 1 (the GDT) and both bitmap blocks of every in-use
+    /// group to rebuild bytes that cannot have changed. Counted on the
+    /// fsync-journal-commit workload: SIX distinct blocks, each re-read once per
+    /// client `fsync`, 98.9% of all reads the daemon issued. `bd-fv9tc` already
+    /// removed the matching WRITEs by comparing the patched buffer against the
+    /// bytes on disk — but that comparison is what the read is FOR, so the reads
+    /// survived it. This lets the boundary answer the same question from memory.
+    ext4_gdt_persisted_fingerprint: std::sync::atomic::AtomicU64,
     /// Per-group inode-table start block (`bg_inode_table`), memoized once.
     ///
     /// The inode-table location of a group is fixed at mkfs and never moves, yet
@@ -5525,6 +5558,7 @@ impl OpenFs {
             #[cfg(feature = "bhh0i_sharded_alloc")]
             bhh0i_sharded_alloc_happened: std::sync::atomic::AtomicBool::new(false),
             ext4_group_desc_cache: ShardedCache::new(),
+            ext4_gdt_persisted_fingerprint: std::sync::atomic::AtomicU64::new(0),
             ext4_inode_table_locations: OnceLock::new(),
             ext4_inode_table_block_cache: ShardedCache::new(),
             ext4_file_data_block_cache: ShardedCache::new(),
@@ -13110,6 +13144,62 @@ impl OpenFs {
         self.ext4_group_desc_cache.clear();
     }
 
+    /// Fingerprint every field of the in-memory group state that a persisted
+    /// group descriptor or the superblock free totals is derived from
+    /// (bd-1bh8i).
+    ///
+    /// Returns `None` when the boundary must persist unconditionally: the knob
+    /// is off, this is not ext4, there is no writable alloc state, or the
+    /// `bd-bhh0i` sharded create path is active (its authoritative counters live
+    /// in the sharded records, not in `alloc.groups`, so a fingerprint over this
+    /// array would be blind to real movement — exactly the staleness that makes
+    /// `ext4_flush_group_descriptors` reconcile before writing).
+    ///
+    /// The hash covers precisely the mutable descriptor fields: the two free
+    /// counts, the directory count, the flags, and BOTH bitmap checksums. The
+    /// checksums are the load-bearing pair — they are what the persist path
+    /// reads the bitmap blocks to stamp, and they are maintained in memory on
+    /// every allocation and free, so a bitmap whose CONTENT moved necessarily
+    /// moves its checksum here. The immutable geometry (bitmap/table locations)
+    /// is deliberately excluded: it is fixed at mkfs and never mutated.
+    fn ext4_group_desc_fingerprint(&self) -> Option<u64> {
+        if !ext4_gdt_skip_unchanged() {
+            trace!(target: "ffs::ext4::rw", guard = "knob_off", "gdt_fp_none");
+            return None;
+        }
+        if !matches!(self.flavor, FsFlavor::Ext4(_)) {
+            trace!(target: "ffs::ext4::rw", guard = "not_ext4", "gdt_fp_none");
+            return None;
+        }
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        if self.bhh0i_sharded_ops_active() {
+            trace!(target: "ffs::ext4::rw", guard = "sharded_active", "gdt_fp_none");
+            return None;
+        }
+        let Ok(alloc_mutex) = self.require_alloc_state() else {
+            trace!(target: "ffs::ext4::rw", guard = "no_alloc_state", "gdt_fp_none");
+            return None;
+        };
+        let alloc = alloc_mutex.read();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        alloc.groups.len().hash(&mut hasher);
+        for gs in &alloc.groups {
+            gs.free_blocks.hash(&mut hasher);
+            gs.free_inodes.hash(&mut hasher);
+            gs.used_dirs.hash(&mut hasher);
+            gs.flags.hash(&mut hasher);
+            gs.block_bitmap_csum.hash(&mut hasher);
+            gs.inode_bitmap_csum.hash(&mut hasher);
+        }
+        // 0 is the "nothing persisted yet" sentinel, so never hand it back as a
+        // real fingerprint — a collision there would skip the FIRST persist.
+        Some(match hasher.finish() {
+            0 => 1,
+            other => other,
+        })
+    }
+
     pub fn read_group_desc_with_scope(
         &self,
         cx: &Cx,
@@ -20451,6 +20541,16 @@ impl OpenFs {
         cx: &Cx,
         alloc: &Ext4AllocState,
     ) -> Result<(), FfsError> {
+        // bd-1bh8i: this is not only the durability boundary's own persist — the
+        // fast-commit DEL_RANGE recovery path calls it with a TRANSIENT alloc
+        // state. Any write from here can make the on-disk descriptors diverge
+        // from whatever the boundary last fingerprinted, so drop the memo and let
+        // the next boundary re-establish it by persisting. Invalidating on EVERY
+        // call (rather than only the transient ones) keeps the rule local and
+        // costs the boundary nothing: it stores its fingerprint after this
+        // returns, so its own call re-arms the memo immediately.
+        self.ext4_gdt_persisted_fingerprint
+            .store(0, std::sync::atomic::Ordering::Release);
         // UNCACHED adapter: the per-group loop does a read-modify-write of the
         // SAME GDT block (all descriptors for a small fs live in one block), so
         // each group's update must see the prior groups' writes. The cached
@@ -30182,8 +30282,47 @@ impl OpenFs {
                 .flush_to_device_after(cx, &base_dev, *flushed_through)?;
         self.clear_ext4_writable_group_desc_cache();
         if flushed > 0 {
-            self.ext4_flush_group_descriptors(cx)?;
-            self.ext4_sync_superblock_free_totals(cx)?;
+            // bd-1bh8i: a boundary that allocated and freed nothing leaves every
+            // descriptor and the superblock free totals byte-identical to what
+            // the previous boundary already persisted, so the only thing the
+            // persist path accomplishes is re-reading block 0, block 1 and both
+            // bitmap blocks of every in-use group to rediscover that. Answer it
+            // from memory instead. The fingerprint is taken BEFORE the persist
+            // because it describes the state being persisted, and recorded only
+            // AFTER both halves succeed — a failure in either must leave the
+            // stored value untouched so the next boundary retries the write.
+            let fingerprint = self.ext4_group_desc_fingerprint();
+            let already_persisted = fingerprint.is_some_and(|fp| {
+                self.ext4_gdt_persisted_fingerprint
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == fp
+            });
+            trace!(
+                target: "ffs::ext4::rw",
+                operation_id = %operation_id,
+                gdt_fingerprint = fingerprint.unwrap_or(0),
+                gdt_stored = self
+                    .ext4_gdt_persisted_fingerprint
+                    .load(std::sync::atomic::Ordering::Acquire),
+                gdt_skipped = already_persisted,
+                "gdt_persist_decision"
+            );
+            if !already_persisted {
+                self.ext4_flush_group_descriptors(cx)?;
+                self.ext4_sync_superblock_free_totals(cx)?;
+                // RECOMPUTE after the persist, do not store the pre-persist value.
+                // `ext4_persist_group_descriptors_from` reads each in-use group's
+                // bitmaps and stamps their checksums back into `GroupStats`, so the
+                // state that is now on disk is NOT the state fingerprinted a moment
+                // ago. Storing the earlier value makes the next boundary compare
+                // post-persist against pre-persist, they never match, and the skip
+                // never fires -- measured: gdt_skipped=false on 31 of 31 decisions
+                // with no guard rejecting, which is what sent me looking here.
+                if let Some(fp) = self.ext4_group_desc_fingerprint() {
+                    self.ext4_gdt_persisted_fingerprint
+                        .store(fp, std::sync::atomic::Ordering::Release);
+                }
+            }
             trace!(
                 target: "ffs::ext4::rw",
                 operation_id = %operation_id,

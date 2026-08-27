@@ -13,9 +13,16 @@ rust-version.workspace = true
 # wrong answer from either file alone:
 #   COMPILE-TIME (this feature)  — OFF for this crate on its own, ON via
 #       ffs-cli's `default`, so the shipped binary CONTAINS the sharded path.
-#   RUNTIME (`FFS_BHH0I_SHARDED`) — OFF unless explicitly set to 1. This is what
-#       decides whether a mount actually uses it, and it is the switch bd-pbyu0
-#       turned off. `sharded_create_enabled_from_env(None)` returns false.
+#   RUNTIME (`FFS_BHH0I_SHARDED`) — ON by default since the bd-y2t0r cutover.
+#       ABSENCE enables the production path: `sharded_create_enabled_from_env(None)`
+#       returns TRUE (crates/ffs-cli/src/main.rs), and `FFS_BHH0I_SHARDED=0` is the
+#       explicit rollback switch. This paragraph previously claimed the opposite —
+#       "OFF unless explicitly set to 1 ... returns false" — which was true only
+#       before that cutover, and it is load-bearing: a plain `ffs-cli mount --rw`
+#       runs the SHARDED path, so any code that branches on
+#       `bhh0i_sharded_ops_active()` is taking the sharded arm in normal operation,
+#       not the fallback. Corrected 2026-08-26 after the stale text cost three
+#       build cycles chasing a lever that its own guard was disabling (bd-1bh8i).
 #
 # So: compiled in, not active by default. Enabling the feature also compiles the
 # `sharded_alloc` primitive + its tests so the decomposition can be
