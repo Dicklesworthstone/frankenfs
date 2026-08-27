@@ -12248,3 +12248,161 @@ Reproduce:
     # then the mirror with FA/FB swapped; take the geometric mean of the two
     python3 scripts/perf/parallel_read_ab/ranalyze.py $WORK/pread-zxF.csv
     # loop-transport arm: FA_LOOP=1 / FB_LOOP=1 on the arm that should cross a loop device
+
+## 2026-08-27 — btrfs create/delete storm: the btrfs-specific-excess hypothesis is REJECTED on a MUTATING row, and the entry-invalidation lever transfers across filesystems to 1.1%
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/create_delete_storm_ab/` (`run_storm_x.sh`, `run_storm_btrfs.sh`).**
+Provenance: in-process self-report
+`bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU, daemons on cpu18/cpu19 (never cpu16 —
+see the parallel-read row).
+
+Seventh row dug in this sequence and the worst remaining un-dug cell on either scorecard:
+the btrfs small-file create/delete storm, banked `2.358280x`.
+
+### 2026-08-27 — a SIX-arm instrument that puts both filesystems in one invocation
+
+`create_delete_storm_batch` reproduced in C (2,000 creates, fsync parent, 2,000 removes,
+fsync parent; one client thread as the banked row). **Six arms live SIMULTANEOUSLY in ONE
+rig invocation**, arm order rotated per round: two kernel ext4 loop mounts, two kernel
+btrfs loop mounts, and **two FrankenFS `--rw` mounts from the SAME ELF — one on the ext4
+image, one on the btrfs image**. That makes "our ext4 vs our btrfs" a paired
+within-invocation ratio rather than a cross-window comparison. 36 rounds.
+`RCH_WORKER=none`, `hostname=thinkstation1`.
+
+Both same-invocation kernel A/A null controls pass: ext4 `0.999226` bootstrap median CI
+`[0.980636, 1.014590]`, btrfs `0.996223` bootstrap median CI `[0.982680, 1.010602]`, from
+20000 resamples over the 36 paired per-round ratios.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+
+| phase | kernel ext4 | kernel btrfs | ours (ext4 img) | ours (btrfs img) |
+| --- | --- | --- | --- | --- |
+| whole batch | 89.574 ms | 144.977 ms | 491.377 ms | 534.827 ms |
+| create 2,000 | 29.499 ms | 31.557 ms | 245.871 ms | 256.124 ms |
+| fsync parent | 18.874 ms | 34.696 ms | **15.805 ms** | **25.552 ms** |
+| delete 2,000 | 21.125 ms | 57.664 ms | 214.713 ms | 223.088 ms |
+| fsync parent | 18.618 ms | 20.420 ms | **15.634 ms** | 24.004 ms |
+
+kernel_median_wall_ns=89574000 (ext4) and kernel_median_wall_ns=144977000 (btrfs) against
+fuse_median_wall_ns=491377000 and fuse_median_wall_ns=534827000.
+
+### 2026-08-27 — REJECTED: there is no btrfs-specific excess in OUR arm on a mutating row
+
+The two published storm cells differ a lot — ext4 `2.862033x` against btrfs `2.358280x` —
+and the natural reading is that btrfs is the easier filesystem for us. It is not:
+
+    ours(ext4) / ours(btrfs), same ELF, same invocation, paired per round
+      whole batch   0.945211  [0.916627, 0.966387]     5.8% apart
+      create        0.984414  [0.958178, 1.010123]     1.6% apart, STRADDLES 1
+      delete        0.970510  [0.936469, 0.989312]     3.0% apart
+      fsync #1      0.613905  [0.607582, 0.621266]     our btrfs fsync is 1.63x ours-on-ext4
+      fsync #2      0.651368  [0.597387, 0.654714]     1.54x
+
+    kernel(btrfs) / kernel(ext4) on the same batch: 144.977 / 89.574 = **1.6185x**
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+
+Same-invocation A/A null control `0.999226` bootstrap median CI `[0.980636, 1.014590]` (ext4) and same-invocation A/A null control `0.996223` bootstrap median CI `[0.982680, 1.010602]` (btrfs),
+both from 20000 resamples over the 36 paired per-round ratios.
+
+**Our two arms agree to `5.8%` on the whole batch and to `1.6%` on the create phase, while
+the two INCUMBENTS differ by `62%`.** So the published ext4-vs-btrfs storm difference is
+the incumbent, not us — the same retirement the readdir+stat row made for READS ("our ext4
+arm and our btrfs arm agree to `0.10%`"), now extended to a MUTATING row where it had never
+been tested. Counted mechanism: both FrankenFS arms issue the same census — `getxattr`
+148,002, `lookup` 148,001, `flush` 74,000, `release` 74,000 over 37 batches — i.e. the
+crossing structure is filesystem-independent.
+
+⚠ **The one real btrfs-specific cost is the directory fsync**, where our btrfs arm is
+`1.63x`/`1.54x` our ext4 arm. Sized honestly it is `25.552 + 24.004 = 49.6 ms` of a
+`534.827 ms` batch — **9.3%** — and we still BEAT kernel btrfs on the first fsync by
+`1.380959x` `[1.353835, 1.560161]` and on the second by `1.151439x`. It is the only place
+on this row where a btrfs-side lever could exist, and it is small.
+
+### 2026-08-27 — the row's own ratio, and where it loses
+
+Balanced across both daemon CPUs, the shipping configuration measures **`2.9402x`** and
+**`3.2645x`** against the live kernel btrfs arm in the two paired runs — absolute arm
+medians kernel_median_wall_ns=170748000 against fuse_median_wall_ns=509225000, and
+kernel_median_wall_ns=162692000 against fuse_median_wall_ns=530897000, so it is visible
+which arm moved — (geometric mean
+**`3.0981x`**), and `3.5776x` in the six-arm run, against the banked `2.358280x`. The ext4
+twin in the SAME six-arm invocation measures `5.4594x`. This ELF is baseline-ISA and
+un-PGO'd so per bd-b9dug both are OVERSTATED, and the ext4 twin's excess over its own
+banked figure was already attributed last commit to entry invalidation post-dating the
+bank (bd-avg6f) — the btrfs cell has the same exposure.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+
+Same-invocation A/A null control `1.022209` bootstrap median CI `[1.007151, 1.068001]`, from 20000 resamples over the 32 paired per-round ratios. Counted mechanism: both FrankenFS
+arms issue `getxattr` 148,002 and `lookup` 148,001 over 37 batches, read off the daemon's
+unconditional crossing counter at the kernel boundary.
+
+Where it loses is the mutation stream, identically to ext4: **create `7.92x`** (kernel
+31.557 ms vs ours 256.124 ms) and **delete `3.88x`** (57.664 ms vs 223.088 ms), while both
+directory fsyncs are WINS. There is no btrfs-shaped attack surface here that is not
+already the ext4 one.
+
+### 2026-08-27 — the entry-invalidation lever transfers across filesystems to 1.1%
+
+Same knob, same rig, btrfs images, one ELF, forward and mirrored with the arms and their
+daemon CPUs swapped:
+
+    FFS_FUSE_ENTRY_INVAL=0, whole batch
+      forward (def on cpu18)   1.167639  [1.143883, 1.179266]
+      mirrored (off on cpu18)  1.270729  (from off/def 0.786950 [0.754272, 0.815277])
+      balanced                 1.218094      <- ext4 measured 1.231079, 1.1% apart
+
+    delete phase
+      forward 1.313643 [1.277688, 1.426478]; mirrored 1.483; balanced 1.395747
+      (ext4 measured 1.431277)
+
+    fsync phases, the built-in negative controls: 0.997091 and 1.027971, unmoved
+
+Same-invocation kernel A/A null control `1.022209` bootstrap median CI
+`[1.007151, 1.068001]` on the mirrored run; ⚠ the forward run's null was MARGINAL
+(`1.051011` bootstrap median CI `[0.998354, 1.124174]`, host at loadavg 28.7), which is
+why the balanced pair is quoted and not either direction alone.
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
+
+⭐ **The counted mechanism is the same exact integer on btrfs**: `crossings_lookup`
+**132,001 → 66,001** — exactly **1.000 fewer LOOKUP per create+delete pair** — plus
+`crossings_getattr` 182,821 → 137,019. Identical to ext4's 132,001 → 66,001. ⇒ **the
+invalidation cost lives in the FUSE layer, not in either filesystem**, which is why the
+price is the same to 1.1% across two completely different on-disk formats. A lever
+measured on one filesystem's mutating row can be expected to carry to the other; a lever
+measured on a filesystem's own data structures cannot.
+
+⚠ As on ext4, this is not a shippable lever: entry invalidation is what makes a create
+visible after a failed lookup without waiting out `ATTR_TTL` (`c6a7a9697`, bd-yu6jz). It
+prices coherence; it does not propose removing it.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. What this banks is the six-arm
+cross-filesystem decomposition, the REJECTED btrfs-specific-excess hypothesis on a
+mutating row, the sized btrfs directory-fsync cost, and the cross-filesystem transfer of
+the entry-invalidation price with its identical integer mechanism — all ISA-invariant.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/create_delete_storm_ab/mkstorm.sh
+    WORK=<scratch> bash scripts/perf/create_delete_storm_ab/mkstorm_btrfs.sh
+    gcc -O2 -o $WORK/storm_ab scripts/perf/create_delete_storm_ab/storm_ab.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=36 TAG=x1 FE_CPUS=18 FB_CPUS=19 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_x.sh
+    python3 scripts/perf/create_delete_storm_ab/sanalyze.py $WORK/xstorm-x1.csv
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=beiF FA_LABEL=def FB_LABEL=off \
+      FA_CPUS=18 FB_CPUS=19 FA_ENV="" FB_ENV="FFS_FUSE_ENTRY_INVAL=0" \
+      bash scripts/perf/create_delete_storm_ab/run_storm_btrfs.sh
+    # then the mirror with FA/FB swapped; take the geometric mean of the two
