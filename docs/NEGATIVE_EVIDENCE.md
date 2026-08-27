@@ -13777,3 +13777,101 @@ Reproduce:
       bash scripts/perf/bulk_durable_write_ab/run_bulk_dio.sh
     # then the mirror with FA/FB swapped; take the geometric mean of the two
     python3 scripts/perf/bulk_durable_write_ab/banalyze.py $WORK/bulkdio-mcF.csv
+
+## 2026-08-27 — the btrfs fsync row's three barriers, LOCATED: two are load-bearing, the third is a bd-73bi2 verification flush, and moving ONE `sync` call collapses 3 → 2
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/fsync_journal_ab/fsync_strace.sh`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=6499e6fb416867aab132c9ed9580bfa162997e9937de9029a8140d4e5d49816d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18, loop device `--direct-io=on`.
+
+The btrfs fsync row counted **`3.000` device FLUSH barriers per client fsync against kernel
+btrfs's `2.000`**, matching a measured `1.5297x` loss to `2%`, and closed with: "the three
+`fdatasync` call sites on the btrfs commit path must be identified first". **This
+identifies them.**
+
+### 2026-08-27 — the traced sequence, byte-identical every fsync
+
+`strace -f -e trace=pwrite64,fdatasync` on the live daemon, 8-op batch. Same-invocation
+A/A null controls for this rig and ELF are the fsync row's: same-invocation A/A null control `0.998436` bootstrap median CI `[0.983451, 1.018431]` and same-invocation A/A null control `0.997565` bootstrap median CI `[0.983482, 1.021369]`,
+both from 20000 resamples over the 48 paired per-round ratios. Counted mechanism: 3 `fdatasync` per client fsync, matching the 3 device FLUSH
+requests `/sys/block/<dev>/stat` reports. `RCH_WORKER=none`, `hostname=thinkstation1`.
+
+    pwrite 16384 @ 42,401,792  \
+    pwrite 16384 @ 42,418,176   |  four 16 KiB tree nodes, CONTIGUOUS (16 KiB apart)
+    pwrite 16384 @ 42,434,560   |
+    pwrite 16384 @ 42,450,944  /
+    fdatasync                     <-- BARRIER 1
+    pwrite 16384 @ 38,862,848     <-- ONE node, the SAME offset every fsync
+    fdatasync                     <-- BARRIER 2
+    pwrite  4096 @ 65,536         <-- the superblock (BTRFS_SUPER_INFO_OFFSET = 0x10000)
+    fdatasync                     <-- BARRIER 3
+
+### 2026-08-27 — the three call sites, and what each is for
+
+| # | site | purpose | verdict |
+| --- | --- | --- | --- |
+| 1 | `crates/ffs-core/src/lib.rs:32674` (`// Issue fsync barrier before superblock write`) | every tree node durable before anything names it | **load-bearing** |
+| 2 | `crates/ffs-core/src/lib.rs:32776` | flushes ONE free-space-tree leaf so the **bd-73bi2 read-back** can check it against the pointer being published | **load-bearing, but for VERIFICATION, not ordering** |
+| 3 | `crates/ffs-core/src/lib.rs:32982` (`// Final fsync to ensure superblock is durable`) | the superblock itself | **load-bearing** |
+
+⭐ **The middle barrier is not slack — it is a P0 regression guard.** bd-73bi2 was "a pointer
+published ahead of its target's durability"; the code re-reads the free-space-tree block
+OFF DISK before the superblock goes live, and that read is only meaningful if the block has
+actually been flushed. Deleting barrier 2 would silently defeat the check. **A naive
+"we issue one barrier too many, remove it" would have re-opened a P0.**
+
+### 2026-08-27 — but the ordering is rearrangeable, and that DOES collapse 3 to 2
+
+The constraint set is only two things: (a) everything the superblock will reference is
+durable before the superblock, and (b) the bd-73bi2 read-back reads bytes that are on disk.
+Today the code satisfies both by flushing twice, because the free-space-tree leaf is
+serialized and written **after** barrier 1. It does not have to be:
+
+    today                                    rearranged
+    ------------------------------------     ------------------------------------
+    tree nodes                               tree nodes
+    BARRIER 1                                free-space-tree leaf
+    free-space-tree leaf                     BARRIER 1'   (covers both)
+    BARRIER 2                                bd-73bi2 read-back  (reads durable bytes)
+    bd-73bi2 read-back                       superblock
+    superblock                               BARRIER 2'
+    BARRIER 3
+
+Both invariants hold in the rearranged form — the read-back still reads bytes a barrier
+made durable, and the superblock still follows a barrier that covered every block it
+names. This is the same argument `btrfs_publish_tree_log` already states in its own comment
+for the tree-log path ("ONE barrier after ALL nodes, not one per node ... nothing requires
+the nodes to be ordered among themselves"); the FULL-commit path simply does not follow its
+own rule, because the FST write was appended after the barrier rather than before it.
+
+**Sized: `3 → 2` barriers is exactly the counted `1.500x` this row already measures as
+`1.5297x`.** One `sync` call moves.
+
+⛔ **NOT TAKEN.** This is a durability-ordering change on the commit path, the class
+bd-4zjkz says must never be traded silently, and the specific barrier involved is a P0
+guard whose semantics depend on ordering with a read-back. Moving it needs the crash/replay
+gate (the bd-dm01m / bd-jhuob tree-log gate is the instrument), and a test that pins the
+new order the way
+`btrfs_publish_tree_log_barriers_between_node_and_superblock_bd_sv7ql` pins the old one.
+What this row banks is that the lever is **real, located to one line, sound on the stated
+invariants, and worth the full `1.500x`** — and that the obvious way to take it (delete a
+barrier) is the wrong one.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates. This entry adds no new ratio — it is a counted trace plus a code reading that
+explains and locates a ratio banked earlier today. What it banks is the byte-exact barrier
+sequence, the three call sites with their purposes, the identification of the middle
+barrier as a verification rather than an ordering flush, and the rearrangement that
+collapses it without weakening either invariant.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/fsync_journal_ab/mkfsync_btrfs.sh
+    gcc -O2 -o $WORK/fsync_ab scripts/perf/fsync_journal_ab/fsync_ab.c
+    WORK=<scratch> ELF=<ffs-cli> OPS=8 TAG=bs1 \
+      bash scripts/perf/fsync_journal_ab/fsync_strace.sh

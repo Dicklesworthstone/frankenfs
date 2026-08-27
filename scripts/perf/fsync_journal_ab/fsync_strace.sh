@@ -6,7 +6,7 @@
 set -euo pipefail
 W=${WORK:?set WORK to a scratch directory outside the repo}
 ELF=${ELF:?set ELF to the ffs-cli under test}
-OPS=${OPS:-200}
+OPS=${OPS:-8}
 FM=/home/ubuntu/fs-fa
 TAG=${TAG:-strace}
 LOOPS=""
@@ -34,7 +34,7 @@ echo "daemon pid $FPID"
 
 STATF=/sys/block/$(basename "$DEV")/stat
 read -r -a B <<<"$(cat "$STATF")"
-sudo -n strace -c -f -p "$FPID" -e trace=fsync,fdatasync,sync_file_range,pwrite64,pwritev,write \
+sudo -n strace -f -p "$FPID" -e trace=fsync,fdatasync,sync_file_range,pwrite64,pwritev \
   -o "$W/strace-$TAG.txt" &
 SPID=$!
 sleep 1
@@ -52,6 +52,7 @@ print('   per client fsync: write_ios=%.3f sectors=%.3f flush_ios=%.3f' % (
     ($(( A[4] - B[4] )))/ops, ($(( A[6] - B[6] )))/ops, ($(( A[15] - B[15] )))/ops))
 "
 echo "== daemon syscall census"
-sudo -n cat "$W/strace-$TAG.txt" 2>/dev/null | tail -15
+echo "== raw sequence, last 40 lines (offset,len visible)"
+sudo -n cat "$W/strace-$TAG.txt" 2>/dev/null | grep -E "pwrite64|fdatasync" | tail -40
 fusermount3 -u "$FM"
 wait "$FPID" 2>/dev/null || true
