@@ -11904,3 +11904,180 @@ Reproduce:
     WORK=<scratch> ELF=<ffs-cli> FENV="FFS_FUSE_WORKERS=4" bash scripts/perf/parallel_metadata_ab/pthreads.sh
     WORK=<scratch> ELF=<ffs-cli> FENV="FFS_FUSE_WORKERS=8 FFS_FUSE_CONCURRENT_MUTATIONS=1" \
       OPS=4096 bash scripts/perf/parallel_metadata_ab/pvalidate.sh
+
+## 2026-08-27 — create/delete storm: the owed wall re-measurement, and a placement bias that faked a 7% result until it was balanced
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, hand rig
+`scripts/perf/create_delete_storm_ab/`.** Provenance: in-process self-report
+`bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance` on every involved CPU (re-verified mid-session).
+
+Fifth row dug in this sequence. Its scorecard cell says the wall ratio is STALE
+(2026-08-08) "and still owed", so this takes it, and the first thing the rig found was
+that the rig itself needed fixing.
+
+### 2026-08-27 — the instrument's own null control FAILS one-directionally on a write row
+
+`create_delete_storm_batch` (`ffs_mounted_kernel_bench.rs:4138`) reproduced in C: serially
+create 2,000 empty files, fsync the parent, remove all 2,000, fsync again; one client
+thread, as the banked row's `1 → 1`. Four arms live SIMULTANEOUSLY in ONE rig invocation
+— two kernel ext4 RW loop mounts and two FrankenFS `--rw` mounts from one ELF — arm order
+rotated per round.
+
+The same-invocation kernel A/A null control passes everywhere (`1.003807`, `1.010827`,
+`1.000257`, `0.995273`, each a bootstrap median with a bootstrap median CI from 20000
+resamples over 32 paired per-round ratios). **The candidate A/A null control does not:**
+
+    two identical FrankenFS mounts, one ELF, identical images
+      A on cpu16, B on cpu17:   1.109374  [1.061948, 1.164267]
+      A on cpu17, B on cpu16:   0.938031  [0.923282, 0.979026]
+      balanced geometric mean:  1.020111
+
+`RCH_WORKER=none`, `hostname=thinkstation1`, one host by construction — every arm is a
+mount inside ONE rig invocation on this box.
+
+**The asymmetry follows the CPU, not the arm** — the daemon on cpu16 is 7-11% slower than
+on cpu17 for this workload, at `performance` governor and EPP on both (so this is NOT the
+governor defect found on readdir+stat earlier today; cpu16 and cpu17 each carry one nvme
+completion queue and this row is fsync-heavy). One-directional A/Bs on this row therefore
+carry a ~10% placement bias, and **every ratio below is the geometric mean of a forward and
+a mirrored run** with the arms and their CPUs swapped.
+
+⛔ **That bias faked a result before it was balanced.** `FFS_MOUNT_BENCH_EVIDENCE=1` — the
+flag the gated comparator REQUIRES, because the sha256 self-report line comes from it, and
+which turns on a per-request `Instant::now()` pair — measured `1.070166x`
+`[1.024103, 1.106947]` in the forward direction, i.e. an apparent **7% self-handicap on
+every banked FrankenFS arm**. Mirrored it measures `0.950513x`, and the balanced geometric
+mean is **`1.008566x` — a NULL**. The 7% was the cpu16 penalty, not the instrument. The
+claim is withdrawn before it was ever made; the flag is not measurably costing the
+campaign anything on this row.
+
+### 2026-08-27 — where the storm loses, and the census that reproduces the banked mechanism
+
+Absolute medians from the cleanest window (32 rounds), kernel_median_wall_ns=97591000 (k1)
+and kernel_median_wall_ns=95091000 (k2) against fuse_median_wall_ns=509971000 and
+fuse_median_wall_ns=549753000 for the two identical FrankenFS arms:
+
+| phase | kernel k1 | kernel k2 | FrankenFS | |
+| --- | --- | --- | --- | --- |
+| create 2,000 | 29.641 ms | 29.818 ms | 255.2 / 274.6 ms | **~8.7x LOSS** |
+| fsync parent | 20.021 ms | 19.393 ms | 15.8 / 16.0 ms | **1.85x WIN** |
+| delete 2,000 | 21.090 ms | 22.181 ms | 222.1 / 247.3 ms | **~10.9x LOSS** |
+| fsync parent | 19.160 ms | 19.021 ms | 16.0 / 15.9 ms | **1.89x WIN** |
+
+`RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
+the daemon at mount:
+`mount_bench_evidence,binary_sha256=481f7a05d6ab37e0c6c95a1fdf1268336e976a5e63fc63796f544ed49a6893a5`.
+The two FrankenFS arms of that run are a candidate A/A pair whose bootstrap median is
+`0.938031` with a bootstrap median CI of `[0.923282, 0.979026]` from 20000 resamples, and
+the kernel A/A null control in the same invocation is `1.010827`.
+
+Same shape as parallel-metadata-write: the mutation stream is the whole loss and the
+directory fsync is a real win. **Counted mechanism, and it reproduces the row's banked
+`bpftrace` census EXACTLY**: over 33 batches (66,000 create+unlink pairs),
+`crossings_getxattr` **264,067 = 2.000 per pair** (the `security.capability` audit probe),
+`crossings_lookup` **132,001 = 1.000 per op**, `create` 66,000, `unlink` 66,000, `flush`
+66,000 — `(132,001 + 264,067 + 66,000×3) / 66,000` = **9.000 crossings per pair**, the
+banked `4.502` per user operation to four figures. This rig additionally counts what the
+banked `fuse_*` trace did not: `crossings_getattr` **189,989 = 2.878 per pair** and
+`release` 1.000 per pair, so the true total is **12.88 crossings per pair**.
+
+Daemon profile (`perf -F 4999 -g dwarf`, 106,428 samples): 75.38% kernel, **18.09% our
+ELF**, 5.30% libc. Children-mode: `Channel::receive` **29.51%** and `ReplySender::send`
+**14.00%** — **43.5% is the `/dev/fuse` read and write** — against `FrankenFuse::lookup`
+3.01%, `Request::dispatch` 1.25%, jemalloc 1.26%. The reverse-notification enqueue
+(`notify` → `futex_wake` → mpmc `unpark`) is **4.20%**. So the row's banked claim that "the
+mutating path is daemon-bound in a way no read-only row is" holds for daemon CPU share but
+NOT for where that CPU goes: it is still three-quarters kernel and mostly transport.
+
+### 2026-08-27 — what the invalidations cost, balanced, with the fsync phases as controls
+
+| lever | whole batch (balanced) | delete phase (balanced) | fsync phases |
+| --- | --- | --- | --- |
+| `FFS_FUSE_ENTRY_INVAL=0` | **`1.231079x`** (fwd `1.337486` `[1.265725, 1.393866]`, mir `1.133137`) | **`1.431277x`** (fwd `1.587233` `[1.511792, 1.718065]`) | unmoved `0.996158` / `1.001107` |
+| `FFS_FUSE_PARENT_INVAL=0` | **`1.086272x`** (fwd `1.168976` `[1.097854, 1.253988]`, mir `1.009420`) | **`1.207516x`** (fwd `1.297100` `[1.248538, 1.345369]`) | unmoved `1.003354` / `1.004666` |
+| both off | **`1.243521x`** (fwd `1.314628`, mir `1.176260`) | **`1.557804x`** (fwd `1.654906`, mir `1.466400`) | unmoved |
+
+Every row is a same-invocation A/A/B: both kernel arms are live alongside both FrankenFS
+arms in each run, and their A/A null control lands at `1.010854`, `1.000257`, `0.995273`
+and `0.979538` across the contributing runs, each a bootstrap median with a bootstrap
+median CI from 20000 resamples over 32 paired per-round ratios. `RCH_WORKER=none`,
+`hostname=thinkstation1`. Counted mechanism: `crossings_lookup` 132,001 to 66,001 and
+`crossings_getattr` 191,082 to 136,194, read off the daemon's unconditional crossing
+counter at the kernel boundary.
+
+⭐ **The entry-invalidation mechanism is an exact integer.** With `FFS_FUSE_ENTRY_INVAL=0`,
+`crossings_lookup` falls **132,001 → 66,001**: exactly **1.000 fewer LOOKUP per
+create+unlink pair**, because invalidating the entry we just created forces the kernel to
+re-resolve the name at unlink time. `crossings_getattr` also falls 191,082 → 136,194
+(0.832 per pair). 14.2% of the row's crossings removed buys 25% of its wall — superlinear,
+because a lookup is a DEPENDENT round trip on the critical path, which is the opposite of
+what the same knob did on parallel-metadata-write (a wall NULL there, because that row
+never deletes inside the timed region). `FFS_FUSE_PARENT_INVAL=0` removes 0.812 getattr
+crossings per pair (187,006 → 133,410) and adds essentially nothing on top of entry
+invalidation — `1.2435` combined against `1.2311` for entry alone.
+
+⚠ **Neither knob is a lever.** Both exist to price coherence, not to be turned off: entry
+invalidation is what makes a create visible after a failed lookup without waiting out
+`ATTR_TTL` (`c6a7a9697`, bd-yu6jz). What this measures is the PRICE of that coherence on
+the storm — **1.23x of the whole batch, 1.43x of the delete phase** — which is now a
+number rather than a suspicion.
+
+### 2026-08-27 — the owed wall ratio, and why it is not a regression claim
+
+Balanced across both daemon CPUs, the shipping configuration measures **`5.0x`-`5.5x`**
+against the live kernel arm, where the banked cell says `2.862033x`. Absolute arm medians,
+so it is visible which arm moved: kernel_median_wall_ns=97591000 and
+kernel_median_wall_ns=95091000 against fuse_median_wall_ns=509971000 and
+fuse_median_wall_ns=549753000 in the cleanest window, and kernel_median_wall_ns=110116000
+and kernel_median_wall_ns=105326000 against fuse_median_wall_ns=553932000 and
+fuse_median_wall_ns=514259000 in the second. **The kernel arm reproduces the bank to ~2%**
+(banked kernel median batch 94.807 ms; measured 92.0-97.6 ms), so the movement is entirely
+on our side. Same-invocation A/A null control `1.010827` bootstrap median CI `[0.991843, 1.038212]`, and same-invocation A/A null control `1.003807` bootstrap median CI `[0.964766, 1.047227]`,
+both from 20000 resamples over the 32 paired per-round ratios of the contributing runs. The
+counted mechanism is the crossing census above — 9.000 crossings per create+delete pair
+excluding getattr and release, 12.88 including them, with `crossings_getxattr` at exactly
+2.000 per pair. `RCH_WORKER=none`, `hostname=thinkstation1`. Two things are known about it and one is not:
+
+  * The banked figure predates entry invalidation, and `entry_invalidation_enabled`'s own
+    doc says so: "A 2,000-create + 2,000-delete storm therefore issues ~4,000 notifications
+    that the 2026-08-08 banked storm row never paid, and that row's re-measurement now sits
+    above its banked figure (bd-avg6f)." This run prices that at `1.2435x`, which closes
+    part of the gap but not all of it — with both invalidations off the row still measures
+    ~`3.9x`.
+  * This ELF is baseline-ISA and un-PGO'd, so per bd-b9dug the loss is OVERSTATED; that
+    effect was measured at ~17.6% of create INSTRUCTIONS with wall inside the noise, and
+    cannot account for a doubling.
+  * ⛔ **NOT established: that the residual is a regression.** Deciding it needs the banked
+    `edbaeb4e…` ELF measured in the SAME window as this one, which was not done. The
+    honest statement is that the row's owed re-measurement lands at `5.0-5.5x` on a
+    baseline-ISA build with invalidation on, that `1.2435x` of the excess is priced, and
+    that a same-window old-ELF arm is the next thing this row needs. There is no per-round
+    drift (round 0 already measures 487-576 ms, `last8/first8` = `0.92`-`1.12`), so it is
+    not an accumulation defect.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO
+gates, so no figure here is a scorecard row. The candidate A/A null control on this row
+fails one-directionally at `1.109374` and only the BALANCED geometric mean (`1.020111`) is
+usable, so every interior ratio above is a geometric mean of a forward and a mirrored run
+and nothing below ~`1.05x` is decidable here. What this banks is the crossing census
+(which reproduces the banked mechanism exactly), the phase decomposition, the exact
+`1.000`-lookup-per-pair invalidation mechanism, the withdrawn `FFS_MOUNT_BENCH_EVIDENCE`
+result, and the placement rule that a write row's A/B must be balanced across daemon CPUs.
+
+Reproduce:
+
+    WORK=<scratch> bash scripts/perf/create_delete_storm_ab/mkstorm.sh
+    gcc -O2 -o $WORK/storm_ab scripts/perf/create_delete_storm_ab/storm_ab.c
+    # forward, then mirrored; take the geometric mean of the two
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=entryinv FA_LABEL=def FB_LABEL=off \
+      FA_CPUS=16 FB_CPUS=17 FA_ENV="" FB_ENV="FFS_FUSE_ENTRY_INVAL=0" \
+      bash scripts/perf/create_delete_storm_ab/run_storm.sh
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=32 TAG=entryinvM FA_LABEL=off FB_LABEL=def \
+      FA_CPUS=16 FB_CPUS=17 FA_ENV="FFS_FUSE_ENTRY_INVAL=0" FB_ENV="" \
+      bash scripts/perf/create_delete_storm_ab/run_storm.sh
+    python3 scripts/perf/create_delete_storm_ab/sanalyze.py $WORK/storm-entryinv.csv
