@@ -16998,3 +16998,93 @@ Reproduce:
       FA_ARGS="--btrfs-verify-data-on-read true" \
       FB_ARGS="--btrfs-verify-data-on-read false" TAG=cs2 \
       bash scripts/perf/parallel_read_btrfs_ab/run_pread_btrfs.sh
+
+## 2026-08-27 — bd-b07o1 CONFIRMED, and it refutes my own claim from two commits ago: the pure stat loop is `1.000` probe per stat on BOTH formats, not `2.000` on ext4 — there is no format-dependent probe rate
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, NEW rig
+`scripts/perf/warm_stat_ext4_ab/` (the mirror of the btrfs twin).** Provenance: in-process
+self-report
+`bench_evidence,binary_sha256=d574a1a8a55db92398d119c44bf4ab4769ad1ec4aed16d79515669f105c5802c`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19 (never 16), client on CPU 8.
+
+bd-b07o1 states: *"warm-stat headline attribution is wrong: `2.000` capability probes/stat
+does not hold for the pure stat loop (`getxattr=5` per mount lifetime)."* The bead carries a
+title and nothing else — no description, no comments — so this measures it.
+
+### The two counters the headline conflates
+
+Same rig as the btrfs twin, same client, same 96,200 stats, only the filesystem differs:
+
+| counter | ext4 base | ext4 `NO_SUPPORT=1` | what it measures |
+| --- | ---: | ---: | --- |
+| `crossings_getxattr` | **96,201** | 1 | kernel↔daemon **crossings** |
+| `op_counts getxattr` | **2** | 0 | requests reaching a **handler** |
+| `crossings_total` | 96,204 | **4** | |
+
+**Both halves of the bead's title are right, and they are not in tension** — they count
+different things. `96,201 / 96,200 = ` **`1.000` crossings per stat**, while only **2**
+requests reach a handler for the whole mount lifetime (the bead says 5; the exact handler
+count depends on what else a mount does at startup, the order of magnitude is the point).
+The capability memo answers every subsequent probe before `with_request_scope`, so the
+handler count is a constant while the crossing count is per-stat.
+
+### ⛔ WITHDRAWN: my "format-dependent probe rate", two commits ago
+
+In the btrfs warm-stat entry I wrote: *"The probe RATE differs by format. ext4 warm stat
+counts `2.000` probes per stat; btrfs counts `1.000`... the difference is how many path
+components each format's lookup resolves through FUSE."*
+
+| format | `crossings_getxattr` | stats | per stat |
+| --- | ---: | ---: | ---: |
+| btrfs (banked two commits ago) | 96,201 | 96,200 | **1.000** |
+| **ext4 (this run, identical rig)** | **96,201** | **96,200** | **1.000** |
+
+**Identical to the crossing.** There is no format-dependent rate. I imported the `2.000`
+from a different workload — the readdir+stat / harness warm-stat shape, which resolves more
+path components — attached it to the pure stat loop, and then invented a mechanism to explain
+a difference that does not exist. ⭐ The original bead
+(bd-warm-stat-is-the-fuse-floor-4wxw9) said the cost is in the **shared** path; my
+"format-dependent" gloss contradicted the very framing this run confirms.
+
+### The ext4 row, measured
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| **row vs kernel ext4, before** | `7.353482` | `7.588808` | **`7.470218x` slower** |
+| **row vs kernel ext4, after suppression** | `1.005153` `[0.998665, 1.006720]` | `1.002784` `[0.997705, 1.008558]` | **`1.003968x` FASTER** |
+| A/A null `k1/k2` | `1.003598` `[1.001602, 1.006476]` ⚠ | `1.001185` `[0.998509, 1.004294]` **PASS** | `1.002391` |
+
+⚠ Disclosed: the forward A/A CI excludes 1 by `0.36%`; the mirrored half passes and the
+balanced residual is `0.24%` against a `7.5x` effect. Absolutes:
+kernel_median_wall_ns=8234000 and kernel_median_wall_ns=8260000 against
+fuse_median_wall_ns=61621000 / fuse_median_wall_ns=8191000 (forward) and
+fuse_median_wall_ns=67244000 / fuse_median_wall_ns=8244000 (mirrored). Digest parity PASS
+across all four arms in both runs. All CIs are 20000-resample bootstrap medians over the 24
+paired per-round ratios.
+
+⇒ **ext4 `7.470218x` against btrfs `7.724334x`, both `1.000` probe/stat, both to parity under
+suppression.** The two formats now agree to `3.3%` on the same rig — which is what
+"the cost is in the shared path" predicts, and what my withdrawn gloss did not.
+
+### Transferable
+
+  * ⭐⭐⭐ **Never carry a rate across workloads.** `2.000` was measured on a workload that
+    resolves more path components; the pure stat loop is `1.000`. A per-operation constant is
+    a property of the *workload's path shape*, not of the filesystem, and re-deriving it on
+    the rig you are actually reporting costs one census line.
+  * ⭐⭐ **A "wrong attribution" bead with only a title can still be decided.** The title named
+    both counters (`probes/stat` and `getxattr per mount lifetime`); measuring both showed
+    they were never in conflict and located the error in the headline that merged them.
+  * ⭐ **An invented mechanism is the tell.** I explained the fictitious 2.000-vs-1.000 gap
+    with a plausible story about path components. The story was the evidence that the number
+    had not been re-measured.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Ratios are same-invocation against live kernel ext4 with both A/A nulls reported, forward and
+mirrored. This entry does not revise the banked harness warm-stat figures, which were measured
+at the harness's own batch shape; it withdraws a cross-format claim I made about the pure
+stat loop.
