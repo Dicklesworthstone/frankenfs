@@ -16360,3 +16360,87 @@ CPU, and the daemon does no device I/O in the write phase.
 
 Hand rig, not `ffs-mounted-kernel-bench`. This entry banks a profile comparison and a code-
 derived byte count; it adds no vs-incumbent ratio and explicitly refuses one.
+
+## 2026-08-27 — each 64 MiB copy on the bulk path is worth `~10.5` percentage points of daemon CPU, counted by ADDING one back; ⛔ my `Arc<[u8]>` sizing from one commit ago is WRONG, and the banked "one vectored write is impossible" rejection is scoped too broadly
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rig
+`scripts/perf/bulk_durable_write_ab/` (`bperf2.sh`, new).** Provenance: in-process self-report
+`bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemon on cpu18, loop device `--direct-io=on`.
+
+One commit ago the bulk row's profile was shown to be copy-dominated
+(`__memmove_avx_unaligned_erms` at `14.10%`) and I sized the fix as "the `Arc<[u8]>`-plus-range
+staging change removes the first copy, taking `2.0x` to `1.0x` and halving a `14.10%` line
+item". **That sizing is wrong.** This measures what a copy actually costs, by adding one back.
+
+### Counted: toggle `FFS_MVCC_FLUSH_BORROW`, which adds or removes exactly one 64 MiB copy
+
+| symbol | `borrow=true` (2 copies) | `borrow=false` (3 copies) | Δ |
+| --- | ---: | ---: | ---: |
+| `__memmove_avx_unaligned_erms` | **16.40%** | **26.92%** | **+10.52 pp** |
+| `_rjem_je_edata_heap_remove` | 2.94% | 4.55% | +1.61 pp |
+| `_rjem_je_edata_avail_remove` | 1.23% | — | |
+| `_rjem_je_arena_ptr_array_flush` | 0.73% | 1.03% | |
+| `__pi_memcpy` (kernel) | 1.73% | 2.29% | +0.56 pp |
+| jemalloc family total | **4.90%** | **6.17%** | +1.27 pp |
+
+⇒ **one 64 MiB copy of the payload is worth `~10.5` percentage points of daemon CPU**, and
+the 16,384 per-block allocations that come with it are worth another `~1.3 pp`. The already
+shipped borrowed flush is therefore worth `~11.8 pp` of daemon CPU on this row, which is a
+much larger share than its `1.108260x` wall would suggest — the rest of the row is waiting.
+
+### ⛔ WITHDRAWN: the `Arc<[u8]>` sizing
+
+`Arc<[u8]>`-plus-range staging replaces **16,384 small allocations with one**; it does **not**
+remove a copy. The payload still has to be copied out of the FUSE receive buffer exactly
+once, because that buffer is reused for the next request while the staged version outlives it.
+
+| change | allocations per 64 MiB batch | bytes copied |
+| --- | ---: | ---: |
+| today | 16,384 | 64 MiB (stage) + 64 MiB (coalesce) |
+| with `Arc<[u8]>` staging | **1** | **unchanged** |
+| with the coalescing copy removed | 16,384 | **64 MiB** |
+
+So the `Arc<[u8]>` change is worth the **allocator** line — measured `4.90%` of daemon CPU,
+of which it can remove most — and **not** the `10.5 pp` I attributed to it. Copy volume is
+`2.0x` either way. ⚠ The `2.0x` in-memory amplification figure stands; what was wrong is
+which change removes it.
+
+### ⛔ SCOPED TOO BROADLY: "one vectored write per flush is impossible"
+
+That rejection was banked as *"`pwritev` can't scatter to multiple offsets"* — true, and it
+rules out ONE writev for a whole flush spanning several runs. It does **not** rule out **one
+`pwritev` PER RUN**: `pwritev(fd, iov, iovcnt, offset)` writes the iovecs *sequentially* from
+`offset`, and every block inside a coalesced run is contiguous on disk by construction. A run
+is exactly what `pwritev` expresses.
+
+⇒ **the second copy is removable in principle**, and it is the `~10.5 pp` one. The blocker is
+not the syscall, it is lifetime: the per-block slices must stay valid for the duration of the
+device write, so the flush would have to hold the shard read locks across `write_contiguous_
+blocks` — precisely what the borrowed two-pass walk was designed to avoid. That is a real
+design decision about lock hold times under concurrent commit, not a small edit, and it is
+now the named next step for this row instead of the `Arc<[u8]>` change.
+
+### Transferable
+
+  * ⭐⭐⭐ **Size a removal by ADDING it back.** `FFS_MVCC_FLUSH_BORROW=0` puts one copy back
+    and prices it at `10.52 pp` in one run — far cleaner than reasoning about how much of a
+    `14.10%` symbol each call site owns.
+  * ⭐⭐ **A rejection's SCOPE is as citable as its verdict, and both decay.** "One vectored
+    write per flush is impossible" was true of the flush and false of a run; the citation
+    that killed the lever quoted the true half.
+  * ⭐ **An allocation-count change and a copy-volume change are different levers with
+    different prices.** Here `4.90%` against `10.5 pp`, and I had merged them.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`. This entry banks a counted profile delta from one
+ELF with a knob toggled; it adds no vs-incumbent ratio.
+
+Reproduce:
+
+    WORK=<scratch> ELF=<ffs-cli> bash scripts/perf/bulk_durable_write_ab/bperf2.sh borrowON ""
+    WORK=<scratch> ELF=<ffs-cli> bash scripts/perf/bulk_durable_write_ab/bperf2.sh \
+      borrowOFF FFS_MVCC_FLUSH_BORROW=0
