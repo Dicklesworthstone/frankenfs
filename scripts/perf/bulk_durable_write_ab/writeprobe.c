@@ -35,13 +35,22 @@ int main(int argc, char **argv) {
     // Non-constant bytes: a compressing or zero-eliding path must not get a free ride.
     for (long i = 0; i < bs; i++) buf[i] = (char)(i * 31 + 7);
 
+    // REWRITE mode (bd-cjqhh): every write targets offset 0, so the total
+    // DISTINCT data is one block while the op count still scales. If the daemon
+    // allocates one staging buffer per WRITE OP, faults track ops and this mode
+    // costs the same as the sequential one; if it allocates per DISTINCT BLOCK,
+    // faults collapse to ~one block's worth. That discriminates two hypotheses
+    // that the sequential workload cannot tell apart, because there ops and
+    // distinct blocks scale together.
+    int rewrite = getenv("WRITEPROBE_REWRITE") != NULL;
+
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
 
     long v0 = nvcsw();
     long written = 0, syncs = 0, blocks = 0;
     for (long i = 0; i < nblocks; i++) {
-        ssize_t w = write(fd, buf, bs);
+        ssize_t w = rewrite ? pwrite(fd, buf, bs, 0) : write(fd, buf, bs);
         if (w != bs) { fprintf(stderr, "write %ld: %s\n", i, strerror(errno)); break; }
         written += w;
         blocks++;

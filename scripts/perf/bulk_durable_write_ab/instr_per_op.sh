@@ -47,7 +47,7 @@ LOOPS="$LOOPS $dev"
 sudo -n mount "$dev" "$KMNT"
 echo "--- kernel btrfs (live incumbent)"
 perf stat -e instructions,task-clock -x, -o "$W/instr-k.txt" -- \
-  taskset -c 8 "$W/writeprobe" "$KMNT/out.bin" "$MB" "$BS" "$SYNC_EVERY" || true
+  env ${PROBEENV:-} taskset -c 8 "$W/writeprobe" "$KMNT/out.bin" "$MB" "$BS" "$SYNC_EVERY" || true
 grep -E "instructions|task-clock" "$W/instr-k.txt" | sed 's/^/    /'
 sudo -n umount "$KMNT"
 
@@ -69,7 +69,7 @@ perf stat -e instructions,page-faults,minor-faults -x, -o "$W/instr-fd.txt" -p "
 dperf=$!
 sleep 1
 perf stat -e instructions,task-clock -x, -o "$W/instr-fc.txt" -- \
-  taskset -c 8 "$W/writeprobe" "$FMNT/out.bin" "$MB" "$BS" "$SYNC_EVERY" || true
+  env ${PROBEENV:-} taskset -c 8 "$W/writeprobe" "$FMNT/out.bin" "$MB" "$BS" "$SYNC_EVERY" || true
 kill -INT "$dperf" 2>/dev/null || true
 wait "$dperf" 2>/dev/null || true
 echo "    client:"; grep -E "instructions|task-clock" "$W/instr-fc.txt" | sed 's/^/      /'

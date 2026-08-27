@@ -18796,3 +18796,48 @@ the previous entry's reasoning about needing a consumer survey first applies to 
 not less. What this turn buys is that the next person aims at the right buffer.
 
 `hostname=thinkstation1`. Nothing shipped, nothing reverted; no new timing claimed.
+
+## 2026-08-27 — bd-cjqhh: the per-write-op staging allocation is now MEASURED, not inferred — rewriting ONE block 192 times still costs `2,437` page faults against `3,533` for 192 distinct blocks, where a per-distinct-block allocation would have cost ~16
+
+Two of my attributions on this row have already been withdrawn — the live-footprint framing, then
+`AlignedVec`. The third (a per-write staging `Vec<u8>`) was reached the same way, by reading code, so
+it should not be handed to the next person unverified. This measures it.
+
+**The discriminating experiment.** The sequential workload cannot separate "one buffer per WRITE OP"
+from "one buffer per DISTINCT BLOCK", because there ops and distinct blocks scale together. A rewrite
+mode separates them: every write targets offset 0, so distinct data stays at ONE block while the op
+count still scales. Added as `WRITEPROBE_REWRITE` in `writeprobe.c`, same fixture, same ELF, 12 MiB of
+write ops either way, `fsync` every 16.
+
+| mode | distinct blocks | write ops | daemon page faults | faults / write op |
+|---|---|---|---|---|
+| sequential | 192 | 192 | **3,533** | `18.40` |
+| rewrite (same offset) | **1** | 192 | **2,437** | `12.69` |
+
+A 64 KiB block is 16 pages. **If the staging buffer were allocated per DISTINCT BLOCK, the rewrite
+mode would have cost about 16 faults. It cost 2,437** — 69% of the sequential figure, i.e. `12.69`
+pages faulted per write of a block that already exists. **The allocation is per WRITE OP.** Confirmed
+by measurement rather than by reading `data.to_vec()` and assuming.
+
+**It also rules out the innocent explanation.** "The data has to live in memory" would predict the
+rewrite mode costing one block's worth, since it is the same 64 KiB of logical data written 192 times.
+It does not. The daemon materialises a fresh ~16-page buffer on every write regardless of whether the
+block is new, and pays 16 first-touch faults for it.
+
+**Why the rewrite mode is 31% cheaper rather than equal, stated as an open detail and not glossed.** I
+do not know. Plausibly the superseded version's memory is partially recycled, or the extent-tree work
+differs when no new block is introduced. It is a 31% effect on a mechanism whose size is `12.69`
+faults per op, so it does not change the conclusion, and I am recording it as unexplained rather than
+inventing a mechanism for it — the last two times I supplied a mechanism from code reading on this row
+I had to withdraw it.
+
+**What this pins for whoever takes the lever.** The target is the per-write staging buffer in MVCC
+version storage, and its size is now bounded by measurement: `12.69`–`18.40` first-touch faults per
+64 KiB write op, linear in bytes, unreachable by the flush-run-buffer reuse knob (a different buffer,
+correctly reused — see the previous entry), by jemalloc extent retention or decay, by allocation size
+class, or by flush frequency. The constraint remains that MVCC versions are snapshot-visible, so a
+buffer may only be recycled once no snapshot can reference it; that is the real work, and it is now
+aimed at the right allocation with a measured target to beat.
+
+ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
+`hostname=thinkstation1`. Nothing shipped, nothing reverted; no timing claimed.
