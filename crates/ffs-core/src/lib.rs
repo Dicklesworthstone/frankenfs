@@ -211,9 +211,7 @@ const BTRFS_DIR_START_INDEX: u64 = 2;
 fn ext4_gdt_skip_unchanged() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SKIP.get_or_init(|| {
-        std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED")
-            .ok()
-            .is_some_and(|raw| {
+        std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED").is_ok_and(|raw| {
                 let v = raw.trim();
                 v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
             })

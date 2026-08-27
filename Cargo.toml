@@ -43,6 +43,24 @@ rust-version = "1.95"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
+# Helper items declared next to the code that uses them.
+items_after_statements = "allow"
+# Guards deliberately span the critical section.
+significant_drop_tightening = "allow"
+# A few long state machines that read worse when split.
+too_many_lines = "allow"
+# Flag records mirroring an on-disk layout.
+struct_excessive_bools = "allow"
+# Suggests #[must_use] on internal accessors; not part of the API contract.
+must_use_candidate = "allow"
+# New lint; asks for assert_eq!(x, "") instead of assert!(x.is_empty()) purely to
+# improve the failure message. Fires on dozens of assertions with no defect behind
+# any, and the rewrite is type-specific so clippy --fix cannot apply it.
+assert_is_empty = "allow"
+# Arms kept separate where each documents a distinct case.
+branches_sharing_code = "allow"
+# Underscore-prefixed helpers referenced across module boundaries.
+used_underscore_items = "allow"
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 module_name_repetitions = { level = "allow", priority = 1 }

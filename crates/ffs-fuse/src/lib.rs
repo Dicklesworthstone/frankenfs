@@ -4758,7 +4758,7 @@ pub fn parent_invalidation_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("FFS_FUSE_PARENT_INVAL")
             .ok()
-            .map_or(true, |raw| {
+            .is_none_or(|raw| {
                 let v = raw.trim();
                 !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
             })
@@ -4776,7 +4776,7 @@ pub fn write_inode_invalidation_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("FFS_FUSE_WRITE_INVAL")
             .ok()
-            .map_or(true, |raw| {
+            .is_none_or(|raw| {
                 let v = raw.trim();
                 !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
             })
