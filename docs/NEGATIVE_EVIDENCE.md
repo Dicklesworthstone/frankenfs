@@ -18126,3 +18126,77 @@ single-threaded probe implies, and need not be equal across opcodes.
 `dispatch_ns`) and only partly closed in magnitude. Nothing shipped, nothing reverted. What changed is
 that "rank opcodes by `dispatch_ns`" is now a known-biased method with a measured size for the bias,
 and there is a deterministic instrument for the unbiased quantity.
+
+## 2026-08-27 — bd-4iqg6 / worst row: `ext4 xattr-get-list-report` decomposed by COUNT — `2.001` blocking crossings per user syscall against the kernel's zero, `50.0%` of them a capability probe the memo answers at `99.956%` but cannot prevent, and the daemon does `0.090%` of the work
+
+`ext4 xattr-get-list-report` is the campaign's worst vs-incumbent ratio (`8.428754x`) and the one read
+row the capability-probe parity lever cannot rescue: `FFS_FUSE_XATTR_NO_SUPPORT` is REFUSED here
+because this image genuinely HAS xattrs, so answering `ENOSYS` would be a lie rather than a
+restriction. So I decomposed it with the deterministic instrument validated on parallel-read instead
+of another wall-time run.
+
+**Instrument.** `scripts/perf/xattr_ab/{xblockprobe.c,run_xblockprobe.sh}`. One report = the banked
+batch's five PATH-BASED syscalls (`getxattr` inline / external / absent-expecting-ENODATA,
+`listxattr` inline, `listxattr` many), 2000 reports = 10,000 user syscalls, single-threaded, warm-up
+outside the counted region. `ru_nvcsw` counts the crossings the client actually WAITS on; the daemon's
+`crossings_*` and `op_counts` supply the other side. ELF
+`7d12d33a0af2de6975f6680708d6ff1d4b036203c560520410a9399561fc4dec` (HEAD, debug — counts are a
+property of the protocol path, not codegen; **no wall time is claimed from this run and none is
+quoted**). `hostname=thinkstation1`.
+
+| quantity | per report | per user syscall |
+|---|---|---|
+| crossings | `10.005` | **`2.001`** |
+| blocking (`nvcsw`) | `10.000` | `2.000` |
+| `getxattr` crossings | `8.002` | — |
+| user `getxattr` in the batch | `3` | — |
+| **capability probes** | **`5.002`** | **`1.000`** |
+
+**FINDING 1 — the row pays exactly 2 blocking round trips per user xattr syscall, and the kernel pays
+zero.** `99.95%` of the crossings block (`nvcsw` 20,000 against 20,010 crossings): unlike parallel-read,
+where `RELEASE` was asynchronous and gave a third of the ladder back for free, **this row has no async
+relief at all.** Every crossing is on the client's critical path.
+
+**FINDING 2 — exactly half the row is the capability probe: `1.000` per path-based syscall.** Three
+user `getxattr` become `8.002` `getxattr` crossings; the `5.002` extra are one probe per path
+resolution, for all five syscalls including the two `listxattr`. That is `50.0%` of all crossings, and
+it matches the banked census's independently-recorded `50.0%` getxattr share exactly.
+
+**FINDING 3 — and this is why the row is stuck: the daemon is already doing nothing.** `op_counts`
+records **9 handler entries** (`getxattr=7`, `listxattr=2`) for **10,000 user ops** — `0.090%`. The
+capability memo's hit rate is **`99.956%`**. There is no cache lever left: a memo cannot be made to
+hit more than 99.956% of the time, and the cost is not the lookup it saves, it is the round trip it
+cannot stop. The only thing that stops the round trip is `ENOSYS`, which on an image that has xattrs
+would be a false answer. **The worst row is structurally blocked at the protocol level, not at any
+level FrankenFS controls.**
+
+**bd-t0xoq's short-circuit is REFUSED here, and I confirmed it changed nothing.** The daemon
+self-reports `capability_shortcircuit=refused,capability_shortcircuit_requested=1,`
+`capability_shortcircuit_presence=present,capability_shortcircuit_mount=ro` — the gate is
+`XattrPresence::ProvenAbsent` and this image's xattrs are present, exactly as designed. Both arms
+produced **bit-identical** counts (`crossings_total=20010`, `op_counts getxattr=7`), so the refusal is
+attested by the counts and not only by the log line. My prediction two entries ago that this knob is
+worth nothing on a warm row is upheld here for an additional reason: on this row it does not even
+reach the code.
+
+**Determinism.** Three independent runs: `crossings_total` `20010`/`20010`/`20010` — **bit-exact**;
+`nvcsw` `20000`/`20001`/`20001`. This is the fourth consecutive counted result to reproduce to ±1
+while wall-time rows on this host were being voided for load.
+
+**⚠ A campaign belief I could NOT confirm, and am flagging rather than repeating.** The probe has been
+attributed in earlier notes to this host's audit rules (`auditctl -l` does show
+`-w /data/projects -p wa` and a destruct rule on the same tree). **But this mount is at
+`/home/ubuntu/xblock-mnt`, OUTSIDE the audited tree, and the probes still fire at exactly `1.000` per
+path-based syscall.** So the `/data/projects` watch is not what triggers them, and any claim that the
+worst row is inflated by *these* audit rules is not supported by this measurement. `audit_enabled` was
+not readable, so I did not establish what does trigger it. The RATE is measured and exact; the CAUSE
+is open, and it matters — if the probe is unconditional kernel behaviour it is a permanent floor,
+whereas if it is configuration-dependent then this row's headline is partly a property of the
+measurement host. That question is now the highest-value thing on this row.
+
+**Floor, stated as a count and not converted to a ratio.** Without the probe the row would cost
+`5.003` crossings per report = `1.001` per user syscall. I am deliberately NOT turning that into a
+predicted speedup: the previous entry established that crossing count is not a time model on this
+codebase (the same correction over- and under-shot two measured levers by 63% and 19%).
+
+Nothing shipped, nothing reverted.
