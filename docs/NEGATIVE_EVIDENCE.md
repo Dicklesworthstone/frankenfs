@@ -15104,3 +15104,119 @@ Reproduce:
       FA_LABEL=base FB_LABEL=noflush FB_ENV="FFS_FUSE_NO_FLUSH=1" TAG=nf1 \
       bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh
     python3 scripts/perf/create_delete_storm_ab/sanalyze.py <body.csv>
+
+## 2026-08-27 — the storm's create-side entry invalidation, PRICED at a balanced `1.105635x` with an exact `1.000`-lookup-per-create mechanism and a passing stale-dentry probe — and NOT shipped, because flipping it would weaken bd-6xwql's gate
+
+**Run 2026-08-27, thinkstation1, kernel 6.17.0-41-generic, rigs
+`scripts/perf/create_delete_storm_ab/run_storm_dio.sh`, `negdentry_probe.c` +
+`negprobe.sh` (both new).** Provenance: in-process self-report
+`bench_evidence,binary_sha256=5553e4eb5702b249f04a51cd62cc48d4bb909803052298451e02fc598e5fc45d`,
+`codegen_isa,target_arch=x86_64,compile_sse4_2=false,compile_avx2=false`,
+`build_profile,pgo_profile_sha256=none`, `RCH_WORKER=none`, `hostname=thinkstation1`,
+governor/EPP `performance`, daemons on CPUs 18/19, client on CPU 8, loop devices
+`--direct-io=on`.
+
+The storm is the biggest genuinely-ours row (`5.494859x`, audit only `11.2%` of its
+dispatch). Its inclusive profile names the third-largest item: **`fuser::notify::Notifier::
+send` at `11.13%` of daemon CPU**, behind only `Channel::receive` (`29.89%`) and
+`ReplySender::send` (`14.45%`). That is the entry-invalidation notifier.
+
+### Where the notification comes from, and why create's looked wrong
+
+The design is already narrow: a negative `lookup` reply calls `remember_negative_entry`, and
+only a later create of *that exact name* calls `notifier.entry(...)`. The storm hits the
+worst case by construction — the kernel looks up each new name (miss, hint remembered) and
+then creates it — so it pays **1 invalidation per create**.
+
+But a CREATE reply hands the kernel a positive entry for that same `(parent, name)`, and
+`fuse_create_open` instantiates the very dentry the negative lookup left behind. There is one
+dentry per `(parent, name)` in a dcache, so by the time the invalidation is issued the stale
+negative reply is already gone — the notification destroys the fresh **positive** entry
+instead, which is exactly the `1.000` extra LOOKUP per pair this row banks.
+
+`FFS_FUSE_CREATE_INVAL` splits the create-side send out of `FFS_FUSE_ENTRY_INVAL` so the two
+can be measured apart. The hint is taken (and forgotten) either way, so the knob suppresses a
+send and nothing else — leaving the hint would hand it to the later removal and the knob
+would measure a rerouting instead of a removal.
+
+### The correctness probe, and why it validates itself
+
+`negdentry_probe.c` drives the sequence that must fail if the argument is wrong:
+`stat` must MISS (installing the negative dentry) → create → **`stat` must HIT** → remove →
+`stat` must MISS again. It reports `negative_dentries_installed`, so a run that never reached
+the code under test is INVALID rather than a pass. Phase 2 does what one process cannot: the
+negative lookup in a forked child, the create in the parent, the re-`stat` in a second child.
+
+| knob | runs | sequences | `negative_dentries_installed` | `stale_negative` | `stale_positive` | `cross_task_ok` | `e2fsck -fn` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| default (ON) | 2 | 3,000 | 3,000 | 0 | 0 | 301/301 | clean |
+| `=0` | 2 | 3,000 | 3,000 | **0** | **0** | **301/301** | clean |
+
+### Measured vs the LIVE kernel incumbent, same invocation
+
+| ratio | forward | mirrored | **balanced** |
+| --- | --- | --- | --- |
+| `base/noCreInval` | `1.120209` `[1.100662, 1.142746]` | `1.091250` `[1.050733, 1.131505]` | **`1.105635x`** |
+| **row vs kernel, before** | `5.376431` | `5.615895` | **`5.494859x`** |
+| **row vs kernel, after** | `4.782767` | `5.122820` | **`4.949874x`** |
+| A/A null `k1/k2` | `0.975128` `[0.961178, 0.985260]` ⚠ | `0.986618` `[0.944207, 1.002792]` | `0.980856` |
+
+Absolutes: kernel_median_wall_ns=86418000 and kernel_median_wall_ns=86136000 against
+fuse_median_wall_ns=470189000 / fuse_median_wall_ns=421003000 (forward) and
+fuse_median_wall_ns=479578000 / fuse_median_wall_ns=451138000 (mirrored). All CIs are
+20000-resample bootstrap medians over the 24 paired per-round ratios.
+
+⚠ **Disclosed: the forward A/A null fails at `0.975128`** (2.5%, CI excludes 1); the mirrored
+half passes. Balanced residual `0.980856` — a `1.9%` null against a `10.6%` effect, and the
+two halves agree in sign. Reported, not hidden.
+
+**Counted mechanism, exact:**
+
+| counter | base | `CREATE_INVAL=0` | Δ |
+| --- | ---: | ---: | ---: |
+| `crossings_lookup` | 100,001 | **50,001** | **−50,000 = `1.000` per create** |
+| `crossings_getattr` | 147,855 | 144,704 | −3,151 |
+| `crossings_total` | 748,057 | 644,907 | **−103,150 (13.8%)** |
+
+⭐ Unlike the FLUSH reject one commit ago, nothing is substituted back: the removed lookups do
+not reappear as another opcode, and the total falls by more than the targeted opcode did
+(the notifier's own sends go too).
+
+### ⛔ NOT SHIPPED — and the reason is a gate, not a doubt
+
+Flipping the default makes
+`create_invalidates_only_the_exact_cached_negative_dentry_bd_6xwql` fail: it asserts that a
+create whose name matches a cached negative reply DOES notify. Forcing the knob on inside
+that test would keep the code path covered while leaving the **shipping default untested** —
+a gate weakened to land a change, which is the one thing this campaign does not do.
+
+Verified instead: with the default unchanged, `cargo test -p ffs-fuse` is **686 passed / 0
+failed**; with `FFS_FUSE_CREATE_INVAL=0` exactly that one test fails and nothing else
+(682 passed / 1 failed). ⇒ The lever is fully priced and blocked on **one named contract
+decision** — restate bd-6xwql for the new default and re-gate it — rather than on more
+measurement.
+
+### Transferable
+
+  * ⭐⭐ **A correctness probe must report whether it reached the code under test.**
+    `negative_dentries_installed=3000` is what separates "3,000 sequences proved it safe"
+    from "3,000 sequences never installed a negative dentry and proved nothing".
+  * ⭐⭐ **Check the total, not just the targeted opcode — in both directions.** The FLUSH
+    reject failed because the kernel substituted GETATTRs; this one succeeds because
+    `crossings_total` fell by MORE than the opcode did. Same counter, opposite verdicts.
+  * ⭐ **A perf commit is the wrong place to renegotiate a coherence contract.** The number
+    is banked, the blocker is named, and the decision stays with whoever owns bd-6xwql.
+
+### Admissibility
+
+Hand rig, not `ffs-mounted-kernel-bench`; the ELF fails that instrument's ISA and PGO gates.
+Every ratio is same-invocation against live kernel ext4 with both A/A nulls reported, forward
+and mirrored.
+
+Reproduce:
+
+    gcc -O2 -o $WORK/negdentry_probe \
+      scripts/perf/create_delete_storm_ab/negdentry_probe.c
+    WORK=<scratch> ELF=<ffs-cli> ROUNDS=24 OPS=2000 CPU=8 FA_CPUS=18 FB_CPUS=19 \
+      FA_LABEL=base FB_LABEL=noCreInval FB_ENV="FFS_FUSE_CREATE_INVAL=0" TAG=ci1 \
+      bash scripts/perf/create_delete_storm_ab/run_storm_dio.sh

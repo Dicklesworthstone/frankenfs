@@ -173,12 +173,21 @@ impl FrankenFuse {
 
     /// A successful create-like operation only needs to evict a negative dentry
     /// when this mount previously installed that exact negative lookup reply.
+    ///
+    /// The hint is taken — and therefore forgotten — whether or not the
+    /// notification is sent, so `FFS_FUSE_CREATE_INVAL=0` suppresses the send
+    /// and nothing else. Leaving the hint behind would hand it to the later
+    /// `unlink`, which would then invalidate a name the kernel is about to drop
+    /// on its own, and the knob would measure a rerouting instead of a removal.
     fn notify_created_entry_invalidation(&self, parent: u64, name: &OsStr) {
         self.inner.invalidate_readdirplus_entries();
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
         if !crate::entry_invalidation_enabled() || !notifier.take_negative_entry(parent, name) {
+            return;
+        }
+        if !crate::create_entry_invalidation_enabled() {
             return;
         }
         notifier.entry(parent, name);

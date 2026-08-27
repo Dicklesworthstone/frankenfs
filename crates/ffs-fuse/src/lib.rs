@@ -4470,6 +4470,61 @@ impl WriteSyncMode {
 /// the daemon does not self-report is unattestable, and the comparator's
 /// knob-divergence proof reads exactly that line. `FFS_FUSE_RECEIVE_SPIN_ADAPTIVE`
 /// is currently in that unattestable state; this knob is not repeating it.
+/// Whether a successful CREATE-like operation still sends the kernel an entry
+/// invalidation for the name it just created (`FFS_FUSE_CREATE_INVAL`, default
+/// ON = shipping behaviour).
+///
+/// Split out of [`entry_invalidation_enabled`] because create and removal have
+/// different arguments. A removal invalidates a name whose entry the kernel may
+/// still hold; a CREATE reply *already hands the kernel a positive entry for that
+/// exact (parent, name)*, so `fuse_create_open` instantiates the very dentry the
+/// earlier negative lookup left behind. There is one dentry per (parent, name) in
+/// a dcache, so after that instantiate the stale negative reply is gone and the
+/// invalidation has nothing left to evict — it destroys the fresh positive entry
+/// instead, which is exactly the counted `1.000` extra LOOKUP per create+delete
+/// pair this row already banks.
+///
+/// Default **ON** — shipping behaviour is unchanged — even though turning it off
+/// measures a balanced `1.105635x` on the create/delete storm and every
+/// correctness probe run so far has passed. What is measured, 2026-08-27:
+///
+/// - `scripts/perf/create_delete_storm_ab/negdentry_probe.c` drives the exact
+///   failing sequence (`stat` MISS → create → `stat` must HIT), and reports
+///   `negative_dentries_installed` so a run that never reached the code path is
+///   INVALID rather than a pass. **4 runs × 3,000 sequences, `stale_negative=0`,
+///   `stale_positive=0`, `e2fsck -fn` clean**, both knob settings.
+/// - Its phase 2 covers what one process cannot: a negative reply cached by one
+///   task and the create done by another. **`cross_task_ok=301/301`** every run —
+///   the dcache entry is shared, so the instantiate is visible outside the
+///   creating task.
+/// - Counted on the storm: `crossings_lookup` **100,001 → 50,001**, exactly
+///   `1.000` removed per create, and `crossings_total` −103,150 (13.8%), taking
+///   the row `5.494859x` → `4.949874x` against live kernel ext4.
+///
+/// ⛔ **The default did not move, and the reason is a gate, not a doubt.**
+/// `create_invalidates_only_the_exact_cached_negative_dentry_bd_6xwql` asserts
+/// that a create whose name matches a cached negative reply DOES notify. Flipping
+/// this default makes that test fail, and forcing the knob on inside it would
+/// keep the code path covered while leaving the shipping default untested — a
+/// gate weakened to land a change. The flip needs bd-6xwql's contract restated
+/// for the new default and re-gated, which is a deliberate decision about
+/// dcache-coherence policy rather than a perf commit's business.
+///
+/// ⚠ Also unchanged and still uncovered: a name created through a DIFFERENT mount
+/// of the same image. This mount only ever remembered hints for its own negative
+/// replies and only ever consumed them on its own creates, so that case was never
+/// served by this notification either way.
+#[must_use]
+pub fn create_entry_invalidation_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FFS_FUSE_CREATE_INVAL").map_or(true, |raw| {
+            let raw = raw.trim();
+            !(raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off"))
+        })
+    })
+}
+
 #[must_use]
 pub fn entry_invalidation_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
