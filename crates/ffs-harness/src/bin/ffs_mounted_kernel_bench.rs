@@ -157,6 +157,10 @@ const MAX_IMAGE_MIB: u64 = 2048;
 const PAYLOAD_BYTES: usize = 1024 * 1024;
 const MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A mutating syscall can block forever when a FUSE daemon deadlocks. Run each
+/// serial durability batch in a child so the parent still owns every mount and
+/// can drop them on timeout (bd-xtnk1).
+const MUTATING_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 const CPU_SAMPLE_INTERVAL_MS: u64 = 1_000;
 const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(CPU_SAMPLE_INTERVAL_MS);
 const MAX_DRIVER_PREFLIGHT_BUSY: f64 = 0.20;
@@ -4168,6 +4172,94 @@ fn create_delete_storm_batch(root: &Path, operations: usize) -> Result<(u64, u64
     ))
 }
 
+/// Decode the deliberately tiny child protocol used to bound a mutating FUSE
+/// batch. Keeping this separate from the workload result makes a partial line
+/// from a killed child a hard error rather than a zero-duration observation.
+fn parse_mutating_batch_result(line: &str) -> Result<(u64, u64)> {
+    let (elapsed, digest) = line
+        .trim()
+        .split_once(',')
+        .ok_or_else(|| anyhow!("mutating batch child emitted malformed result {line:?}"))?;
+    let elapsed = elapsed
+        .parse::<u64>()
+        .with_context(|| format!("parse mutating batch elapsed {elapsed:?}"))?;
+    let digest = digest
+        .parse::<u64>()
+        .with_context(|| format!("parse mutating batch digest {digest:?}"))?;
+    ensure!(
+        elapsed > 0,
+        "mutating batch child reported a zero elapsed duration"
+    );
+    Ok((elapsed, digest))
+}
+
+/// Execute the only currently serial multi-arm mutating acceptance workload in
+/// a subprocess. The parent retains `MountedArm`s, so a deadline failure
+/// unwinds through their existing Drop cleanup instead of leaving rw mounts
+/// owned by a stuck workload thread.
+fn create_delete_storm_batch_bounded(root: &Path, operations: usize) -> Result<(u64, u64)> {
+    let executable = env::current_exe().context("resolve mounted comparator executable")?;
+    let mut child = Command::new(executable)
+        .arg("--mutating-batch-child")
+        .arg("create-delete-storm")
+        .arg(root)
+        .arg(operations.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn bounded create/delete batch for {}", root.display()))?;
+    let deadline = Instant::now() + MUTATING_BATCH_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll mutating batch child")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child.wait().context("wait for killed mutating batch child")?;
+            bail!(
+                "mutating workload deadline elapsed after {} ms in phase=create-delete-storm, root={}; child killed with status {status}; mounted arms will now be unmounted and reaped",
+                MUTATING_BATCH_TIMEOUT.as_millis(),
+                root.display(),
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("child stdout was piped")
+        .read_to_string(&mut stdout)
+        .context("read mutating batch child stdout")?;
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr was piped")
+        .read_to_string(&mut stderr)
+        .context("read mutating batch child stderr")?;
+    ensure!(
+        status.success(),
+        "mutating batch child failed in phase=create-delete-storm: status={status}; stderr={}",
+        stderr.trim()
+    );
+    parse_mutating_batch_result(&stdout)
+}
+
+fn run_mutating_batch_child(args: &[String]) -> Result<ExitCode> {
+    ensure!(
+        args.len() == 4 && args[1] == "create-delete-storm",
+        "invalid --mutating-batch-child arguments"
+    );
+    let root = Path::new(&args[2]);
+    let operations = args[3]
+        .parse::<usize>()
+        .with_context(|| format!("parse child operations {:?}", args[3]))?;
+    let (elapsed, digest) = create_delete_storm_batch(root, operations)?;
+    println!("{elapsed},{digest}");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn readdir_stat_batch(
     root: &Path,
     operations: usize,
@@ -4352,7 +4444,7 @@ fn workload_batch(
         | Workload::ReaddirStat8 => {
             unreachable!("parallel workloads handled above")
         }
-        Workload::CreateDeleteStorm => create_delete_storm_batch(root, config.operations)?,
+        Workload::CreateDeleteStorm => create_delete_storm_batch_bounded(root, config.operations)?,
         Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence)?,
         Workload::BulkDurableWrite => bulk_durable_write_batch(root, config.operations, sequence)?,
         Workload::XattrGetListReport => xattr_get_list_report_batch(root, config.operations)?,
@@ -8822,6 +8914,16 @@ fn run() -> Result<Option<PathBuf>> {
 }
 
 fn main() -> ExitCode {
+    let args = env::args().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|arg| arg == "--mutating-batch-child") {
+        return match run_mutating_batch_child(&args[1..]) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("mounted_kernel_mutating_child,error={error:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
     match run() {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
@@ -8833,6 +8935,34 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mutating_batch_child_result_rejects_partial_or_zero_records_bd_xtnk1() {
+        assert_eq!(
+            super::parse_mutating_batch_result("17,23").expect("complete child record"),
+            (17, 23)
+        );
+        for malformed in ["", "17", "0,23", "17,", "17,23,29", "no,23"] {
+            assert!(
+                super::parse_mutating_batch_result(malformed).is_err(),
+                "a killed or malformed child record must fail closed: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_batch_child_rejects_a_different_workload_bd_xtnk1() {
+        let wrong = vec![
+            "--mutating-batch-child".to_owned(),
+            "warm-stat".to_owned(),
+            "/data/tmp/ignored".to_owned(),
+            "1".to_owned(),
+        ];
+        assert!(
+            super::run_mutating_batch_child(&wrong).is_err(),
+            "the bounded child protocol must not silently execute a different workload"
+        );
+    }
+
     /// bd-fj2dg: occupancy padding is selected per SIDE and defaults to inert.
     ///
     /// Per side, not per replica: A and B are the same configuration visited in a
