@@ -19271,3 +19271,53 @@ mysterious. Every btrfs write row is capped at ~16 MiB until a data-side shortfa
 why the write side has only ever been measured at 12 MiB.
 
 `hostname=thinkstation1`. Nothing shipped, nothing reverted; no timing claimed.
+
+## 2026-08-27 — parallel read, SHIPPING wall-time figure at last: **`1.185941x`** slower than live kernel ext4 (balanced, gate-passing, both A/A nulls clean) — superseding the banked `1.303819x`, which priced zero-message open OFF
+
+The debt from two entries ago is paid. Three earlier attempts were refused by the load-spike rule
+(the host reached loadavg 117–121 with idle under 6%); this window passed the gate in BOTH directions.
+
+**Instrument.** `run_pread.sh`, ext4, ONE invocation per direction carrying four live mounts: two
+kernel ext4 ro loop mounts (`k1`, `k2`) and **two FrankenFS mounts BOTH in the shipping default**, all
+four on loop+`--direct-io=on`, 24 rounds x 8 client threads. Two identical FrankenFS arms is deliberate
+— it yields a genuine FUSE A/A null alongside the kernel one, so the instrument is checked on both
+sides of the comparison. Floor estimator per the rule established for this row, at a fixed 24 rounds.
+ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`.
+
+| direction | kernel tail burden | gate | kernel A/A `k1/k2` | **FUSE A/A `shipA/shipB`** |
+|---|---|---|---|---|
+| forward | `1.1101` / `1.1295` | ADMIT | `0.998725 [0.973098, 1.047209]` | `0.985649 [0.940618, 1.034946]` |
+| mirrored | `1.0630` / `1.0632` | ADMIT | `1.010276 [0.990818, 1.032783]` | `1.010979 [0.975199, 1.028920]` |
+
+All four nulls pass. Absolute floors: kernel `3.941`/`3.946` and `4.086`/`4.044` ms; FrankenFS
+`4.657`/`4.725` and `4.833`/`4.780` ms.
+
+**THE ROW AS SHIPPED**, pooling both kernel arms against both FrankenFS arms per direction and
+balancing the geomeans:
+
+| estimator | forward | mirrored | balanced | vs incumbent |
+|---|---|---|---|---|
+| `min` | `0.840643` | `0.845790` | `0.843212` | **`1.185941x` SLOWER** |
+| mean-of-4-lowest | `0.851618` | `0.840533` | `0.846057` | `1.181953x` SLOWER |
+
+The two independent estimators agree to **0.34%**, and the direction effect is **0.61%** — against the
+`5.9%` systematic direction effect this row showed in an earlier session, which is why both directions
+are still run.
+
+**Supersedes the banked `1.303819x`**, which was measured with zero-message open OFF, i.e. a
+configuration that no longer ships.
+
+**⚠ What I am NOT claiming.** `1.303819 / 1.185941 = 1.0994x` is arithmetic across two different ELFs
+and two different sessions — the banked figure's binary (`05087d76…`) was reaped mid-session and no
+longer exists. It is NOT a measured A/B of the default. The within-window measurement of that lever
+stands separately at `1.160389x`, and the two are consistent to about 5.5% without either being
+derivable from the other. The honest pair of statements is: **the row measures `1.185941x` today in
+the shipping configuration**, and **the banked `1.303819x` is superseded rather than differenced.**
+
+**Where the row now stands on both scales:** `2.502x` the kernel's blocking crossings, `1.185941x` its
+wall time. The gap between those two ratios is the same lesson this ledger recorded earlier — crossing
+count is a mechanism and a floor, not a time model.
+
+Nothing shipped in this entry, nothing reverted; it re-prices a row against a default shipped earlier
+today.
