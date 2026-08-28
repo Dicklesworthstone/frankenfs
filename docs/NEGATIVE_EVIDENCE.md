@@ -20347,3 +20347,53 @@ of which need a local binary. The campaign's measurement loop depends on artifac
 
 `hostname=thinkstation1`. Nothing shipped, nothing reverted; the tree is exactly as the previous
 commit left it.
+
+## 2026-08-28 — CORRECTION to yesterday's blocker: measurement is NOT blocked. Running the whole head-to-head ON the worker is possible — `hz3` has `/dev/fuse`, `fusermount3`, `losetup`, btrfs-progs, `e2fsck` and passwordless `sudo`, measured by a probe that had to be a cargo target
+
+Yesterday I concluded that rch-routed builds block this campaign's measurements, because `cargo build`
+runs on a remote worker and no artifact comes back. **That conclusion was too narrow and I am
+withdrawing it.** The blocker I measured was real — there is still no local ELF — but I framed it as
+"measurement is blocked" when the correct statement is "measurement *from this host* is blocked". Run
+BOTH arms on the worker in one invocation and the artifact never needs to travel.
+
+**Probing the worker required working around two constraints, both worth recording.** `rch exec`
+**refuses non-compilation commands** — a plain `sh -c` capability check is rejected — so the probe had
+to BE a cargo target (`cargo run --example`). And the first version failed to compile on the worker
+with `allow(unsafe_code) incompatible with previous forbid`: `ffs-block` carries
+`#![forbid(unsafe_code)]`, which an `allow` cannot override, so the `getuid` call had to go. Both are
+the environment enforcing rules this ledger already records.
+
+**MEASURED on the worker (`crates/ffs-block/examples/worker_capability_probe.rs`, run via
+`rch exec -- cargo run --release --example …`):**
+
+| capability | worker `hz3` |
+|---|---|
+| `/dev/fuse` | **present** |
+| `fusermount3` | `/usr/bin/fusermount3` |
+| `losetup` | `/usr/sbin/losetup` |
+| btrfs-progs | `/usr/bin/btrfs` |
+| `e2fsck` | `/usr/sbin/e2fsck` |
+| passwordless `sudo -n` | **OK** |
+| CPUs | **64** |
+| **verdict** | **live-incumbent head-to-head is POSSIBLE** |
+
+**One of these contradicts an older campaign note** that the fleet has no `mke2fs`/`e2fsck`. `e2fsck`
+is present on `hz3` today. Whether that note was wrong or the fleet changed, the current measured state
+is what stands.
+
+**Why this matters beyond the method.** Every vs-incumbent row needs a LIVE kernel mount beside the
+FUSE arm; without `losetup` and root the incumbent arm cannot exist and the run degrades to a
+self-comparison, which this campaign rejects by rule. The probe checks exactly those prerequisites,
+and they are all present — so the six-arm comparator this campaign already owns
+(`ffs-harness/src/bin/ffs_mounted_kernel_bench.rs`, with its `--candidate-aa` A/A null and
+`--fuse-transport loop` symmetry) can run there unchanged.
+
+**The remaining step, named precisely so it is not rediscovered.** That comparator takes
+`--ffs-cli PATH`, and the worker's target directory is a generated, worker-scoped path
+(`.rch-target-hz3-pool-<hash>`) that must not be hardcoded. The robust resolution is an example that
+derives its siblings from `std::env::current_exe()`: an example runs from
+`<target>/release/examples/`, so `../ffs-cli` and `../ffs-mounted-kernel-bench` are stable relative
+paths on any worker. That runner is the next piece of work, and it needs no local build.
+
+Nothing shipped, nothing reverted. The probe mounts nothing and formats nothing; it only inspects.
+`hostname=thinkstation1` (orchestration), worker `hz3` (measurement).

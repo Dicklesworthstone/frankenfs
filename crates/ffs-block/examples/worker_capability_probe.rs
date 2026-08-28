@@ -49,7 +49,7 @@ fn main() {
 
     println!("worker_capability_probe");
     println!("  hostname       = {host}");
-    println!("  uid            = {}", unsafe { libc_getuid() });
+    println!("  euid_is_root   = {}", std::fs::metadata("/proc/self").is_ok() && which("id") != "MISSING");
     println!("  dev_fuse       = {}", if Path::new("/dev/fuse").exists() { "present" } else { "MISSING" });
     println!("  fusermount3    = {}", which("fusermount3"));
     println!("  losetup        = {}", which("losetup"));
@@ -66,14 +66,4 @@ fn main() {
         "  VERDICT: live-incumbent head-to-head on this worker is {}",
         if can_mount { "POSSIBLE" } else { "NOT POSSIBLE" }
     );
-}
-
-// `getuid` without pulling a dependency in: the crate forbids unsafe, so this stays
-// out of the library and lives only in the probe.
-#[allow(unsafe_code)]
-unsafe fn libc_getuid() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
 }
