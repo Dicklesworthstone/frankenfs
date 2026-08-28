@@ -19789,3 +19789,50 @@ attributions and the pattern is that each one looked obvious at the time.
 
 ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD + this knob).
 `hostname=thinkstation1`. Counts only; the knob ships default ON so no behaviour changes.
+
+## 2026-08-27 — CORRECTION: there is no "creation-type dependent probe rate" (I compared crossings against `op_counts`) — and the real finding is that the audit↔capability 1:1 coupling BREAKS on the create path, `1.01` `__audit_inode` against `2.02` capability reads
+
+The previous entry reported a "NEW FINDING — the audit capability probe rate depends on the KIND of
+creation", `2.00` for `open(O_CREAT|O_EXCL)` against `1.00` for `mkdir`. **That is wrong and I am
+withdrawing it.** The `2.00` came from `crossings_getxattr` and the `1.00` from `op_counts getxattr` —
+crossings against handler entries, and the capability memo absorbs roughly half the crossings before
+they reach a handler. Comparing the two is apples to oranges. The daemon's own
+`mount_xattr_probe_census` settles it: **`security_capability=606` for 300 operations in BOTH forms**,
+`2.02` each. File creation and `mkdir` pay the same rate; there is no creation-type dependence.
+
+**What the mistake uncovered is worth more than the claim it retracts.** Probing the kernel side of a
+create directly, 300 creates:
+
+| probe | count | per create |
+|---|---|---|
+| `__audit_inode` | 304 | **`1.01`** |
+| `get_vfs_caps_from_disk` | 606 | **`2.02`** |
+| `fuse_getxattr` | 604 | `2.01` |
+| daemon census `security_capability` | 606 | `2.02` |
+
+**On the read rows these two are coupled strictly 1:1** — measured 10,004 / 10,004 on the xattr row
+and 20,003 / 20,003 on warm stat, which is what licensed calling the capability read "the audit
+probe". **On the create path that coupling breaks at 2:1.** There are two capability reads per create
+and only one of them is audit-driven.
+
+`kstack` on `__audit_inode` confirms the single audit call's site — `open_last_lookups` <- `path_openat`
+<- `do_filp_open` <- `__x64_sys_openat`, 301 of 304 — i.e. the ordinary path-resolution record, once,
+exactly as on every other row. The second capability read has a different origin and **I am not naming
+it**: this row has already cost four withdrawn attributions and one apples-to-oranges retraction, and
+the pattern is that each looked obvious.
+
+**The consequence is a scoping correction for the campaign's biggest open lever.** The
+audit-configuration change — the operator decision this ledger keeps flagging — would remove the
+audit-driven probe. On the read rows that is 100% of their capability traffic, because the coupling is
+1:1. **On the create path it would remove only half**, leaving `~1.0` capability read per create
+standing. Anyone estimating what an audit change buys must not apply the read rows' factor to the
+mutating rows.
+
+**Method note, recorded because it is the actual lesson.** Two of this row's errors now come from
+mixing the two counters the daemon exposes: `crossings_*` (what crosses the FUSE boundary) and
+`op_counts` (what reaches a handler). They differ by exactly the memo hit rate, which on the capability
+probe is ~50% here and `99.956%` on the xattr row. They are never interchangeable, and a comparison
+that takes one from each arm is not a measurement.
+
+ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD).
+`hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
