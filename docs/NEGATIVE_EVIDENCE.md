@@ -20053,3 +20053,59 @@ retrying should start there and should test at 64 MiB with `RUST_LOG=info`, not 
 
 ELF during the failed attempt `59069aa347c354a9c67647e1bcdfa153a06d1eb19b7abbb706b9fbf4526114fa`.
 `hostname=thinkstation1`. Nothing shipped; the attempt is reverted.
+
+## 2026-08-27 — bd-cjqhh: the publication gap behind yesterday's REJECT is LOCATED — `btrfs_context().chunks` is built once at mount and never refreshed, while writeback resolves through it, so a chunk grown during a mount is invisible to writeback for that mount's lifetime
+
+The previous entry rejected my data-chunk-growth attempt and named what the next attempt must start
+from: "a newly grown DATA chunk must become visible to writeback's logical→physical mapping, and
+neither `apply_chunk_allocation` nor the in-memory chunk tree update achieves that on its own." This
+locates it.
+
+**The two snapshots, and they are different objects.** Writeback resolves addresses from a CLONE of
+the mount-level context (`ffs-core/src/lib.rs:32025`):
+
+```
+let chunks_for_writeback: Vec<_> = self.btrfs_context()?.chunks.clone();
+```
+
+The growth loop, however, builds its own list by READING the chunk tree
+(`let mut chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)`) and pushes new
+chunks into that (`:31827`). **`BtrfsContext` is constructed exactly once, at mount (`:5736`), and
+`grep` finds no assignment to `btrfs_context.chunks` anywhere outside tests (`:53378`, `:53399`).**
+So growth updates the on-disk chunk tree, the dev tree, the extent allocator and a local derived
+vector — and never the list writeback actually consults.
+
+**That is precisely the failure I measured**: `apply_chunk_allocation` accepted the chunk, the trees
+were updated, and the next write to the new logical range returned *"writeback logical address not
+covered by any chunk"*. The diagnosis and the observed error agree without any inference in between.
+
+**⚠ THE BROADER CLAIM IS UNTESTED, AND I TRIED.** The same gap would apply to the SHIPPING metadata
+and system growth paths — they push into the same local vector and equally never refresh the context —
+which would make it a latent defect in code that ships, not just in my rejected patch. **I could not
+trigger it.** 30,000 creates with `FFS_BTRFS_GROW_CHUNKS=1` and `RUST_LOG=info`:
+
+| | value |
+|---|---|
+| creates completed, both arms | **30,000 / 30,000** |
+| growth events of any kind | **0** |
+| writeback mapping errors | **0** |
+
+The initial metadata chunk was never exhausted, so metadata growth never fired and the latent case
+never arose. **The publication gap is proven for the case that actually grew chunks; that it also
+affects metadata/system growth is an inference from the shared code path, and it stays an inference.**
+
+**A side observation worth banking, because it further undermines a number I have been careful about.**
+At 30,000 creates the storm's blocking-crossing ratio is `6.0061 / 0.0424` = **`142x`**, against
+**`926x`** measured at 4,000 creates. The FrankenFS side is unchanged (`6.0061` vs `6.018`) — it is
+the KERNEL that blocks more as the directory grows (`0.0065` -> `0.0424`). So the deterministic ratio
+on this row is not even stable in workload size, moving 6.5x with N while the wall-time figure
+(`3.655182x`, measured) is not. One more reason that ratio is a composition and never a performance
+number.
+
+**Status.** The next attempt at data-chunk growth needs to publish the new chunk into
+`btrfs_context.chunks` (or make writeback resolve from the live chunk tree instead of a mount-time
+clone) — and that is a change to how the mount's view of its own geometry is maintained, not a
+twenty-line shortfall query. The stash from the rejected attempt remains at `stash@{0}`.
+
+ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD).
+`hostname=thinkstation1`. Nothing shipped, nothing reverted.
