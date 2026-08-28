@@ -19122,3 +19122,50 @@ from the shared working tree before I staged it, the third time that has happene
 verified the committed content is complete and correct (both the flipped default and the guard are in
 `HEAD`, and `ffs-fuse` is 685/0 against it) and left it rather than rewriting shared history. This
 ledger entry carries the evidence; that commit carries the diff.
+
+## 2026-08-27 — parallel read RE-MEASURED in the SHIPPING configuration: every banked figure for this row priced zero-message open OFF, which no longer ships — the row is `2.502x` the kernel's blocking crossings, down from `3.002x`, and `crossings_total` falls `1,801 -> 1,288`
+
+Zero-message open became the default earlier today. **Every banked figure for the parallel-read row
+was measured with it OFF**, so the row's headline now prices a configuration that is no longer
+shipped. This campaign has already been burned by exactly that once — the banked "worst row" priced a
+memo that had stopped shipping — so the row is re-measured here rather than left to go stale.
+
+**Instrument.** `scripts/perf/parallel_read_ab/pr_blocking.sh` with `blockprobe`: one client binary
+over one fixture on one host, against a LIVE kernel ext4 ro loop mount and a FrankenFS mount, 256
+files x 256 KiB. Counts only. The shipping default is A/B'd against an explicit `=0` opt-out from ONE
+ELF, with `FUSE_NO_OPEN_SUPPORT negotiated` counted per run so the configuration is attested rather
+than asserted. ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`.
+
+| quantity | kernel ext4 (live incumbent) | FrankenFS **SHIPPING** (ZMO on) | FrankenFS (banked config, ZMO off) |
+|---|---|---|---|
+| blocking crossings / file | `1.992` | **`4.984`** | `5.980` |
+| `crossings_open` | — | **1** | 257 |
+| `crossings_release` | — | **0** | 257 |
+| `crossings_getxattr` | — | 259 | 259 |
+| `crossings_total` | — | **1,288** | 1,801 |
+| `zmo_negotiated_this_run` | — | 1 | 0 |
+
+**THE ROW, on the deterministic scale, as shipped:** `4.984 / 1.992` = **`2.502x`** the kernel's
+blocking crossings, against `5.980 / 1.992` = `3.002x` in the banked configuration. **The shipped
+default improves this row by `1.200x`** on the campaign's deterministic metric, and removes **28.5%**
+of its round trips.
+
+**It independently re-confirms the async-RELEASE finding.** Zero-message open removes TWO crossings
+per file — `open` (257→1) and `release` (257→0) — but exactly **`1.0` blocking crossing per file**
+(`5.980 → 4.984`). Release was never on the client's critical path, which is what the earlier
+`nvcsw`-based measurement concluded from a different workload and a different instrument.
+
+**Determinism:** a repeat run gave `crossings_total` **bit-exact at 1,288** and blocking crossings
+`4.988` against `4.984` (0.08%); the kernel arm moved 1.0%.
+
+**⚠ The row's banked WALL-TIME figure is stale too, and I am not replacing it here.** The
+`1.303819x` floor-estimator figure was measured with ZMO off. It should not be quoted as the shipping
+row's number. I am deliberately NOT deriving a new wall-time figure by combining it with the
+separately-measured `1.160389x`: this ledger established that crossing count is not a time model on
+this codebase, and multiplying two independently-measured ratios would be exactly the kind of
+arithmetic-instead-of-measurement this row has already had to withdraw once. A fresh floor-estimator
+run in a gate-passing window is what that number needs.
+
+Nothing shipped in this entry, nothing reverted; it re-prices an existing row against the default that
+shipped this morning.
