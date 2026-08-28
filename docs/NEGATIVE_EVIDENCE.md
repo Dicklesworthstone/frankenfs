@@ -19169,3 +19169,56 @@ run in a gate-passing window is what that number needs.
 
 Nothing shipped in this entry, nothing reverted; it re-prices an existing row against the default that
 shipped this morning.
+
+## 2026-08-27 — `FFS_FUSE_NO_FLUSH` REJECTED for shipping, with a concrete reason at last: FLUSH is NOT the RELEASE case — `OpenFs::flush` is a real override whose observability records have RUNTIME consumers that would fail
+
+No wall-time this turn: the host went to **loadavg 117–121 with idle under 6%** during a bounded wait,
+so the fresh floor-estimator run the previous entry asked for is still owed. The standing rule voids
+measurements taken into that, so I took a deterministic question instead.
+
+**The question.** The shipping parallel-read row is `4.984` blocking crossings per file, composed of
+~1 lookup + ~1 capability probe + ~2 reads + **1 flush**. `FFS_FUSE_NO_FLUSH` is marked MEASUREMENT
+ONLY, "valid while `FsOps::flush` is a stub and not one day longer" — which is the exact shape of the
+RELEASE question I closed this morning by proving the trait had no duty and guarding it. So: does the
+same argument carry?
+
+**It does not, and the asymmetry is the finding.** `FsOps::release` has NO production override — the
+trait default `Ok(())` and the `Arc` forwarder are the only definitions, which is what made
+zero-message open safe to default on. `FsOps::flush` DOES have one: `ffs-core/src/fs_ops.rs:4027`,
+which the repo's own guard test at `:4425` uses as the marker that it has located the `FsOps` impl
+block at all.
+
+**Two corrections I made to myself inside this turn, recorded because the first two readings were
+both wrong.** (1) I first read `scripts/e2e/ffs_log_contract_e2e.sh:427` as asserting the flush
+records exist at runtime — it does not; it greps SOURCE FILES for the constant
+`EXT4_RW_SCENARIO_FLUSH`, and suppression would not affect it. (2) I then concluded there was no
+runtime consumer and flush was therefore RELEASE-shaped after all. **That is also wrong.** Three
+runtime consumers exist:
+
+| consumer | what it does |
+|---|---|
+| `crates/ffs-harness/tests/fuse_e2e.rs:9623`, `:15059` | assert `scenario_id = "ext4_rw_flush"` / `"btrfs_rw_flush"` in produced logs |
+| `crates/ffs-core/src/lib.rs:87801`, `:87840` | parse log entries matching those `scenario_id`s |
+| `scripts/e2e/ffs_btrfs_rw_smoke.sh:522` | REJECTS the run with `missing_sync_applied_log` if `btrfs_sync_applied` is absent from the mount log |
+
+Only the flush path emits `scenario_id="*_rw_flush"`. Answering FLUSH with `ENOSYS` stops the kernel
+sending it, the handler never runs, those records are never emitted, and those assertions fail.
+
+**REJECT, and the reason is now concrete rather than the vague "while flush is a stub".** The flush
+override does NO durability work — both flavors emit two `info!` records carrying
+`durability_boundary = "none"` and return `Ok(())`, while `fsync` immediately below does the real work
+via `ext4_sync_with_logging` / `btrfs_sync_with_logging`. So suppression would cost **observability,
+not correctness** — but that observability is a consumed contract with runtime tests behind it, and
+trading a diagnostic record every application sees for a perf lever is a product decision, not one a
+perf campaign gets to take unilaterally.
+
+**The price of the reject, stated so it is not free.** Suppressing FLUSH is worth **`1.000` blocking
+crossing per file = `20.1%`** of the shipping parallel-read row's `4.984`, and `22.3%` of the crossing
+ladder's total (1,278 of 5,729). That is the largest single remaining item on that row after the
+capability probe, and it is being left on the table deliberately.
+
+**Still owed:** the parallel-read wall-time figure in the shipping configuration. The deterministic
+figure is `2.502x` blocking crossings; the banked `1.303819x` predates the zero-message-open default
+and must not be quoted.
+
+`hostname=thinkstation1`. Nothing shipped, nothing reverted.
