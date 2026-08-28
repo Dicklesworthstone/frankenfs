@@ -19419,3 +19419,56 @@ round trips cost against an incumbent that answers in-process — the kernel arm
 where ours is `277–311 ms`.
 
 Nothing shipped, nothing reverted.
+
+## 2026-08-27 — PREDICTION REFUTED: descriptor addressing does NOT remove the capability probe on the worst row — `fgetxattr` still reaches `__audit_inode` (`10,004 -> 10,007`), unlike `fstat` which eliminated it. The campaign's model needs a scope correction
+
+The verified worst row is `8.801255x`, mechanism counted as `2.000` blocking crossings per user
+syscall = 1.0 user answer + 1.0 audit capability probe. On the warm-stat row I showed the probe half
+is avoidable by a client that holds a descriptor: `fstat` resolves no path, so it never reaches
+`__audit_inode`, and the probe went `20,004 -> 4` with FrankenFS reaching exact parity with the kernel.
+**The model predicted the same for `fgetxattr` on the worst row: probes to ~4, the row halved from
+`2.000` to `1.000` blocking crossings per syscall.** That would have been a real client-side
+mitigation for the campaign's worst cell.
+
+**It is wrong.** Same file, same five operations, only the addressing changed (`fgetxattr`/`flistxattr`
+through held descriptors instead of `getxattr`/`listxattr` by path), 2,000 reports = 10,000 ops:
+
+| | FrankenFS `nvcsw`/report | `crossings_getxattr` | `crossings_total` |
+|---|---|---|---|
+| path addressing | `10.000` | 16,004 | 20,010 |
+| **fd addressing** | **`9.999`** | **16,007** | **20,017** |
+
+Unchanged to within 3 crossings in 20,000.
+
+**The mechanism, counted on the LIVE KERNEL arm where no FUSE is involved:**
+
+| | `__audit_inode` | `get_vfs_caps_from_disk` | `vfs_getxattr` |
+|---|---|---|---|
+| path addressing | 10,004 | 10,004 | 6,001 |
+| fd addressing | **10,007** | **10,007** | 6,001 |
+
+**`fgetxattr` reaches `__audit_inode` anyway**, and the capability read tracks it 1:1 in both modes as
+always. The kernel arm pays it essentially free either way (`nvcsw` 1 and 0 for 10,000 ops).
+
+**SCOPE CORRECTION to the model.** I wrote that "every path-based metadata op pays exactly ONE blocking
+crossing for the audit probe". The measured fact is narrower, and the implied corollary — that
+descriptor addressing avoids it — is FALSE in general:
+
+| row | addressing change | probe |
+|---|---|---|
+| btrfs warm stat | `stat` -> `fstat` | **eliminated**, 20,004 -> 4 |
+| ext4 `xattr-get-list-report` | `getxattr` -> `fgetxattr` | **unchanged**, 10,004 -> 10,007 |
+
+The probe follows the audit subsystem's per-SYSCALL inode recording, not the presence of a path walk
+in the caller. `fstat` is not recorded that way; the xattr syscalls are, in both addressing forms. So
+"hold a descriptor" is a mitigation for the stat row ONLY, and the worst row has no client-side
+escape from its probe half.
+
+**What this costs the campaign, stated plainly:** the worst row's `2.000` blocking crossings per
+syscall stands with no client-side mitigation available. Its probe half remains removable only by
+`ENOSYS` (a lie on an image that has xattrs) or by an audit-configuration change, which is the
+operator decision this campaign has repeatedly flagged and cannot take unilaterally. A tempting fix
+has been closed off by measurement instead of being recommended on a plausible model.
+
+ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.

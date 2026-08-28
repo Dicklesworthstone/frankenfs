@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <fcntl.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -54,6 +55,24 @@ int main(int argc, char **argv) {
     snprintf(ext, sizeof(ext), "%s/xattr-external.bin", dir);
     snprintf(many, sizeof(many), "%s/xattr-many.bin", dir);
 
+    // FD MODE (bd-4iqg6): the same five xattr operations through held descriptors
+    // (fgetxattr/flistxattr) instead of paths. A descriptor-based call resolves no
+    // path, so it cannot reach __audit_inode and must pay no capability probe. The
+    // campaign's model says this row is 1.0 user answer + 1.0 probe per syscall; if
+    // that is right, this mode drops it to 1.0. Same file, same operations, same
+    // digest -- only the addressing changes.
+    int fdmode = getenv("XPROBE_FD") != NULL;
+    int fd_inl = -1, fd_ext = -1, fd_many = -1;
+    if (fdmode) {
+        fd_inl = open(inl, O_RDONLY);
+        fd_ext = open(ext, O_RDONLY);
+        fd_many = open(many, O_RDONLY);
+        if (fd_inl < 0 || fd_ext < 0 || fd_many < 0) {
+            fprintf(stderr, "fd mode open: %s\n", strerror(errno));
+            return 1;
+        }
+    }
+
     char buf[65536];
     ssize_t total = 0;
     int ops = 0;
@@ -65,21 +84,25 @@ int main(int argc, char **argv) {
     long v0 = nvcsw();
     for (int i = 0; i < n; i++) {
         ssize_t r;
-        r = getxattr(inl, "user.inline", buf, sizeof(buf));
+        r = fdmode ? fgetxattr(fd_inl, "user.inline", buf, sizeof(buf))
+                   : getxattr(inl, "user.inline", buf, sizeof(buf));
         if (r > 0) { total += r; ops++; }
-        r = getxattr(ext, "user.external", buf, sizeof(buf));
+        r = fdmode ? fgetxattr(fd_ext, "user.external", buf, sizeof(buf))
+                   : getxattr(ext, "user.external", buf, sizeof(buf));
         if (r > 0) { total += r; ops++; }
-        r = getxattr(inl, "user.absent", buf, sizeof(buf));
+        r = fdmode ? fgetxattr(fd_inl, "user.absent", buf, sizeof(buf))
+                   : getxattr(inl, "user.absent", buf, sizeof(buf));
         // ENODATA is the expected answer and still costs a full round trip.
         if (r < 0 && errno == ENODATA) ops++;
-        r = listxattr(inl, buf, sizeof(buf));
+        r = fdmode ? flistxattr(fd_inl, buf, sizeof(buf)) : listxattr(inl, buf, sizeof(buf));
         if (r > 0) { total += r; ops++; }
-        r = listxattr(many, buf, sizeof(buf));
+        r = fdmode ? flistxattr(fd_many, buf, sizeof(buf)) : listxattr(many, buf, sizeof(buf));
         if (r > 0) { total += r; ops++; }
     }
     long v1 = nvcsw();
 
-    printf("reports=%d nvcsw=%ld nvcsw_per_report=%.3f ops=%d bytes=%zd\n", n, v1 - v0,
+    printf("mode=%s reports=%d nvcsw=%ld nvcsw_per_report=%.3f ops=%d bytes=%zd\n",
+           fdmode ? "fd" : "path", n, v1 - v0,
            n ? (double)(v1 - v0) / n : 0.0, ops, total);
     return 0;
 }

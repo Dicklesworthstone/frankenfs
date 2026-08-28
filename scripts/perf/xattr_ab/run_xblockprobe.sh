@@ -53,7 +53,7 @@ run_cfg() {  # $1=label $2=env
   if [ "$up" != "1" ]; then echo "$1: mount never came up"; tail -5 "$log"; return 1; fi
 
   local out
-  out=$(taskset -c "$CLIENTCPU" "$W/xblockprobe" "$MNT" "$N")
+  out=$(env ${PROBEENV:-} taskset -c "$CLIENTCPU" "$W/xblockprobe" "$MNT" "$N")
 
   fusermount3 -u "$MNT" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
