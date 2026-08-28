@@ -19534,3 +19534,56 @@ audit probe and 34% is create/unlink/flush/release traffic that is ours. That is
 would have to come from, and it is a different target class from everything the read side produced.
 
 Nothing shipped, nothing reverted.
+
+## 2026-08-27 — storm invalidation knobs: a REAL measured saving (`entry_inval=0` cuts unlink blocking crossings `5.7475 -> 4.1742` and total crossings `17.6%`) that I am NOT shipping, because my correctness oracle passes in ALL FOUR arms and therefore discriminates nothing
+
+The storm's census showed `getattr` at `1.390` per operation — 11,106 crossings for a workload whose
+client never stats anything. The knobs line says `entry_inval=true`, `fuse_create_inval=true`,
+`parent_inval=true`: we explicitly invalidate the kernel's caches on mutation, and the kernel then
+re-fetches. That is a self-inflicted cost if the invalidations are not load-bearing.
+
+**Measured, one ELF, fixtures rebuilt between arms, every knob attested in the daemon's own line:**
+
+| config | per create | per unlink | `crossings_getattr` | `crossings_total` |
+|---|---|---|---|---|
+| baseline | `6.0308` | `5.7475` | 11,106 | 59,122 |
+| `FFS_FUSE_ENTRY_INVAL=0` | `6.0000` | **`4.1742`** | 8,701 | **48,715** |
+| `FFS_FUSE_CREATE_INVAL=0` | `5.9997` | `4.6205` | 10,487 | 50,501 |
+| `FFS_FUSE_PARENT_INVAL=0` | `6.0088` | `5.0442` | **8,189** | 56,205 |
+
+**Two real findings in that table.** First, **the CREATE phase is flat across all three knobs**
+(`6.03`, `6.00`, `6.00`, `6.01`) — create's 6 blocking crossings are not invalidation and no
+invalidation knob will touch them. Second, **the whole effect is on UNLINK**: `entry_inval=0` cuts it
+`27.4%` and removes `17.6%` of the row's crossings outright.
+
+**Correctness oracle, and why it does NOT license the change.** These knobs exist for cache coherence,
+so a crossing count cannot justify them. I wrote a behavioural oracle —
+`inval_staleness_check.sh`, 200 create/unlink/recreate cycles x 4 routes = 800 checks per arm: after
+unlink the path must be gone by `stat`, by `open`, and from `readdir`, and a re-created file must be
+visible again. Result:
+
+| arm | staleness failures |
+|---|---|
+| baseline | **0 / 800** |
+| `entry_inval=0` | **0 / 800** |
+| `create_inval=0` | **0 / 800** |
+| `parent_inval=0` | **0 / 800** |
+
+**It passes in every arm INCLUDING the baseline, which means it has no discriminating power.** An
+oracle that cannot tell the configurations apart does not show the knob is safe to turn off — it shows
+the oracle never reaches the case the invalidation was written for. This is the same standard applied
+to the guards shipped earlier today: `no_backend_forces_direct_io_bd_q0xnl` and
+`no_fsops_impl_overrides_release_bd_q0xnl` were each verified to FAIL on a planted violation before
+being trusted. This oracle has no such demonstration, so its zeros are not evidence.
+
+**REJECT for shipping; the saving is real and the safety case is not made.** The defaults stay ON. I
+am recording the measured size so the next attempt does not have to re-derive it, and stating exactly
+what is missing: a test that FAILS with the invalidation disabled. Without one, nobody — including me
+— can distinguish "these invalidations are redundant with the entry TTL in this configuration" from
+"my 800 checks never touched the coherence window they protect". The single-client, single-mount,
+immediate-recheck shape of my oracle is the obvious suspect: it re-checks at the moment the cache is
+most likely stale, which is the right instinct, but it never exercises a second client, a cached
+NEGATIVE dentry, or an entry surviving past its TTL.
+
+ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
