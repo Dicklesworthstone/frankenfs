@@ -19942,3 +19942,56 @@ than trying a third variant of the same idea.
 
 ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD).
 `hostname=thinkstation1`. Nothing shipped, nothing reverted; defaults unchanged.
+
+## 2026-08-27 — the storm's SHIPPING wall-time figure, measured on a proper same-invocation comparator: **`3.655182x`** slower than live kernel btrfs, both gates passing — and it is `250x` smaller than the same row's deterministic ratio, exactly as this ledger warned
+
+The storm was decomposed on the deterministic scale (`6.018` blocking crossings per create against the
+kernel's `0.0065`, a `926x` ratio) with an explicit warning that **nobody should quote `926x` as this
+row's performance**, because the incumbent does buffered metadata mutation with almost no blocking
+while still doing real CPU work. This measures what the row actually costs, and closes that loop with
+both numbers taken by me in the shipping configuration.
+
+**Instrument — and note this is NOT the rig used for the deterministic work.** `run_storm_btrfs_dio.sh`
+with `storm_ab.c`: four live mounts in ONE invocation (two kernel btrfs `--rw` loop mounts and two
+FrankenFS mounts BOTH in the shipping default), arm order rotated per round, 24 rounds x 2,000 ops,
+all arms on `--direct-io=on`. The blocking-crossing work used `storm_blocking.sh`, which runs the arms
+SEQUENTIALLY and has no A/A null — fine for counting crossings, **not** admissible for a
+vs-incumbent ratio, which is why this row's wall-time figure needed a different rig rather than a
+re-analysis. ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf`.
+`hostname=thinkstation1`.
+
+| direction | kernel tail `k1`/`k2` | gate | kernel A/A | FUSE A/A |
+|---|---|---|---|---|
+| forward | `1.0674` / `1.0980` | **ADMIT** | `1.017333` | `0.972165` |
+| mirrored, 1st attempt | `1.2391` / `1.1652` | **VOID** | `0.976810` | `1.044055` |
+| mirrored, 2nd attempt | `1.0430` / `1.0871` | **ADMIT** | `1.006539` | `1.023080` |
+
+The first mirror was refused by the gate and retried rather than averaged in; the balanced figure
+below uses only the two ADMITTED runs. The FUSE A/A balances to **`0.997297`** — unity within 0.27% —
+which is what makes the two-directional figure trustworthy given each single direction was 2-3% off.
+
+| estimator | forward | mirrored | **balanced** |
+|---|---|---|---|
+| floor (`min`) | `3.697691x` | `3.613161x` | **`3.655182x` SLOWER** |
+| mean-of-4-lowest | `3.780053x` | `3.611799x` | `3.694968x` SLOWER |
+
+Estimators agree to **1.08%**. Absolute floors: kernel `139.899`/`137.515` ms, FrankenFS
+`505.688`/`520.167` ms.
+
+**CONFIRMS the banked `3.505012x`** — measured `3.655182x` is 4.3% higher, ordinary session-to-session
+movement on a shared host. The second-worst row is still the second-worst row.
+
+**AND IT CLOSES THE LOOP ON THE METRIC WARNING.** Both numbers for this row are now measured by me in
+the shipping configuration:
+
+| metric | value | why they differ |
+|---|---|---|
+| blocking crossings vs kernel | `926x` | the kernel blocks `0.0065` times per create — buffered mutation, near-zero waiting |
+| **wall time vs kernel** | **`3.655182x`** | the kernel still does real CPU work per operation, which a blocking-only metric cannot see |
+
+**A factor of 250 between two honest measurements of the same row.** This is the sharpest available
+demonstration that blocking-crossing count is a mechanism and a floor and NEVER a time model — and it
+is why the deterministic figures throughout this ledger are reported as compositions rather than as
+performance.
+
+Nothing shipped, nothing reverted.
