@@ -20453,3 +20453,53 @@ not mine to take unilaterally.
 Runner committed so the next attempt starts from a working harness rather than rediscovering three
 gates and a silent-exit trap. Worker `hz3`, orchestration `hostname=thinkstation1`. Nothing shipped to
 the filesystem code; no measurement claimed.
+
+## 2026-08-28 — a counted worker-side h2h that does NOT need the cpufreq gate: kernel arms run on `hz3`, the FrankenFS arm does NOT mount there, so there is no measurement — reported rather than fabricated
+
+The six-arm comparator is refused on the worker for a correct reason (no cpufreq interface, and it
+certifies wall-time). Rather than relax that gate, this measures a quantity whose validity does not
+depend on it.
+
+**The validity argument, stated before the result.** A blocking crossing is a VOLUNTARY CONTEXT
+SWITCH: the client sleeps until the daemon replies. CPU frequency changes how LONG each one takes; it
+cannot change HOW MANY there are. Across this campaign those counts reproduced bit-exactly or to ±1,
+including in windows where wall-time rows had to be voided for load. So a counted head-to-head is not
+a weaker substitute for the gated one — it is a different quantity, and it is reported as a count and
+never as a performance ratio. Counts come from `/proc/self/status voluntary_ctxt_switches`: no
+`unsafe`, no C.
+
+**What ran on the worker** (`crates/ffs-harness/examples/h2h_counted.rs`, via
+`rch exec -- cargo run --release -p ffs-harness --example h2h_counted`):
+
+| step | result on `hz3` |
+|---|---|
+| candidate ELF, self-reported | `binary_sha256=40e482876f37b5fc1b7644f6d53ed5a078f1ebc1a5e0084c3290566faf1753d4` |
+| fixture: `mkfs.btrfs`, kernel mount, seed file, unmount | **worked** |
+| kernel arm `k1` — loop + `mount -o ro` | **worked, measured** |
+| kernel arm `k2` — the A/A null | **worked, measured** |
+| **FrankenFS arm** | **DID NOT MOUNT** |
+
+The daemon is not simply absent: its log shows it opened the image and ran
+(`blocks_scanned_total=484`), then shut down cleanly (`background_scrub_stopped`,
+`cli_mount_runtime_standard_ro`) without ever presenting a mountpoint.
+
+**So there is no measurement, and I am not reporting one.** The whole point of the incumbent arm is
+that a run without it is a self-comparison, which this campaign rejects by rule; the inverse is just
+as true — kernel arms with no candidate measure nothing about FrankenFS. Two working kernel arms and a
+missing candidate is a broken instrument, not a result.
+
+**Why it failed is NOT yet known**, and I am not guessing. The obvious suspects are a container that
+exposes `/dev/fuse` while still refusing an unprivileged mount (no setuid `fusermount3`, no
+`user_allow_other`), but the earlier probe found `fusermount3` present and `sudo -n` working, so that
+is a hypothesis and nothing more. The harness now dumps `ls -l $(command -v fusermount3)`,
+`/etc/fuse.conf`, `ls -l /dev/fuse` and the daemon log on failure — that diagnostic pass has not yet
+landed on a worker.
+
+**Fleet capacity is the other blocker, and it is transient.** Three of five attempts were refused
+outright: `no admissible workers: critical_pressure=2, insufficient_slots=1..2,
+insufficient_total_slots=10, active_project_exclusion=1`. rch correctly refuses local fallback, so a
+run either gets a worker or does not happen.
+
+**Net:** the counted h2h harness is written, committed and demonstrated to run end-to-end on a worker
+for the incumbent arms, with the candidate arm as the one unresolved step and its diagnostics already
+in place. No number is claimed. `hostname=thinkstation1` (orchestration), worker `hz3`.
