@@ -19995,3 +19995,61 @@ is why the deterministic figures throughout this ledger are reported as composit
 performance.
 
 Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-cjqhh: I IMPLEMENTED data-chunk growth and it is a REJECT — the chunks are created but the writeback path cannot map them, taking the row from ENOSPC at 16 MiB to a hard failure at 1 MiB. Reverted; baseline verified restored
+
+Two entries ago I specified this gap exactly — growth is METADATA-ONLY by construction, there is no
+`commit_data_shortfall`, and a workload that fills its DATA block groups gets ENOSPC with 98.4% of the
+device unallocated — and declined to fix it, citing bd-ftev0's record of chunk placement landing on
+live data. This turn I judged the fix bounded enough to try, because `plan_growth_for_shortfall` is
+already generic over `ChunkKind` (split out for SYSTEM), `ChunkKind::Data` already maps to
+`BTRFS_BLOCK_GROUP_DATA` with its own `ChunkSizePolicy` target, and the SYSTEM block gave a complete
+pattern to mirror. **The judgement was wrong, and the measurement says so.**
+
+**What I built.** A DATA growth block in the commit path, placed BEFORE the SYSTEM top-up (growing
+dirties the chunk tree, which the SYSTEM block must then account for), passing `None` for the
+superblock since only SYSTEM chunks reach `sys_chunk_array`. Trigger: top up when free data space
+falls below one chunk target, because unlike metadata a commit cannot know how much data the next
+writes will need.
+
+**It fired, and it broke the filesystem.**
+
+| | before (HEAD) | with data growth |
+|---|---|---|
+| blocks written before failure | **255** (16,711,680 B) | **16** (1,048,576 B) |
+| failure | `ENOSPC` at ~16 MiB | **`invalid config: writeback logical address not covered by any chunk`** |
+| `grew_a_data_chunk` events | — | **3** (chunk length 107,347,968 B each) |
+| acknowledged writes | preserved | **LOST** at destroy |
+
+**It was silently worse.** The success log is `info!` and the harness runs `RUST_LOG=warn`, so the
+first run showed 0 growth events and a workload that had gone from 255 blocks to 16 — a regression
+with no visible cause. Re-running at `RUST_LOG=info` showed the 3 chunk creations. **A change whose
+only evidence of running is at a level the harness filters out is a change that will be misdiagnosed**,
+and I nearly did.
+
+**TWO DEFECTS, both mine.**
+
+1. **The low-water trigger is wrong.** `policy.target(ChunkKind::Data, device.total_bytes)` returned
+   `1,073,741,824` on a 1 GiB device — the target IS the whole device, so `data_have < data_target`
+   is true on every commit and it grows unconditionally. A trigger that fires always is not a
+   low-water mark.
+2. **The created chunk is not visible to the writeback path.** This is the fatal one:
+   `plan_growth_for_shortfall` planned it, `apply_chunk_allocation` accepted it, the chunk tree and
+   dev tree were updated — and the very next write to the new logical range failed with *"writeback
+   logical address not covered by any chunk"*. **So the SYSTEM/METADATA pattern is NOT sufficient for
+   DATA**: something else must publish a new chunk into the map the writeback path consults, and
+   mirroring the existing blocks does not do it. I do not know what that something is and am not
+   guessing — that is precisely the bd-ftev0 hazard class, now demonstrated rather than assumed.
+
+**Reverted, and the revert verified.** Stashed as `stash@{0}` (recoverable, not discarded) rather than
+dropped. Rebuilt and re-ran: **255 blocks, ENOSPC at 16 MiB, 0 writeback-mapping errors**, ELF back to
+`05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf`. Baseline is exactly as it was.
+
+**What this buys the next attempt.** The gap's specification stands, and now so does the shape of the
+trap: the missing piece is NOT the shortfall query, which took twenty lines and worked. It is that a
+newly grown DATA chunk must become visible to writeback's logical→physical mapping, and neither
+`apply_chunk_allocation` nor the in-memory chunk tree update achieves that on its own. Anyone
+retrying should start there and should test at 64 MiB with `RUST_LOG=info`, not at the default level.
+
+ELF during the failed attempt `59069aa347c354a9c67647e1bcdfa153a06d1eb19b7abbb706b9fbf4526114fa`.
+`hostname=thinkstation1`. Nothing shipped; the attempt is reverted.
