@@ -20294,3 +20294,56 @@ have until the workload completes.
 
 ELF `e9cef5806af18c0a8ecd682e05f58efff79a5c83bd0c30d661dbab91f0295fbd` (release, HEAD + all fixes).
 `hostname=thinkstation1`.
+
+## 2026-08-28 — MEASUREMENT IS BLOCKED under rch-routed builds: `cargo` runs on a remote worker and the artifact is NOT retrievable, so no locally-runnable ELF exists. Recorded with evidence, and no unverifiable change made to the commit path
+
+A new constraint requires builds and tests to route through `rch` rather than running locally. I
+tested what that means for this campaign's measurements before assuming anything.
+
+**MEASURED, four ways:**
+
+| check | result |
+|---|---|
+| `cargo build -p ffs-cli --release` | routed to worker **`hz3`**, exit **0**, **669.6 s** |
+| local `target/release/ffs-cli` afterwards | **unchanged** — same `binary_sha256=e9cef5806…`, same mtime |
+| local `.rch-target-*` path (rch rewrites `CARGO_TARGET_DIR` to a worker-scoped dir) | **does not exist** — the worker's target tree is not shared |
+| `rch --help` artifact retrieval | **none** — `sync` pushes source TO workers; there is no fetch/pull |
+
+**Consequence, stated plainly.** Every measurement in this campaign runs a FUSE daemon locally against
+local loop devices under `sudo`. That needs a local ELF. Under "build via rch, never local", the build
+succeeds and produces nothing this host can execute, so **live vs-incumbent measurement is not
+possible** — not "harder", not "slower": there is no binary to run. Code edits and `cargo test` still
+work, because a remote test run reports pass/fail without needing an artifact back.
+
+This is the concrete form of the limitation recorded generally in earlier notes ("rch cannot retrieve
+a compiled binary"); it is now measured on this exact command with the sha and the timing.
+
+**Consequently I did NOT make the next fix.** The previous entry left data-chunk growth rejecting at
+bd-k74ef's reservation guard:
+
+```
+bd-k74ef: extent tree has 5 blocks but 4 addresses were reserved and described;
+refusing to write a tree whose blocks and extent items disagree
+```
+
+I traced the window: growth runs at `lib.rs:31934`, well BEFORE the address pool is built at
+`:32683-32707`, so growth is not itself late. The fifth block therefore appears between the pool
+converging and the DAG being rebuilt at `:32966` — and the only extent-tree mutation in that window is
+the accounting sync at `:32950`, which reaches into `extent_tree` (`ffs-btrfs:9143`, block-group key
+lookup at `:9160`). **A new block group from data growth plausibly gains or resizes an item there,
+after the pool has been sized.** That is an INFERENCE from reading the code, and it is exactly the
+kind of claim this ledger has had to withdraw four times on this row.
+
+**So the change is not made.** It would touch the fixpoint ordering in the commit path — the most
+correctness-critical code in the btrfs writer, guarded by a check that exists because a previous
+version "produced an image only we could read" — and I currently have **no way to run a single test of
+it against a real image**. Making an unverifiable edit there to satisfy a turn would be the worst
+trade available.
+
+**What is unblocked and what is not.** Unblocked: source changes, and `cargo test` through rch.
+Blocked: every wall-time row, every counted row, every `btrfs check` verification, and this fix — all
+of which need a local binary. The campaign's measurement loop depends on artifact retrieval that
+`rch` does not provide.
+
+`hostname=thinkstation1`. Nothing shipped, nothing reverted; the tree is exactly as the previous
+commit left it.
