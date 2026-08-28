@@ -19222,3 +19222,52 @@ figure is `2.502x` blocking crossings; the banked `1.303819x` predates the zero-
 and must not be quoted.
 
 `hostname=thinkstation1`. Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-cjqhh's remaining blocker CHARACTERISED EXACTLY: chunk growth is METADATA-ONLY by construction — there is no `commit_data_shortfall`, so a workload that fills its DATA block groups gets ENOSPC with 98.4% of the device unallocated
+
+Still no wall-time: the host sat at **loadavg 87** with 70% idle, so the parallel-read floor-estimator
+run remains owed. Took the deterministic question that blocks the most instead.
+
+**The blocker.** btrfs bulk durable write fails at ~16 MiB in a 1024 MiB image with
+`alloc_no_space_no_block_group needed=65536 required_flags=1 matching_groups=2 total=16777216`.
+`required_flags=1` is `BTRFS_BLOCK_GROUP_DATA`: two DATA block groups totalling exactly 16 MiB, never
+growing. I established earlier that `FFS_BTRFS_GROW_CHUNKS` is attested ON for that run
+(`btrfs_grow_chunks=true`) and logs no refusal — growth is enabled, reached, and does nothing. Until
+now I could not say why, which left a capability gap looking like a possible bug.
+
+**It is neither a bug nor a guard tripping — it is a feature that was never written.** Reading the
+growth path end to end:
+
+| site | what it says |
+|---|---|
+| `plan_growth_for_commit` (`ffs-btrfs/src/lib.rs:7099`) | takes **`tree_nodes` — "the number of tree blocks the commit will write"** |
+| its doc | "See `BtrfsExtentAllocator::commit_metadata_shortfall` for why growing mid-commit is not an option" |
+| `:7107` | `let Some(shortfall) = alloc.commit_metadata_shortfall(tree_nodes, nodesize) else { … }` |
+| `commit_metadata_shortfall` (`:7553`) | `let available = self.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA);` |
+| whole crate | **no `commit_data_shortfall` exists** — the only shortfall query is the metadata one |
+
+**So chunk growth sizes chunks for the COMMIT'S METADATA needs and asks only about METADATA block
+groups.** A workload that exhausts DATA extents is invisible to it: the shortfall query returns `None`
+(metadata is fine), growth correctly declines to act, logs nothing, and the data allocator then
+returns `NoSpace` while the device is almost entirely unallocated. Every observation lines up —
+enabled, reached, silent, ineffective.
+
+**Practical size of the gap:** 16 MiB of data usable in a 1024 MiB image = **1.6% of the device**,
+with the other 98.4% unallocated and unreachable by any write. The live kernel arm completes the same
+64 MiB workload on the same fixture, so this is ours and not the fixture's.
+
+**What a fix is, and the hazard that still stands.** The shape is a data-side sibling: a
+`commit_data_shortfall` querying `allocatable_bytes(BTRFS_BLOCK_GROUP_DATA)`, driven when the data
+allocator is about to fail rather than only at commit time — because the write path fails at
+ALLOCATION time while growth is a commit-time prediction, so even a data-aware shortfall must be
+reachable from the allocation path to help. The placement machinery (`plan_chunk_allocation`,
+`DeviceOccupancy::from_chunks`, the `ChunkSizePolicy` cap) is already written and already refuses
+layouts that would not survive `btrfs check`, so a fix reuses it rather than inventing placement. I am
+still not writing it: bd-ftev0 records this area putting a chunk on top of live data, and the
+correctness bar for that is a crash-consistency oracle plus `btrfs check`, not a perf turn.
+
+**Status.** bd-cjqhh's fault mechanism is closed; this is its OTHER blocker, now specified rather than
+mysterious. Every btrfs write row is capped at ~16 MiB until a data-side shortfall exists, which is
+why the write side has only ever been measured at 12 MiB.
+
+`hostname=thinkstation1`. Nothing shipped, nothing reverted; no timing claimed.
