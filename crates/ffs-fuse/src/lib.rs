@@ -395,8 +395,25 @@ pub fn zero_message_opendir_enabled() -> bool {
 pub fn zero_message_open_measurement_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN")
-            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
+        // DEFAULT ON as of 2026-08-27. Every blocker this knob carried has been
+        // retired by measurement, and the knob may now only ever SUBTRACT:
+        //   * the original "costs more than it saved" REJECT — refuted, and the
+        //     page cache is not dropped (`op_counts read` identical in all arms);
+        //   * the O_DIRECT worry — refuted by a counted oracle, 64/64 reads still
+        //     reach the daemon with FUSE_NO_OPEN_SUPPORT negotiated, controls at 1;
+        //   * the latent backend `FOPEN_DIRECT_IO` case — now guarded by
+        //     `no_backend_forces_direct_io_bd_q0xnl`;
+        //   * "needs rows outside this regime" — btrfs readdir+stat (interleaved)
+        //     and btrfs bulk durable write both measured BIT-IDENTICAL with it on
+        //     and off, attested by `FUSE_NO_OPEN_SUPPORT negotiated` in the log;
+        //   * RELEASE carrying a duty — `FsOps::release`'s trait default is
+        //     `Ok(())`, the only other definition is the `Arc` forwarder, and
+        //     `no_fsops_impl_overrides_release_bd_q0xnl` keeps it that way.
+        // Worth 48.60% of this row's crossings and a balanced 1.160389x.
+        match std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN") {
+            Ok(raw) => !matches!(raw.trim(), "0" | "false" | "off" | "no"),
+            Err(_) => true,
+        }
     })
 }
 
@@ -19890,6 +19907,38 @@ mod tests {
         assert_eq!(
             FrankenFuse::kernel_open_flags(libc::O_RDONLY, fuse_consts::FOPEN_DIRECT_IO),
             fuse_consts::FOPEN_DIRECT_IO
+        );
+    }
+
+    /// bd-q0xnl: nothing may give `FsOps::release` a duty while zero-message open
+    /// is the default.
+    ///
+    /// With `FUSE_NO_OPEN_SUPPORT` negotiated the kernel never sends RELEASE, so a
+    /// `release` implementation that did real work would be silently skipped — no
+    /// error, no test failure, just work that stops happening. That is safe today
+    /// only because the trait default is `Ok(())` and the sole other definition is
+    /// the `Arc` forwarder. This pins that fact so the default flip cannot rot.
+    #[test]
+    fn no_fsops_impl_overrides_release_bd_q0xnl() {
+        let vfs = include_str!("../../ffs-core/src/vfs.rs");
+        let defs = vfs.matches("\n    fn release(").count();
+
+        // Positive control: a path that read the wrong file, or an empty string,
+        // would pass the real assertion vacuously.
+        assert!(
+            vfs.contains("\n    fn release("),
+            "the scan did not find `fn release(` in ffs-core/src/vfs.rs, so it is not \
+             reading the trait definition and its verdict is meaningless"
+        );
+
+        assert_eq!(
+            defs, 2,
+            "ffs-core/src/vfs.rs now defines `fn release(` {defs} times, not 2 (the \
+             trait default returning Ok(()) and the Arc forwarder). If one of them \
+             does real work it is SILENTLY SKIPPED under the default-on \
+             FFS_FUSE_ZERO_MESSAGE_OPEN, because FUSE_NO_OPEN_SUPPORT means the \
+             kernel never sends RELEASE. Either keep release free of duties, or \
+             make zero-message open opt-in again."
         );
     }
 
