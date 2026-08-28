@@ -19368,3 +19368,54 @@ live kernel across 10,000 operations.
 
 ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
 `hostname=thinkstation1`. Nothing shipped, nothing reverted.
+
+## 2026-08-27 — the campaign's WORST ROW verified in the shipping configuration: ext4 `xattr-get-list-report` measures a balanced **`8.801255x`** slower than live kernel ext4, both gates passing — confirming the banked `8.428754x` and retiring the voided run that suggested a regression
+
+The previous entry owed this figure after the gate refused a loaded attempt. The window came back and
+both directions passed.
+
+**Instrument.** `scripts/perf/xattr_ab/run_xattr.sh`, ONE invocation per direction with four live
+mounts: two kernel ext4 ro mounts (`k1`, `k2`) and **two FrankenFS mounts BOTH in the shipping
+default**, arm order rotated per round, 24 rounds x 2,000 reports. Two identical FrankenFS arms give a
+FUSE A/A null as well as the kernel one. ELF
+`df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`.
+
+| direction | kernel tail `k1`/`k2` | gate | kernel A/A | FUSE A/A |
+|---|---|---|---|---|
+| forward (`shipA`@cpu18) | `1.0290` / `1.0750` | **ADMIT** | `0.999472` | `0.912747` |
+| mirrored (`shipA`@cpu19) | `1.0715` / `1.0289` | **ADMIT** | `1.004311` | `1.085818` |
+
+**The FUSE A/A null is the interesting part, and it is why one direction would have been wrong.** Two
+IDENTICAL shipping arms disagreed by **8.7%** in the forward run (floors 277.1 vs 303.6 ms) — and the
+disagreement INVERTED to `1.085818` when the cpusets were swapped. That is core placement, not the
+filesystem, and it balances out: `sqrt(0.912747 x 1.085818)` = **`0.995529`**, unity to 0.45%. The
+kernel A/A balances to `1.001889`. A single-direction figure on this row would have carried a ~9%
+placement bias.
+
+| estimator | forward | mirrored | **balanced** |
+|---|---|---|---|
+| floor (`min`) | `8.666013x` | `8.938608x` | **`8.801255x` SLOWER** |
+| mean-of-4-lowest | `8.940297x` | `9.163357x` | `9.051140x` SLOWER |
+
+The two estimators agree to 2.76%. Absolute floors: kernel `33.457`/`33.475` and `33.493`/`33.350` ms;
+FrankenFS `277.075`/`303.562` and `311.297`/`286.693` ms.
+
+**This CONFIRMS the banked `8.428754x`** — measured `8.801255x` is 4.4% higher, which is ordinary
+session-to-session movement on a row measured months apart on a shared host, and is nowhere near a
+regression. The worst row is still the worst row, and it is still `~8.8x`.
+
+**It also retires the previous entry's voided run**, which produced `12.465548x` and which I refused
+to publish because its own instrument checks failed (kernel tail `1.2596`/`1.3279`, FUSE A/A 6% off).
+That refusal is now vindicated by measurement rather than by policy alone: in a gate-passing window
+the same row, same ELF, same fixture reads `8.80x`. **The `12.47x` was the loaded host, exactly as
+called at the time** — worth recording, because the temptation in the moment was to treat a dramatic
+number as a discovery.
+
+**Mechanism, unchanged and already counted:** `2.000` blocking crossings per user xattr syscall = 1.0
+for the user's own answer + 1.0 for the audit capability probe, with the daemon doing `0.090%` of the
+work (9 handler entries for 10,000 ops, memo hit rate `99.956%`). The `~8.8x` is what two blocking
+round trips cost against an incumbent that answers in-process — the kernel arm's floor is `33.4 ms`
+where ours is `277–311 ms`.
+
+Nothing shipped, nothing reverted.
