@@ -11340,10 +11340,51 @@ impl OpenFs {
                 return Ok(end);
             }
         }
+        // bd-cjqhh: miss against the mount-time list -> retry against the live one.
+        if let Some(live) = self.btrfs_live_chunks() {
+            let pp = live.partition_point(|c| c.key.offset <= logical);
+            if pp > 0 {
+                let chunk = &live[pp - 1];
+                if let Some(end) = chunk.key.offset.checked_add(chunk.length)
+                    && logical < end
+                {
+                    return Ok(end);
+                }
+            }
+        }
         Err(FfsError::Corruption {
             block: logical,
             detail: "logical bytenr not covered by any btrfs chunk".into(),
         })
+    }
+
+    /// bd-cjqhh: the live chunk list, fetched only when the mount-time one misses.
+    ///
+    /// `BtrfsContext` is built once at open and never refreshed, so a chunk grown
+    /// during this mount is absent from `ctx.chunks` and every consumer of it
+    /// reports "not covered by any btrfs chunk". This is the shared fallback for
+    /// those consumers: it is NOT on the hot path — callers try the mount-time list
+    /// first and only reach here on a miss, which cannot happen unless growth ran.
+    ///
+    /// `try_read` rather than `read`: these consumers are reachable while a commit
+    /// holds the allocator's write lock, and blocking there would deadlock. An
+    /// unavailable lock yields `None` and the caller's original error stands.
+    fn btrfs_live_chunks(&self) -> Option<Vec<BtrfsChunkEntry>> {
+        let Some(lock) = self.btrfs_alloc_state.as_ref() else {
+            return None;
+        };
+        let Some(state) = lock.try_read() else {
+            // bd-cjqhh: measured, not assumed — this tells a failing run whether the
+            // fallback was refused by the lock or by the tree.
+            warn!(
+                target: "ffs::btrfs::alloc",
+                "live_chunk_fallback_unavailable_lock_held"
+            );
+            return None;
+        };
+        ffs_btrfs::chunk_entries_from_chunk_tree(&state.chunk_tree)
+            .ok()
+            .filter(|live| !live.is_empty())
     }
 
     fn btrfs_checked_chunk_available(chunk_end: u64, logical: u64) -> Result<u64, FfsError> {
@@ -11409,6 +11450,11 @@ impl OpenFs {
                     );
                     parse_to_ffs_error(&e)
                 })?
+                .or_else(|| {
+                    // bd-cjqhh: grown chunks are absent from the mount-time list.
+                    self.btrfs_live_chunks()
+                        .and_then(|live| map_logical_to_physical(&live, logical).ok().flatten())
+                })
                 .ok_or_else(|| FfsError::Corruption {
                     block: logical,
                     detail: "logical bytenr not covered by any btrfs chunk".into(),
@@ -11477,6 +11523,11 @@ impl OpenFs {
                     );
                     parse_to_ffs_error(&e)
                 })?
+                .or_else(|| {
+                    // bd-cjqhh: grown chunks are absent from the mount-time list.
+                    self.btrfs_live_chunks()
+                        .and_then(|live| map_logical_to_physical(&live, logical).ok().flatten())
+                })
                 .ok_or_else(|| FfsError::Corruption {
                     block: logical,
                     detail: "logical bytenr not covered by any btrfs chunk".into(),
@@ -31860,6 +31911,69 @@ impl OpenFs {
                     demand,
                     "growth_hit_the_per_commit_chunk_cap"
                 );
+            }
+
+            // ── DATA space (bd-cjqhh) ───────────────────────────────────────
+            //
+            // Growth was METADATA-ONLY: `plan_growth_for_commit` asks
+            // `commit_metadata_shortfall`, which queries only
+            // `allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA)`, so a workload
+            // exhausting DATA extents was invisible to it and the data allocator
+            // returned `NoSpace` with the device almost entirely unallocated.
+            //
+            // Low-water mark is a FRACTION of the device: a first attempt used
+            // `policy.target(ChunkKind::Data, total)`, which on a 1 GiB device is
+            // the whole device, so it grew on every commit.
+            {
+                let data_low_water = (device.total_bytes / 16)
+                    .min(policy.target(ffs_btrfs::ChunkKind::Data, device.total_bytes));
+                let data_have = alloc
+                    .extent_alloc
+                    .allocatable_bytes(BTRFS_BLOCK_GROUP_DATA);
+                if data_have < data_low_water {
+                    let shortfall = data_low_water - data_have;
+                    match ffs_btrfs::plan_growth_for_shortfall(
+                        &chunks,
+                        ffs_btrfs::ChunkKind::Data,
+                        shortfall,
+                        &device,
+                        &policy,
+                    ) {
+                        Ok(Some(plan)) => {
+                            let bytes_used_after = plan.dev_bytes_used_after;
+                            let new_chunk = plan.chunk.clone();
+                            let length = plan.chunk.length;
+                            let state = &mut *alloc;
+                            match ffs_btrfs::apply_chunk_allocation(
+                                &plan,
+                                &mut state.chunk_tree,
+                                &mut state.dev_tree,
+                                &mut state.extent_alloc,
+                                None,
+                            ) {
+                                Ok(()) => {
+                                    state.chunk_trees_dirty = true;
+                                    device.bytes_used = bytes_used_after;
+                                    chunks.push(new_chunk);
+                                    warn!(
+                                        target: "ffs::btrfs::alloc",
+                                        shortfall, length, data_have, data_low_water,
+                                        "grew_a_data_chunk"
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    target: "ffs::btrfs::alloc", error = ?e,
+                                    "data_growth_apply_refused"
+                                ),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            target: "ffs::btrfs::alloc", error = ?e, shortfall,
+                            "data_growth_could_not_be_planned"
+                        ),
+                    }
+                }
             }
 
             // ── SYSTEM space for the chunk tree itself (bd-a136s) ───────────
