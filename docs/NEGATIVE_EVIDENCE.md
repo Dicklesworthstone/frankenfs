@@ -20231,3 +20231,66 @@ performance from them.
 ELF `0f5341d7803e478ba8b006b46cfb3888cef1f7f7d7cc18253709d5f2f734809d` (release, HEAD + both resolver
 fixes). Failed-attempt ELF `2552b81763f68db3bdaa3b24bee6cef4fba7833fb50327e267ab1e9dcfcfd169`.
 `hostname=thinkstation1`.
+
+## 2026-08-27 — bd-cjqhh: the third consumer needed LOCK-FREE publication, not another fallback (measured: the write path holds the allocator write lock) — data growth now reaches `24,117,248` bytes against the kernel's `67,108,864`, up from `16,711,680`, and STILL rejects at bd-k74ef's reservation guard
+
+The previous entry fixed two stale-map consumers and named a third. Fixing it revealed that the
+approach itself was wrong for the write path, and the measurement said so rather than an argument.
+
+**A lock-based fallback CANNOT serve the write path — measured, not inferred.** I added the same
+miss-only fallback to the three remaining `ffs-core` consumers (`btrfs_logical_chunk_end` and the two
+`map_logical_to_physical` sites that emit "logical bytenr not covered by any btrfs chunk"), using
+`try_read` to avoid deadlock. It still failed. Rather than assume why, I instrumented the fallback's
+refusal path and re-ran: **exactly 1 `live_chunk_fallback_unavailable_lock_held` against exactly 1
+failure.** `btrfs_write_logical`'s callers already hold the allocator's WRITE lock, so a `try_read`
+there is refused by construction — the deadlock-avoidance that makes the fallback safe is precisely
+what makes it useless on the path that needs it.
+
+**So the fix is lock-free publication.** A new `btrfs_grown_chunks: arc_swap::ArcSwapOption<Vec<…>>`
+on the filesystem struct (the struct already carries three `ArcSwap` fields), stored through `&self`
+when growth applies a chunk, and read by the fallback BEFORE it ever touches the lock. `ArcSwap` is
+readable while the write lock is held, which is the one property the write path requires. One field,
+one constructor line, one store, one load.
+
+**MEASURED RESULT — real progress, still a reject:**
+
+| | before this turn | with lock-free publication | live kernel btrfs |
+|---|---|---|---|
+| bytes written before failure | **16,711,680** | **24,117,248** | **67,108,864** |
+| blocks | 255 | **368** | 1024 |
+| fsyncs completed | 16 | **23** | 65 |
+| share of the kernel's throughput reached | 24.9% | **35.9%** | 100% |
+| "not covered by any chunk" errors | 1 | **0** | — |
+| lock-held fallback refusals | 1 | **0** | — |
+| acknowledged writes lost | 0 | **0** | — |
+
+The entire stale-map consumer class is now closed: zero mapping errors, zero lock refusals.
+
+**STILL REJECTED, at a fourth and different layer — and this one is a guard doing its job:**
+
+```
+fsync errno=5: bd-k74ef: extent tree has 5 blocks but 4 addresses were reserved
+and described; refusing to write
+```
+
+Growing a data chunk inserts extent-tree items, and it happens AFTER the commit has computed and
+reserved its extent-tree address count. The guard refuses the write rather than emitting a tree it
+cannot describe — which is why `writes lost` is 0 and the image is not corrupted. **This is the
+campaign's own safety machinery catching my change**, and it is a correct refusal, not a bug to route
+around. Fixing it means accounting for growth-induced extent-tree growth in the reservation, i.e.
+ordering growth before the reservation is computed or re-reserving after it.
+
+**What is kept and why.** All resolver fixes, the lock-free publication, and the data-growth block
+stay, because `FFS_BTRFS_GROW_CHUNKS` is **default OFF**: nothing changes for any shipping mount.
+With the knob on, the feature is now strictly more capable than before (44% more data written) and
+fails SAFE with no data loss, where the previous state failed earlier. Verified: `ffs-core` btrfs
+**402 passed / 0 failed**, `ffs-btrfs` **429 passed / 0 failed**, and with growth off the write row is
+byte-identical to baseline (`192` blocks, `nvcsw` `2.0677`, `3,547` page faults, 0 errors).
+
+**Scope note on the number:** `instr_per_op.sh` runs the kernel arm and the FUSE arm sequentially in
+one script, not interleaved with A/A nulls. The figures above are therefore a FUNCTIONAL measure —
+how far each arm gets before failing — and not a vs-incumbent performance ratio, which this row cannot
+have until the workload completes.
+
+ELF `e9cef5806af18c0a8ecd682e05f58efff79a5c83bd0c30d661dbab91f0295fbd` (release, HEAD + all fixes).
+`hostname=thinkstation1`.

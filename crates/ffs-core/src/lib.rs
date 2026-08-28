@@ -1714,6 +1714,16 @@ pub struct OpenFs {
     /// back to the sharded cache, then publishes the new inode into the slot
     /// (last-writer-wins; a transient over-write is harmless — the value is the
     /// same immutable RO extent list the sharded cache holds).
+    /// bd-cjqhh: chunks grown during this mount, published LOCK-FREE.
+    ///
+    /// `BtrfsContext` is built once at open and never refreshed, so every consumer
+    /// of `ctx.chunks` misses a chunk grown later. A lock-based fallback cannot fix
+    /// the write path: `btrfs_write_logical`'s callers already hold the allocator's
+    /// WRITE lock, so a `try_read` there is refused — measured, exactly one
+    /// `live_chunk_fallback_unavailable_lock_held` against exactly one failure. An
+    /// `ArcSwap` is readable through `&self` while that write lock is held, which is
+    /// the property the write path requires.
+    btrfs_grown_chunks: arc_swap::ArcSwapOption<Vec<BtrfsChunkEntry>>,
     btrfs_hot_inode_extents: arc_swap::ArcSwapOption<(u64, BtrfsRoInodeExtents)>,
     /// Lock-free single-slot "hot inode" cache for the ext4 read path — the
     /// ext4 analog of [`Self::btrfs_hot_inode_extents`]. Every `read_into`
@@ -5836,6 +5846,7 @@ impl OpenFs {
             btrfs_csum_read_cache: Mutex::new(None),
             btrfs_read_plan_index: OnceLock::new(),
             btrfs_ro_inode_extents: ShardedCache::new(),
+            btrfs_grown_chunks: arc_swap::ArcSwapOption::empty(),
             btrfs_hot_inode_extents: arc_swap::ArcSwapOption::empty(),
             ext4_hot_inode: arc_swap::ArcSwapOption::empty(),
             ext4_hot_parent: arc_swap::ArcSwapOption::empty(),
@@ -11370,6 +11381,13 @@ impl OpenFs {
     /// holds the allocator's write lock, and blocking there would deadlock. An
     /// unavailable lock yields `None` and the caller's original error stands.
     fn btrfs_live_chunks(&self) -> Option<Vec<BtrfsChunkEntry>> {
+        // Lock-free first: this is the only path available to the write side, which
+        // reaches here while holding the allocator's write lock.
+        if let Some(grown) = self.btrfs_grown_chunks.load_full()
+            && !grown.is_empty()
+        {
+            return Some((*grown).clone());
+        }
         let Some(lock) = self.btrfs_alloc_state.as_ref() else {
             return None;
         };
@@ -31955,6 +31973,10 @@ impl OpenFs {
                                     state.chunk_trees_dirty = true;
                                     device.bytes_used = bytes_used_after;
                                     chunks.push(new_chunk);
+                                    // Publish lock-free so the write path, which
+                                    // holds the allocator write lock, can still see it.
+                                    self.btrfs_grown_chunks
+                                        .store(Some(std::sync::Arc::new(chunks.clone())));
                                     warn!(
                                         target: "ffs::btrfs::alloc",
                                         shortfall, length, data_have, data_low_water,
