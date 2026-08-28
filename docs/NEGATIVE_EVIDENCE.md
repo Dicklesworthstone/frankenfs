@@ -19472,3 +19472,65 @@ has been closed off by measurement instead of being recommended on a plausible m
 
 ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
 `hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
+
+## 2026-08-27 — the create/delete storm decomposed: a MUTATING-METADATA row behaves nothing like the read rows — `6.018` blocking crossings per create against the kernel's `0.0065`, the audit probe is only `27.1%` of it, and the deterministic metric diverges from wall time by two orders of magnitude
+
+Every row this campaign has put on the blocking-crossings scale is either a READ row (~99% round trip,
+daemon idle, audit probe dominant) or bulk durable write. The storm is neither: it is mutating
+metadata, which routes through `DispatchGate::exclusive()`. The model had never been tested there, and
+it does not carry.
+
+**Instrument.** `scripts/perf/create_delete_storm_ab/{stormblockprobe.c,storm_blocking.sh}`: one
+client binary over identically-prepared btrfs fixtures on one host, live kernel btrfs `--rw` mount vs
+FrankenFS `--rw`, 4,000 creates then 4,000 unlinks, single-threaded. Create and unlink counted
+SEPARATELY — the readdir+stat row already caught this campaign treating a two-phase workload as one
+number. Both fixtures prepared through the kernel so neither arm is privileged. ELF
+`df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff`. `hostname=thinkstation1`.
+
+| quantity | kernel btrfs (live incumbent) | FrankenFS |
+|---|---|---|
+| blocking crossings / create | `0.0065` | **`6.0180`** |
+| blocking crossings / unlink | `0.0095` | **`5.7618`** |
+| ratio, create | — | **`926x`** |
+| ratio, unlink | — | **`607x`** |
+
+Repeat run: `6.0412` / `5.9188` (0.4% and 2.7%), with `crossings_lookup` 8,003, `crossings_getxattr`
+16,006 and `crossings_other` 20,006 **bit-exact** across both; only `crossings_getattr` moved
+(11,118 → 11,827).
+
+**Composition, 8,000 operations — and the audit probe is NOT the story here:**
+
+| component | per op | share |
+|---|---|---|
+| lookup | `1.000` | 13.5% |
+| getattr | `1.390` | 18.8% |
+| **getxattr (audit probe)** | `2.001` | **27.1%** |
+| create / unlink / flush / release | `2.501` | 33.8% |
+| **total** | **`7.392`** | |
+
+Against ~50% of crossings on the xattr row and 100% on warm stat, the probe is barely a quarter of
+this one. **The storm is the first row whose dominant cost is our own protocol traffic rather than the
+audit probe.**
+
+**And the daemon actually works here.** `op_counts getattr=11,118` against `crossings_getattr=11,118`
+— **every getattr reaches a handler**, where warm stat's attribute cache absorbed all 20,000 of them
+(1 crossing per 20,000 stats). Newly created and freshly unlinked inodes cannot be served from cache,
+so this row exercises the filesystem rather than the boundary.
+
+**⚠ THE DETERMINISTIC METRIC AND WALL TIME DIVERGE BY TWO ORDERS OF MAGNITUDE HERE, and that is the
+most important sentence in this entry.** `926x` blocking crossings against a banked wall-time ratio of
+about `3.5x`. There is no contradiction: the kernel performs buffered metadata mutation with almost NO
+blocking at all (26–38 voluntary context switches for 8,000 operations) but still does real CPU work
+per operation, so a metric that counts only blocking makes its cost look like zero. This is the
+starkest demonstration yet of the rule this ledger has repeated all session — **blocking-crossing
+count is a mechanism and a floor, never a time model** — and on a row where the incumbent's cost is
+pure CPU rather than waiting, the two metrics are not even the same order of magnitude. Nobody should
+quote `926x` as this row's performance.
+
+**What it means for target selection.** On the read rows the deterministic ranking tracked the
+wall-time ranking; here it does not, because the incumbent's blocking is near zero. The usable finding
+is the COMPOSITION, not the ratio: `7.392` crossings per mutating operation, of which only 27% is the
+audit probe and 34% is create/unlink/flush/release traffic that is ours. That is where a storm lever
+would have to come from, and it is a different target class from everything the read side produced.
+
+Nothing shipped, nothing reverted.
