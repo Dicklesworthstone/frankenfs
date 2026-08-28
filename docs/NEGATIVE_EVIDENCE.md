@@ -18887,3 +18887,115 @@ and this row now has a concrete reason to extend it into `ffs-block`.
 `hostname=thinkstation1`. Nothing shipped, nothing reverted; no timing claimed. The measured facts on
 this row are unchanged: `12.69`–`18.40` first-touch faults per 64 KiB write op, per WRITE OP rather
 than per distinct block.
+
+## 2026-08-27 — bd-cjqhh CLOSED: the write-fault mechanism is fully characterised, the fix candidate is named, and the reason it resists a landed fix is a PROJECT RULE plus an unconfirmed branch — not a measurement gap
+
+Ten turns on this row. Closing it with what is established, what is not, and why I am not landing a
+fix, rather than re-instrumenting it again.
+
+**ESTABLISHED BY MEASUREMENT (all deterministic, reproducing to `0.01%`–`0.4%`):**
+
+| fact | evidence |
+|---|---|
+| FrankenFS executes `2.48x` the kernel's instructions for byte-identical durable write work | 124,547,223 vs 50,174,974 over 192 blocks / 12,582,912 B / 13 fsyncs, both arms verified equal |
+| `83.3%` of our instructions are in the daemon | client 20,772,654 vs daemon 103,774,569 |
+| The daemon's cost is memory churn, not filesystem logic | fault profile: `86.44%` of daemon page faults caused by `__memmove_avx_unaligned_erms` |
+| `12.69`–`18.40` first-touch faults per 64 KiB write op, linear in bytes | 3/6/12 MiB → 890/1758/3548 faults, ratios 1.976 and 2.018 |
+| The allocation is per WRITE OP, not per distinct block | rewrite mode: one distinct block, 192 ops → **2,437** faults, where per-block allocation predicts ~16 |
+
+**FOUR ATTESTED NEGATIVES**, each with the lever-ran proof: `FFS_MVCC_FLUSH_BUF_REUSE` (faults
+3,557→3,551, instructions `+1.8%`); jemalloc `retain:true,dirty_decay_ms:-1,muzzy_decay_ms:-1` (faults
+3,551→3,547, proven to reach jemalloc via `abort_conf` on an invalid option); allocation size class
+(4/16/64 KiB → 4,686/3,688/3,497 faults, tracking data volume not allocation count); and flush
+frequency (`SYNC_EVERY` 4/16/64 → 3,496/3,547/3,592, a 16x change moving faults 2.7%).
+
+**THE FIX CANDIDATE.** `AlignedVec::from_vec` takes ownership with no copy when the incoming `Vec` is
+already alignment-aligned, and otherwise allocates `vec![0_u8; …]` — fresh zeroed pages — and
+`copy_from_slice`s into it. Zero-fill followed immediately by a full overwrite is the redundant work,
+and the fresh mapping is what faults.
+
+**WHY IT RESISTS A LANDED FIX — two reasons, neither of which is "I could not measure it".**
+
+1. **The direct fix is forbidden by project rule.** Skipping the zero-fill means allocating
+   uninitialised storage (`MaybeUninit` or equivalent). `crates/ffs-block/src/lib.rs:1` is
+   `#![forbid(unsafe_code)]` and AGENTS.md forbids unsafe workspace-wide. That is a standing rule I
+   will not break for a perf lever, so this fix cannot be written as specified.
+
+2. **The safe alternative targets a branch I cannot show executes.** The safe form is to avoid the
+   realignment copy (make the payload arrive aligned) or to fill via `with_capacity` +
+   `extend_from_slice` instead of zero-then-overwrite. Both only pay if `from_vec` actually takes its
+   copy branch — and jemalloc returns 64 KiB allocations page-aligned, which would make it take the
+   NO-COPY branch and the fix inert. My attempt to settle it by counting `copy_detected` produced zero
+   events, but ALSO zero `buffer_alloc` and zero `ffs::block::io` lines of any kind, so the tracing
+   target never reached the log: **a silent instrument, not a null.** Landing a change on that basis
+   would be shipping an unmeasured no-op, which is precisely what this ledger exists to prevent.
+
+**WHAT WOULD UNBLOCK IT**, for whoever picks it up: a plain atomic counter incremented in the
+`copy_detected` branch and reported on the census line in the style of `crossings_*` — independent of
+the tracing subscriber. That single counter decides between "the copy fires per write, and the safe
+fix is worth `~12.69` faults/op" and "the copy never fires, and the memmove is elsewhere". It is one
+counter, not another measurement campaign.
+
+**Also fixed and landed during this row, so it is not lost in the close:** the bd-6uyto residual at
+`ExtentAllocator::set_nodesize` (extent-tree leaves split by item COUNT, overflowing a 16 KiB node at
+224 items and failing `fsync` with EINVAL, then losing acknowledged writes) — fixed, `ffs-btrfs`
+429/0 and `ffs-core` btrfs 402/0. And `FFS_BTRFS_GROW_CHUNKS` is now attestable on the knob line. The
+row's remaining blocker above 16 MiB is DATA-chunk growth, which chunk growth attested ON does not
+provide.
+
+Closing. Next cell by the deterministic ranking is btrfs `readdir+stat`, the worst row not yet
+decomposed with these instruments.
+
+## 2026-08-27 — next cell: btrfs `readdir+stat` decomposed deterministically — READDIR IS AT PARITY (`20` vs `23` blocking crossings for the whole sweep) and the entire row is the per-entry stat at `1.9764` blocking crossings, which the census splits exactly into `1.0` LOOKUP + `1.0` capability probe
+
+bd-cjqhh is closed. Taking the worst cell not yet decomposed with these instruments, and putting it on
+the same blocking-crossings scale as the rest.
+
+**Instrument.** `scripts/perf/readdir_stat_btrfs_ab/{rdblockprobe.c,rd_blocking.sh}`: one client binary
+over one fixture on one host, against a LIVE kernel btrfs ro loop mount and a FrankenFS mount.
+8,192-entry directory built THROUGH A KERNEL MOUNT so btrfs lays out its own DIR_INDEX/DIR_ITEM keys.
+`ru_nvcsw` counted separately for the readdir sweep and for the stat pass, because the campaign's other
+rows showed the two behave differently. ELF
+`b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
+`hostname=thinkstation1`. Counts only; no wall time claimed.
+
+| quantity | kernel btrfs (live incumbent) | FrankenFS |
+|---|---|---|
+| `nvcsw`, whole readdir sweep of 8,192 entries | 23 | **20** |
+| `nvcsw`, 8,192 stats | 156 | **16,191** |
+| **blocking crossings per stat** | `0.0190` | **`1.9764`** |
+| digest | identical | identical |
+
+**FINDING 1 — READDIR IS AT PARITY, and that is a positive result worth stating plainly.** The entire
+8,192-entry sweep costs us **20** blocking crossings against the kernel's 23. The census shows why:
+`crossings_readdir=17` and `crossings_readdirplus=2` for 8,192 entries — our readdir amortises
+thousands of entries into a handful of round trips, exactly as the kernel's does. **None of this row's
+loss is in readdir.**
+
+**FINDING 2 — the whole row is the per-entry stat, and the census splits it exactly.**
+`1.9764` blocking crossings per stat, and the daemon's census over the same run reports
+`crossings_lookup=8000` and `crossings_getxattr=8196` against 8,192 stats — **`1.0` LOOKUP plus `1.0`
+capability probe per entry, summing to the measured `~2.0`**. Nothing else is material
+(`crossings_getattr=1` for the whole run: the attribute cache absorbs every `getattr`, the same as on
+the warm-stat row).
+
+**This places the row exactly on the campaign's scale**, and it lands level with the worst cell:
+
+| row | blocking crossings per op | composition |
+|---|---|---|
+| ext4 `xattr-get-list-report` | `2.000` | 1.0 user xattr op + 1.0 capability probe |
+| **btrfs `readdir+stat`** | **`1.9764`** | **1.0 cold LOOKUP + 1.0 capability probe** |
+| btrfs warm stat | `1.000` | 1.0 capability probe only (dentry already cached) |
+| ext4 parallel read | `0.855` | open/getxattr/flush amortised over a 256 KiB read |
+
+**readdir+stat is warm stat plus a cold dentry lookup.** The difference between `1.000` and `1.9764`
+is exactly the LOOKUP that warm stat does not pay because its single path is already resolved.
+
+**What each half is worth, and who owns it.** The capability-probe half is the audit-forced probe this
+campaign has already characterised — unconditional on this host, `1.000` per path resolution, removable
+only by `ENOSYS` (a lie on an image with xattrs) or by an audit-configuration change that needs
+operator approval. **The LOOKUP half is genuinely ours and is the newly-actionable part of this row**:
+a cold path resolution costs one full FUSE round trip per entry, where the kernel's costs `0.0190`.
+The kernel arm proves the work itself is nearly free; the cost is that we are across a boundary.
+
+Nothing shipped, nothing reverted.
