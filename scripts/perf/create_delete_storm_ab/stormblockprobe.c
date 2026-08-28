@@ -60,8 +60,16 @@ int main(int argc, char **argv) {
     }
     long v1 = nvcsw();
 
+    // CREATE-ONLY mode: the invalidation knobs were measured to leave the create
+    // phase FLAT (6.03/6.00/6.00/6.01), so create's six blocking crossings are
+    // something else entirely -- and the census read so far has been aggregated
+    // over both phases, which cannot show what one create actually costs. Skipping
+    // the removal phase makes the daemon's per-opcode census attributable to
+    // creates alone.
+    int no_remove = getenv("STORMPROBE_CREATE_ONLY") != NULL;
+
     int removed = 0;
-    for (int i = 0; i < created; i++) {
+    for (int i = 0; !no_remove && i < created; i++) {
         snprintf(path, sizeof(path), "%s/storm/f-%06d", dir, i);
         if (unlink(path) == 0) removed++;
     }

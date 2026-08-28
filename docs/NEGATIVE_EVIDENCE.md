@@ -19587,3 +19587,57 @@ NEGATIVE dentry, or an entry surviving past its TTL.
 
 ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
 `hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
+
+## 2026-08-27 — storm CREATE phase isolated: one `open(O_CREAT|O_EXCL)`+`close` costs `8.02` crossings of which `6.02` block; the create-time invalidation is `1.0` crossing that does NOT block, and the post-create `getattr` is NOT self-inflicted
+
+The invalidation A/B left the create phase flat (`6.03`/`6.00`/`6.00`/`6.01`) while the removal phase
+moved 27%, and the census had been aggregated over both phases so it could not say what ONE create
+costs. Added `STORMPROBE_CREATE_ONLY` and isolated it.
+
+**One create, 4,000 of them, from the daemon's own census:**
+
+| opcode | crossings / create | blocks the client? |
+|---|---|---|
+| lookup | `1.00` | yes |
+| **getxattr (audit probe)** | **`2.00`** | yes |
+| create | `1.00` | yes |
+| getattr | `1.02` | yes |
+| flush | `1.00` | yes |
+| release | `1.00` | **no** (async, per the RELEASE finding) |
+| **total** | **`8.02`** | **`6.02` blocking** |
+
+**FINDING 1 — the probe rate DOUBLES on create.** Every read row measured `1.000` audit capability
+probes per path-based operation. A create pays **`2.00`**. That is the first operation found to pay
+two, and it makes the audit probe 25% of the create phase's crossings on its own.
+
+**FINDING 2 — the create-time invalidation costs a crossing but NOT a blocking one.** Isolated to the
+create phase, with each knob attested:
+
+| config | blocking / create | `crossings_total` | `crossings_getattr` |
+|---|---|---|---|
+| baseline | `6.0023` | 32,027 | 4,011 |
+| `FFS_FUSE_CREATE_INVAL=0` | `6.0003` | **28,017** | 4,003 |
+| `FFS_FUSE_ENTRY_INVAL=0` | `6.0000` | **28,016** | 4,002 |
+| `FFS_FUSE_PARENT_INVAL=0` | `6.0008` | 32,018 | 4,002 |
+
+Disabling it removes **exactly `1.0` crossing per create** (32,027 → 28,017) while leaving blocking
+crossings **unchanged to 0.03%**. It is the daemon→kernel notification, which the client never waits
+on — so on the create path the invalidation is **daemon CPU, not client latency**.
+
+**That is an asymmetry worth stating, because the obvious generalisation from the previous entry is
+wrong.** On the REMOVAL path the same knob was worth `5.7475 → 4.1742` BLOCKING crossings; on the
+CREATE path it is worth zero blocking crossings. "Invalidation costs the client" is true for removals
+and false for creates. A lever aimed at create-time invalidation would buy daemon CPU only, and the
+previous entry's measured 27% belongs entirely to the removal phase.
+
+**FINDING 3 — the post-create `getattr` is NOT ours.** `reply.created(&ATTR_TTL, …)`
+(`ffs-fuse/src/lib.rs:7113`) does attach an attribute TTL, so the kernel should not need to ask — yet
+it asks once per create (`~1.0`), and that count is **unmoved by all three invalidation knobs**
+(4,011 / 4,003 / 4,002 / 4,002). So it is not self-inflicted by our cache invalidation. **I have not
+identified what does cause it and I am not going to guess** — this row has already cost me three
+withdrawn code-reading attributions elsewhere in this ledger. It is `1.0` of the `6.02` blocking
+crossings per create (17%), and it is the largest single unexplained item left in the create phase.
+
+Nothing shipped, nothing reverted. ELF
+`df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`. Counts only.

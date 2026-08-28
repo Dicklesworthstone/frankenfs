@@ -33,7 +33,7 @@ sudo -n losetup --direct-io=on "$dev" 2>/dev/null || true
 LOOPS="$LOOPS $dev"
 sudo -n mount "$dev" "$KMNT"
 echo "--- kernel btrfs (live incumbent)"
-taskset -c 8 "$W/stormblockprobe" "$KMNT" "$N"
+env ${PROBEENV:-} taskset -c 8 "$W/stormblockprobe" "$KMNT" "$N"
 sudo -n umount "$KMNT"
 
 fdev=$(sudo -n losetup --find --show "$W/simgb-f.btrfs")
@@ -47,7 +47,7 @@ fpid=$!
 for _ in $(seq 1 300); do mountpoint -q "$FMNT" && break; kill -0 "$fpid" 2>/dev/null || break; sleep 0.1; done
 mountpoint -q "$FMNT" || { echo "fuse mount never came up"; tail -8 "$W/storm-fuse.log"; exit 1; }
 echo "--- FrankenFS (FUSE, --rw)"
-taskset -c 8 "$W/stormblockprobe" "$FMNT" "$N"
+env ${PROBEENV:-} taskset -c 8 "$W/stormblockprobe" "$FMNT" "$N"
 fusermount3 -u "$FMNT"; wait "$fpid" 2>/dev/null || true
 grep -o "mount_candidate_crossings,.*" "$W/storm-fuse.log" | tail -1 \
   | grep -oE "crossings_(lookup|getattr|getxattr|create|unlink|other|total)=[0-9]+" \
