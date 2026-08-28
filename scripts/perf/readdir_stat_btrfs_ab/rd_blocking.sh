@@ -33,7 +33,7 @@ sudo -n losetup --direct-io=on "$dev" 2>/dev/null || true
 LOOPS="$LOOPS $dev"
 sudo -n mount -o ro "$dev" "$KMNT"
 echo "--- kernel btrfs (live incumbent)"
-taskset -c 8 "$W/rdblockprobe" "$KMNT"
+env ${PROBEENV:-} taskset -c 8 "$W/rdblockprobe" "$KMNT"
 sudo -n umount "$KMNT"
 
 cp "$W/bimgr-base.btrfs" "$W/bimgr-f.btrfs"
@@ -49,7 +49,7 @@ fpid=$!
 for _ in $(seq 1 300); do mountpoint -q "$FMNT" && break; kill -0 "$fpid" 2>/dev/null || break; sleep 0.1; done
 mountpoint -q "$FMNT" || { echo "fuse mount never came up"; tail -8 "$W/rdb-fuse.log"; exit 1; }
 echo "--- FrankenFS (FUSE)"
-taskset -c 8 "$W/rdblockprobe" "$FMNT"
+env ${PROBEENV:-} taskset -c 8 "$W/rdblockprobe" "$FMNT"
 fusermount3 -u "$FMNT"; wait "$fpid" 2>/dev/null || true
 echo "  attested knobs:"
 grep -o "fuse_dispatch_workers=[0-9]*" "$W/rdb-fuse.log" | tail -1 | sed 's/^/    /'

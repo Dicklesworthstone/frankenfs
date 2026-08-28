@@ -18999,3 +18999,62 @@ a cold path resolution costs one full FUSE round trip per entry, where the kerne
 The kernel arm proves the work itself is nearly free; the cost is that we are across a boundary.
 
 Nothing shipped, nothing reverted.
+
+## 2026-08-27 — readdir+stat CORRECTION: the "1.0 cold LOOKUP per entry, genuinely ours" from my last entry is an ARTIFACT OF MY PROBE'S ACCESS PATTERN — a realistic interleaved client engages READDIRPLUS, `crossings_lookup` collapses `8000 -> 1`, and the row halves to `1.0056` blocking crossings per stat
+
+My last entry decomposed readdir+stat as `1.9764` blocking crossings per stat = `1.0` cold LOOKUP +
+`1.0` capability probe, and called the LOOKUP half "genuinely ours and the newly-actionable part of
+this row". **That half does not survive a realistic client.**
+
+**The suspicion was structural, not incidental.** My probe read ALL 8,192 names and then stat'ed them
+in a second pass. The kernel chooses READDIRPLUS adaptively — it stops issuing it when the attributes
+it prefetched go unused — so a phased probe can talk the kernel out of plus and then bill FrankenFS
+for the lookups plus never had a chance to avoid. `ls -l`, and every real directory-listing client,
+interleaves. So I added an interleaved mode as the control for my own instrument.
+
+| quantity | phased (my last entry) | **interleaved (`ls -l` shape)** |
+|---|---|---|
+| FrankenFS blocking crossings / stat | `1.9764` | **`1.0056`** |
+| `crossings_lookup` | 8,000 | **1** |
+| `crossings_readdir` | 17 | **0** |
+| `crossings_readdirplus` | 2 | **45** |
+| `crossings_getxattr` | 8,196 | 8,196 |
+| `crossings_total` | 16,221 | **8,248** |
+| kernel blocking crossings / stat | `0.0190` | `0.0219` |
+
+Digest `10069978255546022933` is IDENTICAL across all four cells — both arms, both modes — so every
+configuration served the same metadata and the comparison is sound. The interleaved figures reproduced
+exactly on a repeat run.
+
+**FINDING — FrankenFS's READDIRPLUS works, and does exactly its job.** Interleaving flips the sweep
+from 17 plain readdir crossings to 45 readdirplus crossings, the kernel's dentry cache is populated
+from them, and **8,000 LOOKUP round trips become 1**. Total crossings halve. This is a FrankenFS
+feature behaving correctly under the access pattern it exists for, and my phased probe was hiding it.
+
+**CORRECTION, stated plainly.** The `1.0` LOOKUP per entry in the previous entry is a property of my
+probe, not of the row. It should not be quoted as a FrankenFS cost, and the "newly actionable"
+label I attached to it is WITHDRAWN — there is nothing to fix there, because a realistic client
+already does not pay it.
+
+**What the row actually is.** For an interleaved client, readdir+stat costs **`1.0056` blocking
+crossings per stat, and `crossings_getxattr=8196` says all of it is the audit capability probe** —
+the same single cost as the warm-stat row's `1.000`. Readdir itself remains at parity (the sweep is 45
+crossings for 8,192 entries).
+
+**This collapses the read side to one rule.** Every path-based metadata op pays exactly ONE blocking
+crossing for the audit capability probe; an op additionally pays one more only if the round trip is
+needed for its own answer, which READDIRPLUS supplies in advance for stat:
+
+| row | blocking crossings / op | composition |
+|---|---|---|
+| ext4 `xattr-get-list-report` | `2.000` | 1.0 user xattr answer + 1.0 probe |
+| btrfs `readdir+stat`, interleaved | **`1.0056`** | **1.0 probe only** (readdirplus supplied the attrs) |
+| btrfs warm stat | `1.000` | 1.0 probe only (path already resolved) |
+| ext4 parallel read | `0.855` | open/getxattr/flush amortised over a 256 KiB read |
+
+Three of the four read rows are now ONE blocking crossing per operation, and that crossing is the same
+audit probe in every case — whose removal is an operator decision this campaign has already
+characterised and cannot take unilaterally.
+
+ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
+`hostname=thinkstation1`. Counts only; no wall time claimed. Nothing shipped, nothing reverted.
