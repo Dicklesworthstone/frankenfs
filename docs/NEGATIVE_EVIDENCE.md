@@ -19866,3 +19866,50 @@ no lever and ships no change.  Retry only with enough paired visits for a
 passing FFS A/A control; do not cite the 6.327297x provisional ratio.
 
 ELF SHA-256: `7089b3a3c7a111f6d478002b4cf53dc59d6faf839e2f2b4a84c396ce1698c629`.
+
+## 2026-08-27 — why NO client-side oracle can validate the invalidation knobs: a second, purpose-built discriminating test (`link(a,b)` staleness) ALSO passes in both arms, and the reason is structural — the FUSE reply to the client's own syscall already refreshes the cache
+
+Two entries ago I rejected the invalidation knobs' measured saving because my staleness oracle passed
+in every arm and therefore discriminated nothing, and I named what was missing: **a test that FAILS
+with the invalidation disabled.** This builds one on purpose and reports that it also fails to
+discriminate — and, more usefully, why.
+
+**The design.** The first oracle was create -> remove -> re-check, single-client and immediate, which
+only exercises cases the kernel learns about from the reply to the very syscall just made. The case it
+never reached is a mutation that changes inode A's attributes while the kernel is told only about
+inode B. **`link(a, b)` is exactly that**: it creates a new dentry `b`, and `a`'s `st_nlink` silently
+goes 1 -> 2 with nothing about `a` in the client's request. With `ATTR_TTL` at **60 seconds**
+(`ffs-fuse/src/lib.rs:639`), a cached `stat(a)` inside that window must return the stale `nlink=1` if
+nothing invalidates it. The oracle primes the cache with a `stat(a)` first, precisely so the recheck
+CAN be served from cache.
+
+**Result — it passes in both arms, with the new knob available to A/B it:**
+
+| arm | `checked` | `stale_nlink` | `stale_after_remove` | old oracle |
+|---|---|---|---|---|
+| `inode_inval` ON (default) | 200 | **0** | **0** | 0 / 800 |
+| `inode_inval` OFF | 200 | **0** | **0** | 0 / 800 |
+
+**The reason is structural, and it generalises to every oracle of this shape.** FUSE's reply to the
+mutating syscall carries the affected inode's refreshed attributes, and the kernel applies them:
+`fn link` (`lib.rs:6623`) answers with `reply.entry(&ATTR_TTL, &to_file_attr(&attr), …)` — `a`'s new
+`nlink` arrives in the reply to the client's own `link()` call. There is no staleness window for an
+invalidation to close, because the protocol already closed it.
+
+**So the invalidations do not protect against anything a single client can provoke through the mount.**
+What they can protect against is a change the client's own syscall did NOT cause — the daemon altering
+an inode autonomously, or a second independent mutator. **A single-client oracle cannot exercise that
+by construction**, and a second mount is not available: the image is opened exclusively by one daemon.
+
+**Consequence, stated as a limit rather than a licence.** The invalidation knobs' measured cost is
+real and now well characterised — `entry_inval=0` is worth `5.7475 -> 4.1742` blocking crossings on
+the removal phase and `17.6%` of the row's crossings; `inode_inval=0` is worth `1.0` kernel-side
+`fuse_invalidate_attr` per create at zero blocking cost. **Their benefit cannot be measured by any
+client-side test on this configuration.** That is not evidence they are unnecessary — it is evidence
+that this class of test cannot decide it, and anything proposing to change a default must argue from
+the daemon's autonomous-change paths, not from a passing oracle. Two oracle designs, one of them built
+specifically to fail, both non-discriminating: I am recording that as a closed line of attack rather
+than trying a third variant of the same idea.
+
+ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD).
+`hostname=thinkstation1`. Nothing shipped, nothing reverted; defaults unchanged.

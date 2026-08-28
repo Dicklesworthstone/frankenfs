@@ -39,6 +39,12 @@ mountpoint -q "$MNT" || { echo "mount never came up"; tail -8 "$W/inval-fuse.log
 
 echo "  attested: $(grep -o 'entry_inval=[a-z]*\|fuse_create_inval=[a-z]*\|parent_inval=[a-z]*' "$W/inval-fuse.log" | tail -3 | tr '\n' ' ')"
 
+# bd-avg6f: the nlink oracle runs FIRST because it is the only arm-discriminating
+# check here -- link(a,b) changes a's nlink while the kernel is told only about b.
+if [ -x "$W/nlinkoracle" ]; then
+  echo "  nlink oracle: $("$W/nlinkoracle" "$MNT" "${NLINK_N:-200}" || true)"
+fi
+
 fail=0
 for i in $(seq 1 200); do
   f="$MNT/storm/stale-$i"
