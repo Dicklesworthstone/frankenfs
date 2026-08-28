@@ -19641,3 +19641,52 @@ crossings per create (17%), and it is the largest single unexplained item left i
 Nothing shipped, nothing reverted. ELF
 `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
 `hostname=thinkstation1`. Counts only.
+
+## 2026-08-27 — the post-create `getattr`: THREE hypotheses eliminated by measurement (not ours, not close, not the fd), and a genuinely new finding — the audit probe rate is CREATION-TYPE dependent, `2.00` for `open(O_CREAT|O_EXCL)` against `1.00` for `mkdir`
+
+The previous entry named the post-create `getattr` as the largest unexplained item in the create
+phase (`1.0` of `6.02` blocking crossings) and refused to guess at its source. This measures it. The
+probe issues exactly two syscalls per file — `open(O_CREAT|O_EXCL)` and `close` — so varying the
+client's syscall shape attributes the `getattr` without kernel tracing and without speculation.
+
+| variant | `getattr` / op | `getxattr` / op | `lookup` / op | blocking / op | `crossings_total` / op |
+|---|---|---|---|---|---|
+| `open(O_CREAT\|O_EXCL)` + `close` | `1.011` | **`2.00`** | `1.00` | `6.0125` | `8.02` |
+| `open(O_CREAT\|O_EXCL)`, fd HELD | `1.902` | `2.00` | `1.00` | `5.8995` | — |
+| **`mkdir`** (no fd exists at all) | **`2.00`** | **`1.00`** | `1.00` | `6.0005` | `7.01` |
+
+**ELIMINATED 1 — it is not our invalidation.** Previous entry: unmoved by all three invalidation knobs
+(4,011 / 4,003 / 4,002 / 4,002).
+
+**ELIMINATED 2 — it is not `close`/`flush`.** Holding every descriptor open until process exit did not
+remove the `getattr`; it nearly DOUBLED it (`1.011` -> `1.902` per create). If `close` were the
+trigger, suppressing it would have removed the count, not increased it. **The experiment also failed
+as a clean discriminator and I am recording that**: process exit still closes the descriptors, so
+`flush` stayed at 2,001 and `release` came out partial (1,053) — the variant changed more than the one
+thing it was meant to isolate. Its value is the refutation, not the number.
+
+**ELIMINATED 3 — it is not file-descriptor handling at all.** `mkdir` creates with no descriptor in
+existence at any point, and pays **`2.00` `getattr` per operation** — more than the fd-based create,
+not less.
+
+**NEW FINDING — the audit capability probe rate depends on the KIND of creation.**
+`open(O_CREAT|O_EXCL)` pays **`2.00`** probes per operation; `mkdir` pays **`1.00`**. Every read row
+measured in this campaign pays `1.000` per path-based operation, so `mkdir` is the ordinary rate and
+**file creation via `open` is the outlier**. The previous entry reported "the probe rate DOUBLES on
+create" — that is now scoped: it doubles for `open(O_CREAT)`, not for creation in general. One extra
+probe per file create is `~12.5%` of that operation's crossings, on a row where the probe is otherwise
+only 27% of the total.
+
+**An oddity worth recording rather than smoothing over:** blocking crossings per operation are
+`6.0125`, `5.8995` and `6.0005` across three variants whose per-opcode compositions differ
+substantially (`8.02` vs `7.01` total crossings, probe `2.00` vs `1.00`, `getattr` `1.011` vs `2.00`).
+The blocking count is far more stable than what composes it. I have no mechanism for that and am not
+inventing one.
+
+**Status.** The `getattr` source is still unidentified, but the search space is now materially smaller:
+not our cache invalidation, not the close path, not descriptor lifetime. It follows creation itself
+and is HIGHER for directories than for files. Three eliminations and one new scoped finding, all by
+measurement — no code-reading attribution, which is the discipline this row's history demands.
+
+ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.

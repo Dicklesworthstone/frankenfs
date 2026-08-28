@@ -46,16 +46,34 @@ int main(int argc, char **argv) {
     int w = open(path, O_CREAT | O_WRONLY, 0644);
     if (w >= 0) { close(w); unlink(path); }
 
+    int no_close = getenv("STORMPROBE_NO_CLOSE") != NULL;
+    int use_mkdir = getenv("STORMPROBE_MKDIR") != NULL;
+    static int held[4096];
+    int nfd = 0;
+
     long v0 = nvcsw();
     int created = 0;
     for (int i = 0; i < n; i++) {
         snprintf(path, sizeof(path), "%s/storm/f-%06d", dir, i);
+        // MKDIR mode: creation with NO file descriptor at all. If the post-create
+        // getattr survives here it follows creation itself, not fd handling -- and
+        // holding fds open already showed it is not a close-time artifact.
+        if (use_mkdir) {
+            if (mkdir(path, 0755) != 0) { fprintf(stderr, "mkdir %d: %s\n", i, strerror(errno)); break; }
+            created++;
+            continue;
+        }
         int fd = open(path, O_CREAT | O_WRONLY | O_EXCL, 0644);
         if (fd < 0) {
             fprintf(stderr, "create %d: %s\n", i, strerror(errno));
             break;
         }
-        close(fd);
+        // NO-CLOSE mode: the post-create getattr is 1.0 per create, unmoved by every
+        // invalidation knob, and its source is unidentified. The probe issues exactly
+        // two syscalls per file -- open(O_CREAT|O_EXCL) and close -- so holding the
+        // descriptor open attributes the getattr to one of them without guessing and
+        // without kernel tracing. Bounded N required: the fds stay open until exit.
+        if (!no_close) close(fd); else if (nfd < (int)(sizeof(held)/sizeof(held[0]))) held[nfd++] = fd;
         created++;
     }
     long v1 = nvcsw();
