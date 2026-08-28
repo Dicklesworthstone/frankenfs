@@ -19836,3 +19836,33 @@ that takes one from each arm is not a measurement.
 
 ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD).
 `hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
+
+## `bd-ext4-readdir-stat-5x-3k3hn` — current-head four-arm re-measurement is **REJECTED** (2026-08-28)
+
+I re-ran the open ext4 `readdir+stat` gap against two live kernel mounts and two
+simultaneous FrankenFS mounts from one freshly built current-head ELF.  This is
+not a replacement performance number: the candidate null failed.
+
+Command (one invocation, rotated arm order):
+
+```text
+WORK=/data/tmp/ffs-rdstat-live-FuOizL \
+ELF=/data/tmp/ffs-rdstat-20260827/release-perf/ffs-cli \
+ROUNDS=4 THREADS=8 CPUBASE=8 TAG=bdext4 \
+bash scripts/perf/readdir_stat_ab/run_multi.sh
+```
+
+All 16 arm visits had the same digest `10247677003263444632`.  The kernel
+pair's median paired total-time ratio was `k1/k2=1.023939`, but the candidate
+pair's was `ffsA/ffsB=1.048509`, including a `1.270694` pair.  The pooled
+medians would superficially give `153.180236 ms / 24.209427 ms = 6.327297x`,
+but that number is void: it is not licensed by the failed candidate A/A null.
+
+The arm medians were kernel `k1=25.197704 ms`, `k2=23.911688 ms`; candidate
+`ffsA=166.027780 ms`, `ffsB=147.101351 ms`.  The daemon census was
+`196,764` FUSE crossings per FFS arm for four visits, with identical operation
+counts (`getxattr=32,770`, `lookup=32,576`, `readdir=330`).  This run prices
+no lever and ships no change.  Retry only with enough paired visits for a
+passing FFS A/A control; do not cite the 6.327297x provisional ratio.
+
+ELF SHA-256: `7089b3a3c7a111f6d478002b4cf53dc59d6faf839e2f2b4a84c396ce1698c629`.
