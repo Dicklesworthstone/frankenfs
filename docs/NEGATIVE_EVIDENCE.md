@@ -19867,6 +19867,35 @@ passing FFS A/A control; do not cite the 6.327297x provisional ratio.
 
 ELF SHA-256: `7089b3a3c7a111f6d478002b4cf53dc59d6faf839e2f2b4a84c396ce1698c629`.
 
+## `bd-6tw2s` — tmpfs-backed fsync comparison is **BLOCKED_CAPABILITY** (2026-08-28)
+
+The current five-arm, loop-backed ext4 fsync rig was launched from tmpfs with
+the freshly built ELF below.  It did not reach a timing arm: the current
+FrankenFS executable correctly refused the journalled writable ext4 images
+used by both FFS arms.
+
+```text
+WORK=/dev/shm/ffs-6tw2s-Gvm9Ud \
+ELF=/data/tmp/ffs-rdstat-20260827/release-perf/ffs-cli \
+ROUNDS=4 OPS=20 CPU=8 TAG=bd6tw2 \
+bash scripts/perf/fsync_journal_ab/run_fsync_ext4.sh
+```
+
+The rig had attached five direct-I/O loop devices and mounted both live kernel
+controls.  `ffsA` then exited before mount completion with:
+
+```text
+refusing writable journalled ext4 mount: the mounted fsync path does not route
+its complete durability checkpoint through JBD2
+```
+
+This is the required fail-closed behavior for the JBD2 capability gap, so there
+is no incumbent ratio, no A/A null, and no instr/op claim.  Do not bypass this
+guard merely to re-price the historical tmpfs loss; the retry predicate is a
+complete JBD2-backed writable mount path.
+
+ELF SHA-256: `7089b3a3c7a111f6d478002b4cf53dc59d6faf839e2f2b4a84c396ce1698c629`.
+
 ## 2026-08-27 — why NO client-side oracle can validate the invalidation knobs: a second, purpose-built discriminating test (`link(a,b)` staleness) ALSO passes in both arms, and the reason is structural — the FUSE reply to the client's own syscall already refreshes the cache
 
 Two entries ago I rejected the invalidation knobs' measured saving because my staleness oracle passed
