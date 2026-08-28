@@ -19690,3 +19690,56 @@ measurement — no code-reading attribution, which is the discipline this row's 
 
 ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
 `hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
+
+## 2026-08-27 — the post-create `getattr` IS IDENTIFIED, and it is self-inflicted through a path NO EXISTING KNOB gates: our notify thread issues `1.0` inode-attribute invalidation per create, the client then revalidates and pays a blocking GETATTR
+
+Two entries ago I named this the largest unexplained item in the create phase and refused to guess.
+One entry ago I eliminated three hypotheses by client-side variants and said the search space was
+smaller but the source still unknown. This names it — by kernel probe first, with the code read only
+confirming what was measured, which is the order this row's history demands.
+
+**Measured, `kprobe` on the whole FUSE attribute family, attributed by comm, 500 creates:**
+
+| probe | comm | count | per create |
+|---|---|---|---|
+| `fuse_invalidate_attr` | **`ffs-fuse-notify`** | 502 | **`1.00`** |
+| `fuse_dentry_revalidate` | `stormblockprobe` | 501 | `1.00` |
+| `fuse_do_getattr` | `stormblockprobe` | 507 | `1.01` |
+| daemon census `getattr` | — | 508 | `1.02` |
+
+`ffs-fuse-notify` is OUR daemon's notification thread. **The chain is: we invalidate the inode's
+cached attributes once per create -> the client's next path resolution revalidates the dentry -> that
+revalidation issues a GETATTR round trip the client blocks on.** The first probe attempt, filtered to
+`fuse_getattr` in the client comm, captured NOTHING — informative in itself, since the requests do not
+originate at that entry point.
+
+**Why none of the three invalidation knobs moved it — confirmed in the code AFTER the measurement.**
+`notify_inode_invalidation` (`franken_fuse.rs:221`) has exactly ONE gated caller: the parent-directory
+case at `:213-219`, behind `parent_invalidation_enabled()`. It also has **SEVEN UNGATED callers** on
+mutation paths (`lib.rs:6417, 6626, 6681, 6719, 6779, 7281, 7357`). **`FFS_FUSE_PARENT_INVAL` gates
+the parent case only; the mutated-inode case it cannot reach.** That is precisely why the measured A/B
+showed create-phase `getattr` at 4,011 / 4,003 / 4,002 / 4,002 across baseline and all three knobs —
+**there is no knob that can turn this one off**, so the "unmoved by every knob" result was never
+evidence that it was not ours. It was evidence that the knobs do not cover it.
+
+**A doc-comment claim this contradicts.** The comment beside the notifier's `inode` sender says
+`FFS_FUSE_PARENT_INVAL=0` turns this off and quotes a cost of "`getattr` 3.147 per create+unlink
+pair". The knob does turn off the PARENT-directory invalidation — my full-storm A/B measured
+`crossings_getattr` 11,106 -> 8,189 with it off, so that part is real — but it does **not** turn off
+the per-create inode invalidation, which is what the create phase pays. Anyone reading that comment
+would expect the knob to price this and it does not.
+
+**Size, and what would be needed to price it.** `1.0` of the `6.02` blocking crossings per create,
+i.e. **~17% of the create phase**, on the row whose create half no other lever has touched. To A/B it
+from one ELF, `notify_inode_invalidation` needs its own gate in the same style as the three that
+exist. I am NOT adding that gate speculatively: the invalidation exists so the kernel does not serve
+stale attributes after a mutation, and the previous entry already showed my staleness oracle passes in
+every arm and therefore discriminates nothing. A knob without an oracle that can fail would just
+reproduce that dead end at a new call site.
+
+**Status.** Identified, sized, and shown to be un-A/B-able with the knobs that exist today — which is
+a more useful place than "unexplained", and it took a kernel probe rather than another client variant
+to get there.
+
+ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
