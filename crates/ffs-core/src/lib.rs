@@ -32021,11 +32021,29 @@ impl OpenFs {
         // write_all_at must use the chunk-mapped physical offset, otherwise
         // the bytes land somewhere unrelated to where the next mount's
         // resolver will look for them.
-        let chunks_for_writeback: Vec<_> = self
-            .btrfs_context()
-            .ok_or_else(|| FfsError::Format("no btrfs context for writeback".into()))?
-            .chunks
-            .clone();
+        // bd-cjqhh: resolve against the LIVE chunk tree, not the mount-time context.
+        //
+        // `BtrfsContext` is built once when the filesystem is opened and is never
+        // refreshed, while chunk growth updates `alloc.chunk_tree` and a local
+        // derived vector. Cloning the context therefore hands writeback a snapshot
+        // that predates any chunk grown during this mount, and the first write into
+        // a grown chunk's logical range fails with "writeback logical address not
+        // covered by any chunk" — measured, when data growth was attempted.
+        //
+        // The chunk tree is the right source: it is what the growth path mutates and
+        // what the next mount will read back, so resolving from it makes writeback
+        // agree with the geometry this very commit is about to persist. Falls back
+        // to the context if the tree cannot be parsed or is empty, so a filesystem
+        // this code cannot describe behaves exactly as before.
+        let chunks_for_writeback: Vec<_> =
+            match ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree) {
+                Ok(live) if !live.is_empty() => live,
+                _ => self
+                    .btrfs_context()
+                    .ok_or_else(|| FfsError::Format("no btrfs context for writeback".into()))?
+                    .chunks
+                    .clone(),
+            };
 
         let resolve_physical = |logical: u64| -> Result<u64, BtrfsMutationError> {
             let mapping = map_logical_to_physical(&chunks_for_writeback, logical)

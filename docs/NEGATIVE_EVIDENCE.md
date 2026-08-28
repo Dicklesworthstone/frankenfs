@@ -20109,3 +20109,66 @@ twenty-line shortfall query. The stash from the rejected attempt remains at `sta
 
 ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD).
 `hostname=thinkstation1`. Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-cjqhh: the writeback publication gap is FIXED (writeback now resolves from the live chunk tree) — and data growth is STILL rejected, now failing one layer deeper at a SECOND consumer of the same stale map
+
+The previous entry located the gap: `btrfs_context().chunks` is built once at mount and never
+refreshed, while writeback clones it, so a chunk grown during a mount is invisible to writeback. This
+implements the fix, verifies it, retries data growth on top of it, and reports where that now fails.
+
+**FIX SHIPPED — writeback resolves from the live chunk tree.** `btrfs_full_transaction_commit` takes
+`&self`, so `btrfs_context` cannot be mutated from it; the correct fix is the other direction anyway.
+Writeback now builds its resolver from `chunk_entries_from_chunk_tree(&alloc.chunk_tree)` — the same
+source the growth path mutates and the same geometry the commit is about to persist — falling back to
+the mount-time context if the tree cannot be parsed or is empty, so a filesystem this code cannot
+describe behaves exactly as before.
+
+**Verified harmless, which is the whole safety case since nothing exercises it today.**
+
+| check | result |
+|---|---|
+| `ffs-core` btrfs-filtered tests | **402 passed / 0 failed** |
+| `ffs-btrfs` tests | **429 passed / 0 failed** |
+| bulk durable write, growth OFF | `192` blocks / `13` syncs / `nvcsw` `2.0677` — byte-identical to baseline |
+| writeback mapping errors | **0** |
+| baseline with growth ON, no growth firing | `255` blocks, ENOSPC at 16 MiB — unchanged |
+
+**It has NO observable effect today** — chunk growth is default OFF, and 30,000 creates could not make
+metadata growth fire. It is a latent-gap fix and a prerequisite for any future growth work, not a
+performance change, and I am not claiming one.
+
+**BOTH defects from the rejected attempt are now fixed, and measured to be fixed.** Re-adding data
+growth on top of the publication fix:
+
+| | first attempt | with both fixes |
+|---|---|---|
+| `grew_a_data_chunk` events | 3 (every commit) | **1** (low-water mark now a fraction of the device, not the whole of it) |
+| writeback mapping errors | present | **0** |
+| acknowledged writes LOST | yes | **0** |
+| blocks written | 16 (1 MiB) — worse than baseline | **255** (16.7 MiB) — baseline restored |
+
+The chunk is created (`length=107,347,968`, `shortfall=51,396,608`, `data_have=15,712,256`,
+`data_low_water=67,108,864`), writeback maps it, and no data is lost.
+
+**STILL REJECTED — a SECOND consumer of the same stale map.** The write at the same 16 MiB boundary
+now fails with `errno=5`:
+
+```
+corrupt metadata at block 84082688: logical bytenr not covered by any btrfs chunk
+```
+
+That is not the writeback resolver — it is the RUNTIME metadata resolver,
+`map_logical_to_physical(&ctx.chunks, logical)` at `ffs-core/src/lib.rs:10046`, which reads the same
+mount-time `BtrfsContext` snapshot. **Same root cause, different consumer.** Fixing it is materially
+harder than the writeback case: that path is `&self`, is on every metadata block access, and would
+have to consult the live chunk tree under the allocator lock — a locking and hot-path change, not a
+resolver swap. **The data-growth block is therefore removed again** (an `EIO` is worse than a clean
+`ENOSPC`), and the row's cap stands at 16 MiB.
+
+**Net for the capability gap:** one of the two blocking consumers is fixed and verified, the trigger
+defect is fixed, and the remaining blocker is named to a single line. That is real progress on a gap
+that was "unknown mechanism" two entries ago, delivered as one landed fix and one honest continued
+reject rather than as a speculative whole.
+
+ELF `072b6a94645b11e04bacad26fa925357e6eb786f48041c39bef463e773ab0eec` (release, HEAD + publication
+fix). `hostname=thinkstation1`.
