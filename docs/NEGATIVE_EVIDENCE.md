@@ -20397,3 +20397,59 @@ paths on any worker. That runner is the next piece of work, and it needs no loca
 
 Nothing shipped, nothing reverted. The probe mounts nothing and formats nothing; it only inspects.
 `hostname=thinkstation1` (orchestration), worker `hz3` (measurement).
+
+## 2026-08-28 — the worker head-to-head runner WORKS and drove the comparator through three gates; it is refused at a fourth for a principled reason — the worker has no cpufreq interface, and I am NOT weakening that gate to obtain a number
+
+The method is right and the runner is built:
+`rch exec -- cargo run --release -p ffs-harness --example h2h_worker` resolves the worker's generated
+target directory from `std::env::current_exe()` (never hardcoded), builds `ffs-cli` and
+`ffs-mounted-kernel-bench` on the worker, and invokes the campaign's own six-arm comparator there.
+Confirmed working on `hz3`:
+
+```
+h2h_worker: hostname=hz3
+h2h_worker: target release dir = /data/projects/frankenfs/.rch-target-hz3-pool-1f1f…/release
+```
+
+**A method fix worth keeping.** The first run had the comparator exit **2 with no output at all** —
+inherited stdout/stderr do not survive back through `rch exec`, so a fail-closed refusal was
+indistinguishable from a crash. The runner now CAPTURES both streams and re-emits them as
+`h2h[stdout]`/`h2h[stderr]`. Every diagnosis below exists only because of that change.
+
+**Three gates passed, each by supplying what it actually asked for:**
+
+| gate | resolution |
+|---|---|
+| `--allow-non-pgo-candidate` | passed; a worker build has no PGO profile and the gate records it as non-production rather than accepting it silently |
+| `--harness-builder is required: name the machine that built the ELF` | runner self-reports `hostname()` — the machine that actually built and ran it |
+| `--candidate-builder is required` | same, since both ELFs are built by that worker in the same invocation |
+
+**Refused at the fourth:**
+
+```
+mounted_kernel_gate,error=read CPU frequency policy
+/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver: No such file or directory (os error 2)
+```
+
+The worker exposes no cpufreq interface. The comparator fails CLOSED on it, and that is correct
+behaviour, not an obstacle to route around: this campaign has already recorded a FUSE candidate A/A
+null failing at **`1.256x` under `powersave`** purely because the daemon core idled between requests.
+A comparator that cannot see the governor cannot certify that a ratio is not a governor artifact.
+
+**I did not weaken it.** There is no override flag, so obtaining a number here would have meant
+editing the gate — which AGENTS.md forbids outright ("never weaken a gate to land a change"), and
+which would have produced exactly the kind of ratio this ledger exists to prevent. **A refusal I
+report is worth more than a number I had to disable a safety check to print.**
+
+**What is now established about the method.** Running both arms on the worker is viable in principle —
+`hz3` has `/dev/fuse`, `fusermount3`, `losetup`, btrfs-progs, `e2fsck`, root and 64 CPUs (measured
+last entry) — and the runner reaches the comparator cleanly. The single remaining blocker is
+environmental: **the worker is missing `/sys/devices/system/cpu/*/cpufreq`**, which a container or a
+VM without CPU-frequency passthrough typically is. Unblocking needs either a worker that exposes
+cpufreq, or an operator decision to give the comparator a sanctioned no-cpufreq mode carrying its own
+evidence standard — a decision about what the campaign will accept as certified, not a code tweak, and
+not mine to take unilaterally.
+
+Runner committed so the next attempt starts from a working harness rather than rediscovering three
+gates and a silent-exit trap. Worker `hz3`, orchestration `hostname=thinkstation1`. Nothing shipped to
+the filesystem code; no measurement claimed.
