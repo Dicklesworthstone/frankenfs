@@ -19058,3 +19058,67 @@ characterised and cannot take unilaterally.
 
 ELF `b67c865f5296f404ef84d2491f8c0c8de50bb1395cda7f0d8233a42028635d46` (release, HEAD).
 `hostname=thinkstation1`. Counts only; no wall time claimed. Nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-q0xnl SHIPPED: zero-message open is now DEFAULT ON — the last blocker ("needs rows outside this regime") is retired by two rows measured BIT-IDENTICAL with it on and off, and RELEASE carrying no duty is now enforced by a guard verified in both directions
+
+`FFS_FUSE_ZERO_MESSAGE_OPEN` has been measured at a balanced **`1.160389x`** on the parallel-read row
+(`crossings_open` 6400→4, `crossings_release` 6400→0, `crossings_total` 26,329→13,532, −48.60%) and
+has sat default OFF behind a series of blockers. All of them are now retired, so this flips the
+default and pins the assumptions it now rests on.
+
+**The blocker chain, and how each was closed:**
+
+| blocker | disposition |
+|---|---|
+| "measured as a transport win while costing more than it saved" (page cache dropped per open) | REFUTED — `op_counts read` identical in all four arms; with `FUSE_NO_OPEN_SUPPORT` the kernel does not call `fuse_open` at all, so nothing invalidates |
+| an `O_DIRECT` open would silently get page-cached behaviour | REFUTED by a counted oracle — 64/64 reads still reach the daemon with ZMO negotiated, buffered controls at 1/64, digests identical |
+| a backend forcing `FOPEN_DIRECT_IO` would be silently dropped | GUARDED — `no_backend_forces_direct_io_bd_q0xnl`, verified to fail on a planted violation |
+| "shipping needs rows outside this regime" | **RETIRED HERE — see below** |
+| RELEASE might carry a duty the kernel now never asks for | **GUARDED HERE — see below** |
+
+**ROWS OUTSIDE THE REGIME — both bit-identical, knob attested per run.** Neither row is one ZMO was
+built for, which is the point: the question was whether it HARMS anything else.
+
+| row | metric | ZMO off | ZMO on |
+|---|---|---|---|
+| btrfs `readdir+stat` (interleaved) | blocking crossings / stat | `1.0056` | `1.0056` |
+| | `crossings_total` | 8,248 | 8,248 |
+| | digest | `10069978255546022933` | identical |
+| btrfs bulk durable write | `nvcsw` / write | `2.0677` | `2.0677` |
+| | `crossings_total` | 408 | 408 |
+| | blocks / syncs completed | 192 / 13 | 192 / 13 |
+
+Every per-opcode count matched as well. `FUSE_NO_OPEN_SUPPORT negotiated` was counted in the daemon's
+own log per run, so the arms are attested rather than assumed. **The write row matters most here: it
+is a MUTATING workload, and it completed identically with RELEASE never sent.**
+
+**RELEASE carries no duty, and that is now enforced.** `FsOps::release`'s trait default is `Ok(())`
+(`ffs-core/src/vfs.rs:2662`), the only other definition is the `Arc` forwarder (`:3600`), and
+`fs_ops.rs` already forbids `OpenFs` from overriding it. New guard
+`no_fsops_impl_overrides_release_bd_q0xnl` pins the count at exactly 2 with a positive control, and
+its message names the consequence: a `release` that did real work would be **silently skipped** under
+the default-on knob, with no error and no other test failing.
+
+**Guard verified in BOTH directions, and the first attempt at that was invalid — recorded because it
+is a trap.** Planting a duplicate `fn release` inside the SAME trait does not compile, so the crate
+failed to build and the guard never ran; that is a build failure masquerading as a passing control. A
+valid control (a separate impl block at the same indentation) trips it correctly: *"ffs-core/src/vfs.rs
+now defines `fn release(` 3 times, not 2"*. `vfs.rs` verified byte-clean after revert.
+
+**The knob may now only ever SUBTRACT.** `FFS_FUSE_ZERO_MESSAGE_OPEN=0|false|off|no` disables it;
+absent or anything else leaves it on. Verified live: with no env the daemon negotiates
+`FUSE_NO_OPEN_SUPPORT`; with `=0` it does not, and the write row is unchanged either way.
+
+**Regression:** `ffs-fuse` **685 passed / 0 failed** — no existing test assumed the knob was opt-in.
+
+ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD + this change).
+`hostname=thinkstation1`. This is the first DEFAULT SHIPPED from this row's chain; the `1.160389x` it
+carries was measured previously and is not re-claimed here.
+
+**Provenance note.** The CODE for this change (the default flip and
+`no_fsops_impl_overrides_release_bd_q0xnl`) landed as commit `2645cba93`, "perf(fuse):
+default-enable zero message open and guard FsOps release duties" — a concurrent pane committed it
+from the shared working tree before I staged it, the third time that has happened in this session. I
+verified the committed content is complete and correct (both the flipped default and the guard are in
+`HEAD`, and `ffs-fuse` is 685/0 against it) and left it rather than rewriting shared history. This
+ledger entry carries the evidence; that commit carries the diff.
