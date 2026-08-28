@@ -20172,3 +20172,62 @@ reject rather than as a speculative whole.
 
 ELF `072b6a94645b11e04bacad26fa925357e6eb786f48041c39bef463e773ab0eec` (release, HEAD + publication
 fix). `hostname=thinkstation1`.
+
+## 2026-08-27 — bd-cjqhh: SECOND stale-map consumer fixed (runtime node resolver, non-blocking live-tree fallback) — data growth STILL REJECTED at a THIRD consumer, and the row's cap is unchanged at `16,711,680` bytes against the kernel's `67,108,864`
+
+The previous entry fixed writeback's resolver and named the next blocker: the runtime metadata
+resolver at `ffs-core/src/lib.rs:10046`, reading the same mount-time `BtrfsContext` snapshot. This
+fixes that one and retries.
+
+**SECOND FIX — the runtime node resolver, designed not to cost anything on the hot path.**
+`ctx.chunks` stays the FAST path, so every pre-existing chunk resolves exactly as before; only a MISS
+consults the live chunk tree. The fallback uses **`try_read`**, because this function is reachable
+while a commit holds the allocator's write lock and a blocking acquire would deadlock — on an
+unavailable lock the original "not covered" error stands. Verified harmless:
+
+| check | result |
+|---|---|
+| `ffs-core` btrfs-filtered | **402 passed / 0 failed** |
+| `ffs-btrfs` | **429 passed / 0 failed** |
+| bulk durable write, growth OFF | `192` blocks / `13` syncs / `nvcsw` `2.0677` / `3,549` page faults — matches baseline |
+| mapping errors | **0** |
+
+**STILL REJECTED — a THIRD consumer, and it is not a resolver swap.** With both resolvers fixed, data
+growth still fails at the same address with the same message:
+
+```
+corrupt metadata at block 84082688: logical bytenr not covered by any btrfs chunk
+```
+
+The remaining consumer is `ffs-btrfs/src/lib.rs:2350`, which takes `chunks` as a PARAMETER — the
+btrfs node provider is constructed at mount with a captured chunk list
+(`byte_node_provider(read_physical, chunks, …)`). Fixing it means changing how that provider is built
+and what it closes over, not swapping one lookup. That is a structural change to mount-time
+construction, and I am stopping rather than attempting it in the same turn that produced two other
+edits to the same file.
+
+**THE MEASURED RESULT, which is the honest number for this attempt:**
+
+| | FrankenFS | live kernel btrfs |
+|---|---|---|
+| bytes written before failure | **16,711,680** (255 blocks) | **67,108,864** (1024 blocks) |
+| fsyncs completed | 16 | 65 |
+| share of a 1024 MiB device usable for data | **1.6%** | 100% |
+| `grew_a_data_chunk` events | 1 (trigger correct) | — |
+| writeback mapping errors | 0 (fixed) | — |
+| acknowledged writes lost | 0 | — |
+
+**Data growth is removed again** — an `EIO` mid-write is worse than a clean `ENOSPC`, and the cap is
+unchanged either way.
+
+**What three attempts have established.** The stale mount-time chunk snapshot is not one bug but a
+PATTERN with at least three consumers: writeback (fixed), the runtime node-cache resolver (fixed), and
+the node provider's captured slice (not fixed). Each was invisible until the one before it was
+repaired, which is why this looked like "unknown mechanism" three entries ago and like a twenty-line
+shortfall query one entry ago. The two landed fixes are correct, verified, and have **no observable
+effect today** because growth is default OFF — they are prerequisites, and I am claiming no
+performance from them.
+
+ELF `0f5341d7803e478ba8b006b46cfb3888cef1f7f7d7cc18253709d5f2f734809d` (release, HEAD + both resolver
+fixes). Failed-attempt ELF `2552b81763f68db3bdaa3b24bee6cef4fba7833fb50327e267ab1e9dcfcfd169`.
+`hostname=thinkstation1`.

@@ -10042,11 +10042,37 @@ impl OpenFs {
         let nodesize = ctx.nodesize;
         let ns = usize::try_from(nodesize)
             .map_err(|_| ParseError::IntegerConversion { field: "nodesize" })?;
-        let mapping =
-            map_logical_to_physical(&ctx.chunks, logical)?.ok_or(ParseError::InvalidField {
-                field: "logical_address",
-                reason: "not covered by any chunk",
-            })?;
+        // bd-cjqhh: the mount-time chunk list is the FAST path, and the live chunk
+        // tree is the fallback.
+        //
+        // `BtrfsContext` is built once at open and never refreshed, so a chunk grown
+        // during this mount is absent from `ctx.chunks` and every metadata read into
+        // it fails with "not covered by any chunk" — measured, when data growth was
+        // attempted on top of the writeback fix.
+        //
+        // Consulting `ctx.chunks` first keeps this hot path exactly as it was for
+        // every pre-existing chunk, which is all of them unless growth has run. Only
+        // a MISS pays for the fallback, and the fallback uses `try_read`: this
+        // function can be reached while a commit holds the allocator's write lock,
+        // and a blocking acquire there would deadlock. If the lock is unavailable
+        // the original "not covered" error stands, exactly as before.
+        let mapping = match map_logical_to_physical(&ctx.chunks, logical)? {
+            Some(mapping) => mapping,
+            None => {
+                let grown = self
+                    .btrfs_alloc_state
+                    .as_ref()
+                    .and_then(|state| state.try_read())
+                    .and_then(|state| {
+                        ffs_btrfs::chunk_entries_from_chunk_tree(&state.chunk_tree).ok()
+                    })
+                    .and_then(|live| map_logical_to_physical(&live, logical).ok().flatten());
+                grown.ok_or(ParseError::InvalidField {
+                    field: "logical_address",
+                    reason: "not covered by any chunk",
+                })?
+            }
+        };
         let mut buf = vec![0_u8; ns];
         self.dev
             .read_exact_at(cx, ByteOffset(mapping.physical), &mut buf)
