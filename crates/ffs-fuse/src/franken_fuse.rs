@@ -228,6 +228,14 @@ impl FrankenFuse {
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
+        // bd-avg6f: gated so the measured ~17% of the create phase this costs can be
+        // A/B'd from ONE ELF. Placed here rather than at the call sites because the
+        // seven mutation-path callers and the one parent-directory caller all funnel
+        // through this function; gating it at the sites would leave the same hole
+        // that made this un-priceable in the first place. Default ON.
+        if !crate::inode_invalidation_enabled() {
+            return;
+        }
         // Queued for the same reason as the entry case (bd-7s0p7): this is a
         // request-handler context, and `fuse_reverse_inval_inode` takes a lock
         // the caller has not released yet.

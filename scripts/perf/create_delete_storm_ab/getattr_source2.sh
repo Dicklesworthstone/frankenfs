@@ -23,7 +23,8 @@ mkdir -p "$MNT"
 DEV=$(sudo -n losetup --find --show "$W/simgb-f.btrfs")
 sudo -n losetup --direct-io=on "$DEV" 2>/dev/null || true
 sudo -n chown "$(id -u)" "$DEV"
-env FFS_MOUNT_BENCH_EVIDENCE=1 FFS_OP_COUNTS=1 RUST_LOG=warn \
+# shellcheck disable=SC2086
+env FFS_MOUNT_BENCH_EVIDENCE=1 FFS_OP_COUNTS=1 RUST_LOG=warn ${FENV:-} \
   taskset -c 18 "$ELF" mount --rw "$DEV" "$MNT" >> "$W/gsrc2-fuse.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 300); do mountpoint -q "$MNT" && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done

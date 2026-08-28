@@ -392,6 +392,36 @@ pub fn zero_message_opendir_enabled() -> bool {
 /// saved" is no longer an open question — it is a `1.160389x` win that costs
 /// nothing on this row's cache. The blocker moved; it did not survive.
 #[must_use]
+/// Whether the daemon tells the kernel to drop an inode's cached ATTRIBUTES after a
+/// mutation (`FFS_FUSE_INODE_INVAL`, default ON — may only ever SUBTRACT).
+///
+/// bd-avg6f: this was measured to cost `1.0` blocking crossing per create — our
+/// notify thread issues one `fuse_invalidate_attr` per create, the client's next
+/// path resolution revalidates the dentry, and that revalidation pays a GETATTR
+/// round trip. That is ~17% of the create phase's `6.02` blocking crossings.
+///
+/// It had NO knob. `FFS_FUSE_PARENT_INVAL` gates only the parent-directory caller
+/// (`franken_fuse.rs:213`); the seven mutation-path callers in this file reach
+/// `notify_inode_invalidation` ungated, which is why an A/B across all three
+/// existing invalidation knobs left create-phase `getattr` flat at
+/// 4,011 / 4,003 / 4,002 / 4,002 and could not price this at all.
+///
+/// ⚠ DEFAULT ON, and this knob exists to MEASURE, not to ship. The invalidation is
+/// what stops the kernel serving stale attributes after a mutation, and the
+/// staleness oracle written for the sibling knobs passes in every arm — it
+/// discriminates nothing, so it cannot license turning this off. Anything proposing
+/// to default it OFF needs an oracle that FAILS with it disabled, in the style of
+/// the guards verified in both directions elsewhere in this crate.
+#[must_use]
+pub fn inode_invalidation_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FFS_FUSE_INODE_INVAL")
+            .is_ok_and(|raw| !matches!(raw.trim(), "0" | "false" | "off" | "no"))
+            || std::env::var("FFS_FUSE_INODE_INVAL").is_err()
+    })
+}
+
 pub fn zero_message_open_measurement_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

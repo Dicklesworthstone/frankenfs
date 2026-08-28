@@ -19743,3 +19743,49 @@ to get there.
 
 ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
 `hostname=thinkstation1`. Counts only; nothing shipped, nothing reverted.
+
+## 2026-08-27 — bd-avg6f: `FFS_FUSE_INODE_INVAL` added (default ON, attested) — and its first use REFUTES my own previous entry: removing the inode invalidation leaves the post-create GETATTR completely unchanged, so it is NOT the cause
+
+The previous entry identified our notify thread issuing `1.0` `fuse_invalidate_attr` per create,
+observed `1.0` `fuse_dentry_revalidate` and `1.0` `fuse_do_getattr` alongside it, and concluded the
+chain was **we invalidate -> the client revalidates -> it pays a blocking GETATTR**. It also noted
+that no knob gated this path, so the claim could not be tested. This adds the knob and tests it.
+
+**Capability added, in the repo's established idiom.** `FFS_FUSE_INODE_INVAL`, default ON, may only
+ever SUBTRACT, gated inside `notify_inode_invalidation` so it covers BOTH the parent-directory caller
+and the seven ungated mutation-path callers — gating at the call sites would have left exactly the
+hole that made this un-priceable. Reported on the daemon's knob line as `inode_inval=`, so a run can
+attest it instead of trusting the environment. `ffs-fuse` **685 passed / 0 failed**.
+
+**THE GATE DEMONSTRABLY WORKS** — `kprobe`, 500 creates, knob attested per run:
+
+| | `invalidate_attr[ffs-fuse-notify]` | `dentry_revalidate` | `do_getattr` | daemon `getattr` |
+|---|---|---|---|---|
+| `inode_inval=true` | **502** | 501 | 503 | 504 |
+| `inode_inval=false` | **absent (0)** | **501** | **501** | **502** |
+
+The invalidation is ours, it is `1.0` per create, and the gate removes it entirely.
+
+**AND THE PREVIOUS ENTRY'S CAUSAL CHAIN IS WITHDRAWN.** With the invalidation gone, the client still
+revalidates the dentry `501` times and still issues `501` GETATTRs; blocking crossings per create are
+`6.0062` -> `6.0003` and daemon `crossings_getattr` `4,026` -> `4,002`. **Removing the cause I
+identified does not remove the effect, so it was not the cause.** The correlation was real — both
+happen once per create — and I read a chain into it. That is the fourth plausible causal story on
+this row to fail a test, and the first one caught by an instrument I built specifically to test it,
+before anyone acted on it.
+
+**What the knob is actually worth.** It removes `1.0` kernel-side `fuse_invalidate_attr` per create
+plus the matching send on our notify thread. That is daemon and kernel CPU — **zero crossings, zero
+blocking crossings, no client latency**. Consistent with the earlier finding that create-path
+invalidation is non-blocking while removal-path invalidation is not. Anyone hoping this knob buys
+client-visible time on the create phase should not; it buys CPU on both sides of the boundary.
+
+**Where the post-create GETATTR now stands.** Still `1.0` per create, still ~17% of the create phase's
+`6.02` blocking crossings, and now with FOUR eliminated causes: not our cache invalidation (three
+knobs), not `close`/`flush`, not descriptor lifetime, and not the inode-attribute invalidation. What
+survives is that it arrives with `fuse_dentry_revalidate`, which fires `1.0` per create **regardless
+of every knob tested**. I am not naming a cause for that — this row has cost four withdrawn
+attributions and the pattern is that each one looked obvious at the time.
+
+ELF `05be7d9a659231eb18200bff80ff9dc7f8b33772a4b455a9dd3803af76342abf` (release, HEAD + this knob).
+`hostname=thinkstation1`. Counts only; the knob ships default ON so no behaviour changes.

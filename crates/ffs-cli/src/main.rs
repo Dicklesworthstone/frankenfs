@@ -8024,7 +8024,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         // so an ELF that predates a knob — the bd-d9378 failure — fails the run
         // closed instead of silently comparing a configuration against itself.
         eprintln!(
-            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},receive_spin_adaptive={},spin_pause={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},ext4_file_data_extent_cache_bytes={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={},btrfs_verify_data_on_read={},btrfs_grow_chunks={}",
+            "mount_candidate_knobs,count_memoized_requests={},fuse_dispatch_workers={},capability_memo={},capability_memo_slots={},capability_memo_bitmap={},io_uring={},io_uring_queue_depth={},io_uring_payload_bytes={},splice={},receive_spin={},receive_spin_adaptive={},spin_pause={},readdirplus_attr_memo={},readdirplus_batch_attrs={},readdirplus_inode_order={},btrfs_readdir_prefetch={},writeback_batch={},btrfs_floor_memo_slots={},ext4_file_data_extent_cache_bytes={},entry_inval={},mvcc_flush_reserve={},mvcc_flush_borrow={},btrfs_commit_fst_early={},mvcc_flush_buf_reuse={},mvcc_flush_vectored={},jemalloc_dirty_decay_ms={},fuse_no_flush={},fuse_create_inval={},parent_inval={},btrfs_verify_data_on_read={},btrfs_grow_chunks={},inode_inval={}",
             ffs_fuse::count_memoized_requests_enabled(),
             fuse_dispatch_workers_from_env()?,
             ffs_fuse::capability_memo_enabled(),
@@ -8101,6 +8101,9 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             // tell "growth is off" from "growth ran and declined". Every other
             // knob on this line is here for exactly that reason.
             ffs_core::btrfs_grow_chunks_from_env_public(),
+            // bd-avg6f: the create phase's ~17% inode-attribute invalidation had no
+            // knob and therefore no attestation; both arrive together.
+            ffs_fuse::inode_invalidation_enabled(),
         );
     }
 
